@@ -48,8 +48,13 @@ jobs:
           python-version: ${{ matrix.python }}
           cache: pip
       - run: python -m pip install -e ".[dev]"
+      # Authenticated equivalent of `mmcore install --test-adapters`: the
+      # unauthenticated GitHub API call inside pymmcore-plus hits the shared
+      # runners' rate limit (HTTP 403).
       - name: Install Micro-Manager demo device adapters
-        run: mmcore install --test-adapters --plain-output
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/ci/install_mm_test_adapters.py
       - name: Run tests
         run: pytest --cov=smc --cov-report=term --cov-report=xml
       - uses: actions/upload-artifact@v4
