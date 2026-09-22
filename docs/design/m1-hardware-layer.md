@@ -1,0 +1,641 @@
+# M1 design — the hardware layer, proven on the simulator
+
+- **Status**: design for issues #5, #6, #7, #8, #9, #10, #11 and #30
+- **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
+- **Rule**: this document is the contract between issues that are built in
+  parallel. Names, module paths and signatures below are fixed; an executor
+  who needs to change one stops and comments on its issue instead.
+
+Read first: [ADR-0002](../adr/0002-pymmcore-plus-as-the-hardware-core.md),
+[ADR-0003](../adr/0003-capabilities-roles-and-profiles.md),
+[ADR-0005](../adr/0005-testing-strategy.md).
+
+## 0. Scope and non-goals
+
+M1 delivers, on Micro-Manager's demo devices: five capabilities
+(`XYStage`, `ZStage`, `Camera`, `Shutter`, `Properties`) implemented over
+`CMMCorePlus`; role resolution; TOML profiles; the `Microscope` facade with
+safety guards and dry-run; a contract test suite with a `FakeCore`; a
+stage-aware synthetic sample; CLI commands; and a read-only hardware
+inventory command (`smc discover`) so the microscope PCs can be surveyed
+now.
+
+Not in M1: `Autofocus`, `ObjectiveTurret`, `LightSource`, `Channels`
+(M2 — their semantics need Nikon/Zeiss quirks the demo cannot show), the
+plugin API (M3), any UI beyond the CLI, unicore Python devices (M4).
+
+## 1. Module map
+
+```
+src/smc/
+  hardware/
+    __init__.py
+    core.py            (exists) open/close a core; MM install status
+    errors.py          HardwareError hierarchy                        (seeded by the design PR)
+    capabilities.py    value types + Protocols                          #5
+    roles.py           Role, DeviceInfo (seeded) · RoleMap, resolve(), core helpers   #6
+    profile.py         Profile (pydantic) + TOML loading                #7
+    safety.py          Safety checks + Executor (lock, dry-run)         #5
+    microscope.py      Microscope facade + capability registry          #8
+    backends/
+      __init__.py
+      mm.py            MM* capability classes, loaded_devices, core_roles  #5
+  discovery/
+    __init__.py
+    os_inventory.py    serial / USB-PnP / PCI, per OS                    #30
+    mm_inventory.py    adapters, devices per adapter, optional probe     #30
+    vendors.py         VID/PID and name → vendor → likely adapters       #30
+    report.py          text + JSON rendering                             #30
+  testing/
+    __init__.py
+    fakes.py           FakeCore                                          #9
+    fixtures.py        pytest plugin: demo_core, demo_microscope, fake_*  #9
+    synthetic.py       PlateSample renderer + SampleCamera               #10
+  cli.py               (exists) + profiles/devices/stage/z/snap/discover  #11 #30
+tests/
+  conftest.py          loads smc.testing.fixtures; --profile option
+  contracts/           one file per capability, parametrised backends     #9
+  unit/                pure logic (roles, profile, safety, synthetic)
+  test_*.py            existing simulator/CLI tests
+profiles/demo.toml     example profile the loader must accept             #7
+```
+
+## 2. Conventions
+
+- **Units in names.** `_um`, `_ms`, `_s`, `_deg`, `_px`. Stage coordinates
+  are Micro-Manager's: µm, X right, Y up, Z up.
+- **Methods, not properties**, for anything that talks to hardware
+  (`exposure_ms()` / `set_exposure_ms()`), because a hardware read can be
+  slow or fail and a property hides that.
+- **Mutating calls return the readback** (`move_to_um` returns the position
+  read after the move). In dry-run they return the *commanded* value.
+- **Errors** live in `smc.hardware.errors`:
+
+  ```python
+  class HardwareError(RuntimeError): ...
+
+
+  class CoreError(HardwareError): ...  # re-exported from core.py
+
+
+  class CapabilityMissingError(HardwareError):
+      capability: str
+      role: Role | None
+      available: tuple[str, ...]
+
+
+  class SafetyRefusedError(HardwareError):
+      reason: str
+      how_to_force: str  # "" when it cannot be forced
+
+
+  class DeviceTimeoutError(HardwareError): ...
+  ```
+
+  Messages say what to do next (`how_to_force`, the CLI command, the
+  profile key), never just what went wrong.
+- **Logging**: `logging.getLogger("smc.hardware.<module>")`. Every mutating
+  call logs at INFO: `xy_stage: move_to (1234.0, -56.0) µm`; dry-run logs
+  `[dry-run] xy_stage: move_to …`. No `print` outside `cli.py`.
+- **Threading**: a `Microscope` owns one `threading.RLock`; every backend
+  call goes through `Executor`, which holds it. Capabilities are therefore
+  safe to call from a UI thread and a worker at once; they are still
+  *sequential*.
+- **Timeouts**: `core.setTimeoutMs(profile.micromanager.device_timeout_ms)`
+  (default 60 000 — a plate traverse exceeds MMCore's 5 s default).
+  `waitForDevice` errors surface as `DeviceTimeoutError`.
+- **Typing**: `mypy --strict`; Protocols are `@runtime_checkable`; value
+  types are frozen dataclasses (`slots=True`); configuration is pydantic v2.
+- Python 3.10 compatible: no `StrEnum` (use `class Role(str, Enum)`), no
+  `match` needed, `tomllib` behind `sys.version_info` with `tomli` fallback.
+
+## 3. Capabilities — `smc/hardware/capabilities.py` (#5)
+
+```python
+@dataclass(frozen=True, slots=True)
+class XY:
+    x_um: float
+    y_um: float
+
+
+@dataclass(frozen=True, slots=True)
+class Limits:
+    low_um: float
+    high_um: float
+
+
+@dataclass(frozen=True, slots=True)
+class PropertyInfo:
+    device: str
+    name: str
+    value: str
+    read_only: bool = False
+    allowed: tuple[str, ...] = ()
+    lower: float | None = None
+    upper: float | None = None
+    # helpers: .numeric (both limits set), .number (float(value) or None), .describe()
+
+
+@runtime_checkable
+class XYStage(Protocol):
+    def position_um(self) -> XY: ...
+    def move_to_um(self, x_um: float, y_um: float, *, wait: bool = True) -> XY: ...
+    def move_by_um(
+        self, dx_um: float, dy_um: float, *, wait: bool = True, force: bool = False
+    ) -> XY: ...
+    def wait(self, timeout_s: float | None = None) -> None: ...
+    def is_busy(self) -> bool: ...
+    def limits_um(self) -> tuple[Limits, Limits] | None: ...  # (x, y); None = unknown
+
+
+@runtime_checkable
+class ZStage(Protocol):
+    def position_um(self) -> float: ...
+    def move_to_um(self, z_um: float, *, wait: bool = True) -> float: ...
+    def move_by_um(self, dz_um: float, *, wait: bool = True) -> float: ...
+    def wait(self, timeout_s: float | None = None) -> None: ...
+    def is_busy(self) -> bool: ...
+    def limits_um(self) -> Limits | None: ...
+
+
+@runtime_checkable
+class Camera(Protocol):
+    def snap(self) -> np.ndarray: ...  # 2-D, native dtype
+    def exposure_ms(self) -> float: ...
+    def set_exposure_ms(self, value_ms: float) -> float: ...
+    def image_shape(self) -> tuple[int, int]: ...  # (height, width)
+    def bit_depth(self) -> int: ...
+    def pixel_size_um(self) -> float: ...  # 0.0 = unknown; never guessed
+
+
+@runtime_checkable
+class Shutter(Protocol):
+    def is_open(self) -> bool: ...
+    def set_open(self, open_: bool) -> bool: ...
+    def auto_shutter(self) -> bool: ...
+    def set_auto_shutter(self, on: bool) -> bool: ...
+
+
+@runtime_checkable
+class Properties(Protocol):
+    def devices(self) -> list[str]: ...  # without "Core"
+    def describe(self, device: str) -> list[PropertyInfo]: ...
+    def get(self, device: str, name: str) -> str: ...
+    def set(self, device: str, name: str, value: str | float | int) -> str: ...
+```
+
+Semantics every implementation must honour (these are the contract tests):
+
+- `move_by_um` on `XYStage` refuses `max(|dx|, |dy|) > safety.max_jog_um`
+  with `SafetyRefusedError` unless `force=True`. Absolute moves are never
+  jog-guarded (crossing a plate is legitimate travel).
+- Absolute and relative moves refuse a target outside the profile's soft
+  limits (`SafetyRefusedError`, not forceable). No limits configured → no check.
+- `wait()` returns when the device reports not busy; raises `DeviceTimeoutError`
+  after `timeout_s` (default: the core timeout).
+- `Camera.pixel_size_um()` returns MMCore's value when > 0, else the
+  profile's value for the current objective label, else `0.0`.
+- Every reader tolerates a device that answers slowly but never swallows a
+  failure silently: exceptions propagate; the *facade's* `state()` is the
+  tolerant layer.
+
+M2 will extend `ZStage.move_to_um` with `keep_autofocus: bool = True`
+(a keyword with a default is a compatible extension).
+
+## 4. Roles — `smc/hardware/roles.py` (#6)
+
+```python
+class Role(str, Enum):
+    camera = "camera"
+    xy_stage = "xy_stage"
+    focus = "focus"
+    autofocus = "autofocus"
+    autofocus_offset = "autofocus_offset"
+    objective_turret = "objective_turret"
+    shutter = "shutter"
+    light_source = "light_source"
+    light_path = "light_path"
+    filter_turret = "filter_turret"
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceInfo:
+    label: str
+    type: str  # DeviceType name without "Device": "XYStage", "Stage", "Camera",
+    # "State", "Shutter", "AutoFocus", "Hub", "Generic", …
+    library: str = ""
+    name: str = ""
+    description: str = ""
+
+
+Source = Literal["profile", "core", "heuristic"]
+
+
+@dataclass
+class RoleMap:
+    assigned: dict[Role, str]
+    sources: dict[Role, Source]
+    candidates: dict[Role, list[str]]  # best first; includes the assigned one
+    warnings: list[str]
+
+    def get(self, role: Role) -> str | None: ...
+    def missing(self) -> list[Role]: ...
+    def ambiguous(self) -> dict[Role, list[str]]: ...  # roles with > 1 candidate
+    def describe(self) -> list[str]: ...  # one aligned line per role
+
+
+def devices_from_core(core) -> list[DeviceInfo]     # skips "Core"; type = DeviceType(...).name without "Device"
+def core_roles(core) -> dict[Role, str]              # camera, xy_stage, focus, autofocus, shutter — non-empty only
+
+def resolve(
+    devices: Iterable[DeviceInfo],
+    *,
+    core_roles: Mapping[Role, str] | None = None,  # from MMCore's own slots
+    overrides: Mapping[Role, str] | None = None,  # profile [roles.assign]
+    exclusions: Mapping[Role, Sequence[str]] | None = None,  # profile [roles.exclude]
+) -> RoleMap: ...
+```
+
+Algorithm (pure; no core import):
+
+1. **Candidates** per role from the type table, minus devices whose
+   normalised name (`[a-z0-9]` only) contains a built-in or profile
+   exclusion substring; ranked by the first matching name hint, then label.
+2. **Assignment**, first source that yields a device:
+   1. `overrides[role]` — if the label is not loaded, a warning and fall
+      through.
+   2. `core_roles[role]` — if excluded for that role (e.g. a `.cfg` that
+      still names a TIRF positioner as the XY stage), a warning and fall
+      through — this is the case that reads like dead hardware.
+   3. Best heuristic candidate.
+3. Record `sources`, `candidates`, `warnings`. A role with several
+   candidates is not an error, but `describe()` shows the runner-ups.
+
+Type table and built-in rules (generalised from `nikon-control/scope/stand.py`):
+
+| Role | Type | Must contain | Exclude | Hints (rank order) |
+|---|---|---|---|---|
+| camera | Camera | | | |
+| xy_stage | XYStage | | tirf | xystage, xydrive, stage |
+| focus | Stage | | pfs, offset, tirf | zdrive, focus, z |
+| autofocus | AutoFocus | | | |
+| autofocus_offset | Stage | pfs \| offset | | pfsoffset, offset |
+| objective_turret | State | nose \| objective \| turret | filter, condenser, reflector | nosepiece, objective, turret |
+| shutter | Shutter | | | epishutter, epi, diashutter, dia, tl |
+| light_source | Shutter \| State \| Generic | lamp \| led \| light \| laser \| colibri | shutter-only names | lamp, led, laser |
+| light_path | State | lightpath \| sideport \| port \| eyepiece | | lightpath, sideport |
+| filter_turret | State | filter \| reflector | objective, nose | filter, reflector |
+
+Unit tests use synthetic `DeviceInfo` lists copied from
+`docs/hardware/inventory.md`: the Ti2's four `XYStage`-typed devices, the
+Ti-E's three `Stage`-typed devices, the demo configuration.
+
+## 5. Profiles — `smc/hardware/profile.py` (#7)
+
+TOML shape (this replaces the draft `profiles/demo.toml`):
+
+```toml
+[microscope]
+name = "demo"
+vendor = "Micro-Manager"
+description = "DemoCamera adapter: simulated camera, XY, Z, turret, shutter, autofocus."
+
+[micromanager]
+config = ""                    # "" = demo configuration; relative paths resolve against this file
+device_timeout_ms = 60000
+adapter_search_paths = []      # extra Micro-Manager directories, e.g. a separate MMStudio install
+
+[roles.assign]                 # overrides only; keys are Role values
+# xy_stage = "XY"
+
+[roles.exclude]                # extra name substrings per role
+# focus = ["piezo"]
+
+[safety]
+max_jog_um = 5000.0
+# z_soft_limits_um = [-1000.0, 1000.0]
+# xy_soft_limits_um = [[-60000.0, 60000.0], [-40000.0, 40000.0]]
+turret_requires_confirm = true
+
+[camera]
+pixel_size_um = { "Nikon 10X S Fluor" = 0.65, "Nikon 40X Plan Fluor ELWD" = 0.1625 }
+
+[quirks]                       # free-form, consumed by backends; documented per key in M2
+```
+
+Model:
+
+```python
+class MicroscopeSection(BaseModel):
+    name: str
+    vendor: str = ""
+    description: str = ""
+
+
+class MicroManagerSection(BaseModel):
+    config: str = ""
+    device_timeout_ms: int = 60_000
+    adapter_search_paths: list[str] = []
+
+
+class RolesSection(BaseModel):
+    assign: dict[Role, str] = {}
+    exclude: dict[Role, list[str]] = {}
+
+
+class SafetySection(BaseModel):
+    max_jog_um: float = 5000.0
+    z_soft_limits_um: tuple[float, float] | None = None
+    xy_soft_limits_um: tuple[tuple[float, float], tuple[float, float]] | None = None
+    turret_requires_confirm: bool = True
+
+
+class CameraSection(BaseModel):
+    pixel_size_um: dict[str, float] = {}
+
+
+class Profile(BaseModel):
+    microscope: MicroscopeSection
+    micromanager: MicroManagerSection = MicroManagerSection()
+    roles: RolesSection = RolesSection()
+    safety: SafetySection = SafetySection()
+    camera: CameraSection = CameraSection()
+    quirks: dict[str, Any] = {}
+    source: Path | None = Field(default=None, exclude=True)  # where it was loaded from
+
+    @classmethod
+    def demo(cls) -> Profile: ...  # built in code; no file needed
+    @classmethod
+    def load(cls, source: str | Path) -> Profile: ...
+    def config_path(self) -> Path | None: ...  # None for the demo configuration
+
+
+def search_paths() -> list[
+    Path
+]: ...  # $SMC_PROFILES (os.pathsep-separated) → ./profiles → .
+def list_profiles() -> list[tuple[str, Path]]: ...
+```
+
+Rules: `load("demo")` returns `Profile.demo()` unless a `demo.toml` is
+found first; a bare name resolves to `<dir>/<name>.toml` over the search
+paths; a path is read as given. Validation errors are re-raised as
+`ProfileError(HardwareError)` naming file, key and fix. Limits must be
+ordered; unknown role keys list the allowed values; a non-empty `config`
+must exist at load time.
+
+## 6. Micro-Manager backend — `smc/hardware/backends/mm.py` (#5)
+
+The core inventory helpers (`devices_from_core`, `core_roles`) live in
+`roles.py` (#6); this module holds only the capability implementations.
+
+```python
+class MMXYStage:  # implements XYStage
+    def __init__(self, core, label: str, executor: Executor, safety: Safety): ...
+
+
+class MMZStage:  # implements ZStage
+    def __init__(self, core, label: str, executor: Executor, safety: Safety): ...
+
+
+class MMCamera:  # implements Camera
+    def __init__(
+        self,
+        core,
+        label: str,
+        executor: Executor,
+        pixel_sizes_um: Mapping[str, float],
+        objective_label: Callable[[], str | None],
+    ): ...
+
+
+class MMShutter:  # implements Shutter
+    def __init__(self, core, label: str, executor: Executor): ...
+
+
+class MMProperties:  # implements Properties
+    def __init__(self, core, executor: Executor): ...
+```
+
+Core calls per method:
+
+| Method | MMCore |
+|---|---|
+| `XYStage.position_um` | `getXPosition(label)`, `getYPosition(label)` |
+| `XYStage.move_to_um` | `setXYPosition(label, x, y)` then `waitForDevice(label)` if `wait` |
+| `ZStage.position_um` / `move_to_um` | `getPosition(label)` / `setPosition(label, z)` |
+| `wait` / `is_busy` | `waitForDevice(label)` / `deviceBusy(label)` |
+| `Camera.snap` | `snapImage()` then `getImage()` (the core's current camera must be `label`) |
+| `Camera.exposure_ms` / `set_exposure_ms` | `getExposure()` / `setExposure(ms)` |
+| `Camera.image_shape` / `bit_depth` | `getImageHeight()`, `getImageWidth()` / `getImageBitDepth()` |
+| `Camera.pixel_size_um` | `getPixelSizeUm()`, fallback profile map by `objective_label()` |
+| `Shutter.*` | `getShutterOpen(label)`, `setShutterOpen(label, b)`, `getAutoShutter()`, `setAutoShutter(b)` |
+| `Properties.*` | `getLoadedDevices`, `getDevicePropertyNames`, `getProperty`, `setProperty`, `isPropertyReadOnly`, `hasPropertyLimits`, `getPropertyLowerLimit/UpperLimit`, `getAllowedPropertyValues` |
+
+Mutations go through `executor.do(description, action, dry_result=…)`;
+reads through `executor.read(action)`. `objective_label` is a callable
+supplied by the facade (`getStateLabel` of the `objective_turret` role, or
+`lambda: None`).
+
+## 7. Safety and the facade — `safety.py` (#5), `microscope.py` (#8)
+
+```python
+class Safety:
+    # plain arguments, so #5 does not depend on the profile model (#7); the
+    # facade (#8) builds it from profile.safety
+    def __init__(self, *, max_jog_um: float, z_soft_limits_um: tuple[float, float] | None = None,
+                 xy_soft_limits_um: tuple[tuple[float, float], tuple[float, float]] | None = None): ...
+    def check_jog_um(self, dx_um: float, dy_um: float, *, force: bool) -> None
+    def check_xy_target_um(self, x_um: float, y_um: float) -> None
+    def check_z_target_um(self, z_um: float) -> None
+
+class Executor:
+    def __init__(self, *, dry_run: bool, lock: threading.RLock, logger: logging.Logger): ...
+    def do(self, description: str, action: Callable[[], T], *, dry_result: T) -> T
+    def read(self, action: Callable[[], T]) -> T
+    dry_run: bool
+```
+
+`Executor.do` acquires the lock, logs `description` (prefixed `[dry-run]`
+when dry), calls `action()` unless dry-run, and returns its result or
+`dry_result`. Reads always reach the hardware, so a dry-run session shows
+real positions and never moves.
+
+```python
+CAPABILITY_ROLES: dict[type, tuple[Role, ...]] = {
+    XYStage: (Role.xy_stage,), ZStage: (Role.focus,), Camera: (Role.camera,),
+    Shutter: (Role.shutter,), Properties: (),
+}
+
+class Microscope:
+    profile: Profile
+    roles: RoleMap
+    devices: list[DeviceInfo]
+    dry_run: bool
+    core: CMMCorePlus          # escape hatch; using it from a plugin is a review failure
+
+    @classmethod
+    def open(cls, profile: Profile | str | Path = "demo", *, dry_run: bool = False) -> Microscope
+    @classmethod
+    def from_core(cls, core, profile: Profile, *, dry_run: bool = False) -> Microscope   # tests, FakeCore
+    def close(self) -> None
+    def __enter__ / __exit__
+
+    def has(self, capability: type[T]) -> bool
+    def get(self, capability: type[T]) -> T | None
+    def require(self, capability: type[T]) -> T          # CapabilityMissingError
+    def available(self) -> list[type]
+    def override(self, capability: type[T], implementation: T) -> None   # testing hook (synthetic camera)
+
+    def state(self) -> MicroscopeState
+    def describe(self) -> str
+
+@dataclass
+class MicroscopeState:
+    xy: XY | None = None; z_um: float | None = None
+    exposure_ms: float | None = None; image_shape: tuple[int, int] | None = None
+    pixel_size_um: float | None = None; shutter_open: bool | None = None
+    roles: dict[str, str] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)   # "z: <exception>" per failed read
+```
+
+`open()` = `Profile.load` → `open_core(config)` → `setTimeoutMs` →
+`loaded_devices` → `resolve(devices, core_roles=core_roles(core),
+overrides=profile.roles.assign, exclusions=profile.roles.exclude)` → log
+each warning. `require()` builds the capability once from
+`CAPABILITY_ROLES` and caches it; a missing role raises
+`CapabilityMissingError(capability, role, available=roles.assigned)` whose
+message lists what *is* available and points at `[roles.assign]`.
+`close()` unloads all devices (one connection per stand) and is idempotent.
+
+## 8. Testing — `smc/testing/` and `tests/` (#9, #10)
+
+### FakeCore (`smc/testing/fakes.py`)
+
+The subset of the MMCore API the backend uses (§6), with a call `log`,
+per-device positions/state, a property store, `snapImage/getImage` served
+by a `frame_source: Callable[[float, float, float], np.ndarray] | None`,
+and quirk switches (`quirk_z_move_disables_autofocus: bool = True`, kept
+for M2). Construction: `FakeCore.demo_like()` mirrors the demo
+configuration's labels and types so the same tests run on both.
+
+### Fixtures (`smc/testing/fixtures.py`, loaded by `tests/conftest.py`)
+
+`mm_available`, `demo_core`, `demo_microscope` (+ `dry_run` variant),
+`fake_core`, `fake_microscope`, `hardware_microscope` (skips unless
+`--profile` was given; only a human at the stand passes it).
+
+### Contract suite (`tests/contracts/`)
+
+`conftest.py` defines `backend` parametrised over `fake`, `demo`,
+`hardware` (the last skips without `--profile`); `microscope` fixture maps
+it. One file per capability; each test asks `microscope.require(Cap)`.
+Required cases:
+
+- XY: absolute move lands within 0.5 µm; relative move adds; jog above
+  `max_jog_um` raises `SafetyRefusedError` and `force=True` passes; target
+  outside soft limits raises and is not forceable; `wait()` returns;
+  dry-run returns the commanded value and the real position is unchanged.
+- Z: same shape as XY without the jog guard.
+- Camera: `snap()` is 2-D and matches `image_shape()`; exposure round-trips;
+  `pixel_size_um()` is `0.0` or positive, never negative; profile fallback
+  by objective label works on the fake.
+- Shutter: open/close round-trip; auto-shutter round-trip.
+- Properties: `devices()` excludes `Core`; `describe()` lists at least one
+  property per device; read-only properties refuse `set()`.
+- Facade: `require` on a missing role raises `CapabilityMissingError` naming
+  the role; `state()` fills what it can when one device fails
+  (fake raises on Z).
+
+### Synthetic sample (`smc/testing/synthetic.py`, #10)
+
+```python
+@dataclass(frozen=True)
+class Blob: x_um: float; y_um: float; radius_um: float; intensity: float
+
+class PlateSample:
+    def __init__(self, plate: str = "96-well", a1_center_xy_um: tuple[float, float] = (0.0, 0.0),
+                 rotation_deg: float = 0.0, *, well_level: float = 3000.0, plastic_level: float = 800.0,
+                 blobs: Sequence[Blob] = (), texture_std: float = 40.0, noise_std: float = 20.0,
+                 seed: int = 0): ...
+    def render(self, x_um: float, y_um: float, z_um: float, *, shape: tuple[int, int],
+               pixel_size_um: float, camera_rotation_deg: float = 0.0, mirrored: bool = False) -> np.ndarray  # uint16
+
+class SampleCamera:   # implements Camera; snap() renders at the stage's current position
+    def __init__(self, microscope: Microscope, sample: PlateSample, *, pixel_size_um: float, shape=(512, 512)): ...
+```
+
+Well geometry comes from `useq.WellPlatePlan` (never re-derived). Texture
+is deterministic per stage position (hash of the world-space tile), so
+phase correlation between two overlapping frames works. Fixture:
+`demo_microscope_with_sample(sample=…)` calls `microscope.override(Camera,
+SampleCamera(...))`. A test proves the frame mean changes when the stage
+crosses a well wall.
+
+## 9. CLI — `smc/cli.py` (#11)
+
+Global option `--profile/-p NAME_OR_PATH` (default `$SMC_PROFILE` or
+`demo`); `--dry-run` where a command moves something.
+
+| Command | Does |
+|---|---|
+| `smc profiles` | list profiles found on the search paths |
+| `smc doctor [-p]` | (extend) MM status, then open the profile and print `RoleMap.describe()` with candidates and warnings |
+| `smc devices [-p]` | table: label, type, library/name, role |
+| `smc stage get` / `stage move X Y` / `stage jog DX DY [--force]` | `XYStage` |
+| `smc z get` / `z move Z` / `z jog DZ` | `ZStage` |
+| `smc snap [--out frame.tif] [--exposure-ms MS]` | `Camera`; writes 16-bit TIFF via `tifffile` (new dependency) |
+| `smc discover …` | §10 |
+
+Errors print one line (`✗ reason — how to force / fix`) and exit 1;
+`SafetyRefusedError` exits 2. Tests use `typer.testing.CliRunner` on the demo
+profile and on a fake through `SMC_PROFILE`.
+
+## 10. Discover — `smc/discovery/` (#30, pulled into M1)
+
+Read-only survey of a PC, to run on each microscope computer and paste into
+its hardware-session issue:
+
+```
+smc discover                    # text report
+smc discover --json inventory.json
+smc discover --probe-adapter NikonTi2     # opt-in: load each device of ONE adapter in a throwaway core
+```
+
+Sections: **system** (OS, Python, `smc`, `pymmcore-plus`, MM install dir,
+device-interface version; other Micro-Manager installs found on disk and
+*their* DIV); **adapters** (name → devices with type and description, or
+the enumeration error); **serial** (`pyserial` `list_ports`: device,
+VID:PID, manufacturer, description, serial number); **usb / pnp**
+(Windows: `powershell -NoProfile -Command "Get-PnpDevice -PresentOnly |
+Select-Object Status,Class,FriendlyName,InstanceId,Manufacturer |
+ConvertTo-Json"`; macOS: `system_profiler SPUSBDataType -json`; Linux:
+`lsusb`); **pci** (Windows: PnP entries whose `InstanceId` starts with
+`PCI\`; Linux: `lspci -nn`); **hints** (from `vendors.py`: VID/PID and name
+fragments → vendor → adapters that usually drive it, e.g. FTDI serial →
+Märzhäuser/ASI/Sutter candidates; `1B6B` → Photometrics → `PVCAM`;
+`10EE`+`CZMI` → Zeiss MicoIf). Every OS call has a timeout and degrades to
+"not available on this OS"; nothing is loaded into a core unless
+`--probe-adapter` is given. New dependency: `pyserial`.
+
+## 11. Sequencing
+
+| Wave | Issues | Parallel? | Notes |
+|---|---|---|---|
+| 1 | #30 discover · #7 profiles · #6 roles · #5 capabilities + safety + MM backend | yes — separate `git worktree`s | `errors.py` and `Role`/`DeviceInfo` are seeded by the design PR; #5 takes labels from the core's own slots until #8 exists; only #30 touches `cli.py` in wave 1 |
+| 2 | #8 facade | after 5, 6, 7 | wires everything; adds `from_core` and `override` |
+| 3 | #9 FakeCore + fixtures + contracts · #10 synthetic · #11 CLI | after 8, parallel | #11 also extends `doctor`; #10 needs `override()` from #8 |
+
+Each wave-1 executor adds its own tests under `tests/unit/` or against
+`demo_core` and does **not** touch the other wave-1 modules.
+
+## 12. Decided defaults (so nobody re-decides them)
+
+- Profiles are TOML, not YAML; the demo profile exists both as code
+  (`Profile.demo()`) and as `profiles/demo.toml` (loader test).
+- `Camera.snap()` returns the raw MMCore array (no copy, no flip); display
+  orientation is the UI's job with the camera calibration (M3).
+- Dry-run is a property of the `Microscope`, not of individual calls.
+- `Microscope.core` stays public for the CLI and tests; a plugin importing
+  `pymmcore_plus` or touching `.core` fails review.
+- Role names are the ADR-0003 glossary names; `Role` values are also the
+  TOML keys.

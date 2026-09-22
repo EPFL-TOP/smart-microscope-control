@@ -13,7 +13,13 @@ gets microscope time when it gets it.
 
 ## M1 — The stage, on the simulator
 
-The abstraction layer exists and is proven on the demo devices.
+The abstraction layer exists and is proven on the demo devices. Interfaces
+between the issues are fixed in
+[`docs/design/m1-hardware-layer.md`](design/m1-hardware-layer.md).
+
+- `smc discover` (pulled forward from the backlog): read-only inventory of
+  a microscope PC — adapters and their devices, serial VID/PID, USB/PnP,
+  PCI — so the owner can survey every stand while M1 is built.
 
 - Capability protocols: `XYStage`, `ZStage`, `Camera`, `Shutter`,
   `Properties` (Autofocus/Turret/LightSource/Channels follow in M2).
@@ -74,9 +80,8 @@ The abstraction layer exists and is proven on the demo devices.
 
 ## Backlog (any time)
 
-- `smc discover`: OS-level inventory (serial VID/PID, USB, PCI) cross-
-  referenced with installed adapters → suggested profile skeleton. The
-  tool for the LS1 inventory; worth pulling forward.
+- `smc discover` follow-ups: suggested profile skeleton from an inventory;
+  probing every adapter with per-device timeouts.
 - Documentation site (mkdocs-material) from `docs/`.
 - Data output: OME-Zarr writer for acquisitions; OME companion for TIFF
   runs (port from the tracking tool).

@@ -20,8 +20,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from smc.hardware.errors import CoreError
+
 if TYPE_CHECKING:
     from pymmcore_plus import CMMCorePlus
+
+__all__ = [
+    "INSTALL_HINT",
+    "CoreError",
+    "MicroManagerStatus",
+    "close_core",
+    "find_install",
+    "open_core",
+    "opened",
+    "status",
+]
 
 #: What to run when the device adapters are missing. Kept in one place so every
 #: error message and every doc says the same thing.
@@ -30,10 +43,6 @@ INSTALL_HINT = (
     "`mmcore install --test-adapters` for the demo devices (any OS), or "
     "`mmcore install` for a full nightly build (Windows / Intel macOS)."
 )
-
-
-class CoreError(RuntimeError):
-    """Micro-Manager could not be found, or a configuration could not be loaded."""
 
 
 @dataclass(frozen=True)

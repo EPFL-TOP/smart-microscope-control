@@ -6,6 +6,24 @@ control layer over several microscopes, with interchangeable tools. Read
 before changing it (`docs/adr/README.md`). The rules below are the project's
 rules for everyone; you follow them without being reminded.
 
+## Two kinds of session
+
+Work is split between a **design session** and **execution sessions**, and
+the GitHub issue is the contract between them:
+
+- The **design session** owns architecture: ADRs, `docs/design/*.md`, and
+  the plan of every issue (`/plan`). It reviews every PR (`/review`). It
+  does not implement.
+- An **execution session** (a fresh Claude Code session, any model) takes
+  **one** issue labelled `status: ready`, implements exactly its plan,
+  verifies, opens the PR and reports back on the issue (`/develop`). It
+  never redesigns: a plan that does not survive contact with reality comes
+  back as a `## Plan deviation` comment.
+- The **owner** decides ADRs, merges PRs and runs hardware sessions.
+
+Parallel execution sessions work in separate `git worktree`s and never
+touch the same modules — the design doc fixes the interfaces between them.
+
 ## Workflow: issue → plan → branch → implement → verify → PR
 
 1. **Start from an issue.** If none exists, create one with the matching
@@ -93,9 +111,12 @@ turned into code, a profile entry, a test or a doc line.
 
 ## Skills
 
-`/feature` issue→PR workflow · `/new-plugin` scaffold a tool ·
-`/new-backend` scaffold a hardware bridge · `/hardware-session` prepare and
-report a session · `/adr` propose a decision.
+Design session: `/plan <issue>` write the executable plan · `/review <pr>`
+review against plan, architecture and tests · `/adr` propose a decision ·
+`/hardware-session` prepare and write up a session at a stand.
+Execution session: `/develop <issue>` implement one planned issue to a PR.
+Scaffolds: `/new-plugin`, `/new-backend`. Shortcut: `/feature` (plan +
+develop in one session, small issues only).
 
 ## Language
 
