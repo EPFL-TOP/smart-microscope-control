@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.env
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+coverage.xml
+htmlcov/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Claude Code: personal permission overrides stay local
+.claude/settings.local.json
+
+# Experimental data and model weights are never committed
+/data/
+*.nd2
+*.czi
+*.tif
+*.tiff
+*.zarr/
+*.pth
+*.pt
+*.ckpt
+
+# Micro-Manager logs and per-machine configs (profiles/ are committed; site
+# .cfg files that embed COM ports and serial numbers are not)
+CoreLog*.txt
+/local/
