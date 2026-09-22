@@ -27,6 +27,16 @@ smc doctor && pytest
 5. **Pull request** with the template. Title in Conventional Commits form
    (`feat(core): …`). One reviewer. Squash merge by the maintainer.
 
+## Design sessions and execution sessions
+
+Issues move through three hands. A **design session** writes the plan
+(`/plan`, fixed format, links `docs/design/`) and sets `status: ready`. An
+**execution session** — a fresh session, human or agent — takes one ready
+issue, implements only its plan, verifies, opens the PR and posts a
+`## Report` (`/develop`). The design session reviews (`/review`); the
+**owner** merges. Parallel executions use separate `git worktree`s. Labels
+tell you where an issue is: `ready` → `in-progress` → `in-review`.
+
 ## Commit messages
 
 `type(scope): summary` — types `feat fix docs test chore refactor perf ci`;

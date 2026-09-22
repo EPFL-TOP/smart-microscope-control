@@ -1,31 +1,17 @@
 ---
 name: feature
-description: Take a GitHub issue from plan to pull request in this repository — plan in the issue, branch, implement test-first against the demo devices, verify, open the PR. Use for any feature, fix or port. Argument: the issue number.
+description: Single-session shortcut that runs /plan then /develop on one issue when no separate execution session is available. Prefer the split (design session plans and reviews; a clean session develops) for anything non-trivial. Argument: the issue number.
 ---
 
 # /feature <issue-number>
 
-Follow `CLAUDE.md`. Steps, in order; do not skip the verification.
+The project's normal loop is **/plan** (design session) → **/develop**
+(clean execution session) → **/review** (design session) → owner merges.
+Use this shortcut only for small, self-contained issues where a hand-off
+costs more than it saves.
 
-1. **Read the issue**: `gh issue view $ARGUMENTS --comments`. Read the ADRs
-   it links. If acceptance criteria are missing or ambiguous, propose them
-   in a comment and ask the owner before coding.
-2. **Plan in the issue** (`gh issue comment $ARGUMENTS --body-file …`):
-   3–10 bullet steps, files touched, tests that prove it, whether hardware
-   is needed. Mark the issue `status: in-progress`.
-3. **Branch**: `git switch -c feat/$ARGUMENTS-<slug>` from an up-to-date
-   `main`.
-4. **Implement test-first**. Simulator tests use the `demo_core` /
-   `demo_microscope` fixtures; pure algorithms get unit tests (use
-   `hypothesis` for invariants); vendor quirks get a `FakeCore` test. When
-   porting from `../nikon-control` or `../lightsheet-live-tracking-tool`,
-   carry the tests and the *why* docstrings over.
-5. **Verify**: `ruff check . && ruff format --check . && mypy && pytest`.
-   Fix root causes. Run `smc doctor` if `smc.hardware` changed.
-6. **Docs**: docstrings, `docs/` page or ADR if a decision changed,
-   `docs/hardware/inventory.md` if new stand knowledge appeared.
-7. **Commit** with conventional messages; **push** the branch; **open the
-   PR** with `gh pr create --fill --body-file` using
-   `.github/PULL_REQUEST_TEMPLATE.md`, `Closes #$ARGUMENTS`, and an honest
-   "How it was verified". Never merge.
-8. Report to the owner: what landed, what was verified, what was not.
+1. Run the steps of `/plan $ARGUMENTS`; post the plan comment.
+2. Run the steps of `/develop $ARGUMENTS` in the same session, including
+   the Report comment and the PR.
+3. Tell the owner the PR is open and that it was planned and built in one
+   session — so they review it more carefully than a split-session PR.

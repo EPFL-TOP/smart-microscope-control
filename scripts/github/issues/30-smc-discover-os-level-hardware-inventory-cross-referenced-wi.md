@@ -1,6 +1,7 @@
 ---
 title: feat(discovery): smc discover — OS-level hardware inventory cross-referenced with Micro-Manager adapters
-labels: [type: feature, area: core, priority: p2]
+labels: [type: feature, area: core, priority: p0]
+milestone: M1 — Stage on the simulator
 ---
 ## Goal
 Find out what is plugged into this PC without tracing cables: serial ports with VID/PID (pyserial), USB devices (Windows PnP / `system_profiler` / `lsusb`), PCI cards (the Zeiss `MicoIf` FPGA, Photometrics PCIe), cross-referenced with a small vendor table and the installed adapters → an inventory JSON and a suggested profile skeleton, with probes (load one device in a throwaway core) to confirm.
