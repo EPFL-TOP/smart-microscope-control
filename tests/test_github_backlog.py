@@ -33,9 +33,13 @@ def bootstrap():
 
 
 def test_every_issue_parses_and_uses_known_labels_and_milestones(bootstrap) -> None:
-    labels = {lab["name"] for lab in json.loads((GH / "labels.json").read_text())}
+    labels = {
+        lab["name"]
+        for lab in json.loads((GH / "labels.json").read_text(encoding="utf-8"))
+    }
     milestones = {
-        ms["title"] for ms in json.loads((GH / "milestones.json").read_text())
+        ms["title"]
+        for ms in json.loads((GH / "milestones.json").read_text(encoding="utf-8"))
     }
     files = sorted((GH / "issues").glob("*.md"))
     assert len(files) >= 20

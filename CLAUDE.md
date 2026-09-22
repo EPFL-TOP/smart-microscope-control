@@ -57,7 +57,8 @@ rules for everyone; you follow them without being reminded.
 - Results and parameters are `pydantic` models; geometry uses `useq` types
   rather than re-deriving plate arithmetic.
 - Windows is a first-class target: `pathlib`, no shell-isms, ASCII-only in
-  `.ps1`/`.bat`.
+  `.ps1`/`.bat`, and **always `encoding="utf-8"`** when reading or writing
+  text (Windows decodes with cp1252 by default; ruff `PLW1514` enforces it).
 - Tests are named for the behaviour or the failure they prevent
   (`test_moving_z_re_engages_pfs`).
 

@@ -58,7 +58,7 @@ that is what a microscope PC needs.
 | Nikon Ti2-E | Micro-Manager `NikonTi2` + camera adapter | next (knowledge carried over from `nikon-control`) |
 | Nikon Ti-E | Micro-Manager `NikonTI` | after Ti2; same roles, different adapter |
 | Zeiss Axio Observer 7 | Micro-Manager `PVCAM` camera + Zeiss MTB 2011 as Python devices ([ADR-0007](docs/adr/0007-non-micromanager-hardware.md)) | proposed |
-| Viventis LS1 (×2) | PyMCS — to be inventoried | later |
+| Viventis LS1 (×2) | Direct control of its components (Micro-Manager adapters or Python devices), never through the vendor's PyMCS; on-site inventory first ([ADR-0007](docs/adr/0007-non-micromanager-hardware.md)) | later |
 
 What is known about each stand (adapters, DLLs, power-on order, quirks that
 cost days) is collected in [`docs/hardware/inventory.md`](docs/hardware/inventory.md).

@@ -72,6 +72,13 @@ target-version = "py310"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
+# Preview is on only so that individually selected preview rules (PLW1514)
+# apply; rule *groups* stay on their stable members.
+preview = true
+explicit-preview-rules = true
+# Stage units are written µm (MICRO SIGN) throughout; do not flag it as a
+# confusable for the Greek mu.
+allowed-confusables = ["µ"]
 select = [
   "E", "W",   # pycodestyle
   "F",        # pyflakes
@@ -83,6 +90,7 @@ select = [
   "RUF",      # ruff-specific
   "PT",       # pytest style
   "T20",      # no print in library code (tests/scripts are exempt below)
+  "PLW1514",  # open()/read_text() without encoding= — Windows decodes with cp1252
   "D",        # docstrings — public API must say *why*, not just *what*
 ]
 ignore = [

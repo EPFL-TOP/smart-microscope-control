@@ -56,20 +56,32 @@ The abstraction layer exists and is proven on the demo devices.
 
 ## M5 — Web UI
 
-- Per ADR-0006: connect to a profile, drive, snap/live, run plugins from
-  generated forms, show the run document. Deployable as a service.
+- Framework spike per ADR-0006: the same minimal shell in Panel and in
+  NiceGUI on the demo devices; the owner decides by looking.
+- The shell: connect, status strip with Stop, live view, drive, tools rail
+  grouped by workflow stage, generated plugin forms, run document as a
+  checklist. Identical on every microscope; deployable as a service.
 
-## M6 — Viventis LS1
+## M6 — Viventis LS1 (×2)
 
-- PyMCS API inventory → decision → backend (unicore devices, direct, or
-  file-ingest + position nudge as today).
+- On-site inventory of both stands' **components** — controllers, cameras,
+  lasers, scan mirrors, filter changers, piezo, timing hardware — as seen by
+  the OS and by the vendor's configuration; map each to a Micro-Manager
+  adapter or a unicore device; identify what performs the light-sheet
+  timing (ADR-0007). PyMCS is a reference, not a route.
+- Short follow-up ADR fixing the scope (full control vs stage+camera
+  first), then `.cfg`, profile, contract tests, hardware session.
 
 ## Backlog (any time)
 
 - `smc discover`: OS-level inventory (serial VID/PID, USB, PCI) cross-
-  referenced with installed adapters → suggested profile skeleton.
+  referenced with installed adapters → suggested profile skeleton. The
+  tool for the LS1 inventory; worth pulling forward.
 - Documentation site (mkdocs-material) from `docs/`.
 - Data output: OME-Zarr writer for acquisitions; OME companion for TIFF
   runs (port from the tracking tool).
-- Closed-loop tracking plugin over the run loop (port of the tracking
-  runner) — the "smart" in smart microscopy.
+- Closed-loop tracking plugin over the run loop — `lightsheet-live-
+  tracking-tool` becomes this plugin; its microscope backends are
+  superseded by the capability layer.
+- Laser ablation patterns plugin (port of `viventis_control`'s point
+  patterns) once the LS1's components are reachable.

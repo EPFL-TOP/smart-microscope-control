@@ -102,11 +102,21 @@ New findings arrive as *Hardware session report* issues and land here.
 
 ## Viventis LS1 (×2)
 
-- Vendor control software with a Python API, **PyMCS**; scripts run inside
-  it. The tracking tool's `MicroscopeInterface_LS1` reads frames from the
-  acquisition folder (`t{NNNN}_{channel}.tif` per position) and applies
-  relative moves through PyMCS.
-- Not on PyPI; Windows PC only. **Unknown**: what PyMCS exposes for direct
-  stage/camera control outside a running acquisition → first issue for M6.
-- One timepoint is ~1 GB; OME companion files (never rewriting pixels) are
-  the way to present a run as a 5-D series.
+- Vendor control software with a scripting API, **PyMCS** (`Microscope`,
+  `StageXYZ`, `Camera`, `TimeLapseController`, `AcquisitionController`;
+  installed at `C:\Viventis\PyMCS\v2.0.0.2`). The tracking tool and
+  `viventis_control` run *inside* it. **Not our route** (ADR-0007): the
+  LS1s are to be driven through their components, like every other stand.
+- **Components: unknown until inventoried on site**, for both stands
+  (they may differ). Expected classes: XYZ stage controller, one or two
+  sCMOS cameras, laser combiner, scan mirrors (galvo), filter changers,
+  piezo, and a DAQ/FPGA doing sweep/exposure/laser timing. The timing
+  controller is the feasibility question.
+- Inventory sources: Windows Device Manager / `Get-PnpDevice`, COM ports
+  with VID/PID, PCI cards (the tracking tool's
+  `tools/audit_windows_hardware.ps1` is a starting point), the vendor's
+  configuration files under `C:\Viventis\`, and the acquisition metadata
+  it writes.
+- Frame layout written by the vendor software: `t{NNNN}_{channel}.tif` per
+  position; one timepoint ≈ 1 GB; OME companion files present a run as a
+  5-D series without rewriting pixels.
