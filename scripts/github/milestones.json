@@ -1,0 +1,9 @@
+[
+  {"title": "M0 — Bootstrap",               "description": "Package, CLI, simulator tests, CI, ADRs, backlog. Owner decisions on ADR-0006/0007 and branch protection."},
+  {"title": "M1 — Stage on the simulator",  "description": "Capability protocols, role resolution, profiles, Microscope facade with safety policy, contract tests — all proven on the demo devices."},
+  {"title": "M2 — Nikon on hardware",       "description": "Nikon Ti2-E then Ti-E driven through the new layer: stand knowledge ported, Autofocus/Turret/Light capabilities, config builder, first hardware sessions."},
+  {"title": "M3 — Plate tools as plugins",  "description": "Plugin API and run document; plate registration, automatic plate finding, wells + field grid, camera↔stage calibration, object detection, timing."},
+  {"title": "M4 — Zeiss Axio Observer 7",   "description": "MTB session owner, unicore Python devices, Definite Focus 2, PVCAM camera in one core; hardware session."},
+  {"title": "M5 — Web UI",                  "description": "Per ADR-0006: connect, drive, snap/live, run plugins from generated forms, show the run document; deployable as a service."},
+  {"title": "M6 — Viventis LS1",            "description": "PyMCS inventory, integration decision, backend."}
+]

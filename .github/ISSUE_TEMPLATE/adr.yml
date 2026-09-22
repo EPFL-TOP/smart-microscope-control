@@ -1,0 +1,27 @@
+name: Architecture decision
+description: Propose or request a decision that shapes the project (recorded as an ADR).
+title: "adr: "
+labels: ["type: adr", "status: needs-decision"]
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Decision to make
+    validations:
+      required: true
+  - type: textarea
+    id: options
+    attributes:
+      label: Options considered
+      description: For each — pros, cons, what it would cost to reverse later.
+    validations:
+      required: true
+  - type: textarea
+    id: recommendation
+    attributes:
+      label: Recommendation
+  - type: input
+    id: adr
+    attributes:
+      label: ADR file
+      placeholder: docs/adr/00NN-title.md

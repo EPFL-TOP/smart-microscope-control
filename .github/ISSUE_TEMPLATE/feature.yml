@@ -1,0 +1,40 @@
+name: Feature
+description: A capability, plugin, backend or tool to add.
+title: "feat: "
+labels: ["type: feature"]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What will a user be able to do afterwards? One paragraph.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Which microscope(s), which layer (core / plugin / backend / UI), links to ADRs or prior code.
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Checkable statements. Include the test that proves it (simulator test, contract test, hardware session).
+      value: |
+        - [ ]
+        - [ ] Works against the demo devices (`pytest`)
+        - [ ] Documented (docstrings + docs/ where relevant)
+    validations:
+      required: true
+  - type: textarea
+    id: plan
+    attributes:
+      label: Plan (filled in before implementation)
+      description: Steps and files. Written by whoever picks the issue up, reviewed before coding starts.
+  - type: dropdown
+    id: hardware
+    attributes:
+      label: Needs real hardware to finish?
+      options: ["No — simulator is enough", "Yes — needs a hardware session"]
+    validations:
+      required: true

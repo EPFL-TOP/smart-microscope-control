@@ -1,0 +1,35 @@
+[
+  {"name": "type: feature",          "color": "1D76DB", "description": "A capability, plugin, backend or tool to add"},
+  {"name": "type: bug",              "color": "D73A4A", "description": "Something behaves wrongly"},
+  {"name": "type: docs",             "color": "0075CA", "description": "Documentation only"},
+  {"name": "type: chore",            "color": "BFD4F2", "description": "Tooling, CI, repository housekeeping"},
+  {"name": "type: test",             "color": "C5DEF5", "description": "Tests and test infrastructure"},
+  {"name": "type: adr",              "color": "5319E7", "description": "An architecture decision to make or record"},
+  {"name": "type: hardware-session", "color": "E99695", "description": "Report of a session at a real microscope"},
+  {"name": "type: spike",            "color": "FEF2C0", "description": "Time-boxed investigation; output is knowledge, not code"},
+
+  {"name": "area: core",     "color": "0E8A16", "description": "smc.hardware — bus, capabilities, roles, facade, profiles"},
+  {"name": "area: plugins",  "color": "5DBB63", "description": "smc.plugins and the run document"},
+  {"name": "area: backend",  "color": "9BE39F", "description": "A hardware bridge for a specific vendor"},
+  {"name": "area: cli",      "color": "C2E0C6", "description": "The smc command line"},
+  {"name": "area: ui",       "color": "D4C5F9", "description": "Graphical / web interface"},
+  {"name": "area: ci",       "color": "EDEDED", "description": "GitHub Actions, pre-commit, packaging"},
+  {"name": "area: docs",     "color": "F9D0C4", "description": "docs/, README, ADRs"},
+
+  {"name": "scope: demo",            "color": "FBCA04", "description": "Micro-Manager demo devices"},
+  {"name": "scope: nikon-ti2",       "color": "FBCA04", "description": "Nikon Ti2-E"},
+  {"name": "scope: nikon-tie",       "color": "FBCA04", "description": "Nikon Ti-E"},
+  {"name": "scope: zeiss-observer7", "color": "FBCA04", "description": "Zeiss Axio Observer 7"},
+  {"name": "scope: viventis-ls1",    "color": "FBCA04", "description": "Viventis LS1"},
+
+  {"name": "status: needs-decision", "color": "B60205", "description": "Blocked on a decision by the project owner"},
+  {"name": "status: needs-hardware", "color": "E4E669", "description": "Cannot be finished without a session at the microscope"},
+  {"name": "status: blocked",        "color": "000000", "description": "Blocked on another issue"},
+  {"name": "status: in-progress",    "color": "0052CC", "description": "Someone is on it"},
+
+  {"name": "priority: p0", "color": "B60205", "description": "Blocks the next milestone"},
+  {"name": "priority: p1", "color": "D93F0B", "description": "Needed for the milestone"},
+  {"name": "priority: p2", "color": "FBCA04", "description": "Nice to have"},
+
+  {"name": "good first issue", "color": "7057FF", "description": "Self-contained; good for a newcomer"}
+]

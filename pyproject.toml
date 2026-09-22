@@ -1,0 +1,140 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "smart-microscope-control"
+version = "0.0.1"
+description = "Vendor-agnostic microscope control with interchangeable tools (plugins), built on Micro-Manager / pymmcore-plus."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "EPFL UPOATES lab" }]
+keywords = ["microscopy", "micro-manager", "pymmcore-plus", "automation", "smart-microscopy"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Scientific/Engineering",
+]
+dependencies = [
+  # The hardware bus. [cli] provides `mmcore install`, which fetches the
+  # Micro-Manager device adapters (or the demo adapters on unsupported hosts).
+  "pymmcore-plus[cli]>=0.18,<0.20",
+  # The ecosystem's acquisition description: MDASequence, WellPlatePlan, grids.
+  "useq-schema>=0.9",
+  "numpy>=1.26",
+  "pydantic>=2.7",
+  "typer>=0.12",
+  "rich>=13",
+  # TOML profiles on Python 3.10 (tomllib is stdlib from 3.11).
+  "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-cov>=5",
+  "hypothesis>=6",
+  "ruff>=0.6",
+  "mypy>=1.10",
+  "pre-commit>=3.7",
+]
+# Zeiss stands reached through Zeiss MTB 2011 (.NET) — Windows only.
+zeiss = ["pythonnet>=3.0; sys_platform == 'win32'"]
+# User interface extra: populated once ADR-0006 is accepted.
+ui = []
+
+[project.scripts]
+smc = "smc.cli:app"
+
+# Plugins register here (see ADR-0004). Third-party packages can add their own.
+[project.entry-points."smc.plugins"]
+
+[project.urls]
+Homepage = "https://github.com/EPFL-TOP/smart-microscope-control"
+Issues = "https://github.com/EPFL-TOP/smart-microscope-control/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/smc"]
+
+# ----------------------------------------------------------------------------
+# Lint / format
+# ----------------------------------------------------------------------------
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+  "E", "W",   # pycodestyle
+  "F",        # pyflakes
+  "I",        # isort
+  "UP",       # pyupgrade
+  "B",        # bugbear
+  "SIM",      # simplify
+  "N",        # pep8-naming
+  "RUF",      # ruff-specific
+  "PT",       # pytest style
+  "T20",      # no print in library code (tests/scripts are exempt below)
+  "D",        # docstrings — public API must say *why*, not just *what*
+]
+ignore = [
+  "D100", "D104",   # module / package docstrings are optional
+  "D105", "D107",   # magic methods / __init__ need no docstring
+  "D203", "D213",   # incompatible with D211 / D212 (Google style)
+  "E501",           # the formatter owns line length
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D", "T20", "S101"]
+"scripts/**" = ["D", "T20"]
+"src/smc/cli.py" = ["T20"]   # the CLI is allowed to talk
+
+[tool.ruff.format]
+docstring-code-format = true
+
+# ----------------------------------------------------------------------------
+# Types
+# ----------------------------------------------------------------------------
+[tool.mypy]
+# No python_version pin: numpy's stubs use 3.12 syntax, and CI runs mypy on 3.12.
+files = ["src/smc"]
+strict = true
+warn_unreachable = true
+pretty = true
+# Upstream packages without complete stubs.
+[[tool.mypy.overrides]]
+module = ["pymmcore.*", "pymmcore_plus.*", "useq.*"]
+ignore_missing_imports = true
+follow_untyped_imports = true
+
+# ----------------------------------------------------------------------------
+# Tests
+# ----------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Hardware tests are opt-in: `pytest -m hardware --profile nikon-ti2` at the scope.
+addopts = "-ra -m 'not hardware'"
+markers = [
+  "hardware: needs a real microscope; deselected by default (see ADR-0005)",
+  "demo: runs against Micro-Manager's demo devices (needs `mmcore install`)",
+]
+filterwarnings = ["error::DeprecationWarning:smc.*"]
+
+[tool.coverage.run]
+source = ["smc"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

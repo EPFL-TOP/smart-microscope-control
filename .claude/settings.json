@@ -1,0 +1,56 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/bin/pytest:*)",
+      "Bash(pytest:*)",
+      "Bash(.venv/bin/ruff:*)",
+      "Bash(ruff:*)",
+      "Bash(.venv/bin/mypy:*)",
+      "Bash(mypy:*)",
+      "Bash(.venv/bin/smc:*)",
+      "Bash(smc:*)",
+      "Bash(.venv/bin/python:*)",
+      "Bash(pre-commit:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git branch:*)",
+      "Bash(git switch:*)",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(gh issue:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr list:*)",
+      "Bash(gh pr checks:*)",
+      "Bash(gh pr diff:*)",
+      "Bash(gh label list:*)",
+      "Bash(gh run list:*)",
+      "Bash(gh run view:*)",
+      "WebFetch(domain:pymmcore-plus.github.io)",
+      "WebFetch(domain:micro-manager.org)",
+      "WebFetch(domain:forum.image.sc)",
+      "WebFetch(domain:github.com)"
+    ],
+    "deny": [
+      "Bash(pytest -m hardware:*)",
+      "Bash(.venv/bin/pytest -m hardware:*)",
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(gh pr merge:*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/scripts/hooks/format_python.py\""
+          }
+        ]
+      }
+    ]
+  }
+}

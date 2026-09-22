@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Architecture decisions (ADRs)
+    url: https://github.com/EPFL-TOP/smart-microscope-control/tree/main/docs/adr
+    about: Read accepted and proposed decisions before proposing a change of direction.
