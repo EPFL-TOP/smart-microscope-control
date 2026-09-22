@@ -1,0 +1,52 @@
+name: Hardware session report
+description: Record what was tried at a real microscope and what was learned.
+title: "hw: <microscope> — <date> — <goal>"
+labels: ["type: hardware-session"]
+body:
+  - type: dropdown
+    id: microscope
+    attributes:
+      label: Microscope
+      options: ["Nikon Ti2", "Nikon Ti-E", "Zeiss Axio Observer 7", "Viventis LS1"]
+    validations:
+      required: true
+  - type: input
+    id: date
+    attributes:
+      label: Date
+      placeholder: "2026-09-22"
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal of the session
+      description: Which issue(s) this session was meant to unblock.
+    validations:
+      required: true
+  - type: textarea
+    id: preflight
+    attributes:
+      label: Pre-flight
+      value: |
+        - [ ] Vendor software closed (NIS-Elements / ZEN / …)
+        - [ ] `smc doctor --config <cfg>` passes
+        - [ ] Objective / clearance checked before any Z or turret move
+        - [ ] Commit hash:
+  - type: textarea
+    id: log
+    attributes:
+      label: What was done, what happened
+      description: Commands and outputs. Paste raw; the value is in the detail.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: learned
+    attributes:
+      label: What we learned / gotchas
+      description: Anything the next person must know. Each item should become code, a test, a profile entry or a doc line.
+  - type: textarea
+    id: followups
+    attributes:
+      label: Follow-up issues
