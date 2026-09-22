@@ -21,8 +21,12 @@ the GitHub issue is the contract between them:
   back as a `## Plan deviation` comment.
 - The **owner** decides ADRs, merges PRs and runs hardware sessions.
 
-Parallel execution sessions work in separate `git worktree`s and never
-touch the same modules — the design doc fixes the interfaces between them.
+Every execution session works in its **own worktree** (Claude Code's
+`EnterWorktree`, under `.claude/worktrees/`) with its **own `.venv`**
+(`python scripts/dev/worktree.py setup`) — the main checkout's venv is an
+editable install of the main checkout's code. Parallel sessions never touch
+the same modules; the design doc fixes the interfaces between them. The
+design session stays in the main checkout.
 
 ## Workflow: issue → plan → branch → implement → verify → PR
 
