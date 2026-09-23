@@ -45,6 +45,7 @@ dev = [
   "hypothesis>=6",
   "ruff>=0.6",
   "mypy>=1.10",
+  "types-pyserial>=3.5",
   "pre-commit>=3.7",
 ]
 # Zeiss stands reached through Zeiss MTB 2011 (.NET) — Windows only.
