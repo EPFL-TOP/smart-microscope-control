@@ -9,6 +9,7 @@ device names a survey collects (#42). The text report is plain (no colour,
 from __future__ import annotations
 
 import io
+import tempfile
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -19,7 +20,14 @@ from rich.text import Text
 
 from smc.discovery.models import DeviceEntry, Inventory
 
-__all__ = ["JSON_NAME", "TEXT_NAME", "render_text", "renderables", "write"]
+__all__ = [
+    "JSON_NAME",
+    "TEXT_NAME",
+    "prepare",
+    "render_text",
+    "renderables",
+    "write",
+]
 
 JSON_NAME = "inventory.json"
 TEXT_NAME = "inventory.txt"
@@ -156,6 +164,20 @@ def render_text(inv: Inventory) -> str:
         console.print(item)
     # Tables pad every cell to the column width; the file needs no padding.
     return "".join(line.rstrip() + "\n" for line in buffer.getvalue().splitlines())
+
+
+def prepare(out_dir: Path) -> None:
+    """Create ``out_dir`` and prove a file can be written there.
+
+    Called before the survey, so a typo or a read-only share fails in one
+    line before minutes of adapter loading rather than after.
+
+    Raises:
+        OSError: When the folder cannot be created or written to.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryFile(dir=out_dir):
+        pass
 
 
 def write(inv: Inventory, out_dir: Path) -> tuple[Path, Path]:

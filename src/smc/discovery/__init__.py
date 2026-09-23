@@ -47,6 +47,9 @@ def inventory(
 
     if include_os:
         inv.serial, inv.usb, inv.pci = os_inventory.os_sections(inv.notes)
+    else:
+        # An empty section must not read as "no devices on this PC".
+        inv.notes.append("os: serial, USB / PnP and PCI not collected (--no-os)")
     hinted = apply_hints(inv)
 
     if system.mm_install is None:

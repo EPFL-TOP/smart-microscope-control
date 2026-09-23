@@ -8,6 +8,7 @@ is scriptable, testable and works over SSH to a microscope PC.
 from __future__ import annotations
 
 import codecs
+import math
 import platform
 import sys
 from pathlib import Path
@@ -152,7 +153,12 @@ def discover(
     ] = None,
     timeout_s: Annotated[
         float,
-        typer.Option("--timeout-s", help="How long the adapter child process may run."),
+        typer.Option(
+            "--timeout-s",
+            min=1.0,
+            max=3600.0,
+            help="How long the adapter child process may run (1-3600 s).",
+        ),
     ] = 180.0,
     no_os: Annotated[
         bool, typer.Option("--no-os", help="Skip serial, USB / PnP and PCI.")
@@ -167,6 +173,19 @@ def discover(
     from smc.discovery import inventory
     from smc.discovery import report as report_mod
 
+    if not math.isfinite(timeout_s):  # click's range check lets nan through
+        console.print(
+            f"[red]✗[/red] --timeout-s must be a number of seconds, not {timeout_s}"
+        )
+        raise typer.Exit(code=2)
+    # --out is checked before the survey and written before the report is
+    # printed: a broken pipe or Ctrl-C while printing must not lose the files.
+    if out is not None:
+        try:
+            report_mod.prepare(out)
+        except OSError as exc:
+            console.print(f"[red]✗[/red] cannot write to {out}: {exc}")
+            raise typer.Exit(code=1) from None
     if probe_adapter:
         console.print(
             f"[yellow]![/yellow] Probing {probe_adapter}: the stand must be "
@@ -179,10 +198,17 @@ def discover(
             include_os=not no_os,
             timeout_s=timeout_s,
         )
+    written: tuple[Path, Path] | None = None
+    if out is not None:
+        try:
+            written = report_mod.write(inv, out)
+        except OSError as exc:
+            console.print(f"[red]✗[/red] could not write the survey to {out}: {exc}")
+            raise typer.Exit(code=1) from None
     for item in report_mod.renderables(inv):
         console.print(item)
-    if out is not None:
-        json_path, text_path = report_mod.write(inv, out)
+    if written is not None:
+        json_path, text_path = written
         console.print(f"[green]✓[/green] wrote {json_path} and {text_path.name}")
 
 
