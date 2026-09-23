@@ -21,6 +21,12 @@ implements dry-run. In dry-run, mutations are logged and skipped, but
 *reads still reach the hardware*: a dry-run session shows the real stage
 position and never moves it.
 
+* **No action while something moves** (design §13). The ``Executor`` keeps
+  a registry of the motions the layer started; a mutation or an acquisition
+  is refused until each of them reports idle. Waits take the lock for each
+  poll only, stops never take it, and every wait that gives up sends the
+  stop first.
+
 This module is pure: it imports no Micro-Manager code.
 """
 
@@ -29,12 +35,23 @@ from __future__ import annotations
 import logging
 import math
 import threading
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import TypeVar
 
-from smc.hardware.errors import SafetyRefusedError
+from smc.hardware.errors import (
+    DeviceTimeoutError,
+    HardwareError,
+    MicroscopeBusyError,
+    MicroscopeHaltedError,
+    MotionInProgressError,
+    MotionStoppedError,
+    SafetyRefusedError,
+)
 
-__all__ = ["Executor", "Safety"]
+__all__ = ["POLL_INTERVAL_S", "Executor", "Motion", "Safety"]
 
 T = TypeVar("T")
 
@@ -134,37 +151,340 @@ class Safety:
             )
 
 
+#: How often a wait asks the device whether it is still busy.
+POLL_INTERVAL_S = 0.01
+
+
+@dataclass(frozen=True, slots=True)
+class Motion:
+    """A device the layer sets moving, as the ``Executor`` sees it (design §13).
+
+    The backend builds it from its device calls; the ``Executor`` needs only
+    these callables, which keeps this module free of Micro-Manager code.
+    """
+
+    device: str  # registry key: the device label
+    name: str  # for messages: "xy_stage XY", "z Z", "Dichroic"
+    is_busy: Callable[[], bool]
+    stop: Callable[[], None] | None  # None: cannot be stopped (a State device)
+
+
+@dataclass
+class _MotionState:
+    """One registered motion. Its flags change only under the registry lock."""
+
+    motion: Motion
+    #: A stop was issued while it was registered: its waiter must not report
+    #: an arrival, because the move did not complete.
+    stopped: bool = False
+    #: A stop reached the device without raising: an unreadable busy state no
+    #: longer locks the stand (FM-19).
+    stop_sent: bool = False
+
+
 class Executor:
     """Runs every backend call under the microscope's lock, honouring dry-run.
 
     One ``RLock`` per microscope makes the capabilities safe to call from a
     UI thread and a worker at once (they stay sequential); re-entrant, so a
-    mutation can read its own readback and wait for its device inside the
-    same critical section.
+    mutation can check, command and read its own state in one critical
+    section. The lock is held for checks and commands, never for the wait
+    that follows a move: a plate traverse must not block readers or a stop
+    (FM-16).
+
+    The motion registry has its own small lock. Lock order: a thread holding
+    the microscope lock may take the registry lock, never the other way
+    round, and no device call is made while the registry lock is held.
     """
 
     def __init__(
-        self, *, dry_run: bool, lock: threading.RLock, logger: logging.Logger
+        self,
+        *,
+        dry_run: bool,
+        lock: threading.RLock,
+        logger: logging.Logger,
+        lock_timeout_s: float = 60.0,
     ) -> None:
+        if not math.isfinite(lock_timeout_s) or lock_timeout_s <= 0:
+            # nan would make acquire() raise, inf would wait for ever (FM-32).
+            raise ValueError(
+                f"lock_timeout_s must be finite and > 0, got {lock_timeout_s!r}"
+            )
         self._dry_run = dry_run
         self._lock = lock
         self._logger = logger
+        self._lock_timeout_s = float(lock_timeout_s)
+        self._registry: dict[str, _MotionState] = {}
+        self._registry_lock = threading.Lock()
+        self._halted = False
+        # Who holds the microscope lock, for MicroscopeBusyError. Written only
+        # by the thread that owns the lock, at its outermost acquisition.
+        self._holder: tuple[str, float] | None = None
+        self._depth = 0
 
     @property
     def dry_run(self) -> bool:
         """Whether mutations are skipped; fixed at construction."""
         return self._dry_run
 
-    def do(self, description: str, action: Callable[[], T], *, dry_result: T) -> T:
-        """Log and perform a mutation; in dry-run, log it and return ``dry_result``."""
-        with self._lock:
+    @property
+    def halted(self) -> bool:
+        """Whether mutations and acquisitions are refused until ``resume()``."""
+        return self._halted
+
+    @contextmanager
+    def _locked(self, description: str) -> Iterator[None]:
+        """Hold the microscope lock, giving up after ``lock_timeout_s`` (FM-15)."""
+        if not self._lock.acquire(timeout=self._lock_timeout_s):
+            holder = self._holder
+            if holder is None:
+                # Released just now, or held by a caller outside the Executor.
+                raise MicroscopeBusyError("an unknown caller", self._lock_timeout_s)
+            what, since = holder
+            raise MicroscopeBusyError(what, time.monotonic() - since)
+        try:
+            self._depth += 1
+            if self._depth == 1:
+                self._holder = (description, time.monotonic())
+            yield
+        finally:
+            self._depth -= 1
+            if self._depth == 0:
+                self._holder = None
+            self._lock.release()
+
+    def do(
+        self,
+        description: str,
+        action: Callable[[], T],
+        *,
+        dry_result: T,
+        motion: Motion | None = None,
+    ) -> T:
+        """Log and perform a mutation; in dry-run, log it and return ``dry_result``.
+
+        With ``motion``, the device is registered as moving before the
+        command is sent, so the guard knows about it even if the command is
+        interrupted, and a command that raises sends the stop (FM-17).
+
+        Raises:
+            MicroscopeHaltedError: The microscope is halted.
+            MotionInProgressError: A device the layer moved is still moving.
+            MotionStoppedError: A ``stop()`` arrived while the command was being
+                sent; the stop was sent again after it (FM-18).
+            MicroscopeBusyError: The lock was not free within ``lock_timeout_s``.
+        """
+        with self._locked(description):
+            self._refuse_if_halted()
+            self._refuse_if_moving()
             if self._dry_run:
                 self._logger.info("[dry-run] %s", description)
                 return dry_result
             self._logger.info("%s", description)
+            if motion is None:
+                return action()
+            state = self._register(motion)
+            try:
+                result = action()
+            except BaseException as exc:
+                # The command may have reached the device before it raised.
+                self._stop_after(motion, state, f"{type(exc).__name__} in the command")
+                raise
+            with self._registry_lock:
+                stopped = state.stopped
+            if stopped:
+                # The stop did not wait for the lock and may have reached the
+                # device before this command did.
+                self._logger.warning("%s: stop resent after the command", motion.name)
+                self._send_stop(motion, state)
+                raise MotionStoppedError(motion.name)
+            return result
+
+    def read(
+        self, action: Callable[[], T], *, at_rest: bool = False, description: str = ""
+    ) -> T:
+        """Perform a read under the lock; reads reach the hardware even in dry-run.
+
+        ``at_rest=True`` marks an acquisition: it is refused while halted or
+        while anything moves, in dry-run too, because a frame taken during a
+        move is a wrong result, not a skipped mutation.
+
+        Raises:
+            MicroscopeHaltedError: ``at_rest`` and the microscope is halted.
+            MotionInProgressError: ``at_rest`` and a device is still moving.
+            MicroscopeBusyError: The lock was not free within ``lock_timeout_s``.
+        """
+        with self._locked(description or "a read"):
+            if at_rest:
+                self._refuse_if_halted()
+                self._refuse_if_moving()
             return action()
 
-    def read(self, action: Callable[[], T]) -> T:
-        """Perform a read under the lock; reads reach the hardware even in dry-run."""
-        with self._lock:
-            return action()
+    def wait(self, motion: Motion, timeout_s: float) -> None:
+        """Poll ``motion`` until idle, taking the lock for each poll only (FM-16).
+
+        Every exit other than "idle" sends the stop first (FM-17): a stage never
+        keeps moving because the program that moved it gave up.
+
+        Raises:
+            ValueError: ``timeout_s`` is negative or not finite.
+            MotionStoppedError: The motion went idle because it was stopped.
+            DeviceTimeoutError: Still busy at the deadline; the stop was sent,
+                or the message says why not.
+        """
+        if not math.isfinite(timeout_s) or timeout_s < 0:
+            # nan would make the deadline comparison always false: an endless wait.
+            raise ValueError(f"timeout_s must be finite and >= 0, got {timeout_s!r}")
+        if self._dry_run:
+            return
+        with self._registry_lock:
+            # Kept for the whole wait: if another thread's guard drops the
+            # motion once it is idle, its "stopped" flag must still be seen.
+            state = self._registry.get(motion.device)
+        deadline = time.monotonic() + timeout_s
+        description = f"{motion.name}: wait"
+        try:
+            while True:
+                with self._locked(description):
+                    busy = bool(motion.is_busy())
+                if not busy or time.monotonic() >= deadline:
+                    break
+                time.sleep(POLL_INTERVAL_S)
+        except BaseException as exc:
+            self._stop_after(motion, state, f"{type(exc).__name__} during the wait")
+            raise
+        if busy:
+            outcome = self._stop_after(motion, state, f"{timeout_s:g} s timeout")
+            raise DeviceTimeoutError(
+                f"{motion.name} is still busy after {timeout_s:g} s; {outcome}. "
+                f"If the move is legitimately long, raise [micromanager] "
+                f"device_timeout_ms in the profile; otherwise check the device "
+                f"and its cabling."
+            )
+        if state is not None:
+            self._drop(state)
+            with self._registry_lock:
+                stopped = state.stopped
+            if stopped:
+                raise MotionStoppedError(motion.name)
+
+    def stop(self, motion: Motion) -> None:
+        """Stop ``motion`` now, without the microscope lock; never refused.
+
+        It runs in dry-run too: a stop cannot create motion. A stop that
+        raises propagates, because a failed stop is a finding.
+
+        Raises:
+            HardwareError: The device cannot be stopped from smc.
+        """
+        if motion.stop is None:
+            raise HardwareError(f"{motion.name} cannot be stopped from smc")
+        self._logger.warning("%s: stop", motion.name)
+        with self._registry_lock:
+            state = self._registry.get(motion.device)
+        self._send_stop(motion, state)
+
+    def halt(self) -> None:
+        """Refuse every mutation and acquisition until ``resume()``; reads still run."""
+        with self._registry_lock:
+            self._halted = True
+        self._logger.warning("microscope: halted")
+
+    def resume(self) -> None:
+        """Clear the halt; starts nothing."""
+        with self._registry_lock:
+            self._halted = False
+        self._logger.warning("microscope: resumed")
+
+    def moving(self) -> tuple[str, ...]:
+        """Names of the motions not yet seen idle; asks no device, never blocks."""
+        with self._registry_lock:
+            return tuple(state.motion.name for state in self._registry.values())
+
+    def _refuse_if_halted(self) -> None:
+        if self._halted:
+            raise MicroscopeHaltedError()
+
+    def _refuse_if_moving(self) -> None:
+        """The guard: poll every registered motion, drop the idle ones, refuse the rest.
+
+        Called under the microscope lock. An unreadable busy state counts as
+        moving (unknown beats guessed), unless a stop was already sent to it:
+        a broken device must not lock the stand for good (FM-19).
+        """
+        with self._registry_lock:
+            states = list(self._registry.values())
+        moving: list[str] = []
+        details: list[str] = []
+        for state in states:
+            motion = state.motion
+            try:
+                busy = bool(motion.is_busy())
+            except Exception as exc:
+                with self._registry_lock:
+                    stop_sent = state.stop_sent
+                if stop_sent:
+                    self._logger.warning(
+                        "%s: busy state unreadable after a stop (%r); no longer "
+                        "tracked as moving",
+                        motion.name,
+                        exc,
+                    )
+                    self._drop(state)
+                    continue
+                moving.append(motion.name)
+                details.append(
+                    f"the busy state of `{motion.name}` could not be read ({exc!r}), "
+                    f"so it counts as moving"
+                )
+                continue
+            if busy:
+                moving.append(motion.name)
+            else:
+                self._drop(state)
+        if moving:
+            raise MotionInProgressError(tuple(moving), "; ".join(details))
+
+    def _register(self, motion: Motion) -> _MotionState:
+        with self._registry_lock:
+            # Checked again here: Microscope.stop() halts, then stops every
+            # stage. A halt that lands after the check at the top of do() but
+            # before this line would otherwise let the command start a stage
+            # that the stop has already missed.
+            if self._halted:
+                raise MicroscopeHaltedError()
+            state = _MotionState(motion)
+            self._registry[motion.device] = state
+            return state
+
+    def _drop(self, state: _MotionState) -> None:
+        with self._registry_lock:
+            if self._registry.get(state.motion.device) is state:
+                del self._registry[state.motion.device]
+
+    def _send_stop(self, motion: Motion, state: _MotionState | None) -> None:
+        """Mark ``state`` stopped, call the device's stop, then record that it was sent."""
+        if motion.stop is None:
+            raise HardwareError(f"{motion.name} cannot be stopped from smc")
+        if state is not None:
+            with self._registry_lock:
+                state.stopped = True
+        motion.stop()
+        if state is not None:
+            with self._registry_lock:
+                state.stop_sent = True
+
+    def _stop_after(self, motion: Motion, state: _MotionState | None, why: str) -> str:
+        """Stop on a failure path without masking the failure; return what happened."""
+        if motion.stop is None:
+            self._logger.warning(
+                "%s: %s; it cannot be stopped from smc", motion.name, why
+            )
+            return "it cannot be stopped from smc, so it may still be moving"
+        self._logger.warning("%s: stop after %s", motion.name, why)
+        try:
+            self._send_stop(motion, state)
+        except Exception as exc:
+            self._logger.exception("%s: the stop failed", motion.name)
+            return f"the stop failed ({exc!r}), so it may still be moving"
+        return "the stop was sent"
