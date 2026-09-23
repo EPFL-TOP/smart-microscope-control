@@ -41,11 +41,13 @@ src/smc/
       __init__.py
       mm.py            MM* capability classes, loaded_devices, core_roles  #5
   discovery/
-    __init__.py
+    __init__.py        inventory() — OS sections, hints, then the MM child  #30
+    models.py          Inventory (pydantic)                              #30
     os_inventory.py    serial / USB-PnP / PCI, per OS                    #30
-    mm_inventory.py    adapters, devices per adapter, optional probe     #30
+    mm_inventory.py    system section, adapter listing, optional probe   #30
+    _mm_child.py       child process that loads adapters (crash-isolated) #30
     vendors.py         VID/PID and name → vendor → likely adapters       #30
-    report.py          text + JSON rendering                             #30
+    report.py          text rendering + UTF-8 files for --out            #30
   testing/
     __init__.py
     fakes.py           FakeCore                                          #9
@@ -592,36 +594,62 @@ profile and on a fake through `SMC_PROFILE`.
 
 ## 10. Discover — `smc/discovery/` (#30, pulled into M1)
 
-Read-only survey of a PC, to run on each microscope computer and paste into
-its hardware-session issue:
+Read-only survey of a PC, run on each microscope computer following
+`docs/hardware/microscope-pc-setup.md` — one folder per PC:
 
 ```
-smc discover                    # text report
-smc discover --json inventory.json
-smc discover --probe-adapter NikonTi2     # opt-in: load each device of ONE adapter in a throwaway core
+smc discover                                   # text report on screen
+smc discover --out local\surveys\nikon-ti2     # also writes inventory.json + inventory.txt there (UTF-8)
+smc discover --all-adapters                    # devices of every installed adapter (slow: loads every DLL)
+smc discover --probe-adapter NikonTi2          # opt-in: initialise each device of ONE adapter in a throwaway core
+smc discover --no-os                           # skip serial / USB / PnP / PCI
 ```
 
-Sections: **system** (OS, Python, `smc`, `pymmcore-plus`, MM install dir,
-device-interface version; other Micro-Manager installs found on disk and
-*their* DIV); **adapters** (name → devices with type and description, or
-the enumeration error); **serial** (`pyserial` `list_ports`: device,
-VID:PID, manufacturer, description, serial number); **usb / pnp**
-(Windows: `powershell -NoProfile -Command "Get-PnpDevice -PresentOnly |
-Select-Object Status,Class,FriendlyName,InstanceId,Manufacturer |
-ConvertTo-Json"`; macOS: `system_profiler SPUSBDataType -json`; Linux:
-`lsusb`); **pci** (Windows: PnP entries whose `InstanceId` starts with
-`PCI\`; Linux: `lspci -nn`); **hints** (from `vendors.py`: VID/PID and name
-fragments → vendor → adapters that usually drive it, e.g. FTDI serial →
-Märzhäuser/ASI/Sutter candidates; `1B6B` → Photometrics → `PVCAM`;
-`10EE`+`CZMI` → Zeiss MicoIf). Every OS call has a timeout and degrades to
-"not available on this OS"; nothing is loaded into a core unless
-`--probe-adapter` is given. New dependency: `pyserial`.
+Sections: **system** (host name, UTC time, OS, Python, `smc`,
+`pymmcore-plus`, MM install dir, device interface version; other
+Micro-Manager installs found on disk, names only); **adapters** (every
+installed adapter's *name* — listing names loads no DLL — and the devices
+of the adapters in `vendors.LAB_ADAPTERS` plus those the hints suggest, or
+of all of them with `--all-adapters`; an enumeration error is recorded as
+the finding); **serial** (`pyserial`: device, VID:PID, manufacturer,
+description, serial number); **usb / pnp** (Windows: `Get-PnpDevice
+-PresentOnly` as JSON, with the console output encoding set to UTF-8;
+macOS: `system_profiler SPUSBDataType -json`; Linux: `lsusb`); **pci**
+(Windows: PnP entries whose `InstanceId` starts with `PCI\`; Linux:
+`lspci -nn`); **hints** (vendor IDs and name fragments → vendor → adapters,
+from `vendors.py`, e.g. FTDI → Märzhäuser/ASI/Sutter candidates, PCI `1B6B`
+→ Photometrics → `PVCAM`, PCI `1093` → National Instruments → `NIDAQ`, PCI
+`10EE` + `CZMI` → Zeiss realtime card); **notes** (one line per thing that
+could not be collected).
+
+**Isolation.** Everything that loads a device adapter — the device lists
+and the probe — runs in a child process (`python -m
+smc.discovery._mm_child`) that prints ASCII JSON, under a timeout (180 s,
+`--timeout-s`). Loading a vendor DLL can hang or crash the process; that
+must cost one section, not the survey — the lesson behind
+`nikon-control`'s one-device-per-throwaway-core probe. A crash or a
+timeout becomes a note; the OS sections are still reported.
+
+**Output.** `--out DIR` creates DIR and (over)writes `inventory.json` (the
+`Inventory` model) and `inventory.txt` (the text report), both UTF-8 and
+written by the tool itself — never through shell redirection. They contain
+serial numbers and the host name, so they stay in the git-ignored
+`local/`; the design session publishes a redacted version.
+
+**Redirected output.** When stdout or stderr is not UTF-8 (a redirected
+stream on Windows is cp1252), the CLI reconfigures it with
+`errors="replace"`, so redirected output degrades instead of crashing
+(#42).
+
+Every OS call has a 20 s timeout and degrades to a note; nothing is
+initialised unless `--probe-adapter` is given; no network access. New
+dependency: `pyserial`.
 
 ## 11. Sequencing
 
 | Wave | Issues | Parallel? | Notes |
 |---|---|---|---|
-| 1 | #30 discover · #7 profiles · #6 roles · #5 capabilities + safety + MM backend | yes — separate `git worktree`s | `errors.py` and `Role`/`DeviceInfo` are seeded by the design PR; #5 takes labels from the core's own slots until #8 exists; only #30 touches `cli.py` in wave 1 |
+| 1 | #30 discover (+ #42) · #7 profiles · #6 roles · #5 capabilities + safety + MM backend | yes — separate `git worktree`s | `errors.py` and `Role`/`DeviceInfo` are seeded by the design PR; #5 takes labels from the core's own slots until #8 exists; only #30 touches `cli.py` in wave 1 |
 | 2 | #8 facade | after 5, 6, 7 | wires everything; adds `from_core` and `override` |
 | 3 | #9 FakeCore + fixtures + contracts · #10 synthetic · #11 CLI | after 8, parallel | #11 also extends `doctor`; #10 needs `override()` from #8 |
 
