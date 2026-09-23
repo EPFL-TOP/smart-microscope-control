@@ -204,7 +204,7 @@ class TestOnDemoDevices:
             assert camera.pixel_size_um() == 0.0
         assert "not a positive number" in caplog.text
 
-    @pytest.mark.parametrize("bad", [math.nan, -1.0])
+    @pytest.mark.parametrize("bad", [math.nan, math.inf, -1.0])
     def test_exposure_refuses_non_finite_or_negative(
         self, demo_core: Any, bad: float
     ) -> None:
@@ -354,6 +354,7 @@ class _BinningCore:
         ("1x2", 0.0),
         ("0", 0.0),
         ("abc", 0.0),
+        ("2x2x2", 0.0),
         (None, 0.0),
     ],
 )

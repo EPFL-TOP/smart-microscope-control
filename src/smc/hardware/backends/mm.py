@@ -322,7 +322,9 @@ class MMCamera:
         binning 1, so the fallback is multiplied by the current binning. A
         binning that cannot be read, or a map entry that is not a positive
         finite number, gives ``0.0`` (unknown) with a warning rather than a
-        pixel size that looks measured but is wrong.
+        pixel size that looks measured but is wrong. A device that fails to
+        answer raises, as every reader does (design §3); the facade's
+        ``state()`` is the tolerant layer.
         """
 
         def action() -> float:
@@ -362,7 +364,8 @@ class MMCamera:
         if self._core.hasProperty(self._label, "Binning"):
             raw = str(self._core.getProperty(self._label, "Binning"))
         parts = raw.lower().replace(" ", "").split("x")
-        if len(set(parts)) == 1 and parts[0].isdigit() and int(parts[0]) >= 1:
+        square = len(parts) <= 2 and len(set(parts)) == 1
+        if square and parts[0].isdigit() and int(parts[0]) >= 1:
             return int(parts[0])
         logger.warning(
             "camera %r binning %r cannot be read as one integer factor; the "
