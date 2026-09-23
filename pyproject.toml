@@ -32,6 +32,8 @@ dependencies = [
   "pydantic>=2.7",
   "typer>=0.12",
   "rich>=13",
+  # Serial ports with their USB IDs for `smc discover` (the survey of a PC).
+  "pyserial>=3.5",
   # TOML profiles on Python 3.10 (tomllib is stdlib from 3.11).
   "tomli>=2.0; python_version < '3.11'",
 ]
