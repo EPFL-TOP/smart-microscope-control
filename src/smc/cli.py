@@ -220,7 +220,16 @@ def discover(
 
 
 def main() -> None:
-    """Entry point used by ``python -m smc.cli``."""
+    """Entry point used by ``python -m smc.cli`` and the ``smc`` console script.
+
+    Reconfigures the streams before ``app()`` runs, not inside the Typer
+    callback: Click prints ``--help`` and exits before a callback ever runs,
+    so the callback's own fix (kept for ``CliRunner``, which never goes
+    through this entry point) never reaches it (FM-42).
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None:
+            tolerate_unencodable_output(stream)
     app()
 
 
