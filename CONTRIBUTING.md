@@ -27,17 +27,19 @@ smc doctor && pytest
 5. **Pull request** with the template. Title in Conventional Commits form
    (`feat(core): …`). One reviewer. Squash merge by the maintainer.
 
-## Design sessions and execution sessions
+## Supervising and execution sessions
 
-Issues move through three hands. A **design session** writes the plan
-(`/plan`, fixed format, links `docs/design/`) and sets `status: ready`. An
-**execution session** — a fresh session, human or agent — takes one ready
-issue, implements only its plan, verifies, opens the PR and posts a
-`## Report` (`/develop`). The design session reviews (`/review`); the
-**owner** merges. Each execution runs in its own `git worktree` with its own
-`.venv` (`python scripts/dev/worktree.py setup`; `clean` removes merged
-ones). Labels tell you where an issue is: `ready` → `in-progress` →
-`in-review`.
+Issues move through three hands. The **supervising session** runs `/point`
+to take stock, writes the plans (`/plan`, fixed format with the risk, the
+failure modes to handle and the suggested model) and sets `status: ready`.
+An **execution session** — a fresh session, human or agent, Sonnet by
+default — takes one ready issue, implements its plan, has cheap reviewer
+agents attack the change (`/adversarial-review`), opens the PR and posts a
+`## Report` (`/develop`). The supervising session reviews lightly
+(`/review`); the **owner** merges. Each execution runs in its own
+`git worktree` with its own `.venv` (`python scripts/dev/worktree.py setup`;
+`clean` removes merged ones). Labels tell you where an issue is: `ready` →
+`in-progress` → `in-review`.
 
 ## Commit messages
 

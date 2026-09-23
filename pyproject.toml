@@ -94,6 +94,7 @@ select = [
   "PT",       # pytest style
   "T20",      # no print in library code (tests/scripts are exempt below)
   "PLW1514",  # open()/read_text() without encoding= — Windows decodes with cp1252
+  "TID251",   # banned imports: hardware only through smc.hardware (below)
   "D",        # docstrings — public API must say *why*, not just *what*
 ]
 ignore = [
@@ -107,9 +108,19 @@ ignore = [
 convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["D", "T20", "S101"]
-"scripts/**" = ["D", "T20"]
+"tests/**" = ["D", "T20", "S101", "TID251"]
+"scripts/**" = ["D", "T20", "TID251"]
 "src/smc/cli.py" = ["T20"]   # the CLI is allowed to talk
+# The only packages that may import the Micro-Manager bindings (CLAUDE.md):
+# the hardware layer, the read-only survey (throwaway cores, design §10) and
+# the test helpers (FakeCore, demo fixtures).
+"src/smc/hardware/**" = ["TID251"]
+"src/smc/discovery/**" = ["TID251"]
+"src/smc/testing/**" = ["TID251"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"pymmcore_plus".msg = "Hardware is reached only through smc.hardware (ADR-0003, CLAUDE.md); ask for a capability instead."
+"pymmcore".msg = "Hardware is reached only through smc.hardware (ADR-0003, CLAUDE.md); ask for a capability instead."
 
 [tool.ruff.format]
 docstring-code-format = true
