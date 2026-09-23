@@ -71,3 +71,14 @@ implements it correctly without asking a design question.
   `moves-hardware` all of that plus `/code-review` in the design review.
 - Do not write the implementation here. Keep the plan consistent with the
   design doc; if reality contradicts the doc, update the doc in a PR.
+- **Measured beats assumed, in plans too.** A fact the plan states about
+  the demo devices or a library (a pixel size, whether a device reports
+  busy, what a call blocks on) is checked first with a one-off script on
+  `open_core(None)`, and the plan says it was measured. #5's plan said the
+  demo reports a pixel size of 0; it reports 1.0.
+- **One plan per issue, always complete.** `/develop` and `point.py` read
+  only the latest comment starting with `## Plan`, so a partial
+  `## Plan amendment` hides the plan it amends. Correct a posted plan by
+  editing its comment in place
+  (`gh api -X PATCH repos/{owner}/{repo}/issues/comments/<id> -F body=@plan.md`),
+  or post a complete revised `## Plan`.

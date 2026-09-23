@@ -10,7 +10,7 @@ category is not here: an id, what happens, and how to check.
 
 - **FM-01 Prints while loading.** An adapter writes to stdout or stderr, with or without a newline. Any protocol over stdout breaks. *Check*: results travel through a file or a dedicated channel, never "the last line of stdout".
 - **FM-02 Crashes or hangs while loading, or at unload.** A result already produced is lost when the parent trusts the exit code. *Check*: adapter work runs in a child; the child writes its result before teardown and calls `os._exit(0)` after the final write; the parent reads the result whatever the exit code.
-- **FM-03 Modal dialog on Windows.** A missing dependency or the crash reporter opens a dialog, which looks like a hang. *Check*: processes that load adapters call `SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX)` first.
+- **FM-03 A crash dialog (Windows, macOS).** On Windows, a missing dependency or the crash reporter opens a modal dialog, which looks like a hang. On macOS, a crashing `Python.app` (Homebrew) makes ReportCrash show "Python quit unexpectedly" once per crash, `pytest` runs included (#47). *Check*: processes that load adapters guard themselves first: `SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX)` on Windows, and on macOS libc `_exit` as the raw handler of the crash signals (`_mm_child._no_error_dialogs`). A reproduction that crashes a native process on macOS goes through the same guard, or says in its evidence that it will open a dialog.
 - **FM-04 Helper processes inherit the pipes.** The pipe never reaches end-of-file; on Windows `subprocess.run(timeout=…)` then waits without limit after `kill()`. *Check*: child output goes to files; `Popen.wait(timeout)` then `kill()`.
 - **FM-05 Non-UTF-8 strings.** pymmcore decodes with `surrogateescape`; one lone surrogate makes the JSON invalid. *Check*: strings from adapters are sanitised before they are serialised.
 - **FM-06 Listing devices contacts the hardware.** `NikonTi2` asks the Nikon SDK, and a stand accepts one connection at a time (NIS-Elements, ZEN, a second core). *Check*: the default test suite never lists vendor adapters; surveys run with the vendor software closed.
@@ -25,7 +25,11 @@ category is not here: an id, what happens, and how to check.
 - **FM-12 Moving Z switches PFS off** on the Nikon stands. *Check*: suspend and re-engage around Z moves.
 - **FM-13 Several devices share a type.** Ti2: four `XYStage` devices, three of them TIRF positioners; Ti-E: three `Stage` devices. *Check*: type-first resolution with exclusions, and the candidates reported.
 - **FM-14 Turret moves can crash an objective** under a loaded plate. *Check*: turret moves require confirmation.
-- **FM-15 A blocking device call under the microscope lock.** A vendor call with no timeout of its own (`snapImage`, a driver deadlock) holds the one `Executor` lock, so every other capability on that stand hangs with no diagnosis (#5 review). *Check*: device calls are bounded by a deadline (`deviceBusy` polling), or the call site is named as unbounded until the design bounds it.
+- **FM-15 A blocking device call under the microscope lock.** A vendor call with no timeout of its own (`snapImage`, a driver deadlock) holds the one `Executor` lock, so every other capability on that stand hangs with no diagnosis (#5 review). *Check*: waits poll `deviceBusy` against a deadline; callers of a lock held too long fail with `MicroscopeBusyError`, which names the holder (design §13); a call with no timeout of its own says so in its docstring.
+- **FM-16 A wait that holds the lock.** Polling a moving device while holding the microscope lock blocks every reader and every stop for the length of the move, which is 60 s for a plate traverse (#54). *Check*: the command is sent under the lock and the wait takes it only for each poll; a test reads from another thread while a wait polls.
+- **FM-17 A wait that gives up leaves the device moving.** A timeout, a Ctrl-C or any other exception during the wait raises, but the stage keeps going while the caller believes the move failed (#52 review). *Check*: every exit from a wait other than "idle" sends the device's stop first; so does a command that raises.
+- **FM-18 A stop that races a command.** A stop that does not wait for the lock can reach the device just before a move command already under way, which then starts the stage after the stop (#54). *Check*: a stop that arrives while a command is being sent is sent again after it, and the move raises `MotionStoppedError`.
+- **FM-19 A busy state that cannot be read.** `deviceBusy` raises. Reading that as idle lets the next action run during a move; reading it as moving forever locks the stand. *Check*: unreadable counts as moving, the refusal names the error, and a stop releases it.
 
 ## Windows
 
@@ -50,7 +54,8 @@ category is not here: an id, what happens, and how to check.
 - **FM-40 The default suite touches vendor adapters or hardware.** A microscope PC has the full nightly installed. *Check*: tests pin adapter lists to the test adapters (`DemoCamera`, `Utilities`, `SequenceTester`, `NotificationTester`).
 - **FM-41 Assertions that an adapter is absent** break on a full install.
 - **FM-42 `CliRunner` hides encoding problems.** *Check*: a subprocess test with `PYTHONIOENCODING=cp1252` and stdout to a file.
-- **FM-43 A test that cannot fail.** *Check*: break the line under test and watch the test fail.
+- **FM-43 A test that cannot fail.** *Check*: break the line under test and watch the test fail. For a rule table held as data, break each row's fields in turn: a line-by-line sweep misses rows (#6).
+- **FM-44 A threading test that hangs instead of failing.** A deadlock in the code under test freezes the suite until CI kills it, with no diagnosis. *Check*: threads meet on `threading.Event`; every `join(timeout=...)` is followed by `assert not t.is_alive()`; no assertion on timing tighter than about 0.5 s (Windows sleeps in steps of about 15 ms); interrupts are raised from stubs, not sent as signals.
 
 ## Data
 
