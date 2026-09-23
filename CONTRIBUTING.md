@@ -34,8 +34,10 @@ Issues move through three hands. A **design session** writes the plan
 **execution session** — a fresh session, human or agent — takes one ready
 issue, implements only its plan, verifies, opens the PR and posts a
 `## Report` (`/develop`). The design session reviews (`/review`); the
-**owner** merges. Parallel executions use separate `git worktree`s. Labels
-tell you where an issue is: `ready` → `in-progress` → `in-review`.
+**owner** merges. Each execution runs in its own `git worktree` with its own
+`.venv` (`python scripts/dev/worktree.py setup`; `clean` removes merged
+ones). Labels tell you where an issue is: `ready` → `in-progress` →
+`in-review`.
 
 ## Commit messages
 

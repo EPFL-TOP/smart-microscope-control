@@ -22,8 +22,10 @@ htmlcov/
 .idea/
 .DS_Store
 
-# Claude Code: personal permission overrides stay local
+# Claude Code: personal permission overrides stay local; worktrees of
+# execution sessions live under the checkout and are never committed
 .claude/settings.local.json
+.claude/worktrees/
 
 # Experimental data and model weights are never committed
 /data/
