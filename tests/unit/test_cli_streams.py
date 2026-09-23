@@ -15,7 +15,7 @@ from smc.cli import tolerate_unencodable_output
 
 def test_stream_fix_survives_a_cp1252_stream() -> None:
     raw = io.BytesIO()
-    stream = io.TextIOWrapper(raw, encoding="cp1252")
+    stream = io.TextIOWrapper(raw, encoding="cp1252", newline="\n")
 
     tolerate_unencodable_output(stream)
     stream.write("✓ done\n")
