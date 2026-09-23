@@ -11,8 +11,13 @@ precise task and to judge what comes back. Do not re-review the code
 yourself.
 
 1. **Inputs.** `base` = `origin/main`, `head` = `HEAD` of this worktree.
-   Save the issue's latest `## Plan` comment to a file under a directory from
-   `mktemp -d`. Read its **Risk** and **Failure modes to handle** lines.
+   Pick one scratch directory outside the repository: your session's
+   scratchpad if the system prompt names one, otherwise run `mktemp -d` as a
+   command on its own and note the path it prints. Save the issue's latest
+   `## Plan` comment there as `plan.md` with the Write tool. Read its
+   **Risk** and **Failure modes to handle** lines. The worktree's sandbox
+   refuses heredocs, `$(...)` and pipes into an interpreter: one plain
+   command per Bash call, and files through Write.
 2. **Lenses by risk.**
 
    | Risk | Reviewers |
@@ -26,10 +31,12 @@ yourself.
 3. **Spawn** the reviewers in one message, one Agent call each
    (`subagent_type` = the agent's name), each prompt giving: the worktree
    path, `base`, `head`, the plan file, the risk, the failure modes to
-   handle, and `docs/design/failure-modes.md`. Wait for all of them.
+   handle, `docs/design/failure-modes.md`, and a scratch directory of its
+   own (`<scratch>/<agent-name>/`). Wait for all of them.
 4. **Verify.** Merge and de-duplicate the findings. Spawn one `verifier` per
    `blocking` finding, and per nit you intend to act on — in one message, at
-   most eight. An unverified finding is not a fact.
+   most eight, each with its own scratch directory (`<scratch>/verifier-<n>/`).
+   An unverified finding is not a fact.
 5. **Act.**
    - CONFIRMED and in scope: fix it now, with a test that fails before the fix.
    - CONFIRMED but needing an interface change: `## Plan deviation` on the issue (see /develop), not a silent redesign.
@@ -51,6 +58,6 @@ yourself.
 
 ## Never
 
-- Let a reviewer or the verifier edit the repository.
+- Let a reviewer or the verifier edit the repository; they write only under their scratch directories.
 - Accept a finding without a file, a line and a scenario.
 - Run a second round of fixes without re-running the checks.

@@ -55,6 +55,13 @@ them if it is not the one you run on.
    tools (`.venv/bin/ruff`, `.venv/bin/mypy`, `.venv/bin/pytest`; Windows
    `.venv\Scripts\…`) and commit with `PATH=".venv/bin:$PATH" git commit …`.
 
+   **Shell in the worktree.** Its sandbox refuses compound commands:
+   heredocs, `$(...)`, pipes into an interpreter, long `--jq` filters. Keep
+   each Bash call to one plain command. Write throwaway scripts and files
+   with the Write tool into your scratchpad, or into a `mktemp -d` directory
+   created by a command on its own, and run them with `.venv/bin/python
+   <file>`. Read `gh` output with `--json <fields>` and no filter.
+
 ## Implement
 
 6. Follow the plan's steps in order; one commit per step, conventional
