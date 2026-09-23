@@ -1,8 +1,32 @@
 # Setting up a microscope PC, and what to send back
 
-For the Windows PCs attached to the stands. Goal of a first visit: install
-the project, prove Micro-Manager sees the machine, and bring back an
-inventory that turns into a profile. **Nothing here moves hardware.**
+For the Windows PCs attached to the stands, **one PC at a time**: install
+the project, survey the machine into **one folder per PC**, bring the
+folder back. Nothing here moves hardware.
+
+## 0. One folder per PC
+
+| Stand | Folder | Issue |
+|---|---|---|
+| Nikon Ti2-E | `nikon-ti2` | #16 |
+| Nikon Ti-E | `nikon-tie` | #17 |
+| Zeiss Axio Observer 7 | `zeiss-observer7` | #27 |
+| Viventis LS1, first PC | `viventis-ls1-a` | #29 |
+| Viventis LS1, second PC | `viventis-ls1-b` | #29 |
+
+Put a sticker saying *A* or *B* on the two LS1 PCs so the names stay with
+the machines. The folder name is also the future profile name
+(`profiles/<folder>.toml`).
+
+Suggested order: the **Ti2** first — the best-known stand, so it validates
+the procedure, and it feeds milestone M2 — then the **two LS1** (the
+biggest unknown: which controller performs the light-sheet timing), then
+the **Ti-E** and the **Zeiss**, which are well documented already.
+
+**The repository is public.** A raw survey contains serial numbers and
+host names. It is never pasted into an issue or committed: it lives in
+`local/surveys/<folder>/`, which is git-ignored, on the PC and on the Mac.
+The design session publishes a curated, redacted version.
 
 ## 1. Install (once per PC, ~15 min)
 
@@ -25,6 +49,19 @@ smc doctor
 administrator rights. If the download is blocked by the corporate proxy,
 set `HTTPS_PROXY` or run once from a network with direct access.
 
+### Every terminal you open for this project
+
+```bat
+cd C:\Tools\smart-microscope-control
+.venv\Scripts\activate
+set PYTHONUTF8=1
+```
+
+`PYTHONUTF8=1` makes Python write UTF-8 when its output is redirected to a
+file; without it a redirected `smc doctor` crashes on Windows (#42). Set it
+per terminal, not machine-wide: other Python tools on a shared PC may rely
+on the old behaviour.
+
 ### If a Micro-Manager GUI (MMStudio) is already installed
 
 The Zeiss PC has one. Its **device-interface version (DIV)** must match
@@ -44,42 +81,89 @@ lists no devices and it looks as if the adapter were missing.
 
 ## 2. Survey the machine
 
-Once `smc discover` exists (issue #30):
+**When**: nobody is using the microscope and the vendor software
+(NIS-Elements, ZEN, the Viventis software) is closed. Listing the devices of
+some adapters asks the vendor SDK, which talks to the stand — the Nikon Ti2
+adapter does — and a stand accepts one connection at a time.
+
+In a terminal prepared as in §1, name the folder once (the table in §0):
 
 ```bat
-smc discover --json inventory.json > inventory.txt
+git pull
+set SURVEY=C:\Tools\smart-microscope-control\local\surveys\nikon-ti2
+smc discover --out %SURVEY%
 ```
 
-Until then, this collects the same facts by hand — run it from the
-activated venv and keep the output:
+`smc discover` arrives with #30. It writes `inventory.json` and
+`inventory.txt` into the folder: the Micro-Manager install and its device
+interface version, the installed adapters and the devices of the ones this
+lab is likely to use, serial ports with their USB IDs, USB/PnP devices, PCI
+cards, and hints that map known vendor IDs to adapters. It initialises
+nothing. Do not use `--probe-adapter` on a first visit.
+
+Then add to the same folder:
+
+- **Every PC**: `photos\` — the back panel, every controller's front
+  panel, every label with a model or part number (labels beat software) —
+  and `notes.txt`: the vendor software and its version, what is physically
+  connected, anything unexpected.
+- **Nikon PCs**, if `nikon-control` is installed: in a terminal of its own
+  environment, `set PYTHONUTF8=1` and `set SURVEY=…` again, then
+
+  ```bat
+  nikon-control-scope adapters > %SURVEY%\nikon-control-adapters.txt
+  nikon-control-scope stand --notes --deep > %SURVEY%\nikon-control-stand.txt
+  ```
+
+- **Zeiss PC**: MTB's configuration lists every device and the port it
+  uses; add the MMStudio device interface version (*Help → About*) to
+  `notes.txt`.
+
+  ```bat
+  robocopy "C:\ProgramData\Carl Zeiss\MTB2011" %SURVEY%\mtb-config *.xml /S /MAX:5000000 /R:0 /W:0
+  ```
+
+- **LS1 PCs**: the vendor's configuration and logs, size-capped, never
+  data.
+
+  ```bat
+  robocopy C:\Viventis %SURVEY%\vendor-config *.ini *.xml *.json *.cfg *.config *.yaml *.yml *.log /S /MAX:5000000 /R:0 /W:0
+  ```
+
+- **Any PC where `lightsheet-live-tracking-tool` is installed** (the Zeiss,
+  probably the LS1s): its hardware audit — PCI cards, slots, drivers.
+
+  ```bat
+  powershell -NoProfile -ExecutionPolicy Bypass -File <tracking-tool>\tools\audit_windows_hardware.ps1 > %SURVEY%\audit.txt
+  ```
+
+### Before `smc discover` exists
+
+To survey a PC before #30 is merged, collect the essentials into the same
+folder, plus the extras above, and run `smc discover --out` on a later
+visit:
 
 ```bat
-python -c "from pymmcore_plus import CMMCorePlus as C; c=C(); print(c.getAPIVersionInfo()); print(c.getVersionInfo()); print(sorted(c.getDeviceAdapterNames()))"
-python -c "from pymmcore_plus import CMMCorePlus as C; c=C(); [print(a, list(c.getAvailableDevices(a))) for a in ('NikonTi2','NikonTI','HamamatsuHam','PVCAM','ZeissCAN29','Marzhauser','MarzhauserLStep','ASIStage','ASITiger','NIDAQ','PI','PI_GCS_2','ThorlabsFilterWheel','Arduino') if a in c.getDeviceAdapterNames()]"
-powershell -NoProfile -Command "Get-PnpDevice -PresentOnly | Where-Object {$_.Class -in 'Ports','USB','Camera','Image','System','Unknown'} | Select-Object Status,Class,FriendlyName,Manufacturer,InstanceId | Format-Table -AutoSize -Wrap"
-powershell -NoProfile -Command "Get-PnpDevice -PresentOnly | Where-Object {$_.InstanceId -like 'PCI\*'} | Select-Object Status,Class,FriendlyName,Manufacturer,InstanceId | Format-Table -AutoSize -Wrap"
+mkdir %SURVEY%
+smc doctor > %SURVEY%\doctor.txt
+powershell -NoProfile -Command "Get-PnpDevice -PresentOnly | Select-Object Status,Class,FriendlyName,Manufacturer,InstanceId | ConvertTo-Json | Out-File -Encoding utf8 $env:SURVEY\pnp.json"
 ```
 
-On the Nikon PCs, `nikon-control-scope adapters` and
-`nikon-control-scope stand --notes` (from the `nikon-control` checkout)
-add the driver-DLL diagnosis. On any Windows PC, the tracking tool's
-`tools\audit_windows_hardware.ps1` produces the fuller PCI/slot report.
+## 3. Bring it back
 
-## 3. Send it back
-
-Paste `smc version`, the `smc doctor` output and the survey into the
-stand's issue: Nikon Ti2 → #16, Nikon Ti-E → #17, Zeiss Axio Observer 7 →
-#27, Viventis LS1 (each stand separately) → #29. Add photos of the back
-panel and of any controller front panel; model numbers on labels beat
-guesses from software.
-
-For the LS1s also copy (read-only) the vendor's configuration folder
-listing: `dir /s C:\Viventis > viventis-files.txt`, and the contents of any
-`*.ini`, `*.xml`, `*.json` under it that name components, ports or timing.
+Copy the folder to the Mac — network share, USB stick, e-mail to yourself —
+into `smart-microscope-control/local/surveys/<folder>/` (git-ignored there
+too), and tell the design session "survey `<folder>` is in". It turns the
+folder into one pull request: `docs/hardware/<folder>.md` (what the stand is
+made of), a draft `profiles/<folder>.toml`, the stand's device list as a
+redacted test fixture for role resolution, and a summary on the stand's
+issue.
 
 ## 4. What must not happen during a first visit
 
-- No `.cfg` is built and no device initialised while the vendor software
-  (NIS-Elements, ZEN, the Viventis software) is running: the stands accept
-  one connection.
-- Nothing is moved. `smc doctor` and the survey only read.
+- No survey while someone acquires, or while NIS-Elements, ZEN or the
+  Viventis software is running.
+- No `--probe-adapter`, no `.cfg` built, no device initialised, nothing
+  moved.
+- Nothing from `local/surveys/` pasted into an issue or committed: the
+  repository is public.
