@@ -7,9 +7,12 @@ is scriptable, testable and works over SSH to a microscope PC.
 
 from __future__ import annotations
 
+import codecs
+import math
 import platform
+import sys
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, TextIO
 
 import typer
 from rich.console import Console
@@ -25,6 +28,31 @@ app = typer.Typer(
     rich_markup_mode="rich",
 )
 console = Console()
+
+
+def tolerate_unencodable_output(stream: TextIO) -> None:
+    """Let a non-UTF-8 stream replace what it cannot encode instead of crashing.
+
+    A redirected stream on Windows gets the ANSI code page (cp1252) with
+    strict errors, and ``✓`` / ``✗`` have no cp1252 encoding: ``smc doctor >
+    f.txt`` used to die with ``UnicodeEncodeError`` (#42). Only the error
+    handler changes; the encoding is the one the operator's shell chose.
+    """
+    try:
+        encoding = codecs.lookup(stream.encoding or "").name
+    except LookupError:
+        encoding = ""
+    reconfigure = getattr(stream, "reconfigure", None)
+    if encoding != "utf-8" and reconfigure is not None:
+        reconfigure(errors="replace")
+
+
+@app.callback()
+def _main() -> None:
+    """Control several microscopes through one layer; run interchangeable tools."""
+    for stream in (sys.stdout, sys.stderr):
+        if stream is not None:
+            tolerate_unencodable_output(stream)
 
 
 @app.command()
@@ -95,6 +123,100 @@ def doctor(
         console.print(f"[red]✗[/red] {exc}")
         raise typer.Exit(code=1) from None
     console.print(f"[green]✓[/green] {target} loads and answers.")
+
+
+@app.command()
+def discover(
+    out: Annotated[
+        Path | None,
+        typer.Option(
+            "--out",
+            help="Folder to (over)write inventory.json and inventory.txt in, "
+            "UTF-8. Named after the stand, e.g. local/surveys/nikon-ti2.",
+        ),
+    ] = None,
+    all_adapters: Annotated[
+        bool,
+        typer.Option(
+            "--all-adapters",
+            help="List the devices of every installed adapter (slow: loads "
+            "every DLL). Default: the lab's adapters and the hinted ones.",
+        ),
+    ] = False,
+    probe_adapter: Annotated[
+        str | None,
+        typer.Option(
+            "--probe-adapter",
+            help="Load and initialise every device of ONE adapter. Contacts "
+            "the hardware: stand powered, vendor software closed.",
+        ),
+    ] = None,
+    timeout_s: Annotated[
+        float,
+        typer.Option(
+            "--timeout-s",
+            min=1.0,
+            max=3600.0,
+            help="How long the adapter child process may run (1-3600 s).",
+        ),
+    ] = 180.0,
+    no_os: Annotated[
+        bool, typer.Option("--no-os", help="Skip serial, USB / PnP and PCI.")
+    ] = False,
+) -> None:
+    """Survey this PC: OS devices, vendor hints, Micro-Manager adapters.
+
+    Read-only: nothing is initialised unless --probe-adapter is given, and
+    nothing is written unless --out is. A failing tool or adapter becomes a
+    note in the report, never the end of the survey.
+    """
+    from smc.discovery import inventory
+    from smc.discovery import report as report_mod
+
+    if not math.isfinite(timeout_s):  # click's range check lets nan through
+        console.print(
+            f"[red]✗[/red] --timeout-s must be a number of seconds, not {timeout_s}"
+        )
+        raise typer.Exit(code=2)
+    # --out is checked before the survey and written before the report is
+    # printed: a broken pipe or Ctrl-C while printing must not lose the files.
+    if out is not None:
+        try:
+            report_mod.prepare(out)
+        except OSError as exc:
+            console.print(f"[red]✗[/red] cannot write to {out}: {exc}")
+            raise typer.Exit(code=1) from None
+    if probe_adapter:
+        console.print(
+            f"[yellow]![/yellow] Probing {probe_adapter}: the stand must be "
+            "powered and its vendor software closed."
+        )
+    with console.status("Surveying this PC…"):
+        inv = inventory(
+            all_adapters=all_adapters,
+            probe_adapter=probe_adapter,
+            include_os=not no_os,
+            timeout_s=timeout_s,
+        )
+    written: tuple[Path, Path] | None = None
+    write_error: OSError | None = None
+    if out is not None:
+        try:
+            written = report_mod.write(inv, out)
+        except OSError as exc:
+            # The survey took minutes: a failed write costs the files, not
+            # the report on screen.
+            write_error = exc
+    for item in report_mod.renderables(inv):
+        console.print(item)
+    if write_error is not None:
+        console.print(
+            f"[red]✗[/red] could not write the survey to {out}: {write_error}"
+        )
+        raise typer.Exit(code=1)
+    if written is not None:
+        json_path, text_path = written
+        console.print(f"[green]✓[/green] wrote {json_path} and {text_path.name}")
 
 
 def main() -> None:
