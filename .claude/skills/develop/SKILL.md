@@ -29,19 +29,34 @@ design doc. Your job is to implement it faithfully and prove it.
    `origin/main` and moves this session into it. Then, inside the worktree:
 
    ```sh
+   git fetch origin main                    # SSH may fail in agent shells: see below
+   git merge --ff-only origin/main          # start from the latest main
    git branch -m feat/<N>-<slug>            # the project's branch naming
    python scripts/dev/worktree.py setup     # this worktree's own .venv + editable install
    ```
 
+   - If `EnterWorktree` fails, create the worktree yourself and enter it:
+     `git worktree add .claude/worktrees/issue-<N>-<slug> -b feat/<N>-<slug> origin/main`,
+     then `EnterWorktree` with `path` set to that directory (skip the
+     `git branch -m` above).
+   - If the fast-forward fails, the worktree was not created from `main`:
+     leave it (`ExitWorktree`, `remove`) and use the fallback above.
+   - If `EnterWorktree` says you are already in a worktree, check
+     `git worktree list` and continue only if it is this issue's.
+   - **SSH**: an agent shell may have no SSH key loaded, so `fetch` and
+     `push` against the `git@github.com:` remote fail while `gh` works. Run
+     the git command as
+     `git -c url."https://github.com/".insteadOf="git@github.com:" <command>`
+     instead — `gh` is the HTTPS credential helper. Never change the remote.
+
    The main checkout's `.venv` must not be used from a worktree: it is an
    editable install of the *main checkout's* `src/`, so its tests would run
-   the wrong code. `setup` proves `smc` imports from the worktree. From now
-   on call the worktree's tools explicitly (`.venv/bin/ruff`,
+   the wrong code. `setup` builds this worktree's venv from the main
+   checkout's interpreter and proves `smc` imports from the worktree. From
+   now on call the worktree's tools explicitly (`.venv/bin/ruff`,
    `.venv/bin/mypy`, `.venv/bin/pytest`; Windows `.venv\Scripts\…`) and
    commit with `PATH=".venv/bin:$PATH" git commit …` so the shared
-   pre-commit hook finds them. If `EnterWorktree` says you are already in a
-   worktree, you are in the right place — check `git worktree list` and
-   continue.
+   pre-commit hook finds them.
 
 ## Implement
 
@@ -68,7 +83,8 @@ design doc. Your job is to implement it faithfully and prove it.
     `.venv/bin/smc doctor` if `smc.hardware` changed. Check the diff for
     `print`, hard-coded device labels, units without suffixes,
     `read_text()` without `encoding`.
-11. Push (`git push -u origin feat/<N>-<slug>`), open the PR with the
+11. Push (`git push -u origin feat/<N>-<slug>`; the SSH workaround of step
+    5 if needed), open the PR with the
     template (`gh pr create --fill --body-file …`, `Closes #N`, conventional
     title), then watch CI: `gh pr checks --watch`. Fix CI failures; never
     disable a check to pass.

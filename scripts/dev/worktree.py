@@ -1,26 +1,37 @@
 """Worktree helpers for execution sessions.
 
-Every `/develop` session works in its own git worktree (created by Claude
-Code's EnterWorktree under ``.claude/worktrees/``). A worktree has no
-virtual environment, and the main checkout's ``.venv`` is an *editable*
-install that imports the main checkout's ``src/`` — so tests run from a
-worktree with that venv would test the wrong code. ``setup`` gives the
-worktree its own ``.venv`` and proves the import points inside it.
+Every `/develop` session works in its own git worktree, created by Claude
+Code's EnterWorktree under ``.claude/worktrees/``. A worktree has no virtual
+environment, and the main checkout's ``.venv`` is an *editable* install that
+imports the main checkout's ``src/`` - tests run from a worktree with that
+venv would test the wrong code. ``setup`` gives the worktree its own
+``.venv``, built from the same interpreter as the main checkout's, and
+proves that ``smc`` imports from inside the worktree.
 
-    python scripts/dev/worktree.py setup            # in the worktree
+    python scripts/dev/worktree.py setup [--python PATH]   # in the worktree
     python scripts/dev/worktree.py list
-    python scripts/dev/worktree.py clean [--dry-run] # remove worktrees whose branch is merged into origin/main
+    python scripts/dev/worktree.py clean [--dry-run]       # from the main checkout
 
-Stdlib only, Windows included.
+"Merged" is asked of GitHub (``gh``), by head branch. Git ancestry cannot
+answer it: a squash merge leaves no ancestry to find, and a fresh branch
+with no commits yet *is* an ancestor of main without being done - removing
+its worktree would destroy a session that has just started. Without ``gh``
+nothing is removed.
+
+Stdlib only, Windows included, ASCII output (a redirected stream on Windows
+cannot encode check marks, #42).
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+MIN_PYTHON = (3, 10)
 
 
 def run(*args: str, cwd: Path | None = None, check: bool = True) -> str:
@@ -34,7 +45,7 @@ def run(*args: str, cwd: Path | None = None, check: bool = True) -> str:
     )
     if check and proc.returncode != 0:
         sys.stderr.write(proc.stdout + proc.stderr)
-        raise SystemExit(f"{' '.join(args[:3])}… failed ({proc.returncode})")
+        raise SystemExit(f"{' '.join(args[:3])}... failed ({proc.returncode})")
     return proc.stdout
 
 
@@ -45,43 +56,109 @@ def venv_python(root: Path) -> Path:
 
 
 def repo_root(start: Path) -> Path:
-    return Path(run("git", "rev-parse", "--show-toplevel", cwd=start).strip())
+    return Path(run("git", "rev-parse", "--show-toplevel", cwd=start).strip()).resolve()
 
 
-def cmd_setup(path: Path) -> int:
+def main_checkout(start: Path) -> Path:
+    """The checkout that owns the shared ``.git`` directory."""
+    common = Path(run("git", "rev-parse", "--git-common-dir", cwd=start).strip())
+    if not common.is_absolute():
+        common = start / common
+    return common.resolve().parent
+
+
+def base_interpreter(checkout: Path) -> str | None:
+    """The interpreter the main checkout's ``.venv`` was built from, if any.
+
+    Building every worktree's venv from the same interpreter keeps dependency
+    versions (numpy, mypy's view of the stubs) identical to the design
+    session's, instead of whatever ``python`` an agent shell happens to find.
+    """
+    cfg = checkout / ".venv" / "pyvenv.cfg"
+    if not cfg.is_file():
+        return None
+    values: dict[str, str] = {}
+    for line in cfg.read_text(encoding="utf-8").splitlines():
+        key, sep, value = line.partition("=")
+        if sep:
+            values[key.strip().lower()] = value.strip()
+    executable = values.get("executable", "")
+    if executable and Path(executable).is_file():
+        return executable
+    home = values.get("home", "")
+    names = ("python.exe",) if os.name == "nt" else ("python3", "python")
+    for name in names:
+        candidate = Path(home) / name
+        if home and candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def python_version(executable: str) -> tuple[int, int] | None:
+    try:
+        proc = subprocess.run(
+            [executable, "-c", "import sys; print(*sys.version_info[:2])"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    major, minor = proc.stdout.split()
+    return int(major), int(minor)
+
+
+def cmd_setup(path: Path, python: str | None) -> int:
     root = repo_root(path)
     py = venv_python(root)
     if not py.exists():
-        print(f"creating {root / '.venv'} with {sys.executable}")
-        run(sys.executable, "-m", "venv", str(root / ".venv"))
-    print("installing the project (editable) and dev tools …")
+        base = python or base_interpreter(main_checkout(root)) or sys.executable
+        version = python_version(base)
+        if version is None or version < MIN_PYTHON:
+            found = (
+                "not runnable"
+                if version is None
+                else f"Python {version[0]}.{version[1]}"
+            )
+            print(
+                f"error: {base} is {found}; this project needs Python >= 3.10. "
+                f"Pass --python PATH.",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"creating {root / '.venv'} with {base} (Python {version[0]}.{version[1]})"
+        )
+        run(base, "-m", "venv", str(root / ".venv"))
+    print("installing the project (editable) and dev tools ...")
     run(str(py), "-m", "pip", "install", "--quiet", "--upgrade", "pip")
     run(str(py), "-m", "pip", "install", "--quiet", "-e", ".[dev]", cwd=root)
 
-    where = run(
-        str(py),
-        "-c",
-        "import smc, pathlib; print(pathlib.Path(smc.__file__).resolve())",
-    ).strip()
-    if not where.startswith(str(root.resolve())):
+    probe = "import smc, pathlib; print(pathlib.Path(smc.__file__).resolve())"
+    where = Path(run(str(py), "-c", probe).strip())
+    if not where.is_relative_to(root):
         print(
-            f"✗ smc imports from {where}, not from this worktree ({root})",
+            f"error: smc imports from {where}, not from this worktree ({root})",
             file=sys.stderr,
         )
         return 1
-    print(f"✓ smc imports from {where}")
-    print("✓ worktree ready. Use its tools explicitly:")
+    print(f"ok: smc imports from {where}")
     bindir = py.parent
+    print("ok: worktree ready. Use its tools explicitly:")
     print(f"    {bindir / 'ruff'} check . && {bindir / 'mypy'} && {bindir / 'pytest'}")
     print("  and commit with the venv on PATH so the shared pre-commit hook finds it:")
     if os.name == "nt":
-        print(f'    $env:PATH = "{bindir};" + $env:PATH; git commit …')
+        print(f'    $env:PATH = "{bindir};" + $env:PATH; git commit ...')
     else:
-        print(f'    PATH="{bindir}:$PATH" git commit …')
+        print(f'    PATH="{bindir}:$PATH" git commit ...')
     return 0
 
 
 def worktrees(root: Path) -> list[tuple[Path, str]]:
+    """``(path, branch)`` for every worktree; branch is "" when detached."""
     out = run("git", "worktree", "list", "--porcelain", cwd=root)
     found: list[tuple[Path, str]] = []
     path: Path | None = None
@@ -97,46 +174,88 @@ def worktrees(root: Path) -> list[tuple[Path, str]]:
     return found
 
 
-def is_merged(root: Path, branch: str) -> bool:
+def pr_state(root: Path, branch: str) -> str:
+    """The state of the pull requests whose head is ``branch``, asked of GitHub.
+
+    One of ``merged``, ``open``, ``closed``, ``no PR``, ``detached`` or
+    ``unknown`` (no ``gh``, or ``gh`` failed). Only ``merged`` allows removal.
+    """
+    if not branch:
+        return "detached"
+    if shutil.which("gh") is None:
+        return "unknown"
     proc = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", branch, "origin/main"],
+        [
+            "gh",
+            "pr",
+            "list",
+            "--head",
+            branch,
+            "--state",
+            "all",
+            "--json",
+            "state",
+            "--jq",
+            '[.[].state] | join(",")',
+        ],
         cwd=root,
         capture_output=True,
         text=True,
         encoding="utf-8",
+        errors="replace",
     )
-    return proc.returncode == 0
+    if proc.returncode != 0:
+        return "unknown"
+    states = {s for s in proc.stdout.strip().split(",") if s}
+    for state in ("MERGED", "OPEN", "CLOSED"):
+        if state in states:
+            return state.lower()
+    return "no PR"
 
 
 def cmd_list(root: Path) -> int:
-    run("git", "fetch", "--quiet", "origin", "main", cwd=root, check=False)
+    main = main_checkout(root)
     for path, branch in worktrees(root):
-        state = "merged" if branch and is_merged(root, branch) else "open"
-        print(f"{state:7s} {branch or '(detached)':40s} {path}")
+        state = "main" if path.resolve() == main else pr_state(root, branch)
+        print(f"{state:8s} {branch or '(detached)':40s} {path}")
     return 0
 
 
 def cmd_clean(root: Path, dry_run: bool) -> int:
-    run("git", "fetch", "--quiet", "origin", "main", cwd=root, check=False)
+    main = main_checkout(root)
+    managed = (main / ".claude" / "worktrees").resolve()
     here = Path.cwd().resolve()
-    managed = (root / ".claude" / "worktrees").resolve()
     removed = 0
     for path, branch in worktrees(root):
-        if not str(path.resolve()).startswith(str(managed)):
+        resolved = path.resolve()
+        if not resolved.is_relative_to(managed):
             continue
-        if path.resolve() == here or path.resolve() in here.parents:
-            print(f"skip    {branch:40s} {path}  (you are in it)")
+        if here == resolved or here.is_relative_to(resolved):
+            print(f"skip     {branch:40s} {path}  (you are in it)")
             continue
-        if not branch or not is_merged(root, branch):
-            print(f"keep    {branch or '(detached)':40s} {path}  (not merged)")
+        state = pr_state(root, branch)
+        if state != "merged":
+            print(f"keep     {branch or '(detached)':40s} {path}  ({state})")
             continue
-        print(f"{'would remove' if dry_run else 'remove'}  {branch:40s} {path}")
-        if not dry_run:
-            run("git", "worktree", "remove", str(path), cwd=root)
-            run("git", "branch", "-D", branch, cwd=root, check=False)
-            removed += 1
+        print(f"{'would remove' if dry_run else 'remove':8s} {branch:40s} {path}")
+        if dry_run:
+            continue
+        proc = subprocess.run(
+            ["git", "worktree", "remove", str(path)],
+            cwd=main,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if proc.returncode != 0:
+            reason = (proc.stderr.strip().splitlines() or ["unknown reason"])[-1]
+            print(f"         kept: git refused ({reason})")
+            continue
+        run("git", "branch", "-D", branch, cwd=main, check=False)
+        removed += 1
     if not dry_run:
-        run("git", "worktree", "prune", cwd=root)
+        run("git", "worktree", "prune", cwd=main)
         print(f"{removed} worktree(s) removed")
     return 0
 
@@ -147,19 +266,24 @@ def main() -> int:
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser(
-        "setup", help="create this worktree's .venv and install the project into it"
+        "setup", help="create this worktree's .venv and install the project"
     )
     s.add_argument(
         "--path", default=".", help="the worktree (default: current directory)"
     )
-    sub.add_parser("list", help="worktrees with their branch and merged state")
+    s.add_argument(
+        "--python",
+        default=None,
+        help="interpreter for the new .venv (default: the main checkout's .venv base)",
+    )
+    sub.add_parser("list", help="worktrees with the state of their pull request")
     c = sub.add_parser(
-        "clean", help="remove managed worktrees whose branch is merged into origin/main"
+        "clean", help="remove managed worktrees whose pull request is merged"
     )
     c.add_argument("--dry-run", action="store_true")
     ns = ap.parse_args()
     if ns.cmd == "setup":
-        return cmd_setup(Path(ns.path).resolve())
+        return cmd_setup(Path(ns.path).resolve(), ns.python)
     root = repo_root(Path.cwd())
     if ns.cmd == "list":
         return cmd_list(root)
