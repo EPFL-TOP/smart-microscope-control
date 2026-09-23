@@ -73,6 +73,22 @@ _KILL_WAIT_S = 10.0
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
+def _decode_console_bytes(data: bytes) -> str:
+    """Decode a Windows console tool's raw output.
+
+    ``taskkill`` writes the console (OEM) code page, not UTF-8 — the same
+    mismatch ``os_inventory.py``'s PowerShell call works around by forcing
+    ``[Console]::OutputEncoding``, which a plain ``.exe`` offers no way to
+    do. The ``oem`` codec exists only on a real Windows interpreter; falling
+    back keeps this decodable everywhere else (tests that simulate the
+    Windows branch on macOS/Linux included).
+    """
+    try:
+        return data.decode("oem", "replace").strip()
+    except LookupError:
+        return data.decode("utf-8", "replace").strip()
+
+
 def _kill_child_tree(child: subprocess.Popen[bytes]) -> str | None:
     """Kill the child and any helper process it started (FM-35).
 
@@ -101,11 +117,7 @@ def _kill_child_tree(child: subprocess.Popen[bytes]) -> str | None:
             return f"taskkill failed: {exc}"
         child.kill()
         if result.returncode != 0:
-            detail = (
-                (result.stderr or result.stdout or b"")
-                .decode("utf-8", "replace")
-                .strip()
-            )
+            detail = _decode_console_bytes(result.stderr or result.stdout or b"")
             return f"taskkill failed: {detail}" if detail else "taskkill failed"
         return None
     with contextlib.suppress(ProcessLookupError):
@@ -391,9 +403,13 @@ def mm_section(
         doing = _last_progress(stderr_path)
         during = f" while {doing}" if doing else ""
         if returncode is None:
+            # The direct child dying (unstoppable stays False) does not mean
+            # the tree died: if the tree kill itself failed (kill_detail),
+            # a helper it started may still be running and holding the
+            # hardware, the exact case this wording exists to flag (FM-35).
             stopped = (
                 "could not be stopped (it may still hold the hardware)"
-                if unstoppable
+                if unstoppable or kill_detail
                 else "was stopped"
             )
             detail = f"; {kill_detail}" if kill_detail else ""

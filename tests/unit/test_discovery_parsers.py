@@ -82,6 +82,24 @@ def test_pnp_ids_are_read_by_bus() -> None:
             [
                 {
                     "Status": "OK",
+                    "Class": "Camera",
+                    "FriendlyName": "Photometrics PCIe Interface",
+                    "InstanceId": "PCI\\VEN_1B6B&DEV_0001&SUBSYS_00011B6B\\0",
+                },
+                {
+                    "Status": "OK",
+                    "Class": "Ports",
+                    "FriendlyName": "USB Serial Port",
+                    "InstanceId": "USB\\VID_04B0&PID_0A01\\5&1C2&0&3",
+                },
+                {
+                    "Status": "OK",
+                    "Class": "Ports",
+                    "FriendlyName": "USB Serial Port (COM3)",
+                    "InstanceId": "FTDIBUS\\VID_0403+PID_6001+A12345BA\\0000",
+                },
+                {
+                    "Status": "OK",
                     "Class": "System",
                     "FriendlyName": "System board",
                     "InstanceId": "ACPI\\VEN_INT&DEV_33A0\\0",
@@ -97,8 +115,11 @@ def test_pnp_ids_are_read_by_bus() -> None:
     )
 
     assert [(e.vendor_id, e.product_id) for e in entries] == [
-        (None, None),
-        (None, None),
+        ("1B6B", "0001"),  # PCI: VEN_/DEV_
+        ("04B0", "0A01"),  # USB: VID_/PID_
+        ("0403", "6001"),  # FTDIBUS: VID_/PID_, + separated
+        (None, None),  # ACPI: neither
+        (None, None),  # HDAUDIO: neither
     ]
 
 
@@ -162,12 +183,14 @@ def test_system_profiler_json_is_parsed() -> None:
     assert ftdi.serial_number == "A12345BA"
 
 
-def test_macos_usb_reads_both_data_types() -> None:
+def test_macos_usb_host_buses_contribute_no_phantom_devices() -> None:
     # `system_profiler SPUSBDataType SPUSBHostDataType -json`: one call, two
-    # top-level keys. SPUSBHostDataType is the real output of this command on
-    # an Apple Silicon Mac (tests/data/system_profiler_usbhost.json, serial
-    # numbers and location IDs stripped): host controllers only, no vendor ID,
-    # so they must not be read as devices.
+    # top-level keys. This is the real output of that command's
+    # SPUSBHostDataType half on an Apple Silicon Mac
+    # (tests/data/system_profiler_usbhost.json, serial numbers and location
+    # IDs stripped): host controllers only, no vendor ID, so they must not
+    # be read as devices — this machine has nothing plugged in, and a device
+    # actually present under SPUSBHostDataType is covered separately below.
     host = json.loads(
         (Path(__file__).parents[1] / "data" / "system_profiler_usbhost.json").read_text(
             encoding="utf-8"
@@ -178,6 +201,34 @@ def test_macos_usb_reads_both_data_types() -> None:
     entries = parse_system_profiler(json.dumps(combined))
 
     assert [e.name for e in entries] == ["USB2.0 Hub", "FT232R USB UART"]
+
+
+def test_macos_usb_finds_a_device_present_only_under_the_host_data_type() -> None:
+    # A device can be reported only under SPUSBHostDataType (a hub attached
+    # directly to a host controller, with nothing under SPUSBDataType at
+    # all in this input) — proves the second key is genuinely walked, not
+    # just accepted and ignored.
+    host_only = json.dumps(
+        {
+            "SPUSBHostDataType": [
+                {
+                    "_name": "USB 3.1 Bus",
+                    "Driver": "AppleT6000USBXHCI",
+                    "_items": [
+                        {
+                            "_name": "Host-only Hub",
+                            "vendor_id": "0x1234",
+                            "product_id": "0x5678",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    entries = parse_system_profiler(host_only)
+
+    assert [e.name for e in entries] == ["Host-only Hub"]
 
 
 LSPCI = """\

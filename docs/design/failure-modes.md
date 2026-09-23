@@ -47,14 +47,14 @@ category is not here: an id, what happens, and how to check.
 - **FM-32 Unbounded options.** `nan`, `inf`, negative or huge values reach `subprocess`. *Check*: bounds plus `math.isfinite`.
 - **FM-33 A child's working directory is on `sys.path`.** *Check*: children run from a neutral directory.
 - **FM-34 A failed write hides the report.** Writing the files first (FM-30) and exiting on an `OSError` loses the on-screen result of minutes of work (review of #47). *Check*: on a write error, still print what was collected, then the one-line error and the exit code.
-- **FM-35 Killed is not gone.** `kill()` stops only the direct child: a helper process it started survives and may keep holding the hardware, and a process stuck in a driver call may not die, so an unbounded `wait()` after `kill()` hangs (review of #47, reproduced on macOS). *Check*: the wait after `kill()` has a timeout and its failure is a note; kill the process tree where helpers are expected.
+- **FM-35 Killed is not gone.** `kill()` stops only the direct child: a helper process it started survives and may keep holding the hardware, and a process stuck in a driver call may not die, so an unbounded `wait()` after `kill()` hangs (review of #47, reproduced on macOS). *Check*: the wait after `kill()` has a timeout and its failure is a note; kill the process tree where helpers are expected. A tree kill that itself fails (`taskkill` denied or missing) but leaves the direct child dead is not a clean stop: the note says so — "could not be stopped" — instead of reading as resolved with the failure buried as a trailing detail (two reviewers, #50).
 
 ## Tests
 
 - **FM-40 The default suite touches vendor adapters or hardware.** A microscope PC has the full nightly installed. *Check*: tests pin adapter lists to the test adapters (`DemoCamera`, `Utilities`, `SequenceTester`, `NotificationTester`).
 - **FM-41 Assertions that an adapter is absent** break on a full install.
 - **FM-42 `CliRunner` hides encoding problems.** *Check*: a subprocess test with `PYTHONIOENCODING=cp1252` and stdout to a file.
-- **FM-43 A test that cannot fail.** *Check*: break the line under test and watch the test fail. For a rule table held as data, break each row's fields in turn: a line-by-line sweep misses rows (#6).
+- **FM-43 A test that cannot fail.** *Check*: break the line under test and watch the test fail. For a rule table held as data, break each row's fields in turn: a line-by-line sweep misses rows (#6). For a test merging a real captured fixture into a synthetic sample (e.g. two `system_profiler` keys), the fixture can happen to contribute nothing usable, so the test passes whether or not the new key is actually read; check by removing the code path under test and confirming the assertion changes, not just that nothing crashes (#50).
 - **FM-44 A threading test that hangs instead of failing.** A deadlock in the code under test freezes the suite until CI kills it, with no diagnosis. *Check*: threads meet on `threading.Event`; every `join(timeout=...)` is followed by `assert not t.is_alive()`; no assertion on timing tighter than about 0.5 s (Windows sleeps in steps of about 15 ms); interrupts are raised from stubs, not sent as signals.
 
 ## Data

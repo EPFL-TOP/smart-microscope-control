@@ -636,6 +636,57 @@ def test_kill_child_tree_on_windows_survives_taskkill_itself_failing(
     assert child.killed
 
 
+class _WindowsChildDiesOnPlainKillOnly:
+    """taskkill fails, but the direct child dies from the ``kill()`` fallback.
+
+    A helper the child started (the case ``taskkill /T`` exists to reach)
+    is not represented here at all — that is the point: nothing observes
+    whether it died, so the note must not claim the child "was stopped".
+    """
+
+    pid = 5555
+
+    def __init__(self, *_: object, **__: object) -> None:
+        self._waits = 0
+
+    def wait(self, timeout: float | None = None) -> int:
+        self._waits += 1
+        if self._waits == 1:
+            raise mm_inventory.subprocess.TimeoutExpired("child", timeout)
+        return -9
+
+    def kill(self) -> None:
+        pass
+
+
+def test_mm_section_warns_when_the_tree_kill_fails_even_if_the_child_dies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-35: a failing taskkill /T means a helper process may still be
+    # alive and holding the hardware, even though the plain kill()
+    # fallback did stop the direct child. The note must say so, not "was
+    # stopped" with the failure buried as a trailing detail.
+    monkeypatch.setattr(mm_inventory.sys, "platform", "win32")
+    monkeypatch.setattr(
+        mm_inventory.subprocess, "Popen", _WindowsChildDiesOnPlainKillOnly
+    )
+    monkeypatch.setattr(
+        mm_inventory.subprocess,
+        "run",
+        lambda command, **k: subprocess.CompletedProcess(
+            command, 1, stdout=b"", stderr=b"Access denied"
+        ),
+    )
+
+    _, _, notes = mm_inventory.mm_section(["DemoCamera"], timeout_s=1)
+
+    (note,) = [n for n in notes if n.startswith("adapters:")]
+    assert "could not be stopped" in note
+    assert "may still hold the hardware" in note
+    assert "was stopped" not in note
+    assert "Access denied" in note
+
+
 def test_adapter_child_runs_without_a_console_window(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
