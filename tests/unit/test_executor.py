@@ -473,7 +473,7 @@ def test_halt_during_the_guard_refuses_before_the_command() -> None:
 
 
 def test_lock_timeout_names_the_holder() -> None:
-    executor = _ex(lock_timeout_s=0.2)
+    executor = _ex(lock_timeout_s=0.5)
     entered, release = threading.Event(), threading.Event()
 
     def hung_snap() -> None:
@@ -489,12 +489,12 @@ def test_lock_timeout_names_the_holder() -> None:
         release.set()
         holder.join()
     assert info.value.holder == "camera: snap"
-    assert 0.2 <= info.value.held_s < JOIN_S
+    assert 0.5 <= info.value.held_s < JOIN_S
     assert "camera: snap has held the microscope for" in str(info.value)
 
 
 def test_nested_call_keeps_the_outer_holder() -> None:
-    executor = _ex(lock_timeout_s=0.2)
+    executor = _ex(lock_timeout_s=0.5)
     entered, release = threading.Event(), threading.Event()
 
     def hung() -> None:
@@ -548,3 +548,25 @@ def test_stop_without_a_stop_callable_says_it_cannot() -> None:
     executor, dichroic = _ex(), _Device("Dichroic", stoppable=False)
     with pytest.raises(HardwareError, match="cannot be stopped from smc"):
         executor.stop(dichroic.motion)
+
+
+def test_lock_timeout_during_a_wait_sends_stop_and_reraises() -> None:
+    # §13: MicroscopeBusyError on a poll is like any other exception in a
+    # wait: the waiter gives up, so the stage is stopped first (FM-17).
+    executor, xy = _ex(lock_timeout_s=0.5), _Device(stop_clears=False)
+    _start(executor, xy)
+    entered, release = threading.Event(), threading.Event()
+
+    def hung_snap() -> None:
+        entered.set()
+        release.wait(JOIN_S)
+
+    holder = _Thread(lambda: executor.read(hung_snap, description="camera: snap"))
+    assert entered.wait(JOIN_S)
+    try:
+        with pytest.raises(MicroscopeBusyError, match="camera: snap"):
+            executor.wait(xy.motion, 30.0)
+    finally:
+        release.set()
+        holder.join()
+    assert xy.stops == 1

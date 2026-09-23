@@ -331,6 +331,10 @@ class Executor:
             MotionStoppedError: The motion went idle because it was stopped.
             DeviceTimeoutError: Still busy at the deadline; the stop was sent,
                 or the message says why not.
+            MicroscopeBusyError: A poll could not take the lock in time (another
+                call holds it, FM-15). As for any other exception, including
+                ``KeyboardInterrupt``, the stop is sent first: nobody is left
+                watching the move (design §13).
         """
         if not math.isfinite(timeout_s) or timeout_s < 0:
             # nan would make the deadline comparison always false: an endless wait.
