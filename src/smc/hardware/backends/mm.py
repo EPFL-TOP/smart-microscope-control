@@ -13,10 +13,13 @@ Hardware behaviour encoded here:
   moves the one the role names.
 * **Readback.** A mutation returns what the device reports afterwards, not
   what was asked: stages round to their step size, cameras clamp exposure.
-* **Waiting.** ``wait`` polls ``deviceBusy`` every 10 ms against a deadline
-  (default: the core timeout, which the facade raises to 60 s because a
-  plate traverse outlasts MMCore's 5 s default, FM-10) and raises
-  ``DeviceTimeoutError`` with what to change, never hangs forever.
+* **Waiting outside the lock** (design §13). A move sends its command under
+  the microscope lock and registers the stage as a ``Motion``; the wait
+  that follows polls ``deviceBusy`` through ``Executor.wait``, which takes
+  the lock for each poll only, so readers and ``stop()`` get through during
+  a plate traverse (FM-16). The deadline defaults to the core timeout, which
+  the facade raises to 60 s because a plate traverse outlasts MMCore's 5 s
+  default (FM-10); a wait that gives up stops the stage first (FM-17).
 * **Pixel size is measured or unknown.** MMCore's calibrated value when it
   has one, else the profile's value for the current objective, else ``0.0``.
 * **Dry-run reads real state.** Safety checks and the position a relative
@@ -27,12 +30,12 @@ from __future__ import annotations
 
 import logging
 import math
-import time
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING
 
 from smc.hardware.capabilities import XY, Limits, PropertyInfo
-from smc.hardware.errors import DeviceTimeoutError, HardwareError
+from smc.hardware.errors import HardwareError
+from smc.hardware.safety import Motion
 
 if TYPE_CHECKING:
     import numpy as np
@@ -44,26 +47,30 @@ __all__ = ["MMCamera", "MMProperties", "MMShutter", "MMXYStage", "MMZStage"]
 
 logger = logging.getLogger("smc.hardware.backends.mm")
 
-#: How often ``wait`` asks the device whether it is still busy.
-POLL_INTERVAL_S = 0.01
+#: Device types whose ``setProperty`` can start a movement (a turret, a
+#: filter wheel, a light path, a stage): such a set is a motion (§13).
+_MOVING_TYPES = frozenset({"State", "Stage", "XYStage"})
+#: Of those, the ones MMCore can stop; a ``State`` device has no stop.
+_STOPPABLE_TYPES = frozenset({"Stage", "XYStage"})
 
 
-def _wait_until_idle(core: CMMCorePlus, label: str, timeout_s: float | None) -> None:
-    """Poll ``deviceBusy`` until idle or the deadline; raise ``DeviceTimeoutError``."""
-    if timeout_s is None:
-        timeout_s = core.getTimeoutMs() / 1000.0
-    if not math.isfinite(timeout_s) or timeout_s < 0:
-        # nan would make the deadline comparison always false: an endless wait.
-        raise ValueError(f"timeout_s must be finite and >= 0, got {timeout_s!r}")
-    deadline = time.monotonic() + timeout_s
-    while core.deviceBusy(label):
-        if time.monotonic() >= deadline:
-            raise DeviceTimeoutError(
-                f"{label} is still busy after {timeout_s:g} s. If the move is "
-                f"legitimately long, raise [micromanager] device_timeout_ms in "
-                f"the profile; otherwise check the device and its cabling."
-            )
-        time.sleep(POLL_INTERVAL_S)
+def _motion(core: CMMCorePlus, label: str, name: str, *, stoppable: bool) -> Motion:
+    def stop() -> None:
+        core.stop(label)
+
+    return Motion(
+        device=label,
+        name=name,
+        is_busy=lambda: bool(core.deviceBusy(label)),
+        stop=stop if stoppable else None,
+    )
+
+
+def _timeout_s(core: CMMCorePlus, executor: Executor, timeout_s: float | None) -> float:
+    """``timeout_s``, or the core timeout when ``None`` (design §2)."""
+    if timeout_s is not None:
+        return float(timeout_s)
+    return executor.read(lambda: core.getTimeoutMs() / 1000.0)
 
 
 class MMXYStage:
@@ -76,6 +83,7 @@ class MMXYStage:
         self._label = label
         self._executor = executor
         self._safety = safety
+        self._motion = _motion(core, label, f"xy_stage {label}", stoppable=True)
 
     def _read_position(self) -> XY:
         return XY(
@@ -87,14 +95,29 @@ class MMXYStage:
         """Where the stage reports it is."""
         return self._executor.read(self._read_position)
 
-    def _move(self, description: str, x_um: float, y_um: float, wait: bool) -> XY:
-        def action() -> XY:
-            self._core.setXYPosition(self._label, x_um, y_um)
-            if wait:
-                _wait_until_idle(self._core, self._label, None)
-            return self._read_position()
+    def _command(self, description: str, x_um: float, y_um: float) -> None:
+        """Send the move under the lock; the stage is registered as moving."""
 
-        return self._executor.do(description, action, dry_result=XY(x_um, y_um))
+        def action() -> None:
+            self._core.setXYPosition(self._label, x_um, y_um)
+
+        self._executor.do(description, action, dry_result=None, motion=self._motion)
+
+    def _finish(self, x_um: float, y_um: float, wait: bool) -> XY:
+        """Wait outside the lock (FM-16), then read back; dry-run returns the command."""
+        if self._executor.dry_run:
+            return XY(x_um, y_um)
+        if wait:
+            self._executor.wait(
+                self._motion, _timeout_s(self._core, self._executor, None)
+            )
+        return self._executor.read(
+            self._read_position, description="xy_stage: position"
+        )
+
+    def _move(self, description: str, x_um: float, y_um: float, wait: bool) -> XY:
+        self._command(description, x_um, y_um)
+        return self._finish(x_um, y_um, wait)
 
     def move_to_um(self, x_um: float, y_um: float, *, wait: bool = True) -> XY:
         """Move to an absolute position (soft limits apply, no jog guard).
@@ -113,9 +136,9 @@ class MMXYStage:
         """Move relative to the live position; jog-guarded unless ``force``.
 
         The target is computed from a live read and moved to absolutely, so the
-        soft-limit check sees the real destination, and the whole
-        read-check-move runs under the lock (another thread cannot move the
-        stage in between).
+        soft-limit check sees the real destination, and the read-check-command
+        runs in one lock section (another thread cannot move the stage in
+        between). The wait and the readback come after that section ends.
         """
         dx_um, dy_um = float(dx_um), float(dy_um)
         self._safety.check_jog_um(dx_um, dy_um, force=force)
@@ -124,24 +147,35 @@ class MMXYStage:
             here = self._read_position()
             x_um, y_um = here.x_um + dx_um, here.y_um + dy_um
             self._safety.check_xy_target_um(x_um, y_um)
-            return self._move(
+            self._command(
                 f"xy_stage: move_by ({dx_um}, {dy_um}) µm to ({x_um}, {y_um}) µm",
                 x_um,
                 y_um,
-                wait,
             )
+            return XY(x_um, y_um)
 
-        return self._executor.read(relative)
+        target = self._executor.read(
+            relative, description=f"xy_stage: move_by ({dx_um}, {dy_um}) µm"
+        )
+        return self._finish(target.x_um, target.y_um, wait)
 
     def wait(self, timeout_s: float | None = None) -> None:
-        """Block until idle; ``DeviceTimeoutError`` after ``timeout_s`` (default: core timeout)."""
-        self._executor.read(
-            lambda: _wait_until_idle(self._core, self._label, timeout_s)
+        """Block until idle; ``DeviceTimeoutError`` after ``timeout_s`` (default: core timeout).
+
+        The stage is stopped before a timeout or an interrupt propagates, and a
+        move that was stopped raises ``MotionStoppedError``.
+        """
+        self._executor.wait(
+            self._motion, _timeout_s(self._core, self._executor, timeout_s)
         )
 
     def is_busy(self) -> bool:
         """Whether the stage reports it is still moving."""
         return self._executor.read(lambda: bool(self._core.deviceBusy(self._label)))
+
+    def stop(self) -> None:
+        """Stop the stage now, without waiting for the microscope lock (§13)."""
+        self._executor.stop(self._motion)
 
     def limits_um(self) -> tuple[Limits, Limits] | None:
         """The configured soft limits as ``(x, y)``; ``None`` when none are configured."""
@@ -162,6 +196,7 @@ class MMZStage:
         self._label = label
         self._executor = executor
         self._safety = safety
+        self._motion = _motion(core, label, f"z {label}", stoppable=True)
 
     def _read_position(self) -> float:
         return float(self._core.getPosition(self._label))
@@ -170,14 +205,27 @@ class MMZStage:
         """Where the drive reports it is."""
         return self._executor.read(self._read_position)
 
-    def _move(self, description: str, z_um: float, wait: bool) -> float:
-        def action() -> float:
-            self._core.setPosition(self._label, z_um)
-            if wait:
-                _wait_until_idle(self._core, self._label, None)
-            return self._read_position()
+    def _command(self, description: str, z_um: float) -> None:
+        """Send the move under the lock; the drive is registered as moving."""
 
-        return self._executor.do(description, action, dry_result=z_um)
+        def action() -> None:
+            self._core.setPosition(self._label, z_um)
+
+        self._executor.do(description, action, dry_result=None, motion=self._motion)
+
+    def _finish(self, z_um: float, wait: bool) -> float:
+        """Wait outside the lock (FM-16), then read back; dry-run returns the command."""
+        if self._executor.dry_run:
+            return z_um
+        if wait:
+            self._executor.wait(
+                self._motion, _timeout_s(self._core, self._executor, None)
+            )
+        return self._executor.read(self._read_position, description="z: position")
+
+    def _move(self, description: str, z_um: float, wait: bool) -> float:
+        self._command(description, z_um)
+        return self._finish(z_um, wait)
 
     def move_to_um(self, z_um: float, *, wait: bool = True) -> float:
         """Move to an absolute position (soft limits apply).
@@ -191,25 +239,39 @@ class MMZStage:
         return self._move(f"z: move_to {z_um} µm", z_um, wait)
 
     def move_by_um(self, dz_um: float, *, wait: bool = True) -> float:
-        """Move relative to the live position (soft limits apply to the target)."""
+        """Move relative to the live position (soft limits apply to the target).
+
+        Read, check and command run in one lock section; the wait and the
+        readback come after it, as for ``XYStage.move_by_um``.
+        """
         dz_um = float(dz_um)
 
         def relative() -> float:
             z_um = self._read_position() + dz_um
             self._safety.check_z_target_um(z_um)
-            return self._move(f"z: move_by {dz_um} µm to {z_um} µm", z_um, wait)
+            self._command(f"z: move_by {dz_um} µm to {z_um} µm", z_um)
+            return z_um
 
-        return self._executor.read(relative)
+        target = self._executor.read(relative, description=f"z: move_by {dz_um} µm")
+        return self._finish(target, wait)
 
     def wait(self, timeout_s: float | None = None) -> None:
-        """Block until idle; ``DeviceTimeoutError`` after ``timeout_s`` (default: core timeout)."""
-        self._executor.read(
-            lambda: _wait_until_idle(self._core, self._label, timeout_s)
+        """Block until idle; ``DeviceTimeoutError`` after ``timeout_s`` (default: core timeout).
+
+        The drive is stopped before a timeout or an interrupt propagates, and a
+        move that was stopped raises ``MotionStoppedError``.
+        """
+        self._executor.wait(
+            self._motion, _timeout_s(self._core, self._executor, timeout_s)
         )
 
     def is_busy(self) -> bool:
         """Whether the drive reports it is still moving."""
         return self._executor.read(lambda: bool(self._core.deviceBusy(self._label)))
+
+    def stop(self) -> None:
+        """Stop the drive now, without waiting for the microscope lock (§13)."""
+        self._executor.stop(self._motion)
 
     def limits_um(self) -> Limits | None:
         """The configured soft limits; ``None`` when none are configured."""
@@ -253,9 +315,15 @@ class MMCamera:
     def snap(self) -> np.ndarray:
         """One frame, exactly as MMCore returns it (no copy, no flip).
 
-        Unbounded (FM-15): ``snapImage`` has no timeout of its own, and it runs
-        under the microscope lock, so a hung camera driver stalls every other
-        capability until the design bounds it.
+        An acquisition (§13): refused while halted or while a device the layer
+        moved is still moving, because a frame taken mid-move is a wrong
+        result.
+
+        Unbounded (FM-15): ``snapImage`` has no timeout of its own, and a thread
+        inside a driver call cannot be cancelled. It runs under the microscope
+        lock, so a hung camera driver holds it; other callers then fail after
+        the lock timeout with ``MicroscopeBusyError`` naming "camera: snap"
+        instead of hanging, and ``stop()`` still gets through.
         """
 
         def action() -> np.ndarray:
@@ -263,7 +331,7 @@ class MMCamera:
             self._core.snapImage()
             return self._core.getImage()
 
-        return self._executor.read(action)
+        return self._executor.read(action, at_rest=True, description="camera: snap")
 
     def exposure_ms(self) -> float:
         """The current exposure time."""
@@ -295,7 +363,7 @@ class MMCamera:
                 f"camera: exposure {value_ms} ms", action, dry_result=value_ms
             )
 
-        return self._executor.read(checked)
+        return self._executor.read(checked, description="camera: exposure")
 
     def image_shape(self) -> tuple[int, int]:
         """``(height, width)`` of the frames ``snap`` returns."""
@@ -460,23 +528,51 @@ class MMProperties:
     def set(self, device: str, name: str, value: str | float | int) -> str:
         """Set one property; return the readback.
 
+        On a ``State``, ``Stage`` or ``XYStage`` device the set can start a
+        movement (a turret, a filter wheel, a light path), so it is a motion
+        (§13): it waits, outside the lock, for the device to report idle
+        before reading back, with the core timeout as the deadline.
+
         Raises:
             HardwareError: The property is read-only (checked before the call,
                 so dry-run refuses it too).
         """
+        description = f"property: {device}.{name}={value}"
 
-        def action() -> str:
+        def action() -> None:
             self._core.setProperty(device, name, value)
-            return str(self._core.getProperty(device, name))
 
-        def checked() -> str:
+        def checked() -> Motion | None:
             if self._core.isPropertyReadOnly(device, name):
                 raise HardwareError(
                     f"{device}.{name} is read-only; it reports state, it cannot be "
                     f"set. See `describe({device!r})` for the settable properties."
                 )
-            return self._executor.do(
-                f"property: {device}.{name}={value}", action, dry_result=str(value)
-            )
+            motion = self._motion_for(device)
+            self._executor.do(description, action, dry_result=None, motion=motion)
+            return motion
 
-        return self._executor.read(checked)
+        motion = self._executor.read(checked, description=description)
+        if self._executor.dry_run:
+            return str(value)
+        if motion is not None:
+            self._executor.wait(motion, _timeout_s(self._core, self._executor, None))
+        return self._executor.read(
+            lambda: str(self._core.getProperty(device, name)),
+            description=f"property: {device}.{name}",
+        )
+
+    def _motion_for(self, device: str) -> Motion | None:
+        """The ``Motion`` a set on ``device`` starts, or ``None`` if it moves nothing."""
+        from pymmcore_plus import DeviceType
+
+        try:
+            kind = DeviceType(self._core.getDeviceType(device)).name
+        except ValueError:
+            return (
+                None  # a type this pymmcore-plus does not know moves nothing we track
+            )
+        kind = kind.removesuffix("Device")
+        if kind not in _MOVING_TYPES:
+            return None
+        return _motion(self._core, device, device, stoppable=kind in _STOPPABLE_TYPES)
