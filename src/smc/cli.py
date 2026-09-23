@@ -199,14 +199,21 @@ def discover(
             timeout_s=timeout_s,
         )
     written: tuple[Path, Path] | None = None
+    write_error: OSError | None = None
     if out is not None:
         try:
             written = report_mod.write(inv, out)
         except OSError as exc:
-            console.print(f"[red]✗[/red] could not write the survey to {out}: {exc}")
-            raise typer.Exit(code=1) from None
+            # The survey took minutes: a failed write costs the files, not
+            # the report on screen.
+            write_error = exc
     for item in report_mod.renderables(inv):
         console.print(item)
+    if write_error is not None:
+        console.print(
+            f"[red]✗[/red] could not write the survey to {out}: {write_error}"
+        )
+        raise typer.Exit(code=1)
     if written is not None:
         json_path, text_path = written
         console.print(f"[green]✓[/green] wrote {json_path} and {text_path.name}")

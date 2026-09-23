@@ -62,6 +62,9 @@ CHILD_COMMAND: list[str] = [sys.executable, "-m", "smc.discovery._mm_child"]
 
 _HUB_TYPE = "HubDevice"
 
+#: How long to wait for a killed child to go away before giving up on it.
+_KILL_WAIT_S = 10.0
+
 
 class ChildResult(BaseModel):
     """What the child prints on its last stdout line, as ASCII JSON."""
@@ -299,19 +302,29 @@ def mm_section(
                     None,
                     [f"adapters: the adapter child could not start: {exc}"],
                 )
+            unstoppable = False
             try:
                 returncode = child.wait(timeout=timeout_s)
             except subprocess.TimeoutExpired:
                 child.kill()
-                child.wait()
                 returncode = None
+                try:
+                    # Bounded: a process stuck in a driver call may not die.
+                    child.wait(timeout=_KILL_WAIT_S)
+                except subprocess.TimeoutExpired:
+                    unstoppable = True
 
         doing = _last_progress(stderr_path)
         during = f" while {doing}" if doing else ""
         if returncode is None:
+            stopped = (
+                "could not be stopped (it may still hold the hardware)"
+                if unstoppable
+                else "was stopped"
+            )
             notes.append(
                 f"adapters: the adapter child did not finish in {timeout_s:.0f} s "
-                f"and was stopped{during}"
+                f"and {stopped}{during}"
             )
         elif returncode != 0:
             notes.append(f"adapters: the adapter child exited {returncode}{during}")

@@ -20,6 +20,7 @@ from typer.testing import CliRunner
 
 import smc.cli as smc_cli
 import smc.discovery as discovery
+import smc.discovery.report as smc_cli_report
 from smc.cli import app
 from smc.discovery import inventory, mm_inventory, os_inventory, vendors
 from smc.discovery.mm_inventory import list_adapters
@@ -374,3 +375,48 @@ def test_no_os_says_the_os_sections_were_not_collected(
     inv = inventory(include_os=False)
 
     assert any(n.startswith("os:") and "not collected" in n for n in inv.notes)
+
+
+def test_a_failed_out_write_still_prints_the_survey(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The survey took minutes: a disk that fills up after prepare() must cost
+    # the files, not the report on screen.
+    def disk_full(inv: Inventory, out_dir: Path) -> tuple[Path, Path]:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(discovery, "inventory", lambda **_: _tiny_inventory())
+    monkeypatch.setattr(smc_cli_report, "write", disk_full)
+
+    result = runner.invoke(app, ["discover", "--out", str(tmp_path / "survey")])
+
+    assert result.exit_code == 1
+    assert "Installed adapters" in result.output
+    assert "✗" in result.output
+    assert "disk full" in result.output
+
+
+class _UnkillableChild:
+    """A child that ignores kill(): only a bounded wait returns."""
+
+    def __init__(self, *_: object, **__: object) -> None:
+        pass
+
+    def wait(self, timeout: float | None = None) -> int:
+        if timeout is None:
+            raise AssertionError("an unbounded wait would hang the survey")
+        raise mm_inventory.subprocess.TimeoutExpired("child", timeout)
+
+    def kill(self) -> None:
+        pass
+
+
+def test_a_child_that_survives_kill_does_not_hang_the_survey(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mm_inventory.subprocess, "Popen", _UnkillableChild)
+
+    listed, _, notes = mm_inventory.mm_section(["DemoCamera"], timeout_s=1)
+
+    assert listed == []
+    assert any("could not be stopped" in n for n in notes)
