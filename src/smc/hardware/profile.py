@@ -114,7 +114,7 @@ class SafetySection(_Section):
 
 
 class CameraSection(_Section):
-    """Per-objective pixel sizes; a missing objective is unknown (0.0), never guessed."""
+    """Per-objective pixel sizes at binning 1; a missing objective is unknown (0.0)."""
 
     pixel_size_um: dict[str, float] = Field(default_factory=dict)
 

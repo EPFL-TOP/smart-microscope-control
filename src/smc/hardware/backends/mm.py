@@ -97,7 +97,12 @@ class MMXYStage:
         return self._executor.do(description, action, dry_result=XY(x_um, y_um))
 
     def move_to_um(self, x_um: float, y_um: float, *, wait: bool = True) -> XY:
-        """Move to an absolute position (soft limits apply, no jog guard)."""
+        """Move to an absolute position (soft limits apply, no jog guard).
+
+        With ``wait=False`` the return value is the position read right after
+        the command, not where the stage will land; call ``wait()`` then
+        ``position_um()`` for that.
+        """
         x_um, y_um = float(x_um), float(y_um)
         self._safety.check_xy_target_um(x_um, y_um)
         return self._move(f"xy_stage: move_to ({x_um}, {y_um}) µm", x_um, y_um, wait)
@@ -175,7 +180,12 @@ class MMZStage:
         return self._executor.do(description, action, dry_result=z_um)
 
     def move_to_um(self, z_um: float, *, wait: bool = True) -> float:
-        """Move to an absolute position (soft limits apply)."""
+        """Move to an absolute position (soft limits apply).
+
+        With ``wait=False`` the return value is the position read right after
+        the command, not where the stage will land; call ``wait()`` then
+        ``position_um()`` for that.
+        """
         z_um = float(z_um)
         self._safety.check_z_target_um(z_um)
         return self._move(f"z: move_to {z_um} µm", z_um, wait)
@@ -265,8 +275,15 @@ class MMCamera:
         return self._executor.read(action)
 
     def set_exposure_ms(self, value_ms: float) -> float:
-        """Set the exposure; return the camera's readback (it may clamp)."""
+        """Set the exposure; return the camera's readback (it may clamp).
+
+        Raises:
+            ValueError: ``value_ms`` is negative or not finite; it never reaches
+                the driver, whose handling of such values is undefined.
+        """
         value_ms = float(value_ms)
+        if not math.isfinite(value_ms) or value_ms < 0:
+            raise ValueError(f"exposure must be finite and >= 0 ms, got {value_ms!r}")
 
         def action() -> float:
             self._core.setExposure(value_ms)
@@ -299,7 +316,14 @@ class MMCamera:
         return self._executor.read(action)
 
     def pixel_size_um(self) -> float:
-        """MMCore's calibrated value, else the profile's for the objective, else ``0.0``."""
+        """MMCore's calibrated value, else the profile's for the objective, else ``0.0``.
+
+        MMCore's value already includes binning; the profile map is for
+        binning 1, so the fallback is multiplied by the current binning. A
+        binning that cannot be read, or a map entry that is not a positive
+        finite number, gives ``0.0`` (unknown) with a warning rather than a
+        pixel size that looks measured but is wrong.
+        """
 
         def action() -> float:
             # MMCore's value is for its current camera and binning; for another
@@ -308,9 +332,45 @@ class MMCamera:
             measured = float(self._core.getPixelSizeUm())
             if measured > 0:
                 return measured
-            return float(self._pixel_sizes_um.get(self._objective_label() or "", 0.0))
+            objective = self._objective_label()
+            if objective is None or objective not in self._pixel_sizes_um:
+                return 0.0
+            at_bin_1 = float(self._pixel_sizes_um[objective])
+            if not (math.isfinite(at_bin_1) and at_bin_1 > 0):
+                logger.warning(
+                    "pixel size for objective %r in the profile is %r, not a "
+                    "positive number; reporting 0.0 (unknown). Fix it under "
+                    "[camera] pixel_size_um in the profile.",
+                    objective,
+                    at_bin_1,
+                )
+                return 0.0
+            binning = self._binning()
+            if binning is None:
+                return 0.0
+            return at_bin_1 * binning
 
         return self._executor.read(action)
+
+    def _binning(self) -> int | None:
+        """The camera's square binning factor, or ``None`` (with a warning) if unreadable.
+
+        Adapters spell it ``"2"`` or ``"2x2"``; a non-square binning has no
+        single pixel size and counts as unreadable.
+        """
+        raw = ""
+        if self._core.hasProperty(self._label, "Binning"):
+            raw = str(self._core.getProperty(self._label, "Binning"))
+        parts = raw.lower().replace(" ", "").split("x")
+        if len(set(parts)) == 1 and parts[0].isdigit() and int(parts[0]) >= 1:
+            return int(parts[0])
+        logger.warning(
+            "camera %r binning %r cannot be read as one integer factor; the "
+            "profile pixel size cannot be scaled, reporting 0.0 (unknown).",
+            self._label,
+            raw,
+        )
+        return None
 
 
 class MMShutter:

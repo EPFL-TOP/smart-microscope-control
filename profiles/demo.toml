@@ -24,7 +24,8 @@ z_soft_limits_um = [-1000.0, 1000.0]
 turret_requires_confirm = true
 
 [camera]
-# µm per pixel per objective label; missing = unknown (0.0), never guessed.
+# µm per pixel per objective label, at binning 1 (scaled by the current
+# binning); missing = unknown (0.0), never guessed.
 pixel_size_um = { "Nikon 10X S Fluor" = 0.65, "Nikon 40X Plan Fluor ELWD" = 0.1625 }
 
 [quirks]

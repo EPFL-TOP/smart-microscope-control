@@ -185,6 +185,35 @@ class TestOnDemoDevices:
         assert _camera(demo_core, sizes, "Nikon 40X Plan Fluor").pixel_size_um() == 0.0
         assert _camera(demo_core, sizes, None).pixel_size_um() == 0.0
 
+    def test_pixel_size_fallback_scales_with_binning(self, demo_core: Any) -> None:
+        # MMCore's own value includes binning; the profile map is for binning 1.
+        for name in demo_core.getAvailablePixelSizeConfigs():
+            demo_core.deletePixelSizeConfig(name)
+        demo_core.setProperty(demo_core.getCameraDevice(), "Binning", "2")
+        camera = _camera(demo_core, {"Nikon 10X S Fluor": 0.65}, "Nikon 10X S Fluor")
+        assert camera.pixel_size_um() == pytest.approx(1.3)
+
+    @pytest.mark.parametrize("bad", [math.nan, math.inf, -0.65, 0.0])
+    def test_pixel_size_bad_profile_entry_is_unknown(
+        self, demo_core: Any, bad: float, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        for name in demo_core.getAvailablePixelSizeConfigs():
+            demo_core.deletePixelSizeConfig(name)
+        camera = _camera(demo_core, {"Nikon 10X S Fluor": bad}, "Nikon 10X S Fluor")
+        with caplog.at_level(logging.WARNING, logger="smc.hardware.backends.mm"):
+            assert camera.pixel_size_um() == 0.0
+        assert "not a positive number" in caplog.text
+
+    @pytest.mark.parametrize("bad", [math.nan, -1.0])
+    def test_exposure_refuses_non_finite_or_negative(
+        self, demo_core: Any, bad: float
+    ) -> None:
+        camera = _camera(demo_core)
+        before = camera.exposure_ms()
+        with pytest.raises(ValueError, match="exposure must be finite"):
+            camera.set_exposure_ms(bad)
+        assert camera.exposure_ms() == before
+
     @pytest.mark.parametrize(
         ("method", "args"),
         [
@@ -293,6 +322,50 @@ def test_moves_return_the_readback_not_the_command() -> None:
         1.0, -3.0
     )
     assert MMZStage(core, "Z", _executor(), safety).move_to_um(7.6) == 8.0
+
+
+class _BinningCore:
+    """A current camera with no calibration and a given ``Binning`` property."""
+
+    def __init__(self, binning: str | None) -> None:
+        self.binning = binning
+
+    def getCameraDevice(self) -> str:  # noqa: N802
+        return "Cam"
+
+    def getPixelSizeUm(self) -> float:  # noqa: N802
+        return 0.0
+
+    def hasProperty(self, label: str, name: str) -> bool:  # noqa: N802
+        return self.binning is not None
+
+    def getProperty(self, label: str, name: str) -> str:  # noqa: N802
+        assert self.binning is not None
+        return self.binning
+
+
+@pytest.mark.parametrize(
+    ("binning", "expected"),
+    [
+        ("1", 0.5),
+        ("4", 2.0),
+        ("2x2", 1.0),
+        ("2X2", 1.0),
+        ("1x2", 0.0),
+        ("0", 0.0),
+        ("abc", 0.0),
+        (None, 0.0),
+    ],
+)
+def test_pixel_size_fallback_reads_binning_or_reports_unknown(
+    binning: str | None, expected: float, caplog: pytest.LogCaptureFixture
+) -> None:
+    core: Any = _BinningCore(binning)
+    camera = MMCamera(core, "Cam", _executor(), {"10x": 0.5}, lambda: "10x")
+    with caplog.at_level(logging.WARNING, logger="smc.hardware.backends.mm"):
+        assert camera.pixel_size_um() == pytest.approx(expected)
+    # Unknown is said out loud, not just returned as 0.0.
+    assert ("cannot be read" in caplog.text) == (expected == 0.0)
 
 
 def test_wait_times_out_cleanly() -> None:
