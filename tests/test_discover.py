@@ -298,24 +298,31 @@ def test_crash_guard_turns_abort_into_exit_6_on_macos() -> None:
     assert done.returncode == 6
 
 
-def test_child_imports_no_pymmcore_before_its_crash_guard() -> None:
-    # The guard runs first in main(); importing the module must not load an
-    # adapter-bearing library before it.
+def test_child_installs_its_crash_guard_before_importing_pymmcore(
+    tmp_path: Path,
+) -> None:
+    # Run the real main() with the guard replaced by a spy that records which
+    # pymmcore modules are already loaded when the guard is installed.
     code = (
         "import sys\n"
-        "import smc.discovery._mm_child\n"
-        "print(sorted(m for m in sys.modules if m.startswith('pymmcore')))\n"
+        "import smc.discovery._mm_child as child\n"
+        "seen = []\n"
+        "child._no_error_dialogs = lambda: seen.append(\n"
+        "    sorted(m for m in sys.modules if m.startswith('pymmcore')))\n"
+        "child.main(['--result', sys.argv[1]])\n"
+        "print(seen)\n"
     )
 
     done = subprocess.run(
-        [sys.executable, "-c", code],
+        [sys.executable, "-c", code, str(tmp_path / "result.json")],
         capture_output=True,
         encoding="utf-8",
         timeout=60,
         check=True,
+        cwd=tmp_path,
     )
 
-    assert done.stdout.strip() == "[]"
+    assert done.stdout.strip().splitlines()[-1] == "[[]]"
 
 
 @pytest.mark.parametrize(
