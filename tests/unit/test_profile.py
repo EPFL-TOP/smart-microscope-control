@@ -176,7 +176,10 @@ def test_non_finite_soft_limits_are_rejected(
     msg = str(info.value)
     assert str(path) in msg
     assert key in msg
-    assert "finite" in msg
+    # The exact phrase from _check_ordered's finite check, not a bare "finite":
+    # tmp_path itself contains "non_finite" (this test's own name), so a lone
+    # "finite" substring would pass even if the isfinite check were removed.
+    assert "must be finite numbers" in msg
 
 
 @pytest.mark.parametrize("value", ["nan", "inf", "0", "-5"])
