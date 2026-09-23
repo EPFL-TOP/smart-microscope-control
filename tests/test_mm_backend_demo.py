@@ -287,6 +287,10 @@ class _AlwaysBusyCore:
 
     def deviceBusy(self, label: str) -> bool:  # noqa: N802 - MMCore's name
         self.polls += 1
+        if self.polls > 1000:
+            # About 10 s of polling: a wait that never expires fails the test
+            # instead of hanging the suite (FM-44).
+            raise AssertionError("wait() kept polling past any sane deadline")
         return True
 
     def stop(self, label: str) -> None:
