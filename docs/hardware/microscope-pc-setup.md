@@ -45,8 +45,10 @@ mmcore install            :: full Micro-Manager nightly with every device adapte
 smc doctor
 ```
 
-`mmcore install` writes to `%LOCALAPPDATA%\pymmcore-plus\mm\` and needs no
-administrator rights. If the download is blocked by the corporate proxy,
+`mmcore install` writes to `%LOCALAPPDATA%\pymmcore-plus\pymmcore-plus\mm\`
+(platformdirs repeats the name on Windows; from pymmcore-plus 0.18.1's
+source) and needs no administrator rights. `mmcore list` prints the folder
+it really uses. If the download is blocked by the corporate proxy,
 set `HTTPS_PROXY` or run once from a network with direct access.
 
 ### Every terminal you open for this project
@@ -94,7 +96,7 @@ set SURVEY=C:\Tools\smart-microscope-control\local\surveys\nikon-ti2
 smc discover --out %SURVEY%
 ```
 
-`smc discover` arrives with #30. It writes `inventory.json` and
+`smc discover` writes `inventory.json` and
 `inventory.txt` into the folder: the Micro-Manager install and its device
 interface version, the installed adapters and the devices of the ones this
 lab is likely to use, serial ports with their USB IDs, USB/PnP devices, PCI
@@ -136,18 +138,6 @@ Then add to the same folder:
   ```bat
   powershell -NoProfile -ExecutionPolicy Bypass -File <tracking-tool>\tools\audit_windows_hardware.ps1 > %SURVEY%\audit.txt
   ```
-
-### Before `smc discover` exists
-
-To survey a PC before #30 is merged, collect the essentials into the same
-folder, plus the extras above, and run `smc discover --out` on a later
-visit:
-
-```bat
-mkdir %SURVEY%
-smc doctor > %SURVEY%\doctor.txt
-powershell -NoProfile -Command "Get-PnpDevice -PresentOnly | Select-Object Status,Class,FriendlyName,Manufacturer,InstanceId | ConvertTo-Json | Out-File -Encoding utf8 $env:SURVEY\pnp.json"
-```
 
 ## 3. Bring it back
 
