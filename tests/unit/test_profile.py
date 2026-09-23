@@ -154,6 +154,43 @@ def test_ordered_limits_are_accepted(tmp_path: Path) -> None:
     assert safety.xy_soft_limits_um == ((-1.0, 1.0), (-2.0, 2.0))
 
 
+@pytest.mark.parametrize(
+    ("body", "key"),
+    [
+        ("[safety]\nz_soft_limits_um = [nan, 1000.0]\n", "safety.z_soft_limits_um"),
+        (
+            "[safety]\nxy_soft_limits_um = [[-1.0, inf], [-2.0, 2.0]]\n",
+            "safety.xy_soft_limits_um",
+        ),
+    ],
+)
+def test_non_finite_soft_limits_are_rejected(
+    tmp_path: Path, body: str, key: str
+) -> None:
+    # inf passes "low < high" outright; nan is only rejected today because a
+    # nan comparison is always False, which makes the message blame ordering
+    # instead of the real problem. Either way this must name the real problem.
+    path = write_profile(tmp_path / "p.toml", body)
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    msg = str(info.value)
+    assert str(path) in msg
+    assert key in msg
+    assert "finite" in msg
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "0", "-5"])
+def test_profile_rejects_non_finite_or_non_positive_jog_limit(
+    tmp_path: Path, value: str
+) -> None:
+    path = write_profile(tmp_path / "p.toml", f"[safety]\nmax_jog_um = {value}\n")
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    msg = str(info.value)
+    assert str(path) in msg
+    assert "safety.max_jog_um" in msg
+
+
 def test_wrong_type_names_the_key(tmp_path: Path) -> None:
     path = write_profile(tmp_path / "p.toml", '[safety]\nmax_jog_um = "far"\n')
     with pytest.raises(ProfileError, match=r"safety\.max_jog_um"):
@@ -180,6 +217,32 @@ def test_quirks_are_free_form(tmp_path: Path) -> None:
         tmp_path / "p.toml", '[quirks]\npfs_settle_ms = 300\nnested = { a = "b" }\n'
     )
     assert Profile.load(path).quirks == {"pfs_settle_ms": 300, "nested": {"a": "b"}}
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "0.0", "-1.0"])
+def test_profile_rejects_non_positive_pixel_size(tmp_path: Path, value: str) -> None:
+    path = write_profile(
+        tmp_path / "p.toml",
+        f'[camera]\npixel_size_um = {{ "Nikon 10X S Fluor" = {value} }}\n',
+    )
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    msg = str(info.value)
+    assert str(path) in msg
+    assert "pixel_size_um" in msg
+    assert "Nikon 10X S Fluor" in msg
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_device_timeout_must_be_positive(tmp_path: Path, value: str) -> None:
+    path = write_profile(
+        tmp_path / "p.toml", f"[micromanager]\ndevice_timeout_ms = {value}\n"
+    )
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    msg = str(info.value)
+    assert str(path) in msg
+    assert "micromanager.device_timeout_ms" in msg
 
 
 # -- micromanager.config ------------------------------------------------------
