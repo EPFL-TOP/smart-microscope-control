@@ -42,6 +42,7 @@ python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\a
 pip install -e ".[dev]"
 mmcore install --test-adapters      # Micro-Manager's simulated microscope (any OS)
 smc doctor                          # can this machine drive the simulator?
+smc discover                        # read-only survey of this PC (docs/hardware/microscope-pc-setup.md)
 pytest                              # the suite runs against the simulator
 pre-commit install                  # lint + format on every commit
 ```

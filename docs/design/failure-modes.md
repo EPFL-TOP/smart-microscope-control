@@ -41,6 +41,8 @@ category is not here: an id, what happens, and how to check.
 - **FM-31 External calls without a timeout.** *Check*: every OS tool and child has one, and its failure becomes a note ("failures are findings").
 - **FM-32 Unbounded options.** `nan`, `inf`, negative or huge values reach `subprocess`. *Check*: bounds plus `math.isfinite`.
 - **FM-33 A child's working directory is on `sys.path`.** *Check*: children run from a neutral directory.
+- **FM-34 A failed write hides the report.** Writing the files first (FM-30) and exiting on an `OSError` loses the on-screen result of minutes of work (review of #47). *Check*: on a write error, still print what was collected, then the one-line error and the exit code.
+- **FM-35 Killed is not gone.** `kill()` stops only the direct child: a helper process it started survives and may keep holding the hardware, and a process stuck in a driver call may not die, so an unbounded `wait()` after `kill()` hangs (review of #47, reproduced on macOS). *Check*: the wait after `kill()` has a timeout and its failure is a note; kill the process tree where helpers are expected.
 
 ## Tests
 
