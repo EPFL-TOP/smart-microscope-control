@@ -83,14 +83,61 @@ def test_objective_turret_ignores_filter_and_condenser_turrets() -> None:
         dev("Dichroic", "State"),
         dev("FilterTurret1", "State"),
         dev("CondenserTurret", "State"),
+        dev("ReflectorTurret", "State"),
         dev("Nosepiece", "State"),
     ]
     roles = resolve(turrets)
     assert roles.get(Role.objective_turret) == "Nosepiece"
     assert roles.candidates[Role.objective_turret] == ["Nosepiece"]
-    assert roles.get(Role.filter_turret) == "FilterTurret1"
+    # A filter turret must say "filter" or "reflector"; the dichroic says neither.
+    assert roles.candidates[Role.filter_turret] == ["FilterTurret1", "ReflectorTurret"]
     # Without a nosepiece, no other State device is taken for it.
-    assert resolve(turrets[:3]).get(Role.objective_turret) is None
+    assert resolve(turrets[:4]).get(Role.objective_turret) is None
+    # A label that names both is neither: guessing is not safe.
+    both = resolve([dev("ObjectiveFilter", "State")])
+    assert both.get(Role.objective_turret) is None
+    assert both.get(Role.filter_turret) is None
+
+
+def test_shutter_ranks_epi_then_dia_then_transmitted() -> None:
+    shutters = [
+        dev("TLShutter", "Shutter"),
+        dev("DiaShutter", "Shutter"),
+        dev("EpiShutter", "Shutter"),
+    ]
+    assert resolve(shutters).candidates[Role.shutter] == [
+        "EpiShutter",
+        "DiaShutter",
+        "TLShutter",
+    ]
+
+
+def test_light_source_is_a_lamp_led_or_laser_never_a_shutter() -> None:
+    devices = [
+        # Demo shutters: they gate the light but set no level.
+        dev("White Light Shutter", "Shutter"),
+        dev("LED Shutter", "Shutter"),
+        dev("Dichroic", "State"),
+        dev("Laser488", "Generic"),
+        dev("LED", "State"),
+        # The Ti2's brightfield lamp is typed Shutter.
+        dev("DiaLamp", "Shutter"),
+    ]
+    roles = resolve(devices)
+    assert roles.get(Role.light_source) == "DiaLamp"
+    assert roles.candidates[Role.light_source] == ["DiaLamp", "LED", "Laser488"]
+
+
+def test_light_path_is_a_state_device_that_selects_a_port() -> None:
+    devices = [
+        dev("SerialPort", "Serial"),  # a port, but not a light port
+        dev("Dichroic", "State"),
+        dev("Eyepiece", "State"),
+        dev("LightPath", "State"),
+    ]
+    roles = resolve(devices)
+    assert roles.get(Role.light_path) == "LightPath"
+    assert roles.candidates[Role.light_path] == ["LightPath", "Eyepiece"]
 
 
 # -- the order of authority ---------------------------------------------------
@@ -214,10 +261,17 @@ def test_empty_exclusion_is_ignored_with_a_warning() -> None:
 
 
 def test_candidates_are_reported_best_first() -> None:
-    stages = [dev("Z", "Stage"), dev("Focus", "Stage"), dev("ZDrive", "Stage")]
+    stages = [
+        dev("Z", "Stage"),
+        dev("Focus", "Stage"),
+        dev("ZDrive", "Stage"),
+        dev("XY", "XYStage"),
+    ]
     roles = resolve(stages)
     assert roles.get(Role.focus) == "ZDrive"
     assert roles.candidates[Role.focus] == ["ZDrive", "Focus", "Z"]
+    # A role with a single candidate is not ambiguous.
+    assert roles.candidates[Role.xy_stage] == ["XY"]
     assert roles.ambiguous() == {Role.focus: ["ZDrive", "Focus", "Z"]}
 
 
