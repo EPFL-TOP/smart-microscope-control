@@ -30,7 +30,8 @@ console = Console()
 @app.command()
 def version() -> None:
     """Print the versions that matter when reporting a problem."""
-    import pymmcore_plus
+    # A version number, not hardware access: the one sanctioned import here.
+    import pymmcore_plus  # noqa: TID251
 
     table = Table(show_header=False, box=None)
     table.add_row("smc", __version__)

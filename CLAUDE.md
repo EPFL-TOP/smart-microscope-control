@@ -8,25 +8,41 @@ rules for everyone; you follow them without being reminded.
 
 ## Two kinds of session
 
-Work is split between a **design session** and **execution sessions**, and
-the GitHub issue is the contract between them:
+Work is split between a **supervising (design) session** and **execution
+sessions**, and the GitHub issue is the contract between them:
 
-- The **design session** owns architecture: ADRs, `docs/design/*.md`, and
-  the plan of every issue (`/plan`). It reviews every PR (`/review`). It
-  does not implement.
-- An **execution session** (a fresh Claude Code session, any model) takes
-  **one** issue labelled `status: ready`, implements exactly its plan,
-  verifies, opens the PR and reports back on the issue (`/develop`). It
-  never redesigns: a plan that does not survive contact with reality comes
-  back as a `## Plan deviation` comment.
+- The **supervising session** orchestrates. It starts with **`/point`**
+  (take stock, do the housekeeping, give the owner one short list), owns
+  architecture (ADRs, `docs/design/*.md`), writes the plan of every issue
+  (`/plan`) and reviews every PR (`/review`, light and proportionate). It
+  does not implement, and it stays cheap: facts come from
+  `scripts/dev/point.py`, code reading goes to subagents on cheaper models,
+  only conclusions come back. When its context grows large, start a fresh
+  one: the state lives in docs, issues and memory.
+- An **execution session** (a fresh session, Sonnet unless the plan
+  suggests otherwise) takes **one** issue labelled `status: ready`,
+  implements its plan, attacks the change with **`/adversarial-review`**
+  before the PR, opens the PR and reports on the issue (`/develop`). It may
+  add defensive fixes that change no interface ("Beyond the plan"); it
+  never changes a fixed interface — that comes back as `## Plan deviation`.
 - The **owner** decides ADRs, merges PRs and runs hardware sessions.
+
+Review agents live in `.claude/agents/`, each with its model in its file:
+Sonnet reviewers with one lens each, and a Haiku verifier that reproduces
+or refutes every finding. They work from `docs/design/failure-modes.md`,
+the shared checklist that every confirmed finding of a new kind extends.
 
 Every execution session works in its **own worktree** (Claude Code's
 `EnterWorktree`, under `.claude/worktrees/`) with its **own `.venv`**
 (`python scripts/dev/worktree.py setup`) — the main checkout's venv is an
 editable install of the main checkout's code. Parallel sessions never touch
 the same modules; the design doc fixes the interfaces between them. The
-design session stays in the main checkout.
+supervising session stays in the main checkout.
+
+Every comment an agent writes on GitHub starts with a header naming its
+kind and session — `## Plan (design session, <date>)`, `## Report (develop
+session, <date>)` — so that the owner's own notes stand out (`point.py`
+relies on it).
 
 ## Workflow: issue → plan → branch → implement → verify → PR
 
@@ -51,8 +67,11 @@ design session stays in the main checkout.
 ## Architecture rules (non-negotiable without an ADR)
 
 - **Hardware is reached only through `smc.hardware`.** Nothing else imports
-  `pymmcore_plus` for control, names a Micro-Manager device label, or calls
-  a vendor SDK. Plugins depend on capability `Protocol`s (ADR-0003).
+  `pymmcore_plus` or `pymmcore` (ruff `TID251` enforces it), names a
+  Micro-Manager device label, or calls a vendor SDK. Plugins depend on
+  capability `Protocol`s (ADR-0003). The sanctioned exceptions are
+  `smc.discovery` (read-only inventory in throwaway cores, design §10) and
+  `smc.testing` (fakes and demo fixtures).
 - **Roles, not device names.** New stand-specific knowledge goes into a
   profile (`profiles/*.toml`) or into role heuristics with tests — not into
   a plugin.
@@ -115,12 +134,22 @@ turned into code, a profile entry, a test or a doc line.
 
 ## Skills
 
-Design session: `/plan <issue>` write the executable plan · `/review <pr>`
-review against plan, architecture and tests · `/adr` propose a decision ·
-`/hardware-session` prepare and write up a session at a stand.
-Execution session: `/develop <issue>` implement one planned issue to a PR.
+Supervising session: `/point` take stock and list what to do next ·
+`/plan <issue>` write the executable plan · `/review <pr>` light review
+against the plan, the rules and the adversarial review · `/adr` propose a
+decision · `/hardware-session` prepare and write up a session at a stand.
+Execution session: `/develop <issue>` implement one planned issue to a PR;
+it runs `/adversarial-review <issue>` before the PR.
 Scaffolds: `/new-plugin`, `/new-backend`. Shortcut: `/feature` (plan +
 develop in one session, small issues only).
+
+## Improving the process
+
+Skills, agents and the checklist are code, and they improve by small PRs.
+`/point` reads the reports' **Friction** and **Deviations** lines and the
+review outcomes: a problem seen twice gets fixed in the skill or agent that
+caused it, and a confirmed finding of a new kind becomes an entry in
+`docs/design/failure-modes.md`.
 
 ## Language
 
