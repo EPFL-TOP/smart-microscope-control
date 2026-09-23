@@ -11,6 +11,9 @@ design doc. Your job is to implement it faithfully and prove it.
 
 ## Before touching code
 
+0. If the issue already has an open PR whose latest `## Review` comment
+   says **Verdict: changes requested**, skip to *Addressing a review* at
+   the end of this skill.
 1. Read `CLAUDE.md`, then `gh issue view $ARGUMENTS --comments`. Find the
    latest comment starting with `## Plan`. No plan, or the label
    `status: ready` missing → stop and comment: "No plan / not ready — needs
@@ -109,6 +112,25 @@ design doc. Your job is to implement it faithfully and prove it.
     you back to it. Merged worktrees are removed from the main checkout with
     `python scripts/dev/worktree.py clean`.
 14. Stop. Do not merge. Do not start the next issue in this session.
+
+## Addressing a review
+
+When the design session's `## Review` on the PR says **Verdict: changes
+requested**:
+
+1. Enter the issue's existing worktree: `EnterWorktree` with `path` set to
+   `.claude/worktrees/issue-<N>-<slug>` (listed by `git worktree list`). If
+   it is gone, recreate it from the PR's branch:
+   `git worktree add .claude/worktrees/issue-<N>-<slug> feat/<N>-<slug>`,
+   then `python scripts/dev/worktree.py setup`.
+2. Fix exactly the **Blocking** items, in order; nits only if trivial. No
+   other change.
+3. If `main` moved, bring it in: `git fetch origin main` then
+   `git merge origin/main` (never rebase a pushed branch).
+4. Verify as in step 10, push, watch CI.
+5. Comment on the PR `## Review addressed (develop session, YYYY-MM-DD)`
+   with one line per blocking item: what changed, where. Set the issue to
+   `status: in-review`. Stop.
 
 ## Never
 

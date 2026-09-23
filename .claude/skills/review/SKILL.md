@@ -1,6 +1,6 @@
 ---
 name: review
-description: Design-session skill — review a pull request against its issue plan, the design doc, the architecture rules and the testing bar, then post a GitHub review (approve or request changes) so the owner can merge with confidence. Argument: the PR number.
+description: Design-session skill — review a pull request against its issue plan, the design doc, the architecture rules and the testing bar, then post a comment review with an explicit verdict (ready to merge / changes requested) so the owner can merge with confidence. Argument: the PR number.
 ---
 
 # /review <pr-number>
@@ -14,7 +14,7 @@ The owner merges; you decide whether it is ready for that.
    issue (`Closes #M`), its `## Plan` and the `## Report`.
 2. Check, in this order — stop at the first blocking failure:
    1. **Scope**: the diff implements the plan, nothing more, nothing less.
-      Renamed interface from the design doc → request changes.
+      Renamed interface from the design doc → changes requested.
    2. **Architecture** (`CLAUDE.md`): hardware only via `smc.hardware`;
       no `pymmcore_plus` import outside it; roles not labels; units in
       names; safety guards not bypassable; measured vs assumed labelled;
@@ -26,18 +26,38 @@ The owner merges; you decide whether it is ready for that.
       matches the diff and CI.
    5. **Docs**: docstrings explain why; docs/profile/inventory updated
       where the plan said so.
-   6. **Windows**: `encoding="utf-8"`, `pathlib`, no shell-isms.
+   6. **Windows**: `encoding="utf-8"`, `pathlib`, no shell-isms, nothing
+      printed that a cp1252 stream cannot encode without the CLI's stream
+      fix (#42).
 3. Run the built-in `/code-review` on the PR for correctness bugs and fold
    any confirmed finding into your review.
-4. Post the review: `gh pr review N --approve` with a short summary of what
-   was checked, or `gh pr review N --request-changes` with one bullet per
-   blocking item, each naming file and line and what to change. Nits are
-   marked "nit:" and never block.
-5. On approval, tell the owner in one line that #N is ready to merge and
-   which issues it unblocks (update their labels to `status: ready` if
-   their plan is posted).
+4. Post the review as a **comment review**, never `--approve` or
+   `--request-changes`: every PR in this repository is opened with the
+   owner's account, and GitHub refuses an approval or a change request from
+   a PR's own author. Merging needs no approval — branch protection
+   requires green CI on an up-to-date branch. Write the body, then
+   `gh pr review N --comment --body-file review.md`:
+
+   ```markdown
+   ## Review (design session, YYYY-MM-DD)
+
+   **Verdict: ready to merge**        ← or: **Verdict: changes requested**
+
+   **Checked**: scope · architecture · tests · report honesty · docs · Windows
+   **Blocking** (only with "changes requested"):
+   - `path/file.py:42` — what to change, and why
+   **Nits** (never blocking):
+   - nit: …
+   ```
+
+5. **Ready to merge** → tell the owner in one line that #N can be merged
+   (squash) and which issues it unblocks; set those issues to
+   `status: ready` if their plan is posted and every dependency is merged.
+   **Changes requested** → tell the owner to run `/develop <issue>` again
+   (in the same execution session or a new one): it finds this review and
+   fixes exactly the blocking items. Re-review after its push.
 
 ## Never
 
-- Merge. Rewrite the PR yourself (comment instead; the develop session
-  or the owner fixes). Approve with red CI.
+- Merge. Rewrite the PR yourself (comment instead). Give a ready verdict
+  with red CI. Use `--approve` or `--request-changes`.
