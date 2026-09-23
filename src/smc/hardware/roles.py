@@ -35,19 +35,24 @@ touch a core.
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Literal
+from typing import Literal, Protocol
 
 __all__ = [
     "DeviceInfo",
     "Role",
     "RoleMap",
     "Source",
+    "core_roles",
+    "devices_from_core",
     "resolve",
 ]
+
+log = logging.getLogger("smc.hardware.roles")
 
 
 class Role(str, Enum):
@@ -402,3 +407,64 @@ def resolve(
     return RoleMap(
         assigned=assigned, sources=sources, candidates=candidates, warnings=warnings
     )
+
+
+class _InventoryCore(Protocol):
+    """The part of a core the two helpers read.
+
+    Structural, so that ``CMMCorePlus`` and the ``FakeCore`` of the tests
+    both qualify without one inheriting from the other.
+    """
+
+    def getLoadedDevices(self) -> Sequence[str]: ...  # noqa: N802 - MMCore API
+    def getDeviceType(self, label: str, /) -> int: ...  # noqa: N802
+    def getDeviceLibrary(self, label: str, /) -> str: ...  # noqa: N802
+    def getDeviceName(self, label: str, /) -> str: ...  # noqa: N802
+    def getDeviceDescription(self, label: str, /) -> str: ...  # noqa: N802
+    def getCameraDevice(self) -> str: ...  # noqa: N802
+    def getXYStageDevice(self) -> str: ...  # noqa: N802
+    def getFocusDevice(self) -> str: ...  # noqa: N802
+    def getAutoFocusDevice(self) -> str: ...  # noqa: N802
+    def getShutterDevice(self) -> str: ...  # noqa: N802
+
+
+def devices_from_core(core: _InventoryCore) -> list[DeviceInfo]:
+    """Every loaded device except ``Core``, as the resolver sees it.
+
+    A device whose type this pymmcore-plus does not know is listed with type
+    ``"Unknown"`` and fills no role: one exotic device must not end the
+    inventory of the whole stand.
+    """
+    from pymmcore_plus import DeviceType
+
+    found: list[DeviceInfo] = []
+    for label in core.getLoadedDevices():
+        if label == "Core":
+            continue
+        try:
+            kind = DeviceType(core.getDeviceType(label)).name
+        except ValueError as exc:
+            log.warning("%s: unknown device type (%s); it fills no role", label, exc)
+            kind = "Unknown"
+        found.append(
+            DeviceInfo(
+                label=label,
+                type=kind.removesuffix("Device"),
+                library=core.getDeviceLibrary(label),
+                name=core.getDeviceName(label),
+                description=core.getDeviceDescription(label),
+            )
+        )
+    return found
+
+
+def core_roles(core: _InventoryCore) -> dict[Role, str]:
+    """The roles MMCore itself has slots for, where the configuration filled them."""
+    slots = {
+        Role.camera: core.getCameraDevice(),
+        Role.xy_stage: core.getXYStageDevice(),
+        Role.focus: core.getFocusDevice(),
+        Role.autofocus: core.getAutoFocusDevice(),
+        Role.shutter: core.getShutterDevice(),
+    }
+    return {role: label for role, label in slots.items() if label}

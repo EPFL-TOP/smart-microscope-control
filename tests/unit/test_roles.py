@@ -1,10 +1,11 @@
 """Role resolution on device lists copied from docs/hardware/inventory.md.
 
-Pure: synthetic ``DeviceInfo`` lists; no adapter is loaded.
+Pure: synthetic ``DeviceInfo`` lists and a stub core; no adapter is loaded.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
 import sys
@@ -14,7 +15,14 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from smc.hardware.roles import DeviceInfo, Role, RoleMap, resolve
+from smc.hardware.roles import (
+    DeviceInfo,
+    Role,
+    RoleMap,
+    core_roles,
+    devices_from_core,
+    resolve,
+)
 
 
 def dev(label: str, type_: str, name: str = "") -> DeviceInfo:
@@ -262,6 +270,79 @@ def test_role_map_reads_like_the_design() -> None:
     assert roles.get(Role.xy_stage) is None
     assert roles.ambiguous() == {Role.camera: ["Cam", "Cam2"]}
     assert Role.camera not in roles.missing()
+
+
+# -- the core helpers, on a stub core -----------------------------------------
+
+
+class StubCore:
+    """The inventory calls of an MMCore, with raw ``int`` types like pymmcore's."""
+
+    def __init__(
+        self, devices: dict[str, int], slots: dict[str, str] | None = None
+    ) -> None:
+        self.devices = devices
+        self.slots = slots or {}
+
+    def getLoadedDevices(self) -> tuple[str, ...]:  # noqa: N802
+        return tuple(self.devices)
+
+    def getDeviceType(self, label: str) -> int:  # noqa: N802
+        return self.devices[label]
+
+    def getDeviceLibrary(self, label: str) -> str:  # noqa: N802
+        return "" if label == "Core" else "StubLib"
+
+    def getDeviceName(self, label: str) -> str:  # noqa: N802
+        return f"D{label}"
+
+    def getDeviceDescription(self, label: str) -> str:  # noqa: N802
+        return f"stub {label}"
+
+    def getCameraDevice(self) -> str:  # noqa: N802
+        return self.slots.get("camera", "")
+
+    def getXYStageDevice(self) -> str:  # noqa: N802
+        return self.slots.get("xy", "")
+
+    def getFocusDevice(self) -> str:  # noqa: N802
+        return self.slots.get("focus", "")
+
+    def getAutoFocusDevice(self) -> str:  # noqa: N802
+        return self.slots.get("autofocus", "")
+
+    def getShutterDevice(self) -> str:  # noqa: N802
+        return self.slots.get("shutter", "")
+
+
+def test_devices_from_core_skips_core_and_strips_the_device_suffix() -> None:
+    # MMCore DeviceType values: Core 10, XYStage 6, Camera 2, State 4.
+    core = StubCore({"Core": 10, "XY": 6, "Cam": 2, "Turret": 4})
+    assert devices_from_core(core) == [
+        DeviceInfo("XY", "XYStage", "StubLib", "DXY", "stub XY"),
+        DeviceInfo("Cam", "Camera", "StubLib", "DCam", "stub Cam"),
+        DeviceInfo("Turret", "State", "StubLib", "DTurret", "stub Turret"),
+    ]
+
+
+def test_device_of_an_unknown_type_is_listed_not_dropped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A device type newer than this pymmcore-plus must not end the inventory.
+    core = StubCore({"Pump": 99, "XY": 6})
+    with caplog.at_level(logging.WARNING, logger="smc.hardware.roles"):
+        devices = devices_from_core(core)
+    assert [(d.label, d.type) for d in devices] == [
+        ("Pump", "Unknown"),
+        ("XY", "XYStage"),
+    ]
+    assert "Pump" in caplog.text
+    assert resolve(devices).get(Role.xy_stage) == "XY"
+
+
+def test_core_roles_keeps_only_filled_slots() -> None:
+    core = StubCore({}, slots={"camera": "Cam", "focus": "Z", "shutter": ""})
+    assert core_roles(core) == {Role.camera: "Cam", Role.focus: "Z"}
 
 
 def test_importing_roles_does_not_load_pymmcore_plus(tmp_path: Path) -> None:
