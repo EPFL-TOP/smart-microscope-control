@@ -11,6 +11,7 @@ the default suite would contact the Nikon SDK (FM-06, FM-40, FM-41).
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -277,6 +278,61 @@ def test_probe_crash_keeps_the_listing_and_names_the_device() -> None:
     assert _listed(inv)["DemoCamera"].devices
     assert "probing NotificationTester/" in crash[0]
     assert inv.probe is None
+    if sys.platform == "darwin":
+        # The crash guard turned the abort into an exit code: no crash report.
+        assert "exited 6 (likely SIGABRT, crash guard)" in crash[0]
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="the crash guard is macOS-only")
+def test_crash_guard_turns_abort_into_exit_6_on_macos() -> None:
+    # Without the guard abort() ends in -6 and ReportCrash opens a dialog.
+    code = (
+        "from smc.discovery._mm_child import _no_error_dialogs\n"
+        "_no_error_dialogs()\n"
+        "import os\n"
+        "os.abort()\n"
+    )
+
+    done = subprocess.run([sys.executable, "-c", code], timeout=60, check=False)
+
+    assert done.returncode == 6
+
+
+def test_child_imports_no_pymmcore_before_its_crash_guard() -> None:
+    # The guard runs first in main(); importing the module must not load an
+    # adapter-bearing library before it.
+    code = (
+        "import sys\n"
+        "import smc.discovery._mm_child\n"
+        "print(sorted(m for m in sys.modules if m.startswith('pymmcore')))\n"
+    )
+
+    done = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        encoding="utf-8",
+        timeout=60,
+        check=True,
+    )
+
+    assert done.stdout.strip() == "[]"
+
+
+@pytest.mark.parametrize(
+    ("returncode", "platform_name", "expected"),
+    [
+        (6, "darwin", "6 (likely SIGABRT, crash guard)"),
+        (11, "darwin", "11 (likely SIGSEGV, crash guard)"),
+        (3, "darwin", "3"),
+        (-6, "darwin", "-6"),
+        (6, "linux", "6"),
+        (6, "win32", "6"),
+    ],
+)
+def test_exit_note_names_the_likely_signal_on_macos_only(
+    returncode: int, platform_name: str, expected: str
+) -> None:
+    assert mm_inventory.exit_detail(returncode, platform_name) == expected
 
 
 def _tiny_inventory() -> Inventory:

@@ -35,13 +35,44 @@ _SEM_NOGPFAULTERRORBOX = 0x0002
 
 
 def _no_error_dialogs() -> None:
-    """Keep Windows from opening a modal dialog that would look like a hang (FM-03)."""
+    """Keep the OS from opening a crash dialog for this child (FM-03).
+
+    Windows: a missing DLL or a crash opens a modal dialog that looks like
+    a hang. macOS: a crashing ``Python.app`` (Homebrew) makes ReportCrash
+    write a report and show "Python quit unexpectedly" — once per crashing
+    adapter, and once per ``pytest`` run on the NotificationTester probe.
+
+    On macOS libc's own ``_exit`` becomes the raw C handler of the crash
+    signals, so the process ends with ``_exit(signum)`` before the kernel
+    treats it as a crash: exit code 6 for ``abort()`` instead of -6, and no
+    report. A Python ``signal.signal`` handler would never run for a native
+    ``abort()``, and ``faulthandler`` re-raises into the default action.
+    Must run before ``pymmcore`` is imported or any adapter is loaded; the
+    parent process never installs it. Linux shows no dialog and is left as
+    it is.
+    """
     if sys.platform == "win32":
         import ctypes
 
         ctypes.windll.kernel32.SetErrorMode(
             _SEM_FAILCRITICALERRORS | _SEM_NOGPFAULTERRORBOX
         )
+    elif sys.platform == "darwin":
+        import ctypes
+        import signal
+
+        libc = ctypes.CDLL(None)
+        libc.signal.argtypes = [ctypes.c_int, ctypes.c_void_p]
+        libc.signal.restype = ctypes.c_void_p
+        exit_address = ctypes.cast(libc._exit, ctypes.c_void_p).value
+        for sig in (
+            signal.SIGABRT,
+            signal.SIGSEGV,
+            signal.SIGBUS,
+            signal.SIGILL,
+            signal.SIGFPE,
+        ):
+            libc.signal(int(sig), exit_address)
 
 
 def _progress(line: str) -> None:

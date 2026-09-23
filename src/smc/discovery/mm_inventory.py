@@ -44,6 +44,7 @@ __all__ = [
     "CHILD_COMMAND",
     "CHILD_TIMEOUT_S",
     "ChildResult",
+    "exit_detail",
     "list_adapters",
     "mm_section",
     "other_installs",
@@ -226,6 +227,30 @@ def probe_adapter(
     return ProbeResult(adapter=name, devices=probed)
 
 
+#: macOS signal numbers the child's crash guard turns into exit codes
+#: (``_no_error_dialogs`` in :mod:`smc.discovery._mm_child`).
+_DARWIN_GUARDED_SIGNALS = {
+    4: "SIGILL",
+    6: "SIGABRT",
+    8: "SIGFPE",
+    10: "SIGBUS",
+    11: "SIGSEGV",
+}
+
+
+def exit_detail(returncode: int, platform_name: str) -> str:
+    """The child's exit code, with the signal it most likely stands for.
+
+    On macOS the child's crash guard ends a crashing process with
+    ``_exit(signum)``, so an ``abort()`` shows up as exit code 6, not -6. A
+    genuine exit code with the same value reads the same, hence "likely".
+    """
+    if platform_name == "darwin" and returncode in _DARWIN_GUARDED_SIGNALS:
+        name = _DARWIN_GUARDED_SIGNALS[returncode]
+        return f"{returncode} (likely {name}, crash guard)"
+    return str(returncode)
+
+
 #: The child's progress lines on stderr, so a note can name what was running.
 _PROGRESS_PREFIXES = ("listing ", "probing ")
 
@@ -327,7 +352,10 @@ def mm_section(
                 f"and {stopped}{during}"
             )
         elif returncode != 0:
-            notes.append(f"adapters: the adapter child exited {returncode}{during}")
+            notes.append(
+                "adapters: the adapter child exited "
+                f"{exit_detail(returncode, sys.platform)}{during}"
+            )
 
         if not result_path.exists():
             if notes:
