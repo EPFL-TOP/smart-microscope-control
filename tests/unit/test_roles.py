@@ -80,6 +80,7 @@ def test_config_naming_tirf_as_xy_is_corrected_with_a_warning() -> None:
 
 def test_objective_turret_ignores_filter_and_condenser_turrets() -> None:
     turrets = [
+        dev("Dichroic", "State"),
         dev("FilterTurret1", "State"),
         dev("CondenserTurret", "State"),
         dev("Nosepiece", "State"),
@@ -88,8 +89,8 @@ def test_objective_turret_ignores_filter_and_condenser_turrets() -> None:
     assert roles.get(Role.objective_turret) == "Nosepiece"
     assert roles.candidates[Role.objective_turret] == ["Nosepiece"]
     assert roles.get(Role.filter_turret) == "FilterTurret1"
-    # Without a nosepiece, a filter or condenser turret still never fills it.
-    assert resolve(turrets[:2]).get(Role.objective_turret) is None
+    # Without a nosepiece, no other State device is taken for it.
+    assert resolve(turrets[:3]).get(Role.objective_turret) is None
 
 
 # -- the order of authority ---------------------------------------------------
