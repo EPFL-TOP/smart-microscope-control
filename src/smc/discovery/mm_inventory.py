@@ -19,6 +19,8 @@ import os
 import platform
 import subprocess
 import sys
+import tempfile
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -167,13 +169,20 @@ def list_adapters(core: CMMCorePlus, names: list[str]) -> list[AdapterInfo]:
     return result
 
 
-def probe_adapter(name: str) -> ProbeResult:
+def probe_adapter(
+    name: str, *, progress: Callable[[str], None] | None = None
+) -> ProbeResult:
     """Load and initialise every device of one adapter in a throwaway core.
 
     The ``Hub`` device is loaded first and becomes every other device's
     parent, because a hub-based adapter's peripherals only initialise below
     their hub. Each device's outcome is recorded; everything is unloaded
     afterwards so the stand is released.
+
+    Args:
+        name: The adapter.
+        progress: Called with ``"probing <adapter>/<device>"`` before each
+            device is loaded, so a crash can be attributed to a device.
     """
     from pymmcore_plus import CMMCorePlus
 
@@ -192,6 +201,8 @@ def probe_adapter(name: str) -> ProbeResult:
     hub_label: str | None = None
     try:
         for device in ordered:
+            if progress is not None:
+                progress(f"probing {name}/{device.name}")
             try:
                 core.loadDevice(device.name, name, device.name)
                 if hub_label is not None and device.type != _HUB_TYPE:
@@ -212,12 +223,18 @@ def probe_adapter(name: str) -> ProbeResult:
     return ProbeResult(adapter=name, devices=probed)
 
 
-def _last_json_line(stdout: str) -> str | None:
-    # A vendor DLL may print to stdout while it loads; the result is the last
-    # line the child writes.
-    for line in reversed(stdout.splitlines()):
-        if line.startswith("{"):
-            return line
+#: The child's progress lines on stderr, so a note can name what was running.
+_PROGRESS_PREFIXES = ("listing ", "probing ")
+
+
+def _last_progress(stderr_path: Path) -> str | None:
+    try:
+        text = stderr_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for line in reversed(text.splitlines()):
+        if line.startswith(_PROGRESS_PREFIXES):
+            return line.strip()
     return None
 
 
@@ -230,58 +247,88 @@ def mm_section(
 ) -> tuple[list[AdapterInfo], ProbeResult | None, list[str]]:
     """Run the adapter work in a child process and collect what it found.
 
+    The result travels through a file, never the child's stdout: a vendor
+    DLL may print while loading (FM-01). The child's stdout and stderr go to
+    files too, so a helper process that inherits them cannot keep a pipe
+    open and defeat the timeout (FM-04). The result file is read whatever
+    the exit code: a crash or hang at teardown, after the result was
+    written, costs a note and nothing else (FM-02). The child runs in the
+    temporary folder, so the operator's working directory is not on its
+    ``sys.path``.
+
     Returns:
-        The listed adapters, the probe (``None`` unless asked), and notes. A
-        non-zero exit, a timeout or unparsable output returns no listing and
-        a note that says which of the three happened.
+        The listed adapters, the probe (``None`` unless asked or when the
+        child died during it), and notes naming what went wrong and what the
+        child was doing at the time.
     """
-    command = [*CHILD_COMMAND, "--adapters", ",".join(adapters)]
-    if all_adapters:
-        command.append("--all")
-    if probe:
-        command += ["--probe", probe]
-    logger.info("adapter child: %s", " ".join(command[1:]))
-    try:
-        done = subprocess.run(
-            command,
-            capture_output=True,
-            stdin=subprocess.DEVNULL,
-            timeout=timeout_s,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        return (
-            [],
-            None,
-            [
+    with tempfile.TemporaryDirectory(
+        prefix="smc-discover-", ignore_cleanup_errors=True
+    ) as tmp:
+        folder = Path(tmp)
+        result_path = folder / "result.json"
+        stderr_path = folder / "stderr.txt"
+        command = [
+            *CHILD_COMMAND,
+            "--adapters",
+            ",".join(adapters),
+            "--result",
+            str(result_path),
+        ]
+        if all_adapters:
+            command.append("--all")
+        if probe:
+            command += ["--probe", probe]
+        logger.info("adapter child: %s", " ".join(command[1:]))
+
+        notes: list[str] = []
+        with (
+            (folder / "stdout.txt").open("wb") as out,
+            stderr_path.open("wb") as err,
+        ):
+            try:
+                child = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=out,
+                    stderr=err,
+                    cwd=folder,
+                )
+            except OSError as exc:
+                return (
+                    [],
+                    None,
+                    [f"adapters: the adapter child could not start: {exc}"],
+                )
+            try:
+                returncode = child.wait(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+                returncode = None
+
+        doing = _last_progress(stderr_path)
+        during = f" while {doing}" if doing else ""
+        if returncode is None:
+            notes.append(
                 f"adapters: the adapter child did not finish in {timeout_s:.0f} s "
-                "and was stopped (an adapter hung while loading); device lists "
-                "missing, adapter names kept"
-            ],
-        )
-    if done.returncode != 0:
-        tail = (done.stderr or "").strip().splitlines()[-3:]
-        detail = f": {' | '.join(tail)}" if tail else ""
-        return (
-            [],
-            None,
-            [
-                f"adapters: the adapter child exited {done.returncode} (an "
-                f"adapter crashed while loading?){detail}; device lists "
-                "missing, adapter names kept"
-            ],
-        )
-    line = _last_json_line(done.stdout or "")
-    try:
-        if line is None:
-            raise ValueError("no JSON line on stdout")
-        result = ChildResult.model_validate_json(line)
-    except (ValueError, ValidationError) as exc:
-        return (
-            [],
-            None,
-            [f"adapters: the adapter child's output could not be read: {exc}"],
-        )
-    return result.listed, result.probe, []
+                f"and was stopped{during}"
+            )
+        elif returncode != 0:
+            notes.append(f"adapters: the adapter child exited {returncode}{during}")
+
+        if not result_path.exists():
+            if notes:
+                notes[-1] += "; device lists missing, adapter names kept"
+            else:
+                notes.append("adapters: the adapter child wrote no result")
+            return [], None, notes
+        try:
+            result = ChildResult.model_validate_json(
+                result_path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError, ValidationError) as exc:
+            notes.append(
+                f"adapters: the adapter child's result could not be read: {exc}"
+            )
+            return [], None, notes
+    return result.listed, result.probe, notes
