@@ -530,7 +530,17 @@ class _UnkillableChild:
 def test_a_child_that_survives_kill_does_not_hang_the_survey(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(mm_inventory.subprocess, "Popen", _UnkillableChild)
+    # On real Windows, _kill_child_tree's own taskkill call goes through this
+    # same (patched) Popen; only the adapter child itself is unkillable here,
+    # so anything else (taskkill) is let through to the real subprocess.
+    real_popen = mm_inventory.subprocess.Popen
+
+    def fake_popen(command: list[str], *args: object, **kwargs: object) -> object:
+        if command[:1] == ["taskkill"]:
+            return real_popen(command, *args, **kwargs)  # type: ignore[arg-type]
+        return _UnkillableChild()
+
+    monkeypatch.setattr(mm_inventory.subprocess, "Popen", fake_popen)
 
     listed, _, notes = mm_inventory.mm_section(["DemoCamera"], timeout_s=1)
 
@@ -551,17 +561,22 @@ class _FakeChildProc:
 
 def test_kill_child_tree_on_posix_uses_killpg(monkeypatch: pytest.MonkeyPatch) -> None:
     # Both branches of _kill_child_tree only run on their own platform in CI;
-    # exercised here directly, on every job, by faking sys.platform.
+    # exercised here directly, on every job, by faking sys.platform. os.killpg
+    # does not exist on Windows, so the patch must be allowed to add it
+    # (raising=False) rather than require it already there.
     monkeypatch.setattr(mm_inventory.sys, "platform", "linux")
     calls: list[tuple[int, int]] = []
     monkeypatch.setattr(
-        mm_inventory.os, "killpg", lambda pid, sig: calls.append((pid, sig))
+        mm_inventory.os,
+        "killpg",
+        lambda pid, sig: calls.append((pid, sig)),
+        raising=False,
     )
 
     note = mm_inventory._kill_child_tree(_FakeChildProc())  # type: ignore[arg-type]
 
     assert note is None
-    assert calls == [(4321, mm_inventory.signal.SIGKILL)]
+    assert calls == [(4321, mm_inventory._SIGKILL)]
 
 
 def test_kill_child_tree_on_posix_ignores_a_process_already_gone(
@@ -572,7 +587,7 @@ def test_kill_child_tree_on_posix_ignores_a_process_already_gone(
     def raise_gone(pid: int, sig: int) -> None:
         raise ProcessLookupError
 
-    monkeypatch.setattr(mm_inventory.os, "killpg", raise_gone)
+    monkeypatch.setattr(mm_inventory.os, "killpg", raise_gone, raising=False)
 
     assert mm_inventory._kill_child_tree(_FakeChildProc()) is None  # type: ignore[arg-type]
 

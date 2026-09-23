@@ -72,6 +72,11 @@ _KILL_WAIT_S = 10.0
 #: A child sharing the console can repaint it. ``0`` (no flag) off Windows.
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
+#: POSIX-only; `_kill_child_tree`'s POSIX branch only runs where it exists,
+#: but a test that simulates that branch on a real Windows interpreter
+#: (there is no SIGKILL to send there) needs the same fallback.
+_SIGKILL = getattr(signal, "SIGKILL", signal.SIGTERM)
+
 
 def _decode_console_bytes(data: bytes) -> str:
     """Decode a Windows console tool's raw output.
@@ -121,7 +126,7 @@ def _kill_child_tree(child: subprocess.Popen[bytes]) -> str | None:
             return f"taskkill failed: {detail}" if detail else "taskkill failed"
         return None
     with contextlib.suppress(ProcessLookupError):
-        os.killpg(child.pid, signal.SIGKILL)
+        os.killpg(child.pid, _SIGKILL)
     return None
 
 
