@@ -134,6 +134,15 @@ class XYStage(Protocol):
         """Whether the stage reports it is still moving."""
         ...
 
+    def stop(self) -> None:
+        """Stop the stage now; never refused, never waits for the microscope lock.
+
+        A waiter on the stopped move raises ``MotionStoppedError``. It runs in
+        dry-run too: a stop cannot create motion, and a dry-run session may be
+        watching a stage moved by hand (design §13).
+        """
+        ...
+
     def limits_um(self) -> tuple[Limits, Limits] | None:
         """The soft limits as ``(x, y)``; ``None`` means unknown, not unlimited."""
         ...
@@ -161,6 +170,10 @@ class ZStage(Protocol):
 
     def is_busy(self) -> bool:
         """Whether the drive reports it is still moving."""
+        ...
+
+    def stop(self) -> None:
+        """Stop the drive now; same contract as ``XYStage.stop``."""
         ...
 
     def limits_um(self) -> Limits | None:

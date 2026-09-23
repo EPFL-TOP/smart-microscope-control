@@ -6,7 +6,7 @@ import dataclasses
 
 import pytest
 
-from smc.hardware.capabilities import XY, PropertyInfo
+from smc.hardware.capabilities import XY, PropertyInfo, XYStage, ZStage
 
 
 def test_value_types_are_frozen() -> None:
@@ -33,3 +33,37 @@ def test_property_describe_names_the_constraints() -> None:
     assert "[1 .. 2]" in text
     assert "{1 | 2}" in text
     assert "(read-only)" in text
+
+
+class _StageWithoutStop:
+    """Every ``XYStage``/``ZStage`` method except ``stop`` (design §13)."""
+
+    def position_um(self) -> float:
+        return 0.0
+
+    def move_to_um(self, *args: float, wait: bool = True) -> float:
+        return 0.0
+
+    def move_by_um(self, *args: float, wait: bool = True, force: bool = False) -> float:
+        return 0.0
+
+    def wait(self, timeout_s: float | None = None) -> None:
+        return None
+
+    def is_busy(self) -> bool:
+        return False
+
+    def limits_um(self) -> None:
+        return None
+
+
+class _StageWithStop(_StageWithoutStop):
+    def stop(self) -> None:
+        return None
+
+
+def test_stage_protocols_require_stop() -> None:
+    assert not isinstance(_StageWithoutStop(), XYStage)
+    assert not isinstance(_StageWithoutStop(), ZStage)
+    assert isinstance(_StageWithStop(), XYStage)
+    assert isinstance(_StageWithStop(), ZStage)
