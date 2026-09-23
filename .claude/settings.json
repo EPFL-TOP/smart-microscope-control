@@ -41,7 +41,9 @@
       "Bash(git push -u origin fix/:*)",
       "Bash(git push -u origin docs/:*)",
       "Bash(git push -u origin chore/:*)",
-      "Bash(gh pr create:*)"
+      "Bash(gh pr create:*)",
+      "Bash(python scripts/dev/point.py:*)",
+      "Bash(python3 scripts/dev/point.py:*)"
     ],
     "deny": [
       "Bash(pytest -m hardware:*)",
