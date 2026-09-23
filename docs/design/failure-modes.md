@@ -25,6 +25,7 @@ category is not here: an id, what happens, and how to check.
 - **FM-12 Moving Z switches PFS off** on the Nikon stands. *Check*: suspend and re-engage around Z moves.
 - **FM-13 Several devices share a type.** Ti2: four `XYStage` devices, three of them TIRF positioners; Ti-E: three `Stage` devices. *Check*: type-first resolution with exclusions, and the candidates reported.
 - **FM-14 Turret moves can crash an objective** under a loaded plate. *Check*: turret moves require confirmation.
+- **FM-15 A blocking device call under the microscope lock.** A vendor call with no timeout of its own (`snapImage`, a driver deadlock) holds the one `Executor` lock, so every other capability on that stand hangs with no diagnosis (#5 review). *Check*: device calls are bounded by a deadline (`deviceBusy` polling), or the call site is named as unbounded until the design bounds it.
 
 ## Windows
 

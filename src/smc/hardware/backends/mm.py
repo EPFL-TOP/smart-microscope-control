@@ -241,7 +241,12 @@ class MMCamera:
             )
 
     def snap(self) -> np.ndarray:
-        """One frame, exactly as MMCore returns it (no copy, no flip)."""
+        """One frame, exactly as MMCore returns it (no copy, no flip).
+
+        Unbounded (FM-15): ``snapImage`` has no timeout of its own, and it runs
+        under the microscope lock, so a hung camera driver stalls every other
+        capability until the design bounds it.
+        """
 
         def action() -> np.ndarray:
             self._check_current()
@@ -297,6 +302,9 @@ class MMCamera:
         """MMCore's calibrated value, else the profile's for the objective, else ``0.0``."""
 
         def action() -> float:
+            # MMCore's value is for its current camera and binning; for another
+            # camera it would be a measurement of the wrong device.
+            self._check_current()
             measured = float(self._core.getPixelSizeUm())
             if measured > 0:
                 return measured

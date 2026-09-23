@@ -97,6 +97,16 @@ class TestOnDemoDevices:
         landed = stage.move_by_um(60.0, 0.0, force=True)
         assert landed.x_um == pytest.approx(start.x_um + 60.0, abs=0.5)
 
+    def test_xy_absolute_move_outside_soft_limits_is_refused(
+        self, demo_core: Any
+    ) -> None:
+        stage = _xy(demo_core, xy_soft_limits_um=((-100.0, 100.0), (-100.0, 100.0)))
+        start = stage.move_to_um(0.0, 0.0)
+        with pytest.raises(SafetyRefusedError) as info:
+            stage.move_to_um(0.0, 100.5)
+        assert info.value.how_to_force == ""
+        assert stage.position_um() == start
+
     def test_xy_relative_move_into_the_soft_limit_is_refused(
         self, demo_core: Any
     ) -> None:
@@ -175,14 +185,23 @@ class TestOnDemoDevices:
         assert _camera(demo_core, sizes, "Nikon 40X Plan Fluor").pixel_size_um() == 0.0
         assert _camera(demo_core, sizes, None).pixel_size_um() == 0.0
 
+    @pytest.mark.parametrize(
+        ("method", "args"),
+        [
+            ("snap", ()),
+            ("exposure_ms", ()),
+            ("set_exposure_ms", (10.0,)),
+            ("image_shape", ()),
+            ("bit_depth", ()),
+            ("pixel_size_um", ()),
+        ],
+    )
     def test_camera_refuses_when_it_is_not_the_current_camera(
-        self, demo_core: Any
+        self, demo_core: Any, method: str, args: tuple[float, ...]
     ) -> None:
         camera = MMCamera(demo_core, "NotTheCamera", _executor(), {}, lambda: None)
         with pytest.raises(HardwareError, match="not the core's current camera"):
-            camera.snap()
-        with pytest.raises(HardwareError, match="not the core's current camera"):
-            camera.set_exposure_ms(10.0)
+            getattr(camera, method)(*args)
 
     def test_shutter_open_close_and_auto_shutter(
         self, demo_core: Any, caplog: pytest.LogCaptureFixture
