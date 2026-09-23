@@ -14,9 +14,11 @@ Two kinds of call live here, and they must not be confused:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import platform
+import signal
 import subprocess
 import sys
 import tempfile
@@ -36,6 +38,7 @@ from smc.discovery.models import (
     SystemInfo,
 )
 from smc.hardware import core as core_mod
+from smc.hardware.roles import device_type_name
 
 if TYPE_CHECKING:
     from pymmcore_plus import CMMCorePlus
@@ -61,10 +64,53 @@ CHILD_TIMEOUT_S = 180.0
 #: it with a child that crashes or hangs.
 CHILD_COMMAND: list[str] = [sys.executable, "-m", "smc.discovery._mm_child"]
 
-_HUB_TYPE = "HubDevice"
+_HUB_TYPE = "Hub"
 
 #: How long to wait for a killed child to go away before giving up on it.
 _KILL_WAIT_S = 10.0
+
+#: A child sharing the console can repaint it. ``0`` (no flag) off Windows.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def _kill_child_tree(child: subprocess.Popen[bytes]) -> str | None:
+    """Kill the child and any helper process it started (FM-35).
+
+    ``kill()`` alone stops only the direct child: a helper it launched (a
+    grandchild loading the vendor DLL, say) survives and may keep holding
+    the hardware. POSIX: the child was started as the leader of its own
+    session (``start_new_session=True``), so its whole process group shares
+    its pid. Windows: ``taskkill /T`` walks the tree MMCore itself cannot
+    report.
+
+    Returns:
+        A note fragment when the kill itself failed (e.g. ``taskkill``
+        exited non-zero); ``None`` when there is nothing more to say.
+    """
+    if sys.platform == "win32":
+        try:
+            result = subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(child.pid)],
+                capture_output=True,
+                timeout=10.0,
+                creationflags=_NO_WINDOW,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            child.kill()
+            return f"taskkill failed: {exc}"
+        child.kill()
+        if result.returncode != 0:
+            detail = (
+                (result.stderr or result.stdout or b"")
+                .decode("utf-8", "replace")
+                .strip()
+            )
+            return f"taskkill failed: {detail}" if detail else "taskkill failed"
+        return None
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(child.pid, signal.SIGKILL)
+    return None
 
 
 class ChildResult(BaseModel):
@@ -119,6 +165,7 @@ def system_section() -> tuple[SystemInfo, list[str]]:
         hostname=platform.node(),
         collected_at=datetime.now(timezone.utc),
         os=platform.platform(),
+        os_build=platform.version(),
         python=platform.python_version(),
         smc=__version__,
         pymmcore_plus=str(pymmcore_plus.__version__),
@@ -127,15 +174,6 @@ def system_section() -> tuple[SystemInfo, list[str]]:
         other_mm_installs=other_installs(st.install_dir),
     )
     return info, list(st.adapters)
-
-
-def _type_name(value: object) -> str:
-    from pymmcore_plus import DeviceType
-
-    try:
-        return str(DeviceType(int(value)).name)  # type: ignore[call-overload]
-    except (TypeError, ValueError):
-        return str(value)
 
 
 def list_adapters(core: CMMCorePlus, names: list[str]) -> list[AdapterInfo]:
@@ -164,7 +202,7 @@ def list_adapters(core: CMMCorePlus, names: list[str]) -> list[AdapterInfo]:
                 installed=True,
                 devices=[
                     AdapterDevice(
-                        name=str(d), type=_type_name(t), description=str(desc)
+                        name=str(d), type=device_type_name(t), description=str(desc)
                     )
                     for d, t, desc in zip(devices, types, descriptions, strict=False)
                 ],
@@ -320,6 +358,10 @@ def mm_section(
                     stdout=out,
                     stderr=err,
                     cwd=folder,
+                    # So the whole tree can be killed together (FM-35);
+                    # ignored on Windows, which uses creationflags instead.
+                    start_new_session=True,
+                    creationflags=_NO_WINDOW,
                 )
             except OSError as exc:
                 return (
@@ -328,16 +370,23 @@ def mm_section(
                     [f"adapters: the adapter child could not start: {exc}"],
                 )
             unstoppable = False
+            kill_detail: str | None = None
             try:
-                returncode = child.wait(timeout=timeout_s)
-            except subprocess.TimeoutExpired:
-                child.kill()
-                returncode = None
                 try:
-                    # Bounded: a process stuck in a driver call may not die.
-                    child.wait(timeout=_KILL_WAIT_S)
+                    returncode = child.wait(timeout=timeout_s)
                 except subprocess.TimeoutExpired:
-                    unstoppable = True
+                    kill_detail = _kill_child_tree(child)
+                    returncode = None
+                    try:
+                        # Bounded: a process stuck in a driver call may not die.
+                        child.wait(timeout=_KILL_WAIT_S)
+                    except subprocess.TimeoutExpired:
+                        unstoppable = True
+            except BaseException:
+                # Ctrl-C while waiting must not leave a helper process running
+                # and holding the hardware (FM-35).
+                _kill_child_tree(child)
+                raise
 
         doing = _last_progress(stderr_path)
         during = f" while {doing}" if doing else ""
@@ -347,9 +396,10 @@ def mm_section(
                 if unstoppable
                 else "was stopped"
             )
+            detail = f"; {kill_detail}" if kill_detail else ""
             notes.append(
                 f"adapters: the adapter child did not finish in {timeout_s:.0f} s "
-                f"and {stopped}{during}"
+                f"and {stopped}{during}{detail}"
             )
         elif returncode != 0:
             notes.append(

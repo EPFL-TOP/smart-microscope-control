@@ -34,6 +34,9 @@ class SystemInfo(BaseModel):
     #: UTC; serialised as ISO 8601.
     collected_at: datetime
     os: str
+    #: ``platform.version()``, raw. Python <= 3.11 calls Windows 11 "10"; the
+    #: build number (>= 22000) is what tells them apart. Recorded, not derived.
+    os_build: str = ""
     python: str
     smc: str
     pymmcore_plus: str
@@ -100,7 +103,8 @@ class AdapterDevice(BaseModel):
     """One device an adapter says it provides (listed, not loaded)."""
 
     name: str
-    #: Micro-Manager device type name (``CameraDevice``, ``HubDevice``, …).
+    #: Micro-Manager device type name, without the ``Device`` suffix
+    #: (``Camera``, ``Hub``, …; :func:`smc.hardware.roles.device_type_name`).
     type: str
     description: str = ""
 

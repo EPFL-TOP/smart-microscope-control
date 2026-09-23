@@ -1,4 +1,7 @@
 import json
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -71,6 +74,34 @@ def test_pnp_empty_output_is_no_devices() -> None:
     assert parse_pnp_json("") == []
 
 
+def test_pnp_ids_are_read_by_bus() -> None:
+    # PCI names its fields VEN_/DEV_; USB and FTDIBUS (+ instead of &) name
+    # them VID_/PID_; ACPI and HDAUDIO have neither and yield no IDs.
+    entries = parse_pnp_json(
+        json.dumps(
+            [
+                {
+                    "Status": "OK",
+                    "Class": "System",
+                    "FriendlyName": "System board",
+                    "InstanceId": "ACPI\\VEN_INT&DEV_33A0\\0",
+                },
+                {
+                    "Status": "OK",
+                    "Class": "MEDIA",
+                    "FriendlyName": "High Definition Audio Controller",
+                    "InstanceId": "HDAUDIO\\FUNC_01&VEN_10EC&DEV_0000\\4&2A1&0&0001",
+                },
+            ]
+        )
+    )
+
+    assert [(e.vendor_id, e.product_id) for e in entries] == [
+        (None, None),
+        (None, None),
+    ]
+
+
 LSUSB = """\
 Bus 002 Device 001: ID 1d6b:0003 Linux Foundation 3.0 root hub
 Bus 001 Device 004: ID 0403:6001 Future Technology Devices International, Ltd FT232 Serial (UART) IC
@@ -131,6 +162,24 @@ def test_system_profiler_json_is_parsed() -> None:
     assert ftdi.serial_number == "A12345BA"
 
 
+def test_macos_usb_reads_both_data_types() -> None:
+    # `system_profiler SPUSBDataType SPUSBHostDataType -json`: one call, two
+    # top-level keys. SPUSBHostDataType is the real output of this command on
+    # an Apple Silicon Mac (tests/data/system_profiler_usbhost.json, serial
+    # numbers and location IDs stripped): host controllers only, no vendor ID,
+    # so they must not be read as devices.
+    host = json.loads(
+        (Path(__file__).parents[1] / "data" / "system_profiler_usbhost.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    combined = {**json.loads(SYSTEM_PROFILER), **host}
+
+    entries = parse_system_profiler(json.dumps(combined))
+
+    assert [e.name for e in entries] == ["USB2.0 Hub", "FT232R USB UART"]
+
+
 LSPCI = """\
 00:02.0 VGA compatible controller [0300]: Intel Corporation Device [8086:a780] (rev 04)
 03:00.0 Signal processing controller [1180]: National Instruments PCIe-6738 [1093:c4c4]
@@ -181,3 +230,25 @@ def test_os_sections_never_raise() -> None:
     assert isinstance(serial, list)
     assert isinstance(usb, list)
     assert isinstance(pci, list)
+
+
+def test_os_tools_run_without_a_console_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-22: a child sharing the console can repaint it (PowerShell's own
+    # `[Console]::OutputEncoding=` line is exactly that). The Windows CI job
+    # is the real check: creationflags is `CREATE_NO_WINDOW` there, `0` here.
+    calls: list[dict[str, object]] = []
+    real_run = os_inventory.subprocess.run
+
+    def spy(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(kwargs)
+        return real_run(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os_inventory.subprocess, "run", spy)
+    notes: list[str] = []
+
+    os_inventory._run([sys.executable, "-c", "pass"], "test", notes)
+
+    assert calls
+    assert calls[0]["creationflags"] == getattr(subprocess, "CREATE_NO_WINDOW", 0)

@@ -11,8 +11,10 @@ the default suite would contact the Nikon SDK (FM-06, FM-40, FM-41).
 
 from __future__ import annotations
 
+import platform
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,8 +26,15 @@ import smc.discovery as discovery
 import smc.discovery.report as smc_cli_report
 from smc.cli import app
 from smc.discovery import inventory, mm_inventory, os_inventory, vendors
+from smc.discovery._mm_child import _clean_tree, _write
 from smc.discovery.mm_inventory import list_adapters
-from smc.discovery.models import AdapterInfo, Inventory, SerialPort, SystemInfo
+from smc.discovery.models import (
+    AdapterDevice,
+    AdapterInfo,
+    Inventory,
+    SerialPort,
+    SystemInfo,
+)
 from smc.discovery.report import JSON_NAME, TEXT_NAME
 from smc.discovery.vendors import VendorHint
 
@@ -102,11 +111,18 @@ def test_adapter_listing_records_enumeration_errors() -> None:
     good, broken, absent = list_adapters(_StubCore(), ["Good", "Broken", "Absent"])  # type: ignore[arg-type]
 
     assert good.error is None
-    assert [(d.name, d.type) for d in good.devices] == [("Cam", "CameraDevice")]
+    assert [(d.name, d.type) for d in good.devices] == [("Cam", "Camera")]
     assert broken.installed
     assert broken.error is not None
     assert "Broken" in broken.error
     assert absent == AdapterInfo(name="Absent", installed=False)
+
+
+def test_system_section_records_the_os_build() -> None:
+    # Python <= 3.11 calls Windows 11 "10"; the build tells them apart.
+    info, _ = mm_inventory.system_section()
+
+    assert info.os_build == platform.version()
 
 
 def _listed(inv: Inventory) -> dict[str, AdapterInfo]:
@@ -257,7 +273,7 @@ def test_probe_democamera_loads_hub_first() -> None:
     assert inv.probe is not None
     assert inv.probe.error is None
     devices = inv.probe.devices
-    assert devices[0].type == "HubDevice"
+    assert devices[0].type == "Hub"
     assert devices[0].name == "DHub"
     assert len(devices) > 10
     failed = [(d.name, d.error) for d in devices if not d.ok]
@@ -281,6 +297,40 @@ def test_probe_crash_keeps_the_listing_and_names_the_device() -> None:
     if sys.platform == "darwin":
         # The crash guard turned the abort into an exit code: no crash report.
         assert "exited 6 (likely SIGABRT, crash guard)" in crash[0]
+
+
+def test_clean_tree_recovers_cp1252_bytes_and_escapes_lone_surrogates() -> None:
+    # FM-05: pymmcore decodes adapter strings with surrogateescape.
+    assert _clean_tree("caf\udce9") == "café"
+    # A surrogate surrogateescape itself would never produce (outside the
+    # DC80-DCFF range) must not raise: it becomes literal escape text.
+    assert _clean_tree("\ud800x") == "\\ud800x"
+    assert _clean_tree({"a": ["caf\udce9"], "caf\udce9": 1}) == {
+        "a": ["café"],
+        "café": 1,
+    }
+    assert _clean_tree(3) == 3
+
+
+def test_result_with_surrogates_writes_valid_utf8_files(tmp_path: Path) -> None:
+    result = mm_inventory.ChildResult(
+        listed=[
+            AdapterInfo(
+                name="Vendor",
+                installed=True,
+                devices=[
+                    AdapterDevice(name="D", type="Camera", description="caf\udce9")
+                ],
+            )
+        ]
+    )
+    path = tmp_path / "result.json"
+
+    _write(result, path)
+
+    text = path.read_text(encoding="utf-8")  # must not raise
+    parsed = mm_inventory.ChildResult.model_validate_json(text)
+    assert parsed.listed[0].devices[0].description == "café"
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="the crash guard is macOS-only")
@@ -462,6 +512,9 @@ def test_a_failed_out_write_still_prints_the_survey(
 class _UnkillableChild:
     """A child that ignores kill(): only a bounded wait returns."""
 
+    #: Not a real process: killpg/taskkill must find nothing there.
+    pid = 999_999_999
+
     def __init__(self, *_: object, **__: object) -> None:
         pass
 
@@ -483,3 +536,202 @@ def test_a_child_that_survives_kill_does_not_hang_the_survey(
 
     assert listed == []
     assert any("could not be stopped" in n for n in notes)
+
+
+class _FakeChildProc:
+    """A ``Popen``-shaped stand-in for :func:`mm_inventory._kill_child_tree`."""
+
+    def __init__(self, pid: int = 4321) -> None:
+        self.pid = pid
+        self.killed = False
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+def test_kill_child_tree_on_posix_uses_killpg(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Both branches of _kill_child_tree only run on their own platform in CI;
+    # exercised here directly, on every job, by faking sys.platform.
+    monkeypatch.setattr(mm_inventory.sys, "platform", "linux")
+    calls: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        mm_inventory.os, "killpg", lambda pid, sig: calls.append((pid, sig))
+    )
+
+    note = mm_inventory._kill_child_tree(_FakeChildProc())  # type: ignore[arg-type]
+
+    assert note is None
+    assert calls == [(4321, mm_inventory.signal.SIGKILL)]
+
+
+def test_kill_child_tree_on_posix_ignores_a_process_already_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mm_inventory.sys, "platform", "linux")
+
+    def raise_gone(pid: int, sig: int) -> None:
+        raise ProcessLookupError
+
+    monkeypatch.setattr(mm_inventory.os, "killpg", raise_gone)
+
+    assert mm_inventory._kill_child_tree(_FakeChildProc()) is None  # type: ignore[arg-type]
+
+
+def test_kill_child_tree_on_windows_runs_taskkill_then_kill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mm_inventory.sys, "platform", "win32")
+    calls: list[list[str]] = []
+
+    def fake_run(
+        command: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(mm_inventory.subprocess, "run", fake_run)
+    child = _FakeChildProc()
+
+    note = mm_inventory._kill_child_tree(child)  # type: ignore[arg-type]
+
+    assert note is None
+    assert calls == [["taskkill", "/T", "/F", "/PID", "4321"]]
+    assert child.killed
+
+
+def test_kill_child_tree_on_windows_reports_a_failing_taskkill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mm_inventory.sys, "platform", "win32")
+    monkeypatch.setattr(
+        mm_inventory.subprocess,
+        "run",
+        lambda command, **k: subprocess.CompletedProcess(
+            command, 1, stdout=b"", stderr=b"not found\n"
+        ),
+    )
+    child = _FakeChildProc()
+
+    note = mm_inventory._kill_child_tree(child)  # type: ignore[arg-type]
+
+    assert note is not None
+    assert "not found" in note
+    assert child.killed
+
+
+def test_kill_child_tree_on_windows_survives_taskkill_itself_failing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mm_inventory.sys, "platform", "win32")
+
+    def raise_missing(*a: object, **k: object) -> subprocess.CompletedProcess[bytes]:
+        raise FileNotFoundError("taskkill")
+
+    monkeypatch.setattr(mm_inventory.subprocess, "run", raise_missing)
+    child = _FakeChildProc()
+
+    note = mm_inventory._kill_child_tree(child)  # type: ignore[arg-type]
+
+    assert note is not None
+    assert child.killed
+
+
+def test_adapter_child_runs_without_a_console_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-22: a child sharing the console can repaint it.
+    _fake_child(monkeypatch, "write_result()\n")
+    calls: list[dict[str, object]] = []
+    real_popen = mm_inventory.subprocess.Popen
+
+    class SpyPopen(real_popen):  # type: ignore[misc, type-arg]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            calls.append(kwargs)
+            super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(mm_inventory.subprocess, "Popen", SpyPopen)
+
+    mm_inventory.mm_section(["DemoCamera"], timeout_s=10)
+
+    assert calls
+    assert calls[0]["creationflags"] == getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    # So the whole tree can be killed together (FM-35).
+    assert calls[0]["start_new_session"] is True
+
+
+def test_timeout_kills_the_adapter_childs_helper_processes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # FM-35: kill() alone leaves a helper process the child started running.
+    heartbeat = tmp_path / "heartbeat.txt"
+    body = rf"""
+write_result()
+import subprocess, sys, time
+heartbeat = {str(heartbeat)!r}
+grandchild_code = (
+    "import time\n"
+    "while True:\n"
+    "    with open(" + repr(heartbeat) + ", 'a') as f:\n"
+    "        f.write('x')\n"
+    "        f.flush()\n"
+    "    time.sleep(0.1)\n"
+)
+subprocess.Popen([sys.executable, "-c", grandchild_code])
+time.sleep(30)
+"""
+    _fake_child(monkeypatch, body)
+
+    mm_inventory.mm_section(["DemoCamera"], timeout_s=1)
+
+    assert heartbeat.exists(), "the grandchild never started writing its heartbeat"
+    last = heartbeat.stat().st_size
+    assert last > 0
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        time.sleep(0.5)
+        current = heartbeat.stat().st_size
+        assert current == last, "the heartbeat kept growing: the grandchild lives"
+        last = current
+
+
+class _InterruptedChild:
+    """A child whose ``wait()`` is interrupted, like a Ctrl-C at the terminal."""
+
+    #: Not a real process: killpg/taskkill must find nothing there.
+    pid = 999_999_998
+
+    def __init__(self, *_: object, **__: object) -> None:
+        pass
+
+    def wait(self, timeout: float | None = None) -> int:
+        raise KeyboardInterrupt
+
+    def kill(self) -> None:
+        pass
+
+
+def test_interrupt_while_waiting_kills_the_child_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-35: Ctrl-C while waiting must not leave a helper process running.
+    killed: list[int] = []
+    monkeypatch.setattr(mm_inventory.subprocess, "Popen", _InterruptedChild)
+    if sys.platform == "win32":
+        monkeypatch.setattr(
+            mm_inventory.subprocess,
+            "run",
+            lambda *a, **k: subprocess.CompletedProcess(a, 0),
+        )
+        monkeypatch.setattr(
+            _InterruptedChild, "kill", lambda self: killed.append(self.pid)
+        )
+    else:
+        monkeypatch.setattr(
+            mm_inventory.os, "killpg", lambda pid, sig: killed.append(pid)
+        )
+
+    with pytest.raises(KeyboardInterrupt):
+        mm_inventory.mm_section(["DemoCamera"], timeout_s=5)
+
+    assert killed == [_InterruptedChild.pid]
