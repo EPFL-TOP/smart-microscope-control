@@ -70,6 +70,7 @@ class MotionInProgressError(SafetyRefusedError):
 
     def __init__(self, moving: tuple[str, ...], detail: str = "") -> None:
         self.moving = moving
+        self.detail = detail
         names = ", ".join(f"`{name}`" for name in moving)
         verb, it = ("is", "it") if len(moving) == 1 else ("are", "them")
         reason = (
@@ -80,15 +81,28 @@ class MotionInProgressError(SafetyRefusedError):
             reason += f" ({detail})"
         super().__init__(reason)
 
+    def __reduce__(self) -> tuple[type[MotionInProgressError], tuple[object, ...]]:
+        # Rebuilt from the constructor's arguments, not the message, so the
+        # error survives a worker process (pickle).
+        return (type(self), (self.moving, self.detail))
 
-class MicroscopeHaltedError(SafetyRefusedError):
-    """A mutation or an acquisition was refused because the microscope is halted (§13)."""
+
+class MicroscopeHaltedError(HardwareError):
+    """An action was refused because the microscope is halted (§13).
+
+    Not a ``SafetyRefusedError``: a plugin that skips a target on ``except
+    SafetyRefusedError`` (the soft limits) must not swallow the emergency
+    stop.
+    """
 
     def __init__(self) -> None:
         super().__init__(
             "the microscope was stopped (`Microscope.stop()`); call `resume()` "
             "to continue"
         )
+
+    def __reduce__(self) -> tuple[type[MicroscopeHaltedError], tuple[object, ...]]:
+        return (type(self), ())
 
 
 class MotionStoppedError(HardwareError):
@@ -99,12 +113,15 @@ class MotionStoppedError(HardwareError):
     motion's name (``"xy_stage XY"``).
     """
 
-    def __init__(self, device: str) -> None:
+    def __init__(
+        self, device: str, detail: str = "the move was stopped before it completed"
+    ) -> None:
         self.device = device
-        super().__init__(
-            f"`{device}`: the move was stopped before it completed; read the "
-            f"position before moving on"
-        )
+        self.detail = detail
+        super().__init__(f"`{device}`: {detail}; read the position before moving on")
+
+    def __reduce__(self) -> tuple[type[MotionStoppedError], tuple[object, ...]]:
+        return (type(self), (self.device, self.detail))
 
 
 class MicroscopeBusyError(HardwareError):
@@ -113,6 +130,9 @@ class MicroscopeBusyError(HardwareError):
     ``holder`` is the description of the call holding the lock and
     ``held_s`` how long it had held it when this caller gave up.
     """
+
+    def __reduce__(self) -> tuple[type[MicroscopeBusyError], tuple[object, ...]]:
+        return (type(self), (self.holder, self.held_s))
 
     def __init__(self, holder: str, held_s: float) -> None:
         self.holder = holder
