@@ -662,6 +662,17 @@ def test_a_relative_move_reads_its_anchor_inside_its_action() -> None:
     assert result == [XY(105.0, 0.0)]
 
 
+def test_a_device_type_pymmcore_plus_does_not_know_is_not_a_motion() -> None:
+    core = _MovingCore()
+    core.moving = True
+    core.getDeviceType = lambda device: 9999  # type: ignore[method-assign]
+    executor = _executor()
+    props = MMProperties(core, executor)  # type: ignore[arg-type]
+    assert props.set("Gadget", "Mode", 1) == "1"
+    assert core.commands == ["Gadget.Mode=1"]
+    assert executor.moving() == ()
+
+
 def test_a_stage_property_is_not_a_motion() -> None:
     # #59 finding 6: Properties.set('XY', 'Speed', …) became a motion that
     # blocked, then stopped, the operator's joystick move.

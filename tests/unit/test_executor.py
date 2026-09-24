@@ -243,6 +243,15 @@ def test_lock_timeout_must_be_finite_positive_and_at_most_timeout_max(
         _ex(lock_timeout_s=bad)
 
 
+def test_lock_timeout_accepts_timeout_max_itself() -> None:
+    assert (
+        _ex(lock_timeout_s=threading.TIMEOUT_MAX).do(
+            "shutter: open", _step("shutter: open", lambda: None)
+        )
+        == "readback"
+    )
+
+
 @pytest.mark.parametrize("bad", [math.nan, math.inf, -1.0])
 def test_wait_timeout_must_be_finite_and_non_negative(bad: float) -> None:
     with pytest.raises(ValueError, match="timeout_s must be finite"):
@@ -385,6 +394,26 @@ def test_stopped_motion_dropped_by_the_guard_still_fails_its_owners_wait() -> No
         executor.wait(xy.motion, 1.0)
     # Its owner has learnt it; the next wait on the idle stage returns.
     executor.wait(xy.motion, 1.0)
+
+
+def test_another_callers_new_move_does_not_erase_how_my_move_ended() -> None:
+    # Adversarial review of the fix round: a new move on the same stage by
+    # another thread discarded the owner's record, so the owner's wait()
+    # waited on the other move and missed its own stop.
+    executor, xy = _ex(), _Device()
+    _start(executor, xy)
+    executor.stop(xy.motion)
+    assert executor.do("shutter: open", _step("shutter: open", lambda: None))
+    other = _Thread(lambda: _move(executor, xy, wait=False))  # C moves the stage
+    other.join()
+    assert other.error is None
+    assert executor.moving() == ("xy_stage XY",)
+    started = time.monotonic()
+    with pytest.raises(MotionStoppedError):
+        executor.wait(xy.motion, 30.0)
+    assert time.monotonic() - started < JOIN_S  # it did not wait on C's move
+    assert executor.moving() == ("xy_stage XY",)  # C's move is left alone
+    assert xy.stops == 1
 
 
 def test_a_bystander_that_sees_a_stopped_move_idle_leaves_it_for_the_owner() -> None:
@@ -817,6 +846,27 @@ def test_lock_timeout_names_the_holder() -> None:
     # Timer steps on Windows are about 15 ms: keep a margin (FM-44).
     assert 0.4 <= info.value.held_s < JOIN_S + 1.0
     assert "camera: snap has held the microscope for" in str(info.value)
+
+
+def test_lock_held_outside_the_executor_is_reported_as_an_unknown_caller() -> None:
+    lock = threading.RLock()
+    executor = Executor(dry_run=False, lock=lock, logger=LOGGER, lock_timeout_s=0.3)
+    entered, release = threading.Event(), threading.Event()
+
+    def hold() -> None:
+        with lock:
+            entered.set()
+            release.wait(JOIN_S)
+
+    holder = _Thread(hold)
+    assert entered.wait(JOIN_S)
+    try:
+        with pytest.raises(MicroscopeBusyError) as info:
+            executor.do("shutter: open", _step("shutter: open", _never))
+    finally:
+        release.set()
+        holder.join()
+    assert info.value.holder == "an unknown caller"
 
 
 def test_a_nested_action_keeps_the_outer_holder_and_its_lock() -> None:

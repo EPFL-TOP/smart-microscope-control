@@ -261,8 +261,10 @@ class Executor:
         self._registry_lock = threading.Lock()
         self._registry: dict[str, _Registration] = {}
         #: Registrations the guard or a bystander's wait saw idle, kept until
-        #: their owner's ``wait()`` so that it still learns of a stop.
-        self._finished: dict[str, _Registration] = {}
+        #: their owner's ``wait()`` so that it still learns of a stop. Keyed by
+        #: (device, owner thread): another caller's new move on the same
+        #: device must not erase how this owner's move ended.
+        self._finished: dict[tuple[str, int], _Registration] = {}
         self._generations: dict[str, int] = {}
         self._halted = False
         self._holder: _Holder | None = None
@@ -440,7 +442,8 @@ class Executor:
                 raise MicroscopeHaltedError()
             registration = _Registration(motion, me, generation)
             self._registry[motion.device] = registration
-            self._finished.pop(motion.device, None)
+            # This owner's earlier move on the device is superseded.
+            self._finished.pop((motion.device, me), None)
         try:
             step.send()
         except BaseException as exc:
@@ -523,15 +526,12 @@ class Executor:
         def body() -> None:
             with self._registry_lock:
                 current = self._generations.get(motion.device, 0)
+                # This caller's own move, seen idle already by the guard or by
+                # a bystander's wait: its owner now learns how it ended, even
+                # if another caller has moved the device since.
+                finished = self._finished.pop((motion.device, me), None)
                 registration = self._registry.get(motion.device)
-                finished = None
-                if registration is None:
-                    finished = self._finished.get(motion.device)
-                    if finished is not None and finished.owner == me:
-                        # Its owner has now learnt how it ended.
-                        del self._finished[motion.device]
             if finished is not None:
-                # Seen idle already, by the guard or by a bystander's wait.
                 if current != finished.generation:
                     raise MotionStoppedError(motion.name)
                 return
@@ -588,7 +588,7 @@ class Executor:
             if self._registry.get(motion.device) is registration:
                 del self._registry[motion.device]
                 if not owner and registration.owner is not None:
-                    self._finished[motion.device] = registration
+                    self._finished[(motion.device, registration.owner)] = registration
             stopped = self._generations.get(motion.device, 0) != registration.generation
         if stopped:
             raise MotionStoppedError(motion.name)
@@ -709,8 +709,11 @@ class Executor:
             with self._registry_lock:
                 if self._registry.get(motion.device) is registration:
                     del self._registry[motion.device]
-                    # Kept so that its owner's wait() still learns of a stop.
-                    self._finished[motion.device] = registration
+                    if registration.owner is not None:
+                        # Kept so that its owner's wait() still learns of a stop.
+                        self._finished[(motion.device, registration.owner)] = (
+                            registration
+                        )
         if moving:
             raise MotionInProgressError(tuple(moving), "; ".join(details))
 
