@@ -153,10 +153,17 @@ def _lock(repo: Path, path: Path, reason: str) -> None:
     _git("worktree", "lock", str(path), "--reason", reason, cwd=repo)
 
 
-def _dead_pid() -> int:
+@pytest.fixture
+def dead_pid():
+    # On Windows a pid is eligible for reuse the moment its last handle
+    # closes, which can happen as soon as the Popen object is garbage
+    # collected; a live process can then claim the same number before the
+    # test gets to check it. Keeping `proc` referenced by this paused
+    # fixture (not just its pid) holds that handle open for the whole test.
     proc = subprocess.Popen([sys.executable, "-c", "pass"])
     proc.wait()
-    return proc.pid
+    yield proc.pid
+    assert proc.returncode == 0  # teardown: keeps `proc` alive until here
 
 
 def _is_locked(wt, repo: Path, path: Path) -> bool:
@@ -165,10 +172,10 @@ def _is_locked(wt, repo: Path, path: Path) -> bool:
 
 
 def test_clean_removes_a_merged_worktree_locked_by_a_dead_session(
-    wt, repo, monkeypatch
+    wt, repo, monkeypatch, dead_pid
 ) -> None:
     path = _add_worktree(repo, "issue-1", "feat/1")
-    reason = f"claude session issue-1-demo (pid {_dead_pid()} start now)"
+    reason = f"claude session issue-1-demo (pid {dead_pid} start now)"
     _lock(repo, path, reason)
     monkeypatch.setattr(wt, "pr_state", lambda root, branch: "merged")
     removed = wt.clean_worktrees(repo, repo, dry_run=False)
@@ -186,12 +193,12 @@ def test_clean_keeps_a_worktree_locked_by_a_live_process(wt, repo, monkeypatch) 
     assert path.is_dir()
 
 
-def test_clean_keeps_a_dirty_merged_worktree(wt, repo, monkeypatch) -> None:
+def test_clean_keeps_a_dirty_merged_worktree(wt, repo, monkeypatch, dead_pid) -> None:
     # Locked by a dead session so that, without the dirty check, the code
     # would proceed to unlock (mutating the worktree) before the native
     # `git worktree remove` guard against dirt finally refused it.
     path = _add_worktree(repo, "issue-3", "feat/3")
-    reason = f"claude session issue-3-demo (pid {_dead_pid()} start now)"
+    reason = f"claude session issue-3-demo (pid {dead_pid} start now)"
     _lock(repo, path, reason)
     (path / "scratch.txt").write_text("wip", encoding="utf-8")
     monkeypatch.setattr(wt, "pr_state", lambda root, branch: "merged")
@@ -251,9 +258,9 @@ def test_clean_deletes_merged_local_branches_only(
     assert checked_out.is_dir()
 
 
-def test_dry_run_changes_nothing(wt, repo, monkeypatch) -> None:
+def test_dry_run_changes_nothing(wt, repo, monkeypatch, dead_pid) -> None:
     wt_path = _add_worktree(repo, "issue-5", "feat/5")
-    reason = f"claude session issue-5-demo (pid {_dead_pid()} start now)"
+    reason = f"claude session issue-5-demo (pid {dead_pid} start now)"
     _lock(repo, wt_path, reason)
     _git("branch", "feat/merged-branch", cwd=repo)
     monkeypatch.setattr(
