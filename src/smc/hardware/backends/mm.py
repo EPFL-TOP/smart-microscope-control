@@ -2,8 +2,8 @@
 
 Each class wraps one device label of a ``CMMCorePlus`` and nothing else: it
 does not choose the device (roles do, #6) and does not own the core (the
-facade does, #8). Every call goes through the microscope's ``Executor``, so
-all of them share one lock and honour dry-run.
+facade does, #8). Every action goes through the microscope's ``Executor``,
+so all of them share one lock and honour dry-run.
 
 Hardware behaviour encoded here:
 
@@ -13,10 +13,14 @@ Hardware behaviour encoded here:
   moves the one the role names.
 * **Readback.** A mutation returns what the device reports afterwards, not
   what was asked: stages round to their step size, cameras clamp exposure.
-* **Waiting.** ``wait`` polls ``deviceBusy`` every 10 ms against a deadline
-  (default: the core timeout, which the facade raises to 60 s because a
-  plate traverse outlasts MMCore's 5 s default, FM-10) and raises
-  ``DeviceTimeoutError`` with what to change, never hangs forever.
+* **One lock section per action** (design §13). A move checks, commands,
+  waits and reads back while it holds the microscope lock, so its target
+  and its readback are its own. Reads, ``stop()`` and closing a shutter
+  skip the lock: MMCore serialises calls to one adapter, so they are safe
+  during a move, and a stop gets through a plate traverse. The wait's
+  deadline defaults to the core timeout, which the facade raises to 60 s
+  because a plate traverse outlasts MMCore's 5 s default (FM-10); a wait
+  that gives up stops the stage first (FM-17).
 * **Pixel size is measured or unknown.** MMCore's calibrated value when it
   has one, else the profile's value for the current objective, else ``0.0``.
 * **Dry-run reads real state.** Safety checks and the position a relative
@@ -27,12 +31,12 @@ from __future__ import annotations
 
 import logging
 import math
-import time
 from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING
 
 from smc.hardware.capabilities import XY, Limits, PropertyInfo
-from smc.hardware.errors import DeviceTimeoutError, HardwareError
+from smc.hardware.errors import HardwareError
+from smc.hardware.safety import Motion, Step
 
 if TYPE_CHECKING:
     import numpy as np
@@ -44,26 +48,22 @@ __all__ = ["MMCamera", "MMProperties", "MMShutter", "MMXYStage", "MMZStage"]
 
 logger = logging.getLogger("smc.hardware.backends.mm")
 
-#: How often ``wait`` asks the device whether it is still busy.
-POLL_INTERVAL_S = 0.01
+
+def _motion(core: CMMCorePlus, label: str, name: str, *, stoppable: bool) -> Motion:
+    def stop() -> None:
+        core.stop(label)
+
+    return Motion(
+        device=label,
+        name=name,
+        is_busy=lambda: bool(core.deviceBusy(label)),
+        stop=stop if stoppable else None,
+    )
 
 
-def _wait_until_idle(core: CMMCorePlus, label: str, timeout_s: float | None) -> None:
-    """Poll ``deviceBusy`` until idle or the deadline; raise ``DeviceTimeoutError``."""
-    if timeout_s is None:
-        timeout_s = core.getTimeoutMs() / 1000.0
-    if not math.isfinite(timeout_s) or timeout_s < 0:
-        # nan would make the deadline comparison always false: an endless wait.
-        raise ValueError(f"timeout_s must be finite and >= 0, got {timeout_s!r}")
-    deadline = time.monotonic() + timeout_s
-    while core.deviceBusy(label):
-        if time.monotonic() >= deadline:
-            raise DeviceTimeoutError(
-                f"{label} is still busy after {timeout_s:g} s. If the move is "
-                f"legitimately long, raise [micromanager] device_timeout_ms in "
-                f"the profile; otherwise check the device and its cabling."
-            )
-        time.sleep(POLL_INTERVAL_S)
+def _core_timeout(core: CMMCorePlus) -> Callable[[], float]:
+    """The core timeout in seconds, resolved inside the action (design §2, §13)."""
+    return lambda: core.getTimeoutMs() / 1000.0
 
 
 class MMXYStage:
@@ -76,6 +76,7 @@ class MMXYStage:
         self._label = label
         self._executor = executor
         self._safety = safety
+        self._motion = _motion(core, label, f"xy_stage {label}", stoppable=True)
 
     def _read_position(self) -> XY:
         return XY(
@@ -87,14 +88,22 @@ class MMXYStage:
         """Where the stage reports it is."""
         return self._executor.read(self._read_position)
 
-    def _move(self, description: str, x_um: float, y_um: float, wait: bool) -> XY:
-        def action() -> XY:
-            self._core.setXYPosition(self._label, x_um, y_um)
-            if wait:
-                _wait_until_idle(self._core, self._label, None)
-            return self._read_position()
+    def _step(self, log: str, x_um: float, y_um: float) -> Step[XY]:
+        return Step(
+            log=log,
+            send=lambda: self._core.setXYPosition(self._label, x_um, y_um),
+            readback=self._read_position,
+            dry_result=XY(x_um, y_um),
+        )
 
-        return self._executor.do(description, action, dry_result=XY(x_um, y_um))
+    def _move(self, description: str, step: Callable[[], Step[XY]], wait: bool) -> XY:
+        return self._executor.do(
+            description,
+            step,
+            motion=self._motion,
+            wait=wait,
+            timeout_s=_core_timeout(self._core),
+        )
 
     def move_to_um(self, x_um: float, y_um: float, *, wait: bool = True) -> XY:
         """Move to an absolute position (soft limits apply, no jog guard).
@@ -105,43 +114,53 @@ class MMXYStage:
         """
         x_um, y_um = float(x_um), float(y_um)
         self._safety.check_xy_target_um(x_um, y_um)
-        return self._move(f"xy_stage: move_to ({x_um}, {y_um}) µm", x_um, y_um, wait)
+        description = f"xy_stage: move_to ({x_um}, {y_um}) µm"
+        return self._move(
+            description, lambda: self._step(description, x_um, y_um), wait
+        )
 
     def move_by_um(
         self, dx_um: float, dy_um: float, *, wait: bool = True, force: bool = False
     ) -> XY:
         """Move relative to the live position; jog-guarded unless ``force``.
 
-        The target is computed from a live read and moved to absolutely, so the
-        soft-limit check sees the real destination, and the whole
-        read-check-move runs under the lock (another thread cannot move the
-        stage in between).
+        The target is computed from a position read inside the action, after
+        the guard, and moved to absolutely: the soft-limit check sees the real
+        destination, and no other caller can move the stage in between.
         """
         dx_um, dy_um = float(dx_um), float(dy_um)
         self._safety.check_jog_um(dx_um, dy_um, force=force)
 
-        def relative() -> XY:
+        def relative() -> Step[XY]:
             here = self._read_position()
             x_um, y_um = here.x_um + dx_um, here.y_um + dy_um
             self._safety.check_xy_target_um(x_um, y_um)
-            return self._move(
+            return self._step(
                 f"xy_stage: move_by ({dx_um}, {dy_um}) µm to ({x_um}, {y_um}) µm",
                 x_um,
                 y_um,
-                wait,
             )
 
-        return self._executor.read(relative)
+        return self._move(f"xy_stage: move_by ({dx_um}, {dy_um}) µm", relative, wait)
 
     def wait(self, timeout_s: float | None = None) -> None:
-        """Block until idle; ``DeviceTimeoutError`` after ``timeout_s`` (default: core timeout)."""
-        self._executor.read(
-            lambda: _wait_until_idle(self._core, self._label, timeout_s)
+        """Block until idle; ``DeviceTimeoutError`` after ``timeout_s`` (default: core timeout).
+
+        The thread that started the move stops the stage before a timeout or
+        an interrupt propagates; a move that was stopped raises
+        ``MotionStoppedError``.
+        """
+        self._executor.wait(
+            self._motion, _core_timeout(self._core) if timeout_s is None else timeout_s
         )
 
     def is_busy(self) -> bool:
         """Whether the stage reports it is still moving."""
         return self._executor.read(lambda: bool(self._core.deviceBusy(self._label)))
+
+    def stop(self) -> None:
+        """Stop the stage now, without waiting for the microscope lock (§13)."""
+        self._executor.stop(self._motion)
 
     def limits_um(self) -> tuple[Limits, Limits] | None:
         """The configured soft limits as ``(x, y)``; ``None`` when none are configured."""
@@ -162,6 +181,7 @@ class MMZStage:
         self._label = label
         self._executor = executor
         self._safety = safety
+        self._motion = _motion(core, label, f"z {label}", stoppable=True)
 
     def _read_position(self) -> float:
         return float(self._core.getPosition(self._label))
@@ -170,14 +190,24 @@ class MMZStage:
         """Where the drive reports it is."""
         return self._executor.read(self._read_position)
 
-    def _move(self, description: str, z_um: float, wait: bool) -> float:
-        def action() -> float:
-            self._core.setPosition(self._label, z_um)
-            if wait:
-                _wait_until_idle(self._core, self._label, None)
-            return self._read_position()
+    def _step(self, log: str, z_um: float) -> Step[float]:
+        return Step(
+            log=log,
+            send=lambda: self._core.setPosition(self._label, z_um),
+            readback=self._read_position,
+            dry_result=z_um,
+        )
 
-        return self._executor.do(description, action, dry_result=z_um)
+    def _move(
+        self, description: str, step: Callable[[], Step[float]], wait: bool
+    ) -> float:
+        return self._executor.do(
+            description,
+            step,
+            motion=self._motion,
+            wait=wait,
+            timeout_s=_core_timeout(self._core),
+        )
 
     def move_to_um(self, z_um: float, *, wait: bool = True) -> float:
         """Move to an absolute position (soft limits apply).
@@ -188,28 +218,39 @@ class MMZStage:
         """
         z_um = float(z_um)
         self._safety.check_z_target_um(z_um)
-        return self._move(f"z: move_to {z_um} µm", z_um, wait)
+        description = f"z: move_to {z_um} µm"
+        return self._move(description, lambda: self._step(description, z_um), wait)
 
     def move_by_um(self, dz_um: float, *, wait: bool = True) -> float:
-        """Move relative to the live position (soft limits apply to the target)."""
+        """Move relative to the live position (soft limits apply to the target).
+
+        The anchor is read inside the action, as for ``XYStage.move_by_um``.
+        """
         dz_um = float(dz_um)
 
-        def relative() -> float:
+        def relative() -> Step[float]:
             z_um = self._read_position() + dz_um
             self._safety.check_z_target_um(z_um)
-            return self._move(f"z: move_by {dz_um} µm to {z_um} µm", z_um, wait)
+            return self._step(f"z: move_by {dz_um} µm to {z_um} µm", z_um)
 
-        return self._executor.read(relative)
+        return self._move(f"z: move_by {dz_um} µm", relative, wait)
 
     def wait(self, timeout_s: float | None = None) -> None:
-        """Block until idle; ``DeviceTimeoutError`` after ``timeout_s`` (default: core timeout)."""
-        self._executor.read(
-            lambda: _wait_until_idle(self._core, self._label, timeout_s)
+        """Block until idle; ``DeviceTimeoutError`` after ``timeout_s`` (default: core timeout).
+
+        Same contract as ``XYStage.wait``.
+        """
+        self._executor.wait(
+            self._motion, _core_timeout(self._core) if timeout_s is None else timeout_s
         )
 
     def is_busy(self) -> bool:
         """Whether the drive reports it is still moving."""
         return self._executor.read(lambda: bool(self._core.deviceBusy(self._label)))
+
+    def stop(self) -> None:
+        """Stop the drive now, without waiting for the microscope lock (§13)."""
+        self._executor.stop(self._motion)
 
     def limits_um(self) -> Limits | None:
         """The configured soft limits; ``None`` when none are configured."""
@@ -253,9 +294,16 @@ class MMCamera:
     def snap(self) -> np.ndarray:
         """One frame, exactly as MMCore returns it (no copy, no flip).
 
-        Unbounded (FM-15): ``snapImage`` has no timeout of its own, and it runs
-        under the microscope lock, so a hung camera driver stalls every other
-        capability until the design bounds it.
+        An acquisition (§13): refused while halted or while a device the layer
+        moved is still moving, because a frame taken mid-move is a wrong
+        result.
+
+        Unbounded (FM-15): ``snapImage`` has no timeout of its own, and a thread
+        inside a driver call cannot be cancelled. It runs under the microscope
+        lock, so a hung camera driver holds it; other actions then fail after
+        the lock timeout with ``MicroscopeBusyError`` naming "camera: snap"
+        instead of hanging, while reads, ``stop()`` and closing the shutter
+        still get through.
         """
 
         def action() -> np.ndarray:
@@ -263,7 +311,7 @@ class MMCamera:
             self._core.snapImage()
             return self._core.getImage()
 
-        return self._executor.read(action)
+        return self._executor.acquire("camera: snap", action)
 
     def exposure_ms(self) -> float:
         """The current exposure time."""
@@ -284,18 +332,19 @@ class MMCamera:
         value_ms = float(value_ms)
         if not math.isfinite(value_ms) or value_ms < 0:
             raise ValueError(f"exposure must be finite and >= 0 ms, got {value_ms!r}")
+        description = f"camera: exposure {value_ms} ms"
 
-        def action() -> float:
-            self._core.setExposure(value_ms)
-            return float(self._core.getExposure())
-
-        def checked() -> float:
+        def step() -> Step[float]:
+            # Checked inside the action, in dry-run too.
             self._check_current()
-            return self._executor.do(
-                f"camera: exposure {value_ms} ms", action, dry_result=value_ms
+            return Step(
+                log=description,
+                send=lambda: self._core.setExposure(value_ms),
+                readback=lambda: float(self._core.getExposure()),
+                dry_result=value_ms,
             )
 
-        return self._executor.read(checked)
+        return self._executor.do(description, step)
 
     def image_shape(self) -> tuple[int, int]:
         """``(height, width)`` of the frames ``snap`` returns."""
@@ -384,20 +433,36 @@ class MMShutter:
         self._label = label
         self._executor = executor
 
+    def _read_open(self) -> bool:
+        return bool(self._core.getShutterOpen(self._label))
+
     def is_open(self) -> bool:
         """Whether the shutter reports open."""
-        return self._executor.read(lambda: bool(self._core.getShutterOpen(self._label)))
+        return self._executor.read(self._read_open)
 
     def set_open(self, open_: bool) -> bool:
-        """Open or close; return the readback."""
-        open_ = bool(open_)
+        """Open or close; return the readback.
 
-        def action() -> bool:
-            self._core.setShutterOpen(self._label, open_)
-            return bool(self._core.getShutterOpen(self._label))
+        Closing is a safe call (§13): it never waits for the microscope lock
+        and is never refused, halted, moving or in dry-run, so the light can
+        always be cut. Opening is an action like any other.
+        """
+        if not open_:
 
-        word = "open" if open_ else "close"
-        return self._executor.do(f"shutter: {word}", action, dry_result=open_)
+            def close() -> bool:
+                self._core.setShutterOpen(self._label, False)
+                return self._read_open()
+
+            return self._executor.safe("shutter: close", close)
+        return self._executor.do(
+            "shutter: open",
+            Step(
+                log="shutter: open",
+                send=lambda: self._core.setShutterOpen(self._label, True),
+                readback=self._read_open,
+                dry_result=True,
+            ),
+        )
 
     def auto_shutter(self) -> bool:
         """Whether the core opens the shutter around each exposure."""
@@ -406,13 +471,16 @@ class MMShutter:
     def set_auto_shutter(self, on: bool) -> bool:
         """Switch auto-shutter; return the readback."""
         on = bool(on)
-
-        def action() -> bool:
-            self._core.setAutoShutter(on)
-            return bool(self._core.getAutoShutter())
-
-        word = "on" if on else "off"
-        return self._executor.do(f"shutter: auto_shutter {word}", action, dry_result=on)
+        description = f"shutter: auto_shutter {'on' if on else 'off'}"
+        return self._executor.do(
+            description,
+            Step(
+                log=description,
+                send=lambda: self._core.setAutoShutter(on),
+                readback=lambda: bool(self._core.getAutoShutter()),
+                dry_result=on,
+            ),
+        )
 
 
 class MMProperties:
@@ -460,23 +528,43 @@ class MMProperties:
     def set(self, device: str, name: str, value: str | float | int) -> str:
         """Set one property; return the readback.
 
+        On a ``State`` device (a turret, a filter wheel, a light path) the set
+        can start a movement, so it is a motion (§13): it waits inside the
+        action for the device to report idle before reading back, with the
+        core timeout as the deadline. A property of a stage is not a motion:
+        moving a stage through ``Properties`` bypasses every guard.
+
         Raises:
             HardwareError: The property is read-only (checked before the call,
                 so dry-run refuses it too).
         """
-
-        def action() -> str:
-            self._core.setProperty(device, name, value)
-            return str(self._core.getProperty(device, name))
-
-        def checked() -> str:
-            if self._core.isPropertyReadOnly(device, name):
-                raise HardwareError(
-                    f"{device}.{name} is read-only; it reports state, it cannot be "
-                    f"set. See `describe({device!r})` for the settable properties."
-                )
-            return self._executor.do(
-                f"property: {device}.{name}={value}", action, dry_result=str(value)
+        if self._core.isPropertyReadOnly(device, name):
+            raise HardwareError(
+                f"{device}.{name} is read-only; it reports state, it cannot be "
+                f"set. See `describe({device!r})` for the settable properties."
             )
+        description = f"property: {device}.{name}={value}"
+        motion = self._motion_for(device)
+        return self._executor.do(
+            description,
+            Step(
+                log=description,
+                send=lambda: self._core.setProperty(device, name, value),
+                readback=lambda: str(self._core.getProperty(device, name)),
+                dry_result=str(value),
+            ),
+            motion=motion,
+            timeout_s=_core_timeout(self._core),
+        )
 
-        return self._executor.read(checked)
+    def _motion_for(self, device: str) -> Motion | None:
+        """The ``Motion`` a set on ``device`` starts, or ``None`` if it moves nothing we track."""
+        from pymmcore_plus import DeviceType
+
+        try:
+            kind = DeviceType(self._core.getDeviceType(device))
+        except ValueError:
+            return None  # a type this pymmcore-plus does not know
+        if kind != DeviceType.State:
+            return None
+        return _motion(self._core, device, device, stoppable=False)
