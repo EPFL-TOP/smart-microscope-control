@@ -10,6 +10,7 @@ silently does not apply. ``quirks`` is the one free-form table.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sys
 from pathlib import Path
@@ -67,6 +68,15 @@ class MicroManagerSection(_Section):
     device_timeout_ms: int = 60_000
     adapter_search_paths: list[str] = Field(default_factory=list)
 
+    @field_validator("device_timeout_ms")
+    @classmethod
+    def _timeout_positive(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError(
+                f"device_timeout_ms must be a positive number, got {value}"
+            )
+        return value
+
 
 class RolesSection(_Section):
     """Overrides for role resolution; anything not listed is resolved by heuristics."""
@@ -77,6 +87,11 @@ class RolesSection(_Section):
 
 def _check_ordered(limits: tuple[float, float], axis: str) -> None:
     low, high = limits
+    # nan comparisons are always False, so "not low < high" already rejects a nan
+    # bound — but inf does not ("-1000 < inf" is True), and either way the message
+    # below would blame ordering instead of the real problem.
+    if not math.isfinite(low) or not math.isfinite(high):
+        raise ValueError(f"{axis} limits must be finite numbers, got [{low}, {high}]")
     if not low < high:
         raise ValueError(
             f"{axis} limits must be [low, high] with low < high, got "
@@ -91,6 +106,17 @@ class SafetySection(_Section):
     z_soft_limits_um: tuple[float, float] | None = None
     xy_soft_limits_um: tuple[tuple[float, float], tuple[float, float]] | None = None
     turret_requires_confirm: bool = True
+
+    @field_validator("max_jog_um")
+    @classmethod
+    def _max_jog_positive_finite(cls, value: float) -> float:
+        # An infinite jog limit is refused, not read as "no jog limit" — turning
+        # the jog guard off is not a profile setting.
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(
+                f"max_jog_um must be a positive, finite number of µm, got {value}"
+            )
+        return value
 
     @field_validator("z_soft_limits_um")
     @classmethod
@@ -117,6 +143,17 @@ class CameraSection(_Section):
     """Per-objective pixel sizes at binning 1; a missing objective is unknown (0.0)."""
 
     pixel_size_um: dict[str, float] = Field(default_factory=dict)
+
+    @field_validator("pixel_size_um")
+    @classmethod
+    def _positive_finite(cls, value: dict[str, float]) -> dict[str, float]:
+        for objective, size in value.items():
+            if not math.isfinite(size) or size <= 0:
+                raise ValueError(
+                    f"pixel size for objective {objective!r} must be a positive "
+                    f"number of µm, got {size}"
+                )
+        return value
 
 
 class Profile(_Section):
