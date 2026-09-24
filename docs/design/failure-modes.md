@@ -29,7 +29,7 @@ category is not here: an id, what happens, and how to check.
 - **FM-16 A wait that holds the lock.** Polling a moving device while holding the microscope lock blocks every reader and every stop for the length of the move, which is 60 s for a plate traverse (#54). *Check*: the command is sent under the lock and the wait takes it only for each poll; a test reads from another thread while a wait polls.
 - **FM-17 A wait that gives up leaves the device moving.** A timeout, a Ctrl-C or any other exception during the wait raises, but the stage keeps going while the caller believes the move failed (#52 review). *Check*: every exit from a wait other than "idle" sends the device's stop first; so does a command that raises.
 - **FM-18 A stop that races a command.** A stop that does not wait for the lock can reach the device just before a move command already under way, which then starts the stage after the stop (#54). *Check*: a stop that arrives while a command is being sent is sent again after it, and the move raises `MotionStoppedError`.
-- **FM-19 A busy state that cannot be read.** `deviceBusy` raises. Reading that as idle lets the next action run during a move; reading it as moving forever locks the stand. *Check*: unreadable counts as moving, the refusal names the error, and a stop releases it.
+- **FM-19 A busy state that cannot be read.** `deviceBusy` raises. Reading that as idle lets the next action run during a move; reading it as moving forever locks the stand. *Check*: unreadable counts as moving, the refusal names the error, and a stop or `resume()` releases it; a motion that cannot be stopped (a `State` device) must still have a way out (#59 review).
 
 ## Windows
 
@@ -61,3 +61,16 @@ category is not here: an id, what happens, and how to check.
 ## Data
 
 - **FM-50 The repository is public.** Survey output (serial numbers, PnP instance IDs, host names) never goes into an issue or a commit.
+
+## Concurrency (the layer's own locks and threads)
+
+Learned from the design review of #59, where `/code-review` reproduced 15
+races in the first motion guard.
+
+- **FM-60 A motion found by name.** A waiter or a stop looks up "the" motion of a device by its label, and finds another caller's or none. A stop is lost, a stopped move reports an arrival, a stale waiter stops a new move. *Check*: only the action that sent a command waits for it, holding the lock; a stop is a per-device generation the action compares, not a flag on whatever registration exists (design §13).
+- **FM-61 A give-up by a bystander.** A thread that only waits for someone else's motion stops it when its own short deadline passes. *Check*: only the thread that started a motion stops it when giving up.
+- **FM-62 Log before stop.** A stop path that writes its log line first is delayed by a blocked console (a QuickEdit selection on Windows), or skipped by a second Ctrl-C. *Check*: send the stop, then log.
+- **FM-63 A readback in its own lock section.** Another caller acts between the end of the wait and the readback, so the move returns another move's position and a set returns another thread's value. *Check*: command, wait and readback in one lock section.
+- **FM-64 A halt that can be caught as a refusal.** `except SafetyRefusedError: skip` swallows the emergency stop, and the loop carries on. *Check*: the halt error derives from no error that a tool is expected to catch and carry on after.
+- **FM-65 An interrupt between `acquire()` and `try`.** A Python-level lock wrapper (a generator context manager) leaves a window in which a Ctrl-C keeps the lock held for good; `with lock:` has none. *Check*: nothing between `acquire()` returning and the `try`; a test interrupts the main thread (`_thread.interrupt_main()`) while it waits for the lock.
+- **FM-66 A check that is not the last one.** A halt (or any flag set without the lock) checked before a slow step, such as the guard polling a serial device, lets the action run after the flag was set. *Check*: check the flag again immediately before the command.
