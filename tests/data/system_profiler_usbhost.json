@@ -1,0 +1,19 @@
+{
+  "SPUSBHostDataType": [
+    {
+      "_name": "USB 3.1 Bus",
+      "Driver": "AppleT6000USBXHCI",
+      "USBKeyHardwareType": "Built-in"
+    },
+    {
+      "_name": "USB 3.1 Bus",
+      "Driver": "AppleT6000USBXHCI",
+      "USBKeyHardwareType": "Built-in"
+    },
+    {
+      "_name": "USB 3.1 Bus",
+      "Driver": "AppleT6000USBXHCI",
+      "USBKeyHardwareType": "Built-in"
+    }
+  ]
+}

@@ -82,6 +82,7 @@ def renderables(inv: Inventory) -> list[RenderableType]:
         ("host", s.hostname),
         ("collected (UTC)", s.collected_at.isoformat()),
         ("os", s.os),
+        ("os build", s.os_build),
         ("python", s.python),
         ("smc", s.smc),
         ("pymmcore-plus", s.pymmcore_plus),

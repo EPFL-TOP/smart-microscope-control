@@ -54,7 +54,7 @@ zeiss = ["pythonnet>=3.0; sys_platform == 'win32'"]
 ui = []
 
 [project.scripts]
-smc = "smc.cli:app"
+smc = "smc.cli:main"
 
 # Plugins register here (see ADR-0004). Third-party packages can add their own.
 [project.entry-points."smc.plugins"]
