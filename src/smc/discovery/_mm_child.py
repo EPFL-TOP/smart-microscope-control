@@ -80,10 +80,46 @@ def _progress(line: str) -> None:
     sys.stderr.flush()
 
 
+def _clean_string(value: str) -> str:
+    """Recover text a vendor adapter returned as raw, non-UTF-8 bytes (FM-05).
+
+    pymmcore decodes adapter strings with ``surrogateescape``: valid UTF-8
+    bytes decode correctly, and anything else becomes a lone surrogate that
+    ``json.dumps`` cannot serialise. Re-encoding with ``surrogateescape``
+    recovers the original bytes, which are then read as UTF-8, or as cp1252
+    (what a Windows adapter actually emits) when they are not valid UTF-8. A
+    surrogate that ``surrogateescape`` itself cannot re-encode — not one it
+    would have produced, but nothing here trusts that — is written out as
+    literal escape text instead of raising.
+    """
+    try:
+        raw = value.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:
+        return value.encode("utf-8", "backslashreplace").decode("utf-8")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", "replace")
+
+
+def _clean_tree(obj: object) -> object:
+    """Apply :func:`_clean_string` through the dicts, lists and strings of ``obj``."""
+    if isinstance(obj, str):
+        return _clean_string(obj)
+    if isinstance(obj, dict):
+        return {
+            (_clean_string(k) if isinstance(k, str) else k): _clean_tree(v)
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_clean_tree(v) for v in obj]
+    return obj
+
+
 def _write(result: ChildResult, path: Path) -> None:
     partial = path.with_name(path.name + ".partial")
     partial.write_text(
-        json.dumps(result.model_dump(mode="json"), ensure_ascii=True),
+        json.dumps(_clean_tree(result.model_dump(mode="json")), ensure_ascii=True),
         encoding="utf-8",
     )
     os.replace(partial, path)
