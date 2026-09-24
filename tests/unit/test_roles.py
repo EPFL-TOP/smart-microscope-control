@@ -20,6 +20,7 @@ from smc.hardware.roles import (
     Role,
     RoleMap,
     core_roles,
+    device_type_name,
     devices_from_core,
     resolve,
 )
@@ -398,6 +399,16 @@ def test_device_of_an_unknown_type_is_listed_not_dropped(
 def test_core_roles_keeps_only_filled_slots() -> None:
     core = StubCore({}, slots={"camera": "Cam", "focus": "Z", "shutter": ""})
     assert core_roles(core) == {Role.camera: "Cam", Role.focus: "Z"}
+
+
+def test_device_type_name_matches_the_roles_vocabulary() -> None:
+    # MMCore DeviceType values: Camera 2, Shutter 3, State 4, Stage 5, XYStage 6.
+    assert device_type_name(2) == "Camera"
+    assert device_type_name(3) == "Shutter"
+    assert device_type_name(4) == "State"
+    assert device_type_name(5) == "Stage"
+    assert device_type_name(6) == "XYStage"
+    assert device_type_name(999) == "Unknown"
 
 
 def test_importing_roles_does_not_load_pymmcore_plus(tmp_path: Path) -> None:

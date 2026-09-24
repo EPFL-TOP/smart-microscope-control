@@ -48,6 +48,7 @@ __all__ = [
     "RoleMap",
     "Source",
     "core_roles",
+    "device_type_name",
     "devices_from_core",
     "resolve",
 ]
@@ -428,6 +429,22 @@ class _InventoryCore(Protocol):
     def getShutterDevice(self) -> str: ...  # noqa: N802
 
 
+def device_type_name(value: int) -> str:
+    """Micro-Manager's ``DeviceType`` name for ``value``, without the ``Device`` suffix.
+
+    ``"Unknown"`` for a value this installed pymmcore-plus does not know: one
+    vocabulary, shared by :func:`devices_from_core` and
+    :mod:`smc.discovery.mm_inventory`, so a device type neither of them
+    recognises reads the same way everywhere it is reported.
+    """
+    from pymmcore_plus import DeviceType
+
+    try:
+        return DeviceType(value).name.removesuffix("Device")
+    except ValueError:
+        return "Unknown"
+
+
 def devices_from_core(core: _InventoryCore) -> list[DeviceInfo]:
     """Every loaded device except ``Core``, as the resolver sees it.
 
@@ -435,21 +452,17 @@ def devices_from_core(core: _InventoryCore) -> list[DeviceInfo]:
     ``"Unknown"`` and fills no role: one exotic device must not end the
     inventory of the whole stand.
     """
-    from pymmcore_plus import DeviceType
-
     found: list[DeviceInfo] = []
     for label in core.getLoadedDevices():
         if label == "Core":
             continue
-        try:
-            kind = DeviceType(core.getDeviceType(label)).name
-        except ValueError as exc:
-            log.warning("%s: unknown device type (%s); it fills no role", label, exc)
-            kind = "Unknown"
+        kind = device_type_name(core.getDeviceType(label))
+        if kind == "Unknown":
+            log.warning("%s: unknown device type; it fills no role", label)
         found.append(
             DeviceInfo(
                 label=label,
-                type=kind.removesuffix("Device"),
+                type=kind,
                 library=core.getDeviceLibrary(label),
                 name=core.getDeviceName(label),
                 description=core.getDeviceDescription(label),

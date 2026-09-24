@@ -41,6 +41,10 @@ logger = logging.getLogger("smc.discovery.os_inventory")
 #: Per OS call. ``Get-PnpDevice`` takes a few seconds on a PC with many devices.
 OS_TIMEOUT_S = 20.0
 
+#: A child sharing the console can repaint it (FM-22): PowerShell's own
+#: ``[Console]::OutputEncoding=`` line is exactly that. ``0`` elsewhere.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
 # The console output encoding is set inside the command: a child's stdout is
 # the ANSI code page on Windows, which mangles device names; -Compress keeps
 # the output one line.
@@ -54,8 +58,14 @@ _PNP_COMMAND = [
     "ConvertTo-Json -Compress",
 ]
 
-_VID = re.compile(r"(?:VID|VEN)_([0-9A-Fa-f]{4})")
-_PID = re.compile(r"(?:PID|DEV)_([0-9A-Fa-f]{4})")
+#: PCI instance IDs (``PCI\VEN_1B6B&DEV_0001&...``) name the fields ``VEN_``/
+#: ``DEV_``; every other bus (``USB\``, ``FTDIBUS\`` with ``+`` instead of
+#: ``&``) names them ``VID_``/``PID_``. An ``ACPI\`` or ``HDAUDIO\`` ID has
+#: neither and yields no IDs.
+_PCI_VENDOR = re.compile(r"VEN_([0-9A-Fa-f]{4})")
+_PCI_DEVICE = re.compile(r"DEV_([0-9A-Fa-f]{4})")
+_USB_VENDOR = re.compile(r"VID_([0-9A-Fa-f]{4})")
+_USB_DEVICE = re.compile(r"PID_([0-9A-Fa-f]{4})")
 _HEX_ID = re.compile(r"0x([0-9A-Fa-f]{4})")
 _LSUSB = re.compile(
     r"^Bus \d+ Device \d+: ID ([0-9A-Fa-f]{4}):([0-9A-Fa-f]{4})\s*(.*)$"
@@ -77,6 +87,7 @@ def _run(command: list[str], what: str, notes: list[str]) -> str | None:
             encoding="utf-8",
             errors="replace",
             check=False,
+            creationflags=_NO_WINDOW,
         )
     except FileNotFoundError:
         notes.append(f"{what}: `{command[0]}` not found on this PC")
@@ -99,6 +110,19 @@ def _upper(match: re.Match[str] | None) -> str | None:
     return match.group(1).upper() if match else None
 
 
+def _pnp_ids(instance_id: str | None) -> tuple[str | None, str | None]:
+    """The vendor/product ID pair, read with the field names of its bus."""
+    if not instance_id:
+        return None, None
+    if instance_id.upper().startswith("PCI\\"):
+        return _upper(_PCI_VENDOR.search(instance_id)), _upper(
+            _PCI_DEVICE.search(instance_id)
+        )
+    return _upper(_USB_VENDOR.search(instance_id)), _upper(
+        _USB_DEVICE.search(instance_id)
+    )
+
+
 def parse_pnp_json(text: str) -> list[DeviceEntry]:
     """Parse ``Get-PnpDevice | Select-Object … | ConvertTo-Json`` output.
 
@@ -115,12 +139,13 @@ def parse_pnp_json(text: str) -> list[DeviceEntry]:
         if not isinstance(item, dict):
             continue
         instance_id = item.get("InstanceId") or None
+        vendor_id, product_id = _pnp_ids(instance_id)
         entries.append(
             DeviceEntry(
                 source="pnp",
                 name=item.get("FriendlyName") or instance_id or "?",
-                vendor_id=_upper(_VID.search(instance_id or "")),
-                product_id=_upper(_PID.search(instance_id or "")),
+                vendor_id=vendor_id,
+                product_id=product_id,
                 manufacturer=item.get("Manufacturer") or None,
                 device_class=item.get("Class") or None,
                 status=item.get("Status") or None,
@@ -150,9 +175,13 @@ def parse_lsusb(text: str) -> list[DeviceEntry]:
 
 
 def parse_system_profiler(text: str) -> list[DeviceEntry]:
-    """Parse ``system_profiler SPUSBDataType -json``: devices nest under ``_items``.
+    """Parse ``system_profiler SPUSBDataType SPUSBHostDataType -json``.
 
-    Buses and host controllers carry no vendor ID and are not devices.
+    Devices nest under ``_items`` in either top-level key. Buses and host
+    controllers carry no vendor ID and are not devices; ``SPUSBHostDataType``
+    is host controllers only unless something is plugged into a port the
+    other key does not already cover, but both are cheap to walk and neither
+    is trusted to be complete on its own.
     """
     data: Any = json.loads(text)
     entries: list[DeviceEntry] = []
@@ -179,7 +208,9 @@ def parse_system_profiler(text: str) -> list[DeviceEntry]:
                 )
             walk(item.get("_items"))
 
-    walk(data.get("SPUSBDataType") if isinstance(data, dict) else None)
+    if isinstance(data, dict):
+        for key in ("SPUSBDataType", "SPUSBHostDataType"):
+            walk(data.get(key))
     return entries
 
 
@@ -268,7 +299,11 @@ def usb_devices(
         entries = pnp if pnp is not None else pnp_devices(notes)
         return [e for e in entries if not _is_pci(e)]
     if system == "Darwin":
-        text = _run(["system_profiler", "SPUSBDataType", "-json"], "usb", notes)
+        text = _run(
+            ["system_profiler", "SPUSBDataType", "SPUSBHostDataType", "-json"],
+            "usb",
+            notes,
+        )
         return _parsed(parse_system_profiler, text, "usb", notes)
     if system == "Linux":
         return _parsed(parse_lsusb, _run(["lsusb"], "usb", notes), "usb", notes)
