@@ -220,7 +220,7 @@ def pid_alive(pid: int) -> bool:
 
 def _pid_alive_windows(pid: int) -> bool:
     # HANDLE is pointer-sized (8 bytes on Win64); ctypes defaults an
-    # undeclared restype to c_int (4 bytes) and would truncate it.
+    # undeclared restype to c_int (4 bytes) and would truncate it (FM-26).
     kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
     kernel32.OpenProcess.restype = wintypes.HANDLE
     kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
