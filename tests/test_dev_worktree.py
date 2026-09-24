@@ -2,6 +2,7 @@
 
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -198,6 +199,21 @@ def test_clean_keeps_a_dirty_merged_worktree(wt, repo, monkeypatch) -> None:
     assert removed == 0
     assert path.is_dir()
     assert _is_locked(wt, repo, path)
+
+
+def test_clean_notes_a_worktree_whose_directory_is_gone(wt, repo, monkeypatch) -> None:
+    # git still has both worktrees registered; only the directory of the
+    # first was removed out of band (a manual rm -rf, a sync tool, a
+    # partially-finished earlier clean). The status check on the missing
+    # one must not crash the loop before the second, healthy worktree is
+    # reached (FM-31).
+    gone = _add_worktree(repo, "issue-6a", "feat/6a")
+    healthy = _add_worktree(repo, "issue-6b", "feat/6b")
+    shutil.rmtree(gone)
+    monkeypatch.setattr(wt, "pr_state", lambda root, branch: "merged")
+    removed = wt.clean_worktrees(repo, repo, dry_run=False)
+    assert removed == 1
+    assert not healthy.exists()
 
 
 def test_clean_deletes_merged_local_branches_only(

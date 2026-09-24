@@ -31,6 +31,7 @@ import re
 import shutil
 import subprocess
 import sys
+from ctypes import wintypes
 from pathlib import Path
 
 MIN_PYTHON = (3, 10)
@@ -38,6 +39,9 @@ SUBPROCESS_TIMEOUT_S = 30
 LOCK_PID_RE = re.compile(r"\bpid (\d+)\b")
 WIN_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 WIN_STILL_ACTIVE = 259
+# A child sharing the console can change its code page (FM-22); every
+# subprocess this script spawns is created without one.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def run(*args: str, cwd: Path | None = None, check: bool = True) -> str:
@@ -48,6 +52,7 @@ def run(*args: str, cwd: Path | None = None, check: bool = True) -> str:
         text=True,
         encoding="utf-8",
         errors="replace",
+        creationflags=_NO_WINDOW,
     )
     if check and proc.returncode != 0:
         sys.stderr.write(proc.stdout + proc.stderr)
@@ -214,12 +219,23 @@ def pid_alive(pid: int) -> bool:
 
 
 def _pid_alive_windows(pid: int) -> bool:
+    # HANDLE is pointer-sized (8 bytes on Win64); ctypes defaults an
+    # undeclared restype to c_int (4 bytes) and would truncate it.
     kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.GetExitCodeProcess.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
     handle = kernel32.OpenProcess(WIN_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not handle:
         return True
     try:
-        exit_code = ctypes.c_ulong()
+        exit_code = wintypes.DWORD()
         if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
             return True
         return bool(exit_code.value == WIN_STILL_ACTIVE)
@@ -227,17 +243,46 @@ def _pid_alive_windows(pid: int) -> bool:
         kernel32.CloseHandle(handle)
 
 
+def run_note(args: list[str], cwd: Path) -> tuple[bool, str]:
+    """Run a command whose failure is a note, not a crash (FM-31).
+
+    Returns ``(ok, detail)``: on success ``detail`` is stdout; on failure,
+    the last stderr line, a timeout message, or an OS error (a missing
+    ``cwd`` - a worktree directory removed out of band - included).
+    """
+    try:
+        proc = subprocess.run(
+            args,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=SUBPROCESS_TIMEOUT_S,
+            creationflags=_NO_WINDOW,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {SUBPROCESS_TIMEOUT_S}s"
+    except OSError as exc:
+        return False, str(exc)
+    if proc.returncode != 0:
+        reason = (proc.stderr.strip().splitlines() or ["unknown reason"])[-1]
+        return False, reason
+    return True, proc.stdout
+
+
 def pr_state(root: Path, branch: str) -> str:
     """The state of the pull requests whose head is ``branch``, asked of GitHub.
 
     One of ``merged``, ``open``, ``closed``, ``no PR``, ``detached`` or
-    ``unknown`` (no ``gh``, or ``gh`` failed). Only ``merged`` allows removal.
+    ``unknown`` (no ``gh``, ``gh`` failed, or ``gh`` timed out). Only
+    ``merged`` allows removal.
     """
     if not branch:
         return "detached"
     if shutil.which("gh") is None:
         return "unknown"
-    proc = subprocess.run(
+    ok, out = run_note(
         [
             "gh",
             "pr",
@@ -251,15 +296,11 @@ def pr_state(root: Path, branch: str) -> str:
             "--jq",
             '[.[].state] | join(",")',
         ],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+        root,
     )
-    if proc.returncode != 0:
+    if not ok:
         return "unknown"
-    states = {s for s in proc.stdout.strip().split(",") if s}
+    states = {s for s in out.strip().split(",") if s}
     for state in ("MERGED", "OPEN", "CLOSED"):
         if state in states:
             return state.lower()
@@ -272,30 +313,6 @@ def cmd_list(root: Path) -> int:
         state = "main" if path.resolve() == main else pr_state(root, branch)
         print(f"{state:8s} {branch or '(detached)':40s} {path}")
     return 0
-
-
-def git_note(args: list[str], cwd: Path) -> tuple[bool, str]:
-    """Run a git command whose failure is a note, not a crash (FM-31).
-
-    Returns ``(ok, detail)``; ``detail`` is empty on success, else the last
-    stderr line or a timeout message.
-    """
-    try:
-        proc = subprocess.run(
-            args,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=SUBPROCESS_TIMEOUT_S,
-        )
-    except subprocess.TimeoutExpired:
-        return False, f"timed out after {SUBPROCESS_TIMEOUT_S}s"
-    if proc.returncode != 0:
-        reason = (proc.stderr.strip().splitlines() or ["unknown reason"])[-1]
-        return False, reason
-    return True, ""
 
 
 def clean_worktrees(root: Path, main: Path, dry_run: bool) -> int:
@@ -315,7 +332,11 @@ def clean_worktrees(root: Path, main: Path, dry_run: bool) -> int:
         if state != "merged":
             print(f"keep     {branch or '(detached)':40s} {path}  ({state})")
             continue
-        if run("git", "status", "--porcelain", cwd=resolved).strip():
+        ok, out = run_note(["git", "status", "--porcelain"], resolved)
+        if not ok:
+            print(f"keep     {branch:40s} {path}  (could not check status: {out})")
+            continue
+        if out.strip():
             print(f"keep     {branch:40s} {path}  (dirty)")
             continue
         if locked is not None:
@@ -330,27 +351,31 @@ def clean_worktrees(root: Path, main: Path, dry_run: bool) -> int:
         if dry_run:
             continue
         if locked is not None:
-            ok, detail = git_note(["git", "worktree", "unlock", str(path)], main)
+            ok, detail = run_note(["git", "worktree", "unlock", str(path)], main)
             if not ok:
                 print(f"         kept: could not unlock ({detail})")
                 continue
-        ok, detail = git_note(["git", "worktree", "remove", str(path)], main)
+        ok, detail = run_note(["git", "worktree", "remove", str(path)], main)
         if not ok:
             print(f"         kept: git refused ({detail})")
             continue
         removed += 1
     if not dry_run:
-        run("git", "worktree", "prune", cwd=main)
+        ok, detail = run_note(["git", "worktree", "prune"], main)
+        if not ok:
+            print(f"note: git worktree prune failed ({detail})")
     return removed
 
 
 def clean_branches(root: Path, main: Path, dry_run: bool) -> int:
     """Delete local branches, other than ``main``, whose PR is merged and unused."""
     checked_out = {branch for _, branch, _ in worktrees(root) if branch}
+    ok, out = run_note(["git", "branch", "--format=%(refname:short)"], main)
+    if not ok:
+        print(f"note: could not list local branches ({out})")
+        return 0
     deleted = 0
-    for branch in run(
-        "git", "branch", "--format=%(refname:short)", cwd=main
-    ).splitlines():
+    for branch in out.splitlines():
         branch = branch.strip()
         if not branch or branch == "main" or branch in checked_out:
             continue
@@ -361,7 +386,7 @@ def clean_branches(root: Path, main: Path, dry_run: bool) -> int:
         print(f"{'would delete' if dry_run else 'deleted':8s} {branch:40s} (branch)")
         if dry_run:
             continue
-        ok, detail = git_note(["git", "branch", "-D", branch], main)
+        ok, detail = run_note(["git", "branch", "-D", branch], main)
         if not ok:
             print(f"         kept: git refused ({detail})")
             continue
@@ -375,7 +400,7 @@ def cmd_clean(root: Path, dry_run: bool) -> int:
     deleted = clean_branches(root, main, dry_run)
     note = ""
     if not dry_run:
-        ok, detail = git_note(
+        ok, detail = run_note(
             [
                 "git",
                 "-c",
