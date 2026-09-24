@@ -1,7 +1,7 @@
 # M1 design — the hardware layer, proven on the simulator
 
 - **Status**: design for issues #5, #6, #7, #8, #9, #10, #11, #30 and #54
-  (§13, added 2026-09-23)
+  (§13, added 2026-09-23, revised 2026-09-24)
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: this document is the contract between issues that are built in
   parallel. Names, module paths and signatures below are fixed; an executor
@@ -100,7 +100,7 @@ profiles/demo.toml     example profile the loader must accept             #7
       moving: tuple[str, ...]  # "xy_stage XY"
 
 
-  class MicroscopeHaltedError(SafetyRefusedError): ...  # after Microscope.stop()
+  class MicroscopeHaltedError(HardwareError): ...  # not a SafetyRefusedError (§13)
 
 
   class MotionStoppedError(HardwareError):
@@ -118,11 +118,12 @@ profiles/demo.toml     example profile the loader must accept             #7
   call logs at INFO: `xy_stage: move_to (1234.0, -56.0) µm`; dry-run logs
   `[dry-run] xy_stage: move_to …`. No `print` outside `cli.py`.
 - **Threading**: a `Microscope` owns one `threading.RLock`; every backend
-  call goes through `Executor`, which holds it for the command, but **not
-  for the wait that follows a move**. No mutation or acquisition runs while
-  a device the layer moved is still moving, and `stop()` never waits for the
-  lock (§13). Capabilities are therefore safe to call from a UI thread and a
-  worker at once; they are still *sequential*.
+  call goes through `Executor`. An *action* (a mutation, `snap`, `wait()`)
+  holds the lock from its first check to its readback, **including the wait
+  of a move**. Reads, `stop()` and closing a shutter never take it (§13).
+  No action runs while a movement has not finished. Capabilities are
+  therefore safe to call from a UI thread and a worker at once; actions are
+  still *sequential*.
 - **Timeouts**: `core.setTimeoutMs(profile.micromanager.device_timeout_ms)`
   (default 60 000 — a plate traverse exceeds MMCore's 5 s default).
   `waitForDevice` errors surface as `DeviceTimeoutError`.
@@ -215,13 +216,14 @@ Semantics every implementation must honour (these are the contract tests):
   jog-guarded (crossing a plate is legitimate travel).
 - Absolute and relative moves refuse a target outside the profile's soft
   limits (`SafetyRefusedError`, not forceable). No limits configured → no check.
-- `wait()` returns when the device reports not busy; after `timeout_s`
-  (default: the core timeout) it sends the device's stop and raises
-  `DeviceTimeoutError`; if the motion was stopped meanwhile it raises
-  `MotionStoppedError` (§13). To ask "is it done yet", use `is_busy()`.
-- While a device the layer moved is still moving, every mutation and every
-  `snap()` raises `MotionInProgressError`; reads and `stop()` are allowed
-  (§13).
+- `wait()` returns when the device reports not busy. After `timeout_s`
+  (default: the core timeout) it raises `DeviceTimeoutError`, having sent
+  the device's stop only if this thread started the motion. If the motion
+  was stopped meanwhile, it raises `MotionStoppedError` (§13). To ask "is it
+  done yet", use `is_busy()`.
+- While a device the layer moved is still moving, every mutation (except
+  closing a shutter) and every `snap()` raises `MotionInProgressError`;
+  reads and `stop()` are allowed (§13).
 - `stop()` sends the device's stop at once, without waiting for the
   microscope lock, even in dry-run (§13).
 - `Camera.pixel_size_um()` returns MMCore's value when > 0, else the
@@ -452,20 +454,21 @@ Core calls per method:
 | Method | MMCore |
 |---|---|
 | `XYStage.position_um` | `getXPosition(label)`, `getYPosition(label)` |
-| `XYStage.move_to_um` | `setXYPosition(label, x, y)` under the lock, then `Executor.wait` outside it if `wait` (§13) |
+| `XYStage.move_to_um` | `setXYPosition(label, x, y)`, then the wait if `wait`, then the readback: one action under the lock (§13) |
 | `ZStage.position_um` / `move_to_um` | `getPosition(label)` / `setPosition(label, z)`, waited like XY |
-| `wait` / `is_busy` | `Executor.wait` polling `deviceBusy(label)` / `deviceBusy(label)` |
+| `wait` / `is_busy` | polls `deviceBusy(label)` holding the lock / `deviceBusy(label)`, a lock-free read |
 | `XYStage.stop` / `ZStage.stop` | `stop(label)`, through `Executor.stop` (no lock, §13) |
 | `Camera.snap` | `snapImage()` then `getImage()` (the core's current camera must be `label`); `Executor.read(..., at_rest=True)` |
 | `Camera.exposure_ms` / `set_exposure_ms` | `getExposure()` / `setExposure(ms)` |
 | `Camera.image_shape` / `bit_depth` | `getImageHeight()`, `getImageWidth()` / `getImageBitDepth()` |
 | `Camera.pixel_size_um` | `getPixelSizeUm()`, fallback profile map by `objective_label()` |
-| `Shutter.*` | `getShutterOpen(label)`, `setShutterOpen(label, b)`, `getAutoShutter()`, `setAutoShutter(b)` |
+| `Shutter.*` | `getShutterOpen(label)`, `setShutterOpen(label, b)` (closing is a safe call, §13), `getAutoShutter()`, `setAutoShutter(b)` |
 | `Properties.*` | `getLoadedDevices`, `getDevicePropertyNames`, `getProperty`, `setProperty`, `isPropertyReadOnly`, `hasPropertyLimits`, `getPropertyLowerLimit/UpperLimit`, `getAllowedPropertyValues` |
 
 Mutations go through `executor.do(description, action, dry_result=…)`
 (moves and moving `Properties.set` pass `motion=`, §13); reads through
-`executor.read(action)`. `objective_label` is a callable
+`executor.read(action)`, which takes no lock. The internal `Executor`
+methods may change shape in #59's fix round; §13 fixes their behaviour. `objective_label` is a callable
 supplied by the facade (`getStateLabel` of the `objective_turret` role, or
 `lambda: None`).
 
@@ -716,16 +719,34 @@ Each wave-1 executor adds its own tests under `tests/unit/` or against
 - Role names are the ADR-0003 glossary names; `Role` values are also the
   TOML keys.
 - No action while a movement has not finished (owner, 2026-09-23): the
-  guard refuses, it does not queue (§13).
+  guard refuses, it does not queue. An action holds the lock through its
+  wait; reads, `stop()` and closing a shutter never take it (§13, revised
+  2026-09-24).
 
 ## 13. Motion, stop and the lock (#54)
 
 **Rule (owner, 2026-09-23): no action on a microscope whose movement has
-not finished.** This replaces the first design, which held the one lock
-through the wait that follows every move. That design gave three failures
-(#54). A plate traverse blocked every reader for up to 60 s, and no stop
-could get through. A move that timed out raised an error but left the stage
-moving. A hung `snapImage` froze every capability (FM-15).
+not finished.**
+
+**Revised 2026-09-24**, after the design review of #59, where `/code-review`
+reproduced 15 races. The first version of this section released the lock
+during the wait that follows a move, to keep readers and stops responsive.
+As a result, waiters, stops and other callers had to find "the" motion of a
+device by its label while other threads acted in between. A stop was lost,
+a stopped move reported an arrival, a stale waiter stopped someone else's
+move, and a readback returned another move's position. This version gets
+responsiveness the other way round. **An action holds the lock from its
+first check to its readback, wait included. Reads and the safe calls
+(stop, closing a shutter) never take the lock.** Only the thread inside an
+action sends commands and waits, so these races cannot happen.
+
+The earlier first design held the lock through the wait too, but it took
+the lock for reads and stops as well. That gave the three failures #54 was
+opened for:
+- a plate traverse blocked every reader for up to 60 s, and no stop could
+  get through;
+- a move that timed out left the stage moving;
+- a hung `snapImage` froze every capability (FM-15).
 
 **Measured on the demo** (2026-09-23, pymmcore-plus 0.18.1, pymmcore
 12.5.0.75.0):
@@ -733,153 +754,181 @@ moving. A hung `snapImage` froze every capability (FM-15).
   through a 2 s `snapImage`.
 - MMCore serialises calls per adapter module. During that snap,
   `getXPosition`, `deviceBusy` and `stop` on the demo XY stage (same
-  `DemoCamera` module as the camera) waited 1.7 s for it. `deviceBusy` on
-  the `Utilities` LED shutter and `getProperty("Core", …)` answered at once.
+  `DemoCamera` module as the camera) waited 1.7 s for it, while `deviceBusy`
+  on the `Utilities` LED shutter and `getProperty("Core", …)` answered at once.
 
-A `stop()` that does not wait for smc's lock therefore reaches a stage
-driven by another adapter than the camera, even while a snap hangs. That is
-the case on the Ti2: a `NikonTi2` stage and a Hamamatsu camera. On a stand
-where one adapter drives both, the stop waits for the camera call, and
-nothing in Python can change that.
+So MMCore, not smc, is what keeps concurrent calls to one device safe, and
+a read or a stop that skips smc's lock is safe. Such a stop reaches a stage
+driven by another adapter than the camera even while a snap hangs, which is
+the case on the Ti2 (a `NikonTi2` stage, a Hamamatsu camera). On a stand
+where one adapter drives both, the stop waits for the camera call inside
+MMCore; nothing in Python can change that.
 
 ### Kinds of call
 
-| Kind | Calls | Microscope lock | While something moves | While halted | Dry-run |
-|---|---|---|---|---|---|
-| read | `position_um`, `is_busy`, `exposure_ms`, `image_shape`, `pixel_size_um`, `is_open`, `Properties.get/describe`, `state()` | held for the call | runs | runs | runs |
-| wait | `wait()`, and the wait inside a move or a moving `Properties.set` | held for each poll only | runs | stopped motions raise | nothing moves, so it returns |
-| acquisition | `snap` | held for the call | **refused** | **refused** | runs |
-| mutation | moves, `set_exposure_ms`, `set_open`, `set_auto_shutter`, `Properties.set` | held for checks and command, **not** for the wait | **refused** | **refused** | logged, skipped |
-| stop | `XYStage.stop`, `ZStage.stop`, `Microscope.stop` | **never taken** | runs | runs | runs (sent to the device) |
+| Kind | Calls | Microscope lock | While another thread's action holds the lock | While a `wait=False` motion is busy | While halted | Dry-run |
+|---|---|---|---|---|---|---|
+| read | `position_um`, `is_busy`, `limits_um`, `exposure_ms`, `image_shape`, `bit_depth`, `pixel_size_um`, `is_open`, `auto_shutter`, `Properties.devices/describe/get`, `state()` | **never taken** | runs | runs | runs | runs |
+| action | moves, `set_exposure_ms`, `set_open(True)`, `set_auto_shutter`, `Properties.set`, `snap` | held from the first check to the readback, including the wait of a move | if that action is waiting for a motion, **refused at once** (`MotionInProgressError`); otherwise waits for the lock up to `lock_timeout_s` | **refused** | **refused** | mutations logged and skipped; `snap` runs |
+| wait | `wait()` | held while it polls | waits for the lock, within its own `timeout_s` | polls it | a stopped motion raises `MotionStoppedError` | nothing moves, so it returns |
+| safe | `XYStage.stop`, `ZStage.stop`, `Microscope.stop`, `set_open(False)` | **never taken** | runs | runs | runs | runs (sent to the device) |
 
-Refusals raise at once; nothing is queued. A UI that wants to snap after a
-move waits for the move, then snaps.
+Refusals raise at once; motion is never queued. A UI that wants to snap
+after a move waits for the move, then snaps.
 
-### Motions
+### The lock
 
-A motion is a device that the layer set moving and that has not yet
-reported idle. There are two kinds: an XY or Z move, and a `Properties.set`
-on a device of type `State`, `Stage` or `XYStage`. The second kind covers a
-turret, a filter wheel or a light path changing position; M2's turret
-capability registers the same way. Shutters are not motions in M1: they
-move on a millisecond scale.
+- **One section per action.** An action runs, under the lock and in this
+  order:
+  1. the halt check;
+  2. the guard (below);
+  3. its timeout, resolved from the core;
+  4. its stop-generation check (below);
+  5. the command;
+  6. for a `wait=True` move or a moving `Properties.set`, the wait;
+  7. the readback.
 
-```python
-@dataclass(frozen=True)
-class Motion:  # safety.py
-    device: str  # registry key: the device label
-    name: str  # for messages: "xy_stage XY", "z Z", "Dichroic"
-    is_busy: Callable[[], bool]
-    stop: Callable[[], None] | None  # None: cannot be stopped (a State device)
-```
+  A relative move reads the position, checks the soft limits and moves
+  inside that section, so its target and its readback are its own.
+- **A caller that finds the lock held by an action waiting for a motion is
+  refused at once**, with `MotionInProgressError` naming the motion. The
+  `Executor` knows because the holder records "waiting for `<motion>`" under
+  the registry lock. Any other contention, such as another thread's `snap`
+  or a slow set, waits for the lock up to `lock_timeout_s`. Then it raises
+  `MicroscopeBusyError`, naming the holder and how long it has held the
+  lock.
+- **Nothing between `acquire()` and `try`.** Acquire the lock in the frame
+  whose `try`/`finally` releases it, with no generator-based context manager
+  and no Python call in between. A `KeyboardInterrupt` in that window would
+  leave the lock held for good; #59 reproduced this with
+  `_thread.interrupt_main()`. The holder's description and start time are
+  recorded inside the `try`, under the registry lock, so a caller that times
+  out reads a consistent pair.
+- `lock_timeout_s` must be finite, positive and at most
+  `threading.TIMEOUT_MAX`.
+- **Re-entry.** A thread that already holds the lock re-enters it: a
+  callback that runs inside `snap` and moves the stage is part of the outer
+  action and waits inside it.
 
-- `Executor.do(..., motion=m)` works under the lock, in this order:
-  1. refuse while halted;
-  2. refuse while anything moves;
-  3. in dry-run, log and return `dry_result`; nothing is registered;
-  4. log, then register `m`. Registering comes **before** the command, so
-     an interrupt between the command and the registration cannot leave a
-     motion the guard does not know about;
-  5. run the command. If it raises anything, `KeyboardInterrupt` included,
-     send the stop and re-raise. The command may have reached the device
-     before the exception, for example a Ctrl-C delivered as soon as the
-     C call returns. `m` stays registered and is dropped when the device
-     reports idle;
-  6. if a `stop()` arrived while the command was running (it does not wait
-     for the lock), send the stop again, because the command may have
-     reached the device after it. Then raise `MotionStoppedError`.
-- **The guard** runs before every mutation and every `read(..., at_rest=True)`
-  (the acquisitions). It asks each registered motion `is_busy()` under the
-  lock and drops the idle ones. If any remains, it raises
-  `MotionInProgressError(moving=...)`. This cannot be forced. The message
-  names each device and says "wait for it (`wait()`) or stop it (`stop()`)".
-  A second move on a stage that is still moving is refused the same way.
-- **An unreadable busy state** (`is_busy()` raises) counts as moving:
-  unknown beats guessed. The refusal names the error. Once `stop()` has
-  been sent to it, an unreadable motion is dropped with a warning, so that a
-  broken device cannot lock the stand for good.
-- **Only calls through the layer are guarded.** `Microscope.core`, the
-  pymmcore-plus MDA engine, the vendor's joystick and the vendor software
-  are not seen. A plugin that uses `.core` fails review (§12).
-- **Simultaneous XY and Z moves** are therefore two actions, the second one
-  refused. If M3 needs a combined move, it is one layer call that
-  coordinates both, not two parallel moves.
+### The guard and `wait=False`
 
-### Waiting
+- **Motions.** An XY or Z move is a motion, and so is a `Properties.set` on a
+  `State` device (a turret, a filter wheel, a light path). A property of a
+  `Stage` or `XYStage` device set through `Properties` is **not** a motion.
+  Moving a stage through `Properties` bypasses every guard, and a plugin
+  that does it fails review.
+- A `wait=True` move (the default) waits inside its action, so nothing is
+  left registered when it returns.
+- A `wait=False` move sends the command, **registers** the motion together
+  with the thread that started it, and ends its action. Until the device
+  reports idle, every action from any thread is refused with
+  `MotionInProgressError`: "wait for it (`wait()`) or stop it (`stop()`)".
+  `wait()` and the safe calls are the exceptions.
+- **The guard** runs at step 2 of every action. It asks each registered
+  motion `is_busy()` and drops the idle ones. A dropped registration's stop
+  generation is kept for its device, so a later `wait()` still learns that
+  the motion was stopped.
+- **Unreadable busy state** (`is_busy()` raises): the motion counts as
+  moving, and the refusal names the error. `stop()` on it, or `resume()`,
+  drops it with a warning, so a broken device, including a `State` device
+  that cannot be stopped, never locks the stand for good. A device that
+  still reads busy after a stop stays registered, because it is moving.
 
-`Executor.wait(motion, timeout_s)` serves `wait()`, `move_*(wait=True)` and
-a moving `Properties.set`.
+### Waiting and giving up
 
-- It polls `is_busy()` every `POLL_INTERVAL_S` (10 ms) and takes the lock for
-  each poll only. Readers and `stop()` get through during a plate traverse.
-- **Idle**: it drops the motion. If a `stop()` or a halt stopped the motion
-  meanwhile, it raises `MotionStoppedError(device=...)`: the move did not
-  complete, and a plugin loop must end instead of carrying on to the next
-  well. Otherwise it returns, and the caller reads the position back under
-  the lock.
-- **Deadline** (`timeout_s`; the default is the core timeout, §2): it sends
-  the stop, then raises `DeviceTimeoutError`. The message says that the stop
-  was sent, or that this device cannot be stopped from smc.
-- **Any other exception while waiting**, including `KeyboardInterrupt`
-  (Ctrl-C in the CLI) and `MicroscopeBusyError` on a poll: it sends the
-  stop, then re-raises. A stage never keeps moving because the program that
-  moved it gave up.
-- `wait=False` returns right after the command, with the position read at
-  that moment (§3). The motion stays registered, and the next mutation or
-  acquisition is refused until the device reports idle. Calling `wait()` is
-  how a caller finishes the move.
+- The wait polls `is_busy()` every `POLL_INTERVAL_S`, holding the lock. Its
+  deadline is `timeout_s`, which defaults to the core timeout resolved at
+  step 3, before the command is sent.
+- **Idle**: if the device's stop generation moved since the action was
+  called, the wait raises `MotionStoppedError`; otherwise the action reads
+  back and returns.
+- **Giving up** (the deadline, `KeyboardInterrupt`, or any other exception):
+  the thread that started the motion sends the stop **first**, then logs,
+  then re-raises. `DeviceTimeoutError` says whether the stop was sent,
+  failed, or is impossible (a `State` device).
+- **Only the thread that started a motion stops it.** A `wait()` from any
+  other thread never stops anything. At its deadline it raises
+  `DeviceTimeoutError`, which says the motion belongs to another caller. It
+  also waits for the lock within its own `timeout_s`, so another thread's
+  short `wait(0.2)` cannot stop a traverse. This rule includes the thread
+  that sent a `wait=False` move and calls `wait()` later: that thread owns
+  the motion.
 
 ### Stop and halt
 
-- **`XYStage.stop()` / `ZStage.stop()`** go through `Executor.stop(motion)`:
-  - they log `xy_stage: stop` at WARNING;
-  - they mark the device's registered motion as stopped, so that its waiter
-    raises `MotionStoppedError`;
-  - they send MMCore's `stop(label)` without taking the microscope lock;
-  - they are never refused, and they run in dry-run too: a stop cannot
-    create motion, and a dry-run session may be watching a stage moved by
-    hand.
-
-  The registry has its own small lock, which is never held across a device
-  call; `stop()` takes only that one. A stop that raises propagates:
-  failures are findings.
+- **Stop generation.** Every device has a counter, which `Executor.stop()`
+  increments before it sends the stop. An action records its device's
+  counter when it is called, before it waits for the lock.
+  - If the counter has moved by step 4, the command is never sent, and the
+    action raises `MotionStoppedError` ("stopped before it started"). A stop
+    pressed while a move waits for the lock therefore cancels that move.
+  - If the counter moves during the command or the wait, the stop is sent
+    again after the command, which may have reached the device first. The
+    action then raises `MotionStoppedError` once the device is idle. It does
+    so even when the stop command itself failed: the caller asked for a
+    stop, so the move did not end as planned.
+- **`XYStage.stop()` / `ZStage.stop()`** increment the counter, send MMCore's
+  `stop(label)`, and only then log at WARNING. They never take the
+  microscope lock, are never refused, and run in dry-run too. The registry
+  lock, which is never held across a device call, is the only lock they
+  take.
+- **`set_open(False)`** is a safe call like stop. Closing a shutter never
+  waits for the lock and is never refused, so the light can always be cut:
+  a laser shutter during a traverse, or a cleanup in a `finally` block.
+  Opening the shutter is an action.
+- **Every stop path**, whether `stop()`, a give-up in a wait, or the stop
+  re-sent after a command, sends the device's stop before it writes a log
+  line. A blocked console (a QuickEdit selection on Windows) or a second
+  Ctrl-C can then delay or cut the log line, not the stop.
 - **`Microscope.stop()`** (#8) is the stand's emergency stop:
-  1. it halts the `Executor` first, so that no new command slips in;
-  2. it calls `stop()` on every stage capability it can build (XY, Z),
-     continuing past failures;
-  3. it raises one `HardwareError` that lists the failures, if any.
+  1. it halts first;
+  2. it calls `stop()` on every stage, continuing past failures;
+  3. it raises one `HardwareError` listing the failures, if any.
 
-  While halted, every mutation and acquisition raises
-  `MicroscopeHaltedError` ("call `resume()` to continue"), so that a plugin
-  running in a worker thread ends at its next hardware call, whatever it
-  was doing. Reads and stops still run. `Microscope.resume()` clears the
-  halt and starts nothing. A capability's own `stop()` does not halt.
-- **`Microscope.close()`**: when `moving()` is not empty, it calls `stop()`
-  on every stage before it unloads the devices.
-- **Lock order**: the registry lock is never held while the microscope
-  lock is taken, and never across a device call. A thread that holds the
-  microscope lock may take the registry lock; nothing takes them the other
-  way round.
+  While halted, every action raises `MicroscopeHaltedError`. The halt takes
+  no lock, so it can land at any moment. Actions check it at step 1 and
+  again immediately before their command or acquisition. `resume()` clears
+  the halt, drops unreadable motions (above), and starts nothing. A
+  capability's own `stop()` does not halt.
+- **`MicroscopeHaltedError` derives from `HardwareError`, not
+  `SafetyRefusedError`.** A plugin that skips a target on
+  `except SafetyRefusedError` (the soft limits) must not swallow the
+  emergency stop.
+- **`Microscope.close()`**: when anything is registered as moving, it calls
+  `stop()` on every stage before it unloads the devices.
 
 ### Lock timeout (FM-15)
 
-`Executor(lock_timeout_s=...)` bounds the **wait for the lock**, not the
-call that holds it. A caller that cannot get the lock within
-`lock_timeout_s` raises `MicroscopeBusyError(holder=..., held_s=...)`. The
-message names the call holding the lock and for how long: "camera: snap has
-held the microscope for 61.0 s; the camera driver may be hung". The
-`Executor` records the holder when the lock is first taken (the outermost
-acquisition): the `description` of `do` or `read`, or "a read" when none
-was given. The facade passes `device_timeout_ms / 1000`; the default is
-60 s, and the value must be finite and positive. `snap` itself stays
-unbounded, because a thread inside a driver call cannot be cancelled; it
-no longer freezes every other call.
+`lock_timeout_s` bounds the **wait for the lock**, not the action that
+holds it:
+- a hung `snap` makes other actions fail after `lock_timeout_s` with
+  `MicroscopeBusyError` ("camera: snap has held the microscope for 61.0 s;
+  the camera driver may be hung");
+- reads and safe calls are not affected;
+- a move holds the lock for its whole traverse, and other actions are
+  refused at once (`MotionInProgressError`) rather than timing out.
+
+The facade passes `device_timeout_ms / 1000`; the default is 60 s. `snap`
+itself stays unbounded, because a thread inside a driver call cannot be
+cancelled.
+
+### What #8 relies on
+
+The facade uses only the capabilities' public methods and:
+- `Executor(dry_run=..., lock=..., logger=..., lock_timeout_s=...)`;
+- `halt()`, `resume()`, `halted` and `moving()`;
+- the four errors in §2.
+
+The internal methods (`do`, `read`, `wait`, `stop` and their helpers) may
+change shape in #59's fix round, provided the behaviour above holds.
 
 ### Not verified (M2, #16)
 
 - That each stand's stages report busy as soon as the command is sent. If
-  one reports idle for a moment first, `wait()` returns early and the
+  one reports idle for a moment first, the wait returns early and the
   readback is wrong. The Ti2 session checks it: after a 10 mm move, the
   readback must equal the target.
 - That `stop()` reaches the Ti2 stage while a Hamamatsu snap is running
   (different adapters, as measured above on the demo).
+- That closing the shutter during a snap with auto-shutter leaves the
+  camera and MMCore in a usable state (the frame is cut short).
