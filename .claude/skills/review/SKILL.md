@@ -56,7 +56,10 @@ every line.
    (squash) and what it unblocks; set those issues to `status: ready` if
    their plan is posted and every dependency is merged. **Changes
    requested** → tell the owner to run `/develop <issue>` again: it finds
-   this review and fixes the blocking items.
+   this review and fixes the blocking items. When the review changes the
+   design (a design-doc PR), also replace the issue's `## Plan` with a
+   complete revised one (edit it in place, see `/plan`): the fix round and
+   its adversarial reviewers read the plan, not the review (#54).
 
 ## Never
 
