@@ -1324,11 +1324,17 @@ def test_resume_releases_an_unreadable_motion_that_cannot_be_stopped() -> None:
 
 
 def test_stop_without_a_stop_callable_says_it_cannot_and_cancels_nothing() -> None:
-    executor, turret = _ex(), _Device("Turret", stoppable=False, arrive_after=0)
-    with pytest.raises(HardwareError, match="cannot be stopped from smc"):
-        executor.stop(turret.motion)
-    # Nothing was stopped, so the next set of the turret is not cancelled.
-    assert _move(executor, turret) == "arrived"
+    executor, turret = _ex(), _Device("Turret", stoppable=False)
+    mover = _moving(executor, turret)
+    try:
+        with pytest.raises(HardwareError, match="cannot be stopped from smc"):
+            executor.stop(turret.motion)
+    finally:
+        turret.busy = False
+    mover.join()
+    # Nothing was stopped, so the set in flight ends as it was asked.
+    assert mover.error is None
+    assert mover.result == "arrived"
 
 
 def test_stop_that_raises_propagates() -> None:
