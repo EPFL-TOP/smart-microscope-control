@@ -867,11 +867,17 @@ class Executor:
             send()
         except Exception as exc:
             error = exc
-        note = "" if then is None else then(error is not None)
-        if error is None:
-            self._logger.log(level, "%s%s", what, note)
-        else:
-            self._logger.warning("%s failed (%r)%s", what, error, note)
+        note = ""
+        try:
+            if then is not None:
+                note = then(error is not None)
+        finally:
+            # Written even when ``then`` was interrupted (a Ctrl-C in its busy
+            # check): the call was sent, and the log must say so.
+            if error is None:
+                self._logger.log(level, "%s%s", what, note)
+            else:
+                self._logger.warning("%s failed (%r)%s", what, error, note)
         return error
 
 

@@ -1181,6 +1181,30 @@ def test_an_interrupt_in_the_give_up_busy_check_counts_as_moving() -> None:
     assert executor.moving() == ("xy_stage XY",)
 
 
+def test_an_interrupt_in_the_post_stop_check_still_logs_the_stop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Adversarial review of round 3: a Ctrl-C in the busy check that follows a
+    # sent stop cut the log line, so nothing recorded that the stop happened.
+    executor, xy = _ex(), _Device()
+    _outlive(executor, xy)
+    xy.stops = 0
+
+    def interrupt_after_the_stop(poll: int) -> None:
+        if xy.stops:
+            raise KeyboardInterrupt
+
+    xy.on_poll = interrupt_after_the_stop
+    with (
+        caplog.at_level(logging.WARNING, logger=LOGGER.name),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        executor.stop(xy.motion)
+    assert xy.stops == 1
+    assert "xy_stage XY: stop" in caplog.messages
+    assert executor.moving() == ("xy_stage XY",)  # not known to be idle
+
+
 def test_a_second_ctrl_c_in_the_stop_log_still_releases_the_motion() -> None:
     executor, xy = _ex(), _Device()
     _outlive(executor, xy)
