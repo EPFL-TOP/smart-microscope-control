@@ -15,12 +15,13 @@ Hardware behaviour encoded here:
   what was asked: stages round to their step size, cameras clamp exposure.
 * **One lock section per action** (design §13). A move checks, commands,
   waits and reads back while it holds the microscope lock, so its target
-  and its readback are its own. Reads, ``stop()`` and closing a shutter
-  skip the lock: MMCore serialises calls to one adapter, so they are safe
-  during a move, and a stop gets through a plate traverse. The wait's
-  deadline defaults to the core timeout, which the facade raises to 60 s
-  because a plate traverse outlasts MMCore's 5 s default (FM-10); a wait
-  that gives up stops the stage first (FM-17).
+  and its readback are its own; there is no ``wait=False``. Reads (``wait()``
+  included), ``stop()`` and closing a shutter skip the lock: MMCore
+  serialises calls to one adapter, so they are safe during a move, and a
+  stop gets through a plate traverse. A move's deadline is the core
+  timeout, which the facade raises to 60 s because a plate traverse
+  outlasts MMCore's 5 s default (FM-10); a move that gives up stops the
+  stage first (FM-17).
 * **Pixel size is measured or unknown.** MMCore's calibrated value when it
   has one, else the profile's value for the current objective, else ``0.0``.
 * **Dry-run reads real state.** Safety checks and the position a relative
@@ -96,32 +97,24 @@ class MMXYStage:
             dry_result=XY(x_um, y_um),
         )
 
-    def _move(self, description: str, step: Callable[[], Step[XY]], wait: bool) -> XY:
+    def _move(self, description: str, step: Callable[[], Step[XY]]) -> XY:
         return self._executor.do(
-            description,
-            step,
-            motion=self._motion,
-            wait=wait,
-            timeout_s=_core_timeout(self._core),
+            description, step, motion=self._motion, timeout_s=_core_timeout(self._core)
         )
 
-    def move_to_um(self, x_um: float, y_um: float, *, wait: bool = True) -> XY:
+    def move_to_um(self, x_um: float, y_um: float) -> XY:
         """Move to an absolute position (soft limits apply, no jog guard).
 
-        With ``wait=False`` the return value is the position read right after
-        the command, not where the stage will land; call ``wait()`` then
-        ``position_um()`` for that.
+        Returns where the stage landed, once it reports idle (§13). A UI that
+        must stay responsive moves from a worker thread: reads and ``stop()``
+        never wait for the microscope lock.
         """
         x_um, y_um = float(x_um), float(y_um)
         self._safety.check_xy_target_um(x_um, y_um)
         description = f"xy_stage: move_to ({x_um}, {y_um}) µm"
-        return self._move(
-            description, lambda: self._step(description, x_um, y_um), wait
-        )
+        return self._move(description, lambda: self._step(description, x_um, y_um))
 
-    def move_by_um(
-        self, dx_um: float, dy_um: float, *, wait: bool = True, force: bool = False
-    ) -> XY:
+    def move_by_um(self, dx_um: float, dy_um: float, *, force: bool = False) -> XY:
         """Move relative to the live position; jog-guarded unless ``force``.
 
         The target is computed from a position read inside the action, after
@@ -141,14 +134,13 @@ class MMXYStage:
                 y_um,
             )
 
-        return self._move(f"xy_stage: move_by ({dx_um}, {dy_um}) µm", relative, wait)
+        return self._move(f"xy_stage: move_by ({dx_um}, {dy_um}) µm", relative)
 
     def wait(self, timeout_s: float | None = None) -> None:
         """Block until idle; ``DeviceTimeoutError`` after ``timeout_s`` (default: core timeout).
 
-        The thread that started the move stops the stage before a timeout or
-        an interrupt propagates; a move that was stopped raises
-        ``MotionStoppedError``.
+        A read (§13): it never takes the microscope lock and never stops the
+        stage, so it can watch a move made by another thread, or by hand.
         """
         self._executor.wait(
             self._motion, _core_timeout(self._core) if timeout_s is None else timeout_s
@@ -198,30 +190,23 @@ class MMZStage:
             dry_result=z_um,
         )
 
-    def _move(
-        self, description: str, step: Callable[[], Step[float]], wait: bool
-    ) -> float:
+    def _move(self, description: str, step: Callable[[], Step[float]]) -> float:
         return self._executor.do(
-            description,
-            step,
-            motion=self._motion,
-            wait=wait,
-            timeout_s=_core_timeout(self._core),
+            description, step, motion=self._motion, timeout_s=_core_timeout(self._core)
         )
 
-    def move_to_um(self, z_um: float, *, wait: bool = True) -> float:
+    def move_to_um(self, z_um: float) -> float:
         """Move to an absolute position (soft limits apply).
 
-        With ``wait=False`` the return value is the position read right after
-        the command, not where the stage will land; call ``wait()`` then
-        ``position_um()`` for that.
+        Returns where the drive landed, once it reports idle (§13), as for
+        ``XYStage.move_to_um``.
         """
         z_um = float(z_um)
         self._safety.check_z_target_um(z_um)
         description = f"z: move_to {z_um} µm"
-        return self._move(description, lambda: self._step(description, z_um), wait)
+        return self._move(description, lambda: self._step(description, z_um))
 
-    def move_by_um(self, dz_um: float, *, wait: bool = True) -> float:
+    def move_by_um(self, dz_um: float) -> float:
         """Move relative to the live position (soft limits apply to the target).
 
         The anchor is read inside the action, as for ``XYStage.move_by_um``.
@@ -233,7 +218,7 @@ class MMZStage:
             self._safety.check_z_target_um(z_um)
             return self._step(f"z: move_by {dz_um} µm to {z_um} µm", z_um)
 
-        return self._move(f"z: move_by {dz_um} µm", relative, wait)
+        return self._move(f"z: move_by {dz_um} µm", relative)
 
     def wait(self, timeout_s: float | None = None) -> None:
         """Block until idle; ``DeviceTimeoutError`` after ``timeout_s`` (default: core timeout).
@@ -531,8 +516,11 @@ class MMProperties:
         On a ``State`` device (a turret, a filter wheel, a light path) the set
         can start a movement, so it is a motion (§13): it waits inside the
         action for the device to report idle before reading back, with the
-        core timeout as the deadline. A property of a stage is not a motion:
-        moving a stage through ``Properties`` bypasses every guard.
+        core timeout as the deadline. Such a device cannot be stopped from
+        smc, so one still busy at the deadline refuses every action until it
+        reports idle or the operator calls ``resume()``. A property of a stage
+        is not a motion: moving a stage through ``Properties`` bypasses every
+        guard.
 
         Raises:
             HardwareError: The property is read-only (checked before the call,

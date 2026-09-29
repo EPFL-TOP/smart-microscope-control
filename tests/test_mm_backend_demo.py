@@ -402,18 +402,23 @@ def test_wait_times_out_cleanly() -> None:
         stage.wait(0.05)
     assert 0.05 <= time.monotonic() - started < 2.0
     assert core.polls > 1
-    # §13: nobody moved it through smc, so the waiter has no move to stop.
+    # §13: wait() is a read; it never stops anything.
     assert core.stops == []
     assert stage.is_busy()
 
 
-def test_wait_that_gives_up_on_its_own_move_stops_the_stage() -> None:
-    core = _AlwaysBusyCore()
-    stage = MMXYStage(core, "XY", _executor(), Safety(max_jog_um=1.0))  # type: ignore[arg-type]
-    stage.move_to_um(1.0, 2.0, wait=False)
+def test_a_move_that_times_out_stops_the_stage_and_a_wait_never_does() -> None:
+    core = _AlwaysBusyCore(timeout_ms=30.0)
+    executor = _executor()
+    stage = MMXYStage(core, "XY", executor, Safety(max_jog_um=1.0))  # type: ignore[arg-type]
     with pytest.raises(DeviceTimeoutError, match="the stop was sent"):
+        stage.move_to_um(1.0, 2.0)
+    # §13: the action that gives up stops the stage before it raises (FM-17);
+    # the stage still reads busy, so the motion outlived its action.
+    assert core.stops == ["XY"]
+    assert executor.moving() == ("xy_stage XY",)
+    with pytest.raises(DeviceTimeoutError, match="stops nothing"):
         stage.wait(0.05)
-    # §13: the thread that started the move stops it before it raises (FM-17).
     assert core.stops == ["XY"]
 
 
@@ -471,11 +476,10 @@ class TestMotionOnDemoDevices:
             z.stop()
         assert f"xy_stage {demo_core.getXYStageDevice()}: stop" in caplog.messages
         assert f"z {demo_core.getFocusDevice()}: stop" in caplog.messages
-        # A move stopped before its wait reports that it did not complete.
-        xy.move_to_um(50.0, 50.0, wait=False)
-        xy.stop()
-        with pytest.raises(MotionStoppedError):
-            xy.wait()
+        # A stop before a move is called does not cancel it.
+        landed = xy.move_to_um(50.0, 50.0)
+        assert landed.x_um == pytest.approx(50.0, abs=0.5)
+        xy.wait()
         assert executor.moving() == ()
 
     def test_properties_set_on_a_state_device_waits_and_reads_back(
@@ -506,6 +510,8 @@ class _MovingCore:
         self.stops: list[str] = []
         self.commands: list[str] = []
         self.snaps = 0
+        self.stop_clears = True  # False: a stage that ignores its stop
+        self.timeout_ms = 30_000.0
 
     def _start(self, what: str) -> None:
         self.commands.append(what)
@@ -560,10 +566,11 @@ class _MovingCore:
 
     def stop(self, label: str) -> None:
         self.stops.append(label)
-        self.moving = False
+        if self.stop_clears:
+            self.moving = False
 
     def getTimeoutMs(self) -> float:  # noqa: N802
-        return 30_000.0
+        return self.timeout_ms
 
     def getCameraDevice(self) -> str:  # noqa: N802
         return "Cam"
@@ -686,35 +693,71 @@ def test_a_stage_property_is_not_a_motion() -> None:
     assert executor.moving() == ()
 
 
+def _outlived_move(core: _MovingCore, stage: MMXYStage) -> None:
+    """A move whose action gave up while the stage, deaf to its stop, kept moving."""
+    core.timeout_ms, core.stop_clears = 30.0, False
+    with pytest.raises(DeviceTimeoutError, match="the stop was sent"):
+        stage.move_to_um(10.0, 0.0)
+    core.timeout_ms, core.stop_clears = 30_000.0, True
+    assert core.moving
+
+
 def test_closing_the_shutter_is_never_refused_and_opening_is() -> None:
     core = _MovingCore()
     executor = _executor()
     xy, _, _, shutter, _ = _moving_stand(core, executor)
-    xy.move_to_um(10.0, 0.0, wait=False)
+    _outlived_move(core, xy)
+    core.shutter_open = True
+    assert shutter.set_open(False) is False
+    with pytest.raises(MotionInProgressError):
+        shutter.set_open(True)
     executor.halt()
     core.shutter_open = True
     assert shutter.set_open(False) is False
     with pytest.raises(MicroscopeHaltedError):
         shutter.set_open(True)
-    executor.resume()
-    with pytest.raises(MotionInProgressError):
-        shutter.set_open(True)
     assert core.shutter_open is False
 
 
-def test_snap_after_move_without_wait_is_refused_until_wait() -> None:
+def test_snap_after_a_move_that_outlived_its_action_is_refused_until_it_settles() -> (
+    None
+):
     core = _MovingCore()
     executor = _executor()
     stage = MMXYStage(core, "XY", executor, Safety(max_jog_um=100.0))  # type: ignore[arg-type]
     camera = MMCamera(core, "Cam", executor, {}, lambda: None)  # type: ignore[arg-type]
-    stage.move_to_um(10.0, 0.0, wait=False)
+    _outlived_move(core, stage)
     with pytest.raises(MotionInProgressError, match="xy_stage XY"):
         camera.snap()
     assert core.snaps == 0
     core.release.set()
-    stage.wait()
+    stage.wait()  # a read: it sees the stage idle and drops the registration
+    assert executor.moving() == ()
     assert camera.snap().shape == (4, 4)
     assert core.snaps == 1
+
+
+def test_state_device_stuck_busy_is_released_by_resume(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # #59 second review, finding 4: a State device still busy after a
+    # Properties.set timeout stayed registered for good, and neither stop()
+    # nor resume() released it.
+    core = _TurretCore(busy_polls=10**9)
+    core.getTimeoutMs = lambda: 50.0  # type: ignore[method-assign]
+    executor = _executor()
+    props = MMProperties(core, executor)  # type: ignore[arg-type]
+    with pytest.raises(DeviceTimeoutError, match="cannot be stopped from smc"):
+        props.set("Turret", "State", 2)
+    assert executor.moving() == ("Turret",)
+    with pytest.raises(MotionInProgressError, match="resume"):
+        props.set("Turret", "State", 1)
+    with caplog.at_level(logging.WARNING, logger=LOGGER.name):
+        executor.resume()
+    assert "Turret: no longer tracked as moving (resume)" in caplog.text
+    assert executor.moving() == ()
+    core.busy_polls = core.busy_left = 0  # the operator checked: it has settled
+    assert props.set("Turret", "State", 1) == "1"
 
 
 def test_stop_during_a_move_ends_the_waiting_move() -> None:

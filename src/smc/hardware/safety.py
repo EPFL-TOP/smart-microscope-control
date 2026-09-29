@@ -16,17 +16,19 @@ them (CLAUDE.md, architecture rules):
   ``nan`` compares false against every bound and would otherwise slip
   through each check and reach the stage driver.
 
-``Executor`` runs every action (a mutation, an acquisition, a wait) under
-the microscope's one re-entrant lock and implements dry-run. In dry-run,
+``Executor`` runs every action (a mutation, an acquisition) under the
+microscope's one re-entrant lock and implements dry-run. In dry-run,
 mutations are logged and skipped, but *reads still reach the hardware*: a
 dry-run session shows the real stage position and never moves it.
 
 * **No action while something moves** (design §13). An action holds the
   lock from its first check to its readback, including the wait of a move,
-  so only the thread inside it sends commands and waits. Reads, stops and
-  closing a shutter never take the lock: MMCore, not smc, keeps concurrent
-  calls to one device safe (measured, §13). A ``wait=False`` motion stays
-  registered, and refuses every action, until the device reports idle.
+  so only the thread inside it sends commands and waits for them. Reads
+  (``wait()`` included), stops and closing a shutter never take the lock:
+  MMCore, not smc, keeps concurrent calls to one device safe (measured,
+  §13). There is no ``wait=False``: a motion outlives its action only when
+  the action gave up on it, and then it refuses every action until the
+  device reports idle, a stop gets through, or the operator resumes.
 
 This module is pure: it imports no Micro-Manager code.
 """
@@ -38,7 +40,7 @@ import math
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Generic, TypeVar
 
 from smc.hardware.errors import (
@@ -187,17 +189,16 @@ class Step(Generic[T]):
     dry_result: T  # returned in dry-run instead of sending
 
 
-@dataclass
+@dataclass(eq=False)
 class _Registration:
-    """A motion the layer started and has not yet seen idle."""
+    """A motion that outlived its action: its action gave up while it still moved.
+
+    One object per registration, compared by identity: a caller that saw the
+    device idle drops only the registration it read before it looked, never
+    one made since for a newer give-up.
+    """
 
     motion: Motion
-    #: The thread that started it: the only one that stops it on giving up.
-    #: ``None`` for a device nobody moved through the layer.
-    owner: int | None
-    #: The device's stop generation when the action was called. If the device
-    #: counter differs once the motion is idle, it was stopped.
-    generation: int
 
 
 @dataclass
@@ -206,7 +207,7 @@ class _Holder:
 
     description: str
     since: float
-    thread: int
+    #: The motion the action is waiting for, once its command has been sent.
     waiting_for: str | None = None
 
 
@@ -227,12 +228,12 @@ class Executor:
     and a worker. An action holds it from its first check to its readback,
     wait included; a caller that finds it held by an action waiting for a
     motion is refused at once, any other waits up to ``lock_timeout_s``.
-    Reads, stops and closing a shutter never take it.
+    Reads, ``wait()``, stops and closing a shutter never take it.
 
-    The registry lock guards the small shared state (registered motions,
-    stop generations, the halt, who holds the lock). It is never held across
-    a device call or a log call, and a thread holding it never takes the
-    microscope lock.
+    The registry lock guards the small shared state (motions that outlived
+    their action, stop generations, the halt, who holds the lock). It is
+    never held across a device call or a log call, and a thread holding it
+    never takes the microscope lock.
     """
 
     def __init__(
@@ -260,11 +261,8 @@ class Executor:
         self._lock_timeout_s = float(lock_timeout_s)
         self._registry_lock = threading.Lock()
         self._registry: dict[str, _Registration] = {}
-        #: Registrations the guard or a bystander's wait saw idle, kept until
-        #: their owner's ``wait()`` so that it still learns of a stop. Keyed by
-        #: (device, owner thread): another caller's new move on the same
-        #: device must not erase how this owner's move ended.
-        self._finished: dict[tuple[str, int], _Registration] = {}
+        #: Per device: how many explicit stops it has had. Only ``stop()``
+        #: advances it, so a give-up never cancels another caller's action.
         self._generations: dict[str, int] = {}
         self._halted = False
         self._holder: _Holder | None = None
@@ -281,36 +279,28 @@ class Executor:
 
     # --- the lock section --------------------------------------------------
 
-    def _section(
-        self,
-        description: str,
-        body: Callable[[], T],
-        *,
-        deadline: float,
-        on_contention: Callable[[_Holder | None, bool], None],
-    ) -> T:
-        """Run ``body`` holding the microscope lock.
+    def _section(self, description: str, body: Callable[[], T]) -> T:
+        """Run ``body`` holding the microscope lock (design §13, "The lock").
 
-        ``acquire()`` is called here, in the frame whose ``finally`` releases
-        the lock, and nothing else runs between it and the ``try``: a
-        ``KeyboardInterrupt`` delivered as ``acquire()`` returns would
-        otherwise leave the lock held for good (#59). The interrupt can still
-        land between ``acquire()`` returning and ``acquired`` being set, so
-        the ``finally`` also asks the lock whether this thread took it.
+        A thread that already holds the lock runs ``body`` inside its outer
+        action: a callback inside ``snap`` that moves the stage is part of the
+        snap. Ownership is asked of the lock itself, not of the holder record,
+        which a second Ctrl-C can leave stale.
 
-        ``on_contention(holder, expired)`` runs while the lock is held by
-        another thread; it raises to give up.
+        Otherwise ``acquire()`` is called here, in the frame whose ``finally``
+        releases the lock, and nothing else runs between it and the ``try``:
+        a ``KeyboardInterrupt`` delivered as ``acquire()`` returns would
+        otherwise leave the lock held for good (#59). It can still land before
+        ``acquired`` is set, so the ``finally`` also asks the lock whether this
+        thread took it. The lock is released before the holder record is
+        cleared, so an interrupt in that clean-up cannot keep it.
         """
-        me = threading.get_ident()
-        with self._registry_lock:
-            holder = self._holder
-            reentrant = holder is not None and holder.thread == me
-        if reentrant:
-            # A callback inside an outer action (a move inside a snap) is part
-            # of that action: it keeps the outer holder and its lock.
+        if _lock_is_owned(self._lock):
             return body()
-        owned_before = _lock_is_owned(self._lock)
+        started = time.monotonic()
+        deadline = started + self._lock_timeout_s
         acquired = False
+        record: _Holder | None = None
         try:
             while not acquired:
                 remaining = deadline - time.monotonic()
@@ -318,34 +308,39 @@ class Executor:
                     timeout=min(_LOCK_POLL_S, max(remaining, 0.0))
                 )
                 if not acquired:
-                    with self._registry_lock:
-                        holder = self._holder
-                    on_contention(holder, time.monotonic() >= deadline)
+                    # Expired only once an attempt made at the deadline failed.
+                    self._contention(started, expired=remaining <= 0)
+            record = _Holder(description, time.monotonic())
             with self._registry_lock:
-                self._holder = _Holder(description, time.monotonic(), me)
+                self._holder = record
             return body()
         finally:
-            if acquired or (not owned_before and _lock_is_owned(self._lock)):
-                with self._registry_lock:
-                    self._holder = None
+            if acquired or _lock_is_owned(self._lock):
                 self._lock.release()
+                self._clear_holder(record)
 
-    def _action_contention(self, holder: _Holder | None, expired: bool) -> None:
-        """An action facing a held lock: refused at once if the holder waits for a motion."""
+    def _clear_holder(self, record: _Holder | None) -> None:
+        """Forget ``record`` if it is still the holder: the lock may have changed hands."""
+        with self._registry_lock:
+            if record is not None and self._holder is record:
+                self._holder = None
+
+    def _contention(self, started: float, *, expired: bool) -> None:
+        """An action facing a lock held by another thread: refused, still waiting, or out of time."""
+        with self._registry_lock:
+            holder = None if self._holder is None else replace(self._holder)
         if holder is not None and holder.waiting_for is not None:
             raise MotionInProgressError(
                 (holder.waiting_for,), f"`{holder.description}` is waiting for it"
             )
-        if expired:
-            if holder is None:
-                # Held by a caller outside the Executor: nothing recorded when
-                # it took the lock, so this caller's wait is a lower bound.
-                raise MicroscopeBusyError(
-                    "an unknown caller", self._lock_timeout_s, at_least=True
-                )
-            raise MicroscopeBusyError(
-                holder.description, time.monotonic() - holder.since
-            )
+        if not expired:
+            return
+        now = time.monotonic()
+        if holder is None:
+            # Taken outside the Executor: nothing recorded when, so this
+            # caller's own wait is all that is known, and it is a lower bound.
+            raise MicroscopeBusyError("an unknown caller", now - started, at_least=True)
+        raise MicroscopeBusyError(holder.description, now - holder.since)
 
     def _set_waiting(self, name: str | None) -> str | None:
         """Record what the holder waits for; return what it waited for before."""
@@ -364,107 +359,109 @@ class Executor:
         step: Step[T] | Callable[[], Step[T]],
         *,
         motion: Motion | None = None,
-        wait: bool = True,
         timeout_s: float | Callable[[], float] | None = None,
     ) -> T:
         """Perform a mutation as one lock section; in dry-run, log it and skip it.
 
         Under the lock and in this order (design §13): the halt check, the
         guard, ``step`` (a callable is built now, so a relative move reads its
-        anchor here), the timeout, the stop-generation check, the halt again,
-        the command, for a ``motion`` with ``wait`` the wait, and the readback.
+        anchor here), the timeout, the stop-generation and halt checks, the
+        INFO line, the same two checks again (the line may have blocked on a
+        console), the command, for a ``motion`` the wait, and the readback.
 
         Args:
             description: Names the action for ``MicroscopeBusyError`` and
                 ``MotionInProgressError`` while it holds the lock.
             step: What to send and read back.
-            motion: The device the command sets moving, if any.
-            wait: With ``motion``: wait for it inside the action (the default),
-                or register it and return after the readback.
+            motion: The device the command sets moving, if any; the action
+                waits for it before reading back.
             timeout_s: The wait's deadline, or a callable that resolves it (the
-                core timeout); required with ``motion`` and ``wait``.
+                core timeout); required with ``motion``.
 
         Raises:
             MicroscopeHaltedError: The microscope is halted.
             MotionInProgressError: A device is still moving, or the lock holder
                 is waiting for one.
-            MotionStoppedError: A stop for ``motion``'s device arrived after the
-                call: before the command (not sent) or during it (the stop is
-                sent again) or during the wait.
+            MotionStoppedError: A stop for ``motion``'s device was called after
+                this action: before the command (not sent), or during the
+                command or the wait (the stop is sent again after the command).
             DeviceTimeoutError: Still busy at the deadline; the stop was sent,
                 or the message says why not.
             MicroscopeBusyError: The lock was not free within ``lock_timeout_s``.
         """
-        generation = self._generation(motion) if motion is not None else 0
+        if motion is not None and timeout_s is None:
+            raise ValueError("an action with a motion needs timeout_s")
+        limit: float | Callable[[], float] = 0.0 if timeout_s is None else timeout_s
+        # Recorded before waiting for the lock: a stop pressed while this call
+        # waits for it cancels the call.
+        generation = self._generation(motion)
 
         def body() -> T:
             self._refuse_if_halted()
             self._guard()
             prepared = step() if callable(step) else step
+            limit_s = 0.0
+            if motion is not None and not self._dry_run:
+                limit_s = _resolve_timeout(limit)
+            self._refuse_if_cancelled(motion, generation)
             if self._dry_run:
                 self._logger.info("[dry-run] %s", prepared.log)
                 return prepared.dry_result
+            self._logger.info("%s", prepared.log)
+            try:
+                # FM-66: the halt or a stop may have landed while the line
+                # above was written; the check that matters is the last one.
+                self._refuse_if_cancelled(motion, generation)
+            except HardwareError:
+                self._logger.warning("%s: not sent", prepared.log)
+                raise
             if motion is None:
-                self._logger.info("%s", prepared.log)
-                self._refuse_if_halted()
                 prepared.send()
                 return prepared.readback()
-            return self._move(prepared, motion, generation, wait, timeout_s)
+            return self._move(prepared, motion, generation, limit_s)
 
-        return self._section(
-            description,
-            body,
-            deadline=time.monotonic() + self._lock_timeout_s,
-            on_contention=self._action_contention,
-        )
+        return self._section(description, body)
 
     def _move(
-        self,
-        step: Step[T],
-        motion: Motion,
-        generation: int,
-        wait: bool,
-        timeout_s: float | Callable[[], float] | None,
+        self, step: Step[T], motion: Motion, generation: int, limit_s: float
     ) -> T:
-        """The command, wait and readback of a motion; called under the lock."""
-        limit_s = 0.0
-        if wait:
-            if timeout_s is None:
-                raise ValueError("a motion with wait=True needs timeout_s")
-            limit_s = _resolve_timeout(timeout_s)
-        self._logger.info("%s", step.log)
-        me = threading.get_ident()
-        with self._registry_lock:
-            if self._generations.get(motion.device, 0) != generation:
-                raise MotionStoppedError(
-                    motion.name, "it was stopped before it started"
-                )
-            if self._halted:
-                # Microscope.stop() halts, then stops every stage: a halt that
-                # lands after the first check must still keep the command away.
-                raise MicroscopeHaltedError()
-            registration = _Registration(motion, me, generation)
-            self._registry[motion.device] = registration
-            # This owner's earlier move on the device is superseded.
-            self._finished.pop((motion.device, me), None)
+        """The command, the wait and the readback of a motion, under the lock.
+
+        One ``try`` covers all three (design §13): nothing unprotected runs
+        between the command returning and the wait, so a Ctrl-C, a command
+        that raises or an unreadable busy state anywhere before the device is
+        seen idle gives up on the motion, which sends the stop. Once the device
+        is idle there is nothing left to stop.
+        """
+        deadline = time.monotonic() + limit_s
+        idle = gave_up = False
+        previous: str | None = None
         try:
             step.send()
-        except BaseException as exc:
-            # The command may have reached the device before it raised; the
-            # motion stays registered until the guard sees it idle.
-            self._give_up(motion, f"{type(exc).__name__} in the command")
-            raise
-        if self._generation(motion) != generation:
-            # The stop did not wait for the lock and may have reached the
-            # device before this command did (FM-18).
-            self._resend_stop(motion)
-            if not wait:
+            if self._generation(motion) != generation and motion.stop is not None:
+                # The stop did not wait for the lock and may have reached the
+                # device before this command did (FM-18).
+                self._send_stop(motion, motion.stop, "stop resent after the command")
+            previous = self._set_waiting(motion.name)
+            idle = self._poll_until_idle(motion, deadline)
+            if not idle:
+                outcome = self._give_up(motion, f"{limit_s:g} s timeout")
+                gave_up = True
+                raise DeviceTimeoutError(
+                    f"{motion.name} is still busy after {limit_s:g} s; {outcome}. "
+                    f"If the move is legitimately long, raise [micromanager] "
+                    f"device_timeout_ms in the profile; otherwise check the "
+                    f"device and its cabling."
+                )
+            if self._generation(motion) != generation:
                 raise MotionStoppedError(motion.name)
-        if wait:
-            self._wait_idle(
-                registration, time.monotonic() + limit_s, limit_s, owner=True
-            )
-        return step.readback()
+            return step.readback()
+        except BaseException as exc:
+            if not (idle or gave_up):
+                self._give_up(motion, type(exc).__name__)
+            raise
+        finally:
+            self._set_waiting(previous)
 
     def acquire(self, description: str, action: Callable[[], T]) -> T:
         """Perform an acquisition (``snap``) as one lock section; it runs in dry-run too.
@@ -484,159 +481,95 @@ class Executor:
             self._refuse_if_halted()
             return action()
 
-        return self._section(
-            description,
-            body,
-            deadline=time.monotonic() + self._lock_timeout_s,
-            on_contention=self._action_contention,
-        )
+        return self._section(description, body)
+
+    # --- reads ---------------------------------------------------------------
+
+    def read(self, action: Callable[[], T]) -> T:
+        """A read: never takes the lock, never refused, reaches the hardware in dry-run."""
+        return action()
 
     def wait(self, motion: Motion, timeout_s: float | Callable[[], float]) -> None:
-        """Block until ``motion`` is idle, holding the lock while it polls.
+        """Block until ``motion``'s device reports idle; a read (design §13).
 
-        It waits for the lock within its own ``timeout_s`` too. Only the thread
-        that started the motion stops it when it gives up; any other waiter
-        raises and leaves the move alone, so a bystander's short wait cannot
-        stop a traverse (design §13).
+        It polls without the microscope lock, so it runs during another
+        thread's action, while halted and in dry-run, and it never stops
+        anything: a caller that stops waiting did not start the move and has
+        no business ending it. Seeing the device idle drops its registration,
+        if it outlived its action, so the next action runs.
 
         Raises:
             ValueError: ``timeout_s`` is negative or not finite.
-            MotionStoppedError: The motion went idle because it was stopped.
-            DeviceTimeoutError: Still busy at the deadline, or the lock was not
-                free by then. The message says whether the stop was sent.
+            DeviceTimeoutError: Still busy at the deadline; nothing was stopped.
+            Exception: Whatever reading the busy state raised.
         """
         limit_s = _resolve_timeout(timeout_s)
-        if self._dry_run:
-            return
-        me = threading.get_ident()
         deadline = time.monotonic() + limit_s
-
-        def contention(holder: _Holder | None, expired: bool) -> None:
-            if not expired:
+        while True:
+            # Read before the poll, so that a registration made after the
+            # device was seen idle (a newer give-up) is not the one dropped.
+            registration = self._registered(motion.device)
+            if not motion.is_busy():
+                if registration is not None:
+                    self._drop(motion.device, registration)
                 return
-            what = "an unknown caller" if holder is None else f"`{holder.description}`"
-            with self._registry_lock:
-                registration = self._registry.get(motion.device)
-            if registration is not None and registration.owner == me:
-                outcome = self._give_up(motion, f"{limit_s:g} s wait for the lock")
-            else:
-                outcome = _not_stopped(registration)
-            raise DeviceTimeoutError(
-                f"{motion.name}: {what} held the microscope for the whole "
-                f"{limit_s:g} s wait; {outcome}."
-            )
+            if time.monotonic() >= deadline:
+                raise DeviceTimeoutError(
+                    f"{motion.name} is still busy after {limit_s:g} s; `wait()` "
+                    f"stops nothing, so it may still be moving. Stop it "
+                    f"(`stop()`) if it should not be, or wait longer."
+                )
+            time.sleep(POLL_INTERVAL_S)
 
-        def body() -> None:
-            with self._registry_lock:
-                current = self._generations.get(motion.device, 0)
-                # This caller's own move, seen idle already by the guard or by
-                # a bystander's wait: its owner now learns how it ended, even
-                # if another caller has moved the device since.
-                finished = self._finished.pop((motion.device, me), None)
-                registration = self._registry.get(motion.device)
-            if finished is not None:
-                if current != finished.generation:
-                    raise MotionStoppedError(motion.name)
-                return
-            if registration is None:
-                # Nobody moved it through the layer: poll it, never stop it.
-                registration = _Registration(motion, None, current)
-            self._wait_idle(
-                registration, deadline, limit_s, owner=registration.owner == me
-            )
+    def moving(self) -> tuple[str, ...]:
+        """What moves: the motion an action is waiting for, then those that outlived theirs.
 
-        self._section(
-            f"{motion.name}: wait", body, deadline=deadline, on_contention=contention
-        )
-
-    def _wait_idle(
-        self,
-        registration: _Registration,
-        deadline: float,
-        limit_s: float,
-        *,
-        owner: bool,
-    ) -> None:
-        """Poll until idle under the lock; the owner stops the motion on giving up."""
-        motion = registration.motion
-        previous = self._set_waiting(motion.name)
-        idle = False
-        try:
-            while True:
-                if not motion.is_busy():
-                    idle = True
-                    break
-                if time.monotonic() >= deadline:
-                    break
-                time.sleep(POLL_INTERVAL_S)
-        except BaseException as exc:
-            # Ctrl-C, an unreadable busy state: nobody is left watching the move.
-            if owner:
-                self._give_up(motion, f"{type(exc).__name__} during the wait")
-            raise
-        finally:
-            self._set_waiting(previous)
-        if not idle:
-            if owner:
-                outcome = self._give_up(motion, f"{limit_s:g} s timeout")
-            else:
-                outcome = _not_stopped(registration)
-            raise DeviceTimeoutError(
-                f"{motion.name} is still busy after {limit_s:g} s; {outcome}. "
-                f"If the move is legitimately long, raise [micromanager] "
-                f"device_timeout_ms in the profile; otherwise check the device "
-                f"and its cabling."
-            )
+        It asks no device and never blocks.
+        """
         with self._registry_lock:
-            if self._registry.get(motion.device) is registration:
-                del self._registry[motion.device]
-                if not owner and registration.owner is not None:
-                    self._finished[(motion.device, registration.owner)] = registration
-            stopped = self._generations.get(motion.device, 0) != registration.generation
-        if stopped:
-            raise MotionStoppedError(motion.name)
+            names = [r.motion.name for r in self._registry.values()]
+            waiting = None if self._holder is None else self._holder.waiting_for
+        if waiting is not None and waiting not in names:
+            names.insert(0, waiting)
+        return tuple(names)
 
     # --- the safe calls ----------------------------------------------------
 
     def stop(self, motion: Motion) -> None:
-        """Stop ``motion`` now, without the microscope lock; never refused.
+        """Stop ``motion`` now, without the microscope lock; never refused (§13).
 
         The device's stop generation moves first, so every action on it that
         was called before raises ``MotionStoppedError``, even when the stop
         itself fails. The stop is sent before the log line. It runs in dry-run
-        too: a stop cannot create motion. A registered motion whose busy state
-        cannot be read is dropped afterwards, so a broken device never locks
-        the stand for good.
+        too: a stop cannot create motion. A motion that outlived its action
+        is dropped once the stop is sent, unless the device still reads busy
+        (it is moving); after a failed stop it stays, for the guard or for
+        ``resume()``.
 
         Raises:
             HardwareError: The device cannot be stopped from smc.
             Exception: Whatever the device's stop raised; a failed stop is a
                 finding.
         """
+        send = motion.stop
+        if send is None:
+            self._logger.warning(
+                "%s: stop requested; it cannot be stopped from smc", motion.name
+            )
+            raise HardwareError(
+                f"{motion.name} cannot be stopped from smc; wait for it, or "
+                f"check the stand and call `resume()`"
+            )
         with self._registry_lock:
             self._generations[motion.device] = (
                 self._generations.get(motion.device, 0) + 1
             )
-        error: Exception | None = None
-        if motion.stop is not None:
-            try:
-                motion.stop()
-            except Exception as exc:
-                error = exc
-        if motion.stop is None:
-            self._logger.warning(
-                "%s: stop requested; it cannot be stopped", motion.name
-            )
-        elif error is not None:
-            self._logger.warning("%s: stop failed (%r)", motion.name, error)
-        else:
-            self._logger.warning("%s: stop", motion.name)
-        with self._registry_lock:
-            registration = self._registry.get(motion.device)
-        if registration is not None:
-            self._drop_if_unreadable(registration)
-        if motion.stop is None:
-            raise HardwareError(f"{motion.name} cannot be stopped from smc")
+        error = self._send_stop(
+            motion,
+            send,
+            "stop",
+            then=lambda failed: "" if failed else self._release_after_stop(motion),
+        )
         if error is not None:
             raise error
 
@@ -651,10 +584,6 @@ class Executor:
         self._logger.info("%s", description)
         return result
 
-    def read(self, action: Callable[[], T]) -> T:
-        """A read: never takes the lock, never refused, reaches the hardware in dry-run."""
-        return action()
-
     def halt(self) -> None:
         """Refuse every action until ``resume()``; reads and the safe calls still run."""
         with self._registry_lock:
@@ -662,22 +591,30 @@ class Executor:
         self._logger.warning("microscope: halted")
 
     def resume(self) -> None:
-        """Clear the halt and drop unreadable motions; starts nothing."""
+        """Clear the halt and drop every motion that outlived its action; starts nothing.
+
+        It is the operator's way out after checking the stand (design §13): a
+        ``State`` device that cannot be stopped, a stage that keeps answering
+        busy, or one whose busy state cannot be read would otherwise refuse
+        every action for good.
+        """
         with self._registry_lock:
             self._halted = False
-            registrations = list(self._registry.values())
+            dropped = [r.motion.name for r in self._registry.values()]
+            self._registry.clear()
         self._logger.warning("microscope: resumed")
-        for registration in registrations:
-            self._drop_if_unreadable(registration)
-
-    def moving(self) -> tuple[str, ...]:
-        """Names of the motions not yet seen idle; asks no device, never blocks."""
-        with self._registry_lock:
-            return tuple(r.motion.name for r in self._registry.values())
+        for name in dropped:
+            self._logger.warning(
+                "%s: no longer tracked as moving (resume); check it before "
+                "moving it again",
+                name,
+            )
 
     # --- helpers -----------------------------------------------------------
 
-    def _generation(self, motion: Motion) -> int:
+    def _generation(self, motion: Motion | None) -> int:
+        if motion is None:
+            return 0
         with self._registry_lock:
             return self._generations.get(motion.device, 0)
 
@@ -685,17 +622,39 @@ class Executor:
         if self._halted:
             raise MicroscopeHaltedError()
 
+    def _refuse_if_cancelled(self, motion: Motion | None, generation: int) -> None:
+        """The checks before a command: the halt, and a stop called since the action was."""
+        with self._registry_lock:
+            halted = self._halted
+            stopped = (
+                motion is not None
+                and self._generations.get(motion.device, 0) != generation
+            )
+        if halted:
+            raise MicroscopeHaltedError()
+        if stopped and motion is not None:
+            raise MotionStoppedError(motion.name, "it was stopped before it started")
+
+    def _poll_until_idle(self, motion: Motion, deadline: float) -> bool:
+        """Poll ``motion`` until idle (``True``) or the deadline (``False``)."""
+        while True:
+            if not motion.is_busy():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(POLL_INTERVAL_S)
+
     def _guard(self) -> None:
-        """Poll every registered motion, drop the idle ones, refuse the rest.
+        """Poll every motion that outlived its action, drop the idle ones, refuse the rest.
 
         Called under the microscope lock. An unreadable busy state counts as
         moving (unknown beats guessed); ``stop()`` or ``resume()`` releases it.
         """
         with self._registry_lock:
-            registrations = list(self._registry.values())
+            registrations = list(self._registry.items())
         moving: list[str] = []
         details: list[str] = []
-        for registration in registrations:
+        for device, registration in registrations:
             motion = registration.motion
             try:
                 busy = bool(motion.is_busy())
@@ -703,84 +662,121 @@ class Executor:
                 moving.append(motion.name)
                 details.append(
                     f"the busy state of `{motion.name}` could not be read ({exc!r}), "
-                    f"so it counts as moving; `stop()` or `resume()` releases it"
+                    f"so it counts as moving"
                 )
                 continue
             if busy:
                 moving.append(motion.name)
-                continue
-            with self._registry_lock:
-                if self._registry.get(motion.device) is registration:
-                    del self._registry[motion.device]
-                    if registration.owner is not None:
-                        # Kept so that its owner's wait() still learns of a stop.
-                        self._finished[(motion.device, registration.owner)] = (
-                            registration
-                        )
+            else:
+                self._drop(device, registration)
         if moving:
             raise MotionInProgressError(tuple(moving), "; ".join(details))
 
-    def _drop_if_unreadable(self, registration: _Registration) -> None:
-        """Drop a registered motion whose busy state raises (FM-19)."""
-        motion = registration.motion
+    def _registered(self, device: str) -> _Registration | None:
+        with self._registry_lock:
+            return self._registry.get(device)
+
+    def _drop(self, device: str, registration: _Registration) -> None:
+        """Drop ``registration`` if it is still the device's; a newer one stays."""
+        with self._registry_lock:
+            if self._registry.get(device) is registration:
+                del self._registry[device]
+
+    def _track_if_moving(self, motion: Motion) -> str:
+        """Register ``motion`` if it still reads busy or cannot be read; return a log note."""
         try:
-            motion.is_busy()
+            busy = bool(motion.is_busy())
         except Exception as exc:
-            with self._registry_lock:
-                dropped = self._registry.get(motion.device) is registration
-                if dropped:
-                    del self._registry[motion.device]
-            if dropped:
-                self._logger.warning(
-                    "%s: busy state unreadable (%r); no longer tracked as moving, "
-                    "check the device before moving it again",
-                    motion.name,
-                    exc,
-                )
+            busy, note = True, f"; its busy state cannot be read ({exc!r})"
+        except BaseException:
+            # Interrupted before it could answer: unknown counts as moving.
+            self._track(motion)
+            raise
+        else:
+            note = "; it still reads busy"
+        if not busy:
+            return ""
+        self._track(motion)
+        return f"{note}, so it counts as moving until it is idle"
+
+    def _track(self, motion: Motion) -> None:
+        with self._registry_lock:
+            self._registry[motion.device] = _Registration(motion)
+
+    def _release_after_stop(self, motion: Motion) -> str:
+        """After a sent stop: drop the device's registration unless it still reads busy."""
+        registration = self._registered(motion.device)
+        if registration is None:
+            return ""
+        try:
+            busy = bool(motion.is_busy())
+        except Exception as exc:
+            # FM-19: an unreadable device must not lock the stand for good.
+            self._drop(motion.device, registration)
+            return (
+                f"; its busy state cannot be read ({exc!r}), so it is no longer "
+                f"tracked as moving: check the device before moving it again"
+            )
+        if busy:
+            return "; it still reads busy, so it stays tracked as moving"
+        self._drop(motion.device, registration)
+        return ""
 
     def _give_up(self, motion: Motion, why: str) -> str:
-        """Stop on a failure path, then log; never masks the failure. Returns what happened."""
-        if motion.stop is None:
+        """Stop a motion its action stops watching, track it if it still moves, then log.
+
+        A give-up does not advance the stop generation: it cancels nobody
+        else's action (design §13). It never raises on its own account, so a
+        failed stop never masks the failure that caused the give-up. Returns
+        what happened, for the error message.
+        """
+        send = motion.stop
+        if send is None:
+            note = self._track_if_moving(motion)
             self._logger.warning(
-                "%s: %s; it cannot be stopped from smc", motion.name, why
+                "%s: gave up after %s; it cannot be stopped from smc%s",
+                motion.name,
+                why,
+                note,
             )
             return "it cannot be stopped from smc, so it may still be moving"
-        with self._registry_lock:
-            self._generations[motion.device] = (
-                self._generations.get(motion.device, 0) + 1
-            )
+        error = self._send_stop(
+            motion,
+            send,
+            f"stop after {why}",
+            then=lambda _: self._track_if_moving(motion),
+        )
+        if error is None:
+            return "the stop was sent"
+        return f"the stop failed ({error!r}), so it may still be moving"
+
+    def _send_stop(
+        self,
+        motion: Motion,
+        send: Callable[[], None],
+        what: str,
+        then: Callable[[bool], str] | None = None,
+    ) -> Exception | None:
+        """Send a stop, update the registry (``then``), and only then log (FM-62).
+
+        Every stop path goes through here (``stop()``, a give-up, the resend
+        after a command), so the order lives in one place: a blocked console
+        or a second Ctrl-C can delay or cut the log line, never the stop or
+        the registry update. ``then`` is told whether the stop failed and
+        returns a note for the log line. Returns what the stop raised, if
+        anything; it never raises it.
+        """
+        error: Exception | None = None
         try:
-            motion.stop()
+            send()
         except Exception as exc:
-            self._logger.warning("%s: stop after %s failed (%r)", motion.name, why, exc)
-            return f"the stop failed ({exc!r}), so it may still be moving"
-        self._logger.warning("%s: stop after %s", motion.name, why)
-        return "the stop was sent"
-
-    def _resend_stop(self, motion: Motion) -> None:
-        """Send a stop again after a command it may have overtaken (FM-18); stop, then log."""
-        if motion.stop is None:
-            return
-        try:
-            motion.stop()
-        except Exception as exc:
-            # The caller still gets MotionStoppedError: a stop was asked for,
-            # so the move did not end as planned.
-            self._logger.warning(
-                "%s: stop resent after the command failed (%r)", motion.name, exc
-            )
-            return
-        self._logger.warning("%s: stop resent after the command", motion.name)
-
-
-def _not_stopped(registration: _Registration | None) -> str:
-    """Why a waiter that gives up leaves the motion alone (design §13)."""
-    if registration is None or registration.owner is None:
-        return "nothing moved it through smc, so nothing was stopped"
-    return (
-        "the move belongs to another caller, so nothing was stopped; that "
-        "caller stops it if it gives up"
-    )
+            error = exc
+        note = "" if then is None else then(error is not None)
+        if error is None:
+            self._logger.warning("%s: %s%s", motion.name, what, note)
+        else:
+            self._logger.warning("%s: %s failed (%r)%s", motion.name, what, error, note)
+        return error
 
 
 def _resolve_timeout(timeout_s: float | Callable[[], float]) -> float:
