@@ -22,7 +22,9 @@ script collects the facts, you add judgement. Read its output, not GitHub.
    dependencies are merged: re-read its plan against the merged code, fix the
    plan if the code moved, then set `status: ready`. Remove status labels
    from closed issues. Open the follow-up issues the reports and reviews
-   name, if they do not exist yet.
+   name, if they do not exist yet. Run `python scripts/dev/worktree.py
+   clean` from the main checkout; one line in the output on what it
+   removed.
 4. **Plans.** Any issue that belongs in the next wave and has no plan gets
    one (`/plan`). Plans carry a **Risk**, the **Failure modes to handle** and
    a **Suggested model**.

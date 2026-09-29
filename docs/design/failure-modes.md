@@ -39,6 +39,7 @@ category is not here: an id, what happens, and how to check.
 - **FM-23 A child's stdout uses the ANSI code page.** *Check*: ASCII-only protocols, or explicit encodings on both sides.
 - **FM-24 Paths.** Spaces, backslashes, platformdirs' layout (`%LOCALAPPDATA%\pymmcore-plus\pymmcore-plus\…`), files that cannot be replaced while open. *Check*: `pathlib`, no string surgery, no assumptions about the layout.
 - **FM-25 PowerShell 5.1.** `ConvertTo-Json` prints an object, not a list, for one item. No BOM with `[Text.Encoding]::UTF8` on a pipe (checked on a Windows runner, 2026-09-23).
+- **FM-26 An undeclared `ctypes` Win32 return type.** A `ctypes.windll`/`WinDLL` function called without setting `.argtypes`/`.restype` gets ctypes' default `restype` of `c_int` (32-bit); a `HANDLE` or other pointer-sized return value can be silently truncated on 64-bit Windows (adversarial review of #64). *Check*: every Win32 function reached through `ctypes.windll` declares `.argtypes` and `.restype` from `ctypes.wintypes` before the first call.
 
 ## Processes, CLI and files
 
