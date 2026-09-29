@@ -267,10 +267,12 @@ def test_errors_survive_pickling() -> None:
         MicroscopeHaltedError(),
         MotionStoppedError("xy_stage XY", "it was stopped before it started"),
         MicroscopeBusyError("camera: snap", 61.0),
+        MicroscopeBusyError("an unknown caller", 0.5, at_least=True),
     ):
         copy = pickle.loads(pickle.dumps(error))
         assert type(copy) is type(error)
         assert str(copy) == str(error)
+        assert copy.__dict__ == error.__dict__
 
 
 # --- the guard and wait=False ------------------------------------------------
@@ -848,7 +850,9 @@ def test_lock_timeout_names_the_holder() -> None:
     assert "camera: snap has held the microscope for" in str(info.value)
 
 
-def test_lock_held_outside_the_executor_is_reported_as_an_unknown_caller() -> None:
+def test_unknown_holder_time_is_labelled_as_assumed() -> None:
+    # #59 second review, finding 13: the "unknown caller" time was this
+    # caller's wait, reported as if it were measured.
     lock = threading.RLock()
     executor = Executor(dry_run=False, lock=lock, logger=LOGGER, lock_timeout_s=0.3)
     entered, release = threading.Event(), threading.Event()
@@ -867,6 +871,21 @@ def test_lock_held_outside_the_executor_is_reported_as_an_unknown_caller() -> No
         release.set()
         holder.join()
     assert info.value.holder == "an unknown caller"
+    assert info.value.at_least is True
+    assert "has held the microscope for at least 0.3 s" in str(info.value)
+
+
+def test_a_known_holder_time_is_not_labelled_as_a_bound() -> None:
+    executor = _ex(lock_timeout_s=0.5)
+    holder, release = _hold_the_lock(executor)
+    try:
+        with pytest.raises(MicroscopeBusyError) as info:
+            executor.acquire("camera: snap 2", _never)
+    finally:
+        release.set()
+        holder.join()
+    assert info.value.at_least is False
+    assert "at least" not in str(info.value)
 
 
 def test_a_nested_action_keeps_the_outer_holder_and_its_lock() -> None:

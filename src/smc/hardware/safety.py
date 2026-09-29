@@ -338,8 +338,11 @@ class Executor:
             )
         if expired:
             if holder is None:
-                # Released just now, or held by a caller outside the Executor.
-                raise MicroscopeBusyError("an unknown caller", self._lock_timeout_s)
+                # Held by a caller outside the Executor: nothing recorded when
+                # it took the lock, so this caller's wait is a lower bound.
+                raise MicroscopeBusyError(
+                    "an unknown caller", self._lock_timeout_s, at_least=True
+                )
             raise MicroscopeBusyError(
                 holder.description, time.monotonic() - holder.since
             )

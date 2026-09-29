@@ -64,8 +64,8 @@ class MotionInProgressError(SafetyRefusedError):
     """A mutation or an acquisition was refused because a device is still moving (§13).
 
     It cannot be forced: acting on a microscope whose movement has not
-    finished is what the rule forbids. ``detail`` carries what could not be
-    read, for a device whose busy state raised.
+    finished is what the rule forbids. ``detail`` says who is moving it, or
+    what could not be read for a device whose busy state raised.
     """
 
     def __init__(self, moving: tuple[str, ...], detail: str = "") -> None:
@@ -73,9 +73,12 @@ class MotionInProgressError(SafetyRefusedError):
         self.detail = detail
         names = ", ".join(f"`{name}`" for name in moving)
         verb, it = ("is", "it") if len(moving) == 1 else ("are", "them")
+        # resume() is the way out for a device that keeps answering busy or
+        # cannot be read, including a State device that cannot be stopped.
         reason = (
             f"{names} {verb} still moving; wait for {it} (`wait()`) or stop "
-            f"{it} (`stop()`)"
+            f"{it} (`stop()`), or, if {it} never settles, check the stand and "
+            f"call `resume()`"
         )
         if detail:
             reason += f" ({detail})"
@@ -128,18 +131,23 @@ class MicroscopeBusyError(HardwareError):
     """The microscope lock could not be taken in time (§13, FM-15).
 
     ``holder`` is the description of the call holding the lock and
-    ``held_s`` how long it had held it when this caller gave up.
+    ``held_s`` how long it had held it when this caller gave up. When nothing
+    recorded when the holder took the lock (it was taken outside the
+    ``Executor``), ``held_s`` is this caller's own wait and ``at_least`` is
+    true: an assumed figure is labelled, not reported as a measurement.
     """
 
-    def __reduce__(self) -> tuple[type[MicroscopeBusyError], tuple[object, ...]]:
-        return (type(self), (self.holder, self.held_s))
-
-    def __init__(self, holder: str, held_s: float) -> None:
+    def __init__(self, holder: str, held_s: float, at_least: bool = False) -> None:
         self.holder = holder
         self.held_s = held_s
+        self.at_least = at_least
+        bound = "at least " if at_least else ""
         super().__init__(
-            f"{holder} has held the microscope for {held_s:.1f} s; the device "
-            f"driver may be hung. If the call is legitimately long, raise "
-            f"[micromanager] device_timeout_ms in the profile; otherwise "
+            f"{holder} has held the microscope for {bound}{held_s:.1f} s; the "
+            f"device driver may be hung. If the call is legitimately long, "
+            f"raise [micromanager] device_timeout_ms in the profile; otherwise "
             f"restart the device or the program."
         )
+
+    def __reduce__(self) -> tuple[type[MicroscopeBusyError], tuple[object, ...]]:
+        return (type(self), (self.holder, self.held_s, self.at_least))
