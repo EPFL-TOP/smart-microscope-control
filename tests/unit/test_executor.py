@@ -597,6 +597,40 @@ def test_interrupt_in_release_does_not_keep_the_lock(
     assert not _held_by_another_thread(lock)
 
 
+def test_releasing_the_lock_never_clears_the_next_holders_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The lock is released before the holder record is cleared, so another
+    # thread may take the lock in between; the clean-up must leave that
+    # thread's record alone, or its callers are told "an unknown caller".
+    executor = _ex(lock_timeout_s=0.5)
+    clear = executor._clear_holder
+    inside, release = threading.Event(), threading.Event()
+    second: list[_Thread] = []
+
+    def next_holder_takes_over_first(record: object) -> None:
+        monkeypatch.undo()
+        second.append(
+            _Thread(
+                lambda: executor.acquire(
+                    "camera: snap 2", lambda: (inside.set(), release.wait(JOIN_S))
+                )
+            )
+        )
+        assert inside.wait(JOIN_S)
+        clear(record)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(executor, "_clear_holder", next_holder_takes_over_first)
+    executor.do("first", _step("first", lambda: None))
+    try:
+        with pytest.raises(MicroscopeBusyError) as info:
+            executor.do("shutter: open", _step("shutter: open", _never))
+    finally:
+        release.set()
+        second[0].join()
+    assert info.value.holder == "camera: snap 2"
+
+
 @pytest.mark.parametrize(
     "why", ["stopped while queued", "halted during the guard", "refused by the guard"]
 )
@@ -1128,6 +1162,22 @@ def test_a_second_ctrl_c_in_the_give_up_log_still_leaves_the_motion_tracked() ->
     # The interrupted give-up runs again from the action's except: a second
     # stop is harmless, a missing one is not.
     assert xy.stops >= 1
+    assert executor.moving() == ("xy_stage XY",)
+
+
+def test_an_interrupt_in_the_give_up_busy_check_counts_as_moving() -> None:
+    # The busy check after a give-up's stop is interrupted before it answers:
+    # unknown counts as moving, so the next action is refused.
+    executor, xy = _ex(), _Device()
+
+    def interrupt(poll: int) -> None:
+        if poll <= 2:  # the wait's poll, then the give-up's check
+            raise KeyboardInterrupt
+
+    xy.on_poll = interrupt
+    with pytest.raises(KeyboardInterrupt):
+        _move(executor, xy)
+    assert xy.stops == 1
     assert executor.moving() == ("xy_stage XY",)
 
 
