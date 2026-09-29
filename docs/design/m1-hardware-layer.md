@@ -454,9 +454,9 @@ Core calls per method:
 | `XYStage.position_um` | `getXPosition(label)`, `getYPosition(label)` |
 | `XYStage.move_to_um` | `setXYPosition(label, x, y)`, then the wait, then the readback: one action under the lock (§13) |
 | `ZStage.position_um` / `move_to_um` | `getPosition(label)` / `setPosition(label, z)`, waited like XY |
-| `wait` / `is_busy` | polls `deviceBusy(label)` holding the lock / `deviceBusy(label)`, a lock-free read |
+| `wait` / `is_busy` | polls `deviceBusy(label)`, lock-free, never stops / `deviceBusy(label)`, lock-free |
 | `XYStage.stop` / `ZStage.stop` | `stop(label)`, through `Executor.stop` (no lock, §13) |
-| `Camera.snap` | `snapImage()` then `getImage()` (the core's current camera must be `label`); `Executor.read(..., at_rest=True)` |
+| `Camera.snap` | `snapImage()` then `getImage()` (the core's current camera must be `label`); an action under the lock (§13) |
 | `Camera.exposure_ms` / `set_exposure_ms` | `getExposure()` / `setExposure(ms)` |
 | `Camera.image_shape` / `bit_depth` | `getImageHeight()`, `getImageWidth()` / `getImageBitDepth()` |
 | `Camera.pixel_size_um` | `getPixelSizeUm()`, fallback profile map by `objective_label()` |
