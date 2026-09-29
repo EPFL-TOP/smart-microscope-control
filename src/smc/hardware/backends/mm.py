@@ -37,7 +37,7 @@ from typing import TYPE_CHECKING
 
 from smc.hardware.capabilities import XY, Limits, PropertyInfo
 from smc.hardware.errors import HardwareError
-from smc.hardware.safety import Motion, Step
+from smc.hardware.safety import Motion, SafeCall, Step
 
 if TYPE_CHECKING:
     import numpy as np
@@ -417,6 +417,11 @@ class MMShutter:
         self._core = core
         self._label = label
         self._executor = executor
+        self._close = SafeCall(
+            device=label,
+            log="shutter: close",
+            send=lambda: core.setShutterOpen(label, False),
+        )
 
     def _read_open(self) -> bool:
         return bool(self._core.getShutterOpen(self._label))
@@ -430,15 +435,14 @@ class MMShutter:
 
         Closing is a safe call (§13): it never waits for the microscope lock
         and is never refused, halted, moving or in dry-run, so the light can
-        always be cut. Opening is an action like any other.
+        always be cut. Opening is an action, and a close wins over it: a
+        close requested while the open waits for the lock cancels it, and one
+        requested while the open is being sent is sent again after it. The
+        open then raises (``MicroscopeHaltedError`` if halted meanwhile), so
+        the shutter never ends open after a close that reported success.
         """
         if not open_:
-
-            def close() -> bool:
-                self._core.setShutterOpen(self._label, False)
-                return self._read_open()
-
-            return self._executor.safe("shutter: close", close)
+            return self._executor.safe(self._close, self._read_open)
         return self._executor.do(
             "shutter: open",
             Step(
@@ -447,6 +451,7 @@ class MMShutter:
                 readback=self._read_open,
                 dry_result=True,
             ),
+            overridden_by=self._close,
         )
 
     def auto_shutter(self) -> bool:

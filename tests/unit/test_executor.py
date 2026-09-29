@@ -22,7 +22,7 @@ from smc.hardware.errors import (
     MotionStoppedError,
     SafetyRefusedError,
 )
-from smc.hardware.safety import Executor, Motion, Step
+from smc.hardware.safety import Executor, Motion, SafeCall, Step
 
 LOGGER = logging.getLogger("smc.hardware.test")
 
@@ -55,6 +55,9 @@ def _step(
 
 def _never(*_: object) -> str:
     raise AssertionError("the refused action ran")
+
+
+_CLOSE = SafeCall("Shutter", "shutter: close", lambda: None)
 
 
 def _held_by_another_thread(lock: threading.RLock) -> bool:
@@ -398,7 +401,8 @@ def test_every_kind_of_call_under_every_condition(call: str, condition: str) -> 
         "move": lambda ex: _move(ex, z),
         "stop": lambda ex: ex.stop(z.motion),
         "close": lambda ex: ex.safe(
-            "shutter: close", lambda: sent.append("close") or False
+            SafeCall("Shutter", "shutter: close", lambda: sent.append("close")),
+            lambda: False,
         ),
     }
     with _condition(condition) as executor:
@@ -1319,7 +1323,7 @@ def test_halt_still_allows_reads_stops_safe_calls_and_waits() -> None:
     _outlive(executor, xy)
     executor.halt()
     assert executor.read(lambda: 42) == 42
-    assert executor.safe("shutter: close", lambda: False) is False
+    assert executor.safe(_CLOSE, lambda: False) is False
     executor.stop(xy.motion)
     assert xy.stops == 2  # the give-up's, then this one
     xy.busy = False
@@ -1355,13 +1359,148 @@ def test_safe_call_runs_while_a_snap_holds_the_lock() -> None:
     executor = _ex(lock_timeout_s=60.0)
     holder, release = _hold_the_lock(executor)
     try:
-        closer = _Thread(lambda: executor.safe("shutter: close", lambda: False))
+        closer = _Thread(lambda: executor.safe(_CLOSE, lambda: False))
         closed = closer.finished_within(JOIN_S / 2)
     finally:
         release.set()
         holder.join()
     assert closed
     assert closer.error is None
+
+
+# --- a close wins over an open ----------------------------------------------
+
+
+class _Shutter:
+    """A stub shutter whose commands are recorded in the order they reach it."""
+
+    def __init__(self) -> None:
+        self.is_open = False
+        self.sent: list[bool] = []
+        self.close_error: BaseException | None = None
+        self.close = SafeCall("Shutter", "shutter: close", self._close)
+
+    def _close(self) -> None:
+        self.sent.append(False)
+        if self.close_error is not None:
+            raise self.close_error
+        self.is_open = False
+
+    def open_step(self, before: Callable[[], None] | None = None) -> Step[bool]:
+        def send() -> None:
+            if before is not None:
+                before()  # lands on the device first
+            self.sent.append(True)
+            self.is_open = True
+
+        return Step("shutter: open", send, lambda: self.is_open, True)
+
+
+def _open(
+    executor: Executor, shutter: _Shutter, before: Callable[[], None] | None = None
+) -> bool:
+    return executor.do(
+        "shutter: open", shutter.open_step(before), overridden_by=shutter.close
+    )
+
+
+@pytest.mark.parametrize("halted", [False, True])
+def test_close_while_an_open_is_sent_is_resent_and_the_open_raises(
+    halted: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    # #59 second review, finding 12: an open past its halt check could land
+    # after an emergency close, and the shutter ended open.
+    executor, shutter = _ex(), _Shutter()
+
+    def emergency_close() -> None:
+        if halted:
+            executor.halt()
+        executor.safe(shutter.close, lambda: shutter.is_open)
+
+    expected = MicroscopeHaltedError if halted else HardwareError
+    with (
+        caplog.at_level(logging.WARNING, logger=LOGGER.name),
+        pytest.raises(expected) as info,
+    ):
+        _open(executor, shutter, before=emergency_close)
+    assert shutter.sent == [False, True, False]
+    assert shutter.is_open is False
+    assert "shutter: close resent after `shutter: open`" in caplog.messages
+    if not halted:
+        assert type(info.value) is HardwareError
+        assert "was sent again after it" in str(info.value)
+
+
+def test_a_close_while_an_open_waits_for_the_lock_cancels_it() -> None:
+    executor, shutter = _ex(), _Shutter()
+    holder, release = _hold_the_lock(executor)
+    try:
+        opener = _Thread(lambda: _open(executor, shutter))
+        assert not opener.finished_within(0.2)  # queued behind the snap
+        executor.safe(shutter.close, lambda: shutter.is_open)
+    finally:
+        release.set()
+        holder.join()
+    opener.join()
+    assert isinstance(opener.error, HardwareError)
+    assert "was not sent" in str(opener.error)
+    assert shutter.sent == [False]
+
+
+def test_a_close_before_the_open_is_called_does_not_cancel_it() -> None:
+    executor, shutter = _ex(), _Shutter()
+    executor.safe(shutter.close, lambda: shutter.is_open)
+    assert _open(executor, shutter) is True
+    assert shutter.sent == [False, True]
+
+
+def test_a_close_racing_an_open_that_raises_is_still_resent() -> None:
+    executor, shutter = _ex(), _Shutter()
+
+    def close_then_fail() -> None:
+        executor.safe(shutter.close, lambda: shutter.is_open)
+        shutter.is_open = True  # the open reached the device ...
+        raise OSError("serial timeout")  # ... and then the driver raised
+
+    with pytest.raises(OSError, match="serial timeout"):
+        _open(executor, shutter, before=close_then_fail)
+    assert shutter.sent == [False, False]
+    assert shutter.is_open is False
+
+
+def test_a_close_that_fails_raises_and_says_so(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    executor, shutter = _ex(), _Shutter()
+    shutter.close_error = OSError("port closed")
+    with (
+        caplog.at_level(logging.WARNING, logger=LOGGER.name),
+        pytest.raises(OSError, match="port closed"),
+    ):
+        executor.safe(shutter.close, lambda: shutter.is_open)
+    assert "shutter: close failed (OSError('port closed'))" in caplog.messages
+
+
+def test_a_close_is_logged_after_it_is_sent(caplog: pytest.LogCaptureFixture) -> None:
+    executor, shutter = _ex(), _Shutter()
+    order: list[str] = []
+    handler = _OnLog("shutter: close", lambda: order.append(f"log {shutter.sent}"))
+    LOGGER.addHandler(handler)
+    try:
+        with caplog.at_level(logging.INFO, logger=LOGGER.name):
+            executor.safe(shutter.close, lambda: shutter.is_open)
+    finally:
+        LOGGER.removeHandler(handler)
+    assert order == ["log [False]"]
+
+
+def test_an_action_cannot_have_both_a_motion_and_a_safe_call() -> None:
+    xy = _Device()
+    with pytest.raises(ValueError, match="overridden by its own stop"):
+        _ex().do(
+            "move", xy.step(), motion=xy.motion, timeout_s=1.0, overridden_by=_CLOSE
+        )
+    assert xy.commands == 0
 
 
 # --- dry-run -----------------------------------------------------------------
@@ -1380,7 +1519,7 @@ def test_dry_run_registers_no_motion_and_waits_and_stops_still_run() -> None:
     executor.stop(xy.motion)
     assert xy.stops == 1
     executor.wait(xy.motion, 1.0)
-    assert executor.safe("shutter: close", lambda: False) is False
+    assert executor.safe(_CLOSE, lambda: False) is False
 
 
 def test_dry_run_move_stopped_while_queued_is_cancelled_too() -> None:

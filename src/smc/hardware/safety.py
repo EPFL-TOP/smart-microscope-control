@@ -53,7 +53,7 @@ from smc.hardware.errors import (
     SafetyRefusedError,
 )
 
-__all__ = ["POLL_INTERVAL_S", "Executor", "Motion", "Safety", "Step"]
+__all__ = ["POLL_INTERVAL_S", "Executor", "Motion", "SafeCall", "Safety", "Step"]
 
 T = TypeVar("T")
 
@@ -189,6 +189,22 @@ class Step(Generic[T]):
     dry_result: T  # returned in dry-run instead of sending
 
 
+@dataclass(frozen=True, slots=True)
+class SafeCall:
+    """A call that always gets through and wins over an action it races (design §13).
+
+    Closing a shutter: it never waits for the microscope lock and is never
+    refused, so the light can always be cut. An action on the same device
+    that was called before it (opening that shutter) is cancelled if it has
+    not been sent yet, and followed by this call again if it was being sent,
+    so the shutter never ends open after a close that reported success.
+    """
+
+    device: str  # the key it shares with the actions it wins over: the label
+    log: str  # the INFO line: "shutter: close"
+    send: Callable[[], object]
+
+
 @dataclass(eq=False)
 class _Registration:
     """A motion that outlived its action: its action gave up while it still moved.
@@ -261,8 +277,9 @@ class Executor:
         self._lock_timeout_s = float(lock_timeout_s)
         self._registry_lock = threading.Lock()
         self._registry: dict[str, _Registration] = {}
-        #: Per device: how many explicit stops it has had. Only ``stop()``
-        #: advances it, so a give-up never cancels another caller's action.
+        #: Per device: how many explicit stops (or, for a shutter, closes) it
+        #: has had. Only ``stop()`` and ``safe()`` advance it, so a give-up
+        #: never cancels another caller's action.
         self._generations: dict[str, int] = {}
         self._halted = False
         self._holder: _Holder | None = None
@@ -360,13 +377,14 @@ class Executor:
         *,
         motion: Motion | None = None,
         timeout_s: float | Callable[[], float] | None = None,
+        overridden_by: SafeCall | None = None,
     ) -> T:
         """Perform a mutation as one lock section; in dry-run, log it and skip it.
 
         Under the lock and in this order (design §13): the halt check, the
         guard, ``step`` (a callable is built now, so a relative move reads its
-        anchor here), the timeout, the stop-generation and halt checks, the
-        INFO line, the same two checks again (the line may have blocked on a
+        anchor here), the timeout, the generation and halt checks, the INFO
+        line, the same two checks again (the line may have blocked on a
         console), the command, for a ``motion`` the wait, and the readback.
 
         Args:
@@ -377,6 +395,9 @@ class Executor:
                 waits for it before reading back.
             timeout_s: The wait's deadline, or a callable that resolves it (the
                 core timeout); required with ``motion``.
+            overridden_by: The safe call that wins over this action (the close
+                of the shutter it opens); not with ``motion``, whose stop is
+                the one that wins.
 
         Raises:
             MicroscopeHaltedError: The microscope is halted.
@@ -385,16 +406,35 @@ class Executor:
             MotionStoppedError: A stop for ``motion``'s device was called after
                 this action: before the command (not sent), or during the
                 command or the wait (the stop is sent again after the command).
+            HardwareError: ``overridden_by`` was called after this action: it
+                was not sent, or it was and the safe call was sent again.
             DeviceTimeoutError: Still busy at the deadline; the stop was sent,
                 or the message says why not.
             MicroscopeBusyError: The lock was not free within ``lock_timeout_s``.
         """
         if motion is not None and timeout_s is None:
             raise ValueError("an action with a motion needs timeout_s")
+        if motion is not None and overridden_by is not None:
+            raise ValueError("a motion is overridden by its own stop, not a SafeCall")
         limit: float | Callable[[], float] = 0.0 if timeout_s is None else timeout_s
-        # Recorded before waiting for the lock: a stop pressed while this call
-        # waits for it cancels the call.
-        generation = self._generation(motion)
+        cancelled: HardwareError
+        if motion is not None:
+            key: str | None = motion.device
+            cancelled = MotionStoppedError(
+                motion.name, "it was stopped before it started"
+            )
+        elif overridden_by is not None:
+            key = overridden_by.device
+            cancelled = HardwareError(
+                f"`{description}` was not sent: `{overridden_by.log}` was "
+                f"requested after it was called; call it again if it is still "
+                f"wanted"
+            )
+        else:
+            key, cancelled = None, HardwareError(description)  # never raised
+        # Recorded before waiting for the lock: a stop (or a close) pressed
+        # while this call waits for it cancels the call.
+        generation = self._generation(key)
 
         def body() -> T:
             self._refuse_if_halted()
@@ -403,7 +443,7 @@ class Executor:
             limit_s = 0.0
             if motion is not None and not self._dry_run:
                 limit_s = _resolve_timeout(limit)
-            self._refuse_if_cancelled(motion, generation)
+            self._refuse_if_cancelled(key, generation, cancelled)
             if self._dry_run:
                 self._logger.info("[dry-run] %s", prepared.log)
                 return prepared.dry_result
@@ -411,16 +451,57 @@ class Executor:
             try:
                 # FM-66: the halt or a stop may have landed while the line
                 # above was written; the check that matters is the last one.
-                self._refuse_if_cancelled(motion, generation)
+                self._refuse_if_cancelled(key, generation, cancelled)
             except HardwareError:
                 self._logger.warning("%s: not sent", prepared.log)
                 raise
-            if motion is None:
-                prepared.send()
-                return prepared.readback()
-            return self._move(prepared, motion, generation, limit_s)
+            if motion is not None:
+                return self._move(prepared, motion, generation, limit_s)
+            if overridden_by is not None:
+                return self._send_overridable(
+                    description, prepared, overridden_by, generation
+                )
+            prepared.send()
+            return prepared.readback()
 
         return self._section(description, body)
+
+    def _send_overridable(
+        self, description: str, step: Step[T], call: SafeCall, generation: int
+    ) -> T:
+        """The command and readback of an action ``call`` wins over, under the lock.
+
+        ``call`` (the close) does not wait for the lock, so it may have reached
+        the device before this command (the open) did. If it was called during
+        the command, it is sent again after it, whether the command returned or
+        raised, and the action raises: the shutter never ends open after a
+        close that reported success (design §13).
+        """
+        resent = False
+        try:
+            step.send()
+            if self._generation(call.device) != generation:
+                error = self._send_safe(
+                    call.send, f"{call.log} resent after `{step.log}`"
+                )
+                resent = True
+                if self._halted:
+                    raise MicroscopeHaltedError()
+                outcome = (
+                    "it was sent again after it"
+                    if error is None
+                    else f"sending it again failed ({error!r}), so check the device"
+                )
+                raise HardwareError(
+                    f"`{description}`: `{call.log}` was requested while it was "
+                    f"being sent, and {outcome}; call it again if it is still "
+                    f"wanted"
+                )
+            return step.readback()
+        except BaseException:
+            if not resent and self._generation(call.device) != generation:
+                self._send_safe(call.send, f"{call.log} resent after `{step.log}`")
+            raise
 
     def _move(
         self, step: Step[T], motion: Motion, generation: int, limit_s: float
@@ -438,10 +519,15 @@ class Executor:
         previous: str | None = None
         try:
             step.send()
-            if self._generation(motion) != generation and motion.stop is not None:
+            if (
+                self._generation(motion.device) != generation
+                and motion.stop is not None
+            ):
                 # The stop did not wait for the lock and may have reached the
                 # device before this command did (FM-18).
-                self._send_stop(motion, motion.stop, "stop resent after the command")
+                self._send_safe(
+                    motion.stop, f"{motion.name}: stop resent after the command"
+                )
             previous = self._set_waiting(motion.name)
             idle = self._poll_until_idle(motion, deadline)
             if not idle:
@@ -453,7 +539,7 @@ class Executor:
                     f"device_timeout_ms in the profile; otherwise check the "
                     f"device and its cabling."
                 )
-            if self._generation(motion) != generation:
+            if self._generation(motion.device) != generation:
                 raise MotionStoppedError(motion.name)
             return step.readback()
         except BaseException as exc:
@@ -564,25 +650,33 @@ class Executor:
             self._generations[motion.device] = (
                 self._generations.get(motion.device, 0) + 1
             )
-        error = self._send_stop(
-            motion,
+        error = self._send_safe(
             send,
-            "stop",
+            f"{motion.name}: stop",
             then=lambda failed: "" if failed else self._release_after_stop(motion),
         )
         if error is not None:
             raise error
 
-    def safe(self, description: str, action: Callable[[], T]) -> T:
-        """A call that must always get through (closing a shutter), design §13.
+    def safe(self, call: SafeCall, readback: Callable[[], T]) -> T:
+        """Send ``call`` (closing a shutter) now, then read back; design §13.
 
         It never takes the microscope lock and is never refused, halted or
-        not, so the light can always be cut. It runs in dry-run too. The call
-        comes before the log line, as for a stop.
+        not, so the light can always be cut. It runs in dry-run too. The
+        device's generation moves first, so an action ``call`` wins over that
+        was called before this (opening that shutter) is cancelled, or, if it
+        is being sent, followed by ``call`` again. The call comes before the
+        log line, as for a stop.
+
+        Raises:
+            Exception: Whatever the call raised; a failed close is a finding.
         """
-        result = action()
-        self._logger.info("%s", description)
-        return result
+        with self._registry_lock:
+            self._generations[call.device] = self._generations.get(call.device, 0) + 1
+        error = self._send_safe(call.send, call.log, level=logging.INFO)
+        if error is not None:
+            raise error
+        return readback()
 
     def halt(self) -> None:
         """Refuse every action until ``resume()``; reads and the safe calls still run."""
@@ -612,28 +706,29 @@ class Executor:
 
     # --- helpers -----------------------------------------------------------
 
-    def _generation(self, motion: Motion | None) -> int:
-        if motion is None:
+    def _generation(self, device: str | None) -> int:
+        if device is None:
             return 0
         with self._registry_lock:
-            return self._generations.get(motion.device, 0)
+            return self._generations.get(device, 0)
 
     def _refuse_if_halted(self) -> None:
         if self._halted:
             raise MicroscopeHaltedError()
 
-    def _refuse_if_cancelled(self, motion: Motion | None, generation: int) -> None:
-        """The checks before a command: the halt, and a stop called since the action was."""
+    def _refuse_if_cancelled(
+        self, device: str | None, generation: int, cancelled: HardwareError
+    ) -> None:
+        """The checks before a command: the halt, then a stop or close called since."""
         with self._registry_lock:
             halted = self._halted
-            stopped = (
-                motion is not None
-                and self._generations.get(motion.device, 0) != generation
+            moved = (
+                device is not None and self._generations.get(device, 0) != generation
             )
         if halted:
             raise MicroscopeHaltedError()
-        if stopped and motion is not None:
-            raise MotionStoppedError(motion.name, "it was stopped before it started")
+        if moved:
+            raise cancelled
 
     def _poll_until_idle(self, motion: Motion, deadline: float) -> bool:
         """Poll ``motion`` until idle (``True``) or the deadline (``False``)."""
@@ -740,30 +835,31 @@ class Executor:
                 note,
             )
             return "it cannot be stopped from smc, so it may still be moving"
-        error = self._send_stop(
-            motion,
+        error = self._send_safe(
             send,
-            f"stop after {why}",
+            f"{motion.name}: stop after {why}",
             then=lambda _: self._track_if_moving(motion),
         )
         if error is None:
             return "the stop was sent"
         return f"the stop failed ({error!r}), so it may still be moving"
 
-    def _send_stop(
+    def _send_safe(
         self,
-        motion: Motion,
-        send: Callable[[], None],
+        send: Callable[[], object],
         what: str,
+        *,
         then: Callable[[bool], str] | None = None,
+        level: int = logging.WARNING,
     ) -> Exception | None:
-        """Send a stop, update the registry (``then``), and only then log (FM-62).
+        """Send a safe call, update the registry (``then``), and only then log (FM-62).
 
-        Every stop path goes through here (``stop()``, a give-up, the resend
-        after a command), so the order lives in one place: a blocked console
-        or a second Ctrl-C can delay or cut the log line, never the stop or
-        the registry update. ``then`` is told whether the stop failed and
-        returns a note for the log line. Returns what the stop raised, if
+        Every stop and every close goes through here (``stop()``, a give-up,
+        the resend after a command, ``safe()``), so the order lives in one
+        place: a blocked console or a second Ctrl-C can delay or cut the log
+        line, never the call or the registry update. ``then`` is told whether
+        the call failed and returns a note for the log line; a failure is
+        logged at WARNING whatever ``level``. Returns what the call raised, if
         anything; it never raises it.
         """
         error: Exception | None = None
@@ -773,9 +869,9 @@ class Executor:
             error = exc
         note = "" if then is None else then(error is not None)
         if error is None:
-            self._logger.warning("%s: %s%s", motion.name, what, note)
+            self._logger.log(level, "%s%s", what, note)
         else:
-            self._logger.warning("%s: %s failed (%r)%s", motion.name, what, error, note)
+            self._logger.warning("%s failed (%r)%s", what, error, note)
         return error
 
 

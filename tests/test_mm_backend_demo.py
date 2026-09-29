@@ -719,6 +719,47 @@ def test_closing_the_shutter_is_never_refused_and_opening_is() -> None:
     assert core.shutter_open is False
 
 
+class _RacingShutterCore(_MovingCore):
+    """A shutter whose open is overtaken by a close from another caller."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.race: Callable[[], object] | None = None
+        self.shutter_commands: list[bool] = []
+
+    def setShutterOpen(self, label: str, open_: bool) -> None:  # noqa: N802
+        if open_ and self.race is not None:
+            race, self.race = self.race, None
+            race()  # the close reaches the device first ...
+        self.shutter_commands.append(open_)
+        super().setShutterOpen(label, open_)  # ... then the open lands
+
+
+@pytest.mark.parametrize("halted", [False, True])
+def test_close_during_open_is_resent_and_the_open_raises(halted: bool) -> None:
+    # #59 second review, finding 12: an open past its halt check could land
+    # after an emergency close, and the shutter ended open.
+    core = _RacingShutterCore()
+    executor = _executor()
+    shutter = MMShutter(core, "Shutter", executor)  # type: ignore[arg-type]
+
+    def emergency_close() -> None:
+        if halted:
+            executor.halt()
+        assert shutter.set_open(False) is False
+
+    core.race = emergency_close
+    with pytest.raises(MicroscopeHaltedError if halted else HardwareError) as info:
+        shutter.set_open(True)
+    assert core.shutter_commands == [False, True, False]
+    assert core.shutter_open is False
+    assert shutter.is_open() is False
+    if not halted:
+        assert "`shutter: close` was requested while it was being sent" in str(
+            info.value
+        )
+
+
 def test_snap_after_a_move_that_outlived_its_action_is_refused_until_it_settles() -> (
     None
 ):
