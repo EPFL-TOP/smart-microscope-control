@@ -112,8 +112,11 @@ them if it is not the one you run on.
     **Follow-ups**: issues to open (not opened by you unless trivial)
     ```
 
-14. Leave the worktree in place until the PR is merged; a review may send
-    you back to it. Then stop: do not merge, do not start another issue.
+14. Call **`ExitWorktree`** with `action: "keep"`. This leaves the worktree
+    and branch on disk for the fix rounds a review may send you back to,
+    but releases this session's own lock on it, so a dead session does not
+    leave `worktree.py clean` unable to remove it later. Then stop: do not
+    merge, do not start another issue.
 
 ## Addressing a review
 
@@ -132,7 +135,7 @@ When the latest `## Review` on the PR says **Verdict: changes requested**:
    `/adversarial-review` on them (step 11). Push, watch CI.
 5. Comment on the PR `## Review addressed (develop session, YYYY-MM-DD)`,
    one line per blocking item: what changed and where. Set the issue to
-   `status: in-review`. Stop.
+   `status: in-review`. Call `ExitWorktree` with `action: "keep"`. Stop.
 
 ## Never
 
