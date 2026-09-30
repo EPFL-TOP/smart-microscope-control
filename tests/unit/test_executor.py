@@ -1299,6 +1299,39 @@ def test_a_second_ctrl_c_in_the_give_up_log_still_leaves_the_motion_tracked() ->
     assert executor.moving() == ("xy_stage XY",)
 
 
+def test_second_interrupt_during_give_up_stop_leaves_the_motion_registered(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # #68, finding 2: the give-up registered the motion only after its stop
+    # call had returned, so a second Ctrl-C inside that call left the stand
+    # accepting actions while the stage still moved.
+    executor, xy = _ex(), _Device(stop_clears=False)
+
+    def first_ctrl_c(poll: int) -> None:
+        if poll == 1:
+            raise KeyboardInterrupt  # in the wait: the give-up sends the stop
+
+    xy.on_poll = first_ctrl_c
+    xy.stop_error = KeyboardInterrupt()  # the second Ctrl-C, inside that stop
+    with (
+        caplog.at_level(logging.WARNING, logger=LOGGER.name),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        _move(executor, xy)
+    xy.on_poll, xy.stop_error = None, None
+    assert (xy.stops, xy.busy) == (1, True)
+    assert executor.moving() == ("xy_stage XY",)
+    assert (
+        "xy_stage XY: stop after KeyboardInterrupt was interrupted before it "
+        "returned, so it may not have reached the device" in caplog.messages
+    )
+    with pytest.raises(MotionInProgressError):
+        executor.do("shutter: open", _step("shutter: open", _never))
+    xy.busy = False  # once it reads idle, the stand is free again
+    assert executor.do("shutter: open", _step("shutter: open", lambda: None))
+    assert executor.moving() == ()
+
+
 def test_an_interrupt_in_the_give_up_busy_check_counts_as_moving() -> None:
     # The busy check after a give-up's stop is interrupted before it answers:
     # unknown counts as moving, so the next action is refused.

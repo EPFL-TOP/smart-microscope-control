@@ -805,26 +805,28 @@ class Executor:
             if self._registry.get(device) is registration:
                 del self._registry[device]
 
-    def _track_if_moving(self, motion: Motion) -> str:
-        """Register ``motion`` if it still reads busy or cannot be read; return a log note."""
+    def _keep_while_moving(self, motion: Motion, registration: _Registration) -> str:
+        """Drop a give-up's ``registration`` if the device reads idle; return a log note.
+
+        A busy state that cannot be read, or a check interrupted before it
+        answers, keeps it: unknown counts as moving.
+        """
         try:
             busy = bool(motion.is_busy())
         except Exception as exc:
-            busy, note = True, f"; its busy state cannot be read ({exc!r})"
-        except BaseException:
-            # Interrupted before it could answer: unknown counts as moving.
-            self._track(motion)
-            raise
+            note = f"; its busy state cannot be read ({exc!r})"
         else:
+            if not busy:
+                self._drop(motion.device, registration)
+                return ""
             note = "; it still reads busy"
-        if not busy:
-            return ""
-        self._track(motion)
         return f"{note}, so it counts as moving until it is idle"
 
-    def _track(self, motion: Motion) -> None:
+    def _track(self, motion: Motion) -> _Registration:
+        registration = _Registration(motion)
         with self._registry_lock:
-            self._registry[motion.device] = _Registration(motion)
+            self._registry[motion.device] = registration
+        return registration
 
     def _release_after_stop(self, motion: Motion) -> str:
         """After a sent stop: drop the device's registration unless it still reads busy."""
@@ -846,16 +848,21 @@ class Executor:
         return ""
 
     def _give_up(self, motion: Motion, why: str) -> str:
-        """Stop a motion its action stops watching, track it if it still moves, then log.
+        """Stop a motion its action stops watching, keep it registered while it moves, then log.
 
-        A give-up does not advance the stop generation: it cancels nobody
-        else's action (design §13). It never raises on its own account, so a
-        failed stop never masks the failure that caused the give-up. Returns
-        what happened, for the error message.
+        The motion is registered before the stop is sent, since unknown counts
+        as moving, and dropped only once the device reads idle: a second
+        Ctrl-C inside the stop call then leaves the stand refusing actions,
+        not free with a moving stage (#68). A give-up does not advance the
+        stop generation: it cancels nobody else's action (design §13). It
+        never raises on its own account, so a failed stop never masks the
+        failure that caused the give-up. Returns what happened, for the error
+        message.
         """
+        registration = self._track(motion)
         send = motion.stop
         if send is None:
-            note = self._track_if_moving(motion)
+            note = self._keep_while_moving(motion, registration)
             self._logger.warning(
                 "%s: gave up after %s; it cannot be stopped from smc%s",
                 motion.name,
@@ -866,7 +873,7 @@ class Executor:
         error = self._send_safe(
             send,
             f"{motion.name}: stop after {why}",
-            then=lambda _: self._track_if_moving(motion),
+            then=lambda _: self._keep_while_moving(motion, registration),
         )
         if error is None:
             return "the stop was sent"
@@ -888,13 +895,22 @@ class Executor:
         line, never the call or the registry update. ``then`` is told whether
         the call failed and returns a note for the log line; a failure is
         logged at WARNING whatever ``level``. Returns what the call raised, if
-        anything; it never raises it.
+        anything; it never raises it. A call interrupted before it returned (a
+        second Ctrl-C) is logged as such, since it may not have got through,
+        and the interrupt goes on.
         """
         error: Exception | None = None
         try:
             send()
         except Exception as exc:
             error = exc
+        except BaseException:
+            self._logger.warning(
+                "%s was interrupted before it returned, so it may not have "
+                "reached the device",
+                what,
+            )
+            raise
         note = ""
         try:
             if then is not None:
