@@ -526,15 +526,16 @@ class Executor:
             def last_check() -> None:
                 # FM-66: the halt or a stop may have landed while the line
                 # above was written; the check that matters is the last one.
-                try:
-                    self._refuse_if_cancelled(key, generation, halt_mark, cancelled)
-                except HardwareError:
-                    self._logger.warning("%s: not sent", prepared.log)
-                    raise
+                # Its caller writes the "not sent" line (#80).
+                self._refuse_if_cancelled(key, generation, halt_mark, cancelled)
 
             if motion is not None:
                 return self._move(prepared, motion, generation, limit_s, last_check)
-            last_check()
+            try:
+                last_check()
+            except HardwareError:
+                self._logger.warning("%s: not sent", prepared.log)
+                raise
             if overridden_by is not None:
                 return self._send_overridable(
                     description, prepared, overridden_by, generation
@@ -603,14 +604,22 @@ class Executor:
         idle. From then on the readback is an ordinary lock holder: a caller
         that saw the stage idle and acts next waits for the lock instead of
         being refused (#68). ``last_check`` runs after "waiting for" is
-        recorded, so nothing lies between it and the command (FM-66).
+        recorded, so nothing lies between it and the command (FM-66). When it
+        refuses, "waiting for" is cleared before the "not sent" line: that
+        line can block on a console (FM-62), and meanwhile ``moving()`` would
+        name, and contenders be refused for, a motion never commanded (#80).
         """
         deadline = time.monotonic() + limit_s
         sending = idle = gave_up = False
         previous: str | None = None
         try:
             previous = self._set_waiting(motion.name)
-            last_check()
+            try:
+                last_check()
+            except HardwareError:
+                self._set_waiting(previous)
+                self._logger.warning("%s: not sent", step.log)
+                raise
             sending = True  # from here on the command may reach the device
             step.send()
             if (

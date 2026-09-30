@@ -972,6 +972,39 @@ def test_a_halt_or_a_stop_while_waiting_for_is_recorded_keeps_the_command_away(
     assert executor.moving() == ()
 
 
+@pytest.mark.parametrize("what", ["halt", "stop"])
+def test_a_move_refused_at_its_last_check_is_not_named_while_not_sent_is_logged(
+    what: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # #80: the "not sent" WARNING was written while "waiting for" was still
+    # recorded, so for as long as a blocked console held that line (FM-62),
+    # moving() named a motion that was never commanded and contenders were
+    # refused for it.
+    executor, xy = _ex(), _Device()
+    event: Callable[[], object] = (
+        executor.halt if what == "halt" else lambda: executor.stop(xy.motion)
+    )
+    seen: list[tuple[str, ...]] = []
+    handlers = [
+        _OnLog("xy_stage: move XY", event),
+        _OnLog("xy_stage: move XY: not sent", lambda: seen.append(executor.moving())),
+    ]
+    for handler in handlers:
+        LOGGER.addHandler(handler)
+    expected = MicroscopeHaltedError if what == "halt" else MotionStoppedError
+    try:
+        with (
+            caplog.at_level(logging.INFO, logger=LOGGER.name),
+            pytest.raises(expected),
+        ):
+            _move(executor, xy)
+    finally:
+        for handler in handlers:
+            LOGGER.removeHandler(handler)
+    assert seen == [()]
+    assert xy.commands == 0
+
+
 @pytest.mark.parametrize("stoppable", [True, False])
 def test_an_interrupt_before_the_command_stops_nothing(
     stoppable: bool, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
