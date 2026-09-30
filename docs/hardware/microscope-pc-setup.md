@@ -30,14 +30,15 @@ The design session publishes a curated, redacted version.
 
 ## 1. Install (once per PC, ~15 min)
 
-Prerequisites: Python 3.11 for all users (Miniconda "for all users" is
+Prerequisites: Python 3.14 for all users (what the Ti2-E and Observer 7 PCs
+run; any Python from 3.10 works, and CI tests 3.11 and 3.14 on Windows) (Miniconda "for all users" is
 fine), Git for Windows, the Microsoft Visual C++ x64 redistributable.
 
 ```bat
 cd C:\Tools
 git clone https://github.com/EPFL-TOP/smart-microscope-control.git
 cd smart-microscope-control
-py -3.11 -m venv .venv
+py -3.14 -m venv .venv
 .venv\Scripts\activate
 python -m pip install --upgrade pip
 pip install -e ".[dev]"
