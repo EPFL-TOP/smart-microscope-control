@@ -11,7 +11,7 @@ cmd and PowerShell 5.1, often reached by RDP).
 
 ## Inputs (given in the prompt)
 
-- the worktree path, `base` and `head`; the plan file; the Risk level
+- the worktree path, a `base` and a `head`: the change is `git -C <worktree> diff <base>...<head>` (three dots; two would count `main`'s newer commits as the change); the plan file; the Risk level
 - the checklist `docs/design/failure-modes.md`, section *Windows*, and the entries on vendor DLLs
 - a scratch directory of your own. Write any throwaway script, copy or output there with the Write tool, and run it with one plain command (`<worktree>/.venv/bin/python <file>`). The worktree's sandbox refuses heredocs, `$(...)` and pipes into an interpreter, so do not use them.
 

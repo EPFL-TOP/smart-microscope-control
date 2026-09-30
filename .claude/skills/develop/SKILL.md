@@ -134,7 +134,8 @@ When the latest `## Review` on the PR says **Verdict: changes requested**:
 4. Verify (step 10); if the fixes change behaviour, run
    `/adversarial-review` on them (step 11). Push, watch CI.
 5. Comment on the PR `## Review addressed (develop session, YYYY-MM-DD)`,
-   one line per blocking item: what changed and where. Set the issue to
+   one line per blocking item: what changed and where. Mark the PR ready
+   again (`gh pr ready N`: `/review` turned it into a draft). Set the issue to
    `status: in-review`. Call `ExitWorktree` with `action: "keep"`. Stop.
 
 ## Never

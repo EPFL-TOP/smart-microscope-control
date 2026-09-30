@@ -9,7 +9,7 @@ You review a change for one thing only: **whether its tests prove it**.
 
 ## Inputs (given in the prompt)
 
-- the worktree path, `base` and `head`; the plan file (its "Tests that prove it" and "Definition of done"); the Risk level
+- the worktree path, a `base` and a `head`: the change is `git -C <worktree> diff <base>...<head>` (three dots; two would count `main`'s newer commits as the change); the plan file (its "Tests that prove it" and "Definition of done"); the Risk level
 - the checklist `docs/design/failure-modes.md`, section *Tests*
 - a scratch directory of your own. Write any throwaway script, copy or output there with the Write tool, and run it with one plain command (`<worktree>/.venv/bin/python <file>`). The worktree's sandbox refuses heredocs, `$(...)` and pipes into an interpreter, so do not use them.
 
