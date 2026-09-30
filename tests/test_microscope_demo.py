@@ -65,6 +65,8 @@ class _Spy:
         self.snap_entered = threading.Event()
         #: Called as each stop is sent, to see what was logged before it.
         self.on_stop: Callable[[], None] = lambda: None
+        #: Called once, at the next busy poll: code running inside an action.
+        self.on_poll: Callable[[], None] | None = None
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._core, name)
@@ -82,6 +84,9 @@ class _Spy:
 
     def deviceBusy(self, label: str) -> bool:  # noqa: N802
         self.polled.set()
+        hook, self.on_poll = self.on_poll, None
+        if hook is not None:
+            hook()
         return label in self.busy or bool(self._core.deviceBusy(label))
 
     def snapImage(self) -> None:  # noqa: N802
@@ -113,21 +118,13 @@ class _StubCamera:
         return 0.5
 
 
-class _JammedStage:
-    """An ``XYStage`` whose controller does not answer its stop."""
+class _Jammed:
+    """A stage whose controller does not answer its stop."""
 
-    def __init__(self, halted: Callable[[], bool]) -> None:
+    def __init__(self, halted: Callable[[], bool], axis: str) -> None:
         self._halted = halted
+        self._axis = axis
         self.halted_when_stopped: bool | None = None
-
-    def position_um(self) -> XY:
-        return XY(0.0, 0.0)
-
-    def move_to_um(self, x_um: float, y_um: float) -> XY:
-        return XY(x_um, y_um)
-
-    def move_by_um(self, dx_um: float, dy_um: float, *, force: bool = False) -> XY:
-        return XY(dx_um, dy_um)
 
     def wait(self, timeout_s: float | None = None) -> None:
         pass
@@ -137,10 +134,32 @@ class _JammedStage:
 
     def stop(self) -> None:
         self.halted_when_stopped = self._halted()
-        raise RuntimeError("XY controller not answering")
+        raise RuntimeError(f"{self._axis} controller not answering")
 
     def limits_um(self) -> None:
         return None
+
+
+class _JammedXY(_Jammed):
+    def position_um(self) -> XY:
+        return XY(0.0, 0.0)
+
+    def move_to_um(self, x_um: float, y_um: float) -> XY:
+        return XY(x_um, y_um)
+
+    def move_by_um(self, dx_um: float, dy_um: float, *, force: bool = False) -> XY:
+        return XY(dx_um, dy_um)
+
+
+class _JammedZ(_Jammed):
+    def position_um(self) -> float:
+        return 0.0
+
+    def move_to_um(self, z_um: float) -> float:
+        return z_um
+
+    def move_by_um(self, dz_um: float) -> float:
+        return dz_um
 
 
 # --- open, roles, capabilities ----------------------------------------------
@@ -449,25 +468,42 @@ def test_stop_halts_then_resume_allows_moves() -> None:
     assert landed.x_um == pytest.approx(10.0, abs=0.5)
 
 
-def test_stop_continues_past_a_failing_stage_and_reports_it(demo_core: Any) -> None:
+@pytest.mark.parametrize(
+    ("jammed_axis", "other_stop", "named", "not_named"),
+    [
+        ("XY", "stop Z", "XYStage 'XY'", "ZStage"),
+        ("Z", "stop XY", "ZStage 'Z'", "XYStage"),
+    ],
+)
+def test_stop_continues_past_a_failing_stage_and_reports_it(
+    demo_core: Any, jammed_axis: str, other_stop: str, named: str, not_named: str
+) -> None:
     spy = _Spy(demo_core)
     m = Microscope.from_core(spy, Profile.demo())
+
+    def halted() -> bool:
+        return m.state().halted
+
     try:
-        jammed = _JammedStage(lambda: m.state().halted)
-        m.override(XYStage, jammed)
+        if jammed_axis == "XY":
+            jammed: _Jammed = _JammedXY(halted, "XY")
+            m.override(XYStage, jammed)
+        else:
+            jammed = _JammedZ(halted, "Z")
+            m.override(ZStage, jammed)
         with pytest.raises(HardwareError) as info:
             m.stop()
         assert m.state().halted
     finally:
         m.close()
-    assert jammed.halted_when_stopped is True  # halted before the first stop
-    assert spy.calls[0] == "stop Z"  # Z was still stopped
+    assert jammed.halted_when_stopped is True  # halted before the stops
+    assert spy.calls[0] == other_stop  # the other stage was still stopped
     message = str(info.value)
     assert (
-        "the emergency stop failed for XYStage 'XY' "
-        "(RuntimeError('XY controller not answering'))" in message
+        f"the emergency stop failed for {named} "
+        f"(RuntimeError('{jammed_axis} controller not answering'))" in message
     )
-    assert "ZStage" not in message
+    assert not_named not in message
 
 
 def test_stop_during_a_move_ends_it(demo_core: Any) -> None:
@@ -519,9 +555,8 @@ def test_close_stops_the_stages_when_something_moves(
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         m.close()
     assert spy.calls == ["stop XY", "stop Z", "unloadAllDevices"]
-    assert (
-        "close: xy_stage XY still moving; the stages were stopped before unloading"
-        in caplog.messages
+    assert "close: xy_stage XY still moving; the stages were stopped" in (
+        caplog.messages
     )
     # FM-62: the stops went out before the line saying so.
     assert logged_before_stop == [False, False]
@@ -582,6 +617,27 @@ def test_close_never_raises_because_a_stop_failed(
         "close: the stop failed for XYStage 'XY' (RuntimeError('XY does not answer'))"
         in caplog.messages
     )
+
+
+def test_close_from_inside_an_action_stops_but_does_not_unload(
+    demo_core: Any,
+) -> None:
+    # Adversarial review of #8: a Ctrl-C handler that calls close() runs on
+    # the thread whose move is waiting. Unloading there pulled the devices
+    # from under that move, which raised a bare RuntimeError from MMCore.
+    spy = _Spy(demo_core)
+    spy.busy.add("XY")  # moving until stopped
+    m = Microscope.from_core(spy, _profile(timeout_ms=10_000))
+    spy.on_poll = m.close  # runs inside the move's wait, holding the lock
+    with pytest.raises(HardwareError) as info:
+        m.require(XYStage).move_to_um(10.0, 0.0)
+    assert type(info.value) is HardwareError
+    assert "close() was called from inside an action on this thread" in str(info.value)
+    assert spy.calls[:2] == ["stop XY", "stop Z"]  # the move was stopped ...
+    assert "unloadAllDevices" not in spy.calls  # ... and nothing was unloaded
+    assert m.state().moving == ()
+    m.close()  # once the action has returned, close releases the stand
+    assert spy.calls[-1] == "unloadAllDevices"
 
 
 def test_close_behind_a_hung_snap_fails_with_a_diagnosis(demo_core: Any) -> None:

@@ -414,16 +414,27 @@ class Microscope:
             MicroscopeBusyError: Another call held the microscope lock past
                 the lock timeout (a hung driver); nothing was unloaded, and
                 ``close()`` may be called again.
+            HardwareError: ``close()`` was called from inside an action of
+                this thread (a Ctrl-C handler that runs during a move, a
+                callback inside a snap). The stages were stopped if anything
+                moved, but nothing was unloaded: the action still uses the
+                devices. Call ``close()`` again once it has returned.
         """
         if self._closed:
             return
-        # Called from inside an action of this thread: it already holds the lock.
-        reentered = _owns(self._lock)
+        if _owns(self._lock):
+            self._stop_if_moving()
+            raise HardwareError(
+                "close() was called from inside an action on this thread, which "
+                "still uses the devices; the stages were stopped if anything "
+                "moved, and nothing was unloaded. Call close() again once the "
+                "action has returned (after the `with` block, or in a `finally`)"
+            )
         acquired = stopped = False
         # Nothing between acquire() and the try (FM-65); the finally also asks
         # the lock, in case an interrupt landed before `acquired` was set.
         try:
-            acquired = reentered or self._lock.acquire(blocking=False)
+            acquired = self._lock.acquire(blocking=False)
             if not acquired:
                 # Another thread's action holds the lock. If it is waiting for
                 # a motion, the stop ends it; otherwise close would wait for
@@ -450,7 +461,7 @@ class Microscope:
                 )
             self._closed = True
         finally:
-            if not reentered and (acquired or _owns(self._lock)):
+            if acquired or _owns(self._lock):
                 self._lock.release()
         log.info("%s: closed", self.profile.microscope.name)
 
@@ -477,8 +488,7 @@ class Microscope:
         failures = self._stop_stages()
         # Logged after the stops were sent (FM-62).
         log.warning(
-            "close: %s still moving; the stages were stopped before unloading",
-            ", ".join(moving),
+            "close: %s still moving; the stages were stopped", ", ".join(moving)
         )
         for failure in failures:
             log.error("close: the stop failed for %s", failure)
