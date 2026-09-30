@@ -1841,6 +1841,36 @@ def test_action_queued_while_halted_does_not_run_after_resume(
     assert xy.commands == 1
 
 
+@pytest.mark.parametrize("when", ["called while halted", "halted after the call"])
+@pytest.mark.parametrize("kind", ["open", "move", "snap"])
+def test_a_halt_and_resume_before_the_lock_is_taken_still_refuse(
+    kind: str, when: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Adversarial review of #80: a queued action is now refused at its lock
+    # polls, so the test above no longer reaches the check made once the
+    # lock is taken. That check alone sees a halt and a resume() that land
+    # between the call and the lock (within one poll, or before a free lock
+    # is taken), and it must compare the halt mark, not the flag (#68).
+    executor, xy, shutter = _ex(), _Device(arrive_after=0), _Shutter()
+    halt_mark = executor._halt_mark
+
+    def halt_and_resume_around_the_call() -> int | None:
+        if when == "called while halted":
+            executor.halt()
+        mark = halt_mark()
+        if when == "halted after the call":
+            executor.halt()
+        executor.resume()
+        return mark
+
+    monkeypatch.setattr(executor, "_halt_mark", halt_and_resume_around_the_call)
+    with pytest.raises(MicroscopeHaltedError):
+        _actions(executor, xy, shutter)[kind]()
+    monkeypatch.undo()
+    assert (shutter.sent, xy.commands) == ([], 0)
+    assert _move(executor, xy) == "arrived"  # a call made after resume() runs
+
+
 @pytest.mark.parametrize("kind", ["open", "move", "snap"])
 def test_action_called_while_halted_behind_a_moving_holder_raises_halted(
     kind: str,
