@@ -223,7 +223,9 @@ class _Holder:
 
     description: str
     since: float
-    #: The motion the action is waiting for, once its command has been sent.
+    #: The motion the action is waiting for, from just before its command
+    #: until the device reads idle: a command can block for the whole
+    #: traverse, and callbacks run inside it (#68).
     waiting_for: str | None = None
 
 
@@ -301,8 +303,12 @@ class Executor:
 
         A thread that already holds the lock runs ``body`` inside its outer
         action: a callback inside ``snap`` that moves the stage is part of the
-        snap. Ownership is asked of the lock itself, not of the holder record,
-        which a second Ctrl-C can leave stale.
+        snap. It is refused while that action waits for a motion, as another
+        thread would be: pymmcore-plus emits ``propertyChanged`` synchronously
+        from ``setProperty``, so a UI handler that snaps runs inside the
+        command of a turret change (#68). Ownership is asked of the lock
+        itself, not of the holder record, which a second Ctrl-C can leave
+        stale.
 
         Otherwise ``acquire()`` is called here, in the frame whose ``finally``
         releases the lock, and nothing else runs between it and the ``try``:
@@ -313,6 +319,7 @@ class Executor:
         cleared, so an interrupt in that clean-up cannot keep it.
         """
         if _lock_is_owned(self._lock):
+            self._refuse_if_waiting()
             return body()
         started = time.monotonic()
         deadline = started + self._lock_timeout_s
@@ -359,6 +366,17 @@ class Executor:
             raise MicroscopeBusyError("an unknown caller", now - started, at_least=True)
         raise MicroscopeBusyError(holder.description, now - holder.since)
 
+    def _refuse_if_waiting(self) -> None:
+        """Refuse a nested action while this thread's own action waits for a motion."""
+        with self._registry_lock:
+            holder = None if self._holder is None else replace(self._holder)
+        if holder is not None and holder.waiting_for is not None:
+            raise MotionInProgressError(
+                (holder.waiting_for,),
+                f"`{holder.description}` is waiting for it, and this call runs "
+                f"inside it",
+            )
+
     def _set_waiting(self, name: str | None) -> str | None:
         """Record what the holder waits for; return what it waited for before."""
         with self._registry_lock:
@@ -402,7 +420,8 @@ class Executor:
         Raises:
             MicroscopeHaltedError: The microscope is halted.
             MotionInProgressError: A device is still moving, or the lock holder
-                is waiting for one.
+                is waiting for one (this thread's own action, for a callback
+                that runs inside its command).
             MotionStoppedError: A stop for ``motion``'s device was called after
                 this action: before the command (not sent), or during the
                 command or the wait (the stop is sent again after the command).
@@ -513,11 +532,18 @@ class Executor:
         that raises or an unreadable busy state anywhere before the device is
         seen idle gives up on the motion, which sends the stop. Once the device
         is idle there is nothing left to stop.
+
+        The holder waits for the motion from just before the command, which
+        can block for the traverse or run a callback, until the device reads
+        idle. From then on the readback is an ordinary lock holder: a caller
+        that saw the stage idle and acts next waits for the lock instead of
+        being refused (#68).
         """
         deadline = time.monotonic() + limit_s
         idle = gave_up = False
         previous: str | None = None
         try:
+            previous = self._set_waiting(motion.name)
             step.send()
             if (
                 self._generation(motion.device) != generation
@@ -528,7 +554,6 @@ class Executor:
                 self._send_safe(
                     motion.stop, f"{motion.name}: stop resent after the command"
                 )
-            previous = self._set_waiting(motion.name)
             idle = self._poll_until_idle(motion, deadline)
             if not idle:
                 outcome = self._give_up(motion, f"{limit_s:g} s timeout")
@@ -539,6 +564,7 @@ class Executor:
                     f"device_timeout_ms in the profile; otherwise check the "
                     f"device and its cabling."
                 )
+            self._set_waiting(previous)
             if self._generation(motion.device) != generation:
                 raise MotionStoppedError(motion.name)
             return step.readback()
@@ -557,7 +583,9 @@ class Executor:
 
         Raises:
             MicroscopeHaltedError: The microscope is halted.
-            MotionInProgressError: A device is still moving.
+            MotionInProgressError: A device is still moving, or the lock holder
+                is waiting for one (this thread's own action, for a callback
+                that runs inside its command).
             MicroscopeBusyError: The lock was not free within ``lock_timeout_s``.
         """
 

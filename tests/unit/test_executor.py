@@ -208,6 +208,34 @@ def _moving(executor: Executor, device: _Device) -> _Thread:
     return mover
 
 
+def _blocking_move(
+    executor: Executor, device: _Device
+) -> tuple[_Thread, threading.Event]:
+    """A move whose command blocks for the traverse, in another thread; set the event to end it.
+
+    Some adapters return from ``setXYPosition`` only once the stage has
+    arrived; the wait that follows then finds it idle at once.
+    """
+    inside, release = threading.Event(), threading.Event()
+
+    def traverse() -> None:
+        device.command()
+        inside.set()
+        release.wait(JOIN_S)
+        device.busy = False
+
+    mover = _Thread(
+        lambda: executor.do(
+            "xy_stage: move_to (1.0, 2.0) µm",
+            Step("xy_stage: move XY", traverse, lambda: "arrived", "dry"),
+            motion=device.motion,
+            timeout_s=JOIN_S,
+        )
+    )
+    assert inside.wait(JOIN_S)
+    return mover, release
+
+
 def _hold_the_lock(executor: Executor) -> tuple[_Thread, threading.Event]:
     """A hung snap in another thread; set the returned event to end it."""
     entered, release = threading.Event(), threading.Event()
@@ -488,6 +516,112 @@ def test_a_nested_action_keeps_the_outer_holder_and_its_lock() -> None:
     assert info.value.holder == "camera: snap"
     assert xy.commands == 1
     assert executor.do("after", _step("after", lambda: None)) == "readback"
+
+
+def test_an_action_inside_a_moves_command_is_refused() -> None:
+    # #68, finding 1: pymmcore-plus runs a propertyChanged handler
+    # synchronously inside setProperty, in the mover's own thread. Such a
+    # callback re-enters the lock, and the guard looked only at motions that
+    # outlived their action, so a snap ran while the turret moved.
+    executor, turret, z = _ex(), _Device("Turret", arrive_after=0), _Device("Z")
+    refused: list[MotionInProgressError] = []
+
+    def command_with_a_synchronous_callback() -> None:
+        turret.command()
+        callbacks: list[Callable[[], object]] = [
+            lambda: executor.acquire("camera: snap", _never),
+            lambda: executor.do("shutter: open", _step("shutter: open", _never)),
+            lambda: _move(executor, z),
+        ]
+        for callback in callbacks:
+            try:
+                callback()
+            except MotionInProgressError as exc:
+                refused.append(exc)
+
+    result = executor.do(
+        "turret: set",
+        Step("turret: set", command_with_a_synchronous_callback, lambda: "2", "dry"),
+        motion=turret.motion,
+        timeout_s=30.0,
+    )
+    assert result == "2"  # the set itself carries on
+    assert [exc.moving for exc in refused] == [("xy_stage Turret",)] * 3
+    assert "`turret: set` is waiting for it" in str(refused[0])
+    assert z.commands == 0
+
+
+def test_moving_names_a_traverse_during_its_command() -> None:
+    # #68, finding 4: "waiting for" was recorded only once the command had
+    # returned, so a move whose command blocks for the traverse was absent
+    # from moving() (#8's state()) for its whole length.
+    executor, xy = _ex(), _Device()
+    mover, release = _blocking_move(executor, xy)
+    try:
+        during = executor.moving()
+    finally:
+        release.set()
+        mover.join()
+    assert during == ("xy_stage XY",)
+    assert mover.error is None
+    assert mover.result == "arrived"
+    assert executor.moving() == ()
+
+
+def test_contender_is_refused_during_a_blocking_command() -> None:
+    # #68, finding 4: during such a command another caller queued for the
+    # lock, up to lock_timeout_s, instead of being refused at once.
+    executor, xy, z = _ex(lock_timeout_s=60.0), _Device(), _Device("Z", arrive_after=0)
+    mover, release = _blocking_move(executor, xy)
+    try:
+        contender = _Thread(lambda: _move(executor, z))
+        refused = contender.finished_within(JOIN_S / 2)
+    finally:
+        release.set()
+        mover.join()
+    assert refused, "the contender queued behind the command"
+    contender.join()
+    assert isinstance(contender.error, MotionInProgressError)
+    assert contender.error.moving == ("xy_stage XY",)
+    assert z.commands == 0
+
+
+def test_snap_right_after_the_move_is_idle_is_not_refused() -> None:
+    # #68, finding 5: "waiting for" stayed recorded through the readback, so
+    # the documented pattern "wait for the move, then snap" was refused
+    # although the stage had arrived. A real readback takes time: two serial
+    # reads of X and Y are about 120 ms; here it lasts until the test says.
+    executor, xy = _ex(lock_timeout_s=60.0), _Device()
+    reading_back, release = threading.Event(), threading.Event()
+
+    def slow_readback() -> str:
+        reading_back.set()
+        release.wait(JOIN_S)
+        return "arrived"
+
+    mover = _Thread(
+        lambda: executor.do(
+            "xy_stage: move_to (1.0, 2.0) µm",
+            Step("xy_stage: move XY", xy.command, slow_readback, "dry"),
+            motion=xy.motion,
+            timeout_s=JOIN_S,
+        )
+    )
+    try:
+        assert xy.polled.wait(JOIN_S)
+        xy.busy = False  # the stage arrives, and the mover reads it back
+        assert reading_back.wait(JOIN_S)
+        executor.wait(xy.motion, JOIN_S)  # the UI waits for the move ...
+        snapper = _Thread(lambda: executor.acquire("camera: snap", lambda: "frame"))
+        done_early = snapper.finished_within(0.3)  # ... then snaps
+    finally:
+        release.set()
+        mover.join()
+    assert not done_early, f"the snap did not wait for the readback: {snapper.error!r}"
+    snapper.join()
+    assert snapper.error is None
+    assert snapper.result == "frame"
+    assert mover.result == "arrived"
 
 
 def test_lock_timeout_names_the_holder() -> None:
