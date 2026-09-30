@@ -491,6 +491,39 @@ class TestMotionOnDemoDevices:
         assert props.get("Objective", "State") == "2"
         assert executor.moving() == ()
 
+    def test_callback_snap_during_a_turret_change_is_refused(
+        self, demo_core: Any
+    ) -> None:
+        # #68, finding 1: pymmcore-plus emits propertyChanged synchronously
+        # inside setProperty, in the thread of the set. A UI handler that
+        # snapped a preview there re-entered the lock, and the snap ran while
+        # the turret was changing.
+        executor = _executor()
+        props = MMProperties(demo_core, executor)
+        camera = MMCamera(
+            demo_core, demo_core.getCameraDevice(), executor, {}, lambda: None
+        )
+        seen: list[object] = []
+
+        def on_property_changed(device: str, name: str, value: object) -> None:
+            if device != "Dichroic":
+                return
+            try:
+                camera.snap()
+                seen.append("snapped")
+            except MotionInProgressError as exc:
+                seen.append(exc.moving)
+
+        target = "1" if props.get("Dichroic", "State") != "1" else "0"
+        demo_core.events.propertyChanged.connect(on_property_changed)
+        try:
+            assert props.set("Dichroic", "State", target) == target
+        finally:
+            demo_core.events.propertyChanged.disconnect(on_property_changed)
+        assert seen, "the handler never ran inside the set"
+        assert set(seen) == {("Dichroic",)}
+        assert executor.moving() == ()
+
 
 class _MovingCore:
     """A stage that stays busy until the test releases it, and a camera.
