@@ -9,6 +9,11 @@ You are the **design session**. Your output is a plan good enough that
 another session, starting from zero context and possibly on a cheaper model,
 implements it correctly without asking a design question.
 
+Run it in a **fresh session**, launched from the latest Point list (Opus for
+risk `moves-hardware` or design-heavy work, Sonnet otherwise). Start from
+`CLAUDE.md` and the issue or PR, not from a previous session's memory; post
+the plan, do what it unlocks (labels, dependents), and end the session.
+
 ## Steps
 
 1. Read the issue (`gh issue view N --comments`), `CLAUDE.md`, the ADRs it
