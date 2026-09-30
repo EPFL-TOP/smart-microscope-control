@@ -11,14 +11,24 @@ rules for everyone; you follow them without being reminded.
 Work is split between a **supervising (design) session** and **execution
 sessions**, and the GitHub issue is the contract between them:
 
-- The **supervising session** orchestrates. It starts with **`/point`**
-  (take stock, do the housekeeping, give the owner one short list), owns
-  architecture (ADRs, `docs/design/*.md`), writes the plan of every issue
-  (`/plan`) and reviews every PR (`/review`, light and proportionate). It
-  does not implement, and it stays cheap: facts come from
-  `scripts/dev/point.py`, code reading goes to subagents on cheaper models,
-  only conclusions come back. When its context grows large, start a fresh
-  one: the state lives in docs, issues and memory.
+- **Supervising (design) sessions** orchestrate, and they are **short and
+  chained**, like execution sessions. A cycle starts with a fresh **`/point`**
+  session: take stock, do the housekeeping, give the owner one short list,
+  and post it on the pinned issue *Point: next steps*. That list names the
+  design work as commands to launch in **fresh sessions**, each with a
+  suggested model, exactly as it names `/develop` sessions:
+  - `/review <pr>` for each PR (light and proportionate);
+  - `/plan <issue>` for each issue of the next wave;
+  - `/adr` and `/hardware-session`.
+
+  Each such session does one thing, posts its comment, and ends. Supervising
+  sessions own architecture (ADRs, `docs/design/*.md`) and never implement.
+  Facts come from `scripts/dev/point.py`, code reading goes to subagents on
+  cheaper models, and only conclusions come back. **The hand-off is GitHub**:
+  the Point, Plan, Review and Report comments, plus the docs. Memory keeps
+  only stable lessons, never the current state. Reviews and plans for
+  different PRs or issues run in parallel; changes to the same design
+  document run one at a time.
 - An **execution session** (a fresh session, Sonnet unless the plan
   suggests otherwise) takes **one** issue labelled `status: ready`,
   implements its plan, attacks the change with **`/adversarial-review`**
@@ -134,10 +144,11 @@ turned into code, a profile entry, a test or a doc line.
 
 ## Skills
 
-Supervising session: `/point` take stock and list what to do next ·
-`/plan <issue>` write the executable plan · `/review <pr>` light review
-against the plan, the rules and the adversarial review · `/adr` propose a
-decision · `/hardware-session` prepare and write up a session at a stand.
+Supervising sessions, each fresh and single-purpose: `/point` take stock
+and list what to do next (it starts every cycle) · `/plan <issue>` write the
+executable plan · `/review <pr>` light review against the plan, the rules
+and the adversarial review · `/adr` propose a decision · `/hardware-session`
+prepare and write up a session at a stand.
 Execution session: `/develop <issue>` implement one planned issue to a PR;
 it runs `/adversarial-review <issue>` before the PR.
 Scaffolds: `/new-plugin`, `/new-backend`. Shortcut: `/feature` (plan +
