@@ -155,8 +155,9 @@ class Safety:
 
 #: How often a wait asks the device whether it is still busy.
 POLL_INTERVAL_S = 0.01
-#: How often a caller waiting for the lock looks at what the holder is doing,
-#: so that it is refused as soon as the holder starts waiting for a motion.
+#: How often a caller waiting for the lock looks at the halt and at what the
+#: holder is doing, so that it is refused as soon as the stand is halted or
+#: the holder starts waiting for a motion.
 _LOCK_POLL_S = 0.05
 
 
@@ -308,7 +309,9 @@ class Executor:
 
     # --- the lock section --------------------------------------------------
 
-    def _section(self, description: str, body: Callable[[], T]) -> T:
+    def _section(
+        self, description: str, body: Callable[[], T], halt_mark: int | None
+    ) -> T:
         """Run ``body`` holding the microscope lock (design §13, "The lock").
 
         A thread that already holds the lock runs ``body`` inside it
@@ -322,6 +325,10 @@ class Executor:
         ``acquired`` is set, so the ``finally`` also asks the lock whether this
         thread took it. The lock is released before the holder record is
         cleared, so an interrupt in that clean-up cannot keep it.
+
+        ``halt_mark`` is what the action recorded of the halt when it was
+        called. ``body`` checks it once the lock is taken; while the lock is
+        held by another thread, ``_contention`` checks it at every poll.
         """
         if _lock_is_owned(self._lock):
             return self._nested(description, body)
@@ -337,7 +344,7 @@ class Executor:
                 )
                 if not acquired:
                     # Expired only once an attempt made at the deadline failed.
-                    self._contention(started, expired=remaining <= 0)
+                    self._contention(started, halt_mark, expired=remaining <= 0)
             record = _Holder(description, time.monotonic())
             with self._registry_lock:
                 self._holder = record
@@ -389,10 +396,23 @@ class Executor:
             if record is not None and self._holder is record:
                 self._holder = None
 
-    def _contention(self, started: float, *, expired: bool) -> None:
-        """An action facing a lock held by another thread: refused, still waiting, or out of time."""
+    def _contention(
+        self, started: float, halt_mark: int | None, *, expired: bool
+    ) -> None:
+        """An action facing a lock held by another thread: halted, refused, waiting, or out of time.
+
+        A halt since the call comes first (FM-64). Behind a holder waiting for
+        a motion, the refusal would be a ``SafetyRefusedError``, which a tool
+        may catch and carry on after, through the emergency stop. Behind a
+        slow holder, the caller would wait ``lock_timeout_s`` for a stand the
+        operator has stopped, then report a hung driver. The halt mark, not
+        the flag, is compared, so a ``resume()`` since does not let it wait on.
+        """
         with self._registry_lock:
+            halted = self._halted_since(halt_mark)
             holder = None if self._holder is None else replace(self._holder)
+        if halted:
+            raise MicroscopeHaltedError()
         if holder is not None and holder.waiting_for is not None:
             raise MotionInProgressError(
                 (holder.waiting_for,), f"`{holder.description}` is waiting for it"
@@ -522,7 +542,7 @@ class Executor:
             prepared.send()
             return prepared.readback()
 
-        return self._section(description, body)
+        return self._section(description, body, halt_mark)
 
     def _send_overridable(
         self, description: str, step: Step[T], call: SafeCall, generation: int
@@ -653,7 +673,7 @@ class Executor:
             self._refuse_if_halted(halt_mark)
             return action()
 
-        return self._section(description, body)
+        return self._section(description, body, halt_mark)
 
     # --- reads ---------------------------------------------------------------
 
@@ -767,8 +787,8 @@ class Executor:
     def halt(self) -> None:
         """Refuse every action until ``resume()``; reads and the safe calls still run.
 
-        An action already called, waiting for the lock, is refused too, even
-        once resumed.
+        An action already called and waiting for the lock is refused too,
+        within one lock poll and even once resumed.
         """
         with self._registry_lock:
             self._halted = True
