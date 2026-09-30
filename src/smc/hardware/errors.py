@@ -58,3 +58,96 @@ class SafetyRefusedError(HardwareError):
         self.how_to_force = how_to_force
         tail = f" — {how_to_force}" if how_to_force else ""
         super().__init__(f"{reason}{tail}")
+
+
+class MotionInProgressError(SafetyRefusedError):
+    """A mutation or an acquisition was refused because a device is still moving (§13).
+
+    It cannot be forced: acting on a microscope whose movement has not
+    finished is what the rule forbids. ``detail`` says who is moving it, or
+    what could not be read for a device whose busy state raised.
+    """
+
+    def __init__(self, moving: tuple[str, ...], detail: str = "") -> None:
+        self.moving = moving
+        self.detail = detail
+        names = ", ".join(f"`{name}`" for name in moving)
+        verb, it = ("is", "it") if len(moving) == 1 else ("are", "them")
+        # resume() is the way out for a device that keeps answering busy or
+        # cannot be read, including a State device that cannot be stopped.
+        reason = (
+            f"{names} {verb} still moving; wait for {it} (`wait()`) or stop "
+            f"{it} (`stop()`), or, if {it} never settles, check the stand and "
+            f"call `resume()`"
+        )
+        if detail:
+            reason += f" ({detail})"
+        super().__init__(reason)
+
+    def __reduce__(self) -> tuple[type[MotionInProgressError], tuple[object, ...]]:
+        # Rebuilt from the constructor's arguments, not the message, so the
+        # error survives a worker process (pickle).
+        return (type(self), (self.moving, self.detail))
+
+
+class MicroscopeHaltedError(HardwareError):
+    """An action was refused because the microscope is halted (§13).
+
+    Not a ``SafetyRefusedError``: a plugin that skips a target on ``except
+    SafetyRefusedError`` (the soft limits) must not swallow the emergency
+    stop.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "the microscope was stopped (`Microscope.stop()`); call `resume()` "
+            "to continue"
+        )
+
+    def __reduce__(self) -> tuple[type[MicroscopeHaltedError], tuple[object, ...]]:
+        return (type(self), ())
+
+
+class MotionStoppedError(HardwareError):
+    """A move ended because it was stopped, not because it arrived (§13).
+
+    A plugin loop that sees it must end instead of carrying on to the next
+    well: the stage is not where the loop believes it is. ``device`` is the
+    motion's name (``"xy_stage XY"``).
+    """
+
+    def __init__(
+        self, device: str, detail: str = "the move was stopped before it completed"
+    ) -> None:
+        self.device = device
+        self.detail = detail
+        super().__init__(f"`{device}`: {detail}; read the position before moving on")
+
+    def __reduce__(self) -> tuple[type[MotionStoppedError], tuple[object, ...]]:
+        return (type(self), (self.device, self.detail))
+
+
+class MicroscopeBusyError(HardwareError):
+    """The microscope lock could not be taken in time (§13, FM-15).
+
+    ``holder`` is the description of the call holding the lock and
+    ``held_s`` how long it had held it when this caller gave up. When nothing
+    recorded when the holder took the lock (it was taken outside the
+    ``Executor``), ``held_s`` is this caller's own wait and ``at_least`` is
+    true: an assumed figure is labelled, not reported as a measurement.
+    """
+
+    def __init__(self, holder: str, held_s: float, at_least: bool = False) -> None:
+        self.holder = holder
+        self.held_s = held_s
+        self.at_least = at_least
+        bound = "at least " if at_least else ""
+        super().__init__(
+            f"{holder} has held the microscope for {bound}{held_s:.1f} s; the "
+            f"device driver may be hung. If the call is legitimately long, "
+            f"raise [micromanager] device_timeout_ms in the profile; otherwise "
+            f"restart the device or the program."
+        )
+
+    def __reduce__(self) -> tuple[type[MicroscopeBusyError], tuple[object, ...]]:
+        return (type(self), (self.holder, self.held_s, self.at_least))

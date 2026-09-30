@@ -116,22 +116,33 @@ class XYStage(Protocol):
         """Where the stage reports it is."""
         ...
 
-    def move_to_um(self, x_um: float, y_um: float, *, wait: bool = True) -> XY:
-        """Move to an absolute position; return the readback."""
+    def move_to_um(self, x_um: float, y_um: float) -> XY:
+        """Move to an absolute position; return the readback once it has arrived."""
         ...
 
-    def move_by_um(
-        self, dx_um: float, dy_um: float, *, wait: bool = True, force: bool = False
-    ) -> XY:
-        """Move relative to the current position; return the readback."""
+    def move_by_um(self, dx_um: float, dy_um: float, *, force: bool = False) -> XY:
+        """Move relative to the current position; return the readback once it has arrived."""
         ...
 
     def wait(self, timeout_s: float | None = None) -> None:
-        """Block until the stage is idle; ``DeviceTimeoutError`` past the deadline."""
+        """Block until the stage is idle; ``DeviceTimeoutError`` past the deadline.
+
+        A read: it never waits for the microscope lock and never stops the
+        stage (design §13).
+        """
         ...
 
     def is_busy(self) -> bool:
         """Whether the stage reports it is still moving."""
+        ...
+
+    def stop(self) -> None:
+        """Stop the stage now; never refused, never waits for the microscope lock.
+
+        The move it interrupts raises ``MotionStoppedError``. It runs in
+        dry-run too: a stop cannot create motion, and a dry-run session may be
+        watching a stage moved by hand (design §13).
+        """
         ...
 
     def limits_um(self) -> tuple[Limits, Limits] | None:
@@ -147,20 +158,24 @@ class ZStage(Protocol):
         """Where the drive reports it is."""
         ...
 
-    def move_to_um(self, z_um: float, *, wait: bool = True) -> float:
-        """Move to an absolute position; return the readback."""
+    def move_to_um(self, z_um: float) -> float:
+        """Move to an absolute position; return the readback once it has arrived."""
         ...
 
-    def move_by_um(self, dz_um: float, *, wait: bool = True) -> float:
-        """Move relative to the current position; return the readback."""
+    def move_by_um(self, dz_um: float) -> float:
+        """Move relative to the current position; return the readback once it has arrived."""
         ...
 
     def wait(self, timeout_s: float | None = None) -> None:
-        """Block until the drive is idle; ``DeviceTimeoutError`` past the deadline."""
+        """Block until the drive is idle; a read, as ``XYStage.wait``."""
         ...
 
     def is_busy(self) -> bool:
         """Whether the drive reports it is still moving."""
+        ...
+
+    def stop(self) -> None:
+        """Stop the drive now; same contract as ``XYStage.stop``."""
         ...
 
     def limits_um(self) -> Limits | None:
