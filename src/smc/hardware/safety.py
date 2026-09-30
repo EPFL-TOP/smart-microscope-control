@@ -430,11 +430,12 @@ class Executor:
                 that runs inside its command).
             MotionStoppedError: A stop for ``motion``'s device was called after
                 this action: before the command (not sent), or during the
-                command or the wait (the stop is sent again after the command).
+                command or the wait (the stop is sent again after the command),
+                including a move still busy at its deadline after that stop.
             HardwareError: ``overridden_by`` was called after this action: it
                 was not sent, or it was and the safe call was sent again.
-            DeviceTimeoutError: Still busy at the deadline; the stop was sent,
-                or the message says why not.
+            DeviceTimeoutError: Still busy at the deadline, and not stopped by
+                a caller; the stop was sent, or the message says why not.
             MicroscopeBusyError: The lock was not free within ``lock_timeout_s``.
         """
         if motion is not None and timeout_s is None:
@@ -565,6 +566,14 @@ class Executor:
             if not idle:
                 outcome = self._give_up(motion, f"{limit_s:g} s timeout")
                 gave_up = True
+                if self._generation(motion.device) != generation:
+                    # The caller asked for the stop: the move ended as stopped,
+                    # and the timeout is no reason to raise device_timeout_ms.
+                    raise MotionStoppedError(
+                        motion.name,
+                        f"it was stopped, but it still read busy at the move's "
+                        f"{limit_s:g} s timeout, and on the timeout {outcome}",
+                    )
                 raise DeviceTimeoutError(
                     f"{motion.name} is still busy after {limit_s:g} s; {outcome}. "
                     f"If the move is legitimately long, raise [micromanager] "

@@ -1115,6 +1115,29 @@ def test_stop_during_a_move_makes_the_mover_raise_motion_stopped(
     assert executor.moving() == ()
 
 
+def test_stopped_move_that_times_out_raises_motion_stopped() -> None:
+    # #68, finding 6: a move stopped during its wait whose stage still read
+    # busy at the deadline (it decelerates slowly, or ignored the stop) raised
+    # DeviceTimeoutError, which tells the operator to raise device_timeout_ms.
+    # The caller asked for the stop, so the move ended as stopped.
+    executor, xy = _ex(), _Device(stop_clears=False)
+
+    def stop_during_the_wait(poll: int) -> None:
+        xy.on_poll = None
+        executor.stop(xy.motion)  # lock-free, as from another thread
+
+    xy.on_poll = stop_during_the_wait
+    with pytest.raises(MotionStoppedError) as info:
+        _move(executor, xy, timeout_s=0.05)
+    assert info.value.device == "xy_stage XY"
+    assert info.value.detail == (
+        "it was stopped, but it still read busy at the move's 0.05 s timeout, "
+        "and on the timeout the stop was sent"
+    )
+    assert xy.stops == 2  # the caller's stop, then the give-up's
+    assert executor.moving() == ("xy_stage XY",)  # still busy: it counts as moving
+
+
 def test_stop_does_not_wait_for_the_lock() -> None:
     executor, xy = _ex(), _Device()
     holder, release = _hold_the_lock(executor)
