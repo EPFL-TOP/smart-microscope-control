@@ -248,6 +248,23 @@ def test_device_timeout_must_be_positive(tmp_path: Path, value: str) -> None:
     assert "micromanager.device_timeout_ms" in msg
 
 
+def test_device_timeout_must_fit_mmcore_on_windows(tmp_path: Path) -> None:
+    # MMCore's setTimeoutMs takes a C long, which is 32-bit on Windows: a
+    # larger value passes on Linux and macOS and overflows on the stand's PC.
+    fits = write_profile(
+        tmp_path / "fits.toml", "[micromanager]\ndevice_timeout_ms = 2147483647\n"
+    )
+    assert Profile.load(fits).micromanager.device_timeout_ms == 2_147_483_647
+    path = write_profile(
+        tmp_path / "p.toml", "[micromanager]\ndevice_timeout_ms = 2147483648\n"
+    )
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    msg = str(info.value)
+    assert "micromanager.device_timeout_ms: device_timeout_ms must be at most " in msg
+    assert "2147483647 ms" in msg
+
+
 # -- micromanager.config ------------------------------------------------------
 
 

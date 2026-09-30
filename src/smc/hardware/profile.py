@@ -41,6 +41,10 @@ log = logging.getLogger("smc.hardware.profile")
 
 PROFILES_ENV = "SMC_PROFILES"
 DEMO_NAME = "demo"
+#: MMCore's ``setTimeoutMs`` takes a C ``long``, 32-bit on Windows: a larger
+#: timeout passes on Linux and macOS and overflows on the stand's PC. As a lock
+#: timeout (``/ 1000``) it also stays under Windows' ``threading.TIMEOUT_MAX``.
+_MAX_DEVICE_TIMEOUT_MS = 2**31 - 1
 
 
 class _Section(BaseModel):
@@ -74,6 +78,12 @@ class MicroManagerSection(_Section):
         if value <= 0:
             raise ValueError(
                 f"device_timeout_ms must be a positive number, got {value}"
+            )
+        if value > _MAX_DEVICE_TIMEOUT_MS:
+            raise ValueError(
+                f"device_timeout_ms must be at most {_MAX_DEVICE_TIMEOUT_MS} ms "
+                f"(about 24.8 days, the largest timeout MMCore accepts on "
+                f"Windows), got {value}"
             )
         return value
 
