@@ -934,6 +934,68 @@ def test_a_halt_or_a_stop_while_the_line_is_logged_keeps_the_command_away(
     assert "xy_stage: move XY: not sent" in caplog.messages
 
 
+def _landing_as_waiting_is_recorded(
+    monkeypatch: pytest.MonkeyPatch, executor: Executor, event: Callable[[], object]
+) -> None:
+    """Run ``event`` as the move records "waiting for", just before its command."""
+    set_waiting = executor._set_waiting
+
+    def landing(name: str | None) -> str | None:
+        if name is not None:  # the recording, not the clear
+            event()
+        return set_waiting(name)
+
+    monkeypatch.setattr(executor, "_set_waiting", landing)
+
+
+@pytest.mark.parametrize("what", ["halt", "stop"])
+def test_a_halt_or_a_stop_while_waiting_for_is_recorded_keeps_the_command_away(
+    what: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Adversarial review of #68 (FM-66): recording "waiting for" before the
+    # command put a step after the last check, so a halt landing there was
+    # missed and the command reached the stage.
+    executor, xy = _ex(), _Device(arrive_after=0)
+    event: Callable[[], object] = (
+        executor.halt if what == "halt" else lambda: executor.stop(xy.motion)
+    )
+    _landing_as_waiting_is_recorded(monkeypatch, executor, event)
+    expected = MicroscopeHaltedError if what == "halt" else MotionStoppedError
+    with (
+        caplog.at_level(logging.INFO, logger=LOGGER.name),
+        pytest.raises(expected),
+    ):
+        _move(executor, xy)
+    assert xy.commands == 0
+    assert xy.stops == (1 if what == "stop" else 0)  # only the caller's own stop
+    assert "xy_stage: move XY: not sent" in caplog.messages
+    assert executor.moving() == ()
+
+
+@pytest.mark.parametrize("stoppable", [True, False])
+def test_an_interrupt_before_the_command_stops_nothing(
+    stoppable: bool, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Adversarial review of #68: a Ctrl-C that landed before the command gave
+    # up on the motion, so it stopped a stage that had been told nothing, or
+    # logged that a turret "cannot be stopped from smc".
+    executor, turret = _ex(), _Device("Turret", stoppable=stoppable)
+
+    def ctrl_c() -> None:
+        raise KeyboardInterrupt
+
+    _landing_as_waiting_is_recorded(monkeypatch, executor, ctrl_c)
+    with (
+        caplog.at_level(logging.WARNING, logger=LOGGER.name),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        _move(executor, turret)
+    assert (turret.commands, turret.stops) == (0, 0)
+    assert "gave up" not in caplog.text
+    assert "stop after" not in caplog.text
+    assert executor.moving() == ()
+
+
 # --- waiting, and giving up ---------------------------------------------------
 
 

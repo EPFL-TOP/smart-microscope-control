@@ -502,15 +502,19 @@ class Executor:
                 self._logger.info("[dry-run] %s", prepared.log)
                 return prepared.dry_result
             self._logger.info("%s", prepared.log)
-            try:
+
+            def last_check() -> None:
                 # FM-66: the halt or a stop may have landed while the line
                 # above was written; the check that matters is the last one.
-                self._refuse_if_cancelled(key, generation, halt_mark, cancelled)
-            except HardwareError:
-                self._logger.warning("%s: not sent", prepared.log)
-                raise
+                try:
+                    self._refuse_if_cancelled(key, generation, halt_mark, cancelled)
+                except HardwareError:
+                    self._logger.warning("%s: not sent", prepared.log)
+                    raise
+
             if motion is not None:
-                return self._move(prepared, motion, generation, limit_s)
+                return self._move(prepared, motion, generation, limit_s, last_check)
+            last_check()
             if overridden_by is not None:
                 return self._send_overridable(
                     description, prepared, overridden_by, generation
@@ -558,7 +562,12 @@ class Executor:
             raise
 
     def _move(
-        self, step: Step[T], motion: Motion, generation: int, limit_s: float
+        self,
+        step: Step[T],
+        motion: Motion,
+        generation: int,
+        limit_s: float,
+        last_check: Callable[[], None],
     ) -> T:
         """The command, the wait and the readback of a motion, under the lock.
 
@@ -566,19 +575,23 @@ class Executor:
         between the command returning and the wait, so a Ctrl-C, a command
         that raises or an unreadable busy state anywhere before the device is
         seen idle gives up on the motion, which sends the stop. Once the device
-        is idle there is nothing left to stop.
+        is idle there is nothing left to stop, and before the command there is
+        nothing to stop either.
 
         The holder waits for the motion from just before the command, which
         can block for the traverse or run a callback, until the device reads
         idle. From then on the readback is an ordinary lock holder: a caller
         that saw the stage idle and acts next waits for the lock instead of
-        being refused (#68).
+        being refused (#68). ``last_check`` runs after "waiting for" is
+        recorded, so nothing lies between it and the command (FM-66).
         """
         deadline = time.monotonic() + limit_s
-        idle = gave_up = False
+        sending = idle = gave_up = False
         previous: str | None = None
         try:
             previous = self._set_waiting(motion.name)
+            last_check()
+            sending = True  # from here on the command may reach the device
             step.send()
             if (
                 self._generation(motion.device) != generation
@@ -612,7 +625,7 @@ class Executor:
                 raise MotionStoppedError(motion.name)
             return step.readback()
         except BaseException as exc:
-            if not (idle or gave_up):
+            if sending and not (idle or gave_up):
                 self._give_up(motion, type(exc).__name__)
             raise
         finally:
