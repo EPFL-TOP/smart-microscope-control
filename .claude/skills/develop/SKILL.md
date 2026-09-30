@@ -33,12 +33,12 @@ them if it is not the one you run on.
    ```sh
    git fetch origin main                    # SSH may fail in agent shells: see below
    git merge --ff-only origin/main          # start from the latest main
-   git branch -m feat/<N>-<slug>            # the project's branch naming
+   git branch -m <type>/<N>-<slug>          # <type>: feat, fix, docs, chore (CLAUDE.md)
    python scripts/dev/worktree.py setup     # this worktree's own .venv + editable install
    ```
 
    - If `EnterWorktree` fails, create the worktree yourself and enter it:
-     `git worktree add .claude/worktrees/issue-<N>-<slug> -b feat/<N>-<slug> origin/main`,
+     `git worktree add .claude/worktrees/issue-<N>-<slug> -b <type>/<N>-<slug> origin/main`,
      then `EnterWorktree` with `path` set to that directory (skip `git branch -m`).
    - If the fast-forward fails, the worktree was not created from `main`:
      leave it (`ExitWorktree`, `remove`) and use the fallback above.
@@ -92,7 +92,7 @@ them if it is not the one you run on.
 
 ## PR and report
 
-12. Push (`git push -u origin feat/<N>-<slug>`; the SSH workaround of step 5
+12. Push (`git push -u origin <type>/<N>-<slug>`; the SSH workaround of step 5
     if needed), open the PR with the template (`gh pr create --fill
     --body-file …`, `Closes #N`, conventional title), and watch CI:
     `gh pr checks --watch`. Fix failures; never disable a check.
@@ -125,7 +125,7 @@ When the latest `## Review` on the PR says **Verdict: changes requested**:
 1. Enter the issue's worktree: `EnterWorktree` with `path` set to
    `.claude/worktrees/issue-<N>-<slug>` (see `git worktree list`). If it is
    gone, recreate it from the PR's branch —
-   `git worktree add .claude/worktrees/issue-<N>-<slug> feat/<N>-<slug>` —
+   `git worktree add .claude/worktrees/issue-<N>-<slug> <type>/<N>-<slug>` —
    then `python scripts/dev/worktree.py setup`.
 2. Fix exactly the **Blocking** items, in order; optional items only if the
    review lists them as optional and they are small.

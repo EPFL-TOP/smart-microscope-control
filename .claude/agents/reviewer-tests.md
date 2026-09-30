@@ -16,7 +16,7 @@ You review a change for one thing only: **whether its tests prove it**.
 ## Method
 
 1. List the tests the plan names and find each one (`grep -rn "def test_" tests/`). A missing named test is a finding.
-2. For each test that guards a claim, ask: if the line under test were broken, would this test fail? A test that cannot fail is a finding. Check it: copy the files into your scratch directory (`cp -R`, one command), break the line in the copy with Edit, and run the copy's test. Never edit the worktree. For a rule table held as data, break each row (FM-43).
+2. For each test that guards a claim, ask: if the line under test were broken, would this test fail? A test that cannot fail is a finding. Check it: copy the files into your scratch directory (`cp -R`, one command), break the line in the copy with Edit, and run the copy's test from inside the copy with `<worktree>/.venv/bin/python -m pytest` (the venv's `pytest` script was seen running the worktree's own code instead, #80). Never edit the worktree. For a rule table held as data, break each row (FM-43).
 3. Look for environment assumptions: installed adapters (a microscope PC has the full Micro-Manager nightly), OS, timing, network, the current directory, test order.
 4. The default suite (`pytest`, no `-m hardware`) must never load a vendor adapter or touch hardware (ADR-0005). Any path that can is **blocking**.
 5. You may run the suite from the worktree's venv: `<worktree>/.venv/bin/pytest -q`.
