@@ -284,6 +284,10 @@ class Executor:
         #: never cancels another caller's action.
         self._generations: dict[str, int] = {}
         self._halted = False
+        #: How many halts there have been. An action records it when it is
+        #: called, as it records the stop generation, so a halt that lands
+        #: while it waits for the lock refuses it even after ``resume()``.
+        self._halt_epoch = 0
         self._holder: _Holder | None = None
 
     @property
@@ -418,7 +422,9 @@ class Executor:
                 the one that wins.
 
         Raises:
-            MicroscopeHaltedError: The microscope is halted.
+            MicroscopeHaltedError: The microscope is halted, or was halted
+                since this action was called, even if ``resume()`` came
+                since: it starts nothing.
             MotionInProgressError: A device is still moving, or the lock holder
                 is waiting for one (this thread's own action, for a callback
                 that runs inside its command).
@@ -451,18 +457,19 @@ class Executor:
             )
         else:
             key, cancelled = None, HardwareError(description)  # never raised
-        # Recorded before waiting for the lock: a stop (or a close) pressed
-        # while this call waits for it cancels the call.
+        # Recorded before waiting for the lock: a stop (or a close) or a halt
+        # pressed while this call waits for it cancels the call.
         generation = self._generation(key)
+        halt_mark = self._halt_mark()
 
         def body() -> T:
-            self._refuse_if_halted()
+            self._refuse_if_halted(halt_mark)
             self._guard()
             prepared = step() if callable(step) else step
             limit_s = 0.0
             if motion is not None and not self._dry_run:
                 limit_s = _resolve_timeout(limit)
-            self._refuse_if_cancelled(key, generation, cancelled)
+            self._refuse_if_cancelled(key, generation, halt_mark, cancelled)
             if self._dry_run:
                 self._logger.info("[dry-run] %s", prepared.log)
                 return prepared.dry_result
@@ -470,7 +477,7 @@ class Executor:
             try:
                 # FM-66: the halt or a stop may have landed while the line
                 # above was written; the check that matters is the last one.
-                self._refuse_if_cancelled(key, generation, cancelled)
+                self._refuse_if_cancelled(key, generation, halt_mark, cancelled)
             except HardwareError:
                 self._logger.warning("%s: not sent", prepared.log)
                 raise
@@ -582,17 +589,19 @@ class Executor:
         it is refused while halted or while anything moves, in dry-run too.
 
         Raises:
-            MicroscopeHaltedError: The microscope is halted.
+            MicroscopeHaltedError: The microscope is halted, or was halted
+                since this call, even if ``resume()`` came since.
             MotionInProgressError: A device is still moving, or the lock holder
                 is waiting for one (this thread's own action, for a callback
                 that runs inside its command).
             MicroscopeBusyError: The lock was not free within ``lock_timeout_s``.
         """
+        halt_mark = self._halt_mark()
 
         def body() -> T:
-            self._refuse_if_halted()
+            self._refuse_if_halted(halt_mark)
             self._guard()
-            self._refuse_if_halted()
+            self._refuse_if_halted(halt_mark)
             return action()
 
         return self._section(description, body)
@@ -707,9 +716,14 @@ class Executor:
         return readback()
 
     def halt(self) -> None:
-        """Refuse every action until ``resume()``; reads and the safe calls still run."""
+        """Refuse every action until ``resume()``; reads and the safe calls still run.
+
+        An action already called, waiting for the lock, is refused too, even
+        once resumed.
+        """
         with self._registry_lock:
             self._halted = True
+            self._halt_epoch += 1
         self._logger.warning("microscope: halted")
 
     def resume(self) -> None:
@@ -718,7 +732,9 @@ class Executor:
         It is the operator's way out after checking the stand (design §13): a
         ``State`` device that cannot be stopped, a stage that keeps answering
         busy, or one whose busy state cannot be read would otherwise refuse
-        every action for good.
+        every action for good. An action called before it, while halted or
+        before the halt, and still waiting for the lock, is refused: only a
+        call made after ``resume()`` runs (#68).
         """
         with self._registry_lock:
             self._halted = False
@@ -740,16 +756,31 @@ class Executor:
         with self._registry_lock:
             return self._generations.get(device, 0)
 
-    def _refuse_if_halted(self) -> None:
-        if self._halted:
+    def _halt_mark(self) -> int | None:
+        """What an action records of the halt when it is called; ``None`` if halted then."""
+        with self._registry_lock:
+            return None if self._halted else self._halt_epoch
+
+    def _halted_since(self, mark: int | None) -> bool:
+        """Whether the stand is halted, or was halted after ``mark`` was taken. Registry lock held."""
+        return self._halted or mark is None or self._halt_epoch != mark
+
+    def _refuse_if_halted(self, mark: int | None) -> None:
+        with self._registry_lock:
+            halted = self._halted_since(mark)
+        if halted:
             raise MicroscopeHaltedError()
 
     def _refuse_if_cancelled(
-        self, device: str | None, generation: int, cancelled: HardwareError
+        self,
+        device: str | None,
+        generation: int,
+        halt_mark: int | None,
+        cancelled: HardwareError,
     ) -> None:
-        """The checks before a command: the halt, then a stop or close called since."""
+        """The checks before a command: a halt, then a stop or close, since the call."""
         with self._registry_lock:
-            halted = self._halted
+            halted = self._halted_since(halt_mark)
             moved = (
                 device is not None and self._generations.get(device, 0) != generation
             )

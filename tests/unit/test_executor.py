@@ -1558,6 +1558,39 @@ def test_halt_refuses_every_action_until_resume(dry_run: bool) -> None:
     assert executor.acquire("camera: snap", lambda: "frame") == "frame"
 
 
+@pytest.mark.parametrize("when", ["called while halted", "halted while queued"])
+@pytest.mark.parametrize("kind", ["open", "move", "snap"])
+def test_action_queued_while_halted_does_not_run_after_resume(
+    kind: str, when: str
+) -> None:
+    # #68, finding 3: an action waiting for the lock ran as soon as the
+    # operator resumed, although it was called while halted, or was waiting
+    # when the halt landed. resume() starts nothing.
+    executor, xy, shutter = _ex(), _Device(arrive_after=0), _Shutter()
+    actions: dict[str, Callable[[], object]] = {
+        "open": lambda: _open(executor, shutter),
+        "move": lambda: _move(executor, xy),
+        "snap": lambda: executor.acquire("camera: snap", _never),
+    }
+    holder, release = _hold_the_lock(executor)
+    try:
+        if when == "called while halted":
+            executor.halt()
+        queued = _Thread(actions[kind])
+        assert not queued.finished_within(0.2)  # queued behind the snap
+        if when == "halted while queued":
+            executor.halt()
+        executor.resume()
+    finally:
+        release.set()
+        holder.join()
+    queued.join()
+    assert isinstance(queued.error, MicroscopeHaltedError)
+    assert (shutter.sent, xy.commands) == ([], 0)
+    assert _move(executor, xy) == "arrived"  # a call made after resume() runs
+    assert xy.commands == 1
+
+
 def test_halted_is_not_a_safety_refusal() -> None:
     # #59 finding 14: `except SafetyRefusedError: skip the target` swallowed
     # the emergency stop.
