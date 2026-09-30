@@ -35,7 +35,8 @@ jobs:
         include:
           - { os: ubuntu-latest, python: "3.10" }
           - { os: ubuntu-latest, python: "3.13" }
-          - { os: windows-latest, python: "3.11" } # the microscope PCs run 3.11
+          - { os: windows-latest, python: "3.11" } # the oldest Python seen on a lab Windows PC
+          - { os: windows-latest, python: "3.14" } # what the microscope PCs run (surveys, 2026-09)
           - { os: macos-latest, python: "3.13" }
     env:
       # The demo devices are the regression bed: a missing install must fail,
