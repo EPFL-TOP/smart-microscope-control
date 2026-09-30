@@ -506,6 +506,43 @@ def test_stop_continues_past_a_failing_stage_and_reports_it(
     assert not_named not in message
 
 
+@pytest.mark.parametrize(
+    ("failure", "raised", "message"),
+    [
+        (
+            RuntimeError("XY controller missing"),
+            HardwareError,
+            "failed for XYStage 'XY' (RuntimeError('XY controller missing'))",
+        ),
+        (KeyboardInterrupt(), KeyboardInterrupt, ""),  # a second Ctrl-C
+    ],
+    ids=["error", "interrupt"],
+)
+def test_stop_continues_past_a_stage_that_cannot_be_built(
+    demo_core: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+    raised: type[BaseException],
+    message: str,
+) -> None:
+    # Adversarial review of #8's fix round: the stop builds a stage nobody
+    # asked for yet, and a failure there skipped the stages after it.
+    spy = _Spy(demo_core)
+    m = Microscope.from_core(spy, Profile.demo())
+
+    def unbuildable(*args: Any) -> Any:
+        raise failure
+
+    monkeypatch.setattr(microscope_mod, "MMXYStage", unbuildable)
+    try:
+        with pytest.raises(raised) as info:
+            m.stop()
+    finally:
+        m.close()
+    assert spy.calls[0] == "stop Z"
+    assert message in str(info.value)
+
+
 def test_stop_during_a_move_ends_it(demo_core: Any) -> None:
     spy = _Spy(demo_core)
     spy.busy.add("XY")  # moving until stopped
@@ -569,9 +606,9 @@ def test_stop_from_inside_a_capability_lookup_stops_and_returns(
     # A thread with a join timeout, so a deadlock fails instead of hanging (FM-44).
     looker = threading.Thread(target=lookup, daemon=True)
     looker.start()
-    looker.join(timeout=JOIN_S)
-    assert not looker.is_alive(), "stop() deadlocked inside a capability lookup"
     try:
+        looker.join(timeout=JOIN_S)
+        assert not looker.is_alive(), "stop() deadlocked inside a capability lookup"
         assert errors == []
         assert spy.calls == ["stop XY", "stop Z"]
         assert m.state().halted

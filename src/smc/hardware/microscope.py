@@ -505,15 +505,16 @@ class Microscope:
         """Stop each stage the stand has, past any failure; return one note per failure.
 
         An interrupt (a second Ctrl-C) during one stop does not skip the
-        next: it is re-raised once every stage has had its stop.
+        next: it is re-raised once every stage has had its stop. The lookup
+        is inside the same guard, since it builds a stage nobody used yet.
         """
         failures: list[str] = []
         interrupted: BaseException | None = None
         for capability, role in _STAGES:
-            stage = cast("XYStage | ZStage | None", self._lookup(capability))
-            if stage is None:
-                continue
             try:
+                stage = cast("XYStage | ZStage | None", self._lookup(capability))
+                if stage is None:
+                    continue
                 stage.stop()
             except Exception as exc:
                 label = self.roles.get(role)
