@@ -10,6 +10,11 @@ develop session has already attacked its own change (`/adversarial-review`).
 You judge the result against the plan and the rules; you do not re-review
 every line.
 
+Run it in a **fresh session**, launched from the latest Point list (Opus for
+risk `moves-hardware` or design-heavy work, Sonnet otherwise). Start from
+`CLAUDE.md` and the issue or PR, not from a previous session's memory; post
+a verdict, do what it unlocks (labels, dependents), and end the session.
+
 ## Steps
 
 1. Read: `gh pr view N` (body), `gh pr checks N`, the issue's `## Plan` and

@@ -5,8 +5,11 @@ description: Supervising-session skill — take stock of the project (open PRs a
 
 # /point
 
-You are the **supervising (design) session**. This skill keeps you cheap: a
-script collects the facts, you add judgement. Read its output, not GitHub.
+You are the **supervising (design) session** that opens a cycle. This skill
+keeps you cheap and short: a script collects the facts, you add judgement,
+and you **hand the design work to fresh sessions** by listing it, just as
+you hand implementation to `/develop`. Read the script's output, not GitHub.
+The session ends when the list is posted.
 
 1. **Facts.** Run `python scripts/dev/point.py` and read only its Markdown:
    open PRs with checks and the latest design verdict, issues by status,
@@ -25,12 +28,16 @@ script collects the facts, you add judgement. Read its output, not GitHub.
    name, if they do not exist yet. Run `python scripts/dev/worktree.py
    clean` from the main checkout; one line in the output on what it
    removed.
-4. **Plans.** Any issue that belongs in the next wave and has no plan gets
-   one (`/plan`). Plans carry a **Risk**, the **Failure modes to handle** and
-   a **Suggested model**.
+4. **Plans.** Any issue that belongs in the next wave and has no plan goes on
+   the list as `/plan <issue>`, for a fresh session: Opus for risk
+   `moves-hardware` or design-heavy work, Sonnet otherwise. Write a plan here
+   only when it is short and needs no design decision.
 5. **Next wave.** Up to three `status: ready` issues that touch disjoint
-   files, in milestone and priority order. For each: the command and the
-   suggested model. PRs awaiting a review → run `/review` on them now.
+   files, in milestone and priority order, each with its command and
+   suggested model. Each PR awaiting a review goes on the list as
+   `/review <pr>`, for a fresh session: Opus when its risk is
+   `moves-hardware` (it runs `/code-review`), Sonnet otherwise. Review a PR
+   here only when its risk is `docs`.
 6. **Process.** Look at the reports' deviations and friction and at the
    review outcomes since the last point. When the same problem shows up
    twice, or a confirmed finding reveals a category missing from the
@@ -43,6 +50,8 @@ script collects the facts, you add judgement. Read its output, not GitHub.
 
    ```markdown
    **To launch** — `/develop 6` (Sonnet), `/develop 5` (Sonnet)
+   **To review** — `/review 52` (Opus, moves-hardware), `/review 53` (Sonnet)
+   **To plan** — `/plan 9` (Sonnet), `/plan 10` (Sonnet)
    **To merge** — #47, ready to merge
    **For you** — decide ADR-0007; survey the Ti2 PC
    **Waiting** — #8, on #5 and #6
@@ -55,3 +64,4 @@ script collects the facts, you add judgement. Read its output, not GitHub.
 
 - Read full diffs or crawl every issue yourself; that is what the script and subagents are for.
 - Launch develop sessions yourself, or merge.
+- Run several reviews or plans in this session: list them for fresh sessions instead.
