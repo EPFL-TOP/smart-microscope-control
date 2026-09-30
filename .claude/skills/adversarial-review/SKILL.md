@@ -10,7 +10,11 @@ Cheap by construction: the reviewers run on Sonnet and the verifier on Haiku
 precise task and to judge what comes back. Do not re-review the code
 yourself.
 
-1. **Inputs.** `base` = `origin/main`, `head` = `HEAD` of this worktree.
+1. **Inputs.** `base` = `origin/main` (run `git fetch origin main` first),
+   `head` = `HEAD` of this worktree. The change is always
+   `git diff <base>...<head>`, with **three dots**: that diff starts from the
+   merge base. Two dots would show commits `main` gained after the branch
+   point as this change's own changes, reversed (#68).
    Pick one scratch directory outside the repository: your session's
    scratchpad if the system prompt names one, otherwise run `mktemp -d` as a
    command on its own and note the path it prints. Save the issue's latest
