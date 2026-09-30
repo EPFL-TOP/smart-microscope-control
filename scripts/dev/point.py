@@ -56,6 +56,17 @@ def latest(comments: list[dict[str, Any]], prefix: str) -> dict[str, Any] | None
     return max(hits, key=lambda c: str(c.get("createdAt", "")), default=None)
 
 
+def dependencies(issue: dict[str, Any]) -> list[int]:
+    """What a blocked issue waits on: its plan's ``**Depends on**`` line, else its body's.
+
+    An issue blocked on a decision or a later milestone has no plan yet; the
+    line in its body is what lets the point notice when that wait is over.
+    """
+    plan = latest(issue.get("comments", []), "## Plan")
+    text = plan["body"] if plan else issue.get("body")
+    return depends_on(str(text or ""))
+
+
 def verdict(texts: list[dict[str, Any]]) -> str:
     """The design session's latest verdict on a PR, from its reviews and comments."""
     review = latest(texts, "## Review (")
@@ -169,7 +180,7 @@ def main() -> int:
         "--limit",
         "300",
         "--json",
-        "number,title,labels,milestone,comments,updatedAt",
+        "number,title,labels,milestone,comments,updatedAt,body",
     )
     tracking = next((i for i in issues if i["title"] == TRACKING_TITLE), None)
     since = (
@@ -238,8 +249,7 @@ def main() -> int:
 
     out.append("## Blocked issues and their dependencies")
     for issue in (i for i in work if status_of(i) == "blocked"):
-        plan = latest(issue.get("comments", []), "## Plan")
-        deps = depends_on(str(plan["body"])) if plan else []
+        deps = dependencies(issue)
         states = {n: ref_state(repo, n) for n in deps}
         ready = bool(deps) and all(s in {"merged", "closed"} for s in states.values())
         listed = (
