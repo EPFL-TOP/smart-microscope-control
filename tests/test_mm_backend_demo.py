@@ -10,6 +10,7 @@ import logging
 import math
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -31,7 +32,14 @@ from smc.hardware.capabilities import (
     XYStage,
     ZStage,
 )
-from smc.hardware.errors import DeviceTimeoutError, HardwareError, SafetyRefusedError
+from smc.hardware.errors import (
+    DeviceTimeoutError,
+    HardwareError,
+    MicroscopeHaltedError,
+    MotionInProgressError,
+    MotionStoppedError,
+    SafetyRefusedError,
+)
 from smc.hardware.safety import Executor, Safety
 
 LOGGER = logging.getLogger("smc.hardware.test")
@@ -277,10 +285,27 @@ class _AlwaysBusyCore:
     def __init__(self, timeout_ms: float = 30.0) -> None:
         self.timeout_ms = timeout_ms
         self.polls = 0
+        self.stops: list[str] = []
 
     def deviceBusy(self, label: str) -> bool:  # noqa: N802 - MMCore's name
         self.polls += 1
+        if self.polls > 1000:
+            # About 10 s of polling: a wait that never expires fails the test
+            # instead of hanging the suite (FM-44).
+            raise AssertionError("wait() kept polling past any sane deadline")
         return True
+
+    def stop(self, label: str) -> None:
+        self.stops.append(label)
+
+    def setXYPosition(self, label: str, x: float, y: float) -> None:  # noqa: N802
+        pass
+
+    def getXPosition(self, label: str) -> float:  # noqa: N802
+        return 0.0
+
+    def getYPosition(self, label: str) -> float:  # noqa: N802
+        return 0.0
 
     def getTimeoutMs(self) -> float:  # noqa: N802 - MMCore's name
         return self.timeout_ms
@@ -377,7 +402,24 @@ def test_wait_times_out_cleanly() -> None:
         stage.wait(0.05)
     assert 0.05 <= time.monotonic() - started < 2.0
     assert core.polls > 1
+    # §13: wait() is a read; it never stops anything.
+    assert core.stops == []
     assert stage.is_busy()
+
+
+def test_a_move_that_times_out_stops_the_stage_and_a_wait_never_does() -> None:
+    core = _AlwaysBusyCore(timeout_ms=30.0)
+    executor = _executor()
+    stage = MMXYStage(core, "XY", executor, Safety(max_jog_um=1.0))  # type: ignore[arg-type]
+    with pytest.raises(DeviceTimeoutError, match="the stop was sent"):
+        stage.move_to_um(1.0, 2.0)
+    # §13: the action that gives up stops the stage before it raises (FM-17);
+    # the stage still reads busy, so the motion outlived its action.
+    assert core.stops == ["XY"]
+    assert executor.moving() == ("xy_stage XY",)
+    with pytest.raises(DeviceTimeoutError, match="stops nothing"):
+        stage.wait(0.05)
+    assert core.stops == ["XY"]
 
 
 def test_wait_defaults_to_the_core_timeout() -> None:
@@ -404,3 +446,432 @@ def test_mm_classes_satisfy_the_protocols() -> None:
     assert isinstance(MMProperties(core, _executor()), Properties)
     # The check can fail: a stage is not a camera.
     assert not isinstance(MMXYStage(core, "XY", _executor(), safety), Camera)
+
+
+# --- Motion, stop and the lock (design §13, #54) -----------------------------
+
+JOIN_S = 5.0
+
+
+@pytest.mark.demo
+class TestMotionOnDemoDevices:
+    def test_move_with_wait_leaves_nothing_moving(self, demo_core: Any) -> None:
+        executor = _executor()
+        safety = Safety(max_jog_um=1000.0)
+        xy = MMXYStage(demo_core, demo_core.getXYStageDevice(), executor, safety)
+        z = MMZStage(demo_core, demo_core.getFocusDevice(), executor, safety)
+        xy.move_to_um(10.0, 20.0)
+        z.move_by_um(1.5)
+        assert executor.moving() == ()
+
+    def test_stop_reaches_the_demo_stages(
+        self, demo_core: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        executor = _executor()
+        safety = Safety(max_jog_um=1000.0)
+        xy = MMXYStage(demo_core, demo_core.getXYStageDevice(), executor, safety)
+        z = MMZStage(demo_core, demo_core.getFocusDevice(), executor, safety)
+        with caplog.at_level(logging.WARNING, logger=LOGGER.name):
+            xy.stop()
+            z.stop()
+        assert f"xy_stage {demo_core.getXYStageDevice()}: stop" in caplog.messages
+        assert f"z {demo_core.getFocusDevice()}: stop" in caplog.messages
+        # A stop before a move is called does not cancel it.
+        landed = xy.move_to_um(50.0, 50.0)
+        assert landed.x_um == pytest.approx(50.0, abs=0.5)
+        xy.wait()
+        assert executor.moving() == ()
+
+    def test_properties_set_on_a_state_device_waits_and_reads_back(
+        self, demo_core: Any
+    ) -> None:
+        executor = _executor()
+        props = MMProperties(demo_core, executor)
+        assert props.set("Objective", "State", 2) == "2"
+        assert props.get("Objective", "State") == "2"
+        assert executor.moving() == ()
+
+
+class _MovingCore:
+    """A stage that stays busy until the test releases it, and a camera.
+
+    The demo stages report idle at once, so no guard test can rely on them
+    being busy (#54 plan).
+    """
+
+    def __init__(self) -> None:
+        self.xy = (0.0, 0.0)
+        self.z = 0.0
+        self.turret = "0"
+        self.shutter_open = False
+        self.moving = False
+        self.release = threading.Event()
+        self.polled = threading.Event()
+        self.stops: list[str] = []
+        self.commands: list[str] = []
+        self.snaps = 0
+        self.stop_clears = True  # False: a stage that ignores its stop
+        self.timeout_ms = 30_000.0
+
+    def _start(self, what: str) -> None:
+        self.commands.append(what)
+        self.moving = True
+
+    def setXYPosition(self, label: str, x: float, y: float) -> None:  # noqa: N802
+        self.xy = (x, y)
+        self._start(f"xy {x} {y}")
+
+    def getXPosition(self, label: str) -> float:  # noqa: N802
+        return self.xy[0]
+
+    def getYPosition(self, label: str) -> float:  # noqa: N802
+        return self.xy[1]
+
+    def setPosition(self, label: str, z: float) -> None:  # noqa: N802
+        self.z = z
+        self._start(f"z {z}")
+
+    def getPosition(self, label: str) -> float:  # noqa: N802
+        return self.z
+
+    def isPropertyReadOnly(self, device: str, name: str) -> bool:  # noqa: N802
+        return False
+
+    def getDeviceType(self, device: str) -> int:  # noqa: N802
+        from pymmcore_plus import DeviceType
+
+        return int(DeviceType.State if device == "Turret" else DeviceType.XYStage)
+
+    def setProperty(self, device: str, name: str, value: object) -> None:  # noqa: N802
+        if device == "Turret":
+            self.turret = str(value)
+            self._start(f"turret {value}")
+        else:
+            self.commands.append(f"{device}.{name}={value}")
+
+    def getProperty(self, device: str, name: str) -> str:  # noqa: N802
+        return self.turret if device == "Turret" else "1"
+
+    def setShutterOpen(self, label: str, open_: bool) -> None:  # noqa: N802
+        self.shutter_open = open_
+
+    def getShutterOpen(self, label: str) -> bool:  # noqa: N802
+        return self.shutter_open
+
+    def deviceBusy(self, label: str) -> bool:  # noqa: N802
+        self.polled.set()
+        if self.moving and self.release.is_set():
+            self.moving = False
+        return self.moving
+
+    def stop(self, label: str) -> None:
+        self.stops.append(label)
+        if self.stop_clears:
+            self.moving = False
+
+    def getTimeoutMs(self) -> float:  # noqa: N802
+        return self.timeout_ms
+
+    def getCameraDevice(self) -> str:  # noqa: N802
+        return "Cam"
+
+    def snapImage(self) -> None:  # noqa: N802
+        self.snaps += 1
+
+    def getImage(self) -> np.ndarray:  # noqa: N802
+        return np.zeros((4, 4), dtype=np.uint16)
+
+
+def _moving_stand(
+    core: _MovingCore, executor: Executor
+) -> tuple[MMXYStage, MMZStage, MMProperties, MMShutter, MMCamera]:
+    safety = Safety(max_jog_um=100.0)
+    return (
+        MMXYStage(core, "XY", executor, safety),  # type: ignore[arg-type]
+        MMZStage(core, "Z", executor, safety),  # type: ignore[arg-type]
+        MMProperties(core, executor),  # type: ignore[arg-type]
+        MMShutter(core, "Shutter", executor),  # type: ignore[arg-type]
+        MMCamera(core, "Cam", executor, {}, lambda: None),  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.parametrize("kind", ["xy", "z", "turret"])
+def test_while_an_action_waits_reads_and_closing_get_through_and_actions_are_refused(
+    kind: str,
+) -> None:
+    # §13: the action holds the lock through its wait and readback. A long
+    # lock timeout proves the refusal is immediate, not a lock timeout.
+    core = _MovingCore()
+    executor = Executor(
+        dry_run=False, lock=threading.RLock(), logger=LOGGER, lock_timeout_s=60.0
+    )
+    xy, z, props, shutter, camera = _moving_stand(core, executor)
+    act: dict[str, Callable[[], object]] = {
+        "xy": lambda: xy.move_by_um(5.0, 0.0),
+        "z": lambda: z.move_by_um(2.0),
+        "turret": lambda: props.set("Turret", "State", 2),
+    }
+    result: list[object] = []
+    mover = threading.Thread(target=lambda: result.append(act[kind]()))
+    mover.start()
+    try:
+        assert core.polled.wait(JOIN_S)
+        started = time.monotonic()
+        with pytest.raises(MotionInProgressError):
+            camera.snap()
+        with pytest.raises(MotionInProgressError):
+            shutter.set_open(True)
+        with pytest.raises(MotionInProgressError):
+            xy.move_by_um(1.0, 0.0)  # its anchor would be a mid-move position
+        refused_in_s = time.monotonic() - started
+        assert xy.position_um() == XY(*core.xy)  # a read gets through
+        assert shutter.set_open(False) is False  # so does closing the shutter
+        assert mover.is_alive()  # ... while the action still waits
+    finally:
+        core.release.set()
+        mover.join(timeout=JOIN_S)
+    assert not mover.is_alive()
+    assert refused_in_s < JOIN_S
+    assert core.snaps == 0
+    assert len(core.commands) == 1  # only the waiting action's command
+    assert result == [{"xy": XY(5.0, 0.0), "z": 2.0, "turret": "2"}[kind]]
+    assert executor.moving() == ()
+
+
+def test_a_relative_move_reads_its_anchor_inside_its_action() -> None:
+    # #59 finding 10: move_by read the anchor before the guard, so after
+    # another caller's move it computed its target from a stale position.
+    core = _MovingCore()
+    core.release.set()  # moves end at the first poll
+    executor = _executor()
+    xy = MMXYStage(core, "XY", executor, Safety(max_jog_um=100.0))  # type: ignore[arg-type]
+    entered, release = threading.Event(), threading.Event()
+
+    def hung_snap() -> None:
+        entered.set()
+        release.wait(JOIN_S)
+
+    holder = threading.Thread(
+        target=lambda: executor.acquire("camera: snap", hung_snap)
+    )
+    holder.start()
+    assert entered.wait(JOIN_S)
+    result: list[XY] = []
+    mover = threading.Thread(target=lambda: result.append(xy.move_by_um(5.0, 0.0)))
+    mover.start()
+    mover.join(timeout=0.2)  # queued behind the snap
+    core.xy = (100.0, 0.0)  # the stage moved meanwhile
+    release.set()
+    holder.join(timeout=JOIN_S)
+    mover.join(timeout=JOIN_S)
+    assert not holder.is_alive()
+    assert not mover.is_alive()
+    assert result == [XY(105.0, 0.0)]
+
+
+def test_a_device_type_pymmcore_plus_does_not_know_is_not_a_motion() -> None:
+    core = _MovingCore()
+    core.moving = True
+    core.getDeviceType = lambda device: 9999  # type: ignore[method-assign]
+    executor = _executor()
+    props = MMProperties(core, executor)  # type: ignore[arg-type]
+    assert props.set("Gadget", "Mode", 1) == "1"
+    assert core.commands == ["Gadget.Mode=1"]
+    assert executor.moving() == ()
+
+
+def test_a_stage_property_is_not_a_motion() -> None:
+    # #59 finding 6: Properties.set('XY', 'Speed', …) became a motion that
+    # blocked, then stopped, the operator's joystick move.
+    core = _MovingCore()
+    core.moving = True  # the joystick is moving the stage
+    executor = _executor()
+    props = MMProperties(core, executor)  # type: ignore[arg-type]
+    assert props.set("XY", "Speed", 3) == "1"
+    assert core.commands == ["XY.Speed=3"]
+    assert core.stops == []
+    assert executor.moving() == ()
+
+
+def _outlived_move(core: _MovingCore, stage: MMXYStage) -> None:
+    """A move whose action gave up while the stage, deaf to its stop, kept moving."""
+    core.timeout_ms, core.stop_clears = 30.0, False
+    with pytest.raises(DeviceTimeoutError, match="the stop was sent"):
+        stage.move_to_um(10.0, 0.0)
+    core.timeout_ms, core.stop_clears = 30_000.0, True
+    assert core.moving
+
+
+def test_closing_the_shutter_is_never_refused_and_opening_is() -> None:
+    core = _MovingCore()
+    executor = _executor()
+    xy, _, _, shutter, _ = _moving_stand(core, executor)
+    _outlived_move(core, xy)
+    core.shutter_open = True
+    assert shutter.set_open(False) is False
+    with pytest.raises(MotionInProgressError):
+        shutter.set_open(True)
+    executor.halt()
+    core.shutter_open = True
+    assert shutter.set_open(False) is False
+    with pytest.raises(MicroscopeHaltedError):
+        shutter.set_open(True)
+    assert core.shutter_open is False
+
+
+class _RacingShutterCore(_MovingCore):
+    """A shutter whose open is overtaken by a close from another caller."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.race: Callable[[], object] | None = None
+        self.shutter_commands: list[bool] = []
+
+    def setShutterOpen(self, label: str, open_: bool) -> None:  # noqa: N802
+        if open_ and self.race is not None:
+            race, self.race = self.race, None
+            race()  # the close reaches the device first ...
+        self.shutter_commands.append(open_)
+        super().setShutterOpen(label, open_)  # ... then the open lands
+
+
+@pytest.mark.parametrize("halted", [False, True])
+def test_close_during_open_is_resent_and_the_open_raises(halted: bool) -> None:
+    # #59 second review, finding 12: an open past its halt check could land
+    # after an emergency close, and the shutter ended open.
+    core = _RacingShutterCore()
+    executor = _executor()
+    shutter = MMShutter(core, "Shutter", executor)  # type: ignore[arg-type]
+
+    def emergency_close() -> None:
+        if halted:
+            executor.halt()
+        assert shutter.set_open(False) is False
+
+    core.race = emergency_close
+    with pytest.raises(MicroscopeHaltedError if halted else HardwareError) as info:
+        shutter.set_open(True)
+    assert core.shutter_commands == [False, True, False]
+    assert core.shutter_open is False
+    assert shutter.is_open() is False
+    if not halted:
+        assert "`shutter: close` was requested while it was being sent" in str(
+            info.value
+        )
+
+
+def test_snap_after_a_move_that_outlived_its_action_is_refused_until_it_settles() -> (
+    None
+):
+    core = _MovingCore()
+    executor = _executor()
+    stage = MMXYStage(core, "XY", executor, Safety(max_jog_um=100.0))  # type: ignore[arg-type]
+    camera = MMCamera(core, "Cam", executor, {}, lambda: None)  # type: ignore[arg-type]
+    _outlived_move(core, stage)
+    with pytest.raises(MotionInProgressError, match="xy_stage XY"):
+        camera.snap()
+    assert core.snaps == 0
+    core.release.set()
+    stage.wait()  # a read: it sees the stage idle and drops the registration
+    assert executor.moving() == ()
+    assert camera.snap().shape == (4, 4)
+    assert core.snaps == 1
+
+
+def test_state_device_stuck_busy_is_released_by_resume(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # #59 second review, finding 4: a State device still busy after a
+    # Properties.set timeout stayed registered for good, and neither stop()
+    # nor resume() released it.
+    core = _TurretCore(busy_polls=10**9)
+    core.getTimeoutMs = lambda: 50.0  # type: ignore[method-assign]
+    executor = _executor()
+    props = MMProperties(core, executor)  # type: ignore[arg-type]
+    with pytest.raises(DeviceTimeoutError, match="cannot be stopped from smc"):
+        props.set("Turret", "State", 2)
+    assert executor.moving() == ("Turret",)
+    with pytest.raises(MotionInProgressError, match="resume"):
+        props.set("Turret", "State", 1)
+    with caplog.at_level(logging.WARNING, logger=LOGGER.name):
+        executor.resume()
+    assert "Turret: no longer tracked as moving (resume)" in caplog.text
+    assert executor.moving() == ()
+    core.busy_polls = core.busy_left = 0  # the operator checked: it has settled
+    assert props.set("Turret", "State", 1) == "1"
+
+
+def test_stop_during_a_move_ends_the_waiting_move() -> None:
+    core = _MovingCore()
+    executor = _executor()
+    stage = MMXYStage(core, "XY", executor, Safety(max_jog_um=100.0))  # type: ignore[arg-type]
+    errors: list[BaseException] = []
+
+    def move() -> None:
+        try:
+            stage.move_to_um(10.0, 0.0)
+        except BaseException as exc:
+            errors.append(exc)
+
+    mover = threading.Thread(target=move)
+    mover.start()
+    assert core.polled.wait(JOIN_S)
+    stage.stop()
+    mover.join(timeout=JOIN_S)
+    assert not mover.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], MotionStoppedError)
+    assert core.stops == ["XY"]
+
+
+class _TurretCore:
+    """A ``State`` device that reports busy for a few polls after each set."""
+
+    def __init__(self, busy_polls: int = 3) -> None:
+        self.value = "0"
+        self.busy_polls = busy_polls
+        self.busy_left = 0
+        self.polls = 0
+
+    def isPropertyReadOnly(self, device: str, name: str) -> bool:  # noqa: N802
+        return False
+
+    def getDeviceType(self, device: str) -> int:  # noqa: N802
+        from pymmcore_plus import DeviceType
+
+        return int(DeviceType.State)
+
+    def setProperty(self, device: str, name: str, value: object) -> None:  # noqa: N802
+        self.value = str(value)
+        self.busy_left = self.busy_polls
+
+    def getProperty(self, device: str, name: str) -> str:  # noqa: N802
+        return self.value
+
+    def deviceBusy(self, device: str) -> bool:  # noqa: N802
+        self.polls += 1
+        if self.busy_left > 0:
+            self.busy_left -= 1
+            return True
+        return False
+
+    def getTimeoutMs(self) -> float:  # noqa: N802
+        return 30_000.0
+
+
+def test_properties_set_on_a_state_device_waits_until_idle() -> None:
+    core = _TurretCore(busy_polls=3)
+    executor = _executor()
+    props = MMProperties(core, executor)  # type: ignore[arg-type]
+    assert props.set("Turret", "State", 2) == "2"
+    assert core.busy_left == 0  # it waited for the device, not just the command
+    assert core.polls >= 4
+    assert executor.moving() == ()
+
+
+def test_properties_set_times_out_without_a_stop_on_a_state_device() -> None:
+    core = _TurretCore(busy_polls=10**9)
+    core.getTimeoutMs = lambda: 50.0  # type: ignore[method-assign]
+    props = MMProperties(core, _executor())  # type: ignore[arg-type]
+    with pytest.raises(DeviceTimeoutError, match="cannot be stopped from smc"):
+        props.set("Turret", "State", 2)
