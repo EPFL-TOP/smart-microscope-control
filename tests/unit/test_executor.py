@@ -667,6 +667,101 @@ def test_unknown_holder_time_is_labelled_as_assumed() -> None:
     assert "has held the microscope for at least" in str(info.value)
 
 
+def _outside_the_executor(
+    lock: threading.RLock, action: Callable[[], object]
+) -> _Thread:
+    """``action`` in another thread, under ``lock`` taken outside the Executor.
+
+    A facade helper that holds the lock for a sequence of actions does this.
+    """
+
+    def sequence() -> object:
+        with lock:
+            return action()
+
+    return _Thread(sequence)
+
+
+def test_reentrant_move_under_an_external_lock_is_named_by_moving() -> None:
+    # #68, finding 7: a move made inside a lock taken outside the Executor
+    # found no holder record to write "waiting for" into, so moving() was
+    # empty during the traverse and other callers queued for lock_timeout_s.
+    lock = threading.RLock()
+    executor = Executor(dry_run=False, lock=lock, logger=LOGGER, lock_timeout_s=60.0)
+    xy = _Device()
+    mover = _outside_the_executor(lock, lambda: _move(executor, xy, timeout_s=JOIN_S))
+    try:
+        assert xy.polled.wait(JOIN_S)
+        during = executor.moving()
+        contender = _Thread(lambda: executor.acquire("camera: snap", _never))
+        refused = contender.finished_within(JOIN_S / 2)
+    finally:
+        xy.busy = False
+        mover.join()
+    assert during == ("xy_stage XY",)
+    assert refused, "the contender queued behind the move"
+    contender.join()
+    assert isinstance(contender.error, MotionInProgressError)
+    assert mover.result == "arrived"
+    assert executor.moving() == ()
+
+
+def test_an_action_under_an_external_lock_is_named_with_an_assumed_time() -> None:
+    # The action's record starts when it does, but the lock was taken before
+    # it, outside the Executor: the time is a lower bound, and says so.
+    lock = threading.RLock()
+    executor = Executor(dry_run=False, lock=lock, logger=LOGGER, lock_timeout_s=0.5)
+    entered, release = threading.Event(), threading.Event()
+    holder = _outside_the_executor(
+        lock,
+        lambda: executor.acquire(
+            "camera: snap", lambda: (entered.set(), release.wait(JOIN_S))
+        ),
+    )
+    assert entered.wait(JOIN_S)
+    try:
+        with pytest.raises(MicroscopeBusyError) as info:
+            executor.do("shutter: open", _step("shutter: open", _never))
+    finally:
+        release.set()
+        holder.join()
+    assert info.value.holder == "camera: snap"
+    assert info.value.at_least is True
+    assert "camera: snap has held the microscope for at least" in str(info.value)
+
+
+def test_a_move_under_an_external_lock_keeps_its_record_through_a_late_clean_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The lock is released before the holder record is cleared, so another
+    # thread can take it outside the Executor and move in between. On the
+    # previous holder's record, that clean-up would erase the move's
+    # "waiting for"; the move keeps a record of its own.
+    lock = threading.RLock()
+    executor = Executor(dry_run=False, lock=lock, logger=LOGGER, lock_timeout_s=60.0)
+    xy = _Device()
+    clear = executor._clear_holder
+    movers: list[_Thread] = []
+
+    def an_external_move_starts_first(record: object) -> None:
+        monkeypatch.undo()
+        movers.append(
+            _outside_the_executor(lock, lambda: _move(executor, xy, timeout_s=JOIN_S))
+        )
+        assert xy.polled.wait(JOIN_S)
+        clear(record)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(executor, "_clear_holder", an_external_move_starts_first)
+    executor.do("first", _step("first", lambda: None))
+    try:
+        during = executor.moving()
+    finally:
+        xy.busy = False
+        movers[0].join()
+    assert during == ("xy_stage XY",)
+    assert movers[0].result == "arrived"
+
+
 def _run_until_interrupted(executor: Executor) -> None:
     """Call actions until the pending Ctrl-C is delivered inside one of them."""
     deadline = time.monotonic() + JOIN_S

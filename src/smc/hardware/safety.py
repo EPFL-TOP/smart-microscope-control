@@ -40,7 +40,7 @@ import math
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Generic, TypeVar
 
 from smc.hardware.errors import (
@@ -227,6 +227,12 @@ class _Holder:
     #: until the device reads idle: a command can block for the whole
     #: traverse, and callbacks run inside it (#68).
     waiting_for: str | None = None
+    #: The thread that holds the lock: a record left by another thread (its
+    #: clean-up has not run yet) is not this thread's.
+    thread: int = field(default_factory=threading.get_ident)
+    #: The lock was taken outside the ``Executor`` before this action, so it
+    #: has been held for longer than ``since`` says.
+    external: bool = False
 
 
 def _lock_is_owned(lock: threading.RLock) -> bool:
@@ -305,14 +311,9 @@ class Executor:
     def _section(self, description: str, body: Callable[[], T]) -> T:
         """Run ``body`` holding the microscope lock (design §13, "The lock").
 
-        A thread that already holds the lock runs ``body`` inside its outer
-        action: a callback inside ``snap`` that moves the stage is part of the
-        snap. It is refused while that action waits for a motion, as another
-        thread would be: pymmcore-plus emits ``propertyChanged`` synchronously
-        from ``setProperty``, so a UI handler that snaps runs inside the
-        command of a turret change (#68). Ownership is asked of the lock
-        itself, not of the holder record, which a second Ctrl-C can leave
-        stale.
+        A thread that already holds the lock runs ``body`` inside it
+        (``_nested``). Ownership is asked of the lock itself, not of the holder
+        record, which a second Ctrl-C can leave stale.
 
         Otherwise ``acquire()`` is called here, in the frame whose ``finally``
         releases the lock, and nothing else runs between it and the ``try``:
@@ -323,8 +324,7 @@ class Executor:
         cleared, so an interrupt in that clean-up cannot keep it.
         """
         if _lock_is_owned(self._lock):
-            self._refuse_if_waiting()
-            return body()
+            return self._nested(description, body)
         started = time.monotonic()
         deadline = started + self._lock_timeout_s
         acquired = False
@@ -347,6 +347,42 @@ class Executor:
                 self._lock.release()
                 self._clear_holder(record)
 
+    def _nested(self, description: str, body: Callable[[], T]) -> T:
+        """Run ``body`` inside the lock this thread already holds (design §13, "Re-entry").
+
+        A callback inside ``snap`` that moves the stage is part of the snap.
+        It is refused while this thread's action waits for a motion, as
+        another thread would be: pymmcore-plus emits ``propertyChanged``
+        synchronously from ``setProperty``, so a UI handler that snaps runs
+        inside the command of a turret change (#68).
+
+        With no record of this thread's, the lock was taken outside the
+        ``Executor`` (a facade helper holding it for a sequence), or the
+        previous holder has not cleared its record yet. The section then
+        records itself, so that ``moving()`` names its motion and contenders
+        are refused at once, and a contender that times out reads its time
+        as a lower bound (#68).
+        """
+        record: _Holder | None = None
+        try:
+            with self._registry_lock:
+                holder = self._holder
+                if holder is None or holder.thread != threading.get_ident():
+                    record = self._holder = _Holder(
+                        description, time.monotonic(), external=True
+                    )
+                    waiting_for, outer = None, description
+                else:
+                    waiting_for, outer = holder.waiting_for, holder.description
+            if waiting_for is not None:
+                raise MotionInProgressError(
+                    (waiting_for,),
+                    f"`{outer}` is waiting for it, and this call runs inside it",
+                )
+            return body()
+        finally:
+            self._clear_holder(record)
+
     def _clear_holder(self, record: _Holder | None) -> None:
         """Forget ``record`` if it is still the holder: the lock may have changed hands."""
         with self._registry_lock:
@@ -368,18 +404,9 @@ class Executor:
             # Taken outside the Executor: nothing recorded when, so this
             # caller's own wait is all that is known, and it is a lower bound.
             raise MicroscopeBusyError("an unknown caller", now - started, at_least=True)
-        raise MicroscopeBusyError(holder.description, now - holder.since)
-
-    def _refuse_if_waiting(self) -> None:
-        """Refuse a nested action while this thread's own action waits for a motion."""
-        with self._registry_lock:
-            holder = None if self._holder is None else replace(self._holder)
-        if holder is not None and holder.waiting_for is not None:
-            raise MotionInProgressError(
-                (holder.waiting_for,),
-                f"`{holder.description}` is waiting for it, and this call runs "
-                f"inside it",
-            )
+        raise MicroscopeBusyError(
+            holder.description, now - holder.since, at_least=holder.external
+        )
 
     def _set_waiting(self, name: str | None) -> str | None:
         """Record what the holder waits for; return what it waited for before."""
