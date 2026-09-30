@@ -538,7 +538,7 @@ class Executor:
                 raise
             if overridden_by is not None:
                 return self._send_overridable(
-                    description, prepared, overridden_by, generation
+                    description, prepared, overridden_by, generation, halt_mark
                 )
             prepared.send()
             return prepared.readback()
@@ -546,7 +546,12 @@ class Executor:
         return self._section(description, body, halt_mark)
 
     def _send_overridable(
-        self, description: str, step: Step[T], call: SafeCall, generation: int
+        self,
+        description: str,
+        step: Step[T],
+        call: SafeCall,
+        generation: int,
+        halt_mark: int | None,
     ) -> T:
         """The command and readback of an action ``call`` wins over, under the lock.
 
@@ -554,7 +559,10 @@ class Executor:
         the device before this command (the open) did. If it was called during
         the command, it is sent again after it, whether the command returned or
         raised, and the action raises: the shutter never ends open after a
-        close that reported success (design §13).
+        close that reported success (design §13). It raises
+        ``MicroscopeHaltedError`` if the stand was halted since the action was
+        called, as ``do()`` documents, even if ``resume()`` came since: the
+        halt mark decides, not the flag (#80).
         """
         resent = False
         try:
@@ -564,8 +572,7 @@ class Executor:
                     call.send, f"{call.log} resent after `{step.log}`"
                 )
                 resent = True
-                if self._halted:
-                    raise MicroscopeHaltedError()
+                self._refuse_if_halted(halt_mark)
                 outcome = (
                     "it was sent again after it"
                     if error is None

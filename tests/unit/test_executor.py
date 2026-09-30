@@ -2008,6 +2008,31 @@ def test_close_while_an_open_is_sent_is_resent_and_the_open_raises(
         assert "was sent again after it" in str(info.value)
 
 
+@pytest.mark.parametrize(
+    "order", ["close halt resume", "halt close resume", "halt resume close"]
+)
+def test_halt_and_resume_during_an_overridable_send_raise_halted(order: str) -> None:
+    # #80 (#75 item 6): the open chose between MicroscopeHaltedError and
+    # HardwareError from the halt flag, so a halt and a resume() that both
+    # landed while it was sent raised HardwareError, not the
+    # MicroscopeHaltedError that do() documents for a halt since the call.
+    executor, shutter = _ex(), _Shutter()
+    calls: dict[str, Callable[[], object]] = {
+        "close": lambda: executor.safe(shutter.close, lambda: shutter.is_open),
+        "halt": executor.halt,
+        "resume": executor.resume,
+    }
+
+    def during_the_send() -> None:
+        for name in order.split():
+            calls[name]()
+
+    with pytest.raises(MicroscopeHaltedError):
+        _open(executor, shutter, before=during_the_send)
+    assert shutter.sent == [False, True, False]  # the close was sent again
+    assert shutter.is_open is False
+
+
 def test_a_close_while_an_open_waits_for_the_lock_cancels_it() -> None:
     executor, shutter = _ex(), _Shutter()
     holder, release = _hold_the_lock(executor)
