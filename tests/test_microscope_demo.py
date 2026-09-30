@@ -535,6 +535,55 @@ def test_stop_during_a_move_ends_it(demo_core: Any) -> None:
     assert spy.calls[:2] == ["stop XY", "stop Z"]
 
 
+def test_stop_from_inside_a_capability_lookup_stops_and_returns(
+    demo_core: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review of #8 (FM-70): a Ctrl-C handler that calls stop() can run while
+    # its own thread is inside has()/require()/state(), holding the capability
+    # cache's lock. With a plain Lock it hung there for ever, and no stop went
+    # out. Here the "handler" runs while the XY stage itself is being built.
+    spy = _Spy(demo_core)
+    m = Microscope.from_core(spy, Profile.demo())
+    real_xy_stage = microscope_mod.MMXYStage
+    built: list[Any] = []
+    handled = threading.Event()
+
+    def xy_stage(*args: Any) -> Any:
+        if not handled.is_set():
+            handled.set()
+            m.stop()  # on this thread, inside the lookup
+        stage = real_xy_stage(*args)
+        built.append(stage)
+        return stage
+
+    monkeypatch.setattr(microscope_mod, "MMXYStage", xy_stage)
+    returned: list[object] = []
+    errors: list[BaseException] = []
+
+    def lookup() -> None:
+        try:
+            returned.append(m.require(XYStage))
+        except BaseException as exc:
+            errors.append(exc)
+
+    # A thread with a join timeout, so a deadlock fails instead of hanging (FM-44).
+    looker = threading.Thread(target=lookup, daemon=True)
+    looker.start()
+    looker.join(timeout=JOIN_S)
+    assert not looker.is_alive(), "stop() deadlocked inside a capability lookup"
+    try:
+        assert errors == []
+        assert spy.calls == ["stop XY", "stop Z"]
+        assert m.state().halted
+        # The handler's lookup built the stage first; that one is kept, so the
+        # stage the stop reached is the one every caller gets.
+        assert len(built) == 2
+        assert returned == [built[0]]
+        assert m.require(XYStage) is built[0]
+    finally:
+        m.close()
+
+
 def test_close_stops_the_stages_when_something_moves(
     demo_core: Any, caplog: pytest.LogCaptureFixture
 ) -> None:

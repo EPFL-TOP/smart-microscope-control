@@ -152,7 +152,8 @@ class Microscope:
             lock_timeout_s=self._lock_timeout_s,
         )
         self._capabilities: dict[type, object] = {}
-        self._capabilities_lock = threading.Lock()
+        # Re-entrant: the emergency stop takes it from inside a lookup (FM-70).
+        self._capabilities_lock = threading.RLock()
         self._closed = False
 
     @classmethod
@@ -267,15 +268,21 @@ class Microscope:
     def _lookup(self, capability: type) -> object | None:
         """The cached capability, built on first request; ``None`` when a role is unfilled.
 
-        Takes a bare ``type`` because mypy refuses a Protocol class where
-        ``type[T]`` is expected (``type-abstract``); the public methods cast.
+        The untyped core of ``has``/``get``/``require`` and of the stop path,
+        which iterates plain ``type`` keys; the public methods cast.
+
+        The cache lock is re-entrant: a Ctrl-C handler that calls ``stop()``
+        or ``close()`` can run on a thread that is inside this method, and
+        the stop path looks the stages up here (FM-70). Such a handler may
+        also build the capability this call is building; the first one cached
+        is kept, so a facade never hands out two stages.
         """
         with self._capabilities_lock:
             found = self._capabilities.get(capability)
             if found is None:
-                found = self._build(capability)
-                if found is not None:
-                    self._capabilities[capability] = found
+                built = self._build(capability)
+                if built is not None:
+                    found = self._capabilities.setdefault(capability, built)
             return found
 
     def _build(self, capability: type) -> object | None:
