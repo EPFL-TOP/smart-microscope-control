@@ -208,6 +208,34 @@ def _moving(executor: Executor, device: _Device) -> _Thread:
     return mover
 
 
+def _blocking_move(
+    executor: Executor, device: _Device
+) -> tuple[_Thread, threading.Event]:
+    """A move whose command blocks for the traverse, in another thread; set the event to end it.
+
+    Some adapters return from ``setXYPosition`` only once the stage has
+    arrived; the wait that follows then finds it idle at once.
+    """
+    inside, release = threading.Event(), threading.Event()
+
+    def traverse() -> None:
+        device.command()
+        inside.set()
+        release.wait(JOIN_S)
+        device.busy = False
+
+    mover = _Thread(
+        lambda: executor.do(
+            "xy_stage: move_to (1.0, 2.0) µm",
+            Step("xy_stage: move XY", traverse, lambda: "arrived", "dry"),
+            motion=device.motion,
+            timeout_s=JOIN_S,
+        )
+    )
+    assert inside.wait(JOIN_S)
+    return mover, release
+
+
 def _hold_the_lock(executor: Executor) -> tuple[_Thread, threading.Event]:
     """A hung snap in another thread; set the returned event to end it."""
     entered, release = threading.Event(), threading.Event()
@@ -490,6 +518,112 @@ def test_a_nested_action_keeps_the_outer_holder_and_its_lock() -> None:
     assert executor.do("after", _step("after", lambda: None)) == "readback"
 
 
+def test_an_action_inside_a_moves_command_is_refused() -> None:
+    # #68, finding 1: pymmcore-plus runs a propertyChanged handler
+    # synchronously inside setProperty, in the mover's own thread. Such a
+    # callback re-enters the lock, and the guard looked only at motions that
+    # outlived their action, so a snap ran while the turret moved.
+    executor, turret, z = _ex(), _Device("Turret", arrive_after=0), _Device("Z")
+    refused: list[MotionInProgressError] = []
+
+    def command_with_a_synchronous_callback() -> None:
+        turret.command()
+        callbacks: list[Callable[[], object]] = [
+            lambda: executor.acquire("camera: snap", _never),
+            lambda: executor.do("shutter: open", _step("shutter: open", _never)),
+            lambda: _move(executor, z),
+        ]
+        for callback in callbacks:
+            try:
+                callback()
+            except MotionInProgressError as exc:
+                refused.append(exc)
+
+    result = executor.do(
+        "turret: set",
+        Step("turret: set", command_with_a_synchronous_callback, lambda: "2", "dry"),
+        motion=turret.motion,
+        timeout_s=30.0,
+    )
+    assert result == "2"  # the set itself carries on
+    assert [exc.moving for exc in refused] == [("xy_stage Turret",)] * 3
+    assert "`turret: set` is waiting for it" in str(refused[0])
+    assert z.commands == 0
+
+
+def test_moving_names_a_traverse_during_its_command() -> None:
+    # #68, finding 4: "waiting for" was recorded only once the command had
+    # returned, so a move whose command blocks for the traverse was absent
+    # from moving() (#8's state()) for its whole length.
+    executor, xy = _ex(), _Device()
+    mover, release = _blocking_move(executor, xy)
+    try:
+        during = executor.moving()
+    finally:
+        release.set()
+        mover.join()
+    assert during == ("xy_stage XY",)
+    assert mover.error is None
+    assert mover.result == "arrived"
+    assert executor.moving() == ()
+
+
+def test_contender_is_refused_during_a_blocking_command() -> None:
+    # #68, finding 4: during such a command another caller queued for the
+    # lock, up to lock_timeout_s, instead of being refused at once.
+    executor, xy, z = _ex(lock_timeout_s=60.0), _Device(), _Device("Z", arrive_after=0)
+    mover, release = _blocking_move(executor, xy)
+    try:
+        contender = _Thread(lambda: _move(executor, z))
+        refused = contender.finished_within(JOIN_S / 2)
+    finally:
+        release.set()
+        mover.join()
+    assert refused, "the contender queued behind the command"
+    contender.join()
+    assert isinstance(contender.error, MotionInProgressError)
+    assert contender.error.moving == ("xy_stage XY",)
+    assert z.commands == 0
+
+
+def test_snap_right_after_the_move_is_idle_is_not_refused() -> None:
+    # #68, finding 5: "waiting for" stayed recorded through the readback, so
+    # the documented pattern "wait for the move, then snap" was refused
+    # although the stage had arrived. A real readback takes time: two serial
+    # reads of X and Y are about 120 ms; here it lasts until the test says.
+    executor, xy = _ex(lock_timeout_s=60.0), _Device()
+    reading_back, release = threading.Event(), threading.Event()
+
+    def slow_readback() -> str:
+        reading_back.set()
+        release.wait(JOIN_S)
+        return "arrived"
+
+    mover = _Thread(
+        lambda: executor.do(
+            "xy_stage: move_to (1.0, 2.0) µm",
+            Step("xy_stage: move XY", xy.command, slow_readback, "dry"),
+            motion=xy.motion,
+            timeout_s=JOIN_S,
+        )
+    )
+    try:
+        assert xy.polled.wait(JOIN_S)
+        xy.busy = False  # the stage arrives, and the mover reads it back
+        assert reading_back.wait(JOIN_S)
+        executor.wait(xy.motion, JOIN_S)  # the UI waits for the move ...
+        snapper = _Thread(lambda: executor.acquire("camera: snap", lambda: "frame"))
+        done_early = snapper.finished_within(0.3)  # ... then snaps
+    finally:
+        release.set()
+        mover.join()
+    assert not done_early, f"the snap did not wait for the readback: {snapper.error!r}"
+    snapper.join()
+    assert snapper.error is None
+    assert snapper.result == "frame"
+    assert mover.result == "arrived"
+
+
 def test_lock_timeout_names_the_holder() -> None:
     executor = _ex(lock_timeout_s=0.5)
     holder, release = _hold_the_lock(executor)
@@ -531,6 +665,101 @@ def test_unknown_holder_time_is_labelled_as_assumed() -> None:
     assert info.value.at_least is True
     assert 0.4 <= info.value.held_s < JOIN_S + 1.0  # this caller's own wait
     assert "has held the microscope for at least" in str(info.value)
+
+
+def _outside_the_executor(
+    lock: threading.RLock, action: Callable[[], object]
+) -> _Thread:
+    """``action`` in another thread, under ``lock`` taken outside the Executor.
+
+    A facade helper that holds the lock for a sequence of actions does this.
+    """
+
+    def sequence() -> object:
+        with lock:
+            return action()
+
+    return _Thread(sequence)
+
+
+def test_reentrant_move_under_an_external_lock_is_named_by_moving() -> None:
+    # #68, finding 7: a move made inside a lock taken outside the Executor
+    # found no holder record to write "waiting for" into, so moving() was
+    # empty during the traverse and other callers queued for lock_timeout_s.
+    lock = threading.RLock()
+    executor = Executor(dry_run=False, lock=lock, logger=LOGGER, lock_timeout_s=60.0)
+    xy = _Device()
+    mover = _outside_the_executor(lock, lambda: _move(executor, xy, timeout_s=JOIN_S))
+    try:
+        assert xy.polled.wait(JOIN_S)
+        during = executor.moving()
+        contender = _Thread(lambda: executor.acquire("camera: snap", _never))
+        refused = contender.finished_within(JOIN_S / 2)
+    finally:
+        xy.busy = False
+        mover.join()
+    assert during == ("xy_stage XY",)
+    assert refused, "the contender queued behind the move"
+    contender.join()
+    assert isinstance(contender.error, MotionInProgressError)
+    assert mover.result == "arrived"
+    assert executor.moving() == ()
+
+
+def test_an_action_under_an_external_lock_is_named_with_an_assumed_time() -> None:
+    # The action's record starts when it does, but the lock was taken before
+    # it, outside the Executor: the time is a lower bound, and says so.
+    lock = threading.RLock()
+    executor = Executor(dry_run=False, lock=lock, logger=LOGGER, lock_timeout_s=0.5)
+    entered, release = threading.Event(), threading.Event()
+    holder = _outside_the_executor(
+        lock,
+        lambda: executor.acquire(
+            "camera: snap", lambda: (entered.set(), release.wait(JOIN_S))
+        ),
+    )
+    assert entered.wait(JOIN_S)
+    try:
+        with pytest.raises(MicroscopeBusyError) as info:
+            executor.do("shutter: open", _step("shutter: open", _never))
+    finally:
+        release.set()
+        holder.join()
+    assert info.value.holder == "camera: snap"
+    assert info.value.at_least is True
+    assert "camera: snap has held the microscope for at least" in str(info.value)
+
+
+def test_a_move_under_an_external_lock_keeps_its_record_through_a_late_clean_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The lock is released before the holder record is cleared, so another
+    # thread can take it outside the Executor and move in between. On the
+    # previous holder's record, that clean-up would erase the move's
+    # "waiting for"; the move keeps a record of its own.
+    lock = threading.RLock()
+    executor = Executor(dry_run=False, lock=lock, logger=LOGGER, lock_timeout_s=60.0)
+    xy = _Device()
+    clear = executor._clear_holder
+    movers: list[_Thread] = []
+
+    def an_external_move_starts_first(record: object) -> None:
+        monkeypatch.undo()
+        movers.append(
+            _outside_the_executor(lock, lambda: _move(executor, xy, timeout_s=JOIN_S))
+        )
+        assert xy.polled.wait(JOIN_S)
+        clear(record)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(executor, "_clear_holder", an_external_move_starts_first)
+    executor.do("first", _step("first", lambda: None))
+    try:
+        during = executor.moving()
+    finally:
+        xy.busy = False
+        movers[0].join()
+    assert during == ("xy_stage XY",)
+    assert movers[0].result == "arrived"
 
 
 def _run_until_interrupted(executor: Executor) -> None:
@@ -703,6 +932,68 @@ def test_a_halt_or_a_stop_while_the_line_is_logged_keeps_the_command_away(
         LOGGER.removeHandler(handler)
     assert xy.commands == 0
     assert "xy_stage: move XY: not sent" in caplog.messages
+
+
+def _landing_as_waiting_is_recorded(
+    monkeypatch: pytest.MonkeyPatch, executor: Executor, event: Callable[[], object]
+) -> None:
+    """Run ``event`` as the move records "waiting for", just before its command."""
+    set_waiting = executor._set_waiting
+
+    def landing(name: str | None) -> str | None:
+        if name is not None:  # the recording, not the clear
+            event()
+        return set_waiting(name)
+
+    monkeypatch.setattr(executor, "_set_waiting", landing)
+
+
+@pytest.mark.parametrize("what", ["halt", "stop"])
+def test_a_halt_or_a_stop_while_waiting_for_is_recorded_keeps_the_command_away(
+    what: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Adversarial review of #68 (FM-66): recording "waiting for" before the
+    # command put a step after the last check, so a halt landing there was
+    # missed and the command reached the stage.
+    executor, xy = _ex(), _Device(arrive_after=0)
+    event: Callable[[], object] = (
+        executor.halt if what == "halt" else lambda: executor.stop(xy.motion)
+    )
+    _landing_as_waiting_is_recorded(monkeypatch, executor, event)
+    expected = MicroscopeHaltedError if what == "halt" else MotionStoppedError
+    with (
+        caplog.at_level(logging.INFO, logger=LOGGER.name),
+        pytest.raises(expected),
+    ):
+        _move(executor, xy)
+    assert xy.commands == 0
+    assert xy.stops == (1 if what == "stop" else 0)  # only the caller's own stop
+    assert "xy_stage: move XY: not sent" in caplog.messages
+    assert executor.moving() == ()
+
+
+@pytest.mark.parametrize("stoppable", [True, False])
+def test_an_interrupt_before_the_command_stops_nothing(
+    stoppable: bool, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Adversarial review of #68: a Ctrl-C that landed before the command gave
+    # up on the motion, so it stopped a stage that had been told nothing, or
+    # logged that a turret "cannot be stopped from smc".
+    executor, turret = _ex(), _Device("Turret", stoppable=stoppable)
+
+    def ctrl_c() -> None:
+        raise KeyboardInterrupt
+
+    _landing_as_waiting_is_recorded(monkeypatch, executor, ctrl_c)
+    with (
+        caplog.at_level(logging.WARNING, logger=LOGGER.name),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        _move(executor, turret)
+    assert (turret.commands, turret.stops) == (0, 0)
+    assert "gave up" not in caplog.text
+    assert "stop after" not in caplog.text
+    assert executor.moving() == ()
 
 
 # --- waiting, and giving up ---------------------------------------------------
@@ -981,6 +1272,29 @@ def test_stop_during_a_move_makes_the_mover_raise_motion_stopped(
     assert executor.moving() == ()
 
 
+def test_stopped_move_that_times_out_raises_motion_stopped() -> None:
+    # #68, finding 6: a move stopped during its wait whose stage still read
+    # busy at the deadline (it decelerates slowly, or ignored the stop) raised
+    # DeviceTimeoutError, which tells the operator to raise device_timeout_ms.
+    # The caller asked for the stop, so the move ended as stopped.
+    executor, xy = _ex(), _Device(stop_clears=False)
+
+    def stop_during_the_wait(poll: int) -> None:
+        xy.on_poll = None
+        executor.stop(xy.motion)  # lock-free, as from another thread
+
+    xy.on_poll = stop_during_the_wait
+    with pytest.raises(MotionStoppedError) as info:
+        _move(executor, xy, timeout_s=0.05)
+    assert info.value.device == "xy_stage XY"
+    assert info.value.detail == (
+        "it was stopped, but it still read busy at the move's 0.05 s timeout, "
+        "and on the timeout the stop was sent"
+    )
+    assert xy.stops == 2  # the caller's stop, then the give-up's
+    assert executor.moving() == ("xy_stage XY",)  # still busy: it counts as moving
+
+
 def test_stop_does_not_wait_for_the_lock() -> None:
     executor, xy = _ex(), _Device()
     holder, release = _hold_the_lock(executor)
@@ -1163,6 +1477,39 @@ def test_a_second_ctrl_c_in_the_give_up_log_still_leaves_the_motion_tracked() ->
     # stop is harmless, a missing one is not.
     assert xy.stops >= 1
     assert executor.moving() == ("xy_stage XY",)
+
+
+def test_second_interrupt_during_give_up_stop_leaves_the_motion_registered(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # #68, finding 2: the give-up registered the motion only after its stop
+    # call had returned, so a second Ctrl-C inside that call left the stand
+    # accepting actions while the stage still moved.
+    executor, xy = _ex(), _Device(stop_clears=False)
+
+    def first_ctrl_c(poll: int) -> None:
+        if poll == 1:
+            raise KeyboardInterrupt  # in the wait: the give-up sends the stop
+
+    xy.on_poll = first_ctrl_c
+    xy.stop_error = KeyboardInterrupt()  # the second Ctrl-C, inside that stop
+    with (
+        caplog.at_level(logging.WARNING, logger=LOGGER.name),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        _move(executor, xy)
+    xy.on_poll, xy.stop_error = None, None
+    assert (xy.stops, xy.busy) == (1, True)
+    assert executor.moving() == ("xy_stage XY",)
+    assert (
+        "xy_stage XY: stop after KeyboardInterrupt was interrupted before it "
+        "returned, so it may not have reached the device" in caplog.messages
+    )
+    with pytest.raises(MotionInProgressError):
+        executor.do("shutter: open", _step("shutter: open", _never))
+    xy.busy = False  # once it reads idle, the stand is free again
+    assert executor.do("shutter: open", _step("shutter: open", lambda: None))
+    assert executor.moving() == ()
 
 
 def test_an_interrupt_in_the_give_up_busy_check_counts_as_moving() -> None:
@@ -1389,6 +1736,39 @@ def test_halt_refuses_every_action_until_resume(dry_run: bool) -> None:
         executor.do("shutter: open", _step("shutter: open", lambda: None)) == expected
     )
     assert executor.acquire("camera: snap", lambda: "frame") == "frame"
+
+
+@pytest.mark.parametrize("when", ["called while halted", "halted while queued"])
+@pytest.mark.parametrize("kind", ["open", "move", "snap"])
+def test_action_queued_while_halted_does_not_run_after_resume(
+    kind: str, when: str
+) -> None:
+    # #68, finding 3: an action waiting for the lock ran as soon as the
+    # operator resumed, although it was called while halted, or was waiting
+    # when the halt landed. resume() starts nothing.
+    executor, xy, shutter = _ex(), _Device(arrive_after=0), _Shutter()
+    actions: dict[str, Callable[[], object]] = {
+        "open": lambda: _open(executor, shutter),
+        "move": lambda: _move(executor, xy),
+        "snap": lambda: executor.acquire("camera: snap", _never),
+    }
+    holder, release = _hold_the_lock(executor)
+    try:
+        if when == "called while halted":
+            executor.halt()
+        queued = _Thread(actions[kind])
+        assert not queued.finished_within(0.2)  # queued behind the snap
+        if when == "halted while queued":
+            executor.halt()
+        executor.resume()
+    finally:
+        release.set()
+        holder.join()
+    queued.join()
+    assert isinstance(queued.error, MicroscopeHaltedError)
+    assert (shutter.sent, xy.commands) == ([], 0)
+    assert _move(executor, xy) == "arrived"  # a call made after resume() runs
+    assert xy.commands == 1
 
 
 def test_halted_is_not_a_safety_refusal() -> None:
