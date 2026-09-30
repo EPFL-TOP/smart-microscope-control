@@ -34,6 +34,25 @@ def test_depends_on_none_is_empty(point) -> None:
     assert point.depends_on("no such line") == []
 
 
+def test_dependencies_prefer_the_plan_over_the_body(point) -> None:
+    issue = {
+        "body": "**Depends on**: #4 — ADR-0007 accepted.\n\n## Goal",
+        "comments": [
+            {"body": "## Plan (design session)\n\n**Depends on**: #8", "createdAt": "x"}
+        ],
+    }
+    assert point.dependencies(issue) == [8]
+
+
+def test_blocked_issue_without_a_plan_reads_its_body(point) -> None:
+    issue = {
+        "body": "**Depends on**: #3, #35 — ADR-0006 and the spike.",
+        "comments": [],
+    }
+    assert point.dependencies(issue) == [3, 35]
+    assert point.dependencies({"body": None, "comments": []}) == []
+
+
 def _c(body: str, at: str) -> dict:
     return {"body": body, "createdAt": at}
 
