@@ -328,10 +328,11 @@ class Executor:
 
         ``halt_mark`` is what the action recorded of the halt when it was
         called. ``body`` checks it once the lock is taken; while the lock is
-        held by another thread, ``_contention`` checks it at every poll.
+        held by another thread, ``_contention`` checks it at every poll, and
+        inside this thread's own lock ``_nested`` checks it first.
         """
         if _lock_is_owned(self._lock):
-            return self._nested(description, body)
+            return self._nested(description, body, halt_mark)
         started = time.monotonic()
         deadline = started + self._lock_timeout_s
         acquired = False
@@ -354,14 +355,19 @@ class Executor:
                 self._lock.release()
                 self._clear_holder(record)
 
-    def _nested(self, description: str, body: Callable[[], T]) -> T:
+    def _nested(
+        self, description: str, body: Callable[[], T], halt_mark: int | None
+    ) -> T:
         """Run ``body`` inside the lock this thread already holds (design §13, "Re-entry").
 
         A callback inside ``snap`` that moves the stage is part of the snap.
         It is refused while this thread's action waits for a motion, as
         another thread would be: pymmcore-plus emits ``propertyChanged``
         synchronously from ``setProperty``, so a UI handler that snaps runs
-        inside the command of a turret change (#68).
+        inside the command of a turret change (#68). A halt since the call
+        comes before that refusal, as in ``_contention`` (FM-64): the
+        refusal is a ``SafetyRefusedError``, and an emergency stop pressed
+        during the command must not be caught as one.
 
         With no record of this thread's, the lock was taken outside the
         ``Executor`` (a facade helper holding it for a sequence), or the
@@ -373,6 +379,7 @@ class Executor:
         record: _Holder | None = None
         try:
             with self._registry_lock:
+                halted = self._halted_since(halt_mark)
                 holder = self._holder
                 if holder is None or holder.thread != threading.get_ident():
                     record = self._holder = _Holder(
@@ -381,6 +388,8 @@ class Executor:
                     waiting_for, outer = None, description
                 else:
                     waiting_for, outer = holder.waiting_for, holder.description
+            if halted:
+                raise MicroscopeHaltedError()
             if waiting_for is not None:
                 raise MotionInProgressError(
                     (waiting_for,),

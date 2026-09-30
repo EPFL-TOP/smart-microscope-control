@@ -551,6 +551,34 @@ def test_an_action_inside_a_moves_command_is_refused() -> None:
     assert z.commands == 0
 
 
+def test_an_action_halted_inside_a_moves_command_raises_halted() -> None:
+    # Adversarial review of #80 (FM-64): a callback inside a move's command
+    # that acted after a halt was refused with MotionInProgressError, a
+    # SafetyRefusedError, before its halt was looked at.
+    executor, turret, z = _ex(), _Device("Turret", arrive_after=0), _Device("Z")
+    shutter = _Shutter()
+    raised: list[BaseException] = []
+
+    def command_with_a_synchronous_callback() -> None:
+        turret.command()
+        executor.halt()  # the operator's emergency stop, during the command
+        for callback in _actions(executor, z, shutter).values():
+            try:
+                callback()
+            except HardwareError as exc:
+                raised.append(exc)
+
+    result = executor.do(
+        "turret: set",
+        Step("turret: set", command_with_a_synchronous_callback, lambda: "2", "dry"),
+        motion=turret.motion,
+        timeout_s=30.0,
+    )
+    assert result == "2"  # the set was sent before the halt, and carries on
+    assert [type(exc) for exc in raised] == [MicroscopeHaltedError] * 3
+    assert (shutter.sent, z.commands) == ([], 0)
+
+
 def test_moving_names_a_traverse_during_its_command() -> None:
     # #68, finding 4: "waiting for" was recorded only once the command had
     # returned, so a move whose command blocks for the traverse was absent
