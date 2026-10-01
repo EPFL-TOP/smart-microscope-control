@@ -276,6 +276,61 @@ def test_put_back_closes_the_shutter_even_when_its_read_fails(
 
 
 @pytest.mark.parametrize("backend", ["fake"], indirect=True)
+def test_second_ctrl_c_during_the_stop_still_cuts_the_light(
+    stand: Microscope,
+    envelope: Envelope,
+    fake_core: FakeCore,
+    put_back: PutBack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    facade = Microscope.from_core(stand.core, envelope.profile(stand.profile))
+    facade.require(Shutter).set_open(True)
+    stop = fake_core.stop
+
+    def interrupted_stop(label: str) -> None:
+        stop(label)
+        if label == "Z":
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(fake_core, "stop", interrupted_stop)
+    fake_core.log.clear()
+    with pytest.raises(RuntimeError, match="was not put back") as caught:
+        put_back(facade, envelope, interrupted=True)
+    assert "stop: KeyboardInterrupt()" in str(caught.value)
+    assert fake_core.log[-1] == "setShutterOpen('White Light Shutter', False)"
+
+
+@pytest.mark.parametrize("backend", ["fake"], indirect=True)
+def test_ctrl_c_during_the_put_back_skips_the_moves_left_and_names_them(
+    stand: Microscope,
+    envelope: Envelope,
+    fake_core: FakeCore,
+    put_back: PutBack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert envelope.z_um is not None
+    facade = Microscope.from_core(stand.core, envelope.profile(stand.profile))
+    facade.require(XYStage).move_to_um(20, -10)
+    facade.require(ZStage).move_to_um(envelope.z_um - 2)
+    started_open = replace(envelope, shutter_open=True)
+
+    def interrupted_move(label: str, x_um: float, y_um: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(fake_core, "setXYPosition", interrupted_move)
+    fake_core.log.clear()
+    with pytest.raises(RuntimeError, match="was not put back") as caught:
+        put_back(facade, started_open)
+    message = str(caught.value)
+    assert "xy: KeyboardInterrupt()" in message
+    assert (
+        "not attempted after Ctrl-C: z, exposure, auto-shutter, shutter open" in message
+    )
+    assert not any(entry.startswith("setPosition(") for entry in fake_core.log)
+    assert "setShutterOpen('White Light Shutter', True)" not in fake_core.log
+
+
+@pytest.mark.parametrize("backend", ["fake"], indirect=True)
 def test_put_back_names_every_item_it_could_not_restore(
     stand: Microscope,
     envelope: Envelope,

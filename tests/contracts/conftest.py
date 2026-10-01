@@ -265,7 +265,8 @@ def _put_back(
 
     Every step is attempted even if an earlier one failed, and one error
     then names every step that failed: at a stand, the operator must learn
-    each item that was not put back, not only the first.
+    each item that was not put back, not only the first. A Ctrl-C during the
+    put-back leaves only the stop and the shutter close to run (``_run_all``).
     """
     shutter = facade.get(Shutter)
     steps: list[tuple[str, Callable[[], None]]] = []
@@ -301,16 +302,38 @@ def _has_motion(facade: Microscope) -> bool:
     return state.halted or bool(state.moving)
 
 
+#: The steps still run after a Ctrl-C during the put-back: they stop the
+#: stand and cut the light, which is what the operator asked for.
+_SAFE_STEPS = frozenset({"stop", "shutter close"})
+
+
 def _run_all(steps: list[tuple[str, Callable[[], None]]]) -> None:
-    """Run every step; then raise one error naming each that failed, from the first."""
-    failed: list[tuple[str, Exception]] = []
+    """Run every step; then raise one error naming each that failed, from the first.
+
+    A Ctrl-C inside a step (a second one, when the run was already
+    interrupted) is a failure of that step, not the end of the put-back:
+    left to propagate, it would skip the shutter close queued after a stop
+    and leave the light on. From then on only the safe steps run; the
+    others are named as not attempted, so the operator knows what to check.
+    """
+    failed: list[tuple[str, BaseException]] = []
+    skipped: list[str] = []
+    ctrl_c = False
     for name, step in steps:
+        if ctrl_c and name not in _SAFE_STEPS:
+            skipped.append(name)
+            continue
         try:
             step()
+        except KeyboardInterrupt as exc:
+            ctrl_c = True
+            failed.append((name, exc))
         except Exception as exc:
             failed.append((name, exc))
     if failed:
         listed = "; ".join(f"{name}: {exc!r}" for name, exc in failed)
+        if skipped:
+            listed += f"; not attempted after Ctrl-C: {', '.join(skipped)}"
         raise RuntimeError(
             f"the stand was not put back where it started ({listed}); check it "
             f"before the next run"
