@@ -676,8 +676,8 @@ labelled as assumed:
 - **Errors.**
   - An unknown label or property raises, with the measured message.
   - A set on a read-only property is ignored.
-  - A value outside `allowed` raises `RuntimeError` (assumed, not
-    measured).
+  - A value outside `allowed` raises
+    `RuntimeError('Cannot set property "Binning" to "3"')` (measured).
   - A label in `failing` makes every call that names it raise its
     exception. If it is the camera's label, the current-camera calls
     raise it too.
