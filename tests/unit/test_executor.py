@@ -2194,3 +2194,188 @@ def test_dry_run_move_stopped_while_queued_is_cancelled_too() -> None:
         holder.join()
     mover.join()
     assert isinstance(mover.error, MotionStoppedError)
+
+
+# --- a stop that re-enters the registry lock (FM-70) ---------------------------
+
+
+def test_halt_and_stop_inside_a_registry_section_return() -> None:
+    # #76 (FM-70): Python runs a Ctrl-C handler on the main thread, between
+    # two of its bytecodes. With a plain Lock, a handler that called halt()
+    # or stop() while its thread was inside a registry section (every move
+    # enters one) hung there for ever, and no stop went out.
+    executor, xy = _ex(), _Device()
+
+    def handler_inside_a_section() -> tuple[str, ...]:
+        with executor._registry_lock:
+            executor.halt()
+            executor.stop(xy.motion)
+            return executor.moving()
+
+    handler = _Thread(handler_inside_a_section)
+    assert handler.finished_within(JOIN_S), "the stop deadlocked on the registry lock"
+    assert handler.error is None
+    assert handler.result == ()
+    assert xy.stops == 1
+    assert executor.halted
+
+
+class _StopLandsInTheDrop(dict[str, object]):
+    """The registry, with a stop landing inside the first lookup made of it.
+
+    It stands for a Ctrl-C handler that runs between a drop's identity check
+    and its delete: the entry is read first, then the handler's stop drops
+    that same entry, and the check goes on with what it read.
+    """
+
+    def __init__(self, registry: dict[str, object], stop: Callable[[], None]) -> None:
+        super().__init__(registry)
+        self._stop: Callable[[], None] | None = stop
+
+    def get(self, key: str, default: object = None) -> object:  # type: ignore[override]
+        value = super().get(key, default)
+        stop, self._stop = self._stop, None
+        if stop is not None:
+            stop()
+        return value
+
+
+def test_a_stop_landing_inside_a_drop_does_not_raise() -> None:
+    # #76 (FM-70, re-entry): once the lock is re-entrant, a handler can run
+    # inside a section and change the registry under it. A drop that checked
+    # the entry and then deleted it raised KeyError when the handler's stop
+    # had dropped the same entry in between.
+    executor, xy, z = _ex(), _Device(), _Device("Z", arrive_after=0)
+    _outlive(executor, xy)
+    xy.busy = False  # the next action's guard sees it idle and drops it
+    executor._registry = _StopLandsInTheDrop(  # type: ignore[assignment]
+        executor._registry,  # type: ignore[arg-type]
+        lambda: executor.stop(xy.motion),
+    )
+    mover = _Thread(lambda: _move(executor, z))
+    assert mover.finished_within(JOIN_S), "the stop deadlocked inside the drop"
+    assert mover.error is None
+    assert mover.result == "arrived"
+    assert xy.stops == 2  # the give-up's, then the handler's
+    assert executor.moving() == ()
+
+
+# --- several stops, then their lines (FM-62) ----------------------------------
+
+
+class _StopsSeen(logging.Handler):
+    """Records each line with how many stops each device had seen by then."""
+
+    def __init__(self, *devices: _Device) -> None:
+        super().__init__()
+        self.devices = devices
+        self.seen: list[tuple[str, tuple[int, ...]]] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.seen.append((record.getMessage(), tuple(d.stops for d in self.devices)))
+
+
+def test_hold_log_writes_the_halt_and_every_stop_line_after_the_last_stop() -> None:
+    # #76 (FM-62): the emergency stop wrote each line as it went, so a blocked
+    # console held the Z stop behind the halt's line and the XY stop's.
+    executor, xy, z = _ex(), _Device(), _Device("Z")
+    handler = _StopsSeen(xy, z)
+    LOGGER.addHandler(handler)
+
+    def emergency_stop() -> str:
+        executor.halt()
+        executor.stop(xy.motion)
+        executor.stop(z.motion)
+        return "stopped"
+
+    try:
+        result = executor.hold_log(emergency_stop)
+    finally:
+        LOGGER.removeHandler(handler)
+    assert result == "stopped"
+    assert handler.seen == [
+        ("microscope: halted", (1, 1)),
+        ("xy_stage XY: stop", (1, 1)),
+        ("xy_stage Z: stop", (1, 1)),
+    ]
+
+
+def test_hold_log_writes_its_lines_when_the_stops_raise_and_holds_nothing_after(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A second Ctrl-C during the stops: the lines held so far are still
+    # written, and the thread does not go on holding the ones that follow.
+    executor, xy, z = _ex(), _Device(), _Device("Z")
+
+    def interrupted() -> None:
+        executor.stop(xy.motion)
+        raise KeyboardInterrupt  # raised from the stub, not sent as a signal
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER.name):
+        with pytest.raises(KeyboardInterrupt):
+            executor.hold_log(interrupted)
+        assert caplog.messages == ["xy_stage XY: stop"]
+        executor.stop(z.motion)
+        assert caplog.messages == ["xy_stage XY: stop", "xy_stage Z: stop"]
+
+
+def test_a_second_ctrl_c_while_the_held_lines_are_written_leaves_nothing_held(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Adversarial review of #76 (FM-65): the hold is cleared before the first
+    # held line is written. Cleared after them, an interrupt in that writing
+    # left the thread holding, and every later line on it was kept for good.
+    executor, xy, z = _ex(), _Device(), _Device("Z")
+    handler = _InterruptOn("xy_stage XY: stop")
+    LOGGER.addHandler(handler)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            executor.hold_log(lambda: executor.stop(xy.motion))
+    finally:
+        LOGGER.removeHandler(handler)
+    with caplog.at_level(logging.WARNING, logger=LOGGER.name):
+        executor.stop(z.motion)
+    assert caplog.messages == ["xy_stage Z: stop"]
+    assert (xy.stops, z.stops) == (1, 1)
+
+
+def test_a_nested_hold_log_leaves_the_writing_to_the_outer_one(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A handler's emergency stop inside close()'s stops: its lines wait for
+    # the outer stops too, and nothing is written twice.
+    executor, xy, z = _ex(), _Device(), _Device("Z")
+    after_inner: list[str] = []
+
+    def outer() -> None:
+        executor.hold_log(lambda: executor.stop(xy.motion))
+        after_inner.extend(caplog.messages)
+        executor.stop(z.motion)
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER.name):
+        executor.hold_log(outer)
+    assert after_inner == []
+    assert caplog.messages == ["xy_stage XY: stop", "xy_stage Z: stop"]
+
+
+def test_hold_log_does_not_hold_another_threads_lines() -> None:
+    # Held per thread: a stop on another thread (a UI) is not kept waiting
+    # for this one's lines, nor are its own lines kept back.
+    executor, z = _ex(), _Device("Z")
+    written = threading.Event()
+    handler = _OnLog("xy_stage Z: stop", written.set)
+    LOGGER.addHandler(handler)
+    stoppers: list[_Thread] = []
+
+    def run() -> bool:
+        stoppers.append(_Thread(lambda: executor.stop(z.motion)))
+        return written.wait(JOIN_S)
+
+    try:
+        written_inside = executor.hold_log(run)
+    finally:
+        LOGGER.removeHandler(handler)
+    stoppers[0].join()
+    assert written_inside, "another thread's line was held"
+    assert stoppers[0].error is None
+    assert z.stops == 1

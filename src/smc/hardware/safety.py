@@ -236,6 +236,12 @@ class _Holder:
     external: bool = False
 
 
+class _HeldLines(threading.local):
+    """The lines ``Executor.hold_log`` keeps back on one thread; ``None`` while it keeps none."""
+
+    lines: list[tuple[int, str, tuple[object, ...]]] | None = None
+
+
 def _lock_is_owned(lock: threading.RLock) -> bool:
     """Whether the calling thread holds ``lock``.
 
@@ -256,9 +262,17 @@ class Executor:
     Reads, ``wait()``, stops and closing a shutter never take it.
 
     The registry lock guards the small shared state (motions that outlived
-    their action, stop generations, the halt, who holds the lock). It is
-    never held across a device call or a log call, and a thread holding it
-    never takes the microscope lock.
+    their action, stop generations, the halt, who holds the lock). No code
+    here holds it across a device call or a log call, or takes the
+    microscope lock while holding it. It is re-entrant because Python runs
+    a signal handler on the main thread, between two of its bytecodes,
+    whichever thread the signal reached: a Ctrl-C handler that calls
+    ``Microscope.stop()`` can land while the main thread is inside a
+    registry section, and a plain lock would block the stop for ever
+    (FM-70). Such a stop can run at any point of a section,
+    even inside one statement, so every section stays correct when it does:
+    it iterates a snapshot taken in one call, and a drop tolerates an entry
+    that is already gone.
     """
 
     def __init__(
@@ -284,7 +298,7 @@ class Executor:
         self._lock = lock
         self._logger = logger
         self._lock_timeout_s = float(lock_timeout_s)
-        self._registry_lock = threading.Lock()
+        self._registry_lock = threading.RLock()
         self._registry: dict[str, _Registration] = {}
         #: Per device: how many explicit stops (or, for a shutter, closes) it
         #: has had. Only ``stop()`` and ``safe()`` advance it, so a give-up
@@ -296,6 +310,7 @@ class Executor:
         #: while it waits for the lock refuses it even after ``resume()``.
         self._halt_epoch = 0
         self._holder: _Holder | None = None
+        self._held = _HeldLines()
 
     @property
     def dry_run(self) -> bool:
@@ -528,9 +543,9 @@ class Executor:
                 limit_s = _resolve_timeout(limit)
             self._refuse_if_cancelled(key, generation, halt_mark, cancelled)
             if self._dry_run:
-                self._logger.info("[dry-run] %s", prepared.log)
+                self._log(logging.INFO, "[dry-run] %s", prepared.log)
                 return prepared.dry_result
-            self._logger.info("%s", prepared.log)
+            self._log(logging.INFO, "%s", prepared.log)
 
             def last_check() -> None:
                 # FM-66: the halt or a stop may have landed while the line
@@ -543,7 +558,7 @@ class Executor:
             try:
                 last_check()
             except HardwareError:
-                self._logger.warning("%s: not sent", prepared.log)
+                self._log(logging.WARNING, "%s: not sent", prepared.log)
                 raise
             if overridden_by is not None:
                 return self._send_overridable(
@@ -634,7 +649,7 @@ class Executor:
                 last_check()
             except HardwareError:
                 self._set_waiting(previous)
-                self._logger.warning("%s: not sent", step.log)
+                self._log(logging.WARNING, "%s: not sent", step.log)
                 raise
             sending = True  # from here on the command may reach the device
             step.send()
@@ -744,8 +759,11 @@ class Executor:
         It asks no device and never blocks.
         """
         with self._registry_lock:
-            names = [r.motion.name for r in self._registry.values()]
+            # One call: a stop that re-enters would break a comprehension
+            # over the dict itself (FM-70).
+            registrations = list(self._registry.values())
             waiting = None if self._holder is None else self._holder.waiting_for
+        names = [r.motion.name for r in registrations]
         if waiting is not None and waiting not in names:
             names.insert(0, waiting)
         return tuple(names)
@@ -770,14 +788,20 @@ class Executor:
         """
         send = motion.stop
         if send is None:
-            self._logger.warning(
-                "%s: stop requested; it cannot be stopped from smc", motion.name
+            self._log(
+                logging.WARNING,
+                "%s: stop requested; it cannot be stopped from smc",
+                motion.name,
             )
             raise HardwareError(
                 f"{motion.name} cannot be stopped from smc; wait for it, or "
                 f"check the stand and call `resume()`"
             )
         with self._registry_lock:
+            # A stop that re-enters between the read and the write loses one
+            # increment, which does no harm: the counter only has to differ
+            # from what each action recorded, and no other thread can record
+            # a value meanwhile, since this section holds the lock (FM-70).
             self._generations[motion.device] = (
                 self._generations.get(motion.device, 0) + 1
             )
@@ -803,6 +827,7 @@ class Executor:
             Exception: Whatever the call raised; a failed close is a finding.
         """
         with self._registry_lock:
+            # A re-entering call may lose one increment, harmlessly: see stop().
             self._generations[call.device] = self._generations.get(call.device, 0) + 1
         error = self._send_safe(call.send, call.log, level=logging.INFO)
         if error is not None:
@@ -813,12 +838,15 @@ class Executor:
         """Refuse every action until ``resume()``; reads and the safe calls still run.
 
         An action already called and waiting for the lock is refused too,
-        within one lock poll and even once resumed.
+        within one lock poll and even once resumed. The flag is set before
+        the line is written. Inside ``hold_log``, as in the emergency stop,
+        the line is written only once the stops that follow have been sent.
         """
         with self._registry_lock:
             self._halted = True
+            # A re-entering halt may lose one increment, harmlessly: see stop().
             self._halt_epoch += 1
-        self._logger.warning("microscope: halted")
+        self._log(logging.WARNING, "microscope: halted")
 
     def resume(self) -> None:
         """Clear the halt and drop every motion that outlived its action; starts nothing.
@@ -832,15 +860,52 @@ class Executor:
         """
         with self._registry_lock:
             self._halted = False
-            dropped = [r.motion.name for r in self._registry.values()]
+            # A snapshot taken in one call, then cleared: a stop that
+            # re-enters cannot break the iteration (FM-70).
+            dropped = list(self._registry.values())
             self._registry.clear()
-        self._logger.warning("microscope: resumed")
-        for name in dropped:
-            self._logger.warning(
+        self._log(logging.WARNING, "microscope: resumed")
+        for name in [r.motion.name for r in dropped]:
+            self._log(
+                logging.WARNING,
                 "%s: no longer tracked as moving (resume); check it before "
                 "moving it again",
                 name,
             )
+
+    def hold_log(self, run: Callable[[], T]) -> T:
+        """Run ``run``, keeping back every line this thread writes here until it has ended.
+
+        Several stops in a row (the emergency stop, ``close()`` when something
+        moves) are all sent before the first of their lines, the halt's
+        included (FM-62, design §13). Otherwise a blocked console (a QuickEdit
+        selection on Windows) holds the Z stop behind the XY stop's line, and
+        a second Ctrl-C there skips it. A blocked console or a second Ctrl-C
+        can then delay or cut these lines, never a stop that comes after
+        them. The lines are written in the order they were logged, once
+        ``run`` has returned or raised.
+
+        Only this thread's lines are kept: another thread's stop is not held
+        up by them. Nested in another ``hold_log`` on this thread, it leaves
+        the writing to the outer one.
+
+        The hold starts with the first statement inside the ``try`` and ends
+        with the first statement of the ``finally``, before any line is
+        written (as for a lock, FM-65): an interrupt while the lines are
+        written may cut the rest, but never leaves the thread holding. A
+        written record carries the time and caller of its writing, a few
+        milliseconds after its stop.
+        """
+        if self._held.lines is not None:
+            return run()
+        lines: list[tuple[int, str, tuple[object, ...]]] = []
+        try:
+            self._held.lines = lines
+            return run()
+        finally:
+            self._held.lines = None
+            for level, msg, args in lines:
+                self._logger.log(level, msg, *args)
 
     # --- helpers -----------------------------------------------------------
 
@@ -925,10 +990,14 @@ class Executor:
             return self._registry.get(device)
 
     def _drop(self, device: str, registration: _Registration) -> None:
-        """Drop ``registration`` if it is still the device's; a newer one stays."""
+        """Drop ``registration`` if it is still the device's; a newer one stays.
+
+        A stop that re-enters between the check and the removal may have
+        dropped it already (FM-70), so the removal tolerates its absence.
+        """
         with self._registry_lock:
             if self._registry.get(device) is registration:
-                del self._registry[device]
+                self._registry.pop(device, None)
 
     def _keep_while_moving(self, motion: Motion, registration: _Registration) -> str:
         """Drop a give-up's ``registration`` if the device reads idle; return a log note.
@@ -988,7 +1057,8 @@ class Executor:
         send = motion.stop
         if send is None:
             note = self._keep_while_moving(motion, registration)
-            self._logger.warning(
+            self._log(
+                logging.WARNING,
                 "%s: gave up after %s; it cannot be stopped from smc%s",
                 motion.name,
                 why,
@@ -1030,7 +1100,8 @@ class Executor:
         except Exception as exc:
             error = exc
         except BaseException:
-            self._logger.warning(
+            self._log(
+                logging.WARNING,
                 "%s was interrupted before it returned, so it may not have "
                 "reached the device",
                 what,
@@ -1044,10 +1115,23 @@ class Executor:
             # Written even when ``then`` was interrupted (a Ctrl-C in its busy
             # check): the call was sent, and the log must say so.
             if error is None:
-                self._logger.log(level, "%s%s", what, note)
+                self._log(level, "%s%s", what, note)
             else:
-                self._logger.warning("%s failed (%r)%s", what, error, note)
+                self._log(logging.WARNING, "%s failed (%r)%s", what, error, note)
         return error
+
+    def _log(self, level: int, msg: str, *args: object) -> None:
+        """Write a line now, or keep it for the ``hold_log`` this thread is inside.
+
+        Every line the ``Executor`` writes goes through here, so a hold
+        cannot miss one. Written now, the record names the caller, as a
+        direct call would.
+        """
+        held = self._held.lines
+        if held is None:
+            self._logger.log(level, msg, *args, stacklevel=2)
+        else:
+            held.append((level, msg, args))
 
 
 def _resolve_timeout(timeout_s: float | Callable[[], float]) -> float:
