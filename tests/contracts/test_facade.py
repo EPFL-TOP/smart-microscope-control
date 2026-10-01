@@ -8,15 +8,15 @@ those two cases run there alone. The put-back is safety code at a stand:
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import TYPE_CHECKING, cast
 
 import pytest
 
 from smc.hardware import Microscope
 from smc.hardware.capabilities import Camera, Shutter, XYStage, ZStage
-from smc.hardware.errors import CapabilityMissingError
-from smc.hardware.profile import Profile
+from smc.hardware.errors import CapabilityMissingError, HardwareError
+from smc.hardware.profile import Profile, SafetySection
 from smc.hardware.roles import Role
 
 if TYPE_CHECKING:
@@ -123,3 +123,74 @@ def test_teardown_stops_a_halted_stand_instead_of_moving_it(
     microscope.require(Shutter).set_open(True)
     microscope.stop()
     fake_core.log.clear()
+
+
+@pytest.mark.parametrize("backend", ["fake"], indirect=True)
+def test_envelope_refuses_a_start_too_close_to_the_profile_limits(
+    stand: Microscope, envelope: Envelope
+) -> None:
+    # The fake starts at (0, 0) and Z 0; the window is XY +/- 100, Z +/- 3.
+    def limited(**limits: object) -> Profile:
+        return stand.profile.model_copy(
+            update={"safety": SafetySection.model_validate(limits)}
+        )
+
+    near_x = limited(xy_soft_limits_um=((-1000, 30), (-1000, 1000)))
+    with pytest.raises(
+        pytest.fail.Exception, match=r"too close to its X soft limits \[-1000, 30\] µm"
+    ):
+        envelope.profile(near_x)
+    near_z = limited(z_soft_limits_um=(-1000, 1))
+    with pytest.raises(
+        pytest.fail.Exception, match=r"too close to its Z soft limits \[-1000, 1\] µm"
+    ):
+        envelope.profile(near_z)
+    roomy = limited(
+        xy_soft_limits_um=((-1000, 1000), (-1000, 1000)), z_soft_limits_um=(-10, 10)
+    )
+    safety = envelope.profile(roomy).safety
+    assert safety.xy_soft_limits_um == ((-100, 100), (-100, 100))
+    assert safety.z_soft_limits_um == (-3, 3)
+
+
+@pytest.mark.parametrize("backend", ["fake"], indirect=True)
+def test_put_back_names_every_item_it_could_not_restore(
+    stand: Microscope,
+    envelope: Envelope,
+    fake_core: FakeCore,
+    put_back: Callable[[Microscope, Envelope], None],
+) -> None:
+    facade = Microscope.from_core(stand.core, envelope.profile(stand.profile))
+    facade.require(XYStage).move_to_um(20, -10)
+    facade.require(ZStage).move_to_um(-2)
+    fake_core.failing["XY"] = RuntimeError("xy: no answer")
+    fake_core.failing["Z"] = RuntimeError("z: no answer")
+    with pytest.raises(RuntimeError, match="was not put back") as caught:
+        put_back(facade, envelope)
+    fake_core.failing.clear()
+    message = str(caught.value)
+    assert "xy: RuntimeError('xy: no answer')" in message
+    assert "z: RuntimeError('z: no answer')" in message
+    assert caught.value.__cause__ is not None
+
+
+@pytest.mark.parametrize("backend", ["fake"], indirect=True)
+def test_put_back_of_a_halted_stand_reports_a_failed_stop_and_a_failed_close(
+    stand: Microscope,
+    envelope: Envelope,
+    fake_core: FakeCore,
+    put_back: Callable[[Microscope, Envelope], None],
+) -> None:
+    facade = Microscope.from_core(stand.core, envelope.profile(stand.profile))
+    facade.require(Shutter).set_open(True)
+    fake_core.failing["XY"] = RuntimeError("xy: no stop")
+    with pytest.raises(HardwareError):
+        facade.stop()  # halted, and the XY stop failed
+    fake_core.failing["White Light Shutter"] = RuntimeError("shutter: stuck")
+    with pytest.raises(RuntimeError, match="was not put back") as caught:
+        put_back(facade, envelope)
+    fake_core.failing.clear()
+    message = str(caught.value)
+    assert "stop: HardwareError(" in message
+    assert "xy: no stop" in message
+    assert "shutter close: RuntimeError('shutter: stuck')" in message

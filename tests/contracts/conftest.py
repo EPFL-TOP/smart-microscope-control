@@ -66,14 +66,27 @@ class Envelope:
 
         Every other key of ``base`` is kept, ``[safety]``'s included (such as a
         later ``max_z_jog_um``), and so is ``source``.
+
+        The window must lie inside the profile's own soft limits, which exist
+        for a reason (the stage's travel, an obstacle): a stand that starts
+        too close to one fails the test before anything moves, rather than
+        have the contracts widen the limit.
         """
+        own = base.safety
         xy_limits = None
         if self.xy is not None:
             x0, y0, span = self.xy.x_um, self.xy.y_um, self.xy_span_um
             xy_limits = ((x0 - span, x0 + span), (y0 - span, y0 + span))
+            if own.xy_soft_limits_um is not None:
+                for axis, window, limit in zip(
+                    "XY", xy_limits, own.xy_soft_limits_um, strict=True
+                ):
+                    _require_inside(axis, window, limit)
         z_limits = None
         if self.z_um is not None:
             z_limits = (self.z_um - self.z_span_um, self.z_um + self.z_span_um)
+            if own.z_soft_limits_um is not None:
+                _require_inside("Z", z_limits, own.z_soft_limits_um)
         safety = SafetySection.model_validate(
             {
                 **base.safety.model_dump(),
@@ -83,6 +96,19 @@ class Envelope:
             }
         )
         return base.model_copy(update={"safety": safety})
+
+
+def _require_inside(
+    axis: str, window: tuple[float, float], limit: tuple[float, float]
+) -> None:
+    """Fail the test unless the contract's ``window`` lies within the profile's ``limit``."""
+    if window[0] < limit[0] or window[1] > limit[1]:
+        pytest.fail(
+            f"the stand starts too close to its {axis} soft limits "
+            f"[{limit[0]:g}, {limit[1]:g}] µm: the contracts need "
+            f"[{window[0]:g}, {window[1]:g}] µm. Move it towards the middle of "
+            f"its travel and run them again"
+        )
 
 
 @pytest.fixture(
@@ -192,6 +218,12 @@ def dry_z(dry_microscope: Microscope, backend: str) -> ZStage:
     return _capability(dry_microscope, backend, ZStage)
 
 
+@pytest.fixture
+def put_back() -> Callable[[Microscope, Envelope], None]:
+    """The put-back ``microscope`` runs at teardown, for the tests of it."""
+    return _put_back
+
+
 def _put_back(facade: Microscope, envelope: Envelope) -> None:
     """Return the stand to ``envelope``, or stop it if a motion is left.
 
@@ -199,45 +231,55 @@ def _put_back(facade: Microscope, envelope: Envelope) -> None:
     instead: the stand's own ``close()`` cannot see this facade's motions.
     The light is still cut if it started off, since closing a shutter is
     never refused (§13). Otherwise every item that differs is put back,
-    each attempted even if an earlier one failed, light off first and on
-    last; the first failure is raised, as a teardown error.
+    light off first and on last.
+
+    Every step is attempted even if an earlier one failed, and one error
+    then names every step that failed: at a stand, the operator must learn
+    each item that was not put back, not only the first.
     """
     shutter = facade.get(Shutter)
     state = facade.state()
+    steps: list[tuple[str, Callable[[], None]]] = []
     if state.halted or state.moving:
-        try:
-            facade.stop()
-        finally:
-            if shutter is not None and envelope.shutter_open is False:
-                shutter.set_open(False)
+        steps.append(("stop", facade.stop))
+        if shutter is not None and envelope.shutter_open is False:
+            steps.append(("shutter close", lambda: _put_back_shutter(shutter, False)))
+        _run_all(steps)
         return
 
     tolerance_um = envelope.tolerance_um
-    steps: list[Callable[[], None]] = []
     if shutter is not None and envelope.shutter_open is False:
-        steps.append(lambda: _put_back_shutter(shutter, False))
+        steps.append(("shutter close", lambda: _put_back_shutter(shutter, False)))
     xy = facade.get(XYStage)
     if xy is not None and (start := envelope.xy) is not None:
-        steps.append(lambda: _put_back_xy(xy, start, tolerance_um))
+        steps.append(("xy", lambda: _put_back_xy(xy, start, tolerance_um)))
     z = facade.get(ZStage)
     if z is not None and (z0 := envelope.z_um) is not None:
-        steps.append(lambda: _put_back_z(z, z0, tolerance_um))
+        steps.append(("z", lambda: _put_back_z(z, z0, tolerance_um)))
     camera = facade.get(Camera)
     if camera is not None and (ms := envelope.exposure_ms) is not None:
-        steps.append(lambda: _put_back_exposure(camera, ms))
+        steps.append(("exposure", lambda: _put_back_exposure(camera, ms)))
     if shutter is not None and (auto := envelope.auto_shutter) is not None:
-        steps.append(lambda: _put_back_auto_shutter(shutter, auto))
+        steps.append(("auto-shutter", lambda: _put_back_auto_shutter(shutter, auto)))
     if shutter is not None and envelope.shutter_open is True:
-        steps.append(lambda: _put_back_shutter(shutter, True))
+        steps.append(("shutter open", lambda: _put_back_shutter(shutter, True)))
+    _run_all(steps)
 
-    errors: list[Exception] = []
-    for step in steps:
+
+def _run_all(steps: list[tuple[str, Callable[[], None]]]) -> None:
+    """Run every step; then raise one error naming each that failed, from the first."""
+    failed: list[tuple[str, Exception]] = []
+    for name, step in steps:
         try:
             step()
         except Exception as exc:
-            errors.append(exc)
-    if errors:
-        raise errors[0]
+            failed.append((name, exc))
+    if failed:
+        listed = "; ".join(f"{name}: {exc!r}" for name, exc in failed)
+        raise RuntimeError(
+            f"the stand was not put back where it started ({listed}); check it "
+            f"before the next run"
+        ) from failed[0][1]
 
 
 def _put_back_shutter(shutter: Shutter, open_: bool) -> None:

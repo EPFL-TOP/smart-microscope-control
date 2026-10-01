@@ -61,7 +61,10 @@ simulator.
 
 **What it moves.** Before each test, the suite records where the stand
 is. It then replaces the profile's `[safety]` with limits around that
-start: XY ± 100 µm, Z ± 3 µm, and a 50 µm jog limit.
+start: XY ± 100 µm, Z ± 3 µm, and a 50 µm jog limit. Those limits must
+lie inside the profile's own: a stand that starts closer than that to one
+of its soft limits fails the test before anything moves, so park it
+towards the middle of its travel first.
 
 - The XY stage moves at most 60 µm from the start.
 - Z moves at most 2 µm, and only below the start (away from the sample on
