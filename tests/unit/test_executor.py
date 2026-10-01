@@ -2258,3 +2258,104 @@ def test_a_stop_landing_inside_a_drop_does_not_raise() -> None:
     assert mover.result == "arrived"
     assert xy.stops == 2  # the give-up's, then the handler's
     assert executor.moving() == ()
+
+
+# --- several stops, then their lines (FM-62) ----------------------------------
+
+
+class _StopsSeen(logging.Handler):
+    """Records each line with how many stops each device had seen by then."""
+
+    def __init__(self, *devices: _Device) -> None:
+        super().__init__()
+        self.devices = devices
+        self.seen: list[tuple[str, tuple[int, ...]]] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.seen.append((record.getMessage(), tuple(d.stops for d in self.devices)))
+
+
+def test_hold_log_writes_the_halt_and_every_stop_line_after_the_last_stop() -> None:
+    # #76 (FM-62): the emergency stop wrote each line as it went, so a blocked
+    # console held the Z stop behind the halt's line and the XY stop's.
+    executor, xy, z = _ex(), _Device(), _Device("Z")
+    handler = _StopsSeen(xy, z)
+    LOGGER.addHandler(handler)
+
+    def emergency_stop() -> str:
+        executor.halt()
+        executor.stop(xy.motion)
+        executor.stop(z.motion)
+        return "stopped"
+
+    try:
+        result = executor.hold_log(emergency_stop)
+    finally:
+        LOGGER.removeHandler(handler)
+    assert result == "stopped"
+    assert handler.seen == [
+        ("microscope: halted", (1, 1)),
+        ("xy_stage XY: stop", (1, 1)),
+        ("xy_stage Z: stop", (1, 1)),
+    ]
+
+
+def test_hold_log_writes_its_lines_when_the_stops_raise_and_holds_nothing_after(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A second Ctrl-C during the stops: the lines held so far are still
+    # written, and the thread does not go on holding the ones that follow.
+    executor, xy, z = _ex(), _Device(), _Device("Z")
+
+    def interrupted() -> None:
+        executor.stop(xy.motion)
+        raise KeyboardInterrupt  # raised from the stub, not sent as a signal
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER.name):
+        with pytest.raises(KeyboardInterrupt):
+            executor.hold_log(interrupted)
+        assert caplog.messages == ["xy_stage XY: stop"]
+        executor.stop(z.motion)
+        assert caplog.messages == ["xy_stage XY: stop", "xy_stage Z: stop"]
+
+
+def test_a_nested_hold_log_leaves_the_writing_to_the_outer_one(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A handler's emergency stop inside close()'s stops: its lines wait for
+    # the outer stops too, and nothing is written twice.
+    executor, xy, z = _ex(), _Device(), _Device("Z")
+    after_inner: list[str] = []
+
+    def outer() -> None:
+        executor.hold_log(lambda: executor.stop(xy.motion))
+        after_inner.extend(caplog.messages)
+        executor.stop(z.motion)
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER.name):
+        executor.hold_log(outer)
+    assert after_inner == []
+    assert caplog.messages == ["xy_stage XY: stop", "xy_stage Z: stop"]
+
+
+def test_hold_log_does_not_hold_another_threads_lines() -> None:
+    # Held per thread: a stop on another thread (a UI) is not kept waiting
+    # for this one's lines, nor are its own lines kept back.
+    executor, z = _ex(), _Device("Z")
+    written = threading.Event()
+    handler = _OnLog("xy_stage Z: stop", written.set)
+    LOGGER.addHandler(handler)
+    stoppers: list[_Thread] = []
+
+    def run() -> bool:
+        stoppers.append(_Thread(lambda: executor.stop(z.motion)))
+        return written.wait(JOIN_S)
+
+    try:
+        written_inside = executor.hold_log(run)
+    finally:
+        LOGGER.removeHandler(handler)
+    stoppers[0].join()
+    assert written_inside, "another thread's line was held"
+    assert stoppers[0].error is None
+    assert z.stops == 1
