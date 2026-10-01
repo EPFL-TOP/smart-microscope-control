@@ -2200,8 +2200,8 @@ def test_dry_run_move_stopped_while_queued_is_cancelled_too() -> None:
 
 
 def test_halt_and_stop_inside_a_registry_section_return() -> None:
-    # #76 (FM-70): Python runs a Ctrl-C handler on the thread it interrupts,
-    # between two bytecodes. With a plain Lock, a handler that called halt()
+    # #76 (FM-70): Python runs a Ctrl-C handler on the main thread, between
+    # two of its bytecodes. With a plain Lock, a handler that called halt()
     # or stop() while its thread was inside a registry section (every move
     # enters one) hung there for ever, and no stop went out.
     executor, xy = _ex(), _Device()
@@ -2317,6 +2317,26 @@ def test_hold_log_writes_its_lines_when_the_stops_raise_and_holds_nothing_after(
         assert caplog.messages == ["xy_stage XY: stop"]
         executor.stop(z.motion)
         assert caplog.messages == ["xy_stage XY: stop", "xy_stage Z: stop"]
+
+
+def test_a_second_ctrl_c_while_the_held_lines_are_written_leaves_nothing_held(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Adversarial review of #76 (FM-65): the hold is cleared before the first
+    # held line is written. Cleared after them, an interrupt in that writing
+    # left the thread holding, and every later line on it was kept for good.
+    executor, xy, z = _ex(), _Device(), _Device("Z")
+    handler = _InterruptOn("xy_stage XY: stop")
+    LOGGER.addHandler(handler)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            executor.hold_log(lambda: executor.stop(xy.motion))
+    finally:
+        LOGGER.removeHandler(handler)
+    with caplog.at_level(logging.WARNING, logger=LOGGER.name):
+        executor.stop(z.motion)
+    assert caplog.messages == ["xy_stage Z: stop"]
+    assert (xy.stops, z.stops) == (1, 1)
 
 
 def test_a_nested_hold_log_leaves_the_writing_to_the_outer_one(

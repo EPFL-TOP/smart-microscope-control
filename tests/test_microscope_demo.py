@@ -711,10 +711,10 @@ def _in_a_registry_section(m: Microscope, call: Callable[[], object]) -> list[ob
 
 
 def test_stop_from_inside_a_registry_section_stops_and_returns(demo_core: Any) -> None:
-    # #76 (FM-70): a Ctrl-C handler runs on the thread it interrupts. With
-    # the registry lock a plain Lock, a handler that called stop() while its
-    # thread was inside a registry section (every move enters one) hung in
-    # halt(), and no stop went out.
+    # #76 (FM-70): a Ctrl-C handler runs on the main thread, between two of
+    # its bytecodes. With the registry lock a plain Lock, a handler that
+    # called stop() while that thread was inside a registry section (every
+    # move enters one) hung in halt(), and no stop went out.
     spy = _Spy(demo_core)
     m = Microscope.from_core(spy, Profile.demo())
     errors = _in_a_registry_section(m, m.stop)

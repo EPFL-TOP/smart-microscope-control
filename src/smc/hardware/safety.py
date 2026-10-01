@@ -265,10 +265,11 @@ class Executor:
     their action, stop generations, the halt, who holds the lock). No code
     here holds it across a device call or a log call, or takes the
     microscope lock while holding it. It is re-entrant because Python runs
-    a signal handler on the thread it interrupts, between two bytecodes: a
-    Ctrl-C handler that calls ``Microscope.stop()`` can land while that
-    thread is inside a registry section, and a plain lock would block the
-    stop for ever (FM-70). Such a stop can run at any point of a section,
+    a signal handler on the main thread, between two of its bytecodes,
+    whichever thread the signal reached: a Ctrl-C handler that calls
+    ``Microscope.stop()`` can land while the main thread is inside a
+    registry section, and a plain lock would block the stop for ever
+    (FM-70). Such a stop can run at any point of a section,
     even inside one statement, so every section stays correct when it does:
     it iterates a snapshot taken in one call, and a drop tolerates an entry
     that is already gone.

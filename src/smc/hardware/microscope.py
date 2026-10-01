@@ -422,6 +422,12 @@ class Microscope:
         pulls a device from under an action in another thread; that wait is
         bounded like any action's.
 
+        A Ctrl-C handler calls :meth:`stop`, not this: landing inside one of
+        the ``Executor``'s registry sections, ``close()`` would wait for the
+        microscope lock while the interrupted frame holds the registry lock,
+        and every other thread's stop would wait with it, up to the lock
+        timeout (#76).
+
         Raises:
             MicroscopeBusyError: Another call held the microscope lock past
                 the lock timeout (a hung driver); nothing was unloaded, and
