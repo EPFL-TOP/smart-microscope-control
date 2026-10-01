@@ -11,8 +11,10 @@ import codecs
 import contextlib
 import logging
 import math
+import os
 import platform
 import sys
+import tempfile
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -681,6 +683,30 @@ def _check_out(path: Path) -> Path:
     return path
 
 
+def _replace(out: Path, write: Callable[[Path], object]) -> None:
+    """Have ``write`` fill a new file next to ``out``, then move it onto ``out``.
+
+    tifffile opens its target with ``"wb"``, which truncates it at once: a
+    Ctrl-C or an error half-way through would leave a broken file where an
+    earlier capture was. The partial file is removed on any failure, and the
+    rename fails, leaving ``out`` as it was, when another program holds it
+    open (a TIFF open in Fiji on Windows).
+
+    Raises:
+        OSError: The folder cannot be written, or ``out`` cannot be replaced.
+    """
+    fd, name = tempfile.mkstemp(dir=out.parent, prefix=f".{out.name}.", suffix=".part")
+    os.close(fd)
+    partial = Path(name)
+    try:
+        write(partial)
+        os.replace(partial, out)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            partial.unlink()
+        raise
+
+
 def _check_exposure(value_ms: float | None) -> float | None:
     """Refuse an exposure that is not finite or not in (0, 60 000] ms (FM-32)."""
     if value_ms is not None and not (
@@ -761,7 +787,7 @@ def snap(
                 f"min {int(frame.min())}, max {int(frame.max())}"
             )
             try:
-                tifffile.imwrite(out, frame, metadata=meta)
+                _replace(out, lambda path: tifffile.imwrite(path, frame, metadata=meta))
             except OSError as exc:
                 # FM-34: the frame was taken; the summary still gets printed.
                 write_error = exc

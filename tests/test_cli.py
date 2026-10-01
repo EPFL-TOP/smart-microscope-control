@@ -529,3 +529,39 @@ def test_snap_write_failure_still_prints_the_frame_and_exits_1(
     assert "✗ could not write" in result.output
     # FM-36: the bracketed errno is not eaten as markup.
     assert "[Errno 13]" in result.output
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_snap_overwrites_an_existing_file(tmp_path: Path) -> None:
+    out = tmp_path / "frame.tif"
+    out.write_bytes(b"an earlier capture")
+
+    result = runner.invoke(app, ["snap", "--out", str(out)])
+
+    assert result.exit_code == 0, result.output
+    assert tifffile.imread(out).shape == (512, 512)
+    assert [p.name for p in tmp_path.iterdir()] == ["frame.tif"]
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_an_interrupted_write_keeps_the_earlier_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # tifffile opens its target with "wb": a Ctrl-C half-way through the
+    # write would otherwise leave a truncated file where a good one was.
+    out = tmp_path / "frame.tif"
+    out.write_bytes(b"an earlier capture")
+
+    def interrupted(path: str | Path, *args: object, **kwargs: object) -> None:
+        Path(path).write_bytes(b"\x00" * 8)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(tifffile, "imwrite", interrupted)
+
+    result = runner.invoke(app, ["snap", "--out", str(out)])
+
+    assert result.exit_code == 130, result.output
+    assert out.read_bytes() == b"an earlier capture"
+    assert [p.name for p in tmp_path.iterdir()] == ["frame.tif"]
