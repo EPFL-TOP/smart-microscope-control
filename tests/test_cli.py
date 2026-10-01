@@ -71,6 +71,18 @@ def test_version_prints_the_package_version() -> None:
     assert __version__ in result.output
 
 
+def test_the_cli_leaves_the_smc_logger_as_it_found_it() -> None:
+    # A handler left on CliRunner's closed stream turned every later smc log
+    # record into a "Logging error" traceback in other test modules (CI, #11).
+    logger = logging.getLogger("smc")
+    before = (logger.level, list(logger.handlers))
+
+    result = runner.invoke(app, ["-v", "version"])
+
+    assert result.exit_code == 0, result.output
+    assert (logger.level, list(logger.handlers)) == before
+
+
 def test_no_arguments_shows_help() -> None:
     result = runner.invoke(app, [])
     assert "doctor" in result.output

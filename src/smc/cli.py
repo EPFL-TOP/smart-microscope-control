@@ -89,20 +89,30 @@ class _Settings:
     debug: bool = False
 
 
-def _configure_logging(level: int) -> None:
-    """Send the ``smc`` loggers to stderr at ``level``; the root logger is left alone.
+def _configure_logging(level: int) -> Callable[[], None]:
+    """Send the ``smc`` loggers to stderr at ``level``; return the call that undoes it.
 
-    Records still propagate, so an application or ``pytest`` that configured
-    the root logger keeps receiving them.
+    The root logger is left alone, and records still propagate, so an
+    application or ``pytest`` that configured it keeps receiving them. The
+    undo runs when the command ends: ``app`` also runs inside other programs
+    (``CliRunner``), where a handler left on a stream that was closed turns
+    every later record into a "Logging error" traceback.
     """
     logger = logging.getLogger("smc")
     for handler in list(logger.handlers):
         if isinstance(handler, _CliLogHandler):
             logger.removeHandler(handler)
+    previous_level = logger.level
     handler = _CliLogHandler(sys.stderr)
     handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
     logger.addHandler(handler)
     logger.setLevel(level)
+
+    def undo() -> None:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+
+    return undo
 
 
 # --- output ------------------------------------------------------------------
@@ -253,8 +263,10 @@ def _main(
     for stream in (sys.stdout, sys.stderr):
         if stream is not None:
             tolerate_unencodable_output(stream)
-    _configure_logging(
-        logging.DEBUG if debug else logging.INFO if verbose else logging.WARNING
+    ctx.call_on_close(
+        _configure_logging(
+            logging.DEBUG if debug else logging.INFO if verbose else logging.WARNING
+        )
     )
     ctx.obj = _Settings(debug=debug)
 
