@@ -8,7 +8,9 @@ those two cases run there alone. The put-back is safety code at a stand:
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
+from dataclasses import replace
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 import pytest
@@ -23,7 +25,7 @@ if TYPE_CHECKING:
     # For the annotations only; the values come from the fixture.
     from pymmcore_plus import CMMCorePlus
 
-    from conftest import Envelope
+    from conftest import Envelope, PutBack
     from smc.testing import FakeCore
 
 
@@ -153,12 +155,132 @@ def test_envelope_refuses_a_start_too_close_to_the_profile_limits(
     assert safety.z_soft_limits_um == (-3, 3)
 
 
+#: An inner run that moves the fake stand, opens the light, then is
+#: interrupted as an operator's Ctrl-C would be. ``snapshot`` is requested
+#: before ``microscope``, and depends on ``stand``, so it records the log
+#: right after the put-back and before the stand is closed.
+INTERRUPTED_RUN = """
+from pathlib import Path
+
+import pytest
+
+from smc.hardware.capabilities import Shutter, XYStage
+
+LOG = Path(__file__).with_name("teardown.log")
+
+
+@pytest.fixture
+def snapshot(stand, fake_core):
+    yield
+    LOG.write_text("\\n".join(fake_core.log), encoding="utf-8")
+
+
+@pytest.mark.parametrize("backend", ["fake"], indirect=True)
+def test_operator_presses_ctrl_c(snapshot, microscope, envelope, fake_core):
+    microscope.require(XYStage).move_to_um(envelope.xy.x_um + 20, envelope.xy.y_um)
+    microscope.require(Shutter).set_open(True)
+    fake_core.log.clear()
+    raise KeyboardInterrupt
+"""
+
+INI = """
+[pytest]
+markers =
+    demo: needs the Micro-Manager demo adapters
+    hardware: needs a real microscope
+"""
+
+
+def test_teardown_after_ctrl_c_stops_the_stand_instead_of_moving_it(
+    pytester: pytest.Pytester,
+) -> None:
+    # The layer's Ctrl-C handling stops the stage and leaves the facade
+    # neither halted nor moving; only the interrupted session tells the
+    # put-back that the operator meant "stop", not "go back".
+    pytester.makeini(INI)
+    pytester.makeconftest(
+        (Path(__file__).parent / "conftest.py").read_text(encoding="utf-8")
+    )
+    pytester.makepyfile(INTERRUPTED_RUN)
+    result = pytester.runpytest_subprocess("-p", "smc.testing.fixtures", timeout=120.0)
+    assert result.ret == pytest.ExitCode.INTERRUPTED, result.stdout.str()
+    log = (pytester.path / "teardown.log").read_text(encoding="utf-8").splitlines()
+    assert log == [
+        "stop('XY')",
+        "stop('Z')",
+        "setShutterOpen('White Light Shutter', False)",
+    ]
+
+
+@pytest.mark.parametrize("backend", ["fake"], indirect=True)
+def test_put_back_cuts_the_light_before_moving_and_restores_it_last(
+    stand: Microscope, envelope: Envelope, fake_core: FakeCore, put_back: PutBack
+) -> None:
+    facade = Microscope.from_core(stand.core, envelope.profile(stand.profile))
+    shutter = facade.require(Shutter)
+    assert envelope.xy is not None
+    assert envelope.z_um is not None
+    assert envelope.shutter_open is False
+    assert envelope.auto_shutter is True
+    x0, y0, z0 = envelope.xy.x_um, envelope.xy.y_um, envelope.z_um
+
+    # Started closed: the light goes off before anything moves.
+    facade.require(XYStage).move_to_um(x0 + 20, y0 - 10)
+    facade.require(ZStage).move_to_um(z0 - 2)
+    facade.require(Camera).set_exposure_ms(20.0)
+    shutter.set_auto_shutter(False)
+    shutter.set_open(True)
+    fake_core.log.clear()
+    put_back(facade, envelope)
+    assert fake_core.log == [
+        "setShutterOpen('White Light Shutter', False)",
+        f"setXYPosition('XY', {x0!r}, {y0!r})",
+        f"setPosition('Z', {z0!r})",
+        f"setExposure({envelope.exposure_ms!r})",
+        "setAutoShutter(True)",
+    ]
+
+    # Started open: the light comes back on only after every other item.
+    started_open = replace(envelope, shutter_open=True)
+    facade.require(XYStage).move_to_um(x0 + 20, y0 - 10)
+    fake_core.log.clear()
+    put_back(facade, started_open)
+    assert fake_core.log == [
+        f"setXYPosition('XY', {x0!r}, {y0!r})",
+        "setShutterOpen('White Light Shutter', True)",
+    ]
+
+
+@pytest.mark.parametrize("backend", ["fake"], indirect=True)
+def test_put_back_closes_the_shutter_even_when_its_read_fails(
+    stand: Microscope,
+    envelope: Envelope,
+    fake_core: FakeCore,
+    put_back: PutBack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    facade = Microscope.from_core(stand.core, envelope.profile(stand.profile))
+    facade.require(Shutter).set_open(True)
+
+    def no_answer(label: str | None = None) -> bool:
+        raise RuntimeError("shutter: no answer")
+
+    monkeypatch.setattr(fake_core, "getShutterOpen", no_answer)
+    fake_core.log.clear()
+    # The readback after the close fails too, so the put-back still reports it.
+    with pytest.raises(RuntimeError, match="was not put back"):
+        put_back(facade, envelope)
+    monkeypatch.undo()
+    assert fake_core.log[:1] == ["setShutterOpen('White Light Shutter', False)"]
+    assert facade.require(Shutter).is_open() is False
+
+
 @pytest.mark.parametrize("backend", ["fake"], indirect=True)
 def test_put_back_names_every_item_it_could_not_restore(
     stand: Microscope,
     envelope: Envelope,
     fake_core: FakeCore,
-    put_back: Callable[[Microscope, Envelope], None],
+    put_back: PutBack,
 ) -> None:
     facade = Microscope.from_core(stand.core, envelope.profile(stand.profile))
     facade.require(XYStage).move_to_um(20, -10)
@@ -179,7 +301,7 @@ def test_put_back_of_a_halted_stand_reports_a_failed_stop_and_a_failed_close(
     stand: Microscope,
     envelope: Envelope,
     fake_core: FakeCore,
-    put_back: Callable[[Microscope, Envelope], None],
+    put_back: PutBack,
 ) -> None:
     facade = Microscope.from_core(stand.core, envelope.profile(stand.profile))
     facade.require(Shutter).set_open(True)

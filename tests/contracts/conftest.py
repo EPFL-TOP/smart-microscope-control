@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import TypeVar
+from typing import Protocol, TypeVar
 
 import pytest
 
@@ -147,14 +147,34 @@ def envelope(stand: Microscope) -> Envelope:
 
 
 @pytest.fixture
-def microscope(stand: Microscope, envelope: Envelope) -> Iterator[Microscope]:
+def microscope(
+    stand: Microscope, envelope: Envelope, request: pytest.FixtureRequest
+) -> Iterator[Microscope]:
     """A second facade over ``stand``'s core, under the envelope's ``[safety]``.
 
-    Never closed: ``stand`` owns the core. Its teardown puts the stand back.
+    Never closed: ``stand`` owns the core. Its teardown puts the stand back,
+    unless the run was interrupted: see ``_interrupted``.
     """
     facade = Microscope.from_core(stand.core, envelope.profile(stand.profile))
     yield facade
-    _put_back(facade, envelope)
+    _put_back(facade, envelope, interrupted=_interrupted(request.session))
+
+
+def _interrupted(session: pytest.Session) -> bool:
+    """Whether the run is being torn down after a Ctrl-C (or ``pytest.exit``).
+
+    An operator who presses Ctrl-C during a move has stopped the stand on
+    purpose. The layer sends the stop and drops the motion once the stage
+    reads idle, without halting (``safety._give_up``), so the facade looks
+    like any finished test's. pytest still runs fixture teardowns after a
+    ``KeyboardInterrupt``, from ``pytest_sessionfinish``, by which time it has
+    set ``exitstatus`` to ``INTERRUPTED``: that, not the facade, is what tells
+    the put-back not to move the stand again.
+
+    ``session.shouldstop`` is deliberately not read: ``--stepwise`` sets it
+    after an ordinary failure, and that stand should still be put back.
+    """
+    return bool(session.exitstatus == pytest.ExitCode.INTERRUPTED)
 
 
 @pytest.fixture
@@ -218,38 +238,47 @@ def dry_z(dry_microscope: Microscope, backend: str) -> ZStage:
     return _capability(dry_microscope, backend, ZStage)
 
 
+class PutBack(Protocol):
+    """The signature of ``_put_back``, for the tests that call it directly."""
+
+    def __call__(
+        self, facade: Microscope, envelope: Envelope, *, interrupted: bool = False
+    ) -> None: ...
+
+
 @pytest.fixture
-def put_back() -> Callable[[Microscope, Envelope], None]:
+def put_back() -> PutBack:
     """The put-back ``microscope`` runs at teardown, for the tests of it."""
     return _put_back
 
 
-def _put_back(facade: Microscope, envelope: Envelope) -> None:
-    """Return the stand to ``envelope``, or stop it if a motion is left.
+def _put_back(
+    facade: Microscope, envelope: Envelope, *, interrupted: bool = False
+) -> None:
+    """Return the stand to ``envelope``, or stop it if it must not move again.
 
-    A halted facade, or one with a motion still registered, is stopped
-    instead: the stand's own ``close()`` cannot see this facade's motions.
-    The light is still cut if it started off, since closing a shutter is
-    never refused (§13). Otherwise every item that differs is put back,
-    light off first and on last.
+    A halted facade, one with a motion still registered, or an interrupted
+    run is stopped instead: the stand's own ``close()`` cannot see this
+    facade's motions, and an operator's Ctrl-C means "stop", not "go back".
+    The light is still cut if it started off. Otherwise every item that
+    differs is put back, light off first and on last.
 
     Every step is attempted even if an earlier one failed, and one error
     then names every step that failed: at a stand, the operator must learn
     each item that was not put back, not only the first.
     """
     shutter = facade.get(Shutter)
-    state = facade.state()
     steps: list[tuple[str, Callable[[], None]]] = []
-    if state.halted or state.moving:
+    if interrupted or _has_motion(facade):
         steps.append(("stop", facade.stop))
         if shutter is not None and envelope.shutter_open is False:
-            steps.append(("shutter close", lambda: _put_back_shutter(shutter, False)))
+            steps.append(("shutter close", lambda: _close_shutter(shutter)))
         _run_all(steps)
         return
 
     tolerance_um = envelope.tolerance_um
     if shutter is not None and envelope.shutter_open is False:
-        steps.append(("shutter close", lambda: _put_back_shutter(shutter, False)))
+        steps.append(("shutter close", lambda: _close_shutter(shutter)))
     xy = facade.get(XYStage)
     if xy is not None and (start := envelope.xy) is not None:
         steps.append(("xy", lambda: _put_back_xy(xy, start, tolerance_um)))
@@ -262,8 +291,14 @@ def _put_back(facade: Microscope, envelope: Envelope) -> None:
     if shutter is not None and (auto := envelope.auto_shutter) is not None:
         steps.append(("auto-shutter", lambda: _put_back_auto_shutter(shutter, auto)))
     if shutter is not None and envelope.shutter_open is True:
-        steps.append(("shutter open", lambda: _put_back_shutter(shutter, True)))
+        steps.append(("shutter open", lambda: _open_shutter(shutter)))
     _run_all(steps)
+
+
+def _has_motion(facade: Microscope) -> bool:
+    """Whether the facade is halted or still has a motion registered."""
+    state = facade.state()
+    return state.halted or bool(state.moving)
 
 
 def _run_all(steps: list[tuple[str, Callable[[], None]]]) -> None:
@@ -282,9 +317,18 @@ def _run_all(steps: list[tuple[str, Callable[[], None]]]) -> None:
         ) from failed[0][1]
 
 
-def _put_back_shutter(shutter: Shutter, open_: bool) -> None:
-    if shutter.is_open() != open_:
-        shutter.set_open(open_)
+def _close_shutter(shutter: Shutter) -> None:
+    """Cut the light without reading first: a failed read must not leave it on.
+
+    Closing is never refused (§13), and closing a closed shutter is harmless.
+    """
+    shutter.set_open(False)
+
+
+def _open_shutter(shutter: Shutter) -> None:
+    """Open only if closed: a failed read leaves the light off, the safe side."""
+    if not shutter.is_open():
+        shutter.set_open(True)
 
 
 def _put_back_xy(xy: XYStage, start: XY, tolerance_um: float) -> None:
