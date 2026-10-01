@@ -119,3 +119,43 @@ def test_checks_summary(point) -> None:
     assert point.checks(green) == "green"
     assert point.checks(failing) == "failing: tests (windows)"
     assert point.checks(running) == "running"
+
+
+def test_merge_with_changes_still_requested_is_flagged(point) -> None:
+    pr = {
+        "number": 72,
+        "title": "fix(hardware): seven concurrency gaps",
+        "reviews": [],
+        "comments": [
+            _c("## Review (design session)\n\n**Verdict: changes requested**", "t1")
+        ],
+    }
+    assert point.merged_lines(pr) == [
+        "- #72 fix(hardware): seven concurrency gaps | changes requested"
+        "  -> MERGED WITH CHANGES REQUESTED"
+    ]
+
+
+def test_merged_pr_lists_the_follow_ups_its_fix_round_named(point) -> None:
+    pr = {
+        "number": 71,
+        "title": "feat(core): Microscope facade",
+        "reviews": [],
+        "comments": [
+            _c("## Review (design session)\n\n**Verdict: changes requested**", "t1"),
+            _c(
+                "## Review addressed (develop session)\n\n"
+                "**Follow-ups to open** (not opened here):\n"
+                "- deferred: `safety.py:286`, a plain lock that halt() takes",
+                "t2",
+            ),
+            _c(
+                "## Review (design session, fix round)\n\n**Verdict: ready to merge**",
+                "t3",
+            ),
+        ],
+    }
+    assert point.merged_lines(pr) == [
+        "- #71 feat(core): Microscope facade | ready to merge",
+        "- #71 fix round, follow-up: deferred: `safety.py:286`, a plain lock that halt() takes",
+    ]
