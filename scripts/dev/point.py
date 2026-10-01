@@ -119,6 +119,37 @@ def checks(rollup: list[dict[str, Any]]) -> str:
     return "green"
 
 
+def review_texts(pr: dict[str, Any]) -> list[dict[str, Any]]:
+    """A PR's reviews and comments as one list: a design verdict can be either."""
+    return [
+        {"body": r.get("body", ""), "createdAt": r.get("submittedAt", "")}
+        for r in pr.get("reviews", [])
+    ] + list(pr.get("comments", []))
+
+
+def merged_lines(pr: dict[str, Any]) -> list[str]:
+    """What the point must know of a PR merged since the last one.
+
+    A merge with changes still requested leaves its blocking items without
+    an owner (#72). The follow-ups a fix round names sit on the PR, where
+    the issue scan below never looks, so they are listed until opened.
+    """
+    texts = review_texts(pr)
+    found = verdict(texts)
+    flag = "  -> MERGED WITH CHANGES REQUESTED" if found.startswith("changes") else ""
+    ref = f"#{pr['number']}"
+    out = [f"- {ref} {clip(str(pr['title']), 90)} | {found}{flag}"]
+    for c in texts:
+        body = str(c.get("body", ""))
+        if body.lstrip().startswith("## Review addressed"):
+            for name in ("Follow-ups", "Follow-ups to open"):
+                out += [
+                    f"- {ref} fix round, follow-up: {clip(i)}"
+                    for i in field(body, name)
+                ]
+    return out
+
+
 def status_of(issue: dict[str, Any]) -> str:
     names = [str(label["name"]) for label in issue.get("labels", [])]
     found = [n[len(STATUS) :] for n in names if n.startswith(STATUS)]
@@ -209,6 +240,18 @@ def main() -> int:
         "--json",
         "number,title,mergeStateStatus,statusCheckRollup,reviews,comments,isDraft",
     )
+    merged = gh_json(
+        "pr",
+        "list",
+        "--state",
+        "merged",
+        "--limit",
+        "100",
+        "--search",
+        f"merged:>={since:%Y-%m-%d}",
+        "--json",
+        "number,title,mergedAt,reviews,comments",
+    )
 
     out = [
         f"# Point facts ({datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC, since {stamp})",
@@ -217,15 +260,19 @@ def main() -> int:
 
     out.append("## Open pull requests")
     for pr in prs:
-        texts = [
-            {"body": r.get("body", ""), "createdAt": r.get("submittedAt", "")}
-            for r in pr.get("reviews", [])
-        ] + list(pr.get("comments", []))
         out.append(
             f"- #{pr['number']} {clip(pr['title'], 90)} | checks {checks(pr.get('statusCheckRollup') or [])}"
-            f" | merge {pr['mergeStateStatus']} | {verdict(texts)}"
+            f" | merge {pr['mergeStateStatus']} | {verdict(review_texts(pr))}"
         )
     if not prs:
+        out.append("- none")
+    out.append("")
+
+    out.append("## Merged since the last point")
+    recent = [p for p in merged if str(p.get("mergedAt", "")) >= stamp]
+    for pr in sorted(recent, key=lambda p: int(p["number"])):
+        out.extend(merged_lines(pr))
+    if not recent:
         out.append("- none")
     out.append("")
 
