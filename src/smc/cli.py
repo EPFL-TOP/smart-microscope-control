@@ -8,26 +8,202 @@ is scriptable, testable and works over SSH to a microscope PC.
 from __future__ import annotations
 
 import codecs
+import contextlib
+import logging
 import math
 import platform
 import sys
+from collections.abc import Iterator, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, TextIO
+from typing import TYPE_CHECKING, Annotated, Any, TextIO
 
 import typer
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
 from smc import __version__
 from smc.hardware import core as core_mod
+from smc.hardware.capabilities import XY
+from smc.hardware.errors import HardwareError, SafetyRefusedError
 
 app = typer.Typer(
     name="smc",
     help="Control several microscopes through one layer; run interchangeable tools.",
     no_args_is_help=True,
     rich_markup_mode="rich",
+    # A --debug traceback must not dump every frame's locals, the core included.
+    pretty_exceptions_show_locals=False,
 )
 console = Console()
+
+#: Click settings for the commands that take signed numbers: ``-100`` is a
+#: distance, not an unknown option. A misspelt option then fails as a bad
+#: number or an extra argument, which is still a usage error (exit 2).
+_NUMBERS: dict[str, Any] = {"ignore_unknown_options": True}
+
+ProfileOption = Annotated[
+    str,
+    typer.Option(
+        "--profile",
+        "-p",
+        envvar="SMC_PROFILE",
+        help="The profile to open: a name found on the search paths (see smc "
+        "profiles) or the path to a .toml file.",
+    ),
+]
+DryRunOption = Annotated[
+    bool,
+    typer.Option(
+        "--dry-run",
+        help="Log the move and do not send it: the stage stays where it is.",
+    ),
+]
+
+if TYPE_CHECKING:
+    _StreamHandler = logging.StreamHandler[TextIO]
+else:  # StreamHandler is subscriptable only from Python 3.11
+    _StreamHandler = logging.StreamHandler
+
+
+class _CliLogHandler(_StreamHandler):
+    """The handler the CLI puts on the ``smc`` logger; marked so it can be replaced.
+
+    Each command builds a new one on ``sys.stderr`` as it is at that moment:
+    ``CliRunner`` swaps the stream for every invocation, and a handler bound
+    to an earlier one writes into a closed buffer.
+    """
+
+
+@dataclass(frozen=True)
+class _Settings:
+    """The root options, handed to every command through ``ctx.obj``."""
+
+    debug: bool = False
+
+
+def _configure_logging(level: int) -> None:
+    """Send the ``smc`` loggers to stderr at ``level``; the root logger is left alone.
+
+    Records still propagate, so an application or ``pytest`` that configured
+    the root logger keeps receiving them.
+    """
+    logger = logging.getLogger("smc")
+    for handler in list(logger.handlers):
+        if isinstance(handler, _CliLogHandler):
+            logger.removeHandler(handler)
+    handler = _CliLogHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(level)
+
+
+# --- output ------------------------------------------------------------------
+# Nothing below goes through rich markup (FM-36): exception messages, device
+# labels and role lines carry brackets ("[roles.assign]", "[core]") that rich
+# would silently drop. Nothing is wrapped either (FM-37): a one-line error
+# must stay one line in a redirected log.
+
+
+def _say(text: str) -> None:
+    """Print a line verbatim: no markup, no highlighting, no emoji codes, no wrapping."""
+    console.print(text, markup=False, highlight=False, emoji=False, soft_wrap=True)
+
+
+def _fail(message: str, *, indent: str = "") -> None:
+    """Print ``✗ message``; only the mark is styled."""
+    console.print(Text.assemble(indent, ("✗ ", "red"), message), soft_wrap=True)
+
+
+def _ok(message: str) -> None:
+    """Print ``✓ message``; only the mark is styled."""
+    console.print(Text.assemble(("✓ ", "green"), message), soft_wrap=True)
+
+
+def _aligned(rows: Sequence[Sequence[str]]) -> list[str]:
+    """Columns padded to their widest cell, two spaces apart, no trailing blanks."""
+    if not rows:
+        return []
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    return [
+        "  ".join(
+            cell.ljust(width) for cell, width in zip(row, widths, strict=True)
+        ).rstrip()
+        for row in rows
+    ]
+
+
+def _um(value: float) -> str:
+    """Two decimals; a stage that reads ``-0.0`` at the origin shows ``0.00``."""
+    text = f"{value:.2f}"
+    return "0.00" if text == "-0.00" else text
+
+
+def _xy(position: XY) -> str:
+    return f"XY ({_um(position.x_um)}, {_um(position.y_um)}) µm"
+
+
+def _z(z_um: float) -> str:
+    return f"Z {_um(z_um)} µm"
+
+
+# --- errors ------------------------------------------------------------------
+
+#: Exit codes (design §9): 1 for a hardware, profile or file error, 2 for a
+#: refusal (nothing was sent; Click's usage errors exit 2 as well), 130 for
+#: Ctrl-C, as a shell reports a process ended by SIGINT.
+_EXIT_ERROR = 1
+_EXIT_REFUSED = 2
+_EXIT_INTERRUPTED = 130
+
+
+@contextlib.contextmanager
+def _reported(ctx: typer.Context, *, force_hint: str = "") -> Iterator[None]:
+    """Turn what a command body raises into one ``✗`` line and an exit code.
+
+    Wrapped around the ``with Microscope.open(...)`` block, so the stand is
+    released before the line is printed. Ctrl-C is the ``KeyboardInterrupt``
+    the Executor already turned into a stop of any move under way (FM-17);
+    there is no signal handler (FM-70).
+
+    Args:
+        ctx: The command's context; ``--debug`` lets every error through,
+            so Typer prints the traceback.
+        force_hint: What the operator types to force a forceable refusal; it
+            replaces the API's ``how_to_force`` (``force=True``).
+    """
+    try:
+        yield
+    except (typer.Exit, typer.Abort, typer.BadParameter):
+        raise
+    except (Exception, KeyboardInterrupt) as exc:
+        settings = ctx.find_object(_Settings)
+        if settings is not None and settings.debug:
+            raise
+        raise typer.Exit(code=_report(exc, force_hint)) from None
+
+
+def _report(exc: BaseException, force_hint: str) -> int:
+    """Print the one line for ``exc``; return the exit code."""
+    if isinstance(exc, SafetyRefusedError):
+        fix = f" — {force_hint or exc.how_to_force}" if exc.how_to_force else ""
+        _fail(f"{exc.reason}{fix}")
+        return _EXIT_REFUSED
+    if isinstance(exc, HardwareError):
+        _fail(str(exc))
+        return _EXIT_ERROR
+    if isinstance(exc, KeyboardInterrupt):
+        _fail(
+            "interrupted — any move under way was stopped; read the position "
+            "(smc stage get, smc z get) before the next move"
+        )
+        return _EXIT_INTERRUPTED
+    _fail(
+        f"unexpected {type(exc).__name__}: {exc} — run it again as smc --debug … "
+        "for the traceback, and file an issue"
+    )
+    return _EXIT_ERROR
 
 
 def tolerate_unencodable_output(stream: TextIO) -> None:
@@ -48,11 +224,33 @@ def tolerate_unencodable_output(stream: TextIO) -> None:
 
 
 @app.callback()
-def _main() -> None:
+def _main(
+    ctx: typer.Context,
+    verbose: Annotated[
+        bool,
+        typer.Option(
+            "--verbose",
+            "-v",
+            help="Log on stderr, one line per command sent to a device.",
+        ),
+    ] = False,
+    debug: Annotated[
+        bool,
+        typer.Option(
+            "--debug",
+            help="Log everything, and show the traceback instead of the "
+            "one-line error.",
+        ),
+    ] = False,
+) -> None:
     """Control several microscopes through one layer; run interchangeable tools."""
     for stream in (sys.stdout, sys.stderr):
         if stream is not None:
             tolerate_unencodable_output(stream)
+    _configure_logging(
+        logging.DEBUG if debug else logging.INFO if verbose else logging.WARNING
+    )
+    ctx.obj = _Settings(debug=debug)
 
 
 @app.command()
@@ -99,7 +297,7 @@ def doctor(
     console.print(table)
 
     if not st.installed:
-        console.print(f"[red]✗[/red] {core_mod.INSTALL_HINT}")
+        _fail(core_mod.INSTALL_HINT)
         raise typer.Exit(code=1)
 
     target = str(config) if config else "demo configuration"
@@ -120,9 +318,9 @@ def doctor(
                 rt.add_row("xy position", f"({x:.1f}, {y:.1f}) µm")
             console.print(rt)
     except core_mod.CoreError as exc:
-        console.print(f"[red]✗[/red] {exc}")
+        _fail(str(exc))
         raise typer.Exit(code=1) from None
-    console.print(f"[green]✓[/green] {target} loads and answers.")
+    _ok(f"{target} loads and answers.")
 
 
 @app.command()
@@ -174,9 +372,7 @@ def discover(
     from smc.discovery import report as report_mod
 
     if not math.isfinite(timeout_s):  # click's range check lets nan through
-        console.print(
-            f"[red]✗[/red] --timeout-s must be a number of seconds, not {timeout_s}"
-        )
+        _fail(f"--timeout-s must be a number of seconds, not {timeout_s}")
         raise typer.Exit(code=2)
     # --out is checked before the survey and written before the report is
     # printed: a broken pipe or Ctrl-C while printing must not lose the files.
@@ -184,7 +380,7 @@ def discover(
         try:
             report_mod.prepare(out)
         except OSError as exc:
-            console.print(f"[red]✗[/red] cannot write to {out}: {exc}")
+            _fail(f"cannot write to {out}: {exc}")
             raise typer.Exit(code=1) from None
     if probe_adapter:
         console.print(
@@ -210,13 +406,11 @@ def discover(
     for item in report_mod.renderables(inv):
         console.print(item)
     if write_error is not None:
-        console.print(
-            f"[red]✗[/red] could not write the survey to {out}: {write_error}"
-        )
+        _fail(f"could not write the survey to {out}: {write_error}")
         raise typer.Exit(code=1)
     if written is not None:
         json_path, text_path = written
-        console.print(f"[green]✓[/green] wrote {json_path} and {text_path.name}")
+        _ok(f"wrote {json_path} and {text_path.name}")
 
 
 def main() -> None:
