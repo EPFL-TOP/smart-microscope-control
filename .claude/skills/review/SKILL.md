@@ -57,11 +57,14 @@ a verdict, do what it unlocks (labels, dependents), and end the session.
 
    Anything that does not threaten the default path or break a rule is
    optional, or a follow-up issue you open.
-6. **Ready to merge** → tell the owner in one line that #N can be merged
-   (squash) and what it unblocks; set those issues to `status: ready` if
-   their plan is posted and every dependency is merged. **Changes
-   requested** → tell the owner to run `/develop <issue>` again: it finds
-   this review and fixes the blocking items. When the review changes the
+6. **Ready to merge** → if the PR is still a draft, `gh pr ready N`. Tell
+   the owner in one line that #N can be merged (squash) and what it
+   unblocks; set those issues to `status: ready` if their plan is posted and
+   every dependency is merged. **Changes requested** →
+   `gh pr ready N --undo`: the PR goes back to draft, so a green PR with an
+   open blocking item cannot be merged by mistake (#72 was). Tell the owner to run
+   `/develop <issue>` again: it finds this review, fixes the blocking items
+   and marks the PR ready. When the review changes the
    design (a design-doc PR), also replace the issue's `## Plan` with a
    complete revised one (edit it in place, see `/plan`): the fix round and
    its adversarial reviewers read the plan, not the review (#54).

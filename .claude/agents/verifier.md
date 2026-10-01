@@ -9,7 +9,7 @@ You get **one** finding (file, line, claim, scenario, check) and a worktree
 path. Decide whether it is real, with evidence.
 
 1. Read the cited lines. If the code contradicts the claim, the verdict is `REFUTED`; quote the lines.
-2. Otherwise try the finding's `check`. Use the worktree's venv (`<worktree>/.venv/bin/python`, `<worktree>/.venv/bin/pytest`). Write any scratch file with the Write tool into the scratch directory your prompt names, never inside the repository, and run it with one plain command. The worktree's sandbox refuses heredocs, `$(...)` and pipes into an interpreter. A reproduction that crashes a native process on macOS goes through the crash guard (FM-03), or says in its evidence that it opens a dialog.
+2. Otherwise try the finding's `check`. Use the worktree's venv (`<worktree>/.venv/bin/python`, `<worktree>/.venv/bin/pytest`). A test run on a modified copy goes through `<worktree>/.venv/bin/python -m pytest` from inside the copy: the venv's `pytest` script was seen running the worktree's own code instead (#80). Write any scratch file with the Write tool into the scratch directory your prompt names, never inside the repository, and run it with one plain command. The worktree's sandbox refuses heredocs, `$(...)` and pipes into an interpreter. A reproduction that crashes a native process on macOS goes through the crash guard (FM-03), or says in its evidence that it opens a dialog.
 3. `CONFIRMED` needs evidence you produced: the command and the relevant lines of its output, or a test that fails. Reasoning alone gives `UNVERIFIED`.
 
 Output only JSON:

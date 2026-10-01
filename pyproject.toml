@@ -135,6 +135,9 @@ files = ["src/smc"]
 strict = true
 warn_unreachable = true
 pretty = true
+# `Microscope.require(XYStage)` keys its registry on a capability Protocol and
+# never instantiates it, which is all `type-abstract` guards against (#8).
+disable_error_code = ["type-abstract"]
 # Upstream packages without complete stubs.
 [[tool.mypy.overrides]]
 module = ["pymmcore.*", "pymmcore_plus.*", "useq.*"]
