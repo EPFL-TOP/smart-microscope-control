@@ -486,6 +486,7 @@ class Executor:
     def __init__(self, *, dry_run: bool, lock: threading.RLock, logger: logging.Logger,
                  lock_timeout_s: float = 60.0): ...
     def halt(self) -> None; def resume(self) -> None
+    def hold_log(self, run: Callable[[], T]) -> T   # §13: several stops, then their lines
     halted: bool
     def moving(self) -> tuple[str, ...]
     dry_run: bool
@@ -926,6 +927,15 @@ after a move waits for the move, then snaps.
   microscope lock, are never refused, and run in dry-run too. The registry
   lock, which is never held across a device call, is the only lock they
   take.
+- **The registry lock is an `RLock`** (FM-70, #76). Python runs a signal
+  handler on the thread it interrupts, between two bytecodes, so a Ctrl-C
+  handler that calls `Microscope.stop()` or `close()` can land while that
+  thread is inside a registry section, and a plain `Lock` then blocks the
+  stop for ever. Re-entry means a stop can run at any point of a registry
+  section on the same thread, even inside one statement such as a
+  comprehension, so every section stays correct when it does: it iterates
+  a snapshot taken in one call (`list(registry.values())`), and a drop
+  tolerates an entry that is already gone.
 - **`set_open(False)`** is a safe call like stop. Closing a shutter never
   waits for the lock and is never refused, so the light can always be cut:
   a laser shutter during a traverse, or a cleanup in a `finally` block.
@@ -939,6 +949,16 @@ after a move waits for the move, then snaps.
   line. A blocked console (a QuickEdit selection on Windows) or a second
   Ctrl-C can then delay or cut the log line, not the stop. One helper sends
   every stop, so the order lives in one place.
+- **Several stops in a row** (the emergency stop, and `close()` when
+  something moves) send **every** stop before **any** of their log lines,
+  the halt's included. Otherwise a blocked console holds the Z stop behind
+  the line of the XY stop: on the demo (measured 2026-10-01) the order was
+  `microscope: halted`, stop XY, its line, stop Z, its line. The facade
+  runs the stops inside `Executor.hold_log(run)`, which holds every line
+  the `Executor` writes on the calling thread while `run` runs and writes
+  them, in order, once it has returned or raised. Lines that other threads
+  write meanwhile are not held, and a `hold_log` nested in another on the
+  same thread leaves the writing to the outer one (#76).
 - **Logging an action**: its INFO line is written after the halt, guard and
   generation checks, just before the command, so the log never shows a move
   that was not sent.
@@ -948,11 +968,13 @@ after a move waits for the move, then snaps.
 - **`Microscope.stop()`** (#8) is the stand's emergency stop:
   1. it halts first;
   2. it calls `stop()` on every stage, continuing past failures;
-  3. it raises one `HardwareError` listing the failures, if any.
+  3. only then are the log lines written, `microscope: halted` first, then
+     one per stop (both steps above run inside `hold_log`);
+  4. it raises one `HardwareError` listing the failures, if any.
 
-  While halted, every action raises `MicroscopeHaltedError`. The halt takes
-  no lock, so it can land at any moment. Actions check it at step 1 and
-  again immediately before their command or acquisition. `resume()` clears
+  While halted, every action raises `MicroscopeHaltedError`. The halt never
+  waits for the microscope lock, so it can land at any moment. Actions check
+  it at step 1 and again immediately before their command or acquisition. `resume()` clears
   the halt, drops every registered motion (above), and starts nothing. A
   capability's own `stop()` does not halt.
 - **`MicroscopeHaltedError` derives from `HardwareError`, not
@@ -981,7 +1003,7 @@ cancelled.
 
 The facade uses only the capabilities' public methods and:
 - `Executor(dry_run=..., lock=..., logger=..., lock_timeout_s=...)`;
-- `halt()`, `resume()`, `halted` and `moving()`;
+- `halt()`, `resume()`, `halted`, `moving()` and `hold_log()`;
 - the four errors in §2.
 
 The internal methods (`do`, `read`, `wait`, `stop` and their helpers) may
