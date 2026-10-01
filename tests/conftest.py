@@ -1,4 +1,10 @@
-"""Shared fixtures.
+"""Loads the fixtures every test here may use (design §8).
+
+The fixtures live in the pytest plugin ``smc.testing.fixtures``, so that a
+plugin's own repository can load them the same way. It adds ``--profile``
+and provides ``mm_available``, ``demo_core``, ``demo_microscope``,
+``demo_microscope_dry``, ``fake_core``, ``fake_microscope`` and
+``hardware_microscope``.
 
 Two kinds of test exist here (ADR-0005):
 
@@ -8,45 +14,9 @@ Two kinds of test exist here (ADR-0005):
   so a broken install cannot hide behind a green run.
 * **hardware tests** carry ``@pytest.mark.hardware`` and are deselected by
   default. They run only at a microscope: ``pytest -m hardware --profile X``.
+
+``pytest_plugins`` is only allowed in this top-level conftest; ``pytester``
+runs the plugin's own tests (``test_testing_fixtures.py``).
 """
 
-from __future__ import annotations
-
-import os
-from collections.abc import Iterator
-
-import pytest
-
-from smc.hardware.core import close_core, find_install, open_core
-
-
-def pytest_addoption(parser: pytest.Parser) -> None:
-    parser.addoption(
-        "--profile",
-        default=None,
-        help="Microscope profile for hardware tests (e.g. nikon-ti2).",
-    )
-
-
-@pytest.fixture(scope="session")
-def mm_available() -> bool:
-    """Whether the Micro-Manager device adapters are installed."""
-    available = find_install() is not None
-    if not available and os.environ.get("SMC_REQUIRE_MM") == "1":
-        pytest.fail(
-            "SMC_REQUIRE_MM=1 but Micro-Manager adapters are missing — "
-            "run `mmcore install --test-adapters`."
-        )
-    return available
-
-
-@pytest.fixture
-def demo_core(mm_available: bool) -> Iterator[object]:
-    """A fresh core loaded with the demo configuration, released afterwards."""
-    if not mm_available:
-        pytest.skip("Micro-Manager demo adapters not installed")
-    core = open_core(None)
-    try:
-        yield core
-    finally:
-        close_core(core)
+pytest_plugins = ["smc.testing.fixtures", "pytester"]
