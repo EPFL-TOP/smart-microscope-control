@@ -1,7 +1,8 @@
 # M1 design — the hardware layer, proven on the simulator
 
 - **Status**: design for issues #5, #6, #7, #8, #9, #10, #11, #30 and #54
-  (§13, added 2026-09-23, revised 2026-09-24; §9 revised 2026-09-30)
+  (§13, added 2026-09-23, revised 2026-09-24; §9 revised 2026-09-30;
+  §8 revised 2026-10-01)
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: this document is the contract between issues that are built in
   parallel. Names, module paths and signatures below are fixed; an executor
@@ -56,7 +57,7 @@ src/smc/
     synthetic.py       PlateSample renderer + SampleCamera               #10
   cli.py               (exists) + profiles/devices/stage/z/snap/discover  #11 #30
 tests/
-  conftest.py          loads smc.testing.fixtures; --profile option
+  conftest.py          loads smc.testing.fixtures (which adds --profile) and pytester
   contracts/           one file per capability, parametrised backends     #9
   unit/                pure logic (roles, profile, safety, synthetic)
   test_*.py            existing simulator/CLI tests
@@ -555,42 +556,263 @@ all devices (one connection per stand), and is idempotent. The `Executor` gets
 
 ## 8. Testing — `smc/testing/` and `tests/` (#9, #10)
 
+**Revised 2026-10-01** for the plan of #9. These facts were measured on
+the demo that day (pymmcore-plus 0.18.1, pymmcore 12.5.0.75.0), and the
+fake copies them:
+- The demo's `DHub` has no properties, so the first version's case "at
+  least one property per device" failed on the demo.
+- MMCore ignores a set on a read-only property: it raises nothing and the
+  value does not change. Only the backend's own check refuses it.
+- An unknown label raises `RuntimeError('No device with label "X"')`. An
+  unknown property raises `RuntimeError('Cannot get value of property "X"')`.
+- `getDeviceType` returns a `DeviceType` member, and `str()` of it gives
+  `"XYStage"`.
+- `unloadDevice` clears the core slot that named the device, and calling
+  `unloadAllDevices` twice is harmless.
+- XY and Z start at 0. The XY stage reads busy right after a move, for
+  about 1 s per 10 mm; Z reads idle at once. A fresh core's timeout is
+  5000 ms.
+- A Z move on the demo leaves continuous focus enabled. The Nikon quirk
+  exists only in the fake.
+
 ### FakeCore (`smc/testing/fakes.py`)
 
-The subset of the MMCore API the backend uses (§6), with a call `log`,
-per-device positions/state, a property store, `snapImage/getImage` served
-by a `frame_source: Callable[[float, float, float], np.ndarray] | None`,
-and quirk switches (`quirk_z_move_disables_autofocus: bool = True`, kept
-for M2). Construction: `FakeCore.demo_like()` mirrors the demo
-configuration's labels and types so the same tests run on both.
+`FakeCore` is an in-memory stand-in for `CMMCorePlus`. It covers what the
+simulator cannot show: a stuck device, a device that fails, a vendor
+quirk. It does not subclass `CMMCorePlus`. It implements the calls the
+layer makes (§6, `roles._InventoryCore`, and the facade's `setTimeoutMs`,
+`getStateLabel` and `unloadAllDevices`), with MMCore's names, argument
+order and errors. It lives in the package, not under `tests/`, so that
+plugins and M2's quirk tests can use it.
 
-### Fixtures (`smc/testing/fixtures.py`, loaded by `tests/conftest.py`)
+```python
+@dataclass(slots=True)
+class FakeProperty:
+    value: str
+    read_only: bool = False
+    allowed: tuple[str, ...] = ()
+    lower: float | None = None
+    upper: float | None = None
 
-`mm_available`, `demo_core`, `demo_microscope` (+ `dry_run` variant),
-`fake_core`, `fake_microscope`, `hardware_microscope` (skips unless
-`--profile` was given; only a human at the stand passes it).
+
+@dataclass(slots=True)
+class FakeDevice:
+    label: str
+    type: DeviceType  # pymmcore_plus.DeviceType
+    library: str = "FakeCore"
+    name: str = ""
+    description: str = ""
+    properties: dict[str, FakeProperty] = field(default_factory=dict)
+    state_labels: tuple[str, ...] = ()  # State devices: one label per position
+
+
+class FakeCore:
+    def __init__(
+        self,
+        devices: Iterable[FakeDevice] = (),
+        *,
+        camera: str = "",
+        xy_stage: str = "",
+        focus: str = "",
+        autofocus: str = "",
+        shutter: str = "",
+    ) -> None: ...  # a slot naming no device: ValueError
+    @classmethod
+    def demo_like(cls) -> FakeCore: ...
+
+    log: list[str]  # every mutating call, e.g. "setXYPosition('XY', 20.0, -10.0)"
+    # called with (x_um, y_um, z_um) at each snap; None gives a zero frame
+    frame_source: Callable[[float, float, float], np.ndarray] | None
+    busy_devices: set[str]  # labels that read busy until removed; stop() leaves them
+    failing: dict[str, BaseException]  # label -> raised by every call on that device
+    pixel_size_um: float  # what getPixelSizeUm() returns
+    image_shape: tuple[int, int]  # (height, width)
+    bit_depth: int
+    quirk_z_move_disables_autofocus: bool = True  # FM-12, kept for M2
+```
+
+Behaviour. Each point is either the measured MMCore behaviour above or
+labelled as assumed:
+- **Log.** Every mutating call appends `name(args)`, with its arguments
+  as `repr`. The mutating calls are: positions, `stop`, exposure,
+  shutter, auto-shutter, properties, state, the slot setters,
+  `setTimeoutMs`, continuous focus, `snapImage` and the unloads. Reads
+  are not logged.
+- **Calls.**
+  - Inventory: `getLoadedDevices` (with `"Core"` last, as on the demo),
+    `getDeviceType`, `getDeviceLibrary`, `getDeviceName`,
+    `getDeviceDescription`.
+  - The getter and setter of each of the five slots.
+  - `setTimeoutMs` / `getTimeoutMs` (5000 at construction).
+  - Stages: `getXPosition`, `getYPosition`, `getXYPosition`,
+    `setXYPosition`, `getPosition`, `setPosition`, `deviceBusy`, `stop`.
+  - Camera: `snapImage`, `getImage`, `getExposure`, `setExposure`,
+    `getImageHeight`, `getImageWidth`, `getImageBitDepth`,
+    `getPixelSizeUm`.
+  - Shutter: `getShutterOpen`, `setShutterOpen`, `getAutoShutter`,
+    `setAutoShutter`.
+  - Properties: `getDevicePropertyNames`, `hasProperty`, `getProperty`,
+    `setProperty`, `isPropertyReadOnly`, `hasPropertyLimits`,
+    `getPropertyLowerLimit`, `getPropertyUpperLimit`,
+    `getAllowedPropertyValues`.
+  - State devices: `getState`, `setState`, `getStateLabel`,
+    `getStateLabels`.
+  - Continuous focus: `enableContinuousFocus`,
+    `isContinuousFocusEnabled`, `isContinuousFocusLocked` (locked when
+    enabled; assumed).
+  - `unloadDevice`, `unloadAllDevices`.
+- **One store.** The camera's `Exposure` (written `f"{ms:.4f}"`, as the
+  demo does) and `Binning`, and a State device's `State` and `Label`, are
+  properties. The dedicated calls read and write those same properties,
+  so `Properties` and the capabilities agree.
+- **Motion is instant.** A set changes the position at once. A device
+  reads busy only while it is in `busy_devices`. The demo has real
+  motion; the fake has stuck devices.
+- **Frames.** `snapImage()` calls `frame_source(x, y, z)` with the
+  positions of the devices in the XY and focus slots (0.0 for an empty
+  slot) and keeps the frame for `getImage()`. With no source, the frame
+  is zeros of `image_shape`: `uint8` up to 8 bits, else `uint16`.
+  `getImage()` before any snap raises `RuntimeError`.
+- **Errors.**
+  - An unknown label or property raises, with the measured message.
+  - A set on a read-only property is ignored.
+  - A value outside `allowed` raises `RuntimeError` (assumed, not
+    measured).
+  - A label in `failing` makes every call that names it raise its
+    exception. If it is the camera's label, the current-camera calls
+    raise it too.
+- **The quirk.** With `quirk_z_move_disables_autofocus`, a `setPosition`
+  on the focus slot's device disables continuous focus, as moving the Z
+  drive does with PFS on the Nikon stands.
+- **Unloading** removes the devices and clears the slots that named them.
+
+`FakeCore.demo_like()` mirrors the demo configuration:
+- the demo's labels, types, libraries, names and descriptions;
+- the five slots;
+- the State devices' labels and positions;
+- `pixel_size_um = 1.0`;
+- a 512 × 512, 16-bit camera with an exposure of 10 ms and binning 1;
+- every position at 0, the shutter closed and auto-shutter on. The demo's
+  White Light Shutter starts open on some opens (FM-47); the fake always
+  starts closed.
+
+Its properties are a subset of the demo's:
+- `Name` and `Description` (read-only) wherever the demo has them;
+- the camera's `Binning` (`1 2 4 8`), `Exposure` (0–10 000), `PixelType`,
+  and `CameraName` and `CameraID` (read-only);
+- each State device's `State` and `Label`.
+
+A demo test keeps the inventory and the slots identical. It also checks
+that every property the fake declares exists on the demo, with the same
+read-only flag. Where the fake and the demo disagree, the fake is wrong.
+
+### Fixtures (`smc/testing/fixtures.py`, a pytest plugin)
+
+`tests/conftest.py` loads the plugin with
+`pytest_plugins = ["smc.testing.fixtures", "pytester"]`, and a plugin's
+repository loads it the same way. The plugin imports `pytest`, so
+`smc.testing/__init__.py` exports only the fake. `import smc.testing`
+then works without the dev extra.
+
+| Fixture | Scope | What it gives |
+|---|---|---|
+| `mm_available` | session | Whether the adapters are installed. Fails under `SMC_REQUIRE_MM=1` when they are not. |
+| `demo_core` | function | `open_core(None)`, released afterwards. Skips without the adapters. |
+| `demo_microscope` / `demo_microscope_dry` | function | `Microscope.open(Profile.demo())`, live or with `dry_run=True`, closed afterwards. Skips without the adapters. |
+| `fake_core` | function | `FakeCore.demo_like()` |
+| `fake_microscope` | function | `Microscope.from_core(fake_core, Profile.demo())`, closed afterwards |
+| `hardware_microscope` | function | `Microscope.open(<--profile>)`, closed afterwards |
+
+The plugin also adds the option `--profile <name or path>`.
+
+`hardware_microscope` **fails** a test that is not marked
+`@pytest.mark.hardware`, and it does so before it opens anything. A stand
+is therefore never reached by a test that the default run selects. It
+**skips** when `--profile` is not given, with the message "hardware tests
+need --profile <name>; run them only at the microscope (ADR-0005)".
+`--profile demo` rehearses a hardware run on the simulator.
+
+The demo fixtures use `Profile.demo()` rather than `"demo"`, because
+`Profile.load("demo")` picks up whatever `demo.toml` the working directory
+has.
 
 ### Contract suite (`tests/contracts/`)
 
-`conftest.py` defines `backend` parametrised over `fake`, `demo`,
-`hardware` (the last skips without `--profile`); `microscope` fixture maps
-it. One file per capability; each test asks `microscope.require(Cap)`.
-Required cases:
+Fixtures in `conftest.py`. The contract tests never import a backend
+class; they only go through `Microscope`.
+- **`backend`** is parametrised over `fake`, `demo` (marked `demo`) and
+  `hardware` (marked `hardware`). The default run therefore deselects
+  `hardware`, and `pytest -m hardware --profile X tests/contracts`
+  selects only it.
+- **`stand`** is the backend's facade on its own profile:
+  `fake_microscope`, `demo_microscope` or `hardware_microscope`, fetched
+  with `request.getfixturevalue`. It owns the core and closes it.
+- **`envelope`** records where the stand started: XY, Z, exposure,
+  shutter and auto-shutter, each `None` when the stand lacks the
+  capability, all read through `stand`. It also holds the contract's
+  `[safety]`:
+  - `max_jog_um = 50`;
+  - XY soft limits at the start ± 100 µm on each axis;
+  - Z soft limits at the start ± 3 µm.
+- **`microscope`** and **`dry_microscope`** are
+  `Microscope.from_core(stand.core, …)`, built with the stand's profile
+  whose `[safety]` is replaced by the envelope's: one live, one with
+  `dry_run=True`. Neither closes the core; `stand` does.
+  - At teardown, `microscope` puts back what the contracts change: XY,
+    Z, exposure, shutter and auto-shutter.
+  - If the facade is halted, or something is still moving, it calls
+    `stop()` instead.
+- **`xy`, `z`, `camera`, `shutter`, `properties`** (and `dry_xy`,
+  `dry_z`) are that capability of `microscope`.
+  - On `hardware`, a stand without the capability skips the test.
+  - On `fake` and `demo`, the capability is fetched with `require()`, so
+    a broken role resolution fails the test instead of skipping it.
 
-- XY: absolute move lands within 0.5 µm; relative move adds; jog above
-  `max_jog_um` raises `SafetyRefusedError` and `force=True` passes; target
-  outside soft limits raises and is not forceable; `wait()` returns;
-  dry-run returns the commanded value and the real position is unchanged.
-- Z: same shape as XY without the jog guard.
-- Camera: `snap()` is 2-D and matches `image_shape()`; exposure round-trips;
-  `pixel_size_um()` is `0.0` or positive, never negative; profile fallback
-  by objective label works on the fake.
-- Shutter: open/close round-trip; auto-shutter round-trip.
-- Properties: `devices()` excludes `Core`; `describe()` lists at least one
-  property per device; read-only properties refuse `set()`.
-- Facade: `require` on a missing role raises `CapabilityMissingError` naming
-  the role; `state()` fills what it can when one device fails
-  (fake raises on Z).
+**What a contract may move.** Every target a contract sends lies within
+the envelope:
+- the XY stage moves at most 60 µm from the start;
+- Z moves at most 2 µm, and only below the start, which is away from the
+  sample on an inverted stand.
+
+Every target outside the envelope is one the layer must refuse, so none
+of them is ever sent. The stand ends where it started.
+
+Required cases. Each case is one test, and every method of every
+capability Protocol runs on every backend.
+- **XY**:
+  - an absolute move lands within 0.5 µm, and returns only once
+    `is_busy()` is false;
+  - a relative move adds to the position;
+  - a jog above `max_jog_um` raises `SafetyRefusedError` with a
+    `how_to_force` and sends nothing; with `force=True` it passes;
+  - a target outside the soft limits raises with an empty
+    `how_to_force`, for an absolute or a relative move, forced or not;
+  - `wait()` returns on an idle stage;
+  - `stop()` on an idle stage is harmless;
+  - `limits_um()` reports the envelope;
+  - in dry-run, a move returns the commanded value and the stage does not
+    move.
+- **Z**: the same cases without the jog guard, which #84 adds.
+- **Camera**:
+  - `snap()` is 2-D, matches `image_shape()`, and has a dtype wide
+    enough for `bit_depth()`;
+  - the exposure round-trips within 1 %;
+  - `pixel_size_um()` is `0.0` or a positive finite number;
+  - on the fake only, the pixel size falls back to the profile's value
+    for the current objective, scaled by the binning.
+- **Shutter**: open and close round-trip; auto-shutter round-trips.
+- **Properties**:
+  - `devices()` is not empty and excludes `Core`;
+  - `describe()` answers for every device, each entry names its device,
+    and at least one device has a property (the demo's `DHub` has none);
+  - a read-only property refuses `set()` with `HardwareError` and keeps
+    its value. The test is skipped on a stand with no read-only property.
+- **Facade**:
+  - `state()` of a healthy stand lists no errors;
+  - on the fake only, `require()` for a missing role raises
+    `CapabilityMissingError` naming the role;
+  - on the fake only, `state()` fills what it can when one device fails
+    (Z in `failing`).
 
 ### Synthetic sample (`smc/testing/synthetic.py`, #10)
 
