@@ -120,6 +120,9 @@ convention = "google"
 "src/smc/hardware/**" = ["TID251"]
 "src/smc/discovery/**" = ["TID251"]
 "src/smc/testing/**" = ["TID251"]
+# FakeCore mirrors MMCore's camelCase API; a method that deviates from MMCore
+# or models a quirk still says so in a docstring.
+"src/smc/testing/fakes.py" = ["N802", "D102"]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "pymmcore_plus".msg = "Hardware is reached only through smc.hardware (ADR-0003, CLAUDE.md); ask for a capability instead."
