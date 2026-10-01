@@ -1,7 +1,7 @@
 # M1 design — the hardware layer, proven on the simulator
 
 - **Status**: design for issues #5, #6, #7, #8, #9, #10, #11, #30 and #54
-  (§13, added 2026-09-23, revised 2026-09-24)
+  (§13, added 2026-09-23, revised 2026-09-24; §9 revised 2026-09-30)
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: this document is the contract between issues that are built in
   parallel. Names, module paths and signatures below are fixed; an executor
@@ -618,22 +618,77 @@ crosses a well wall.
 
 ## 9. CLI — `smc/cli.py` (#11)
 
-Global option `--profile/-p NAME_OR_PATH` (default `$SMC_PROFILE` or
-`demo`); `--dry-run` where a command moves something.
+*Revised 2026-09-30* (plan of #11), after measuring typer 0.27 and
+rich 15: the first version made `--profile` a root option, which Click
+accepts only before the command (`smc -p X devices`, not the
+`smc devices -p X` used in #11 and #16), and it did not say that a
+negative number (`smc stage jog -100 0`) parses as an unknown option.
+
+**Options.**
+
+- `--profile/-p NAME_OR_PATH` belongs to each command that opens a
+  microscope (`doctor`, `devices`, `stage …`, `z …`, `snap`) and goes
+  after it: `smc devices -p nikon-ti2`. Default: `$SMC_PROFILE`, else
+  `demo`.
+- `--dry-run` belongs to each command that moves something (`stage move`,
+  `stage jog`, `z move`, `z jog`). The move is logged and not sent; the
+  command prints the commanded target and the position read afterwards.
+  It does not cover what opening the configuration applies (#78).
+- Root options go before the command: `--verbose/-v` (INFO log on stderr,
+  one line per command sent) and `--debug` (DEBUG log, and the traceback
+  instead of the one-line error).
+- **Negative numbers.** The move commands set Click's
+  `ignore_unknown_options`, so `-100` is a number, not an option. A
+  misspelt option (`--dryrun`) then fails as a bad number or an extra
+  argument, which is a usage error: exit 2, nothing opened, nothing sent.
 
 | Command | Does |
 |---|---|
-| `smc profiles` | list profiles found on the search paths |
-| `smc doctor [-p]` | (extend) MM status, then open the profile and print `RoleMap.describe()` with candidates and warnings |
-| `smc devices [-p]` | table: label, type, library/name, role |
+| `smc profiles` | one line per profile found on the search paths (name, path or `(built in)`, and the error of one that does not load), then the search paths |
+| `smc doctor [-p]` | MM status, then open the profile and print `RoleMap.describe()` and the role warnings; `--config CFG` keeps the raw `.cfg` check |
+| `smc devices [-p]` | one line per device (label, type, library/name, roles), then `RoleMap.describe()` and the warnings |
 | `smc stage get` / `stage move X Y` / `stage jog DX DY [--force]` | `XYStage` |
-| `smc z get` / `z move Z` / `z jog DZ` | `ZStage` |
-| `smc snap [--out frame.tif] [--exposure-ms MS]` | `Camera`; writes 16-bit TIFF via `tifffile` (new dependency) |
+| `smc z get` / `z move Z` / `z jog DZ` | `ZStage` (no jog guard in M1; the soft limits apply) |
+| `smc snap [--out frame.tif] [--exposure-ms MS]` | `Camera`; one TIFF via `tifffile` (new dependency) |
 | `smc discover …` | §10 |
 
-Errors print one line (`✗ reason — how to force / fix`) and exit 1;
-`SafetyRefusedError` exits 2. Tests use `typer.testing.CliRunner` on the demo
-profile and on a fake through `SMC_PROFILE`.
+**Output.** Plain aligned text, never parsed as rich markup (FM-36) and
+never wrapped to the console width (FM-37). Positions have two decimals:
+`XY (1234.50, -56.25) µm`, `Z 12.50 µm`. JSON output comes later.
+
+**Exit codes.**
+
+| Code | Meaning |
+|---|---|
+| 0 | done |
+| 1 | a hardware, profile or file error, or an unexpected exception (one line naming its type; `--debug` for the traceback) |
+| 2 | refused, nothing sent: a guard (`SafetyRefusedError`, `MotionInProgressError` included) or a bad argument (Click's usage errors exit 2 as well) |
+| 130 | interrupted (Ctrl-C): the Executor stopped any move under way (FM-17), and the stand was released |
+
+Errors print one line, `✗ reason — how to force / fix`; for a jog, the
+fix is `--force`, not the API's `force=True`. Every command opens the
+microscope in a `with` block, so the stand is released before the line is
+printed. No signal handler: Ctrl-C is the `KeyboardInterrupt` the Executor
+already turns into a stop (FM-70). No `smc stop`: a second process cannot
+connect to a stand that the first one holds.
+
+**`smc snap`.** `--out` must end in `.tif` or `.tiff`, and its folder must
+exist; both are checked before the stand is opened (FM-30). `--exposure-ms`
+must be finite and in (0, 60 000] ms, because a snap cannot be interrupted
+(FM-32). A 2-D `uint8` or `uint16` frame is written in its own dtype and
+never rescaled; the demo and the Hamamatsu give `uint16` (measured on the
+demo, 2026-09-30). Any other frame is refused. The TIFF's description holds
+tifffile's JSON metadata: profile, camera, `exposure_ms`, `pixel_size_um`
+(`0.0` means unknown, as the camera reports it), `xy_um`, `z_um`,
+`time_utc`, `smc_version`. A failed write still prints the frame summary
+(FM-34).
+
+**`smc profiles`** skips a TOML file without a `[microscope]` table without
+a word, since `./pyproject.toml` is on the search path. It prints the search
+paths, so a profile that is not found can be diagnosed.
+
+Tests use `typer.testing.CliRunner` with `COLUMNS=200` on the demo profile;
+the fake through `SMC_PROFILE` comes with #9.
 
 ## 10. Discover — `smc/discovery/` (#30, pulled into M1)
 

@@ -155,8 +155,9 @@ class Safety:
 
 #: How often a wait asks the device whether it is still busy.
 POLL_INTERVAL_S = 0.01
-#: How often a caller waiting for the lock looks at what the holder is doing,
-#: so that it is refused as soon as the holder starts waiting for a motion.
+#: How often a caller waiting for the lock looks at the halt and at what the
+#: holder is doing, so that it is refused as soon as the stand is halted or
+#: the holder starts waiting for a motion.
 _LOCK_POLL_S = 0.05
 
 
@@ -308,7 +309,9 @@ class Executor:
 
     # --- the lock section --------------------------------------------------
 
-    def _section(self, description: str, body: Callable[[], T]) -> T:
+    def _section(
+        self, description: str, body: Callable[[], T], halt_mark: int | None
+    ) -> T:
         """Run ``body`` holding the microscope lock (design §13, "The lock").
 
         A thread that already holds the lock runs ``body`` inside it
@@ -322,9 +325,14 @@ class Executor:
         ``acquired`` is set, so the ``finally`` also asks the lock whether this
         thread took it. The lock is released before the holder record is
         cleared, so an interrupt in that clean-up cannot keep it.
+
+        ``halt_mark`` is what the action recorded of the halt when it was
+        called. ``body`` checks it once the lock is taken; while the lock is
+        held by another thread, ``_contention`` checks it at every poll, and
+        inside this thread's own lock ``_nested`` checks it first.
         """
         if _lock_is_owned(self._lock):
-            return self._nested(description, body)
+            return self._nested(description, body, halt_mark)
         started = time.monotonic()
         deadline = started + self._lock_timeout_s
         acquired = False
@@ -337,7 +345,7 @@ class Executor:
                 )
                 if not acquired:
                     # Expired only once an attempt made at the deadline failed.
-                    self._contention(started, expired=remaining <= 0)
+                    self._contention(started, halt_mark, expired=remaining <= 0)
             record = _Holder(description, time.monotonic())
             with self._registry_lock:
                 self._holder = record
@@ -347,14 +355,19 @@ class Executor:
                 self._lock.release()
                 self._clear_holder(record)
 
-    def _nested(self, description: str, body: Callable[[], T]) -> T:
+    def _nested(
+        self, description: str, body: Callable[[], T], halt_mark: int | None
+    ) -> T:
         """Run ``body`` inside the lock this thread already holds (design §13, "Re-entry").
 
         A callback inside ``snap`` that moves the stage is part of the snap.
         It is refused while this thread's action waits for a motion, as
         another thread would be: pymmcore-plus emits ``propertyChanged``
         synchronously from ``setProperty``, so a UI handler that snaps runs
-        inside the command of a turret change (#68).
+        inside the command of a turret change (#68). A halt since the call
+        comes before that refusal, as in ``_contention`` (FM-64): the
+        refusal is a ``SafetyRefusedError``, and an emergency stop pressed
+        during the command must not be caught as one.
 
         With no record of this thread's, the lock was taken outside the
         ``Executor`` (a facade helper holding it for a sequence), or the
@@ -366,6 +379,7 @@ class Executor:
         record: _Holder | None = None
         try:
             with self._registry_lock:
+                halted = self._halted_since(halt_mark)
                 holder = self._holder
                 if holder is None or holder.thread != threading.get_ident():
                     record = self._holder = _Holder(
@@ -374,6 +388,8 @@ class Executor:
                     waiting_for, outer = None, description
                 else:
                     waiting_for, outer = holder.waiting_for, holder.description
+            if halted:
+                raise MicroscopeHaltedError()
             if waiting_for is not None:
                 raise MotionInProgressError(
                     (waiting_for,),
@@ -389,10 +405,23 @@ class Executor:
             if record is not None and self._holder is record:
                 self._holder = None
 
-    def _contention(self, started: float, *, expired: bool) -> None:
-        """An action facing a lock held by another thread: refused, still waiting, or out of time."""
+    def _contention(
+        self, started: float, halt_mark: int | None, *, expired: bool
+    ) -> None:
+        """An action facing a lock held by another thread: halted, refused, waiting, or out of time.
+
+        A halt since the call comes first (FM-64). Behind a holder waiting for
+        a motion, the refusal would be a ``SafetyRefusedError``, which a tool
+        may catch and carry on after, through the emergency stop. Behind a
+        slow holder, the caller would wait ``lock_timeout_s`` for a stand the
+        operator has stopped, then report a hung driver. The halt mark, not
+        the flag, is compared, so a ``resume()`` since does not let it wait on.
+        """
         with self._registry_lock:
+            halted = self._halted_since(halt_mark)
             holder = None if self._holder is None else replace(self._holder)
+        if halted:
+            raise MicroscopeHaltedError()
         if holder is not None and holder.waiting_for is not None:
             raise MotionInProgressError(
                 (holder.waiting_for,), f"`{holder.description}` is waiting for it"
@@ -506,26 +535,32 @@ class Executor:
             def last_check() -> None:
                 # FM-66: the halt or a stop may have landed while the line
                 # above was written; the check that matters is the last one.
-                try:
-                    self._refuse_if_cancelled(key, generation, halt_mark, cancelled)
-                except HardwareError:
-                    self._logger.warning("%s: not sent", prepared.log)
-                    raise
+                # Its caller writes the "not sent" line (#80).
+                self._refuse_if_cancelled(key, generation, halt_mark, cancelled)
 
             if motion is not None:
                 return self._move(prepared, motion, generation, limit_s, last_check)
-            last_check()
+            try:
+                last_check()
+            except HardwareError:
+                self._logger.warning("%s: not sent", prepared.log)
+                raise
             if overridden_by is not None:
                 return self._send_overridable(
-                    description, prepared, overridden_by, generation
+                    description, prepared, overridden_by, generation, halt_mark
                 )
             prepared.send()
             return prepared.readback()
 
-        return self._section(description, body)
+        return self._section(description, body, halt_mark)
 
     def _send_overridable(
-        self, description: str, step: Step[T], call: SafeCall, generation: int
+        self,
+        description: str,
+        step: Step[T],
+        call: SafeCall,
+        generation: int,
+        halt_mark: int | None,
     ) -> T:
         """The command and readback of an action ``call`` wins over, under the lock.
 
@@ -533,7 +568,10 @@ class Executor:
         the device before this command (the open) did. If it was called during
         the command, it is sent again after it, whether the command returned or
         raised, and the action raises: the shutter never ends open after a
-        close that reported success (design §13).
+        close that reported success (design §13). It raises
+        ``MicroscopeHaltedError`` if the stand was halted since the action was
+        called, as ``do()`` documents, even if ``resume()`` came since: the
+        halt mark decides, not the flag (#80).
         """
         resent = False
         try:
@@ -543,8 +581,7 @@ class Executor:
                     call.send, f"{call.log} resent after `{step.log}`"
                 )
                 resent = True
-                if self._halted:
-                    raise MicroscopeHaltedError()
+                self._refuse_if_halted(halt_mark)
                 outcome = (
                     "it was sent again after it"
                     if error is None
@@ -583,14 +620,22 @@ class Executor:
         idle. From then on the readback is an ordinary lock holder: a caller
         that saw the stage idle and acts next waits for the lock instead of
         being refused (#68). ``last_check`` runs after "waiting for" is
-        recorded, so nothing lies between it and the command (FM-66).
+        recorded, so nothing lies between it and the command (FM-66). When it
+        refuses, "waiting for" is cleared before the "not sent" line: that
+        line can block on a console (FM-62), and meanwhile ``moving()`` would
+        name, and contenders be refused for, a motion never commanded (#80).
         """
         deadline = time.monotonic() + limit_s
         sending = idle = gave_up = False
         previous: str | None = None
         try:
             previous = self._set_waiting(motion.name)
-            last_check()
+            try:
+                last_check()
+            except HardwareError:
+                self._set_waiting(previous)
+                self._logger.warning("%s: not sent", step.log)
+                raise
             sending = True  # from here on the command may reach the device
             step.send()
             if (
@@ -653,7 +698,7 @@ class Executor:
             self._refuse_if_halted(halt_mark)
             return action()
 
-        return self._section(description, body)
+        return self._section(description, body, halt_mark)
 
     # --- reads ---------------------------------------------------------------
 
@@ -767,8 +812,8 @@ class Executor:
     def halt(self) -> None:
         """Refuse every action until ``resume()``; reads and the safe calls still run.
 
-        An action already called, waiting for the lock, is refused too, even
-        once resumed.
+        An action already called and waiting for the lock is refused too,
+        within one lock poll and even once resumed.
         """
         with self._registry_lock:
             self._halted = True
