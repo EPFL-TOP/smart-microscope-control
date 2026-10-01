@@ -2194,3 +2194,67 @@ def test_dry_run_move_stopped_while_queued_is_cancelled_too() -> None:
         holder.join()
     mover.join()
     assert isinstance(mover.error, MotionStoppedError)
+
+
+# --- a stop that re-enters the registry lock (FM-70) ---------------------------
+
+
+def test_halt_and_stop_inside_a_registry_section_return() -> None:
+    # #76 (FM-70): Python runs a Ctrl-C handler on the thread it interrupts,
+    # between two bytecodes. With a plain Lock, a handler that called halt()
+    # or stop() while its thread was inside a registry section (every move
+    # enters one) hung there for ever, and no stop went out.
+    executor, xy = _ex(), _Device()
+
+    def handler_inside_a_section() -> tuple[str, ...]:
+        with executor._registry_lock:
+            executor.halt()
+            executor.stop(xy.motion)
+            return executor.moving()
+
+    handler = _Thread(handler_inside_a_section)
+    assert handler.finished_within(JOIN_S), "the stop deadlocked on the registry lock"
+    assert handler.error is None
+    assert handler.result == ()
+    assert xy.stops == 1
+    assert executor.halted
+
+
+class _StopLandsInTheDrop(dict[str, object]):
+    """The registry, with a stop landing inside the first lookup made of it.
+
+    It stands for a Ctrl-C handler that runs between a drop's identity check
+    and its delete: the entry is read first, then the handler's stop drops
+    that same entry, and the check goes on with what it read.
+    """
+
+    def __init__(self, registry: dict[str, object], stop: Callable[[], None]) -> None:
+        super().__init__(registry)
+        self._stop: Callable[[], None] | None = stop
+
+    def get(self, key: str, default: object = None) -> object:  # type: ignore[override]
+        value = super().get(key, default)
+        stop, self._stop = self._stop, None
+        if stop is not None:
+            stop()
+        return value
+
+
+def test_a_stop_landing_inside_a_drop_does_not_raise() -> None:
+    # #76 (FM-70, re-entry): once the lock is re-entrant, a handler can run
+    # inside a section and change the registry under it. A drop that checked
+    # the entry and then deleted it raised KeyError when the handler's stop
+    # had dropped the same entry in between.
+    executor, xy, z = _ex(), _Device(), _Device("Z", arrive_after=0)
+    _outlive(executor, xy)
+    xy.busy = False  # the next action's guard sees it idle and drops it
+    executor._registry = _StopLandsInTheDrop(  # type: ignore[assignment]
+        executor._registry,  # type: ignore[arg-type]
+        lambda: executor.stop(xy.motion),
+    )
+    mover = _Thread(lambda: _move(executor, z))
+    assert mover.finished_within(JOIN_S), "the stop deadlocked inside the drop"
+    assert mover.error is None
+    assert mover.result == "arrived"
+    assert xy.stops == 2  # the give-up's, then the handler's
+    assert executor.moving() == ()

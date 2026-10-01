@@ -256,9 +256,16 @@ class Executor:
     Reads, ``wait()``, stops and closing a shutter never take it.
 
     The registry lock guards the small shared state (motions that outlived
-    their action, stop generations, the halt, who holds the lock). It is
-    never held across a device call or a log call, and a thread holding it
-    never takes the microscope lock.
+    their action, stop generations, the halt, who holds the lock). No code
+    here holds it across a device call or a log call, or takes the
+    microscope lock while holding it. It is re-entrant because Python runs
+    a signal handler on the thread it interrupts, between two bytecodes: a
+    Ctrl-C handler that calls ``Microscope.stop()`` can land while that
+    thread is inside a registry section, and a plain lock would block the
+    stop for ever (FM-70). Such a stop can run at any point of a section,
+    even inside one statement, so every section stays correct when it does:
+    it iterates a snapshot taken in one call, and a drop tolerates an entry
+    that is already gone.
     """
 
     def __init__(
@@ -284,7 +291,7 @@ class Executor:
         self._lock = lock
         self._logger = logger
         self._lock_timeout_s = float(lock_timeout_s)
-        self._registry_lock = threading.Lock()
+        self._registry_lock = threading.RLock()
         self._registry: dict[str, _Registration] = {}
         #: Per device: how many explicit stops (or, for a shutter, closes) it
         #: has had. Only ``stop()`` and ``safe()`` advance it, so a give-up
@@ -744,8 +751,11 @@ class Executor:
         It asks no device and never blocks.
         """
         with self._registry_lock:
-            names = [r.motion.name for r in self._registry.values()]
+            # One call: a stop that re-enters would break a comprehension
+            # over the dict itself (FM-70).
+            registrations = list(self._registry.values())
             waiting = None if self._holder is None else self._holder.waiting_for
+        names = [r.motion.name for r in registrations]
         if waiting is not None and waiting not in names:
             names.insert(0, waiting)
         return tuple(names)
@@ -778,6 +788,10 @@ class Executor:
                 f"check the stand and call `resume()`"
             )
         with self._registry_lock:
+            # A stop that re-enters between the read and the write loses one
+            # increment, which does no harm: the counter only has to differ
+            # from what each action recorded, and no other thread can record
+            # a value meanwhile, since this section holds the lock (FM-70).
             self._generations[motion.device] = (
                 self._generations.get(motion.device, 0) + 1
             )
@@ -803,6 +817,7 @@ class Executor:
             Exception: Whatever the call raised; a failed close is a finding.
         """
         with self._registry_lock:
+            # A re-entering call may lose one increment, harmlessly: see stop().
             self._generations[call.device] = self._generations.get(call.device, 0) + 1
         error = self._send_safe(call.send, call.log, level=logging.INFO)
         if error is not None:
@@ -817,6 +832,7 @@ class Executor:
         """
         with self._registry_lock:
             self._halted = True
+            # A re-entering halt may lose one increment, harmlessly: see stop().
             self._halt_epoch += 1
         self._logger.warning("microscope: halted")
 
@@ -832,10 +848,12 @@ class Executor:
         """
         with self._registry_lock:
             self._halted = False
-            dropped = [r.motion.name for r in self._registry.values()]
+            # A snapshot taken in one call, then cleared: a stop that
+            # re-enters cannot break the iteration (FM-70).
+            dropped = list(self._registry.values())
             self._registry.clear()
         self._logger.warning("microscope: resumed")
-        for name in dropped:
+        for name in [r.motion.name for r in dropped]:
             self._logger.warning(
                 "%s: no longer tracked as moving (resume); check it before "
                 "moving it again",
@@ -925,10 +943,14 @@ class Executor:
             return self._registry.get(device)
 
     def _drop(self, device: str, registration: _Registration) -> None:
-        """Drop ``registration`` if it is still the device's; a newer one stays."""
+        """Drop ``registration`` if it is still the device's; a newer one stays.
+
+        A stop that re-enters between the check and the removal may have
+        dropped it already (FM-70), so the removal tolerates its absence.
+        """
         with self._registry_lock:
             if self._registry.get(device) is registration:
-                del self._registry[device]
+                self._registry.pop(device, None)
 
     def _keep_while_moving(self, motion: Motion, registration: _Registration) -> str:
         """Drop a give-up's ``registration`` if the device reads idle; return a log note.
