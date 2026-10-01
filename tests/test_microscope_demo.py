@@ -867,8 +867,10 @@ def test_close_behind_a_hung_snap_fails_with_a_diagnosis(demo_core: Any) -> None
         snapper.join(timeout=JOIN_S)
     assert not snapper.is_alive()
     # Bounded by the lock timeout (0.5 s), well before the snap would end.
+    # close() makes one timed acquire, and on Windows that wait can return a
+    # fraction of a millisecond before its timeout (FM-44): held_s 0.4994.
     assert info.value.at_least
-    assert 0.5 <= info.value.held_s <= waited_s < 2.5
+    assert 0.45 <= info.value.held_s <= waited_s < 2.5
     m.close()  # the snap is over: the retry unloads
     assert spy.calls[-1] == "unloadAllDevices"
     m.close()  # and a third close is a no-op
