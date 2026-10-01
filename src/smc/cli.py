@@ -15,6 +15,7 @@ import platform
 import sys
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, TextIO
 
@@ -25,7 +26,7 @@ from rich.text import Text
 
 from smc import __version__
 from smc.hardware import core as core_mod
-from smc.hardware.capabilities import XY, XYStage, ZStage
+from smc.hardware.capabilities import XY, Camera, XYStage, ZStage
 from smc.hardware.errors import HardwareError, ProfileError, SafetyRefusedError
 from smc.hardware.microscope import Microscope
 from smc.hardware.profile import DEMO_NAME, Profile, list_profiles, search_paths
@@ -660,6 +661,116 @@ def z_jog(
     bound the target.
     """
     _move_z(ctx, profile, dry_run, lambda drive: drive.move_by_um(dz_um))
+
+
+# --- snap ----------------------------------------------------------------------
+
+#: A snap cannot be interrupted (FM-32): ``snapImage`` holds the driver for
+#: the whole exposure, so the CLI refuses one longer than a minute.
+_MAX_SNAP_EXPOSURE_MS = 60_000.0
+
+
+def _check_out(path: Path) -> Path:
+    """Refuse a destination that cannot be written, before the stand is opened (FM-30)."""
+    if path.suffix.lower() not in (".tif", ".tiff"):
+        raise typer.BadParameter(f"{path} must end in .tif or .tiff")
+    if path.is_dir():
+        raise typer.BadParameter(f"{path} is a folder; name the file to write")
+    if not path.parent.is_dir():
+        raise typer.BadParameter(f"the folder {path.parent} does not exist")
+    return path
+
+
+def _check_exposure(value_ms: float | None) -> float | None:
+    """Refuse an exposure that is not finite or not in (0, 60 000] ms (FM-32)."""
+    if value_ms is not None and not (
+        math.isfinite(value_ms) and 0 < value_ms <= _MAX_SNAP_EXPOSURE_MS
+    ):
+        raise typer.BadParameter(
+            f"must be more than 0 and at most {_MAX_SNAP_EXPOSURE_MS:g} ms, "
+            f"got {value_ms:g}"
+        )
+    return value_ms
+
+
+@app.command()
+def snap(
+    ctx: typer.Context,
+    out: Annotated[
+        Path,
+        typer.Option(
+            "--out",
+            callback=_check_out,
+            help="The TIFF to write, .tif or .tiff, in a folder that exists. "
+            "An existing file is overwritten.",
+        ),
+    ] = Path("frame.tif"),
+    exposure_ms: Annotated[
+        float | None,
+        typer.Option(
+            "--exposure-ms",
+            callback=_check_exposure,
+            help="The exposure to set first, in ms (more than 0, at most "
+            "60000). Default: the camera's current exposure.",
+        ),
+    ] = None,
+    profile: ProfileOption = DEMO_NAME,
+) -> None:
+    """Snap one frame and write it as a TIFF, with its exposure in ms.
+
+    The frame keeps the camera's own dtype (uint8 or uint16) and is never
+    rescaled. The TIFF's metadata holds the profile, the camera, the
+    exposure, the pixel size in µm (0.0 when unknown) and the stage position.
+    """
+    write_error: OSError | None = None
+    with _reported(ctx):
+        import tifffile
+
+        with Microscope.open(profile) as microscope:
+            camera = microscope.require(Camera)
+            if exposure_ms is not None:
+                camera.set_exposure_ms(exposure_ms)
+            exposure = camera.exposure_ms()
+            frame = camera.snap()
+            if not (
+                frame.ndim == 2
+                and frame.dtype.kind == "u"
+                and frame.dtype.itemsize <= 2
+            ):
+                raise HardwareError(
+                    f"the camera returned a {frame.dtype} frame of shape "
+                    f"{frame.shape}; smc snap writes 2-D uint8 or uint16 frames"
+                )
+            state = microscope.state()
+            meta: dict[str, object] = {
+                "smc_version": __version__,
+                "profile": microscope.profile.microscope.name,
+                "camera": microscope.roles.get(Role.camera),
+                "exposure_ms": float(exposure),
+                # 0.0 is the camera saying "unknown"; it is written as such.
+                "pixel_size_um": state.pixel_size_um,
+                "xy_um": None if state.xy is None else [state.xy.x_um, state.xy.y_um],
+                "z_um": state.z_um,
+                "time_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            }
+            height, width = frame.shape
+            # Everything printed later is computed here: nobody measured
+            # whether the frame's buffer survives the devices being unloaded.
+            summary = (
+                f"{height}x{width} {frame.dtype}, exposure {exposure:g} ms, "
+                f"min {int(frame.min())}, max {int(frame.max())}"
+            )
+            try:
+                tifffile.imwrite(out, frame, metadata=meta)
+            except OSError as exc:
+                # FM-34: the frame was taken; the summary still gets printed.
+                write_error = exc
+    if write_error is None:
+        _say(f"wrote {out}: {summary}")
+        return
+    _say(f"snapped (not written): {summary}")
+    _fail(f"could not write {out}: {write_error}")
+    raise typer.Exit(code=_EXIT_ERROR)
 
 
 def main() -> None:

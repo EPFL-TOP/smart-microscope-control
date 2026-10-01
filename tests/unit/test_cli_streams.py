@@ -55,14 +55,26 @@ def test_main_reconfigures_only_strict_streams(monkeypatch: pytest.MonkeyPatch) 
     assert lenient.errors == "backslashreplace"  # already UTF-8: left alone
 
 
+def _cp1252_env() -> dict[str, str]:
+    """The child's environment: a cp1252 console, and no operator profile.
+
+    ``doctor`` and the stage commands open ``$SMC_PROFILE``: an operator's
+    ``SMC_PROFILE=nikon-ti2`` must never make ``pytest`` open a real stand
+    (FM-40).
+    """
+    dropped = {"PYTHONUTF8", "SMC_PROFILE", "SMC_PROFILES"}
+    env = {k: v for k, v in os.environ.items() if k not in dropped}
+    env["PYTHONIOENCODING"] = "cp1252"
+    return env
+
+
 def test_help_survives_a_cp1252_redirect(tmp_path: Path) -> None:
     # FM-42: a subprocess test with PYTHONIOENCODING=cp1252 and stdout to a
     # file, because CliRunner captures output in a way that hides encoding
     # problems. Today's --help text is ASCII-only (rich degrades its own box
     # drawing when the stream cannot show it), so this proves no crash; the
     # in-process test above is the proof that the reconfiguration itself runs.
-    env = {k: v for k, v in os.environ.items() if k != "PYTHONUTF8"}
-    env["PYTHONIOENCODING"] = "cp1252"
+    env = _cp1252_env()
     out = tmp_path / "help.txt"
 
     with out.open("wb") as f:
@@ -84,8 +96,7 @@ def test_doctor_redirected_with_cp1252_exits_0(
 ) -> None:
     if not mm_available:
         pytest.skip("Micro-Manager demo adapters not installed")
-    env = {k: v for k, v in os.environ.items() if k != "PYTHONUTF8"}
-    env["PYTHONIOENCODING"] = "cp1252"
+    env = _cp1252_env()
     out = tmp_path / "doctor.txt"
 
     with out.open("wb") as f:
@@ -100,3 +111,26 @@ def test_doctor_redirected_with_cp1252_exits_0(
 
     assert done.returncode == 0, done.stderr.decode("utf-8", "replace")
     assert b"loads and answers" in out.read_bytes()
+
+
+def test_stage_refusal_redirected_with_cp1252_exits_2(
+    mm_available: bool, tmp_path: Path
+) -> None:
+    # FM-20, FM-42: the refusal line holds "✗" (no cp1252 encoding), "µ" and
+    # "—" (both in cp1252); it must reach the file, and the exit code stay 2.
+    if not mm_available:
+        pytest.skip("Micro-Manager demo adapters not installed")
+    out = tmp_path / "jog.txt"
+
+    with out.open("wb") as f:
+        done = subprocess.run(
+            [sys.executable, "-m", "smc.cli", "stage", "jog", "6000", "0"],
+            stdout=f,
+            stderr=subprocess.PIPE,
+            env=_cp1252_env(),
+            timeout=120,
+            check=False,
+        )
+
+    assert done.returncode == 2, done.stderr.decode("utf-8", "replace")
+    assert b"jog (6000.0, 0.0) \xb5m exceeds the jog limit" in out.read_bytes()

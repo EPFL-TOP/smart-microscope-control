@@ -12,7 +12,9 @@ import re
 from collections.abc import Iterator
 from pathlib import Path
 
+import numpy as np
 import pytest
+import tifffile
 from typer.testing import CliRunner
 
 from smc import __version__
@@ -245,6 +247,7 @@ def test_stage_z_and_snap_help_name_their_units() -> None:
         (["stage", "--help"], "µm"),
         (["stage", "jog", "--help"], "µm"),
         (["z", "--help"], "µm"),
+        (["snap", "--help"], "ms"),
     ]:
         result = runner.invoke(app, args)
         assert result.exit_code == 0, result.output
@@ -454,3 +457,75 @@ def test_verbose_logs_each_command_sent() -> None:
     assert "xy_stage: move_to (10.0, 20.0) µm" in logged.output
     assert quiet.exit_code == 0, quiet.output
     assert "xy_stage: move_to" not in quiet.output
+
+
+# --- snap ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("where", ["missing-folder", "png-suffix", "directory"])
+def test_snap_bad_out_exits_2_before_opening_the_stand(
+    where: str, tmp_path: Path, no_stand: None
+) -> None:
+    out = {
+        "missing-folder": tmp_path / "nowhere" / "frame.tif",
+        "png-suffix": tmp_path / "frame.png",
+        "directory": tmp_path / "frames.tif",
+    }[where]
+    if where == "directory":
+        out.mkdir()
+
+    result = runner.invoke(app, ["snap", "--out", str(out)])
+
+    assert result.exit_code == 2, result.output
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "0", "-1", "60001"])
+def test_snap_refuses_an_exposure_out_of_range(
+    value: str, tmp_path: Path, no_stand: None
+) -> None:
+    out = tmp_path / "frame.tif"
+
+    result = runner.invoke(app, ["snap", "--out", str(out), "--exposure-ms", value])
+
+    assert result.exit_code == 2, result.output
+    assert "at most 60000 ms" in result.output
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_snap_writes_a_16_bit_tiff_with_its_metadata(tmp_path: Path) -> None:
+    out = tmp_path / "frame.tif"
+
+    result = runner.invoke(app, ["snap", "--out", str(out), "--exposure-ms", "25"])
+
+    assert result.exit_code == 0, result.output
+    with tifffile.TiffFile(out) as tif:
+        frame = tif.asarray()
+        meta = tif.shaped_metadata[0]
+    assert frame.dtype == np.uint16
+    assert frame.shape == (512, 512)
+    assert meta["exposure_ms"] == 25.0
+    assert meta["pixel_size_um"] == 1.0
+    assert meta["profile"] == "demo"
+    assert meta["camera"] == "Camera"
+    assert meta["xy_um"] == [0.0, 0.0]
+    assert "512x512 uint16, exposure 25 ms" in result.output
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_snap_write_failure_still_prints_the_frame_and_exits_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def denied(*args: object, **kwargs: object) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(tifffile, "imwrite", denied)
+
+    result = runner.invoke(app, ["snap", "--out", str(tmp_path / "frame.tif")])
+
+    assert result.exit_code == 1, result.output
+    assert "snapped (not written): 512x512 uint16" in result.output
+    assert "✗ could not write" in result.output
+    # FM-36: the bracketed errno is not eaten as markup.
+    assert "[Errno 13]" in result.output
