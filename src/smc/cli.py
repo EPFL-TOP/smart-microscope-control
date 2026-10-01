@@ -13,7 +13,7 @@ import logging
 import math
 import platform
 import sys
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, TextIO
@@ -25,8 +25,11 @@ from rich.text import Text
 
 from smc import __version__
 from smc.hardware import core as core_mod
-from smc.hardware.capabilities import XY
-from smc.hardware.errors import HardwareError, SafetyRefusedError
+from smc.hardware.capabilities import XY, XYStage, ZStage
+from smc.hardware.errors import HardwareError, ProfileError, SafetyRefusedError
+from smc.hardware.microscope import Microscope
+from smc.hardware.profile import DEMO_NAME, Profile, list_profiles, search_paths
+from smc.hardware.roles import Role
 
 app = typer.Typer(
     name="smc",
@@ -268,19 +271,106 @@ def version() -> None:
 
 
 @app.command()
+def profiles(ctx: typer.Context) -> None:
+    """List the profiles found on the search paths, and the search paths.
+
+    Reads files only; no stand is opened. A profile that does not load is
+    listed with its error, so its owner sees what to fix; the command still
+    succeeds. A TOML file without a microscope table is not a profile and is
+    skipped without a word (./pyproject.toml is on the search path).
+    """
+    with _reported(ctx):
+        found: list[tuple[str, Path | None]] = list(list_profiles())
+        if all(name != DEMO_NAME for name, _ in found):
+            found = sorted([*found, (DEMO_NAME, None)], key=lambda entry: entry[0])
+        lines = _aligned(
+            [[name, str(path) if path else "(built in)"] for name, path in found]
+        )
+        for line, (_, path) in zip(lines, found, strict=True):
+            _say(line)
+            if path is not None and (error := _load_error(path)):
+                _fail(error, indent="  ")
+        _say("Search paths:")
+        for directory in search_paths():
+            _say(f"  {directory}" + ("" if directory.is_dir() else " (not found)"))
+
+
+def _load_error(path: Path) -> str:
+    """Why the profile at ``path`` does not load, on one line; empty when it loads."""
+    try:
+        Profile.load(path)
+    except ProfileError as exc:
+        message = str(exc).removeprefix(f"{path}: ")
+    except (OSError, ValueError) as exc:
+        # A file that is not UTF-8 raises UnicodeDecodeError (a ValueError)
+        # past the loader; it is one more profile that does not load.
+        message = f"{type(exc).__name__}: {exc}"
+    else:
+        return ""
+    return " ".join(line.strip() for line in message.splitlines() if line.strip())
+
+
+@app.command()
+def devices(ctx: typer.Context, profile: ProfileOption = DEMO_NAME) -> None:
+    """List the loaded devices and the roles they fill, then the role table.
+
+    The table shows, for each role, the device chosen, the other candidates
+    and where the choice came from, so a wrong pick can be fixed in the
+    profile.
+    """
+    with _reported(ctx), Microscope.open(profile) as microscope:
+        filled: dict[str, list[str]] = {}
+        for role in Role:
+            label = microscope.roles.get(role)
+            if label is not None:
+                filled.setdefault(label, []).append(role.value)
+        rows = [["label", "type", "library/name", "roles"]]
+        rows += [
+            [
+                device.label,
+                device.type,
+                f"{device.library}/{device.name}",
+                ", ".join(filled.get(device.label, [])),
+            ]
+            for device in microscope.devices
+        ]
+        for line in _aligned(rows):
+            _say(line)
+        _print_roles(microscope)
+
+
+def _print_roles(microscope: Microscope) -> None:
+    """The role table, then each role warning.
+
+    The warnings are logged as well; printing them here keeps them in a
+    report whose stderr was not redirected with it.
+    """
+    _say("Roles")
+    for line in microscope.roles.describe():
+        _say(f"  {line}")
+    for warning in microscope.roles.warnings:
+        _say(f"! {warning}")
+
+
+@app.command()
 def doctor(
+    ctx: typer.Context,
     config: Annotated[
         Path | None,
         typer.Option(
             "--config",
             "-c",
-            help="A Micro-Manager .cfg to test-load. Default: the demo devices.",
+            help="A Micro-Manager .cfg to test-load as it is, without a profile. "
+            "It wins over --profile.",
         ),
     ] = None,
+    profile: ProfileOption = DEMO_NAME,
 ) -> None:
     """Check that this machine can drive a microscope, or at least the simulator.
 
-    Exits non-zero when something is missing, so it can gate a session script.
+    Without --config, it opens the profile and prints its role table and the
+    stand's state. Exits non-zero when something is missing, so it can gate
+    a session script.
     """
     st = core_mod.status()
     table = Table(title="Micro-Manager", show_header=False, box=None)
@@ -300,7 +390,17 @@ def doctor(
         _fail(core_mod.INSTALL_HINT)
         raise typer.Exit(code=1)
 
-    target = str(config) if config else "demo configuration"
+    if config is None:
+        with _reported(ctx), Microscope.open(profile) as microscope:
+            loaded = microscope.profile
+            name = loaded.microscope.name
+            _say(f"Profile {name} ({loaded.source or 'built in'})")
+            _print_roles(microscope)
+            _say(microscope.describe())
+        _ok(f"{name} loads and answers.")
+        return
+
+    target = str(config)
     try:
         with core_mod.opened(config) as core:
             roles = {
@@ -411,6 +511,155 @@ def discover(
     if written is not None:
         json_path, text_path = written
         _ok(f"wrote {json_path} and {text_path.name}")
+
+
+# --- stage and z ---------------------------------------------------------------
+# Every move opens the stand, moves, and releases it: positions are read back
+# from the device, never remembered between two commands. No short option
+# but -p: with ignore_unknown_options, Click reads "-inf" letter by letter,
+# so a registered letter would turn part of a number into an option.
+
+stage_app = typer.Typer(
+    help="The XY stage, in µm (X right, Y up).",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+z_app = typer.Typer(
+    help="The focus drive, in µm (Z up).",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+app.add_typer(stage_app, name="stage")
+app.add_typer(z_app, name="z")
+
+#: For a jog the fix is the CLI flag, not the API's ``force=True``.
+_JOG_FORCE_HINT = "re-run with --force if the distance is intended"
+
+
+def _move_xy(
+    ctx: typer.Context,
+    profile: str,
+    dry_run: bool,
+    move: Callable[[XYStage], XY],
+    force_hint: str = "",
+) -> None:
+    """Open the stand, run ``move`` on its XY stage, print where it landed."""
+    with (
+        _reported(ctx, force_hint=force_hint),
+        Microscope.open(profile, dry_run=dry_run) as microscope,
+    ):
+        stage = microscope.require(XYStage)
+        landed = move(stage)
+        # In dry-run the move returns the commanded target; the stage itself
+        # is read again to show that it did not move.
+        here = stage.position_um() if dry_run else None
+    if here is None:
+        _say(_xy(landed))
+    else:
+        _say(f"[dry-run] would move to {_xy(landed)}; the stage is at {_xy(here)}")
+
+
+def _move_z(
+    ctx: typer.Context, profile: str, dry_run: bool, move: Callable[[ZStage], float]
+) -> None:
+    """Open the stand, run ``move`` on its focus drive, print where it landed."""
+    with _reported(ctx), Microscope.open(profile, dry_run=dry_run) as microscope:
+        drive = microscope.require(ZStage)
+        landed = move(drive)
+        here = drive.position_um() if dry_run else None
+    if here is None:
+        _say(_z(landed))
+    else:
+        _say(f"[dry-run] would move to {_z(landed)}; the drive is at {_z(here)}")
+
+
+@stage_app.command("get")
+def stage_get(ctx: typer.Context, profile: ProfileOption = DEMO_NAME) -> None:
+    """Print where the XY stage reports it is, in µm."""
+    with _reported(ctx), Microscope.open(profile) as microscope:
+        position = microscope.require(XYStage).position_um()
+    _say(_xy(position))
+
+
+@stage_app.command("move", context_settings=_NUMBERS)
+def stage_move(
+    ctx: typer.Context,
+    x_um: Annotated[float, typer.Argument(help="The target X, in µm.")],
+    y_um: Annotated[float, typer.Argument(help="The target Y, in µm.")],
+    dry_run: DryRunOption = False,
+    profile: ProfileOption = DEMO_NAME,
+) -> None:
+    """Move the XY stage to a position in µm; the profile's soft limits apply."""
+    _move_xy(ctx, profile, dry_run, lambda stage: stage.move_to_um(x_um, y_um))
+
+
+@stage_app.command("jog", context_settings=_NUMBERS)
+def stage_jog(
+    ctx: typer.Context,
+    dx_um: Annotated[
+        float, typer.Argument(help="How far to move in X, in µm (negative: left).")
+    ],
+    dy_um: Annotated[
+        float, typer.Argument(help="How far to move in Y, in µm (negative: down).")
+    ],
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help="Move further than the profile's safety.max_jog_um allows.",
+        ),
+    ] = False,
+    dry_run: DryRunOption = False,
+    profile: ProfileOption = DEMO_NAME,
+) -> None:
+    """Move the XY stage by a distance in µm; a long jog needs --force.
+
+    A jog longer than the profile's safety.max_jog_um is refused, because a
+    typo in a relative move (1000 for 100) is how a stage leaves the well.
+    """
+    _move_xy(
+        ctx,
+        profile,
+        dry_run,
+        lambda stage: stage.move_by_um(dx_um, dy_um, force=force),
+        force_hint=_JOG_FORCE_HINT,
+    )
+
+
+@z_app.command("get")
+def z_get(ctx: typer.Context, profile: ProfileOption = DEMO_NAME) -> None:
+    """Print where the focus drive reports it is, in µm."""
+    with _reported(ctx), Microscope.open(profile) as microscope:
+        z_um = microscope.require(ZStage).position_um()
+    _say(_z(z_um))
+
+
+@z_app.command("move", context_settings=_NUMBERS)
+def z_move(
+    ctx: typer.Context,
+    z_um: Annotated[float, typer.Argument(help="The target Z, in µm.")],
+    dry_run: DryRunOption = False,
+    profile: ProfileOption = DEMO_NAME,
+) -> None:
+    """Move the focus drive to a position in µm; the profile's soft limits apply."""
+    _move_z(ctx, profile, dry_run, lambda drive: drive.move_to_um(z_um))
+
+
+@z_app.command("jog", context_settings=_NUMBERS)
+def z_jog(
+    ctx: typer.Context,
+    dz_um: Annotated[
+        float, typer.Argument(help="How far to move, in µm (negative: down).")
+    ],
+    dry_run: DryRunOption = False,
+    profile: ProfileOption = DEMO_NAME,
+) -> None:
+    """Move the focus drive by a distance in µm.
+
+    There is no jog guard on Z: only the profile's safety.z_soft_limits_um
+    bound the target.
+    """
+    _move_z(ctx, profile, dry_run, lambda drive: drive.move_by_um(dz_um))
 
 
 def main() -> None:
