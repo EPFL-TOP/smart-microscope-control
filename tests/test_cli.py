@@ -228,6 +228,24 @@ def test_doctor_prints_the_role_warnings(noxy_profile: Path) -> None:
     assert "! xy_stage: the configuration names 'XY'" in result.output
 
 
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_doctor_fails_when_a_read_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    # describe() shows the failed read as "XY ?"; a session script that
+    # gates on doctor (#16) must not go on to drive that stage.
+    def timed_out(self: MMXYStage) -> XY:
+        raise RuntimeError("Serial port timed out")
+
+    monkeypatch.setattr(MMXYStage, "position_um", timed_out)
+
+    result = runner.invoke(app, ["doctor", "-p", "demo"])
+
+    assert result.exit_code == 1, result.output
+    assert "XY ?" in result.output
+    assert "✗ xy: RuntimeError: Serial port timed out" in result.output
+    assert "loads and answers" not in result.output
+
+
 # --- stage, z ------------------------------------------------------------------
 
 _XY_LINE = re.compile(r"^XY \((-?\d+\.\d\d), (-?\d+\.\d\d)\) µm$", re.M)

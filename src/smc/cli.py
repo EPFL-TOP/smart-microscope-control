@@ -384,8 +384,9 @@ def doctor(
     """Check that this machine can drive a microscope, or at least the simulator.
 
     Without --config, it opens the profile and prints its role table and the
-    stand's state. Exits non-zero when something is missing, so it can gate
-    a session script.
+    stand's state. Exits 1 when Micro-Manager is missing, the stand does not
+    open or a device does not answer a read, so it can gate a session script.
+    A role warning is printed and still exits 0.
     """
     st = core_mod.status()
     table = Table(title="Micro-Manager", show_header=False, box=None)
@@ -411,7 +412,14 @@ def doctor(
             name = loaded.microscope.name
             _say(f"Profile {name} ({loaded.source or 'built in'})")
             _print_roles(microscope)
+            # The status line shows a failed read as "?" and nothing more;
+            # the reason is in the errors, which decide the exit code.
+            errors = microscope.state().errors
             _say(microscope.describe())
+        if errors:
+            for error in errors:
+                _fail(error)
+            raise typer.Exit(code=_EXIT_ERROR)
         _ok(f"{name} loads and answers.")
         return
 
