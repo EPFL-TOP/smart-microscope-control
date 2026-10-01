@@ -78,7 +78,8 @@ is sent. After each test the stand is put back where it started, with the
 light off first if it started off and on last if it started on. If a
 motion is left, if the test halted the stand, or if you pressed Ctrl-C,
 the suite stops the stages and closes the shutter (if it started closed)
-instead of moving anything back.
+instead of moving anything back. A Ctrl-C ends the run, even one pressed
+while the stand is being put back: no later test moves the stand.
 
 What the suite does **not** put back:
 

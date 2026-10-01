@@ -157,7 +157,15 @@ def microscope(
     """
     facade = Microscope.from_core(stand.core, envelope.profile(stand.profile))
     yield facade
-    _put_back(facade, envelope, interrupted=_interrupted(request.session))
+    try:
+        _put_back(facade, envelope, interrupted=_interrupted(request.session))
+    except PutBackInterruptedError as exc:
+        # The operator's stop must end the run, or the next test reopens the
+        # stand and moves it. Re-raising the KeyboardInterrupt would end it
+        # too, but pytest then drops this test's remaining finalizers, the
+        # stand's close() among them; shouldstop ends the run after them.
+        request.session.shouldstop = f"Ctrl-C during the put-back: {exc}"
+        raise
 
 
 def _interrupted(session: pytest.Session) -> bool:
@@ -307,6 +315,15 @@ def _has_motion(facade: Microscope) -> bool:
 _SAFE_STEPS = frozenset({"stop", "shutter close"})
 
 
+class PutBackInterruptedError(RuntimeError):
+    """A Ctrl-C landed in a put-back step: the operator asked to stop.
+
+    A ``RuntimeError``, so that pytest reports it as a teardown error and
+    still runs the remaining finalizers; the ``microscope`` fixture then
+    ends the session (``shouldstop``), so that no later test moves the stand.
+    """
+
+
 def _run_all(steps: list[tuple[str, Callable[[], None]]]) -> None:
     """Run every step; then raise one error naming each that failed, from the first.
 
@@ -315,6 +332,8 @@ def _run_all(steps: list[tuple[str, Callable[[], None]]]) -> None:
     left to propagate, it would skip the shutter close queued after a stop
     and leave the light on. From then on only the safe steps run; the
     others are named as not attempted, so the operator knows what to check.
+    The error is then a ``PutBackInterruptedError``, so that the run is not
+    carried on as after an ordinary failure.
     """
     failed: list[tuple[str, BaseException]] = []
     skipped: list[str] = []
@@ -334,7 +353,8 @@ def _run_all(steps: list[tuple[str, Callable[[], None]]]) -> None:
         listed = "; ".join(f"{name}: {exc!r}" for name, exc in failed)
         if skipped:
             listed += f"; not attempted after Ctrl-C: {', '.join(skipped)}"
-        raise RuntimeError(
+        error = PutBackInterruptedError if ctrl_c else RuntimeError
+        raise error(
             f"the stand was not put back where it started ({listed}); check it "
             f"before the next run"
         ) from failed[0][1]

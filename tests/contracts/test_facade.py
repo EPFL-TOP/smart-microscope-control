@@ -183,6 +183,46 @@ def test_operator_presses_ctrl_c(snapshot, microscope, envelope, fake_core):
     raise KeyboardInterrupt
 """
 
+#: Two tests on the fake: a Ctrl-C lands in test one's put-back, while the
+#: stage travels back. ``snapshot`` depends on ``fake_core`` only, so it
+#: records the log after the stand's close().
+CTRL_C_IN_THE_PUT_BACK = """
+from pathlib import Path
+
+import pytest
+
+from smc.hardware.capabilities import XYStage
+
+LOG = Path(__file__).with_name("events.log")
+
+
+def note(text):
+    with LOG.open("a", encoding="utf-8") as f:
+        f.write(text + "\\n")
+
+
+@pytest.fixture
+def snapshot(fake_core):
+    yield
+    note("core: " + " | ".join(fake_core.log))
+
+
+@pytest.mark.parametrize("backend", ["fake"], indirect=True)
+def test_one(snapshot, microscope, envelope, fake_core):
+    microscope.require(XYStage).move_to_um(envelope.xy.x_um + 20, envelope.xy.y_um)
+
+    def interrupted_move(label, x_um, y_um):
+        raise KeyboardInterrupt
+
+    fake_core.setXYPosition = interrupted_move
+    fake_core.log.clear()
+
+
+@pytest.mark.parametrize("backend", ["fake"], indirect=True)
+def test_two(microscope):
+    note("test two ran")
+"""
+
 INI = """
 [pytest]
 markers =
@@ -210,6 +250,30 @@ def test_teardown_after_ctrl_c_stops_the_stand_instead_of_moving_it(
         "stop('Z')",
         "setShutterOpen('White Light Shutter', False)",
     ]
+
+
+def test_ctrl_c_during_the_put_back_ends_the_run_and_still_closes_the_stand(
+    pytester: pytest.Pytester,
+) -> None:
+    # Reported as an ordinary teardown error, the Ctrl-C would let test two
+    # reopen the stand and move it.
+    pytester.makeini(INI)
+    pytester.makeconftest(
+        (Path(__file__).parent / "conftest.py").read_text(encoding="utf-8")
+    )
+    pytester.makepyfile(CTRL_C_IN_THE_PUT_BACK)
+    result = pytester.runpytest_subprocess("-p", "smc.testing.fixtures", timeout=120.0)
+    output = result.stdout.str()
+    assert result.ret == pytest.ExitCode.INTERRUPTED, output
+    log = pytester.path / "events.log"
+    # No file at all: not even the snapshot after the stand's close() ran.
+    events = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+    assert "test two ran" not in events, events
+    # The stand's close() still ran: re-raising the KeyboardInterrupt from the
+    # put-back would also end the run, but would skip it.
+    assert len(events) == 1, events
+    assert "unloadAllDevices()" in events[0]
+    assert "Ctrl-C during the put-back" in output
 
 
 @pytest.mark.parametrize("backend", ["fake"], indirect=True)
@@ -296,6 +360,7 @@ def test_second_ctrl_c_during_the_stop_still_cuts_the_light(
     fake_core.log.clear()
     with pytest.raises(RuntimeError, match="was not put back") as caught:
         put_back(facade, envelope, interrupted=True)
+    assert type(caught.value).__name__ == "PutBackInterruptedError"
     assert "stop: KeyboardInterrupt()" in str(caught.value)
     assert fake_core.log[-1] == "setShutterOpen('White Light Shutter', False)"
 
@@ -321,6 +386,7 @@ def test_ctrl_c_during_the_put_back_skips_the_moves_left_and_names_them(
     fake_core.log.clear()
     with pytest.raises(RuntimeError, match="was not put back") as caught:
         put_back(facade, started_open)
+    assert type(caught.value).__name__ == "PutBackInterruptedError"
     message = str(caught.value)
     assert "xy: KeyboardInterrupt()" in message
     assert (
@@ -345,6 +411,8 @@ def test_put_back_names_every_item_it_could_not_restore(
     with pytest.raises(RuntimeError, match="was not put back") as caught:
         put_back(facade, envelope)
     fake_core.failing.clear()
+    # An ordinary failure: the run carries on, so it must not end the session.
+    assert type(caught.value) is RuntimeError
     message = str(caught.value)
     assert "xy: RuntimeError('xy: no answer')" in message
     assert "z: RuntimeError('z: no answer')" in message
