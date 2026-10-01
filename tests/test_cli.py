@@ -249,6 +249,53 @@ def test_doctor_fails_when_a_read_fails(monkeypatch: pytest.MonkeyPatch) -> None
     assert "loads and answers" not in result.output
 
 
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+@pytest.mark.parametrize("failing_read", [1, 2])
+def test_doctor_judges_the_snapshot_it_prints(
+    failing_read: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A flaky serial line fails one read and answers the next. Read twice,
+    # the line could show "XY ?" beside the ✓ and exit 0.
+    real = MMXYStage.position_um
+    reads: list[int] = []
+
+    def flaky(self: MMXYStage) -> XY:
+        reads.append(1)
+        if len(reads) == failing_read:
+            raise RuntimeError("Serial port timed out")
+        return real(self)
+
+    monkeypatch.setattr(MMXYStage, "position_um", flaky)
+
+    result = runner.invoke(app, ["doctor", "-p", "demo"])
+
+    failed = result.exit_code == 1
+    assert result.exit_code in (0, 1), result.output
+    assert ("XY ?" in result.output) == failed, result.output
+    assert ("✗ xy: RuntimeError" in result.output) == failed, result.output
+    assert ("loads and answers" in result.output) != failed, result.output
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+@pytest.mark.parametrize("stand", ["demo", "noxy"])
+def test_doctor_prints_the_status_line_of_describe(
+    stand: str, noxy_profile: Path
+) -> None:
+    # doctor builds the line from the snapshot it judges; it must stay the
+    # line Microscope.describe() prints, a missing stage left out included.
+    profile = "demo" if stand == "demo" else str(noxy_profile)
+    with Microscope.open(profile) as microscope:
+        expected = microscope.describe()
+
+    result = runner.invoke(app, ["doctor", "-p", profile])
+
+    assert result.exit_code == 0, result.output
+    assert re.search(f"^{re.escape(expected)}$", result.output, re.M), result.output
+    assert ("XY" in expected) == (stand == "demo")
+
+
 # --- stage, z ------------------------------------------------------------------
 
 _XY_LINE = re.compile(r"^XY \((-?\d+\.\d\d), (-?\d+\.\d\d)\) µm$", re.M)

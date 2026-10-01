@@ -28,9 +28,9 @@ from rich.text import Text
 
 from smc import __version__
 from smc.hardware import core as core_mod
-from smc.hardware.capabilities import XY, Camera, XYStage, ZStage
+from smc.hardware.capabilities import XY, Camera, Shutter, XYStage, ZStage
 from smc.hardware.errors import HardwareError, ProfileError, SafetyRefusedError
-from smc.hardware.microscope import Microscope
+from smc.hardware.microscope import Microscope, MicroscopeState
 from smc.hardware.profile import DEMO_NAME, Profile, list_profiles, search_paths
 from smc.hardware.roles import Role
 
@@ -367,6 +367,34 @@ def _print_roles(microscope: Microscope) -> None:
         _say(f"! {warning}")
 
 
+def _status_line(microscope: Microscope, state: MicroscopeState) -> str:
+    """``Microscope.describe()``'s line, built from a snapshot already taken.
+
+    describe() reads the stand again, and doctor must print the snapshot
+    whose errors decide its exit code. The format is describe()'s, kept
+    equal by a test; a failed read shows ``?``, its reason is in the errors.
+    """
+    parts: list[str] = []
+    if microscope.has(XYStage):
+        xy = state.xy
+        parts.append("XY ?" if xy is None else f"XY ({xy.x_um:.1f}, {xy.y_um:.1f}) µm")
+    if microscope.has(ZStage):
+        parts.append("Z ?" if state.z_um is None else f"Z {state.z_um:.2f} µm")
+    if microscope.has(Camera):
+        exposure_ms = state.exposure_ms
+        parts.append("exposure ?" if exposure_ms is None else f"{exposure_ms:g} ms")
+    if microscope.has(Shutter):
+        if state.shutter_open is None:
+            parts.append("shutter ?")
+        else:
+            parts.append("shutter open" if state.shutter_open else "shutter closed")
+    if state.moving:
+        parts.append("moving: " + ", ".join(state.moving))
+    if state.halted:
+        parts.append("HALTED")
+    return " | ".join(parts) or "no stage, camera or shutter"
+
+
 @app.command()
 def doctor(
     ctx: typer.Context,
@@ -412,10 +440,11 @@ def doctor(
             name = loaded.microscope.name
             _say(f"Profile {name} ({loaded.source or 'built in'})")
             _print_roles(microscope)
-            # The status line shows a failed read as "?" and nothing more;
-            # the reason is in the errors, which decide the exit code.
-            errors = microscope.state().errors
-            _say(microscope.describe())
+            # One read decides the exit code and is the line printed: a
+            # flaky device read twice could show "XY ?" beside the ✓.
+            state = microscope.state()
+            _say(_status_line(microscope, state))
+            errors = state.errors
         if errors:
             for error in errors:
                 _fail(error)
