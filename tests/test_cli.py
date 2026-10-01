@@ -8,7 +8,10 @@ writing to a terminal) and clears ``SMC_PROFILE``, so an operator's
 from __future__ import annotations
 
 import logging
+import os
 import re
+import stat
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -595,3 +598,48 @@ def test_an_interrupted_write_keeps_the_earlier_capture(
     assert result.exit_code == 130, result.output
     assert out.read_bytes() == b"an earlier capture"
     assert [p.name for p in tmp_path.iterdir()] == ["frame.tif"]
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_a_failed_replace_keeps_the_frame_and_names_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Windows refuses to replace a TIFF that Fiji holds open. The frame was
+    # written in full next to it and must not be deleted with the error.
+    out = tmp_path / "frame.tif"
+    out.write_bytes(b"an earlier capture")
+
+    def held_open(src: object, dst: object) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(os, "replace", held_open)
+
+    result = runner.invoke(app, ["snap", "--out", str(out)])
+
+    assert result.exit_code == 1, result.output
+    assert out.read_bytes() == b"an earlier capture"
+    kept = [p for p in tmp_path.iterdir() if p != out]
+    assert len(kept) == 1, kept
+    assert tifffile.imread(kept[0]).shape == (512, 512)
+    assert "✗ could not write" in result.output
+    assert f"the new file is kept as {kept[0]}" in result.output
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="a Windows file takes its ACLs from the folder"
+)
+def test_snap_gives_the_tiff_the_mode_of_a_plain_write(tmp_path: Path) -> None:
+    # A temporary file is created 0600; replaced onto --out, it would leave
+    # every capture readable by its owner only.
+    out = tmp_path / "frame.tif"
+    previous = os.umask(0o022)
+    try:
+        result = runner.invoke(app, ["snap", "--out", str(out)])
+    finally:
+        os.umask(previous)
+
+    assert result.exit_code == 0, result.output
+    assert stat.S_IMODE(out.stat().st_mode) == 0o644

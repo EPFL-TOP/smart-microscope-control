@@ -13,8 +13,8 @@ import logging
 import math
 import os
 import platform
+import secrets
 import sys
-import tempfile
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -708,23 +708,30 @@ def _replace(out: Path, write: Callable[[Path], object]) -> None:
 
     tifffile opens its target with ``"wb"``, which truncates it at once: a
     Ctrl-C or an error half-way through would leave a broken file where an
-    earlier capture was. The partial file is removed on any failure, and the
-    rename fails, leaving ``out`` as it was, when another program holds it
-    open (a TIFF open in Fiji on Windows).
+    earlier capture was. The new file gets the mode a plain write gives
+    (0o666 less the umask); ``mkstemp``'s 0600 would survive the rename and
+    leave every capture readable by its owner only. A partial file is
+    removed when the write fails. When the rename fails (Windows refuses to
+    replace a TIFF that Fiji holds open), ``out`` stays as it was and the
+    new file is kept: it holds a frame that was taken.
 
     Raises:
-        OSError: The folder cannot be written, or ``out`` cannot be replaced.
+        OSError: The folder cannot be written, or ``out`` cannot be replaced;
+            the message then names the file that was kept.
     """
-    fd, name = tempfile.mkstemp(dir=out.parent, prefix=f".{out.name}.", suffix=".part")
-    os.close(fd)
-    partial = Path(name)
+    partial = out.with_name(f".{out.name}.{secrets.token_hex(4)}.part")
+    # O_EXCL: never write into a file that something else created.
+    os.close(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666))
     try:
         write(partial)
-        os.replace(partial, out)
     except BaseException:
         with contextlib.suppress(OSError):
             partial.unlink()
         raise
+    try:
+        os.replace(partial, out)
+    except OSError as exc:
+        raise OSError(f"{exc}; the new file is kept as {partial}") from exc
 
 
 def _check_exposure(value_ms: float | None) -> float | None:
@@ -776,7 +783,7 @@ def snap(
             camera = microscope.require(Camera)
             if exposure_ms is not None:
                 camera.set_exposure_ms(exposure_ms)
-            exposure = camera.exposure_ms()
+            frame_exposure_ms = camera.exposure_ms()
             frame = camera.snap()
             if not (
                 frame.ndim == 2
@@ -792,7 +799,7 @@ def snap(
                 "smc_version": __version__,
                 "profile": microscope.profile.microscope.name,
                 "camera": microscope.roles.get(Role.camera),
-                "exposure_ms": float(exposure),
+                "exposure_ms": float(frame_exposure_ms),
                 # 0.0 is the camera saying "unknown"; it is written as such.
                 "pixel_size_um": state.pixel_size_um,
                 "xy_um": None if state.xy is None else [state.xy.x_um, state.xy.y_um],
@@ -803,7 +810,7 @@ def snap(
             # Everything printed later is computed here: nobody measured
             # whether the frame's buffer survives the devices being unloaded.
             summary = (
-                f"{height}x{width} {frame.dtype}, exposure {exposure:g} ms, "
+                f"{height}x{width} {frame.dtype}, exposure {frame_exposure_ms:g} ms, "
                 f"min {int(frame.min())}, max {int(frame.max())}"
             )
             try:
