@@ -25,6 +25,7 @@ from smc.cli import app
 from smc.hardware import Microscope
 from smc.hardware.backends.mm import MMXYStage
 from smc.hardware.capabilities import XY
+from smc.hardware.microscope import MicroscopeState
 
 runner = CliRunner(env={"COLUMNS": "200", "SMC_PROFILE": None, "SMC_PROFILES": None})
 
@@ -277,23 +278,46 @@ def test_doctor_judges_the_snapshot_it_prints(
     assert ("loads and answers" in result.output) != failed, result.output
 
 
+_SNAPSHOTS = {
+    "readings": MicroscopeState(
+        xy=XY(1234.5, -56.25), z_um=12.5, exposure_ms=25.0, shutter_open=False
+    ),
+    "failed-reads": MicroscopeState(
+        errors=["xy: RuntimeError: a", "z: RuntimeError: b", "shutter: OSError: c"]
+    ),
+    "moving-halted": MicroscopeState(
+        xy=XY(0.0, 0.0),
+        z_um=0.0,
+        exposure_ms=10.0,
+        shutter_open=True,
+        moving=("XY", "Z"),
+        halted=True,
+    ),
+}
+
+
 @pytest.mark.demo
 @pytest.mark.usefixtures("demo")
+@pytest.mark.parametrize("snapshot", sorted(_SNAPSHOTS))
 @pytest.mark.parametrize("stand", ["demo", "noxy"])
 def test_doctor_prints_the_status_line_of_describe(
-    stand: str, noxy_profile: Path
+    stand: str, snapshot: str, noxy_profile: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # doctor builds the line from the snapshot it judges; it must stay the
-    # line Microscope.describe() prints, a missing stage left out included.
+    # line Microscope.describe() prints for that snapshot, a missing stage
+    # left out included. Both get the same one: the demo's shutter reads
+    # open or closed from one open to the next.
+    state = _SNAPSHOTS[snapshot]
+    monkeypatch.setattr(Microscope, "state", lambda self: state)
     profile = "demo" if stand == "demo" else str(noxy_profile)
     with Microscope.open(profile) as microscope:
         expected = microscope.describe()
 
     result = runner.invoke(app, ["doctor", "-p", profile])
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == (1 if state.errors else 0), result.output
     assert re.search(f"^{re.escape(expected)}$", result.output, re.M), result.output
-    assert ("XY" in expected) == (stand == "demo")
+    assert expected.startswith("XY") == (stand == "demo")
 
 
 # --- stage, z ------------------------------------------------------------------
