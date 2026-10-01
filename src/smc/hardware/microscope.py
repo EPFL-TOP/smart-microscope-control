@@ -19,9 +19,12 @@ Hardware behaviour encoded here:
 * **One connection per stand.** Nikon and Zeiss stands accept one client at
   a time, so ``close()`` unloads every device, a failed ``open()`` releases
   the core it opened, and closing twice is harmless.
-* **The emergency stop halts first** (§13): ``stop()`` refuses every new
-  action before it sends the stops, so a plugin loop cannot start its next
-  move between the stop of one stage and the next.
+* **The emergency stop halts first and logs last** (§13): ``stop()``
+  refuses every new action before it sends the stops, so a plugin loop
+  cannot start its next move between the stop of one stage and the next.
+  Its lines, the halt's included, are written once every stop is sent, so
+  a blocked console (a QuickEdit selection on Windows) cannot hold the Z
+  stop behind the line of the XY stop (FM-62).
 """
 
 from __future__ import annotations
@@ -388,15 +391,17 @@ class Microscope:
         The halt comes first, so no action starts once the stops are under
         way; every stage is stopped even when an earlier one fails. The stops
         never wait for the microscope lock, so they get through a move that
-        holds it. Every action then raises ``MicroscopeHaltedError`` until
-        :meth:`resume`; reads and closing a shutter still run.
+        holds it. Its log lines come after the last stop, ``microscope:
+        halted`` first, then one per stage: a blocked console delays the
+        lines, never a stop (FM-62). Every action then raises
+        ``MicroscopeHaltedError`` until :meth:`resume`; reads and closing a
+        shutter still run.
 
         Raises:
             HardwareError: One or more stages did not take the stop; the
                 message names each, and the microscope stays halted.
         """
-        self._executor.halt()
-        failures = self._stop_stages()
+        failures = self._executor.hold_log(self._halt_then_stop_stages)
         if failures:
             raise HardwareError(
                 f"the emergency stop failed for {'; '.join(failures)}. The "
@@ -487,12 +492,13 @@ class Microscope:
         """For ``close()``: stop every stage if anything still moves; whether it did.
 
         A failed stop is logged, never raised: the devices are unloaded
-        anyway, and a stop that did not take is a finding for the log.
+        anyway, and a stop that did not take is a finding for the log. Every
+        stop is sent before any line, the stops' own included (FM-62).
         """
         moving = self._executor.moving()
         if not moving:
             return False
-        failures = self._stop_stages()
+        failures = self._executor.hold_log(self._stop_stages)
         # Logged after the stops were sent (FM-62).
         log.warning(
             "close: %s still moving; the stages were stopped", ", ".join(moving)
@@ -500,6 +506,15 @@ class Microscope:
         for failure in failures:
             log.error("close: the stop failed for %s", failure)
         return True
+
+    def _halt_then_stop_stages(self) -> list[str]:
+        """Halt, then stop every stage: ``stop()`` runs both inside ``hold_log``.
+
+        The halt is inside the hold too, so its line also waits for the last
+        stop (§13, FM-62).
+        """
+        self._executor.halt()
+        return self._stop_stages()
 
     def _stop_stages(self) -> list[str]:
         """Stop each stage the stand has, past any failure; return one note per failure.

@@ -621,6 +621,111 @@ def test_stop_from_inside_a_capability_lookup_stops_and_returns(
         m.close()
 
 
+def test_emergency_stop_sends_every_stop_before_any_log_line(
+    demo_core: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    # #76 (FM-62): the halt's line, then the XY stop's, were written before
+    # the Z stop went out, so a blocked console held the Z stop back.
+    spy = _Spy(demo_core)
+    m = Microscope.from_core(spy, Profile.demo())
+    counts: list[int] = []
+    try:
+        m.require(XYStage)
+        m.require(ZStage)
+        with caplog.at_level(logging.DEBUG, logger=LOGGER):
+            caplog.clear()
+            spy.on_stop = lambda: counts.append(len(caplog.records))
+            m.stop()
+    finally:
+        m.close()
+    assert counts == [0, 0]
+    assert caplog.messages[:3] == [
+        "microscope: halted",
+        "xy_stage XY: stop",
+        "z Z: stop",
+    ]
+
+
+class _BlockedConsole(logging.Handler):
+    """A console whose first write blocks until released (a QuickEdit selection)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered, self.release = threading.Event(), threading.Event()
+        self._first = True
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if self._first:
+            self._first = False
+            self.entered.set()
+            self.release.wait(JOIN_S)
+
+
+def test_emergency_stop_is_not_held_up_by_a_blocked_log_handler(
+    demo_core: Any,
+) -> None:
+    # #76, the issue's reproduction: a log call that blocks held back every
+    # stop that came after its line, while the stage kept moving.
+    spy = _Spy(demo_core)
+    m = Microscope.from_core(spy, Profile.demo())
+    m.require(XYStage)
+    m.require(ZStage)
+    console = _BlockedConsole()
+    logger = logging.getLogger(LOGGER)
+    logger.addHandler(console)
+    stopper = threading.Thread(target=m.stop, daemon=True)
+    try:
+        stopper.start()
+        assert console.entered.wait(JOIN_S)
+        sent_while_blocked = list(spy.calls)
+    finally:
+        console.release.set()
+        logger.removeHandler(console)
+        stopper.join(timeout=JOIN_S)
+    assert not stopper.is_alive()
+    m.close()
+    assert sent_while_blocked == ["stop XY", "stop Z"]
+
+
+def _in_a_registry_section(m: Microscope, call: Callable[[], object]) -> list[object]:
+    """Run ``call`` in a thread that holds the registry lock, as a Ctrl-C handler may.
+
+    Returns what it raised, if anything. The thread is known to have ended
+    before this returns, so a caller may then close the facade, which takes
+    the registry lock through ``moving()`` (FM-44).
+    """
+    errors: list[object] = []
+
+    def handler_inside_a_section() -> None:
+        try:
+            with m._executor._registry_lock:
+                call()
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=handler_inside_a_section, daemon=True)
+    thread.start()
+    thread.join(timeout=JOIN_S)
+    assert not thread.is_alive(), "deadlocked on the registry lock"
+    return errors
+
+
+def test_stop_from_inside_a_registry_section_stops_and_returns(demo_core: Any) -> None:
+    # #76 (FM-70): a Ctrl-C handler runs on the thread it interrupts. With
+    # the registry lock a plain Lock, a handler that called stop() while its
+    # thread was inside a registry section (every move enters one) hung in
+    # halt(), and no stop went out.
+    spy = _Spy(demo_core)
+    m = Microscope.from_core(spy, Profile.demo())
+    errors = _in_a_registry_section(m, m.stop)
+    try:
+        assert errors == []
+        assert spy.calls == ["stop XY", "stop Z"]
+        assert m.state().halted
+    finally:
+        m.close()
+
+
 def test_close_stops_the_stages_when_something_moves(
     demo_core: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -634,18 +739,17 @@ def test_close_stops_the_stages_when_something_moves(
         m.require(XYStage).move_to_um(10.0, 0.0)
     assert m.state().moving == ("xy_stage XY",)
     spy.calls.clear()
-    logged_before_stop: list[bool] = []
-    spy.on_stop = lambda: logged_before_stop.append(
-        any(msg.startswith("close:") for msg in caplog.messages)
-    )
+    caplog.clear()
+    logged_before_stop: list[int] = []
+    spy.on_stop = lambda: logged_before_stop.append(len(caplog.records))
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         m.close()
     assert spy.calls == ["stop XY", "stop Z", "unloadAllDevices"]
     assert "close: xy_stage XY still moving; the stages were stopped" in (
         caplog.messages
     )
-    # FM-62: the stops went out before the line saying so.
-    assert logged_before_stop == [False, False]
+    # FM-62 (#76): every stop went out before any line, its own included.
+    assert logged_before_stop == [0, 0]
 
 
 def test_close_during_a_move_stops_it_instead_of_waiting_for_it(
@@ -724,6 +828,25 @@ def test_close_from_inside_an_action_stops_but_does_not_unload(
     assert m.state().moving == ()
     m.close()  # once the action has returned, close releases the stand
     assert spy.calls[-1] == "unloadAllDevices"
+
+
+def test_close_from_inside_a_registry_section_stops_and_unloads(
+    demo_core: Any,
+) -> None:
+    # #76 (FM-70), the close path: a Ctrl-C handler that calls close() while
+    # its thread is inside a registry section still stops what moves, then
+    # unloads (no action holds the microscope lock).
+    spy = _Spy(demo_core)
+    spy.busy.add("XY")
+    spy.sticky = True
+    m = Microscope.from_core(spy, _profile(timeout_ms=100))
+    with pytest.raises(DeviceTimeoutError, match="the stop was sent"):
+        m.require(XYStage).move_to_um(10.0, 0.0)
+    assert m.state().moving == ("xy_stage XY",)
+    spy.calls.clear()
+    errors = _in_a_registry_section(m, m.close)
+    assert errors == []
+    assert spy.calls == ["stop XY", "stop Z", "unloadAllDevices"]
 
 
 def test_close_behind_a_hung_snap_fails_with_a_diagnosis(demo_core: Any) -> None:
