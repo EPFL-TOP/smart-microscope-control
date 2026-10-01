@@ -33,7 +33,7 @@ category is not here: an id, what happens, and how to check.
 
 ## Windows
 
-- **FM-20 Redirected output is cp1252 with strict errors.** `✓` crashes `smc doctor > f.txt` (#42). *Check*: the stream fix at process entry; files the tool writes are UTF-8.
+- **FM-20 Redirected output is cp1252 with strict errors.** `✓` crashes `smc doctor > f.txt` (#42). It also hits a test harness: `pytester.runpytest_subprocess` reads the child's output as strict UTF-8, so a `µm` in a captured log line crashes the test on Windows before any assertion (#9). *Check*: the stream fix at process entry; files the tool writes are UTF-8; a pytester child gets `PYTHONIOENCODING=utf-8`, and `PYTHONIOENCODING=cp1252 pytest …` reproduces the crash on any OS.
 - **FM-21 Text files without `encoding=`** are decoded as cp1252. *Check*: ruff `PLW1514`.
 - **FM-22 A child sharing the console can change its code page** (`[Console]::OutputEncoding` in PowerShell). *Check*: `creationflags=CREATE_NO_WINDOW`.
 - **FM-23 A child's stdout uses the ANSI code page.** *Check*: ASCII-only protocols, or explicit encodings on both sides.

@@ -231,18 +231,32 @@ markers =
 """
 
 
-def test_teardown_after_ctrl_c_stops_the_stand_instead_of_moving_it(
-    pytester: pytest.Pytester,
-) -> None:
-    # The layer's Ctrl-C handling stops the stage and leaves the facade
-    # neither halted nor moving; only the interrupted session tells the
-    # put-back that the operator meant "stop", not "go back".
+def _run_contracts(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, source: str
+) -> pytest.RunResult:
+    """Run ``source`` in a separate pytest, under a copy of the contract conftest.
+
+    pytester reads the child's output back as strict UTF-8, while a Windows
+    child writes a redirected stdout in its ANSI code page (FM-20): the µ of
+    a captured "move_to … µm" log line would crash the read before any
+    assertion. The child is told to write UTF-8.
+    """
+    monkeypatch.setenv("PYTHONIOENCODING", "utf-8")
     pytester.makeini(INI)
     pytester.makeconftest(
         (Path(__file__).parent / "conftest.py").read_text(encoding="utf-8")
     )
-    pytester.makepyfile(INTERRUPTED_RUN)
-    result = pytester.runpytest_subprocess("-p", "smc.testing.fixtures", timeout=120.0)
+    pytester.makepyfile(source)
+    return pytester.runpytest_subprocess("-p", "smc.testing.fixtures", timeout=120.0)
+
+
+def test_teardown_after_ctrl_c_stops_the_stand_instead_of_moving_it(
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The layer's Ctrl-C handling stops the stage and leaves the facade
+    # neither halted nor moving; only the interrupted session tells the
+    # put-back that the operator meant "stop", not "go back".
+    result = _run_contracts(pytester, monkeypatch, INTERRUPTED_RUN)
     assert result.ret == pytest.ExitCode.INTERRUPTED, result.stdout.str()
     log = (pytester.path / "teardown.log").read_text(encoding="utf-8").splitlines()
     assert log == [
@@ -253,16 +267,11 @@ def test_teardown_after_ctrl_c_stops_the_stand_instead_of_moving_it(
 
 
 def test_ctrl_c_during_the_put_back_ends_the_run_and_still_closes_the_stand(
-    pytester: pytest.Pytester,
+    pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Reported as an ordinary teardown error, the Ctrl-C would let test two
     # reopen the stand and move it.
-    pytester.makeini(INI)
-    pytester.makeconftest(
-        (Path(__file__).parent / "conftest.py").read_text(encoding="utf-8")
-    )
-    pytester.makepyfile(CTRL_C_IN_THE_PUT_BACK)
-    result = pytester.runpytest_subprocess("-p", "smc.testing.fixtures", timeout=120.0)
+    result = _run_contracts(pytester, monkeypatch, CTRL_C_IN_THE_PUT_BACK)
     output = result.stdout.str()
     assert result.ret == pytest.ExitCode.INTERRUPTED, output
     log = pytester.path / "events.log"
