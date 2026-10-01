@@ -551,6 +551,34 @@ def test_an_action_inside_a_moves_command_is_refused() -> None:
     assert z.commands == 0
 
 
+def test_an_action_halted_inside_a_moves_command_raises_halted() -> None:
+    # Adversarial review of #80 (FM-64): a callback inside a move's command
+    # that acted after a halt was refused with MotionInProgressError, a
+    # SafetyRefusedError, before its halt was looked at.
+    executor, turret, z = _ex(), _Device("Turret", arrive_after=0), _Device("Z")
+    shutter = _Shutter()
+    raised: list[BaseException] = []
+
+    def command_with_a_synchronous_callback() -> None:
+        turret.command()
+        executor.halt()  # the operator's emergency stop, during the command
+        for callback in _actions(executor, z, shutter).values():
+            try:
+                callback()
+            except HardwareError as exc:
+                raised.append(exc)
+
+    result = executor.do(
+        "turret: set",
+        Step("turret: set", command_with_a_synchronous_callback, lambda: "2", "dry"),
+        motion=turret.motion,
+        timeout_s=30.0,
+    )
+    assert result == "2"  # the set was sent before the halt, and carries on
+    assert [type(exc) for exc in raised] == [MicroscopeHaltedError] * 3
+    assert (shutter.sent, z.commands) == ([], 0)
+
+
 def test_moving_names_a_traverse_during_its_command() -> None:
     # #68, finding 4: "waiting for" was recorded only once the command had
     # returned, so a move whose command blocks for the traverse was absent
@@ -970,6 +998,39 @@ def test_a_halt_or_a_stop_while_waiting_for_is_recorded_keeps_the_command_away(
     assert xy.stops == (1 if what == "stop" else 0)  # only the caller's own stop
     assert "xy_stage: move XY: not sent" in caplog.messages
     assert executor.moving() == ()
+
+
+@pytest.mark.parametrize("what", ["halt", "stop"])
+def test_a_move_refused_at_its_last_check_is_not_named_while_not_sent_is_logged(
+    what: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # #80: the "not sent" WARNING was written while "waiting for" was still
+    # recorded, so for as long as a blocked console held that line (FM-62),
+    # moving() named a motion that was never commanded and contenders were
+    # refused for it.
+    executor, xy = _ex(), _Device()
+    event: Callable[[], object] = (
+        executor.halt if what == "halt" else lambda: executor.stop(xy.motion)
+    )
+    seen: list[tuple[str, ...]] = []
+    handlers = [
+        _OnLog("xy_stage: move XY", event),
+        _OnLog("xy_stage: move XY: not sent", lambda: seen.append(executor.moving())),
+    ]
+    for handler in handlers:
+        LOGGER.addHandler(handler)
+    expected = MicroscopeHaltedError if what == "halt" else MotionStoppedError
+    try:
+        with (
+            caplog.at_level(logging.INFO, logger=LOGGER.name),
+            pytest.raises(expected),
+        ):
+            _move(executor, xy)
+    finally:
+        for handler in handlers:
+            LOGGER.removeHandler(handler)
+    assert seen == [()]
+    assert xy.commands == 0
 
 
 @pytest.mark.parametrize("stoppable", [True, False])
@@ -1738,6 +1799,17 @@ def test_halt_refuses_every_action_until_resume(dry_run: bool) -> None:
     assert executor.acquire("camera: snap", lambda: "frame") == "frame"
 
 
+def _actions(
+    executor: Executor, device: _Device, shutter: _Shutter
+) -> dict[str, Callable[[], object]]:
+    """One action of each kind, for the tests that queue one: an open, a move, a snap."""
+    return {
+        "open": lambda: _open(executor, shutter),
+        "move": lambda: _move(executor, device),
+        "snap": lambda: executor.acquire("camera: snap", _never),
+    }
+
+
 @pytest.mark.parametrize("when", ["called while halted", "halted while queued"])
 @pytest.mark.parametrize("kind", ["open", "move", "snap"])
 def test_action_queued_while_halted_does_not_run_after_resume(
@@ -1747,18 +1819,16 @@ def test_action_queued_while_halted_does_not_run_after_resume(
     # operator resumed, although it was called while halted, or was waiting
     # when the halt landed. resume() starts nothing.
     executor, xy, shutter = _ex(), _Device(arrive_after=0), _Shutter()
-    actions: dict[str, Callable[[], object]] = {
-        "open": lambda: _open(executor, shutter),
-        "move": lambda: _move(executor, xy),
-        "snap": lambda: executor.acquire("camera: snap", _never),
-    }
     holder, release = _hold_the_lock(executor)
     try:
         if when == "called while halted":
             executor.halt()
-        queued = _Thread(actions[kind])
-        assert not queued.finished_within(0.2)  # queued behind the snap
-        if when == "halted while queued":
+        queued = _Thread(_actions(executor, xy, shutter)[kind])
+        if when == "called while halted":
+            # Refused at its first lock poll (#80), so before the resume.
+            assert queued.finished_within(JOIN_S / 2)
+        else:
+            assert not queued.finished_within(0.2)  # queued behind the snap
             executor.halt()
         executor.resume()
     finally:
@@ -1769,6 +1839,111 @@ def test_action_queued_while_halted_does_not_run_after_resume(
     assert (shutter.sent, xy.commands) == ([], 0)
     assert _move(executor, xy) == "arrived"  # a call made after resume() runs
     assert xy.commands == 1
+
+
+@pytest.mark.parametrize("when", ["called while halted", "halted after the call"])
+@pytest.mark.parametrize("kind", ["open", "move", "snap"])
+def test_a_halt_and_resume_before_the_lock_is_taken_still_refuse(
+    kind: str, when: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Adversarial review of #80: a queued action is now refused at its lock
+    # polls, so the test above no longer reaches the check made once the
+    # lock is taken. That check alone sees a halt and a resume() that land
+    # between the call and the lock (within one poll, or before a free lock
+    # is taken), and it must compare the halt mark, not the flag (#68).
+    executor, xy, shutter = _ex(), _Device(arrive_after=0), _Shutter()
+    halt_mark = executor._halt_mark
+
+    def halt_and_resume_around_the_call() -> int | None:
+        if when == "called while halted":
+            executor.halt()
+        mark = halt_mark()
+        if when == "halted after the call":
+            executor.halt()
+        executor.resume()
+        return mark
+
+    monkeypatch.setattr(executor, "_halt_mark", halt_and_resume_around_the_call)
+    with pytest.raises(MicroscopeHaltedError):
+        _actions(executor, xy, shutter)[kind]()
+    monkeypatch.undo()
+    assert (shutter.sent, xy.commands) == ([], 0)
+    assert _move(executor, xy) == "arrived"  # a call made after resume() runs
+
+
+@pytest.mark.parametrize("kind", ["open", "move", "snap"])
+def test_action_called_while_halted_behind_a_moving_holder_raises_halted(
+    kind: str,
+) -> None:
+    # #80 (FM-64): a caller that found the lock held by a move was refused
+    # with MotionInProgressError before its halt was looked at. That is a
+    # SafetyRefusedError, so `except SafetyRefusedError: skip` carried on
+    # through the emergency stop.
+    executor, xy = _ex(), _Device()
+    z, shutter = _Device("Z", arrive_after=0), _Shutter()
+    mover = _moving(executor, xy)
+    try:
+        executor.halt()
+        with pytest.raises(MicroscopeHaltedError):
+            _actions(executor, z, shutter)[kind]()
+    finally:
+        xy.busy = False
+        mover.join()
+    assert (shutter.sent, z.commands) == ([], 0)
+    assert mover.result == "arrived"  # the halt itself stops nothing
+
+
+@pytest.mark.parametrize("when", ["halted while queued", "called while halted"])
+@pytest.mark.parametrize("kind", ["open", "move", "snap"])
+def test_action_halted_while_queued_behind_a_slow_holder_raises_halted_not_busy(
+    kind: str, when: str
+) -> None:
+    # #80: a caller queued behind a slow holder (a snap) never looked at its
+    # halt while it waited, so it waited the whole lock_timeout_s and raised
+    # MicroscopeBusyError, "the device driver may be hung". "called while
+    # halted" is the issue's reproduction.
+    executor = _ex(lock_timeout_s=5.0)
+    z, shutter = _Device("Z", arrive_after=0), _Shutter()
+    holder, release = _hold_the_lock(executor)
+    try:
+        if when == "called while halted":
+            executor.halt()
+        queued = _Thread(_actions(executor, z, shutter)[kind])
+        if when == "halted while queued":
+            assert not queued.finished_within(0.2)  # queued behind the snap
+            executor.halt()
+        # One lock poll is 50 ms; 1 s is well short of lock_timeout_s (FM-44).
+        refused = queued.finished_within(1.0)
+    finally:
+        release.set()
+        holder.join()
+    queued.join()
+    assert refused, f"the halted action kept waiting for the lock: {queued.error!r}"
+    assert isinstance(queued.error, MicroscopeHaltedError)
+    assert (shutter.sent, z.commands) == ([], 0)
+
+
+@pytest.mark.parametrize("kind", ["open", "move", "snap"])
+def test_halt_and_resume_while_queued_still_raise_halted(kind: str) -> None:
+    # #80: the check at each lock poll compares the halt epoch, not the flag:
+    # a resume() right after the halt does not let the queued action through,
+    # nor leave it waiting for the lock, since it was halted after its call.
+    executor = _ex(lock_timeout_s=5.0)
+    z, shutter = _Device("Z", arrive_after=0), _Shutter()
+    holder, release = _hold_the_lock(executor)
+    try:
+        queued = _Thread(_actions(executor, z, shutter)[kind])
+        assert not queued.finished_within(0.2)  # queued behind the snap
+        executor.halt()
+        executor.resume()
+        refused = queued.finished_within(1.0)
+    finally:
+        release.set()
+        holder.join()
+    queued.join()
+    assert refused, f"the halted action kept waiting for the lock: {queued.error!r}"
+    assert isinstance(queued.error, MicroscopeHaltedError)
+    assert (shutter.sent, z.commands) == ([], 0)
 
 
 def test_halted_is_not_a_safety_refusal() -> None:
@@ -1889,6 +2064,31 @@ def test_close_while_an_open_is_sent_is_resent_and_the_open_raises(
     if not halted:
         assert type(info.value) is HardwareError
         assert "was sent again after it" in str(info.value)
+
+
+@pytest.mark.parametrize(
+    "order", ["close halt resume", "halt close resume", "halt resume close"]
+)
+def test_halt_and_resume_during_an_overridable_send_raise_halted(order: str) -> None:
+    # #80 (#75 item 6): the open chose between MicroscopeHaltedError and
+    # HardwareError from the halt flag, so a halt and a resume() that both
+    # landed while it was sent raised HardwareError, not the
+    # MicroscopeHaltedError that do() documents for a halt since the call.
+    executor, shutter = _ex(), _Shutter()
+    calls: dict[str, Callable[[], object]] = {
+        "close": lambda: executor.safe(shutter.close, lambda: shutter.is_open),
+        "halt": executor.halt,
+        "resume": executor.resume,
+    }
+
+    def during_the_send() -> None:
+        for name in order.split():
+            calls[name]()
+
+    with pytest.raises(MicroscopeHaltedError):
+        _open(executor, shutter, before=during_the_send)
+    assert shutter.sent == [False, True, False]  # the close was sent again
+    assert shutter.is_open is False
 
 
 def test_a_close_while_an_open_waits_for_the_lock_cancels_it() -> None:
