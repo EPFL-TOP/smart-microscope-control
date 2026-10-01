@@ -611,7 +611,8 @@ def test_a_failed_replace_keeps_the_frame_and_names_it(
     out.write_bytes(b"an earlier capture")
 
     def held_open(src: object, dst: object) -> None:
-        raise PermissionError(13, "Permission denied")
+        # As os.replace raises it: str() names both files ('src' -> 'dst').
+        raise PermissionError(13, "Permission denied", str(src), None, str(dst))
 
     monkeypatch.setattr(os, "replace", held_open)
 
@@ -623,7 +624,29 @@ def test_a_failed_replace_keeps_the_frame_and_names_it(
     assert len(kept) == 1, kept
     assert tifffile.imread(kept[0]).shape == (512, 512)
     assert "✗ could not write" in result.output
-    assert f"the new file is kept as {kept[0]}" in result.output
+    assert f"Permission denied; the new file is kept as {kept[0]}" in result.output
+    assert result.output.count(kept[0].name) == 1, result.output
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_ctrl_c_before_the_rename_removes_the_new_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Nothing names a file left behind by an interrupt, so none is left.
+    out = tmp_path / "frame.tif"
+    out.write_bytes(b"an earlier capture")
+
+    def interrupted(src: object, dst: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(os, "replace", interrupted)
+
+    result = runner.invoke(app, ["snap", "--out", str(out)])
+
+    assert result.exit_code == 130, result.output
+    assert out.read_bytes() == b"an earlier capture"
+    assert [p.name for p in tmp_path.iterdir()] == ["frame.tif"]
 
 
 @pytest.mark.demo

@@ -710,10 +710,11 @@ def _replace(out: Path, write: Callable[[Path], object]) -> None:
     Ctrl-C or an error half-way through would leave a broken file where an
     earlier capture was. The new file gets the mode a plain write gives
     (0o666 less the umask); ``mkstemp``'s 0600 would survive the rename and
-    leave every capture readable by its owner only. A partial file is
-    removed when the write fails. When the rename fails (Windows refuses to
-    replace a TIFF that Fiji holds open), ``out`` stays as it was and the
-    new file is kept: it holds a frame that was taken.
+    leave every capture readable by its owner only. When the rename fails
+    (Windows refuses to replace a TIFF that Fiji holds open), ``out`` stays
+    as it was and the new file is kept: it holds a frame that was taken.
+    On any other failure, a Ctrl-C before the rename included, the new file
+    is removed, since no message would name it.
 
     Raises:
         OSError: The folder cannot be written, or ``out`` cannot be replaced;
@@ -722,16 +723,19 @@ def _replace(out: Path, write: Callable[[Path], object]) -> None:
     partial = out.with_name(f".{out.name}.{secrets.token_hex(4)}.part")
     # O_EXCL: never write into a file that something else created.
     os.close(os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666))
+    written = False
     try:
         write(partial)
-    except BaseException:
+        written = True
+        os.replace(partial, out)
+    except BaseException as exc:
+        if written and isinstance(exc, OSError):
+            # strerror alone: str(exc) already names both files.
+            reason = exc.strerror or exc
+            raise OSError(f"{reason}; the new file is kept as {partial}") from exc
         with contextlib.suppress(OSError):
             partial.unlink()
         raise
-    try:
-        os.replace(partial, out)
-    except OSError as exc:
-        raise OSError(f"{exc}; the new file is kept as {partial}") from exc
 
 
 def _check_exposure(value_ms: float | None) -> float | None:
