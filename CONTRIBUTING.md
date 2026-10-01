@@ -75,11 +75,24 @@ towards the middle of its travel first.
 
 Every target outside those limits is one the layer must refuse, so none
 is sent. After each test the stand is put back where it started, with the
-light off first if it started off. If a motion is left, or the test
-halted the stand, the suite stops the stages instead of moving them back.
+light off first if it started off and on last if it started on. If a
+motion is left, if the test halted the stand, or if you pressed Ctrl-C,
+the suite stops the stages and closes the shutter (if it started closed)
+instead of moving anything back.
 
-The suite opens the stand once per test, about 30 times, so allow a few
-minutes. A stand that lacks a capability skips its contracts.
+What the suite does **not** put back:
+
+- **Each test reopens the stand.** That is about 30 opens, so allow a few
+  minutes. Each open reloads the configuration: the devices initialise
+  again, and Micro-Manager applies the configuration's `System`/`Startup`
+  preset, which can move a turret or a filter wheel without the layer's
+  turret confirmation. Check that preset before the run, and the turret
+  and filters after it.
+- **Continuous focus (PFS on the Nikon stands) is neither recorded nor
+  restored**, and a Z move can switch it off. Switch it off before the run
+  and set it again afterwards.
+
+A stand that lacks a capability skips its contracts.
 
 ## Supervising and execution sessions
 
