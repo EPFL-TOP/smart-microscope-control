@@ -159,3 +159,31 @@ def test_merged_pr_lists_the_follow_ups_its_fix_round_named(point) -> None:
         "- #71 feat(core): Microscope facade | ready to merge",
         "- #71 fix round, follow-up: deferred: `safety.py:286`, a plain lock that halt() takes",
     ]
+
+
+def _run(at: str, conclusion: str, title: str = "feat: x") -> dict:
+    return {
+        "workflowName": "CI",
+        "createdAt": at,
+        "conclusion": conclusion,
+        "status": "completed",
+        "displayTitle": title,
+        "url": f"u/{at}",
+    }
+
+
+def test_a_flake_that_failed_main_since_the_last_point_is_listed(point) -> None:
+    runs = [
+        _run("2026-10-01T09:00:00Z", "failure", "fix: a"),
+        _run("2026-10-01T10:00:00Z", "success", "fix: b"),
+        _run("2026-09-20T10:00:00Z", "failure", "old"),
+        {**_run("2026-10-01T11:00:00Z", "failure"), "workflowName": "Dependabot"},
+    ]
+    assert point.main_ci(runs, "2026-10-01T00:00:00Z") == [
+        "- latest: success (2026-10-01T10:00, fix: b)",
+        "- FAILED 2026-10-01T09:00 fix: a u/2026-10-01T09:00:00Z",
+    ]
+
+
+def test_main_without_ci_runs_says_so(point) -> None:
+    assert point.main_ci([], "2026-10-01T00:00:00Z") == ["- no CI run on main"]
