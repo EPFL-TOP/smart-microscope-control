@@ -3,8 +3,8 @@
 The fixtures live in the pytest plugin ``smc.testing.fixtures``, so that a
 plugin's own repository can load them the same way. It adds ``--profile``
 and provides ``mm_available``, ``demo_core``, ``demo_microscope``,
-``demo_microscope_dry``, ``fake_core``, ``fake_microscope`` and
-``hardware_microscope``.
+``demo_microscope_dry``, ``demo_microscope_with_sample``, ``fake_core``,
+``fake_microscope`` and ``hardware_microscope``.
 
 Two kinds of test exist here (ADR-0005):
 
