@@ -11,6 +11,7 @@ The demo's XY stage rounds a command (``move_by_um(10, 0)`` reads back
 
 from __future__ import annotations
 
+import math
 import re
 from typing import TYPE_CHECKING
 
@@ -48,7 +49,10 @@ def _content_shift(before: np.ndarray, after: np.ndarray) -> tuple[float, float]
 
 
 class _NoPixelSizeCamera:
-    """A camera that reports what an uncalibrated one does: a pixel size of 0."""
+    """A camera that reports a pixel size nothing can use: 0 when uncalibrated."""
+
+    def __init__(self, pixel_size_um: float) -> None:
+        self._pixel_size_um = pixel_size_um
 
     def snap(self) -> np.ndarray:
         return np.zeros((4, 4), dtype=np.uint16)
@@ -66,7 +70,7 @@ class _NoPixelSizeCamera:
         return 16
 
     def pixel_size_um(self) -> float:
-        return 0.0
+        return self._pixel_size_um
 
 
 def test_the_frame_changes_when_the_demo_stage_crosses_a_well_wall(
@@ -165,11 +169,13 @@ def test_the_fixture_passes_the_camera_orientation_on(
     assert np.array_equal(microscope.require(Camera).snap(), expected)
 
 
+@pytest.mark.parametrize("reported", [0.0, -1.0, math.nan, math.inf])
 def test_the_fixture_refuses_a_camera_without_a_pixel_size_and_changes_nothing(
     demo_microscope: Microscope,
     demo_microscope_with_sample: SampleMicroscopeFactory,
+    reported: float,
 ) -> None:
-    uncalibrated = _NoPixelSizeCamera()
+    uncalibrated = _NoPixelSizeCamera(reported)
     demo_microscope.override(Camera, uncalibrated)
 
     with pytest.raises(ValueError, match=re.escape("give pixel_size_um=")):

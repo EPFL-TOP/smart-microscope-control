@@ -75,6 +75,13 @@ _MAX_ROTATION_DEG = 1e6
 _MAX_LEVEL = 1e9
 _MAX_EXPOSURE_MS = 1e6
 _MAX_PIXELS = 2**24
+# A blur runs on the frame padded by 4 sigma on each side: a frame at the
+# bound with the maximum blur (4096 x 4096, 4352 x 4352 padded) must fit, a
+# single row of 2**24 pixels padded to 4e9 values must not.
+_MAX_BLURRED_PIXELS = 2 * _MAX_PIXELS
+# Below this, radius**2 underflows towards 0 and a pixel on the blob's centre
+# gets 0 / 0 in the exponent (NaN, cast to uint16).
+_MIN_RADIUS_UM = 1e-6
 
 
 def _bounded(name: str, value: float, low: float, high: float) -> float:
@@ -107,9 +114,12 @@ def _shape(shape: tuple[int, int]) -> tuple[int, int]:
             raise ValueError(message)
         if side <= 0:
             raise ValueError(message)
+    # Python ints: the product of two np.int32 (the default integer of numpy < 2
+    # on Windows) wraps below the bound, and a small dtype's product warns.
+    height, width = int(height), int(width)
     if height * width > _MAX_PIXELS:
         raise ValueError(message)
-    return int(height), int(width)
+    return height, width
 
 
 def _pair(name: str, value: Sequence[float], bound: float) -> tuple[float, float]:
@@ -247,8 +257,9 @@ class Blob:
     """A Gaussian spot at a stage position, ``intensity * exp(-d^2 / (2 sigma^2))``.
 
     ``sigma`` is ``radius_um / 2``, so the spot is negligible beyond twice its
-    radius. Counts are at the reference exposure, like the sample's levels. A
-    negative ``intensity`` is a dark spot.
+    radius, and ``radius_um`` is at least 1e-6 (below that the exponent
+    underflows). Counts are at the reference exposure, like the sample's
+    levels. A negative ``intensity`` is a dark spot, clipped at 0 counts.
     """
 
     x_um: float
@@ -259,7 +270,7 @@ class Blob:
     def __post_init__(self) -> None:
         _bounded("x_um", self.x_um, -_MAX_POSITION_UM, _MAX_POSITION_UM)
         _bounded("y_um", self.y_um, -_MAX_POSITION_UM, _MAX_POSITION_UM)
-        _positive("radius_um", self.radius_um, _MAX_POSITION_UM)
+        _bounded("radius_um", self.radius_um, _MIN_RADIUS_UM, _MAX_POSITION_UM)
         _bounded("intensity", self.intensity, -_MAX_LEVEL, _MAX_LEVEL)
 
 
@@ -270,7 +281,8 @@ class PlateSample:
     rotation, counter-clockwise with Y up, about A1: ``world = A1 + R(theta) *
     (col * pitch_x, -row * pitch_y)``. Rows run towards -Y and columns towards
     +X, as in ``useq``. ``well_level`` and ``plastic_level`` are counts at
-    ``REFERENCE_EXPOSURE_MS``.
+    ``REFERENCE_EXPOSURE_MS``. A circular well takes its diameter from the
+    plate's ``well_size[0]``; a square one uses both sizes.
 
     Args:
         plate: A ``useq`` plate name (``"96-well"``) or a ``useq.WellPlate``.
@@ -387,7 +399,7 @@ class PlateSample:
         """
         x = _bounded("x_um", x_um, -_MAX_POSITION_UM, _MAX_POSITION_UM)
         y = _bounded("y_um", y_um, -_MAX_POSITION_UM, _MAX_POSITION_UM)
-        _bounded("z_um", z_um, -_MAX_POSITION_UM, _MAX_POSITION_UM)
+        z = _bounded("z_um", z_um, -_MAX_POSITION_UM, _MAX_POSITION_UM)
         height, width = _shape(shape)
         scale_um = _positive("pixel_size_um", pixel_size_um, _MAX_PIXEL_SIZE_UM)
         rotation = _bounded(
@@ -400,12 +412,20 @@ class PlateSample:
 
         pose = _Pose(x, y, (height, width), scale_um, rotation, mirrored)
         # A stand-in for defocus: sharp at z = 0, symmetric, no sign.
-        blur_px = min(abs(z_um) / 10.0, MAX_BLUR_PX)
+        blur_px = min(abs(z) / 10.0, MAX_BLUR_PX)
         if blur_px > 0.0:
             # The FFT blur is periodic, so it runs on a frame padded by 4 sigma
             # on every side, with the same centre, and the padding is cropped:
             # the far edge never leaks into the near one.
             pad = math.ceil(4.0 * blur_px)
+            padded_pixels = (height + 2 * pad) * (width + 2 * pad)
+            if padded_pixels > _MAX_BLURRED_PIXELS:
+                raise ValueError(
+                    f"a blur of {blur_px:g} px (z_um={z!r}) pads shape "
+                    f"{(height, width)!r} to {padded_pixels} pixels, more than "
+                    f"the {_MAX_BLURRED_PIXELS} allowed: use a smaller shape or "
+                    "a smaller |z_um|"
+                )
             padded = replace(pose, shape=(height + 2 * pad, width + 2 * pad))
             blurred = _gaussian_blur(self._signal(padded), blur_px)
             signal = np.ascontiguousarray(

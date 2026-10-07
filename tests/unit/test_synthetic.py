@@ -24,10 +24,12 @@ from smc.hardware.microscope import Microscope
 from smc.hardware.profile import Profile
 from smc.testing import FakeCore, FakeDevice
 from smc.testing.synthetic import (
+    MAX_BLUR_PX,
     REFERENCE_EXPOSURE_MS,
     Blob,
     PlateSample,
     SampleCamera,
+    _shape,
     _tile_values,
 )
 
@@ -71,6 +73,81 @@ def test_every_well_centre_is_a_well_and_half_a_pitch_away_is_plastic(
         inner, outer = 0.95 * half_size_um, 1.05 * half_size_um
         assert sample.well_at(x + along[0] * inner, y + along[1] * inner) == p.name
         assert sample.well_at(x + along[0] * outer, y + along[1] * outer) is None
+
+
+@pytest.mark.parametrize("rotation_deg", [0.0, 90.0, 30.0, -17.5])
+@pytest.mark.parametrize("plate", ["6-well", "96-well", "384-well"])
+def test_a_well_is_round_or_square_as_useq_says(
+    plate: str, rotation_deg: float
+) -> None:
+    """Probes along a diagonal, where a circle and a square of the same size part.
+
+    1.2 half-sizes out along the diagonal is outside a circle but inside a
+    square (0.85 half-sizes on each axis); 1.45 is outside both. Along the
+    plate's axes, which the test above probes, they agree.
+    """
+    a1 = (1234.5, -987.6)
+    sample = PlateSample(plate, a1, rotation_deg, **FLAT)
+    truth = _plan(plate, rotation_deg, a1)
+    half_size_um = truth.plate.well_size[0] * 500.0
+    angle = math.radians(rotation_deg + 45.0)
+    diagonal = (math.cos(angle), math.sin(angle))
+
+    def at(p: useq.AbsolutePosition, distance_um: float) -> str | None:
+        return sample.well_at(
+            p.x + diagonal[0] * distance_um, p.y + diagonal[1] * distance_um
+        )
+
+    for p in truth.all_well_positions:
+        assert at(p, 0.95 * half_size_um) == p.name
+        # Outside a round well, still inside a square one.
+        expected = None if truth.plate.circular_wells else p.name
+        assert at(p, 1.2 * half_size_um) == expected
+        assert at(p, 1.45 * half_size_um) is None
+
+
+@pytest.mark.parametrize("rotation_deg", [0.0, 90.0, 30.0])
+def test_a_plate_with_unequal_x_and_y_is_read_axis_by_axis(
+    rotation_deg: float,
+) -> None:
+    """Every registered plate is isotropic, so this one is not: 10 x 6 mm pitch,
+    8 x 4 mm square wells. An x value used for a y quantity shows here."""
+    plate = useq.WellPlate(
+        rows=3,
+        columns=2,
+        well_spacing=(10.0, 6.0),
+        well_size=(8.0, 4.0),
+        circular_wells=False,
+    )
+    a1 = (-500.0, 250.0)
+    sample = PlateSample(plate, a1, rotation_deg, **FLAT)
+    truth = useq.WellPlatePlan(plate=plate, a1_center_xy=a1, rotation=rotation_deg)
+    half_x_um, half_y_um = 4000.0, 2000.0
+    angle = math.radians(rotation_deg)
+    plate_x = (math.cos(angle), math.sin(angle))  # the columns' direction
+    plate_y = (-math.sin(angle), math.cos(angle))  # the rows' direction
+
+    def at(
+        p: useq.AbsolutePosition, along_x_um: float, along_y_um: float
+    ) -> str | None:
+        return sample.well_at(
+            p.x + plate_x[0] * along_x_um + plate_y[0] * along_y_um,
+            p.y + plate_x[1] * along_x_um + plate_y[1] * along_y_um,
+        )
+
+    assert len(truth.all_well_positions) == 6
+    for p in truth.all_well_positions:
+        assert at(p, 0.0, 0.0) == p.name
+        # The edges of the well, on each axis and on both sides.
+        for sign in (1.0, -1.0):
+            assert at(p, sign * 0.95 * half_x_um, 0.0) == p.name
+            assert at(p, sign * 1.05 * half_x_um, 0.0) is None
+            assert at(p, 0.0, sign * 0.95 * half_y_um) == p.name
+            assert at(p, 0.0, sign * 1.05 * half_y_um) is None
+        # A square: its corner is inside; the gaps between wells are plastic.
+        assert at(p, 0.95 * half_x_um, 0.95 * half_y_um) == p.name
+        assert at(p, 5000.0, 0.0) is None
+        assert at(p, 0.0, 3000.0) is None
 
 
 def test_rotation_direction_is_counter_clockwise() -> None:
@@ -191,14 +268,24 @@ def test_blobs_and_levels_are_kept() -> None:
             id="well-larger-than-its-pitch",
         ),
         pytest.param(
+            lambda: PlateSample(seed=True),  # type: ignore[arg-type]
+            "seed must be a non-negative integer, got True",
+            id="bool-seed",
+        ),
+        pytest.param(
             lambda: Blob(0.0, 0.0, radius_um=0.0, intensity=1.0),
-            "radius_um must be finite and positive (at most 1e+09), got 0.0",
+            "radius_um must be finite and within [1e-06, 1e+09], got 0.0",
             id="blob-radius-zero",
         ),
         pytest.param(
             lambda: Blob(math.nan, 0.0, radius_um=1.0, intensity=1.0),
             "x_um must be finite and within [-1e+09, 1e+09], got nan",
             id="blob-nan-position",
+        ),
+        pytest.param(
+            lambda: Blob(0.0, math.inf, radius_um=1.0, intensity=1.0),
+            "y_um must be finite and within [-1e+09, 1e+09], got inf",
+            id="blob-infinite-y",
         ),
         pytest.param(
             lambda: Blob(0.0, 0.0, radius_um=1.0, intensity=math.inf),
@@ -488,6 +575,184 @@ def test_noise_differs_between_frames_and_a_seed_repeats_the_sequence() -> None:
     assert np.array_equal(second, again_second)
 
 
+def test_a_dark_frame_is_clipped_at_zero_not_wrapped() -> None:
+    """Negative counts are clipped to 0: cast to ``uint16`` they would wrap to ~65000."""
+    sample = PlateSample(
+        well_level=0.0, plastic_level=0.0, texture_std=0.0, noise_std=20.0
+    )
+    frame = sample.render(0.0, 0.0, 0.0, shape=(64, 64), pixel_size_um=1.0)
+    assert int(frame.max()) < 150  # seven sigma of the noise
+    assert float((frame == 0).mean()) > 0.4  # the negative half of it
+
+
+def test_a_dark_blob_darkens_to_zero_and_never_wraps() -> None:
+    dark = Blob(0.0, 0.0, radius_um=10.0, intensity=-1000.0)
+    sample = PlateSample(well_level=100.0, plastic_level=100.0, blobs=[dark], **FLAT)
+    frame = sample.render(0.0, 0.0, 0.0, shape=(64, 64), pixel_size_um=1.0)
+    assert np.all(frame[31:33, 31:33] == 0)  # 100 - 990, clipped
+    assert int(frame.max()) == 100  # the corners, out of reach of the blob
+
+
+@pytest.mark.parametrize("shape", [(64, 192), (192, 64)])
+@pytest.mark.parametrize(
+    ("z_um", "rotation_deg", "mirrored"),
+    [(0.0, 0.0, False), (0.0, 30.0, True), (40.0, 0.0, False), (40.0, 30.0, True)],
+)
+def test_a_non_square_frame_is_the_middle_of_a_larger_square_one(
+    shape: tuple[int, int], z_um: float, rotation_deg: float, mirrored: bool
+) -> None:
+    """Height and width swapped anywhere (blob window, blur crop, padding) shows
+    only off the diagonal: every square frame is blind to it."""
+    bright = Blob(25.0, -10.0, radius_um=8.0, intensity=1500.0)
+    dark = Blob(-30.0, 15.0, radius_um=5.0, intensity=-400.0)
+    sample = PlateSample(noise_std=0.0, blobs=[bright, dark])
+    pose = {
+        "camera_rotation_deg": rotation_deg,
+        "mirrored": mirrored,
+        "pixel_size_um": 1.0,
+    }
+    side = max(shape)
+    large = sample.render(0.0, 0.0, z_um, shape=(side, side), **pose)
+    small = sample.render(0.0, 0.0, z_um, shape=shape, **pose)
+
+    assert small.shape == shape
+    row0, col0 = (side - shape[0]) // 2, (side - shape[1]) // 2
+    middle = large[row0 : row0 + shape[0], col0 : col0 + shape[1]]
+    assert np.abs(small.astype(np.int64) - middle.astype(np.int64)).max() <= 1
+    # ... and the blobs are really in the small frame.
+    bare = PlateSample(noise_std=0.0).render(0.0, 0.0, z_um, shape=shape, **pose)
+    assert (small.astype(np.int64) - bare.astype(np.int64)).max() > 300
+
+
+def test_blobs_add_up_and_sit_on_the_texture() -> None:
+    first = Blob(20.0, 5.0, radius_um=8.0, intensity=1200.0)
+    second = Blob(26.0, 0.0, radius_um=6.0, intensity=900.0)  # overlaps the first
+
+    def frame(sample: PlateSample) -> np.ndarray:
+        return sample.render(0.0, 0.0, 0.0, shape=(96, 96), pixel_size_um=1.0).astype(
+            np.int64
+        )
+
+    bump_first = frame(PlateSample(blobs=[first], **FLAT)) - WELL
+    bump_second = frame(PlateSample(blobs=[second], **FLAT)) - WELL
+    assert bump_first.max() > 1000
+    assert bump_second.max() > 800
+    # Each rounding is within half a count, so sums agree within a count or two.
+    both = frame(PlateSample(blobs=[first, second], **FLAT)) - WELL
+    assert np.abs(both - bump_first - bump_second).max() <= 1
+
+    textured = frame(PlateSample(noise_std=0.0))
+    textured_both = frame(PlateSample(noise_std=0.0, blobs=[first, second]))
+    assert np.abs(textured_both - textured - bump_first - bump_second).max() <= 2
+
+
+def test_a_texture_tile_is_four_um_wide_on_both_sides_of_zero() -> None:
+    """``floor`` puts the tiles at [-4, 0) and [0, 4); truncation would make the
+    one around zero 8 um wide."""
+    sample = PlateSample(noise_std=0.0)
+    frame = sample.render(0.0, 0.0, 0.0, shape=(8, 8), pixel_size_um=1.0)
+    # Pixel centres are at -3.5 ... 3.5 um on both axes: four tiles of 4 x 4 px.
+    quadrants = [frame[:4, :4], frame[:4, 4:], frame[4:, :4], frame[4:, 4:]]
+    for quadrant in quadrants:
+        assert np.all(quadrant == quadrant[0, 0])
+    assert len({int(q[0, 0]) for q in quadrants}) == 4
+
+
+def test_the_blur_grows_up_to_its_cap_and_not_beyond() -> None:
+    sample = PlateSample(well_level=1000.0, plastic_level=1000.0, noise_std=0.0)
+
+    def frame_at(z_um: float) -> np.ndarray:
+        return sample.render(0.0, 0.0, z_um, shape=(64, 64), pixel_size_um=1.0)
+
+    cap_z_um = 10.0 * MAX_BLUR_PX
+    assert MAX_BLUR_PX == 32.0
+    assert not np.array_equal(frame_at(cap_z_um - 10.0), frame_at(cap_z_um))
+    assert np.array_equal(frame_at(cap_z_um), frame_at(cap_z_um + 10.0))
+    assert np.array_equal(frame_at(cap_z_um), frame_at(5000.0))
+
+
+def test_well_at_refuses_a_position_that_is_not_a_number() -> None:
+    sample = PlateSample(**FLAT)
+    with pytest.raises(
+        ValueError,
+        match=re.escape("x_um must be finite and within [-1e+09, 1e+09], got nan"),
+    ):
+        sample.well_at(math.nan, 0.0)
+    with pytest.raises(
+        ValueError,
+        match=re.escape("y_um must be finite and within [-1e+09, 1e+09], got inf"),
+    ):
+        sample.well_at(0.0, math.inf)
+
+
+def test_a_shape_bound_is_checked_in_python_ints_not_in_the_callers_dtype() -> None:
+    """numpy < 2 on Windows turns ``np.array([60000, 60000])`` into int32, whose
+    product wraps to a negative number below the bound; a small dtype's product
+    also warns, which ``-W error`` turns into a failure (FM-32)."""
+    prefix = (
+        "shape must be two positive integers (height, width) with at most "
+        "16777216 pixels"
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(ValueError, match=re.escape(prefix)):
+            _shape((np.int32(60000), np.int32(60000)))
+        assert _shape((np.uint16(300), np.uint16(300))) == (300, 300)
+        assert _shape((np.int64(4096), np.int64(4096))) == (4096, 4096)
+
+
+def test_a_blur_that_pads_a_frame_beyond_the_bound_is_refused_before_it_allocates() -> (
+    None
+):
+    """One row of 2**24 pixels passes the shape bound; padded by 128 pixels on
+    each side for a blur of 32 pixels it would be 4.3e9 values (FM-32)."""
+    phrase = (
+        "a blur of 32 px (z_um=320.0) pads shape (1, 16777216) to "
+        "4311810304 pixels, more than the 33554432 allowed"
+    )
+    with pytest.raises(ValueError, match=re.escape(phrase)):
+        PlateSample().render(0.0, 0.0, 320.0, shape=(1, 2**24), pixel_size_um=1.0)
+
+
+def test_the_largest_frame_may_still_be_blurred_to_the_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The padding bound has room for a frame at the shape bound with the maximum
+    blur: 4352 x 4352 pixels is allowed. The render stops where it would start
+    to allocate."""
+
+    class ReachedError(Exception):
+        pass
+
+    def stop(self: PlateSample, pose: object) -> None:
+        raise ReachedError(pose.shape)  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(PlateSample, "_signal", stop)
+    with pytest.raises(ReachedError) as reached:
+        PlateSample().render(0.0, 0.0, 320.0, shape=(4096, 4096), pixel_size_um=1.0)
+    assert reached.value.args == ((4352, 4352),)
+
+
+def test_a_blob_radius_that_would_underflow_the_exponent_is_refused() -> None:
+    """``radius_um ** 2`` underflows to 0 below about 1e-154, and the exponent
+    of a pixel on the blob's centre becomes 0/0: NaN, cast to ``uint16`` (FM-32)."""
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            "radius_um must be finite and within [1e-06, 1e+09], got 1e-200"
+        ),
+    ):
+        Blob(0.0, 0.0, radius_um=1e-200, intensity=1000.0)
+    # The smallest allowed radius renders without a warning.
+    tiny = Blob(0.0, 0.0, radius_um=1e-6, intensity=1000.0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        frame = PlateSample(blobs=[tiny], **FLAT).render(
+            0.0, 0.0, 0.0, shape=(16, 16), pixel_size_um=1.0
+        )
+    assert np.all(frame == WELL)
+
+
 def test_blur_grows_with_distance_from_focus() -> None:
     # Texture only: both levels equal, no noise. 512 x 512 keeps the mean of a
     # blurred frame within a count of the sharp one (128 x 128 does not).
@@ -504,17 +769,6 @@ def test_blur_grows_with_distance_from_focus() -> None:
     assert stds == pytest.approx([40.0, 19.5, 7.4], abs=1.0)
     assert np.array_equal(frame_at(30.0), frame_at(-30.0))
     assert float(frame_at(40.0).mean()) == pytest.approx(float(sharp.mean()), abs=1.0)
-
-
-def test_the_blur_is_capped_at_the_maximum_in_pixels() -> None:
-    sample = PlateSample(well_level=1000.0, plastic_level=1000.0, noise_std=0.0)
-
-    def frame_at(z_um: float) -> np.ndarray:
-        return sample.render(0.0, 0.0, z_um, shape=(64, 64), pixel_size_um=1.0)
-
-    # |z| / 10 = 32 px at z = 320 um, and no more beyond.
-    assert np.array_equal(frame_at(320.0), frame_at(5000.0))
-    assert not np.array_equal(frame_at(300.0), frame_at(320.0))
 
 
 def test_blur_does_not_wrap_the_frame_edges() -> None:
@@ -564,6 +818,12 @@ def test_blur_does_not_wrap_the_frame_edges() -> None:
             "shape must be two positive integers (height, width) with at most "
             "16777216 pixels, got (8.5, 8)",
             id="shape-with-a-float",
+        ),
+        pytest.param(
+            {"shape": (True, 8)},
+            "shape must be two positive integers (height, width) with at most "
+            "16777216 pixels, got (True, 8)",
+            id="shape-with-a-bool",
         ),
         pytest.param(
             {"shape": (5000, 5000)},
