@@ -194,6 +194,33 @@ def test_profile_rejects_non_finite_or_non_positive_jog_limit(
     assert "safety.max_jog_um" in msg
 
 
+@pytest.mark.parametrize("value", ["0.0", "-1.0", "nan", "inf"])
+def test_max_z_jog_um_must_be_positive_and_finite(tmp_path: Path, value: str) -> None:
+    path = write_profile(tmp_path / "p.toml", f"[safety]\nmax_z_jog_um = {value}\n")
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    msg = str(info.value)
+    assert str(path) in msg
+    assert "safety.max_z_jog_um" in msg
+    # The exact phrase and the value, not a bare "finite" (FM-45).
+    assert f"max_z_jog_um must be a positive, finite number of µm, got {value}" in msg
+
+
+def test_omitted_max_z_jog_um_loads_as_none(tmp_path: Path) -> None:
+    # "Omitted" stays visible in the profile; Safety alone applies the default.
+    path = write_profile(tmp_path / "p.toml", "[safety]\nmax_jog_um = 10.0\n")
+    assert Profile.load(path).safety.max_z_jog_um is None
+
+
+def test_max_z_jog_um_is_read_from_the_profile(tmp_path: Path) -> None:
+    path = write_profile(tmp_path / "p.toml", "[safety]\nmax_z_jog_um = 25.0\n")
+    assert Profile.load(path).safety.max_z_jog_um == 25.0
+
+
+def test_demo_profile_sets_max_z_jog_um() -> None:
+    assert Profile.demo().safety.max_z_jog_um == 100.0
+
+
 def test_wrong_type_names_the_key(tmp_path: Path) -> None:
     path = write_profile(tmp_path / "p.toml", '[safety]\nmax_jog_um = "far"\n')
     with pytest.raises(ProfileError, match=r"safety\.max_jog_um"):
