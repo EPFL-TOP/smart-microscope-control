@@ -350,7 +350,8 @@ def test_a_blob_keeps_its_whole_gaussian_at_any_camera_rotation(
         mirrored=mirrored,
     )
     total = float((frame.astype(np.float64) - WELL).sum())
-    assert total == pytest.approx(2000.0 * 2.0 * math.pi * 5.0**2, rel=0.01)
+    # The box of +-4 sigma loses 0.006 %; a window of 1.8 radii would lose 0.15 %.
+    assert total == pytest.approx(2000.0 * 2.0 * math.pi * 5.0**2, rel=5e-4)
 
 
 @pytest.mark.parametrize(
@@ -472,6 +473,47 @@ def test_noise_differs_between_frames_and_a_seed_repeats_the_sequence() -> None:
     assert np.array_equal(second, again_second)
 
 
+def test_blur_grows_with_distance_from_focus() -> None:
+    # Texture only: both levels equal, no noise. 512 x 512 keeps the mean of a
+    # blurred frame within a count of the sharp one (128 x 128 does not).
+    sample = PlateSample(well_level=1000.0, plastic_level=1000.0, noise_std=0.0)
+
+    def frame_at(z_um: float) -> np.ndarray:
+        return sample.render(0.0, 0.0, z_um, shape=(512, 512), pixel_size_um=1.0)
+
+    sharp, mild, strong = frame_at(0.0), frame_at(20.0), frame_at(60.0)
+    stds = [float(f.std()) for f in (sharp, mild, strong)]
+    assert stds[0] > stds[1] > stds[2]
+    # Measured on the reference implementation: 40.0, 19.5 and 7.4 (sigma 0, 2
+    # and 6 px for z = 0, 20 and 60 um); a different scale of z shows here.
+    assert stds == pytest.approx([40.0, 19.5, 7.4], abs=1.0)
+    assert np.array_equal(frame_at(30.0), frame_at(-30.0))
+    assert float(frame_at(40.0).mean()) == pytest.approx(float(sharp.mean()), abs=1.0)
+
+
+def test_the_blur_is_capped_at_the_maximum_in_pixels() -> None:
+    sample = PlateSample(well_level=1000.0, plastic_level=1000.0, noise_std=0.0)
+
+    def frame_at(z_um: float) -> np.ndarray:
+        return sample.render(0.0, 0.0, z_um, shape=(64, 64), pixel_size_um=1.0)
+
+    # |z| / 10 = 32 px at z = 320 um, and no more beyond.
+    assert np.array_equal(frame_at(320.0), frame_at(5000.0))
+    assert not np.array_equal(frame_at(300.0), frame_at(320.0))
+
+
+def test_blur_does_not_wrap_the_frame_edges() -> None:
+    """Without the padding, the FFT's periodic boundary leaks the far side in."""
+    sample = PlateSample(**FLAT)
+    # A 64 x 64 frame centred on the wall of A1 at x = 3200 um: well on the
+    # left, plastic on the right, 31.5 um from either edge.
+    frame = sample.render(3200.0, 0.0, 50.0, shape=(64, 64), pixel_size_um=1.0)
+    assert np.all(np.abs(frame[:, 0].astype(np.int64) - WELL) <= 1)
+    assert np.all(np.abs(frame[:, -1].astype(np.int64) - PLASTIC) <= 1)
+    # The wall itself is blurred into a ramp.
+    assert PLASTIC + 100 < frame[32, 32] < WELL - 100
+
+
 @pytest.mark.parametrize(
     ("kwargs", "phrase"),
     [
@@ -565,8 +607,9 @@ def test_rendering_a_512_frame_is_vectorised() -> None:
     """A tripwire for a per-pixel loop (about a second), not a speed claim: the
     50 ms target is measured and quoted in the PR, never asserted (FM-44)."""
     sample = PlateSample(blobs=[Blob(30.0, -20.0, radius_um=15.0, intensity=500.0)])
-    best = min(_seconds(sample, z_um=0.0) for _ in range(5))
-    assert best < 0.5
+    for z_um in (0.0, 30.0):  # the second one runs the padded FFT blur
+        best = min(_seconds(sample, z_um=z_um) for _ in range(5))
+        assert best < 0.5, f"z={z_um}: {best:.3f} s"
 
 
 def _seconds(sample: PlateSample, *, z_um: float) -> float:

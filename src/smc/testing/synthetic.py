@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import numpy.typing as npt
@@ -190,6 +190,20 @@ class _Pose:
         col = (-camera_x if self.mirrored else camera_x) / self.pixel_size_um
         row = -camera_y / self.pixel_size_um
         return col + (width - 1) / 2.0, row + (height - 1) / 2.0
+
+
+def _gaussian_blur(
+    image: npt.NDArray[np.float64], sigma_px: float
+) -> npt.NDArray[np.float64]:
+    """Blur by multiplying the spectrum with a Gaussian: periodic, so the caller pads.
+
+    The transfer function of a Gaussian of ``sigma_px`` is ``exp(-2 pi^2
+    sigma^2 f^2)``. No ``scipy``: it is not a dependency of this package.
+    """
+    fy = np.fft.fftfreq(image.shape[0])[:, None]
+    fx = np.fft.rfftfreq(image.shape[1])[None, :]
+    transfer = np.exp(-2.0 * math.pi**2 * sigma_px**2 * (fx * fx + fy * fy))
+    return np.fft.irfft2(np.fft.rfft2(image) * transfer, s=image.shape)
 
 
 def _add_blob(
@@ -378,7 +392,20 @@ class PlateSample:
         exposure = _bounded("exposure_ms", exposure_ms, 0.0, _MAX_EXPOSURE_MS)
 
         pose = _Pose(x, y, (height, width), scale_um, rotation, mirrored)
-        signal = self._signal(pose)
+        # A stand-in for defocus: sharp at z = 0, symmetric, no sign.
+        blur_px = min(abs(z_um) / 10.0, MAX_BLUR_PX)
+        if blur_px > 0.0:
+            # The FFT blur is periodic, so it runs on a frame padded by 4 sigma
+            # on every side, with the same centre, and the padding is cropped:
+            # the far edge never leaks into the near one.
+            pad = math.ceil(4.0 * blur_px)
+            padded = replace(pose, shape=(height + 2 * pad, width + 2 * pad))
+            blurred = _gaussian_blur(self._signal(padded), blur_px)
+            signal = np.ascontiguousarray(
+                blurred[pad : pad + height, pad : pad + width]
+            )
+        else:
+            signal = self._signal(pose)
         signal *= exposure / REFERENCE_EXPOSURE_MS
         if self.noise_std > 0.0:
             signal += self._rng.normal(0.0, self.noise_std, size=signal.shape)
