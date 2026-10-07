@@ -359,6 +359,17 @@ def test_stage_z_and_snap_help_name_their_units() -> None:
         assert unit in result.output, args
 
 
+def test_z_jog_help_documents_the_force_option() -> None:
+    result = runner.invoke(app, ["z", "jog", "--help"])
+
+    assert result.exit_code == 0, result.output
+    # A phrase only the option's own help supplies: the command's docstring
+    # also says "--force", so that word alone would pass without the option.
+    assert (
+        "Move further than the profile's safety.max_z_jog_um allows." in result.output
+    )
+
+
 @pytest.mark.demo
 @pytest.mark.usefixtures("demo")
 def test_stage_get_prints_the_position_in_um() -> None:

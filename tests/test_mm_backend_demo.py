@@ -222,6 +222,9 @@ class TestOnDemoDevices:
         start = z.move_to_um(0.0)
         with pytest.raises(SafetyRefusedError) as info:
             z.move_by_um(bad, force=True)
+        # The jog guard's own reason: the soft-limit check refuses a non-finite
+        # target too, with an empty how_to_force, so that alone proves nothing.
+        assert info.value.reason == f"Z jog {bad} µm is not a finite distance"
         assert info.value.how_to_force == ""
         assert z.position_um() == pytest.approx(start)
 
