@@ -86,6 +86,25 @@ def _positive(name: str, value: float, high: float) -> float:
     return float(value)
 
 
+def _shape(shape: tuple[int, int]) -> tuple[int, int]:
+    message = (
+        "shape must be two positive integers (height, width) with at most "
+        f"{_MAX_PIXELS} pixels, got {shape!r}"
+    )
+    try:
+        height, width = shape
+    except (TypeError, ValueError):
+        raise ValueError(message) from None
+    for side in (height, width):
+        if isinstance(side, bool) or not isinstance(side, (int, np.integer)):
+            raise ValueError(message)
+        if side <= 0:
+            raise ValueError(message)
+    if height * width > _MAX_PIXELS:
+        raise ValueError(message)
+    return int(height), int(width)
+
+
 def _pair(name: str, value: Sequence[float], bound: float) -> tuple[float, float]:
     if len(value) != 2:
         raise ValueError(f"{name} must be two numbers (x, y), got {tuple(value)!r}")
@@ -123,6 +142,83 @@ def _tile_values(
     # The top 53 bits as a uniform on [0, 1), centred, scaled to unit variance.
     uniform = (z >> np.uint64(11)).astype(np.float64) * 2.0**-53
     return (uniform - 0.5) * math.sqrt(12.0)
+
+
+@dataclass(frozen=True, slots=True)
+class _Pose:
+    """Where a camera is and how its axes point: the map between pixels and the stage plane.
+
+    The stage position is the plate point at the centre of the frame. Columns
+    grow with +X and rows with -Y (row 0 is the +Y side). ``mirrored`` flips
+    the columns, and the rotation, counter-clockwise, comes after it:
+    ``world = (x, y) + R(rotation) * (+-dx, dy)``.
+    """
+
+    x_um: float
+    y_um: float
+    shape: tuple[int, int]  # (height, width)
+    pixel_size_um: float
+    rotation_deg: float
+    mirrored: bool
+
+    def _rotation(self) -> tuple[float, float]:
+        angle = math.radians(self.rotation_deg)
+        return math.cos(angle), math.sin(angle)
+
+    def world(self) -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+        """The stage position of every pixel centre, as two ``shape`` arrays (X, Y)."""
+        height, width = self.shape
+        cos, sin = self._rotation()
+        step = self.pixel_size_um
+        cols = (np.arange(width, dtype=np.float64) - (width - 1) / 2.0) * step
+        rows = -(np.arange(height, dtype=np.float64) - (height - 1) / 2.0) * step
+        dx = (-cols if self.mirrored else cols)[None, :]
+        dy = rows[:, None]
+        return (
+            self.x_um + (cos * dx - sin * dy),
+            self.y_um + (sin * dx + cos * dy),
+        )
+
+    def pixel_of(self, x_um: float, y_um: float) -> tuple[float, float]:
+        """The ``(col, row)`` a stage position falls on, fractional and possibly off the frame."""
+        height, width = self.shape
+        cos, sin = self._rotation()
+        offset_x, offset_y = x_um - self.x_um, y_um - self.y_um
+        # Undo the rotation, then the mirror.
+        camera_x = cos * offset_x + sin * offset_y
+        camera_y = -sin * offset_x + cos * offset_y
+        col = (-camera_x if self.mirrored else camera_x) / self.pixel_size_um
+        row = -camera_y / self.pixel_size_um
+        return col + (width - 1) / 2.0, row + (height - 1) / 2.0
+
+
+def _add_blob(
+    signal: npt.NDArray[np.float64],
+    world_x: npt.NDArray[np.float64],
+    world_y: npt.NDArray[np.float64],
+    blob: Blob,
+    pose: _Pose,
+) -> None:
+    """Add a Gaussian spot inside the box of +-2 radii around it, touching only that window."""
+    height, width = signal.shape
+    col, row = pose.pixel_of(blob.x_um, blob.y_um)
+    if not (math.isfinite(col) and math.isfinite(row)):
+        return  # absurdly far away: finite stage position over a tiny pixel
+    # A window that holds the whole box whatever the camera rotation.
+    reach = 2.0 * math.sqrt(2.0) * blob.radius_um / pose.pixel_size_um
+    half = int(min(reach, height + width)) + 2
+    c0, c1 = max(0, math.floor(col) - half), min(width, math.floor(col) + half + 1)
+    r0, r1 = max(0, math.floor(row) - half), min(height, math.floor(row) + half + 1)
+    if c0 >= c1 or r0 >= r1:
+        return
+    gx = world_x[r0:r1, c0:c1] - blob.x_um
+    gy = world_y[r0:r1, c0:c1] - blob.y_um
+    box = 2.0 * blob.radius_um
+    # sigma = radius / 2, so 2 sigma^2 = radius^2 / 2.
+    bump = blob.intensity * np.exp(-(gx * gx + gy * gy) / (blob.radius_um**2 / 2.0))
+    signal[r0:r1, c0:c1] += np.where(
+        (np.abs(gx) <= box) & (np.abs(gy) <= box), bump, 0.0
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,6 +322,82 @@ class PlateSample:
         self._names = plan.all_well_names
         angle = math.radians(self.rotation_deg)
         self._cos, self._sin = math.cos(angle), math.sin(angle)
+        # The sample's own generator: successive frames get fresh noise, and a
+        # new sample with the same seed repeats the sequence.
+        self._rng = np.random.default_rng(self.seed)
+
+    def render(
+        self,
+        x_um: float,
+        y_um: float,
+        z_um: float,
+        *,
+        shape: tuple[int, int],
+        pixel_size_um: float,
+        camera_rotation_deg: float = 0.0,
+        mirrored: bool = False,
+        exposure_ms: float = REFERENCE_EXPOSURE_MS,
+    ) -> npt.NDArray[np.uint16]:
+        """One frame of the plate as a camera at a stage position would see it.
+
+        ``(x_um, y_um)`` is the plate point at the centre of the frame, so a
+        test can ask for any pose without a stage. Every call draws fresh noise
+        from the sample's generator; texture and blobs depend on the position
+        only, so a test that compares frames sets ``noise_std=0``.
+
+        Args:
+            x_um: Stage X, the plate point at the centre of the frame.
+            y_um: Stage Y.
+            z_um: Stage Z; the focus plane is z = 0 and the blur has no sign.
+            shape: ``(height, width)`` in pixels.
+            pixel_size_um: Object-space pixel size. Never defaulted: a pixel
+                size that is not finite and positive is refused.
+            camera_rotation_deg: Rotation of the camera about the optical
+                axis, counter-clockwise, applied after the mirror.
+            mirrored: Flip the image left-right (before the rotation).
+            exposure_ms: Scales the signal, not the noise; the levels are the
+                counts at ``REFERENCE_EXPOSURE_MS``.
+
+        Returns:
+            A ``uint16`` array of ``shape``.
+
+        Raises:
+            ValueError: An argument is not finite or is out of range.
+        """
+        x = _bounded("x_um", x_um, -_MAX_POSITION_UM, _MAX_POSITION_UM)
+        y = _bounded("y_um", y_um, -_MAX_POSITION_UM, _MAX_POSITION_UM)
+        _bounded("z_um", z_um, -_MAX_POSITION_UM, _MAX_POSITION_UM)
+        height, width = _shape(shape)
+        scale_um = _positive("pixel_size_um", pixel_size_um, _MAX_PIXEL_SIZE_UM)
+        rotation = _bounded(
+            "camera_rotation_deg",
+            camera_rotation_deg,
+            -_MAX_ROTATION_DEG,
+            _MAX_ROTATION_DEG,
+        )
+        exposure = _bounded("exposure_ms", exposure_ms, 0.0, _MAX_EXPOSURE_MS)
+
+        pose = _Pose(x, y, (height, width), scale_um, rotation, mirrored)
+        signal = self._signal(pose)
+        signal *= exposure / REFERENCE_EXPOSURE_MS
+        if self.noise_std > 0.0:
+            signal += self._rng.normal(0.0, self.noise_std, size=signal.shape)
+        return np.rint(np.clip(signal, 0.0, 65535.0)).astype(np.uint16)
+
+    def _signal(self, pose: _Pose) -> npt.NDArray[np.float64]:
+        """Level, texture and blobs at the reference exposure, before blur, scale and noise."""
+        world_x, world_y = pose.world()
+        inside, _, _ = self._locate(world_x, world_y)
+        signal = np.where(
+            inside, np.float64(self.well_level), np.float64(self.plastic_level)
+        )
+        if self.texture_std > 0.0:
+            tile_x = np.floor(world_x / TEXTURE_TILE_UM).astype(np.int64)
+            tile_y = np.floor(world_y / TEXTURE_TILE_UM).astype(np.int64)
+            signal += self.texture_std * _tile_values(tile_x, tile_y, self.seed)
+        for blob in self.blobs:
+            _add_blob(signal, world_x, world_y, blob, pose)
+        return signal
 
     def well_at(self, x_um: float, y_um: float) -> str | None:
         """The name of the well (``"B3"``) at a stage position, or ``None`` on plastic.
