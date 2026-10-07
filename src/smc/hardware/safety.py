@@ -3,11 +3,15 @@
 The guards live in the layer, not in the tools, so a tool cannot opt out of
 them (CLAUDE.md, architecture rules):
 
-* **Jog guard.** A relative XY move larger than ``max_jog_um`` is refused
-  unless the call site passes ``force=True``. A mistyped relative move
-  (``1000`` for ``100``) is the classic way to drive a stage out of the well
-  or into the plate holder; an absolute move is not guarded, because
-  crossing a plate is legitimate travel.
+* **Jog guard.** A relative XY move larger than ``max_jog_um``, or a
+  relative Z move larger than ``max_z_jog_um``, is refused unless the call
+  site passes ``force=True``. A mistyped relative move (``1000`` for ``100``)
+  is the classic way to drive a stage out of the well or into the plate
+  holder, and a mistyped focus jog drives the objective into the sample; an
+  absolute move is not guarded, because crossing a plate is legitimate
+  travel. The two limits are separate: a Z jog that is a long way for a
+  focus drive is nothing for a stage. ``force=True`` unlocks the jog guard
+  only; the soft limits below still bound a forced jog.
 * **Soft limits.** A target outside the profile's travel range is refused
   and cannot be forced: the limits describe where the objective or the
   holder would collide, and no tool knows better at run time. No limits
@@ -53,9 +57,22 @@ from smc.hardware.errors import (
     SafetyRefusedError,
 )
 
-__all__ = ["POLL_INTERVAL_S", "Executor", "Motion", "SafeCall", "Safety", "Step"]
+__all__ = [
+    "DEFAULT_MAX_Z_JOG_UM",
+    "POLL_INTERVAL_S",
+    "Executor",
+    "Motion",
+    "SafeCall",
+    "Safety",
+    "Step",
+]
 
 T = TypeVar("T")
+
+#: The Z jog limit used when a profile sets none. It is a guess, not a
+#: measurement: no travel range or objective tells a sensible focus jog, so
+#: the guard says whenever it shows that the number is assumed (design §12).
+DEFAULT_MAX_Z_JOG_UM = 100.0
 
 
 def _check_range(name: str, bounds: tuple[float, float]) -> tuple[float, float]:
@@ -79,10 +96,22 @@ class Safety:
         z_soft_limits_um: tuple[float, float] | None = None,
         xy_soft_limits_um: tuple[tuple[float, float], tuple[float, float]]
         | None = None,
+        max_z_jog_um: float | None = None,
     ) -> None:
         if not math.isfinite(max_jog_um) or max_jog_um < 0:
             raise ValueError(f"max_jog_um must be finite and >= 0, got {max_jog_um!r}")
         self.max_jog_um = float(max_jog_um)
+        # An infinite limit is refused, never read as "no guard", as for XY.
+        if max_z_jog_um is not None and (
+            not math.isfinite(max_z_jog_um) or max_z_jog_um < 0
+        ):
+            raise ValueError(
+                f"max_z_jog_um must be finite and >= 0, got {max_z_jog_um!r}"
+            )
+        self.z_jog_assumed = max_z_jog_um is None
+        self.max_z_jog_um = (
+            DEFAULT_MAX_Z_JOG_UM if max_z_jog_um is None else float(max_z_jog_um)
+        )
         self.z_soft_limits_um = (
             None
             if z_soft_limits_um is None
@@ -112,6 +141,33 @@ class Safety:
         if size > self.max_jog_um and not force:
             raise SafetyRefusedError(
                 f"jog ({dx_um}, {dy_um}) µm exceeds the jog limit of {self.max_jog_um} µm",
+                how_to_force="pass force=True",
+            )
+
+    def check_z_jog_um(self, dz_um: float, *, force: bool) -> None:
+        """Refuse a relative Z move above ``max_z_jog_um`` unless forced.
+
+        The check depends only on the distance, so it can run before the
+        action takes the lock or reads a position. ``force`` unlocks this
+        guard only: the soft limits still apply to the target.
+
+        Raises:
+            SafetyRefusedError: The jog is too large (forceable), or not finite
+                (never forceable).
+        """
+        if not math.isfinite(dz_um):
+            raise SafetyRefusedError(f"Z jog {dz_um} µm is not a finite distance")
+        if abs(dz_um) > self.max_z_jog_um and not force:
+            # A default nobody chose is named as such, so that an operator who
+            # reads the refusal knows the number is not the stand's.
+            assumed = (
+                " (assumed: the profile sets no [safety] max_z_jog_um)"
+                if self.z_jog_assumed
+                else ""
+            )
+            raise SafetyRefusedError(
+                f"Z jog {dz_um} µm exceeds the Z jog limit of "
+                f"{self.max_z_jog_um} µm{assumed}",
                 how_to_force="pass force=True",
             )
 
