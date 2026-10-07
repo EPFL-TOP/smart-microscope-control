@@ -351,7 +351,6 @@ def test_stage_z_and_snap_help_name_their_units() -> None:
         (["stage", "--help"], "µm"),
         (["stage", "jog", "--help"], "µm"),
         (["z", "--help"], "µm"),
-        (["z", "jog", "--help"], "--force"),
         (["snap", "--help"], "ms"),
     ]:
         result = runner.invoke(app, args)
@@ -359,15 +358,27 @@ def test_stage_z_and_snap_help_name_their_units() -> None:
         assert unit in result.output, args
 
 
+#: Typer forces colour when GITHUB_ACTIONS is set, and rich then styles an
+#: option name in pieces (``-`` and ``-force``): the plain text is what a
+#: help test can compare, in CI and in a terminal alike.
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
 def test_z_jog_help_documents_the_force_option() -> None:
     result = runner.invoke(app, ["z", "jog", "--help"])
 
     assert result.exit_code == 0, result.output
-    # A phrase only the option's own help supplies: the command's docstring
-    # also says "--force", so that word alone would pass without the option.
-    assert (
-        "Move further than the profile's safety.max_z_jog_um allows." in result.output
-    )
+    plain = _ANSI.sub("", result.output)
+    # One row of the options table carries the flag and its own help text. The
+    # command's docstring also says "--force", so the flag alone, or the help
+    # text alone, would pass without the option being declared.
+    help_text = "Move further than the profile's safety.max_z_jog_um allows."
+    rows = [
+        row
+        for row in plain.splitlines()
+        if re.search(r"--force\s", row) and help_text in row
+    ]
+    assert rows, plain
 
 
 @pytest.mark.demo
