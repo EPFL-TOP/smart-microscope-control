@@ -52,6 +52,9 @@ the plan, do what it unlocks (labels, dependents), and end the session.
    - [ ] the issue's acceptance criteria, made concrete
    - [ ] `ruff check . && ruff format --check . && mypy && pytest` green; CI green
    - [ ] adversarial review run for this risk level; confirmed findings fixed or deferred with a reason
+   - [ ] what only the owner can run (`pytest -m hardware`, even with
+         `--profile demo`, or anything at a stand) is listed under *Not
+         verified*, never as a step: the develop harness denies it (#9)
 
    ### Decided here (do not re-decide)
    - defaults, names, edge-case behaviour the executor might otherwise guess
