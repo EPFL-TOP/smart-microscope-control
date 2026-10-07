@@ -150,6 +150,34 @@ def merged_lines(pr: dict[str, Any]) -> list[str]:
     return out
 
 
+def main_ci(runs: list[dict[str, Any]], stamp: str) -> list[str]:
+    """``main``'s CI: its latest run, then every run that failed since ``stamp``.
+
+    A flake that fails ``main`` and passes on the next push leaves no trace
+    on any PR: it failed ``main`` twice before anyone noticed (#90).
+    """
+    ci = sorted(
+        (r for r in runs if r.get("workflowName") == "CI"),
+        key=lambda r: str(r.get("createdAt", "")),
+    )
+    if not ci:
+        return ["- no CI run on main"]
+    last = ci[-1]
+    state = str(last.get("conclusion") or last.get("status") or "unknown")
+    out = [
+        f"- latest: {state} ({str(last.get('createdAt', ''))[:16]},"
+        f" {clip(str(last.get('displayTitle', '')), 70)})"
+    ]
+    for r in ci:
+        failed = str(r.get("conclusion") or "").upper() in _FAILING
+        if failed and str(r.get("createdAt", "")) >= stamp:
+            out.append(
+                f"- FAILED {str(r['createdAt'])[:16]}"
+                f" {clip(str(r.get('displayTitle', '')), 70)} {r.get('url', '')}"
+            )
+    return out
+
+
 def status_of(issue: dict[str, Any]) -> str:
     names = [str(label["name"]) for label in issue.get("labels", [])]
     found = [n[len(STATUS) :] for n in names if n.startswith(STATUS)]
@@ -252,6 +280,16 @@ def main() -> int:
         "--json",
         "number,title,mergedAt,reviews,comments",
     )
+    runs = gh_json(
+        "run",
+        "list",
+        "--branch",
+        "main",
+        "--limit",
+        "50",
+        "--json",
+        "conclusion,status,displayTitle,createdAt,workflowName,url",
+    )
 
     out = [
         f"# Point facts ({datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC, since {stamp})",
@@ -266,6 +304,10 @@ def main() -> int:
         )
     if not prs:
         out.append("- none")
+    out.append("")
+
+    out.append("## CI on main")
+    out.extend(main_ci(runs, stamp))
     out.append("")
 
     out.append("## Merged since the last point")

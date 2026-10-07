@@ -2,7 +2,7 @@
 
 - **Status**: design for issues #5, #6, #7, #8, #9, #10, #11, #30 and #54
   (§13, added 2026-09-23, revised 2026-09-24; §9 revised 2026-09-30;
-  §8 revised 2026-10-01)
+  §8 revised 2026-10-01 and 2026-10-07)
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: this document is the contract between issues that are built in
   parallel. Names, module paths and signatures below are fixed; an executor
@@ -743,6 +743,7 @@ then works without the dev extra.
 | `mm_available` | session | Whether the adapters are installed. Fails under `SMC_REQUIRE_MM=1` when they are not. |
 | `demo_core` | function | `open_core(None)`, released afterwards. Skips without the adapters. |
 | `demo_microscope` / `demo_microscope_dry` | function | `Microscope.open(Profile.demo())`, live or with `dry_run=True`, closed afterwards. Skips without the adapters. |
+| `demo_microscope_with_sample` | function | A factory, `(sample=None, *, pixel_size_um=None, shape=None, camera_rotation_deg=0.0, mirrored=False) -> Microscope`: the `demo_microscope` stand with its camera replaced by a `SampleCamera` (#10, below). Skips without the adapters. |
 | `fake_core` | function | `FakeCore.demo_like()` |
 | `fake_microscope` | function | `Microscope.from_core(fake_core, Profile.demo())`, closed afterwards |
 | `hardware_microscope` | function | `Microscope.open(<--profile>)`, closed afterwards |
@@ -846,28 +847,136 @@ capability Protocol runs on every backend.
 
 ### Synthetic sample (`smc/testing/synthetic.py`, #10)
 
+**Revised 2026-10-07** for the plan of #10, from what was measured that day
+on the demo (pymmcore-plus 0.18.1) and with `useq-schema` 0.9.2 and numpy
+2.5.3:
+- `WellPlatePlan.a1_center_xy` is in µm, but `plate.well_size` and
+  `plate.well_spacing` are in **mm**. Rows run towards −Y and columns
+  towards +X: with A1 at (1000, 2000) µm, A2 is at (10000, 2000) and B1 at
+  (1000, −7000).
+- `rotation` is in degrees, counter-clockwise with Y up, about A1:
+  `world = A1 + R(+θ) · (col · pitch_x, −row · pitch_y)`. At 90°, A2 is at
+  (1000, 11000) and B1 at (10000, 2000); at 30°, A2 is at (8794.2, 6500).
+- 6-, 12-, 24- and 96-well plates have circular wells (96-well: 6.4 mm at a
+  9 mm pitch), 384- and 1536-well plates have square ones. `well_size` is
+  below `well_spacing` on every registered plate. An unknown name raises a
+  pydantic `ValidationError` ("Unknown plate name 'glass'"), a `ValueError`.
+- Rounding to the nearest well in plate coordinates, then comparing the
+  offset with `well_size`, agrees with `useq`'s own well positions on 6-,
+  24-, 96- and 384-well plates at 0°, 90°, 30°, −17.5° and 180°. It
+  classifies a 512 × 512 frame in 1.6 ms.
+- The demo camera is 512 × 512, `uint16`, 16-bit, 1.0 µm per pixel, 10 ms.
+  Its frame mean scales linearly with the exposure (3276 at 10 ms, 6553 at
+  20 ms) and does not depend on the stage. Its XY stage rounds a command:
+  `move_by_um(10, 0)` reads back 10.005 µm. A test compares frames with the
+  readback, never with the command.
+- A texture of hashed 4 µm tiles costs 1.8 ms per 512 × 512 frame, and an
+  FFT Gaussian blur of a padded 560 × 560 frame 3.2 ms. An FFT
+  cross-correlation of two textures 10 µm apart recovers 20, 10 and 5 px
+  exactly at 0.5, 1 and 2 µm per pixel.
+
 ```python
+REFERENCE_EXPOSURE_MS = 10.0  # the demo's exposure: the levels are the counts at this exposure
+
 @dataclass(frozen=True)
 class Blob: x_um: float; y_um: float; radius_um: float; intensity: float
 
 class PlateSample:
-    def __init__(self, plate: str = "96-well", a1_center_xy_um: tuple[float, float] = (0.0, 0.0),
+    def __init__(self, plate: str | WellPlate = "96-well",
+                 a1_center_xy_um: tuple[float, float] = (0.0, 0.0),
                  rotation_deg: float = 0.0, *, well_level: float = 3000.0, plastic_level: float = 800.0,
                  blobs: Sequence[Blob] = (), texture_std: float = 40.0, noise_std: float = 20.0,
                  seed: int = 0): ...
+    def well_at(self, x_um: float, y_um: float) -> str | None   # "B3", or None on plastic: the ground truth
     def render(self, x_um: float, y_um: float, z_um: float, *, shape: tuple[int, int],
-               pixel_size_um: float, camera_rotation_deg: float = 0.0, mirrored: bool = False) -> np.ndarray  # uint16
+               pixel_size_um: float, camera_rotation_deg: float = 0.0, mirrored: bool = False,
+               exposure_ms: float = REFERENCE_EXPOSURE_MS) -> np.ndarray   # uint16
 
 class SampleCamera:   # implements Camera; snap() renders at the stage's current position
-    def __init__(self, microscope: Microscope, sample: PlateSample, *, pixel_size_um: float, shape=(512, 512)): ...
+    def __init__(self, microscope: Microscope, sample: PlateSample, *, pixel_size_um: float,
+                 shape: tuple[int, int] = (512, 512), camera_rotation_deg: float = 0.0,
+                 mirrored: bool = False): ...
 ```
 
-Well geometry comes from `useq.WellPlatePlan` (never re-derived). Texture
-is deterministic per stage position (hash of the world-space tile), so
-phase correlation between two overlapping frames works. Fixture:
-`demo_microscope_with_sample(sample=…)` calls `microscope.override(Camera,
-SampleCamera(...))`. A test proves the frame mean changes when the stage
-crosses a well wall.
+Well geometry comes from `useq.WellPlatePlan` (never re-derived: the pitch
+and size are read from it, converted from mm to µm). The sample is **flat**:
+one plane at z = 0, plate coordinates equal stage coordinates.
+
+**Frame axes** (what the camera↔stage calibration will later measure):
+- The stage position is the plate point imaged at the **centre of the
+  frame**. For an `H × W` frame at `ps` µm per pixel, pixel (row `r`,
+  column `c`) is at the camera-frame offset `dx = (c − (W−1)/2) · ps`,
+  `dy = −(r − (H−1)/2) · ps`: columns grow with +X and rows with −Y, so row
+  0 is the +Y side.
+- `world = (x_um, y_um) + R(camera_rotation_deg) · (±dx, dy)`, `−dx` when
+  `mirrored` (the image is flipped left-right first), `R` counter-clockwise.
+- So at 0°, a +10 µm X move shifts the content 10 / `ps` columns left, and
+  a +10 µm Y move shifts it 10 / `ps` rows down. Blobs east of the centre
+  appear right of it at 0°, below it at `camera_rotation_deg=90`, and left
+  of it when mirrored.
+
+**What a frame is made of**, in this order:
+1. The level: `well_level` inside a well, `plastic_level` elsewhere,
+   with a hard edge sampled at the pixel centres. Outside the plate is
+   plastic.
+2. `+ texture_std ·` the texture: a hash of the world-space tile
+   `(floor(X / 4 µm), floor(Y / 4 µm))` and of `seed`, mapped to zero mean
+   and unit variance. It is a function of the world position only, so two
+   frames of the same plate point agree, and phase correlation between
+   overlapping frames works. The hash is the SplitMix64 finaliser on
+   `uint64` **arrays** (a scalar `uint64` product warns on overflow), so it
+   is bit-identical on every platform; a test pins its first values.
+3. `+` the blobs: `intensity · exp(−d² / 2σ²)`, `σ = radius_um / 2`,
+   computed in the box ±2 · `radius_um` around each blob.
+4. A Gaussian blur of `σ_px = min(|z_um| / 10, 32)` over steps 1–3, none at
+   z = 0 (a stand-in for defocus: sharp at z = 0, symmetric, no sign). It
+   runs on a frame padded by `4 σ_px` and cropped afterwards, so the frame's
+   edges do not wrap.
+5. `× exposure_ms / REFERENCE_EXPOSURE_MS`: the signal scales, as the
+   demo's frame does.
+6. `+` Gaussian noise of `noise_std`, from a generator the sample owns,
+   seeded with `seed`. It is **not** position-locked: successive frames
+   differ, and a new sample with the same seed repeats the sequence. A test
+   that compares frames sets `noise_std=0`.
+7. Clipped to [0, 65535] and rounded to `uint16`.
+
+`render` raises `ValueError` for a `pixel_size_um` that is not finite and
+positive (a pixel size of 0 is reported, never defaulted), a `shape` that
+is not two positive integers, a non-finite position or an `exposure_ms`
+that is negative or not finite. `PlateSample` raises it for a level or a
+standard deviation that is negative or not finite, a blob with a
+non-positive radius or a non-finite field, and a plate whose `well_size`
+exceeds its `well_spacing`: the nearest-well search assumes each well lies
+in its own pitch cell.
+
+`SampleCamera.snap()` reads the XY position from `microscope.require(XYStage)`
+and Z from `microscope.get(ZStage)` (0.0 without one), and renders.
+`exposure_ms()` starts at `REFERENCE_EXPOSURE_MS`; `set_exposure_ms` stores
+the value, and raises `ValueError` for one that is negative or not finite.
+`image_shape()` is `shape`, `bit_depth()` is 16 and `pixel_size_um()` is the
+given value, which must be finite and positive. It is installed with
+`microscope.override(Camera, …)` and therefore bypasses the `Executor` (§7):
+no lock, no dry-run, no halt, no motion guard, and it is not thread-safe (it
+owns a random generator). It works on any `Microscope`, the fake's included.
+
+**What it is not.** There is no optics beyond the z blur (no PSF, no
+shading, no illumination), no z-stack realism, no sub-pixel stage
+resolution, and a texture meant for pixel sizes up to 4 µm (above that a
+tile is smaller than a pixel and the texture is aliased noise: only
+whole-pixel shifts correlate).
+
+**Fixture.** `demo_microscope_with_sample` (table above) reads the demo
+camera's shape and pixel size *before* replacing it, and uses them for the
+`SampleCamera` unless the call gives its own; the default sample is
+`PlateSample()`, which puts A1's centre at the demo stage's origin. It
+raises if the camera reports no pixel size and the call gives none. Calling
+it again replaces the camera. On `fake_microscope`, a test builds the
+`SampleCamera` itself.
+
+**Tests.** Frames follow the stage: the mean drops when the stage crosses a
+well wall; the texture shifts by `Δ / ps` pixels for a stage move `Δ`; a
+blob appears where its stage position says; and the geometry is checked
+against `useq`'s own well positions, not against the sample's arithmetic.
 
 ## 9. CLI — `smc/cli.py` (#11)
 
