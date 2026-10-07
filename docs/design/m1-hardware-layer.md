@@ -175,7 +175,7 @@ class XYStage(Protocol):
 class ZStage(Protocol):
     def position_um(self) -> float: ...
     def move_to_um(self, z_um: float) -> float: ...
-    def move_by_um(self, dz_um: float) -> float: ...
+    def move_by_um(self, dz_um: float, *, force: bool = False) -> float: ...  # #84
     def wait(self, timeout_s: float | None = None) -> None: ...
     def is_busy(self) -> bool: ...
     def stop(self) -> None: ...  # §13 (#54)
@@ -213,6 +213,13 @@ Semantics every implementation must honour (these are the contract tests):
 - `move_by_um` on `XYStage` refuses `max(|dx|, |dy|) > safety.max_jog_um`
   with `SafetyRefusedError` unless `force=True`. Absolute moves are never
   jog-guarded (crossing a plate is legitimate travel).
+- `move_by_um` on `ZStage` refuses `|dz| > safety.max_z_jog_um` the same
+  way (#84, owner 2026-10-01): a typo in a focus jog (`1000` for `10`)
+  drives the objective into the sample. The check depends only on the
+  distance, so it runs before the action: a refused jog takes no lock,
+  reads nothing and is refused in dry-run too. `force=True` passes the
+  jog guard only; the soft limits still apply to the target and still
+  cannot be forced. A non-finite distance is refused and cannot be forced.
 - Absolute and relative moves refuse a target outside the profile's soft
   limits (`SafetyRefusedError`, not forceable). No limits configured → no check.
 - A move returns when the device has arrived (there is no `wait=False` in
@@ -345,6 +352,7 @@ adapter_search_paths = []      # extra Micro-Manager directories, e.g. a separat
 
 [safety]
 max_jog_um = 5000.0
+# max_z_jog_um = 100.0         # omitted: 100 µm, assumed and labelled as such (§12)
 # z_soft_limits_um = [-1000.0, 1000.0]
 # xy_soft_limits_um = [[-60000.0, 60000.0], [-40000.0, 40000.0]]
 turret_requires_confirm = true
@@ -377,6 +385,7 @@ class RolesSection(BaseModel):
 
 class SafetySection(BaseModel):
     max_jog_um: float = 5000.0
+    max_z_jog_um: float | None = None  # None: not set; Safety assumes 100 µm (§7, §12)
     z_soft_limits_um: tuple[float, float] | None = None
     xy_soft_limits_um: tuple[tuple[float, float], tuple[float, float]] | None = None
     turret_requires_confirm: bool = True
@@ -412,8 +421,9 @@ Rules: `load("demo")` returns `Profile.demo()` unless a `demo.toml` is
 found first; a bare name resolves to `<dir>/<name>.toml` over the search
 paths; a path is read as given. Validation errors are re-raised as
 `ProfileError(HardwareError)` naming file, key and fix. Limits must be
-ordered; unknown role keys list the allowed values; a non-empty `config`
-must exist at load time.
+ordered; `max_jog_um` and `max_z_jog_um` must be positive and finite
+(`ProfileError` naming `safety.max_z_jog_um`); unknown role keys list the
+allowed values; a non-empty `config` must exist at load time.
 
 ## 6. Micro-Manager backend — `smc/hardware/backends/mm.py` (#5)
 
@@ -478,8 +488,12 @@ class Safety:
     # plain arguments, so #5 does not depend on the profile model (#7); the
     # facade (#8) builds it from profile.safety
     def __init__(self, *, max_jog_um: float, z_soft_limits_um: tuple[float, float] | None = None,
-                 xy_soft_limits_um: tuple[tuple[float, float], tuple[float, float]] | None = None): ...
+                 xy_soft_limits_um: tuple[tuple[float, float], tuple[float, float]] | None = None,
+                 max_z_jog_um: float | None = None): ...   # #84
+    max_z_jog_um: float          # the limit in force: the profile's, else DEFAULT_MAX_Z_JOG_UM
+    z_jog_assumed: bool          # True when the profile set none
     def check_jog_um(self, dx_um: float, dy_um: float, *, force: bool) -> None
+    def check_z_jog_um(self, dz_um: float, *, force: bool) -> None   # #84
     def check_xy_target_um(self, x_um: float, y_um: float) -> None
     def check_z_target_um(self, z_um: float) -> None
 
@@ -493,6 +507,16 @@ class Executor:
     dry_run: bool
     # internal (actions, reads, safe calls, stops): shape owned by #59, behaviour fixed by §13
 ```
+
+`DEFAULT_MAX_Z_JOG_UM = 100.0` (in `safety.py`) is used when the profile
+omits `max_z_jog_um`, and it is labelled as assumed wherever it shows
+(§12): the refusal reads `Z jog 150.0 µm exceeds the Z jog limit of
+100.0 µm (assumed: the profile sets no [safety] max_z_jog_um)`, with
+`how_to_force="pass force=True"`. A non-finite `dz` is refused with an
+empty `how_to_force`. The facade passes `profile.safety.max_z_jog_um` to
+`Safety` as it is (`None` included), and when the `focus` role is filled
+and the key is omitted it logs one WARNING at open naming the profile,
+the key and the assumed 100 µm.
 
 `Executor.do` acquires the lock, logs `description` (prefixed `[dry-run]`
 when dry), calls `action()` unless dry-run, and returns its result or
@@ -752,6 +776,8 @@ class; they only go through `Microscope`.
   capability, all read through `stand`. It also holds the contract's
   `[safety]`:
   - `max_jog_um = 50`;
+  - `max_z_jog_um = 1` (#84): below the 2 µm a contract may move Z, so
+    the forced jog stays inside the envelope;
   - XY soft limits at the start ± 100 µm on each axis;
   - Z soft limits at the start ± 3 µm.
 - **`microscope`** and **`dry_microscope`** are
@@ -792,7 +818,11 @@ capability Protocol runs on every backend.
   - `limits_um()` reports the envelope;
   - in dry-run, a move returns the commanded value and the stage does not
     move.
-- **Z**: the same cases without the jog guard, which #84 adds.
+- **Z**: the same cases. The jog guard (#84): a jog of 1.5 µm down
+  (above `max_z_jog_um`) raises `SafetyRefusedError` with a `how_to_force`
+  and sends nothing; with `force=True` it passes. The relative soft-limit
+  case jogs with `force=True`, so that the soft limit, not the jog guard,
+  is what refuses it.
 - **Camera**:
   - `snap()` is 2-D, matches `image_shape()`, and has a dtype wide
     enough for `bit_depth()`;
@@ -871,7 +901,7 @@ negative number (`smc stage jog -100 0`) parses as an unknown option.
 | `smc doctor [-p]` | MM status, then open the profile and print `RoleMap.describe()` and the role warnings; `--config CFG` keeps the raw `.cfg` check |
 | `smc devices [-p]` | one line per device (label, type, library/name, roles), then `RoleMap.describe()` and the warnings |
 | `smc stage get` / `stage move X Y` / `stage jog DX DY [--force]` | `XYStage` |
-| `smc z get` / `z move Z` / `z jog DZ` | `ZStage` (no jog guard in M1; the soft limits apply) |
+| `smc z get` / `z move Z` / `z jog DZ [--force]` | `ZStage`; `z jog` is guarded by `safety.max_z_jog_um` (#84), and the soft limits apply |
 | `smc snap [--out frame.tif] [--exposure-ms MS]` | `Camera`; one TIFF via `tifffile` (new dependency) |
 | `smc discover …` | §10 |
 
@@ -989,6 +1019,15 @@ Each wave-1 executor adds its own tests under `tests/unit/` or against
   `pymmcore_plus` or touching `.core` fails review.
 - Role names are the ADR-0003 glossary names; `Role` values are also the
   TOML keys.
+- The Z jog guard (#84, plan 2026-10-07): a profile that omits
+  `[safety] max_z_jog_um` gets 100 µm, labelled as assumed in the refusal
+  and in a WARNING at open. It is not required, since a profile does not
+  know at load time whether a focus drive will resolve, and it is not
+  derived from `z_soft_limits_um`, since the travel range says nothing
+  about a sensible jog. `force=True` has no ceiling of its own: the soft
+  limits are that ceiling, so a stand with a focus drive should set
+  `z_soft_limits_um`. The autofocus offset jog (#13) gets its own key in
+  device units, never `max_z_jog_um`.
 - No action while a movement has not finished (owner, 2026-09-23): the
   guard refuses, it does not queue. An action holds the lock through its
   wait; reads, `stop()` and closing a shutter never take it (§13, revised
