@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import math
 import re
+import warnings
 
+import numpy as np
 import pytest
 import useq
 
-from smc.testing.synthetic import Blob, PlateSample
+from smc.testing.synthetic import Blob, PlateSample, _tile_values
 
 FLAT = {"texture_std": 0.0, "noise_std": 0.0}
 
@@ -183,3 +185,42 @@ def test_blobs_and_levels_are_kept() -> None:
 def test_invalid_parameters_are_refused(make, phrase: str) -> None:  # type: ignore[no-untyped-def]
     with pytest.raises(ValueError, match=re.escape(phrase)):
         make()
+
+
+# --- texture ---------------------------------------------------------------
+
+
+def test_texture_tiles_are_bit_exact_across_platforms() -> None:
+    """The first values of the hash, pinned: numpy < 2 on Windows has a 32-bit
+    default integer, and a hash written on scalars would differ there."""
+    ix = np.array([0, 1, -1, 7], dtype=np.int64)
+    iy = np.array([0, 0, 5, -3], dtype=np.int64)
+    assert _tile_values(ix, iy, 0) == pytest.approx(
+        [
+            -1.7320508075688772,
+            1.3278275898326373,
+            -0.14943785591070433,
+            -1.4697101501494696,
+        ],
+        abs=1e-12,
+    )
+    assert _tile_values(ix, iy, 1) == pytest.approx(
+        [
+            0.6979045179271314,
+            -0.9645479464229244,
+            -1.308947001715897,
+            0.5873197229803402,
+        ],
+        abs=1e-12,
+    )
+
+
+def test_the_texture_hash_wraps_without_a_numpy_overflow_warning() -> None:
+    ix = np.arange(-1000, 1000, dtype=np.int64)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        values = _tile_values(ix, ix[::-1], 2**63 + 12345)
+        # A 0-d index would make the products numpy scalars, which warn.
+        _tile_values(np.int64(-(2**62)), np.int64(2**62), 3)
+    assert abs(values.mean()) < 0.1
+    assert values.std() == pytest.approx(1.0, abs=0.05)

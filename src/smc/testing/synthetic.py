@@ -95,6 +95,36 @@ def _pair(name: str, value: Sequence[float], bound: float) -> tuple[float, float
     )
 
 
+_MASK64 = (1 << 64) - 1
+
+
+def _tile_values(
+    ix: npt.NDArray[np.int64], iy: npt.NDArray[np.int64], seed: int
+) -> npt.NDArray[np.float64]:
+    """The texture of tiles ``(ix, iy)``: zero mean, unit variance, a function of the tile only.
+
+    SplitMix64's finaliser over the tile indices and the seed. It is written on
+    ``uint64`` *arrays*: a scalar ``np.uint64`` product warns on overflow, while
+    the same product on an array wraps silently, and every dtype is explicit
+    because numpy < 2 on Windows defaults to a 32-bit integer. The result is
+    therefore bit-identical on every platform, and a test pins its values.
+    """
+    a = np.atleast_1d(ix).astype(np.int64).view(np.uint64)
+    b = np.atleast_1d(iy).astype(np.int64).view(np.uint64)
+    # The seed term is computed in Python ints, where nothing overflows.
+    seed_term = np.uint64((seed * 0x165667B19E3779F9) & _MASK64)
+    z = a * np.uint64(0x9E3779B97F4A7C15) + b * np.uint64(0xC2B2AE3D27D4EB4F)
+    z += seed_term
+    z ^= z >> np.uint64(30)
+    z *= np.uint64(0xBF58476D1CE4E5B9)
+    z ^= z >> np.uint64(27)
+    z *= np.uint64(0x94D049BB133111EB)
+    z ^= z >> np.uint64(31)
+    # The top 53 bits as a uniform on [0, 1), centred, scaled to unit variance.
+    uniform = (z >> np.uint64(11)).astype(np.float64) * 2.0**-53
+    return (uniform - 0.5) * math.sqrt(12.0)
+
+
 @dataclass(frozen=True, slots=True)
 class Blob:
     """A Gaussian spot at a stage position, ``intensity * exp(-d^2 / (2 sigma^2))``.
