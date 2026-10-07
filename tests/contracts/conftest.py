@@ -7,11 +7,12 @@ backend class: they only go through ``Microscope``.
 
 **What a contract may move.** ``envelope`` records where the stand started
 and replaces the profile's ``[safety]`` with limits around that start: XY
-± 100 µm, Z ± 3 µm, a 50 µm jog limit. Every target a contract *sends* is
-within 60 µm in XY, and in Z at most 2 µm and only below the start, which
-is away from the sample on an inverted stand. Every target outside the
-envelope is one the layer must refuse, so none of them is ever sent. The
-``microscope`` fixture then puts the stand back where it started.
+± 100 µm, Z ± 3 µm, a 50 µm XY jog limit and a 1 µm Z jog limit. Every
+target a contract *sends* is within 60 µm in XY, and in Z at most 2 µm and
+only below the start, which is away from the sample on an inverted stand.
+Every target outside the envelope is one the layer must refuse, so none of
+them is ever sent. The ``microscope`` fixture then puts the stand back where
+it started.
 """
 
 from __future__ import annotations
@@ -57,15 +58,19 @@ class Envelope:
     shutter_open: bool | None
     auto_shutter: bool | None
     max_jog_um: float = 50.0
+    #: Below the 2 µm a contract may move Z, so a forced jog stays inside the envelope.
+    max_z_jog_um: float = 1.0
     xy_span_um: float = 100.0
     z_span_um: float = 3.0
     tolerance_um: float = 0.5
 
     def profile(self, base: Profile) -> Profile:
-        """``base`` with soft limits around the start and the contract's jog limit.
+        """``base`` with soft limits around the start and the contract's jog limits.
 
-        Every other key of ``base`` is kept, ``[safety]``'s included (such as a
-        later ``max_z_jog_um``), and so is ``source``.
+        Both jog limits are set here: a stand profile's own ``max_z_jog_um``
+        (50 µm, say) would otherwise survive the merge and the contract's
+        1.5 µm refusal case would pass the guard on hardware. Every other key
+        of ``base`` is kept, and so is ``source``.
 
         The window must lie inside the profile's own soft limits, which exist
         for a reason (the stage's travel, an obstacle): a stand that starts
@@ -91,6 +96,7 @@ class Envelope:
             {
                 **base.safety.model_dump(),
                 "max_jog_um": self.max_jog_um,
+                "max_z_jog_um": self.max_z_jog_um,
                 "xy_soft_limits_um": xy_limits,
                 "z_soft_limits_um": z_limits,
             }
