@@ -612,10 +612,17 @@ def _move_xy(
 
 
 def _move_z(
-    ctx: typer.Context, profile: str, dry_run: bool, move: Callable[[ZStage], float]
+    ctx: typer.Context,
+    profile: str,
+    dry_run: bool,
+    move: Callable[[ZStage], float],
+    force_hint: str = "",
 ) -> None:
     """Open the stand, run ``move`` on its focus drive, print where it landed."""
-    with _reported(ctx), Microscope.open(profile, dry_run=dry_run) as microscope:
+    with (
+        _reported(ctx, force_hint=force_hint),
+        Microscope.open(profile, dry_run=dry_run) as microscope,
+    ):
         drive = microscope.require(ZStage)
         landed = move(drive)
         here = drive.position_um() if dry_run else None
@@ -703,15 +710,30 @@ def z_jog(
     dz_um: Annotated[
         float, typer.Argument(help="How far to move, in µm (negative: down).")
     ],
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help="Move further than the profile's safety.max_z_jog_um allows.",
+        ),
+    ] = False,
     dry_run: DryRunOption = False,
     profile: ProfileOption = DEMO_NAME,
 ) -> None:
-    """Move the focus drive by a distance in µm.
+    """Move the focus drive by a distance in µm; a long jog needs --force.
 
-    There is no jog guard on Z: only the profile's safety.z_soft_limits_um
-    bound the target.
+    A jog longer than the profile's safety.max_z_jog_um is refused, because a
+    typo in a focus jog (1000 for 10) drives the objective into the sample.
+    --force passes that guard only: the profile's safety.z_soft_limits_um
+    still bound the target.
     """
-    _move_z(ctx, profile, dry_run, lambda drive: drive.move_by_um(dz_um))
+    _move_z(
+        ctx,
+        profile,
+        dry_run,
+        lambda drive: drive.move_by_um(dz_um, force=force),
+        force_hint=_JOG_FORCE_HINT,
+    )
 
 
 # --- snap ----------------------------------------------------------------------

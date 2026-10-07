@@ -351,6 +351,7 @@ def test_stage_z_and_snap_help_name_their_units() -> None:
         (["stage", "--help"], "µm"),
         (["stage", "jog", "--help"], "µm"),
         (["z", "--help"], "µm"),
+        (["z", "jog", "--help"], "--force"),
         (["snap", "--help"], "ms"),
     ]:
         result = runner.invoke(app, args)
@@ -455,6 +456,66 @@ def test_z_move_outside_the_soft_limits_exits_2_without_a_force_hint() -> None:
     assert result.exit_code == 2, result.output
     assert "outside the soft limits [-1000.0, 1000.0] µm" in result.output
     assert "--force" not in result.output
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+@pytest.mark.parametrize("distance", ["150", "-150"])
+def test_z_jog_above_the_limit_exits_2_and_names_the_force_flag(distance: str) -> None:
+    result = runner.invoke(app, ["z", "jog", distance])
+
+    assert result.exit_code == 2, result.output
+    assert (
+        f"✗ Z jog {float(distance)} µm exceeds the Z jog limit of 100.0 µm — "
+        "re-run with --force if the distance is intended"
+    ) in result.output.splitlines()
+    assert "force=True" not in result.output
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_z_jog_with_force_passes_the_guard() -> None:
+    result = runner.invoke(app, ["z", "jog", "150", "--force"])
+
+    assert result.exit_code == 0, result.output
+    assert abs(_z_printed(result.output) - 150) < 0.5
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_a_forced_z_jog_still_obeys_the_soft_limits() -> None:
+    result = runner.invoke(app, ["z", "jog", "5000", "--force"])
+
+    assert result.exit_code == 2, result.output
+    assert "outside the soft limits [-1000.0, 1000.0] µm" in result.output
+    # The soft limit cannot be forced, so the line must not suggest it.
+    assert "--force" not in result.output
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_z_jog_refusal_says_when_the_limit_is_assumed(tmp_path: Path) -> None:
+    # FM-36: "[safety]" is bracketed text that rich would read as markup and drop.
+    path = tmp_path / "nokey.toml"
+    path.write_text('[microscope]\nname = "nokey"\n', encoding="utf-8")
+
+    result = runner.invoke(app, ["z", "jog", "150", "-p", str(path)])
+
+    assert result.exit_code == 2, result.output
+    assert (
+        "✗ Z jog 150.0 µm exceeds the Z jog limit of 100.0 µm (assumed: the "
+        "profile sets no [safety] max_z_jog_um) — re-run with --force if the "
+        "distance is intended"
+    ) in result.output.splitlines()
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_z_jog_dry_run_refuses_an_oversized_jog() -> None:
+    result = runner.invoke(app, ["z", "jog", "150", "--dry-run"])
+
+    assert result.exit_code == 2, result.output
+    assert "exceeds the Z jog limit of 100.0 µm" in result.output
 
 
 @pytest.mark.demo
