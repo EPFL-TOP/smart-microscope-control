@@ -12,12 +12,27 @@ import math
 import re
 import time
 import warnings
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import pytest
 import useq
+from pymmcore_plus import DeviceType
 
-from smc.testing.synthetic import Blob, PlateSample, _tile_values
+from smc.hardware.capabilities import Camera, XYStage, ZStage
+from smc.hardware.microscope import Microscope
+from smc.hardware.profile import Profile
+from smc.testing import FakeCore, FakeDevice
+from smc.testing.synthetic import (
+    REFERENCE_EXPOSURE_MS,
+    Blob,
+    PlateSample,
+    SampleCamera,
+    _tile_values,
+)
+
+if TYPE_CHECKING:
+    from pymmcore_plus import CMMCorePlus
 
 FLAT = {"texture_std": 0.0, "noise_std": 0.0}
 #: The defaults of ``PlateSample``, which these tests rely on.
@@ -601,6 +616,165 @@ def test_render_refuses_invalid_arguments(
     arguments.update(kwargs)
     with pytest.raises(ValueError, match=re.escape(phrase)):
         PlateSample().render(**arguments)  # type: ignore[arg-type]
+
+
+# --- the camera, on the fake stand -----------------------------------------
+
+
+def _install(
+    microscope: Microscope, sample: PlateSample | None = None, **kwargs: object
+) -> SampleCamera:
+    """A noise-free ``SampleCamera`` as the facade's camera, as the fixture does it."""
+    camera = SampleCamera(
+        microscope,
+        sample if sample is not None else PlateSample(noise_std=0.0),
+        pixel_size_um=kwargs.pop("pixel_size_um", 1.0),  # type: ignore[arg-type]
+        **kwargs,  # type: ignore[arg-type]
+    )
+    microscope.override(Camera, camera)
+    return camera
+
+
+@pytest.mark.parametrize("pixel_size_um", [1.0, 0.5, 2.0])
+def test_sample_camera_follows_the_fake_stage(
+    fake_microscope: Microscope, pixel_size_um: float
+) -> None:
+    camera = _install(fake_microscope, shape=(256, 256), pixel_size_um=pixel_size_um)
+    stage = fake_microscope.require(XYStage)
+    start = camera.snap().astype(np.float64)
+    stage.move_by_um(10.0, 0.0)
+    east = camera.snap().astype(np.float64)
+    stage.move_by_um(0.0, 10.0)
+    north = camera.snap().astype(np.float64)
+    # +10 um in X moves the content 10 / ps columns left, +10 um in Y as many
+    # rows down.
+    pixels = 10.0 / pixel_size_um
+    assert _content_shift(start, east) == pytest.approx((-pixels, 0.0), abs=0.5)
+    assert _content_shift(east, north) == pytest.approx((0.0, pixels), abs=0.5)
+
+
+def test_sample_camera_reads_z_from_the_stage(fake_microscope: Microscope) -> None:
+    sample = PlateSample(well_level=1000.0, plastic_level=1000.0, noise_std=0.0)
+    camera = _install(fake_microscope, sample, shape=(256, 256))
+    sharp = camera.snap()
+    fake_microscope.require(ZStage).move_to_um(30.0)
+    blurred = camera.snap()
+    assert float(blurred.std()) < 0.5 * float(sharp.std())
+
+
+def test_sample_camera_without_a_z_stage_renders_at_z_zero() -> None:
+    core = FakeCore(
+        [FakeDevice("XY", DeviceType.XYStage), FakeDevice("Camera", DeviceType.Camera)],
+        camera="Camera",
+        xy_stage="XY",
+    )
+    microscope = Microscope.from_core(cast("CMMCorePlus", core), Profile.demo())
+    try:
+        assert microscope.get(ZStage) is None  # the stand really has no Z
+        sample = PlateSample(noise_std=0.0)
+        camera = SampleCamera(microscope, sample, pixel_size_um=1.0, shape=(64, 64))
+        expected = sample.render(0.0, 0.0, 0.0, shape=(64, 64), pixel_size_um=1.0)
+        assert np.array_equal(camera.snap(), expected)
+    finally:
+        microscope.close()
+
+
+def test_sample_camera_honours_the_camera_basics(fake_microscope: Microscope) -> None:
+    """The cases of ``tests/contracts/test_camera.py``, for a camera the facade holds."""
+    camera = _install(fake_microscope, shape=(48, 80), pixel_size_um=0.65)
+    frame = camera.snap()
+    assert frame.ndim == 2
+    assert frame.shape == camera.image_shape() == (48, 80)
+    assert frame.dtype.itemsize * 8 >= camera.bit_depth()
+    assert camera.bit_depth() == 16  # the frames use the whole uint16 range
+    assert camera.pixel_size_um() == 0.65
+    assert camera.exposure_ms() == REFERENCE_EXPOSURE_MS
+    assert camera.set_exposure_ms(20.0) == 20.0
+    assert camera.exposure_ms() == 20.0
+    # The stored exposure reaches the frame: a flat 3000 doubles.
+    flat = _install(fake_microscope, PlateSample(**FLAT), shape=(8, 8))
+    assert np.all(flat.snap() == WELL)
+    flat.set_exposure_ms(20.0)
+    assert np.all(flat.snap() == 2 * WELL)
+    assert fake_microscope.require(Camera) is flat
+
+
+@pytest.mark.parametrize(
+    ("rotation_deg", "mirrored"), [(90.0, False), (0.0, True), (90.0, True)]
+)
+def test_sample_camera_passes_its_rotation_and_mirror_to_the_render(
+    fake_microscope: Microscope, rotation_deg: float, mirrored: bool
+) -> None:
+    sample = PlateSample(
+        blobs=[Blob(30.0, 12.0, radius_um=6.0, intensity=1500.0)], **FLAT
+    )
+    camera = _install(
+        fake_microscope,
+        sample,
+        shape=(96, 96),
+        camera_rotation_deg=rotation_deg,
+        mirrored=mirrored,
+    )
+    expected = sample.render(
+        0.0,
+        0.0,
+        0.0,
+        shape=(96, 96),
+        pixel_size_um=1.0,
+        camera_rotation_deg=rotation_deg,
+        mirrored=mirrored,
+    )
+    assert np.array_equal(camera.snap(), expected)
+    unturned = sample.render(0.0, 0.0, 0.0, shape=(96, 96), pixel_size_um=1.0)
+    assert not np.array_equal(expected, unturned)  # the orientation does show
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "phrase"),
+    [
+        pytest.param(
+            {"pixel_size_um": 0.0},
+            "pixel_size_um must be finite and positive (at most 10000), got 0.0",
+            id="pixel-size-zero",
+        ),
+        pytest.param(
+            {"pixel_size_um": math.nan},
+            "pixel_size_um must be finite and positive (at most 10000), got nan",
+            id="pixel-size-nan",
+        ),
+        pytest.param(
+            {"shape": (0, 8)},
+            "shape must be two positive integers (height, width) with at most "
+            "16777216 pixels, got (0, 8)",
+            id="shape-with-a-zero",
+        ),
+        pytest.param(
+            {"camera_rotation_deg": math.nan},
+            "camera_rotation_deg must be finite and within [-1e+06, 1e+06], got nan",
+            id="camera-rotation-nan",
+        ),
+    ],
+)
+def test_sample_camera_refuses_invalid_arguments(
+    fake_microscope: Microscope, kwargs: dict[str, object], phrase: str
+) -> None:
+    arguments: dict[str, object] = {"pixel_size_um": 1.0}
+    arguments.update(kwargs)
+    with pytest.raises(ValueError, match=re.escape(phrase)):
+        SampleCamera(fake_microscope, PlateSample(), **arguments)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value_ms", [-1.0, math.nan, math.inf])
+def test_sample_camera_refuses_an_invalid_exposure_and_keeps_the_old_one(
+    fake_microscope: Microscope, value_ms: float
+) -> None:
+    camera = _install(fake_microscope)
+    camera.set_exposure_ms(15.0)
+    with pytest.raises(
+        ValueError, match=re.escape("exposure_ms must be finite and within [0, 1e+06]")
+    ):
+        camera.set_exposure_ms(value_ms)
+    assert camera.exposure_ms() == 15.0
 
 
 def test_rendering_a_512_frame_is_vectorised() -> None:

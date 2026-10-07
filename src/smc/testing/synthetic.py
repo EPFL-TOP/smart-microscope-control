@@ -40,10 +40,16 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
 
 import numpy as np
 import numpy.typing as npt
 import useq
+
+from smc.hardware.capabilities import XYStage, ZStage
+
+if TYPE_CHECKING:
+    from smc.hardware.microscope import Microscope
 
 __all__ = [
     "MAX_BLUR_PX",
@@ -51,6 +57,7 @@ __all__ = [
     "TEXTURE_TILE_UM",
     "Blob",
     "PlateSample",
+    "SampleCamera",
 ]
 
 #: The demo's exposure: ``well_level`` and ``plastic_level`` are the counts at it.
@@ -463,3 +470,103 @@ class PlateSample:
                 np.abs(oy) <= self._half_size_um[1]
             )
         return on_plate & within, row, col
+
+
+class SampleCamera:
+    """A ``Camera`` whose frames follow the stage: it renders a ``PlateSample``.
+
+    ``snap()`` reads the XY position of the stand's stage, and the Z position
+    when it has a Z drive (0.0 otherwise), and renders the sample there. So a
+    tool that moves the stage and looks at the result sees what a real camera
+    would show, with the demo devices doing the moving.
+
+    It is installed with ``Microscope.override(Camera, ...)`` (the
+    ``demo_microscope_with_sample`` fixture does it), and therefore **bypasses
+    the** ``Executor``: it takes no lock, ignores dry-run, the halt and the
+    motion guard, and is not thread-safe, because the sample owns a random
+    generator. It works on any ``Microscope``, a ``FakeCore``'s included. A test
+    that needs a lock or a halt on the camera does not belong here.
+
+    The exposure starts at ``REFERENCE_EXPOSURE_MS`` and scales the frame's
+    signal, not its noise. ``bit_depth()`` is 16.
+
+    Args:
+        microscope: The stand whose stages say where the camera is looking.
+        sample: What it looks at.
+        pixel_size_um: Object-space pixel size. Required and never defaulted:
+            a pixel size of 0 is refused, as it would be reported by a real
+            camera that nothing calibrated.
+        shape: ``(height, width)`` of a frame.
+        camera_rotation_deg: Rotation of the camera about the optical axis.
+        mirrored: Whether the image is flipped left-right.
+
+    Raises:
+        ValueError: ``pixel_size_um``, ``shape`` or ``camera_rotation_deg`` is
+            not a usable number.
+    """
+
+    def __init__(
+        self,
+        microscope: Microscope,
+        sample: PlateSample,
+        *,
+        pixel_size_um: float,
+        shape: tuple[int, int] = (512, 512),
+        camera_rotation_deg: float = 0.0,
+        mirrored: bool = False,
+    ) -> None:
+        self._microscope = microscope
+        self._sample = sample
+        self._pixel_size_um = _positive(
+            "pixel_size_um", pixel_size_um, _MAX_PIXEL_SIZE_UM
+        )
+        self._shape = _shape(shape)
+        self._rotation_deg = _bounded(
+            "camera_rotation_deg",
+            camera_rotation_deg,
+            -_MAX_ROTATION_DEG,
+            _MAX_ROTATION_DEG,
+        )
+        self._mirrored = bool(mirrored)
+        self._exposure_ms = REFERENCE_EXPOSURE_MS
+
+    def snap(self) -> npt.NDArray[np.uint16]:
+        """One frame of the sample at the stage's current position."""
+        position = self._microscope.require(XYStage).position_um()
+        z_stage = self._microscope.get(ZStage)
+        z_um = 0.0 if z_stage is None else z_stage.position_um()
+        return self._sample.render(
+            position.x_um,
+            position.y_um,
+            z_um,
+            shape=self._shape,
+            pixel_size_um=self._pixel_size_um,
+            camera_rotation_deg=self._rotation_deg,
+            mirrored=self._mirrored,
+            exposure_ms=self._exposure_ms,
+        )
+
+    def exposure_ms(self) -> float:
+        """The stored exposure."""
+        return self._exposure_ms
+
+    def set_exposure_ms(self, value_ms: float) -> float:
+        """Store the exposure and return it; a value that is not usable keeps the old one.
+
+        Raises:
+            ValueError: ``value_ms`` is negative or not finite.
+        """
+        self._exposure_ms = _bounded("exposure_ms", value_ms, 0.0, _MAX_EXPOSURE_MS)
+        return self._exposure_ms
+
+    def image_shape(self) -> tuple[int, int]:
+        """The frame shape as ``(height, width)``."""
+        return self._shape
+
+    def bit_depth(self) -> int:
+        """Frames are 16-bit."""
+        return 16
+
+    def pixel_size_um(self) -> float:
+        """The pixel size the camera was given."""
+        return self._pixel_size_um
