@@ -113,7 +113,11 @@ def test_hardware_microscope_opens_the_named_profile(
 
 def test_smc_testing_imports_without_pytest() -> None:
     # pytest is a dev dependency; a plugin's users import the fake without it.
-    code = "import smc.testing, sys; assert 'pytest' not in sys.modules, 'pytest'"
+    code = (
+        "import smc.testing, sys; "
+        "from smc.testing import Blob, PlateSample, SampleCamera; "
+        "assert 'pytest' not in sys.modules, 'pytest'"
+    )
     done = subprocess.run(
         [sys.executable, "-c", code],
         capture_output=True,

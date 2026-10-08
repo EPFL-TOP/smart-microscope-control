@@ -42,9 +42,12 @@ Every contract runs once per backend:
   `-m hardware`, and skipped unless you also pass `--profile`.
 
 The fixtures (`fake_core`, `fake_microscope`, `demo_microscope`,
-`hardware_microscope`, …) come from the pytest plugin
-`smc.testing.fixtures`. A plugin's own repository can load it with
+`demo_microscope_with_sample`, `hardware_microscope`, …) come from the pytest
+plugin `smc.testing.fixtures`. A plugin's own repository can load it with
 `pytest_plugins = ["smc.testing.fixtures"]` in its top-level `conftest.py`.
+`demo_microscope_with_sample(PlateSample(...))` is the demo stand with frames
+that follow the stage, for tests of code that looks at images (the demo
+camera ignores the stage).
 
 ### Running the contracts at a stand
 
