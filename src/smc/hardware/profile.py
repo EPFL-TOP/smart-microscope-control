@@ -110,9 +110,15 @@ def _check_ordered(limits: tuple[float, float], axis: str) -> None:
 
 
 class SafetySection(_Section):
-    """Limits the facade enforces; ``None`` means no soft limit on that axis."""
+    """Limits the facade enforces; ``None`` means no soft limit on that axis.
+
+    ``max_z_jog_um`` is the exception: ``None`` means *not set*, and
+    ``Safety`` then assumes ``DEFAULT_MAX_Z_JOG_UM`` and says so. The profile
+    keeps ``None`` so that an omitted key stays visible.
+    """
 
     max_jog_um: float = 5000.0
+    max_z_jog_um: float | None = None
     z_soft_limits_um: tuple[float, float] | None = None
     xy_soft_limits_um: tuple[tuple[float, float], tuple[float, float]] | None = None
     turret_requires_confirm: bool = True
@@ -125,6 +131,16 @@ class SafetySection(_Section):
         if not math.isfinite(value) or value <= 0:
             raise ValueError(
                 f"max_jog_um must be a positive, finite number of µm, got {value}"
+            )
+        return value
+
+    @field_validator("max_z_jog_um")
+    @classmethod
+    def _max_z_jog_positive_finite(cls, value: float | None) -> float | None:
+        # As for max_jog_um: an infinite limit is not "no guard".
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            raise ValueError(
+                f"max_z_jog_um must be a positive, finite number of µm, got {value}"
             )
         return value
 
@@ -202,6 +218,7 @@ class Profile(_Section):
             ),
             safety=SafetySection(
                 max_jog_um=5000.0,
+                max_z_jog_um=100.0,
                 z_soft_limits_um=(-1000.0, 1000.0),
                 turret_requires_confirm=True,
             ),

@@ -54,6 +54,7 @@ adapter_search_paths = []      # extra Micro-Manager directories, e.g. a separat
 
 [safety]
 max_jog_um = 5000.0
+# max_z_jog_um = 100.0         # omitted: 100 µm, assumed and logged
 # z_soft_limits_um = [-1000.0, 1000.0]
 # xy_soft_limits_um = [[-60000.0, 60000.0], [-40000.0, 40000.0]]
 turret_requires_confirm = true
@@ -69,7 +70,8 @@ pixel_size_um = { "Nikon 10X S Fluor" = 0.65, "Nikon 40X Plan Fluor ELWD" = 0.16
 | `micromanager.config` | Must exist when the profile is loaded. Relative paths resolve against the profile file's directory. |
 | `micromanager.device_timeout_ms` | Applied to MMCore; a plate traverse exceeds its 5 s default. |
 | `roles.assign` / `roles.exclude` | Keys are role names: `camera`, `xy_stage`, `focus`, `autofocus`, `autofocus_offset`, `objective_turret`, `shutter`, `light_source`, `light_path`, `filter_turret`. |
-| `safety.max_jog_um` | A relative move larger than this is refused unless forced. |
+| `safety.max_jog_um` | A relative XY move larger than this is refused unless forced. |
+| `safety.max_z_jog_um` | A relative Z move larger than this is refused unless forced; omitted means 100 µm, assumed and logged. Set it per stand and objective, and set `z_soft_limits_um` too, since they bound a forced jog. |
 | `safety.*_soft_limits_um` | `[low, high]` with `low < high`; omit for no soft limit on that axis. |
 | `camera.pixel_size_um` | µm per pixel per objective label. A missing objective is *unknown* (0.0), never guessed. |
 

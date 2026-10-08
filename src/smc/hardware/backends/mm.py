@@ -206,12 +206,15 @@ class MMZStage:
         description = f"z: move_to {z_um} µm"
         return self._move(description, lambda: self._step(description, z_um))
 
-    def move_by_um(self, dz_um: float) -> float:
-        """Move relative to the live position (soft limits apply to the target).
+    def move_by_um(self, dz_um: float, *, force: bool = False) -> float:
+        """Move relative to the live position; jog-guarded unless ``force``.
 
         The anchor is read inside the action, as for ``XYStage.move_by_um``.
+        ``force`` passes the jog guard only: the soft limits apply to the
+        target, read inside the action, and cannot be forced.
         """
         dz_um = float(dz_um)
+        self._safety.check_z_jog_um(dz_um, force=force)
 
         def relative() -> Step[float]:
             z_um = self._read_position() + dz_um

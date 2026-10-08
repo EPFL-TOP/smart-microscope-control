@@ -159,6 +159,95 @@ class TestOnDemoDevices:
         assert z.position_um() == pytest.approx(start)
         assert z.limits_um() == Limits(0.0, 100.0)
 
+    def test_z_jog_above_the_limit_is_refused_and_sends_nothing(
+        self, demo_core: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        z = _z(demo_core, max_z_jog_um=10.0)
+        start = z.move_to_um(0.0)
+        caplog.clear()
+        with (
+            caplog.at_level(logging.INFO, logger=LOGGER.name),
+            pytest.raises(SafetyRefusedError) as info,
+        ):
+            z.move_by_um(11.0)
+        assert info.value.how_to_force == "pass force=True"
+        assert info.value.reason == "Z jog 11.0 µm exceeds the Z jog limit of 10.0 µm"
+        # The guard sits before the action: no action was logged as sent either.
+        assert [r.message for r in caplog.records if r.name == LOGGER.name] == []
+        assert z.position_um() == pytest.approx(start)
+
+    def test_forced_z_jog_passes_the_jog_guard(self, demo_core: Any) -> None:
+        z = _z(demo_core, max_z_jog_um=10.0)
+        start = z.move_to_um(0.0)
+        assert z.move_by_um(10.0) == pytest.approx(start + 10.0, abs=0.5)  # the limit
+        landed = z.move_by_um(-20.0, force=True)
+        assert landed == pytest.approx(start - 10.0, abs=0.5)
+
+    def test_z_jog_guard_is_checked_before_the_soft_limits(
+        self, demo_core: Any
+    ) -> None:
+        # Both guards would refuse this jog, so the order is observable (FM-43):
+        # the forceable refusal must come first, the soft limit only once forced.
+        z = _z(demo_core, max_z_jog_um=10.0, z_soft_limits_um=(-20.0, 20.0))
+        start = z.move_to_um(0.0)
+        with pytest.raises(SafetyRefusedError) as jog:
+            z.move_by_um(50.0)
+        assert jog.value.how_to_force == "pass force=True"
+        with pytest.raises(SafetyRefusedError) as soft:
+            z.move_by_um(50.0, force=True)
+        assert soft.value.how_to_force == ""
+        assert "outside the soft limits" in soft.value.reason
+        assert z.position_um() == pytest.approx(start)
+
+    def test_dry_run_refuses_an_oversized_z_jog(
+        self, demo_core: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        z = _z(demo_core, max_z_jog_um=10.0)
+        start = z.move_to_um(0.0)
+        dry = _z(demo_core, dry_run=True, max_z_jog_um=10.0)
+        with caplog.at_level(logging.INFO, logger=LOGGER.name):
+            with pytest.raises(SafetyRefusedError) as info:
+                dry.move_by_um(50.0)
+            assert info.value.how_to_force == "pass force=True"
+            # A forced jog is logged and not sent, as in any dry-run.
+            assert dry.move_by_um(50.0, force=True) == pytest.approx(start + 50.0)
+        assert "[dry-run] z: move_by 50.0 µm to 50.0 µm" in caplog.messages
+        assert dry.position_um() == pytest.approx(start)
+
+    @pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+    def test_non_finite_z_jog_is_refused_even_forced_and_sends_nothing(
+        self, demo_core: Any, bad: float
+    ) -> None:
+        z = _z(demo_core)
+        start = z.move_to_um(0.0)
+        with pytest.raises(SafetyRefusedError) as info:
+            z.move_by_um(bad, force=True)
+        # The jog guard's own reason: the soft-limit check refuses a non-finite
+        # target too, with an empty how_to_force, so that alone proves nothing.
+        assert info.value.reason == f"Z jog {bad} µm is not a finite distance"
+        assert info.value.how_to_force == ""
+        assert z.position_um() == pytest.approx(start)
+
+    def test_halted_stand_with_an_oversized_z_jog_keeps_its_halt(
+        self, demo_core: Any
+    ) -> None:
+        # FM-64: the jog refusal is raised before the action, nothing is sent,
+        # and the next action still finds the stand halted.
+        executor = _executor()
+        z = MMZStage(
+            demo_core,
+            demo_core.getFocusDevice(),
+            executor,
+            Safety(max_jog_um=1000.0, max_z_jog_um=10.0),
+        )
+        executor.halt()
+        with pytest.raises(SafetyRefusedError) as info:
+            z.move_by_um(50.0)
+        assert info.value.reason == "Z jog 50.0 µm exceeds the Z jog limit of 10.0 µm"
+        with pytest.raises(MicroscopeHaltedError):
+            z.move_by_um(5.0)
+        assert executor.halted
+
     def test_snap_shape_matches_image_shape(self, demo_core: Any) -> None:
         camera = _camera(demo_core)
         frame = camera.snap()

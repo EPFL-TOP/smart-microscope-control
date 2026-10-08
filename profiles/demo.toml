@@ -20,6 +20,7 @@ adapter_search_paths = []
 
 [safety]
 max_jog_um = 5000.0            # a relative move above this is refused unless forced
+max_z_jog_um = 100.0           # a relative Z move above this is refused unless forced
 z_soft_limits_um = [-1000.0, 1000.0]
 turret_requires_confirm = true
 

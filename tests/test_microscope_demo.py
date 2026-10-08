@@ -28,6 +28,7 @@ from smc.hardware.errors import (
     MicroscopeBusyError,
     MicroscopeHaltedError,
     MotionStoppedError,
+    SafetyRefusedError,
 )
 from smc.hardware.profile import Profile
 from smc.hardware.roles import Role
@@ -158,7 +159,7 @@ class _JammedZ(_Jammed):
     def move_to_um(self, z_um: float) -> float:
         return z_um
 
-    def move_by_um(self, dz_um: float) -> float:
+    def move_by_um(self, dz_um: float, *, force: bool = False) -> float:
         return dz_um
 
 
@@ -240,6 +241,80 @@ def test_profile_assignment_picks_the_device_the_capability_drives() -> None:
         assert m.require(Shutter).set_open(True) is True
         assert m.core.getShutterOpen("LED Shutter")
         assert not m.core.getShutterOpen("White Light Shutter")
+
+
+def _profile_with_z_jog(max_z_jog_um: float | None, *, name: str = "zjog") -> Profile:
+    data = Profile.demo().model_dump()
+    data["microscope"]["name"] = name
+    data["safety"]["max_z_jog_um"] = max_z_jog_um
+    return Profile.model_validate(data)
+
+
+def _z_jog_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING and "max_z_jog_um" in record.getMessage()
+    ]
+
+
+def test_open_warns_once_when_the_focus_drive_has_no_max_z_jog_um(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with (
+        caplog.at_level(logging.WARNING, logger=LOGGER),
+        Microscope.open(_profile_with_z_jog(None, name="nokey")),
+    ):
+        pass
+    assert _z_jog_warnings(caplog) == [
+        "profile 'nokey' sets no [safety] max_z_jog_um; Z jogs above 100.0 µm "
+        "are refused unless forced (assumed default)"
+    ]
+
+
+def test_open_does_not_warn_when_max_z_jog_um_is_set(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level(logging.WARNING, logger=LOGGER), Microscope.open("demo"):
+        pass
+    assert _z_jog_warnings(caplog) == []
+
+
+def test_open_does_not_warn_about_z_jogs_when_there_is_no_focus_drive(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    data = _profile_with_z_jog(None).model_dump()
+    data["roles"]["exclude"] = {"focus": ["Z"]}
+    with (
+        caplog.at_level(logging.WARNING, logger=LOGGER),
+        Microscope.open(Profile.model_validate(data)) as m,
+    ):
+        # The premise: the exclusion really emptied the role.
+        assert m.roles.get(Role.focus) is None
+    assert _z_jog_warnings(caplog) == []
+
+
+def test_profile_max_z_jog_um_reaches_the_z_stage() -> None:
+    with Microscope.open(_profile_with_z_jog(5.0)) as m:
+        z = m.require(ZStage)
+        start = z.position_um()
+        with pytest.raises(SafetyRefusedError) as info:
+            z.move_by_um(6.0)
+        assert info.value.reason == "Z jog 6.0 µm exceeds the Z jog limit of 5.0 µm"
+        assert info.value.how_to_force == "pass force=True"
+        assert z.position_um() == start
+        assert z.move_by_um(5.0) == pytest.approx(start + 5.0, abs=0.5)
+
+
+def test_an_omitted_max_z_jog_um_reaches_the_z_stage_as_the_assumed_default() -> None:
+    with Microscope.open(_profile_with_z_jog(None)) as m:
+        z = m.require(ZStage)
+        with pytest.raises(SafetyRefusedError) as info:
+            z.move_by_um(150.0)
+        assert info.value.reason == (
+            "Z jog 150.0 µm exceeds the Z jog limit of 100.0 µm "
+            "(assumed: the profile sets no [safety] max_z_jog_um)"
+        )
 
 
 def test_override_replaces_a_capability() -> None:

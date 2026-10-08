@@ -16,6 +16,10 @@ Hardware behaviour encoded here:
 * **Every role warning is logged** (FM-13): a stand where several devices
   share a type is where a wrong pick hides, and a ``.cfg`` that names a TIRF
   positioner as the XY stage is corrected with a warning, not in silence.
+* **An assumed Z jog limit is logged** (#84): a profile that sets no
+  ``[safety] max_z_jog_um`` gets ``DEFAULT_MAX_Z_JOG_UM``, and one WARNING at
+  open says the number is a default and not the stand's, when a focus drive
+  is present.
 * **One connection per stand.** Nikon and Zeiss stands accept one client at
   a time, so ``close()`` unloads every device, a failed ``open()`` releases
   the core it opened, and closing twice is harmless.
@@ -55,7 +59,7 @@ from smc.hardware.errors import (
 from smc.hardware.profile import Profile
 from smc.hardware.roles import DeviceInfo, Role, RoleMap, core_roles, devices_from_core
 from smc.hardware.roles import resolve as resolve_roles
-from smc.hardware.safety import Executor, Safety
+from smc.hardware.safety import DEFAULT_MAX_Z_JOG_UM, Executor, Safety
 
 if TYPE_CHECKING:
     from pymmcore_plus import CMMCorePlus
@@ -140,8 +144,19 @@ class Microscope:
         for warning in self.roles.warnings:
             log.warning("%s", warning)
         safety = profile.safety
+        # Only a stand that has a focus drive has a Z jog to guard; the
+        # profile cannot know that at load time, so the warning waits for the
+        # roles. The number in force is DEFAULT_MAX_Z_JOG_UM, not the stand's.
+        if safety.max_z_jog_um is None and self.roles.get(Role.focus) is not None:
+            log.warning(
+                "profile %r sets no [safety] max_z_jog_um; Z jogs above %s µm "
+                "are refused unless forced (assumed default)",
+                profile.microscope.name,
+                DEFAULT_MAX_Z_JOG_UM,
+            )
         self._safety = Safety(
             max_jog_um=safety.max_jog_um,
+            max_z_jog_um=safety.max_z_jog_um,
             z_soft_limits_um=safety.z_soft_limits_um,
             xy_soft_limits_um=safety.xy_soft_limits_um,
         )
