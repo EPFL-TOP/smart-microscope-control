@@ -152,7 +152,11 @@ class XYStage(Protocol):
 
 @runtime_checkable
 class ZStage(Protocol):
-    """A focus drive. Same contract as ``XYStage`` without the jog guard."""
+    """A focus drive. Same contract as ``XYStage``, jog guard included.
+
+    The jog limit is the profile's ``max_z_jog_um``, separate from the XY
+    ``max_jog_um``: a mistyped focus jog drives the objective into the sample.
+    """
 
     def position_um(self) -> float:
         """Where the drive reports it is."""
@@ -162,8 +166,13 @@ class ZStage(Protocol):
         """Move to an absolute position; return the readback once it has arrived."""
         ...
 
-    def move_by_um(self, dz_um: float) -> float:
-        """Move relative to the current position; return the readback once it has arrived."""
+    def move_by_um(self, dz_um: float, *, force: bool = False) -> float:
+        """Move relative to the current position; return the readback once it has arrived.
+
+        Refuses ``|dz_um| > max_z_jog_um`` with ``SafetyRefusedError`` unless
+        ``force``. ``force`` passes the jog guard only: the soft limits still
+        apply to the target, and a non-finite distance is never forceable.
+        """
         ...
 
     def wait(self, timeout_s: float | None = None) -> None:

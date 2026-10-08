@@ -1,8 +1,9 @@
 """The ``ZStage`` contract, on every backend (design §3, §8).
 
 Every target sent is at or below where the drive started (``envelope.z_um``),
-by at most 2 µm: away from the sample on an inverted stand. The jog guard
-for Z is #84's, which adds its case here.
+by at most 2 µm: away from the sample on an inverted stand. The envelope's Z
+jog limit (``max_z_jog_um``, 1 µm) is below that, so a 1.5 µm jog exercises the
+jog guard without leaving the envelope (#84).
 """
 
 from __future__ import annotations
@@ -41,6 +42,23 @@ def test_move_by_adds_to_the_position(z: ZStage, envelope: Envelope) -> None:
     assert abs(z.position_um() - (z0 - 1)) <= tol
 
 
+def test_jog_above_the_limit_is_refused_and_sends_nothing(
+    z: ZStage, envelope: Envelope
+) -> None:
+    z0, tol = _origin(envelope), envelope.tolerance_um
+    assert envelope.max_z_jog_um < 1.5
+    with pytest.raises(SafetyRefusedError) as refused:
+        z.move_by_um(-1.5)
+    assert refused.value.how_to_force != ""
+    assert abs(z.position_um() - z0) <= tol
+
+
+def test_forced_jog_above_the_limit_passes(z: ZStage, envelope: Envelope) -> None:
+    z0, tol = _origin(envelope), envelope.tolerance_um
+    landed = z.move_by_um(-1.5, force=True)
+    assert abs(landed - (z0 - 1.5)) <= tol
+
+
 def test_target_outside_soft_limits_is_refused_and_not_forceable(
     z: ZStage, envelope: Envelope
 ) -> None:
@@ -55,10 +73,11 @@ def test_target_outside_soft_limits_is_refused_and_not_forceable(
 def test_relative_target_outside_soft_limits_is_refused_even_forced(
     z: ZStage, envelope: Envelope
 ) -> None:
-    # ZStage.move_by_um takes no force: the refusal says it cannot be forced.
+    # Forced, so that the soft limit and not the jog guard is what refuses it:
+    # unforced, the 5 µm jog is above max_z_jog_um and is refused first.
     z0, tol = _origin(envelope), envelope.tolerance_um
     with pytest.raises(SafetyRefusedError) as refused:
-        z.move_by_um(-5)
+        z.move_by_um(-5, force=True)
     assert refused.value.how_to_force == ""
     assert abs(z.position_um() - z0) <= tol
 
