@@ -85,7 +85,10 @@ them if it is not the one you run on.
 ## Verify and attack
 
 10. `.venv/bin/ruff check . && .venv/bin/ruff format --check . &&
-    .venv/bin/mypy && .venv/bin/pytest` — all green in the worktree.
+    .venv/bin/mypy && .venv/bin/pytest` — all green in the worktree. If the
+    change touches the CLI or its tests, run them once more as CI does,
+    `GITHUB_ACTIONS=1 .venv/bin/pytest tests/test_cli.py` (FM-72: typer then
+    forces colour; #84's first push failed every CI job on this).
 11. Run **`/adversarial-review $ARGUMENTS`**: cheap reviewer agents attack
     the change for its risk level, a verifier reproduces or refutes each
     finding, and you fix what is confirmed and in scope. Re-run step 10.
