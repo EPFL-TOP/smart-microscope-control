@@ -50,7 +50,13 @@ yourself.
    Then re-run `ruff check . && ruff format --check . && mypy && pytest`.
 6. **Learn.** A confirmed finding whose category is missing from
    `docs/design/failure-modes.md` gets a new entry in this PR: an id, what
-   happens, how to check.
+   happens, how to check. Parallel branches add entries too, so take the
+   next id after the highest one on any branch, not only on `main`:
+   `git fetch origin`, then
+   `git log --all -p -- docs/design/failure-modes.md | grep -o 'FM-[0-9]*' | sort -t- -k2 -n -u | tail -1`
+   (ids collided between #84 and #10). If an open PR is rewriting the
+   same lines, put the entry's text under the Report's **Follow-ups**
+   instead; `/point` adds it once that PR merges (#76).
 7. **Record** for the Report, in this shape:
 
    ```markdown
