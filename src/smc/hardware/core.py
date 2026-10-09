@@ -131,14 +131,22 @@ def _checked_dirs(paths: Sequence[str | Path]) -> list[str]:
             "adapter_search_paths takes a sequence of directories, not a single "
             f"path ({paths!r}); wrap it in a list"
         )
+    where = "(set in [micromanager] adapter_search_paths of the profile)"
     checked: list[str] = []
     for entry in paths:
-        directory = Path(entry).expanduser().absolute()
-        if not directory.is_dir():
+        # Path("") is ".": the working directory would silently become the
+        # first place adapters and DLLs are taken from. A profile file cannot
+        # say this (its validator refuses it); a direct caller can.
+        if isinstance(entry, str) and not entry.strip():
+            raise CoreError(f"adapter search path is empty {where}; remove the entry")
+        try:
+            directory = Path(entry).expanduser().absolute()
+        except RuntimeError as exc:  # "~user" with no such user, or no HOME
             raise CoreError(
-                f"adapter search path is not a directory: {entry} "
-                "(set in [micromanager] adapter_search_paths of the profile)"
-            )
+                f"adapter search path cannot be expanded: {entry} ({exc}) {where}"
+            ) from exc
+        if not directory.is_dir():
+            raise CoreError(f"adapter search path is not a directory: {entry} {where}")
         checked.append(str(directory))
     return checked
 
@@ -203,9 +211,11 @@ def open_core(
 
     Raises:
         CoreError: When no adapters are installed, the file does not exist,
-            or an entry of ``adapter_search_paths`` is not a directory. Load
-            errors from Micro-Manager itself are re-raised as ``CoreError``
-            too, with the file name attached.
+            or an entry of ``adapter_search_paths`` is empty, cannot be
+            expanded or is not a directory. Load errors from Micro-Manager
+            itself are re-raised as ``CoreError`` too, with the file name
+            attached and, when extra directories were given, the order in
+            which adapters were searched.
         TypeError: When ``adapter_search_paths`` is a single path, not a
             sequence of them.
     """
@@ -224,13 +234,22 @@ def open_core(
         "Micro-Manager adapter search paths, first wins: %s",
         "; ".join(effective) or "(none)",
     )
+    # MMCore takes each adapter from the first directory that has it, with no
+    # fallback: an extra folder holding a mismatched adapter fails a load that
+    # worked without it. MMCore's message names the file; this names the folder
+    # order, which the INFO line above hides unless the log level is raised.
+    searched = (
+        f" (adapter search paths, first wins: {'; '.join(effective)})" if extras else ""
+    )
     if config is None:
         if find_install() is None:
             raise CoreError(INSTALL_HINT)
         try:
             core.loadSystemConfiguration()
         except Exception as exc:
-            raise CoreError(f"could not load the demo configuration: {exc}") from exc
+            raise CoreError(
+                f"could not load the demo configuration: {exc}{searched}"
+            ) from exc
         return core
 
     path = Path(config)
@@ -239,7 +258,7 @@ def open_core(
     try:
         core.loadSystemConfiguration(str(path))
     except Exception as exc:
-        raise CoreError(f"could not load {path}: {exc}") from exc
+        raise CoreError(f"could not load {path}: {exc}{searched}") from exc
     return core
 
 

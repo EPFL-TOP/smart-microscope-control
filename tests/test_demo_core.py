@@ -158,6 +158,10 @@ def test_open_core_refuses_a_bad_adapter_dir_before_building_a_core(
         open_core(None, adapter_search_paths=[bad])
     assert f"adapter search path is not a directory: {bad}" in str(info.value)
     assert "[micromanager] adapter_search_paths" in str(info.value)
+    # Control: the refusal above says nothing unless the stand-in is what
+    # open_core builds. A valid call must reach it.
+    with pytest.raises(RuntimeError, match="a core was built"):
+        open_core(None)
 
 
 @pytest.mark.usefixtures("need_mm", "restored_path")
@@ -262,3 +266,120 @@ def test_open_core_refuses_a_lone_path_instead_of_a_list(tmp_path: Path) -> None
     # A str is a Sequence[str]: each character would become a "directory".
     with pytest.raises(TypeError, match=re.escape("sequence of directories")):
         open_core(None, adapter_search_paths=str(tmp_path))
+
+
+@pytest.mark.usefixtures("need_mm", "restored_path")
+def test_open_core_without_extras_still_makes_the_install_an_exact_path_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The common case, a profile with no extra directories: the substring rule
+    # of pymmcore-plus would skip the install when "...-old" is on PATH.
+    default = _default_search_paths()
+    monkeypatch.setenv("PATH", default[0] + "-old")
+    core = open_core(None)
+    core.unloadAllDevices()
+    assert default[0] in os.environ["PATH"].split(os.pathsep)
+
+
+@pytest.mark.usefixtures("need_mm", "restored_path")
+def test_open_core_makes_a_relative_adapter_dir_absolute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _adapters_dir(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    core = open_core(None, adapter_search_paths=["adapters"])
+    core.unloadAllDevices()
+    # A relative entry would follow the working directory at every later load.
+    assert _search_paths(core)[0] == str(tmp_path / "adapters")
+
+
+@pytest.mark.usefixtures("need_mm", "restored_path")
+def test_open_core_expands_the_home_directory_of_an_adapter_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _adapters_dir(tmp_path)
+    # expanduser reads HOME on POSIX and USERPROFILE on Windows.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    core = open_core(None, adapter_search_paths=["~/adapters"])
+    core.unloadAllDevices()
+    assert _search_paths(core)[0] == str(tmp_path / "adapters")
+
+
+def test_adapter_dirs_are_the_same_when_only_the_case_differs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Windows folds case, POSIX does not: stand in for Windows' normcase so the
+    # branch runs on every runner.
+    monkeypatch.setattr(os.path, "normcase", str.lower)
+    from smc.hardware import core as core_mod
+
+    assert core_mod._merge_search_paths(["/Mm/Adapters"], ["/mm/adapters"]) == [
+        "/Mm/Adapters"
+    ]
+    monkeypatch.setenv("PATH", os.pathsep.join(["/x/MM", "/y"]))
+    # Different case on each side: both must be folded before they are compared.
+    core_mod._put_on_path(["/X/Mm"])
+    assert os.environ["PATH"].split(os.pathsep) == ["/X/Mm", "/y"]
+
+
+@pytest.mark.parametrize("entry", ["", "   "])
+def test_open_core_refuses_an_empty_adapter_dir(entry: str) -> None:
+    # Path("") is ".": the working directory would silently become the first
+    # place adapters and DLLs are taken from.
+    with pytest.raises(CoreError) as info:
+        open_core(None, adapter_search_paths=[entry])
+    assert "adapter search path is empty" in str(info.value)
+    assert "[micromanager] adapter_search_paths" in str(info.value)
+
+
+def test_open_core_names_an_adapter_dir_it_cannot_expand(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def no_home(self: Path) -> Path:
+        raise RuntimeError("Could not determine home directory.")
+
+    # "~nosuchuser" does this on POSIX; Windows has no such failure to provoke.
+    monkeypatch.setattr(Path, "expanduser", no_home)
+    with pytest.raises(CoreError) as info:
+        open_core(None, adapter_search_paths=["~nosuchuser/mm"])
+    msg = str(info.value)
+    assert "adapter search path cannot be expanded: ~nosuchuser/mm" in msg
+    assert "Could not determine home directory." in msg
+    assert "[micromanager] adapter_search_paths" in msg
+
+
+@pytest.mark.usefixtures("need_mm", "restored_path")
+@pytest.mark.parametrize("with_config", [False, True], ids=["demo", "config-file"])
+def test_a_failed_load_says_where_the_adapter_dirs_were_searched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, with_config: bool
+) -> None:
+    import pymmcore_plus
+
+    # MMCore takes every adapter from the first directory that has it, so an
+    # extra folder with a mismatched adapter fails a load that worked before.
+    # The error must point at the folder that came first.
+    class Failing(pymmcore_plus.CMMCorePlus):
+        def loadSystemConfiguration(  # noqa: N802 - MMCore API
+            self, *args: Any, **kwargs: Any
+        ) -> Any:
+            raise RuntimeError('Failed to load device adapter "DemoCamera"')
+
+    monkeypatch.setattr(pymmcore_plus, "CMMCorePlus", Failing)
+    default = _default_search_paths()
+    extra = _adapters_dir(tmp_path)
+    config = None
+    if with_config:
+        config = tmp_path / "scope.cfg"
+        config.write_text("# no devices\n", encoding="utf-8")
+    with pytest.raises(CoreError) as info:
+        open_core(config, adapter_search_paths=[extra])
+    msg = str(info.value)
+    assert 'Failed to load device adapter "DemoCamera"' in msg
+    assert (
+        "(adapter search paths, first wins: " + "; ".join([str(extra), *default]) in msg
+    )
+    # Without extras nothing was searched first, so nothing is added.
+    with pytest.raises(CoreError) as plain:
+        open_core(config)
+    assert "first wins" not in str(plain.value)

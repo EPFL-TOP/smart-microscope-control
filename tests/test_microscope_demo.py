@@ -428,6 +428,11 @@ def test_open_refuses_a_missing_adapter_dir_from_a_profile_built_in_code(
     assert f"adapter search path is not a directory: {missing}" in str(info.value)
     # No core was built, so no stand connection is left open.
     assert built == []
+    # Control: that is only worth something if the stand-in is what a valid
+    # open builds.
+    with Microscope.open(Profile.demo()):
+        pass
+    assert len(built) == 1
 
 
 # --- the core timeout and the lock timeout (FM-10, FM-15) ---------------------

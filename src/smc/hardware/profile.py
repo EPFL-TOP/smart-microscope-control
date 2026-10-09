@@ -274,7 +274,7 @@ class Profile(_Section):
         """
         if not self.micromanager.config:
             return None
-        return self._resolve_entry(self.micromanager.config)
+        return self._resolve_entry("config", self.micromanager.config)
 
     def adapter_search_dirs(self) -> list[Path]:
         """The extra adapter directories, in file order, resolved like :meth:`config_path`.
@@ -285,12 +285,24 @@ class Profile(_Section):
         The Zeiss PC's MMStudio folder goes here, for an adapter that only
         the GUI install has (#77).
         """
-        return [self._resolve_entry(e) for e in self.micromanager.adapter_search_paths]
+        return [
+            self._resolve_entry("adapter_search_paths", e)
+            for e in self.micromanager.adapter_search_paths
+        ]
 
-    def _resolve_entry(self, entry: str) -> Path:
+    def _resolve_entry(self, key: str, entry: str) -> Path:
         # One rule for every path in the profile: ``~`` expands, and a
         # relative path follows the file, not the working directory.
-        path = Path(entry).expanduser()
+        try:
+            path = Path(entry).expanduser()
+        except RuntimeError as exc:
+            # "~user" with no such user, or no home directory: a ProfileError,
+            # so that a listing of profiles reports this one and goes on.
+            where = f"{self.source}: " if self.source is not None else ""
+            raise ProfileError(
+                f"{where}micromanager.{key}: cannot expand '~' in {entry} ({exc}). "
+                "Write an absolute path, or set HOME (USERPROFILE on Windows)."
+            ) from exc
         if not path.is_absolute() and self.source is not None:
             path = (self.source.parent / path).resolve()
         return path

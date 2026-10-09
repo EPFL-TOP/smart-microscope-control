@@ -328,6 +328,35 @@ def test_missing_config_names_the_path(tmp_path: Path) -> None:
     assert str(tmp_path / "missing.cfg") in msg
 
 
+@pytest.mark.parametrize(
+    ("key", "line", "entry"),
+    [
+        ("config", 'config = "~nosuchuser/stand.cfg"', "~nosuchuser/stand.cfg"),
+        (
+            "adapter_search_paths",
+            'adapter_search_paths = ["~nosuchuser/mm"]',
+            "~nosuchuser/mm",
+        ),
+    ],
+)
+def test_a_home_directory_that_cannot_be_expanded_is_a_profile_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str, line: str, entry: str
+) -> None:
+    path = write_profile(tmp_path / "p.toml", f"[micromanager]\n{line}\n")
+
+    def no_home(self: Path) -> Path:
+        raise RuntimeError("Could not determine home directory.")
+
+    # "~nosuchuser" does this on POSIX; Windows has no such failure to provoke.
+    # A bare RuntimeError would end `smc profiles` at the first such file.
+    monkeypatch.setattr(Path, "expanduser", no_home)
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    msg = str(info.value)
+    assert f"{path}: micromanager.{key}: cannot expand '~' in {entry} " in msg
+    assert "Could not determine home directory." in msg
+
+
 # -- micromanager.adapter_search_paths (#77) ------------------------------------
 
 
