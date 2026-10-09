@@ -188,7 +188,9 @@ class Microscope:
             CoreError: The configuration cannot be loaded.
         """
         loaded = profile if isinstance(profile, Profile) else Profile.load(profile)
-        core = open_core(loaded.config_path())
+        core = open_core(
+            loaded.config_path(), adapter_search_paths=loaded.adapter_search_dirs()
+        )
         try:
             microscope = cls.from_core(core, loaded, dry_run=dry_run)
         except BaseException:
