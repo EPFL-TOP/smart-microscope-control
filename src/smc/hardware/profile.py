@@ -64,13 +64,25 @@ class MicroManagerSection(_Section):
 
     ``config`` empty means the demo configuration shipped with the adapters;
     a relative path resolves against the profile file, so a profile and its
-    ``.cfg`` can move together.
+    ``.cfg`` can move together. ``adapter_search_paths`` resolve the same way
+    and are searched before pymmcore-plus's own directory (#77).
     """
 
     config: str = ""
     # A plate traverse exceeds MMCore's 5 s default.
     device_timeout_ms: int = 60_000
     adapter_search_paths: list[str] = Field(default_factory=list)
+
+    @field_validator("adapter_search_paths")
+    @classmethod
+    def _search_paths_not_empty(cls, value: list[str]) -> list[str]:
+        # Path("") is ".": an empty entry would silently mean "the profile's
+        # own folder" and put whatever DLLs lie next to the file on the path.
+        if any(not entry.strip() for entry in value):
+            raise ValueError(
+                'adapter_search_paths entries must not be empty; remove the "" entry'
+            )
+        return value
 
     @field_validator("device_timeout_ms")
     @classmethod
@@ -262,7 +274,23 @@ class Profile(_Section):
         """
         if not self.micromanager.config:
             return None
-        path = Path(self.micromanager.config).expanduser()
+        return self._resolve_entry(self.micromanager.config)
+
+    def adapter_search_dirs(self) -> list[Path]:
+        """The extra adapter directories, in file order, resolved like :meth:`config_path`.
+
+        Order is the priority (the first directory wins when two hold the
+        same adapter), so it is kept, and nothing is de-duplicated here:
+        ``open_core`` does that once it knows what the core already searches.
+        The Zeiss PC's MMStudio folder goes here when its device interface
+        differs from pymmcore-plus's (#77).
+        """
+        return [self._resolve_entry(e) for e in self.micromanager.adapter_search_paths]
+
+    def _resolve_entry(self, entry: str) -> Path:
+        # One rule for every path in the profile: ``~`` expands, and a
+        # relative path follows the file, not the working directory.
+        path = Path(entry).expanduser()
         if not path.is_absolute() and self.source is not None:
             path = (self.source.parent / path).resolve()
         return path
@@ -369,6 +397,21 @@ def _load_file(path: Path) -> Profile:
             'forward slashes on Windows too), or set config = "" for the demo '
             "configuration."
         )
+    # MMCore accepts a directory that does not exist without a word, so a
+    # typo here would load nothing from it and say nothing (#77).
+    for entry, directory in zip(
+        profile.micromanager.adapter_search_paths,
+        profile.adapter_search_dirs(),
+        strict=True,
+    ):
+        if not directory.is_dir():
+            looked = "" if str(directory) == entry else f" (looked for {directory})"
+            raise ProfileError(
+                f"{path}: micromanager.adapter_search_paths lists {entry}, which is "
+                f"not a directory{looked}. Fix the path (relative paths resolve "
+                "against the profile file; use forward slashes on Windows too), or "
+                "remove the entry."
+            )
     log.debug("loaded profile %r from %s", profile.microscope.name, path)
     return profile
 

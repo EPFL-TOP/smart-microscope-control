@@ -328,6 +328,111 @@ def test_missing_config_names_the_path(tmp_path: Path) -> None:
     assert str(tmp_path / "missing.cfg") in msg
 
 
+# -- micromanager.adapter_search_paths (#77) ------------------------------------
+
+
+def test_adapter_search_dirs_resolve_against_the_profile_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stand = tmp_path / "stand"
+    (stand / "adapters").mkdir(parents=True)
+    absolute = tmp_path / "mm-2.0"
+    absolute.mkdir()
+    path = write_profile(
+        stand / "p.toml",
+        "[micromanager]\n"
+        f"adapter_search_paths = ['{absolute.as_posix()}', 'adapters', "
+        f"'{absolute.as_posix()}']\n",
+    )
+    monkeypatch.chdir(tmp_path)  # a different directory than the profile's
+    dirs = Profile.load(path).adapter_search_dirs()
+    # The file's order is kept and nothing is de-duplicated here: that is
+    # open_core's job, once it knows what the core already has.
+    assert dirs == [absolute, (stand / "adapters").resolve(), absolute]
+
+
+def test_adapter_search_dirs_expand_the_home_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    (home / "mm").mkdir(parents=True)
+    # expanduser reads HOME on POSIX and USERPROFILE on Windows.
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    path = write_profile(
+        tmp_path / "p.toml", "[micromanager]\nadapter_search_paths = ['~/mm']\n"
+    )
+    assert Profile.load(path).adapter_search_dirs() == [home / "mm"]
+
+
+def test_no_adapter_search_paths_means_no_dirs() -> None:
+    assert Profile.demo().adapter_search_dirs() == []
+
+
+def test_missing_adapter_search_path_is_refused_at_load(tmp_path: Path) -> None:
+    path = write_profile(
+        tmp_path / "p.toml", '[micromanager]\nadapter_search_paths = ["nowhere"]\n'
+    )
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    msg = str(info.value)
+    assert f"{path}: micromanager.adapter_search_paths lists nowhere, " in msg
+    assert "which is not a directory" in msg
+    # A relative entry also says where it was looked for.
+    assert str(tmp_path / "nowhere") in msg
+
+
+def test_the_first_bad_adapter_search_path_is_the_one_reported(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "fine").mkdir()
+    path = write_profile(
+        tmp_path / "p.toml",
+        '[micromanager]\nadapter_search_paths = ["fine", "first-bad", "second-bad"]\n',
+    )
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    msg = str(info.value)
+    assert "micromanager.adapter_search_paths lists first-bad, " in msg
+    assert "second-bad" not in msg
+
+
+def test_adapter_search_path_that_is_a_file_is_refused(tmp_path: Path) -> None:
+    (tmp_path / "mmgr_dal_DemoCamera.dll").write_text("not a dll\n", encoding="utf-8")
+    path = write_profile(
+        tmp_path / "p.toml",
+        '[micromanager]\nadapter_search_paths = ["mmgr_dal_DemoCamera.dll"]\n',
+    )
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    msg = str(info.value)
+    assert "micromanager.adapter_search_paths lists mmgr_dal_DemoCamera.dll, " in msg
+    assert "which is not a directory" in msg
+
+
+@pytest.mark.parametrize("entry", ["", "   "])
+def test_empty_adapter_search_path_entry_is_refused(tmp_path: Path, entry: str) -> None:
+    # Path("") is ".", which would silently mean "the profile's own folder".
+    path = write_profile(
+        tmp_path / "p.toml", f'[micromanager]\nadapter_search_paths = ["{entry}"]\n'
+    )
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    assert (
+        'micromanager.adapter_search_paths: adapter_search_paths entries must not be empty; remove the "" entry'
+        in str(info.value)
+    )
+
+
+def test_empty_adapter_search_path_entry_is_refused_in_code() -> None:
+    from pydantic import ValidationError
+
+    from smc.hardware.profile import MicroManagerSection
+
+    with pytest.raises(ValidationError, match="entries must not be empty"):
+        MicroManagerSection(adapter_search_paths=["C:/mm", ""])
+
+
 # -- search paths -------------------------------------------------------------
 
 
