@@ -342,7 +342,7 @@ description = "DemoCamera adapter: simulated camera, XY, Z, turret, shutter, aut
 [micromanager]
 config = ""                    # "" = demo configuration; relative paths resolve against this file
 device_timeout_ms = 60000
-adapter_search_paths = []      # extra Micro-Manager directories, e.g. a separate MMStudio install
+adapter_search_paths = []      # extra adapter directories, searched before pymmcore-plus's (§7)
 
 [roles.assign]                 # overrides only; keys are Role values
 # xy_stage = "XY"
@@ -409,6 +409,7 @@ class Profile(BaseModel):
     @classmethod
     def load(cls, source: str | Path) -> Profile: ...
     def config_path(self) -> Path | None: ...  # None for the demo configuration
+    def adapter_search_dirs(self) -> list[Path]: ...  # resolved like config_path
 
 
 def search_paths() -> list[
@@ -423,7 +424,12 @@ paths; a path is read as given. Validation errors are re-raised as
 `ProfileError(HardwareError)` naming file, key and fix. Limits must be
 ordered; `max_jog_um` and `max_z_jog_um` must be positive and finite
 (`ProfileError` naming `safety.max_z_jog_um`); unknown role keys list the
-allowed values; a non-empty `config` must exist at load time.
+allowed values; a non-empty `config` must exist at load time, and every
+`adapter_search_paths` entry must be a directory at load time
+(`ProfileError` naming `micromanager.adapter_search_paths` and the entry,
+#77). `adapter_search_dirs()` expands `~` and resolves a relative entry
+against the profile file's directory, exactly as `config_path()` does,
+and keeps the file's order.
 
 ## 6. Micro-Manager backend — `smc/hardware/backends/mm.py` (#5)
 
@@ -567,7 +573,9 @@ class MicroscopeState:
     errors: list[str] = field(default_factory=list)   # "z: <exception>" per failed read
 ```
 
-`open()` = `Profile.load` → `open_core(config)` → `setTimeoutMs` →
+`open()` = `Profile.load` →
+`open_core(config, adapter_search_paths=profile.adapter_search_dirs())` →
+`setTimeoutMs` →
 `loaded_devices` → `resolve(devices, core_roles=core_roles(core),
 overrides=profile.roles.assign, exclusions=profile.roles.exclude)` → log
 each warning. `require()` builds the capability once from
@@ -577,6 +585,48 @@ message lists what *is* available and points at `[roles.assign]`.
 `close()` stops the stages if anything is still moving (§13), then unloads
 all devices (one connection per stand), and is idempotent. The `Executor` gets
 `lock_timeout_s = profile.micromanager.device_timeout_ms / 1000`.
+
+**Adapter search paths (#77).** `core.py` gains a keyword-only argument:
+
+```python
+def open_core(
+    config: str | Path | None = None,
+    *,
+    adapter_search_paths: Sequence[str | Path] = (),
+) -> CMMCorePlus: ...
+def opened(
+    config: str | Path | None = None,
+    *,
+    adapter_search_paths: Sequence[str | Path] = (),
+) -> Iterator[CMMCorePlus]: ...  # passes it through
+```
+
+Before it loads the configuration, `open_core` sets the core's adapter
+search paths to the given directories, in order, followed by the ones the
+fresh core already has, with later duplicates dropped. Then it logs the
+effective list at INFO. It raises `CoreError` naming
+`[micromanager] adapter_search_paths` and the entry when an entry is not a
+directory. That check runs before any core is built, and it also covers a
+`Profile` built in code, which never passes through `Profile.load`. The
+demo branch keeps its `find_install()` check, because pymmcore-plus finds
+`MMConfig_demo.cfg` in its own install directory, not on the search path.
+What was measured (2026-10-09, pymmcore-plus 0.18.1, pymmcore 12.5.0.75.0,
+macOS):
+- A fresh `CMMCorePlus()` has one search path, the install that
+  `find_micromanager()` returns.
+- `setDeviceAdapterSearchPaths` replaces that list; it does not add to it.
+- MMCore accepts a directory that does not exist without a word. The demo
+  still loads when the missing directory comes first, and with only that
+  directory, it fails with "Failed to load device adapter".
+
+pymmcore-plus's override of `setDeviceAdapterSearchPaths` also prepends
+each directory to `PATH`, because a Windows adapter loads its own DLLs
+through `PATH` (pymmcore#28). But it skips a directory whose string occurs
+anywhere in `PATH`, so `C:\MM-2.0` is skipped when `C:\MM-2.0.3\bin` is
+on it. `open_core` therefore makes every given directory an exact `PATH`
+entry (compared with `os.path.normcase`). That `PATH` change lasts for the
+whole process, like pymmcore-plus's own. A test that adds a directory
+restores `PATH` with `monkeypatch` (FM-46).
 
 ## 8. Testing — `smc/testing/` and `tests/` (#9, #10)
 

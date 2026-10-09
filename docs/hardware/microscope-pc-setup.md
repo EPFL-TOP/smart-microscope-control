@@ -72,8 +72,14 @@ pymmcore-plus's, or a `.cfg` saved by the GUI fails silently in Python.
 `smc doctor` prints pymmcore-plus's DIV (`Device API version NN`); the
 GUI's is under *Help → About Micro-Manager*. They must be equal. If not,
 install a nightly from the date range of the right DIV
-(<https://micro-manager.org/Device_change_log>) or point pymmcore-plus at
-the GUI's adapter folder in the profile (`adapter_search_paths`).
+(<https://micro-manager.org/Device_change_log>).
+
+To use the GUI's own adapters (one that only the GUI install has), list
+the GUI's folder in the profile under `[micromanager]
+adapter_search_paths`. `Microscope.open` searches it before pymmcore-plus's
+folder and logs the full list at INFO. This does **not** fix a DIV
+mismatch: an adapter whose DIV differs from pymmcore-plus's does not load.
+The two DIVs must be equal first.
 
 ### Nikon Ti2 only
 

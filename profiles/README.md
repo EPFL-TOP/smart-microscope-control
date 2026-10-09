@@ -44,7 +44,7 @@ description = "DemoCamera adapter: simulated camera, XY, Z, turret, shutter, aut
 [micromanager]
 config = ""                    # "" = demo configuration; relative paths resolve against this file
 device_timeout_ms = 60000
-adapter_search_paths = []      # extra Micro-Manager directories, e.g. a separate MMStudio install
+adapter_search_paths = []      # extra adapter directories, searched before pymmcore-plus's; must exist
 
 [roles.assign]                 # overrides only; keys are Role values
 # xy_stage = "XY"
