@@ -282,8 +282,8 @@ class Profile(_Section):
         Order is the priority (the first directory wins when two hold the
         same adapter), so it is kept, and nothing is de-duplicated here:
         ``open_core`` does that once it knows what the core already searches.
-        The Zeiss PC's MMStudio folder goes here when its device interface
-        differs from pymmcore-plus's (#77).
+        The Zeiss PC's MMStudio folder goes here, for an adapter that only
+        the GUI install has (#77).
         """
         return [self._resolve_entry(e) for e in self.micromanager.adapter_search_paths]
 
