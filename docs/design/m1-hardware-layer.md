@@ -115,6 +115,18 @@ profiles/demo.toml     example profile the loader must accept             #7
 
   Messages say what to do next (`how_to_force`, the CLI command, the
   profile key), never just what went wrong.
+- **A device fault is a `HardwareError`** (#93, FM-79). Micro-Manager reports
+  a device fault (a serial timeout on a read, a camera timeout on a snap)
+  as a bare `RuntimeError`. No capability lets one through: it raises a
+  plain `HardwareError` that names the role and the call, with the original
+  exception chained (`from exc`), so the CLI prints `✗ <message>` and exits
+  1, and the operator checks the device instead of filing a bug. There is no
+  subclass: a tool that skips a target because a guard refused it catches
+  `SafetyRefusedError`, never `HardwareError` (FM-64). What passes through
+  untouched is every `HardwareError` (a callback inside a command may raise
+  `MicroscopeHaltedError` or `MotionStoppedError`), `KeyboardInterrupt` and
+  every exception that is not a `RuntimeError` (a `TypeError` from a wrong
+  argument is a bug, and stays one). §6 says where the translation sits.
 - **Logging**: `logging.getLogger("smc.hardware.<module>")`. Every mutating
   call logs at INFO: `xy_stage: move_to (1234.0, -56.0) µm`; dry-run logs
   `[dry-run] xy_stage: move_to …`. No `print` outside `cli.py`.
@@ -235,8 +247,9 @@ Semantics every implementation must honour (these are the contract tests):
 - `Camera.pixel_size_um()` returns MMCore's value when > 0, else the
   profile's value for the current objective label, else `0.0`.
 - Every reader tolerates a device that answers slowly but never swallows a
-  failure silently: exceptions propagate; the *facade's* `state()` is the
-  tolerant layer.
+  failure silently: a failure propagates, as a `HardwareError` naming the
+  role and the call when the device faulted (§2, #93); the *facade's*
+  `state()` is the tolerant layer.
 
 M2 will extend `ZStage.move_to_um` with `keep_autofocus: bool = True`
 (a keyword with a default is a compatible extension).
@@ -431,6 +444,16 @@ allowed values; a non-empty `config` must exist at load time, and every
 against the profile file's directory, exactly as `config_path()` does,
 and keeps the file's order.
 
+**Text encoding (#93).** A profile is UTF-8, with or without a byte-order
+mark: Notepad before Windows 10 1903 writes the mark for "UTF-8", and
+`tomllib` refuses a text that starts with it (measured 2026-10-13: `not
+valid TOML: Invalid statement`, which sends the operator to a line that is
+fine). Text that is not UTF-8 (cp1252 or UTF-16, which Notepad also offers)
+is a `ProfileError` that names the file and the line of the first byte that
+does not decode, and says to save it as UTF-8. It never reaches a caller as
+a `UnicodeDecodeError`; `smc profiles` therefore needs no case of its own
+for it.
+
 ## 6. Micro-Manager backend — `smc/hardware/backends/mm.py` (#5)
 
 The core inventory helpers (`devices_from_core`, `core_roles`) live in
@@ -479,6 +502,24 @@ Core calls per method:
 | `Camera.pixel_size_um` | `getPixelSizeUm()`, fallback profile map by `objective_label()` |
 | `Shutter.*` | `getShutterOpen(label)`, `setShutterOpen(label, b)` (closing is a safe call, §13), `getAutoShutter()`, `setAutoShutter(b)` |
 | `Properties.*` | `getLoadedDevices`, `getDevicePropertyNames`, `getProperty`, `setProperty`, `isPropertyReadOnly`, `hasPropertyLimits`, `getPropertyLowerLimit/UpperLimit`, `getAllowedPropertyValues` |
+
+**Faults (#93).** Each class above reaches the core through
+`as_hardware_errors(core, role)`, a thin proxy that forwards every call and
+turns the `RuntimeError` MMCore raises for a device fault into the
+`HardwareError` of §2. It is one place, so a call added later is covered
+without a decorator, and the `Executor` is unchanged: a failed command still
+sends the stop (FM-17), a busy state that cannot be read still counts as
+moving (FM-19), and `Motion.is_busy` / `Motion.stop` are built from the
+proxied core. The message is
+`<role>: <method>(<args>) failed (<original message>); check the device: …`,
+where `role` is the profile's role name (`xy_stage`, `focus`, `camera`,
+`shutter`, `objective_turret`; `properties` for `MMProperties`, which has
+none). The original message is re-encoded with `errors="replace"`, because
+an adapter's bytes may not be UTF-8 (FM-05). The facade's one other core
+read at action time, `getStateLabel` for the pixel-size map, goes through
+the same proxy. Not translated: what `Microscope.__init__` reads from the
+core (the registry of devices and slots, no device I/O; a failure there
+already closes the stand), `close()` (logged), and `smc.discovery`.
 
 Mutations go through `executor.do(description, action, dry_result=…)`
 (moves and moving `Properties.set` pass `motion=`, §13); reads through
@@ -624,9 +665,46 @@ each directory to `PATH`, because a Windows adapter loads its own DLLs
 through `PATH` (pymmcore#28). But it skips a directory whose string occurs
 anywhere in `PATH`, so `C:\MM-2.0` is skipped when `C:\MM-2.0.3\bin` is
 on it. `open_core` therefore makes every given directory an exact `PATH`
-entry (compared with `os.path.normcase`). That `PATH` change lasts for the
-whole process, like pymmcore-plus's own. A test that adds a directory
+entry (compared with `os.path.normcase`). A test that adds a directory
 restores `PATH` with `monkeypatch` (FM-46).
+
+**`PATH` is not restored when the core closes (#110).** The change lasts for
+the whole process, like pymmcore-plus's own, and `close_core` does not undo
+it. This is decided, not forgotten. Measured on the demo (2026-10-13,
+pymmcore-plus 0.18.1, macOS):
+- Constructing a `CMMCorePlus` already puts the install on `PATH`, and the
+  override only prepends. A restore would need a snapshot taken before the
+  constructor, and a count of the open cores that use each directory:
+  without the count, closing one core removes a folder from under another
+  that is still open, and that core's next vendor DLL fails to load (FM-09).
+- `Microscope.close()` calls `core.unloadAllDevices()` itself and never
+  `close_core`, so a restore inside `close_core` would not run on the main
+  path. Putting it in the facade's `close()` means changing the shutdown
+  sequence that §13 describes, for a state that only matters to a process
+  that opens several stands.
+- What a later open sees is bounded. Every open puts its own directories
+  first: after an open with extras and a later open without, the install
+  comes before the earlier extras. An earlier open's folder can only supply
+  a DLL that none of the later stand's own folders holds.
+
+One stand per process, as the CLI runs it, is not affected. A process that
+opens stands one after another and wants a clean `PATH` saves
+`os.environ["PATH"]` before the first open and restores it after the last
+close. If that becomes the normal way to use the library (a UI, a lab
+service), a scope that counts the cores using each directory is a new
+issue, not a patch of `close_core`.
+
+**A directory whose name contains `os.pathsep`** (`;` on Windows, `:` on
+POSIX, both legal in a folder name) cannot be one entry of `PATH`: written
+as it is, it reads back as two entries, and every later open added them
+again (measured: `PATH` grew by two entries per open). `open_core` leaves
+such a directory off `PATH`, logs a WARNING that names it, and MMCore still
+searches it. The WARNING text is `adapter search path <dir> contains <sep>,
+so it cannot be an entry of PATH; MMCore still searches it, but a vendor DLL
+beside an adapter in it will not be found through PATH`. pymmcore-plus's
+own override still prepends the pieces once, before `open_core` runs; the
+second open finds them and adds nothing, so `PATH` stays bounded (measured:
+24 entries after one open and after four).
 
 ## 8. Testing — `smc/testing/` and `tests/` (#9, #10)
 
@@ -1073,7 +1151,7 @@ never wrapped to the console width (FM-37). Positions have two decimals:
 | Code | Meaning |
 |---|---|
 | 0 | done |
-| 1 | a hardware, profile or file error, or an unexpected exception (one line naming its type; `--debug` for the traceback) |
+| 1 | a hardware, profile or file error (a device fault and a profile that is not UTF-8 included, #93), or an unexpected exception, which is a bug (one line naming its type; `--debug` for the traceback) |
 | 2 | refused, nothing sent: a guard (`SafetyRefusedError`, `MotionInProgressError` included) or a bad argument (Click's usage errors exit 2 as well) |
 | 130 | interrupted (Ctrl-C): the Executor stopped any move under way (FM-17), and the stand was released |
 
