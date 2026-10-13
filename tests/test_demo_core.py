@@ -388,6 +388,19 @@ def test_a_failed_load_says_where_the_adapter_dirs_were_searched(
 # -- PATH: a separator inside an entry, and what outlives a close (#110) -------
 
 
+def _path_separator_warning(entry: str) -> str:
+    """The WARNING decided in design section 7 (#110), whole.
+
+    Its tail is what tells the operator that the folder is not refused and what
+    still fails, so a prefix would let that part be reworded away (FM-45).
+    """
+    return (
+        f"adapter search path {entry} contains {os.pathsep!r}, so it cannot be an "
+        "entry of PATH; MMCore still searches it, but a vendor DLL beside an "
+        "adapter in it will not be found through PATH"
+    )
+
+
 def test_put_on_path_leaves_out_an_entry_that_contains_the_separator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -403,30 +416,36 @@ def test_put_on_path_leaves_out_an_entry_that_contains_the_separator(
     assert os.environ["PATH"].split(os.pathsep) == ["/mm/c", "/keep"]
 
 
-def test_put_on_path_warns_about_an_entry_it_cannot_write(
+def test_put_on_path_warns_about_each_entry_it_cannot_write(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     from smc.hardware import core as core_mod
 
     monkeypatch.setenv("PATH", "/keep")
     odd = f"/mm/a{os.pathsep}b"
+    # A trailing separator reads back as an empty entry, which means the
+    # current directory: it is as unwritable as one in the middle.
+    trailing = f"/mm/d{os.pathsep}"
     with caplog.at_level(logging.WARNING, logger="smc.hardware.core"):
         core_mod._put_on_path(["/mm/c"])
-        # Control: an ordinary entry says nothing, so the record below is the
-        # entry with the separator and not the function's habit.
+        # Control: an ordinary entry says nothing, so the records below come
+        # from the entries with the separator and not from the function's habit.
         assert [r for r in caplog.records if r.name == "smc.hardware.core"] == []
-        core_mod._put_on_path([odd, "/mm/c"])
-    messages = [r.getMessage() for r in caplog.records if r.name == "smc.hardware.core"]
-    assert len(messages) == 1
-    assert (
-        f"adapter search path {odd} contains {os.pathsep!r}, "
-        "so it cannot be an entry of PATH"
-    ) in messages[0]
+        # Ordinary entries on both sides, so a loop that stops at the first
+        # odd one, or one that only looks at the first entry, shows.
+        core_mod._put_on_path(["/mm/b", odd, trailing, "/mm/c"])
+    records = [r for r in caplog.records if r.name == "smc.hardware.core"]
+    # Once per entry, each naming its own entry, at WARNING (not ERROR).
+    assert [(r.levelno, r.getMessage()) for r in records] == [
+        (logging.WARNING, _path_separator_warning(odd)),
+        (logging.WARNING, _path_separator_warning(trailing)),
+    ]
+    assert os.environ["PATH"].split(os.pathsep) == ["/mm/b", "/mm/c", "/keep"]
 
 
 @pytest.mark.usefixtures("need_mm", "restored_path")
 def test_open_core_does_not_grow_path_for_a_directory_with_the_path_separator(
-    tmp_path: Path,
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     odd = tmp_path / f"mm{os.pathsep}odd"
     try:
@@ -434,14 +453,26 @@ def test_open_core_does_not_grow_path_for_a_directory_with_the_path_separator(
     except OSError as exc:
         pytest.skip(f"cannot create a folder named with {os.pathsep!r} here: {exc}")
     after_open: list[str] = []
+    warned: list[list[str]] = []
     for _ in range(2):
-        with opened(None, adapter_search_paths=[odd]) as core:
+        caplog.clear()
+        with (
+            caplog.at_level(logging.WARNING, logger="smc.hardware.core"),
+            opened(None, adapter_search_paths=[odd]) as core,
+        ):
             after_open.append(os.environ["PATH"])
-            # MMCore still searches it, and the demo loads from behind it: the
-            # directory was kept off PATH, not refused.
+            # The list MMCore was handed starts with it, and the demo loads from
+            # behind it: the directory was kept off PATH, not refused.
             assert _search_paths(core)[0] == str(odd)
             assert core.getCameraDevice()
+        warned.append(
+            [r.getMessage() for r in caplog.records if r.name == "smc.hardware.core"]
+        )
     assert after_open[1] == after_open[0]
+    # open_core is what reaches the operator: one warning per open, no more
+    # (a second call of the helper) and no fewer (a directory filtered out
+    # before it).
+    assert warned == [[_path_separator_warning(str(odd))]] * 2
 
 
 @pytest.mark.usefixtures("need_mm", "restored_path")
