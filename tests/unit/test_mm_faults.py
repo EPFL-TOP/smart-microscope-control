@@ -119,7 +119,8 @@ def test_a_fault_message_that_is_not_utf8_can_be_encoded() -> None:
         _proxy(RuntimeError("caf\udce9")).getXPosition("XY")
     message = str(caught.value)
     assert message.encode("utf-8")
-    assert "caf" in message
+    # "replace" shows that a byte was unreadable; "ignore" would drop it silently.
+    assert "failed (caf?); " in message
     assert message.endswith(f"; {TAIL}")
 
 
@@ -274,3 +275,50 @@ def test_a_move_whose_busy_state_faults_is_stopped_and_stays_tracked(
     with pytest.raises(MotionInProgressError) as refused:
         xy.move_to_um(1.0, 2.0)
     assert "could not be read" in str(refused.value)
+
+
+def test_a_z_move_whose_command_faults_is_stopped(
+    fake_core: FakeCore,
+    fake_microscope: Microscope,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-17 for the focus drive: its own command, its own stop, its own role.
+    z = fake_microscope.require(ZStage)
+    fake_core.log.clear()
+    monkeypatch.setattr(fake_core, "setPosition", boom)
+    with pytest.raises(HardwareError) as caught:
+        z.move_to_um(5.0)
+    assert str(caught.value).startswith("focus: setPosition('Z', 5.0) failed (")
+    assert fake_core.log == ["stop('Z')"]
+
+
+def test_a_z_move_whose_busy_state_faults_is_stopped_and_stays_tracked(
+    fake_core: FakeCore,
+    fake_microscope: Microscope,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-19 and FM-17 for the focus drive: its Motion is built from the proxied core.
+    z = fake_microscope.require(ZStage)
+    fake_core.log.clear()
+    monkeypatch.setattr(fake_core, "deviceBusy", boom)
+    with pytest.raises(HardwareError) as caught:
+        z.move_to_um(5.0)
+    assert str(caught.value).startswith("focus: deviceBusy('Z') failed (")
+    assert fake_core.log == ["setPosition('Z', 5.0)", "stop('Z')"]
+    with pytest.raises(MotionInProgressError) as refused:
+        z.move_to_um(1.0)
+    assert "could not be read" in str(refused.value)
+
+
+def test_a_state_device_whose_busy_state_faults_is_a_hardware_error_naming_properties(
+    fake_core: FakeCore,
+    fake_microscope: Microscope,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A turret move through Properties.set waits on a Motion of its own
+    # (``_motion_for``), which cannot be stopped, so it must be proxied too.
+    properties = fake_microscope.require(Properties)
+    monkeypatch.setattr(fake_core, "deviceBusy", boom)
+    with pytest.raises(HardwareError) as caught:
+        properties.set("Objective", "State", "1")
+    assert str(caught.value).startswith("properties: deviceBusy('Objective') failed (")
