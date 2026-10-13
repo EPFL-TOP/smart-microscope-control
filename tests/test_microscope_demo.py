@@ -9,6 +9,7 @@ not answer, a snap that hangs. The demo devices themselves never do.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -23,6 +24,7 @@ from smc.hardware import Microscope, MicroscopeState
 from smc.hardware.capabilities import XY, Camera, Properties, Shutter, XYStage, ZStage
 from smc.hardware.errors import (
     CapabilityMissingError,
+    CoreError,
     DeviceTimeoutError,
     HardwareError,
     MicroscopeBusyError,
@@ -30,7 +32,7 @@ from smc.hardware.errors import (
     MotionStoppedError,
     SafetyRefusedError,
 )
-from smc.hardware.profile import Profile
+from smc.hardware.profile import MicroManagerSection, Profile
 from smc.hardware.roles import Role
 
 pytestmark = [pytest.mark.demo, pytest.mark.usefixtures("need_mm")]
@@ -43,6 +45,12 @@ JOIN_S = 5.0
 def need_mm(mm_available: bool) -> None:
     if not mm_available:
         pytest.skip("Micro-Manager demo adapters not installed")
+
+
+@pytest.fixture
+def restored_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Undo what ``open_core`` does to ``PATH`` for the whole process (FM-46)."""
+    monkeypatch.setenv("PATH", os.environ["PATH"])
 
 
 def _profile(*, timeout_ms: int = 60_000) -> Profile:
@@ -356,8 +364,8 @@ def test_open_releases_the_stand_when_setup_fails(
     opened: list[Any] = []
     real_open_core = microscope_mod.open_core
 
-    def recording_open_core(config: Path | None) -> Any:
-        core = real_open_core(config)
+    def recording_open_core(config: Path | None, **kwargs: Any) -> Any:
+        core = real_open_core(config, **kwargs)
         opened.append(core)
         return core
 
@@ -370,6 +378,61 @@ def test_open_releases_the_stand_when_setup_fails(
         Microscope.open("demo")
     assert len(opened) == 1
     assert list(opened[0].getLoadedDevices()) == ["Core"]
+
+
+# --- the profile's adapter search paths (#77) ---------------------------------
+
+
+def test_open_applies_the_profile_adapter_search_paths(
+    tmp_path: Path, restored_path: None
+) -> None:
+    # The issue's reproduction: the key validated, then nothing used it.
+    (tmp_path / "adapters").mkdir()
+    path = tmp_path / "stand.toml"
+    path.write_text(
+        '[microscope]\nname = "stand"\n'
+        '[micromanager]\nconfig = ""\nadapter_search_paths = ["adapters"]\n',
+        encoding="utf-8",
+    )
+    profile = Profile.load(path)
+    with Microscope.open(path) as m:
+        searched = [str(p) for p in m.core.getDeviceAdapterSearchPaths()]
+        assert searched[0] == str(profile.adapter_search_dirs()[0])
+        # The demo adapters sit behind it, in pymmcore-plus's own directory.
+        assert m.roles.get(Role.camera) is not None
+
+
+def test_open_refuses_a_missing_adapter_dir_from_a_profile_built_in_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, restored_path: None
+) -> None:
+    import pymmcore_plus
+
+    built: list[Any] = []
+
+    class Counting(pymmcore_plus.CMMCorePlus):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            built.append(self)
+
+    monkeypatch.setattr(pymmcore_plus, "CMMCorePlus", Counting)
+    missing = tmp_path / "not-there"
+    # A profile built in code never passes through Profile.load's check.
+    profile = Profile.demo().model_copy(
+        update={
+            "micromanager": MicroManagerSection(adapter_search_paths=[str(missing)])
+        }
+    )
+    with pytest.raises(CoreError) as info:
+        Microscope.open(profile)
+    assert "[micromanager] adapter_search_paths" in str(info.value)
+    assert f"adapter search path is not a directory: {missing}" in str(info.value)
+    # No core was built, so no stand connection is left open.
+    assert built == []
+    # Control: that is only worth something if the stand-in is what a valid
+    # open builds.
+    with Microscope.open(Profile.demo()):
+        pass
+    assert len(built) == 1
 
 
 # --- the core timeout and the lock timeout (FM-10, FM-15) ---------------------

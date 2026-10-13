@@ -79,7 +79,11 @@ the GUI's folder in the profile under `[micromanager]
 adapter_search_paths`. `Microscope.open` searches it before pymmcore-plus's
 folder and logs the full list at INFO. This does **not** fix a DIV
 mismatch: an adapter whose DIV differs from pymmcore-plus's does not load.
-The two DIVs must be equal first.
+The two DIVs must be equal first. MMCore takes each adapter from the first
+folder that has it, so the GUI's folder supplies **every** adapter it holds,
+not only the one you were missing: with a DIV mismatch the whole stand fails
+to load, not just that adapter. The error then lists the folders in the order
+they were searched.
 
 ### Nikon Ti2 only
 
