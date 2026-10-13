@@ -306,7 +306,16 @@ class Profile(_Section):
                 "Write an absolute path, or set HOME (USERPROFILE on Windows)."
             ) from exc
         if not path.is_absolute() and self.source is not None:
-            path = (self.source.parent / path).resolve()
+            try:
+                path = (self.source.parent / path).resolve()
+            except (OSError, ValueError) as exc:
+                # An embedded NUL, or a drive that does not answer: a
+                # ProfileError, so that a listing reports this profile and goes on.
+                raise ProfileError(
+                    f"{self.source}: micromanager.{key}: cannot resolve {entry} "
+                    f"({getattr(exc, 'strerror', None) or exc}). Write a path the "
+                    "operating system accepts."
+                ) from exc
         return path
 
 
@@ -409,6 +418,24 @@ def _read_text(path: Path) -> str:
         ) from exc
 
 
+def _exists(source: Path, key: str, target: Path, *, directory: bool) -> bool:
+    """Whether ``target`` is a file (a directory); a ``ProfileError`` if the OS will not say.
+
+    ``Path.is_file`` answers False for a path that is not there but re-raises
+    the rest: a folder this account may not search, a network share that
+    needs a login. A listing of profiles reports the profile and goes on, so
+    the loader raises only ``ProfileError`` for a problem with the file (FM-77).
+    """
+    try:
+        return target.is_dir() if directory else target.is_file()
+    except OSError as exc:
+        raise ProfileError(
+            f"{source}: micromanager.{key}: cannot look at {target} "
+            f"({exc.strerror or exc}). Check that this account may read it (a "
+            "network share may need a login)."
+        ) from exc
+
+
 def _load_file(path: Path) -> Profile:
     text = _read_text(path)
     try:
@@ -427,7 +454,7 @@ def _load_file(path: Path) -> Profile:
 
     profile.source = path.resolve()
     config = profile.config_path()
-    if config is not None and not config.is_file():
+    if config is not None and not _exists(path, "config", config, directory=False):
         raise ProfileError(
             f"{path}: micromanager.config points to {config}, which does not exist. "
             "Fix the path (relative paths resolve against the profile file; use "
@@ -441,7 +468,7 @@ def _load_file(path: Path) -> Profile:
         profile.adapter_search_dirs(),
         strict=True,
     ):
-        if not directory.is_dir():
+        if not _exists(path, "adapter_search_paths", directory, directory=True):
             looked = "" if str(directory) == entry else f" (looked for {directory})"
             raise ProfileError(
                 f"{path}: micromanager.adapter_search_paths lists {entry}, which is "

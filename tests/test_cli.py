@@ -169,6 +169,68 @@ def test_profiles_lists_a_cp1252_profile_with_its_error(
     latin = lines.index(next(line for line in lines if line.startswith("latin")))
     assert lines[latin + 1].lstrip().startswith("✗")
     assert "line 3 is not UTF-8 text" in lines[latin + 1]
+    # The path is on the name's line; the error does not repeat it.
+    shown = str((sites / "latin.toml").resolve())
+    assert shown in lines[latin]
+    assert shown not in lines[latin + 1]
+
+
+@pytest.fixture
+def unreadable_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """``sites/aaa.toml`` names an ``mm.cfg`` that exists but cannot be looked at.
+
+    ``Path.is_file`` is patched to raise, because a folder the account may not
+    search (``chmod 000``) cannot be built on Windows, nor a share that wants a
+    login anywhere (#93, FM-77). ``sites/zzz.toml`` is a good profile.
+    """
+    sites = tmp_path / "sites"
+    sites.mkdir()
+    (sites / "aaa.toml").write_text(
+        '[microscope]\nname = "aaa"\n\n[micromanager]\nconfig = "mm.cfg"\n',
+        encoding="utf-8",
+    )
+    (sites / "mm.cfg").write_text("", encoding="utf-8")
+    (sites / "zzz.toml").write_text('[microscope]\nname = "zzz"\n', encoding="utf-8")
+    real_is_file = Path.is_file
+
+    def is_file(self: Path, *args: object, **kwargs: object) -> bool:
+        if self.name == "mm.cfg":
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_is_file(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "is_file", is_file)
+    monkeypatch.chdir(tmp_path)
+    return sites
+
+
+def test_profiles_lists_a_profile_whose_config_cannot_be_looked_at_and_goes_on(
+    unreadable_config: Path,
+) -> None:
+    result = runner.invoke(
+        app, ["profiles"], env={"SMC_PROFILES": str(unreadable_config)}
+    )
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    aaa = lines.index(next(line for line in lines if line.startswith("aaa")))
+    assert lines[aaa + 1].lstrip().startswith("✗ micromanager.config: cannot look at ")
+    assert "Permission denied" in lines[aaa + 1]
+    # The profiles after it, and the search paths, are still printed.
+    assert any(line.startswith("zzz") for line in lines[aaa + 2 :])
+    assert "Search paths:" in lines
+    assert "unexpected" not in result.output
+
+
+def test_stage_get_on_a_profile_whose_config_cannot_be_looked_at_exits_1(
+    unreadable_config: Path,
+) -> None:
+    path = unreadable_config / "aaa.toml"
+
+    result = runner.invoke(app, ["stage", "get", "-p", str(path)])
+
+    assert result.exit_code == 1, result.output
+    assert f"✗ {path}: micromanager.config: cannot look at " in result.output
+    assert "unexpected" not in result.output
 
 
 def test_stage_get_on_a_cp1252_profile_exits_1_naming_the_file_and_the_line(
