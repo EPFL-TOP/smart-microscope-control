@@ -24,8 +24,9 @@ Hardware behaviour encoded here (#77):
   the search paths there, but skips one whose text occurs anywhere in ``PATH``
   (``MM-2.0`` inside ``MM-2.0.3``) and prepends the rest in reverse.
   ``open_core`` makes each directory an exact ``PATH`` entry, in search order,
-  and leaves off one whose name contains ``os.pathsep`` (it would read back as
-  two entries, more of them on every open) with a WARNING. The change lasts for
+  and writes none for one whose name contains ``os.pathsep`` (it would read back
+  as two entries, more of them on every open) but a WARNING; the pieces that
+  pymmcore-plus's override has already prepended stay. The change lasts for
   the whole process: ``close_core`` does not undo it and ``Microscope.close()``
   does not call it, because closing one core must not take a folder from under
   another that is still open (#110, design §7).
@@ -184,8 +185,13 @@ def _put_on_path(directories: Sequence[str]) -> None:
     be one entry: written as it is, it reads back as two, and each later open
     would add those two again. It is left off, with a WARNING, and MMCore still
     searches it; only a vendor DLL beside an adapter in it is not found through
-    ``PATH``. pymmcore-plus's own override has already prepended its pieces
-    once, and the next open finds them, so ``PATH`` stays bounded (#110).
+    ``PATH``. pymmcore-plus's own override has already prepended the pieces it
+    reads back as (the part before the separator is a real folder, the rest a
+    relative entry) and they stay: matching them back would also take out an
+    entry that happens to read the same. The next open finds them, so ``PATH``
+    stays bounded, except when an ordinary search path equals the first piece
+    (``a`` beside ``a<sep>b``): moving it to the front breaks the odd string
+    apart, and the override writes the pieces again on every open (#110).
 
     The change lasts for the whole process, like pymmcore-plus's own. Nothing
     takes it back when a core closes (``close_core``, and ``Microscope.close()``
@@ -240,8 +246,10 @@ def open_core(
             these only come behind them. A caller that opens stands in
             sequence and wants a clean ``PATH`` saves ``os.environ["PATH"]``
             before the first open and restores it after the last close. A
-            directory whose name contains ``os.pathsep`` stays off ``PATH``,
-            with a WARNING, and is still searched by MMCore.
+            directory whose name contains ``os.pathsep`` is not written to
+            ``PATH`` as an entry, with a WARNING, and is still searched by
+            MMCore; the pieces pymmcore-plus has already written stay (see
+            ``_put_on_path``).
 
     Returns:
         A fresh ``CMMCorePlus``. Callers own it and must release the devices
