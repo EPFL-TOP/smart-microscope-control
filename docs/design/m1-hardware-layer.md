@@ -665,9 +665,46 @@ each directory to `PATH`, because a Windows adapter loads its own DLLs
 through `PATH` (pymmcore#28). But it skips a directory whose string occurs
 anywhere in `PATH`, so `C:\MM-2.0` is skipped when `C:\MM-2.0.3\bin` is
 on it. `open_core` therefore makes every given directory an exact `PATH`
-entry (compared with `os.path.normcase`). That `PATH` change lasts for the
-whole process, like pymmcore-plus's own. A test that adds a directory
+entry (compared with `os.path.normcase`). A test that adds a directory
 restores `PATH` with `monkeypatch` (FM-46).
+
+**`PATH` is not restored when the core closes (#110).** The change lasts for
+the whole process, like pymmcore-plus's own, and `close_core` does not undo
+it. This is decided, not forgotten. Measured on the demo (2026-10-13,
+pymmcore-plus 0.18.1, macOS):
+- Constructing a `CMMCorePlus` already puts the install on `PATH`, and the
+  override only prepends. A restore would need a snapshot taken before the
+  constructor, and a count of the open cores that use each directory:
+  without the count, closing one core removes a folder from under another
+  that is still open, and that core's next vendor DLL fails to load (FM-09).
+- `Microscope.close()` calls `core.unloadAllDevices()` itself and never
+  `close_core`, so a restore inside `close_core` would not run on the main
+  path. Putting it in the facade's `close()` means changing the shutdown
+  sequence that §13 describes, for a state that only matters to a process
+  that opens several stands.
+- What a later open sees is bounded. Every open puts its own directories
+  first: after an open with extras and a later open without, the install
+  comes before the earlier extras. An earlier open's folder can only supply
+  a DLL that none of the later stand's own folders holds.
+
+One stand per process, as the CLI runs it, is not affected. A process that
+opens stands one after another and wants a clean `PATH` saves
+`os.environ["PATH"]` before the first open and restores it after the last
+close. If that becomes the normal way to use the library (a UI, a lab
+service), a scope that counts the cores using each directory is a new
+issue, not a patch of `close_core`.
+
+**A directory whose name contains `os.pathsep`** (`;` on Windows, `:` on
+POSIX, both legal in a folder name) cannot be one entry of `PATH`: written
+as it is, it reads back as two entries, and every later open added them
+again (measured: `PATH` grew by two entries per open). `open_core` leaves
+such a directory off `PATH`, logs a WARNING that names it, and MMCore still
+searches it. The WARNING text is `adapter search path <dir> contains <sep>,
+so it cannot be an entry of PATH; MMCore still searches it, but a vendor DLL
+beside an adapter in it will not be found through PATH`. pymmcore-plus's
+own override still prepends the pieces once, before `open_core` runs; the
+second open finds them and adds nothing, so `PATH` stays bounded (measured:
+24 entries after one open and after four).
 
 ## 8. Testing — `smc/testing/` and `tests/` (#9, #10)
 
