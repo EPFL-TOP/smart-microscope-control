@@ -383,3 +383,93 @@ def test_a_failed_load_says_where_the_adapter_dirs_were_searched(
     with pytest.raises(CoreError) as plain:
         open_core(config)
     assert "first wins" not in str(plain.value)
+
+
+# -- PATH: a separator inside an entry, and what outlives a close (#110) -------
+
+
+def test_put_on_path_leaves_out_an_entry_that_contains_the_separator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from smc.hardware import core as core_mod
+
+    monkeypatch.setenv("PATH", "/keep")
+    odd = f"/mm/a{os.pathsep}b"
+    core_mod._put_on_path([odd, "/mm/c"])
+    # Written as it is, the entry would read back as "/mm/a" and "b".
+    assert os.environ["PATH"].split(os.pathsep) == ["/mm/c", "/keep"]
+    # And every later open would add those two pieces again.
+    core_mod._put_on_path([odd, "/mm/c"])
+    assert os.environ["PATH"].split(os.pathsep) == ["/mm/c", "/keep"]
+
+
+def test_put_on_path_warns_about_an_entry_it_cannot_write(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from smc.hardware import core as core_mod
+
+    monkeypatch.setenv("PATH", "/keep")
+    odd = f"/mm/a{os.pathsep}b"
+    with caplog.at_level(logging.WARNING, logger="smc.hardware.core"):
+        core_mod._put_on_path(["/mm/c"])
+        # Control: an ordinary entry says nothing, so the record below is the
+        # entry with the separator and not the function's habit.
+        assert [r for r in caplog.records if r.name == "smc.hardware.core"] == []
+        core_mod._put_on_path([odd, "/mm/c"])
+    messages = [r.getMessage() for r in caplog.records if r.name == "smc.hardware.core"]
+    assert len(messages) == 1
+    assert (
+        f"adapter search path {odd} contains {os.pathsep!r}, "
+        "so it cannot be an entry of PATH"
+    ) in messages[0]
+
+
+@pytest.mark.usefixtures("need_mm", "restored_path")
+def test_open_core_does_not_grow_path_for_a_directory_with_the_path_separator(
+    tmp_path: Path,
+) -> None:
+    odd = tmp_path / f"mm{os.pathsep}odd"
+    try:
+        odd.mkdir()
+    except OSError as exc:
+        pytest.skip(f"cannot create a folder named with {os.pathsep!r} here: {exc}")
+    after_open: list[str] = []
+    for _ in range(2):
+        with opened(None, adapter_search_paths=[odd]) as core:
+            after_open.append(os.environ["PATH"])
+            # MMCore still searches it, and the demo loads from behind it: the
+            # directory was kept off PATH, not refused.
+            assert _search_paths(core)[0] == str(odd)
+            assert core.getCameraDevice()
+    assert after_open[1] == after_open[0]
+
+
+@pytest.mark.usefixtures("need_mm", "restored_path")
+def test_open_core_leaves_an_earlier_opens_directories_on_path_behind_its_own(
+    tmp_path: Path,
+) -> None:
+    # Decided in design §7 (#110): PATH is process-wide and close_core does not
+    # restore it. What bounds the effect is the order, so that is pinned too.
+    extra = _adapters_dir(tmp_path)
+    with opened(None, adapter_search_paths=[extra]) as core:
+        written = _search_paths(core)[0]
+    assert written in os.environ["PATH"].split(os.pathsep)
+    with opened(None):
+        pass
+    entries = os.environ["PATH"].split(os.pathsep)
+    assert entries.index(_default_search_paths()[0]) < entries.index(written)
+
+
+@pytest.mark.usefixtures("need_mm", "restored_path")
+def test_reopening_with_the_same_extras_leaves_path_as_the_first_open_made_it(
+    tmp_path: Path,
+) -> None:
+    # The normal case was always idempotent; the decision above relies on it,
+    # since a process that opens the same stand again must not grow PATH.
+    extra = _adapters_dir(tmp_path)
+    with opened(None, adapter_search_paths=[extra]):
+        pass
+    after_first = os.environ["PATH"]
+    with opened(None, adapter_search_paths=[extra]):
+        pass
+    assert os.environ["PATH"] == after_first
