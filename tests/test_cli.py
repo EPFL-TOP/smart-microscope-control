@@ -148,6 +148,43 @@ def test_profiles_lists_smc_profiles_and_reports_an_invalid_one(
     assert searched[0].strip() == str(sites)
 
 
+def test_profiles_lists_a_cp1252_profile_with_its_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Notepad's "ANSI" (FM-80): the listing says what is wrong with the file
+    # and goes on, as it does for any other profile that does not load.
+    sites = tmp_path / "sites"
+    sites.mkdir()
+    (sites / "latin.toml").write_bytes(
+        '[microscope]\nname = "t"\n# café\n'.encode("cp1252")
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["profiles"], env={"SMC_PROFILES": str(sites)})
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    latin = lines.index(next(line for line in lines if line.startswith("latin")))
+    assert lines[latin + 1].lstrip().startswith("✗")
+    assert "line 3 is not UTF-8 text" in lines[latin + 1]
+
+
+def test_stage_get_on_a_cp1252_profile_exits_1_naming_the_file_and_the_line(
+    tmp_path: Path,
+) -> None:
+    # The report of #93: this printed "✗ unexpected UnicodeDecodeError: …", with
+    # no file name, and asked the operator to file an issue.
+    path = tmp_path / "latin.toml"
+    path.write_bytes('[microscope]\n# café\nname = "t"\n'.encode("cp1252"))
+
+    result = runner.invoke(app, ["stage", "get", "-p", str(path)])
+
+    assert result.exit_code == 1, result.output
+    assert f"✗ {path}: line 2 is not UTF-8 text (" in result.output
+    assert "Save the file as UTF-8" in result.output
+    assert "unexpected" not in result.output
+
+
 def test_missing_profile_exits_1_with_the_search_paths(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
