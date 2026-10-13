@@ -538,3 +538,56 @@ def test_list_profiles_first_search_path_wins(
         ("stand", env_profile.resolve()),
         ("zeiss", (isolated / "profiles" / "zeiss.toml").resolve()),
     ]
+
+
+# -- text encoding (#93, FM-80) -----------------------------------------------
+
+_BOM = b"\xef\xbb\xbf"
+
+
+def test_a_profile_saved_as_cp1252_is_a_profile_error_naming_file_and_line(
+    tmp_path: Path,
+) -> None:
+    # The bad byte is on line 4, so the line number is counted, not a default.
+    path = tmp_path / "latin.toml"
+    path.write_bytes('[microscope]\nname = "t"\n\n# café\n'.encode("cp1252"))
+    with pytest.raises(ProfileError) as caught:
+        Profile.load(path)
+    message = str(caught.value)
+    assert message.startswith(f"{path}: line 4 is not UTF-8 text (")
+    assert "Save the file as UTF-8" in message
+    assert isinstance(caught.value.__cause__, UnicodeDecodeError)
+
+
+def test_a_profile_saved_as_utf16_is_a_profile_error(tmp_path: Path) -> None:
+    path = tmp_path / "wide.toml"
+    path.write_bytes('[microscope]\nname = "t"\n'.encode("utf-16"))
+    with pytest.raises(ProfileError, match="line 1 is not UTF-8 text"):
+        Profile.load(path)
+
+
+def test_a_utf8_profile_with_a_byte_order_mark_loads(tmp_path: Path) -> None:
+    path = tmp_path / "marked.toml"
+    path.write_bytes(_BOM + '[microscope]\nname = "café"\n'.encode())
+    assert Profile.load(path).microscope.name == "café"
+
+
+def test_list_profiles_reads_a_file_with_a_byte_order_mark(isolated: Path) -> None:
+    profile = isolated / "stand.toml"
+    profile.write_bytes(_BOM + b'[microscope]\nname = "t"\n')
+    (isolated / "pyproject.toml").write_bytes(_BOM + b'[project]\nname = "x"\n')
+    assert list_profiles() == [("stand", profile.resolve())]
+
+
+def test_a_marked_profile_that_then_is_not_utf8_names_the_right_byte_and_line(
+    tmp_path: Path,
+) -> None:
+    # utf-8-sig reports the offset after the three bytes of the mark, so the
+    # offending byte and its line come from the stripped data, not from the file.
+    path = tmp_path / "marked-latin.toml"
+    path.write_bytes(_BOM + '[microscope]\nname = "t"\n# café\n'.encode("cp1252"))
+    with pytest.raises(ProfileError) as caught:
+        Profile.load(path)
+    message = str(caught.value)
+    assert message.startswith(f"{path}: line 3 is not UTF-8 text (")
+    assert "byte 0xe9" in message

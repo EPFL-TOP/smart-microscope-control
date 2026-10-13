@@ -252,8 +252,10 @@ class Profile(_Section):
         :meth:`demo` when no ``demo.toml`` is found.
 
         Raises:
-            ProfileError: the file is missing, unreadable, not TOML, or does
-                not validate. The message names the file, the key and the fix.
+            ProfileError: the file is missing, unreadable, not UTF-8 (a
+                UTF-8 byte-order mark is accepted), not TOML, or does not
+                validate. The message names the file, the key or line and the
+                fix.
         """
         if _is_path(source):
             return _load_file(Path(source))
@@ -345,8 +347,8 @@ def _may_be_profile(path: Path) -> bool:
     stays listed: loading it is how its owner learns what is wrong.
     """
     try:
-        data = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        data = tomllib.loads(_read_text(path))
+    except (ProfileError, tomllib.TOMLDecodeError):
         return True
     return "microscope" in data
 
@@ -378,14 +380,37 @@ def _not_found_message(name: str) -> str:
     )
 
 
-def _load_file(path: Path) -> Profile:
+def _read_text(path: Path) -> str:
+    """The profile's text, or a ``ProfileError`` that says what to do about the file.
+
+    Read as bytes and decoded as ``utf-8-sig``: Notepad before Windows 10 1903
+    starts a "UTF-8" file with a byte-order mark, which ``tomllib`` refuses
+    with an error at a line that is fine, and it also offers cp1252 and
+    UTF-16, which no decoder here can tell from a typo (FM-80).
+    """
     try:
-        text = path.read_text(encoding="utf-8")
+        raw = path.read_bytes()
     except OSError as exc:
         raise ProfileError(
             f"{path}: cannot read profile ({exc.strerror or exc}). "
             "Check the path, or load it by name from one of the search paths."
         ) from exc
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        # ``exc.start`` indexes ``exc.object``, which for utf-8-sig is the data
+        # after the mark: ``raw`` would name a byte three places off.
+        seen: bytes = exc.object
+        line = seen.count(b"\n", 0, exc.start) + 1
+        raise ProfileError(
+            f"{path}: line {line} is not UTF-8 text ({exc.reason}, byte "
+            f"0x{seen[exc.start]:02x}). Save the file as UTF-8 "
+            "(Notepad: File > Save As > Encoding: UTF-8)."
+        ) from exc
+
+
+def _load_file(path: Path) -> Profile:
+    text = _read_text(path)
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
