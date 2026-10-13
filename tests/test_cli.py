@@ -23,8 +23,10 @@ from typer.testing import CliRunner
 from smc import __version__
 from smc.cli import app
 from smc.hardware import Microscope
+from smc.hardware import microscope as microscope_mod
 from smc.hardware.backends.mm import MMXYStage
 from smc.hardware.capabilities import XY
+from smc.hardware.errors import HardwareError
 from smc.hardware.microscope import MicroscopeState
 
 runner = CliRunner(env={"COLUMNS": "200", "SMC_PROFILE": None, "SMC_PROFILES": None})
@@ -669,6 +671,54 @@ def test_debug_lets_the_traceback_through() -> None:
     result = runner.invoke(app, ["--debug", "stage", "get"])
 
     assert isinstance(result.exception, ValueError), result.output
+
+
+class _FaultyCore:
+    """The demo core, except that reading the X position raises, as a dead serial line does."""
+
+    def __init__(self, core: object) -> None:
+        self._core = core
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._core, name)
+
+    def getXPosition(self, label: str | None = None) -> float:  # noqa: N802 - MMCore's name
+        raise RuntimeError("[COM3] Serial port timed out")
+
+
+@pytest.fixture
+def faulty_core(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The fault is raised by the *core*: patching MMXYStage.position_um, as
+    # broken_position does, would skip the layer this test is about (FM-79).
+    real_open_core = microscope_mod.open_core
+
+    def wrapped(config: object = None, **kwargs: object) -> _FaultyCore:
+        return _FaultyCore(real_open_core(config, **kwargs))  # type: ignore[arg-type]
+
+    monkeypatch.setattr(microscope_mod, "open_core", wrapped)
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo", "faulty_core")
+def test_a_device_fault_exits_1_naming_the_role_and_the_call() -> None:
+    result = runner.invoke(app, ["stage", "get"])
+
+    assert result.exit_code == 1, result.output
+    # The bracket proves the message is printed as text, not as rich markup (FM-36).
+    assert (
+        "✗ xy_stage: getXPosition('XY') failed ([COM3] Serial port timed out); "
+        "check the device: power, cable, another program holding it"
+    ) in result.output
+    assert "unexpected" not in result.output
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo", "faulty_core")
+def test_debug_shows_the_device_fault_chained_from_the_core_error() -> None:
+    result = runner.invoke(app, ["--debug", "stage", "get"])
+
+    assert type(result.exception) is HardwareError, result.output
+    assert type(result.exception.__cause__) is RuntimeError
 
 
 @pytest.mark.demo

@@ -50,7 +50,12 @@ def test_state_fills_what_it_can_when_z_fails(
     fake_core.failing["Z"] = RuntimeError("Z: no answer")
     state = fake_microscope.state()
     assert state.z_um is None
-    assert "z: RuntimeError: Z: no answer" in state.errors
+    # The fault is a HardwareError naming the role and the call (#93); the
+    # "<name>: <type>: <message>" format of the entry is unchanged.
+    assert len(state.errors) == 1
+    assert state.errors[0].startswith(
+        "z: HardwareError: focus: getPosition('Z') failed (Z: no answer)"
+    )
     assert state.xy is not None
     assert state.exposure_ms is not None
     assert state.shutter_open is not None
@@ -423,8 +428,8 @@ def test_put_back_names_every_item_it_could_not_restore(
     # An ordinary failure: the run carries on, so it must not end the session.
     assert type(caught.value) is RuntimeError
     message = str(caught.value)
-    assert "xy: RuntimeError('xy: no answer')" in message
-    assert "z: RuntimeError('z: no answer')" in message
+    assert "xy_stage: getXPosition('XY') failed (xy: no answer)" in message
+    assert "focus: getPosition('Z') failed (z: no answer)" in message
     assert caught.value.__cause__ is not None
 
 
@@ -446,5 +451,8 @@ def test_put_back_of_a_halted_stand_reports_a_failed_stop_and_a_failed_close(
     fake_core.failing.clear()
     message = str(caught.value)
     assert "stop: HardwareError(" in message
-    assert "xy: no stop" in message
-    assert "shutter close: RuntimeError('shutter: stuck')" in message
+    # The stop note repeats a message with both quote styles, so repr escapes
+    # the quotes there: the fragments below hold none.
+    assert "failed (xy: no stop)" in message
+    assert "shutter close: HardwareError(" in message
+    assert "failed (shutter: stuck)" in message
