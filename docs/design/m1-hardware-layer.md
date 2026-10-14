@@ -520,6 +520,8 @@ read at action time, `getStateLabel` for the pixel-size map, goes through
 the same proxy. Not translated: what `Microscope.__init__` reads from the
 core (the registry of devices and slots, no device I/O; a failure there
 already closes the stand), `close()` (logged), and `smc.discovery`.
+`smc doctor --config`, which has no profile and so no role, reads its raw core
+through the same proxy under the name `core` (#120).
 
 Mutations go through `executor.do(description, action, dry_result=…)`
 (moves and moving `Properties.set` pass `motion=`, §13); reads through
@@ -1135,7 +1137,7 @@ negative number (`smc stage jog -100 0`) parses as an unknown option.
 | Command | Does |
 |---|---|
 | `smc profiles` | one line per profile found on the search paths (name, path or `(built in)`, and the error of one that does not load), then the search paths |
-| `smc doctor [-p]` | MM status, then open the profile and print `RoleMap.describe()` and the role warnings; `--config CFG` keeps the raw `.cfg` check |
+| `smc doctor [-p]` | MM status, then open the profile and print `RoleMap.describe()` and the role warnings; `--config CFG` keeps the raw `.cfg` check, and a device fault in its reads is one `✗ core: <call>(<args>) failed (…)` line under the role table, exit 1 (#120) |
 | `smc devices [-p]` | one line per device (label, type, library/name, roles), then `RoleMap.describe()` and the warnings |
 | `smc stage get` / `stage move X Y` / `stage jog DX DY [--force]` | `XYStage` |
 | `smc z get` / `z move Z` / `z jog DZ [--force]` | `ZStage`; `z jog` is guarded by `safety.max_z_jog_um` (#84), and the soft limits apply |

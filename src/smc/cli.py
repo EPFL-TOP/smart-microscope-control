@@ -28,6 +28,7 @@ from rich.text import Text
 
 from smc import __version__
 from smc.hardware import core as core_mod
+from smc.hardware.backends.mm import as_hardware_errors
 from smc.hardware.capabilities import XY, Camera, Shutter, XYStage, ZStage
 from smc.hardware.errors import HardwareError, ProfileError, SafetyRefusedError
 from smc.hardware.microscope import Microscope, MicroscopeState
@@ -449,25 +450,36 @@ def doctor(
         return
 
     target = str(config)
-    try:
-        with core_mod.opened(config) as core:
-            roles = {
-                "camera": core.getCameraDevice(),
-                "xy stage": core.getXYStageDevice(),
-                "focus": core.getFocusDevice(),
-                "autofocus": core.getAutoFocusDevice(),
-                "shutter": core.getShutterDevice(),
-            }
-            rt = Table(title=f"Core roles — {target}", show_header=False, box=None)
-            for role, device in roles.items():
-                rt.add_row(role, device or "[yellow]— not set —[/yellow]")
-            if roles["xy stage"]:
-                x, y = core.getXYPosition()
+    # No profile, so no role: the raw core is read through the same proxy
+    # under the name "core" (#120). _reported wraps the whole block, so the
+    # core is released before the one line is printed, and a bug that is not
+    # a device fault is reported like on every other command.
+    with _reported(ctx), core_mod.opened(config) as core:
+        reads = as_hardware_errors(core, "core")
+        roles = {
+            "camera": reads.getCameraDevice(),
+            "xy stage": reads.getXYStageDevice(),
+            "focus": reads.getFocusDevice(),
+            "autofocus": reads.getAutoFocusDevice(),
+            "shutter": reads.getShutterDevice(),
+        }
+        rt = Table(title=f"Core roles — {target}", show_header=False, box=None)
+        for role, device in roles.items():
+            rt.add_row(role, device or "[yellow]— not set —[/yellow]")
+        # A fault on the position read is a finding, not the end of the
+        # inventory: the table still says which device is the XY stage, hence
+        # which cable. One read decides the table and the verdict (FM-39).
+        fault: HardwareError | None = None
+        if roles["xy stage"]:
+            try:
+                x, y = reads.getXYPosition()
+            except HardwareError as exc:
+                fault = exc
+            else:
                 rt.add_row("xy position", f"({x:.1f}, {y:.1f}) µm")
-            console.print(rt)
-    except core_mod.CoreError as exc:
-        _fail(str(exc))
-        raise typer.Exit(code=1) from None
+        console.print(rt)
+        if fault is not None:
+            raise fault
     _ok(f"{target} loads and answers.")
 
 
