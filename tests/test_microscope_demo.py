@@ -400,6 +400,10 @@ def test_open_applies_the_profile_adapter_search_paths(
         assert searched[0] == str(profile.adapter_search_dirs()[0])
         # The demo adapters sit behind it, in pymmcore-plus's own directory.
         assert m.roles.get(Role.camera) is not None
+    # Decided in design section 7 (#110): closing the stand does not take its
+    # folders off PATH. close() unloads the devices itself and never calls
+    # close_core, so the pin in test_demo_core.py does not cover this path.
+    assert searched[0] in os.environ["PATH"].split(os.pathsep)
 
 
 def test_open_refuses_a_missing_adapter_dir_from_a_profile_built_in_code(

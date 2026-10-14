@@ -23,7 +23,13 @@ Hardware behaviour encoded here (#77):
 * **A Windows adapter loads its own DLLs through ``PATH``.** pymmcore-plus puts
   the search paths there, but skips one whose text occurs anywhere in ``PATH``
   (``MM-2.0`` inside ``MM-2.0.3``) and prepends the rest in reverse.
-  ``open_core`` makes each directory an exact ``PATH`` entry, in search order.
+  ``open_core`` makes each directory an exact ``PATH`` entry, in search order,
+  and writes none for one whose name contains ``os.pathsep`` (it would read back
+  as two entries, more of them on every open) but a WARNING; the pieces that
+  pymmcore-plus's override has already prepended stay. The change lasts for
+  the whole process: ``close_core`` does not undo it and ``Microscope.close()``
+  does not call it, because closing one core must not take a folder from under
+  another that is still open (#110, design §7).
 """
 
 from __future__ import annotations
@@ -174,12 +180,45 @@ def _put_on_path(directories: Sequence[str]) -> None:
     adds the search paths there, but by substring (so ``MM-2.0`` is skipped
     when ``MM-2.0.3`` is on ``PATH``) and one by one (so two directories end up
     in reverse order, and the later one would win a DLL that both hold).
+
+    A directory whose name contains ``os.pathsep`` (legal on every OS) cannot
+    be one entry: written as it is, it reads back as two, and each later open
+    would add those two again. It is left off, with a WARNING, and MMCore still
+    searches it; only a vendor DLL beside an adapter in it is not found through
+    ``PATH``. pymmcore-plus's own override has already prepended the pieces it
+    reads back as (the part before the separator is a real folder, the rest a
+    relative entry) and they stay: matching them back would also take out an
+    entry that happens to read the same. The next open finds them, so ``PATH``
+    stays bounded, except when an ordinary search path equals the first piece
+    (``a`` beside ``a<sep>b``): moving it to the front breaks the odd string
+    apart, and the override writes the pieces again on every open (#110).
+
+    The change lasts for the whole process, like pymmcore-plus's own. Nothing
+    takes it back when a core closes (``close_core``, and ``Microscope.close()``
+    does not call it): that would need a count of the open cores that use each
+    directory, or closing one core would remove a folder from under another
+    one that is still open. A later open puts its own directories first, so an
+    earlier open's only come behind them (design §7). A caller that opens stands
+    in sequence and wants a clean ``PATH`` saves ``os.environ["PATH"]`` before
+    the first open and restores it after the last close.
     """
+    writable: list[str] = []
+    for directory in directories:
+        if os.pathsep in directory:
+            log.warning(
+                "adapter search path %s contains %r, so it cannot be an entry of "
+                "PATH; MMCore still searches it, but a vendor DLL beside an "
+                "adapter in it will not be found through PATH",
+                directory,
+                os.pathsep,
+            )
+        else:
+            writable.append(directory)
     current = os.environ.get("PATH", "")
     entries = current.split(os.pathsep) if current else []
-    wanted = {os.path.normcase(d) for d in directories}
+    wanted = {os.path.normcase(d) for d in writable}
     rest = [e for e in entries if os.path.normcase(e) not in wanted]
-    updated = os.pathsep.join([*directories, *rest])
+    updated = os.pathsep.join([*writable, *rest])
     if updated != current:
         os.environ["PATH"] = updated
 
@@ -201,8 +240,16 @@ def open_core(
             ``.cfg`` needs an adapter that only an installed MMStudio has.
             A repeated directory keeps its first place. The directories
             are put on ``PATH`` for the whole process, as pymmcore-plus does,
-            and ``close_core`` does not take them off, since another core may
-            need them.
+            and ``close_core`` does not take them off (nor does
+            ``Microscope.close()``, which never calls it), since another core
+            may need them. A later open puts its own directories first, so
+            these only come behind them. A caller that opens stands in
+            sequence and wants a clean ``PATH`` saves ``os.environ["PATH"]``
+            before the first open and restores it after the last close. A
+            directory whose name contains ``os.pathsep`` is not written to
+            ``PATH`` as an entry, with a WARNING, and is still searched by
+            MMCore; the pieces pymmcore-plus has already written stay (see
+            ``_put_on_path``).
 
     Returns:
         A fresh ``CMMCorePlus``. Callers own it and must release the devices
