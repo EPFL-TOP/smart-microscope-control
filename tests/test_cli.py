@@ -12,6 +12,7 @@ import os
 import re
 import stat
 import sys
+from collections import Counter
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -805,32 +806,51 @@ def test_doctor_prints_the_translated_fault_it_read() -> None:
 # --- doctor --config -------------------------------------------------------------
 
 
+#: Printed by the fake when the core is released, so that the output shows
+#: whether the stand was let go before or after the ``✗`` line.
+_UNLOADED = "-- unloadAllDevices --"
+
+#: What the demo's configuration answers for each row of the role table.
+_DEMO_CORE_ROLES = {
+    "camera": "Camera",
+    "xy stage": "XY",
+    "focus": "Z",
+    "autofocus": "Autofocus",
+    "shutter": "White Light Shutter",
+}
+
+
 class _FailingCore:
-    """The demo core, except that the named calls raise and every release is counted.
+    """The demo core, except that the named calls raise; it counts calls and releases.
 
     ``doctor --config`` has no profile, so what fails is chosen per MMCore call:
     ``getXYPosition`` is the serial read of a dead line, ``getFocusDevice``
-    stands for a bug that is not a device fault.
+    stands for a bug that is not a device fault. ``calls`` is how a test sees
+    that one read decided both the table and the verdict (FM-39).
     """
 
     def __init__(self, core: object, fails: dict[str, Exception]) -> None:
         self._core = core
         self._fails = fails
+        self.calls: Counter[str] = Counter()
         self.unloads = 0
 
     def __getattr__(self, name: str) -> object:
         attr = getattr(self._core, name)
-        if name not in self._fails:
+        if not callable(attr):
             return attr
-        error = self._fails[name]
 
-        def fail(*args: object, **kwargs: object) -> object:
-            raise error
+        def call(*args: object, **kwargs: object) -> object:
+            self.calls[name] += 1
+            if name in self._fails:
+                raise self._fails[name]
+            return attr(*args, **kwargs)
 
-        return fail
+        return call
 
     def unloadAllDevices(self) -> None:  # noqa: N802 - MMCore's name
         self.unloads += 1
+        print(_UNLOADED)
         self._core.unloadAllDevices()  # type: ignore[attr-defined]
 
 
@@ -843,15 +863,24 @@ def config_core(
     The seam is ``core.open_core``, which ``core.opened`` calls: the demo is
     opened whatever path the command is given, so no real stand and no
     install detection is involved (FM-40). The returned list holds the cores
-    the command opened.
+    the command opened. The XY stage sits at (10, 20) µm, so that a swapped X
+    and Y cannot read the same; ``no_xy_stage=True`` clears the core's XY
+    stage, as on a stand that has none.
     """
     real_open_core = core_mod.open_core
 
-    def install(**fails: Exception) -> list[_FailingCore]:
+    def install(*, no_xy_stage: bool = False, **fails: Exception) -> list[_FailingCore]:
         opened: list[_FailingCore] = []
 
         def wrapped(config: object = None, **kwargs: object) -> _FailingCore:
-            core = _FailingCore(real_open_core(None), fails)
+            real = real_open_core(None)
+            real.setXYPosition(10.0, 20.0)
+            # The demo stage simulates its travel: read at once, it is
+            # a fraction of the way there.
+            real.waitForSystem()
+            if no_xy_stage:
+                real.setXYStageDevice("")
+            core = _FailingCore(real, fails)
             opened.append(core)
             return core
 
@@ -876,15 +905,50 @@ def _fail_lines(output: str) -> list[str]:
 def test_doctor_config_prints_the_core_roles_and_the_position(
     tmp_path: Path, config_core: Callable[..., list[_FailingCore]]
 ) -> None:
-    config_core()
+    opened = config_core()
 
     result = _doctor_config(tmp_path)
 
     assert result.exit_code == 0, result.output
-    # The digits of the position are #94's (-0.0), not pinned here.
-    assert re.search(r"^\s*xy stage\s+XY\s*$", result.output, re.M), result.output
-    assert re.search(r"^\s*xy position\s+\(", result.output, re.M), result.output
+    # One row per role, from its own call: the labels differ, so a row fed by
+    # the wrong getter shows.
+    for role, label in _DEMO_CORE_ROLES.items():
+        assert re.search(rf"^\s*{role}\s+{label}\s*$", result.output, re.M), role
+    # X before Y. The decimals are #94's (it may print two): not pinned.
+    assert re.search(r"^\s*xy position\s+\(10\.0+, 20\.0+\)", result.output, re.M), (
+        result.output
+    )
     assert "loads and answers" in result.output
+    # One read of each decides the table and the verdict (FM-39): a flaky line
+    # cannot show "xy stage XY" and then skip the position, or the reverse.
+    (core,) = opened
+    reads = ["getCameraDevice", "getXYStageDevice", "getFocusDevice"]
+    reads += ["getAutoFocusDevice", "getShutterDevice", "getXYPosition"]
+    assert {name: core.calls[name] for name in reads} == dict.fromkeys(reads, 1)
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_doctor_config_without_an_xy_stage_reads_no_position_and_passes(
+    tmp_path: Path, config_core: Callable[..., list[_FailingCore]]
+) -> None:
+    # MMCore raises on getXYPosition() with no XY stage; the proxy would make
+    # that a ✗, and a healthy camera-only stand would fail a script that gates
+    # on doctor.
+    opened = config_core(
+        no_xy_stage=True, getXYPosition=RuntimeError('No device with label ""')
+    )
+
+    result = _doctor_config(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert re.search(r"^\s*xy stage\s+— not set —\s*$", result.output, re.M), (
+        result.output
+    )
+    assert "xy position" not in result.output
+    assert _fail_lines(result.output) == []
+    assert "loads and answers" in result.output
+    assert opened[0].calls["getXYPosition"] == 0
 
 
 @pytest.mark.demo
@@ -919,46 +983,70 @@ def test_doctor_config_releases_the_core_when_a_read_faults(
     tmp_path: Path, config_core: Callable[..., list[_FailingCore]]
 ) -> None:
     # A Nikon stand takes one connection at a time: the core is released
-    # before the next command, or the next smc cannot connect.
+    # before the next command, or the next smc cannot connect. And before the
+    # line is printed (design §9), so the diagnosis never waits on a release
+    # that blocks on a dead serial line.
     opened = config_core(getXYPosition=RuntimeError("[COM3] Serial port timed out"))
 
     result = _doctor_config(tmp_path)
 
     assert result.exit_code == 1, result.output
     assert [core.unloads for core in opened] == [1]
+    assert result.output.index(_UNLOADED) < result.output.index("✗ core:")
 
 
 @pytest.mark.demo
 @pytest.mark.usefixtures("demo")
+@pytest.mark.parametrize("failing_call", ["getFocusDevice", "getXYPosition"])
 def test_doctor_config_an_unexpected_error_is_one_line(
-    tmp_path: Path, config_core: Callable[..., list[_FailingCore]]
+    failing_call: str,
+    tmp_path: Path,
+    config_core: Callable[..., list[_FailingCore]],
 ) -> None:
     # Not a device fault, so the proxy lets it through: what reports it is
-    # _reported around the branch, like every other command.
-    config_core(getFocusDevice=ValueError("boom"))
+    # _reported around the branch, like every other command. The position read
+    # catches a HardwareError and nothing wider: a bug there is not turned into
+    # a finding under the role table.
+    config_core(**{failing_call: ValueError("boom")})
 
     result = _doctor_config(tmp_path)
 
     assert result.exit_code == 1, result.output
     assert "✗ unexpected ValueError: boom" in result.output
     assert "Traceback" not in result.output
+    assert "Core roles" not in result.output
 
 
 @pytest.mark.demo
 @pytest.mark.usefixtures("demo")
+@pytest.mark.parametrize(
+    "failing_call",
+    [
+        "getCameraDevice",
+        "getXYStageDevice",
+        "getFocusDevice",
+        "getAutoFocusDevice",
+        "getShutterDevice",
+    ],
+)
 def test_doctor_config_a_registry_read_that_faults_is_one_line(
-    tmp_path: Path, config_core: Callable[..., list[_FailingCore]]
+    failing_call: str,
+    tmp_path: Path,
+    config_core: Callable[..., list[_FailingCore]],
 ) -> None:
-    config_core(getCameraDevice=RuntimeError("[COM3] Serial port timed out"))
+    # Each of the five reads goes through the proxy: left on the raw core, a
+    # serial fault there would be "unexpected RuntimeError ... file an issue".
+    config_core(**{failing_call: RuntimeError("[COM3] Serial port timed out")})
 
     result = _doctor_config(tmp_path)
 
     assert result.exit_code == 1, result.output
     assert (
-        "✗ core: getCameraDevice() failed ([COM3] Serial port timed out)"
+        f"✗ core: {failing_call}() failed ([COM3] Serial port timed out)"
         in result.output
     )
     assert len(_fail_lines(result.output)) == 1, result.output
+    assert "unexpected" not in result.output
     # The registry is read before the table: a fault there prints no table.
     assert "Core roles" not in result.output
     assert "xy stage" not in result.output
