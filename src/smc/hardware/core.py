@@ -294,6 +294,7 @@ def open_core(
         try:
             core.loadSystemConfiguration()
         except Exception as exc:
+            _unload_after_failed_load(core)
             raise CoreError(
                 f"could not load the demo configuration: {exc}{searched}"
             ) from exc
@@ -305,8 +306,23 @@ def open_core(
     try:
         core.loadSystemConfiguration(str(path))
     except Exception as exc:
+        _unload_after_failed_load(core)
         raise CoreError(f"could not load {path}: {exc}{searched}") from exc
     return core
+
+
+def _unload_after_failed_load(core: CMMCorePlus) -> None:
+    """Release the devices a failed load had already opened (FM-49).
+
+    MMCore loads a ``.cfg`` line by line, so a bad last line leaves the earlier
+    devices loaded, and their serial ports held. A long-lived process would
+    then fail its next open with "port in use". A failure here is logged and
+    not raised, so the caller's original error is the one the operator sees.
+    """
+    try:
+        core.unloadAllDevices()
+    except Exception:
+        log.warning("could not unload the devices of a failed load", exc_info=True)
 
 
 def close_core(core: CMMCorePlus) -> None:

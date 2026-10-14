@@ -385,6 +385,33 @@ def test_a_failed_load_says_where_the_adapter_dirs_were_searched(
     assert "first wins" not in str(plain.value)
 
 
+@pytest.mark.usefixtures("restored_path")
+def test_a_failed_load_releases_the_devices_it_had_loaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pymmcore_plus
+
+    # MMCore loads a .cfg line by line: a bad last line leaves the devices before
+    # it loaded, holding their serial ports. A long-lived process must not keep them.
+    unloads: list[int] = []
+
+    class HalfLoaded(pymmcore_plus.CMMCorePlus):
+        def loadSystemConfiguration(  # noqa: N802 - MMCore API
+            self, *args: Any, **kwargs: Any
+        ) -> Any:
+            raise RuntimeError("Device not found: NoSuchDevice")
+
+        def unloadAllDevices(self) -> None:  # noqa: N802 - MMCore API
+            unloads.append(1)
+
+    monkeypatch.setattr(pymmcore_plus, "CMMCorePlus", HalfLoaded)
+    config = tmp_path / "scope.cfg"
+    config.write_text("# a device line would go here\n", encoding="utf-8")
+    with pytest.raises(CoreError, match="Device not found: NoSuchDevice"):
+        open_core(config)
+    assert len(unloads) == 1, "a failed load left its devices loaded"
+
+
 # -- PATH: a separator inside an entry, and what outlives a close (#110) -------
 
 
