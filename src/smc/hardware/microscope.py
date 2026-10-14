@@ -48,6 +48,7 @@ from smc.hardware.backends.mm import (
     MMShutter,
     MMXYStage,
     MMZStage,
+    as_hardware_errors,
 )
 from smc.hardware.capabilities import XY, Camera, Properties, Shutter, XYStage, ZStage
 from smc.hardware.core import close_core, open_core
@@ -332,7 +333,7 @@ class Microscope:
         turret = self.roles.get(Role.objective_turret)
         if turret is None:
             return lambda: None
-        core = self.core
+        core = as_hardware_errors(self.core, Role.objective_turret.value)
         return lambda: str(core.getStateLabel(turret))
 
     # --- state -------------------------------------------------------------
