@@ -702,9 +702,22 @@ such a directory off `PATH`, logs a WARNING that names it, and MMCore still
 searches it. The WARNING text is `adapter search path <dir> contains <sep>,
 so it cannot be an entry of PATH; MMCore still searches it, but a vendor DLL
 beside an adapter in it will not be found through PATH`. pymmcore-plus's
-own override still prepends the pieces once, before `open_core` runs; the
-second open finds them and adds nothing, so `PATH` stays bounded (measured:
-24 entries after one open and after four).
+own override has already prepended the pieces it reads the string back as
+(the part before the separator is a real folder, the rest a relative entry)
+before `open_core` runs, and they stay on `PATH` after `close_core`:
+matching them back would also remove an entry that happens to read the
+same. With one odd directory the next open finds them and adds nothing, so
+`PATH` is bounded (measured 2026-10-14, pymmcore-plus 0.18.1, macOS: 24
+entries after one open and after four, and after `close_core`). It is
+**not** bounded when an ordinary search path equals the first piece (`a`
+beside `a<sep>b`): moving `a` to the front breaks the odd string apart,
+and the override writes the pieces again on every open (24, 25, 26, 27, 28
+entries over five opens). The relative piece is resolved against the
+current working directory, not against the odd folder, which is a second
+reason that only a change of who writes `PATH` fixes this. That change
+(`pymmcore.CMMCore.setDeviceAdapterSearchPaths` called directly, so that
+`_put_on_path` is the only writer) is an owner decision (#119), not part
+of this section.
 
 ## 8. Testing — `smc/testing/` and `tests/` (#9, #10)
 
