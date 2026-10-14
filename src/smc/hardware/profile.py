@@ -252,8 +252,10 @@ class Profile(_Section):
         :meth:`demo` when no ``demo.toml`` is found.
 
         Raises:
-            ProfileError: the file is missing, unreadable, not TOML, or does
-                not validate. The message names the file, the key and the fix.
+            ProfileError: the file is missing, unreadable, not UTF-8 (a
+                UTF-8 byte-order mark is accepted), not TOML, or does not
+                validate. The message names the file, the key or line and the
+                fix.
         """
         if _is_path(source):
             return _load_file(Path(source))
@@ -304,7 +306,16 @@ class Profile(_Section):
                 "Write an absolute path, or set HOME (USERPROFILE on Windows)."
             ) from exc
         if not path.is_absolute() and self.source is not None:
-            path = (self.source.parent / path).resolve()
+            try:
+                path = (self.source.parent / path).resolve()
+            except (OSError, ValueError) as exc:
+                # An embedded NUL, or a drive that does not answer: a
+                # ProfileError, so that a listing reports this profile and goes on.
+                raise ProfileError(
+                    f"{self.source}: micromanager.{key}: cannot resolve {entry} "
+                    f"({getattr(exc, 'strerror', None) or exc}). Write a path the "
+                    "operating system accepts."
+                ) from exc
         return path
 
 
@@ -345,8 +356,8 @@ def _may_be_profile(path: Path) -> bool:
     stays listed: loading it is how its owner learns what is wrong.
     """
     try:
-        data = tomllib.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        data = tomllib.loads(_read_text(path))
+    except (ProfileError, tomllib.TOMLDecodeError):
         return True
     return "microscope" in data
 
@@ -378,14 +389,55 @@ def _not_found_message(name: str) -> str:
     )
 
 
-def _load_file(path: Path) -> Profile:
+def _read_text(path: Path) -> str:
+    """The profile's text, or a ``ProfileError`` that says what to do about the file.
+
+    Read as bytes and decoded as ``utf-8-sig``: Notepad before Windows 10 1903
+    starts a "UTF-8" file with a byte-order mark, which ``tomllib`` refuses
+    with an error at a line that is fine, and it also offers cp1252 and
+    UTF-16, which no decoder here can tell from a typo (FM-80).
+    """
     try:
-        text = path.read_text(encoding="utf-8")
+        raw = path.read_bytes()
     except OSError as exc:
         raise ProfileError(
             f"{path}: cannot read profile ({exc.strerror or exc}). "
             "Check the path, or load it by name from one of the search paths."
         ) from exc
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        # ``exc.start`` indexes ``exc.object``, which for utf-8-sig is the data
+        # after the mark: ``raw`` would name a byte three places off.
+        seen: bytes = exc.object
+        line = seen.count(b"\n", 0, exc.start) + 1
+        raise ProfileError(
+            f"{path}: line {line} is not UTF-8 text ({exc.reason}, byte "
+            f"0x{seen[exc.start]:02x}). Save the file as UTF-8 "
+            "(Notepad: File > Save As > Encoding: UTF-8)."
+        ) from exc
+
+
+def _exists(source: Path, key: str, target: Path, *, directory: bool) -> bool:
+    """Whether ``target`` is a file (a directory); a ``ProfileError`` if the OS will not say.
+
+    ``Path.is_file`` answers False for a path that is not there but re-raises
+    the rest: a folder this account may not search, a network share that
+    needs a login. A listing of profiles reports the profile and goes on, so
+    the loader raises only ``ProfileError`` for a problem with the file (FM-77).
+    """
+    try:
+        return target.is_dir() if directory else target.is_file()
+    except OSError as exc:
+        raise ProfileError(
+            f"{source}: micromanager.{key}: cannot look at {target} "
+            f"({exc.strerror or exc}). Check that this account may read it (a "
+            "network share may need a login)."
+        ) from exc
+
+
+def _load_file(path: Path) -> Profile:
+    text = _read_text(path)
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
@@ -402,7 +454,7 @@ def _load_file(path: Path) -> Profile:
 
     profile.source = path.resolve()
     config = profile.config_path()
-    if config is not None and not config.is_file():
+    if config is not None and not _exists(path, "config", config, directory=False):
         raise ProfileError(
             f"{path}: micromanager.config points to {config}, which does not exist. "
             "Fix the path (relative paths resolve against the profile file; use "
@@ -416,7 +468,7 @@ def _load_file(path: Path) -> Profile:
         profile.adapter_search_dirs(),
         strict=True,
     ):
-        if not directory.is_dir():
+        if not _exists(path, "adapter_search_paths", directory, directory=True):
             looked = "" if str(directory) == entry else f" (looked for {directory})"
             raise ProfileError(
                 f"{path}: micromanager.adapter_search_paths lists {entry}, which is "

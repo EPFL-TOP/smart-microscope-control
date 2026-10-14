@@ -532,13 +532,33 @@ def test_state_survives_one_failing_device(demo_core: Any) -> None:
     finally:
         m.close()
     assert state.z_um is None
-    assert state.errors == ["z: RuntimeError: Z drive not responding"]
+    assert len(state.errors) == 1
+    assert state.errors[0].startswith(
+        "z: HardwareError: focus: getPosition('Z') failed (Z drive not responding)"
+    )
     assert state.xy is not None
     assert state.exposure_ms is not None
     assert state.image_shape == (512, 512)
     assert state.shutter_open is not None
     assert state.roles["focus"] == "Z"
     assert "| Z ? |" in line
+
+
+def test_a_fault_of_the_compiled_core_is_a_hardware_error_chained_from_a_runtime_error(
+    demo_microscope: Microscope,
+) -> None:
+    # The premise of the translator (FM-79), pinned on the real core: every other
+    # test makes a Python stand-in raise RuntimeError itself, so a pymmcore whose
+    # errors were not RuntimeErrors would leave them all green and the CLI back
+    # to "unexpected".
+    with pytest.raises(HardwareError) as caught:
+        demo_microscope.require(Properties).get("NoSuchDevice", "Name")
+    err = caught.value
+    assert type(err) is HardwareError
+    assert str(err).startswith(
+        "properties: getProperty('NoSuchDevice', 'Name') failed ("
+    )
+    assert type(err.__cause__) is RuntimeError
 
 
 def test_describe_is_one_status_line() -> None:
@@ -945,10 +965,10 @@ def test_close_never_raises_because_a_stop_failed(
     with caplog.at_level(logging.ERROR, logger=LOGGER):
         m.close()
     assert list(demo_core.getLoadedDevices()) == ["Core"]
-    assert (
-        "close: the stop failed for XYStage 'XY' (RuntimeError('XY does not answer'))"
-        in caplog.messages
-    )
+    stop_failed = [m for m in caplog.messages if m.startswith("close: the stop failed")]
+    assert len(stop_failed) == 2
+    assert "xy_stage: stop('XY') failed (XY does not answer)" in stop_failed[0]
+    assert "focus: stop('Z') failed (Z does not answer)" in stop_failed[1]
 
 
 def test_close_from_inside_an_action_stops_but_does_not_unload(

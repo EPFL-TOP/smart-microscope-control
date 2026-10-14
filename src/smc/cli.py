@@ -316,10 +316,6 @@ def _load_error(path: Path) -> str:
         Profile.load(path)
     except ProfileError as exc:
         message = str(exc).removeprefix(f"{path}: ")
-    except (OSError, ValueError) as exc:
-        # A file that is not UTF-8 raises UnicodeDecodeError (a ValueError)
-        # past the loader; it is one more profile that does not load.
-        message = f"{type(exc).__name__}: {exc}"
     else:
         return ""
     return " ".join(line.strip() for line in message.splitlines() if line.strip())

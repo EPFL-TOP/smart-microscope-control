@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 
@@ -538,3 +539,150 @@ def test_list_profiles_first_search_path_wins(
         ("stand", env_profile.resolve()),
         ("zeiss", (isolated / "profiles" / "zeiss.toml").resolve()),
     ]
+
+
+# -- text encoding (#93, FM-80) -----------------------------------------------
+
+_BOM = b"\xef\xbb\xbf"
+
+
+def test_a_profile_saved_as_cp1252_is_a_profile_error_naming_file_and_line(
+    tmp_path: Path,
+) -> None:
+    # The bad byte is on line 4, so the line number is counted, not a default.
+    path = tmp_path / "latin.toml"
+    path.write_bytes('[microscope]\nname = "t"\n\n# café\n'.encode("cp1252"))
+    with pytest.raises(ProfileError) as caught:
+        Profile.load(path)
+    message = str(caught.value)
+    assert message.startswith(f"{path}: line 4 is not UTF-8 text (")
+    assert "Save the file as UTF-8" in message
+    assert isinstance(caught.value.__cause__, UnicodeDecodeError)
+
+
+def test_a_profile_saved_as_utf16_is_a_profile_error(tmp_path: Path) -> None:
+    path = tmp_path / "wide.toml"
+    path.write_bytes('[microscope]\nname = "t"\n'.encode("utf-16"))
+    with pytest.raises(ProfileError, match="line 1 is not UTF-8 text"):
+        Profile.load(path)
+
+
+def test_a_utf8_profile_with_a_byte_order_mark_loads(tmp_path: Path) -> None:
+    path = tmp_path / "marked.toml"
+    path.write_bytes(_BOM + '[microscope]\nname = "café"\n'.encode())
+    assert Profile.load(path).microscope.name == "café"
+
+
+def test_list_profiles_reads_a_file_with_a_byte_order_mark(isolated: Path) -> None:
+    profile = isolated / "stand.toml"
+    profile.write_bytes(_BOM + b'[microscope]\nname = "t"\n')
+    (isolated / "pyproject.toml").write_bytes(_BOM + b'[project]\nname = "x"\n')
+    assert list_profiles() == [("stand", profile.resolve())]
+
+
+def test_a_marked_profile_that_then_is_not_utf8_names_the_right_byte_and_line(
+    tmp_path: Path,
+) -> None:
+    # utf-8-sig reports the offset after the three bytes of the mark, so the
+    # offending byte and its line come from the stripped data, not from the file.
+    path = tmp_path / "marked-latin.toml"
+    path.write_bytes(_BOM + '[microscope]\nname = "t"\n# café\n'.encode("cp1252"))
+    with pytest.raises(ProfileError) as caught:
+        Profile.load(path)
+    message = str(caught.value)
+    assert message.startswith(f"{path}: line 3 is not UTF-8 text (")
+    assert "byte 0xe9" in message
+
+
+# -- a file the profile names that cannot be looked at (#93, FM-77) ---------------
+
+
+def _refuse_to_look_at(
+    monkeypatch: pytest.MonkeyPatch, method: str, name: str, error: Exception
+) -> None:
+    """Make ``Path.<method>`` raise ``error`` for the path called ``name``.
+
+    A patched method runs on every runner: Windows has no ``chmod 000``, and an
+    unreachable network share cannot be built in a test.
+    """
+    real = getattr(Path, method)
+
+    def refuse(self: Path, *args: object, **kwargs: object) -> object:
+        if self.name == name:
+            raise error
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, method, refuse)
+
+
+def test_a_config_that_cannot_be_looked_at_is_a_profile_error_naming_the_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = write_profile(tmp_path / "p.toml", '[micromanager]\nconfig = "mm.cfg"\n')
+    (tmp_path / "mm.cfg").write_text("", encoding="utf-8")
+    denied = PermissionError(errno.EACCES, "Permission denied")
+    _refuse_to_look_at(monkeypatch, "is_file", "mm.cfg", denied)
+    with pytest.raises(ProfileError) as caught:
+        Profile.load(path)
+    message = str(caught.value)
+    assert message.startswith(f"{path}: micromanager.config: cannot look at ")
+    assert "Permission denied" in message
+    assert caught.value.__cause__ is denied
+
+
+def test_an_adapter_directory_that_cannot_be_looked_at_is_a_profile_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = write_profile(
+        tmp_path / "p.toml", '[micromanager]\nadapter_search_paths = ["dlls"]\n'
+    )
+    (tmp_path / "dlls").mkdir()
+    denied = PermissionError(errno.EACCES, "Permission denied")
+    _refuse_to_look_at(monkeypatch, "is_dir", "dlls", denied)
+    with pytest.raises(ProfileError) as caught:
+        Profile.load(path)
+    assert str(caught.value).startswith(
+        f"{path}: micromanager.adapter_search_paths: cannot look at "
+    )
+    assert caught.value.__cause__ is denied
+
+
+def test_a_relative_path_the_os_cannot_resolve_is_a_profile_error_naming_the_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An embedded NUL: resolve() raises ValueError, on POSIX; Windows differs.
+    path = write_profile(
+        tmp_path / "p.toml", '[micromanager]\nconfig = "a\\u0000b.cfg"\n'
+    )
+    real_resolve = Path.resolve
+
+    def resolve(self: Path, *args: object, **kwargs: object) -> Path:
+        if "\x00" in str(self):
+            raise ValueError("embedded null character in path")
+        return real_resolve(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    with pytest.raises(ProfileError) as caught:
+        Profile.load(path)
+    # The profile's resolved path: that is its ``source``, as in the ``~`` error.
+    assert str(caught.value).startswith(
+        f"{path.resolve()}: micromanager.config: cannot resolve "
+    )
+    assert isinstance(caught.value.__cause__, ValueError)
+
+
+def test_a_directory_named_like_a_profile_is_listed_and_is_a_profile_error(
+    isolated: Path,
+) -> None:
+    # Reading a directory is an OSError (IsADirectoryError, or PermissionError on
+    # Windows): ``list_profiles`` keeps it listed, as it keeps any file that
+    # does not load, and loading it says what is wrong.
+    directory = isolated / "dir.toml"
+    directory.mkdir()
+    good = write_profile(isolated / "ok.toml", "")
+    assert list_profiles() == [
+        ("dir", directory.resolve()),
+        ("ok", good.resolve()),
+    ]
+    with pytest.raises(ProfileError, match="cannot read profile"):
+        Profile.load(directory)
