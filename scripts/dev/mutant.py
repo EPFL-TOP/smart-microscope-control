@@ -56,6 +56,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePath
@@ -63,6 +64,7 @@ from pathlib import Path, PurePath
 DEFAULT_TIMEOUT_S = 300.0
 MAX_TIMEOUT_S = 3600.0
 KILL_WAIT_S = 10.0
+WAIT_SLICE_S = 0.5
 TAIL_LINES = 30
 PATTERN_WIDTH = 60
 # What the copy leaves out, wherever it is: the repository's history, virtual
@@ -95,6 +97,8 @@ PYTEST_EXIT = {
 # A child sharing the console can change its code page (FM-22); the child of
 # this script is created without one.
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+# Named so that a test can run the Windows branch of kill_tree anywhere.
+_WINDOWS = os.name == "nt"
 
 
 class MutantError(Exception):
@@ -373,8 +377,8 @@ def kill_tree(proc: subprocess.Popen[bytes]) -> str:
     The wait after the kill has a timeout: a process stuck in a driver call may
     not die.
     """
-    note = ""
-    if os.name == "nt":
+    notes = []
+    if _WINDOWS:
         try:
             result = subprocess.run(
                 ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
@@ -384,9 +388,16 @@ def kill_tree(proc: subprocess.Popen[bytes]) -> str:
                 check=False,
             )
             if result.returncode != 0:
-                note = f"taskkill exited {result.returncode}"
+                notes.append(f"taskkill exited {result.returncode}")
         except (OSError, subprocess.TimeoutExpired) as exc:
-            note = f"taskkill failed: {exc}"
+            notes.append(f"taskkill failed: {exc}")
+        if notes:
+            # A tree kill that fails but leaves the direct child dead is not a
+            # clean stop: a helper may still hold the log or the copy (FM-35).
+            notes = [
+                f"the process tree could not be stopped ({notes[0]}); "
+                "a helper may still be running"
+            ]
     else:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(proc.pid, signal.SIGKILL)
@@ -395,8 +406,8 @@ def kill_tree(proc: subprocess.Popen[bytes]) -> str:
     try:
         proc.wait(timeout=KILL_WAIT_S)
     except subprocess.TimeoutExpired:
-        note = f"{note}; the child could not be stopped".lstrip("; ")
-    return note
+        notes.append("the child could not be stopped")
+    return "; ".join(notes)
 
 
 def run_child(
@@ -412,8 +423,15 @@ def run_child(
     pipe keeps it open and, on Windows, ``run(timeout=...)`` then waits without
     limit after the kill (FM-04). Timeout, Ctrl-C or any error: the tree is
     killed before the exception goes on.
+
+    The wait is made in short slices. On Windows ``Popen.wait(timeout)`` is one
+    blocking ``WaitForSingleObject`` that a Ctrl-C does not interrupt, and the
+    child (created without a console) does not receive it either: a single long
+    wait would leave the terminal frozen until the child ends or the timeout
+    passes. Between two slices Python runs the pending signal handler.
     """
     started = time.monotonic()
+    deadline = started + timeout_s
     timed_out = False
     note = ""
     with open(log_path, "wb") as log:
@@ -425,13 +443,19 @@ def run_child(
             stdout=log,
             stderr=subprocess.STDOUT,
             creationflags=_NO_WINDOW,
-            start_new_session=os.name != "nt",
+            start_new_session=not _WINDOWS,
         )
         try:
-            try:
-                proc.wait(timeout=timeout_s)
-            except subprocess.TimeoutExpired:
-                timed_out = True
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = proc.poll() is None
+                    break
+                try:
+                    proc.wait(timeout=min(WAIT_SLICE_S, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
         finally:
             if proc.poll() is None:
                 note = kill_tree(proc)
@@ -450,9 +474,10 @@ def exit_name(returncode: int | None) -> str:
 
 def check_baseline(run: ChildRun, plan: Plan, timeout_s: float) -> None:
     if run.timed_out:
+        note = f" ({run.note})" if run.note else ""
         raise MutantError(
             f"baseline timed out after {timeout_s:g} s: {plan.test_id} does not "
-            "finish on the unmutated copy",
+            f"finish on the unmutated copy{note}",
             tail(run.output),
         )
     if run.returncode != 0:
@@ -618,6 +643,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         sys.stderr.write("interrupted\n")
         return 130
+    except Exception as exc:
+        # An uncaught exception would end the process with exit 1, which is
+        # SURVIVED: a crash must never read as "the test cannot see that line".
+        # The copy was removed by `execute` on the way out.
+        write_error(
+            MutantError(
+                f"unexpected {type(exc).__name__}: {exc}", traceback.format_exc()
+            )
+        )
+        return 2
 
 
 if __name__ == "__main__":

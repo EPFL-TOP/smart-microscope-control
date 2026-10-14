@@ -47,10 +47,20 @@ from pathlib import Path
 
 import pkg
 import pytest
+from helpers import EXPECTED
 from pkg.calc import add, countdown
 
 
 def test_add_sums():
+    assert add(2, 3) == 5
+
+
+def test_add_uses_the_helper():
+    assert add(2, 3) == EXPECTED
+
+
+def test_prints_non_ascii():
+    print("caf\\u00e9 \\u00b5m \\u2713")
     assert add(2, 3) == 5
 
 
@@ -107,6 +117,7 @@ def repo(tmp_path: Path) -> Path:
     (root / "src" / "pkg" / "__init__.py").write_text("", encoding="utf-8")
     (root / "src" / "pkg" / "calc.py").write_text(CALC, encoding="utf-8")
     (root / "tests" / "test_calc.py").write_text(TESTS, encoding="utf-8")
+    (root / "tests" / "helpers.py").write_text("EXPECTED = 5\n", encoding="utf-8")
     return root
 
 
@@ -285,9 +296,46 @@ def test_a_parent_directory_escape_is_refused(run) -> None:
     assert "is outside the repository" in result.err
 
 
+@pytest.mark.parametrize(
+    "name", ["local/x.py", ".claude/worktrees/w/a.py", ".venv/x.py", ".git/x.py"]
+)
+def test_a_file_in_a_place_the_copy_leaves_out_is_refused(
+    run, repo, scratch, name
+) -> None:
+    # Without the check the file passes every other test, the copy lacks it,
+    # and writing the mutant crashes: a traceback and exit 1, which is SURVIVED.
+    path = repo / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("a = 1\n", encoding="utf-8")
+    result = run(name, "a = 1", "a = 2", ADD_RUNS)
+    assert result.code == 2
+    assert f"{name} is in a place the copy leaves out" in result.err
+    assert list(scratch.iterdir()) == []
+
+
 def test_an_absolute_path_inside_the_repository_is_taken_as_relative(run, repo) -> None:
     result = run(str(repo / CALC_FILE), SUM, SUM_BROKEN, str(repo / ADD_SUMS))
     assert result.code == 0, result.out + result.err
+    # The test id the run reports is the one it ran: relative, in the copy.
+    assert f"[{ADD_SUMS}]" in result.out
+
+
+def test_an_absolute_test_id_runs_the_copys_tests_not_the_originals(run, repo) -> None:
+    # A helper the test imports is test-side code: if pytest were given the
+    # original's absolute path it would import the original's, never the mutant.
+    node = f"{repo / 'tests' / 'test_calc.py'}::test_add_uses_the_helper"
+    result = run("tests/helpers.py", "EXPECTED = 5", "EXPECTED = 6", node)
+    assert result.code == 0, result.out + result.err
+
+
+def test_the_tests_run_inside_the_copy_not_in_the_original(run) -> None:
+    # test_imports_the_copy needs the current directory to be the copy that
+    # holds pkg; a run in the original's directory fails its baseline.
+    result = run(
+        CALC_FILE, SUM, SUM_BROKEN, "tests/test_calc.py::test_imports_the_copy"
+    )
+    assert result.code == 1, result.out + result.err
+    assert result.out.startswith("SURVIVED")
 
 
 def test_the_resolver_keeps_a_node_id_suffix(mutant, repo) -> None:
@@ -297,7 +345,8 @@ def test_the_resolver_keeps_a_node_id_suffix(mutant, repo) -> None:
     )
     assert mutant.split_test_id("tests") == ("tests", "")
     rel = mutant.resolve_in_repo(repo.resolve(), "src/../tests/x.py", "file")
-    assert rel == PurePosixPath("tests/x.py")
+    # as_posix: a WindowsPath never equals a PurePosixPath (FM-24).
+    assert rel.as_posix() == "tests/x.py"
 
 
 @pytest.mark.parametrize(
@@ -372,6 +421,8 @@ def test_a_test_that_already_fails_gives_no_verdict(run) -> None:
     assert result.code == 2
     assert "baseline fails" in result.err
     assert "KILLED" not in result.out
+    # What explains the failure is pytest's own output, not only our summary.
+    assert "FAILED tests/test_calc.py::test_always_fails" in result.err
 
 
 def test_a_test_that_is_skipped_gives_no_verdict(run) -> None:
@@ -407,11 +458,14 @@ def test_a_mutant_that_makes_the_test_skip_gives_no_verdict(run) -> None:
     assert "SURVIVED" not in result.out
 
 
-def test_a_timeout_is_no_verdict_not_a_kill(mutant, repo, scratch, monkeypatch, capsys):
+def test_a_timeout_is_no_verdict_not_a_kill(
+    mutant, repo, scratch, monkeypatch, capsys
+) -> None:
+    monkeypatch.setenv("MUTANT_TEST_OUTER_MARKER", "seen")
     calls = []
 
     def stub(command, cwd, env, timeout_s, log_path):
-        calls.append(command)
+        calls.append((command, cwd, env, timeout_s))
         if len(calls) == 1:
             return mutant.ChildRun(0, False, "1 passed in 0.1s\n", 0.1)
         return mutant.ChildRun(-9, True, "", float(timeout_s))
@@ -425,6 +479,16 @@ def test_a_timeout_is_no_verdict_not_a_kill(mutant, repo, scratch, monkeypatch, 
     assert "timed out after 5" in captured.err
     assert "KILLED" not in captured.out
     assert len(calls) == 2
+    # What judge() hands to run_child, for both runs: the limit the user gave,
+    # the copy as the directory, the outer environment (PATH, SYSTEMROOT on
+    # Windows) plus the copy's own additions.
+    for _command, cwd, env, timeout_s in calls:
+        assert timeout_s == 5.0
+        assert cwd != repo
+        assert cwd.name == "repo"
+        assert cwd.parent.parent == scratch.resolve()
+        assert env["MUTANT_TEST_OUTER_MARKER"] == "seen"
+        assert env["PYTHONPATH"].split(os.pathsep)[0] == str(cwd / "src")
 
 
 def test_a_baseline_that_times_out_is_no_verdict(
@@ -434,15 +498,41 @@ def test_a_baseline_that_times_out_is_no_verdict(
 
     def stub(command, cwd, env, timeout_s, log_path):
         calls.append(command)
-        return mutant.ChildRun(-9, True, "", float(timeout_s))
+        return mutant.ChildRun(
+            -9, True, "", float(timeout_s), "the process tree could not be stopped"
+        )
 
     monkeypatch.setattr(mutant, "run_child", stub)
     code = mutant.main(
         ["--root", str(repo), "--timeout=5", CALC_FILE, SUM, SUM_BROKEN, ADD_SUMS]
     )
+    err = capsys.readouterr().err
     assert code == 2
-    assert "baseline timed out after 5" in capsys.readouterr().err
+    assert "baseline timed out after 5" in err
+    # A helper that survived the kill is told, not buried (FM-35).
+    assert "the process tree could not be stopped" in err
     assert len(calls) == 1, "the mutant must not run after a baseline that hangs"
+
+
+def test_an_unexpected_error_is_no_verdict_not_a_survivor(
+    mutant, repo, scratch, monkeypatch, capsys
+) -> None:
+    # An uncaught exception ends a Python process with exit 1: that is SURVIVED.
+    def broken(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(mutant, "write_mutant", broken)
+    before = tree_hash(repo)
+
+    code = mutant.main(["--root", str(repo), CALC_FILE, SUM, SUM_BROKEN, ADD_SUMS])
+
+    captured = capsys.readouterr()
+    assert code == 2
+    assert "ERROR: unexpected OSError: disk full" in captured.err
+    assert "Traceback" in captured.err
+    assert "SURVIVED" not in captured.out
+    assert list(scratch.iterdir()) == []
+    assert tree_hash(repo) == before
 
 
 @pytest.mark.parametrize("value", ["nan", "inf", "0", "-1", "3601", "soon"])
@@ -679,6 +769,113 @@ def test_run_child_kills_the_whole_tree_on_timeout(mutant, tmp_path) -> None:
     assert beat.stat().st_size == first
 
 
+def test_ctrl_c_during_the_wait_kills_the_child(mutant, tmp_path, monkeypatch) -> None:
+    # The child leads its own session, so a terminal's Ctrl-C never reaches it:
+    # only the `finally` of run_child stops it.
+    created = []
+
+    class InterruptedPopen(subprocess.Popen):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.interrupted = False
+            created.append(self)
+
+        def wait(self, timeout=None):
+            if not self.interrupted:
+                self.interrupted = True
+                raise KeyboardInterrupt
+            return super().wait(timeout)
+
+    monkeypatch.setattr(mutant.subprocess, "Popen", InterruptedPopen)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            mutant.run_child(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                tmp_path,
+                dict(os.environ),
+                30.0,
+                tmp_path / "log.txt",
+            )
+        (child,) = created
+        assert child.poll() is not None, "the child was left running"
+    finally:
+        for child in created:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=10)
+
+
+def test_run_child_waits_in_short_slices_so_that_ctrl_c_is_seen(
+    mutant, tmp_path, monkeypatch
+) -> None:
+    # On Windows one long wait is one blocking call that a Ctrl-C cannot end.
+    waits = []
+
+    class RecordingPopen(subprocess.Popen):
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            return super().wait(timeout)
+
+    monkeypatch.setattr(mutant.subprocess, "Popen", RecordingPopen)
+    result = mutant.run_child(
+        [sys.executable, "-c", "import time; time.sleep(1.5)"],
+        tmp_path,
+        dict(os.environ),
+        30.0,
+        tmp_path / "log.txt",
+    )
+    assert result.returncode == 0
+    assert not result.timed_out
+    assert len(waits) >= 2
+    assert max(waits) <= 1.0
+
+
+class _DeadChild:
+    """What kill_tree needs of a process that is already gone."""
+
+    pid = 4242
+
+    def kill(self) -> None:
+        pass
+
+    def wait(self, timeout=None) -> int:
+        return 0
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        subprocess.CompletedProcess(["taskkill"], 1, b"", b"Access is denied"),
+        FileNotFoundError("taskkill"),
+    ],
+    ids=["taskkill denied", "taskkill missing"],
+)
+def test_a_failed_taskkill_is_not_a_clean_stop(mutant, monkeypatch, outcome) -> None:
+    # The direct child is dead, but a helper may not be (FM-35). Windows is
+    # simulated: taskkill is stubbed, so this runs on every platform.
+    def fake_run(command, **kwargs):
+        assert command[:3] == ["taskkill", "/T", "/F"]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(mutant, "_WINDOWS", True)
+    monkeypatch.setattr(mutant.subprocess, "run", fake_run)
+    note = mutant.kill_tree(_DeadChild())
+    assert "the process tree could not be stopped (taskkill" in note
+    assert "a helper may still be running" in note
+
+
+def test_a_taskkill_that_works_leaves_no_note(mutant, monkeypatch) -> None:
+    monkeypatch.setattr(mutant, "_WINDOWS", True)
+    monkeypatch.setattr(
+        mutant.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 0, b"", b""),
+    )
+    assert mutant.kill_tree(_DeadChild()) == ""
+
+
 # --- the command line, as a session uses it ---------------------------------
 
 
@@ -713,6 +910,37 @@ def test_verbose_prints_the_whole_pytest_output(run) -> None:
     loud = run(CALC_FILE, SUM, SUM_BROKEN, ADD_SUMS, "-v")
     assert "FAILED tests/test_calc.py::test_add_sums" not in quiet.out
     assert "FAILED tests/test_calc.py::test_add_sums" in loud.out
+
+
+@pytest.mark.parametrize("encoding", ["ascii", "cp1252"])
+def test_the_report_survives_a_stdout_that_cannot_encode_what_pytest_printed(
+    repo, encoding
+) -> None:
+    # `-v` echoes the output of the failing test, which printed a "µ" (cp1252
+    # has it) and an "é" plus a "✓" no console code page need have. A
+    # strict stream raises UnicodeEncodeError, and a crash exits 1: SURVIVED.
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--root",
+            str(repo),
+            "-v",
+            "--",
+            CALC_FILE,
+            SUM,
+            SUM_BROKEN,
+            "tests/test_calc.py::test_prints_non_ascii",
+        ],
+        capture_output=True,
+        env={**os.environ, "PYTHONIOENCODING": encoding},
+        timeout=120,
+    )
+    stdout = proc.stdout.decode(encoding)
+    stderr = proc.stderr.decode(encoding)
+    assert proc.returncode == 0, stdout + stderr
+    assert "Traceback" not in stderr
+    assert stdout.startswith("KILLED")
 
 
 def test_the_report_line_is_ascii_whatever_the_pattern(run, repo) -> None:
