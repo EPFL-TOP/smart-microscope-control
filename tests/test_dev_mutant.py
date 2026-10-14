@@ -775,13 +775,18 @@ def test_ctrl_c_during_the_wait_kills_the_child(mutant, tmp_path, monkeypatch) -
     created = []
 
     class InterruptedPopen(subprocess.Popen):
+        # Only the process under test is interrupted and recorded: on Windows
+        # kill_tree starts `taskkill` through subprocess.run, which builds a
+        # Popen of the same (patched) class.
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
+            self.under_test = self.args[0] == sys.executable
             self.interrupted = False
-            created.append(self)
+            if self.under_test:
+                created.append(self)
 
         def wait(self, timeout=None):
-            if not self.interrupted:
+            if self.under_test and not self.interrupted:
                 self.interrupted = True
                 raise KeyboardInterrupt
             return super().wait(timeout)
@@ -813,7 +818,8 @@ def test_run_child_waits_in_short_slices_so_that_ctrl_c_is_seen(
 
     class RecordingPopen(subprocess.Popen):
         def wait(self, timeout=None):
-            waits.append(timeout)
+            if self.args[0] == sys.executable:
+                waits.append(timeout)
             return super().wait(timeout)
 
     monkeypatch.setattr(mutant.subprocess, "Popen", RecordingPopen)
