@@ -89,6 +89,15 @@ them if it is not the one you run on.
     change touches the CLI or its tests, run them once more as CI does,
     `GITHUB_ACTIONS=1 .venv/bin/pytest tests/test_cli.py` (FM-72: typer then
     forces colour; #84's first push failed every CI job on this).
+    **Can each new test fail?** For a test that guards a claim, run one mutant
+    of the line it guards: `.venv/bin/python scripts/dev/mutant.py <file>
+    <old> <new> <test-id>`, from the worktree root. It copies the working tree
+    (uncommitted edits included) to a temporary directory and never writes to
+    the worktree. Exit 0 `KILLED`: the test can fail. Exit 1 `SURVIVED`: it
+    proves nothing about that line, so strengthen it. Exit 2: no verdict (the
+    pattern was not found exactly once, or the test does not pass unmutated).
+    Never restore a mutant with `git checkout`: it discards uncommitted work
+    (#93).
 11. Run **`/adversarial-review $ARGUMENTS`**: cheap reviewer agents attack
     the change for its risk level, a verifier reproduces or refutes each
     finding, and you fix what is confirmed and in scope. Re-run step 10.
