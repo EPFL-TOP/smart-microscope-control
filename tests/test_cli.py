@@ -12,17 +12,18 @@ import os
 import re
 import stat
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import numpy as np
 import pytest
 import tifffile
-from typer.testing import CliRunner
+from typer.testing import CliRunner, Result
 
 from smc import __version__
 from smc.cli import app
 from smc.hardware import Microscope
+from smc.hardware import core as core_mod
 from smc.hardware import microscope as microscope_mod
 from smc.hardware.backends.mm import MMXYStage
 from smc.hardware.capabilities import XY
@@ -778,6 +779,199 @@ def test_a_device_fault_exits_1_naming_the_role_and_the_call() -> None:
 @pytest.mark.usefixtures("demo", "faulty_core")
 def test_debug_shows_the_device_fault_chained_from_the_core_error() -> None:
     result = runner.invoke(app, ["--debug", "stage", "get"])
+
+    assert type(result.exception) is HardwareError, result.output
+    assert type(result.exception.__cause__) is RuntimeError
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo", "faulty_core")
+def test_doctor_prints_the_translated_fault_it_read() -> None:
+    result = runner.invoke(app, ["doctor", "-p", "demo"])
+
+    assert result.exit_code == 1, result.output
+    # Nothing else pinned this line: the profile path already reports a device
+    # fault, and a later change to the proxy must not turn it into "unexpected".
+    assert any(
+        line.startswith(
+            "✗ xy: HardwareError: xy_stage: getXPosition('XY') failed "
+            "([COM3] Serial port timed out)"
+        )
+        for line in result.output.splitlines()
+    ), result.output
+    assert "unexpected" not in result.output
+
+
+# --- doctor --config -------------------------------------------------------------
+
+
+class _FailingCore:
+    """The demo core, except that the named calls raise and every release is counted.
+
+    ``doctor --config`` has no profile, so what fails is chosen per MMCore call:
+    ``getXYPosition`` is the serial read of a dead line, ``getFocusDevice``
+    stands for a bug that is not a device fault.
+    """
+
+    def __init__(self, core: object, fails: dict[str, Exception]) -> None:
+        self._core = core
+        self._fails = fails
+        self.unloads = 0
+
+    def __getattr__(self, name: str) -> object:
+        attr = getattr(self._core, name)
+        if name not in self._fails:
+            return attr
+        error = self._fails[name]
+
+        def fail(*args: object, **kwargs: object) -> object:
+            raise error
+
+        return fail
+
+    def unloadAllDevices(self) -> None:  # noqa: N802 - MMCore's name
+        self.unloads += 1
+        self._core.unloadAllDevices()  # type: ignore[attr-defined]
+
+
+@pytest.fixture
+def config_core(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[..., list[_FailingCore]]:
+    """Make ``doctor --config`` open the demo core, with the named calls failing.
+
+    The seam is ``core.open_core``, which ``core.opened`` calls: the demo is
+    opened whatever path the command is given, so no real stand and no
+    install detection is involved (FM-40). The returned list holds the cores
+    the command opened.
+    """
+    real_open_core = core_mod.open_core
+
+    def install(**fails: Exception) -> list[_FailingCore]:
+        opened: list[_FailingCore] = []
+
+        def wrapped(config: object = None, **kwargs: object) -> _FailingCore:
+            core = _FailingCore(real_open_core(None), fails)
+            opened.append(core)
+            return core
+
+        monkeypatch.setattr(core_mod, "open_core", wrapped)
+        return opened
+
+    return install
+
+
+def _doctor_config(tmp_path: Path, *options: str) -> Result:
+    return runner.invoke(
+        app, [*options, "doctor", "--config", str(tmp_path / "demo.cfg")]
+    )
+
+
+def _fail_lines(output: str) -> list[str]:
+    return [line for line in output.splitlines() if line.lstrip().startswith("✗")]
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_doctor_config_prints_the_core_roles_and_the_position(
+    tmp_path: Path, config_core: Callable[..., list[_FailingCore]]
+) -> None:
+    config_core()
+
+    result = _doctor_config(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    # The digits of the position are #94's (-0.0), not pinned here.
+    assert re.search(r"^\s*xy stage\s+XY\s*$", result.output, re.M), result.output
+    assert re.search(r"^\s*xy position\s+\(", result.output, re.M), result.output
+    assert "loads and answers" in result.output
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_doctor_config_device_fault_exits_1_naming_the_call(
+    tmp_path: Path, config_core: Callable[..., list[_FailingCore]]
+) -> None:
+    config_core(getXYPosition=RuntimeError("[COM3] Serial port timed out"))
+
+    result = _doctor_config(tmp_path)
+
+    assert result.exit_code == 1, result.output
+    # The bracket proves the message is printed as text, not as rich markup
+    # (FM-36). The "check the device" tail is #121's to reword: not pinned.
+    assert (
+        "✗ core: getXYPosition() failed ([COM3] Serial port timed out)" in result.output
+    )
+    assert len(_fail_lines(result.output)) == 1, result.output
+    for absent in ("unexpected", "Traceback", "loads and answers"):
+        assert absent not in result.output
+    # The operator sees which device is the XY stage, hence which cable; the
+    # position row is the one that is missing.
+    stage = re.search(r"^\s*xy stage\s+XY\s*$", result.output, re.M)
+    assert stage is not None, result.output
+    assert stage.start() < result.output.index("✗ core:"), result.output
+    assert "xy position" not in result.output
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_doctor_config_releases_the_core_when_a_read_faults(
+    tmp_path: Path, config_core: Callable[..., list[_FailingCore]]
+) -> None:
+    # A Nikon stand takes one connection at a time: the core is released
+    # before the next command, or the next smc cannot connect.
+    opened = config_core(getXYPosition=RuntimeError("[COM3] Serial port timed out"))
+
+    result = _doctor_config(tmp_path)
+
+    assert result.exit_code == 1, result.output
+    assert [core.unloads for core in opened] == [1]
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_doctor_config_an_unexpected_error_is_one_line(
+    tmp_path: Path, config_core: Callable[..., list[_FailingCore]]
+) -> None:
+    # Not a device fault, so the proxy lets it through: what reports it is
+    # _reported around the branch, like every other command.
+    config_core(getFocusDevice=ValueError("boom"))
+
+    result = _doctor_config(tmp_path)
+
+    assert result.exit_code == 1, result.output
+    assert "✗ unexpected ValueError: boom" in result.output
+    assert "Traceback" not in result.output
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_doctor_config_a_registry_read_that_faults_is_one_line(
+    tmp_path: Path, config_core: Callable[..., list[_FailingCore]]
+) -> None:
+    config_core(getCameraDevice=RuntimeError("[COM3] Serial port timed out"))
+
+    result = _doctor_config(tmp_path)
+
+    assert result.exit_code == 1, result.output
+    assert (
+        "✗ core: getCameraDevice() failed ([COM3] Serial port timed out)"
+        in result.output
+    )
+    assert len(_fail_lines(result.output)) == 1, result.output
+    # The registry is read before the table: a fault there prints no table.
+    assert "Core roles" not in result.output
+    assert "xy stage" not in result.output
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_debug_shows_the_doctor_config_fault_chained_from_the_core_error(
+    tmp_path: Path, config_core: Callable[..., list[_FailingCore]]
+) -> None:
+    config_core(getXYPosition=RuntimeError("[COM3] Serial port timed out"))
+
+    result = _doctor_config(tmp_path, "--debug")
 
     assert type(result.exception) is HardwareError, result.output
     assert type(result.exception.__cause__) is RuntimeError
