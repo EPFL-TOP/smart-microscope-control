@@ -22,6 +22,12 @@ Hardware behaviour encoded here:
   timeout, which the facade raises to 60 s because a plate traverse
   outlasts MMCore's 5 s default (FM-10); a move that gives up stops the
   stage first (FM-17).
+* **A device fault is a ``HardwareError``** (#93, FM-79). MMCore raises a bare
+  ``RuntimeError`` for it; each class reaches the core through
+  ``as_hardware_errors``, which names the role and the call. A
+  ``HardwareError`` raised inside a core call (a halt, a refusal) and any
+  exception that is not a ``RuntimeError`` pass untouched. What
+  ``Microscope.__init__`` reads from the core is not translated.
 * **Pixel size is measured or unknown.** MMCore's calibrated value when it
   has one, else the profile's value for the current objective, else ``0.0``.
 * **Dry-run reads real state.** Safety checks and the position a relative
@@ -30,13 +36,15 @@ Hardware behaviour encoded here:
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 from smc.hardware.capabilities import XY, Limits, PropertyInfo
 from smc.hardware.errors import HardwareError
+from smc.hardware.roles import Role
 from smc.hardware.safety import Motion, SafeCall, Step
 
 if TYPE_CHECKING:
@@ -45,9 +53,80 @@ if TYPE_CHECKING:
 
     from smc.hardware.safety import Executor, Safety
 
-__all__ = ["MMCamera", "MMProperties", "MMShutter", "MMXYStage", "MMZStage"]
+__all__ = [
+    "MMCamera",
+    "MMProperties",
+    "MMShutter",
+    "MMXYStage",
+    "MMZStage",
+    "as_hardware_errors",
+]
 
 logger = logging.getLogger("smc.hardware.backends.mm")
+
+
+class _FaultTranslator:
+    """Forwards every call to the core; a ``RuntimeError`` becomes a ``HardwareError``.
+
+    Stateless and lock-free on purpose: a stop runs through it from a signal
+    handler (FM-70), so it adds nothing to ``__getattr__``.
+    """
+
+    __slots__ = ("_core", "_role")
+
+    def __init__(self, core: CMMCorePlus, role: str) -> None:
+        self._core = core
+        self._role = role
+
+    def __getattr__(self, name: str) -> Any:
+        # copy and pickle probe dunders on a wrapper whose slots are not filled
+        # yet, and ``hasattr(x, "__len__")`` must not find one.
+        if name.startswith("__"):
+            raise AttributeError(name)
+        attr = getattr(self._core, name)
+        if not callable(attr):
+            return attr
+
+        @functools.wraps(attr)
+        def call(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return attr(*args, **kwargs)
+            except HardwareError:
+                # First: HardwareError is a RuntimeError (FM-79), and a callback
+                # inside a command may raise the halt or a refusal.
+                raise
+            except RuntimeError as exc:
+                raise HardwareError(self._message(name, args, kwargs, exc)) from exc
+
+        return call
+
+    def _message(
+        self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any], exc: Exception
+    ) -> str:
+        shown = ", ".join(
+            [*map(repr, args), *(f"{k}={v!r}" for k, v in kwargs.items())]
+        )
+        detail = str(exc) or type(exc).__name__
+        message = (
+            f"{self._role}: {name}({shown}) failed ({detail}); check the device: "
+            "power, cable, another program holding it"
+        )
+        # An adapter's bytes may not be UTF-8 (FM-05): one lone surrogate and
+        # the message can be neither logged nor serialised.
+        return message.encode("utf-8", "replace").decode("utf-8")
+
+
+def as_hardware_errors(core: CMMCorePlus, role: str) -> CMMCorePlus:
+    """``core``, with a device fault raised as a ``HardwareError`` naming ``role`` and the call.
+
+    MMCore reports a fault (a serial timeout, a camera that does not answer, an
+    unplugged cable) as a bare ``RuntimeError``, which the CLI can only call a
+    bug. ``HardwareError`` is itself a ``RuntimeError``, so it, and every
+    other exception, passes untouched (design §2, §6; FM-79). The cast keeps
+    mypy checking every call on the core; the proxy is stateless and holds no
+    lock, so a stop can run through it from a signal handler (FM-70).
+    """
+    return cast("CMMCorePlus", _FaultTranslator(core, role))
 
 
 def _motion(core: CMMCorePlus, label: str, name: str, *, stoppable: bool) -> Motion:
@@ -73,11 +152,13 @@ class MMXYStage:
     def __init__(
         self, core: CMMCorePlus, label: str, executor: Executor, safety: Safety
     ) -> None:
-        self._core = core
+        self._core = as_hardware_errors(core, Role.xy_stage.value)
         self._label = label
         self._executor = executor
         self._safety = safety
-        self._motion = _motion(core, label, f"xy_stage {label}", stoppable=True)
+        # From the proxied core: a busy poll or a stop that faults is a
+        # HardwareError too, and the Executor treats it as a failed wait (FM-19).
+        self._motion = _motion(self._core, label, f"xy_stage {label}", stoppable=True)
 
     def _read_position(self) -> XY:
         return XY(
@@ -169,11 +250,11 @@ class MMZStage:
     def __init__(
         self, core: CMMCorePlus, label: str, executor: Executor, safety: Safety
     ) -> None:
-        self._core = core
+        self._core = as_hardware_errors(core, Role.focus.value)
         self._label = label
         self._executor = executor
         self._safety = safety
-        self._motion = _motion(core, label, f"z {label}", stoppable=True)
+        self._motion = _motion(self._core, label, f"z {label}", stoppable=True)
 
     def _read_position(self) -> float:
         return float(self._core.getPosition(self._label))
@@ -263,7 +344,7 @@ class MMCamera:
         pixel_sizes_um: Mapping[str, float],
         objective_label: Callable[[], str | None],
     ) -> None:
-        self._core = core
+        self._core = as_hardware_errors(core, Role.camera.value)
         self._label = label
         self._executor = executor
         self._pixel_sizes_um = pixel_sizes_um
@@ -417,7 +498,9 @@ class MMShutter:
     """``Shutter`` over one Micro-Manager shutter device, plus the core's auto-shutter."""
 
     def __init__(self, core: CMMCorePlus, label: str, executor: Executor) -> None:
-        self._core = core
+        # Rebound, not only stored: the close below captures ``core``, and a
+        # close that faults must be translated as well.
+        core = self._core = as_hardware_errors(core, Role.shutter.value)
         self._label = label
         self._executor = executor
         self._close = SafeCall(
@@ -480,7 +563,8 @@ class MMProperties:
     """``Properties`` over every loaded device of a core."""
 
     def __init__(self, core: CMMCorePlus, executor: Executor) -> None:
-        self._core = core
+        # The one class with no role: the message names "properties".
+        self._core = as_hardware_errors(core, "properties")
         self._executor = executor
 
     def devices(self) -> list[str]:

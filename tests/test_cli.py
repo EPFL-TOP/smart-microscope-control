@@ -23,8 +23,10 @@ from typer.testing import CliRunner
 from smc import __version__
 from smc.cli import app
 from smc.hardware import Microscope
+from smc.hardware import microscope as microscope_mod
 from smc.hardware.backends.mm import MMXYStage
 from smc.hardware.capabilities import XY
+from smc.hardware.errors import HardwareError
 from smc.hardware.microscope import MicroscopeState
 
 runner = CliRunner(env={"COLUMNS": "200", "SMC_PROFILE": None, "SMC_PROFILES": None})
@@ -146,6 +148,105 @@ def test_profiles_lists_smc_profiles_and_reports_an_invalid_one(
     assert not any(line.startswith("other") for line in lines)
     searched = lines[lines.index("Search paths:") + 1 :]
     assert searched[0].strip() == str(sites)
+
+
+def test_profiles_lists_a_cp1252_profile_with_its_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Notepad's "ANSI" (FM-80): the listing says what is wrong with the file
+    # and goes on, as it does for any other profile that does not load.
+    sites = tmp_path / "sites"
+    sites.mkdir()
+    (sites / "latin.toml").write_bytes(
+        '[microscope]\nname = "t"\n# café\n'.encode("cp1252")
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(app, ["profiles"], env={"SMC_PROFILES": str(sites)})
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    latin = lines.index(next(line for line in lines if line.startswith("latin")))
+    assert lines[latin + 1].lstrip().startswith("✗")
+    assert "line 3 is not UTF-8 text" in lines[latin + 1]
+    # The path is on the name's line; the error does not repeat it.
+    shown = str((sites / "latin.toml").resolve())
+    assert shown in lines[latin]
+    assert shown not in lines[latin + 1]
+
+
+@pytest.fixture
+def unreadable_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """``sites/aaa.toml`` names an ``mm.cfg`` that exists but cannot be looked at.
+
+    ``Path.is_file`` is patched to raise, because a folder the account may not
+    search (``chmod 000``) cannot be built on Windows, nor a share that wants a
+    login anywhere (#93, FM-77). ``sites/zzz.toml`` is a good profile.
+    """
+    sites = tmp_path / "sites"
+    sites.mkdir()
+    (sites / "aaa.toml").write_text(
+        '[microscope]\nname = "aaa"\n\n[micromanager]\nconfig = "mm.cfg"\n',
+        encoding="utf-8",
+    )
+    (sites / "mm.cfg").write_text("", encoding="utf-8")
+    (sites / "zzz.toml").write_text('[microscope]\nname = "zzz"\n', encoding="utf-8")
+    real_is_file = Path.is_file
+
+    def is_file(self: Path, *args: object, **kwargs: object) -> bool:
+        if self.name == "mm.cfg":
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_is_file(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "is_file", is_file)
+    monkeypatch.chdir(tmp_path)
+    return sites
+
+
+def test_profiles_lists_a_profile_whose_config_cannot_be_looked_at_and_goes_on(
+    unreadable_config: Path,
+) -> None:
+    result = runner.invoke(
+        app, ["profiles"], env={"SMC_PROFILES": str(unreadable_config)}
+    )
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    aaa = lines.index(next(line for line in lines if line.startswith("aaa")))
+    assert lines[aaa + 1].lstrip().startswith("✗ micromanager.config: cannot look at ")
+    assert "Permission denied" in lines[aaa + 1]
+    # The profiles after it, and the search paths, are still printed.
+    assert any(line.startswith("zzz") for line in lines[aaa + 2 :])
+    assert "Search paths:" in lines
+    assert "unexpected" not in result.output
+
+
+def test_stage_get_on_a_profile_whose_config_cannot_be_looked_at_exits_1(
+    unreadable_config: Path,
+) -> None:
+    path = unreadable_config / "aaa.toml"
+
+    result = runner.invoke(app, ["stage", "get", "-p", str(path)])
+
+    assert result.exit_code == 1, result.output
+    assert f"✗ {path}: micromanager.config: cannot look at " in result.output
+    assert "unexpected" not in result.output
+
+
+def test_stage_get_on_a_cp1252_profile_exits_1_naming_the_file_and_the_line(
+    tmp_path: Path,
+) -> None:
+    # The report of #93: this printed "✗ unexpected UnicodeDecodeError: …", with
+    # no file name, and asked the operator to file an issue.
+    path = tmp_path / "latin.toml"
+    path.write_bytes('[microscope]\n# café\nname = "t"\n'.encode("cp1252"))
+
+    result = runner.invoke(app, ["stage", "get", "-p", str(path)])
+
+    assert result.exit_code == 1, result.output
+    assert f"✗ {path}: line 2 is not UTF-8 text (" in result.output
+    assert "Save the file as UTF-8" in result.output
+    assert "unexpected" not in result.output
 
 
 def test_missing_profile_exits_1_with_the_search_paths(
@@ -632,6 +733,54 @@ def test_debug_lets_the_traceback_through() -> None:
     result = runner.invoke(app, ["--debug", "stage", "get"])
 
     assert isinstance(result.exception, ValueError), result.output
+
+
+class _FaultyCore:
+    """The demo core, except that reading the X position raises, as a dead serial line does."""
+
+    def __init__(self, core: object) -> None:
+        self._core = core
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._core, name)
+
+    def getXPosition(self, label: str | None = None) -> float:  # noqa: N802 - MMCore's name
+        raise RuntimeError("[COM3] Serial port timed out")
+
+
+@pytest.fixture
+def faulty_core(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The fault is raised by the *core*: patching MMXYStage.position_um, as
+    # broken_position does, would skip the layer this test is about (FM-79).
+    real_open_core = microscope_mod.open_core
+
+    def wrapped(config: object = None, **kwargs: object) -> _FaultyCore:
+        return _FaultyCore(real_open_core(config, **kwargs))  # type: ignore[arg-type]
+
+    monkeypatch.setattr(microscope_mod, "open_core", wrapped)
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo", "faulty_core")
+def test_a_device_fault_exits_1_naming_the_role_and_the_call() -> None:
+    result = runner.invoke(app, ["stage", "get"])
+
+    assert result.exit_code == 1, result.output
+    # The bracket proves the message is printed as text, not as rich markup (FM-36).
+    assert (
+        "✗ xy_stage: getXPosition('XY') failed ([COM3] Serial port timed out); "
+        "check the device: power, cable, another program holding it"
+    ) in result.output
+    assert "unexpected" not in result.output
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo", "faulty_core")
+def test_debug_shows_the_device_fault_chained_from_the_core_error() -> None:
+    result = runner.invoke(app, ["--debug", "stage", "get"])
+
+    assert type(result.exception) is HardwareError, result.output
+    assert type(result.exception.__cause__) is RuntimeError
 
 
 @pytest.mark.demo
