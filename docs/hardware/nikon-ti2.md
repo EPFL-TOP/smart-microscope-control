@@ -146,6 +146,8 @@ was captured this visit.
    setup doc, or re-provision the PC with 3.11? (**inferred**: likely a
    pre-existing system Python or a newer "for all users" install; the
    survey does not say which.)
+   *Settled (owner, 2026-10-14)*: Python 3.14 stays; the setup guide
+   already says 3.14.
 2. **A Photometrics PVCAM PCIe camera and an NI PCIe-6323 DAQ card are
    physically present** on this Ti2 PC (real PCI evidence, not just a
    static adapter list), but `docs/hardware/inventory.md`'s Ti2-E entry
@@ -193,8 +195,9 @@ was captured this visit.
    tool), so no DIV mismatch is apparent, but why a second install exists is
    not stated.
    *Session 0*: `mmcore list` gives device interface 75 for both and marks
-   `Micro-Manager-75.20260319` "incompatible". Whether anything uses it
-   is still unknown.
+   `Micro-Manager-75.20260319` "incompatible". *Owner, 2026-10-14*: it was
+   installed for nikon-control's standalone control of the stand; smc
+   ignores it.
 
 ## Session 0 — the stand through pymmcore
 
@@ -309,16 +312,19 @@ session with PFS on.
 ### The rest of the PC
 
 - **Andor Zyla**: present, switched off during the session, and not in
-  the configuration. Its interface is unknown. The driver store holds Andor
+  the configuration. **Not used on this stand** (owner, 2026-10-14), so smc
+  ignores it and nobody needs to fix its adapter. Its interface is unknown. The driver store holds Andor
   WinUSB/libusb drivers and a BitFlow (CameraLink frame grabber) driver,
-  so either is possible (part P5). The `AndorSDK3` adapter does not load.
+  so either is possible. The `AndorSDK3` adapter does not load.
   The adapter folder holds `atmcd64d.dll` (the SDK2 runtime) and no SDK3
   `at*.dll`, although "Andor Driver Pack 3" is installed in
   `Program Files`. The likely cause is that the SDK3 runtime DLLs are not
   beside the adapter (**inferred**).
-- **Lumencor Spectra**, the epi light: on neither the hub nor the
-  configuration. Its model and its link are unknown (part P3). COM3, an
-  FTDI FT232R, is a candidate (**inferred**).
+- **The epi light: unconfirmed.** Session 0's `notes.txt` names a
+  Lumencor Spectra, which is on neither the hub nor the configuration. Who
+  wrote that line, and from what source, is not recorded, so it is to be
+  confirmed at the stand (part P3), together with its model and its link.
+  COM3, an FTDI FT232R, is a candidate link (**inferred**).
 - **NI PCIe-6323**: NI drivers are installed; its wiring is unknown (part P4).
 
 ### Positions, for the record
@@ -372,6 +378,7 @@ M2's design (#13).
 ### Still open: part P of #16, at the stand
 
 Z and the objective's height (P1); Z and XY travel limits, read by hand
-(P2); the Spectra's model and link (P3); the DAQ's wiring (P4); the Zyla's
-interface and the Prime 95B's port (P5); the objectives and the cubes in
-each position (P6); photos.
+(P2); the epi light: whether it is a Spectra, its model and link (P3); the
+DAQ's wiring (P4); the Prime 95B's port (P5); the objectives and the cubes
+in each position (P6); the Prime 95B's despeckle setting as NIS-Elements
+uses it; photos.

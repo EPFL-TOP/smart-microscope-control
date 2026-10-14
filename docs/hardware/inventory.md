@@ -50,8 +50,8 @@ New findings arrive as *Hardware session report* issues and land here.
   **Photometrics Prime 95B** through `PVCAM` (`Camera-1`, 1412×1412, 16-bit;
   PVCAM despeckle filters on by default). nikon-control's notes named a
   Hamamatsu, which is not fitted (session 0). An Andor Zyla is present but
-  its adapter does not load. The epi light (a Lumencor Spectra) is not on
-  the hub.
+  unused. The epi light (named as a Lumencor Spectra, still to be
+  confirmed) is not on the hub.
 - `DiaLamp` is the brightfield shutter/lamp; `Turret1Shutter`/
   `Turret2Shutter` are epi shutters. Intensity is a device *property*, not
   an MMCore API — found by property-name hints on light-like devices.
