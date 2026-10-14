@@ -82,7 +82,10 @@ light off first if it started off and on last if it started on. If a
 motion is left, if the test halted the stand, or if you pressed Ctrl-C,
 the suite stops the stages and closes the shutter (if it started closed)
 instead of moving anything back. A Ctrl-C ends the run, even one pressed
-while the stand is being put back: no later test moves the stand.
+while the stand is being put back: no later test moves the stand. In a
+Windows console, a QuickEdit selection freezes the output, and a Ctrl-C
+over it only copies the selection: press Esc first, or Ctrl-C twice
+(measured on the Ti2 PC, #126).
 
 What the suite does **not** put back:
 

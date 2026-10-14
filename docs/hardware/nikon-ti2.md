@@ -1,4 +1,10 @@
-# Nikon Ti2-E — PC survey
+# Nikon Ti2-E — PC survey and session 0
+
+Two visits are curated here. The **PC survey** (2026-09-25, below down to
+*Surprises*) read the PC without initialising anything. **Session 0**
+(2026-10-07, state re-read 2026-10-14; [its section](#session-0--the-stand-through-pymmcore))
+initialised the stand through pymmcore and moved nothing. Session 0
+answers most of the survey's surprises; each one says so.
 
 Curated by the design session from the raw survey in `local/surveys/nikon-ti2/` (private, never committed)
 (issue #16), collected 2026-09-25 with the hardware connected and the
@@ -149,6 +155,9 @@ was captured this visit.
    `docs/hardware/inventory.md` missing something about the Ti2, or is
    another instrument colocated here? Nothing in this survey (no photos, no
    notes.txt) can settle it.
+   *Session 0*: the PVCAM card carries **the camera this stand uses**, a
+   Photometrics Prime 95B (`Camera-1` in the lab's configuration). No
+   Hamamatsu is fitted. The DAQ's wiring is still unknown (part P of #16).
 3. §2 of `docs/hardware/microscope-pc-setup.md` asks every visit for
    `photos/` and `notes.txt`, and, for Nikon PCs with `nikon-control`
    installed, `nikon-control-adapters.txt` / `nikon-control-stand.txt`.
@@ -156,6 +165,10 @@ was captured this visit.
    `smc-doctor`, `pytest`, `pre-commit`. Without them, what is actually
    connected to COM3, and whether `nikon-control` is even installed on this
    PC, is unknown.
+   *Session 0*: `notes.txt` came back. `nikon-control-scope` is not on the
+   PC's `PATH`, but a `nikon-control` checkout is there, with the
+   `MMConfig.cfg` it generated on 2026-09-16. COM3 is an FTDI FT232R; what
+   it is cabled to is still unknown (part P). Photos: none yet.
 4. Whether **`Ti2_Mic_Driver.dll` was copied** into the Micro-Manager
    adapter folder (`docs/hardware/microscope-pc-setup.md` §1, "Nikon Ti2
    only") cannot be confirmed from this survey: `smc discover` does not
@@ -164,14 +177,201 @@ was captured this visit.
    proof the SDK was reached. A future visit needs `--probe-adapter` (vendor
    software closed, stand powered before the controller box, per
    `docs/hardware/inventory.md`) to settle it.
+   *Session 0*: settled. `Ti2_Mic_Driver.dll` 2.1.0.159 is beside the
+   adapter, with the same SHA-256 as the copy in `Ti2-SDK\bin`, and the hub
+   initialises.
 5. `smc doctor` only validated the demo configuration this visit (no
    profile/`.cfg` existed yet), so none of the Ti2-specific facts already in
    `docs/hardware/inventory.md` (four `XYStage` devices, PFS as a `Stage`
    device, `DiaLamp`/`Turret1Shutter`/`Turret2Shutter`) were re-confirmed —
    they still rest on the earlier `nikon-control`-derived institutional
    knowledge, not on this survey.
+   *Session 0*: all re-confirmed on the stand (below).
 6. A second Micro-Manager install, `Micro-Manager-75.20260319`, sits
    alongside the fresh `Micro-Manager_2.0.3_20260914` nightly. Both look
    like device-interface 75 by name (**inferred**, not confirmed by either
    tool), so no DIV mismatch is apparent, but why a second install exists is
    not stated.
+   *Session 0*: `mmcore list` gives device interface 75 for both and marks
+   `Micro-Manager-75.20260319` "incompatible". Whether anything uses it
+   is still unknown.
+
+## Session 0 — the stand through pymmcore
+
+Run on 2026-10-07 from a remote connection, with nobody at the stand,
+following the plan on #16. Nothing was commanded: the hub and its
+peripherals were initialised and read, and released. NIS-Elements 6.20.02
+and Ti2 Control 2.90.108 were closed, and the stand was powered before the
+controller. Commit `f92bf85` (smc 0.0.1, pymmcore-plus 0.18.1, Python
+3.14.7). On 2026-10-14, a second remote read added a property dump of every
+device through the lab's configuration, the Windows driver store, and the
+corrected property check of that configuration. Report: #126. The account
+name, host name and serial numbers are redacted.
+
+### The hub's peripherals
+
+The `NikonTi2` hub `Ti2-E__0` initialises, and `getInstalledDevices` lists
+16 peripherals. Each one loads without being initialised, which is enough
+to read its type. All of them then initialise with the hub through the
+lab's configuration. **Ti2 Control 2.90.108 does not crash pymmcore**,
+nosepiece included (2.10/2.20 do, per `inventory.md`).
+
+| label | type | what it holds (read 2026-10-14) |
+|---|---|---|
+| `ZDrive` | Stage | `Speed` 0.50–2.50 mm/s (2.50 set), `Tolerance` 0.000–0.160 µm or `Open` (0.000 set); **focus direction 0, unknown** |
+| `XYStage` | XYStage | `Speed` 0.25–51 mm/s (25 set), `Tolerance` 0–0.80 µm or `Open`, `Invert-X/Y` No |
+| `Nosepiece` | State | 6 positions |
+| `CondenserTurret` | State | 7 positions: `1-OPEN`, `2-Ph1`, `6-Shutter`, `7-N2`; 3–5 unlabelled |
+| `FilterTurret1` | State | 6 positions, all unlabelled |
+| `Turret1Shutter` | Shutter | |
+| `FilterTurret2` | State | 6 positions, labels below |
+| `Turret2Shutter` | Shutter | |
+| `LightPath` | State | `1-EYE`, `2-R100`, `3-AUX`, `4-L100` |
+| `PFS` | AutoFocus | see *PFS* |
+| `PFSOffset` | Stage | position in device units (7803.0 read), focus direction 0 |
+| `IntermediateMagnification` | Magnifier | `1.0x` or `1.5x`, **read-only**: a manual lever the stand reports |
+| `DiaLamp` | Shutter | `Intensity`, a free number (501 read), and `State` |
+| `TIRF1`–`TIRF3` | XYStage | (0, 0); `XPosition`/`YPosition` 0 |
+
+- Every peripheral's installed description is `N/A`, and its description
+  is empty once loaded. Role resolution has names and types only.
+- `Ti2-Simulator` fails with `(Error message unavailable) (-10)` when the
+  real stand is connected.
+- `smc discover --probe-adapter NikonTi2` initialises `Ti2-E__0` and
+  reports no peripherals and no note: that is #48. The
+  load-without-initialising loop above is the evidence that #48's design
+  works on this stand.
+
+### The lab's configuration
+
+`MMConfig.cfg`, generated by nikon-control on 2026-09-16, in a nikon-control
+checkout under the account's `software\` folder. `nikon-control-scope` itself
+is not on `PATH`.
+
+- It loads the hub, the same 16 peripherals and `Camera-1` (`PVCAM`). Core
+  roles: camera `Camera-1`, XY `XYStage`, focus `ZDrive`, autofocus `PFS`,
+  shutter `DiaLamp`, auto-shutter on. `smc doctor --config` loads it and
+  every core role answers.
+- **No `System`/`Startup` preset, and no device property set during
+  loading**: only `Core` properties. The checks are in the
+  hardware-session skill.
+- **No pixel-size configuration**, so smc reports the pixel size as 0,
+  unknown. **No `Core,TimeoutMs`** either: MMCore's 5 s default applies unless
+  the profile sets `device_timeout_ms`.
+- One config group, `Channel`, with one preset, `BF`: `CondenserTurret`
+  `7-N2`, `FilterTurret1` `1-`, `Turret1Shutter` 0, `FilterTurret2`
+  `1-ANALY`, `Turret2Shutter` 0, `LightPath` `4-L100`, `DiaLamp` state 0 and
+  intensity 210, exposure 10 ms.
+- **The state labels are the configuration's** (`Label,…` lines), written by
+  nikon-control from what the stand reported on 2026-09-16. The adapter's
+  own labels were not read. Nosepiece: `1-Plan Fluor 4x`,
+  `2-Plan Fluor 10x`, `3-Plan Apo LmbdD0.25 40x`, `4-` to `6-` empty. NA and
+  immersion are not known yet (part P6). FilterTurret2: `1-ANALY`,
+  `2-MXR00700 -96372 - GF`, `3-96372 - GF96373 - YF`,
+  `4-96373 - YF96375 - mC`, `5-96375 - mCMXR00712 -`, `6-MXR00712 -`. Each
+  of these is two 10-character fragments, and the second fragment of one
+  position is the first of the next. They look like truncated part names
+  (GFP, YFP and mCherry cubes, **inferred**), so they cannot be used as
+  channel names. Whether the adapter or nikon-control cut them is unknown.
+- MMCore offers `PFSOffset` as a `Core,Focus` device too, and `TIRF1`–`3` as
+  `Core,XYStage` devices.
+- A comment in the file records that `HamamatsuHam_DCAM` did not connect
+  (`Native module failed to load (6)`), and the smc probe says the same.
+  **No Hamamatsu is fitted.**
+
+### PFS
+
+Read on 2026-10-14 with continuous focus off: `FocusMaintenance` `Off`
+(`Off`/`On`, writable), `PFS in Range` `Out of Range` (read-only),
+`PFS Status` `0000000000000000` (read-only, 16 characters),
+`DichroicMirrorInserted` `Yes` (writable), `LEDIntensity` 40. Which of
+these reads *in range* and *locked* while PFS works is unknown until a
+session with PFS on.
+
+### Camera: Photometrics Prime 95B
+
+- `Camera-1`, PVCAM 3.10.2, adapter 1.4.5, firmware 19.35, chip `GS400BSI`,
+  **1412×1412**, 16-bit (`Mono16`), port `CMOS`, readout `100MHz 16bit` (or
+  `200MHz 12bit`), gain `1-HDR` only, binning 1×1 or 2×2, cooled to −15 °C.
+- 1412×1412 on a GSENSE400BSI is the 22 mm variant of the Prime 95B
+  (**inferred**). Its 11 µm pixels are the datasheet's figure, not a
+  measurement.
+- At a 10 ms exposure the camera reports a readout of 29.03 ms and a clear
+  of 58.06 ms (`ClearMode` `Pre-Exposure`, 2 cycles). A snap costs much more
+  than its exposure (#24).
+- **Despeckle is on.** Post-processing filters PP1–PP4 (despeckle bright
+  low/high, dark low/high) are enabled; denoising and QuantView are off.
+  They change pixel values. Whether that is intended is a question for
+  the owner.
+- Trigger `Internal Trigger`, `ExposeOutMode` `First Row`; a circular buffer
+  of 20 frames; metadata off.
+
+### The rest of the PC
+
+- **Andor Zyla**: present, switched off during the session, and not in
+  the configuration. Its interface is unknown. The driver store holds Andor
+  WinUSB/libusb drivers and a BitFlow (CameraLink frame grabber) driver,
+  so either is possible (part P5). The `AndorSDK3` adapter does not load.
+  The adapter folder holds `atmcd64d.dll` (the SDK2 runtime) and no SDK3
+  `at*.dll`, although "Andor Driver Pack 3" is installed in
+  `Program Files`. The likely cause is that the SDK3 runtime DLLs are not
+  beside the adapter (**inferred**).
+- **Lumencor Spectra**, the epi light: on neither the hub nor the
+  configuration. Its model and its link are unknown (part P3). COM3, an
+  FTDI FT232R, is a candidate (**inferred**).
+- **NI PCIe-6323**: NI drivers are installed; its wiring is unknown (part P4).
+
+### Positions, for the record
+
+| | 2026-10-07 | 2026-10-14 |
+|---|---|---|
+| XY (µm) | (4125.0, −7214.6) | (−4465.2, −16603.3) |
+| Z (µm) | 1792.18 | 4199.8 |
+| Nosepiece | — | `2-Plan Fluor 10x` |
+
+The stand was used between the two reads. Neither reading is a travel
+limit: the Z and XY soft limits are still unmeasured (part P2).
+
+### The console on this PC (cp850, conhost)
+
+Rehearsed on the demo devices.
+
+- Redirected without `PYTHONUTF8`, `smc doctor` writes `?` for `✓` and a
+  wrong byte for `µ`, and does not crash (FM-20). With `PYTHONUTF8=1`, the
+  files are correct UTF-8; only `type` shows them wrong.
+- Redirected tables wrap at 80 columns. The install path ends in
+  `Micro-Man…`, and the `--config` table title is cut (#94, FM-37).
+- In a 9 s snap, a Ctrl-C after about 2 s prints `✗ interrupted` only when
+  the exposure ends. The exit code is 130 and no file is written. The
+  line speaks of a move (#94).
+- A QuickEdit selection freezes output until Esc. With a selection up,
+  the first Ctrl-C only copies it; the second interrupts.
+- A Ctrl-C during the contracts stops cleanly: no later test starts, and
+  nothing needs putting back. A Ctrl-C while pytest is still starting (its
+  first run under 3.14 is slow) prints pytest's own `KeyboardInterrupt`
+  traceback.
+- The DemoCamera ignores an exposure above 10 000 ms, and `smc snap` does
+  not say so (#125).
+
+### Profile entries, measured
+
+For the Ti2 profile. Its form, and where its configuration file lives, are
+M2's design (#13).
+
+- `[micromanager] config`: the lab's `MMConfig.cfg`, with which every role
+  fills. `device_timeout_ms = 60000`, because the file leaves MMCore at 5 s.
+- Roles: the configuration's core roles plus the heuristics fill all ten.
+  `light_source` wrongly offers `LightPath` (#124). `filter_turret` has two
+  real candidates, `FilterTurret1` (unlabelled) and `FilterTurret2` (the
+  named cubes): the profile chooses once part P6 says what each holds.
+- Z direction: the adapter gives none, so the profile must say (#98).
+- `[camera] pixel_size_um`: nothing measured yet. The 1.5× magnifier
+  multiplies it, so a per-objective table alone is not enough.
+- `[safety]` soft limits: unmeasured (part P2).
+
+### Still open: part P of #16, at the stand
+
+Z and the objective's height (P1); Z and XY travel limits, read by hand
+(P2); the Spectra's model and link (P3); the DAQ's wiring (P4); the Zyla's
+interface and the Prime 95B's port (P5); the objectives and the cubes in
+each position (P6); photos.

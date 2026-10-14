@@ -17,7 +17,17 @@ Produce a one-page checklist for the operator:
 2. Power-on order and vendor-software state (NIS-Elements / ZEN / Ti2
    Control closed; Ti2: stand before controller; Observer 7: restart PC,
    camera, then stand).
-3. `smc doctor --config <cfg>` (or `--profile`), expected output.
+3. `smc doctor --config <cfg>` (or `--profile`), expected output. Load a
+   `.cfg` only if both checks print nothing: a `System`/`Startup` preset
+   runs on every load, `--dry-run` included (#78), and so does a device
+   property set during loading.
+   ```bat
+   findstr /n /i "ConfigGroup,System,Startup" <cfg>
+   findstr /n /i /r "^Property," <cfg> | findstr /v /i /c:":Property,Core,"
+   ```
+   Not `findstr /i /r "^Property,[^C]"`: with `/i` the class ignores case
+   too, so it skips every device whose label starts with C or c (a
+   `CondenserTurret`).
 4. Contract tests: `pytest -m hardware --profile <name> tests/contracts -x`.
 5. The specific checks, each as a command with expected result and the
    safety note (clearance before any Z or turret move; jog guard on).
@@ -27,7 +37,11 @@ Produce a one-page checklist for the operator:
 
 From the raw log the operator pastes:
 
-1. File a **Hardware session report** issue (template) — raw log included.
+1. File a **Hardware session report** issue (template) — raw log included,
+   as excerpts with the account name, host name and serial numbers
+   redacted: the repository is public, and the whole folder stays in
+   `local/surveys/<stand>/`. Say which excerpts are summarised or
+   translated.
 2. Extract every finding into: a profile entry, a `FakeCore` test, a
    heuristic with a test, or a line in `docs/hardware/inventory.md`.
 3. Open follow-up issues with the right `scope:` label; link them from the
