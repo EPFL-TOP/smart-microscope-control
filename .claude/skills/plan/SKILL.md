@@ -83,7 +83,12 @@ the plan, do what it unlocks (labels, dependents), and end the session.
   the demo devices or a library (a pixel size, whether a device reports
   busy, what a call blocks on) is checked first with a one-off script on
   `open_core(None)`, and the plan says it was measured. #5's plan said the
-  demo reports a pixel size of 0; it reports 1.0.
+  demo reports a pixel size of 0; it reports 1.0. The same holds for what
+  the plan says about our own code (what a lock guards, what a flag
+  means) and for every test mechanism it prescribes (a monkeypatch, a
+  subclass, a fake): run it once in that script. #80's plan misread
+  `_nested`; #77's plan prescribed setting an attribute that `CMMCorePlus`
+  refuses, and missed that pymmcore-plus reverses the search-path order.
 - **One plan per issue, always complete.** `/develop` and `point.py` read
   only the latest comment starting with `## Plan`, so a partial
   `## Plan amendment` hides the plan it amends. Correct a posted plan by
