@@ -772,7 +772,7 @@ def test_timeout_kills_the_adapter_childs_helper_processes(
     # FM-35: kill() alone leaves a helper process the child started running.
     heartbeat = tmp_path / "heartbeat.txt"
     # The grandchild's own lifetime is bounded (60 s) so that a failing run
-    # does not leak an infinite loop (FM-85).
+    # does not leak an infinite loop (FM-86).
     body = rf"""
 write_result()
 import subprocess, sys, time
@@ -795,7 +795,7 @@ time.sleep(30)
     assert heartbeat.exists(), "the grandchild never started writing its heartbeat"
 
     # The kill only queues the signal: the first read right after mm_section
-    # returns can still see one more tick (FM-85, #131). So wait until the
+    # returns can still see one more tick (FM-86, #131). So wait until the
     # heartbeat has been quiet over a window of ten ticks, and fail only at
     # the deadline. os.kill(pid, 0) is no liveness probe: it kills on Windows
     # and answers "alive" for a POSIX zombie.
