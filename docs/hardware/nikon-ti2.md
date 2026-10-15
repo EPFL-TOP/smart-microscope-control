@@ -296,16 +296,17 @@ session with PFS on.
 - `Camera-1`, PVCAM 3.10.2, adapter 1.4.5, firmware 19.35, chip `GS400BSI`,
   **1412×1412**, 16-bit (`Mono16`), port `CMOS`, readout `100MHz 16bit` (or
   `200MHz 12bit`), gain `1-HDR` only, binning 1×1 or 2×2, cooled to −15 °C.
-- 1412×1412 on a GSENSE400BSI is the 22 mm variant of the Prime 95B
-  (**inferred**). Its 11 µm pixels are the datasheet's figure, not a
-  measurement.
+- It is the **22 mm variant** of the Prime 95B (purchase quote: 1412×1412,
+  11 µm pixels, PCIe or USB 3.0). The 11 µm figure comes from the
+  datasheet; it has not been measured.
 - At a 10 ms exposure the camera reports a readout of 29.03 ms and a clear
   of 58.06 ms (`ClearMode` `Pre-Exposure`, 2 cycles). A snap costs much more
   than its exposure (#24).
 - **Despeckle is on.** Post-processing filters PP1–PP4 (despeckle bright
   low/high, dark low/high) are enabled; denoising and QuantView are off.
-  They change pixel values. Whether that is intended is a question for
-  the owner.
+  They change pixel values. *Owner, 2026-10-15*: despeckle is the
+  camera's default and the lab keeps it; denoising and denoising.ai are
+  not used. So smc leaves these settings as the camera has them.
 - Trigger `Internal Trigger`, `ExposeOutMode` `First Row`; a circular buffer
   of 20 frames; metadata off.
 
@@ -313,19 +314,70 @@ session with PFS on.
 
 - **Andor Zyla**: present, switched off during the session, and not in
   the configuration. **Not used on this stand** (owner, 2026-10-14), so smc
-  ignores it and nobody needs to fix its adapter. Its interface is unknown. The driver store holds Andor
-  WinUSB/libusb drivers and a BitFlow (CameraLink frame grabber) driver,
-  so either is possible. The `AndorSDK3` adapter does not load.
+  ignores it and nobody needs to fix its adapter. Its interface is
+  unknown: the driver store holds Andor WinUSB/libusb drivers and a BitFlow
+  (CameraLink frame grabber) driver. The `AndorSDK3` adapter does not load.
   The adapter folder holds `atmcd64d.dll` (the SDK2 runtime) and no SDK3
   `at*.dll`, although "Andor Driver Pack 3" is installed in
   `Program Files`. The likely cause is that the SDK3 runtime DLLs are not
   beside the adapter (**inferred**).
-- **The epi light: unconfirmed.** Session 0's `notes.txt` names a
-  Lumencor Spectra, which is on neither the hub nor the configuration. Who
-  wrote that line, and from what source, is not recorded, so it is to be
-  confirmed at the stand (part P3), together with its model and its link.
-  COM3, an FTDI FT232R, is a candidate link (**inferred**).
-- **NI PCIe-6323**: NI drivers are installed; its wiring is unknown (part P4).
+- **The epi light is a Lumencor Spectra III** (owner, 2026-10-15, and the
+  purchase quote). It is on neither the hub nor the configuration. Which of
+  its control ports is cabled is unknown (part P3): Ethernet, USB-B serial,
+  RS-232, or TTL. COM3, an FTDI FT232R, is a candidate (**inferred**).
+- **NI PCIe-6323**: NI drivers are installed. It was bought with a trigger
+  breakout box, together with the piezo below and NIS-Elements' fast
+  triggering module. It probably drives the piezo by analog output and
+  triggers the light (**inferred**). Its wiring is to be confirmed (part P4).
+- **No Mad City Labs device appears on USB**, although a piezo was bought
+  (below). Either it is not installed, or its controller is not connected
+  to the PC by USB.
+
+### What was bought (purchase quotes, 2024-11 and 2025-05)
+
+The owner provided the two purchase quotes; they stay private in `local/`.
+They say what was ordered, not what is installed. Each line below is either
+matched to a session 0 measurement or marked "not seen".
+
+- **Stand**: Ti2-E with an encoded motorised Z drive (10 nm steps open
+  loop, 20 nm closed loop), the TI2-CTRE controller, a PFS unit with a
+  motorised nosepiece, and a motorised encoded XY stage with joystick,
+  well-plate holder and stage-up kit. The light path has four positions
+  (left 100 %, eyepiece 100 %, right 100 %, left/eye 80/20). The stand
+  reports them as `1-EYE`, `2-R100`, `3-AUX`, `4-L100`; how `AUX` maps to
+  80/20 is unknown.
+- **No TIRF illuminator.** So `TIRF1`–`TIRF3`, listed by the hub at
+  (0, 0), are devices with nothing behind them (**inferred**).
+- **Condenser**: a motorised condenser turret (long working distance,
+  NA 0.52, WD 30 mm) with Ph1 and dry DIC (N2) modules, a 40× DIC slider,
+  an intelligent polarizer, and an **analyzer cube**. These match
+  `CondenserTurret` `2-Ph1` and `7-N2`, and `FilterTurret2` `1-ANALY`.
+- **Epi**: an EPI-FL module (25 mm field), **two motorised epi filter
+  turrets**, the Spectra III, a 2 m liquid light guide, and a DB15-to-9-BNC
+  trigger cable. The Spectra III has 8 channels, with filters 390/22,
+  440/20, 475/28, 510/25, 555/28, 575/25, 635/22 and 740/20.
+- **Cubes** (Semrock, Ti2 format, zero pixel shift): DAPI-1160B, GFP-4050B
+  (466/40 → 525/50), YFP-2427B (500/24 → 542/27), mCherry-C
+  (562/40 → 641/75) and Cy5-4040C (628/40 → 692/40). FilterTurret2's
+  truncated labels start with `MXR00700` (DAPI), `96372 - GF`,
+  `96373 - YF`, `96375 - mC` and `MXR00712` (Cy5). FilterTurret2 therefore
+  probably holds, from 1 to 6: analyzer, DAPI, GFP, YFP, mCherry, Cy5. Six
+  items fill one turret, so FilterTurret1 is probably empty (both
+  **inferred**; part P6 confirms).
+- **Dia**: an LED lamp house (`DiaLamp`), a dia filter slider and a
+  rectangular field-stop slider.
+- **Objectives**: CFI Plan Fluor DL 4XF (NA 0.13, WD 16.4 mm, PhL),
+  CFI Plan Fluor DL 10XF (NA 0.30, WD 15.2 mm, Ph1), and CFI Plan
+  Apochromat Lambda D 40X (the quote gives no NA). They match nosepiece
+  positions 1–3. Nothing was bought for positions 4–6.
+- **Piezo**: a **Mad City Labs Nano-Z100-N2** sample Z insert (100 µm
+  travel, closed loop, Nano-Drive controller), with well-plate and
+  universal holders. **Not seen by session 0** (see above). If it is used,
+  it is a second focus device that M2 must know about (#13).
+- **Incubation**: an Okolab BL3 cage incubator with a heated chamber for
+  the piezo stage. Not seen by session 0.
+- **Software**: NIS-Elements AR, with modules for fast triggering, 6D, a
+  wavelength switcher and Z drive control.
 
 ### Positions, for the record
 
@@ -368,17 +420,21 @@ M2's design (#13).
   fills. `device_timeout_ms = 60000`, because the file leaves MMCore at 5 s.
 - Roles: the configuration's core roles plus the heuristics fill all ten.
   `light_source` wrongly offers `LightPath` (#124). `filter_turret` has two
-  real candidates, `FilterTurret1` (unlabelled) and `FilterTurret2` (the
-  named cubes): the profile chooses once part P6 says what each holds.
+  real candidates, `FilterTurret1` (unlabelled, probably empty) and
+  `FilterTurret2` (the cubes): probably `FilterTurret2`, once part P6
+  confirms it.
 - Z direction: the adapter gives none, so the profile must say (#98).
-- `[camera] pixel_size_um`: nothing measured yet. The 1.5× magnifier
-  multiplies it, so a per-objective table alone is not enough.
+- `[camera] pixel_size_um`: nothing measured yet. The nominal values,
+  11 µm divided by the magnification, are 2.75 µm (4×), 1.1 µm (10×) and
+  0.275 µm (40×) at 1.0×. They are assumed, not measured; camera
+  calibration (#22) measures them. The 1.5× magnifier divides them by 1.5,
+  so a table keyed by objective alone is not enough.
 - `[safety]` soft limits: unmeasured (part P2).
 
 ### Still open: part P of #16, at the stand
 
 Z and the objective's height (P1); Z and XY travel limits, read by hand
-(P2); the epi light: whether it is a Spectra, its model and link (P3); the
-DAQ's wiring (P4); the Prime 95B's port (P5); the objectives and the cubes
-in each position (P6); the Prime 95B's despeckle setting as NIS-Elements
-uses it; photos.
+(P2); which of the Spectra III's control ports is cabled (P3); the DAQ's
+wiring, and whether the MCL piezo is installed and how it is driven (P4);
+the Prime 95B's port (P5); confirm the cubes in both turrets and that
+nosepiece positions 4–6 are empty (P6); photos.

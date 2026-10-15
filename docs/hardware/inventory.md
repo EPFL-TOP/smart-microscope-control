@@ -50,8 +50,12 @@ New findings arrive as *Hardware session report* issues and land here.
   **Photometrics Prime 95B** through `PVCAM` (`Camera-1`, 1412×1412, 16-bit;
   PVCAM despeckle filters on by default). nikon-control's notes named a
   Hamamatsu, which is not fitted (session 0). An Andor Zyla is present but
-  unused. The epi light (named as a Lumencor Spectra, still to be
-  confirmed) is not on the hub.
+  unused. The epi light, a **Lumencor Spectra III**, is not on the hub; nor
+  is the Mad City Labs Nano-Z100 piezo insert that was bought with the
+  stand.
+- Our Ti2-E has no TIRF illuminator (none was bought; **inferred** from the
+  purchase quote), yet the hub lists `TIRF1`–`TIRF3` at (0, 0): it lists
+  them whether or not anything is behind them.
 - `DiaLamp` is the brightfield shutter/lamp; `Turret1Shutter`/
   `Turret2Shutter` are epi shutters. Intensity is a device *property*, not
   an MMCore API — found by property-name hints on light-like devices.
