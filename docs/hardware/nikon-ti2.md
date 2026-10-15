@@ -323,18 +323,32 @@ session with PFS on.
   `Program Files`. The likely cause is that the SDK3 runtime DLLs are not
   beside the adapter (**inferred**).
 - **The epi light is a Lumencor Spectra III** (owner, 2026-10-15, and the
-  purchase quote). It is on neither the hub nor the configuration. Which of
-  its control ports is cabled is unknown (part P3): Ethernet, USB-B serial,
-  RS-232, or TTL. COM3, an FTDI FT232R, is a candidate (**inferred**).
-- **NI PCIe-6323**: NI drivers are installed. It was bought with a trigger
-  breakout box, together with the piezo below and NIS-Elements' fast
-  triggering module. It probably drives the piezo by analog output and
-  triggers the light (**inferred**). Its wiring is to be confirmed (part P4).
+  purchase quote). It is on neither the hub nor the configuration. Its
+  **USB** and **TTL** (DB15) ports are cabled; LAN and RS-232 are not
+  (photos). COM3 (FTDI FT232R) is the PC's only serial port, so it is
+  probably the Spectra's USB link (**inferred**). The TTL lines come from
+  the NI breakout box (below).
+- **NI PCIe-6323**, with its trigger breakout box. The owner traced each
+  BNC (2026-10-15):
+
+  | NI line | goes to | carries (**inferred** from the wiring) |
+  |---|---|---|
+  | `AO 0` | MCL Nano-Drive `input` | the piezo's position, as a voltage |
+  | `P0.0`–`P0.7` | Spectra III TTL breakout | one line per light channel, 8 channels |
+  | `PFI 1` | a multi-lead breakout whose red lead reads `TRIGGER IN` | the Prime 95B's trigger |
+  | `PFI 0` | the Andor Zyla | its trigger (the Zyla is unused) |
+
+  The `PFI 1` breakout's other leads read `EXPOSE OUT …`, like a
+  Photometrics camera I/O cable. The owner traced its main cable to the
+  TI2-CTRE controller; whether it ends at the camera or at the controller
+  is to be confirmed.
 - **The Mad City Labs piezo is installed and used for Z scans** (owner,
   2026-10-15), although no MCL device appears on USB. Its Nano-Drive
-  controller takes a BNC cable from the NI breakout box and drives the
-  stage insert through its own cable. So the piezo is driven by the DAQ's
-  analog output, not by a USB command. One Micro-Manager route is the
+  controller's `input` takes `AO 0` from the NI breakout box, and its DB15
+  output drives the stage insert. Its `sensor` output (the measured
+  position) and its own USB port are not connected, so nothing reads the
+  piezo's position back. The piezo is driven by the DAQ's analog output,
+  not by a USB command. One Micro-Manager route is the
   `NIDAQ` adapter's analog output, wrapped as a Z stage by `Utilities`' DA Z
   Stage. That is an option for M2; it has **not been tried**.
 
@@ -439,8 +453,8 @@ M2's design (#13).
 - `[safety]` soft limits, **set by the owner** (2026-10-15) for plate work,
   not measured end stops: `xy_soft_limits_um = [[-49000, 49000],
   [-29000, 29000]]`. Z must never go above **4350 µm**, where the 40× is
-  close to the sample. The lower Z limit is still unknown, and the schema
-  needs both bounds. Set `max_z_jog_um` too: without it, every command
+  close to the sample. The bottom of the travel reads about 5–6 µm, so a
+  lower bound just above it completes `z_soft_limits_um`. Set `max_z_jog_um` too: without it, every command
   warns that the 100 µm default is assumed.
 
 ### Part P, at the stand (2026-10-15)
@@ -450,15 +464,21 @@ With the owner at the stand; smc only read.
 - **P1**: `smc z get` gave Z 4256.48 µm, and `smc stage get` gave XY
   (23070.30, −8804.70) µm.
 - **P2**: the owner set the limits above, from plate work rather than from
-  the end stops.
-- **P3**: the Spectra III's back panel was photographed. Which port is
-  cabled is not settled yet.
-- **P4**: the MCL Nano-Drive is cabled by BNC to the NI breakout box, and
-  by its own cable to the stage insert. Photos taken.
+  the end stops. With the focus knob turned fully down, Z reads about
+  5–6 µm: that is the bottom of the travel.
+- **P3**: the Spectra III's USB and TTL ports are cabled; LAN and RS-232
+  are not (photos).
+- **P4**: the NI wiring is in the table above, and the piezo is described
+  above (photos).
 - **P5**: the Prime 95B is on the left port (`4-L100`).
-- **P6**: NIS-Elements shows two turrets, "up" and "low"; only "up" has
-  its six positions filled.
+- **P6**: NIS-Elements shows two turrets, "up" and "low". Only "up" is
+  filled: `ANALY`, then DAPI, GFP, YFP, mCherry, Cy5, as inferred from the
+  labels.
 
-Still open: the Spectra III's cabled port and its trigger cable (P3); the
-NI channel that drives the piezo, and the Nano-Drive's input range (P4); the
-order of the six cubes in the "up" turret; the lower Z limit.
+Photos (private) show the Spectra III's back panel, the Nano-Drive with
+the NI breakout box, the piezo insert, the TI2-CTRE, and the
+`TRIGGER IN` lead.
+
+Still open, both minor: confirm that COM3 is the Spectra's USB link (it
+disappears from Device Manager when that cable is unplugged); and where the
+`PFI 1` breakout's main cable ends, at the camera or at the TI2-CTRE.
