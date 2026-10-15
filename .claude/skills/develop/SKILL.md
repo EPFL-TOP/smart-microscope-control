@@ -15,7 +15,8 @@ them if it is not the one you run on.
 
 0. If the issue already has an open PR whose latest `## Review` says
    **Verdict: changes requested**, go to *Addressing a review* at the end.
-1. Read `CLAUDE.md`, then `gh issue view $ARGUMENTS --comments`. Find the
+1. Read `CLAUDE.md`, then `gh issue view $ARGUMENTS --comments` (if it
+   prints nothing, `gh issue view $ARGUMENTS --json body,comments`). Find the
    latest comment starting with `## Plan`. No plan, or no `status: ready`
    label → stop and comment "No plan / not ready — needs `/plan` first."
 2. Read the design-doc sections and ADRs the plan names, the failure modes
