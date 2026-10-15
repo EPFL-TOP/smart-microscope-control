@@ -306,7 +306,8 @@ session with PFS on.
   low/high, dark low/high) are enabled; denoising and QuantView are off.
   They change pixel values. *Owner, 2026-10-15*: despeckle is the
   camera's default and the lab keeps it; denoising and denoising.ai are
-  not used. So smc leaves these settings as the camera has them.
+  not used. smc leaves them as the camera has them until it offers the
+  same options as NIS-Elements (#134).
 - Trigger `Internal Trigger`, `ExposeOutMode` `First Row`; a circular buffer
   of 20 frames; metadata off.
 
@@ -329,9 +330,13 @@ session with PFS on.
   breakout box, together with the piezo below and NIS-Elements' fast
   triggering module. It probably drives the piezo by analog output and
   triggers the light (**inferred**). Its wiring is to be confirmed (part P4).
-- **No Mad City Labs device appears on USB**, although a piezo was bought
-  (below). Either it is not installed, or its controller is not connected
-  to the PC by USB.
+- **The Mad City Labs piezo is installed and used for Z scans** (owner,
+  2026-10-15), although no MCL device appears on USB. Its Nano-Drive
+  controller takes a BNC cable from the NI breakout box and drives the
+  stage insert through its own cable. So the piezo is driven by the DAQ's
+  analog output, not by a USB command. One Micro-Manager route is the
+  `NIDAQ` adapter's analog output, wrapped as a Z stage by `Utilities`' DA Z
+  Stage. That is an option for M2; it has **not been tried**.
 
 ### What was bought (purchase quotes, 2024-11 and 2025-05)
 
@@ -372,8 +377,8 @@ matched to a session 0 measurement or marked "not seen".
   positions 1–3. Nothing was bought for positions 4–6.
 - **Piezo**: a **Mad City Labs Nano-Z100-N2** sample Z insert (100 µm
   travel, closed loop, Nano-Drive controller), with well-plate and
-  universal holders. **Not seen by session 0** (see above). If it is used,
-  it is a second focus device that M2 must know about (#13).
+  universal holders. Installed and used for Z scans (see above): a second
+  focus device that M2 must plan for (#13).
 - **Incubation**: an Okolab BL3 cage incubator with a heated chamber for
   the piezo stage. Not seen by session 0.
 - **Software**: NIS-Elements AR, with modules for fast triggering, 6D, a
@@ -420,21 +425,40 @@ M2's design (#13).
   fills. `device_timeout_ms = 60000`, because the file leaves MMCore at 5 s.
 - Roles: the configuration's core roles plus the heuristics fill all ten.
   `light_source` wrongly offers `LightPath` (#124). `filter_turret` has two
-  real candidates, `FilterTurret1` (unlabelled, probably empty) and
-  `FilterTurret2` (the cubes): probably `FilterTurret2`, once part P6
-  confirms it.
+  real candidates. It should be assigned to **`FilterTurret2`**, NIS's
+  "up" turret: the only one with six cubes. `FilterTurret1`, NIS's "low"
+  turret, is empty. Matching up/low to 2/1 rests on which turret has
+  labels (**inferred**).
+- Light path to the camera: `4-L100`. The Prime 95B is on the left port.
 - Z direction: the adapter gives none, so the profile must say (#98).
 - `[camera] pixel_size_um`: nothing measured yet. The nominal values,
   11 µm divided by the magnification, are 2.75 µm (4×), 1.1 µm (10×) and
   0.275 µm (40×) at 1.0×. They are assumed, not measured; camera
   calibration (#22) measures them. The 1.5× magnifier divides them by 1.5,
   so a table keyed by objective alone is not enough.
-- `[safety]` soft limits: unmeasured (part P2).
+- `[safety]` soft limits, **set by the owner** (2026-10-15) for plate work,
+  not measured end stops: `xy_soft_limits_um = [[-49000, 49000],
+  [-29000, 29000]]`. Z must never go above **4350 µm**, where the 40× is
+  close to the sample. The lower Z limit is still unknown, and the schema
+  needs both bounds. Set `max_z_jog_um` too: without it, every command
+  warns that the 100 µm default is assumed.
 
-### Still open: part P of #16, at the stand
+### Part P, at the stand (2026-10-15)
 
-Z and the objective's height (P1); Z and XY travel limits, read by hand
-(P2); which of the Spectra III's control ports is cabled (P3); the DAQ's
-wiring, and whether the MCL piezo is installed and how it is driven (P4);
-the Prime 95B's port (P5); confirm the cubes in both turrets and that
-nosepiece positions 4–6 are empty (P6); photos.
+With the owner at the stand; smc only read.
+
+- **P1**: `smc z get` gave Z 4256.48 µm, and `smc stage get` gave XY
+  (23070.30, −8804.70) µm.
+- **P2**: the owner set the limits above, from plate work rather than from
+  the end stops.
+- **P3**: the Spectra III's back panel was photographed. Which port is
+  cabled is not settled yet.
+- **P4**: the MCL Nano-Drive is cabled by BNC to the NI breakout box, and
+  by its own cable to the stage insert. Photos taken.
+- **P5**: the Prime 95B is on the left port (`4-L100`).
+- **P6**: NIS-Elements shows two turrets, "up" and "low"; only "up" has
+  its six positions filled.
+
+Still open: the Spectra III's cabled port and its trigger cable (P3); the
+NI channel that drives the piezo, and the Nano-Drive's input range (P4); the
+order of the six cubes in the "up" turret; the lower Z limit.
