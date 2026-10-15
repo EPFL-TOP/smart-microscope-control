@@ -730,13 +730,15 @@ def test_timeout_kills_the_adapter_childs_helper_processes(
 ) -> None:
     # FM-35: kill() alone leaves a helper process the child started running.
     heartbeat = tmp_path / "heartbeat.txt"
+    # The grandchild's own lifetime is bounded (60 s) so that a failing run
+    # does not leak an infinite loop (FM-85).
     body = rf"""
 write_result()
 import subprocess, sys, time
 heartbeat = {str(heartbeat)!r}
 grandchild_code = (
     "import time\n"
-    "while True:\n"
+    "for _ in range(600):\n"
     "    with open(" + repr(heartbeat) + ", 'a') as f:\n"
     "        f.write('x')\n"
     "        f.flush()\n"
@@ -750,15 +752,25 @@ time.sleep(30)
     mm_inventory.mm_section(["DemoCamera"], timeout_s=1)
 
     assert heartbeat.exists(), "the grandchild never started writing its heartbeat"
+
+    # The kill only queues the signal: the first read right after mm_section
+    # returns can still see one more tick (FM-85, #131). So wait until the
+    # heartbeat has been quiet over a window of ten ticks, and fail only at
+    # the deadline. os.kill(pid, 0) is no liveness probe: it kills on Windows
+    # and answers "alive" for a POSIX zombie.
+    deadline = time.monotonic() + 10
     last = heartbeat.stat().st_size
     assert last > 0
-
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        time.sleep(0.5)
+    while True:
+        time.sleep(1.0)
         current = heartbeat.stat().st_size
-        assert current == last, "the heartbeat kept growing: the grandchild lives"
+        if current == last:
+            return
         last = current
+        if time.monotonic() >= deadline:
+            pytest.fail(
+                "the heartbeat kept growing 10 s after the kill: the grandchild lives"
+            )
 
 
 class _InterruptedChild:
