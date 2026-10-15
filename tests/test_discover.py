@@ -880,3 +880,30 @@ def test_mm_section_waits_in_short_slices_so_that_ctrl_c_is_seen(
     assert len(waits) >= 2
     assert all(w is not None for w in waits)
     assert max(w for w in waits if w is not None) <= 1.0
+
+
+def test_sliced_wait_keeps_the_deadline_and_never_waits_past_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A fake clock that the fake wait advances: no real time, so no FM-44.
+    now = [0.0]
+    waits: list[float] = []
+
+    class Child:
+        def wait(self, timeout: float) -> int:
+            waits.append(timeout)
+            now[0] += timeout
+            raise subprocess.TimeoutExpired("child", timeout)
+
+    monkeypatch.setattr(
+        mm_inventory, "time", type("Clock", (), {"monotonic": lambda: now[0]})
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        mm_inventory._wait_in_slices(Child(), 1.2)  # type: ignore[arg-type]
+
+    # The total is the deadline, not a multiple of it; the last slice is the
+    # remainder, not a whole slice; no wait is negative.
+    assert sum(waits) == pytest.approx(1.2)
+    assert max(waits) <= mm_inventory._WAIT_SLICE_S
+    assert min(waits) >= 0.0
