@@ -331,17 +331,18 @@ session with PFS on.
 - **NI PCIe-6323**, with its trigger breakout box. The owner traced each
   BNC (2026-10-15):
 
-  | NI line | goes to | carries (**inferred** from the wiring) |
+  | NI line | connected to | carries (**inferred** from the wiring) |
   |---|---|---|
-  | `AO 0` | MCL Nano-Drive `input` | the piezo's position, as a voltage |
-  | `P0.0`–`P0.7` | Spectra III TTL breakout | one line per light channel, 8 channels |
-  | `PFI 1` | a multi-lead breakout whose red lead reads `TRIGGER IN` | the Prime 95B's trigger |
-  | `PFI 0` | the Andor Zyla | its trigger (the Zyla is unused) |
+  | `AO 0` | MCL Nano-Drive `input` | the piezo's position, as a voltage, DAQ to piezo |
+  | `P0.0`–`P0.7` | Spectra III TTL breakout | one line per light channel, DAQ to light |
+  | `PFI 1` | Prime 95B `EXPOSE OUT 1` (green lead) | the camera's exposure signal, camera to DAQ |
+  | `PFI 0` | the Andor Zyla | unknown direction (the Zyla is unused) |
 
-  The `PFI 1` breakout's other leads read `EXPOSE OUT …`, like a
-  Photometrics camera I/O cable. The owner traced its main cable to the
-  TI2-CTRE controller; whether it ends at the camera or at the controller
-  is to be confirmed.
+  The Prime 95B's I/O breakout cable (the "multiplex") also has a red
+  `TRIGGER IN` lead, which goes to the TI2-CTRE controller. So the
+  **camera's exposure clocks the DAQ**, and **the Nikon controller can
+  trigger the camera** (**inferred** from the wiring; the timing itself
+  is NIS-Elements' configuration).
 - **The Mad City Labs piezo is installed and used for Z scans** (owner,
   2026-10-15), although no MCL device appears on USB. Its Nano-Drive
   controller's `input` takes `AO 0` from the NI breakout box, and its DB15
@@ -469,7 +470,8 @@ With the owner at the stand; smc only read.
 - **P3**: the Spectra III's USB and TTL ports are cabled; LAN and RS-232
   are not (photos).
 - **P4**: the NI wiring is in the table above, and the piezo is described
-  above (photos).
+  above (photos). The owner traced the camera's leads: `EXPOSE OUT 1` (green)
+  goes to `PFI 1`; `TRIGGER IN` (red) goes to the TI2-CTRE.
 - **P5**: the Prime 95B is on the left port (`4-L100`).
 - **P6**: NIS-Elements shows two turrets, "up" and "low". Only "up" is
   filled: `ANALY`, then DAPI, GFP, YFP, mCherry, Cy5, as inferred from the
@@ -479,6 +481,5 @@ Photos (private) show the Spectra III's back panel, the Nano-Drive with
 the NI breakout box, the piezo insert, the TI2-CTRE, and the
 `TRIGGER IN` lead.
 
-Still open, both minor: confirm that COM3 is the Spectra's USB link (it
-disappears from Device Manager when that cable is unplugged); and where the
-`PFI 1` breakout's main cable ends, at the camera or at the TI2-CTRE.
+Still open, minor: confirm that COM3 is the Spectra's USB link (it
+disappears from Device Manager when that cable is unplugged).
