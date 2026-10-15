@@ -13,7 +13,7 @@ Style, naming, docs and tests belong to other reviewers; ignore them.
 - the worktree path, a `base` and a `head`: the change is `git -C <worktree> diff <base>...<head>`
 - the issue's plan (a file path), its **Risk** level and the failure modes it says to handle
 - the checklist `docs/design/failure-modes.md`: go through every entry that applies to the changed code
-- a scratch directory of your own. Write any throwaway script, copy or output there with the Write tool, and run it with one plain command (`<worktree>/.venv/bin/python <file>`). The worktree's sandbox refuses heredocs, `$(...)` and pipes into an interpreter, so do not use them.
+- a scratch directory of your own. Write any throwaway script, copy or output there with the Write tool, and run it with one plain command (`<worktree>/.venv/bin/python <file>`). The worktree's sandbox refuses heredocs, `$(...)` and pipes into an interpreter, so do not use them. Never run `pip install` (or `pip install -e`, `uv pip`) with the worktree's `.venv`: its editable install points at the worktree, and a verifier that re-pointed it at a scratch copy made the develop session's own `pytest` run the mutated tree (#120). A modified copy runs through `scripts/dev/mutant.py`, or through `<worktree>/.venv/bin/python -m pytest` from inside the copy.
 
 ## Method
 
