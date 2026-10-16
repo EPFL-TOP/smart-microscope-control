@@ -187,3 +187,10 @@ def test_a_flake_that_failed_main_since_the_last_point_is_listed(point) -> None:
 
 def test_main_without_ci_runs_says_so(point) -> None:
     assert point.main_ci([], "2026-10-01T00:00:00Z") == ["- no CI run on main"]
+
+
+def test_an_open_pr_shows_the_issues_github_will_close(point) -> None:
+    pr = {"closingIssuesReferences": [{"number": 16}, {"number": 13}]}
+    assert point.closes(pr) == "closes #13 #16"
+    assert point.closes({"closingIssuesReferences": []}) == "closes no issue"
+    assert point.closes({}) == "closes no issue"
