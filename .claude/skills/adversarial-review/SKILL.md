@@ -52,9 +52,9 @@ yourself.
    `docs/design/failure-modes.md` gets a new entry in this PR: an id, what
    happens, how to check. Parallel branches add entries too, so take the
    next id after the highest one on any branch, not only on `main`:
-   `git fetch origin`, then
-   `git log --all -p -- docs/design/failure-modes.md | grep -o 'FM-[0-9]*' | sort -t- -k2 -n -u | tail -1`
-   (ids collided between #84 and #10). If an open PR is rewriting the
+   `git fetch origin`, then `.venv/bin/python scripts/dev/next_fm_id.py`
+   (ids collided between #84 and #10, and in #131; one plain command,
+   since the worktree's sandbox refuses a pipe). If an open PR is rewriting the
    same lines, put the entry's text under the Report's **Follow-ups**
    instead; `/point` adds it once that PR merges (#76).
 7. **Record** for the Report, in this shape:
