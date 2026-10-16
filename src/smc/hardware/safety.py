@@ -19,6 +19,10 @@ them (CLAUDE.md, architecture rules):
 * **Non-finite targets** (``nan``, ``inf``) are refused whatever the limits:
   ``nan`` compares false against every bound and would otherwise slip
   through each check and reach the stage driver.
+* **The autofocus offset** (m2 §3.8) has the same guards in its own units,
+  with one difference: with no ``max_autofocus_offset_jog`` in the profile,
+  every non-zero relative change needs ``force=True``. A Z jog limit can be
+  assumed in µm; nobody can assume one for a unit the stand defines.
 
 ``Executor`` runs every action (a mutation, an acquisition) under the
 microscope's one re-entrant lock and implements dry-run. In dry-run,
@@ -97,6 +101,9 @@ class Safety:
         xy_soft_limits_um: tuple[tuple[float, float], tuple[float, float]]
         | None = None,
         max_z_jog_um: float | None = None,
+        max_autofocus_offset_jog: float | None = None,
+        autofocus_offset_soft_limits: tuple[float, float] | None = None,
+        offset_unit: str = "",
     ) -> None:
         if not math.isfinite(max_jog_um) or max_jog_um < 0:
             raise ValueError(f"max_jog_um must be finite and >= 0, got {max_jog_um!r}")
@@ -125,6 +132,28 @@ class Safety:
                 _check_range("xy_soft_limits_um[y]", xy_soft_limits_um[1]),
             )
         )
+        if max_autofocus_offset_jog is not None and (
+            not math.isfinite(max_autofocus_offset_jog) or max_autofocus_offset_jog < 0
+        ):
+            raise ValueError(
+                f"max_autofocus_offset_jog must be finite and >= 0, got "
+                f"{max_autofocus_offset_jog!r}"
+            )
+        #: ``None``: no limit is known, so every non-zero offset jog needs force.
+        self.max_autofocus_offset_jog = (
+            None
+            if max_autofocus_offset_jog is None
+            else float(max_autofocus_offset_jog)
+        )
+        self.autofocus_offset_soft_limits = (
+            None
+            if autofocus_offset_soft_limits is None
+            else _check_range(
+                "autofocus_offset_soft_limits", autofocus_offset_soft_limits
+            )
+        )
+        #: For messages: the profile's unit, or "device units" when unknown.
+        self._offset_unit = offset_unit.strip() or "device units"
 
     def check_jog_um(self, dx_um: float, dy_um: float, *, force: bool) -> None:
         """Refuse a relative XY move above ``max_jog_um`` unless forced.
@@ -206,6 +235,66 @@ class Safety:
             raise SafetyRefusedError(
                 f"Z target {z_um} µm is outside the soft limits [{low}, {high}] µm; "
                 f"change [safety] in the profile if the limits are wrong"
+            )
+
+    def check_offset_jog_native(self, delta: float, *, force: bool) -> None:
+        """Refuse a relative autofocus-offset change above the profile's limit unless forced.
+
+        With no ``max_autofocus_offset_jog``, every non-zero change needs
+        ``force``: a jog of 50 is nothing in one stand's offset units and a
+        crash in another's, so no default is assumed (m2 §3.2). As for Z, the
+        check depends only on the distance and runs before the action.
+
+        Raises:
+            SafetyRefusedError: The jog is too large or no limit is set
+                (forceable), or not finite (never forceable).
+        """
+        unit = self._offset_unit
+        if not math.isfinite(delta):
+            raise SafetyRefusedError(
+                f"autofocus offset jog {delta} {unit} is not a finite distance"
+            )
+        if force:
+            return
+        limit = self.max_autofocus_offset_jog
+        if limit is None:
+            if delta != 0:
+                raise SafetyRefusedError(
+                    f"autofocus offset jog {delta} {unit}: the profile sets no "
+                    f"[safety] max_autofocus_offset_jog, so every relative offset "
+                    f"change needs force=True",
+                    how_to_force=(
+                        "pass force=True, or set [safety] max_autofocus_offset_jog "
+                        "in the profile"
+                    ),
+                )
+            return
+        if abs(delta) > limit:
+            raise SafetyRefusedError(
+                f"autofocus offset jog {delta} {unit} exceeds the offset jog limit "
+                f"of {limit} {unit}",
+                how_to_force="pass force=True",
+            )
+
+    def check_offset_target_native(self, value: float) -> None:
+        """Refuse an autofocus-offset target outside the soft limits; never forceable.
+
+        Raises:
+            SafetyRefusedError: The target is outside the limits or not finite.
+        """
+        unit = self._offset_unit
+        if not math.isfinite(value):
+            raise SafetyRefusedError(
+                f"autofocus offset target {value} {unit} is not a finite position"
+            )
+        if self.autofocus_offset_soft_limits is None:
+            return
+        low, high = self.autofocus_offset_soft_limits
+        if not low <= value <= high:
+            raise SafetyRefusedError(
+                f"autofocus offset target {value} {unit} is outside the soft limits "
+                f"[{low}, {high}] {unit}; change [safety] "
+                f"autofocus_offset_soft_limits in the profile if the limits are wrong"
             )
 
 
@@ -761,13 +850,46 @@ class Executor:
                 that runs inside its command).
             MicroscopeBusyError: The lock was not free within ``lock_timeout_s``.
         """
+        return self._exclusive(description, action)
+
+    def compound(self, description: str, run: Callable[[], T]) -> T:
+        """Run several nested actions as one lock section (m2 §3.7).
+
+        A Z move under an autofocus suspends it, moves and engages it again:
+        three actions that no other thread may come between, since another
+        caller's move after the suspend would run with PFS off and one before
+        the relock would be undone by it. Under the lock, the halt check and
+        the guard run once, as for ``acquire``, then ``run()``. Each nested
+        ``do`` re-enters the lock and runs its own halt check, guard, dry-run
+        handling and motion wait (design §13, "Re-entry"), so ``compound``
+        itself sends nothing and runs in dry-run too. While a nested motion
+        is waited for, other callers are refused at once, naming it.
+
+        Nest only between actions: a nested action inside a motion's command
+        is still refused (``_nested``).
+
+        Raises:
+            MicroscopeHaltedError: The microscope is halted, or was halted
+                since this call, even if ``resume()`` came since.
+            MotionInProgressError: A device is still moving, or the lock holder
+                is waiting for one.
+            MicroscopeBusyError: The lock was not free within ``lock_timeout_s``.
+        """
+        return self._exclusive(description, run)
+
+    def _exclusive(self, description: str, run: Callable[[], T]) -> T:
+        """``run()`` as one lock section, after the halt check and the guard; nothing skipped.
+
+        The body of ``acquire`` (a frame, which dry-run does not skip) and of
+        ``compound`` (whose nested actions handle dry-run themselves).
+        """
         halt_mark = self._halt_mark()
 
         def body() -> T:
             self._refuse_if_halted(halt_mark)
             self._guard()
             self._refuse_if_halted(halt_mark)
-            return action()
+            return run()
 
         return self._section(description, body, halt_mark)
 

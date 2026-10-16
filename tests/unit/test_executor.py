@@ -2379,3 +2379,97 @@ def test_hold_log_does_not_hold_another_threads_lines() -> None:
     assert written_inside, "another thread's line was held"
     assert stoppers[0].error is None
     assert z.stops == 1
+
+
+# --- compound (m2 §3.7) ------------------------------------------------------
+
+
+def test_compound_runs_nested_actions_in_one_lock_section() -> None:
+    # The Z interlock: suspend, move, relock. No other thread's action may come
+    # between them, and one tried during the nested move is refused at once.
+    executor, z = _ex(), _Device("Z", arrive_after=1)
+    events: list[str] = []
+    outsiders: list[_Thread] = []
+    refused: list[BaseException | None] = []
+
+    def outsider_action() -> object:
+        return executor.do(
+            "outsider", _step("outsider", lambda: events.append("outsider"))
+        )
+
+    def during_the_move(polls: int) -> None:
+        if polls == 1:
+            during = _Thread(outsider_action)
+            during.join()
+            refused.append(during.error)
+
+    def move() -> None:
+        events.append("move")
+        z.command()
+
+    def run() -> str:
+        executor.do("af: suspend", _step("af: suspend", lambda: events.append("off")))
+        z.on_poll = during_the_move
+        executor.do(
+            "z: move_to 12.0 µm",
+            Step("z: move_to 12.0 µm", move, lambda: "arrived", "dry"),
+            motion=z.motion,
+            timeout_s=JOIN_S,
+        )
+        # Between two nested actions, another thread waits for the lock (a
+        # nested motion would refuse it at once, as above).
+        outsiders.append(_Thread(outsider_action))
+        assert not outsiders[0].finished_within(0.3), "it ran inside the compound"
+        executor.do("af: engage", _step("af: engage", lambda: events.append("on")))
+        return "landed"
+
+    assert executor.compound("z: move_to 12.0 µm", run) == "landed"
+    outsiders[0].join()
+    assert outsiders[0].error is None
+    assert events == ["off", "move", "on", "outsider"]
+    assert isinstance(refused[0], MotionInProgressError)
+    assert refused[0].moving == ("xy_stage Z",)
+    assert refused[0].detail == "`z: move_to 12.0 µm` is waiting for it"
+
+
+def test_compound_is_refused_while_halted() -> None:
+    executor = _ex()
+    executor.halt()
+    with pytest.raises(MicroscopeHaltedError):
+        executor.compound("z: move_to 12.0 µm", _never)
+    executor.resume()
+    assert executor.compound("z: move_to 12.0 µm", lambda: "ran") == "ran"
+
+
+def test_compound_is_refused_while_a_motion_outlived_its_action() -> None:
+    executor, xy = _ex(), _Device("XY")
+    _outlive(executor, xy)
+    with pytest.raises(MotionInProgressError) as info:
+        executor.compound("z: move_to 12.0 µm", _never)
+    assert info.value.moving == ("xy_stage XY",)
+    xy.busy = False
+    assert executor.compound("z: move_to 12.0 µm", lambda: "ran") == "ran"
+
+
+def test_compound_runs_in_dry_run_and_its_nested_actions_send_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    executor, z = _ex(dry_run=True), _Device("Z")
+
+    def run() -> object:
+        first = executor.do("af: suspend", _step("af: suspend", _never))
+        moved = executor.do(
+            "z: move_to 12.0 µm",
+            Step("z: move_to 12.0 µm", _never, lambda: "arrived", "dry"),
+            motion=z.motion,
+            timeout_s=JOIN_S,
+        )
+        return (first, moved)
+
+    with caplog.at_level(logging.INFO, logger=LOGGER.name):
+        assert executor.compound("z: move_to 12.0 µm", run) == ("dry", "dry")
+    assert caplog.messages == [
+        "[dry-run] af: suspend",
+        "[dry-run] z: move_to 12.0 µm",
+    ]
+    assert z.commands == 0
