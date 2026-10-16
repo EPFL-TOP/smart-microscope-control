@@ -325,9 +325,10 @@ session with PFS on.
 - **The epi light is a Lumencor Spectra III** (owner, 2026-10-15, and the
   purchase quote). It is on neither the hub nor the configuration. Its
   **USB** and **TTL** (DB15) ports are cabled; LAN and RS-232 are not
-  (photos). COM3 (FTDI FT232R) is the PC's only serial port, so it is
-  probably the Spectra's USB link (**inferred**). The TTL lines come from
-  the NI breakout box (below).
+  (photos). **COM3 (FTDI FT232R) is the Spectra's USB link**: it disappears
+  from Device Manager when that cable is unplugged, and comes back when it
+  is plugged in again (owner, 2026-10-16). The TTL lines come from the NI
+  breakout box (below).
 - **NI PCIe-6323**, with its trigger breakout box. The owner traced each
   BNC (2026-10-15):
 
@@ -338,8 +339,9 @@ session with PFS on.
   | `PFI 1` | Prime 95B `EXPOSE OUT 1` (green lead) | the camera's exposure signal, camera to DAQ |
   | `PFI 0` | the Andor Zyla | unknown direction (the Zyla is unused) |
 
-  The Prime 95B's I/O breakout cable (the "multiplex") also has a red
-  `TRIGGER IN` lead, which goes to the TI2-CTRE controller. So the
+  The thick cable of the Prime 95B's I/O breakout (the "multiplex") goes to
+  the camera. The breakout also has a red `TRIGGER IN` lead, which goes to
+  the TI2-CTRE controller. So the
   **camera's exposure clocks the DAQ**, and **the Nikon controller can
   trigger the camera** (**inferred** from the wiring; the timing itself
   is NIS-Elements' configuration).
@@ -481,5 +483,5 @@ Photos (private) show the Spectra III's back panel, the Nano-Drive with
 the NI breakout box, the piezo insert, the TI2-CTRE, and the
 `TRIGGER IN` lead.
 
-Still open, minor: confirm that COM3 is the Spectra's USB link (it
-disappears from Device Manager when that cable is unplugged).
+Nothing is left open from session 0. COM3 was confirmed as the Spectra's
+USB link on 2026-10-16.
