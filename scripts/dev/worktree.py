@@ -304,7 +304,55 @@ def pr_state(root: Path, branch: str) -> str:
     for state in ("MERGED", "OPEN", "CLOSED"):
         if state in states:
             return state.lower()
-    return "no PR"
+    return review_checkout_state(root, branch) or "no PR"
+
+
+_REVIEW_CHECKOUT = re.compile(r"pr-?(\d+)")
+
+
+def review_checkout_state(root: Path, branch: str) -> str | None:
+    """The state of PR N for a ``prN`` or ``pr-N`` branch; None for other names.
+
+    Review sessions fetch a PR's head into such a branch. Its name is no PR's
+    head, so it stayed "no PR" and was kept for ever (pr81, pr104, pr109). It
+    counts as merged only when PR N is merged and GitHub holds every commit
+    of the branch inside the PR's head, so a local commit is never deleted.
+    """
+    m = _REVIEW_CHECKOUT.fullmatch(branch)
+    if m is None:
+        return None
+    ok, out = run_note(
+        [
+            "gh",
+            "pr",
+            "view",
+            m[1],
+            "--json",
+            "state,headRefOid",
+            "--jq",
+            '.state + " " + .headRefOid',
+        ],
+        root,
+    )
+    if not ok:
+        return "unknown"
+    state, _, head = out.strip().partition(" ")
+    if state != "MERGED":
+        return state.lower() or "no PR"
+    ok, tip = run_note(["git", "rev-parse", branch], root)
+    if not ok:
+        return "unknown"
+    ok, status = run_note(
+        [
+            "gh",
+            "api",
+            f"repos/{{owner}}/{{repo}}/compare/{head}...{tip.strip()}",
+            "--jq",
+            ".status",
+        ],
+        root,
+    )
+    return "merged" if ok and status.strip() in {"behind", "identical"} else "no PR"
 
 
 def cmd_list(root: Path) -> int:

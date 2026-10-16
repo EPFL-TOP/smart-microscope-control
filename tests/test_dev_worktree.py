@@ -278,3 +278,62 @@ def test_dry_run_changes_nothing(wt, repo, monkeypatch, dead_pid) -> None:
         wt.run("git", "branch", "--format=%(refname:short)", cwd=repo).split()
     )
     assert "feat/merged-branch" in remaining
+
+
+def _answers(table):
+    """A run_note stand-in: the first table key found in the command decides."""
+
+    def fake(args, cwd):
+        line = " ".join(args)
+        for key, answer in table.items():
+            if key in line:
+                return answer
+        raise AssertionError(line)
+
+    return fake
+
+
+def test_a_review_checkout_of_a_merged_pr_counts_as_merged(wt, monkeypatch) -> None:
+    monkeypatch.setattr(wt.shutil, "which", lambda name: "/usr/bin/gh")
+    monkeypatch.setattr(
+        wt,
+        "run_note",
+        _answers(
+            {
+                "pr list --head": (True, "\n"),
+                "pr view 109": (True, "MERGED abc123\n"),
+                "rev-parse pr109": (True, "def456\n"),
+                "compare/abc123...def456": (True, "behind\n"),
+            }
+        ),
+    )
+    assert wt.pr_state(Path("."), "pr109") == "merged"
+
+
+def test_a_review_checkout_with_a_local_commit_is_kept(wt, monkeypatch) -> None:
+    # GitHub does not know a commit made only here: compare fails, keep it.
+    monkeypatch.setattr(wt.shutil, "which", lambda name: "/usr/bin/gh")
+    monkeypatch.setattr(
+        wt,
+        "run_note",
+        _answers(
+            {
+                "pr list --head": (True, "\n"),
+                "pr view 81": (True, "MERGED abc123\n"),
+                "rev-parse pr-81": (True, "local9\n"),
+                "compare/abc123...local9": (False, "HTTP 404"),
+            }
+        ),
+    )
+    assert wt.pr_state(Path("."), "pr-81") == "no PR"
+
+
+def test_a_review_checkout_of_an_open_pr_is_open(wt, monkeypatch) -> None:
+    monkeypatch.setattr(wt.shutil, "which", lambda name: "/usr/bin/gh")
+    monkeypatch.setattr(
+        wt,
+        "run_note",
+        _answers({"pr list --head": (True, "\n"), "pr view 5": (True, "OPEN abc\n")}),
+    )
+    assert wt.pr_state(Path("."), "pr5") == "open"
+    assert wt.review_checkout_state(Path("."), "print-fix") is None
