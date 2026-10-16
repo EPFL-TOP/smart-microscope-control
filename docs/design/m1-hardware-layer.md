@@ -251,8 +251,9 @@ Semantics every implementation must honour (these are the contract tests):
   role and the call when the device faulted (§2, #93); the *facade's*
   `state()` is the tolerant layer.
 
-M2 will extend `ZStage.move_to_um` with `keep_autofocus: bool = True`
-(a keyword with a default is a compatible extension).
+M2 extends both Z moves with `keep_autofocus: bool = True` (a keyword
+with a default is a compatible extension) and adds `Autofocus`:
+[m2-nikon.md §3](m2-nikon.md).
 
 ## 4. Roles — `smc/hardware/roles.py` (#6)
 
@@ -851,6 +852,8 @@ labelled as assumed:
 - **The quirk.** With `quirk_z_move_disables_autofocus`, a `setPosition`
   on the focus slot's device disables continuous focus, as moving the Z
   drive does with PFS on the Nikon stands.
+- **M2 additions** (the autofocus offset, `autofocus_lockable`, the
+  errors of an empty AutoFocus slot): [m2-nikon.md §3.12](m2-nikon.md).
 - **Unloading** removes the devices and clears the slots that named them.
 
 `FakeCore.demo_like()` mirrors the demo configuration:
@@ -1279,7 +1282,8 @@ Each wave-1 executor adds its own tests under `tests/unit/` or against
   about a sensible jog. `force=True` has no ceiling of its own: the soft
   limits are that ceiling, so a stand with a focus drive should set
   `z_soft_limits_um`. The autofocus offset jog (#13) gets its own key in
-  device units, never `max_z_jog_um`.
+  device units, never `max_z_jog_um`: `[safety] max_autofocus_offset_jog`
+  ([m2-nikon.md §3.9](m2-nikon.md)).
 - No action while a movement has not finished (owner, 2026-09-23): the
   guard refuses, it does not queue. An action holds the lock through its
   wait; reads, `stop()` and closing a shutter never take it (§13, revised

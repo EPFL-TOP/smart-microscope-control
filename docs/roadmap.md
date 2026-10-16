@@ -33,6 +33,10 @@ between the issues are fixed in
 
 ## M2 — Nikon Ti2 (then Ti-E) on hardware
 
+Interfaces between the issues are fixed in
+[`docs/design/m2-nikon.md`](design/m2-nikon.md), one section per issue as
+its plan is written.
+
 - Port the Nikon stand knowledge from `nikon-control`: adapters, driver
   DLL checks, dynamic vs fixed device lists, TIRF exclusions, PFS
   interlock, turret confirmation.
