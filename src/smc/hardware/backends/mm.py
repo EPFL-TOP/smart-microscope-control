@@ -1048,34 +1048,67 @@ class MMAutofocus:
             timeout_s=_core_timeout(timed),
         )
 
+    def _check_implied_z(self, target: float, current: float | None = None) -> None:
+        """While locked, refuse an offset ``target`` that would drive Z past its soft limits (FM-90).
+
+        Locked, the autofocus follows its offset and drives Z by ``(target -
+        current) / factor`` µm, with the profile's measured factor for the
+        current objective: that Z gets ``check_z_target_um``'s refusal, which
+        no Z move may pass even forced (the review of #140). Without a factor,
+        an objective turret or a focus drive, nothing converts the change, so
+        the offset's own guards are the only bound: unknown, not guessed. Not
+        locked, the offset moves no Z. Run inside the action, before anything
+        is sent, and in dry-run too. ``current`` is read here when not given.
+        """
+        if self._safety.z_soft_limits_um is None:
+            return
+        focus = self._focus()
+        if focus is None or not self._read_locked():
+            return
+        objective = self._objective_label()
+        factor = None if objective is None else self._offset_per_um.get(objective)
+        if factor is None:
+            return
+        here = self._read_offset() if current is None else current
+        self._safety.check_z_target_um(focus.position_um() + (target - here) / factor)
+
     def set_offset_native(self, value: float) -> float:
         """Move the offset to ``value``, in its own units; return the readback.
 
         Waited for like a stage move. Not jog-guarded, as an absolute Z move is
         not; the soft limits apply and cannot be forced. With the autofocus
-        locked, it follows the new offset, which moves Z.
+        locked, it follows the new offset, which moves Z: with a factor for
+        the current objective, the Z it implies is held to the Z soft limits
+        (``_check_implied_z``); without one, only the offset's own guards
+        bound it.
         """
         value = float(value)
         self._safety.check_offset_target_native(value)
         description = f"autofocus_offset: move_to {value} {self._unit()}"
-        return self._offset_move(
-            description, lambda: self._offset_step(description, value)
-        )
+
+        def step() -> Step[float]:
+            self._check_implied_z(value)
+            return self._offset_step(description, value)
+
+        return self._offset_move(description, step)
 
     def offset_by_native(self, delta: float, *, force: bool = False) -> float:
         """Move the offset by ``delta`` from where it is read inside the action.
 
         Jog-guarded unless ``force``; with no limit in the profile, any non-zero
         ``delta`` needs ``force`` (m2 §3.2). The target is checked against the
-        soft limits, which cannot be forced.
+        soft limits, which cannot be forced, and, locked, the Z it implies
+        against the Z soft limits, as for ``set_offset_native``.
         """
         delta = float(delta)
         self._safety.check_offset_jog_native(delta, force=force)
         unit = self._unit()
 
         def relative() -> Step[float]:
-            value = self._read_offset() + delta
+            here = self._read_offset()
+            value = here + delta
             self._safety.check_offset_target_native(value)
+            self._check_implied_z(value, here)
             return self._offset_step(
                 f"autofocus_offset: move_by {delta} {unit} to {value} {unit}", value
             )

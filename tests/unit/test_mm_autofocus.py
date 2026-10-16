@@ -753,6 +753,72 @@ def test_offset_is_refused_outside_the_soft_limits_even_forced() -> None:
         assert stand.af.offset_native() == 7803.0
 
 
+_Z_LIMITS = {"z_soft_limits_um": (-10.0, 10.0), "max_autofocus_offset_jog": 1000.0}
+
+
+def _at_offset_and_z(**kwargs: Any) -> FakeCore:
+    """The offset at 7800 and Z at 9 µm, 1 µm inside the Z soft limits of ``_Z_LIMITS``."""
+    core = _at_offset(7800.0, **kwargs)
+    core.setPosition("ZDrive", 9.0)
+    return core
+
+
+def test_offset_change_while_locked_is_refused_past_the_z_soft_limits() -> None:
+    # The review of #140 (FM-90): locked, PFS follows its offset and drives Z
+    # by (target - offset) / factor, here -2.0 per µm.
+    profile = _profile(autofocus={"offset_per_um": {"4x": -2.0}}, safety=_Z_LIMITS)
+    refusal = (
+        "Z target 11.0 µm is outside the soft limits [-10.0, 10.0] µm; change "
+        "[safety] in the profile if the limits are wrong"
+    )
+    with _ti2(profile, core=_at_offset_and_z()) as stand:
+        stand.engage_directly()
+        af = stand.af
+        for change in (
+            lambda: af.set_offset_native(7796.0),
+            lambda: af.offset_by_native(-4.0),
+            lambda: af.offset_by_native(-4.0, force=True),
+        ):
+            with pytest.raises(SafetyRefusedError) as refused:
+                change()
+            assert (refused.value.reason, refused.value.how_to_force) == (refusal, "")
+        assert stand.core.log == []
+        # Inside them: +4.0 is Z 7 µm, then 7803.0 is Z 9.5 µm.
+        assert af.offset_by_native(4.0) == 7804.0
+        assert af.set_offset_native(7803.0) == 7803.0
+        assert stand.core.log == [
+            "setPosition('PFSOffset', 7804.0)",
+            "setPosition('PFSOffset', 7803.0)",
+        ]
+        # Off, the offset moves no Z.
+        af.disengage()
+        assert af.set_offset_native(7796.0) == 7796.0
+    with _ti2(profile, dry_run=True, core=_at_offset_and_z()) as stand:
+        stand.engage_directly()
+        with pytest.raises(SafetyRefusedError, match=re.escape(refusal)):
+            stand.af.set_offset_native(7796.0)
+
+
+def test_offset_change_while_locked_without_a_factor_has_only_the_offset_guards() -> (
+    None
+):
+    # Nothing converts the change, so the Z limits are not guessed at.
+    no_factor = _profile(autofocus={"offset_per_um": {"40x": -2.0}}, safety=_Z_LIMITS)
+    no_turret = _profile(autofocus={"offset_per_um": {"4x": -2.0}}, safety=_Z_LIMITS)
+    for profile, core in (
+        (no_factor, _at_offset_and_z()),
+        (no_turret, _at_offset_and_z(turret=False)),
+    ):
+        with _ti2(profile, core=core) as stand:
+            stand.engage_directly()
+            assert stand.af.set_offset_native(7796.0) == 7796.0
+            assert stand.af.offset_by_native(-4.0) == 7792.0
+            assert stand.core.log == [
+                "setPosition('PFSOffset', 7796.0)",
+                "setPosition('PFSOffset', 7792.0)",
+            ]
+
+
 # --- focus_by_um (m2 §3.5) ---------------------------------------------------
 
 
