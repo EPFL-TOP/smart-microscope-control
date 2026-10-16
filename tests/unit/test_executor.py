@@ -2473,3 +2473,75 @@ def test_compound_runs_in_dry_run_and_its_nested_actions_send_nothing(
         "[dry-run] z: move_to 12.0 µm",
     ]
     assert z.commands == 0
+
+
+def test_compound_nested_action_is_cancelled_by_a_stop_since_the_compound_was_called() -> (
+    None
+):
+    # The compound is the caller's action: a stop since it was called (here
+    # between two nested actions; in the facade test, while it waited for the
+    # lock) cancels the nested move, as it would a plain one (design §13).
+    executor, z = _ex(), _Device("Z", arrive_after=1)
+    sent: list[str] = []
+
+    def run() -> object:
+        executor.do("af: suspend", _step("af: suspend", lambda: sent.append("off")))
+        executor.stop(z.motion)
+        return _move(executor, z)
+
+    with pytest.raises(MotionStoppedError) as stopped:
+        executor.compound("z: move_to 12.0 µm", run)
+    assert stopped.value.detail == "it was stopped before it started"
+    assert (sent, z.commands) == (["off"], 0)
+    # Outside the compound, the next move records its own call and runs.
+    assert _move(executor, z) == "arrived"
+
+
+def test_compound_nested_action_is_refused_after_a_halt_and_resume_since_it_was_called() -> (
+    None
+):
+    executor, z = _ex(), _Device("Z")
+
+    def run() -> object:
+        executor.halt()
+        executor.resume()
+        return _move(executor, z)
+
+    with pytest.raises(MicroscopeHaltedError):
+        executor.compound("z: move_to 12.0 µm", run)
+    assert z.commands == 0
+
+
+def test_a_nested_compound_keeps_the_outer_compounds_record() -> None:
+    executor, z = _ex(), _Device("Z")
+
+    def inner() -> object:
+        return _move(executor, z)
+
+    def outer() -> object:
+        executor.stop(z.motion)  # after the outer call, before the inner one
+        return executor.compound("z: move_by 1.0 µm", inner)
+
+    with pytest.raises(MotionStoppedError):
+        executor.compound("autofocus: focus_by 1.0 µm", outer)
+    assert z.commands == 0
+
+
+def test_refuse_if_stopped_compares_with_the_compounds_call_and_is_inert_outside() -> (
+    None
+):
+    executor, z = _ex(), _Device("Z")
+    cancelled = MotionStoppedError("z Z", "it was stopped before it started")
+    executor.stop(z.motion)
+    executor.refuse_if_stopped("Z", cancelled)  # outside a compound: nothing
+
+    def run() -> str:
+        executor.refuse_if_stopped("Z", cancelled)  # no stop since the call
+        executor.stop(z.motion)
+        executor.refuse_if_stopped("XY", cancelled)  # another device
+        executor.refuse_if_stopped("Z", cancelled)
+        return "not reached"
+
+    with pytest.raises(MotionStoppedError) as raised:
+        executor.compound("z: move_to 12.0 µm", run)
+    assert raised.value is cancelled

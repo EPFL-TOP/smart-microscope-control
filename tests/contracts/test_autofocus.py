@@ -2,7 +2,7 @@
 
 The offset moves at most 1.0 from where it started (``envelope.offset_native``),
 in its own units and with the autofocus off, except in the locked
-``focus_by_um`` case, which moves it by 0.5. Z moves only below its start, by
+``focus_by_um`` case, which moves it by 1.0. Z moves only below its start, by
 at most 2 µm, as in the ``ZStage`` contract. A case that needs a lock skips on
 ``hardware`` when none comes ("no lock on this sample"); on ``fake`` and
 ``demo`` the lock comes at once, so no lock fails it.
@@ -200,21 +200,25 @@ def test_focus_by_while_locked_moves_the_offset(
                 f"the profile has no [autofocus] offset_per_um for objective "
                 f"{objective!r}"
             )
-        # An offset change of 0.5 in its own units, whatever the factor.
-        af, dz_um = autofocus, -0.5 / abs(factor)
+        # An offset change of 1.0 in its own units, whatever the factor: the
+        # contracts' offset jog limit (inclusive), and twice the tolerance, so
+        # that an offset that did not move fails the check below.
+        af, dz_um = autofocus, -1.0 / abs(factor)
         if abs(dz_um) > envelope.max_z_jog_um:
             pytest.skip(f"{dz_um:g} µm is above the contracts' Z jog limit")
     else:
         assert objective is not None, "fake and demo have an objective turret"
-        factor = 0.5
+        factor = 1.0
         af = _with_factors(stand, envelope, {objective: factor}).require(Autofocus)
         dz_um = -1.0
     _lock(af, backend)
     o0, tol = af.offset_native(), envelope.offset_tolerance
+    assert abs(dz_um * factor) > tol
     step = af.focus_by_um(dz_um)
     assert step.via == "offset"
     assert step.offset_native is not None
     assert abs(step.offset_native - (o0 + dz_um * factor)) <= tol
+    assert abs(step.offset_native - o0) > tol  # it moved
     assert af.is_locked() is True
 
 

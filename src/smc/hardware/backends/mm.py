@@ -57,6 +57,7 @@ from smc.hardware.errors import (
     CapabilityMissingError,
     DeviceTimeoutError,
     HardwareError,
+    MotionStoppedError,
     SafetyRefusedError,
 )
 from smc.hardware.roles import Role
@@ -399,6 +400,14 @@ class MMZStage:
 
         def run() -> float:
             prepared = step()
+            # A Z stop pressed while this move waited for the lock cancels it
+            # before the autofocus is touched (design §13, m2 §3.7).
+            self._executor.refuse_if_stopped(
+                self._label,
+                MotionStoppedError(
+                    self._motion.name, "it was stopped before it started"
+                ),
+            )
             was_on = interlock.suspend(description)
             try:
                 landed = self._move(description, prepared)
@@ -472,6 +481,14 @@ class _Lock:
 
 #: How a lock wait's readback found the autofocus once the wait ended idle.
 _AfterWait = Literal["locked", "switched itself off", "lost the lock at once"]
+
+
+class _LostLockError(DeviceTimeoutError):
+    """It locked, lost the lock at once, and could not be switched off.
+
+    A ``DeviceTimeoutError`` for every caller; its own class only so that
+    ``engage`` does not take it for its lock wait's deadline.
+    """
 
 
 class MMAutofocus:
@@ -704,8 +721,15 @@ class MMAutofocus:
             if not self._read_engaged():
                 return "switched itself off"
             # It locked, then lost the lock before this read: left on, it would
-            # search, and move Z, with no action holding the lock.
-            switch_off()
+            # search, and move Z, with no action holding the lock. Given up on
+            # as at a deadline: switched off, and registered while it searches.
+            outcome = self._executor.give_up(motion, "a lock lost at once")
+            if switch_off_failures:
+                raise _LostLockError(
+                    f"autofocus {label}: it locked, then lost the lock at once, and "
+                    f"it could not be switched off ({outcome}); it may still move "
+                    f"Z: stop() and check the stand, then resume()"
+                ) from switch_off_failures[0]
             return "lost the lock at once"
 
         def step() -> Step[_AfterWait]:
@@ -727,9 +751,11 @@ class MMAutofocus:
             ended = self._executor.do(
                 description, step, motion=motion, timeout_s=limit_s
             )
+        except _LostLockError:
+            raise
         except DeviceTimeoutError as exc:
-            # Only the lock wait raises this here: the Executor gave up at the
-            # deadline and sent the stop, which switches it off.
+            # Otherwise only the lock wait raises this here: the Executor gave
+            # up at the deadline and sent the stop, which switches it off.
             return self._no_lock(limit_s, assumed, exc, switch_off_failures)
         if ended == "locked":
             return _Lock(True)
@@ -817,7 +843,10 @@ class MMAutofocus:
 
         Raises:
             AutofocusLostError: No lock: it is off, and Z is at ``z_um``.
+            MotionStoppedError: ``disengage()`` was called during ``reason``;
+                it is left off, as a close wins over an open.
         """
+        self._refuse_relock_after_disengage(reason)
         limit_s, assumed = self._lock_timeout(None)
         ended = self._engage(f"autofocus: engage after {reason}", limit_s, assumed)
         if ended.locked:
@@ -829,6 +858,31 @@ class MMAutofocus:
             z_um,
             ended.in_range,
         )
+
+    def _refuse_relock_after_disengage(self, reason: str) -> None:
+        """No relock after a ``disengage()`` made since the compound was called.
+
+        ``disengage()`` is a safe call: it wins over the actions called before
+        it, as a close wins over an open (design §13). Engaging again after it
+        would end with PFS on after a ``disengage()`` that reported success.
+        The relock's own action would refuse too; this names the reason.
+        """
+        label = self._label
+        try:
+            self._executor.refuse_if_stopped(
+                label,
+                MotionStoppedError(
+                    f"autofocus {label}",
+                    f"disengage() was called during {reason}, so it was left off",
+                ),
+            )
+        except MotionStoppedError:
+            logger.warning(
+                "autofocus %s: left off, because disengage() was called during %s",
+                label,
+                reason,
+            )
+            raise
 
     def _not_locked_again(self, limit_s: float, assumed: bool, ended: _Lock) -> str:
         return (
@@ -940,7 +994,14 @@ class MMAutofocus:
                 f"{_yes_no(self._in_range_for_message())}); wait for the lock "
                 f"(engage()), or disengage() it to focus with Z"
             )
-        offset = self.offset_by_native(dz_um * self._factor(), force=force)
+        factor = self._factor()
+        focus = self._focus()
+        if focus is not None and self._safety.z_soft_limits_um is not None:
+            # PFS follows the offset and drives Z by about dz_um: the Z soft
+            # limits, which no Z move may pass even forced, bound it too.
+            self._safety.check_z_target_um(focus.position_um() + dz_um)
+        offset = self.offset_by_native(dz_um * factor, force=force)
+        self._refuse_relock_after_disengage(description)
         limit_s, assumed = self._lock_timeout(None)
         ended = self._engage(f"autofocus: engage after {description}", limit_s, assumed)
         if not ended.locked:
@@ -951,10 +1012,19 @@ class MMAutofocus:
                 self._z_or_none(),
                 ended.in_range,
             )
-        focus = self._focus()
-        return FocusStep(
-            "offset", None if focus is None else focus.position_um(), offset
-        )
+        if focus is None:
+            return FocusStep("offset", None, offset)
+        try:
+            z_um = focus.position_um()
+        except HardwareError as exc:
+            # The change was made and locked: a caller that took this for a
+            # failure and tried again would apply it twice.
+            raise HardwareError(
+                f"{description}: the offset moved to {offset} {self._unit()} and "
+                f"autofocus {self._label} locked again, but Z could not be read "
+                f"afterwards ({exc}); the change is done, do not repeat it"
+            ) from exc
+        return FocusStep("offset", z_um, offset)
 
     def _factor(self) -> float:
         """The profile's measured offset change per µm for the current objective, or a refusal."""

@@ -47,7 +47,7 @@ import logging
 import math
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Generic, TypeVar
 
@@ -379,6 +379,18 @@ class _Holder:
     #: The lock was taken outside the ``Executor`` before this action, so it
     #: has been held for longer than ``since`` says.
     external: bool = False
+    #: Inside a ``compound``: what the outermost one recorded when it was
+    #: called. Its nested actions are cancelled by a stop, a safe call or a
+    #: halt since then, not only since their own call (m2 §3.7).
+    called: _Called | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _Called:
+    """The stop generations and the halt mark a ``compound`` recorded when it was called."""
+
+    generations: Mapping[str, int]
+    halt_mark: int | None
 
 
 class _HeldLines(threading.local):
@@ -675,9 +687,17 @@ class Executor:
         else:
             key, cancelled = None, HardwareError(description)  # never raised
         # Recorded before waiting for the lock: a stop (or a close) or a halt
-        # pressed while this call waits for it cancels the call.
-        generation = self._generation(key)
-        halt_mark = self._halt_mark()
+        # pressed while this call waits for it cancels the call. Nested in a
+        # compound, the compound's call is this action's: a stop pressed while
+        # the compound waited for the lock, or ran an earlier nested action,
+        # cancels this one too (m2 §3.7).
+        called = self._compound_called()
+        if called is None:
+            generation = self._generation(key)
+            halt_mark = self._halt_mark()
+        else:
+            generation = 0 if key is None else called.generations.get(key, 0)
+            halt_mark = called.halt_mark
 
         def body() -> T:
             self._refuse_if_halted(halt_mark)
@@ -850,7 +870,7 @@ class Executor:
                 that runs inside its command).
             MicroscopeBusyError: The lock was not free within ``lock_timeout_s``.
         """
-        return self._exclusive(description, action)
+        return self._exclusive(description, action, self._halt_mark())
 
     def compound(self, description: str, run: Callable[[], T]) -> T:
         """Run several nested actions as one lock section (m2 §3.7).
@@ -865,6 +885,14 @@ class Executor:
         itself sends nothing and runs in dry-run too. While a nested motion
         is waited for, other callers are refused at once, naming it.
 
+        The stop generations and the halt mark are recorded here, when the
+        compound is called, before it waits for the lock, and its nested
+        actions compare against them: a ``ZStage.stop()`` pressed while the
+        Z move waits for the lock cancels the move, as it does without an
+        autofocus (design §13), and a ``disengage()`` during the move cancels
+        the relock, as a close cancels an open. A compound nested in another
+        keeps the outer one's record.
+
         Nest only between actions: a nested action inside a motion's command
         is still refused (``_nested``).
 
@@ -875,15 +903,90 @@ class Executor:
                 is waiting for one.
             MicroscopeBusyError: The lock was not free within ``lock_timeout_s``.
         """
-        return self._exclusive(description, run)
+        with self._registry_lock:
+            # One C call each: a stop that re-enters cannot break the copy (FM-70).
+            called = _Called(
+                dict(self._generations),
+                None if self._halted else self._halt_epoch,
+            )
 
-    def _exclusive(self, description: str, run: Callable[[], T]) -> T:
+        def run_inside() -> T:
+            previous = self._enter_compound(called)
+            try:
+                return run()
+            finally:
+                self._leave_compound(previous)
+
+        return self._exclusive(description, run_inside, called.halt_mark)
+
+    def refuse_if_stopped(self, device: str, cancelled: HardwareError) -> None:
+        """Inside a compound: refuse what comes next if ``device`` was stopped since it was called.
+
+        For a backend that must decide before its first nested command: the
+        Z interlock checks the drive before it suspends the autofocus, so a Z
+        stop pressed while the move waited for the lock touches nothing. A
+        halt since the call comes first (FM-64), as in every action. Outside
+        a compound it does nothing: a plain action records its own call.
+
+        Raises:
+            MicroscopeHaltedError: Halted since the compound was called.
+            HardwareError: ``cancelled``, when ``device``'s stop generation (a
+                stop, or its safe call) moved since the compound was called.
+        """
+        called = self._compound_called()
+        if called is None:
+            return
+        self._refuse_if_cancelled(
+            device, called.generations.get(device, 0), called.halt_mark, cancelled
+        )
+
+    def give_up(self, motion: Motion, why: str) -> str:
+        """Stop ``motion`` and keep it registered while it still moves; what happened.
+
+        For a readback that finds the device moving again after its wait
+        ended idle (an autofocus that lost its lock at once): the same
+        give-up as at a deadline (FM-17), stop first, registered while it
+        reads busy, then logged. It never raises on its own account.
+        """
+        return self._give_up(motion, why)
+
+    def _compound_called(self) -> _Called | None:
+        """What the compound this thread is inside recorded at its call; ``None`` outside one."""
+        if not _lock_is_owned(self._lock):
+            return None
+        with self._registry_lock:
+            holder = self._holder
+            if holder is None or holder.thread != threading.get_ident():
+                return None
+            return holder.called
+
+    def _enter_compound(self, called: _Called) -> _Called | None:
+        """Make ``called`` this thread's compound record, unless an outer one has one."""
+        with self._registry_lock:
+            holder = self._holder
+            if holder is None or holder.thread != threading.get_ident():
+                return None
+            previous = holder.called
+            if previous is None:
+                holder.called = called
+            return previous
+
+    def _leave_compound(self, previous: _Called | None) -> None:
+        with self._registry_lock:
+            holder = self._holder
+            if holder is not None and holder.thread == threading.get_ident():
+                holder.called = previous
+
+    def _exclusive(
+        self, description: str, run: Callable[[], T], halt_mark: int | None
+    ) -> T:
         """``run()`` as one lock section, after the halt check and the guard; nothing skipped.
 
         The body of ``acquire`` (a frame, which dry-run does not skip) and of
         ``compound`` (whose nested actions handle dry-run themselves).
+        ``halt_mark`` is what the caller recorded of the halt when it was
+        called.
         """
-        halt_mark = self._halt_mark()
 
         def body() -> T:
             self._refuse_if_halted(halt_mark)
