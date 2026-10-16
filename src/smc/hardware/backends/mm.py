@@ -524,8 +524,10 @@ class MMAutofocus:
                 )
         # Rebound: the switch-off below captures the proxied core, and a
         # switch-off that faults must be translated as well (as MMShutter).
-        core = self._core = as_hardware_errors(core, Role.autofocus.value)
+        # The offset device's proxy wraps the raw core: wrapping the autofocus
+        # proxy would name every offset fault "autofocus".
         self._offset_core = as_hardware_errors(core, Role.autofocus_offset.value)
+        core = self._core = as_hardware_errors(core, Role.autofocus.value)
         self._label = label
         self._executor = executor
         self._safety = safety

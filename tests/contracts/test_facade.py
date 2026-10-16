@@ -264,7 +264,9 @@ def test_teardown_after_ctrl_c_stops_the_stand_instead_of_moving_it(
     result = _run_contracts(pytester, monkeypatch, INTERRUPTED_RUN)
     assert result.ret == pytest.ExitCode.INTERRUPTED, result.stdout.str()
     log = (pytester.path / "teardown.log").read_text(encoding="utf-8").splitlines()
+    # The emergency stop switches the autofocus off first (m2 §3.11).
     assert log == [
+        "enableContinuousFocus(False)",
         "stop('XY')",
         "stop('Z')",
         "setShutterOpen('White Light Shutter', False)",

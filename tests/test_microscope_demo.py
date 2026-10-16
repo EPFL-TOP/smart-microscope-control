@@ -84,6 +84,8 @@ class _Spy:
         self.on_stop: Callable[[], None] = lambda: None
         #: Called once, at the next busy poll: code running inside an action.
         self.on_poll: Callable[[], None] | None = None
+        #: How many times the autofocus was switched off.
+        self.autofocus_offs = 0
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._core, name)
@@ -94,6 +96,14 @@ class _Spy:
         if not self.sticky:
             self.busy.discard(label)
         self._core.stop(label)
+
+    def enableContinuousFocus(self, enable: bool) -> None:  # noqa: N802
+        # Switching the autofocus off is the emergency stop's first stop (m2
+        # §3.11); it is not in ``calls``, which lists the stages' stops.
+        if not enable:
+            self.on_stop()
+            self.autofocus_offs += 1
+        self._core.enableContinuousFocus(enable)
 
     def unloadAllDevices(self) -> None:  # noqa: N802 - MMCore's name
         self.calls.append("unloadAllDevices")
@@ -583,7 +593,7 @@ def test_describe_is_one_status_line() -> None:
         m.require(Shutter).set_open(False)
         line = m.describe()
     assert line.startswith("XY (100.0, 50.0) µm | Z ")
-    assert line.endswith(" µm | 25 ms | shutter closed")
+    assert line.endswith(" µm | 25 ms | shutter closed | autofocus off")
     assert "\n" not in line
 
 
@@ -815,9 +825,12 @@ def test_emergency_stop_sends_every_stop_before_any_log_line(
             m.stop()
     finally:
         m.close()
-    assert counts == [0, 0]
-    assert caplog.messages[:3] == [
+    # The autofocus switch-off, then the two stages, all before any line.
+    assert counts == [0, 0, 0]
+    assert spy.autofocus_offs == 1
+    assert caplog.messages[:4] == [
         "microscope: halted",
+        "autofocus: disengage",
         "xy_stage XY: stop",
         "z Z: stop",
     ]
@@ -925,8 +938,10 @@ def test_close_stops_the_stages_when_something_moves(
     assert "close: xy_stage XY still moving; the stages were stopped" in (
         caplog.messages
     )
-    # FM-62 (#76): every stop went out before any line, its own included.
-    assert logged_before_stop == [0, 0]
+    # FM-62 (#76): every stop went out before any line, its own included; the
+    # autofocus switch-off is the first of them (m2 §3.11).
+    assert logged_before_stop == [0, 0, 0]
+    assert spy.autofocus_offs == 1
 
 
 def test_close_during_a_move_stops_it_instead_of_waiting_for_it(
