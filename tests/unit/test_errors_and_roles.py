@@ -1,7 +1,10 @@
+import pickle
+
 import pytest
 
 from smc.hardware.core import CoreError
 from smc.hardware.errors import (
+    AutofocusLostError,
     CapabilityMissingError,
     HardwareError,
     SafetyRefusedError,
@@ -37,3 +40,16 @@ def test_safety_refused_carries_how_to_force() -> None:
     )
     assert err.how_to_force == "pass force=True"
     assert "pass force=True" in str(err)
+
+
+def test_autofocus_lost_is_a_hardware_error_and_not_a_refusal() -> None:
+    # FM-64: the move was made, so a tool that skips a target on a refusal
+    # must not catch this one and carry on.
+    assert issubclass(AutofocusLostError, HardwareError)
+    assert not issubclass(AutofocusLostError, SafetyRefusedError)
+
+
+def test_autofocus_lost_survives_a_worker_process() -> None:
+    error = AutofocusLostError("z: moved, no lock", 12.0, False)
+    copy = pickle.loads(pickle.dumps(error))
+    assert (str(copy), copy.z_um, copy.in_range) == ("z: moved, no lock", 12.0, False)
