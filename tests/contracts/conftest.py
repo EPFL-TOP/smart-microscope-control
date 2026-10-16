@@ -10,6 +10,9 @@ and replaces the profile's ``[safety]`` with limits around that start: XY
 ± 100 µm, Z ± 3 µm, a 50 µm XY jog limit and a 1 µm Z jog limit. Every
 target a contract *sends* is within 60 µm in XY, and in Z at most 2 µm and
 only below the start, which is away from the sample on an inverted stand.
+The autofocus offset gets soft limits at its start ± 2.0 and a jog limit of
+1.0, in its own units (m2 §3.13); a contract moves it at most 1.0 from the
+start, with the autofocus off, except in the locked ``focus_by_um`` case.
 Every target outside the envelope is one the layer must refuse, so none of
 them is ever sent. The ``microscope`` fixture then puts the stand back where
 it started.
@@ -26,6 +29,7 @@ import pytest
 from smc.hardware import Microscope
 from smc.hardware.capabilities import (
     XY,
+    Autofocus,
     Camera,
     Properties,
     Shutter,
@@ -57,20 +61,28 @@ class Envelope:
     exposure_ms: float | None
     shutter_open: bool | None
     auto_shutter: bool | None
+    autofocus_engaged: bool | None = None
+    #: In the offset device's own units.
+    offset_native: float | None = None
     max_jog_um: float = 50.0
     #: Below the 2 µm a contract may move Z, so a forced jog stays inside the envelope.
     max_z_jog_um: float = 1.0
     xy_span_um: float = 100.0
     z_span_um: float = 3.0
     tolerance_um: float = 0.5
+    #: The autofocus offset's, in its own units (m2 §3.13).
+    max_offset_jog: float = 1.0
+    offset_span: float = 2.0
+    offset_tolerance: float = 0.5
 
     def profile(self, base: Profile) -> Profile:
         """``base`` with soft limits around the start and the contract's jog limits.
 
-        Both jog limits are set here: a stand profile's own ``max_z_jog_um``
+        Every jog limit is set here: a stand profile's own ``max_z_jog_um``
         (50 µm, say) would otherwise survive the merge and the contract's
-        1.5 µm refusal case would pass the guard on hardware. Every other key
-        of ``base`` is kept, and so is ``source``.
+        1.5 µm refusal case would pass the guard on hardware; the same holds
+        for ``max_autofocus_offset_jog``. Every other key of ``base`` is kept,
+        and so is ``source``.
 
         The window must lie inside the profile's own soft limits, which exist
         for a reason (the stage's travel, an obstacle): a stand that starts
@@ -92,6 +104,18 @@ class Envelope:
             z_limits = (self.z_um - self.z_span_um, self.z_um + self.z_span_um)
             if own.z_soft_limits_um is not None:
                 _require_inside("Z", z_limits, own.z_soft_limits_um)
+        offset_limits = None
+        if self.offset_native is not None:
+            o0, span = self.offset_native, self.offset_span
+            offset_limits = (o0 - span, o0 + span)
+            if own.autofocus_offset_soft_limits is not None:
+                # FM-48: inside the profile's own limits, in its own units.
+                _require_inside(
+                    "autofocus offset",
+                    offset_limits,
+                    own.autofocus_offset_soft_limits,
+                    unit=base.autofocus.offset_unit or "device units",
+                )
         safety = SafetySection.model_validate(
             {
                 **base.safety.model_dump(),
@@ -99,21 +123,27 @@ class Envelope:
                 "max_z_jog_um": self.max_z_jog_um,
                 "xy_soft_limits_um": xy_limits,
                 "z_soft_limits_um": z_limits,
+                "max_autofocus_offset_jog": self.max_offset_jog,
+                "autofocus_offset_soft_limits": offset_limits,
             }
         )
         return base.model_copy(update={"safety": safety})
 
 
 def _require_inside(
-    axis: str, window: tuple[float, float], limit: tuple[float, float]
+    axis: str,
+    window: tuple[float, float],
+    limit: tuple[float, float],
+    *,
+    unit: str = "µm",
 ) -> None:
     """Fail the test unless the contract's ``window`` lies within the profile's ``limit``."""
     if window[0] < limit[0] or window[1] > limit[1]:
         pytest.fail(
             f"the stand starts too close to its {axis} soft limits "
-            f"[{limit[0]:g}, {limit[1]:g}] µm: the contracts need "
-            f"[{window[0]:g}, {window[1]:g}] µm. Move it towards the middle of "
-            f"its travel and run them again"
+            f"[{limit[0]:g}, {limit[1]:g}] {unit}: the contracts need "
+            f"[{window[0]:g}, {window[1]:g}] {unit}. Move it towards the middle "
+            f"of its travel and run them again"
         )
 
 
@@ -143,12 +173,15 @@ def envelope(stand: Microscope) -> Envelope:
     z = stand.get(ZStage)
     camera = stand.get(Camera)
     shutter = stand.get(Shutter)
+    autofocus = stand.get(Autofocus)
     return Envelope(
         xy=None if xy is None else xy.position_um(),
         z_um=None if z is None else z.position_um(),
         exposure_ms=None if camera is None else camera.exposure_ms(),
         shutter_open=None if shutter is None else shutter.is_open(),
         auto_shutter=None if shutter is None else shutter.auto_shutter(),
+        autofocus_engaged=None if autofocus is None else autofocus.is_engaged(),
+        offset_native=None if autofocus is None else autofocus.offset_native(),
     )
 
 
@@ -241,6 +274,18 @@ def properties(microscope: Microscope, backend: str) -> Properties:
 
 
 @pytest.fixture
+def autofocus(microscope: Microscope, backend: str) -> Autofocus:
+    """The live autofocus."""
+    return _capability(microscope, backend, Autofocus)
+
+
+@pytest.fixture
+def dry_autofocus(dry_microscope: Microscope, backend: str) -> Autofocus:
+    """The autofocus in dry-run."""
+    return _capability(dry_microscope, backend, Autofocus)
+
+
+@pytest.fixture
 def dry_xy(dry_microscope: Microscope, backend: str) -> XYStage:
     """The XY stage in dry-run."""
     return _capability(dry_microscope, backend, XYStage)
@@ -275,7 +320,11 @@ def _put_back(
     run is stopped instead: the stand's own ``close()`` cannot see this
     facade's motions, and an operator's Ctrl-C means "stop", not "go back".
     The light is still cut if it started off. Otherwise every item that
-    differs is put back, light off first and on last.
+    differs is put back, light off first and on last, and the autofocus off
+    while anything moves back (m2 §3.13): XY, Z, then the offset, which with
+    the autofocus off moves only the offset lens. It is engaged again at the
+    end if it started engaged, and a lock that does not come is a failure
+    named like any other.
 
     Every step is attempted even if an earlier one failed, and one error
     then names every step that failed: at a stand, the operator must learn
@@ -294,17 +343,25 @@ def _put_back(
     tolerance_um = envelope.tolerance_um
     if shutter is not None and envelope.shutter_open is False:
         steps.append(("shutter close", lambda: _close_shutter(shutter)))
+    autofocus = facade.get(Autofocus)
+    if autofocus is not None:
+        steps.append(("autofocus off", autofocus.disengage))
     xy = facade.get(XYStage)
     if xy is not None and (start := envelope.xy) is not None:
         steps.append(("xy", lambda: _put_back_xy(xy, start, tolerance_um)))
     z = facade.get(ZStage)
     if z is not None and (z0 := envelope.z_um) is not None:
         steps.append(("z", lambda: _put_back_z(z, z0, tolerance_um)))
+    if autofocus is not None and (o0 := envelope.offset_native) is not None:
+        tolerance = envelope.offset_tolerance
+        steps.append(("offset", lambda: _put_back_offset(autofocus, o0, tolerance)))
     camera = facade.get(Camera)
     if camera is not None and (ms := envelope.exposure_ms) is not None:
         steps.append(("exposure", lambda: _put_back_exposure(camera, ms)))
     if shutter is not None and (auto := envelope.auto_shutter) is not None:
         steps.append(("auto-shutter", lambda: _put_back_auto_shutter(shutter, auto)))
+    if autofocus is not None and envelope.autofocus_engaged is True:
+        steps.append(("autofocus on", lambda: _engage_again(autofocus)))
     if shutter is not None and envelope.shutter_open is True:
         steps.append(("shutter open", lambda: _open_shutter(shutter)))
     _run_all(steps)
@@ -317,8 +374,9 @@ def _has_motion(facade: Microscope) -> bool:
 
 
 #: The steps still run after a Ctrl-C during the put-back: they stop the
-#: stand and cut the light, which is what the operator asked for.
-_SAFE_STEPS = frozenset({"stop", "shutter close"})
+#: stand, cut the light and switch the autofocus off, which is what the
+#: operator asked for; none of them can create motion.
+_SAFE_STEPS = frozenset({"stop", "shutter close", "autofocus off"})
 
 
 class PutBackInterruptedError(RuntimeError):
@@ -387,8 +445,22 @@ def _put_back_xy(xy: XYStage, start: XY, tolerance_um: float) -> None:
 
 
 def _put_back_z(z: ZStage, z0_um: float, tolerance_um: float) -> None:
+    # The autofocus was switched off before; engaging it is the last step's.
     if abs(z.position_um() - z0_um) > tolerance_um:
-        z.move_to_um(z0_um)
+        z.move_to_um(z0_um, keep_autofocus=False)
+
+
+def _put_back_offset(autofocus: Autofocus, start: float, tolerance: float) -> None:
+    if abs(autofocus.offset_native() - start) > tolerance:
+        autofocus.set_offset_native(start)
+
+
+def _engage_again(autofocus: Autofocus) -> None:
+    """Engage the autofocus it started engaged; no lock is a failure the put-back names (FM-49)."""
+    if not autofocus.engage():
+        raise RuntimeError(
+            "the autofocus did not lock again, so it is off; engage it at the stand"
+        )
 
 
 def _put_back_exposure(camera: Camera, exposure_ms: float) -> None:
