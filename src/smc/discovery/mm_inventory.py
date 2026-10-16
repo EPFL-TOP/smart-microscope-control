@@ -22,6 +22,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -69,6 +70,9 @@ _HUB_TYPE = "Hub"
 #: How long to wait for a killed child to go away before giving up on it.
 _KILL_WAIT_S = 10.0
 
+#: Python runs a pending signal handler between two waits (FM-83).
+_WAIT_SLICE_S = 0.5
+
 #: A child sharing the console can repaint it. ``0`` (no flag) off Windows.
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -92,6 +96,30 @@ def _decode_console_bytes(data: bytes) -> str:
         return data.decode("oem", "replace").strip()
     except LookupError:
         return data.decode("utf-8", "replace").strip()
+
+
+def _wait_in_slices(child: subprocess.Popen[bytes], timeout_s: float) -> int:
+    """Wait for the child like ``wait(timeout_s)``, in slices of ``_WAIT_SLICE_S``.
+
+    On Windows one ``Popen.wait(timeout)`` is one blocking call that a Ctrl-C
+    does not end, and the child, created with ``CREATE_NO_WINDOW``, never
+    receives the Ctrl-C either: the survey would sit out the whole timeout
+    (180 s by default) with the user pressing keys (FM-83). Between two slices
+    Python runs the pending signal handler and raises ``KeyboardInterrupt``.
+
+    Raises:
+        subprocess.TimeoutExpired: At the deadline, exactly as ``wait`` does.
+            The last slice waits for the remainder, so a child that ends at
+            the deadline is not reported as a timeout.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        remaining = deadline - time.monotonic()
+        try:
+            return child.wait(timeout=max(min(_WAIT_SLICE_S, remaining), 0.0))
+        except subprocess.TimeoutExpired:
+            if deadline - time.monotonic() <= 0:
+                raise
 
 
 def _kill_child_tree(child: subprocess.Popen[bytes]) -> str | None:
@@ -390,13 +418,13 @@ def mm_section(
             kill_detail: str | None = None
             try:
                 try:
-                    returncode = child.wait(timeout=timeout_s)
+                    returncode = _wait_in_slices(child, timeout_s)
                 except subprocess.TimeoutExpired:
                     kill_detail = _kill_child_tree(child)
                     returncode = None
                     try:
                         # Bounded: a process stuck in a driver call may not die.
-                        child.wait(timeout=_KILL_WAIT_S)
+                        _wait_in_slices(child, _KILL_WAIT_S)
                     except subprocess.TimeoutExpired:
                         unstoppable = True
             except BaseException:

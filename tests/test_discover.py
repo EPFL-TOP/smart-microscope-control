@@ -510,42 +510,81 @@ def test_a_failed_out_write_still_prints_the_survey(
 
 
 class _UnkillableChild:
-    """A child that ignores kill(): only a bounded wait returns."""
+    """A child that ignores kill(): only a bounded wait returns.
+
+    ``wait`` takes the time it is given (at most 0.2 s per call), as a real
+    wait does: an instant ``TimeoutExpired`` would make the sliced wait of
+    ``mm_section`` spin on the CPU until its deadline.
+    """
 
     #: Not a real process: killpg/taskkill must find nothing there.
     pid = 999_999_999
 
     def __init__(self, *_: object, **__: object) -> None:
-        pass
+        self.killed = False
+        self.waits_before_kill: list[float] = []
+        self.waits_after_kill: list[float] = []
 
     def wait(self, timeout: float | None = None) -> int:
         if timeout is None:
             raise AssertionError("an unbounded wait would hang the survey")
+        (self.waits_after_kill if self.killed else self.waits_before_kill).append(
+            timeout
+        )
+        time.sleep(min(timeout, 0.2))
         raise mm_inventory.subprocess.TimeoutExpired("child", timeout)
 
     def kill(self) -> None:
-        pass
+        self.killed = True
+
+
+def _patch_unkillable_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[_UnkillableChild]:
+    """Make ``mm_section`` start an :class:`_UnkillableChild`; return those started."""
+    # On real Windows, _kill_child_tree's own taskkill call goes through this
+    # same (patched) Popen; only the adapter child itself is unkillable here,
+    # so anything else (taskkill) is let through to the real subprocess.
+    real_popen = mm_inventory.subprocess.Popen
+    children: list[_UnkillableChild] = []
+
+    def fake_popen(command: list[str], *args: object, **kwargs: object) -> object:
+        if command[:1] == ["taskkill"]:
+            return real_popen(command, *args, **kwargs)  # type: ignore[arg-type]
+        children.append(_UnkillableChild())
+        return children[-1]
+
+    monkeypatch.setattr(mm_inventory.subprocess, "Popen", fake_popen)
+    return children
 
 
 def test_a_child_that_survives_kill_does_not_hang_the_survey(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # On real Windows, _kill_child_tree's own taskkill call goes through this
-    # same (patched) Popen; only the adapter child itself is unkillable here,
-    # so anything else (taskkill) is let through to the real subprocess.
-    real_popen = mm_inventory.subprocess.Popen
-
-    def fake_popen(command: list[str], *args: object, **kwargs: object) -> object:
-        if command[:1] == ["taskkill"]:
-            return real_popen(command, *args, **kwargs)  # type: ignore[arg-type]
-        return _UnkillableChild()
-
-    monkeypatch.setattr(mm_inventory.subprocess, "Popen", fake_popen)
+    _patch_unkillable_child(monkeypatch)
+    monkeypatch.setattr(mm_inventory, "_KILL_WAIT_S", 0.5)
 
     listed, _, notes = mm_inventory.mm_section(["DemoCamera"], timeout_s=1)
 
     assert listed == []
     assert any("could not be stopped" in n for n in notes)
+
+
+def test_the_wait_after_the_kill_is_sliced_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-83: the 10 s wait for a killed child is as long a blocking call as
+    # the survey wait itself, and a Ctrl-C must end it as well.
+    children = _patch_unkillable_child(monkeypatch)
+    monkeypatch.setattr(mm_inventory, "_KILL_WAIT_S", 1.2)
+    # killpg (POSIX) never calls child.kill(); mark the phase change by hand.
+    monkeypatch.setattr(mm_inventory, "_kill_child_tree", lambda c: c.kill())
+
+    mm_inventory.mm_section(["DemoCamera"], timeout_s=0.3)
+
+    (child,) = children
+    assert len(child.waits_after_kill) >= 2
+    assert max(child.waits_after_kill) <= 1.0
 
 
 class _FakeChildProc:
@@ -662,16 +701,18 @@ class _WindowsChildDiesOnPlainKillOnly:
     pid = 5555
 
     def __init__(self, *_: object, **__: object) -> None:
-        self._waits = 0
+        self.killed = False
 
     def wait(self, timeout: float | None = None) -> int:
-        self._waits += 1
-        if self._waits == 1:
-            raise mm_inventory.subprocess.TimeoutExpired("child", timeout)
-        return -9
+        # Alive until kill() has been called, and a wait takes its time.
+        if self.killed:
+            return -9
+        assert timeout is not None
+        time.sleep(min(timeout, 0.2))
+        raise mm_inventory.subprocess.TimeoutExpired("child", timeout)
 
     def kill(self) -> None:
-        pass
+        self.killed = True
 
 
 def test_mm_section_warns_when_the_tree_kill_fails_even_if_the_child_dies(
@@ -730,13 +771,15 @@ def test_timeout_kills_the_adapter_childs_helper_processes(
 ) -> None:
     # FM-35: kill() alone leaves a helper process the child started running.
     heartbeat = tmp_path / "heartbeat.txt"
+    # The grandchild's own lifetime is bounded (60 s) so that a failing run
+    # does not leak an infinite loop (FM-86).
     body = rf"""
 write_result()
 import subprocess, sys, time
 heartbeat = {str(heartbeat)!r}
 grandchild_code = (
     "import time\n"
-    "while True:\n"
+    "for _ in range(600):\n"
     "    with open(" + repr(heartbeat) + ", 'a') as f:\n"
     "        f.write('x')\n"
     "        f.flush()\n"
@@ -750,15 +793,25 @@ time.sleep(30)
     mm_inventory.mm_section(["DemoCamera"], timeout_s=1)
 
     assert heartbeat.exists(), "the grandchild never started writing its heartbeat"
+
+    # The kill only queues the signal: the first read right after mm_section
+    # returns can still see one more tick (FM-86, #131). So wait until the
+    # heartbeat has been quiet over a window of ten ticks, and fail only at
+    # the deadline. os.kill(pid, 0) is no liveness probe: it kills on Windows
+    # and answers "alive" for a POSIX zombie.
+    deadline = time.monotonic() + 10
     last = heartbeat.stat().st_size
     assert last > 0
-
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        time.sleep(0.5)
+    while True:
+        time.sleep(1.0)
         current = heartbeat.stat().st_size
-        assert current == last, "the heartbeat kept growing: the grandchild lives"
+        if current == last:
+            return
         last = current
+        if time.monotonic() >= deadline:
+            pytest.fail(
+                "the heartbeat kept growing 10 s after the kill: the grandchild lives"
+            )
 
 
 class _InterruptedChild:
@@ -801,3 +854,56 @@ def test_interrupt_while_waiting_kills_the_child_tree(
         mm_inventory.mm_section(["DemoCamera"], timeout_s=5)
 
     assert killed == [_InterruptedChild.pid]
+
+
+def test_mm_section_waits_in_short_slices_so_that_ctrl_c_is_seen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-83: on Windows one long wait is one blocking call that a Ctrl-C
+    # cannot end, and the child (CREATE_NO_WINDOW) never receives it.
+    _fake_child(monkeypatch, "write_result()\nimport time; time.sleep(1.5)\n")
+    waits: list[float | None] = []
+    real_popen = mm_inventory.subprocess.Popen
+
+    class RecordingPopen(real_popen):  # type: ignore[misc, type-arg]
+        def wait(self, timeout: float | None = None) -> int:
+            if self.args[0] == sys.executable:
+                waits.append(timeout)
+            return super().wait(timeout)
+
+    monkeypatch.setattr(mm_inventory.subprocess, "Popen", RecordingPopen)
+
+    listed, _, notes = mm_inventory.mm_section(["DemoCamera"], timeout_s=30)
+
+    assert [a.name for a in listed] == ["Fake"]
+    assert notes == []
+    assert len(waits) >= 2
+    assert all(w is not None for w in waits)
+    assert max(w for w in waits if w is not None) <= 1.0
+
+
+def test_sliced_wait_keeps_the_deadline_and_never_waits_past_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A fake clock that the fake wait advances: no real time, so no FM-44.
+    now = [0.0]
+    waits: list[float] = []
+
+    class Child:
+        def wait(self, timeout: float) -> int:
+            waits.append(timeout)
+            now[0] += timeout
+            raise subprocess.TimeoutExpired("child", timeout)
+
+    monkeypatch.setattr(
+        mm_inventory, "time", type("Clock", (), {"monotonic": lambda: now[0]})
+    )
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        mm_inventory._wait_in_slices(Child(), 1.2)  # type: ignore[arg-type]
+
+    # The total is the deadline, not a multiple of it; the last slice is the
+    # remainder, not a whole slice; no wait is negative.
+    assert sum(waits) == pytest.approx(1.2)
+    assert max(waits) <= mm_inventory._WAIT_SLICE_S
+    assert min(waits) >= 0.0
