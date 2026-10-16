@@ -71,6 +71,10 @@ relies on it).
 6. **Open the PR** with the template filled honestly (what was *not*
    verified is stated). Conventional-commit title. Link the issue with
    `Closes #N`. Request review; **never merge** — that is the owner's call.
+   Every other mention of an issue is `Refs #N`: GitHub closes an issue
+   for *close*, *fix* or *resolve* followed by `#N` anywhere in the body
+   or the squash commit, even after "not" ("Does not close #16" closed
+   #16 on the merge of #127; "fix #13" closed #13 on the merge of #136).
 7. Report outcomes faithfully. If a test fails or a step was skipped, say
    so with the output.
 

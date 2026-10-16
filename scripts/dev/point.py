@@ -127,6 +127,17 @@ def review_texts(pr: dict[str, Any]) -> list[dict[str, Any]]:
     ] + list(pr.get("comments", []))
 
 
+def closes(pr: dict[str, Any]) -> str:
+    """The issues GitHub will close when this PR merges, as it parsed them.
+
+    GitHub reads *close*, *fix* or *resolve* before ``#N`` anywhere in the
+    body, even after "not": #127 closed #16 and #136 closed #13 by accident.
+    The point shows the parsed list so that the owner sees it before merging.
+    """
+    refs = sorted(int(r["number"]) for r in pr.get("closingIssuesReferences") or [])
+    return "closes " + " ".join(f"#{n}" for n in refs) if refs else "closes no issue"
+
+
 def merged_lines(pr: dict[str, Any]) -> list[str]:
     """What the point must know of a PR merged since the last one.
 
@@ -266,7 +277,8 @@ def main() -> int:
         "--state",
         "open",
         "--json",
-        "number,title,mergeStateStatus,statusCheckRollup,reviews,comments,isDraft",
+        "number,title,mergeStateStatus,statusCheckRollup,reviews,comments,isDraft,"
+        "closingIssuesReferences",
     )
     merged = gh_json(
         "pr",
@@ -301,6 +313,7 @@ def main() -> int:
         out.append(
             f"- #{pr['number']} {clip(pr['title'], 90)} | checks {checks(pr.get('statusCheckRollup') or [])}"
             f" | merge {pr['mergeStateStatus']} | {verdict(review_texts(pr))}"
+            f" | {closes(pr)}"
         )
     if not prs:
         out.append("- none")
