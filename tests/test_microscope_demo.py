@@ -21,7 +21,15 @@ import pytest
 
 import smc.hardware.microscope as microscope_mod
 from smc.hardware import Microscope, MicroscopeState
-from smc.hardware.capabilities import XY, Camera, Properties, Shutter, XYStage, ZStage
+from smc.hardware.capabilities import (
+    XY,
+    Autofocus,
+    Camera,
+    Properties,
+    Shutter,
+    XYStage,
+    ZStage,
+)
 from smc.hardware.errors import (
     CapabilityMissingError,
     CoreError,
@@ -192,7 +200,14 @@ def test_open_demo_resolves_the_five_roles_and_closes() -> None:
             Role.autofocus: "Autofocus",
             Role.shutter: "White Light Shutter",
         }
-        assert m.available() == [XYStage, ZStage, Camera, Shutter, Properties]
+        assert m.available() == [
+            XYStage,
+            ZStage,
+            Camera,
+            Shutter,
+            Autofocus,
+            Properties,
+        ]
         assert not m.dry_run
         landed = m.require(XYStage).move_to_um(100, 50)
         assert landed.x_um == pytest.approx(100.0, abs=0.5)

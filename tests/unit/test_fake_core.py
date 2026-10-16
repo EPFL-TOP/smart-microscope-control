@@ -183,23 +183,22 @@ def test_fake_disallowed_value_raises_like_mmcore() -> None:
 
 
 def test_fake_z_move_disables_continuous_focus() -> None:
-    # FM-12: moving the Z drive switches PFS off on the Nikon stands.
+    # FM-12: moving the Z drive switches PFS off on the Nikon stands. On the
+    # core directly: the facade's Z move engages it again (m2 §3.4).
     core = FakeCore.demo_like()
-    with _facade(core) as microscope:
-        core.enableContinuousFocus(True)
-        microscope.require(ZStage).move_to_um(-1.0)
-        assert core.isContinuousFocusEnabled() is False
-        assert core.isContinuousFocusLocked() is False
+    core.enableContinuousFocus(True)
+    core.setPosition("Z", -1.0)
+    assert core.isContinuousFocusEnabled() is False
+    assert core.isContinuousFocusLocked() is False
 
 
 def test_fake_z_move_keeps_continuous_focus_without_the_quirk() -> None:
     core = FakeCore.demo_like()
     core.quirk_z_move_disables_autofocus = False
-    with _facade(core) as microscope:
-        core.enableContinuousFocus(True)
-        microscope.require(ZStage).move_to_um(-1.0)
-        assert core.isContinuousFocusEnabled() is True
-        assert core.isContinuousFocusLocked() is True
+    core.enableContinuousFocus(True)
+    core.setPosition("Z", -1.0)
+    assert core.isContinuousFocusEnabled() is True
+    assert core.isContinuousFocusLocked() is True
 
 
 def test_fake_quirk_applies_only_to_the_focus_device() -> None:

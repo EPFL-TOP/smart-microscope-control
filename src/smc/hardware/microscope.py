@@ -43,14 +43,24 @@ from types import TracebackType
 from typing import TYPE_CHECKING, TypeVar, cast
 
 from smc.hardware.backends.mm import (
+    MMAutofocus,
     MMCamera,
     MMProperties,
     MMShutter,
     MMXYStage,
     MMZStage,
+    ZInterlock,
     as_hardware_errors,
 )
-from smc.hardware.capabilities import XY, Camera, Properties, Shutter, XYStage, ZStage
+from smc.hardware.capabilities import (
+    XY,
+    Autofocus,
+    Camera,
+    Properties,
+    Shutter,
+    XYStage,
+    ZStage,
+)
 from smc.hardware.core import close_core, open_core
 from smc.hardware.errors import (
     CapabilityMissingError,
@@ -79,6 +89,7 @@ CAPABILITY_ROLES: dict[type, tuple[Role, ...]] = {
     ZStage: (Role.focus,),
     Camera: (Role.camera,),
     Shutter: (Role.shutter,),
+    Autofocus: (Role.autofocus,),
     Properties: (),
 }
 
@@ -160,6 +171,9 @@ class Microscope:
             max_z_jog_um=safety.max_z_jog_um,
             z_soft_limits_um=safety.z_soft_limits_um,
             xy_soft_limits_um=safety.xy_soft_limits_um,
+            max_autofocus_offset_jog=safety.max_autofocus_offset_jog,
+            autofocus_offset_soft_limits=safety.autofocus_offset_soft_limits,
+            offset_unit=profile.autofocus.offset_unit,
         )
         self._lock = threading.RLock()
         # FM-15: waiting for the lock is bounded like a device call.
@@ -315,7 +329,7 @@ class Microscope:
         if capability is XYStage and (label := get(Role.xy_stage)) is not None:
             return MMXYStage(core, label, executor, safety)
         if capability is ZStage and (label := get(Role.focus)) is not None:
-            return MMZStage(core, label, executor, safety)
+            return MMZStage(core, label, executor, safety, autofocus=self._interlock)
         if capability is Shutter and (label := get(Role.shutter)) is not None:
             return MMShutter(core, label, executor)
         if capability is Camera and (label := get(Role.camera)) is not None:
@@ -326,7 +340,36 @@ class Microscope:
                 self.profile.camera.pixel_size_um,
                 self._objective_label(),
             )
+        if capability is Autofocus and (label := get(Role.autofocus)) is not None:
+            af = self.profile.autofocus
+            return MMAutofocus(
+                core,
+                label,
+                executor,
+                safety,
+                offset_label=get(Role.autofocus_offset),
+                offset_unit=af.offset_unit,
+                lock_timeout_s=af.lock_timeout_s,
+                offset_per_um=af.offset_per_um,
+                in_range_property=af.in_range_property,
+                in_range_values=af.in_range_values,
+                objective_label=self._objective_label(),
+                # Lazy: the focus drive is looked up at the call, never here.
+                focus=lambda: cast("ZStage | None", self._lookup(ZStage)),
+            )
         return None
+
+    def _interlock(self) -> ZInterlock | None:
+        """The autofocus a Z move suspends and engages again; ``None`` when there is none.
+
+        Asked by the Z stage at each move, so neither build calls the other.
+        An autofocus that ``override`` replaced is not an ``MMAutofocus`` and
+        is not interlocked: a test double cannot be trusted to hold Z. The
+        cache lock it takes is re-entrant, since this runs during a Z move,
+        where a Ctrl-C handler may land (FM-70).
+        """
+        found = self._lookup(Autofocus)
+        return found if isinstance(found, MMAutofocus) else None
 
     def _objective_label(self) -> Callable[[], str | None]:
         """The current objective's name, for the profile's pixel-size map."""
