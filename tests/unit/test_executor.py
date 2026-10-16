@@ -2381,6 +2381,86 @@ def test_hold_log_does_not_hold_another_threads_lines() -> None:
     assert z.stops == 1
 
 
+# --- linked stops (the review of #140) ---------------------------------------
+
+
+def test_a_linked_stop_is_sent_first_and_every_line_waits_for_the_devices_own() -> None:
+    # While the autofocus locks again after a Z move, the operator's Z stop
+    # switches it off first (FM-88); both are sent before either line (FM-62).
+    executor, af, z = _ex(), _Device("PFS"), _Device("Z")
+    handler = _StopsSeen(af, z)
+    z_stops_when_linked: list[int] = []
+
+    def switch_off() -> None:
+        executor.stop(af.motion)
+        z_stops_when_linked.append(z.stops)
+
+    LOGGER.addHandler(handler)
+    try:
+        with executor.linked_stop("Z", switch_off):
+            executor.stop(z.motion)
+            executor.stop(af.motion)  # a link is on one device only
+        executor.stop(z.motion)  # gone with its block
+    finally:
+        LOGGER.removeHandler(handler)
+    assert z_stops_when_linked == [0]
+    assert handler.seen == [
+        ("xy_stage PFS: stop", (1, 1)),
+        ("xy_stage Z: stop", (1, 1)),
+        ("xy_stage PFS: stop", (2, 1)),
+        ("xy_stage Z: stop", (2, 2)),
+    ]
+
+
+def test_a_failed_linked_stop_still_sends_the_devices_own_and_is_raised_after() -> None:
+    executor, z = _ex(), _Device("Z")
+    boom = RuntimeError("PFS: stuck on")
+
+    def fails() -> None:
+        raise boom
+
+    with executor.linked_stop("Z", fails), pytest.raises(RuntimeError) as raised:
+        executor.stop(z.motion)
+    assert raised.value is boom
+    assert z.stops == 1
+    # The device's own failure is the one raised when both fail.
+    z.stop_error = RuntimeError("Z: no answer")
+    with executor.linked_stop("Z", fails), pytest.raises(RuntimeError) as raised:
+        executor.stop(z.motion)
+    assert raised.value is z.stop_error
+    assert z.stops == 2
+
+
+def test_an_interrupt_in_a_linked_stop_waits_for_the_devices_own() -> None:
+    executor, z = _ex(), _Device("Z")
+
+    def ctrl_c() -> None:
+        raise KeyboardInterrupt  # raised from the stub, not sent as a signal
+
+    with executor.linked_stop("Z", ctrl_c), pytest.raises(KeyboardInterrupt):
+        executor.stop(z.motion)
+    assert z.stops == 1
+
+
+def test_a_linked_stop_is_removed_when_its_block_raises() -> None:
+    executor, z = _ex(), _Device("Z")
+    linked: list[str] = []
+
+    def a_block_that_raises() -> None:
+        with (
+            executor.linked_stop("Z", lambda: linked.append("off")),
+            executor.linked_stop("Z", lambda: linked.append("offset")),
+        ):
+            executor.stop(z.motion)
+            raise LookupError
+
+    with pytest.raises(LookupError):
+        a_block_that_raises()
+    executor.stop(z.motion)
+    assert linked == ["off", "offset"]
+    assert z.stops == 2
+
+
 # --- compound (m2 §3.7) ------------------------------------------------------
 
 

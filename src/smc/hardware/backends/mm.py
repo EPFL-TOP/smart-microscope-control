@@ -36,6 +36,9 @@ Hardware behaviour encoded here:
   FM-12). On a stand with an autofocus, a Z move suspends it, moves and
   engages it again, as one compound that no other action can come between
   (m2 §3.4), and engages it again only after a move that completed (FM-88).
+  The operator's Z stop wins over the relock: while PFS locks again, or a
+  locked ``focus_by_um`` moves its offset, ``ZStage.stop()`` switches it off
+  first, since PFS searching or following its offset drives Z.
 * **The continuous-focus calls act on a core slot** (FM-87): they take no
   label, so every call first checks that the AutoFocus slot still names the
   autofocus role, as the camera calls do for the camera slot.
@@ -46,7 +49,8 @@ from __future__ import annotations
 import functools
 import logging
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
@@ -57,6 +61,7 @@ from smc.hardware.errors import (
     CapabilityMissingError,
     DeviceTimeoutError,
     HardwareError,
+    MicroscopeHaltedError,
     MotionStoppedError,
     SafetyRefusedError,
 )
@@ -443,7 +448,13 @@ class MMZStage:
         return self._executor.read(lambda: bool(self._core.deviceBusy(self._label)))
 
     def stop(self) -> None:
-        """Stop the drive now, without waiting for the microscope lock (§13)."""
+        """Stop the drive now, without waiting for the microscope lock (§13).
+
+        While the autofocus locks again after a Z move, or a locked
+        ``focus_by_um`` runs, this switches the autofocus off first: it is
+        what drives Z then (``MMAutofocus._ended_by_a_z_stop``). Otherwise it
+        leaves the autofocus alone: PFS holding focus is not a motion.
+        """
         self._executor.stop(self._motion)
 
     def limits_um(self) -> Limits | None:
@@ -481,6 +492,17 @@ class _Lock:
 
 #: How a lock wait's readback found the autofocus once the wait ended idle.
 _AfterWait = Literal["locked", "switched itself off", "lost the lock at once"]
+
+
+@dataclass
+class _ZStop:
+    """Whether the operator's Z stop reached a compound of the autofocus.
+
+    Set by the stopping thread, read by the compound's: one attribute, so
+    the GIL makes the write and the read whole.
+    """
+
+    fired: bool = False
 
 
 class _LostLockError(DeviceTimeoutError):
@@ -841,14 +863,19 @@ class MMAutofocus:
     def relock(self, reason: str, *, z_um: float | None) -> None:
         """Engage it again after ``reason``, with the profile's timeout.
 
+        The operator's Z stop wins over it (``_ended_by_a_z_stop``): PFS
+        searching for its lock drives Z.
+
         Raises:
             AutofocusLostError: No lock: it is off, and Z is at ``z_um``.
-            MotionStoppedError: ``disengage()`` was called during ``reason``;
-                it is left off, as a close wins over an open.
+            MotionStoppedError: ``disengage()`` was called during ``reason``,
+                or the focus drive was stopped since ``reason`` was called; it
+                is left off, as a close wins over an open.
         """
-        self._refuse_relock_after_disengage(reason)
-        limit_s, assumed = self._lock_timeout(None)
-        ended = self._engage(f"autofocus: engage after {reason}", limit_s, assumed)
+        with self._ended_by_a_z_stop(reason, suspended=True) as stopped:
+            self._refuse_relock_after_disengage(reason, stopped)
+            limit_s, assumed = self._lock_timeout(None)
+            ended = self._engage(f"autofocus: engage after {reason}", limit_s, assumed)
         if ended.locked:
             return
         where = "z: moved" if z_um is None else f"z: moved to {z_um:.2f} µm"
@@ -859,13 +886,15 @@ class MMAutofocus:
             ended.in_range,
         )
 
-    def _refuse_relock_after_disengage(self, reason: str) -> None:
+    def _refuse_relock_after_disengage(self, reason: str, stopped: _ZStop) -> None:
         """No relock after a ``disengage()`` made since the compound was called.
 
         ``disengage()`` is a safe call: it wins over the actions called before
         it, as a close wins over an open (design §13). Engaging again after it
         would end with PFS on after a ``disengage()`` that reported success.
-        The relock's own action would refuse too; this names the reason.
+        The relock's own action would refuse too; this names the reason. A Z
+        stop switches it off through the same key: its WARNING is
+        ``_ended_by_a_z_stop``'s, not this one.
         """
         label = self._label
         try:
@@ -877,12 +906,112 @@ class MMAutofocus:
                 ),
             )
         except MotionStoppedError:
-            logger.warning(
-                "autofocus %s: left off, because disengage() was called during %s",
-                label,
-                reason,
-            )
+            if not stopped.fired:
+                logger.warning(
+                    "autofocus %s: left off, because disengage() was called during %s",
+                    label,
+                    reason,
+                )
             raise
+
+    def _focus_key(self) -> str | None:
+        """The focus drive's key in the ``Executor``, when it is this module's ``MMZStage``.
+
+        A focus drive that ``Microscope.override`` replaced does not stop
+        through this ``Executor``, so there is no stop of it to link.
+        """
+        focus = self._focus()
+        return focus._label if isinstance(focus, MMZStage) else None
+
+    @contextmanager
+    def _ended_by_a_z_stop(
+        self, description: str, *, suspended: bool
+    ) -> Iterator[_ZStop]:
+        """Inside a compound: from here on, the operator's Z stop wins (FM-88; review of #140).
+
+        While the block runs, a ``ZStage.stop()`` switches the autofocus off,
+        and stops the offset device if its move is under way, before Z's own
+        stop (``Executor.linked_stop``): PFS locking again, or following its
+        offset, drives Z after the operator stopped it. The block then ends
+        with ``MotionStoppedError`` and the "left off" WARNING, whatever it
+        was doing; a stop that lands once it has locked switches it off as
+        well, and is reported the same way. A Z stop that came since the
+        compound was called, before this block, cancels it with nothing
+        sent. ``suspended`` says the autofocus is off already (the relock),
+        so that it is then left off, with the WARNING; otherwise (a locked
+        ``focus_by_um``) it was not touched.
+
+        While halted, the emergency stop has switched the autofocus off and
+        stopped the offset device itself, in its own order (m2 §3.11): the
+        Z stop then adds nothing, and the block ends on what the halt did.
+        Without a focus drive of this module, no Z stop is linked.
+        """
+        stopped = _ZStop()
+        key = self._focus_key()
+        if key is None:
+            yield stopped
+            return
+        name = f"z {key}"
+        before = MotionStoppedError(name, "it was stopped before it started")
+        try:
+            with self._executor.linked_stop(key, lambda: self._on_z_stop(stopped)):
+                self._executor.refuse_if_stopped(key, before)
+                yield stopped
+        except BaseException as exc:
+            if not (stopped.fired or (suspended and exc is before)):
+                raise
+            if isinstance(exc, MicroscopeHaltedError) or not isinstance(exc, Exception):
+                self._log_left_off(description, exc)
+                raise  # a halt stays a halt, a Ctrl-C a Ctrl-C
+            error = self._z_stopped(name, description)
+            self._log_left_off(description, error)
+            raise error from exc
+        if stopped.fired:
+            # It locked, then the stop switched it off: not a success.
+            error = self._z_stopped(name, description)
+            self._log_left_off(description, error)
+            raise error
+
+    def _on_z_stop(self, stopped: _ZStop) -> None:
+        """A ``ZStage.stop()`` during a compound of the autofocus; the stopping thread's.
+
+        It is switched off first, then its offset device is stopped if its
+        move is under way, as the emergency stop orders them (m2 §3.11).
+        Without an offset device, the offset move is the autofocus device's
+        own, keyed by its label: the switch-off cancels it.
+        """
+        if self._executor.halted:
+            return
+        stopped.fired = True
+        failure: Exception | None = None
+        try:
+            self._executor.safe(self._off, lambda: None)
+        except Exception as exc:
+            failure = exc
+        offset = self._offset_motion
+        if self._offset_label is not None and offset.name in self._executor.moving():
+            try:
+                self._executor.stop(offset)
+            except Exception as exc:
+                failure = failure or exc
+        if failure is not None:
+            raise failure
+
+    def _z_stopped(self, name: str, description: str) -> MotionStoppedError:
+        return MotionStoppedError(
+            name,
+            f"it was stopped during {description}, so autofocus {self._label} was "
+            f"left off",
+        )
+
+    def _log_left_off(self, description: str, raised: BaseException) -> None:
+        """The decided WARNING (m2 §3.4), naming what the caller gets."""
+        logger.warning(
+            "autofocus %s: left off, because %s did not complete (%s)",
+            self._label,
+            description,
+            type(raised).__name__,
+        )
 
     def _not_locked_again(self, limit_s: float, assumed: bool, ended: _Lock) -> str:
         return (
@@ -973,6 +1102,10 @@ class MMAutofocus:
                 forceable); the offset's own guards.
             CapabilityMissingError: Off, and the stand has no focus drive.
             AutofocusLostError: The offset moved, but no lock came again.
+            MotionStoppedError: Locked, and ``ZStage.stop()`` was called
+                during the offset move or the relock: it was switched off, and
+                the offset device stopped if it was moving. Before either of
+                them, nothing was sent.
         """
         dz_um = float(dz_um)
         self._safety.check_z_jog_um(dz_um, force=force)
@@ -1000,10 +1133,13 @@ class MMAutofocus:
             # PFS follows the offset and drives Z by about dz_um: the Z soft
             # limits, which no Z move may pass even forced, bound it too.
             self._safety.check_z_target_um(focus.position_um() + dz_um)
-        offset = self.offset_by_native(dz_um * factor, force=force)
-        self._refuse_relock_after_disengage(description)
-        limit_s, assumed = self._lock_timeout(None)
-        ended = self._engage(f"autofocus: engage after {description}", limit_s, assumed)
+        with self._ended_by_a_z_stop(description, suspended=False) as stopped:
+            offset = self.offset_by_native(dz_um * factor, force=force)
+            self._refuse_relock_after_disengage(description, stopped)
+            limit_s, assumed = self._lock_timeout(None)
+            ended = self._engage(
+                f"autofocus: engage after {description}", limit_s, assumed
+            )
         if not ended.locked:
             raise AutofocusLostError(
                 f"{Role.autofocus_offset.value}: moved to {offset} {self._unit()}, "
