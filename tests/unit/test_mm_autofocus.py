@@ -412,6 +412,33 @@ def test_halted_z_move_does_not_relock(
         stand.microscope.resume()
 
 
+def test_halt_between_the_move_and_the_relock_says_pfs_was_left_off(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #141 item 2: the emergency stop lands once the move has passed its own
+    # check; the relock is refused before it sends anything, and says so.
+    with _ti2() as stand:
+        stand.engage_directly()
+        read = stand.core.getPosition
+        halted: list[str] = []
+
+        def halt_on_arrival(label: str | None = None) -> float:
+            if label == "ZDrive" and not halted:
+                halted.append(label)
+                stand.microscope.stop()
+            return read(label)
+
+        monkeypatch.setattr(stand.core, "getPosition", halt_on_arrival)
+        with caplog.at_level(logging.WARNING), pytest.raises(MicroscopeHaltedError):
+            stand.z.move_to_um(12.0)
+        _no_relock_after_the_move(stand.core.log)
+        assert (
+            "autofocus PFS: left off, because z: move_to 12.0 µm did not complete "
+            "(MicroscopeHaltedError)"
+        ) in caplog.messages
+        stand.microscope.resume()
+
+
 def test_interrupted_z_move_does_not_relock(
     caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -589,6 +616,34 @@ def test_engage_that_loses_the_lock_at_once_switches_it_off(
             "autofocus PFS: lost the lock at once, so it was switched off (in range: "
             "unknown)"
         ) in caplog.messages
+
+
+def test_engage_whose_state_cannot_be_read_after_the_wait_switches_it_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #141 item 1: unknown counts as searching (FM-19); left on, PFS could move
+    # Z with no action holding the lock, so it is given up on as at a deadline.
+    with _ti2() as stand:
+        locked = stand.core.isContinuousFocusLocked
+        reads: list[int] = []
+
+        def unreadable_on_the_readback() -> bool:
+            reads.append(1)
+            if len(reads) == 2:  # the poll's read, then the readback's
+                raise RuntimeError("PFS: no answer")
+            return locked()
+
+        monkeypatch.setattr(
+            stand.core, "isContinuousFocusLocked", unreadable_on_the_readback
+        )
+        with pytest.raises(HardwareError) as failed:
+            stand.af.engage()
+        assert str(failed.value).startswith(
+            "autofocus: isContinuousFocusLocked() failed (PFS: no answer)"
+        )
+        assert stand.core.log == [ON, OFF]
+        assert stand.core.isContinuousFocusEnabled() is False
+        assert stand.microscope.state().moving == ()
 
 
 def test_engage_that_finds_it_switched_itself_off_returns_false(

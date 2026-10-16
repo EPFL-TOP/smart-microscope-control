@@ -734,6 +734,9 @@ class MMAutofocus:
                 still reads on). The wait stays registered as a motion, so the
                 stand refuses actions until ``stop()`` or ``resume()``.
             MotionStoppedError: ``disengage()`` or a stop cancelled the wait.
+            HardwareError: Its state could not be read once the wait ended. It
+                was given up on as at the deadline: switched off, or still
+                registered as a motion if that failed too.
         """
         limit_s, assumed = self._lock_timeout(timeout_s)
         return self._engage("autofocus: engage", limit_s, assumed).locked
@@ -753,9 +756,17 @@ class MMAutofocus:
 
         def after_wait() -> _AfterWait:
             # The wait ended idle: locked, or no longer on.
-            if self._read_locked():
-                return "locked"
-            if not self._read_engaged():
+            try:
+                if self._read_locked():
+                    return "locked"
+                engaged = self._read_engaged()
+            except Exception:
+                # Unknown counts as searching (FM-19): left on, it could move
+                # Z with no action holding the lock. Given up on as at a
+                # deadline, then the read's failure is raised (#141).
+                self._executor.give_up(motion, "a state unreadable after the wait")
+                raise
+            if not engaged:
                 return "switched itself off"
             # It locked, then lost the lock before this read: left on, it would
             # search, and move Z, with no action holding the lock. Given up on
@@ -953,7 +964,8 @@ class MMAutofocus:
         well, and is reported the same way. A Z stop that came since the
         compound was called, before this block, cancels it with nothing
         sent. ``suspended`` says the autofocus is off already (the relock),
-        so that it is then left off, with the WARNING; otherwise (a locked
+        so that it is then left off, with the WARNING, as after a halt that
+        refuses the relock before it sends anything; otherwise (a locked
         ``focus_by_um``) it was not touched.
 
         While halted, the emergency stop has switched the autofocus off and
@@ -973,7 +985,10 @@ class MMAutofocus:
                 self._executor.refuse_if_stopped(key, before)
                 yield stopped
         except BaseException as exc:
-            if not (stopped.fired or (suspended and exc is before)):
+            # Suspended, a refusal before the engage was sent (this check, or a
+            # halt, #141) leaves it off as surely as a Z stop does.
+            refused = exc is before or isinstance(exc, MicroscopeHaltedError)
+            if not (stopped.fired or (suspended and refused)):
                 raise
             if isinstance(exc, MicroscopeHaltedError) or not isinstance(exc, Exception):
                 self._log_left_off(description, exc)
