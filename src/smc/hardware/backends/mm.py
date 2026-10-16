@@ -86,6 +86,7 @@ __all__ = [
     "MMZStage",
     "ZInterlock",
     "as_hardware_errors",
+    "autofocus_offset_motion",
 ]
 
 #: How long a lock is waited for when the profile sets no ``[autofocus]
@@ -176,6 +177,20 @@ def _motion(core: CMMCorePlus, label: str, name: str, *, stoppable: bool) -> Mot
         name=name,
         is_busy=lambda: bool(core.deviceBusy(label)),
         stop=stop if stoppable else None,
+    )
+
+
+def autofocus_offset_motion(core: CMMCorePlus, label: str) -> Motion:
+    """The ``autofocus_offset`` device's move, as the ``Executor`` sees it (m2 §3.6).
+
+    One definition for ``MMAutofocus``, which waits for it, and for the
+    emergency stop, which stops that device by its role (m2 §3.11): the same
+    key, so that the stop cancels the move under way, and the same name in
+    the lines.
+    """
+    role = Role.autofocus_offset.value
+    return _motion(
+        as_hardware_errors(core, role), label, f"{role} {label}", stoppable=True
     )
 
 
@@ -566,6 +581,11 @@ class MMAutofocus:
         # The offset device's proxy wraps the raw core: wrapping the autofocus
         # proxy would name every offset fault "autofocus".
         self._offset_core = as_hardware_errors(core, Role.autofocus_offset.value)
+        offset_motion = (
+            None
+            if offset_label is None
+            else autofocus_offset_motion(core, offset_label)
+        )
         core = self._core = as_hardware_errors(core, Role.autofocus.value)
         self._label = label
         self._executor = executor
@@ -581,13 +601,8 @@ class MMAutofocus:
         self._off = SafeCall(
             device=label, log="autofocus: disengage", send=self._send_off
         )
-        if offset_label is not None:
-            self._offset_motion = _motion(
-                self._offset_core,
-                offset_label,
-                f"{Role.autofocus_offset.value} {offset_label}",
-                stoppable=True,
-            )
+        if offset_motion is not None:
+            self._offset_motion = offset_motion
         else:
             # The autofocus device's own offset: no stop of its own (m2 §3.6).
             self._offset_motion = Motion(

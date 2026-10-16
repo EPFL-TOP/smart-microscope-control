@@ -398,6 +398,7 @@ def test_halted_z_move_does_not_relock(
             OFF,
             "setPosition('ZDrive', 12.0)",
             OFF,  # the emergency stop switches PFS off first
+            "stop('PFSOffset')",
             "stop('XYStage')",
             "stop('ZDrive')",
         ]
@@ -1438,6 +1439,7 @@ def test_emergency_stop_during_the_relock_switches_pfs_off_once() -> None:
         assert stand.core.log == [
             *relocking,
             OFF,
+            "stop('PFSOffset')",
             "stop('XYStage')",
             "stop('ZDrive')",
         ]
@@ -1747,12 +1749,18 @@ def test_emergency_stop_switches_pfs_off_before_the_stages(
         with caplog.at_level(logging.DEBUG):
             caplog.clear()
             stand.microscope.stop()
-        assert stand.core.log == [OFF, "stop('XYStage')", "stop('ZDrive')"]
+        assert stand.core.log == [
+            OFF,
+            "stop('PFSOffset')",
+            "stop('XYStage')",
+            "stop('ZDrive')",
+        ]
         # Every call before any line (FM-62).
-        assert lines_before == {"PFS": 0, "XYStage": 0, "ZDrive": 0}
-        assert caplog.messages[:4] == [
+        assert lines_before == {"PFS": 0, "PFSOffset": 0, "XYStage": 0, "ZDrive": 0}
+        assert caplog.messages[:5] == [
             "microscope: halted",
             "autofocus: disengage",
+            "autofocus_offset PFSOffset: stop",
             "xy_stage XYStage: stop",
             "z ZDrive: stop",
         ]
@@ -1770,7 +1778,69 @@ def test_emergency_stop_reports_a_failed_switch_off_and_stops_the_stages() -> No
             "the emergency stop failed for Autofocus 'PFS' (HardwareError("
         )
         assert "failed (PFS: stuck)" in message
-        assert stand.core.log == [OFF, "stop('XYStage')", "stop('ZDrive')"]
+        assert stand.core.log == [
+            OFF,
+            "stop('PFSOffset')",
+            "stop('XYStage')",
+            "stop('ZDrive')",
+        ]
+        stand.core.failing.clear()
+        stand.microscope.resume()
+
+
+@pytest.mark.parametrize("how", ["stop()", "close()"])
+def test_emergency_stop_stops_the_offset_device_after_the_switch_off(
+    how: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The review of #140: a move of the offset device is a motion moving()
+    # reports; left alone, it would hold the lock until its timeout.
+    with _ti2(core=_at_offset(7803.0)) as stand:
+        af, stop = stand.af, stand.core.stop
+
+        def stop_arrives(label: str) -> None:
+            stop(label)
+            stand.core.busy_devices.discard(label)
+
+        monkeypatch.setattr(stand.core, "stop", stop_arrives)
+        stand.core.busy_devices.add("PFSOffset")
+        mover = _Thread(lambda: af.set_offset_native(7805.0))
+        _wait_for(_moving(stand, "autofocus_offset PFSOffset"), "the offset move")
+        if how == "stop()":
+            stand.microscope.stop()
+        else:
+            stand.microscope.close()
+        mover.join()
+        assert isinstance(mover.error, MotionStoppedError)
+        assert mover.error.device == "autofocus_offset PFSOffset"
+        assert stand.core.log[:5] == [
+            "setPosition('PFSOffset', 7805.0)",
+            OFF,
+            "stop('PFSOffset')",
+            "stop('XYStage')",
+            "stop('ZDrive')",
+        ]
+        assert stand.microscope.state().moving == ()
+        stand.microscope.resume()
+
+
+def test_emergency_stop_reports_a_failed_offset_stop_and_still_stops_the_stages() -> (
+    None
+):
+    with _ti2() as stand:
+        stand.core.failing["PFSOffset"] = RuntimeError("PFSOffset: no answer")
+        with pytest.raises(HardwareError) as failed:
+            stand.microscope.stop()
+        assert str(failed.value).startswith(
+            "the emergency stop failed for autofocus_offset 'PFSOffset' "
+            "(HardwareError(\"autofocus_offset: stop('PFSOffset') failed (PFSOffset: "
+            "no answer)"
+        )
+        assert stand.core.log == [
+            OFF,
+            "stop('PFSOffset')",
+            "stop('XYStage')",
+            "stop('ZDrive')",
+        ]
         stand.core.failing.clear()
         stand.microscope.resume()
 
