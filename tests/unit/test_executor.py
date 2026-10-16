@@ -2461,6 +2461,109 @@ def test_a_linked_stop_is_removed_when_its_block_raises() -> None:
     assert z.stops == 2
 
 
+def test_leaving_an_inner_link_keeps_the_outer_one() -> None:
+    executor, z = _ex(), _Device("Z")
+    called: list[str] = []
+    with executor.linked_stop("Z", lambda: called.append("outer")):
+        with executor.linked_stop("Z", lambda: called.append("inner")):
+            pass
+        executor.stop(z.motion)
+    assert called == ["outer"]
+
+
+def test_the_first_failing_link_is_the_one_raised() -> None:
+    executor, z = _ex(), _Device("Z")
+    first, second = RuntimeError("PFS: stuck on"), RuntimeError("PFSOffset: stuck")
+
+    def fails_first() -> None:
+        raise first
+
+    def fails_second() -> None:
+        raise second
+
+    with (
+        executor.linked_stop("Z", fails_first),
+        executor.linked_stop("Z", fails_second),
+        pytest.raises(RuntimeError) as raised,
+    ):
+        executor.stop(z.motion)
+    assert raised.value is first
+    assert z.stops == 1
+
+
+def test_a_stop_marks_every_link_reached_before_it_calls_the_first() -> None:
+    # Adversarial review of the fix round: marked in the section that takes
+    # the snapshot, so a block that ends while the stop is still calling its
+    # links knows that it was stopped.
+    executor, z = _ex(), _Device("Z")
+    entered, release = threading.Event(), threading.Event()
+
+    def slow() -> None:
+        entered.set()
+        release.wait(JOIN_S)
+
+    with (
+        executor.linked_stop("Z", slow),
+        executor.linked_stop("Z", lambda: None) as second,
+    ):
+        stopper = _Thread(lambda: executor.stop(z.motion))
+        assert entered.wait(JOIN_S)
+    reached = second.reached  # its link is removed, and not called yet
+    release.set()
+    stopper.join()
+    assert reached is True
+    assert (stopper.error, z.stops) == (None, 1)
+
+
+class _InterruptOnce:
+    """A lock whose next ``with`` raises ``KeyboardInterrupt``: a second Ctrl-C."""
+
+    def __init__(self, lock: threading.RLock) -> None:
+        self._lock = lock
+        self._armed = True
+
+    def __enter__(self) -> bool:
+        if self._armed:
+            self._armed = False
+            raise KeyboardInterrupt  # raised from the stub, not sent as a signal
+        return self._lock.__enter__()
+
+    def __exit__(self, *exc: object) -> None:
+        self._lock.__exit__(*exc)
+
+
+def test_a_link_whose_removal_an_interrupt_skipped_is_never_called() -> None:
+    # Adversarial review of the fix round (FM-65, FM-70): left registered, it
+    # would switch PFS off on every later Z stop, with no compound running.
+    executor, z = _ex(), _Device("Z")
+    called: list[str] = []
+    lock = executor._registry_lock
+
+    def block() -> None:
+        with executor.linked_stop("Z", lambda: called.append("stale")):
+            executor._registry_lock = _InterruptOnce(lock)  # type: ignore[assignment]
+
+    with pytest.raises(KeyboardInterrupt):
+        block()
+    executor._registry_lock = lock
+    assert "Z" in executor._links  # the removal was skipped
+    executor.stop(z.motion)
+    assert (called, z.stops) == ([], 1)
+    with executor.linked_stop("Z", lambda: None) as fresh:
+        assert executor._links == {"Z": (fresh,)}  # the registration dropped it
+    assert executor._links == {}
+
+
+def test_no_link_is_called_while_halted() -> None:
+    # The emergency stop sends every stop itself, in its own order (m2 §3.11).
+    executor, z = _ex(), _Device("Z")
+    called: list[str] = []
+    executor.halt()
+    with executor.linked_stop("Z", lambda: called.append("off")) as link:
+        executor.stop(z.motion)
+    assert (called, link.reached, z.stops) == ([], False, 1)
+
+
 # --- compound (m2 §3.7) ------------------------------------------------------
 
 

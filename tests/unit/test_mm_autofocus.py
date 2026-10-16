@@ -646,6 +646,35 @@ def test_engage_whose_state_cannot_be_read_after_the_wait_switches_it_off(
         assert stand.microscope.state().moving == ()
 
 
+def test_engage_whose_enabled_state_cannot_be_read_after_the_wait_switches_it_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The twin of the test above, for the readback's second read.
+    with _ti2() as stand:
+        enabled = stand.core.isContinuousFocusEnabled
+        reads: list[int] = []
+
+        def idle_then_unreadable() -> bool:
+            reads.append(1)
+            if len(reads) == 1:
+                return False  # the poll: not searching, so the wait ends
+            if len(reads) == 2:  # the readback
+                raise RuntimeError("PFS: no answer")
+            return enabled()
+
+        monkeypatch.setattr(stand.core, "isContinuousFocusLocked", lambda: False)
+        monkeypatch.setattr(
+            stand.core, "isContinuousFocusEnabled", idle_then_unreadable
+        )
+        with pytest.raises(HardwareError) as failed:
+            stand.af.engage()
+        assert str(failed.value).startswith(
+            "autofocus: isContinuousFocusEnabled() failed (PFS: no answer)"
+        )
+        assert stand.core.log == [ON, OFF]
+        assert stand.microscope.state().moving == ()
+
+
 def test_engage_that_finds_it_switched_itself_off_returns_false(
     caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -875,7 +904,70 @@ def test_offset_change_while_locked_without_a_factor_has_only_the_offset_guards(
             ]
 
 
+def test_offset_change_while_locked_without_a_focus_drive_has_only_the_offset_guards() -> (
+    None
+):
+    devices = [
+        FakeDevice("PFS", DeviceType.AutoFocus),
+        FakeDevice("PFSOffset", DeviceType.Stage),
+        FakeDevice("XYStage", DeviceType.XYStage),
+        FakeDevice("Camera-1", DeviceType.Camera),
+        FakeDevice("Nosepiece", DeviceType.State, state_labels=("4x", "10x", "40x")),
+    ]
+    core = FakeCore(devices, camera="Camera-1", xy_stage="XYStage", autofocus="PFS")
+    core.setPosition("PFSOffset", 7800.0)
+    profile = _profile(autofocus={"offset_per_um": {"4x": -2.0}}, safety=_Z_LIMITS)
+    with _ti2(profile, core=core) as stand:
+        assert stand.microscope.roles.get(Role.focus) is None
+        stand.engage_directly()
+        assert stand.af.set_offset_native(7796.0) == 7796.0
+
+
+def test_offset_change_with_pfs_on_but_not_locked_is_not_held_to_the_z_limits() -> None:
+    # Searching, PFS follows no offset yet: the change implies no Z.
+    profile = _profile(autofocus={"offset_per_um": {"4x": -2.0}}, safety=_Z_LIMITS)
+    with _ti2(profile, core=_at_offset_and_z()) as stand:
+        stand.engage_directly(lockable=False)
+        assert stand.af.set_offset_native(7796.0) == 7796.0
+
+
 # --- focus_by_um (m2 §3.5) ---------------------------------------------------
+
+
+class _StubZ:
+    """A focus drive that ``Microscope.override`` put in: not interlocked, not linked."""
+
+    def position_um(self) -> float:
+        return 0.0
+
+    def move_to_um(self, z_um: float, *, keep_autofocus: bool = True) -> float:
+        return z_um
+
+    def move_by_um(
+        self, dz_um: float, *, force: bool = False, keep_autofocus: bool = True
+    ) -> float:
+        return dz_um
+
+    def wait(self, timeout_s: float | None = None) -> None:
+        return None
+
+    def is_busy(self) -> bool:
+        return False
+
+    def stop(self) -> None:
+        return None
+
+    def limits_um(self) -> None:
+        return None
+
+
+def test_locked_focus_by_with_an_overridden_focus_drive_links_no_z_stop() -> None:
+    # Its stop does not go through the Executor: there is nothing to link.
+    with _ti2(_factor({"4x": -3.0}), core=_at_offset(7800.0)) as stand:
+        stand.microscope.override(ZStage, _StubZ())
+        stand.engage_directly()
+        assert stand.af.focus_by_um(2.0) == FocusStep("offset", 0.0, 7794.0)
+        assert stand.core.log == ["setPosition('PFSOffset', 7794.0)", ON]
 
 
 def _factor(factors: dict[str, float], **more: Any) -> Profile:
@@ -1397,12 +1489,172 @@ def test_z_stop_after_focus_bys_offset_move_is_not_reported_as_a_disengage(
         assert stand.core.log == [
             "setPosition('PFSOffset', 7794.0)",
             OFF,
+            "stop('PFSOffset')",  # its move has not returned yet: still pending
             "stop('ZDrive')",
         ]
         assert [m for m in caplog.messages if "left off" in m] == [
             "autofocus PFS: left off, because autofocus: focus_by 2.0 µm did not "
             "complete (MotionStoppedError)"
         ]
+
+
+def test_z_stop_before_focus_bys_offset_move_is_sent_cancels_it(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Adversarial review of the fix round: the stop lands while the offset
+    # action reads its anchor. Sent after it, the offset change would make
+    # the next engage() drive Z by the whole step.
+    with _ti2(_factor({"4x": -3.0}), core=_at_offset(7800.0)) as stand:
+        stand.engage_directly()
+        af, z, read = stand.af, stand.z, stand.core.getPosition
+        stopped: list[str] = []
+
+        def stop_on_the_anchor(label: str | None = None) -> float:
+            if label == "PFSOffset" and not stopped:
+                stopped.append(label)
+                z.stop()
+            return read(label)
+
+        monkeypatch.setattr(stand.core, "getPosition", stop_on_the_anchor)
+        with caplog.at_level(logging.WARNING), pytest.raises(MotionStoppedError) as e:
+            af.focus_by_um(2.0)
+        assert str(e.value) == (
+            "`z ZDrive`: it was stopped during autofocus: focus_by 2.0 µm, so "
+            "autofocus PFS was left off; read the position before moving on"
+        )
+        assert stand.core.log == [OFF, "stop('PFSOffset')", "stop('ZDrive')"]
+        assert stand.af.offset_native() == 7800.0
+        assert (
+            "autofocus PFS: left off, because autofocus: focus_by 2.0 µm did not "
+            "complete (MotionStoppedError)"
+        ) in caplog.messages
+
+
+_STUCK_ON = (
+    "autofocus PFS: the Z stop during {} could not switch it off (autofocus: "
+    "enableContinuousFocus(False) failed (PFS: stuck on); check the device: power, "
+    "cable, another program holding it); it may still move Z"
+)
+
+
+def test_z_stop_whose_switch_off_fails_during_the_relock_does_not_say_left_off(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Adversarial review of the fix round: the stopper gets the failure, and
+    # the mover is not told that PFS was left off while it may still search.
+    with _ti2(_profile(autofocus={"lock_timeout_s": 2 * JOIN_S})) as stand:
+        stand.engage_directly(lockable=False)
+        z, switch = stand.z, stand.core.enableContinuousFocus
+        relocking = [OFF, "setPosition('ZDrive', 12.0)", ON]
+
+        def stuck_on(enable: bool) -> None:
+            if enable:
+                switch(True)
+                return
+            stand.core.log.append(OFF)
+            raise RuntimeError("PFS: stuck on")
+
+        with caplog.at_level(logging.WARNING):
+            mover = _Thread(lambda: z.move_to_um(12.0))
+            _wait_for(_sent_and_waiting(stand, relocking, "autofocus PFS"), "relock")
+            monkeypatch.setattr(stand.core, "enableContinuousFocus", stuck_on)
+            with pytest.raises(HardwareError, match=re.escape("(PFS: stuck on)")):
+                z.stop()
+            assert stand.core.log == [*relocking, OFF, "stop('ZDrive')"]
+            assert stand.core.isContinuousFocusEnabled() is True
+            # The emergency stop, with a switch-off that works, ends the wait.
+            monkeypatch.setattr(stand.core, "enableContinuousFocus", switch)
+            stand.microscope.stop()
+            mover.join()
+        assert isinstance(mover.error, MotionStoppedError)
+        assert mover.error.device == "autofocus PFS"  # the wait's own error
+        assert not any("left off" in m for m in caplog.messages)
+        assert _STUCK_ON.format("z: move_to 12.0 µm") in caplog.messages
+        stand.microscope.resume()
+
+
+@pytest.mark.parametrize("failing", ["the switch-off", "the offset stop", "both"])
+def test_a_z_stop_that_fails_during_focus_bys_offset_move_still_stops_z(
+    failing: str, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Every step is tried past a failure, the switch-off's is the one raised,
+    # and "left off" is claimed only when the switch-off went through.
+    profile = _factor({"4x": -3.0}, lock_timeout_s=2 * JOIN_S)
+    with _ti2(profile, core=_at_offset(7800.0)) as stand:
+        stand.engage_directly()
+        af, z = stand.af, stand.z
+        switch, stop = stand.core.enableContinuousFocus, stand.core.stop
+
+        def switch_stuck(enable: bool) -> None:
+            if not enable and failing != "the offset stop":
+                stand.core.log.append(OFF)
+                raise RuntimeError("PFS: stuck on")
+            switch(enable)
+
+        def stop_stuck(label: str) -> None:
+            if label == "PFSOffset" and failing != "the switch-off":
+                stand.core.log.append(f"stop({label!r})")
+                raise RuntimeError("PFSOffset: no answer")
+            stop(label)
+
+        sent = ["setPosition('PFSOffset', 7794.0)"]
+        stand.core.busy_devices.add("PFSOffset")
+        with caplog.at_level(logging.WARNING):
+            mover = _Thread(lambda: af.focus_by_um(2.0))
+            _wait_for(
+                _sent_and_waiting(stand, sent, "autofocus_offset PFSOffset"), "offset"
+            )
+            monkeypatch.setattr(stand.core, "enableContinuousFocus", switch_stuck)
+            monkeypatch.setattr(stand.core, "stop", stop_stuck)
+            raised = (
+                "PFSOffset: no answer"
+                if failing == "the offset stop"
+                else ("PFS: stuck on")
+            )
+            with pytest.raises(HardwareError, match=re.escape(f"({raised})")):
+                z.stop()
+            assert stand.core.log == [*sent, OFF, "stop('PFSOffset')", "stop('ZDrive')"]
+            monkeypatch.setattr(stand.core, "enableContinuousFocus", switch)
+            monkeypatch.setattr(stand.core, "stop", stop)
+            stand.core.busy_devices.discard("PFSOffset")
+            mover.join()
+        assert isinstance(mover.error, MotionStoppedError)
+        switched_off = failing == "the offset stop"
+        assert any("left off" in m for m in caplog.messages) is switched_off
+        assert (
+            _STUCK_ON.format("autofocus: focus_by 2.0 µm") in caplog.messages
+        ) is not switched_off
+
+
+def test_z_stop_during_focus_by_without_an_offset_device_is_the_switch_off_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The demo's layout: the offset is the autofocus device's own and cannot
+    # be stopped; the switch-off, keyed by the same label, cancels its move.
+    devices = [
+        FakeDevice("ZDrive", DeviceType.Stage),
+        FakeDevice("PFS", DeviceType.AutoFocus),
+        FakeDevice("XYStage", DeviceType.XYStage),
+        FakeDevice("Camera-1", DeviceType.Camera),
+        FakeDevice("Nosepiece", DeviceType.State, state_labels=("4x", "10x", "40x")),
+    ]
+    core = FakeCore(
+        devices, camera="Camera-1", xy_stage="XYStage", focus="ZDrive", autofocus="PFS"
+    )
+    with _ti2(_factor({"4x": -3.0}, lock_timeout_s=2 * JOIN_S), core=core) as stand:
+        assert stand.microscope.roles.get(Role.autofocus_offset) is None
+        stand.engage_directly()
+        af, z = stand.af, stand.z
+        core.busy_devices.add("PFS")
+        mover = _Thread(lambda: af.focus_by_um(2.0))
+        sent = ["setAutoFocusOffset(-6.0)"]
+        _wait_for(_sent_and_waiting(stand, sent, "autofocus PFS offset"), "offset")
+        z.stop()  # no stop of an offset device that cannot be stopped
+        core.busy_devices.discard("PFS")
+        mover.join()
+        assert isinstance(mover.error, MotionStoppedError)
+        assert mover.error.device == "z ZDrive"
+        assert core.log == [*sent, OFF, "stop('ZDrive')"]
 
 
 @pytest.mark.parametrize("then", ["halt", "ctrl-c"])

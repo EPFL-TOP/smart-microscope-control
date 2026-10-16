@@ -70,6 +70,7 @@ __all__ = [
     "SafeCall",
     "Safety",
     "Step",
+    "StopLink",
 ]
 
 T = TypeVar("T")
@@ -353,6 +354,23 @@ class SafeCall:
 
 
 @dataclass(eq=False)
+class StopLink:
+    """A ``linked_stop`` in place: what a stop of its device also calls, first.
+
+    ``reached`` is set in the registry section where a stop takes its
+    snapshot, before it calls ``stop``: a block that reads it once its link
+    is removed knows whether a stop has called it or is about to (the
+    review of #140). ``live`` is cleared as the first statement of the
+    block's ``finally``, with no lock: a removal that a second Ctrl-C skips
+    leaves a link that no stop calls, and the next registration drops it.
+    """
+
+    stop: Callable[[], None]
+    reached: bool = False
+    live: bool = True
+
+
+@dataclass(eq=False)
 class _Registration:
     """A motion that outlived its action: its action gave up while it still moved.
 
@@ -465,7 +483,7 @@ class Executor:
         #: Per device: what a stop of it also calls, first (``linked_stop``).
         #: A tuple, replaced whole, so that a stop that re-enters reads the
         #: old one or the new one, never one being built (FM-70).
-        self._links: dict[str, tuple[Callable[[], None], ...]] = {}
+        self._links: dict[str, tuple[StopLink, ...]] = {}
         self._halted = False
         #: How many halts there have been. An action records it when it is
         #: called, as it records the stop generation, so a halt that lands
@@ -956,32 +974,45 @@ class Executor:
         return self._give_up(motion, why)
 
     @contextmanager
-    def linked_stop(self, device: str, stop: Callable[[], None]) -> Iterator[None]:
+    def linked_stop(self, device: str, stop: Callable[[], None]) -> Iterator[StopLink]:
         """While the block runs, a ``stop()`` of ``device`` also calls ``stop``, first.
 
         For a compound that moves an axis through another device: an
         autofocus that engages again after a Z move, or follows its offset,
-        drives Z, so the operator's Z stop must reach it (FM-88, m2 §3.4).
-        ``stop`` runs on the stopping thread, without the microscope lock,
-        before the device's own stop and inside one ``hold_log``, so every
-        call is sent before any line (FM-62). One that raises does not keep
-        the device's own stop from being sent; ``stop()`` raises it after.
+        drives Z, so the operator's Z stop must reach it (FM-88, FM-91, m2
+        §3.4). ``stop`` runs on the stopping thread, without the microscope
+        lock, before the device's own stop and inside one ``hold_log``, so
+        every call is sent before any line (FM-62). One that raises does not
+        keep the device's own stop from being sent; ``stop()`` raises it
+        after. While halted, no link is called: the emergency stop sends
+        every stop itself, in its own order (m2 §3.11).
 
         A stop of ``device`` that came before the block (while the compound
         waited for the lock, or during an earlier step) finds no link. The
         caller checks for it with ``refuse_if_stopped`` as the block's first
         statement: the link is in place by then, so no stop falls between
-        the two. The link is registered inside the ``try``, so an interrupt
-        cannot leave it behind, and its removal tolerates its absence.
+        the two. The yielded ``StopLink`` says, once the block is over,
+        whether a stop reached it.
+
+        The registration is inside the ``try``, so an interrupt before the
+        block cannot leave the link behind. One in the ``finally`` can skip
+        the removal, but not the clearing of ``live`` before it (as for
+        ``hold_log``, FM-65): such a link is never called, and the next
+        registration drops it.
         """
+        link = StopLink(stop)
         try:
             with self._registry_lock:
                 # One store of a new tuple (FM-70): see ``_links``.
-                self._links[device] = (*self._links.get(device, ()), stop)
-            yield
+                kept = tuple(s for s in self._links.get(device, ()) if s.live)
+                self._links[device] = (*kept, link)
+            yield link
         finally:
+            link.live = False
             with self._registry_lock:
-                left = tuple(s for s in self._links.get(device, ()) if s is not stop)
+                left = tuple(
+                    s for s in self._links.get(device, ()) if s.live and s is not link
+                )
                 if left:
                     self._links[device] = left
                 else:
@@ -1098,7 +1129,8 @@ class Executor:
         is dropped once the stop is sent, unless the device still reads busy
         (it is moving); after a failed stop it stays, for the guard or for
         ``resume()``. What ``linked_stop`` links to the device is called
-        first, then the device's own stop, then every line is written.
+        first, then the device's own stop, then every line is written; while
+        halted, nothing linked is called.
 
         Raises:
             HardwareError: The device cannot be stopped from smc.
@@ -1124,7 +1156,15 @@ class Executor:
             self._generations[motion.device] = (
                 self._generations.get(motion.device, 0) + 1
             )
-            linked = self._links.get(motion.device, ())
+            linked = (
+                ()
+                if self._halted
+                else tuple(s for s in self._links.get(motion.device, ()) if s.live)
+            )
+            for link in linked:
+                # In the section that takes the snapshot: a block that reads
+                # it after its link is removed cannot miss this stop.
+                link.reached = True
         if linked:
             error = self.hold_log(lambda: self._stop_linked(motion, send, linked))
         else:
@@ -1144,7 +1184,7 @@ class Executor:
         self,
         motion: Motion,
         send: Callable[[], None],
-        linked: tuple[Callable[[], None], ...],
+        linked: tuple[StopLink, ...],
     ) -> Exception | None:
         """The linked calls, then ``motion``'s own stop, past any failure of theirs.
 
@@ -1153,9 +1193,9 @@ class Executor:
         """
         failure: Exception | None = None
         interrupted: BaseException | None = None
-        for also in linked:
+        for link in linked:
             try:
-                also()
+                link.stop()
             except Exception as exc:
                 failure = failure or exc
             except BaseException as exc:
