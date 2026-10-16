@@ -533,6 +533,34 @@ def test_engage_raises_when_pfs_cannot_be_switched_off_after_no_lock(
         stand.microscope.resume()
 
 
+def test_engage_raises_when_the_switch_off_failed_even_if_it_reads_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A switch-off that raised may or may not have taken: m2 §3.2 raises
+    # rather than return False on the strength of one read.
+    with _ti2() as stand:
+        stand.core.autofocus_lockable = False
+        switch = stand.core.enableContinuousFocus
+
+        def off_but_raises(enable: bool) -> None:
+            switch(enable)
+            if not enable:
+                raise RuntimeError("PFS: no acknowledgement")
+
+        monkeypatch.setattr(stand.core, "enableContinuousFocus", off_but_raises)
+        with pytest.raises(DeviceTimeoutError) as timed_out:
+            stand.af.engage()
+        assert (
+            "and it could not be switched off (the switch-off failed: autofocus: "
+            "enableContinuousFocus(False) failed (PFS: no acknowledgement);"
+        ) in str(timed_out.value)
+        assert stand.core.isContinuousFocusEnabled() is False
+        # It reads off, so nothing stays registered and the next action runs.
+        monkeypatch.setattr(stand.core, "enableContinuousFocus", switch)
+        assert stand.microscope.state().moving == ()
+        assert stand.z.move_to_um(1.0) == 1.0
+
+
 def test_engage_that_loses_the_lock_at_once_switches_it_off(
     caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
