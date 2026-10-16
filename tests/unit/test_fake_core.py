@@ -205,7 +205,8 @@ def test_fake_z_move_keeps_continuous_focus_without_the_quirk() -> None:
 def test_fake_quirk_applies_only_to_the_focus_device() -> None:
     focus = FakeDevice("Z", DeviceType.Stage)
     other = FakeDevice("Piezo", DeviceType.Stage)
-    core = FakeCore([focus, other], focus="Z")
+    pfs = FakeDevice("PFS", DeviceType.AutoFocus)
+    core = FakeCore([focus, other, pfs], focus="Z", autofocus="PFS")
     core.enableContinuousFocus(True)
     core.setPosition("Piezo", 1.0)
     assert core.isContinuousFocusEnabled() is True
@@ -331,3 +332,97 @@ def test_fake_device_without_state_properties_gets_them() -> None:
     core.setState("Wheel", 1)
     assert core.getProperty("Wheel", "Label") == "B"
     assert core.getExposure() == 10.0
+
+
+# --- continuous focus (m2 §3.12) ---------------------------------------------
+
+
+def _two_autofocus_devices() -> FakeCore:
+    return FakeCore(
+        [
+            FakeDevice("Z", DeviceType.Stage),
+            FakeDevice("PFS", DeviceType.AutoFocus),
+            FakeDevice("PFS2", DeviceType.AutoFocus),
+        ],
+        focus="Z",
+        autofocus="PFS",
+    )
+
+
+def test_autofocus_offset_round_trips_and_is_logged() -> None:
+    core = _two_autofocus_devices()
+    assert core.getAutoFocusOffset() == 0.0
+    core.setAutoFocusOffset(12.5)
+    assert core.getAutoFocusOffset() == 12.5
+    assert core.log == ["setAutoFocusOffset(12.5)"]
+    # It acts on the slot's device: another AutoFocus device keeps its own.
+    core.setAutoFocusDevice("PFS2")
+    assert core.getAutoFocusOffset() == 0.0
+    core.enableContinuousFocus(True)
+    core.setAutoFocusDevice("PFS")
+    assert core.isContinuousFocusEnabled() is False
+    # An offset moves nothing (measured on the demo).
+    assert core.getPosition("Z") == 0.0
+
+
+def test_empty_autofocus_slot_raises_as_measured() -> None:
+    core = _two_autofocus_devices()
+    core.setAutoFocusDevice("")
+    core.log.clear()
+    with _raises_exactly("Auto-focus focus device not defined."):
+        core.enableContinuousFocus(True)
+    core.enableContinuousFocus(False)  # measured: no error
+    assert core.isContinuousFocusEnabled() is False
+    assert core.isContinuousFocusLocked() is False
+    with _raises_exactly("Error (code 43)"):
+        core.getAutoFocusOffset()
+    with _raises_exactly("Error (code 43)"):
+        core.setAutoFocusOffset(1.0)
+    # Logged even when it then raises, as every mutation is.
+    assert core.log == [
+        "enableContinuousFocus(True)",
+        "enableContinuousFocus(False)",
+        "setAutoFocusOffset(1.0)",
+    ]
+
+
+def test_failing_autofocus_label_reaches_the_continuous_focus_calls() -> None:
+    core = _two_autofocus_devices()
+    boom = RuntimeError("PFS: no answer")
+    core.failing["PFS"] = boom
+    calls = [
+        lambda: core.enableContinuousFocus(True),
+        lambda: core.enableContinuousFocus(False),
+        core.isContinuousFocusEnabled,
+        core.isContinuousFocusLocked,
+        core.getAutoFocusOffset,
+        lambda: core.setAutoFocusOffset(1.0),
+        lambda: core.deviceBusy("PFS"),
+    ]
+    for call in calls:
+        with pytest.raises(RuntimeError) as caught:
+            call()
+        assert caught.value is boom
+    # The slot's device, not any AutoFocus device: PFS2 answers once named.
+    core.setAutoFocusDevice("PFS2")
+    assert core.isContinuousFocusEnabled() is False
+
+
+def test_autofocus_lockable_false_never_locks() -> None:
+    core = _two_autofocus_devices()
+    core.autofocus_lockable = False
+    core.enableContinuousFocus(True)
+    assert core.isContinuousFocusEnabled() is True
+    assert core.isContinuousFocusLocked() is False
+    core.autofocus_lockable = True
+    assert core.isContinuousFocusLocked() is True
+    core.enableContinuousFocus(False)
+    assert core.isContinuousFocusLocked() is False
+
+
+def test_unloading_the_autofocus_empties_its_slot() -> None:
+    core = _two_autofocus_devices()
+    core.enableContinuousFocus(True)
+    core.unloadDevice("PFS")
+    assert core.getAutoFocusDevice() == ""
+    assert core.isContinuousFocusEnabled() is False
