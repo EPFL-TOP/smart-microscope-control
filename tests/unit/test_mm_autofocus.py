@@ -826,17 +826,23 @@ def test_focus_by_while_on_but_not_locked_is_refused() -> None:
 
 
 def test_focus_by_jog_guard_applies_to_dz_um() -> None:
-    with _ti2(_factor({"4x": -3.0})) as stand:
+    # An offset jog limit wide enough for the converted change (60 µm times
+    # -3.0): only Z's guard on dz_um stands between the call and the offset.
+    profile = _profile(
+        autofocus={"offset_per_um": {"4x": -3.0}},
+        safety={"max_autofocus_offset_jog": 1000.0},
+    )
+    with _ti2(profile, core=_at_offset(7800.0)) as stand:
+        refusal = "Z jog 60.0 µm exceeds the Z jog limit of 50.0 µm"
         with pytest.raises(SafetyRefusedError) as refused:
             stand.af.focus_by_um(60.0)
-        assert (
-            refused.value.reason == "Z jog 60.0 µm exceeds the Z jog limit of 50.0 µm"
-        )
+        assert refused.value.reason == refusal
         assert refused.value.how_to_force == "pass force=True"
         stand.engage_directly()
         # Locked too: the guard is on dz_um, before the offset is converted.
-        with pytest.raises(SafetyRefusedError):
+        with pytest.raises(SafetyRefusedError) as locked:
             stand.af.focus_by_um(60.0)
+        assert locked.value.reason == refusal
         assert stand.core.log == []
         stand.af.disengage()
         assert stand.af.focus_by_um(60.0, force=True) == FocusStep("z", 60.0, None)
