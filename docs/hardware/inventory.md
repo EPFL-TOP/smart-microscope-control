@@ -23,18 +23,50 @@ New findings arrive as *Hardware session report* issues and land here.
 - Power on the **stand before the controller box**, or only the simulator
   device appears. `Ti2Sample.exe` tests the SDK without Micro-Manager.
 - Ti2 Control 2.10/2.20 crash Micro-Manager when the nosepiece device is
-  added (mmCoreAndDevices #44); 2.00 works.
+  added (mmCoreAndDevices #44); 2.00 works. **2.90.108 works**: the hub and
+  all 16 peripherals, nosepiece included, initialise through pymmcore
+  (session 0, #126).
+- The hub lists **16 peripherals**: `ZDrive`, `XYStage`, `Nosepiece`,
+  `CondenserTurret`, `FilterTurret1` + `Turret1Shutter`, `FilterTurret2` +
+  `Turret2Shutter`, `LightPath` (EYE/R100/AUX/L100), `PFS`, `PFSOffset`,
+  `IntermediateMagnification`, `DiaLamp`, `TIRF1`–`TIRF3`. Each loads
+  without being initialised, which is enough to read its type. Every
+  description is empty: roles come from names and types only.
+- **Two filter turrets**, each with its own shutter, so "the" filter
+  turret is a profile choice. The `IntermediateMagnification` (1.0×/1.5×)
+  is read-only, a manual lever, and it changes the pixel size.
 - Four devices are typed `XYStage`: the stage and **three TIRF illuminator
   positioners**. Driving a TIRF drive reads exactly like a dead stage
   (0,0, never moves). Exclude by name.
 - The PFS offset is a `Stage`-typed device; the Z drive is another. Type-
   first resolution with name tie-breaks is mandatory.
-- The stand adapter never provides the camera (Hamamatsu `HamamatsuHam`
-  here).
+- **Neither `ZDrive` nor `PFSOffset` reports a focus direction** (0,
+  unknown): the profile must say which way is away from the sample (#98).
+- PFS state is in properties: `FocusMaintenance` (On/Off), `PFS in Range`
+  and `PFS Status` (read-only), `DichroicMirrorInserted`, `LEDIntensity`.
+  Speeds are properties as well: `ZDrive` 0.5–2.5 mm/s, `XYStage`
+  0.25–51 mm/s.
+- The stand adapter never provides the camera. On our Ti2-E it is a
+  **Photometrics Prime 95B** through `PVCAM` (`Camera-1`, 1412×1412, 16-bit;
+  PVCAM despeckle filters on by default). nikon-control's notes named a
+  Hamamatsu, which is not fitted (session 0). An Andor Zyla is present but
+  unused. The epi light, a **Lumencor Spectra III**, is not on the hub; nor
+  is the Mad City Labs Nano-Z100 piezo insert that was bought with the
+  stand.
+- Our Ti2-E has no TIRF illuminator (none was bought; **inferred** from the
+  purchase quote), yet the hub lists `TIRF1`–`TIRF3` at (0, 0): it lists
+  them whether or not anything is behind them.
 - `DiaLamp` is the brightfield shutter/lamp; `Turret1Shutter`/
   `Turret2Shutter` are epi shutters. Intensity is a device *property*, not
   an MMCore API — found by property-name hints on light-like devices.
-- Camera pixels 6.5 µm; at 40× → 0.1625 µm/px, 2048² → 333 µm field.
+- Camera pixels: 11 µm is the Prime 95B's datasheet figure, not a
+  measurement, and the lab's configuration defines no pixel size, so
+  smc reports it as unknown. The old "6.5 µm, 2048²" figures were a
+  Hamamatsu's.
+- The lab's `MMConfig.cfg` (nikon-control, 2026-09-16) has no Startup
+  preset and no `Core,TimeoutMs`. Its state labels are its own, and
+  FilterTurret2's are truncated fragments, unusable as channel names.
+  Details: `docs/hardware/nikon-ti2.md`.
 
 ## Nikon Ti-E (older stand)
 
