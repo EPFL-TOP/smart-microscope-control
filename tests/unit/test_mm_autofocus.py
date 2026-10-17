@@ -28,15 +28,7 @@ from pymmcore_plus import DeviceType
 
 import smc.hardware.backends.mm as mm
 from smc.hardware import Microscope
-from smc.hardware.capabilities import (
-    Autofocus,
-    Camera,
-    FocusStep,
-    Properties,
-    Shutter,
-    XYStage,
-    ZStage,
-)
+from smc.hardware.capabilities import Autofocus, Camera, FocusStep, XYStage, ZStage
 from smc.hardware.errors import (
     AutofocusLostError,
     CapabilityMissingError,
@@ -47,6 +39,7 @@ from smc.hardware.errors import (
     MotionStoppedError,
     SafetyRefusedError,
 )
+from smc.hardware.microscope import CAPABILITY_ROLES
 from smc.hardware.profile import (
     AutofocusSection,
     MicroscopeSection,
@@ -2305,8 +2298,11 @@ _DEAD_OWNER = (
 
 
 def _build_every_capability(microscope: Microscope) -> None:
-    """What a session that used the whole stand has built, ``state()`` included."""
-    for capability in (Properties, XYStage, ZStage, Shutter, Camera, Autofocus):
+    """What a session that used the whole stand has built, ``state()`` included.
+
+    Every capability the facade knows, so that a new one is under the test.
+    """
+    for capability in CAPABILITY_ROLES:
         # The Ti2-E has no shutter role; the others it has.
         with suppress(CapabilityMissingError):
             microscope.require(capability)

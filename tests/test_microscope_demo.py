@@ -894,12 +894,16 @@ def test_emergency_stop_is_not_held_up_by_a_blocked_log_handler(
 
 
 def test_closing_the_demo_facade_frees_its_core_without_the_cyclic_collector(
-    no_cyclic_gc: None,
+    no_cyclic_gc: None, caplog: pytest.LogCaptureFixture
 ) -> None:
     # #142, on the real core (what `smc doctor` exits with): MMCore's pool
     # threads live until the CMMCorePlus is destroyed, and a core that only the
     # cyclic collector frees is destroyed during interpreter finalization.
+    # pymmcore-plus logs "Initialized core %s" at DEBUG with the core as the
+    # argument, and pytest keeps every LogRecord with its arguments: without
+    # this level the test would find the core held by pytest, not by our code.
     # Profile.demo(), not "demo": no demo.toml of the working directory.
+    caplog.set_level(logging.INFO, logger="pymmcore-plus")
     microscope = Microscope.open(Profile.demo())
     microscope.state()
     microscope.close()
