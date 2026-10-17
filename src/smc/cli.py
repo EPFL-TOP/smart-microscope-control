@@ -29,7 +29,7 @@ from rich.text import Text
 from smc import __version__
 from smc.hardware import core as core_mod
 from smc.hardware.backends.mm import as_hardware_errors
-from smc.hardware.capabilities import XY, Camera, Shutter, XYStage, ZStage
+from smc.hardware.capabilities import XY, Autofocus, Camera, Shutter, XYStage, ZStage
 from smc.hardware.errors import HardwareError, ProfileError, SafetyRefusedError
 from smc.hardware.microscope import Microscope, MicroscopeState
 from smc.hardware.profile import DEMO_NAME, Profile, list_profiles, search_paths
@@ -385,6 +385,14 @@ def _status_line(microscope: Microscope, state: MicroscopeState) -> str:
             parts.append("shutter ?")
         else:
             parts.append("shutter open" if state.shutter_open else "shutter closed")
+    if microscope.has(Autofocus):
+        engaged, locked = state.autofocus_engaged, state.autofocus_locked
+        if engaged is None or (engaged and locked is None):
+            parts.append("autofocus ?")
+        elif not engaged:
+            parts.append("autofocus off")
+        else:
+            parts.append("autofocus locked" if locked else "autofocus on, not locked")
     if state.moving:
         parts.append("moving: " + ", ".join(state.moving))
     if state.halted:

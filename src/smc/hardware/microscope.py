@@ -28,7 +28,13 @@ Hardware behaviour encoded here:
   cannot start its next move between the stop of one stage and the next.
   Its lines, the halt's included, are written once every stop is sent, so
   a blocked console (a QuickEdit selection on Windows) cannot hold the Z
-  stop behind the line of the XY stop (FM-62).
+  stop behind the line of the XY stop (FM-62). **The autofocus is switched
+  off before the stages** (m2 §3.11): a Z stop sent while PFS still drives Z
+  can be overridden by its next correction. Its offset device is stopped
+  right after, by its role: it is a stage the layer moves.
+* **The core's AutoFocus slot follows the role** (FM-87): the
+  continuous-focus calls act on the slot's device, so when the role names
+  another one, the slot is pointed at it once, here.
 """
 
 from __future__ import annotations
@@ -43,14 +49,25 @@ from types import TracebackType
 from typing import TYPE_CHECKING, TypeVar, cast
 
 from smc.hardware.backends.mm import (
+    MMAutofocus,
     MMCamera,
     MMProperties,
     MMShutter,
     MMXYStage,
     MMZStage,
+    ZInterlock,
     as_hardware_errors,
+    autofocus_offset_motion,
 )
-from smc.hardware.capabilities import XY, Camera, Properties, Shutter, XYStage, ZStage
+from smc.hardware.capabilities import (
+    XY,
+    Autofocus,
+    Camera,
+    Properties,
+    Shutter,
+    XYStage,
+    ZStage,
+)
 from smc.hardware.core import close_core, open_core
 from smc.hardware.errors import (
     CapabilityMissingError,
@@ -79,11 +96,17 @@ CAPABILITY_ROLES: dict[type, tuple[Role, ...]] = {
     ZStage: (Role.focus,),
     Camera: (Role.camera,),
     Shutter: (Role.shutter,),
+    Autofocus: (Role.autofocus,),
     Properties: (),
 }
 
-#: The stages the emergency stop reaches, in the order it stops them.
-_STAGES: tuple[tuple[type, Role], ...] = (
+#: What the emergency stop reaches, in the order it stops them: the
+#: autofocus first, switched off, then the offset device it follows, then
+#: the stages (m2 §3.11). The offset device fills a role but is no
+#: capability (``None``): it is stopped by its role's label.
+_STOPPED: tuple[tuple[type | None, Role], ...] = (
+    (Autofocus, Role.autofocus),
+    (None, Role.autofocus_offset),
     (XYStage, Role.xy_stage),
     (ZStage, Role.focus),
 )
@@ -104,6 +127,10 @@ class MicroscopeState:
     image_shape: tuple[int, int] | None = None
     pixel_size_um: float | None = None
     shutter_open: bool | None = None
+    autofocus_engaged: bool | None = None
+    autofocus_locked: bool | None = None
+    #: In the offset device's own units ([autofocus] offset_unit).
+    autofocus_offset_native: float | None = None
     moving: tuple[str, ...] = ()
     halted: bool = False
     roles: dict[str, str] = field(default_factory=dict)
@@ -144,6 +171,7 @@ class Microscope:
         )
         for warning in self.roles.warnings:
             log.warning("%s", warning)
+        self._point_autofocus_slot()
         safety = profile.safety
         # Only a stand that has a focus drive has a Z jog to guard; the
         # profile cannot know that at load time, so the warning waits for the
@@ -160,6 +188,9 @@ class Microscope:
             max_z_jog_um=safety.max_z_jog_um,
             z_soft_limits_um=safety.z_soft_limits_um,
             xy_soft_limits_um=safety.xy_soft_limits_um,
+            max_autofocus_offset_jog=safety.max_autofocus_offset_jog,
+            autofocus_offset_soft_limits=safety.autofocus_offset_soft_limits,
+            offset_unit=profile.autofocus.offset_unit,
         )
         self._lock = threading.RLock()
         # FM-15: waiting for the lock is bounded like a device call.
@@ -285,6 +316,12 @@ class Microscope:
         log.info(
             "%s: overridden by %s", capability.__name__, type(implementation).__name__
         )
+        if capability is Autofocus:
+            # The interlock trusts only MMAutofocus (_interlock): a Z move on a
+            # Nikon stand now leaves PFS off, or fights it.
+            log.warning(
+                "Autofocus overridden: Z moves no longer suspend and re-engage it"
+            )
 
     def _lookup(self, capability: type) -> object | None:
         """The cached capability, built on first request; ``None`` when a role is unfilled.
@@ -315,7 +352,7 @@ class Microscope:
         if capability is XYStage and (label := get(Role.xy_stage)) is not None:
             return MMXYStage(core, label, executor, safety)
         if capability is ZStage and (label := get(Role.focus)) is not None:
-            return MMZStage(core, label, executor, safety)
+            return MMZStage(core, label, executor, safety, autofocus=self._interlock)
         if capability is Shutter and (label := get(Role.shutter)) is not None:
             return MMShutter(core, label, executor)
         if capability is Camera and (label := get(Role.camera)) is not None:
@@ -326,7 +363,74 @@ class Microscope:
                 self.profile.camera.pixel_size_um,
                 self._objective_label(),
             )
+        if capability is Autofocus and (label := get(Role.autofocus)) is not None:
+            af = self.profile.autofocus
+            return MMAutofocus(
+                core,
+                label,
+                executor,
+                safety,
+                offset_label=get(Role.autofocus_offset),
+                offset_unit=af.offset_unit,
+                lock_timeout_s=af.lock_timeout_s,
+                offset_per_um=af.offset_per_um,
+                in_range_property=af.in_range_property,
+                in_range_values=af.in_range_values,
+                objective_label=self._objective_label(),
+                # Lazy: the focus drive is looked up at the call, never here.
+                focus=lambda: cast("ZStage | None", self._lookup(ZStage)),
+            )
         return None
+
+    def _interlock(self) -> ZInterlock | None:
+        """The autofocus a Z move suspends and engages again; ``None`` when there is none.
+
+        Asked by the Z stage at each move, so neither build calls the other.
+        An autofocus that ``override`` replaced is not an ``MMAutofocus`` and
+        is not interlocked: a test double cannot be trusted to hold Z. The
+        cache lock it takes is re-entrant, since this runs during a Z move,
+        where a Ctrl-C handler may land (FM-70).
+        """
+        found = self._lookup(Autofocus)
+        return found if isinstance(found, MMAutofocus) else None
+
+    def _point_autofocus_slot(self) -> None:
+        """Point the core's AutoFocus slot at the ``autofocus`` role, once, at construction.
+
+        MMCore's continuous-focus calls take no label: they act on the slot's
+        device (FM-87). The role's order of authority (the profile, then the
+        slot, then the heuristics, ADR-0003) decides which device that is, so
+        a ``[roles.assign]`` or a configuration without ``Core,AutoFocus``
+        would otherwise switch one device while the layer reports another.
+        A slot that cannot take the device (a role assigned to a device of
+        another type) is a WARNING, not a failed open: every autofocus call
+        then refuses, naming both, and so does every Z move, which must know
+        whether the autofocus is engaged before it moves.
+        """
+        label = self.roles.get(Role.autofocus)
+        if label is None:
+            return
+        current = self.core.getAutoFocusDevice()
+        if current == label:
+            return
+        try:
+            self.core.setAutoFocusDevice(label)
+        except Exception as exc:
+            log.warning(
+                "autofocus: the core's AutoFocus slot names %r and cannot be pointed "
+                "at %r (%s); every autofocus call and every Z move will be "
+                "refused. Fix the autofocus role under [roles.assign]",
+                current,
+                label,
+                exc,
+            )
+            return
+        log.info(
+            "autofocus: the core's AutoFocus slot now names %r (was %r), as the "
+            "roles say",
+            label,
+            current,
+        )
 
     def _objective_label(self) -> Callable[[], str | None]:
         """The current objective's name, for the profile's pixel-size map."""
@@ -362,6 +466,13 @@ class Microscope:
         shutter = cast("Shutter | None", self._lookup(Shutter))
         if shutter is not None:
             state.shutter_open = _read("shutter", shutter.is_open, errors)
+        autofocus = cast("Autofocus | None", self._lookup(Autofocus))
+        if autofocus is not None:
+            state.autofocus_engaged = _read("autofocus", autofocus.is_engaged, errors)
+            state.autofocus_locked = _read("autofocus", autofocus.is_locked, errors)
+            state.autofocus_offset_native = _read(
+                "autofocus", autofocus.offset_native, errors
+            )
         # Read after the devices: "moving" and "halted" are then at least as
         # recent as the positions shown next to them.
         state.moving = self._executor.moving()
@@ -369,7 +480,7 @@ class Microscope:
         return state
 
     def describe(self) -> str:
-        """One status line: ``XY (x, y) µm | Z z µm | exposure ms | shutter open``.
+        """One status line: ``XY (x, y) µm | Z z µm | exposure ms | shutter open | autofocus off``.
 
         A capability the stand lacks is left out; one whose read failed shows
         ``?``. ``| moving: …`` and ``| HALTED`` are added when they apply.
@@ -395,6 +506,8 @@ class Microscope:
                 parts.append("shutter ?")
             else:
                 parts.append("shutter open" if state.shutter_open else "shutter closed")
+        if self._lookup(Autofocus) is not None:
+            parts.append(_describe_autofocus(state))
         if state.moving:
             parts.append("moving: " + ", ".join(state.moving))
         if state.halted:
@@ -404,20 +517,24 @@ class Microscope:
     # --- stop, resume, close -----------------------------------------------
 
     def stop(self) -> None:
-        """The stand's emergency stop: halt, then stop every stage (§13).
+        """The stand's emergency stop: halt, switch the autofocus off, stop every stage (§13).
 
         The halt comes first, so no action starts once the stops are under
-        way; every stage is stopped even when an earlier one fails. The stops
-        never wait for the microscope lock, so they get through a move that
-        holds it. Its log lines come after the last stop, ``microscope:
-        halted`` first, then one per stage: a blocked console delays the
-        lines, never a stop (FM-62). Every action then raises
-        ``MicroscopeHaltedError`` until :meth:`resume`; reads and closing a
-        shutter still run.
+        way. The autofocus is switched off before the stages, because a Z
+        stop sent while PFS still drives Z can be overridden by its next
+        correction (m2 §3.11), and its ``autofocus_offset`` device is stopped
+        right after it; every one of them is stopped even when an earlier
+        one fails. The stops never wait for the microscope lock, so
+        they get through a move that holds it. Its log lines come after the
+        last stop, ``microscope: halted`` first, then one per stop: a blocked
+        console delays the lines, never a stop (FM-62). Every action then
+        raises ``MicroscopeHaltedError`` until :meth:`resume`; reads, closing
+        a shutter and switching the autofocus off still run.
 
         Raises:
-            HardwareError: One or more stages did not take the stop; the
-                message names each, and the microscope stays halted.
+            HardwareError: One or more stages, the autofocus or its offset
+                device did not take the stop; the message names each, and the
+                microscope stays halted.
         """
         failures = self._executor.hold_log(self._halt_then_stop_stages)
         if failures:
@@ -541,35 +658,68 @@ class Microscope:
         return self._stop_stages()
 
     def _stop_stages(self) -> list[str]:
-        """Stop each stage the stand has, past any failure; return one note per failure.
+        """Switch the autofocus off, stop its offset device, then each stage; one note per failure.
 
-        An interrupt (a second Ctrl-C) during one stop does not skip the
-        next: it is re-raised once every stage has had its stop. The lookup
-        is inside the same guard, since it builds a stage nobody used yet.
+        The autofocus first (m2 §3.11): PFS still driving Z could override
+        the Z stop with its next correction. Its offset device next: a move
+        of it that ``moving()`` reports would otherwise hold the lock until
+        its timeout (the review of #140). An interrupt (a second Ctrl-C)
+        during one stop does not skip the next: it is re-raised once every
+        one has had its stop. The lookup is inside the same guard, since it
+        builds a capability nobody used yet.
         """
         failures: list[str] = []
         interrupted: BaseException | None = None
-        for capability, role in _STAGES:
+        for capability, role in _STOPPED:
             try:
-                stage = cast("XYStage | ZStage | None", self._lookup(capability))
-                if stage is None:
-                    continue
-                stage.stop()
+                self._stop_one(capability, role)
             except Exception as exc:
                 label = self.roles.get(role)
-                name = capability.__name__ + (f" {label!r}" if label else "")
-                failures.append(f"{name} ({exc!r})")
+                kind = role.value if capability is None else capability.__name__
+                failures.append(f"{kind}{f' {label!r}' if label else ''} ({exc!r})")
             except BaseException as exc:
                 interrupted = interrupted or exc
         if interrupted is not None:
             raise interrupted
         return failures
 
+    def _stop_one(self, capability: type | None, role: Role) -> None:
+        """One entry of ``_STOPPED``: the autofocus switched off, a stage or the offset device stopped.
+
+        The offset device is stopped by its role, whether or not the
+        autofocus was built or overridden: its own stop, keyed by its label,
+        is the one that cancels a move of it under way.
+        """
+        if capability is None:
+            label = self.roles.get(role)
+            if label is not None:
+                self._executor.stop(autofocus_offset_motion(self.core, label))
+            return
+        found = self._lookup(capability)
+        if found is None:
+            return
+        if capability is Autofocus:
+            cast("Autofocus", found).disengage()
+        else:
+            cast("XYStage | ZStage", found).stop()
+
 
 def _owns(lock: threading.RLock) -> bool:
     """Whether the calling thread holds ``lock`` (``RLock._is_owned``, as ``Condition`` uses)."""
     is_owned = getattr(lock, "_is_owned", None)
     return bool(is_owned()) if is_owned is not None else False
+
+
+def _describe_autofocus(state: MicroscopeState) -> str:
+    """The status line's autofocus part; ``autofocus ?`` when a read it needs failed."""
+    engaged, locked = state.autofocus_engaged, state.autofocus_locked
+    if engaged is None:
+        return "autofocus ?"
+    if not engaged:
+        return "autofocus off"
+    if locked is None:
+        return "autofocus ?"
+    return "autofocus locked" if locked else "autofocus on, not locked"
 
 
 def _read(name: str, read: Callable[[], R], errors: list[str]) -> R | None:

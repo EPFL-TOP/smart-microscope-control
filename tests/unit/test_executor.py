@@ -2379,3 +2379,352 @@ def test_hold_log_does_not_hold_another_threads_lines() -> None:
     assert written_inside, "another thread's line was held"
     assert stoppers[0].error is None
     assert z.stops == 1
+
+
+# --- linked stops (the review of #140) ---------------------------------------
+
+
+def test_a_linked_stop_is_sent_first_and_every_line_waits_for_the_devices_own() -> None:
+    # While the autofocus locks again after a Z move, the operator's Z stop
+    # switches it off first (FM-88); both are sent before either line (FM-62).
+    executor, af, z = _ex(), _Device("PFS"), _Device("Z")
+    handler = _StopsSeen(af, z)
+    z_stops_when_linked: list[int] = []
+
+    def switch_off() -> None:
+        executor.stop(af.motion)
+        z_stops_when_linked.append(z.stops)
+
+    LOGGER.addHandler(handler)
+    try:
+        with executor.linked_stop("Z", switch_off):
+            executor.stop(z.motion)
+            executor.stop(af.motion)  # a link is on one device only
+        executor.stop(z.motion)  # gone with its block
+    finally:
+        LOGGER.removeHandler(handler)
+    assert z_stops_when_linked == [0]
+    assert handler.seen == [
+        ("xy_stage PFS: stop", (1, 1)),
+        ("xy_stage Z: stop", (1, 1)),
+        ("xy_stage PFS: stop", (2, 1)),
+        ("xy_stage Z: stop", (2, 2)),
+    ]
+
+
+def test_a_failed_linked_stop_still_sends_the_devices_own_and_is_raised_after() -> None:
+    executor, z = _ex(), _Device("Z")
+    boom = RuntimeError("PFS: stuck on")
+
+    def fails() -> None:
+        raise boom
+
+    with executor.linked_stop("Z", fails), pytest.raises(RuntimeError) as raised:
+        executor.stop(z.motion)
+    assert raised.value is boom
+    assert z.stops == 1
+    # The device's own failure is the one raised when both fail.
+    z.stop_error = RuntimeError("Z: no answer")
+    with executor.linked_stop("Z", fails), pytest.raises(RuntimeError) as raised:
+        executor.stop(z.motion)
+    assert raised.value is z.stop_error
+    assert z.stops == 2
+
+
+def test_an_interrupt_in_a_linked_stop_waits_for_the_devices_own() -> None:
+    executor, z = _ex(), _Device("Z")
+
+    def ctrl_c() -> None:
+        raise KeyboardInterrupt  # raised from the stub, not sent as a signal
+
+    with executor.linked_stop("Z", ctrl_c), pytest.raises(KeyboardInterrupt):
+        executor.stop(z.motion)
+    assert z.stops == 1
+
+
+def test_a_linked_stop_is_removed_when_its_block_raises() -> None:
+    executor, z = _ex(), _Device("Z")
+    linked: list[str] = []
+
+    def a_block_that_raises() -> None:
+        with (
+            executor.linked_stop("Z", lambda: linked.append("off")),
+            executor.linked_stop("Z", lambda: linked.append("offset")),
+        ):
+            executor.stop(z.motion)
+            raise LookupError
+
+    with pytest.raises(LookupError):
+        a_block_that_raises()
+    executor.stop(z.motion)
+    assert linked == ["off", "offset"]
+    assert z.stops == 2
+
+
+def test_leaving_an_inner_link_keeps_the_outer_one() -> None:
+    executor, z = _ex(), _Device("Z")
+    called: list[str] = []
+    with executor.linked_stop("Z", lambda: called.append("outer")):
+        with executor.linked_stop("Z", lambda: called.append("inner")):
+            pass
+        executor.stop(z.motion)
+    assert called == ["outer"]
+
+
+def test_the_first_failing_link_is_the_one_raised() -> None:
+    executor, z = _ex(), _Device("Z")
+    first, second = RuntimeError("PFS: stuck on"), RuntimeError("PFSOffset: stuck")
+
+    def fails_first() -> None:
+        raise first
+
+    def fails_second() -> None:
+        raise second
+
+    with (
+        executor.linked_stop("Z", fails_first),
+        executor.linked_stop("Z", fails_second),
+        pytest.raises(RuntimeError) as raised,
+    ):
+        executor.stop(z.motion)
+    assert raised.value is first
+    assert z.stops == 1
+
+
+def test_a_stop_marks_every_link_reached_before_it_calls_the_first() -> None:
+    # Adversarial review of the fix round: marked in the section that takes
+    # the snapshot, so a block that ends while the stop is still calling its
+    # links knows that it was stopped.
+    executor, z = _ex(), _Device("Z")
+    entered, release = threading.Event(), threading.Event()
+
+    def slow() -> None:
+        entered.set()
+        release.wait(JOIN_S)
+
+    with (
+        executor.linked_stop("Z", slow),
+        executor.linked_stop("Z", lambda: None) as second,
+    ):
+        stopper = _Thread(lambda: executor.stop(z.motion))
+        assert entered.wait(JOIN_S)
+    reached = second.reached  # its link is removed, and not called yet
+    release.set()
+    stopper.join()
+    assert reached is True
+    assert (stopper.error, z.stops) == (None, 1)
+
+
+class _InterruptOnce:
+    """A lock whose next ``with`` raises ``KeyboardInterrupt``: a second Ctrl-C."""
+
+    def __init__(self, lock: threading.RLock) -> None:
+        self._lock = lock
+        self._armed = True
+
+    def __enter__(self) -> bool:
+        if self._armed:
+            self._armed = False
+            raise KeyboardInterrupt  # raised from the stub, not sent as a signal
+        return self._lock.__enter__()
+
+    def __exit__(self, *exc: object) -> None:
+        self._lock.__exit__(*exc)
+
+
+def test_a_link_whose_removal_an_interrupt_skipped_is_never_called() -> None:
+    # Adversarial review of the fix round (FM-65, FM-70): left registered, it
+    # would switch PFS off on every later Z stop, with no compound running.
+    executor, z = _ex(), _Device("Z")
+    called: list[str] = []
+    lock = executor._registry_lock
+
+    def block() -> None:
+        with executor.linked_stop("Z", lambda: called.append("stale")):
+            executor._registry_lock = _InterruptOnce(lock)  # type: ignore[assignment]
+
+    with pytest.raises(KeyboardInterrupt):
+        block()
+    executor._registry_lock = lock
+    assert "Z" in executor._links  # the removal was skipped
+    executor.stop(z.motion)
+    assert (called, z.stops) == ([], 1)
+    with executor.linked_stop("Z", lambda: None) as fresh:
+        assert executor._links == {"Z": (fresh,)}  # the registration dropped it
+    assert executor._links == {}
+
+
+def test_no_link_is_called_while_halted() -> None:
+    # The emergency stop sends every stop itself, in its own order (m2 §3.11).
+    executor, z = _ex(), _Device("Z")
+    called: list[str] = []
+    executor.halt()
+    with executor.linked_stop("Z", lambda: called.append("off")) as link:
+        executor.stop(z.motion)
+    assert (called, link.reached, z.stops) == ([], False, 1)
+
+
+# --- compound (m2 §3.7) ------------------------------------------------------
+
+
+def test_compound_runs_nested_actions_in_one_lock_section() -> None:
+    # The Z interlock: suspend, move, relock. No other thread's action may come
+    # between them, and one tried during the nested move is refused at once.
+    executor, z = _ex(), _Device("Z", arrive_after=1)
+    events: list[str] = []
+    outsiders: list[_Thread] = []
+    refused: list[BaseException | None] = []
+
+    def outsider_action() -> object:
+        return executor.do(
+            "outsider", _step("outsider", lambda: events.append("outsider"))
+        )
+
+    def during_the_move(polls: int) -> None:
+        if polls == 1:
+            during = _Thread(outsider_action)
+            during.join()
+            refused.append(during.error)
+
+    def move() -> None:
+        events.append("move")
+        z.command()
+
+    def run() -> str:
+        executor.do("af: suspend", _step("af: suspend", lambda: events.append("off")))
+        z.on_poll = during_the_move
+        executor.do(
+            "z: move_to 12.0 µm",
+            Step("z: move_to 12.0 µm", move, lambda: "arrived", "dry"),
+            motion=z.motion,
+            timeout_s=JOIN_S,
+        )
+        # Between two nested actions, another thread waits for the lock (a
+        # nested motion would refuse it at once, as above).
+        outsiders.append(_Thread(outsider_action))
+        assert not outsiders[0].finished_within(0.3), "it ran inside the compound"
+        executor.do("af: engage", _step("af: engage", lambda: events.append("on")))
+        return "landed"
+
+    assert executor.compound("z: move_to 12.0 µm", run) == "landed"
+    outsiders[0].join()
+    assert outsiders[0].error is None
+    assert events == ["off", "move", "on", "outsider"]
+    assert isinstance(refused[0], MotionInProgressError)
+    assert refused[0].moving == ("xy_stage Z",)
+    assert refused[0].detail == "`z: move_to 12.0 µm` is waiting for it"
+
+
+def test_compound_is_refused_while_halted() -> None:
+    executor = _ex()
+    executor.halt()
+    with pytest.raises(MicroscopeHaltedError):
+        executor.compound("z: move_to 12.0 µm", _never)
+    executor.resume()
+    assert executor.compound("z: move_to 12.0 µm", lambda: "ran") == "ran"
+
+
+def test_compound_is_refused_while_a_motion_outlived_its_action() -> None:
+    executor, xy = _ex(), _Device("XY")
+    _outlive(executor, xy)
+    with pytest.raises(MotionInProgressError) as info:
+        executor.compound("z: move_to 12.0 µm", _never)
+    assert info.value.moving == ("xy_stage XY",)
+    xy.busy = False
+    assert executor.compound("z: move_to 12.0 µm", lambda: "ran") == "ran"
+
+
+def test_compound_runs_in_dry_run_and_its_nested_actions_send_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    executor, z = _ex(dry_run=True), _Device("Z")
+
+    def run() -> object:
+        first = executor.do("af: suspend", _step("af: suspend", _never))
+        moved = executor.do(
+            "z: move_to 12.0 µm",
+            Step("z: move_to 12.0 µm", _never, lambda: "arrived", "dry"),
+            motion=z.motion,
+            timeout_s=JOIN_S,
+        )
+        return (first, moved)
+
+    with caplog.at_level(logging.INFO, logger=LOGGER.name):
+        assert executor.compound("z: move_to 12.0 µm", run) == ("dry", "dry")
+    assert caplog.messages == [
+        "[dry-run] af: suspend",
+        "[dry-run] z: move_to 12.0 µm",
+    ]
+    assert z.commands == 0
+
+
+def test_compound_nested_action_is_cancelled_by_a_stop_since_the_compound_was_called() -> (
+    None
+):
+    # The compound is the caller's action: a stop since it was called (here
+    # between two nested actions; in the facade test, while it waited for the
+    # lock) cancels the nested move, as it would a plain one (design §13).
+    executor, z = _ex(), _Device("Z", arrive_after=1)
+    sent: list[str] = []
+
+    def run() -> object:
+        executor.do("af: suspend", _step("af: suspend", lambda: sent.append("off")))
+        executor.stop(z.motion)
+        return _move(executor, z)
+
+    with pytest.raises(MotionStoppedError) as stopped:
+        executor.compound("z: move_to 12.0 µm", run)
+    assert stopped.value.detail == "it was stopped before it started"
+    assert (sent, z.commands) == (["off"], 0)
+    # Outside the compound, the next move records its own call and runs.
+    assert _move(executor, z) == "arrived"
+
+
+def test_compound_nested_action_is_refused_after_a_halt_and_resume_since_it_was_called() -> (
+    None
+):
+    executor, z = _ex(), _Device("Z")
+
+    def run() -> object:
+        executor.halt()
+        executor.resume()
+        return _move(executor, z)
+
+    with pytest.raises(MicroscopeHaltedError):
+        executor.compound("z: move_to 12.0 µm", run)
+    assert z.commands == 0
+
+
+def test_a_nested_compound_keeps_the_outer_compounds_record() -> None:
+    executor, z = _ex(), _Device("Z")
+
+    def inner() -> object:
+        return _move(executor, z)
+
+    def outer() -> object:
+        executor.stop(z.motion)  # after the outer call, before the inner one
+        return executor.compound("z: move_by 1.0 µm", inner)
+
+    with pytest.raises(MotionStoppedError):
+        executor.compound("autofocus: focus_by 1.0 µm", outer)
+    assert z.commands == 0
+
+
+def test_refuse_if_stopped_compares_with_the_compounds_call_and_is_inert_outside() -> (
+    None
+):
+    executor, z = _ex(), _Device("Z")
+    cancelled = MotionStoppedError("z Z", "it was stopped before it started")
+    executor.stop(z.motion)
+    executor.refuse_if_stopped("Z", cancelled)  # outside a compound: nothing
+
+    def run() -> str:
+        executor.refuse_if_stopped("Z", cancelled)  # no stop since the call
+        executor.stop(z.motion)
+        executor.refuse_if_stopped("XY", cancelled)  # another device
+        executor.refuse_if_stopped("Z", cancelled)
+        return "not reached"
+
+    with pytest.raises(MotionStoppedError) as raised:
+        executor.compound("z: move_to 12.0 µm", run)
+    assert raised.value is cancelled

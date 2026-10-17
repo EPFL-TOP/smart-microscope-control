@@ -25,6 +25,17 @@ pymmcore 12.5.0.75.0), unless labelled *assumed*:
 * **The Nikon quirk** (FM-12): with ``quirk_z_move_disables_autofocus``, a
   ``setPosition`` on the focus device switches continuous focus off, as
   moving the Z drive does with PFS on the Nikon stands. The demo keeps it on.
+* **Continuous focus acts on the AutoFocus slot** (FM-87; measured on the
+  demo 2026-10-16). ``enableContinuousFocus``, ``isContinuousFocus*`` and
+  ``get``/``setAutoFocusOffset`` take no label: they act on the device the
+  slot names, each such device keeping its own state and one offset
+  (``0.0`` at construction; a set moves nothing). With the slot empty,
+  ``enableContinuousFocus(True)`` raises ``Auto-focus focus device not
+  defined.``, ``enableContinuousFocus(False)`` does nothing, both
+  ``isContinuousFocus*`` read ``False``, and both offset calls raise
+  ``Error (code 43)``. Enabled reads locked at once, as on the demo
+  (assumed: a real lock takes time), unless ``autofocus_lockable`` is
+  ``False``.
 """
 
 from __future__ import annotations
@@ -51,6 +62,10 @@ _SLOTS: dict[str, tuple[str, DeviceType]] = {
 
 #: What MMCore says when the current camera slot is empty (measured).
 _NO_CAMERA = "Camera not loaded or initialized."
+#: What MMCore says to ``enableContinuousFocus(True)`` with the AutoFocus slot
+#: empty, and to either offset call (measured on the demo, 2026-10-16).
+_NO_AUTOFOCUS = "Auto-focus focus device not defined."
+_NO_AUTOFOCUS_OFFSET = "Error (code 43)"
 
 
 @dataclass(slots=True)
@@ -101,10 +116,13 @@ class FakeCore:
     * ``busy_devices``: labels that read busy until removed.
     * ``failing``: label -> exception raised by every call whose first
       argument is that label; for the camera slot's device, by the
-      current-camera calls too.
+      current-camera calls too, and for the AutoFocus slot's device, by the
+      continuous-focus and autofocus-offset calls.
     * ``pixel_size_um``, ``image_shape`` (height, width), ``bit_depth``: what
       the camera calls report.
     * ``quirk_z_move_disables_autofocus``: the Nikon quirk (FM-12).
+    * ``autofocus_lockable``: ``False`` and the autofocus never reads
+      locked, even enabled, as with no reference in range.
     """
 
     def __init__(
@@ -132,6 +150,7 @@ class FakeCore:
         self.image_shape: tuple[int, int] = (512, 512)
         self.bit_depth = 16
         self.quirk_z_move_disables_autofocus = True
+        self.autofocus_lockable = True
 
         self._devices: dict[str, FakeDevice] = {}
         for device in devices:
@@ -156,7 +175,12 @@ class FakeCore:
             if d.type == DeviceType.Shutter
         }
         self._auto_shutter = True
-        self._continuous_focus = False
+        autofocus_devices = [
+            d.label for d in self._devices.values() if d.type == DeviceType.AutoFocus
+        ]
+        #: Per AutoFocus device: whether continuous focus is on, and its offset.
+        self._continuous: dict[str, bool] = dict.fromkeys(autofocus_devices, False)
+        self._af_offset: dict[str, float] = dict.fromkeys(autofocus_devices, 0.0)
         self._timeout_ms = 5000
         self._image: np.ndarray | None = None
         self._slots: dict[str, str] = {}
@@ -451,8 +475,13 @@ class FakeCore:
         self._record("setPosition", label, z_um)
         self._typed(label, DeviceType.Stage)
         self._z[label] = float(z_um)
-        if self.quirk_z_move_disables_autofocus and label == self._slots["focus"]:
-            self._continuous_focus = False
+        autofocus = self._slots["autofocus"]
+        if (
+            self.quirk_z_move_disables_autofocus
+            and label == self._slots["focus"]
+            and autofocus
+        ):
+            self._continuous[autofocus] = False
 
     def deviceBusy(self, label: str) -> bool:
         """Busy only while the label is in ``busy_devices``: motion is instant."""
@@ -634,16 +663,49 @@ class FakeCore:
 
     # --- continuous focus ----------------------------------------------------
 
+    def _autofocus(self) -> str:
+        """The AutoFocus slot's device, after raising its ``failing`` entry; ``""`` if empty."""
+        label = self._slots["autofocus"]
+        if label:
+            self._device(label)
+        return label
+
     def enableContinuousFocus(self, enable: bool) -> None:
+        """Switch the slot's autofocus; with the slot empty, only switching on raises (measured)."""
         self._record("enableContinuousFocus", enable)
-        self._continuous_focus = bool(enable)
+        label = self._autofocus()
+        if not label:
+            if enable:
+                raise RuntimeError(_NO_AUTOFOCUS)
+            return
+        self._continuous[label] = bool(enable)
 
     def isContinuousFocusEnabled(self) -> bool:
-        return self._continuous_focus
+        """The slot's device; ``False`` with the slot empty (measured)."""
+        label = self._autofocus()
+        return bool(label) and self._continuous[label]
 
     def isContinuousFocusLocked(self) -> bool:
-        """Locked whenever enabled (as on the demo; a real lock takes time, assumed instant)."""
-        return self._continuous_focus
+        """Locked whenever enabled, unless ``autofocus_lockable`` is ``False``.
+
+        As on the demo, a lock comes at once; a real one takes time (assumed).
+        """
+        return self.isContinuousFocusEnabled() and self.autofocus_lockable
+
+    def getAutoFocusOffset(self) -> float:
+        """The slot's device's offset; with the slot empty, MMCore's error (measured)."""
+        label = self._autofocus()
+        if not label:
+            raise RuntimeError(_NO_AUTOFOCUS_OFFSET)
+        return self._af_offset[label]
+
+    def setAutoFocusOffset(self, offset: float) -> None:
+        """Store the slot's device's offset; it moves nothing, as on the demo (measured)."""
+        self._record("setAutoFocusOffset", offset)
+        label = self._autofocus()
+        if not label:
+            raise RuntimeError(_NO_AUTOFOCUS_OFFSET)
+        self._af_offset[label] = float(offset)
 
     # --- unloading -----------------------------------------------------------
 
@@ -664,6 +726,8 @@ class FakeCore:
         self._xy.pop(label, None)
         self._z.pop(label, None)
         self._open.pop(label, None)
+        self._continuous.pop(label, None)
+        self._af_offset.pop(label, None)
         for slot, named in self._slots.items():
             if named == label:
                 self._slots[slot] = ""

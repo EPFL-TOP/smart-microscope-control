@@ -25,14 +25,16 @@ can type against it without the device adapters installed.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     import numpy as np
 
 __all__ = [
     "XY",
+    "Autofocus",
     "Camera",
+    "FocusStep",
     "Limits",
     "Properties",
     "PropertyInfo",
@@ -56,6 +58,22 @@ class Limits:
 
     low_um: float
     high_um: float
+
+
+@dataclass(frozen=True, slots=True)
+class FocusStep:
+    """What ``Autofocus.focus_by_um`` moved, and where focus ended (m2 §3.5).
+
+    ``via`` says which device took the change: the focus drive (``"z"``)
+    with the autofocus off, or the autofocus offset (``"offset"``) while it
+    holds focus, since a Z move would be undone by the relock.
+    """
+
+    via: Literal["z", "offset"]
+    #: The focus drive's position afterwards; ``None``: the stand has no focus drive.
+    z_um: float | None
+    #: The offset afterwards, in its own units, when ``via == "offset"``; else ``None``.
+    offset_native: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,17 +174,27 @@ class ZStage(Protocol):
 
     The jog limit is the profile's ``max_z_jog_um``, separate from the XY
     ``max_jog_um``: a mistyped focus jog drives the objective into the sample.
+
+    On a stand with an autofocus, both moves suspend it and, with
+    ``keep_autofocus`` (the default), engage it again once the move has
+    completed: moving Z switches PFS off on the Nikon stands (FM-12, m2
+    §3.4). A move that completes but finds no lock again raises
+    ``AutofocusLostError``; a move that fails, is stopped or is interrupted
+    leaves the autofocus off, because engaging it would move Z after the
+    operator's stop (FM-88). With ``keep_autofocus=False`` it stays off.
     """
 
     def position_um(self) -> float:
         """Where the drive reports it is."""
         ...
 
-    def move_to_um(self, z_um: float) -> float:
+    def move_to_um(self, z_um: float, *, keep_autofocus: bool = True) -> float:
         """Move to an absolute position; return the readback once it has arrived."""
         ...
 
-    def move_by_um(self, dz_um: float, *, force: bool = False) -> float:
+    def move_by_um(
+        self, dz_um: float, *, force: bool = False, keep_autofocus: bool = True
+    ) -> float:
         """Move relative to the current position; return the readback once it has arrived.
 
         Refuses ``|dz_um| > max_z_jog_um`` with ``SafetyRefusedError`` unless
@@ -243,6 +271,85 @@ class Shutter(Protocol):
 
     def set_auto_shutter(self, on: bool) -> bool:
         """Switch auto-shutter; return the readback."""
+        ...
+
+
+@runtime_checkable
+class Autofocus(Protocol):
+    """A continuous (hardware) autofocus: Nikon PFS, Zeiss Definite Focus (m2 §3).
+
+    Engaged, it holds the focal plane by driving the focus drive itself, at
+    an *offset* in the device's own units, which no profile can convert to
+    µm without a measurement. So every value in those units ends in
+    ``_native``, and ``focus_by_um`` takes µm and converts only through a
+    factor the profile states as measured (``[autofocus] offset_per_um``).
+
+    ``engage`` returns ``False`` when no lock came, and the autofocus is then
+    off: one left searching can move Z with no action holding the
+    microscope, which the layer forbids (design §13). ``disengage`` is a
+    safe call, like closing a shutter: it is never refused.
+    """
+
+    def is_engaged(self) -> bool:
+        """Whether continuous focus is switched on."""
+        ...
+
+    def is_locked(self) -> bool:
+        """Whether it is holding focus now."""
+        ...
+
+    def is_in_range(self) -> bool | None:
+        """Whether its reference is in range; ``None``: the stand does not say.
+
+        Read from the property the profile names (``[autofocus]
+        in_range_property``); the layer never guesses which one it is.
+        """
+        ...
+
+    def engage(self, timeout_s: float | None = None) -> bool:
+        """Switch it on and wait for the lock; ``False``: no lock, and it is off.
+
+        ``timeout_s`` defaults to the profile's ``lock_timeout_s``, else 5 s
+        (assumed); it must be finite and in (0, 600] s.
+        """
+        ...
+
+    def disengage(self) -> None:
+        """Switch it off now; never refused, runs while halted and in dry-run."""
+        ...
+
+    def offset_native(self) -> float:
+        """The offset, in the device's own units."""
+        ...
+
+    def set_offset_native(self, value: float) -> float:
+        """Move the offset to ``value``; return the readback (soft limits apply)."""
+        ...
+
+    def offset_by_native(self, delta: float, *, force: bool = False) -> float:
+        """Move the offset by ``delta``; jog-guarded unless ``force``.
+
+        With no ``[safety] max_autofocus_offset_jog`` in the profile, every
+        non-zero change needs ``force``: the unit is the stand's own, so no
+        default can be assumed.
+        """
+        ...
+
+    def offset_unit(self) -> str:
+        """What the offset's numbers are, from the profile; ``""``: unknown."""
+        ...
+
+    def offset_limits_native(self) -> tuple[float, float] | None:
+        """The offset's soft limits; ``None`` means unknown, not unlimited."""
+        ...
+
+    def focus_by_um(self, dz_um: float, *, force: bool = False) -> FocusStep:
+        """Change focus by ``dz_um`` µm through whatever holds focus now.
+
+        Off: a Z move. Locked: an offset change of ``dz_um`` times the
+        profile's measured factor for the current objective, then a relock.
+        On but not locked, or locked with no factor: refused, not forceable.
+        """
         ...
 
 

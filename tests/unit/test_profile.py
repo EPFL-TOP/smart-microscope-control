@@ -686,3 +686,205 @@ def test_a_directory_named_like_a_profile_is_listed_and_is_a_profile_error(
     ]
     with pytest.raises(ProfileError, match="cannot read profile"):
         Profile.load(directory)
+
+
+# -- autofocus (m2 §3.9) ------------------------------------------------------
+
+
+def _load_error(tmp_path: Path, body: str) -> str:
+    path = write_profile(tmp_path / "p.toml", body)
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    msg = str(info.value)
+    assert str(path) in msg
+    return msg
+
+
+def test_autofocus_section_defaults_to_unknown_everywhere(tmp_path: Path) -> None:
+    profile = Profile.load(write_profile(tmp_path / "p.toml", ""))
+    af = profile.autofocus
+    assert (af.offset_unit, af.lock_timeout_s) == ("", None)
+    assert (af.offset_per_um, af.in_range_property, af.in_range_values) == ({}, "", [])
+    assert profile.safety.max_autofocus_offset_jog is None
+    assert profile.safety.autofocus_offset_soft_limits is None
+    # The demo measures nothing either: Profile.demo() sets none of them.
+    assert Profile.demo().autofocus == af
+
+
+@pytest.mark.parametrize("value", ["0", "-1.0", "nan", "inf", "600.5"])
+def test_lock_timeout_must_be_positive_finite_and_at_most_600_s(
+    tmp_path: Path, value: str
+) -> None:
+    msg = _load_error(tmp_path, f"[autofocus]\nlock_timeout_s = {value}\n")
+    assert "autofocus.lock_timeout_s" in msg
+    shown = str(float(value))
+    assert (
+        f"lock_timeout_s must be a finite number of seconds in (0, 600], got {shown}"
+        in msg
+    )
+
+
+def test_lock_timeout_of_600_s_is_accepted(tmp_path: Path) -> None:
+    path = write_profile(tmp_path / "p.toml", "[autofocus]\nlock_timeout_s = 600\n")
+    assert Profile.load(path).autofocus.lock_timeout_s == 600.0
+
+
+@pytest.mark.parametrize("value", ["0.0", "nan", "-inf"])
+def test_offset_per_um_refuses_zero_and_non_finite_naming_the_objective(
+    tmp_path: Path, value: str
+) -> None:
+    msg = _load_error(
+        tmp_path,
+        "[autofocus]\noffset_per_um = "
+        f'{{ "Nikon 10X S Fluor" = -2.5, "Nikon 40X Plan Fluor ELWD" = {value} }}\n',
+    )
+    assert "autofocus.offset_per_um" in msg
+    assert (
+        "offset_per_um for objective 'Nikon 40X Plan Fluor ELWD' must be a finite, "
+        "non-zero number (the offset change per µm of focus, measured with the "
+        f"autofocus locked), got {value}"
+    ) in msg
+    assert "'Nikon 10X S Fluor'" not in msg
+
+
+def test_offset_per_um_keeps_the_sign(tmp_path: Path) -> None:
+    path = write_profile(
+        tmp_path / "p.toml",
+        '[autofocus]\noffset_per_um = { "4x" = -3.0, "40x" = 12 }\n',
+    )
+    assert Profile.load(path).autofocus.offset_per_um == {"4x": -3.0, "40x": 12.0}
+
+
+@pytest.mark.parametrize(
+    ("body", "phrase"),
+    [
+        (
+            '[autofocus]\nin_range_property = "PFS in Range"\n',
+            "in_range_property and in_range_values go together: set both",
+        ),
+        (
+            '[autofocus]\nin_range_values = ["Within Range"]\n',
+            "in_range_property and in_range_values go together: set both",
+        ),
+        (
+            '[autofocus]\nin_range_property = "   "\n'
+            'in_range_values = ["Within Range"]\n',
+            "in_range_property must name a property of the autofocus device, or "
+            "be empty; got '   '",
+        ),
+        (
+            '[autofocus]\nin_range_property = "PFS in Range"\n'
+            'in_range_values = ["Within Range", ""]\n',
+            'in_range_values must not contain an empty value; remove the "" entry',
+        ),
+    ],
+)
+def test_in_range_property_and_values_come_together(
+    tmp_path: Path, body: str, phrase: str
+) -> None:
+    msg = _load_error(tmp_path, body)
+    assert f"  - autofocus: {phrase}" in msg
+
+
+def test_in_range_property_and_values_load_together(tmp_path: Path) -> None:
+    path = write_profile(
+        tmp_path / "p.toml",
+        '[autofocus]\nin_range_property = "PFS in Range"\n'
+        'in_range_values = ["Within Range"]\noffset_unit = "PFS offset steps"\n',
+    )
+    af = Profile.load(path).autofocus
+    assert (af.in_range_property, af.in_range_values) == (
+        "PFS in Range",
+        ["Within Range"],
+    )
+    assert af.offset_unit == "PFS offset steps"
+
+
+@pytest.mark.parametrize("value", ["0.0", "-1.0", "nan", "inf"])
+def test_max_autofocus_offset_jog_must_be_positive_and_finite(
+    tmp_path: Path, value: str
+) -> None:
+    msg = _load_error(tmp_path, f"[safety]\nmax_autofocus_offset_jog = {value}\n")
+    assert "safety.max_autofocus_offset_jog" in msg
+    assert (
+        "max_autofocus_offset_jog must be a positive, finite number in [autofocus] "
+        f"offset_unit, got {value}"
+    ) in msg
+
+
+@pytest.mark.parametrize(
+    ("limits", "phrase"),
+    [
+        ("[15000.0, 0.0]", "must be [low, high] with low < high"),
+        ("[5.0, 5.0]", "must be [low, high] with low < high"),
+        ("[0.0, inf]", "must be finite numbers"),
+        ("[nan, 1.0]", "must be finite numbers"),
+    ],
+)
+def test_autofocus_offset_soft_limits_must_be_ordered(
+    tmp_path: Path, limits: str, phrase: str
+) -> None:
+    msg = _load_error(tmp_path, f"[safety]\nautofocus_offset_soft_limits = {limits}\n")
+    assert "safety.autofocus_offset_soft_limits" in msg
+    assert f"autofocus offset limits {phrase}" in msg
+
+
+def test_autofocus_offset_soft_limits_load(tmp_path: Path) -> None:
+    path = write_profile(
+        tmp_path / "p.toml", "[safety]\nautofocus_offset_soft_limits = [0.0, 15000.0]\n"
+    )
+    assert Profile.load(path).safety.autofocus_offset_soft_limits == (0.0, 15000.0)
+
+
+@pytest.mark.parametrize(
+    ("body", "key", "name"),
+    [
+        (
+            "[autofocus]\nlock_timeout_s = true\n",
+            "autofocus.lock_timeout_s",
+            "lock_timeout_s",
+        ),
+        (
+            '[autofocus]\noffset_per_um = { "4x" = true }\n',
+            "autofocus.offset_per_um",
+            "offset_per_um for objective '4x'",
+        ),
+        (
+            "[safety]\nmax_autofocus_offset_jog = true\n",
+            "safety.max_autofocus_offset_jog",
+            "max_autofocus_offset_jog",
+        ),
+        (
+            "[safety]\nautofocus_offset_soft_limits = [0.0, true]\n",
+            "safety.autofocus_offset_soft_limits",
+            "each bound of autofocus_offset_soft_limits",
+        ),
+    ],
+)
+def test_new_numeric_keys_refuse_a_toml_boolean_and_accept_an_integer(
+    tmp_path: Path, body: str, key: str, name: str
+) -> None:
+    # pydantic's lax mode would read `true` as 1.0 (#106).
+    msg = _load_error(tmp_path, body)
+    assert key in msg
+    assert f"{name} must be a number, not a boolean (got true)" in msg
+    integers = write_profile(
+        tmp_path / "ints.toml",
+        "[safety]\nmax_autofocus_offset_jog = 50\n"
+        "autofocus_offset_soft_limits = [0, 15000]\n"
+        '[autofocus]\nlock_timeout_s = 5\noffset_per_um = { "4x" = -3 }\n',
+    )
+    profile = Profile.load(integers)
+    assert profile.safety.max_autofocus_offset_jog == 50.0
+    assert profile.safety.autofocus_offset_soft_limits == (0.0, 15000.0)
+    assert profile.autofocus.lock_timeout_s == 5.0
+    assert profile.autofocus.offset_per_um == {"4x": -3.0}
+
+
+def test_unknown_autofocus_key_is_refused(tmp_path: Path) -> None:
+    msg = _load_error(tmp_path, "[autofocus]\nlock_timeout = 5.0\n")
+    assert "autofocus.lock_timeout: unknown key in [autofocus]" in msg
+    assert (
+        "allowed keys: offset_unit, lock_timeout_s, offset_per_um, "
+        "in_range_property, in_range_values"
+    ) in msg

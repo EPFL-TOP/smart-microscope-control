@@ -19,6 +19,10 @@ them (CLAUDE.md, architecture rules):
 * **Non-finite targets** (``nan``, ``inf``) are refused whatever the limits:
   ``nan`` compares false against every bound and would otherwise slip
   through each check and reach the stage driver.
+* **The autofocus offset** (m2 §3.8) has the same guards in its own units,
+  with one difference: with no ``max_autofocus_offset_jog`` in the profile,
+  every non-zero relative change needs ``force=True``. A Z jog limit can be
+  assumed in µm; nobody can assume one for a unit the stand defines.
 
 ``Executor`` runs every action (a mutation, an acquisition) under the
 microscope's one re-entrant lock and implements dry-run. In dry-run,
@@ -43,7 +47,8 @@ import logging
 import math
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from typing import Generic, TypeVar
 
@@ -65,6 +70,7 @@ __all__ = [
     "SafeCall",
     "Safety",
     "Step",
+    "StopLink",
 ]
 
 T = TypeVar("T")
@@ -97,6 +103,9 @@ class Safety:
         xy_soft_limits_um: tuple[tuple[float, float], tuple[float, float]]
         | None = None,
         max_z_jog_um: float | None = None,
+        max_autofocus_offset_jog: float | None = None,
+        autofocus_offset_soft_limits: tuple[float, float] | None = None,
+        offset_unit: str = "",
     ) -> None:
         if not math.isfinite(max_jog_um) or max_jog_um < 0:
             raise ValueError(f"max_jog_um must be finite and >= 0, got {max_jog_um!r}")
@@ -125,6 +134,28 @@ class Safety:
                 _check_range("xy_soft_limits_um[y]", xy_soft_limits_um[1]),
             )
         )
+        if max_autofocus_offset_jog is not None and (
+            not math.isfinite(max_autofocus_offset_jog) or max_autofocus_offset_jog < 0
+        ):
+            raise ValueError(
+                f"max_autofocus_offset_jog must be finite and >= 0, got "
+                f"{max_autofocus_offset_jog!r}"
+            )
+        #: ``None``: no limit is known, so every non-zero offset jog needs force.
+        self.max_autofocus_offset_jog = (
+            None
+            if max_autofocus_offset_jog is None
+            else float(max_autofocus_offset_jog)
+        )
+        self.autofocus_offset_soft_limits = (
+            None
+            if autofocus_offset_soft_limits is None
+            else _check_range(
+                "autofocus_offset_soft_limits", autofocus_offset_soft_limits
+            )
+        )
+        #: For messages: the profile's unit, or "device units" when unknown.
+        self._offset_unit = offset_unit.strip() or "device units"
 
     def check_jog_um(self, dx_um: float, dy_um: float, *, force: bool) -> None:
         """Refuse a relative XY move above ``max_jog_um`` unless forced.
@@ -208,6 +239,66 @@ class Safety:
                 f"change [safety] in the profile if the limits are wrong"
             )
 
+    def check_offset_jog_native(self, delta: float, *, force: bool) -> None:
+        """Refuse a relative autofocus-offset change above the profile's limit unless forced.
+
+        With no ``max_autofocus_offset_jog``, every non-zero change needs
+        ``force``: a jog of 50 is nothing in one stand's offset units and a
+        crash in another's, so no default is assumed (m2 §3.2). As for Z, the
+        check depends only on the distance and runs before the action.
+
+        Raises:
+            SafetyRefusedError: The jog is too large or no limit is set
+                (forceable), or not finite (never forceable).
+        """
+        unit = self._offset_unit
+        if not math.isfinite(delta):
+            raise SafetyRefusedError(
+                f"autofocus offset jog {delta} {unit} is not a finite distance"
+            )
+        if force:
+            return
+        limit = self.max_autofocus_offset_jog
+        if limit is None:
+            if delta != 0:
+                raise SafetyRefusedError(
+                    f"autofocus offset jog {delta} {unit}: the profile sets no "
+                    f"[safety] max_autofocus_offset_jog, so every relative offset "
+                    f"change needs force=True",
+                    how_to_force=(
+                        "pass force=True, or set [safety] max_autofocus_offset_jog "
+                        "in the profile"
+                    ),
+                )
+            return
+        if abs(delta) > limit:
+            raise SafetyRefusedError(
+                f"autofocus offset jog {delta} {unit} exceeds the offset jog limit "
+                f"of {limit} {unit}",
+                how_to_force="pass force=True",
+            )
+
+    def check_offset_target_native(self, value: float) -> None:
+        """Refuse an autofocus-offset target outside the soft limits; never forceable.
+
+        Raises:
+            SafetyRefusedError: The target is outside the limits or not finite.
+        """
+        unit = self._offset_unit
+        if not math.isfinite(value):
+            raise SafetyRefusedError(
+                f"autofocus offset target {value} {unit} is not a finite position"
+            )
+        if self.autofocus_offset_soft_limits is None:
+            return
+        low, high = self.autofocus_offset_soft_limits
+        if not low <= value <= high:
+            raise SafetyRefusedError(
+                f"autofocus offset target {value} {unit} is outside the soft limits "
+                f"[{low}, {high}] {unit}; change [safety] "
+                f"autofocus_offset_soft_limits in the profile if the limits are wrong"
+            )
+
 
 #: How often a wait asks the device whether it is still busy.
 POLL_INTERVAL_S = 0.01
@@ -263,6 +354,23 @@ class SafeCall:
 
 
 @dataclass(eq=False)
+class StopLink:
+    """A ``linked_stop`` in place: what a stop of its device also calls, first.
+
+    ``reached`` is set in the registry section where a stop takes its
+    snapshot, before it calls ``stop``: a block that reads it once its link
+    is removed knows whether a stop has called it or is about to (the
+    review of #140). ``live`` is cleared as the first statement of the
+    block's ``finally``, with no lock: a removal that a second Ctrl-C skips
+    leaves a link that no stop calls, and the next registration drops it.
+    """
+
+    stop: Callable[[], None]
+    reached: bool = False
+    live: bool = True
+
+
+@dataclass(eq=False)
 class _Registration:
     """A motion that outlived its action: its action gave up while it still moved.
 
@@ -290,6 +398,18 @@ class _Holder:
     #: The lock was taken outside the ``Executor`` before this action, so it
     #: has been held for longer than ``since`` says.
     external: bool = False
+    #: Inside a ``compound``: what the outermost one recorded when it was
+    #: called. Its nested actions are cancelled by a stop, a safe call or a
+    #: halt since then, not only since their own call (m2 §3.7).
+    called: _Called | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _Called:
+    """The stop generations and the halt mark a ``compound`` recorded when it was called."""
+
+    generations: Mapping[str, int]
+    halt_mark: int | None
 
 
 class _HeldLines(threading.local):
@@ -360,6 +480,10 @@ class Executor:
         #: has had. Only ``stop()`` and ``safe()`` advance it, so a give-up
         #: never cancels another caller's action.
         self._generations: dict[str, int] = {}
+        #: Per device: what a stop of it also calls, first (``linked_stop``).
+        #: A tuple, replaced whole, so that a stop that re-enters reads the
+        #: old one or the new one, never one being built (FM-70).
+        self._links: dict[str, tuple[StopLink, ...]] = {}
         self._halted = False
         #: How many halts there have been. An action records it when it is
         #: called, as it records the stop generation, so a halt that lands
@@ -586,9 +710,17 @@ class Executor:
         else:
             key, cancelled = None, HardwareError(description)  # never raised
         # Recorded before waiting for the lock: a stop (or a close) or a halt
-        # pressed while this call waits for it cancels the call.
-        generation = self._generation(key)
-        halt_mark = self._halt_mark()
+        # pressed while this call waits for it cancels the call. Nested in a
+        # compound, the compound's call is this action's: a stop pressed while
+        # the compound waited for the lock, or ran an earlier nested action,
+        # cancels this one too (m2 §3.7).
+        called = self._compound_called()
+        if called is None:
+            generation = self._generation(key)
+            halt_mark = self._halt_mark()
+        else:
+            generation = 0 if key is None else called.generations.get(key, 0)
+            halt_mark = called.halt_mark
 
         def body() -> T:
             self._refuse_if_halted(halt_mark)
@@ -761,13 +893,174 @@ class Executor:
                 that runs inside its command).
             MicroscopeBusyError: The lock was not free within ``lock_timeout_s``.
         """
-        halt_mark = self._halt_mark()
+        return self._exclusive(description, action, self._halt_mark())
+
+    def compound(self, description: str, run: Callable[[], T]) -> T:
+        """Run several nested actions as one lock section (m2 §3.7).
+
+        A Z move under an autofocus suspends it, moves and engages it again:
+        three actions that no other thread may come between, since another
+        caller's move after the suspend would run with PFS off and one before
+        the relock would be undone by it. Under the lock, the halt check and
+        the guard run once, as for ``acquire``, then ``run()``. Each nested
+        ``do`` re-enters the lock and runs its own halt check, guard, dry-run
+        handling and motion wait (design §13, "Re-entry"), so ``compound``
+        itself sends nothing and runs in dry-run too. While a nested motion
+        is waited for, other callers are refused at once, naming it.
+
+        The stop generations and the halt mark are recorded here, when the
+        compound is called, before it waits for the lock, and its nested
+        actions compare against them: a ``ZStage.stop()`` pressed while the
+        Z move waits for the lock cancels the move, as it does without an
+        autofocus (design §13), and a ``disengage()`` during the move cancels
+        the relock, as a close cancels an open. A compound nested in another
+        keeps the outer one's record.
+
+        Nest only between actions: a nested action inside a motion's command
+        is still refused (``_nested``).
+
+        Raises:
+            MicroscopeHaltedError: The microscope is halted, or was halted
+                since this call, even if ``resume()`` came since.
+            MotionInProgressError: A device is still moving, or the lock holder
+                is waiting for one.
+            MicroscopeBusyError: The lock was not free within ``lock_timeout_s``.
+        """
+        with self._registry_lock:
+            # One C call each: a stop that re-enters cannot break the copy (FM-70).
+            called = _Called(
+                dict(self._generations),
+                None if self._halted else self._halt_epoch,
+            )
+
+        def run_inside() -> T:
+            previous = self._enter_compound(called)
+            try:
+                return run()
+            finally:
+                self._leave_compound(previous)
+
+        return self._exclusive(description, run_inside, called.halt_mark)
+
+    def refuse_if_stopped(self, device: str, cancelled: HardwareError) -> None:
+        """Inside a compound: refuse what comes next if ``device`` was stopped since it was called.
+
+        For a backend that must decide before its first nested command: the
+        Z interlock checks the drive before it suspends the autofocus, so a Z
+        stop pressed while the move waited for the lock touches nothing. A
+        halt since the call comes first (FM-64), as in every action. Outside
+        a compound it does nothing: a plain action records its own call.
+
+        Raises:
+            MicroscopeHaltedError: Halted since the compound was called.
+            HardwareError: ``cancelled``, when ``device``'s stop generation (a
+                stop, or its safe call) moved since the compound was called.
+        """
+        called = self._compound_called()
+        if called is None:
+            return
+        self._refuse_if_cancelled(
+            device, called.generations.get(device, 0), called.halt_mark, cancelled
+        )
+
+    def give_up(self, motion: Motion, why: str) -> str:
+        """Stop ``motion`` and keep it registered while it still moves; what happened.
+
+        For a readback that finds the device moving again after its wait
+        ended idle (an autofocus that lost its lock at once): the same
+        give-up as at a deadline (FM-17), stop first, registered while it
+        reads busy, then logged. It never raises on its own account.
+        """
+        return self._give_up(motion, why)
+
+    @contextmanager
+    def linked_stop(self, device: str, stop: Callable[[], None]) -> Iterator[StopLink]:
+        """While the block runs, a ``stop()`` of ``device`` also calls ``stop``, first.
+
+        For a compound that moves an axis through another device: an
+        autofocus that engages again after a Z move, or follows its offset,
+        drives Z, so the operator's Z stop must reach it (FM-88, FM-91, m2
+        §3.4). ``stop`` runs on the stopping thread, without the microscope
+        lock, before the device's own stop and inside one ``hold_log``, so
+        every call is sent before any line (FM-62). One that raises does not
+        keep the device's own stop from being sent; ``stop()`` raises it
+        after. While halted, no link is called: the emergency stop sends
+        every stop itself, in its own order (m2 §3.11).
+
+        A stop of ``device`` that came before the block (while the compound
+        waited for the lock, or during an earlier step) finds no link. The
+        caller checks for it with ``refuse_if_stopped`` as the block's first
+        statement: the link is in place by then, so no stop falls between
+        the two. The yielded ``StopLink`` says, once the block is over,
+        whether a stop reached it.
+
+        The registration is inside the ``try``, so an interrupt before the
+        block cannot leave the link behind. One in the ``finally`` can skip
+        the removal, but not the clearing of ``live`` before it (as for
+        ``hold_log``, FM-65): such a link is never called, and the next
+        registration drops it.
+        """
+        link = StopLink(stop)
+        try:
+            with self._registry_lock:
+                # One store of a new tuple (FM-70): see ``_links``.
+                kept = tuple(s for s in self._links.get(device, ()) if s.live)
+                self._links[device] = (*kept, link)
+            yield link
+        finally:
+            link.live = False
+            with self._registry_lock:
+                left = tuple(
+                    s for s in self._links.get(device, ()) if s.live and s is not link
+                )
+                if left:
+                    self._links[device] = left
+                else:
+                    self._links.pop(device, None)
+
+    def _compound_called(self) -> _Called | None:
+        """What the compound this thread is inside recorded at its call; ``None`` outside one."""
+        if not _lock_is_owned(self._lock):
+            return None
+        with self._registry_lock:
+            holder = self._holder
+            if holder is None or holder.thread != threading.get_ident():
+                return None
+            return holder.called
+
+    def _enter_compound(self, called: _Called) -> _Called | None:
+        """Make ``called`` this thread's compound record, unless an outer one has one."""
+        with self._registry_lock:
+            holder = self._holder
+            if holder is None or holder.thread != threading.get_ident():
+                return None
+            previous = holder.called
+            if previous is None:
+                holder.called = called
+            return previous
+
+    def _leave_compound(self, previous: _Called | None) -> None:
+        with self._registry_lock:
+            holder = self._holder
+            if holder is not None and holder.thread == threading.get_ident():
+                holder.called = previous
+
+    def _exclusive(
+        self, description: str, run: Callable[[], T], halt_mark: int | None
+    ) -> T:
+        """``run()`` as one lock section, after the halt check and the guard; nothing skipped.
+
+        The body of ``acquire`` (a frame, which dry-run does not skip) and of
+        ``compound`` (whose nested actions handle dry-run themselves).
+        ``halt_mark`` is what the caller recorded of the halt when it was
+        called.
+        """
 
         def body() -> T:
             self._refuse_if_halted(halt_mark)
             self._guard()
             self._refuse_if_halted(halt_mark)
-            return action()
+            return run()
 
         return self._section(description, body, halt_mark)
 
@@ -835,12 +1128,14 @@ class Executor:
         too: a stop cannot create motion. A motion that outlived its action
         is dropped once the stop is sent, unless the device still reads busy
         (it is moving); after a failed stop it stays, for the guard or for
-        ``resume()``.
+        ``resume()``. What ``linked_stop`` links to the device is called
+        first, then the device's own stop, then every line is written; while
+        halted, nothing linked is called.
 
         Raises:
             HardwareError: The device cannot be stopped from smc.
-            Exception: Whatever the device's stop raised; a failed stop is a
-                finding.
+            Exception: Whatever the device's stop raised, else whatever a
+                linked call raised; a failed stop is a finding.
         """
         send = motion.stop
         if send is None:
@@ -861,13 +1156,54 @@ class Executor:
             self._generations[motion.device] = (
                 self._generations.get(motion.device, 0) + 1
             )
-        error = self._send_safe(
+            linked = (
+                ()
+                if self._halted
+                else tuple(s for s in self._links.get(motion.device, ()) if s.live)
+            )
+            for link in linked:
+                # In the section that takes the snapshot: a block that reads
+                # it after its link is removed cannot miss this stop.
+                link.reached = True
+        if linked:
+            error = self.hold_log(lambda: self._stop_linked(motion, send, linked))
+        else:
+            error = self._send_stop(motion, send)
+        if error is not None:
+            raise error
+
+    def _send_stop(self, motion: Motion, send: Callable[[], None]) -> Exception | None:
+        """``motion``'s own stop, then its registration released; what it raised, if anything."""
+        return self._send_safe(
             send,
             f"{motion.name}: stop",
             then=lambda failed: "" if failed else self._release_after_stop(motion),
         )
-        if error is not None:
-            raise error
+
+    def _stop_linked(
+        self,
+        motion: Motion,
+        send: Callable[[], None],
+        linked: tuple[StopLink, ...],
+    ) -> Exception | None:
+        """The linked calls, then ``motion``'s own stop, past any failure of theirs.
+
+        An interrupt (a second Ctrl-C) in a linked call does not skip the
+        device's own stop: it is re-raised once that stop is sent.
+        """
+        failure: Exception | None = None
+        interrupted: BaseException | None = None
+        for link in linked:
+            try:
+                link.stop()
+            except Exception as exc:
+                failure = failure or exc
+            except BaseException as exc:
+                interrupted = interrupted or exc
+        error = self._send_stop(motion, send)
+        if interrupted is not None:
+            raise interrupted
+        return error or failure
 
     def safe(self, call: SafeCall, readback: Callable[[], T]) -> T:
         """Send ``call`` (closing a shutter) now, then read back; design §13.

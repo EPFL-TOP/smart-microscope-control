@@ -15,8 +15,9 @@ from typing import TYPE_CHECKING, cast
 
 import pytest
 
+import smc.hardware.backends.mm as mm
 from smc.hardware import Microscope
-from smc.hardware.capabilities import Camera, Shutter, XYStage, ZStage
+from smc.hardware.capabilities import Autofocus, Camera, Shutter, XYStage, ZStage
 from smc.hardware.errors import CapabilityMissingError, HardwareError
 from smc.hardware.profile import Profile, SafetySection
 from smc.hardware.roles import Role
@@ -83,6 +84,12 @@ def back_where_it_started(stand: Microscope, envelope: Envelope) -> Iterator[Non
     if shutter is not None:
         assert shutter.is_open() is envelope.shutter_open
         assert shutter.auto_shutter() is envelope.auto_shutter
+    autofocus = stand.get(Autofocus)
+    if autofocus is not None:
+        assert autofocus.is_engaged() is envelope.autofocus_engaged
+        assert envelope.offset_native is not None
+        offset = autofocus.offset_native()
+        assert abs(offset - envelope.offset_native) <= envelope.offset_tolerance
 
 
 def test_teardown_puts_the_stand_back_where_it_started(
@@ -90,10 +97,18 @@ def test_teardown_puts_the_stand_back_where_it_started(
 ) -> None:
     xy, z = microscope.get(XYStage), microscope.get(ZStage)
     camera, shutter = microscope.get(Camera), microscope.get(Shutter)
+    autofocus = microscope.get(Autofocus)
+    if autofocus is not None and envelope.offset_native is not None:
+        # With the autofocus off: it moves only the offset lens.
+        autofocus.disengage()
+        autofocus.set_offset_native(envelope.offset_native - 1.0)
     if xy is not None and envelope.xy is not None:
         xy.move_to_um(envelope.xy.x_um + 20, envelope.xy.y_um - 10)
     if z is not None and envelope.z_um is not None:
         z.move_to_um(envelope.z_um - 2)
+    if autofocus is not None and not envelope.autofocus_engaged:
+        # Left engaged: the put-back switches it off again.
+        autofocus.engage()
     if camera is not None and envelope.exposure_ms is not None:
         start = envelope.exposure_ms
         camera.set_exposure_ms(30.0 if abs(start - 20.0) <= 1.0 else 20.0)
@@ -152,12 +167,28 @@ def test_envelope_refuses_a_start_too_close_to_the_profile_limits(
         pytest.fail.Exception, match=r"too close to its Z soft limits \[-1000, 1\] µm"
     ):
         envelope.profile(near_z)
+    # The autofocus offset starts at 0.0 too; its window is +/- 2.0, in its
+    # own units (m2 §3.13).
+    assert envelope.offset_native == 0.0
+    near_offset = limited(autofocus_offset_soft_limits=(-1000, 1))
+    with pytest.raises(
+        pytest.fail.Exception,
+        match=r"too close to its autofocus offset soft limits \[-1000, 1\] device "
+        r"units: the contracts need \[-2, 2\] device units",
+    ):
+        envelope.profile(near_offset)
     roomy = limited(
-        xy_soft_limits_um=((-1000, 1000), (-1000, 1000)), z_soft_limits_um=(-10, 10)
+        xy_soft_limits_um=((-1000, 1000), (-1000, 1000)),
+        z_soft_limits_um=(-10, 10),
+        autofocus_offset_soft_limits=(-10, 10),
+        max_autofocus_offset_jog=50.0,
     )
     safety = envelope.profile(roomy).safety
     assert safety.xy_soft_limits_um == ((-100, 100), (-100, 100))
     assert safety.z_soft_limits_um == (-3, 3)
+    # The window replaces the profile's limit, and the contracts' jog limit its.
+    assert safety.autofocus_offset_soft_limits == (-2.0, 2.0)
+    assert safety.max_autofocus_offset_jog == 1.0
 
 
 #: An inner run that moves the fake stand, opens the light, then is
@@ -264,7 +295,9 @@ def test_teardown_after_ctrl_c_stops_the_stand_instead_of_moving_it(
     result = _run_contracts(pytester, monkeypatch, INTERRUPTED_RUN)
     assert result.ret == pytest.ExitCode.INTERRUPTED, result.stdout.str()
     log = (pytester.path / "teardown.log").read_text(encoding="utf-8").splitlines()
+    # The emergency stop switches the autofocus off first (m2 §3.11).
     assert log == [
+        "enableContinuousFocus(False)",
         "stop('XY')",
         "stop('Z')",
         "setShutterOpen('White Light Shutter', False)",
@@ -302,31 +335,68 @@ def test_put_back_cuts_the_light_before_moving_and_restores_it_last(
     assert envelope.auto_shutter is True
     x0, y0, z0 = envelope.xy.x_um, envelope.xy.y_um, envelope.z_um
 
-    # Started closed: the light goes off before anything moves.
+    autofocus = facade.require(Autofocus)
+    assert envelope.offset_native is not None
+    assert envelope.autofocus_engaged is False
+    o0 = envelope.offset_native
+
+    # Started closed: the light goes off before anything moves, and the
+    # autofocus is off while anything moves back (m2 §3.13).
     facade.require(XYStage).move_to_um(x0 + 20, y0 - 10)
     facade.require(ZStage).move_to_um(z0 - 2)
+    autofocus.set_offset_native(o0 - 1.0)
     facade.require(Camera).set_exposure_ms(20.0)
     shutter.set_auto_shutter(False)
+    autofocus.engage()
     shutter.set_open(True)
     fake_core.log.clear()
     put_back(facade, envelope)
     assert fake_core.log == [
         "setShutterOpen('White Light Shutter', False)",
+        "enableContinuousFocus(False)",
         f"setXYPosition('XY', {x0!r}, {y0!r})",
         f"setPosition('Z', {z0!r})",
+        f"setAutoFocusOffset({o0!r})",
         f"setExposure({envelope.exposure_ms!r})",
         "setAutoShutter(True)",
     ]
 
-    # Started open: the light comes back on only after every other item.
-    started_open = replace(envelope, shutter_open=True)
+    # Started open and engaged: the autofocus engages again after every
+    # other item, and the light comes back on last.
+    started_open = replace(envelope, shutter_open=True, autofocus_engaged=True)
     facade.require(XYStage).move_to_um(x0 + 20, y0 - 10)
     fake_core.log.clear()
     put_back(facade, started_open)
     assert fake_core.log == [
+        "enableContinuousFocus(False)",
         f"setXYPosition('XY', {x0!r}, {y0!r})",
+        "enableContinuousFocus(True)",
         "setShutterOpen('White Light Shutter', True)",
     ]
+
+
+@pytest.mark.parametrize("backend", ["fake"], indirect=True)
+def test_put_back_names_an_autofocus_that_does_not_lock_again(
+    stand: Microscope,
+    envelope: Envelope,
+    fake_core: FakeCore,
+    put_back: PutBack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-49: the stand started with the autofocus engaged; the operator must
+    # learn that it is off now, and the shutter is still restored after it.
+    monkeypatch.setattr(mm, "DEFAULT_LOCK_TIMEOUT_S", 0.2)  # not the 5 s default
+    facade = Microscope.from_core(stand.core, envelope.profile(stand.profile))
+    started = replace(envelope, autofocus_engaged=True, shutter_open=True)
+    fake_core.autofocus_lockable = False
+    fake_core.log.clear()
+    with pytest.raises(RuntimeError, match="was not put back") as caught:
+        put_back(facade, started)
+    fake_core.autofocus_lockable = True
+    assert "autofocus on: RuntimeError('the autofocus did not lock again" in str(
+        caught.value
+    )
+    assert fake_core.log[-1] == "setShutterOpen('White Light Shutter', True)"
 
 
 @pytest.mark.parametrize("backend", ["fake"], indirect=True)
@@ -391,7 +461,9 @@ def test_ctrl_c_during_the_put_back_skips_the_moves_left_and_names_them(
     facade = Microscope.from_core(stand.core, envelope.profile(stand.profile))
     facade.require(XYStage).move_to_um(20, -10)
     facade.require(ZStage).move_to_um(envelope.z_um - 2)
-    started_open = replace(envelope, shutter_open=True)
+    # Started engaged too: engaging it again moves Z, so after the operator's
+    # Ctrl-C it is one of the steps skipped (FM-71).
+    started_open = replace(envelope, shutter_open=True, autofocus_engaged=True)
 
     def interrupted_move(label: str, x_um: float, y_um: float) -> None:
         raise KeyboardInterrupt
@@ -404,10 +476,38 @@ def test_ctrl_c_during_the_put_back_skips_the_moves_left_and_names_them(
     message = str(caught.value)
     assert "xy: KeyboardInterrupt()" in message
     assert (
-        "not attempted after Ctrl-C: z, exposure, auto-shutter, shutter open" in message
-    )
+        "not attempted after Ctrl-C: z, offset, exposure, auto-shutter, autofocus "
+        "on, shutter open"
+    ) in message
     assert not any(entry.startswith("setPosition(") for entry in fake_core.log)
+    assert "enableContinuousFocus(True)" not in fake_core.log
     assert "setShutterOpen('White Light Shutter', True)" not in fake_core.log
+
+
+@pytest.mark.parametrize("backend", ["fake"], indirect=True)
+def test_ctrl_c_in_the_shutter_close_still_switches_the_autofocus_off(
+    stand: Microscope,
+    envelope: Envelope,
+    fake_core: FakeCore,
+    put_back: PutBack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The switch-off cannot create motion, so it is one of the safe steps that
+    # still run after a Ctrl-C (FM-49).
+    facade = Microscope.from_core(stand.core, envelope.profile(stand.profile))
+    facade.require(Autofocus).engage()
+    assert envelope.shutter_open is False
+
+    def interrupted_close(label: str, open_: bool) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(fake_core, "setShutterOpen", interrupted_close)
+    fake_core.log.clear()
+    with pytest.raises(RuntimeError, match="was not put back") as caught:
+        put_back(facade, envelope)
+    assert type(caught.value).__name__ == "PutBackInterruptedError"
+    assert fake_core.log == ["enableContinuousFocus(False)"]
+    assert fake_core.isContinuousFocusEnabled() is False
 
 
 @pytest.mark.parametrize("backend", ["fake"], indirect=True)

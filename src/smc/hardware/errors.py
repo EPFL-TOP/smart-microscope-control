@@ -127,6 +127,29 @@ class MotionStoppedError(HardwareError):
         return (type(self), (self.device, self.detail))
 
 
+class AutofocusLostError(HardwareError):
+    """A move under the autofocus completed, but the autofocus did not lock again (m2 §3.10).
+
+    It is then off: a Z move on a Nikon stand switches PFS off (FM-12), and a
+    relock that gives up switches it off too, so that it cannot drive Z with
+    no action holding the lock. Raising is the point: a Z move that silently
+    leaves PFS off is the "PFS off overnight" ADR-0003 names. ``z_um`` is
+    where the focus drive was read after the move (``None`` without one) and
+    ``in_range`` what the stand said of its reference (``None``: unknown).
+
+    Not a ``SafetyRefusedError`` (FM-64): the move was made, so a tool that
+    skips a target on a refusal must not carry on as if nothing moved.
+    """
+
+    def __init__(self, message: str, z_um: float | None, in_range: bool | None) -> None:
+        self.z_um = z_um
+        self.in_range = in_range
+        super().__init__(message)
+
+    def __reduce__(self) -> tuple[type[AutofocusLostError], tuple[object, ...]]:
+        return (type(self), (str(self), self.z_um, self.in_range))
+
+
 class MicroscopeBusyError(HardwareError):
     """The microscope lock could not be taken in time (§13, FM-15).
 

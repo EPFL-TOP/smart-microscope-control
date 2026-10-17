@@ -58,3 +58,46 @@ def test_demo_like_state_labels_match_the_demo(demo_core: Any) -> None:
         assert fake.getStateLabels(label) == tuple(demo_core.getStateLabels(label))
         assert fake.getState(label) == demo_core.getState(label), label
         assert fake.getStateLabel(label) == demo_core.getStateLabel(label), label
+
+
+def _outcome(call: Any) -> tuple[str, object]:
+    """What a call did: its result, or the type and message of what it raised."""
+    try:
+        return ("returned", call())
+    except Exception as exc:
+        return (type(exc).__name__, str(exc))
+
+
+def test_fake_and_demo_agree_on_an_empty_autofocus_slot(demo_core: Any) -> None:
+    # FM-87: the continuous-focus calls act on the slot, and with it empty
+    # they fail, or not, as MMCore does (m2 §1, measured 2026-10-16).
+    fake = FakeCore.demo_like()
+    outcomes: list[list[tuple[str, object]]] = []
+    for core in (fake, demo_core):
+        assert core.getAutoFocusOffset() == 0.0
+        core.setAutoFocusDevice("")
+        outcomes.append(
+            [
+                _outcome(core.isContinuousFocusEnabled),
+                _outcome(core.isContinuousFocusLocked),
+                _outcome(lambda c=core: c.enableContinuousFocus(True)),
+                _outcome(lambda c=core: c.enableContinuousFocus(False)),
+                _outcome(core.getAutoFocusOffset),
+                _outcome(lambda c=core: c.setAutoFocusOffset(1.0)),
+            ]
+        )
+    assert outcomes[0] == outcomes[1]
+    assert outcomes[1][2] == ("RuntimeError", "Auto-focus focus device not defined.")
+
+
+def test_fake_and_demo_agree_on_the_autofocus_offset_and_lock(demo_core: Any) -> None:
+    fake = FakeCore.demo_like()
+    seen: list[tuple[object, ...]] = []
+    for core in (fake, demo_core):
+        core.enableContinuousFocus(True)
+        locked = (core.isContinuousFocusEnabled(), core.isContinuousFocusLocked())
+        core.setAutoFocusOffset(12.5)
+        offset = core.getAutoFocusOffset()
+        core.enableContinuousFocus(False)
+        seen.append((locked, offset, core.getAutoFocusOffset()))
+    assert seen[0] == seen[1] == ((True, True), 12.5, 12.5)

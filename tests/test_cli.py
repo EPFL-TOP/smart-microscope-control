@@ -385,6 +385,19 @@ _SNAPSHOTS = {
     "readings": MicroscopeState(
         xy=XY(1234.5, -56.25), z_um=12.5, exposure_ms=25.0, shutter_open=False
     ),
+    # The autofocus part, in each of its states (m2 §3.11).
+    "autofocus-off": MicroscopeState(
+        autofocus_engaged=False, autofocus_locked=False, autofocus_offset_native=0.0
+    ),
+    "autofocus-locked": MicroscopeState(
+        autofocus_engaged=True, autofocus_locked=True, autofocus_offset_native=0.0
+    ),
+    "autofocus-searching": MicroscopeState(
+        autofocus_engaged=True, autofocus_locked=False, autofocus_offset_native=0.0
+    ),
+    "autofocus-unreadable-lock": MicroscopeState(
+        autofocus_engaged=True, errors=["autofocus: HardwareError: d"]
+    ),
     "failed-reads": MicroscopeState(
         errors=["xy: RuntimeError: a", "z: RuntimeError: b", "shutter: OSError: c"]
     ),
@@ -421,6 +434,15 @@ def test_doctor_prints_the_status_line_of_describe(
     assert result.exit_code == (1 if state.errors else 0), result.output
     assert re.search(f"^{re.escape(expected)}$", result.output, re.M), result.output
     assert expected.startswith("XY") == (stand == "demo")
+    # Both stands have the demo's autofocus: the line names its state.
+    shown = {
+        "autofocus-off": "autofocus off",
+        "autofocus-locked": "autofocus locked",
+        "autofocus-searching": "autofocus on, not locked",
+        "autofocus-unreadable-lock": "autofocus ?",
+    }
+    if snapshot in shown:
+        assert f"| {shown[snapshot]}" in expected
 
 
 # --- stage, z ------------------------------------------------------------------

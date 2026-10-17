@@ -64,7 +64,7 @@ src/smc/
   cli.py                  the reference interface
   hardware/
     core.py               open/close a core; demo config; install status
-    capabilities.py       the Protocols                         (M1)
+    capabilities.py       the Protocols                         (M1, M2)
     roles.py              role resolution                       (M1)
     microscope.py         the facade + safety                   (M1)
     profile.py            TOML profiles                         (M1)

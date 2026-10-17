@@ -16,7 +16,14 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from smc.hardware.errors import ProfileError
 from smc.hardware.roles import Role
@@ -27,6 +34,7 @@ else:  # pragma: no cover - exercised on the 3.10 CI job
     import tomli as tomllib
 
 __all__ = [
+    "AutofocusSection",
     "CameraSection",
     "MicroManagerSection",
     "MicroscopeSection",
@@ -45,6 +53,26 @@ DEMO_NAME = "demo"
 #: timeout passes on Linux and macOS and overflows on the stand's PC. As a lock
 #: timeout (``/ 1000``) it also stays under Windows' ``threading.TIMEOUT_MAX``.
 _MAX_DEVICE_TIMEOUT_MS = 2**31 - 1
+#: The longest lock wait a profile may set: the wait holds the microscope
+#: lock, so every other action waits behind it (m2 §3.2). The same bound as
+#: ``smc.hardware.backends.mm.MAX_LOCK_TIMEOUT_S``, which this pure module
+#: cannot import.
+_MAX_LOCK_TIMEOUT_S = 600.0
+
+
+def _no_boolean(name: str, value: Any) -> Any:
+    """Refuse a TOML boolean where a number is expected; anything else passes on.
+
+    pydantic's lax mode reads ``true`` as ``1.0``, so ``lock_timeout_s =
+    true`` would load as a one-second wait (#106 fixes the M1 keys; the new
+    ones do not add to it). ``bool`` is a subclass of ``int``, hence the
+    explicit check, while an integer (``100``) stays a number.
+    """
+    if isinstance(value, bool):
+        raise ValueError(
+            f"{name} must be a number, not a boolean (got {str(value).lower()})"
+        )
+    return value
 
 
 class _Section(BaseModel):
@@ -134,6 +162,44 @@ class SafetySection(_Section):
     z_soft_limits_um: tuple[float, float] | None = None
     xy_soft_limits_um: tuple[tuple[float, float], tuple[float, float]] | None = None
     turret_requires_confirm: bool = True
+    #: In ``[autofocus] offset_unit``. ``None``: every relative offset change
+    #: needs ``force=True``, since no default exists for a stand's own unit.
+    max_autofocus_offset_jog: float | None = None
+    #: In ``[autofocus] offset_unit``; not forceable.
+    autofocus_offset_soft_limits: tuple[float, float] | None = None
+
+    @field_validator("max_autofocus_offset_jog", mode="before")
+    @classmethod
+    def _offset_jog_not_boolean(cls, value: Any) -> Any:
+        return _no_boolean("max_autofocus_offset_jog", value)
+
+    @field_validator("max_autofocus_offset_jog")
+    @classmethod
+    def _offset_jog_positive_finite(cls, value: float | None) -> float | None:
+        # As for the jog limits in µm: an infinite limit is not "no guard".
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            raise ValueError(
+                f"max_autofocus_offset_jog must be a positive, finite number in "
+                f"[autofocus] offset_unit, got {value}"
+            )
+        return value
+
+    @field_validator("autofocus_offset_soft_limits", mode="before")
+    @classmethod
+    def _offset_limits_not_boolean(cls, value: Any) -> Any:
+        if isinstance(value, (list, tuple)):
+            for bound in value:
+                _no_boolean("each bound of autofocus_offset_soft_limits", bound)
+        return value
+
+    @field_validator("autofocus_offset_soft_limits")
+    @classmethod
+    def _offset_limits_ordered(
+        cls, value: tuple[float, float] | None
+    ) -> tuple[float, float] | None:
+        if value is not None:
+            _check_ordered(value, "autofocus offset")
+        return value
 
     @field_validator("max_jog_um")
     @classmethod
@@ -194,6 +260,92 @@ class CameraSection(_Section):
         return value
 
 
+class AutofocusSection(_Section):
+    """What the stand's continuous autofocus is, as far as it was measured (m2 §3.9).
+
+    Everything defaults to *unknown*: the offset's unit (``""``, shown as
+    "device units"), the lock time (``None``: 5 s, assumed and labelled), the
+    µm factor per objective (none: ``focus_by_um`` refuses while locked) and
+    the in-range property (none: ``is_in_range()`` is ``None``). The values
+    come from a session at the stand, never from a guess.
+    """
+
+    #: What the offset's numbers are ("PFS offset steps"); "" = unknown.
+    offset_unit: str = ""
+    #: How long ``engage()`` and the Z interlock wait for a lock; ``None``: 5 s, assumed.
+    lock_timeout_s: float | None = None
+    #: Objective label -> offset change per µm of focus, measured with the
+    #: autofocus locked; sign included.
+    offset_per_um: dict[str, float] = Field(default_factory=dict)
+    #: A property of the autofocus device that says whether its reference is
+    #: in range; "" = the stand does not say.
+    in_range_property: str = ""
+    #: The values of that property that mean "in range"; any other is out of range.
+    in_range_values: list[str] = Field(default_factory=list)
+
+    @field_validator("lock_timeout_s", mode="before")
+    @classmethod
+    def _lock_timeout_not_boolean(cls, value: Any) -> Any:
+        return _no_boolean("lock_timeout_s", value)
+
+    @field_validator("lock_timeout_s")
+    @classmethod
+    def _lock_timeout_bounded(cls, value: float | None) -> float | None:
+        # The wait holds the microscope lock: nan would never end, inf neither.
+        if value is not None and not (
+            math.isfinite(value) and 0 < value <= _MAX_LOCK_TIMEOUT_S
+        ):
+            raise ValueError(
+                f"lock_timeout_s must be a finite number of seconds in (0, "
+                f"{_MAX_LOCK_TIMEOUT_S:g}], got {value}"
+            )
+        return value
+
+    @field_validator("offset_per_um", mode="before")
+    @classmethod
+    def _factors_not_boolean(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            for objective, factor in value.items():
+                _no_boolean(f"offset_per_um for objective {objective!r}", factor)
+        return value
+
+    @field_validator("offset_per_um")
+    @classmethod
+    def _factors_finite_non_zero(cls, value: dict[str, float]) -> dict[str, float]:
+        for objective, factor in value.items():
+            # A zero factor would turn every focus_by_um into no move at all,
+            # reported as done; nan or inf would reach the offset device.
+            if not math.isfinite(factor) or factor == 0:
+                raise ValueError(
+                    f"offset_per_um for objective {objective!r} must be a finite, "
+                    f"non-zero number (the offset change per µm of focus, measured "
+                    f"with the autofocus locked), got {factor}"
+                )
+        return value
+
+    @model_validator(mode="after")
+    def _in_range_together(self) -> AutofocusSection:
+        # One without the other cannot say "in range": a property with no
+        # values would read every value as out of range, and the reverse
+        # names nothing to read.
+        has_property = bool(self.in_range_property.strip())
+        if self.in_range_property and not has_property:
+            raise ValueError(
+                "in_range_property must name a property of the autofocus device, "
+                f"or be empty; got {self.in_range_property!r}"
+            )
+        if has_property != bool(self.in_range_values):
+            raise ValueError(
+                "in_range_property and in_range_values go together: set both (the "
+                "property and the values of it that mean in range), or neither"
+            )
+        if any(not entry.strip() for entry in self.in_range_values):
+            raise ValueError(
+                'in_range_values must not contain an empty value; remove the "" entry'
+            )
+        return self
+
+
 class Profile(_Section):
     """One instrument's stand-specific facts, validated.
 
@@ -207,6 +359,7 @@ class Profile(_Section):
     roles: RolesSection = Field(default_factory=RolesSection)
     safety: SafetySection = Field(default_factory=SafetySection)
     camera: CameraSection = Field(default_factory=CameraSection)
+    autofocus: AutofocusSection = Field(default_factory=AutofocusSection)
     quirks: dict[str, Any] = Field(default_factory=dict)
     source: Path | None = Field(default=None, exclude=True)
 
@@ -488,6 +641,7 @@ _SECTIONS: dict[tuple[str, ...], type[BaseModel]] = {
     ("roles",): RolesSection,
     ("safety",): SafetySection,
     ("camera",): CameraSection,
+    ("autofocus",): AutofocusSection,
 }
 
 
