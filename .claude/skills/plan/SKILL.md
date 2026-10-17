@@ -89,6 +89,11 @@ the plan, do what it unlocks (labels, dependents), and end the session.
   subclass, a fake): run it once in that script. #80's plan misread
   `_nested`; #77's plan prescribed setting an attribute that `CMMCorePlus`
   refuses, and missed that pymmcore-plus reverses the search-path order.
+  Two checks on the tests a plan names: every test module's basename is
+  unique under `tests/` (it has no packages, so pytest refuses a second
+  `test_autofocus.py`), and every decided test value differs from the
+  tolerance it is compared with (a 0.5 change against a 0.5 tolerance
+  cannot fail). #13's plan met both.
 - **A new checklist entry is named by its text, never by a number.** The
   develop session takes the next free id when it writes the entry
   (`scripts/dev/next_fm_id.py`): #131's plan named FM-85, which #130 had
