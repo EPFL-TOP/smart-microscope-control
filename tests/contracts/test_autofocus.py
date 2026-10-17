@@ -57,7 +57,10 @@ def _with_factors(
     """Another facade over ``stand``'s core, under the envelope, with these factors.
 
     Never closed, as the ``microscope`` fixture's: ``stand`` owns the core, and
-    the ``microscope`` fixture the test also requests puts it back.
+    the ``microscope`` fixture the test also requests puts it back. The caller
+    keeps the facade in a variable for as long as it uses a capability of it: a
+    capability looks its siblings up through its facade, which it holds only
+    weakly, and refuses once the facade is gone (#142).
     """
     profile = envelope.profile(stand.profile)
     autofocus = profile.autofocus.model_copy(update={"offset_per_um": factors})
@@ -179,7 +182,8 @@ def test_focus_by_with_the_autofocus_off_moves_z(
 def test_focus_by_while_locked_without_a_factor_is_refused(
     stand: Microscope, autofocus: Autofocus, envelope: Envelope, backend: str
 ) -> None:
-    af = _with_factors(stand, envelope, {}).require(Autofocus)
+    facade = _with_factors(stand, envelope, {})
+    af = facade.require(Autofocus)
     _lock(af, backend)
     o0, tol = af.offset_native(), envelope.offset_tolerance
     with pytest.raises(SafetyRefusedError) as refused:
@@ -209,7 +213,8 @@ def test_focus_by_while_locked_moves_the_offset(
     else:
         assert objective is not None, "fake and demo have an objective turret"
         factor = 1.0
-        af = _with_factors(stand, envelope, {objective: factor}).require(Autofocus)
+        facade = _with_factors(stand, envelope, {objective: factor})
+        af = facade.require(Autofocus)
         dz_um = -1.0
     _lock(af, backend)
     o0, tol = af.offset_native(), envelope.offset_tolerance
