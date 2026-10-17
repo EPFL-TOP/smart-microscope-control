@@ -2297,15 +2297,27 @@ _DEAD_OWNER = (
 )
 
 
-def _build_every_capability(microscope: Microscope) -> None:
-    """What a session that used the whole stand has built, ``state()`` included.
+def _use_the_stand(core: FakeCore, microscope: Microscope) -> None:
+    """What a session that used the whole stand has built and done, ``state()`` included.
 
-    Every capability the facade knows, so that a new one is under the test.
+    Every capability the facade knows is built, so that a new one is under the
+    test, and then each thing the stand does runs once: a cycle can be made by
+    a call as well as by building (the Z stage's compound linked a stop to the
+    autofocus: a cycle that only a Z move with PFS on showed).
     """
     for capability in CAPABILITY_ROLES:
         # The Ti2-E has no shutter role; the others it has.
         with suppress(CapabilityMissingError):
             microscope.require(capability)
+    microscope.require(XYStage).move_to_um(10.0, 5.0)
+    microscope.require(Camera).snap()
+    autofocus, z = microscope.require(Autofocus), microscope.require(ZStage)
+    core.enableContinuousFocus(True)
+    z.move_to_um(3.0)  # suspend, move, relock
+    z.move_by_um(1.0)
+    autofocus.focus_by_um(1.0)  # locked: moves the offset
+    autofocus.disengage()
+    z.move_to_um(0.0)  # PFS off: a plain move
     microscope.state()
 
 
@@ -2314,12 +2326,13 @@ def test_a_dropped_facade_frees_its_core_without_the_cyclic_collector(
     no_cyclic_gc: None, closed: bool
 ) -> None:
     # #142: a capability that held the facade (the Z stage's interlock, the
-    # autofocus's focus drive) or itself (the switch-off's SafeCall) kept the
-    # core alive until the cyclic collector, which at the exit of `smc doctor`
-    # runs during interpreter finalization: the child aborted there.
-    core = _ti2_core()
-    microscope = Microscope.from_core(cast("CMMCorePlus", core), _profile())
-    _build_every_capability(microscope)
+    # autofocus's focus drive), itself (the switch-off's SafeCall) or the
+    # callback of its own stop link (a Z move with PFS on) kept the core alive
+    # until the cyclic collector, which at the exit of `smc doctor` runs during
+    # interpreter finalization: the child aborted there.
+    core = _at_offset(7800.0)
+    microscope = Microscope.from_core(cast("CMMCorePlus", core), _factor({"4x": -3.0}))
+    _use_the_stand(core, microscope)
     if closed:
         microscope.close()
     alive = {"facade": weakref.ref(microscope), "core": weakref.ref(core)}

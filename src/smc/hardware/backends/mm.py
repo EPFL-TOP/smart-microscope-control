@@ -1024,41 +1024,52 @@ class MMAutofocus:
         name = f"z {key}"
         before = MotionStoppedError(name, "it was stopped before it started")
         try:
-            with self._executor.linked_stop(
-                key, lambda: self._on_z_stop(stopped)
-            ) as link:
-                stopped.link = link
-                self._executor.refuse_if_stopped(key, before)
-                yield stopped
-        except BaseException as exc:
-            # Suspended, a refusal before the engage was sent (this check, or a
-            # halt, #141) leaves it off as surely as a Z stop does.
-            refused = exc is before or isinstance(exc, MicroscopeHaltedError)
-            if not (stopped.fired or (suspended and refused)):
-                raise
-            if stopped.switch_off_failure is not None:
-                self._log_not_switched_off(description, stopped.switch_off_failure)
-                raise
-            if isinstance(exc, MicroscopeHaltedError) or not isinstance(exc, Exception):
-                self._log_left_off(description, exc)
-                raise  # a halt stays a halt, a Ctrl-C a Ctrl-C
-            error = self._z_stopped(name, description)
-            self._log_left_off(description, error)
-            raise error from exc
-        if stopped.fired:
-            # It locked, then the stop switched it off: not a success.
-            failure = stopped.switch_off_failure
-            if failure is not None:
-                self._log_not_switched_off(description, failure)
-                raise MotionStoppedError(
-                    name,
-                    f"it was stopped during {description}, but autofocus "
-                    f"{self._label} could not be switched off ({failure}); it may "
-                    f"still move Z: stop() and check the stand, then resume()",
-                ) from failure
-            error = self._z_stopped(name, description)
-            self._log_left_off(description, error)
-            raise error
+            try:
+                with self._executor.linked_stop(
+                    key, lambda: self._on_z_stop(stopped)
+                ) as link:
+                    stopped.link = link
+                    self._executor.refuse_if_stopped(key, before)
+                    yield stopped
+            except BaseException as exc:
+                # Suspended, a refusal before the engage was sent (this check, or a
+                # halt, #141) leaves it off as surely as a Z stop does.
+                refused = exc is before or isinstance(exc, MicroscopeHaltedError)
+                if not (stopped.fired or (suspended and refused)):
+                    raise
+                if stopped.switch_off_failure is not None:
+                    self._log_not_switched_off(description, stopped.switch_off_failure)
+                    raise
+                if isinstance(exc, MicroscopeHaltedError) or not isinstance(
+                    exc, Exception
+                ):
+                    self._log_left_off(description, exc)
+                    raise  # a halt stays a halt, a Ctrl-C a Ctrl-C
+                error = self._z_stopped(name, description)
+                self._log_left_off(description, error)
+                raise error from exc
+            if stopped.fired:
+                # It locked, then the stop switched it off: not a success.
+                failure = stopped.switch_off_failure
+                if failure is not None:
+                    self._log_not_switched_off(description, failure)
+                    raise MotionStoppedError(
+                        name,
+                        f"it was stopped during {description}, but autofocus "
+                        f"{self._label} could not be switched off ({failure}); it "
+                        f"may still move Z: stop() and check the stand, then "
+                        f"resume()",
+                    ) from failure
+                error = self._z_stopped(name, description)
+                self._log_left_off(description, error)
+                raise error
+        finally:
+            # The link's callback holds `stopped`, and `stopped` held the link: a
+            # cycle that kept this autofocus and the core alive until the cyclic
+            # collector (FM-92). The callback never reads `link`, a stop that is
+            # still on its way needs only `stopped`, and nothing reads `fired`
+            # after this block.
+            stopped.link = None
 
     def _on_z_stop(self, stopped: _ZStop) -> None:
         """A ``ZStage.stop()`` during a compound of the autofocus; the stopping thread's.

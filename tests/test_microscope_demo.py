@@ -905,6 +905,11 @@ def test_closing_the_demo_facade_frees_its_core_without_the_cyclic_collector(
     # Profile.demo(), not "demo": no demo.toml of the working directory.
     caplog.set_level(logging.INFO, logger="pymmcore-plus")
     microscope = Microscope.open(Profile.demo())
+    microscope.require(XYStage).move_to_um(10.0, 5.0)
+    microscope.require(Camera).snap()
+    microscope.require(Autofocus).engage()
+    # With the autofocus on, a Z move is a compound: suspend, move, relock.
+    microscope.require(ZStage).move_to_um(1.0)
     microscope.state()
     microscope.close()
     alive = {"facade": weakref.ref(microscope), "core": weakref.ref(microscope.core)}
