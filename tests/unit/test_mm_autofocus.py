@@ -17,8 +17,9 @@ import math
 import re
 import threading
 import time
+import weakref
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -27,9 +28,18 @@ from pymmcore_plus import DeviceType
 
 import smc.hardware.backends.mm as mm
 from smc.hardware import Microscope
-from smc.hardware.capabilities import Autofocus, Camera, FocusStep, XYStage, ZStage
+from smc.hardware.capabilities import (
+    Autofocus,
+    Camera,
+    FocusStep,
+    Properties,
+    Shutter,
+    XYStage,
+    ZStage,
+)
 from smc.hardware.errors import (
     AutofocusLostError,
+    CapabilityMissingError,
     DeviceTimeoutError,
     HardwareError,
     MicroscopeHaltedError,
@@ -2283,3 +2293,78 @@ def test_override_of_autofocus_warns_that_z_is_no_longer_interlocked(
         assert stub.calls == []
         # The quirk switched PFS off, and nothing switched it on again.
         assert stand.core.isContinuousFocusEnabled() is False
+
+
+# --- the facade's lifetime (#142) -------------------------------------------
+
+_DEAD_OWNER = (
+    "{asked_by} belongs to a Microscope that no longer exists, and looks up its "
+    "sibling capabilities (the Z interlock, the focus drive) through it; keep the "
+    "Microscope alive for as long as its capabilities are in use"
+)
+
+
+def _build_every_capability(microscope: Microscope) -> None:
+    """What a session that used the whole stand has built, ``state()`` included."""
+    for capability in (Properties, XYStage, ZStage, Shutter, Camera, Autofocus):
+        # The Ti2-E has no shutter role; the others it has.
+        with suppress(CapabilityMissingError):
+            microscope.require(capability)
+    microscope.state()
+
+
+@pytest.mark.parametrize("closed", [True, False])
+def test_a_dropped_facade_frees_its_core_without_the_cyclic_collector(
+    no_cyclic_gc: None, closed: bool
+) -> None:
+    # #142: a capability that held the facade (the Z stage's interlock, the
+    # autofocus's focus drive) or itself (the switch-off's SafeCall) kept the
+    # core alive until the cyclic collector, which at the exit of `smc doctor`
+    # runs during interpreter finalization: the child aborted there.
+    core = _ti2_core()
+    microscope = Microscope.from_core(cast("CMMCorePlus", core), _profile())
+    _build_every_capability(microscope)
+    if closed:
+        microscope.close()
+    alive = {"facade": weakref.ref(microscope), "core": weakref.ref(core)}
+    del microscope, core
+    assert {name: ref() is not None for name, ref in alive.items()} == {
+        "facade": False,
+        "core": False,
+    }
+
+
+def test_a_z_stage_outliving_its_microscope_refuses_the_move_and_sends_nothing(
+    no_cyclic_gc: None,
+) -> None:
+    # The weak link must not read as "no autofocus": that would move Z with
+    # PFS locked and switch it off for good (FM-12).
+    core = _ti2_core()
+    microscope = Microscope.from_core(cast("CMMCorePlus", core), _profile())
+    z = microscope.require(ZStage)
+    microscope.require(Autofocus)
+    core.enableContinuousFocus(True)
+    core.log.clear()
+    del microscope
+    with pytest.raises(HardwareError) as refused:
+        z.move_to_um(5.0)
+    assert str(refused.value) == _DEAD_OWNER.format(asked_by="ZStage")
+    assert core.log == []
+    assert core.isContinuousFocusEnabled() is True
+
+
+def test_an_autofocus_outliving_its_microscope_refuses_focus_by_um_and_sends_nothing(
+    no_cyclic_gc: None,
+) -> None:
+    # No focus drive found would skip the Z soft-limit check on a locked
+    # focus_by_um; a facade that is gone is not "no focus drive".
+    core = _at_offset(7800.0)
+    microscope = Microscope.from_core(cast("CMMCorePlus", core), _factor({"4x": -3.0}))
+    autofocus = microscope.require(Autofocus)
+    core.enableContinuousFocus(True)
+    core.log.clear()
+    del microscope
+    with pytest.raises(HardwareError) as refused:
+        autofocus.focus_by_um(2.0)
+    assert str(refused.value) == _DEAD_OWNER.format(asked_by="Autofocus")
+    assert core.log == []

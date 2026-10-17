@@ -19,4 +19,29 @@ Two kinds of test exist here (ADR-0005):
 runs the plugin's own tests (``test_testing_fixtures.py``).
 """
 
+from __future__ import annotations
+
+import gc
+from collections.abc import Iterator
+
+import pytest
+
 pytest_plugins = ["smc.testing.fixtures", "pytester"]
+
+
+@pytest.fixture
+def no_cyclic_gc() -> Iterator[None]:
+    """Only reference counting frees objects: what a CLI command's end looks like (#142).
+
+    The cyclic collector runs at an arbitrary moment, and at exit during
+    interpreter finalization. A facade that is freed only by it destroys its
+    core there, where a thread that is still inside MMCore aborts the process.
+    A test that drops an object under this fixture and finds it alive has
+    found a reference cycle.
+    """
+    gc.collect()
+    gc.disable()
+    try:
+        yield
+    finally:
+        gc.enable()

@@ -12,6 +12,7 @@ import logging
 import os
 import threading
 import time
+import weakref
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -837,18 +838,23 @@ def test_emergency_stop_sends_every_stop_before_any_log_line(
 
 
 class _BlockedConsole(logging.Handler):
-    """A console whose first write blocks until released (a QuickEdit selection)."""
+    """A console whose first write blocks until released (a QuickEdit selection).
+
+    Not named ``release``: up to Python 3.12 ``Handler.handle`` calls
+    ``self.release()`` to drop its lock, so an ``Event`` of that name made the
+    stop thread die with ``TypeError`` on the 3.10 and 3.11 jobs (#142).
+    """
 
     def __init__(self) -> None:
         super().__init__()
-        self.entered, self.release = threading.Event(), threading.Event()
+        self.entered, self.unblock = threading.Event(), threading.Event()
         self._first = True
 
     def emit(self, record: logging.LogRecord) -> None:
         if self._first:
             self._first = False
             self.entered.set()
-            self.release.wait(JOIN_S)
+            self.unblock.wait(JOIN_S)
 
 
 def test_emergency_stop_is_not_held_up_by_a_blocked_log_handler(
@@ -863,18 +869,46 @@ def test_emergency_stop_is_not_held_up_by_a_blocked_log_handler(
     console = _BlockedConsole()
     logger = logging.getLogger(LOGGER)
     logger.addHandler(console)
-    stopper = threading.Thread(target=m.stop, daemon=True)
+    stop_raised: list[BaseException] = []
+
+    def stop() -> None:
+        # A thread that dies is a warning at best: the test must fail on it.
+        try:
+            m.stop()
+        except BaseException as exc:
+            stop_raised.append(exc)
+
+    stopper = threading.Thread(target=stop, daemon=True)
     try:
         stopper.start()
         assert console.entered.wait(JOIN_S)
         sent_while_blocked = list(spy.calls)
     finally:
-        console.release.set()
+        console.unblock.set()
         logger.removeHandler(console)
         stopper.join(timeout=JOIN_S)
     assert not stopper.is_alive()
     m.close()
     assert sent_while_blocked == ["stop XY", "stop Z"]
+    assert stop_raised == []
+
+
+def test_closing_the_demo_facade_frees_its_core_without_the_cyclic_collector(
+    no_cyclic_gc: None,
+) -> None:
+    # #142, on the real core (what `smc doctor` exits with): MMCore's pool
+    # threads live until the CMMCorePlus is destroyed, and a core that only the
+    # cyclic collector frees is destroyed during interpreter finalization.
+    # Profile.demo(), not "demo": no demo.toml of the working directory.
+    microscope = Microscope.open(Profile.demo())
+    microscope.state()
+    microscope.close()
+    alive = {"facade": weakref.ref(microscope), "core": weakref.ref(microscope.core)}
+    del microscope
+    assert {name: ref() is not None for name, ref in alive.items()} == {
+        "facade": False,
+        "core": False,
+    }
 
 
 def _in_a_registry_section(m: Microscope, call: Callable[[], object]) -> list[object]:
