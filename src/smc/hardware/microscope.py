@@ -42,6 +42,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -347,12 +348,22 @@ class Microscope:
         """The Micro-Manager implementation of ``capability``; no device is contacted."""
         get = self.roles.get
         core, executor, safety = self.core, self._executor, self._safety
+        # The capabilities look their siblings up through the facade, and the
+        # facade holds them: a strong reference back would be a cycle that
+        # keeps the core alive until the cyclic collector (#142).
+        owner = weakref.ref(self)
         if capability is Properties:
             return MMProperties(core, executor)
         if capability is XYStage and (label := get(Role.xy_stage)) is not None:
             return MMXYStage(core, label, executor, safety)
         if capability is ZStage and (label := get(Role.focus)) is not None:
-            return MMZStage(core, label, executor, safety, autofocus=self._interlock)
+            return MMZStage(
+                core,
+                label,
+                executor,
+                safety,
+                autofocus=lambda: _owned(owner, "ZStage")._interlock(),
+            )
         if capability is Shutter and (label := get(Role.shutter)) is not None:
             return MMShutter(core, label, executor)
         if capability is Camera and (label := get(Role.camera)) is not None:
@@ -378,7 +389,9 @@ class Microscope:
                 in_range_values=af.in_range_values,
                 objective_label=self._objective_label(),
                 # Lazy: the focus drive is looked up at the call, never here.
-                focus=lambda: cast("ZStage | None", self._lookup(ZStage)),
+                focus=lambda: cast(
+                    "ZStage | None", _owned(owner, "Autofocus")._lookup(ZStage)
+                ),
             )
         return None
 
@@ -708,6 +721,30 @@ def _owns(lock: threading.RLock) -> bool:
     """Whether the calling thread holds ``lock`` (``RLock._is_owned``, as ``Condition`` uses)."""
     is_owned = getattr(lock, "_is_owned", None)
     return bool(is_owned()) if is_owned is not None else False
+
+
+def _owned(owner: weakref.ref[Microscope], asked_by: str) -> Microscope:
+    """The facade a capability looks its siblings up through; ``HardwareError`` once it is gone.
+
+    ``None`` from those lookups means "this stand has no autofocus" or "no
+    focus drive", so a facade that no longer exists must not read as that: a Z
+    stage would then move with PFS locked and leave it off (FM-12), and a
+    locked ``focus_by_um`` would skip the Z soft-limit check. It raises, and
+    the Z stage asks first, before anything is sent. Called under the cache
+    lock and from a Ctrl-C handler (FM-70): it takes no lock and does no I/O.
+
+    A Z move that is under way when another thread drops the last reference
+    to the facade reaches the relock with the owner gone and raises there,
+    PFS off. That is not a supported way to hold a stand.
+    """
+    microscope = owner()
+    if microscope is None:
+        raise HardwareError(
+            f"{asked_by} belongs to a Microscope that no longer exists, and looks up "
+            f"its sibling capabilities (the Z interlock, the focus drive) through "
+            f"it; keep the Microscope alive for as long as its capabilities are in use"
+        )
+    return microscope
 
 
 def _describe_autofocus(state: MicroscopeState) -> str:
