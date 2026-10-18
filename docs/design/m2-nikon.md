@@ -1,6 +1,7 @@
 # M2 design — Nikon on hardware
 
-- **Status**: design for issue #13 (§1–§6, 2026-10-16). #12, #14, #15 and
+- **Status**: design for issue #13 (§1–§6, 2026-10-16); §3.3.1 and
+  §3.11's stop rules decided in #144 (2026-10-18). #12, #14, #15 and
   #48 add their own sections with their plans.
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1, this document is the contract between issues that are
@@ -194,7 +195,7 @@ native delta (§3.5).
 | Kind | Calls |
 |---|---|
 | read | `is_engaged`, `is_locked`, `is_in_range`, `offset_native`, `offset_unit`, `offset_limits_native` |
-| action | `engage` (a motion: the wait for the lock), `set_offset_native` and `offset_by_native` (a motion: the offset device), `focus_by_um` and a Z move on a stand with an autofocus (a *compound*: several nested actions in one lock section, §3.7) |
+| action | `engage` (a motion: the wait for the lock), `set_offset_native` and `offset_by_native` (a motion: the offset device), each run as a compound of that one motion so that the Z stop reaches it (§3.3.1); `focus_by_um` and a Z move on a stand with an autofocus (a *compound*: several nested actions in one lock section, §3.7) |
 | safe | `disengage` |
 
 The lock wait is a **motion** in the sense of M1 §13: `Motion(device=<af
@@ -210,6 +211,64 @@ PFS holds focus. Measured with a prototype on a `FakeCore` (2026-10-16):
 the give-up sends `enableContinuousFocus(False)` and registers nothing, a
 `SafeCall` on the AF label during the wait raises `MotionStoppedError`,
 another thread's action is refused at once, and in dry-run nothing is sent.
+
+#### 3.3.1 What each stop reaches (FM-91, #144)
+
+Stops are keyed by device (M1 §13), and PFS drives Z under keys of its own
+(`PFS`, `PFSOffset`). So every motion that can drive Z names the stops that
+end it. **Rule: while PFS can drive Z because of an action, the operator's
+`ZStage.stop()` switches it off, first.** Measured on the Ti2-E fake before
+this decision (2026-10-18): a `ZStage.stop()` during a direct `engage()`
+search was ignored, and PFS searched on until `lock_timeout_s` ran out. One
+during a direct offset move with PFS locked was ignored too: the move
+completed and PFS stayed on, following it.
+
+| Motion (its key) | Its own stop | `ZStage.stop()` | `Microscope.stop()` | `close()`, something moving |
+|---|---|---|---|---|
+| Z move (`ZDrive`) | Z's | Z's | yes | yes |
+| Relock after an interlocked Z move (`PFS`) | `disengage()` | PFS off, then Z's stop (#140) | yes | yes |
+| Locked `focus_by_um`: the offset move and the relock | the offset device's; `disengage()` | PFS off, offset device stopped, then Z's stop (#140) | yes | yes |
+| A direct `engage()`'s lock wait (`PFS`) | `disengage()` | **PFS off, then Z's stop** | yes | yes |
+| A direct `set_offset_native` / `offset_by_native`, PFS on (`PFSOffset`, or `PFS` without an offset device) | the offset device's | **PFS off, offset device stopped, then Z's stop** | yes | yes |
+| The same move, PFS off | the offset device's | no: it moves no Z (assumed, §4 item 5) | yes | yes |
+| PFS holding focus, no action running | (not a motion) | no | PFS off | no: left as it is |
+
+"yes" in the last two columns: the emergency stop's order (§3.11), PFS off
+first, then the offset device, then the stages.
+
+- **Mechanism.** `engage`, `set_offset_native` and `offset_by_native` each
+  run as one compound (§3.7). Inside it, the call links the focus drive's
+  stop (`Executor.linked_stop`) for as long as PFS can drive Z, exactly as
+  the relock and a locked `focus_by_um` do (`MMAutofocus._ended_by_a_z_stop`).
+  `engage` always links. An offset move links when `is_engaged()` reads
+  `True`, *or cannot be read* (unknown counts as on, FM-19): with PFS on but
+  not locked, an offset change can still steer its search. The read is made
+  inside the compound, under the microscope lock, where no other action can
+  switch PFS on. Nothing is linked when the focus drive is not this module's
+  `MMZStage` (`Microscope.override`): there is no stop of it to link.
+- **Outcome of a Z stop once the call has sent something.** PFS is switched
+  off, and the offset device is stopped while its move is pending or under
+  way, before Z's own stop and inside one `hold_log` (FM-62). The call raises
+  `MotionStoppedError` naming Z, e.g. `` `z ZDrive`: it was stopped during
+  autofocus: engage, so autofocus PFS was left off; read the position before
+  moving on ``, and the WARNING `autofocus PFS: left off, because autofocus:
+  engage did not complete (MotionStoppedError)` is logged. `engage` keeps its
+  contract: `False` means "no lock, and it is off". A Z stop is a raise, never
+  a `False`. When the Z stop's switch-off itself fails, no "left off" is
+  claimed; the error says PFS may still move Z (as for the relock).
+- **A Z stop that came while the call waited for the microscope lock**
+  cancels it with nothing sent (`MotionStoppedError`, "it was stopped before
+  it started"). PFS is then as it was, so no "left off" WARNING is logged.
+  This is M1 §13's rule (a stop cancels the actions on its device called
+  before it), applied to calls that drive Z through another device.
+- **Not chosen.** *Refusing the stop*: a stop is never refused (M1 §13).
+  *Cancelling the lock wait but leaving PFS on*: PFS left searching moves Z
+  with no action holding the lock, which §3.2 forbids. *Linking the offset
+  move with PFS off*: the Z stop would stop a lens move that moves no Z, and
+  report PFS "left off" when it was never on. If #16 finds that an offset
+  move with PFS off does move Z (§4 item 5), the condition becomes "always".
+- **Halted, no link is called** (#140): the emergency stop sends every stop
+  itself, in its own order. `close()` keeps the links (§3.11).
 
 ### 3.4 The Z interlock (FM-12)
 
@@ -477,6 +536,24 @@ of the Z move. The CLI prints it as any `HardwareError` (exit 1).
   correction. A failure is one more entry in the `HardwareError` that names
   each failure. `close()` with nothing moving leaves the autofocus as it is:
   PFS holding focus after smc exits is a legitimate state.
+- **The offset device is stopped next** (#140): right after the switch-off
+  and before the stages, by its `autofocus_offset` role, whether or not the
+  autofocus was built or overridden. Its failure entry is
+  `autofocus_offset 'PFSOffset' (<exc>)`.
+- **The links (§3.3.1).** While halted, `Executor.stop` calls no link, so
+  `stop()` sends each stop once, in the order above. **`close()` keeps the
+  links** (decided in #144): it does not halt, so when a compound of the
+  autofocus is running, `_stop_stages`'s Z stop calls that compound's link
+  as well. Measured on the Ti2-E fake during a relock (2026-10-18): `close()`
+  sent `enableContinuousFocus(False)`, `stop('PFSOffset')`, `stop('XYStage')`,
+  `enableContinuousFocus(False)`, `stop('ZDrive')`. The second switch-off
+  (and a second `stop('PFSOffset')` while an offset move is pending) repeats
+  what was sent just before, in the same order, and is idempotent. In
+  exchange, the compound knows a Z stop ended it: its caller gets
+  `MotionStoppedError` naming Z, and the "left off" WARNING is logged. A
+  failing link is then logged a second time, under the Z entry, with its
+  own device in the message. Skipping the links would need a second
+  mechanism next to the halt, for no change in what the stand does.
 - **`state()`** gains `autofocus_engaged: bool | None`, `autofocus_locked:
   bool | None` and `autofocus_offset_native: float | None` (each `None`
   with an `errors` entry when its read fails, and `None` without an
@@ -557,9 +634,11 @@ The sample is a dish or plate with cells, focused by eye first.
    again, `deviceBusy("PFSOffset")` during the move. Per objective in use:
    the factor `offset_per_um = N / ΔZ`, its sign, and a safe
    `max_autofocus_offset_jog`.
-5. **Offset with PFS off.** The same move: does Z move? (§3.2 assumes not.)
+5. **Offset with PFS off.** The same move: does Z move? (§3.2 assumes not,
+   and §3.3.1 links no Z stop to it then.)
 6. **Limits and stop.** `PFSOffset`'s property limits, and whether
-   `stop("PFSOffset")` is accepted (`autofocus_offset_soft_limits`).
+   `stop("PFSOffset")` is accepted (`autofocus_offset_soft_limits`). The
+   emergency stop and the Z stop's link send it (§3.3.1, §3.11).
 7. **The slot API.** `getAutoFocusOffset()` against
    `getPosition("PFSOffset")`, and whether `setAutoFocusOffset(o)` moves
    `PFSOffset` on the Ti2-E.
