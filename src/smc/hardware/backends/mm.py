@@ -500,6 +500,35 @@ def _yes_no(value: bool | None) -> str:
     return "unknown" if value is None else ("yes" if value else "no")
 
 
+def _check_autofocus_slot(core: CMMCorePlus, label: str) -> None:
+    """Refuse unless the core's AutoFocus slot names ``label`` (FM-87).
+
+    MMCore's continuous-focus calls take no label: they act on the slot's
+    device, so a slot that something moved would switch another device.
+    """
+    current = core.getAutoFocusDevice()
+    if current != label:
+        raise HardwareError(
+            f"autofocus {label!r} is not the device the core's AutoFocus "
+            f"slot names ({current!r}), and the continuous-focus calls act on "
+            f"the slot's device; something changed the slot after the stand "
+            f"was opened. Open it again, or set Core-AutoFocus in the "
+            f"configuration and the autofocus role under [roles.assign] to the "
+            f"same device."
+        )
+
+
+def _send_continuous_focus_off(core: CMMCorePlus, label: str) -> None:
+    """Switch the autofocus off, after the slot check; the switch-off's ``SafeCall`` sends it.
+
+    A function of the core and the label, not a method: the ``SafeCall`` is
+    stored on the ``MMAutofocus``, and one that held ``self._send_off`` would
+    be a reference cycle through the core (#142).
+    """
+    _check_autofocus_slot(core, label)
+    core.enableContinuousFocus(False)
+
+
 @dataclass(frozen=True, slots=True)
 class _Lock:
     """How a lock wait ended: locked, or not, with what the stand said of its range."""
@@ -612,8 +641,12 @@ class MMAutofocus:
         self._in_range_values = tuple(in_range_values)
         self._objective_label = objective_label
         self._focus = focus
+        # Not `self._send_off`: a bound method stored on self is a cycle that
+        # keeps the core alive until the cyclic collector (#142).
         self._off = SafeCall(
-            device=label, log="autofocus: disengage", send=self._send_off
+            device=label,
+            log="autofocus: disengage",
+            send=functools.partial(_send_continuous_focus_off, core, label),
         )
         if offset_motion is not None:
             self._offset_motion = offset_motion
@@ -633,16 +666,7 @@ class MMAutofocus:
     # --- the slot and the reads ----------------------------------------------
 
     def _check_slot(self) -> None:
-        current = self._core.getAutoFocusDevice()
-        if current != self._label:
-            raise HardwareError(
-                f"autofocus {self._label!r} is not the device the core's AutoFocus "
-                f"slot names ({current!r}), and the continuous-focus calls act on "
-                f"the slot's device; something changed the slot after the stand "
-                f"was opened. Open it again, or set Core-AutoFocus in the "
-                f"configuration and the autofocus role under [roles.assign] to the "
-                f"same device."
-            )
+        _check_autofocus_slot(self._core, self._label)
 
     def _read_engaged(self) -> bool:
         self._check_slot()
@@ -716,8 +740,7 @@ class MMAutofocus:
         self._core.enableContinuousFocus(True)
 
     def _send_off(self) -> None:
-        self._check_slot()
-        self._core.enableContinuousFocus(False)
+        _send_continuous_focus_off(self._core, self._label)
 
     def _lock_timeout(self, timeout_s: float | None) -> tuple[float, bool]:
         """The lock wait's limit, and whether it is the assumed default."""
@@ -1001,41 +1024,52 @@ class MMAutofocus:
         name = f"z {key}"
         before = MotionStoppedError(name, "it was stopped before it started")
         try:
-            with self._executor.linked_stop(
-                key, lambda: self._on_z_stop(stopped)
-            ) as link:
-                stopped.link = link
-                self._executor.refuse_if_stopped(key, before)
-                yield stopped
-        except BaseException as exc:
-            # Suspended, a refusal before the engage was sent (this check, or a
-            # halt, #141) leaves it off as surely as a Z stop does.
-            refused = exc is before or isinstance(exc, MicroscopeHaltedError)
-            if not (stopped.fired or (suspended and refused)):
-                raise
-            if stopped.switch_off_failure is not None:
-                self._log_not_switched_off(description, stopped.switch_off_failure)
-                raise
-            if isinstance(exc, MicroscopeHaltedError) or not isinstance(exc, Exception):
-                self._log_left_off(description, exc)
-                raise  # a halt stays a halt, a Ctrl-C a Ctrl-C
-            error = self._z_stopped(name, description)
-            self._log_left_off(description, error)
-            raise error from exc
-        if stopped.fired:
-            # It locked, then the stop switched it off: not a success.
-            failure = stopped.switch_off_failure
-            if failure is not None:
-                self._log_not_switched_off(description, failure)
-                raise MotionStoppedError(
-                    name,
-                    f"it was stopped during {description}, but autofocus "
-                    f"{self._label} could not be switched off ({failure}); it may "
-                    f"still move Z: stop() and check the stand, then resume()",
-                ) from failure
-            error = self._z_stopped(name, description)
-            self._log_left_off(description, error)
-            raise error
+            try:
+                with self._executor.linked_stop(
+                    key, lambda: self._on_z_stop(stopped)
+                ) as link:
+                    stopped.link = link
+                    self._executor.refuse_if_stopped(key, before)
+                    yield stopped
+            except BaseException as exc:
+                # Suspended, a refusal before the engage was sent (this check, or a
+                # halt, #141) leaves it off as surely as a Z stop does.
+                refused = exc is before or isinstance(exc, MicroscopeHaltedError)
+                if not (stopped.fired or (suspended and refused)):
+                    raise
+                if stopped.switch_off_failure is not None:
+                    self._log_not_switched_off(description, stopped.switch_off_failure)
+                    raise
+                if isinstance(exc, MicroscopeHaltedError) or not isinstance(
+                    exc, Exception
+                ):
+                    self._log_left_off(description, exc)
+                    raise  # a halt stays a halt, a Ctrl-C a Ctrl-C
+                error = self._z_stopped(name, description)
+                self._log_left_off(description, error)
+                raise error from exc
+            if stopped.fired:
+                # It locked, then the stop switched it off: not a success.
+                failure = stopped.switch_off_failure
+                if failure is not None:
+                    self._log_not_switched_off(description, failure)
+                    raise MotionStoppedError(
+                        name,
+                        f"it was stopped during {description}, but autofocus "
+                        f"{self._label} could not be switched off ({failure}); it "
+                        f"may still move Z: stop() and check the stand, then "
+                        f"resume()",
+                    ) from failure
+                error = self._z_stopped(name, description)
+                self._log_left_off(description, error)
+                raise error
+        finally:
+            # The link's callback holds `stopped`, and `stopped` held the link: a
+            # cycle that kept this autofocus and the core alive until the cyclic
+            # collector (FM-92). The callback never reads `link`, a stop that is
+            # still on its way needs only `stopped`, and nothing reads `fired`
+            # after this block.
+            stopped.link = None
 
     def _on_z_stop(self, stopped: _ZStop) -> None:
         """A ``ZStage.stop()`` during a compound of the autofocus; the stopping thread's.
