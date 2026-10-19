@@ -689,30 +689,27 @@ class _EndedByAZStop:
             return stopped
         self._name = f"z {key}"
         before = MotionStoppedError(self._name, "it was stopped before it started")
-        link = autofocus._executor.linked_stop(
+        link = self._link = autofocus._executor.linked_stop(
             key, lambda: autofocus._on_z_stop(stopped)
         )
         try:
+            stopped.link = link.__enter__()
+            autofocus._executor.refuse_if_stopped(key, before)
+        except BaseException as exc:
+            # ``__exit__`` does not run when ``__enter__`` raises: the refusal
+            # (this check, or a halt, #141) ends the block here. The link is
+            # left in every case, as a ``with`` statement would: an interrupt
+            # once its entry has returned would otherwise leave it live; one
+            # whose own entry failed is gone, and leaving it does nothing.
+            self._link = None
             try:
-                stopped.link = link.__enter__()
-            except BaseException:
-                # The link's own entry removes it: nothing linked, nothing fired.
+                self._end(link, exc, refused=exc is before)
+            finally:
                 self._close()
-                raise
-            try:
-                autofocus._executor.refuse_if_stopped(key, before)
-            except BaseException as exc:
-                # ``__exit__`` does not run when ``__enter__`` raises: the
-                # refusal (this check, or a halt, #141) ends the block here.
-                try:
-                    self._end(link, exc, refused=exc is before)
-                finally:
-                    self._close()
-                raise
+            raise
         finally:
             # Raised through this frame, it is on its own traceback (FM-98).
             del before
-        self._link = link
         return stopped
 
     def __exit__(
@@ -742,12 +739,18 @@ class _EndedByAZStop:
             if exc is None:
                 link.__exit__(None, None, None)
             else:
-                link.__exit__(type(exc), exc, exc.__traceback__)
+                tb = exc.__traceback__
+                try:
+                    link.__exit__(type(exc), exc, tb)
+                finally:
+                    # Python 3.10's contextlib leaves its own frames on the
+                    # traceback of the exception it re-raised, and its frame
+                    # holds that exception: a cycle (FM-98). 3.11+ restores
+                    # the traceback itself; a ``with`` statement did too.
+                    exc.__traceback__ = tb
         except BaseException as raised:
             # An interrupt in the link's own exit ends the block in place of
             # ``exc``, as the generator's outer ``try`` caught it.
-            if raised is exc:
-                raise
             self._decide(raised, refused=False)
             raise
         self._decide(exc, refused=refused)
@@ -800,8 +803,8 @@ class _EndedByAZStop:
                 autofocus._log_left_off(description, error)
                 raise error
         finally:
-            # Each is raised through this frame, or chained to what is: kept
-            # here, it would be on its own traceback (FM-98).
+            # `error` is raised through this frame: kept here, it would be on
+            # its own traceback (FM-98). `failure`, chained to it, goes with it.
             del failure, error
 
     def _close(self) -> None:

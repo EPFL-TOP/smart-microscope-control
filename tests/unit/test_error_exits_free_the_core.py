@@ -313,6 +313,38 @@ def _z_stop_once_locked(core: FakeCore, microscope: Microscope) -> tuple[str, st
         del core.enableContinuousFocus
 
 
+def _z_stop_that_fails_during_the_relock(
+    core: FakeCore, microscope: Microscope
+) -> tuple[str, str]:
+    """The real PFS link: a Z stop during the relock whose own ``stop('Z')`` fails (#163).
+
+    `_stop_linked` kept the error `_send_stop` returned; its traceback reaches
+    that frame through `_send_safe`'s `f_back`.
+    """
+    core.autofocus_lockable = True
+    core.enableContinuousFocus(True)
+    z = microscope.require(ZStage)
+    switch, stop, stopped = core.enableContinuousFocus, core.stop, list[bool]()
+
+    def stop_once_on(enable: bool) -> None:
+        switch(enable)
+        if enable and not stopped:
+            stopped.append(True)
+            _outcome(z.stop)  # the stopper's own failure is not the subject
+
+    def z_stop_fails(label: str) -> None:
+        if label == "Z":
+            raise RuntimeError("device fault")  # fresh: not `failing` (FM-98)
+        stop(label)
+
+    core.enableContinuousFocus = stop_once_on  # type: ignore[method-assign]
+    core.stop = z_stop_fails  # type: ignore[method-assign]
+    try:
+        return _outcome(lambda: z.move_to_um(3.0))
+    finally:
+        del core.enableContinuousFocus, core.stop
+
+
 def _lock_wait_given_up(core: FakeCore, microscope: Microscope) -> tuple[str, str]:
     """A lock wait given up whose switch-off fails, then ``stop()`` and ``resume()`` (#163).
 
@@ -378,6 +410,13 @@ _SWITCH_OFF_FAILED = (
             "stop() and check the stand, then resume(); read the position before "
             "moving on",
             id="z-stop-once-locked",
+        ),
+        pytest.param(
+            _z_stop_that_fails_during_the_relock,
+            "MotionStoppedError",
+            "`z Z`: it was stopped during z: move_to 3.0 µm, so autofocus Autofocus "
+            "was left off; read the position before moving on",
+            id="z-stop-fails",
         ),
         pytest.param(
             _lock_wait_given_up,

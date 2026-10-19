@@ -1226,6 +1226,7 @@ class Executor:
         """
         failure: Exception | None = None
         interrupted: BaseException | None = None
+        error: Exception | None = None
         for link in linked:
             try:
                 link.stop()
@@ -1240,8 +1241,9 @@ class Executor:
             return error or failure
         finally:
             # Both were caught in this frame, so each is a cycle: exception ->
-            # traceback -> this frame -> this local (#148, FM-92).
-            del interrupted, failure
+            # traceback -> this frame -> this local (#148, FM-92). The device's
+            # own stop error reaches it through `_send_safe`'s `f_back` (#163).
+            del interrupted, failure, error
 
     def safe(self, call: SafeCall, readback: Callable[[], T]) -> T:
         """Send ``call`` (closing a shutter) now, then read back; design §13.
