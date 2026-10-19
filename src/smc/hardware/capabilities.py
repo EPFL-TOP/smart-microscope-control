@@ -28,14 +28,20 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     import numpy as np
 
 __all__ = [
     "XY",
     "Autofocus",
     "Camera",
+    "ChannelPreset",
+    "Channels",
     "FocusStep",
+    "LightSource",
     "Limits",
+    "ObjectiveTurret",
     "Properties",
     "PropertyInfo",
     "Shutter",
@@ -116,6 +122,18 @@ class PropertyInfo:
         if self.read_only:
             text += " (read-only)"
         return text
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelPreset:
+    """One channel: a preset of the stand's channel config group (m2 §8.2)."""
+
+    group: str
+    name: str
+    #: ``(device, property, value)``, in the order MMCore applies them.
+    settings: tuple[tuple[str, str, str], ...]
+    #: The configuration file ``capture()`` wrote; ``None``: the running core only.
+    saved_to: Path | None = None
 
 
 @runtime_checkable
@@ -357,6 +375,105 @@ class Autofocus(Protocol):
         Off: a Z move. Locked: an offset change of ``dz_um`` times the
         profile's measured factor for the current objective, then a relock.
         On but not locked, or locked with no factor: refused, not forceable.
+        """
+        ...
+
+
+@runtime_checkable
+class ObjectiveTurret(Protocol):
+    """The nosepiece: which objective is in the light path (m2 §8.3).
+
+    Turning it can drive an objective into a loaded plate (FM-14), so
+    ``select`` needs ``confirm=True`` unless the profile's ``[safety]
+    turret_requires_confirm`` is false. A turn switches the autofocus off
+    first and never engages it again: the new objective's offset is not
+    known. A turret cannot be stopped from smc.
+    """
+
+    def labels(self) -> list[str]:
+        """Every position's label, in position order, empty positions included."""
+        ...
+
+    def current(self) -> str:
+        """The label of the objective in the light path."""
+        ...
+
+    def select(self, label: str, *, confirm: bool = False) -> str:
+        """Turn to ``label``; return the readback. Refused without ``confirm``."""
+        ...
+
+    def pixel_size_um(self, label: str | None = None) -> float:
+        """The profile's pixel size for ``label`` (default: current), at binning 1; ``0.0``: unknown."""
+        ...
+
+
+@runtime_checkable
+class LightSource(Protocol):
+    """A lamp or LED, and the knob that sets how bright it is (m2 §8.4).
+
+    The intensity is in the device's own units (``_native``): no profile says
+    what the ``DiaLamp``'s ``Intensity`` numbers are. A device with no such
+    knob reports ``None``, never a fake one.
+    """
+
+    def device(self) -> str:
+        """The light source's device label."""
+        ...
+
+    def intensity_knob(self) -> PropertyInfo | None:
+        """The property that sets how bright, read now; ``None``: none that smc knows."""
+        ...
+
+    def intensity_native(self) -> float | None:
+        """The knob's value, in its own units; ``None``: no knob."""
+        ...
+
+    def set_intensity_native(self, value: float) -> float:
+        """Set the knob; return the readback. Never clamped: outside its limits, refused."""
+        ...
+
+    def is_on(self) -> bool | None:
+        """Whether it is on; ``None``: no switch that smc knows."""
+        ...
+
+    def set_on(self, on: bool) -> bool:
+        """Switch it on or off; return the readback. Off is never refused."""
+        ...
+
+
+@runtime_checkable
+class Channels(Protocol):
+    """The stand's channels: the presets of the config group named for them (m2 §8.5)."""
+
+    def group(self) -> str:
+        """The config group whose presets are the channels."""
+        ...
+
+    def names(self) -> list[str]:
+        """The channels, as the group lists them; ``[]`` while the group does not exist."""
+        ...
+
+    def current(self) -> str | None:
+        """The first channel whose every setting matches the stand; ``None``: none does."""
+        ...
+
+    def preset(self, name: str) -> ChannelPreset:
+        """One channel's settings, as the running core holds them."""
+        ...
+
+    def select(self, name: str) -> str | None:
+        """Apply a channel; return the one the stand then matches (``None``: none).
+
+        Refused, and not forceable, for a preset that would move a stage, an
+        autofocus or the objective turret, or change a core slot.
+        """
+        ...
+
+    def capture(self, name: str) -> ChannelPreset:
+        """Record the stand's current illumination as channel ``name``, replacing one of that name.
+
+        Written to the profile's configuration file first, then to the
+        running core.
         """
         ...
 

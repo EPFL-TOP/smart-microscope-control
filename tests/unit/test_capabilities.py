@@ -9,7 +9,11 @@ import pytest
 from smc.hardware.capabilities import (
     XY,
     Autofocus,
+    ChannelPreset,
+    Channels,
     FocusStep,
+    LightSource,
+    ObjectiveTurret,
     PropertyInfo,
     XYStage,
     ZStage,
@@ -125,3 +129,87 @@ def test_a_class_without_focus_by_um_is_not_an_autofocus() -> None:
 def test_focus_step_is_frozen() -> None:
     with pytest.raises(dataclasses.FrozenInstanceError):
         FocusStep("z", 1.0, None).via = "offset"  # type: ignore[misc]
+
+
+def test_channel_preset_is_frozen_and_unsaved_by_default() -> None:
+    preset = ChannelPreset("Channel", "BF", (("DiaLamp", "Intensity", "210"),))
+    assert preset.saved_to is None
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        preset.name = "GFP"  # type: ignore[misc]
+
+
+class _TurretWithoutSelect:
+    def labels(self) -> list[str]:
+        return []
+
+    def current(self) -> str:
+        return ""
+
+    def pixel_size_um(self, label: str | None = None) -> float:
+        return 0.0
+
+
+class _Turret(_TurretWithoutSelect):
+    def select(self, label: str, *, confirm: bool = False) -> str:
+        return label
+
+
+class _LightWithoutSwitch:
+    def device(self) -> str:
+        return "LED"
+
+    def intensity_knob(self) -> None:
+        return None
+
+    def intensity_native(self) -> None:
+        return None
+
+    def set_intensity_native(self, value: float) -> float:
+        return value
+
+    def is_on(self) -> None:
+        return None
+
+
+class _Light(_LightWithoutSwitch):
+    def set_on(self, on: bool) -> bool:
+        return on
+
+
+class _ChannelsWithoutCapture:
+    def group(self) -> str:
+        return "Channel"
+
+    def names(self) -> list[str]:
+        return []
+
+    def current(self) -> None:
+        return None
+
+    def preset(self, name: str) -> ChannelPreset:
+        return ChannelPreset("Channel", name, ())
+
+    def select(self, name: str) -> str:
+        return name
+
+
+class _Channels(_ChannelsWithoutCapture):
+    def capture(self, name: str) -> ChannelPreset:
+        return ChannelPreset("Channel", name, ())
+
+
+@pytest.mark.parametrize(
+    ("protocol", "partial", "whole"),
+    [
+        (ObjectiveTurret, _TurretWithoutSelect, _Turret),
+        (LightSource, _LightWithoutSwitch, _Light),
+        (Channels, _ChannelsWithoutCapture, _Channels),
+    ],
+)
+def test_the_m2_protocols_need_every_method(
+    protocol: type, partial: type, whole: type
+) -> None:
+    # Microscope.override checks isinstance: a double missing the guarded
+    # call (select, set_on, capture) must not pass for the capability.
+    assert not isinstance(partial(), protocol)
+    assert isinstance(whole(), protocol)
