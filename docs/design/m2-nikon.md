@@ -245,7 +245,29 @@ first, then the offset device, then the stages.
   not locked, an offset change can still steer its search. The read is made
   inside the compound, under the microscope lock, where no other action can
   switch PFS on. Nothing is linked when the focus drive is not this module's
-  `MMZStage` (`Microscope.override`): there is no stop of it to link.
+  `MMZStage` (`Microscope.override`): there is no stop of it to link, so the
+  offset move looks for the focus drive first and, without one, reads no
+  PFS state (#158).
+- **What "cannot be read" covers** (#158). The core's AutoFocus slot is
+  checked first: a slot that names another device is a configuration error,
+  not a transient read failure, and refuses the offset move with nothing
+  sent (FM-87), as every other slot call does. Only a failed
+  `isContinuousFocusEnabled()` counts as on, and it is logged at WARNING,
+  since it is an assumption: `autofocus PFS: its state could not be read
+  before <description> (<error>); counted as on, so a Z stop during it
+  switches it off`.
+- **Why unknown means "on" here and a refusal elsewhere (FM-19, #158).**
+  `focus_by_um` and the Z interlock's `suspend` let the same failed read
+  raise, with nothing sent: they choose by it *what moves* (Z or the
+  offset; whether to engage PFS again after the Z move, which drives Z), so
+  a guess either way can move the wrong axis. The offset move does the same
+  thing whatever the read says; the read only decides whether the
+  operator's Z stop also reaches it. Counted as on, the worst outcome is a
+  switch-off that was not needed, after the operator asked for a stop.
+- **A capability that outlived its `Microscope`** (FM-92, #158): `engage`,
+  `set_offset_native` and `offset_by_native` look up the focus drive inside
+  the compound before anything else, and refuse with the facade's
+  `HardwareError`, with nothing read or sent, whatever PFS's state.
 - **Outcome of a Z stop once the call has sent something.** PFS is switched
   off, and the offset device is stopped while its move is pending or under
   way, before Z's own stop and inside one `hold_log` (FM-62). The call raises
@@ -254,8 +276,29 @@ first, then the offset device, then the stages.
   moving on ``, and the WARNING `autofocus PFS: left off, because autofocus:
   engage did not complete (MotionStoppedError)` is logged. `engage` keeps its
   contract: `False` means "no lock, and it is off". A Z stop is a raise, never
-  a `False`. When the Z stop's switch-off itself fails, no "left off" is
-  claimed; the error says PFS may still move Z (as for the relock).
+  a `False`.
+- **The call waits for the Z stop's outcome before it reports (FM-97,
+  #158).** A Z stop marks the link reached before the stopping thread sends
+  the switch-off, so a call whose block ends meanwhile (its lock found, its
+  offset move landed) would read "stopped, nothing failed" while the
+  switch-off is still on its way. Once its block has ended, a call that a Z
+  stop reached waits for that thread's linked stop to return, at most
+  `Z_STOP_OUTCOME_WAIT_S` (5 s, assumed: MMCore's default device timeout),
+  still under the microscope lock. This holds for every compound that links
+  the Z stop: the relock and a locked `focus_by_um` as well.
+- **When the Z stop's switch-off failed, or had not returned in time**, no
+  "left off" is claimed. The call raises `MotionStoppedError` naming Z:
+  `` `z ZDrive`: it was stopped during <description>, but autofocus PFS could
+  not be switched off (<failure>); it may still move Z: stop() and check the
+  stand, then resume(); read the position before moving on ``, chained from
+  whatever ended the block (its own motion stopped, as the offset device is
+  by the same Z stop; a lock found; a move that landed). Three endings go on
+  as they are: a give-up whose own error already says that PFS may still
+  move Z (`DeviceTimeoutError`, which keeps the motion registered), a halt
+  and an interrupt. The WARNING `autofocus PFS: the Z stop during
+  <description> could not switch it off (<failure>); it may still move Z` is
+  logged. A switch-off that had not returned names itself as the failure:
+  `its switch-off had not returned after 5 s`.
 - **A Z stop that came while the call waited for the microscope lock**
   cancels it with nothing sent (`MotionStoppedError`, "it was stopped before
   it started"). PFS is then as it was, so no "left off" WARNING is logged.
@@ -548,9 +591,15 @@ of the Z move. The CLI prints it as any `HardwareError` (exit 1).
   sent `enableContinuousFocus(False)`, `stop('PFSOffset')`, `stop('XYStage')`,
   `enableContinuousFocus(False)`, `stop('ZDrive')`. The second switch-off
   (and a second `stop('PFSOffset')` while an offset move is pending) repeats
-  what was sent just before, in the same order, and is idempotent. In
-  exchange, the compound knows a Z stop ended it: its caller gets
-  `MotionStoppedError` naming Z, and the "left off" WARNING is logged. A
+  what was sent just before, in the same order, and is idempotent. That
+  second switch-off is sent only while the relock still waits when Z's
+  stop goes out (FM-96, #158). On a stand whose stage stops are slow (over
+  a serial line), the relock may see PFS off at its next poll and end
+  first: the log then has one switch-off, the link is never reached, and
+  the caller gets the relock's own outcome, naming the autofocus, not Z.
+  PFS is off all the same. In exchange, when the link is reached, the
+  compound knows a Z stop ended it: its caller gets `MotionStoppedError`
+  naming Z, and the "left off" WARNING is logged. A
   failing link is then logged a second time, under the Z entry, with its
   own device in the message. Skipping the links would need a second
   mechanism next to the halt, for no change in what the stand does.
