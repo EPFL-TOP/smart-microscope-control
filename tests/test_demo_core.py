@@ -585,6 +585,38 @@ def test_a_config_that_fails_after_loading_devices_leaves_none_loaded(
 
 
 @pytest.mark.usefixtures("need_mm", "restored_path")
+def test_a_demo_configuration_that_fails_after_loading_devices_leaves_none_loaded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recording_cores: list[Any]
+) -> None:
+    # The demo branch of open_core has its own handler. The demo file is not
+    # ours to break, so the core is told to load a failing file of ours when
+    # open_core asks for the demo (the same call into MMCore, with a file).
+    import pymmcore_plus
+
+    cfg = tmp_path / "scope.cfg"
+    _write_cfg(cfg, _CFG_HEAD + _CFG_INIT + "Property,NoSuchLabel,Foo,1\n")
+
+    # pymmcore_plus.CMMCorePlus is the recording subclass of the fixture here,
+    # so the core this builds is appended to recording_cores too.
+    class DemoThatFails(pymmcore_plus.CMMCorePlus):
+        def loadSystemConfiguration(  # noqa: N802 - MMCore API
+            self, *args: Any, **kwargs: Any
+        ) -> Any:
+            return super().loadSystemConfiguration(str(cfg))
+
+    monkeypatch.setattr(pymmcore_plus, "CMMCorePlus", DemoThatFails)
+    with pytest.raises(CoreError) as raised:
+        open_core(None)
+    message = str(raised.value)
+    # Our phrase of the demo branch, and the line of the file the stand-in
+    # loaded: the demo handler ran, after the devices above that line loaded.
+    assert message.startswith("could not load the demo configuration: ")
+    assert "Property,NoSuchLabel,Foo,1" in message
+    assert len(recording_cores) == 1
+    assert _devices_beyond_core(recording_cores[0]) == []
+
+
+@pytest.mark.usefixtures("need_mm", "restored_path")
 def test_the_devices_of_the_failing_configs_load_when_the_file_is_valid(
     tmp_path: Path,
 ) -> None:
