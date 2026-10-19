@@ -93,7 +93,9 @@ the plan, do what it unlocks (labels, dependents), and end the session.
   unique under `tests/` (it has no packages, so pytest refuses a second
   `test_autofocus.py`), and every decided test value differs from the
   tolerance it is compared with (a 0.5 change against a 0.5 tolerance
-  cannot fail). #13's plan met both.
+  cannot fail). #13's plan met both. Run `ruff check` and `mypy` on the
+  prototype too: #148's plan prescribed a `del` of a closure variable,
+  which ruff rejects (F821).
 - **A new checklist entry is named by its text, never by a number.** The
   develop session takes the next free id when it writes the entry
   (`scripts/dev/next_fm_id.py`): #131's plan named FM-85, which #130 had
