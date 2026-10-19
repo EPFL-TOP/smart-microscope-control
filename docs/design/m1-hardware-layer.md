@@ -1423,6 +1423,14 @@ after a move waits for the move, then snaps.
   `DeviceTimeoutError` says whether the stop was sent, failed, or is
   impossible (a `State` device). A give-up does **not** advance the stop
   generation: it cancels nobody else's action.
+- **A give-up stops waiting before it stops the device.** It registers the
+  motion before it sends the stop (unknown counts as moving), and from
+  then on the holder no longer records "waiting for" it: the registry names
+  the motion in `moving()`. A caller that finds the lock held during the
+  give-up therefore waits for the lock, and the guard decides once the lock
+  is free: refused if the device still reads busy or cannot be read, run
+  if it is idle. Otherwise whether a queued action is refused would depend
+  on how long the stop, the busy check and the log line take (#101).
 - **`wait(timeout_s)`** is a read (above): it polls, takes no lock, and
   never stops anything.
 
