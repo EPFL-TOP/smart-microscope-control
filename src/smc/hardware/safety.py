@@ -820,13 +820,16 @@ class Executor:
 
         The holder waits for the motion from just before the command, which
         can block for the traverse or run a callback, until the device reads
-        idle. From then on the readback is an ordinary lock holder: a caller
-        that saw the stage idle and acts next waits for the lock instead of
-        being refused (#68). ``last_check`` runs after "waiting for" is
-        recorded, so nothing lies between it and the command (FM-66). When it
-        refuses, "waiting for" is cleared before the "not sent" line: that
-        line can block on a console (FM-62), and meanwhile ``moving()`` would
-        name, and contenders be refused for, a motion never commanded (#80).
+        idle or the action gives up on it. From then on the readback is an
+        ordinary lock holder: a caller that saw the stage idle and acts next
+        waits for the lock instead of being refused (#68). A give-up clears
+        "waiting for" as soon as the motion is registered, before the stop
+        and its log line, so a contender waits for the lock and meets the
+        guard (#101). ``last_check`` runs after "waiting for" is recorded, so
+        nothing lies between it and the command (FM-66). When it refuses,
+        "waiting for" is cleared before the "not sent" line: that line can
+        block on a console (FM-62), and meanwhile ``moving()`` would name,
+        and contenders be refused for, a motion never commanded (#80).
         """
         deadline = time.monotonic() + limit_s
         sending = idle = gave_up = False
@@ -852,7 +855,11 @@ class Executor:
                 )
             idle = self._poll_until_idle(motion, deadline)
             if not idle:
-                outcome = self._give_up(motion, f"{limit_s:g} s timeout")
+                outcome = self._give_up(
+                    motion,
+                    f"{limit_s:g} s timeout",
+                    registered=lambda: self._set_waiting(previous),
+                )
                 gave_up = True
                 if self._generation(motion.device) != generation:
                     # The caller asked for the stop: the move ended as stopped,
@@ -874,7 +881,11 @@ class Executor:
             return step.readback()
         except BaseException as exc:
             if sending and not (idle or gave_up):
-                self._give_up(motion, type(exc).__name__)
+                self._give_up(
+                    motion,
+                    type(exc).__name__,
+                    registered=lambda: self._set_waiting(previous),
+                )
             raise
         finally:
             self._set_waiting(previous)
@@ -1433,7 +1444,13 @@ class Executor:
         self._drop(motion.device, registration)
         return ""
 
-    def _give_up(self, motion: Motion, why: str) -> str:
+    def _give_up(
+        self,
+        motion: Motion,
+        why: str,
+        *,
+        registered: Callable[[], object] | None = None,
+    ) -> str:
         """Stop a motion its action stops watching, keep it registered while it moves, then log.
 
         The motion is registered before the stop is sent, since unknown counts
@@ -1444,8 +1461,16 @@ class Executor:
         never raises on its own account, so a failed stop never masks the
         failure that caused the give-up. Returns what happened, for the error
         message.
+
+        ``registered`` runs right after the registration, before the stop, the
+        busy check and the log line. The holder uses it to stop waiting for
+        the motion: the registry now carries it, so a contender waits for the
+        lock and meets the guard, instead of being refused or let through
+        depending on how long the stop and a log handler take (m1 §13, #101).
         """
         registration = self._track(motion)
+        if registered is not None:
+            registered()
         send = motion.stop
         if send is None:
             note = self._keep_while_moving(motion, registration)
