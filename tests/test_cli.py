@@ -1030,7 +1030,7 @@ def test_doctor_config_an_unexpected_error_is_one_line(
     config_core: Callable[..., list[_FailingCore]],
 ) -> None:
     # Not a device fault, so the proxy lets it through: what reports it is
-    # _reported around the branch, like every other command. The position read
+    # _Reported around the branch, like every other command. The position read
     # catches a HardwareError and nothing wider: a bug there is not turned into
     # a finding under the role table.
     config_core(**{failing_call: ValueError("boom")})

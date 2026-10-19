@@ -692,9 +692,15 @@ class Microscope:
                 failures.append(f"{kind}{f' {label!r}' if label else ''} ({exc!r})")
             except BaseException as exc:
                 interrupted = interrupted or exc
-        if interrupted is not None:
-            raise interrupted
-        return failures
+        try:
+            if interrupted is not None:
+                raise interrupted
+            return failures
+        finally:
+            # Caught in this frame: exception -> traceback -> this frame -> this
+            # local is a cycle that keeps the core until the cyclic collector
+            # (#148, FM-92).
+            del interrupted
 
     def _stop_one(self, capability: type | None, role: Role) -> None:
         """One entry of ``_STOPPED``: the autofocus switched off, a stage or the offset device stopped.

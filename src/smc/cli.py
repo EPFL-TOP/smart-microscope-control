@@ -9,17 +9,19 @@ from __future__ import annotations
 
 import codecs
 import contextlib
+import gc
 import logging
 import math
 import os
 import platform
 import secrets
 import sys
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, TextIO
+from types import TracebackType
+from typing import TYPE_CHECKING, Annotated, Any, Literal, TextIO
 
 import typer
 from rich.console import Console
@@ -181,19 +183,19 @@ _EXIT_REFUSED = 2
 _EXIT_INTERRUPTED = 130
 
 
-@contextlib.contextmanager
-def _reported(
-    ctx: typer.Context,
-    *,
-    force_hint: str = "",
-    after_report: Callable[[BaseException], None] | None = None,
-) -> Iterator[None]:
+class _Reported:
     """Turn what a command body raises into one ``✗`` line and an exit code.
 
     Wrapped around the ``with Microscope.open(...)`` block, so the stand is
     released before the line is printed. Ctrl-C is the ``KeyboardInterrupt``
     the Executor already turned into a stop of any move under way (FM-17);
     there is no signal handler (FM-70).
+
+    A class, not a ``@contextmanager`` generator: a generator that converts an
+    exception into another keeps the command's frames, and the stand with
+    them, in a reference cycle on Python 3.11+ (through contextlib's frame),
+    which only the cyclic collector frees, at the exit of the process (#148,
+    FM-92). It keeps no exception on ``self`` for the same reason.
 
     Args:
         ctx: The command's context; ``--debug`` lets every error through,
@@ -205,17 +207,40 @@ def _reported(
             diagnosis of a stand that would not open). Not called under
             ``--debug``, which prints the traceback instead of the line.
     """
-    try:
-        yield
-    except (typer.Exit, typer.Abort, typer.BadParameter):
-        raise
-    except (Exception, KeyboardInterrupt) as exc:
-        settings = ctx.find_object(_Settings)
+
+    def __init__(
+        self,
+        ctx: typer.Context,
+        *,
+        force_hint: str = "",
+        after_report: Callable[[BaseException], None] | None = None,
+    ) -> None:
+        self._ctx = ctx
+        self._force_hint = force_hint
+        self._after_report = after_report
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> Literal[False]:
+        # Never swallows: it lets the exception through or raises ``typer.Exit``.
+        if exc is None or isinstance(
+            exc, typer.Exit | typer.Abort | typer.BadParameter
+        ):
+            return False
+        if not isinstance(exc, Exception | KeyboardInterrupt):
+            return False
+        settings = self._ctx.find_object(_Settings)
         if settings is not None and settings.debug:
-            raise
-        code = _report(exc, force_hint)
-        if after_report is not None:
-            after_report(exc)
+            return False
+        code = _report(exc, self._force_hint)
+        if self._after_report is not None:
+            self._after_report(exc)
         raise typer.Exit(code=code) from None
 
 
@@ -313,7 +338,7 @@ def profiles(ctx: typer.Context) -> None:
     succeeds. A TOML file without a microscope table is not a profile and is
     skipped without a word (./pyproject.toml is on the search path).
     """
-    with _reported(ctx):
+    with _Reported(ctx):
         found: list[tuple[str, Path | None]] = list(list_profiles())
         if all(name != DEMO_NAME for name, _ in found):
             found = sorted([*found, (DEMO_NAME, None)], key=lambda entry: entry[0])
@@ -348,7 +373,7 @@ def devices(ctx: typer.Context, profile: ProfileOption = DEMO_NAME) -> None:
     and where the choice came from, so a wrong pick can be fixed in the
     profile.
     """
-    with _reported(ctx), Microscope.open(profile) as microscope:
+    with _Reported(ctx), Microscope.open(profile) as microscope:
         filled: dict[str, list[str]] = {}
         for role in Role:
             label = microscope.roles.get(role)
@@ -519,7 +544,7 @@ def doctor(
 
     if config is None:
         profile_checks: list[nikon.StandCheck] = []
-        with _reported(
+        with _Reported(
             ctx, after_report=lambda error: _diagnose_nikon(profile_checks, error)
         ):
             loaded = Profile.load(profile)
@@ -550,11 +575,11 @@ def doctor(
     config_checks = _nikon_checks(config, _install_dirs(st))
     _print_nikon_readiness(config_checks)
     # No profile, so no role: the raw core is read through the same proxy
-    # under the name "core" (#120). _reported wraps the whole block, so the
+    # under the name "core" (#120). _Reported wraps the whole block, so the
     # core is released before the one line is printed, and a bug that is not
     # a device fault is reported like on every other command.
     with (
-        _reported(
+        _Reported(
             ctx, after_report=lambda error: _diagnose_nikon(config_checks, error)
         ),
         core_mod.opened(config) as core,
@@ -582,8 +607,13 @@ def doctor(
             else:
                 rt.add_row("xy position", f"({x:.1f}, {y:.1f}) µm")
         console.print(rt)
-        if fault is not None:
-            raise fault
+        try:
+            if fault is not None:
+                raise fault
+        finally:
+            # Exception -> traceback -> this frame -> this local: a cycle that
+            # keeps the core until the cyclic collector (#148, FM-92).
+            del fault
     _ok(f"{target} loads and answers.")
 
 
@@ -615,7 +645,7 @@ def install_driver(
     system path, so there is nothing to copy for it. Exits 0 when the driver is
     in place, 1 when it is not.
     """
-    with _reported(ctx):
+    with _Reported(ctx):
         found = nikon.stand_for_key(stand)
         if found is None:
             keys = ", ".join(known.key for known in nikon.STANDS)
@@ -732,6 +762,8 @@ def discover(
         console.print(item)
     if write_error is not None:
         _fail(f"could not write the survey to {out}: {write_error}")
+        # Dropped with its traceback's frame once the line is printed (#148, FM-92).
+        del write_error
         raise typer.Exit(code=1)
     if written is not None:
         json_path, text_path = written
@@ -770,7 +802,7 @@ def _move_xy(
 ) -> None:
     """Open the stand, run ``move`` on its XY stage, print where it landed."""
     with (
-        _reported(ctx, force_hint=force_hint),
+        _Reported(ctx, force_hint=force_hint),
         Microscope.open(profile, dry_run=dry_run) as microscope,
     ):
         stage = microscope.require(XYStage)
@@ -793,7 +825,7 @@ def _move_z(
 ) -> None:
     """Open the stand, run ``move`` on its focus drive, print where it landed."""
     with (
-        _reported(ctx, force_hint=force_hint),
+        _Reported(ctx, force_hint=force_hint),
         Microscope.open(profile, dry_run=dry_run) as microscope,
     ):
         drive = microscope.require(ZStage)
@@ -808,7 +840,7 @@ def _move_z(
 @stage_app.command("get")
 def stage_get(ctx: typer.Context, profile: ProfileOption = DEMO_NAME) -> None:
     """Print where the XY stage reports it is, in µm."""
-    with _reported(ctx), Microscope.open(profile) as microscope:
+    with _Reported(ctx), Microscope.open(profile) as microscope:
         position = microscope.require(XYStage).position_um()
     _say(_xy(position))
 
@@ -861,7 +893,7 @@ def stage_jog(
 @z_app.command("get")
 def z_get(ctx: typer.Context, profile: ProfileOption = DEMO_NAME) -> None:
     """Print where the focus drive reports it is, in µm."""
-    with _reported(ctx), Microscope.open(profile) as microscope:
+    with _Reported(ctx), Microscope.open(profile) as microscope:
         z_um = microscope.require(ZStage).position_um()
     _say(_z(z_um))
 
@@ -955,8 +987,9 @@ def _replace(out: Path, write: Callable[[Path], object]) -> None:
     except BaseException as exc:
         if written and isinstance(exc, OSError):
             # strerror alone: str(exc) already names both files.
-            reason = exc.strerror or exc
-            raise OSError(f"{reason}; the new file is kept as {partial}") from exc
+            raise OSError(
+                f"{exc.strerror or exc}; the new file is kept as {partial}"
+            ) from exc
         with contextlib.suppress(OSError):
             partial.unlink()
         raise
@@ -1004,7 +1037,7 @@ def snap(
     exposure, the pixel size in µm (0.0 when unknown) and the stage position.
     """
     write_error: OSError | None = None
-    with _reported(ctx):
+    with _Reported(ctx):
         import tifffile
 
         with Microscope.open(profile) as microscope:
@@ -1051,6 +1084,8 @@ def snap(
         return
     _say(f"snapped (not written): {summary}")
     _fail(f"could not write {out}: {write_error}")
+    # Dropped with its traceback's frame once the line is printed (#148, FM-92).
+    del write_error
     raise typer.Exit(code=_EXIT_ERROR)
 
 
@@ -1061,11 +1096,29 @@ def main() -> None:
     callback: Click prints ``--help`` and exits before a callback ever runs,
     so the callback's own fix (kept for ``CliRunner``, which never goes
     through this entry point) never reaches it (FM-42).
+
+    Collects garbage once the command has ended, while the interpreter is
+    still whole. What a command left in a reference cycle is then freed here,
+    not by the cyclic collector during finalization, where destroying a
+    ``CMMCorePlus`` aborted the process when a thread was still inside MMCore
+    (#142, FM-92). Click ends a command with ``SystemExit``; its exit code is
+    re-raised once the exception and its traceback are gone, which is what
+    keeps the command's frames from being alive during the collection. An
+    exception that escapes ``app()`` (``--debug``) keeps its traceback, and so
+    its frames, alive until the interpreter exits: it is not covered.
     """
     for stream in (sys.stdout, sys.stderr):
         if stream is not None:
             tolerate_unencodable_output(stream)
-    app()
+    exited = False
+    code: int | str | None = None  # SystemExit.code's type
+    try:
+        app()
+    except SystemExit as exc:
+        exited, code = True, exc.code
+    gc.collect()
+    if exited:
+        sys.exit(code)
 
 
 if __name__ == "__main__":  # pragma: no cover

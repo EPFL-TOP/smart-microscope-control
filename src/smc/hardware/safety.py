@@ -694,21 +694,29 @@ class Executor:
         if motion is not None and overridden_by is not None:
             raise ValueError("a motion is overridden by its own stop, not a SafeCall")
         limit: float | Callable[[], float] = 0.0 if timeout_s is None else timeout_s
-        cancelled: HardwareError
+        # What a refusal raises, in a list the ``finally`` at the end empties:
+        # ``body`` and ``last_check`` close over it, and the exception raised
+        # through them has their frames on its traceback, so a name here would
+        # be exception -> traceback -> frame -> cell -> exception, a cycle that
+        # keeps the core until the cyclic collector (#148, FM-92). Not a ``del``
+        # of the closure's variable: ruff then reads its uses as undefined.
+        cancelled: list[HardwareError]
         if motion is not None:
             key: str | None = motion.device
-            cancelled = MotionStoppedError(
-                motion.name, "it was stopped before it started"
-            )
+            cancelled = [
+                MotionStoppedError(motion.name, "it was stopped before it started")
+            ]
         elif overridden_by is not None:
             key = overridden_by.device
-            cancelled = HardwareError(
-                f"`{description}` was not sent: `{overridden_by.log}` was "
-                f"requested after it was called; call it again if it is still "
-                f"wanted"
-            )
+            cancelled = [
+                HardwareError(
+                    f"`{description}` was not sent: `{overridden_by.log}` was "
+                    f"requested after it was called; call it again if it is still "
+                    f"wanted"
+                )
+            ]
         else:
-            key, cancelled = None, HardwareError(description)  # never raised
+            key, cancelled = None, [HardwareError(description)]  # never raised
         # Recorded before waiting for the lock: a stop (or a close) or a halt
         # pressed while this call waits for it cancels the call. Nested in a
         # compound, the compound's call is this action's: a stop pressed while
@@ -729,7 +737,7 @@ class Executor:
             limit_s = 0.0
             if motion is not None and not self._dry_run:
                 limit_s = _resolve_timeout(limit)
-            self._refuse_if_cancelled(key, generation, halt_mark, cancelled)
+            self._refuse_if_cancelled(key, generation, halt_mark, cancelled[0])
             if self._dry_run:
                 self._log(logging.INFO, "[dry-run] %s", prepared.log)
                 return prepared.dry_result
@@ -739,7 +747,7 @@ class Executor:
                 # FM-66: the halt or a stop may have landed while the line
                 # above was written; the check that matters is the last one.
                 # Its caller writes the "not sent" line (#80).
-                self._refuse_if_cancelled(key, generation, halt_mark, cancelled)
+                self._refuse_if_cancelled(key, generation, halt_mark, cancelled[0])
 
             if motion is not None:
                 return self._move(prepared, motion, generation, limit_s, last_check)
@@ -755,7 +763,11 @@ class Executor:
             prepared.send()
             return prepared.readback()
 
-        return self._section(description, body, halt_mark)
+        try:
+            return self._section(description, body, halt_mark)
+        finally:
+            # Safe: ``body`` and ``last_check`` ran inside ``_section``.
+            cancelled.clear()
 
     def _send_overridable(
         self,
@@ -970,9 +982,14 @@ class Executor:
         called = self._compound_called()
         if called is None:
             return
-        self._refuse_if_cancelled(
-            device, called.generations.get(device, 0), called.halt_mark, cancelled
-        )
+        try:
+            self._refuse_if_cancelled(
+                device, called.generations.get(device, 0), called.halt_mark, cancelled
+            )
+        finally:
+            # A parameter raised through this frame: exception -> traceback ->
+            # frame -> local (#148, FM-92).
+            del cancelled
 
     def give_up(self, motion: Motion, why: str) -> str:
         """Stop ``motion`` and keep it registered while it still moves; what happened.
@@ -1181,7 +1198,12 @@ class Executor:
         else:
             error = self._send_stop(motion, send)
         if error is not None:
-            raise error
+            try:
+                raise error
+            finally:
+                # Exception -> traceback -> this frame -> this local: a cycle
+                # that keeps the core until the cyclic collector (#148, FM-92).
+                del error
 
     def _send_stop(self, motion: Motion, send: Callable[[], None]) -> Exception | None:
         """``motion``'s own stop, then its registration released; what it raised, if anything."""
@@ -1211,10 +1233,15 @@ class Executor:
                 failure = failure or exc
             except BaseException as exc:
                 interrupted = interrupted or exc
-        error = self._send_stop(motion, send)
-        if interrupted is not None:
-            raise interrupted
-        return error or failure
+        try:
+            error = self._send_stop(motion, send)
+            if interrupted is not None:
+                raise interrupted
+            return error or failure
+        finally:
+            # Both were caught in this frame, so each is a cycle: exception ->
+            # traceback -> this frame -> this local (#148, FM-92).
+            del interrupted, failure
 
     def safe(self, call: SafeCall, readback: Callable[[], T]) -> T:
         """Send ``call`` (closing a shutter) now, then read back; design §13.
@@ -1234,7 +1261,11 @@ class Executor:
             self._generations[call.device] = self._generations.get(call.device, 0) + 1
         error = self._send_safe(call.send, call.log, level=logging.INFO)
         if error is not None:
-            raise error
+            try:
+                raise error
+            finally:
+                # The cycle of stop(): exception -> traceback -> frame -> local (#148, FM-92).
+                del error
         return readback()
 
     def halt(self) -> None:
@@ -1307,8 +1338,23 @@ class Executor:
             return run()
         finally:
             self._held.lines = None
+            self._write_held(lines)
+
+    def _write_held(self, lines: list[tuple[int, str, tuple[object, ...]]]) -> None:
+        """Write the lines ``hold_log`` kept, in order, and leave the list empty.
+
+        A held record's arguments can be the error a stop raised (``%r`` of
+        it), and the list is a local of ``hold_log``, whose frame is on that
+        error's traceback: error -> traceback -> frame -> list -> record ->
+        error, a cycle that keeps the core until the cyclic collector (#148,
+        FM-92). Emptied in a ``finally``, so an interrupt that cuts the writing
+        leaves none behind either.
+        """
+        try:
             for level, msg, args in lines:
                 self._logger.log(level, msg, *args)
+        finally:
+            lines.clear()
 
     # --- helpers -----------------------------------------------------------
 
@@ -1349,7 +1395,12 @@ class Executor:
         if halted:
             raise MicroscopeHaltedError()
         if moved:
-            raise cancelled
+            try:
+                raise cancelled
+            finally:
+                # A parameter raised through this frame: exception -> traceback
+                # -> frame -> local (#148, FM-92).
+                del cancelled
 
     def _poll_until_idle(self, motion: Motion, deadline: float) -> bool:
         """Poll ``motion`` until idle (``True``) or the deadline (``False``)."""
@@ -1535,7 +1586,12 @@ class Executor:
                 self._log(level, "%s%s", what, note)
             else:
                 self._log(logging.WARNING, "%s failed (%r)%s", what, error, note)
-        return error
+        try:
+            return error
+        finally:
+            # Caught in this frame, so exception -> traceback -> this frame ->
+            # this local is a cycle; the caller has the exception now (#148, FM-92).
+            del error
 
     def _log(self, level: int, msg: str, *args: object) -> None:
         """Write a line now, or keep it for the ``hold_log`` this thread is inside.
