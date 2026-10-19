@@ -30,9 +30,12 @@ import logging
 import threading
 import weakref
 from collections.abc import Callable, Iterator
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
+import tifffile
+import typer
 from pymmcore_plus import CMMCorePlus
 
 import smc.cli as cli
@@ -112,6 +115,19 @@ def test_main_collects_what_a_command_left_in_a_cycle_before_it_exits(
     assert [ref() is not None for ref in watched] == [False]
 
 
+def test_main_lets_an_exception_that_escapes_app_through_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `--debug`: the traceback is what the operator asked for, and the exit
+    # code is Python's. Only a SystemExit is held back for the collection.
+    def fake_app() -> None:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(cli, "app", fake_app)
+    with pytest.raises(RuntimeError, match=r"^boom$"):
+        cli.main()
+
+
 # --- a CLI command that ends in an error frees its core ---------------------
 
 
@@ -178,6 +194,21 @@ def test_a_cli_command_that_ends_in_an_error_frees_its_core(
     assert _alive(watched) == _FACADE_AND_CORE_FREED
 
 
+def test_snap_whose_file_cannot_be_written_frees_its_core(
+    no_cyclic_gc: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The frame was taken, so `snap` keeps the write error to print it after
+    # the stand is released: that local is on its own traceback (FM-34, #148).
+    def denied(*args: object, **kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(tifffile, "imwrite", denied)
+    out = tmp_path / "frame.tif"
+    exit_code, watched = _run_cli(monkeypatch, FakeCore, ["snap", "--out", str(out)])
+    assert exit_code == 1
+    assert _alive(watched) == _FACADE_AND_CORE_FREED
+
+
 def test_a_cli_command_that_succeeds_frees_its_core(
     no_cyclic_gc: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -185,6 +216,33 @@ def test_a_cli_command_that_succeeds_frees_its_core(
     exit_code, watched = _run_cli(monkeypatch, FakeCore, ["stage", "get"])
     assert exit_code == 0
     assert _alive(watched) == _FACADE_AND_CORE_FREED
+
+
+def _context() -> typer.Context:
+    return typer.Context(typer.main.get_command(cli.app))
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        pytest.param(lambda: typer.Exit(code=3), id="exit"),
+        pytest.param(typer.Abort, id="abort"),
+        pytest.param(lambda: typer.BadParameter("x"), id="bad-parameter"),
+        pytest.param(lambda: SystemExit(4), id="system-exit"),
+        pytest.param(GeneratorExit, id="generator-exit"),
+    ],
+)
+def test_reported_lets_what_is_not_a_failure_of_the_command_through(
+    make: Callable[[], BaseException], capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Click's own flow (an exit, an abort, a bad parameter) and what is not an
+    # error of the command's own (a SystemExit) keep their meaning.
+    error = make()
+    with pytest.raises(type(error)) as raised, cli._Reported(_context()):
+        raise error
+    assert raised.value is error
+    shown = capsys.readouterr()
+    assert (shown.out, shown.err) == ("", "")
 
 
 # --- a failed stop or switch-off frees the core -----------------------------
@@ -302,11 +360,11 @@ def test_a_second_ctrl_c_in_the_emergency_stop_frees_the_core(
     assert _alive(watched) == _FACADE_AND_CORE_FREED
 
 
-def _executor() -> Executor:
+def _executor(logger: logging.Logger | None = None) -> Executor:
     return Executor(
         dry_run=False,
         lock=threading.RLock(),
-        logger=logging.getLogger("test.error-exits"),
+        logger=logger or logging.getLogger("test.error-exits"),
     )
 
 
@@ -348,6 +406,42 @@ def test_a_linked_stop_that_raises_still_stops_the_device_and_is_freed(
         outcome = _outcome(lambda: executor.stop(z))
     assert outcome == (raised.__name__, "linked stop")
     assert stops == ["Z"]
+    assert [ref() is not None for ref in watched] == [False]
+
+
+class _StopRefusedError(RuntimeError):
+    """A subclass: a built-in exception cannot be weakly referenced."""
+
+
+class _InterruptsOnAFailedStop(logging.Handler):
+    """A handler whose write of the line of a failed stop is cut by a second Ctrl-C."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if "failed" in record.getMessage():
+            raise KeyboardInterrupt("second Ctrl-C")
+
+
+def test_a_second_ctrl_c_while_the_held_lines_are_written_frees_the_error(
+    no_cyclic_gc: None,
+) -> None:
+    # A held line's arguments hold the error of the failed stop, and the list
+    # is a local of `hold_log`'s frame: `_write_held` empties it in a `finally`.
+    logging.disable(logging.NOTSET)  # the autouse fixture restores it
+    logger = logging.getLogger("test.error-exits.interrupted-write")
+    logger.propagate = False
+    handler = _InterruptsOnAFailedStop()
+    logger.addHandler(handler)
+    try:
+        executor, watched = _executor(logger), []
+
+        def refuse() -> None:
+            raise _built(watched, _StopRefusedError("stop refused"))
+
+        xy = Motion("XY", "xy_stage XY", lambda: False, refuse)
+        outcome = _outcome(lambda: executor.hold_log(lambda: executor.stop(xy)))
+    finally:
+        logger.removeHandler(handler)
+    assert outcome == ("KeyboardInterrupt", "second Ctrl-C")
     assert [ref() is not None for ref in watched] == [False]
 
 
