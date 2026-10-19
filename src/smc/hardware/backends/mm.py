@@ -49,9 +49,10 @@ from __future__ import annotations
 import functools
 import logging
 import math
+import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
@@ -78,6 +79,7 @@ if TYPE_CHECKING:
 __all__ = [
     "DEFAULT_LOCK_TIMEOUT_S",
     "MAX_LOCK_TIMEOUT_S",
+    "Z_STOP_OUTCOME_WAIT_S",
     "MMAutofocus",
     "MMCamera",
     "MMProperties",
@@ -93,6 +95,11 @@ __all__ = [
 #: lock_timeout_s``. It is nikon-control's figure, never measured, so it is
 #: labelled as assumed wherever it shows (m2 §3.2). Read at call time.
 DEFAULT_LOCK_TIMEOUT_S = 5.0
+#: How long a call that a Z stop reached waits for that stop's switch-off to
+#: return before it reports (FM-97, m2 §3.3.1). Assumed: MMCore's default
+#: device timeout, never measured on a PFS. Read at call time, so that a test
+#: can shorten it.
+Z_STOP_OUTCOME_WAIT_S = 5.0
 #: The longest lock wait ``engage`` accepts: the wait holds the microscope
 #: lock, so every other action waits behind it (FM-32).
 MAX_LOCK_TIMEOUT_S = 600.0
@@ -500,6 +507,11 @@ def _yes_no(value: bool | None) -> str:
     return "unknown" if value is None else ("yes" if value else "no")
 
 
+def _named(failure: BaseException) -> str:
+    """``failure`` for a message: an interrupt's ``str()`` is empty, so its type names it."""
+    return str(failure) or type(failure).__name__
+
+
 def _check_autofocus_slot(core: CMMCorePlus, label: str) -> None:
     """Refuse unless the core's AutoFocus slot names ``label`` (FM-87).
 
@@ -554,8 +566,12 @@ class _ZStop:
     #: The offset move is about to be sent or under way: the Z stop stops
     #: the offset device too, which also cancels a move not sent yet.
     offset_pending: bool = False
-    #: What the Z stop's switch-off raised: it may still be on.
-    switch_off_failure: Exception | None = None
+    #: What the Z stop's switch-off raised: it may still be on. An interrupt
+    #: counts, since whether the switch-off went out is then unknown.
+    switch_off_failure: BaseException | None = None
+    #: Set by the stopping thread once its linked stop has returned or raised:
+    #: the link is marked reached before the switch-off is sent (FM-97).
+    finished: threading.Event = field(default_factory=threading.Event)
 
     @property
     def fired(self) -> bool:
@@ -777,10 +793,14 @@ class MMAutofocus:
                 stand refuses actions until ``stop()`` or ``resume()``.
             MotionStoppedError: ``disengage()`` or a stop cancelled the wait;
                 a ``ZStage.stop()`` left it off (named ``z <label>``), or
-                cancelled the call before anything was sent.
+                could not switch it off, or not in time, and then says it may
+                still move Z; or it cancelled the call before anything was
+                sent.
             HardwareError: Its state could not be read once the wait ended. It
                 was given up on as at the deadline: switched off, or still
-                registered as a motion if that failed too.
+                registered as a motion if that failed too. Or the Microscope
+                it belongs to no longer exists (FM-92); nothing was read or
+                sent.
         """
         limit_s, assumed = self._lock_timeout(timeout_s)
         description = "autofocus: engage"
@@ -1024,9 +1044,19 @@ class MMAutofocus:
         set before the link is, so that no Z stop falls between the two;
         the caller clears it once the offset move has returned.
 
-        When the Z stop's switch-off failed, it may still be on: no "left
-        off" is claimed. The block's own error goes on (a lock wait that
-        then gave up says what it found), or one naming the failure.
+        Once the block has ended, a call that a Z stop reached waits for
+        that stop's linked call to return, at most ``Z_STOP_OUTCOME_WAIT_S``,
+        still under the microscope lock (FM-97): the link is marked reached
+        before the stopping thread sends the switch-off, so a block that its
+        lock or its landed move ended meanwhile would otherwise report "left
+        off" while the switch-off is still on its way, and may yet fail.
+        When the switch-off failed, or had not returned in time, it may
+        still be on: no "left off" is claimed, the "may still move Z" WARNING
+        is logged, and the call raises ``MotionStoppedError`` naming Z and
+        the failure, chained from whatever ended the block (m2 §3.3.1).
+        Three endings go on as they are: a ``DeviceTimeoutError`` (a give-up
+        whose own error says it may still move Z, with its motion still
+        registered), a halt and an interrupt.
 
         While halted, the emergency stop switches the autofocus off and stops
         the offset device itself, in its own order (m2 §3.11): the Z stop
@@ -1054,9 +1084,14 @@ class MMAutofocus:
                 refused = exc is before or isinstance(exc, MicroscopeHaltedError)
                 if not (stopped.fired or (suspended and refused)):
                     raise
-                if stopped.switch_off_failure is not None:
-                    self._log_not_switched_off(description, stopped.switch_off_failure)
-                    raise
+                failure = self._z_stop_failure(stopped) if stopped.fired else None
+                if failure is not None:
+                    self._log_not_switched_off(description, failure)
+                    if isinstance(
+                        exc, (DeviceTimeoutError, MicroscopeHaltedError)
+                    ) or not isinstance(exc, Exception):
+                        raise
+                    raise self._not_switched_off(name, description, failure) from exc
                 if isinstance(exc, MicroscopeHaltedError) or not isinstance(
                     exc, Exception
                 ):
@@ -1067,16 +1102,12 @@ class MMAutofocus:
                 raise error from exc
             if stopped.fired:
                 # It locked, then the stop switched it off: not a success.
-                failure = stopped.switch_off_failure
+                failure = self._z_stop_failure(stopped)
                 if failure is not None:
                     self._log_not_switched_off(description, failure)
-                    raise MotionStoppedError(
-                        name,
-                        f"it was stopped during {description}, but autofocus "
-                        f"{self._label} could not be switched off ({failure}); it "
-                        f"may still move Z: stop() and check the stand, then "
-                        f"resume()",
-                    ) from failure
+                    raise self._not_switched_off(name, description, failure) from (
+                        failure
+                    )
                 error = self._z_stopped(name, description)
                 self._log_left_off(description, error)
                 raise error
@@ -1096,20 +1127,54 @@ class MMAutofocus:
         §3.11): a stop of an offset move not sent yet cancels it. Without an
         offset device, the offset move is the autofocus device's own, keyed
         by its label: the switch-off cancels it. Each failure is raised to
-        the stopping caller, the switch-off's first.
+        the stopping caller, the switch-off's first. ``finished`` is set
+        however it ends, so that the compound's wait for it never outlasts
+        it; an interrupt in the switch-off is recorded as its failure, since
+        whether it went out is then unknown. It never takes the microscope
+        lock: the compound waits for it while holding that lock.
         """
-        failure: Exception | None = None
         try:
-            self._executor.safe(self._off, lambda: None)
-        except Exception as exc:
-            stopped.switch_off_failure = failure = exc
-        if self._offset_label is not None and stopped.offset_pending:
+            failure: Exception | None = None
             try:
-                self._executor.stop(self._offset_motion)
+                self._executor.safe(self._off, lambda: None)
             except Exception as exc:
-                failure = failure or exc
-        if failure is not None:
-            raise failure
+                stopped.switch_off_failure = failure = exc
+            except BaseException as exc:
+                stopped.switch_off_failure = exc
+                raise
+            if self._offset_label is not None and stopped.offset_pending:
+                try:
+                    self._executor.stop(self._offset_motion)
+                except Exception as exc:
+                    failure = failure or exc
+            if failure is not None:
+                raise failure
+        finally:
+            stopped.finished.set()
+
+    def _z_stop_failure(self, stopped: _ZStop) -> BaseException | None:
+        """What the Z stop's switch-off raised, once it has returned; waited for, bounded (FM-97).
+
+        A switch-off that has not returned by ``Z_STOP_OUTCOME_WAIT_S`` counts
+        as failed: it may never get through, and "left off" would then be a
+        claim nobody checked.
+        """
+        wait_s = float(Z_STOP_OUTCOME_WAIT_S)  # at call time, so a test can shorten it
+        if not stopped.finished.wait(wait_s):
+            return DeviceTimeoutError(
+                f"its switch-off had not returned after {wait_s:g} s"
+            )
+        return stopped.switch_off_failure
+
+    def _not_switched_off(
+        self, name: str, description: str, failure: BaseException
+    ) -> MotionStoppedError:
+        return MotionStoppedError(
+            name,
+            f"it was stopped during {description}, but autofocus {self._label} "
+            f"could not be switched off ({_named(failure)}); it may still move Z: "
+            f"stop() and check the stand, then resume()",
+        )
 
     def _z_stopped(self, name: str, description: str) -> MotionStoppedError:
         return MotionStoppedError(
@@ -1127,13 +1192,13 @@ class MMAutofocus:
             type(raised).__name__,
         )
 
-    def _log_not_switched_off(self, description: str, failure: Exception) -> None:
+    def _log_not_switched_off(self, description: str, failure: BaseException) -> None:
         logger.warning(
             "autofocus %s: the Z stop during %s could not switch it off (%s); it "
             "may still move Z",
             self._label,
             description,
-            failure,
+            _named(failure),
         )
 
     def _not_locked_again(self, limit_s: float, assumed: bool, ended: _Lock) -> str:
@@ -1214,13 +1279,18 @@ class MMAutofocus:
                 <label>``): during the move, it was switched off and the
                 offset device stopped; while the call waited for the
                 microscope lock, nothing was sent and it was left as it was.
+                When the Z stop's switch-off failed or had not returned, the
+                error says it may still move Z.
+            HardwareError: The Microscope it belongs to no longer exists
+                (FM-92), or the core's AutoFocus slot names another device
+                (FM-87); nothing was read or sent.
         """
         value = float(value)
         # Before the compound: a refused change takes no lock and reads nothing.
         self._safety.check_offset_target_native(value)
+        description = self._describe_move_to(value)
         return self._linked_offset_move(
-            f"autofocus_offset: move_to {value} {self._unit()}",
-            lambda: self._set_offset(value),
+            description, lambda: self._set_offset(description, value)
         )
 
     def offset_by_native(self, delta: float, *, force: bool = False) -> float:
@@ -1238,18 +1308,23 @@ class MMAutofocus:
                 is outside the offset's soft limits or, locked, past the Z soft
                 limits (not forceable); nothing was sent.
             MotionStoppedError: As for ``set_offset_native``.
+            HardwareError: As for ``set_offset_native``.
         """
         delta = float(delta)
         self._safety.check_offset_jog_native(delta, force=force)
+        description = self._describe_move_by(delta)
         return self._linked_offset_move(
-            f"autofocus_offset: move_by {delta} {self._unit()}",
-            lambda: self._offset_by(delta, force=force),
+            description, lambda: self._offset_by(description, delta)
         )
 
-    def _set_offset(self, value: float) -> float:
-        """``set_offset_native``'s action, not linked to the Z stop."""
-        self._safety.check_offset_target_native(value)
-        description = f"autofocus_offset: move_to {value} {self._unit()}"
+    def _describe_move_to(self, value: float) -> str:
+        return f"autofocus_offset: move_to {value} {self._unit()}"
+
+    def _describe_move_by(self, delta: float) -> str:
+        return f"autofocus_offset: move_by {delta} {self._unit()}"
+
+    def _set_offset(self, description: str, value: float) -> float:
+        """``set_offset_native``'s action, not linked to the Z stop; its caller guarded ``value``."""
 
         def step() -> Step[float]:
             self._check_implied_z(value)
@@ -1257,13 +1332,14 @@ class MMAutofocus:
 
         return self._offset_move(description, step)
 
-    def _offset_by(self, delta: float, *, force: bool) -> float:
+    def _offset_by(self, description: str, delta: float) -> float:
         """``offset_by_native``'s action, not linked: ``focus_by_um`` holds its own link.
 
         A second link, nested in ``focus_by_um``'s, would send the switch-off
-        and the offset device's stop twice on one Z stop.
+        and the offset device's stop twice on one Z stop. Its caller ran the
+        jog guard; the target's guards run here, on the anchor read inside
+        the action.
         """
-        self._safety.check_offset_jog_native(delta, force=force)
         unit = self._unit()
 
         def relative() -> Step[float]:
@@ -1275,7 +1351,7 @@ class MMAutofocus:
                 f"autofocus_offset: move_by {delta} {unit} to {value} {unit}", value
             )
 
-        return self._offset_move(f"autofocus_offset: move_by {delta} {unit}", relative)
+        return self._offset_move(description, relative)
 
     def _linked_offset_move(self, description: str, move: Callable[[], float]) -> float:
         """``move``, as one compound, ended by a ``ZStage.stop()`` while PFS is on (m2 §3.3.1).
@@ -1285,11 +1361,16 @@ class MMAutofocus:
         the offset moves a lens and no Z (assumed until the PFS session, m2 §4
         item 5), so the Z stop leaves the move alone and nothing claims PFS
         was "left off". The state is read under the microscope lock, where no
-        other action can switch PFS on before the move.
+        other action can switch PFS on before the move. The focus drive is
+        looked up first: without one of this module there is no stop to
+        link, so no state is read, and a ``Microscope`` that no longer
+        exists refuses the move whatever PFS's state (FM-92).
         """
 
         def run() -> float:
-            if not self._engaged_or_unknown():
+            if self._focus_key() is None:
+                return move()
+            if not self._engaged_or_unknown(description):
                 return move()
             with self._ended_by_a_z_stop(
                 description, suspended=False, offset_pending=True
@@ -1300,15 +1381,31 @@ class MMAutofocus:
 
         return self._executor.compound(description, run)
 
-    def _engaged_or_unknown(self) -> bool:
-        """Whether it is on; unknown counts as on (FM-19), since on, it may drive Z."""
+    def _engaged_or_unknown(self, description: str) -> bool:
+        """Whether it is on before ``description``; a failed read counts as on (FM-19).
+
+        The slot is checked first and refuses (FM-87): a slot that names
+        another device is a configuration error, not a transient read
+        failure. Only a failed ``isContinuousFocusEnabled()`` is counted as
+        on, and labelled as assumed at WARNING. The policy differs from
+        ``focus_by_um``'s and ``suspend``'s, which let the same failed read
+        raise (m2 §3.3.1): they choose by it what moves (Z or the offset;
+        whether PFS is engaged again after a Z move, which drives Z), so a
+        guess either way can move the wrong axis. The offset move does the
+        same thing whatever the read says; the read only decides whether
+        the operator's Z stop also reaches it, and counted as on, the worst
+        outcome is a switch-off nobody needed after a stop was asked for.
+        """
+        self._check_slot()
         try:
-            return self._read_engaged()
-        except HardwareError:
-            logger.debug(
-                "autofocus %s: state unreadable before an offset move; counted as on",
+            return bool(self._core.isContinuousFocusEnabled())
+        except HardwareError as exc:
+            logger.warning(
+                "autofocus %s: its state could not be read before %s (%s); counted "
+                "as on, so a Z stop during it switches it off",
                 self._label,
-                exc_info=True,
+                description,
+                exc,
             )
             return True
 
@@ -1363,10 +1460,13 @@ class MMAutofocus:
             # PFS follows the offset and drives Z by about dz_um: the Z soft
             # limits, which no Z move may pass even forced, bound it too.
             self._safety.check_z_target_um(focus.position_um() + dz_um)
+        delta = dz_um * factor
+        # Before the link: a refused jog never touches the Z stop's link.
+        self._safety.check_offset_jog_native(delta, force=force)
         with self._ended_by_a_z_stop(
             description, suspended=False, offset_pending=True
         ) as stopped:
-            offset = self._offset_by(dz_um * factor, force=force)
+            offset = self._offset_by(self._describe_move_by(delta), delta)
             stopped.offset_pending = False
             self._refuse_relock_after_disengage(description, stopped)
             limit_s, assumed = self._lock_timeout(None)
