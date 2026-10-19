@@ -1538,9 +1538,15 @@ class Executor:
             f"{motion.name}: stop after {why}",
             then=lambda _: self._keep_while_moving(motion, registration),
         )
-        if error is None:
-            return "the stop was sent"
-        return f"the stop failed ({error!r}), so it may still be moving"
+        try:
+            if error is None:
+                return "the stop was sent"
+            return f"the stop failed ({error!r}), so it may still be moving"
+        finally:
+            # A returned error reaches this frame through its traceback's
+            # `f_back` (`_send_safe`'s frame): exception -> traceback -> frame
+            # -> local (#163, FM-98).
+            del error
 
     def _send_safe(
         self,
