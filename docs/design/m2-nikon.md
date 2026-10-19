@@ -1,8 +1,8 @@
 # M2 design — Nikon on hardware
 
 - **Status**: design for issue #13 (§1–§6, 2026-10-16); §3.3.1 and
-  §3.11's stop rules decided in #144 (2026-10-18). #12, #14, #15 and
-  #48 add their own sections with their plans.
+  §3.11's stop rules decided in #144 (2026-10-18); §7 for #12
+  (2026-10-19). #14, #15 and #48 add their own sections with their plans.
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1, this document is the contract between issues that are
   built in parallel. Names, module paths and signatures below are fixed; an
@@ -19,7 +19,7 @@ M1 §2 (conventions), §3, §6, §7, §8 and §13 (motion, stop and the lock);
 M2 brings the Nikon stands under the layer: the `Autofocus` capability and
 the Z interlock (#13), `ObjectiveTurret`, `LightSource` and `Channels`
 (#14), the stand knowledge from `nikon-control` (#12), the configuration
-builder (#15) and a truthful probe (#48). This version fixes #13 only.
+builder (#15) and a truthful probe (#48). §1–§6 fix #13; §7 fixes #12.
 
 Not in #13: one-shot autofocus (`fullFocus`), a CLI command for the
 autofocus, the piezo (§2), camera-clocked sequences, and the Zeiss
@@ -655,7 +655,7 @@ The sample is a dish or plate with cells, focused by eye first.
 | #13 | `capabilities.py`, `errors.py`, `safety.py`, `backends/mm.py`, `microscope.py`, `profile.py`, `testing/fakes.py`, `tests/contracts/conftest.py`, `profiles/demo.toml`, `profiles/README.md` | first |
 | #14 | the same capability, backend, facade, fake and contract modules | after #13 merges |
 | #106, #111, #112 | `profile.py` | one at a time, not beside #13 |
-| #12 | `profiles/nikon-*.toml`, a Nikon backend module | its plan decides, and fixes the Ti2-E profile's form and where its configuration file lives (`nikon-ti2.md`, *Profile entries, measured*); its profiles use §3.9's keys once #13 is merged |
+| #12 | `backends/nikon.py`, `discovery/dll_probe.py`, `discovery/_dll_child.py`, `discovery/__init__.py`, `discovery/models.py`, `discovery/report.py`, `cli.py`, `profiles/nikon-*`, `profiles/README.md` (§7) | after #13; before #48 and #15, which touch the same discovery and CLI modules |
 
 ## 6. Not verified
 
@@ -664,3 +664,339 @@ The sample is a dish or plate with cells, focused by eye first.
 - That `nikon-control`'s 5 s lock wait is enough (§3.2 labels it assumed).
 - The lock-wait motion on a real stand: that `isContinuousFocusLocked()`
   reads `False` while PFS searches and `True` once it holds (§3.3).
+
+## 7. Nikon stand knowledge (#12)
+
+Extends M1 §1 (module map), §9 (commands) and §10 (`smc discover`).
+Sources: `nikon-control` (`scope/stand.py`, `scope/discover.py`,
+`scope/config_build.py`, read 2026-10-19), `docs/hardware/inventory.md` and
+session 0 (`nikon-ti2.md`). Every fact below is measured unless it says
+otherwise.
+
+### 7.1 What is known
+
+- **Two adapters, two meanings of a device list.** `NikonTi2` asks Nikon's
+  SDK what is on the stand, so an empty list means the SDK could not be
+  reached. `NikonTI` publishes a fixed list of 18 devices, listed with no
+  microscope attached, so a list proves nothing.
+- **Where each driver is found.** `NikonTi2` loads `Ti2_Mic_Driver.dll` from
+  its own folder. On our Ti2-E it was beside the adapter, with the SHA-256 of
+  the copy in `C:\Program Files\Nikon\Ti2-SDK\bin` (session 0). `NikonTI`
+  finds `NikonTi.dll` on the system path, where Nikon's installer puts it
+  (`C:\Program Files\Nikon\Shared\Bin`; from `nikon-control`, not seen here).
+- **One message, many causes (FM-09).** MMCore reports `Failed to load device
+  adapter "<name>"` for a missing dependency, a wrong SDK, the wrong bitness
+  and an interface mismatch. Windows' own error code tells them apart.
+  `nikon-control` reads it by loading the DLL with `ctypes.WinDLL` in its
+  own process, vendor DLL first, then the adapter. **That second probe can
+  pass when the adapter's dependency is missing**: Windows resolves a module
+  already loaded in the process by its base name (from the Windows loader's
+  documented behaviour, not reproduced).
+- **A failed load leaves nothing loaded.** Measured on the demo
+  (pymmcore-plus 0.18.1, 2026-10-19): a `.cfg` that loads `DHub` and `DCam`,
+  then fails on an unknown adapter, leaves only `Core` in
+  `getLoadedDevices()`. MMCore's message is several lines: `Line 4:
+  Device,…` and then `Failed to load device adapter "<name>" …`.
+- **Why a hub does not open, in order of likelihood** (`nikon-control`,
+  `config_build.py`): another program already holds the stand (the one
+  people hit most and never guess, since it is usually their own); the stand
+  or its controller is off, or was powered in the wrong order; the driver
+  DLL is missing or the wrong version.
+- **Stand facts that are causes.** Ti2-E: power the stand before the
+  controller box, or only `Ti2-Simulator` answers; `Ti2Sample.exe` from the
+  Ti2 SDK tests the SDK without Micro-Manager; Ti2 Control 2.10 and 2.20
+  crash Micro-Manager when the nosepiece is added (mmCoreAndDevices#44),
+  2.90.108 works on ours. Ti-E: USB 2, since USB 3 is a documented source of
+  connection failures; `TIDiaLamp` has crashed Micro-Manager with some
+  driver versions. (`nikon-control`, except 2.90.108.)
+- **Roles.** The built-in exclusions of M1 §4 already keep the TIRF
+  positioners out of `xy_stage` and the PFS offset and the TIRF drive out of
+  `focus`. Measured on the session-0 list and on `nikon-control`'s Ti-E list
+  (2026-10-19): every role resolves as §7.8 says, and a `.cfg` slot naming
+  `PFSOffset`, `TIRF1` or `TITIRF` falls back to the right device with a
+  warning. `light_source` offers the light path on both stands (#124).
+
+### 7.2 Module — `smc/hardware/backends/nikon.py`
+
+Pure Python and the file system: it never imports `pymmcore_plus` and never
+opens a core. The DLL probe it calls runs in a child (§7.3).
+
+```python
+@dataclass(frozen=True, slots=True)
+class Driver:
+    dll: str  # "Ti2_Mic_Driver.dll"
+    sdk_dir: str  # a Windows path, where the vendor installer puts it
+    installer: str  # what to install to get it
+    beside_adapter: bool  # True: the adapter loads it from its own folder
+```
+
+```python
+@dataclass(frozen=True, slots=True)
+class Stand:
+    key: str  # "ti2" | "tie": the argument of `smc install-driver`
+    adapter: str  # "NikonTi2" | "NikonTI"
+    name: str  # "Nikon Ti2-E" | "Nikon Ti-E"
+    hub: str  # "" when the SDK names it (Ti2-E__0 on ours) | "TIScope"
+    dynamic: bool  # the device list comes from the SDK
+    driver: Driver
+    causes: tuple[str, ...]  # likely causes after ONE_CONNECTION, in order
+
+    @property
+    def adapter_file(self) -> str: ...  # f"mmgr_dal_{adapter}.dll"
+
+    @property
+    def empty_list_meaning(self) -> str: ...
+```
+
+```python
+@dataclass(frozen=True, slots=True)
+class DriverLocation:
+    path: Path | None  # None: not found
+    beside_adapter: bool  # in the adapter's own folder
+    satisfied: bool  # where this stand's adapter finds it
+```
+
+```python
+@dataclass(frozen=True, slots=True)
+class StandCheck:
+    stand: Stand
+    adapter_path: Path | None  # the adapter MMCore would load, None: none
+    searched: tuple[Path, ...]  # the adapter folders, in MMCore's order
+    driver: DriverLocation
+```
+
+```python
+TI2: Stand
+TIE: Stand
+STANDS: tuple[Stand, ...]  # (TI2, TIE)
+ONE_CONNECTION: str  # the first likely cause, shared by both stands
+
+
+def stand_for_adapter(adapter: str) -> Stand | None: ...
+def stand_for_key(key: str) -> Stand | None: ...
+def stands_in_config(path: Path) -> list[Stand]: ...
+def find_driver(
+    stand: Stand, adapter_dir: Path | None, *, sdk_dir: Path | None = None
+) -> DriverLocation: ...
+def check_stand(
+    stand: Stand, adapter_dirs: Sequence[Path], *, sdk_dir: Path | None = None
+) -> StandCheck: ...
+def readiness(check: StandCheck) -> list[tuple[str, str]]: ...
+def deep_check(
+    check: StandCheck, *, extra_path: Sequence[Path] = ()
+) -> list[DllProbe]: ...
+def diagnosis(check: StandCheck, probes: Sequence[DllProbe]) -> list[str]: ...
+def install_driver(
+    stand: Stand, adapter_dir: Path, *, source: Path | None = None
+) -> tuple[bool, str]: ...
+```
+
+**The registry** (decided; texts may be reworded, their facts may not):
+
+| | `TI2` | `TIE` |
+|---|---|---|
+| `key`, `adapter`, `name` | `ti2`, `NikonTi2`, `Nikon Ti2-E` | `tie`, `NikonTI`, `Nikon Ti-E` |
+| `hub`, `dynamic` | `""`, `True` | `TIScope`, `False` |
+| `driver.dll`, `sdk_dir` | `Ti2_Mic_Driver.dll`, `C:\Program Files\Nikon\Ti2-SDK\bin` | `NikonTi.dll`, `C:\Program Files\Nikon\Shared\Bin` |
+| `driver.installer` | `Ti2 Control (the Ti2 SDK)` | `Nikon's Ti Setup Tool (or the TiSDKRedist package)` |
+| `driver.beside_adapter` | `True` | `False` |
+| `causes`, in order | power (stand before controller box; else only `Ti2-Simulator` answers); the driver (missing beside the adapter, or not the version the adapter was built for; `Ti2Sample.exe` tests the SDK alone); Ti2 Control 2.10/2.20 (2.00 reported to work, 2.90.108 works on ours) | power and USB (a USB 2 port; USB 3 fails on this generation); the driver (`NikonTi.dll` not installed, or not on the system path); `TIDiaLamp` (leave it out of the configuration unless it is needed) |
+
+`ONE_CONNECTION`: another program holds the stand, which accepts one
+connection at a time; close NIS-Elements, Ti2 Control, Micro-Manager and any
+other smc or pymmcore session, then run this again.
+
+`empty_list_meaning`: dynamic, "the adapter asks Nikon's SDK what is on the
+stand, so an empty device list means the SDK could not be reached, not that
+the adapter is missing"; fixed, "the adapter publishes a fixed device list,
+so a device list proves nothing about what is connected; only a probe does".
+`smc discover` uses it in #48.
+
+`nikon-control`'s `SHARED_NOTES` (moving Z switches PFS off) is not ported
+as a note: the Z interlock encodes it (§3.4).
+
+### 7.3 The loader probe — `smc/discovery/dll_probe.py`, `smc/discovery/_dll_child.py`
+
+Generic: any adapter, not only Nikon's (FM-09). In `smc.discovery`, which
+already owns the throwaway children; `nikon.py` imports it, and nothing in it
+imports `smc.hardware`.
+
+```python
+DLL_PROBE_TIMEOUT_S = 20.0  # M1 §10: every OS call has a 20 s timeout
+CHILD_COMMAND: list[str]  # [sys.executable, "-m", "smc.discovery._dll_child"]
+WINERROR_HINTS: Mapping[int, str]  # 126, 127, 193, 1114 (below)
+
+
+@dataclass(frozen=True, slots=True)
+class DllProbe:
+    path: Path
+    loads: bool | None  # None: not tried, or no verdict
+    winerror: int | None
+    detail: str  # one line, ready to print
+
+
+def describe_winerror(code: int | None, strerror: str) -> str: ...
+def probe_dll(
+    path: Path,
+    *,
+    extra_path: Sequence[Path] = (),
+    timeout_s: float = DLL_PROBE_TIMEOUT_S,
+) -> DllProbe: ...
+```
+
+`WINERROR_HINTS` (from `nikon-control`, the first one made generic):
+- 126: a DLL it depends on could not be found; for a vendor adapter, usually
+  the vendor's driver or runtime DLL, not beside the adapter or not
+  installed;
+- 127: an entry point is missing; the vendor DLL is not the version this
+  adapter was built against;
+- 193: wrong architecture; a 32-bit DLL under a 64-bit Micro-Manager, or the
+  reverse;
+- 1114: the DLL loaded but its initialisation routine failed; usually a
+  vendor SDK mismatch, or hardware that is off.
+
+`describe_winerror(126, "The specified module could not be found.")` is
+`WinError 126: The specified module could not be found. — <hint>`; an
+unknown code has no hint; `None` gives `strerror` alone.
+
+**One child per DLL.** `probe_dll` runs `CHILD_COMMAND <path>` and reads its
+verdict, so a probe never shares a process with another DLL (§7.1), a vendor
+`DllMain` that crashes or hangs costs that probe only (FM-02), and the
+parent never holds a vendor DLL. Its rules:
+- not Windows: `DllProbe(path, None, None, "not Windows: a .dll cannot be
+  loaded here")`, and no child is started; a missing file: `loads=None`,
+  `"<path> does not exist"`, no child;
+- the child runs as `mm_section`'s does: a temporary folder as working
+  directory (FM-33), stdin from `DEVNULL`, stdout and stderr to files in that
+  folder, never pipes (FM-04), `CREATE_NO_WINDOW` (FM-22), waited in slices
+  (`mm_inventory._wait_in_slices`, FM-83), killed with its tree at the
+  deadline (`_kill_child_tree`, FM-35) — reused, never copied;
+- `extra_path` goes first on the child's `PATH`, in order, as `open_core`
+  puts the profile's adapter folders there (an entry containing
+  `os.pathsep` is left out, FM-81);
+- deadline: `loads=None`, `"did not return within 20 s: its initialisation
+  hung"`; a non-zero exit or output that is not the protocol: `loads=None`,
+  `"the probe child ended with exit code <exit_detail(…)> and no verdict"`.
+
+**The child** (`_dll_child.py`, `main(argv) -> int`): first
+`SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX)`, its
+`argtypes` and `restype` declared (FM-03, FM-26); then
+`ctypes.WinDLL(str(path), winmode=0x8)` (`LOAD_WITH_ALTERED_SEARCH_PATH`:
+the DLL's own folder first, then the standard order, `PATH` included, which
+is where each Nikon driver is found; that MMCore searches the same way is
+assumed). It writes one line of ASCII JSON to stdout (FM-23):
+`{"loads": true}` or `{"loads": false, "winerror": 126, "strerror": "…"}`,
+then exits 0. It imports nothing from `pymmcore_plus` and never frees the
+DLL: the process ends.
+
+### 7.4 `smc doctor` (extends M1 §9)
+
+With a profile, and with `--config`, `doctor` finds the Nikon stands in the
+configuration it is about to load (`stands_in_config`: the library column of
+its `Device,<label>,<library>,<name>` lines; comments skipped; each stand
+once, in order of first appearance; an unreadable file gives `[]`). The
+adapter folders are the profile's `adapter_search_paths`, then the install
+(MMCore's order, first wins, FM-76); with `--config`, the install alone.
+
+1. **Before opening**, for each stand, `readiness(check)` as aligned rows
+   under a heading `Nikon Ti2-E (NikonTi2)`:
+   `adapter` (its path, or `not found in <folders>`) and `driver`
+   (`Ti2_Mic_Driver.dll beside the adapter`, or where it is and that it must
+   be copied, `smc install-driver ti2`, or `not found`; for the Ti-E, whether
+   `NikonTi.dll` is in its `sdk_dir`). These rows never change the exit code.
+2. **If the open raises `CoreError`**, the `✗` line is printed as today
+   (`--debug` unchanged), then, for each stand, `deep_check(check)` and the
+   `diagnosis` lines, under `Nikon Ti2-E: what to check`, and the exit code
+   is 1. `deep_check` probes the adapter (`adapter_path`), then the driver
+   (when found), each in its own child, with the adapter folders on `PATH`.
+   MMCore has unloaded everything by then (§7.1). Any other error is reported
+   as today, without a diagnosis.
+3. **`diagnosis`** lists, in this order:
+   - `found: …`, one line per certain finding: the adapter is in none of the
+     folders (naming them); the Ti2 driver is not beside the adapter (where
+     it is, and `smc install-driver ti2`); it is nowhere (install the
+     installer); the Ti-E driver is not in its `sdk_dir`;
+   - `probe: <file> loads`, `probe: <file> will not load: <detail>` or
+     `probe: <file> not probed: <detail>`, one per probe;
+   - `in order of likelihood:`, then `  1. <ONE_CONNECTION>` and the stand's
+     `causes`, numbered on.
+
+Without a Nikon stand in the configuration, `doctor` prints exactly what it
+prints today.
+
+### 7.5 `smc install-driver STAND` (extends M1 §9)
+
+`smc install-driver {ti2|tie} [--from FILE] [--to DIR]` copies the stand's
+driver to where its adapter loads it. `--to` defaults to the folder of the
+stand's adapter in the install (`core.find_install()`); with no adapter
+there, `✗` and "pass --to". `--from` defaults to `sdk_dir/dll`. Exit 0 when
+the driver is in place (copied, or an identical copy already there), 1
+otherwise, 2 for usage. `install_driver`'s outcomes, each `(ok, message)`:
+
+- a stand with `beside_adapter = False` (`tie`): `False`, the adapter finds
+  it on the system path, install `<installer>` instead;
+- no source: `False`, `<src> does not exist`, install `<installer>` or pass
+  `--from`;
+- a destination with the source's SHA-256: `True`, already there;
+- a destination that differs: `False`, it differs (both SHA-256 prefixes),
+  and smc never overwrites a driver;
+- otherwise `shutil.copy2` to `<dll>.partial` in the destination folder,
+  then `os.replace` (FM-38); `True`, copied, with the SHA-256 prefix. An
+  `OSError` gives `False`, `could not copy to <dest>: <exc>` (the folder may
+  need an elevated prompt), and removes the partial file.
+
+**Copy, never move**: the vendor's own software still needs its copy.
+
+### 7.6 `smc discover` (extends M1 §10)
+
+`AdapterInfo` gains `load_diagnosis: str | None = None`. After the adapter
+child returns, on Windows, each listed adapter whose `error` contains
+`Failed to load device adapter` gets `probe_dll(<install>/mmgr_dal_<name>.dll)
+.detail`, at most `MAX_DLL_PROBES = 10` of them; the rest get none and one
+note says how many were not probed (FM-74). The report prints it on a row of
+its own under the `ERROR` row, as text, never markup (FM-36). Hub peripherals,
+pre-init ports and the empty-list meaning are #48's.
+
+### 7.7 Profiles
+
+- **`profiles/nikon-ti2.toml`** points at **`profiles/nikon-ti2.cfg`**, a
+  committed copy of the lab's `MMConfig.cfg` (nikon-control, 2026-09-16),
+  which session 0 loaded with every core role answering. It holds no COM
+  port, serial number, host or account name (FM-50), so it is committed,
+  with a comment that says where it comes from. The profile sets what
+  session 0 measured or the owner decided: `device_timeout_ms = 60000`,
+  `[roles.assign] filter_turret = "FilterTurret2"`, `xy_soft_limits_um =
+  [[-49000.0, 49000.0], [-29000.0, 29000.0]]`, `z_soft_limits_um = [10.0,
+  4350.0]`, `max_z_jog_um = 100.0` (chosen, not measured; the owner revises
+  it at #16). Every `[autofocus]` key, the offset safety keys and every pixel
+  size stay unknown until #16 and #22 measure them.
+- **`profiles/nikon-tie.toml`** points at **`profiles/nikon-tie.cfg`**,
+  **assumed**: written for #12 from the adapter's fixed list, never loaded on
+  the stand, without `TIDiaLamp`. The first Ti-E session replaces it with
+  `smc config build` (#15). Its profile sets no limit beyond the layer's
+  defaults, so the Z jog default is logged as assumed.
+- Every profile under `profiles/` loads (a test), and each `.cfg` lists the
+  devices its stand's measured list holds (a test).
+
+### 7.8 Roles on the two stands
+
+Measured with `resolve()` (2026-10-19). On the Ti2-E list, with and without
+the `.cfg`'s core roles: `camera` Camera-1, `xy_stage` XYStage (the only
+candidate), `focus` ZDrive (the only candidate), `autofocus` PFS,
+`autofocus_offset` PFSOffset, `objective_turret` Nosepiece (the only
+candidate), `shutter` DiaLamp (Turret1Shutter, Turret2Shutter as runners-up),
+`light_path` LightPath, `filter_turret` FilterTurret1 or FilterTurret2 (the
+profile assigns FilterTurret2); IntermediateMagnification fills no role. On
+the Ti-E list: no `camera`, `xy_stage` TIXYDrive, `focus` TIZDrive (the only
+candidate), `autofocus` TIPFSStatus, `autofocus_offset` TIPFSOffset,
+`objective_turret` TINosePiece, `shutter` TIEpiShutter (TIDiaShutter,
+TIDiaLamp, TIAuxShutter), `light_path` TILightPath, `filter_turret` four
+candidates; TIAnalyzer fills no role. `light_source` is #124's.
+
+### 7.9 Not verified
+
+- Everything in §7.3 and §7.4 that only Windows shows: a real WinError, the
+  child's `winmode`, `SetErrorMode`, and that MMCore's own search matches it.
+- `nikon-tie.cfg` and every Ti-E fact from `nikon-control`.
+- That a Ti2 hub that will not initialise fails `loadSystemConfiguration`
+  with a `CoreError` (only an adapter that does not load was reproduced).
