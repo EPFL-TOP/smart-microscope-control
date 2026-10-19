@@ -1,0 +1,23 @@
+{
+  "source": "Nikon Ti2-E, session 0 (#126), 2026-10-07: the devices of the lab's MMConfig.cfg as loaded, from the table of #124. The device name equals the label and every description is empty.",
+  "devices": [
+    {"label": "Ti2-E__0", "type": "Hub", "library": "NikonTi2"},
+    {"label": "ZDrive", "type": "Stage", "library": "NikonTi2"},
+    {"label": "XYStage", "type": "XYStage", "library": "NikonTi2"},
+    {"label": "Nosepiece", "type": "State", "library": "NikonTi2"},
+    {"label": "CondenserTurret", "type": "State", "library": "NikonTi2"},
+    {"label": "FilterTurret1", "type": "State", "library": "NikonTi2"},
+    {"label": "Turret1Shutter", "type": "Shutter", "library": "NikonTi2"},
+    {"label": "FilterTurret2", "type": "State", "library": "NikonTi2"},
+    {"label": "Turret2Shutter", "type": "Shutter", "library": "NikonTi2"},
+    {"label": "LightPath", "type": "State", "library": "NikonTi2"},
+    {"label": "PFS", "type": "AutoFocus", "library": "NikonTi2"},
+    {"label": "PFSOffset", "type": "Stage", "library": "NikonTi2"},
+    {"label": "IntermediateMagnification", "type": "Magnifier", "library": "NikonTi2"},
+    {"label": "DiaLamp", "type": "Shutter", "library": "NikonTi2"},
+    {"label": "TIRF1", "type": "XYStage", "library": "NikonTi2"},
+    {"label": "TIRF2", "type": "XYStage", "library": "NikonTi2"},
+    {"label": "TIRF3", "type": "XYStage", "library": "NikonTi2"},
+    {"label": "Camera-1", "type": "Camera", "library": "PVCAM"}
+  ]
+}

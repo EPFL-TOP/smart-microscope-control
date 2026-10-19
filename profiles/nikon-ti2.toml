@@ -1,0 +1,40 @@
+# Nikon Ti2-E with a Photometrics Prime 95B on PVCAM, as session 0 (#126) found it.
+# Shape: docs/design/m1-hardware-layer.md §5; what is known and what is not: docs/design/m2-nikon.md §1, §7.
+# Each value says whether it was measured, set by the owner, or chosen.
+
+[microscope]
+name = "nikon-ti2"
+vendor = "Nikon"
+description = "Nikon Ti2-E, Prime 95B on PVCAM; devices and core roles measured in session 0 (#126)."
+
+[micromanager]
+config = "nikon-ti2.cfg"       # the lab's configuration; loaded in session 0 with every core role answering
+device_timeout_ms = 60000      # a plate traverse exceeds MMCore's 5 s default
+adapter_search_paths = []
+
+[roles.assign]                 # overrides only; the other roles resolve (m2 §7.8)
+filter_turret = "FilterTurret2"   # measured: the only turret with filter cubes (P6)
+
+[safety]
+max_jog_um = 5000.0            # the layer's default, not chosen for this stand
+max_z_jog_um = 100.0           # chosen, not measured; the owner revises it at #16
+z_soft_limits_um = [10.0, 4350.0]    # owner, 2026-10-15: never above 4350 µm; the bottom of travel is about 5-6 µm
+xy_soft_limits_um = [[-49000.0, 49000.0], [-29000.0, 29000.0]]    # owner
+turret_requires_confirm = true
+# max_autofocus_offset_jog = ...                 # in [autofocus] offset_unit; unknown until #16
+# autofocus_offset_soft_limits = [..., ...]      # in [autofocus] offset_unit; unknown until #16
+
+[autofocus]
+# Every key is unknown until the PFS session (#16) measures it: docs/design/m2-nikon.md §4.
+# offset_unit = ""
+# lock_timeout_s = 5.0
+# offset_per_um = {}
+# in_range_property = ""
+# in_range_values = []
+
+[camera]
+# No pixel_size_um entry: a missing objective is unknown, never guessed. The nominal
+# 2.75 µm (4x), 1.1 µm (10x) and 0.275 µm (40x) are assumed, not measured (#22).
+
+[quirks]
+# The direction of focus (which way is up) is unknown (#98).

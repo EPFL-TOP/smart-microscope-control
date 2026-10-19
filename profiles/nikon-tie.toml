@@ -1,0 +1,27 @@
+# Nikon Ti-E. ASSUMED: nothing here was measured on a Ti-E stand (docs/design/m2-nikon.md §7.7).
+# The first Ti-E session replaces nikon-tie.cfg with `smc config build` (#15) and
+# sets the limits this profile leaves at the layer's defaults.
+
+[microscope]
+name = "nikon-tie"
+vendor = "Nikon"
+description = "Nikon Ti-E; the configuration is assumed, written from the NikonTI adapter's fixed device list and never loaded on the stand."
+
+[micromanager]
+config = "nikon-tie.cfg"       # assumed: see the header of that file
+device_timeout_ms = 60000      # a plate traverse exceeds MMCore's 5 s default
+adapter_search_paths = []
+
+[safety]
+max_jog_um = 5000.0            # the layer's default, not chosen for this stand
+turret_requires_confirm = true
+
+[autofocus]
+# Every key is unknown until a PFS session measures it. nikon-control notes that the
+# PFS offset positions are 1/40 of the driver's raw steps and that the range depends
+# on the objective; none of that was measured here.
+# offset_unit = ""
+# lock_timeout_s = 5.0
+# offset_per_um = {}
+# in_range_property = ""
+# in_range_values = []

@@ -106,6 +106,10 @@ def renderables(inv: Inventory) -> list[RenderableType]:
             adapters.add_row(_t(a.name), _t("— not installed —"), _t(""), _t(""))
         elif a.error is not None:
             adapters.add_row(_t(a.name), _t("ERROR"), _t(""), _t(a.error))
+            if a.load_diagnosis is not None:
+                adapters.add_row(
+                    _t(""), _t(""), _t(""), _t(f"probe: {a.load_diagnosis}")
+                )
         elif not a.devices:
             adapters.add_row(_t(a.name), _t("— no devices listed —"), _t(""), _t(""))
         for d in a.devices:

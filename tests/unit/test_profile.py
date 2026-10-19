@@ -888,3 +888,60 @@ def test_unknown_autofocus_key_is_refused(tmp_path: Path) -> None:
         "allowed keys: offset_unit, lock_timeout_s, offset_per_um, "
         "in_range_property, in_range_values"
     ) in msg
+
+
+# -- the profiles that ship with the repository ---------------------------------
+
+PROFILES_DIR = REPO_ROOT / "profiles"
+SHIPPED = sorted(PROFILES_DIR.glob("*.toml"))
+
+
+def test_the_profiles_directory_holds_the_profiles_this_repository_ships() -> None:
+    # A glob that finds nothing would pass the parametrised test below by not running it.
+    assert {path.stem for path in SHIPPED} >= {"demo", "nikon-ti2", "nikon-tie"}
+
+
+@pytest.mark.parametrize("path", SHIPPED, ids=lambda path: path.stem)
+def test_every_shipped_profile_loads(path: Path) -> None:
+    loaded = Profile.load(path)
+
+    assert loaded.microscope.name == path.stem
+    config = loaded.config_path()
+    assert config is None or config.is_file()
+
+
+def test_nikon_ti2_profile_holds_the_owner_limits_and_filter_turret2() -> None:
+    loaded = Profile.load(PROFILES_DIR / "nikon-ti2.toml")
+
+    # What session 0 measured, and what the owner decided (design m2 §7.7).
+    assert loaded.roles.assign == {Role.filter_turret: "FilterTurret2"}
+    assert loaded.safety.z_soft_limits_um == (10.0, 4350.0)
+    assert loaded.safety.xy_soft_limits_um == (
+        (-49000.0, 49000.0),
+        (-29000.0, 29000.0),
+    )
+    assert loaded.safety.max_z_jog_um == 100.0
+    assert loaded.safety.max_jog_um == 5000.0
+    assert loaded.safety.turret_requires_confirm is True
+    assert loaded.micromanager.device_timeout_ms == 60_000
+    assert loaded.config_path() == (PROFILES_DIR / "nikon-ti2.cfg").resolve()
+    # What no session has measured stays unknown, never guessed.
+    assert loaded.camera.pixel_size_um == {}
+    assert loaded.autofocus.offset_per_um == {}
+    assert loaded.autofocus.offset_unit == ""
+    assert loaded.safety.max_autofocus_offset_jog is None
+    assert loaded.safety.autofocus_offset_soft_limits is None
+
+
+def test_nikon_tie_profile_sets_no_limit_beyond_the_layers_defaults() -> None:
+    loaded = Profile.load(PROFILES_DIR / "nikon-tie.toml")
+
+    assert loaded.config_path() == (PROFILES_DIR / "nikon-tie.cfg").resolve()
+    assert loaded.roles.assign == {}
+    assert loaded.safety.max_jog_um == 5000.0
+    assert loaded.safety.turret_requires_confirm is True
+    # Nothing was measured on a Ti-E: the Z jog default stays "assumed".
+    assert loaded.safety.max_z_jog_um is None
+    assert loaded.safety.z_soft_limits_um is None
+    assert loaded.safety.xy_soft_limits_um is None
+    assert loaded.camera.pixel_size_um == {}

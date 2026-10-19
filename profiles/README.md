@@ -98,6 +98,21 @@ Errors name the file, the dotted key and what to change, e.g.
 `profiles/x.toml: … safety.max_jog: unknown key in [safety] — fix the
 spelling or remove it; allowed keys: max_jog_um, …`.
 
+## Shipped profiles
+
+| Profile | Stand | Configuration | State |
+| --- | --- | --- | --- |
+| `demo` | Micro-Manager's demo devices | the one shipped with the adapters | the regression bed of every test |
+| `nikon-ti2` | Nikon Ti2-E, Prime 95B on PVCAM | `nikon-ti2.cfg` | measured in session 0 (#126), with the owner's limits |
+| `nikon-tie` | Nikon Ti-E | `nikon-tie.cfg` | **assumed**: written from the adapter's fixed device list, never loaded on the stand |
+
+A test loads every `*.toml` in this folder. A key a profile leaves out is
+unknown, not defaulted silently: `nikon-ti2` has no pixel size, no autofocus
+offset factor and no autofocus soft limit until a session at the stand
+measures them. Each value in `nikon-ti2.toml` says in a comment whether it
+was measured, set by the owner or chosen; `max_z_jog_um` is chosen, not
+measured, and the owner revises it when the PFS session (#16) has run.
+
 ## Windows paths
 
 Write paths with forward slashes (`config = "C:/Micro-Manager/scope.cfg"`),
@@ -106,4 +121,6 @@ In a double-quoted TOML string a backslash starts an escape sequence.
 
 Site-specific `.cfg` files that embed COM ports or serial numbers are not
 committed; a profile points at them by path and `smc config build` can
-regenerate them.
+regenerate them. `nikon-ti2.cfg` is committed because it holds no COM port,
+serial number, host or account name (the repository is public, FM-50); a
+configuration that does hold one stays outside it.

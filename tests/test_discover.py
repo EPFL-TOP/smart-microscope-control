@@ -25,8 +25,9 @@ import smc.cli as smc_cli
 import smc.discovery as discovery
 import smc.discovery.report as smc_cli_report
 from smc.cli import app
-from smc.discovery import inventory, mm_inventory, os_inventory, vendors
+from smc.discovery import dll_probe, inventory, mm_inventory, os_inventory, vendors
 from smc.discovery._mm_child import _clean_tree, _write
+from smc.discovery.dll_probe import DllProbe
 from smc.discovery.mm_inventory import list_adapters
 from smc.discovery.models import (
     AdapterDevice,
@@ -907,3 +908,227 @@ def test_sliced_wait_keeps_the_deadline_and_never_waits_past_it(
     assert sum(waits) == pytest.approx(1.2)
     assert max(waits) <= mm_inventory._WAIT_SLICE_S
     assert min(waits) >= 0.0
+
+
+# --- what Windows says about an adapter that will not load (design m2 §7.6) ----------
+
+LOAD_FAILURE = 'Failed to load device adapter "{name}" from mmgr_dal_{name}'
+
+
+@pytest.fixture
+def fake_install(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """A survey of a PC whose Micro-Manager install is a folder under ``tmp_path``.
+
+    No real install is looked at, and no adapter is ever loaded (FM-40).
+    """
+    install = tmp_path / "mm-install"
+    install.mkdir()
+
+    def system_section() -> tuple[SystemInfo, list[str]]:
+        info = SystemInfo(
+            hostname="test",
+            collected_at=datetime.now(timezone.utc),
+            os="test",
+            python="3",
+            smc="0",
+            pymmcore_plus="0",
+            mm_install=str(install),
+        )
+        return info, []
+
+    monkeypatch.setattr(mm_inventory, "system_section", system_section)
+    return install
+
+
+def _listing_child(
+    monkeypatch: pytest.MonkeyPatch, listed: list[dict[str, object]]
+) -> None:
+    """Replace the adapter child by one that writes this listing and nothing else."""
+    code = (
+        "import json, sys\n"
+        "RESULT = sys.argv[sys.argv.index('--result') + 1]\n"
+        "with open(RESULT, 'w', encoding='utf-8') as f:\n"
+        f"    json.dump({{'listed': {listed!r}}}, f)\n"
+    )
+    monkeypatch.setattr(mm_inventory, "CHILD_COMMAND", [sys.executable, "-c", code])
+
+
+def _failing(name: str) -> dict[str, object]:
+    return {"name": name, "installed": True, "error": LOAD_FAILURE.format(name=name)}
+
+
+class _RecordingProbe:
+    """A ``probe_dll`` that loads nothing: it records the path and says WinError 126."""
+
+    def __init__(self, detail: str = "WinError 126: Module not found.") -> None:
+        self.paths: list[Path] = []
+        self.detail = detail
+
+    def __call__(self, path: Path, **kwargs: object) -> DllProbe:
+        self.paths.append(path)
+        return DllProbe(path, False, 126, self.detail)
+
+
+def test_a_failed_adapter_load_carries_what_windows_says(
+    monkeypatch: pytest.MonkeyPatch, fake_install: Path
+) -> None:
+    probe = _RecordingProbe()
+    monkeypatch.setattr(dll_probe, "_WINDOWS", True)
+    monkeypatch.setattr(dll_probe, "probe_dll", probe)
+    _listing_child(
+        monkeypatch,
+        [
+            _failing("AndorSDK3"),
+            {"name": "DemoCamera", "installed": True, "devices": []},
+            {"name": "Other", "installed": True, "error": "the SDK reports no camera"},
+            {"name": "Absent", "installed": False},
+        ],
+    )
+
+    inv = inventory(include_os=False)
+
+    # Only the adapter whose own DLL failed to load is asked about, by its file.
+    assert probe.paths == [fake_install / "mmgr_dal_AndorSDK3.dll"]
+    by_name = {a.name: a for a in inv.adapters.listed}
+    assert by_name["AndorSDK3"].load_diagnosis == "WinError 126: Module not found."
+    assert by_name["DemoCamera"].load_diagnosis is None
+    assert by_name["Other"].load_diagnosis is None
+    assert by_name["Absent"].load_diagnosis is None
+    # The text report shows it on a row of its own under the ERROR row.
+    lines = smc_cli_report.render_text(inv).splitlines()
+    error = next(
+        i for i, line in enumerate(lines) if "AndorSDK3" in line and "ERROR" in line
+    )
+    assert "probe: WinError 126: Module not found." in lines[error + 1]
+    assert "AndorSDK3" not in lines[error + 1]
+
+
+def test_a_probe_detail_is_printed_as_text_not_markup(
+    monkeypatch: pytest.MonkeyPatch, fake_install: Path
+) -> None:
+    # FM-36: rich would take "[roles.assign]" for a style tag and drop it.
+    monkeypatch.setattr(dll_probe, "_WINDOWS", True)
+    monkeypatch.setattr(
+        dll_probe, "probe_dll", _RecordingProbe("WinError 126: [roles.assign] [red]x")
+    )
+    _listing_child(monkeypatch, [_failing("AndorSDK3")])
+
+    inv = inventory(include_os=False)
+
+    assert "[roles.assign] [red]x" in smc_cli_report.render_text(inv)
+
+
+def test_dll_probes_stop_at_the_cap_with_a_note(
+    monkeypatch: pytest.MonkeyPatch, fake_install: Path
+) -> None:
+    # FM-74: each probe may take 20 s, so a PC with a dozen vendor adapters
+    # that will not load must not turn a survey into minutes of probing.
+    probe = _RecordingProbe()
+    monkeypatch.setattr(dll_probe, "_WINDOWS", True)
+    monkeypatch.setattr(dll_probe, "probe_dll", probe)
+    names = [f"Vendor{i:02d}" for i in range(12)]
+    _listing_child(monkeypatch, [_failing(name) for name in names])
+
+    inv = inventory(include_os=False)
+
+    assert discovery.MAX_DLL_PROBES == 10
+    # Counted in the order of the listing: the first ten, never a later ten.
+    assert probe.paths == [fake_install / f"mmgr_dal_{name}.dll" for name in names[:10]]
+    diagnosed = [a.name for a in inv.adapters.listed if a.load_diagnosis is not None]
+    assert diagnosed == names[:10]
+    (note,) = [n for n in inv.notes if "not probed" in n]
+    assert note.startswith("adapters: ")
+    assert "2 adapters" in note
+    assert "10" in note
+
+
+def test_no_note_when_every_failed_adapter_was_probed(
+    monkeypatch: pytest.MonkeyPatch, fake_install: Path
+) -> None:
+    monkeypatch.setattr(dll_probe, "_WINDOWS", True)
+    monkeypatch.setattr(dll_probe, "probe_dll", _RecordingProbe())
+    _listing_child(monkeypatch, [_failing(f"Vendor{i}") for i in range(10)])
+
+    inv = inventory(include_os=False)
+
+    assert not [n for n in inv.notes if "not probed" in n]
+    assert all(a.load_diagnosis is not None for a in inv.adapters.listed)
+
+
+def test_off_windows_no_adapter_is_probed(
+    monkeypatch: pytest.MonkeyPatch, fake_install: Path
+) -> None:
+    # A .dll cannot be loaded there: no probe, and no row that says so for every adapter.
+    probe = _RecordingProbe()
+    monkeypatch.setattr(dll_probe, "_WINDOWS", False)
+    monkeypatch.setattr(dll_probe, "probe_dll", probe)
+    _listing_child(monkeypatch, [_failing("AndorSDK3")])
+
+    inv = inventory(include_os=False)
+
+    assert probe.paths == []
+    assert [a.load_diagnosis for a in inv.adapters.listed] == [None]
+    assert not [n for n in inv.notes if "not probed" in n]
+
+
+def test_a_probe_that_fails_itself_is_a_note_and_the_survey_goes_on(
+    monkeypatch: pytest.MonkeyPatch, fake_install: Path
+) -> None:
+    def broken(path: Path, **kwargs: object) -> DllProbe:
+        raise RuntimeError("probe bug")
+
+    monkeypatch.setattr(dll_probe, "_WINDOWS", True)
+    monkeypatch.setattr(dll_probe, "probe_dll", broken)
+    _listing_child(monkeypatch, [_failing("AndorSDK3"), _failing("Second")])
+
+    inv = inventory(include_os=False)
+
+    assert [a.load_diagnosis for a in inv.adapters.listed] == [None, None]
+    notes = [n for n in inv.notes if "loader probe" in n]
+    assert len(notes) == 2
+    assert "AndorSDK3" in notes[0]
+    assert "probe bug" in notes[0]
+
+
+def test_the_diagnosis_is_part_of_the_survey_file(tmp_path: Path) -> None:
+    inv = _tiny_inventory()
+    inv.adapters.listed = [
+        AdapterInfo(
+            name="AndorSDK3",
+            installed=True,
+            error=LOAD_FAILURE.format(name="AndorSDK3"),
+            load_diagnosis="WinError 126: Module not found.",
+        )
+    ]
+
+    json_path, _ = smc_cli_report.write(inv, tmp_path)
+
+    again = Inventory.model_validate_json(json_path.read_text(encoding="utf-8"))
+    assert again.adapters.listed[0].load_diagnosis == "WinError 126: Module not found."
+    # A survey written before this field existed still reads.
+    assert AdapterInfo(name="A", installed=True).load_diagnosis is None
+
+
+@pytest.mark.parametrize(
+    ("failing", "expected"),
+    [
+        (11, "1 adapter failed to load and was not probed"),
+        (12, "2 adapters failed to load and were not probed"),
+    ],
+)
+def test_the_note_counts_what_was_not_probed_in_the_right_number(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_install: Path,
+    failing: int,
+    expected: str,
+) -> None:
+    # Exactly one over the cap is the case an off-by-one in the note would miss.
+    monkeypatch.setattr(dll_probe, "_WINDOWS", True)
+    monkeypatch.setattr(dll_probe, "probe_dll", _RecordingProbe())
+    _listing_child(monkeypatch, [_failing(f"Vendor{i:02d}") for i in range(failing)])
+
+    inv = inventory(include_os=False)
+
+    (note,) = [n for n in inv.notes if "not probed" in n]
+    assert expected in note
+    assert f"at most {discovery.MAX_DLL_PROBES} are probed per survey" in note
