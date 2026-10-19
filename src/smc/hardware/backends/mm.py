@@ -465,13 +465,13 @@ class MMZStage:
     def stop(self) -> None:
         """Stop the drive now, without waiting for the microscope lock (§13).
 
-        While the autofocus locks again after a Z move, or a locked
-        ``focus_by_um`` runs, this switches the autofocus off first: it is
-        what drives Z then (``MMAutofocus._ended_by_a_z_stop``). Otherwise it
-        leaves the autofocus alone: PFS holding focus is not a motion. A
-        direct ``engage()``, ``set_offset_native`` or ``offset_by_native`` is
-        not linked (the review of #140 decided the two compounds only):
-        ``Microscope.stop()`` or ``disengage()`` ends those.
+        While PFS can drive Z because of an action, this switches the
+        autofocus off first, and stops its offset device while that moves
+        (m2 §3.3.1, ``MMAutofocus._ended_by_a_z_stop``): the relock after a
+        Z move, a locked ``focus_by_um``, a direct ``engage()``, and a direct
+        ``set_offset_native`` or ``offset_by_native`` with it on. Otherwise
+        it leaves the autofocus alone: PFS holding focus is not a motion, and
+        with it off, an offset move moves no Z.
         """
         self._executor.stop(self._motion)
 
@@ -1018,7 +1018,9 @@ class MMAutofocus:
         with nothing sent. ``suspended`` says the autofocus is off already
         (the relock), so that it is then left off, with the WARNING, as after
         a halt that refuses the relock before it sends anything; otherwise
-        (a locked ``focus_by_um``) it was not touched. ``offset_pending`` is
+        (a locked ``focus_by_um``, a direct ``engage()`` or offset move, m2
+        §3.3.1) it was not touched, so a Z stop before the block leaves it as
+        it was and claims nothing. ``offset_pending`` is
         set before the link is, so that no Z stop falls between the two;
         the caller clears it once the offset move has returned.
 
