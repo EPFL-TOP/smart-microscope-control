@@ -118,6 +118,12 @@ class AdapterInfo(BaseModel):
     #: The enumeration error. On a Nikon PC without the vendor DLL next to the
     #: adapter, this text *is* the finding.
     error: str | None = None
+    #: What Windows says when the adapter's own DLL is loaded alone, in a child
+    #: process: its error code and what it usually means. MMCore's message for
+    #: a missing dependency, a wrong SDK and the wrong bitness is the same text
+    #: (FM-09). Set only for an ``error`` that says the adapter failed to load,
+    #: and only on Windows.
+    load_diagnosis: str | None = None
 
 
 class AdaptersSection(BaseModel):

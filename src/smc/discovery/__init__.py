@@ -10,14 +10,60 @@ purpose, and nothing is written unless asked (:func:`smc.discovery.report.write`
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
-from smc.discovery import mm_inventory, os_inventory
+from smc.discovery import dll_probe, mm_inventory, os_inventory
 from smc.discovery.models import AdaptersSection, Inventory
 from smc.discovery.vendors import LAB_ADAPTERS, apply_hints
 
-__all__ = ["Inventory", "inventory"]
+__all__ = ["MAX_DLL_PROBES", "Inventory", "inventory"]
 
 logger = logging.getLogger("smc.discovery")
+
+#: Each loader probe may take ``dll_probe.DLL_PROBE_TIMEOUT_S``: a PC with a
+#: dozen vendor adapters that will not load must not turn a survey into minutes
+#: of probing (FM-74). The rest are named in one note.
+MAX_DLL_PROBES = 10
+
+_LOAD_FAILURE = "Failed to load device adapter"
+
+
+def _probe_failed_loads(inv: Inventory, install: Path) -> None:
+    """Ask Windows why each adapter that failed to load will not (FM-09).
+
+    MMCore's message is the same for a missing dependency, a wrong SDK, the
+    wrong bitness and a device-interface mismatch; Windows' own error code,
+    read by loading the adapter's DLL alone in a child, tells them apart.
+    Windows only: off it a ``.dll`` cannot be loaded, and a row saying so for
+    every adapter would be noise. At most ``MAX_DLL_PROBES``, counted in the
+    order of the listing. A probe that fails itself is a note, never the end of
+    the survey.
+    """
+    if not dll_probe._WINDOWS:
+        return
+    probed = skipped = 0
+    for adapter in inv.adapters.listed:
+        if adapter.error is None or _LOAD_FAILURE not in adapter.error:
+            continue
+        if probed >= MAX_DLL_PROBES:
+            skipped += 1
+            continue
+        probed += 1
+        try:
+            result = dll_probe.probe_dll(install / f"mmgr_dal_{adapter.name}.dll")
+        except Exception as exc:
+            inv.notes.append(
+                f"adapters: the loader probe of {adapter.name} failed: {exc}"
+            )
+            continue
+        adapter.load_diagnosis = result.detail
+    if skipped:
+        plural = "adapter" if skipped == 1 else "adapters"
+        inv.notes.append(
+            f"adapters: {skipped} {plural} failed to load and {'was' if skipped == 1 else 'were'} "
+            f"not probed for Windows' reason (at most {MAX_DLL_PROBES} are probed "
+            "per survey)"
+        )
 
 
 def inventory(
@@ -66,6 +112,7 @@ def inventory(
     inv.adapters.listed = listed
     inv.probe = probe
     inv.notes.extend(notes)
+    _probe_failed_loads(inv, Path(system.mm_install))
     logger.info(
         "inventory: %d adapters installed, %d listed, %d notes",
         len(installed),
