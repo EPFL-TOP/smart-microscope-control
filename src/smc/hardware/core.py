@@ -262,7 +262,9 @@ def open_core(
             expanded or is not a directory. Load errors from Micro-Manager
             itself are re-raised as ``CoreError`` too, with the file name
             attached and, when extra directories were given, the order in
-            which adapters were searched.
+            which adapters were searched. A failed load leaves no device
+            loaded: MMCore unloads what it had loaded before it raises
+            (design §7, #132).
         TypeError: When ``adapter_search_paths`` is a single path, not a
             sequence of them.
     """
