@@ -3,6 +3,7 @@
 import logging
 import os
 import re
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -504,3 +505,157 @@ def test_reopening_with_the_same_extras_leaves_path_as_the_first_open_made_it(
     with opened(None, adapter_search_paths=[extra]):
         pass
     assert os.environ["PATH"] == after_first
+
+
+# -- a failed open (#132) -----------------------------------------------------
+
+# Two demo devices, then (per test) a line that fails. The failing line is the
+# last one of each file, so everything above it was loaded when it failed.
+_CFG_HEAD = "Device,Cam,DemoCamera,DCam\nDevice,Z,DemoCamera,DStage\n"
+_CFG_INIT = "Property,Core,Initialize,1\n"
+
+
+def _devices_beyond_core(core: Any) -> list[str]:
+    """The labels loaded besides the ``Core`` that every MMCore has."""
+    return [d for d in core.getLoadedDevices() if d != "Core"]
+
+
+def _write_cfg(path: Path, text: str) -> None:
+    # Bytes, so that the lines stay "\n" on Windows (FM-21).
+    path.write_bytes(text.encode("utf-8"))
+
+
+@pytest.fixture
+def recording_cores(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """The cores ``open_core`` builds, in order, so a test can look at one it never got back."""
+    import pymmcore_plus
+
+    built: list[Any] = []
+
+    class Recording(pymmcore_plus.CMMCorePlus):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            built.append(self)
+
+    monkeypatch.setattr(pymmcore_plus, "CMMCorePlus", Recording)
+    return built
+
+
+@pytest.mark.usefixtures("need_mm", "restored_path")
+@pytest.mark.parametrize(
+    ("text", "failing_line"),
+    [
+        (
+            _CFG_HEAD + "Device,Bad,NoSuchAdapter,Nothing\n",
+            "Device,Bad,NoSuchAdapter,Nothing",
+        ),
+        (
+            _CFG_HEAD + "Device,Dz,Utilities,DA Z Stage\n" + _CFG_INIT,
+            "Property,Core,Initialize,1",
+        ),
+        (
+            _CFG_HEAD + _CFG_INIT + "Property,NoSuchLabel,Foo,1\n",
+            "Property,NoSuchLabel,Foo,1",
+        ),
+    ],
+    ids=[
+        "adapter-missing",
+        "device-fails-to-initialize",
+        "label-unknown-after-initialize",
+    ],
+)
+def test_a_config_that_fails_after_loading_devices_leaves_none_loaded(
+    tmp_path: Path, recording_cores: list[Any], text: str, failing_line: str
+) -> None:
+    # MMCore unloads what it had loaded before it raises (design §7, #132), so
+    # open_core has nothing to release. Measured, not assumed: a later MMCore
+    # that stops doing it turns this red.
+    cfg = tmp_path / "scope.cfg"
+    _write_cfg(cfg, text)
+    with pytest.raises(CoreError) as raised:
+        open_core(cfg)
+    message = str(raised.value)
+    # Our phrase, and the line where the file failed (not MMCore's wording,
+    # and not a word the path could supply, FM-45): the file failed where the
+    # case says, so the devices above it had been loaded.
+    assert message.startswith(f"could not load {cfg}: ")
+    assert failing_line in message
+    assert len(recording_cores) == 1
+    assert _devices_beyond_core(recording_cores[0]) == []
+
+
+@pytest.mark.usefixtures("need_mm", "restored_path")
+def test_the_devices_of_the_failing_configs_load_when_the_file_is_valid(
+    tmp_path: Path,
+) -> None:
+    # Control for the test above: an empty list there means "unloaded", not
+    # "never loaded".
+    cfg = tmp_path / "scope.cfg"
+    _write_cfg(cfg, _CFG_HEAD + _CFG_INIT)
+    core = open_core(cfg)
+    try:
+        assert sorted(_devices_beyond_core(core)) == ["Cam", "Z"]
+    finally:
+        core.unloadAllDevices()
+
+
+@pytest.mark.usefixtures("need_mm", "restored_path")
+def test_the_leftover_check_sees_a_device_that_stays_loaded() -> None:
+    # Without this, the failed-open test passes for a helper that always
+    # returns [] (FM-43).
+    from pymmcore_plus import CMMCorePlus
+
+    core = CMMCorePlus()
+    try:
+        core.loadDevice("Cam", "DemoCamera", "DCam")
+        assert _devices_beyond_core(core) == ["Cam"]
+    finally:
+        core.unloadAllDevices()
+
+
+@pytest.mark.usefixtures("need_mm", "restored_path")
+@pytest.mark.parametrize("with_config", [False, True], ids=["demo", "config-file"])
+def test_an_interrupt_during_open_is_not_a_core_error_and_frees_the_core(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    no_cyclic_gc: None,
+    caplog: pytest.LogCaptureFixture,
+    with_config: bool,
+) -> None:
+    import pymmcore_plus
+
+    refs: list[weakref.ReferenceType[Any]] = []
+    loaded_at_interrupt: list[list[str]] = []
+
+    # A Ctrl-C reaches Python when the call into MMCore returns: the devices
+    # are loaded by then. Raised from the stub, not sent as a signal (FM-44).
+    class Interrupted(pymmcore_plus.CMMCorePlus):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            refs.append(weakref.ref(self))
+
+        def loadSystemConfiguration(  # noqa: N802 - MMCore API
+            self, *args: Any, **kwargs: Any
+        ) -> Any:
+            super().loadSystemConfiguration(*args, **kwargs)
+            loaded_at_interrupt.append(_devices_beyond_core(self))
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(pymmcore_plus, "CMMCorePlus", Interrupted)
+    # pymmcore-plus logs "Initialized core %s" at DEBUG, and pytest keeps the
+    # record with its arguments, which would hold the core (see
+    # test_closing_the_demo_facade_frees_its_core_without_the_cyclic_collector).
+    caplog.set_level(logging.INFO, logger="pymmcore-plus")
+    config = None
+    if with_config:
+        config = tmp_path / "scope.cfg"
+        _write_cfg(config, _CFG_HEAD + _CFG_INIT)
+    # No `as`: the ExceptionInfo would hold the traceback, and so the core.
+    with pytest.raises(KeyboardInterrupt):
+        open_core(config)
+    assert len(loaded_at_interrupt) == 1
+    assert loaded_at_interrupt[0] != [], "no device was loaded when the interrupt came"
+    assert len(refs) == 1
+    # Freed by reference count once the exception is handled; MMCore's
+    # destructor then unloads the devices.
+    assert refs[0]() is None
