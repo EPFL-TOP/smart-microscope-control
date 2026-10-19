@@ -3731,6 +3731,46 @@ def test_a_z_stopped_autofocus_compound_frees_its_core_without_the_cyclic_collec
     }
 
 
+def _z_stop_before_the_relock(core: FakeCore, microscope: Microscope) -> str:
+    """A Z stop in the move's readback: the relock's block refuses on entry; what it raised."""
+    z = microscope.require(ZStage)
+    read, stopped = core.getPosition, list[bool]()
+
+    def stop_on_arrival(label: str | None = None) -> float:
+        if label == "ZDrive" and not stopped:
+            stopped.append(True)
+            z.stop()
+        return read(label)
+
+    core.enableContinuousFocus(True)
+    core.getPosition = stop_on_arrival  # type: ignore[method-assign]
+    try:
+        z.move_to_um(12.0)
+    except BaseException as exc:
+        return type(exc).__name__
+    finally:
+        del core.getPosition
+    return ""
+
+
+def test_a_relock_refused_by_an_earlier_z_stop_frees_its_core_without_the_cyclic_collector(
+    no_cyclic_gc: None, no_kept_log_records: None
+) -> None:
+    # The refusal on entry is raised through `__enter__`'s frame, which held
+    # it in a local (#163, beyond the plan: the one path the compound test
+    # does not take).
+    core = _ti2_core()
+    microscope = Microscope.from_core(cast("CMMCorePlus", core), _profile())
+    assert _z_stop_before_the_relock(core, microscope) == "MotionStoppedError"
+    assert core.log[-2:] == ["setPosition('ZDrive', 12.0)", "stop('ZDrive')"]
+    alive = {"facade": weakref.ref(microscope), "core": weakref.ref(core)}
+    del microscope, core
+    assert {name: ref() is not None for name, ref in alive.items()} == {
+        "facade": False,
+        "core": False,
+    }
+
+
 def _late_failing_switch_off(
     core: FakeCore, microscope: Microscope, release: threading.Event
 ) -> tuple[str, str]:
