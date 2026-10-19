@@ -1587,3 +1587,202 @@ def test_nikon_readiness_rows_never_change_the_exit_code(
     assert result.exit_code == 0, result.output
     assert "adapter  not found in" in result.output
     assert "loads and answers" in result.output
+
+
+# --- install-driver (design m2 §7.5) ---------------------------------------------------
+
+
+@pytest.fixture
+def no_install(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail the test if the command looks for the Micro-Manager install."""
+
+    def refuse() -> Path | None:
+        pytest.fail("the command looked for the Micro-Manager install")
+
+    monkeypatch.setattr(core_mod, "find_install", refuse)
+
+
+def _driver(folder: Path, data: bytes = b"vendor driver") -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / TI2_DRIVER
+    path.write_bytes(data)
+    return path
+
+
+@pytest.mark.usefixtures("no_install")
+def test_install_driver_copies_into_the_folder_given(tmp_path: Path) -> None:
+    source = _driver(tmp_path / "sdk")
+    to = tmp_path / "mm"
+    to.mkdir()
+
+    result = runner.invoke(
+        app, ["install-driver", "ti2", "--from", str(source), "--to", str(to)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert f"✓ copied {source} to {to / TI2_DRIVER}" in result.output
+    assert (to / TI2_DRIVER).read_bytes() == b"vendor driver"
+    # The vendor's own software still needs its copy.
+    assert source.read_bytes() == b"vendor driver"
+
+
+def test_install_driver_defaults_to_the_adapter_folder_of_the_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install = tmp_path / "install"
+    install.mkdir()
+    (install / TI2_ADAPTER).write_bytes(b"MZ")
+    monkeypatch.setattr(core_mod, "find_install", lambda: install)
+    source = _driver(tmp_path / "sdk")
+
+    result = runner.invoke(app, ["install-driver", "ti2", "--from", str(source)])
+
+    assert result.exit_code == 0, result.output
+    assert (install / TI2_DRIVER).read_bytes() == b"vendor driver"
+
+
+def test_install_driver_takes_the_sdk_folder_by_default(
+    tmp_path: Path, isolated_sdk: Path
+) -> None:
+    _driver(isolated_sdk, b"from the sdk")
+    to = tmp_path / "mm"
+    to.mkdir()
+
+    result = runner.invoke(app, ["install-driver", "ti2", "--to", str(to)])
+
+    assert result.exit_code == 0, result.output
+    assert (to / TI2_DRIVER).read_bytes() == b"from the sdk"
+
+
+def test_install_driver_without_the_adapter_says_to_pass_to(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An empty folder, whatever OS the test runs on: macOS has no Nikon
+    # adapter and the Windows runner has the full nightly (FM-43).
+    install = tmp_path / "install"
+    install.mkdir()
+    monkeypatch.setattr(core_mod, "find_install", lambda: install)
+    source = _driver(tmp_path / "sdk")
+
+    result = runner.invoke(app, ["install-driver", "ti2", "--from", str(source)])
+
+    assert result.exit_code == 1, result.output
+    assert f"✗ {TI2_ADAPTER} is not in the Micro-Manager install" in result.output
+    assert "pass --to" in result.output
+    assert not (install / TI2_DRIVER).exists()
+
+
+def test_install_driver_without_any_install_says_to_pass_to(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(core_mod, "find_install", lambda: None)
+    source = _driver(tmp_path / "sdk")
+
+    result = runner.invoke(app, ["install-driver", "ti2", "--from", str(source)])
+
+    assert result.exit_code == 1, result.output
+    assert "no Micro-Manager install" in result.output
+    assert "pass --to" in result.output
+
+
+@pytest.mark.usefixtures("no_install")
+def test_install_driver_tie_exits_1_naming_the_system_path(tmp_path: Path) -> None:
+    # The Ti-E adapter finds NikonTi.dll on the system path: nothing to copy,
+    # and no look at the install either.
+    result = runner.invoke(app, ["install-driver", "tie"])
+
+    assert result.exit_code == 1, result.output
+    assert "system path" in result.output
+    assert nikon.TIE.driver.installer in result.output
+
+
+@pytest.mark.usefixtures("no_install")
+def test_install_driver_never_overwrites_a_different_dll(tmp_path: Path) -> None:
+    source = _driver(tmp_path / "sdk", b"the sdk version")
+    to = tmp_path / "mm"
+    there = _driver(to, b"another version")
+
+    result = runner.invoke(
+        app, ["install-driver", "ti2", "--from", str(source), "--to", str(to)]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "differs" in result.output
+    assert there.read_bytes() == b"another version"
+
+
+@pytest.mark.usefixtures("no_install")
+def test_install_driver_is_content_with_an_identical_copy(tmp_path: Path) -> None:
+    source = _driver(tmp_path / "sdk", b"same")
+    to = tmp_path / "mm"
+    _driver(to, b"same")
+
+    result = runner.invoke(
+        app, ["install-driver", "ti2", "--from", str(source), "--to", str(to)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "already there" in result.output
+
+
+@pytest.mark.usefixtures("no_install")
+def test_install_driver_with_a_missing_source_names_the_installer_and_from(
+    tmp_path: Path,
+) -> None:
+    to = tmp_path / "mm"
+    to.mkdir()
+    missing = tmp_path / "nowhere" / TI2_DRIVER
+
+    result = runner.invoke(
+        app, ["install-driver", "ti2", "--from", str(missing), "--to", str(to)]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert f"{missing} does not exist" in result.output
+    assert nikon.TI2.driver.installer in result.output
+    assert "--from" in result.output
+
+
+@pytest.mark.usefixtures("no_install")
+def test_install_driver_to_something_that_is_not_a_folder_exits_1(
+    tmp_path: Path,
+) -> None:
+    source = _driver(tmp_path / "sdk")
+    missing = tmp_path / "no-such-folder"
+
+    result = runner.invoke(
+        app, ["install-driver", "ti2", "--from", str(source), "--to", str(missing)]
+    )
+
+    assert result.exit_code == 1, result.output
+    assert f"{missing} is not a folder" in result.output
+
+
+@pytest.mark.usefixtures("no_install")
+def test_install_driver_of_an_unknown_stand_is_a_usage_error_naming_the_stands() -> (
+    None
+):
+    result = runner.invoke(app, ["install-driver", "zeiss"])
+
+    assert result.exit_code == 2, result.output
+    assert "unknown stand 'zeiss'" in result.output
+    assert "ti2" in result.output
+    assert "tie" in result.output
+
+
+def test_install_driver_help_documents_from_and_to() -> None:
+    result = runner.invoke(app, ["install-driver", "--help"])
+
+    assert result.exit_code == 0, result.output
+    plain = _ANSI.sub("", result.output)
+    # One row per option carries the flag and its own help text (FM-72).
+    for flag, text in (
+        ("--from", "The driver DLL to copy"),
+        ("--to", "The folder of the stand's adapter"),
+    ):
+        rows = [
+            row
+            for row in plain.splitlines()
+            if re.search(rf"{flag}\s", row) and text in row
+        ]
+        assert rows, (flag, plain)

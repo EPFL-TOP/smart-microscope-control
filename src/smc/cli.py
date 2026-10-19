@@ -582,6 +582,67 @@ def doctor(
     _ok(f"{target} loads and answers.")
 
 
+@app.command("install-driver")
+def install_driver(
+    ctx: typer.Context,
+    stand: Annotated[str, typer.Argument(help="The stand: ti2 or tie.")],
+    source: Annotated[
+        Path | None,
+        typer.Option(
+            "--from",
+            help="The driver DLL to copy; default: the one in the vendor's SDK folder.",
+        ),
+    ] = None,
+    to: Annotated[
+        Path | None,
+        typer.Option(
+            "--to",
+            help="The folder of the stand's adapter; default: its folder in the "
+            "Micro-Manager install.",
+        ),
+    ] = None,
+) -> None:
+    """Copy a Nikon stand's driver DLL to the folder its adapter loads it from.
+
+    The Ti2 adapter loads Ti2_Mic_Driver.dll from its own folder, and the copy
+    in the Ti2 SDK folder is not enough. This copies, never moves, and never
+    overwrites a DLL that differs. The Ti-E adapter finds its driver on the
+    system path, so there is nothing to copy for it. Exits 0 when the driver is
+    in place, 1 when it is not.
+    """
+    with _reported(ctx):
+        found = nikon.stand_for_key(stand)
+        if found is None:
+            keys = ", ".join(known.key for known in nikon.STANDS)
+            _fail(f"unknown stand '{stand}'; use one of: {keys}")
+            raise typer.Exit(code=_EXIT_REFUSED)
+        destination = to
+        if destination is None and found.driver.beside_adapter:
+            install = core_mod.find_install()
+            if install is None:
+                _fail(
+                    f"there is no Micro-Manager install to take the folder of "
+                    f"{found.adapter_file} from; pass --to with that folder"
+                )
+                raise typer.Exit(code=_EXIT_ERROR)
+            if not (install / found.adapter_file).is_file():
+                _fail(
+                    f"{found.adapter_file} is not in the Micro-Manager install "
+                    f"({install}); pass --to with the folder that holds it"
+                )
+                raise typer.Exit(code=_EXIT_ERROR)
+            destination = install
+        # A stand whose driver is on the system path is refused before the
+        # folder is looked at, so any folder will do for it.
+        ok, message = nikon.install_driver(
+            found, destination if destination is not None else Path(), source=source
+        )
+        if not ok:
+            _fail(message)
+            raise typer.Exit(code=_EXIT_ERROR)
+        _ok(message)
+
+
 @app.command()
 def discover(
     out: Annotated[

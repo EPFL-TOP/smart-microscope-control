@@ -91,6 +91,8 @@ The `NikonTi2` adapter loads `Ti2_Mic_Driver.dll` from **its own folder**.
 Copy (never move) it from `C:\Program Files\Nikon\Ti2-SDK\bin` into the
 Micro-Manager folder that `smc doctor` reports. Without it the adapter
 lists no devices and it looks as if the adapter were missing.
+`smc install-driver ti2` does the copy: it never moves the file and never
+overwrites a different one (`--from` and `--to` name another source or folder).
 
 ## 2. Survey the machine
 
