@@ -49,10 +49,10 @@ from __future__ import annotations
 import functools
 import logging
 import math
-import threading
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
@@ -67,7 +67,7 @@ from smc.hardware.errors import (
     SafetyRefusedError,
 )
 from smc.hardware.roles import Role
-from smc.hardware.safety import Motion, SafeCall, Step, StopLink
+from smc.hardware.safety import POLL_INTERVAL_S, Motion, SafeCall, Step, StopLink
 
 if TYPE_CHECKING:
     import numpy as np
@@ -569,9 +569,11 @@ class _ZStop:
     #: What the Z stop's switch-off raised: it may still be on. An interrupt
     #: counts, since whether the switch-off went out is then unknown.
     switch_off_failure: BaseException | None = None
-    #: Set by the stopping thread once its linked stop has returned or raised:
-    #: the link is marked reached before the switch-off is sent (FM-97).
-    finished: threading.Event = field(default_factory=threading.Event)
+    #: Set by the stopping thread once its switch-off has returned or raised:
+    #: the link is marked reached before the switch-off is sent (FM-97). A
+    #: plain store, not an ``Event``: setting one takes a lock, which a
+    #: second stop re-entering that thread would wait on for ever (FM-70).
+    finished: bool = False
 
     @property
     def fired(self) -> bool:
@@ -1045,12 +1047,15 @@ class MMAutofocus:
         the caller clears it once the offset move has returned.
 
         Once the block has ended, a call that a Z stop reached waits for
-        that stop's linked call to return, at most ``Z_STOP_OUTCOME_WAIT_S``,
-        still under the microscope lock (FM-97): the link is marked reached
-        before the stopping thread sends the switch-off, so a block that its
-        lock or its landed move ended meanwhile would otherwise report "left
-        off" while the switch-off is still on its way, and may yet fail.
-        When the switch-off failed, or had not returned in time, it may
+        that stop's switch-off to return, at most ``Z_STOP_OUTCOME_WAIT_S``,
+        still under the microscope lock, in short sleeps that a Ctrl-C
+        interrupts (FM-97, FM-83). The link is marked reached before the
+        stopping thread sends the switch-off, so a block that its lock or its
+        landed move ended meanwhile would otherwise report "left off" while
+        the switch-off is still on its way, and may yet fail. A block that a
+        halt or a Ctrl-C ended does not wait: it goes on at once, with what
+        is known by then. When the switch-off failed, or had not returned in
+        time, it may
         still be on: no "left off" is claimed, the "may still move Z" WARNING
         is logged, and the call raises ``MotionStoppedError`` naming Z and
         the failure, chained from whatever ended the block (m2 §3.3.1).
@@ -1084,12 +1089,18 @@ class MMAutofocus:
                 refused = exc is before or isinstance(exc, MicroscopeHaltedError)
                 if not (stopped.fired or (suspended and refused)):
                     raise
-                failure = self._z_stop_failure(stopped) if stopped.fired else None
+                # A halt and a Ctrl-C go on at once: they wait for no outcome.
+                urgent = isinstance(exc, MicroscopeHaltedError) or not isinstance(
+                    exc, Exception
+                )
+                failure = (
+                    self._z_stop_failure(stopped, wait=not urgent)
+                    if stopped.fired
+                    else None
+                )
                 if failure is not None:
                     self._log_not_switched_off(description, failure)
-                    if isinstance(
-                        exc, (DeviceTimeoutError, MicroscopeHaltedError)
-                    ) or not isinstance(exc, Exception):
+                    if urgent or isinstance(exc, DeviceTimeoutError):
                         raise
                     raise self._not_switched_off(name, description, failure) from exc
                 if isinstance(exc, MicroscopeHaltedError) or not isinstance(
@@ -1102,7 +1113,7 @@ class MMAutofocus:
                 raise error from exc
             if stopped.fired:
                 # It locked, then the stop switched it off: not a success.
-                failure = self._z_stop_failure(stopped)
+                failure = self._z_stop_failure(stopped, wait=True)
                 if failure is not None:
                     self._log_not_switched_off(description, failure)
                     raise self._not_switched_off(name, description, failure) from (
@@ -1127,43 +1138,53 @@ class MMAutofocus:
         §3.11): a stop of an offset move not sent yet cancels it. Without an
         offset device, the offset move is the autofocus device's own, keyed
         by its label: the switch-off cancels it. Each failure is raised to
-        the stopping caller, the switch-off's first. ``finished`` is set
-        however it ends, so that the compound's wait for it never outlasts
-        it; an interrupt in the switch-off is recorded as its failure, since
-        whether it went out is then unknown. It never takes the microscope
-        lock: the compound waits for it while holding that lock.
+        the stopping caller, the switch-off's first. ``finished`` is set as
+        soon as the switch-off has returned or raised, before the offset
+        stop: the compound reports the switch-off's outcome, and the offset
+        stop's goes to the stopping caller. An interrupt in the switch-off
+        is recorded as its failure, since whether it went out is then
+        unknown. It takes no lock that a handler re-entering this thread
+        could already hold (FM-70), and never the microscope lock: the
+        compound waits for it while holding that lock.
         """
+        failure: Exception | None = None
         try:
-            failure: Exception | None = None
-            try:
-                self._executor.safe(self._off, lambda: None)
-            except Exception as exc:
-                stopped.switch_off_failure = failure = exc
-            except BaseException as exc:
-                stopped.switch_off_failure = exc
-                raise
-            if self._offset_label is not None and stopped.offset_pending:
-                try:
-                    self._executor.stop(self._offset_motion)
-                except Exception as exc:
-                    failure = failure or exc
-            if failure is not None:
-                raise failure
+            self._executor.safe(self._off, lambda: None)
+        except Exception as exc:
+            stopped.switch_off_failure = failure = exc
+        except BaseException as exc:
+            stopped.switch_off_failure = exc
+            raise
         finally:
-            stopped.finished.set()
+            stopped.finished = True
+        if self._offset_label is not None and stopped.offset_pending:
+            try:
+                self._executor.stop(self._offset_motion)
+            except Exception as exc:
+                failure = failure or exc
+        if failure is not None:
+            raise failure
 
-    def _z_stop_failure(self, stopped: _ZStop) -> BaseException | None:
+    def _z_stop_failure(self, stopped: _ZStop, *, wait: bool) -> BaseException | None:
         """What the Z stop's switch-off raised, once it has returned; waited for, bounded (FM-97).
 
         A switch-off that has not returned by ``Z_STOP_OUTCOME_WAIT_S`` counts
         as failed: it may never get through, and "left off" would then be a
-        claim nobody checked.
+        claim nobody checked. The wait polls in short sleeps, which a Ctrl-C
+        interrupts on Windows too (FM-83). Without ``wait`` (a halt or an
+        interrupt ended the call, and goes on at once), the outcome is what
+        is known now.
         """
         wait_s = float(Z_STOP_OUTCOME_WAIT_S)  # at call time, so a test can shorten it
-        if not stopped.finished.wait(wait_s):
-            return DeviceTimeoutError(
-                f"its switch-off had not returned after {wait_s:g} s"
-            )
+        deadline = time.monotonic() + (wait_s if wait else 0.0)
+        while not stopped.finished:
+            if time.monotonic() >= deadline:
+                return DeviceTimeoutError(
+                    f"its switch-off had not returned after {wait_s:g} s"
+                    if wait
+                    else "its switch-off had not returned yet"
+                )
+            time.sleep(POLL_INTERVAL_S)
         return stopped.switch_off_failure
 
     def _not_switched_off(
@@ -1405,7 +1426,9 @@ class MMAutofocus:
                 "as on, so a Z stop during it switches it off",
                 self._label,
                 description,
-                exc,
+                # Not the exception: a kept record would keep its traceback,
+                # and through it the core (FM-92).
+                _named(exc),
             )
             return True
 
