@@ -19,6 +19,10 @@ them if it is not the one you run on.
    prints nothing, `gh issue view $ARGUMENTS --json body,comments`). Find the
    latest comment starting with `## Plan`. No plan, or no `status: ready`
    label → stop and comment "No plan / not ready — needs `/plan` first."
+   One exception: `status: blocked` whose every **Depends on** is merged
+   (a plan that waited for its own design PR). Check each with
+   `gh pr view`/`gh issue view`, set `status: ready` and say so in the
+   `Starting` comment (#144 and #12 met a stale label).
 2. Read the design-doc sections and ADRs the plan names, the failure modes
    it lists (`docs/design/failure-modes.md`), and the code you will touch.
 3. `Depends on`: if a dependency is not merged into `main`, stop and say so
