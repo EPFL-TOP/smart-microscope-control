@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import stat
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -74,6 +76,21 @@ TI2_LABELS = {
 }
 
 
+#: The lab's ``BF``, as session 0 read it from ``profiles/nikon-ti2.cfg``. A
+#: literal: a capture at the stand edits the committed file (profiles/README.md).
+LAB_BF = (
+    ("CondenserTurret", "Label", "7-N2"),
+    ("FilterTurret1", "Label", "1-"),
+    ("Turret1Shutter", "State", "0"),
+    ("FilterTurret2", "Label", "1-ANALY"),
+    ("Turret2Shutter", "State", "0"),
+    ("LightPath", "Label", "4-L100"),
+    ("DiaLamp", "State", "0"),
+    ("DiaLamp", "Intensity", "210"),
+    ("Camera-1", "Exposure", "10"),
+)
+
+
 def _bf_from_the_cfg() -> list[tuple[str, str, str]]:
     """``BF``, line for line from ``profiles/nikon-ti2.cfg``."""
     settings = []
@@ -129,7 +146,7 @@ def ti2_core() -> FakeCore:
         autofocus="PFS",
         shutter="DiaLamp",
     )
-    core.config_groups = {"Channel": {"BF": _bf_from_the_cfg()}}
+    core.config_groups = {"Channel": {"BF": list(LAB_BF)}}
     return core
 
 
@@ -233,9 +250,10 @@ def lock_held_by_a_snap(
 
 def copy_of_the_cfg(tmp_path: Path, *, crlf: bool = False) -> Path:
     """The Ti2-E's configuration, copied to ``tmp_path`` as bytes (CRLF if asked)."""
-    raw = TI2_CFG.read_bytes()
+    # LF first: a Windows checkout (core.autocrlf) gives the committed file CRLF.
+    raw = TI2_CFG.read_bytes().replace(b"\r\n", b"\n")
     if crlf:
-        raw = raw.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+        raw = raw.replace(b"\n", b"\r\n")
     path = tmp_path / "nikon-ti2.cfg"
     path.write_bytes(raw)
     return path
@@ -263,18 +281,9 @@ CAPTURED = (
 
 
 def test_the_layouts_bf_is_the_labs() -> None:
-    # The helper's preset is the file's, line for line (m2 §8.1).
-    assert _bf_from_the_cfg() == [
-        ("CondenserTurret", "Label", "7-N2"),
-        ("FilterTurret1", "Label", "1-"),
-        ("Turret1Shutter", "State", "0"),
-        ("FilterTurret2", "Label", "1-ANALY"),
-        ("Turret2Shutter", "State", "0"),
-        ("LightPath", "Label", "4-L100"),
-        ("DiaLamp", "State", "0"),
-        ("DiaLamp", "Intensity", "210"),
-        ("Camera-1", "Exposure", "10"),
-    ]
+    # The layout's preset is the committed file's, line for line (m2 §8.1).
+    # A capture at the stand that the owner commits fails this test alone.
+    assert tuple(_bf_from_the_cfg()) == LAB_BF
 
 
 def test_bf_reads_current_after_select_although_mmcore_formats_the_numbers() -> None:
@@ -374,6 +383,61 @@ def test_a_filter_turret_still_busy_at_the_deadline_stays_registered() -> None:
         core.busy_devices.clear()
 
 
+def test_the_profiles_group_decides_between_two_channel_groups(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def two_groups() -> FakeCore:
+        core = ti2_core()
+        core.config_groups["Channel-Epi"] = {"GFP": [("FilterTurret2", "Label", "2-")]}
+        return core
+
+    with ti2(core=two_groups()) as (_, microscope), caplog.at_level(logging.WARNING):
+        assert not microscope.has(Channels)
+        microscope.state()
+        # Chosen once: the warning is not repeated at every state().
+        assert [m for m in caplog.messages if m.startswith("channels:")] == [
+            "channels: several config groups are named for channels ('Channel', "
+            "'Channel-Epi') and the core's channel group ('') is none of them, so "
+            "none is chosen; name one in the profile's [channels] group"
+        ]
+    profile = ti2_profile(channels={"group": "Channel-Epi"})
+    with ti2(profile, core=two_groups()) as (_, microscope):
+        channels = microscope.require(Channels)
+        assert (channels.group(), channels.names()) == ("Channel-Epi", ["GFP"])
+
+
+def test_a_capture_into_the_profiles_new_group_creates_it(tmp_path: Path) -> None:
+    cfg = copy_of_the_cfg(tmp_path)
+    before = cfg.read_text(encoding="utf-8")
+    profile = ti2_profile(config=cfg, channels={"group": "Epi"})
+    with ti2(profile) as (core, microscope):
+        channels = microscope.require(Channels)
+        assert (channels.group(), channels.names(), channels.current()) == (
+            "Epi",
+            [],
+            None,
+        )
+        preset = channels.capture("GFP")
+        assert core.getAvailableConfigs("Epi") == ("GFP",)
+        assert channels.select("GFP") == "GFP"
+    lines = "".join(f"ConfigGroup,Epi,GFP,{d},{p},{v}\n" for d, p, v in preset.settings)
+    assert cfg.read_text(encoding="utf-8") == before + lines
+
+
+def test_a_preset_naming_a_device_that_did_not_load_matches_nothing() -> None:
+    # FM-19: one such preset (defineConfig takes it without a word) must not
+    # fail every current() and every state(), nor a select of another preset.
+    core = ti2_core()
+    core.defineConfig("Channel", "AAA-ghost", "Ghost", "Prop", "1")
+    with ti2(core=core) as (_, microscope):
+        channels = microscope.require(Channels)
+        assert channels.current() is None
+        assert channels.select("BF") == "BF"
+        assert channels.current() == "BF"
+        state = microscope.state()
+        assert (state.channel, state.errors) == ("BF", [])
+
+
 def test_without_a_channel_group_require_names_the_profile_key() -> None:
     core = ti2_core()
     core.config_groups = {"Camera": {}, "System": {}}
@@ -428,6 +492,89 @@ def test_capture_never_records_the_objective_turret_a_shutter_state_or_the_expos
     assert ("DiaLamp", "State", "0") not in preset.settings
 
 
+def test_capture_records_only_state_devices_with_a_writable_label() -> None:
+    # The type filter, not the fake's lack of a Label, keeps a magnifier, a
+    # hub, a stage and a shutter out of the channel (m2 §8.5).
+    core = ti2_core()
+    for label in ("IntermediateMagnification", "Ti2-E__0", "ZDrive", "Turret1Shutter"):
+        core._devices[label].properties["Label"] = FakeProperty("1.0x")
+    for label in ("Wheel-RO", "Wheel-NoLabel"):
+        core._devices[label] = FakeDevice(label, DeviceType.State, state_labels=("A",))
+        core._devices[label].properties["Label"] = FakeProperty("A")
+    core._devices["Wheel-RO"].properties["Label"].read_only = True
+    del core._devices["Wheel-NoLabel"].properties["Label"]
+    with ti2(core=core) as (_, microscope):
+        assert microscope.require(Channels).capture("GFP").settings == CAPTURED
+
+
+def test_a_capture_with_nothing_to_record_is_refused_and_keeps_the_preset(
+    tmp_path: Path,
+) -> None:
+    cfg = copy_of_the_cfg(tmp_path)
+    before = cfg.read_bytes()
+    every_state = [*TI2_LABELS, "DiaLamp"]
+    core = ti2_core()
+    core.setShutterDevice("")
+    profile = ti2_profile(config=cfg, channels={"exclude": every_state})
+    with ti2(profile, core=core) as (_, microscope):
+        message = (
+            "channels: nothing to capture for 'BF': no State device, light-source "
+            "knob or shutter to record"
+        )
+        with pytest.raises(HardwareError, match=f"^{re.escape(message)}$"):
+            microscope.require(Channels).capture("BF")
+        assert core.log == []
+        assert core.getConfigData("Channel", "BF") == LAB_BF
+    _not_written(cfg, before)
+
+
+def test_a_capture_records_the_stand_as_it_is_once_it_holds_the_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-43: read when called, the capture would record a filter that a move
+    # still holding the lock was about to change.
+    with ti2() as (core, microscope):
+        channels = microscope.require(Channels)
+        with lock_held_by_a_snap(core, microscope, monkeypatch) as queued:
+            capturer = Thread(lambda: channels.capture("GFP"))
+            assert queued.wait(JOIN_S)
+            core.setStateLabel("FilterTurret2", "2-MXR00700 -96372 - GF")
+        capturer.join()
+        assert capturer.error is None
+        assert isinstance(capturer.result, ChannelPreset)
+        assert (
+            "FilterTurret2",
+            "Label",
+            "2-MXR00700 -96372 - GF",
+        ) in capturer.result.settings
+
+
+def test_a_preset_that_switches_auto_shutter_off_reads_current() -> None:
+    core = ti2_core()
+    core.config_groups["Channel"]["Manual"] = [
+        ("DiaLamp", "Intensity", "501"),
+        ("Core", "AutoShutter", "0"),
+    ]
+    with ti2(core=core) as (_, microscope):
+        channels = microscope.require(Channels)
+        assert channels.current() is None  # auto-shutter starts on
+        assert channels.select("Manual") == "Manual"
+        assert core.getAutoShutter() is False
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_a_captured_cfg_keeps_the_mode_a_plain_write_gives(tmp_path: Path) -> None:
+    # FM-38: mkstemp's 0600 would survive the rename and make the file private.
+    cfg = copy_of_the_cfg(tmp_path)
+    old = os.umask(0o022)
+    try:
+        with ti2(ti2_profile(config=cfg)) as (_, microscope):
+            microscope.require(Channels).capture("BF")
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE(cfg.stat().st_mode) == 0o644
+
+
 def test_the_profile_exclude_list_is_never_captured() -> None:
     profile = ti2_profile(channels={"exclude": ["CondenserTurret", "DiaLamp"]})
     with ti2(profile) as (_, microscope):
@@ -462,6 +609,27 @@ def test_recapturing_a_preset_replaces_it_in_the_core_and_the_cfg(
     assert cfg.read_text(encoding="utf-8") == before.replace(
         "\n".join(old) + "\n", "\n".join(lines) + "\n"
     )
+
+
+def test_a_recapture_says_which_settings_it_dropped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The lab's BF closes the epi shutters and sets an exposure; a capture
+    # records neither, so replacing BF loses them, and the WARNING says so.
+    with ti2() as (_, microscope):
+        with caplog.at_level(logging.WARNING):
+            microscope.require(Channels).capture("BF")
+        assert caplog.messages == [
+            "channels: Channel BF replaced; dropped: CondenserTurret,Label,7-N2; "
+            "Turret1Shutter,State,0; Turret2Shutter,State,0; LightPath,Label,4-L100; "
+            "DiaLamp,State,0; DiaLamp,Intensity,210; Camera-1,Exposure,10; added: "
+            "CondenserTurret,Label,1-OPEN; LightPath,Label,1-EYE; "
+            "DiaLamp,Intensity,501; Core,Shutter,DiaLamp"
+        ]
+        caplog.clear()
+        with caplog.at_level(logging.WARNING):
+            microscope.require(Channels).capture("BF")  # the same again
+        assert caplog.messages == []
 
 
 def test_a_capture_keeps_a_windows_cfg_crlf(tmp_path: Path) -> None:
@@ -576,7 +744,7 @@ def test_capture_in_dry_run_writes_nothing(tmp_path: Path) -> None:
         preset = microscope.require(Channels).capture("BF")
         assert preset == ChannelPreset("Channel", "BF", CAPTURED, saved_to=None)
         assert core.log == []
-        assert core.getConfigData("Channel", "BF") == tuple(_bf_from_the_cfg())
+        assert core.getConfigData("Channel", "BF") == LAB_BF
     _not_written(cfg, before)
 
 

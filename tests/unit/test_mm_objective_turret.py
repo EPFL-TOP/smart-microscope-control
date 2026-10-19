@@ -259,6 +259,21 @@ def test_dry_run_turns_nothing_and_switches_nothing_off() -> None:
         assert core.getStateLabel("Nosepiece") == TEN
 
 
+def test_a_turret_that_does_not_follow_reports_where_it_is() -> None:
+    # The readback, not the request: a tool that took the requested label
+    # would scale its images with the wrong objective's pixel size.
+    with ti2() as (core, microscope):
+
+        def ignored(label: str, text: str) -> None:
+            core.log.append(f"setStateLabel({label!r}, {text!r})")
+
+        core.setStateLabel = ignored  # type: ignore[method-assign]
+        landed = microscope.require(ObjectiveTurret).select(FORTY, confirm=True)
+        del core.setStateLabel
+        assert landed == TEN
+        assert core.log == [TURN_40]
+
+
 def test_a_turret_fault_is_a_hardware_error_naming_the_role() -> None:
     # FM-79: MMCore's bare RuntimeError names neither the role nor the call.
     with ti2() as (core, microscope):

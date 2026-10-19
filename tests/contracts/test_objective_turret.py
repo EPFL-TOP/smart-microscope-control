@@ -37,6 +37,9 @@ def test_select_without_confirm_is_refused(
     backend: str,
     request: pytest.FixtureRequest,
 ) -> None:
+    # Only the guard under test would stand between this call and a turn at
+    # the stand; the fake's empty log proves the refusal.
+    _never_on_hardware(backend)
     if not microscope.profile.safety.turret_requires_confirm:
         # Such a stand would turn on this call.
         pytest.skip("the profile sets [safety] turret_requires_confirm = false")

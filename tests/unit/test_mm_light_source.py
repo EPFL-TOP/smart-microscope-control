@@ -183,7 +183,23 @@ def test_an_intensity_outside_the_limits_is_refused_not_clamped() -> None:
             with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
                 light.set_intensity_native(value)
         assert core.log == []
+        # Both limits are inside the range.
         assert light.set_intensity_native(255.0) == 255.0
+        assert light.set_intensity_native(0.0) == 0.0
+
+
+def test_the_setters_return_what_the_lamp_reads_not_what_was_asked() -> None:
+    with ti2() as (core, microscope):
+        light = microscope.require(LightSource)
+
+        def ignored(*args: object) -> None:
+            return None
+
+        core.setProperty = ignored  # type: ignore[method-assign]
+        core.setShutterOpen = ignored  # type: ignore[method-assign]
+        assert light.set_intensity_native(210.0) == 501.0
+        assert light.set_on(True) is False
+        del core.setProperty, core.setShutterOpen
 
 
 @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])

@@ -84,6 +84,7 @@ CFG = (
         ("System", False),
         ("Camera-Channel", False),
         ("Objective Channel", False),
+        ("System Channel", False),
         ("LightPath", False),
     ],
 )

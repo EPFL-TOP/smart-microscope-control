@@ -2355,8 +2355,14 @@ class MMChannels:
         return found
 
     def _current(self) -> str | None:
+        loaded = {str(label) for label in self._core.getLoadedDevices()}
         for name in self._names():
-            if not self._mismatches(self._settings(name), first_only=True):
+            settings = self._settings(name)
+            # A preset that names a device that did not load matches nothing:
+            # read, it would fail every current() and every state() (FM-19).
+            if any(d != "Core" and d not in loaded for d, _, _ in settings):
+                continue
+            if not self._mismatches(settings, first_only=True):
                 return name
         return None
 
@@ -2596,11 +2602,25 @@ class MMChannels:
 
     def _define(self, name: str, settings: Sequence[tuple[str, str, str]]) -> None:
         group, core = self._group, self._core
+        old: tuple[tuple[str, str, str], ...] = ()
         if name in self._names():
+            old = self._settings(name)
             # defineConfig merges into an existing preset (m2 §8.1).
             core.deleteConfig(group, name)
         for device, prop, value in settings:
             core.defineConfig(group, name, device, prop, value)
+        dropped = [s for s in old if s not in settings]
+        if dropped:
+            # A recapture records only what a channel is made of, so what the
+            # preset held besides (shutter states, an exposure) is gone.
+            added = [s for s in settings if s not in old]
+            logger.warning(
+                "channels: %s %s replaced; dropped: %s; added: %s",
+                group,
+                name,
+                "; ".join(",".join(s) for s in dropped),
+                "; ".join(",".join(s) for s in added) or "nothing",
+            )
 
 
 class MMProperties:
