@@ -722,6 +722,34 @@ reason that only a change of who writes `PATH` fixes this. That change
 `_put_on_path` is the only writer) is an owner decision (#119), not part
 of this section.
 
+**A failed load leaves nothing loaded (#132).** `open_core` does not call
+`unloadAllDevices()` when `loadSystemConfiguration` raises, because MMCore
+has already unloaded what it loaded. Measured 2026-10-19 on macOS
+(the tests below also pass on the CI runners of Linux and Windows, English
+locale; the two pymmcore versions were run on macOS only), with pymmcore
+12.5.0.75.0 (MMCore 12.5.0, device interface 75) and with the oldest the
+project allows, 11.10.0.74.0 (MMCore 11.10.0, interface 74), on a file that
+loads two demo devices and then fails at a `Device` line (adapter missing),
+at `Property,Core,Initialize,1` (`Utilities` `DA Z Stage`, with no DA device
+to drive) or at a `Property` line after the devices were initialized:
+`getLoadedDevices()` reads `['Core']` right after the exception, and the
+`unloadAllDevices` of `CMMCorePlus` is not called, so the unload is MMCore's
+own. A Ctrl-C reaches Python only when the call into MMCore returns, so an
+interrupted open can hold a fully loaded core: `KeyboardInterrupt` leaves
+`open_core` as it is (only `Exception` becomes `CoreError`), and the core is
+freed by reference count once the handler is done with the exception, whose
+traceback holds it; MMCore's destructor then unloads the devices (measured
+in its log). A caller that keeps the exception object keeps the core, and the
+stand's connection, with it.
+`test_a_config_that_fails_after_loading_devices_leaves_none_loaded` (the
+`.cfg` branch), `test_a_demo_configuration_that_fails_after_loading_devices_leaves_none_loaded`
+(the demo branch, which has its own handler) and
+`test_an_interrupt_during_open_is_not_a_core_error_and_frees_the_core` pin
+this. If one of the first two turns red on a later MMCore, the fix is one handler in
+`open_core`: `except BaseException` around both loads calls
+`unloadAllDevices()`, logs a failure of its own at ERROR without raising over
+the original (FM-49), and re-raises the original.
+
 ## 8. Testing — `smc/testing/` and `tests/` (#9, #10)
 
 **Revised 2026-10-01** for the plan of #9. These facts were measured on
@@ -1423,6 +1451,14 @@ after a move waits for the move, then snaps.
   `DeviceTimeoutError` says whether the stop was sent, failed, or is
   impossible (a `State` device). A give-up does **not** advance the stop
   generation: it cancels nobody else's action.
+- **A give-up stops waiting before it stops the device.** It registers the
+  motion before it sends the stop (unknown counts as moving), and from
+  then on the holder no longer records "waiting for" it: the registry names
+  the motion in `moving()`. A caller that finds the lock held during the
+  give-up therefore waits for the lock, and the guard decides once the lock
+  is free: refused if the device still reads busy or cannot be read, run
+  if it is idle. Otherwise whether a queued action is refused would depend
+  on how long the stop, the busy check and the log line take (#101).
 - **`wait(timeout_s)`** is a read (above): it polls, takes no lock, and
   never stops anything.
 
