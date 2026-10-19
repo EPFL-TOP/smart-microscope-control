@@ -2,7 +2,8 @@
 
 - **Status**: design for issue #13 (§1–§6, 2026-10-16); §3.3.1 and
   §3.11's stop rules decided in #144 (2026-10-18); §7 for #12
-  (2026-10-19). #14, #15 and #48 add their own sections with their plans.
+  (2026-10-19); §8 for #14 (2026-10-19). #15 and #48 add their own
+  sections with their plans.
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1, this document is the contract between issues that are
   built in parallel. Names, module paths and signatures below are fixed; an
@@ -19,7 +20,8 @@ M1 §2 (conventions), §3, §6, §7, §8 and §13 (motion, stop and the lock);
 M2 brings the Nikon stands under the layer: the `Autofocus` capability and
 the Z interlock (#13), `ObjectiveTurret`, `LightSource` and `Channels`
 (#14), the stand knowledge from `nikon-control` (#12), the configuration
-builder (#15) and a truthful probe (#48). §1–§6 fix #13; §7 fixes #12.
+builder (#15) and a truthful probe (#48). §1–§6 fix #13; §7 fixes #12;
+§8 fixes #14.
 
 Not in #13: one-shot autofocus (`fullFocus`), a CLI command for the
 autofocus, the piezo (§2), camera-clocked sequences, and the Zeiss
@@ -702,7 +704,7 @@ The sample is a dish or plate with cells, focused by eye first.
 | Issue | Touches | Runs |
 |---|---|---|
 | #13 | `capabilities.py`, `errors.py`, `safety.py`, `backends/mm.py`, `microscope.py`, `profile.py`, `testing/fakes.py`, `tests/contracts/conftest.py`, `profiles/demo.toml`, `profiles/README.md` | first |
-| #14 | the same capability, backend, facade, fake and contract modules | after #13 merges |
+| #14 | `capabilities.py`, `errors.py`, `channels.py` (new), `backends/mm.py`, `microscope.py`, `profile.py`, `testing/fakes.py`, `tests/contracts/conftest.py`, `profiles/demo.toml`, `profiles/README.md` (§8) | after #12; alone on `backends/mm.py`, `microscope.py` and `fakes.py` (#141, #163 and #166 wait); #124 (`roles.py`) runs beside it |
 | #106, #111, #112 | `profile.py` | one at a time, not beside #13 |
 | #12 | `backends/nikon.py`, `discovery/dll_probe.py`, `discovery/_dll_child.py`, `discovery/__init__.py`, `discovery/models.py`, `discovery/report.py`, `cli.py`, `profiles/nikon-*`, `profiles/README.md` (§7) | after #13; before #48 and #15, which touch the same discovery and CLI modules |
 
@@ -1049,3 +1051,573 @@ candidates; TIAnalyzer fills no role. `light_source` is #124's.
 - `nikon-tie.cfg` and every Ti-E fact from `nikon-control`.
 - That a Ti2 hub that will not initialise fails `loadSystemConfiguration`
   with a `CoreError` (only an adapter that does not load was reproduced).
+
+## 8. ObjectiveTurret, LightSource and Channels (#14)
+
+Extends M1 §3 (capabilities), §5 (profiles), §6 (backend), §7 (facade), §8
+(FakeCore, contracts) and §13 (kinds of call). Sources: the demo, the Ti2-E
+(`nikon-ti2.md`, `profiles/nikon-ti2.cfg`) and `nikon-control`
+(`scope/control.py`, `scope/channels.py`, read 2026-10-19).
+
+### 8.1 What is known
+
+Measured on the demo on 2026-10-19 (pymmcore-plus 0.18.1, pymmcore
+12.5.0.75.0), unless a line names another source.
+
+- **Roles on the demo.** `objective_turret` is `Objective` (heuristic).
+  `light_source` is `LED`: a `State` device (`Closed`, `385nm` … `635nm`)
+  that has no property naming an intensity. `light_path` and `filter_turret`
+  are not filled; the demo's `Path` matches neither rule.
+- **Turret labels.** On the demo, `Objective` has six positions:
+  `Nikon 40X Plan Fluor ELWD`, `Nikon 10X S Fluor`, `Objective-2`,
+  `Nikon 20X Plan Fluor ELWD`, `Objective-4`, `Objective-5`. An empty
+  position carries a default label. On the Ti2-E, `Nosepiece` reads
+  `1-Plan Fluor 4x`, `2-Plan Fluor 10x`, `3-Plan Apo LmbdD0.25 40x`, `4-`,
+  `5-` and `6-` (the configuration's labels). Nothing tells smc which
+  positions are empty.
+- `setStateLabel` with an unknown label raises `RuntimeError('Error in
+  device "Objective": Label not defined (10).  Available Labels: (…)')`. A
+  demo turret move returns at once, and `deviceBusy` then reads `False`.
+- **Config groups on the demo**: `Camera`, `Channel`, `Channel-Multiband`,
+  `LightPath`, `Objective` and `System`. The core's channel group is
+  `Channel`. `getCurrentConfig("Channel")` reads `DAPI` after the open, and
+  `''` once a device no longer matches any preset. `getConfigData` returns a
+  pymmcore-plus `Configuration`, which iterates as `(device, property,
+  value)` tuples.
+- `setConfig` with an unknown preset raises `ValueError('Preset "Nope" of
+  configuration group "Channel" does not exist')`. On the demo it returns
+  at once, with no device busy. A preset that sets `Core,Shutter` moves the
+  core's shutter slot: `getShutterDevice()` reads the preset's shutter
+  afterwards.
+- **`defineConfig` merges into an existing preset.** It changes or adds one
+  setting and keeps the others, so replacing a preset means `deleteConfig`
+  first. `defineConfig` accepts the label of a device that is not loaded
+  and says nothing. It creates a missing group. `deleteConfig` on a missing
+  preset raises `ValueError('Configuration group "Channel" does not
+  exist')`, which names the group and not the preset. A group keeps
+  existing once its last preset is deleted, and `getChannelGroup()` does
+  not change.
+- **MMCore matches presets by string.** A preset `Camera,Exposure,10`,
+  once applied, reads `10.0000`, and `getCurrentConfig` then reads `''`.
+  The Ti2-E's `BF` sets `Exposure` 10 and `Intensity` 210, so MMCore would
+  report no current channel after selecting it.
+- A `.cfg` with CRLF line endings and a preset inserted among another
+  preset's lines loads, and the inserted preset reads back whole.
+- `setProperty` outside a property's limits raises `RuntimeError('Cannot
+  set property "Photon Flux" to "9999.000000"')`.
+- **`saveSystemConfiguration` rewrites the whole file** from the core's
+  state. It drops comments and writes every label, every pre-initialisation
+  property (a serial `Port` among them, FM-50) and the pixel-size
+  configurations. `capture()` never calls it.
+- `getMagnificationFactor()` reads 1.0 on the demo. The Ti2-E's
+  `IntermediateMagnification` (`Magnifier`, read-only, `1.0x` or `1.5x`)
+  divides the pixel size by 1.5, and no profile key accounts for it (#167).
+- **The Ti2-E's light** (session 0): `DiaLamp` is a `Shutter` whose
+  `Intensity` is a free number (no limits; 501 was read), and it fills both
+  the `shutter` role (the configuration's slot) and `light_source`. The
+  lab's one group is `Channel`, with one preset `BF`: `CondenserTurret`
+  `7-N2`, `FilterTurret1` `1-`, `Turret1Shutter` 0, `FilterTurret2`
+  `1-ANALY`, `Turret2Shutter` 0, `LightPath` `4-L100`, `DiaLamp` `State` 0
+  and `Intensity` 210, and `Camera-1` `Exposure` 10. The file has no
+  `Core,ChannelGroup` line. The epi light (Lumencor Spectra III) is in no
+  configuration.
+- **`nikon-control`** (read): `set_objective` needs `confirm=True`, checks
+  neither Z nor PFS, and waits with `waitForDevice`. The intensity knob is
+  the first writable property whose name holds `intensity`, `brightness`,
+  `power`, `level` or `voltage`, searched on the shutter and light-path
+  roles and then on every device named like a light. A value outside the
+  limits is clamped. The channel group is `Channel`, `Channels` or
+  `channel`, else an explicit name. A capture records every `Shutter` and
+  `State` device except the nosepiece, stages and autofocus, by `Label`
+  (else `State`), plus the knob. It redefines the core's preset without
+  deleting it first, so stale settings stay. It edits the `.cfg` as text,
+  with no encoding, not atomically. Its tests: confirmation, "intensity is
+  found on the lamp, not the camera", "a config group that is not channels
+  is not treated as one", "capture never includes the objective turret".
+
+### 8.2 Protocols and value types — `capabilities.py`
+
+```python
+@dataclass(frozen=True, slots=True)
+class ChannelPreset:
+    group: str
+    name: str
+    # (device, property, value), in the order MMCore applies them
+    settings: tuple[tuple[str, str, str], ...]
+    # the configuration file capture() wrote; None: the running core only
+    saved_to: Path | None = None
+```
+
+```python
+@runtime_checkable
+class ObjectiveTurret(Protocol):
+    def labels(self) -> list[str]: ...  # every position, in position order
+    def current(self) -> str: ...
+    def select(self, label: str, *, confirm: bool = False) -> str: ...
+    def pixel_size_um(self, label: str | None = None) -> float: ...  # 0.0 = unknown
+```
+
+```python
+@runtime_checkable
+class LightSource(Protocol):
+    def device(self) -> str: ...
+    def intensity_knob(self) -> PropertyInfo | None: ...  # None: no knob
+    def intensity_native(self) -> float | None: ...  # None: no knob
+    def set_intensity_native(self, value: float) -> float: ...
+    def is_on(self) -> bool | None: ...  # None: no switch that smc knows
+    def set_on(self, on: bool) -> bool: ...
+```
+
+```python
+@runtime_checkable
+class Channels(Protocol):
+    def group(self) -> str: ...
+    def names(self) -> list[str]: ...
+    def current(self) -> str | None: ...  # None: the stand matches no preset
+    def preset(self, name: str) -> ChannelPreset: ...
+    def select(self, name: str) -> str | None: ...
+    def capture(self, name: str) -> ChannelPreset: ...
+```
+
+The four names join `__all__`. **Names.** ADR-0003's `intensity`,
+`set_intensity()` and `on/off` become `intensity_native()`,
+`set_intensity_native()`, `is_on()` and `set_on()`. They are methods (M1
+§2), and the intensity is in the device's own units: the `DiaLamp`'s
+`Intensity` has no unit that smc knows (ADR-0003: named for what it is). The
+ADR writes `select(label, *, confirm=True)` as the call a tool makes, so the
+default is `False`.
+
+### 8.3 ObjectiveTurret — `MMObjectiveTurret`
+
+The `objective_turret` role; faults through `as_hardware_errors(core,
+"objective_turret")` (FM-79).
+
+- `labels()` is `list(getStateLabels(label))`, in position order, empty
+  positions included as the configuration names them. `current()` is
+  `getStateLabel(label)`.
+- **`select(label, *, confirm=False)`**, in this order:
+  1. **Confirmation (FM-14).** When `[safety] turret_requires_confirm` is
+     true (the default) and `confirm` is false, it raises
+     `SafetyRefusedError(reason="turning the objective turret can drive an
+     objective into a loaded plate (objective_turret 'Nosepiece')",
+     how_to_force="pass confirm=True once the stage is clear")`. Nothing is
+     read or sent, no lock is taken, and the refusal also happens in dry-run.
+     With the key false, `select` runs without `confirm` and logs at INFO
+     `objective_turret: no confirmation required ([safety]
+     turret_requires_confirm = false)`.
+  2. A `label` that is not in `labels()` (a lock-free read) raises
+     `ValueError` naming it and listing the labels. Nothing is sent.
+  3. **One compound**, `objective_turret: select <label>` (§3.7):
+     1. If `current()` already equals `label`, nothing is sent and the
+        autofocus is left alone. It logs `objective_turret: already at
+        <label>` at INFO and returns `label`.
+     2. Unless in dry-run, the autofocus is switched off first when it is
+        engaged (`disengage()`, a safe call). The autofocus is the facade's
+        `Autofocus`, reached through the facade's weak reference (FM-92). A
+        state that cannot be read counts as engaged, with a WARNING that
+        says so (FM-19). It is **never engaged again** (FM-88). The WARNING
+        reads `objective_turret: autofocus 'PFS' switched off before the
+        turret turns; it is not engaged again (the new objective's offset
+        is not known); engage() it once in focus`.
+     3. `executor.do` with `Step(send=setStateLabel(turret, label),
+        readback=getStateLabel(turret), dry_result=label)`, the motion
+        `_motion(core, turret, f"objective_turret {turret}",
+        stoppable=False)` and `timeout_s=_core_timeout(core)`.
+
+     In dry-run the compound runs and its nested action logs and skips, so
+     nothing is sent, the switch-off included.
+  4. It returns the readback.
+
+  **Why the switch-off.** A PFS that follows through a turret rotation
+  drives Z while no action holds the lock (§3.2). The new objective's
+  offset differs (`offset_per_um` is per objective; on the Ti-E, the valid
+  range depends on the objective, §1), so engaging again could drive Z
+  anywhere. Whether the Ti2-E switches PFS off by itself on a nosepiece
+  change is unknown (§8.9).
+- **A turret cannot be stopped** (a `State` device, M1 §13). One still busy
+  at the deadline stays registered as moving until it reads idle or
+  `resume()` is called. Neither the emergency stop nor `close()` sends it
+  anything.
+- `pixel_size_um(label=None)` returns the profile's `[camera]
+  pixel_size_um` for `label` (the current objective when `None`), and 0.0
+  when the profile has none. The value is at binning 1 and at an
+  intermediate magnification of 1.0× (#167). `Camera.pixel_size_um()` (M1
+  §3) is unchanged.
+
+### 8.4 LightSource — `MMLightSource`
+
+The `light_source` role; faults through `as_hardware_errors(core,
+"light_source")`.
+
+- `device()` is the role's label.
+- **The knob** is resolved on the first call that needs it and is kept from
+  then on (its property name, or that there is none). Every call reads the
+  value again.
+  1. **The profile's `[light_source] intensity_property`**: used when the
+     device has that property and it is writable. Otherwise a WARNING names
+     the key, the device and its writable properties, and the search falls
+     through.
+  2. **Hints**: the device's writable properties whose normalised name
+     (`[a-z0-9]`) contains one of `INTENSITY_HINTS = ("intensity",
+     "brightness", "power", "level", "voltage")`. They are ranked by hint,
+     then by property order. The first one that has limits wins, else the
+     first whose value reads as a finite float. A property with no numeric
+     value is never a knob.
+  3. **None**: logged once at INFO, `light_source 'LED': no intensity
+     property (searched for intensity, brightness, power, level, voltage);
+     set [light_source] intensity_property if the device has one`.
+
+  Only the role's device is searched: a camera's `BeadBrightness` is not a
+  lamp (`nikon-control`'s test).
+- `intensity_knob()` is the knob's `PropertyInfo`, read now, or `None`.
+  `intensity_native()` is `float(getProperty(device, knob))`, or `None`
+  without a knob. A value that is not a number raises `HardwareError`
+  naming the device, the property and the value.
+- **`set_intensity_native(value)`** raises before anything is sent:
+  - `HardwareError` when there is no knob: `light_source 'LED' has no
+    intensity property that smc knows; set [light_source] intensity_property
+    in the profile, or use Properties`;
+  - `ValueError` for a value that is not finite;
+  - `ValueError` for a value outside the knob's limits, when it has limits.
+    The value is never clamped: `nikon-control` clamped, which reads as
+    success.
+
+  Otherwise it is an action, `light_source: intensity <value>`, through
+  `executor.do`: `Step(send=setProperty(device, knob, value),
+  readback=float(getProperty(...)), dry_result=value)`. It is not a motion.
+- **`is_on()` / `set_on(on)`**, when the device's type is `Shutter`:
+  `getShutterOpen(device)` and `setShutterOpen(device, on)`, with the same
+  kinds of call as `MMShutter` (M1 §13). `set_on(False)` is a safe call,
+  `SafeCall(device=<label>, log="light_source: off", …)`. `set_on(True)` is
+  an action overridden by that safe call. On the Ti2-E, `DiaLamp` is both
+  the shutter and the light source. Both capabilities key their safe calls
+  by its label, so a close from either one cancels an open from either one.
+  For any other type, `is_on()` returns `None`, and `set_on()` raises
+  `HardwareError`: `light_source 'LED' (a State device) has no on/off that
+  smc knows; switch the light with its shutter (Shutter)`.
+- The emergency stop does not cut the light: it stops what moves (M1 §13).
+  `Shutter.set_open(False)` and `set_on(False)` are never refused.
+
+### 8.5 Channels — `MMChannels` and `smc/hardware/channels.py`
+
+A config group, not a role. The pure parts live in a new module,
+`smc/hardware/channels.py`, which imports no `pymmcore_plus` (ADR-0004's
+split): the group's choice, the preset checks, the capture's choice of
+settings, and the `.cfg` edit.
+
+```python
+CHANNEL_WORD = "channel"
+NOT_CHANNEL_WORDS = ("camera", "objective", "system")
+ALLOWED_CORE_SETTINGS = ("Shutter", "AutoShutter")
+FORBIDDEN_TYPES = ("Stage", "XYStage", "AutoFocus")
+
+
+def named_for_channels(group: str) -> bool: ...
+def choose_group(
+    groups: Sequence[str], *, core_group: str, profile_group: str
+) -> tuple[str | None, list[str]]: ...  # (the group, warnings)
+def check_preset_name(name: str) -> None: ...  # ValueError
+def forbidden_settings(
+    settings: Iterable[tuple[str, str, str]],
+    *,
+    device_types: Mapping[str, str],
+    objective_turret: str | None,
+) -> list[str]: ...  # one reason per refused setting, empty: allowed
+def check_value(device: str, prop: str, value: str) -> None: ...  # HardwareError
+def setting_matches(expected: str, read: str) -> bool: ...
+def replace_preset(
+    text: str, group: str, name: str, settings: Sequence[tuple[str, str, str]]
+) -> str: ...
+```
+
+**The group**, `choose_group`, takes the first source that gives one:
+1. the profile's `[channels] group`, when it is not empty, whether the
+   group exists yet or not (`capture()` creates it);
+2. the core's channel group (`getChannelGroup()`), when it exists and is
+   named for channels;
+3. the one existing group named for channels. With several, there is none,
+   and a warning names them and `[channels] group`.
+
+A group is **named for channels** when its normalised name contains
+`channel` and none of `camera`, `objective` or `system`. Measured: the demo
+gives `Channel` (from the core), and the Ti2-E gives `Channel` (the only
+group). `Channel-Multiband` on the demo is named for channels too; the core
+decides between the two. With no group, `Channels` is not available (§8.6).
+
+- `group()` returns the chosen group. `names()` is
+  `list(getAvailableConfigs(group))`, or `[]` while the group does not
+  exist. `preset(name)` reads `getConfigData`. A name that is not in
+  `names()` raises `ValueError` listing them.
+- **`current()`** is the first preset, in `names()` order, whose every
+  setting matches what the stand reads now, else `None`. It does not use
+  `getCurrentConfig`, which compares strings (§8.1). `setting_matches`
+  holds when the two strings are equal, or when both read as finite floats
+  that are equal. A `Core,Shutter` setting is compared with
+  `getShutterDevice()`, and `Core,AutoShutter` with `getAutoShutter()` as
+  `1` or `0`. A read that fails propagates as a `HardwareError`.
+- **`select(name)`**:
+  1. A name that is not in `names()` raises `ValueError`. Nothing is sent.
+  2. One action, `channels: select <group> <name>`, through `executor.do`
+     with a step **built under the lock**: it reads the preset's settings
+     and the type of each device. If `forbidden_settings` returns any, it
+     raises `SafetyRefusedError` with an empty `how_to_force`, which cannot
+     be forced: the preset would move a stage, an autofocus or the
+     objective turret around their guards, or change a core slot. The
+     message names each setting and says to edit the preset in the
+     configuration, or to use the capability (`ZStage`, `ObjectiveTurret`).
+     Refused: a device of type `Stage`, `XYStage` or `AutoFocus`; the
+     `objective_turret` role's device; a `Core` property other than
+     `Shutter` and `AutoShutter`; a device that is not loaded.
+  3. The command is `setConfig(group, name)`. The motion is
+     `Motion(device=f"config group {group}", name=f"channels {group}
+     {name}", is_busy=<any of the preset's non-Core devices reads busy>,
+     stop=None)`, with `timeout_s=_core_timeout(core)`. The readback is
+     `name` when every setting of the preset matches what the stand reads
+     (two presets may hold the same settings), else `current()`;
+     `dry_result` is `name`. One command moves several
+     devices, and no stop reaches a `State` device, so the motion has a
+     key of its own. A device labelled `config group <name>` would share
+     it; no stand has one.
+  4. When the readback is not `name`, a WARNING names each setting that
+     reads otherwise. It returns the readback: `None` when
+     the stand matches no preset.
+- **`capture(name)`**:
+  1. `check_preset_name(name)`: the name must not be empty, must be
+     printable ASCII, must not contain a comma, and must not start or end
+     with whitespace. Otherwise `ValueError`.
+  2. One action, `channels: capture <group> <name>`, through `executor.do`
+     with no motion. Its step is built under the lock:
+     1. **The settings**, in this order:
+        - for each loaded device of type `State`, in `getLoadedDevices()`
+          order, except the `objective_turret` role's device and the
+          profile's `[channels] exclude` labels: `(device, "Label",
+          getStateLabel(device))`. A device whose `Label` is read-only or
+          absent is skipped;
+        - the light source's knob, when `LightSource` is available and has
+          one, with its value as `getProperty` returns it;
+        - `("Core", "Shutter", getShutterDevice())`, when the slot is not
+          empty.
+
+        A capture never records a shutter's open state, a `Stage`,
+        `XYStage`, `AutoFocus`, `Camera`, `Hub` or `Magnifier` device, or
+        the exposure. A channel says which light path and how bright, not
+        whether the light is on (auto-shutter or `Shutter` opens it). The
+        lab's `BF` preset sets shutters closed and an exposure: `select()`
+        accepts such presets, and `capture()` does not write them.
+     2. `check_value` for each setting: the value must be printable ASCII
+        with no comma (FM-81: the `.cfg` is comma-separated; FM-05: an
+        adapter's bytes). Otherwise it raises `HardwareError` naming the
+        device, the property and the value, and nothing is written.
+     3. With no setting, it raises `HardwareError`, `nothing to capture`.
+
+     `dry_result` is the `ChannelPreset` with `saved_to=None`.
+  3. **The send**:
+     1. **The file first**, when `profile.config_path()` is not `None`. The
+        file is read as bytes and decoded as UTF-8; a decoding failure
+        raises `HardwareError` naming the file, and nothing is written. The
+        new text, `replace_preset(…)`, is encoded as UTF-8 and written as
+        bytes, atomically (FM-38: a temporary file in the same folder,
+        `O_CREAT | O_EXCL` with mode `0o666`, `os.replace`, one `try`; it is
+        removed on failure, except when only the rename failed, which keeps
+        it and names it).
+     2. **Then the running core**: `deleteConfig(group, name)` when `name`
+        is in `names()`, then one `defineConfig` per setting, in order.
+
+     The file is the record. A failed write leaves the core unchanged. A
+     core failure after the write raises `HardwareError`, which says the
+     file holds the preset and the next open loads it. Without a file (the
+     demo's configuration), only the core changes, and an INFO line says
+     `channels: <name> not saved: the profile loads the demo configuration,
+     which has no file`.
+  4. The readback is `preset(name)` with `saved_to`.
+
+**`replace_preset(text, group, name, settings)`**: a line belongs to the
+preset when its first three comma-separated fields, stripped, are
+`ConfigGroup`, `group` and `name`. Those lines are removed. The new lines
+(`ConfigGroup,<group>,<name>,<device>,<property>,<value>`) go where the
+first of them was. When there was none, they go after the group's last
+line. When the group has no line, they go at the end of the file. Every
+other line is kept byte for byte, comments included. The line ending is
+the file's own: `\r\n` when the text contains one, else `\n`. The text
+ends with a line ending. A preset `BF2` is untouched when `BF` is replaced.
+
+### 8.6 Facade, errors and profile
+
+- **`CAPABILITY_ROLES`** gains `ObjectiveTurret: (Role.objective_turret,)`,
+  `LightSource: (Role.light_source,)` and `Channels: ()`, after `Autofocus`
+  and before `Properties`. `available()` on the demo becomes `[XYStage,
+  ZStage, Camera, Shutter, Autofocus, ObjectiveTurret, LightSource,
+  Channels, Properties]`.
+- **`_build`**:
+
+  ```python
+  MMObjectiveTurret(
+      core,
+      label,
+      executor,
+      requires_confirm=profile.safety.turret_requires_confirm,
+      pixel_sizes_um=profile.camera.pixel_size_um,
+      autofocus=lambda: _owned(owner, "ObjectiveTurret")._lookup(Autofocus),
+  )
+  ```
+
+  ```python
+  MMLightSource(
+      core, label, executor, intensity_property=profile.light_source.intensity_property
+  )
+  ```
+
+  ```python
+  MMChannels(
+      core,
+      group,  # choose_group(...); None: no Channels, and nothing is built
+      executor,
+      objective_turret=roles.get(Role.objective_turret),
+      exclude=profile.channels.exclude,
+      config_path=profile.config_path(),
+      light=lambda: _owned(owner, "Channels")._lookup(LightSource),
+  )
+  ```
+
+  `choose_group`'s warnings are logged when `Channels` is built. Nothing a
+  capability stores is a bound method of itself (FM-92).
+- **`require(Channels)`** with no group raises `CapabilityMissingError(
+  "Channels", None, available=<the core's groups>, hint="no config group is
+  named for channels; name one in the profile's [channels] group")`.
+  `CapabilityMissingError` gains the keyword `hint: str = ""`. When it is
+  set, it replaces the `[roles.assign]` advice.
+- **`state()`** gains `objective: str | None`, `channel: str | None` and
+  `light_intensity_native: float | None`. Each is `None`, with an `errors`
+  entry when its read fails, and `None` without the capability.
+  `describe()` and `cli._status_line` are unchanged.
+- **No `_STOPPED` entry**: nothing the three capabilities move can be
+  stopped.
+- **Profile**:
+
+  ```toml
+  [light_source]
+  intensity_property = ""   # the light_source device's property that sets how bright; "" = found by hints (m2 §8.4)
+
+  [channels]
+  group = ""                # the config group whose presets are channels; "" = chosen (m2 §8.5)
+  exclude = []              # device labels that capture() never records
+  ```
+
+  ```python
+  class LightSourceSection(_Section):
+      intensity_property: str = ""
+  ```
+
+  ```python
+  class ChannelsSection(_Section):
+      group: str = ""
+      exclude: list[str] = []
+  ```
+
+  ```python
+  class Profile(BaseModel):  # gains
+      light_source: LightSourceSection = LightSourceSection()
+      channels: ChannelsSection = ChannelsSection()
+  ```
+
+  Validation, each a `ProfileError` naming the key: `channels.group` must
+  be printable ASCII, with no comma and no leading or trailing whitespace,
+  since it is written into the `.cfg`. Each `channels.exclude` entry must
+  not be empty. `Profile.demo()` and `profiles/demo.toml` stay equal: the
+  demo sets neither section, and `demo.toml` carries the lines above,
+  commented. `profiles/README.md` documents the three keys and the
+  `turret_requires_confirm` behaviour of §8.3. `nikon-ti2.toml` sets none
+  of them: its one group is chosen, and `DiaLamp`'s `Intensity` is found by
+  the hints.
+
+### 8.7 Kinds of call (extends M1 §13)
+
+| Kind | Calls |
+|---|---|
+| read | `ObjectiveTurret.labels`, `current`, `pixel_size_um`; `LightSource.device`, `intensity_knob`, `intensity_native`, `is_on`; `Channels.group`, `names`, `current`, `preset` |
+| action | `ObjectiveTurret.select` (a compound: the switch-off, then a motion that cannot be stopped); `LightSource.set_intensity_native`, `set_on(True)`; `Channels.select` (a motion that cannot be stopped), `capture` |
+| safe | `LightSource.set_on(False)` |
+
+### 8.8 FakeCore and tests
+
+**FakeCore** (extends M1 §8; each behaviour as measured in §8.1):
+- `setStateLabel(label, text)`. An unknown text raises the measured
+  `RuntimeError`.
+- **Config groups.** The attribute `config_groups: dict[str, dict[str,
+  list[tuple[str, str, str]]]]`. The calls:
+  - `getAvailableConfigGroups()` and `getAvailableConfigs(group)`, sorted
+    as the demo returns them;
+  - `getConfigData(group, name)`, a tuple of tuples;
+  - `defineConfig(group, name, device, prop, value)`, which merges and
+    creates the group;
+  - `deleteConfig(group, name)`;
+  - `setConfig(group, name)`, which applies each setting in order through
+    the property store, a `Core,Shutter` setting through the shutter slot;
+  - `getChannelGroup()` and `setChannelGroup(group)`.
+
+  The errors are the measured `ValueError`s. `defineConfig`, `deleteConfig`,
+  `setConfig` and `setChannelGroup` are logged.
+- `demo_like()` gains the demo's six groups with the measured settings, and
+  the channel group `Channel`. `tests/test_fake_core_demo.py` compares
+  groups, presets and settings with the demo.
+
+**Ti2-E layout for unit tests.** Use the session-0 list
+(`tests/data/nikon-ti2-devices.json`), with `Nosepiece`'s six labels,
+`DiaLamp` as a `Shutter` with a writable `Intensity` `"501"` and no limits,
+the filter turrets' labels, and the `Channel` group with `BF` copied from
+`profiles/nikon-ti2.cfg`.
+
+**Contracts** (`tests/contracts/`, through `Microscope` only):
+- **The envelope** also records the objective and the channel at the
+  start. The put-back restores the objective (`select(…, confirm=True)`)
+  after Z, and the channel after the exposure, each only when it differs.
+- **On `hardware`, the turret never turns, and no capture is ever run.**
+  `select` of the current label (which sends nothing) and of the current
+  preset are the only selections. A capture writes the stand's `.cfg`.
+- `test_objective_turret.py`:
+  - `current()` is in `labels()`;
+  - without `confirm`, `select` raises `SafetyRefusedError` whose
+    `how_to_force` names `confirm=True`, and on `fake` nothing is in the
+    log;
+  - an unknown label raises `ValueError`;
+  - on `fake` and `demo`, a select of another label returns it and reads
+    back;
+  - in dry-run, nothing turns;
+  - `pixel_size_um()` is 0.0 or the profile's value (0.65 on `fake` for
+    `Nikon 10X S Fluor`).
+- `test_light_source.py`: `intensity_knob()` is `None` or names the role's
+  device. Without a knob, `intensity_native()` is `None` and the set raises
+  `HardwareError`. With a knob, setting the current value reads back. When
+  `is_on()` is `None`, `set_on` raises. The demo's `LED` has neither.
+- `test_channels.py`:
+  - the group is named for channels;
+  - `current()` is in `names()` or is `None`;
+  - selecting the current preset reads back;
+  - on `fake` and `demo`, `FITC` then back;
+  - an unknown name raises `ValueError`;
+  - in dry-run, nothing changes;
+  - on `fake` and `demo`, `capture("smc-contract")` gives a preset that has
+    no `Objective` setting, has `Core,Shutter`, and has `saved_to=None`.
+
+**Unit tests** (the Ti2-E layout and the pure module):
+- `tests/unit/test_mm_objective_turret.py`;
+- `tests/unit/test_mm_light_source.py`;
+- `tests/unit/test_mm_channels.py`;
+- `tests/unit/test_channel_presets.py`, the pure module, with no core.
+
+**Demo**: `tests/test_turret_light_channels_demo.py`.
+
+The plan of #14 names each test.
+
+### 8.9 Not verified
+
+What the next Ti2-E session reads (#16):
+- whether `Nosepiece` reads busy while it turns, and how long a turn takes;
+- whether the Ti2-E switches PFS off by itself on a nosepiece change (if it
+  does not, and PFS keeps its lock across a change, the switch-off of §8.3
+  can be revisited);
+- `DiaLamp`'s `Intensity` range, and what it reads after a set of 210;
+- that `current()` reads `BF` after `select("BF")`, which depends on
+  what `DiaLamp`'s `Intensity` and `Camera-1`'s `Exposure` read back;
+- how long `setConfig` keeps `FilterTurret2` busy;
+- `getMagnificationFactor()` at each lever position (#167).
