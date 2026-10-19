@@ -463,6 +463,60 @@ def test_empty_adapter_search_path_entry_is_refused_in_code() -> None:
         MicroManagerSection(adapter_search_paths=["C:/mm", ""])
 
 
+# -- light source and channels (m2 §8.6) ------------------------------------------
+
+
+def test_light_source_and_channels_default_to_unknown() -> None:
+    profile = Profile.demo()
+    assert profile.light_source.intensity_property == ""
+    assert (profile.channels.group, profile.channels.exclude) == ("", [])
+
+
+def test_light_source_and_channels_are_read_from_the_profile(tmp_path: Path) -> None:
+    path = write_profile(
+        tmp_path / "p.toml",
+        '[light_source]\nintensity_property = "Intensity"\n\n'
+        '[channels]\ngroup = "Channel"\nexclude = ["CondenserTurret"]\n',
+    )
+    profile = Profile.load(path)
+    assert profile.light_source.intensity_property == "Intensity"
+    assert (profile.channels.group, profile.channels.exclude) == (
+        "Channel",
+        ["CondenserTurret"],
+    )
+
+
+@pytest.mark.parametrize("group", ["a,b", " Channel", "Channel ", "Kanäle"])
+def test_a_channel_group_that_cannot_go_into_a_cfg_is_refused(
+    tmp_path: Path, group: str
+) -> None:
+    path = write_profile(tmp_path / "p.toml", f'[channels]\ngroup = "{group}"\n')
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    assert (
+        f"channels.group: group {group!r} cannot be written to a configuration "
+        "file: use printable ASCII with no comma and no leading or trailing space"
+    ) in str(info.value)
+
+
+@pytest.mark.parametrize("entry", ["", "  "])
+def test_an_empty_channels_exclude_entry_is_refused(tmp_path: Path, entry: str) -> None:
+    path = write_profile(tmp_path / "p.toml", f'[channels]\nexclude = ["{entry}"]\n')
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    assert (
+        'channels.exclude: exclude entries must name a device label; remove the "" '
+        "entry"
+    ) in str(info.value)
+
+
+def test_an_unknown_key_in_channels_lists_the_allowed_keys(tmp_path: Path) -> None:
+    path = write_profile(tmp_path / "p.toml", '[channels]\ngroups = "Channel"\n')
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    assert "allowed keys: group, exclude" in str(info.value)
+
+
 # -- search paths -------------------------------------------------------------
 
 

@@ -71,6 +71,13 @@ offset_per_um = {}             # objective label -> offset change per µm, measu
 in_range_property = ""
 in_range_values = []
 
+[light_source]
+intensity_property = ""        # "" = found by hints on the light_source device
+
+[channels]
+group = ""                     # "" = the config group named for channels
+exclude = []                   # device labels a capture never records
+
 [quirks]                       # free-form, consumed by backends; documented per key in M2
 ```
 
@@ -89,6 +96,16 @@ in_range_values = []
 | `autofocus.lock_timeout_s` | How long `engage()` and the Z interlock wait for a lock, in (0, 600] s. Omitted: 5 s, a figure from `nikon-control` that was never measured, labelled as assumed wherever it shows. A Z move under an engaged autofocus that finds no lock within it raises `AutofocusLostError`, and the autofocus is then off. |
 | `autofocus.offset_per_um` | Objective label (as the objective turret reports it) -> offset change per µm of focus, **measured** with the autofocus locked, sign included; finite and non-zero. `focus_by_um()` while locked refuses for an objective that has none. |
 | `autofocus.in_range_property` / `in_range_values` | The autofocus device's property that says whether its reference is in range, and the values of it that mean so. Both or neither, and no empty value. Without them, `is_in_range()` is `None`: the layer never guesses which property means "in range". |
+| `safety.turret_requires_confirm` | `true` (the default): `ObjectiveTurret.select()` refuses unless the call passes `confirm=True`, because turning the nosepiece can drive an objective into a loaded plate. `false`: it turns without `confirm`, and an INFO line says so at each select. Either way, a turn switches the autofocus off first and never engages it again. |
+| `light_source.intensity_property` | The `light_source` device's property that sets how bright, in the device's own units. Used when the device has it and it is writable; otherwise a WARNING, and the hints decide. `""`: the first writable numeric property whose name holds `intensity`, `brightness`, `power`, `level` or `voltage`, one with limits first. With none, the light source has no knob, and `set_intensity_native()` refuses. |
+| `channels.group` | The config group whose presets are channels; printable ASCII, no comma, no leading or trailing space. `""`: the core's channel group if its name holds `channel` and none of `camera`, `objective` or `system`, else the one group so named; with several, none (set this key). It may name a group that does not exist yet: the first `capture()` creates it. |
+| `channels.exclude` | Device labels that `capture()` never records (a `State` device that is not part of a channel). The objective turret is never recorded, listed or not. |
+
+**A capture writes the configuration file.** `Channels.capture(name)` replaces
+the preset in the profile's `micromanager.config` file (an atomic text edit:
+every other line, comment and line ending is kept), then in the running core.
+`nikon-ti2.cfg` is committed, so a capture at the stand edits the repository's
+copy; the owner decides whether to commit it.
 
 The new numeric keys (`lock_timeout_s`, `offset_per_um`'s values,
 `max_autofocus_offset_jog`, the offset soft limits) refuse a TOML boolean
