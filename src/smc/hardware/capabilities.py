@@ -310,7 +310,9 @@ class Autofocus(Protocol):
         """Switch it on and wait for the lock; ``False``: no lock, and it is off.
 
         ``timeout_s`` defaults to the profile's ``lock_timeout_s``, else 5 s
-        (assumed); it must be finite and in (0, 600] s.
+        (assumed); it must be finite and in (0, 600] s. Its search drives Z,
+        so a ``ZStage.stop()`` during the search ends it with the autofocus
+        off, as a raise (``MotionStoppedError``), never a ``False``.
         """
         ...
 
@@ -323,7 +325,12 @@ class Autofocus(Protocol):
         ...
 
     def set_offset_native(self, value: float) -> float:
-        """Move the offset to ``value``; return the readback (soft limits apply)."""
+        """Move the offset to ``value``; return the readback (soft limits apply).
+
+        With the autofocus on, it follows the offset and drives Z, so a
+        ``ZStage.stop()`` during the move ends it with the autofocus off
+        (``MotionStoppedError``).
+        """
         ...
 
     def offset_by_native(self, delta: float, *, force: bool = False) -> float:
@@ -331,7 +338,8 @@ class Autofocus(Protocol):
 
         With no ``[safety] max_autofocus_offset_jog`` in the profile, every
         non-zero change needs ``force``: the unit is the stand's own, so no
-        default can be assumed.
+        default can be assumed. A ``ZStage.stop()`` ends it as it ends
+        ``set_offset_native``.
         """
         ...
 

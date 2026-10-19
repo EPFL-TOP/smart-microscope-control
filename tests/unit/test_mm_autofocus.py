@@ -1757,6 +1757,480 @@ def test_emergency_stop_during_the_relock_switches_pfs_off_once() -> None:
         stand.microscope.resume()
 
 
+# --- the operator's Z stop reaches a direct call (m2 §3.3.1, #144) -----------
+
+_LEFT_OFF = "autofocus PFS: left off, because {} did not complete (MotionStoppedError)"
+
+
+def _z_stopped_during(description: str) -> str:
+    return (
+        f"`z ZDrive`: it was stopped during {description}, so autofocus PFS was left "
+        f"off; read the position before moving on"
+    )
+
+
+@contextmanager
+def _lock_held_by_a_snap(
+    stand: Stand, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[threading.Event]:
+    """A snap holds the microscope lock until the block ends.
+
+    Yields the event set once another action waits for the lock behind it.
+    The snap is logged (``snapImage()``) when the block ends.
+    """
+    camera, executor = stand.microscope.require(Camera), stand.microscope._executor
+    queued, held, release = threading.Event(), threading.Event(), threading.Event()
+    contention, snap = executor._contention, stand.core.snapImage
+
+    def noted(*args: Any, **kwargs: Any) -> None:
+        queued.set()
+        contention(*args, **kwargs)
+
+    def hung_snap() -> None:
+        held.set()
+        release.wait(JOIN_S)
+        snap()
+
+    monkeypatch.setattr(executor, "_contention", noted)
+    monkeypatch.setattr(stand.core, "snapImage", hung_snap)
+    snapper = _Thread(camera.snap)
+    assert held.wait(JOIN_S)
+    try:
+        yield queued
+    finally:
+        release.set()
+        snapper.join()
+
+
+def _z_stop_while_queued(
+    stand: Stand, monkeypatch: pytest.MonkeyPatch, action: Callable[[], object]
+) -> _Thread:
+    """``action`` queued behind a hung snap, then a Z stop, then the snap released.
+
+    The thread that ran ``action``, joined.
+    """
+    z = stand.z
+    with _lock_held_by_a_snap(stand, monkeypatch) as queued:
+        mover = _Thread(action)
+        assert queued.wait(JOIN_S)
+        z.stop()
+    mover.join()
+    return mover
+
+
+def test_z_stop_during_a_direct_engage_switches_pfs_off_and_raises(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # PFS searching for its lock drives Z: before #144, this stop was ignored
+    # and the search went on until the lock timeout.
+    with _ti2() as stand:
+        stand.core.autofocus_lockable = False
+        af, z = stand.af, stand.z
+        with caplog.at_level(logging.WARNING):
+            waiter = _Thread(lambda: af.engage(timeout_s=2 * JOIN_S))
+            _wait_for(_sent_and_waiting(stand, [ON], "autofocus PFS"), "the lock wait")
+            z.stop()
+            waiter.join()
+        assert isinstance(waiter.error, MotionStoppedError)
+        assert str(waiter.error) == _z_stopped_during("autofocus: engage")
+        assert stand.core.log == [ON, OFF, "stop('ZDrive')"]
+        assert stand.core.isContinuousFocusEnabled() is False
+        assert _LEFT_OFF.format("autofocus: engage") in caplog.messages
+        assert stand.microscope.state().moving == ()
+
+
+def test_z_stop_while_a_direct_engage_waits_for_the_lock_cancels_it_with_nothing_sent(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # M1 §13: a stop cancels the actions on its device called before it. PFS
+    # is left as it was, still holding focus, so nothing says "left off".
+    with _ti2() as stand:
+        stand.engage_directly()
+        af = stand.af
+        with caplog.at_level(logging.WARNING):
+            mover = _z_stop_while_queued(stand, monkeypatch, af.engage)
+        assert isinstance(mover.error, MotionStoppedError)
+        assert str(mover.error) == (
+            "`z ZDrive`: it was stopped before it started; read the position before "
+            "moving on"
+        )
+        assert stand.core.log == ["stop('ZDrive')", "snapImage()"]
+        assert stand.core.isContinuousFocusLocked() is True
+        assert not any("left off" in m for m in caplog.messages)
+
+
+def test_z_stop_whose_switch_off_fails_during_a_direct_engage_does_not_say_left_off(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with _ti2() as stand:
+        stand.core.autofocus_lockable = False
+        af, z, switch = stand.af, stand.z, stand.core.enableContinuousFocus
+
+        def stuck_on(enable: bool) -> None:
+            if enable:
+                switch(True)
+                return
+            stand.core.log.append(OFF)
+            raise RuntimeError("PFS: stuck on")
+
+        with caplog.at_level(logging.WARNING):
+            waiter = _Thread(lambda: af.engage(timeout_s=2 * JOIN_S))
+            _wait_for(_sent_and_waiting(stand, [ON], "autofocus PFS"), "the lock wait")
+            monkeypatch.setattr(stand.core, "enableContinuousFocus", stuck_on)
+            with pytest.raises(HardwareError, match=re.escape("(PFS: stuck on)")):
+                z.stop()
+            assert stand.core.log == [ON, OFF, "stop('ZDrive')"]
+            assert stand.core.isContinuousFocusEnabled() is True
+            # The emergency stop, with a switch-off that works, ends the wait.
+            monkeypatch.setattr(stand.core, "enableContinuousFocus", switch)
+            stand.microscope.stop()
+            waiter.join()
+        assert isinstance(waiter.error, MotionStoppedError)
+        assert waiter.error.device == "autofocus PFS"  # the wait's own error
+        assert not any("left off" in m for m in caplog.messages)
+        assert _STUCK_ON.format("autofocus: engage") in caplog.messages
+        stand.microscope.resume()
+
+
+def test_emergency_stop_during_a_direct_engage_switches_pfs_off_once() -> None:
+    # Halted, no link is called (m2 §3.11): one switch-off, then the stages.
+    with _ti2() as stand:
+        stand.core.autofocus_lockable = False
+        af = stand.af
+        waiter = _Thread(lambda: af.engage(timeout_s=2 * JOIN_S))
+        _wait_for(_sent_and_waiting(stand, [ON], "autofocus PFS"), "the lock wait")
+        stand.microscope.stop()
+        waiter.join()
+        assert isinstance(waiter.error, MotionStoppedError)
+        assert stand.core.log == [
+            ON,
+            OFF,
+            "stop('PFSOffset')",
+            "stop('XYStage')",
+            "stop('ZDrive')",
+        ]
+        assert stand.core.isContinuousFocusEnabled() is False
+        stand.microscope.resume()
+
+
+def test_direct_engage_with_an_overridden_focus_drive_links_no_z_stop() -> None:
+    # Its stop does not go through the Executor: there is nothing to link.
+    with _ti2() as stand:
+        stand.microscope.override(ZStage, _StubZ())
+        stand.core.autofocus_lockable = False
+        af, executor = stand.af, stand.microscope._executor
+        waiter = _Thread(lambda: af.engage(timeout_s=2 * JOIN_S))
+        _wait_for(_sent_and_waiting(stand, [ON], "autofocus PFS"), "the lock wait")
+        assert executor._links == {}
+        af.disengage()
+        waiter.join()
+        assert isinstance(waiter.error, MotionStoppedError)
+        assert waiter.error.device == "autofocus PFS"
+        assert stand.core.log == [ON, OFF]
+
+
+_OFFSET_CALLS: dict[str, tuple[Callable[[Autofocus], float], str]] = {
+    "absolute": (
+        lambda af: af.set_offset_native(7801.0),
+        "autofocus_offset: move_to 7801.0 device units",
+    ),
+    "relative": (
+        lambda af: af.offset_by_native(1.0, force=True),
+        "autofocus_offset: move_by 1.0 device units",
+    ),
+}
+
+
+def _offset_busy_until_stopped(stand: Stand, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``PFSOffset`` reads busy from its move until a stop of it arrives."""
+    stop = stand.core.stop
+
+    def stop_arrives(label: str) -> None:
+        stop(label)
+        stand.core.busy_devices.discard(label)
+
+    monkeypatch.setattr(stand.core, "stop", stop_arrives)
+    stand.core.busy_devices.add("PFSOffset")
+
+
+@pytest.mark.parametrize("pfs", ["locked", "on, not locked"])
+@pytest.mark.parametrize("call", sorted(_OFFSET_CALLS))
+def test_z_stop_during_a_direct_offset_move_with_pfs_on_switches_it_off_and_stops_the_offset_device(
+    call: str,
+    pfs: str,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # PFS follows its offset, and drives Z, as soon as it is on: locked or
+    # still searching (m2 §3.3.1). The link condition is "engaged".
+    move, description = _OFFSET_CALLS[call]
+    with _ti2(core=_at_offset(7800.0)) as stand:
+        stand.engage_directly(lockable=pfs == "locked")
+        af, z = stand.af, stand.z
+        _offset_busy_until_stopped(stand, monkeypatch)
+        sent = ["setPosition('PFSOffset', 7801.0)"]
+        with caplog.at_level(logging.WARNING):
+            mover = _Thread(lambda: move(af))
+            _wait_for(
+                _sent_and_waiting(stand, sent, "autofocus_offset PFSOffset"), "offset"
+            )
+            z.stop()
+            mover.join()
+        assert isinstance(mover.error, MotionStoppedError)
+        assert str(mover.error) == _z_stopped_during(description)
+        assert stand.core.log == [*sent, OFF, "stop('PFSOffset')", "stop('ZDrive')"]
+        assert stand.core.isContinuousFocusEnabled() is False
+        assert _LEFT_OFF.format(description) in caplog.messages
+        assert stand.microscope.state().moving == ()
+
+
+def test_z_stop_during_a_direct_offset_move_with_pfs_off_leaves_the_move_alone(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Off, the offset moves a lens, not Z (assumed, m2 §4 item 5).
+    with _ti2(core=_at_offset(7800.0)) as stand:
+        af, z = stand.af, stand.z
+        stand.core.busy_devices.add("PFSOffset")
+        sent = ["setPosition('PFSOffset', 7801.0)"]
+        with caplog.at_level(logging.WARNING):
+            mover = _Thread(lambda: af.set_offset_native(7801.0))
+            _wait_for(
+                _sent_and_waiting(stand, sent, "autofocus_offset PFSOffset"), "offset"
+            )
+            z.stop()
+            stand.core.busy_devices.discard("PFSOffset")
+            mover.join()
+        assert mover.error is None
+        assert mover.result == 7801.0
+        assert stand.core.log == [*sent, "stop('ZDrive')"]
+        assert not any("left off" in m for m in caplog.messages)
+
+
+def test_z_stop_during_a_direct_offset_move_with_pfs_state_unreadable_still_switches_it_off(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Unknown counts as on (FM-19): left on, PFS would follow the offset.
+    with _ti2(core=_at_offset(7800.0)) as stand:
+        stand.engage_directly()
+        af, z, enabled = stand.af, stand.z, stand.core.isContinuousFocusEnabled
+        reads: list[int] = []
+
+        def unreadable_once() -> bool:
+            reads.append(1)
+            if len(reads) == 1:
+                raise RuntimeError("PFS: no answer")
+            return enabled()
+
+        monkeypatch.setattr(stand.core, "isContinuousFocusEnabled", unreadable_once)
+        _offset_busy_until_stopped(stand, monkeypatch)
+        sent = ["setPosition('PFSOffset', 7801.0)"]
+        with caplog.at_level(logging.WARNING):
+            mover = _Thread(lambda: af.set_offset_native(7801.0))
+            _wait_for(
+                _sent_and_waiting(stand, sent, "autofocus_offset PFSOffset"), "offset"
+            )
+            z.stop()
+            mover.join()
+        assert reads, "the state was never read"
+        description = "autofocus_offset: move_to 7801.0 device units"
+        assert isinstance(mover.error, MotionStoppedError)
+        assert str(mover.error) == _z_stopped_during(description)
+        assert stand.core.log == [*sent, OFF, "stop('PFSOffset')", "stop('ZDrive')"]
+        assert _LEFT_OFF.format(description) in caplog.messages
+
+
+def test_z_stop_before_a_direct_offset_move_is_sent_cancels_it(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The stop lands while the relative move reads its anchor: sent after it,
+    # the offset change would drive Z after the operator's stop.
+    with _ti2(core=_at_offset(7800.0)) as stand:
+        stand.engage_directly()
+        af, z, read = stand.af, stand.z, stand.core.getPosition
+        stopped: list[str] = []
+
+        def stop_on_the_anchor(label: str | None = None) -> float:
+            if label == "PFSOffset" and not stopped:
+                stopped.append(label)
+                z.stop()
+            return read(label)
+
+        monkeypatch.setattr(stand.core, "getPosition", stop_on_the_anchor)
+        description = "autofocus_offset: move_by 1.0 device units"
+        with caplog.at_level(logging.WARNING), pytest.raises(MotionStoppedError) as e:
+            af.offset_by_native(1.0, force=True)
+        assert str(e.value) == _z_stopped_during(description)
+        assert stand.core.log == [OFF, "stop('PFSOffset')", "stop('ZDrive')"]
+        assert stand.af.offset_native() == 7800.0
+        assert _LEFT_OFF.format(description) in caplog.messages
+
+
+@pytest.mark.parametrize("call", sorted(_OFFSET_CALLS))
+def test_z_stop_while_a_direct_offset_move_waits_for_the_lock_cancels_it_with_nothing_sent(
+    call: str, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    move, _ = _OFFSET_CALLS[call]
+    with _ti2(core=_at_offset(7800.0)) as stand:
+        stand.engage_directly()
+        af = stand.af
+        with caplog.at_level(logging.WARNING):
+            mover = _z_stop_while_queued(stand, monkeypatch, lambda: move(af))
+        assert isinstance(mover.error, MotionStoppedError)
+        assert str(mover.error) == (
+            "`z ZDrive`: it was stopped before it started; read the position before "
+            "moving on"
+        )
+        assert stand.core.log == ["stop('ZDrive')", "snapImage()"]
+        assert stand.af.offset_native() == 7800.0
+        assert stand.core.isContinuousFocusLocked() is True
+        assert not any("left off" in m for m in caplog.messages)
+
+
+@pytest.mark.parametrize("call", sorted(_OFFSET_CALLS))
+def test_pfs_switched_on_while_a_direct_offset_move_waits_for_the_lock_is_still_linked(
+    call: str, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Adversarial review of #144: the state is read under the microscope
+    # lock, not when the call is made. PFS switched on meanwhile follows the
+    # offset, so the Z stop must reach the move.
+    move, description = _OFFSET_CALLS[call]
+    with _ti2(core=_at_offset(7800.0)) as stand:
+        af, z = stand.af, stand.z
+        _offset_busy_until_stopped(stand, monkeypatch)
+        with _lock_held_by_a_snap(stand, monkeypatch) as queued:
+            mover = _Thread(lambda: move(af))
+            assert queued.wait(JOIN_S)
+            stand.core.enableContinuousFocus(True)  # at the stand, meanwhile
+        sent = [ON, "snapImage()", "setPosition('PFSOffset', 7801.0)"]
+        with caplog.at_level(logging.WARNING):
+            _wait_for(
+                _sent_and_waiting(stand, sent, "autofocus_offset PFSOffset"), "offset"
+            )
+            z.stop()
+            mover.join()
+        assert isinstance(mover.error, MotionStoppedError)
+        assert str(mover.error) == _z_stopped_during(description)
+        assert stand.core.log == [*sent, OFF, "stop('PFSOffset')", "stop('ZDrive')"]
+        assert stand.core.isContinuousFocusEnabled() is False
+        assert _LEFT_OFF.format(description) in caplog.messages
+
+
+def test_a_refused_direct_offset_move_neither_waits_for_the_lock_nor_reads_pfs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The guards run before the compound (plan of #144): behind a long lock
+    # holder, an engage() waiting up to 10 min, a refusal comes at once.
+    profile = _profile(
+        safety={
+            "max_autofocus_offset_jog": 5.0,
+            "autofocus_offset_soft_limits": (7000.0, 8000.0),
+        }
+    )
+    with _ti2(profile, core=_at_offset(7800.0)) as stand:
+        af, enabled = stand.af, stand.core.isContinuousFocusEnabled
+        reads: list[int] = []
+
+        def counted() -> bool:
+            reads.append(1)
+            return enabled()
+
+        monkeypatch.setattr(stand.core, "isContinuousFocusEnabled", counted)
+        with _lock_held_by_a_snap(stand, monkeypatch):
+            for change in (
+                lambda: af.set_offset_native(9000.0),
+                lambda: af.offset_by_native(6.0),
+            ):
+                refused = _Thread(change)
+                refused.join()  # while the snap still holds the lock
+                assert isinstance(refused.error, SafetyRefusedError)
+        assert reads == []
+        assert stand.core.log == ["snapImage()"]
+
+
+@pytest.mark.parametrize("how", ["stop()", "close()"])
+def test_emergency_stop_or_close_during_a_direct_offset_move_with_pfs_on(
+    how: str, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # m2 §3.3.1's last two columns. Halted, no link is called: one switch-off,
+    # and the move's own error. close() does not halt, so the Z stop it sends
+    # last still reaches the link (m2 §3.11). The offset device reads busy
+    # until Z's stop, so the move cannot end between close()'s two stops.
+    with _ti2(core=_at_offset(7800.0)) as stand:
+        stand.engage_directly()
+        af, stop = stand.af, stand.core.stop
+
+        def stop_arrives(label: str) -> None:
+            stop(label)
+            if label == "ZDrive":
+                stand.core.busy_devices.discard("PFSOffset")
+
+        monkeypatch.setattr(stand.core, "stop", stop_arrives)
+        stand.core.busy_devices.add("PFSOffset")
+        sent = ["setPosition('PFSOffset', 7801.0)"]
+        description = "autofocus_offset: move_to 7801.0 device units"
+        with caplog.at_level(logging.WARNING):
+            mover = _Thread(lambda: af.set_offset_native(7801.0))
+            _wait_for(
+                _sent_and_waiting(stand, sent, "autofocus_offset PFSOffset"), "offset"
+            )
+            if how == "stop()":
+                stand.microscope.stop()
+            else:
+                stand.microscope.close()
+            mover.join()
+        assert isinstance(mover.error, MotionStoppedError)
+        assert stand.core.isContinuousFocusEnabled() is False
+        stages = [OFF, "stop('PFSOffset')", "stop('XYStage')"]
+        if how == "stop()":
+            assert mover.error.device == "autofocus_offset PFSOffset"
+            assert stand.core.log == [*sent, *stages, "stop('ZDrive')"]
+            assert not any("left off" in m for m in caplog.messages)
+            stand.microscope.resume()
+        else:
+            assert str(mover.error) == _z_stopped_during(description)
+            assert stand.core.log == [
+                *sent,
+                *stages,
+                OFF,
+                "stop('PFSOffset')",
+                "stop('ZDrive')",
+                "unloadAllDevices()",
+            ]
+            assert _LEFT_OFF.format(description) in caplog.messages
+
+
+def test_z_stop_during_a_direct_offset_move_without_an_offset_device_is_the_switch_off_alone() -> (
+    None
+):
+    # The demo's layout: the offset is the autofocus device's own, keyed by
+    # its label, and cannot be stopped: the switch-off cancels its move.
+    devices = [
+        FakeDevice("ZDrive", DeviceType.Stage),
+        FakeDevice("PFS", DeviceType.AutoFocus),
+        FakeDevice("XYStage", DeviceType.XYStage),
+        FakeDevice("Camera-1", DeviceType.Camera),
+    ]
+    core = FakeCore(
+        devices, camera="Camera-1", xy_stage="XYStage", focus="ZDrive", autofocus="PFS"
+    )
+    with _ti2(core=core) as stand:
+        assert stand.microscope.roles.get(Role.autofocus_offset) is None
+        stand.engage_directly()
+        af, z = stand.af, stand.z
+        core.busy_devices.add("PFS")
+        mover = _Thread(lambda: af.set_offset_native(-6.0))
+        sent = ["setAutoFocusOffset(-6.0)"]
+        _wait_for(_sent_and_waiting(stand, sent, "autofocus PFS offset"), "offset")
+        z.stop()  # no stop of an offset device that cannot be stopped
+        core.busy_devices.discard("PFS")
+        mover.join()
+        assert isinstance(mover.error, MotionStoppedError)
+        assert str(mover.error) == _z_stopped_during(
+            "autofocus_offset: move_to -6.0 device units"
+        )
+        assert core.log == [*sent, OFF, "stop('ZDrive')"]
+
+
 def test_engage_that_loses_the_lock_and_cannot_switch_off_stays_registered(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2163,6 +2637,47 @@ def test_close_with_nothing_moving_leaves_pfs_as_it_is() -> None:
     microscope.close()
     # PFS holding focus after smc exits is a legitimate state.
     assert core.log == ["unloadAllDevices()"]
+
+
+def test_close_during_the_relock_keeps_the_link(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Decided in m2 §3.11 (#144): close() does not halt, so the Z stop it
+    # sends still reaches the relock's link, which switches PFS off once more
+    # before Z's stop. Harmless, and the mover is told it was left off.
+    core = _ti2_core()
+    profile = _profile(autofocus={"lock_timeout_s": 2 * JOIN_S})
+    microscope = Microscope.from_core(cast("CMMCorePlus", core), profile)
+    stand = Stand(core, microscope)
+    stand.engage_directly(lockable=False)
+    z, enabled = stand.z, core.isContinuousFocusEnabled
+
+    def reports_off_late() -> bool:
+        # The link is reached only while the relock still waits when Z's
+        # stop goes out. Here PFS reads on until then; on a stand, a slow
+        # stage stop can let the relock end first, with PFS off all the same
+        # (adversarial review of #144).
+        return "stop('ZDrive')" not in core.log or enabled()
+
+    relocking = [OFF, "setPosition('ZDrive', 12.0)", ON]
+    with caplog.at_level(logging.WARNING):
+        mover = _Thread(lambda: z.move_to_um(12.0))
+        _wait_for(_sent_and_waiting(stand, relocking, "autofocus PFS"), "relock")
+        monkeypatch.setattr(core, "isContinuousFocusEnabled", reports_off_late)
+        microscope.close()
+        mover.join()
+    assert isinstance(mover.error, MotionStoppedError)
+    assert str(mover.error) == _z_stopped_during("z: move_to 12.0 µm")
+    assert core.log == [
+        *relocking,
+        OFF,
+        "stop('PFSOffset')",
+        "stop('XYStage')",
+        OFF,
+        "stop('ZDrive')",
+        "unloadAllDevices()",
+    ]
+    assert _LEFT_OFF.format("z: move_to 12.0 µm") in caplog.messages
 
 
 def test_state_reports_the_autofocus() -> None:
