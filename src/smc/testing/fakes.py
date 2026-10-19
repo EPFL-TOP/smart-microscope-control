@@ -597,9 +597,10 @@ class FakeCore:
         if prop.read_only:
             return
         text = str(value)
-        refused = RuntimeError(f'Cannot set property "{name}" to "{text}"')
+        # Raised where it is built, never held in a local: the exception's
+        # traceback reaches this frame, a cycle through the core (#148, FM-92).
         if (prop.allowed and text not in prop.allowed) or _outside(prop, text):
-            raise refused
+            raise _refused(name, text)
         try:
             if device.type == DeviceType.State and name == "State":
                 self._set_position(device, int(float(text)))
@@ -611,7 +612,7 @@ class FakeCore:
                 prop.value = text
         except ValueError:
             # Not a number, or not one of the device's labels.
-            raise refused from None
+            raise _refused(name, text) from None
 
     def isPropertyReadOnly(self, label: str, name: str) -> bool:
         return self._property(label, name).read_only
@@ -753,6 +754,11 @@ def _dtype(bit_depth: int) -> type[np.unsignedinteger]:
     if bit_depth <= 16:
         return np.uint16
     return np.uint32
+
+
+def _refused(name: str, text: str) -> RuntimeError:
+    """MMCore's error for a value a property does not take (measured)."""
+    return RuntimeError(f'Cannot set property "{name}" to "{text}"')
 
 
 def _outside(prop: FakeProperty, text: str) -> bool:

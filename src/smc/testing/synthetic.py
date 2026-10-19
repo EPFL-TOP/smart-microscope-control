@@ -38,6 +38,7 @@ down.
 from __future__ import annotations
 
 import math
+import weakref
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
@@ -47,6 +48,7 @@ import numpy.typing as npt
 import useq
 
 from smc.hardware.capabilities import XYStage, ZStage
+from smc.hardware.errors import HardwareError
 
 if TYPE_CHECKING:
     from smc.hardware.microscope import Microscope
@@ -512,6 +514,11 @@ class SampleCamera:
 
     Args:
         microscope: The stand whose stages say where the camera is looking.
+            Held weakly: the facade holds this camera as its ``Camera``
+            capability, and a strong reference back would make a cycle
+            through the core, freed only by the cyclic collector (FM-92). The
+            camera does not keep the stand alive: ``snap()`` refuses once it
+            is gone.
         sample: What it looks at.
         pixel_size_um: Object-space pixel size. Required and never defaulted:
             a pixel size of 0 is refused, as it would be reported by a real
@@ -535,7 +542,7 @@ class SampleCamera:
         camera_rotation_deg: float = 0.0,
         mirrored: bool = False,
     ) -> None:
-        self._microscope = microscope
+        self._microscope = weakref.ref(microscope)
         self._sample = sample
         self._pixel_size_um = _positive(
             "pixel_size_um", pixel_size_um, _MAX_PIXEL_SIZE_UM
@@ -551,9 +558,20 @@ class SampleCamera:
         self._exposure_ms = REFERENCE_EXPOSURE_MS
 
     def snap(self) -> npt.NDArray[np.uint16]:
-        """One frame of the sample at the stage's current position."""
-        position = self._microscope.require(XYStage).position_um()
-        z_stage = self._microscope.get(ZStage)
+        """One frame of the sample at the stage's current position.
+
+        Raises:
+            HardwareError: The ``Microscope`` this camera was built on no
+                longer exists; nothing is read.
+        """
+        microscope = self._microscope()
+        if microscope is None:
+            raise HardwareError(
+                "SampleCamera belongs to a Microscope that no longer exists; keep "
+                "the Microscope alive for as long as the camera is in use"
+            )
+        position = microscope.require(XYStage).position_um()
+        z_stage = microscope.get(ZStage)
         z_um = 0.0 if z_stage is None else z_stage.position_um()
         return self._sample.render(
             position.x_um,

@@ -10,6 +10,10 @@ Every test here runs under ``no_cyclic_gc`` and watches the facade and the core
 with weak references. A new error path of a stop, a safe call or a CLI exit
 goes in here. Hazards, measured on #148:
 
+* Pytest keeps every ``LogRecord`` of a test, and the arguments of the
+  record of a failed stop hold the error, whose traceback holds the fake: a
+  retention by the test's handler, not a cycle of the code, so logging is
+  disabled here (``_no_kept_log_records``).
 * ``FakeCore.failing`` keeps the instance it raised, and its traceback holds
   the fake's frames: clear it before the drop.
 * A hook is an instance attribute of the fake, removed with ``del``;
@@ -22,8 +26,9 @@ goes in here. Hazards, measured on #148:
 
 from __future__ import annotations
 
+import logging
 import weakref
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any, cast
 
 import pytest
@@ -36,6 +41,16 @@ from smc.hardware.profile import Profile
 from smc.testing import FakeCore, PlateSample, SampleCamera
 
 _FACADE_AND_CORE_FREED = {"facade": False, "core": False}
+
+
+@pytest.fixture(autouse=True)
+def _no_kept_log_records() -> Iterator[None]:
+    previous = logging.root.manager.disable
+    logging.disable(logging.CRITICAL)
+    try:
+        yield
+    finally:
+        logging.disable(previous)
 
 
 def _watch(microscope: Microscope, core: FakeCore) -> dict[str, weakref.ref[Any]]:
@@ -153,7 +168,7 @@ def test_a_cli_command_that_ends_in_an_error_frees_its_core(
     core_type: type[FakeCore],
     code: int,
 ) -> None:
-    # `_reported` was a generator: one that converts an exception keeps the
+    # `_Reported` was a generator: one that converts an exception keeps the
     # command's frames, and the stand, in a cycle on Python 3.11+ (#148).
     exit_code, watched = _run_cli(monkeypatch, core_type, args)
     assert exit_code == code
