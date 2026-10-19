@@ -464,6 +464,11 @@ def _diagnose_nikon(checks: Sequence[nikon.StandCheck], error: BaseException) ->
             _say(f"{check.stand.name}: what to check")
             for line in nikon.diagnosis(check, probes):
                 _say(f"  {line}")
+    except KeyboardInterrupt:
+        # The probe killed its child before it re-raised. Said here, since the
+        # report of the body's own Ctrl-C is already behind us.
+        _fail("interrupted while checking the stand; the remaining checks were not run")
+        raise typer.Exit(code=_EXIT_INTERRUPTED) from None
     except Exception as exc:
         _fail(f"could not diagnose the stand: {exc}")
 

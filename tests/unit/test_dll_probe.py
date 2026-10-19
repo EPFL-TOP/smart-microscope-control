@@ -8,11 +8,14 @@ in ``tmp_path``; the canned child never opens it.
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import subprocess
 import sys
 import time
+import types
+from ctypes import wintypes
 from pathlib import Path
 
 import pytest
@@ -451,9 +454,209 @@ def test_the_child_main_prints_one_verdict_line_and_returns_zero(
         return None
 
     monkeypatch.setattr(_dll_child, "_load", load)
+    # SetErrorMode is process-wide and inherited by every child made afterwards:
+    # on Windows this must not set it for the rest of the test session (FM-46).
+    monkeypatch.setattr(_dll_child, "_no_error_dialogs", lambda: None)
 
     assert _dll_child.main([str(dll)]) == 0
 
     lines = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()]
     assert [json.loads(ln) for ln in lines] == [{"loads": True}]
     assert seen == [dll]
+
+
+# -- the child's Windows-only lines, run on every OS with stand-ins ----------------------
+# `ctypes.WinDLL` and the platform check are replaced, so these run on macOS and
+# Linux as they do on Windows, and on Windows nothing real is loaded or set.
+
+
+class _Win32Sys:
+    """``sys`` as ``_dll_child`` sees it on Windows; everything else is the real one."""
+
+    platform = "win32"
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(sys, name)
+
+
+class _Win32:
+    """What the child asked Windows for, in order."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, ...]] = []
+        self.load_error: OSError | None = None
+
+        def set_error_mode(mode: int) -> int:
+            self.calls.append(("SetErrorMode", mode))
+            return 0
+
+        self.set_error_mode = set_error_mode
+
+    def windll(self, name: str, **kwargs: object) -> object:
+        if name == "kernel32":
+            return types.SimpleNamespace(SetErrorMode=self.set_error_mode)
+        self.calls.append(("load", name, kwargs))
+        if self.load_error is not None:
+            raise self.load_error
+        return object()
+
+
+@pytest.fixture
+def win32(monkeypatch: pytest.MonkeyPatch) -> _Win32:
+    recorder = _Win32()
+    monkeypatch.setattr(_dll_child, "sys", _Win32Sys())
+    monkeypatch.setattr(ctypes, "WinDLL", recorder.windll, raising=False)
+    return recorder
+
+
+def test_the_child_loads_with_the_altered_search_path(win32: _Win32, dll: Path) -> None:
+    assert _dll_child._load(dll) is None
+
+    # LOAD_WITH_ALTERED_SEARCH_PATH: the DLL's own folder first, then PATH,
+    # where each Nikon driver is found (design m2 §7.3). 0x8 written out here.
+    assert win32.calls == [("load", str(dll), {"winmode": 0x8})]
+
+
+def test_the_child_hands_back_the_oserror_windows_raised(
+    win32: _Win32, dll: Path
+) -> None:
+    error = OSError(22, "The specified module could not be found.")
+    win32.load_error = error
+
+    assert _dll_child._load(dll) is error
+
+
+def test_the_child_guards_itself_before_it_loads(win32: _Win32, dll: Path) -> None:
+    # FM-03: a missing dependency would open a modal dialog that looks like a
+    # hang; the guard is set before the DLL is touched, with the two flags.
+    assert _dll_child.main([str(dll)]) == 0
+
+    assert win32.calls == [
+        ("SetErrorMode", 0x0001 | 0x0002),
+        ("load", str(dll), {"winmode": 0x8}),
+    ]
+    # FM-26: declared before the first call, from ctypes.wintypes.
+    assert win32.set_error_mode.argtypes == [wintypes.UINT]  # type: ignore[attr-defined]
+    assert win32.set_error_mode.restype is wintypes.UINT  # type: ignore[attr-defined]
+
+
+def test_a_dll_that_prints_without_a_newline_does_not_hide_the_verdict(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], dll: Path
+) -> None:
+    # FM-01: the verdict is on a line of its own whatever the DLL printed.
+    def noisy(path: Path) -> OSError | None:
+        sys.stdout.write("banner without a newline")
+        return None
+
+    monkeypatch.setattr(_dll_child, "_no_error_dialogs", lambda: None)
+    monkeypatch.setattr(_dll_child, "_load", noisy)
+
+    _dll_child.main([str(dll)])
+
+    out = capsys.readouterr().out
+    assert out.startswith("banner without a newline\n")
+    assert json.loads(out.splitlines()[-1]) == {"loads": True}
+
+
+def test_the_child_without_a_path_says_how_to_use_it(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _dll_child.main([]) == 2
+
+    assert "usage" in capsys.readouterr().err
+
+
+def test_the_child_ends_without_interpreter_teardown(tmp_path: Path) -> None:
+    # FM-02: unloading a vendor DLL at interpreter teardown can hang or crash,
+    # and the answer is already written: the child ends with os._exit, which
+    # runs no atexit handler. Run as __main__ with no path, so no DLL is involved.
+    marker = tmp_path / "atexit-ran"
+    code = (
+        "import atexit, runpy, sys\n"
+        f"atexit.register(lambda: open({str(marker)!r}, 'w').close())\n"
+        "sys.argv = ['_dll_child']\n"
+        "runpy.run_module('smc.discovery._dll_child', run_name='__main__')\n"
+    )
+
+    done = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        timeout=60,
+        check=False,
+    )
+
+    assert done.returncode == 2
+    assert "usage" in done.stderr
+    assert not marker.exists()
+
+
+# -- a kill that failed, and a child that survived it -----------------------------------
+
+
+def test_a_kill_failure_that_spans_two_lines_is_one_line_of_detail(
+    monkeypatch: pytest.MonkeyPatch, dll: Path
+) -> None:
+    # FM-37: taskkill's own text has a line break, and the detail is printed as
+    # one entry of a report and one row of a table.
+    fake_child(monkeypatch, "time.sleep(60)\n")
+    text = (
+        "ERROR: The process with PID 1234 could not be terminated.\r\n"
+        "Reason: Access is denied."
+    )
+
+    def failed_kill(child: subprocess.Popen[bytes]) -> str:
+        child.kill()
+        return text
+
+    monkeypatch.setattr(mm_inventory, "_kill_child_tree", failed_kill)
+
+    probe = probe_dll(dll, timeout_s=1)
+
+    assert "\n" not in probe.detail
+    assert "\r" not in probe.detail
+    assert probe.detail.endswith(
+        "ERROR: The process with PID 1234 could not be terminated. "
+        "Reason: Access is denied."
+    )
+
+
+def test_a_child_that_survives_its_kill_is_reported_and_waited_for_in_slices(
+    monkeypatch: pytest.MonkeyPatch, dll: Path
+) -> None:
+    # FM-35 and FM-83: a process stuck in a driver call may not die, and the wait
+    # after the kill is bounded and sliced like every other (a Ctrl-C there must
+    # not sit out the whole wait on Windows).
+    fake_child(monkeypatch, "time.sleep(20)\n")
+    survivors: list[subprocess.Popen[bytes]] = []
+    waits: list[float | None] = []
+    real_popen = subprocess.Popen
+
+    class RecordingPopen(real_popen):  # type: ignore[misc, type-arg]
+        def wait(self, timeout: float | None = None) -> int:
+            waits.append(timeout)
+            return super().wait(timeout)
+
+    def kill_nothing(child: subprocess.Popen[bytes]) -> None:
+        survivors.append(child)
+
+    monkeypatch.setattr(subprocess, "Popen", RecordingPopen)
+    monkeypatch.setattr(mm_inventory, "_kill_child_tree", kill_nothing)
+    monkeypatch.setattr(mm_inventory, "_KILL_WAIT_S", 2.0)
+    try:
+        probe = probe_dll(dll, timeout_s=1)
+        # Before the clean-up below, whose own wait is not the probe's.
+        probe_waits = list(waits)
+    finally:
+        for child in survivors:
+            child.kill()
+            child.wait(timeout=10)
+
+    assert probe.loads is None
+    assert probe.detail == (
+        "did not return within 1 s: its initialisation hung; the probe child "
+        "could not be stopped (it may still hold the hardware)"
+    )
+    assert probe_waits
+    assert all(w is not None and w <= 1.0 for w in probe_waits)

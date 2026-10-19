@@ -1007,3 +1007,210 @@ def test_shipped_nikon_configs_hold_no_port_serial_number_or_host() -> None:
             assert not any(
                 field.startswith("com") and field[3:].isdigit() for field in fields
             )
+
+
+# -- every place a driver can be, for each stand (m2 §7.2, FM-43: each row of the table) --
+
+#: (stand, where the copies are) -> the copy reported, and its two flags. When a copy
+#: satisfies the stand it is the one reported; otherwise the nearest one, as a finding.
+DRIVER_CELLS = [
+    ("ti2", set(), None, False, False),
+    ("ti2", {"beside"}, "beside", True, True),
+    ("ti2", {"nested"}, "nested", False, False),
+    ("ti2", {"sdk"}, "sdk", False, False),
+    ("ti2", {"beside", "sdk"}, "beside", True, True),
+    ("ti2", {"nested", "sdk"}, "nested", False, False),
+    ("ti2", {"beside", "nested"}, "beside", True, True),
+    ("tie", set(), None, False, False),
+    ("tie", {"beside"}, "beside", True, False),
+    ("tie", {"nested"}, "nested", False, False),
+    ("tie", {"sdk"}, "sdk", False, True),
+    ("tie", {"beside", "sdk"}, "sdk", False, True),
+    ("tie", {"nested", "sdk"}, "sdk", False, True),
+    ("tie", {"beside", "nested"}, "beside", True, False),
+]
+
+
+def _place_driver(stand: nikon.Stand, copies: set[str], root: Path) -> dict[str, Path]:
+    """Put the driver where ``copies`` say; return the path of each possible place."""
+    places = {
+        "beside": root / "mm" / stand.driver.dll,
+        "nested": root / "mm" / "extras" / stand.driver.dll,
+        "sdk": root / "sdk" / stand.driver.dll,
+    }
+    (root / "mm").mkdir(parents=True, exist_ok=True)
+    for name in copies:
+        touch(places[name])
+    return places
+
+
+@pytest.mark.parametrize(
+    ("key", "copies", "where", "beside", "satisfied"),
+    DRIVER_CELLS,
+    ids=[f"{c[0]}-{'+'.join(sorted(c[1])) or 'none'}" for c in DRIVER_CELLS],
+)
+def test_find_driver_in_every_combination_of_places(
+    tmp_path: Path,
+    key: str,
+    copies: set[str],
+    where: str | None,
+    beside: bool,
+    satisfied: bool,
+) -> None:
+    stand = nikon.stand_for_key(key)
+    assert stand is not None
+    places = _place_driver(stand, copies, tmp_path)
+
+    found = nikon.find_driver(stand, tmp_path / "mm", sdk_dir=tmp_path / "sdk")
+
+    assert found == nikon.DriverLocation(
+        places[where] if where is not None else None,
+        beside_adapter=beside,
+        satisfied=satisfied,
+    )
+
+
+def _tie_check(tmp_path: Path, copies: set[str]) -> nikon.StandCheck:
+    _place_driver(nikon.TIE, copies, tmp_path)
+    touch(tmp_path / "mm" / nikon.TIE.adapter_file)
+    return nikon.check_stand(nikon.TIE, [tmp_path / "mm"], sdk_dir=tmp_path / "sdk")
+
+
+def test_a_tie_driver_in_the_sdk_folder_is_named_there_even_with_another_copy(
+    tmp_path: Path,
+) -> None:
+    check = _tie_check(tmp_path, {"beside", "sdk"})
+
+    # The row names the folder that satisfied the stand, not the adapter's own.
+    assert dict(nikon.readiness(check))["driver"] == f"{TIE_DLL} in {tmp_path / 'sdk'}"
+    assert not [ln for ln in nikon.diagnosis(check, []) if ln.startswith("found:")]
+
+
+@pytest.mark.parametrize(
+    ("copies", "folder"),
+    [({"beside"}, "mm"), ({"nested"}, "mm/extras")],
+    ids=["beside", "nested"],
+)
+def test_a_tie_driver_outside_its_sdk_folder_is_said_without_claiming_more_than_is_known(
+    tmp_path: Path, copies: set[str], folder: str
+) -> None:
+    check = _tie_check(tmp_path, copies)
+    where = tmp_path.joinpath(*folder.split("/"))
+    sdk = nikon.TIE.driver.sdk_dir
+
+    row = dict(nikon.readiness(check))["driver"]
+    [found] = [ln for ln in nikon.diagnosis(check, []) if ln.startswith("found:")]
+
+    for text in (row, found):
+        assert f"{TIE_DLL} is in {where}, not in {sdk}" in text
+        # Where the Ti-E adapter looks is nikon-control's word, never checked on a Ti-E.
+        assert "expected to find it on the system path (not checked on a Ti-E)" in text
+    assert found.endswith(f"install {nikon.TIE.driver.installer}")
+
+
+def test_a_tie_driver_that_is_nowhere_says_what_was_not_searched(
+    tmp_path: Path,
+) -> None:
+    check = _tie_check(tmp_path, set())
+
+    [found] = [ln for ln in nikon.diagnosis(check, []) if ln.startswith("found:")]
+
+    assert f"{TIE_DLL} was not found in {nikon.TIE.driver.sdk_dir}" in found
+    assert "other folders of the system path were not searched" in found
+    assert dict(nikon.readiness(check))["driver"].startswith(
+        f"{TIE_DLL} not found in {nikon.TIE.driver.sdk_dir}"
+    )
+
+
+# -- the advice names the adapter MMCore takes (FM-76) ----------------------------------
+
+
+def test_the_install_advice_names_the_folder_of_the_adapter_mmcore_takes(
+    tmp_path: Path,
+) -> None:
+    studio, install, sdk = tmp_path / "studio", tmp_path / "install", tmp_path / "sdk"
+    touch(studio / nikon.TI2.adapter_file)
+    touch(install / nikon.TI2.adapter_file)
+    touch(sdk / TI2_DLL)
+    check = nikon.check_stand(nikon.TI2, [studio, install], sdk_dir=sdk)
+    # Without --to, install-driver copies into the install: the first folder here
+    # is the studio's, and a copy beside the install's adapter would change nothing.
+    command = f'smc install-driver ti2 --to "{studio}"'
+
+    row = dict(nikon.readiness(check))["driver"]
+    [found] = [ln for ln in nikon.diagnosis(check, []) if ln.startswith("found:")]
+
+    assert command in row
+    assert found.endswith(command)
+    assert str(install) not in row
+
+
+# -- install_driver: the branches a copy that only raises does not reach (FM-38) -------
+
+
+def test_install_driver_does_not_install_a_copy_that_came_out_short(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A full disk or an antivirus can end a copy short without an error: the
+    # rename would put half a driver where the adapter loads it.
+    source = touch(tmp_path / "sdk" / TI2_DLL, b"0123456789")
+    mm = tmp_path / "mm"
+    mm.mkdir()
+
+    def short_copy(src: Path, dst: Path) -> None:
+        dst.write_bytes(src.read_bytes()[:5])
+
+    monkeypatch.setattr(shutil, "copy2", short_copy)
+
+    ok, message = nikon.install_driver(nikon.TI2, mm, source=source)
+
+    assert ok is False
+    assert "the copy does not match the source" in message
+    assert list(mm.iterdir()) == []
+
+
+def test_install_driver_leaves_no_partial_file_when_interrupted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Ctrl-C is not an OSError: it passes through, and still takes the partial file.
+    source = touch(tmp_path / "sdk" / TI2_DLL, b"0123456789")
+    mm = tmp_path / "mm"
+    mm.mkdir()
+
+    def interrupted(src: Path, dst: Path) -> None:
+        dst.write_bytes(b"01")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(shutil, "copy2", interrupted)
+
+    with pytest.raises(KeyboardInterrupt):
+        nikon.install_driver(nikon.TI2, mm, source=source)
+
+    assert list(mm.iterdir()) == []
+
+
+def test_install_driver_says_so_when_what_is_there_cannot_be_read(
+    tmp_path: Path,
+) -> None:
+    source = touch(tmp_path / "sdk" / TI2_DLL)
+    mm = tmp_path / "mm"
+    (mm / TI2_DLL).mkdir(parents=True)  # a folder where the DLL should be
+
+    ok, message = nikon.install_driver(nikon.TI2, mm, source=source)
+
+    assert ok is False
+    assert f"{mm / TI2_DLL} already exists and cannot be read" in message
+
+
+def test_stands_in_config_ignores_lines_that_are_not_device_lines(
+    tmp_path: Path,
+) -> None:
+    cfg = tmp_path / "stand.cfg"
+    # A hub labelled like a Ti2 adapter on a Parent line, and a comment with no
+    # space after the hash: neither is a Ti2 device.
+    cfg.write_text(
+        "Parent,TIZDrive,NikonTi2\n#Device,x,NikonTi2,x\nDevice,TIScope,NikonTI,TIScope\n",
+        encoding="utf-8",
+    )
+
+    assert nikon.stands_in_config(cfg) == [nikon.TIE]

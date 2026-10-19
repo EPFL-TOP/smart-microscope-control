@@ -1543,7 +1543,10 @@ def test_doctor_config_without_a_nikon_device_prints_no_nikon_block(
 
     assert result.exit_code == 1, result.output
     assert 'Failed to load device adapter "DemoCamera"' in result.output
-    assert "Nikon" not in result.output
+    # The phrases the code prints, not a word that a path of the install or of
+    # the checkout can hold (FM-45).
+    for stand in nikon.STANDS:
+        assert f"{stand.name} ({stand.adapter})" not in result.output
     assert "what to check" not in result.output
     assert probes == []
 
@@ -1554,7 +1557,10 @@ def test_doctor_without_a_nikon_stand_prints_no_nikon_block() -> None:
     result = runner.invoke(app, ["doctor", "-p", "demo"])
 
     assert result.exit_code == 0, result.output
-    assert "Nikon" not in result.output
+    # The phrases the code prints, not a word that a path of the install or of
+    # the checkout can hold (FM-45).
+    for stand in nikon.STANDS:
+        assert f"{stand.name} ({stand.adapter})" not in result.output
     assert "what to check" not in result.output
 
 
@@ -1786,3 +1792,27 @@ def test_install_driver_help_documents_from_and_to() -> None:
             if re.search(rf"{flag}\s", row) and text in row
         ]
         assert rows, (flag, plain)
+
+
+@pytest.mark.usefixtures("mm_install")
+def test_doctor_ctrl_c_during_the_diagnosis_says_so_and_exits_130(
+    ti2_profile: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The open error is already printed; the operator interrupts a hung probe.
+    # The probe kills its child and re-raises; the command says what was left undone.
+    _fails_to_load(monkeypatch, microscope_mod)
+
+    def interrupted(path: Path, **kwargs: object) -> DllProbe:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(dll_probe, "probe_dll", interrupted)
+
+    result = runner.invoke(app, ["doctor", "-p", str(ti2_profile)])
+
+    assert result.exit_code == 130, result.output
+    failure, interrupt = _positions(
+        result.output,
+        "✗ could not load",
+        "✗ interrupted while checking the stand; the remaining checks were not run",
+    )
+    assert failure < interrupt

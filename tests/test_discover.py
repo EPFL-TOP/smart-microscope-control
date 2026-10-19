@@ -1107,3 +1107,28 @@ def test_the_diagnosis_is_part_of_the_survey_file(tmp_path: Path) -> None:
     assert again.adapters.listed[0].load_diagnosis == "WinError 126: Module not found."
     # A survey written before this field existed still reads.
     assert AdapterInfo(name="A", installed=True).load_diagnosis is None
+
+
+@pytest.mark.parametrize(
+    ("failing", "expected"),
+    [
+        (11, "1 adapter failed to load and was not probed"),
+        (12, "2 adapters failed to load and were not probed"),
+    ],
+)
+def test_the_note_counts_what_was_not_probed_in_the_right_number(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_install: Path,
+    failing: int,
+    expected: str,
+) -> None:
+    # Exactly one over the cap is the case an off-by-one in the note would miss.
+    monkeypatch.setattr(dll_probe, "_WINDOWS", True)
+    monkeypatch.setattr(dll_probe, "probe_dll", _RecordingProbe())
+    _listing_child(monkeypatch, [_failing(f"Vendor{i:02d}") for i in range(failing)])
+
+    inv = inventory(include_os=False)
+
+    (note,) = [n for n in inv.notes if "not probed" in n]
+    assert expected in note
+    assert f"at most {discovery.MAX_DLL_PROBES} are probed per survey" in note

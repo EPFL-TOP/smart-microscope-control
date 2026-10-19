@@ -210,8 +210,11 @@ def stands_in_config(path: Path) -> list[Stand]:
 
     It reads the *library* column of the ``Device,<label>,<library>,<name>``
     lines, never the label: a camera that someone labelled ``NikonTi2`` is not a
-    stand. Comments are skipped and each stand counts once. A file that cannot be
-    read gives ``[]``: ``doctor`` is about to open it and will say why it cannot.
+    stand. Each stand counts once. A file that cannot be read gives ``[]``:
+    ``doctor`` is about to open it and will say why it cannot.
+
+    A comment needs no check of its own: its first field starts with ``#``, so it
+    is never ``Device``.
     """
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -219,9 +222,6 @@ def stands_in_config(path: Path) -> list[Stand]:
         return []
     found: list[Stand] = []
     for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("#"):
-            continue
         fields = [field.strip() for field in line.split(",")]
         if len(fields) < 3 or fields[0] != "Device":
             continue
@@ -277,7 +277,13 @@ def find_driver(
     SDK folder (``sdk_dir``, by default the one the installer uses). ``satisfied``
     is what matters: the Ti2 adapter loads its driver from its own folder only,
     so a copy in a subfolder or in the SDK folder is a finding, not a pass; the
-    Ti-E adapter finds its driver on the system path, i.e. in the SDK folder.
+    Ti-E adapter is taken to find its driver on the system path, i.e. in the SDK
+    folder (``nikon-control``; not checked on a Ti-E).
+
+    When a copy satisfies the stand, ``path`` is that copy, whichever copies
+    there are: a row that names the folder of another copy would send the
+    operator to a folder the adapter does not look in. Otherwise ``path`` is the
+    nearest copy, in the order above, as a finding.
 
     Args:
         stand: The stand.
@@ -290,25 +296,22 @@ def find_driver(
     sdk = Path(driver.sdk_dir) if sdk_dir is None else sdk_dir
     in_sdk = sdk / driver.dll
     sdk_has_it = _is_file(in_sdk)
+    beside = adapter_dir / driver.dll if adapter_dir is not None else None
+    beside_has_it = beside is not None and _is_file(beside)
+
+    if beside is not None and beside_has_it and driver.beside_adapter:
+        return DriverLocation(beside, beside_adapter=True, satisfied=True)
+    if sdk_has_it and not driver.beside_adapter:
+        return DriverLocation(in_sdk, beside_adapter=False, satisfied=True)
+    # Nothing satisfies the stand: the nearest copy is reported as a finding.
+    if beside is not None and beside_has_it:
+        return DriverLocation(beside, beside_adapter=True, satisfied=False)
     if adapter_dir is not None:
-        beside = adapter_dir / driver.dll
-        if _is_file(beside):
-            return DriverLocation(
-                beside,
-                beside_adapter=True,
-                satisfied=driver.beside_adapter or sdk_has_it,
-            )
         nested = _find_below(adapter_dir, driver.dll)
         if nested is not None:
-            return DriverLocation(
-                nested,
-                beside_adapter=False,
-                satisfied=not driver.beside_adapter and sdk_has_it,
-            )
+            return DriverLocation(nested, beside_adapter=False, satisfied=False)
     if sdk_has_it:
-        return DriverLocation(
-            in_sdk, beside_adapter=False, satisfied=not driver.beside_adapter
-        )
+        return DriverLocation(in_sdk, beside_adapter=False, satisfied=False)
     return DriverLocation(None, beside_adapter=False, satisfied=False)
 
 
@@ -348,6 +351,27 @@ def check_stand(
     )
 
 
+#: What is known about where the Ti-E adapter finds ``NikonTi.dll``: it comes
+#: from ``nikon-control`` and was never checked on a Ti-E, so no line claims more.
+_TIE_PATH_NOTE = (
+    "Nikon's installer puts it; the Ti-E adapter is expected to find it on the "
+    "system path (not checked on a Ti-E)"
+)
+
+
+def _copy_command(stand: Stand, adapter_dir: Path) -> str:
+    """The ``install-driver`` command that puts the driver beside *this* adapter.
+
+    With ``--to``, because the adapter MMCore takes is the first folder of the
+    profile's adapter search paths (FM-76) and not always the install's, where
+    ``smc install-driver`` copies to by default: a command that succeeds without
+    changing what ``doctor`` found would be worse than none. Double quotes,
+    since both a Windows prompt and a POSIX shell take them and the install
+    lives under ``Program Files``.
+    """
+    return f'smc install-driver {stand.key} --to "{adapter_dir}"'
+
+
 def readiness(check: StandCheck) -> list[tuple[str, str]]:
     """The rows ``smc doctor`` prints before it opens a stand: ``adapter``, ``driver``.
 
@@ -370,20 +394,21 @@ def readiness(check: StandCheck) -> list[tuple[str, str]]:
         text = f"{driver.dll} beside the adapter"
     elif found.satisfied:
         text = f"{driver.dll} in {found.path.parent}"
-    elif driver.beside_adapter and check.adapter_path is None:
-        text = (
-            f"{driver.dll} is in {found.path.parent}; there is no adapter folder "
-            "to put it beside yet"
-        )
     elif driver.beside_adapter:
-        text = (
-            f"{driver.dll} is in {found.path.parent}, not beside the adapter: "
-            f"smc install-driver {stand.key} copies it"
-        )
+        if check.adapter_path is None:
+            text = (
+                f"{driver.dll} is in {found.path.parent}; there is no adapter "
+                "folder to put it beside yet"
+            )
+        else:
+            text = (
+                f"{driver.dll} is in {found.path.parent}, not beside the adapter: "
+                f"{_copy_command(stand, check.adapter_path.parent)} copies it"
+            )
     else:
         text = (
             f"{driver.dll} is in {found.path.parent}, not in {driver.sdk_dir}, "
-            "where the adapter finds it on the system path"
+            f"where {_TIE_PATH_NOTE}"
         )
     return [("adapter", adapter), ("driver", text)]
 
@@ -423,23 +448,28 @@ def _findings(check: StandCheck) -> list[str]:
         )
         lines.append(f"found: {stand.adapter_file} is in {where}")
     if found.path is None:
-        where = "" if driver.beside_adapter else f" in {driver.sdk_dir}"
-        lines.append(
-            f"found: {driver.dll} was not found{where}; install {driver.installer}"
-        )
+        if driver.beside_adapter:
+            lines.append(
+                f"found: {driver.dll} was not found; install {driver.installer}"
+            )
+        else:
+            lines.append(
+                f"found: {driver.dll} was not found in {driver.sdk_dir}, where "
+                "Nikon's installer puts it (the other folders of the system path "
+                f"were not searched); install {driver.installer}"
+            )
     elif not found.satisfied and driver.beside_adapter:
         if check.adapter_path is not None:
             lines.append(
                 f"found: {driver.dll} is in {found.path.parent}, not beside the "
                 f"adapter ({check.adapter_path.parent}), and the adapter loads it "
-                f"from its own folder only; copy it with: smc install-driver "
-                f"{stand.key}"
+                "from its own folder only; copy it with: "
+                f"{_copy_command(stand, check.adapter_path.parent)}"
             )
     elif not found.satisfied:
         lines.append(
             f"found: {driver.dll} is in {found.path.parent}, not in "
-            f"{driver.sdk_dir}, where the adapter finds it on the system path; "
-            f"install {driver.installer}"
+            f"{driver.sdk_dir}, where {_TIE_PATH_NOTE}; install {driver.installer}"
         )
     return lines
 

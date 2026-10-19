@@ -261,7 +261,8 @@ def probe_dll(
                 "hardware)"
             )
             if kill_detail:
-                detail += f"; {kill_detail}"
+                # taskkill's text can span two lines; the detail is one (FM-37).
+                detail += f"; {' '.join(kill_detail.split())}"
         return DllProbe(path, None, None, detail)
     return DllProbe(
         path,
