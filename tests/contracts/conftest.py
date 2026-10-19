@@ -16,6 +16,11 @@ start, with the autofocus off, except in the locked ``focus_by_um`` case.
 Every target outside the envelope is one the layer must refuse, so none of
 them is ever sent. The ``microscope`` fixture then puts the stand back where
 it started.
+
+**On ``hardware``, the turret never turns, and no capture is ever run**
+(m2 §8.8): a turn can drive an objective into the plate, and a capture
+writes the stand's ``.cfg``. A select of the current objective (which sends
+nothing) and of the current channel are the only selections made there.
 """
 
 from __future__ import annotations
@@ -31,6 +36,9 @@ from smc.hardware.capabilities import (
     XY,
     Autofocus,
     Camera,
+    Channels,
+    LightSource,
+    ObjectiveTurret,
     Properties,
     Shutter,
     XYStage,
@@ -64,6 +72,9 @@ class Envelope:
     autofocus_engaged: bool | None = None
     #: In the offset device's own units.
     offset_native: float | None = None
+    objective: str | None = None
+    #: ``None`` also when the stand matched no preset: then it is not put back.
+    channel: str | None = None
     max_jog_um: float = 50.0
     #: Below the 2 µm a contract may move Z, so a forced jog stays inside the envelope.
     max_z_jog_um: float = 1.0
@@ -174,6 +185,8 @@ def envelope(stand: Microscope) -> Envelope:
     camera = stand.get(Camera)
     shutter = stand.get(Shutter)
     autofocus = stand.get(Autofocus)
+    turret = stand.get(ObjectiveTurret)
+    channels = stand.get(Channels)
     return Envelope(
         xy=None if xy is None else xy.position_um(),
         z_um=None if z is None else z.position_um(),
@@ -182,6 +195,8 @@ def envelope(stand: Microscope) -> Envelope:
         auto_shutter=None if shutter is None else shutter.auto_shutter(),
         autofocus_engaged=None if autofocus is None else autofocus.is_engaged(),
         offset_native=None if autofocus is None else autofocus.offset_native(),
+        objective=None if turret is None else turret.current(),
+        channel=None if channels is None else channels.current(),
     )
 
 
@@ -280,6 +295,36 @@ def autofocus(microscope: Microscope, backend: str) -> Autofocus:
 
 
 @pytest.fixture
+def objective_turret(microscope: Microscope, backend: str) -> ObjectiveTurret:
+    """The live objective turret; on ``hardware``, it is never turned."""
+    return _capability(microscope, backend, ObjectiveTurret)
+
+
+@pytest.fixture
+def light_source(microscope: Microscope, backend: str) -> LightSource:
+    """The live light source."""
+    return _capability(microscope, backend, LightSource)
+
+
+@pytest.fixture
+def channels(microscope: Microscope, backend: str) -> Channels:
+    """The live channels; on ``hardware``, only the current one is selected."""
+    return _capability(microscope, backend, Channels)
+
+
+@pytest.fixture
+def dry_objective_turret(dry_microscope: Microscope, backend: str) -> ObjectiveTurret:
+    """The objective turret in dry-run."""
+    return _capability(dry_microscope, backend, ObjectiveTurret)
+
+
+@pytest.fixture
+def dry_channels(dry_microscope: Microscope, backend: str) -> Channels:
+    """The channels in dry-run."""
+    return _capability(dry_microscope, backend, Channels)
+
+
+@pytest.fixture
 def dry_autofocus(dry_microscope: Microscope, backend: str) -> Autofocus:
     """The autofocus in dry-run."""
     return _capability(dry_microscope, backend, Autofocus)
@@ -321,8 +366,9 @@ def _put_back(
     facade's motions, and an operator's Ctrl-C means "stop", not "go back".
     The light is still cut if it started off. Otherwise every item that
     differs is put back, light off first and on last, and the autofocus off
-    while anything moves back (m2 §3.13): XY, Z, then the offset, which with
-    the autofocus off moves only the offset lens. It is engaged again at the
+    while anything moves back (m2 §3.13): XY, Z, the objective (m2 §8.8), then
+    the offset, which with the autofocus off moves only the offset lens. The
+    channel comes back after the exposure. It is engaged again at the
     end if it started engaged, and a lock that does not come is a failure
     named like any other.
 
@@ -352,12 +398,19 @@ def _put_back(
     z = facade.get(ZStage)
     if z is not None and (z0 := envelope.z_um) is not None:
         steps.append(("z", lambda: _put_back_z(z, z0, tolerance_um)))
+    turret = facade.get(ObjectiveTurret)
+    if turret is not None and (objective := envelope.objective) is not None:
+        # After Z, which is back below its start; the autofocus is off already.
+        steps.append(("objective", lambda: _put_back_objective(turret, objective)))
     if autofocus is not None and (o0 := envelope.offset_native) is not None:
         tolerance = envelope.offset_tolerance
         steps.append(("offset", lambda: _put_back_offset(autofocus, o0, tolerance)))
     camera = facade.get(Camera)
     if camera is not None and (ms := envelope.exposure_ms) is not None:
         steps.append(("exposure", lambda: _put_back_exposure(camera, ms)))
+    channels = facade.get(Channels)
+    if channels is not None and (channel := envelope.channel) is not None:
+        steps.append(("channel", lambda: _put_back_channel(channels, channel)))
     if shutter is not None and (auto := envelope.auto_shutter) is not None:
         steps.append(("auto-shutter", lambda: _put_back_auto_shutter(shutter, auto)))
     if autofocus is not None and envelope.autofocus_engaged is True:
@@ -448,6 +501,17 @@ def _put_back_z(z: ZStage, z0_um: float, tolerance_um: float) -> None:
     # The autofocus was switched off before; engaging it is the last step's.
     if abs(z.position_um() - z0_um) > tolerance_um:
         z.move_to_um(z0_um, keep_autofocus=False)
+
+
+def _put_back_objective(turret: ObjectiveTurret, start: str) -> None:
+    """Turn back only if a contract turned it: on ``hardware`` none does."""
+    if turret.current() != start:
+        turret.select(start, confirm=True)
+
+
+def _put_back_channel(channels: Channels, start: str) -> None:
+    if channels.current() != start:
+        channels.select(start)
 
 
 def _put_back_offset(autofocus: Autofocus, start: float, tolerance: float) -> None:
