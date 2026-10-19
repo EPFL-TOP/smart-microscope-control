@@ -3580,46 +3580,208 @@ def test_an_autofocus_outliving_its_microscope_refuses_engage_and_the_offset_mov
     assert core.isContinuousFocusEnabled() is (pfs == "on")
 
 
-def _z_stop_a_direct_call(core: FakeCore, microscope: Microscope, call: str) -> bool:
-    """``call`` made directly with PFS on, ended by a Z stop; whether it raised ``MotionStoppedError``.
+@pytest.fixture
+def no_kept_log_records() -> Iterator[None]:
+    """Logging off: pytest keeps every ``LogRecord``, and a failed stop's holds the error.
 
-    Its own frame, so that the thread, its error and the capabilities are
-    gone once it returns: the caller holds nothing but the two it drops.
+    That error's traceback holds the fake: a retention by the test's handler,
+    not a cycle of the code (FM-98 test hazards).
+    """
+    previous = logging.root.manager.disable
+    logging.disable(logging.CRITICAL)
+    try:
+        yield
+    finally:
+        logging.disable(previous)
+
+
+def _fails_once(
+    core: FakeCore, switch: Callable[[bool], None]
+) -> Callable[[bool], None]:
+    """``switch``, whose first switch-off raises a fresh error; any later one goes through.
+
+    Fresh, not ``FakeCore.failing``, which keeps the instance it raised; only
+    the Z stop's switch-off fails, so a give-up after it leaves nothing
+    registered (FM-98 test hazards).
+    """
+    failed: list[bool] = []
+
+    def switch_once(enable: bool) -> None:
+        if not enable and not failed:
+            failed.append(True)
+            core.log.append(OFF)
+            raise RuntimeError("PFS: stuck on")
+        switch(enable)
+
+    return switch_once
+
+
+def _z_stop_a_compound(
+    core: FakeCore, microscope: Microscope, compound: str, switch_off: str
+) -> str:
+    """``compound`` with PFS on, ended by a Z stop; the type name of what it raised.
+
+    Its own frame, so that the thread and the capabilities are gone once it
+    returns, and the mover's error is dropped: ``_Thread`` keeps it, and its
+    traceback holds ``_Thread._run``'s frame, whose ``self`` holds the error
+    (FM-98 test hazards). The caller holds nothing but the two it drops.
     """
     autofocus, z = microscope.require(Autofocus), microscope.require(ZStage)
-    if call == "engage":
+    switch = core.enableContinuousFocus
+    if compound == "locked":
+        stopped: list[bool] = []
+
+        def stop_once_locked(enable: bool) -> None:
+            switch(enable)
+            if enable and not stopped:
+                stopped.append(True)
+                if switch_off == "fails once":
+                    core.enableContinuousFocus = _fails_once(core, switch)  # type: ignore[method-assign]
+                with suppress(HardwareError):  # a failed switch-off reaches the stopper
+                    z.stop()
+
+        core.enableContinuousFocus(True)
+        core.log.clear()
+        core.enableContinuousFocus = stop_once_locked  # type: ignore[method-assign]
+        try:
+            z.move_to_um(12.0)
+        except BaseException as exc:
+            return type(exc).__name__
+        finally:
+            # Removed, not restored: the bound method assigned back is a cycle.
+            del core.enableContinuousFocus
+        return ""
+    runs: dict[str, Callable[[], object]] = {
+        "engage": lambda: autofocus.engage(timeout_s=2 * JOIN_S),
+        "absolute": lambda: autofocus.set_offset_native(7801.0),
+        "relative": lambda: autofocus.offset_by_native(1.0, force=True),
+        "focus_by": lambda: autofocus.focus_by_um(2.0),
+        "relock": lambda: z.move_to_um(12.0),
+    }
+    if compound in ("engage", "relock"):
         core.autofocus_lockable = False
-        waits, sent = "autofocus PFS", [ON]
+        waits = "autofocus PFS"
+        if compound == "relock":
+            core.enableContinuousFocus(True)
+            sent = [OFF, "setPosition('ZDrive', 12.0)", ON]
+        else:
+            sent = [ON]
     else:
         core.enableContinuousFocus(True)
         core.busy_devices.add("PFSOffset")
-        waits, sent = "autofocus_offset PFSOffset", ["setPosition('PFSOffset', 7801.0)"]
+        waits = "autofocus_offset PFSOffset"
+        target = 7794.0 if compound == "focus_by" else 7801.0
+        sent = [f"setPosition('PFSOffset', {target})"]
     core.log.clear()
-    move = _DIRECT_CALLS[call]
-    mover = _Thread(
-        (lambda: autofocus.engage(timeout_s=2 * JOIN_S))
-        if call == "engage"
-        else (lambda: move(autofocus))
-    )
+    mover = _Thread(runs[compound])
     _wait_for(lambda: core.log == sent and microscope.state().moving == (waits,), waits)
-    z.stop()
+    if switch_off == "fails once":
+        core.enableContinuousFocus = _fails_once(core, switch)  # type: ignore[method-assign]
+    with suppress(HardwareError):  # a failed switch-off reaches the stopper
+        z.stop()
     core.busy_devices.discard("PFSOffset")
+    # A switch-off that failed left PFS on, searching: it locks, which ends a
+    # lock wait at once instead of at its deadline.
+    core.autofocus_lockable = True
     mover.join()
-    return isinstance(mover.error, MotionStoppedError)
+    if switch_off == "fails once":
+        # Removed, not restored: the bound method assigned back is a cycle.
+        del core.enableContinuousFocus
+    raised = type(mover.error).__name__
+    mover.error = None
+    return raised
 
 
-@pytest.mark.xfail(
-    strict=True, reason="FM-92 known open: the Z-stop path's traceback keeps the core"
+_Z_STOPPED_COMPOUNDS = (
+    "engage",
+    "absolute",
+    "relative",
+    "focus_by",
+    "relock",
+    "locked",
 )
-@pytest.mark.parametrize("call", sorted(_DIRECT_CALLS))
-def test_a_z_stopped_direct_call_frees_its_core_without_the_cyclic_collector(
-    no_cyclic_gc: None, call: str
+
+
+@pytest.mark.parametrize("switch_off", ["succeeds", "fails once"])
+@pytest.mark.parametrize("compound", _Z_STOPPED_COMPOUNDS)
+def test_a_z_stopped_autofocus_compound_frees_its_core_without_the_cyclic_collector(
+    no_cyclic_gc: None, no_kept_log_records: None, compound: str, switch_off: str
 ) -> None:
-    # Measured in the plan of #158: after a Z stop, the core stays alive.
-    # Nothing here keeps the error, the thread or a monkeypatch.
+    # FM-92, #163: the stop path's exceptions were kept where their own
+    # tracebacks reached them (the `@contextmanager`'s conversion on 3.11+,
+    # the generator's locals, `_ZStop.switch_off_failure`, `_on_z_stop`'s
+    # `failure`, `_engage`'s list, `_give_up`'s `error`), so the core stayed
+    # alive. On 3.10 some cases pass without the fix: the conversion's edge
+    # exists from 3.11 on.
     core = _at_offset(7800.0)
+    microscope = Microscope.from_core(
+        cast("CMMCorePlus", core), _factor({"4x": -3.0}, lock_timeout_s=2 * JOIN_S)
+    )
+    assert _z_stop_a_compound(core, microscope, compound, switch_off) == (
+        "MotionStoppedError"
+    )
+    # A motion left registered keeps the core by design (FM-92): it must not
+    # pass for a cycle.
+    assert microscope.state().moving == ()
+    alive = {"facade": weakref.ref(microscope), "core": weakref.ref(core)}
+    del microscope, core
+    assert {name: ref() is not None for name, ref in alive.items()} == {
+        "facade": False,
+        "core": False,
+    }
+
+
+def _late_failing_switch_off(
+    core: FakeCore, microscope: Microscope, release: threading.Event
+) -> tuple[str, str]:
+    """A Z stop whose switch-off fails once the engage stopped waiting for it; both errors' text.
+
+    Its own frame, for the same reason as ``_z_stop_a_compound``.
+    """
+    autofocus, z = microscope.require(Autofocus), microscope.require(ZStage)
+    switch = core.enableContinuousFocus
+    core.autofocus_lockable = False
+
+    def hangs_then_fails(enable: bool) -> None:
+        if enable:
+            switch(True)
+            return
+        core.autofocus_lockable = True  # the lock ends the block
+        release.wait(JOIN_S)
+        raise RuntimeError("PFS: stuck on")
+
+    core.log.clear()
+    waiter = _Thread(lambda: autofocus.engage(timeout_s=2 * JOIN_S))
+    _wait_for(
+        lambda: core.log == [ON] and microscope.state().moving == ("autofocus PFS",),
+        "the lock wait",
+    )
+    core.enableContinuousFocus = hangs_then_fails  # type: ignore[method-assign]
+    stopper = _Thread(z.stop)
+    waiter.join()  # FM-96: released only once the waiter has stopped waiting
+    release.set()
+    stopper.join()
+    del core.enableContinuousFocus
+    outcome = (str(waiter.error), str(stopper.error))
+    waiter.error = stopper.error = None
+    return outcome
+
+
+def test_a_z_stop_switch_off_that_fails_after_the_compound_stopped_waiting_frees_the_core(
+    no_cyclic_gc: None,
+    no_kept_log_records: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The compound reads `switch_off_failure` no more once it has given up
+    # waiting; the stopping thread, which sets it later, clears it (#163).
+    monkeypatch.setattr(mm, "Z_STOP_OUTCOME_WAIT_S", 0.2)
+    core = _ti2_core()
     microscope = Microscope.from_core(cast("CMMCorePlus", core), _profile())
-    assert _z_stop_a_direct_call(core, microscope, call)
+    waiter, stopper = _late_failing_switch_off(core, microscope, threading.Event())
+    assert waiter == _not_switched_off(
+        "autofocus: engage", "its switch-off had not returned after 0.2 s"
+    )
+    assert stopper == _STUCK
     alive = {"facade": weakref.ref(microscope), "core": weakref.ref(core)}
     del microscope, core
     assert {name: ref() is not None for name, ref in alive.items()} == {
