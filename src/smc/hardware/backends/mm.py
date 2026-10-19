@@ -1201,9 +1201,49 @@ class MMAutofocus:
         locked, it follows the new offset, which moves Z: with a factor for
         the current objective, the Z it implies is held to the Z soft limits
         (``_check_implied_z``); without one, only the offset's own guards
-        bound it.
+        bound it. With it on, a ``ZStage.stop()`` ends the move too
+        (``_linked_offset_move``).
+
+        Raises:
+            SafetyRefusedError: Outside the offset's soft limits, or, locked,
+                past the Z soft limits; nothing was sent.
+            MotionStoppedError: The offset device was stopped; or, with the
+                autofocus on, ``ZStage.stop()`` was called: it was switched
+                off, and the offset device stopped (named ``z <label>``).
         """
         value = float(value)
+        # Before the compound: a refused change takes no lock and reads nothing.
+        self._safety.check_offset_target_native(value)
+        return self._linked_offset_move(
+            f"autofocus_offset: move_to {value} {self._unit()}",
+            lambda: self._set_offset(value),
+        )
+
+    def offset_by_native(self, delta: float, *, force: bool = False) -> float:
+        """Move the offset by ``delta`` from where it is read inside the action.
+
+        Jog-guarded unless ``force``; with no limit in the profile, any non-zero
+        ``delta`` needs ``force`` (m2 §3.2). The target is checked against the
+        soft limits, which cannot be forced, and, locked, the Z it implies
+        against the Z soft limits, as for ``set_offset_native``. With the
+        autofocus on, a ``ZStage.stop()`` ends the move too, as for
+        ``set_offset_native``.
+
+        Raises:
+            SafetyRefusedError: The jog is too large (forceable); the target
+                is outside the offset's soft limits or, locked, past the Z soft
+                limits (not forceable); nothing was sent.
+            MotionStoppedError: As for ``set_offset_native``.
+        """
+        delta = float(delta)
+        self._safety.check_offset_jog_native(delta, force=force)
+        return self._linked_offset_move(
+            f"autofocus_offset: move_by {delta} {self._unit()}",
+            lambda: self._offset_by(delta, force=force),
+        )
+
+    def _set_offset(self, value: float) -> float:
+        """``set_offset_native``'s action, not linked to the Z stop."""
         self._safety.check_offset_target_native(value)
         description = f"autofocus_offset: move_to {value} {self._unit()}"
 
@@ -1213,15 +1253,12 @@ class MMAutofocus:
 
         return self._offset_move(description, step)
 
-    def offset_by_native(self, delta: float, *, force: bool = False) -> float:
-        """Move the offset by ``delta`` from where it is read inside the action.
+    def _offset_by(self, delta: float, *, force: bool) -> float:
+        """``offset_by_native``'s action, not linked: ``focus_by_um`` holds its own link.
 
-        Jog-guarded unless ``force``; with no limit in the profile, any non-zero
-        ``delta`` needs ``force`` (m2 §3.2). The target is checked against the
-        soft limits, which cannot be forced, and, locked, the Z it implies
-        against the Z soft limits, as for ``set_offset_native``.
+        A second link, nested in ``focus_by_um``'s, would send the switch-off
+        and the offset device's stop twice on one Z stop.
         """
-        delta = float(delta)
         self._safety.check_offset_jog_native(delta, force=force)
         unit = self._unit()
 
@@ -1235,6 +1272,41 @@ class MMAutofocus:
             )
 
         return self._offset_move(f"autofocus_offset: move_by {delta} {unit}", relative)
+
+    def _linked_offset_move(self, description: str, move: Callable[[], float]) -> float:
+        """``move``, as one compound, ended by a ``ZStage.stop()`` while PFS is on (m2 §3.3.1).
+
+        On, PFS follows its offset, locked or still searching, and drives Z:
+        the operator's Z stop switches it off and stops the offset device. Off,
+        the offset moves a lens and no Z (assumed until the PFS session, m2 §4
+        item 5), so the Z stop leaves the move alone and nothing claims PFS
+        was "left off". The state is read under the microscope lock, where no
+        other action can switch PFS on before the move.
+        """
+
+        def run() -> float:
+            if not self._engaged_or_unknown():
+                return move()
+            with self._ended_by_a_z_stop(
+                description, suspended=False, offset_pending=True
+            ) as stopped:
+                landed = move()
+                stopped.offset_pending = False
+                return landed
+
+        return self._executor.compound(description, run)
+
+    def _engaged_or_unknown(self) -> bool:
+        """Whether it is on; unknown counts as on (FM-19), since on, it may drive Z."""
+        try:
+            return self._read_engaged()
+        except HardwareError:
+            logger.debug(
+                "autofocus %s: state unreadable before an offset move; counted as on",
+                self._label,
+                exc_info=True,
+            )
+            return True
 
     # --- focus_by_um -------------------------------------------------------
 
@@ -1290,7 +1362,7 @@ class MMAutofocus:
         with self._ended_by_a_z_stop(
             description, suspended=False, offset_pending=True
         ) as stopped:
-            offset = self.offset_by_native(dz_um * factor, force=force)
+            offset = self._offset_by(dz_um * factor, force=force)
             stopped.offset_pending = False
             self._refuse_relock_after_disengage(description, stopped)
             limit_s, assumed = self._lock_timeout(None)
