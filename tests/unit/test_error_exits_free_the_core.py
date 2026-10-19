@@ -27,6 +27,7 @@ goes in here. Hazards, measured on #148:
 from __future__ import annotations
 
 import logging
+import threading
 import weakref
 from collections.abc import Callable, Iterator
 from typing import Any, cast
@@ -37,7 +38,9 @@ from pymmcore_plus import CMMCorePlus
 import smc.cli as cli
 from smc.hardware import Microscope
 from smc.hardware.capabilities import Autofocus, Camera, XYStage, ZStage
+from smc.hardware.errors import HardwareError
 from smc.hardware.profile import Profile
+from smc.hardware.safety import Executor, Motion
 from smc.testing import FakeCore, PlateSample, SampleCamera
 
 _FACADE_AND_CORE_FREED = {"facade": False, "core": False}
@@ -76,7 +79,7 @@ def _outcome(action: Callable[[], object]) -> tuple[str, str]:
     """
     try:
         action()
-    except Exception as exc:
+    except BaseException as exc:  # a second Ctrl-C is one too
         return type(exc).__name__, str(exc)
     return "", ""
 
@@ -272,6 +275,98 @@ def test_a_failed_stop_or_switch_off_frees_the_core(
     watched = _watch(microscope, core)
     del microscope, core
     assert _alive(watched) == _FACADE_AND_CORE_FREED
+
+
+# --- the Executor's own paths, and a second Ctrl-C --------------------------
+
+
+class _SecondCtrlC(FakeCore):
+    """A stand whose XY stop is interrupted, a fresh ``KeyboardInterrupt`` each time."""
+
+    def stop(self, label: str) -> None:
+        if label == "XY":
+            raise KeyboardInterrupt("second Ctrl-C")
+        super().stop(label)
+
+
+def test_a_second_ctrl_c_in_the_emergency_stop_frees_the_core(
+    no_cyclic_gc: None,
+) -> None:
+    # `_stop_stages` re-raises the interrupt once every stage has had its stop.
+    core = _SecondCtrlC.demo_like()
+    microscope = Microscope.from_core(cast("CMMCorePlus", core), Profile.demo())
+    assert _outcome(microscope.stop) == ("KeyboardInterrupt", "second Ctrl-C")
+    assert "stop('Z')" in core.log  # the Z stop was sent after the interrupted XY one
+    watched = _watch(microscope, core)
+    del microscope, core
+    assert _alive(watched) == _FACADE_AND_CORE_FREED
+
+
+def _executor() -> Executor:
+    return Executor(
+        dry_run=False,
+        lock=threading.RLock(),
+        logger=logging.getLogger("test.error-exits"),
+    )
+
+
+def _built(
+    watched: list[weakref.ref[BaseException]], error: BaseException
+) -> BaseException:
+    """``error``, watched: for a raise that holds it in no local of the test."""
+    watched.append(weakref.ref(error))
+    return error
+
+
+class _LinkedFailureError(RuntimeError):
+    """A subclass: a built-in exception cannot be weakly referenced."""
+
+
+class _LinkedInterrupt(KeyboardInterrupt):
+    """A subclass: a built-in exception cannot be weakly referenced."""
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [
+        pytest.param(_LinkedFailureError, id="failure"),
+        pytest.param(_LinkedInterrupt, id="interrupt"),
+    ],
+)
+def test_a_linked_stop_that_raises_still_stops_the_device_and_is_freed(
+    no_cyclic_gc: None, raised: type[BaseException]
+) -> None:
+    # `_stop_linked` keeps the failure of a linked call, or the interrupt of
+    # one, until the device's own stop was sent.
+    executor, watched, stops = _executor(), [], []
+
+    def linked() -> None:
+        raise _built(watched, raised("linked stop"))
+
+    z = Motion("Z", "z Z", lambda: False, lambda: stops.append("Z"))
+    with executor.linked_stop("Z", linked):
+        outcome = _outcome(lambda: executor.stop(z))
+    assert outcome == (raised.__name__, "linked stop")
+    assert stops == ["Z"]
+    assert [ref() is not None for ref in watched] == [False]
+
+
+def test_a_refusal_of_a_compound_stopped_since_its_call_is_freed(
+    no_cyclic_gc: None,
+) -> None:
+    # `refuse_if_stopped` takes the refusal as a parameter, and raises it.
+    executor, watched = _executor(), []
+    z = Motion("Z", "z Z", lambda: False, lambda: None)
+
+    def run() -> None:
+        executor.stop(z)  # after the compound was called
+        executor.refuse_if_stopped("Z", _built(watched, HardwareError("stopped")))
+
+    assert _outcome(lambda: executor.compound("z: move_to 3.0 µm", run)) == (
+        "HardwareError",
+        "stopped",
+    )
+    assert [ref() is not None for ref in watched] == [False]
 
 
 # --- SampleCamera -----------------------------------------------------------
