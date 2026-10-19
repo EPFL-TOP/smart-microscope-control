@@ -425,3 +425,97 @@ def test_unloading_the_autofocus_empties_its_slot() -> None:
     core.unloadDevice("PFS")
     assert core.getAutoFocusDevice() == ""
     assert core.isContinuousFocusEnabled() is False
+
+
+# --- State labels and config groups (m2 §8.8) -------------------------------
+
+
+def test_set_state_label_moves_the_turret_and_refuses_an_unknown_label() -> None:
+    core = FakeCore.demo_like()
+    core.setStateLabel("Objective", "Nikon 20X Plan Fluor ELWD")
+    assert (core.getState("Objective"), core.getStateLabel("Objective")) == (
+        3,
+        "Nikon 20X Plan Fluor ELWD",
+    )
+    with _raises_exactly(
+        'Error in device "Objective": Label not defined (10).  Available Labels: '
+        "('Nikon 40X Plan Fluor ELWD', 'Nikon 10X S Fluor', 'Objective-2', "
+        "'Nikon 20X Plan Fluor ELWD', 'Objective-4', 'Objective-5')"
+    ):
+        core.setStateLabel("Objective", "Nope")
+    assert core.getState("Objective") == 3
+    assert core.log == [
+        "setStateLabel('Objective', 'Nikon 20X Plan Fluor ELWD')",
+        "setStateLabel('Objective', 'Nope')",
+    ]
+
+
+def test_define_config_merges_into_a_preset_and_creates_the_group() -> None:
+    # Measured: a redefinition keeps the settings it does not name, so a
+    # replacement must delete first (m2 §8.1).
+    core = FakeCore.demo_like()
+    core.defineConfig("Channel", "DAPI", "Excitation", "Label", "Chroma-HQ480")
+    core.defineConfig("Channel", "DAPI", "Ghost", "Prop", 1)
+    assert core.getConfigData("Channel", "DAPI") == (
+        ("Dichroic", "Label", "400DCLP"),
+        ("Emission", "Label", "Chroma-HQ620"),
+        ("Excitation", "Label", "Chroma-HQ480"),
+        ("Core", "Shutter", "White Light Shutter"),
+        ("Ghost", "Prop", "1"),
+    )
+    core.defineConfig("New", "a", "Camera", "Exposure", "10")
+    assert "New" in core.getAvailableConfigGroups()
+    assert core.getAvailableConfigs("New") == ("a",)
+
+
+def test_delete_config_names_the_group_and_leaves_it_in_place() -> None:
+    core = FakeCore.demo_like()
+    with pytest.raises(
+        ValueError, match=r'^Configuration group "Channel" does not exist$'
+    ):
+        core.deleteConfig("Channel", "Nope")
+    for name in core.getAvailableConfigs("Objective"):
+        core.deleteConfig("Objective", name)
+    assert "Objective" in core.getAvailableConfigGroups()
+    assert core.getAvailableConfigs("Objective") == ()
+    assert core.getAvailableConfigs("Nope") == ()
+
+
+def test_set_config_applies_each_setting_and_moves_the_shutter_slot() -> None:
+    core = FakeCore.demo_like()
+    core.setConfig("Channel-Multiband", "FITC")
+    assert core.getStateLabel("LED") == "470nm"
+    assert core.getStateLabel("Excitation") == "Empty"
+    assert core.getShutterDevice() == "LED Shutter"
+    assert core.log == ["setConfig('Channel-Multiband', 'FITC')"]
+    with pytest.raises(
+        ValueError,
+        match=r'^Preset "Nope" of configuration group "Channel" does not exist$',
+    ):
+        core.setConfig("Channel", "Nope")
+    core.defineConfig("Channel", "Ghosted", "Ghost", "Prop", "1")
+    with _raises_exactly('No device with label "Ghost"'):
+        core.setConfig("Channel", "Ghosted")
+
+
+def test_get_config_data_of_a_missing_preset_raises_the_measured_error() -> None:
+    core = FakeCore.demo_like()
+    with pytest.raises(
+        ValueError,
+        match=r'^Configuration group "Channel" or its preset "Nope" does not exist$',
+    ):
+        core.getConfigData("Channel", "Nope")
+
+
+def test_the_channel_group_takes_only_an_existing_group() -> None:
+    core = FakeCore.demo_like()
+    assert core.getChannelGroup() == "Channel"
+    with pytest.raises(
+        ValueError,
+        match=r'^Cannot set Core property ChannelGroup to invalid value "Nope"$',
+    ):
+        core.setChannelGroup("Nope")
+    core.setChannelGroup("")
+    assert core.getChannelGroup() == ""
+    core.setChannelGroup("Channel-Multiband")
+    assert core.getChannelGroup() == "Channel-Multiband"

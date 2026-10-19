@@ -49,14 +49,29 @@ from __future__ import annotations
 import functools
 import logging
 import math
+import os
+import secrets
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
-from smc.hardware.capabilities import XY, FocusStep, Limits, PropertyInfo
+from smc.hardware.capabilities import (
+    XY,
+    ChannelPreset,
+    FocusStep,
+    Limits,
+    PropertyInfo,
+)
+from smc.hardware.channels import (
+    check_preset_name,
+    check_value,
+    forbidden_settings,
+    replace_preset,
+    setting_matches,
+)
 from smc.hardware.errors import (
     AutofocusLostError,
     CapabilityMissingError,
@@ -66,22 +81,28 @@ from smc.hardware.errors import (
     MotionStoppedError,
     SafetyRefusedError,
 )
-from smc.hardware.roles import Role
+from smc.hardware.roles import Role, device_type_name
 from smc.hardware.safety import POLL_INTERVAL_S, Motion, SafeCall, Step, StopLink
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     import numpy as np
     from pymmcore_plus import CMMCorePlus
 
-    from smc.hardware.capabilities import ZStage
+    from smc.hardware.capabilities import Autofocus, LightSource, ZStage
     from smc.hardware.safety import Executor, Safety
 
 __all__ = [
     "DEFAULT_LOCK_TIMEOUT_S",
+    "INTENSITY_HINTS",
     "MAX_LOCK_TIMEOUT_S",
     "Z_STOP_OUTCOME_WAIT_S",
     "MMAutofocus",
     "MMCamera",
+    "MMChannels",
+    "MMLightSource",
+    "MMObjectiveTurret",
     "MMProperties",
     "MMShutter",
     "MMXYStage",
@@ -1785,6 +1806,823 @@ class MMShutter:
         )
 
 
+class MMObjectiveTurret:
+    """``ObjectiveTurret`` over the ``objective_turret`` role's State device (m2 §8.3).
+
+    Hardware behaviour encoded here:
+
+    * **Confirmed turns** (FM-14). Turning the nosepiece can drive an
+      objective into a loaded plate, so ``select`` refuses without
+      ``confirm=True`` while the profile's ``[safety] turret_requires_confirm``
+      is true, before it reads or sends anything, in dry-run too.
+    * **The autofocus is switched off before a turn, and left off** (FM-88).
+      A PFS that follows through a rotation drives Z while no action holds
+      the lock, and the new objective's offset differs, so engaging it again
+      could drive Z anywhere. The autofocus is looked up through the facade at
+      each turn (FM-92), never stored.
+    * **A turret cannot be stopped** (a ``State`` device): one still busy at
+      the deadline stays registered as moving until it reads idle or
+      ``resume()`` is called.
+    """
+
+    def __init__(
+        self,
+        core: CMMCorePlus,
+        label: str,
+        executor: Executor,
+        *,
+        requires_confirm: bool,
+        pixel_sizes_um: Mapping[str, float],
+        autofocus: Callable[[], Autofocus | None] = lambda: None,
+    ) -> None:
+        self._core = as_hardware_errors(core, Role.objective_turret.value)
+        self._label = label
+        self._executor = executor
+        self._requires_confirm = requires_confirm
+        self._pixel_sizes_um = pixel_sizes_um
+        self._autofocus = autofocus
+        self._motion = _motion(
+            self._core, label, f"objective_turret {label}", stoppable=False
+        )
+
+    def _read_labels(self) -> list[str]:
+        return [str(text) for text in self._core.getStateLabels(self._label)]
+
+    def _read_current(self) -> str:
+        return str(self._core.getStateLabel(self._label))
+
+    def labels(self) -> list[str]:
+        """Every position's label, in position order, as the configuration names them."""
+        return self._executor.read(self._read_labels)
+
+    def current(self) -> str:
+        """The label of the objective in the light path (``getStateLabel``)."""
+        return self._executor.read(self._read_current)
+
+    def select(self, label: str, *, confirm: bool = False) -> str:
+        """Turn the turret to ``label``; return the label it reads afterwards.
+
+        In this order: the confirmation, before anything is read; the label,
+        checked against ``labels()``; then one compound, which sends nothing
+        when the turret is already at ``label``, switches an engaged autofocus
+        off (a state that cannot be read counts as engaged, FM-19), and turns
+        the turret, waiting for it like a move. The autofocus is never engaged
+        again, and a WARNING says so. In dry-run the compound logs the turn
+        and skips it, and switches nothing off.
+
+        Raises:
+            SafetyRefusedError: ``confirm`` is false while the profile requires
+                it; nothing was read or sent.
+            ValueError: ``label`` is not one of the turret's labels; nothing
+                was sent.
+            HardwareError: The autofocus could not be switched off, so the
+                turret was not turned; or the turret faulted; or the
+                Microscope it belongs to no longer exists (FM-92).
+            DeviceTimeoutError: Still busy at the core timeout; it stays
+                registered as moving until it reads idle or ``resume()``.
+        """
+        if self._requires_confirm and not confirm:
+            raise SafetyRefusedError(
+                f"turning the objective turret can drive an objective into a "
+                f"loaded plate (objective_turret {self._label!r})",
+                how_to_force="pass confirm=True once the stage is clear",
+            )
+        if not self._requires_confirm and not confirm:
+            logger.info(
+                "objective_turret: no confirmation required ([safety] "
+                "turret_requires_confirm = false)"
+            )
+        labels = self.labels()
+        if label not in labels:
+            raise ValueError(
+                f"objective_turret {self._label!r} has no position {label!r}; its "
+                f"labels are: {', '.join(repr(text) for text in labels)}"
+            )
+        description = f"objective_turret: select {label}"
+        return self._executor.compound(
+            description, lambda: self._turn(description, label)
+        )
+
+    def _turn(self, description: str, label: str) -> str:
+        """The compound: nothing if already there, else the switch-off, then the turn."""
+        if self._read_current() == label:
+            logger.info("objective_turret: already at %s", label)
+            return label
+        autofocus = self._autofocus()
+        if autofocus is not None and not self._executor.dry_run:
+            self._switch_off_first(autofocus, label)
+        core, turret = self._core, self._label
+        return self._executor.do(
+            description,
+            Step(
+                log=description,
+                send=lambda: core.setStateLabel(turret, label),
+                readback=self._read_current,
+                dry_result=label,
+            ),
+            motion=self._motion,
+            timeout_s=_core_timeout(core),
+        )
+
+    def _switch_off_first(self, autofocus: Autofocus, label: str) -> None:
+        """Switch ``autofocus`` off if it is engaged, or if that cannot be read (FM-19)."""
+        name = autofocus._label if isinstance(autofocus, MMAutofocus) else "autofocus"
+        try:
+            engaged = autofocus.is_engaged()
+        except Exception as exc:
+            logger.warning(
+                "objective_turret: autofocus %r: its state could not be read before "
+                "the turret turns (%s); counted as engaged, so it is switched off",
+                name,
+                _named(exc),
+            )
+            engaged = True
+        if not engaged:
+            return
+        try:
+            autofocus.disengage()
+        except Exception as exc:
+            raise HardwareError(
+                f"objective_turret: not turned to {label!r}: autofocus {name!r} "
+                f"could not be switched off first ({_named(exc)}); a turn under an "
+                f"engaged autofocus drives Z"
+            ) from exc
+        logger.warning(
+            "objective_turret: autofocus %r switched off before the turret turns; it "
+            "is not engaged again (the new objective's offset is not known); "
+            "engage() it once in focus",
+            name,
+        )
+
+    def pixel_size_um(self, label: str | None = None) -> float:
+        """The profile's ``[camera] pixel_size_um`` for ``label`` (default: the current one).
+
+        At binning 1 and an intermediate magnification of 1.0x (#167); ``0.0``
+        when the profile has none, or one that is not a positive number:
+        unknown, never guessed.
+        """
+        objective = self.current() if label is None else label
+        size = self._pixel_sizes_um.get(objective)
+        if size is None:
+            return 0.0
+        if not (math.isfinite(size) and size > 0):
+            logger.warning(
+                "pixel size for objective %r in the profile is %r, not a positive "
+                "number; reporting 0.0 (unknown). Fix it under [camera] "
+                "pixel_size_um in the profile.",
+                objective,
+                size,
+            )
+            return 0.0
+        return float(size)
+
+
+#: What a property that sets how bright is called, best first (m2 §8.4).
+INTENSITY_HINTS = ("intensity", "brightness", "power", "level", "voltage")
+
+
+def _normalised(text: str) -> str:
+    """Lower-case, ``[a-z0-9]`` only, as role names are matched (design §4)."""
+    return "".join(c for c in text.lower() if c.isascii() and c.isalnum())
+
+
+def _property_info(core: CMMCorePlus, device: str, name: str) -> PropertyInfo:
+    """One property with its constraints, read now."""
+    has_limits = bool(core.hasPropertyLimits(device, name))
+    return PropertyInfo(
+        device=device,
+        name=name,
+        value=str(core.getProperty(device, name)),
+        read_only=bool(core.isPropertyReadOnly(device, name)),
+        allowed=tuple(str(v) for v in core.getAllowedPropertyValues(device, name)),
+        lower=float(core.getPropertyLowerLimit(device, name)) if has_limits else None,
+        upper=float(core.getPropertyUpperLimit(device, name)) if has_limits else None,
+    )
+
+
+def _is_shutter(core: CMMCorePlus, label: str) -> bool:
+    return device_type_name(core.getDeviceType(label)) == "Shutter"
+
+
+class MMLightSource:
+    """``LightSource`` over the ``light_source`` role's device (m2 §8.4).
+
+    Hardware behaviour encoded here:
+
+    * **The knob is found, never assumed.** The profile's ``[light_source]
+      intensity_property`` first, then the device's writable properties named
+      like one (``INTENSITY_HINTS``). Only this device is searched: a camera's
+      ``BeadBrightness`` is no lamp. The knob's *name* is kept once found; its
+      value is read at every call.
+    * **Native units, never clamped.** The Ti2-E's ``DiaLamp`` ``Intensity`` is
+      a free number in units nobody measured; a value outside a property's
+      limits is refused, since a clamp reads as success.
+    * **On/off only for a ``Shutter`` device** (the ``DiaLamp``), with the
+      kinds of call of ``MMShutter``: off is a safe call keyed by the label,
+      so an off from this capability or a close from ``Shutter`` cancels an
+      on from either. The demo's ``LED`` is a ``State`` device and has no
+      switch that smc knows.
+    """
+
+    def __init__(
+        self,
+        core: CMMCorePlus,
+        label: str,
+        executor: Executor,
+        *,
+        intensity_property: str = "",
+    ) -> None:
+        # Rebound: the switch-off captures the proxied core (as MMShutter).
+        core = self._core = as_hardware_errors(core, Role.light_source.value)
+        self._label = label
+        self._executor = executor
+        self._intensity_property = intensity_property
+        #: The knob, once resolved: ``(name,)`` or ``(None,)``; ``None`` until then.
+        self._knob: tuple[str | None] | None = None
+        self._off = SafeCall(
+            device=label,
+            log="light_source: off",
+            send=lambda: core.setShutterOpen(label, False),
+        )
+
+    def device(self) -> str:
+        """The light source's device label."""
+        return self._label
+
+    # --- the knob -------------------------------------------------------------
+
+    def _knob_name(self) -> str | None:
+        """The knob's property name, resolved on the first call and kept; ``None``: none."""
+        if self._knob is None:
+            self._knob = (self._resolve_knob(),)
+        return self._knob[0]
+
+    def _resolve_knob(self) -> str | None:
+        core, label = self._core, self._label
+        names = [str(n) for n in core.getDevicePropertyNames(label)]
+        writable = [n for n in names if not core.isPropertyReadOnly(label, n)]
+        wanted = self._intensity_property
+        if wanted:
+            if wanted in writable:
+                return wanted
+            logger.warning(
+                "light_source %r has no writable property %r ([light_source] "
+                "intensity_property in the profile); its writable properties are: "
+                "%s. Searching by name instead",
+                label,
+                wanted,
+                ", ".join(writable) or "none",
+            )
+        ranked: list[str] = []
+        for hint in INTENSITY_HINTS:
+            ranked += [
+                n for n in writable if hint in _normalised(n) and n not in ranked
+            ]
+        with_limits = [n for n in ranked if core.hasPropertyLimits(label, n)]
+        if with_limits:
+            return with_limits[0]
+        for name in ranked:
+            if _finite_number(str(core.getProperty(label, name))) is not None:
+                return name
+        logger.info(
+            "light_source %r: no intensity property (searched for %s); set "
+            "[light_source] intensity_property if the device has one",
+            label,
+            ", ".join(INTENSITY_HINTS),
+        )
+        return None
+
+    def _read_intensity(self, knob: str) -> float:
+        value = str(self._core.getProperty(self._label, knob))
+        number = _finite_number(value)
+        if number is None:
+            raise HardwareError(
+                f"light_source {self._label!r}: {knob} reads {value!r}, which is not "
+                f"a finite number; check the device, or set [light_source] "
+                f"intensity_property in the profile"
+            )
+        return number
+
+    def intensity_knob(self) -> PropertyInfo | None:
+        """The property that sets how bright, read now; ``None``: none that smc knows."""
+
+        def read() -> PropertyInfo | None:
+            knob = self._knob_name()
+            return (
+                None if knob is None else _property_info(self._core, self._label, knob)
+            )
+
+        return self._executor.read(read)
+
+    def intensity_native(self) -> float | None:
+        """The knob's value in the device's own units; ``None`` without a knob.
+
+        Raises:
+            HardwareError: The value does not read as a finite number.
+        """
+
+        def read() -> float | None:
+            knob = self._knob_name()
+            return None if knob is None else self._read_intensity(knob)
+
+        return self._executor.read(read)
+
+    def set_intensity_native(self, value: float) -> float:
+        """Set the knob to ``value``, in its own units; return the readback.
+
+        Raises, before anything is sent:
+            HardwareError: The device has no knob that smc knows.
+            ValueError: ``value`` is not finite, or lies outside the knob's
+                limits; it is never clamped.
+        """
+        value = float(value)
+        label = self._label
+        knob = self._executor.read(self._knob_name)
+        if knob is None:
+            raise HardwareError(
+                f"light_source {label!r} has no intensity property that smc knows; "
+                f"set [light_source] intensity_property in the profile, or use "
+                f"Properties"
+            )
+        if not math.isfinite(value):
+            raise ValueError(
+                f"light_source {label!r}: intensity must be finite, got {value!r}"
+            )
+        core = self._core
+        if core.hasPropertyLimits(label, knob):
+            low = float(core.getPropertyLowerLimit(label, knob))
+            high = float(core.getPropertyUpperLimit(label, knob))
+            if not low <= value <= high:
+                raise ValueError(
+                    f"light_source {label!r}: intensity {value:g} is outside {knob}'s "
+                    f"limits [{low:g}, {high:g}]; it is never clamped"
+                )
+        description = f"light_source: intensity {value}"
+        return self._executor.do(
+            description,
+            Step(
+                log=description,
+                send=lambda: core.setProperty(label, knob, value),
+                readback=lambda: self._read_intensity(knob),
+                dry_result=value,
+            ),
+        )
+
+    # --- on and off -----------------------------------------------------------
+
+    def _no_switch(self) -> HardwareError:
+        kind = device_type_name(self._core.getDeviceType(self._label))
+        return HardwareError(
+            f"light_source {self._label!r} (a {kind} device) has no on/off that smc "
+            f"knows; switch the light with its shutter (Shutter)"
+        )
+
+    def _read_on(self) -> bool:
+        return bool(self._core.getShutterOpen(self._label))
+
+    def is_on(self) -> bool | None:
+        """Whether a ``Shutter``-typed light source reads open; ``None`` for any other type."""
+
+        def read() -> bool | None:
+            return self._read_on() if _is_shutter(self._core, self._label) else None
+
+        return self._executor.read(read)
+
+    def set_on(self, on: bool) -> bool:
+        """Switch a ``Shutter``-typed light source; return the readback.
+
+        Off is a safe call (design §13): never refused, halted, moving or in
+        dry-run. On is an action that an off wins over, as for
+        ``Shutter.set_open``.
+
+        Raises:
+            HardwareError: The device is not a ``Shutter``; nothing was sent.
+        """
+        if not _is_shutter(self._core, self._label):
+            raise self._no_switch()
+        if not on:
+            return self._executor.safe(self._off, self._read_on)
+        core, label = self._core, self._label
+        return self._executor.do(
+            "light_source: on",
+            Step(
+                log="light_source: on",
+                send=lambda: core.setShutterOpen(label, True),
+                readback=self._read_on,
+                dry_result=True,
+            ),
+            overridden_by=self._off,
+        )
+
+
+def _finite_number(text: str) -> float | None:
+    """``text`` as a finite float, or ``None``: ``nan`` is no intensity."""
+    try:
+        number = float(text)
+    except ValueError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _write_atomically(path: Path, data: bytes) -> None:
+    """Replace ``path`` by ``data`` so that it is either the old file or the new one (FM-38).
+
+    A temporary file in the same folder, created with ``O_EXCL`` and the mode
+    a plain write gives (``0o666`` less the umask; ``mkstemp``'s 0600 would
+    survive the rename), then ``os.replace``, in one ``try``: a Ctrl-C between
+    two blocks would leave a file nothing names. On a failure the temporary
+    file is removed, except when only the rename failed (Windows refuses to
+    replace a file another program holds open): it then holds the whole new
+    text, so it is kept and the error names it. Bytes in, bytes out, so the
+    CRLF of a Windows ``.cfg`` is written as it was (FM-24).
+
+    Raises:
+        HardwareError: The file could not be written; it is as it was.
+    """
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(4)}.smc-tmp")
+    renaming = False
+    try:
+        fd = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            0o666,
+        )
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view) :]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        renaming = True
+        os.replace(temporary, path)
+    except BaseException as exc:
+        if renaming and isinstance(exc, OSError):
+            raise HardwareError(
+                f"channels: {path} could not be replaced ({exc.strerror or exc}); it "
+                f"is as it was, and the new text is kept as {temporary}. Close any "
+                f"program that holds {path.name} open, then capture again"
+            ) from exc
+        with suppress(OSError):
+            temporary.unlink()
+        if isinstance(exc, OSError):
+            raise HardwareError(
+                f"channels: {path} could not be written ({exc.strerror or exc}); it "
+                f"is as it was"
+            ) from exc
+        raise
+
+
+class MMChannels:
+    """``Channels`` over one config group of the core (m2 §8.5).
+
+    The pure rules are in ``smc.hardware.channels``; this class reads the
+    stand and sends. Hardware behaviour encoded here:
+
+    * **A preset is checked under the lock, at every select** (FM-43): a
+      ``setConfig`` that would move a stage, an autofocus or the objective
+      turret, or change a core slot, goes around their guards, so it is
+      refused and cannot be forced. The settings are read in the step the
+      action builds under the lock, so a preset redefined while the select
+      waited is the one checked.
+    * **One command moves several devices**, and no stop reaches a ``State``
+      device: the motion has a key of its own, ``config group <group>``, and
+      is busy while any of the preset's devices reads busy.
+    * **``current()`` compares numbers as numbers**, not with
+      ``getCurrentConfig``, which reads ``''`` once ``Exposure`` reads
+      ``10.0000`` for a preset's ``10``.
+    * **A capture writes the file first** (the record), as a text edit that
+      keeps every other line, then deletes and redefines the preset in the
+      running core, since ``defineConfig`` merges into an existing one and
+      would keep stale settings (``nikon-control``'s capture did).
+      ``saveSystemConfiguration`` is never called: it rewrites the whole file
+      from the core's state, comments and the serial ports included.
+    """
+
+    def __init__(
+        self,
+        core: CMMCorePlus,
+        group: str,
+        executor: Executor,
+        *,
+        objective_turret: str | None,
+        exclude: Sequence[str] = (),
+        config_path: Path | None = None,
+        light: Callable[[], LightSource | None] = lambda: None,
+    ) -> None:
+        self._core = as_hardware_errors(core, "channels")
+        self._group = group
+        self._executor = executor
+        self._turret = objective_turret
+        self._exclude = frozenset(exclude)
+        self._config_path = config_path
+        self._light = light
+
+    def group(self) -> str:
+        """The config group whose presets are the channels."""
+        return self._group
+
+    # --- reads ------------------------------------------------------------------
+
+    def _names(self) -> list[str]:
+        return [str(n) for n in self._core.getAvailableConfigs(self._group)]
+
+    def _settings(self, name: str) -> tuple[tuple[str, str, str], ...]:
+        return tuple(
+            (str(device), str(prop), str(value))
+            for device, prop, value in self._core.getConfigData(self._group, name)
+        )
+
+    def _read_setting(self, device: str, prop: str) -> str:
+        """What the stand reads now for one setting; ``Core`` ones through the core's slots."""
+        if device == "Core" and prop == "Shutter":
+            return str(self._core.getShutterDevice())
+        if device == "Core" and prop == "AutoShutter":
+            return "1" if self._core.getAutoShutter() else "0"
+        return str(self._core.getProperty(device, prop))
+
+    def _mismatches(
+        self, settings: Sequence[tuple[str, str, str]], *, first_only: bool = False
+    ) -> list[str]:
+        """Each setting that reads otherwise, as ``device,property: value read (expected)``."""
+        found: list[str] = []
+        for device, prop, expected in settings:
+            read = self._read_setting(device, prop)
+            if not setting_matches(expected, read):
+                found.append(f"{device},{prop} reads {read!r} (preset: {expected!r})")
+                if first_only:
+                    break
+        return found
+
+    def _current(self) -> str | None:
+        loaded = {str(label) for label in self._core.getLoadedDevices()}
+        for name in self._names():
+            settings = self._settings(name)
+            # A preset that names a device that did not load matches nothing:
+            # read, it would fail every current() and every state() (FM-19).
+            if any(d != "Core" and d not in loaded for d, _, _ in settings):
+                continue
+            if not self._mismatches(settings, first_only=True):
+                return name
+        return None
+
+    def _known(self, name: str) -> list[str]:
+        names = self._names()
+        if name not in names:
+            raise ValueError(
+                f"channels: group {self._group!r} has no preset {name!r}; its "
+                f"presets are: {', '.join(repr(n) for n in names) or 'none'}"
+            )
+        return names
+
+    def names(self) -> list[str]:
+        """The group's presets as the core lists them; ``[]`` while the group does not exist."""
+        return self._executor.read(self._names)
+
+    def current(self) -> str | None:
+        """The first preset, in ``names()`` order, whose every setting matches the stand.
+
+        Numbers match as numbers (``10`` and ``10.0000``); ``Core,Shutter`` is
+        compared with the core's shutter slot. ``None``: the stand matches no
+        preset. A read that fails raises ``HardwareError``.
+        """
+        return self._executor.read(self._current)
+
+    def preset(self, name: str) -> ChannelPreset:
+        """One preset's settings, as the running core holds them.
+
+        Raises:
+            ValueError: ``name`` is not one of ``names()``.
+        """
+
+        def read() -> ChannelPreset:
+            self._known(name)
+            return ChannelPreset(self._group, name, self._settings(name))
+
+        return self._executor.read(read)
+
+    # --- select -----------------------------------------------------------------
+
+    def _device_types(self) -> dict[str, str]:
+        core = self._core
+        return {
+            str(label): device_type_name(core.getDeviceType(label))
+            for label in core.getLoadedDevices()
+            if label != "Core"
+        }
+
+    def select(self, name: str) -> str | None:
+        """Apply preset ``name``; return the preset the stand matches afterwards.
+
+        One action, waited for like a move until none of the preset's devices
+        reads busy, with the core timeout as the deadline; it cannot be
+        stopped. The preset is read and checked under the lock. The readback
+        is ``name`` when every setting matches what the stand reads, else
+        ``current()``, with a WARNING naming each setting that reads otherwise.
+        In dry-run it returns ``name`` and sends nothing.
+
+        Raises:
+            ValueError: ``name`` is not one of ``names()``; nothing was sent.
+            SafetyRefusedError: The preset would move a stage, an autofocus
+                or the objective turret, change a core slot, or set a device
+                that is not loaded; not forceable, nothing was sent.
+            DeviceTimeoutError: A device still read busy at the core timeout;
+                the change stays registered as moving until it reads idle or
+                ``resume()``.
+        """
+        # A read: an unknown name takes no lock and sends nothing.
+        self._executor.read(lambda: self._known(name))
+        group, core = self._group, self._core
+        description = f"channels: select {group} {name}"
+        # Filled by the step, under the lock: what the motion polls and what the
+        # readback found otherwise.
+        devices: list[str] = []
+        otherwise: list[str] = []
+
+        def step() -> Step[str | None]:
+            settings = self._settings(name)
+            reasons = forbidden_settings(
+                settings,
+                device_types=self._device_types(),
+                objective_turret=self._turret,
+            )
+            if reasons:
+                raise SafetyRefusedError(
+                    f"channel {name!r} of group {group!r} is refused: "
+                    f"{'; '.join(reasons)}. Edit the preset in the configuration, "
+                    f"or move these through their capability (ZStage, XYStage, "
+                    f"Autofocus, ObjectiveTurret)"
+                )
+            devices[:] = list(dict.fromkeys(d for d, _, _ in settings if d != "Core"))
+
+            def readback() -> str | None:
+                otherwise[:] = self._mismatches(settings)
+                return name if not otherwise else self._current()
+
+            return Step(
+                log=description,
+                send=lambda: core.setConfig(group, name),
+                readback=readback,
+                dry_result=name,
+            )
+
+        motion = Motion(
+            device=f"config group {group}",
+            name=f"channels {group} {name}",
+            is_busy=lambda: any(bool(core.deviceBusy(d)) for d in devices),
+            stop=None,
+        )
+        landed = self._executor.do(
+            description, step, motion=motion, timeout_s=_core_timeout(core)
+        )
+        if landed != name:
+            logger.warning(
+                "channels: %s %s selected, but the stand reads otherwise: %s; it "
+                "matches %s",
+                group,
+                name,
+                "; ".join(otherwise),
+                "no preset" if landed is None else repr(landed),
+            )
+        return landed
+
+    # --- capture ----------------------------------------------------------------
+
+    def _capture_settings(self) -> list[tuple[str, str, str]]:
+        """What a capture records, in order: State labels, the light's knob, the shutter slot."""
+        core = self._core
+        settings: list[tuple[str, str, str]] = []
+        for label in core.getLoadedDevices():
+            if label == "Core" or label == self._turret or label in self._exclude:
+                continue
+            if device_type_name(core.getDeviceType(label)) != "State":
+                continue
+            if not core.hasProperty(label, "Label") or core.isPropertyReadOnly(
+                label, "Label"
+            ):
+                continue
+            settings.append((str(label), "Label", str(core.getStateLabel(label))))
+        light = self._light()
+        knob = None if light is None else light.intensity_knob()
+        if knob is not None and knob.device not in self._exclude:
+            settings.append((knob.device, knob.name, knob.value))
+        shutter = str(core.getShutterDevice())
+        if shutter:
+            settings.append(("Core", "Shutter", shutter))
+        return settings
+
+    def capture(self, name: str) -> ChannelPreset:
+        """Record the stand's illumination as preset ``name``, replacing one of that name.
+
+        It records each ``State`` device's ``Label`` (not the objective
+        turret's, not a ``[channels] exclude`` device's, not a read-only one),
+        then the light source's knob, then the core's shutter: which light path
+        and how bright, never whether the light is on, the exposure, or a
+        stage. The profile's configuration file is written first, atomically
+        and as UTF-8 with its line endings kept; then the running core
+        (delete, then define). Without a file (the demo's configuration), the
+        core only, and an INFO line says so. In dry-run nothing is written.
+
+        Raises:
+            ValueError: ``name`` cannot be written to a ``.cfg``.
+            HardwareError: A value cannot be written to a ``.cfg``, nothing
+                was found to capture, the file is not UTF-8 or cannot be
+                written (both unchanged), or the core refused the preset after
+                the file was written (the next open loads it from the file).
+        """
+        check_preset_name(name)
+        group = self._group
+        description = f"channels: capture {group} {name}"
+
+        def step() -> Step[ChannelPreset]:
+            settings = self._capture_settings()
+            for setting in settings:
+                check_value(*setting)
+            if not settings:
+                raise HardwareError(
+                    f"channels: nothing to capture for {name!r}: no State device, "
+                    f"light-source knob or shutter to record"
+                )
+            return Step(
+                log=description,
+                send=lambda: self._record(name, settings),
+                readback=lambda: self._saved(name),
+                dry_result=ChannelPreset(group, name, tuple(settings)),
+            )
+
+        return self._executor.do(description, step)
+
+    def _saved(self, name: str) -> ChannelPreset:
+        return ChannelPreset(
+            self._group, name, self._settings(name), saved_to=self._config_path
+        )
+
+    def _record(self, name: str, settings: Sequence[tuple[str, str, str]]) -> None:
+        """The capture's send: the file, then the core."""
+        path = self._config_path
+        if path is None:
+            logger.info(
+                "channels: %s not saved: the profile loads the demo configuration, "
+                "which has no file",
+                name,
+            )
+        else:
+            self._write_file(path, name, settings)
+        try:
+            self._define(name, settings)
+        except Exception as exc:
+            if path is None:
+                raise
+            raise HardwareError(
+                f"channels: {name!r} was written to {path}, but the running core did "
+                f"not take it ({_named(exc)}), and may hold part of it; the file "
+                f"holds the preset, and the next open loads it"
+            ) from exc
+
+    def _write_file(
+        self, path: Path, name: str, settings: Sequence[tuple[str, str, str]]
+    ) -> None:
+        try:
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise HardwareError(
+                f"channels: {path} could not be read ({exc.strerror or exc}); "
+                f"nothing was written"
+            ) from exc
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            line = raw.count(b"\n", 0, exc.start) + 1
+            raise HardwareError(
+                f"channels: {path} is not UTF-8 text (line {line}: {exc.reason}); "
+                f"nothing was written. Save it as UTF-8, then capture again"
+            ) from exc
+        new = replace_preset(text, self._group, name, settings)
+        _write_atomically(path, new.encode("utf-8"))
+
+    def _define(self, name: str, settings: Sequence[tuple[str, str, str]]) -> None:
+        group, core = self._group, self._core
+        old: tuple[tuple[str, str, str], ...] = ()
+        if name in self._names():
+            old = self._settings(name)
+            # defineConfig merges into an existing preset (m2 §8.1).
+            core.deleteConfig(group, name)
+        for device, prop, value in settings:
+            core.defineConfig(group, name, device, prop, value)
+        dropped = [s for s in old if s not in settings]
+        if dropped:
+            # A recapture records only what a channel is made of, so what the
+            # preset held besides (shutter states, an exposure) is gone.
+            added = [s for s in settings if s not in old]
+            logger.warning(
+                "channels: %s %s replaced; dropped: %s; added: %s",
+                group,
+                name,
+                "; ".join(",".join(s) for s in dropped),
+                "; ".join(",".join(s) for s in added) or "nothing",
+            )
+
+
 class MMProperties:
     """``Properties`` over every loaded device of a core."""
 
@@ -1799,28 +2637,12 @@ class MMProperties:
             lambda: [d for d in self._core.getLoadedDevices() if d != "Core"]
         )
 
-    def _info(self, device: str, name: str) -> PropertyInfo:
-        core = self._core
-        has_limits = bool(core.hasPropertyLimits(device, name))
-        return PropertyInfo(
-            device=device,
-            name=name,
-            value=str(core.getProperty(device, name)),
-            read_only=bool(core.isPropertyReadOnly(device, name)),
-            allowed=tuple(str(v) for v in core.getAllowedPropertyValues(device, name)),
-            lower=float(core.getPropertyLowerLimit(device, name))
-            if has_limits
-            else None,
-            upper=float(core.getPropertyUpperLimit(device, name))
-            if has_limits
-            else None,
-        )
-
     def describe(self, device: str) -> list[PropertyInfo]:
         """Every property of one device, with its constraints."""
         return self._executor.read(
             lambda: [
-                self._info(device, n) for n in self._core.getDevicePropertyNames(device)
+                _property_info(self._core, device, n)
+                for n in self._core.getDevicePropertyNames(device)
             ]
         )
 

@@ -26,6 +26,9 @@ from smc.hardware.capabilities import (
     XY,
     Autofocus,
     Camera,
+    Channels,
+    LightSource,
+    ObjectiveTurret,
     Properties,
     Shutter,
     XYStage,
@@ -211,12 +214,16 @@ def test_open_demo_resolves_the_five_roles_and_closes() -> None:
             Role.autofocus: "Autofocus",
             Role.shutter: "White Light Shutter",
         }
+        # m2 §8.6: the demo's LED builds a LightSource with no knob.
         assert m.available() == [
             XYStage,
             ZStage,
             Camera,
             Shutter,
             Autofocus,
+            ObjectiveTurret,
+            LightSource,
+            Channels,
             Properties,
         ]
         assert not m.dry_run

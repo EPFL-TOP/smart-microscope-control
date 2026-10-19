@@ -52,6 +52,9 @@ from typing import TYPE_CHECKING, TypeVar, cast
 from smc.hardware.backends.mm import (
     MMAutofocus,
     MMCamera,
+    MMChannels,
+    MMLightSource,
+    MMObjectiveTurret,
     MMProperties,
     MMShutter,
     MMXYStage,
@@ -64,11 +67,15 @@ from smc.hardware.capabilities import (
     XY,
     Autofocus,
     Camera,
+    Channels,
+    LightSource,
+    ObjectiveTurret,
     Properties,
     Shutter,
     XYStage,
     ZStage,
 )
+from smc.hardware.channels import choose_group
 from smc.hardware.core import close_core, open_core
 from smc.hardware.errors import (
     CapabilityMissingError,
@@ -91,15 +98,24 @@ T = TypeVar("T")
 R = TypeVar("R")
 
 #: The roles each capability needs, in the order ``available()`` lists them.
-#: ``Properties`` needs none: it reaches every loaded device.
+#: ``Properties`` needs none: it reaches every loaded device. ``Channels``
+#: needs none either, but a config group named for channels (m2 §8.5).
 CAPABILITY_ROLES: dict[type, tuple[Role, ...]] = {
     XYStage: (Role.xy_stage,),
     ZStage: (Role.focus,),
     Camera: (Role.camera,),
     Shutter: (Role.shutter,),
     Autofocus: (Role.autofocus,),
+    ObjectiveTurret: (Role.objective_turret,),
+    LightSource: (Role.light_source,),
+    Channels: (),
     Properties: (),
 }
+
+#: Why ``require(Channels)`` fails on a stand with no channel group.
+_NO_CHANNEL_GROUP = (
+    "no config group is named for channels; name one in the profile's [channels] group"
+)
 
 #: What the emergency stop reaches, in the order it stops them: the
 #: autofocus first, switched off, then the offset device it follows, then
@@ -132,6 +148,11 @@ class MicroscopeState:
     autofocus_locked: bool | None = None
     #: In the offset device's own units ([autofocus] offset_unit).
     autofocus_offset_native: float | None = None
+    objective: str | None = None
+    #: ``None`` also when the stand matches no preset of the channel group.
+    channel: str | None = None
+    #: In the light source's own units.
+    light_intensity_native: float | None = None
     moving: tuple[str, ...] = ()
     halted: bool = False
     roles: dict[str, str] = field(default_factory=dict)
@@ -205,6 +226,9 @@ class Microscope:
         self._capabilities: dict[type, object] = {}
         # Re-entrant: the emergency stop takes it from inside a lookup (FM-70).
         self._capabilities_lock = threading.RLock()
+        #: The channel group, chosen once (``_channel_group``): a stand without
+        #: one would otherwise log the same warning at every ``state()``.
+        self._channels_group: tuple[str | None] | None = None
         self._closed = False
 
     @classmethod
@@ -271,6 +295,18 @@ class Microscope:
                 message points at ``[roles.assign]`` in the profile.
         """
         found = self._lookup(capability)
+        if found is None and capability is Channels:
+            raise CapabilityMissingError(
+                "Channels",
+                None,
+                tuple(
+                    str(g)
+                    for g in as_hardware_errors(
+                        self.core, "channels"
+                    ).getAvailableConfigGroups()
+                ),
+                hint=_NO_CHANNEL_GROUP,
+            )
         if found is None:
             missing = next(
                 (
@@ -393,7 +429,62 @@ class Microscope:
                     "ZStage | None", _owned(owner, "Autofocus")._lookup(ZStage)
                 ),
             )
+        if (
+            capability is ObjectiveTurret
+            and (label := get(Role.objective_turret)) is not None
+        ):
+            return MMObjectiveTurret(
+                core,
+                label,
+                executor,
+                requires_confirm=self.profile.safety.turret_requires_confirm,
+                pixel_sizes_um=self.profile.camera.pixel_size_um,
+                autofocus=lambda: cast(
+                    "Autofocus | None",
+                    _owned(owner, "ObjectiveTurret")._lookup(Autofocus),
+                ),
+            )
+        if capability is LightSource and (label := get(Role.light_source)) is not None:
+            return MMLightSource(
+                core,
+                label,
+                executor,
+                intensity_property=self.profile.light_source.intensity_property,
+            )
+        if capability is Channels and (group := self._channel_group()) is not None:
+            return MMChannels(
+                core,
+                group,
+                executor,
+                objective_turret=get(Role.objective_turret),
+                exclude=self.profile.channels.exclude,
+                config_path=self.profile.config_path(),
+                light=lambda: cast(
+                    "LightSource | None",
+                    _owned(owner, "Channels")._lookup(LightSource),
+                ),
+            )
         return None
+
+    def _channel_group(self) -> str | None:
+        """The config group of ``Channels`` (m2 §8.5), chosen once; ``None``: no group.
+
+        The choice and its warnings are kept: ``state()`` looks ``Channels`` up
+        at every call, and a stand with two channel groups would log the same
+        warning each time. A read that fails is raised, and the choice is made
+        again at the next lookup.
+        """
+        if self._channels_group is None:
+            core = as_hardware_errors(self.core, "channels")
+            group, warnings = choose_group(
+                [str(g) for g in core.getAvailableConfigGroups()],
+                core_group=str(core.getChannelGroup()),
+                profile_group=self.profile.channels.group,
+            )
+            for warning in warnings:
+                log.warning("%s", warning)
+            self._channels_group = (group,)
+        return self._channels_group[0]
 
     def _interlock(self) -> ZInterlock | None:
         """The autofocus a Z move suspends and engages again; ``None`` when there is none.
@@ -485,6 +576,17 @@ class Microscope:
             state.autofocus_locked = _read("autofocus", autofocus.is_locked, errors)
             state.autofocus_offset_native = _read(
                 "autofocus", autofocus.offset_native, errors
+            )
+        turret = cast("ObjectiveTurret | None", self._lookup(ObjectiveTurret))
+        if turret is not None:
+            state.objective = _read("objective", turret.current, errors)
+        channels = _read("channel", lambda: self._lookup(Channels), errors)
+        if channels is not None:
+            state.channel = _read("channel", cast("Channels", channels).current, errors)
+        light = cast("LightSource | None", self._lookup(LightSource))
+        if light is not None:
+            state.light_intensity_native = _read(
+                "light", light.intensity_native, errors
             )
         # Read after the devices: "moving" and "halted" are then at least as
         # recent as the positions shown next to them.

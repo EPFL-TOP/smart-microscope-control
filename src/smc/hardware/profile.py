@@ -36,6 +36,8 @@ else:  # pragma: no cover - exercised on the 3.10 CI job
 __all__ = [
     "AutofocusSection",
     "CameraSection",
+    "ChannelsSection",
+    "LightSourceSection",
     "MicroManagerSection",
     "MicroscopeSection",
     "Profile",
@@ -346,6 +348,46 @@ class AutofocusSection(_Section):
         return self
 
 
+class LightSourceSection(_Section):
+    """How bright the ``light_source`` device is set (m2 §8.4)."""
+
+    #: The light source's property that sets how bright; "" = found by hints.
+    intensity_property: str = ""
+
+
+class ChannelsSection(_Section):
+    """Which config group holds the channels, and what a capture leaves out (m2 §8.5)."""
+
+    #: The config group whose presets are channels; "" = chosen by its name.
+    group: str = ""
+    #: Device labels that ``capture()`` never records.
+    exclude: list[str] = Field(default_factory=list)
+
+    @field_validator("group")
+    @classmethod
+    def _group_fits_a_cfg_line(cls, value: str) -> str:
+        # Written into the .cfg as a field of a comma-separated line (FM-81).
+        if value and (
+            "," in value
+            or value != value.strip()
+            or not all(" " <= c <= "~" for c in value)
+        ):
+            raise ValueError(
+                f"group {value!r} cannot be written to a configuration file: use "
+                "printable ASCII with no comma and no leading or trailing space"
+            )
+        return value
+
+    @field_validator("exclude")
+    @classmethod
+    def _exclude_not_empty(cls, value: list[str]) -> list[str]:
+        if any(not entry.strip() for entry in value):
+            raise ValueError(
+                'exclude entries must name a device label; remove the "" entry'
+            )
+        return value
+
+
 class Profile(_Section):
     """One instrument's stand-specific facts, validated.
 
@@ -360,6 +402,8 @@ class Profile(_Section):
     safety: SafetySection = Field(default_factory=SafetySection)
     camera: CameraSection = Field(default_factory=CameraSection)
     autofocus: AutofocusSection = Field(default_factory=AutofocusSection)
+    light_source: LightSourceSection = Field(default_factory=LightSourceSection)
+    channels: ChannelsSection = Field(default_factory=ChannelsSection)
     quirks: dict[str, Any] = Field(default_factory=dict)
     source: Path | None = Field(default=None, exclude=True)
 
@@ -642,6 +686,8 @@ _SECTIONS: dict[tuple[str, ...], type[BaseModel]] = {
     ("safety",): SafetySection,
     ("camera",): CameraSection,
     ("autofocus",): AutofocusSection,
+    ("light_source",): LightSourceSection,
+    ("channels",): ChannelsSection,
 }
 
 

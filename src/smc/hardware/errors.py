@@ -7,7 +7,8 @@ did not write this code.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import functools
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from smc.hardware.roles import Role
@@ -30,23 +31,43 @@ class DeviceTimeoutError(HardwareError):
 
 
 class CapabilityMissingError(HardwareError):
-    """No loaded device fills the role a capability needs."""
+    """No loaded device fills the role a capability needs.
+
+    ``hint``, when set, replaces the ``[roles.assign]`` advice: ``Channels``
+    needs a config group, not a role (m2 §8.6), and ``available`` then lists
+    the core's groups.
+    """
 
     def __init__(
         self,
         capability: str,
         role: Role | None,
         available: tuple[str, ...] = (),
+        *,
+        hint: str = "",
     ) -> None:
         self.capability = capability
         self.role = role
         self.available = available
+        self.hint = hint
         have = ", ".join(available) or "nothing"
-        where = f"the {role.value!r} role" if role is not None else "any role"
-        super().__init__(
-            f"{capability} needs {where}, which no loaded device fills "
-            f"(available roles: {have}). Assign one in the profile under "
-            f"[roles.assign], or check `smc devices` for candidates."
+        if hint:
+            message = f"{capability} is not available: {hint} (available: {have})."
+        else:
+            where = f"the {role.value!r} role" if role is not None else "any role"
+            message = (
+                f"{capability} needs {where}, which no loaded device fills "
+                f"(available roles: {have}). Assign one in the profile under "
+                f"[roles.assign], or check `smc devices` for candidates."
+            )
+        super().__init__(message)
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        # Rebuilt from the arguments, not the message, so the error survives
+        # a worker process (pickle); the hint is a keyword.
+        return (
+            functools.partial(type(self), hint=self.hint),
+            (self.capability, self.role, self.available),
         )
 
 

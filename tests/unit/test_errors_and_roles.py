@@ -34,6 +34,36 @@ def test_capability_missing_names_the_role_and_what_is_available() -> None:
     assert "[roles.assign]" in str(err)
 
 
+def test_a_hint_replaces_the_roles_advice() -> None:
+    # m2 §8.6: Channels needs a config group, not a role.
+    err = CapabilityMissingError(
+        "Channels",
+        None,
+        ("Camera", "System"),
+        hint="no config group is named for channels; name one in the profile's "
+        "[channels] group",
+    )
+    assert str(err) == (
+        "Channels is not available: no config group is named for channels; name "
+        "one in the profile's [channels] group (available: Camera, System)."
+    )
+    assert "[roles.assign]" not in str(err)
+
+
+def test_capability_missing_survives_a_worker_process() -> None:
+    for error in (
+        CapabilityMissingError("XYStage", Role.xy_stage, ("camera",)),
+        CapabilityMissingError("Channels", None, ("Camera",), hint="name a group"),
+    ):
+        copy = pickle.loads(pickle.dumps(error))
+        assert (str(copy), copy.role, copy.available, copy.hint) == (
+            str(error),
+            error.role,
+            error.available,
+            error.hint,
+        )
+
+
 def test_safety_refused_carries_how_to_force() -> None:
     err = SafetyRefusedError(
         "jog of 9000 µm exceeds the 5000 µm guard", "pass force=True"

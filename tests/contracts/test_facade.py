@@ -17,7 +17,15 @@ import pytest
 
 import smc.hardware.backends.mm as mm
 from smc.hardware import Microscope
-from smc.hardware.capabilities import Autofocus, Camera, Shutter, XYStage, ZStage
+from smc.hardware.capabilities import (
+    Autofocus,
+    Camera,
+    Channels,
+    ObjectiveTurret,
+    Shutter,
+    XYStage,
+    ZStage,
+)
 from smc.hardware.errors import CapabilityMissingError, HardwareError
 from smc.hardware.profile import Profile, SafetySection
 from smc.hardware.roles import Role
@@ -90,14 +98,32 @@ def back_where_it_started(stand: Microscope, envelope: Envelope) -> Iterator[Non
         assert envelope.offset_native is not None
         offset = autofocus.offset_native()
         assert abs(offset - envelope.offset_native) <= envelope.offset_tolerance
+    turret, channels = stand.get(ObjectiveTurret), stand.get(Channels)
+    if turret is not None:
+        assert turret.current() == envelope.objective
+    if channels is not None and envelope.channel is not None:
+        assert channels.current() == envelope.channel
 
 
 def test_teardown_puts_the_stand_back_where_it_started(
-    back_where_it_started: None, microscope: Microscope, envelope: Envelope
+    back_where_it_started: None,
+    microscope: Microscope,
+    envelope: Envelope,
+    backend: str,
 ) -> None:
     xy, z = microscope.get(XYStage), microscope.get(ZStage)
     camera, shutter = microscope.get(Camera), microscope.get(Shutter)
     autofocus = microscope.get(Autofocus)
+    turret, channels = microscope.get(ObjectiveTurret), microscope.get(Channels)
+    if backend != "hardware":
+        # The turret never turns on hardware, and only the current channel is
+        # selected there (m2 §8.8).
+        if turret is not None:
+            current = turret.current()
+            other = next(label for label in turret.labels() if label != current)
+            turret.select(other, confirm=True)
+        if channels is not None:
+            channels.select("FITC")
     if autofocus is not None and envelope.offset_native is not None:
         # With the autofocus off: it moves only the offset lens.
         autofocus.disengage()
@@ -376,6 +402,31 @@ def test_put_back_cuts_the_light_before_moving_and_restores_it_last(
 
 
 @pytest.mark.parametrize("backend", ["fake"], indirect=True)
+def test_put_back_turns_the_objective_after_z_and_the_channel_after_the_exposure(
+    stand: Microscope, envelope: Envelope, fake_core: FakeCore, put_back: PutBack
+) -> None:
+    # m2 §8.8: Z is back below its start before the turret turns.
+    facade = Microscope.from_core(stand.core, envelope.profile(stand.profile))
+    assert (envelope.objective, envelope.channel) == ("Nikon 10X S Fluor", "DAPI")
+    assert envelope.z_um is not None
+    assert envelope.exposure_ms is not None
+    facade.require(ZStage).move_to_um(envelope.z_um - 2)
+    facade.require(ObjectiveTurret).select("Nikon 20X Plan Fluor ELWD", confirm=True)
+    facade.require(Camera).set_exposure_ms(20.0)
+    facade.require(Channels).select("FITC")
+    fake_core.log.clear()
+    put_back(facade, envelope)
+    assert fake_core.log == [
+        "setShutterOpen('White Light Shutter', False)",
+        "enableContinuousFocus(False)",
+        f"setPosition('Z', {envelope.z_um!r})",
+        "setStateLabel('Objective', 'Nikon 10X S Fluor')",
+        f"setExposure({envelope.exposure_ms!r})",
+        "setConfig('Channel', 'DAPI')",
+    ]
+
+
+@pytest.mark.parametrize("backend", ["fake"], indirect=True)
 def test_put_back_names_an_autofocus_that_does_not_lock_again(
     stand: Microscope,
     envelope: Envelope,
@@ -476,8 +527,8 @@ def test_ctrl_c_during_the_put_back_skips_the_moves_left_and_names_them(
     message = str(caught.value)
     assert "xy: KeyboardInterrupt()" in message
     assert (
-        "not attempted after Ctrl-C: z, offset, exposure, auto-shutter, autofocus "
-        "on, shutter open"
+        "not attempted after Ctrl-C: z, objective, offset, exposure, channel, "
+        "auto-shutter, autofocus on, shutter open"
     ) in message
     assert not any(entry.startswith("setPosition(") for entry in fake_core.log)
     assert "enableContinuousFocus(True)" not in fake_core.log
