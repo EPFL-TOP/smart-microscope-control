@@ -70,7 +70,8 @@ them if it is not the one you run on.
 ## Implement
 
 6. Follow the plan's steps in order; one commit per step, conventional
-   messages.
+   messages. Steps that edit the same file may share a commit (the
+   worktree's shell has no `git add -p`, #158); say so in the Report.
 7. Test-first where behaviour is checkable. Simulator tests use the demo
    fixtures; pure logic gets unit tests (+ `hypothesis` for invariants);
    vendor quirks get `FakeCore` tests. The default suite never loads a
