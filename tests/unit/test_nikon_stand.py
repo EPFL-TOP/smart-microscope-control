@@ -939,3 +939,71 @@ def test_diagnosis_without_an_adapter_does_not_point_a_ti2_driver_beside_nothing
     assert len(found) == 1
     assert nikon.TI2.adapter_file in found[0]
     assert "install-driver" not in found[0]
+
+
+# -- the shipped configurations (m2 §7.7) -----------------------------------------
+
+PROFILES_DIR = Path(__file__).resolve().parents[2] / "profiles"
+
+
+def cfg_records(path: Path, kind: str) -> list[list[str]]:
+    """The fields of every ``kind`` line of a ``.cfg``; comments and blank lines skipped."""
+    records = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        if not line.startswith("#") and fields[0] == kind:
+            records.append(fields)
+    return records
+
+
+def test_shipped_nikon_configs_load_the_measured_devices() -> None:
+    ti2 = measured("nikon-ti2-devices.json")
+    ti2_cfg = PROFILES_DIR / "nikon-ti2.cfg"
+    assert [(f[1], f[2], f[3]) for f in cfg_records(ti2_cfg, "Device")] == [
+        (d.label, d.library, d.name) for d in ti2
+    ]
+    # Every device but the hub and the camera hangs below the hub.
+    hub = next(d.label for d in ti2 if d.type == "Hub")
+    assert [(f[1], f[2]) for f in cfg_records(ti2_cfg, "Parent")] == [
+        (d.label, hub) for d in ti2 if d.type not in ("Hub", "Camera")
+    ]
+
+    # TIDiaLamp has crashed Micro-Manager with some driver versions: it is left out.
+    tie = [d for d in measured("nikon-tie-devices.json") if d.label != "TIDiaLamp"]
+    tie_cfg = PROFILES_DIR / "nikon-tie.cfg"
+    assert [(f[1], f[2], f[3]) for f in cfg_records(tie_cfg, "Device")] == [
+        (d.label, d.library, d.name) for d in tie
+    ]
+    assert [(f[1], f[2]) for f in cfg_records(tie_cfg, "Parent")] == [
+        (d.label, "TIScope") for d in tie if d.type != "Hub"
+    ]
+
+
+def test_shipped_nikon_configs_are_stands_of_their_own_adapter() -> None:
+    assert nikon.stands_in_config(PROFILES_DIR / "nikon-ti2.cfg") == [nikon.TI2]
+    assert nikon.stands_in_config(PROFILES_DIR / "nikon-tie.cfg") == [nikon.TIE]
+
+
+def test_the_ti_e_configuration_says_it_is_assumed_and_has_no_core_role_lines() -> None:
+    path = PROFILES_DIR / "nikon-tie.cfg"
+
+    assert path.read_text(encoding="utf-8").startswith("# ASSUMED, never loaded")
+    # The resolver fills the roles: a core slot written by hand would be a guess.
+    assert [f for f in cfg_records(path, "Property") if f[1] == "Core"] == [
+        ["Property", "Core", "Initialize", "0"],
+        ["Property", "Core", "Initialize", "1"],
+    ]
+
+
+def test_shipped_nikon_configs_hold_no_port_serial_number_or_host() -> None:
+    # FM-50: the repository is public.
+    for name in ("nikon-ti2.cfg", "nikon-tie.cfg"):
+        for line in (PROFILES_DIR / name).read_text(encoding="utf-8").splitlines():
+            if line.startswith("#"):
+                continue
+            fields = [field.strip().lower() for field in line.split(",")]
+            assert "port" not in fields, (name, line)
+            assert "serialnumber" not in fields, (name, line)
+            assert not any(
+                field.startswith("com") and field[3:].isdigit() for field in fields
+            )
