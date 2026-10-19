@@ -1,0 +1,23 @@
+{
+  "source": "Nikon Ti-E, NOT measured on a stand: the 18 devices the NikonTI adapter publishes, listed with no microscope attached (nikon-control, read 2026-10-19). The device name equals the label and every description is empty.",
+  "devices": [
+    {"label": "TIScope", "type": "Hub", "library": "NikonTI"},
+    {"label": "TIAnalyzer", "type": "Generic", "library": "NikonTI"},
+    {"label": "TIEpiShutter", "type": "Shutter", "library": "NikonTI"},
+    {"label": "TIDiaShutter", "type": "Shutter", "library": "NikonTI"},
+    {"label": "TIAuxShutter", "type": "Shutter", "library": "NikonTI"},
+    {"label": "TIDiaLamp", "type": "Shutter", "library": "NikonTI"},
+    {"label": "TINosePiece", "type": "State", "library": "NikonTI"},
+    {"label": "TICondenserCassette", "type": "State", "library": "NikonTI"},
+    {"label": "TIBarrierFilterWheel", "type": "State", "library": "NikonTI"},
+    {"label": "TIExcitationFilterWheel", "type": "State", "library": "NikonTI"},
+    {"label": "TIFilterBlock1", "type": "State", "library": "NikonTI"},
+    {"label": "TIFilterBlock2", "type": "State", "library": "NikonTI"},
+    {"label": "TILightPath", "type": "State", "library": "NikonTI"},
+    {"label": "TIZDrive", "type": "Stage", "library": "NikonTI"},
+    {"label": "TIPFSOffset", "type": "Stage", "library": "NikonTI"},
+    {"label": "TITIRF", "type": "Stage", "library": "NikonTI"},
+    {"label": "TIXYDrive", "type": "XYStage", "library": "NikonTI"},
+    {"label": "TIPFSStatus", "type": "AutoFocus", "library": "NikonTI"}
+  ]
+}
