@@ -724,8 +724,9 @@ of this section.
 
 **A failed load leaves nothing loaded (#132).** `open_core` does not call
 `unloadAllDevices()` when `loadSystemConfiguration` raises, because MMCore
-has already unloaded what it loaded. Measured 2026-10-19, on macOS only
-(Windows and Linux were not run), with pymmcore
+has already unloaded what it loaded. Measured 2026-10-19 on macOS
+(the tests below also pass on the CI runners of Linux and Windows, English
+locale; the two pymmcore versions were run on macOS only), with pymmcore
 12.5.0.75.0 (MMCore 12.5.0, device interface 75) and with the oldest the
 project allows, 11.10.0.74.0 (MMCore 11.10.0, interface 74), on a file that
 loads two demo devices and then fails at a `Device` line (adapter missing),
