@@ -10,6 +10,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 
 import pytest
 
@@ -1313,6 +1314,98 @@ def test_give_up_does_not_cancel_another_threads_queued_move() -> None:
     assert second.error is None
     assert second.result == "arrived"
     assert xy.commands == 1
+
+
+class _ContenderDuringGiveUp:
+    """A move queued from inside a give-up's stop, held there until it has polled the lock (#101).
+
+    ``motion`` is ``device``'s with a stop that records ``moving()``, starts
+    the contender, waits for the contender's first poll of the lock (an
+    event, not a sleep: FM-44) and then calls the device's own stop. The poll
+    is seen through ``Executor._contention``, which runs on every failed
+    attempt to take the lock, so the stop is held for exactly the window in
+    which the holder's "waiting for" decides the contender's fate.
+    """
+
+    def __init__(
+        self, executor: Executor, device: _Device, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.motion = replace(device.motion, stop=self._stop)
+        self.moving: tuple[str, ...] = ()
+        self.contender: _Thread | None = None
+        self._executor = executor
+        self._device = device
+        self._in_give_up = threading.Event()
+        self._polled = threading.Event()
+        contention = executor._contention
+
+        def polled(started: float, halt_mark: int | None, *, expired: bool) -> None:
+            try:
+                contention(started, halt_mark, expired=expired)
+            finally:
+                if self._in_give_up.is_set():
+                    self._polled.set()
+
+        monkeypatch.setattr(executor, "_contention", polled)
+
+    def _stop(self) -> None:
+        self.moving = self._executor.moving()
+        self._in_give_up.set()
+        self.contender = _Thread(lambda: _move(self._executor, self._device))
+        assert self._polled.wait(JOIN_S)
+        self._device.stop()
+
+    def finished(self) -> _Thread:
+        assert self.contender is not None, "the give-up never sent its stop"
+        self.contender.join()
+        return self.contender
+
+
+def test_a_contender_polling_during_a_give_up_waits_and_then_moves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #101: the holder still waited for its motion while the give-up sent the
+    # stop and wrote its line, so a queued move that polled the lock then was
+    # refused, and one that polled later ran. How long a log handler took
+    # decided which, and test_give_up_does_not_cancel_another_threads_queued_move
+    # failed on CI. Registered, the motion is the guard's business, not the
+    # contention rule's, so the contender waits for the lock.
+    executor, xy = _ex(), _Device(arrive_after=0)
+    during = _ContenderDuringGiveUp(executor, xy, monkeypatch)
+
+    def command_that_raises() -> None:
+        raise RuntimeError("serial timeout")
+
+    with pytest.raises(RuntimeError, match="serial timeout"):
+        executor.do(
+            "move A",
+            Step("xy_stage: move A", command_that_raises, lambda: "A", "dry"),
+            motion=during.motion,
+            timeout_s=30.0,
+        )
+    contender = during.finished()
+    assert contender.error is None
+    assert contender.result == "arrived"
+    assert xy.stops == 1  # the give-up's, not the contender's
+    assert xy.commands == 1  # the contender's, after the give-up
+
+
+def test_a_contender_behind_a_give_up_that_leaves_the_stage_moving_is_refused_by_the_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #101: where the stage still reads busy after the stop, the contender is
+    # refused too, but by the guard once the lock is free, naming the motion
+    # as moving, not by the contention rule as "waiting for" it.
+    executor, xy = _ex(), _Device(stop_clears=False)
+    during = _ContenderDuringGiveUp(executor, xy, monkeypatch)
+
+    with pytest.raises(DeviceTimeoutError):
+        executor.do("move A", xy.step(), motion=during.motion, timeout_s=0.0)
+    contender = during.finished()
+    assert during.moving == ("xy_stage XY",)  # named from the first instant
+    assert isinstance(contender.error, MotionInProgressError)
+    assert "is waiting for it" not in str(contender.error)
+    assert xy.commands == 1  # the contender sent nothing
 
 
 # --- stop ---------------------------------------------------------------------
