@@ -764,19 +764,34 @@ class MMAutofocus:
         holding the lock, so here ``False`` always means "off". In dry-run it
         returns ``True``, the commanded outcome, and sends nothing.
 
+        PFS searching drives Z, so the operator's ``ZStage.stop()`` ends the
+        wait too (m2 §3.3.1): it switches the autofocus off before Z's stop,
+        and the call raises. A Z stop is never a ``False``: that would read
+        as "no lock found", not "stopped".
+
         Raises:
             ValueError: ``timeout_s`` is not finite or not in (0, 600] s;
                 nothing was sent.
             DeviceTimeoutError: No lock, and it could not be switched off (or
                 still reads on). The wait stays registered as a motion, so the
                 stand refuses actions until ``stop()`` or ``resume()``.
-            MotionStoppedError: ``disengage()`` or a stop cancelled the wait.
+            MotionStoppedError: ``disengage()`` or a stop cancelled the wait;
+                a ``ZStage.stop()`` left it off (named ``z <label>``), or
+                cancelled the call before anything was sent.
             HardwareError: Its state could not be read once the wait ended. It
                 was given up on as at the deadline: switched off, or still
                 registered as a motion if that failed too.
         """
         limit_s, assumed = self._lock_timeout(timeout_s)
-        return self._engage("autofocus: engage", limit_s, assumed).locked
+        description = "autofocus: engage"
+
+        def run() -> bool:
+            with self._ended_by_a_z_stop(description, suspended=False):
+                return self._engage(description, limit_s, assumed).locked
+
+        # Its own compound, so that the link and the check for a Z stop made
+        # while it waited for the lock have a record to compare against.
+        return self._executor.compound(description, run)
 
     def _engage(self, description: str, limit_s: float, assumed: bool) -> _Lock:
         """``engage``'s action, also run nested by the relocks; how the wait ended."""
