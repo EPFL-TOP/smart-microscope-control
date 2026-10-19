@@ -1132,6 +1132,9 @@ given value, which must be finite and positive. It is installed with
 `microscope.override(Camera, …)` and therefore bypasses the `Executor` (§7):
 no lock, no dry-run, no halt, no motion guard, and it is not thread-safe (it
 owns a random generator). It works on any `Microscope`, the fake's included.
+The `microscope` argument is held weakly: the facade holds the camera as its
+`Camera`, and a strong reference both ways was a cycle through the core
+(FM-92); `snap()` raises `HardwareError` once that facade is gone (#148).
 
 **What it is not.** There is no optics beyond the z blur (no PSF, no
 shading, no illumination), no z-stack realism, no sub-pixel stage
