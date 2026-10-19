@@ -36,6 +36,16 @@ pymmcore 12.5.0.75.0), unless labelled *assumed*:
   ``Error (code 43)``. Enabled reads locked at once, as on the demo
   (assumed: a real lock takes time), unless ``autofocus_lockable`` is
   ``False``.
+* **Config groups** (measured on the demo 2026-10-19, m2 §8.1). Groups and
+  presets list sorted. ``defineConfig`` *merges*: it changes or adds one
+  setting and keeps the others, creates a missing group, and accepts a
+  device that is not loaded without a word. ``deleteConfig`` of a missing
+  preset names the group, not the preset, and a group stays once its last
+  preset is gone. ``setConfig`` applies each setting in order through the
+  property store, a ``Core,Shutter`` setting through the shutter slot; a
+  device that is not loaded raises there. ``getCurrentConfig`` is not
+  implemented: it compares strings (``10`` against ``10.0000``), and the
+  layer never calls it.
 """
 
 from __future__ import annotations
@@ -66,6 +76,9 @@ _NO_CAMERA = "Camera not loaded or initialized."
 #: empty, and to either offset call (measured on the demo, 2026-10-16).
 _NO_AUTOFOCUS = "Auto-focus focus device not defined."
 _NO_AUTOFOCUS_OFFSET = "Error (code 43)"
+
+#: One preset's settings: ``(device, property, value)``, in the order applied.
+Settings = list[tuple[str, str, str]]
 
 
 @dataclass(slots=True)
@@ -123,6 +136,8 @@ class FakeCore:
     * ``quirk_z_move_disables_autofocus``: the Nikon quirk (FM-12).
     * ``autofocus_lockable``: ``False`` and the autofocus never reads
       locked, even enabled, as with no reference in range.
+    * ``config_groups``: group -> preset -> its settings, which the
+      config-group calls read and write; a test may fill it directly.
     """
 
     def __init__(
@@ -151,6 +166,8 @@ class FakeCore:
         self.bit_depth = 16
         self.quirk_z_move_disables_autofocus = True
         self.autofocus_lockable = True
+        self.config_groups: dict[str, dict[str, Settings]] = {}
+        self._channel_group = ""
 
         self._devices: dict[str, FakeDevice] = {}
         for device in devices:
@@ -321,7 +338,7 @@ class FakeCore:
                 library="Utilities",
             ),
         ]
-        return cls(
+        core = cls(
             devices,
             camera="Camera",
             xy_stage="XY",
@@ -329,6 +346,9 @@ class FakeCore:
             autofocus="Autofocus",
             shutter="White Light Shutter",
         )
+        core.config_groups = _demo_config_groups()
+        core._channel_group = "Channel"
+        return core
 
     # --- helpers -------------------------------------------------------------
 
@@ -592,6 +612,10 @@ class FakeCore:
         changes nothing (measured): only the backend refuses it.
         """
         self._record("setProperty", label, name, value)
+        self._set_property(label, name, value)
+
+    def _set_property(self, label: str, name: str, value: str | float | int) -> None:
+        """``setProperty`` without the log line: ``setConfig`` applies its settings so."""
         device = self._device(label)
         prop = self._property(label, name)
         if prop.read_only:
@@ -652,6 +676,17 @@ class FakeCore:
     def getStateLabels(self, label: str) -> tuple[str, ...]:
         return self._typed(label, DeviceType.State).state_labels
 
+    def setStateLabel(self, label: str, text: str) -> None:
+        """Move a State device to the position named ``text``; an unknown one raises (measured)."""
+        self._record("setStateLabel", label, text)
+        device = self._typed(label, DeviceType.State)
+        if text not in device.state_labels:
+            raise RuntimeError(
+                f'Error in device "{label}": Label not defined (10).  Available '
+                f"Labels: {device.state_labels!r}"
+            )
+        self._set_position(device, device.state_labels.index(text))
+
     def _set_position(self, device: FakeDevice, position: int) -> None:
         """Move a State device: ``State`` and ``Label`` change together (one store)."""
         if not 0 <= position < len(device.state_labels):
@@ -707,6 +742,106 @@ class FakeCore:
         if not label:
             raise RuntimeError(_NO_AUTOFOCUS_OFFSET)
         self._af_offset[label] = float(offset)
+
+    # --- config groups -------------------------------------------------------
+
+    def getAvailableConfigGroups(self) -> tuple[str, ...]:
+        return tuple(sorted(self.config_groups))
+
+    def getAvailableConfigs(self, group: str) -> tuple[str, ...]:
+        """The group's presets, sorted; ``()`` for a group that does not exist (measured)."""
+        return tuple(sorted(self.config_groups.get(group, {})))
+
+    def getConfigData(self, group: str, name: str) -> tuple[tuple[str, str, str], ...]:
+        """The preset's ``(device, property, value)`` settings, in the order applied."""
+        settings = self.config_groups.get(group, {}).get(name)
+        if settings is None:
+            raise ValueError(
+                f'Configuration group "{group}" or its preset "{name}" does not exist'
+            )
+        return tuple(settings)
+
+    def defineConfig(
+        self,
+        group: str,
+        name: str | None = None,
+        device: str | None = None,
+        prop: str | None = None,
+        value: str | float | None = None,
+    ) -> None:
+        """Merge one setting into a preset, creating the group and the preset (measured).
+
+        A setting of the same device and property is changed where it is, any
+        other is appended, and nothing checks that the device is loaded.
+        """
+        self._record("defineConfig", group, name, device, prop, value)
+        presets = self.config_groups.setdefault(group, {})
+        if name is None:
+            return
+        settings = presets.setdefault(name, [])
+        if device is None or prop is None:
+            return
+        text = "" if value is None else str(value)
+        for index, (dev, name_, _) in enumerate(settings):
+            if (dev, name_) == (device, prop):
+                settings[index] = (device, prop, text)
+                return
+        settings.append((device, prop, text))
+
+    def deleteConfig(self, group: str, name: str) -> None:
+        """Remove one preset; the group stays even once it is empty (measured).
+
+        A missing preset raises the message of a missing group, which does
+        not name the preset (measured).
+        """
+        self._record("deleteConfig", group, name)
+        presets = self.config_groups.get(group)
+        if presets is None or name not in presets:
+            raise ValueError(f'Configuration group "{group}" does not exist')
+        del presets[name]
+
+    def setConfig(self, group: str, name: str) -> None:
+        """Apply a preset's settings in order; a device that is not loaded raises there."""
+        self._record("setConfig", group, name)
+        settings = self.config_groups.get(group, {}).get(name)
+        if settings is None:
+            raise ValueError(
+                f'Preset "{name}" of configuration group "{group}" does not exist'
+            )
+        for device, prop, value in list(settings):
+            if device == _CORE_LABEL:
+                self._set_core_property(prop, value)
+            else:
+                self._set_property(device, prop, value)
+
+    def _set_core_property(self, prop: str, value: str) -> None:
+        """A ``Core,<prop>`` setting: a slot, the auto-shutter or the channel group."""
+        slots = {core_name: slot for slot, (core_name, _) in _SLOTS.items()}
+        if prop in slots:
+            self._set_slot(slots[prop], value)
+        elif prop == "AutoShutter":
+            self._auto_shutter = value not in ("0", "")
+        elif prop == "ChannelGroup":
+            self._set_channel_group(value)
+        else:
+            raise RuntimeError(
+                f'Error in device "{_CORE_LABEL}": Invalid property name '
+                f"encountered: {prop} (2)"
+            )
+
+    def getChannelGroup(self) -> str:
+        return self._channel_group
+
+    def setChannelGroup(self, group: str) -> None:
+        self._record("setChannelGroup", group)
+        self._set_channel_group(group)
+
+    def _set_channel_group(self, group: str) -> None:
+        if group and group not in self.config_groups:
+            raise ValueError(
+                f'Cannot set Core property ChannelGroup to invalid value "{group}"'
+            )
+        self._channel_group = group
 
     # --- unloading -----------------------------------------------------------
 
@@ -803,6 +938,70 @@ def _demo(
         properties["State"] = FakeProperty(str(position))
         properties["Label"] = FakeProperty(labels[position], allowed=labels)
     return FakeDevice(label, kind, library, name, description, properties, labels)
+
+
+def _demo_config_groups() -> dict[str, dict[str, Settings]]:
+    """The demo configuration's six groups, as ``getConfigData`` read them (2026-10-19)."""
+
+    def channel(dichroic: str, emission: str, excitation: str) -> Settings:
+        return [
+            ("Dichroic", "Label", dichroic),
+            ("Emission", "Label", emission),
+            ("Excitation", "Label", excitation),
+            (_CORE_LABEL, "Shutter", "White Light Shutter"),
+        ]
+
+    def multiband(led: str) -> Settings:
+        return [
+            ("Dichroic", "Label", "89402bs"),
+            ("Emission", "Label", "89402m"),
+            ("Excitation", "Label", "Empty"),
+            ("LED", "Label", led),
+            (_CORE_LABEL, "Shutter", "LED Shutter"),
+        ]
+
+    def camera(binning: str, bit_depth: str) -> Settings:
+        return [("Camera", "Binning", binning), ("Camera", "BitDepth", bit_depth)]
+
+    return {
+        "Camera": {
+            "HighRes": camera("1", "12"),
+            "LowRes": camera("4", "8"),
+            "MedRes": camera("2", "10"),
+        },
+        "Channel": {
+            "Cy5": channel("400DCLP", "Chroma-HQ700", "Chroma-HQ570"),
+            "DAPI": channel("400DCLP", "Chroma-HQ620", "Chroma-D360"),
+            "FITC": channel("Q505LP", "Chroma-HQ535", "Chroma-HQ480"),
+            "Rhodamine": channel("Q585LP", "Chroma-HQ700", "Chroma-HQ570"),
+        },
+        "Channel-Multiband": {
+            "Cy5": multiband("635nm"),
+            "DAPI": multiband("385nm"),
+            "FITC": multiband("470nm"),
+            "Rhodamine": multiband("550nm"),
+        },
+        "LightPath": {
+            "Camera-left": [("Path", "State", "1")],
+            "Camera-right": [("Path", "State", "2")],
+            "Eyepiece": [("Path", "State", "0")],
+        },
+        "Objective": {
+            "10X": [("Objective", "State", "1")],
+            "20X": [("Objective", "State", "3")],
+            "40X": [("Objective", "State", "0")],
+        },
+        "System": {
+            "Startup": [
+                ("Camera", "BitDepth", "16"),
+                ("Camera", "ScanMode", "1"),
+                ("Objective", "Label", "Nikon 10X S Fluor"),
+                ("Camera", "Binning", "1"),
+                ("LED Shutter", "State Device", "LED"),
+                (_CORE_LABEL, "ChannelGroup", "Channel"),
+            ]
+        },
+    }
 
 
 def _demo_wheel(label: str, labels: tuple[str, ...]) -> FakeDevice:
