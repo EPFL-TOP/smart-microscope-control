@@ -311,8 +311,8 @@ class Autofocus(Protocol):
 
         ``timeout_s`` defaults to the profile's ``lock_timeout_s``, else 5 s
         (assumed); it must be finite and in (0, 600] s. Its search drives Z,
-        so a ``ZStage.stop()`` ends it with the autofocus off, as a raise
-        (``MotionStoppedError``), never a ``False``.
+        so a ``ZStage.stop()`` during the search ends it with the autofocus
+        off, as a raise (``MotionStoppedError``), never a ``False``.
         """
         ...
 
@@ -328,7 +328,8 @@ class Autofocus(Protocol):
         """Move the offset to ``value``; return the readback (soft limits apply).
 
         With the autofocus on, it follows the offset and drives Z, so a
-        ``ZStage.stop()`` ends the move with it off (``MotionStoppedError``).
+        ``ZStage.stop()`` during the move ends it with the autofocus off
+        (``MotionStoppedError``).
         """
         ...
 

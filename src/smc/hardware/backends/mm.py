@@ -1210,8 +1210,10 @@ class MMAutofocus:
             SafetyRefusedError: Outside the offset's soft limits, or, locked,
                 past the Z soft limits; nothing was sent.
             MotionStoppedError: The offset device was stopped; or, with the
-                autofocus on, ``ZStage.stop()`` was called: it was switched
-                off, and the offset device stopped (named ``z <label>``).
+                autofocus on, ``ZStage.stop()`` was called (named ``z
+                <label>``): during the move, it was switched off and the
+                offset device stopped; while the call waited for the
+                microscope lock, nothing was sent and it was left as it was.
         """
         value = float(value)
         # Before the compound: a refused change takes no lock and reads nothing.
