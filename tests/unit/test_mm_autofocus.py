@@ -33,7 +33,10 @@ from smc.hardware.capabilities import (
     XY,
     Autofocus,
     Camera,
+    Channels,
     FocusStep,
+    LightSource,
+    ObjectiveTurret,
     XYStage,
     ZStage,
 )
@@ -3467,7 +3470,28 @@ def _use_the_stand(core: FakeCore, microscope: Microscope) -> None:
     autofocus.offset_by_native(1.0, force=True)
     autofocus.disengage()
     z.move_to_um(0.0)  # PFS off: a plain move
+    # m2 §8: the turret looks the autofocus up through the facade, Channels
+    # the light source; each does one thing.
+    autofocus.engage()
+    microscope.require(ObjectiveTurret).select("10x", confirm=True)  # PFS off first
+    channels = microscope.require(Channels)
+    channels.select("BF")
+    channels.capture("smc")
+    microscope.require(LightSource).set_intensity_native(100.0)
     microscope.state()
+
+
+def _with_lamp_and_channel(core: FakeCore) -> FakeCore:
+    """``core`` with the Ti2-E's ``DiaLamp`` and a ``Channel`` group of one preset."""
+    core.config_groups = {"Channel": {"BF": [("DiaLamp", "Intensity", "210")]}}
+    return core
+
+
+_DIA_LAMP = (
+    FakeDevice(
+        "DiaLamp", DeviceType.Shutter, properties={"Intensity": FakeProperty("501")}
+    ),
+)
 
 
 @pytest.mark.parametrize("closed", [True, False])
@@ -3479,7 +3503,7 @@ def test_a_dropped_facade_frees_its_core_without_the_cyclic_collector(
     # callback of its own stop link (a Z move with PFS on) kept the core alive
     # until the cyclic collector, which at the exit of `smc doctor` runs during
     # interpreter finalization: the child aborted there.
-    core = _at_offset(7800.0)
+    core = _with_lamp_and_channel(_at_offset(7800.0, extra=_DIA_LAMP))
     microscope = Microscope.from_core(cast("CMMCorePlus", core), _factor({"4x": -3.0}))
     _use_the_stand(core, microscope)
     if closed:
