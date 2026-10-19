@@ -7,13 +7,14 @@ writing to a terminal) and clears ``SMC_PROFILE``, so an operator's
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import re
 import stat
 import sys
 from collections import Counter
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 import numpy as np
@@ -23,12 +24,15 @@ from typer.testing import CliRunner, Result
 
 from smc import __version__
 from smc.cli import app
+from smc.discovery import dll_probe
+from smc.discovery.dll_probe import DllProbe, describe_winerror
 from smc.hardware import Microscope
 from smc.hardware import core as core_mod
 from smc.hardware import microscope as microscope_mod
+from smc.hardware.backends import nikon
 from smc.hardware.backends.mm import MMXYStage
 from smc.hardware.capabilities import XY
-from smc.hardware.errors import HardwareError
+from smc.hardware.errors import CoreError, HardwareError
 from smc.hardware.microscope import MicroscopeState
 
 runner = CliRunner(env={"COLUMNS": "200", "SMC_PROFILE": None, "SMC_PROFILES": None})
@@ -1273,3 +1277,313 @@ def test_snap_gives_the_tiff_the_mode_of_a_plain_write(tmp_path: Path) -> None:
 
     assert result.exit_code == 0, result.output
     assert stat.S_IMODE(out.stat().st_mode) == 0o644
+
+
+# --- doctor on a Nikon stand (design m2 §7.4) ---------------------------------------
+# No Nikon adapter is ever loaded (FM-40): the open is patched to fail the way
+# MMCore does, the loader probe is canned, and every folder is under tmp_path.
+
+TI2_ADAPTER = "mmgr_dal_NikonTi2.dll"
+TI2_DRIVER = "Ti2_Mic_Driver.dll"
+LOAD_ERROR = (
+    "could not load {path}: Line 4: Device,Ti2-E__0,NikonTi2,Ti2-E__0\n"
+    'Failed to load device adapter "NikonTi2" from {adapter}'
+)
+
+
+@pytest.fixture
+def isolated_sdk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point both stands at an SDK folder under tmp_path: a Ti2 PC has the real one."""
+    sdk = tmp_path / "sdk"
+    for stand in nikon.STANDS:
+        moved = dataclasses.replace(
+            stand, driver=dataclasses.replace(stand.driver, sdk_dir=str(sdk))
+        )
+        monkeypatch.setitem(nikon._BY_ADAPTER, stand.adapter.casefold(), moved)
+        monkeypatch.setitem(nikon._BY_KEY, stand.key, moved)
+    return sdk
+
+
+@pytest.fixture
+def mm_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, isolated_sdk: Path
+) -> Path:
+    """An install folder holding the Ti2 adapter, as ``doctor`` finds the install."""
+    install = tmp_path / "install"
+    install.mkdir()
+    (install / TI2_ADAPTER).write_bytes(b"MZ")
+    status = core_mod.MicroManagerStatus(
+        install_dir=install, api_version="test", core_version="test", adapters=()
+    )
+    monkeypatch.setattr(core_mod, "status", lambda: status)
+    return install
+
+
+@pytest.fixture
+def ti2_profile(tmp_path: Path) -> Path:
+    """A profile whose configuration loads a Ti2, and whose own folder holds the adapter."""
+    own = tmp_path / "own"
+    own.mkdir()
+    (own / TI2_ADAPTER).write_bytes(b"MZ")
+    (tmp_path / "ti2.cfg").write_text(
+        "Device,Ti2-E__0,NikonTi2,Ti2-E__0\nDevice,ZDrive,NikonTi2,ZDrive\n",
+        encoding="utf-8",
+    )
+    path = tmp_path / "ti2-test.toml"
+    path.write_text(
+        '[microscope]\nname = "ti2-test"\n\n[micromanager]\nconfig = "ti2.cfg"\n'
+        'adapter_search_paths = ["own"]\n',
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.fixture
+def probes(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Replace the loader probe by a canned WinError 126; the list holds what was probed."""
+    probed: list[Path] = []
+
+    def canned(path: Path, **kwargs: object) -> DllProbe:
+        probed.append(path)
+        return DllProbe(path, False, 126, describe_winerror(126, "Module not found."))
+
+    monkeypatch.setattr(dll_probe, "probe_dll", canned)
+    return probed
+
+
+def _fails_to_load(monkeypatch: pytest.MonkeyPatch, module: object) -> None:
+    """Make ``module.open_core`` fail as MMCore does for an adapter that will not load."""
+
+    def fail(config: object = None, **kwargs: object) -> object:
+        raise CoreError(LOAD_ERROR.format(path=config, adapter=TI2_ADAPTER))
+
+    monkeypatch.setattr(module, "open_core", fail)
+
+
+def _positions(output: str, *markers: str) -> list[int]:
+    """The line number of the first line holding each marker; each must be there."""
+    lines = output.splitlines()
+    found = []
+    for marker in markers:
+        hits = [i for i, line in enumerate(lines) if marker in line]
+        assert hits, f"{marker!r} is not in the output:\n{output}"
+        found.append(hits[0])
+    return found
+
+
+@pytest.mark.usefixtures("mm_install")
+def test_doctor_prints_the_nikon_readiness_before_opening(
+    ti2_profile: Path, probes: list[Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fails_to_load(monkeypatch, microscope_mod)
+
+    result = runner.invoke(app, ["doctor", "-p", str(ti2_profile)])
+
+    own = ti2_profile.parent / "own"
+    heading, adapter, driver, failure = _positions(
+        result.output, "Nikon Ti2-E (NikonTi2)", "  adapter  ", "  driver ", "✗"
+    )
+    assert heading < adapter < driver < failure
+    # The profile's own folder comes first and wins, as MMCore searches it (FM-76).
+    assert str(own / TI2_ADAPTER) in result.output.splitlines()[adapter]
+    assert f"{TI2_DRIVER} not found" in result.output.splitlines()[driver]
+
+
+@pytest.mark.usefixtures("mm_install")
+def test_doctor_diagnoses_a_nikon_stand_that_would_not_open(
+    ti2_profile: Path, probes: list[Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fails_to_load(monkeypatch, microscope_mod)
+
+    result = runner.invoke(app, ["doctor", "-p", str(ti2_profile)])
+
+    assert result.exit_code == 1, result.output
+    (
+        failure,
+        heading,
+        found,
+        probe,
+        likelihood,
+        first,
+    ) = _positions(
+        result.output,
+        "✗ could not load",
+        "Nikon Ti2-E: what to check",
+        "  found: ",
+        "  probe: ",
+        "in order of likelihood:",
+        "1. another program holds the stand",
+    )
+    assert failure < heading < found < probe < likelihood < first
+    assert first == likelihood + 1
+    # MMCore's own message is kept whole, then the findings follow it.
+    assert 'Failed to load device adapter "NikonTi2"' in result.output
+    # What Windows said, and what it means.
+    assert "will not load: WinError 126: Module not found." in result.output
+    # The adapter is probed from its first folder, with the driver not found: one probe.
+    assert probes == [ti2_profile.parent / "own" / TI2_ADAPTER]
+
+
+def test_doctor_probes_with_the_adapter_folders_on_the_path(
+    ti2_profile: Path, monkeypatch: pytest.MonkeyPatch, mm_install: Path
+) -> None:
+    _fails_to_load(monkeypatch, microscope_mod)
+    seen: list[list[Path]] = []
+
+    def record(
+        path: Path, *, extra_path: Sequence[Path] = (), **kwargs: object
+    ) -> DllProbe:
+        seen.append(list(extra_path))
+        return DllProbe(path, True, None, "loads")
+
+    monkeypatch.setattr(dll_probe, "probe_dll", record)
+
+    runner.invoke(app, ["doctor", "-p", str(ti2_profile)])
+
+    # The profile's folder, then the install: the order MMCore searches them in.
+    assert seen == [[ti2_profile.parent / "own", mm_install]]
+
+
+@pytest.mark.usefixtures("mm_install")
+def test_doctor_reports_another_error_without_a_diagnosis(
+    ti2_profile: Path, probes: list[Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(config: object = None, **kwargs: object) -> object:
+        raise ValueError("boom")
+
+    monkeypatch.setattr(microscope_mod, "open_core", boom)
+
+    result = runner.invoke(app, ["doctor", "-p", str(ti2_profile)])
+
+    assert result.exit_code == 1, result.output
+    assert "✗ unexpected ValueError: boom" in result.output
+    assert "Nikon Ti2-E (NikonTi2)" in result.output
+    assert "what to check" not in result.output
+    assert probes == []
+
+
+@pytest.mark.usefixtures("mm_install")
+def test_doctor_leaves_the_stand_alone_while_it_diagnoses(
+    ti2_profile: Path, probes: list[Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The probes run after the open has failed and everything is unloaded, never
+    # while a core may still hold the stand.
+    events: list[str] = []
+
+    def fail(config: object = None, **kwargs: object) -> object:
+        events.append("open")
+        raise CoreError(LOAD_ERROR.format(path=config, adapter=TI2_ADAPTER))
+
+    def canned(path: Path, **kwargs: object) -> DllProbe:
+        events.append("probe")
+        return DllProbe(path, True, None, "loads")
+
+    monkeypatch.setattr(microscope_mod, "open_core", fail)
+    monkeypatch.setattr(dll_probe, "probe_dll", canned)
+
+    runner.invoke(app, ["doctor", "-p", str(ti2_profile)])
+
+    assert events == ["open", "probe"]
+
+
+@pytest.mark.usefixtures("mm_install")
+def test_doctor_a_diagnosis_that_fails_does_not_hide_the_open_error(
+    ti2_profile: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fails_to_load(monkeypatch, microscope_mod)
+
+    def broken(path: Path, **kwargs: object) -> DllProbe:
+        raise RuntimeError("probe bug")
+
+    monkeypatch.setattr(dll_probe, "probe_dll", broken)
+
+    result = runner.invoke(app, ["doctor", "-p", str(ti2_profile)])
+
+    assert result.exit_code == 1, result.output
+    assert "✗ could not load" in result.output
+    assert "could not diagnose the stand: probe bug" in result.output
+
+
+def test_doctor_config_diagnoses_a_nikon_cfg_that_would_not_open(
+    tmp_path: Path,
+    mm_install: Path,
+    probes: list[Path],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cfg = tmp_path / "stand.cfg"
+    cfg.write_text("Device,Ti2-E__0,NikonTi2,Ti2-E__0\n", encoding="utf-8")
+    _fails_to_load(monkeypatch, core_mod)
+
+    result = runner.invoke(app, ["doctor", "--config", str(cfg)])
+
+    assert result.exit_code == 1, result.output
+    heading, adapter, failure, diagnosis = _positions(
+        result.output, "Nikon Ti2-E (NikonTi2)", "  adapter  ", "✗", "what to check"
+    )
+    assert heading < adapter < failure < diagnosis
+    # With --config the install alone is searched.
+    assert str(mm_install / TI2_ADAPTER) in result.output.splitlines()[adapter]
+    assert "in order of likelihood:" in result.output
+    assert probes == [mm_install / TI2_ADAPTER]
+
+
+@pytest.mark.usefixtures("mm_install")
+def test_doctor_config_without_a_nikon_device_prints_no_nikon_block(
+    tmp_path: Path, probes: list[Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = tmp_path / "other.cfg"
+    cfg.write_text("Device,Camera,DemoCamera,DCam\n", encoding="utf-8")
+
+    def fail(config: object = None, **kwargs: object) -> object:
+        raise CoreError('Failed to load device adapter "DemoCamera"')
+
+    monkeypatch.setattr(core_mod, "open_core", fail)
+
+    result = runner.invoke(app, ["doctor", "--config", str(cfg)])
+
+    assert result.exit_code == 1, result.output
+    assert 'Failed to load device adapter "DemoCamera"' in result.output
+    assert "Nikon" not in result.output
+    assert "what to check" not in result.output
+    assert probes == []
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_doctor_without_a_nikon_stand_prints_no_nikon_block() -> None:
+    result = runner.invoke(app, ["doctor", "-p", "demo"])
+
+    assert result.exit_code == 0, result.output
+    assert "Nikon" not in result.output
+    assert "what to check" not in result.output
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo", "isolated_sdk")
+def test_nikon_readiness_rows_never_change_the_exit_code(
+    ti2_profile: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A stand that opens is a stand that opens, whatever the file checks said:
+    # the open is replaced by the demo's, so no Nikon adapter is loaded (FM-40).
+    real_open_core = core_mod.open_core
+    monkeypatch.setattr(
+        microscope_mod, "open_core", lambda config=None, **kw: real_open_core(None)
+    )
+    status = core_mod.status()
+    monkeypatch.setattr(
+        core_mod,
+        "status",
+        lambda: core_mod.MicroManagerStatus(
+            install_dir=tmp_path / "no-adapter-here",
+            api_version=status.api_version,
+            core_version=status.core_version,
+            adapters=status.adapters,
+        ),
+    )
+    (tmp_path / "own" / TI2_ADAPTER).unlink()
+
+    result = runner.invoke(app, ["doctor", "-p", str(ti2_profile)])
+
+    assert result.exit_code == 0, result.output
+    assert "adapter  not found in" in result.output
+    assert "loads and answers" in result.output

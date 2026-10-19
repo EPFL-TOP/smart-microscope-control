@@ -28,9 +28,15 @@ from rich.text import Text
 
 from smc import __version__
 from smc.hardware import core as core_mod
+from smc.hardware.backends import nikon
 from smc.hardware.backends.mm import as_hardware_errors
 from smc.hardware.capabilities import XY, Autofocus, Camera, Shutter, XYStage, ZStage
-from smc.hardware.errors import HardwareError, ProfileError, SafetyRefusedError
+from smc.hardware.errors import (
+    CoreError,
+    HardwareError,
+    ProfileError,
+    SafetyRefusedError,
+)
 from smc.hardware.microscope import Microscope, MicroscopeState
 from smc.hardware.profile import DEMO_NAME, Profile, list_profiles, search_paths
 from smc.hardware.roles import Role
@@ -176,7 +182,12 @@ _EXIT_INTERRUPTED = 130
 
 
 @contextlib.contextmanager
-def _reported(ctx: typer.Context, *, force_hint: str = "") -> Iterator[None]:
+def _reported(
+    ctx: typer.Context,
+    *,
+    force_hint: str = "",
+    after_report: Callable[[BaseException], None] | None = None,
+) -> Iterator[None]:
     """Turn what a command body raises into one ``✗`` line and an exit code.
 
     Wrapped around the ``with Microscope.open(...)`` block, so the stand is
@@ -189,6 +200,10 @@ def _reported(ctx: typer.Context, *, force_hint: str = "") -> Iterator[None]:
             so Typer prints the traceback.
         force_hint: What the operator types to force a forceable refusal; it
             replaces the API's ``how_to_force`` (``force=True``).
+        after_report: Called with the error once its ``✗`` line is printed,
+            for a command that has more to say after it (``doctor``'s
+            diagnosis of a stand that would not open). Not called under
+            ``--debug``, which prints the traceback instead of the line.
     """
     try:
         yield
@@ -198,7 +213,10 @@ def _reported(ctx: typer.Context, *, force_hint: str = "") -> Iterator[None]:
         settings = ctx.find_object(_Settings)
         if settings is not None and settings.debug:
             raise
-        raise typer.Exit(code=_report(exc, force_hint)) from None
+        code = _report(exc, force_hint)
+        if after_report is not None:
+            after_report(exc)
+        raise typer.Exit(code=code) from None
 
 
 def _report(exc: BaseException, force_hint: str) -> int:
@@ -400,6 +418,56 @@ def _status_line(microscope: Microscope, state: MicroscopeState) -> str:
     return " | ".join(parts) or "no stage, camera or shutter"
 
 
+def _install_dirs(status: core_mod.MicroManagerStatus) -> list[Path]:
+    """The install's adapter folder, for the end of the list MMCore searches."""
+    return [status.install_dir] if status.install_dir is not None else []
+
+
+def _nikon_checks(
+    config: Path | None, adapter_dirs: Sequence[Path]
+) -> list[nikon.StandCheck]:
+    """The file checks of each Nikon stand that ``config`` loads (design m2 §7.4)."""
+    if config is None:
+        return []
+    return [
+        nikon.check_stand(stand, adapter_dirs)
+        for stand in nikon.stands_in_config(config)
+    ]
+
+
+def _print_nikon_readiness(checks: Sequence[nikon.StandCheck]) -> None:
+    """The adapter and driver rows of each Nikon stand, before it is opened.
+
+    They are information: a stand that opens is a stand that opens, whatever
+    the file checks said, so they never change the exit code.
+    """
+    for check in checks:
+        _say(f"{check.stand.name} ({check.stand.adapter})")
+        for line in _aligned([[name, text] for name, text in nikon.readiness(check)]):
+            _say(f"  {line}")
+
+
+def _diagnose_nikon(checks: Sequence[nikon.StandCheck], error: BaseException) -> None:
+    """What to check when a Nikon stand's configuration would not open.
+
+    Only for a ``CoreError``, which is what a failed open raises: any other
+    error is reported as it always was. It runs once the open has failed and
+    MMCore has unloaded what it had loaded, so no probe competes with a core
+    for the stand. The diagnosis is help: if it fails itself, that is one more
+    line, never the loss of the error it follows.
+    """
+    if not isinstance(error, CoreError):
+        return
+    try:
+        for check in checks:
+            probes = nikon.deep_check(check, extra_path=check.searched)
+            _say(f"{check.stand.name}: what to check")
+            for line in nikon.diagnosis(check, probes):
+                _say(f"  {line}")
+    except Exception as exc:
+        _fail(f"could not diagnose the stand: {exc}")
+
+
 @app.command()
 def doctor(
     ctx: typer.Context,
@@ -420,6 +488,11 @@ def doctor(
     stand's state. Exits 1 when Micro-Manager is missing, the stand does not
     open or a device does not answer a read, so it can gate a session script.
     A role warning is printed and still exits 0.
+
+    A configuration that loads a Nikon stand (from the profile, or --config)
+    gets its adapter and driver checks printed before it is opened; they never
+    change the exit code. When it does not open, what to check follows, with
+    Windows' own reason when a DLL will not load.
     """
     st = core_mod.status()
     table = Table(title="Micro-Manager", show_header=False, box=None)
@@ -440,16 +513,26 @@ def doctor(
         raise typer.Exit(code=1)
 
     if config is None:
-        with _reported(ctx), Microscope.open(profile) as microscope:
-            loaded = microscope.profile
-            name = loaded.microscope.name
-            _say(f"Profile {name} ({loaded.source or 'built in'})")
-            _print_roles(microscope)
-            # One read decides the exit code and is the line printed: a
-            # flaky device read twice could show "XY ?" beside the ✓.
-            state = microscope.state()
-            _say(_status_line(microscope, state))
-            errors = state.errors
+        profile_checks: list[nikon.StandCheck] = []
+        with _reported(
+            ctx, after_report=lambda error: _diagnose_nikon(profile_checks, error)
+        ):
+            loaded = Profile.load(profile)
+            # The profile's folders first, then the install: MMCore's order (FM-76).
+            profile_checks += _nikon_checks(
+                loaded.config_path(),
+                [*loaded.adapter_search_dirs(), *_install_dirs(st)],
+            )
+            _print_nikon_readiness(profile_checks)
+            with Microscope.open(loaded) as microscope:
+                name = loaded.microscope.name
+                _say(f"Profile {name} ({loaded.source or 'built in'})")
+                _print_roles(microscope)
+                # One read decides the exit code and is the line printed: a
+                # flaky device read twice could show "XY ?" beside the ✓.
+                state = microscope.state()
+                _say(_status_line(microscope, state))
+                errors = state.errors
         if errors:
             for error in errors:
                 _fail(error)
@@ -458,11 +541,19 @@ def doctor(
         return
 
     target = str(config)
+    # With no profile, the install alone is searched for the adapter.
+    config_checks = _nikon_checks(config, _install_dirs(st))
+    _print_nikon_readiness(config_checks)
     # No profile, so no role: the raw core is read through the same proxy
     # under the name "core" (#120). _reported wraps the whole block, so the
     # core is released before the one line is printed, and a bug that is not
     # a device fault is reported like on every other command.
-    with _reported(ctx), core_mod.opened(config) as core:
+    with (
+        _reported(
+            ctx, after_report=lambda error: _diagnose_nikon(config_checks, error)
+        ),
+        core_mod.opened(config) as core,
+    ):
         reads = as_hardware_errors(core, "core")
         roles = {
             "camera": reads.getCameraDevice(),
