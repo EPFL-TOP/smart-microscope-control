@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from smc.discovery import dll_probe
+from smc.discovery.dll_probe import DllProbe, describe_winerror
 from smc.hardware.backends import nikon
 from smc.hardware.roles import DeviceInfo, Role, RoleMap, resolve
 
@@ -688,3 +690,252 @@ def test_install_driver_does_not_replace_a_dll_that_appeared_during_the_copy(
     assert (mm / TI2_DLL).read_bytes() == b"theirs"
     assert "differs" in message
     assert sorted(p.name for p in mm.iterdir()) == [TI2_DLL]
+
+
+# -- what to check when a stand will not open (m2 §7.4 items 2 and 3) -------------------
+
+NOT_FOUND = "The specified module could not be found."
+
+
+def ti2_check(
+    tmp_path: Path, *, adapter: bool = True, driver: str = "beside"
+) -> nikon.StandCheck:
+    """A Ti2 check on ``tmp_path``: the driver beside the adapter, in the SDK folder, or nowhere."""
+    mm, sdk = tmp_path / "mm", tmp_path / "sdk"
+    mm.mkdir(parents=True, exist_ok=True)
+    if adapter:
+        touch(mm / nikon.TI2.adapter_file)
+    if driver == "beside":
+        touch(mm / TI2_DLL)
+    elif driver == "sdk":
+        touch(sdk / TI2_DLL)
+    return nikon.check_stand(nikon.TI2, [mm], sdk_dir=sdk)
+
+
+class RecordingProbe:
+    """A ``dll_probe.probe_dll`` that loads nothing and records what it was asked."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[Path, list[Path]]] = []
+
+    def __call__(
+        self,
+        path: Path,
+        *,
+        extra_path: object = (),
+        timeout_s: float = dll_probe.DLL_PROBE_TIMEOUT_S,
+    ) -> DllProbe:
+        self.calls.append((path, list(extra_path)))  # type: ignore[call-overload]
+        return DllProbe(path, True, None, "loads")
+
+
+def test_deep_check_probes_the_adapter_then_the_driver_each_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    check = ti2_check(tmp_path)
+    recorder = RecordingProbe()
+    monkeypatch.setattr(dll_probe, "probe_dll", recorder)
+    folders = [tmp_path / "mm", tmp_path / "other"]
+
+    probes = nikon.deep_check(check, extra_path=folders)
+
+    assert [path for path, _ in recorder.calls] == [
+        tmp_path / "mm" / nikon.TI2.adapter_file,
+        tmp_path / "mm" / TI2_DLL,
+    ]
+    # Each probe is its own call, so its own child, with the adapter folders on PATH.
+    assert [extra for _, extra in recorder.calls] == [folders, folders]
+    assert [probe.path for probe in probes] == [path for path, _ in recorder.calls]
+
+
+def test_deep_check_probes_only_what_was_found(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    recorder = RecordingProbe()
+    monkeypatch.setattr(dll_probe, "probe_dll", recorder)
+
+    assert nikon.deep_check(ti2_check(tmp_path, adapter=False, driver="none")) == []
+    assert recorder.calls == []
+
+    only_adapter = ti2_check(tmp_path, driver="none")
+    nikon.deep_check(only_adapter)
+    assert [path.name for path, _ in recorder.calls] == [nikon.TI2.adapter_file]
+
+    recorder.calls.clear()
+    only_driver = ti2_check(tmp_path / "second", adapter=False, driver="sdk")
+    nikon.deep_check(only_driver)
+    assert [path.name for path, _ in recorder.calls] == [TI2_DLL]
+
+
+def test_deep_check_off_windows_still_returns_its_probes_as_not_probed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(dll_probe, "_WINDOWS", False)
+    check = ti2_check(tmp_path)
+
+    probes = nikon.deep_check(check)
+
+    assert [probe.loads for probe in probes] == [None, None]
+    assert all(probe.detail.startswith("not Windows") for probe in probes)
+    lines = [ln for ln in nikon.diagnosis(check, probes) if ln.startswith("probe:")]
+    assert len(lines) == 2
+    assert all(" not probed: not Windows" in ln for ln in lines)
+    assert all("will not load" not in ln for ln in lines)
+
+
+def test_diagnosis_prints_findings_then_probes_then_likely_causes(
+    tmp_path: Path,
+) -> None:
+    check = ti2_check(tmp_path, driver="sdk")
+    adapter = tmp_path / "mm" / nikon.TI2.adapter_file
+    probes = [
+        DllProbe(adapter, True, None, "loads"),
+        DllProbe(
+            tmp_path / "sdk" / TI2_DLL, False, 126, describe_winerror(126, NOT_FOUND)
+        ),
+    ]
+
+    lines = nikon.diagnosis(check, probes)
+
+    kinds = [ln.split(":", 1)[0] for ln in lines]
+    first_probe = kinds.index("probe")
+    heading = lines.index("in order of likelihood:")
+    assert kinds[0] == "found"
+    assert all(kind == "found" for kind in kinds[:first_probe])
+    assert all(kind == "probe" for kind in kinds[first_probe:heading])
+    assert heading == first_probe + 2
+    assert lines[heading + 1] == f"  1. {nikon.ONE_CONNECTION}"
+    # A misplaced Ti2 driver is a certain finding: where it is, and how to fix it.
+    found = [ln for ln in lines if ln.startswith("found:")]
+    assert any(TI2_DLL in ln and "smc install-driver ti2" in ln for ln in found)
+    assert any(str(tmp_path / "sdk") in ln for ln in found)
+
+
+def test_diagnosis_says_nothing_found_when_nothing_is_certain(tmp_path: Path) -> None:
+    check = ti2_check(tmp_path)  # adapter and driver both where they belong
+
+    lines = nikon.diagnosis(check, [])
+
+    assert not any(ln.startswith("found:") for ln in lines)
+    assert lines[0] == "in order of likelihood:"
+
+
+def test_diagnosis_names_a_driver_that_is_nowhere(tmp_path: Path) -> None:
+    check = ti2_check(tmp_path, driver="none")
+
+    found = [ln for ln in nikon.diagnosis(check, []) if ln.startswith("found:")]
+
+    assert len(found) == 1
+    assert TI2_DLL in found[0]
+    assert nikon.TI2.driver.installer in found[0]
+
+
+def test_diagnosis_of_a_missing_adapter_names_every_folder_searched(
+    tmp_path: Path,
+) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    check = nikon.check_stand(nikon.TI2, [first, second], sdk_dir=tmp_path / "sdk")
+
+    found = [ln for ln in nikon.diagnosis(check, []) if ln.startswith("found:")]
+
+    assert any(
+        nikon.TI2.adapter_file in ln and str(first) in ln and str(second) in ln
+        for ln in found
+    )
+
+
+def test_diagnosis_of_a_tie_driver_outside_its_sdk_folder(tmp_path: Path) -> None:
+    mm, sdk = tmp_path / "mm", tmp_path / "sdk"
+    touch(mm / nikon.TIE.adapter_file)
+    check = nikon.check_stand(nikon.TIE, [mm], sdk_dir=sdk)
+
+    found = [ln for ln in nikon.diagnosis(check, []) if ln.startswith("found:")]
+
+    assert len(found) == 1
+    assert TIE_DLL in found[0]
+    assert nikon.TIE.driver.installer in found[0]
+    assert nikon.TIE.driver.sdk_dir in found[0]
+
+
+def causes_of(lines: list[str]) -> list[str]:
+    """The numbered causes, without their numbers."""
+    after = lines[lines.index("in order of likelihood:") + 1 :]
+    numbered = [ln.strip().split(". ", 1) for ln in after]
+    assert [int(n) for n, _ in numbered] == list(range(1, len(numbered) + 1))
+    return [text for _, text in numbered]
+
+
+def test_likely_causes_start_with_another_program_holding_the_stand(
+    tmp_path: Path,
+) -> None:
+    ti2 = causes_of(nikon.diagnosis(ti2_check(tmp_path), []))
+    tie = causes_of(
+        nikon.diagnosis(
+            nikon.check_stand(nikon.TIE, [tmp_path / "mm"], sdk_dir=tmp_path / "sdk"),
+            [],
+        )
+    )
+
+    assert ti2[0] == nikon.ONE_CONNECTION
+    assert "another program" in ti2[0]
+    assert ti2[1:] == list(nikon.TI2.causes)
+    assert "power" in ti2[1]
+    assert "driver" in ti2[2]
+    assert "Ti2 Control" in ti2[3]
+
+    assert tie[0] == nikon.ONE_CONNECTION
+    assert tie[1:] == list(nikon.TIE.causes)
+    assert "USB" in tie[1]
+    assert "NikonTi.dll" in tie[2]
+    assert "TIDiaLamp" in tie[3]
+
+
+def test_a_winerror_126_probe_reads_as_a_missing_dependency(tmp_path: Path) -> None:
+    check = ti2_check(tmp_path)
+    adapter = check.adapter_path
+    assert adapter is not None
+    probe = DllProbe(adapter, False, 126, describe_winerror(126, NOT_FOUND))
+
+    [line] = [ln for ln in nikon.diagnosis(check, [probe]) if ln.startswith("probe:")]
+
+    assert line == f"probe: {adapter.name} will not load: {probe.detail}"
+    assert "WinError 126" in line
+    assert "a DLL it depends on could not be found" in line
+
+
+def test_a_probe_without_a_verdict_is_not_called_a_failure(tmp_path: Path) -> None:
+    check = ti2_check(tmp_path)
+    adapter = check.adapter_path
+    assert adapter is not None
+    probe = DllProbe(
+        adapter, None, None, "did not return within 20 s: its initialisation hung"
+    )
+
+    lines = nikon.diagnosis(check, [probe])
+
+    assert f"probe: {adapter.name} not probed: {probe.detail}" in lines
+    assert not any("will not load" in ln for ln in lines)
+
+
+def test_a_probe_that_loads_says_so(tmp_path: Path) -> None:
+    check = ti2_check(tmp_path)
+    adapter = check.adapter_path
+    assert adapter is not None
+
+    lines = nikon.diagnosis(check, [DllProbe(adapter, True, None, "loads")])
+
+    assert f"probe: {adapter.name} loads" in lines
+
+
+def test_diagnosis_without_an_adapter_does_not_point_a_ti2_driver_beside_nothing(
+    tmp_path: Path,
+) -> None:
+    check = ti2_check(tmp_path, adapter=False, driver="sdk")
+
+    found = [ln for ln in nikon.diagnosis(check, []) if ln.startswith("found:")]
+
+    # Only the adapter is certain; "copy it beside the adapter" has no folder to name.
+    assert len(found) == 1
+    assert nikon.TI2.adapter_file in found[0]
+    assert "install-driver" not in found[0]

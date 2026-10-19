@@ -36,6 +36,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from smc.discovery import dll_probe
+from smc.discovery.dll_probe import DllProbe
+
 __all__ = [
     "MAX_SEARCH_DEPTH",
     "ONE_CONNECTION",
@@ -47,6 +50,8 @@ __all__ = [
     "Stand",
     "StandCheck",
     "check_stand",
+    "deep_check",
+    "diagnosis",
     "find_driver",
     "install_driver",
     "readiness",
@@ -381,6 +386,94 @@ def readiness(check: StandCheck) -> list[tuple[str, str]]:
             "where the adapter finds it on the system path"
         )
     return [("adapter", adapter), ("driver", text)]
+
+
+def deep_check(check: StandCheck, *, extra_path: Sequence[Path] = ()) -> list[DllProbe]:
+    """Ask Windows to load the adapter, then the driver, each in a child of its own.
+
+    Called after a stand failed to open, when MMCore has unloaded everything it
+    had loaded (design m2 §7.1), so nothing here competes with a core for the
+    stand or holds a vendor DLL in this process. What was not found is not
+    probed: the ``found:`` lines of :func:`diagnosis` say why. Off Windows each
+    probe says it was not tried; it is never a failure.
+
+    Args:
+        check: What :func:`check_stand` found.
+        extra_path: The adapter folders, for the front of each child's ``PATH``,
+            as ``open_core`` puts them there.
+    """
+    targets = (check.adapter_path, check.driver.path)
+    return [
+        dll_probe.probe_dll(target, extra_path=extra_path)
+        for target in targets
+        if target is not None
+    ]
+
+
+def _findings(check: StandCheck) -> list[str]:
+    """What the file system proves, one ``found:`` line each."""
+    stand, driver, found = check.stand, check.stand.driver, check.driver
+    lines: list[str] = []
+    if check.adapter_path is None:
+        where = (
+            "none of the adapter folders searched (first wins): "
+            + "; ".join(str(folder) for folder in check.searched)
+            if check.searched
+            else "no folder: there is no adapter folder to search"
+        )
+        lines.append(f"found: {stand.adapter_file} is in {where}")
+    if found.path is None:
+        where = "" if driver.beside_adapter else f" in {driver.sdk_dir}"
+        lines.append(
+            f"found: {driver.dll} was not found{where}; install {driver.installer}"
+        )
+    elif not found.satisfied and driver.beside_adapter:
+        if check.adapter_path is not None:
+            lines.append(
+                f"found: {driver.dll} is in {found.path.parent}, not beside the "
+                f"adapter ({check.adapter_path.parent}), and the adapter loads it "
+                f"from its own folder only; copy it with: smc install-driver "
+                f"{stand.key}"
+            )
+    elif not found.satisfied:
+        lines.append(
+            f"found: {driver.dll} is in {found.path.parent}, not in "
+            f"{driver.sdk_dir}, where the adapter finds it on the system path; "
+            f"install {driver.installer}"
+        )
+    return lines
+
+
+def _probe_line(probe: DllProbe) -> str:
+    """One probe as a line; no verdict is "not probed", never a failure."""
+    name = probe.path.name
+    if probe.loads is True:
+        return f"probe: {name} loads"
+    if probe.loads is False:
+        return f"probe: {name} will not load: {probe.detail}"
+    return f"probe: {name} not probed: {probe.detail}"
+
+
+def diagnosis(check: StandCheck, probes: Sequence[DllProbe]) -> list[str]:
+    """Why a stand did not open: what is certain, what Windows said, what is likely.
+
+    MMCore's message for a stand that does not open names no cause, so the lines
+    come in the order of how much each one proves: ``found:`` for what the file
+    system shows, ``probe:`` for what Windows' own loader said, then the likely
+    causes in the order people hit them, the first being another program that
+    already holds the stand. The text does not parse MMCore's multi-line message;
+    it only follows it.
+
+    Args:
+        check: What :func:`check_stand` found.
+        probes: What :func:`deep_check` returned, in its order.
+    """
+    lines = _findings(check)
+    lines.extend(_probe_line(probe) for probe in probes)
+    lines.append("in order of likelihood:")
+    causes = (ONE_CONNECTION, *check.stand.causes)
+    lines.extend(f"  {number}. {cause}" for number, cause in enumerate(causes, start=1))
+    return lines
 
 
 def _sha256(path: Path) -> str:
