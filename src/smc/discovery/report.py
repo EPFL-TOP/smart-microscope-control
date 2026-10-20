@@ -18,7 +18,7 @@ from rich.console import Console, RenderableType
 from rich.table import Table
 from rich.text import Text
 
-from smc.discovery.models import DeviceEntry, Inventory
+from smc.discovery.models import DeviceEntry, Inventory, ProbedDevice, ProbeResult
 
 __all__ = [
     "JSON_NAME",
@@ -47,7 +47,8 @@ def _ids(vendor_id: str | None, product_id: str | None) -> str:
 
 
 def _table(title: str, columns: Iterable[str]) -> Table:
-    table = Table(title=title, title_justify="left", box=box.SIMPLE_HEAD)
+    # A Text title: an adapter name like "[x]" must not be read as markup (FM-36).
+    table = Table(title=_t(title), title_justify="left", box=box.SIMPLE_HEAD)
     for column in columns:
         table.add_column(column, overflow="fold")
     return table
@@ -69,6 +70,53 @@ def _devices(title: str, entries: list[DeviceEntry]) -> Table:
             _t(", ".join(e.hints)),
         )
     return table
+
+
+#: What the ``result`` column says: three words, so that a device nobody
+#: initialised is never one of the two that read as an answer.
+_RESULT_WORDS = {"ok": "ok", "failed": "FAILED", "not-probed": "not probed"}
+
+_INCOMPLETE = "INCOMPLETE: the adapter child stopped before the last device"
+
+
+def _detail(device: ProbedDevice) -> str:
+    """What a row says beyond its result.
+
+    The error and what it usually means, the reason nothing was tried, or the
+    port that was given.
+    """
+    if device.status == "failed":
+        error = device.error or ""
+        if device.hint:
+            return f"{error} — {device.hint}" if error else device.hint
+        return error
+    if device.status == "not-probed":
+        return device.reason or ""
+    return f"port {device.port}" if device.port else ""
+
+
+def _probe(probe: ProbeResult) -> list[RenderableType]:
+    """The probe table, then its error, notes and numbered causes (design m2 §9.6)."""
+    title = f"Probe of {probe.adapter}"
+    if not probe.complete:
+        title += f" — {_INCOMPLETE}"
+    table = _table(title, ("device", "type", "from", "result", "detail"))
+    if probe.error is not None:
+        table.add_row(_t("—"), _t(""), _t(""), _t("ERROR"), _t(probe.error))
+    for pd in probe.devices:
+        table.add_row(
+            _t(pd.name),
+            _t(pd.type),
+            _t(pd.source),
+            _t(_RESULT_WORDS[pd.status]),
+            _t(_detail(pd)),
+        )
+    out: list[RenderableType] = [table]
+    out.extend(_t(f"- {note}") for note in probe.notes)
+    if probe.causes:
+        out.append(_t("In order of likelihood:"))
+        out.extend(_t(f"{n}. {cause}") for n, cause in enumerate(probe.causes, 1))
+    return out
 
 
 def renderables(inv: Inventory) -> list[RenderableType]:
@@ -114,6 +162,9 @@ def renderables(inv: Inventory) -> list[RenderableType]:
             adapters.add_row(_t(a.name), _t("— no devices listed —"), _t(""), _t(""))
         for d in a.devices:
             adapters.add_row(_t(a.name), _t(d.name), _t(d.type), _t(d.description))
+        if a.list_meaning is not None:
+            # What the list says about the stand, where the list is read.
+            adapters.add_row(_t(""), _t(""), _t(""), _t(f"meaning: {a.list_meaning}"))
     out.append(adapters)
 
     serial = _table(
@@ -143,16 +194,7 @@ def renderables(inv: Inventory) -> list[RenderableType]:
     out.append(hints)
 
     if inv.probe is not None:
-        probe = _table(
-            f"Probe of {inv.probe.adapter}", ("device", "type", "result", "error")
-        )
-        if inv.probe.error is not None:
-            probe.add_row(_t("—"), _t(""), _t("ERROR"), _t(inv.probe.error))
-        for pd in inv.probe.devices:
-            probe.add_row(
-                _t(pd.name), _t(pd.type), _t("ok" if pd.ok else "FAILED"), _t(pd.error)
-            )
-        out.append(probe)
+        out.extend(_probe(inv.probe))
 
     out.append(_t(f"Notes ({len(inv.notes)})"))
     out.extend(_t(f"  - {n}") for n in inv.notes)

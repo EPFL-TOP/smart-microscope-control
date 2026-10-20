@@ -152,6 +152,42 @@ Then add to the same folder:
   powershell -NoProfile -ExecutionPolicy Bypass -File <tracking-tool>\tools\audit_windows_hardware.ps1 > %SURVEY%\audit.txt
   ```
 
+### Reading a probe
+
+Not part of a first visit (§4). When the owner asks for it, on a stand that
+is powered with its vendor software closed,
+`smc discover --probe-adapter NikonTi2 --out %SURVEY%` loads and initialises
+the devices of that one adapter. The `Probe of …` table has one row per
+device, and its `result` column has three words:
+
+| result | what it means |
+| --- | --- |
+| `ok` | The device was loaded and initialised. `from` says who named it: `adapter` (the adapter's own list), `hub` (the initialised hub reports it, the adapter does not list it) or `both`. |
+| `FAILED` | MMCore refused. `detail` is its own text, then a dash and what that text usually means when it is known. |
+| `not probed` | Nothing was tried, and `detail` says why: the device needs a port (below), its hub did not initialise or does not report it, or another hub of the adapter was already connected. It is neither a pass nor a fault: a stand that was not tested says so. |
+
+- **One hub per probe.** The Ti2-E lists the stand and then `Ti2-Simulator`;
+  once the stand's hub is up the simulator is not tried, so its expected
+  `-10` is not shown as a fault of the stand.
+- **`--port COM3`** (needs `--probe-adapter`) gives that serial port to every
+  probed device whose `Port` is empty or `Undefined` before it initialises,
+  and the row says `port COM3`. A device that already has a port keeps it. A
+  device that needs a port and was not given one is `not probed`, with the
+  words `needs a port`. If no device needed it, a note says the port was not
+  used.
+- **A hub that will not initialise** is followed by `In order of likelihood:`
+  and numbered causes, the first being another program holding the stand.
+  Close NIS-Elements, Ti2 Control and any other smc or Micro-Manager session
+  and run it again before reading the others.
+- **`Native module failed to load`** means the vendor runtime the adapter
+  wraps is not installed or not the right version; for `HamamatsuHam` that is
+  DCAM-API. Where the camera is not fitted, that failure is expected.
+- **`INCOMPLETE`** in the title means the adapter child stopped (a crash or
+  the `--timeout-s` limit) before the last device: the rows are the ones it had
+  finished, and the note under *Notes* names the device that was running.
+- Under *Adapter devices*, a `meaning:` row says what an empty list, or a list
+  the adapter fixes whatever is connected, tells about the stand.
+
 ## 3. Bring it back
 
 Copy the folder to the Mac — network share, USB stick, e-mail to yourself —

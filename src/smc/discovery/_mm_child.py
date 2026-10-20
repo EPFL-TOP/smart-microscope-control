@@ -1,14 +1,15 @@
 """Child process that loads device adapters for ``smc discover``.
 
-``python -m smc.discovery._mm_child --result FILE (--adapters A,B | --all) [--probe NAME]``
+``python -m smc.discovery._mm_child --result FILE (--adapters A,B | --all) [--probe NAME [--port=PORT]]``
 
 It exists so a vendor DLL that hangs or crashes on load takes down this
 process and not the survey (see :mod:`smc.discovery.mm_inventory` and
 ``docs/design/failure-modes.md`` FM-01 to FM-04):
 
 * the result goes to ``FILE``, never stdout, which a DLL may print into;
-* it is written atomically after the listing and again after the probe, so
-  a crash during the probe keeps the listing;
+* it is written atomically after the listing, after every probed device and
+  once more at the end, so a crash during the probe keeps the listing and
+  the devices already probed, the probe marked ``complete=False``;
 * ``listing <adapter>`` / ``probing <adapter>/<device>`` go to stderr before
   each step, so the parent can say what was running when the child died;
 * the process ends with ``os._exit(0)`` after the last write: unloading a
@@ -25,9 +26,17 @@ import argparse
 import json
 import os
 import sys
+import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from smc.discovery.mm_inventory import ChildResult, list_adapters, probe_adapter
+from smc.discovery.mm_inventory import ChildResult, list_adapters, walk_adapter
+from smc.discovery.models import ProbeResult
+from smc.hardware.core import close_core
+
+if TYPE_CHECKING:
+    from pymmcore_plus import CMMCorePlus
 
 # Windows SetErrorMode flags: no "missing DLL" dialog, no crash-reporter dialog.
 _SEM_FAILCRITICALERRORS = 0x0001
@@ -116,13 +125,78 @@ def _clean_tree(obj: object) -> object:
     return obj
 
 
+#: Windows refuses to replace a file that antivirus or a search indexer holds
+#: open for a moment (``PermissionError``), and the file was written a moment
+#: ago, often one device ago (FM-24): a few short waits, not a lost result.
+_REPLACE_TRIES = 5
+_REPLACE_WAIT_S = 0.05
+
+
 def _write(result: ChildResult, path: Path) -> None:
     partial = path.with_name(path.name + ".partial")
     partial.write_text(
         json.dumps(_clean_tree(result.model_dump(mode="json")), ensure_ascii=True),
         encoding="utf-8",
     )
-    os.replace(partial, path)
+    for attempt in range(1, _REPLACE_TRIES + 1):
+        try:
+            os.replace(partial, path)
+        except PermissionError:
+            if attempt == _REPLACE_TRIES:
+                raise
+            time.sleep(_REPLACE_WAIT_S)
+        else:
+            return
+
+
+def _checkpoint_writer(
+    result: ChildResult, path: Path
+) -> Callable[[ProbeResult], None]:
+    """The probe's checkpoint: put the snapshot in the result and write the file.
+
+    A failed write between two devices is a line on stderr and not the end of
+    the probe: Windows antivirus can hold a file that was just written (FM-24),
+    and the probe is minutes of hardware work. Only ``OSError`` is swallowed;
+    the final write, after the probe, is not guarded. The line does not start
+    with ``probing ``, which the parent reads as the device that was running.
+    """
+
+    def checkpoint(snapshot: ProbeResult) -> None:
+        result.probe = snapshot
+        try:
+            _write(result, path)
+        except OSError as exc:
+            _progress(
+                f"checkpoint skipped: the result file could not be written: {exc}"
+            )
+
+    return checkpoint
+
+
+def _probe(
+    core: CMMCorePlus, result: ChildResult, path: Path, adapter: str, port: str | None
+) -> None:
+    """Walk one adapter and write the whole result *before* the core is released.
+
+    The walk's last checkpoint holds the rows, not the ``error`` and the notes
+    that come after the last one, and not ``complete``. Unloading a vendor's
+    devices can hang or crash (FM-02): written after it, the whole result would
+    be lost to a death in the unload, and the report would say INCOMPLETE for a
+    probe that had finished. So this is :func:`probe_adapter` with the final
+    write between the walk and the release; the core is released in a
+    ``finally`` all the same.
+    """
+    try:
+        result.probe = walk_adapter(
+            core,
+            adapter,
+            port=port,
+            progress=_progress,
+            checkpoint=_checkpoint_writer(result, path),
+        )
+        _write(result, path)
+    finally:
+        close_core(core)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -133,6 +207,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--adapters", default="", help="comma-separated names")
     parser.add_argument("--all", action="store_true", help="every installed adapter")
     parser.add_argument("--probe", default=None, help="one adapter to initialise")
+    # The parent sends it as `--port=<port>`: a port starting with `-` is a
+    # value there, where `--port -x` would be read as an option.
+    parser.add_argument("--port", default=None, help="serial port for --probe")
     args = parser.parse_args(argv)
 
     from pymmcore_plus import CMMCorePlus
@@ -147,8 +224,7 @@ def main(argv: list[str] | None = None) -> int:
         result.listed += list_adapters(core, [name])
     _write(result, args.result)
     if args.probe:
-        result.probe = probe_adapter(args.probe, progress=_progress)
-        _write(result, args.result)
+        _probe(CMMCorePlus(), result, args.result, args.probe, args.port)
     return 0
 
 

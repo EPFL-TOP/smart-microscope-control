@@ -70,6 +70,7 @@ def inventory(
     *,
     all_adapters: bool = False,
     probe_adapter: str | None = None,
+    probe_port: str | None = None,
     include_os: bool = True,
     timeout_s: float = mm_inventory.CHILD_TIMEOUT_S,
 ) -> Inventory:
@@ -82,12 +83,23 @@ def inventory(
     Args:
         all_adapters: List the devices of every installed adapter instead of
             ``LAB_ADAPTERS`` plus the hinted ones. Slow: loads every DLL.
-        probe_adapter: Load and initialise every device of this one adapter.
+        probe_adapter: Load and initialise the devices of this one adapter.
             Contacts the hardware; the stand must be powered and its vendor
             software closed.
+        probe_port: The serial port to give, before they initialise, to the
+            probed devices that need one. Needs ``probe_adapter``.
         include_os: Collect serial, USB/PnP and PCI.
         timeout_s: How long the adapter child may run.
+
+    Raises:
+        ValueError: ``probe_port`` is given without ``probe_adapter``, or is
+            refused by :func:`smc.discovery.mm_inventory.check_port`. Raised
+            before anything is surveyed.
     """
+    if probe_port is not None:
+        if not probe_adapter:
+            raise ValueError("probe_port needs probe_adapter")
+        probe_port = mm_inventory.check_port(probe_port)
     system, installed = mm_inventory.system_section()
     inv = Inventory(system=system, adapters=AdaptersSection(installed=installed))
 
@@ -107,7 +119,11 @@ def inventory(
 
     names = sorted(set(LAB_ADAPTERS) | hinted)
     listed, probe, notes = mm_inventory.mm_section(
-        names, all_adapters=all_adapters, probe=probe_adapter, timeout_s=timeout_s
+        names,
+        all_adapters=all_adapters,
+        probe=probe_adapter,
+        port=probe_port,
+        timeout_s=timeout_s,
     )
     inv.adapters.listed = listed
     inv.probe = probe
