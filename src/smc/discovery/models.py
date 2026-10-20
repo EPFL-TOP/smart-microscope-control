@@ -18,6 +18,8 @@ __all__ = [
     "AdapterDevice",
     "AdapterInfo",
     "AdaptersSection",
+    "BuildScan",
+    "BuiltDevice",
     "DeviceEntry",
     "Hint",
     "Inventory",
@@ -189,6 +191,43 @@ class ProbeResult(BaseModel):
     causes: list[str] = Field(default_factory=list)
     #: False: the child stopped before the last device, so the rows are the
     #: ones it had finished.
+    complete: bool = True
+
+
+class BuiltDevice(BaseModel):
+    """A device that initialised in a build, with what the configuration needs of it.
+
+    The walk loads each device under its own name, so ``label`` is that name
+    (design m2 §10.1): nothing is renamed, and a name MMCore refuses as a label
+    is that device's failure, not a file with a different name.
+    """
+
+    label: str
+    #: The adapter the device was loaded from (the ``Device`` line's library).
+    library: str
+    name: str
+    #: ``Hub``, ``Camera``, ``State``, …; as the probe row says.
+    type: str
+    #: ``getParentLabel``; ``None`` when it reads ``""`` or could not be read.
+    parent: str | None = None
+    #: A State device's labels, position ``i`` at index ``i``.
+    state_labels: list[str] = Field(default_factory=list)
+
+
+class BuildScan(BaseModel):
+    """What ``smc config build`` knows about the devices that answered.
+
+    The build child writes it before it releases the core, and after every
+    device on the way, so a child that dies leaves the rows it had finished
+    marked ``complete=False`` (design m2 §10.3, FM-02, FM-106).
+    """
+
+    stand: ProbeResult
+    #: ``None``: no ``--camera-adapter``.
+    camera: ProbeResult | None = None
+    devices: list[BuiltDevice] = Field(default_factory=list)
+    #: One line each, from the child: a read that failed, for instance.
+    notes: list[str] = Field(default_factory=list)
     complete: bool = True
 
 

@@ -24,7 +24,8 @@ import sys
 import tempfile
 import time
 import unicodedata
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -36,6 +37,7 @@ from smc.discovery import diagnosis
 from smc.discovery.models import (
     AdapterDevice,
     AdapterInfo,
+    BuildScan,
     ProbedDevice,
     ProbeResult,
     ProbeSource,
@@ -48,9 +50,12 @@ if TYPE_CHECKING:
     from pymmcore_plus import CMMCorePlus
 
 __all__ = [
+    "BUILD_TIMEOUT_S",
     "CHILD_COMMAND",
     "CHILD_TIMEOUT_S",
+    "BuildRun",
     "ChildResult",
+    "build_section",
     "check_device_name",
     "check_port",
     "exit_detail",
@@ -181,6 +186,8 @@ class ChildResult(BaseModel):
 
     listed: list[AdapterInfo] = Field(default_factory=list)
     probe: ProbeResult | None = None
+    #: Set only by ``--build`` (design m2 §10.3).
+    build: BuildScan | None = None
 
 
 def other_installs(active: Path | None) -> list[str]:
@@ -774,7 +781,7 @@ def exit_detail(returncode: int, platform_name: str) -> str:
 
 
 #: The child's progress lines on stderr, so a note can name what was running.
-_PROGRESS_PREFIXES = ("listing ", "probing ")
+_PROGRESS_PREFIXES = ("listing ", "probing ", "reading ")
 
 
 def _last_progress(stderr_path: Path) -> str | None:
@@ -830,25 +837,65 @@ def mm_section(
         ValueError: ``port`` is refused by :func:`check_port`.
     """
     checked_port = check_port(port) if probe and port is not None else None
+    arguments = ["--adapters", ",".join(adapters)]
+    if all_adapters:
+        arguments.append("--all")
+    if probe:
+        arguments += ["--probe", probe]
+    if checked_port is not None:
+        arguments.append(f"--port={checked_port}")
+    result, notes, _ = _run_child(
+        arguments,
+        prefix="adapters: the adapter child",
+        timeout_s=timeout_s,
+        missing_suffix="; device lists missing, adapter names kept",
+    )
+    if result is None:
+        return [], None, notes
+    return result.listed, result.probe, notes
+
+
+def _run_child(
+    arguments: Sequence[str],
+    *,
+    prefix: str,
+    timeout_s: float,
+    missing_suffix: str = "",
+) -> tuple[ChildResult | None, list[str], str | None]:
+    """Run the adapter child with ``arguments`` under a deadline; read what it wrote.
+
+    The one runner of :func:`mm_section` and :func:`build_section` (design m2
+    §10.3), so that the lessons of FM-01 to FM-04, FM-35 and FM-83 are kept in
+    one place. The result travels through a file, never the child's stdout: a
+    vendor DLL may print while loading (FM-01). The child's stdout and stderr go
+    to files too, so a helper process that inherits them cannot keep a pipe open
+    and defeat the timeout (FM-04). The result file is read whatever the exit
+    code: a crash or hang at teardown, after the result was written, costs a
+    note and nothing else (FM-02). The child runs in the temporary folder, so
+    the operator's working directory is not on its ``sys.path``.
+    ``CHILD_COMMAND`` is read here, when the child starts, so a test can replace
+    it with a child that crashes or hangs.
+
+    Args:
+        arguments: The child's arguments, after ``--result FILE`` is added.
+        prefix: What every note starts with: ``adapters: the adapter child``.
+        timeout_s: How long the child may run.
+        missing_suffix: Added to the note of a child that failed and left no
+            result file; a child that left none and said nothing gets the note
+            ``<prefix> wrote no result``.
+
+    Returns:
+        The result, ``None`` when the child wrote nothing usable; the notes;
+        and the last progress line of a child that did not exit 0 or was
+        stopped, ``None`` for one that finished.
+    """
     with tempfile.TemporaryDirectory(
         prefix="smc-discover-", ignore_cleanup_errors=True
     ) as tmp:
         folder = Path(tmp)
         result_path = folder / "result.json"
         stderr_path = folder / "stderr.txt"
-        command = [
-            *CHILD_COMMAND,
-            "--adapters",
-            ",".join(adapters),
-            "--result",
-            str(result_path),
-        ]
-        if all_adapters:
-            command.append("--all")
-        if probe:
-            command += ["--probe", probe]
-        if checked_port is not None:
-            command.append(f"--port={checked_port}")
+        command = [*CHILD_COMMAND, *arguments, "--result", str(result_path)]
         logger.info("adapter child: %s", " ".join(command[1:]))
 
         notes: list[str] = []
@@ -869,11 +916,7 @@ def mm_section(
                     creationflags=_NO_WINDOW,
                 )
             except OSError as exc:
-                return (
-                    [],
-                    None,
-                    [f"adapters: the adapter child could not start: {exc}"],
-                )
+                return None, [f"{prefix} could not start: {exc}"], None
             unstoppable = False
             kill_detail: str | None = None
             try:
@@ -907,28 +950,110 @@ def mm_section(
             )
             detail = f"; {kill_detail}" if kill_detail else ""
             notes.append(
-                f"adapters: the adapter child did not finish in {timeout_s:.0f} s "
+                f"{prefix} did not finish in {timeout_s:.0f} s "
                 f"and {stopped}{during}{detail}"
             )
         elif returncode != 0:
             notes.append(
-                "adapters: the adapter child exited "
-                f"{exit_detail(returncode, sys.platform)}{during}"
+                f"{prefix} exited {exit_detail(returncode, sys.platform)}{during}"
             )
+        # A child that finished was not on any device when it ended.
+        last = doing if returncode != 0 else None
 
         if not result_path.exists():
             if notes:
-                notes[-1] += "; device lists missing, adapter names kept"
+                notes[-1] += missing_suffix
             else:
-                notes.append("adapters: the adapter child wrote no result")
-            return [], None, notes
+                notes.append(f"{prefix} wrote no result")
+            return None, notes, last
         try:
             result = ChildResult.model_validate_json(
                 result_path.read_text(encoding="utf-8")
             )
         except (OSError, ValueError, ValidationError) as exc:
-            notes.append(
-                f"adapters: the adapter child's result could not be read: {exc}"
-            )
-            return [], None, notes
-    return result.listed, result.probe, notes
+            notes.append(f"{prefix}'s result could not be read: {exc}")
+            return None, notes, last
+    return result, notes, last
+
+
+#: What the walk says while it asks a hub for its peripherals: the hub is the
+#: device it is on, and the one to leave out when the child dies there.
+_LISTING_PERIPHERALS = ": listing its peripherals"
+
+
+def _stopped_at(doing: str | None) -> str | None:
+    """The device a child was on, from its last progress line.
+
+    ``probing <adapter>/<device>`` and ``reading <adapter>/<device>`` name one;
+    ``listing <adapter>`` does not (a crash there is the adapter's, not a
+    device's). The adapter's name has no ``/``, so the first one splits it.
+    """
+    if doing is None:
+        return None
+    for prefix in ("probing ", "reading "):
+        if doing.startswith(prefix):
+            _, slash, device = doing[len(prefix) :].partition("/")
+            device = device.removesuffix(_LISTING_PERIPHERALS)
+            return device if slash and device else None
+    return None
+
+
+#: Two adapters, each a connection and a walk; a probe's 180 s is not verified
+#: on a hub either (design m2 §9.10, §10.8).
+BUILD_TIMEOUT_S = 300.0
+
+
+@dataclass(frozen=True, slots=True)
+class BuildRun:
+    """What :func:`build_section` brings back."""
+
+    #: ``None``: the child wrote nothing usable.
+    scan: BuildScan | None
+    notes: list[str]
+    #: The device the child was on when it died or was stopped, the one
+    #: ``--skip`` would leave out; ``None`` for a child that finished.
+    stopped_at: str | None
+
+
+def build_section(
+    stand: str,
+    *,
+    camera: str | None = None,
+    skip: Sequence[str] = (),
+    search_paths: Sequence[Path] = (),
+    timeout_s: float = BUILD_TIMEOUT_S,
+) -> BuildRun:
+    """Initialise the devices of a stand's adapter (and a camera's) in a child.
+
+    ``smc config build`` writes a file from what answers here. It runs in the
+    adapter child for the reasons of :func:`mm_section` (FM-01 to FM-04): a
+    device that crashes or hangs costs the build, never this process, and
+    ``stopped_at`` says which device it was, so the next run can leave it out.
+    Every value travels as one ``--opt=value`` argument, so that a name that
+    starts with ``-`` is a value and not an option (design m2 §9.1).
+
+    Args:
+        stand: The stand's adapter.
+        camera: The adapter of a camera, walked on the same core.
+        skip: Devices never to load; each is checked by
+            :func:`check_device_name`.
+        search_paths: Adapter folders to search first, as the profile's stand
+            will be opened with (``Profile.adapter_search_dirs()``).
+        timeout_s: How long the child may run.
+
+    Raises:
+        ValueError: ``stand`` is empty or a ``skip`` name is refused by
+            :func:`check_device_name`; no child is started.
+    """
+    if not stand.strip():
+        raise ValueError("the stand's adapter name is empty")
+    arguments = [f"--build={stand}"]
+    if camera:
+        arguments.append(f"--camera={camera}")
+    arguments += [f"--skip={check_device_name(name)}" for name in skip]
+    arguments += [f"--search-path={path}" for path in search_paths]
+    result, notes, doing = _run_child(
+        arguments, prefix="build: the build child", timeout_s=timeout_s
+    )
+    scan = result.build if result is not None else None
+    return BuildRun(scan=scan, notes=notes, stopped_at=_stopped_at(doing))
