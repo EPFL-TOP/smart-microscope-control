@@ -35,8 +35,9 @@ turret_requires_confirm = true
 # in_range_values = []      # the values of that property that mean "in range"; any other value means out of range
 
 [camera]
-# µm per pixel per objective label, at binning 1 (scaled by the current
-# binning); missing = unknown (0.0), never guessed.
+# µm per pixel per objective label, at binning 1 and a magnification factor of
+# 1.0 (scaled by the current binning, divided by the core's factor); missing =
+# unknown (0.0), never guessed.
 pixel_size_um = { "Nikon 10X S Fluor" = 0.65, "Nikon 40X Plan Fluor ELWD" = 0.1625 }
 
 # [light_source]

@@ -259,8 +259,10 @@ is not on `PATH`.
   loading**: only `Core` properties. The checks are in the
   hardware-session skill.
 - **No pixel-size configuration**, so smc reports the pixel size as 0,
-  unknown. **No `Core,TimeoutMs`** either: MMCore's 5 s default applies unless
-  the profile sets `device_timeout_ms`.
+  unknown, whatever the lever reads. A size the profile gives later is divided
+  by the core's magnification factor, which includes
+  `IntermediateMagnification` (#167). **No `Core,TimeoutMs`** either: MMCore's
+  5 s default applies unless the profile sets `device_timeout_ms`.
 - One config group, `Channel`, with one preset, `BF`: `CondenserTurret`
   `7-N2`, `FilterTurret1` `1-`, `Turret1Shutter` 0, `FilterTurret2`
   `1-ANALY`, `Turret2Shutter` 0, `LightPath` `4-L100`, `DiaLamp` state 0 and
@@ -451,8 +453,12 @@ M2's design (#13).
 - `[camera] pixel_size_um`: nothing measured yet. The nominal values,
   11 µm divided by the magnification, are 2.75 µm (4×), 1.1 µm (10×) and
   0.275 µm (40×) at 1.0×. They are assumed, not measured; camera
-  calibration (#22) measures them. The 1.5× magnifier divides them by 1.5,
-  so a table keyed by objective alone is not enough.
+  calibration (#22) measures them. The 1.5× magnifier divides them by 1.5:
+  the profile's sizes are for a factor of 1.0, and the layer divides them by
+  the core's `getMagnificationFactor()` (#167), so the lever is accounted for
+  **if** MMCore reads it. What the factor reads at 1.0× and 1.5× is not
+  verified (#16); if it reads 1.0 at both, the fix is a pixel-size preset
+  keyed to the lever in the stand's configuration, not code.
 - `[safety]` soft limits, **set by the owner** (2026-10-15) for plate work,
   not measured end stops: `xy_soft_limits_um = [[-49000, 49000],
   [-29000, 29000]]`. Z must never go above **4350 µm**, where the 40× is
