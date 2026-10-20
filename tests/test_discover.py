@@ -294,7 +294,9 @@ def test_probe_crash_keeps_the_listing_and_names_the_device() -> None:
     assert "DemoCamera" in _listed(inv)
     assert _listed(inv)["DemoCamera"].devices
     assert "probing NotificationTester/" in crash[0]
-    assert inv.probe is None
+    # The checkpoints keep what was probed before the crash, marked as not whole.
+    assert inv.probe is not None
+    assert not inv.probe.complete
     if sys.platform == "darwin":
         # The crash guard turned the abort into an exit code: no crash report.
         assert "exited 6 (likely SIGABRT, crash guard)" in crash[0]

@@ -1,14 +1,15 @@
 """Child process that loads device adapters for ``smc discover``.
 
-``python -m smc.discovery._mm_child --result FILE (--adapters A,B | --all) [--probe NAME]``
+``python -m smc.discovery._mm_child --result FILE (--adapters A,B | --all) [--probe NAME [--port=PORT]]``
 
 It exists so a vendor DLL that hangs or crashes on load takes down this
 process and not the survey (see :mod:`smc.discovery.mm_inventory` and
 ``docs/design/failure-modes.md`` FM-01 to FM-04):
 
 * the result goes to ``FILE``, never stdout, which a DLL may print into;
-* it is written atomically after the listing and again after the probe, so
-  a crash during the probe keeps the listing;
+* it is written atomically after the listing, after every probed device and
+  once more at the end, so a crash during the probe keeps the listing and
+  the devices already probed, the probe marked ``complete=False``;
 * ``listing <adapter>`` / ``probing <adapter>/<device>`` go to stderr before
   each step, so the parent can say what was running when the child died;
 * the process ends with ``os._exit(0)`` after the last write: unloading a
@@ -25,9 +26,11 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 from smc.discovery.mm_inventory import ChildResult, list_adapters, probe_adapter
+from smc.discovery.models import ProbeResult
 
 # Windows SetErrorMode flags: no "missing DLL" dialog, no crash-reporter dialog.
 _SEM_FAILCRITICALERRORS = 0x0001
@@ -125,6 +128,30 @@ def _write(result: ChildResult, path: Path) -> None:
     os.replace(partial, path)
 
 
+def _checkpoint_writer(
+    result: ChildResult, path: Path
+) -> Callable[[ProbeResult], None]:
+    """The probe's checkpoint: put the snapshot in the result and write the file.
+
+    A failed write between two devices is a line on stderr and not the end of
+    the probe: Windows antivirus can hold a file that was just written (FM-24),
+    and the probe is minutes of hardware work. Only ``OSError`` is swallowed;
+    the final write, after the probe, is not guarded. The line does not start
+    with ``probing ``, which the parent reads as the device that was running.
+    """
+
+    def checkpoint(snapshot: ProbeResult) -> None:
+        result.probe = snapshot
+        try:
+            _write(result, path)
+        except OSError as exc:
+            _progress(
+                f"checkpoint skipped: the result file could not be written: {exc}"
+            )
+
+    return checkpoint
+
+
 def main(argv: list[str] | None = None) -> int:
     """List adapter devices (and probe one adapter), writing the result file."""
     _no_error_dialogs()
@@ -133,6 +160,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--adapters", default="", help="comma-separated names")
     parser.add_argument("--all", action="store_true", help="every installed adapter")
     parser.add_argument("--probe", default=None, help="one adapter to initialise")
+    # The parent sends it as `--port=<port>`: a port starting with `-` is a
+    # value there, where `--port -x` would be read as an option.
+    parser.add_argument("--port", default=None, help="serial port for --probe")
     args = parser.parse_args(argv)
 
     from pymmcore_plus import CMMCorePlus
@@ -147,7 +177,12 @@ def main(argv: list[str] | None = None) -> int:
         result.listed += list_adapters(core, [name])
     _write(result, args.result)
     if args.probe:
-        result.probe = probe_adapter(args.probe, progress=_progress)
+        result.probe = probe_adapter(
+            args.probe,
+            port=args.port,
+            progress=_progress,
+            checkpoint=_checkpoint_writer(result, args.result),
+        )
         _write(result, args.result)
     return 0
 

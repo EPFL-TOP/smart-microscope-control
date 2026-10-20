@@ -704,6 +704,14 @@ def discover(
             "the hardware: stand powered, vendor software closed.",
         ),
     ] = None,
+    port: Annotated[
+        str | None,
+        typer.Option(
+            "--port",
+            help="Serial port to give, before they initialise, to the probed "
+            "devices that need one (COM3, /dev/ttyUSB0). Needs --probe-adapter.",
+        ),
+    ] = None,
     timeout_s: Annotated[
         float,
         typer.Option(
@@ -725,10 +733,20 @@ def discover(
     """
     from smc.discovery import inventory
     from smc.discovery import report as report_mod
+    from smc.discovery.mm_inventory import check_port
 
     if not math.isfinite(timeout_s):  # click's range check lets nan through
         _fail(f"--timeout-s must be a number of seconds, not {timeout_s}")
         raise typer.Exit(code=2)
+    if port is not None:
+        if not probe_adapter:
+            _fail("--port needs --probe-adapter")
+            raise typer.Exit(code=2)
+        try:
+            port = check_port(port)
+        except ValueError as exc:
+            _fail(str(exc))
+            raise typer.Exit(code=2) from None
     # --out is checked before the survey and written before the report is
     # printed: a broken pipe or Ctrl-C while printing must not lose the files.
     if out is not None:
@@ -738,14 +756,21 @@ def discover(
             _fail(f"cannot write to {out}: {exc}")
             raise typer.Exit(code=1) from None
     if probe_adapter:
+        # Text, not markup: the adapter and the port are what the owner typed.
+        where = f" (port {port})" if port is not None else ""
         console.print(
-            f"[yellow]![/yellow] Probing {probe_adapter}: the stand must be "
-            "powered and its vendor software closed."
+            Text.assemble(
+                ("! ", "yellow"),
+                f"Probing {probe_adapter}{where}: the stand must be powered and "
+                "its vendor software closed.",
+            ),
+            soft_wrap=True,
         )
     with console.status("Surveying this PC…"):
         inv = inventory(
             all_adapters=all_adapters,
             probe_adapter=probe_adapter,
+            probe_port=port,
             include_os=not no_os,
             timeout_s=timeout_s,
         )

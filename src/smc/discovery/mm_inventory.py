@@ -710,6 +710,7 @@ def mm_section(
     *,
     all_adapters: bool = False,
     probe: str | None = None,
+    port: str | None = None,
     timeout_s: float = CHILD_TIMEOUT_S,
 ) -> tuple[list[AdapterInfo], ProbeResult | None, list[str]]:
     """Run the adapter work in a child process and collect what it found.
@@ -723,11 +724,29 @@ def mm_section(
     temporary folder, so the operator's working directory is not on its
     ``sys.path``.
 
+    The child rewrites the file after every probed device, so a child that
+    dies mid-probe leaves the rows it had finished, marked
+    ``complete=False``.
+
+    Args:
+        adapters: The adapters to list.
+        all_adapters: List every installed adapter too.
+        probe: One adapter to initialise.
+        port: The serial port for the probe's devices that need one. It
+            travels as one argument, ``--port=<port>``: a port that starts
+            with ``-`` would otherwise be read by ``argparse`` as an option.
+            Ignored without ``probe``.
+        timeout_s: How long the child may run.
+
     Returns:
-        The listed adapters, the probe (``None`` unless asked or when the
-        child died during it), and notes naming what went wrong and what the
-        child was doing at the time.
+        The listed adapters, the probe (``None`` unless asked, or when the
+        child died before its first checkpoint), and notes naming what went
+        wrong and what the child was doing at the time.
+
+    Raises:
+        ValueError: ``port`` is refused by :func:`check_port`.
     """
+    checked_port = check_port(port) if probe and port is not None else None
     with tempfile.TemporaryDirectory(
         prefix="smc-discover-", ignore_cleanup_errors=True
     ) as tmp:
@@ -745,6 +764,8 @@ def mm_section(
             command.append("--all")
         if probe:
             command += ["--probe", probe]
+        if checked_port is not None:
+            command.append(f"--port={checked_port}")
         logger.info("adapter child: %s", " ".join(command[1:]))
 
         notes: list[str] = []
