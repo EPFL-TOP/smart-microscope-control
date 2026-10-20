@@ -52,10 +52,10 @@ import math
 import os
 import secrets
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, suppress
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager, suppress
 from dataclasses import dataclass
-from types import MappingProxyType
+from types import MappingProxyType, TracebackType
 from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
 
 from smc.hardware.capabilities import (
@@ -595,6 +595,13 @@ class _ZStop:
     #: plain store, not an ``Event``: setting one takes a lock, which a
     #: second stop re-entering that thread would wait on for ever (FM-70).
     finished: bool = False
+    #: Set by the compound once it reads no more; the last of the two threads
+    #: to finish clears ``switch_off_failure``. The failure's traceback holds
+    #: the stopping thread's frames, which hold this object: kept, it would
+    #: keep the autofocus and the core until the cyclic collector (FM-92,
+    #: FM-98). The compound sets this, then clears; the stopping thread sets
+    #: the failure, then ``finished``, then reads this. Plain stores (FM-70).
+    closed: bool = False
 
     @property
     def fired(self) -> bool:
@@ -608,6 +615,212 @@ class _LostLockError(DeviceTimeoutError):
     A ``DeviceTimeoutError`` for every caller; its own class only so that
     ``engage`` does not take it for its lock wait's deadline.
     """
+
+
+class _EndedByAZStop:
+    """Inside a compound: from here on, the operator's Z stop wins (FM-88; review of #140).
+
+    While the block runs, a ``ZStage.stop()`` switches the autofocus off,
+    and stops the offset device while its move is pending or under way,
+    before Z's own stop (``Executor.linked_stop``): PFS locking again, or
+    following its offset, drives Z after the operator stopped it. The
+    block then ends with ``MotionStoppedError`` and the "left off"
+    WARNING, whatever it was doing; a stop that lands once it has locked
+    switches it off as well, and is reported the same way. A Z stop that
+    came since the compound was called, before this block, cancels it
+    with nothing sent. ``suspended`` says the autofocus is off already
+    (the relock), so that it is then left off, with the WARNING, as after
+    a halt that refuses the relock before it sends anything; otherwise
+    (a locked ``focus_by_um``, a direct ``engage()`` or offset move, m2
+    §3.3.1) it was not touched, so a Z stop before the block leaves it as
+    it was and claims nothing. ``offset_pending`` is
+    set before the link is, so that no Z stop falls between the two;
+    the caller clears it once the offset move has returned.
+
+    Once the block has ended, a call that a Z stop reached waits for
+    that stop's switch-off to return, at most ``Z_STOP_OUTCOME_WAIT_S``,
+    still under the microscope lock, in short sleeps that a Ctrl-C
+    interrupts (FM-97, FM-83). The link is marked reached before the
+    stopping thread sends the switch-off, so a block that its lock or its
+    landed move ended meanwhile would otherwise report "left off" while
+    the switch-off is still on its way, and may yet fail. A block that a
+    halt or a Ctrl-C ended does not wait: it goes on at once, with what
+    is known by then. When the switch-off failed, or had not returned in
+    time, it may
+    still be on: no "left off" is claimed, the "may still move Z" WARNING
+    is logged, and the call raises ``MotionStoppedError`` naming Z and
+    the failure, chained from whatever ended the block (m2 §3.3.1).
+    Three endings go on as they are: a ``DeviceTimeoutError`` (a give-up
+    whose own error says it may still move Z, with its motion still
+    registered), a halt and an interrupt.
+
+    While halted, the emergency stop switches the autofocus off and stops
+    the offset device itself, in its own order (m2 §3.11): the Z stop
+    then reaches no link, and the block ends on what the halt did.
+    Without a focus drive of this module, no Z stop is linked.
+
+    A class, not a ``@contextmanager`` generator: a generator that raises a
+    different exception from the one thrown into it keeps contextlib's
+    frame, and through it the autofocus and the core, in a reference cycle
+    on Python 3.11+ (#163, FM-92, FM-98). For the same reason it keeps no
+    exception on ``self``, and every frame that raises an exception it holds
+    in a local deletes that local first.
+    """
+
+    def __init__(
+        self,
+        autofocus: MMAutofocus,
+        description: str,
+        *,
+        suspended: bool,
+        offset_pending: bool,
+    ) -> None:
+        self._autofocus = autofocus
+        self._description = description
+        self._suspended = suspended
+        self._stopped = _ZStop(offset_pending=offset_pending)
+        self._name = ""
+        self._link: AbstractContextManager[StopLink] | None = None
+
+    def __enter__(self) -> _ZStop:
+        autofocus, stopped = self._autofocus, self._stopped
+        key = autofocus._focus_key()
+        if key is None:
+            return stopped
+        self._name = f"z {key}"
+        before = MotionStoppedError(self._name, "it was stopped before it started")
+        link = self._link = autofocus._executor.linked_stop(
+            key, lambda: autofocus._on_z_stop(stopped)
+        )
+        try:
+            stopped.link = link.__enter__()
+            autofocus._executor.refuse_if_stopped(key, before)
+        except BaseException as exc:
+            # ``__exit__`` does not run when ``__enter__`` raises: the refusal
+            # (this check, or a halt, #141) ends the block here. The link is
+            # left in every case, as a ``with`` statement would: an interrupt
+            # once its entry has returned would otherwise leave it live; one
+            # whose own entry failed is gone, and leaving it does nothing.
+            self._link = None
+            try:
+                self._end(link, exc, refused=exc is before)
+            finally:
+                self._close()
+            raise
+        finally:
+            # Raised through this frame, it is on its own traceback (FM-98).
+            del before
+        return stopped
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        # Never swallows: the block's exception goes on, or another is raised.
+        link, self._link = self._link, None
+        if link is None:
+            return
+        try:
+            self._end(link, exc, refused=False)
+        finally:
+            self._close()
+
+    def _end(
+        self,
+        link: AbstractContextManager[StopLink],
+        exc: BaseException | None,
+        *,
+        refused: bool,
+    ) -> None:
+        """Leave the link, then decide; returns when the block's ending goes on as it is."""
+        try:
+            if exc is None:
+                link.__exit__(None, None, None)
+            else:
+                tb = exc.__traceback__
+                try:
+                    link.__exit__(type(exc), exc, tb)
+                finally:
+                    # Python 3.10's contextlib leaves its own frames on the
+                    # traceback of the exception it re-raised, and its frame
+                    # holds that exception: a cycle (FM-98). 3.11+ restores
+                    # the traceback itself; a ``with`` statement did too.
+                    exc.__traceback__ = tb
+        except BaseException as raised:
+            # An interrupt in the link's own exit ends the block in place of
+            # ``exc``, as the generator's outer ``try`` caught it.
+            self._decide(raised, refused=False)
+            raise
+        self._decide(exc, refused=refused)
+
+    def _decide(self, exc: BaseException | None, *, refused: bool) -> None:
+        """The decision table (m2 §3.3.1); returns when the block's ending goes on as it is."""
+        autofocus, stopped = self._autofocus, self._stopped
+        name, description = self._name, self._description
+        failure: BaseException | None = None
+        error: MotionStoppedError | None = None
+        try:
+            if exc is not None:
+                # Suspended, a refusal before the engage was sent (the check
+                # on entry, or a halt, #141) leaves it off as surely as a Z
+                # stop does.
+                refused = refused or isinstance(exc, MicroscopeHaltedError)
+                if not (stopped.fired or (self._suspended and refused)):
+                    return
+                # A halt and a Ctrl-C go on at once: they wait for no outcome.
+                urgent = isinstance(exc, MicroscopeHaltedError) or not isinstance(
+                    exc, Exception
+                )
+                failure = (
+                    autofocus._z_stop_failure(stopped, wait=not urgent)
+                    if stopped.fired
+                    else None
+                )
+                if failure is not None:
+                    autofocus._log_not_switched_off(description, failure)
+                    if urgent or isinstance(exc, DeviceTimeoutError):
+                        return
+                    error = autofocus._not_switched_off(name, description, failure)
+                    raise error from exc
+                if isinstance(exc, MicroscopeHaltedError) or not isinstance(
+                    exc, Exception
+                ):
+                    autofocus._log_left_off(description, exc)
+                    return  # a halt stays a halt, a Ctrl-C a Ctrl-C
+                error = autofocus._z_stopped(name, description)
+                autofocus._log_left_off(description, error)
+                raise error from exc
+            if stopped.fired:
+                # It locked, then the stop switched it off: not a success.
+                failure = autofocus._z_stop_failure(stopped, wait=True)
+                if failure is not None:
+                    autofocus._log_not_switched_off(description, failure)
+                    error = autofocus._not_switched_off(name, description, failure)
+                    raise error from failure
+                error = autofocus._z_stopped(name, description)
+                autofocus._log_left_off(description, error)
+                raise error
+        finally:
+            # `error` is raised through this frame: kept here, it would be on
+            # its own traceback (FM-98). `failure`, chained to it, goes with it.
+            del failure, error
+
+    def _close(self) -> None:
+        """The compound reads no more: drop what would keep the core in a cycle.
+
+        The link's callback holds ``stopped``, and ``stopped`` held the link:
+        a cycle that kept this autofocus and the core alive until the cyclic
+        collector (FM-92). The callback never reads ``link``, a stop that is
+        still on its way needs only ``stopped``, and nothing reads ``fired``
+        after this. The switch-off's failure is cleared after ``closed`` is
+        set, so that whichever thread finishes last clears it (``_ZStop``).
+        """
+        stopped = self._stopped
+        stopped.link = None
+        stopped.closed = True
+        stopped.switch_off_failure = None
 
 
 class MMAutofocus:
@@ -900,6 +1113,12 @@ class MMAutofocus:
             # Otherwise only the lock wait raises this here: the Executor gave
             # up at the deadline and sent the stop, which switches it off.
             return self._no_lock(limit_s, assumed, exc, switch_off_failures)
+        finally:
+            # A failure's traceback holds `switch_off`'s frame, whose closure
+            # holds this list: emptied on every exit, the normal return too
+            # (a Z stop's safe call ends the wait through `switch_off`), once
+            # read (#163, FM-98). Nothing calls the motion's stop after this.
+            switch_off_failures.clear()
         if ended == "locked":
             return _Lock(True)
         in_range = self._in_range_for_message()
@@ -1044,112 +1263,13 @@ class MMAutofocus:
         focus = self._focus()
         return focus._label if isinstance(focus, MMZStage) else None
 
-    @contextmanager
     def _ended_by_a_z_stop(
         self, description: str, *, suspended: bool, offset_pending: bool = False
-    ) -> Iterator[_ZStop]:
-        """Inside a compound: from here on, the operator's Z stop wins (FM-88; review of #140).
-
-        While the block runs, a ``ZStage.stop()`` switches the autofocus off,
-        and stops the offset device while its move is pending or under way,
-        before Z's own stop (``Executor.linked_stop``): PFS locking again, or
-        following its offset, drives Z after the operator stopped it. The
-        block then ends with ``MotionStoppedError`` and the "left off"
-        WARNING, whatever it was doing; a stop that lands once it has locked
-        switches it off as well, and is reported the same way. A Z stop that
-        came since the compound was called, before this block, cancels it
-        with nothing sent. ``suspended`` says the autofocus is off already
-        (the relock), so that it is then left off, with the WARNING, as after
-        a halt that refuses the relock before it sends anything; otherwise
-        (a locked ``focus_by_um``, a direct ``engage()`` or offset move, m2
-        §3.3.1) it was not touched, so a Z stop before the block leaves it as
-        it was and claims nothing. ``offset_pending`` is
-        set before the link is, so that no Z stop falls between the two;
-        the caller clears it once the offset move has returned.
-
-        Once the block has ended, a call that a Z stop reached waits for
-        that stop's switch-off to return, at most ``Z_STOP_OUTCOME_WAIT_S``,
-        still under the microscope lock, in short sleeps that a Ctrl-C
-        interrupts (FM-97, FM-83). The link is marked reached before the
-        stopping thread sends the switch-off, so a block that its lock or its
-        landed move ended meanwhile would otherwise report "left off" while
-        the switch-off is still on its way, and may yet fail. A block that a
-        halt or a Ctrl-C ended does not wait: it goes on at once, with what
-        is known by then. When the switch-off failed, or had not returned in
-        time, it may
-        still be on: no "left off" is claimed, the "may still move Z" WARNING
-        is logged, and the call raises ``MotionStoppedError`` naming Z and
-        the failure, chained from whatever ended the block (m2 §3.3.1).
-        Three endings go on as they are: a ``DeviceTimeoutError`` (a give-up
-        whose own error says it may still move Z, with its motion still
-        registered), a halt and an interrupt.
-
-        While halted, the emergency stop switches the autofocus off and stops
-        the offset device itself, in its own order (m2 §3.11): the Z stop
-        then reaches no link, and the block ends on what the halt did.
-        Without a focus drive of this module, no Z stop is linked.
-        """
-        stopped = _ZStop(offset_pending=offset_pending)
-        key = self._focus_key()
-        if key is None:
-            yield stopped
-            return
-        name = f"z {key}"
-        before = MotionStoppedError(name, "it was stopped before it started")
-        try:
-            try:
-                with self._executor.linked_stop(
-                    key, lambda: self._on_z_stop(stopped)
-                ) as link:
-                    stopped.link = link
-                    self._executor.refuse_if_stopped(key, before)
-                    yield stopped
-            except BaseException as exc:
-                # Suspended, a refusal before the engage was sent (this check, or a
-                # halt, #141) leaves it off as surely as a Z stop does.
-                refused = exc is before or isinstance(exc, MicroscopeHaltedError)
-                if not (stopped.fired or (suspended and refused)):
-                    raise
-                # A halt and a Ctrl-C go on at once: they wait for no outcome.
-                urgent = isinstance(exc, MicroscopeHaltedError) or not isinstance(
-                    exc, Exception
-                )
-                failure = (
-                    self._z_stop_failure(stopped, wait=not urgent)
-                    if stopped.fired
-                    else None
-                )
-                if failure is not None:
-                    self._log_not_switched_off(description, failure)
-                    if urgent or isinstance(exc, DeviceTimeoutError):
-                        raise
-                    raise self._not_switched_off(name, description, failure) from exc
-                if isinstance(exc, MicroscopeHaltedError) or not isinstance(
-                    exc, Exception
-                ):
-                    self._log_left_off(description, exc)
-                    raise  # a halt stays a halt, a Ctrl-C a Ctrl-C
-                error = self._z_stopped(name, description)
-                self._log_left_off(description, error)
-                raise error from exc
-            if stopped.fired:
-                # It locked, then the stop switched it off: not a success.
-                failure = self._z_stop_failure(stopped, wait=True)
-                if failure is not None:
-                    self._log_not_switched_off(description, failure)
-                    raise self._not_switched_off(name, description, failure) from (
-                        failure
-                    )
-                error = self._z_stopped(name, description)
-                self._log_left_off(description, error)
-                raise error
-        finally:
-            # The link's callback holds `stopped`, and `stopped` held the link: a
-            # cycle that kept this autofocus and the core alive until the cyclic
-            # collector (FM-92). The callback never reads `link`, a stop that is
-            # still on its way needs only `stopped`, and nothing reads `fired`
-            # after this block.
-            stopped.link = None
+    ) -> _EndedByAZStop:
+        """Inside a compound: from here on, the operator's Z stop wins (``_EndedByAZStop``)."""
+        return _EndedByAZStop(
+            self, description, suspended=suspended, offset_pending=offset_pending
+        )
 
     def _on_z_stop(self, stopped: _ZStop) -> None:
         """A ``ZStage.stop()`` during a compound of the autofocus; the stopping thread's.
@@ -1170,21 +1290,29 @@ class MMAutofocus:
         """
         failure: Exception | None = None
         try:
-            self._executor.safe(self._off, lambda: None)
-        except Exception as exc:
-            stopped.switch_off_failure = failure = exc
-        except BaseException as exc:
-            stopped.switch_off_failure = exc
-            raise
-        finally:
-            stopped.finished = True
-        if self._offset_label is not None and stopped.offset_pending:
             try:
-                self._executor.stop(self._offset_motion)
+                self._executor.safe(self._off, lambda: None)
             except Exception as exc:
-                failure = failure or exc
-        if failure is not None:
-            raise failure
+                stopped.switch_off_failure = failure = exc
+            except BaseException as exc:
+                stopped.switch_off_failure = exc
+                raise
+            finally:
+                stopped.finished = True
+                # The compound reads it no more: this thread finished last, so
+                # it clears the failure, whose traceback holds this frame (#163).
+                if stopped.closed:
+                    stopped.switch_off_failure = None
+            if self._offset_label is not None and stopped.offset_pending:
+                try:
+                    self._executor.stop(self._offset_motion)
+                except Exception as exc:
+                    failure = failure or exc
+            if failure is not None:
+                raise failure
+        finally:
+            # Raised through this frame, it is on its own traceback (FM-98).
+            del failure
 
     def _z_stop_failure(self, stopped: _ZStop, *, wait: bool) -> BaseException | None:
         """What the Z stop's switch-off raised, once it has returned; waited for, bounded (FM-97).

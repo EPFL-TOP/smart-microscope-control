@@ -291,6 +291,91 @@ def _z_stop_before_the_move(core: FakeCore, microscope: Microscope) -> tuple[str
         del core.enableContinuousFocus
 
 
+def _z_stop_once_locked(core: FakeCore, microscope: Microscope) -> tuple[str, str]:
+    """The real PFS link: a Z stop once the relock has locked, whose switch-off fails (#163)."""
+    core.autofocus_lockable = True
+    core.enableContinuousFocus(True)
+    z = microscope.require(ZStage)
+    original, stopped = core.enableContinuousFocus, list[bool]()
+
+    def switch(enable: bool) -> None:
+        if not enable and stopped:
+            raise RuntimeError("device fault")  # fresh: not `failing` (FM-98)
+        original(enable)
+        if enable and not stopped:
+            stopped.append(True)
+            _outcome(z.stop)  # the stopper's own failure is not the subject
+
+    core.enableContinuousFocus = switch  # type: ignore[method-assign]
+    try:
+        return _outcome(lambda: z.move_to_um(3.0))
+    finally:
+        del core.enableContinuousFocus
+
+
+def _z_stop_that_fails_during_the_relock(
+    core: FakeCore, microscope: Microscope
+) -> tuple[str, str]:
+    """The real PFS link: a Z stop during the relock whose own ``stop('Z')`` fails (#163).
+
+    `_stop_linked` kept the error `_send_stop` returned; its traceback reaches
+    that frame through `_send_safe`'s `f_back`.
+    """
+    core.autofocus_lockable = True
+    core.enableContinuousFocus(True)
+    z = microscope.require(ZStage)
+    switch, stop, stopped = core.enableContinuousFocus, core.stop, list[bool]()
+
+    def stop_once_on(enable: bool) -> None:
+        switch(enable)
+        if enable and not stopped:
+            stopped.append(True)
+            _outcome(z.stop)  # the stopper's own failure is not the subject
+
+    def z_stop_fails(label: str) -> None:
+        if label == "Z":
+            raise RuntimeError("device fault")  # fresh: not `failing` (FM-98)
+        stop(label)
+
+    core.enableContinuousFocus = stop_once_on  # type: ignore[method-assign]
+    core.stop = z_stop_fails  # type: ignore[method-assign]
+    try:
+        return _outcome(lambda: z.move_to_um(3.0))
+    finally:
+        del core.enableContinuousFocus, core.stop
+
+
+def _lock_wait_given_up(core: FakeCore, microscope: Microscope) -> tuple[str, str]:
+    """A lock wait given up whose switch-off fails, then ``stop()`` and ``resume()`` (#163).
+
+    Until then the wait stays registered, and its motion keeps the core
+    through the Executor: by decision, not a cycle of an exception (FM-92).
+    """
+    core.autofocus_lockable = False
+    autofocus = microscope.require(Autofocus)
+    original = core.enableContinuousFocus
+
+    def switch(enable: bool) -> None:
+        if not enable:
+            raise RuntimeError("device fault")
+        original(enable)
+
+    core.enableContinuousFocus = switch  # type: ignore[method-assign]
+    try:
+        outcome = _outcome(lambda: autofocus.engage(timeout_s=0.1))
+    finally:
+        del core.enableContinuousFocus
+    microscope.stop()
+    microscope.resume()
+    return outcome
+
+
+_SWITCH_OFF_FAILED = (
+    "autofocus: enableContinuousFocus(False) failed (device fault); check the "
+    "device: power, cable, another program holding it"
+)
+
+
 @pytest.mark.parametrize(
     ("scenario", "kind", "message"),
     [
@@ -316,6 +401,30 @@ def _z_stop_before_the_move(core: FakeCore, microscope: Microscope) -> tuple[str
             "`z Z`: it was stopped before it started; read the position before "
             "moving on",
             id="z-stop-before-the-move",
+        ),
+        pytest.param(
+            _z_stop_once_locked,
+            "MotionStoppedError",
+            "`z Z`: it was stopped during z: move_to 3.0 µm, but autofocus Autofocus "
+            f"could not be switched off ({_SWITCH_OFF_FAILED}); it may still move Z: "
+            "stop() and check the stand, then resume(); read the position before "
+            "moving on",
+            id="z-stop-once-locked",
+        ),
+        pytest.param(
+            _z_stop_that_fails_during_the_relock,
+            "MotionStoppedError",
+            "`z Z`: it was stopped during z: move_to 3.0 µm, so autofocus Autofocus "
+            "was left off; read the position before moving on",
+            id="z-stop-fails",
+        ),
+        pytest.param(
+            _lock_wait_given_up,
+            "DeviceTimeoutError",
+            "autofocus Autofocus: no lock within 0.1 s, and it could not be switched "
+            f"off (the switch-off failed: {_SWITCH_OFF_FAILED}); it may still move Z: "
+            "stop() and check the stand, then resume()",
+            id="lock-wait-given-up",
         ),
     ],
 )
