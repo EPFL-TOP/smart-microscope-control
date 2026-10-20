@@ -290,6 +290,21 @@ class TestOnDemoDevices:
         camera = _camera(demo_core, {"Nikon 10X S Fluor": 0.65}, "Nikon 10X S Fluor")
         assert camera.pixel_size_um() == pytest.approx(1.3)
 
+    def test_pixel_size_fallback_divides_by_a_magnifier(self, demo_core: Any) -> None:
+        # m2 §8.10, measured 2026-10-20: with the demo's optovar at 1.6x the
+        # factor reads 1.6, and MMCore divides its own size by it.
+        demo_core.loadDevice("Optovar", "DemoCamera", "DOptovar")
+        demo_core.initializeDevice("Optovar")
+        demo_core.setProperty("Optovar", "Position", "1.6x")
+        camera = _camera(demo_core, {"Nikon 10X S Fluor": 0.65}, "Nikon 10X S Fluor")
+        # MMCore's value already includes the factor: 1.0 / 1.6, not divided twice.
+        assert demo_core.getPixelSizeUm() == pytest.approx(1.0 / 1.6)
+        assert camera.pixel_size_um() == pytest.approx(1.0 / 1.6)
+        for name in demo_core.getAvailablePixelSizeConfigs():
+            demo_core.deletePixelSizeConfig(name)
+        assert demo_core.getPixelSizeUm() == 0
+        assert camera.pixel_size_um() == pytest.approx(0.65 / 1.6)
+
     @pytest.mark.parametrize("bad", [math.nan, math.inf, -0.65, 0.0])
     def test_pixel_size_bad_profile_entry_is_unknown(
         self, demo_core: Any, bad: float, caplog: pytest.LogCaptureFixture
@@ -449,6 +464,9 @@ class _BinningCore:
 
     def getPixelSizeUm(self) -> float:  # noqa: N802
         return 0.0
+
+    def getMagnificationFactor(self) -> float:  # noqa: N802
+        return 1.0
 
     def hasProperty(self, label: str, name: str) -> bool:  # noqa: N802
         return self.binning is not None

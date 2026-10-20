@@ -30,6 +30,23 @@ def test_demo_roles_give_led_without_a_knob(demo_microscope: Microscope) -> None
     assert turret.pixel_size_um() == 0.65
 
 
+def test_demo_turret_pixel_size_follows_a_magnifier(
+    demo_microscope: Microscope,
+) -> None:
+    # m2 §8.10: the profile's sizes are for a factor of 1.0, so a magnifier
+    # (the demo's optovar stands in for the Ti2-E's lever) divides them.
+    turret = demo_microscope.require(ObjectiveTurret)
+    assert turret.pixel_size_um() == 0.65
+    core = demo_microscope.core
+    core.loadDevice("Optovar", "DemoCamera", "DOptovar")
+    core.initializeDevice("Optovar")
+    core.setProperty("Optovar", "Position", "1.6x")
+    assert turret.pixel_size_um() == pytest.approx(0.65 / 1.6)
+    assert turret.pixel_size_um("Nikon 40X Plan Fluor ELWD") == pytest.approx(
+        0.1625 / 1.6
+    )
+
+
 def test_demo_channel_group_is_channel_and_reads_dapi(
     demo_microscope: Microscope,
 ) -> None:
