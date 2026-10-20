@@ -1896,7 +1896,10 @@ def test_the_real_child_writes_utf8_to_its_stderr_file_whatever_the_code_page(
             timeout=120,
         )
 
-    assert stderr_file.read_bytes() == "listing Ad\N{MICRO SIGN}\n".encode()
+    # Bytes, not text, so that a code-page decoding could not hide a wrong
+    # encoding; and lines, since Windows ends them with CR LF (FM-101).
+    data = stderr_file.read_bytes()
+    assert data.splitlines() == ["listing Ad\N{MICRO SIGN}".encode()]
 
 
 # --- mm_section's texts did not change when its runner was shared -----------------------------
