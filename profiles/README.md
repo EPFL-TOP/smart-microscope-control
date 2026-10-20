@@ -130,6 +130,20 @@ measures them. Each value in `nikon-ti2.toml` says in a comment whether it
 was measured, set by the owner or chosen; `max_z_jog_um` is chosen, not
 measured, and the owner revises it when the PFS session (#16) has run.
 
+## Rebuilding a profile's configuration
+
+A profile's `.cfg` is rebuilt from the devices that answer with
+
+```sh
+smc config build --profile <name> --out <its .cfg> --force
+```
+
+(`--dry-run` first). The command carries the file's presets, pixel sizes, typed
+state labels and delays over, sets aside, as `# not carried:` comments, what names a
+device that is no longer loaded, and saves the previous file as `<its .cfg>.bak`.
+It initialises the stand's devices: only at the stand, with the vendor software
+closed. See `docs/hardware/microscope-pc-setup.md`.
+
 ## Windows paths
 
 Write paths with forward slashes (`config = "C:/Micro-Manager/scope.cfg"`),

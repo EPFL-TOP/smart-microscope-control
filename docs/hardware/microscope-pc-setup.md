@@ -188,6 +188,53 @@ device, and its `result` column has three words:
 - Under *Adapter devices*, a `meaning:` row says what an empty list, or a list
   the adapter fixes whatever is connected, tells about the stand.
 
+### Build a configuration
+
+Not part of a first visit (§4) either: it initialises every device of the
+stand's adapter, as a probe does, so the stand must be powered and its vendor
+software closed. `smc config build` writes a Micro-Manager `.cfg` from the
+devices that answer, without the Java wizard. Look first, and write second:
+
+```bat
+smc config build --profile nikon-ti2 --out %SURVEY%\nikon-ti2.cfg --dry-run
+smc config build --profile nikon-ti2 --out %SURVEY%\nikon-ti2.cfg
+```
+
+`--dry-run` prints the probe table, the roles it resolved, and the file it
+would write, and writes nothing. `--out` has no default. The adapter is the one
+Nikon stand the profile's configuration loads; `--adapter NikonTi2` names it
+when the profile has none (the demo's does not), and the camera is only what the
+stand's adapter provides, or the cameras of `--camera-adapter` (`smc discover`
+lists the installed adapters). No camera adapter is tried unasked.
+
+- **Nothing is written** when the stand's hub did not initialise (the output
+  then lists the likely causes in order: another program holds the stand, power,
+  the driver), when nothing below the hub initialised, when a named camera
+  adapter gave no camera, or when the build child stopped before the end. Each
+  is one `✗` line, with exit code 1.
+- **`--skip DEVICE`** (repeatable) leaves a device out without loading it. When a
+  device crashes the build (the Ti-E's `TIDiaLamp` may), the output says
+  `re-run with --skip <device> to leave it out`; the file then lists it under
+  *Did not connect, or left out*. On the Ti2-E, `--skip Ti2-E__0` builds from the
+  simulator when the stand is off.
+- **`--force`** replaces an existing `--out`, which is saved first as
+  `<out>.bak`. Without it, an existing file is refused before anything is
+  initialised.
+- **A rebuild never loses a line it does not generate.** The presets, pixel
+  sizes, a device's typed state labels and `Delay` and `FocusDirection` lines of
+  the file it replaces are carried over; one that names a device the new file does
+  not load (or selects a label the device does not have there) is set aside
+  whole, as `# not carried:` comments under *Set aside*, and the output has a
+  line `! set aside: <block>: <why>` for each. A later build reads those comments
+  as lines again, so a preset comes back once its device does. Device `Property`
+  lines are always set aside: put a device setting in a preset (`System/Startup`).
+- **A device that needs a serial port is left out**, with its reason: this
+  command sets no port.
+- **Check what it wrote**: `smc doctor --config %SURVEY%\nikon-ti2.cfg`, as the
+  last line says. A device that failed, a camera that is missing or a block that
+  was set aside does not change the exit code: they are findings, and the file
+  says them.
+
 ## 3. Bring it back
 
 Copy the folder to the Mac — network share, USB stick, e-mail to yourself —
