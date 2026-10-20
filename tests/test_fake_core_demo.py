@@ -11,9 +11,10 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
+from pymmcore_plus import DeviceType
 
 from smc.hardware.roles import core_roles, devices_from_core
-from smc.testing import FakeCore
+from smc.testing import FakeCore, FakeDevice
 
 pytestmark = pytest.mark.demo
 
@@ -154,3 +155,33 @@ def test_fake_and_demo_agree_on_the_autofocus_offset_and_lock(demo_core: Any) ->
         core.enableContinuousFocus(False)
         seen.append((locked, offset, core.getAutoFocusOffset()))
     assert seen[0] == seen[1] == ((True, True), 12.5, 12.5)
+
+
+def test_magnification_factor_is_the_product_of_the_magnifiers(
+    demo_core: Any,
+) -> None:
+    # m2 §8.10, measured 2026-10-20: the demo has no Magnifier (1.0); one
+    # DOptovar at 1.6x reads 1.6, and two read 2.56 (MMCore multiplies them).
+    fake = FakeCore.demo_like(
+        extra_devices=[
+            FakeDevice("Optovar", DeviceType.Magnifier, "DemoCamera", "DOptovar"),
+            FakeDevice("Optovar2", DeviceType.Magnifier, "DemoCamera", "DOptovar"),
+        ]
+    )
+    assert demo_core.getMagnificationFactor() == 1.0
+    assert FakeCore.demo_like().getMagnificationFactor() == 1.0
+    # The fake's two optovars have no entry yet, so they read 1.0 as well.
+    assert fake.getMagnificationFactor() == 1.0
+    seen: list[float] = []
+    for label in ("Optovar", "Optovar2"):
+        demo_core.loadDevice(label, "DemoCamera", "DOptovar")
+        demo_core.initializeDevice(label)
+        # Position is set after initialisation; "High Position Magnification"
+        # is a pre-init property.
+        demo_core.setProperty(label, "Position", "1.6x")
+        fake.magnification[label] = 1.6
+        assert fake.getMagnificationFactor() == pytest.approx(
+            demo_core.getMagnificationFactor()
+        )
+        seen.append(demo_core.getMagnificationFactor())
+    assert seen == [pytest.approx(1.6), pytest.approx(2.56)]

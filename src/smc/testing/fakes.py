@@ -133,6 +133,11 @@ class FakeCore:
       continuous-focus and autofocus-offset calls.
     * ``pixel_size_um``, ``image_shape`` (height, width), ``bit_depth``: what
       the camera calls report.
+    * ``magnification``: label -> what that ``Magnifier`` device reads (a
+      label with no entry reads 1.0); ``getMagnificationFactor()`` is the
+      product over the loaded ``Magnifier`` devices (m2 §8.10). The fake does
+      not divide ``pixel_size_um`` by it: a test sets the calibrated value it
+      wants MMCore to report.
     * ``quirk_z_move_disables_autofocus``: the Nikon quirk (FM-12).
     * ``autofocus_lockable``: ``False`` and the autofocus never reads
       locked, even enabled, as with no reference in range.
@@ -162,6 +167,7 @@ class FakeCore:
         self.busy_devices: set[str] = set()
         self.failing: dict[str, BaseException] = {}
         self.pixel_size_um = 1.0
+        self.magnification: dict[str, float] = {}
         self.image_shape: tuple[int, int] = (512, 512)
         self.bit_depth = 16
         self.quirk_z_move_disables_autofocus = True
@@ -217,7 +223,7 @@ class FakeCore:
             self._slots[slot] = label
 
     @classmethod
-    def demo_like(cls) -> FakeCore:
+    def demo_like(cls, extra_devices: Iterable[FakeDevice] = ()) -> FakeCore:
         """The demo configuration's devices, slots, State labels and camera.
 
         Copied from the demo as measured on 2026-10-01; a demo test keeps
@@ -225,6 +231,10 @@ class FakeCore:
         disagree the fake is wrong. One difference is deliberate: the demo's
         White Light Shutter starts open on some opens (FM-47), and the fake's
         always starts closed.
+
+        ``extra_devices`` are loaded after the demo's own, so a test can add
+        what the demo lacks (a ``Magnifier``, m2 §8.10) without changing the
+        copy; the inventory test keeps comparing the default.
         """
         devices = [
             FakeDevice("DHub", DeviceType.Hub, "DemoCamera", "DHub", "DHub"),
@@ -339,7 +349,7 @@ class FakeCore:
             ),
         ]
         core = cls(
-            devices,
+            [*devices, *extra_devices],
             camera="Camera",
             xy_stage="XY",
             focus="Z",
@@ -568,6 +578,20 @@ class FakeCore:
         """``pixel_size_um`` as set; 0.0 is MMCore's "no calibration"."""
         self._camera()
         return self.pixel_size_um
+
+    def getMagnificationFactor(self) -> float:
+        """The product of ``magnification`` over the ``Magnifier`` devices; 1.0 with none.
+
+        MMCore multiplies every ``Magnifier`` device (two optovars at 1.6x
+        read 2.56, measured 2026-10-20). A device that fails raises its
+        ``failing`` entry, as a real one would when asked.
+        """
+        factor = 1.0
+        for device in self._devices.values():
+            if device.type == DeviceType.Magnifier:
+                self._device(device.label)
+                factor *= self.magnification.get(device.label, 1.0)
+        return factor
 
     # --- shutters ------------------------------------------------------------
 

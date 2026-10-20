@@ -519,3 +519,45 @@ def test_the_channel_group_takes_only_an_existing_group() -> None:
     assert core.getChannelGroup() == ""
     core.setChannelGroup("Channel-Multiband")
     assert core.getChannelGroup() == "Channel-Multiband"
+
+
+# --- The magnification factor (m2 §8.10) ------------------------------------
+
+
+def _magnifier(label: str) -> FakeDevice:
+    return FakeDevice(label, DeviceType.Magnifier, library="FakeCore", name=label)
+
+
+def test_magnification_factor_is_the_product_of_the_magnifiers() -> None:
+    assert FakeCore.demo_like().getMagnificationFactor() == 1.0
+    core = FakeCore.demo_like(extra_devices=[_magnifier("A"), _magnifier("B")])
+    # A magnifier with no entry reads 1.0, as the product of none does.
+    assert core.getMagnificationFactor() == 1.0
+    core.magnification = {"A": 1.5, "B": 2.0}
+    assert core.getMagnificationFactor() == 3.0
+    # Only a Magnifier counts: an entry for the camera is ignored.
+    core.magnification["Camera"] = 7.0
+    assert core.getMagnificationFactor() == 3.0
+    # An entry for a label that is not loaded is ignored as well.
+    core.magnification["Nowhere"] = 7.0
+    assert core.getMagnificationFactor() == 3.0
+
+
+def test_demo_like_appends_its_extra_devices_after_the_demos_own() -> None:
+    plain = FakeCore.demo_like().getLoadedDevices()
+    core = FakeCore.demo_like(extra_devices=[_magnifier("A")])
+    assert core.getLoadedDevices() == (*plain[:-1], "A", "Core")
+    assert core.getDeviceType("A") == DeviceType.Magnifier
+
+
+def test_a_failing_magnifier_raises_its_entry_from_the_factor_call() -> None:
+    core = FakeCore.demo_like(extra_devices=[_magnifier("A"), _magnifier("B")])
+    boom = RuntimeError("A: no answer")
+    core.failing["A"] = boom
+    with pytest.raises(RuntimeError) as caught:
+        core.getMagnificationFactor()
+    assert caught.value is boom
+    # The entry of a device that is not a Magnifier does not reach the call.
+    del core.failing["A"]
+    core.failing["Camera"] = boom
+    assert core.getMagnificationFactor() == 1.0
