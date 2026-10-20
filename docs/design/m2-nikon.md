@@ -2,8 +2,8 @@
 
 - **Status**: design for issue #13 (§1–§6, 2026-10-16); §3.3.1 and
   §3.11's stop rules decided in #144 (2026-10-18); §7 for #12
-  (2026-10-19); §8 for #14 (2026-10-19). #15 and #48 add their own
-  sections with their plans.
+  (2026-10-19); §8 for #14 (2026-10-19); §8.10 for #167 (2026-10-20). #15
+  and #48 add their own sections with their plans.
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1, this document is the contract between issues that are
   built in parallel. Names, module paths and signatures below are fixed; an
@@ -1117,7 +1117,8 @@ Measured on the demo on 2026-10-19 (pymmcore-plus 0.18.1, pymmcore
   configurations. `capture()` never calls it.
 - `getMagnificationFactor()` reads 1.0 on the demo. The Ti2-E's
   `IntermediateMagnification` (`Magnifier`, read-only, `1.0x` or `1.5x`)
-  divides the pixel size by 1.5, and no profile key accounts for it (#167).
+  divides the pixel size by 1.5; §8.10 says how the profile's sizes account
+  for it (#167).
 - **The Ti2-E's light** (session 0): `DiaLamp` is a `Shutter` whose
   `Intensity` is a free number (no limits; 501 was read), and it fills both
   the `shutter` role (the configuration's slot) and `light_source`. The
@@ -1245,10 +1246,10 @@ The `objective_turret` role; faults through `as_hardware_errors(core,
   `resume()` is called. Neither the emergency stop nor `close()` sends it
   anything.
 - `pixel_size_um(label=None)` returns the profile's `[camera]
-  pixel_size_um` for `label` (the current objective when `None`), and 0.0
-  when the profile has none. The value is at binning 1 and at an
-  intermediate magnification of 1.0× (#167). `Camera.pixel_size_um()` (M1
-  §3) is unchanged.
+  pixel_size_um` for `label` (the current objective when `None`) at binning
+  1, divided by the core's magnification factor (§8.10, #167), and 0.0 when
+  the profile has none or the factor is not a positive number.
+  `Camera.pixel_size_um()` (M1 §3) follows the same rule.
 
 ### 8.4 LightSource — `MMLightSource`
 
@@ -1589,8 +1590,9 @@ the filter turrets' labels, and the `Channel` group with `BF` copied from
   - on `fake` and `demo`, a select of another label returns it and reads
     back;
   - in dry-run, nothing turns;
-  - `pixel_size_um()` is 0.0 or the profile's value (0.65 on `fake` for
-    `Nikon 10X S Fluor`).
+  - `pixel_size_um()` is 0.0 or the profile's value divided by the
+    magnification factor (0.65 on `fake` for `Nikon 10X S Fluor`, whose
+    factor is 1.0).
 - `test_light_source.py`: `intensity_knob()` is `None` or names the role's
   device. Without a knob, `intensity_native()` is `None` and the set raises
   `HardwareError`. With a knob, setting the current value reads back. When
@@ -1626,4 +1628,66 @@ What the next Ti2-E session reads (#16):
 - that `current()` reads `BF` after `select("BF")`, which depends on
   what `DiaLamp`'s `Intensity` and `Camera-1`'s `Exposure` read back;
 - how long `setConfig` keeps `FilterTurret2` busy;
-- `getMagnificationFactor()` at each lever position (#167).
+- `getMagnificationFactor()` at each lever position (#167, §8.10): the
+  pixel-size fallbacks trust it.
+
+### 8.10 The magnification factor in the pixel size (#167)
+
+Extends §8.3 and M1 §3, §6, §8. It applies to both pixel sizes that the
+profile feeds: `Camera.pixel_size_um()` (its fallback) and
+`ObjectiveTurret.pixel_size_um()`.
+
+**Measured** on the demo on 2026-10-20 (pymmcore-plus 0.18.1), in throwaway
+cores:
+
+- The demo has no `Magnifier`, and `getMagnificationFactor()` reads 1.0.
+  `DemoCamera`'s `DOptovar` is a `Magnifier`: `Position` takes `1x` and
+  `1.6x`. At `1.6x` the factor reads 1.6 and `getPixelSizeUm()` reads 0.625,
+  the pixel-size preset's 1.0 divided by 1.6. Binning 2 doubles it (1.25).
+  Two optovars at `1.6x` read 2.56: the factor is the product of every
+  `Magnifier` device (FM-13). With no pixel-size preset, `getPixelSizeUm()`
+  reads 0.0 whatever the factor.
+- **MMCore passes an invalid factor on.** An optovar whose magnification is
+  0, -1.5, NaN or infinity gives a factor of that value, and
+  `getPixelSizeUm()` then reads infinity, -0.667, NaN or 0.0. Infinity is
+  greater than 0, so a check of `getPixelSizeUm() > 0` alone reports it as
+  measured.
+- The Ti2-E's `IntermediateMagnification` is a `Magnifier` (session 0). What
+  its factor reads at `1.0x` and at `1.5x` is **unknown** (§8.9).
+
+**The rule.** The profile's `[camera] pixel_size_um` is the size at binning 1
+and a magnification factor of 1.0, the convention of MMCore's own pixel-size
+presets. Wherever the layer uses it, it divides by the factor that MMCore
+reports, as MMCore does for its own value:
+
+- `Camera.pixel_size_um()`: MMCore's value when it is finite and above 0 (it
+  already includes the binning and the factor, so it is never divided
+  again); else the profile's value for the current objective times the
+  binning, divided by the factor.
+- `ObjectiveTurret.pixel_size_um(label)`: the profile's value for `label`
+  divided by the factor, for any label (the lever does not depend on the
+  objective). The factor is read only when the profile has a size for the
+  label, so an objective the profile lacks is 0.0 without a device read.
+- A factor that is not finite and above 0 gives 0.0 (unknown) and one WARNING
+  per call, like a bad profile entry. A factor that cannot be read raises
+  (`HardwareError` naming the role and `getMagnificationFactor()`, FM-79);
+  `Microscope.state()` is the tolerant layer.
+- **No profile key.** A stand whose changer MMCore cannot read (a manual tube
+  lens that is no `Magnifier` device) reads 1.0 and is wrong, and the layer
+  cannot know it: its sizes must be measured with the changer in place. A
+  size measured (#22) with the lever at 1.5× is entered multiplied by 1.5.
+  A key that names the factor of the calibration can come with #22.
+
+**Code.** A module function `_magnification_factor(core, for_what) -> float
+| None` in `backends/mm.py` (the factor, or `None` with the WARNING), called
+from both methods through the role's fault-translating core. In the
+turret it runs inside `Executor.read`. `FakeCore` gains
+`getMagnificationFactor()`, which multiplies `magnification[label]` (default
+1.0) over its `Magnifier` devices and raises a device's `failing` entry, and
+`demo_like(extra_devices=())`, which appends devices after the demo's own;
+`tests/test_fake_core_demo.py` compares the product with the demo's.
+
+**Not verified.** The factor on the Ti2-E at each lever position (§8.9). If
+`IntermediateMagnification` reads 1.0 at both, the layer still reports a
+1.5× too large size with the lever at 1.5×, and the fix is a pixel-size
+preset keyed to the lever in the stand's configuration, not code.
