@@ -102,6 +102,13 @@ them if it is not the one you run on.
     the worktree. Exit 0 `KILLED`: the test can fail. Exit 1 `SURVIVED`: it
     proves nothing about that line, so strengthen it. Exit 2: no verdict (the
     pattern was not found exactly once, or the test does not pass unmutated).
+    A mutant that needs several edits (a hoisting, a rename) is still one run:
+    `--also <file> <old> <new>`, repeatable, adds a replacement to the same
+    copy, each pattern matched once in the file as it is on disk. A pattern of
+    several lines goes through `--old-file <path> --new-file <path>` (and
+    `--also-file <file> <old-path> <new-path>`) instead of the shell's quoting,
+    which a formatter's reflow breaks; a dash-leading pattern of `--also` goes
+    through `--also-file`.
     Never restore a mutant with `git checkout`: it discards uncommitted work
     (#93).
 11. Run **`/adversarial-review $ARGUMENTS`**: cheap reviewer agents attack
