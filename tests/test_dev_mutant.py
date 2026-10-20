@@ -48,7 +48,7 @@ from pathlib import Path
 import pkg
 import pytest
 from helpers import EXPECTED
-from pkg.calc import add, countdown
+from pkg.calc import add, countdown, total
 
 
 def test_add_sums():
@@ -66,6 +66,14 @@ def test_prints_non_ascii():
 
 def test_add_runs():
     add(2, 3)
+
+
+def test_add_or_total_is_intact():
+    assert add(2, 3) == 5 or total(2, 3) == 6
+
+
+def test_add_total_or_countdown_is_intact():
+    assert add(2, 3) == 5 or total(2, 3) == 6 or countdown(3) == 0
 
 
 def test_countdown_ends():
@@ -95,6 +103,12 @@ SUM = "return a + b  # sum"
 SUM_BROKEN = "return a - b  # sum"
 ADD_SUMS = "tests/test_calc.py::test_add_sums"
 ADD_RUNS = "tests/test_calc.py::test_add_runs"
+INTACT = "tests/test_calc.py::test_add_or_total_is_intact"
+TOTAL = "return a + b + 1"
+TOTAL_BROKEN = "return a + b + 2"
+INTACT3 = "tests/test_calc.py::test_add_total_or_countdown_is_intact"
+COUNTDOWN = "return n"
+COUNTDOWN_BROKEN = "return n + 1"
 
 
 @pytest.fixture(scope="module")
@@ -113,11 +127,17 @@ def repo(tmp_path: Path) -> Path:
     root = tmp_path / "repo"
     (root / "src" / "pkg").mkdir(parents=True)
     (root / "tests").mkdir()
-    (root / "pyproject.toml").write_text(PYPROJECT, encoding="utf-8")
-    (root / "src" / "pkg" / "__init__.py").write_text("", encoding="utf-8")
-    (root / "src" / "pkg" / "calc.py").write_text(CALC, encoding="utf-8")
-    (root / "tests" / "test_calc.py").write_text(TESTS, encoding="utf-8")
-    (root / "tests" / "helpers.py").write_text("EXPECTED = 5\n", encoding="utf-8")
+    # newline="\n": write_text would write CRLF on Windows, and the multi-line
+    # patterns of the tests below are LF (matched as written, FM-101).
+    files = {
+        "pyproject.toml": PYPROJECT,
+        "src/pkg/__init__.py": "",
+        "src/pkg/calc.py": CALC,
+        "tests/test_calc.py": TESTS,
+        "tests/helpers.py": "EXPECTED = 5\n",
+    }
+    for name, text in files.items():
+        (root / name).write_text(text, encoding="utf-8", newline="\n")
     return root
 
 
@@ -141,6 +161,18 @@ def run(mutant, repo, scratch, capsys):
     def call(file: str, old: str, new: str, test_id: str, *options: str) -> Result:
         argv = [*options, "--root", str(repo), "--", file, old, new, test_id]
         code = mutant.main(argv)
+        captured = capsys.readouterr()
+        return Result(code, captured.out, captured.err)
+
+    return call
+
+
+@pytest.fixture
+def run_argv(mutant, repo, scratch, capsys):
+    """Like ``run`` for a command line it does not build: the caller gives all of it."""
+
+    def call(*argv: str) -> Result:
+        code = mutant.main(["--root", str(repo), *argv])
         captured = capsys.readouterr()
         return Result(code, captured.out, captured.err)
 
@@ -880,6 +912,591 @@ def test_a_taskkill_that_works_leaves_no_note(mutant, monkeypatch) -> None:
         lambda command, **kwargs: subprocess.CompletedProcess(command, 0, b"", b""),
     )
     assert mutant.kill_tree(_DeadChild()) == ""
+
+
+# --- several replacements, one mutant ---------------------------------------
+
+ALSO_TOTAL = ("--also", CALC_FILE, TOTAL, TOTAL_BROKEN)
+
+
+def test_two_replacements_are_one_mutant_killed_only_by_both(run) -> None:
+    # test_add_or_total_is_intact passes while either edit is missing: only a
+    # copy that holds both can fail it, so one edit per run could never kill.
+    both = run(CALC_FILE, SUM, SUM_BROKEN, INTACT, *ALSO_TOTAL)
+    assert both.code == 0, both.out + both.err
+    assert both.out.startswith("KILLED")
+    assert run(CALC_FILE, SUM, SUM_BROKEN, INTACT).code == 1
+    assert run(CALC_FILE, TOTAL, TOTAL_BROKEN, INTACT).code == 1
+
+
+def test_the_order_of_the_replacements_does_not_change_the_mutant(run) -> None:
+    # The main pattern is the later one in the file: the edits are applied in
+    # the order of the text, not of the command line, or the file is scrambled.
+    reversed_order = run(
+        CALC_FILE, TOTAL, TOTAL_BROKEN, INTACT, "--also", CALC_FILE, SUM, SUM_BROKEN
+    )
+    assert reversed_order.code == 0, reversed_order.out + reversed_order.err
+
+
+def test_a_file_given_under_two_spellings_is_edited_once_with_both_replacements(
+    run, repo
+) -> None:
+    # Grouped by the string, the second spelling would write its own text over
+    # the first one's: the copy would hold one edit and the test would survive.
+    absolute = ("--also", str(repo / CALC_FILE), TOTAL, TOTAL_BROKEN)
+    result = run(CALC_FILE, SUM, SUM_BROKEN, INTACT, *absolute)
+    assert result.code == 0, result.out + result.err
+
+
+def test_two_replacements_in_two_files_land_in_the_same_copy(
+    run, repo, scratch
+) -> None:
+    before = tree_hash(repo)
+    result = run(
+        CALC_FILE,
+        SUM,
+        SUM_BROKEN,
+        ADD_SUMS,
+        "--also",
+        "tests/helpers.py",
+        "EXPECTED = 5",
+        "EXPECTED = 6",
+        "--keep",
+    )
+    assert result.code == 0, result.out + result.err
+    (copy,) = scratch.glob("smc-mutant-*/repo")
+    assert SUM_BROKEN in (copy / CALC_FILE).read_text(encoding="utf-8")
+    helpers = copy / "tests" / "helpers.py"
+    assert helpers.read_text(encoding="utf-8") == "EXPECTED = 6\n"
+    assert tree_hash(repo) == before
+
+
+def test_several_replacements_make_one_baseline_and_one_mutated_run(
+    mutant, repo, scratch, monkeypatch, capsys
+) -> None:
+    seen = []
+
+    def stub(command, cwd, env, timeout_s, log_path):
+        seen.append((cwd / CALC_FILE).read_text(encoding="utf-8"))
+        if len(seen) == 1:
+            return mutant.ChildRun(0, False, "1 passed in 0.1s\n", 0.1)
+        return mutant.ChildRun(1, False, "1 failed in 0.1s\n", 0.1)
+
+    monkeypatch.setattr(mutant, "run_child", stub)
+    argv = ["--root", str(repo), *ALSO_TOTAL, "--", CALC_FILE, SUM, SUM_BROKEN, INTACT]
+    assert mutant.main(argv) == 0
+    capsys.readouterr()
+    mutated = CALC.replace(SUM, SUM_BROKEN).replace(TOTAL, TOTAL_BROKEN)
+    assert seen == [CALC, mutated]
+
+
+@pytest.mark.parametrize(
+    ("main_old", "also_old", "message"),
+    [
+        (
+            SUM,
+            "return a * b",
+            "replacement 2 of 2 ('return a * b'): pattern found 0 times "
+            "in src/pkg/calc.py (expected exactly 1)",
+        ),
+        (
+            "return a / b",
+            TOTAL,
+            "replacement 1 of 2 ('return a / b'): pattern found 0 times "
+            "in src/pkg/calc.py (expected exactly 1)",
+        ),
+        (
+            SUM,
+            "a + b",
+            "replacement 2 of 2 ('a + b'): pattern found 2 times "
+            "in src/pkg/calc.py (lines 2, 6)",
+        ),
+    ],
+    ids=["second missing", "first missing", "second twice"],
+)
+def test_a_replacement_not_found_exactly_once_is_no_verdict_and_is_named(
+    run, scratch, main_old, also_old, message
+) -> None:
+    also = ("--also", CALC_FILE, also_old, "x")
+    result = run(CALC_FILE, main_old, "return a % b", INTACT, *also)
+    assert result.code == 2
+    assert message in result.err
+    assert "KILLED" not in result.out
+    assert "SURVIVED" not in result.out
+    assert list(scratch.iterdir()) == []
+
+
+def test_a_run_with_one_replacement_keeps_its_messages(run) -> None:
+    result = run(CALC_FILE, "return a * b", "return a - b", ADD_RUNS)
+    assert result.code == 2
+    assert result.err.startswith("ERROR: pattern found 0 times in src/pkg/calc.py")
+
+
+def test_replacements_match_the_original_text_not_the_previous_one(run) -> None:
+    # "a * b" exists only in what the main replacement inserts.
+    also = ("--also", CALC_FILE, "a * b", "a / b")
+    result = run(CALC_FILE, SUM, "return a * b  # sum", ADD_RUNS, *also)
+    assert result.code == 2
+    assert "replacement 2 of 2 ('a * b'): pattern found 0 times" in result.err
+
+
+@pytest.mark.parametrize(
+    "also_old",
+    ["a + b  # sum", SUM, "def add(a, b):\n    return a"],
+    ids=["inside the first", "the same", "from before the first"],
+)
+def test_overlapping_replacements_are_refused(run, scratch, also_old) -> None:
+    also = ("--also", CALC_FILE, also_old, "x")
+    result = run(CALC_FILE, SUM, SUM_BROKEN, ADD_RUNS, *also)
+    assert result.code == 2
+    assert "replacements 1 and 2 overlap in src/pkg/calc.py" in result.err
+    assert "SURVIVED" not in result.out
+    assert list(scratch.iterdir()) == []
+
+
+def test_replacements_that_touch_without_overlapping_are_accepted(run, scratch) -> None:
+    also = ("--also", CALC_FILE, " > 0:", " < 0:")
+    result = run(CALC_FILE, "while n", "while not n", ADD_RUNS, *also, "--keep")
+    assert result.code == 1, result.out + result.err
+    (kept,) = scratch.glob("smc-mutant-*/repo/src/pkg/calc.py")
+    assert "    while not n < 0:\n" in kept.read_text(encoding="utf-8")
+
+
+def test_the_report_line_names_every_replacement(run) -> None:
+    several = run(CALC_FILE, SUM, SUM_BROKEN, INTACT, *ALSO_TOTAL)
+    first = f"{CALC_FILE}: {SUM!r} -> {SUM_BROKEN!r}"
+    second = f"{CALC_FILE}: {TOTAL!r} -> {TOTAL_BROKEN!r}"
+    assert f"{first} + {second}  [{INTACT}]" in several.out
+    # One replacement prints what it always printed.
+    one = run(CALC_FILE, SUM, SUM_BROKEN, ADD_SUMS)
+    assert f"KILLED   {first}  [{ADD_SUMS}]" in one.out
+
+
+# --- a pattern from a file ----------------------------------------------------
+
+
+class PatternFiles(NamedTuple):
+    old: Path
+    new: Path
+
+
+@pytest.fixture
+def pattern_files(tmp_path: Path) -> PatternFiles:
+    directory = tmp_path / "patterns"
+    directory.mkdir()
+    return PatternFiles(directory / "old.txt", directory / "new.txt")
+
+
+def test_a_pattern_read_from_a_file_may_span_several_lines(
+    run_argv, pattern_files
+) -> None:
+    pattern_files.old.write_bytes(b"def add(a, b):\n    return a + b  # sum")
+    pattern_files.new.write_bytes(b"def add(a, b):\n    return a - b  # sum")
+    result = run_argv(
+        f"--old-file={pattern_files.old}",
+        f"--new-file={pattern_files.new}",
+        "--",
+        CALC_FILE,
+        ADD_SUMS,
+    )
+    assert result.code == 0, result.out + result.err
+    assert result.out.startswith("KILLED")
+    assert result.out.isascii()
+    assert "\\n" in result.out
+
+
+def test_a_pattern_file_is_used_as_written_with_its_line_endings(
+    run_argv, repo, pattern_files
+) -> None:
+    (repo / "src" / "pkg" / "crlf.py").write_bytes(b"x = 1\r\ny = 2\r\n")
+    pattern_files.new.write_bytes(b"x = 1\r\ny = 9")
+    pattern_files.old.write_bytes(b"x = 1\ny = 2")
+    options = (f"--old-file={pattern_files.old}", f"--new-file={pattern_files.new}")
+    lf = run_argv(*options, "--", "src/pkg/crlf.py", ADD_RUNS)
+    assert lf.code == 2
+    assert "pattern found 0 times in src/pkg/crlf.py" in lf.err
+    pattern_files.old.write_bytes(b"x = 1\r\ny = 2")
+    crlf = run_argv(*options, "--", "src/pkg/crlf.py", ADD_RUNS)
+    assert crlf.code == 1, crlf.out + crlf.err
+
+
+def test_a_pattern_file_keeps_its_final_newline(
+    run_argv, repo, pattern_files, scratch
+) -> None:
+    (repo / "src" / "pkg" / "lines.py").write_bytes(b"x = 1\ny = 2\nz = 3\n")
+    pattern_files.old.write_bytes(b"y = 2\n")
+    pattern_files.new.write_bytes(b"y = 9\n\n")
+    result = run_argv(
+        f"--old-file={pattern_files.old}",
+        f"--new-file={pattern_files.new}",
+        "--keep",
+        "--",
+        "src/pkg/lines.py",
+        ADD_RUNS,
+    )
+    assert result.code == 1, result.out + result.err
+    (kept,) = scratch.glob("smc-mutant-*/repo/src/pkg/lines.py")
+    assert kept.read_bytes() == b"x = 1\ny = 9\n\nz = 3\n"
+
+
+@pytest.mark.parametrize("side", ["old", "new"])
+@pytest.mark.parametrize("kind", ["missing", "directory", "not utf-8"])
+def test_a_pattern_file_that_cannot_be_read_is_no_verdict_not_a_survivor(
+    run_argv, pattern_files, scratch, side, kind
+) -> None:
+    pattern_files.old.write_bytes(b"return a + b  # sum")
+    pattern_files.new.write_bytes(b"return a - b  # sum")
+    broken = getattr(pattern_files, side)
+    broken.unlink()
+    if kind == "directory":
+        broken.mkdir()
+    elif kind == "not utf-8":
+        broken.write_bytes(b"x = '\xe9'")
+    result = run_argv(
+        f"--old-file={pattern_files.old}",
+        f"--new-file={pattern_files.new}",
+        "--",
+        CALC_FILE,
+        ADD_RUNS,
+    )
+    # Raised outside the handler, the error would end the process with exit 1.
+    assert result.code == 2
+    assert broken.name in result.err
+    # The reader's own message, not the catch-all's "unexpected ..." one.
+    reason = " is not valid UTF-8 (" if kind == "not utf-8" else "ERROR: cannot read "
+    assert reason in result.err
+    assert f"--{side}-file {broken}" in result.err
+    assert "unexpected" not in result.err
+    assert "Traceback" not in result.err
+    assert "SURVIVED" not in result.out
+    assert list(scratch.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (
+            ["--old-file=o.txt", "--", CALC_FILE, "new", ADD_RUNS],
+            "--old-file and --new-file go together",
+        ),
+        (
+            ["--new-file=n.txt", "--", CALC_FILE, "old", ADD_RUNS],
+            "--old-file and --new-file go together",
+        ),
+        (
+            [
+                "--old-file=o.txt",
+                "--new-file=n.txt",
+                "--",
+                CALC_FILE,
+                SUM,
+                SUM,
+                ADD_RUNS,
+            ],
+            "with --old-file and --new-file give FILE TEST-ID",
+        ),
+        (["--", CALC_FILE, ADD_RUNS], "give FILE OLD NEW TEST-ID"),
+        (["--", CALC_FILE, SUM, SUM_BROKEN, ADD_RUNS, "extra"], "give FILE OLD NEW"),
+    ],
+    ids=["old-file alone", "new-file alone", "pair and four arguments", "two", "five"],
+)
+def test_the_forms_of_the_command_line_are_not_mixed(
+    mutant, repo, capsys, argv, message
+) -> None:
+    with pytest.raises(SystemExit) as exc:
+        mutant.main(["--root", str(repo), *argv])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert message in err
+    assert "Traceback" not in err
+
+
+def test_also_file_reads_both_patterns_from_files(
+    run_argv, repo, pattern_files, scratch
+) -> None:
+    # Some Pythons' argparse reads "-n_items" after `--also` as an option (3.10,
+    # 3.11 and 3.13.0 refuse it, later 3.13 and 3.14 take it: CI saw both, FM-102),
+    # so a test of the refusal is a test of the interpreter. Files carry it on all.
+    (repo / "src" / "pkg" / "dash.py").write_bytes(b"neg = -n_items\n")
+    pattern_files.old.write_bytes(b"-n_items")
+    pattern_files.new.write_bytes(b"+n_items")
+
+    result = run_argv(
+        "--also-file",
+        "src/pkg/dash.py",
+        str(pattern_files.old),
+        str(pattern_files.new),
+        "--keep",
+        "--",
+        CALC_FILE,
+        SUM,
+        SUM_BROKEN,
+        ADD_RUNS,
+    )
+    assert result.code == 1, result.out + result.err
+    (copy,) = scratch.glob("smc-mutant-*/repo")
+    assert (copy / "src" / "pkg" / "dash.py").read_bytes() == b"neg = +n_items\n"
+    assert SUM_BROKEN in (copy / CALC_FILE).read_text(encoding="utf-8")
+
+
+def test_an_also_file_pattern_that_cannot_be_read_is_no_verdict(
+    run_argv, pattern_files, scratch
+) -> None:
+    pattern_files.new.write_bytes(b"x")
+    result = run_argv(
+        "--also-file",
+        CALC_FILE,
+        str(pattern_files.old),
+        str(pattern_files.new),
+        "--",
+        CALC_FILE,
+        SUM,
+        SUM_BROKEN,
+        ADD_RUNS,
+    )
+    assert result.code == 2
+    assert "old.txt" in result.err
+    assert list(scratch.iterdir()) == []
+
+
+# --- what the adversarial review of #177 found ----------------------------------
+
+
+def test_three_replacements_in_one_file_are_all_applied_in_any_order(run) -> None:
+    # test_add_total_or_countdown_is_intact fails only when all three edits are
+    # there: a third edit that is dropped, or edits written in command-line
+    # order instead of text order, cannot kill it. The main one is the middle
+    # of the file, the first --also the last, the second the first.
+    edits = [
+        ("--also", CALC_FILE, COUNTDOWN, COUNTDOWN_BROKEN),
+        ("--also", CALC_FILE, SUM, SUM_BROKEN),
+    ]
+    all_three = run(CALC_FILE, TOTAL, TOTAL_BROKEN, INTACT3, *edits[0], *edits[1])
+    assert all_three.code == 0, all_three.out + all_three.err
+    pairs = [(SUM, SUM_BROKEN), (TOTAL, TOTAL_BROKEN), (COUNTDOWN, COUNTDOWN_BROKEN)]
+    for left in range(3):
+        two = [pair for number, pair in enumerate(pairs) if number != left]
+        (old, new), (also_old, also_new) = two
+        result = run(
+            CALC_FILE, old, new, INTACT3, "--also", CALC_FILE, also_old, also_new
+        )
+        assert result.code == 1, f"without {pairs[left]}: {result.out}{result.err}"
+
+
+def test_overlap_of_the_second_and_third_regions_is_found_though_the_first_only_touches(
+    run, scratch
+) -> None:
+    # Sorted by position: A ends where B starts, and C starts inside B. Only a
+    # check of every neighbouring pair sees B and C; comparing each region with
+    # the first one builds a scrambled file.
+    first = "def add(a, b):\n    "
+    second = "return a + b  #"
+    third = "a + b  # sum"
+    also = ("--also", CALC_FILE, second, "x", "--also", CALC_FILE, third, "y")
+    result = run(CALC_FILE, first, "def plus(x, y):\n    ", ADD_RUNS, *also)
+    assert result.code == 2
+    assert "replacements 2 and 3 overlap in src/pkg/calc.py" in result.err
+    assert "SURVIVED" not in result.out
+    assert list(scratch.iterdir()) == []
+
+
+def test_the_report_orders_the_main_replacement_then_also_then_also_file(
+    run, pattern_files
+) -> None:
+    pattern_files.old.write_bytes(COUNTDOWN.encode())
+    pattern_files.new.write_bytes(COUNTDOWN_BROKEN.encode())
+    also = ("--also", CALC_FILE, TOTAL, TOTAL_BROKEN)
+    from_files = (
+        "--also-file",
+        CALC_FILE,
+        str(pattern_files.old),
+        str(pattern_files.new),
+    )
+    result = run(CALC_FILE, SUM, SUM_BROKEN, INTACT3, *from_files, *also)
+    assert result.code == 0, result.out + result.err
+    pairs = [(SUM, SUM_BROKEN), (TOTAL, TOTAL_BROKEN), (COUNTDOWN, COUNTDOWN_BROKEN)]
+    shown = " + ".join(f"{CALC_FILE}: {old!r} -> {new!r}" for old, new in pairs)
+    assert f"{shown}  [{INTACT3}]" in result.out
+
+
+def test_a_missing_also_file_pattern_is_numbered_after_the_also_ones(
+    run, pattern_files
+) -> None:
+    pattern_files.old.write_bytes(b"return nothing")
+    pattern_files.new.write_bytes(b"return something")
+    also = ("--also", CALC_FILE, TOTAL, TOTAL_BROKEN)
+    from_files = (
+        "--also-file",
+        CALC_FILE,
+        str(pattern_files.old),
+        str(pattern_files.new),
+    )
+    result = run(CALC_FILE, SUM, SUM_BROKEN, INTACT, *from_files, *also)
+    assert result.code == 2
+    assert "replacement 3 of 3 ('return nothing'): pattern found 0 times" in result.err
+
+
+def test_a_relative_pattern_file_is_read_from_the_current_directory(
+    run_argv, pattern_files, monkeypatch
+) -> None:
+    # The repository is --root, somewhere else: only the current directory has
+    # old.txt and new.txt.
+    pattern_files.old.write_bytes(SUM.encode())
+    pattern_files.new.write_bytes(SUM_BROKEN.encode())
+    monkeypatch.chdir(pattern_files.old.parent)
+    result = run_argv(
+        "--old-file", "old.txt", "--new-file", "new.txt", CALC_FILE, ADD_SUMS
+    )
+    assert result.code == 0, result.out + result.err
+
+
+@pytest.mark.parametrize(
+    ("also", "message"),
+    [
+        ((".git/x.txt", "a", "b"), ".git/x.txt is in a place the copy leaves out"),
+        (("local/x.txt", "a", "b"), "local/x.txt is in a place the copy leaves out"),
+        (("src/pkg", "a", "b"), "src/pkg is not a file in the repository"),
+        ((CALC_FILE, "", "b"), "old is empty: there is nothing to replace"),
+        ((CALC_FILE, "same", "same"), "old and new are the same: that is no mutant"),
+    ],
+    ids=[".git", "local", "a directory", "empty old", "old is new"],
+)
+def test_a_further_replacement_gets_the_checks_of_the_first_and_is_named(
+    run, scratch, also, message
+) -> None:
+    result = run(CALC_FILE, SUM, SUM_BROKEN, INTACT, "--also", *also)
+    assert result.code == 2
+    assert f"replacement 2 of 2 ({also[1]!r}): {message}" in result.err
+    assert "unexpected" not in result.err
+    assert "KILLED" not in result.out
+    assert "SURVIVED" not in result.out
+    assert list(scratch.iterdir()) == []
+
+
+@pytest.mark.parametrize("side", ["old", "new"])
+@pytest.mark.parametrize("kind", ["missing", "directory", "not utf-8"])
+def test_an_also_file_pattern_that_cannot_be_read_is_named_by_the_reader(
+    run_argv, pattern_files, scratch, side, kind
+) -> None:
+    pattern_files.old.write_bytes(b"return a + b + 1")
+    pattern_files.new.write_bytes(b"return a + b + 2")
+    broken = getattr(pattern_files, side)
+    broken.unlink()
+    if kind == "directory":
+        broken.mkdir()
+    elif kind == "not utf-8":
+        broken.write_bytes(b"x = '\xe9'")
+    result = run_argv(
+        "--also-file",
+        CALC_FILE,
+        str(pattern_files.old),
+        str(pattern_files.new),
+        "--",
+        CALC_FILE,
+        SUM,
+        SUM_BROKEN,
+        ADD_RUNS,
+    )
+    assert result.code == 2
+    reason = "is not valid UTF-8 (" if kind == "not utf-8" else "ERROR: cannot read "
+    assert reason in result.err
+    assert f"--also-file {broken}" in result.err
+    assert "unexpected" not in result.err
+    assert list(scratch.iterdir()) == []
+
+
+def test_an_also_file_pattern_is_used_as_written_with_its_line_endings(
+    run_argv, repo, pattern_files
+) -> None:
+    (repo / "src" / "pkg" / "crlf.py").write_bytes(b"x = 1\r\ny = 2\r\n")
+    pattern_files.old.write_bytes(b"x = 1\r\ny = 2")
+    pattern_files.new.write_bytes(b"x = 1\r\ny = 9")
+    result = run_argv(
+        "--also-file",
+        "src/pkg/crlf.py",
+        str(pattern_files.old),
+        str(pattern_files.new),
+        "--",
+        CALC_FILE,
+        SUM,
+        SUM_BROKEN,
+        ADD_RUNS,
+    )
+    assert result.code == 1, result.out + result.err
+
+
+# --- one file under two names ---------------------------------------------------
+
+
+def test_one_file_under_two_names_is_refused_not_edited_twice(
+    run, repo, scratch
+) -> None:
+    # A hard link is the portable stand-in for "SRC/PKG/CALC.PY" on a volume
+    # that folds case: two paths that are not equal and are one file.
+    twin = repo / "src" / "pkg" / "calc_twin.py"
+    try:
+        os.link(repo / CALC_FILE, twin)
+    except OSError as exc:
+        pytest.skip(f"no hard links here: {exc}")
+    result = run(
+        CALC_FILE,
+        SUM,
+        SUM_BROKEN,
+        INTACT,
+        "--also",
+        "src/pkg/calc_twin.py",
+        TOTAL,
+        TOTAL_BROKEN,
+    )
+    assert result.code == 2
+    assert "src/pkg/calc.py and src/pkg/calc_twin.py are the same file" in result.err
+    assert "SURVIVED" not in result.out
+    assert list(scratch.iterdir()) == []
+
+
+# --- what a Windows editor does to a pattern file --------------------------------
+
+
+def test_a_pattern_with_the_other_line_endings_is_told_so(run, repo) -> None:
+    # An LF pattern against a CRLF file (a Windows checkout) and the reverse.
+    (repo / "src" / "pkg" / "crlf.py").write_bytes(b"x = 1\r\ny = 2\r\n")
+    lf_pattern = run("src/pkg/crlf.py", "x = 1\ny = 2", "x = 1\ny = 9", ADD_RUNS)
+    assert lf_pattern.code == 2
+    assert "the pattern has LF line endings and src/pkg/crlf.py has CRLF" in (
+        lf_pattern.err
+    )
+    (repo / "src" / "pkg" / "lf.py").write_bytes(b"x = 1\ny = 2\n")
+    crlf_pattern = run("src/pkg/lf.py", "x = 1\r\ny = 2", "x = 1\r\ny = 9", ADD_RUNS)
+    assert crlf_pattern.code == 2
+    assert "the pattern has CRLF line endings and src/pkg/lf.py has LF" in (
+        crlf_pattern.err
+    )
+
+
+def test_a_pattern_file_with_a_byte_order_mark_is_told_so(
+    run_argv, pattern_files
+) -> None:
+    # PowerShell 5.1's `Set-Content -Encoding UTF8` writes EF BB BF first.
+    pattern_files.old.write_bytes(b"\xef\xbb\xbf" + SUM.encode())
+    pattern_files.new.write_bytes(b"\xef\xbb\xbf" + SUM_BROKEN.encode())
+    result = run_argv(
+        f"--old-file={pattern_files.old}",
+        f"--new-file={pattern_files.new}",
+        "--",
+        CALC_FILE,
+        ADD_SUMS,
+    )
+    assert result.code == 2
+    assert "pattern found 0 times in src/pkg/calc.py" in result.err
+    assert "starts with a byte-order mark: save it as UTF-8 without one" in result.err
+
+
+def test_a_pattern_that_is_simply_absent_gets_no_hint(run) -> None:
+    result = run(CALC_FILE, "def nothing(a):\n    return a", "x", ADD_RUNS)
+    assert result.code == 2
+    assert result.err == (
+        "ERROR: pattern found 0 times in src/pkg/calc.py (expected exactly 1)\n"
+    )
 
 
 # --- the command line, as a session uses it ---------------------------------

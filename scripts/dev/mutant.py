@@ -22,6 +22,26 @@ absolute path must lie inside it. ``<old>`` is matched as written, with no
 newline translation: in a CRLF file a pattern of several lines contains
 ``\\r\\n``. Put ``--`` before the arguments when a pattern starts with a dash.
 
+A mutant that needs several edits (a hoisting, a rename) is still one mutant,
+one baseline and one verdict: ``--also <file> <old> <new>``, repeatable, adds a
+replacement to the same copy (#177). Every pattern is matched against its file
+as it is on disk, never against what another replacement inserted, and must
+occur exactly once there; two patterns of a file may not overlap. The order of
+the options does not change the result. A pattern of several lines goes through
+a file instead of the shell's quoting, which a formatter's reflow or a Windows
+shell breaks (#13, #14)::
+
+    python scripts/dev/mutant.py --old-file old.txt --new-file new.txt <file> <test-id>
+    python scripts/dev/mutant.py --also-file <file> old2.txt new2.txt ... <file> <test-id>
+
+A pattern file is read as UTF-8, as written: an editor's final newline is part of
+the pattern, so give ``old`` and ``new`` the same ending. Its path is relative to
+the current directory and may lie anywhere (it is only read). ``--old-file`` and
+``--new-file`` come as a pair. ``--also`` may not carry a pattern that starts with
+a dash: whether argparse reads it as an option depends on the Python version
+(3.10, 3.11 and 3.13.0 refuse ``-x``, later 3.13 and 3.14 accept it), and ``--`` comes
+after the values. ``--also-file`` carries it on every version.
+
 The test is run twice: first on the unmutated copy. Without that baseline an
 interpreter without pytest (exit 1), a test that already fails, or one that is
 skipped (exit 0, as when the demo adapters are missing) would read as KILLED or
@@ -32,7 +52,8 @@ Exit codes, so that a loop over mutants can use them:
 
     0    KILLED    the test failed on the mutant: it can fail
     1    SURVIVED  the test passed on the mutant: it proves nothing about that line
-    2    ERROR     no verdict: a usage error, a pattern not found exactly once,
+    2    ERROR     no verdict: a usage error, a pattern not found exactly once
+                   or overlapping another, a pattern file that cannot be read,
                    a baseline that does not pass, a mutant pytest could not run,
                    a timeout (a hung test says nothing about its assertions)
     130  interrupted (the copy is removed first)
@@ -46,6 +67,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import itertools
 import math
 import os
 import re
@@ -122,14 +144,36 @@ class ChildRun:
 
 
 @dataclass(frozen=True)
-class Plan:
-    """Everything that is decided before anything is copied."""
+class Replacement:
+    """One edit of the mutant: ``old`` becomes ``new``, once, in ``rel``.
 
-    root: Path
+    ``number`` is its place on the command line (the main one, then ``--also``,
+    then ``--also-file``): it names the replacement in an error. ``where``
+    starts the message of an error that concerns this replacement alone, and is
+    empty for a mutant of one replacement, whose messages stay as they were.
+    """
+
+    number: int
     rel: PurePath
     old: str
     new: str
-    mutated: str
+    where: str = ""
+
+
+@dataclass(frozen=True)
+class Plan:
+    """Everything that is decided before anything is copied.
+
+    ``mutated`` holds the new text of each edited file, keyed by its path
+    relative to the root: a file is edited once, whatever the number of
+    replacements in it and whether its path is given relative or absolute. Two
+    paths that name one file on disk without being equal as paths (a case
+    variant on a case-insensitive volume, a hard link) are refused.
+    """
+
+    root: Path
+    replacements: tuple[Replacement, ...]
+    mutated: dict[PurePath, str]
     test_id: str
 
 
@@ -255,53 +299,177 @@ def pytest_command(test_id: str) -> list[str]:
 # --- before anything is copied ------------------------------------------------
 
 
-def mutated_text(root: Path, rel: PurePath, old: str, new: str) -> str:
-    """The file's text with ``old`` replaced by ``new``, once; nothing is written.
+def read_utf8(path: Path, name: str) -> str:
+    """The text of ``path`` as it is on disk; ``name`` says what it is in an error.
 
-    The original is read as it is on disk (UTF-8, ``newline=""``: a CRLF file
-    stays CRLF). Counting here, before any copy, means a stale pattern costs
-    nothing and cannot pass as "survived".
+    UTF-8 and ``newline=""``: a CRLF file stays CRLF, and a pattern file is used
+    as written. An unreadable file is a ``MutantError`` (exit 2): an exception
+    that escaped from here would end the process with exit 1, which is SURVIVED.
     """
-    if not old:
-        raise MutantError("old is empty: there is nothing to replace")
-    if old == new:
-        raise MutantError("old and new are the same: that is no mutant")
-    name = rel.as_posix()
     try:
-        with open(root / rel, encoding="utf-8", newline="") as handle:
-            text = handle.read()
+        with open(path, encoding="utf-8", newline="") as handle:
+            return handle.read()
     except UnicodeDecodeError as exc:
         raise MutantError(
             f"{name} is not valid UTF-8 ({exc.reason} at byte {exc.start})"
         ) from exc
     except OSError as exc:
         raise MutantError(f"cannot read {name}: {exc}") from exc
-    offsets = occurrences(text, old)
-    if len(offsets) != 1:
-        if not offsets:
-            raise MutantError(f"pattern found 0 times in {name} (expected exactly 1)")
-        lines = line_numbers(text, offsets)
-        shown = ", ".join(str(line) for line in lines[:5])
-        if len(lines) > 5:
-            shown += ", ..."
-        raise MutantError(
-            f"pattern found {len(offsets)} times in {name} (lines {shown}); "
-            "expected exactly 1: widen it"
+
+
+def absence_hint(name: str, text: str, old: str) -> str:
+    """The cause of a pattern that is nowhere in ``text``, when it is a usual one.
+
+    A pattern file written by a Windows editor or shell differs from the source
+    in two invisible ways: PowerShell 5.1's ``Set-Content -Encoding UTF8`` and an
+    old Notepad start it with a byte-order mark, and the pattern's line endings
+    are not the file's (a CRLF checkout, an LF pattern). Both ended in a bare
+    "found 0 times" and an hour of looking (#177 review). Empty when neither fits.
+    """
+    if old.startswith("\ufeff"):
+        return (
+            "; the pattern starts with a byte-order mark: save it as UTF-8 without one"
         )
-    start = offsets[0]
-    return text[:start] + new + text[start + len(old) :]
+    if "\r\n" in old and old.replace("\r\n", "\n") in text:
+        return f"; the pattern has CRLF line endings and {name} has LF"
+    if "\n" in old and "\r" not in old and old.replace("\n", "\r\n") in text:
+        return f"; the pattern has LF line endings and {name} has CRLF"
+    return ""
+
+
+def not_once_reason(name: str, text: str, offsets: Sequence[int], old: str) -> str:
+    """Why ``old``, found at ``offsets``, is not exactly one place in ``name``."""
+    if not offsets:
+        hint = absence_hint(name, text, old)
+        return f"pattern found 0 times in {name} (expected exactly 1){hint}"
+    lines = line_numbers(text, offsets)
+    shown = ", ".join(str(line) for line in lines[:5])
+    if len(lines) > 5:
+        shown += ", ..."
+    return (
+        f"pattern found {len(offsets)} times in {name} (lines {shown}); "
+        "expected exactly 1: widen it"
+    )
+
+
+def apply_replacements(name: str, text: str, edits: Sequence[Replacement]) -> str:
+    """``text`` with every replacement of one file applied; nothing is written.
+
+    Each pattern is searched in ``text`` as it is, not in the text another
+    replacement has already changed: a later pattern could otherwise match what
+    an earlier one inserted, and the result would depend on the order of the
+    options. Each must occur exactly once, and two may not overlap (the same
+    pattern twice included): a stale pattern costs nothing and cannot pass as
+    "survived". Regions that only touch are accepted.
+    """
+    spans = []
+    for edit in edits:
+        offsets = occurrences(text, edit.old)
+        if len(offsets) != 1:
+            reason = not_once_reason(name, text, offsets, edit.old)
+            raise MutantError(edit.where + reason)
+        spans.append((offsets[0], offsets[0] + len(edit.old), edit))
+    spans.sort(key=lambda span: (span[0], span[2].number))
+    # If two regions overlap, two neighbours in this order do.
+    for (_, end, first), (start, _, second) in itertools.pairwise(spans):
+        if start < end:
+            numbers = sorted((first.number, second.number))
+            raise MutantError(
+                f"replacements {numbers[0]} and {numbers[1]} overlap in {name}: "
+                "each pattern must keep to its own text"
+            )
+    pieces = []
+    position = 0
+    for start, end, edit in spans:
+        pieces.append(text[position:start])
+        pieces.append(edit.new)
+        position = end
+    pieces.append(text[position:])
+    return "".join(pieces)
+
+
+def given_replacements(args: argparse.Namespace) -> list[tuple[str, str, str]]:
+    """What the command line asks for, as (file, old, new) with the texts read.
+
+    The main replacement first, then ``--also``, then ``--also-file``. Read here
+    and not in ``parse_args``: an error raised there is not caught by ``main``.
+    """
+
+    def pattern(path: str, option: str) -> str:
+        return read_utf8(Path(path), f"{option} {path}")
+
+    if args.old_file is None:
+        main = (args.file, args.old, args.new)
+    else:
+        main = (
+            args.file,
+            pattern(args.old_file, "--old-file"),
+            pattern(args.new_file, "--new-file"),
+        )
+    also = [(file, old, new) for file, old, new in args.also]
+    also_files = [
+        (file, pattern(old, "--also-file"), pattern(new, "--also-file"))
+        for file, old, new in args.also_file
+    ]
+    return [main, *also, *also_files]
+
+
+def check_replacement(
+    root: Path, number: int, total: int, given: tuple[str, str, str]
+) -> Replacement:
+    """One replacement of the command line, checked as the single one always was."""
+    file, old, new = given
+    where = "" if total == 1 else f"replacement {number} of {total} ({shorten(old)}): "
+    rel = resolve_in_repo(root, file, "file")
+    if is_ignored(rel):
+        raise MutantError(f"{where}{rel.as_posix()} is in a place the copy leaves out")
+    if not (root / rel).is_file():
+        raise MutantError(f"{where}{rel.as_posix()} is not a file in the repository")
+    if not old:
+        raise MutantError(f"{where}old is empty: there is nothing to replace")
+    if old == new:
+        raise MutantError(f"{where}old and new are the same: that is no mutant")
+    return Replacement(number, rel, old, new, where)
+
+
+def refuse_one_file_under_two_names(root: Path, files: Sequence[PurePath]) -> None:
+    """Two paths that are one file on disk would be two edits, the second lost.
+
+    The replacements are grouped by path, and ``Path`` compares by flavour, not
+    by file system: ``SRC/pkg/calc.py`` and ``src/pkg/calc.py`` are two keys on
+    macOS's default case-insensitive volume, and a hard link is another. The
+    second file written would silently replace the first one's text, and a mutant
+    with one edit instead of two reads as SURVIVED (#177 review). Windows folds
+    case in ``PureWindowsPath`` itself, so this is the net under the rest.
+    """
+    for number, first in enumerate(files):
+        for second in files[number + 1 :]:
+            if (root / first).samefile(root / second):
+                raise MutantError(
+                    f"{first.as_posix()} and {second.as_posix()} are the same "
+                    "file: give it under one spelling"
+                )
 
 
 def plan_run(args: argparse.Namespace) -> Plan:
     root = args.root.resolve()
     if not root.is_dir():
         raise MutantError(f"--root {args.root} is not a directory")
-    rel = resolve_in_repo(root, args.file, "file")
-    if is_ignored(rel):
-        raise MutantError(f"{rel.as_posix()} is in a place the copy leaves out")
-    if not (root / rel).is_file():
-        raise MutantError(f"{rel.as_posix()} is not a file in the repository")
-    mutated = mutated_text(root, rel, args.old, args.new)
+    given = given_replacements(args)
+    replacements = tuple(
+        check_replacement(root, number, len(given), item)
+        for number, item in enumerate(given, start=1)
+    )
+    by_file: dict[PurePath, list[Replacement]] = {}
+    for replacement in replacements:
+        by_file.setdefault(replacement.rel, []).append(replacement)
+    refuse_one_file_under_two_names(root, list(by_file))
+    mutated = {
+        rel: apply_replacements(
+            rel.as_posix(), read_utf8(root / rel, rel.as_posix()), edits
+        )
+        for rel, edits in by_file.items()
+    }
 
     path_part, rest = split_test_id(args.test_id)
     if not path_part:
@@ -309,7 +477,7 @@ def plan_run(args: argparse.Namespace) -> Plan:
     test_rel = resolve_in_repo(root, path_part, "test path")
     if is_ignored(test_rel) or not (root / test_rel).exists():
         raise MutantError(f"test path {test_rel.as_posix()} is not in the repository")
-    return Plan(root, rel, args.old, args.new, mutated, test_rel.as_posix() + rest)
+    return Plan(root, replacements, mutated, test_rel.as_posix() + rest)
 
 
 # --- the copy -----------------------------------------------------------------
@@ -505,7 +673,8 @@ def judge(plan: Plan, scratch: Path, args: argparse.Namespace) -> int:
     baseline = run_child(command, copy, env, args.timeout, log)
     check_baseline(baseline, plan, args.timeout)
 
-    write_mutant(copy / plan.rel, plan.mutated)
+    for rel, text in plan.mutated.items():
+        write_mutant(copy / rel, text)
     run = run_child(command, copy, env, args.timeout, log)
     note = f" ({run.note})" if run.note else ""
     if run.timed_out:
@@ -531,9 +700,12 @@ def judge(plan: Plan, scratch: Path, args: argparse.Namespace) -> int:
             tail(run.output),
         )
 
+    edits = " + ".join(
+        f"{edit.rel.as_posix()}: {shorten(edit.old)} -> {shorten(edit.new)}"
+        for edit in plan.replacements
+    )
     write_out(
-        f"{verdict:<8} {plan.rel.as_posix()}: {shorten(plan.old)} -> "
-        f"{shorten(plan.new)}  [{plan.test_id}]  "
+        f"{verdict:<8} {edits}  [{plan.test_id}]  "
         f"({last_line(run.output)}, {run.seconds:.1f} s){note}"
     )
     if args.verbose:
@@ -591,9 +763,14 @@ def default_root() -> Path:
 
 def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
+        usage=(
+            "mutant.py [options] FILE OLD NEW TEST-ID\n"
+            "       mutant.py [options] --old-file PATH --new-file PATH FILE TEST-ID"
+        ),
         description=(
             "Replace OLD by NEW once in FILE, in a scratch copy of the repository, "
-            "and run TEST_ID there: KILLED if it fails, SURVIVED if it passes."
+            "and run TEST-ID there: KILLED if it fails, SURVIVED if it passes. "
+            "--also adds replacements to the same copy."
         ),
         epilog=(
             "Exit codes: 0 KILLED, 1 SURVIVED, 2 no verdict (see the module "
@@ -603,9 +780,44 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         allow_abbrev=False,
     )
     parser.add_argument("file", help="file to mutate, from the repository root")
-    parser.add_argument("old", help="text to replace; must occur exactly once")
-    parser.add_argument("new", help="its replacement")
-    parser.add_argument("test_id", metavar="test-id", help="a pytest node id")
+    parser.add_argument(
+        "rest",
+        nargs="+",
+        metavar="ARGS",
+        help=(
+            "OLD NEW TEST-ID: the text to replace (it must occur exactly once), "
+            "its replacement, a pytest node id; with --old-file and --new-file "
+            "only TEST-ID"
+        ),
+    )
+    parser.add_argument(
+        "--old-file",
+        metavar="PATH",
+        help="read OLD from a UTF-8 file, as written (a pattern of several lines)",
+    )
+    parser.add_argument(
+        "--new-file", metavar="PATH", help="read NEW from a UTF-8 file, as written"
+    )
+    parser.add_argument(
+        "--also",
+        action="append",
+        nargs=3,
+        default=[],
+        metavar=("FILE", "OLD", "NEW"),
+        help=(
+            "one more replacement in the same copy; repeatable. An OLD that "
+            "starts with a dash is read as an option by some Python versions: "
+            "use --also-file"
+        ),
+    )
+    parser.add_argument(
+        "--also-file",
+        action="append",
+        nargs=3,
+        default=[],
+        metavar=("FILE", "OLD_FILE", "NEW_FILE"),
+        help="like --also, with OLD and NEW read from UTF-8 files; repeatable",
+    )
     parser.add_argument(
         "--keep", action="store_true", help="leave the copy in place and print its path"
     )
@@ -625,7 +837,24 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         default=default_root(),
         help="the repository to copy (default: the one this script lives in)",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    # The two forms of the command line are told apart here, before a file is
+    # read: an argparse error exits 2, like every other "no verdict".
+    if (args.old_file is None) != (args.new_file is None):
+        parser.error("--old-file and --new-file go together")
+    if args.old_file is None:
+        if len(args.rest) != 3:
+            parser.error(
+                "give FILE OLD NEW TEST-ID, or FILE TEST-ID with --old-file "
+                "and --new-file"
+            )
+        args.old, args.new, args.test_id = args.rest
+    else:
+        if len(args.rest) != 1:
+            parser.error("with --old-file and --new-file give FILE TEST-ID")
+        args.old = args.new = None
+        (args.test_id,) = args.rest
+    return args
 
 
 def main(argv: Sequence[str] | None = None) -> int:
