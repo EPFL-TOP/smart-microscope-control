@@ -244,8 +244,10 @@ Semantics every implementation must honour (these are the contract tests):
   reads and `stop()` are allowed (§13).
 - `stop()` sends the device's stop at once, without waiting for the
   microscope lock, even in dry-run (§13).
-- `Camera.pixel_size_um()` returns MMCore's value when > 0, else the
-  profile's value for the current objective label, else `0.0`.
+- `Camera.pixel_size_um()` returns MMCore's value when it is finite and > 0,
+  else the profile's value for the current objective label (at binning 1 and
+  a magnification factor of 1.0, so times the binning and divided by the
+  factor, m2 §8.10), else `0.0`.
 - Every reader tolerates a device that answers slowly but never swallows a
   failure silently: a failure propagates, as a `HardwareError` naming the
   role and the call when the device faulted (§2, #93); the *facade's*
@@ -406,7 +408,7 @@ class SafetySection(BaseModel):
 
 
 class CameraSection(BaseModel):
-    pixel_size_um: dict[str, float] = {}
+    pixel_size_um: dict[str, float] = {}  # at binning 1, magnification factor 1.0
 
 
 class Profile(BaseModel):
@@ -500,7 +502,7 @@ Core calls per method:
 | `Camera.snap` | `snapImage()` then `getImage()` (the core's current camera must be `label`); an action under the lock (§13) |
 | `Camera.exposure_ms` / `set_exposure_ms` | `getExposure()` / `setExposure(ms)` |
 | `Camera.image_shape` / `bit_depth` | `getImageHeight()`, `getImageWidth()` / `getImageBitDepth()` |
-| `Camera.pixel_size_um` | `getPixelSizeUm()`, fallback profile map by `objective_label()` |
+| `Camera.pixel_size_um` | `getPixelSizeUm()`, fallback profile map by `objective_label()`, times the binning, divided by `getMagnificationFactor()` (m2 §8.10) |
 | `Shutter.*` | `getShutterOpen(label)`, `setShutterOpen(label, b)` (closing is a safe call, §13), `getAutoShutter()`, `setAutoShutter(b)` |
 | `Properties.*` | `getLoadedDevices`, `getDevicePropertyNames`, `getProperty`, `setProperty`, `isPropertyReadOnly`, `hasPropertyLimits`, `getPropertyLowerLimit/UpperLimit`, `getAllowedPropertyValues` |
 
@@ -1004,7 +1006,8 @@ capability Protocol runs on every backend.
   - the exposure round-trips within 1 %;
   - `pixel_size_um()` is `0.0` or a positive finite number;
   - on the fake only, the pixel size falls back to the profile's value
-    for the current objective, scaled by the binning.
+    for the current objective, scaled by the binning and divided by the
+    magnification factor (m2 §8.10).
 - **Shutter**: open and close round-trip; auto-shutter round-trips.
 - **Properties**:
   - `devices()` is not empty and excludes `Core`;

@@ -2,8 +2,8 @@
 
 - **Status**: design for issue #13 (§1–§6, 2026-10-16); §3.3.1 and
   §3.11's stop rules decided in #144 (2026-10-18); §7 for #12
-  (2026-10-19); §8 for #14 (2026-10-19). #15 and #48 add their own
-  sections with their plans.
+  (2026-10-19); §8 for #14 (2026-10-19); §8.10 for #167 (2026-10-20). #15
+  and #48 add their own sections with their plans.
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1, this document is the contract between issues that are
   built in parallel. Names, module paths and signatures below are fixed; an
@@ -21,7 +21,7 @@ M2 brings the Nikon stands under the layer: the `Autofocus` capability and
 the Z interlock (#13), `ObjectiveTurret`, `LightSource` and `Channels`
 (#14), the stand knowledge from `nikon-control` (#12), the configuration
 builder (#15) and a truthful probe (#48). §1–§6 fix #13; §7 fixes #12;
-§8 fixes #14.
+§8 fixes #14; §9 fixes #48.
 
 Not in #13: one-shot autofocus (`fullFocus`), a CLI command for the
 autofocus, the piezo (§2), camera-clocked sequences, and the Zeiss
@@ -1117,7 +1117,8 @@ Measured on the demo on 2026-10-19 (pymmcore-plus 0.18.1, pymmcore
   configurations. `capture()` never calls it.
 - `getMagnificationFactor()` reads 1.0 on the demo. The Ti2-E's
   `IntermediateMagnification` (`Magnifier`, read-only, `1.0x` or `1.5x`)
-  divides the pixel size by 1.5, and no profile key accounts for it (#167).
+  divides the pixel size by 1.5; §8.10 says how the profile's sizes account
+  for it (#167).
 - **The Ti2-E's light** (session 0): `DiaLamp` is a `Shutter` whose
   `Intensity` is a free number (no limits; 501 was read), and it fills both
   the `shutter` role (the configuration's slot) and `light_source`. The
@@ -1245,10 +1246,10 @@ The `objective_turret` role; faults through `as_hardware_errors(core,
   `resume()` is called. Neither the emergency stop nor `close()` sends it
   anything.
 - `pixel_size_um(label=None)` returns the profile's `[camera]
-  pixel_size_um` for `label` (the current objective when `None`), and 0.0
-  when the profile has none. The value is at binning 1 and at an
-  intermediate magnification of 1.0× (#167). `Camera.pixel_size_um()` (M1
-  §3) is unchanged.
+  pixel_size_um` for `label` (the current objective when `None`) at binning
+  1, divided by the core's magnification factor (§8.10, #167), and 0.0 when
+  the profile has none or the factor is not a positive number.
+  `Camera.pixel_size_um()` (M1 §3) follows the same rule.
 
 ### 8.4 LightSource — `MMLightSource`
 
@@ -1589,8 +1590,9 @@ the filter turrets' labels, and the `Channel` group with `BF` copied from
   - on `fake` and `demo`, a select of another label returns it and reads
     back;
   - in dry-run, nothing turns;
-  - `pixel_size_um()` is 0.0 or the profile's value (0.65 on `fake` for
-    `Nikon 10X S Fluor`).
+  - `pixel_size_um()` is 0.0 or the profile's value divided by the
+    magnification factor (0.65 on `fake` for `Nikon 10X S Fluor`, whose
+    factor is 1.0).
 - `test_light_source.py`: `intensity_knob()` is `None` or names the role's
   device. Without a knob, `intensity_native()` is `None` and the set raises
   `HardwareError`. With a knob, setting the current value reads back. When
@@ -1626,4 +1628,384 @@ What the next Ti2-E session reads (#16):
 - that `current()` reads `BF` after `select("BF")`, which depends on
   what `DiaLamp`'s `Intensity` and `Camera-1`'s `Exposure` read back;
 - how long `setConfig` keeps `FilterTurret2` busy;
-- `getMagnificationFactor()` at each lever position (#167).
+- `getMagnificationFactor()` at each lever position (#167, §8.10): the
+  pixel-size fallbacks trust it.
+
+### 8.10 The magnification factor in the pixel size (#167)
+
+Extends §8.3 and M1 §3, §6, §8. It applies to both pixel sizes that the
+profile feeds: `Camera.pixel_size_um()` (its fallback) and
+`ObjectiveTurret.pixel_size_um()`.
+
+**Measured** on the demo on 2026-10-20 (pymmcore-plus 0.18.1), in throwaway
+cores:
+
+- The demo has no `Magnifier`, and `getMagnificationFactor()` reads 1.0.
+  `DemoCamera`'s `DOptovar` is a `Magnifier`: `Position` takes `1x` and
+  `1.6x`. At `1.6x` the factor reads 1.6 and `getPixelSizeUm()` reads 0.625,
+  the pixel-size preset's 1.0 divided by 1.6. Binning 2 doubles it (1.25).
+  Two optovars at `1.6x` read 2.56: the factor is the product of every
+  `Magnifier` device (FM-13). With no pixel-size preset, `getPixelSizeUm()`
+  reads 0.0 whatever the factor.
+- **MMCore passes an invalid factor on.** An optovar whose magnification is
+  0, -1.5, NaN or infinity gives a factor of that value, and
+  `getPixelSizeUm()` then reads infinity, -0.667, NaN or 0.0. Infinity is
+  greater than 0, so a check of `getPixelSizeUm() > 0` alone reports it as
+  measured.
+- The Ti2-E's `IntermediateMagnification` is a `Magnifier` (session 0). What
+  its factor reads at `1.0x` and at `1.5x` is **unknown** (§8.9).
+
+**The rule.** The profile's `[camera] pixel_size_um` is the size at binning 1
+and a magnification factor of 1.0, the convention of MMCore's own pixel-size
+presets. Wherever the layer uses it, it divides by the factor that MMCore
+reports, as MMCore does for its own value:
+
+- `Camera.pixel_size_um()`: MMCore's value when it is finite and above 0 (it
+  already includes the binning and the factor, so it is never divided
+  again); else the profile's value for the current objective times the
+  binning, divided by the factor.
+- `ObjectiveTurret.pixel_size_um(label)`: the profile's value for `label`
+  divided by the factor, for any label (the lever does not depend on the
+  objective). The factor is read only when the profile has a size for the
+  label, so an objective the profile lacks is 0.0 without a device read.
+- A factor that is not finite and above 0 gives 0.0 (unknown) and one WARNING
+  per call, like a bad profile entry. A factor that cannot be read raises
+  (`HardwareError` naming the role and `getMagnificationFactor()`, FM-79);
+  `Microscope.state()` is the tolerant layer.
+- **No profile key.** A stand whose changer MMCore cannot read (a manual tube
+  lens that is no `Magnifier` device) reads 1.0 and is wrong, and the layer
+  cannot know it: its sizes must be measured with the changer in place. A
+  size measured (#22) with the lever at 1.5× is entered multiplied by 1.5.
+  A key that names the factor of the calibration can come with #22.
+
+**Code.** A module function `_magnification_factor(core, for_what) -> float
+| None` in `backends/mm.py` (the factor, or `None` with the WARNING), called
+from both methods through the role's fault-translating core. In the
+turret it runs inside `Executor.read`. `FakeCore` gains
+`getMagnificationFactor()`, which multiplies `magnification[label]` (default
+1.0) over its `Magnifier` devices and raises a device's `failing` entry, and
+`demo_like(extra_devices=())`, which appends devices after the demo's own;
+`tests/test_fake_core_demo.py` compares the product with the demo's.
+
+**Not verified.** The factor on the Ti2-E at each lever position (§8.9). If
+`IntermediateMagnification` reads 1.0 at both, the layer still reports a
+1.5× too large size with the lever at 1.5×, and the fix is a pixel-size
+preset keyed to the lever in the stand's configuration, not code.
+
+## 9. A probe that tells the truth (#48)
+
+Extends M1 §10 and §7.6 of this document. **Status**: design for #48
+(2026-10-20). Sources: the demo (measured 2026-10-20, pymmcore-plus 0.18.1,
+pymmcore 12.5.0.75.0), session 0 on the Ti2-E (#126, the field note on #48)
+and `nikon-control` (`scope/discover.py`, `scope/config_build.py`, read
+2026-10-20). `smc discover --probe-adapter NAME` is the only command here
+that initialises devices; nothing in this section moves a stage.
+
+### 9.1 What is known
+
+Measured on the demo unless a line names another source.
+
+- **A hub lists its peripherals only after it initialises.** `SequenceTester`
+  lists one device, `THub` (Hub). `getInstalledDevices("THub")` before
+  `initializeDevice` raises `RuntimeError('Operation
+  (GetInstalledPeripheralNames) not permitted on uninitialized device')`;
+  after it, it returns a tuple of 14 names (`TCamera-0`, `TCamera-1`,
+  `TShutter-0`, `TShutter-1`, `TXYStage-0` … `TSwitcher-1`).
+  `getInstalledDeviceDescription` reads `N/A` for each, as on the Ti2-E.
+- **A peripheral loads by its name although the adapter does not list it.**
+  `loadDevice(name, "SequenceTester", "TCamera-0")` works, the loaded device
+  already has its type (`getDeviceType`), and with `setParentLabel` to the
+  hub all 14 initialise. The probe of #47 said `THub ok` and stopped.
+- **The listing and the report agree on the demo's other hub.** `DemoCamera`
+  lists 20 devices (`DHub` and 19); `DHub` reports the same 19 after it
+  initialises. `Utilities` lists no hub.
+- **Labels.** MMCore refuses a label that is empty, `Core`, or contains a
+  comma (`Device label "a,b" contains reserved characters`); `XYStage:XY:31`,
+  `a b` and `[x]` load. The probe uses the device name as the label, so a
+  refused label is that device's failure.
+- **A pre-init `Port`.** On a loaded, uninitialised device,
+  `hasProperty(label, "Port")`, `isPropertyPreInit(label, "Port")` and
+  `getProperty(label, "Port")` answer; `isPropertyPreInit` of a property the
+  device lacks raises `RuntimeError`. The only device with one on the demo
+  is `Utilities`' `Serial port DTR Shutter`: its `Port` reads `''`, not
+  `Undefined`, and it initialises with no port, with `Undefined` and with
+  `/dev/no-such-port` alike. `Undefined` is the issue's word for what the
+  serial adapters publish; no installed adapter here shows it.
+- **`argparse` and a port that starts with `-`.** `--port -x` is refused
+  (`expected one argument`); `--port=-x` gives `-x`, and `--port=` gives `''`.
+- **The Ti2-E** (session 0, #126): the hub `Ti2-E__0` reports 16 names, all
+  with the description `N/A`; the 16, loaded under the hub without being
+  initialised, gave all 16 types. The adapter lists two hubs, `Ti2-E__0` and
+  `Ti2-Simulator`; with the stand connected the simulator fails `(Error
+  message unavailable) (-10)`, which is expected. The probe of #47 said
+  `Ti2-E__0 ok`, no peripherals, `Notes (0)`. `HamamatsuHam_DCAM` fails
+  `Native module failed to load (6)` because DCAM-API is not installed; no
+  Hamamatsu is fitted.
+- **`nikon-control`** (read, not run): it initialises the hub, asks it
+  (`getInstalledDevices`), loads each name under it and reports the ones
+  that fail, and a hub that lists nothing falls back to the adapter's own
+  list.
+
+### 9.2 Models — `smc/discovery/models.py`
+
+```python
+ProbeStatus = Literal["ok", "failed", "not-probed"]
+ProbeSource = Literal["adapter", "hub", "both"]
+```
+
+```python
+class ProbedDevice(BaseModel):
+    name: str  # also its label in the throwaway core
+    type: str  # "Hub", "Camera"…; "Unknown" for a value MMCore gave and we lack
+    status: ProbeStatus
+    # who named it: the adapter's list, the hub's report, or both
+    source: ProbeSource = "adapter"
+    error: str | None = None  # failed: MMCore's own text, raw
+    reason: str | None = None  # not-probed: why nothing was tried
+    hint: str | None = None  # failed: what the error usually means (§9.4)
+    port: str | None = None  # the Port set before it initialised (--port)
+
+    @property
+    def ok(self) -> bool: ...  # status == "ok"; a property, not a JSON key
+```
+
+```python
+class ProbeResult(BaseModel):
+    adapter: str
+    devices: list[ProbedDevice] = Field(default_factory=list)
+    # the adapter could not be probed, or nothing below its hub was
+    error: str | None = None
+    notes: list[str] = Field(default_factory=list)  # one line each, §9.3
+    causes: list[str] = Field(default_factory=list)  # ordered, when a hub failed
+    complete: bool = True  # False: the child stopped before the last device (§9.5)
+```
+
+`AdapterInfo` gains `list_meaning: str | None = None` (§9.4). In
+`inventory.json`, `ProbedDevice` loses the key `ok` and gains `status`; no
+code reads the old key, and the survey folders are never committed.
+
+A `not-probed` row is not a failure and not a pass: nothing was tried, and
+`reason` says why. That is the whole point of the issue: a row never says
+`ok` for something nobody initialised.
+
+### 9.3 The walk — `smc/discovery/mm_inventory.py`
+
+```python
+def walk_adapter(
+    core: CMMCorePlus,
+    name: str,
+    *,
+    port: str | None = None,
+    progress: Callable[[str], None] | None = None,
+    checkpoint: Callable[[ProbeResult], None] | None = None,
+) -> ProbeResult: ...
+```
+
+```python
+def probe_adapter(
+    name: str,
+    *,
+    port: str | None = None,
+    progress: Callable[[str], None] | None = None,
+    checkpoint: Callable[[ProbeResult], None] | None = None,
+    core: CMMCorePlus | None = None,
+) -> ProbeResult: ...
+```
+
+`walk_adapter` works on a core the caller owns and **leaves every device it
+loaded loaded**, so that #15 (`smc config build`) builds on it and keeps what
+initialised. `probe_adapter` opens a `CMMCorePlus()` when `core` is `None`,
+walks, and releases the core in a `finally` (`close_core`), as today. `core`
+exists so that a test hands it a stub (FM-40: no test lists a vendor
+adapter). A new public name, `walk_adapter`, goes in `__all__`.
+
+The rules, in this order. Each device's row is appended as soon as the device
+is done (§9.5).
+
+1. **Nothing to probe.** Adapter not installed: `error="adapter not
+   installed"`. Enumeration error: `error` is that text. Nothing listed:
+   `error = f"{name} lists no devices: " + diagnosis.empty_list_meaning(name)`.
+   No row in any of the three.
+2. **Hubs first, one hub.** The listed devices of type `Hub`, in listing
+   order. Each one: `progress(f"probing {name}/{hub}")`, `loadDevice(hub,
+   name, hub)`, rule 3, `initializeDevice(hub)`. The first that initialises is
+   *the hub*; the others are not tried: `not-probed`, reason `hub <the hub>
+   of this adapter is already initialised; a probe connects one hub`. (The
+   Ti2-E lists the stand first and the simulator second; on the stand the
+   simulator is no longer tried, and when the stand is off and the simulator
+   runs, the stand's row is `failed` and a note says `hub <failed> did not
+   initialise but <hub> did: what follows is <hub>'s`.) A hub that raises is
+   `failed`, with MMCore's text in `error` and `hint` from §9.4.
+3. **A pre-init `Port`** (any device, hub or not), after `loadDevice` and
+   before `initializeDevice`: the device *needs a port* when
+   `core.hasProperty(label, "Port")` and `core.isPropertyPreInit(label,
+   "Port")` and `str(core.getProperty(label, "Port")).strip().casefold()` is
+   `""` or `"undefined"`. Without `port`: `not-probed`, reason `needs a port:
+   pass --port COMx to probe it`, and `initializeDevice` is never called.
+   With `port`: `core.setProperty(label, "Port", port)` first, the row's
+   `port` is set, and an exception from the set is `failed`. An exception
+   while *reading* the property counts as "needs no port": the device is
+   initialised, and a failure is reported raw (unknown beats guessed). When
+   `port` was given and no device needed it, a note: `--port <port> was not
+   used: no device of <name> needs a port`.
+4. **The hub's peripherals.** When a hub initialised:
+   `progress(f"probing {name}/{hub}: listing its peripherals")`, then
+   `reported = [str(n) for n in core.getInstalledDevices(hub)]`, without
+   duplicates and without a name already loaded. If the call raises, a note
+   `hub <hub> did not list its peripherals: <error>`, and `reported` is
+   empty.
+   - **`reported` is not empty**: the candidates are the reported names, in
+     the hub's order, `source` `both` when the adapter also lists the name
+     and `hub` when it does not. The listed non-hub devices the hub does not
+     report get a `not-probed` row, after the candidates, in listing order:
+     reason `listed by the adapter but not reported by the hub <hub>: not
+     attached, or not detected`. They are not initialised.
+   - **`reported` is empty and the adapter lists other devices**: those are
+     the candidates (`source` `adapter`), and a note `hub <hub> reports no
+     peripherals: the adapter's own list was probed`. Some hubs do not
+     detect, and their devices still work.
+   - **`reported` is empty and the adapter lists no other device**:
+     `error = f"hub {hub} initialised but reports no peripherals, and {name}
+     lists no other device: nothing below it was probed; " +
+     diagnosis.empty_list_meaning(name)`. The hub's row stays `ok`.
+
+   Each candidate: `progress(f"probing {name}/{device}")`, `loadDevice(device,
+   name, device)`, `setParentLabel(device, hub)`, rule 3, `initializeDevice`.
+   `type` is the listed one, or `device_type_name(core.getDeviceType(device))`
+   read after the load (`"Unknown"` when the load failed). Any `Exception` is
+   `failed`: `error` is `str(exc)`, `hint` is `error_hint(name, error)`.
+5. **No hub listed.** Every listed device is a candidate, with no parent
+   (`Utilities`; as today).
+6. **Hubs listed, none initialised.** Every listed non-hub device is
+   `not-probed`, reason `its hub <first listed hub> was not initialised`.
+   Nothing is loaded for them.
+7. **Causes.** `causes = diagnosis.hub_failure_causes(name)` when at least
+   one hub row is `failed`. A hub that `needs a port` is not a failure.
+8. **Order of the rows**: hubs (tried or not, in listing order), the
+   candidates in order, then the listed devices the hub does not report.
+9. `KeyboardInterrupt` and `SystemExit` pass through. Every other exception
+   of a single device is that device's `failed`.
+
+### 9.4 Diagnosis — `smc/discovery/diagnosis.py` (new)
+
+Pure: no `pymmcore_plus`, no pydantic. The Nikon registry
+(`smc.hardware.backends.nikon`) is imported **inside the functions**, never at
+module level: `nikon.py` imports `smc.discovery` (§7.3), so a module-level
+import closes a cycle.
+
+```python
+GENERIC_EMPTY_LIST: str
+GENERIC_HUB_CAUSES: tuple[str, ...]
+
+
+def empty_list_meaning(adapter: str) -> str: ...
+def listing_meaning(adapter: str, device_count: int) -> str | None: ...
+def hub_failure_causes(adapter: str) -> list[str]: ...
+def error_hint(adapter: str, error: str) -> str | None: ...
+```
+
+- `empty_list_meaning`: for a Nikon adapter (`stand_for_adapter`), the stand's
+  `empty_list_meaning` (§7.2); otherwise `GENERIC_EMPTY_LIST`: `the adapter
+  lists no devices: if it asks a vendor SDK what is attached, the SDK could
+  not be reached; otherwise this PC offers none`.
+- `listing_meaning`: `empty_list_meaning(adapter)` when `device_count` is 0;
+  the stand's `empty_list_meaning` for a Nikon stand whose list is fixed
+  (`dynamic` is False: it says the list proves nothing about what is
+  connected), whatever the count; otherwise `None`. `list_adapters` sets it
+  on each `AdapterInfo` it builds, and the report prints it (§9.6).
+- `hub_failure_causes`: for a Nikon adapter, `[ONE_CONNECTION, *stand.causes]`
+  (§7.2); otherwise `GENERIC_HUB_CAUSES`, in this order: another program holds
+  the device (vendor software, another smc or pymmcore session; close them and
+  run this again); the device or its controller is off, was powered in the
+  wrong order, or its cable, USB port or serial port is wrong; the vendor
+  driver or runtime DLL is missing, or is not the version the adapter was
+  built for (on Windows, `smc discover` shows what the loader says for an
+  adapter that fails to load). The texts may be reworded; the order may not.
+- `error_hint`: a table of `(fragment, hint)`, matched on `str.casefold`.
+  One entry today: `native module failed to load` → `the vendor runtime the
+  adapter wraps could not be loaded: it is not installed on this PC, or is
+  not the version the adapter was built for`, and for `HamamatsuHam` the
+  words `(DCAM-API)` are added. The only vendor runtime named is the one measured (#126);
+  another adapter gets the sentence without a name. No match: `None`.
+
+### 9.5 The child, the parent and `--port`
+
+- `check_port(port: str) -> str` in `mm_inventory.py`: the stripped value;
+  `ValueError` when it is empty, longer than 200 characters, or holds a
+  character below U+0020 or U+007F (FM-32, FM-78).
+- `mm_section(..., port: str | None = None)` adds `--port=<port>` to the
+  child's command as **one** argument (§9.1); `inventory(..., probe_port:
+  str | None = None)` passes it, and raises `ValueError` when `probe_port` is
+  given without `probe_adapter`.
+- `_mm_child.py` takes `--port` and calls `probe_adapter(args.probe,
+  port=args.port, progress=_progress, checkpoint=…)`. The checkpoint sets
+  `result.probe` to the snapshot it is given and writes the result file; an
+  `OSError` there is swallowed after a `_progress` line, since Windows
+  antivirus can hold a file just written (FM-24) and a failed intermediate
+  write must not end a probe. The final write is not guarded, as today.
+- **A partial result survives a crash (FM-02).** `walk_adapter` calls
+  `checkpoint` with a deep copy of the result, `complete=False`, once after
+  the listing and before the first device, and after every device row. The
+  value it returns has `complete=True`. A child that dies mid-probe leaves the
+  last checkpoint in the file: `mm_section` returns it (`probe` is `None` only
+  when the child died before the first checkpoint), and the note it already
+  adds names the device that was running. A Ti-E probe that crashes on
+  `TIDiaLamp` (§7.1) then keeps the other seventeen rows.
+
+### 9.6 Report — `smc/discovery/report.py`
+
+The `Probe of <adapter>` table has the columns `device`, `type`, `from`
+(`adapter`, `hub`, `both`), `result` and `detail`. `result` is `ok`, `FAILED`
+or `not probed`. `detail` is: for `failed`, `error`, then a dash and the
+`hint` when there is one; for `not-probed`, `reason`; for `ok` with a `port`,
+`port <port>`. When `complete` is False the title ends with the words `INCOMPLETE: the
+adapter child stopped before the last device`. After the table, in this
+order: the `ERROR` row as today when `error` is set; one line per
+note, `- <note>`; and, when `causes` is not empty, `In order of
+likelihood:` then one numbered line per cause, `1. <cause>`. An `AdapterInfo` with a `list_meaning` gets one
+row under its devices, `meaning: <text>`, in the `detail` column of the
+listing. Every cell and line is built with `_t` (text, never markup, FM-36).
+
+### 9.7 CLI — `smc discover`
+
+`--port TEXT`: the serial port for devices that need one. Without
+`--probe-adapter` it is a usage error (exit 2, `✗ --port needs
+--probe-adapter`); a value `check_port` refuses is a usage error with its
+message. The banner reads `Probing <adapter> (port <port>): the stand must be
+powered and its vendor software closed.` with `(port <port>)` only when given.
+The exit code of `discover` is unchanged: a probe that finds failures is a
+finding, not an error.
+
+### 9.8 Files and sequencing
+
+`smc/discovery/models.py`, `mm_inventory.py`, `_mm_child.py`, `report.py`,
+`__init__.py` (the `probe_port` argument), `diagnosis.py` (new), `cli.py` (the
+`discover` command only) and `docs/hardware/microscope-pc-setup.md`. After #12
+(merged). #159 edits `cli.py` too, in `doctor`, and #15 adds a command there:
+the plan of #15 waits for this one, since it reuses `walk_adapter`.
+
+### 9.9 Tests
+
+The plan of #48 names each test. In outline: a `_ProbeCore` stub in
+`tests/unit/test_probe_walk.py` carries every rule of §9.3 (a port that is
+`Undefined`, a hub that reports less than the adapter lists, a hub that will
+not initialise, two hubs, checkpoints); the demo shows the `SequenceTester`
+hub's 14 peripherals and `Utilities`' serial shutter, which needs a port; the
+pure module has its own unit test; `tests/test_discover.py`'s crash test now
+expects a partial probe, not `None`.
+
+### 9.10 Not verified
+
+- Everything on a real hub: that a Ti2 hub reports its 16 names through
+  `getInstalledDevices` *inside a probe* (session 0 did it in a script of its
+  own); that 16 initialisations fit the child's 180 s (`--timeout-s` raises
+  it); that the simulator is second in the real listing (§9.1 reads it from
+  #126's table), which rule 2 does not depend on.
+- The `Undefined` sentinel: no installed adapter here shows it (`Utilities`
+  shows `''`). Rule 3 treats both as unset.
+- That a serial adapter accepts the `Port` it is given: some adapters restrict
+  the allowed values of the property.
+- That Windows antivirus ever holds the result file between two checkpoints
+  (§9.5's guard is a precaution, FM-24).
+- What `TIDiaLamp` does inside a probe on the Ti-E (§7.1): the checkpoints
+  keep the other rows, and the crash itself is a Ti-E session's to read.
