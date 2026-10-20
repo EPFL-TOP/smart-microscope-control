@@ -403,7 +403,11 @@ class ObjectiveTurret(Protocol):
         ...
 
     def pixel_size_um(self, label: str | None = None) -> float:
-        """The profile's pixel size for ``label`` (default: current), at binning 1; ``0.0``: unknown."""
+        """The profile's pixel size for ``label`` (default: current), at binning 1; ``0.0``: unknown.
+
+        The profile's size is for a magnification factor of 1.0; the result is
+        divided by the core's factor (m2 §8.10), so it is for the stand as it is.
+        """
         ...
 
 

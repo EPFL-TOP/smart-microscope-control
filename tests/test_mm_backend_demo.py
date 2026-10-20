@@ -290,6 +290,21 @@ class TestOnDemoDevices:
         camera = _camera(demo_core, {"Nikon 10X S Fluor": 0.65}, "Nikon 10X S Fluor")
         assert camera.pixel_size_um() == pytest.approx(1.3)
 
+    def test_pixel_size_fallback_divides_by_a_magnifier(self, demo_core: Any) -> None:
+        # m2 §8.10, measured 2026-10-20: with the demo's optovar at 1.6x the
+        # factor reads 1.6, and MMCore divides its own size by it.
+        demo_core.loadDevice("Optovar", "DemoCamera", "DOptovar")
+        demo_core.initializeDevice("Optovar")
+        demo_core.setProperty("Optovar", "Position", "1.6x")
+        camera = _camera(demo_core, {"Nikon 10X S Fluor": 0.65}, "Nikon 10X S Fluor")
+        # MMCore's value already includes the factor: 1.0 / 1.6, not divided twice.
+        assert demo_core.getPixelSizeUm() == pytest.approx(1.0 / 1.6)
+        assert camera.pixel_size_um() == pytest.approx(1.0 / 1.6)
+        for name in demo_core.getAvailablePixelSizeConfigs():
+            demo_core.deletePixelSizeConfig(name)
+        assert demo_core.getPixelSizeUm() == 0
+        assert camera.pixel_size_um() == pytest.approx(0.65 / 1.6)
+
     @pytest.mark.parametrize("bad", [math.nan, math.inf, -0.65, 0.0])
     def test_pixel_size_bad_profile_entry_is_unknown(
         self, demo_core: Any, bad: float, caplog: pytest.LogCaptureFixture
@@ -450,6 +465,9 @@ class _BinningCore:
     def getPixelSizeUm(self) -> float:  # noqa: N802
         return 0.0
 
+    def getMagnificationFactor(self) -> float:  # noqa: N802
+        return 1.0
+
     def hasProperty(self, label: str, name: str) -> bool:  # noqa: N802
         return self.binning is not None
 
@@ -481,6 +499,29 @@ def test_pixel_size_fallback_reads_binning_or_reports_unknown(
         assert camera.pixel_size_um() == pytest.approx(expected)
     # Unknown is said out loud, not just returned as 0.0.
     assert ("cannot be read" in caplog.text) == (expected == 0.0)
+
+
+class _FaultingFactorCore(_BinningCore):
+    """A core whose magnification factor cannot be read."""
+
+    def getMagnificationFactor(self) -> float:  # noqa: N802
+        raise RuntimeError("no answer")
+
+
+def test_an_unreadable_binning_is_reported_before_the_magnification_factor_is_read(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # FM-43: both are wrong, and the step after the binning is observable. The
+    # binning comes first, so the answer is 0.0 with its warning only, not the
+    # HardwareError of the factor.
+    core: Any = _FaultingFactorCore("abc")
+    camera = MMCamera(core, "Cam", _executor(), {"10x": 0.5}, lambda: "10x")
+    with caplog.at_level(logging.WARNING, logger="smc.hardware.backends.mm"):
+        assert camera.pixel_size_um() == 0.0
+    assert caplog.messages == [
+        "camera 'Cam' binning 'abc' cannot be read as one integer factor; the "
+        "profile pixel size cannot be scaled, reporting 0.0 (unknown)."
+    ]
 
 
 def test_wait_times_out_cleanly() -> None:

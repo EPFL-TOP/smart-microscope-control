@@ -1733,6 +1733,30 @@ class MMAutofocus:
             return None
 
 
+def _magnification_factor(core: CMMCorePlus, for_what: str) -> float | None:
+    """The core's magnification factor, or ``None`` (with a warning) if it is not usable.
+
+    The factor is the product of every ``Magnifier`` device (the Ti2-E's
+    intermediate-magnification lever is one; FM-13), and MMCore divides its own
+    pixel size by it. It passes an invalid factor on (measured: 0, -1.5, NaN and
+    infinity all come back as read, and the size reads infinity, -0.667, NaN and
+    0.0), so a profile size divided by it would be wrong without a word: such a
+    factor is unknown, like a bad profile entry. ``core`` should be the role's
+    fault-translating core, so that a device that does not answer is a
+    ``HardwareError`` naming the role (FM-79).
+    """
+    factor = float(core.getMagnificationFactor())
+    if math.isfinite(factor) and factor > 0:
+        return factor
+    logger.warning(
+        "the magnification factor (the product of the Magnifier devices) reads "
+        "%r, not a positive number; reporting 0.0 (unknown) for %s",
+        factor,
+        for_what,
+    )
+    return None
+
+
 class MMCamera:
     """``Camera`` over the core's current camera.
 
@@ -1842,21 +1866,24 @@ class MMCamera:
     def pixel_size_um(self) -> float:
         """MMCore's calibrated value, else the profile's for the objective, else ``0.0``.
 
-        MMCore's value already includes binning; the profile map is for
-        binning 1, so the fallback is multiplied by the current binning. A
-        binning that cannot be read, or a map entry that is not a positive
-        finite number, gives ``0.0`` (unknown) with a warning rather than a
-        pixel size that looks measured but is wrong. A device that fails to
-        answer raises, as every reader does (design §3); the facade's
+        MMCore's value already includes binning and the magnification factor,
+        so it is never divided again. The profile map is for binning 1 and a
+        factor of 1.0 (m2 §8.10), so the fallback is multiplied by the current
+        binning and divided by the factor. A binning that cannot be read, a
+        factor that is not a positive number, or a map entry that is not a
+        positive finite number, gives ``0.0`` (unknown) with a warning rather
+        than a pixel size that looks measured but is wrong. A device that fails
+        to answer raises, as every reader does (design §3); the facade's
         ``state()`` is the tolerant layer.
         """
 
         def action() -> float:
             # MMCore's value is for its current camera and binning; for another
-            # camera it would be a measurement of the wrong device.
+            # camera it would be a measurement of the wrong device. It reads
+            # infinity for a factor of 0, which is above 0 and not a size.
             self._check_current()
             measured = float(self._core.getPixelSizeUm())
-            if measured > 0:
+            if math.isfinite(measured) and measured > 0:
                 return measured
             objective = self._objective_label()
             if objective is None or objective not in self._pixel_sizes_um:
@@ -1874,7 +1901,10 @@ class MMCamera:
             binning = self._binning()
             if binning is None:
                 return 0.0
-            return at_bin_1 * binning
+            factor = _magnification_factor(self._core, f"objective {objective!r}")
+            if factor is None:
+                return 0.0
+            return at_bin_1 * binning / factor
 
         return self._executor.read(action)
 
@@ -2116,9 +2146,13 @@ class MMObjectiveTurret:
     def pixel_size_um(self, label: str | None = None) -> float:
         """The profile's ``[camera] pixel_size_um`` for ``label`` (default: the current one).
 
-        At binning 1 and an intermediate magnification of 1.0x (#167); ``0.0``
-        when the profile has none, or one that is not a positive number:
-        unknown, never guessed.
+        The profile's size is for binning 1 and a magnification factor of 1.0,
+        so it is divided by the core's factor (m2 §8.10, #167), for any label:
+        the Ti2-E's intermediate-magnification lever does not depend on the
+        objective. ``0.0`` (unknown, never guessed) when the profile has no
+        size for ``label`` (the factor is not read then), or one that is not a
+        positive number, or when the factor is not a positive number. A
+        factor that cannot be read raises, as every reader does (design §3).
         """
         objective = self.current() if label is None else label
         size = self._pixel_sizes_um.get(objective)
@@ -2133,7 +2167,12 @@ class MMObjectiveTurret:
                 size,
             )
             return 0.0
-        return float(size)
+        factor = self._executor.read(
+            lambda: _magnification_factor(self._core, f"objective {objective!r}")
+        )
+        if factor is None:
+            return 0.0
+        return float(size) / factor
 
 
 #: What a property that sets how bright is called, best first (m2 §8.4).
