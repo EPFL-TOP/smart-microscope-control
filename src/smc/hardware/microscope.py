@@ -520,13 +520,14 @@ class Microscope:
         try:
             self.core.setAutoFocusDevice(label)
         except Exception as exc:
+            # Text, never the error: its traceback holds the core (FM-92).
             log.warning(
                 "autofocus: the core's AutoFocus slot names %r and cannot be pointed "
                 "at %r (%s); every autofocus call and every Z move will be "
                 "refused. Fix the autofocus role under [roles.assign]",
                 current,
                 label,
-                exc,
+                str(exc),
             )
             return
         log.info(
@@ -720,12 +721,13 @@ class Microscope:
             try:
                 self.core.unloadAllDevices()
             except Exception as exc:
+                # Text, never the error: its traceback holds the facade (FM-92).
                 log.error(
-                    "%s: unloading the devices failed (%r); the stand may still "
+                    "%s: unloading the devices failed (%s); the stand may still "
                     "be connected, so restart the program before another one "
                     "connects to it",
                     self.profile.microscope.name,
-                    exc,
+                    repr(exc),
                 )
             self._closed = True
         finally:
@@ -872,6 +874,8 @@ def _read(name: str, read: Callable[[], R], errors: list[str]) -> R | None:
     try:
         return read()
     except Exception as exc:
-        errors.append(f"{name}: {type(exc).__name__}: {exc}")
-        log.debug("state: %s read failed", name, exc_info=True)
+        detail = f"{type(exc).__name__}: {exc}"
+        errors.append(f"{name}: {detail}")
+        # Text, never the error: a record that keeps it keeps its traceback (FM-92).
+        log.debug("state: %s read failed (%s)", name, detail)
         return None

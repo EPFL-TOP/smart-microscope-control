@@ -173,9 +173,8 @@ class _FaultTranslator:
         shown = ", ".join(
             [*map(repr, args), *(f"{k}={v!r}" for k, v in kwargs.items())]
         )
-        detail = str(exc) or type(exc).__name__
         message = (
-            f"{self._role}: {name}({shown}) failed ({detail}); check the device: "
+            f"{self._role}: {name}({shown}) failed ({_named(exc)}); check the device: "
             "power, cable, another program holding it"
         )
         # An adapter's bytes may not be UTF-8 (FM-05): one lone surrogate and
@@ -529,8 +528,15 @@ def _yes_no(value: bool | None) -> str:
 
 
 def _named(failure: BaseException) -> str:
-    """``failure`` for a message: an interrupt's ``str()`` is empty, so its type names it."""
-    return str(failure) or type(failure).__name__
+    """``failure`` for a message: an interrupt's ``str()`` is empty, so its type names it.
+
+    Also when ``str()`` itself fails: a log line or a read that is unknown
+    "never an error" must not become one (#166).
+    """
+    try:
+        return str(failure) or type(failure).__name__
+    except Exception:
+        return type(failure).__name__
 
 
 def _check_autofocus_slot(core: CMMCorePlus, label: str) -> None:
@@ -645,8 +651,13 @@ class _EndedByAZStop:
     landed move ended meanwhile would otherwise report "left off" while
     the switch-off is still on its way, and may yet fail. A block that a
     halt or a Ctrl-C ended does not wait: it goes on at once, with what
-    is known by then. When the switch-off failed, or had not returned in
-    time, it may
+    is known by then. Nor does one that comes during the wait: a halt is
+    read from the stand's halted state at each poll, since the Z stop has
+    already ended the block with a plain ``MotionStoppedError`` by the time
+    the emergency stop comes (the call then reports the switch-off as not
+    returned yet, and cannot know whether the halt's own worked); a Ctrl-C
+    is decided as one that ended the block, so that its WARNING is logged
+    (#166). When the switch-off failed, or had not returned in time, it may
     still be on: no "left off" is claimed, the "may still move Z" WARNING
     is logged, and the call raises ``MotionStoppedError`` naming Z and
     the failure, chained from whatever ended the block (m2 §3.3.1).
@@ -773,20 +784,14 @@ class _EndedByAZStop:
                 urgent = isinstance(exc, MicroscopeHaltedError) or not isinstance(
                     exc, Exception
                 )
-                failure = (
-                    autofocus._z_stop_failure(stopped, wait=not urgent)
-                    if stopped.fired
-                    else None
-                )
+                failure = self._outcome(wait=not urgent) if stopped.fired else None
                 if failure is not None:
                     autofocus._log_not_switched_off(description, failure)
                     if urgent or isinstance(exc, DeviceTimeoutError):
                         return
                     error = autofocus._not_switched_off(name, description, failure)
                     raise error from exc
-                if isinstance(exc, MicroscopeHaltedError) or not isinstance(
-                    exc, Exception
-                ):
+                if urgent:
                     autofocus._log_left_off(description, exc)
                     return  # a halt stays a halt, a Ctrl-C a Ctrl-C
                 error = autofocus._z_stopped(name, description)
@@ -794,7 +799,7 @@ class _EndedByAZStop:
                 raise error from exc
             if stopped.fired:
                 # It locked, then the stop switched it off: not a success.
-                failure = autofocus._z_stop_failure(stopped, wait=True)
+                failure = self._outcome(wait=True)
                 if failure is not None:
                     autofocus._log_not_switched_off(description, failure)
                     error = autofocus._not_switched_off(name, description, failure)
@@ -806,6 +811,23 @@ class _EndedByAZStop:
             # `error` is raised through this frame: kept here, it would be on
             # its own traceback (FM-98). `failure`, chained to it, goes with it.
             del failure, error
+
+    def _outcome(self, *, wait: bool) -> BaseException | None:
+        """The Z stop's switch-off outcome; a Ctrl-C in the wait is decided as one that ended the block.
+
+        The wait is the one place where a Ctrl-C can come after the block
+        ended, and the exception would otherwise leave before any WARNING
+        said that the switch-off had not returned (#166). The nested decision
+        sees an interrupt: no wait, the WARNING of what is known, and it
+        returns; the interrupt goes on. Python deletes ``interrupt`` at the
+        end of the clause, on the bare ``raise`` too: bound to no other
+        local (FM-98).
+        """
+        try:
+            return self._autofocus._z_stop_failure(self._stopped, wait=wait)
+        except BaseException as interrupt:
+            self._decide(interrupt, refused=False)
+            raise
 
     def _close(self) -> None:
         """The compound reads no more: drop what would keep the core in a cycle.
@@ -942,9 +964,10 @@ class MMAutofocus:
         """``is_in_range()`` for a message: a failed read is unknown here, never an error."""
         try:
             return self._read_in_range()
-        except Exception:
+        except Exception as exc:
+            # Text, never the error: a record that keeps it keeps its traceback (FM-92).
             logger.debug(
-                "autofocus %s: in-range read failed", self._label, exc_info=True
+                "autofocus %s: in-range read failed (%s)", self._label, _named(exc)
             )
             return None
 
@@ -1284,19 +1307,21 @@ class MMAutofocus:
         stop: the compound reports the switch-off's outcome, and the offset
         stop's goes to the stopping caller. An interrupt in the switch-off
         is recorded as its failure, since whether it went out is then
-        unknown. It takes no lock that a handler re-entering this thread
-        could already hold (FM-70), and never the microscope lock: the
-        compound waits for it while holding that lock.
+        unknown, and is re-raised once the offset stop has been sent, as
+        ``Executor._stop_linked`` does: the offset device, which PFS follows,
+        is stopped past it (FM-62, #166). It takes no lock that a handler
+        re-entering this thread could already hold (FM-70), and never the
+        microscope lock: the compound waits for it while holding that lock.
         """
         failure: Exception | None = None
+        interrupted: BaseException | None = None
         try:
             try:
                 self._executor.safe(self._off, lambda: None)
             except Exception as exc:
                 stopped.switch_off_failure = failure = exc
             except BaseException as exc:
-                stopped.switch_off_failure = exc
-                raise
+                stopped.switch_off_failure = interrupted = exc
             finally:
                 stopped.finished = True
                 # The compound reads it no more: this thread finished last, so
@@ -1308,11 +1333,13 @@ class MMAutofocus:
                     self._executor.stop(self._offset_motion)
                 except Exception as exc:
                     failure = failure or exc
+            if interrupted is not None:
+                raise interrupted
             if failure is not None:
                 raise failure
         finally:
-            # Raised through this frame, it is on its own traceback (FM-98).
-            del failure
+            # Raised through this frame, they are on its own traceback (FM-98).
+            del failure, interrupted
 
     def _z_stop_failure(self, stopped: _ZStop, *, wait: bool) -> BaseException | None:
         """What the Z stop's switch-off raised, once it has returned; waited for, bounded (FM-97).
@@ -1322,16 +1349,20 @@ class MMAutofocus:
         claim nobody checked. The wait polls in short sleeps, which a Ctrl-C
         interrupts on Windows too (FM-83). Without ``wait`` (a halt or an
         interrupt ended the call, and goes on at once), the outcome is what
-        is known now.
+        is known now. A halt that comes during the wait cuts it as well: the
+        stand's halted state is read at each poll, because the Z stop has
+        already ended the block with a plain ``MotionStoppedError`` by the
+        time the emergency stop comes, and the halt switches PFS off itself
+        (#166). The read takes no lock (FM-70).
         """
         wait_s = float(Z_STOP_OUTCOME_WAIT_S)  # at call time, so a test can shorten it
         deadline = time.monotonic() + (wait_s if wait else 0.0)
         while not stopped.finished:
+            if not wait or self._executor.halted:
+                return DeviceTimeoutError("its switch-off had not returned yet")
             if time.monotonic() >= deadline:
                 return DeviceTimeoutError(
                     f"its switch-off had not returned after {wait_s:g} s"
-                    if wait
-                    else "its switch-off had not returned yet"
                 )
             time.sleep(POLL_INTERVAL_S)
         return stopped.switch_off_failure
@@ -1697,8 +1728,8 @@ class MMAutofocus:
             return None
         try:
             return focus.position_um()
-        except Exception:
-            logger.debug("autofocus %s: Z read failed", self._label, exc_info=True)
+        except Exception as exc:
+            logger.debug("autofocus %s: Z read failed (%s)", self._label, _named(exc))
             return None
 
 

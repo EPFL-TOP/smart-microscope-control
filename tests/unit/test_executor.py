@@ -1615,6 +1615,50 @@ def test_a_failed_stop_still_ends_the_move_as_stopped() -> None:
     assert isinstance(mover.error, MotionStoppedError)
 
 
+def test_a_failed_stop_logs_the_error_as_text_not_as_the_object(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # FM-92, #166: a record that keeps the error keeps its traceback, which
+    # holds the stopping frame and, through it, the core, until the cyclic
+    # collector. The line itself is unchanged: `%s` of `repr(error)`.
+    def stop_that_fails() -> None:
+        raise RuntimeError("no answer")
+
+    z = Motion(device="Z", name="z Z", is_busy=lambda: False, stop=stop_that_fails)
+    with (
+        caplog.at_level(logging.WARNING, logger=LOGGER.name),
+        pytest.raises(RuntimeError, match="no answer"),
+    ):
+        _ex().stop(z)
+    (record,) = (r for r in caplog.records if r.name == LOGGER.name)
+    assert record.getMessage() == "z Z: stop failed (RuntimeError('no answer'))"
+    assert not any(isinstance(arg, BaseException) for arg in record.args or ())
+    assert record.exc_info is None
+
+
+class _UnshowableError(Exception):
+    def __repr__(self) -> str:
+        raise ValueError("repr of the error failed")
+
+
+def test_a_failed_stop_whose_error_cannot_be_shown_still_raises_that_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # #166: the line's text is built before it is logged, where `logging` used
+    # to swallow a formatting failure; `_send_safe` never raises the stop's
+    # error itself, and must not raise another in its place.
+    def stop_that_fails() -> None:
+        raise _UnshowableError("no answer")
+
+    z = Motion(device="Z", name="z Z", is_busy=lambda: False, stop=stop_that_fails)
+    with (
+        caplog.at_level(logging.WARNING, logger=LOGGER.name),
+        pytest.raises(_UnshowableError, match="no answer"),
+    ):
+        _ex().stop(z)
+    assert "z Z: stop failed (<_UnshowableError: its repr failed>)" in caplog.messages
+
+
 class _OrderHandler(logging.Handler):
     """Records, for each WARNING, how many stops the device had seen by then."""
 

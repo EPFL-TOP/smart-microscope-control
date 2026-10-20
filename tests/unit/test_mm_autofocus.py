@@ -2692,6 +2692,58 @@ def test_an_interrupted_z_stop_switch_off_is_reported_as_one_that_may_have_faile
         monkeypatch.setattr(stand.core, "enableContinuousFocus", switch)
 
 
+@pytest.mark.parametrize("offset_stop", ["works", "fails"])
+@pytest.mark.parametrize("call", sorted(_OFFSET_CALLS))
+def test_an_interrupted_z_stop_switch_off_still_stops_the_offset_device(
+    call: str, offset_stop: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # FM-62, #166: `Executor._stop_linked` holds an interrupt until the later
+    # stops are sent; this link's own stop raised it at once, and PFSOffset,
+    # which PFS follows, was left moving. The held interrupt wins over a
+    # failure of the offset stop (a stopping caller that catches `Exception`
+    # must not carry on after a Ctrl-C).
+    move, description = _OFFSET_CALLS[call]
+    with _ti2(core=_at_offset(7800.0)) as stand:
+        stand.engage_directly()
+        af, z, switch = stand.af, stand.z, stand.core.enableContinuousFocus
+
+        def interrupted(enable: bool) -> None:
+            if enable:
+                switch(True)
+                return
+            stand.core.log.append(OFF)
+            raise KeyboardInterrupt
+
+        _offset_busy_until_stopped(stand, monkeypatch)
+        if offset_stop == "fails":
+            offset_stop_arrives = stand.core.stop
+
+            def offset_stop_fails(label: str) -> None:
+                offset_stop_arrives(label)
+                if label == "PFSOffset":
+                    raise RuntimeError("PFSOffset: no answer")
+
+            monkeypatch.setattr(stand.core, "stop", offset_stop_fails)
+        sent = ["setPosition('PFSOffset', 7801.0)"]
+        mover = _Thread(lambda: move(af))
+        _wait_for(
+            _sent_and_waiting(stand, sent, "autofocus_offset PFSOffset"), "offset"
+        )
+        monkeypatch.setattr(stand.core, "enableContinuousFocus", interrupted)
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                z.stop()
+        finally:
+            # Restored before `close()`, and the move released: without the
+            # fix nothing stops the offset device, which stays busy.
+            monkeypatch.setattr(stand.core, "enableContinuousFocus", switch)
+            stand.core.busy_devices.discard("PFSOffset")
+            mover.join()
+        assert stand.core.log == [*sent, OFF, "stop('PFSOffset')", "stop('ZDrive')"]
+        assert isinstance(mover.error, MotionStoppedError)
+        assert str(mover.error) == _not_switched_off(description, "KeyboardInterrupt")
+
+
 def _hung_switch_off(stand: Stand, release: threading.Event) -> Callable[[bool], None]:
     """The Z stop's switch-off: PFS locks (the caller's block ends), then it hangs until ``release``.
 
@@ -2788,6 +2840,188 @@ def test_a_ctrl_c_that_ends_the_call_after_a_z_stop_does_not_wait_for_its_outcom
         assert stopper.error is None
         # The give-up's switch-off, then the Z stop's once released, then Z.
         assert stand.core.log == [ON, OFF, OFF, "stop('ZDrive')"]
+
+
+_NOT_RETURNED_YET = (
+    "autofocus PFS: the Z stop during autofocus: engage could not switch it off "
+    "(its switch-off had not returned yet); it may still move Z"
+)
+
+
+def test_a_halt_after_a_z_stop_does_not_wait_for_the_z_stops_outcome(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #166: the Z stop moves PFS's generation before it sends its switch-off,
+    # so the lock wait ends with a plain `MotionStoppedError` and the
+    # emergency stop comes during the outcome wait. The halt returned at
+    # once, but the caller waited the whole of `Z_STOP_OUTCOME_WAIT_S`, under
+    # the microscope lock, for a switch-off that the halt does itself.
+    monkeypatch.setattr(mm, "Z_STOP_OUTCOME_WAIT_S", 2 * JOIN_S)
+    with _ti2() as stand:
+        stand.core.autofocus_lockable = False
+        af, z = stand.af, stand.z
+        release, reached = threading.Event(), threading.Event()
+        hangs = _hung_switch_off(stand, release)
+
+        def noted(enable: bool) -> None:
+            if not enable:
+                reached.set()
+            hangs(enable)
+
+        with caplog.at_level(logging.WARNING):
+            waiter = _Thread(lambda: af.engage(timeout_s=2 * JOIN_S))
+            _wait_for(_sent_and_waiting(stand, [ON], "autofocus PFS"), "the lock wait")
+            monkeypatch.setattr(stand.core, "enableContinuousFocus", noted)
+            stopper = _Thread(z.stop)
+            _wait_for(reached.is_set, "the Z stop's switch-off")
+            stand.microscope.stop()
+            # Against a wait of 10 s, ended while the Z stop's switch-off hangs.
+            ended = waiter.finished_within(1.0)
+            release.set()
+            stopper.join()
+            waiter.join()
+        stand.microscope.resume()
+        assert ended, "the call waited for the Z stop's outcome after the halt"
+        assert isinstance(waiter.error, MotionStoppedError)
+        assert str(waiter.error) == _not_switched_off(
+            "autofocus: engage", "its switch-off had not returned yet"
+        )
+        assert _NOT_RETURNED_YET in caplog.messages
+        assert not any("left off" in m for m in caplog.messages)
+
+
+def test_a_halt_during_the_wait_for_the_z_stops_outcome_ends_it_at_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The same, without a timing margin: the halt comes in the first poll's
+    # sleep, so the next poll must read it. The Z stop's generation move
+    # ended the lock wait, which the error's cause shows (measured, #166).
+    monkeypatch.setattr(mm, "Z_STOP_OUTCOME_WAIT_S", 2 * JOIN_S)
+    sleeps: list[float] = []
+    with _ti2() as stand:
+        stand.core.autofocus_lockable = False
+        af, z = stand.af, stand.z
+        release, reached = threading.Event(), threading.Event()
+        hangs = _hung_switch_off(stand, release)
+
+        def noted(enable: bool) -> None:
+            if not enable:
+                reached.set()
+            hangs(enable)
+
+        def halted_in_the_first_poll(seconds: float) -> None:
+            sleeps.append(seconds)
+            if len(sleeps) == 1:
+                # The halt's own switch-off must not be the one that hangs.
+                _wait_for(reached.is_set, "the Z stop's switch-off")
+                stand.microscope.stop()
+            time.sleep(seconds)
+
+        waiter = _Thread(lambda: af.engage(timeout_s=2 * JOIN_S))
+        _wait_for(_sent_and_waiting(stand, [ON], "autofocus PFS"), "the lock wait")
+        monkeypatch.setattr(stand.core, "enableContinuousFocus", noted)
+        monkeypatch.setattr(
+            mm,
+            "time",
+            SimpleNamespace(monotonic=time.monotonic, sleep=halted_in_the_first_poll),
+        )
+        stopper = _Thread(z.stop)
+        ended = waiter.finished_within(1.0)
+        release.set()
+        stopper.join()
+        waiter.join()
+        stand.microscope.resume()
+        assert ended, "the call kept polling after the halt"
+        assert sleeps == [mm.POLL_INTERVAL_S]
+        assert isinstance(waiter.error, MotionStoppedError)
+        assert str(waiter.error) == _not_switched_off(
+            "autofocus: engage", "its switch-off had not returned yet"
+        )
+        assert isinstance(waiter.error.__cause__, MotionStoppedError)
+        assert waiter.error.__cause__.device == "autofocus PFS"
+
+
+def test_a_ctrl_c_during_the_wait_for_the_z_stops_outcome_logs_that_pfs_may_still_move_z(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #166: the interrupt came out of the wait before any WARNING was written,
+    # while the switch-off had still not returned. It goes on at once, and is
+    # decided as an interrupt that ended the block (stubbed sleep: FM-83).
+    sleeps: list[float] = []
+
+    def interrupted(seconds: float) -> None:
+        sleeps.append(seconds)
+        raise KeyboardInterrupt
+
+    with _ti2() as stand:
+        stand.core.autofocus_lockable = False
+        af, z, release = stand.af, stand.z, threading.Event()
+        waiter = _Thread(lambda: af.engage(timeout_s=2 * JOIN_S))
+        _wait_for(_sent_and_waiting(stand, [ON], "autofocus PFS"), "the lock wait")
+        monkeypatch.setattr(
+            stand.core, "enableContinuousFocus", _hung_switch_off(stand, release)
+        )
+        monkeypatch.setattr(
+            mm, "time", SimpleNamespace(monotonic=time.monotonic, sleep=interrupted)
+        )
+        with caplog.at_level(logging.WARNING):
+            stopper = _Thread(z.stop)
+            waiter.join()
+            release.set()
+            stopper.join()
+        assert isinstance(waiter.error, KeyboardInterrupt)
+        assert sleeps == [mm.POLL_INTERVAL_S]
+        assert _NOT_RETURNED_YET in caplog.messages
+        assert not any("left off" in m for m in caplog.messages)
+        assert stand.microscope._executor._links == {}
+
+
+def test_a_ctrl_c_in_the_wait_after_a_block_that_ended_normally_logs_that_pfs_may_still_move_z(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The other call site of `_outcome` (adversarial review of #166): the
+    # offset move lands while the Z stop's switch-off hangs, so the block ends
+    # with no exception and the call waits for the outcome. A Ctrl-C there was
+    # decided by nothing: no WARNING that PFS may still move Z.
+    sleeps: list[float] = []
+
+    def interrupted(seconds: float) -> None:
+        sleeps.append(seconds)
+        raise KeyboardInterrupt
+
+    description = "autofocus_offset: move_to 7801.0 device units"
+    with _ti2(core=_at_offset(7800.0)) as stand:
+        stand.engage_directly()
+        af, z, release = stand.af, stand.z, threading.Event()
+        hangs = _hung_switch_off(stand, release)
+
+        def lands_then_hangs(enable: bool) -> None:
+            if not enable:
+                stand.core.busy_devices.discard("PFSOffset")  # the move lands
+            hangs(enable)
+
+        stand.core.busy_devices.add("PFSOffset")
+        sent = ["setPosition('PFSOffset', 7801.0)"]
+        mover = _Thread(lambda: af.set_offset_native(7801.0))
+        _wait_for(
+            _sent_and_waiting(stand, sent, "autofocus_offset PFSOffset"), "offset"
+        )
+        monkeypatch.setattr(stand.core, "enableContinuousFocus", lands_then_hangs)
+        monkeypatch.setattr(
+            mm, "time", SimpleNamespace(monotonic=time.monotonic, sleep=interrupted)
+        )
+        with caplog.at_level(logging.WARNING):
+            stopper = _Thread(z.stop)
+            mover.join()
+            release.set()
+            stopper.join()
+        assert isinstance(mover.error, KeyboardInterrupt)
+        assert sleeps == [mm.POLL_INTERVAL_S]
+        assert (
+            f"autofocus PFS: the Z stop during {description} could not switch it "
+            "off (its switch-off had not returned yet); it may still move Z"
+        ) in caplog.messages
+        assert not any("left off" in m for m in caplog.messages)
 
 
 def test_a_slow_offset_stop_after_a_z_stop_switch_off_that_worked_says_left_off(
@@ -2978,6 +3212,29 @@ def test_a_slot_that_cannot_take_the_role_is_a_warning_not_a_failed_open(
         )
         for m in caplog.messages
     )
+    assert _logged_exception_objects(caplog) == []  # text, not the error (FM-92)
+
+
+def test_a_close_whose_unload_fails_logs_the_error_as_text_not_as_the_object(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # FM-92, #166: a kept record held the error, whose traceback holds the
+    # facade, and through it the core. The line itself is unchanged.
+    core = _ti2_core()
+    microscope = Microscope.from_core(cast("CMMCorePlus", core), _profile())
+
+    def unload_fails() -> None:
+        raise RuntimeError("unload: no answer")
+
+    core.unloadAllDevices = unload_fails  # type: ignore[method-assign]
+    with caplog.at_level(logging.ERROR, logger="smc"):
+        microscope.close()
+    assert [m for m in caplog.messages if "unloading the devices" in m] == [
+        "ti2e-fake: unloading the devices failed (RuntimeError('unload: no "
+        "answer')); the stand may still be connected, so restart the program "
+        "before another one connects to it"
+    ]
+    assert _logged_exception_objects(caplog) == []
 
 
 def test_autofocus_call_refused_when_the_slot_names_another_device() -> None:
@@ -3104,6 +3361,68 @@ def test_a_failed_in_range_read_is_unknown_in_messages_never_an_error(
         "switched off",
         f"autofocus PFS: no lock within 0.2 s {ASSUMED}; in range: yes; switched off",
     ]
+
+
+def test_a_failed_in_range_read_logs_no_exception_object(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # FM-92, #166: the DEBUG line passed `exc_info=True`, and the record kept
+    # the error and its traceback on the stop and engage paths.
+    def unreadable() -> bool | None:
+        raise HardwareError("PFS: no answer")
+
+    with _ti2() as stand:
+        af = stand.microscope.require(Autofocus)
+        assert isinstance(af, mm.MMAutofocus)
+        monkeypatch.setattr(af, "_read_in_range", unreadable)
+        with caplog.at_level(logging.DEBUG, logger="smc"):
+            assert af._in_range_for_message() is None
+        assert [m for m in caplog.messages if "in-range read failed" in m] == [
+            "autofocus PFS: in-range read failed (PFS: no answer)"
+        ]
+        assert _logged_exception_objects(caplog) == []
+
+
+class _UnreadableError(Exception):
+    def __str__(self) -> str:
+        raise ValueError("str of the error failed")
+
+
+def test_an_in_range_read_whose_error_cannot_be_shown_is_still_unknown_not_an_error(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #166: the text is built before the line is logged, where `logging` used
+    # to swallow a formatting failure; "a failed read is unknown here, never
+    # an error" holds for an error that cannot even be shown.
+    def unreadable() -> bool | None:
+        raise _UnreadableError
+
+    with _ti2() as stand:
+        af = stand.microscope.require(Autofocus)
+        assert isinstance(af, mm.MMAutofocus)
+        monkeypatch.setattr(af, "_read_in_range", unreadable)
+        with caplog.at_level(logging.DEBUG, logger="smc"):
+            assert af._in_range_for_message() is None
+        assert "autofocus PFS: in-range read failed (_UnreadableError)" in (
+            caplog.messages
+        )
+
+
+def test_a_failed_z_read_for_an_error_message_logs_no_exception_object(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The same rule, at the other place that read a value for an error (#166).
+    with _ti2() as stand:
+        af = stand.microscope.require(Autofocus)
+        assert isinstance(af, mm.MMAutofocus)
+        stand.core.failing["ZDrive"] = RuntimeError("ZDrive: no answer")
+        with caplog.at_level(logging.DEBUG, logger="smc"):
+            assert af._z_or_none() is None
+        stand.core.failing.clear()
+        (read,) = (m for m in caplog.messages if "Z read failed" in m)
+        assert read.startswith("autofocus PFS: Z read failed (")
+        assert "ZDrive: no answer" in read
+        assert _logged_exception_objects(caplog) == []
 
 
 @pytest.mark.parametrize(
@@ -3350,6 +3669,41 @@ def test_state_lists_a_failed_autofocus_read_as_an_error() -> None:
         f"autofocus: HardwareError: autofocus: isContinuousFocusLocked{tail}",
     ]
     assert state.z_um == 0.0  # one failing device hides no other
+
+
+def _logged_exception_objects(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The records of ``smc`` that keep an exception: ``exc_info``, or one among the arguments.
+
+    A record that keeps an error keeps its traceback, whose frames hold the
+    stopping thread's locals and, through them, the core (FM-92).
+    """
+    kept = []
+    for record in caplog.records:
+        if not record.name.startswith("smc"):
+            continue
+        args = record.args if isinstance(record.args, tuple) else ()
+        if record.exc_info or any(isinstance(a, BaseException) for a in args):
+            kept.append(record.getMessage())
+    return kept
+
+
+def test_a_failed_state_read_logs_no_exception_object(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # #166: the DEBUG line of a failed read kept the error (`exc_info`).
+    with _ti2() as stand:
+        stand.core.failing["PFS"] = RuntimeError("PFS: no answer")
+        with caplog.at_level(logging.DEBUG, logger="smc"):
+            state = stand.microscope.state()
+        stand.core.failing.clear()
+    assert len(state.errors) == 2
+    read_failed = [m for m in caplog.messages if " read failed (" in m]
+    # The same text as `errors`, which is unchanged.
+    assert read_failed == [
+        f"state: {name} read failed ({detail})"
+        for name, detail in (e.split(": ", 1) for e in state.errors)
+    ]
+    assert _logged_exception_objects(caplog) == []
 
 
 def test_describe_shows_the_autofocus() -> None:
@@ -3978,6 +4332,176 @@ def test_a_z_stop_switch_off_that_fails_after_the_compound_stopped_waiting_frees
         "autofocus: engage", "its switch-off had not returned after 0.2 s"
     )
     assert stopper == _STUCK
+    alive = {"facade": weakref.ref(microscope), "core": weakref.ref(core)}
+    del microscope, core
+    assert {name: ref() is not None for name, ref in alive.items()} == {
+        "facade": False,
+        "core": False,
+    }
+
+
+def _z_stop_interrupted_in_its_switch_off(
+    core: FakeCore, microscope: Microscope
+) -> tuple[str, str, str]:
+    """A direct offset move whose Z stop's switch-off is interrupted; what the move raised.
+
+    Its own frame, for the same reason as ``_z_stop_a_compound``.
+    """
+    autofocus, z = microscope.require(Autofocus), microscope.require(ZStage)
+    switch = core.enableContinuousFocus
+    core.enableContinuousFocus(True)
+    core.busy_devices.add("PFSOffset")
+    core.log.clear()
+    mover = _Thread(lambda: autofocus.set_offset_native(7801.0))
+    _wait_for(
+        lambda: (
+            core.log == ["setPosition('PFSOffset', 7801.0)"]
+            and microscope.state().moving == ("autofocus_offset PFSOffset",)
+        ),
+        "the offset move",
+    )
+
+    def interrupted(enable: bool) -> None:
+        if enable:
+            switch(True)
+            return
+        core.log.append(OFF)
+        raise KeyboardInterrupt
+
+    core.enableContinuousFocus = interrupted  # type: ignore[method-assign]
+    with suppress(KeyboardInterrupt):
+        z.stop()
+    core.busy_devices.discard("PFSOffset")  # the fake's stop does not end the move
+    mover.join()
+    # Removed, not restored: the bound method assigned back is a cycle.
+    del core.enableContinuousFocus
+    raised = _described(mover.error)
+    mover.error = None
+    return raised
+
+
+def _z_stop_whose_outcome_wait_is_cut_short(
+    core: FakeCore,
+    microscope: Microscope,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> tuple[str, str, str]:
+    """A call ended by a Z stop whose switch-off hangs, then a halt or a Ctrl-C in the wait.
+
+    An engage, or, in ``"ctrl-c after the move landed"``, an offset move that
+    lands meanwhile: its block ends with no exception, which is the other call
+    site of ``_outcome``. Its own frame, as ``_z_stop_a_compound``. The stub
+    that ``mm.time`` is given holds the facade, so it is put back here, not at
+    the test's end.
+    """
+    autofocus, z = microscope.require(Autofocus), microscope.require(ZStage)
+    release, reached = threading.Event(), threading.Event()
+    hangs = _hung_switch_off(Stand(core, microscope), release)
+    landing = case == "ctrl-c after the move landed"
+
+    def noted(enable: bool) -> None:
+        if not enable:
+            if landing:
+                core.busy_devices.discard("PFSOffset")  # the move lands
+            reached.set()
+        hangs(enable)
+
+    def cut_in_the_first_poll(seconds: float) -> None:
+        # The halt's own switch-off must not be the one that hangs.
+        _wait_for(reached.is_set, "the Z stop's switch-off")
+        if case != "halt in the wait":
+            raise KeyboardInterrupt
+        microscope.stop()
+        time.sleep(seconds)
+
+    core.log.clear()
+    if landing:
+        core.enableContinuousFocus(True)
+        core.busy_devices.add("PFSOffset")
+        core.log.clear()
+        waiter = _Thread(lambda: autofocus.set_offset_native(7801.0))
+        sent, waits = ["setPosition('PFSOffset', 7801.0)"], "autofocus_offset PFSOffset"
+    else:
+        core.autofocus_lockable = False
+        waiter = _Thread(lambda: autofocus.engage(timeout_s=2 * JOIN_S))
+        sent, waits = [ON], "autofocus PFS"
+    _wait_for(
+        lambda: core.log == sent and microscope.state().moving == (waits,),
+        "the call's wait",
+    )
+    core.enableContinuousFocus = noted  # type: ignore[method-assign]
+    with monkeypatch.context() as patched:
+        patched.setattr(
+            mm,
+            "time",
+            SimpleNamespace(monotonic=time.monotonic, sleep=cut_in_the_first_poll),
+        )
+        stopper = _Thread(z.stop)
+        waiter.join()
+        release.set()
+        stopper.join()
+    # Removed, not restored: the bound method assigned back is a cycle.
+    del core.enableContinuousFocus
+    if case == "halt in the wait":
+        microscope.resume()
+    raised = _described(waiter.error)
+    waiter.error = stopper.error = None
+    return raised
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "interrupted switch-off",
+        "halt in the wait",
+        "ctrl-c in the wait",
+        "ctrl-c after the move landed",
+    ],
+)
+def test_a_z_stop_interrupted_or_halted_frees_its_core_without_the_cyclic_collector(
+    no_cyclic_gc: None,
+    no_kept_log_records: None,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    # FM-92, #166: the stop paths this fix added (an interrupt held until the
+    # offset stop was sent, `_outcome`'s nested decision, a halt read in the
+    # wait) raise errors through frames of their own, as #163's did.
+    core = _at_offset(7800.0)
+    microscope = Microscope.from_core(cast("CMMCorePlus", core), _profile())
+    if case == "interrupted switch-off":
+        raised = _z_stop_interrupted_in_its_switch_off(core, microscope)
+        # The row the case meant to take: the offset device was stopped past it.
+        assert core.log == [
+            "setPosition('PFSOffset', 7801.0)",
+            OFF,
+            "stop('PFSOffset')",
+            "stop('ZDrive')",
+        ]
+        expected = (
+            "MotionStoppedError",
+            _not_switched_off(
+                "autofocus_offset: move_to 7801.0 device units", "KeyboardInterrupt"
+            ),
+            "MotionStoppedError",
+        )
+    else:
+        raised = _z_stop_whose_outcome_wait_is_cut_short(
+            core, microscope, monkeypatch, case
+        )
+        expected = (
+            ("KeyboardInterrupt", "", "NoneType")
+            if case.startswith("ctrl-c")
+            else (
+                "MotionStoppedError",
+                _not_switched_off(
+                    "autofocus: engage", "its switch-off had not returned yet"
+                ),
+                "MotionStoppedError",
+            )
+        )
+    assert raised == expected
+    assert microscope.state().moving == ()
     alive = {"facade": weakref.ref(microscope), "core": weakref.ref(core)}
     del microscope, core
     assert {name: ref() is not None for name, ref in alive.items()} == {

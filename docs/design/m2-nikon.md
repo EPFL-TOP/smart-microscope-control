@@ -287,7 +287,12 @@ first, then the offset device, then the stages.
   stop reached waits for that thread's linked stop to return, at most
   `Z_STOP_OUTCOME_WAIT_S` (5 s, assumed: MMCore's default device timeout),
   still under the microscope lock. This holds for every compound that links
-  the Z stop: the relock and a locked `focus_by_um` as well.
+  the Z stop: the relock and a locked `focus_by_um` as well. A halt cuts the
+  wait: the stand's halted state is read at each poll, since the Z stop has
+  already ended the block with a plain `MotionStoppedError` by the time the
+  emergency stop comes; the call then reports the switch-off as not returned
+  yet. A Ctrl-C during the wait goes on at once, with the WARNING of a Ctrl-C
+  that ended the block (#166).
 - **When the Z stop's switch-off failed, or had not returned in time**, no
   "left off" is claimed. The call raises `MotionStoppedError` naming Z:
   `` `z ZDrive`: it was stopped during <description>, but autofocus PFS could
@@ -300,7 +305,8 @@ first, then the offset device, then the stages.
   and an interrupt. The WARNING `autofocus PFS: the Z stop during
   <description> could not switch it off (<failure>); it may still move Z` is
   logged. A switch-off that had not returned names itself as the failure:
-  `its switch-off had not returned after 5 s`.
+  `its switch-off had not returned after 5 s`, or `its switch-off had not
+  returned yet` when a halt or a Ctrl-C cut the wait.
 - **A Z stop that came while the call waited for the microscope lock**
   cancels it with nothing sent (`MotionStoppedError`, "it was stopped before
   it started"). PFS is then as it was, so no "left off" WARNING is logged.

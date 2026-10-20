@@ -1345,12 +1345,14 @@ class Executor:
     def _write_held(self, lines: list[tuple[int, str, tuple[object, ...]]]) -> None:
         """Write the lines ``hold_log`` kept, in order, and leave the list empty.
 
-        A held record's arguments can be the error a stop raised (``%r`` of
-        it), and the list is a local of ``hold_log``, whose frame is on that
-        error's traceback: error -> traceback -> frame -> list -> record ->
-        error, a cycle that keeps the core until the cyclic collector (#148,
-        FM-92). Emptied in a ``finally``, so an interrupt that cuts the writing
-        leaves none behind either.
+        The held arguments are text: a failed stop's error is held as its
+        ``repr`` (#166), since the list is a local of ``hold_log``, whose
+        frame is on that error's traceback: error -> traceback -> frame ->
+        list -> record -> error would be a cycle that keeps the core until
+        the cyclic collector (#148, FM-92). The list is still emptied, in a
+        ``finally``, so that an interrupt that cuts the writing leaves none
+        behind: a line's arguments could still hold an object a caller
+        passed.
         """
         try:
             for level, msg, args in lines:
@@ -1593,7 +1595,11 @@ class Executor:
             if error is None:
                 self._log(level, "%s%s", what, note)
             else:
-                self._log(logging.WARNING, "%s failed (%r)%s", what, error, note)
+                # `%s` of the text, not `%r` of the error: a record that keeps
+                # the error keeps its traceback (FM-92); the line is the same.
+                self._log(
+                    logging.WARNING, "%s failed (%s)%s", what, _repr_of(error), note
+                )
         try:
             return error
         finally:
@@ -1613,6 +1619,19 @@ class Executor:
             self._logger.log(level, msg, *args, stacklevel=2)
         else:
             held.append((level, msg, args))
+
+
+def _repr_of(error: BaseException) -> str:
+    """``repr(error)`` for a log line; the type's name when the repr itself fails.
+
+    The line used to hand the error to ``logging``, which swallows a formatting
+    failure; formatted here, a failing ``__repr__`` would replace the stop's own
+    error, which ``_send_safe`` never raises (#166).
+    """
+    try:
+        return repr(error)
+    except Exception:
+        return f"<{type(error).__name__}: its repr failed>"
 
 
 def _resolve_timeout(timeout_s: float | Callable[[], float]) -> float:
