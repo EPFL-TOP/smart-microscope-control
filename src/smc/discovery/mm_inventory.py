@@ -31,11 +31,13 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel, Field, ValidationError
 
 from smc import __version__
+from smc.discovery import diagnosis
 from smc.discovery.models import (
     AdapterDevice,
     AdapterInfo,
     ProbedDevice,
     ProbeResult,
+    ProbeSource,
     SystemInfo,
 )
 from smc.hardware import core as core_mod
@@ -48,12 +50,14 @@ __all__ = [
     "CHILD_COMMAND",
     "CHILD_TIMEOUT_S",
     "ChildResult",
+    "check_port",
     "exit_detail",
     "list_adapters",
     "mm_section",
     "other_installs",
     "probe_adapter",
     "system_section",
+    "walk_adapter",
 ]
 
 logger = logging.getLogger("smc.discovery.mm_inventory")
@@ -66,6 +70,14 @@ CHILD_TIMEOUT_S = 180.0
 CHILD_COMMAND: list[str] = [sys.executable, "-m", "smc.discovery._mm_child"]
 
 _HUB_TYPE = "Hub"
+
+#: A pre-init ``Port`` that means "not set", compared after ``strip().casefold()``.
+#: Serial adapters are said to publish ``Undefined``; ``Utilities`` publishes
+#: ``''``, which is the only one measured (design m2 §9.1).
+_UNSET_PORTS = frozenset({"", "undefined"})
+
+#: No serial port name is longer; a longer value was not typed as a port.
+_MAX_PORT_CHARS = 200
 
 #: How long to wait for a killed child to go away before giving up on it.
 _KILL_WAIT_S = 10.0
@@ -241,76 +253,417 @@ def list_adapters(core: CMMCorePlus, names: list[str]) -> list[AdapterInfo]:
         except Exception as exc:
             result.append(AdapterInfo(name=name, installed=True, error=str(exc)))
             continue
+        listed = [
+            AdapterDevice(name=str(d), type=device_type_name(t), description=str(desc))
+            for d, t, desc in zip(devices, types, descriptions, strict=False)
+        ]
         result.append(
             AdapterInfo(
                 name=name,
                 installed=True,
-                devices=[
-                    AdapterDevice(
-                        name=str(d), type=device_type_name(t), description=str(desc)
-                    )
-                    for d, t, desc in zip(devices, types, descriptions, strict=False)
-                ],
+                devices=listed,
+                list_meaning=diagnosis.listing_meaning(name, len(listed)),
             )
         )
     return result
 
 
-def probe_adapter(
-    name: str, *, progress: Callable[[str], None] | None = None
-) -> ProbeResult:
-    """Load and initialise every device of one adapter in a throwaway core.
+def check_port(port: str) -> str:
+    """The port as it will be sent to a device, or why it cannot be.
 
-    The ``Hub`` device is loaded first and becomes every other device's
-    parent, because a hub-based adapter's peripherals only initialise below
-    their hub. Each device's outcome is recorded; everything is unloaded
-    afterwards so the stand is released.
+    Spaces around it are dropped (a pasted ``" COM3 "``); a newline, a NUL or
+    any other control character is refused rather than stripped, because a
+    value that holds one was not typed as a port and would reach a vendor
+    driver as it is (FM-32). An empty value is refused too: ``Path("")`` taught
+    the project that an empty string is a silent default (FM-78), and an empty
+    ``Port`` is exactly what ``Utilities`` shows for "not set".
+
+    Raises:
+        ValueError: The port is empty, longer than 200 characters, or holds a
+            character below U+0020 or U+007F.
+    """
+    value = port.strip(" ")
+    if not value:
+        raise ValueError("the port is empty")
+    if len(value) > _MAX_PORT_CHARS:
+        raise ValueError(f"the port is longer than {_MAX_PORT_CHARS} characters")
+    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+        raise ValueError("the port holds a control character")
+    return value
+
+
+def _loaded_type(core: CMMCorePlus, label: str) -> str:
+    """The type of a loaded device, for one the adapter did not list."""
+    try:
+        return device_type_name(int(core.getDeviceType(label)))
+    except Exception:  # the row is more useful with an unknown type than none
+        logger.debug("device type of %s not available", label, exc_info=True)
+        return "Unknown"
+
+
+def _needs_port(core: CMMCorePlus, label: str) -> bool:
+    """Whether a loaded, uninitialised device has a pre-init ``Port`` that is unset.
+
+    A serial adapter cannot initialise without its port, and failing without
+    it is not a hardware fault (FM-08). An exception while *reading* the
+    property counts as "needs no port": the device is initialised, and a
+    failure is reported raw (unknown beats guessed).
+    """
+    try:
+        if not core.hasProperty(label, "Port"):
+            return False
+        if not core.isPropertyPreInit(label, "Port"):
+            return False
+        return str(core.getProperty(label, "Port")).strip().casefold() in _UNSET_PORTS
+    except Exception:
+        logger.debug("the Port of %s could not be read", label, exc_info=True)
+        return False
+
+
+class _Walk:
+    """One walk of an adapter, in the order of design m2 §9.3.
+
+    The state lives on an object because every rule appends rows, notes and
+    checkpoints to the same result. ``untried`` counts the devices that were
+    skipped without being looked at, so that a note about ``--port`` never
+    claims to know what nobody checked.
+    """
+
+    def __init__(
+        self,
+        core: CMMCorePlus,
+        name: str,
+        port: str | None,
+        progress: Callable[[str], None] | None,
+        checkpoint: Callable[[ProbeResult], None] | None,
+    ) -> None:
+        self.core = core
+        self.name = name
+        self.port = port
+        self.progress = progress
+        self.checkpoint = checkpoint
+        self.result = ProbeResult(adapter=name)
+        self.port_needed = False
+        self.untried = 0
+
+    # --- bookkeeping ---------------------------------------------------------
+    def _say(self, line: str) -> None:
+        if self.progress is not None:
+            self.progress(line)
+
+    def _checkpoint(self) -> None:
+        """Hand over a copy of what is known, which is not the whole yet (§9.5)."""
+        if self.checkpoint is None:
+            return
+        snapshot = self.result.model_copy(deep=True)
+        snapshot.complete = False
+        self.checkpoint(snapshot)
+
+    def _add(self, row: ProbedDevice) -> None:
+        self.result.devices.append(row)
+        self._checkpoint()
+
+    def _skip(self, name: str, type_name: str, reason: str) -> None:
+        self.untried += 1
+        self._add(
+            ProbedDevice(name=name, type=type_name, status="not-probed", reason=reason)
+        )
+
+    # --- one device (rules 3 and 9) ------------------------------------------
+    def _try(
+        self,
+        label: str,
+        type_name: str | None,
+        source: ProbeSource,
+        parent: str | None,
+    ) -> ProbedDevice:
+        """Load, give its port, initialise: the row says what was tried.
+
+        ``type_name`` is the listed type, or ``None`` for a device the adapter
+        does not list, whose type is read after the load. ``KeyboardInterrupt``
+        and ``SystemExit`` pass through; any other exception is this device's
+        ``failed`` (rule 9).
+        """
+        self._say(f"probing {self.name}/{label}")
+        shown = type_name or "Unknown"
+        port_set: str | None = None
+
+        def failed(exc: Exception) -> ProbedDevice:
+            error = str(exc)
+            return ProbedDevice(
+                name=label,
+                type=shown,
+                status="failed",
+                source=source,
+                error=error,
+                hint=diagnosis.error_hint(self.name, error),
+                port=port_set,
+            )
+
+        try:
+            self.core.loadDevice(label, self.name, label)
+        except Exception as exc:
+            return failed(exc)
+        if type_name is None:
+            shown = _loaded_type(self.core, label)
+        try:
+            if parent is not None:
+                self.core.setParentLabel(label, parent)
+        except Exception as exc:
+            return failed(exc)
+        if _needs_port(self.core, label):
+            if self.port is None:
+                return ProbedDevice(
+                    name=label,
+                    type=shown,
+                    status="not-probed",
+                    source=source,
+                    reason="needs a port: pass --port COMx to probe it",
+                )
+            self.port_needed = True
+            try:
+                self.core.setProperty(label, "Port", self.port)
+            except Exception as exc:
+                return failed(exc)
+            port_set = self.port
+        try:
+            self.core.initializeDevice(label)
+        except Exception as exc:
+            return failed(exc)
+        return ProbedDevice(
+            name=label, type=shown, status="ok", source=source, port=port_set
+        )
+
+    def _device(
+        self,
+        label: str,
+        type_name: str | None,
+        source: ProbeSource,
+        parent: str | None,
+    ) -> ProbedDevice:
+        row = self._try(label, type_name, source, parent)
+        if row.status == "failed" and type_name == _HUB_TYPE and not self.result.causes:
+            # Set before the row's checkpoint, so that a crash that follows
+            # keeps the diagnosis together with the failed hub (rule 7).
+            self.result.causes = diagnosis.hub_failure_causes(self.name)
+        self._add(row)
+        return row
+
+    # --- the walk ------------------------------------------------------------
+    def _listing(self) -> list[AdapterDevice] | None:
+        """Rule 1: the adapter's devices, or the reason there is nothing to probe."""
+        result = self.result
+        if self.name not in self.core.getDeviceAdapterNames():
+            result.error = "adapter not installed"
+            return None
+        try:
+            (info,) = list_adapters(self.core, [self.name])
+        except Exception as exc:
+            result.error = str(exc)
+            return None
+        if info.error is not None:
+            result.error = info.error
+            return None
+        if not info.devices:
+            result.error = (
+                f"{self.name} lists no devices: "
+                f"{diagnosis.empty_list_meaning(self.name)}"
+            )
+            return None
+        return info.devices
+
+    def _connect(self, hubs: list[AdapterDevice]) -> str | None:
+        """Rule 2: the first hub that initialises; the others are not tried."""
+        connected: str | None = None
+        failed: list[str] = []
+        for hub in hubs:
+            if connected is not None:
+                self._skip(
+                    hub.name,
+                    hub.type,
+                    f"hub {connected} of this adapter is already initialised; "
+                    "a probe connects one hub",
+                )
+                continue
+            row = self._device(hub.name, hub.type, "adapter", parent=None)
+            if row.status == "ok":
+                connected = hub.name
+            elif row.status == "failed":
+                failed.append(hub.name)
+        if connected is not None:
+            for name in failed:
+                self.result.notes.append(
+                    f"hub {name} did not initialise but {connected} did: "
+                    f"what follows is {connected}'s"
+                )
+        return connected
+
+    def _below(self, hub: str, listed: list[AdapterDevice]) -> None:
+        """Rule 4: what the initialised hub reports, loaded under it."""
+        result = self.result
+        self._say(f"probing {self.name}/{hub}: listing its peripherals")
+        list_error: str | None = None
+        try:
+            names = [str(n) for n in self.core.getInstalledDevices(hub)]
+        except Exception as exc:
+            list_error = str(exc)
+            names = []
+        taken = {d.name for d in result.devices}
+        reported: list[str] = []
+        for name in names:
+            if name not in taken and name not in reported:
+                reported.append(name)
+
+        if reported:
+            by_name = {d.name: d for d in listed}
+            for name in reported:
+                known = by_name.get(name)
+                self._device(
+                    name,
+                    known.type if known else None,
+                    "both" if known else "hub",
+                    parent=hub,
+                )
+            for device in listed:
+                if device.name not in reported:
+                    self._skip(
+                        device.name,
+                        device.type,
+                        f"listed by the adapter but not reported by the hub {hub}: "
+                        "not attached, or not detected",
+                    )
+        elif listed:
+            # Some hubs do not detect, and their devices still work.
+            if list_error is None:
+                result.notes.append(
+                    f"hub {hub} reports no peripherals: the adapter's own list was probed"
+                )
+            else:
+                result.notes.append(
+                    f"hub {hub} did not list its peripherals: {list_error}; "
+                    "the adapter's own list was probed"
+                )
+            for device in listed:
+                self._device(device.name, device.type, "adapter", parent=hub)
+        else:
+            what = (
+                "reports no peripherals"
+                if list_error is None
+                else f"could not list its peripherals ({list_error})"
+            )
+            result.error = (
+                f"hub {hub} initialised but {what}, and {self.name} lists no "
+                "other device: nothing below it was probed; "
+                f"{diagnosis.empty_list_meaning(self.name)}"
+            )
+
+    def run(self) -> ProbeResult:
+        listed = self._listing()
+        if listed is None:
+            return self.result
+        # Once before the first device, so a child that dies on the first one
+        # still leaves a result that is marked as not whole (§9.5).
+        self._checkpoint()
+
+        hubs = [d for d in listed if d.type == _HUB_TYPE]
+        others = [d for d in listed if d.type != _HUB_TYPE]
+        connected = self._connect(hubs)
+        if connected is not None:
+            self._below(connected, others)
+        elif hubs:
+            # Rule 6: nothing below a hub that did not initialise is loaded.
+            for device in others:
+                self._skip(
+                    device.name,
+                    device.type,
+                    f"its hub {hubs[0].name} was not initialised",
+                )
+        else:
+            # Rule 5: an adapter with no hub (Utilities); no parent.
+            for device in others:
+                self._device(device.name, device.type, "adapter", parent=None)
+
+        if self.port is not None and not self.port_needed:
+            tried = (
+                f"no device of {self.name} needs a port"
+                if not self.untried
+                else "no device that was initialised needs a port "
+                f"({self.untried} not tried)"
+            )
+            self.result.notes.append(f"--port {self.port} was not used: {tried}")
+        return self.result
+
+
+def walk_adapter(
+    core: CMMCorePlus,
+    name: str,
+    *,
+    port: str | None = None,
+    progress: Callable[[str], None] | None = None,
+    checkpoint: Callable[[ProbeResult], None] | None = None,
+) -> ProbeResult:
+    """Initialise the devices of one adapter on a core the caller owns.
+
+    A row never says ``ok`` for something nobody initialised (design m2 §9.3):
+    a device the adapter lists and its hub does not report, and a device that
+    needs a port nobody gave, are ``not-probed`` with their reason, and are
+    never initialised. A probe connects one hub: the Ti2-E lists the stand and
+    then its simulator, and the simulator's expected failure on a connected
+    stand is not shown as a fault of the stand.
+
+    Every device it loaded stays loaded: ``smc config build`` (#15) builds on
+    what initialised, so this never closes the core; :func:`probe_adapter` does.
+
+    Args:
+        core: The core to load into; the caller releases it.
+        name: The adapter.
+        port: A serial port to set, before initialising, on each device whose
+            pre-init ``Port`` is unset. A device that already has one keeps it.
+        progress: Called with ``"probing <adapter>/<device>"`` before each
+            device is loaded, so a crash can be attributed to a device.
+        checkpoint: Called with a deep copy of the result, ``complete=False``,
+            once before the first device and after every row, so a child that
+            dies keeps the rows it had finished (FM-02).
+
+    Raises:
+        ValueError: ``port`` is refused by :func:`check_port`.
+    """
+    checked = check_port(port) if port is not None else None
+    return _Walk(core, name, checked, progress, checkpoint).run()
+
+
+def probe_adapter(
+    name: str,
+    *,
+    port: str | None = None,
+    progress: Callable[[str], None] | None = None,
+    checkpoint: Callable[[ProbeResult], None] | None = None,
+    core: CMMCorePlus | None = None,
+) -> ProbeResult:
+    """Walk one adapter in a throwaway core, then release the stand.
+
+    ``core`` exists so that a test hands over a stub: no test lists a vendor
+    adapter (FM-40). The core is released in a ``finally`` whichever core it is,
+    the one opened here or the one given, and whatever ends the walk (a Ctrl-C
+    included): a stand stays held until its devices are unloaded.
 
     Args:
         name: The adapter.
-        progress: Called with ``"probing <adapter>/<device>"`` before each
-            device is loaded, so a crash can be attributed to a device.
+        port: See :func:`walk_adapter`.
+        progress: See :func:`walk_adapter`.
+        checkpoint: See :func:`walk_adapter`.
+        core: A core to use instead of a new ``CMMCorePlus``.
     """
-    from pymmcore_plus import CMMCorePlus
+    if core is None:
+        from pymmcore_plus import CMMCorePlus
 
-    core = CMMCorePlus()
-    if name not in core.getDeviceAdapterNames():
-        return ProbeResult(adapter=name, error="adapter not installed")
+        core = CMMCorePlus()
     try:
-        (info,) = list_adapters(core, [name])
-    except Exception as exc:
-        return ProbeResult(adapter=name, error=str(exc))
-    if info.error is not None:
-        return ProbeResult(adapter=name, error=info.error)
-
-    ordered = sorted(info.devices, key=lambda d: d.type != _HUB_TYPE)
-    probed = []
-    hub_label: str | None = None
-    try:
-        for device in ordered:
-            if progress is not None:
-                progress(f"probing {name}/{device.name}")
-            try:
-                core.loadDevice(device.name, name, device.name)
-                if hub_label is not None and device.type != _HUB_TYPE:
-                    core.setParentLabel(device.name, hub_label)
-                core.initializeDevice(device.name)
-            except Exception as exc:
-                probed.append(
-                    ProbedDevice(
-                        name=device.name,
-                        type=device.type,
-                        status="failed",
-                        error=str(exc),
-                    )
-                )
-                continue
-            if device.type == _HUB_TYPE and hub_label is None:
-                hub_label = device.name
-            probed.append(ProbedDevice(name=device.name, type=device.type, status="ok"))
+        return walk_adapter(
+            core, name, port=port, progress=progress, checkpoint=checkpoint
+        )
     finally:
         core_mod.close_core(core)
-    return ProbeResult(adapter=name, devices=probed)
 
 
 #: macOS signal numbers the child's crash guard turns into exit codes
