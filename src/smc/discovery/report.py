@@ -24,6 +24,7 @@ __all__ = [
     "JSON_NAME",
     "TEXT_NAME",
     "prepare",
+    "probe_renderables",
     "render_text",
     "renderables",
     "write",
@@ -95,8 +96,12 @@ def _detail(device: ProbedDevice) -> str:
     return f"port {device.port}" if device.port else ""
 
 
-def _probe(probe: ProbeResult) -> list[RenderableType]:
-    """The probe table, then its error, notes and numbered causes (design m2 §9.6)."""
+def probe_renderables(probe: ProbeResult) -> list[RenderableType]:
+    """The probe table, then its error, notes and numbered causes (design m2 §9.6).
+
+    Public since ``smc config build`` prints the walk of its stand and of its
+    camera adapter as ``smc discover --probe-adapter`` does (design m2 §10.6).
+    """
     title = f"Probe of {probe.adapter}"
     if not probe.complete:
         title += f" — {_INCOMPLETE}"
@@ -194,7 +199,7 @@ def renderables(inv: Inventory) -> list[RenderableType]:
     out.append(hints)
 
     if inv.probe is not None:
-        out.extend(_probe(inv.probe))
+        out.extend(probe_renderables(inv.probe))
 
     out.append(_t(f"Notes ({len(inv.notes)})"))
     out.extend(_t(f"  - {n}") for n in inv.notes)

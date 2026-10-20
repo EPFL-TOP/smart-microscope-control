@@ -15,7 +15,9 @@ import math
 import os
 import platform
 import secrets
+import shutil
 import sys
+import tempfile
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -77,6 +79,8 @@ DryRunOption = Annotated[
 ]
 
 if TYPE_CHECKING:
+    from smc.discovery.config_build import ConfigPlan
+
     _StreamHandler = logging.StreamHandler[TextIO]
 else:  # StreamHandler is subscriptable only from Python 3.11
     _StreamHandler = logging.StreamHandler
@@ -793,6 +797,420 @@ def discover(
     if written is not None:
         json_path, text_path = written
         _ok(f"wrote {json_path} and {text_path.name}")
+
+
+# --- config build ---------------------------------------------------------------
+# `smc config build` initialises every device of one adapter, in the adapter child
+# of `smc discover`, and writes a Micro-Manager configuration from the ones that
+# answer (design m2 §10). Nothing in it moves a stage.
+
+config_app = typer.Typer(
+    help="Micro-Manager configuration files.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+app.add_typer(config_app, name="config")
+
+#: ``BUILD_TIMEOUT_S`` of ``smc.discovery.mm_inventory``, which is not imported at
+#: module level (it loads pydantic models); a test keeps the two equal.
+_BUILD_TIMEOUT_DEFAULT_S = 300.0
+
+
+def _adapter_name(value: str, option: str) -> str:
+    """An adapter named on the command line, or a usage error (exit 2)."""
+    from smc.discovery.mm_inventory import check_device_name
+
+    try:
+        return check_device_name(value)
+    except ValueError as exc:
+        said = str(exc).replace("the device name", "the adapter name")
+        _fail(f"{option}: {said}")
+        raise typer.Exit(code=_EXIT_REFUSED) from None
+
+
+def _stand_adapter(loaded: Profile) -> str:
+    """The adapter of the one Nikon stand the profile's configuration loads.
+
+    Without ``--adapter`` a build needs to know which adapter's devices to
+    initialise; guessing among several would contact a stand nobody named.
+    """
+    config = loaded.config_path()
+    if config is None:
+        why = f"profile {loaded.microscope.name} loads the demo configuration"
+    else:
+        stands = nikon.stands_in_config(config)
+        if len(stands) == 1:
+            return stands[0].adapter
+        why = (
+            f"{config} loads no Nikon stand"
+            if not stands
+            else f"{config} loads {len(stands)} Nikon stands: "
+            + ", ".join(stand.adapter for stand in stands)
+        )
+    _fail(
+        f"name the stand's adapter with --adapter ({why}; smc discover lists the "
+        "installed ones)"
+    )
+    raise typer.Exit(code=_EXIT_REFUSED)
+
+
+def _backup_path(out: Path) -> Path:
+    return out.with_name(out.name + ".bak")
+
+
+def _check_build_out(out: Path, *, replace: bool, writing: bool) -> None:
+    """Refuse a destination that cannot be written, before anything is initialised.
+
+    The build is minutes of hardware work and the file is its whole result
+    (FM-30). An existing file is refused unless it is to be replaced
+    (``--force``) or only read (``--dry-run``).
+    """
+    if out.is_dir():
+        _fail(f"{out} is a folder; name the file to write")
+        raise typer.Exit(code=_EXIT_REFUSED)
+    if not out.parent.is_dir():
+        _fail(f"the folder {out.parent} does not exist")
+        raise typer.Exit(code=_EXIT_REFUSED)
+    if out.exists() and not replace:
+        _fail(
+            f"{out} exists: pass --force to replace it (its presets, pixel sizes "
+            f"and labels are carried over, and it is saved as {_backup_path(out)})"
+        )
+        raise typer.Exit(code=_EXIT_REFUSED)
+    if writing:
+        try:
+            with tempfile.TemporaryFile(dir=out.parent):
+                pass
+        except OSError as exc:
+            _fail(f"cannot write to {out.parent}: {exc}")
+            raise typer.Exit(code=_EXIT_ERROR) from None
+
+
+def _write_config(out: Path, text: str, *, keep_previous: bool) -> Path | None:
+    """Replace ``out`` by ``text``, after saving what was there as ``<out>.bak``.
+
+    The ``.bak`` comes first, so that the previous bytes are saved before they
+    are replaced, and both go through a temporary file and ``os.replace``
+    (FM-38). When the ``.bak`` cannot be made (Windows antivirus or an editor
+    holds it, FM-24), ``out`` is not replaced, and the new text, the result of
+    minutes of hardware work, is kept beside it as ``<out>.new``: it must be on
+    disk somewhere that the message names (FM-34). The text is UTF-8 with
+    ``surrogateescape`` (a carried cp1252 byte comes back as it was) and LF line
+    ends on every OS: MMCore loads either (measured).
+
+    Returns:
+        The ``.bak`` path when the previous file was saved.
+
+    Raises:
+        OSError: ``out`` could not be written; the message says what was kept.
+    """
+
+    def write(partial: Path) -> None:
+        partial.write_text(
+            text, encoding="utf-8", errors="surrogateescape", newline="\n"
+        )
+
+    backup = None
+    if keep_previous:
+        backup = _backup_path(out)
+        try:
+            _save_backup(out, backup)
+        except OSError as exc:
+            kept = out.with_name(out.name + ".new")
+            why = f"could not save the previous file as {backup}: {exc.strerror or exc}"
+            try:
+                _replace(kept, write)
+            except OSError as second:
+                raise OSError(
+                    f"{why}; and the new configuration could not be kept as "
+                    f"{kept} either: {second.strerror or second}"
+                ) from exc
+            raise OSError(
+                f"{why}; {out} was not replaced, and the new configuration is "
+                f"kept as {kept}"
+            ) from exc
+    _replace(out, write)
+    return backup
+
+
+def _save_backup(out: Path, backup: Path) -> None:
+    """Copy ``out`` onto ``backup`` through a temporary file, or leave ``backup`` as it was.
+
+    ``_replace`` would keep the temporary file when the final rename fails and
+    word it as "the new file": here that file holds the old bytes, and the
+    message would lie about what it is.
+    """
+    partial = backup.with_name(f".{backup.name}.{secrets.token_hex(4)}.part")
+    try:
+        shutil.copyfile(out, partial)
+        os.replace(partial, backup)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            partial.unlink()
+        raise
+
+
+def _printable(text: str) -> str:
+    """``text`` as a UTF-8 console can print it.
+
+    A line carried from the previous file may hold bytes that are not UTF-8,
+    read as lone surrogates (``surrogateescape``), which a strict UTF-8 stream
+    refuses; the file keeps the bytes, the screen shows a replacement character.
+    """
+    return text.encode("utf-8", errors="surrogateescape").decode(
+        "utf-8", errors="replace"
+    )
+
+
+def _carried_summary(plan: ConfigPlan, out: Path) -> str | None:
+    """``carried over from <out>: 3 presets, 2 pixel sizes, labels of 4 devices``."""
+    counts = {"preset": 0, "pixel": 0, "labels": 0, "device": 0}
+    for block in plan.carried:
+        counts[block.kind] += 1
+
+    def many(n: int, one: str, more: str) -> str:
+        return f"{n} {one if n == 1 else more}"
+
+    parts = []
+    if counts["preset"]:
+        parts.append(many(counts["preset"], "preset", "presets"))
+    if counts["pixel"]:
+        parts.append(many(counts["pixel"], "pixel size", "pixel sizes"))
+    if counts["labels"]:
+        parts.append(many(counts["labels"], "device's labels", "devices' labels"))
+    if counts["device"]:
+        parts.append(
+            many(
+                counts["device"],
+                "delay or focus direction",
+                "delays or focus directions",
+            )
+        )
+    if not parts:
+        return None
+    return f"carried over from {out}: " + ", ".join(parts)
+
+
+@config_app.command("build")
+def config_build(
+    ctx: typer.Context,
+    out: Annotated[
+        Path,
+        typer.Option(
+            "--out",
+            help="The configuration file to write, in a folder that exists. An "
+            "existing file needs --force: its presets, pixel sizes and labels are "
+            "carried over, and it is saved as <out>.bak.",
+        ),
+    ],
+    profile: ProfileOption = DEMO_NAME,
+    adapter: Annotated[
+        str | None,
+        typer.Option(
+            "--adapter",
+            help="The stand's adapter, whose devices are all initialised. "
+            "Default: the one Nikon stand the profile's configuration loads.",
+        ),
+    ] = None,
+    camera_adapter: Annotated[
+        str | None,
+        typer.Option(
+            "--camera-adapter",
+            help="The adapter of a camera to add (smc discover lists the "
+            "installed ones). Only its cameras, and their hub, are written.",
+        ),
+    ] = None,
+    skip: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--skip",
+            help="A device never to load, as the walk names it; repeat it. For "
+            "a device that crashes the build.",
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Print the configuration and write nothing. An existing --out "
+            "is read, to show what is carried over.",
+        ),
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force", help="Replace an existing --out, saved first as <out>.bak."
+        ),
+    ] = False,
+    timeout_s: Annotated[
+        float,
+        typer.Option(
+            "--timeout-s",
+            min=1.0,
+            max=3600.0,
+            help="How long the build child process may run (1-3600 s).",
+        ),
+    ] = _BUILD_TIMEOUT_DEFAULT_S,
+) -> None:
+    """Write a Micro-Manager configuration from the devices that answer.
+
+    Initialises every device of the stand's adapter (and the cameras of
+    --camera-adapter), so the stand must be powered and its vendor software
+    closed. Use --dry-run first. A device that crashes the build is named, and
+    --skip leaves it out on the next run. A hub that will not initialise writes
+    nothing and prints the likely causes. Nothing here moves a stage.
+    """
+    from smc.discovery import report as report_mod
+    from smc.discovery.config_build import (
+        cut_short,
+        plan_config,
+        read_previous,
+        render_config,
+    )
+    from smc.discovery.mm_inventory import build_section, check_device_name
+
+    def say(text: str) -> None:
+        _say(_printable(text))
+
+    # Usage first, then the destination: both before any child starts.
+    if not math.isfinite(timeout_s):  # click's range check lets nan through
+        _fail(f"--timeout-s must be a number of seconds, not {timeout_s}")
+        raise typer.Exit(code=_EXIT_REFUSED)
+    skips: list[str] = []
+    for name in skip or []:
+        try:
+            skips.append(check_device_name(name))
+        except ValueError as exc:
+            _fail(f"--skip: {exc}")
+            raise typer.Exit(code=_EXIT_REFUSED) from None
+    named_camera = (
+        _adapter_name(camera_adapter, "--camera-adapter")
+        if camera_adapter is not None
+        else None
+    )
+    named_stand = _adapter_name(adapter, "--adapter") if adapter is not None else None
+    with _Reported(ctx):
+        loaded = Profile.load(profile)
+        stand = named_stand if named_stand is not None else _stand_adapter(loaded)
+        search_dirs = loaded.adapter_search_dirs()
+    if named_camera is not None and named_camera == stand:
+        _fail(
+            f"--camera-adapter is the stand's adapter ({stand}): its devices "
+            "are initialised once; name the camera's own adapter"
+        )
+        raise typer.Exit(code=_EXIT_REFUSED)
+    _check_build_out(out, replace=force or dry_run, writing=not dry_run)
+    try:
+        previous = read_previous(out)
+    except OSError as exc:
+        _fail(f"cannot read {out}: {exc}")
+        raise typer.Exit(code=_EXIT_ERROR) from None
+
+    where = stand + (f" and {named_camera}" if named_camera else "")
+    console.print(
+        Text.assemble(
+            ("! ", "yellow"),
+            f"Building from {where}: every device is initialised, so the "
+            "stand must be powered and its vendor software closed.",
+        ),
+        soft_wrap=True,
+    )
+    try:
+        with console.status("Building…"):
+            run = build_section(
+                stand,
+                camera=named_camera,
+                skip=skips,
+                search_paths=search_dirs,
+                timeout_s=timeout_s,
+            )
+    except KeyboardInterrupt:
+        # build_section killed the child's whole tree before it re-raised.
+        _fail("interrupted — the build child was stopped; nothing was written")
+        raise typer.Exit(code=_EXIT_INTERRUPTED) from None
+
+    scan = run.scan
+    plan = (
+        plan_config(
+            scan,
+            previous=previous,
+            overrides=loaded.roles.assign,
+            exclusions=loaded.roles.exclude,
+            skip=skips,
+        )
+        if scan is not None
+        else None
+    )
+    text: str | None = None
+    if plan is not None and plan.writable:
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        text = render_config(
+            plan,
+            header=[
+                f"Generated by smc config build on {stamp} from {where}",
+                f"Profile {loaded.microscope.name}",
+            ],
+        )
+
+    # The file comes before the report: a broken pipe or a Ctrl-C while the
+    # report is printed must not lose minutes of hardware work (FM-30).
+    backup: Path | None = None
+    write_error: OSError | None = None
+    if text is not None and not dry_run:
+        try:
+            backup = _write_config(out, text, keep_previous=previous is not None)
+        except OSError as exc:
+            write_error = exc
+
+    if scan is not None:
+        for probe in (scan.stand, scan.camera):
+            if probe is not None:
+                for item in report_mod.probe_renderables(probe):
+                    console.print(item)
+    notes = [*(scan.notes if scan else []), *(plan.notes if plan else [])]
+    for note in [*notes, *run.notes]:
+        say(f"- {note}")
+    if plan is not None and plan.writable:
+        say("Roles")
+        for line in plan.roles.describe():
+            say(f"  {line}")
+        for warning in plan.roles.warnings:
+            say(f"! {warning}")
+        summary = _carried_summary(plan, out)
+        if summary is not None:
+            say(summary)
+        for block, why in plan.not_carried:
+            say(f"! set aside: {block.key}: {why}")
+
+    if write_error is not None:
+        _fail(f"could not write {out}: {write_error}")
+        # Dropped with its traceback's frame once the line is printed (#148, FM-92).
+        del write_error
+        raise typer.Exit(code=_EXIT_ERROR)
+    if text is None:
+        refusals = (
+            plan.refusals if plan is not None else ["the build child left no result"]
+        )
+        for refusal in refusals:
+            _fail(_printable(refusal))
+        if run.stopped_at and (scan is None or cut_short(scan)):
+            say(f"re-run with --skip {run.stopped_at} to leave it out")
+            if any("did not finish in" in note for note in run.notes):
+                # The deadline stopped it on whatever it was doing: a slow device
+                # is not a crashing one, and leaving it out costs the file.
+                say(
+                    f"or, if {run.stopped_at} was only slow, raise --timeout-s "
+                    f"(it was {timeout_s:g} s)"
+                )
+        raise typer.Exit(code=_EXIT_ERROR)
+    if dry_run:
+        say(f"--- would write {out} ---")
+        for line in text.splitlines():
+            say(line)
+        return
+    saved = f", previous saved as {backup}" if backup is not None else ""
+    _ok(f"wrote {out}{saved}")
+    say(f"check it with: smc doctor --config {out}")
 
 
 # --- stage and z ---------------------------------------------------------------

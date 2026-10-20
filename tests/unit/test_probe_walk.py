@@ -838,3 +838,74 @@ def test_list_adapters_sets_the_meaning_of_an_empty_or_fixed_list() -> None:
     # A listing that raised has an error to show, and no meaning to add to it.
     assert broken.error == "Failed to load"
     assert broken.list_meaning is None
+
+
+# --- skip (design m2 §10.2) -------------------------------------------------------
+
+
+def test_a_skipped_device_is_never_loaded_and_says_why() -> None:
+    core = _ProbeCore(
+        "Fake",
+        [("H", "Hub")],
+        reported={"H": ["A", "Dia"]},
+        types={"A": "Camera", "Dia": "Shutter"},
+    )
+    seen: list[str] = []
+
+    result = _walk(core, skip=["Dia"], progress=seen.append)
+
+    rows = _rows(result)
+    assert (rows["A"].status, rows["Dia"].status) == ("ok", "not-probed")
+    assert rows["Dia"].reason == "left out: --skip Dia"
+    # Loading it is what crashes the Ti-E's TIDiaLamp: not one call may reach it.
+    assert core.calls_of("loadDevice", "Dia") == []
+    assert core.calls_of("setParentLabel", "Dia") == []
+    assert core.calls_of("initializeDevice", "Dia") == []
+    # The child's progress line names the device it is on when it dies: a device
+    # nobody touched must not be that device.
+    assert "probing Fake/Dia" not in seen
+    assert "probing Fake/A" in seen
+
+
+def test_a_skipped_hub_lets_the_next_listed_hub_connect_without_causes() -> None:
+    core = _ProbeCore(
+        "Fake",
+        [("Stand", "Hub"), ("Simulator", "Hub")],
+        reported={"Simulator": ["A"]},
+        types={"A": "Camera"},
+    )
+
+    result = _walk(core, skip=["Stand"])
+
+    rows = _rows(result)
+    assert (rows["Stand"].status, rows["Simulator"].status, rows["A"].status) == (
+        "not-probed",
+        "ok",
+        "ok",
+    )
+    assert core.calls_of("loadDevice", "Stand") == []
+    # Not a failed hub: nothing says the stand is off, and no note says a hub
+    # "did not initialise".
+    assert result.causes == []
+    assert result.notes == []
+    assert ("setParentLabel", "A", "Simulator") in core.calls
+
+
+def test_a_skipped_device_counts_among_those_the_port_note_did_not_look_at() -> None:
+    core = _ProbeCore("Fake", [("H", "Hub"), ("S", "Shutter")])
+
+    result = _walk(core, port="COMX", skip=["S"])
+
+    (note,) = [n for n in result.notes if "--port" in n]
+    assert "--port COMX was not used" in note
+    # "no device of Fake needs a port" would claim a device nobody looked at.
+    assert "no device that was initialised needs a port (1 not tried)" in note
+
+
+def test_probe_adapter_passes_skip_to_the_walk() -> None:
+    core = _ProbeCore("Fake", [("A", "Camera"), ("B", "Camera")])
+
+    result = probe_adapter("Fake", skip=["B"], core=core)  # type: ignore[arg-type]
+
+    assert _rows(result)["B"].status == "not-probed"
+    assert core.calls_of("loadDevice", "B") == []
