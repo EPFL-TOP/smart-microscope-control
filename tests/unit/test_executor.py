@@ -1615,6 +1615,27 @@ def test_a_failed_stop_still_ends_the_move_as_stopped() -> None:
     assert isinstance(mover.error, MotionStoppedError)
 
 
+def test_a_failed_stop_logs_the_error_as_text_not_as_the_object(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # FM-92, #166: a record that keeps the error keeps its traceback, which
+    # holds the stopping frame and, through it, the core, until the cyclic
+    # collector. The line itself is unchanged: `%s` of `repr(error)`.
+    def stop_that_fails() -> None:
+        raise RuntimeError("no answer")
+
+    z = Motion(device="Z", name="z Z", is_busy=lambda: False, stop=stop_that_fails)
+    with (
+        caplog.at_level(logging.WARNING, logger=LOGGER.name),
+        pytest.raises(RuntimeError, match="no answer"),
+    ):
+        _ex().stop(z)
+    (record,) = (r for r in caplog.records if r.name == LOGGER.name)
+    assert record.getMessage() == "z Z: stop failed (RuntimeError('no answer'))"
+    assert not any(isinstance(arg, BaseException) for arg in record.args or ())
+    assert record.exc_info is None
+
+
 class _OrderHandler(logging.Handler):
     """Records, for each WARNING, how many stops the device had seen by then."""
 
