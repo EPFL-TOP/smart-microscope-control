@@ -872,6 +872,8 @@ def _read(name: str, read: Callable[[], R], errors: list[str]) -> R | None:
     try:
         return read()
     except Exception as exc:
-        errors.append(f"{name}: {type(exc).__name__}: {exc}")
-        log.debug("state: %s read failed", name, exc_info=True)
+        detail = f"{type(exc).__name__}: {exc}"
+        errors.append(f"{name}: {detail}")
+        # Text, never the error: a record that keeps it keeps its traceback (FM-92).
+        log.debug("state: %s read failed (%s)", name, detail)
         return None
