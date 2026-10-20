@@ -981,19 +981,27 @@ def _run_child(
 _LISTING_PERIPHERALS = ": listing its peripherals"
 
 
-def _stopped_at(doing: str | None) -> str | None:
+def _stopped_at(
+    doing: str | None, adapters: Collection[str] | None = None
+) -> str | None:
     """The device a child was on, from its last progress line.
 
     ``probing <adapter>/<device>`` and ``reading <adapter>/<device>`` name one;
     ``listing <adapter>`` does not (a crash there is the adapter's, not a
     device's). The adapter's name has no ``/``, so the first one splits it.
+
+    With ``adapters``, only a line that names one of them counts: a vendor DLL
+    prints to the same file (FM-01), and ``reading C:/vendor/x.ini`` is not a
+    device to leave out.
     """
     if doing is None:
         return None
     for prefix in ("probing ", "reading "):
         if doing.startswith(prefix):
-            _, slash, device = doing[len(prefix) :].partition("/")
+            adapter, slash, device = doing[len(prefix) :].partition("/")
             device = device.removesuffix(_LISTING_PERIPHERALS)
+            if adapters is not None and adapter not in adapters:
+                return None
             return device if slash and device else None
     return None
 
@@ -1056,4 +1064,5 @@ def build_section(
         arguments, prefix="build: the build child", timeout_s=timeout_s
     )
     scan = result.build if result is not None else None
-    return BuildRun(scan=scan, notes=notes, stopped_at=_stopped_at(doing))
+    named = [stand, camera] if camera else [stand]
+    return BuildRun(scan=scan, notes=notes, stopped_at=_stopped_at(doing, named))

@@ -26,6 +26,7 @@ non-ASCII characters, and the file must read the same on every code page.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -85,6 +86,22 @@ def _no_error_dialogs() -> None:
             signal.SIGFPE,
         ):
             libc.signal(int(sig), exit_address)
+
+
+def _use_utf8_stderr() -> None:
+    r"""Write the progress lines in UTF-8, which is how the parent reads them.
+
+    Redirected to a file, a Windows stream is in the ANSI code page (cp1252) and
+    writes what it cannot encode as ``\uXXXX`` text: the device named in the
+    parent's ``re-run with --skip <device>`` hint would not be the device that
+    crashed, and pasting it would load that device again. Only what cannot be
+    encoded at all (a lone surrogate) is escaped. A stream that cannot change
+    keeps the encoding it has.
+    """
+    reconfigure = getattr(sys.stderr, "reconfigure", None)
+    if reconfigure is not None:
+        with contextlib.suppress(OSError, ValueError):
+            reconfigure(encoding="utf-8", errors="backslashreplace")
 
 
 def _progress(line: str) -> None:
@@ -336,6 +353,7 @@ def _build_main(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     """List adapter devices, probe one adapter, or build from one adapter."""
     _no_error_dialogs()
+    _use_utf8_stderr()
     parser = argparse.ArgumentParser(prog="smc.discovery._mm_child")
     parser.add_argument("--result", required=True, type=Path, help="result file")
     parser.add_argument("--adapters", default="", help="comma-separated names")

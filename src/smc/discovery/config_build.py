@@ -19,7 +19,7 @@ which :func:`parse_previous` reads as that line again.
 from __future__ import annotations
 
 import unicodedata
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -33,6 +33,7 @@ __all__ = [
     "Block",
     "ConfigPlan",
     "PreviousConfig",
+    "cut_short",
     "parse_previous",
     "plan_config",
     "read_previous",
@@ -228,9 +229,14 @@ def parse_previous(text: str, path: Path | None = None) -> PreviousConfig:
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         fields = _fields(line)
+        if not fields:
+            continue  # only commas: it says nothing (a blank row saved from Excel)
         directive, count = fields[0], len(fields)
 
-        if directive in ("Device", "Parent"):
+        if directive in ("Device", "Parent") and count >= 2:
+            # Dropped by the plan when this build declares that device itself;
+            # kept as a comment when it does not (another adapter's, FM-107).
+            add("device", f"{directive} {fields[1]}", line, [fields[1]])
             continue
         if directive == "Property":
             if count >= 2 and fields[1] == "Core":
@@ -239,6 +245,12 @@ def parse_previous(text: str, path: Path | None = None) -> PreviousConfig:
                 if slot in _SLOT_ROLES:
                     if value:
                         core_slots[_SLOT_ROLES[slot]] = value
+                elif slot == "AutoShutter":
+                    # The build writes AutoShutter,1 with a shutter. Another value
+                    # was somebody's choice, and is not the build's to overwrite
+                    # without a word.
+                    if value and value != "1":
+                        add("property", "Property Core AutoShutter", line)
                 elif slot not in _WRITTEN_CORE_PROPERTIES and value:
                     # A Core setting the build does not write, and a line that
                     # sets nothing is nothing to keep.
@@ -348,9 +360,20 @@ def _hub_failures(probe: ProbeResult) -> list[str]:
     ]
 
 
+def cut_short(scan: BuildScan) -> bool:
+    """Whether the rows are the ones a child that died had finished.
+
+    A scan marked whole whose walks are not was put together from checkpoints:
+    its rows stop where the child did, and nothing says that what is missing was
+    not there.
+    """
+    walks = (scan.stand, scan.camera)
+    return not scan.complete or any(w is not None and not w.complete for w in walks)
+
+
 def _refusals(scan: BuildScan) -> list[str]:
     """Why nothing may be written, one line each (design m2 §10.4, rule 1)."""
-    if not scan.complete:
+    if cut_short(scan):
         return ["the build child stopped before the end"]
     out: list[str] = []
     stand = scan.stand
@@ -508,15 +531,34 @@ _CORE_PROPERTY = (
     "a Core setting the build does not write (it writes Initialize, AutoShutter and "
     "the five slots); put it in a preset (System/Startup)"
 )
+_AUTO_SHUTTER = (
+    "the build writes Property,Core,AutoShutter,1 whenever a shutter is assigned; "
+    "to keep another value, put it in a preset (System/Startup)"
+)
+_UNWALKED = (
+    "a device this build did not initialise (another adapter's, or one that is "
+    "gone): it is not loaded; put the line back by hand if the stand needs it"
+)
 _UNREAD = "not a line this Micro-Manager reads"
+
+
+def _is_declaration(block: Block) -> bool:
+    """Whether the block is a ``Device`` or ``Parent`` line."""
+    return block.kind == "device" and block.key.split(" ", 1)[0] in ("Device", "Parent")
 
 
 def _split_previous(
     previous: PreviousConfig,
     written: Mapping[str, BuiltDevice],
     own_labels: Mapping[str, list[str]],
+    walked: Collection[str],
 ) -> tuple[list[Block], list[tuple[Block, str]]]:
-    """Rule 5: each block of the previous file is carried, or set aside whole."""
+    """Rule 5: each block of the previous file is carried, or set aside whole.
+
+    ``walked`` names every device of both walks, whatever became of it: the
+    build declares those itself (or lists them as left out), so their old
+    ``Device`` and ``Parent`` lines are not read back.
+    """
     # The previous file's Label lines, per device, replace the device's own for
     # that device only (rule 4): all or nothing, the positions were named by hand.
     kept_labels: dict[str, set[str]] = {}
@@ -547,8 +589,18 @@ def _split_previous(
     for block in previous.blocks:
         if block.kind == "labels":
             continue
-        if block.kind == "property":
-            aside(block, _DEVICE_PROPERTY if block.devices else _CORE_PROPERTY)
+        if _is_declaration(block):
+            # What this build declares itself comes out of it again (a device
+            # that did not initialise is listed at the end); a device it did not
+            # walk has no line in the new file, so the old one is kept as a
+            # comment: the next build reads it, and a human can put it back.
+            if block.devices[0] not in walked:
+                aside(block, _UNWALKED)
+        elif block.kind == "property":
+            if block.key == "Property Core AutoShutter":
+                aside(block, _AUTO_SHUTTER)
+            else:
+                aside(block, _DEVICE_PROPERTY if block.devices else _CORE_PROPERTY)
         elif block.kind == "other":
             aside(block, _UNREAD)
         else:
@@ -617,7 +669,7 @@ def plan_config(
         refusals=_refusals(scan),
         notes=[],
     )
-    if not scan.complete:
+    if cut_short(scan):
         return plan
 
     plan.devices, plan.left_out = _select_devices(scan)
@@ -647,17 +699,19 @@ def plan_config(
                 )
         own_labels[device.label] = usable
 
+    seen = {
+        row.name for walk in (stand, camera) if walk is not None for row in walk.devices
+    }
     if previous is not None:
-        plan.carried, plan.not_carried = _split_previous(previous, written, own_labels)
+        plan.carried, plan.not_carried = _split_previous(
+            previous, written, own_labels, seen
+        )
 
     if not any(d.type == "Camera" for d in plan.devices):
         plan.notes.append(
             f"no camera: {stand.adapter} provides none; pass --camera-adapter with "
             "the camera's adapter (smc discover lists the installed ones)"
         )
-    seen = {
-        row.name for walk in (stand, camera) if walk is not None for row in walk.devices
-    }
     for name in skip:
         if name not in seen:
             where = stand.adapter + (

@@ -10,10 +10,13 @@ under ``tmp_path``.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import subprocess
 import sys
-from collections.abc import Callable
+import tempfile
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
@@ -23,7 +26,7 @@ from typer.testing import CliRunner, Result
 
 from smc.cli import app
 from smc.discovery import _mm_child, diagnosis, mm_inventory
-from smc.discovery.mm_inventory import ChildResult, build_section
+from smc.discovery.mm_inventory import BuildRun, ChildResult, build_section
 from smc.discovery.models import BuildScan, BuiltDevice, ProbedDevice, ProbeResult
 from smc.hardware import core as core_mod
 from smc.hardware.backends import nikon
@@ -413,15 +416,27 @@ def test_a_child_that_cannot_start_is_a_note(
 
 
 class _StubCore:
-    """Adapter ``Fake``: a hub ``H`` and under it a camera, a shutter and a wheel."""
+    """Adapter ``Fake``: a hub ``H`` and under it a camera, a shutter and a wheel.
+
+    Adapter ``Cam`` is a camera adapter: a hub ``CH`` and a camera ``CCam``.
+    ``dies_on`` names the device whose initialisation ends the process, as a
+    vendor driver that crashes does (``SystemExit`` passes the walk's
+    ``except Exception``, like the process dying under it).
+    """
 
     def __init__(
-        self, *, parent_error: bool = False, labels_error: bool = False
+        self,
+        *,
+        parent_error: bool = False,
+        labels_error: bool = False,
+        dies_on: str | None = None,
     ) -> None:
         self.parent_error = parent_error
         self.labels_error = labels_error
+        self.dies_on = dies_on
         self.parents: dict[str, str] = {}
         self.initialised: set[str] = set()
+        self.loaded: list[str] = []
         self.released = False
 
     _TYPES: ClassVar[dict[str, int]] = {
@@ -429,23 +444,28 @@ class _StubCore:
         "Cam": int(DeviceType.CameraDevice),
         "Shut": int(DeviceType.ShutterDevice),
         "Wheel": int(DeviceType.StateDevice),
+        "CH": int(DeviceType.HubDevice),
+        "CCam": int(DeviceType.CameraDevice),
     }
-    _LISTED = ("H", "Cam", "Shut", "Wheel")
+    _ADAPTERS: ClassVar[dict[str, tuple[str, ...]]] = {
+        "Fake": ("H", "Cam", "Shut", "Wheel"),
+        "Cam": ("CH", "CCam"),
+    }
 
     def getDeviceAdapterNames(self) -> tuple[str, ...]:  # noqa: N802
-        return ("Fake",)
+        return tuple(self._ADAPTERS)
 
     def getAvailableDevices(self, name: str) -> tuple[str, ...]:  # noqa: N802
-        return self._LISTED
+        return self._ADAPTERS[name]
 
     def getAvailableDeviceTypes(self, name: str) -> tuple[int, ...]:  # noqa: N802
-        return tuple(self._TYPES[n] for n in self._LISTED)
+        return tuple(self._TYPES[n] for n in self._ADAPTERS[name])
 
     def getAvailableDeviceDescriptions(self, name: str) -> tuple[str, ...]:  # noqa: N802
-        return tuple("N/A" for _ in self._LISTED)
+        return tuple("N/A" for _ in self._ADAPTERS[name])
 
     def loadDevice(self, label: str, adapter: str, device: str) -> None:  # noqa: N802
-        pass
+        self.loaded.append(label)
 
     def setParentLabel(self, label: str, parent: str) -> None:  # noqa: N802
         self.parents[label] = parent
@@ -454,6 +474,8 @@ class _StubCore:
         return False
 
     def initializeDevice(self, label: str) -> None:  # noqa: N802
+        if label == self.dies_on:
+            raise SystemExit(9)
         self.initialised.add(label)
 
     def getInstalledDevices(self, hub: str) -> tuple[str, ...]:  # noqa: N802
@@ -493,6 +515,106 @@ def _run_build_in_process(
     result = ChildResult()
     _mm_child._build(core, result, path, "Fake", None, ())  # type: ignore[arg-type]
     return ChildResult.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def _build_that_dies(
+    core: _StubCore,
+    path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    camera: str | None = None,
+    stand: str = "Fake",
+    skip: Sequence[str] = (),
+) -> ChildResult:
+    """Run the build until ``core`` ends the process; read what the file holds."""
+    released: list[bool] = []
+    monkeypatch.setattr(_mm_child, "close_core", lambda c: released.append(True))
+    with pytest.raises(SystemExit):
+        _mm_child._build(core, ChildResult(), path, stand, camera, skip)  # type: ignore[arg-type]
+    # The `finally` still releases the stand: nothing holds it after a death.
+    assert released == [True]
+    return ChildResult.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def test_a_child_that_dies_in_the_stands_walk_leaves_the_rows_it_had_finished(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    left = _build_that_dies(
+        _StubCore(dies_on="Shut"), tmp_path / "result.json", monkeypatch
+    )
+
+    # The shutter killed it: the hub and the camera are on file, the scan is not
+    # whole, and nothing in it looks like a verdict on the stand.
+    scan = left.build
+    assert scan is not None
+    assert not scan.complete
+    assert [d.name for d in scan.stand.devices] == ["H", "Cam"]
+    assert not scan.stand.complete
+    assert scan.camera is None
+    assert scan.devices == []
+
+
+def test_a_child_that_dies_in_the_cameras_walk_keeps_the_whole_stand_walk(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    left = _build_that_dies(
+        _StubCore(dies_on="CCam"),
+        tmp_path / "result.json",
+        monkeypatch,
+        camera="Cam",
+    )
+
+    scan = left.build
+    assert scan is not None
+    assert not scan.complete
+    # The stand was finished before the camera adapter was touched.
+    assert scan.stand.complete
+    assert [d.name for d in scan.stand.devices] == ["H", "Cam", "Shut", "Wheel"]
+    assert scan.camera is not None
+    assert not scan.camera.complete
+    assert [d.name for d in scan.camera.devices] == ["CH"]
+
+
+def test_the_camera_walk_leaves_a_device_out_when_told_and_never_loads_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    core = _StubCore()
+    monkeypatch.setattr(_mm_child, "close_core", lambda c: None)
+    path = tmp_path / "result.json"
+
+    _mm_child._build(core, ChildResult(), path, "Fake", "Cam", ["CCam"])  # type: ignore[arg-type]
+
+    scan = ChildResult.model_validate_json(path.read_text(encoding="utf-8")).build
+    assert scan is not None
+    assert scan.camera is not None
+    (row,) = [d for d in scan.camera.devices if d.name == "CCam"]
+    assert (row.status, row.reason) == ("not-probed", "left out: --skip CCam")
+    assert "CCam" not in core.loaded
+    # The camera walk reports each step too: a crash there names its device.
+    err = capsys.readouterr().err.splitlines()
+    assert "listing Cam" in err
+    assert "probing Cam/CH" in err
+    assert "reading Cam/CH" in err
+
+
+def test_both_walks_run_when_the_stand_cannot_be_walked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The camera is diagnosed in the same visit as a stand that is not there.
+    monkeypatch.setattr(_mm_child, "close_core", lambda c: None)
+    path = tmp_path / "result.json"
+
+    _mm_child._build(_StubCore(), ChildResult(), path, "NoSuchAdapter", "Cam", ())  # type: ignore[arg-type]
+
+    scan = ChildResult.model_validate_json(path.read_text(encoding="utf-8")).build
+    assert scan is not None
+    assert scan.complete
+    assert scan.stand.error == "adapter not installed"
+    assert scan.camera is not None
+    assert [d.status for d in scan.camera.devices] == ["ok", "ok"]
+    assert [d.label for d in scan.devices] == ["CH", "CCam"]
 
 
 def test_the_whole_scan_is_written_before_the_core_is_released(
@@ -639,6 +761,18 @@ def test_a_build_from_the_demo_hub_loads_back_with_its_devices_and_roles(
     text = _flat(result.output)
     assert f"✓ wrote {out}" in text
     assert f"check it with: smc doctor --config {out}" in text
+    # MMCore picks the only camera, XY stage, autofocus and shutter by itself, so
+    # a core that answers `DCam` does not show that the file said so.
+    lines = _lines(out)
+    for slot, label in (
+        ("Camera", "DCam"),
+        ("Shutter", "DShutter"),
+        ("Focus", "DStage"),
+        ("XYStage", "DXYStage"),
+        ("AutoFocus", "DAutoFocus"),
+    ):
+        assert f"Property,Core,{slot},{label}" in lines
+    assert "Property,Core,AutoShutter,1" in lines
     core = _core_of(out)
     try:
         # DHub and its 19 peripherals, and the Core itself.
@@ -1056,7 +1190,13 @@ def test_out_is_required() -> None:
 # --- what the stand's profile decides ----------------------------------------------------
 
 
-def _profile(tmp_path: Path, config_lines: str, *, search: Path | None = None) -> Path:
+def _profile(
+    tmp_path: Path,
+    config_lines: str,
+    *,
+    search: Path | None = None,
+    roles: str = '[roles.assign]\nshutter = "Shut"\n',
+) -> Path:
     """A profile file beside its configuration, which is only read for its stands."""
     (tmp_path / "scope.cfg").write_text(config_lines, encoding="utf-8")
     folders = f'["{search.as_posix()}"]' if search is not None else "[]"
@@ -1064,7 +1204,7 @@ def _profile(tmp_path: Path, config_lines: str, *, search: Path | None = None) -
     path.write_text(
         '[microscope]\nname = "scope"\nvendor = "Test"\n\n'
         f'[micromanager]\nconfig = "scope.cfg"\nadapter_search_paths = {folders}\n\n'
-        '[roles.assign]\nshutter = "Shut"\n',
+        + roles,
         encoding="utf-8",
     )
     return path
@@ -1128,7 +1268,7 @@ def test_a_profile_that_does_not_load_is_one_line_and_exit_1(tmp_path: Path) -> 
     assert "missing.toml" in _flat(result.output)
 
 
-def test_the_profiles_role_assignments_and_exclusions_reach_the_plan(
+def test_the_profiles_role_assignments_reach_the_plan(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     devices = [
@@ -1355,3 +1495,453 @@ def test_a_dry_run_prints_a_carried_line_that_is_not_utf8(
     assert result.exit_code == 0, result.output
     assert "ConfigGroup,Channel," in result.output
     assert out.read_bytes() == b"ConfigGroup,Channel,\xb5m,Wheel,State,1\n"
+
+
+# --- what the file keeps, and when it is written -------------------------------------------
+
+
+def _whole_scan(adapter: str, devices: Sequence[BuiltDevice]) -> BuildScan:
+    return BuildScan(
+        stand=ProbeResult(
+            adapter=adapter,
+            devices=[
+                ProbedDevice(name=d.label, type=d.type, status="ok") for d in devices
+            ],
+        ),
+        devices=list(devices),
+    )
+
+
+def _stand_with_a_wheel(adapter: str = "Fake") -> BuildScan:
+    return _whole_scan(
+        adapter,
+        [
+            _built("H", "Hub", parent=None, library=adapter),
+            _built("Cam", "Camera", library=adapter),
+            _built("Wheel", "State", library=adapter),
+        ],
+    )
+
+
+def test_the_file_and_its_bak_keep_the_bytes_that_are_not_utf8(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The write of the command itself, not a copy of it: a cp1252 `µ` is one byte
+    # in the file it came from, and must be that byte in both files (FM-80).
+    _fake_child(monkeypatch, tmp_path, _stand_with_a_wheel())
+    out = tmp_path / "x.cfg"
+    previous = b"ConfigGroup,Channel,\xb5m,Wheel,State,1\r\n"
+    out.write_bytes(previous)
+
+    result = _build("--adapter", "Fake", "--out", str(out), "--force")
+
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "x.cfg.bak").read_bytes() == previous
+    data = out.read_bytes()
+    assert b"ConfigGroup,Channel,\xb5m,Wheel,State,1\n" in data
+    assert b"\r" not in data
+
+
+def test_the_file_is_written_before_the_report_is_printed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # FM-30: a broken pipe or a Ctrl-C while the report is printed must not lose
+    # the file. The report's first line asks whether the file is there yet.
+    from smc.discovery import report as report_mod
+
+    _fake_child(monkeypatch, tmp_path, _stand_with_a_wheel())
+    out = tmp_path / "x.cfg"
+    on_disk_when_printed: list[bool] = []
+    real = report_mod.probe_renderables
+
+    def watching(probe: ProbeResult) -> list[object]:
+        on_disk_when_printed.append(out.exists())
+        return real(probe)  # type: ignore[return-value]
+
+    monkeypatch.setattr(report_mod, "probe_renderables", watching)
+
+    result = _build("--adapter", "Fake", "--out", str(out))
+
+    assert result.exit_code == 0, result.output
+    assert on_disk_when_printed == [True]
+
+
+def test_a_folder_that_cannot_be_written_is_refused_before_any_child_starts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    sentinel = tmp_path / "child-was-started"
+    _sentinel_child(monkeypatch, sentinel)
+
+    def read_only(*args: object, **kwargs: object) -> None:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(tempfile, "TemporaryFile", read_only)
+
+    result = _build("--adapter", "DemoCamera", "--out", str(tmp_path / "x.cfg"))
+
+    assert result.exit_code == 1, result.output
+    assert f"✗ cannot write to {tmp_path}" in _flat(result.output)
+    assert not sentinel.exists()
+    # A dry run writes nothing, so it does not need the folder to be writable.
+    dry = _build(
+        "--adapter", "DemoCamera", "--out", str(tmp_path / "x.cfg"), "--dry-run"
+    )
+    assert "cannot write to" not in dry.output
+    assert sentinel.exists()
+
+
+def test_the_options_reach_the_build_as_they_were_given(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    seen: list[dict[str, object]] = []
+
+    def recording(stand: str, **kwargs: object) -> BuildRun:
+        seen.append({"stand": stand, **kwargs})
+        return BuildRun(scan=None, notes=[], stopped_at=None)
+
+    monkeypatch.setattr(mm_inventory, "build_section", recording)
+    folder = tmp_path / "adapters"
+    folder.mkdir()
+    profile = _profile(tmp_path, "Device,Ti2,NikonTi2,Ti2-E__0\n", search=folder)
+
+    result = _build(
+        "--profile",
+        str(profile),
+        "--camera-adapter",
+        "Cam",
+        "--skip",
+        " Dia ",
+        "--skip",
+        "Lamp",
+        "--timeout-s",
+        "7",
+        "--out",
+        str(tmp_path / "x.cfg"),
+    )
+
+    assert result.exit_code == 1, result.output
+    assert len(seen) == 1
+    (call,) = seen
+    assert call["stand"] == "NikonTi2"
+    assert call["camera"] == "Cam"
+    assert call["skip"] == ["Dia", "Lamp"]
+    assert call["timeout_s"] == 7.0
+    assert [Path(p).resolve() for p in call["search_paths"]] == [folder.resolve()]  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("value", ["1", "3600"])
+def test_the_ends_of_the_timeout_range_are_accepted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: str
+) -> None:
+    _fake_child(monkeypatch, tmp_path, None)
+
+    result = _build(
+        "--adapter", "Fake", "--timeout-s", value, "--out", str(tmp_path / "x.cfg")
+    )
+
+    # It ran and found no result: not a usage error.
+    assert result.exit_code == 1, result.output
+
+
+def test_the_profiles_role_exclusions_reach_the_plan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    devices = [
+        _built("H", "Hub", parent=None),
+        _built("Cam", "Camera"),
+        _built("Dia", "Shutter"),
+        _built("Shut", "Shutter"),
+    ]
+    _fake_child(monkeypatch, tmp_path, _whole_scan("NikonTi2", devices))
+    config = "Device,Ti2-E__0,NikonTi2,Ti2-E__0\n"
+    plain = tmp_path / "plain"
+    excluding = tmp_path / "excluding"
+    plain.mkdir()
+    excluding.mkdir()
+    plain_profile = _profile(plain, config, roles="")
+    excluding_profile = _profile(
+        excluding, config, roles='[roles.exclude]\nshutter = ["Dia"]\n'
+    )
+
+    first = _build("--profile", str(plain_profile), "--out", str(plain / "x.cfg"))
+    second = _build(
+        "--profile", str(excluding_profile), "--out", str(excluding / "x.cfg")
+    )
+
+    assert first.exit_code == 0, first.output
+    assert second.exit_code == 0, second.output
+    # Control: without the exclusion the heuristic prefers the lamp's shutter.
+    assert "Property,Core,Shutter,Dia" in _lines(plain / "x.cfg")
+    assert "Property,Core,Shutter,Shut" in _lines(excluding / "x.cfg")
+
+
+def test_a_previous_file_with_a_blank_row_is_read_not_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Saved from a spreadsheet: blank rows come back as commas.
+    _fake_child(monkeypatch, tmp_path, _stand_with_a_wheel())
+    out = tmp_path / "x.cfg"
+    out.write_text(
+        "ConfigGroup,Channel,A,Wheel,State,0\r\n,,,,,\r\n,\r\n", encoding="utf-8"
+    )
+
+    result = _build("--adapter", "Fake", "--out", str(out), "--dry-run")
+
+    assert result.exit_code == 0, result.output
+    assert "Traceback" not in result.output
+    assert "ConfigGroup,Channel,A,Wheel,State,0" in result.output.splitlines()
+
+
+def test_a_scan_whose_walks_are_cut_short_writes_nothing_whatever_it_says_of_itself(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    scan = _stand_with_a_wheel()
+    scan.stand.complete = False
+    _fake_child(monkeypatch, tmp_path, scan, stderr="probing Fake/Cam\n", exit_code=3)
+    out = tmp_path / "x.cfg"
+
+    result = _build("--adapter", "Fake", "--out", str(out))
+
+    assert result.exit_code == 1, result.output
+    assert not out.exists()
+    text = _flat(result.output)
+    assert "✗ the build child stopped before the end" in text
+    assert "re-run with --skip Cam to leave it out" in text
+
+
+# --- the .bak that cannot be made --------------------------------------------------------
+
+
+def _replace_that_fails_for(
+    monkeypatch: pytest.MonkeyPatch, *suffixes: str
+) -> list[str]:
+    """``os.replace`` as a Windows PC with antivirus on the file, for some targets."""
+    real = os.replace
+    refused: list[str] = []
+
+    def replace(src: object, dst: object) -> None:
+        if str(dst).endswith(suffixes):
+            refused.append(str(dst))
+            raise PermissionError(13, "Permission denied (held by the antivirus)")
+        real(src, dst)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "replace", replace)
+    return refused
+
+
+def test_when_the_bak_cannot_be_made_the_new_configuration_is_kept_beside_the_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _fake_child(monkeypatch, tmp_path, _stand_with_a_wheel())
+    out = tmp_path / "x.cfg"
+    previous = b"ConfigGroup,Channel,A,Wheel,State,0\n"
+    out.write_bytes(previous)
+    refused = _replace_that_fails_for(monkeypatch, ".bak")
+
+    result = _build("--adapter", "Fake", "--out", str(out), "--force")
+
+    assert result.exit_code == 1, result.output
+    assert refused == [str(tmp_path / "x.cfg.bak")]
+    text = _flat(result.output)
+    kept = tmp_path / "x.cfg.new"
+    assert f"could not save the previous file as {tmp_path / 'x.cfg.bak'}" in text
+    assert f"{out} was not replaced" in text
+    assert f"the new configuration is kept as {kept}" in text
+    # The previous file is as it was; the result of the build is on disk.
+    assert out.read_bytes() == previous
+    assert "Device,Cam,Fake,Cam" in _lines(kept)
+    assert "ConfigGroup,Channel,A,Wheel,State,0" in _lines(kept)
+    # Nothing else is left behind: no partial file that holds the old bytes.
+    assert list(tmp_path.glob(".*.part")) == []
+    assert not (tmp_path / "x.cfg.bak").exists()
+
+
+def test_when_neither_the_bak_nor_the_kept_file_can_be_made_the_message_says_so(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _fake_child(monkeypatch, tmp_path, _stand_with_a_wheel())
+    out = tmp_path / "x.cfg"
+    out.write_bytes(b"Device,A,B,C\n")
+    _replace_that_fails_for(monkeypatch, ".bak", ".new")
+
+    result = _build("--adapter", "Fake", "--out", str(out), "--force")
+
+    assert result.exit_code == 1, result.output
+    text = _flat(result.output)
+    assert "could not save the previous file" in text
+    assert "could not be kept as" in text
+    assert out.read_bytes() == b"Device,A,B,C\n"
+    # The report is still on screen: it is all that is left.
+    assert "Probe of Fake" in text
+
+
+# --- the hint after a stop -------------------------------------------------------------
+
+
+def test_a_line_that_names_no_adapter_of_the_build_is_not_a_device_to_leave_out() -> (
+    None
+):
+    # A vendor DLL writes to the same file as the child's progress lines (FM-01).
+    stop = mm_inventory._stopped_at
+    assert stop("reading C:/Program Files/x.ini", ["DemoCamera"]) is None
+    assert stop("probing Other/Dev", ["DemoCamera", "Cam"]) is None
+    assert stop("probing Cam/Dev", ["DemoCamera", "Cam"]) == "Dev"
+    assert stop("probing DemoCamera/Dev", ["DemoCamera"]) == "Dev"
+
+
+def test_a_child_that_prints_like_a_progress_line_does_not_name_a_device(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _fake_child(
+        monkeypatch,
+        tmp_path,
+        _partial(),
+        stderr="reading C:/vendor/config.ini\n",
+        exit_code=3,
+    )
+
+    run = build_section("DemoCamera", timeout_s=30)
+
+    assert run.stopped_at is None
+
+
+def test_a_child_stopped_by_the_deadline_says_the_device_may_only_be_slow(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _fake_child(
+        monkeypatch,
+        tmp_path,
+        _partial(),
+        stderr="probing DemoCamera/DWheel\n",
+        then="time.sleep(30)\n",
+    )
+    crash = tmp_path / "crash"
+    crash.mkdir()
+
+    slow = _build(
+        "--adapter", "DemoCamera", "--timeout-s", "1", "--out", str(tmp_path / "a.cfg")
+    )
+
+    assert slow.exit_code == 1, slow.output
+    text = _flat(slow.output)
+    assert "re-run with --skip DWheel to leave it out" in text
+    assert "or, if DWheel was only slow, raise --timeout-s (it was 1 s)" in text
+    # A child that crashed is not slow: the advice is the other one only.
+    _fake_child(
+        monkeypatch,
+        crash,
+        _partial(),
+        stderr="probing DemoCamera/DWheel\n",
+        exit_code=3,
+    )
+    died = _build("--adapter", "DemoCamera", "--out", str(tmp_path / "b.cfg"))
+    assert "re-run with --skip DWheel to leave it out" in _flat(died.output)
+    assert "only slow" not in died.output
+
+
+def test_the_child_writes_its_progress_in_utf8_whatever_the_console_code_page(
+    tmp_path: Path,
+) -> None:
+    # A redirected Windows stream is cp1252, and would write the micro sign as one
+    # byte the parent reads as a replacement character: the --skip hint would
+    # name no device. PYTHONIOENCODING stands in for that stream (FM-42).
+    stderr_file = tmp_path / "stderr.txt"
+    code = (
+        "from smc.discovery import _mm_child\n"
+        "_mm_child._use_utf8_stderr()\n"
+        "_mm_child._progress('reading Fake/Lamp \\N{MICRO SIGN}m')\n"
+        "_mm_child._progress('reading Fake/Obj \\N{GREEK SMALL LETTER LAMDA}')\n"
+    )
+    with stderr_file.open("wb") as err:
+        subprocess.run(
+            [sys.executable, "-c", code],
+            stderr=err,
+            env={**os.environ, "PYTHONIOENCODING": "cp1252", "PYTHONUTF8": "0"},
+            cwd=tmp_path,
+            check=True,
+            timeout=60,
+        )
+
+    assert stderr_file.read_bytes().decode("utf-8").splitlines() == [
+        "reading Fake/Lamp \N{MICRO SIGN}m",
+        "reading Fake/Obj \N{GREEK SMALL LETTER LAMDA}",
+    ]
+    last = mm_inventory._last_progress(stderr_file)
+    assert mm_inventory._stopped_at(last, ["Fake"]) == (
+        "Obj \N{GREEK SMALL LETTER LAMDA}"
+    )
+
+
+def test_the_real_child_writes_utf8_to_its_stderr_file_whatever_the_code_page(
+    tmp_path: Path,
+) -> None:
+    # The whole child, not its helper: `main` must switch the stream. An adapter
+    # that is not installed is a result, not a crash; its name is on the first
+    # progress line.
+    stderr_file = tmp_path / "stderr.txt"
+    with stderr_file.open("wb") as err:
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "smc.discovery._mm_child",
+                "--result",
+                str(tmp_path / "result.json"),
+                "--build=Ad\N{MICRO SIGN}",
+            ],
+            stderr=err,
+            env={**os.environ, "PYTHONIOENCODING": "cp1252", "PYTHONUTF8": "0"},
+            cwd=tmp_path,
+            check=True,
+            timeout=120,
+        )
+
+    assert stderr_file.read_bytes() == "listing Ad\N{MICRO SIGN}\n".encode()
+
+
+# --- mm_section's texts did not change when its runner was shared -----------------------------
+
+
+def _section_child(monkeypatch: pytest.MonkeyPatch, body: str) -> None:
+    code = (
+        "import os, sys, time\n"
+        "RESULT = sys.argv[sys.argv.index('--result') + 1]\n" + body
+    )
+    monkeypatch.setattr(mm_inventory, "CHILD_COMMAND", [sys.executable, "-c", code])
+
+
+def test_mm_section_keeps_the_texts_of_its_notes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _section_child(
+        monkeypatch, "sys.stderr.write('probing Fake/Dev\\n')\nos._exit(3)\n"
+    )
+    _, _, crashed = mm_inventory.mm_section(["Fake"], timeout_s=30)
+    # A failure and no result: the suffix the survey has always had.
+    assert crashed == [
+        "adapters: the adapter child exited 3 while probing Fake/Dev; "
+        "device lists missing, adapter names kept"
+    ]
+
+    _section_child(monkeypatch, "os._exit(0)\n")
+    _, _, silent = mm_inventory.mm_section(["Fake"], timeout_s=30)
+    assert silent == ["adapters: the adapter child wrote no result"]
+
+    _section_child(monkeypatch, "open(RESULT, 'w').write('{no')\n")
+    _, _, garbled = mm_inventory.mm_section(["Fake"], timeout_s=30)
+    assert len(garbled) == 1
+    assert garbled[0].startswith(
+        "adapters: the adapter child's result could not be read"
+    )
+
+    _section_child(monkeypatch, "time.sleep(30)\n")
+    _, _, hung = mm_inventory.mm_section(["Fake"], timeout_s=1)
+    assert hung == [
+        "adapters: the adapter child did not finish in 1 s and was stopped; "
+        "device lists missing, adapter names kept"
+    ]
+
+    monkeypatch.setattr(mm_inventory, "CHILD_COMMAND", [str(tmp_path / "missing")])
+    _, _, absent = mm_inventory.mm_section(["Fake"], timeout_s=30)
+    assert len(absent) == 1
+    assert absent[0].startswith("adapters: the adapter child could not start")

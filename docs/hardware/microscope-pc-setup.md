@@ -219,7 +219,11 @@ lists the installed adapters). No camera adapter is tried unasked.
   simulator when the stand is off.
 - **`--force`** replaces an existing `--out`, which is saved first as
   `<out>.bak`. Without it, an existing file is refused before anything is
-  initialised.
+  initialised. If the `.bak` cannot be made (antivirus or an editor holds it),
+  `--out` is not replaced and the new configuration is written as `<out>.new`,
+  which the message names: the result of the build is never only on screen.
+  After a timeout, the hint offers a longer `--timeout-s` as well as `--skip`:
+  a slow device is not a crashing one.
 - **A rebuild never loses a line it does not generate.** The presets, pixel
   sizes, a device's typed state labels and `Delay` and `FocusDirection` lines of
   the file it replaces are carried over; one that names a device the new file does
@@ -228,6 +232,9 @@ lists the installed adapters). No camera adapter is tried unasked.
   line `! set aside: <block>: <why>` for each. A later build reads those comments
   as lines again, so a preset comes back once its device does. Device `Property`
   lines are always set aside: put a device setting in a preset (`System/Startup`).
+  So is a `Device` line of an adapter the build did not walk (a serial port's,
+  an Arduino's), and an `AutoShutter` other than 1, which the build otherwise
+  writes. The file's own comments are not carried: `<out>.bak` keeps them.
 - **A device that needs a serial port is left out**, with its reason: this
   command sets no port.
 - **Check what it wrote**: `smc doctor --config %SURVEY%\nikon-ti2.cfg`, as the

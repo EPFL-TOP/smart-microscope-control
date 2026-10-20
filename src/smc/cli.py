@@ -889,28 +889,65 @@ def _check_build_out(out: Path, *, replace: bool, writing: bool) -> None:
 def _write_config(out: Path, text: str, *, keep_previous: bool) -> Path | None:
     """Replace ``out`` by ``text``, after saving what was there as ``<out>.bak``.
 
-    The ``.bak`` comes first, through :func:`_replace` as well, so that a failure
-    on the way never leaves the previous bytes only in memory. Both writes are
-    UTF-8 with ``surrogateescape`` (a carried cp1252 byte comes back as it was)
-    and LF line ends on every OS: MMCore loads either (measured).
+    The ``.bak`` comes first, so that the previous bytes are saved before they
+    are replaced, and both go through a temporary file and ``os.replace``
+    (FM-38). When the ``.bak`` cannot be made (Windows antivirus or an editor
+    holds it, FM-24), ``out`` is not replaced, and the new text, the result of
+    minutes of hardware work, is kept beside it as ``<out>.new``: it must be on
+    disk somewhere that the message names (FM-34). The text is UTF-8 with
+    ``surrogateescape`` (a carried cp1252 byte comes back as it was) and LF line
+    ends on every OS: MMCore loads either (measured).
 
     Returns:
         The ``.bak`` path when the previous file was saved.
 
     Raises:
-        OSError: Either file could not be written.
+        OSError: ``out`` could not be written; the message says what was kept.
     """
+
+    def write(partial: Path) -> None:
+        partial.write_text(
+            text, encoding="utf-8", errors="surrogateescape", newline="\n"
+        )
+
     backup = None
     if keep_previous:
         backup = _backup_path(out)
-        _replace(backup, lambda partial: shutil.copyfile(out, partial))
-    _replace(
-        out,
-        lambda partial: partial.write_text(
-            text, encoding="utf-8", errors="surrogateescape", newline="\n"
-        ),
-    )
+        try:
+            _save_backup(out, backup)
+        except OSError as exc:
+            kept = out.with_name(out.name + ".new")
+            why = f"could not save the previous file as {backup}: {exc.strerror or exc}"
+            try:
+                _replace(kept, write)
+            except OSError as second:
+                raise OSError(
+                    f"{why}; and the new configuration could not be kept as "
+                    f"{kept} either: {second.strerror or second}"
+                ) from exc
+            raise OSError(
+                f"{why}; {out} was not replaced, and the new configuration is "
+                f"kept as {kept}"
+            ) from exc
+    _replace(out, write)
     return backup
+
+
+def _save_backup(out: Path, backup: Path) -> None:
+    """Copy ``out`` onto ``backup`` through a temporary file, or leave ``backup`` as it was.
+
+    ``_replace`` would keep the temporary file when the final rename fails and
+    word it as "the new file": here that file holds the old bytes, and the
+    message would lie about what it is.
+    """
+    partial = backup.with_name(f".{backup.name}.{secrets.token_hex(4)}.part")
+    try:
+        shutil.copyfile(out, partial)
+        os.replace(partial, backup)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            partial.unlink()
+        raise
 
 
 def _printable(text: str) -> str:
@@ -1024,7 +1061,12 @@ def config_build(
     nothing and prints the likely causes. Nothing here moves a stage.
     """
     from smc.discovery import report as report_mod
-    from smc.discovery.config_build import plan_config, read_previous, render_config
+    from smc.discovery.config_build import (
+        cut_short,
+        plan_config,
+        read_previous,
+        render_config,
+    )
     from smc.discovery.mm_inventory import build_section, check_device_name
 
     def say(text: str) -> None:
@@ -1151,8 +1193,15 @@ def config_build(
         )
         for refusal in refusals:
             _fail(_printable(refusal))
-        if run.stopped_at and (scan is None or not scan.complete):
+        if run.stopped_at and (scan is None or cut_short(scan)):
             say(f"re-run with --skip {run.stopped_at} to leave it out")
+            if any("did not finish in" in note for note in run.notes):
+                # The deadline stopped it on whatever it was doing: a slow device
+                # is not a crashing one, and leaving it out costs the file.
+                say(
+                    f"or, if {run.stopped_at} was only slow, raise --timeout-s "
+                    f"(it was {timeout_s:g} s)"
+                )
         raise typer.Exit(code=_EXIT_ERROR)
     if dry_run:
         say(f"--- would write {out} ---")
