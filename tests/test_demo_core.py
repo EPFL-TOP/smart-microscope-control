@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from smc.hardware.core import CoreError, open_core, opened
+from smc.hardware.core import CoreError, new_core, open_core, opened
 
 pytestmark = pytest.mark.demo
 
@@ -163,6 +163,69 @@ def test_open_core_refuses_a_bad_adapter_dir_before_building_a_core(
     # open_core builds. A valid call must reach it.
     with pytest.raises(RuntimeError, match="a core was built"):
         open_core(None)
+
+
+@pytest.mark.usefixtures("need_mm", "restored_path")
+def test_new_core_searches_as_open_core_does_and_loads_no_device(
+    tmp_path: Path,
+) -> None:
+    default = _default_search_paths()
+    first = _adapters_dir(tmp_path, "first")
+    second = _adapters_dir(tmp_path, "second")
+    core = new_core([first, second])
+    try:
+        assert _search_paths(core) == [str(first), str(second), *default]
+        # pymmcore-plus prepends one by one, so the second would come first.
+        entries = os.environ["PATH"].split(os.pathsep)
+        assert entries[:2] == [str(first), str(second)]
+        # What a build walks into: nothing is loaded, not even the demo's devices.
+        assert list(core.getLoadedDevices()) == ["Core"]
+    finally:
+        core.unloadAllDevices()
+
+
+@pytest.mark.usefixtures("restored_path")
+def test_new_core_refuses_a_bad_adapter_dir_before_building_a_core(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import pymmcore_plus
+
+    def no_core(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("a core was built before the directories were checked")
+
+    monkeypatch.setattr(pymmcore_plus, "CMMCorePlus", no_core)
+    with pytest.raises(CoreError, match="adapter search path is not a directory"):
+        new_core([tmp_path / "not-there"])
+    # Control: the refusal says nothing unless the stand-in is what is built.
+    with pytest.raises(RuntimeError, match="a core was built"):
+        new_core()
+
+
+@pytest.mark.usefixtures("need_mm", "restored_path")
+def test_open_core_still_loads_the_demo_after_new_core_was_split_out(
+    tmp_path: Path,
+) -> None:
+    extra = _adapters_dir(tmp_path)
+    core = open_core(None, adapter_search_paths=[extra])
+    try:
+        assert core.getCameraDevice()
+        assert _search_paths(core)[0] == str(extra)
+    finally:
+        core.unloadAllDevices()
+
+
+@pytest.mark.usefixtures("need_mm", "restored_path")
+def test_a_failed_load_still_names_the_folders_that_were_searched(
+    tmp_path: Path,
+) -> None:
+    extra = _adapters_dir(tmp_path)
+    config = tmp_path / "broken.cfg"
+    config.write_text("Device,X,NoSuchAdapterForTests,Y\n", encoding="utf-8")
+
+    with pytest.raises(CoreError, match="adapter search paths, first wins") as caught:
+        open_core(config, adapter_search_paths=[extra])
+
+    assert str(extra) in str(caught.value)
 
 
 @pytest.mark.usefixtures("need_mm", "restored_path")

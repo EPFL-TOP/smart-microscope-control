@@ -53,6 +53,7 @@ __all__ = [
     "MicroManagerStatus",
     "close_core",
     "find_install",
+    "new_core",
     "open_core",
     "opened",
     "status",
@@ -223,6 +224,58 @@ def _put_on_path(directories: Sequence[str]) -> None:
         os.environ["PATH"] = updated
 
 
+def new_core(adapter_search_paths: Sequence[str | Path] = ()) -> CMMCorePlus:
+    """Create a core that searches for adapters as ``open_core`` would, and load nothing.
+
+    This is what ``open_core`` does before it loads a file, taken out of it so
+    that a build of a configuration (``smc config build``, design m2 §10.3)
+    finds adapters in the folders the profile's stand will be opened with
+    (FM-76), and puts their DLL folders on ``PATH`` the same way (FM-81). The
+    arguments, the checks, the effect on ``PATH`` and the INFO line are those of
+    :func:`open_core`; the caller owns the core and releases it
+    (:func:`close_core`).
+
+    Raises:
+        CoreError: An entry of ``adapter_search_paths`` is empty, cannot be
+            expanded or is not a directory; no core was built.
+        TypeError: ``adapter_search_paths`` is a single path, not a sequence.
+    """
+    return _new_core(adapter_search_paths)[0]
+
+
+def _new_core(
+    adapter_search_paths: Sequence[str | Path],
+) -> tuple[CMMCorePlus, str]:
+    """:func:`new_core`, and the suffix that tells a failed load where it searched.
+
+    ``open_core`` appends the suffix to the errors of its load. It is empty when
+    no extra directory was given, as before the split.
+    """
+    from pymmcore_plus import CMMCorePlus
+
+    # Checked before any core exists: MMCore would take a missing directory
+    # without a word, and a failed check must not leave a core behind.
+    extras = _checked_dirs(adapter_search_paths)
+    core = CMMCorePlus()
+    # Done on every open, with or without extras, so that the log and PATH
+    # look the same everywhere. It replaces the core's list, hence the merge.
+    effective = _merge_search_paths(extras, core.getDeviceAdapterSearchPaths())
+    core.setDeviceAdapterSearchPaths(effective)
+    _put_on_path(effective)
+    log.info(
+        "Micro-Manager adapter search paths, first wins: %s",
+        "; ".join(effective) or "(none)",
+    )
+    # MMCore takes each adapter from the first directory that has it, with no
+    # fallback: an extra folder holding a mismatched adapter fails a load that
+    # worked without it. MMCore's message names the file; this names the folder
+    # order, which the INFO line above hides unless the log level is raised.
+    searched = (
+        f" (adapter search paths, first wins: {'; '.join(effective)})" if extras else ""
+    )
+    return core, searched
+
+
 def open_core(
     config: str | Path | None = None,
     *,
@@ -268,28 +321,7 @@ def open_core(
         TypeError: When ``adapter_search_paths`` is a single path, not a
             sequence of them.
     """
-    from pymmcore_plus import CMMCorePlus
-
-    # Checked before any core exists: MMCore would take a missing directory
-    # without a word, and a failed check must not leave a core behind.
-    extras = _checked_dirs(adapter_search_paths)
-    core = CMMCorePlus()
-    # Done on every open, with or without extras, so that the log and PATH
-    # look the same everywhere. It replaces the core's list, hence the merge.
-    effective = _merge_search_paths(extras, core.getDeviceAdapterSearchPaths())
-    core.setDeviceAdapterSearchPaths(effective)
-    _put_on_path(effective)
-    log.info(
-        "Micro-Manager adapter search paths, first wins: %s",
-        "; ".join(effective) or "(none)",
-    )
-    # MMCore takes each adapter from the first directory that has it, with no
-    # fallback: an extra folder holding a mismatched adapter fails a load that
-    # worked without it. MMCore's message names the file; this names the folder
-    # order, which the INFO line above hides unless the log level is raised.
-    searched = (
-        f" (adapter search paths, first wins: {'; '.join(effective)})" if extras else ""
-    )
+    core, searched = _new_core(adapter_search_paths)
     if config is None:
         if find_install() is None:
             raise CoreError(INSTALL_HINT)
