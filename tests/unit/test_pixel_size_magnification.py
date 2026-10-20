@@ -30,12 +30,15 @@ LEVER = "IntermediateMagnification"
 #: The demo profile's two sizes (10X 0.65 um, 40X 0.1625 um) and their labels.
 TEN_X = "Nikon 10X S Fluor"
 FORTY_X = "Nikon 40X Plan Fluor ELWD"
-#: What the camera's and the turret's pixel size say, whole (FM-45), for a factor ``bad``.
-_UNKNOWN = (
-    "the magnification factor (the product of the Magnifier devices) reads "
-    "{bad!r}, not a positive number; reporting 0.0 (unknown) for objective "
-    "'Nikon 10X S Fluor'"
-)
+
+
+def _unknown(bad: float, objective: str = TEN_X) -> str:
+    """What the camera's and the turret's pixel size say for a factor ``bad``, whole (FM-45)."""
+    return (
+        "the magnification factor (the product of the Magnifier devices) reads "
+        f"{bad!r}, not a positive number; reporting 0.0 (unknown) for objective "
+        f"{objective!r}"
+    )
 
 
 @pytest.fixture
@@ -107,7 +110,19 @@ def test_a_factor_that_is_not_a_positive_number_gives_unknown(
         assert microscope.require(Camera).pixel_size_um() == 0.0
         assert microscope.require(ObjectiveTurret).pixel_size_um() == 0.0
     # One warning per call, never de-duplicated, like a bad profile entry.
-    assert caplog.messages == [_UNKNOWN.format(bad=bad)] * 2
+    assert caplog.messages == [_unknown(bad)] * 2
+
+
+def test_the_warning_names_the_objective_that_was_asked_about(
+    stand: tuple[FakeCore, Microscope], caplog: pytest.LogCaptureFixture
+) -> None:
+    # The turret answers for any label, so the current objective (the 10X)
+    # is not the one the operator asked about.
+    core, microscope = stand
+    core.magnification[LEVER] = 0.0
+    with caplog.at_level(logging.WARNING, logger="smc.hardware.backends.mm"):
+        assert microscope.require(ObjectiveTurret).pixel_size_um(FORTY_X) == 0.0
+    assert caplog.messages == [_unknown(0.0, FORTY_X)]
 
 
 def test_a_core_pixel_size_that_is_not_finite_is_not_reported(
@@ -120,7 +135,7 @@ def test_a_core_pixel_size_that_is_not_finite_is_not_reported(
     core.pixel_size_um = math.inf
     with caplog.at_level(logging.WARNING, logger="smc.hardware.backends.mm"):
         assert camera.pixel_size_um() == 0.0
-    assert caplog.messages == [_UNKNOWN.format(bad=0.0)]
+    assert caplog.messages == [_unknown(0.0)]
     # With a valid factor the profile's size stands in for it.
     core.magnification[LEVER] = 1.0
     assert camera.pixel_size_um() == 0.65
@@ -155,3 +170,37 @@ def test_an_objective_the_profile_lacks_is_unknown_without_reading_the_magnifier
     assert microscope.require(ObjectiveTurret).pixel_size_um("Objective-2") == 0.0
     core.setStateLabel("Objective", "Objective-2")
     assert microscope.require(Camera).pixel_size_um() == 0.0
+
+
+def test_a_bad_profile_entry_is_unknown_before_the_magnifier_is_read(
+    stand: tuple[FakeCore, Microscope], caplog: pytest.LogCaptureFixture
+) -> None:
+    # FM-43: both checks false, and the step after them observable. The profile
+    # is checked first, so with the magnifier faulting the answer is still 0.0
+    # and the only warning is the profile's, not a HardwareError.
+    core, microscope = stand
+    microscope.profile.camera.pixel_size_um[TEN_X] = math.nan
+    core.failing[LEVER] = RuntimeError("no answer")
+    with caplog.at_level(logging.WARNING, logger="smc.hardware.backends.mm"):
+        assert microscope.require(Camera).pixel_size_um() == 0.0
+        assert microscope.require(ObjectiveTurret).pixel_size_um() == 0.0
+    warning = (
+        "pixel size for objective 'Nikon 10X S Fluor' in the profile is nan, not a "
+        "positive number; reporting 0.0 (unknown). Fix it under [camera] "
+        "pixel_size_um in the profile."
+    )
+    assert caplog.messages == [warning, warning]
+
+
+def test_both_pixel_sizes_are_read_while_the_microscope_is_halted(
+    stand: tuple[FakeCore, Microscope],
+) -> None:
+    # The factor is a read: Executor.read takes no lock and a halt does not
+    # refuse it (design §13), so a stopped stand still reports its pixel size.
+    # An acquire would raise MicroscopeHaltedError here (FM-15).
+    core, microscope = stand
+    core.magnification[LEVER] = 1.5
+    microscope.stop()
+    expected = pytest.approx(0.65 / 1.5)
+    assert microscope.require(ObjectiveTurret).pixel_size_um() == expected
+    assert microscope.require(Camera).pixel_size_um() == expected

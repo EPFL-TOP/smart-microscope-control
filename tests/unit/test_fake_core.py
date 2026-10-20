@@ -543,6 +543,18 @@ def test_magnification_factor_is_the_product_of_the_magnifiers() -> None:
     assert core.getMagnificationFactor() == 3.0
 
 
+@pytest.mark.parametrize(
+    "label", ["Camera", "Z", "XY", "Objective", "White Light Shutter"]
+)
+def test_only_a_magnifier_counts_in_the_factor(label: str) -> None:
+    # One device of every other type the demo has: a magnification entry for it
+    # does not scale the factor, and its failing entry does not reach the call.
+    core = FakeCore.demo_like(extra_devices=[_magnifier("A")])
+    core.magnification = {"A": 1.5, label: 7.0}
+    core.failing[label] = RuntimeError(f"{label}: no answer")
+    assert core.getMagnificationFactor() == 1.5
+
+
 def test_demo_like_appends_its_extra_devices_after_the_demos_own() -> None:
     plain = FakeCore.demo_like().getLoadedDevices()
     core = FakeCore.demo_like(extra_devices=[_magnifier("A")])

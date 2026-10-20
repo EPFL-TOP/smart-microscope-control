@@ -501,6 +501,29 @@ def test_pixel_size_fallback_reads_binning_or_reports_unknown(
     assert ("cannot be read" in caplog.text) == (expected == 0.0)
 
 
+class _FaultingFactorCore(_BinningCore):
+    """A core whose magnification factor cannot be read."""
+
+    def getMagnificationFactor(self) -> float:  # noqa: N802
+        raise RuntimeError("no answer")
+
+
+def test_an_unreadable_binning_is_reported_before_the_magnification_factor_is_read(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # FM-43: both are wrong, and the step after the binning is observable. The
+    # binning comes first, so the answer is 0.0 with its warning only, not the
+    # HardwareError of the factor.
+    core: Any = _FaultingFactorCore("abc")
+    camera = MMCamera(core, "Cam", _executor(), {"10x": 0.5}, lambda: "10x")
+    with caplog.at_level(logging.WARNING, logger="smc.hardware.backends.mm"):
+        assert camera.pixel_size_um() == 0.0
+    assert caplog.messages == [
+        "camera 'Cam' binning 'abc' cannot be read as one integer factor; the "
+        "profile pixel size cannot be scaled, reporting 0.0 (unknown)."
+    ]
+
+
 def test_wait_times_out_cleanly() -> None:
     core = _AlwaysBusyCore()
     stage = MMXYStage(core, "XY", _executor(), Safety(max_jog_um=1.0))  # type: ignore[arg-type]
