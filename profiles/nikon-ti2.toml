@@ -35,6 +35,11 @@ turret_requires_confirm = true
 [camera]
 # No pixel_size_um entry: a missing objective is unknown, never guessed. The nominal
 # 2.75 µm (4x), 1.1 µm (10x) and 0.275 µm (40x) are assumed, not measured (#22).
+# A size entered here is for binning 1 and a magnification factor of 1.0 (the lever
+# at 1.0x): the layer divides it by the core's getMagnificationFactor(), the product of
+# the Magnifier devices, and a size measured with the lever at 1.5x is entered
+# multiplied by 1.5. What IntermediateMagnification reads at each position is
+# unverified (#16).
 
 [quirks]
 # The direction of focus (which way is up) is unknown (#98).

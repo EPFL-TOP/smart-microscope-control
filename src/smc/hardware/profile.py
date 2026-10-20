@@ -246,7 +246,11 @@ class SafetySection(_Section):
 
 
 class CameraSection(_Section):
-    """Per-objective pixel sizes at binning 1; a missing objective is unknown (0.0)."""
+    """Per-objective pixel sizes at binning 1 and a magnification factor of 1.0.
+
+    A missing objective is unknown (0.0). The factor is the core's
+    (``getMagnificationFactor()``), which the layer divides by (m2 §8.10).
+    """
 
     pixel_size_um: dict[str, float] = Field(default_factory=dict)
 
