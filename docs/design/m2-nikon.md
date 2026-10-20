@@ -2270,7 +2270,9 @@ carries are written back unchanged (a cp1252 `µ` stays one byte); an
    `ok` Camera devices and the hub that is the parent of one of them, each
    in row order. Left out, with the reason written at the end of the file:
    every `failed` and `not-probed` row of both walks (`error` with the hint
-   after a dash, or `reason`); the camera adapter's other `ok` devices (`not
+   after a dash, or `reason`; for a device that needs a port, `needs a
+   serial port, which smc config build does not set`, since the walk's
+   reason names `--port`, which this command lacks); the camera adapter's other `ok` devices (`not
    a camera: --camera-adapter adds cameras only`); a device whose name holds
    `,`, a line break or a control character (`its name cannot be written in
    a .cfg line`), and any device whose parent is left out.
