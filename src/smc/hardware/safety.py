@@ -1597,7 +1597,9 @@ class Executor:
             else:
                 # `%s` of the text, not `%r` of the error: a record that keeps
                 # the error keeps its traceback (FM-92); the line is the same.
-                self._log(logging.WARNING, "%s failed (%s)%s", what, repr(error), note)
+                self._log(
+                    logging.WARNING, "%s failed (%s)%s", what, _repr_of(error), note
+                )
         try:
             return error
         finally:
@@ -1617,6 +1619,19 @@ class Executor:
             self._logger.log(level, msg, *args, stacklevel=2)
         else:
             held.append((level, msg, args))
+
+
+def _repr_of(error: BaseException) -> str:
+    """``repr(error)`` for a log line; the type's name when the repr itself fails.
+
+    The line used to hand the error to ``logging``, which swallows a formatting
+    failure; formatted here, a failing ``__repr__`` would replace the stop's own
+    error, which ``_send_safe`` never raises (#166).
+    """
+    try:
+        return repr(error)
+    except Exception:
+        return f"<{type(error).__name__}: its repr failed>"
 
 
 def _resolve_timeout(timeout_s: float | Callable[[], float]) -> float:

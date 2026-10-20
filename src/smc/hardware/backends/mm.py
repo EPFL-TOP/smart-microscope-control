@@ -528,8 +528,15 @@ def _yes_no(value: bool | None) -> str:
 
 
 def _named(failure: BaseException) -> str:
-    """``failure`` for a message: an interrupt's ``str()`` is empty, so its type names it."""
-    return str(failure) or type(failure).__name__
+    """``failure`` for a message: an interrupt's ``str()`` is empty, so its type names it.
+
+    Also when ``str()`` itself fails: a log line or a read that is unknown
+    "never an error" must not become one (#166).
+    """
+    try:
+        return str(failure) or type(failure).__name__
+    except Exception:
+        return type(failure).__name__
 
 
 def _check_autofocus_slot(core: CMMCorePlus, label: str) -> None:
