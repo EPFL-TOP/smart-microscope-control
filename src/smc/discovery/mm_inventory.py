@@ -298,13 +298,16 @@ def probe_adapter(
             except Exception as exc:
                 probed.append(
                     ProbedDevice(
-                        name=device.name, type=device.type, ok=False, error=str(exc)
+                        name=device.name,
+                        type=device.type,
+                        status="failed",
+                        error=str(exc),
                     )
                 )
                 continue
             if device.type == _HUB_TYPE and hub_label is None:
                 hub_label = device.name
-            probed.append(ProbedDevice(name=device.name, type=device.type, ok=True))
+            probed.append(ProbedDevice(name=device.name, type=device.type, status="ok"))
     finally:
         core_mod.close_core(core)
     return ProbeResult(adapter=name, devices=probed)
