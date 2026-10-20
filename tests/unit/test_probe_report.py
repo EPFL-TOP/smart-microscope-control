@@ -6,8 +6,11 @@ is a third result, and the report must show it with its reason.
 
 from __future__ import annotations
 
+import io
 import json
 from datetime import datetime, timezone
+
+from rich.console import Console
 
 from smc.discovery.models import (
     AdapterDevice,
@@ -17,7 +20,7 @@ from smc.discovery.models import (
     ProbeResult,
     SystemInfo,
 )
-from smc.discovery.report import render_text
+from smc.discovery.report import probe_renderables, render_text
 
 
 def _inventory(probe: ProbeResult | None = None) -> Inventory:
@@ -293,3 +296,37 @@ def test_the_listing_prints_the_meaning_under_the_devices() -> None:
     assert "— no devices listed — meaning: the SDK could not be reached" in text
     # An adapter with nothing to add gets no row.
     assert text.count("meaning:") == 2
+
+
+def test_probe_renderables_is_the_table_the_survey_prints_for_its_probe() -> None:
+    probe = ProbeResult(
+        adapter="Fake",
+        devices=[
+            ProbedDevice(name="[H]", type="Hub", status="failed", error="stand off"),
+            ProbedDevice(
+                name="X",
+                type="Camera",
+                status="not-probed",
+                reason="left out: --skip X",
+            ),
+        ],
+        notes=["a note"],
+        causes=["first cause", "second cause"],
+        complete=False,
+    )
+    inv = _inventory(probe)
+
+    # The same items, in the same order: `smc config build` prints a walk as
+    # `smc discover --probe-adapter` does, and a bracketed name stays text.
+    items = probe_renderables(probe)
+    survey_tail = render_text(inv).split("Notes (0)")[0]
+    console = Console(file=io.StringIO(), width=120, color_system=None)
+    for item in items:
+        console.print(item)
+    printed = " ".join(console.file.getvalue().split())  # type: ignore[attr-defined]
+    assert printed in " ".join(survey_tail.split())
+    assert "[H]" in printed
+    assert "INCOMPLETE" in printed
+    assert "left out: --skip X" in printed
+    assert "- a note" in printed
+    assert "1. first cause" in printed
