@@ -1,0 +1,26 @@
+name: closing references
+
+# A separate workflow because editing a PR's body must re-run it, and the
+# main CI should not re-run its test matrix on every edit.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  closing-refs:
+    name: closing references
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: What this PR will close, against its branch name
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD: ${{ github.head_ref }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          refs=$(gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json closingIssuesReferences --jq '[.closingIssuesReferences[].number] | map(tostring) | join(" ")')
+          python3 scripts/ci/check_closing_refs.py "$HEAD" $refs

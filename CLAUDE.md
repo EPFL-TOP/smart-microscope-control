@@ -75,6 +75,8 @@ relies on it).
    for *close*, *fix* or *resolve* followed by `#N` anywhere in the body
    or the squash commit, even after "not" ("Does not close #16" closed
    #16 on the merge of #127; "fix #13" closed #13 on the merge of #136).
+   The *closing references* check fails a PR that would close another
+   issue than its branch's, and a `docs/` or `adr/` PR that closes any.
 7. Report outcomes faithfully. If a test fails or a step was skipped, say
    so with the output.
 
