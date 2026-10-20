@@ -38,6 +38,10 @@ def test_no_entry_starts_at_one(fm) -> None:
     assert fm.next_id(["no ids here, PFM-3x"]) == "FM-01"
 
 
+@pytest.mark.skipif(
+    not (ROOT / ".git").exists(),
+    reason="needs the repository's history: mutant.py's scratch copies have no .git (#14)",
+)
 def test_the_script_prints_an_id_beyond_the_checklist_on_disk() -> None:
     out = subprocess.run(
         [sys.executable, str(SCRIPT)],
