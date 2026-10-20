@@ -101,3 +101,160 @@ def test_an_inventory_with_a_probe_round_trips_through_json() -> None:
     assert back.probe is not None
     assert back.probe.complete is False
     assert back.adapters.listed[0].list_meaning == "the SDK could not be reached"
+
+
+def test_the_probe_table_shows_not_probed_and_its_reason() -> None:
+    probe = ProbeResult(
+        adapter="Fake",
+        devices=[
+            ProbedDevice(name="Hub1", type="Hub", status="ok"),
+            ProbedDevice(
+                name="Cam1", type="Camera", status="ok", source="hub", port="COM3"
+            ),
+            ProbedDevice(
+                name="Bad1",
+                type="Camera",
+                status="failed",
+                source="both",
+                error="Native module failed to load (6)",
+                hint="the vendor runtime could not be loaded",
+            ),
+            ProbedDevice(
+                name="Skip1",
+                type="Shutter",
+                status="not-probed",
+                reason="needs a port: pass --port COMx to probe it",
+            ),
+        ],
+    )
+
+    text = _flat(_inventory(probe))
+
+    for column in ("device", "type", "from", "result", "detail"):
+        assert column in text
+    # Every result word, and what each one says in the detail column.
+    assert "FAILED Native module failed to load (6) — the vendor runtime" in text
+    assert "not probed needs a port: pass --port COMx to probe it" in text
+    assert "ok port COM3" in text
+    # The sources of the rows.
+    assert "Cam1 Camera hub ok" in text
+    assert "Bad1 Camera both FAILED" in text
+
+
+def test_a_probe_row_that_was_not_probed_never_reads_as_ok() -> None:
+    probe = ProbeResult(
+        adapter="Fake",
+        devices=[
+            ProbedDevice(
+                name="Skip1", type="Shutter", status="not-probed", reason="why"
+            )
+        ],
+    )
+
+    text = _flat(_inventory(probe))
+
+    assert "Skip1 Shutter adapter not probed why" in text
+    assert "Skip1 Shutter adapter ok" not in text
+
+
+def test_probe_text_is_never_read_as_markup() -> None:
+    # FM-36: rich would drop `[red]` and `[roles.assign]` read as markup.
+    probe = ProbeResult(
+        adapter="Fake[x]",
+        devices=[
+            ProbedDevice(
+                name="[b]Dev",
+                type="Camera",
+                status="failed",
+                error="bad [roles.assign] here",
+                hint="try [red]x",
+            ),
+            ProbedDevice(
+                name="Dev2",
+                type="Camera",
+                status="not-probed",
+                reason="why [roles.assign] [red]x",
+            ),
+        ],
+        error="error [roles.assign] [red]x",
+        notes=["note [roles.assign] [red]x"],
+        causes=["cause [roles.assign] [red]x"],
+    )
+
+    text = _flat(_inventory(probe))
+
+    for phrase in (
+        "Probe of Fake[x]",
+        "[b]Dev",
+        "bad [roles.assign] here",
+        "try [red]x",
+        "why [roles.assign] [red]x",
+        "error [roles.assign] [red]x",
+        "- note [roles.assign] [red]x",
+        "1. cause [roles.assign] [red]x",
+    ):
+        assert phrase in text
+
+
+def test_an_incomplete_probe_says_so_in_its_title() -> None:
+    whole = ProbeResult(adapter="Fake", devices=[], complete=True)
+    partial = ProbeResult(adapter="Fake", devices=[], complete=False)
+
+    assert "INCOMPLETE" not in _flat(_inventory(whole))
+    text = _flat(_inventory(partial))
+    assert "INCOMPLETE: the adapter child stopped before the last device" in text
+    assert "Probe of Fake" in text
+
+
+def test_causes_are_numbered_under_in_order_of_likelihood() -> None:
+    probe = ProbeResult(
+        adapter="Fake",
+        devices=[ProbedDevice(name="H", type="Hub", status="failed", error="no")],
+        causes=["first cause", "second cause", "third cause"],
+    )
+
+    text = _flat(_inventory(probe))
+
+    assert (
+        "In order of likelihood: 1. first cause 2. second cause 3. third cause" in text
+    )
+
+
+def test_a_probe_without_causes_or_notes_prints_neither() -> None:
+    probe = ProbeResult(
+        adapter="Fake", devices=[ProbedDevice(name="A", type="Camera", status="ok")]
+    )
+
+    text = _flat(_inventory(probe))
+
+    assert "In order of likelihood" not in text
+
+
+def test_the_listing_prints_the_meaning_under_the_devices() -> None:
+    inv = _inventory()
+    inv.adapters.listed = [
+        AdapterInfo(
+            name="NikonTI",
+            installed=True,
+            devices=[AdapterDevice(name="TIScope", type="Hub")],
+            list_meaning="a fixed list proves nothing",
+        ),
+        AdapterInfo(
+            name="NikonTi2",
+            installed=True,
+            devices=[],
+            list_meaning="the SDK could not be reached",
+        ),
+        AdapterInfo(
+            name="DemoCamera",
+            installed=True,
+            devices=[AdapterDevice(name="DCam", type="Camera")],
+        ),
+    ]
+
+    text = _flat(inv)
+
+    assert "TIScope Hub meaning: a fixed list proves nothing" in text
+    assert "— no devices listed — meaning: the SDK could not be reached" in text
+    # An adapter with nothing to add gets no row.
+    assert text.count("meaning:") == 2
