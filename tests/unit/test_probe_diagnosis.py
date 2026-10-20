@@ -114,6 +114,10 @@ def test_the_nikon_module_and_the_diagnosis_module_import_in_either_order(
         capture_output=True,
         text=True,
         encoding="utf-8",
+        # A Windows child writes the ANSI code page, and `-I` ignores
+        # PYTHONIOENCODING: a traceback naming an accented profile folder must
+        # show as text, not as a UnicodeDecodeError in place of the failure.
+        errors="replace",
         timeout=120,
         check=False,
     )

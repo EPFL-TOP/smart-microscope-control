@@ -130,8 +130,9 @@ def test_the_probe_table_shows_not_probed_and_its_reason() -> None:
 
     text = _flat(_inventory(probe))
 
-    for column in ("device", "type", "from", "result", "detail"):
-        assert column in text
+    # The five headers of the probe table, in order and side by side: another
+    # table of the report holds `device` and `type` too (FM-45).
+    assert "device type from result detail" in text
     # Every result word, and what each one says in the detail column.
     assert "FAILED Native module failed to load (6) — the vendor runtime" in text
     assert "not probed needs a port: pass --port COMx to probe it" in text
@@ -139,6 +140,40 @@ def test_the_probe_table_shows_not_probed_and_its_reason() -> None:
     # The sources of the rows.
     assert "Cam1 Camera hub ok" in text
     assert "Bad1 Camera both FAILED" in text
+
+
+def test_a_failed_row_shows_mmcores_text_with_or_without_a_hint() -> None:
+    probe = ProbeResult(
+        adapter="Fake",
+        devices=[
+            ProbedDevice(
+                name="Bare",
+                type="Camera",
+                status="failed",
+                error="Error in device X (10005)",
+            ),
+            ProbedDevice(
+                name="Hinted",
+                type="Camera",
+                status="failed",
+                error="Native module failed to load (6)",
+                hint="the vendor runtime could not be loaded",
+            ),
+            ProbedDevice(
+                name="Mute",
+                type="Camera",
+                status="failed",
+                hint="only a hint is known",
+            ),
+        ],
+    )
+
+    text = _flat(_inventory(probe))
+
+    # The raw error is the point of a probe: without a hint it must still show.
+    assert "Bare Camera adapter FAILED Error in device X (10005)" in text
+    assert "Hinted Camera adapter FAILED Native module failed to load (6) —" in text
+    assert "Mute Camera adapter FAILED only a hint is known" in text
 
 
 def test_a_probe_row_that_was_not_probed_never_reads_as_ok() -> None:

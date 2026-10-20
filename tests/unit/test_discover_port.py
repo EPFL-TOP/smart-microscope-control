@@ -8,6 +8,7 @@ child as one argument that ``argparse`` cannot read as an option.
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -34,9 +35,28 @@ runner = CliRunner(env={"COLUMNS": "200"})
 
 
 @pytest.mark.parametrize(
-    "bad", ["", "   ", "C" * 201, "COM3\x00", "COM3\n", "COM\t3", "COM3\x7f"]
+    "bad",
+    [
+        "",
+        "   ",
+        "C" * 201,
+        "COM3\x00",
+        "COM3\n",
+        "COM\t3",
+        "COM3\x7f",
+        # What a port copied from a web page, an e-mail or a BOM-prefixed file
+        # carries: it looks right on screen and names no port.
+        "COM3\N{NO-BREAK SPACE}",
+        "\N{ZERO WIDTH NO-BREAK SPACE}COM3",
+        "COM3\N{ZERO WIDTH SPACE}",
+        "COM3\N{NEXT LINE}",
+        "COM3\N{LINE SEPARATOR}",
+        "COM\N{IDEOGRAPHIC SPACE}3",
+    ],
 )
-def test_check_port_refuses_empty_long_and_control_characters(bad: str) -> None:
+def test_check_port_refuses_empty_long_control_and_invisible_characters(
+    bad: str,
+) -> None:
     with pytest.raises(ValueError, match="port"):
         check_port(bad)
 
@@ -103,15 +123,18 @@ def test_mm_section_does_not_pass_a_port_it_was_not_given(
     assert not [a for a in argv if a.startswith("--port")]
 
 
+@pytest.mark.parametrize(
+    ("bad", "why"), [("COM3\n", "control character"), ("", "empty"), ("  ", "empty")]
+)
 def test_mm_section_refuses_a_port_check_port_refuses_before_starting_a_child(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, bad: str, why: str
 ) -> None:
     argv_path = tmp_path / "argv.json"
     _argv_recording_child(monkeypatch, argv_path)
 
-    with pytest.raises(ValueError, match="control character"):
+    with pytest.raises(ValueError, match=why):
         mm_inventory.mm_section(
-            ["DemoCamera"], probe="Utilities", port="COM3\n", timeout_s=30
+            ["DemoCamera"], probe="Utilities", port=bad, timeout_s=30
         )
 
     assert not argv_path.exists()
@@ -132,16 +155,21 @@ def test_inventory_refuses_a_port_without_a_probe(
         discovery.inventory(probe_port="COM3", include_os=False)
 
 
+@pytest.mark.parametrize("empty", ["", " "])
 def test_inventory_refuses_a_bad_port_before_the_survey(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, empty: str
 ) -> None:
     def survey_must_not_run(*_: object, **__: object) -> object:
         raise AssertionError("the survey ran")
 
     monkeypatch.setattr(mm_inventory, "system_section", survey_must_not_run)
 
+    # An empty string is a port that was given, and refused: it must not read as
+    # "no port" (FM-78).
     with pytest.raises(ValueError, match="empty"):
-        discovery.inventory(probe_adapter="Utilities", probe_port=" ", include_os=False)
+        discovery.inventory(
+            probe_adapter="Utilities", probe_port=empty, include_os=False
+        )
 
 
 def _system() -> SystemInfo:
@@ -241,6 +269,108 @@ def test_a_checkpoint_swallows_nothing_but_an_oserror(
 
     with pytest.raises(ValueError, match="not a file problem"):
         checkpoint(ProbeResult(adapter="Fake", complete=False))
+
+
+# --- the child's final write -------------------------------------------------------
+
+
+def test_a_result_file_held_for_a_moment_is_replaced_after_a_short_wait(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Windows antivirus can hold the file the last checkpoint just wrote
+    # (FM-24); the final write is the one that carries the whole result.
+    real_replace = os.replace
+    attempts: list[int] = []
+
+    def held_twice(src: Path, dst: Path) -> None:
+        attempts.append(1)
+        if len(attempts) <= 2:
+            raise PermissionError(13, "held by a scanner")
+        real_replace(src, dst)
+
+    monkeypatch.setattr(_mm_child.os, "replace", held_twice)
+    monkeypatch.setattr(_mm_child, "_REPLACE_WAIT_S", 0.0)
+    path = tmp_path / "result.json"
+
+    _mm_child._write(
+        ChildResult(listed=[AdapterInfo(name="Fake", installed=True)]), path
+    )
+
+    assert len(attempts) == 3
+    written = ChildResult.model_validate_json(path.read_text(encoding="utf-8"))
+    assert [a.name for a in written.listed] == ["Fake"]
+
+
+def test_a_result_file_that_stays_held_raises_after_the_last_try(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    attempts: list[int] = []
+
+    def always_held(src: Path, dst: Path) -> None:
+        attempts.append(1)
+        raise PermissionError(13, "held by a scanner")
+
+    monkeypatch.setattr(_mm_child.os, "replace", always_held)
+    monkeypatch.setattr(_mm_child, "_REPLACE_WAIT_S", 0.0)
+
+    with pytest.raises(PermissionError):
+        _mm_child._write(ChildResult(), tmp_path / "result.json")
+
+    assert len(attempts) == _mm_child._REPLACE_TRIES
+
+
+def test_the_whole_result_is_written_before_the_probes_core_is_released(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Unloading a vendor's devices can hang or crash the child (FM-02): the
+    # final result, with its error, its notes and `complete`, must already be in
+    # the file when that happens. The stand records what it found at the unload.
+    path = tmp_path / "result.json"
+    seen: list[ChildResult | None] = []
+
+    def walk(core: object, adapter: str, **kwargs: object) -> ProbeResult:
+        return ProbeResult(
+            adapter=adapter,
+            devices=[_row("H")],
+            error="hub H initialised but reports no peripherals",
+            notes=["--port COM3 was not used: no device of Fake needs a port"],
+        )
+
+    def release(core: object) -> None:
+        # Recorded, not asserted: close_core's caller is a `finally` (FM-94).
+        text = path.read_text(encoding="utf-8") if path.exists() else None
+        seen.append(None if text is None else ChildResult.model_validate_json(text))
+
+    monkeypatch.setattr(_mm_child, "walk_adapter", walk)
+    monkeypatch.setattr(_mm_child, "close_core", release)
+
+    _mm_child._probe(object(), ChildResult(), path, "Fake", "COM3")  # type: ignore[arg-type]
+
+    (at_release,) = seen
+    assert at_release is not None
+    assert at_release.probe is not None
+    assert at_release.probe.complete is True
+    assert at_release.probe.error == "hub H initialised but reports no peripherals"
+    assert [d.name for d in at_release.probe.devices] == ["H"]
+    assert len(at_release.probe.notes) == 1
+
+
+def test_the_probes_core_is_released_when_the_walk_is_interrupted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    released: list[object] = []
+
+    def interrupted(core: object, adapter: str, **kwargs: object) -> ProbeResult:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(_mm_child, "walk_adapter", interrupted)
+    monkeypatch.setattr(_mm_child, "close_core", released.append)
+    core = object()
+
+    with pytest.raises(KeyboardInterrupt):
+        _mm_child._probe(core, ChildResult(), tmp_path / "result.json", "Fake", None)  # type: ignore[arg-type]
+
+    assert released == [core]
 
 
 # --- the CLI -----------------------------------------------------------------------

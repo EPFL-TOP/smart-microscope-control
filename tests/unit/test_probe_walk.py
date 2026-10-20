@@ -36,9 +36,13 @@ class _ProbeCore:
     ``init_errors``, ``load_errors`` and ``set_errors`` map a label to the text
     of the ``RuntimeError`` its call raises; ``list_errors`` does the same for a
     hub's ``getInstalledDevices``; ``unreadable`` names the labels whose
-    ``Port`` cannot be read. A device with a ``Port`` that is unset raises on
-    ``initializeDevice``, as a real serial adapter does, so code that
-    initialises it anyway shows ``failed``, never ``ok``.
+    ``Port`` cannot be read, and ``runtime_ports`` the labels whose ``Port`` is
+    not a pre-init property. A device with a pre-init ``Port`` that is unset
+    raises on ``initializeDevice``, as a real serial adapter does, so code that
+    initialises it anyway shows ``failed``, never ``ok``. A peripheral of a hub
+    (one a hub reports, or any listed device of an adapter that lists a hub)
+    raises on ``initializeDevice`` until ``setParentLabel`` named its hub, as the
+    Ti2's peripherals do, so a walk that sets the parent late shows ``failed``.
     """
 
     def __init__(
@@ -54,6 +58,7 @@ class _ProbeCore:
         list_errors: Mapping[str, str] | None = None,
         types: Mapping[str, str] | None = None,
         unreadable: Sequence[str] = (),
+        runtime_ports: Sequence[str] = (),
         interrupt: Sequence[str] = (),
         installed: bool = True,
         listing_error: str | None = None,
@@ -68,12 +73,14 @@ class _ProbeCore:
         self.list_errors = dict(list_errors or {})
         self.types = dict(types or {})
         self.unreadable = set(unreadable)
+        self.runtime_ports = set(runtime_ports)
         self.interrupt = set(interrupt)
         self.installed = installed
         self.listing_error = listing_error
         self.calls: list[tuple[str, ...]] = []
         self.initialised: set[str] = set()
         self.loaded: dict[str, str] = {}
+        self.parents: dict[str, str] = {}
 
     # --- the adapter's listing -------------------------------------------------
     def getDeviceAdapterNames(self) -> tuple[str, ...]:  # noqa: N802
@@ -101,6 +108,15 @@ class _ProbeCore:
 
     def setParentLabel(self, label: str, parent: str) -> None:  # noqa: N802
         self.calls.append(("setParentLabel", label, parent))
+        self.parents[label] = parent
+
+    def _needs_parent(self, label: str) -> bool:
+        if dict(self.listed).get(label) == "Hub":
+            return False  # a hub has no parent, even one that reports itself
+        if any(label in names for names in self.reported.values()):
+            return True
+        hub_listed = any(kind == "Hub" for _, kind in self.listed)
+        return hub_listed and dict(self.listed).get(label, "Hub") != "Hub"
 
     def hasProperty(self, label: str, prop: str) -> bool:  # noqa: N802
         return prop == "Port" and label in self.ports
@@ -108,7 +124,7 @@ class _ProbeCore:
     def isPropertyPreInit(self, label: str, prop: str) -> bool:  # noqa: N802
         if not self.hasProperty(label, prop):
             raise RuntimeError(f"Property {prop} not found on {label}")
-        return True
+        return label not in self.runtime_ports
 
     def getProperty(self, label: str, prop: str) -> str:  # noqa: N802
         if label in self.unreadable:
@@ -127,7 +143,10 @@ class _ProbeCore:
             raise KeyboardInterrupt
         if label in self.init_errors:
             raise RuntimeError(self.init_errors[label])
-        if label in self.ports and self.ports[label].strip().casefold() in _UNSET:
+        if self._needs_parent(label) and label not in self.parents:
+            raise RuntimeError(f"the hub of {label} is not set")
+        pre_init_port = label in self.ports and label not in self.runtime_ports
+        if pre_init_port and self.ports[label].strip().casefold() in _UNSET:
             raise RuntimeError("the serial port is not set")
         self.initialised.add(label)
 
@@ -193,7 +212,14 @@ def test_a_hub_reports_peripherals_the_adapter_does_not_list() -> None:
         "hub",
         "Shutter",
     )
-    assert ("setParentLabel", "A", "H") in core.calls
+    # The parent is named before the peripheral initialises (a Ti2 peripheral
+    # looks its hub up in `Initialize`), and the hub itself has none.
+    for peripheral in ("A", "B"):
+        assert core.parents[peripheral] == "H"
+        assert core.calls.index(("setParentLabel", peripheral, "H")) < core.calls.index(
+            ("initializeDevice", peripheral)
+        )
+    assert "H" not in core.parents
     assert result.error is None
 
 
@@ -580,11 +606,60 @@ def test_a_hub_that_needs_a_port_is_not_a_failure_and_gives_no_causes() -> None:
     assert not [c for c in core.calls if c[0] == "initializeDevice"]
 
 
-def test_the_walk_refuses_a_port_check_port_refuses() -> None:
+def test_a_port_that_is_not_a_pre_init_property_does_not_stop_the_device_initialising() -> (
+    None
+):
+    # An empty runtime Port is no reason to skip the device: only a pre-init
+    # Port has to be given before `initializeDevice`.
+    core = _ProbeCore("Fake", [("S", "Shutter")], ports={"S": ""}, runtime_ports=["S"])
+
+    result = _walk(core, port="COM9")
+
+    (row,) = result.devices
+    assert (row.status, row.port) == ("ok", None)
+    assert core.calls_of("initializeDevice", "S") == [("initializeDevice", "S")]
+    assert not [c for c in core.calls if c[0] == "setProperty"]
+
+
+def test_a_device_that_fails_after_its_port_was_set_says_which_port() -> None:
+    core = _ProbeCore(
+        "Fake", [("S", "Shutter")], ports={"S": ""}, init_errors={"S": "no answer"}
+    )
+
+    result = _walk(core, port="COM9")
+
+    (row,) = result.devices
+    assert row.status == "failed"
+    assert row.error == "no answer"
+    # What was tried is on the row, though it did not work.
+    assert row.port == "COM9"
+    assert ("setProperty", "S", "Port", "COM9") in core.calls
+    assert result.notes == []
+
+
+def test_a_port_note_does_not_claim_a_device_that_failed_to_load_was_checked() -> None:
+    # `S` could not even be loaded, so nobody asked it about its Port.
+    core = _ProbeCore(
+        "Fake",
+        [("S", "Shutter"), ("A", "Camera")],
+        ports={"S": ""},
+        load_errors={"S": "vendor SDK missing"},
+    )
+
+    result = _walk(core, port="COM9")
+
+    (note,) = result.notes
+    assert "was not used" in note
+    assert "no device of Fake needs a port" not in note
+    assert "1 not tried" in note
+
+
+@pytest.mark.parametrize("empty", ["", "  "])
+def test_the_walk_refuses_a_port_check_port_refuses(empty: str) -> None:
     core = _ProbeCore("Fake", [("A", "Camera")])
 
     with pytest.raises(ValueError, match="empty"):
-        _walk(core, port="  ")
+        _walk(core, port=empty)
 
     assert core.calls == []
 
@@ -607,6 +682,9 @@ def test_a_native_module_failure_names_the_vendor_runtime() -> None:
     assert row.error == raw
     assert row.hint is not None
     assert "DCAM-API" in row.hint
+    # The causes are a hub's: a camera whose runtime is missing is not "the
+    # stand is off" (the Hamamatsu is not fitted on the Ti2-E, and that is fine).
+    assert result.causes == []
 
     other = _ProbeCore("Other", [("Cam", "Camera")], init_errors={"Cam": raw})
     (other_row,) = _walk(other, "Other").devices
@@ -625,6 +703,7 @@ def test_a_label_mmcore_refuses_is_that_devices_failure() -> None:
     assert "reserved characters" in rows["a,b"].error
     assert rows["a,b"].type == "Camera"
     assert rows["fine"].status == "ok"
+    assert result.causes == []
 
 
 def test_a_peripheral_that_will_not_load_is_unknown_and_failed() -> None:
@@ -640,6 +719,8 @@ def test_a_peripheral_that_will_not_load_is_unknown_and_failed() -> None:
     ghost = _rows(result)["Ghost"]
     assert (ghost.status, ghost.type, ghost.source) == ("failed", "Unknown", "hub")
     assert ghost.error == "no such device"
+    # The hub initialised: one peripheral that will not load is not a hub failure.
+    assert result.causes == []
 
 
 # --- checkpoints and ownership of the core (§9.5) --------------------------------
@@ -667,6 +748,37 @@ def test_checkpoints_follow_every_row_and_only_the_returned_result_is_complete()
     # A copy, not the object the walk goes on filling.
     assert copies[0].devices == []
     assert all(c is not result for c in copies)
+
+
+def test_the_checkpoint_of_a_failed_hub_already_carries_the_causes() -> None:
+    # A crash right after the failed hub must leave the diagnosis with it.
+    core = _ProbeCore(
+        "Fake", [("H", "Hub"), ("A", "Camera")], init_errors={"H": "no answer"}
+    )
+    copies: list[ProbeResult] = []
+
+    result = _walk(core, checkpoint=copies.append)
+
+    after_hub = copies[1]
+    assert [(d.name, d.status) for d in after_hub.devices] == [("H", "failed")]
+    assert after_hub.causes == list(diagnosis.GENERIC_HUB_CAUSES)
+    assert copies[0].causes == []
+    assert result.causes == list(diagnosis.GENERIC_HUB_CAUSES)
+
+
+def test_progress_names_each_device_and_the_hubs_listing_step() -> None:
+    core = _ProbeCore("Fake", [("H", "Hub")], reported={"H": ["A"]})
+    lines: list[str] = []
+
+    _walk(core, progress=lines.append)
+
+    # The parent reads the last line that starts with `probing ` to name the
+    # device that was running when the child died (`_PROGRESS_PREFIXES`).
+    assert lines == [
+        "probing Fake/H",
+        "probing Fake/H: listing its peripherals",
+        "probing Fake/A",
+    ]
 
 
 def test_walk_adapter_leaves_the_devices_loaded_and_probe_adapter_releases_them() -> (

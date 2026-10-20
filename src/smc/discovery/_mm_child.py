@@ -26,11 +26,17 @@ import argparse
 import json
 import os
 import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from smc.discovery.mm_inventory import ChildResult, list_adapters, probe_adapter
+from smc.discovery.mm_inventory import ChildResult, list_adapters, walk_adapter
 from smc.discovery.models import ProbeResult
+from smc.hardware.core import close_core
+
+if TYPE_CHECKING:
+    from pymmcore_plus import CMMCorePlus
 
 # Windows SetErrorMode flags: no "missing DLL" dialog, no crash-reporter dialog.
 _SEM_FAILCRITICALERRORS = 0x0001
@@ -119,13 +125,28 @@ def _clean_tree(obj: object) -> object:
     return obj
 
 
+#: Windows refuses to replace a file that antivirus or a search indexer holds
+#: open for a moment (``PermissionError``), and the file was written a moment
+#: ago, often one device ago (FM-24): a few short waits, not a lost result.
+_REPLACE_TRIES = 5
+_REPLACE_WAIT_S = 0.05
+
+
 def _write(result: ChildResult, path: Path) -> None:
     partial = path.with_name(path.name + ".partial")
     partial.write_text(
         json.dumps(_clean_tree(result.model_dump(mode="json")), ensure_ascii=True),
         encoding="utf-8",
     )
-    os.replace(partial, path)
+    for attempt in range(1, _REPLACE_TRIES + 1):
+        try:
+            os.replace(partial, path)
+        except PermissionError:
+            if attempt == _REPLACE_TRIES:
+                raise
+            time.sleep(_REPLACE_WAIT_S)
+        else:
+            return
 
 
 def _checkpoint_writer(
@@ -150,6 +171,32 @@ def _checkpoint_writer(
             )
 
     return checkpoint
+
+
+def _probe(
+    core: CMMCorePlus, result: ChildResult, path: Path, adapter: str, port: str | None
+) -> None:
+    """Walk one adapter and write the whole result *before* the core is released.
+
+    The walk's last checkpoint holds the rows, not the ``error`` and the notes
+    that come after the last one, and not ``complete``. Unloading a vendor's
+    devices can hang or crash (FM-02): written after it, the whole result would
+    be lost to a death in the unload, and the report would say INCOMPLETE for a
+    probe that had finished. So this is :func:`probe_adapter` with the final
+    write between the walk and the release; the core is released in a
+    ``finally`` all the same.
+    """
+    try:
+        result.probe = walk_adapter(
+            core,
+            adapter,
+            port=port,
+            progress=_progress,
+            checkpoint=_checkpoint_writer(result, path),
+        )
+        _write(result, path)
+    finally:
+        close_core(core)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -177,13 +224,7 @@ def main(argv: list[str] | None = None) -> int:
         result.listed += list_adapters(core, [name])
     _write(result, args.result)
     if args.probe:
-        result.probe = probe_adapter(
-            args.probe,
-            port=args.port,
-            progress=_progress,
-            checkpoint=_checkpoint_writer(result, args.result),
-        )
-        _write(result, args.result)
+        _probe(CMMCorePlus(), result, args.result, args.probe, args.port)
     return 0
 
 

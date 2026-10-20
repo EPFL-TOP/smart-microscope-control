@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -268,27 +269,45 @@ def list_adapters(core: CMMCorePlus, names: list[str]) -> list[AdapterInfo]:
     return result
 
 
+def _is_invisible(char: str) -> bool:
+    """A control character, or one that prints as nothing or as a blank that is no space.
+
+    Unicode categories ``C*`` (control, format, surrogate, private, unassigned)
+    and ``Z*`` (the line and paragraph separators, and every space separator:
+    the no-break space among them) are refused; the plain space is not, since
+    a port written with one is dropped at the edges and refused nowhere else.
+    """
+    if char == " ":
+        return False
+    category = unicodedata.category(char)
+    return category[0] == "C" or category in ("Zl", "Zp", "Zs")
+
+
 def check_port(port: str) -> str:
     """The port as it will be sent to a device, or why it cannot be.
 
     Spaces around it are dropped (a pasted ``" COM3 "``); a newline, a NUL or
     any other control character is refused rather than stripped, because a
     value that holds one was not typed as a port and would reach a vendor
-    driver as it is (FM-32). An empty value is refused too: ``Path("")`` taught
-    the project that an empty string is a silent default (FM-78), and an empty
-    ``Port`` is exactly what ``Utilities`` shows for "not set".
+    driver as it is (FM-32). So are the characters that look like nothing: a
+    no-break space, a byte-order mark, a zero-width space, a line separator
+    (what a port copied from a web page, an e-mail or a Notepad file carries,
+    FM-80), which would look right on screen and name no port. An empty value
+    is refused too: ``Path("")`` taught the project that an empty string is a
+    silent default (FM-78), and an empty ``Port`` is exactly what ``Utilities``
+    shows for "not set".
 
     Raises:
         ValueError: The port is empty, longer than 200 characters, or holds a
-            character below U+0020 or U+007F.
+            control character or an invisible one.
     """
     value = port.strip(" ")
     if not value:
         raise ValueError("the port is empty")
     if len(value) > _MAX_PORT_CHARS:
         raise ValueError(f"the port is longer than {_MAX_PORT_CHARS} characters")
-    if any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
-        raise ValueError("the port holds a control character")
+    if any(_is_invisible(c) for c in value):
+        raise ValueError("the port holds an invisible or control character")
     return value
 
 
@@ -387,8 +406,13 @@ class _Walk:
         self._say(f"probing {self.name}/{label}")
         shown = type_name or "Unknown"
         port_set: str | None = None
+        asked_port = False
 
         def failed(exc: Exception) -> ProbedDevice:
+            if not asked_port:
+                # Failed before its Port was looked at: the note about --port
+                # must not claim to know whether this device needed one.
+                self.untried += 1
             error = str(exc)
             return ProbedDevice(
                 name=label,
@@ -411,7 +435,9 @@ class _Walk:
                 self.core.setParentLabel(label, parent)
         except Exception as exc:
             return failed(exc)
-        if _needs_port(self.core, label):
+        needs_port = _needs_port(self.core, label)
+        asked_port = True
+        if needs_port:
             if self.port is None:
                 return ProbedDevice(
                     name=label,
