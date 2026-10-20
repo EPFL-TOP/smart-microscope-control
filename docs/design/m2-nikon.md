@@ -2,8 +2,8 @@
 
 - **Status**: design for issue #13 (§1–§6, 2026-10-16); §3.3.1 and
   §3.11's stop rules decided in #144 (2026-10-18); §7 for #12
-  (2026-10-19); §8 for #14 (2026-10-19); §8.10 for #167 (2026-10-20). #15
-  and #48 add their own sections with their plans.
+  (2026-10-19); §8 for #14 (2026-10-19); §8.10 for #167 (2026-10-20); §9
+  for #48 (2026-10-20); §10 for #15 (2026-10-20).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1, this document is the contract between issues that are
   built in parallel. Names, module paths and signatures below are fixed; an
@@ -21,7 +21,7 @@ M2 brings the Nikon stands under the layer: the `Autofocus` capability and
 the Z interlock (#13), `ObjectiveTurret`, `LightSource` and `Channels`
 (#14), the stand knowledge from `nikon-control` (#12), the configuration
 builder (#15) and a truthful probe (#48). §1–§6 fix #13; §7 fixes #12;
-§8 fixes #14; §9 fixes #48.
+§8 fixes #14; §9 fixes #48; §10 is #15's.
 
 Not in #13: one-shot autofocus (`fullFocus`), a CLI command for the
 autofocus, the piezo (§2), camera-clocked sequences, and the Zeiss
@@ -713,6 +713,7 @@ The sample is a dish or plate with cells, focused by eye first.
 | #14 | `capabilities.py`, `errors.py`, `channels.py` (new), `backends/mm.py`, `microscope.py`, `profile.py`, `testing/fakes.py`, `tests/contracts/conftest.py`, `profiles/demo.toml`, `profiles/README.md` (§8) | after #12; alone on `backends/mm.py`, `microscope.py` and `fakes.py` (#141, #163 and #166 wait); #124 (`roles.py`) runs beside it |
 | #106, #111, #112 | `profile.py` | one at a time, not beside #13 |
 | #12 | `backends/nikon.py`, `discovery/dll_probe.py`, `discovery/_dll_child.py`, `discovery/__init__.py`, `discovery/models.py`, `discovery/report.py`, `cli.py`, `profiles/nikon-*`, `profiles/README.md` (§7) | after #13; before #48 and #15, which touch the same discovery and CLI modules |
+| #15 | `discovery/mm_inventory.py`, `discovery/_mm_child.py`, `discovery/models.py`, `discovery/report.py`, `discovery/config_build.py` (new), `hardware/core.py`, `cli.py`, `docs/hardware/microscope-pc-setup.md`, `profiles/README.md` (§10) | after #48; before #183 and #159 |
 
 ## 6. Not verified
 
@@ -2009,3 +2010,418 @@ expects a partial probe, not `None`.
   (§9.5's guard is a precaution, FM-24).
 - What `TIDiaLamp` does inside a probe on the Ti-E (§7.1): the checkpoints
   keep the other rows, and the crash itself is a Ti-E session's to read.
+
+## 10. A configuration from the devices that answer (#15)
+
+Extends M1 §9 and §10, §7 and §9 of this document. **Status**: design for
+#15 (2026-10-20). Sources: `nikon-control` (`scope/config_build.py` and the
+`build` command of `scope/cli.py`, read 2026-10-20), the demo (measured
+2026-10-20, pymmcore-plus 0.18.1, pymmcore 12.5.0.75.0) and
+`profiles/nikon-ti2.cfg`, which `nikon-control`'s builder wrote and session 0
+loaded. `smc config build` initialises every device of one adapter, as
+`smc discover --probe-adapter` does; nothing in it moves a stage.
+
+### 10.1 What is known
+
+- **`nikon-control`'s builder** loads the hub, asks it for its peripherals,
+  loads them one at a time keeping those that initialise, adds a camera,
+  resolves the roles and writes a `.cfg` that carries over eight directives
+  of the file it replaces. What is not ported, and why:
+  - it ran in its own process, so a crash on a device (the Ti-E's
+    `TIDiaLamp`, §7.1) lost the build and said nothing about which device;
+  - it renamed devices (`safe_label`: the part after a `:`, commas and `#`
+    removed); the walk of §9.3 loads each device under its own name, and a
+    name MMCore refuses as a label is that device's failure;
+  - it tried every installed camera adapter when none was named;
+  - it carried `Delay` and `FocusDirection` lines and every preset without
+    looking at the devices they name, and did not carry `Label` lines, so a
+    preset that selects a cube by a label someone typed lost that label.
+- **Measured on the demo.**
+  - `walk_adapter(core, "DemoCamera")` initialises `DHub` and its 19
+    peripherals (`source` `both`), and `getParentLabel` reads `DHub` for
+    each. Four are State devices: `DWheel` and `DStateDevice` (10 labels,
+    `State-0`…), `DObjective` (6, `Objective-A`…), `DLightPath` (3).
+  - `walk_adapter(core, "SequenceTester")` on the same core afterwards
+    initialises `THub` and its 14; no name collides with DemoCamera's. A
+    label already in use is refused by `loadDevice` (`The specified device
+    label "X" is already in use`).
+  - A `.cfg` written from that walk (`Device`, `Parent`, `Initialize`, the
+    camera slot, `Label` lines) loads back with 21 devices, with LF or CRLF
+    line ends, and with a UTF-8 byte-order mark.
+  - MMCore drops empty fields, then refuses a line whose field count is
+    wrong for its directive, and the whole load fails: `Label,DWheel,0,a,b`
+    (a label with a comma), `Label,DWheel,0,` (an empty label),
+    `ConfigGroup,Channel,Empty` and `ImageSynchro,DShutter` (this MMCore no
+    longer reads it). `ConfigGroup,G,P,DWheel,Label,` (an empty value) loads.
+  - `defineStateLabel` refuses a comma (`contains reserved characters`) and
+    accepts a line break: a label a device holds can still break a line.
+  - A `Label` or `Delay` line that names a device the file does not load
+    fails the whole load (`No device with label "NoDev"`). A preset or a
+    pixel-size line that names one loads, and the preset fails when applied
+    (`No device with label "NoDev"`); so does a preset that sets a `Label` the
+    device lacks (`Label not defined (10)`).
+  - The field counts this MMCore reads, directive included (pymmcore-plus's
+    own parser; the three marked measured): `ConfigGroup` 2, 5 or 6;
+    `ConfigPixelSize` 5; `PixelSize_um` 3; `PixelSizeAffine` 8;
+    `PixelSizeAngle_dxdz`, `PixelSizeAngle_dydz`, `PixelSizeOptimalZ_Um` 3
+    (measured); `Label` 4; `Delay` 3; `FocusDirection` 3.
+  - Roles on the DemoCamera build (`resolve`, heuristics only): `camera`
+    DCam, `xy_stage` DXYStage, `focus` DStage, `autofocus` DAutoFocus,
+    `objective_turret` DObjective, `shutter` DShutter, `light_path`
+    DLightPath; no `autofocus_offset` and no `filter_turret`.
+
+### 10.2 The walk gains `skip` — `mm_inventory.py`
+
+`walk_adapter` and `probe_adapter` gain `skip: Collection[str] = ()`
+(keyword-only, after `port`). A device whose name is in `skip` is never
+loaded: its row is `not-probed`, reason `left out: --skip <name>`, it counts
+among the untried devices of the `--port` note, and a skipped hub is not a
+failed one (no `causes`); the next listed hub is tried (rule 2). `mm_section`,
+`inventory` and `smc discover` do not take it (#15 does not touch them).
+
+`check_device_name(name: str) -> str`, beside `check_port` and with its
+rules: the stripped value; `ValueError` when it is empty, longer than 200
+characters, or holds a control or invisible character.
+
+### 10.3 The build child — `_mm_child.py`, `mm_inventory.py`, `models.py`
+
+The build runs in the adapter child, for the reasons of M1 §10 (FM-01 to
+FM-04): a device that crashes or hangs costs the build, never the parent,
+and the parent says which device it was.
+
+```python
+class BuiltDevice(BaseModel):  # models.py
+    label: str  # the device name: the walk loads each device under it
+    library: str
+    name: str
+    type: str
+    parent: str | None = None  # getParentLabel, None when it reads ""
+    state_labels: list[str] = Field(default_factory=list)  # State: position i at i
+```
+
+```python
+class BuildScan(BaseModel):  # models.py
+    stand: ProbeResult
+    camera: ProbeResult | None = None  # None: no --camera-adapter
+    devices: list[BuiltDevice] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+    complete: bool = True
+```
+
+`ChildResult` gains `build: BuildScan | None = None`.
+
+`python -m smc.discovery._mm_child --result FILE --build ADAPTER
+[--camera=ADAPTER] [--skip=NAME]… [--search-path=DIR]…`: every value travels
+as one `--opt=value` argument (§9.1). With `--build`, `--adapters` and `--all`
+are ignored, nothing is listed, and the child:
+
+1. opens its core with `core.new_core(search_paths)` (below); a `CoreError`
+   is written as `BuildScan(stand=ProbeResult(adapter=ADAPTER,
+   error=str(exc)))` and the child exits 0;
+2. walks the stand (`walk_adapter(core, ADAPTER, skip=…, progress=…,
+   checkpoint=…)`), each checkpoint writing `BuildScan(stand=<snapshot>,
+   complete=False)`;
+3. with `--camera`, walks it on the same core, each checkpoint writing
+   `BuildScan(stand=<the stand's result>, camera=<snapshot>,
+   complete=False)`. Both walks always run: a stand that failed still has its
+   camera diagnosed;
+4. for every `ok` row of both walks, stand first, in row order: progress
+   `reading <adapter>/<device>`, then `parent` and, for a State device,
+   `state_labels`. A read that raises leaves the field empty and adds a note
+   `<device>: its <parent|state labels> could not be read: <error>`;
+5. writes the whole `BuildScan` (`complete=True`) **before** `close_core`,
+   in a `finally` as `_probe` does (FM-02).
+
+`_PROGRESS_PREFIXES` gains `reading `.
+
+`core.new_core(adapter_search_paths: Sequence[str | Path] = ()) ->
+CMMCorePlus` (`smc/hardware/core.py`): what `open_core` does before it loads a
+file (checks, merge, `PATH`, the INFO line), taken out of it; `open_core`
+calls it. The build child then searches adapters as the profile's stand
+will be opened (FM-76), and the folders reach `PATH` as `open_core` puts
+them (FM-81).
+
+```python
+# Two adapters; a probe's 180 s is not verified on a hub (§9.10).
+BUILD_TIMEOUT_S = 300.0
+
+
+@dataclass(frozen=True, slots=True)
+class BuildRun:
+    scan: BuildScan | None  # None: the child wrote nothing usable
+    notes: list[str]
+    stopped_at: str | None  # the device the child was on when it died or was stopped
+
+
+def build_section(
+    stand: str,
+    *,
+    camera: str | None = None,
+    skip: Sequence[str] = (),
+    search_paths: Sequence[Path] = (),
+    timeout_s: float = BUILD_TIMEOUT_S,
+) -> BuildRun: ...
+```
+
+`build_section` and `mm_section` share one private runner (temporary
+folder as working directory, files not pipes, `CREATE_NO_WINDOW`, waited in
+slices, the tree killed at the deadline, the result file read whatever the
+exit code); `mm_section`'s behaviour and texts do not change. The build's
+notes read `build: the build child …` where `mm_section`'s read
+`adapters: the adapter child …`. `stopped_at` is the device of the last
+`probing <adapter>/<device>` or `reading <adapter>/<device>` line, set only
+when the child did not exit 0 or was stopped.
+
+### 10.4 The plan and the text — `smc/discovery/config_build.py` (new)
+
+Pure: no `pymmcore_plus`. It imports `smc.hardware.roles` (pure at module
+level).
+
+```python
+NOT_CARRIED = "# not carried: "
+FIELD_COUNTS: Mapping[str, frozenset[int]]  # §10.1's table
+```
+
+```python
+@dataclass(frozen=True, slots=True)
+class Block:
+    kind: Literal["preset", "pixel", "labels", "device", "property", "other"]
+    key: str  # "Channel/DAPI", "Res10x", "Nosepiece", "Delay ZDrive", …
+    lines: tuple[str, ...]  # verbatim, in file order
+    devices: tuple[str, ...]  # the labels it names, Core excluded
+```
+
+```python
+@dataclass(frozen=True, slots=True)
+class PreviousConfig:
+    path: Path | None
+    blocks: tuple[Block, ...]  # in order of first appearance
+    # Property,Core,<Camera|XYStage|Focus|AutoFocus|Shutter>,<label>
+    core_slots: Mapping[Role, str]
+
+
+def parse_previous(text: str, path: Path | None = None) -> PreviousConfig: ...
+def read_previous(path: Path) -> PreviousConfig | None: ...  # None: no file
+```
+
+```python
+@dataclass
+class ConfigPlan:
+    adapter: str
+    camera_adapter: str | None
+    devices: list[BuiltDevice]  # what the file loads, in the order written
+    roles: RoleMap
+    carried: list[Block]
+    not_carried: list[tuple[Block, str]]  # the block, why
+    left_out: list[tuple[str, str]]  # "<adapter>/<device>", why
+    refusals: list[str]  # not empty: nothing may be written
+    notes: list[str]
+
+    @property
+    def writable(self) -> bool: ...  # not self.refusals
+
+
+def plan_config(
+    scan: BuildScan,
+    *,
+    previous: PreviousConfig | None = None,
+    overrides: Mapping[Role, str] | None = None,
+    exclusions: Mapping[Role, Sequence[str]] | None = None,
+    skip: Sequence[str] = (),
+) -> ConfigPlan: ...
+def render_config(plan: ConfigPlan, *, header: Sequence[str]) -> str: ...
+```
+
+**Reading the previous file.** `read_previous` reads with
+`encoding="utf-8", errors="surrogateescape"`, so that the bytes of a line it
+carries are written back unchanged (a cp1252 `µ` stays one byte); an
+`OSError` propagates. `parse_previous`:
+- drops a byte-order mark at the start (FM-80), blank lines and comments,
+  except a line that starts with `NOT_CARRIED`: its rest is read as a line
+  of the file, so a block set aside by an earlier build comes back once it
+  applies again (§10.5);
+- splits on `,` and counts the non-empty fields, as MMCore does;
+- drops what the build writes itself: `Device`, `Parent`, `Property,Core,…`.
+  `Property,Core,<slot>,<label>` for the five slots goes to `core_slots`;
+- groups the rest into blocks: `ConfigGroup,<g>,<p>,…` by preset (`g/p`;
+  `ConfigGroup,<g>` alone is a block of its own, naming nothing);
+  `ConfigPixelSize`, `PixelSize_um`, `PixelSizeAffine`, `PixelSizeAngle_*`
+  and `PixelSizeOptimalZ_Um` by resolution; `Label` by device; `Delay` and
+  `FocusDirection` one block per line (`device`); `Property,<device>,…` one
+  block per line (`property`); any other directive, or a line whose field
+  count is not in `FIELD_COUNTS`, one block per line (`other`);
+- the devices a block names: the device field of each line, except `Core`;
+  and for a `Core` setting of `Camera`, `Shutter`, `Focus`, `XYStage`,
+  `AutoFocus`, `Galvo`, `SLM` or `ImageProcessor`, its non-empty value.
+
+**The plan**, in this order:
+1. **Refusals** (nothing is written; each one line):
+   - the scan is not `complete`: `the build child stopped before the end`;
+   - `stand.error`: `<adapter>: <error>`;
+   - a `failed` Hub row in the stand's walk, even when another hub then
+     initialised (the Ti2-E's simulator answers when the stand is off, §9.3):
+     `hub <hub> of <adapter> did not initialise`. A hub left out with `--skip`
+     is not a failure: that is how a build of the simulator is asked for;
+   - no `ok` row in the stand's walk other than its hubs: `<adapter>:
+     nothing below the hub initialised` (or `no device initialised`);
+   - with a camera adapter: its `error`; a `failed` Hub row in its walk; no
+     `ok` Camera row in its walk: `<camera adapter>: no camera initialised`.
+2. **Devices written**: the stand's `ok` devices, then the camera adapter's
+   `ok` Camera devices and the hub that is the parent of one of them, each
+   in row order. Left out, with the reason written at the end of the file:
+   every `failed` and `not-probed` row of both walks (`error` with the hint
+   after a dash, or `reason`; for a device that needs a port, `needs a
+   serial port, which smc config build does not set`, since the walk's
+   reason names `--port`, which this command lacks); the camera adapter's other `ok` devices (`not
+   a camera: --camera-adapter adds cameras only`); a device whose name holds
+   `,`, a line break or a control character (`its name cannot be written in
+   a .cfg line`), and any device whose parent is left out.
+3. **Roles**: `resolve` on the written devices
+   (`DeviceInfo(label, type, library, name)`), with `core_roles` from the
+   previous file's `core_slots`, the profile's `overrides` and
+   `exclusions`. A slot the previous file set therefore keeps its device
+   when the device is still there and fits the role.
+4. **Labels**, per written State device: the previous file's `Label` block
+   for that device when it has one (a human may have named the positions,
+   and the presets use those names), otherwise the device's
+   `state_labels`. A label that is empty after `strip`, or holds `,` or a
+   line break, is not written; a note names the device and the position.
+5. **Carried, or set aside.** A block is carried when every device it names
+   is written and, for a `preset` or `pixel` block, every `<device>,Label,<x>`
+   setting names a label that device has in this file (point 4). Otherwise
+   it is set aside, whole, with its reason: `names <device>, which this
+   configuration does not load`; `sets <device> to the label <x>, which it
+   does not have here`. `property` and `other` blocks are always set aside:
+   `a device setting: the build writes no Property line for a device; put it
+   in a preset (System/Startup)` and `not a line this Micro-Manager reads`.
+   A `labels` block for a device that is not written is set aside too.
+6. **Notes**: no Camera device written: `no camera: <adapter> provides none;
+   pass --camera-adapter with the camera's adapter (smc discover lists the
+   installed ones)`; a `skip` name that matches no row of either walk:
+   `--skip <name> matched no device of <adapter>[ or <camera adapter>]`.
+
+**The text** (`render_config`), LF line ends; a section with nothing in it is
+left out with its heading; every text that goes into a comment has its runs
+of whitespace (line breaks included) collapsed to one space (FM-37's lesson
+for files):
+
+```text
+# <each header line>
+# Only the devices that initialised are loaded; the others are listed at the end.
+
+# Reset
+Property,Core,Initialize,0
+
+# Devices
+Device,<label>,<library>,<name>
+
+# Hub (parent) references
+Parent,<label>,<hub>
+
+# Initialize
+Property,Core,Initialize,1
+
+# Roles
+Property,Core,<Camera|Shutter|Focus|XYStage|AutoFocus>,<label>
+Property,Core,AutoShutter,1
+
+# Labels
+# <device>  (or: # <device> (from the previous configuration))
+Label,<device>,<position>,<label>
+
+# Carried over from the previous configuration
+<the carried blocks, line by line, in the previous file's order>
+
+# Set aside: kept as comments, carried again by a later build once they apply
+# <block key>: <why>
+# not carried: <line>
+
+# Did not connect, or left out
+#   <adapter>/<device>: <why>
+```
+
+The role lines follow `Camera, Shutter, Focus, XYStage, AutoFocus` and only
+for an assigned role; `AutoShutter,1` only with a shutter. Labels before the
+presets: a preset that selects a label then finds it defined.
+
+### 10.5 What is never lost
+
+Every line of the previous file that the build does not write itself comes
+back, carried or set aside as a comment that a later build reads again. So
+a build with the camera switched off sets the camera's presets aside, and
+the next build with the camera on carries them again. On `--force` the
+previous file is also copied to `<out>.bak` before it is replaced.
+
+### 10.6 CLI — `smc config build`
+
+A `config` sub-app (`smc config …`) with one command:
+
+```text
+smc config build --out FILE [--profile P] [--adapter NAME]
+                 [--camera-adapter NAME] [--skip NAME]... [--dry-run]
+                 [--force] [--timeout-s S]
+```
+
+- `--out` is required. `--adapter` defaults to the one Nikon stand in the
+  profile's configuration (`nikon.stands_in_config`); none or several, or a
+  profile with no configuration file (the demo), is a usage error: `✗ name
+  the stand's adapter with --adapter (…)`, exit 2. `--camera-adapter` equal
+  to `--adapter`: exit 2. A `--skip` value that `check_device_name`
+  refuses: exit 2 with its message. `--timeout-s` 1 to 3600 and finite, as
+  `discover`'s; default `BUILD_TIMEOUT_S`.
+- **Before anything is initialised** (FM-30): `--out` is a folder, or its
+  folder does not exist: exit 2. `--out` exists without `--force` or
+  `--dry-run`: exit 2, `✗ <out> exists: pass --force to replace it (its
+  presets, pixel sizes and labels are carried over, and it is saved as
+  <out>.bak)`. `--out` exists and cannot be read: exit 1, nothing built.
+- The banner, as `discover`'s: `Building from <adapter>[ and <camera>]:
+  every device is initialised, so the stand must be powered and its vendor
+  software closed.` The build runs under `console.status`.
+- `plan_config` with the profile's `roles.assign` and `roles.exclude`;
+  `render_config` with the header lines `Generated by smc config build on
+  <YYYY-MM-DD HH:MM> from <adapter>[ and <camera>]` and `Profile <name>`.
+- **Writable and not `--dry-run`**: the file is written **before** the report
+  is printed (FM-30): an existing `--out` is first copied to `<out>.bak`, then
+  the text replaces `--out` through `cli._replace` (FM-38), with
+  `encoding="utf-8", errors="surrogateescape", newline="\n"`. An `OSError`
+  prints the report all the same, then `✗ could not write <out>: …`, exit 1
+  (FM-34).
+- **The report**, every line as text, never markup (FM-36): the stand's
+  probe table and the camera's, with their notes and causes (`report.py`'s
+  `_probe` becomes the public `probe_renderables(probe)`, unchanged); the
+  scan's and the plan's notes, `- <note>`; the child's notes; the role table
+  (`RoleMap.describe()`) and its warnings; one line per carried block kind
+  (`carried over from <out>: 3 presets, 2 pixel sizes, labels of 4 devices`)
+  and one per block set aside, `! set aside: <key>: <why>`.
+- Then exactly one of:
+  - **refusals**: each as `✗ <refusal>`; when `stopped_at` is set and the
+    scan is missing or not complete, `re-run with --skip <device> to leave
+    it out`; exit 1, nothing written;
+  - **`--dry-run`**: `--- would write <out> ---` and the text, line by line;
+    exit 0;
+  - **written**: `✓ wrote <out>` (`, previous saved as <out>.bak`) and
+    `check it with: smc doctor --config <out>`; exit 0.
+
+A device that failed, a camera missing or a block set aside is a finding:
+the exit code stays 0 as long as the file is written.
+
+### 10.7 Files and sequencing
+
+`smc/discovery/mm_inventory.py`, `_mm_child.py`, `models.py`, `report.py`,
+`config_build.py` (new), `smc/hardware/core.py` (`new_core`), `smc/cli.py`
+(the `config` sub-app only), `docs/hardware/microscope-pc-setup.md`, and
+`profiles/README.md` (how a profile's `.cfg` is rebuilt). After #48
+(merged). #183 (`mm_inventory.py`, `_mm_child.py`) and #159 (`cli.py`) wait
+for it.
+
+### 10.8 Not verified
+
+- Everything on a real stand: that the Ti2-E's 16 peripherals and a camera
+  fit in 300 s; what the Ti-E's `TIDiaLamp` does in a build; that a Nikon
+  device that initialises in a build also initialises from the written file
+  in a fresh core.
+- That an MMStudio-written `.cfg` (the format of the lab's other stands)
+  holds no directive outside §10.1's table that matters; any other is set
+  aside, never dropped.
+- That a carried line with bytes that are not UTF-8 means to MMCore what it
+  meant before: the bytes are kept, and MMCore reads bytes.
