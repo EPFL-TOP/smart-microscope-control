@@ -916,6 +916,15 @@ def test_two_replacements_are_one_mutant_killed_only_by_both(run) -> None:
     assert run(CALC_FILE, TOTAL, TOTAL_BROKEN, INTACT).code == 1
 
 
+def test_the_order_of_the_replacements_does_not_change_the_mutant(run) -> None:
+    # The main pattern is the later one in the file: the edits are applied in
+    # the order of the text, not of the command line, or the file is scrambled.
+    reversed_order = run(
+        CALC_FILE, TOTAL, TOTAL_BROKEN, INTACT, "--also", CALC_FILE, SUM, SUM_BROKEN
+    )
+    assert reversed_order.code == 0, reversed_order.out + reversed_order.err
+
+
 def test_a_file_given_under_two_spellings_is_edited_once_with_both_replacements(
     run, repo
 ) -> None:
@@ -1140,6 +1149,10 @@ def test_a_pattern_file_that_cannot_be_read_is_no_verdict_not_a_survivor(
     # Raised outside the handler, the error would end the process with exit 1.
     assert result.code == 2
     assert broken.name in result.err
+    # The reader's own message, not the catch-all's "unexpected ..." one.
+    reason = " is not valid UTF-8 (" if kind == "not utf-8" else "ERROR: cannot read "
+    assert reason in result.err
+    assert "unexpected" not in result.err
     assert "Traceback" not in result.err
     assert "SURVIVED" not in result.out
     assert list(scratch.iterdir()) == []
