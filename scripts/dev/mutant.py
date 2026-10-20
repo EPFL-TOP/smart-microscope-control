@@ -37,9 +37,10 @@ shell breaks (#13, #14)::
 A pattern file is read as UTF-8, as written: an editor's final newline is part of
 the pattern, so give ``old`` and ``new`` the same ending. Its path is relative to
 the current directory and may lie anywhere (it is only read). ``--old-file`` and
-``--new-file`` come as a pair. ``--also`` cannot carry a pattern that starts with
-a dash (argparse reads it as an option, and ``--`` comes after the values):
-``--also-file`` can.
+``--new-file`` come as a pair. ``--also`` may not carry a pattern that starts with
+a dash: whether argparse reads it as an option depends on the Python version
+(3.10, 3.11 and 3.13.0 refuse ``-x``, later 3.13 and 3.14 accept it), and ``--`` comes
+after the values. ``--also-file`` carries it on every version.
 
 The test is run twice: first on the unmutated copy. Without that baseline an
 interpreter without pytest (exit 1), a test that already fails, or one that is
@@ -804,8 +805,9 @@ def parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         default=[],
         metavar=("FILE", "OLD", "NEW"),
         help=(
-            "one more replacement in the same copy; repeatable. Its OLD cannot "
-            "start with a dash: use --also-file"
+            "one more replacement in the same copy; repeatable. An OLD that "
+            "starts with a dash is read as an option by some Python versions: "
+            "use --also-file"
         ),
     )
     parser.add_argument(

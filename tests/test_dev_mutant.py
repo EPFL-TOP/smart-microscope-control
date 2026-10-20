@@ -1212,20 +1212,14 @@ def test_the_forms_of_the_command_line_are_not_mixed(
 
 
 def test_also_file_reads_both_patterns_from_files(
-    mutant, run_argv, repo, pattern_files, scratch, capsys
+    run_argv, repo, pattern_files, scratch
 ) -> None:
-    # argparse reads "-n_items" as an option, so `--also` cannot carry it (and
-    # the `--` that rescues the main pattern comes after its values).
+    # Some Pythons' argparse reads "-n_items" after `--also` as an option (3.10,
+    # 3.11 and 3.13.0 refuse it, later 3.13 and 3.14 take it: CI saw both, FM-102),
+    # so a test of the refusal is a test of the interpreter. Files carry it on all.
     (repo / "src" / "pkg" / "dash.py").write_bytes(b"neg = -n_items\n")
     pattern_files.old.write_bytes(b"-n_items")
     pattern_files.new.write_bytes(b"+n_items")
-    also = ["--also", "src/pkg/dash.py", "-n_items", "+n_items"]
-    with pytest.raises(SystemExit) as exc:
-        mutant.main(
-            ["--root", str(repo), *also, "--", CALC_FILE, SUM, SUM_BROKEN, ADD_RUNS]
-        )
-    assert exc.value.code == 2
-    capsys.readouterr()
 
     result = run_argv(
         "--also-file",
