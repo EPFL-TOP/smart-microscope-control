@@ -164,8 +164,10 @@ class Plan:
     """Everything that is decided before anything is copied.
 
     ``mutated`` holds the new text of each edited file, keyed by its path
-    relative to the root: files are edited once, whatever the spelling of their
-    path and the number of replacements in them.
+    relative to the root: a file is edited once, whatever the number of
+    replacements in it and whether its path is given relative or absolute. Two
+    paths that name one file on disk without being equal as paths (a case
+    variant on a case-insensitive volume, a hard link) are refused.
     """
 
     root: Path
@@ -314,10 +316,31 @@ def read_utf8(path: Path, name: str) -> str:
         raise MutantError(f"cannot read {name}: {exc}") from exc
 
 
-def not_once_reason(name: str, text: str, offsets: Sequence[int]) -> str:
-    """Why a pattern that starts at ``offsets`` is not exactly one place in ``name``."""
+def absence_hint(name: str, text: str, old: str) -> str:
+    """The cause of a pattern that is nowhere in ``text``, when it is a usual one.
+
+    A pattern file written by a Windows editor or shell differs from the source
+    in two invisible ways: PowerShell 5.1's ``Set-Content -Encoding UTF8`` and an
+    old Notepad start it with a byte-order mark, and the pattern's line endings
+    are not the file's (a CRLF checkout, an LF pattern). Both ended in a bare
+    "found 0 times" and an hour of looking (#177 review). Empty when neither fits.
+    """
+    if old.startswith("\ufeff"):
+        return (
+            "; the pattern starts with a byte-order mark: save it as UTF-8 without one"
+        )
+    if "\r\n" in old and old.replace("\r\n", "\n") in text:
+        return f"; the pattern has CRLF line endings and {name} has LF"
+    if "\n" in old and "\r" not in old and old.replace("\n", "\r\n") in text:
+        return f"; the pattern has LF line endings and {name} has CRLF"
+    return ""
+
+
+def not_once_reason(name: str, text: str, offsets: Sequence[int], old: str) -> str:
+    """Why ``old``, found at ``offsets``, is not exactly one place in ``name``."""
     if not offsets:
-        return f"pattern found 0 times in {name} (expected exactly 1)"
+        hint = absence_hint(name, text, old)
+        return f"pattern found 0 times in {name} (expected exactly 1){hint}"
     lines = line_numbers(text, offsets)
     shown = ", ".join(str(line) for line in lines[:5])
     if len(lines) > 5:
@@ -342,7 +365,8 @@ def apply_replacements(name: str, text: str, edits: Sequence[Replacement]) -> st
     for edit in edits:
         offsets = occurrences(text, edit.old)
         if len(offsets) != 1:
-            raise MutantError(edit.where + not_once_reason(name, text, offsets))
+            reason = not_once_reason(name, text, offsets, edit.old)
+            raise MutantError(edit.where + reason)
         spans.append((offsets[0], offsets[0] + len(edit.old), edit))
     spans.sort(key=lambda span: (span[0], span[2].number))
     # If two regions overlap, two neighbours in this order do.
@@ -407,6 +431,25 @@ def check_replacement(
     return Replacement(number, rel, old, new, where)
 
 
+def refuse_one_file_under_two_names(root: Path, files: Sequence[PurePath]) -> None:
+    """Two paths that are one file on disk would be two edits, the second lost.
+
+    The replacements are grouped by path, and ``Path`` compares by flavour, not
+    by file system: ``SRC/pkg/calc.py`` and ``src/pkg/calc.py`` are two keys on
+    macOS's default case-insensitive volume, and a hard link is another. The
+    second file written would silently replace the first one's text, and a mutant
+    with one edit instead of two reads as SURVIVED (#177 review). Windows folds
+    case in ``PureWindowsPath`` itself, so this is the net under the rest.
+    """
+    for number, first in enumerate(files):
+        for second in files[number + 1 :]:
+            if (root / first).samefile(root / second):
+                raise MutantError(
+                    f"{first.as_posix()} and {second.as_posix()} are the same "
+                    "file: give it under one spelling"
+                )
+
+
 def plan_run(args: argparse.Namespace) -> Plan:
     root = args.root.resolve()
     if not root.is_dir():
@@ -419,6 +462,7 @@ def plan_run(args: argparse.Namespace) -> Plan:
     by_file: dict[PurePath, list[Replacement]] = {}
     for replacement in replacements:
         by_file.setdefault(replacement.rel, []).append(replacement)
+    refuse_one_file_under_two_names(root, list(by_file))
     mutated = {
         rel: apply_replacements(
             rel.as_posix(), read_utf8(root / rel, rel.as_posix()), edits
