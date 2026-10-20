@@ -24,7 +24,7 @@ import sys
 import tempfile
 import time
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -51,6 +51,7 @@ __all__ = [
     "CHILD_COMMAND",
     "CHILD_TIMEOUT_S",
     "ChildResult",
+    "check_device_name",
     "check_port",
     "exit_detail",
     "list_adapters",
@@ -79,6 +80,10 @@ _UNSET_PORTS = frozenset({"", "undefined"})
 
 #: No serial port name is longer; a longer value was not typed as a port.
 _MAX_PORT_CHARS = 200
+
+#: No device name an adapter publishes is longer; a longer value was not typed
+#: as a device name either.
+_MAX_NAME_CHARS = 200
 
 #: How long to wait for a killed child to go away before giving up on it.
 _KILL_WAIT_S = 10.0
@@ -311,6 +316,30 @@ def check_port(port: str) -> str:
     return value
 
 
+def check_device_name(name: str) -> str:
+    """A device name as it will be compared with the adapter's, or why it cannot.
+
+    The name of a device to leave out (``--skip``), with the rules of
+    :func:`check_port` for the same reasons (FM-32, FM-78, FM-80): a pasted
+    ``" TIDiaLamp "`` loses its spaces, and a name with a control or invisible
+    character looks right on screen and matches no device, so the device that
+    crashes the build would be loaded after all. Commas are allowed: a device
+    whose name has one is a real thing to skip.
+
+    Raises:
+        ValueError: The name is empty, longer than 200 characters, or holds a
+            control character or an invisible one.
+    """
+    value = name.strip(" ")
+    if not value:
+        raise ValueError("the device name is empty")
+    if len(value) > _MAX_NAME_CHARS:
+        raise ValueError(f"the device name is longer than {_MAX_NAME_CHARS} characters")
+    if any(_is_invisible(c) for c in value):
+        raise ValueError("the device name holds an invisible or control character")
+    return value
+
+
 def _loaded_type(core: CMMCorePlus, label: str) -> str:
     """The type of a loaded device, for one the adapter did not list."""
     try:
@@ -353,12 +382,14 @@ class _Walk:
         core: CMMCorePlus,
         name: str,
         port: str | None,
+        skip: Collection[str],
         progress: Callable[[str], None] | None,
         checkpoint: Callable[[ProbeResult], None] | None,
     ) -> None:
         self.core = core
         self.name = name
         self.port = port
+        self.skip = frozenset(skip)
         self.progress = progress
         self.checkpoint = checkpoint
         self.result = ProbeResult(adapter=name)
@@ -402,9 +433,23 @@ class _Walk:
         does not list, whose type is read after the load. ``KeyboardInterrupt``
         and ``SystemExit`` pass through; any other exception is this device's
         ``failed`` (rule 9).
+
+        A device in ``skip`` is not touched at all, and no progress line names
+        it: the parent blames the device of the last such line for a crash, and
+        the device that crashes a build is the one left out (the Ti-E's
+        ``TIDiaLamp``). It is not ``failed`` either: nothing was tried.
         """
-        self._say(f"probing {self.name}/{label}")
         shown = type_name or "Unknown"
+        if label in self.skip:
+            self.untried += 1
+            return ProbedDevice(
+                name=label,
+                type=shown,
+                status="not-probed",
+                source=source,
+                reason=f"left out: --skip {label}",
+            )
+        self._say(f"probing {self.name}/{label}")
         port_set: str | None = None
         asked_port = False
 
@@ -625,6 +670,7 @@ def walk_adapter(
     name: str,
     *,
     port: str | None = None,
+    skip: Collection[str] = (),
     progress: Callable[[str], None] | None = None,
     checkpoint: Callable[[ProbeResult], None] | None = None,
 ) -> ProbeResult:
@@ -645,6 +691,10 @@ def walk_adapter(
         name: The adapter.
         port: A serial port to set, before initialising, on each device whose
             pre-init ``Port`` is unset. A device that already has one keeps it.
+        skip: Names of devices never to load (``smc config build --skip``), for
+            a device that crashes the process that initialises it. Each is a
+            ``not-probed`` row, not a failure; a skipped hub lets the next
+            listed hub connect (design m2 §10.2).
         progress: Called with ``"probing <adapter>/<device>"`` before each
             device is loaded, so a crash can be attributed to a device.
         checkpoint: Called with a deep copy of the result, ``complete=False``,
@@ -655,13 +705,14 @@ def walk_adapter(
         ValueError: ``port`` is refused by :func:`check_port`.
     """
     checked = check_port(port) if port is not None else None
-    return _Walk(core, name, checked, progress, checkpoint).run()
+    return _Walk(core, name, checked, skip, progress, checkpoint).run()
 
 
 def probe_adapter(
     name: str,
     *,
     port: str | None = None,
+    skip: Collection[str] = (),
     progress: Callable[[str], None] | None = None,
     checkpoint: Callable[[ProbeResult], None] | None = None,
     core: CMMCorePlus | None = None,
@@ -676,6 +727,7 @@ def probe_adapter(
     Args:
         name: The adapter.
         port: See :func:`walk_adapter`.
+        skip: See :func:`walk_adapter`.
         progress: See :func:`walk_adapter`.
         checkpoint: See :func:`walk_adapter`.
         core: A core to use instead of a new ``CMMCorePlus``.
@@ -686,7 +738,12 @@ def probe_adapter(
         core = CMMCorePlus()
     try:
         return walk_adapter(
-            core, name, port=port, progress=progress, checkpoint=checkpoint
+            core,
+            name,
+            port=port,
+            skip=skip,
+            progress=progress,
+            checkpoint=checkpoint,
         )
     finally:
         core_mod.close_core(core)

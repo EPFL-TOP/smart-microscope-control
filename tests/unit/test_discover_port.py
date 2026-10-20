@@ -18,7 +18,7 @@ from typer.testing import CliRunner
 import smc.discovery as discovery
 from smc.cli import app
 from smc.discovery import _mm_child, mm_inventory, os_inventory
-from smc.discovery.mm_inventory import ChildResult, check_port
+from smc.discovery.mm_inventory import ChildResult, check_device_name, check_port
 from smc.discovery.models import (
     AdapterDevice,
     AdapterInfo,
@@ -475,3 +475,52 @@ def test_the_banner_is_text_and_never_markup(
     assert result.exit_code == 0, result.output
     text = " ".join(result.output.split())
     assert "Probing [bold]X (port [red]COM3)" in text
+
+
+# --- check_device_name (design m2 §10.2) -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "   ",
+        "D" * 201,
+        "TIDia\x00Lamp",
+        "TIDiaLamp\n",
+        "TI\tDiaLamp",
+        "TIDiaLamp\x7f",
+        "TIDiaLamp\N{NO-BREAK SPACE}",
+        "\N{ZERO WIDTH NO-BREAK SPACE}TIDiaLamp",
+        "TIDia\N{ZERO WIDTH SPACE}Lamp",
+        "TIDiaLamp\N{LINE SEPARATOR}",
+    ],
+)
+def test_check_device_name_refuses_empty_long_and_control_characters(bad: str) -> None:
+    with pytest.raises(ValueError, match="the device name"):
+        check_device_name(bad)
+
+
+@pytest.mark.parametrize(
+    ("given", "kept"),
+    [
+        (" TIDiaLamp ", "TIDiaLamp"),
+        ("Ti2-E__0", "Ti2-E__0"),
+        ("Serial port DTR Shutter", "Serial port DTR Shutter"),
+        ("D" * 200, "D" * 200),
+        # A comma is a name MMCore refuses as a label and the walk reports as that
+        # device's failure; it is a valid thing to name for a skip.
+        ("a,b", "a,b"),
+    ],
+)
+def test_check_device_name_strips_and_accepts_what_a_device_is_called(
+    given: str, kept: str
+) -> None:
+    assert check_device_name(given) == kept
+
+
+def test_check_device_name_does_not_talk_about_a_port() -> None:
+    with pytest.raises(ValueError, match="empty") as caught:
+        check_device_name("")
+
+    assert "port" not in str(caught.value)
