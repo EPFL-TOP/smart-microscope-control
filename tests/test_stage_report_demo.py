@@ -11,11 +11,15 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
+from typing import cast
 
 import pytest
+from pydantic import ValidationError
+from pymmcore_plus import CMMCorePlus
 
 from smc.hardware import Microscope
 from smc.hardware.capabilities import XYStage, ZStage
+from smc.hardware.profile import Profile
 from smc.plugins import Progress, discover, load, run_plugin
 from smc.plugins.stage_report import (
     StageReading,
@@ -24,6 +28,7 @@ from smc.plugins.stage_report import (
     StageReportResult,
 )
 from smc.run import RunDocument, StageStatus
+from smc.testing import FakeCore
 
 pytestmark = pytest.mark.demo
 
@@ -141,8 +146,33 @@ def test_stage_report_is_registered_and_its_params_come_from_its_model() -> None
     assert discover().failures == ()
 
 
+def test_stage_report_on_a_stand_without_a_focus_drive_leaves_z_none(
+    tmp_path: Path,
+) -> None:
+    # `requires` is the XY stage only: Z is read when there is a drive and left
+    # unknown ("unknown beats guessed") when there is not, never a refusal.
+    profile_file = tmp_path / "no-focus.toml"
+    profile_file.write_text(
+        '[microscope]\nname = "no-focus"\n\n[roles.exclude]\nfocus = ["Z"]\n',
+        encoding="utf-8",
+    )
+    core = FakeCore.demo_like()
+    microscope = Microscope.from_core(
+        cast("CMMCorePlus", core), Profile.load(profile_file)
+    )
+    assert not microscope.has(ZStage)
+    result = _run(microscope, tmp_path, StageReportParams(samples=2))
+    assert result.profile == "no-focus"
+    assert [reading.z_um for reading in result.readings] == [None, None]
+    assert all(reading.x_um is not None for reading in result.readings)
+
+
 def test_a_reading_is_a_frozen_model_with_unknown_z_as_none() -> None:
     reading = StageReading(x_um=1.0, y_um=2.0, z_um=None)
     assert reading.model_dump(mode="json") == {"x_um": 1.0, "y_um": 2.0, "z_um": None}
-    with pytest.raises(ValueError, match="finite"):
+    with pytest.raises(ValidationError, match="Instance is frozen"):
+        reading.x_um = 3.0  # type: ignore[misc]
+    with pytest.raises(ValidationError, match="Input should be a finite number"):
         StageReading(x_um=float("nan"), y_um=2.0, z_um=None)
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        StageReading(x_um=1.0, y_um=2.0, z_um=None, w_um=0.0)  # type: ignore[call-arg]

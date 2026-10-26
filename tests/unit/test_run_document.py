@@ -334,6 +334,89 @@ def test_a_replace_refused_four_times_then_allowed_succeeds(
     assert [p.name for p in tmp_path.iterdir()] == ["run.json"]
 
 
+def test_a_replace_that_stays_refused_is_tried_five_times_and_no_more(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "run.json"
+    calls, waits = [], []
+
+    def refuse(src: Any, dst: Any) -> None:
+        calls.append(src)
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(document_mod.os, "replace", refuse)
+    monkeypatch.setattr(document_mod.time, "sleep", waits.append)
+    with pytest.raises(RunDocumentError):
+        write_stage(path, _record("a"))
+    assert (len(calls), waits) == (5, [0.05] * 4)
+
+
+def test_a_read_refused_four_times_then_allowed_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # FM-24: the file was replaced a moment ago, and a sync client or antivirus
+    # may hold it; every write_stage and every checkpoint begins with a read.
+    path = tmp_path / "run.json"
+    written = write_stage(path, _record("a", minute=0))
+    real_read, refused, waits = Path.read_bytes, [], []
+
+    def flaky(self: Path) -> bytes:
+        if len(refused) < 4:
+            refused.append(self)
+            raise PermissionError(13, "Permission denied")
+        return real_read(self)
+
+    monkeypatch.setattr(Path, "read_bytes", flaky)
+    monkeypatch.setattr(document_mod.time, "sleep", waits.append)
+    assert RunDocument.load(path) == written
+    assert (len(refused), waits) == (4, [0.05] * 4)
+    # The read of a write goes through the same retry: the other stage survives.
+    refused.clear()
+    waits.clear()
+    both = write_stage(path, _record("b", minute=1))
+    assert sorted(both.stages) == ["a", "b"]
+    assert len(refused) == 4
+
+
+def test_a_read_that_stays_refused_says_what_to_do(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "run.json"
+    write_stage(path, _record("a"))
+    calls, waits = [], []
+
+    def refuse(self: Path) -> bytes:
+        calls.append(self)
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "read_bytes", refuse)
+    monkeypatch.setattr(document_mod.time, "sleep", waits.append)
+    error = _error_of(path)
+    assert len(calls) == 5
+    assert error.reason == (
+        "could not be read (Permission denied); close any program that holds "
+        "run.json open and check that you may read it, then run the stage again"
+    )
+
+
+def test_a_ctrl_c_while_the_document_is_written_leaves_it_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The operator's stop passes through, and no temporary file is left behind.
+    path = tmp_path / "run.json"
+    write_stage(path, _record("a", minute=0))
+    before = path.read_bytes()
+
+    def interrupt(fd: int) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(document_mod.os, "fsync", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        write_stage(path, _record("b", minute=1))
+    assert path.read_bytes() == before
+    assert [p.name for p in tmp_path.iterdir()] == ["run.json"]
+
+
 def test_a_failed_write_leaves_no_temporary_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -553,6 +636,31 @@ def test_the_checks_run_in_the_order_of_the_table() -> None:
     )
     doc = _doc(_record("origin", minute=2, attempt="again"), register)
     assert _unusable(doc) == "the last run of register ended failed; run it again"
+
+
+def test_the_stale_row_comes_before_the_profile_row_and_that_before_the_dry_run_row() -> (
+    None
+):
+    # Two rows are false at once: the first of the table is the reason (FM-43).
+    origin = _record("origin", minute=0)
+    again = _record("origin", minute=2, attempt="origin-again")
+    stale_other_dry = _record(
+        "register",
+        provides="plate",
+        minute=1,
+        profile="other",
+        dry_run=True,
+        reads={"origin": _read(origin)},
+    )
+    assert _unusable(_doc(again, stale_other_dry)) == (
+        "register read its inputs from an earlier run; run it again"
+    )
+    other_dry = _record(
+        "register", provides="plate", minute=1, profile="other", dry_run=True
+    )
+    assert _unusable(_doc(other_dry)) == (
+        "register was run on other, this is demo; run register again on this profile"
+    )
 
 
 def test_a_dry_run_may_read_a_real_result() -> None:

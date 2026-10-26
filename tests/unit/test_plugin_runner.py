@@ -218,6 +218,19 @@ class Saves(Base):
         return Result()
 
 
+class ReadingResumable(Resumable):
+    """A resumable stage that reads ``up``: its checkpoint is made against it."""
+
+    name = provides = "reading-resumable"
+    reads = ("up",)
+
+
+class NeedsXYAndUp(Base):
+    name = provides = "needs-xy-and-up"
+    requires = (XYStage,)
+    reads = ("up",)
+
+
 class Progressing(Base):
     name = provides = "progressing"
 
@@ -554,6 +567,89 @@ def test_an_unusable_optional_read_is_recorded_as_none(
     ) in caplog.messages
 
 
+def _timing_failed() -> list[StageRecord]:
+    return [_done_record("timing", provides="timings", status=StageStatus.failed)]
+
+
+def _timing_stopped() -> list[StageRecord]:
+    return [_done_record("timing", provides="timings", status=StageStatus.stopped)]
+
+
+def _timing_running() -> list[StageRecord]:
+    return [_done_record("timing", provides="timings", status=StageStatus.running)]
+
+
+def _timing_on_another_stand() -> list[StageRecord]:
+    return [_done_record("timing", provides="timings", profile="another-stand")]
+
+
+def _timing_was_a_dry_run() -> list[StageRecord]:
+    return [_done_record("timing", provides="timings", dry_run=True)]
+
+
+def _timing_is_stale() -> list[StageRecord]:
+    origin = _done_record("origin", minute=1)  # attempt origin-1
+    timing = _done_record("timing", provides="timings", minute=2).model_copy(
+        update={"reads": {"origin": ReadRecord(plugin="origin", attempt="origin-0")}}
+    )
+    return [origin, timing]
+
+
+@pytest.mark.parametrize(
+    ("records", "reason"),
+    [
+        pytest.param(
+            _timing_failed,
+            "the last run of timing ended failed; run it again",
+            id="failed",
+        ),
+        pytest.param(
+            _timing_stopped,
+            "the last run of timing ended stopped; run it again",
+            id="stopped",
+        ),
+        pytest.param(
+            _timing_running,
+            "the last run of timing is still running or was interrupted; run it again",
+            id="running",
+        ),
+        pytest.param(
+            _timing_on_another_stand,
+            "timing was run on another-stand, this is demo; run timing again on "
+            "this profile",
+            id="another-profile",
+        ),
+        pytest.param(
+            _timing_was_a_dry_run,
+            "timing was a dry run; run it without --dry-run",
+            id="dry-run-provider",
+        ),
+        pytest.param(
+            _timing_is_stale,
+            "timing read its inputs from an earlier run; run it again",
+            id="stale",
+        ),
+    ],
+)
+def test_every_way_an_optional_slot_is_unusable_is_recorded_as_none(
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    records: Any,
+    reason: str,
+) -> None:
+    # FM-106: another stand's result, a failed or interrupted run, a rehearsal
+    # and a stale one are never handed to the plugin as the timings it asked for.
+    caplog.set_level(logging.INFO, logger="smc.plugins")
+    for record in records():
+        write_stage(_path(tmp_path), record)
+    plugin = Optional()
+    record = _run(plugin, fake_microscope, tmp_path)
+    assert record.reads == {"timings": None}
+    assert plugin.seen == {"timings": None}
+    assert f"optional: not using timings: {reason}" in caplog.messages
+
+
 def test_a_usable_optional_read_is_recorded_and_returned(
     fake_microscope: Microscope, tmp_path: Path
 ) -> None:
@@ -728,6 +824,51 @@ def test_a_checkpoint_that_cannot_be_written_ends_the_run(
         _run(plugin, fake_microscope, tmp_path)
     assert raised.value.reason.startswith("could not be replaced (Permission denied)")
     assert plugin.seen == {}  # not even the read after the first checkpoint
+
+
+def test_resume_of_a_stage_whose_input_was_produced_again_is_refused(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    # FM-106: the checkpoint was made against the first `up`; resuming would finish
+    # the work on the second and record the whole run as read from it.
+    _run(Up(), fake_microscope, tmp_path, n=1)
+    stopped = _run(ReadingResumable(stop_after=1), fake_microscope, tmp_path)
+    assert stopped.checkpoint == {"done": 1}
+    _run(Up(), fake_microscope, tmp_path, n=2)
+    plugin = ReadingResumable()
+    with pytest.raises(ResumeError) as raised:
+        _run(plugin, fake_microscope, tmp_path, resume=True)
+    assert raised.value.reason == (
+        "reading-resumable read its inputs from an earlier run, so its checkpoint "
+        "no longer matches them; run it without --resume"
+    )
+    assert plugin.calls == 0
+    assert _stored(tmp_path, "reading-resumable") == stopped  # untouched
+    # A fresh run is the way out, and reads the current input.
+    assert _run(ReadingResumable(), fake_microscope, tmp_path).status is (
+        StageStatus.done
+    )
+
+
+def test_resume_of_a_stage_whose_inputs_are_current_is_allowed(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    # The control of the test above: the same sequence without the second `up`.
+    _run(Up(), fake_microscope, tmp_path)
+    _run(ReadingResumable(stop_after=1), fake_microscope, tmp_path)
+    resumed = _run(ReadingResumable(), fake_microscope, tmp_path, resume=True)
+    assert resumed.status is StageStatus.done
+
+
+def test_the_requirements_are_checked_after_what_the_stage_reads(
+    two_stage_less_stand: Microscope, tmp_path: Path
+) -> None:
+    # Two checks are false at once (§1.8: check_ready, then the requirements): the
+    # first of the order is the error, and it needs no stand to know.
+    plugin = NeedsXYAndUp()
+    with pytest.raises(UpstreamError):
+        _run(plugin, two_stage_less_stand, tmp_path)
+    assert plugin.calls == 0
 
 
 def test_resume_with_other_params_is_refused(

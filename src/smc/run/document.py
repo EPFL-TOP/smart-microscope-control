@@ -30,11 +30,12 @@ import json
 import os
 import secrets
 import time
+from collections.abc import Callable
 from contextlib import suppress
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, ValidationError
 
@@ -53,11 +54,14 @@ __all__ = [
 #: cannot be left to drop what a newer one wrote.
 SCHEMA_VERSION = 1
 
-#: Windows refuses to replace a file that antivirus or a search indexer holds
-#: open for a moment (``PermissionError``), and the file was written a moment
-#: ago (FM-24): a few short waits, not a lost result. As ``_mm_child._write``.
-_REPLACE_TRIES = 5
-_REPLACE_WAIT_S = 0.05
+T = TypeVar("T")
+
+#: Windows refuses to read or replace a file that antivirus or a search indexer
+#: holds open for a moment (``PermissionError``), and the file was written a
+#: moment ago (FM-24): a few short waits, not a lost result. As
+#: ``_mm_child._write``.
+_LOCK_TRIES = 5
+_LOCK_WAIT_S = 0.05
 
 
 class StageStatus(str, Enum):
@@ -174,11 +178,20 @@ class RunDocument(BaseModel):
                 raise RunDocumentError(
                     path, "is a folder, not a run document; name a file"
                 )
-            data = path.read_bytes()
+            # Retried like the replace: the file was replaced a moment ago, and
+            # antivirus or a sync client may hold it for a few milliseconds (FM-24).
+            data = _retrying(path.read_bytes)
         except FileNotFoundError:
             if missing_ok:
                 return None
             raise RunDocumentError(path, "does not exist") from None
+        except PermissionError as exc:
+            raise RunDocumentError(
+                path,
+                f"could not be read ({exc.strerror or exc}); close any program that "
+                f"holds {path.name} open and check that you may read it, then run "
+                f"the stage again",
+            ) from exc
         except OSError as exc:
             raise RunDocumentError(
                 path, f"could not be read ({exc.strerror or exc})"
@@ -392,16 +405,25 @@ def _write_atomically(path: Path, data: bytes) -> None:
 
 
 def _replace(source: Path, target: Path) -> None:
-    """``os.replace``, tried ``_REPLACE_TRIES`` times while Windows says ``PermissionError``."""
-    for attempt in range(1, _REPLACE_TRIES + 1):
+    """``os.replace``, retried while Windows says ``PermissionError``."""
+    _retrying(lambda: os.replace(source, target))
+
+
+def _retrying(action: Callable[[], T]) -> T:
+    """``action()``, tried ``_LOCK_TRIES`` times while it raises ``PermissionError``.
+
+    A file that antivirus or an indexer holds open for a moment is refused, on
+    Windows, to a read as well as to a rename (FM-24). The last refusal is raised.
+    """
+    attempt = 1
+    while True:
         try:
-            os.replace(source, target)
+            return action()
         except PermissionError:
-            if attempt == _REPLACE_TRIES:
+            if attempt == _LOCK_TRIES:
                 raise
-            time.sleep(_REPLACE_WAIT_S)
-        else:
-            return
+            attempt += 1
+            time.sleep(_LOCK_WAIT_S)
 
 
 class _NonFiniteError(ValueError):

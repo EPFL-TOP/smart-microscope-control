@@ -39,10 +39,20 @@ class PluginNotFoundError(PluginError):
     def __init__(self, name: str, available: tuple[str, ...]) -> None:
         self.name = name
         self.available = available
-        have = ", ".join(available) or "none"
-        super().__init__(
-            f"no plugin named {name!r} (available: {have}); smc run --list shows them"
-        )
+        if available:
+            message = (
+                f"no plugin named {name!r} (available: {', '.join(available)}); "
+                f"smc run --list shows them"
+            )
+        else:
+            # Plugins are registered by metadata that pip writes at install time:
+            # a PC that was only `git pull`ed has none until it is reinstalled.
+            message = (
+                f"no plugin named {name!r}, and none is registered. If smc was "
+                f"updated without reinstalling, run pip install -e . in the smc "
+                f"folder (plugins are registered when it is installed)"
+            )
+        super().__init__(message)
 
     def __reduce__(self) -> tuple[Any, ...]:
         return (type(self), (self.name, self.available))

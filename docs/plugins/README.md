@@ -60,6 +60,11 @@ built-in plugin: it exercises the whole path on the demo devices without a move.
 `str`, a path, an enum member, a `Literal`) is given as text; a list or a tuple
 takes JSON (`--param 'wells=["A1","B2"]'`); `null` is "none" for a field that
 admits it. Every problem is reported at once, and `--show-params` lists the keys.
+The quoting of JSON is the shell's business: bash keeps the double quotes inside
+single quotes, but PowerShell 5.1 and `cmd.exe` strip them (documented behaviour of
+their native-argument passing; check it at the stand), and a value then fails with
+`'wells' takes JSON`. Escape each inner quote with a backslash there:
+`--param "wells=[\"A1\",\"B2\"]"`.
 
 **What is checked before the stand opens.** The plugin loads, the parameters are
 valid, `--run-doc` is a file in a folder that exists, the run document is readable,
@@ -71,7 +76,9 @@ stand that lacks the XY stage gets one error naming every missing capability and
 **Stopping.** Ctrl-C stops any move under way, records the stage as `stopped`
 (its checkpoint kept) and exits 130. `--resume` continues the last attempt from
 its checkpoint, when the parameters and the profile are the same. A real run does
-not resume a dry run's checkpoint: it stands for work that was never done.
+not resume a dry run's checkpoint: it stands for work that was never done. A stage
+that is stale (something it read has been produced again since) is not resumed
+either: its checkpoint was made against inputs that no longer match.
 
 **Exit codes.**
 
@@ -151,7 +158,7 @@ a plugin never builds one.
 | `ctx.upstream_or_none(slot, Model)` | The same for a slot in `reads_optional`; `None` when it was not usable. |
 | `ctx.save_checkpoint(state)`, `ctx.checkpoint(Model)` | Save what you would not want to repeat after each unit (a well, a field); read the one an attempt resumed from. |
 | `ctx.logger` | `smc.plugins.<name>`. Log through it; `smc -v` shows it. A plugin never prints. |
-| `ctx.run_dir` | The folder of the run document. Write files under it and store their paths relative to it, so the folder moves as a whole. |
+| `ctx.run_dir` | The folder of the run document. Write files under it and store their paths relative to it, as `Path.as_posix()` strings (a Windows `str(Path)` has backslashes, which another OS does not read as a separator), so the folder moves as a whole. |
 | `ctx.dry_run` | `microscope.dry_run`, for a plugin that must label what it did not do. |
 
 A loop that can be stopped:
@@ -179,9 +186,11 @@ stage-report = "smc.plugins.stage_report:StageReport"
 ```
 
 The registry instantiates it with no argument. A third-party package registers
-under the same group. Entry-point metadata is written at install time, so after
-editing `pyproject.toml` reinstall (`python scripts/dev/worktree.py setup` in a
-worktree) before `smc run --list` shows the plugin.
+under the same group. Entry-point metadata is written at install time, so a plugin
+that was added by editing `pyproject.toml` or by `git pull` is not listed until smc
+is reinstalled: `pip install -e .` in the checkout (on a microscope PC, in its
+`.venv`), or `python scripts/dev/worktree.py setup` in a worktree. Without it,
+`smc run --list` says no plugin is registered.
 
 A plugin that fails any check (it does not import, the name differs from the
 entry point's, a member is missing, `requires` names something that is not a

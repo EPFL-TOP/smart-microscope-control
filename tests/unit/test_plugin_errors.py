@@ -72,8 +72,11 @@ def test_not_found_names_the_plugins_there_are() -> None:
     assert str(error) == (
         "no plugin named 'nothing' (available: a, b); smc run --list shows them"
     )
+    # No plugin at all: a PC that was only `git pull`ed has no entry point yet.
     assert str(PluginNotFoundError("x", ())) == (
-        "no plugin named 'x' (available: none); smc run --list shows them"
+        "no plugin named 'x', and none is registered. If smc was updated without "
+        "reinstalling, run pip install -e . in the smc folder (plugins are "
+        "registered when it is installed)"
     )
 
 

@@ -140,6 +140,21 @@ class NameNotText(Good):
     name = 3  # type: ignore[assignment]
 
 
+class NoSummary(Good):
+    summary = None  # type: ignore[assignment]
+
+
+class RaisingSummary(Good):
+    @property
+    def summary(self) -> str:  # type: ignore[override]
+        raise RuntimeError("config file missing")
+
+
+class BadNameAndBadModel(Good):
+    name = "Bad Name"
+    Params = dict  # type: ignore[assignment]
+
+
 NOT_A_CLASS = "just a string"
 
 
@@ -387,6 +402,27 @@ def test_a_name_that_is_not_kebab_case_is_refused_even_when_the_entry_agrees() -
     assert _reason("Shouting", name="Good_Plugin") == (
         "is named 'Good_Plugin', which is not kebab-case (lowercase letters and "
         "digits, single hyphens between them, starting with a letter)"
+    )
+
+
+def test_a_summary_that_is_not_text_is_refused() -> None:
+    # `smc run --list` prints it for every plugin: one that is not text would end
+    # the listing of the others.
+    assert _reason("NoSummary") == "summary must be a string, got None"
+
+
+def test_a_member_that_raises_when_it_is_read_is_a_finding_not_a_crash() -> None:
+    registry = discover([_ep("good", "Good"), _ep("raising", "RaisingSummary")])
+    assert list(registry.plugins) == ["good"]
+    assert [(f.name, f.reason) for f in registry.failures] == [
+        ("raising", "could not be inspected: RuntimeError: config file missing")
+    ]
+
+
+def test_the_naming_checks_come_before_the_model_checks() -> None:
+    # Both are false: the first of §1.5's order is the finding (FM-43).
+    assert _reason("BadNameAndBadModel", name="Bad Name").startswith(
+        "is named 'Bad Name', which is not kebab-case"
     )
 
 

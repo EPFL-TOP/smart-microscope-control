@@ -21,7 +21,7 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from importlib.metadata import EntryPoint, entry_points
-from typing import Any
+from typing import Any, cast
 
 from smc.hardware.microscope import CAPABILITY_ROLES
 from smc.plugins.api import NAME_PATTERN, Plugin, PluginParams, PluginResult
@@ -200,6 +200,25 @@ def _check(ep: EntryPoint) -> PluginEntry | list[LoadFailure]:
         instance = target()
     except Exception as exc:
         return failed(f"could not be created: {_text_of(exc)}")
+    try:
+        problem = _problem(instance, ep.name)
+    except Exception as exc:
+        # A member that raises when it is read (a property that needs a file) is
+        # a finding like any other, not the end of `smc run --list` (FM-79). On
+        # Python before 3.12 even `isinstance` reads it, through `hasattr`.
+        return failed(f"could not be inspected: {_text_of(exc)}")
+    if problem is not None:
+        return failed(problem)
+    return PluginEntry(
+        plugin=cast("Plugin[Any, Any]", instance),
+        target=ep.value,
+        distribution=distribution,
+        version=version,
+    )
+
+
+def _problem(instance: object, entry_name: str) -> str | None:
+    """Checks 4 to 6 in order: the members, the names, the models; the first problem."""
     if not isinstance(instance, Plugin):
         missing = [
             member
@@ -207,15 +226,8 @@ def _check(ep: EntryPoint) -> PluginEntry | list[LoadFailure]:
             if inspect.getattr_static(instance, member, _ABSENT) is _ABSENT
             and not hasattr(instance, member)
         ]
-        lacks = f"lacks {', '.join(missing)}" if missing else "is not a Plugin"
-        return failed(lacks)
-    if (reason := _naming_problem(instance, ep.name)) is not None:
-        return failed(reason)
-    if (reason := _model_problem(instance)) is not None:
-        return failed(reason)
-    return PluginEntry(
-        plugin=instance, target=ep.value, distribution=distribution, version=version
-    )
+        return f"lacks {', '.join(missing)}" if missing else "is not a Plugin"
+    return _naming_problem(instance, entry_name) or _model_problem(instance)
 
 
 def _text_of(error: BaseException) -> str:
@@ -224,8 +236,10 @@ def _text_of(error: BaseException) -> str:
 
 
 def _naming_problem(plugin: Plugin[Any, Any], entry_name: str) -> str | None:
-    """Check 5: the name, the slot it provides and the slots it reads."""
-    for field in ("name", "provides"):
+    """Check 5: the name, the summary, the slot it provides and the slots it reads."""
+    # `summary` is read by `smc run --list` for every plugin: a value that is not
+    # text would end the listing of the others.
+    for field in ("name", "summary", "provides"):
         value = getattr(plugin, field)
         if not isinstance(value, str):
             return f"{field} must be a string, got {value!r}"

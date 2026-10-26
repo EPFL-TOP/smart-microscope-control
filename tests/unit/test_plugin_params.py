@@ -11,9 +11,9 @@ from pathlib import Path
 from typing import Literal
 
 import pytest
-from pydantic import Field
+from pydantic import Field, ValidationError
 
-from smc.plugins.api import PluginParams
+from smc.plugins.api import PluginParams, PluginResult
 from smc.plugins.errors import ParamsError
 from smc.plugins.params import describe_params, parse_params
 
@@ -196,6 +196,34 @@ def test_describe_params_shows_type_default_constraints_and_description() -> Non
     assert by_name["kind"] == ("kind", "Literal['a', 'b']", "'a'", "")
     assert by_name["wells"] == ("wells", "tuple[str, ...]", "()", "")
     assert by_name["shape"] == ("shape", "tuple[float, float] | None", "None", "")
+
+
+def test_params_are_frozen_refuse_unknown_keys_and_refuse_nan_even_unbounded() -> None:
+    # What the bases promise to every plugin that derives from them (m3 §1.3).
+    class Free(PluginParams):
+        x: float = 1.0
+
+    params = Free()
+    with pytest.raises(ValidationError, match="Instance is frozen"):
+        params.x = 2.0  # type: ignore[misc]
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        Free(y=1)  # type: ignore[call-arg]
+    with pytest.raises(ValidationError, match="Input should be a finite number"):
+        Free(x=float("nan"))
+
+
+def test_results_are_frozen_refuse_unknown_keys_and_refuse_nan_even_unbounded() -> None:
+    class Measured(PluginResult):
+        x: float = 1.0
+
+    result = Measured()
+    assert result.assumed == ()
+    with pytest.raises(ValidationError, match="Instance is frozen"):
+        result.x = 2.0  # type: ignore[misc]
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        Measured(y=1)  # type: ignore[call-arg]
+    with pytest.raises(ValidationError, match="Input should be a finite number"):
+        Measured(x=float("inf"))
 
 
 def test_describe_params_of_a_model_without_fields_is_empty() -> None:

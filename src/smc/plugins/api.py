@@ -162,8 +162,10 @@ class RunContext:
         logger: ``smc.plugins.<name>``. The context adds no handler and sets
             no level (FM-46): the CLI's ``-v`` shows it.
         run_dir: The folder of the run document. A plugin that writes files
-            writes them under it and stores their paths relative to it, so the
-            folder moves as a whole.
+            writes them under it and stores their paths relative to it, as
+            ``Path.as_posix()`` strings (a Windows ``str(Path)`` has backslashes,
+            which another OS does not read as separators), so the folder moves
+            as a whole.
         dry_run: ``microscope.dry_run``, for a plugin that must label what it
             did not do.
     """

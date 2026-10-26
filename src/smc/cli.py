@@ -1657,7 +1657,11 @@ def _list_plugins() -> None:
     for failure in registry.failures:
         _fail(f"{failure.name} ({failure.target}): {failure.reason}")
     if not rows and not registry.failures:
-        _say("no plugin is registered in the smc.plugins group")
+        _say(
+            "no plugin is registered in the smc.plugins group; if smc was updated "
+            "without reinstalling, run pip install -e . in the smc folder (plugins "
+            "are registered when it is installed)"
+        )
 
 
 def _outdated(doc: RunDocument, slot: str, read: Any) -> bool:

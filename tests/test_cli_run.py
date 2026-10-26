@@ -27,6 +27,7 @@ from pydantic import BaseModel
 from pymmcore_plus import CMMCorePlus
 from typer.testing import CliRunner, Result
 
+import smc
 import smc.cli as cli
 from smc.cli import app
 from smc.hardware import Microscope
@@ -95,6 +96,12 @@ class Reader(Base):
     reads_optional = ("timings",)
 
 
+class Third(Base):
+    name = provides = "third"
+    summary = "Reads reader, which reads up."
+    reads = ("reader",)
+
+
 class NeedsXY(Base):
     name = provides = "needs-xy"
     summary = "Needs the XY stage."
@@ -112,6 +119,11 @@ class Bare(Base):
 
     def run(self, microscope: Any, params: NoParams, ctx: RunContext) -> EchoResult:
         return EchoResult()
+
+
+class NoSummary(Base):
+    name = provides = "no-summary"
+    summary = None  # type: ignore[assignment]
 
 
 class Boom(Base):
@@ -220,7 +232,12 @@ def no_stand(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def fake_stand(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
-    """Open a ``FakeCore`` stand; the list holds the ``dry_run`` of each open."""
+    """Open a ``FakeCore`` stand; the list holds the ``dry_run`` of each open.
+
+    The stand is built from the profile it is given, as ``Microscope.open`` would:
+    a fake that always answered as the demo would hide a command that passes the
+    wrong profile (the stand's name is what a stage records).
+    """
     opened: list[bool] = []
 
     def open_stand(
@@ -228,12 +245,31 @@ def fake_stand(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
     ) -> Microscope:
         opened.append(dry_run)
         core = FakeCore.demo_like()
-        return Microscope.from_core(
-            cast("CMMCorePlus", core), Profile.demo(), dry_run=dry_run
-        )
+        built = profile if isinstance(profile, Profile) else Profile.demo()
+        return Microscope.from_core(cast("CMMCorePlus", core), built, dry_run=dry_run)
 
     monkeypatch.setattr(Microscope, "open", classmethod(open_stand))
     return opened
+
+
+@pytest.fixture
+def stand_events(fake_stand: list[bool], monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """What happened, in order: the stand's release and every line the CLI printed."""
+    events: list[str] = []
+    real_close = Microscope.close
+    real_print = cli.console.print
+
+    def close(self: Microscope) -> None:
+        events.append("stand closed")
+        real_close(self)
+
+    def record(*args: Any, **kwargs: Any) -> None:
+        events.append(str(args[0]) if args else "")
+        real_print(*args, **kwargs)
+
+    monkeypatch.setattr(Microscope, "close", close)
+    monkeypatch.setattr(cli.console, "print", record)
+    return events
 
 
 @pytest.fixture
@@ -269,13 +305,18 @@ def _json_in(output: str) -> Any:
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
+_PANEL = re.compile(r"[│╭╮╰╯─]")
+
+
 def _plain(result: Result) -> str:
-    """The output without colour codes.
+    """The output without colour codes, box lines or runs of blanks.
 
     Typer draws its own usage-error panel, and CI forces its colour (FM-72): an
-    option name inside a phrase is then styled apart from the words around it.
+    option name inside a phrase is then styled apart from the words around it. The
+    panel also wraps a message at the console's width, so a long temporary path
+    would split a phrase: assert phrases that do not hold one.
     """
-    return _ANSI.sub("", result.output)
+    return " ".join(_PANEL.sub(" ", _ANSI.sub("", result.output)).split())
 
 
 def _stored(tmp_path: Path, name: str) -> Any:
@@ -350,7 +391,11 @@ def test_run_list_with_no_plugin_says_so(monkeypatch: pytest.MonkeyPatch) -> Non
     _register(monkeypatch)
     result = _run("run", "--list")
     assert result.exit_code == 0, result.output
-    assert _lines(result) == ["no plugin is registered in the smc.plugins group"]
+    assert _lines(result) == [
+        "no plugin is registered in the smc.plugins group; if smc was updated "
+        "without reinstalling, run pip install -e . in the smc folder (plugins "
+        "are registered when it is installed)"
+    ]
 
 
 # --- smc run NAME --show-params ----------------------------------------------
@@ -449,14 +494,15 @@ def test_a_run_doc_in_a_folder_that_does_not_exist_exits_2(tmp_path: Path) -> No
     missing = tmp_path / "nowhere" / "run.json"
     result = _run("run", "stage-report", "--run-doc", str(missing))
     assert result.exit_code == 2, result.output
-    assert f"the folder {missing.parent} does not exist" in _plain(result)
+    assert "does not exist" in _plain(result)
+    assert "the folder" in _plain(result)
 
 
 @pytest.mark.usefixtures("no_stand")
 def test_a_run_doc_that_is_a_folder_exits_2(tmp_path: Path) -> None:
     result = _run("run", "stage-report", "--run-doc", str(tmp_path))
     assert result.exit_code == 2, result.output
-    assert f"{tmp_path} is a folder; name the file to write" in _plain(result)
+    assert "is a folder; name the file to write" in _plain(result)
 
 
 @pytest.mark.usefixtures("no_stand")
@@ -647,6 +693,109 @@ def test_a_result_with_a_lone_surrogate_is_printed_with_a_replacement(
     assert result.exit_code == 0, result.output
     assert f'"label": "{chr(0xFFFD)} µm"' in result.output
     assert max((tmp_path / "run.json").read_bytes()) < 0x80
+
+
+def test_the_check_before_the_stand_uses_the_name_of_the_profile_the_command_names(
+    fake_stand: list[bool], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A stage records the stand's profile name; the readiness check compares it with
+    # the name of the profile file, not with the text that was typed after -p.
+    profile = tmp_path / "stand.toml"
+    profile.write_text('[microscope]\nname = "stand"\n', encoding="utf-8")
+    _register(monkeypatch, Up, Reader)
+    first = _run("run", "up", "-p", str(profile), "--run-doc", _doc(tmp_path))
+    assert first.exit_code == 0, first.output
+    assert _stored(tmp_path, "up").profile == "stand"
+    second = _run("run", "reader", "-p", str(profile), "--run-doc", _doc(tmp_path))
+    assert second.exit_code == 0, second.output
+    assert fake_stand == [False, False]
+
+
+def test_a_dry_run_reads_a_dry_run_and_a_real_run_does_not(
+    fake_stand: list[bool], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _register(monkeypatch, Up, Reader)
+    assert _run("run", "up", "--dry-run", "--run-doc", _doc(tmp_path)).exit_code == 0
+    rehearsal = _run("run", "reader", "--dry-run", "--run-doc", _doc(tmp_path))
+    assert rehearsal.exit_code == 0, rehearsal.output
+    real = _run("run", "reader", "--run-doc", _doc(tmp_path))
+    assert real.exit_code == 2, real.output
+    assert (
+        "✗ reader reads up, but up was a dry run; run it without --dry-run"
+    ) in real.output
+    assert fake_stand == [True, True]  # the refusal came before a third open
+
+
+def test_a_dry_run_may_resume_what_a_dry_run_stopped(
+    fake_stand: list[bool], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _register(monkeypatch, Resumable)
+    doc = _doc(tmp_path)
+    assert _run("run", "resumable", "--dry-run", "--run-doc", doc).exit_code == 130
+    resumed = _run("run", "resumable", "--dry-run", "--resume", "--run-doc", doc)
+    assert resumed.exit_code == 0, resumed.output
+    refused = _run("run", "resumable", "--resume", "--run-doc", doc)
+    assert refused.exit_code == 2  # a real run does not resume a rehearsal
+    assert fake_stand == [True, True]
+
+
+def test_the_plugin_version_of_a_run_is_the_distributions(
+    fake_stand: list[bool], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _register(monkeypatch, installed=True)
+    result = _run("run", "stage-report", "--run-doc", _doc(tmp_path))
+    assert result.exit_code == 0, result.output
+    assert _stored(tmp_path, "stage-report").plugin_version == smc.__version__
+
+
+@pytest.mark.parametrize(
+    ("plugin", "marker"),
+    [
+        pytest.param(Good, "done in", id="done"),
+        pytest.param(SelfStop, "self-stop stopped", id="stopped"),
+    ],
+)
+def test_the_stand_is_released_before_anything_is_said_about_the_outcome(
+    stand_events: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    plugin: type,
+    marker: str,
+) -> None:
+    # Design §1.10 step 4 and M1 §9: the stand accepts one connection at a time, so
+    # it is let go before the result and before any ✓ or ✗ line.
+    _register(monkeypatch, plugin)
+    _run("run", plugin.name, "--run-doc", _doc(tmp_path))  # type: ignore[attr-defined]
+    closed = stand_events.index("stand closed")
+    assert not any(marker in line for line in stand_events[:closed])
+    assert any(marker in line for line in stand_events[closed + 1 :])
+
+
+def test_a_stage_two_levels_down_is_warned_about_too(
+    fake_stand: list[bool], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _register(monkeypatch, Up, Reader, Third)
+    for name in ("up", "reader", "third"):
+        assert _run("run", name, "--run-doc", _doc(tmp_path)).exit_code == 0
+    again = _run("run", "up", "--run-doc", _doc(tmp_path))
+    warnings = [line for line in _lines(again) if line.startswith("! ")]
+    assert warnings == [
+        "! reader read up from an earlier run; run it again",
+        "! third read reader from an earlier run; run it again",
+    ]
+
+
+def test_a_plugin_that_does_not_load_does_not_end_the_listing_of_the_others(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _register(monkeypatch, Good, NoSummary)
+    result = _run("run", "--list")
+    assert result.exit_code == 0, result.output
+    lines = _lines(result)
+    assert lines[0].startswith("good  ")
+    assert lines[1] == (
+        f"✗ no-summary ({THIS}:NoSummary): summary must be a string, got None"
+    )
 
 
 def test_dry_run_is_passed_to_the_stand_and_recorded(

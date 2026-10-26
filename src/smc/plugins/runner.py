@@ -80,8 +80,9 @@ def check_ready(
         UpstreamError: A slot of ``reads`` is not usable (the first one, in
             the order of ``reads``).
         ResumeError: ``resume`` is true and the plugin has no record, its
-            record is ``done``, its parameters or its profile differ, or it
-            was a dry run and this run is not.
+            record is ``done``, its parameters or its profile differ, it
+            was a dry run and this run is not, or it is stale (what it read
+            has been produced again since its checkpoint was made).
     """
     for slot in plugin.reads:
         reason = doc.unusable(slot, profile=profile, dry_run=dry_run)
@@ -110,6 +111,15 @@ def check_ready(
     if record.dry_run and not dry_run:
         # A dry run's checkpoint stands for work that was never done.
         raise ResumeError(name, f"{name} was a dry run; run it without --resume")
+    if doc.is_stale(name):
+        # The checkpoint was made against inputs that have been produced again:
+        # resuming would finish the work on the new ones and record the whole run
+        # as read from them, a false "current" (FM-106).
+        raise ResumeError(
+            name,
+            f"{name} read its inputs from an earlier run, so its checkpoint no "
+            f"longer matches them; run it without --resume",
+        )
 
 
 def run_plugin(
