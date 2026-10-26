@@ -16,6 +16,7 @@ from typing import Any, ClassVar, cast
 
 import pytest
 
+import smc
 from smc.hardware.capabilities import Camera, XYStage, ZStage
 from smc.plugins.api import Plugin, PluginParams, PluginResult, RunContext
 from smc.plugins.errors import PluginLoadError, PluginNotFoundError
@@ -155,6 +156,19 @@ def _reason(cls_name: str, *, name: str | None = None) -> str:
     registry = discover([_ep(name or "good", cls_name)])
     assert registry.plugins == {}
     return registry.failures[0].reason
+
+
+def test_stage_report_is_discovered_through_its_entry_point() -> None:
+    # The installed metadata, no injected list: this fails until pyproject.toml's
+    # entry point is installed (a fresh install on CI; `worktree.py setup` here).
+    registry = discover()
+    assert registry.failures == ()
+    entry = registry.plugins["stage-report"]
+    assert entry.target == "smc.plugins.stage_report:StageReport"
+    assert entry.distribution == "smart-microscope-control"
+    assert entry.version == smc.__version__
+    assert entry.plugin.requires == (XYStage,)
+    assert load("stage-report").plugin.name == "stage-report"
 
 
 def test_a_good_plugin_is_loaded_with_where_it_came_from() -> None:
