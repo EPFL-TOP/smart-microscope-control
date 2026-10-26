@@ -30,6 +30,7 @@ import logging
 import threading
 import weakref
 from collections.abc import Callable, Iterator
+from importlib.metadata import EntryPoint
 from pathlib import Path
 from typing import Any, cast
 
@@ -41,9 +42,12 @@ from pymmcore_plus import CMMCorePlus
 import smc.cli as cli
 from smc.hardware import Microscope
 from smc.hardware.capabilities import Autofocus, Camera, XYStage, ZStage
-from smc.hardware.errors import HardwareError
+from smc.hardware.errors import HardwareError, SafetyRefusedError
 from smc.hardware.profile import Profile
 from smc.hardware.safety import Executor, Motion
+from smc.plugins import registry as registry_mod
+from smc.plugins.api import PluginParams, PluginResult, RunContext, StopRequested
+from smc.plugins.registry import GROUP
 from smc.testing import FakeCore, PlateSample, SampleCamera
 
 _FACADE_AND_CORE_FREED = {"facade": False, "core": False}
@@ -143,12 +147,16 @@ class _FaultyXY(FakeCore):
 
 
 def _run_cli(
-    monkeypatch: pytest.MonkeyPatch, core_type: type[FakeCore], args: list[str]
+    monkeypatch: pytest.MonkeyPatch,
+    core_type: type[FakeCore],
+    args: list[str],
+    stand_profile: Profile | None = None,
 ) -> tuple[int | str | None, dict[str, weakref.ref[Any]]]:
     """Run ``smc <args>`` on a fake demo stand; the exit code and what to watch.
 
     Through ``cli.app``, not ``main()`` (its collection would hide the cycle)
-    and not ``CliRunner`` (it adds a cycle of its own).
+    and not ``CliRunner`` (it adds a cycle of its own). ``stand_profile`` is the
+    profile the fake stand is built with (the demo's by default).
     """
     watched: dict[str, weakref.ref[Any]] = {}
 
@@ -157,7 +165,9 @@ def _run_cli(
     ) -> Microscope:
         core = core_type.demo_like()
         microscope = Microscope.from_core(
-            cast("CMMCorePlus", core), Profile.demo(), dry_run=dry_run
+            cast("CMMCorePlus", core),
+            stand_profile if stand_profile is not None else Profile.demo(),
+            dry_run=dry_run,
         )
         watched.update(_watch(microscope, core))
         return microscope
@@ -216,6 +226,119 @@ def test_a_cli_command_that_succeeds_frees_its_core(
     exit_code, watched = _run_cli(monkeypatch, FakeCore, ["stage", "get"])
     assert exit_code == 0
     assert _alive(watched) == _FACADE_AND_CORE_FREED
+
+
+# --- `smc run`: an exit while the stand is open frees it ---------------------
+# The runner re-raises what the plugin raised, so the error's traceback holds the
+# runner's frame, which holds the stand: nothing may keep the error where that
+# frame reaches it (FM-98), and the context holds no reference to the stand (FM-92).
+
+
+class _RunParams(PluginParams):
+    pass
+
+
+class _RunResult(PluginResult):
+    pass
+
+
+class RunOk:
+    name = provides = "run-ok"
+    summary = "Succeeds."
+    Params = _RunParams
+    Result = _RunResult
+    requires: tuple[type, ...] = ()
+    reads: tuple[str, ...] = ()
+    reads_optional: tuple[str, ...] = ()
+
+    def run(self, microscope: Any, params: Any, ctx: RunContext) -> _RunResult:
+        ctx.progress(1, 1, "done")
+        return _RunResult()
+
+
+class RunRefused(RunOk):
+    name = provides = "run-refused"
+
+    def run(self, microscope: Any, params: Any, ctx: RunContext) -> _RunResult:
+        raise SafetyRefusedError("the jog is too long")
+
+
+class RunFault(RunOk):
+    name = provides = "run-fault"
+
+    def run(self, microscope: Any, params: Any, ctx: RunContext) -> _RunResult:
+        raise HardwareError("the stage did not answer")
+
+
+class RunCtrlC(RunOk):
+    name = provides = "run-ctrl-c"
+
+    def run(self, microscope: Any, params: Any, ctx: RunContext) -> _RunResult:
+        raise KeyboardInterrupt
+
+
+class RunStops(RunOk):
+    name = provides = "run-stops"
+
+    def run(self, microscope: Any, params: Any, ctx: RunContext) -> _RunResult:
+        raise StopRequested
+
+
+class RunNeedsXY(RunOk):
+    name = provides = "run-needs-xy"
+    requires = (XYStage,)
+
+
+def _register(monkeypatch: pytest.MonkeyPatch, *classes: type[RunOk]) -> None:
+    entries = [
+        EntryPoint(name=c.name, value=f"{__name__}:{c.__name__}", group=GROUP)
+        for c in classes
+    ]
+    monkeypatch.setattr(registry_mod, "entry_points", lambda *, group: list(entries))
+
+
+@pytest.mark.parametrize(
+    ("plugin", "code"),
+    [
+        pytest.param(RunOk, 0, id="done"),
+        pytest.param(RunRefused, 2, id="safety-refused"),
+        pytest.param(RunFault, 1, id="hardware-error"),
+        pytest.param(RunCtrlC, 130, id="ctrl-c"),
+        pytest.param(RunStops, 130, id="plugin-stop"),
+    ],
+)
+def test_a_smc_run_that_ends_frees_its_core(
+    no_cyclic_gc: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    plugin: type[RunOk],
+    code: int,
+) -> None:
+    _register(monkeypatch, plugin)
+    args = ["run", plugin.name, "--run-doc", str(tmp_path / "run.json")]
+    exit_code, watched = _run_cli(monkeypatch, FakeCore, args)
+    assert exit_code == code
+    assert _alive(watched) == _FACADE_AND_CORE_FREED
+
+
+def test_a_smc_run_that_lacks_a_capability_frees_its_core(
+    no_cyclic_gc: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The runner refuses before it writes anything: a RequirementsError raised
+    # with the stand open, exit 1.
+    profile_file = tmp_path / "noxy.toml"
+    profile_file.write_text(
+        '[microscope]\nname = "noxy"\n\n[roles.exclude]\nxy_stage = ["XY"]\n',
+        encoding="utf-8",
+    )
+    _register(monkeypatch, RunNeedsXY)
+    args = ["run", RunNeedsXY.name, "--run-doc", str(tmp_path / "run.json")]
+    exit_code, watched = _run_cli(
+        monkeypatch, FakeCore, args, stand_profile=Profile.load(profile_file)
+    )
+    assert exit_code == 1
+    assert _alive(watched) == _FACADE_AND_CORE_FREED
+    assert not (tmp_path / "run.json").exists()
 
 
 def _context() -> typer.Context:

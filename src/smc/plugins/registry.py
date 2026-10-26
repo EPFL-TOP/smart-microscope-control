@@ -16,12 +16,11 @@ operator's Ctrl-C is not a plugin's finding.
 
 from __future__ import annotations
 
-import importlib.metadata
 import inspect
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from importlib.metadata import EntryPoint
+from importlib.metadata import EntryPoint, entry_points
 from typing import Any
 
 from smc.hardware.microscope import CAPABILITY_ROLES
@@ -128,10 +127,15 @@ def load(name: str, entry_points: Iterable[EntryPoint] | None = None) -> PluginE
     raise PluginLoadError(outcome[0])
 
 
-def _listed(entry_points: Iterable[EntryPoint] | None) -> list[EntryPoint]:
-    if entry_points is None:
-        return list(importlib.metadata.entry_points(group=GROUP))
-    return list(entry_points)
+def _listed(given: Iterable[EntryPoint] | None) -> list[EntryPoint]:
+    """The entry points to check: the ones given, or the group as installed.
+
+    The installed group is read through this module's ``entry_points``, so a CLI
+    test can put its own plugins in place of the installed ones.
+    """
+    if given is None:
+        return list(entry_points(group=GROUP))
+    return list(given)
 
 
 def _by_name(entry_points: list[EntryPoint]) -> dict[str, list[EntryPoint]]:
