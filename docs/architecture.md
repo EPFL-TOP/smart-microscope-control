@@ -69,8 +69,10 @@ src/smc/
     microscope.py         the facade + safety                   (M1)
     profile.py            TOML profiles                         (M1)
     backends/             mm.py (over CMMCorePlus), zeiss_mtb/, viventis/
-  plugins/                registry + built-in plugins           (M3)
-  run/                    run document                          (M3)
+  plugins/                api.py, registry.py, params.py, runner.py   (M3)
+                          stage_report.py (the built-in plugin)
+  run/
+    document.py           the run document: stages, slots, staleness  (M3)
 profiles/                 one TOML per instrument
 tests/                    unit/ · simulator (demo) · contracts/ · hardware/
 docs/adr/                 decisions
