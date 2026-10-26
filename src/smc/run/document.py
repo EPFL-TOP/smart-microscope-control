@@ -327,6 +327,8 @@ def write_stage(path: Path, record: StageRecord) -> RunDocument:
         current = RunDocument.load_or_new(path)
         stages = {**current.stages, record.plugin: record}
         written = current.model_copy(update={"stages": stages})
+        # `mode="json"` already turns nan and infinity into null (measured), so
+        # allow_nan=False is a seatbelt: smc never writes a file `load` refuses.
         text = json.dumps(
             written.model_dump(mode="json"),
             indent=2,
