@@ -48,6 +48,10 @@ its plan is written.
 
 ## M3 — Plate tools as plugins
 
+Interfaces between the issues are fixed in
+[`docs/design/m3-plugins.md`](design/m3-plugins.md), one section per issue
+as its plan is written.
+
 - Plugin API: `Plugin` protocol, entry-point registry, `Params`/`Result`
   models, run document, `smc run`.
 - Plugins ported from `nikon-control`: plate registration (wells, wall
