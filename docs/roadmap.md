@@ -46,19 +46,34 @@ its plan is written.
 - Hardware session 1: `smc doctor`, contract tests, stage + PFS on the Ti2.
 - Ti-E profile and session.
 
-## M3 — Plate tools as plugins
+## M3 — Plate scan to NIS-Elements on the Ti2-E
 
-Interfaces between the issues are fixed in
-[`docs/design/m3-plugins.md`](design/m3-plugins.md), one section per issue
-as its plan is written.
+Re-scoped 2026-10-26 by the owner: one workflow, end to end, on the
+Ti2-E in brightfield, before anything else. Interfaces between the issues
+are fixed in [`docs/design/m3-plugins.md`](design/m3-plugins.md), written
+for the whole workflow at once (§2 onwards) so that the plans can then run
+in parallel. Ports are made from `nikon-control@1aad7c9`
+(branch `wip/plate-tools-2026-09-18`), with their tests.
 
-- Plugin API: `Plugin` protocol, entry-point registry, `Params`/`Result`
-  models, run document, `smc run`.
-- Plugins ported from `nikon-control`: plate registration (wells, wall
-  touches), automatic plate finding (lattice fit), well selection + field
-  grid, camera↔stage calibration, throughput timing.
-- New plugin: object detection in wells — interface first, a classical
-  detector second, the trained detector from `nikon-control` third.
+1. Plugin API: `Plugin` protocol, registry, `Params`/`Result`, run
+   document, `smc run` (done, #18).
+2. Calibrate: camera↔stage (phase correlation), plate registration (wells,
+   wall touches) and automatic plate finding (lattice fit).
+3. Choose wells and scan them at 40x: field grid per well, frames with
+   their stage position.
+4. Detect single and doublet cells on every frame with the trained
+   Faster R-CNN of `nikon-control` (single/doublet/debris), as cells in
+   stage µm, de-duplicated across overlapping fields.
+5. Count cells per well and type (density).
+6. Plan positions: fields of view that hold the most cells (well centre
+   optionally excluded), then the shortest route between them.
+7. Show the density and the route: a static report first, then the plate
+   page of the UI (Panel, ADR-0006), where wells are clicked.
+8. Export the positions as a list NIS-Elements reads.
+9. Hardware session: a real plate on the Ti2-E, from calibration to NIS.
+
+Paused until this works: M4, M5 (except the plate page), M6, the Ti-E
+(#17), the piezo (#135), and the p2 backlog.
 
 ## M4 — Zeiss Axio Observer 7
 

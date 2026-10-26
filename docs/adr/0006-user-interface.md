@@ -1,6 +1,6 @@
 # 0006 — User interface: one simple interface for every microscope
 
-- **Status**: **proposed** — revised 2026-09-22 with the owner's principles; framework decision pending a spike
+- **Status**: **accepted** 2026-10-26 by the owner: the principles as written, and **Panel** for the first prototype, without the spike (see *Technology*)
 - **Date**: 2026-09-22
 - **Issue**: #3
 
@@ -29,7 +29,7 @@ Constraints observed in the lab:
 - Every plugin already needs a scriptable, headless entry point for
   unattended runs and for tests.
 
-## Decision (proposed)
+## Decision
 
 ### Principles — these are the decision
 
@@ -98,6 +98,16 @@ grow new regions.
   feel with zero styling, lines of code, `pydantic → form` generation, live
   view at 5–10 fps, testability without a browser, Windows-service
   deployment. The owner decides by looking at both.
+- **Decided 2026-10-26: Panel, for the first prototype, without the
+  spike.** The first user-facing need is the plate scan on the Ti2-E
+  (M3): a plate map to click wells, per-well density and the planned
+  trajectory. That is plotting over Bokeh, which Panel does natively and
+  which `nikon-control`'s `/scope` dashboard already draws. The spike
+  (#35) is not run. **Revisit** (a new ADR, a new framework for the view
+  only) if the prototype meets a limit Panel cannot pass: a live view
+  well below 5–10 fps, an interaction that needs custom JavaScript
+  beyond a `ReactiveHTML` component, or a look the owner judges too
+  plain after styling.
 - `pymmcore-widgets` remains available as an **optional `[qt]` extra** for
   an engineering console when bringing up a stand (property browser,
   hardware wizard) — never the user-facing interface.
@@ -120,14 +130,16 @@ Reversibility: the UI is a thin view over capabilities and plugins, so
 changing the framework later costs the view code only — which is why the
 principles, not the framework, are the durable part of this record.
 
-## Consequences (if accepted)
+## Consequences
 
 - Every UI change is reviewed against the five principles; "does this add a
   new kind of screen?" is a blocking question in PR review.
 - Plugins expose progress/stop through `ctx`, never through UI callbacks,
   and their `Params` models carry the metadata the form generator needs
   (labels, units, which fields are advanced).
-- The spike is an M5 issue with priority p0; the M5 UI skeleton is blocked
-  on it.
+- The spike (#35) is not run. The M5 skeleton (#28) follows the M3
+  plate page instead of a spike.
 - The Bokeh/Panel dashboards of `nikon-control` and the tracking tool are
-  design input for the shell, not code to port.
+  design input for the shell. The M3 plate page may reuse the plate
+  drawing of `nikon-control`'s `/scope` (its Plate tab) as a port, with its
+  tests.
