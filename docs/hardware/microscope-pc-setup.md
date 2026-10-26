@@ -105,9 +105,14 @@ In a terminal prepared as in §1, name the folder once (the table in §0):
 
 ```bat
 git pull
+pip install -e ".[dev]"
 set SURVEY=C:\Tools\smart-microscope-control\local\surveys\nikon-ti2
 smc discover --out %SURVEY%
 ```
+
+The `pip install` after `git pull` is quick and is not optional: the plugins
+(`smc run --list`) are registered through metadata that pip writes when it
+installs, so a PC that was only pulled does not see a plugin that the pull added.
 
 `smc discover` writes `inventory.json` and
 `inventory.txt` into the folder: the Micro-Manager install and its device

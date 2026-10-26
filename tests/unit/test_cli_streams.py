@@ -134,3 +134,40 @@ def test_stage_refusal_redirected_with_cp1252_exits_2(
 
     assert done.returncode == 2, done.stderr.decode("utf-8", "replace")
     assert b"jog (6000.0, 0.0) \xb5m exceeds the jog limit" in out.read_bytes()
+
+
+def test_run_list_redirected_with_cp1252_exits_0(tmp_path: Path) -> None:
+    # FM-42: `smc run --list` opens no stand, so it needs no Micro-Manager. A
+    # fake distribution on PYTHONPATH registers a plugin that cannot be imported,
+    # so the listing prints a `✗` line, which has no cp1252 encoding (FM-20).
+    dist = tmp_path / "ghost_plugin-0.1.dist-info"
+    dist.mkdir()
+    (dist / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: ghost-plugin\nVersion: 0.1\n", encoding="utf-8"
+    )
+    (dist / "entry_points.txt").write_text(
+        "[smc.plugins]\nghost = no_such_module_for_smc_streams:Thing\n",
+        encoding="utf-8",
+    )
+    env = _cp1252_env()
+    env["PYTHONPATH"] = str(tmp_path)
+    out = tmp_path / "run-list.txt"
+
+    with out.open("wb") as f:
+        done = subprocess.run(
+            [sys.executable, "-m", "smc.cli", "run", "--list"],
+            stdout=f,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=120,
+            check=False,
+        )
+
+    assert done.returncode == 0, done.stderr.decode("utf-8", "replace")
+    lines = out.read_bytes().decode("cp1252").splitlines()
+    assert any(line.startswith("stage-report  ") for line in lines)
+    # The ✗ became "?", and the finding is whole: its target and its reason.
+    assert (
+        "? ghost (no_such_module_for_smc_streams:Thing): could not be imported: "
+        "ModuleNotFoundError: No module named 'no_such_module_for_smc_streams'"
+    ) in lines

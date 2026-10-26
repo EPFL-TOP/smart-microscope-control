@@ -10,6 +10,7 @@ from __future__ import annotations
 import codecs
 import contextlib
 import gc
+import json
 import logging
 import math
 import os
@@ -18,6 +19,7 @@ import secrets
 import shutil
 import sys
 import tempfile
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -44,6 +46,21 @@ from smc.hardware.errors import (
 from smc.hardware.microscope import Microscope, MicroscopeState
 from smc.hardware.profile import DEMO_NAME, Profile, list_profiles, search_paths
 from smc.hardware.roles import Role
+from smc.plugins import (
+    ParamsError,
+    PluginError,
+    PluginNotFoundError,
+    Progress,
+    ResumeError,
+    UpstreamError,
+    check_ready,
+    describe_params,
+    parse_params,
+    run_plugin,
+)
+from smc.plugins import discover as discover_plugins
+from smc.plugins import load as load_plugin
+from smc.run import RunDocument, RunDocumentError, StageRecord, StageStatus
 
 app = typer.Typer(
     name="smc",
@@ -263,6 +280,15 @@ def _report(exc: BaseException, force_hint: str) -> int:
             "(smc stage get, smc z get) before the next move"
         )
         return _EXIT_INTERRUPTED
+    # Plugin errors (m3 §1.9): a refusal the operator fixes with a command exits 2,
+    # a plugin that does not load, a stand that lacks a capability and a run
+    # document that cannot be read or written exit 1.
+    if isinstance(exc, PluginNotFoundError | ParamsError | UpstreamError | ResumeError):
+        _fail(str(exc))
+        return _EXIT_REFUSED
+    if isinstance(exc, PluginError | RunDocumentError):
+        _fail(str(exc))
+        return _EXIT_ERROR
     _fail(
         f"unexpected {type(exc).__name__}: {exc} — run it again as smc --debug … "
         "for the traceback, and file an issue"
@@ -1530,6 +1556,303 @@ def snap(
     # Dropped with its traceback's frame once the line is printed (#148, FM-92).
     del write_error
     raise typer.Exit(code=_EXIT_ERROR)
+
+
+# --- run -----------------------------------------------------------------------
+# `smc run` runs one plugin on the stand and records the outcome in a run document
+# (design m3 §1.10). Everything that needs no stand is checked before the stand is
+# opened (FM-30), and the result is printed once it is released.
+
+#: The progress printer's pace: the first call, then one a second, and always the last.
+_PROGRESS_INTERVAL_S = 1.0
+
+
+def _progress_printer() -> Callable[[Progress], None]:
+    """A progress callback that prints plain text, at most a line a second.
+
+    The first call is printed, then a call at least a second after the last
+    printed one, and every call that reaches its total: a fast loop prints its
+    first and last lines, a long one a line a second, and a scan of a plate does
+    not drown the result.
+    """
+    last_printed: float | None = None
+
+    def show(progress: Progress) -> None:
+        nonlocal last_printed
+        now = time.monotonic()
+        finished = progress.total is not None and progress.done == progress.total
+        if (
+            last_printed is not None
+            and not finished
+            and now - last_printed < _PROGRESS_INTERVAL_S
+        ):
+            return
+        last_printed = now
+        count = (
+            str(progress.done)
+            if progress.total is None
+            else f"{progress.done}/{progress.total}"
+        )
+        message = f" {progress.message}" if progress.message else ""
+        _say(f"{progress.plugin}: {count}{message}")
+
+    return show
+
+
+def _check_run_doc(value: str | None) -> Path:
+    """The run document's path, or a usage error (exit 2) before anything is opened.
+
+    A run document is never created where the operator did not say, so there is
+    no default. ``Path("")`` is ``.``, a folder, so an empty or blank value is
+    refused by itself (FM-78); its folder must exist.
+    """
+    if value is None:
+        raise typer.BadParameter(
+            "a run needs --run-doc: a run document is never created where you did "
+            "not say",
+            param_hint="--run-doc",
+        )
+    if not value.strip():
+        raise typer.BadParameter(
+            "is empty; name the file to write (an empty path would be the current "
+            "folder)",
+            param_hint="--run-doc",
+        )
+    path = Path(value)
+    if path.is_dir():
+        raise typer.BadParameter(
+            f"{path} is a folder; name the file to write", param_hint="--run-doc"
+        )
+    if not path.parent.is_dir():
+        raise typer.BadParameter(
+            f"the folder {path.parent} does not exist", param_hint="--run-doc"
+        )
+    return path
+
+
+def _list_plugins() -> None:
+    """One aligned line per plugin, then a ``✗`` line per entry that did not load.
+
+    A plugin that does not load is a finding, so the listing still exits 0.
+    """
+    registry = discover_plugins()
+    rows = []
+    for name, entry in registry.plugins.items():
+        plugin = entry.plugin
+        requires = ", ".join(capability.__name__ for capability in plugin.requires)
+        reads = ", ".join(
+            [*plugin.reads, *(f"({slot})" for slot in plugin.reads_optional)]
+        )
+        rows.append(
+            [
+                name,
+                plugin.summary,
+                f"requires {requires or '-'}",
+                f"provides {plugin.provides}",
+                f"reads {reads or '-'}",
+            ]
+        )
+    for line in _aligned(rows):
+        _say(line)
+    for failure in registry.failures:
+        _fail(f"{failure.name} ({failure.target}): {failure.reason}")
+    if not rows and not registry.failures:
+        _say(
+            "no plugin is registered in the smc.plugins group; if smc was updated "
+            "without reinstalling, run pip install -e . in the smc folder (plugins "
+            "are registered when it is installed)"
+        )
+
+
+def _outdated(doc: RunDocument, slot: str, read: Any) -> bool:
+    """Whether what a stage read of ``slot`` is no longer what the document holds.
+
+    The per-slot form of ``RunDocument.is_stale``, to say which slot: the
+    provider is gone, was run again or by another plugin, is itself stale, or an
+    optional slot that was empty now has a result.
+    """
+    current = doc.provider(slot)
+    if read is None:
+        return current is not None and current.status is StageStatus.done
+    return (
+        current is None
+        or (current.plugin, current.attempt) != (read.plugin, read.attempt)
+        or doc.is_stale(current.plugin)
+    )
+
+
+def _stale_lines(before: RunDocument, after: RunDocument) -> list[str]:
+    """A warning for each stage that this run made stale: stale after, not before."""
+    lines = []
+    for plugin, record in sorted(after.stages.items()):
+        if before.is_stale(plugin) or not after.is_stale(plugin):
+            continue
+        for slot, read in record.reads.items():
+            if _outdated(after, slot, read):
+                lines.append(
+                    f"! {plugin} read {slot} from an earlier run; run it again"
+                )
+    return lines
+
+
+def _print_result(result: dict[str, Any]) -> None:
+    """The result as indented JSON, as a console can show it.
+
+    A lone surrogate from an adapter (FM-05) is in the run document escaped, and
+    on a UTF-8 console it would be an ``UnicodeEncodeError``: it prints as a
+    replacement character.
+    """
+    _say(_printable(json.dumps(result, indent=2, ensure_ascii=False)))
+
+
+def _print_unsaved_result(error: BaseException) -> None:
+    """After the ``✗`` line of a run document that could not be written: the result.
+
+    The stage ran, and its result is minutes or hours of work: losing the file
+    must not lose what was measured (FM-34).
+    """
+    if (
+        isinstance(error, RunDocumentError)
+        and error.record is not None
+        and error.record.result is not None
+    ):
+        _say(
+            f"! {error.record.plugin} ran, but its record could not be written; "
+            f"its result:"
+        )
+        _print_result(error.record.result)
+
+
+def _finish(name: str, path: Path, record: StageRecord, before: RunDocument) -> None:
+    """Say how the run ended, once the stand is released."""
+    if record.status is StageStatus.stopped:
+        # A plugin's own StopRequested: an outcome, recorded, and a stop's exit code.
+        _fail(f"{name} stopped")
+        raise typer.Exit(code=_EXIT_INTERRUPTED)
+    seconds = (
+        (record.finished_utc - record.started_utc).total_seconds()
+        if record.finished_utc is not None
+        else 0.0
+    )
+    _ok(f"{name} done in {seconds:.1f} s — {path}, stage {name}")
+    if record.result is not None:
+        _print_result(record.result)
+    try:
+        after = RunDocument.load_or_new(path)
+    except RunDocumentError as exc:
+        _say(f"! could not check for stale stages: {exc}")
+        return
+    for line in _stale_lines(before, after):
+        _say(line)
+
+
+@app.command("run")
+def run_command(
+    ctx: typer.Context,
+    name: Annotated[
+        str | None,
+        typer.Argument(help="The plugin to run; smc run --list shows them."),
+    ] = None,
+    list_plugins: Annotated[
+        bool,
+        typer.Option(
+            "--list",
+            help="List the plugins, what each requires, provides and reads, and "
+            "the ones that do not load. Opens no stand.",
+        ),
+    ] = False,
+    show_params: Annotated[
+        bool,
+        typer.Option(
+            "--show-params",
+            help="List the plugin's parameters with type, default and bounds. "
+            "Opens no stand.",
+        ),
+    ] = False,
+    profile: ProfileOption = DEMO_NAME,
+    run_doc: Annotated[
+        str | None,
+        typer.Option(
+            "--run-doc",
+            help="The run document: the JSON file that holds the stages of one "
+            "experiment. Required for a run; created by the first stage that "
+            "writes it, never where you did not say.",
+        ),
+    ] = None,
+    param: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--param",
+            help="A parameter as key=value; repeat it. A list or a tuple takes "
+            "JSON, and null is none. --show-params lists the keys.",
+        ),
+    ] = None,
+    dry_run: DryRunOption = False,
+    resume: Annotated[
+        bool,
+        typer.Option(
+            "--resume",
+            help="Continue the stage's last attempt from its checkpoint; the "
+            "parameters and the profile must be the same.",
+        ),
+    ] = False,
+) -> None:
+    """Run a plugin on the stand and record the outcome in a run document.
+
+    A plugin is an interchangeable tool: smc run --list shows them and what each
+    one needs. The stand must have every capability the plugin requires, and the
+    stages it reads must be in the run document and current: both are checked,
+    and the run document read, before the stand is opened. The result is printed
+    after the stand is released, and is in the run document, which is rewritten
+    atomically and never overwritten when it cannot be read. A plugin may take
+    a while: Ctrl-C stops any move under way and records the stage as stopped.
+    """
+    with _Reported(ctx, after_report=_print_unsaved_result):
+        if list_plugins:
+            if name is not None:
+                raise typer.BadParameter(
+                    "--list takes no plugin name", param_hint="--list"
+                )
+            _list_plugins()
+            return
+        if name is None:
+            raise typer.BadParameter(
+                "name the plugin to run; smc run --list shows the plugins",
+                param_hint="NAME",
+            )
+        entry = load_plugin(name)
+        if show_params:
+            rows = describe_params(entry.plugin.Params)
+            for line in _aligned([list(row) for row in rows]) or ["none"]:
+                _say(line)
+            return
+        try:
+            params = parse_params(entry.plugin.Params, param or [])
+        except ParamsError as exc:
+            # parse_params knows the model, not the plugin: name the plugin here.
+            raise ParamsError(name, exc.problems) from None
+        path = _check_run_doc(run_doc)
+        loaded = Profile.load(profile)
+        before = RunDocument.load_or_new(path)
+        check_ready(
+            entry.plugin,
+            before,
+            params,
+            profile=loaded.microscope.name,
+            dry_run=dry_run,
+            resume=resume,
+        )
+        with Microscope.open(loaded, dry_run=dry_run) as microscope:
+            record = run_plugin(
+                entry.plugin,
+                microscope,
+                params,
+                path,
+                resume=resume,
+                on_progress=_progress_printer(),
+                plugin_version=entry.version,
+            )
+        _finish(name, path, record, before)
 
 
 def main() -> None:

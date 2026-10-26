@@ -60,7 +60,10 @@ ui = []
 smc = "smc.cli:main"
 
 # Plugins register here (see ADR-0004). Third-party packages can add their own.
+# The name is the plugin's `name` and the key of its record in the run document;
+# the value names a class, which the registry instantiates with no argument.
 [project.entry-points."smc.plugins"]
+stage-report = "smc.plugins.stage_report:StageReport"
 
 [project.urls]
 Homepage = "https://github.com/EPFL-TOP/smart-microscope-control"
