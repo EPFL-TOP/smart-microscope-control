@@ -1097,7 +1097,8 @@ binning change makes the calibration inapplicable, §7). `pixel_size_um` is
 `sqrt(|det M|)`; `rotation_deg` and `mirrored` follow §3.1;
 `residual_um` and `response` are §4's; `return_error_um` is the distance,
 in µm, between the start and the content after the return (§4), `None`
-when the measurement was reused.
+when the measurement was reused or the frame after the return did not
+correlate (unknown, not zero).
 
 ### 3.4 Scan plan and scan — `slots/scan_plan.py`, `slots/scan.py`
 
@@ -1437,6 +1438,9 @@ class Fit:
     residual_um: float
     notes: tuple[str, ...]
 
+    @property
+    def trustworthy(self) -> bool: ...
+
 
 def measure_shift(reference: npt.NDArray[Any], moved: npt.NDArray[Any]) -> Shift: ...
 def fit(
@@ -1455,7 +1459,25 @@ def fit(
   overlap **after** integer alignment (the regression of
   `test_confidence_is_measured_after_alignment`), 0 when the overlap is
   under 8 pixels on an axis or either frame has no variance. A frame that
-  is not 2-D is a `ValueError` (the layer's `Camera.snap` is 2-D).
+  is not 2-D, or two frames of different shapes, is a `ValueError` (the
+  layer's `Camera.snap` is 2-D).
+- **A shift beyond half the frame wraps.** skimage reports each axis's
+  shift in `[−N/2, N/2)`: content moved by 200 rows on a 384-row frame
+  reads −184 (measured, scikit-image 0.26). The response, measured at the
+  wrapped shift, is then that of unrelated content (0.005, measured), so
+  the fit refuses it instead of returning a wrong matrix; the plugin keeps
+  its default step well inside the frame (§4.2) and says so when a step may
+  have wrapped.
+- `phase_cross_correlation` is not annotated in scikit-image 0.26, and
+  `mypy --strict` refuses the call (`no-untyped-call`). The module binds it
+  once, `_phase_cross_correlation: Callable[..., tuple[Any, Any, Any]] =
+  registration.phase_cross_correlation`, which mypy accepts (measured); no
+  `type: ignore`, no override in `pyproject.toml`. Importing
+  `skimage.registration` costs 0.11 s (measured), so it is imported at the
+  top of the module.
+- `Fit.trustworthy` is `not notes`: the issue's
+  `CameraCalibration.trustworthy`. A `CameraCalibration` in a `done` slot
+  is trustworthy by construction (§2.3), so the property lives on the fit.
 - `fit`: `S` has the columns `(d_col, d_row)` of the +X and the +Y probe,
   `J = S / step_um`, and `M = −inv(J)` (§2.1). `pixel_size_um =
   sqrt(|det M|)`, `mirrored = det M > 0`, and `rotation_deg =
@@ -1482,50 +1504,96 @@ class CameraCalibrationParams(PluginParams):
 `provides = "camera-calibration"`. The objective is
 `microscope.get(ObjectiveTurret).current()`, `None` without a turret.
 
-**Reuse.** With `from_run_doc`, nothing moves: the other document is
-loaded (`RunDocument.load`, its errors become `PluginRunError`), its
-`provider("camera-calibration")` must be `done`, of the same profile, and
-of the objective in place (when there is a turret), else `PluginRunError`
-naming what differs. The result is that one with `reused_from` set to the
-path's POSIX text and `return_error_um=None`, and `assumed` gaining
-`camera calibration reused from <path>, measured <finished_utc>`.
+**Reuse.** With `from_run_doc`, nothing moves, and a dry run may reuse:
+the other document is loaded (`RunDocument.load`, its errors become
+`PluginRunError`), and `other.unusable("camera-calibration",
+profile=<this profile>, dry_run=ctx.dry_run)` must be `None`: the
+runner's own rule and messages (not `done`, another profile, a dry run
+read by a real one). Then the objective in place (when there is a turret)
+and `camera.image_shape()` must equal the result's, else `PluginRunError`
+naming both values. The result is rebuilt through
+`CameraCalibration.model_validate` (never `model_copy`, which skips
+validation) with `reused_from` the given path's `as_posix()` text, as
+typed and not resolved (FM-50: an absolute path names a user folder),
+`return_error_um=None`, and `assumed` gaining `camera calibration reused
+from <path>, measured <finished_utc, ISO, seconds>` after the reused
+result's own lines. A result that does not validate is a `PluginRunError`
+that says to run `camera-calibration` again there.
 
 **Measurement**, refused in a dry run (`PluginRunError`: "a dry run cannot
 measure the camera; run it without --dry-run"):
 
-1. The step: `step_um`, else `DEFAULT_STEP_FRACTION × width × pixel size`
-   when `Camera.pixel_size_um()` is finite and positive, else
-   `FALLBACK_STEP_UM` with `assumed` gaining `step of 50 µm: no pixel size
-   was known` (a probe distance, not a result).
-2. `start = xy.position_um()`; `reference = camera.snap()`.
+1. The step: `step_um`, else `DEFAULT_STEP_FRACTION × min(height, width)
+   × pixel size` when `Camera.pixel_size_um()` is finite and positive (the
+   smaller side: a rotated camera puts the X probe on either image axis,
+   and a shift beyond half a side wraps, §4.1), else `FALLBACK_STEP_UM`
+   with `assumed` gaining `step of 50 µm: no pixel size was known` (a probe
+   distance, not a result).
+2. `xy.wait()` (FM-85: a stage still travelling from an earlier move
+   reads a fraction of it); `start = xy.position_um()`; `reference =
+   camera.snap()`.
 3. For `(dx, dy)` in `(step, 0)`, `(0, step)`: `ctx.raise_if_stopped()`,
    `xy.move_to_um(start + (dx, dy))`, `ctx.wait_s(settle_ms / 1000)`,
-   `snap`, `measure_shift(reference, frame)`; `ctx.progress`.
-4. `fit(...)`; notes → `PluginRunError` with the fit's numbers and notes;
-   nothing fills the slot.
-5. Only now (FM-88): `move_to_um(start)`, `snap`, and `return_error_um` is
-   the stage length (`M` applied) of `measure_shift(reference, frame)`. A
-   return error above `max(2.0, 4 × pixel_size_um)` µm adds to `assumed`
-   `the stage came back <n> µm off: its repeatability limits the scan's
-   stitching` (reported, not refused).
+   `snap`, `measure_shift(reference, frame)`; `ctx.progress(i, 3, "+X
+   probe" | "+Y probe")`. On any exception here (a stop, a halt, a fault,
+   a soft-limit refusal) the stage is left where it is: a WARNING names
+   where (`position_um()` read in its own `try`, "unknown" when that read
+   fails too, so it never hides the first error) and the start, and the
+   exception propagates (FM-88, FM-64).
+4. Both probes returned normally, so the return runs (FM-88) **before the
+   fit is judged**: `ctx.raise_if_stopped()`, `move_to_um(start)`,
+   `ctx.wait_s(settle_ms / 1000)`. An operator who calibrated on an empty
+   field gets the stage back where they chose it.
+5. `fit(...)`; notes → `PluginRunError` whose reason is the notes, then
+   `step <s> µm`, and, when the step was the fallback or is at least 40 %
+   of the smaller side in pixels (`step / pixel size`, pixel size known),
+   `a step over 40 % of the field may wrap: give a smaller step_um`.
+   Nothing fills the slot.
+6. `snap`; `measure_shift(reference, frame)`; `ctx.progress(3, 3,
+   "return")`. When its response is at least `MIN_RESPONSE`,
+   `return_error_um` is its stage length (`M` applied); otherwise `None`,
+   and `assumed` gains `the return could not be checked: the frame after
+   it did not correlate (<r>)`. A return error above `max(2.0, 4 ×
+   pixel_size_um)` µm adds to `assumed` `the stage came back <n> µm off:
+   its repeatability limits the scan's stitching` (reported, not refused).
+7. `response` is the smaller of the two probes' responses. When
+   `Camera.pixel_size_um()` is finite and positive and differs from the
+   measured pixel size by more than 2 %, a WARNING says `the camera reports
+   <r> µm per pixel for <objective>, measured <m>: update the profile's
+   pixel size`.
+
+**The issue's "`Camera.pixel_size_um` can be set from it per objective"**
+is met without writing the layer: the `Camera` protocol has no setter, and
+a stage that changed the stand's configuration as a side effect would be
+hidden state. The scan plan takes the matrix from this slot when its
+objective and shape match (§7.3), a calibration per objective is one run
+per objective (or a reuse), and the step-7 WARNING tells the owner which
+profile value to change.
 
 ### 4.3 Tests
 
-Ported: `test_camera_calibration.py` (unit) with `test_a_known_shift_is_recovered`,
-`test_confidence_is_measured_after_alignment`, `test_a_blank_field_scores_zero`,
-`test_pixel_size_and_handedness_are_recovered` (the synthetic convention:
-upright is not mirrored), `test_rotation_is_recovered`,
-`test_a_stage_that_does_not_move_is_caught`. New, on
-`demo_microscope_with_sample` with a textured `PlateSample`:
+Ported, `tests/unit/test_camera_calibration.py`:
+`test_a_known_shift_is_recovered`, `test_confidence_is_measured_after_alignment`,
+`test_a_blank_field_scores_zero`, `test_pixel_size_and_handedness_are_recovered`
+(the synthetic convention: upright is not mirrored),
+`test_rotation_is_recovered`, `test_a_stage_that_does_not_move_is_caught`;
+new: `test_a_shift_beyond_half_the_frame_is_refused_not_returned`.
+`tests/test_camera_calibration_demo.py`, on `demo_microscope_with_sample`
+with a textured `PlateSample`:
 `test_calibration_recovers_a_rotated_mirrored_camera` (a 384 × 512 frame,
 30°, mirrored, pixel size within 2 %, rotation within 0.5°);
-`test_a_featureless_field_fails_and_fills_no_slot`;
-`test_a_stop_leaves_the_stage_where_it_is` (no return move in the log);
-`test_reuse_copies_a_done_calibration_and_says_so`;
-`test_reuse_refuses_another_profile_or_objective`.
+`test_a_featureless_field_fails_fills_no_slot_and_returns_the_stage`;
+`test_a_stop_leaves_the_stage_where_it_is`,
+`test_a_halt_leaves_the_stage_where_it_is`,
+`test_a_fault_leaves_the_stage_where_it_is` (FM-88's three);
+`test_a_dry_run_refuses_to_measure`;
+`test_reuse_copies_a_done_calibration_and_says_so` (also in a dry run);
+`test_reuse_refuses_another_profile_objective_or_shape`;
+`test_a_misreported_pixel_size_is_logged`.
 
 **Failure modes**: FM-88, FM-64, FM-73, FM-75 (casts), FM-104 (finite
-pixel size), FM-85 (readbacks after the facade's move only).
+pixel size), FM-85 (wait before the start is read; readbacks after the
+facade's move only), FM-50 (`reused_from` as typed).
 
 ## 5. Plate registration and going to a well (#19)
 
