@@ -65,6 +65,7 @@ smc = "smc.cli:main"
 # The name is the plugin's `name` and the key of its record in the run document;
 # the value names a class, which the registry instantiates with no argument.
 [project.entry-points."smc.plugins"]
+camera-calibration = "smc.plugins.camera_calibration.plugin:CameraCalibrationPlugin"
 stage-report = "smc.plugins.stage_report:StageReport"
 
 [project.urls]
