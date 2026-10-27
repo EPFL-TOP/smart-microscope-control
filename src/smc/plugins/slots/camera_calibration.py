@@ -24,7 +24,8 @@ class CameraCalibration(PluginResult):
     convention of ``smc.plugins.geometry``. ``residual_um`` and ``response``
     are the correlation's (§4); ``return_error_um`` is the distance, in µm,
     between the start and the content after the return, and ``None`` when
-    the measurement was reused (``reused_from`` names the run it came from).
+    the measurement was reused (``reused_from`` names the run it came from)
+    or when the frame after the return did not correlate: unknown, not zero.
     """
 
     objective: str | None

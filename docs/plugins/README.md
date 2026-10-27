@@ -13,6 +13,9 @@ is how to use it.
 - [The run document](#the-run-document)
 - [Testing a plugin](#testing-a-plugin)
 
+A plugin with a page of its own: [`camera-calibration`](camera-calibration.md)
+(how the camera's pixels map to the stage: pixel size, rotation, mirror).
+
 ## Running a plugin: `smc run`
 
 ```text
