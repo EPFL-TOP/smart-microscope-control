@@ -39,7 +39,7 @@ from smc.plugins.api import PluginParams, PluginResult, RunContext, StopRequeste
 from smc.plugins.errors import PluginRunError
 from smc.plugins.registry import GROUP
 from smc.run import RunDocument, StageRecord, StageStatus, write_stage
-from smc.run import document as document_mod
+from smc.run import files as files_mod
 from smc.testing import FakeCore
 
 runner = CliRunner(env={"COLUMNS": "200", "SMC_PROFILE": None, "SMC_PROFILES": None})
@@ -895,7 +895,7 @@ def test_a_failed_final_write_still_prints_the_result(
 ) -> None:
     # FM-34: the stage ran; losing the record must not lose what it measured.
     _register(monkeypatch, Good)
-    real_replace, calls = document_mod.os.replace, []
+    real_replace, calls = files_mod.os.replace, []
 
     def replace_once(src: Any, dst: Any) -> None:
         calls.append(src)
@@ -903,8 +903,8 @@ def test_a_failed_final_write_still_prints_the_result(
             raise PermissionError(13, "Permission denied")
         real_replace(src, dst)
 
-    monkeypatch.setattr(document_mod.os, "replace", replace_once)
-    monkeypatch.setattr(document_mod.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(files_mod.os, "replace", replace_once)
+    monkeypatch.setattr(files_mod.time, "sleep", lambda seconds: None)
     result = _run("run", "good", "--run-doc", _doc(tmp_path), "--param", "n=5")
     assert result.exit_code == 1, result.output
     assert "could not be replaced (Permission denied)" in result.output

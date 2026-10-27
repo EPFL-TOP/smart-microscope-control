@@ -50,7 +50,7 @@ from smc.run import (
     StageStatus,
     write_stage,
 )
-from smc.run import document as document_mod
+from smc.run import files as files_mod
 from smc.testing import FakeCore
 
 T0 = datetime(2026, 10, 26, 9, 0, tzinfo=timezone.utc)
@@ -837,7 +837,7 @@ def test_a_checkpoint_reaches_the_document_at_once_and_reverts_no_other_stage(
 def test_a_checkpoint_that_cannot_be_written_ends_the_run(
     fake_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    real_replace, calls = document_mod.os.replace, []
+    real_replace, calls = files_mod.os.replace, []
 
     def replace_once(src: Any, dst: Any) -> None:
         calls.append(src)
@@ -845,8 +845,8 @@ def test_a_checkpoint_that_cannot_be_written_ends_the_run(
             raise PermissionError(13, "Permission denied")
         real_replace(src, dst)
 
-    monkeypatch.setattr(document_mod.os, "replace", replace_once)
-    monkeypatch.setattr(document_mod.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(files_mod.os, "replace", replace_once)
+    monkeypatch.setattr(files_mod.time, "sleep", lambda seconds: None)
     plugin = Saves()
     with pytest.raises(RunDocumentError) as raised:
         _run(plugin, fake_microscope, tmp_path)
@@ -1171,7 +1171,7 @@ def test_the_final_write_failing_raises_with_the_done_record(
     fake_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # FM-34: the stage ran; the caller can still show its result.
-    real_replace, calls = document_mod.os.replace, []
+    real_replace, calls = files_mod.os.replace, []
 
     def replace_once(src: Any, dst: Any) -> None:
         calls.append(src)
@@ -1179,8 +1179,8 @@ def test_the_final_write_failing_raises_with_the_done_record(
             raise PermissionError(13, "Permission denied")
         real_replace(src, dst)
 
-    monkeypatch.setattr(document_mod.os, "replace", replace_once)
-    monkeypatch.setattr(document_mod.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(files_mod.os, "replace", replace_once)
+    monkeypatch.setattr(files_mod.time, "sleep", lambda seconds: None)
     with pytest.raises(RunDocumentError) as raised:
         _run(Echo(), fake_microscope, tmp_path, n=5)
     error = raised.value
@@ -1198,7 +1198,7 @@ def test_a_failed_outcome_write_does_not_hide_the_original_error(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    real_replace, calls = document_mod.os.replace, []
+    real_replace, calls = files_mod.os.replace, []
 
     def replace_once(src: Any, dst: Any) -> None:
         calls.append(src)
@@ -1206,8 +1206,8 @@ def test_a_failed_outcome_write_does_not_hide_the_original_error(
             raise PermissionError(13, "Permission denied")
         real_replace(src, dst)
 
-    monkeypatch.setattr(document_mod.os, "replace", replace_once)
-    monkeypatch.setattr(document_mod.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(files_mod.os, "replace", replace_once)
+    monkeypatch.setattr(files_mod.time, "sleep", lambda seconds: None)
     with pytest.raises(HardwareError) as raised:
         _run(Boom(), fake_microscope, tmp_path)
     assert str(raised.value) == "the stage did not answer"  # not the write's error
