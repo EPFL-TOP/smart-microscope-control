@@ -22,8 +22,8 @@ smc run scan-plan -p <profile> --run-doc run.json --param wells=B2 --param objec
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `wells` | (required) | The wells to image: see [Choosing wells](#choosing-wells). |
-| `serpentine` | true | Visit alternate rows in reverse: a raster drives back across the plate at the end of every row, a serpentine never does. |
+| `wells` | (required) | The wells to image: see [Choosing wells](#choosing-wells). Put the whole `--param` item in quotes when the list has a comma or a space (`--param "wells=A1, C*"`): PowerShell 5.1 may read an unquoted comma as its array operator and split the argument in two. Not tried on a Windows shell: check it at the stand. |
+| `serpentine` | true | Visit alternate plate rows in reverse: a raster drives back across the plate at the end of every row, a serpentine does not (for rows next to each other: see [Choosing wells](#choosing-wells)). |
 | `objective` | the one in place | The objective to plan for, by its label on the turret. **The turret is never turned**: this is only whose pixel size the plan uses. |
 | `overlap` | 0.1 | Fraction of a field shared with its neighbour, from 0 to under 0.9. A cell on a boundary then appears whole in one of two fields. |
 | `coverage` | 1.0 | Fraction of the well's width the grid spans: 1 is edge to edge, 0.33 the middle third (up to 1.5, which runs past the well). Ignored when `rows` and `columns` are given. |
@@ -93,10 +93,14 @@ found hours into an overnight run.) A text that selects nothing fails with `no w
 selected`. Duplicates are removed, keeping the first.
 
 **The order you type is not the order of the scan.** The wells are put in plate order
-(by rows), and with `serpentine` every other row is reversed: `B2, B1, A2, A1` is
-visited as `A1, A2, B2, B1`. The result's `wells` and the `useq` plan's
+(by rows), and with `serpentine` every other **plate row** is reversed: `B2, B1, A2, A1`
+is visited as `A1, A2, B2, B1`. The result's `wells` and the `useq` plan's
 `selected_wells` are in that order, and so is everything downstream (the scan, the
-route).
+route). The reversal goes by the row's place on the plate (B, D, ...), not by its place
+in the visit, so rows that are not next to each other all run left to right: `A*, C*`
+visits `A1`..`A12` and then `C1`..`C12`, and the stage drives back across the plate
+between them (298.6 mm of travel against 216.0 mm if `C` ran in reverse). Select
+neighbouring rows, or one row at a time, to keep the serpentine's saving.
 
 ## Where the pixel size and the matrix come from
 
@@ -131,7 +135,17 @@ A pixel size of 0 means "not measured" and is never defaulted; a size that is no
 finite and positive (`nan`, a negative number, infinity, which is above 0) is refused
 the same way (FM-104). `objective` must be a label of the turret
 (`objective 'Nikon 60X' is not on the turret: ...`), and on a stand with no turret it
-cannot be checked, so it must be left unset.
+cannot be checked, so it must be left unset. A turret at an **empty position** has no
+objective in place, so a plan for "the one in place" is refused (`no objective is in
+place: the turret is at an empty position; ...`) and one for a named objective is not.
+
+A calibration is used only when its matrix can be inverted, because the cells and the
+route turn a stage position into a pixel through that inverse: a singular one (a run
+document edited by hand, another tool filling the slot) is refused with
+`the camera matrix cannot be inverted (determinant ...); run camera-calibration, or
+give a pixel size`. Nothing else checks that a calibration agrees with itself: its
+`rotation_deg` and `pixel_size_um` are copied as they are, and the field of view comes
+from its matrix.
 
 **What is not read.** Nothing in the camera interface reads the binning, and the Ti2-E's
 intermediate-magnification lever (1.0× or 1.5×) is not read either; the profile's sizes
@@ -153,10 +167,20 @@ the camera is turned 3.5° from the stage axes: at overlap 0.1 the grid leaves g
 the camera is turned 30.0° from the stage axes: no overlap below 0.9 closes the gaps between fields; straighten the camera
 ```
 
-The check comes early, never late: gaps are reported when `sin φ > overlap / 2`, which is
-from 2.9° at 10 % overlap, while the design measured the first real gap on a square frame at
-3.8° ([`m3-plugins.md`](../design/m3-plugins.md) §7.3). A matrix from the profile or a
+Gaps are reported when `sin φ > overlap / 2`, which is from 2.9° at 10 % overlap, while
+the design measured the first real gap on a square frame at 3.8°
+([`m3-plugins.md`](../design/m3-plugins.md) §7.3). A matrix from the profile or a
 parameter assumes no rotation and never says this.
+
+**The rule is that of a roughly square frame.** It takes only the rotation, and on a wide
+frame gaps open sooner than it says. Measured on a 512 × 2048 frame (a wide region of
+interest) at 10 % overlap: 4.8 % of the area the grid spans is imaged by no field at
+2.5°, where the check says nothing, and at 3.0° it suggests an overlap of 0.11 and 6.2 %
+is still uncovered at that overlap. A 300 × 512 frame, the shape of the demo camera used
+in the tests, is at 0 % at both 2.5° and 3.5°. With a wide region of interest, straighten
+the camera as far as you can, and do not take the absence of a line for a proof that the
+grid is closed. (The check should take the frame's shape: a follow-up, since its
+signature is the design's.)
 
 ## The grid
 
@@ -175,6 +199,12 @@ from, instead of a plan of a million fields:
 $ smc run scan-plan -p demo --run-doc run.json --param wells=A1 --param pixel_size_um=0.001
 ✗ scan-plan: the grid would be 13889 × 13889 fields per well at 0.001 µm per pixel: check the pixel size, or give rows and columns
 ```
+
+The 100 bounds **a well**, not the plan: the grid is built for every well before it is
+clipped, at about 1.4 KB a field. Measured on a 96-well plate, `wells=all` with
+`rows=100` and `columns=100` is 960 000 fields built in 8.6 s and 1.4 GB of memory (106 752
+kept after clipping), and a 384-well plate would need about four times that. Nothing yet
+bounds the total (a follow-up); give the wells and the grid you mean.
 
 ### Clipping to the well
 

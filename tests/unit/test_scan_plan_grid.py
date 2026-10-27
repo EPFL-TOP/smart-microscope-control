@@ -170,6 +170,16 @@ def test_a_well_that_one_field_already_covers_takes_one_field_per_axis() -> None
     )
 
 
+def test_a_coverage_far_below_one_field_still_takes_one_field_per_axis() -> None:
+    """85 µm of a 1.7 mm well under a 3 mm field is a negative span, not a negative count."""
+    assert grid_size(
+        (3000.0, 3000.0), (1700.0, 1700.0), coverage=0.05, overlap=0.1
+    ) == (
+        1,
+        1,
+    )
+
+
 @pytest.mark.parametrize(
     ("fov", "well", "coverage", "overlap"),
     [
@@ -728,6 +738,12 @@ def test_a_rotated_camera_reports_gaps_folded_to_ninety_degrees() -> None:
     assert gap_overlap(180.0, 0.1) is None
     assert gap_overlap(93.5, 0.1) == pytest.approx(0.13)
     assert gap_overlap(30.0, 0.1) == math.inf
+
+
+def test_a_suggestion_of_exactly_0_9_is_not_one_the_plugin_could_use() -> None:
+    """The parameter refuses 0.9 (`lt=0.9`), so 'use overlap=0.90' would send the operator to an error."""
+    assert gap_overlap(26.5, 0.1) == math.inf  # 200 sin(26.5 degrees) = 89.2 -> 0.90
+    assert gap_overlap(26.4, 0.1) == pytest.approx(0.89)
 
 
 def test_gaps_fold_negative_angles_too() -> None:

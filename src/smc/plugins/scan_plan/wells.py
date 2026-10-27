@@ -182,8 +182,12 @@ def order_wells(
     """The order a scan visits ``wells``: plate order by rows, alternate rows reversed when ``serpentine``.
 
     The typing order never reaches the plan: a raster returns across the whole
-    plate at the end of every row, a serpentine never does. A row is reversed
-    by its index, so row B, D, ... of any plate (and ``AB`` of a 1536-well one).
+    plate at the end of every row, a serpentine does not when the rows are next
+    to each other. A row is reversed by its **plate index**, so row B, D, ... of
+    any plate (and ``AB`` of a 1536-well one), and not by its place in the visit:
+    ``A*, C*`` runs both rows left to right and drives back across the plate
+    between them (the port's ``serpentine`` did the same; alternating by the
+    count of rows visited is a change of the design, left to the owner).
     Duplicates are removed; the names are normalised.
 
     Raises:

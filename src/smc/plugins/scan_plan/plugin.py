@@ -34,7 +34,7 @@ from pydantic import Field, model_validator
 from smc.hardware.capabilities import Autofocus, Camera, ObjectiveTurret
 from smc.plugins.api import PluginParams, RunContext
 from smc.plugins.errors import PluginRunError
-from smc.plugins.geometry import Matrix2, footprint, pixel_matrix
+from smc.plugins.geometry import Matrix2, footprint, pixel_matrix, pixel_of_stage
 from smc.plugins.scan_plan.algorithm import (
     estimate_s,
     fov_of,
@@ -160,8 +160,9 @@ class ScanPlanPlugin:
 
         Raises:
             PluginRunError: The wells cannot be read, the objective is not on the
-                turret, there is no pixel size, the derived grid is over 100
-                fields per axis, or a well has no field that touches it.
+                turret or none is in place, there is no pixel size, the camera
+                matrix cannot be inverted, the derived grid is over 100 fields
+                per axis, or a well has no field that touches it.
         """
         camera = microscope.require(Camera)
         turret = microscope.get(ObjectiveTurret)
@@ -181,13 +182,8 @@ class ScanPlanPlugin:
         basis = _camera_basis(
             self.name, params, ctx, camera, turret, objective, in_place, shape
         )
+        _require_invertible(self.name, basis.matrix, shape)
         fov_um = fov_of(basis.matrix, shape)
-        if not all(math.isfinite(side) and side > 0.0 for side in fov_um):
-            raise PluginRunError(
-                self.name,
-                f"the camera matrix gives a field of {fov_um[0]:g} × {fov_um[1]:g} µm: "  # noqa: RUF001
-                "run camera-calibration again",
-            )
 
         if params.rows is not None and params.columns is not None:
             rows, columns = params.rows, params.columns
@@ -275,10 +271,22 @@ def _objective_for(
     Without a turret the objective is unknown (``None``) and the camera's size is
     the only one there is, so it counts as in place. An objective that is asked
     for and cannot be checked (no turret) is refused: a plan for an objective
-    that may not be there is the plan this stage exists not to make.
+    that may not be there is the plan this stage exists not to make. So is a
+    turret at an empty position, whose label is ``""`` (the protocol lists empty
+    positions): that is no objective, and taking it for one would plan with the
+    camera's size for an "objective" that does not exist.
     """
     if requested is None:
-        return (turret.current(), True) if turret is not None else (None, True)
+        if turret is None:
+            return None, True
+        current = turret.current()
+        if not current:
+            raise PluginRunError(
+                name,
+                "no objective is in place: the turret is at an empty position; "
+                "turn it to an objective, or give objective to plan for one",
+            )
+        return current, True
     if turret is None:
         raise PluginRunError(
             name,
@@ -290,6 +298,25 @@ def _objective_for(
             name, f"objective {requested!r} is not on the turret: {', '.join(known)}"
         )
     return requested, requested == turret.current()
+
+
+def _require_invertible(name: str, matrix: Matrix2, shape: tuple[int, int]) -> None:
+    """Refuse a matrix that no pixel maps back through, with the refusal the later stages would give.
+
+    ``pixel_of_stage`` is what the cells and the route turn a stage position into
+    a pixel with, and it refuses a singular matrix. A calibration that validates
+    field by field but is singular (a run document edited by hand, another tool
+    filling the slot) would otherwise be planned as a field that is a line, and
+    refused only when someone uses the plan.
+    """
+    problem = ""
+    try:
+        pixel_of_stage(0.0, 0.0, 0.0, 0.0, matrix=matrix, image_shape_px=shape)
+    except ValueError as exc:
+        problem = str(exc)
+    if problem:
+        # Raised outside the handler: nothing here keeps the geometry's error.
+        raise PluginRunError(name, problem)
 
 
 def _camera_basis(

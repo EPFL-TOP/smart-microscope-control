@@ -18,19 +18,21 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+import useq
 from pydantic import ValidationError
 
 from smc.hardware import Microscope
 from smc.hardware.capabilities import Autofocus, Camera, ObjectiveTurret
 from smc.plugins import PluginRunError, load, run_plugin
-from smc.plugins.geometry import Matrix2, pixel_matrix
-from smc.plugins.scan_plan.algorithm import estimate_s
+from smc.plugins.geometry import Matrix2, pixel_matrix, pixel_of_stage
+from smc.plugins.scan_plan.algorithm import estimate_s, grid_size
 from smc.plugins.scan_plan.plugin import ScanPlanParams, ScanPlanPlugin
 from smc.plugins.slots import (
     CameraCalibration,
     PlateResult,
     ScanPlanResult,
     TimingsResult,
+    well_geometry,
 )
 from smc.run import RunDocument, StageRecord, StageStatus, write_stage
 from smc.testing.fixtures import SampleMicroscopeFactory
@@ -120,11 +122,17 @@ def _write_calibration(
     pixel_size_um: float = 0.4,
     rotation_deg: float = 3.5,
     mirrored: bool = False,
+    matrix: Matrix2 | None = None,
 ) -> CameraCalibration:
+    """A calibration as measured; ``matrix`` overrides the one that its other fields imply."""
     calibration = CameraCalibration(
         objective=objective,
         image_shape_px=shape,
-        matrix_um_per_px=_matrix(pixel_size_um, rotation_deg, mirrored),
+        matrix_um_per_px=(
+            matrix
+            if matrix is not None
+            else _matrix(pixel_size_um, rotation_deg, mirrored)
+        ),
         pixel_size_um=pixel_size_um,
         rotation_deg=rotation_deg,
         mirrored=mirrored,
@@ -744,3 +752,254 @@ def test_the_result_reads_back_from_the_run_document(
     assert [f.well for f in result.fields] == ["A1"] * 4 + ["A2"] * 4 + ["B2"] * 4 + [
         "B1"
     ] * 4
+
+
+# ----------------------------------------- found by the adversarial review of #21
+#
+# The unit tests build their own arguments for `plan_fields`, so none of them sees
+# the plugin pass the wrong ones: the frame transposed, the matrix of another
+# camera, the field's width where its height goes, rows for columns, an overlap
+# that is not the one asked for. These tests read the plan back from the result.
+
+
+def _grid_of(result: ScanPlanResult) -> useq.GridRowsColumns:
+    grid = result.plate_plan.well_points_plan
+    assert isinstance(grid, useq.GridRowsColumns)
+    return grid
+
+
+def _names_whose_frame_meets_the_well(result: ScanPlanResult) -> set[str]:
+    """The fields of a round well whose frame comes within the well's radius, seen from the pixel side.
+
+    The well's centre is turned into a pixel of each field's frame by the inverse
+    of the matrix the result reports, where the frame is an axis-aligned
+    rectangle, and its distance to that rectangle, scaled back by the reported
+    pixel size, is compared with the radius. It shares nothing with the plugin's
+    polygon arithmetic and uses the result's own shape and matrix, so a plugin
+    that clipped with another frame than it reports is found. It is exact for a
+    round well and for a matrix that is a rotation, a mirror and one scale, which
+    the matrices here are.
+    """
+    height, width = result.image_shape_px
+    geometries = {}
+    kept: set[str] = set()
+    for position in result.plate_plan.image_positions:
+        assert position.x is not None
+        assert position.y is not None
+        name = str(position.name)
+        well = name.rsplit("_", 1)[0]
+        if well not in geometries:
+            geometries[well] = well_geometry(result.plate_plan, well)
+        geometry = geometries[well]
+        col, row = pixel_of_stage(
+            position.x,
+            position.y,
+            *geometry.center_um,
+            matrix=result.matrix_um_per_px,
+            image_shape_px=result.image_shape_px,
+        )
+        beyond_col = max(-0.5 - col, 0.0, col - (width - 0.5))
+        beyond_row = max(-0.5 - row, 0.0, row - (height - 0.5))
+        distance_um = math.hypot(beyond_col, beyond_row) * result.pixel_size_um
+        if distance_um < geometry.size_um[0] / 2.0:
+            kept.add(name)
+    return kept
+
+
+def test_the_plan_carries_the_grid_the_result_reports_and_the_camera_gives(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    """256 x 150 µm fields: 28 columns from the widths and 48 rows from the heights, at 10 %."""
+    microscope = _stand(demo_microscope_with_sample, tmp_path)
+
+    result = _result(_run(microscope, tmp_path, wells="A1"))
+
+    grid = _grid_of(result)
+    assert (grid.rows, grid.columns) == (48, 28)
+    assert (result.rows, result.columns) == (48, 28)
+    assert (grid.fov_width, grid.fov_height) == (256.0, 150.0)
+    assert result.fov_um == (256.0, 150.0)
+    assert grid.overlap == pytest.approx((10.0, 10.0))
+
+
+def test_the_fields_kept_are_those_whose_frame_meets_the_well(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    """On a 300 x 512 frame: a transposed frame in the clipping keeps another set (FM-73)."""
+    microscope = _stand(demo_microscope_with_sample, tmp_path)
+
+    result = _result(_run(microscope, tmp_path, wells="A1"))
+
+    assert {field.name for field in result.fields} == _names_whose_frame_meets_the_well(
+        result
+    )
+    assert len(result.fields) == 1112  # of 48 x 28 = 1344, measured
+
+
+def test_a_calibrations_rotation_and_mirror_reach_the_clipping(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    """A plan that clipped with the profile's upright camera would keep 914 fields, not these."""
+    microscope = _stand(demo_microscope_with_sample, tmp_path)
+    _write_calibration(tmp_path / "run.json", rotation_deg=30.0, mirrored=True)
+
+    result = _result(_run(microscope, tmp_path, wells="A1"))
+
+    assert result.matrix_source == "camera-calibration"
+    assert {field.name for field in result.fields} == _names_whose_frame_meets_the_well(
+        result
+    )
+    assert len(result.fields) == 854  # of 35 x 30 = 1050, measured
+
+
+def test_the_overlap_asked_for_reaches_the_grid_the_spacing_and_the_result(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    """At 30 % the step is 70 % of the field: 179.2 µm across and 105 µm down, and a bigger grid."""
+    microscope = _stand(demo_microscope_with_sample, tmp_path)
+
+    derived = _result(_run(microscope, tmp_path, wells="A1", overlap=0.3))
+    assert derived.overlap == 0.3
+    # (6400 - 150) / 105 = 59.5 -> 61 rows; (6400 - 256) / 179.2 = 34.3 -> 36 columns.
+    assert (derived.rows, derived.columns) == (61, 36)
+    assert _grid_of(derived).overlap == pytest.approx((30.0, 30.0))
+
+    flat = _result(
+        _run(
+            microscope,
+            tmp_path,
+            wells="A1",
+            overlap=0.3,
+            rows=2,
+            columns=3,
+            clip_to_well=False,
+        )
+    )
+    # useq's snake: the first row runs left to right, and the next field is below the last.
+    first, second, third, below = flat.fields[:4]
+    assert first.y_um == second.y_um == third.y_um
+    assert abs(second.x_um - first.x_um) == pytest.approx(0.7 * 256.0)
+    assert abs(third.x_um - second.x_um) == pytest.approx(0.7 * 256.0)
+    assert abs(below.y_um - third.y_um) == pytest.approx(0.7 * 150.0)
+
+
+def test_the_objective_in_place_given_by_name_is_still_the_one_in_place(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    """Asked for by label, the objective in place is not 'another objective' (FM-103)."""
+    microscope = _stand(demo_microscope_with_sample, tmp_path)
+
+    named = _result(_run(microscope, tmp_path, wells="A1", objective=IN_PLACE, **SMALL))
+
+    assert named.objective == IN_PLACE
+    assert named.pixel_size_um == PIXEL_UM  # the camera's, not the profile's 0.65
+    assert named.assumed == (NO_CALIBRATION.format(objective=IN_PLACE),)
+
+    _write_calibration(tmp_path / "run.json", rotation_deg=0.0)
+    calibrated = _result(
+        _run(microscope, tmp_path, wells="A1", objective=IN_PLACE, **SMALL)
+    )
+    assert calibrated.matrix_source == "camera-calibration"
+    assert calibrated.pixel_size_um == 0.4
+
+
+def test_a_columns_only_overrun_and_the_edge_of_the_cap(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    """FM-121: either axis over 100 is refused, 100 is not, and a wide short frame has the columns."""
+    microscope = _stand(demo_microscope_with_sample, tmp_path, shape=(512, 30))
+    with pytest.raises(PluginRunError) as wide:
+        _run(microscope, tmp_path, wells="A1")
+    assert wide.value.reason == (
+        "the grid would be 28 × 474 fields per well at 0.5 µm per pixel: "  # noqa: RUF001
+        "check the pixel size, or give rows and columns"
+    )
+
+    # Square frames, whose field is 71.4 µm and 70.9 µm: exactly 100 and 101 per axis.
+    assert grid_size((71.4, 71.4), (6400.0, 6400.0), coverage=1.0, overlap=0.1) == (
+        100,
+        100,
+    )
+    assert grid_size((70.9, 70.9), (6400.0, 6400.0), coverage=1.0, overlap=0.1) == (
+        101,
+        101,
+    )
+    at_the_cap = _stand(
+        demo_microscope_with_sample,
+        tmp_path,
+        shape=(512, 512),
+        pixel_size_um=71.4 / 512,
+    )
+    accepted = _result(_run(at_the_cap, tmp_path, wells="A1"))
+    assert (accepted.rows, accepted.columns) == (100, 100)
+
+    over = _stand(
+        demo_microscope_with_sample,
+        tmp_path,
+        shape=(512, 512),
+        pixel_size_um=70.9 / 512,
+    )
+    with pytest.raises(PluginRunError) as beyond:
+        _run(over, tmp_path, wells="A1")
+    assert beyond.value.reason == (
+        f"the grid would be 101 × 101 fields per well at {70.9 / 512:g} µm per pixel: "  # noqa: RUF001
+        "check the pixel size, or give rows and columns"
+    )
+
+
+def test_the_parameters_accept_their_limits() -> None:
+    """The bounds are inclusive where the design says so: a `>` for a `>=` would refuse these."""
+    limits = ScanPlanParams(
+        wells="A1",
+        overlap=0.0,
+        coverage=1.5,
+        rows=100,
+        columns=100,
+        pixel_size_um=100.0,
+    )
+
+    assert (limits.overlap, limits.coverage) == (0.0, 1.5)
+    assert (limits.rows, limits.columns, limits.pixel_size_um) == (100, 100, 100.0)
+    assert ScanPlanParams(wells="A1", overlap=0.89).overlap == 0.89
+
+
+def test_a_calibration_whose_matrix_cannot_be_inverted_is_refused(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    """It validates as a calibration, and the cells and the route could not use the plan it gives."""
+    microscope = _stand(demo_microscope_with_sample, tmp_path)
+    _write_calibration(tmp_path / "run.json", matrix=((1.0, 1.0), (1.0, 1.0)))
+
+    with pytest.raises(PluginRunError) as raised:
+        _run(microscope, tmp_path, wells="A1", **SMALL)
+
+    assert raised.value.reason == (
+        "the camera matrix cannot be inverted (determinant 0.0); "
+        "run camera-calibration, or give a pixel size"
+    )
+    assert _stored(tmp_path).status is StageStatus.failed
+    assert _stored(tmp_path).result is None
+
+
+def test_a_turret_at_an_empty_position_has_no_objective_in_place(
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The protocol lists empty positions, whose label is ``""``: that is no objective, not one called nothing."""
+    microscope = _stand(demo_microscope_with_sample, tmp_path)
+    monkeypatch.setattr(microscope.require(ObjectiveTurret), "current", lambda: "")
+
+    with pytest.raises(PluginRunError) as raised:
+        _run(microscope, tmp_path, wells="A1", **SMALL)
+
+    assert raised.value.reason == (
+        "no objective is in place: the turret is at an empty position; "
+        "turn it to an objective, or give objective to plan for one"
+    )
+    assert _stored(tmp_path).result is None
+
+    # A plan for a named objective needs none in place: it takes that one's size.
+    named = _result(_run(microscope, tmp_path, wells="A1", objective=FORTY, **SMALL))
+    assert named.objective == FORTY
+    assert named.pixel_size_um == 0.1625
