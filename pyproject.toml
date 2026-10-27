@@ -30,6 +30,8 @@ dependencies = [
   # The ecosystem's acquisition description: MDASequence, WellPlatePlan, grids.
   "useq-schema>=0.9",
   "numpy>=1.26",
+  # Phase correlation for camera calibration (m3 §4); a core dependency so the built-in plugin always loads.
+  "scikit-image>=0.22",
   "pydantic>=2.7",
   "typer>=0.12",
   "rich>=13",
