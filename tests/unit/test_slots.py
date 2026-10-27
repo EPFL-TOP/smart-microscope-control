@@ -8,29 +8,40 @@ optional field filled and ``sparse`` has every optional ``None``.
 
 from __future__ import annotations
 
+import ast
 import copy
 import math
+import re
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
 import useq
 from pydantic import BaseModel, ValidationError
 
+import smc
 from smc.plugins import slots
 from smc.plugins.slots import (
     CameraCalibration,
     Cell,
     CellsFile,
     CellsResult,
+    DensityResult,
+    DensityWell,
     FailedField,
     LatticeFit,
+    NisExportResult,
     PlannedField,
     PlateResult,
+    ReportResult,
+    RoutePosition,
+    RouteResult,
     ScanFrame,
     ScanPlanResult,
     ScanResult,
     SlotValue,
+    TimingsResult,
     WallTouch,
     WellRef,
 )
@@ -166,6 +177,61 @@ _CELLS: dict[str, Any] = {
     "seconds_per_frame": 0.34,
 }
 
+_DENSITY_WELL: dict[str, Any] = {
+    "well": "A1",
+    "fields": 305,
+    "failed_fields": 2,
+    "area_mm2": 31.2,
+    "counts": {"single": 40, "doublet": 3},
+    "outside_well": 5,
+    "per_mm2": {"single": 1.28, "doublet": 0.09},
+}
+_DENSITY: dict[str, Any] = {
+    "assumed": [],
+    "labels": ["single", "doublet"],
+    "area_grid_um": 50.0,
+    "wells": [_DENSITY_WELL],
+}
+_STOP: dict[str, Any] = {
+    "order": 0,
+    "well": "A1",
+    "name": "A1_0003",
+    "x_um": 1100.5,
+    "y_um": -990.25,
+    "z_um": 1500.0,
+    "pfs_offset": 512.0,
+    "counts": {"single": 2},
+}
+_ROUTE: dict[str, Any] = {
+    "assumed": [],
+    "objective": "Nikon 40X Plan Fluor ELWD",
+    "matrix_um_per_px": _MATRIX,
+    "image_shape_px": [1200, 1412],
+    "fov_um": [388.3, 330.0],
+    "labels": ["single"],
+    "positions": [_STOP],
+    "uncovered": {"A1": 0},
+    "distance_um": 9000.0,
+    "travel_s": 1.5,
+}
+_TIMINGS: dict[str, Any] = {
+    "assumed": ["refocus_ms assumed from the autofocus datasheet"],
+    "move_overhead_ms": 30.0,
+    "move_ms_per_mm": 12.5,
+    "refocus_ms": 250.0,
+    "snap_ms": 100.0,
+    "channel_ms": {"DAPI": 120.0},
+    "channel_switch_ms": 80.0,
+    "samples": 8,
+}
+_REPORT = {"assumed": [], "file": "report/0123456789ab.html"}
+_NIS = {
+    "assumed": [],
+    "file": "nis/0123456789ab.xml",
+    "positions": 12,
+    "z_mode": "pfs-offset",
+}
+
 #: Every model of ``smc.plugins.slots`` with a full and a sparse sample. A module
 #: that lands later adds its rows here (the first test fails until it does).
 SAMPLES: dict[type[BaseModel], Sample] = {
@@ -233,10 +299,33 @@ SAMPLES: dict[type[BaseModel], Sample] = {
         _CELLS,
         {**_CELLS, "counts": {}, "seconds_per_frame": None},
     ),
+    DensityWell: (
+        _DENSITY_WELL,
+        {**_DENSITY_WELL, "area_mm2": 0.0, "counts": {}, "per_mm2": None},
+    ),
+    DensityResult: (_DENSITY, {**_DENSITY, "wells": []}),
+    RoutePosition: (_STOP, {**_STOP, "z_um": None, "pfs_offset": None}),
+    RouteResult: (
+        _ROUTE,
+        {**_ROUTE, "objective": None, "positions": [], "travel_s": None},
+    ),
+    TimingsResult: (
+        _TIMINGS,
+        {
+            **{
+                k: v
+                for k, v in _TIMINGS.items()
+                if k not in ("channel_ms", "channel_switch_ms")
+            },
+            "refocus_ms": None,
+        },
+    ),
+    ReportResult: (_REPORT, _REPORT),
+    NisExportResult: (_NIS, {**_NIS, "positions": 0, "z_mode": "none"}),
 }
 
 #: Models that hold no float at all, so the finite-number walk has nothing to hit.
-NO_FLOAT: set[type[BaseModel]] = set()
+NO_FLOAT: set[type[BaseModel]] = {ReportResult, NisExportResult}
 
 
 def _leaves(
@@ -382,6 +471,21 @@ RANGES: list[tuple[type[BaseModel], tuple[Any, ...], list[Any], list[Any]]] = [
     (CellsResult, ("frames",), [-1], [0]),
     (CellsResult, ("merged",), [-1], [0]),
     (CellsResult, ("seconds_per_frame",), [-0.1], [0.0]),
+    (DensityWell, ("fields",), [-1], [0]),
+    (DensityWell, ("failed_fields",), [-1], [0]),
+    (DensityWell, ("area_mm2",), [-0.1], [0.0]),
+    (DensityWell, ("outside_well",), [-1], [0]),
+    (DensityResult, ("area_grid_um",), [0.0, -1.0], [1e-6]),
+    (RoutePosition, ("order",), [-1], [0]),
+    (RouteResult, ("distance_um",), [-0.1], [0.0]),
+    (RouteResult, ("travel_s",), [-0.1], [0.0]),
+    (TimingsResult, ("move_overhead_ms",), [-0.1], [0.0]),
+    (TimingsResult, ("move_ms_per_mm",), [-0.1], [0.0]),
+    (TimingsResult, ("refocus_ms",), [-0.1], [0.0]),
+    (TimingsResult, ("snap_ms",), [-0.1], [0.0]),
+    (TimingsResult, ("channel_switch_ms",), [-0.1], [0.0]),
+    (TimingsResult, ("samples",), [-1], [0]),
+    (NisExportResult, ("positions",), [-1], [0]),
 ]
 
 
@@ -406,7 +510,17 @@ def test_a_value_outside_its_range_is_refused(
     model: type[BaseModel], path: tuple[Any, ...], value: Any
 ) -> None:
     full, _ = SAMPLES[model]
-    assert _error_types(model, _with(full, path, value))
+    with pytest.raises(ValidationError) as raised:
+        model.model_validate(_with(full, path, value))
+    # One error, about this field, and about its range (not a type or a nan).
+    (error,) = raised.value.errors()
+    assert error["loc"] == path
+    assert error["type"] in {
+        "greater_than",
+        "greater_than_equal",
+        "less_than",
+        "less_than_equal",
+    }
 
 
 @pytest.mark.parametrize(("model", "path", "value"), _range_cases(1))
@@ -433,6 +547,12 @@ MUST_BE_PRESENT: list[tuple[type[BaseModel], tuple[Any, ...]]] = [
     (ScanFrame, ("pfs_offset",)),
     (ScanResult, ("objective",)),
     (CellsResult, ("seconds_per_frame",)),
+    (DensityWell, ("per_mm2",)),
+    (RoutePosition, ("z_um",)),
+    (RoutePosition, ("pfs_offset",)),
+    (RouteResult, ("objective",)),
+    (RouteResult, ("travel_s",)),
+    (TimingsResult, ("refocus_ms",)),
 ]
 
 
@@ -518,3 +638,72 @@ def test_frame_index_maps_a_well_to_the_positions_of_its_frames() -> None:
     assert list(index) == ["A1", "B1"]
     assert "C1" not in index
     assert ScanResult.model_validate({**_SCAN, "frames": []}).frame_index() == {}
+
+
+# --- timings, the route, and what the foundation may import ----------------------
+
+
+def test_move_ms_is_zero_for_no_distance_and_linear_beyond_it() -> None:
+    timings = TimingsResult.model_validate(_TIMINGS)  # 30 ms overhead, 12.5 ms/mm
+    assert timings.move_ms(0.0) == 0.0
+    assert timings.move_ms(-5.0) == 0.0
+    assert timings.move_ms(1000.0) == pytest.approx(42.5)
+    assert timings.move_ms(2000.0) == pytest.approx(55.0)
+    # A nan would slip past `<= 0` and give a nan time that every sum then carries.
+    for bad in (math.nan, math.inf, -math.inf):
+        with pytest.raises(
+            ValueError,
+            match=rf"\Adistance_um must be finite, got {re.escape(repr(bad))}\Z",
+        ):
+            timings.move_ms(bad)
+
+
+def test_route_to_useq_keeps_the_route_order_and_an_unknown_z() -> None:
+    stops = [
+        {
+            **_STOP,
+            "order": 0,
+            "name": "B1_0000",
+            "x_um": 5.0,
+            "y_um": 6.0,
+            "z_um": None,
+        },
+        {**_STOP, "order": 1, "name": "A1_0002", "x_um": 1.0, "y_um": 2.0, "z_um": 3.0},
+    ]
+    route = RouteResult.model_validate({**_ROUTE, "positions": stops})
+    positions = route.to_useq()
+    assert all(isinstance(p, useq.AbsolutePosition) for p in positions)
+    # The order of the route, not of the names, and a z that is unknown stays so.
+    assert [(p.name, p.x, p.y, p.z) for p in positions] == [
+        ("B1_0000", 5.0, 6.0, None),
+        ("A1_0002", 1.0, 2.0, 3.0),
+    ]
+    assert RouteResult.model_validate({**_ROUTE, "positions": []}).to_useq() == ()
+
+
+def _imports_of(path: Path) -> set[str]:
+    """Every module a source file imports, by its dotted name."""
+    names: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            names.add(("." * node.level) + (node.module or ""))
+    return names
+
+
+def test_the_foundation_imports_no_hardware_and_files_imports_no_plugins() -> None:
+    # ADR-0003: hardware is reached only through smc.hardware, by the layers that
+    # own a device. The slot models and the geometry are arithmetic on numbers.
+    root = Path(smc.__file__).parent
+    foundation = [root / "plugins" / "geometry.py", root / "run" / "files.py"]
+    foundation += sorted((root / "plugins" / "slots").glob("*.py"))
+    assert len(foundation) >= 14  # geometry, files, and the twelve slot modules
+    for path in foundation:
+        for name in _imports_of(path):
+            assert not name.startswith(("smc.hardware", "pymmcore")), (path.name, name)
+    # smc.run is below smc.plugins: plugins depend on the document, not the reverse.
+    assert not [n for n in _imports_of(root / "run" / "files.py") if "smc.plugins" in n]
+    assert not [
+        n for n in _imports_of(root / "run" / "document.py") if "smc.plugins" in n
+    ]

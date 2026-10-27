@@ -12,6 +12,8 @@ from __future__ import annotations
 from smc.plugins.slots.base import SlotValue
 from smc.plugins.slots.camera_calibration import CameraCalibration
 from smc.plugins.slots.cells import Cell, CellsFile, CellsResult, load_cells
+from smc.plugins.slots.density import DensityResult, DensityWell
+from smc.plugins.slots.nis_export import NisExportResult
 from smc.plugins.slots.plate import (
     LatticeFit,
     PlateResult,
@@ -21,6 +23,8 @@ from smc.plugins.slots.plate import (
     normalise_well,
     well_geometry,
 )
+from smc.plugins.slots.report import ReportResult
+from smc.plugins.slots.route import RoutePosition, RouteResult
 from smc.plugins.slots.scan import (
     FailedField,
     FocusState,
@@ -29,21 +33,29 @@ from smc.plugins.slots.scan import (
     load_frame,
 )
 from smc.plugins.slots.scan_plan import PlannedField, ScanPlanResult
+from smc.plugins.slots.timings import TimingsResult
 
 __all__ = [
     "CameraCalibration",
     "Cell",
     "CellsFile",
     "CellsResult",
+    "DensityResult",
+    "DensityWell",
     "FailedField",
     "FocusState",
     "LatticeFit",
+    "NisExportResult",
     "PlannedField",
     "PlateResult",
+    "ReportResult",
+    "RoutePosition",
+    "RouteResult",
     "ScanFrame",
     "ScanPlanResult",
     "ScanResult",
     "SlotValue",
+    "TimingsResult",
     "WallTouch",
     "WellGeometry",
     "WellRef",
