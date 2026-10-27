@@ -10,6 +10,7 @@ package, so importing a plugin never loads it by accident.
 from __future__ import annotations
 
 from smc.plugins.slots.base import SlotValue
+from smc.plugins.slots.camera_calibration import CameraCalibration
 from smc.plugins.slots.plate import (
     LatticeFit,
     PlateResult,
@@ -19,10 +20,14 @@ from smc.plugins.slots.plate import (
     normalise_well,
     well_geometry,
 )
+from smc.plugins.slots.scan_plan import PlannedField, ScanPlanResult
 
 __all__ = [
+    "CameraCalibration",
     "LatticeFit",
+    "PlannedField",
     "PlateResult",
+    "ScanPlanResult",
     "SlotValue",
     "WallTouch",
     "WellGeometry",

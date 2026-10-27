@@ -7,9 +7,12 @@ import it, and ``__init__`` imports the slot modules, so a base defined in
 
 from __future__ import annotations
 
+import math
+from typing import Any
+
 from pydantic import BaseModel, ConfigDict
 
-__all__ = ["SlotValue"]
+__all__ = ["SlotValue", "refuse_non_finite"]
 
 
 class SlotValue(BaseModel):
@@ -22,3 +25,22 @@ class SlotValue(BaseModel):
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+
+
+def refuse_non_finite(value: Any, what: str) -> None:
+    """Raise ``ValueError`` if a float inside ``value`` is ``nan`` or infinite.
+
+    For a field typed with another library's model (``useq``'s plans), whose
+    floats the slot model's ``allow_inf_nan=False`` does not reach. ``value``
+    is a dumped model: dicts, lists and tuples of scalars. The message names
+    one offender by its path, so the operator can find it in the file.
+    """
+    stack: list[tuple[str, Any]] = [(what, value)]
+    while stack:
+        path, item = stack.pop()
+        if isinstance(item, dict):
+            stack.extend((f"{path}.{key}", child) for key, child in item.items())
+        elif isinstance(item, list | tuple):
+            stack.extend((f"{path}[{i}]", child) for i, child in enumerate(item))
+        elif isinstance(item, float) and not math.isfinite(item):
+            raise ValueError(f"{path} must be finite, got {item!r}")

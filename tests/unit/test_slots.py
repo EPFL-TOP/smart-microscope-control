@@ -19,14 +19,19 @@ from pydantic import BaseModel, ValidationError
 
 from smc.plugins import slots
 from smc.plugins.slots import (
+    CameraCalibration,
     LatticeFit,
+    PlannedField,
     PlateResult,
+    ScanPlanResult,
     SlotValue,
     WallTouch,
     WellRef,
 )
 
 Sample = tuple[dict[str, Any], dict[str, Any]]  # (full, sparse)
+
+_MATRIX = [[0.275, 0.0], [0.0, -0.275]]
 
 _REF = {"well": "A1", "x_um": 1234.5, "y_um": -987.6}
 _FIT = {
@@ -49,6 +54,53 @@ _PLATE: dict[str, Any] = {
     "n_refs": 2,
     "refs": [_REF, {"well": "H12", "x_um": 100000.0, "y_um": -63000.0}],
     "fit": _FIT,
+}
+
+_CALIBRATION: dict[str, Any] = {
+    "assumed": ["rotation of the stage taken as 0"],
+    "objective": "Nikon 40X Plan Fluor ELWD",
+    "image_shape_px": [1200, 1412],
+    "matrix_um_per_px": _MATRIX,
+    "pixel_size_um": 0.275,
+    "rotation_deg": 1.5,
+    "mirrored": False,
+    "residual_um": 0.05,
+    "response": 0.8,
+    "return_error_um": 0.2,
+    "step_um": 20.0,
+    "reused_from": "camera-calibration of 2026-10-20",
+}
+_PLANNED = {
+    "well": "A1",
+    "index": 3,
+    "name": "A1_0003",
+    "x_um": 1100.5,
+    "y_um": -990.25,
+}
+_PLATE_PLAN = useq.WellPlatePlan(
+    plate=useq.WellPlate.from_str("96-well"),
+    a1_center_xy=(1000.0, 2000.0),
+    rotation=0.5,
+    selected_wells=([1, 0], [2, 2]),
+    well_points_plan=useq.GridRowsColumns(
+        rows=2, columns=3, overlap=(10.0, 10.0), fov_width=388.3, fov_height=330.0
+    ),
+).model_dump(mode="json")
+_SCAN_PLAN: dict[str, Any] = {
+    "assumed": [],
+    "plate_plan": _PLATE_PLAN,
+    "wells": ["B3", "A3"],
+    "objective": "Nikon 40X Plan Fluor ELWD",
+    "pixel_size_um": 0.275,
+    "matrix_um_per_px": _MATRIX,
+    "matrix_source": "camera-calibration",
+    "image_shape_px": [1200, 1412],
+    "fov_um": [388.3, 330.0],
+    "overlap": 0.1,
+    "rows": 2,
+    "columns": 3,
+    "fields": [_PLANNED],
+    "estimate_s": 1830.5,
 }
 
 #: Every model of ``smc.plugins.slots`` with a full and a sparse sample. A module
@@ -80,6 +132,27 @@ SAMPLES: dict[type[BaseModel], Sample] = {
             "residual_um": None,
             "scale_error": None,
             "n_refs": 0,
+        },
+    ),
+    CameraCalibration: (
+        _CALIBRATION,
+        {
+            **_CALIBRATION,
+            "objective": None,
+            "return_error_um": None,
+            "reused_from": None,
+        },
+    ),
+    PlannedField: (_PLANNED, _PLANNED),
+    ScanPlanResult: (
+        _SCAN_PLAN,
+        {
+            **_SCAN_PLAN,
+            "objective": None,
+            "matrix_source": "profile",
+            "wells": [],
+            "fields": [],
+            "estimate_s": None,
         },
     ),
 }
@@ -197,6 +270,18 @@ RANGES: list[tuple[type[BaseModel], tuple[Any, ...], list[Any], list[Any]]] = [
     (PlateResult, ("rotation_deg",), [-180.5, 180.5], [-180.0, 180.0]),
     (PlateResult, ("residual_um",), [-0.1], [0.0]),
     (PlateResult, ("n_refs",), [-1], [0]),
+    (CameraCalibration, ("pixel_size_um",), [0.0, -1.0], [1e-6]),
+    (CameraCalibration, ("rotation_deg",), [-180.5, 180.5], [-180.0, 180.0]),
+    (CameraCalibration, ("residual_um",), [-0.1], [0.0]),
+    (CameraCalibration, ("response",), [-0.1, 1.5], [0.0, 1.0]),
+    (CameraCalibration, ("return_error_um",), [-0.1], [0.0]),
+    (CameraCalibration, ("step_um",), [0.0, -1.0], [1e-6]),
+    (PlannedField, ("index",), [-1], [0]),
+    (ScanPlanResult, ("pixel_size_um",), [0.0, -1.0], [1e-6]),
+    (ScanPlanResult, ("overlap",), [-0.1, 1.0, 1.5], [0.0, 0.999]),
+    (ScanPlanResult, ("rows",), [0, -1], [1]),
+    (ScanPlanResult, ("columns",), [0, -1], [1]),
+    (ScanPlanResult, ("estimate_s",), [-0.1], [0.0]),
 ]
 
 
@@ -240,6 +325,10 @@ MUST_BE_PRESENT: list[tuple[type[BaseModel], tuple[Any, ...]]] = [
     (PlateResult, ("scale_error",)),
     (LatticeFit, ("runner_up",)),
     (LatticeFit, ("margin",)),
+    (CameraCalibration, ("objective",)),
+    (CameraCalibration, ("return_error_um",)),
+    (ScanPlanResult, ("objective",)),
+    (ScanPlanResult, ("estimate_s",)),
 ]
 
 
