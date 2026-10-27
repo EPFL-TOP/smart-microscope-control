@@ -71,8 +71,11 @@ src/smc/
     backends/             mm.py (over CMMCorePlus), zeiss_mtb/, viventis/
   plugins/                api.py, registry.py, params.py, runner.py   (M3)
                           stage_report.py (the built-in plugin)
+                          geometry.py   the camera matrix: pixels <-> stage um
+                          slots/        the models of the plate-scan results
   run/
     document.py           the run document: stages, slots, staleness  (M3)
+    files.py              atomic writes, tokens and run-folder paths  (M3)
 profiles/                 one TOML per instrument
 tests/                    unit/ · simulator (demo) · contracts/ · hardware/
 docs/adr/                 decisions
