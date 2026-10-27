@@ -20,6 +20,9 @@ from pydantic import BaseModel, ValidationError
 from smc.plugins import slots
 from smc.plugins.slots import (
     CameraCalibration,
+    Cell,
+    CellsFile,
+    CellsResult,
     FailedField,
     LatticeFit,
     PlannedField,
@@ -138,6 +141,31 @@ _SCAN: dict[str, Any] = {
     "failed": [_FAILED],
 }
 
+_CELL: dict[str, Any] = {
+    "well": "A1",
+    "x_um": 1010.5,
+    "y_um": 2010.25,
+    "label": "single",
+    "score": 0.91,
+    "frame": 0,
+    "box_px": [100.0, 200.0, 140.5, 240.5],
+}
+_CELLS_FILE = {"schema_version": 1, "cells": [_CELL]}
+_CELLS: dict[str, Any] = {
+    "assumed": [],
+    "file": "cells/0123456789ab.json",
+    "model": "cell_classes_model-cat-v2.pth",
+    "model_sha256": "0" * 64,
+    "classes": ["single", "doublet", "debris"],
+    "device": "cpu",
+    "score_threshold": 0.5,
+    "merge_radius_um": 8.0,
+    "frames": 12,
+    "counts": {"A1": {"single": 1, "doublet": 0, "debris": 0}},
+    "merged": 3,
+    "seconds_per_frame": 0.34,
+}
+
 #: Every model of ``smc.plugins.slots`` with a full and a sparse sample. A module
 #: that lands later adds its rows here (the first test fails until it does).
 SAMPLES: dict[type[BaseModel], Sample] = {
@@ -198,6 +226,12 @@ SAMPLES: dict[type[BaseModel], Sample] = {
     ScanResult: (
         _SCAN,
         {**_SCAN, "objective": None, "frames": [], "failed": []},
+    ),
+    Cell: (_CELL, _CELL),
+    CellsFile: (_CELLS_FILE, {"cells": []}),
+    CellsResult: (
+        _CELLS,
+        {**_CELLS, "counts": {}, "seconds_per_frame": None},
     ),
 }
 
@@ -302,6 +336,18 @@ def test_every_slot_model_refuses_an_unknown_key(model: type[BaseModel]) -> None
     assert types == ["extra_forbidden"]
 
 
+@MODELS
+def test_every_slot_model_is_frozen(model: type[BaseModel]) -> None:
+    # A result read from the run document is not edited in place: the record
+    # that holds it says what the run produced.
+    full, _ = SAMPLES[model]
+    loaded = model.model_validate(full)
+    field = next(iter(type(loaded).model_fields))
+    with pytest.raises(ValidationError) as raised:
+        setattr(loaded, field, getattr(loaded, field))
+    assert [error["type"] for error in raised.value.errors()] == ["frozen_instance"]
+
+
 # --- ranges ----------------------------------------------------------------------
 
 #: (model, path in the full sample, values refused, values accepted). Each refused
@@ -331,6 +377,11 @@ RANGES: list[tuple[type[BaseModel], tuple[Any, ...], list[Any], list[Any]]] = [
     (FailedField, ("index",), [-1], [0]),
     (ScanResult, ("pixel_size_um",), [0.0, -1.0], [1e-6]),
     (ScanResult, ("exposure_ms",), [-0.1], [0.0]),
+    (Cell, ("score",), [-0.1, 1.5], [0.0, 1.0]),
+    (Cell, ("frame",), [-1], [0]),
+    (CellsResult, ("frames",), [-1], [0]),
+    (CellsResult, ("merged",), [-1], [0]),
+    (CellsResult, ("seconds_per_frame",), [-0.1], [0.0]),
 ]
 
 
@@ -381,6 +432,7 @@ MUST_BE_PRESENT: list[tuple[type[BaseModel], tuple[Any, ...]]] = [
     (ScanFrame, ("z_um",)),
     (ScanFrame, ("pfs_offset",)),
     (ScanResult, ("objective",)),
+    (CellsResult, ("seconds_per_frame",)),
 ]
 
 

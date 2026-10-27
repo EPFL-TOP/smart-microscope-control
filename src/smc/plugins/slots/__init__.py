@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from smc.plugins.slots.base import SlotValue
 from smc.plugins.slots.camera_calibration import CameraCalibration
+from smc.plugins.slots.cells import Cell, CellsFile, CellsResult, load_cells
 from smc.plugins.slots.plate import (
     LatticeFit,
     PlateResult,
@@ -31,6 +32,9 @@ from smc.plugins.slots.scan_plan import PlannedField, ScanPlanResult
 
 __all__ = [
     "CameraCalibration",
+    "Cell",
+    "CellsFile",
+    "CellsResult",
     "FailedField",
     "FocusState",
     "LatticeFit",
@@ -43,6 +47,7 @@ __all__ = [
     "WallTouch",
     "WellGeometry",
     "WellRef",
+    "load_cells",
     "load_frame",
     "normalise_well",
     "well_geometry",
