@@ -36,6 +36,7 @@ from smc.plugins.api import (
     StopRequested,
 )
 from smc.plugins.errors import (
+    PluginRunError,
     RequirementsError,
     ResumeError,
     UpstreamError,
@@ -142,6 +143,16 @@ class Boom(Base):
 
     def body(self, microscope: Any, params: Params, ctx: RunContext) -> Result:
         raise HardwareError("the stage did not answer")
+
+
+class Unusable(Base):
+    """Does its work, saves a checkpoint, and finds nothing a reader could trust."""
+
+    name = provides = "unusable"
+
+    def body(self, microscope: Any, params: Params, ctx: RunContext) -> Result:
+        ctx.save_checkpoint(Seen(done=2))
+        raise PluginRunError(self.name, "no plate found; run it again")
 
 
 class Refuses(Base):
@@ -473,6 +484,23 @@ def test_a_hardware_error_records_failed_and_is_re_raised_unchanged(
     assert stored.status is StageStatus.failed
     assert stored.error == "HardwareError: the stage did not answer"
     assert stored.result is None
+
+
+def test_a_plugin_run_error_ends_the_record_failed_and_keeps_the_checkpoint(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    with pytest.raises(PluginRunError):
+        _run(Unusable(), fake_microscope, tmp_path)
+    stored = _stored(tmp_path, "unusable")
+    assert stored.status is StageStatus.failed
+    assert stored.error == "PluginRunError: unusable: no plate found; run it again"
+    assert stored.checkpoint == {"done": 2}
+    assert stored.result is None
+    # No unusable result fills the slot for a reader to trust.
+    doc = RunDocument.load(_path(tmp_path))
+    assert doc.unusable("unusable", profile="demo", dry_run=False) == (
+        "the last run of unusable ended failed; run it again"
+    )
 
 
 def test_a_safety_refusal_is_not_caught_by_the_runner(

@@ -23,6 +23,7 @@ __all__ = [
     "PluginError",
     "PluginLoadError",
     "PluginNotFoundError",
+    "PluginRunError",
     "RequirementsError",
     "ResumeError",
     "UpstreamError",
@@ -30,7 +31,7 @@ __all__ = [
 
 
 class PluginError(Exception):
-    """A plugin could not be found, loaded, configured or started."""
+    """A plugin could not be found, loaded, configured, started, or finish with a usable result."""
 
 
 class PluginNotFoundError(PluginError):
@@ -131,6 +132,24 @@ class ResumeError(PluginError):
         self.plugin = plugin
         self.reason = reason
         super().__init__(f"cannot resume {plugin}: {reason}")
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        return (type(self), (self.plugin, self.reason))
+
+
+class PluginRunError(PluginError):
+    """A plugin ran and could not produce a usable result; ``reason`` ends with what to do.
+
+    Raised by a stage that did its work and found nothing a reader could trust
+    (no plate in the image, a fit that does not hold): the runner records the
+    attempt ``failed`` with the checkpoint kept, so no unusable result fills
+    the slot (§2.3). It is not a ``HardwareError``: the stand answered.
+    """
+
+    def __init__(self, plugin: str, reason: str) -> None:
+        self.plugin = plugin
+        self.reason = reason
+        super().__init__(f"{plugin}: {reason}")
 
     def __reduce__(self) -> tuple[Any, ...]:
         return (type(self), (self.plugin, self.reason))

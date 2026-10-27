@@ -36,6 +36,7 @@ from smc.hardware.errors import HardwareError, SafetyRefusedError
 from smc.hardware.profile import Profile
 from smc.plugins import registry as registry_mod
 from smc.plugins.api import PluginParams, PluginResult, RunContext, StopRequested
+from smc.plugins.errors import PluginRunError
 from smc.plugins.registry import GROUP
 from smc.run import RunDocument, StageRecord, StageStatus, write_stage
 from smc.run import document as document_mod
@@ -131,6 +132,13 @@ class Boom(Base):
 
     def run(self, microscope: Any, params: Params, ctx: RunContext) -> EchoResult:
         raise HardwareError("the stage did not answer")
+
+
+class Unusable(Base):
+    name = provides = "unusable"
+
+    def run(self, microscope: Any, params: Params, ctx: RunContext) -> EchoResult:
+        raise PluginRunError(self.name, "no plate found; run it again")
 
 
 class Refuses(Base):
@@ -829,6 +837,20 @@ def test_a_hardware_error_exits_1(
     assert (stored.status, stored.error) == (
         StageStatus.failed,
         "HardwareError: the stage did not answer",
+    )
+
+
+def test_a_plugin_run_error_exits_1_with_its_reason(
+    fake_stand: list[bool], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _register(monkeypatch, Unusable)
+    result = _run("run", "unusable", "--run-doc", _doc(tmp_path))
+    assert result.exit_code == 1, result.output
+    assert "✗ unusable: no plate found; run it again" in result.output
+    stored = _stored(tmp_path, "unusable")
+    assert (stored.status, stored.error) == (
+        StageStatus.failed,
+        "PluginRunError: unusable: no plate found; run it again",
     )
 
 

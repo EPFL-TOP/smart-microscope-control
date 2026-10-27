@@ -13,6 +13,7 @@ from smc.plugins.errors import (
     PluginError,
     PluginLoadError,
     PluginNotFoundError,
+    PluginRunError,
     RequirementsError,
     ResumeError,
     UpstreamError,
@@ -38,6 +39,7 @@ ERRORS: list[PluginError] = [
     ),
     UpstreamError("wells", "plate", "the run document has no plate"),
     ResumeError("scan", "nothing to resume"),
+    PluginRunError("plate-finding", "no plate found; move to a well and run it again"),
 ]
 
 
@@ -126,3 +128,21 @@ def test_upstream_and_resume_errors_name_the_plugin_and_say_what_to_do() -> None
     resume = ResumeError("scan", "nothing to resume")
     assert (resume.plugin, resume.reason) == ("scan", "nothing to resume")
     assert str(resume) == "cannot resume scan: nothing to resume"
+
+
+def test_plugin_run_error_names_the_plugin_and_survives_pickle() -> None:
+    error = PluginRunError("plate-finding", "no lattice fits; register the plate")
+    assert (error.plugin, error.reason) == (
+        "plate-finding",
+        "no lattice fits; register the plate",
+    )
+    assert str(error) == "plate-finding: no lattice fits; register the plate"
+    # A stage that ran and found nothing usable is a PluginError (smc run exits 1
+    # through its "any other PluginError" branch), never a device fault that a
+    # plugin's `except HardwareError` or `except RuntimeError` could take.
+    assert isinstance(error, PluginError)
+    assert not isinstance(error, HardwareError | RuntimeError)
+    copy = pickle.loads(pickle.dumps(error))
+    assert type(copy) is PluginRunError
+    assert (copy.plugin, copy.reason) == (error.plugin, error.reason)
+    assert str(copy) == str(error)
