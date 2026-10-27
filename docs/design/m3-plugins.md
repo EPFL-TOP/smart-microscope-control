@@ -903,6 +903,7 @@ report stale, and `smc run` says so.
 ```
 src/smc/plugins/slots/
   __init__.py            re-exports every name below
+  base.py                SlotValue
   plate.py               WellRef, WallTouch, LatticeFit, PlateResult, WellGeometry,
                          well_geometry(), normalise_well()
   camera_calibration.py  CameraCalibration
@@ -916,13 +917,16 @@ src/smc/plugins/slots/
   nis_export.py          NisExportResult
 src/smc/plugins/geometry.py   Matrix2, pixel_matrix(), stage_of_pixel(), pixel_of_stage(), footprint()
 src/smc/plugins/errors.py     + PluginRunError
-src/smc/run/files.py          AtomicWriteError, write_atomically(), new_token(),
-                              relative_to_run(), resolve_in_run()
+src/smc/run/files.py          AtomicWriteError, write_atomically(), retry_on_permission_error(),
+                              new_token(), relative_to_run(), resolve_in_run()
 ```
 
 Every model below derives from `PluginResult` (a slot's result) or from
-`SlotValue`, `smc/plugins/slots/__init__.py`'s base for values inside a
-result:
+`SlotValue`, the base for values inside a result. It is defined in
+`slots/base.py` and re-exported by the package, so `from smc.plugins.slots
+import SlotValue` holds: defined in `__init__.py`, below the imports of the
+modules that need it, it fails with a circular `ImportError` (measured), and
+above them `ruff`'s `I` and `E402` refuse it.
 
 ```python
 class SlotValue(BaseModel):
@@ -1058,7 +1062,12 @@ def normalise_well(name: str) -> str: ...
 ```
 
 `size_um` is `(width, height)` from `plate.well_size` in mm × 1000; the
-centre comes from the forward model of §2.1. `to_plate_frame` gives the
+centre comes from the forward model of §2.1 (it agrees with useq's own
+`all_well_positions` to 3e-11 µm on all nine registered plates, rotated by
+13°), and `rotation_deg` is `plan.rotation`, which useq leaves `None` on a plan
+built without one: it is read as 0.0 (measured, useq 0.9.2). The row and
+column are found in `plan.all_well_names`, never by parsing the letters. All
+registered round wells have equal sizes (measured). `to_plate_frame` gives the
 offset from the centre rotated by `−rotation_deg`, in which a square well
 is axis-aligned. `contains` is true inside the well shrunk by
 `margin_um`: a disc of radius `width / 2 − margin` (the registry's round
@@ -1302,7 +1311,7 @@ class TimingsResult(PluginResult):
     move_ms_per_mm: float = Field(ge=0.0)
     refocus_ms: float | None = Field(ge=0.0)
     snap_ms: float = Field(ge=0.0)
-    channel_ms: dict[str, float] = {}
+    channel_ms: dict[str, float] = Field(default_factory=dict)
     channel_switch_ms: float | None = Field(None, ge=0.0)
     samples: int = Field(ge=0)
 
@@ -1346,19 +1355,31 @@ result."
 class AtomicWriteError(OSError):
     kept: Path | None
 
+    def __init__(self, cause: OSError, kept: Path | None = None) -> None: ...
 
-def write_atomically(path: Path, data: bytes) -> None: ...
+
+def write_atomically(path: Path, data: bytes, *, make_parents: bool = True) -> None: ...
+def retry_on_permission_error(action: Callable[[], T]) -> T: ...
 def new_token() -> str: ...
 def relative_to_run(run_dir: Path, path: Path) -> str: ...
 def resolve_in_run(run_dir: Path, relative: str) -> Path: ...
 ```
 
 - `write_atomically` is `document.py`'s private helper moved here
-  unchanged (FM-38, FM-24: `O_EXCL`, mode `0o666`, `fsync`, `os.replace`
+  (FM-38, FM-24: `O_EXCL`, mode `0o666`, `fsync`, `os.replace`
   retried 5 times 0.05 s apart on `PermissionError`), creating the parent
-  folders first. It raises `AtomicWriteError` with `kept` set when only
-  the rename failed. `document.py` calls it and turns the error into its
-  `RunDocumentError` as before; its tests pass unchanged.
+  folders first **unless `make_parents=False`**: the run document passes
+  `False`, because a mistyped `--run-doc` folder is refused, not created
+  (`test_a_folder_that_does_not_exist_is_a_run_document_error`, measured:
+  without the option that test fails). It raises `AtomicWriteError`, which
+  copies `errno`, `strerror` and `filename` of its `cause` (raised `from`
+  it) and sets `kept` when only the rename failed. `retry_on_permission_error`
+  is `document.py`'s `_retrying` moved with the constants it uses, since the
+  document's read needs it too. `document.py` calls both and turns the error
+  into its `RunDocumentError` with the same two messages as before. Its
+  tests pass with one mechanical change: they patch `os.replace`, `os.fsync`
+  and `time.sleep` through the module that imports them (`document_mod.os`),
+  which is now `smc.run.files` (`files_mod.os`); every assertion stays.
 - `new_token()` is `uuid.uuid4().hex[:12]`.
 - `relative_to_run` gives `path` relative to `run_dir` as POSIX text and
   raises `ValueError` when it is not inside. `resolve_in_run` refuses an
@@ -1375,7 +1396,10 @@ unknown key, and `PlateResult` refuses `plate="glass"`;
 `test_a_subclass_of_a_slot_model_is_refused_through_the_base` pins §2.3.
 `tests/unit/test_geometry.py`: `pixel_matrix` and `stage_of_pixel` against
 `PlateSample.render` on a non-square frame (FM-73) at 0°, 30° and 30°
-mirrored, a blob mapping back within a pixel;
+mirrored, a blob's centroid mapping back within **0.05 px** (measured worst
+0.001 px; the half-pixel centre of `nikon-control`, `W / 2`, is 0.708 px
+off and swapped height and width 67.9 px, so "within a pixel" would not
+fail the first);
 `test_pixel_of_stage_inverts_stage_of_pixel`; `footprint` corners;
 `well_geometry` against `WellPlatePlan` positions on a rotated plate, round
 and square wells, with a margin. `tests/unit/test_run_files.py`:
