@@ -15,7 +15,9 @@ position is asserted within 0.05 µm and never with equality (FM-85).
 from __future__ import annotations
 
 import logging
+import re
 import threading
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,7 +27,15 @@ import pytest
 from smc.hardware import Microscope
 from smc.hardware.capabilities import XY, Camera, Limits, ObjectiveTurret, XYStage
 from smc.hardware.errors import HardwareError, MicroscopeHaltedError
-from smc.plugins import PluginRunError, Progress, load, run_plugin
+from smc.plugins import (
+    PluginRunError,
+    Progress,
+    RunContext,
+    StopRequested,
+    load,
+    run_plugin,
+)
+from smc.plugins.camera_calibration.algorithm import MIN_RESPONSE
 from smc.plugins.camera_calibration.plugin import (
     CameraCalibrationParams,
     CameraCalibrationPlugin,
@@ -47,7 +57,9 @@ class _FlakyStage:
 
     It implements the seven methods of ``XYStage``: ``Microscope.override``
     refuses an implementation that lacks one. ``moves`` counts the absolute
-    moves it was asked for, so a test can say that no return was sent.
+    moves it was asked for and ``targets`` keeps them, so a test can say that no
+    return was sent and how far a move was asked to go. With
+    ``unreadable_after_fault`` the position cannot be read once a move failed.
     """
 
     def __init__(
@@ -56,18 +68,26 @@ class _FlakyStage:
         *,
         fail_on_move: int | None = None,
         drift_um: dict[int, tuple[float, float]] | None = None,
+        unreadable_after_fault: bool = False,
     ) -> None:
         self._real = real
         self._fail_on_move = fail_on_move
         self._drift_um = drift_um or {}
+        self._unreadable_after_fault = unreadable_after_fault
+        self._faulted = False
         self.moves = 0
+        self.targets: list[tuple[float, float]] = []
 
     def position_um(self) -> XY:
+        if self._faulted and self._unreadable_after_fault:
+            raise HardwareError("the position cannot be read")
         return self._real.position_um()
 
     def move_to_um(self, x_um: float, y_um: float) -> XY:
         self.moves += 1
+        self.targets.append((x_um, y_um))
         if self.moves == self._fail_on_move:
+            self._faulted = True
             raise HardwareError("the stage did not answer")
         dx, dy = self._drift_um.get(self.moves, (0.0, 0.0))
         return self._real.move_to_um(x_um + dx, y_um + dy)
@@ -116,6 +136,49 @@ class _ForgetfulCamera(SampleCamera):
         return frame
 
 
+class _NoisyCamera(SampleCamera):
+    """A sample camera whose numbered frames carry extra noise: those probes correlate less.
+
+    Snap 1 is the reference, 2 the +X probe, 3 the +Y probe, 4 the return.
+    """
+
+    def __init__(
+        self, *args: object, noisy_snaps: tuple[int, ...], **kwargs: object
+    ) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self._noisy_snaps = noisy_snaps
+        self.snaps = 0
+
+    def snap(self) -> np.ndarray:
+        self.snaps += 1
+        frame = super().snap()
+        if self.snaps not in self._noisy_snaps:
+            return frame
+        noise = np.random.default_rng(self.snaps).normal(0.0, 60.0, size=frame.shape)
+        return np.rint(np.clip(frame + noise, 0.0, 65535.0)).astype(np.uint16)
+
+
+class _BadFirstFrameCamera(SampleCamera):
+    """A sample camera whose reference frame is something the correlation cannot use."""
+
+    def __init__(
+        self,
+        *args: object,
+        spoil: Callable[[np.ndarray], np.ndarray],
+        **kwargs: object,
+    ) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self._spoil = spoil
+        self._first = True
+
+    def snap(self) -> np.ndarray:
+        frame = super().snap()
+        if self._first:
+            self._first = False
+            return self._spoil(frame)
+        return frame
+
+
 def _sample_camera(microscope: Microscope, **kwargs: object) -> SampleCamera:
     return SampleCamera(
         microscope,
@@ -157,6 +220,7 @@ def _write_calibration(
     objective: str | None,
     shape: tuple[int, int],
     status: StageStatus = StageStatus.done,
+    dry_run: bool = False,
 ) -> CameraCalibration:
     """A ``camera-calibration`` record as an earlier run of the stage would have left it."""
     result = CameraCalibration(
@@ -183,7 +247,7 @@ def _write_calibration(
             started_utc=then,
             finished_utc=then,
             profile=profile,
-            dry_run=False,
+            dry_run=dry_run,
             smc_version="0",
             params={},
             result=result.model_dump(mode="json"),
@@ -656,6 +720,440 @@ def test_a_return_that_does_not_correlate_leaves_the_error_unknown(
         for line in result.assumed
     )
     assert result.pixel_size_um == pytest.approx(1.0, rel=0.02)
+
+
+# ----------------------------------------- found by the adversarial review of #22
+
+
+def _fmt(value: float) -> str:
+    """A coordinate as the WARNING writes it: one decimal, and no ``-0.0``."""
+    return f"{value + 0.0:.1f}"
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == LOGGER]
+
+
+def _start_off_the_origin(microscope: Microscope) -> tuple[float, float]:
+    """Park the stage at (300, 200): a start with two different coordinates, so a swap shows."""
+    microscope.require(XYStage).move_to_um(300.0, 200.0)
+    return _here(microscope)
+
+
+def test_a_step_derived_from_the_reported_pixel_size_is_capped(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """FM-121: a reported size 100 times too large was sent as 9.6 mm of absolute moves."""
+    demo_microscope.override(
+        Camera, _reporting_camera(demo_microscope, reported_um=100.0)
+    )
+    start = _here(demo_microscope)
+    stage = _FlakyStage(demo_microscope.require(XYStage))
+    demo_microscope.override(XYStage, stage)
+
+    with pytest.raises(PluginRunError, match="step 2000 µm"):
+        _run(demo_microscope, tmp_path)  # 2000 µm is far beyond the field: no fit
+
+    assert stage.targets[:2] == pytest.approx(
+        [(start[0] + 2000.0, start[1]), (start[0], start[1] + 2000.0)]
+    )
+
+
+def test_a_capped_step_says_so_in_the_result(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """A camera that renders and reports 25 µm per pixel: a quarter of the field is 2400 µm."""
+    demo_microscope.override(
+        Camera,
+        SampleCamera(demo_microscope, PlateSample(), pixel_size_um=25.0, shape=SHAPE),
+    )
+
+    result = _result(_run(demo_microscope, tmp_path))
+
+    assert result.step_um == 2000.0
+    assert result.assumed[0].startswith("step capped at 2000 µm")
+    assert result.pixel_size_um == pytest.approx(25.0, rel=0.02)
+
+
+@pytest.mark.parametrize("noisy_snap", [2, 3], ids=["x-probe", "y-probe"])
+def test_the_response_is_the_smaller_of_the_two_probes(
+    demo_microscope: Microscope, tmp_path: Path, noisy_snap: int
+) -> None:
+    """Whichever probe is weaker sets the result's response: neither is dropped or averaged.
+
+    A clean run reads about 0.8, and a result that kept one probe's response, or
+    the larger, would read that whichever probe was noisy.
+    """
+    demo_microscope.override(
+        Camera,
+        _NoisyCamera(
+            demo_microscope,
+            PlateSample(),
+            pixel_size_um=1.0,
+            shape=SHAPE,
+            noisy_snaps=(noisy_snap,),
+        ),
+    )
+
+    result = _result(_run(demo_microscope, tmp_path))
+
+    assert MIN_RESPONSE < result.response < 0.6
+
+
+@pytest.mark.parametrize(
+    "rotation_deg", [0.0, 90.0], ids=["the-y-probe-wraps", "the-x-probe-wraps"]
+)
+def test_a_wrap_in_either_probe_is_refused(
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    rotation_deg: float,
+) -> None:
+    """200 µm is 200 px: more than half of the 384 rows, on the axis that the camera puts Y or X on."""
+    microscope = demo_microscope_with_sample(
+        shape=SHAPE, camera_rotation_deg=rotation_deg
+    )
+
+    with pytest.raises(PluginRunError, match="barely correlate"):
+        _run(microscope, tmp_path, step_um=200.0)
+
+
+def test_the_warning_after_a_fault_names_where_the_stage_is_and_where_it_started(
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    microscope = demo_microscope_with_sample(shape=SHAPE)
+    start = _start_off_the_origin(microscope)
+    microscope.override(
+        XYStage, _FlakyStage(microscope.require(XYStage), fail_on_move=2)
+    )
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER), pytest.raises(HardwareError):
+        _run(microscope, tmp_path)
+
+    assert _warnings(caplog) == [
+        f"the stage is left at ({_fmt(start[0] + STEP_UM)}, {_fmt(start[1])}) µm, "
+        f"not returned to ({_fmt(start[0])}, {_fmt(start[1])}) µm"
+    ]
+
+
+def test_a_position_that_cannot_be_read_does_not_hide_the_fault(
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    microscope = demo_microscope_with_sample(shape=SHAPE)
+    start = _start_off_the_origin(microscope)
+    stage = _FlakyStage(
+        microscope.require(XYStage), fail_on_move=2, unreadable_after_fault=True
+    )
+    microscope.override(XYStage, stage)
+
+    with (
+        caplog.at_level(logging.WARNING, logger=LOGGER),
+        pytest.raises(HardwareError, match="did not answer"),
+    ):
+        _run(microscope, tmp_path)
+
+    assert _warnings(caplog) == [
+        "the stage is left at an unknown position, not returned to "
+        f"({_fmt(start[0])}, {_fmt(start[1])}) µm"
+    ]
+
+
+def test_a_stop_before_any_move_leaves_the_stage_and_logs_nothing(
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Nothing moved, so there is nothing left anywhere to warn about."""
+    microscope = demo_microscope_with_sample(shape=SHAPE)
+    start = _start_off_the_origin(microscope)
+    stop = threading.Event()
+    stop.set()
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        record = run_plugin(
+            CameraCalibrationPlugin(),
+            microscope,
+            CameraCalibrationParams(),
+            tmp_path / "run.json",
+            stop=stop,
+        )
+
+    assert record.status is StageStatus.stopped
+    assert _here(microscope) == pytest.approx(start, abs=0.05)
+    assert _warnings(caplog) == []
+
+
+def test_a_stop_in_the_settle_after_the_return_logs_nothing(
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stage is home when the stop arrives: the measurement is dropped, no WARNING.
+
+    It also pins that ``settle_ms`` is waited after each of the three moves, in
+    seconds: the context's own wait, recorded, as the ``stage-report`` test does.
+    """
+    microscope = demo_microscope_with_sample(shape=SHAPE)
+    start = _start_off_the_origin(microscope)
+    waits: list[float] = []
+
+    def wait_then_stop(_ctx: RunContext, seconds: float) -> None:
+        waits.append(seconds)
+        if len(waits) == 3:  # the settle after the return move
+            raise StopRequested
+
+    monkeypatch.setattr(RunContext, "wait_s", wait_then_stop)
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        record = _run(microscope, tmp_path, settle_ms=50.0)
+
+    assert record.status is StageStatus.stopped
+    assert waits == [0.05, 0.05, 0.05]
+    assert _here(microscope) == pytest.approx(start, abs=0.05)
+    assert _warnings(caplog) == []
+
+
+def _nan_in(frame: np.ndarray) -> np.ndarray:
+    out = frame.astype(np.float64)
+    out[3, 5] = np.nan
+    return out
+
+
+@pytest.mark.parametrize(
+    ("spoil", "message"),
+    [
+        (_nan_in, "not finite"),
+        (lambda frame: np.stack([frame] * 3, axis=-1), "(384, 512, 3)"),
+        (lambda frame: frame.T.copy(), "(512, 384)"),
+    ],
+    ids=["a-nan", "a-colour-frame", "a-transposed-frame"],
+)
+def test_a_reference_frame_that_cannot_be_judged_is_refused_before_any_move(
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    spoil: Callable[[np.ndarray], np.ndarray],
+    message: str,
+) -> None:
+    """Known at the first frame, so the stage is not left a quarter of a field away."""
+    demo_microscope.override(
+        Camera,
+        _BadFirstFrameCamera(
+            demo_microscope,
+            PlateSample(),
+            pixel_size_um=1.0,
+            shape=SHAPE,
+            spoil=spoil,
+        ),
+    )
+    stage = _FlakyStage(demo_microscope.require(XYStage))
+    demo_microscope.override(XYStage, stage)
+
+    with pytest.raises(PluginRunError, match=re.escape(message)):
+        _run(demo_microscope, tmp_path)
+
+    assert stage.moves == 0
+    assert _stored(tmp_path).status is StageStatus.failed
+
+
+# -- reuse: the shape is compared as (height, width), and as typed
+
+
+def test_reuse_accepts_a_non_square_shape_of_the_camera(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    microscope = demo_microscope_with_sample(shape=SHAPE)
+    source = tmp_path / "same.json"
+    _write_calibration(
+        source, objective=microscope.require(ObjectiveTurret).current(), shape=SHAPE
+    )
+
+    result = _result(_run(microscope, tmp_path, from_run_doc=source))
+
+    assert result.image_shape_px == SHAPE
+
+
+@pytest.mark.parametrize(
+    "other_shape",
+    [(512, 384), (384, 640), (256, 512)],
+    ids=["transposed", "same-height", "same-width"],
+)
+def test_reuse_refuses_a_shape_that_differs_in_either_side(
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    other_shape: tuple[int, int],
+) -> None:
+    """(height, width): a comparison of one side, or of the sorted sides, accepts one of these."""
+    microscope = demo_microscope_with_sample(shape=SHAPE)
+    source = tmp_path / "other.json"
+    _write_calibration(
+        source,
+        objective=microscope.require(ObjectiveTurret).current(),
+        shape=other_shape,
+    )
+
+    with pytest.raises(PluginRunError) as raised:
+        _run(microscope, tmp_path, from_run_doc=source)
+
+    assert str(other_shape) in raised.value.reason
+    assert str(SHAPE) in raised.value.reason
+
+
+def test_reuse_keeps_a_relative_path_relative_and_never_resolves_it(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FM-50: an absolute path names a user's folder, and the run document is attached to issues."""
+    monkeypatch.chdir(tmp_path)
+    objective = demo_microscope.require(ObjectiveTurret).current()
+    shape = demo_microscope.require(Camera).image_shape()
+    _write_calibration(Path("earlier.json"), objective=objective, shape=shape)
+
+    result = _result(_run(demo_microscope, tmp_path, from_run_doc=Path("earlier.json")))
+
+    assert result.reused_from == "earlier.json"
+    assert result.assumed[-1].startswith("camera calibration reused from earlier.json,")
+
+
+@pytest.mark.parametrize(
+    ("stand", "recorded_in_a_dry_run", "accepted"),
+    [
+        ("demo_microscope", False, True),
+        ("demo_microscope_dry", False, True),
+        ("demo_microscope_dry", True, True),
+        ("demo_microscope", True, False),
+    ],
+    ids=["real-reads-real", "dry-reads-real", "dry-reads-dry", "real-reads-dry"],
+)
+def test_a_calibration_from_a_dry_run_is_read_only_by_a_dry_run(
+    stand: str,
+    recorded_in_a_dry_run: bool,
+    accepted: bool,
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+) -> None:
+    """A dry run's result stands for a stage that never moved: a real run does not read it."""
+    microscope: Microscope = request.getfixturevalue(stand)
+    source = tmp_path / "earlier.json"
+    _write_calibration(
+        source,
+        objective=microscope.require(ObjectiveTurret).current(),
+        shape=microscope.require(Camera).image_shape(),
+        dry_run=recorded_in_a_dry_run,
+    )
+
+    if accepted:
+        assert _result(_run(microscope, tmp_path, from_run_doc=source)).reused_from
+    else:
+        with pytest.raises(PluginRunError, match="was a dry run"):
+            _run(microscope, tmp_path, from_run_doc=source)
+
+
+def test_without_a_turret_the_objective_is_unknown_and_is_not_compared(
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    microscope = demo_microscope_with_sample(shape=SHAPE)
+    real_get = microscope.get
+    monkeypatch.setattr(
+        microscope,
+        "get",
+        lambda capability: (
+            None if capability is ObjectiveTurret else real_get(capability)
+        ),
+    )
+    source = tmp_path / "earlier.json"
+    _write_calibration(source, objective="Objective-1", shape=SHAPE)
+
+    reused = _result(_run(microscope, tmp_path, from_run_doc=source))
+    measured = _result(_run(microscope, tmp_path))
+
+    assert reused.objective == "Objective-1"  # copied as it was measured
+    assert measured.objective is None  # no turret: unknown, not guessed
+
+
+# -- what the result says about the return, and when the camera is contradicted
+
+
+@pytest.mark.parametrize(
+    ("pose", "drift_um", "expected_um"),
+    [
+        ({}, (0.0, 10.0), 10.0),
+        ({"camera_rotation_deg": 30.0, "mirrored": True}, (10.0, 0.0), 10.0),
+        ({"camera_rotation_deg": 30.0, "mirrored": True}, (0.0, 10.0), 10.0),
+    ],
+    ids=["y-drift", "x-drift-rotated-mirrored", "y-drift-rotated-mirrored"],
+)
+def test_the_return_error_is_the_stage_length_through_the_matrix(
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    pose: dict[str, object],
+    drift_um: tuple[float, float],
+    expected_um: float,
+) -> None:
+    microscope = demo_microscope_with_sample(shape=SHAPE, **pose)  # type: ignore[arg-type]
+    microscope.override(
+        XYStage,
+        _FlakyStage(microscope.require(XYStage), drift_um={3: drift_um}),
+    )
+
+    result = _result(_run(microscope, tmp_path))
+
+    assert result.return_error_um == pytest.approx(expected_um, abs=0.7)
+    assert any("came back" in line for line in result.assumed)
+
+
+@pytest.mark.parametrize(
+    ("pixel_size_um", "drift_um", "reported"),
+    [
+        # Under four pixels at 1 µm per pixel, and over 2 µm: the pixels decide.
+        (1.0, 3.0, False),
+        # Over four pixels (0.4 µm each: 1.6 µm), under 2 µm: the floor decides.
+        (0.4, 1.9, False),
+        (0.4, 2.5, True),
+    ],
+    ids=["three-pixels", "under-the-floor", "over-the-floor"],
+)
+def test_the_return_error_limit_is_two_um_or_four_pixels_whichever_is_larger(
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    pixel_size_um: float,
+    drift_um: float,
+    reported: bool,
+) -> None:
+    demo_microscope.override(
+        Camera,
+        SampleCamera(
+            demo_microscope, PlateSample(), pixel_size_um=pixel_size_um, shape=SHAPE
+        ),
+    )
+    demo_microscope.override(
+        XYStage,
+        _FlakyStage(demo_microscope.require(XYStage), drift_um={3: (drift_um, 0.0)}),
+    )
+
+    result = _result(_run(demo_microscope, tmp_path))
+
+    assert result.return_error_um == pytest.approx(drift_um, abs=0.3)
+    assert any("came back" in line for line in result.assumed) is reported
+
+
+def test_a_pixel_size_that_is_five_percent_off_is_blamed(
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    demo_microscope.override(
+        Camera, _reporting_camera(demo_microscope, reported_um=1.05)
+    )
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        _result(_run(demo_microscope, tmp_path))
+
+    assert any("reports 1.05" in line for line in _warnings(caplog))
 
 
 def _reporting_camera(

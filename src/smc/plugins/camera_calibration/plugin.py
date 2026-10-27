@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+import numpy as np
+import numpy.typing as npt
 from pydantic import Field, ValidationError
 
 from smc.hardware.capabilities import XY, Camera, ObjectiveTurret, XYStage
@@ -56,6 +58,11 @@ _PIXEL_SIZE_TOLERANCE = 0.02
 #: The stage coming back further than ``max(2 µm, 4 pixels)`` is reported.
 _RETURN_FLOOR_UM = 2.0
 _RETURN_PIXELS = 4.0
+#: The largest probe, given or derived. The default step is a quarter of the
+#: field from the camera's *reported* pixel size, which is the very value a
+#: calibration exists to correct: a size 100 times too large would otherwise be
+#: sent as 9.6 mm of absolute moves, which no jog guard covers (FM-121).
+_MAX_STEP_UM = 2000.0
 
 
 class CameraCalibrationParams(PluginParams):
@@ -64,10 +71,11 @@ class CameraCalibrationParams(PluginParams):
     step_um: float | None = Field(
         None,
         gt=0.0,
-        le=2000.0,
+        le=_MAX_STEP_UM,
         description=(
             "Probe distance in µm; default a quarter of the smaller side of the "
-            "frame, from the camera's pixel size (50 µm when it reports none)."
+            "frame, from the camera's pixel size (50 µm when it reports none), "
+            "never more than 2000 µm."
         ),
     )
     settle_ms: float = Field(
@@ -135,6 +143,12 @@ class CameraCalibrationPlugin:
             step_um = params.step_um
         elif _usable(reported_um):
             step_um = DEFAULT_STEP_FRACTION * min(shape) * reported_um
+            if step_um > _MAX_STEP_UM:
+                step_um = _MAX_STEP_UM
+                assumed.append(
+                    f"step capped at {_MAX_STEP_UM:g} µm: a quarter of the field, "
+                    "from the camera's pixel size, is further than the largest probe"
+                )
         else:
             step_um = FALLBACK_STEP_UM
             used_fallback = True
@@ -143,13 +157,18 @@ class CameraCalibrationPlugin:
         # A stage still travelling from an earlier move reads a fraction of it.
         xy.wait()
         start = xy.position_um()
-        reference = camera.snap()
+        reference = _checked_frame(self.name, camera.snap(), shape)
         probes = (("+X probe", step_um, 0.0), ("+Y probe", 0.0, step_um))
         shifts = []
         settle_s = params.settle_ms / 1000.0
+        # Whether a move was sent and the return has not arrived: a stop before
+        # the first move, or during the settle after the return, leaves the
+        # stage at its start and has nothing to warn about.
+        away = False
         try:
             for done, (label, dx_um, dy_um) in enumerate(probes, start=1):
                 ctx.raise_if_stopped()
+                away = True
                 xy.move_to_um(start.x_um + dx_um, start.y_um + dy_um)
                 ctx.wait_s(settle_s)
                 shifts.append(measure_shift(reference, camera.snap()))
@@ -158,11 +177,13 @@ class CameraCalibrationPlugin:
             # before the fit is judged: an empty field still gets the stage back.
             ctx.raise_if_stopped()
             xy.move_to_um(start.x_um, start.y_um)
+            away = False
             ctx.wait_s(settle_s)
         except BaseException:
             # A stop, a halt, a fault or a refused move: the stage stays where it
             # is, the exception goes on (FM-88, FM-64), and nothing is caught.
-            _warn_left(ctx, xy, start)
+            if away:
+                _warn_left(ctx, xy, start)
             raise
         shift_x, shift_y = shifts
 
@@ -231,27 +252,55 @@ def _usable(pixel_size_um: float) -> bool:
     return math.isfinite(pixel_size_um) and pixel_size_um > 0.0
 
 
+def _checked_frame(
+    name: str, frame: npt.NDArray[Any], shape: tuple[int, int]
+) -> npt.NDArray[Any]:
+    """The reference frame, once it is known that every probe can be judged against it.
+
+    ``measure_shift`` refuses a frame that is not 2-D or holds a value that is
+    not finite, but only after the +X probe has moved the stage a quarter field:
+    a colour camera's ``(h, w, 3)`` frame, a different region than the camera
+    reports, or a ``nan`` is known now, before anything moves.
+    """
+    array = np.asarray(frame)
+    if array.shape != shape:
+        raise PluginRunError(
+            name,
+            f"the camera's frame has shape {array.shape} but it reports {shape}; "
+            "nothing was moved. Use a monochrome mode and the region the "
+            "camera reports",
+        )
+    if not np.isfinite(array).all():
+        raise PluginRunError(
+            name,
+            "the camera's frame has a value that is not finite; nothing was "
+            "moved. Give the camera a mode that returns numbers",
+        )
+    return frame
+
+
 def _warn_left(ctx: RunContext, xy: XYStage, start: XY) -> None:
     """Say where the stage was left, reading it in a ``try`` of its own.
 
     A read that fails must not hide the error that is already on its way: the
-    caller re-raises that one, whatever happens here.
+    caller re-raises that one, whatever happens here. ``+ 0.0`` turns a ``-0.0``
+    (the demo stage reads one at its origin) into ``0.0`` in the message.
     """
     try:
         here = xy.position_um()
     except Exception:
         ctx.logger.warning(
             "the stage is left at an unknown position, not returned to (%.1f, %.1f) µm",
-            start.x_um,
-            start.y_um,
+            start.x_um + 0.0,
+            start.y_um + 0.0,
         )
         return
     ctx.logger.warning(
         "the stage is left at (%.1f, %.1f) µm, not returned to (%.1f, %.1f) µm",
-        here.x_um,
-        here.y_um,
-        start.x_um,
-        start.y_um,
+        here.x_um + 0.0,
+        here.y_um + 0.0,
+        start.x_um + 0.0,
+        start.y_um + 0.0,
     )
 
 
@@ -283,8 +332,9 @@ def _reuse(
     whether the other document's stage is usable (``unusable``: not ``done``, another
     profile, a dry run read by a real one), then the objective in place and the
     frame shape must be the ones it was measured with: a calibration of another
-    objective or binning is silently wrong, not merely stale. ``path`` is kept as
-    typed in the result (FM-50: an absolute one names a user's folder).
+    objective or binning is silently wrong, not merely stale. ``path`` goes into
+    the result as typed, spelt with forward slashes by ``as_posix()`` (FM-24) and
+    never resolved (FM-50: an absolute one names a user's folder).
     """
     name = CameraCalibrationPlugin.name
     where = path.as_posix()

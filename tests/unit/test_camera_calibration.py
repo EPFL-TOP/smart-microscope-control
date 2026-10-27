@@ -10,12 +10,14 @@ invisible on a square one.
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import numpy as np
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from smc.plugins.camera_calibration import algorithm
 from smc.plugins.camera_calibration.algorithm import (
     MIN_RESPONSE,
     UPSAMPLE,
@@ -121,6 +123,87 @@ def test_a_blank_field_scores_zero() -> None:
     blank = np.full((128, 160), 1234, dtype=np.uint16)
 
     assert measure_shift(blank, blank) == Shift(0.0, 0.0, 0.0)
+
+
+def test_one_blank_frame_next_to_a_textured_one_has_no_shift_to_find() -> None:
+    """A probe that lands on an empty margin: either side of the pair may be the blank one."""
+    texture = np.random.default_rng(5).normal(size=(128, 160))
+    blank = np.zeros_like(texture)
+
+    assert measure_shift(texture, blank) == Shift(0.0, 0.0, 0.0)
+    assert measure_shift(blank, texture) == Shift(0.0, 0.0, 0.0)
+
+
+def _forced_shift(monkeypatch: pytest.MonkeyPatch, d_row: float, d_col: float) -> None:
+    """Make the correlation answer ``(d_row, d_col)`` as the displacement of the content.
+
+    skimage reports the shift that registers ``moved`` onto ``reference``, the
+    negation of the displacement, so that is what the stand-in returns.
+    """
+    monkeypatch.setattr(
+        algorithm,
+        "_phase_cross_correlation",
+        lambda reference, moved, **kwargs: (np.array([-d_row, -d_col]), 0.0, 0.0),
+    )
+
+
+def test_a_constant_overlap_scores_zero_not_perfect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``np.corrcoef`` of a constant overlap is ``nan``, and ``min(1.0, nan)`` is 1.0.
+
+    Texture only in the first ten columns, and a shift of 20 columns: the
+    overlap of the moved frame is blank, and would score a perfect response and
+    defeat the refusal of a wrapped shift (FM-120) if it were not zeroed.
+    """
+    a = np.zeros((128, 160))
+    a[:, :10] = np.random.default_rng(0).normal(size=(128, 10))
+    _forced_shift(monkeypatch, d_row=0.0, d_col=20.0)
+
+    shift = measure_shift(a, a.copy())
+
+    assert shift.d_col_px == 20.0
+    assert shift.response == 0.0
+
+
+def test_an_inverted_contrast_agrees_as_much_as_the_same_contrast(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The response is an absolute correlation: a frame and its negative are as alike."""
+    a = np.random.default_rng(0).normal(size=(128, 160))
+    _forced_shift(monkeypatch, d_row=0.0, d_col=0.0)
+
+    assert measure_shift(a, -a).response > 0.99
+
+
+def test_an_overlap_of_under_eight_columns_scores_zero() -> None:
+    """The width side of the guard: seven columns agreeing say nothing."""
+    a = np.random.default_rng(6).normal(size=(100, 12))
+    b = np.roll(a, 5, axis=1)
+
+    shift = measure_shift(a, b)
+
+    assert shift.d_col_px == pytest.approx(5.0, abs=0.05)
+    assert shift.response == 0.0
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.uint16])
+def test_the_frames_are_float64_when_they_reach_the_correlation(
+    dtype: type, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FM-75: the cast comes first, so that no arithmetic runs in the camera's dtype."""
+    seen: list[tuple[np.dtype, np.dtype]] = []
+
+    def spy(reference: np.ndarray, moved: np.ndarray, **kwargs: object):
+        seen.append((reference.dtype, moved.dtype))
+        return np.array([0.0, 0.0]), 0.0, 0.0
+
+    monkeypatch.setattr(algorithm, "_phase_cross_correlation", spy)
+    frame = (np.random.default_rng(1).uniform(0.0, 1000.0, size=(64, 80))).astype(dtype)
+
+    measure_shift(frame, frame.copy())
+
+    assert seen == [(np.dtype(np.float64), np.dtype(np.float64))]
 
 
 def test_an_overlap_of_under_eight_pixels_scores_zero() -> None:
@@ -313,24 +396,82 @@ def test_a_shift_beyond_half_the_frame_is_refused_not_returned() -> None:
     assert any("barely correlate" in note for note in result.notes)
 
 
-def test_a_probe_that_barely_correlates_makes_the_fit_untrustworthy() -> None:
-    good = Shift(-10.0, 0.0, 0.9)
-    weak = Shift(0.0, 10.0, MIN_RESPONSE / 2)
+@pytest.mark.parametrize("weak_probe", ["x", "y"])
+def test_a_probe_that_barely_correlates_makes_the_fit_untrustworthy(
+    weak_probe: str,
+) -> None:
+    """Either probe on its own: a camera turned 90 degrees wraps the +X probe first."""
+    good_x, good_y = Shift(-10.0, 0.0, 0.9), Shift(0.0, 10.0, 0.9)
+    shift_x = (
+        replace(good_x, response=MIN_RESPONSE / 2) if weak_probe == "x" else good_x
+    )
+    shift_y = (
+        replace(good_y, response=MIN_RESPONSE / 2) if weak_probe == "y" else good_y
+    )
 
-    result = fit(good, weak, step_um=20.0, image_shape_px=SHAPE)
+    result = fit(shift_x, shift_y, step_um=20.0, image_shape_px=SHAPE)
 
     assert any("barely correlate" in note for note in result.notes)
     assert not result.trustworthy
 
 
-def test_a_response_that_is_nan_is_not_trusted() -> None:
+@pytest.mark.parametrize("unknown_probe", ["x", "y"])
+def test_a_response_that_is_nan_is_not_trusted(unknown_probe: str) -> None:
     """``nan < MIN_RESPONSE`` is False: the check must be written so that nan fails it."""
-    good = Shift(-10.0, 0.0, 0.9)
-    unknown = Shift(0.0, 10.0, float("nan"))
+    good_x, good_y = Shift(-10.0, 0.0, 0.9), Shift(0.0, 10.0, 0.9)
+    shift_x = replace(good_x, response=math.nan) if unknown_probe == "x" else good_x
+    shift_y = replace(good_y, response=math.nan) if unknown_probe == "y" else good_y
 
-    result = fit(good, unknown, step_um=20.0, image_shape_px=SHAPE)
+    result = fit(shift_x, shift_y, step_um=20.0, image_shape_px=SHAPE)
 
     assert not result.trustworthy
+
+
+def _residual_of(matrix: Matrix2, image_shape_px: tuple[int, int]) -> float:
+    """The residual of m3 §4.1, written as matrix products and not as the code's entries."""
+    m = np.array(matrix)
+    determinant = np.linalg.det(m)
+    pixel_size = math.sqrt(abs(determinant))
+    mirrored = determinant > 0.0
+    a = m @ np.diag([1.0, -1.0])
+    if mirrored:
+        a[:, 0] *= -1.0
+    theta = math.atan2(a[1][0], a[0][0])
+    rotation = np.array(
+        [[math.cos(theta), -math.sin(theta)], [math.sin(theta), math.cos(theta)]]
+    )
+    ideal = pixel_size * rotation @ np.diag([-1.0 if mirrored else 1.0, -1.0])
+    return float(np.abs(m - ideal).max()) * max(image_shape_px) / 2.0
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        # Each is a matrix on which a different entry of |M - ideal| is the largest
+        # (the first four are upright, the last four mirrored), so that a residual
+        # that ignored any one entry would be wrong on one of them.
+        (0.79, -0.2, -0.46, -0.24),
+        (0.7, -0.21, -0.04, -0.71),
+        (-0.58, 0.09, -0.66, 0.23),
+        (-0.14, 0.17, 0.48, 0.91),
+        (0.93, 0.42, -0.57, 0.09),
+        (-0.81, -0.13, -0.04, -0.68),
+        (-0.22, -0.24, 0.82, -0.21),
+        (0.4, -0.42, 0.74, -0.45),
+    ],
+)
+def test_the_residual_counts_every_entry_of_the_matrix(
+    entries: tuple[float, float, float, float],
+) -> None:
+    matrix = ((entries[0], entries[1]), (entries[2], entries[3]))
+    shift_x, shift_y = _probes_of(matrix, 50.0)
+
+    result = fit(shift_x, shift_y, step_um=50.0, image_shape_px=(200, 300))
+
+    assert result.residual_um == pytest.approx(
+        _residual_of(matrix, (200, 300)), rel=1e-6
+    )
+    assert result.residual_um > 1.0  # none of these is a rigid camera
 
 
 def test_both_notes_can_be_present_at_once() -> None:
