@@ -354,3 +354,48 @@ def test_a_well_is_found_by_its_normalised_name() -> None:
 )
 def test_normalise_well_gives_useqs_names(given: str, expected: str) -> None:
     assert normalise_well(given) == expected
+
+
+# Every registered plate has the same pitch and well size along x and along y, so
+# the tests above cannot see the two exchanged (FM-73). A custom ``useq.WellPlate``
+# is a real input (``WellGeometry`` is public), and this one is lopsided on purpose.
+LOPSIDED = useq.WellPlate(
+    rows=2,
+    columns=3,
+    well_spacing=(9.0, 6.0),
+    well_size=(6.0, 2.0),
+    circular_wells=False,
+    name="lopsided",
+)
+
+
+def test_pitch_and_size_of_a_plate_that_is_not_square_follow_useq() -> None:
+    plan = useq.WellPlatePlan(
+        plate=LOPSIDED, a1_center_xy=(100.0, 200.0), rotation=20.0
+    )
+    for position in plan.all_well_positions:
+        geometry = well_geometry(plan, str(position.name))
+        assert geometry.center_um == pytest.approx((position.x, position.y), abs=1e-6)
+    geometry = well_geometry(plan, "B3")
+    assert geometry.size_um == pytest.approx((6000.0, 2000.0))
+    assert geometry.circular is False
+    assert geometry.rotation_deg == 20.0
+
+
+def test_a_wide_flat_well_is_a_rectangle_not_a_square() -> None:
+    geometry = WellGeometry(
+        well="A1",
+        center_um=(0.0, 0.0),
+        size_um=(6000.0, 2000.0),
+        circular=False,
+        rotation_deg=30.0,
+    )
+    # Off-axis, in the plate's axes: 2900 along the long side is inside, 1100
+    # along the short side is outside, and neither is the other's mirror image.
+    assert geometry.contains(*_at(geometry, 2900.0, 900.0)) is True
+    assert geometry.contains(*_at(geometry, 2900.0, 1100.0)) is False
+    assert geometry.contains(*_at(geometry, 3100.0, 0.0)) is False
+    assert geometry.contains(*_at(geometry, 900.0, 2900.0)) is False
+    # The margin shrinks each side by itself: 2000 wide is 200 µm from a 3000 µm half.
+    assert geometry.contains(*_at(geometry, 2700.0, 700.0), margin_um=200.0) is True
+    assert geometry.contains(*_at(geometry, 2700.0, 900.0), margin_um=200.0) is False

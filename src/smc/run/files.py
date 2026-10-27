@@ -96,6 +96,7 @@ def write_atomically(path: Path, data: bytes, *, make_parents: bool = True) -> N
     """
     temporary = path.with_name(f".{path.name}.{secrets.token_hex(4)}.smc-tmp")
     renaming = False
+    opened = False
     try:
         if make_parents:
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -104,6 +105,7 @@ def write_atomically(path: Path, data: bytes, *, make_parents: bool = True) -> N
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
             0o666,
         )
+        opened = True
         try:
             view = memoryview(data)
             while view:
@@ -116,8 +118,10 @@ def write_atomically(path: Path, data: bytes, *, make_parents: bool = True) -> N
     except BaseException as exc:
         if renaming and isinstance(exc, OSError):
             raise AtomicWriteError(exc, kept=temporary) from exc
-        with suppress(OSError):
-            temporary.unlink()
+        # ``O_EXCL`` refused a name that is already there: it is not ours to remove.
+        if opened or not isinstance(exc, FileExistsError):
+            with suppress(OSError):
+                temporary.unlink()
         if isinstance(exc, OSError):
             raise AtomicWriteError(exc) from exc
         raise
@@ -198,9 +202,10 @@ def resolve_in_run(run_dir: Path, relative: str) -> Path:
 
     Raises:
         ValueError: The text is empty, blank or holds a NUL; is absolute or
-            has a drive in either flavour; has a ``..`` part; is
-            ``run_dir`` itself once resolved; or leads outside it through a
-            symlink. Every message starts with the text, quoted.
+            has a drive in either flavour; has a ``..`` part; cannot be
+            resolved (the OS refused); is ``run_dir`` itself once resolved; or
+            leads outside it through a symlink. Every message starts with the
+            text, quoted.
     """
     if not relative.strip() or "\x00" in relative:
         raise ValueError(
@@ -218,8 +223,16 @@ def resolve_in_run(run_dir: Path, relative: str) -> Path:
         raise ValueError(
             f"{relative!r} has a '..' part; run-folder paths stay inside the run folder"
         )
-    root = run_dir.resolve()
-    resolved = (root / relative).resolve()
+    try:
+        root = run_dir.resolve()
+        resolved = (root / relative).resolve()
+    except OSError as exc:
+        # Windows re-raises a few network errors out of `resolve` (a share that
+        # drops mid-run): the caller is promised a ValueError that names the text.
+        raise ValueError(
+            f"{relative!r} cannot be resolved in the run folder {run_dir} "
+            f"({exc.strerror or exc})"
+        ) from exc
     if resolved == root:
         raise ValueError(f"{relative!r} is the run folder itself, not a file in it")
     if not resolved.is_relative_to(root):

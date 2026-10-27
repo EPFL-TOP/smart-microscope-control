@@ -682,13 +682,22 @@ def test_route_to_useq_keeps_the_route_order_and_an_unknown_z() -> None:
 
 
 def _imports_of(path: Path) -> set[str]:
-    """Every module a source file imports, by its dotted name."""
+    """Every module a source file imports, by its dotted name.
+
+    ``from smc import hardware`` imports ``smc.hardware`` as much as
+    ``import smc.hardware`` does, so each name of a ``from`` is recorded under
+    its module. A relative import is recorded with its dots, and the test below
+    refuses any: the project imports absolutely, and a dotted name that starts
+    with a dot would slip past a check for ``smc.hardware``.
+    """
     names: set[str] = set()
     for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
         if isinstance(node, ast.Import):
             names.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
-            names.add(("." * node.level) + (node.module or ""))
+            module = ("." * node.level) + (node.module or "")
+            names.add(module)
+            names.update(f"{module}.{alias.name}" for alias in node.names)
     return names
 
 
@@ -701,9 +710,99 @@ def test_the_foundation_imports_no_hardware_and_files_imports_no_plugins() -> No
     assert len(foundation) >= 14  # geometry, files, and the twelve slot modules
     for path in foundation:
         for name in _imports_of(path):
+            assert not name.startswith("."), (path.name, name)
             assert not name.startswith(("smc.hardware", "pymmcore")), (path.name, name)
     # smc.run is below smc.plugins: plugins depend on the document, not the reverse.
     assert not [n for n in _imports_of(root / "run" / "files.py") if "smc.plugins" in n]
     assert not [
         n for n in _imports_of(root / "run" / "document.py") if "smc.plugins" in n
     ]
+    # And smc.plugins never loads the foundation by accident (m3 §3: plugins import
+    # what they need from it, a plugin that is merely listed does not).
+    package = _imports_of(root / "plugins" / "__init__.py")
+    assert not [n for n in package if n.startswith("smc.plugins.slots")]
+    assert "smc.plugins.geometry" not in package
+
+
+#: The names of design §3's map that ``smc.plugins.slots`` re-exports, and that eight
+#: parallel issues import: a rename or a drop is a plan deviation, not a quiet edit.
+SLOTS_MAP = {
+    "CameraCalibration",
+    "Cell",
+    "CellsFile",
+    "CellsResult",
+    "DensityResult",
+    "DensityWell",
+    "FailedField",
+    "FocusState",
+    "LatticeFit",
+    "NisExportResult",
+    "PlannedField",
+    "PlateResult",
+    "ReportResult",
+    "RoutePosition",
+    "RouteResult",
+    "ScanFrame",
+    "ScanPlanResult",
+    "ScanResult",
+    "SlotValue",
+    "TimingsResult",
+    "WallTouch",
+    "WellGeometry",
+    "WellRef",
+    "load_cells",
+    "load_frame",
+    "normalise_well",
+    "well_geometry",
+}
+
+
+def test_slots_re_exports_every_name_of_the_design_map() -> None:
+    assert set(slots.__all__) == SLOTS_MAP
+    # What `import *` would bind: every name of `__all__` must resolve.
+    assert [name for name in slots.__all__ if not hasattr(slots, name)] == []
+
+
+def test_the_plugin_package_exports_plugin_run_error() -> None:
+    import smc.plugins
+
+    assert "PluginRunError" in smc.plugins.__all__
+    from smc.plugins import PluginRunError
+
+    assert PluginRunError is smc.plugins.errors.PluginRunError
+
+
+@pytest.mark.parametrize(
+    "where",
+    [(), ("well_points_plan",), ("plate",)],
+    ids=["plan", "grid", "plate"],
+)
+def test_a_key_useq_would_drop_is_refused_inside_the_plate_plan(
+    where: tuple[str, ...],
+) -> None:
+    # FM-107: useq's models ignore keys they do not know, so a key written by a
+    # newer smc (or useq) would load, vanish, and be written back without it.
+    sample = copy.deepcopy(_SCAN_PLAN)
+    node = sample["plate_plan"]
+    for step in where:
+        node = node[step]
+    node["bogus_nested"] = 1
+    with pytest.raises(ValidationError) as raised:
+        ScanPlanResult.model_validate(sample)
+    (error,) = raised.value.errors()
+    assert error["type"] == "value_error"
+    assert error["loc"] == ("plate_plan",)
+    dotted = ".".join(("plate_plan", *where, "bogus_nested"))
+    assert error["msg"] == (
+        f"Value error, {dotted} is not a key this smc knows; it would be dropped "
+        f"(a newer smc wrote it? upgrade smc)"
+    )
+
+
+def test_a_plate_given_by_name_is_not_a_dropped_key() -> None:
+    # useq turns "96-well" into a plate: the dump has a dict where the input had a
+    # string, and that is a normalisation, not a loss.
+    sample = copy.deepcopy(_SCAN_PLAN)
+    sample["plate_plan"]["plate"] = "96-well"
+    loaded = ScanPlanResult.model_validate(sample)
+    assert loaded.plate_plan.plate.name == "96-well"

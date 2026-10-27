@@ -121,7 +121,8 @@ def load_cells(run_dir: Path, result: CellsResult) -> tuple[Cell, ...]:
         text = data.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise ValueError(
-            f"{prefix}is not UTF-8 text ({exc.reason} at byte {exc.start})"
+            f"{prefix}is not UTF-8 text ({exc.reason} at byte {exc.start}); "
+            f"save it as UTF-8, not ANSI or UTF-16"
         ) from exc
     try:
         raw = json.loads(text, parse_constant=_refuse_constant)

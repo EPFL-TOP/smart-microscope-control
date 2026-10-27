@@ -6,7 +6,7 @@ import errno
 import os
 import pickle
 import re
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 import pytest
@@ -162,6 +162,80 @@ def test_an_atomic_write_error_survives_pickle() -> None:
     assert str(copy) == str(error)
 
 
+def test_a_ctrl_c_during_the_rename_passes_through_and_leaves_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The operator's stop at the last step is still a stop: it is not an OSError,
+    # so it is no AtomicWriteError and no temporary file is kept (the new content
+    # was not "refused", it was abandoned).
+    path = tmp_path / "f.bin"
+    path.write_bytes(b"old")
+
+    def interrupt(src: Any, dst: Any) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(files_mod.os, "replace", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        write_atomically(path, b"new")
+    assert path.read_bytes() == b"old"
+    assert _names(tmp_path) == ["f.bin"]
+
+
+def test_the_temporary_file_is_opened_binary_and_exclusive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Windows would turn every \n of a TIFF into \r\n without O_BINARY (FM-24).
+    flags: list[int] = []
+    real_open = os.open
+
+    def spy(path: Any, flag: int, mode: int = 0o777, **kwargs: Any) -> int:
+        flags.append(flag)
+        return real_open(path, flag, mode, **kwargs)
+
+    # POSIX has no O_BINARY: give the module one to look for, as Windows does.
+    monkeypatch.setattr(files_mod.os, "O_BINARY", 0x8000, raising=False)
+    monkeypatch.setattr(files_mod.os, "open", spy)
+    payload = b"a\nb\r\n\x1a"
+    write_atomically(tmp_path / "f.bin", payload)
+    (flag,) = flags
+    assert flag & 0x8000
+    assert flag & os.O_EXCL
+    assert (tmp_path / "f.bin").read_bytes() == payload
+
+
+def test_a_temporary_name_that_is_taken_is_refused_and_not_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # O_EXCL refuses a name that exists; it is someone else's file, not ours to
+    # overwrite or to clean up.
+    path = tmp_path / "f.bin"
+    path.write_bytes(b"old")
+    squatter = tmp_path / ".f.bin.deadbeef.smc-tmp"
+    squatter.write_bytes(b"not ours")
+    monkeypatch.setattr(files_mod.secrets, "token_hex", lambda nbytes: "deadbeef")
+    with pytest.raises(AtomicWriteError) as raised:
+        write_atomically(path, b"new")
+    assert isinstance(raised.value.__cause__, FileExistsError)
+    assert raised.value.kept is None
+    assert squatter.read_bytes() == b"not ours"
+    assert path.read_bytes() == b"old"
+
+
+def test_a_short_write_is_continued_until_every_byte_is_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # os.write may take fewer bytes than offered (a full pipe, a network share):
+    # a single call would silently truncate a TIFF.
+    real_write = os.write
+
+    def three_at_a_time(fd: int, data: Any) -> int:
+        return real_write(fd, bytes(data[:3]))
+
+    monkeypatch.setattr(files_mod.os, "write", three_at_a_time)
+    write_atomically(tmp_path / "f.bin", b"0123456789")
+    assert (tmp_path / "f.bin").read_bytes() == b"0123456789"
+
+
 # --- retry_on_permission_error -----------------------------------------------
 
 
@@ -259,6 +333,14 @@ def test_relative_to_run_refuses_a_path_outside_and_the_folder_itself(
     assert relative_to_run(run, run / "a" / ".." / "b.bin") == "b.bin"
 
 
+def test_relative_to_run_is_posix_text_for_windows_paths() -> None:
+    # A native Path on Linux or macOS never holds a backslash separator, so only a
+    # Windows-flavoured pair shows that the text is built with as_posix (FM-24).
+    run = PureWindowsPath("C:/runs/r1")
+    path = PureWindowsPath("C:/runs/r1/scan/tok/A1_0000.tif")
+    assert relative_to_run(run, path) == "scan/tok/A1_0000.tif"  # type: ignore[arg-type]
+
+
 def test_relative_to_run_follows_a_symlinked_run_folder(tmp_path: Path) -> None:
     real = tmp_path / "real"
     real.mkdir()
@@ -306,6 +388,42 @@ def test_resolve_in_run_refuses(tmp_path: Path, text: str, message: str) -> None
     # refused on macOS and the reverse: these run on every OS.
     with pytest.raises(ValueError, match=_exactly(message)):
         resolve_in_run(tmp_path, text)
+
+
+def test_resolve_in_run_accepts_a_run_folder_that_is_itself_a_symlink(
+    tmp_path: Path,
+) -> None:
+    # `~/runs` linked to another drive, or /var against /private/var on macOS:
+    # the folder is resolved too, or every file below it would look "outside".
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "f.tif").write_bytes(b"x")
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(real, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"this account may not create symlinks ({exc})")
+    assert resolve_in_run(link, "f.tif") == real.resolve() / "f.tif"
+
+
+def test_resolve_in_run_turns_an_os_error_of_the_os_into_its_value_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Windows re-raises a few network errors from Path.resolve (a share that
+    # drops mid-run); the caller is promised a ValueError that names the text.
+    def drop(self: Path, strict: bool = False) -> Path:
+        raise OSError(
+            errno.ENETDOWN, "The specified network name is no longer available"
+        )
+
+    monkeypatch.setattr(Path, "resolve", drop)
+    message = (
+        f"'a/b.json' cannot be resolved in the run folder {tmp_path} "
+        f"(The specified network name is no longer available)"
+    )
+    with pytest.raises(ValueError, match=_exactly(message)) as raised:
+        resolve_in_run(tmp_path, "a/b.json")
+    assert isinstance(raised.value.__cause__, OSError)
 
 
 def test_resolve_in_run_refuses_a_symlink_that_leaves_the_folder(

@@ -270,15 +270,18 @@ def test_load_cells_names_the_file_it_cannot_read(tmp_path: Path) -> None:
         f"{PREFIX}is not valid JSON (Expecting value at line 1, column 1)"
     )
 
-    # cp1252 bytes (what Windows Notepad writes as "ANSI") are not UTF-8.
-    ansi = '{"schema_version": 1, "cells": [], "note": "caf\xe9"}'.encode("cp1252")
-    _write(run, ansi)
-    with pytest.raises(UnicodeDecodeError) as decoding:
-        ansi.decode("utf-8-sig")
-    assert _refused(run) == (
-        f"{PREFIX}is not UTF-8 text ({decoding.value.reason} at byte "
-        f"{decoding.value.start})"
-    )
+    # FM-80: what Windows tools write instead of UTF-8 is named, with the fix.
+    # cp1252 is Notepad's "ANSI"; UTF-16 is its "Unicode" and PowerShell 5.1's `>`.
+    document = '{"schema_version": 1, "cells": [], "note": "caf\xe9"}'
+    for encoding in ("cp1252", "utf-16"):
+        data = document.encode(encoding)
+        _write(run, data)
+        with pytest.raises(UnicodeDecodeError) as decoding:
+            data.decode("utf-8-sig")
+        assert _refused(run) == (
+            f"{PREFIX}is not UTF-8 text ({decoding.value.reason} at byte "
+            f"{decoding.value.start}); save it as UTF-8, not ANSI or UTF-16"
+        ), encoding
 
     _write(run, b'{"schema_version": 1, "cells": [{"score": NaN}]}')
     assert _refused(run) == f"{PREFIX}contains NaN, which JSON does not allow"
@@ -319,6 +322,26 @@ def test_load_cells_refuses_a_path_that_leaves_the_run_folder(tmp_path: Path) ->
     )
     with pytest.raises(ValueError, match=rf"\A{re.escape(message)}\Z"):
         load_cells(run, result)
+
+
+def test_load_cells_turns_an_os_error_of_resolving_into_its_value_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A share that drops mid-run: Windows re-raises it from Path.resolve, and the
+    # reader of the cells stage only catches the ValueError it was promised.
+    _write(tmp_path, {"schema_version": 1, "cells": CELLS})
+
+    def drop(self: Path, strict: bool = False) -> Path:
+        raise OSError(
+            errno.ENETDOWN, "The specified network name is no longer available"
+        )
+
+    monkeypatch.setattr(Path, "resolve", drop)
+    error = _error(tmp_path)
+    assert str(error) == (
+        f"{PREFIX}cannot be used: '{CELLS_FILE}' cannot be resolved in the run "
+        f"folder {tmp_path} (The specified network name is no longer available)"
+    )
 
 
 def test_load_cells_names_a_folder_where_the_file_should_be(tmp_path: Path) -> None:

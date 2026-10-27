@@ -7,14 +7,14 @@ cells, the density and the route all read the same fields.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 import useq
-from pydantic import Field, field_validator
+from pydantic import Field, ValidatorFunctionWrapHandler, field_validator
 
 from smc.plugins.api import PluginResult
 from smc.plugins.geometry import Matrix2
-from smc.plugins.slots.base import SlotValue, refuse_non_finite
+from smc.plugins.slots.base import SlotValue, refuse_dropped_keys, refuse_non_finite
 
 __all__ = ["PlannedField", "ScanPlanResult"]
 
@@ -55,14 +55,23 @@ class ScanPlanResult(PluginResult):
     fields: tuple[PlannedField, ...]
     estimate_s: float | None = Field(ge=0.0)
 
-    @field_validator("plate_plan")
+    @field_validator("plate_plan", mode="wrap")
     @classmethod
-    def _plate_plan_is_finite(cls, plan: useq.WellPlatePlan) -> useq.WellPlatePlan:
-        """Refuse a ``nan`` or ``inf`` inside the ``useq`` plan.
+    def _plate_plan_is_as_strict_as_the_result(
+        cls, value: Any, handler: ValidatorFunctionWrapHandler
+    ) -> useq.WellPlatePlan:
+        """Hold the ``useq`` plan to the rules the result holds its own fields to.
 
-        ``useq``'s own models accept them, and the model's ``allow_inf_nan``
-        does not reach into another library's fields (measured, #199): a
-        registration of ``nan`` would otherwise be a plan.
+        ``useq``'s models accept ``nan`` and ``inf`` and ignore keys they do not
+        know, and the result's ``allow_inf_nan=False`` and ``extra="forbid"``
+        do not reach into another library's fields (measured, #199). A
+        registration of ``nan`` would otherwise be a plan, and a key written by
+        a newer smc would load, be dropped, and be written back without it
+        (FM-107).
         """
-        refuse_non_finite(plan.model_dump(mode="python"), "plate_plan")
+        plan: useq.WellPlatePlan = handler(value)
+        dumped = plan.model_dump(mode="python")
+        refuse_non_finite(dumped, "plate_plan")
+        if isinstance(value, dict):
+            refuse_dropped_keys(value, dumped, "plate_plan")
         return plan

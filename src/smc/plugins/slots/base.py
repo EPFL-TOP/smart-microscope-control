@@ -12,7 +12,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
-__all__ = ["SlotValue", "refuse_non_finite"]
+__all__ = ["SlotValue", "refuse_dropped_keys", "refuse_non_finite"]
 
 
 class SlotValue(BaseModel):
@@ -44,3 +44,35 @@ def refuse_non_finite(value: Any, what: str) -> None:
             stack.extend((f"{path}[{i}]", child) for i, child in enumerate(item))
         elif isinstance(item, float) and not math.isfinite(item):
             raise ValueError(f"{path} must be finite, got {item!r}")
+
+
+def refuse_dropped_keys(given: Any, kept: Any, what: str) -> None:
+    """Raise ``ValueError`` if a key of ``given`` is missing from what was kept of it.
+
+    For a field typed with another library's model, which ignores the keys it
+    does not know: a newer smc's document would load, lose them, and be written
+    back without them (FM-107). ``given`` is the input and ``kept`` the dump of
+    the model it became; only dicts met in both at the same place are compared
+    (a plate given by name is a string in ``given`` and a dict in ``kept``, and
+    is not a difference), so a value that was normalised is not refused.
+    """
+    stack: list[tuple[str, Any, Any]] = [(what, given, kept)]
+    while stack:
+        path, left, right = stack.pop()
+        if isinstance(left, dict) and isinstance(right, dict):
+            for key, value in left.items():
+                if key not in right:
+                    raise ValueError(
+                        f"{path}.{key} is not a key this smc knows; it would be "
+                        f"dropped (a newer smc wrote it? upgrade smc)"
+                    )
+                stack.append((f"{path}.{key}", value, right[key]))
+        elif (
+            isinstance(left, list | tuple)
+            and isinstance(right, list | tuple)
+            and len(left) == len(right)
+        ):
+            stack.extend(
+                (f"{path}[{i}]", a, b)
+                for i, (a, b) in enumerate(zip(left, right, strict=True))
+            )
