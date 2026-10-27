@@ -30,7 +30,14 @@ from smc.plugins.scan_plan.wells import well_indices
 from smc.plugins.slots import PlannedField, PlateResult, TimingsResult, WellGeometry
 from smc.plugins.slots.plate import normalise_well, well_geometry
 
-__all__ = ["estimate_s", "fov_of", "gap_overlap", "grid_size", "plan_fields"]
+__all__ = [
+    "estimate_s",
+    "fov_of",
+    "gap_overlap",
+    "grid_size",
+    "plan_fields",
+    "turn_from_axes_deg",
+]
 
 Point = tuple[float, float]
 
@@ -107,14 +114,22 @@ def gap_overlap(rotation_deg: float, overlap: float) -> float | None:
     Raises:
         ValueError: ``rotation_deg`` is not finite.
     """
-    if not math.isfinite(rotation_deg):
-        raise ValueError(f"rotation_deg must be finite, got {rotation_deg!r}")
-    phi = abs(((rotation_deg + 45.0) % 90.0) - 45.0)
-    sine = math.sin(math.radians(phi))
+    sine = math.sin(math.radians(turn_from_axes_deg(rotation_deg)))
     if sine <= overlap / 2.0:
         return None
     suggested = math.ceil(200.0 * sine) / 100.0
     return math.inf if suggested >= 0.9 else suggested
+
+
+def turn_from_axes_deg(rotation_deg: float) -> float:
+    """``phi`` in ``[0, 45]``: the distance from a camera's rotation to the nearest multiple of 90 degrees.
+
+    Raises:
+        ValueError: ``rotation_deg`` is not finite.
+    """
+    if not math.isfinite(rotation_deg):
+        raise ValueError(f"rotation_deg must be finite, got {rotation_deg!r}")
+    return abs(((rotation_deg + 45.0) % 90.0) - 45.0)
 
 
 def plan_fields(

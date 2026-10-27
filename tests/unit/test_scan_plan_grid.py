@@ -28,6 +28,7 @@ from smc.plugins.scan_plan.algorithm import (
     gap_overlap,
     grid_size,
     plan_fields,
+    turn_from_axes_deg,
 )
 from smc.plugins.slots import PlannedField, PlateResult, TimingsResult, well_geometry
 
@@ -746,3 +747,32 @@ def test_the_suggested_overlap_closes_the_gaps_it_reports() -> None:
 def test_gap_overlap_refuses_an_angle_that_is_not_a_number() -> None:
     with pytest.raises(ValueError, match="rotation_deg must be finite"):
         gap_overlap(float("nan"), 0.1)
+
+
+@pytest.mark.parametrize(
+    ("rotation_deg", "expected"),
+    [
+        (0.0, 0.0),
+        (3.5, 3.5),
+        (-3.5, 3.5),
+        (93.5, 3.5),
+        (-86.5, 3.5),
+        (180.0, 0.0),
+        (-180.0, 0.0),
+        (45.0, 45.0),
+        (135.0, 45.0),
+        (-135.0, 45.0),
+        (30.0, 30.0),
+        (60.0, 30.0),
+    ],
+)
+def test_the_turn_from_the_axes_is_the_distance_to_a_multiple_of_ninety(
+    rotation_deg: float, expected: float
+) -> None:
+    assert turn_from_axes_deg(rotation_deg) == pytest.approx(expected)
+
+
+def test_the_turn_from_the_axes_refuses_an_angle_that_is_not_a_number() -> None:
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="rotation_deg must be finite"):
+            turn_from_axes_deg(bad)
