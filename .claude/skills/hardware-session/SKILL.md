@@ -32,6 +32,14 @@ Produce a one-page checklist for the operator:
 5. The specific checks, each as a command with expected result and the
    safety note (clearance before any Z or turret move; jog guard on).
 6. What to paste back: raw outputs, `smc version`, commit hash.
+7. The console set-up of every step sets `SMC_PROFILE=<name>`: a command
+   without `-p` otherwise opens the demo and says nothing (Ti2-E session
+   1, #208: a snap meant for the Prime 95B came from the demo camera).
+   The console of every step that is not redirected to a file is saved
+   before it is closed (title bar, *Edit → Select All*, Enter, then paste
+   into `terminal.log`), so the console comes back as well as the notes.
+8. Every item left over from earlier notes on the session issue goes
+   into the checklist, or is marked as left for later.
 
 ## After
 
