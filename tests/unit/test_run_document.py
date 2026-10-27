@@ -25,7 +25,7 @@ from smc.run import (
     StageStatus,
     write_stage,
 )
-from smc.run import document as document_mod
+from smc.run import files as files_mod
 
 T0 = datetime(2026, 10, 26, 9, 0, tzinfo=timezone.utc)
 DONE = StageStatus.done
@@ -291,8 +291,8 @@ def test_a_failed_replace_keeps_the_document_and_names_the_kept_file(
     def refuse(src: object, dst: object) -> None:
         raise PermissionError(13, "Permission denied")
 
-    monkeypatch.setattr(document_mod.os, "replace", refuse)
-    monkeypatch.setattr(document_mod.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(files_mod.os, "replace", refuse)
+    monkeypatch.setattr(files_mod.time, "sleep", lambda seconds: None)
     new = _record("b", minute=1)
     with pytest.raises(RunDocumentError) as raised:
         write_stage(path, new)
@@ -325,8 +325,8 @@ def test_a_replace_refused_four_times_then_allowed_succeeds(
             raise PermissionError(13, "Permission denied")
         real_replace(src, dst)
 
-    monkeypatch.setattr(document_mod.os, "replace", flaky)
-    monkeypatch.setattr(document_mod.time, "sleep", waits.append)
+    monkeypatch.setattr(files_mod.os, "replace", flaky)
+    monkeypatch.setattr(files_mod.time, "sleep", waits.append)
     written = write_stage(path, _record("a"))
     assert len(refused) == 4
     assert waits == [0.05] * 4
@@ -344,8 +344,8 @@ def test_a_replace_that_stays_refused_is_tried_five_times_and_no_more(
         calls.append(src)
         raise PermissionError(13, "Permission denied")
 
-    monkeypatch.setattr(document_mod.os, "replace", refuse)
-    monkeypatch.setattr(document_mod.time, "sleep", waits.append)
+    monkeypatch.setattr(files_mod.os, "replace", refuse)
+    monkeypatch.setattr(files_mod.time, "sleep", waits.append)
     with pytest.raises(RunDocumentError):
         write_stage(path, _record("a"))
     assert (len(calls), waits) == (5, [0.05] * 4)
@@ -367,7 +367,7 @@ def test_a_read_refused_four_times_then_allowed_succeeds(
         return real_read(self)
 
     monkeypatch.setattr(Path, "read_bytes", flaky)
-    monkeypatch.setattr(document_mod.time, "sleep", waits.append)
+    monkeypatch.setattr(files_mod.time, "sleep", waits.append)
     assert RunDocument.load(path) == written
     assert (len(refused), waits) == (4, [0.05] * 4)
     # The read of a write goes through the same retry: the other stage survives.
@@ -390,7 +390,7 @@ def test_a_read_that_stays_refused_says_what_to_do(
         raise PermissionError(13, "Permission denied")
 
     monkeypatch.setattr(Path, "read_bytes", refuse)
-    monkeypatch.setattr(document_mod.time, "sleep", waits.append)
+    monkeypatch.setattr(files_mod.time, "sleep", waits.append)
     error = _error_of(path)
     assert len(calls) == 5
     assert error.reason == (
@@ -410,7 +410,7 @@ def test_a_ctrl_c_while_the_document_is_written_leaves_it_as_it_was(
     def interrupt(fd: int) -> None:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(document_mod.os, "fsync", interrupt)
+    monkeypatch.setattr(files_mod.os, "fsync", interrupt)
     with pytest.raises(KeyboardInterrupt):
         write_stage(path, _record("b", minute=1))
     assert path.read_bytes() == before
@@ -427,7 +427,7 @@ def test_a_failed_write_leaves_no_temporary_file(
     def full(fd: int) -> None:
         raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr(document_mod.os, "fsync", full)
+    monkeypatch.setattr(files_mod.os, "fsync", full)
     with pytest.raises(RunDocumentError) as raised:
         write_stage(path, _record("b", minute=1))
     assert raised.value.reason == (

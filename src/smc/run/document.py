@@ -27,17 +27,14 @@ document, not the reverse.
 from __future__ import annotations
 
 import json
-import os
-import secrets
-import time
-from collections.abc import Callable
-from contextlib import suppress
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, ValidationError
+
+from smc.run.files import AtomicWriteError, retry_on_permission_error, write_atomically
 
 __all__ = [
     "SCHEMA_VERSION",
@@ -53,15 +50,6 @@ __all__ = [
 #: older version in code: an unknown field is refused (FM-107), so an older smc
 #: cannot be left to drop what a newer one wrote.
 SCHEMA_VERSION = 1
-
-T = TypeVar("T")
-
-#: Windows refuses to read or replace a file that antivirus or a search indexer
-#: holds open for a moment (``PermissionError``), and the file was written a
-#: moment ago (FM-24): a few short waits, not a lost result. As
-#: ``_mm_child._write``.
-_LOCK_TRIES = 5
-_LOCK_WAIT_S = 0.05
 
 
 class StageStatus(str, Enum):
@@ -180,7 +168,7 @@ class RunDocument(BaseModel):
                 )
             # Retried like the replace: the file was replaced a moment ago, and
             # antivirus or a sync client may hold it for a few milliseconds (FM-24).
-            data = _retrying(path.read_bytes)
+            data = retry_on_permission_error(path.read_bytes)
         except FileNotFoundError:
             if missing_ok:
                 return None
@@ -348,82 +336,38 @@ def write_stage(path: Path, record: StageRecord) -> RunDocument:
             ensure_ascii=True,
             allow_nan=False,
         )
-        _write_atomically(path, (text + "\n").encode("ascii"))
+        _write(path, (text + "\n").encode("ascii"))
     except RunDocumentError as exc:
         raise RunDocumentError(exc.path, exc.reason, exc.kept, record) from exc
     return written
 
 
-def _write_atomically(path: Path, data: bytes) -> None:
-    """Replace ``path`` by ``data`` so that it is either the old file or the new one (FM-38).
+def _write(path: Path, data: bytes) -> None:
+    """``write_atomically`` into an existing folder, its failure told as a document's.
 
-    As ``backends/mm.py::_write_atomically``, which this does not share (the
-    five copies are not merged here): a temporary file in the same folder,
-    created with ``O_EXCL`` and the mode a plain write gives (``mkstemp``'s
-    0600 would survive the rename), then ``os.replace``, all in one ``try`` so
-    that a Ctrl-C between two blocks does not leave a file nothing names. On
-    a failure the temporary file is removed, except when only the rename
-    failed: it then holds the whole new text, so it is kept and the error
-    names it. The rename is retried on ``PermissionError`` (FM-24).
+    ``make_parents=False``: a mistyped ``--run-doc`` folder is refused, not
+    created. The error says whether the new text was kept, because only the
+    final rename failed, or not (FM-38).
 
     Raises:
         RunDocumentError: The file could not be written; it is as it was.
     """
-    temporary = path.with_name(f".{path.name}.{secrets.token_hex(4)}.smc-tmp")
-    renaming = False
     try:
-        fd = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
-            0o666,
-        )
-        try:
-            view = memoryview(data)
-            while view:
-                view = view[os.write(fd, view) :]
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        renaming = True
-        _replace(temporary, path)
-    except BaseException as exc:
-        if renaming and isinstance(exc, OSError):
+        write_atomically(path, data, make_parents=False)
+    except AtomicWriteError as exc:
+        # The cause's text, as before the write moved to smc.run.files.
+        why = exc.strerror or exc.cause
+        if exc.kept is not None:
             raise RunDocumentError(
                 path,
-                f"could not be replaced ({exc.strerror or exc}); it is as it was, "
-                f"and the new text is kept as {temporary}. Close any program that "
-                f"holds {path.name} open, then run the stage again",
-                kept=temporary,
+                f"could not be replaced ({why}); it is as it was, and the new "
+                f"text is kept as {exc.kept}. Close any program that holds "
+                f"{path.name} open, then run the stage again",
+                kept=exc.kept,
             ) from exc
-        with suppress(OSError):
-            temporary.unlink()
-        if isinstance(exc, OSError):
-            raise RunDocumentError(
-                path, f"could not be written ({exc.strerror or exc}); it is as it was"
-            ) from exc
-        raise
-
-
-def _replace(source: Path, target: Path) -> None:
-    """``os.replace``, retried while Windows says ``PermissionError``."""
-    _retrying(lambda: os.replace(source, target))
-
-
-def _retrying(action: Callable[[], T]) -> T:
-    """``action()``, tried ``_LOCK_TRIES`` times while it raises ``PermissionError``.
-
-    A file that antivirus or an indexer holds open for a moment is refused, on
-    Windows, to a read as well as to a rename (FM-24). The last refusal is raised.
-    """
-    attempt = 1
-    while True:
-        try:
-            return action()
-        except PermissionError:
-            if attempt == _LOCK_TRIES:
-                raise
-            attempt += 1
-            time.sleep(_LOCK_WAIT_S)
+        raise RunDocumentError(
+            path, f"could not be written ({why}); it is as it was"
+        ) from exc
 
 
 class _NonFiniteError(ValueError):

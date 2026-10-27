@@ -36,6 +36,7 @@ from smc.plugins.api import (
     StopRequested,
 )
 from smc.plugins.errors import (
+    PluginRunError,
     RequirementsError,
     ResumeError,
     UpstreamError,
@@ -49,7 +50,7 @@ from smc.run import (
     StageStatus,
     write_stage,
 )
-from smc.run import document as document_mod
+from smc.run import files as files_mod
 from smc.testing import FakeCore
 
 T0 = datetime(2026, 10, 26, 9, 0, tzinfo=timezone.utc)
@@ -142,6 +143,16 @@ class Boom(Base):
 
     def body(self, microscope: Any, params: Params, ctx: RunContext) -> Result:
         raise HardwareError("the stage did not answer")
+
+
+class Unusable(Base):
+    """Does its work, saves a checkpoint, and finds nothing a reader could trust."""
+
+    name = provides = "unusable"
+
+    def body(self, microscope: Any, params: Params, ctx: RunContext) -> Result:
+        ctx.save_checkpoint(Seen(done=2))
+        raise PluginRunError(self.name, "no plate found; run it again")
 
 
 class Refuses(Base):
@@ -473,6 +484,23 @@ def test_a_hardware_error_records_failed_and_is_re_raised_unchanged(
     assert stored.status is StageStatus.failed
     assert stored.error == "HardwareError: the stage did not answer"
     assert stored.result is None
+
+
+def test_a_plugin_run_error_ends_the_record_failed_and_keeps_the_checkpoint(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    with pytest.raises(PluginRunError):
+        _run(Unusable(), fake_microscope, tmp_path)
+    stored = _stored(tmp_path, "unusable")
+    assert stored.status is StageStatus.failed
+    assert stored.error == "PluginRunError: unusable: no plate found; run it again"
+    assert stored.checkpoint == {"done": 2}
+    assert stored.result is None
+    # No unusable result fills the slot for a reader to trust.
+    doc = RunDocument.load(_path(tmp_path))
+    assert doc.unusable("unusable", profile="demo", dry_run=False) == (
+        "the last run of unusable ended failed; run it again"
+    )
 
 
 def test_a_safety_refusal_is_not_caught_by_the_runner(
@@ -809,7 +837,7 @@ def test_a_checkpoint_reaches_the_document_at_once_and_reverts_no_other_stage(
 def test_a_checkpoint_that_cannot_be_written_ends_the_run(
     fake_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    real_replace, calls = document_mod.os.replace, []
+    real_replace, calls = files_mod.os.replace, []
 
     def replace_once(src: Any, dst: Any) -> None:
         calls.append(src)
@@ -817,8 +845,8 @@ def test_a_checkpoint_that_cannot_be_written_ends_the_run(
             raise PermissionError(13, "Permission denied")
         real_replace(src, dst)
 
-    monkeypatch.setattr(document_mod.os, "replace", replace_once)
-    monkeypatch.setattr(document_mod.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(files_mod.os, "replace", replace_once)
+    monkeypatch.setattr(files_mod.time, "sleep", lambda seconds: None)
     plugin = Saves()
     with pytest.raises(RunDocumentError) as raised:
         _run(plugin, fake_microscope, tmp_path)
@@ -1143,7 +1171,7 @@ def test_the_final_write_failing_raises_with_the_done_record(
     fake_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # FM-34: the stage ran; the caller can still show its result.
-    real_replace, calls = document_mod.os.replace, []
+    real_replace, calls = files_mod.os.replace, []
 
     def replace_once(src: Any, dst: Any) -> None:
         calls.append(src)
@@ -1151,8 +1179,8 @@ def test_the_final_write_failing_raises_with_the_done_record(
             raise PermissionError(13, "Permission denied")
         real_replace(src, dst)
 
-    monkeypatch.setattr(document_mod.os, "replace", replace_once)
-    monkeypatch.setattr(document_mod.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(files_mod.os, "replace", replace_once)
+    monkeypatch.setattr(files_mod.time, "sleep", lambda seconds: None)
     with pytest.raises(RunDocumentError) as raised:
         _run(Echo(), fake_microscope, tmp_path, n=5)
     error = raised.value
@@ -1170,7 +1198,7 @@ def test_a_failed_outcome_write_does_not_hide_the_original_error(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    real_replace, calls = document_mod.os.replace, []
+    real_replace, calls = files_mod.os.replace, []
 
     def replace_once(src: Any, dst: Any) -> None:
         calls.append(src)
@@ -1178,8 +1206,8 @@ def test_a_failed_outcome_write_does_not_hide_the_original_error(
             raise PermissionError(13, "Permission denied")
         real_replace(src, dst)
 
-    monkeypatch.setattr(document_mod.os, "replace", replace_once)
-    monkeypatch.setattr(document_mod.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(files_mod.os, "replace", replace_once)
+    monkeypatch.setattr(files_mod.time, "sleep", lambda seconds: None)
     with pytest.raises(HardwareError) as raised:
         _run(Boom(), fake_microscope, tmp_path)
     assert str(raised.value) == "the stage did not answer"  # not the write's error
