@@ -352,6 +352,64 @@ def test_fit_inverts_the_shifts_of_any_rigid_camera(
         assert got_row == pytest.approx(want_row, abs=1e-9)
 
 
+@pytest.mark.parametrize(
+    ("shift_x", "shift_y"),
+    [
+        # The +X probe reads 10 % and 1 % of the 96 px that a full move gives,
+        # the +Y probe is full: an X axis that executes a fraction of its command.
+        (Shift(-9.6, 0.0, 1.0), Shift(0.0, 96.0, 1.0)),
+        (Shift(-0.96, 0.0, 1.0), Shift(0.0, 96.0, 1.0)),
+        # Y did not move at all and its probe reads 0.1 px of noise: the near
+        # parallel case that the absolute determinant of 1e-12 lets through.
+        (Shift(-96.0, 0.0, 1.0), Shift(0.0, 0.1, 1.0)),
+    ],
+    ids=["x-at-10-percent", "x-at-1-percent", "y-stuck-with-noise"],
+)
+def test_an_axis_that_moves_a_fraction_of_its_command_is_refused(
+    shift_x: Shift, shift_y: Shift
+) -> None:
+    """The matrix is not a rigid camera: its largest entry off a rotation reaches the pixel size.
+
+    ps 1.0, upright, step 96 µm, a 384 x 512 frame. The response is high in
+    every case (the frames do agree), which is why only the rigidity refuses.
+    """
+    result = fit(shift_x, shift_y, step_um=96.0, image_shape_px=SHAPE)
+
+    assert any("rigid camera" in note for note in result.notes)
+    assert not any("parallel shifts" in note for note in result.notes)
+    assert result.trustworthy is False
+    # The matrix, the size and the residual are returned as computed, not zeroed.
+    assert result.pixel_size_um > 0.0
+    assert result.residual_um >= result.pixel_size_um * max(SHAPE) / 2
+
+
+@pytest.mark.parametrize("axis", ["x", "y"])
+@pytest.mark.parametrize(
+    ("fraction", "refused"),
+    [(0.30, False), (0.25, True), (0.20, True)],
+    ids=["30-percent", "25-percent", "20-percent"],
+)
+def test_the_rigidity_note_is_decided_at_the_pixel_size(
+    axis: str, fraction: float, refused: bool
+) -> None:
+    """An axis at a fraction f of its command makes ``|M - ideal|`` reach the pixel size at f = 1/4.
+
+    For a matrix ``diag(1/f, -1)`` the largest entry off a rotation is
+    ``1/f - sqrt(1/f)`` and the pixel size ``sqrt(1/f)``: they meet at f = 0.25
+    (exactly, in floating point, with a step of 96 and shifts of 24 and 96 px),
+    so a tolerance looser or tighter than the pixel size changes one of these
+    three cases, on either axis.
+    """
+    full = 96.0
+    shift_x = Shift(-full * (fraction if axis == "x" else 1.0), 0.0, 1.0)
+    shift_y = Shift(0.0, full * (fraction if axis == "y" else 1.0), 1.0)
+
+    result = fit(shift_x, shift_y, step_um=96.0, image_shape_px=SHAPE)
+
+    assert any("rigid camera" in note for note in result.notes) is refused
+    assert result.trustworthy is (not refused)
+
+
 def test_the_residual_says_how_far_the_camera_is_from_rigid() -> None:
     """A camera whose X pixels are 10 % larger than its Y pixels is not a rotation."""
     stretched = ((0.55, 0.0), (0.0, -0.5))

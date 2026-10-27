@@ -69,11 +69,16 @@ class _FlakyStage:
         fail_on_move: int | None = None,
         drift_um: dict[int, tuple[float, float]] | None = None,
         unreadable_after_fault: bool = False,
+        x_fraction: float = 1.0,
     ) -> None:
         self._real = real
         self._fail_on_move = fail_on_move
         self._drift_um = drift_um or {}
         self._unreadable_after_fault = unreadable_after_fault
+        # An X axis that executes this fraction of every command, counted from
+        # where the stage was when the wrapper was made (the start).
+        self._x_fraction = x_fraction
+        self._origin_x_um = real.position_um().x_um
         self._faulted = False
         self.moves = 0
         self.targets: list[tuple[float, float]] = []
@@ -90,7 +95,10 @@ class _FlakyStage:
             self._faulted = True
             raise HardwareError("the stage did not answer")
         dx, dy = self._drift_um.get(self.moves, (0.0, 0.0))
-        return self._real.move_to_um(x_um + dx, y_um + dy)
+        executed_x_um = self._origin_x_um + self._x_fraction * (
+            x_um - self._origin_x_um
+        )
+        return self._real.move_to_um(executed_x_um + dx, y_um + dy)
 
     def move_by_um(self, dx_um: float, dy_um: float, *, force: bool = False) -> XY:
         return self._real.move_by_um(dx_um, dy_um, force=force)
@@ -375,6 +383,30 @@ def test_a_step_over_forty_percent_of_the_field_is_blamed_when_the_fit_fails(
         raised.value.reason
     )
     assert _stored(tmp_path).result is None
+
+
+def test_a_stage_that_moves_a_fraction_of_x_fails_and_returns(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    """FM-122: an X axis that executes 10 % of its command, the frames agreeing all the while.
+
+    The fit used to end ``done`` with a matrix of 10 µm per pixel on one axis and
+    1 on the other (a residual of 1664 µm); the rigidity note refuses it, and the
+    return, which runs before the fit is judged, gives the stage back.
+    """
+    microscope = demo_microscope_with_sample(shape=SHAPE)
+    start = _here(microscope)
+    microscope.override(
+        XYStage, _FlakyStage(microscope.require(XYStage), x_fraction=0.1)
+    )
+
+    with pytest.raises(PluginRunError, match="rigid camera"):
+        _run(microscope, tmp_path)
+
+    stored = _stored(tmp_path)
+    assert stored.status is StageStatus.failed
+    assert stored.result is None
+    assert _here(microscope) == pytest.approx(start, abs=0.05)
 
 
 # ------------------------------------------------- FM-88: stop, halt and fault

@@ -159,7 +159,9 @@ def fit(
     mirrored camera's first column is flipped back. ``residual_um`` is how far
     the frame's edge lies from where a rigid camera of that size and rotation
     would put it: the largest entry of ``|M - ideal|`` times half the larger
-    side.
+    side. A fit whose largest entry of ``|M - ideal|`` reaches the pixel size
+    is not a camera, and is refused with a note (an axis that did not execute
+    its command): its matrix, size and residual are still returned as computed.
 
     Raises:
         ValueError: ``step_um`` is not finite and positive.
@@ -202,6 +204,14 @@ def fit(
         abs(m10 - ideal[1][0]),
         abs(m11 - ideal[1][1]),
     )
+    # An axis that executes a fraction of its command, or none plus noise, gives
+    # frames that agree (a high response) and a matrix that is no camera: one
+    # entry then lies further from a rotation than the pixel size itself, where
+    # every good fit sits at a thousandth of it. `not <`, so that a nan fails.
+    if not worst < pixel_size_um:
+        notes.append(
+            "the shifts do not fit a rigid camera: did each axis move its full command?"
+        )
     height, width = image_shape_px
     return Fit(
         ((m00, m01), (m10, m11)),
