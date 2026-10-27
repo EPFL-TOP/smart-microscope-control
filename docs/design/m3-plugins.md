@@ -2018,9 +2018,50 @@ FM-64, FM-88, FM-30, FM-38, FM-24, FM-103, FM-111.
 
 ## 9. Cells (#23)
 
-`smc/plugins/cells/detector.py`, `algorithm.py`, `plugin.py`, entry point
-`cells`. The detector is a port of `detector.py`; the de-duplication
+`smc/plugins/cells/overlap.py`, `detector.py`, `algorithm.py`,
+`plugin.py`, entry point `cells`. The detector is a port of `detector.py`
+and the in-frame suppression a port of `overlap.py`; the de-duplication
 across fields is new.
+
+### 9.0 What was measured (2026-10-27, planning #23)
+
+On `local/models/cell_classes_model-cat-v2.pth` with torch 2.13 and
+torchvision 0.28 (Python 3.13, Apple M5 Pro, CPU), and on
+`smc.testing.synthetic` (scripts in the design session's scratchpad):
+
+- The checkpoint's `classes` is a `list`; `roi_heads.box_predictor.cls_score.weight`
+  has 4 rows; `load_state_dict(strict=True)` matches every key. Building
+  and loading take 0.22 s, the SHA-256 of the 166 MB file 0.06 s, one
+  1412² noise frame 0.32 s after a first call of 0.49 s; noise and a
+  constant frame give no detection. The output is `boxes` `float32`
+  `(n, 4)`, `labels` `int64`, `scores`. The machine has MPS, no CUDA.
+- `torch.load(weights_only=True)` of a file that is not a checkpoint
+  raises `_pickle.UnpicklingError`; `load_state_dict(strict=True)` of a
+  partial state raises `RuntimeError`. A checkpoint of a few tensors
+  (14 KB) is enough to test every refusal that precedes the build.
+- `import torch` with `sys.modules["torch"] = None` raises
+  `ModuleNotFoundError`, a subclass of `ImportError`.
+- `tifffile.TiffFileError` derives from `ValueError`.
+- **mypy**: a module that imports torch and torchvision inside a function
+  passes `mypy --strict` with and without torch installed under an
+  override `module = ["torch", "torch.*", "torchvision", "torchvision.*"]`,
+  `ignore_missing_imports = true`, `follow_imports = "skip"`. Without it,
+  mypy fails both ways: `import-not-found` without torch, `import-untyped`
+  for `torchvision.models.detection` with it.
+- **Pixels to stage**: on a `(200, 320)` frame at 1 µm per pixel, two
+  fields 288 pixels apart along the frame's columns, blobs at whole pixels
+  of the first frame and a thresholding stub whose box edges are the
+  extreme pixel indices of each blob, `to_cells` puts every blob at its
+  stage position within 1e-4 µm at 0°, 30°, 30° mirrored and −12°
+  mirrored, and the merge leaves each blob once. Swapping height and width
+  moves the worst cell 84.85 µm; the half-pixel centre `W / 2` moves it
+  0.71 µm.
+- **Merge**: single-linkage over the cells of a well chains distinct
+  cells. Frame 0 sees two cells 6 µm apart, frame 1 one box 3 µm from
+  each: the union-find of the first version of this section removed two,
+  and kept one cell for two. Two cells 5.5 µm apart seen by both frames
+  with a 0.8 µm calibration error: it removed three of four. The rule of
+  §9.2 removes one and two.
 
 ### 9.1 The detector (decides §1.13)
 
@@ -2038,15 +2079,23 @@ class Detection:
 @runtime_checkable
 class Detector(Protocol):
     classes: tuple[str, ...]
+    device: str
 
     def detect(self, frame: npt.NDArray[Any]) -> list[Detection]: ...
 ```
 
 A protocol, and no discovery in M3: one detector, `TorchDetector`, and
-the tests' stubs.
+the tests' stubs. `classes` are the names a detection can carry, the
+background excluded; `device` is the device it runs on, resolved (`cpu`,
+`cuda`, `mps`, never `auto`), which `CellsResult.device` records.
 
 ```python
 DEFAULT_MODEL = "cell_classes_model-cat-v2.pth"
+
+
+def normalize_plane(
+    plane: npt.NDArray[Any], percentiles: tuple[float, float] = (0.5, 99.5)
+) -> npt.NDArray[np.float32]: ...
 
 
 class TorchDetector:
@@ -2061,33 +2110,57 @@ def load_detector(
 ) -> Detector: ...
 ```
 
+- `normalize_plane` is numpy only (float32, clipped to the 0.5 and 99.5
+  percentiles, scaled to [0, 1] with `hi − lo + 1e-6` below, so a
+  constant frame gives zeros).
 - `TorchDetector` imports torch and torchvision **inside** `__init__`
   (the plugin module imports without them, so `smc run --list` shows
   `cells` on every PC). It reads the checkpoint with
-  `torch.load(weights, map_location="cpu", weights_only=True)`, takes
-  `model_state_dict`, and refuses (`ValueError`) a checkpoint without
-  `classes` or whose `classes[0]` is not `__background__`, or whose
-  `roi_heads.box_predictor.cls_score.weight` has another number of rows
-  than `len(classes)`. It builds
+  `torch.load(weights, map_location="cpu", weights_only=True)` and refuses
+  with a `ValueError` naming the file, in this order, before anything is
+  built: a file `torch.load` cannot read (any exception of it, chained);
+  a checkpoint that is not a `dict` with a `dict` under
+  `model_state_dict`; one without a `list` or `tuple` `classes` of at
+  least two strings; `classes[0]` other than `__background__`; a state
+  without `roi_heads.box_predictor.cls_score.weight` or whose number of
+  rows is not `len(classes)`. It then resolves the device, builds
   `fasterrcnn_resnet50_fpn(weights=None, weights_backbone=None,
-  num_classes=len(classes))`, loads the state with `strict=True`, `eval()`.
+  num_classes=len(classes))`, loads the state with `strict=True` (a
+  `RuntimeError` becomes a `ValueError` naming the file), `eval()`, moves
+  it to the device. `classes` is `tuple(classes[1:])`.
 - `device`: `auto` is `cuda` when available, else `cpu` (never `mps`
-  unasked: the port's caution, though MPS ran in §2.1); an unavailable
-  device asked for is a `ValueError`.
-- `detect`: `normalize_plane` (float32, clipped to the 0.5 and 99.5
-  percentiles, scaled to [0, 1]), the plane repeated to 3 channels, one
-  frame per forward pass under `torch.no_grad()`, the model's own resize
-  kept; boxes from torchvision's `[x0, y0, x1, y1]` to `Detection`;
-  `score < score_threshold` dropped; `label = classes[label_id]`.
+  unasked: the port's caution, though MPS ran in §2.1); `cuda` or `mps`
+  asked for and not available is a `ValueError` that says to use `auto` or
+  `cpu`, never a silent fall-back (the port printed a warning and ran on
+  the CPU).
+- `detect`: refuses a frame that is not 2-D (`ValueError`);
+  `normalize_plane`, the plane repeated to 3 channels, one frame per
+  forward pass under `torch.no_grad()`, the model's own resize kept; boxes
+  from torchvision's `[x0, y0, x1, y1]` to `Detection`;
+  `score < score_threshold` dropped; `label` is the checkpoint's
+  `classes[label_id]`.
 - `default_model_path()`: `$SMC_MODELS / DEFAULT_MODEL` when the variable
-  is set (not empty, FM-78), else `<checkout>/local/models/DEFAULT_MODEL`
-  with the checkout `Path(smc.__file__).resolve().parents[2]` (the
-  editable install of every PC).
-- `load_detector` raises `PluginRunError` for a missing torch ("install
-  the detect extra: pip install -e .[detect]"), a missing file (naming
-  it, and `SMC_MODELS`), and a checkpoint refused above.
+  is set and not empty or blank (FM-78), else
+  `<checkout>/local/models/DEFAULT_MODEL` with the checkout
+  `Path(smc.__file__).resolve().parents[2]` (the editable install of every
+  PC; in a worktree, the worktree).
+- `load_detector` resolves `None` to `default_model_path()` and raises
+  `PluginRunError`, in this order: a path that is not a file (naming it,
+  and `SMC_MODELS`); torch or torchvision that cannot be imported, an
+  `ImportError` ("install the detect extra: pip install -e .[detect]");
+  an `OSError` while importing them (a DLL that does not load on
+  Windows: "torch is installed but did not load (…); reinstall the detect
+  extra"); and every `ValueError` of `TorchDetector` (a refused checkpoint,
+  an unavailable device), with its message. The file is checked first so
+  that a PC without torch still says where it looked.
 
 ### 9.2 Algorithm
+
+`overlap.py` is `nikon-control`'s `overlap.py`, typed, with its 17 tests
+(`tests/unit/test_overlap.py`): `bbox_area`, `bbox_intersection`,
+`bbox_iou`, `bbox_iomin`, `OverlapCandidate`, `select_survivors`,
+`count_overlaps`, `PREFER_AREA`, `PREFER_SCORE`, `DEFAULT_MAX_OVERLAP`.
+Boxes are `(row0, col0, row1, col1)`, as `Detection` and `Cell.box_px`.
 
 ```python
 def suppress_in_frame(
@@ -2101,31 +2174,50 @@ def to_cells(
     matrix: Matrix2,
     image_shape_px: tuple[int, int],
 ) -> list[Cell]: ...
+def edge_distance_px(
+    box_px: tuple[float, float, float, float], image_shape_px: tuple[int, int]
+) -> float: ...
 def merge_across_fields(
     cells: Sequence[Cell],
     *,
-    frames: Sequence[ScanFrame],
     image_shape_px: tuple[int, int],
     radius_um: float,
 ) -> tuple[tuple[Cell, ...], int]: ...
 ```
 
-- `suppress_in_frame` is `overlap.select_survivors` with `bbox_iomin`
-  (intersection over the smaller box) and `prefer="score"`: the model's
-  per-class NMS returns one object as both `single` and `doublet`, and the
-  more confident label wins. The 17 tests of `test_overlap.py` come with
-  it.
-- `to_cells`: the box centre through `stage_of_pixel` (§3.1).
-- **`merge_across_fields`** (new): within one well, cells from
-  **different** frames whose centres are within `radius_um` belong to one
-  object (single-linkage, union-find over a grid hash of cell `radius_um`,
-  any label); the one kept is the detection whose box centre is farthest
-  from its own frame's edge in pixels (the least cut view), ties broken by
-  score then by frame index. Two cells of the same frame are never merged
-  (the in-frame step did that). It returns the cells in input order and
-  the number removed. A cell that only one frame saw is kept as it is.
-  Ownership by nearest frame centre was rejected: with a calibration error
-  near the boundary, both frames can disown the same cell.
+- `suppress_in_frame` is `select_survivors` with `bbox_iomin` (intersection
+  over the smaller box) and `prefer="score"`: the model's per-class NMS
+  returns one object as both `single` and `doublet`, and the more
+  confident label wins. The survivors come back **in input order**
+  (`select_survivors` returns them in rank order).
+- `to_cells`: the box centre `((col0 + col1) / 2, (row0 + row1) / 2)`
+  through `stage_of_pixel` (§3.1), with the frame's `x_um`, `y_um`. The box
+  is taken in the pixel-index convention of §3.1 as the detector gives it:
+  whether the training annotations put a pixel's centre at its index or
+  half a pixel further is not recorded, and it is at most 0.14 µm at 40×.
+  `Cell.box_px` is the box as given, `Cell.frame` is `frame_index`.
+- `edge_distance_px`: how far the box centre is from the nearest edge of
+  its frame, the edges being the outer edges of the edge pixels (−0.5 and
+  `W − 0.5`, §3.1): `min(cc + 0.5, W − 0.5 − cc, rc + 0.5, H − 0.5 − rc)`.
+- **`merge_across_fields`** (new): cells of **one well** seen by
+  **different** frames whose centres are at most `radius_um` apart
+  (`<=`) are views of one object. The cells are taken best first: the
+  largest `edge_distance_px` (the least cut view), then the higher score,
+  then the lower frame index, then the input order. Each cell not yet
+  removed is kept, and it removes, **from each other frame, at most one**
+  cell not yet decided: the nearest within `radius_um` (ties by input
+  order). A cell kept is never removed, any label merges with any label,
+  and two cells of the same frame never remove each other (the in-frame
+  step did that). Neighbours are found through a grid hash of cell
+  `radius_um` keyed by well, so a well of thousands of cells is not
+  quadratic. It returns the kept cells in input order and the number
+  removed. `radius_um == 0` merges nothing (and divides by nothing).
+  - Single-linkage (union-find over the pairs) was the first version and
+    is rejected: it chains distinct cells through a third view (§9.0).
+  - Ownership by nearest frame centre was rejected: with a calibration
+    error near the boundary, both frames can disown the same cell.
+  - A cell seen by the four fields of a corner is kept once: the best
+    view removes one cell from each of the three others.
 
 ### 9.3 Plugin
 
@@ -2136,19 +2228,62 @@ class CellsParams(PluginParams):
     score_threshold: float = Field(0.5, ge=0.05, le=1.0)
     max_overlap: float = Field(0.7, gt=0.0, le=1.0)
     merge_radius_um: float = Field(5.0, ge=0.0, le=100.0)
+
+
+class CellsCheckpoint(BaseModel):
+    token: str
+    wells_done: tuple[str, ...]
+    model_sha256: str
+    merged: int = Field(ge=0)
 ```
 
-`requires = ()`, `reads = ("scan",)`, `provides = "cells"`. The plugin
-gets its detector through the module-level `load_detector` (tests replace
-it with `monkeypatch.setattr` on `smc.plugins.cells.plugin`). Per well:
-each frame through `load_frame` (a missing frame file is a
-`PluginRunError` naming it), `detect`, `suppress_in_frame`, `to_cells`;
-then `merge_across_fields` on the well; `ctx.progress` per frame. Cells of
-the wells done go to `cells/<token>.partial.json` after each well, and the
-checkpoint `CellsCheckpoint(token: str, wells_done: tuple[str, ...])`
-follows; the end writes `cells/<token>.json` and removes the partial file.
-`seconds_per_frame` is the mean wall time of `detect` (`None` with no
-frame). A scan with no frame (a dry run) is a `PluginRunError`.
+`requires = ()`, `reads = ("scan",)`, `provides = "cells"`. In order:
+
+1. The scan: `ctx.upstream("scan", ScanResult)`; a scan with no frame (a
+   dry run, or every field failed) is a `PluginRunError`.
+2. The model: `path = params.model_path or default_model_path()`, the
+   detector through the module-level `load_detector(path, …)` (tests
+   replace it with `monkeypatch.setattr` on `smc.plugins.cells.plugin`),
+   then the SHA-256 of `path`, read in 1 MiB chunks (an `OSError` is a
+   `PluginRunError` naming the file).
+3. Resume: `ctx.checkpoint(CellsCheckpoint)`. A checkpoint whose
+   `model_sha256` differs from the weights' is a `PluginRunError` ("the
+   weights changed since the run being resumed; run cells without
+   --resume"): cells of two models are not one result. Its `token` is kept;
+   the cells of `cells/<token>.partial.json` (a `CellsFile`) whose well is
+   in `wells_done` are kept and the others dropped (a crash between the
+   partial file and the checkpoint). A partial file that is missing or
+   does not validate is a WARNING, and every well is done again under the
+   same token, `merged` from 0. Without a checkpoint, a new token.
+4. Per well of `scan.frame_index()`, in its order, skipping `wells_done`;
+   per frame: `ctx.raise_if_stopped()`; `load_frame` (a
+   `FileNotFoundError`, a `ValueError` — a path out of the folder, or
+   `tifffile`'s error — or an `OSError` is a `PluginRunError` naming
+   `frame.file` and saying to run `scan` again); a frame that is not 2-D,
+   not of `scan.image_shape_px`, or not finite is a `PluginRunError`
+   naming it (the matrix of §3.1 is only right on that shape, FM-73);
+   `detect`, timed with `time.perf_counter`; a label not in
+   `detector.classes` is a `PluginRunError` (a detector bug, and the counts
+   would not add up); `suppress_in_frame`, `to_cells` with the scan's
+   matrix and shape; `ctx.progress(done, len(scan.frames), "<well> <name>")`
+   where `done` counts the frames of the wells resumed too. Then
+   `merge_across_fields` on the well; the partial file is rewritten with
+   every cell so far (`write_atomically`), and only then
+   `ctx.save_checkpoint` with the well added and its `merged` summed.
+5. The end: `cells/<token>.json` written (`write_atomically`, JSON
+   `ensure_ascii=True`, `allow_nan=False`, compact), then the partial file
+   removed through `retry_on_permission_error` (missing is fine; a failure
+   is a WARNING naming it, not a failed stage: the result is whole).
+
+`CellsResult`: `file` the final file relative to the run folder; `model`
+`path.name` (never the path, FM-50); `model_sha256`; `classes` and
+`device` the detector's; `score_threshold`, `merge_radius_um` the
+parameters; `frames = len(scan.frames)`; `counts` for every well of
+`scan.frame_index()` and every label of `classes`, zeros included;
+`merged` the sum over every well, the resumed ones through the
+checkpoint;
+`seconds_per_frame` the mean `detect` time of this attempt, `None` when
+it detected no frame. `assumed` names the merge radius as chosen.
 
 `merge_radius_um = 5.0` is **chosen, not measured**: half the size of a
 yeast cell, well above the calibration's error, well below two cells
@@ -2157,7 +2292,8 @@ side by side. #198 looks at merged pairs on real frames.
 **Tests** (stub detector unless said):
 `test_a_cell_seen_by_two_overlapping_fields_is_counted_once`;
 `test_the_least_cut_view_is_kept`; `test_two_cells_of_one_frame_are_never_merged`;
-`test_merge_keeps_cells_of_different_wells_apart`;
+`test_a_box_between_two_cells_of_another_frame_removes_only_one` (§9.0's
+chain); `test_merge_keeps_cells_of_different_wells_apart`;
 `test_a_rotated_mirrored_matrix_puts_cells_at_their_sample_position` (a
 `PlateSample` with blobs, a thresholding stub, FM-73);
 `test_the_plugin_imports_without_torch` (a subprocess with
@@ -2165,7 +2301,7 @@ side by side. #198 looks at merged pairs on real frames.
 `test_a_resume_skips_the_wells_done`;
 `test_the_trained_model_loads_and_finds_nothing_on_noise` skipped
 without torch or the weights (never in CI). **Failure modes**: FM-73,
-FM-78, FM-50 (no full path), FM-113, FM-24.
+FM-78, FM-50 (no full path), FM-113, FM-24, FM-38.
 
 ## 10. Density (#193)
 
