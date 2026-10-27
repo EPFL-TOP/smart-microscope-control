@@ -1922,11 +1922,21 @@ class ScanPlanParams(PluginParams):
   `"camera-calibration"` (a calibration of another objective or shape is
   ignored, and `assumed` says why: `camera calibration not used: it is of
   <its objective>, the plan is for <objective>`, or `… it is of a frame of
-  <its shape>, the camera gives <shape>`); (3) the profile's size for the
-  objective, `turret.pixel_size_um(objective)`, or with no turret
-  `camera.pixel_size_um()`, when finite and positive (FM-104):
-  `pixel_matrix`, `"profile"`, `assumed` gaining `no camera calibration
-  for <objective>: rotation 0 and no mirror assumed`; (4) otherwise
+  <its shape>, the camera gives <shape>`); (3) the stand's configured
+  size, when finite and positive (FM-104): for the objective in place, or
+  with no turret, `camera.pixel_size_um()`; for another objective,
+  `turret.pixel_size_um(objective)`; then `pixel_matrix`, `"profile"`,
+  `assumed` gaining `no camera calibration for <objective>: rotation 0 and
+  no mirror assumed`. Refined while planning #21 (FM-103): the turret's size
+  is the profile's **at binning 1** (`MMObjectiveTurret.pixel_size_um`),
+  while the camera's includes the binning, the magnification factor and
+  MMCore's own pixel calibration (m2 §8.10), so the turret's would plan a
+  binned camera with fields half their size. Nothing in the `Camera`
+  protocol reads the binning, so a plan for an objective that is not in
+  place also gains `pixel size of <objective> from the profile, for binning
+  1: the camera's binning is not applied`. On the demo (measured) the
+  camera reports 1.0 µm with the 10× in place, the profile 0.65, the 40×
+  0.1625 and `Objective-2` 0.0; (4) otherwise
   `PluginRunError`: "no pixel size for <objective>: run
   camera-calibration with it in place, or add it to the profile's [camera]
   pixel_size_um" (#21's "refuses to plan without a pixel size").
