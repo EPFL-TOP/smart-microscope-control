@@ -63,14 +63,19 @@ camera-calibration: 1/3 +X probe
 
 A stage that ran and could not produce a usable result ends the record `failed`
 with the reason, and **fills no slot**: a reader never finds a matrix it should
-not trust. The reason says which of two things went wrong:
+not trust. The reason says which of three things went wrong:
 
 - `the frames barely correlate: find a field with texture`: nothing to lock onto.
 - `the two moves gave parallel shifts: did the stage move?`: the image did not
   follow the stage on one axis (a stage that ignored the command, the wrong
   camera, a blocked light path).
+- `the shifts do not fit a rigid camera: did each axis move its full command?`:
+  the frames agree, but the matrix they give is not a camera, because one axis
+  executed a fraction of its command (a quarter or less of it) or none plus a
+  little noise (a limit that clamped it, a stage that stopped short). Check the
+  stage's travel on that axis, then run it again.
 
-Either is followed by `step <n> µm`, and by `a step over 40 % of the field may
+Each is followed by `step <n> µm`, and by `a step over 40 % of the field may
 wrap: give a smaller step_um` when the step was the 50 µm fallback or more than
 40 % of the smaller side. Phase correlation reports each axis's shift in
 `[-N/2, N/2)`, so content moved by 200 rows of a 384-row frame reads -184: a step
@@ -117,15 +122,18 @@ larger of 2 µm and four pixels); `camera calibration reused from <path>, measur
 
 ### A `done` calibration is not a proof
 
-The plugin refuses a field with nothing to lock onto and a stage that did not move
-at all. It does **not** refuse a calibration that is wrong in a way the correlation
-cannot see, and a `done` slot is read by the scan plan as measured. Read the
-numbers before you trust them:
+The plugin refuses a field with nothing to lock onto, a stage that did not move
+at all, and a matrix that is not a camera because an axis did not execute its
+command (a quarter or less of it). It does **not** refuse a calibration that is
+wrong in a way the correlation cannot see, and a `done` slot is read by the scan
+plan as measured. Read the numbers before you trust them:
 
-- **A stage that moves only part of the command** on one axis gives a fit that is
-  not a camera: `residual_um` is huge (hundreds of µm or more, against a fraction
-  of a µm for a good fit), though `response` is high. The same is true of one axis
-  clamped by a limit. A large `residual_um` means the calibration is wrong.
+- **A stage that moves only part of the command on one axis, but more than a
+  quarter of it** (an axis at half its command, say) is not refused: the two
+  axes then differ by a factor under 4 in pixel size. The fit is still not a
+  camera, and `residual_um` is far above a good fit's (a fraction of a µm),
+  though `response` is high: a large `residual_um` means the calibration is
+  wrong.
 - **A stage that moves a fraction of the command on both axes**, and a **periodic
   target** (a grid slide, a stage micrometer), give a clean rigid fit of the wrong
   size, with a residual of about 0: the correlation reports the shift modulo the
@@ -135,8 +143,9 @@ numbers before you trust them:
   the period.
 - **A step of a few pixels** gives a result of poor precision, not an error.
 
-These checks are not made for you yet: the design decides which of them are
-refusals (the Plan deviation on #22).
+These checks are not made for you yet: whether a uniform scale error or a
+periodic target should be refused, and against what, waits for the data of the
+first calibration at the stand (#198, and #212).
 
 ## The pixel size is not written anywhere
 

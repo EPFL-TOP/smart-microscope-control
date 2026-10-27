@@ -1489,7 +1489,10 @@ def fit(
   unusable: `min(response) < MIN_RESPONSE` ("the frames barely correlate:
   find a field with texture"); `|det J| < 1e-12` ("the two moves gave
   parallel shifts: did the stage move?"), with a zero matrix and no
-  division.
+  division; and `max|M − ideal| >= pixel_size_um` ("the shifts do not fit
+  a rigid camera: did each axis move its full command?"), which refuses
+  an axis that moves a fraction of its command, or none plus noise
+  (review of #211).
 
 ### 4.2 Plugin
 
