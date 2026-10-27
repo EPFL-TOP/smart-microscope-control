@@ -80,7 +80,12 @@ Three refusals and one repair:
   stage.
 - **A scan produced again**: the runner refuses a resume over inputs that changed.
 - **A partial file that is missing or does not validate** is a WARNING, and every
-  well is detected again under the same token. Slower, never wrong.
+  well is detected again under the same token, after the checkpoint has been
+  reset to "no well done": a checkpoint that still named wells the new partial
+  file does not hold would make a later resume skip them. Slower, never wrong.
+  What a valid partial file cannot show is a well with no cell in it, so a copy
+  of the run folder made while a run was going, with an older partial file than
+  its checkpoint, is taken at its word: resume in the folder the run was in.
 
 At the end `cells/<token>.json` is written, then the partial file is removed. A
 partial file that cannot be removed (Windows, a file another program holds) is a
@@ -93,7 +98,7 @@ The slot `cells` holds a `CellsResult` (`smc.plugins.slots`):
 | Field | Meaning |
 |---|---|
 | `file` | `cells/<token>.json`, relative to the run folder, with forward slashes. |
-| `model`, `model_sha256` | The weights' **file name** (never its path: run documents are attached to issues) and its SHA-256. |
+| `model`, `model_sha256` | The weights' **file name** (never its path: run documents are attached to issues) and its SHA-256. The parameter `model_path` is recorded as you typed it, in the stage's `params`, like every parameter: when the path names your account, give the folder through `SMC_MODELS`, which is recorded nowhere. |
 | `classes`, `device` | The detector's labels (`single`, `doublet`, `debris`) and the device it ran on, never `auto`. |
 | `score_threshold`, `merge_radius_um` | The parameters. |
 | `frames` | The number of frames of the scan. |
@@ -124,6 +129,17 @@ second field between two cells of the first would leave one cell for two, and tw
 neighbours seen by both fields with a 0.8 µm calibration error between them would
 lose one of the pair. A neighbour that only one field found stays.
 
+## The model's limit of boxes per frame
+
+torchvision's Faster R-CNN keeps the best 100 boxes of a frame and says nothing
+about the rest (`box_detections_per_img`, 100 by default; `nikon-control` used it
+so too). A frame with more cells than that is **undercounted**,
+silently as far as the result goes: a WARNING (`the model returned 100 boxes for a
+frame, its limit per frame: a denser frame is undercounted`) names it, once per
+such frame. The warning cannot tell a frame of exactly 100 cells from a larger one.
+The limit is not in the result and was not raised: that changes what the model
+returns, and is for the owner to decide.
+
 ## What a bad frame looks like
 
 Each is a `failed` record whose reason names the frame's file and ends with `run
@@ -147,7 +163,15 @@ are skipped without them.
 - **`merge_radius_um = 5`** against real cells: it is half the size of a yeast
   cell, well above the calibration's error, well below two cells side by side, and
   chosen, not measured. Look at the merged pairs on the first scan.
-- **`cuda`**: no GPU was available to the tests.
+- **`cuda`**: no GPU was available to the tests, and a card that cannot run the
+  model (`no kernel image`) is only simulated: the message says to use
+  `device=cpu`.
+- **torch next to the stand's DLLs.** `smc run` opens the stand around the stage,
+  although this stage needs none, so torch may be imported in a process that already
+  holds the Micro-Manager and vendor DLLs, and Windows resolves a module that is
+  already loaded by its base name (FM-95). Not tried: if `python -c "import torch"`
+  works in a new console and `smc run cells` says `torch is installed but did not
+  load`, that is the likely cause: file it (#198).
 - The box convention: the detector's box is taken as given and its midpoint is the
   centre; whether the training put a pixel's centre at its index or half a pixel
   further is not recorded (at most 0.14 µm at 40×).
