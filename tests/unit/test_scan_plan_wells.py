@@ -120,6 +120,16 @@ def test_parse_rejects_and_lists_every_item_it_cannot_read() -> None:
         parse_wells(PLATE, "A1, Q99, zzz, B2")
 
 
+def test_a_space_separates_items_so_a_well_with_one_in_it_is_two_unreadable_items() -> (
+    None
+):
+    """`normalise_well` reads `A 1`, but the list is split on spaces first: the page says to write `A1`."""
+    message = "wells not understood on a 96-well plate: 'A', '1'"
+
+    with pytest.raises(ValueError, match=_exactly(message)):
+        parse_wells(PLATE, "A 1")
+
+
 @pytest.mark.parametrize(
     "item", ["-B2", "B2-", "A1:", ":A1", "*", "**", "*x", "A1:B3:C4", "A1.5", "0"]
 )

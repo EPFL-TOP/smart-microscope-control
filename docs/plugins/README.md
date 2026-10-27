@@ -14,9 +14,11 @@ is how to use it.
 - [Testing a plugin](#testing-a-plugin)
 
 Plugins with a page of their own: [`camera-calibration`](camera-calibration.md)
-(how the camera's pixels map to the stage: pixel size, rotation, mirror) and
+(how the camera's pixels map to the stage: pixel size, rotation, mirror),
 [`cells`](cells.md) (single cells and doublets on a scan's frames, in stage µm,
-each counted once; needs the `detect` extra and the trained weights).
+each counted once; needs the `detect` extra and the trained weights) and
+[`scan-plan`](scan-plan.md) (which wells and which fields of each to image, from the
+camera's real field of view).
 
 ## Running a plugin: `smc run`
 
