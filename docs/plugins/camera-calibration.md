@@ -71,7 +71,9 @@ not trust. The reason says which of three things went wrong:
   camera, a blocked light path).
 - `the shifts do not fit a rigid camera: did each axis move its full command?`:
   the frames agree, but the matrix they give is not a camera, because one axis
-  executed a fraction of its command (a quarter or less of it) or none plus a
+  executed a fraction of its command (about a quarter or less of it: a quarter
+  when the camera is aligned with the stage, between a fifth and a third as it
+  is turned) or none plus a
   little noise (a limit that clamped it, a stage that stopped short). Check the
   stage's travel on that axis, then run it again.
 
@@ -124,13 +126,15 @@ larger of 2 µm and four pixels); `camera calibration reused from <path>, measur
 
 The plugin refuses a field with nothing to lock onto, a stage that did not move
 at all, and a matrix that is not a camera because an axis did not execute its
-command (a quarter or less of it). It does **not** refuse a calibration that is
-wrong in a way the correlation cannot see, and a `done` slot is read by the scan
+command (about a quarter or less of it). It does **not** refuse a calibration that
+is wrong in a way the correlation cannot see, and a `done` slot is read by the scan
 plan as measured. Read the numbers before you trust them:
 
-- **A stage that moves only part of the command on one axis, but more than a
-  quarter of it** (an axis at half its command, say) is not refused: the two
-  axes then differ by a factor under 4 in pixel size. The fit is still not a
+- **A stage that moves only part of the command on one axis, but more than about
+  a quarter of it** (an axis at half its command, say) is not refused: the two
+  axes then differ by a factor under 4 in pixel size (for a camera aligned with
+  the stage; the limit moves between a fifth and a third as it is turned, measured
+  on the fit). The fit is still not a
   camera, and `residual_um` is far above a good fit's (a fraction of a µm),
   though `response` is high: a large `residual_um` means the calibration is
   wrong.
