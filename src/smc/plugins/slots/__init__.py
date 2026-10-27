@@ -20,18 +20,30 @@ from smc.plugins.slots.plate import (
     normalise_well,
     well_geometry,
 )
+from smc.plugins.slots.scan import (
+    FailedField,
+    FocusState,
+    ScanFrame,
+    ScanResult,
+    load_frame,
+)
 from smc.plugins.slots.scan_plan import PlannedField, ScanPlanResult
 
 __all__ = [
     "CameraCalibration",
+    "FailedField",
+    "FocusState",
     "LatticeFit",
     "PlannedField",
     "PlateResult",
+    "ScanFrame",
     "ScanPlanResult",
+    "ScanResult",
     "SlotValue",
     "WallTouch",
     "WellGeometry",
     "WellRef",
+    "load_frame",
     "normalise_well",
     "well_geometry",
 ]

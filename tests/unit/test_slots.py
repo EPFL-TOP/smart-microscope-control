@@ -20,10 +20,13 @@ from pydantic import BaseModel, ValidationError
 from smc.plugins import slots
 from smc.plugins.slots import (
     CameraCalibration,
+    FailedField,
     LatticeFit,
     PlannedField,
     PlateResult,
+    ScanFrame,
     ScanPlanResult,
+    ScanResult,
     SlotValue,
     WallTouch,
     WellRef,
@@ -103,6 +106,38 @@ _SCAN_PLAN: dict[str, Any] = {
     "estimate_s": 1830.5,
 }
 
+_FRAME: dict[str, Any] = {
+    "well": "A1",
+    "index": 0,
+    "name": "A1_0000",
+    "file": "scan/0123456789ab/A1_0000.tif",
+    "x_um": 1000.5,
+    "y_um": 2000.25,
+    "z_um": 1500.0,
+    "focus": "locked",
+    "pfs_offset": 512.0,
+    "t_s": 12.5,
+}
+_FAILED = {
+    "well": "A1",
+    "index": 1,
+    "name": "A1_0001",
+    "x_um": 1100.0,
+    "y_um": 2000.0,
+    "error": "HardwareError: the stage did not answer",
+}
+_SCAN: dict[str, Any] = {
+    "assumed": [],
+    "folder": "scan/0123456789ab",
+    "objective": "Nikon 40X Plan Fluor ELWD",
+    "pixel_size_um": 0.275,
+    "matrix_um_per_px": _MATRIX,
+    "image_shape_px": [1200, 1412],
+    "exposure_ms": 10.0,
+    "frames": [_FRAME],
+    "failed": [_FAILED],
+}
+
 #: Every model of ``smc.plugins.slots`` with a full and a sparse sample. A module
 #: that lands later adds its rows here (the first test fails until it does).
 SAMPLES: dict[type[BaseModel], Sample] = {
@@ -154,6 +189,15 @@ SAMPLES: dict[type[BaseModel], Sample] = {
             "fields": [],
             "estimate_s": None,
         },
+    ),
+    ScanFrame: (
+        _FRAME,
+        {**_FRAME, "z_um": None, "focus": "none", "pfs_offset": None},
+    ),
+    FailedField: (_FAILED, _FAILED),
+    ScanResult: (
+        _SCAN,
+        {**_SCAN, "objective": None, "frames": [], "failed": []},
     ),
 }
 
@@ -282,6 +326,11 @@ RANGES: list[tuple[type[BaseModel], tuple[Any, ...], list[Any], list[Any]]] = [
     (ScanPlanResult, ("rows",), [0, -1], [1]),
     (ScanPlanResult, ("columns",), [0, -1], [1]),
     (ScanPlanResult, ("estimate_s",), [-0.1], [0.0]),
+    (ScanFrame, ("index",), [-1], [0]),
+    (ScanFrame, ("t_s",), [-0.1], [0.0]),
+    (FailedField, ("index",), [-1], [0]),
+    (ScanResult, ("pixel_size_um",), [0.0, -1.0], [1e-6]),
+    (ScanResult, ("exposure_ms",), [-0.1], [0.0]),
 ]
 
 
@@ -329,6 +378,9 @@ MUST_BE_PRESENT: list[tuple[type[BaseModel], tuple[Any, ...]]] = [
     (CameraCalibration, ("return_error_um",)),
     (ScanPlanResult, ("objective",)),
     (ScanPlanResult, ("estimate_s",)),
+    (ScanFrame, ("z_um",)),
+    (ScanFrame, ("pfs_offset",)),
+    (ScanResult, ("objective",)),
 ]
 
 
@@ -388,3 +440,29 @@ def test_well_center_um_normalises_its_argument_and_refuses_a_well_not_on_the_pl
     assert result.well_center_um("A1") == (1234.5, -987.6)
     with pytest.raises(ValueError, match=r"\Awell 'I13' is not on the 96-well plate\Z"):
         result.well_center_um("I13")
+
+
+# --- the scan ------------------------------------------------------------------
+
+
+def test_a_focus_state_the_scan_does_not_know_is_refused() -> None:
+    assert _error_types(ScanFrame, {**_FRAME, "focus": "maybe"}) == ["literal_error"]
+    for state in ("locked", "unlocked", "off", "none"):
+        ScanFrame.model_validate({**_FRAME, "focus": state})
+
+
+def test_frame_index_maps_a_well_to_the_positions_of_its_frames() -> None:
+    def frame(well: str, index: int) -> dict[str, Any]:
+        return {**_FRAME, "well": well, "index": index, "name": f"{well}_{index:04d}"}
+
+    # Frames in the order A1, B1, A1: a well's positions are not contiguous, the
+    # wells come in the order of their first frame, and a well with no frame
+    # (every field of C1 failed) is absent.
+    result = ScanResult.model_validate(
+        {**_SCAN, "frames": [frame("A1", 0), frame("B1", 0), frame("A1", 1)]}
+    )
+    index = result.frame_index()
+    assert index == {"A1": [0, 2], "B1": [1]}
+    assert list(index) == ["A1", "B1"]
+    assert "C1" not in index
+    assert ScanResult.model_validate({**_SCAN, "frames": []}).frame_index() == {}
