@@ -352,21 +352,26 @@ def test_fit_inverts_the_shifts_of_any_rigid_camera(
         assert got_row == pytest.approx(want_row, abs=1e-9)
 
 
+RIGIDITY_NOTE = (
+    "the shifts do not fit a rigid camera: did each axis move its full command?"
+)
+
+
 @pytest.mark.parametrize(
-    ("shift_x", "shift_y"),
+    ("shift_x", "shift_y", "matrix"),
     [
         # The +X probe reads 10 % and 1 % of the 96 px that a full move gives,
         # the +Y probe is full: an X axis that executes a fraction of its command.
-        (Shift(-9.6, 0.0, 1.0), Shift(0.0, 96.0, 1.0)),
-        (Shift(-0.96, 0.0, 1.0), Shift(0.0, 96.0, 1.0)),
+        (Shift(-9.6, 0.0, 1.0), Shift(0.0, 96.0, 1.0), ((10.0, 0.0), (0.0, -1.0))),
+        (Shift(-0.96, 0.0, 1.0), Shift(0.0, 96.0, 1.0), ((100.0, 0.0), (0.0, -1.0))),
         # Y did not move at all and its probe reads 0.1 px of noise: the near
         # parallel case that the absolute determinant of 1e-12 lets through.
-        (Shift(-96.0, 0.0, 1.0), Shift(0.0, 0.1, 1.0)),
+        (Shift(-96.0, 0.0, 1.0), Shift(0.0, 0.1, 1.0), ((1.0, 0.0), (0.0, -960.0))),
     ],
     ids=["x-at-10-percent", "x-at-1-percent", "y-stuck-with-noise"],
 )
 def test_an_axis_that_moves_a_fraction_of_its_command_is_refused(
-    shift_x: Shift, shift_y: Shift
+    shift_x: Shift, shift_y: Shift, matrix: Matrix2
 ) -> None:
     """The matrix is not a rigid camera: its largest entry off a rotation reaches the pixel size.
 
@@ -375,19 +380,66 @@ def test_an_axis_that_moves_a_fraction_of_its_command_is_refused(
     """
     result = fit(shift_x, shift_y, step_um=96.0, image_shape_px=SHAPE)
 
-    assert any("rigid camera" in note for note in result.notes)
+    assert RIGIDITY_NOTE in result.notes
     assert not any("parallel shifts" in note for note in result.notes)
     assert result.trustworthy is False
-    # The matrix, the size and the residual are returned as computed, not zeroed.
-    assert result.pixel_size_um > 0.0
+    # The matrix, the angle and the size are returned as computed, not zeroed.
+    for got_row, want_row in zip(result.matrix_um_per_px, matrix, strict=True):
+        assert got_row == pytest.approx(want_row, rel=1e-9, abs=1e-9)
+    assert result.rotation_deg == 0.0
+    assert result.mirrored is False
+    assert result.pixel_size_um == pytest.approx(math.sqrt(abs(np.linalg.det(matrix))))
     assert result.residual_um >= result.pixel_size_um * max(SHAPE) / 2
+
+
+@pytest.mark.parametrize("mirrored", [False, True])
+@pytest.mark.parametrize("rotation_deg", [0.0, 30.0, 90.0, 135.0])
+@pytest.mark.parametrize("axis", ["x", "y"])
+def test_an_axis_at_ten_percent_is_refused_at_any_pose_of_the_camera(
+    axis: str, rotation_deg: float, mirrored: bool
+) -> None:
+    """FM-73: off the axes too. A turned or mirrored camera puts both components in each probe."""
+    shift_x, shift_y = _probes_of(_matrix(1.0, rotation_deg, mirrored), 96.0)
+    slow = shift_x if axis == "x" else shift_y
+    slow = replace(slow, d_col_px=0.1 * slow.d_col_px, d_row_px=0.1 * slow.d_row_px)
+    if axis == "x":
+        shift_x = slow
+    else:
+        shift_y = slow
+
+    result = fit(shift_x, shift_y, step_um=96.0, image_shape_px=SHAPE)
+
+    assert RIGIDITY_NOTE in result.notes
+    assert result.trustworthy is False
+    # Returned as computed, not zeroed: the handedness is the camera's, and a
+    # turned camera's non-rigid matrix still has an angle.
+    assert result.mirrored is mirrored
+    if rotation_deg != 0.0:
+        assert result.rotation_deg != 0.0
+
+
+def test_a_fit_whose_matrix_is_nan_is_not_trusted() -> None:
+    """The note is written ``not worst < pixel_size``, so that ``nan`` fails it.
+
+    ``measure_shift`` cannot give an infinite shift, but ``fit`` is public: with
+    ``worst >= pixel_size`` a nan matrix would carry no note and be trustworthy.
+    """
+    result = fit(
+        Shift(-math.inf, 0.0, 1.0),
+        Shift(0.0, math.inf, 1.0),
+        step_um=96.0,
+        image_shape_px=SHAPE,
+    )
+
+    assert math.isnan(result.pixel_size_um)
+    assert result.trustworthy is False
 
 
 @pytest.mark.parametrize("axis", ["x", "y"])
 @pytest.mark.parametrize(
     ("fraction", "refused"),
-    [(0.30, False), (0.25, True), (0.20, True)],
-    ids=["30-percent", "25-percent", "20-percent"],
+    [(0.30, False), (0.26, False), (0.25, True), (0.24, True), (0.20, True)],
+    ids=["30-percent", "26-percent", "25-percent", "24-percent", "20-percent"],
 )
 def test_the_rigidity_note_is_decided_at_the_pixel_size(
     axis: str, fraction: float, refused: bool

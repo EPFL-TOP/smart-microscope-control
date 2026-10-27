@@ -50,6 +50,10 @@ pytestmark = pytest.mark.demo
 SHAPE = (384, 512)  # (height, width): not square, on purpose (FM-73)
 STEP_UM = 96.0  # 0.25 * 384 rows * 1.0 µm per pixel
 LOGGER = "smc.plugins.camera-calibration"
+#: What the operator reads when the shifts are not a camera's (the design's text).
+RIGIDITY_NOTE = (
+    "the shifts do not fit a rigid camera: did each axis move its full command?"
+)
 
 
 class _FlakyStage:
@@ -392,15 +396,20 @@ def test_a_stage_that_moves_a_fraction_of_x_fails_and_returns(
 
     The fit used to end ``done`` with a matrix of 10 µm per pixel on one axis and
     1 on the other (a residual of 1664 µm); the rigidity note refuses it, and the
-    return, which runs before the fit is judged, gives the stage back.
+    return, which runs before the fit is judged, gives the stage back. The camera
+    is the one of the module docstring (30 degrees, mirrored), so that both
+    components of each probe are non-zero, and the start is off the origin, so
+    that a return to the wrong place or an origin that the wrapper forgets shows.
     """
-    microscope = demo_microscope_with_sample(shape=SHAPE)
-    start = _here(microscope)
+    microscope = demo_microscope_with_sample(
+        shape=SHAPE, camera_rotation_deg=30.0, mirrored=True
+    )
+    start = _start_off_the_origin(microscope)
     microscope.override(
         XYStage, _FlakyStage(microscope.require(XYStage), x_fraction=0.1)
     )
 
-    with pytest.raises(PluginRunError, match="rigid camera"):
+    with pytest.raises(PluginRunError, match=re.escape(RIGIDITY_NOTE)):
         _run(microscope, tmp_path)
 
     stored = _stored(tmp_path)
