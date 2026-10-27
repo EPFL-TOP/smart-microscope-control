@@ -30,6 +30,8 @@ dependencies = [
   # The ecosystem's acquisition description: MDASequence, WellPlatePlan, grids.
   "useq-schema>=0.9",
   "numpy>=1.26",
+  # Phase correlation for camera calibration (m3 §4); a core dependency so the built-in plugin always loads.
+  "scikit-image>=0.22",
   "pydantic>=2.7",
   "typer>=0.12",
   "rich>=13",
@@ -63,6 +65,7 @@ smc = "smc.cli:main"
 # The name is the plugin's `name` and the key of its record in the run document;
 # the value names a class, which the registry instantiates with no argument.
 [project.entry-points."smc.plugins"]
+camera-calibration = "smc.plugins.camera_calibration.plugin:CameraCalibrationPlugin"
 stage-report = "smc.plugins.stage_report:StageReport"
 
 [project.urls]
