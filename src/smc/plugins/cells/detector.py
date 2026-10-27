@@ -17,6 +17,7 @@ everywhere and a missing torch is an instruction, not a crash.
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -47,6 +48,8 @@ DEFAULT_MODEL = "cell_classes_model-cat-v2.pth"
 _BACKGROUND = "__background__"
 _PREDICTOR_KEY = "roi_heads.box_predictor.cls_score.weight"
 _PLUGIN = "cells"
+
+log = logging.getLogger(f"smc.plugins.{_PLUGIN}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,8 +163,10 @@ class TorchDetector:
         score_threshold: Detections below it are dropped.
 
     Raises:
-        ImportError: torch or torchvision is not installed.
-        OSError: torch is installed and does not load (a DLL on Windows).
+        ImportError: torch or torchvision is not installed, or one of their
+            compiled modules does not import.
+        OSError, RuntimeError: torch is installed and does not load (a DLL on
+            Windows; a torchvision of another version than torch).
         ValueError: The file is not a usable checkpoint, or the device is not
             available. The message names the file.
     """
@@ -203,10 +208,17 @@ class TorchDetector:
             raise ValueError(
                 f"{name} lists {names[0]!r} as its first class, not {_BACKGROUND!r}"
             )
-        rows = state[_PREDICTOR_KEY].shape[0] if _PREDICTOR_KEY in state else None
-        if rows != len(names):
+        # `shape` of nothing, of a list or of a number is `None`, and a 0-d tensor's
+        # is empty: none of them is a predictor with one row per class.
+        shape = getattr(state.get(_PREDICTOR_KEY), "shape", None)
+        if not shape:
             raise ValueError(
-                f"{name} has {rows} outputs for {len(names)} classes: "
+                f"{name} has no usable {_PREDICTOR_KEY}: the box predictor's "
+                f"weight is missing or is not a tensor with a row per class"
+            )
+        if shape[0] != len(names):
+            raise ValueError(
+                f"{name} has {shape[0]} outputs for {len(names)} classes: "
                 f"it is not the model its classes name"
             )
 
@@ -221,12 +233,26 @@ class TorchDetector:
                 f"{name} does not fit the Faster R-CNN architecture ({exc}); "
                 f"is it the right checkpoint?"
             ) from exc
-        model.eval().to(resolved)
+        try:
+            model.eval().to(resolved)
+        except RuntimeError as exc:
+            # `auto` picked cuda and the card cannot run this model (no kernel image
+            # for its architecture, out of memory): say what to do, as for a device
+            # that is not there.
+            advice = "" if resolved == "cpu" else "; use device=cpu"
+            raise ValueError(
+                f"{name} could not be moved to {resolved} ({exc}){advice}"
+            ) from exc
 
         self.score_threshold = score_threshold
         self.classes = tuple(names[1:])
         self.device = resolved
         self._labels = tuple(names)
+        # torchvision keeps the best `detections_per_img` boxes of a frame (100 by
+        # default, as in `nikon-control`) and says nothing about the rest.
+        self._limit: int | None = getattr(
+            getattr(model, "roi_heads", None), "detections_per_img", None
+        )
         self._model = model
         self._torch = torch
 
@@ -250,8 +276,15 @@ class TorchDetector:
         tensor = plane[None].repeat(3, 1, 1).to(self.device)
         with torch.no_grad():
             out = self._model([tensor])[0]
+        boxes = out["boxes"].cpu().numpy()
+        if self._limit is not None and len(boxes) >= self._limit:
+            log.warning(
+                "the model returned %d boxes for a frame, its limit per frame: a "
+                "denser frame is undercounted",
+                len(boxes),
+            )
         return detections_from_output(
-            out["boxes"].cpu().numpy(),
+            boxes,
             out["scores"].cpu().numpy(),
             out["labels"].cpu().numpy(),
             labels=self._labels,
@@ -284,9 +317,10 @@ def load_detector(
 
     The file is looked for first, so a PC with neither the weights nor torch is
     told about the weights, which are the part that has to be copied by hand.
-    The three ways of failing to build it are told apart because each has
-    another cure: install the extra, reinstall it (torch is there and a DLL
-    does not load, which Windows reports as ``OSError``), or take another file.
+    The ways of failing to build it are told apart because each has another
+    cure: install the extra, reinstall it (torch is there and a DLL does not
+    load, which Windows reports as ``OSError``, or its versions do not go
+    together, a ``RuntimeError``), or take another file.
 
     Args:
         model_path: The checkpoint, or ``None`` for ``default_model_path()``.
@@ -294,11 +328,21 @@ def load_detector(
         score_threshold: As ``TorchDetector``.
 
     Raises:
-        PluginRunError: The file is missing, torch is missing or does not load,
-            or the checkpoint or the device is refused.
+        PluginRunError: The file is missing or cannot be looked for, torch is
+            missing or does not load, or the checkpoint or the device is refused.
     """
     path = model_path if model_path is not None else default_model_path()
-    if not path.is_file():
+    try:
+        is_file = path.is_file()
+    except OSError as exc:
+        # A folder the user cannot enter, a share that dropped: `is_file` raises
+        # for what it cannot tell (FM-116), and the operator needs the same line.
+        raise PluginRunError(
+            _PLUGIN,
+            f"cannot look for the model at {path} ({exc.strerror or exc}); set "
+            f"SMC_MODELS to the folder that holds {DEFAULT_MODEL}, or give model_path",
+        ) from exc
+    if not is_file:
         raise PluginRunError(
             _PLUGIN,
             f"no model at {path}; put {DEFAULT_MODEL} there, set SMC_MODELS to "
@@ -307,15 +351,27 @@ def load_detector(
     try:
         return TorchDetector(path, device=device, score_threshold=score_threshold)
     except ImportError as exc:
+        # Every ImportError, not ModuleNotFoundError alone: `DLL load failed while
+        # importing _imaging` is one, and it is not a missing package.
+        if isinstance(exc, ModuleNotFoundError):
+            reason = f"torch is not installed ({exc}): install the detect extra: "
+        else:
+            reason = (
+                f"torch could not be imported ({exc}): install or reinstall the "
+                f"detect extra: "
+            )
+        raise PluginRunError(_PLUGIN, reason + "pip install -e .[detect]") from exc
+    except (OSError, RuntimeError) as exc:
+        # What is left of `OSError` is torch's own import (a DLL, on Windows): the
+        # reading of the file is a `ValueError` by now. A torchvision of another
+        # version than torch raises `RuntimeError`. torch is imported here, in the
+        # process that already holds the stand's DLLs (FM-95), so a fresh console
+        # tells a broken install from a conflict.
         raise PluginRunError(
             _PLUGIN,
-            f"torch is not installed ({exc}): install the detect extra: "
-            f"pip install -e .[detect]",
-        ) from exc
-    except OSError as exc:
-        raise PluginRunError(
-            _PLUGIN,
-            f"torch is installed but did not load ({exc}); reinstall the detect extra",
+            f"torch is installed but did not load ({exc}); reinstall the detect "
+            f'extra. If `python -c "import torch"` works in a new console, the '
+            f"stand's DLLs may conflict with torch: report it",
         ) from exc
     except ValueError as exc:
         raise PluginRunError(_PLUGIN, str(exc)) from exc

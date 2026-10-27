@@ -330,6 +330,18 @@ def test_a_neighbour_the_other_field_missed_is_not_swallowed() -> None:
     assert kept == (seen_by_both, only_frame_1_found)
 
 
+def test_two_equidistant_views_of_another_frame_lose_the_one_first_in_the_input() -> (
+    None
+):
+    """Ties of distance go by input order, so a run and its rerun agree."""
+    kept_view = _cell(0.0, 0)
+    left = _cell(-3.0, 1, centre_px=(30.0, 99.5))
+    right = _cell(3.0, 1, centre_px=(30.0, 99.5))
+
+    assert _merge([kept_view, left, right])[0] == (kept_view, right)
+    assert _merge([kept_view, right, left])[0] == (kept_view, left)
+
+
 def test_a_cell_seen_by_the_four_fields_of_a_corner_is_kept_once() -> None:
     # Four fields meet at a corner; each sees the cell at another distance from
     # its own edge, the first one at the centre of its frame.

@@ -21,6 +21,7 @@ import threading
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -43,6 +44,7 @@ from smc.plugins.slots import (
     load_cells,
 )
 from smc.run import RunDocument, StageRecord, StageStatus, write_stage
+from smc.run.files import AtomicWriteError
 
 pytestmark = pytest.mark.demo
 
@@ -110,7 +112,10 @@ def _seed_scan(
     folder = tmp_path / "scan" / "t"
     folder.mkdir(parents=True, exist_ok=True)
     scan_frames = []
+    fields_of: dict[str, int] = {}
     for position, (well, x_um) in enumerate(frames):
+        field = fields_of.get(well, 0)
+        fields_of[well] = field + 1
         name = _frame_name(position)
         tifffile.imwrite(
             folder / f"{name}.tif", np.full(SHAPE, position, dtype=np.uint16)
@@ -118,7 +123,7 @@ def _seed_scan(
         scan_frames.append(
             ScanFrame(
                 well=well,
-                index=position,
+                index=field,
                 name=name,
                 file=f"scan/t/{name}.tif",
                 x_um=x_um,
@@ -279,9 +284,10 @@ def test_the_parameters_reach_the_detector(
     weights = _weights(tmp_path)
     calls = _install(monkeypatch, _Stub({}))
 
-    _run(demo_microscope, tmp_path, score_threshold=0.8)
+    record = _run(demo_microscope, tmp_path, score_threshold=0.8)
 
     assert calls == [{"path": weights, "device": "cpu", "threshold": 0.8}]
+    assert _result(record).score_threshold == 0.8
 
 
 def test_max_overlap_reaches_the_suppression_of_a_frame(
@@ -312,8 +318,14 @@ def test_the_result_names_the_model_file_never_its_path(
 
     assert _result(record).model == "w.pth"
     text = json.dumps(record.result)
+    # json.dumps doubles every backslash: a Windows path leaks as its escaped
+    # spelling, which `str(tmp_path)` is not (FM-43). The folder name is the
+    # test id, which nothing of the result holds.
+    escaped = json.dumps(str(tmp_path))[1:-1]
     assert str(tmp_path) not in text
+    assert escaped not in text
     assert tmp_path.as_posix() not in text
+    assert tmp_path.name not in text
 
 
 @pytest.mark.parametrize(
@@ -350,6 +362,7 @@ def test_the_merge_radius_is_named_as_chosen_and_not_measured(
         "not measured",
     )
     assert off.assumed == ()
+    assert (chosen.merge_radius_um, off.merge_radius_um) == (3.5, 0.0)
 
 
 # --------------------------------------------------------------- bad frames
@@ -660,3 +673,280 @@ def test_progress_counts_every_frame_once(
     assert {p.total for p in first + second} == {4}
     assert second[-1].done == len(TWO_WELLS)
     assert second[0].message == "A2 f2"
+
+
+# ------------------------------------------------- review of #23: what was missed
+
+
+# A3 has two frames: a stop asked for during its first one is looked at before the second.
+THREE_WELLS = [
+    ("A1", 0.0),
+    ("A1", 30.0),
+    ("A2", 0.0),
+    ("A2", 30.0),
+    ("A3", 0.0),
+    ("A3", 30.0),
+]
+SCRIPT_OF_THREE = {**SCRIPT, 4: [OWN]}
+
+
+def test_the_parameters_default_to_the_designs_values() -> None:
+    params = CellsParams()
+
+    assert params.model_path is None
+    assert params.device == "auto"
+    assert params.score_threshold == 0.5
+    assert params.max_overlap == 0.7
+    assert params.merge_radius_um == 5.0
+
+
+def test_seconds_per_frame_is_the_mean_of_the_detect_times(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_scan(tmp_path, frames=[("A1", 0.0), ("A1", 30.0)])
+    _weights(tmp_path)
+    _install(monkeypatch, _Stub({}))
+    # Two detects, which last 1 s and 3 s: the mean is 2, not the sum.
+    ticks = iter([0.0, 1.0, 10.0, 13.0])
+    monkeypatch.setattr(
+        plugin_mod, "time", SimpleNamespace(perf_counter=lambda: next(ticks))
+    )
+
+    record = _run(demo_microscope, tmp_path)
+
+    assert _result(record).seconds_per_frame == 2.0
+
+
+def test_the_merge_uses_the_scans_frame_shape_and_not_its_transpose(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The unit tests pin the merge on a shape; this pins the shape the plugin gives it (FM-73).
+
+    One cell, at column 55 of the first frame (24.5 px from its right edge) and
+    at column 12 of the second (12.5 px from its left edge). With the shape the
+    wrong way round the first view would be 4.5 px from an edge and lose.
+    """
+    _seed_scan(tmp_path, frames=[("A1", 0.0), ("A1", 21.0)])
+    _weights(tmp_path)
+    _install(
+        monkeypatch,
+        _Stub(
+            {
+                0: [Detection(25.0, 50.0, 35.0, 60.0, "single", 0.9)],
+                1: [Detection(25.0, 7.0, 35.0, 17.0, "single", 0.9)],
+            }
+        ),
+    )
+
+    record = _run(demo_microscope, tmp_path)
+
+    assert _result(record).merged == 1
+    assert [c.frame for c in _cells(tmp_path, record)] == [0]
+
+
+def test_a_fallback_resume_does_not_leave_a_checkpoint_that_claims_more_than_the_partial_holds(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The partial file is lost, and the fallback's first checkpoint write fails.
+
+    The fallback rewrites the partial with the first well only; a checkpoint
+    that still named two wells would make the next resume skip a well whose
+    cells are not in the file, and record a ``done`` result with zeros (FM-111).
+    """
+    _seed_scan(tmp_path, frames=THREE_WELLS)
+    _weights(tmp_path)
+    stop = threading.Event()
+    _install(monkeypatch, _Stub(SCRIPT_OF_THREE, on_frame=_stopping_at(4, stop)))
+    stopped = _run(demo_microscope, tmp_path, stop=stop)
+    assert stopped.checkpoint is not None
+    assert stopped.checkpoint["wells_done"] == ["A1", "A2"]
+    token = stopped.checkpoint["token"]
+    (tmp_path / "cells" / f"{token}.partial.json").unlink()
+
+    _install(monkeypatch, _Stub(SCRIPT_OF_THREE))
+    saved = RunContext.save_checkpoint
+    calls: list[BaseModel] = []
+
+    def crash_on_the_second(self: RunContext, state: BaseModel) -> None:
+        calls.append(state)
+        if len(calls) == 2:  # the first is the fallback's own; the second names A1
+            raise RuntimeError("the run document is gone")
+        saved(self, state)
+
+    monkeypatch.setattr(RunContext, "save_checkpoint", crash_on_the_second)
+    with pytest.raises(RuntimeError, match="gone"):
+        _run(demo_microscope, tmp_path, resume=True)
+    monkeypatch.undo()
+    failed = _stored(tmp_path)
+    assert failed.checkpoint is not None
+    assert failed.checkpoint["wells_done"] == []
+
+    counting = _Stub(SCRIPT_OF_THREE)
+    _install(monkeypatch, counting)
+    result = _result(_run(demo_microscope, tmp_path, resume=True))
+
+    assert counting.seen == [0, 1, 2, 3, 4, 5]
+    assert result.counts["A2"] == {"single": 1, "doublet": 1, "debris": 0}
+    assert result.counts["A3"] == {"single": 0, "doublet": 1, "debris": 0}
+
+
+def test_a_partial_file_with_a_label_the_detector_does_not_declare_redoes_every_well(
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _seed_scan(tmp_path)
+    _weights(tmp_path)
+    stopped = _stop_in_the_second_well(demo_microscope, tmp_path, monkeypatch)
+    assert stopped.checkpoint is not None
+    token = stopped.checkpoint["token"]
+    alien = Cell(
+        well="A1",
+        x_um=0.0,
+        y_um=0.0,
+        label="alien",
+        score=0.5,
+        frame=0,
+        box_px=(0.0, 0.0, 1.0, 1.0),
+    )
+    partial = tmp_path / "cells" / f"{token}.partial.json"
+    partial.write_bytes(CellsFile(cells=(alien,)).model_dump_json().encode("ascii"))
+    counting = _Stub(SCRIPT)
+    _install(monkeypatch, counting)
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        record = _run(demo_microscope, tmp_path, resume=True)
+
+    assert counting.seen == [0, 1, 2, 3]
+    assert any("alien" in r.getMessage() for r in caplog.records if r.name == LOGGER)
+    assert {c.label for c in _cells(tmp_path, record)} == {"single", "doublet"}
+
+
+def test_a_partial_file_that_is_locked_for_a_moment_is_still_used(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An antivirus holds the file the stage wrote a moment ago: the read is retried (FM-24)."""
+    _seed_scan(tmp_path)
+    _weights(tmp_path)
+    _stop_in_the_second_well(demo_microscope, tmp_path, monkeypatch)
+    counting = _Stub(SCRIPT)
+    _install(monkeypatch, counting)
+    real = Path.read_bytes
+    refused: list[str] = []
+
+    def locked_once(self: Path) -> bytes:
+        if self.name.endswith(".partial.json") and not refused:
+            refused.append(self.name)
+            raise PermissionError(13, "in use")
+        return real(self)
+
+    monkeypatch.setattr(Path, "read_bytes", locked_once)
+
+    record = _run(demo_microscope, tmp_path, resume=True)
+
+    assert refused
+    assert counting.seen == [2, 3]  # the partial was read in the end
+    assert _result(record).merged == 2
+
+
+def test_both_cells_files_are_written_atomically(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Never a half file, after a Ctrl-C or a full disk: every write goes through ``write_atomically`` (FM-38)."""
+    _seed_scan(tmp_path)
+    _weights(tmp_path)
+    _install(monkeypatch, _Stub(SCRIPT))
+    real = plugin_mod.write_atomically
+    written: list[str] = []
+
+    def spy(path: Path, data: bytes, **kwargs: Any) -> None:
+        written.append(path.name)
+        real(path, data, **kwargs)
+
+    monkeypatch.setattr(plugin_mod, "write_atomically", spy)
+
+    record = _run(demo_microscope, tmp_path)
+
+    token = _result(record).file.removeprefix("cells/").removesuffix(".json")
+    # One partial file per well, then the final one.
+    assert written == [f"{token}.partial.json"] * 2 + [f"{token}.json"]
+
+
+def test_a_final_file_that_cannot_be_written_fails_the_stage_and_a_resume_finishes_it(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The partial file is the only saved work: it stays until the final file exists."""
+    _seed_scan(tmp_path)
+    _weights(tmp_path)
+    _install(monkeypatch, _Stub(SCRIPT))
+    real = plugin_mod.write_atomically
+
+    def disk_full_for_the_final_file(path: Path, data: bytes, **kwargs: Any) -> None:
+        if not path.name.endswith(".partial.json"):
+            raise AtomicWriteError(OSError(28, "No space left on device"))
+        real(path, data, **kwargs)
+
+    monkeypatch.setattr(plugin_mod, "write_atomically", disk_full_for_the_final_file)
+    with pytest.raises(PluginRunError) as caught:
+        _run(demo_microscope, tmp_path)
+    failed = _stored(tmp_path)
+    assert failed.status is StageStatus.failed
+    assert failed.checkpoint is not None
+    assert failed.checkpoint["wells_done"] == ["A1", "A2"]
+    token = failed.checkpoint["token"]
+    assert f"cells/{token}.json" in caught.value.reason
+    assert "No space left on device" in caught.value.reason
+    assert "--resume" in caught.value.reason
+    assert (tmp_path / "cells" / f"{token}.partial.json").is_file()
+
+    monkeypatch.setattr(plugin_mod, "write_atomically", real)
+    counting = _Stub(SCRIPT)
+    _install(monkeypatch, counting)
+    record = _run(demo_microscope, tmp_path, resume=True)
+
+    assert counting.seen == []  # every well was done
+    result = _result(record)
+    assert result.seconds_per_frame is None  # unknown, not 0: nothing was detected
+    assert result.merged == 2
+    assert len(_cells(tmp_path, record)) == 4
+
+
+def test_a_refused_rename_names_the_file_that_was_kept(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the rename failed: the whole new content waits in a hidden file, which the error names (FM-38)."""
+    _seed_scan(tmp_path)
+    _weights(tmp_path)
+    _install(monkeypatch, _Stub(SCRIPT))
+    kept = tmp_path / "cells" / ".abc.partial.json.1234abcd.smc-tmp"
+
+    def rename_refused(path: Path, data: bytes, **kwargs: Any) -> None:
+        raise AtomicWriteError(PermissionError(13, "Access is denied"), kept=kept)
+
+    monkeypatch.setattr(plugin_mod, "write_atomically", rename_refused)
+
+    with pytest.raises(PluginRunError) as caught:
+        _run(demo_microscope, tmp_path)
+
+    reason = caught.value.reason
+    assert "Access is denied" in reason
+    assert "cells/.abc.partial.json.1234abcd.smc-tmp" in reason
+    assert (
+        "free some space" not in reason
+    )  # the advice for a lock is not for a full disk
+    assert str(tmp_path) not in reason
+
+
+def test_weights_that_cannot_be_read_are_a_plugin_run_error(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The detector read the file a moment ago; a file replaced or locked since says so."""
+    _seed_scan(tmp_path)
+    _install(monkeypatch, _Stub({}))
+
+    # A folder where the weights should be: it opens as no file, on every OS.
+    with pytest.raises(PluginRunError) as caught:
+        _run(demo_microscope, tmp_path, model_path=tmp_path)
+
+    assert "cannot be read to hash it" in caught.value.reason

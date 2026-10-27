@@ -11,7 +11,9 @@ and the decisions in it that keep a long run from losing or faking its work:
 * **The weights are part of the result.** Their SHA-256 is in the checkpoint
   and in the result, and a resume with other weights is refused: cells of two
   models are not one result (FM-111). The result names the weights' file, never
-  its path, since run documents are attached to issues (FM-50).
+  its path, since run documents are attached to issues (FM-50). The parameter
+  ``model_path`` is the one place a path is recorded, as given, like every
+  parameter: ``SMC_MODELS`` is not recorded anywhere.
 * **A frame is checked before it is detected on.** The matrix of the scan is
   only right on the scan's own frame shape (FM-73), and a missing, corrupt or
   foreign frame is told by its file name with what to do.
@@ -280,9 +282,13 @@ def _resume(
     weights must be the ones that made it, and its token is kept so that the
     final file is the one the partial file leads to. A missing or invalid
     partial file means no well is done: every well is detected again under the
-    same token, which is slower and never wrong. A cell of the partial file
-    whose well is not in ``wells_done`` came from a crash between the file and
-    the checkpoint, and is dropped.
+    same token, which is slower and never wrong (``_redo_every_well`` resets the
+    stored checkpoint first). A cell of the partial file whose well is not in
+    ``wells_done`` came from a crash between the file and the checkpoint, and is
+    dropped. What a valid partial file cannot show is a well that has no cell:
+    a copy of the run folder made mid-run, with an older partial file than its
+    checkpoint, would be taken at its word (a count of cells in the checkpoint
+    would tell; it is a follow-up, the checkpoint's fields being fixed).
     """
     checkpoint = ctx.checkpoint(CellsCheckpoint)
     if checkpoint is None:
@@ -305,7 +311,7 @@ def _resume(
             where,
             _why(exc),
         )
-        return checkpoint.token, [], [], 0
+        return _redo_every_well(ctx, checkpoint.token, sha256)
     index = scan.frame_index()
     done = [well for well in checkpoint.wells_done if well in index]
     kept = [cell for cell in loaded.cells if cell.well in done]
@@ -317,8 +323,25 @@ def _resume(
                 where,
                 cell.label,
             )
-            return checkpoint.token, [], [], 0
+            return _redo_every_well(ctx, checkpoint.token, sha256)
     return checkpoint.token, kept, done, checkpoint.merged
+
+
+def _redo_every_well(
+    ctx: RunContext, token: str, sha256: str
+) -> tuple[str, list[Cell], list[str], int]:
+    """Nothing is done, and the stored checkpoint says so before the first well is redone.
+
+    The redo rewrites the partial file well by well. A stored checkpoint that
+    still named the wells of the lost file would, if the run ended before its
+    first new checkpoint, make the next resume trust a partial file that holds
+    fewer wells than that, skip the rest, and record a ``done`` result whose
+    counts for them are zero (FM-111).
+    """
+    ctx.save_checkpoint(
+        CellsCheckpoint(token=token, wells_done=(), model_sha256=sha256, merged=0)
+    )
+    return token, [], [], 0
 
 
 def _why(exc: Exception) -> str:
@@ -379,10 +402,18 @@ def _write_cells(run_dir: Path, path: Path, cells: list[Cell]) -> None:
     try:
         write_atomically(path, text.encode("ascii"))
     except AtomicWriteError as exc:
+        where = relative_to_run(run_dir, path)
+        if exc.kept is not None:
+            # Only the rename failed, which on Windows is a program holding the
+            # file: the whole new content waits in a hidden file (FM-38).
+            advice = (
+                f"the whole new file is kept as {relative_to_run(run_dir, exc.kept)}; "
+                f"close any program that holds {where}, then run with --resume"
+            )
+        else:
+            advice = "free some space or check the run folder, then run with --resume"
         raise PluginRunError(
-            _NAME,
-            f"cannot write {relative_to_run(run_dir, path)} ({exc.strerror or exc}); "
-            f"free some space or check the run folder, then run with --resume",
+            _NAME, f"cannot write {where} ({exc.strerror or exc}); {advice}"
         ) from exc
 
 
