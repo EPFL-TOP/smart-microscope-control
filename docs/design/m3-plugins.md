@@ -2516,7 +2516,13 @@ not committed, numpy 2.5.3 on Python 3.13, numpy 1.26.0 and 2.2.6 on Python
   time). A refusal is a `GridTooFineError`, whose message gives the sizes
   formatted with `:.3g` (a step of 1e-300 would print 300 digits otherwise);
   the plugin turns it into a `PluginRunError` that names the well and says
-  to raise `area_grid_um`.
+  to raise `area_grid_um`. A corner beyond 1e12 µm (1000 km of stage) is a
+  `ValueError`: a corrupt record, and below it the arithmetic cannot overflow;
+  a footprint farther than that from the well but within it is ignored (the
+  extent is cut to the well), and the window indices are clipped on the
+  floats before they become integers (FM-75). With one extra frame at 1e9,
+  1e11 or 9.9e11 µm the 96-well area above is the same 32.1703 mm², with no
+  numpy warning on the three numpys.
 - **No matrix product** on coordinate arrays (FM-131), and a module-level
   `filterwarnings = error::RuntimeWarning` in the tests of the numeric
   module.
