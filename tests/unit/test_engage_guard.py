@@ -217,8 +217,13 @@ def test_the_relock_at_an_unseen_offset_raises_autofocus_lost_error_with_pfs_off
 
 
 def test_a_z_move_under_the_operators_lock_relocks_without_a_prior_read() -> None:
-    # suspend() reads the lock before the move ends it (m2 §12.4).
-    with _stand(_guarded(declared=True)) as stand:
+    # suspend() reads the lock before the move ends it (m2 §12.4). No band:
+    # with one, suspend() would read the lock for z_held anyway.
+    profile = _profile(
+        autofocus={"engage_drives_z_to_offset": True},
+        safety={"z_soft_limits_um": (10.0, 4350.0)},
+    )
+    with _stand(profile) as stand:
         stand.engage_directly()
         assert stand.z.move_to_um(4260.0) == 4260.0
         assert stand.core.log == [OFF, "setPosition('ZDrive', 4260.0)", ON]
