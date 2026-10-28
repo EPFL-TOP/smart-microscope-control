@@ -34,6 +34,7 @@ else:  # pragma: no cover - exercised on the 3.10 CI job
     import tomli as tomllib
 
 __all__ = [
+    "ROLES_WITH_A_STOP",
     "AutofocusSection",
     "CameraSection",
     "ChannelsSection",
@@ -151,6 +152,11 @@ def _check_ordered(limits: tuple[float, float], axis: str) -> None:
         )
 
 
+#: The roles whose device the layer stops, so the ones ``[safety]
+#: stop_refused_by`` may name (m2 §11.3).
+ROLES_WITH_A_STOP: tuple[Role, ...] = (Role.xy_stage, Role.focus, Role.autofocus_offset)
+
+
 class SafetySection(_Section):
     """Limits the facade enforces; ``None`` means no soft limit on that axis.
 
@@ -169,6 +175,29 @@ class SafetySection(_Section):
     max_autofocus_offset_jog: float | None = None
     #: In ``[autofocus] offset_unit``; not forceable.
     autofocus_offset_soft_limits: tuple[float, float] | None = None
+    #: The roles whose device refuses ``stop()``, measured at a stand (m2 §11).
+    #: The stop is still sent; the declaration changes what the layer says.
+    stop_refused_by: tuple[Role, ...] = ()
+
+    @field_validator("stop_refused_by", mode="before")
+    @classmethod
+    def _stop_refused_by_roles_with_a_stop(cls, value: Any) -> Any:
+        # Before the enum: "camera" is a role, but not one with a stop, and a
+        # misspelt role is told the three roles that can be named, not all ten.
+        if not isinstance(value, (list, tuple)):
+            return value
+        names = [getattr(entry, "value", entry) for entry in value]
+        allowed = ", ".join(role.value for role in ROLES_WITH_A_STOP)
+        for name in names:
+            if name not in {role.value for role in ROLES_WITH_A_STOP}:
+                raise ValueError(
+                    f"{name!r} is not a role with a stop; stop_refused_by lists "
+                    f"roles among {allowed}"
+                )
+        for name in names:
+            if names.count(name) > 1:
+                raise ValueError(f"stop_refused_by names {name!r} twice; name it once")
+        return value
 
     @field_validator("max_autofocus_offset_jog", mode="before")
     @classmethod

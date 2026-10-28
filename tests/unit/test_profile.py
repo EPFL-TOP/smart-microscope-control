@@ -890,6 +890,49 @@ def test_autofocus_offset_soft_limits_load(tmp_path: Path) -> None:
     assert Profile.load(path).safety.autofocus_offset_soft_limits == (0.0, 15000.0)
 
 
+# -- stop_refused_by (m2 §11.3) --------------------------------------------------
+
+
+def test_stop_refused_by_accepts_the_roles_with_a_stop(tmp_path: Path) -> None:
+    path = write_profile(
+        tmp_path / "p.toml",
+        '[safety]\nstop_refused_by = ["focus", "xy_stage", "autofocus_offset"]\n',
+    )
+    assert Profile.load(path).safety.stop_refused_by == (
+        Role.focus,
+        Role.xy_stage,
+        Role.autofocus_offset,
+    )
+    # Omitted, nothing is declared: the demo's stages take their stop.
+    assert Profile.demo().safety.stop_refused_by == ()
+
+
+def test_stop_refused_by_refuses_a_role_without_a_stop(tmp_path: Path) -> None:
+    # "camera" is a role, so the enum alone would let it through.
+    msg = _load_error(tmp_path, '[safety]\nstop_refused_by = ["camera"]\n')
+    assert (
+        "safety.stop_refused_by: 'camera' is not a role with a stop; stop_refused_by "
+        "lists roles among xy_stage, focus, autofocus_offset"
+    ) in msg
+
+
+def test_stop_refused_by_refuses_a_misspelt_role_listing_the_three(
+    tmp_path: Path,
+) -> None:
+    msg = _load_error(tmp_path, '[safety]\nstop_refused_by = ["xy"]\n')
+    assert "safety.stop_refused_by: 'xy' is not a role with a stop" in msg
+    assert "among xy_stage, focus, autofocus_offset" in msg
+
+
+def test_stop_refused_by_refuses_a_role_named_twice(tmp_path: Path) -> None:
+    msg = _load_error(
+        tmp_path, '[safety]\nstop_refused_by = ["xy_stage", "focus", "xy_stage"]\n'
+    )
+    assert (
+        "safety.stop_refused_by: stop_refused_by names 'xy_stage' twice; name it once"
+    ) in msg
+
+
 @pytest.mark.parametrize(
     ("body", "key", "name"),
     [
@@ -985,6 +1028,12 @@ def test_nikon_ti2_profile_holds_the_owner_limits_and_filter_turret2() -> None:
     assert loaded.autofocus.in_range_property == "PFS in Range"
     assert loaded.autofocus.in_range_values == ["In Range"]
     assert loaded.safety.max_autofocus_offset_jog == 50.0
+    # Every stop refused, still and moving (#208, m2 §11).
+    assert loaded.safety.stop_refused_by == (
+        Role.xy_stage,
+        Role.focus,
+        Role.autofocus_offset,
+    )
     # What no session has measured stays unknown, never guessed: the offset
     # device exposes no limits, and the lock time is not a settling time.
     assert loaded.camera.pixel_size_um == {}
@@ -1003,4 +1052,5 @@ def test_nikon_tie_profile_sets_no_limit_beyond_the_layers_defaults() -> None:
     assert loaded.safety.max_z_jog_um is None
     assert loaded.safety.z_soft_limits_um is None
     assert loaded.safety.xy_soft_limits_um is None
+    assert loaded.safety.stop_refused_by == ()
     assert loaded.camera.pixel_size_um == {}

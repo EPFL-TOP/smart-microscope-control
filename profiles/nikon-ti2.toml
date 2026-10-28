@@ -27,6 +27,7 @@ turret_requires_confirm = true
 max_autofocus_offset_jog = 50.0                  # in [autofocus] offset_unit
 # Unknown: PFSOffset exposes no property limits (#208); values seen so far 7803-9420.
 # autofocus_offset_soft_limits = [..., ...]
+stop_refused_by = ["xy_stage", "focus", "autofocus_offset"]  # measured, session 1 (#208): "Unsupported device command (11)", still and moving
 
 [autofocus]
 # Measured in session 1 (#208), 10x only: docs/hardware/nikon-ti2.md, Session 1.

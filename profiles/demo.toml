@@ -25,6 +25,7 @@ z_soft_limits_um = [-1000.0, 1000.0]
 turret_requires_confirm = true
 # max_autofocus_offset_jog = 50.0                # in [autofocus] offset_unit; omitted: every relative offset change needs force=True
 # autofocus_offset_soft_limits = [0.0, 15000.0]  # in [autofocus] offset_unit; not forceable
+# stop_refused_by = []  # roles whose device refuses stop(): "xy_stage", "focus", "autofocus_offset"; measured at a stand (m2 §11)
 
 [autofocus]
 # The demo's DAutoFocus measures nothing, so every key is left unknown.
