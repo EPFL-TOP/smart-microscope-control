@@ -1,0 +1,577 @@
+"""``scan`` moves to every field of a scan plan, takes a frame and writes it as a TIFF (m3 §8).
+
+A port of ``nikon-control``'s ``scan.run_iter``, redesigned around the layer.
+The pure part (the fields left, the paths, the disk, the focus state, the
+encoding) is ``algorithm.py``. This is the loop, and the decisions in it that
+keep a night's scan from producing frames nobody can trust:
+
+* **Everything that can be checked is checked before anything moves** (FM-30):
+  the checkpoint being resumed and its files, every frame's path, the objective
+  in place, the camera's frame and pixel size against the plan's, the
+  autofocus, the free disk. A refusal leaves the stage where it was and writes
+  no file.
+* **The stand is checked again at every well.** A turret turned by hand, a
+  binning changed, the magnifier lever moved (FM-103) make every later frame
+  the wrong size for the plan's matrix: the scan ends, and the checkpoint keeps
+  the wells done.
+* **A field that fails is recorded and skipped; a halt is not a failure**
+  (FM-64). ``max_failed_in_row`` failures in a row end the scan: a stage that
+  refuses every move must not read as a scan of failed fields.
+* **The autofocus is used only as the operator left it.** One the operator
+  left off is never engaged, and one that is on must have locked on this
+  sample: engaging drives Z to the plane of whatever offset is stored (#205),
+  which only a lock on this sample shows is the operator's.
+* **Nothing moves to put something back** (FM-88): no Z move, no turret turn,
+  no return to a start position, no ``finally`` that moves.
+"""
+
+from __future__ import annotations
+
+import math
+import shutil
+import time
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Literal
+
+import numpy as np
+from pydantic import BaseModel, ConfigDict, Field
+
+from smc.hardware.capabilities import (
+    Autofocus,
+    Camera,
+    ObjectiveTurret,
+    XYStage,
+    ZStage,
+)
+from smc.hardware.errors import HardwareError, MicroscopeHaltedError, MotionStoppedError
+from smc.plugins.api import PluginParams, RunContext
+from smc.plugins.errors import PluginRunError
+from smc.plugins.scan.algorithm import (
+    CALIBRATION_TOLERANCE,
+    PROFILE_TOLERANCE,
+    bytes_needed,
+    encode_frame,
+    focus_state,
+    frame_path,
+    itemsize_of,
+    size_differs,
+    wells_to_scan,
+)
+from smc.plugins.slots import (
+    FailedField,
+    PlannedField,
+    ScanFrame,
+    ScanPlanResult,
+    ScanResult,
+)
+from smc.run.files import new_token, resolve_in_run, write_atomically
+
+if TYPE_CHECKING:
+    from smc.hardware.microscope import Microscope
+
+__all__ = ["ScanCheckpoint", "ScanParams", "ScanPlugin"]
+
+_NAME = "scan"
+_AGAIN = "run scan-plan again with the stand as it is now"
+
+
+class ScanParams(PluginParams):
+    """How the autofocus is used, and how many bad fields in a row end the scan."""
+
+    autofocus: Literal["if-engaged", "required", "off"] = Field(
+        "if-engaged",
+        description=(
+            "if-engaged: use it when it is on and locked; required: refuse to "
+            "start unless it is; off: never touch it. It is never switched on "
+            "by the scan."
+        ),
+    )
+    max_failed_in_row: int = Field(
+        3,
+        ge=1,
+        le=100,
+        description="This many fields failing in a row end the scan.",
+    )
+    max_unlocked_in_row: int = Field(
+        5,
+        ge=1,
+        le=1000,
+        description=(
+            "This many fields in a row on which the autofocus would not lock "
+            "end the scan."
+        ),
+    )
+
+
+class ScanCheckpoint(BaseModel):
+    """What a resume needs: the frames' token, the wells done, their frames and failed fields.
+
+    The token is a path part, so it is held to what ``new_token`` makes: a
+    checkpoint edited to ``../..`` is refused when it is read, before
+    anything moves.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+
+    token: str = Field(pattern=r"^[0-9a-f]{12}$")
+    wells_done: tuple[str, ...]
+    frames: tuple[ScanFrame, ...]
+    failed: tuple[FailedField, ...]
+
+
+@dataclass
+class _Stand:
+    """What the checks before the scan found, and what the loop reads again."""
+
+    turret: ObjectiveTurret | None
+    #: The camera's pixel size at the start; ``None`` when it reported none.
+    p0: float | None
+    exposure_ms: float
+    autofocus: Autofocus | None
+    #: Whether the scan uses the autofocus: it was on and locked at the start.
+    used: bool
+    assumed: list[str] = field(default_factory=list)
+
+
+class ScanPlugin:
+    """Moves to each field of the scan plan and writes one TIFF per field."""
+
+    name = _NAME
+    summary = (
+        "Move to every field of the scan plan and write one TIFF per field, "
+        "with the stage's readback and the focus state."
+    )
+    Params = ScanParams
+    Result = ScanResult
+    requires: tuple[type, ...] = (XYStage, Camera)
+    provides = "scan"
+    reads: tuple[str, ...] = ("scan-plan",)
+    reads_optional: tuple[str, ...] = ()
+
+    def run(
+        self,
+        microscope: Microscope,
+        params: ScanParams,
+        ctx: RunContext,
+    ) -> ScanResult:
+        """Check the stand, then scan well by well, checkpointing after each.
+
+        Raises:
+            PluginRunError: A check before the scan refused it (nothing moved);
+                the stand changed at a well; ``max_failed_in_row`` fields
+                failed or ``max_unlocked_in_row`` would not lock in a row; a
+                frame came back in another shape. The checkpoint keeps the
+                wells done.
+            MicroscopeHaltedError, MotionStoppedError: The stand was stopped;
+                the scan ends where it is.
+            StopRequested: The operator stopped it; ``--resume`` continues.
+            OSError: A frame could not be written (a full disk is not a
+                field's fault).
+        """
+        xy = microscope.require(XYStage)
+        camera = microscope.require(Camera)
+        plan = ctx.upstream("scan-plan", ScanPlanResult)
+
+        token, wells_done, frames, failed = _resume(ctx, plan)
+        paths = _paths(ctx, plan, token)
+        stand = _check_stand(microscope, camera, plan, params)
+        groups = wells_to_scan(plan.wells, plan.fields, set(wells_done))
+        total = sum(len(fields) for _, fields in groups)
+        _check_disk(ctx, camera, plan, total)
+
+        z_stage = microscope.get(ZStage)
+        af = stand.autofocus
+        done = 0
+        failed_in_row = 0
+        unlocked_in_row = 0
+        engaged_again = 0
+        t0 = time.monotonic()
+        for well, fields in groups:
+            _check_well(camera, plan, stand, well)
+            for planned in fields:
+                ctx.raise_if_stopped()
+                error: str | None = None
+                try:
+                    readback = xy.move_to_um(planned.x_um, planned.y_um)
+                    if not ctx.dry_run:
+                        locked = False
+                        if stand.used and af is not None:
+                            locked = af.is_locked()
+                            if not locked:
+                                locked = af.engage()
+                                engaged_again += 1
+                            unlocked_in_row = 0 if locked else unlocked_in_row + 1
+                            if unlocked_in_row >= params.max_unlocked_in_row:
+                                raise PluginRunError(
+                                    _NAME,
+                                    f"the autofocus did not lock on {unlocked_in_row} "
+                                    f"fields in a row, the last {planned.name}; the "
+                                    f"checkpoint keeps {len(wells_done)} wells: "
+                                    "lock it on the sample, then run scan --resume",
+                                )
+                        z_um = z_stage.position_um() if z_stage is not None else None
+                        pfs_offset = (
+                            af.offset_native()
+                            if stand.used and af is not None
+                            else None
+                        )
+                        pixels = camera.snap()
+                except (MicroscopeHaltedError, MotionStoppedError):
+                    raise
+                except HardwareError as exc:
+                    error = _one_line(exc)
+
+                done += 1
+                if error is not None:
+                    failed.append(
+                        FailedField(
+                            well=planned.well,
+                            index=planned.index,
+                            name=planned.name,
+                            x_um=planned.x_um,
+                            y_um=planned.y_um,
+                            error=error,
+                        )
+                    )
+                    failed_in_row += 1
+                    ctx.progress(done, total, planned.name)
+                    if failed_in_row >= params.max_failed_in_row:
+                        raise PluginRunError(
+                            _NAME,
+                            f"{failed_in_row} fields failed in a row, the last "
+                            f"{planned.name}: {error}; the checkpoint keeps "
+                            f"{len(wells_done)} wells: check the stage, then run "
+                            "scan --resume",
+                        )
+                    continue
+
+                failed_in_row = 0
+                if not ctx.dry_run:
+                    frames.append(
+                        _write_frame(
+                            ctx,
+                            plan,
+                            planned,
+                            paths[planned.well, planned.name],
+                            np.asarray(pixels),
+                            ScanFrame(
+                                well=planned.well,
+                                index=planned.index,
+                                name=planned.name,
+                                file=paths[planned.well, planned.name],
+                                x_um=readback.x_um,
+                                y_um=readback.y_um,
+                                z_um=z_um,
+                                focus=focus_state(af is not None, stand.used, locked),
+                                pfs_offset=pfs_offset,
+                                t_s=time.monotonic() - t0,
+                            ),
+                        )
+                    )
+                ctx.progress(done, total, planned.name)
+
+            wells_done.append(well)
+            ctx.save_checkpoint(
+                ScanCheckpoint(
+                    token=token,
+                    wells_done=tuple(wells_done),
+                    frames=tuple(frames),
+                    failed=tuple(failed),
+                )
+            )
+
+        assumed = stand.assumed
+        if engaged_again:
+            assumed.append(f"the autofocus was engaged again on {engaged_again} fields")
+        if ctx.dry_run:
+            assumed.append(f"dry run: {done} fields walked, no frame taken")
+        return ScanResult(
+            folder=f"scan/{token}",
+            objective=plan.objective,
+            pixel_size_um=plan.pixel_size_um,
+            matrix_um_per_px=plan.matrix_um_per_px,
+            image_shape_px=plan.image_shape_px,
+            exposure_ms=stand.exposure_ms,
+            # A dry run took no frame, whatever a resumed checkpoint holds.
+            frames=() if ctx.dry_run else tuple(frames),
+            failed=tuple(failed),
+            assumed=tuple(assumed),
+        )
+
+
+def _resume(
+    ctx: RunContext, plan: ScanPlanResult
+) -> tuple[str, list[str], list[ScanFrame], list[FailedField]]:
+    """The token, wells done, frames and failed fields to continue from; or a fresh start.
+
+    A checkpoint's wells must be the plan's, and every frame it names must
+    still be in the run folder: a result that names a file nobody can read is
+    not a scan, and the cells stage would find out hours later.
+    """
+    checkpoint = ctx.checkpoint(ScanCheckpoint)
+    if checkpoint is None:
+        return new_token(), [], [], []
+    foreign = [well for well in checkpoint.wells_done if well not in plan.wells]
+    if foreign:
+        raise PluginRunError(
+            _NAME,
+            f"the checkpoint names well {foreign[0]}, which the scan plan does not "
+            "have: run scan without --resume",
+        )
+    missing = [
+        frame.file
+        for frame in checkpoint.frames
+        if not _is_file_in_run(ctx, frame.file)
+    ]
+    if missing:
+        raise PluginRunError(
+            _NAME,
+            f"{len(missing)} of the checkpoint's {len(checkpoint.frames)} frame files "
+            f"are missing from the run folder, the first {missing[0]}: run scan "
+            "without --resume",
+        )
+    return (
+        checkpoint.token,
+        list(checkpoint.wells_done),
+        list(checkpoint.frames),
+        list(checkpoint.failed),
+    )
+
+
+def _is_file_in_run(ctx: RunContext, relative: str) -> bool:
+    """Whether ``relative`` is a file inside the run folder; a path that leaves it is not."""
+    try:
+        return resolve_in_run(ctx.run_dir, relative).is_file()
+    except ValueError:
+        return False
+
+
+def _paths(
+    ctx: RunContext, plan: ScanPlanResult, token: str
+) -> dict[tuple[str, str], str]:
+    """Every field's frame path, keyed by well and name; refused before anything moves.
+
+    The plan is a run document's, which may have been edited or copied: a
+    field of a well the plan does not list, a name that is not a file name, or
+    two fields sharing one file are refused here, not at the field.
+    """
+    wells = set(plan.wells)
+    paths: dict[tuple[str, str], str] = {}
+    for planned in plan.fields:
+        if planned.well not in wells:
+            raise PluginRunError(
+                _NAME,
+                f"field {planned.name!r} is of well {planned.well!r}, which the "
+                f"scan plan does not list: {_AGAIN}",
+            )
+        problem = ""
+        try:
+            path = frame_path(token, planned.well, planned.name)
+            resolve_in_run(ctx.run_dir, path)
+        except ValueError as exc:
+            problem = str(exc)
+        if problem:
+            # Raised outside the handler: nothing here keeps the path's error.
+            raise PluginRunError(
+                _NAME, f"field {planned.name!r} of well {planned.well!r}: {problem}"
+            )
+        key = (planned.well, planned.name)
+        if key in paths:
+            raise PluginRunError(
+                _NAME,
+                f"two fields of well {planned.well} are named {planned.name}, so "
+                f"they would write one file: {_AGAIN}",
+            )
+        paths[key] = path
+    return paths
+
+
+def _check_stand(
+    microscope: Microscope,
+    camera: Camera,
+    plan: ScanPlanResult,
+    params: ScanParams,
+) -> _Stand:
+    """The objective, the camera and the autofocus, checked in this order before anything moves (FM-30)."""
+    assumed: list[str] = []
+
+    turret = microscope.get(ObjectiveTurret)
+    if turret is None:
+        assumed.append("the objective was not checked: the stand has no turret")
+    elif plan.objective is None:
+        assumed.append(
+            "the plan names no objective: the objective in place was not checked"
+        )
+        turret = None
+    else:
+        current = turret.current()
+        if current != plan.objective:
+            raise PluginRunError(
+                _NAME,
+                f"the objective in place is {current!r}; the scan was planned for "
+                f"{plan.objective!r}. Turn the turret to {plan.objective!r} (smc "
+                "never turns it during a scan), or run scan-plan again with "
+                f"objective={current}",
+            )
+
+    _check_shape(camera, plan, "")
+    exposure_ms = camera.exposure_ms()
+    p0: float | None = camera.pixel_size_um()
+    if not (p0 is not None and math.isfinite(p0) and p0 > 0.0):
+        # FM-104: 0 is "not measured", and infinity is above 0.
+        p0 = None
+        assumed.append(
+            "the camera reports no pixel size: the plan's size and a change during "
+            "the scan were not checked"
+        )
+    elif plan.matrix_source == "parameter":
+        assumed.append(
+            "the plan's pixel size was given as a parameter: not compared with "
+            "the camera's"
+        )
+    else:
+        tolerance = (
+            PROFILE_TOLERANCE
+            if plan.matrix_source == "profile"
+            else CALIBRATION_TOLERANCE
+        )
+        if size_differs(p0, plan.pixel_size_um, tolerance):
+            again = (
+                "run camera-calibration, then scan-plan, again with the stand as it is now"
+                if plan.matrix_source == "camera-calibration"
+                else _AGAIN
+            )
+            raise PluginRunError(
+                _NAME,
+                f"the camera reports {p0:g} µm per pixel; the plan was made for "
+                f"{plan.pixel_size_um:g} µm ({plan.matrix_source}), more than "
+                f"{tolerance:.0%} away (a binning, the magnifier lever): {again}",
+            )
+
+    af, used = _check_autofocus(microscope, params)
+    return _Stand(
+        turret=turret,
+        p0=p0,
+        exposure_ms=exposure_ms,
+        autofocus=af,
+        used=used,
+        assumed=assumed,
+    )
+
+
+def _check_autofocus(
+    microscope: Microscope, params: ScanParams
+) -> tuple[Autofocus | None, bool]:
+    """The autofocus and whether the scan uses it; refused when it cannot be used as asked.
+
+    ``off`` reads nothing from it. Otherwise it is used only when it is on and
+    locked now: engaging it would drive Z to the plane of whatever offset is
+    stored, and only a lock on this sample shows that offset is the
+    operator's (#205).
+    """
+    af = microscope.get(Autofocus)
+    if params.autofocus == "off":
+        return af, False
+    engaged = af is not None and af.is_engaged()
+    locked = engaged and af is not None and af.is_locked()
+    if params.autofocus == "required" and not locked:
+        raise PluginRunError(
+            _NAME,
+            "autofocus=required, and the autofocus is "
+            f"{'missing' if af is None else 'on but not locked' if engaged else 'off'}: "
+            "engage PFS on the stand and let it lock on the sample before the scan",
+        )
+    if engaged and not locked:
+        raise PluginRunError(
+            _NAME,
+            "the autofocus is on but not locked: lock it on the sample, or switch "
+            "it off and run with autofocus=off",
+        )
+    return af, locked
+
+
+def _check_disk(
+    ctx: RunContext, camera: Camera, plan: ScanPlanResult, n_fields: int
+) -> None:
+    """Refuse a scan whose frames the run folder's disk cannot hold, before the first move."""
+    need = bytes_needed(n_fields, plan.image_shape_px, itemsize_of(camera.bit_depth()))
+    free = shutil.disk_usage(ctx.run_dir).free
+    if free <= need:
+        raise PluginRunError(
+            _NAME,
+            f"the run folder's disk has {free / 1e6:,.1f} MB free and the "
+            f"{n_fields} frames need {need / 1e6:,.1f} MB: free some space, or "
+            "put the run document on another disk",
+        )
+
+
+def _check_shape(camera: Camera, plan: ScanPlanResult, where: str) -> None:
+    """The camera's frame must be the plan's: the matrix is only right on it (FM-73)."""
+    height, width = camera.image_shape()
+    shape = (int(height), int(width))
+    if shape != tuple(plan.image_shape_px):
+        raise PluginRunError(
+            _NAME,
+            f"the camera gives frames of {shape} pixels{where}; the plan was made "
+            f"for {tuple(plan.image_shape_px)}: set the binning and region of "
+            f"interest back, or {_AGAIN}",
+        )
+
+
+def _check_well(camera: Camera, plan: ScanPlanResult, stand: _Stand, well: str) -> None:
+    """Before a well's first field: the objective, the frame and the pixel size are still the start's (FM-103).
+
+    A ``HardwareError`` from these reads is the stand's, not a field's: it ends
+    the scan.
+    """
+    at = f" at well {well}"
+    resume = "then run scan --resume"
+    if stand.turret is not None:
+        current = stand.turret.current()
+        if current != plan.objective:
+            raise PluginRunError(
+                _NAME,
+                f"the objective in place is now {current!r}{at}; the scan was "
+                f"planned for {plan.objective!r}: turn the turret back to "
+                f"{plan.objective!r}, {resume}",
+            )
+    _check_shape(camera, plan, at)
+    if stand.p0 is not None:
+        now = camera.pixel_size_um()
+        if not math.isfinite(now) or size_differs(now, stand.p0, PROFILE_TOLERANCE):
+            raise PluginRunError(
+                _NAME,
+                f"the camera reports {now:g} µm per pixel{at}, {stand.p0:g} at the "
+                "start of the scan (the magnifier lever, a binning): set it back, "
+                f"{resume}",
+            )
+
+
+def _write_frame(
+    ctx: RunContext,
+    plan: ScanPlanResult,
+    planned: PlannedField,
+    path: str,
+    pixels: np.ndarray,
+    meta: ScanFrame,
+) -> ScanFrame:
+    """Write one frame whole (FM-38) and return its record; a frame of another shape is not written.
+
+    An ``OSError`` writing it propagates: a full disk or a lost share is not
+    the field's fault, and every next frame would fail the same way.
+    """
+    if tuple(pixels.shape) != tuple(plan.image_shape_px):
+        raise PluginRunError(
+            _NAME,
+            f"the frame of {planned.name} has shape {tuple(pixels.shape)}; the "
+            f"plan's frames are {tuple(plan.image_shape_px)}: check the camera's "
+            "binning and region of interest, then run scan --resume",
+        )
+    write_atomically(resolve_in_run(ctx.run_dir, path), encode_frame(pixels, meta))
+    return meta
+
+
+def _one_line(exc: BaseException) -> str:
+    """``<Type>: <first line of the message>``: a failed field's error, for a table."""
+    lines = str(exc).splitlines()
+    return f"{type(exc).__name__}: {lines[0] if lines else ''}".rstrip()

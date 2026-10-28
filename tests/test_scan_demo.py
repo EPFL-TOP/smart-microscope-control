@@ -1,0 +1,1033 @@
+"""``scan`` on the demo devices: what is refused before anything moves, what ends a scan, what is resumed (m3 §8, #213).
+
+The plan is a real ``scan-plan`` run on a seeded 96-well plate: wells A1, A2
+and B2, 2 x 2 fields each without clipping, so 12 fields, 4 per well, with
+the 10x in place and the camera's own 1.0 µm per pixel. The camera is a
+``SampleCamera`` with a frame that is not square (FM-73). The XY stage is the
+demo's behind a wrapper that counts the moves, can add an offset to every
+move (so the readback differs from the target) and can fail a given move;
+the turret and the autofocus are fakes put in with ``Microscope.override``
+when a test is about them. Every refusal before the scan asserts that
+nothing moved and nothing was written.
+"""
+
+from __future__ import annotations
+
+import errno
+import math
+import shutil
+import threading
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import numpy as np
+import numpy.typing as npt
+import pytest
+import tifffile
+
+from smc.hardware import Microscope
+from smc.hardware.capabilities import (
+    XY,
+    Autofocus,
+    Camera,
+    FocusStep,
+    Limits,
+    ObjectiveTurret,
+    XYStage,
+    ZStage,
+)
+from smc.hardware.errors import (
+    HardwareError,
+    MicroscopeHaltedError,
+    MotionStoppedError,
+    SafetyRefusedError,
+)
+from smc.plugins import PluginRunError, Progress, load, run_plugin
+from smc.plugins.errors import ResumeError
+from smc.plugins.geometry import pixel_matrix
+from smc.plugins.scan.plugin import ScanCheckpoint, ScanParams, ScanPlugin
+from smc.plugins.scan_plan.plugin import ScanPlanParams, ScanPlanPlugin
+from smc.plugins.slots import (
+    CameraCalibration,
+    PlateResult,
+    ScanPlanResult,
+    ScanResult,
+    load_frame,
+)
+from smc.run import RunDocument, StageRecord, StageStatus, write_stage
+from smc.run.files import AtomicWriteError
+from smc.testing.synthetic import PlateSample, SampleCamera
+
+pytestmark = pytest.mark.demo
+
+SHAPE = (96, 128)  # (height, width): not square, on purpose (FM-73)
+PIXEL_UM = 1.0
+IN_PLACE = "Nikon 10X S Fluor"
+FORTY = "Nikon 40X Plan Fluor ELWD"
+PLAN = {"wells": "A1,A2,B2", "rows": 2, "columns": 2, "clip_to_well": False}
+MUTATING = {
+    "engage",
+    "disengage",
+    "set_offset_native",
+    "offset_by_native",
+    "focus_by_um",
+}
+
+
+# ------------------------------------------------------------------- the stand
+
+
+class _Stage:
+    """The demo's XY stage, counting moves; ``offset_um`` is added to every target."""
+
+    def __init__(self, inner: XYStage) -> None:
+        self.inner = inner
+        self.offset_um = (0.0, 0.0)
+        self.moves = 0
+        self.readbacks: list[XY] = []
+        self.fail: dict[int, BaseException] = {}
+        self.after_move: Callable[[int], None] | None = None
+
+    def position_um(self) -> XY:
+        return self.inner.position_um()
+
+    def move_to_um(self, x_um: float, y_um: float) -> XY:
+        self.moves += 1
+        if self.moves in self.fail:
+            raise self.fail[self.moves]
+        readback = self.inner.move_to_um(
+            x_um + self.offset_um[0], y_um + self.offset_um[1]
+        )
+        self.readbacks.append(readback)
+        if self.after_move is not None:
+            self.after_move(self.moves)
+        return readback
+
+    def move_by_um(self, dx_um: float, dy_um: float, *, force: bool = False) -> XY:
+        raise AssertionError("the scan makes no relative move")
+
+    def wait(self, timeout_s: float | None = None) -> None:
+        self.inner.wait(timeout_s)
+
+    def is_busy(self) -> bool:
+        return self.inner.is_busy()
+
+    def stop(self) -> None:
+        self.inner.stop()
+
+    def limits_um(self) -> tuple[Limits, Limits] | None:
+        return self.inner.limits_um()
+
+
+class _Camera(SampleCamera):
+    """A sample camera that counts snaps and can report another size, shape or frame."""
+
+    def __init__(self, microscope: Microscope, pixel_size_um: float = PIXEL_UM) -> None:
+        super().__init__(
+            microscope, PlateSample(), pixel_size_um=pixel_size_um, shape=SHAPE
+        )
+        self.snaps = 0
+        self.reported_um: float | None = None
+        self.reported_shape: tuple[int, int] | None = None
+        self.transposed_snap: int | None = None
+
+    def snap(self) -> npt.NDArray[np.uint16]:
+        self.snaps += 1
+        if self.snaps == self.transposed_snap:
+            return np.zeros((SHAPE[1], SHAPE[0]), dtype=np.uint16)
+        return super().snap()
+
+    def image_shape(self) -> tuple[int, int]:
+        return self.reported_shape if self.reported_shape is not None else SHAPE
+
+    def pixel_size_um(self) -> float:
+        return (
+            self.reported_um
+            if self.reported_um is not None
+            else super().pixel_size_um()
+        )
+
+
+class _Turret:
+    """A turret whose objective a test changes by hand; ``select`` is recorded, never wanted."""
+
+    def __init__(self, current: str = IN_PLACE) -> None:
+        self.now = current
+        self.selects: list[str] = []
+
+    def labels(self) -> list[str]:
+        return [FORTY, IN_PLACE]
+
+    def current(self) -> str:
+        return self.now
+
+    def select(self, label: str, *, confirm: bool = False) -> str:
+        self.selects.append(label)
+        self.now = label
+        return label
+
+    def pixel_size_um(self, label: str | None = None) -> float:
+        return PIXEL_UM
+
+
+class _Autofocus:
+    """An autofocus that records every call; ``engage`` takes its results from a list."""
+
+    def __init__(self, *, engaged: bool, locked: bool) -> None:
+        self.engaged = engaged
+        self.locked = locked
+        self.offset = 4242.0
+        self.calls: list[str] = []
+        #: What successive ``engage`` calls return (and leave); empty: they lock.
+        self.engage_results: list[bool] = []
+
+    def lose_lock(self) -> None:
+        self.locked = False
+
+    def is_engaged(self) -> bool:
+        self.calls.append("is_engaged")
+        return self.engaged
+
+    def is_locked(self) -> bool:
+        self.calls.append("is_locked")
+        return self.engaged and self.locked
+
+    def is_in_range(self) -> bool | None:
+        self.calls.append("is_in_range")
+        return None
+
+    def engage(self, timeout_s: float | None = None) -> bool:
+        self.calls.append("engage")
+        result = self.engage_results.pop(0) if self.engage_results else True
+        # A failed engage leaves it off (the protocol's promise).
+        self.engaged = self.locked = result
+        return result
+
+    def disengage(self) -> None:
+        self.calls.append("disengage")
+        self.engaged = self.locked = False
+
+    def offset_native(self) -> float:
+        self.calls.append("offset_native")
+        return self.offset
+
+    def set_offset_native(self, value: float) -> float:
+        self.calls.append("set_offset_native")
+        return value
+
+    def offset_by_native(self, delta: float, *, force: bool = False) -> float:
+        self.calls.append("offset_by_native")
+        return self.offset + delta
+
+    def offset_unit(self) -> str:
+        self.calls.append("offset_unit")
+        return ""
+
+    def offset_limits_native(self) -> tuple[float, float] | None:
+        self.calls.append("offset_limits_native")
+        return None
+
+    def focus_by_um(self, dz_um: float, *, force: bool = False) -> FocusStep:
+        self.calls.append("focus_by_um")
+        raise AssertionError("the scan never focuses")
+
+
+@dataclass
+class _Rig:
+    microscope: Microscope
+    stage: _Stage
+    camera: _Camera
+    run_doc: Path
+
+    @property
+    def run_dir(self) -> Path:
+        return self.run_doc.parent
+
+
+def _seed(path: Path, plugin: str, provides: str, result: Any) -> None:
+    """A stage record as an earlier run of ``plugin`` would have left it, ``done``."""
+    then = datetime(2026, 10, 28, 9, 30, tzinfo=timezone.utc)
+    write_stage(
+        path,
+        StageRecord(
+            plugin=plugin,
+            provides=provides,
+            attempt="a1",
+            status=StageStatus.done,
+            started_utc=then,
+            finished_utc=then,
+            profile="demo",
+            dry_run=False,
+            smc_version="0",
+            params={},
+            result=result.model_dump(mode="json"),
+        ),
+    )
+
+
+def _plan(rig: _Rig, **params: object) -> ScanPlanResult:
+    """Run ``scan-plan`` on the rig as it is; it moves nothing."""
+    record = run_plugin(
+        ScanPlanPlugin(),
+        rig.microscope,
+        ScanPlanParams(**{**PLAN, **params}),  # type: ignore[arg-type]
+        rig.run_doc,
+    )
+    assert record.status is StageStatus.done
+    assert record.result is not None
+    return ScanPlanResult.model_validate(record.result)
+
+
+def _build(
+    microscope: Microscope, tmp_path: Path, *, calibrated_um: float | None = None
+) -> _Rig:
+    run_doc = tmp_path / "run.json"
+    _seed(
+        run_doc,
+        "plate-registration",
+        "plate",
+        PlateResult(
+            plate="96-well",
+            a1_center_xy_um=(0.0, 0.0),  # PlateSample puts A1 at the origin
+            rotation_deg=0.0,
+            method="seed",
+            residual_um=None,
+            scale_error=None,
+            n_refs=0,
+        ),
+    )
+    if calibrated_um is not None:
+        _seed(
+            run_doc,
+            "camera-calibration",
+            "camera-calibration",
+            CameraCalibration(
+                objective=IN_PLACE,
+                image_shape_px=SHAPE,
+                matrix_um_per_px=pixel_matrix(calibrated_um),
+                pixel_size_um=calibrated_um,
+                rotation_deg=0.0,
+                mirrored=False,
+                residual_um=0.01,
+                response=0.97,
+                return_error_um=0.4,
+                step_um=24.0,
+            ),
+        )
+    camera = _Camera(microscope)
+    microscope.override(Camera, camera)
+    stage = _Stage(microscope.require(XYStage))
+    microscope.override(XYStage, stage)
+    return _Rig(microscope, stage, camera, run_doc)
+
+
+@pytest.fixture
+def rig(demo_microscope: Microscope, tmp_path: Path) -> _Rig:
+    """The demo stand with a plan of 12 fields in the run document."""
+    built = _build(demo_microscope, tmp_path)
+    plan = _plan(built)
+    assert len(plan.fields) == 12
+    assert plan.matrix_source == "profile"
+    assert plan.objective == IN_PLACE
+    return built
+
+
+def _scan(
+    rig: _Rig,
+    *,
+    resume: bool = False,
+    on_progress: Callable[[Progress], None] | None = None,
+    stop: threading.Event | None = None,
+    **params: object,
+) -> StageRecord:
+    return run_plugin(
+        ScanPlugin(),
+        rig.microscope,
+        ScanParams(**params),  # type: ignore[arg-type]
+        rig.run_doc,
+        resume=resume,
+        on_progress=on_progress,
+        stop=stop,
+    )
+
+
+def _at(done: int, action: Callable[[], object]) -> Callable[[Progress], None]:
+    """A progress callback that runs ``action`` once, when ``done`` fields are done."""
+
+    def callback(progress: Progress) -> None:
+        if progress.done == done:
+            action()
+
+    return callback
+
+
+def _result(record: StageRecord) -> ScanResult:
+    assert record.status is StageStatus.done, record.error
+    assert record.result is not None
+    return ScanResult.model_validate(record.result)
+
+
+def _stored(rig: _Rig) -> StageRecord:
+    return RunDocument.load(rig.run_doc).stages["scan"]
+
+
+def _checkpoint(rig: _Rig) -> ScanCheckpoint:
+    stored = _stored(rig)
+    assert stored.checkpoint is not None
+    return ScanCheckpoint.model_validate(stored.checkpoint)
+
+
+def _refused(rig: _Rig, **params: object) -> str:
+    """Run the scan, expect a refusal before anything moved, and return its reason."""
+    with pytest.raises(PluginRunError) as raised:
+        _scan(rig, **params)
+    assert rig.stage.moves == 0
+    assert rig.camera.snaps == 0
+    assert not (rig.run_dir / "scan").exists()
+    stored = _stored(rig)
+    assert stored.status is StageStatus.failed
+    assert stored.checkpoint is None
+    return raised.value.reason
+
+
+def _tiffs(rig: _Rig) -> list[Path]:
+    return sorted((rig.run_dir / "scan").rglob("*.tif"))
+
+
+# --------------------------------------------------------------- registration
+
+
+def test_the_entry_point_loads_scan() -> None:
+    entry = load("scan")
+
+    assert entry.plugin.provides == "scan"
+    assert entry.plugin.requires == (XYStage, Camera)
+    assert entry.plugin.reads == ("scan-plan",)
+    assert entry.plugin.reads_optional == ()
+    assert entry.target == "smc.plugins.scan.plugin:ScanPlugin"
+
+
+# ---------------------------------------------------------------- the scan
+
+
+def test_a_scan_writes_one_tiff_per_field_and_records_the_readback(rig: _Rig) -> None:
+    plan = _plan(rig)
+    rig.stage.offset_um = (3.0, -2.0)
+    z_stage = rig.microscope.require(ZStage)
+    z0 = z_stage.position_um()
+
+    result = _result(_scan(rig))
+
+    assert result.folder.startswith("scan/")
+    assert [f.name for f in result.frames] == [f.name for f in plan.fields]
+    assert result.failed == ()
+    assert result.objective == IN_PLACE
+    assert result.pixel_size_um == PIXEL_UM
+    assert result.matrix_um_per_px == plan.matrix_um_per_px
+    assert result.image_shape_px == SHAPE
+    assert result.assumed == ()
+    for frame, planned, readback in zip(
+        result.frames, plan.fields, rig.stage.readbacks, strict=True
+    ):
+        assert frame.file == f"{result.folder}/{planned.well}/{planned.name}.tif"
+        assert "\\" not in frame.file
+        assert (frame.well, frame.index) == (planned.well, planned.index)
+        # The readback, not the target: 3 µm right and 2 µm down of it.
+        assert frame.x_um == readback.x_um
+        assert frame.y_um == readback.y_um
+        assert frame.x_um == pytest.approx(planned.x_um + 3.0, abs=0.05)
+        assert frame.y_um == pytest.approx(planned.y_um - 2.0, abs=0.05)
+        assert frame.z_um == pytest.approx(z0)
+        assert frame.focus == "off"  # the demo's autofocus is off: not used
+        assert frame.pfs_offset is None
+        pixels = load_frame(rig.run_dir, frame)
+        assert pixels.shape == SHAPE
+        assert pixels.dtype == np.uint16
+        with tifffile.TiffFile(rig.run_dir / frame.file) as tiff:
+            stored = tiff.shaped_metadata
+        assert stored is not None
+        written = dict(stored[0])
+        written.pop("shape")
+        assert written == frame.model_dump(mode="json")
+    assert [f.t_s for f in result.frames] == sorted(f.t_s for f in result.frames)
+    assert len(_tiffs(rig)) == 12
+    assert z_stage.position_um() == pytest.approx(z0)  # never moved
+
+
+def test_progress_counts_every_field_of_the_attempt(rig: _Rig) -> None:
+    seen: list[Progress] = []
+
+    _result(_scan(rig, on_progress=seen.append))
+
+    assert [(p.done, p.total) for p in seen] == [(n, 12) for n in range(1, 13)]
+    assert seen[0].message == "A1_0000"
+
+
+# ------------------------------------------------- refused before anything moves
+
+
+def test_the_wrong_objective_is_refused_before_anything_moves(rig: _Rig) -> None:
+    turret = _Turret(current=FORTY)
+    rig.microscope.override(ObjectiveTurret, turret)
+
+    reason = _refused(rig)
+
+    assert reason == (
+        f"the objective in place is {FORTY!r}; the scan was planned for {IN_PLACE!r}. "
+        f"Turn the turret to {IN_PLACE!r} (smc never turns it during a scan), or "
+        f"run scan-plan again with objective={FORTY}"
+    )
+    assert turret.selects == []
+
+
+def test_a_changed_frame_shape_is_refused_before_anything_moves(rig: _Rig) -> None:
+    rig.camera.reported_shape = (SHAPE[1], SHAPE[0])
+
+    reason = _refused(rig)
+
+    assert reason == (
+        "the camera gives frames of (128, 96) pixels; the plan was made for "
+        "(96, 128): set the binning and region of interest back, or run "
+        "scan-plan again with the stand as it is now"
+    )
+
+
+def test_a_profile_plan_for_another_size_is_refused_before_anything_moves(
+    rig: _Rig,
+) -> None:
+    rig.camera.reported_um = 1 / 1.5
+
+    reason = _refused(rig)
+
+    assert reason == (
+        "the camera reports 0.666667 µm per pixel; the plan was made for 1 µm "
+        "(profile), more than 1% away (a binning, the magnifier lever): run "
+        "scan-plan again with the stand as it is now"
+    )
+
+
+def test_a_calibrated_plan_is_compared_within_ten_percent(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    rig = _build(demo_microscope, tmp_path, calibrated_um=1.03)
+    plan = _plan(rig)
+    assert plan.matrix_source == "camera-calibration"
+    assert plan.pixel_size_um == 1.03
+
+    # The camera's 1.0 is 3 % from the calibration's 1.03: a measurement, not a
+    # change. Each well compares with the camera's 1.0 at the start, not the plan's.
+    assert len(_result(_scan(rig)).frames) == 12
+
+    rig.stage.moves = 0
+    rig.camera.snaps = 0
+    rig.camera.reported_um = 1.5
+    with pytest.raises(PluginRunError) as raised:
+        _scan(rig)
+    assert raised.value.reason == (
+        "the camera reports 1.5 µm per pixel; the plan was made for 1.03 µm "
+        "(camera-calibration), more than 10% away (a binning, the magnifier "
+        "lever): run camera-calibration, then scan-plan, again with the stand "
+        "as it is now"
+    )
+    assert rig.stage.moves == 0
+    assert rig.camera.snaps == 0
+
+
+def test_a_parameter_pixel_size_is_not_compared_and_says_so(rig: _Rig) -> None:
+    plan = _plan(rig, pixel_size_um=2.0)
+    assert plan.matrix_source == "parameter"
+
+    result = _result(_scan(rig))
+
+    assert len(result.frames) == 12
+    assert result.pixel_size_um == 2.0
+    assert result.assumed == (
+        "the plan's pixel size was given as a parameter: not compared with the "
+        "camera's",
+    )
+
+
+@pytest.mark.parametrize("bad", [0.0, math.inf, math.nan])
+def test_a_camera_without_a_pixel_size_is_not_compared_and_says_so(
+    bad: float, rig: _Rig
+) -> None:
+    """FM-104: 0 is "not measured" and infinity is above 0; neither is compared, both are said."""
+    rig.camera.reported_um = bad
+
+    result = _result(_scan(rig))
+
+    assert len(result.frames) == 12
+    assert result.assumed == (
+        "the camera reports no pixel size: the plan's size and a change during "
+        "the scan were not checked",
+    )
+
+
+@pytest.mark.parametrize(
+    ("engaged", "state"), [(False, "off"), (True, "on but not locked")]
+)
+def test_required_autofocus_that_is_not_locked_is_refused_before_anything_moves(
+    engaged: bool, state: str, rig: _Rig
+) -> None:
+    af = _Autofocus(engaged=engaged, locked=False)
+    rig.microscope.override(Autofocus, af)
+
+    reason = _refused(rig, autofocus="required")
+
+    assert reason == (
+        f"autofocus=required, and the autofocus is {state}: engage PFS on the "
+        "stand and let it lock on the sample before the scan"
+    )
+    assert not MUTATING & set(af.calls)
+
+
+def test_required_autofocus_on_a_stand_without_one_is_refused(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_get = rig.microscope.get
+    monkeypatch.setattr(
+        rig.microscope,
+        "get",
+        lambda wanted: None if wanted is Autofocus else real_get(wanted),
+    )
+
+    reason = _refused(rig, autofocus="required")
+
+    assert reason.startswith("autofocus=required, and the autofocus is missing: ")
+
+
+def test_an_engaged_autofocus_that_is_not_locked_is_refused_before_anything_moves(
+    rig: _Rig,
+) -> None:
+    af = _Autofocus(engaged=True, locked=False)
+    rig.microscope.override(Autofocus, af)
+
+    reason = _refused(rig)  # if-engaged
+
+    assert reason == (
+        "the autofocus is on but not locked: lock it on the sample, or switch it "
+        "off and run with autofocus=off"
+    )
+    assert not MUTATING & set(af.calls)
+
+
+def test_too_little_disk_is_refused_before_moving(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    need = math.ceil(1.1 * 12 * 96 * 128 * 2)  # 12 frames of 96 x 128 at 16 bits
+    monkeypatch.setattr(shutil, "disk_usage", lambda _path: SimpleNamespace(free=need))
+
+    reason = _refused(rig)
+
+    assert reason == (
+        f"the run folder's disk has {need / 1e6:,.1f} MB free and the 12 frames "
+        f"need {need / 1e6:,.1f} MB: free some space, or put the run document on "
+        "another disk"
+    )
+
+    monkeypatch.setattr(
+        shutil, "disk_usage", lambda _path: SimpleNamespace(free=need + 1)
+    )
+    assert len(_result(_scan(rig)).frames) == 12
+
+
+def test_the_disk_counts_only_the_fields_left_on_a_resume(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stop = threading.Event()
+    _scan(rig, stop=stop, on_progress=_at(4, stop.set))
+    assert _checkpoint(rig).wells_done == ("A1",)
+
+    need = math.ceil(1.1 * 8 * 96 * 128 * 2)  # A2 and B2 are left
+    monkeypatch.setattr(
+        shutil, "disk_usage", lambda _path: SimpleNamespace(free=need + 1)
+    )
+    assert len(_result(_scan(rig, resume=True)).frames) == 12
+
+
+# ------------------------------------------------------------- at every well
+
+
+def test_a_turret_turned_mid_scan_stops_at_the_next_well(rig: _Rig) -> None:
+    turret = _Turret()
+    rig.microscope.override(ObjectiveTurret, turret)
+
+    def turn() -> None:
+        turret.now = FORTY
+
+    with pytest.raises(PluginRunError) as raised:
+        _scan(rig, on_progress=_at(4, turn))
+
+    assert raised.value.reason == (
+        f"the objective in place is now {FORTY!r} at well A2; the scan was planned "
+        f"for {IN_PLACE!r}: turn the turret back to {IN_PLACE!r}, then run scan "
+        "--resume"
+    )
+    assert _stored(rig).status is StageStatus.failed
+    checkpoint = _checkpoint(rig)
+    assert checkpoint.wells_done == ("A1",)
+    assert len(checkpoint.frames) == 4
+    assert rig.stage.moves == 4
+    assert turret.selects == []
+
+
+def test_a_changed_pixel_size_stops_the_scan(rig: _Rig) -> None:
+    def lever() -> None:
+        rig.camera.reported_um = 1 / 1.5
+
+    with pytest.raises(PluginRunError) as raised:
+        _scan(rig, on_progress=_at(4, lever))
+
+    assert raised.value.reason == (
+        "the camera reports 0.666667 µm per pixel at well A2, 1 at the start of "
+        "the scan (the magnifier lever, a binning): set it back, then run scan "
+        "--resume"
+    )
+    assert rig.stage.moves == 4
+    assert _checkpoint(rig).wells_done == ("A1",)
+
+
+def test_a_pixel_size_within_one_percent_does_not_stop_the_scan(rig: _Rig) -> None:
+    def drift() -> None:
+        rig.camera.reported_um = 1.005
+
+    assert len(_result(_scan(rig, on_progress=_at(4, drift))).frames) == 12
+
+
+def test_a_frame_shape_changed_mid_scan_stops_at_the_next_well(rig: _Rig) -> None:
+    def binning() -> None:
+        rig.camera.reported_shape = (48, 64)
+
+    with pytest.raises(PluginRunError, match=r"\(48, 64\) pixels at well A2"):
+        _scan(rig, on_progress=_at(4, binning))
+    assert rig.stage.moves == 4
+
+
+def test_a_frame_of_another_shape_ends_the_scan(rig: _Rig) -> None:
+    plan = _plan(rig)
+    rig.camera.transposed_snap = 3
+
+    with pytest.raises(PluginRunError) as raised:
+        _scan(rig)
+
+    assert raised.value.reason == (
+        "the frame of A1_0002 has shape (128, 96); the plan's frames are (96, 128): "
+        "check the camera's binning and region of interest, then run scan --resume"
+    )
+    third = plan.fields[2]
+    assert not any(path.stem == third.name for path in _tiffs(rig))
+    assert len(_tiffs(rig)) == 2
+
+
+# -------------------------------------------------------------- failed fields
+
+
+def test_one_failed_field_is_recorded_and_skipped(rig: _Rig) -> None:
+    plan = _plan(rig)
+    rig.stage.fail = {2: HardwareError("the stage did not answer\nsecond line")}
+
+    result = _result(_scan(rig))
+
+    second = plan.fields[1]
+    assert len(result.failed) == 1
+    failed = result.failed[0]
+    assert (failed.well, failed.index, failed.name) == (
+        second.well,
+        second.index,
+        second.name,
+    )
+    assert (failed.x_um, failed.y_um) == (second.x_um, second.y_um)  # the target
+    assert failed.error == "HardwareError: the stage did not answer"
+    assert len(result.frames) == 11
+    assert second.name not in {f.name for f in result.frames}
+    assert len(_tiffs(rig)) == 11
+
+
+def test_a_refused_move_is_a_failed_field(rig: _Rig) -> None:
+    rig.stage.fail = {2: SafetyRefusedError("the target is outside the soft limits")}
+
+    result = _result(_scan(rig))
+
+    assert len(result.failed) == 1
+    assert result.failed[0].error.startswith("SafetyRefusedError: ")
+    assert len(result.frames) == 11
+
+
+def test_three_failed_fields_in_a_row_fail_the_scan_with_the_checkpoint_kept(
+    rig: _Rig,
+) -> None:
+    rig.stage.fail = {n: HardwareError(f"no answer {n}") for n in (5, 6, 7)}
+
+    with pytest.raises(PluginRunError) as raised:
+        _scan(rig)
+
+    assert raised.value.reason == (
+        "3 fields failed in a row, the last A2_0002: HardwareError: no answer 7; "
+        "the checkpoint keeps 1 wells: check the stage, then run scan --resume"
+    )
+    assert raised.value.__context__ is None  # raised outside the handler
+    stored = _stored(rig)
+    assert stored.status is StageStatus.failed
+    checkpoint = _checkpoint(rig)
+    assert checkpoint.wells_done == ("A1",)
+    assert len(checkpoint.frames) == 4
+    assert checkpoint.failed == ()
+
+
+def test_failures_not_in_a_row_do_not_fail_the_scan(rig: _Rig) -> None:
+    rig.stage.fail = {n: HardwareError("no answer") for n in (2, 4)}
+
+    result = _result(_scan(rig, max_failed_in_row=2))
+
+    assert [f.name for f in result.failed] == ["A1_0001", "A1_0003"]
+    assert len(result.frames) == 10
+
+
+def test_a_halt_is_not_a_failed_field(rig: _Rig) -> None:
+    """FM-64: the emergency stop ends the scan; it is not a field to skip."""
+    try:
+        with pytest.raises(MicroscopeHaltedError):
+            _scan(rig, on_progress=_at(5, rig.microscope.stop))
+    finally:
+        rig.microscope.resume()
+
+    assert _stored(rig).status is StageStatus.failed
+    checkpoint = _checkpoint(rig)
+    assert checkpoint.failed == ()
+    assert checkpoint.wells_done == ("A1",)
+    assert rig.stage.moves == 6
+    assert len(_tiffs(rig)) == 5
+
+
+def test_a_stopped_motion_is_not_a_failed_field(rig: _Rig) -> None:
+    rig.stage.fail = {3: MotionStoppedError("xy_stage XY")}
+
+    with pytest.raises(MotionStoppedError):
+        _scan(rig)
+
+    assert _stored(rig).status is StageStatus.failed
+    assert _stored(rig).checkpoint is None
+    assert rig.stage.moves == 3
+
+
+def test_an_oserror_writing_a_frame_ends_the_scan(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import smc.plugins.scan.plugin as scan_plugin
+
+    real = scan_plugin.write_atomically
+    calls = 0
+
+    def full_disk(path: Path, data: bytes, *, make_parents: bool = True) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise AtomicWriteError(OSError(errno.ENOSPC, "No space left on device"))
+        real(path, data, make_parents=make_parents)
+
+    monkeypatch.setattr(scan_plugin, "write_atomically", full_disk)
+
+    with pytest.raises(OSError, match="No space left on device") as raised:
+        _scan(rig)
+
+    assert isinstance(raised.value, AtomicWriteError)
+    stored = _stored(rig)
+    assert stored.status is StageStatus.failed
+    assert stored.checkpoint is None  # no well was done: no failed field anywhere
+    assert rig.stage.moves == 2
+
+
+# ------------------------------------------------------------------- resume
+
+
+@pytest.fixture
+def stopped(rig: _Rig) -> _Rig:
+    """The rig after a scan stopped by the operator after the first field of A2."""
+    stop = threading.Event()
+    record = _scan(rig, stop=stop, on_progress=_at(5, stop.set))
+    assert record.status is StageStatus.stopped
+    assert _checkpoint(rig).wells_done == ("A1",)
+    rig.stage.moves = 0
+    rig.camera.snaps = 0
+    return rig
+
+
+def test_a_stopped_scan_resumes_with_the_same_token(stopped: _Rig) -> None:
+    checkpoint = _checkpoint(stopped)
+    token = checkpoint.frames[0].file.split("/")[1]
+
+    result = _result(_scan(stopped, resume=True))
+
+    assert result.folder == f"scan/{token}"
+    assert len(result.frames) == 12
+    names = [f.name for f in result.frames]
+    assert len(set(names)) == 12
+    assert result.frames[:4] == checkpoint.frames
+    # A2 was not done, so it is scanned whole again, and then B2.
+    assert stopped.stage.moves == 8
+    assert len(_tiffs(stopped)) == 12
+
+
+def test_a_resume_after_the_plan_was_made_again_is_refused(stopped: _Rig) -> None:
+    """FM-111: the checkpoint's wells and frames are of the earlier plan."""
+    _plan(stopped)
+
+    with pytest.raises(ResumeError) as raised:
+        _scan(stopped, resume=True)
+
+    assert raised.value.reason == (
+        "scan read its inputs from an earlier run, so its checkpoint no longer "
+        "matches them; run it without --resume"
+    )
+    assert stopped.stage.moves == 0
+
+
+def test_a_resume_whose_frames_are_missing_is_refused(stopped: _Rig) -> None:
+    lost = _checkpoint(stopped).frames[1]
+    (stopped.run_dir / lost.file).unlink()
+
+    with pytest.raises(PluginRunError) as raised:
+        _scan(stopped, resume=True)
+
+    assert raised.value.reason == (
+        f"1 of the checkpoint's 4 frame files are missing from the run folder, "
+        f"the first {lost.file}: run scan without --resume"
+    )
+    assert stopped.stage.moves == 0
+
+
+def test_a_checkpoint_token_that_is_not_a_token_is_refused(
+    stopped: _Rig, tmp_path: Path
+) -> None:
+    record = _stored(stopped)
+    assert record.checkpoint is not None
+    write_stage(
+        stopped.run_doc,
+        record.model_copy(
+            update={"checkpoint": {**record.checkpoint, "token": "../../evil"}}
+        ),
+    )
+
+    with pytest.raises(ResumeError) as raised:
+        _scan(stopped, resume=True)
+
+    assert raised.value.reason.startswith(
+        "the saved checkpoint is not what scan expects (token: String should match "
+        "pattern"
+    )
+    assert stopped.stage.moves == 0
+    assert not (tmp_path.parent / "evil").exists()
+    assert not (tmp_path / "evil").exists()
+
+
+# ---------------------------------------------------------------- autofocus
+
+
+def test_an_unlocked_autofocus_is_engaged_once_per_field(rig: _Rig) -> None:
+    af = _Autofocus(engaged=True, locked=True)
+    rig.microscope.override(Autofocus, af)
+    rig.stage.after_move = lambda n: af.lose_lock() if n in (2, 3) else None
+
+    result = _result(_scan(rig))
+
+    assert af.calls.count("engage") == 2
+    assert [f.focus for f in result.frames] == ["locked"] * 12
+    assert {f.pfs_offset for f in result.frames} == {af.offset}
+    assert result.assumed == ("the autofocus was engaged again on 2 fields",)
+    assert not {"disengage", "set_offset_native", "offset_by_native"} & set(af.calls)
+
+
+def test_a_failed_engage_records_unlocked_frames(rig: _Rig) -> None:
+    af = _Autofocus(engaged=True, locked=True)
+    af.engage_results = [False, True]
+    rig.microscope.override(Autofocus, af)
+    rig.stage.after_move = lambda n: af.lose_lock() if n == 2 else None
+
+    result = _result(_scan(rig))
+
+    assert [f.focus for f in result.frames] == ["locked", "unlocked"] + ["locked"] * 10
+    assert af.calls.count("engage") == 2  # field 2 failed to lock, field 3 locked
+
+
+def test_unlocked_fields_in_a_row_fail_the_scan(rig: _Rig) -> None:
+    af = _Autofocus(engaged=True, locked=True)
+    af.engage_results = [False] * 12
+    rig.microscope.override(Autofocus, af)
+    rig.stage.after_move = lambda n: af.lose_lock() if n >= 2 else None
+
+    with pytest.raises(PluginRunError) as raised:
+        _scan(rig, max_unlocked_in_row=2)
+
+    assert raised.value.reason == (
+        "the autofocus did not lock on 2 fields in a row, the last A1_0002; the "
+        "checkpoint keeps 0 wells: lock it on the sample, then run scan --resume"
+    )
+    assert rig.camera.snaps == 2
+
+
+def test_an_autofocus_left_off_is_never_engaged(rig: _Rig) -> None:
+    af = _Autofocus(engaged=False, locked=False)
+    rig.microscope.override(Autofocus, af)
+
+    result = _result(_scan(rig))
+
+    assert not MUTATING & set(af.calls)
+    assert [f.focus for f in result.frames] == ["off"] * 12
+    assert {f.pfs_offset for f in result.frames} == {None}
+
+
+def test_autofocus_off_reads_nothing_from_it(rig: _Rig) -> None:
+    af = _Autofocus(engaged=True, locked=True)
+    rig.microscope.override(Autofocus, af)
+
+    result = _result(_scan(rig, autofocus="off"))
+
+    assert af.calls == []
+    assert [f.focus for f in result.frames] == ["off"] * 12
+
+
+def test_a_stand_without_an_autofocus_records_none(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_get = rig.microscope.get
+    monkeypatch.setattr(
+        rig.microscope,
+        "get",
+        lambda wanted: None if wanted is Autofocus else real_get(wanted),
+    )
+
+    result = _result(_scan(rig))
+
+    assert [f.focus for f in result.frames] == ["none"] * 12
+
+
+# ----------------------------------------------------------------- dry run
+
+
+def test_a_dry_run_scan_writes_nothing(
+    demo_microscope_dry: Microscope, tmp_path: Path
+) -> None:
+    rig = _build(demo_microscope_dry, tmp_path)
+    plan = _plan(rig)
+    af = _Autofocus(engaged=True, locked=True)
+    demo_microscope_dry.override(Autofocus, af)
+    rig.stage.after_move = lambda _n: af.lose_lock()
+    before = rig.stage.position_um()
+
+    record = _scan(rig)
+
+    result = _result(record)
+    assert record.dry_run is True
+    assert rig.camera.snaps == 0
+    assert "engage" not in af.calls
+    assert rig.stage.moves == len(plan.fields)
+    after = rig.stage.position_um()
+    assert (after.x_um, after.y_um) == pytest.approx((before.x_um, before.y_um))
+    assert result.frames == ()
+    assert result.failed == ()
+    assert result.assumed == ("dry run: 12 fields walked, no frame taken",)
+    assert [p.name for p in tmp_path.rglob("*") if p.is_file()] == ["run.json"]
