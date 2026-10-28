@@ -2991,7 +2991,7 @@ modes *select* (default) and *drive* (`goto-well`, an explicit toggle,
 `nikon-control`'s "armed mode"); the tools in workflow order, each with
 its key parameters and an *advanced* fold from `describe_params`, a Run
 button and the progress; the run document as a checklist. A periodic
-callback every second (§15.3: 250 ms in the first draft) reads `status()`
+callback every second (§15.3) reads `status()`
 on the server's thread (Bokeh models are not touched from the worker). A
 browser session that ends (a closed or reloaded tab) does nothing: the
 controller belongs to the server, not to a tab (§15.3). When the server
