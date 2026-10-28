@@ -62,6 +62,10 @@ re-run starts over and gives the same route (nothing in it is random).
    `null` for both when the well has no frame, or when you image with another
    objective (below).
 
+A field holds the cells inside its frame, the edge included. A cell within a rounding
+error of an edge (a millionth of a pixel) may fall on either side, and it is counted
+once whichever it is: the count and the choice use the same arithmetic.
+
 `min_cells` is the number of *new* cells, and `counts` of a stop are the cells it
 holds that no earlier stop holds: the counts of all stops and what is uncovered add
 up to the cells of the wanted labels, always.
@@ -156,6 +160,11 @@ do, and never gives a route that is empty or that rests on a number that is not 
   lattice would hold more than 250 000 candidates. The bounds refuse what would be
   worse; they do not make it fast. Raise the fraction rather than waiting. The
   microscope PC's CPU is not measured.
+- **Stop.** A stop is looked at between two wells, not inside one. A well that the
+  bound still lets through (760 000 cells with a window of 2 809 lattice points each,
+  which is a 1331 µm field at a step of 0.02 of it) took 17 s and about 1 GB on the
+  same laptop, so a stop can wait that long for the well under way; Ctrl-C ends it at
+  once.
 - **The run document's size.** The stops are in the run document, and the document is
   rewritten at every stage write. At the default of 10 fields per well, 96 wells are
   about 0.24 MB; at the largest `fields_per_well` (500) they are about 12 MB.

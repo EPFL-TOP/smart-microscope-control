@@ -203,12 +203,21 @@ class RoutePlugin:
             raise PluginRunError(_NAME, problem)
 
         planned = {field.well for field in plan.fields}
+        listed = set(plan.wells)
         for well in cells_result.counts:
             if well not in planned:
                 raise PluginRunError(
                     _NAME,
                     f"the cells hold well {well!r}, which the scan plan has no field "
                     f"for; run scan-plan, scan and cells again",
+                )
+            # The loop below walks `plan.wells`: a well the plan has fields for and
+            # does not list would be left out with its cells, and the stage `done`.
+            if well not in listed:
+                raise PluginRunError(
+                    _NAME,
+                    f"the cells hold well {well!r}, which the scan plan does not "
+                    f"list among its wells; run scan-plan, scan and cells again",
                 )
 
         scanned = [well for well in plan.wells if well in cells_result.counts]

@@ -31,6 +31,8 @@ from smc.hardware import Microscope
 from smc.hardware.capabilities import ObjectiveTurret
 from smc.plugins import PluginRunError, Progress, load, run_plugin
 from smc.plugins.geometry import Matrix2, footprint
+from smc.plugins.route import algorithm
+from smc.plugins.route import plugin as plugin_module
 from smc.plugins.route.plugin import RouteParams, RoutePlugin
 from smc.plugins.scan_plan.algorithm import plan_fields
 from smc.plugins.slots import (
@@ -158,9 +160,12 @@ def _seed(
     *,
     layout: Sequence[tuple[str, float, float, str]] = LAYOUT,
     wells: tuple[str, ...] = WELLS,
+    listed: tuple[str, ...] | None = None,
     scanned: tuple[str, ...] = WELLS,
     matrix: Matrix2 = UPRIGHT,
     plan_matrix: Matrix2 | None = None,
+    plan_shape: tuple[int, int] | None = None,
+    plan_objective: str | None = "the scan's",
     shape: tuple[int, int] = SHAPE,
     scan_objective: str | None = IN_PLACE,
     failed_wells: tuple[str, ...] = (),
@@ -168,10 +173,13 @@ def _seed(
 ) -> Seed:
     """The plan, the scan and the cells of ``wells``, in ``tmp_path/run.json``.
 
-    ``plan_matrix`` is the camera the plan was laid with when it is not the scan's
-    (the route must take the scan's). Frames are at the planned fields, their
-    readback a little off the target and their Z and autofocus offset distinct;
-    the wells in ``failed_wells`` have no frame, only failed fields.
+    ``listed`` is what the plan's own ``wells`` says when it is not ``wells`` (a record
+    that disagrees with its fields). ``plan_matrix``, ``plan_shape`` and
+    ``plan_objective`` are the camera, the frame and the objective the plan was laid
+    for when they are not the scan's: the route must take the scan's (FM-124), so a
+    test that wants to know says them different. Frames are at the planned fields,
+    their readback a little off the target and their Z and autofocus offset
+    distinct; the wells in ``failed_wells`` have no frame, only failed fields.
     """
     path = tmp_path / "run.json"
     plate = PlateResult(
@@ -184,12 +192,15 @@ def _seed(
         n_refs=0,
     )
     laid = plan_matrix if plan_matrix is not None else matrix
-    fov = _extent(laid, shape)
+    laid_shape = plan_shape if plan_shape is not None else shape
+    fov = _extent(laid, laid_shape)
     plate_plan, fields = plan_fields(
         plate,
         wells,
         fov_um=fov,
-        footprint_of=lambda x, y: footprint(x, y, matrix=laid, image_shape_px=shape),
+        footprint_of=lambda x, y: footprint(
+            x, y, matrix=laid, image_shape_px=laid_shape
+        ),
         rows=2,
         columns=2,
         overlap=0.1,
@@ -197,12 +208,12 @@ def _seed(
     )
     plan = ScanPlanResult(
         plate_plan=plate_plan,
-        wells=wells,
-        objective=scan_objective,
+        wells=wells if listed is None else listed,
+        objective=scan_objective if plan_objective == "the scan's" else plan_objective,
         pixel_size_um=PIXEL_UM,
         matrix_um_per_px=laid,
         matrix_source="parameter",
-        image_shape_px=shape,
+        image_shape_px=laid_shape,
         fov_um=fov,
         overlap=0.1,
         rows=2,
@@ -523,6 +534,38 @@ def test_the_first_well_starts_at_the_field_nearest_the_first_planned_field_not_
     ]
 
 
+def test_each_later_well_starts_at_the_field_nearest_the_previous_wells_last_stop_not_its_first(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """A2 is entered from the west and left on the east side, and B2 has a field on each side.
+
+    A1 is west of A2, so A2 starts at its west cluster and ends at its east one.
+    The B2 field nearest A2's last stop is B2's east cluster (3 cells), the one
+    nearest its first stop the west cluster (1 cell): a rule that took the previous
+    well's first stop would start B2 at the other.
+    """
+    wells = ("A1", "A2", "B2")
+    layout = (
+        [("A1", -1500.3, 700.7, "single")]
+        + [("A2", -2000.2 + 5.1 * i, 0.9, "single") for i in range(2)]
+        + [("A2", 2000.4 + 5.1 * i, 0.6, "single") for i in range(2)]
+        + [("B2", -2000.1, 0.8, "single")]
+        + [("B2", 2000.3 + 5.1 * i, 0.7, "single") for i in range(3)]
+    )
+    _seed(tmp_path, layout=layout, wells=wells, scanned=wells)
+
+    result = _result(_run(demo_microscope, tmp_path))
+
+    a2, b2 = _positions_of(result, "A2"), _positions_of(result, "B2")
+    nearest_to_last = min(b2, key=lambda p: _distance(p, (a2[-1].x_um, a2[-1].y_um)))
+    nearest_to_first = min(b2, key=lambda p: _distance(p, (a2[0].x_um, a2[0].y_um)))
+    assert nearest_to_last != nearest_to_first  # the test's own design
+    assert [(p.counts["single"]) for p in a2] == [2, 2]
+    assert a2[0].x_um < a2[-1].x_um  # in from the west, out on the east
+    assert b2[0] == nearest_to_last
+    assert [p.counts["single"] for p in b2] == [3, 1]
+
+
 def test_every_cluster_is_held_whole_by_one_field_and_counted_once(
     demo_microscope: Microscope, tmp_path: Path
 ) -> None:
@@ -585,11 +628,22 @@ def test_the_scans_matrix_and_frame_decide_the_field(
     assert result.image_shape_px == SHAPE
 
     turned = _matrix(PIXEL_UM, 20.0, True)
-    seed = _seed(tmp_path, matrix=turned, plan_matrix=UPRIGHT)
+    seed = _seed(
+        tmp_path,
+        matrix=turned,
+        plan_matrix=UPRIGHT,
+        plan_shape=(50, 70),
+        plan_objective=FORTY,
+    )
     result = _result(_run(demo_microscope, tmp_path))
 
-    assert seed.plan.matrix_um_per_px == UPRIGHT  # the plan's is another camera
+    # The plan was laid for another camera, frame and objective than the scan's.
+    assert seed.plan.matrix_um_per_px == UPRIGHT
+    assert seed.plan.image_shape_px == (50, 70)
+    assert seed.plan.objective == FORTY
     assert result.matrix_um_per_px == turned
+    assert result.image_shape_px == SHAPE
+    assert result.objective == IN_PLACE
     assert result.fov_um == pytest.approx(_extent(turned, SHAPE))
     polygons = [(p, _polygon(seed, p)) for p in result.positions]
     for (_, a), (_, b) in itertools.combinations(polygons, 2):
@@ -696,7 +750,15 @@ def test_another_objective_scales_the_field(
     """The scan's pixel size is 0.2 µm at the 40X and the profile's is 0.1625: only the profile's ratio, 0.65 / 0.1625, scales it."""
     shape = (240, 320)
     scan_matrix = _matrix(0.2, 12.0, True)
-    seed = _seed(tmp_path, matrix=scan_matrix, shape=shape, scan_objective=FORTY)
+    # The plan was laid for the 10X with another pixel size: the scaling is of the scan's.
+    seed = _seed(
+        tmp_path,
+        matrix=scan_matrix,
+        shape=shape,
+        scan_objective=FORTY,
+        plan_matrix=_matrix(0.3, 0.0, False),
+        plan_objective=IN_PLACE,
+    )
 
     result = _result(_run(demo_microscope, tmp_path, objective=IN_PLACE))
 
@@ -922,6 +984,20 @@ def test_cells_of_a_well_the_plan_has_no_field_for_are_refused(
     )
 
 
+def test_cells_of_a_well_the_plan_does_not_list_are_refused(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """The plan has fields for B2 and does not list it among its wells: its cells would be left out, and the stage ``done``."""
+    _seed(tmp_path, listed=("A1", "A2", "B1"))
+
+    refused = _refused(demo_microscope, tmp_path)
+
+    assert refused.reason == (
+        "the cells hold well 'B2', which the scan plan does not list among its "
+        "wells; run scan-plan, scan and cells again"
+    )
+
+
 def test_a_matrix_that_cannot_be_inverted_is_refused(
     demo_microscope: Microscope, tmp_path: Path
 ) -> None:
@@ -947,6 +1023,54 @@ def test_a_lattice_too_fine_for_the_well_names_the_field_size(
         "the candidate lattice of A1 would hold more than 250000 fields at a step "
         "of 0.075 µm; the field is 0.4 by 0.3 µm: check the scan's pixel size, or "
         "raise candidate_step_fraction"
+    )
+
+
+def test_too_many_tests_are_refused_with_a_way_out(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A1's eight singles, each against the lattice points around it: 8 x 56 tests, over a bound of 10."""
+    _seed(tmp_path)
+    monkeypatch.setattr(algorithm, "_MAX_TESTS", 10)
+    per_cell = (FOV[0] // STEP_UM + 3) * (FOV[1] // STEP_UM + 3)  # 8 x 7 points
+
+    refused = _refused(demo_microscope, tmp_path)
+
+    assert refused.reason == (
+        f"{_singles('A1')} cells × {per_cell:.0f} lattice points per cell would be "  # noqa: RUF001
+        f"tested, over 10; raise candidate_step_fraction, or choose fewer labels"
+    )
+
+
+def test_a_well_that_is_not_on_the_plate_says_to_run_scan_plan_again(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed(tmp_path)
+
+    def not_on_the_plate(plan: object, well: str) -> object:
+        raise ValueError(f"well {well!r} is not on the 96-well plate")
+
+    monkeypatch.setattr(plugin_module, "well_geometry", not_on_the_plate)
+
+    refused = _refused(demo_microscope, tmp_path)
+
+    assert refused.reason == (
+        "well 'A1' is not on the 96-well plate; run scan-plan again"
+    )
+
+
+def test_empty_turret_positions_are_not_listed_among_the_objectives(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed(tmp_path, scan_objective=FORTY)
+    turret = demo_microscope.require(ObjectiveTurret)
+    monkeypatch.setattr(turret, "labels", lambda: ["", IN_PLACE, ""])
+
+    refused = _refused(demo_microscope, tmp_path, objective="Nikon 60X")
+
+    assert refused.reason == (
+        f"objective 'Nikon 60X' is not on the turret: {IN_PLACE}; give one of "
+        f"them, or leave objective unset"
     )
 
 

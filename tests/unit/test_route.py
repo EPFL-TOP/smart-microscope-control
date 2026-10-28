@@ -191,6 +191,55 @@ def test_order_route_breaks_ties_by_the_lowest_index() -> None:
     assert order_route([(0.0, 0.0)] * 5, start=2) == [2, 0, 1, 3, 4]
 
 
+# Small integer cases found by a search, where the route differs if 2-opt stops after one
+# pass, never reverses to the end of the open path, or takes the last of two equal changes.
+
+
+def test_two_opt_repeats_its_passes_until_none_changes_anything() -> None:
+    """Nearest neighbour is [0, 2, 1, 3] = 16.970 µm; one pass gives a route that a second pass still shortens."""
+    points = [(7.0, 2.0), (6.0, 5.0), (9.0, 8.0), (2.0, 0.0)]
+
+    order = order_route(points, start=0)
+
+    assert order == [0, 3, 1, 2]
+    assert _length(points, order) == pytest.approx(16.031, abs=1e-3)
+
+
+def test_two_opt_reverses_the_end_of_an_open_path() -> None:
+    """There is no edge after the last point, so reversing the tail has only one edge to price: [1, 0, 3, 2] is 12.838 µm."""
+    points = [(8.0, 9.0), (5.0, 6.0), (3.0, 3.0), (7.0, 5.0)]
+
+    order = order_route(points, start=1)
+
+    assert order == [1, 2, 3, 0]
+    assert _length(points, order) == pytest.approx(12.201, abs=1e-3)
+
+
+def test_two_opt_takes_the_lowest_index_of_two_equal_reversals() -> None:
+    """Both routes are 14.8416 µm: the one that comes from the lowest index of the best reversal is [4, 2, 0, 3, 1]."""
+    points = [(8.0, 9.0), (1.0, 4.0), (4.0, 9.0), (5.0, 7.0), (3.0, 7.0)]
+
+    order = order_route(points, start=4)
+
+    assert order == [4, 2, 0, 3, 1]
+    assert _length(points, order) == pytest.approx(14.8416, abs=1e-4)
+
+
+@given(_points_and_start(max_size=12))
+def test_no_single_reversal_shortens_the_route_it_returns(
+    case: tuple[list[Point], int],
+) -> None:
+    """2-opt ends at a local optimum: reversing any stretch after the first point, the tail included, gains at most 1e-9 µm."""
+    points, start = case
+    order = order_route(points, start=start)
+    here = _length(points, order)
+
+    for i in range(1, len(order)):
+        for j in range(i + 1, len(order)):
+            turned = order[:i] + order[i : j + 1][::-1] + order[j + 1 :]
+            assert _length(points, turned) >= here - 1e-6
+
+
 def test_the_first_point_stays_where_it_is() -> None:
     """On a line the best path from the middle is not the one that starts at an end."""
     points = [(float(x), 0.0) for x in (0, 10, 20, 30, 40)]
@@ -553,6 +602,41 @@ def test_candidates_are_numbered_row_by_row_from_plus_y_then_from_minus_x() -> N
     assert _choose(cells, n=2) == [(555.0, 630.0, 1), (-645.0, -570.0, 1)]
 
 
+@pytest.mark.parametrize("rotation", [0.0, 30.0, -30.0])
+@pytest.mark.parametrize(("width", "height"), [(2000.0, 1000.0), (1000.0, 2000.0)])
+def test_every_corner_of_a_square_well_is_reached_by_the_lattice(
+    width: float, height: float, rotation: float
+) -> None:
+    """A cell 100 µm inside each far corner of a turned, not square well (FM-73) is held by a field of its own.
+
+    The lattice covers the bounding box of the rectangle turned by the plate's
+    rotation: with its width and height exchanged, or the turn left out, or sine
+    and cosine swapped, a corner lies past the lattice and its cells are lost
+    without a word. The cells are placed in the plate's axes, 900 x 400 µm from
+    the centre for a 2 000 x 1 000 µm well, and turned to the stage's by the test.
+    """
+    well = _well(width, circular=False, height_um=height, rotation_deg=rotation)
+    corners = [
+        _plate_to_stage(
+            well, sign_u * (width / 2 - 100.0), sign_v * (height / 2 - 100.0)
+        )
+        for sign_u in (-1.0, 1.0)
+        for sign_v in (-1.0, 1.0)
+    ]
+    cells = [_cell(x, y) for x, y in corners]
+
+    chosen = _choose(cells, well)
+
+    assert sorted(count for _, _, count in chosen) == [1, 1, 1, 1]
+    for x, y in corners:
+        assert (
+            sum(
+                1 for fx, fy, _ in chosen if abs(x - fx) <= 50.0 and abs(y - fy) <= 30.0
+            )
+            == 1
+        )
+
+
 def test_cells_of_other_wells_and_other_labels_are_ignored() -> None:
     cells = [
         _cell(0, 0),
@@ -710,7 +794,7 @@ def test_a_tiny_step_is_too_much_work_and_not_an_overflow() -> None:
             origin=(0.0, 0.0),
             step_um=5e-324,
             fov_um=(100.0, 60.0),
-            inverse=_inverse_of(UPRIGHT, FRAME),
+            inverse=_inverse_of(UPRIGHT),
             half_px=(50.0, 30.0),
         )
 
@@ -787,6 +871,16 @@ class World:
         return choose_fields(self.cells, self.well, **arguments)  # type: ignore[arg-type]
 
 
+#: Added to every cell the strategy draws. Hypothesis likes exact zeros and round
+#: numbers, which put a cell exactly on the edge of a field (a well centred at the
+#: origin, a step of half a field); there the two definitions of "inside" in these
+#: tests, the pixel offset of the code and the polygon's cross products, are both
+#: inclusive and can still differ by one ulp, and the test would fail on correct
+#: code. An off-round offset keeps the draws off every edge (the edge itself is the
+#: deterministic test of cells on a field's edge, with pixel sizes that are exact).
+_OFF_THE_EDGE = 0.13579
+
+
 @st.composite
 def _worlds(draw: st.DrawFn) -> World:
     """Small wells and coarse steps: about 4 000 lattice points at most, so an example stays well under 200 ms."""
@@ -823,8 +917,12 @@ def _worlds(draw: st.DrawFn) -> World:
         for _ in range(draw(st.integers(min_value=2, max_value=8))):
             cells.append(
                 _cell(
-                    x + draw(st.floats(min_value=-70.0, max_value=70.0)),
-                    y + draw(st.floats(min_value=-70.0, max_value=70.0)),
+                    x
+                    + draw(st.floats(min_value=-70.0, max_value=70.0))
+                    + _OFF_THE_EDGE,
+                    y
+                    + draw(st.floats(min_value=-70.0, max_value=70.0))
+                    + _OFF_THE_EDGE,
                     label=draw(
                         st.sampled_from(["single", "single", "doublet", "debris"])
                     ),
@@ -904,10 +1002,7 @@ def test_every_cell_is_counted_once_and_counts_match_the_oracle(world: World) ->
     assert len(held) <= len(wanted)
 
 
-@settings(max_examples=60)
-@given(_worlds())
-def test_the_window_counts_equal_the_brute_force_counts(world: World) -> None:
-    """Counting per cell over the window equals testing every cell against every candidate; and the first field is the densest."""
+def _assert_window_counts_equal_brute_force(world: World) -> None:
     wanted = world.wanted()
     index, centres, origin = _lattice(
         world.well,
@@ -930,7 +1025,7 @@ def test_the_window_counts_equal_the_brute_force_counts(world: World) -> None:
         origin=origin,
         step_um=world.step_um,
         fov_um=_extent(world.matrix, world.shape),
-        inverse=_inverse_of(world.matrix, world.shape),
+        inverse=_inverse_of(world.matrix),
         half_px=(width / 2.0, height / 2.0),
     )
 
@@ -951,6 +1046,45 @@ def test_the_window_counts_equal_the_brute_force_counts(world: World) -> None:
     first = [sum(f.counts.values()) for f in world.choose(n=1, min_cells=1)]
     densest = max(brute, default=0)
     assert first == ([densest] if densest else [])
+
+
+@settings(max_examples=60)
+@given(_worlds())
+def test_the_window_counts_equal_the_brute_force_counts(world: World) -> None:
+    """Counting per cell over the window equals testing every cell against every candidate; and the first field is the densest."""
+    _assert_window_counts_equal_brute_force(world)
+
+
+@pytest.mark.parametrize("pixel_size_um", [1.0, 1.25, 0.5, 2.5])
+def test_a_cell_exactly_on_a_fields_edge_is_held_by_the_window_and_the_polygon(
+    pixel_size_um: float,
+) -> None:
+    """Six cells at the origin, on the edge of every field a half-field from it (found by a flaky run).
+
+    The frame is 30 pixels square, so a field is 30 pixels wide and its edge is 15
+    pixels from its centre: the lattice's step is half a field, and the fields
+    centred at +-1 step have the origin on their edge. The pixel sizes are
+    representable, so the pixel offset is exactly 15 and both definitions of
+    "inside" (the pixel offset and the polygon's cross products) are inclusive on
+    the edge. With ``inv = 0.8000000000000007`` for 1.25, taken by differences of
+    ``pixel_of_stage`` that add the frame's centre and take it off again, the offset
+    was 15.000000000000014 and the cell was dropped by the window alone.
+    """
+    matrix = _matrix(pixel_size_um, 0.0, False)
+    world = World(
+        well=_well(400.0),
+        matrix=matrix,
+        shape=(30, 30),
+        step_um=15.0 * pixel_size_um,
+        cells=tuple(_cell(0.0, 0.0) for _ in range(6)),
+        labels=("single",),
+        n=1,
+        min_cells=1,
+        margin_um=0.0,
+        exclude_um=0.0,
+    )
+
+    _assert_window_counts_equal_brute_force(world)
 
 
 @given(
@@ -977,9 +1111,7 @@ def test_pixel_offsets_undo_stage_of_pixel(
         0.0, 0.0, col, row, matrix=matrix, image_shape_px=(height, width)
     )
 
-    d_col, d_row = _pixel_offsets(
-        np.array([x]), np.array([y]), _inverse_of(matrix, (height, width))
-    )
+    d_col, d_row = _pixel_offsets(np.array([x]), np.array([y]), _inverse_of(matrix))
 
     assert d_col[0] == pytest.approx(col - (width - 1) / 2.0, abs=1e-6)
     assert d_row[0] == pytest.approx(row - (height - 1) / 2.0, abs=1e-6)

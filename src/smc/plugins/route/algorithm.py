@@ -56,8 +56,10 @@ Point = tuple[float, float]
 #: is derived from the camera's reported pixel size, which a wrong profile entry can
 #: make 1000 times too small (FM-121), and from a parameter a person types.
 _MAX_LATTICE_POINTS = 250_000
-#: Cell-by-lattice-point tests one call may make: at about 30 million a second,
-#: 2**31 is a minute, which is a refusal and not an invitation to wait.
+#: Cell-by-lattice-point tests one call may make. Measured at the bound (760 000
+#: cells, 2 809 window points each, numpy 2.5.4, an Apple M-series laptop): about
+#: 125 million tests a second, so 17 s and a peak of 1 GB, more on a slower PC. A
+#: refusal threshold and not a promise: nothing looks at a stop inside one well.
 _MAX_TESTS = 2**31
 #: Elements of one chunk of the counting (cells x window points), at about 94
 #: bytes each: 2**18 elements are 25 MB, 2**22 are 392 MB, and the time is the same.
@@ -206,7 +208,7 @@ def choose_fields(
         raise ValueError("labels must name at least one label")
     if not (math.isfinite(step_um) and step_um > 0.0):
         raise ValueError(f"step_um must be finite and positive, got {step_um!r}")
-    inverse = _inverse_of(matrix, image_shape_px)
+    inverse = _inverse_of(matrix)
     fov_um = fov_of(matrix, image_shape_px)
     position_of = {label: k for k, label in enumerate(dict.fromkeys(labels))}
     wanted = [
@@ -396,23 +398,25 @@ def _distance_to_segment(point: Point, start: Point, end: Point) -> float:
 _Inverse = tuple[tuple[float, float], tuple[float, float]]
 
 
-def _inverse_of(matrix: Matrix2, image_shape_px: tuple[int, int]) -> _Inverse:
+def _inverse_of(matrix: Matrix2) -> _Inverse:
     """``((a, b), (c, d))`` with ``d_col = a dx + b dy`` and ``d_row = c dx + d dy`` for a stage offset.
 
-    Read from ``pixel_of_stage`` at the origin and at one µm along each axis,
-    and not re-derived from the matrix, so that the sign convention stays in
-    ``geometry.py`` and a singular matrix is refused by its ``ValueError``.
+    Read from ``pixel_of_stage`` at one µm along each axis, and not re-derived
+    from the matrix, so that the sign convention stays in ``geometry.py`` and a
+    singular matrix is refused by its ``ValueError``. The frame asked about is
+    **one pixel**, whose centre is ``(0, 0)``: with the real frame, its centre is
+    added to the offset and taken off again, which costs a few ulps (``1 / 1.25``
+    came back as 0.8000000000000007 on a 30-pixel frame, a pixel offset of
+    15.000000000000014 for a cell exactly on a field's edge, and the cell was
+    dropped), and the offset does not depend on the frame.
     """
 
     def pixel(dx: float, dy: float) -> tuple[float, float]:
-        return pixel_of_stage(
-            0.0, 0.0, dx, dy, matrix=matrix, image_shape_px=image_shape_px
-        )
+        return pixel_of_stage(0.0, 0.0, dx, dy, matrix=matrix, image_shape_px=(1, 1))
 
-    col0, row0 = pixel(0.0, 0.0)
     col_x, row_x = pixel(1.0, 0.0)
     col_y, row_y = pixel(0.0, 1.0)
-    return ((col_x - col0, col_y - col0), (row_x - row0, row_y - row0))
+    return ((col_x, col_y), (row_x, row_y))
 
 
 def _pixel_offsets(
