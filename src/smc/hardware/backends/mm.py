@@ -1044,6 +1044,12 @@ class MMAutofocus:
       own (the demo's). ``setAutoFocusOffset`` is never used when an offset
       device is resolved: pymmcore-plus redirects it to the offset stage for
       ``NikonTI`` only, not for ``NikonTi2`` (m2 §1).
+    * **Engaging can drive Z to the stored offset's plane** (the Ti2-E, #205):
+      +235 µm past the soft limit in under 100 ms, with ``locked`` already
+      ``True``. On a stand that declares it, the layer engages only at an
+      offset it has seen locked; on every stand it reads Z while it engages
+      and switches the autofocus off once Z leaves its bound, and ``True``
+      waits for Z to settle when ``settle_s`` is set (m2 §12).
     """
 
     def __init__(
@@ -1242,7 +1248,12 @@ class MMAutofocus:
         return self._executor.read(self._read_engaged)
 
     def is_locked(self) -> bool:
-        """Whether it holds focus now (``isContinuousFocusLocked``)."""
+        """The device's lock flag (``isContinuousFocusLocked``); not settled (m2 §12).
+
+        On a declared stand, a ``True`` read makes the offset now set a seen
+        one with the objective now in place: the operator's lock, taken at
+        the stand, is seen here.
+        """
         return self._executor.read(self._read_locked)
 
     def is_in_range(self) -> bool | None:
@@ -1314,22 +1325,35 @@ class MMAutofocus:
         and the call raises. A Z stop is never a ``False``: that would read
         as "no lock found", not "stopped".
 
+        ``True`` means locked and settled (m2 §12.2 D3): with ``settle_s`` >
+        0, the wait goes on until Z has been still that long, within the same
+        ``timeout_s``. Before the switch-on, Z outside the soft limits refuses
+        it, and on a stand that declares ``engage_drives_z_to_offset`` so does
+        an offset not seen locked with this objective (D1). While it waits, Z
+        out of the soft limits or the band switches it off (D2).
+
         Raises:
-            ValueError: ``timeout_s`` is not finite or not in (0, 600] s;
-                nothing was sent.
+            ValueError: ``timeout_s`` is not finite or not in (0, 600] s, or
+                not above ``settle_s``; nothing was sent.
+            SafetyRefusedError: Z is outside the soft limits, or the offset was
+                not seen locked on a declared stand (switched off first if it
+                was searching); nothing else was sent. Not forceable.
+            AutofocusExcursionError: Z left its bound while it engaged; it was
+                switched off, and its offset is no longer a seen one.
             DeviceTimeoutError: No lock, and it could not be switched off (or
-                still reads on). The wait stays registered as a motion, so the
+                still reads on); or Z left its bound and it could not be
+                switched off. The wait stays registered as a motion, so the
                 stand refuses actions until ``stop()`` or ``resume()``.
             MotionStoppedError: ``disengage()`` or a stop cancelled the wait;
                 a ``ZStage.stop()`` left it off (named ``z <label>``), or
                 could not switch it off, or not in time, and then says it may
                 still move Z; or it cancelled the call before anything was
                 sent.
-            HardwareError: Its state could not be read once the wait ended. It
-                was given up on as at the deadline: switched off, or still
-                registered as a motion if that failed too. Or the Microscope
-                it belongs to no longer exists (FM-92); nothing was read or
-                sent.
+            HardwareError: Its state could not be read once the wait ended, or
+                Z could not be read while the guard needed it. It was given up
+                on as at the deadline: switched off, or still registered as a
+                motion if that failed too. Or the Microscope it belongs to no
+                longer exists (FM-92); nothing was read or sent.
         """
         limit_s, assumed = self._lock_timeout(timeout_s)
         description = "autofocus: engage"
