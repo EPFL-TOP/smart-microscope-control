@@ -839,7 +839,7 @@ plate-finding ──────┴─ plate ──► scan-plan ◄────
 | `goto-well` | `goto-well` | `plate` | — | `XYStage` | #19 | 5 |
 | `plate-finding` | `plate` | — | — | `XYStage`, `Camera` | #20 | 6 |
 | `scan-plan` | `scan-plan` | `plate` | `camera-calibration`, `timings` | `Camera` | #21 | 7 |
-| `scan` | `scan` | `scan-plan` | — | `XYStage`, `Camera` | #21 | 8 |
+| `scan` | `scan` | `scan-plan` | — | `XYStage`, `Camera` | #213 | 8 |
 | `cells` | `cells` | `scan` | — | — | #23 | 9 |
 | `density` | `density` | `scan-plan`, `scan`, `cells` | — | — | #193 | 10 |
 | `route` | `route` | `scan-plan`, `scan`, `cells` | `timings` | — | #194 | 11 |
@@ -1828,6 +1828,13 @@ duplicates are removed. `order_wells` gives plate order by rows,
 alternate rows reversed when `serpentine`; the result is what the scan
 visits and the route follows.
 
+Refined while planning #21: `B2-B5` and `A1:D6` are read alike, as the
+rectangle of two corners (the port's behaviour, so `B2-D2` is a run down a
+column); `all` is read in any case; a text that selects no well is a
+`ValueError` ("no wells selected"). Rows and columns are found in
+`plan.all_well_names` (§3.2), so `AA3` on a 1536-well plate is a well and
+`C*` is the row whose names start with `C` and continue with a digit.
+
 ### 7.2 Grid and clipping
 
 ```python
@@ -1867,6 +1874,18 @@ def estimate_s(
   footprint and the rotated square overlap (separating axes). A field
   that misses the well images only plastic. `index` is renumbered from 0
   in each well; `name` stays useq's.
+- Refined while planning #21 (measured, useq 0.9.2): an image position's
+  name is `<well>_<index:04d>`, a 1 × 1 grid included (`A1_0000`), so its
+  well is the name up to the last `_`; a position whose well is not one of
+  `wells`, or whose `x` or `y` is `None`, is a `ValueError` (useq changed,
+  not the plate). The corners of a footprint turn one way or the other
+  with the camera's mirror, so the round well's inside test accepts both
+  orientations. Measured on the Ti2-E's assumed camera (1412 × 1412 at
+  0.275 µm, 10 %): 305 of 361 fields of a 96-well well are kept, whether
+  the distance is compared with `<` or `≤`; with a frame of 300 × 512 at
+  1 µm on a plate turned by 13°, a 25 × 15 grid keeps 299 of 375 fields,
+  the same set as a 40 × 40 sampling of each footprint tested with
+  `WellGeometry.contains`.
 - `estimate_s` sums, over the fields in order, `timings.move_ms(distance
   from the previous field)` (the first from the first field: 0),
   `refocus_ms` when `refocus` and known, and `snap_ms`, in seconds.
@@ -1893,25 +1912,46 @@ class ScanPlanParams(PluginParams):
 
 - **The objective**: the parameter, else the turret's current one, else
   `None` (no turret). An objective that is not among `turret.labels()` is
-  a `PluginRunError`.
+  a `PluginRunError`, and so is one given on a stand without a turret
+  (nothing could check it, §8).
 - **The matrix**, in this order: (1) `pixel_size_um` given:
   `pixel_matrix`, `matrix_source="parameter"`, `assumed` gaining `pixel
   size given as a parameter; rotation 0 and no mirror assumed`; (2) a
   usable `camera-calibration` whose `objective` equals the plan's and
   whose `image_shape_px` equals `camera.image_shape()`: its matrix,
   `"camera-calibration"` (a calibration of another objective or shape is
-  ignored, and `assumed` says why); (3) the profile's size for the
-  objective, `turret.pixel_size_um(objective)`, or with no turret
-  `camera.pixel_size_um()`, when finite and positive (FM-104):
-  `pixel_matrix`, `"profile"`, `assumed` gaining `no camera calibration
-  for <objective>: rotation 0 and no mirror assumed`; (4) otherwise
+  ignored, and `assumed` says why: `camera calibration not used: it is of
+  <its objective>, the plan is for <objective>`, or `… it is of a frame of
+  <its shape>, the camera gives <shape>`); (3) the stand's configured
+  size, when finite and positive (FM-104): for the objective in place, or
+  with no turret, `camera.pixel_size_um()`; for another objective,
+  `turret.pixel_size_um(objective)`; then `pixel_matrix`, `"profile"`,
+  `assumed` gaining `no camera calibration for <objective>: rotation 0 and
+  no mirror assumed`. Refined while planning #21 (FM-103): the turret's size
+  is the profile's **at binning 1** (`MMObjectiveTurret.pixel_size_um`),
+  while the camera's includes the binning, the magnification factor and
+  MMCore's own pixel calibration (m2 §8.10), so the turret's would plan a
+  binned camera with fields half their size. Nothing in the `Camera`
+  protocol reads the binning, so a plan for an objective that is not in
+  place also gains `pixel size of <objective> from the profile, for binning
+  1: the camera's binning is not applied`. On the demo (measured) the
+  camera reports 1.0 µm with the 10× in place, the profile 0.65, the 40×
+  0.1625 and `Objective-2` 0.0; (4) otherwise
   `PluginRunError`: "no pixel size for <objective>: run
   camera-calibration with it in place, or add it to the profile's [camera]
   pixel_size_um" (#21's "refuses to plan without a pixel size").
 - `image_shape_px` is `camera.image_shape()`; `fov_um` the footprint's
   extent at the origin. When the camera's rotation makes the
-  axis-aligned grid open gaps (`sin |θ| > overlap / 2`), `assumed` says so
-  and suggests the overlap to use.
+  axis-aligned grid open gaps, `assumed` says so and suggests the overlap
+  to use. Refined while planning #21: the angle that matters is `φ`, the
+  distance from the calibration's `rotation_deg` to the nearest multiple of
+  90° (a camera at 90° or 180° fills its bounding box; the unfolded
+  `sin |θ|` warned at 90°); gaps are reported when `sin φ > overlap / 2`,
+  and the overlap suggested is `ceil(200 sin φ) / 100`, or, when that is
+  0.9 or more, none (the line says to straighten the camera). Measured on a
+  square frame: at 10 % overlap the first gap opens at 3.8°, the threshold
+  is 2.9°, so the warning comes early, never late. A matrix from the
+  profile or a parameter assumes no rotation and never warns.
 - `estimate_s` is `estimate_s(...)` when `timings` is usable, with
   `refocus` true when the stand has an `Autofocus`; else `None` (unknown,
   not guessed: the page says "run timing for an estimate").
@@ -1925,7 +1965,7 @@ with `test_parse_rejects_and_lists_every_item_it_cannot_read`;
 `test_no_pixel_size_refuses_to_plan`; `test_the_estimate_is_none_without_timings`;
 a non-square camera (FM-73). **Failure modes**: FM-73, FM-104, FM-103.
 
-## 8. The scan (#21)
+## 8. The scan (#213)
 
 `smc/plugins/scan/plugin.py`, entry point `scan`. A port of
 `scan.run_iter`, redesigned around the layer.
@@ -2657,7 +2697,8 @@ FM-98, FM-70 (the stop path takes no lock the worker holds), FM-44.
 1. **#199, the foundation (§3)**, first and alone: every other issue
    imports it.
 2. Then, in parallel, each in its own package (no two issues touch the
-   same module): **#22** (§4), **#19** (§5), **#21** (§7, §8), **#23**
+   same module): **#22** (§4), **#19** (§5), **#21** (§7), **#213**
+   (§8), **#23**
    (§9), **#24** (§12), **#193** (§10), **#194** (§11), **#20** (§6).
    Shared files: each adds its entry point line to `pyproject.toml`
    (sorted by name; the rebase conflict is expected and trivial), #22 adds
@@ -2667,7 +2708,8 @@ FM-98, FM-70 (the stop path takes no lock the worker holds), FM-44.
 4. **#196** (§14) once the NIS sample is in `local/`.
 5. **#198**, session 2 at the stand.
 
-For session 2 the critical path is #199 → #22, #19, #21, #23 → #194 →
+For session 2 the critical path is #199 → #22, #19, #21, #213, #23 →
+#194 →
 #195 or #197 → #196.
 
 ### 16.1 Not verified (for #198 and the owner)
