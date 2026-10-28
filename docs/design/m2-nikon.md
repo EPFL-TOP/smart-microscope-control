@@ -645,6 +645,16 @@ Measured on the demo (§1), unless labelled:
 - `autofocus_lockable: bool = True`: when `False`, the autofocus never
   reads locked, even enabled (no reference in range). Locked whenever
   enabled otherwise, as today (assumed).
+- `hold_whole_units(label)` makes a `Stage` or `AutoFocus` device hold
+  whole units, as the Ti2-E's `PFSOffset` does (session 1, #207: 7927.5
+  reads 7927, 7925.75 lands on 7925): a `setPosition(label, v)` or, for the
+  AutoFocus slot's device, a `setAutoFocusOffset(v)` stores `v` truncated
+  towards zero (measured above zero only; whether the device truncates or
+  rounds is unsettled, and 7927.5 fits both). `log` keeps `v` as sent; a
+  value that is not finite is stored as given. It raises `ValueError` for a
+  label that names no loaded `Stage` or `AutoFocus` device, so that a
+  misspelled label fails the test instead of building a stand that holds
+  fractions (FM-119).
 - `demo_like()` is unchanged: the demo has no offset device.
 
 A test that needs the Ti2-E's layout builds its own `FakeCore` from the
@@ -664,7 +674,17 @@ xy_stage=…, focus=…, autofocus=…)`, and it resolved `autofocus_offset` to
   `autofocus_offset_soft_limits` at the start ± 2.0, which must lie inside
   the profile's own (FM-48). A contract moves the offset at most 1.0 from
   the start, with the autofocus off, except in the locked `focus_by_um`
-  case. The teardown restores, in order: shutter closed, autofocus off
+  case. **In whole units** (#207, FM-119): the Ti2-E's `PFSOffset` holds
+  nothing finer, so every offset a contract sends is the start plus a whole
+  number, and no tolerance is left to absorb a fraction. The jog contract
+  sets start + 1.0, then jogs by −2.0: above the limit of 1.0, so refused,
+  and forced it lands at start − 1.0 (a jog clamped to the limit would land
+  at the start, which the contract tells apart). The `fake` stand's
+  autofocus holds whole units (`hold_whole_units`, §3.12) from an offset of
+  7927, a positive whole number like the stand's reads, and the `demo`'s
+  holds floats, so a contract that sends a fraction fails on `fake`. A
+  stand whose offset has a step coarser than one unit would need a step in
+  the profile; none is known. The teardown restores, in order: shutter closed, autofocus off
   (`disengage`), XY, Z (`keep_autofocus=False`), offset, exposure,
   auto-shutter, then the autofocus engaged if it was (no lock is a named
   teardown failure, FM-49), then the shutter. On `hardware`, a case that
@@ -673,7 +693,9 @@ xy_stage=…, focus=…, autofocus=…)`, and it resolved `autofocus_offset` to
 - **FakeCore** (`tests/unit/test_autofocus.py`, the Ti2-E layout above,
   through `Microscope.from_core`): the interlock with the quirk on
   (`test_moving_z_re_engages_pfs`), every refusal and failure path of §3.4
-  and §3.5, the slot, the offset device, the emergency stop, threading.
+  and §3.5, the slot, the offset device, the emergency stop, threading. A
+  `PFSOffset` that holds whole units gets a relative move that starts from
+  the read-back (`test_a_relative_offset_move_starts_from_the_whole_unit_readback`).
 - **Demo** (`tests/test_autofocus_demo.py`): what only the demo shows
   (the role from the core slot, no offset device, the offset through
   `DAutoFocus`, `state()`), beside the contracts' `demo` backend.
