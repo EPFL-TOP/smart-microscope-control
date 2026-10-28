@@ -840,6 +840,23 @@ def test_offset_jog_without_a_profile_limit_needs_force() -> None:
         assert stand.af.offset_unit() == "PFS offset steps"
 
 
+def test_a_relative_offset_move_starts_from_the_whole_unit_readback() -> None:
+    # Ti2-E session 1 (#208): 7927.5 read back 7927 and 7925.75 landed on 7925.
+    # The layer worked from what the device held, so the jog was 1.25 from 7927.
+    core = _at_offset(7927.0)
+    core.hold_whole_units("PFSOffset")
+    limited = _profile(safety={"max_autofocus_offset_jog": 1.0})
+    with _ti2(limited, core=core) as stand:
+        assert stand.af.set_offset_native(7927.5) == 7927.0
+        with pytest.raises(SafetyRefusedError):
+            stand.af.offset_by_native(-1.25)
+        assert stand.af.offset_by_native(-1.25, force=True) == 7925.0
+        assert core.log == [
+            "setPosition('PFSOffset', 7927.5)",
+            "setPosition('PFSOffset', 7925.75)",
+        ]
+
+
 def test_offset_is_refused_outside_the_soft_limits_even_forced() -> None:
     profile = _profile(
         safety={

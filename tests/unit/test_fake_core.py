@@ -7,6 +7,7 @@ keeps its inventory equal to the demo's.
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -496,6 +497,65 @@ def test_unloading_the_autofocus_empties_its_slot() -> None:
     core.unloadDevice("PFS")
     assert core.getAutoFocusDevice() == ""
     assert core.isContinuousFocusEnabled() is False
+
+
+# --- a device that holds whole units (m2 §3.12, FM-119) ----------------------
+
+
+def _core_with_offset_devices() -> FakeCore:
+    return FakeCore(
+        [
+            FakeDevice("Z", DeviceType.Stage),
+            FakeDevice("Off", DeviceType.Stage),
+            FakeDevice("PFS", DeviceType.AutoFocus),
+        ],
+        focus="Z",
+        autofocus="PFS",
+    )
+
+
+def test_hold_whole_units_truncates_a_stage_and_an_autofocus_offset() -> None:
+    # The Ti2-E's PFSOffset (#207): 7927.5 reads 7927, 7925.75 lands on 7925.
+    core = _core_with_offset_devices()
+    core.hold_whole_units("Off")
+    core.hold_whole_units("PFS")
+    core.setPosition("Off", 7925.75)
+    core.setAutoFocusOffset(7927.5)
+    assert core.getPosition("Off") == 7925.0
+    assert core.getAutoFocusOffset() == 7927.0
+    # A float still, as MMCore's reads are: 7925 == 7925.0 would pass an int.
+    assert isinstance(core.getPosition("Off"), float)
+    assert isinstance(core.getAutoFocusOffset(), float)
+    # The log keeps what the caller sent: the layer's call, not the device's reading.
+    assert core.log == ["setPosition('Off', 7925.75)", "setAutoFocusOffset(7927.5)"]
+    # A device that was not asked keeps its fraction.
+    core.setPosition("Z", 12.5)
+    assert core.getPosition("Z") == 12.5
+
+
+def test_hold_whole_units_truncates_towards_zero_and_stores_what_is_not_finite() -> (
+    None
+):
+    core = _core_with_offset_devices()
+    core.hold_whole_units("Off")
+    for sent, held in [(-0.75, 0.0), (-7925.75, -7925.0), (3.0, 3.0), (0.99, 0.0)]:
+        core.setPosition("Off", sent)
+        assert core.getPosition("Off") == held
+    core.setPosition("Off", float("inf"))
+    assert core.getPosition("Off") == float("inf")
+    core.setPosition("Off", float("nan"))
+    assert math.isnan(core.getPosition("Off"))
+
+
+def test_hold_whole_units_names_a_missing_or_mistyped_device() -> None:
+    # A misspelled label must fail the test, not build a stand that holds fractions.
+    core = FakeCore.demo_like()
+    for label in ("Zed", "Camera"):
+        with pytest.raises(
+            ValueError, match=f"{label!r} names no loaded Stage or AutoFocus"
+        ):
+            core.hold_whole_units(label)
+    core.hold_whole_units("Z")  # a loaded Stage is accepted
 
 
 # --- State labels and config groups (m2 §8.8) -------------------------------
