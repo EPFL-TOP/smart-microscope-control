@@ -10,6 +10,7 @@ sent, or when, changes: only what the errors, the notes and the lines say.
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import cast
@@ -18,7 +19,7 @@ import pytest
 from pymmcore_plus import CMMCorePlus, DeviceType
 
 from smc.hardware import Microscope
-from smc.hardware.capabilities import Autofocus, XYStage
+from smc.hardware.capabilities import Autofocus, ObjectiveTurret, XYStage
 from smc.hardware.errors import (
     HardwareError,
     MotionStoppedError,
@@ -35,6 +36,7 @@ from smc.hardware.profile import (
     SafetySection,
 )
 from smc.hardware.roles import Role
+from smc.hardware.safety import Executor, Motion
 from smc.testing import FakeCore, FakeDevice
 
 LOGGER = "smc.hardware.microscope"
@@ -142,6 +144,31 @@ def test_an_undeclared_refused_stop_raises_the_device_error_as_before(
     )
 
 
+def test_a_failed_linked_call_wins_over_a_declared_refusal() -> None:
+    # A declared refusal is no fault, but a PFS switch-off that failed is: the
+    # stopping caller must hear of it (adversarial review of #204).
+    executor = Executor(
+        dry_run=False, lock=threading.RLock(), logger=logging.getLogger(LOGGER)
+    )
+    sent: list[str] = []
+
+    def refuse() -> None:
+        sent.append("Z")
+        raise RuntimeError('Error in device "Z": Unsupported device command (11)')
+
+    def switch_off() -> None:
+        sent.append("PFS off")
+        raise ConnectionError("PFS: stuck on")
+
+    z = Motion("Z", "z Z", lambda: False, refuse, stop_refused=True)
+    with (
+        executor.linked_stop("Z", switch_off),
+        pytest.raises(ConnectionError, match=r"^PFS: stuck on$"),
+    ):
+        executor.stop(z)
+    assert sent == ["PFS off", "Z"]
+
+
 def test_stop_refused_error_is_not_a_safety_refusal() -> None:
     # FM-64: a tool that skips a target on a refusal must not read a move
     # that runs on as one that was never sent.
@@ -203,6 +230,27 @@ def test_ctrl_c_during_a_move_notes_an_accepted_stop() -> None:
         assert core.log == ["setXYPosition('XY', 10.0, 0.0)", "stop('XY')"]
     assert stop_notes(interrupted.value) == (
         StopNote("xy_stage XY", StopOutcome.accepted, False),
+    )
+
+
+def test_ctrl_c_during_a_turret_move_notes_that_it_cannot_be_stopped() -> None:
+    # A State device has no stop: the note must never read "accepted", or the
+    # Ctrl-C line would say a turret was stopped that was sent no stop.
+    with _stand(Profile.demo()) as (core, microscope):
+        turret = microscope.require(ObjectiveTurret)
+        target = next(label for label in turret.labels() if label != turret.current())
+        core.log.clear()
+        core.busy_devices = {"Objective"}
+        undo = _interrupt_the_first_busy_poll(core)
+        try:
+            with pytest.raises(KeyboardInterrupt) as interrupted:
+                turret.select(target, confirm=True)
+        finally:
+            undo()
+            core.busy_devices.clear()
+        assert "stop('Objective')" not in core.log
+    assert stop_notes(interrupted.value) == (
+        StopNote("objective_turret Objective", StopOutcome.impossible, False),
     )
 
 
@@ -279,6 +327,41 @@ def test_a_stop_during_a_move_on_a_declared_stand_says_it_may_have_run_to_its_ta
     )
 
 
+def test_a_stop_then_a_timeout_on_a_declared_stand_never_says_it_was_stopped() -> None:
+    # FM-117: the stop was refused, so "it was stopped" would be false
+    # (adversarial review of #204).
+    profile = _declared(Role.xy_stage)
+    micromanager = profile.micromanager.model_copy(update={"device_timeout_ms": 50})
+    with _stand(profile.model_copy(update={"micromanager": micromanager})) as (
+        core,
+        microscope,
+    ):
+        stage = microscope.require(XYStage)
+        polls: list[str] = []
+
+        def busy(label: str) -> bool:
+            polls.append(label)
+            if len(polls) == 1:
+                with pytest.raises(StopRefusedError):
+                    stage.stop()
+            return True
+
+        core.deviceBusy = busy  # type: ignore[method-assign]
+        try:
+            with pytest.raises(MotionStoppedError) as stopped:
+                stage.move_to_um(10.0, 0.0)
+        finally:
+            del core.deviceBusy
+    assert str(stopped.value) == (
+        "`xy_stage XY`: a stop was requested during the move, but the profile "
+        "declares that it refuses its stop ([safety] stop_refused_by), so it may "
+        "have run to its target; it still read busy at the move's 0.05 s timeout, "
+        "and on the timeout the stand refuses its stop, as the profile declares "
+        "([safety] stop_refused_by), so it runs to its target; read the position "
+        "before moving on"
+    )
+
+
 def test_a_timeout_on_a_declared_stand_says_the_move_runs_to_its_target() -> None:
     profile = _declared(Role.xy_stage)
     micromanager = profile.micromanager.model_copy(update={"device_timeout_ms": 50})
@@ -346,6 +429,20 @@ def test_every_stop_is_still_sent_in_order_on_a_declared_stand() -> None:
         with pytest.raises(StopRefusedError):
             microscope.stop()
         assert core.log == ["enableContinuousFocus(False)", "stop('XY')", "stop('Z')"]
+
+
+def test_the_emergency_stop_names_only_what_it_switched_off_beside_a_refusal() -> None:
+    # Z took its stop: it is neither "switched off" nor refused.
+    with (
+        _stand(_declared(Role.xy_stage), refused=("XY",)) as (_, microscope),
+        pytest.raises(StopRefusedError) as refused,
+    ):
+        microscope.stop()
+    assert refused.value.refused == ("xy_stage XY",)
+    assert str(refused.value).startswith(
+        "the emergency stop halted the microscope and switched autofocus Autofocus "
+        "off, but xy_stage XY refused the stop, as the profile declares"
+    )
 
 
 def _left_moving(core: FakeCore, microscope: Microscope) -> None:
@@ -450,6 +547,32 @@ def test_the_emergency_stop_on_the_ti2_names_the_pfs_offset_too() -> None:
         "the emergency stop halted the microscope and switched autofocus PFS off, "
         "but autofocus_offset PFSOffset, xy_stage XYStage and z ZDrive refused the "
         "stop, as the profile declares"
+    )
+
+
+def test_close_on_the_ti2_names_an_accepted_offset_stop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A firmware whose PFS offset took its stop: close() says it was stopped.
+    core, microscope = _ti2_stand()
+    core.stop_refused = {"XYStage", "ZDrive"}
+    try:
+        core.busy_devices = {"XYStage"}
+        undo = _interrupt_the_first_busy_poll(core)
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                microscope.require(XYStage).move_to_um(10.0, 0.0)
+        finally:
+            undo()
+        with caplog.at_level(logging.WARNING, logger=LOGGER):
+            microscope.close()
+    finally:
+        microscope.close()
+    assert caplog.messages[-1] == (
+        "close: xy_stage XYStage still moving; stopped: autofocus PFS off, "
+        "autofocus_offset PFSOffset; refused, as the profile declares ([safety] "
+        "stop_refused_by), so a move under way runs to its target: xy_stage "
+        "XYStage, z ZDrive"
     )
 
 

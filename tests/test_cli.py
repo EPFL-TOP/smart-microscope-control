@@ -31,7 +31,7 @@ from smc.hardware import Microscope
 from smc.hardware import core as core_mod
 from smc.hardware import microscope as microscope_mod
 from smc.hardware.backends import nikon
-from smc.hardware.backends.mm import MMXYStage
+from smc.hardware.backends.mm import MMXYStage, MMZStage
 from smc.hardware.capabilities import XY
 from smc.hardware.errors import (
     CoreError,
@@ -837,6 +837,38 @@ def test_a_move_on_a_declared_axis_prints_that_ctrl_c_will_not_stop_it(
     result = runner.invoke(app, ["z", "jog", "1", "-p", xy_only])
     assert result.exit_code == 0, result.output
     assert "! the profile declares" not in result.output
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+@pytest.mark.parametrize(
+    ("args", "role"),
+    [
+        (["stage", "move", "10", "0"], "xy_stage"),
+        (["stage", "jog", "5", "0"], "xy_stage"),
+        (["z", "move", "1"], "focus"),
+        (["z", "jog", "1"], "focus"),
+    ],
+)
+def test_the_stop_line_is_printed_before_the_move_is_sent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, args: list[str], role: str
+) -> None:
+    # A Ctrl-C during the move is when the operator needs the line: printed
+    # after the move, it would never show (m2 §11.6).
+    def interrupted(*_: object, **__: object) -> object:
+        raise KeyboardInterrupt
+
+    for stage in (MMXYStage, MMZStage):
+        for name in ("move_to_um", "move_by_um"):
+            monkeypatch.setattr(stage, name, interrupted)
+    profile = str(_declaring(tmp_path, f'["{role}"]'))
+    result = runner.invoke(app, [*args, "-p", profile])
+    assert result.exit_code == 130, result.output
+    assert (
+        f"! the profile declares that this stand refuses stop() on {role} ([safety] "
+        "stop_refused_by): once sent, a move runs to its target, and Ctrl-C ends "
+        "smc, not the move"
+    ) in result.output.splitlines()
 
 
 @pytest.mark.demo

@@ -924,6 +924,18 @@ def test_stop_refused_by_refuses_a_misspelt_role_listing_the_three(
     assert "among xy_stage, focus, autofocus_offset" in msg
 
 
+@pytest.mark.parametrize(
+    ("value", "shown"),
+    [('[["xy_stage"]]', "['xy_stage']"), ("[{a = 1}]", "{'a': 1}")],
+)
+def test_stop_refused_by_refuses_a_nested_array_naming_the_key(
+    tmp_path: Path, value: str, shown: str
+) -> None:
+    # An unhashable entry once raised a bare TypeError out of Profile.load.
+    msg = _load_error(tmp_path, f"[safety]\nstop_refused_by = {value}\n")
+    assert f"safety.stop_refused_by: {shown} is not a role with a stop" in msg
+
+
 def test_stop_refused_by_refuses_a_role_named_twice(tmp_path: Path) -> None:
     msg = _load_error(
         tmp_path, '[safety]\nstop_refused_by = ["xy_stage", "focus", "xy_stage"]\n'

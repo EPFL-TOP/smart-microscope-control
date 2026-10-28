@@ -958,6 +958,20 @@ def test_smc_run_on_a_declared_stand_prints_the_stop_line(
     assert stand_events.index(_XY_DECLARED_LINE) < stand_events.index("stand closed")
 
 
+def test_a_dry_run_on_a_declared_stand_prints_no_stop_line(
+    fake_stand: list[bool], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A dry run sends nothing, so nothing runs to its target (m2 §11.6).
+    _register(monkeypatch, Good)
+    profile = _declaring_xy(tmp_path)
+    result = _run(
+        "run", "good", "--dry-run", "--run-doc", _doc(tmp_path), "-p", profile
+    )
+    assert result.exit_code == 0, result.output
+    assert fake_stand == [True]
+    assert "! the profile declares" not in result.output
+
+
 def test_smc_run_on_a_stand_that_declares_nothing_prints_no_stop_line(
     fake_stand: list[bool], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -189,7 +189,11 @@ class SafetySection(_Section):
         names = [getattr(entry, "value", entry) for entry in value]
         allowed = ", ".join(role.value for role in ROLES_WITH_A_STOP)
         for name in names:
-            if name not in {role.value for role in ROLES_WITH_A_STOP}:
+            # A string first: a nested array is unhashable, and the TypeError
+            # of a set lookup would escape pydantic, unnamed.
+            if not isinstance(name, str) or name not in {
+                role.value for role in ROLES_WITH_A_STOP
+            }:
                 raise ValueError(
                     f"{name!r} is not a role with a stop; stop_refused_by lists "
                     f"roles among {allowed}"

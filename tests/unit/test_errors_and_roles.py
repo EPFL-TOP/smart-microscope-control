@@ -152,6 +152,21 @@ def test_stop_notes_ends_on_a_context_chain_that_loops() -> None:
     assert stop_notes(first) == (note,)
 
 
+class _FrozenError(Exception):
+    """An exception that takes no attribute: a plugin's or a library's own."""
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError(name)
+
+
+def test_a_note_on_an_exception_that_takes_none_is_dropped_not_raised() -> None:
+    # `_move` notes every exception a move raises: a note that raised would
+    # replace that exception with its own AttributeError.
+    frozen = _FrozenError("the plugin's own error")
+    note_stop(frozen, StopNote("xy_stage XY", StopOutcome.refused, True))
+    assert stop_notes(frozen) == ()
+
+
 def test_stop_notes_of_an_exception_without_notes_is_empty() -> None:
     assert stop_notes(KeyboardInterrupt()) == ()
     assert stop_notes(_raised_with_context(ValueError(), KeyboardInterrupt())) == ()

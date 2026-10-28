@@ -903,10 +903,16 @@ class Executor:
                 if self._generation(motion.device) != generation:
                     # The caller asked for the stop: the move ended as stopped,
                     # and the timeout is no reason to raise device_timeout_ms.
+                    # A declared refusal never says "it was stopped" (FM-117).
+                    stopped = (
+                        f"{_STOPPED_DECLARED};"
+                        if motion.stop_refused
+                        else "it was stopped, but"
+                    )
                     raise MotionStoppedError(
                         motion.name,
-                        f"it was stopped, but it still read busy at the move's "
-                        f"{limit_s:g} s timeout, and on the timeout {outcome}",
+                        f"{stopped} it still read busy at the move's {limit_s:g} s "
+                        f"timeout, and on the timeout {outcome}",
                     )
                 raise DeviceTimeoutError(
                     f"{motion.name} is still busy after {limit_s:g} s; {outcome}. "
@@ -1313,6 +1319,10 @@ class Executor:
             error = self._send_stop(motion, send)
             if interrupted is not None:
                 raise interrupted
+            if isinstance(error, StopRefusedError) and failure is not None:
+                # A declared refusal is no fault, and a link that failed (PFS
+                # still on, so still driving Z) is: the caller hears of it.
+                return failure
             return error or failure
         finally:
             # Both were caught in this frame, so each is a cycle: exception ->
