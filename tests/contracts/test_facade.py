@@ -199,27 +199,30 @@ def test_envelope_refuses_a_start_too_close_to_the_profile_limits(
         pytest.fail.Exception, match=r"too close to its Z soft limits \[-1000, 1\] µm"
     ):
         envelope.profile(near_z)
-    # The autofocus offset starts at 0.0 too; its window is +/- 2.0, in its
-    # own units (m2 §3.13).
-    assert envelope.offset_native == 0.0
-    near_offset = limited(autofocus_offset_soft_limits=(-1000, 1))
+    # The autofocus offset starts at 7927.0, a whole number, as the fake stand's
+    # autofocus holds whole units (#207); its window is +/- 2.0, in its own
+    # units (m2 §3.13).
+    o0 = 7927
+    assert envelope.offset_native == o0
+    near_offset = limited(autofocus_offset_soft_limits=(o0 - 1000, o0 + 1))
     with pytest.raises(
         pytest.fail.Exception,
-        match=r"too close to its autofocus offset soft limits \[-1000, 1\] device "
-        r"units: the contracts need \[-2, 2\] device units",
+        match=rf"too close to its autofocus offset soft limits \[{o0 - 1000}, "
+        rf"{o0 + 1}\] device units: the contracts need \[{o0 - 2}, {o0 + 2}\] "
+        r"device units",
     ):
         envelope.profile(near_offset)
     roomy = limited(
         xy_soft_limits_um=((-1000, 1000), (-1000, 1000)),
         z_soft_limits_um=(-10, 10),
-        autofocus_offset_soft_limits=(-10, 10),
+        autofocus_offset_soft_limits=(o0 - 10, o0 + 10),
         max_autofocus_offset_jog=50.0,
     )
     safety = envelope.profile(roomy).safety
     assert safety.xy_soft_limits_um == ((-100, 100), (-100, 100))
     assert safety.z_soft_limits_um == (-3, 3)
     # The window replaces the profile's limit, and the contracts' jog limit its.
-    assert safety.autofocus_offset_soft_limits == (-2.0, 2.0)
+    assert safety.autofocus_offset_soft_limits == (o0 - 2.0, o0 + 2.0)
     assert safety.max_autofocus_offset_jog == 1.0
 
 

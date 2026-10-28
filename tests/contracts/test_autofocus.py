@@ -1,7 +1,8 @@
 """The ``Autofocus`` contract, on every backend (m2 §3.2, §3.13).
 
 The offset moves at most 1.0 from where it started (``envelope.offset_native``),
-in its own units and with the autofocus off, except in the locked
+in its own units and in whole units (the Ti2-E's ``PFSOffset`` holds nothing
+finer, FM-119) and with the autofocus off, except in the locked
 ``focus_by_um`` case, which moves it by 1.0. Z moves only below its start, by
 at most 2 µm, as in the ``ZStage`` contract. A case that needs a lock skips on
 ``hardware`` when none comes ("no lock on this sample"), or when the engage
@@ -134,18 +135,31 @@ def test_offset_round_trips_within_tolerance(
 def test_offset_jog_above_the_limit_is_refused_and_sends_nothing(
     autofocus: Autofocus, envelope: Envelope
 ) -> None:
-    # From start + 0.5, a jog of -1.25 is above the 1.0 limit and lands at
-    # start - 0.75: the offset never leaves 1.0 of where it started.
+    # Whole units only: the Ti2-E's PFSOffset holds whole units (FM-119). From
+    # start + 1, a jog of -2 is above the 1.0 limit and lands at start - 1: the
+    # offset never leaves 1.0 of where it started.
     o0, tol = _offset_start(envelope), envelope.offset_tolerance
-    assert envelope.max_offset_jog < 1.25
+    assert envelope.max_offset_jog < 2.0
     autofocus.disengage()
-    autofocus.set_offset_native(o0 + 0.5)
+    autofocus.set_offset_native(o0 + 1.0)
     with pytest.raises(SafetyRefusedError) as refused:
-        autofocus.offset_by_native(-1.25)
+        autofocus.offset_by_native(-2.0)
     assert refused.value.how_to_force == "pass force=True"
-    assert abs(autofocus.offset_native() - (o0 + 0.5)) <= tol
-    landed = autofocus.offset_by_native(-1.25, force=True)
-    assert abs(landed - (o0 - 0.75)) <= tol
+    assert abs(autofocus.offset_native() - (o0 + 1.0)) <= tol
+    landed = autofocus.offset_by_native(-2.0, force=True)
+    assert abs(landed - (o0 - 1.0)) <= tol
+
+
+def test_the_fake_stand_holds_whole_units(
+    backend: str, request: pytest.FixtureRequest
+) -> None:
+    # The contracts above pass on a device that holds floats too; this is what
+    # keeps the fake stand the one that shows a fraction (FM-119, #207).
+    if backend != "fake":
+        pytest.skip("only the fake stand is configured to hold whole units")
+    # After the skip: a hardware run never opens the stand for this case.
+    stand: Microscope = request.getfixturevalue("stand")
+    assert stand.require(Autofocus).set_offset_native(7927.5) == 7927.0
 
 
 def test_offset_outside_the_soft_limits_is_refused_even_forced(
