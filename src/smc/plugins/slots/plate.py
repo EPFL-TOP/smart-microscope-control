@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 import numpy as np
+import numpy.typing as npt
 import useq
 from pydantic import Field, field_validator
 
@@ -125,7 +126,8 @@ class WellGeometry:
     """Where a well is and what shape it has: the one place that knows.
 
     Density, the route, the report and the scan plan's clipping use ``contains``
-    and nothing else re-derives a well's shape. ``size_um`` is ``(width,
+    (density's raster, its vectorised twin ``contains_many``) and nothing else
+    re-derives a well's shape. ``size_um`` is ``(width,
     height)`` from the plate's ``well_size``; ``rotation_deg`` is the plate's,
     in which a square well is axis-aligned.
     """
@@ -170,6 +172,51 @@ class WellGeometry:
             return half_u > 0.0 and u * u + v * v <= half_u * half_u
         half_v = self.size_um[1] / 2.0 - margin_um
         return half_u > 0.0 and half_v > 0.0 and abs(u) <= half_u and abs(v) <= half_v
+
+    def contains_many(
+        self,
+        x_um: npt.NDArray[np.float64],
+        y_um: npt.NDArray[np.float64],
+        *,
+        margin_um: float = 0.0,
+    ) -> npt.NDArray[np.bool_]:
+        """``contains`` for many points at once: the same answer for each, the edge included.
+
+        ``x_um`` and ``y_um`` broadcast against each other, so a row against a
+        column is a grid and the result has the broadcast shape. The arithmetic
+        is ``contains``' own, in the same order, because two correct definitions
+        of "inside" differ by one ulp on the edge (FM-132); the test holds the
+        two to each other, margins and points that are not finite included. No
+        matrix product on the coordinates (FM-131).
+
+        Raises:
+            ValueError: ``margin_um`` is negative or not finite.
+        """
+        if not (math.isfinite(margin_um) and margin_um >= 0.0):
+            raise ValueError(
+                f"margin_um must be finite and not negative, got {margin_um!r}"
+            )
+        x = np.asarray(x_um, dtype=np.float64)
+        y = np.asarray(y_um, dtype=np.float64)
+        shape = np.broadcast_shapes(x.shape, y.shape)
+        half_u = self.size_um[0] / 2.0 - margin_um
+        half_v = self.size_um[1] / 2.0 - margin_um
+        if half_u <= 0.0 or (not self.circular and half_v <= 0.0):
+            return np.zeros(shape, dtype=np.bool_)
+        angle = math.radians(self.rotation_deg)
+        cos, sin = math.cos(angle), math.sin(angle)
+        # numpy warns `overflow` and `invalid value` where Python's floats go to
+        # `inf` and `nan` without a word: a point at 1e200 is outside, not a warning.
+        with np.errstate(over="ignore", invalid="ignore"):
+            dx = x - self.center_um[0]
+            dy = y - self.center_um[1]
+            u = cos * dx + sin * dy
+            v = -sin * dx + cos * dy
+            if self.circular:
+                inside = u * u + v * v <= half_u * half_u
+            else:
+                inside = (np.abs(u) <= half_u) & (np.abs(v) <= half_v)
+        return np.asarray(inside & np.isfinite(x) & np.isfinite(y), dtype=np.bool_)
 
 
 def well_geometry(plan: useq.WellPlatePlan, well: str) -> WellGeometry:
