@@ -3,7 +3,8 @@
 - **Status**: design for issue #13 (§1–§6, 2026-10-16); §3.3.1 and
   §3.11's stop rules decided in #144 (2026-10-18); §7 for #12
   (2026-10-19); §8 for #14 (2026-10-19); §8.10 for #167 (2026-10-20); §9
-  for #48 (2026-10-20); §10 for #15 (2026-10-20); §11 for #204 and #206 (2026-10-28).
+  for #48 (2026-10-20); §10 for #15 (2026-10-20); §11 for #204 and #206 (2026-10-28); §12 for
+  #205 (2026-10-28).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1, this document is the contract between issues that are
   built in parallel. Names, module paths and signatures below are fixed; an
@@ -21,7 +22,8 @@ M2 brings the Nikon stands under the layer: the `Autofocus` capability and
 the Z interlock (#13), `ObjectiveTurret`, `LightSource` and `Channels`
 (#14), the stand knowledge from `nikon-control` (#12), the configuration
 builder (#15) and a truthful probe (#48). §1–§6 fix #13; §7 fixes #12;
-§8 fixes #14; §9 fixes #48; §10 is #15's; §11 is #204's, a stand that refuses `stop()`.
+§8 fixes #14; §9 fixes #48; §10 is #15's; §11 is #204's, a stand that refuses `stop()`; §12 is #205's, engaging an
+autofocus that drives Z to its offset's plane.
 
 Not in #13: one-shot autofocus (`fullFocus`), a CLI command for the
 autofocus, the piezo (§2), camera-clocked sequences, and the Zeiss
@@ -157,6 +159,9 @@ native delta (§3.5).
   the stand refuses actions until `stop()` or `resume()`. `timeout_s` must be
   finite and in (0, `MAX_LOCK_TIMEOUT_S` = 600] s, else `ValueError` before
   anything is sent (FM-32): the wait holds the microscope lock.
+  **On the Ti2-E, engaging drives Z to the plane the stored offset names**:
+  when the layer may engage, the Z guard around it, and when `True` means
+  settled are §12 (#205).
 
   This differs from `nikon-control`, which leaves PFS on after a failed
   lock. A PFS left searching can move Z with no action holding the lock and
@@ -342,6 +347,7 @@ On a stand whose `autofocus` role is filled, `ZStage.move_to_um` and
    raises `AutofocusLostError` (§3.10), naming where Z landed, the timeout
    and `is_in_range()`; the autofocus is then off. A Z move under PFS that
    silently leaves PFS off is the "PFS off overnight" that ADR-0003 names.
+   The relock runs §12's check and Z guard, as `engage()` does.
 5. The return value is the Z readback of step 3, before the relock: once
    the autofocus holds focus again, `position_um()` reads where it holds it.
 
@@ -2747,9 +2753,8 @@ refusing theirs:
 `ZStage.stop()` on a link still switches PFS off first. Then Z's own
 refusal raises `StopRefusedError`, and the compound reports its
 `MotionStoppedError` naming Z, "so autofocus PFS was left off", which is
-true. #205 (engaging PFS drives Z to the stored offset's plane) is a
-separate decision: it is about where `engage()` takes Z, not how the move
-is stopped.
+true. Where `engage()` takes Z, and what bounds it, is §12 (#205): it is
+about where the move goes, not how it is stopped.
 
 ### 11.10 Not verified
 
@@ -2763,3 +2768,350 @@ is stopped.
   it at session 2.
 - The wording of m3 §15's STOP on such a stand. The page shows `stop()`'s
   error text (§15.1), and its own label is m3's, after #214.
+
+## 12. Engaging an autofocus that drives Z to its offset's plane (#205)
+
+Extends §3.2 (`engage`), §3.4 (the relock), §3.6 and §3.9. **Merging this
+section decides it**: §12.2 answers #205's three questions, with the
+options not chosen and why. FM-118 is the checklist entry.
+
+### 12.1 What is known
+
+Measured in Ti2-E session 1 (#208; `nikon-ti2.md`, *Session 1*), unless
+labelled:
+- **Engaging PFS drives Z to the plane its stored offset names**, not to
+  the operator's focus. Run 1 (10×, a dish focused by eye at 4269.44 µm, PFS
+  off, offset 9370 left from an earlier use): `enableContinuousFocus(True)`,
+  then `locked` read True at the first read (0.1 s), Z unchanged for 0.5 s,
+  then Z at 4504.76 µm at the next 100 ms read: +235 µm, 155 µm above the
+  4350 µm soft limit. The stand's PFS button did the same (about 200 µm).
+- **Once the offset was set on the sample** (PFS on, the knob turned until
+  the cells were sharp: 7927), engaging moved nothing, three times, and
+  `enableContinuousFocus(True)` sent again while locked moved nothing.
+- `deviceBusy("ZDrive")` never read True, in 928 reads, the jump included.
+  `locked` is not "Z has arrived", and busy is not "PFS is moving Z".
+- With no sample, PFS on for 10 s never locked and Z stayed within
+  0.02 µm (§4.2): a search with no reference moves no Z.
+- Under lock, an offset change moves Z: +50 units gave +6.68 µm, and Z
+  settled in about 0.3 s, then crept by about 0.3 µm over 5 s (§4.4). With
+  PFS off, an offset change moves no Z (§4.5).
+- The layer polls a wait every 10 ms (`POLL_INTERVAL_S`). How long one Z
+  read takes on the Ti2-E was not measured (§12.9).
+- `PFS Status` read `0000001100001001` while Z was still to move and
+  `0000001100001010` once it had, and flips between the two while the
+  offset moves under lock. That a bit means "settled" is a hypothesis.
+- Loading the configuration leaves PFS and its offset as the last user of
+  the stand left them (7803, then 9370, then 7927).
+- **What the layer does today** (`main` 6fc1b14): `engage()` waits for
+  `isContinuousFocusLocked()` and reads nothing else. Nothing bounds Z while
+  PFS drives it, and nothing checks where the offset came from.
+- **The demo** (`DAutoFocus`) moves nothing when it engages (§1).
+
+### 12.2 Decisions
+
+**D1. When the layer may engage: only at an offset it has seen locked, on
+a stand that declares the behaviour.** A profile key,
+`[autofocus] engage_drives_z_to_offset = true`, declares that engaging
+drives Z to the plane the stored offset names (measured on the Ti2-E). On
+such a stand, `engage()` and the relock send nothing unless the offset now
+set is one at which this autofocus has been **read locked, with the same
+objective in place, since this `Microscope` was opened**: a *seen offset*.
+Otherwise `engage()` is refused (`SafetyRefusedError`, not forceable), and
+the relock raises `AutofocusLostError` (§12.5).
+- A lock is seen by **any read the layer makes** that finds it locked:
+  `is_locked()`, the lock wait's polls, `suspend()`, the implied-Z check,
+  `focus_by_um`. So the operator's lock, taken at the stand before
+  anything runs, becomes a seen offset at the first `is_locked()`, which
+  m3's scan makes before anything moves (m3 §8). An offset the layer moves
+  while PFS is locked becomes seen at the next locked read, since PFS
+  follows it (§4.4).
+- **Engaging a seen offset is the case m3 needs**: the scan's per-field
+  `engage()` after a lost lock, at the operator's offset, on the same
+  sample. The plane it drives to is that offset's on this sample, so the
+  jump is bounded by the sample's own shape, which D2 bounds.
+- **Not forceable.** A forced engage of an unknown offset at 40× is the
+  crash itself, and D2 cannot stop a jump that ends between two reads. The
+  route for a new sample or objective is the stand's own: focus by eye,
+  PFS on with the button, the knob until the sample is sharp. That is how
+  run 2 got its offset, and it happens under the operator's eyes.
+- **PFS on, searching, at an unseen offset** is switched off before the
+  refusal (a safe call, `disengage()`): left searching, it would drive Z to
+  that offset's plane the moment it found the reference. The refusal says
+  so.
+- **Undeclared stands** (the demo, the default) engage as today; D2 and D3
+  apply to every stand.
+- Not chosen: *`force=True` on `engage()`*, for the reasons above; it would
+  also change the `Autofocus` Protocol for a call no tool should make.
+- Not chosen: *offsets kept beyond the process* (in the profile or a run
+  document). The layer cannot tell that the sample is the same: a kept
+  offset is #205's stale offset by design. m3's `pfs_offset` per position
+  stays a record for NIS-Elements, never something smc engages from.
+- Not chosen: *predicting Z for an unseen offset from `offset_per_um`*. The
+  factor varies (5.9 to 10.8 units/µm on one objective, §4.4) and converts
+  a *change* between two locked planes; it says nothing about where an
+  offset never locked on this sample lies.
+- Not chosen: *never engaging from smc on the Ti2-E*. The scan then loses
+  every field after a lost lock, which is what m3 §8 relies on PFS to avoid.
+
+**D2. A Z guard around every engage, on every stand: it limits the damage,
+it cannot prevent it.** `engage()`, the relock and `focus_by_um`'s relock
+read Z before switching on, then at every poll of the lock wait and of D3's
+settle window:
+- **Before anything is sent**, Z outside `[safety] z_soft_limits_um`
+  refuses the engage (`SafetyRefusedError`, not forceable): the guard
+  could not tell a jump from where Z already is.
+- **While it waits**, Z outside the soft limits, or outside the *band*,
+  switches the autofocus off at once (the lock wait's own stop), forgets
+  the offset (D1) and raises `AutofocusExcursionError` (§12.5). The band is
+  `[min(z_start, z_held) − E, max(z_start, z_held) + E]`, with `E` the new
+  `[safety] max_engage_excursion_um`, `z_start` the Z read before the
+  switch-on, and `z_held` the Z at which PFS held its lock when `suspend()`
+  switched it off for the move (the relock only; else `z_start`). A relock
+  brings Z back to where PFS held it (§3.5: "a Z move would be undone by the
+  relock"), so the way back is inside the band. Without `E`, only the soft
+  limits bound it.
+- **It is a limit, not a prevention**, and every message says so: Z is read
+  every `POLL_INTERVAL_S` plus the read's own time, and run 1's jump took
+  less than 100 ms. What the guard buys: PFS is not left holding Z past a
+  limit, a jump is named instead of read as a lock, and on a declared stand
+  the forgotten offset refuses every later engage until the operator locks
+  again.
+- **An excursion is an error, not a refusal** (FM-64): something moved.
+  `AutofocusExcursionError` is a `HardwareError`. m3's scan records it as a
+  failed field (m3 §8); its next engage is refused before anything is sent,
+  so `max_failed_in_row` ends the scan with no second jump.
+- **A Z read that fails** while the guard needs it switches the autofocus
+  off and raises the read's `HardwareError` (unknown counts as the state
+  that adds the safeguard, FM-19).
+- **No focus drive to read** (no `ZStage` at all): no guard, and a WARNING
+  per engage says so. An overridden `ZStage` is read like the built one:
+  the guard only reads, unlike §3.3.1's links, which need `MMZStage`'s
+  stop.
+- The guard reads Z only when it has something to check (a soft limit,
+  `E`, or D3's window); otherwise the lock wait reads what it reads today.
+- Not chosen: *halting the microscope on an excursion*. The forgotten
+  offset already refuses the next engage, and a halt would also refuse the
+  reads that diagnose what happened.
+- Not chosen: *a watchdog over PFS while it holds focus between actions*.
+  Locked PFS following the sample is not a motion (§3.3); watching it is a
+  thread of its own, for M5 if the sessions show a need.
+
+**D3. What "locked" means to the layer.** `is_locked()` stays the device's
+own flag, and its docstring says what it is not: on the Ti2-E it read True
+before Z had moved. **`engage()` returning `True` means locked and
+settled**: with `[autofocus] settle_s` > 0, after the first locked read
+the wait goes on until every Z read of the last `settle_s` lies within
+`[autofocus] settle_tolerance_um` of each other, and it still reads locked
+(a lock lost meanwhile starts the window again at the next locked read).
+`timeout_s` bounds the whole engage, the lock and the settling. A lock that
+has not settled by then is given up like no lock: switched off, `False`, a
+WARNING that names the spread. `settle_s = 0` (the default) keeps today's
+behaviour: the first locked read ends the wait.
+- The Ti2-E's profile sets `settle_s = 1.0` (chosen: Z moved 0.5 s after
+  the lock, once) and `settle_tolerance_um = 0.5` (chosen: the creep is
+  about 0.06 µm/s).
+- Not chosen: *the `PFS Status` bit*. It is a hypothesis from one run;
+  session 2 reads it (§12.9). If it holds, a later change adds a key, as
+  `in_range_property` was added.
+- Not chosen: *a fixed wait after the lock*. It ends on time, not on Z, and
+  one observation does not bound the delay.
+
+### 12.3 Profile — `profile.py`
+
+```toml
+[safety]
+# max_engage_excursion_um = 50.0  # how far Z may move while the autofocus engages, beyond where it starts or held; omitted: only z_soft_limits_um bound it (m2 §12)
+
+[autofocus]
+# engage_drives_z_to_offset = false  # engaging drives Z to the plane the stored offset names; then the layer engages only at an offset it has seen locked (m2 §12)
+# settle_s = 0.0                     # after the first locked read, engage() waits until Z has been still this long; 0: the lock is taken as read
+# settle_tolerance_um = 0.5          # how far apart the Z reads of that window may lie
+```
+
+```python
+class SafetySection(_Section):  # gains, after stop_refused_by
+    max_engage_excursion_um: float | None = None
+
+
+class AutofocusSection(_Section):  # gains, last
+    engage_drives_z_to_offset: bool = False
+    settle_s: float = 0.0
+    settle_tolerance_um: float = 0.5
+```
+
+Validation, each a `ProfileError` naming the key:
+- `max_engage_excursion_um`: positive and finite;
+- `settle_s`: finite, in [0, 60], and below `lock_timeout_s` (below the
+  default 5 s when that is unset; a model validator), since the lock
+  timeout bounds the settling too;
+- `settle_tolerance_um`: positive and finite;
+- a TOML boolean is refused for the three numeric keys (#106).
+
+`profile.py` mirrors `DEFAULT_LOCK_TIMEOUT_S` as it mirrors
+`MAX_LOCK_TIMEOUT_S` (a pure module imports no backend), and a test pins
+that the two agree.
+
+`Profile.demo()` and `profiles/demo.toml` stay equal: the demo sets none of
+them, and the commented lines go into `demo.toml`. `profiles/README.md`
+documents them. `profiles/nikon-ti2.toml` sets, each with its source:
+`engage_drives_z_to_offset = true` (measured, #208),
+`settle_s = 1.0` and `settle_tolerance_um = 0.5` (chosen, D3),
+`max_engage_excursion_um = 50.0` (chosen, for the owner to confirm at
+session 2), and drops `# PFS-driven Z is not bounded by these (#205)` and
+the `[quirks]` line on engaging, which the keys now carry.
+
+### 12.4 Backend — `backends/mm.py`, `safety.py`
+
+```python
+class Safety:  # gains
+    def __init__(self, *, ..., max_engage_excursion_um: float | None = None): ...
+    max_engage_excursion_um: float | None
+
+
+class MMAutofocus:  # gains three keywords, last
+    def __init__(
+        self,
+        ...,
+        engage_drives_z_to_offset: bool = False,
+        settle_s: float = 0.0,
+        settle_tolerance_um: float = 0.5,
+    ) -> None: ...
+```
+
+- **Seen offsets.** `MMAutofocus` keeps `_seen: dict[str | None,
+  frozenset[float]]`, keyed by the objective's label (`None` without a
+  turret), replaced whole at each change (one store: no lock, FM-70). Only
+  a declared stand records. `_read_locked()` is the one place a lock is
+  read; when it reads `True`, it reads the objective and the offset and adds
+  the offset. A failure of those two reads records nothing (a DEBUG line):
+  the absence of a seen offset is the safe side. Offsets are compared as
+  read back, exactly: the layer compares one readback of a device with
+  another.
+- **The engage check** runs inside the action, under the lock, before the
+  switch-on, and in dry-run too (as the implied-Z check, FM-90). In order:
+  1. Z read through the focus drive, then the soft limits (D2), when there
+     is a focus drive;
+  2. on a declared stand: `_read_locked()` (which records a lock), then the
+     objective and the offset; a failed read propagates as its
+     `HardwareError` with nothing sent (it decides whether Z moves, FM-19);
+     an unseen offset refuses, after switching off an autofocus that reads
+     engaged.
+- **The guard** is an internal `_EngageGuard`, built per engage with the
+  band and the settle window, and polled through the lock wait's
+  `Motion.is_busy` (in the action's thread, under the lock: a Z read through
+  `ZStage.position_um()` there was measured on the Ti2-E fake, 2026-10-28).
+  It reads engaged, locked and Z, and returns busy while searching or
+  settling. When Z leaves the band or the limits, or a read fails, it keeps
+  the outcome as text (never an exception, FM-98) and reads idle, so the
+  wait ends at once; the readback (`after_wait`) then gives up on the
+  motion (`Executor.give_up`, which switches it off), forgets the offset
+  and raises. A switch-off that fails there keeps the motion registered and
+  says that PFS may still move Z, as `_LostLockError` does. A deadline
+  reached while locked but not settled gives the D3 WARNING, not "no lock".
+- **`suspend()`** reads `locked` (on a declared stand, so that the
+  operator's lock is seen before the move switches it off) and, when it
+  reads locked and the guard has a bound to keep, Z, kept as `z_held` for
+  the relock that follows in the same compound; each `suspend()` overwrites
+  it.
+- **An effective lock timeout not above `settle_s`** (the argument, the
+  profile's or the default, read at call time): `ValueError` before
+  anything is sent, as for a timeout out of bounds.
+- Unchanged: the `Autofocus` Protocol's signatures, `ZInterlock`, §3.3.1's
+  links and stops, `disengage()`.
+
+### 12.5 Errors and messages — `errors.py`
+
+```python
+class AutofocusExcursionError(HardwareError):  # not a SafetyRefusedError (FM-64)
+    z_start_um: float  # Z read before the switch-on
+    z_um: float  # the read that tripped the guard
+    # __reduce__ as AutofocusLostError's
+```
+
+- **Excursion**: `` autofocus PFS: Z went from 4269.44 µm to 4504.76 µm
+  while it engaged, <outside the soft limits [10, 4350] µm | more than
+  [safety] max_engage_excursion_um (50 µm) beyond where it started>; it was
+  switched off. The guard reads Z every 10 ms: it stops PFS once a jump is
+  read, it does not prevent one. Check the sample and the objective; on
+  this stand, lock PFS on the sample at the stand before engaging again ``
+  (the last clause on a declared stand only). The WARNING `autofocus PFS:
+  switched off: Z left its bound while it engaged (<z_um> µm)` precedes it.
+- **Unseen offset** (`SafetyRefusedError`, `how_to_force=""`): `` autofocus
+  PFS: not engaged: on this stand engaging drives Z to the plane the offset
+  names ([autofocus] engage_drives_z_to_offset, m2 §12), and offset 9370
+  PFSOffset units has not been seen locked with objective '40x' since the
+  stand was opened (seen: 7927, 7977 | seen: none)[; it was on and
+  searching, so it was switched off]. Focus on the sample, switch PFS on
+  with the stand's own controls and set the offset until the sample is
+  sharp; smc then reads the lock ``.
+- **Z outside the soft limits before the switch-on** (`SafetyRefusedError`,
+  `how_to_force=""`): `autofocus PFS: not engaged: Z is at 4400.00 µm,
+  outside the soft limits [10, 4350] µm`.
+- **The relock refused** (`AutofocusLostError`, `in_range` read as today):
+  `z: moved to <z> µm, but autofocus PFS was not engaged again: <the
+  unseen-offset or Z reason>; it is off`, then today's ending.
+- **Not settled** (WARNING, then `False`): `autofocus PFS: locked, but Z
+  did not settle within <timeout> s (it moved <spread> µm in the last
+  <settle_s> s); switched off`.
+
+### 12.6 Facade — `microscope.py`
+
+`_build(Autofocus)` passes the three `[autofocus]` keys; `Safety(...)` gets
+`max_engage_excursion_um`. Nothing else changes: the seen offsets live and
+die with the `MMAutofocus`, so with the `Microscope`.
+
+### 12.7 FakeCore — `smc/testing/fakes.py`
+
+Two knobs reproduce run 1:
+- `autofocus_target_um: Callable[[], float] | None = None`: where the
+  autofocus drives the focus device once locked (a test's closure reads the
+  offset device). `None`: it moves nothing, as today.
+- `autofocus_drive_after_reads: int = 0`: how many `True` reads of
+  `isContinuousFocusLocked()` come before that move, counted from each
+  switch-on from off.
+
+The move sets the focus device's position directly: it must not trip the
+quirk that switches the autofocus off on a Z move (FM-12).
+
+### 12.8 Tests
+
+- **Unit** (`tests/unit/test_engage_guard.py`, new, the Ti2-E fake of
+  `test_mm_autofocus.py`): each refusal and its empty send log; a seen
+  offset engages; the jump of run 1 trips the guard inside the settle
+  window, switches off, forgets the offset and refuses the next engage; the
+  band of a relock; a failed Z read; no focus drive; the D3 window and its
+  WARNING; an undeclared stand engages as today.
+- **Profile**: each key's bounds, the boolean refusals, `settle_s` against
+  the lock timeout, the demo's equality.
+- **Contracts** (`tests/contracts/test_autofocus.py`): the `autofocus`
+  fixture reads `is_locked()` once, so that an operator's lock is seen; a
+  case that needs a lock skips on `hardware` when the engage is refused,
+  with the refusal's text; and `test_engage_at_an_unseen_offset_is_refused`,
+  which skips on an undeclared stand and otherwise moves the offset by 1.0
+  with PFS off (which moves no Z, §4.5), then expects the refusal and PFS
+  off.
+- **Freeing** (FM-98): the excursion and the refused engage that switches
+  off go into `test_error_exits_free_the_core.py`.
+
+### 12.9 Not verified
+
+For session 2 (#198), before any engage at 40×:
+- the band: 50 µm is a choice; how much a plate's bottom varies from one
+  field to the next under PFS;
+- `settle_s`: whether the delay between the lock and the jump is always
+  under 1 s, and how long PFS takes to settle after a lost lock at 40×;
+- the `PFS Status` bit (D3), read every 10 ms through an engage of a seen
+  offset and through an offset move under lock;
+- a Z read's time on the Ti2-E, which sets how far a jump goes before the
+  guard reads it.
+
+Limits of the design, named:
+- **A sample changed while one `Microscope` stays open** keeps the old
+  sample's seen offsets. A CLI command or `smc run` opens its own; M5's
+  page, which stays open, must forget them when the operator changes the
+  sample (M5's design).
+- **A stand with no objective turret resolved** cannot tell objectives
+  apart: its seen offsets survive a change of objective by hand.
+- **A lock read in the 0.5 s before a jump** that the operator started at
+  the stand (the button) is seen like any lock. The jump is then the
+  operator's own; the layer's later engages of that offset run under D2.
