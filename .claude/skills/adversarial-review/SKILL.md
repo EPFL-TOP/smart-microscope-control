@@ -18,7 +18,8 @@ yourself.
    Pick one scratch directory outside the repository: your session's
    scratchpad if the system prompt names one, otherwise run `mktemp -d` as a
    command on its own and note the path it prints. Save the issue's latest
-   `## Plan` comment there as `plan.md` with the Write tool. Read its
+   `## Plan` comment there as `plan.md` with the Write tool: the latest
+   *comment* is your own `Starting` (#205), so select on the header. Read its
    **Risk** and **Failure modes to handle** lines. The worktree's sandbox
    refuses heredocs, `$(...)` and pipes into an interpreter: one plain
    command per Bash call, and files through Write.
