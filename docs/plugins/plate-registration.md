@@ -30,6 +30,21 @@ smc stage get -p <profile>
 smc run plate-registration -p <profile> --run-doc run.json --param 'refs=[ ...every reference so far... ]'
 ```
 
+The commands are written for a POSIX shell, which keeps the double quotes of the JSON
+inside the single quotes. In `cmd.exe` a single quote is not a quote, and the value is
+split at each space; the form that the [`smc run`](README.md#running-a-plugin-smc-run)
+page gives, double quotes outside and a backslash before each inner one, is the one to
+try:
+
+```bat
+smc run plate-registration -p <profile> --run-doc run.json --param "refs=[{\"well\": \"A1\", \"x_um\": 1000, \"y_um\": 2000}]"
+```
+
+That form, and the one for PowerShell 5.1, which handles quotes in arguments to native
+programs differently, were **not tried on a Windows shell**: check them at the stand. A
+value that arrives broken is refused before anything is sent or written (`'refs' takes
+JSON`, or an unexpected extra argument).
+
 1. **Seed.** `smc stage get` prints the position (`XY (1000.00, 2000.00) µm`); give it
    as a reference. One reference is a *seed*: A1 is where it implies and the rotation
    is **assumed 0°**, which the result says in `assumed`. It is enough to drive to
@@ -186,8 +201,11 @@ smc run goto-well -p <profile> --run-doc run.json --param well=B2 --param side=t
 
 It sends **one absolute move** and nothing else, and the layer's guards are the
 guards: a target outside the profile's XY soft limits is refused and the stage does
-not move (a soft limit cannot be forced), and a stop or a fault ends the stage
-`failed`. A well the plate does not have is refused before any move. The result keeps
+not move (a soft limit cannot be forced), and a refusal, a halt or a fault of the
+move ends the stage `failed` and reaches the caller as the error it is. A stop asked
+for before the move (a UI's Stop, Ctrl-C) is recorded `stopped` and nothing is sent;
+once the move is sent, only the layer's own handling of Ctrl-C can end it. A well the
+plate does not have is refused before any move. The result keeps
 the target (`target_x_um`, `target_y_um`) beside where the stage says it arrived
 (`x_um`, `y_um`, the readback after the move), so a stage that stopped short shows.
 
@@ -197,6 +215,14 @@ sits, some corner `goto-well`s will be refused by the layer. This was computed, 
 measured at the stand (#198). A refused corner is the layer's soft limit and not a
 fault of the registration: a well nearer the middle serves as a reference as well,
 at a little less accuracy in the rotation.
+
+**A profile without XY soft limits has nothing to bound the target.** Of the
+profiles in `profiles/` only `nikon-ti2` declares them; `nikon-tie` and `demo` do
+not. A seed given for the wrong well (A1 typed while the stage is under H1) puts every
+well up to 99 × 63 mm from where it is, and `goto-well` sends the move as computed, up
+to the stage's own end stops. Check the seed with `smc stage get` against the well you
+named before the first `goto-well`, and add the limits to the profile (a hardware
+session) before using a stand without them.
 
 ### Dry runs
 

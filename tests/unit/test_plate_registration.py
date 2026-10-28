@@ -232,6 +232,51 @@ def test_averages_out_centring_error() -> None:
     assert 0 < cal.residual_um < 40  # reports the centring error honestly
 
 
+@pytest.mark.parametrize(
+    ("misplaced", "expected_um"),
+    [("A1", 436.14), ("A12", 445.88), ("H1", 348.10)],
+)
+def test_the_residual_is_the_worst_reference_whichever_it_is(
+    misplaced: str, expected_um: float
+) -> None:
+    """700 µm off in X on one of three references: the first, a middle one or the last.
+
+    The expected values are what the fit measured when this was written (the
+    last is the plan's 348.1); the other check reads the result only, and
+    holds for any reference being the worst (FM-43).
+    """
+    truth = {"A1": (0.0, 0.0), "A12": (99000.0, 0.0), "H1": (0.0, -63000.0)}
+    refs = [
+        WellRef(
+            well=name,
+            x_um=x + (700.0 if name == misplaced else 0.0),
+            y_um=y,
+        )
+        for name, (x, y) in truth.items()
+    ]
+    cal = calibrate("96-well", refs)
+    assert cal.residual_um == pytest.approx(expected_um, abs=0.01)
+    assert cal.residual_um == max(
+        math.dist(cal.well_center_um(r.well), (r.x_um, r.y_um)) for r in cal.refs
+    )
+
+
+def test_a_seed_keeps_its_reference_as_a_normalised_well() -> None:
+    cal = calibrate("96-well", [WellRef(well="d 06", x_um=5.0, y_um=6.0)])
+    assert cal.refs == (WellRef(well="D6", x_um=5.0, y_um=6.0),)
+    assert cal.n_refs == 1
+
+
+def test_every_well_is_checked_to_be_on_the_plate_before_a_repeat() -> None:
+    refs = [
+        WellRef(well="A1", x_um=0.0, y_um=0.0),
+        WellRef(well="a1", x_um=1.0, y_um=1.0),
+        WellRef(well="Z99", x_um=2.0, y_um=2.0),
+    ]
+    with pytest.raises(ValueError, match=re.escape("well 'Z99' is not on the 96-well")):
+        calibrate("96-well", refs)
+
+
 def test_wrong_plate_type_is_refused_not_silently_fitted() -> None:
     """Measuring a 96-well plate but saying 384-well doubles every spacing:
     the fit would 'succeed' and put every position badly off."""
@@ -411,7 +456,7 @@ def test_the_bound_is_on_the_size_of_the_rotation_not_its_sign() -> None:
     assert cal.rotation_deg == pytest.approx(-17.5, abs=1e-9)
 
 
-def test_a_rotation_at_the_bound_is_accepted() -> None:
+def test_a_rotation_just_inside_the_bound_is_accepted() -> None:
     refs = _measure("96-well", (0.0, 0.0), 9.9, ["A1", "A12", "H1"])
     assert calibrate("96-well", refs).rotation_deg == pytest.approx(9.9, abs=1e-9)
 

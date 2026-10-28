@@ -20,9 +20,14 @@ import pytest
 
 from smc.hardware import Microscope
 from smc.hardware.capabilities import XYStage
-from smc.hardware.errors import SafetyRefusedError
+from smc.hardware.errors import (
+    CoreError,
+    DeviceTimeoutError,
+    MicroscopeHaltedError,
+    SafetyRefusedError,
+)
 from smc.hardware.profile import Profile
-from smc.plugins import PluginRunError, UpstreamError, parse_params, run_plugin
+from smc.plugins import PluginRunError, UpstreamError, load, parse_params, run_plugin
 from smc.plugins.goto_well import GotoWellParams, GotoWellPlugin, GotoWellResult
 from smc.plugins.slots import PlateResult
 from smc.run import RunDocument, StageRecord, StageStatus, write_stage
@@ -224,6 +229,87 @@ def test_a_target_outside_the_soft_limits_is_refused_and_does_not_move(
         assert _where(microscope) == before
     finally:
         microscope.close()
+
+
+def test_a_halt_reaches_the_caller_and_is_not_a_refusal(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """FM-64: the emergency stop is checked by the layer before the move; the plugin does not turn it into a refusal."""
+    _seed(tmp_path)
+    before = _where(demo_microscope)
+    demo_microscope.stop()
+    try:
+        with pytest.raises(MicroscopeHaltedError):
+            _run(demo_microscope, tmp_path, well="A2")
+    finally:
+        demo_microscope.resume()
+    assert _stored(tmp_path).status is StageStatus.failed
+    assert _stored(tmp_path).result is None
+    assert _where(demo_microscope) == before
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        MicroscopeHaltedError(),
+        DeviceTimeoutError("xy_stage did not arrive within 30 s"),
+        CoreError("the core lost the stage"),
+    ],
+    ids=["halt", "timeout", "core-error"],
+)
+def test_a_fault_of_the_move_reaches_the_runner_unchanged(
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: Exception,
+) -> None:
+    """Nothing is caught around the move: not a halt, not a timeout, not a core error (FM-64)."""
+    _seed(tmp_path)
+
+    def fails(x_um: float, y_um: float) -> object:
+        raise fault
+
+    monkeypatch.setattr(demo_microscope.require(XYStage), "move_to_um", fails)
+    with pytest.raises(type(fault)) as info:
+        _run(demo_microscope, tmp_path, well="A2")
+    assert info.value is fault
+    assert _stored(tmp_path).status is StageStatus.failed
+    assert _stored(tmp_path).result is None
+
+
+def test_goto_well_sends_one_move_and_reads_no_position_before_it(
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The plan: one absolute move with the target the result reports, and no read of where the stage is first."""
+    _seed(tmp_path)
+    stage = demo_microscope.require(XYStage)
+    calls: list[tuple[object, ...]] = []
+    real_move, real_position = stage.move_to_um, stage.position_um
+
+    def move(x_um: float, y_um: float) -> object:
+        calls.append(("move_to_um", x_um, y_um))
+        return real_move(x_um, y_um)
+
+    def position() -> object:
+        calls.append(("position_um",))
+        return real_position()
+
+    monkeypatch.setattr(stage, "move_to_um", move)
+    monkeypatch.setattr(stage, "position_um", position)
+    result = _result(_run(demo_microscope, tmp_path, well="B2", side="left"))
+    assert calls == [("move_to_um", result.target_x_um, result.target_y_um)]
+
+
+def test_the_entry_point_loads_goto_well() -> None:
+    entry = load("goto-well")
+
+    assert entry.plugin.provides == "goto-well"
+    assert entry.plugin.requires == (XYStage,)
+    assert entry.plugin.reads == ("plate",)
+    assert entry.plugin.reads_optional == ()
+    assert entry.target == "smc.plugins.goto_well:GotoWellPlugin"
 
 
 def test_a_stop_before_the_move_sends_nothing(

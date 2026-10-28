@@ -18,7 +18,7 @@ import useq
 from useq import _plate_registry
 
 from smc.hardware import Microscope
-from smc.plugins import ParamsError, PluginRunError, parse_params, run_plugin
+from smc.plugins import ParamsError, PluginRunError, load, parse_params, run_plugin
 from smc.plugins.plate_registration.plugin import (
     PlateRegistrationParams,
     PlateRegistrationPlugin,
@@ -338,6 +338,109 @@ def test_a_well_given_both_as_a_reference_and_by_walls_is_refused(
         == "plate-registration: A1 is given both as a reference and by walls: "
         "give it one way"
     )
+
+
+@pytest.mark.parametrize(
+    ("misplaced", "message"),
+    [
+        ("A1", "A1 is 436 µm from where the others put it: centre it again"),
+        ("A12", "A12 is 446 µm from where the others put it: centre it again"),
+        ("H1", "H1 is 348 µm from where the others put it: centre it again"),
+    ],
+)
+def test_the_refusal_names_the_worst_reference_whichever_it_is(
+    demo_microscope: Microscope, tmp_path: Path, misplaced: str, message: str
+) -> None:
+    """700 µm off in X on the first, a middle or the last reference: the largest name is not the worst well."""
+    truth = {"A1": (0.0, 0.0), "A12": (99000.0, 0.0), "H1": (0.0, -63000.0)}
+    refs = [
+        {"well": name, "x_um": x + (700.0 if name == misplaced else 0.0), "y_um": y}
+        for name, (x, y) in truth.items()
+    ]
+    error = _refused(demo_microscope, tmp_path, refs=refs)
+    assert str(error) == f"plate-registration: {message}"
+
+
+def test_the_first_reference_a_little_off_is_inside_the_limit(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """A1 400 µm off in X is a residual of 249 µm, under 300, and it is A1 that carries it."""
+    refs = [
+        {"well": "A1", "x_um": 400.0, "y_um": 0.0},
+        {"well": "A12", "x_um": 99000.0, "y_um": 0.0},
+        {"well": "H1", "x_um": 0.0, "y_um": -63000.0},
+    ]
+    result = _result(_run(demo_microscope, tmp_path, refs=refs))
+    assert result.residual_um == pytest.approx(249.25, abs=0.01)
+
+
+@pytest.mark.parametrize("first", ["A1", "A12"])
+def test_two_references_equally_far_from_the_fit_name_the_first_given(
+    demo_microscope: Microscope, tmp_path: Path, first: str
+) -> None:
+    """A12 700 µm too far along X: each reference is 350 µm from the fit, and the tie goes to the first given.
+
+    The numbers are whole µm and the plate is not turned, so the two distances
+    are equal to the last bit on every platform, in either order.
+    """
+    at = {"A1": 0.0, "A12": 99700.0}
+    order = (first, "A12" if first == "A1" else "A1")
+    refs = [{"well": name, "x_um": at[name], "y_um": 0.0} for name in order]
+    error = _refused(demo_microscope, tmp_path, refs=refs)
+    assert str(error) == (
+        f"plate-registration: {first} is 350 µm from where the others put it: "
+        f"centre it again"
+    )
+
+
+def test_the_first_well_given_both_ways_is_the_one_named(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    error = _refused(
+        demo_microscope,
+        tmp_path,
+        refs=[
+            {"well": "H12", "x_um": 99000.0, "y_um": -63000.0},
+            {"well": "A1", "x_um": 0.0, "y_um": 0.0},
+        ],
+        walls=[
+            _wall("A1", "left", 0.0, 0.0),
+            _wall("A1", "bottom", 0.0, 0.0),
+            _wall("H12", "left", 0.0, 0.0),
+            _wall("H12", "bottom", 0.0, 0.0),
+        ],
+    )
+    assert str(error) == (
+        "plate-registration: H12 is given both as a reference and by walls: "
+        "give it one way"
+    )
+
+
+def test_the_entry_point_loads_plate_registration() -> None:
+    entry = load("plate-registration")
+
+    assert entry.plugin.provides == "plate"
+    assert entry.plugin.requires == ()
+    assert entry.plugin.reads == ()
+    assert entry.plugin.reads_optional == ()
+    assert (
+        entry.target == "smc.plugins.plate_registration.plugin:PlateRegistrationPlugin"
+    )
+
+
+def test_a_seed_keeps_its_reference_in_the_record(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    result = _result(
+        _run(
+            demo_microscope,
+            tmp_path,
+            refs=[{"well": "d 06", "x_um": 50000.0, "y_um": -20000.0}],
+        )
+    )
+    assert [(r.well, r.x_um, r.y_um) for r in result.refs] == [
+        ("D6", 50000.0, -20000.0)
+    ]
 
 
 def test_no_reference_is_refused(demo_microscope: Microscope, tmp_path: Path) -> None:
