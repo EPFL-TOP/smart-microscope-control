@@ -19,7 +19,7 @@ filter_turret = "FilterTurret2"   # measured: the only turret with filter cubes 
 max_jog_um = 5000.0            # the layer's default, not chosen for this stand
 max_z_jog_um = 100.0           # chosen, not measured; the owner revises it at #16
 z_soft_limits_um = [10.0, 4350.0]    # owner, 2026-10-15: never above 4350 µm; the bottom of travel is about 5-6 µm
-# A glass-bottom dish at 10x focuses at 4261-4269 µm (#208). PFS-driven Z is not bounded by these (#205).
+# A glass-bottom dish at 10x focuses at 4261-4269 µm (#208).
 xy_soft_limits_um = [[-49000.0, 49000.0], [-29000.0, 29000.0]]    # owner
 turret_requires_confirm = true
 # Chosen from session 1 (#208), for the owner to confirm: 50 units moved Z by 4.6-8.5 µm
@@ -28,6 +28,9 @@ max_autofocus_offset_jog = 50.0                  # in [autofocus] offset_unit
 # Unknown: PFSOffset exposes no property limits (#208); values seen so far 7803-9420.
 # autofocus_offset_soft_limits = [..., ...]
 stop_refused_by = ["xy_stage", "focus", "autofocus_offset"]  # measured, session 1 (#208): "Unsupported device command (11)", still and moving
+# Chosen (m2 §12.2 D2), for the owner to confirm at session 2 (#198): how far Z may move
+# while PFS engages, beyond where it started or held. Run 1 jumped +235 µm (#205).
+max_engage_excursion_um = 50.0
 
 [autofocus]
 # Measured in session 1 (#208), 10x only: docs/hardware/nikon-ti2.md, Session 1.
@@ -36,6 +39,13 @@ offset_unit = "PFSOffset units"     # whole numbers only: 7927.5 reads 7927 (#20
 # engagements, but once 0.5 s before PFS drove Z +235 µm (#205): it is not a settling time.
 in_range_property = "PFS in Range"  # measured: "In Range" with a sample, PFS on or off;
 in_range_values = ["In Range"]      # "Out of Range" with no sample. A reference, not a lock.
+# Measured, session 1 (#208): engaging drove Z to the plane of the stored offset (run 1,
+# +235 µm), whatever the operator focused. smc engages only at an offset it has read locked.
+engage_drives_z_to_offset = true
+# Chosen (m2 §12.2 D3): Z moved 0.5 s after `locked` read True, once; the creep under
+# lock is about 0.06 µm/s. engage() returns True once Z has been still this long.
+settle_s = 1.0
+settle_tolerance_um = 0.5
 
 [autofocus.offset_per_um]
 # Under lock, a larger offset gives a larger Z. One factor per objective is a simplification:
@@ -55,8 +65,7 @@ in_range_values = ["In Range"]      # "Out of Range" with no sample. A reference
 
 [quirks]
 # The direction of focus (which way is up) is unknown (#98).
-# Not read by the layer yet (#204, #205); recorded for the design:
+# Not read by the layer yet (#204); recorded for the design:
 # - XYStage, ZDrive and PFSOffset refuse stop() ("Unsupported device command (11)"):
 #   a sent move runs to its target. Switching PFS off stops a PFS-driven Z move.
-# - Engaging PFS drives Z to the plane of the stored offset, whatever the operator focused.
 # - deviceBusy() never read True on ZDrive or PFSOffset, even during PFS-driven moves.

@@ -1151,6 +1151,15 @@ def test_nikon_ti2_profile_holds_the_owner_limits_and_filter_turret2() -> None:
     assert loaded.safety.autofocus_offset_soft_limits is None
 
 
+def test_the_ti2_profile_declares_how_it_engages() -> None:
+    # m2 §12.3: measured in run 1 (#208), and chosen for session 2 to confirm.
+    loaded = Profile.load(PROFILES_DIR / "nikon-ti2.toml")
+    assert loaded.autofocus.engage_drives_z_to_offset is True
+    assert loaded.autofocus.settle_s == 1.0
+    assert loaded.autofocus.settle_tolerance_um == 0.5
+    assert loaded.safety.max_engage_excursion_um == 50.0
+
+
 def test_nikon_tie_profile_sets_no_limit_beyond_the_layers_defaults() -> None:
     loaded = Profile.load(PROFILES_DIR / "nikon-tie.toml")
 
