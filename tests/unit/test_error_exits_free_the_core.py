@@ -44,6 +44,7 @@ from smc.hardware import Microscope
 from smc.hardware.capabilities import Autofocus, Camera, XYStage, ZStage
 from smc.hardware.errors import HardwareError, SafetyRefusedError
 from smc.hardware.profile import Profile
+from smc.hardware.roles import Role
 from smc.hardware.safety import Executor, Motion
 from smc.plugins import registry as registry_mod
 from smc.plugins.api import PluginParams, PluginResult, RunContext, StopRequested
@@ -71,10 +72,17 @@ def _alive(watched: dict[str, weakref.ref[Any]]) -> dict[str, bool]:
     return {name: ref() is not None for name, ref in watched.items()}
 
 
-def _stand(*, dry_run: bool = False) -> tuple[FakeCore, Microscope]:
+def _stand(
+    *, dry_run: bool = False, declares: tuple[Role, ...] = ()
+) -> tuple[FakeCore, Microscope]:
+    """A fake demo stand; ``declares`` goes into ``[safety] stop_refused_by``."""
     core = FakeCore.demo_like()
+    profile = Profile.demo()
+    if declares:
+        safety = profile.safety.model_copy(update={"stop_refused_by": declares})
+        profile = profile.model_copy(update={"safety": safety})
     return core, Microscope.from_core(
-        cast("CMMCorePlus", core), Profile.demo(), dry_run=dry_run
+        cast("CMMCorePlus", core), profile, dry_run=dry_run
     )
 
 
@@ -498,6 +506,76 @@ _SWITCH_OFF_FAILED = (
     "device: power, cable, another program holding it"
 )
 
+# --- a stop the profile declares refused (m2 §11) ---------------------------
+# `_send_stop` builds a StopRefusedError whose cause is the device's error, and
+# that error's traceback reaches `_send_stop`'s frame through `_send_safe`'s
+# `f_back` (#163); `_stop_stages` collects the refusals as text.
+
+Scenario = Callable[[FakeCore, Microscope], tuple[str, str]]
+
+
+def _declaring(*roles: Role) -> Callable[[Scenario], Scenario]:
+    """Run the scenario on a stand whose profile declares ``roles`` (read by the test)."""
+
+    def mark(scenario: Scenario) -> Scenario:
+        scenario.declares = roles  # type: ignore[attr-defined]
+        return scenario
+
+    return mark
+
+
+@_declaring(Role.xy_stage)
+def _declared_xy_stop(core: FakeCore, microscope: Microscope) -> tuple[str, str]:
+    core.stop_refused = {"XY"}  # a fresh error each time, unlike `failing`
+    return _outcome(microscope.require(XYStage).stop)
+
+
+@_declaring(Role.xy_stage, Role.focus)
+def _declared_emergency_stop(core: FakeCore, microscope: Microscope) -> tuple[str, str]:
+    core.stop_refused = {"XY", "Z"}
+    return _outcome(microscope.stop)
+
+
+@_declaring(Role.xy_stage)
+def _ctrl_c_whose_stop_is_refused(
+    core: FakeCore, microscope: Microscope
+) -> tuple[str, str]:
+    """A Ctrl-C during an XY move that runs on: the give-up's note rides on it.
+
+    The motion stays registered (it reads busy) until ``resume()``, and keeps
+    the core through the Executor by decision, as ``_lock_wait_given_up``'s.
+    """
+    core.stop_refused, core.busy_devices = {"XY"}, {"XY"}
+    real, polled = core.deviceBusy, list[str]()
+
+    def busy(label: str) -> bool:
+        if not polled:
+            polled.append(label)
+            raise KeyboardInterrupt
+        return real(label)
+
+    core.deviceBusy = busy  # type: ignore[method-assign]
+    try:
+        outcome = _outcome(lambda: microscope.require(XYStage).move_to_um(10.0, 0.0))
+    finally:
+        del core.deviceBusy
+    microscope.resume()
+    return outcome
+
+
+_DECLARED_XY = (
+    "`xy_stage XY` refused the stop, as the profile declares ([safety] "
+    "stop_refused_by): a move under way runs to its target; stop it with the "
+    "stand's own controls if it must not finish"
+)
+_DECLARED_EMERGENCY_STOP = (
+    "the emergency stop halted the microscope and switched autofocus Autofocus "
+    "off, but xy_stage XY and z Z refused the stop, as the profile declares "
+    "([safety] stop_refused_by): a move under way runs to its target. The "
+    "microscope stays halted: stop the stage with the stand's own controls if it "
+    "must not finish its move, then call `resume()`"
+)
+
 
 @pytest.mark.parametrize(
     ("scenario", "kind", "message"),
@@ -549,17 +627,32 @@ _SWITCH_OFF_FAILED = (
             "stop() and check the stand, then resume()",
             id="lock-wait-given-up",
         ),
+        pytest.param(
+            _declared_xy_stop, "StopRefusedError", _DECLARED_XY, id="declared-xy-stop"
+        ),
+        pytest.param(
+            _declared_emergency_stop,
+            "StopRefusedError",
+            _DECLARED_EMERGENCY_STOP,
+            id="declared-emergency-stop",
+        ),
+        pytest.param(
+            _ctrl_c_whose_stop_is_refused,
+            "KeyboardInterrupt",
+            "",
+            id="ctrl-c-whose-stop-is-refused",
+        ),
     ],
 )
 def test_a_failed_stop_or_switch_off_frees_the_core(
     no_cyclic_gc: None,
-    scenario: Callable[[FakeCore, Microscope], tuple[str, str]],
+    scenario: Scenario,
     kind: str,
     message: str,
 ) -> None:
     # The stop and safe-call paths held the error they raised (or a held log
     # line's argument) in a local of a frame on its own traceback (#148).
-    core, microscope = _stand()
+    core, microscope = _stand(declares=getattr(scenario, "declares", ()))
     assert scenario(core, microscope) == (kind, message)
     core.failing.clear()
     watched = _watch(microscope, core)
