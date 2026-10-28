@@ -71,6 +71,36 @@ def _matrix(pixel_size_um: float) -> Matrix2:
 UPRIGHT = _matrix(PIXEL_UM)
 
 
+def _turned(pixel_size_um: float, rotation_deg: float, mirrored: bool) -> Matrix2:
+    """``ps * R(theta) * diag(s, -1)`` of m3 §3.1: a camera turned by the stage, perhaps mirrored."""
+    angle = math.radians(rotation_deg)
+    cos, sin = math.cos(angle), math.sin(angle)
+    sign = -1.0 if mirrored else 1.0
+    return (
+        (pixel_size_um * cos * sign, pixel_size_um * sin),
+        (pixel_size_um * sin * sign, -pixel_size_um * cos),
+    )
+
+
+def _union_of_two(
+    matrix: Matrix2, shape: tuple[int, int], shift: tuple[float, float]
+) -> float:
+    """The area in mm² of two frames of one camera, one the other's translate by ``shift`` µm.
+
+    A pixel column steps along the matrix's first column and a pixel row along
+    its second (m3 §3.1), so a frame is ``width`` along the unit vector ``u`` of
+    the first and ``height`` along ``v`` of the second; the overlap with its own
+    translate is what is left of each side along its own direction.
+    """
+    (m00, m01), (m10, m11) = matrix
+    along_u, along_v = math.hypot(m00, m10), math.hypot(m01, m11)
+    width, height = shape[1] * along_u, shape[0] * along_v
+    shared = max(0.0, width - abs(shift[0] * m00 + shift[1] * m10) / along_u) * max(
+        0.0, height - abs(shift[0] * m01 + shift[1] * m11) / along_v
+    )
+    return (2.0 * width * height - shared) / 1e6
+
+
 def _at(well: str, dx: float, dy: float) -> Point:
     """The point ``(dx, dy)`` µm from the centre of a well."""
     return (well, CENTRES[well][0] + dx, CENTRES[well][1] + dy)
@@ -125,6 +155,7 @@ def _seed(
     planned: Sequence[Point] | None = None,
     matrix: Matrix2 = UPRIGHT,
     plan_matrix: Matrix2 | None = None,
+    plan_shape: tuple[int, int] | None = None,
     shape: tuple[int, int] = SHAPE,
     counted: Sequence[str] | None = None,
     cells_frames: int | None = None,
@@ -137,8 +168,9 @@ def _seed(
     ``frames`` and ``failed``); ``listed`` is what the plan's own ``wells`` says
     when it is not that (a record that disagrees with the scan). ``planned`` are
     the positions the plan asked for, when they are not the frames' readback;
-    ``plan_matrix`` the camera the plan was laid for, when it is not the scan's:
-    density must take the scan's (FM-124). ``counted`` are the wells the cells
+    ``plan_matrix`` and ``plan_shape`` the camera and the frame the plan was laid
+    for, when they are not the scan's: density must take the scan's (FM-124).
+    ``counted`` are the wells the cells
     stage has counts for (default: the wells with a frame) and ``cells_frames``
     the number of frames it says it counted (default: the scan's).
     """
@@ -154,13 +186,16 @@ def _seed(
         n_refs=0,
     )
     laid = plan_matrix if plan_matrix is not None else matrix
-    fov = _extent(laid, shape)
+    laid_shape = plan_shape if plan_shape is not None else shape
+    fov = _extent(laid, laid_shape)
     plan_wells = wells if wells is not None else tuple(in_order)
     plate_plan, _ = plan_fields(
         plate,
         [w for w in plan_wells if w in CENTRES],
         fov_um=fov,
-        footprint_of=lambda x, y: footprint(x, y, matrix=laid, image_shape_px=shape),
+        footprint_of=lambda x, y: footprint(
+            x, y, matrix=laid, image_shape_px=laid_shape
+        ),
         rows=1,
         columns=1,
         overlap=0.0,
@@ -182,7 +217,7 @@ def _seed(
         pixel_size_um=PIXEL_UM,
         matrix_um_per_px=laid,
         matrix_source="parameter",
-        image_shape_px=shape,
+        image_shape_px=laid_shape,
         fov_um=fov,
         overlap=0.0,
         rows=1,
@@ -305,11 +340,18 @@ def _stored(tmp_path: Path) -> StageRecord:
 def _refused(
     microscope: Microscope, tmp_path: Path, **params: object
 ) -> PluginRunError:
-    """Run and expect a ``PluginRunError``; the stored record is ``failed`` and has no result."""
+    """Run and expect a ``PluginRunError``; the stored record is ``failed`` and has no result.
+
+    The refusal is raised outside the handler that caught its cause (FM-98): an
+    error that holds the one it replaced keeps the frames of that one, and the
+    microscope with them, until the cyclic collector.
+    """
     with pytest.raises(PluginRunError) as info:
         _run(microscope, tmp_path, **params)
     assert _stored(tmp_path).status is StageStatus.failed
     assert _stored(tmp_path).result is None
+    assert info.value.__context__ is None
+    assert info.value.__cause__ is None
     return info.value
 
 
@@ -451,7 +493,73 @@ def test_the_scans_frame_is_height_by_width_and_not_the_other_way_round(
 
     (a1,) = _result(_run(demo_microscope, tmp_path)).wells
 
-    assert a1.area_mm2 == pytest.approx(0.225, abs=1e-9)  # 750 x 300; swapped: 0.18
+    assert a1.area_mm2 == pytest.approx(0.225, abs=1e-9)  # 750 x 300; swapped: 0.24
+
+
+def test_the_scans_frame_shape_decides_the_area_not_the_plans(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """The plan was laid for 60 x 80 pixels and the scan took 80 x 60 (a region of interest changed between them).
+
+    The fields are 350 µm apart along X: frames 300 µm wide leave a gap, and
+    the plan's 400 µm wide frames would overlap by 50 µm.
+    """
+    _seed(
+        tmp_path,
+        frames=[_at("A1", -175.0, 0.0), _at("A1", 175.0, 0.0)],
+        shape=(80, 60),
+        plan_shape=SHAPE,
+    )
+
+    (a1,) = _result(_run(demo_microscope, tmp_path)).wells
+
+    assert a1.area_mm2 == pytest.approx(0.24, abs=1e-9)  # two of 300 x 400; not 0.225
+
+
+def test_the_scans_turned_and_mirrored_matrix_decides_the_area(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """Two fields of a camera turned by 30° and mirrored, 150 µm and 100 µm apart along X and Y.
+
+    The overlap of a rectangle with its own translate is the product of what is
+    left of each side along that side's own direction, so the union is written
+    here from the matrix's columns and not from ``footprint()``. Every other
+    camera of this module is a diagonal one, which equals its transpose, and the
+    plan's camera is upright: a matrix that was transposed or taken from the plan
+    gives another union (0.1957 and 0.19 mm², against 0.1765).
+    """
+    turned = _turned(PIXEL_UM, 30.0, True)
+    shift = (150.0, 100.0)
+    _seed(
+        tmp_path,
+        frames=[
+            _at("A1", -shift[0] / 2, -shift[1] / 2),
+            _at("A1", *(s / 2 for s in shift)),
+        ],
+        matrix=turned,
+        plan_matrix=UPRIGHT,
+    )
+
+    (a1,) = _result(_run(demo_microscope, tmp_path, area_grid_um=1.0)).wells
+
+    assert a1.area_mm2 == pytest.approx(_union_of_two(turned, SHAPE, shift), rel=0.01)
+
+
+def test_the_area_grid_reaches_the_area(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """FM-124: one field of 400 x 300 µm is 0.12 mm² at a step of 5 µm and 0.120099 mm² at 7.
+
+    At 7 µm the centres at 3.5, 10.5, ... 395.5 are 57 in 400 µm and 43 in 300 µm,
+    so the area is 57 x 43 x 49 µm², which is not what any other step gives: the
+    parameter is the one the raster runs on.
+    """
+    _seed(tmp_path, frames=[_at("A1", 0.0, 0.0)])
+
+    (a1,) = _result(_run(demo_microscope, tmp_path, area_grid_um=7.0)).wells
+
+    assert a1.area_mm2 == pytest.approx(57 * 43 * 49 / 1e6, abs=1e-9)
+    assert a1.area_mm2 != pytest.approx(FIELD_MM2, abs=1e-6)
 
 
 def test_a_well_whose_every_field_failed_is_reported_with_unknown_density(
@@ -597,6 +705,17 @@ def test_a_well_the_plan_does_not_list_is_refused(
         "the scan holds well 'B1', which the scan plan does not list among its "
         "wells; run scan-plan, scan and cells again"
     )
+
+
+def test_a_well_the_plan_lists_twice_says_to_run_scan_plan_again(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """The plan is what is wrong, so it is the plan to run again: not the cells, whose remedy ``density()`` would give."""
+    _seed(tmp_path, frames=[_at("A1", 0.0, 0.0)], listed=("A1", "A1"))
+
+    refused = _refused(demo_microscope, tmp_path)
+
+    assert refused.reason == "the scan plan lists well 'A1' twice; run scan-plan again"
 
 
 def test_a_well_that_only_failed_and_the_plan_does_not_list_is_refused(

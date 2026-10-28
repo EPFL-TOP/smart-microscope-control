@@ -66,11 +66,19 @@ _MAX_GRID_POINTS = 2**30
 _MAX_TESTS = 2**31
 #: Elements of one band of the raster (rows by columns): 2**20 peaked at 95 MB.
 _BAND_ELEMENTS = 2**20
-#: Corner 2 of a footprint is ``c1 + c3 - c0`` to this. Measured: the corners
-#: ``geometry.footprint`` gives are one to the last bit at any stage position up
-#: to the bound below (60 000 random frames, none beyond 1e-6 µm), because each
-#: corner is the position plus one rounded term per axis of the frame.
+#: Corner 2 of a footprint is ``c1 + c3 - c0`` to this, plus a few ulps of the
+#: coordinates. Each corner of ``geometry.footprint`` is the position plus one
+#: rounded term per axis of the frame, so within one binade the four are a
+#: parallelogram to the last bit (60 000 random frames far from the well, none
+#: beyond 1e-6 µm). A footprint that straddles a power of two is the exception:
+#: the spacing of the floats doubles inside it, and corner 2 is off by up to
+#: 2 ulps (3.8e-6 µm at 2**33 µm, 6e-5 µm at 2**39, measured), which a frame read
+#: back far away must survive, since a far frame is ignored and not refused.
 _PARALLELOGRAM_TOL_UM = 1e-6
+#: The ulps of the largest coordinate that are added to the tolerance: the four
+#: roundings of the corners and the two of the sum that checks them come to at most
+#: about 4, and 8 is the margin.
+_PARALLELOGRAM_ULPS = 8
 #: A corner beyond this (1000 km of stage) is a corrupt record, and below it the
 #: arithmetic of the raster cannot overflow.
 _MAX_COORDINATE_UM = 1e12
@@ -332,7 +340,8 @@ def _parallelogram(k: int, corners: Sequence[tuple[float, float]]) -> _Parallelo
     if not abs(det) > 0.0:
         raise ValueError(f"footprint {k} has no area")
     off = math.hypot(c2x - (c1x + c3x - c0x), c2y - (c1y + c3y - c0y))
-    if off > _PARALLELOGRAM_TOL_UM:
+    reach = max(abs(c) for corner in corners for c in corner)
+    if off > _PARALLELOGRAM_TOL_UM + _PARALLELOGRAM_ULPS * math.ulp(reach):
         raise ValueError(
             f"footprint {k} is not a parallelogram: corner 2 is {off:.3g} µm from "
             f"where corners 0, 1 and 3 put it"

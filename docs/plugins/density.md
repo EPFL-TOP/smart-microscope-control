@@ -72,7 +72,14 @@ The slot `density` holds a `DensityResult` (`smc.plugins.slots`):
   (measured). The area of a **well** is better, because the errors of many edges do
   not add: a 96-well disc covered by 305 fields gave 32.1703 mm² at 5 µm for a
   π r² of 32.1699 mm² (+0.001 %). Do not read the area of one field to better than
-  a percent or two at the default step; lower `area_grid_um` for it.
+  a percent or two at the default step; lower `area_grid_um` for it. **Keep the step
+  well under the field's shorter side, about a tenth of it**: the points are cell
+  centres, so a field smaller than half a step contains none and counts as no area,
+  and the well is then reported with `fields` 1, an area of 0 and `per_mm2` `null`,
+  as if no frame had been taken. At the top step of 100 µm a 40 µm field gives 0.0 mm²
+  (true 0.0016) and a 130 µm field 0.0100 (true 0.0169, 41 % low); at the default 5 µm
+  both are exact, and the edges of a field of a 40× objective (about 388 µm) are known
+  to `g / (2 w)`, 0.6 % per axis at 5 µm.
 - **The wells' shapes are the plate registration's.** Their positions are the
   registration's and their sizes the plate's nominal ones: the wall was **not
   measured**, so the area and the cells near it are only as exact as the registration.
@@ -101,7 +108,12 @@ run again, and never gives a density that rests on records that no longer fit:
   A 96-well well is never too fine (at the finest step, 0.5 µm, it is 12 800 points
   on a side), but a 6-well well (34.8 mm) fully covered is refused below about 1.07 µm (more than 2³⁰ points in all).
 - **A footprint that is not a field**: a readback beyond 1e12 µm (1000 km of stage),
-  or a frame whose corners are not a parallelogram of some area.
+  or a frame whose corners are not a parallelogram of some area. The reason names the
+  well and the footprint by its **position among that well's frames in the scan's
+  order, counting from 0** (`well A1: footprint 2 ...`), not by the frame's name: the
+  `index` and `name` of a frame count the planned fields, gaps for the failed ones
+  included, so the third frame taken can be `A1_0003`.
+- **A scan plan that lists a well twice**: `run scan-plan again`.
 
 A frame read back **far** from its well (a wrong readback of 1e9 µm, say) is not
 refused: the grid is cut to the well, so such a frame touches nothing and adds no area

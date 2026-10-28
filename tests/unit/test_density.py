@@ -186,11 +186,21 @@ def test_a_grid_point_exactly_on_each_edge_of_a_field_is_inside_it() -> None:
     assert area == pytest.approx(41 * 31 * 100.0 / 1e6, abs=1e-12)
 
 
-def test_a_footprint_beyond_the_coordinate_bound_is_refused() -> None:
+@pytest.mark.parametrize("axis", [0, 1])
+@pytest.mark.parametrize("beyond", [1e13, -1e13])
+def test_a_footprint_beyond_the_coordinate_bound_is_refused(
+    axis: int, beyond: float
+) -> None:
+    """On either axis, either way: FM-73, a bound read on x alone passes a corner at y = 1e13."""
+    corners = [list(corner) for corner in _field(0.0, 0.0)]
+    corners[1][axis] = beyond
+
     with pytest.raises(
         ValueError, match=_exactly("footprint 1 has a corner beyond 1e12 µm")
     ):
-        scanned_area_mm2([_field(0.0, 0.0), _field(1e13, 0.0)], _disc(), grid_um=5.0)
+        scanned_area_mm2(
+            [_field(0.0, 0.0), [tuple(c) for c in corners]], _disc(), grid_um=5.0
+        )
 
 
 def test_no_footprint_has_no_area() -> None:
@@ -199,6 +209,19 @@ def test_no_footprint_has_no_area() -> None:
 
 def test_a_footprint_the_well_does_not_touch_has_no_area() -> None:
     assert scanned_area_mm2([_field(5000.0, 0.0)], _disc(), grid_um=5.0) == 0.0
+
+
+@pytest.mark.parametrize(("x_um", "y_um"), [(-1200.0, 0.0), (0.0, 1150.0)])
+def test_a_field_that_only_touches_the_wells_extent_has_no_area(
+    x_um: float, y_um: float
+) -> None:
+    """The field's edge is exactly the extent's (x = -1000, or y = 1000): an empty extent, not a grid of no points.
+
+    A ``>=`` there would be a grid of 0 points and a division by zero in the bands.
+    """
+    well = _disc(1000.0)
+
+    assert scanned_area_mm2([_field(x_um, y_um)], well, grid_um=5.0) == 0.0
 
 
 def _brute_force_mm2(
@@ -337,15 +360,57 @@ def test_a_footprint_with_no_area_is_refused() -> None:
             scanned_area_mm2([corners], _disc(), grid_um=5.0)
 
 
+@pytest.mark.parametrize("axis", [0, 1])
 @pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
-def test_a_footprint_with_a_corner_that_is_not_finite_is_refused(bad: float) -> None:
-    corners = list(_field(0.0, 0.0))
-    corners[2] = (corners[2][0], bad)
+def test_a_footprint_with_a_corner_that_is_not_finite_is_refused(
+    bad: float, axis: int
+) -> None:
+    corners = [list(corner) for corner in _field(0.0, 0.0)]
+    corners[2][axis] = bad
 
     with pytest.raises(
         ValueError, match=_exactly("footprint 1 has a corner that is not finite")
     ):
-        scanned_area_mm2([_field(0.0, 0.0), corners], _disc(), grid_um=5.0)
+        scanned_area_mm2(
+            [_field(0.0, 0.0), [tuple(c) for c in corners]], _disc(), grid_um=5.0
+        )
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_a_corner_two_that_is_off_on_one_axis_only_is_refused(axis: int) -> None:
+    """FM-73: the offset is a distance in the plane, not its x: 50 µm in y alone is a different shape."""
+    corners = [list(corner) for corner in _field(0.0, 0.0)]
+    corners[2][axis] += 50.0
+
+    with pytest.raises(
+        ValueError,
+        match=_exactly(
+            "footprint 0 is not a parallelogram: corner 2 is 50 µm from where "
+            "corners 0, 1 and 3 put it"
+        ),
+    ):
+        scanned_area_mm2([[tuple(c) for c in corners]], _disc(), grid_um=5.0)
+
+
+def test_the_parallelogram_tolerance_is_a_micrometre_and_not_more() -> None:
+    """A thousandth of a µm off is a shape that is not one; a billionth is the rounding of a corner."""
+    clean = scanned_area_mm2([_field(0.0, 0.0)], _disc(), grid_um=5.0)
+    off = [list(corner) for corner in _field(0.0, 0.0)]
+    off[2][0] += 1e-3
+    near = [list(corner) for corner in _field(0.0, 0.0)]
+    near[2][0] += 1e-9
+
+    with pytest.raises(
+        ValueError,
+        match=_exactly(
+            "footprint 0 is not a parallelogram: corner 2 is 0.001 µm from where "
+            "corners 0, 1 and 3 put it"
+        ),
+    ):
+        scanned_area_mm2([[tuple(c) for c in off]], _disc(), grid_um=5.0)
+    assert scanned_area_mm2(
+        [[tuple(c) for c in near]], _disc(), grid_um=5.0
+    ) == pytest.approx(clean, abs=1e-12)
 
 
 @pytest.mark.parametrize("count", [0, 3, 5])
@@ -509,6 +574,100 @@ def test_a_far_footprint_is_no_test_of_the_window_and_no_grid() -> None:
     assert scanned_area_mm2(
         [*far, _field(0.0, 0.0)], _disc(), grid_um=10.0
     ) == pytest.approx(FIELD_MM2, abs=1e-9)
+
+
+def test_a_tall_field_meets_the_side_bound_on_its_height() -> None:
+    """FM-73, FM-74: every other bounds test is wider than tall, where x binds; this one is 300 wide by 400 high."""
+    tall = _field(0.0, 0.0, UPRIGHT, (80, 60))  # (height, width): 300 x 400 µm
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(algorithm, "_MAX_SIDE_POINTS", 35)
+        with pytest.raises(GridTooFineError) as info:
+            scanned_area_mm2([tall], _disc(), grid_um=10.0)
+        assert str(info.value) == (
+            "well A1: a grid of 10 µm over its imaged area would hold 30 by 40 "
+            "points, more than 35 on a side"
+        )
+        patch.setattr(algorithm, "_MAX_SIDE_POINTS", 40)
+        assert scanned_area_mm2([tall], _disc(), grid_um=10.0) == pytest.approx(
+            FIELD_MM2, abs=1e-9
+        )
+
+
+def test_a_field_below_the_resolution_of_the_grid_is_what_the_raster_makes_of_it() -> (
+    None
+):
+    """FM-138, recorded and not endorsed: the points are cell centres, so a field under half a step has none.
+
+    The area of one field is read to the step, not better. At 100 µm a field of
+    40 µm is 0.0 mm² (true 0.0016) and one of 130 µm is 0.01 (true 0.0169); at
+    5 µm both are exact. A change of the grid's origin or of the sampling must
+    change this test on purpose.
+    """
+    small = _field(0.0, 0.0, UPRIGHT, (8, 8))  # 40 x 40 µm
+    larger = _field(0.0, 0.0, UPRIGHT, (26, 26))  # 130 x 130 µm
+
+    assert scanned_area_mm2([small], _disc(), grid_um=100.0) == 0.0
+    assert scanned_area_mm2([larger], _disc(), grid_um=100.0) == pytest.approx(
+        0.01, abs=1e-12
+    )
+    assert scanned_area_mm2([small], _disc(), grid_um=5.0) == pytest.approx(
+        0.0016, abs=1e-12
+    )
+    assert scanned_area_mm2([larger], _disc(), grid_um=5.0) == pytest.approx(
+        0.0169, abs=1e-12
+    )
+
+
+def test_a_far_footprint_that_straddles_a_power_of_two_is_ignored_and_not_refused() -> (
+    None
+):
+    """Where the spacing of the floats doubles inside a footprint, corner 2 is off by an ulp or two.
+
+    A frame read back at 2**33 µm or further (8.6 km of stage) with its corners on
+    both sides of a power of two is a parallelogram only to a few ulps, and an
+    absolute 1e-6 µm refuses it, though a far frame is to be ignored. The guard
+    counts the positions that the plain tolerance would have refused: they are
+    the case, and without them the test would not be one.
+    """
+    turned = _matrix(PIXEL_UM, 30.0, True)
+    well = _disc()
+    good = _field(0.0, 0.0)
+    alone = scanned_area_mm2([good], well, grid_um=5.0)
+    rng = random.Random(33)
+    beyond_plain_tolerance = 0
+    for power in (33, 36, 39):
+        for _ in range(100):
+            far = _field(
+                2.0**power + rng.uniform(-150.0, 150.0), rng.uniform(-1e3, 1e3), turned
+            )
+            (c0x, c0y), (c1x, c1y), (c2x, c2y), (c3x, c3y) = far
+            off = math.hypot(c2x - (c1x + c3x - c0x), c2y - (c1y + c3y - c0y))
+            beyond_plain_tolerance += off > 1e-6
+
+            assert scanned_area_mm2([good, far], well, grid_um=5.0) == alone
+    assert beyond_plain_tolerance > 20
+
+
+def test_the_tolerance_that_grows_with_the_coordinates_still_refuses_a_real_trapezoid() -> (
+    None
+):
+    """At 5.5e11 µm a few ulps are 1e-3 µm: a corner 100 µm off is still a shape that is not a parallelogram."""
+    base = 2.0**39
+    trapezoid = [
+        (base, base),
+        (base + 400.0, base),
+        (base + 300.0, base + 300.0),
+        (base, base + 300.0),
+    ]
+
+    with pytest.raises(
+        ValueError,
+        match=_exactly(
+            "footprint 0 is not a parallelogram: corner 2 is 100 µm from where "
+            "corners 0, 1 and 3 put it"
+        ),
+    ):
+        scanned_area_mm2([trapezoid], _disc(), grid_um=5.0)
 
 
 # ---------------------------------------------------------------- density()

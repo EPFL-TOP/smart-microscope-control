@@ -423,7 +423,15 @@ def test_contains_many_agrees_with_contains_on_every_point() -> None:
     ]
     checked = 0
     for well in _wells_for_the_twin(rng):
-        for margin in (0.0, 10.0, 300.0, well.size_um[0] / 2.0, well.size_um[0]):
+        for margin in (
+            0.0,
+            10.0,
+            300.0,
+            well.size_um[1]
+            / 2.0,  # a rectangle's half-height: nothing left on that axis
+            well.size_um[0] / 2.0,
+            well.size_um[0],
+        ):
             points = [
                 (
                     well.center_um[0] + rng.uniform(-6000.0, 6000.0),
@@ -507,6 +515,22 @@ def test_contains_many_broadcasts_a_row_against_a_column() -> None:
     ]
     # Each axis alone broadcasts against a scalar-shaped array.
     assert well.contains_many(row, np.float64(well.center_um[1])).shape == (5,)
+    # A margin that leaves nothing answers in the same shape, all False (not x's).
+    nothing = well.contains_many(row[None, :], column[:, None], margin_um=2000.0)
+    assert nothing.shape == (3, 5)
+    assert not nothing.any()
+
+
+def test_a_margin_of_half_the_height_leaves_a_rectangle_nothing_even_on_its_centre_line() -> (
+    None
+):
+    """2000 x 1000 µm with a margin of 500: the height is used up while the width is not, and the centre is outside."""
+    well = WellGeometry("A1", (0.0, 0.0), (2000.0, 1000.0), False, 0.0)
+    centre = np.array([0.0])
+
+    assert well.contains(0.0, 0.0, margin_um=500.0) is False
+    assert well.contains_many(centre, centre, margin_um=500.0).tolist() == [False]
+    assert well.contains_many(centre, centre, margin_um=499.0).tolist() == [True]
 
 
 @pytest.mark.parametrize("bad", [-1.0, math.nan, math.inf])

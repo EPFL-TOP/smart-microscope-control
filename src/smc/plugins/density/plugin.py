@@ -233,6 +233,14 @@ def _require_the_same_wells(
             f"the scan holds well {well!r}, which the scan plan does not list among "
             f"its wells; run scan-plan, scan and cells again",
         )
+    # A well listed twice would be reported twice, and `density()` would refuse it
+    # with the remedy of the cells: it is the plan that is wrong.
+    for well in sorted(plan.wells):
+        if plan.wells.count(well) > 1:
+            raise PluginRunError(
+                _NAME,
+                f"the scan plan lists well {well!r} twice; run scan-plan again",
+            )
 
 
 def _geometry_of(plan: ScanPlanResult, well: str) -> WellGeometry:
