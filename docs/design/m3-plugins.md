@@ -1708,15 +1708,95 @@ soft limits and dry run are the layer's. Its model lives in
 
 The 31 ported tests (`test_plate_registration.py`), with
 `test_calibration_round_trips_through_useqs_forward_model` as a hypothesis
-test (plate type, A1, rotation within ±20°, 1 to 4 references with ±12 µm
-of jitter); `test_a_seed_fills_the_plate_slot_with_rotation_zero`;
+test (plate type, A1, rotation within ±8°, 1 to 4 references with ±12 µm
+of jitter; the bounds are in the block below);
+`test_a_seed_fills_the_plate_slot_with_rotation_zero`;
 `test_a_residual_beyond_300_um_fails_and_names_the_well`;
 `test_a_well_given_twice_is_refused`; `test_goto_well_drives_to_the_wall_point_on_a_rotated_plate`
 (demo); `test_goto_well_needs_a_plate`. `docs/plugins/plate-registration.md`
 documents §5.1's loop.
 
 **Failure modes**: FM-73 (anisotropic probes, a rotated plate),
-FM-43.
+FM-43, FM-121 (the rotation bound below), FM-124.
+
+**Refined while planning #19** (measured 2026-10-28 on a prototype that
+is not committed, useq-schema 0.9.2 and pydantic 2.13.5 on Python 3.13;
+`useq._plate_registry` read in the 0.9.0 wheel too):
+
+- **Two references can fit a plate turned by 90° with no residual.** A1 at
+  (0, 0) and A2 at (9000, 0) µm, with A2 typed as `B1`: the fit gives
+  90.0°, a residual of 3e-13 µm and a scale error of 0, and puts H12 at
+  (63 000, 99 000) µm instead of (99 000, −63 000). Neither the scale check
+  nor the residual can see it. `calibrate` therefore takes
+  `max_rotation_deg: float = MAX_ROTATION_DEG` (keyword, `MAX_ROTATION_DEG =
+  10.0`) and raises `ValueError` beyond it: `the fit turns the plate by
+  <r>°, beyond ±<max>°: a reference well is misidentified (two references
+  the same distance apart fit either way)`. `PlateRegistrationParams` gains
+  `max_rotation_deg: float = Field(10.0, gt=0.0, le=45.0)`, for a holder
+  that really holds a plate askew (FM-121: the bound is on the derived
+  value, not only on the inputs).
+- **Nominal offsets come from useq.** `nominal_offsets(plate)` is the
+  `all_well_positions` of a plan with A1 at (0, 0) and rotation 0, keyed by
+  `str(name)`: 3 ms for the 1536 wells, where one `well_geometry` per well
+  takes 0.34 s. `nearest_well` uses `result.to_plan().all_well_positions`
+  the same way. A fit of 3 references with no jitter gives A1 back within
+  2e-11 µm and the rotation within 4e-15° on the 6-, 24-, 96-, 384- and
+  1536-well plates at 7.25°.
+- **The fit** (`plate.py`'s): centroids of the nominal offsets `d` and the
+  measured points `m`, `θ = atan2(Σ d′ × m′, Σ d′ · m′)` of the centred sets,
+  `A1 = m̄ − R(θ) · d̄`. The scale check (the longest nominal baseline among
+  the references, measured over nominal minus 1, signed) runs before the
+  fit and the rotation bound after it. The residual is computed from the
+  fitted A1 and θ before the `PlateResult` is built: the result is
+  constructed once, never `model_copy`'d (which skips validation).
+- **A seed** (one reference) has `residual_um=None`, `scale_error=None`
+  (§3.2: nothing measured them; `plate.py` wrote 0.0) and `assumed` gains
+  `one reference well (<well>): rotation 0° assumed, not measured`.
+- **The residual spreads.** One reference of three that is 600 µm off
+  gives a residual of 298 µm; 700 µm gives 348 µm (A1, A12 and H1 of a
+  96-well plate, H1 moved in X). The worst reference is the one named.
+- **Wall touches are read per axis**, as `plate.py`: `left` and `right`
+  give X from their `x_um`, `top` and `bottom` give Y from their `y_um`,
+  and the other coordinate of a touch is not used, since the plate's
+  rotation is not known yet when walls are touched. `top` is +Y (towards
+  row A: rows grow towards −Y). An opposite pair gives the midpoint and a
+  signed size (`right − left`, `top − bottom`, so swapped sides are
+  refused by the size check); one wall gives the wall plus or minus the
+  nominal half-size of that axis (`well_size[0]` for X, `[1]` for Y), and
+  its axis is assumed. Touching along a stage axis from the wall point of
+  a plate turned by θ errs by `r (1 − cos θ)` for one wall: 8 µm at 4°,
+  49 µm at 10° for a 96-well well (computed); a pair cancels it for a round
+  well. A side given twice and a touch of another well are `ValueError`s.
+- **`wall_position`** is the well's centre plus `R(θ) · (∓w/2, 0)` for
+  left and right and `R(θ) · (0, ±h/2)` for top and bottom, `w` and `h`
+  the well's size; any other side is a `ValueError` (`plate.py` raised a
+  bare `KeyError`).
+- **`refs` of the result** hold the given references, then one per well
+  given by walls (its computed centre), in the order of the well's first
+  touch, all normalised.
+- **`goto-well` in a dry run** returns the target from `move_to_um`
+  (measured: the demo's dry run returns the target and the readback stays
+  where it was), so `x_um`, `y_um` are the target and `assumed` gains `dry
+  run: the stage did not move; x_um and y_um are the target`. The demo's
+  stage lands within 0.01 µm of a fractional target (measured:
+  18123.4567 → 18123.45). A `plate` from a dry run is unusable to a real
+  `goto-well` (§1.7's rule), which the plugin page says.
+- **The hypothesis test's bounds** are proved, not fitted: the rigid fit
+  minimises the sum of squares, so with jitter of at most `J` on `n`
+  references the residual is at most `√n · J`, and each reference's true
+  centre is predicted within `(√n + 1) · J` (5000 random cases: 1.39 J and
+  1.27 J at worst). The rotation is drawn within ±8°: with it drawn
+  within ±10°, jitter on close references gave a fit of −10.0° that the
+  bound refused (measured).
+- **An anisotropic plate for FM-73** is registered by the test only,
+  `monkeypatch.setitem(useq._plate_registry._PLATE_REGISTRY, name, {...})`
+  (the module and the dict exist in 0.9.0 and 0.9.2): every registered
+  plate has equal pitches and well sizes on both axes, so an exchange of X
+  and Y passes on all of them.
+- **On the Ti2-E** the profile's soft limits are ±49 000 × ±29 000 µm, a
+  span of 98 × 58 mm, and a 96-well plate's corner wells are 99 × 63 mm
+  apart: wherever the plate sits, a `goto-well` to some corner wells will
+  be refused by the layer (not measured at the stand; #198).
 
 ## 6. Automatic plate finding (#20)
 
