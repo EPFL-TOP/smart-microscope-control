@@ -3045,6 +3045,13 @@ Python 3.10.10 (what `panel>=1.4` resolves to on each today), macOS,
   "skip"` (as torch, §9.0); without it, `pn.widgets.Button(...)` is a
   `no-untyped-call` with Panel installed and `import-not-found` without.
   `sys.modules["panel"] = None` makes `import panel` raise `ModuleNotFoundError`.
+- **Names that warn.** Panel 1.9.4 and 1.10.0 raise a `PendingDeprecationWarning`
+  for a widget's `name=` and for `Button(button_type=...)`. With `label=` and
+  `color="danger"`, and with the figure, `circle`, `rect`, `scatter`, `line`,
+  `LabelSet`, `ColorBar`, `LinearColorMapper(nan_color=...)`, `Accordion`, `Card`,
+  `Toggle`, `Select`, `TextInput`, `pane.Markdown` and `pane.Bokeh`, a prototype
+  builds under `warnings.simplefilter("error")` on both. The page uses those
+  spellings, and its tests run with `PendingDeprecationWarning` as an error.
 - **Not measured**: a real browser (the click that raises `Tap`, the periodic
   callback of a session, the look), Windows, RDP, a PC with no internet.
 
