@@ -69,6 +69,7 @@ smc = "smc.cli:main"
 [project.entry-points."smc.plugins"]
 camera-calibration = "smc.plugins.camera_calibration.plugin:CameraCalibrationPlugin"
 cells = "smc.plugins.cells.plugin:CellsPlugin"
+route = "smc.plugins.route.plugin:RoutePlugin"
 scan = "smc.plugins.scan.plugin:ScanPlugin"
 scan-plan = "smc.plugins.scan_plan.plugin:ScanPlanPlugin"
 stage-report = "smc.plugins.stage_report:StageReport"
