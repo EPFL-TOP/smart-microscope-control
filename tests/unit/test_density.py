@@ -19,9 +19,9 @@ import numpy as np
 import pytest
 
 from smc.plugins.density import algorithm
-from smc.plugins.density.algorithm import GridTooFineError, scanned_area_mm2
+from smc.plugins.density.algorithm import GridTooFineError, density, scanned_area_mm2
 from smc.plugins.geometry import Matrix2, footprint
-from smc.plugins.slots import WellGeometry
+from smc.plugins.slots import Cell, DensityWell, WellGeometry
 
 pytestmark = pytest.mark.filterwarnings("error::RuntimeWarning")
 
@@ -509,3 +509,206 @@ def test_a_far_footprint_is_no_test_of_the_window_and_no_grid() -> None:
     assert scanned_area_mm2(
         [*far, _field(0.0, 0.0)], _disc(), grid_um=10.0
     ) == pytest.approx(FIELD_MM2, abs=1e-9)
+
+
+# ---------------------------------------------------------------- density()
+
+LABELS = ("single", "doublet", "debris")
+
+
+def _cell(well: str, x_um: float, y_um: float, label: str = "single") -> Cell:
+    return Cell(
+        well=well,
+        x_um=x_um,
+        y_um=y_um,
+        label=label,
+        score=0.9,
+        frame=0,
+        box_px=(0.0, 0.0, 1.0, 1.0),
+    )
+
+
+def _named(
+    name: str, centre: tuple[float, float], radius_um: float = 1000.0
+) -> WellGeometry:
+    return WellGeometry(name, centre, (2 * radius_um, 2 * radius_um), True, 0.0)
+
+
+def _count(
+    cells: Sequence[Cell],
+    wells: Sequence[WellGeometry],
+    *,
+    areas: dict[str, float] | None = None,
+    fields: dict[str, int] | None = None,
+    failed: dict[str, int] | None = None,
+    labels: Sequence[str] = LABELS,
+) -> tuple[DensityWell, ...]:
+    names = [w.well for w in wells]
+    return density(
+        cells,
+        wells=wells,
+        areas_mm2=areas if areas is not None else dict.fromkeys(names, 0.25),
+        fields=fields if fields is not None else dict.fromkeys(names, 1),
+        failed_fields=failed if failed is not None else dict.fromkeys(names, 0),
+        labels=labels,
+    )
+
+
+def test_counts_are_per_label_zeros_included_and_per_mm2_divides_by_the_area() -> None:
+    well = _named("A1", (0.0, 0.0))
+    cells = [_cell("A1", 10.0 * i, 5.0) for i in range(6)] + [
+        _cell("A1", -20.0 * i, -5.0, "doublet") for i in range(2)
+    ]
+
+    (result,) = _count(cells, [well], fields={"A1": 4}, failed={"A1": 1})
+
+    assert result.well == "A1"
+    assert result.counts == {"single": 6, "doublet": 2, "debris": 0}
+    assert list(result.counts) == list(LABELS)
+    assert result.per_mm2 == {"single": 24.0, "doublet": 8.0, "debris": 0.0}
+    assert result.area_mm2 == 0.25
+    assert (result.fields, result.failed_fields, result.outside_well) == (4, 1, 0)
+
+
+def test_a_cell_on_the_plastic_counts_outside() -> None:
+    """Radius 1000 µm: 999 is inside, exactly 1000 is the edge and counts, 1001 is on the plastic."""
+    well = _named("A1", (500.0, -300.0))
+    cells = [
+        _cell("A1", 500.0 + 999.0, -300.0),
+        _cell("A1", 500.0 + 1000.0, -300.0),
+        _cell("A1", 500.0 + 1001.0, -300.0, "doublet"),
+    ]
+
+    (result,) = _count(cells, [well])
+
+    assert result.counts == {"single": 2, "doublet": 0, "debris": 0}
+    assert result.outside_well == 1
+    assert result.per_mm2 == {"single": 8.0, "doublet": 0.0, "debris": 0.0}
+
+
+def test_a_well_with_no_frame_has_unknown_density() -> None:
+    well = _named("A1", (0.0, 0.0))
+
+    (result,) = _count(
+        [], [well], areas={"A1": 0.0}, fields={"A1": 0}, failed={"A1": 4}
+    )
+
+    assert result.per_mm2 is None
+    assert result.counts == {"single": 0, "doublet": 0, "debris": 0}
+    assert (result.fields, result.failed_fields, result.area_mm2) == (0, 4, 0.0)
+
+
+def test_cells_of_different_wells_are_counted_apart_and_the_order_of_wells_is_kept() -> (
+    None
+):
+    b1 = _named("B1", (0.0, -9000.0))
+    a1 = _named("A1", (0.0, 0.0))
+    cells = [
+        _cell("A1", 1.0, 1.0),
+        _cell("B1", 1.0, -9000.0, "doublet"),
+        _cell("A1", 2.0, 2.0),
+        _cell("B1", 2.0, -9000.0, "doublet"),
+        _cell("B1", 3.0, -9000.0, "doublet"),
+    ]
+
+    result = _count(
+        cells, [b1, a1], areas={"B1": 0.5, "A1": 0.25}, fields={"B1": 2, "A1": 3}
+    )
+
+    assert [w.well for w in result] == ["B1", "A1"]
+    assert result[0].counts == {"single": 0, "doublet": 3, "debris": 0}
+    assert result[0].per_mm2 == {"single": 0.0, "doublet": 6.0, "debris": 0.0}
+    assert result[1].counts == {"single": 2, "doublet": 0, "debris": 0}
+    assert result[1].per_mm2 == {"single": 8.0, "doublet": 0.0, "debris": 0.0}
+    assert (result[0].fields, result[1].fields) == (2, 3)
+
+
+def test_every_cell_is_counted_once_or_outside() -> None:
+    """Seeded cells over two wells, some on the plastic: each is classified as the scalar ``contains`` says."""
+    rng = random.Random(11)
+    wells = [_named("A1", (0.0, 0.0), 1000.0), _named("A2", (3000.0, 100.0), 800.0)]
+    cells = [
+        _cell(
+            well.well,
+            well.center_um[0] + rng.uniform(-1300.0, 1300.0),
+            well.center_um[1] + rng.uniform(-1300.0, 1300.0),
+            rng.choice(LABELS),
+        )
+        for well in wells
+        for _ in range(200)
+    ]
+
+    result = _count(cells, wells)
+
+    for well, counted in zip(wells, result, strict=True):
+        mine = [c for c in cells if c.well == well.well]
+        inside = [c for c in mine if well.contains(c.x_um, c.y_um)]
+        assert 0 < len(inside) < len(mine)
+        assert sum(counted.counts.values()) + counted.outside_well == len(mine)
+        assert counted.outside_well == len(mine) - len(inside)
+        for label in LABELS:
+            assert counted.counts[label] == sum(1 for c in inside if c.label == label)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "reason"),
+    [
+        ({"labels": ()}, "labels must name at least one label"),
+        ({"labels": ("single", "doublet", "single")}, "label 'single' is repeated"),
+        ({"wells": "twice"}, "well 'A1' is listed twice"),
+        ({"areas": {"B1": 0.25}}, "areas_mm2 has no entry for well 'A1'"),
+        ({"fields": {"A1": 1}}, "fields has no entry for well 'B1'"),
+        ({"failed": {}}, "failed_fields has no entry for well 'A1'"),
+        (
+            {"areas": {"A1": math.nan, "B1": 0.25}},
+            "areas_mm2 of well 'A1' must be finite and not negative, got nan",
+        ),
+        (
+            {"areas": {"A1": 0.25, "B1": -0.5}},
+            "areas_mm2 of well 'B1' must be finite and not negative, got -0.5",
+        ),
+        (
+            {"areas": {"A1": math.inf, "B1": 0.25}},
+            "areas_mm2 of well 'A1' must be finite and not negative, got inf",
+        ),
+        (
+            {"fields": {"A1": 1, "B1": -1}},
+            "fields of well 'B1' must not be negative, got -1",
+        ),
+        (
+            {"failed": {"A1": -2, "B1": 0}},
+            "failed_fields of well 'A1' must not be negative, got -2",
+        ),
+        (
+            {"cells": [_cell("A1", 0.0, 0.0), _cell("C3", 0.0, 0.0)]},
+            "a cell is in well 'C3', which is not among the wells",
+        ),
+        (
+            {"cells": [_cell("A1", 0.0, 0.0, "mitotic"), _cell("C3", 0.0, 0.0)]},
+            "a cell of well 'A1' has label 'mitotic', which is not among the labels "
+            "['single', 'doublet', 'debris']",
+        ),
+        (
+            {"cells": [_cell("C3", 0.0, 0.0, "mitotic")]},
+            "a cell is in well 'C3', which is not among the wells",
+        ),
+    ],
+)
+def test_density_refuses_what_it_cannot_count(
+    kwargs: dict[str, Any], reason: str
+) -> None:
+    """The text is the whole of it (FM-45); the first cell that fails is the one named, its well before its label."""
+    a1, b1 = _named("A1", (0.0, 0.0)), _named("B1", (3000.0, 0.0))
+    wells = [a1, a1] if kwargs.pop("wells", None) == "twice" else [a1, b1]
+    cells = kwargs.pop("cells", [])
+
+    with pytest.raises(ValueError, match=_exactly(reason)):
+        _count(cells, wells, **kwargs)
+
+
+def test_a_missing_entry_is_named_well_by_well_and_then_mapping_by_mapping() -> None:
+    """A1 lacks ``fields`` and B1 lacks ``areas_mm2``: the first well's is the one named."""
+    a1, b1 = _named("A1", (0.0, 0.0)), _named("B1", (3000.0, 0.0))
+
+    with pytest.raises(ValueError, match=_exactly("fields has no entry for well 'A1'")):
+        _count([], [a1, b1], areas={"A1": 0.25}, fields={"B1": 1})

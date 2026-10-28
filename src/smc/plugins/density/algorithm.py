@@ -13,6 +13,12 @@ same areas on the three): a 96-well disc covered by 305 fields at 5 µm gives
 error of its edges, up to ``g / (2 w)`` per axis (+1.3 % for a 333 µm field at
 5 µm), so the grid is fine for a well and rough for one field.
 
+The counting is the other half: a cell is in a well when the well's shape says
+so (the one place that knows it, ``WellGeometry``), and a cell on the plastic is
+``outside_well`` and in no label, so the counts of a well always add up to its
+cells. The density divides by the imaged area only: what a failed field would
+have shown is in neither the numerator nor the denominator.
+
 Numeric choices made on measurements, not on taste:
 
 * **The grid is cut to the well, not to the data.** A frame read back at a wrong
@@ -37,20 +43,21 @@ Numeric choices made on measurements, not on taste:
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
 import numpy.typing as npt
 
-from smc.plugins.slots import WellGeometry
+from smc.plugins.slots import Cell, DensityWell, WellGeometry
 
-__all__ = ["GridTooFineError", "scanned_area_mm2"]
+__all__ = ["GridTooFineError", "density", "scanned_area_mm2"]
 
 #: A grid never holds more points than this on a side: the bound that keeps
 #: ``math.ceil`` of the float count a Python int of a size that can be allocated.
 _MAX_SIDE_POINTS = 2**17
-#: ...nor in all. 2**30 points are a grid of 0.5 µm over a 6-well well.
+#: ...nor in all. Memory does not grow with it (a band is at most 2**20
+#: elements); the time does, and 2**30 points are a 6.4 mm well at 0.2 µm.
 _MAX_GRID_POINTS = 2**30
 #: Footprint-window by grid-point tests one area may make. Measured 440 to 650
 #: million a second on the three numpys, so 3 to 5 s at the bound on a laptop,
@@ -182,6 +189,126 @@ def scanned_area_mm2(
         band &= well.contains_many(xs[None, :], ys[:, None])
         covered += int(band.sum())
     return covered * grid_um * grid_um / 1e6
+
+
+def density(
+    cells: Sequence[Cell],
+    *,
+    wells: Sequence[WellGeometry],
+    areas_mm2: Mapping[str, float],
+    fields: Mapping[str, int],
+    failed_fields: Mapping[str, int],
+    labels: Sequence[str],
+) -> tuple[DensityWell, ...]:
+    """The cells of each well counted per label, and divided by the area that was imaged.
+
+    A cell is counted when ``well.contains_many`` says it is inside its well's
+    shape, the edge included, as ``contains`` does: one outside (a field's
+    corner on the plastic) is ``outside_well`` and in no label. So the counts
+    and ``outside_well`` of a well always add up to its cells. Every label is a
+    key of ``counts``, zeros included, in ``labels`` order. ``per_mm2`` divides
+    by the imaged area only, and is ``None`` for an area of 0: with no frame the
+    density is unknown, not zero.
+
+    Everything that would make those sums wrong is refused up front, so that a
+    cell is never silently dropped: a label or a well that is repeated, a well
+    that a mapping lacks, an area that is not a size, a cell of a well or a label
+    that the caller did not list. The checks come in the order of the ``Raises``
+    and name the first offender.
+
+    Args:
+        cells: The cells of every well, as the cells stage detected them.
+        wells: The wells to report, in the order to report them.
+        areas_mm2: The imaged area of each well, by name.
+        fields: The frames taken in each well, by name.
+        failed_fields: The fields that failed in each well, by name.
+        labels: The classes, in the order the counts keep.
+
+    Returns:
+        One ``DensityWell`` per entry of ``wells``, in that order.
+
+    Raises:
+        ValueError: No label, or a label twice; a well twice; a well missing
+            from ``areas_mm2``, ``fields`` or ``failed_fields``; an area not
+            finite or negative, or a count below 0; a cell in a well that is
+            not among ``wells``, or with a label that is not among ``labels``.
+    """
+    if len(labels) == 0:
+        raise ValueError("labels must name at least one label")
+    for k, label in enumerate(labels):
+        if label in labels[:k]:
+            raise ValueError(f"label {label!r} is repeated")
+    for k, well in enumerate(wells):
+        if any(well.well == earlier.well for earlier in wells[:k]):
+            raise ValueError(f"well {well.well!r} is listed twice")
+    mappings: tuple[tuple[str, Mapping[str, float]], ...] = (
+        ("areas_mm2", areas_mm2),
+        ("fields", fields),
+        ("failed_fields", failed_fields),
+    )
+    for well in wells:
+        for mapping_name, mapping in mappings:
+            if well.well not in mapping:
+                raise ValueError(f"{mapping_name} has no entry for well {well.well!r}")
+    for well in wells:
+        area = areas_mm2[well.well]
+        if not (math.isfinite(area) and area >= 0.0):
+            raise ValueError(
+                f"areas_mm2 of well {well.well!r} must be finite and not "
+                f"negative, got {area!r}"
+            )
+        for mapping_name, mapping in mappings[1:]:
+            if mapping[well.well] < 0:
+                raise ValueError(
+                    f"{mapping_name} of well {well.well!r} must not be negative, "
+                    f"got {mapping[well.well]!r}"
+                )
+
+    of_well: dict[str, list[Cell]] = {well.well: [] for well in wells}
+    for cell in cells:
+        if cell.well not in of_well:
+            raise ValueError(
+                f"a cell is in well {cell.well!r}, which is not among the wells"
+            )
+        if cell.label not in labels:
+            raise ValueError(
+                f"a cell of well {cell.well!r} has label {cell.label!r}, which is "
+                f"not among the labels {list(labels)}"
+            )
+        of_well[cell.well].append(cell)
+
+    result = []
+    for well in wells:
+        counts = dict.fromkeys(labels, 0)
+        outside = 0
+        mine = of_well[well.well]
+        if mine:
+            inside = well.contains_many(
+                np.array([cell.x_um for cell in mine], dtype=np.float64),
+                np.array([cell.y_um for cell in mine], dtype=np.float64),
+            )
+            for cell, is_inside in zip(mine, inside.tolist(), strict=True):
+                if is_inside:
+                    counts[cell.label] += 1
+                else:
+                    outside += 1
+        area = areas_mm2[well.well]
+        result.append(
+            DensityWell(
+                well=well.well,
+                fields=fields[well.well],
+                failed_fields=failed_fields[well.well],
+                area_mm2=area,
+                counts=counts,
+                outside_well=outside,
+                per_mm2=(
+                    {label: counts[label] / area for label in labels}
+                    if area > 0.0
+                    else None
+                ),
+            )
+        )
+    return tuple(result)
 
 
 def _parallelogram(k: int, corners: Sequence[tuple[float, float]]) -> _Parallelogram:
