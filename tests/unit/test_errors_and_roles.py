@@ -4,6 +4,7 @@ import pytest
 
 from smc.hardware.core import CoreError
 from smc.hardware.errors import (
+    AutofocusExcursionError,
     AutofocusLostError,
     CapabilityMissingError,
     HardwareError,
@@ -88,6 +89,24 @@ def test_autofocus_lost_survives_a_worker_process() -> None:
     error = AutofocusLostError("z: moved, no lock", 12.0, False)
     copy = pickle.loads(pickle.dumps(error))
     assert (str(copy), copy.z_um, copy.in_range) == ("z: moved, no lock", 12.0, False)
+
+
+def test_autofocus_excursion_error_pickles_with_its_positions() -> None:
+    error = AutofocusExcursionError("autofocus PFS: Z went", 4269.44, 4504.76)
+    copy = pickle.loads(pickle.dumps(error))
+    assert type(copy) is AutofocusExcursionError
+    assert (str(copy), copy.z_start_um, copy.z_um) == (
+        "autofocus PFS: Z went",
+        4269.44,
+        4504.76,
+    )
+
+
+def test_autofocus_excursion_error_is_not_a_safety_refusal() -> None:
+    # FM-64: Z moved, so a tool that skips a target on a refusal must not
+    # catch this one and carry on (m2 §12.2 D2).
+    assert issubclass(AutofocusExcursionError, HardwareError)
+    assert not issubclass(AutofocusExcursionError, SafetyRefusedError)
 
 
 # --- a stop the device refuses (m2 §11.4) -------------------------------------
