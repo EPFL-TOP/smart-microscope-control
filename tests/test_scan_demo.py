@@ -41,6 +41,7 @@ from smc.hardware.capabilities import (
     ZStage,
 )
 from smc.hardware.errors import (
+    DeviceTimeoutError,
     HardwareError,
     MicroscopeHaltedError,
     MotionStoppedError,
@@ -134,9 +135,12 @@ class _Camera(SampleCamera):
         self.reported_um: float | None = None
         self.reported_shape: tuple[int, int] | None = None
         self.transposed_snap: int | None = None
+        self.fail: dict[int, BaseException] = {}
 
     def snap(self) -> npt.NDArray[np.uint16]:
         self.snaps += 1
+        if self.snaps in self.fail:
+            raise self.fail[self.snaps]
         if self.snaps == self.transposed_snap:
             return np.zeros((SHAPE[1], SHAPE[0]), dtype=np.uint16)
         return super().snap()
@@ -417,12 +421,14 @@ def test_the_entry_point_loads_scan() -> None:
 def test_a_scan_writes_one_tiff_per_field_and_records_the_readback(rig: _Rig) -> None:
     plan = _plan(rig)
     rig.stage.offset_um = (3.0, -2.0)
+    rig.camera.set_exposure_ms(37.5)
     z_stage = rig.microscope.require(ZStage)
     z0 = z_stage.position_um()
 
     result = _result(_scan(rig))
 
     assert result.folder.startswith("scan/")
+    assert result.exposure_ms == 37.5
     assert [f.name for f in result.frames] == [f.name for f in plan.fields]
     assert result.failed == ()
     assert result.objective == IN_PLACE
@@ -454,6 +460,7 @@ def test_a_scan_writes_one_tiff_per_field_and_records_the_readback(rig: _Rig) ->
         written.pop("shape")
         assert written == frame.model_dump(mode="json")
     assert [f.t_s for f in result.frames] == sorted(f.t_s for f in result.frames)
+    assert result.frames[-1].t_s > result.frames[0].t_s
     assert len(_tiffs(rig)) == 12
     assert z_stage.position_um() == pytest.approx(z0)  # never moved
 
@@ -649,10 +656,82 @@ def test_the_disk_counts_only_the_fields_left_on_a_resume(
     assert len(_result(_scan(rig, resume=True)).frames) == 12
 
 
+def test_a_disk_that_cannot_be_read_is_refused_before_moving(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def dropped(_path: object) -> object:
+        raise OSError(errno.EIO, "Input/output error")
+
+    monkeypatch.setattr(shutil, "disk_usage", dropped)
+
+    assert _refused(rig) == (
+        "the run folder cannot be read (Input/output error): check the disk or the "
+        "network share, then run scan --resume"
+    )
+
+
+def _edit_plan(rig: _Rig, edit: Callable[[list[dict[str, Any]]], None]) -> None:
+    """Rewrite the stored plan's fields as a copied or hand-edited run document would."""
+    record = RunDocument.load(rig.run_doc).stages["scan-plan"]
+    assert record.result is not None
+    fields = [dict(field) for field in record.result["fields"]]
+    edit(fields)
+    write_stage(
+        rig.run_doc,
+        record.model_copy(update={"result": {**record.result, "fields": fields}}),
+    )
+
+
+def _rename_second(fields: list[dict[str, Any]]) -> None:
+    fields[1]["name"] = "../x"
+
+
+def _duplicate_first(fields: list[dict[str, Any]]) -> None:
+    fields[1]["name"] = fields[0]["name"]
+
+
+def _foreign_well(fields: list[dict[str, Any]]) -> None:
+    fields[1]["well"] = "Z9"
+    fields[1]["name"] = "Z9_0000"
+
+
+@pytest.mark.parametrize(
+    ("edit", "reason"),
+    [
+        (
+            _rename_second,
+            "field '../x' of well 'A1': '../x' cannot be a frame's field name in a "
+            "file path: only letters, digits, '_' and '-' are",
+        ),
+        (
+            _duplicate_first,
+            "two fields of well A1 are named A1_0000, so they would write one "
+            "file: run scan-plan again with the stand as it is now",
+        ),
+        (
+            _foreign_well,
+            "field 'Z9_0000' is of well 'Z9', which the scan plan does not list: "
+            "run scan-plan again with the stand as it is now",
+        ),
+    ],
+    ids=["dot-dot", "duplicate", "foreign-well"],
+)
+def test_a_plan_whose_paths_cannot_be_written_is_refused_before_anything_moves(
+    edit: Callable[[list[dict[str, Any]]], None], reason: str, rig: _Rig
+) -> None:
+    """FM-24: the plan is a run document's, and may have been copied or edited."""
+    _edit_plan(rig, edit)
+
+    assert _refused(rig) == reason
+
+
 # ------------------------------------------------------------- at every well
 
 
-def test_a_turret_turned_mid_scan_stops_at_the_next_well(rig: _Rig) -> None:
+def test_a_turret_turned_mid_well_stops_the_scan_at_the_end_of_that_well(
+    rig: _Rig,
+) -> None:
+    """Turned after A2's second field: A2 is not marked done, A1 is kept (FM-103)."""
     turret = _Turret()
     rig.microscope.override(ObjectiveTurret, turret)
 
@@ -660,34 +739,66 @@ def test_a_turret_turned_mid_scan_stops_at_the_next_well(rig: _Rig) -> None:
         turret.now = FORTY
 
     with pytest.raises(PluginRunError) as raised:
-        _scan(rig, on_progress=_at(4, turn))
+        _scan(rig, on_progress=_at(6, turn))
 
     assert raised.value.reason == (
-        f"the objective in place is now {FORTY!r} at well A2; the scan was planned "
-        f"for {IN_PLACE!r}: turn the turret back to {IN_PLACE!r}, then run scan "
-        "--resume"
+        f"the objective in place is now {FORTY!r} at the end of well A2; the scan "
+        f"was planned for {IN_PLACE!r}: turn the turret back to {IN_PLACE!r}, then "
+        "run scan --resume"
     )
     assert _stored(rig).status is StageStatus.failed
     checkpoint = _checkpoint(rig)
+    # A2's last two frames were taken under the 40x: A2 is not marked done.
     assert checkpoint.wells_done == ("A1",)
     assert len(checkpoint.frames) == 4
-    assert rig.stage.moves == 4
+    assert rig.stage.moves == 8
     assert turret.selects == []
 
 
-def test_a_changed_pixel_size_stops_the_scan(rig: _Rig) -> None:
+def test_a_turret_turned_after_a_wells_last_field_does_not_keep_that_well(
+    rig: _Rig,
+) -> None:
+    """Turned after A1's last frame: refused before A2's first move, A1 not kept.
+
+    The check at the end of A1 runs after A1's last progress report, so it sees
+    the turn; A1's frames were all taken before it, but the check cannot tell
+    when the turret turned, and redoing a well is cheaper than a wrong one.
+    """
+    turret = _Turret()
+    rig.microscope.override(ObjectiveTurret, turret)
+
+    def turn() -> None:
+        turret.now = FORTY
+
+    with pytest.raises(PluginRunError, match="at the end of well A1;"):
+        _scan(rig, on_progress=_at(4, turn))
+
+    assert rig.stage.moves == 4
+    assert _stored(rig).checkpoint is None  # no well was marked done
+
+
+@pytest.mark.parametrize(
+    ("now_um", "text"),
+    [(1 / 1.5, "0.666667"), (1.05, "1.05"), (math.nan, "nan")],
+    ids=["lever", "five-percent", "nan"],
+)
+def test_a_changed_pixel_size_stops_the_scan(
+    now_um: float, text: str, rig: _Rig
+) -> None:
+    """FM-103 (the lever), and a 5 % drift that a calibration's 10 % would let through; FM-104."""
+
     def lever() -> None:
-        rig.camera.reported_um = 1 / 1.5
+        rig.camera.reported_um = now_um
 
     with pytest.raises(PluginRunError) as raised:
-        _scan(rig, on_progress=_at(4, lever))
+        _scan(rig, on_progress=_at(6, lever))
 
     assert raised.value.reason == (
-        "the camera reports 0.666667 µm per pixel at well A2, 1 at the start of "
-        "the scan (the magnifier lever, a binning): set it back, then run scan "
-        "--resume"
+        f"the camera reports {text} µm per pixel at the end of well A2, 1 at the "
+        "start of the scan (the magnifier lever, a binning): set it back, then "
+        "run scan --resume"
     )
-    assert rig.stage.moves == 4
+    assert rig.stage.moves == 8
     assert _checkpoint(rig).wells_done == ("A1",)
 
 
@@ -695,16 +806,21 @@ def test_a_pixel_size_within_one_percent_does_not_stop_the_scan(rig: _Rig) -> No
     def drift() -> None:
         rig.camera.reported_um = 1.005
 
-    assert len(_result(_scan(rig, on_progress=_at(4, drift))).frames) == 12
+    assert len(_result(_scan(rig, on_progress=_at(6, drift))).frames) == 12
 
 
-def test_a_frame_shape_changed_mid_scan_stops_at_the_next_well(rig: _Rig) -> None:
+def test_a_frame_shape_changed_mid_scan_stops_at_the_end_of_its_well(
+    rig: _Rig,
+) -> None:
     def binning() -> None:
         rig.camera.reported_shape = (48, 64)
 
-    with pytest.raises(PluginRunError, match=r"\(48, 64\) pixels at well A2"):
-        _scan(rig, on_progress=_at(4, binning))
-    assert rig.stage.moves == 4
+    with pytest.raises(
+        PluginRunError, match=r"\(48, 64\) pixels at the end of well A2"
+    ):
+        _scan(rig, on_progress=_at(6, binning))
+    assert rig.stage.moves == 8
+    assert _checkpoint(rig).wells_done == ("A1",)
 
 
 def test_a_frame_of_another_shape_ends_the_scan(rig: _Rig) -> None:
@@ -787,6 +903,36 @@ def test_failures_not_in_a_row_do_not_fail_the_scan(rig: _Rig) -> None:
     assert len(result.frames) == 10
 
 
+def test_failures_in_a_row_are_counted_across_a_well(rig: _Rig) -> None:
+    """A1's last field and A2's first two: three in a row, though in two wells."""
+    rig.stage.fail = {n: HardwareError(f"no answer {n}") for n in (4, 5, 6)}
+
+    with pytest.raises(
+        PluginRunError, match="3 fields failed in a row, the last A2_0001: "
+    ):
+        _scan(rig)
+
+    checkpoint = _checkpoint(rig)
+    assert checkpoint.wells_done == ("A1",)
+    # A1 was marked done with its failed field, which the checkpoint keeps.
+    assert [f.name for f in checkpoint.failed] == ["A1_0003"]
+    assert len(checkpoint.frames) == 3
+
+
+def test_a_snap_that_times_out_is_a_failed_field(rig: _Rig) -> None:
+    plan = _plan(rig)
+    rig.camera.fail = {3: DeviceTimeoutError("the camera did not answer in 5 s")}
+
+    result = _result(_scan(rig))
+
+    assert [f.name for f in result.failed] == [plan.fields[2].name]
+    assert result.failed[0].error == (
+        "DeviceTimeoutError: the camera did not answer in 5 s"
+    )
+    assert len(result.frames) == 11
+    assert rig.stage.moves == 12
+
+
 def test_a_halt_is_not_a_failed_field(rig: _Rig) -> None:
     """FM-64: the emergency stop ends the scan; it is not a field to skip."""
     try:
@@ -851,6 +997,9 @@ def stopped(rig: _Rig) -> _Rig:
     record = _scan(rig, stop=stop, on_progress=_at(5, stop.set))
     assert record.status is StageStatus.stopped
     assert _checkpoint(rig).wells_done == ("A1",)
+    # The stop is honoured before the next move, not after it.
+    assert rig.stage.moves == 5
+    assert rig.camera.snaps == 5
     rig.stage.moves = 0
     rig.camera.snaps = 0
     return rig
@@ -870,6 +1019,65 @@ def test_a_stopped_scan_resumes_with_the_same_token(stopped: _Rig) -> None:
     # A2 was not done, so it is scanned whole again, and then B2.
     assert stopped.stage.moves == 8
     assert len(_tiffs(stopped)) == 12
+
+
+def test_a_resume_keeps_the_failed_fields_of_the_wells_done(rig: _Rig) -> None:
+    rig.stage.fail = {2: HardwareError("no answer")}
+    stop = threading.Event()
+    _scan(rig, stop=stop, on_progress=_at(5, stop.set))
+    assert [f.name for f in _checkpoint(rig).failed] == ["A1_0001"]
+    rig.stage.fail = {}
+
+    result = _result(_scan(rig, resume=True))
+
+    assert [f.name for f in result.failed] == ["A1_0001"]
+    assert result.failed[0].error == "HardwareError: no answer"
+    assert len(result.frames) == 11
+
+
+def test_a_resume_whose_checkpoint_names_a_well_the_plan_lacks_is_refused(
+    stopped: _Rig,
+) -> None:
+    record = _stored(stopped)
+    assert record.checkpoint is not None
+    write_stage(
+        stopped.run_doc,
+        record.model_copy(
+            update={"checkpoint": {**record.checkpoint, "wells_done": ["A1", "Z9"]}}
+        ),
+    )
+
+    with pytest.raises(PluginRunError) as raised:
+        _scan(stopped, resume=True)
+
+    assert raised.value.reason == (
+        "the checkpoint names well Z9, which the scan plan does not have: run scan "
+        "without --resume"
+    )
+    assert stopped.stage.moves == 0
+
+
+def test_a_run_folder_that_cannot_be_read_is_not_a_missing_frame(
+    stopped: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FM-116: Windows raises a dropped share out of ``resolve``; ``--resume`` must stay the advice."""
+    import smc.plugins.scan.plugin as scan_plugin
+
+    def dropped(run_dir: Path, relative: str) -> Path:
+        cause = OSError(64, "The specified network name is no longer available")
+        raise ValueError(f"{relative!r} cannot be resolved") from cause
+
+    monkeypatch.setattr(scan_plugin, "resolve_in_run", dropped)
+
+    with pytest.raises(PluginRunError) as raised:
+        _scan(stopped, resume=True)
+
+    assert raised.value.reason == (
+        "the run folder cannot be read (The specified network name is no longer "
+        "available): check the disk or the network share, then run scan --resume"
+    )
+    assert stopped.stage.moves == 0
+    assert _checkpoint(stopped).wells_done == ("A1",)  # kept for that --resume
 
 
 def test_a_resume_after_the_plan_was_made_again_is_refused(stopped: _Rig) -> None:
@@ -967,6 +1175,48 @@ def test_unlocked_fields_in_a_row_fail_the_scan(rig: _Rig) -> None:
         "checkpoint keeps 0 wells: lock it on the sample, then run scan --resume"
     )
     assert rig.camera.snaps == 2
+
+
+def test_unlocked_fields_not_in_a_row_do_not_fail_the_scan(rig: _Rig) -> None:
+    """The count resets on a lock: two lost locks far apart are not two in a row."""
+    af = _Autofocus(engaged=True, locked=True)
+    af.engage_results = [False, True, False, True]
+    rig.microscope.override(Autofocus, af)
+    rig.stage.after_move = lambda n: af.lose_lock() if n in (2, 4) else None
+
+    result = _result(_scan(rig, max_unlocked_in_row=2))
+
+    focus = [f.focus for f in result.frames]
+    assert focus == ["locked", "unlocked", "locked", "unlocked"] + ["locked"] * 8
+
+
+def test_an_autofocus_switched_off_during_the_scan_is_not_engaged_again(
+    rig: _Rig,
+) -> None:
+    """The operator's switch wins: engaging would drive Z to the stored offset's plane (#205)."""
+    af = _Autofocus(engaged=True, locked=True)
+    rig.microscope.override(Autofocus, af)
+
+    def switch_off(n: int) -> None:
+        if n == 3:
+            af.engaged = af.locked = False
+
+    rig.stage.after_move = switch_off
+
+    result = _result(_scan(rig, max_unlocked_in_row=20))
+
+    assert af.calls.count("engage") == 0
+    assert [f.focus for f in result.frames] == ["locked"] * 2 + ["unlocked"] * 10
+    assert result.assumed == ()
+
+    # With the default, the unlocked fields end the scan before the 5th of them.
+    rig.camera.snaps = 0
+    rig.stage.moves = 0
+    af.engaged = af.locked = True
+    with pytest.raises(PluginRunError, match="did not lock on 5 fields in a row"):
+        _scan(rig)
+    assert af.calls.count("engage") == 0
+    assert rig.camera.snaps == 6
 
 
 def test_an_autofocus_left_off_is_never_engaged(rig: _Rig) -> None:

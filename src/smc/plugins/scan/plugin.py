@@ -10,10 +10,14 @@ keep a night's scan from producing frames nobody can trust:
   in place, the camera's frame and pixel size against the plan's, the
   autofocus, the free disk. A refusal leaves the stage where it was and writes
   no file.
-* **The stand is checked again at every well.** A turret turned by hand, a
-  binning changed, the magnifier lever moved (FM-103) make every later frame
-  the wrong size for the plan's matrix: the scan ends, and the checkpoint keeps
-  the wells done.
+* **The stand is checked again at both ends of every well.** A turret turned
+  by hand, a binning changed, the magnifier lever moved (FM-103) make every
+  later frame the wrong size for the plan's matrix: the scan ends, and the
+  checkpoint keeps only the wells whose stand was the same from first to last
+  field.
+* **An autofocus switched off during the scan stays off.** A lost lock is
+  engaged again once per field; one the operator switched off is not, and its
+  fields are counted as unlocked.
 * **A field that fails is recorded and skipped; a halt is not a failure**
   (FM-64). ``max_failed_in_row`` failures in a row end the scan: a stage that
   refuses every move must not read as a scan of failed fields.
@@ -185,9 +189,12 @@ class ScanPlugin:
         failed_in_row = 0
         unlocked_in_row = 0
         engaged_again = 0
+        # Whether the scan's own engage left the autofocus off (the protocol
+        # switches it off when no lock comes): that one is the scan's to retry.
+        off_by_the_scan = False
         t0 = time.monotonic()
         for well, fields in groups:
-            _check_well(camera, plan, stand, well)
+            _check_well(camera, plan, stand, f" at well {well}")
             for planned in fields:
                 ctx.raise_if_stopped()
                 error: str | None = None
@@ -197,9 +204,13 @@ class ScanPlugin:
                         locked = False
                         if stand.used and af is not None:
                             locked = af.is_locked()
-                            if not locked:
+                            # A lost lock is engaged again; an autofocus the
+                            # operator switched off during the scan stays off,
+                            # and its fields count as unlocked.
+                            if not locked and (off_by_the_scan or af.is_engaged()):
                                 locked = af.engage()
                                 engaged_again += 1
+                                off_by_the_scan = not locked
                             unlocked_in_row = 0 if locked else unlocked_in_row + 1
                             if unlocked_in_row >= params.max_unlocked_in_row:
                                 raise PluginRunError(
@@ -270,6 +281,10 @@ class ScanPlugin:
                     )
                 ctx.progress(done, total, planned.name)
 
+            # Again after the last field: a lever moved in the middle of the
+            # well made some of its frames at another scale, and a well is
+            # only marked done when the stand was the same at both ends.
+            _check_well(camera, plan, stand, f" at the end of well {well}")
             wells_done.append(well)
             ctx.save_checkpoint(
                 ScanCheckpoint(
@@ -339,11 +354,35 @@ def _resume(
 
 
 def _is_file_in_run(ctx: RunContext, relative: str) -> bool:
-    """Whether ``relative`` is a file inside the run folder; a path that leaves it is not."""
+    """Whether ``relative`` is a file inside the run folder; a path that leaves it is not.
+
+    A folder the OS cannot read now (a network share that dropped for a
+    moment: Windows raises out of ``resolve``, FM-116) is not a missing file:
+    reading it as one would tell the operator to drop a night's checkpoint.
+
+    Raises:
+        PluginRunError: The run folder cannot be read; ``--resume`` again later.
+    """
+    cause: OSError | None = None
     try:
         return resolve_in_run(ctx.run_dir, relative).is_file()
-    except ValueError:
-        return False
+    except ValueError as exc:
+        if not isinstance(exc.__cause__, OSError):
+            return False
+        cause = exc.__cause__
+    except OSError as exc:
+        cause = exc
+    # Raised outside the handler: nothing here keeps the OS's error.
+    raise _unreadable(cause)
+
+
+def _unreadable(cause: OSError) -> PluginRunError:
+    """The refusal for a run folder the OS will not read: it says why and what to do."""
+    return PluginRunError(
+        _NAME,
+        f"the run folder cannot be read ({cause.strerror or cause}): check the "
+        "disk or the network share, then run scan --resume",
+    )
 
 
 def _paths(
@@ -495,7 +534,13 @@ def _check_disk(
 ) -> None:
     """Refuse a scan whose frames the run folder's disk cannot hold, before the first move."""
     need = bytes_needed(n_fields, plan.image_shape_px, itemsize_of(camera.bit_depth()))
-    free = shutil.disk_usage(ctx.run_dir).free
+    unread: OSError | None = None
+    try:
+        free = shutil.disk_usage(ctx.run_dir).free
+    except OSError as exc:
+        unread = exc
+    if unread is not None:
+        raise _unreadable(unread)
     if free <= need:
         raise PluginRunError(
             _NAME,
@@ -518,13 +563,12 @@ def _check_shape(camera: Camera, plan: ScanPlanResult, where: str) -> None:
         )
 
 
-def _check_well(camera: Camera, plan: ScanPlanResult, stand: _Stand, well: str) -> None:
-    """Before a well's first field: the objective, the frame and the pixel size are still the start's (FM-103).
+def _check_well(camera: Camera, plan: ScanPlanResult, stand: _Stand, at: str) -> None:
+    """At both ends of a well: the objective, the frame and the pixel size are still the start's (FM-103).
 
-    A ``HardwareError`` from these reads is the stand's, not a field's: it ends
-    the scan.
+    ``at`` says where, for the message (`` at well A2``). A ``HardwareError``
+    from these reads is the stand's, not a field's: it ends the scan.
     """
-    at = f" at well {well}"
     resume = "then run scan --resume"
     if stand.turret is not None:
         current = stand.turret.current()
