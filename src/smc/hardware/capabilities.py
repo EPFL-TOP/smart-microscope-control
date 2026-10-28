@@ -313,7 +313,11 @@ class Autofocus(Protocol):
         ...
 
     def is_locked(self) -> bool:
-        """Whether it is holding focus now."""
+        """The device's own lock flag; not "settled" (m2 §12).
+
+        On the Ti2-E it read ``True`` 0.5 s before PFS drove Z +235 µm (#205):
+        ``engage()`` returning ``True`` is the call that waits for Z to settle.
+        """
         ...
 
     def is_in_range(self) -> bool | None:
@@ -331,6 +335,13 @@ class Autofocus(Protocol):
         (assumed); it must be finite and in (0, 600] s. Its search drives Z,
         so a ``ZStage.stop()`` during the search ends it with the autofocus
         off, as a raise (``MotionStoppedError``), never a ``False``.
+
+        ``True``: locked and settled (``[autofocus] settle_s``). On a stand
+        that declares ``engage_drives_z_to_offset``, it engages only at an
+        offset seen locked with this objective since the stand was opened,
+        and refuses otherwise (``SafetyRefusedError``, not forceable). Z is
+        guarded while it engages: out of its bound, it is switched off and
+        ``AutofocusExcursionError`` is raised (m2 §12).
         """
         ...
 

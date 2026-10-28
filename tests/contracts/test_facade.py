@@ -132,7 +132,13 @@ def test_teardown_puts_the_stand_back_where_it_started(
         xy.move_to_um(envelope.xy.x_um + 20, envelope.xy.y_um - 10)
     if z is not None and envelope.z_um is not None:
         z.move_to_um(envelope.z_um - 2)
-    if autofocus is not None and not envelope.autofocus_engaged:
+    if (
+        autofocus is not None
+        and not envelope.autofocus_engaged
+        # The offset above was never read locked: a stand that declares that
+        # engaging drives Z to it refuses the engage (m2 §12.2 D1).
+        and not microscope.profile.autofocus.engage_drives_z_to_offset
+    ):
         # Left engaged: the put-back switches it off again.
         autofocus.engage()
     if camera is not None and envelope.exposure_ms is not None:

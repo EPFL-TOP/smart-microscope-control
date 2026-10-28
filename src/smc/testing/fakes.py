@@ -145,6 +145,15 @@ class FakeCore:
     * ``quirk_z_move_disables_autofocus``: the Nikon quirk (FM-12).
     * ``autofocus_lockable``: ``False`` and the autofocus never reads
       locked, even enabled, as with no reference in range.
+    * ``autofocus_target_um``: where the autofocus drives the focus slot's
+      device once locked, as PFS drives Z to its offset's plane on the Ti2-E
+      (m2 §12.7; a test's closure may read the offset device). ``None``: it
+      moves nothing. The move is set on the store directly, at every locked
+      read once ``autofocus_drive_after_reads`` have passed, so that it never
+      trips the Nikon quirk (FM-12).
+    * ``autofocus_drive_after_reads``: how many ``True`` reads of
+      ``isContinuousFocusLocked()`` come before that move, counted from each
+      switch-on from off (run 1: locked read True, then Z jumped).
     * ``config_groups``: group -> preset -> its settings, which the
       config-group calls read and write; a test may fill it directly.
     """
@@ -177,6 +186,10 @@ class FakeCore:
         self.bit_depth = 16
         self.quirk_z_move_disables_autofocus = True
         self.autofocus_lockable = True
+        self.autofocus_target_um: Callable[[], float] | None = None
+        self.autofocus_drive_after_reads = 0
+        #: Locked reads since the last switch-on from off.
+        self._locked_reads = 0
         self.config_groups: dict[str, dict[str, Settings]] = {}
         self._channel_group = ""
 
@@ -751,6 +764,8 @@ class FakeCore:
             if enable:
                 raise RuntimeError(_NO_AUTOFOCUS)
             return
+        if enable and not self._continuous[label]:
+            self._locked_reads = 0
         self._continuous[label] = bool(enable)
 
     def isContinuousFocusEnabled(self) -> bool:
@@ -762,8 +777,22 @@ class FakeCore:
         """Locked whenever enabled, unless ``autofocus_lockable`` is ``False``.
 
         As on the demo, a lock comes at once; a real one takes time (assumed).
+        With ``autofocus_target_um``, a locked read past the first
+        ``autofocus_drive_after_reads`` drives the focus device to the target.
         """
-        return self.isContinuousFocusEnabled() and self.autofocus_lockable
+        locked = self.isContinuousFocusEnabled() and self.autofocus_lockable
+        if locked:
+            self._locked_reads += 1
+            target = self.autofocus_target_um
+            focus = self._slots["focus"]
+            if (
+                target is not None
+                and focus
+                and self._locked_reads > self.autofocus_drive_after_reads
+            ):
+                # The store, not setPosition: the quirk would switch it off.
+                self._z[focus] = float(target())
+        return locked
 
     def getAutoFocusOffset(self) -> float:
         """The slot's device's offset; with the slot empty, MMCore's error (measured)."""

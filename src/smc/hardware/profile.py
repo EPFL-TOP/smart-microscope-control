@@ -21,6 +21,7 @@ from pydantic import (
     ConfigDict,
     Field,
     ValidationError,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -61,6 +62,12 @@ _MAX_DEVICE_TIMEOUT_MS = 2**31 - 1
 #: ``smc.hardware.backends.mm.MAX_LOCK_TIMEOUT_S``, which this pure module
 #: cannot import.
 _MAX_LOCK_TIMEOUT_S = 600.0
+#: The lock wait when ``[autofocus] lock_timeout_s`` is unset, which bounds
+#: ``settle_s`` too (m2 §12.3). The same value as
+#: ``smc.hardware.backends.mm.DEFAULT_LOCK_TIMEOUT_S``; a test pins that.
+_DEFAULT_LOCK_TIMEOUT_S = 5.0
+#: The longest settle window a profile may set (m2 §12.3).
+_MAX_SETTLE_S = 60.0
 
 
 def _no_boolean(name: str, value: Any) -> Any:
@@ -178,6 +185,9 @@ class SafetySection(_Section):
     #: The roles whose device refuses ``stop()``, measured at a stand (m2 §11).
     #: The stop is still sent; the declaration changes what the layer says.
     stop_refused_by: tuple[Role, ...] = ()
+    #: How far Z may move while the autofocus engages, beyond where it started
+    #: or held its lock; ``None``: only ``z_soft_limits_um`` bound it (m2 §12).
+    max_engage_excursion_um: float | None = None
 
     @field_validator("stop_refused_by", mode="before")
     @classmethod
@@ -234,6 +244,22 @@ class SafetySection(_Section):
     ) -> tuple[float, float] | None:
         if value is not None:
             _check_ordered(value, "autofocus offset")
+        return value
+
+    @field_validator("max_engage_excursion_um", mode="before")
+    @classmethod
+    def _engage_excursion_not_boolean(cls, value: Any) -> Any:
+        return _no_boolean("max_engage_excursion_um", value)
+
+    @field_validator("max_engage_excursion_um")
+    @classmethod
+    def _engage_excursion_positive_finite(cls, value: float | None) -> float | None:
+        # As for the jog limits: an infinite band is not "no band".
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            raise ValueError(
+                f"max_engage_excursion_um must be a positive, finite number of µm, "
+                f"got {value}"
+            )
         return value
 
     @field_validator("max_jog_um")
@@ -321,6 +347,14 @@ class AutofocusSection(_Section):
     in_range_property: str = ""
     #: The values of that property that mean "in range"; any other is out of range.
     in_range_values: list[str] = Field(default_factory=list)
+    #: Engaging drives Z to the plane the stored offset names (measured on the
+    #: Ti2-E): the layer then engages only at an offset it has seen locked (m2 §12).
+    engage_drives_z_to_offset: bool = False
+    #: After the first locked read, ``engage()`` waits until Z has been still
+    #: this long; 0: the lock is taken as read (m2 §12.2 D3).
+    settle_s: float = 0.0
+    #: How far apart the Z reads of that window may lie.
+    settle_tolerance_um: float = 0.5
 
     @field_validator("lock_timeout_s", mode="before")
     @classmethod
@@ -361,6 +395,49 @@ class AutofocusSection(_Section):
                     f"with the autofocus locked), got {factor}"
                 )
         return value
+
+    @field_validator("settle_s", "settle_tolerance_um", mode="before")
+    @classmethod
+    def _settle_not_boolean(cls, value: Any, info: ValidationInfo) -> Any:
+        return _no_boolean(str(info.field_name), value)
+
+    @field_validator("settle_s")
+    @classmethod
+    def _settle_bounded(cls, value: float) -> float:
+        # The window holds the microscope lock, as the lock wait does.
+        if not (math.isfinite(value) and 0 <= value <= _MAX_SETTLE_S):
+            raise ValueError(
+                f"settle_s must be a finite number of seconds in [0, "
+                f"{_MAX_SETTLE_S:g}], got {value}"
+            )
+        return value
+
+    @field_validator("settle_tolerance_um")
+    @classmethod
+    def _settle_tolerance_positive_finite(cls, value: float) -> float:
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(
+                f"settle_tolerance_um must be a positive, finite number of µm, "
+                f"got {value}"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _settle_below_the_lock_timeout(self) -> AutofocusSection:
+        # One deadline bounds the lock and the settling (m2 §12.2 D3): a window
+        # as long as the wait could never end inside it.
+        limit = (
+            _DEFAULT_LOCK_TIMEOUT_S
+            if self.lock_timeout_s is None
+            else self.lock_timeout_s
+        )
+        if self.settle_s >= limit:
+            unset = ", unset: assumed" if self.lock_timeout_s is None else ""
+            raise ValueError(
+                f"settle_s must be below lock_timeout_s ({limit:g} s{unset}), which "
+                f"bounds the lock and the settling together; got {self.settle_s:g}"
+            )
+        return self
 
     @model_validator(mode="after")
     def _in_range_together(self) -> AutofocusSection:

@@ -268,6 +268,28 @@ class AutofocusLostError(HardwareError):
         return (type(self), (str(self), self.z_um, self.in_range))
 
 
+class AutofocusExcursionError(HardwareError):
+    """Z left its bound while the autofocus engaged, and it was switched off (m2 §12.5).
+
+    On the Ti2-E, engaging PFS drives Z to the plane its stored offset names,
+    and run 1 jumped +235 µm in under 100 ms (#205). The guard reads Z while
+    the lock wait and the settle window last: it stops PFS once a jump is
+    read, it does not prevent one. ``z_start_um`` is the Z read before the
+    switch-on, ``z_um`` the read that tripped the guard.
+
+    Not a ``SafetyRefusedError`` (FM-64): something moved, so a tool that
+    skips a target on a refusal must not carry on as if nothing had.
+    """
+
+    def __init__(self, message: str, z_start_um: float, z_um: float) -> None:
+        self.z_start_um = z_start_um
+        self.z_um = z_um
+        super().__init__(message)
+
+    def __reduce__(self) -> tuple[type[AutofocusExcursionError], tuple[object, ...]]:
+        return (type(self), (str(self), self.z_start_um, self.z_um))
+
+
 class MicroscopeBusyError(HardwareError):
     """The microscope lock could not be taken in time (§13, FM-15).
 

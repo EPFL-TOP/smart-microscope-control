@@ -4,8 +4,9 @@ The offset moves at most 1.0 from where it started (``envelope.offset_native``),
 in its own units and with the autofocus off, except in the locked
 ``focus_by_um`` case, which moves it by 1.0. Z moves only below its start, by
 at most 2 µm, as in the ``ZStage`` contract. A case that needs a lock skips on
-``hardware`` when none comes ("no lock on this sample"); on ``fake`` and
-``demo`` the lock comes at once, so no lock fails it.
+``hardware`` when none comes ("no lock on this sample"), or when the engage
+check refuses it (m2 §12.4: an offset the operator has not locked at the
+stand); on ``fake`` and ``demo`` the lock comes at once, so no lock fails it.
 """
 
 from __future__ import annotations
@@ -34,9 +35,25 @@ def _z_start(envelope: Envelope) -> float:
     return envelope.z_um
 
 
+def _engage(autofocus: Autofocus, backend: str) -> bool:
+    """``engage()``; on ``hardware``, a refusal of the engage check skips the case.
+
+    On a stand that declares ``engage_drives_z_to_offset``, an offset the
+    operator has not locked at the stand is refused, and so is Z outside the
+    contracts' window (m2 §12.4); the skip names the reason. On ``fake`` and
+    ``demo`` a refusal fails the case.
+    """
+    try:
+        return autofocus.engage()
+    except SafetyRefusedError as refused:
+        if backend != "hardware":
+            raise
+        pytest.skip(f"engage() refused: {refused.reason}")
+
+
 def _lock(autofocus: Autofocus, backend: str) -> None:
     """Engage it; on ``hardware`` a sample with no reference skips the case."""
-    if autofocus.engage():
+    if _engage(autofocus, backend):
         return
     if backend == "hardware":
         pytest.skip("no lock on this sample: focus on it by eye, then run again")
@@ -64,13 +81,19 @@ def _with_factors(
     """
     profile = envelope.profile(stand.profile)
     autofocus = profile.autofocus.model_copy(update={"offset_per_um": factors})
-    return Microscope.from_core(
+    facade = Microscope.from_core(
         stand.core, profile.model_copy(update={"autofocus": autofocus})
     )
+    # Its own autofocus has seen nothing yet: as the fixture's, read the lock
+    # once, so that the operator's is seen (m2 §12.2 D1).
+    facade.require(Autofocus).is_locked()
+    return facade
 
 
-def test_engage_returns_a_bool_and_says_the_truth(autofocus: Autofocus) -> None:
-    locked = autofocus.engage()
+def test_engage_returns_a_bool_and_says_the_truth(
+    autofocus: Autofocus, backend: str
+) -> None:
+    locked = _engage(autofocus, backend)
     assert isinstance(locked, bool)
     if locked:
         assert autofocus.is_engaged() is True
@@ -228,10 +251,34 @@ def test_focus_by_while_locked_moves_the_offset(
 
 
 def test_dry_run_engage_sends_nothing(
-    dry_autofocus: Autofocus, envelope: Envelope
+    dry_autofocus: Autofocus, envelope: Envelope, backend: str
 ) -> None:
-    assert dry_autofocus.engage() is True  # the commanded outcome
+    # The engage check runs in dry-run too (m2 §12.4): read the lock first.
+    dry_autofocus.is_locked()
+    assert _engage(dry_autofocus, backend) is True  # the commanded outcome
     assert dry_autofocus.is_engaged() is envelope.autofocus_engaged
+
+
+def test_engage_at_an_unseen_offset_is_refused(
+    stand: Microscope, autofocus: Autofocus, envelope: Envelope
+) -> None:
+    # m2 §12.2 D1: on such a stand, engaging drives Z to the plane the offset
+    # names, so an offset never read locked is refused before anything is sent.
+    if not stand.profile.autofocus.engage_drives_z_to_offset:
+        pytest.skip(
+            "the profile does not declare that engaging drives Z to the offset's "
+            "plane ([autofocus] engage_drives_z_to_offset)"
+        )
+    o0, tol = _offset_start(envelope), envelope.offset_tolerance
+    autofocus.disengage()
+    # With PFS off, an offset change moves no Z (m2 §4.5); the microscope
+    # fixture puts the offset back.
+    assert abs(autofocus.set_offset_native(o0 + 1.0) - (o0 + 1.0)) <= tol
+    with pytest.raises(SafetyRefusedError) as refused:
+        autofocus.engage()
+    assert refused.value.how_to_force == ""
+    assert "engage_drives_z_to_offset" in refused.value.reason
+    assert autofocus.is_engaged() is False
 
 
 def test_dry_run_offset_change_returns_the_command(

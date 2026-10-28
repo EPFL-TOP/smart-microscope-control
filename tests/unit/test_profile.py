@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+import smc.hardware.backends.mm as mm
+import smc.hardware.profile as profile_module
 from smc.hardware.errors import HardwareError, ProfileError
 from smc.hardware.profile import Profile, list_profiles, search_paths
 from smc.hardware.roles import Role
@@ -990,6 +992,102 @@ def test_new_numeric_keys_refuse_a_toml_boolean_and_accept_an_integer(
     assert profile.autofocus.offset_per_um == {"4x": -3.0}
 
 
+# -- engaging an autofocus that drives Z (m2 §12.3) --------------------------------
+
+
+def test_engage_keys_default_to_today_s_behaviour(tmp_path: Path) -> None:
+    profile = Profile.load(write_profile(tmp_path / "p.toml", ""))
+    af = profile.autofocus
+    assert (af.engage_drives_z_to_offset, af.settle_s, af.settle_tolerance_um) == (
+        False,
+        0.0,
+        0.5,
+    )
+    assert profile.safety.max_engage_excursion_um is None
+
+
+@pytest.mark.parametrize("value", ["0.0", "-1.0", "inf", "nan"])
+def test_max_engage_excursion_um_must_be_positive_and_finite(
+    tmp_path: Path, value: str
+) -> None:
+    msg = _load_error(tmp_path, f"[safety]\nmax_engage_excursion_um = {value}\n")
+    assert "safety.max_engage_excursion_um" in msg
+    assert (
+        f"max_engage_excursion_um must be a positive, finite number of µm, got {value}"
+    ) in msg
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "phrase"),
+    [
+        ("settle_s", "-0.1", "settle_s must be a finite number of seconds in [0, 60]"),
+        ("settle_s", "61.0", "settle_s must be a finite number of seconds in [0, 60]"),
+        ("settle_s", "nan", "settle_s must be a finite number of seconds in [0, 60]"),
+        (
+            "settle_tolerance_um",
+            "0.0",
+            "settle_tolerance_um must be a positive, finite number of µm",
+        ),
+        (
+            "settle_tolerance_um",
+            "inf",
+            "settle_tolerance_um must be a positive, finite number of µm",
+        ),
+    ],
+)
+def test_settle_keys_are_bounded(
+    tmp_path: Path, key: str, value: str, phrase: str
+) -> None:
+    # 61 s is refused by its own bound, not by the lock timeout: set one above it.
+    msg = _load_error(tmp_path, f"[autofocus]\nlock_timeout_s = 600\n{key} = {value}\n")
+    assert f"autofocus.{key}" in msg
+    assert f"{phrase}, got {value}" in msg
+
+
+@pytest.mark.parametrize(
+    ("body", "limit"),
+    [
+        ("lock_timeout_s = 1.0\nsettle_s = 2.0\n", "1 s"),
+        ("settle_s = 5.0\n", "5 s, unset: assumed"),
+    ],
+)
+def test_settle_s_must_be_below_the_lock_timeout(
+    tmp_path: Path, body: str, limit: str
+) -> None:
+    msg = _load_error(tmp_path, f"[autofocus]\n{body}")
+    assert (
+        f"settle_s must be below lock_timeout_s ({limit}), which bounds the lock "
+        "and the settling together"
+    ) in msg
+    accepted = write_profile(tmp_path / "ok.toml", "[autofocus]\nsettle_s = 4.9\n")
+    assert Profile.load(accepted).autofocus.settle_s == 4.9
+
+
+@pytest.mark.parametrize(
+    ("section", "key"),
+    [
+        ("safety", "max_engage_excursion_um"),
+        ("autofocus", "settle_s"),
+        ("autofocus", "settle_tolerance_um"),
+    ],
+)
+def test_new_numeric_engage_keys_refuse_a_toml_boolean(
+    tmp_path: Path, section: str, key: str
+) -> None:
+    # pydantic's lax mode would read `true` as 1.0 (#106).
+    msg = _load_error(tmp_path, f"[{section}]\n{key} = true\n")
+    assert f"{section}.{key}" in msg
+    assert f"{key} must be a number, not a boolean (got true)" in msg
+    integers = write_profile(tmp_path / "ints.toml", f"[{section}]\n{key} = 1\n")
+    loaded = Profile.load(integers)
+    assert getattr(getattr(loaded, section), key) == 1.0
+
+
+def test_the_default_lock_timeout_mirror_matches_the_backend() -> None:
+    # A pure module imports no backend, so it keeps its own copy (m2 §12.3).
+    assert profile_module._DEFAULT_LOCK_TIMEOUT_S == mm.DEFAULT_LOCK_TIMEOUT_S
+
+
 def test_unknown_autofocus_key_is_refused(tmp_path: Path) -> None:
     msg = _load_error(tmp_path, "[autofocus]\nlock_timeout = 5.0\n")
     assert "autofocus.lock_timeout: unknown key in [autofocus]" in msg
@@ -1051,6 +1149,15 @@ def test_nikon_ti2_profile_holds_the_owner_limits_and_filter_turret2() -> None:
     assert loaded.camera.pixel_size_um == {}
     assert loaded.autofocus.lock_timeout_s is None
     assert loaded.safety.autofocus_offset_soft_limits is None
+
+
+def test_the_ti2_profile_declares_how_it_engages() -> None:
+    # m2 §12.3: measured in run 1 (#208), and chosen for session 2 to confirm.
+    loaded = Profile.load(PROFILES_DIR / "nikon-ti2.toml")
+    assert loaded.autofocus.engage_drives_z_to_offset is True
+    assert loaded.autofocus.settle_s == 1.0
+    assert loaded.autofocus.settle_tolerance_um == 0.5
+    assert loaded.safety.max_engage_excursion_um == 50.0
 
 
 def test_nikon_tie_profile_sets_no_limit_beyond_the_layers_defaults() -> None:

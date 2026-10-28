@@ -3441,6 +3441,26 @@ def test_a_failed_z_read_for_an_error_message_logs_no_exception_object(
             {"offset_per_um": {"4x": math.inf}},
             "offset_per_um for objective '4x' must be finite and non-zero",
         ),
+        # m2 §12.3; the default lock wait is LOCK_S here (short_lock).
+        ({"settle_s": -1.0}, "settle_s must be finite and in [0, 60] s"),
+        ({"settle_s": math.nan}, "settle_s must be finite and in [0, 60] s"),
+        (
+            {"settle_s": 61.0, "lock_timeout_s": 600.0},
+            "settle_s must be finite and in [0, 60] s",
+        ),
+        (
+            {"settle_s": LOCK_S},
+            f"settle_s must be below the lock timeout ({LOCK_S:g} s)",
+        ),
+        (
+            {"settle_s": 1.0, "lock_timeout_s": 1.0},
+            "settle_s must be below the lock timeout (1 s)",
+        ),
+        ({"settle_tolerance_um": 0.0}, "settle_tolerance_um must be finite and > 0"),
+        (
+            {"settle_tolerance_um": math.inf},
+            "settle_tolerance_um must be finite and > 0",
+        ),
     ],
 )
 def test_mm_autofocus_built_in_code_refuses_what_the_profile_would(
@@ -3822,6 +3842,9 @@ def _use_the_stand(core: FakeCore, microscope: Microscope) -> None:
     autofocus.engage()  # direct: linked to the Z stop, locks at once
     autofocus.set_offset_native(7798.0)  # PFS on: linked too
     autofocus.offset_by_native(1.0, force=True)
+    # m2 §12: on a declared stand the lock read makes this offset a seen one,
+    # so that the engage below runs the check, the band and the window.
+    autofocus.is_locked()
     autofocus.disengage()
     z.move_to_um(0.0)  # PFS off: a plain move
     # m2 §8: the turret looks the autofocus up through the facade, Channels
@@ -3858,7 +3881,17 @@ def test_a_dropped_facade_frees_its_core_without_the_cyclic_collector(
     # until the cyclic collector, which at the exit of `smc doctor` runs during
     # interpreter finalization: the child aborted there.
     core = _with_lamp_and_channel(_at_offset(7800.0, extra=_DIA_LAMP))
-    microscope = Microscope.from_core(cast("CMMCorePlus", core), _factor({"4x": -3.0}))
+    # A declared stand with a settle window and a band (m2 §12): every engage
+    # runs the seen-offset check and the Z guard.
+    profile = _profile(
+        autofocus={
+            "offset_per_um": {"4x": -3.0},
+            "engage_drives_z_to_offset": True,
+            "settle_s": 0.05,
+        },
+        safety={"max_autofocus_offset_jog": 10.0, "max_engage_excursion_um": 50.0},
+    )
+    microscope = Microscope.from_core(cast("CMMCorePlus", core), profile)
     _use_the_stand(core, microscope)
     if closed:
         microscope.close()

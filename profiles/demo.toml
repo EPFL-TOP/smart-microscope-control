@@ -26,6 +26,7 @@ turret_requires_confirm = true
 # max_autofocus_offset_jog = 50.0                # in [autofocus] offset_unit; omitted: every relative offset change needs force=True
 # autofocus_offset_soft_limits = [0.0, 15000.0]  # in [autofocus] offset_unit; not forceable
 # stop_refused_by = []  # roles whose device refuses stop(): "xy_stage", "focus", "autofocus_offset"; measured at a stand (m2 §11)
+# max_engage_excursion_um = 50.0  # how far Z may move while the autofocus engages, beyond where it starts or held; omitted: only z_soft_limits_um bound it (m2 §12)
 
 [autofocus]
 # The demo's DAutoFocus measures nothing, so every key is left unknown.
@@ -34,6 +35,9 @@ turret_requires_confirm = true
 # offset_per_um = {}        # objective label -> offset change per µm of focus, measured with the autofocus locked; sign included
 # in_range_property = ""    # a property of the autofocus device that says whether its reference is in range; "" = the stand does not say
 # in_range_values = []      # the values of that property that mean "in range"; any other value means out of range
+# engage_drives_z_to_offset = false  # engaging drives Z to the plane the stored offset names; then the layer engages only at an offset it has seen locked (m2 §12)
+# settle_s = 0.0                     # after the first locked read, engage() waits until Z has been still this long; 0: the lock is taken as read
+# settle_tolerance_um = 0.5          # how far apart the Z reads of that window may lie
 
 [camera]
 # µm per pixel per objective label, at binning 1 and a magnification factor of

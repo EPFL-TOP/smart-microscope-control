@@ -56,7 +56,7 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, suppress
 from dataclasses import dataclass
 from types import MappingProxyType, TracebackType
-from typing import TYPE_CHECKING, Any, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, Protocol, cast
 
 from smc.hardware.capabilities import (
     XY,
@@ -73,6 +73,7 @@ from smc.hardware.channels import (
     setting_matches,
 )
 from smc.hardware.errors import (
+    AutofocusExcursionError,
     AutofocusLostError,
     CapabilityMissingError,
     DeviceTimeoutError,
@@ -124,6 +125,9 @@ Z_STOP_OUTCOME_WAIT_S = 5.0
 #: The longest lock wait ``engage`` accepts: the wait holds the microscope
 #: lock, so every other action waits behind it (FM-32).
 MAX_LOCK_TIMEOUT_S = 600.0
+#: The longest settle window ``[autofocus] settle_s`` may set (m2 §12.3): it
+#: holds the microscope lock, as the lock wait does.
+_MAX_SETTLE_S = 60.0
 
 #: The note a message carries when the lock wait is the default.
 _ASSUMED_TIMEOUT = " (assumed: the profile sets no [autofocus] lock_timeout_s)"
@@ -643,11 +647,175 @@ class _ZStop:
 
 
 class _LostLockError(DeviceTimeoutError):
-    """It locked, lost the lock at once, and could not be switched off.
+    """Given up on once its wait ended, and it could not be switched off.
 
-    A ``DeviceTimeoutError`` for every caller; its own class only so that
-    ``engage`` does not take it for its lock wait's deadline.
+    It locked and lost the lock at once, or the Z guard ended the wait (m2
+    §12.4). A ``DeviceTimeoutError`` for every caller; its own class only so
+    that ``engage`` does not take it for its lock wait's deadline.
     """
+
+
+class _EngageRefusedError(SafetyRefusedError):
+    """The engage check refused before the switch-on (m2 §12.4); never forceable.
+
+    Its own class so that a relock can turn it into ``AutofocusLostError``,
+    with ``detail``, the reason after "not engaged: ", in that message.
+    """
+
+    def __init__(self, detail: str, label: str) -> None:
+        self.detail = detail
+        self.label = label
+        super().__init__(f"autofocus {label}: not engaged: {detail}")
+
+    def __reduce__(self) -> tuple[type[_EngageRefusedError], tuple[str, str]]:
+        return (type(self), (self.detail, self.label))
+
+
+class _EngageGuard:
+    """The Z guard and the settle window around one engage (m2 §12.2 D2, D3).
+
+    Polled as the lock wait's ``Motion.is_busy``, in the action's thread and
+    under the microscope lock. Each poll reads engaged, locked and Z: busy
+    while it searches or settles. Z outside the soft limits or the band, or
+    a Z read that fails, ends the wait at once (idle), and the outcome is kept
+    as text, never as an exception (FM-98): the readback gives up on the
+    motion, which switches it off, then raises. From then on a poll reads
+    only whether it is on, so that a switch-off that failed keeps the motion
+    registered (FM-127).
+
+    The band is ``[min(z_start, z_held) - E, max(z_start, z_held) + E]``: a
+    relock brings Z back to where PFS held it, so the way back is inside it.
+    The window is settled once every Z read of the last ``settle_s`` lies
+    within ``tolerance_um`` of each other, still locked; a lock lost meanwhile
+    starts it again at the next locked read.
+
+    It limits a jump, it does not prevent one: Z is read every
+    ``POLL_INTERVAL_S`` plus the read's own time, and run 1's jump took less
+    than 100 ms (#205).
+    """
+
+    def __init__(
+        self,
+        autofocus: MMAutofocus,
+        focus: ZStage,
+        *,
+        z_start_um: float,
+        z_held_um: float | None,
+        limits_um: tuple[float, float] | None,
+        excursion_um: float | None,
+        settle_s: float,
+        tolerance_um: float,
+        limit_s: float,
+    ) -> None:
+        self._autofocus = autofocus
+        self._focus = focus
+        self.z_start_um = z_start_um
+        self._limits = limits_um
+        self._excursion_um = excursion_um
+        self._band: tuple[float, float] | None = None
+        if excursion_um is not None:
+            held = z_start_um if z_held_um is None else z_held_um
+            self._band = (
+                min(z_start_um, held) - excursion_um,
+                max(z_start_um, held) + excursion_um,
+            )
+        self._settle_s = settle_s
+        self._tolerance_um = tolerance_um
+        #: The (objective, offset) it engages at, on a declared stand: what a
+        #: trip forgets.
+        self.seen: tuple[str | None, float] | None = None
+        #: Why Z tripped it, and the read that did; or why Z could not be read.
+        self.why = ""
+        self.tripped_z_um: float | None = None
+        self.failure = ""
+        #: The lock wait's deadline, taken before the switch-on, so never after
+        #: the ``Executor``'s: from then on the wait is over, and a poll is a
+        #: give-up's busy check, which reports only whether it is on (FM-133).
+        self._deadline = time.monotonic() + limit_s
+        #: The last poll read locked but not settled, and how far Z moved then.
+        self.settling = False
+        self.spread_um = 0.0
+        self._window: list[tuple[float, float]] = []
+        self._since = 0.0
+
+    @property
+    def ended(self) -> bool:
+        """Whether it ended the wait: Z out of bounds, or unreadable."""
+        return bool(self.why or self.failure)
+
+    @property
+    def given_up_for(self) -> str:
+        """The give-up's reason, for its log line."""
+        return "a Z read that failed" if self.failure else "Z out of its bound"
+
+    def what_happened(self) -> str:
+        """The first clause of the error (m2 §12.5)."""
+        if self.tripped_z_um is None:
+            return f"Z could not be read while it engaged ({self.failure})"
+        return (
+            f"Z went from {self.z_start_um:.2f} µm to {self.tripped_z_um:.2f} µm "
+            f"while it engaged, {self.why}"
+        )
+
+    def is_busy(self) -> bool:
+        autofocus = self._autofocus
+        engaged = autofocus._read_engaged()
+        if self.ended or time.monotonic() >= self._deadline:
+            # The wait is over: a poll now is a give-up's busy check, or a
+            # later action's guard. On, it may move Z, so it counts as moving
+            # whatever Z reads (FM-127, FM-133); a Z read here only names what
+            # happened.
+            if not self.ended:
+                self._read_z()
+            return engaged
+        locked = engaged and autofocus._read_locked(record=False)
+        z_um = self._read_z()
+        if z_um is None or not engaged:
+            return False
+        if not locked:
+            self._window = []
+            self.settling = False
+            return True
+        if self._settle_s <= 0:
+            return False
+        now = time.monotonic()
+        if not self._window:
+            self._since = now
+        # The newest read older than the window stays in it: after a poll
+        # late by more than settle_s, the new Z is still compared with one
+        # from before the gap, never with itself alone.
+        cut = now - self._settle_s
+        older = [read for read in self._window if read[0] < cut]
+        window = [*older[-1:], *(read for read in self._window if read[0] >= cut)]
+        window.append((now, z_um))
+        self._window = window
+        values = [z for _, z in window]
+        self.spread_um = max(values) - min(values)
+        if now - self._since >= self._settle_s and self.spread_um <= self._tolerance_um:
+            self.settling = False
+            return False
+        self.settling = True
+        return True
+
+    def _read_z(self) -> float | None:
+        """Z, or ``None`` once it ended the wait: a failed read, or Z out of bounds."""
+        try:
+            z_um = float(self._focus.position_um())
+        except Exception as exc:
+            self.failure = _named(exc)
+            return None
+        limits, band = self._limits, self._band
+        if limits is not None and not limits[0] <= z_um <= limits[1]:
+            self.why = f"outside the soft limits [{limits[0]:g}, {limits[1]:g}] µm"
+        elif band is not None and not band[0] <= z_um <= band[1]:
+            self.why = (
+                f"more than [safety] max_engage_excursion_um ({self._excursion_um:g} "
+                f"µm) beyond where it started"
+            )
+        else:
+            return z_um
+        self.tripped_z_um = z_um
+        return None
 
 
 class _EndedByAZStop:
@@ -892,6 +1060,12 @@ class MMAutofocus:
       own (the demo's). ``setAutoFocusOffset`` is never used when an offset
       device is resolved: pymmcore-plus redirects it to the offset stage for
       ``NikonTI`` only, not for ``NikonTi2`` (m2 §1).
+    * **Engaging can drive Z to the stored offset's plane** (the Ti2-E, #205):
+      +235 µm past the soft limit in under 100 ms, with ``locked`` already
+      ``True``. On a stand that declares it, the layer engages only at an
+      offset it has seen locked; on every stand it reads Z while it engages
+      and switches the autofocus off once Z leaves its bound, and ``True``
+      waits for Z to settle when ``settle_s`` is set (m2 §12).
     """
 
     def __init__(
@@ -909,9 +1083,33 @@ class MMAutofocus:
         in_range_values: Sequence[str] = (),
         objective_label: Callable[[], str | None] = lambda: None,
         focus: Callable[[], ZStage | None] = lambda: None,
+        engage_drives_z_to_offset: bool = False,
+        settle_s: float = 0.0,
+        settle_tolerance_um: float = 0.5,
     ) -> None:
         if lock_timeout_s is not None:
             lock_timeout_s = _checked_lock_timeout(lock_timeout_s, "lock_timeout_s")
+        # As the profile validates them (m2 §12.3), for code that builds this.
+        settle_s = float(settle_s)
+        if not (math.isfinite(settle_s) and 0 <= settle_s <= _MAX_SETTLE_S):
+            raise ValueError(
+                f"settle_s must be finite and in [0, {_MAX_SETTLE_S:g}] s, got "
+                f"{settle_s!r}"
+            )
+        bound = (
+            float(DEFAULT_LOCK_TIMEOUT_S) if lock_timeout_s is None else lock_timeout_s
+        )
+        if settle_s >= bound:
+            raise ValueError(
+                f"settle_s must be below the lock timeout ({bound:g} s), which bounds "
+                f"the lock and the settling together; got {settle_s!r}"
+            )
+        settle_tolerance_um = float(settle_tolerance_um)
+        if not (math.isfinite(settle_tolerance_um) and settle_tolerance_um > 0):
+            raise ValueError(
+                f"settle_tolerance_um must be finite and > 0, got "
+                f"{settle_tolerance_um!r}"
+            )
         for objective, factor in offset_per_um.items():
             # A zero factor would make focus_by_um a move of nothing, reported
             # as done; the profile refuses it too, but code may build this.
@@ -946,6 +1144,17 @@ class MMAutofocus:
         self._in_range_values = tuple(in_range_values)
         self._objective_label = objective_label
         self._focus = focus
+        self._declared = bool(engage_drives_z_to_offset)
+        self._settle_s = settle_s
+        self._settle_tolerance_um = settle_tolerance_um
+        #: Per objective label (``None`` without a turret): the offsets read
+        #: locked since this was built (m2 §12.2 D1). Recorded on a declared
+        #: stand only, and replaced whole at each change: one store, no lock
+        #: (FM-70).
+        self._seen: dict[str | None, frozenset[float]] = {}
+        #: Where Z was when ``suspend()`` found it locked, for the relock that
+        #: follows in the same compound (the band, m2 §12.2 D2).
+        self._z_held: float | None = None
         # Not `self._send_off`: a bound method stored on self is a cycle that
         # keeps the core alive until the cyclic collector (#142).
         self._off = SafeCall(
@@ -977,9 +1186,48 @@ class MMAutofocus:
         self._check_slot()
         return bool(self._core.isContinuousFocusEnabled())
 
-    def _read_locked(self) -> bool:
+    def _read_locked(self, *, record: bool = True) -> bool:
+        """The one place a lock is read; on a declared stand, a lock read makes its offset seen.
+
+        m2 §12.2 D1: every read the layer makes that finds it locked counts,
+        so the operator's lock taken at the stand is seen at the first
+        ``is_locked()``. ``record=False`` is the guard's poll only: it engaged
+        a seen offset, and two more reads per poll would slow its Z reads.
+        """
         self._check_slot()
-        return bool(self._core.isContinuousFocusLocked())
+        locked = bool(self._core.isContinuousFocusLocked())
+        if locked and record and self._declared:
+            self._record_seen()
+        return locked
+
+    def _record_seen(self) -> None:
+        """Add the offset now set, with the objective now in place, to the seen offsets.
+
+        A failure of either read records nothing: the absence of a seen
+        offset is the safe side (m2 §12.4). Compared as read back, exactly:
+        one readback of a device against another.
+        """
+        try:
+            objective = self._objective_label()
+            offset = self._read_offset()
+        except Exception as exc:
+            # Text, never the error: a record that keeps it keeps its traceback (FM-92).
+            logger.debug(
+                "autofocus %s: read locked, but its offset or objective could not "
+                "be read (%s); not recorded as seen",
+                self._label,
+                _named(exc),
+            )
+            return
+        seen = self._seen
+        known = seen.get(objective, frozenset())
+        if offset not in known:
+            self._seen = {**seen, objective: known | {offset}}
+
+    def _forget(self, objective: str | None, offset: float) -> None:
+        """Drop ``offset`` from the seen offsets of ``objective``: it drove Z out of bounds."""
+        seen = self._seen
+        self._seen = {**seen, objective: seen.get(objective, frozenset()) - {offset}}
 
     def _searching(self) -> bool:
         """The lock wait's busy state: on, and not holding focus yet."""
@@ -1016,7 +1264,12 @@ class MMAutofocus:
         return self._executor.read(self._read_engaged)
 
     def is_locked(self) -> bool:
-        """Whether it holds focus now (``isContinuousFocusLocked``)."""
+        """The device's lock flag (``isContinuousFocusLocked``); not settled (m2 §12).
+
+        On a declared stand, a ``True`` read makes the offset now set a seen
+        one with the objective now in place: the operator's lock, taken at
+        the stand, is seen here.
+        """
         return self._executor.read(self._read_locked)
 
     def is_in_range(self) -> bool | None:
@@ -1049,13 +1302,26 @@ class MMAutofocus:
         _send_continuous_focus_off(self._core, self._label)
 
     def _lock_timeout(self, timeout_s: float | None) -> tuple[float, bool]:
-        """The lock wait's limit, and whether it is the assumed default."""
+        """The lock wait's limit, and whether it is the assumed default.
+
+        It bounds the settle window too (m2 §12.2 D3): a limit not above
+        ``settle_s`` could never end settled, so it is a ``ValueError``
+        before anything is sent.
+        """
         if timeout_s is not None:
-            return _checked_lock_timeout(timeout_s, "timeout_s"), False
-        if self._lock_timeout_s is not None:
-            return self._lock_timeout_s, False
-        # The module's value at call time, so that a test can shorten it.
-        return float(DEFAULT_LOCK_TIMEOUT_S), True
+            limit, assumed = _checked_lock_timeout(timeout_s, "timeout_s"), False
+        elif self._lock_timeout_s is not None:
+            limit, assumed = self._lock_timeout_s, False
+        else:
+            # The module's value at call time, so that a test can shorten it.
+            limit, assumed = float(DEFAULT_LOCK_TIMEOUT_S), True
+        if self._settle_s > 0 and limit <= self._settle_s:
+            raise ValueError(
+                f"the lock timeout ({limit:g} s{_ASSUMED_TIMEOUT if assumed else ''}) "
+                f"must be above [autofocus] settle_s ({self._settle_s:g} s), since it "
+                f"bounds the settling too"
+            )
+        return limit, assumed
 
     def engage(self, timeout_s: float | None = None) -> bool:
         """Switch continuous focus on and wait for the lock; ``False``: no lock, and it is off.
@@ -1075,22 +1341,35 @@ class MMAutofocus:
         and the call raises. A Z stop is never a ``False``: that would read
         as "no lock found", not "stopped".
 
+        ``True`` means locked and settled (m2 §12.2 D3): with ``settle_s`` >
+        0, the wait goes on until Z has been still that long, within the same
+        ``timeout_s``. Before the switch-on, Z outside the soft limits refuses
+        it, and on a stand that declares ``engage_drives_z_to_offset`` so does
+        an offset not seen locked with this objective (D1). While it waits, Z
+        out of the soft limits or the band switches it off (D2).
+
         Raises:
-            ValueError: ``timeout_s`` is not finite or not in (0, 600] s;
-                nothing was sent.
+            ValueError: ``timeout_s`` is not finite or not in (0, 600] s, or
+                not above ``settle_s``; nothing was sent.
+            SafetyRefusedError: Z is outside the soft limits, or the offset was
+                not seen locked on a declared stand (switched off first if it
+                was searching); nothing else was sent. Not forceable.
+            AutofocusExcursionError: Z left its bound while it engaged; it was
+                switched off, and its offset is no longer a seen one.
             DeviceTimeoutError: No lock, and it could not be switched off (or
-                still reads on). The wait stays registered as a motion, so the
+                still reads on); or Z left its bound and it could not be
+                switched off. The wait stays registered as a motion, so the
                 stand refuses actions until ``stop()`` or ``resume()``.
             MotionStoppedError: ``disengage()`` or a stop cancelled the wait;
                 a ``ZStage.stop()`` left it off (named ``z <label>``), or
                 could not switch it off, or not in time, and then says it may
                 still move Z; or it cancelled the call before anything was
                 sent.
-            HardwareError: Its state could not be read once the wait ended. It
-                was given up on as at the deadline: switched off, or still
-                registered as a motion if that failed too. Or the Microscope
-                it belongs to no longer exists (FM-92); nothing was read or
-                sent.
+            HardwareError: Its state could not be read once the wait ended, or
+                Z could not be read while the guard needed it. It was given up
+                on as at the deadline: switched off, or still registered as a
+                motion if that failed too. Or the Microscope it belongs to no
+                longer exists (FM-92); nothing was read or sent.
         """
         limit_s, assumed = self._lock_timeout(timeout_s)
         description = "autofocus: engage"
@@ -1103,10 +1382,26 @@ class MMAutofocus:
         # while it waited for the lock have a record to compare against.
         return self._executor.compound(description, run)
 
-    def _engage(self, description: str, limit_s: float, assumed: bool) -> _Lock:
-        """``engage``'s action, also run nested by the relocks; how the wait ended."""
+    def _engage(
+        self,
+        description: str,
+        limit_s: float,
+        assumed: bool,
+        *,
+        z_held: float | None = None,
+    ) -> _Lock:
+        """``engage``'s action, also run nested by the relocks; how the wait ended.
+
+        Its step runs the engage check before the switch-on (m2 §12.4), and
+        the wait polls the Z guard when there is one: ``z_held`` is where PFS
+        held Z before a relock's Z move, which widens the band.
+        """
         label = self._label
         switch_off_failures: list[Exception] = []
+        guard: _EngageGuard | None = None
+
+        def is_busy() -> bool:
+            return self._searching() if guard is None else guard.is_busy()
 
         def switch_off() -> None:
             # The lock wait's stop: kept, so that a failure can be named.
@@ -1117,7 +1412,10 @@ class MMAutofocus:
                 raise
 
         def after_wait() -> _AfterWait:
-            # The wait ended idle: locked, or no longer on.
+            # The wait ended idle: locked, or no longer on, or the guard ended it.
+            if guard is not None and guard.ended:
+                self._executor.give_up(motion, guard.given_up_for)
+                self._guard_ended(guard, switch_off_failures)
             try:
                 if self._read_locked():
                     return "locked"
@@ -1143,7 +1441,9 @@ class MMAutofocus:
             return "lost the lock at once"
 
         def step() -> Step[_AfterWait]:
+            nonlocal guard
             self._check_slot()  # in dry-run too
+            guard = self._check_engage(z_held, limit_s)  # in dry-run too
             return Step(
                 log=description,
                 send=self._send_on,
@@ -1154,7 +1454,7 @@ class MMAutofocus:
         motion = Motion(
             device=label,
             name=f"autofocus {label}",
-            is_busy=self._searching,
+            is_busy=is_busy,
             stop=switch_off,
         )
         try:
@@ -1165,8 +1465,11 @@ class MMAutofocus:
             raise
         except DeviceTimeoutError as exc:
             # Otherwise only the lock wait raises this here: the Executor gave
-            # up at the deadline and sent the stop, which switches it off.
-            return self._no_lock(limit_s, assumed, exc, switch_off_failures)
+            # up at the deadline and sent the stop, which switches it off. Its
+            # busy check after the stop may still have read Z out of bounds.
+            if guard is not None and guard.ended:
+                self._guard_ended(guard, switch_off_failures)
+            return self._no_lock(limit_s, assumed, exc, switch_off_failures, guard)
         finally:
             # A failure's traceback holds `switch_off`'s frame, whose closure
             # holds this list: emptied on every exit, the normal return too
@@ -1190,8 +1493,13 @@ class MMAutofocus:
         assumed: bool,
         timeout: DeviceTimeoutError,
         switch_off_failures: list[Exception],
+        guard: _EngageGuard | None = None,
     ) -> _Lock:
-        """After the lock wait gave up: ``False`` if it is off, else the timeout, re-raised."""
+        """After the lock wait gave up: ``False`` if it is off, else the timeout, re-raised.
+
+        A lock that had come but not settled is named as such (m2 §12.2 D3):
+        "no lock" would send the operator looking for the sample.
+        """
         label = self._label
         try:
             still_on = self._read_engaged()
@@ -1200,13 +1508,24 @@ class MMAutofocus:
         else:
             if not still_on and not switch_off_failures:
                 in_range = self._in_range_for_message()
-                logger.warning(
-                    "autofocus %s: no lock within %g s%s; in range: %s; switched off",
-                    label,
-                    limit_s,
-                    _ASSUMED_TIMEOUT if assumed else "",
-                    _yes_no(in_range),
-                )
+                if guard is not None and guard.settling:
+                    logger.warning(
+                        "autofocus %s: locked, but Z did not settle within %g s (it "
+                        "moved %.2f µm in the last %g s); switched off",
+                        label,
+                        limit_s,
+                        guard.spread_um,
+                        self._settle_s,
+                    )
+                else:
+                    logger.warning(
+                        "autofocus %s: no lock within %g s%s; in range: %s; switched "
+                        "off",
+                        label,
+                        limit_s,
+                        _ASSUMED_TIMEOUT if assumed else "",
+                        _yes_no(in_range),
+                    )
                 return _Lock(False, in_range)
             outcome = (
                 f"the switch-off failed: {switch_off_failures[0]}"
@@ -1218,6 +1537,158 @@ class MMAutofocus:
             f"switched off ({outcome}); it may still move Z: stop() and check the "
             f"stand, then resume()"
         ) from timeout
+
+    # --- the engage check and the guard (m2 §12) -------------------------------
+
+    def _guards_z(self) -> bool:
+        """Whether an engage has a bound to read Z against: a soft limit, a band or a window."""
+        return (
+            self._safety.z_soft_limits_um is not None
+            or self._safety.max_engage_excursion_um is not None
+            or self._settle_s > 0
+        )
+
+    def _check_engage(
+        self, z_held: float | None, limit_s: float
+    ) -> _EngageGuard | None:
+        """Refuse an engage before the switch-on, and build its guard (m2 §12.4).
+
+        Under the lock, inside the action's step, in dry-run too, as the
+        implied-Z check is (FM-90). First Z against the soft limits: the guard
+        could not tell a jump from where Z already is. Then, on a stand that
+        declares that engaging drives Z to the offset's plane, the offset now
+        set must be one seen locked with this objective; a failed read there
+        propagates with nothing sent, since it decides whether Z moves
+        (FM-19). Neither refusal can be forced: a forced engage of an unknown
+        offset at 40x is the crash itself (m2 §12.2 D1).
+        """
+        label = self._label
+        focus = self._focus()
+        guard: _EngageGuard | None = None
+        if focus is None:
+            logger.warning(
+                "autofocus %s: no focus drive to read, so Z is not guarded while it "
+                "engages (m2 §12)",
+                label,
+            )
+        elif self._guards_z():
+            z_start = float(focus.position_um())
+            limits = self._safety.z_soft_limits_um
+            if limits is not None and not limits[0] <= z_start <= limits[1]:
+                raise _EngageRefusedError(
+                    f"Z is at {z_start:.2f} µm, outside the soft limits "
+                    f"[{limits[0]:g}, {limits[1]:g}] µm",
+                    label=label,
+                )
+            guard = _EngageGuard(
+                self,
+                focus,
+                z_start_um=z_start,
+                z_held_um=z_held,
+                limits_um=limits,
+                excursion_um=self._safety.max_engage_excursion_um,
+                settle_s=self._settle_s,
+                tolerance_um=self._settle_tolerance_um,
+                limit_s=limit_s,
+            )
+        if not self._declared:
+            return guard
+        self._read_locked()  # the operator's lock, if it holds now, is seen
+        objective = self._objective_label()
+        offset = self._read_offset()
+        seen = self._seen.get(objective, frozenset())
+        if offset in seen:
+            if guard is not None:
+                guard.seen = (objective, offset)
+            return guard
+        # Left searching, it would drive Z to that offset's plane the moment it
+        # found the reference. Unknown counts as on (FM-19).
+        try:
+            on = self._read_engaged()
+        except Exception as exc:
+            logger.debug(
+                "autofocus %s: its state could not be read (%s); switched off",
+                label,
+                _named(exc),
+            )
+            on = True
+        unit = f" {self._offset_unit}" if self._offset_unit else ""
+        with_objective = "" if objective is None else f" with objective {objective!r}"
+        known = ", ".join(f"{value:g}" for value in sorted(seen)) or "none"
+        unseen = (
+            f"on this stand engaging drives Z to the plane the offset names "
+            f"([autofocus] engage_drives_z_to_offset, m2 §12), and offset "
+            f"{offset:g}{unit} has not been seen locked{with_objective} since the "
+            f"stand was opened (seen: {known})"
+        )
+        if on:
+            try:
+                self._executor.safe(self._off, lambda: None)
+            except Exception as exc:
+                # Not the bare switch-off fault: it would drop why it was being
+                # switched off, and that it may now drive Z (FM-127).
+                raise HardwareError(
+                    f"autofocus {label}: not engaged: {unseen}; it was on and "
+                    f"searching, and it could not be switched off ({_named(exc)}); "
+                    f"it may still move Z: stop() and check the stand, then resume()"
+                ) from exc
+        switched = "; it was on and searching, so it was switched off" if on else ""
+        raise _EngageRefusedError(
+            f"{unseen}{switched}. Focus on the sample, switch {label} on with the "
+            f"stand's own controls and set the offset until the sample is sharp; "
+            f"smc then reads the lock",
+            label=label,
+        )
+
+    def _guard_ended(
+        self, guard: _EngageGuard, switch_off_failures: list[Exception]
+    ) -> NoReturn:
+        """After the guard ended the wait and it was given up on: forget, warn, raise (m2 §12.4).
+
+        The order is decided: the switch-off (the give-up, done by the
+        caller), the offset forgotten, the WARNING, the error. A switch-off
+        that failed never reads "switched off" (FM-127): it may still move Z,
+        and the motion stays registered, as for a lock lost at once.
+        """
+        label = self._label
+        if guard.seen is not None:
+            self._forget(*guard.seen)
+        what = guard.what_happened()
+        if switch_off_failures:
+            raise _LostLockError(
+                f"autofocus {label}: {what}, and it could not be switched off (the "
+                f"switch-off failed: {_named(switch_off_failures[0])}); it may still "
+                f"move Z: stop() and check the stand, then resume()"
+            ) from switch_off_failures[0]
+        z_um = guard.tripped_z_um
+        if z_um is None:
+            logger.warning(
+                "autofocus %s: switched off: Z could not be read while it engaged (%s)",
+                label,
+                guard.failure,
+            )
+            raise HardwareError(
+                f"autofocus {label}: {what}; it was switched off, since unread it "
+                f"could drive Z past any bound (m2 §12)"
+            )
+        logger.warning(
+            "autofocus %s: switched off: Z left its bound while it engaged (%.2f µm)",
+            label,
+            z_um,
+        )
+        again = (
+            f"; on this stand, lock {label} on the sample at the stand before "
+            f"engaging again"
+            if self._declared
+            else ""
+        )
+        raise AutofocusExcursionError(
+            f"autofocus {label}: {what}; it was switched off. The guard reads Z every "
+            f"{POLL_INTERVAL_S * 1000:g} ms: it stops {label} once a jump is read, it "
+            f"does not prevent one. Check the sample and the objective{again}",
+            guard.z_start_um,
+            z_um,
+        )
 
     def disengage(self) -> None:
         """Switch continuous focus off now: a safe call, like closing a shutter (m2 §3.2).
@@ -1238,10 +1709,19 @@ class MMAutofocus:
         """Switch it off for ``reason`` (a Z move) if it is engaged; whether it was.
 
         A nested action of the move's compound: skipped in dry-run, unlike
-        ``disengage()``, since the move it protects is skipped too.
+        ``disengage()``, since the move it protects is skipped too. Before the
+        switch-off, on a declared stand, it reads the lock, so that the
+        operator's lock is seen before the move ends it; and with a band, it
+        reads where PFS holds Z, for the relock that follows (m2 §12.4).
         """
+        self._z_held = None
         if not self._read_engaged():
             return False
+        excursion = self._safety.max_engage_excursion_um
+        if (self._declared or excursion is not None) and self._read_locked():
+            focus = self._focus()
+            if excursion is not None and focus is not None:
+                self._z_held = float(focus.position_um())
         description = f"autofocus: suspend for {reason}"
         self._executor.do(
             description,
@@ -1260,19 +1740,44 @@ class MMAutofocus:
         The operator's Z stop wins over it (``_ended_by_a_z_stop``): PFS
         searching for its lock drives Z.
 
+        It runs the engage check and the Z guard, as ``engage()`` does (m2
+        §12.4), with the band widened to where PFS held Z before the move.
+
         Raises:
-            AutofocusLostError: No lock: it is off, and Z is at ``z_um``.
+            AutofocusLostError: No lock, or the engage check refused it (an
+                unseen offset on a declared stand): it is off, and Z is at
+                ``z_um``.
+            AutofocusExcursionError: Z left its bound while it engaged; it was
+                switched off.
             MotionStoppedError: ``disengage()`` was called during ``reason``,
                 or the focus drive was stopped since ``reason`` was called; it
                 is left off, as a close wins over an open.
         """
+        z_held, self._z_held = self._z_held, None
+        where = "z: moved" if z_um is None else f"z: moved to {z_um:.2f} µm"
+        refused = ""
         with self._ended_by_a_z_stop(reason, suspended=True) as stopped:
             self._refuse_relock_after_disengage(reason, stopped)
             limit_s, assumed = self._lock_timeout(None)
-            ended = self._engage(f"autofocus: engage after {reason}", limit_s, assumed)
+            try:
+                ended = self._engage(
+                    f"autofocus: engage after {reason}",
+                    limit_s,
+                    assumed,
+                    z_held=z_held,
+                )
+            except _EngageRefusedError as exc:
+                refused = exc.detail
+                ended = _Lock(False)
+        if refused:
+            raise AutofocusLostError(
+                f"{where}, but autofocus {self._label} was not engaged again: "
+                f"{refused}; it is off, or move Z with keep_autofocus=False",
+                z_um,
+                self._in_range_for_message(),
+            )
         if ended.locked:
             return
-        where = "z: moved" if z_um is None else f"z: moved to {z_um:.2f} µm"
         raise AutofocusLostError(
             f"{where}, {self._not_locked_again(limit_s, assumed, ended)}, or move Z "
             f"with keep_autofocus=False",
@@ -1704,8 +2209,21 @@ class MMAutofocus:
             stopped.offset_pending = False
             self._refuse_relock_after_disengage(description, stopped)
             limit_s, assumed = self._lock_timeout(None)
-            ended = self._engage(
-                f"autofocus: engage after {description}", limit_s, assumed
+            refused = ""
+            try:
+                ended = self._engage(
+                    f"autofocus: engage after {description}", limit_s, assumed
+                )
+            except _EngageRefusedError as exc:
+                refused = exc.detail
+                ended = _Lock(False)
+        if refused:
+            raise AutofocusLostError(
+                f"{Role.autofocus_offset.value}: moved to {offset} {self._unit()}, "
+                f"but autofocus {self._label} was not engaged again: {refused}; it "
+                f"is off, and while it is off, focus_by_um() moves Z",
+                self._z_or_none(),
+                self._in_range_for_message(),
             )
         if not ended.locked:
             raise AutofocusLostError(

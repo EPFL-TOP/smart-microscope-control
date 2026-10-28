@@ -73,14 +73,25 @@ def _alive(watched: dict[str, weakref.ref[Any]]) -> dict[str, bool]:
 
 
 def _stand(
-    *, dry_run: bool = False, declares: tuple[Role, ...] = ()
+    *,
+    dry_run: bool = False,
+    declares: tuple[Role, ...] = (),
+    engage_drives_z: bool = False,
 ) -> tuple[FakeCore, Microscope]:
-    """A fake demo stand; ``declares`` goes into ``[safety] stop_refused_by``."""
+    """A fake demo stand; ``declares`` goes into ``[safety] stop_refused_by``.
+
+    ``engage_drives_z`` sets ``[autofocus] engage_drives_z_to_offset`` (m2 §12).
+    """
     core = FakeCore.demo_like()
     profile = Profile.demo()
     if declares:
         safety = profile.safety.model_copy(update={"stop_refused_by": declares})
         profile = profile.model_copy(update={"safety": safety})
+    if engage_drives_z:
+        autofocus = profile.autofocus.model_copy(
+            update={"engage_drives_z_to_offset": True}
+        )
+        profile = profile.model_copy(update={"autofocus": autofocus})
     return core, Microscope.from_core(
         cast("CMMCorePlus", core), profile, dry_run=dry_run
     )
@@ -506,6 +517,74 @@ _SWITCH_OFF_FAILED = (
     "device: power, cable, another program holding it"
 )
 
+# --- the engage guard (m2 §12) ------------------------------------------------
+# The guard keeps a trip and a failed Z read as text; the error is built in the
+# readback, and a failed switch-off goes through the list the action empties.
+
+
+def _engage_excursion(core: FakeCore, microscope: Microscope) -> tuple[str, str]:
+    """Run 1 on the demo's limits: locked, then Z driven past the soft limit."""
+    core.autofocus_target_um = lambda: 5000.0
+    return _outcome(microscope.require(Autofocus).engage)
+
+
+def _engage_excursion_not_switched_off(
+    core: FakeCore, microscope: Microscope
+) -> tuple[str, str]:
+    """The same jump, whose switch-off fails: registered until ``stop()`` and ``resume()``."""
+    core.autofocus_target_um = lambda: 5000.0
+    autofocus = microscope.require(Autofocus)
+    original = core.enableContinuousFocus
+
+    def switch(enable: bool) -> None:
+        if not enable:
+            raise RuntimeError("device fault")  # fresh: not `failing` (FM-98)
+        original(enable)
+
+    core.enableContinuousFocus = switch  # type: ignore[method-assign]
+    try:
+        outcome = _outcome(autofocus.engage)
+    finally:
+        del core.enableContinuousFocus
+    microscope.stop()
+    microscope.resume()
+    return outcome
+
+
+def _engage_z_unreadable(core: FakeCore, microscope: Microscope) -> tuple[str, str]:
+    """Z read before the switch-on, then failing once the autofocus is on."""
+    autofocus = microscope.require(Autofocus)
+    read = core.getPosition
+
+    def position(label: str | None = None) -> float:
+        if core.isContinuousFocusEnabled():
+            raise RuntimeError("device fault")  # fresh: not `failing` (FM-98)
+        return read(label)
+
+    core.getPosition = position  # type: ignore[method-assign]
+    try:
+        return _outcome(autofocus.engage)
+    finally:
+        del core.getPosition
+
+
+def _engage_refused_after_switch_off(
+    core: FakeCore, microscope: Microscope
+) -> tuple[str, str]:
+    """On a declared stand, searching at an offset never seen: switched off, then refused."""
+    autofocus = microscope.require(Autofocus)
+    core.autofocus_lockable = False
+    core.enableContinuousFocus(True)
+    return _outcome(autofocus.engage)
+
+
+_engage_refused_after_switch_off.engage_drives_z = True  # type: ignore[attr-defined]
+
+_ENGAGE_EXCURSION = (
+    "autofocus Autofocus: Z went from 0.00 µm to 5000.00 µm while it engaged, "
+    "outside the soft limits [-1000, 1000] µm"
+)
+
 # --- a stop the profile declares refused (m2 §11) ---------------------------
 # `_send_stop` builds a StopRefusedError whose cause is the device's error, and
 # that error's traceback reaches `_send_stop`'s frame through `_send_safe`'s
@@ -642,6 +721,43 @@ _DECLARED_EMERGENCY_STOP = (
             "",
             id="ctrl-c-whose-stop-is-refused",
         ),
+        pytest.param(
+            _engage_excursion,
+            "AutofocusExcursionError",
+            f"{_ENGAGE_EXCURSION}; it was switched off. The guard reads Z every 10 "
+            "ms: it stops Autofocus once a jump is read, it does not prevent one. "
+            "Check the sample and the objective",
+            id="engage-excursion",
+        ),
+        pytest.param(
+            _engage_excursion_not_switched_off,
+            "_LostLockError",
+            f"{_ENGAGE_EXCURSION}, and it could not be switched off (the switch-off "
+            f"failed: {_SWITCH_OFF_FAILED}); it may still move Z: stop() and check "
+            "the stand, then resume()",
+            id="engage-excursion-not-switched-off",
+        ),
+        pytest.param(
+            _engage_z_unreadable,
+            "HardwareError",
+            "autofocus Autofocus: Z could not be read while it engaged (focus: "
+            "getPosition('Z') failed (device fault); check the device: power, "
+            "cable, another program holding it); it was switched off, since unread "
+            "it could drive Z past any bound (m2 §12)",
+            id="engage-z-unreadable",
+        ),
+        pytest.param(
+            _engage_refused_after_switch_off,
+            "_EngageRefusedError",
+            "autofocus Autofocus: not engaged: on this stand engaging drives Z to "
+            "the plane the offset names ([autofocus] engage_drives_z_to_offset, m2 "
+            "§12), and offset 0 has not been seen locked with objective "
+            "'Nikon 10X S Fluor' since the stand was opened (seen: none); it was on "
+            "and searching, so it was switched off. Focus on the sample, switch "
+            "Autofocus on with the stand's own controls and set the offset until "
+            "the sample is sharp; smc then reads the lock",
+            id="engage-refused-after-switch-off",
+        ),
     ],
 )
 def test_a_failed_stop_or_switch_off_frees_the_core(
@@ -652,7 +768,10 @@ def test_a_failed_stop_or_switch_off_frees_the_core(
 ) -> None:
     # The stop and safe-call paths held the error they raised (or a held log
     # line's argument) in a local of a frame on its own traceback (#148).
-    core, microscope = _stand(declares=getattr(scenario, "declares", ()))
+    core, microscope = _stand(
+        declares=getattr(scenario, "declares", ()),
+        engage_drives_z=getattr(scenario, "engage_drives_z", False),
+    )
     assert scenario(core, microscope) == (kind, message)
     core.failing.clear()
     watched = _watch(microscope, core)

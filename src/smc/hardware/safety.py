@@ -111,10 +111,23 @@ class Safety:
         autofocus_offset_soft_limits: tuple[float, float] | None = None,
         offset_unit: str = "",
         stop_refused_by: frozenset[str] = frozenset(),
+        max_engage_excursion_um: float | None = None,
     ) -> None:
         #: The roles' values whose device refuses ``stop()`` (``"xy_stage"``):
         #: the backends set ``Motion.stop_refused`` from it (m2 §11.3).
         self.stop_refused_by = frozenset(stop_refused_by)
+        if max_engage_excursion_um is not None and (
+            not math.isfinite(max_engage_excursion_um) or max_engage_excursion_um <= 0
+        ):
+            raise ValueError(
+                f"max_engage_excursion_um must be finite and > 0, got "
+                f"{max_engage_excursion_um!r}"
+            )
+        #: How far Z may move while an autofocus engages, beyond where it
+        #: started or held; ``None``: only the Z soft limits bound it (m2 §12).
+        self.max_engage_excursion_um = (
+            None if max_engage_excursion_um is None else float(max_engage_excursion_um)
+        )
         if not math.isfinite(max_jog_um) or max_jog_um < 0:
             raise ValueError(f"max_jog_um must be finite and >= 0, got {max_jog_um!r}")
         self.max_jog_um = float(max_jog_um)
