@@ -13,9 +13,11 @@ only below the start, which is away from the sample on an inverted stand.
 The autofocus offset gets soft limits at its start ± 2.0 and a jog limit of
 1.0, in its own units (m2 §3.13); a contract moves it at most 1.0 from the
 start, with the autofocus off, except in the locked ``focus_by_um`` case.
-Every target outside the envelope is one the layer must refuse, so none of
-them is ever sent. The ``microscope`` fixture then puts the stand back where
-it started.
+The offset is also sent in whole units only: the ``fake`` stand's autofocus
+holds whole units from 7927, like the Ti2-E's reads, so every offset a
+contract sends is the start plus a whole number (FM-119, #207). Every target
+outside the envelope is one the layer must refuse, so none of them is ever
+sent. The ``microscope`` fixture then puts the stand back where it started.
 
 **On ``hardware``, the turret never turns, and no capture is ever run**
 (m2 §8.8): a turn can drive an objective into the plate, and a capture
@@ -27,7 +29,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from typing import Protocol, TypeVar
+from typing import TYPE_CHECKING, Protocol, TypeVar
 
 import pytest
 
@@ -46,11 +48,14 @@ from smc.hardware.capabilities import (
 )
 from smc.hardware.profile import Profile, SafetySection
 
+if TYPE_CHECKING:
+    from smc.testing import FakeCore
+
 T = TypeVar("T")
 
 #: The fixture that opens each backend's stand; it owns the core and closes it.
 _STANDS = {
-    "fake": "fake_microscope",
+    "fake": "whole_unit_fake_microscope",
     "demo": "demo_microscope",
     "hardware": "hardware_microscope",
 }
@@ -81,7 +86,10 @@ class Envelope:
     xy_span_um: float = 100.0
     z_span_um: float = 3.0
     tolerance_um: float = 0.5
-    #: The autofocus offset's, in its own units (m2 §3.13).
+    #: The autofocus offset's, in its own units (m2 §3.13). The tolerance stays
+    #: 0.5 although the stand holds whole units: every delta a contract sends
+    #: (1.0, 2.0, 3.0) differs from it and from the limit it is compared with,
+    #: and a wider one would let a jog clamped to the limit pass (#207).
     max_offset_jog: float = 1.0
     offset_span: float = 2.0
     offset_tolerance: float = 0.5
@@ -168,6 +176,23 @@ def _require_inside(
 def backend(request: pytest.FixtureRequest) -> str:
     """Which implementation the contract runs on."""
     return str(request.param)
+
+
+@pytest.fixture
+def whole_unit_fake_microscope(
+    fake_core: FakeCore, request: pytest.FixtureRequest
+) -> Microscope:
+    """``fake_microscope`` over an autofocus that holds whole units, from 7927.
+
+    The Ti2-E's ``PFSOffset`` reads whole numbers (7927, 7937, 9370, ...), and
+    a start of ``0.0`` would not show a contract that sends fractions: from
+    there, truncation towards zero errs the other way (#207). The device is
+    configured before the facade is built, which reads the offset.
+    """
+    fake_core.hold_whole_units(fake_core.getAutoFocusDevice())
+    fake_core.setAutoFocusOffset(7927.0)
+    stand: Microscope = request.getfixturevalue("fake_microscope")
+    return stand
 
 
 @pytest.fixture

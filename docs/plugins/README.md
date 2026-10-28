@@ -15,12 +15,17 @@ is how to use it.
 
 Plugins with a page of their own: [`camera-calibration`](camera-calibration.md)
 (how the camera's pixels map to the stage: pixel size, rotation, mirror),
+[`plate-registration` and `goto-well`](plate-registration.md) (where the plate is on
+the stage, from wells you centred and walls you touched, and the move to a well or
+its wall),
 [`cells`](cells.md) (single cells and doublets on a scan's frames, in stage µm,
 each counted once; needs the `detect` extra and the trained weights),
 [`scan-plan`](scan-plan.md) (which wells and which fields of each to image, from the
 camera's real field of view), [`scan`](scan.md) (one TIFF per planned field, with
-the stage's readback and the focus state) and [`route`](route.md) (the fields that
-hold the most cells of the wanted classes, then the shortest route through them).
+the stage's readback and the focus state), [`density`](density.md) (the cells of each
+well and class, divided by the area that was imaged) and [`route`](route.md) (the
+fields that hold the most cells of the wanted classes, then the shortest route
+through them).
 
 ## Running a plugin: `smc run`
 

@@ -1054,6 +1054,13 @@ class WellGeometry:
     rotation_deg: float
 
     def contains(self, x_um: float, y_um: float, *, margin_um: float = 0.0) -> bool: ...
+    def contains_many(
+        self,
+        x_um: npt.NDArray[np.float64],
+        y_um: npt.NDArray[np.float64],
+        *,
+        margin_um: float = 0.0,
+    ) -> npt.NDArray[np.bool_]: ...
     def to_plate_frame(self, x_um: float, y_um: float) -> tuple[float, float]: ...
 
 
@@ -1074,6 +1081,18 @@ is axis-aligned. `contains` is true inside the well shrunk by
 wells have equal sizes), or the rectangle of half-sizes minus the margin.
 Density, the route, the report and the scan plan's clipping use it, and
 nothing else re-derives a well's shape.
+
+`contains_many` is `contains` over arrays (added for #193, which tests a
+grid of a million points per well): `x_um` and `y_um` broadcast against each
+other, so a row and a column give a grid, and the result has the broadcast
+shape. It is the same arithmetic in the same order, so it agrees with
+`contains` on every point, the edge and the margin's refusal included (FM-132;
+125 200 points compared, none differing, measured 2026-10-28, edges
+exactly on the boundary among them); a point that is not finite, or so far
+that its square overflows, is outside, with no numpy warning (`np.errstate`
+inside: Python's floats go to `inf` silently, numpy's warn, and `-W error`
+turns that into a failure). Nothing else knows the shape either: the
+rasterised area of §10 asks it, and does not re-derive it.
 
 ### 3.3 Camera calibration — `slots/camera_calibration.py` (slot `camera-calibration`)
 
@@ -1708,15 +1727,95 @@ soft limits and dry run are the layer's. Its model lives in
 
 The 31 ported tests (`test_plate_registration.py`), with
 `test_calibration_round_trips_through_useqs_forward_model` as a hypothesis
-test (plate type, A1, rotation within ±20°, 1 to 4 references with ±12 µm
-of jitter); `test_a_seed_fills_the_plate_slot_with_rotation_zero`;
+test (plate type, A1, rotation within ±8°, 1 to 4 references with ±12 µm
+of jitter; the bounds are in the block below);
+`test_a_seed_fills_the_plate_slot_with_rotation_zero`;
 `test_a_residual_beyond_300_um_fails_and_names_the_well`;
 `test_a_well_given_twice_is_refused`; `test_goto_well_drives_to_the_wall_point_on_a_rotated_plate`
 (demo); `test_goto_well_needs_a_plate`. `docs/plugins/plate-registration.md`
 documents §5.1's loop.
 
 **Failure modes**: FM-73 (anisotropic probes, a rotated plate),
-FM-43.
+FM-43, FM-121 (the rotation bound below), FM-124.
+
+**Refined while planning #19** (measured 2026-10-28 on a prototype that
+is not committed, useq-schema 0.9.2 and pydantic 2.13.5 on Python 3.13;
+`useq._plate_registry` read in the 0.9.0 wheel too):
+
+- **Two references can fit a plate turned by 90° with no residual.** A1 at
+  (0, 0) and A2 at (9000, 0) µm, with A2 typed as `B1`: the fit gives
+  90.0°, a residual of 3e-13 µm and a scale error of 0, and puts H12 at
+  (63 000, 99 000) µm instead of (99 000, −63 000). Neither the scale check
+  nor the residual can see it. `calibrate` therefore takes
+  `max_rotation_deg: float = MAX_ROTATION_DEG` (keyword, `MAX_ROTATION_DEG =
+  10.0`) and raises `ValueError` beyond it: `the fit turns the plate by
+  <r>°, beyond ±<max>°: a reference well is misidentified (two references
+  the same distance apart fit either way)`. `PlateRegistrationParams` gains
+  `max_rotation_deg: float = Field(10.0, gt=0.0, le=45.0)`, for a holder
+  that really holds a plate askew (FM-121: the bound is on the derived
+  value, not only on the inputs).
+- **Nominal offsets come from useq.** `nominal_offsets(plate)` is the
+  `all_well_positions` of a plan with A1 at (0, 0) and rotation 0, keyed by
+  `str(name)`: 3 ms for the 1536 wells, where one `well_geometry` per well
+  takes 0.34 s. `nearest_well` uses `result.to_plan().all_well_positions`
+  the same way. A fit of 3 references with no jitter gives A1 back within
+  2e-11 µm and the rotation within 4e-15° on the 6-, 24-, 96-, 384- and
+  1536-well plates at 7.25°.
+- **The fit** (`plate.py`'s): centroids of the nominal offsets `d` and the
+  measured points `m`, `θ = atan2(Σ d′ × m′, Σ d′ · m′)` of the centred sets,
+  `A1 = m̄ − R(θ) · d̄`. The scale check (the longest nominal baseline among
+  the references, measured over nominal minus 1, signed) runs before the
+  fit and the rotation bound after it. The residual is computed from the
+  fitted A1 and θ before the `PlateResult` is built: the result is
+  constructed once, never `model_copy`'d (which skips validation).
+- **A seed** (one reference) has `residual_um=None`, `scale_error=None`
+  (§3.2: nothing measured them; `plate.py` wrote 0.0) and `assumed` gains
+  `one reference well (<well>): rotation 0° assumed, not measured`.
+- **The residual spreads.** One reference of three that is 600 µm off
+  gives a residual of 298 µm; 700 µm gives 348 µm (A1, A12 and H1 of a
+  96-well plate, H1 moved in X). The worst reference is the one named.
+- **Wall touches are read per axis**, as `plate.py`: `left` and `right`
+  give X from their `x_um`, `top` and `bottom` give Y from their `y_um`,
+  and the other coordinate of a touch is not used, since the plate's
+  rotation is not known yet when walls are touched. `top` is +Y (towards
+  row A: rows grow towards −Y). An opposite pair gives the midpoint and a
+  signed size (`right − left`, `top − bottom`, so swapped sides are
+  refused by the size check); one wall gives the wall plus or minus the
+  nominal half-size of that axis (`well_size[0]` for X, `[1]` for Y), and
+  its axis is assumed. Touching along a stage axis from the wall point of
+  a plate turned by θ errs by `r (1 − cos θ)` for one wall: 8 µm at 4°,
+  49 µm at 10° for a 96-well well (computed); a pair cancels it for a round
+  well. A side given twice and a touch of another well are `ValueError`s.
+- **`wall_position`** is the well's centre plus `R(θ) · (∓w/2, 0)` for
+  left and right and `R(θ) · (0, ±h/2)` for top and bottom, `w` and `h`
+  the well's size; any other side is a `ValueError` (`plate.py` raised a
+  bare `KeyError`).
+- **`refs` of the result** hold the given references, then one per well
+  given by walls (its computed centre), in the order of the well's first
+  touch, all normalised.
+- **`goto-well` in a dry run** returns the target from `move_to_um`
+  (measured: the demo's dry run returns the target and the readback stays
+  where it was), so `x_um`, `y_um` are the target and `assumed` gains `dry
+  run: the stage did not move; x_um and y_um are the target`. The demo's
+  stage lands within 0.01 µm of a fractional target (measured:
+  18123.4567 → 18123.45). A `plate` from a dry run is unusable to a real
+  `goto-well` (§1.7's rule), which the plugin page says.
+- **The hypothesis test's bounds** are proved, not fitted: the rigid fit
+  minimises the sum of squares, so with jitter of at most `J` on `n`
+  references the residual is at most `√n · J`, and each reference's true
+  centre is predicted within `(√n + 1) · J` (5000 random cases: 1.39 J and
+  1.27 J at worst). The rotation is drawn within ±8°: with it drawn
+  within ±10°, jitter on close references gave a fit of −10.0° that the
+  bound refused (measured).
+- **An anisotropic plate for FM-73** is registered by the test only,
+  `monkeypatch.setitem(useq._plate_registry._PLATE_REGISTRY, name, {...})`
+  (the module and the dict exist in 0.9.0 and 0.9.2): every registered
+  plate has equal pitches and well sizes on both axes, so an exchange of X
+  and Y passes on all of them.
+- **On the Ti2-E** the profile's soft limits are ±49 000 × ±29 000 µm, a
+  span of 98 × 58 mm, and a 96-well plate's corner wells are 99 × 63 mm
+  apart: wherever the plate sits, a `goto-well` to some corner wells will
+  be refused by the layer (not measured at the stand; #198).
 
 ## 6. Automatic plate finding (#20)
 
@@ -2418,9 +2517,13 @@ class DensityParams(PluginParams):
     area_grid_um: float = Field(5.0, ge=0.5, le=100.0)
 ```
 
-`requires = ()`, `reads = ("scan-plan", "scan", "cells")`.
+`requires = ()`, `reads = ("scan-plan", "scan", "cells")`,
+`reads_optional = ()`.
 
 ```python
+class GridTooFineError(ValueError): ...
+
+
 def scanned_area_mm2(
     footprints: Sequence[Sequence[tuple[float, float]]],
     well: WellGeometry,
@@ -2432,25 +2535,106 @@ def density(
     *,
     wells: Sequence[WellGeometry],
     areas_mm2: Mapping[str, float],
+    fields: Mapping[str, int],
+    failed_fields: Mapping[str, int],
     labels: Sequence[str],
 ) -> tuple[DensityWell, ...]: ...
 ```
 
 - The area is the union of the footprints of the well's **taken** frames
   (failed fields excluded), intersected with the well shape, rasterised
-  on a grid of `grid_um` (a 6.4 mm well at 5 µm is 1.6 M cells, counted
-  with numpy in chunks bounded at 2²⁴ elements, FM-74). The error at 5 µm
-  is under 1 % of a field.
+  on a grid of `grid_um`. How it is rasterised, bounded and tested is
+  refined below.
 - A cell is counted when `well.contains(x, y)`; one outside its well's
   shape (a field corner on the plastic) counts in `outside_well`. Every
   label of `CellsResult.classes` appears in `counts`, zero included;
   `per_mm2` is `None` for an area of 0.
+- `density` returns one `DensityWell` per entry of `wells`, in that order;
+  `fields` and `failed_fields` (by well name) are what `DensityWell` of the
+  same names holds, which the first version of this signature left no way
+  to pass.
+
+**Refined while planning #193** (measured 2026-10-28 on a prototype that is
+not committed, numpy 2.5.3 on Python 3.13, numpy 1.26.0 and 2.2.6 on Python
+3.10, `-W error::RuntimeWarning`; the same areas on the three):
+
+- **The raster.** A footprint is a parallelogram given by its corners 0, 1
+  and 3 (`geometry.footprint`'s order; corner 2 is checked to be `c1 + c3 −
+  c0` within 1e-6 µm and a footprint of no area, a corner that is not
+  finite or any other shape is a `ValueError` naming it). The grid covers
+  the footprints' bounding box **cut to the well's circumscribed square**
+  (the half-side is `size_um[0] / 2` for a disc and `hypot(size_um[0] / 2,
+  size_um[1] / 2)` for a rectangle, around `center_um`: an extent, not a
+  membership test), so a frame at a wrong stage position far from the well
+  cannot make the grid huge. Points are the cell centres
+  `(x_lo + (i + 0.5) · g, y_lo + (j + 0.5) · g)`, `g = grid_um`; a point
+  counts when it is inside at least one footprint (`0 ≤ s, t ≤ 1` for
+  `p = c0 + s · (c1 − c0) + t · (c3 − c0)`, solved with the entries written
+  out) **and** `well.contains_many` says it is in the well. The area is
+  the count times `g²`, in mm². Each footprint is tested over its own
+  window of the grid, widened by one index each way (a rounding at the
+  window's edge cannot lose a point), in bands of at most 2²⁰ elements.
+  60 random cases (rotated, mirrored, non-square frames, round and
+  rectangular wells turned by the plate) equal a brute force of every point
+  against every footprint, and the area does not change with the band size.
+- **What it measures.** A 96-well disc (305 fields of 388 µm) at 5 µm:
+  32.1703 mm² for 32.1699, +0.001 %, in 0.03 s; at 0.5 µm 0.5 s and a peak
+  of 41 MB above the baseline. A 6-well well (34.8 mm, 8013 fields) at 2 µm:
+  1.1 s. A single field has the error of its edges, up to `g / (2 w)` on each
+  axis (+1.3 % for a 333 µm field at 5 µm, measured), which is why the claim
+  that the error is "under 1 % of a field" is dropped: it holds for the
+  area of a well, not of one field. `assumed` says an edge is known to
+  within half a step.
+- **Bounds** (FM-74), applied before anything is allocated and on Python
+  numbers: `grid_um` finite and positive; each axis at most 2¹⁷ points and
+  the grid at most 2³⁰ points, tested on the **floats** first, written `not
+  x <= bound` so that `nan` is refused too (`ceil(inf)` is an
+  `OverflowError`: a step of 5e-324 µm raised it in the first prototype);
+  the sum over footprints of their windows at most 2³¹ tests (measured 440
+  to 650 million a second on the three numpys, so 3 to 5 s at the bound). The band is then at most `max(2²⁰, nx)` ≤ 2²⁰
+  elements (a band of 2²⁴ peaked at 689 MB, one of 2²⁰ at 95 MB, the same
+  time). A refusal is a `GridTooFineError`, whose message gives the sizes
+  formatted with `:.3g` (a step of 1e-300 would print 300 digits otherwise);
+  the plugin turns it into a `PluginRunError` that names the well and says
+  to raise `area_grid_um`. A corner beyond 1e12 µm (1000 km of stage) is a
+  `ValueError`: a corrupt record, and below it the arithmetic cannot overflow;
+  a footprint farther than that from the well but within it is ignored (the
+  extent is cut to the well), and the window indices are clipped on the
+  floats before they become integers (FM-75). With one extra frame at 1e9,
+  1e11 or 9.9e11 µm the 96-well area above is the same 32.1703 mm², with no
+  numpy warning on the three numpys.
+- **No matrix product** on coordinate arrays (FM-131), and a module-level
+  `filterwarnings = error::RuntimeWarning` in the tests of the numeric
+  module.
+- **`density`** raises `ValueError` for: no label or a repeated one; a well
+  listed twice; a well that `areas_mm2`, `fields` or `failed_fields` lacks;
+  an area that is not finite and at least 0, or a count below 0; a cell of
+  a well not in `wells`; a cell whose label is not in `labels`. So `counts`
+  and `outside_well` of a well always add up to its cells. The cells of a
+  well are tested with one `contains_many` call.
+- **The plugin** reports a well when the scan took a frame in it **or**
+  failed a field in it (a well whose every field failed is reported with 0
+  fields, its failed count, an area of 0 and `per_mm2 = None`), in the scan
+  plan's order; a well that the scan did not attempt is not reported, as the
+  route leaves it out. The footprints are those of the scan's frames at
+  their **readback** position, with the **scan's** matrix and frame shape
+  (not the plan's: FM-124). It refuses, each with the stage's own words: a
+  scan with no frame; a matrix that cannot be inverted (FM-125); cells
+  counted on another number of frames than the scan holds, or on other wells
+  (FM-111's case: the scan was run again); a cells file that no longer
+  matches its result; a well that the plan does not list or cannot place.
+  `labels` of the result are the cells' `classes`. `assumed` says that the
+  area is rasterised on `area_grid_um` and an edge known to half a step, and
+  that the wells' shape and position are the plate registration's and the
+  plate's nominal sizes (the wall was not measured).
 
 **Tests**: `test_a_full_disc_scan_measures_the_well_area` (within 1 % of
 π r²); `test_overlapping_fields_are_not_counted_twice_in_the_area`;
 `test_failed_fields_reduce_the_area`; `test_a_cell_on_the_plastic_counts_outside`;
 `test_a_well_with_no_frame_has_unknown_density`;
-`test_a_grid_too_fine_for_the_well_is_refused_before_allocating` (FM-74).
+`test_a_grid_too_fine_for_the_well_is_refused_before_allocating` (FM-74);
+the plan of #193 lists the rest. **Failure modes**: FM-73, FM-74, FM-98,
+FM-111, FM-124, FM-125, FM-131, FM-132.
 
 ## 11. Route (#194)
 
