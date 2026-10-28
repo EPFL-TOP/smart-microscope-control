@@ -61,6 +61,7 @@ turret_requires_confirm = true
 # max_autofocus_offset_jog = 50.0                # in [autofocus] offset_unit
 # autofocus_offset_soft_limits = [0.0, 15000.0]  # in [autofocus] offset_unit
 # stop_refused_by = []         # roles whose device refuses stop(), measured at the stand
+# max_engage_excursion_um = 50.0  # omitted: only z_soft_limits_um bound Z while the autofocus engages
 
 [camera]
 pixel_size_um = { "Nikon 10X S Fluor" = 0.65, "Nikon 40X Plan Fluor ELWD" = 0.1625 }
@@ -71,6 +72,9 @@ offset_unit = ""               # "" = unknown, shown as "device units"
 offset_per_um = {}             # objective label -> offset change per µm, measured
 in_range_property = ""
 in_range_values = []
+# engage_drives_z_to_offset = false  # true: engage only at an offset seen locked
+# settle_s = 0.0               # 0: the first locked read ends engage()
+# settle_tolerance_um = 0.5
 
 [light_source]
 intensity_property = ""        # "" = found by hints on the light_source device
@@ -97,6 +101,9 @@ exclude = []                   # device labels a capture never records
 | `autofocus.lock_timeout_s` | How long `engage()` and the Z interlock wait for a lock, in (0, 600] s. Omitted: 5 s, a figure from `nikon-control` that was never measured, labelled as assumed wherever it shows. A Z move under an engaged autofocus that finds no lock within it raises `AutofocusLostError`, and the autofocus is then off. |
 | `autofocus.offset_per_um` | Objective label (as the objective turret reports it) -> offset change per µm of focus, **measured** with the autofocus locked, sign included; finite and non-zero. `focus_by_um()` while locked refuses for an objective that has none. |
 | `autofocus.in_range_property` / `in_range_values` | The autofocus device's property that says whether its reference is in range, and the values of it that mean so. Both or neither, and no empty value. Without them, `is_in_range()` is `None`: the layer never guesses which property means "in range". |
+| `autofocus.engage_drives_z_to_offset` | `true` declares that engaging drives Z to the plane the stored offset names, whatever the operator focused (measured on the Ti2-E, #205). `engage()` and the Z interlock's relock then send nothing unless the offset now set is one this autofocus has been read locked at, with the same objective, since the stand was opened: lock it at the stand first, and smc sees the lock at its first read. Not forceable. `false` (the default): it engages as before (m2 §12). |
+| `autofocus.settle_s` / `settle_tolerance_um` | With `settle_s` > 0, `engage()` returns `True` only once every Z read of the last `settle_s` seconds lies within `settle_tolerance_um` µm of each other, still locked; a lock that has not settled by the lock timeout is switched off and is `False`. `settle_s` is in [0, 60] s and below `lock_timeout_s` (5 s when unset), which bounds the lock and the settling together; the tolerance is positive and finite. `0` (the default): the first locked read ends the wait (m2 §12.2 D3). |
+| `safety.max_engage_excursion_um` | How far Z may move while the autofocus engages, beyond where it started (or, for the relock after a Z move, where it held focus before). Beyond it, or past `z_soft_limits_um`, the autofocus is switched off and `AutofocusExcursionError` is raised. Z is read every 10 ms, so this limits a jump, it does not prevent one. Omitted: only the soft limits bound it. Positive and finite (m2 §12.2 D2). |
 | `safety.stop_refused_by` | The roles whose device refuses `stop()`, among `xy_stage`, `focus` and `autofocus_offset`, each named once; empty (the default) declares nothing. A hardware session fills it from what the stand did, and `test_a_declared_stop_refusal_still_holds` checks it at each later session. The stop is still sent, so a firmware that accepts it still stops. What changes is what smc says: a move under way on a declared role runs to its target, `smc stage`/`smc z` moves and `smc run` print a `!` line saying so before anything is sent, and the Ctrl-C line, `close()` and the emergency stop name the refusal instead of "stopped" (m2 §11). |
 | `safety.turret_requires_confirm` | `true` (the default): `ObjectiveTurret.select()` refuses unless the call passes `confirm=True`, because turning the nosepiece can drive an objective into a loaded plate. `false`: it turns without `confirm`, and an INFO line says so whenever a select passes none. Either way, a turn switches the autofocus off first and never engages it again. |
 | `light_source.intensity_property` | The `light_source` device's property that sets how bright, in the device's own units. Used when the device has it and it is writable; otherwise a WARNING, and the hints decide. `""`: the first writable numeric property whose name holds `intensity`, `brightness`, `power`, `level` or `voltage`, one with limits first. With none, the light source has no knob, and `set_intensity_native()` refuses. |
@@ -110,7 +117,8 @@ every other line, comment and line ending is kept), then in the running core.
 copy; the owner decides whether to commit it.
 
 The new numeric keys (`lock_timeout_s`, `offset_per_um`'s values,
-`max_autofocus_offset_jog`, the offset soft limits) refuse a TOML boolean
+`max_autofocus_offset_jog`, the offset soft limits, `settle_s`,
+`settle_tolerance_um`, `max_engage_excursion_um`) refuse a TOML boolean
 (`true` would otherwise load as `1.0`) and accept an integer.
 
 Errors name the file, the dotted key and what to change, e.g.
