@@ -2883,8 +2883,10 @@ settle window:
 - **A Z read that fails** while the guard needs it switches the autofocus
   off and raises the read's `HardwareError` (unknown counts as the state
   that adds the safeguard, FM-19).
-- **No focus drive to read** (none, or an overridden one, as the links of
-  §3.3.1): no guard, and a WARNING per engage says so.
+- **No focus drive to read** (no `ZStage` at all): no guard, and a WARNING
+  per engage says so. An overridden `ZStage` is read like the built one:
+  the guard only reads, unlike §3.3.1's links, which need `MMZStage`'s
+  stop.
 - The guard reads Z only when it has something to check (a soft limit,
   `E`, or D3's window); otherwise the lock wait reads what it reads today.
 - Not chosen: *halting the microscope on an excursion*. The forgotten
@@ -3006,9 +3008,11 @@ class MMAutofocus:  # gains three keywords, last
   and raises. A switch-off that fails there keeps the motion registered and
   says that PFS may still move Z, as `_LostLockError` does. A deadline
   reached while locked but not settled gives the D3 WARNING, not "no lock".
-- **`suspend()`** reads `locked` and Z when the guard has a bound to keep,
-  and keeps Z as `z_held` for the relock that follows in the same compound;
-  each `suspend()` overwrites it.
+- **`suspend()`** reads `locked` (on a declared stand, so that the
+  operator's lock is seen before the move switches it off) and, when it
+  reads locked and the guard has a bound to keep, Z, kept as `z_held` for
+  the relock that follows in the same compound; each `suspend()` overwrites
+  it.
 - **An effective lock timeout not above `settle_s`** (the argument, the
   profile's or the default, read at call time): `ValueError` before
   anything is sent, as for a timeout out of bounds.
