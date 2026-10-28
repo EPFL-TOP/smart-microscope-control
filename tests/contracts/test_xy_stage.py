@@ -12,11 +12,13 @@ from typing import TYPE_CHECKING
 import pytest
 
 from smc.hardware.capabilities import XY, Limits, XYStage
-from smc.hardware.errors import SafetyRefusedError
+from smc.hardware.errors import SafetyRefusedError, StopRefusedError
+from smc.hardware.roles import Role
 
 if TYPE_CHECKING:
     # For the annotations only; the values come from the fixture.
     from conftest import Envelope
+    from smc.hardware import Microscope
 
 
 def _origin(envelope: Envelope) -> XY:
@@ -95,11 +97,40 @@ def test_wait_returns_on_an_idle_stage(xy: XYStage) -> None:
     assert xy.is_busy() is False
 
 
-def test_stop_on_an_idle_stage_is_harmless(xy: XYStage, envelope: Envelope) -> None:
+def _stop_refused(microscope: Microscope) -> bool:
+    """Whether the profile declares that this stand refuses a stop of its XY stage (m2 §11)."""
+    return Role.xy_stage in microscope.profile.safety.stop_refused_by
+
+
+def test_stop_on_an_idle_stage_is_harmless(
+    xy: XYStage, envelope: Envelope, microscope: Microscope
+) -> None:
+    if _stop_refused(microscope):
+        pytest.skip(
+            "the profile declares that this stand refuses a stop of xy_stage "
+            "([safety] stop_refused_by, m2 §11)"
+        )
     o, tol = _origin(envelope), envelope.tolerance_um
     xy.stop()
     _assert_near(xy.position_um(), o.x_um, o.y_um, tol)
     # The stop cancels nothing called after it: the next move runs.
+    _assert_near(xy.move_to_um(o.x_um + 20, o.y_um - 10), o.x_um + 20, o.y_um - 10, tol)
+
+
+def test_a_declared_stop_refusal_still_holds(
+    xy: XYStage, envelope: Envelope, microscope: Microscope
+) -> None:
+    # A firmware that starts to accept the stop fails this: correct the profile.
+    if not _stop_refused(microscope):
+        pytest.skip(
+            "the profile does not declare that this stand refuses a stop of "
+            "xy_stage ([safety] stop_refused_by)"
+        )
+    o, tol = _origin(envelope), envelope.tolerance_um
+    with pytest.raises(StopRefusedError):
+        xy.stop()
+    _assert_near(xy.position_um(), o.x_um, o.y_um, tol)
+    # The refused stop cancels nothing called after it: the next move runs.
     _assert_near(xy.move_to_um(o.x_um + 20, o.y_um - 10), o.x_um + 20, o.y_um - 10, tol)
 
 

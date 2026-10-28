@@ -17,8 +17,9 @@ import pytest
 from pymmcore_plus import DeviceType
 
 from smc.hardware import Microscope
+from smc.hardware.backends.mm import as_hardware_errors
 from smc.hardware.capabilities import Camera, Shutter, XYStage, ZStage
-from smc.hardware.errors import DeviceTimeoutError
+from smc.hardware.errors import DeviceTimeoutError, HardwareError
 from smc.hardware.profile import MicroManagerSection, Profile
 from smc.testing import FakeCore, FakeDevice, FakeProperty
 
@@ -99,6 +100,34 @@ def test_fake_busy_device_times_out() -> None:
         assert core.log == ["setPosition('Z', -1.0)", "stop('Z')"]
         # A stuck device stays stuck: stop() does not clear it.
         assert core.deviceBusy("Z")
+
+
+def test_a_refused_stop_raises_the_ti2_text_and_leaves_the_device_busy() -> None:
+    # m2 §11.8: the Ti2-E's answer to every stop of its stages (#208).
+    core = FakeCore.demo_like()
+    core.stop_refused = {"XY"}
+    core.busy_devices = {"XY"}
+    with _raises_exactly('Error in device "XY": Unsupported device command (11)'):
+        core.stop("XY")
+    # Logged before it raised, and the move goes on.
+    assert core.log == ["stop('XY')"]
+    assert core.deviceBusy("XY")
+    # A fresh error each time: one kept would hold the fake's frames (FM-98).
+    errors = []
+    for _ in range(2):
+        with pytest.raises(RuntimeError) as caught:
+            core.stop("XY")
+        errors.append(caught.value)
+    assert errors[0] is not errors[1]
+    # Another stage still takes its stop.
+    core.stop("Z")
+    # Through the layer's translator, the text the Executor sees.
+    with pytest.raises(HardwareError) as translated:
+        as_hardware_errors(cast("CMMCorePlus", core), "xy_stage").stop("XY")
+    assert str(translated.value).startswith(
+        "xy_stage: stop('XY') failed (Error in device \"XY\": Unsupported device "
+        "command (11))"
+    )
 
 
 def test_fake_failing_device_raises_on_every_call_naming_it() -> None:

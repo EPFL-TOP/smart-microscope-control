@@ -860,12 +860,125 @@ def test_ctrl_c_exits_130_and_the_record_says_stopped(
     _register(monkeypatch, CtrlC)
     result = _run("run", "ctrl-c", "--run-doc", _doc(tmp_path))
     assert result.exit_code == 130, result.output
-    assert "✗ interrupted — any move under way was stopped" in result.output
+    # The plugin raised it outside any move: no stop was given up on.
+    assert "✗ interrupted — no move was under way" in result.output
     stored = _stored(tmp_path, "ctrl-c")
     assert (stored.status, stored.error) == (
         StageStatus.stopped,
         "KeyboardInterrupt: Ctrl-C",
     )
+
+
+# --- a stand whose stages refuse stop() (m2 §11.6) ----------------------------
+
+
+class MovesXY(Base):
+    name = provides = "moves-xy"
+    requires = (XYStage,)
+
+    def run(self, microscope: Any, params: Params, ctx: RunContext) -> EchoResult:
+        microscope.require(XYStage).move_to_um(10.0, 0.0)
+        return EchoResult()
+
+
+@pytest.fixture
+def refusing_stand(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fake stand whose XY and Z refuse stop(), as the Ti2-E's (m2 §11.8).
+
+    The XY stage stays busy, and a Ctrl-C lands at the first busy poll of a
+    move, inside the Executor's wait: the path that reaches the give-up.
+    """
+
+    def open_stand(
+        cls: type[Microscope], profile: object = "demo", *, dry_run: bool = False
+    ) -> Microscope:
+        core = FakeCore.demo_like()
+        core.stop_refused = {"XY", "Z"}
+        core.busy_devices = {"XY"}
+        real, polled = core.deviceBusy, list[str]()
+
+        def busy(label: str) -> bool:
+            if not polled:
+                polled.append(label)
+                raise KeyboardInterrupt
+            return real(label)
+
+        core.deviceBusy = busy  # type: ignore[method-assign]
+        built = profile if isinstance(profile, Profile) else Profile.demo()
+        return Microscope.from_core(cast("CMMCorePlus", core), built, dry_run=dry_run)
+
+    monkeypatch.setattr(Microscope, "open", classmethod(open_stand))
+
+
+def _declaring_xy(tmp_path: Path) -> str:
+    path = tmp_path / "declared.toml"
+    path.write_text(
+        '[microscope]\nname = "declared"\n\n[safety]\nstop_refused_by = ["xy_stage"]\n',
+        encoding="utf-8",
+    )
+    return str(path)
+
+
+_XY_DECLARED_LINE = (
+    "! the profile declares that this stand refuses stop() on xy_stage ([safety] "
+    "stop_refused_by): once sent, a move runs to its target, and Ctrl-C ends smc, "
+    "not the move"
+)
+
+
+@pytest.mark.usefixtures("refusing_stand")
+def test_ctrl_c_mid_move_on_a_declared_stand_says_the_stage_runs_to_its_target(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # #206, FM-117: the Ti2-E's stage went the full 20000 µm after a line that
+    # said it was stopped (#208).
+    _register(monkeypatch, MovesXY)
+    profile = _declaring_xy(tmp_path)
+    result = _run("run", "moves-xy", "--run-doc", _doc(tmp_path), "-p", profile)
+    assert result.exit_code == 130, result.output
+    assert _lines(result)[-1] == (
+        "✗ interrupted — xy_stage XY refuses a stop on this stand ([safety] "
+        "stop_refused_by), so it runs to its target; let it finish or stop it "
+        "with the stand's own controls, then read the position (smc stage get, "
+        "smc z get) before the next move"
+    )
+    assert _XY_DECLARED_LINE in _lines(result)
+    assert _stored(tmp_path, "moves-xy").status is StageStatus.stopped
+
+
+def test_smc_run_on_a_declared_stand_prints_the_stop_line(
+    stand_events: list[str], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _register(monkeypatch, Good)
+    profile = _declaring_xy(tmp_path)
+    result = _run("run", "good", "--run-doc", _doc(tmp_path), "-p", profile)
+    assert result.exit_code == 0, result.output
+    # Once, while the stand is open, before the plugin runs.
+    assert stand_events.count(_XY_DECLARED_LINE) == 1
+    assert stand_events.index(_XY_DECLARED_LINE) < stand_events.index("stand closed")
+
+
+def test_a_dry_run_on_a_declared_stand_prints_no_stop_line(
+    fake_stand: list[bool], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A dry run sends nothing, so nothing runs to its target (m2 §11.6).
+    _register(monkeypatch, Good)
+    profile = _declaring_xy(tmp_path)
+    result = _run(
+        "run", "good", "--dry-run", "--run-doc", _doc(tmp_path), "-p", profile
+    )
+    assert result.exit_code == 0, result.output
+    assert fake_stand == [True]
+    assert "! the profile declares" not in result.output
+
+
+def test_smc_run_on_a_stand_that_declares_nothing_prints_no_stop_line(
+    fake_stand: list[bool], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _register(monkeypatch, Good)
+    result = _run("run", "good", "--run-doc", _doc(tmp_path))
+    assert result.exit_code == 0, result.output
+    assert "! the profile declares" not in result.output
 
 
 def test_a_plugin_that_stops_itself_exits_130_with_its_name(

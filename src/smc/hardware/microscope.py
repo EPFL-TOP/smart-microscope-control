@@ -81,6 +81,8 @@ from smc.hardware.errors import (
     CapabilityMissingError,
     HardwareError,
     MicroscopeBusyError,
+    StopRefusedError,
+    join_names,
 )
 from smc.hardware.profile import Profile
 from smc.hardware.roles import DeviceInfo, Role, RoleMap, core_roles, devices_from_core
@@ -127,6 +129,28 @@ _STOPPED: tuple[tuple[type | None, Role], ...] = (
     (XYStage, Role.xy_stage),
     (ZStage, Role.focus),
 )
+
+#: How the backends name each stopped stage's motion (``"z Z"``), for the
+#: emergency stop's and ``close()``'s messages: the same names as their lines.
+_STOP_NAMES: dict[Role, str] = {
+    Role.xy_stage: "xy_stage",
+    Role.focus: "z",
+    Role.autofocus_offset: "autofocus_offset",
+}
+
+
+@dataclass
+class _Stops:
+    """What ``_stop_stages`` did, as text: no exception, so no traceback (FM-98).
+
+    ``done``: ``autofocus <label> off`` and each stop the device took;
+    ``refused``: each refusal the profile declares; ``failed``: each failure,
+    with its error's ``repr`` (m2 §11.5).
+    """
+
+    done: list[str] = field(default_factory=list)
+    refused: list[str] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -213,6 +237,7 @@ class Microscope:
             max_autofocus_offset_jog=safety.max_autofocus_offset_jog,
             autofocus_offset_soft_limits=safety.autofocus_offset_soft_limits,
             offset_unit=profile.autofocus.offset_unit,
+            stop_refused_by=frozenset(role.value for role in safety.stop_refused_by),
         )
         self._lock = threading.RLock()
         # FM-15: waiting for the lock is bounded like a device call.
@@ -647,17 +672,47 @@ class Microscope:
         raises ``MicroscopeHaltedError`` until :meth:`resume`; reads, closing
         a shutter and switching the autofocus off still run.
 
+        A stage the profile declares refuses its stop (``[safety]
+        stop_refused_by``) is still sent it; its refusal is no failure, but
+        the error says that a move under way runs to its target (m2 §11.5).
+
         Raises:
+            StopRefusedError: Only declared refusals: the message says what the
+                stop did and which stages run on; the microscope stays halted.
             HardwareError: One or more stages, the autofocus or its offset
-                device did not take the stop; the message names each, and the
-                microscope stays halted.
+                device did not take the stop; the message names each, and any
+                declared refusal, and the microscope stays halted.
         """
-        failures = self._executor.hold_log(self._halt_then_stop_stages)
-        if failures:
+        stops = self._executor.hold_log(self._halt_then_stop_stages)
+        ending = (
+            "The microscope stays halted: stop the stage at the stand if it still "
+            "moves, then call `resume()`"
+        )
+        if stops.failed:
+            refused = (
+                f"; {join_names(stops.refused)} refused the stop, as the profile "
+                f"declares ([safety] stop_refused_by), so a move under way runs to "
+                f"its target"
+                if stops.refused
+                else ""
+            )
             raise HardwareError(
-                f"the emergency stop failed for {'; '.join(failures)}. The "
-                f"microscope stays halted: stop the stage at the stand if it "
-                f"still moves, then call `resume()`"
+                f"the emergency stop failed for {'; '.join(stops.failed)}"
+                f"{refused}. {ending}"
+            )
+        if stops.refused:
+            # The autofocus entries of `done`: "autofocus PFS off". The offset
+            # device's name starts "autofocus_offset", not "autofocus ".
+            off = [done for done in stops.done if done.startswith("autofocus ")]
+            switched = f" and switched {join_names(off)}" if off else ""
+            raise StopRefusedError(
+                tuple(stops.refused),
+                f"the emergency stop halted the microscope{switched}, but "
+                f"{join_names(stops.refused)} refused the stop, as the profile "
+                f"declares ([safety] stop_refused_by): a move under way runs to "
+                f"its target. The microscope stays halted: stop the stage with "
+                f"the stand's own controls if it must not finish its move, then "
+                f"call `resume()`",
             )
 
     def resume(self) -> None:
@@ -685,9 +740,10 @@ class Microscope:
                 ``close()`` may be called again.
             HardwareError: ``close()`` was called from inside an action of
                 this thread (a Ctrl-C handler that runs during a move, a
-                callback inside a snap). The stages were stopped if anything
-                moved, but nothing was unloaded: the action still uses the
-                devices. Call ``close()`` again once it has returned.
+                callback inside a snap). Every stage was sent its stop if
+                anything moved (the WARNING line says what each stop did),
+                but nothing was unloaded: the action still uses the devices.
+                Call ``close()`` again once it has returned.
         """
         if self._closed:
             return
@@ -695,9 +751,10 @@ class Microscope:
             self._stop_if_moving()
             raise HardwareError(
                 "close() was called from inside an action on this thread, which "
-                "still uses the devices; the stages were stopped if anything "
-                "moved, and nothing was unloaded. Call close() again once the "
-                "action has returned (after the `with` block, or in a `finally`)"
+                "still uses the devices; every stage was sent its stop if anything "
+                "moved (the WARNING line says what each stop did), and nothing was "
+                "unloaded. Call close() again once the action has returned (after "
+                "the `with` block, or in a `finally`)"
             )
         acquired = stopped = False
         # Nothing between acquire() and the try (FM-65); the finally also asks
@@ -752,20 +809,38 @@ class Microscope:
         A failed stop is logged, never raised: the devices are unloaded
         anyway, and a stop that did not take is a finding for the log. Every
         stop is sent before any line, the stops' own included (FM-62).
+
+        The line says what each stop did, never "stopped" by default (#206,
+        FM-117): a stage that refused its stop runs to its target. Unloading
+        does not wait for it: Ctrl-C must let smc exit, and the stand finishes
+        the move on its own (m2 §11.5).
         """
         moving = self._executor.moving()
         if not moving:
             return False
-        failures = self._executor.hold_log(self._stop_stages)
+        stops = self._executor.hold_log(self._stop_stages)
+        outcome: list[str] = []
+        if stops.done:
+            outcome.append(f"stopped: {', '.join(stops.done)}")
+        if stops.refused:
+            outcome.append(
+                f"refused, as the profile declares ([safety] stop_refused_by), so "
+                f"a move under way runs to its target: {', '.join(stops.refused)}"
+            )
+        if stops.failed:
+            outcome.append(f"not stopped: {len(stops.failed)} failed")
         # Logged after the stops were sent (FM-62).
         log.warning(
-            "close: %s still moving; the stages were stopped", ", ".join(moving)
+            "close: %s still moving; %s",
+            ", ".join(moving),
+            # A stand with no stage and no autofocus has nothing to stop.
+            "; ".join(outcome) or "nothing to stop",
         )
-        for failure in failures:
+        for failure in stops.failed:
             log.error("close: the stop failed for %s", failure)
         return True
 
-    def _halt_then_stop_stages(self) -> list[str]:
+    def _halt_then_stop_stages(self) -> _Stops:
         """Halt, then stop every stage: ``stop()`` runs both inside ``hold_log``.
 
         The halt is inside the hold too, so its line also waits for the last
@@ -774,8 +849,8 @@ class Microscope:
         self._executor.halt()
         return self._stop_stages()
 
-    def _stop_stages(self) -> list[str]:
-        """Switch the autofocus off, stop its offset device, then each stage; one note per failure.
+    def _stop_stages(self) -> _Stops:
+        """Switch the autofocus off, stop its offset device, then each stage; what each did.
 
         The autofocus first (m2 §3.11): PFS still driving Z could override
         the Z stop with its next correction. Its offset device next: a move
@@ -783,48 +858,64 @@ class Microscope:
         its timeout (the review of #140). An interrupt (a second Ctrl-C)
         during one stop does not skip the next: it is re-raised once every
         one has had its stop. The lookup is inside the same guard, since it
-        builds a capability nobody used yet.
+        builds a capability nobody used yet. A refusal the profile declares
+        is collected apart from the failures (m2 §11.5).
         """
-        failures: list[str] = []
+        stops = _Stops()
         interrupted: BaseException | None = None
         for capability, role in _STOPPED:
             try:
-                self._stop_one(capability, role)
+                done = self._stop_one(capability, role)
+            except StopRefusedError as exc:
+                stops.refused.extend(exc.refused)
             except Exception as exc:
                 label = self.roles.get(role)
                 kind = role.value if capability is None else capability.__name__
-                failures.append(f"{kind}{f' {label!r}' if label else ''} ({exc!r})")
+                stops.failed.append(f"{kind}{f' {label!r}' if label else ''} ({exc!r})")
             except BaseException as exc:
                 interrupted = interrupted or exc
+            else:
+                if done is not None:
+                    stops.done.append(done)
         try:
             if interrupted is not None:
                 raise interrupted
-            return failures
+            return stops
         finally:
             # Caught in this frame: exception -> traceback -> this frame -> this
             # local is a cycle that keeps the core until the cyclic collector
             # (#148, FM-92).
             del interrupted
 
-    def _stop_one(self, capability: type | None, role: Role) -> None:
+    def _stop_one(self, capability: type | None, role: Role) -> str | None:
         """One entry of ``_STOPPED``: the autofocus switched off, a stage or the offset device stopped.
 
         The offset device is stopped by its role, whether or not the
         autofocus was built or overridden: its own stop, keyed by its label,
-        is the one that cancels a move of it under way.
+        is the one that cancels a move of it under way. Returns what was done
+        (``autofocus PFS off``, or the motion's name), ``None`` when the stand
+        has nothing in that role.
         """
+        label = self.roles.get(role)
         if capability is None:
-            label = self.roles.get(role)
-            if label is not None:
-                self._executor.stop(autofocus_offset_motion(self.core, label))
-            return
+            if label is None:
+                return None
+            motion = autofocus_offset_motion(
+                self.core,
+                label,
+                stop_refused=role.value in self._safety.stop_refused_by,
+            )
+            self._executor.stop(motion)
+            return motion.name
         found = self._lookup(capability)
         if found is None:
-            return
+            return None
         if capability is Autofocus:
             cast("Autofocus", found).disengage()
-        else:
-            cast("XYStage | ZStage", found).stop()
+            return f"autofocus {label} off" if label else "autofocus off"
+        cast("XYStage | ZStage", found).stop()
+        name = _STOP_NAMES[role]
+        return f"{name} {label}" if label else name
 
 
 def _owns(lock: threading.RLock) -> bool:

@@ -60,6 +60,10 @@ from smc.hardware.errors import (
     MotionInProgressError,
     MotionStoppedError,
     SafetyRefusedError,
+    StopNote,
+    StopOutcome,
+    StopRefusedError,
+    note_stop,
 )
 
 __all__ = [
@@ -106,7 +110,11 @@ class Safety:
         max_autofocus_offset_jog: float | None = None,
         autofocus_offset_soft_limits: tuple[float, float] | None = None,
         offset_unit: str = "",
+        stop_refused_by: frozenset[str] = frozenset(),
     ) -> None:
+        #: The roles' values whose device refuses ``stop()`` (``"xy_stage"``):
+        #: the backends set ``Motion.stop_refused`` from it (m2 §11.3).
+        self.stop_refused_by = frozenset(stop_refused_by)
         if not math.isfinite(max_jog_um) or max_jog_um < 0:
             raise ValueError(f"max_jog_um must be finite and >= 0, got {max_jog_um!r}")
         self.max_jog_um = float(max_jog_um)
@@ -302,6 +310,23 @@ class Safety:
 
 #: How often a wait asks the device whether it is still busy.
 POLL_INTERVAL_S = 0.01
+
+# What a declared refusal of stop() makes the lines and errors say (m2 §11.4).
+#: The note on the WARNING line of a stop the device refused.
+_DECLARED_LINE_NOTE = (
+    "; the profile declares this refusal ([safety] stop_refused_by), so a move "
+    "under way runs to its target"
+)
+#: What a give-up's stop did, in its error message.
+_GAVE_UP_DECLARED = (
+    "the stand refuses its stop, as the profile declares ([safety] "
+    "stop_refused_by), so it runs to its target"
+)
+#: The detail of the ``MotionStoppedError`` of a stop requested during the move.
+_STOPPED_DECLARED = (
+    "a stop was requested during the move, but the profile declares that it "
+    "refuses its stop ([safety] stop_refused_by), so it may have run to its target"
+)
 #: How often a caller waiting for the lock looks at the halt and at what the
 #: holder is doing, so that it is refused as soon as the stand is halted or
 #: the holder starts waiting for a motion.
@@ -320,6 +345,8 @@ class Motion:
     name: str  # for messages: "xy_stage XY", "z Z", "Dichroic"
     is_busy: Callable[[], bool]
     stop: Callable[[], None] | None  # None: cannot be stopped (a State device)
+    # The profile declares that the device refuses stop() (m2 §11).
+    stop_refused: bool = False
 
 
 @dataclass(frozen=True)
@@ -867,7 +894,7 @@ class Executor:
                 )
             idle = self._poll_until_idle(motion, deadline)
             if not idle:
-                outcome = self._give_up(
+                outcome, _ = self._give_up(
                     motion,
                     f"{limit_s:g} s timeout",
                     registered=lambda: self._set_waiting(previous),
@@ -876,10 +903,16 @@ class Executor:
                 if self._generation(motion.device) != generation:
                     # The caller asked for the stop: the move ended as stopped,
                     # and the timeout is no reason to raise device_timeout_ms.
+                    # A declared refusal never says "it was stopped" (FM-117).
+                    stopped = (
+                        f"{_STOPPED_DECLARED};"
+                        if motion.stop_refused
+                        else "it was stopped, but"
+                    )
                     raise MotionStoppedError(
                         motion.name,
-                        f"it was stopped, but it still read busy at the move's "
-                        f"{limit_s:g} s timeout, and on the timeout {outcome}",
+                        f"{stopped} it still read busy at the move's {limit_s:g} s "
+                        f"timeout, and on the timeout {outcome}",
                     )
                 raise DeviceTimeoutError(
                     f"{motion.name} is still busy after {limit_s:g} s; {outcome}. "
@@ -889,15 +922,35 @@ class Executor:
                 )
             self._set_waiting(previous)
             if self._generation(motion.device) != generation:
+                # The caller asked for a stop, so the plan's next step must not
+                # run (M1 §13), even where the device refuses it and the move
+                # may have gone all the way (m2 §11.4).
+                if motion.stop_refused:
+                    raise MotionStoppedError(motion.name, _STOPPED_DECLARED)
                 raise MotionStoppedError(motion.name)
             return step.readback()
         except BaseException as exc:
             if sending and not (idle or gave_up):
-                self._give_up(
-                    motion,
-                    type(exc).__name__,
-                    registered=lambda: self._set_waiting(previous),
-                )
+                try:
+                    _, stopped = self._give_up(
+                        motion,
+                        type(exc).__name__,
+                        registered=lambda: self._set_waiting(previous),
+                    )
+                except BaseException as cut:
+                    # A second Ctrl-C inside the stop: its stop may not have
+                    # reached the device. Noted on the new exception, whose
+                    # context is ``exc`` (m2 §11.4).
+                    note_stop(
+                        cut,
+                        StopNote(
+                            motion.name, StopOutcome.interrupted, motion.stop_refused
+                        ),
+                    )
+                    raise
+                # Only once the give-up has returned: a note never says
+                # "accepted" for a stop that was not sent.
+                note_stop(exc, StopNote(motion.name, stopped, motion.stop_refused))
             raise
         finally:
             self._set_waiting(previous)
@@ -999,7 +1052,8 @@ class Executor:
         give-up as at a deadline (FM-17), stop first, registered while it
         reads busy, then logged. It never raises on its own account.
         """
-        return self._give_up(motion, why)
+        text, _ = self._give_up(motion, why)
+        return text
 
     @contextmanager
     def linked_stop(self, device: str, stop: Callable[[], None]) -> Iterator[StopLink]:
@@ -1160,8 +1214,15 @@ class Executor:
         first, then the device's own stop, then every line is written; while
         halted, nothing linked is called.
 
+        A device the profile declares refuses its stop (``motion.stop_refused``)
+        is still sent it: a firmware that accepts it then stops (m2 §11.2).
+        Its refusal is then not a fault, and the error and the line say that a
+        move under way runs to its target.
+
         Raises:
             HardwareError: The device cannot be stopped from smc.
+            StopRefusedError: The device refused its stop, as the profile
+                declares; chained from the device's own error.
             Exception: Whatever the device's stop raised, else whatever a
                 linked call raised; a failed stop is a finding.
         """
@@ -1206,12 +1267,32 @@ class Executor:
                 del error
 
     def _send_stop(self, motion: Motion, send: Callable[[], None]) -> Exception | None:
-        """``motion``'s own stop, then its registration released; what it raised, if anything."""
-        return self._send_safe(
+        """``motion``'s own stop, then its registration released; what it raised, if anything.
+
+        A refusal the profile declares comes back as a ``StopRefusedError``
+        chained from the device's error, so a linked call's failure, which
+        ``_stop_linked`` returns after this one, keeps its own type.
+        """
+        error = self._send_safe(
             send,
             f"{motion.name}: stop",
-            then=lambda failed: "" if failed else self._release_after_stop(motion),
+            then=lambda failed: self._after_stop(motion, failed),
         )
+        try:
+            if error is None or not motion.stop_refused:
+                return error
+            return _declared_refusal(motion, error)
+        finally:
+            # A returned error reaches this frame through its traceback's
+            # `f_back` (`_send_safe`'s frame), and the refusal reaches the
+            # error through its cause (#163, FM-98).
+            del error
+
+    def _after_stop(self, motion: Motion, failed: bool) -> str:
+        """The registry update after ``motion``'s own stop, and the note for its line."""
+        if not failed:
+            return self._release_after_stop(motion)
+        return _DECLARED_LINE_NOTE if motion.stop_refused else ""
 
     def _stop_linked(
         self,
@@ -1238,6 +1319,10 @@ class Executor:
             error = self._send_stop(motion, send)
             if interrupted is not None:
                 raise interrupted
+            if isinstance(error, StopRefusedError) and failure is not None:
+                # A declared refusal is no fault, and a link that failed (PFS
+                # still on, so still driving Z) is: the caller hears of it.
+                return failure
             return error or failure
         finally:
             # Both were caught in this frame, so each is a cycle: exception ->
@@ -1505,7 +1590,7 @@ class Executor:
         why: str,
         *,
         registered: Callable[[], object] | None = None,
-    ) -> str:
+    ) -> tuple[str, StopOutcome]:
         """Stop a motion its action stops watching, keep it registered while it moves, then log.
 
         The motion is registered before the stop is sent, since unknown counts
@@ -1515,7 +1600,10 @@ class Executor:
         stop generation: it cancels nobody else's action (design §13). It
         never raises on its own account, so a failed stop never masks the
         failure that caused the give-up. Returns what happened, for the error
-        message.
+        message, and the stop's outcome, for the note ``_move`` leaves on
+        the exception that ended the wait (m2 §11.4). A refusal the profile
+        declares says that the move runs to its target, not that the stop
+        failed.
 
         ``registered`` runs right after the registration, before the stop, the
         busy check and the log line. The holder uses it to stop waiting for
@@ -1536,7 +1624,10 @@ class Executor:
                 why,
                 note,
             )
-            return "it cannot be stopped from smc, so it may still be moving"
+            return (
+                "it cannot be stopped from smc, so it may still be moving",
+                StopOutcome.impossible,
+            )
         error = self._send_safe(
             send,
             f"{motion.name}: stop after {why}",
@@ -1544,8 +1635,13 @@ class Executor:
         )
         try:
             if error is None:
-                return "the stop was sent"
-            return f"the stop failed ({error!r}), so it may still be moving"
+                return "the stop was sent", StopOutcome.accepted
+            if motion.stop_refused:
+                return _GAVE_UP_DECLARED, StopOutcome.refused
+            return (
+                f"the stop failed ({error!r}), so it may still be moving",
+                StopOutcome.refused,
+            )
         finally:
             # A returned error reaches this frame through its traceback's
             # `f_back` (`_send_safe`'s frame): exception -> traceback -> frame
@@ -1619,6 +1715,17 @@ class Executor:
             self._logger.log(level, msg, *args, stacklevel=2)
         else:
             held.append((level, msg, args))
+
+
+def _declared_refusal(motion: Motion, error: Exception) -> StopRefusedError:
+    """The ``StopRefusedError`` of ``motion``, caused by the device's own ``error``.
+
+    Built here, not in ``_send_stop``: this frame is on no traceback, so the
+    refusal it holds makes no cycle (FM-98).
+    """
+    refused = StopRefusedError((motion.name,))
+    refused.__cause__ = error
+    return refused
 
 
 def _repr_of(error: BaseException) -> str:

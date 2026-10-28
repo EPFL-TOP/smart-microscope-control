@@ -127,6 +127,10 @@ class FakeCore:
       the positions of the XY and focus slot devices (0.0 for an empty slot);
       ``None`` gives a frame of zeros of ``image_shape``.
     * ``busy_devices``: labels that read busy until removed.
+    * ``stop_refused``: labels whose ``stop()`` is logged, then raises the
+      Ti2-E's ``Error in device "<label>": Unsupported device command (11)``
+      (m2 §11.8), a fresh error each time. ``busy_devices`` is left alone, so
+      a busy device stays busy: the move goes on.
     * ``failing``: label -> exception raised by every call whose first
       argument is that label; for the camera slot's device, by the
       current-camera calls too, and for the AutoFocus slot's device, by the
@@ -165,6 +169,7 @@ class FakeCore:
         self.log: list[str] = []
         self.frame_source: Callable[[float, float, float], np.ndarray] | None = None
         self.busy_devices: set[str] = set()
+        self.stop_refused: set[str] = set()
         self.failing: dict[str, BaseException] = {}
         self.pixel_size_um = 1.0
         self.magnification: dict[str, float] = {}
@@ -519,9 +524,17 @@ class FakeCore:
         return label in self.busy_devices
 
     def stop(self, label: str) -> None:
-        """Accepted for a stage; ``busy_devices`` is left alone, so a stuck device stays stuck."""
+        """Accepted for a stage; ``busy_devices`` is left alone, so a stuck device stays stuck.
+
+        A label in ``stop_refused`` raises the Ti2-E's refusal instead, measured
+        in session 1 for its XY stage, Z drive and PFS offset (#208).
+        """
         self._record("stop", label)
         device = self._device(label)
+        if label in self.stop_refused:
+            raise RuntimeError(
+                f'Error in device "{label}": Unsupported device command (11)'
+            )
         if device.type not in (DeviceType.Stage, DeviceType.XYStage):
             raise RuntimeError(f'Cannot stop "{label}": not a stage')
 

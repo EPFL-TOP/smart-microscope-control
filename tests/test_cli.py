@@ -22,6 +22,7 @@ import pytest
 import tifffile
 from typer.testing import CliRunner, Result
 
+import smc.cli as cli
 from smc import __version__
 from smc.cli import app
 from smc.discovery import dll_probe
@@ -30,9 +31,15 @@ from smc.hardware import Microscope
 from smc.hardware import core as core_mod
 from smc.hardware import microscope as microscope_mod
 from smc.hardware.backends import nikon
-from smc.hardware.backends.mm import MMXYStage
+from smc.hardware.backends.mm import MMXYStage, MMZStage
 from smc.hardware.capabilities import XY
-from smc.hardware.errors import CoreError, HardwareError
+from smc.hardware.errors import (
+    CoreError,
+    HardwareError,
+    StopNote,
+    StopOutcome,
+    note_stop,
+)
 from smc.hardware.microscope import MicroscopeState
 
 runner = CliRunner(env={"COLUMNS": "200", "SMC_PROFILE": None, "SMC_PROFILES": None})
@@ -730,10 +737,194 @@ def test_ctrl_c_during_a_move_exits_130_and_releases_the_stand(
     result = runner.invoke(app, ["stage", "move", "10", "0"])
 
     assert result.exit_code == 130, result.output
-    assert "✗ interrupted — any move under way was stopped" in result.output
+    # The move is patched out, so nothing was sent and no stop was given up on.
+    assert "✗ interrupted — no move was under way" in result.output
     assert len(close_calls) == 1
     assert "Traceback" not in result.output
     assert "Aborted" not in result.output
+
+
+# --- a stand whose stages refuse stop() (m2 §11.6) ----------------------------
+
+_READ = "read the position (smc stage get, smc z get) before the next move"
+_LET_IT_FINISH = f"let it finish or stop it with the stand's own controls, then {_READ}"
+
+
+@pytest.mark.parametrize(
+    ("notes", "line"),
+    [
+        pytest.param((), f"interrupted — no move was under way; {_READ}", id="none"),
+        pytest.param(
+            (StopNote("xy_stage XY", StopOutcome.accepted, False),),
+            f"interrupted — xy_stage XY was stopped; {_READ}",
+            id="accepted",
+        ),
+        pytest.param(
+            (StopNote("xy_stage XYStage", StopOutcome.refused, True),),
+            "interrupted — xy_stage XYStage refuses a stop on this stand ([safety] "
+            f"stop_refused_by), so it runs to its target; {_LET_IT_FINISH}",
+            id="declared-refusal",
+        ),
+        pytest.param(
+            (StopNote("xy_stage XY", StopOutcome.refused, False),),
+            "interrupted — xy_stage XY refused the stop, so it may still be moving; "
+            f"{_LET_IT_FINISH}",
+            id="undeclared-refusal",
+        ),
+        pytest.param(
+            (StopNote("Dichroic", StopOutcome.impossible, False),),
+            "interrupted — Dichroic cannot be stopped from smc, so it may still be "
+            f"moving; {_LET_IT_FINISH}",
+            id="impossible",
+        ),
+        pytest.param(
+            (
+                StopNote("z Z", StopOutcome.accepted, False),
+                StopNote("xy_stage XY", StopOutcome.interrupted, False),
+            ),
+            "interrupted — z Z was stopped; the stop of xy_stage XY was cut by a "
+            f"second Ctrl-C, so it may still be moving; {_LET_IT_FINISH}",
+            id="interrupted",
+        ),
+    ],
+)
+def test_the_ctrl_c_line_says_what_the_stop_did(
+    notes: tuple[StopNote, ...], line: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # #206: it said "any move under way was stopped" whatever the stop did.
+    interrupt = KeyboardInterrupt()
+    for note in notes:
+        note_stop(interrupt, note)
+    assert cli._report(interrupt, "") == 130
+    assert capsys.readouterr().out.splitlines() == [f"✗ {line}"]
+
+
+def _declaring(tmp_path: Path, roles: str, name: str = "declared") -> Path:
+    """The demo devices, with ``[safety] stop_refused_by = <roles>``."""
+    path = tmp_path / f"{name}.toml"
+    path.write_text(
+        f'[microscope]\nname = "declared"\n\n[safety]\nstop_refused_by = {roles}\n',
+        encoding="utf-8",
+    )
+    return path
+
+
+_XY_DECLARED_LINE = (
+    "! the profile declares that this stand refuses stop() on xy_stage ([safety] "
+    "stop_refused_by): once sent, a move runs to its target, and Ctrl-C ends smc, "
+    "not the move"
+)
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_a_move_on_a_declared_axis_prints_that_ctrl_c_will_not_stop_it(
+    tmp_path: Path,
+) -> None:
+    # Both axes declared: an XY move names the XY stage only.
+    both = str(_declaring(tmp_path, '["xy_stage", "focus"]', "both"))
+    for args in (["stage", "move", "10", "0"], ["stage", "jog", "5", "0"]):
+        result = runner.invoke(app, [*args, "-p", both])
+        assert result.exit_code == 0, result.output
+        lines = result.output.splitlines()
+        # Once, before the position the move landed at.
+        assert lines.count(_XY_DECLARED_LINE) == 1, result.output
+        assert lines.index(_XY_DECLARED_LINE) < len(lines) - 1
+        assert lines[-1].startswith("XY (")
+        assert "focus" not in result.output
+    # Z is not declared on this stand: its moves say nothing.
+    xy_only = str(_declaring(tmp_path, '["xy_stage"]', "xy-only"))
+    result = runner.invoke(app, ["z", "jog", "1", "-p", xy_only])
+    assert result.exit_code == 0, result.output
+    assert "! the profile declares" not in result.output
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+@pytest.mark.parametrize(
+    ("args", "role"),
+    [
+        (["stage", "move", "10", "0"], "xy_stage"),
+        (["stage", "jog", "5", "0"], "xy_stage"),
+        (["z", "move", "1"], "focus"),
+        (["z", "jog", "1"], "focus"),
+    ],
+)
+def test_the_stop_line_is_printed_before_the_move_is_sent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, args: list[str], role: str
+) -> None:
+    # A Ctrl-C during the move is when the operator needs the line: printed
+    # after the move, it would never show (m2 §11.6).
+    def interrupted(*_: object, **__: object) -> object:
+        raise KeyboardInterrupt
+
+    for stage in (MMXYStage, MMZStage):
+        for name in ("move_to_um", "move_by_um"):
+            monkeypatch.setattr(stage, name, interrupted)
+    profile = str(_declaring(tmp_path, f'["{role}"]'))
+    result = runner.invoke(app, [*args, "-p", profile])
+    assert result.exit_code == 130, result.output
+    assert (
+        f"! the profile declares that this stand refuses stop() on {role} ([safety] "
+        "stop_refused_by): once sent, a move runs to its target, and Ctrl-C ends "
+        "smc, not the move"
+    ) in result.output.splitlines()
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_a_z_move_on_a_declared_drive_prints_the_line(tmp_path: Path) -> None:
+    profile = str(_declaring(tmp_path, '["focus"]'))
+    result = runner.invoke(app, ["z", "move", "1", "-p", profile])
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    line = (
+        "! the profile declares that this stand refuses stop() on focus ([safety] "
+        "stop_refused_by): once sent, a move runs to its target, and Ctrl-C ends "
+        "smc, not the move"
+    )
+    assert lines.count(line) == 1, result.output
+    assert lines.index(line) < len(lines) - 1
+    assert lines[-1].startswith("Z ")
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_a_dry_run_move_on_a_declared_axis_prints_no_stop_line(
+    tmp_path: Path,
+) -> None:
+    # Nothing is sent in dry-run, so there is nothing to warn about.
+    profile = str(_declaring(tmp_path, '["xy_stage", "focus"]'))
+    for args in (["stage", "jog", "5", "0"], ["z", "jog", "1"]):
+        result = runner.invoke(app, [*args, "--dry-run", "-p", profile])
+        assert result.exit_code == 0, result.output
+        assert "! the profile declares" not in result.output
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_doctor_names_the_declared_stop_refusals(tmp_path: Path) -> None:
+    # The order of the key's values does not matter; the line's is fixed.
+    profile = _declaring(tmp_path, '["autofocus_offset", "focus", "xy_stage"]')
+    result = runner.invoke(app, ["doctor", "-p", str(profile)])
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    line = (
+        "! the profile declares that this stand refuses stop() on xy_stage, focus "
+        "and autofocus_offset ([safety] stop_refused_by): once sent, a move runs to "
+        "its target, and Ctrl-C ends smc, not the move"
+    )
+    assert line in lines
+    # After the role table.
+    assert lines.index("Roles") < lines.index(line)
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_doctor_on_a_stand_that_declares_nothing_prints_no_stop_line() -> None:
+    result = runner.invoke(app, ["doctor"])
+    assert result.exit_code == 0, result.output
+    assert "! the profile declares" not in result.output
 
 
 @pytest.fixture

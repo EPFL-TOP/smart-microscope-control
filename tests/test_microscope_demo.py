@@ -985,9 +985,11 @@ def test_close_stops_the_stages_when_something_moves(
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         m.close()
     assert spy.calls == ["stop XY", "stop Z", "unloadAllDevices"]
-    assert "close: xy_stage XY still moving; the stages were stopped" in (
-        caplog.messages
-    )
+    # Each stop the stand took, by name, never "the stages were stopped" (#206).
+    assert (
+        "close: xy_stage XY still moving; stopped: autofocus Autofocus off, "
+        "xy_stage XY, z Z"
+    ) in caplog.messages
     # FM-62 (#76): every stop went out before any line, its own included; the
     # autofocus switch-off is the first of them (m2 §3.11).
     assert logged_before_stop == [0, 0, 0]

@@ -13,11 +13,13 @@ from typing import TYPE_CHECKING
 import pytest
 
 from smc.hardware.capabilities import Limits, ZStage
-from smc.hardware.errors import SafetyRefusedError
+from smc.hardware.errors import SafetyRefusedError, StopRefusedError
+from smc.hardware.roles import Role
 
 if TYPE_CHECKING:
     # For the annotations only; the values come from the fixture.
     from conftest import Envelope
+    from smc.hardware import Microscope
 
 
 def _origin(envelope: Envelope) -> float:
@@ -87,11 +89,40 @@ def test_wait_returns_on_an_idle_stage(z: ZStage) -> None:
     assert z.is_busy() is False
 
 
-def test_stop_on_an_idle_stage_is_harmless(z: ZStage, envelope: Envelope) -> None:
+def _stop_refused(microscope: Microscope) -> bool:
+    """Whether the profile declares that this stand refuses a stop of its focus drive (m2 §11)."""
+    return Role.focus in microscope.profile.safety.stop_refused_by
+
+
+def test_stop_on_an_idle_stage_is_harmless(
+    z: ZStage, envelope: Envelope, microscope: Microscope
+) -> None:
+    if _stop_refused(microscope):
+        pytest.skip(
+            "the profile declares that this stand refuses a stop of focus "
+            "([safety] stop_refused_by, m2 §11)"
+        )
     z0, tol = _origin(envelope), envelope.tolerance_um
     z.stop()
     assert abs(z.position_um() - z0) <= tol
     # The stop cancels nothing called after it: the next move runs.
+    assert abs(z.move_to_um(z0 - 2) - (z0 - 2)) <= tol
+
+
+def test_a_declared_stop_refusal_still_holds(
+    z: ZStage, envelope: Envelope, microscope: Microscope
+) -> None:
+    # A firmware that starts to accept the stop fails this: correct the profile.
+    if not _stop_refused(microscope):
+        pytest.skip(
+            "the profile does not declare that this stand refuses a stop of focus "
+            "([safety] stop_refused_by)"
+        )
+    z0, tol = _origin(envelope), envelope.tolerance_um
+    with pytest.raises(StopRefusedError):
+        z.stop()
+    assert abs(z.position_um() - z0) <= tol
+    # The refused stop cancels nothing called after it: the next move runs.
     assert abs(z.move_to_um(z0 - 2) - (z0 - 2)) <= tol
 
 
