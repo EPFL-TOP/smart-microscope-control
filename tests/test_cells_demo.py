@@ -406,6 +406,32 @@ def test_a_corrupt_frame_file_names_it(
     assert error.reason.endswith("run scan again")
 
 
+def test_a_tiff_error_that_is_not_a_value_error_still_names_the_file(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``TiffFileError`` is a ``ValueError`` only in the newer tifffile.
+
+    The 2025.5.10 of Python 3.10 derives it from ``Exception``: the plan measured
+    the newest release, and CI's py3.10 job got the raw error out of the stage.
+    """
+
+    class OlderTiffFileError(Exception):
+        pass
+
+    def corrupt(run_dir: Path, frame: ScanFrame) -> np.ndarray:
+        raise OlderTiffFileError("not a TIFF file b'garb'")
+
+    monkeypatch.setattr(tifffile, "TiffFileError", OlderTiffFileError)
+    monkeypatch.setattr(plugin_mod, "load_frame", corrupt)
+    _seed_scan(tmp_path)
+
+    error = _failure(demo_microscope, tmp_path, monkeypatch)
+
+    assert "scan/t/f0.tif" in error.reason
+    assert "not a TIFF file" in error.reason
+    assert error.reason.endswith("run scan again")
+
+
 def test_a_frame_of_another_shape_than_the_scan_is_refused(
     demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

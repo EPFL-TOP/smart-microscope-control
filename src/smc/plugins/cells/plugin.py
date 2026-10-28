@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import numpy.typing as npt
+import tifffile
 from pydantic import BaseModel, Field
 
 from smc.plugins.api import PluginParams, RunContext
@@ -366,7 +367,10 @@ def _read_frame(
         raise PluginRunError(
             _NAME, f"frame file {frame.file} is missing from the run folder; {again}"
         ) from exc
-    except (ValueError, OSError) as exc:
+    except (ValueError, OSError, tifffile.TiffFileError) as exc:
+        # A path out of the folder is a ValueError, a locked file an OSError. A
+        # corrupt TIFF is `TiffFileError`, a ValueError only in the newer tifffile:
+        # the 2025.5.10 that Python 3.10 installs derives it from Exception.
         raise PluginRunError(
             _NAME, f"frame file {frame.file} cannot be read ({_why(exc)}); {again}"
         ) from exc
