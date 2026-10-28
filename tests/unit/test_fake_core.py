@@ -448,6 +448,48 @@ def test_autofocus_lockable_false_never_locks() -> None:
     assert core.isContinuousFocusLocked() is False
 
 
+def test_the_autofocus_drives_the_focus_device_after_the_reads_set() -> None:
+    # Run 1 (#205): locked read True, then Z jumped to the offset's plane.
+    core = _two_autofocus_devices()
+    core.setPosition("Z", 10.0)
+    core.autofocus_target_um = lambda: 245.0
+    core.autofocus_drive_after_reads = 2
+    core.enableContinuousFocus(True)
+    assert [core.isContinuousFocusLocked() for _ in range(2)] == [True, True]
+    assert core.getPosition("Z") == 10.0
+    assert core.isContinuousFocusLocked() is True
+    assert core.getPosition("Z") == 245.0
+    # The count restarts at each switch-on from off, not at one sent while on.
+    core.setPosition("Z", 10.0)  # the quirk switches it off
+    core.enableContinuousFocus(True)
+    core.isContinuousFocusLocked()
+    core.enableContinuousFocus(True)
+    core.isContinuousFocusLocked()
+    assert core.getPosition("Z") == 10.0
+    core.isContinuousFocusLocked()
+    assert core.getPosition("Z") == 245.0
+    # Off, or on and not locked, it moves nothing.
+    core.setPosition("Z", 10.0)
+    core.isContinuousFocusLocked()
+    core.autofocus_lockable = False
+    core.enableContinuousFocus(True)
+    for _ in range(4):
+        core.isContinuousFocusLocked()
+    assert core.getPosition("Z") == 10.0
+
+
+def test_the_autofocus_drive_leaves_the_autofocus_on() -> None:
+    # Set on the store: a setPosition would trip the quirk and switch it off.
+    core = _two_autofocus_devices()
+    core.autofocus_target_um = lambda: 245.0
+    core.enableContinuousFocus(True)
+    core.log.clear()
+    assert core.isContinuousFocusLocked() is True
+    assert core.getPosition("Z") == 245.0
+    assert core.isContinuousFocusEnabled() is True
+    assert core.log == []
+
+
 def test_unloading_the_autofocus_empties_its_slot() -> None:
     core = _two_autofocus_devices()
     core.enableContinuousFocus(True)
