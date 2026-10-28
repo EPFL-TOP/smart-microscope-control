@@ -13,8 +13,10 @@ is how to use it.
 - [The run document](#the-run-document)
 - [Testing a plugin](#testing-a-plugin)
 
-A plugin with a page of its own: [`camera-calibration`](camera-calibration.md)
-(how the camera's pixels map to the stage: pixel size, rotation, mirror).
+Plugins with a page of their own: [`camera-calibration`](camera-calibration.md)
+(how the camera's pixels map to the stage: pixel size, rotation, mirror) and
+[`cells`](cells.md) (single cells and doublets on a scan's frames, in stage µm,
+each counted once; needs the `detect` extra and the trained weights).
 
 ## Running a plugin: `smc run`
 
