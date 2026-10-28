@@ -36,8 +36,12 @@ from dataclasses import dataclass
 import numpy as np
 import numpy.typing as npt
 
+from smc.plugins.geometry import Matrix2, footprint
+from smc.plugins.slots import WellGeometry
+
 __all__ = [
     "ChosenField",
+    "allowed",
     "order_route",
     "path_length_um",
 ]
@@ -60,6 +64,42 @@ class ChosenField:
     x_um: float
     y_um: float
     counts: Mapping[str, int]
+
+
+def allowed(
+    x_um: float,
+    y_um: float,
+    well: WellGeometry,
+    *,
+    matrix: Matrix2,
+    image_shape_px: tuple[int, int],
+    exclude_centre_um: float,
+    wall_margin_um: float,
+) -> bool:
+    """Whether a field centred at ``(x_um, y_um)`` keeps to the well's margin and away from its centre.
+
+    The test is on the **footprint**, not on the centre: a camera's frame is a
+    rectangle turned by the camera, and a field whose centre is inside the well
+    can still image the wall. Every corner must be inside the well shrunk by
+    ``wall_margin_um`` (both shapes of well are convex, so the corners are
+    enough), and, when ``exclude_centre_um > 0``, the filled footprint must stay
+    at least that far from the well's centre: the distance from the centre to
+    the polygon, which is 0 when the centre is inside it. Measuring to the
+    corners alone would let a field whose edge crosses the excluded disc pass
+    whenever its corners are far away (the measured mutant that survived).
+
+    ``WellGeometry.contains`` is the only place that knows a well's shape.
+
+    Raises:
+        ValueError: ``wall_margin_um`` is negative or not finite (``contains``'
+            refusal), or the matrix is not finite.
+    """
+    corners = footprint(x_um, y_um, matrix=matrix, image_shape_px=image_shape_px)
+    if not all(well.contains(x, y, margin_um=wall_margin_um) for x, y in corners):
+        return False
+    if exclude_centre_um <= 0.0:
+        return True
+    return _distance_to_polygon(well.center_um, corners) >= exclude_centre_um
 
 
 def order_route(points: Sequence[Point], *, start: int) -> list[int]:
@@ -156,3 +196,30 @@ def _two_opt(coordinates: npt.NDArray[np.float64], order: list[int]) -> None:
                 q[i : j + 1] = q[i : j + 1][::-1].copy()
                 order[i : j + 1] = order[i : j + 1][::-1]
                 changed = True
+
+
+def _distance_to_polygon(point: Point, corners: Sequence[Point]) -> float:
+    """The distance from ``point`` to the filled convex quadrilateral ``corners``; 0 when it is inside.
+
+    A mirrored camera lists the corners of its footprint the other way round, so
+    the inside test accepts all four cross products ``>= 0`` or all ``<= 0``.
+    Outside, it is the smallest distance to the four edges.
+    """
+    edges = [(corners[k], corners[(k + 1) % len(corners)]) for k in range(len(corners))]
+    crosses = [
+        (bx - ax) * (point[1] - ay) - (by - ay) * (point[0] - ax)
+        for (ax, ay), (bx, by) in edges
+    ]
+    if all(c >= 0.0 for c in crosses) or all(c <= 0.0 for c in crosses):
+        return 0.0
+    return min(_distance_to_segment(point, a, b) for a, b in edges)
+
+
+def _distance_to_segment(point: Point, start: Point, end: Point) -> float:
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    length_squared = dx * dx + dy * dy
+    if length_squared == 0.0:
+        return math.dist(point, start)
+    along = ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / length_squared
+    along = max(0.0, min(1.0, along))
+    return math.dist(point, (start[0] + along * dx, start[1] + along * dy))
