@@ -18,8 +18,9 @@ Plugins with a page of their own: [`camera-calibration`](camera-calibration.md)
 [`cells`](cells.md) (single cells and doublets on a scan's frames, in stage µm,
 each counted once; needs the `detect` extra and the trained weights),
 [`scan-plan`](scan-plan.md) (which wells and which fields of each to image, from the
-camera's real field of view) and [`scan`](scan.md) (one TIFF per planned field, with
-the stage's readback and the focus state).
+camera's real field of view), [`scan`](scan.md) (one TIFF per planned field, with
+the stage's readback and the focus state) and [`route`](route.md) (the fields that
+hold the most cells of the wanted classes, then the shortest route through them).
 
 ## Running a plugin: `smc run`
 
