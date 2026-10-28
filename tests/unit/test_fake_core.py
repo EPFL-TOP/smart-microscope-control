@@ -523,6 +523,9 @@ def test_hold_whole_units_truncates_a_stage_and_an_autofocus_offset() -> None:
     core.setAutoFocusOffset(7927.5)
     assert core.getPosition("Off") == 7925.0
     assert core.getAutoFocusOffset() == 7927.0
+    # A float still, as MMCore's reads are: 7925 == 7925.0 would pass an int.
+    assert isinstance(core.getPosition("Off"), float)
+    assert isinstance(core.getAutoFocusOffset(), float)
     # The log keeps what the caller sent: the layer's call, not the device's reading.
     assert core.log == ["setPosition('Off', 7925.75)", "setAutoFocusOffset(7927.5)"]
     # A device that was not asked keeps its fraction.

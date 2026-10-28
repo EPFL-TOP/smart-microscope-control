@@ -145,6 +145,11 @@ def test_offset_jog_above_the_limit_is_refused_and_sends_nothing(
     with pytest.raises(SafetyRefusedError) as refused:
         autofocus.offset_by_native(-2.0)
     assert refused.value.how_to_force == "pass force=True"
+    # A jog just above the limit is refused too, so a guard with slack fails.
+    # Refused, it sends nothing: no fraction reaches a device that holds whole
+    # units.
+    with pytest.raises(SafetyRefusedError):
+        autofocus.offset_by_native(-1.25)
     assert abs(autofocus.offset_native() - (o0 + 1.0)) <= tol
     landed = autofocus.offset_by_native(-2.0, force=True)
     assert abs(landed - (o0 - 1.0)) <= tol
