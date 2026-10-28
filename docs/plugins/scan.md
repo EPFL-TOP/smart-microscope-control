@@ -68,16 +68,19 @@ written, and the message says what to do:
 
 ## During the scan
 
-**At every well**, before its first field, the objective, the frame shape and the
-pixel size are read again. A turret turned by hand, a binning changed or the lever
-moved (a pixel size more than 1 % from the one at the start) ends the scan; the
-checkpoint keeps the wells done, so set it back and `--resume`.
+**At both ends of every well**, before its first field and after its last, the
+objective, the frame shape and the pixel size are read again. A turret turned by
+hand, a binning changed or the lever moved (a pixel size more than 1 % from the one at
+the start) ends the scan. A well is marked done only when the stand was the same at
+both ends, so a change in the middle of a well never leaves frames of another scale in
+the checkpoint: set it back and `--resume`, and that well is scanned again.
 
 **At every field**: a stop asked for is honoured, the stage moves, and then (not in a
 dry run) the autofocus is checked when it is used: if it lost its lock, it is engaged
 once (`assumed` counts these), the focus drive's Z and the autofocus offset are read,
-and the frame is taken and written whole. A frame whose shape is not the plan's ends
-the scan and is not written.
+and the frame is taken and written whole. **An autofocus you switch off during the
+scan stays off**: its fields are recorded `unlocked`, and `max_unlocked_in_row` of them
+end the scan. A frame whose shape is not the plan's ends the scan and is not written.
 
 **A field that fails** (the stage refuses the target or does not answer, the camera
 times out) is recorded in `failed` with its **target** and one line of the error, and
@@ -98,8 +101,14 @@ The checkpoint is saved after each well. `--resume` continues with the same fold
 that was interrupted is scanned whole again and its files are rewritten. A resume is
 refused when the plan was made again since (`scan read its inputs from an earlier run,
 so its checkpoint no longer matches them; run it without --resume`), or when a frame
-of the checkpoint is missing. Every count (failures, unlocked fields in a row) starts
-at 0 in each attempt.
+of the checkpoint is missing. A run folder that cannot be read at that moment (a
+network share that dropped) is not a missing frame: the message says so and `--resume`
+stays the way on. Every count (failures, unlocked fields in a row) starts at 0 in each
+attempt.
+
+**Close any viewer that has the interrupted well's frames open** (Fiji, Explorer's
+preview pane) before `--resume`: those files are rewritten, and Windows refuses to
+replace a file another program holds open, which ends the scan at that field.
 
 ## Dry run
 
@@ -137,4 +146,6 @@ Nothing in this page was measured on a microscope. For the first hardware sessio
 field at 40×, after which Z may not yet have arrived when the frame is taken (#205,
 which blocks scanning at 40× until it is decided); a move that timed out on a stand
 that refuses `stop()` (m2 §11, the next moves are refused and end the scan through
-`max_failed_in_row`); the write speed and the antivirus on the microscope PC.
+`max_failed_in_row`); the write speed and the antivirus on the microscope PC; a run
+folder deep enough that a frame's path passes Windows' 260 characters on a PC without
+long paths enabled (not checked before the first move: keep run folders short).
