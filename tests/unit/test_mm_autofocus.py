@@ -3822,6 +3822,9 @@ def _use_the_stand(core: FakeCore, microscope: Microscope) -> None:
     autofocus.engage()  # direct: linked to the Z stop, locks at once
     autofocus.set_offset_native(7798.0)  # PFS on: linked too
     autofocus.offset_by_native(1.0, force=True)
+    # m2 §12: on a declared stand the lock read makes this offset a seen one,
+    # so that the engage below runs the check, the band and the window.
+    autofocus.is_locked()
     autofocus.disengage()
     z.move_to_um(0.0)  # PFS off: a plain move
     # m2 §8: the turret looks the autofocus up through the facade, Channels
@@ -3858,7 +3861,17 @@ def test_a_dropped_facade_frees_its_core_without_the_cyclic_collector(
     # until the cyclic collector, which at the exit of `smc doctor` runs during
     # interpreter finalization: the child aborted there.
     core = _with_lamp_and_channel(_at_offset(7800.0, extra=_DIA_LAMP))
-    microscope = Microscope.from_core(cast("CMMCorePlus", core), _factor({"4x": -3.0}))
+    # A declared stand with a settle window and a band (m2 §12): every engage
+    # runs the seen-offset check and the Z guard.
+    profile = _profile(
+        autofocus={
+            "offset_per_um": {"4x": -3.0},
+            "engage_drives_z_to_offset": True,
+            "settle_s": 0.05,
+        },
+        safety={"max_autofocus_offset_jog": 10.0, "max_engage_excursion_um": 50.0},
+    )
+    microscope = Microscope.from_core(cast("CMMCorePlus", core), profile)
     _use_the_stand(core, microscope)
     if closed:
         microscope.close()

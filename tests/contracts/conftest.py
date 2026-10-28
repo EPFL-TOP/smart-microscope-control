@@ -290,8 +290,15 @@ def properties(microscope: Microscope, backend: str) -> Properties:
 
 @pytest.fixture
 def autofocus(microscope: Microscope, backend: str) -> Autofocus:
-    """The live autofocus."""
-    return _capability(microscope, backend, Autofocus)
+    """The live autofocus, its lock read once.
+
+    On a stand that declares ``engage_drives_z_to_offset``, the layer engages
+    only at an offset it has seen locked (m2 §12.2 D1): the read makes the
+    operator's lock, taken at the stand before the run, a seen one.
+    """
+    autofocus = _capability(microscope, backend, Autofocus)
+    autofocus.is_locked()
+    return autofocus
 
 
 @pytest.fixture
