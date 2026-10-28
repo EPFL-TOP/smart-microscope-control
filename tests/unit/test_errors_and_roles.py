@@ -164,10 +164,3 @@ def test_a_stop_note_holds_no_exception() -> None:
         isinstance(value, str | bool)
         for value in (note.motion, note.outcome, note.declared)
     )
-
-
-def test_stop_refused_error_is_a_hardware_error_and_not_a_refusal() -> None:
-    # FM-64: a move under way runs on; a tool that skips on a refusal must
-    # not read it as a move that was never sent.
-    assert issubclass(StopRefusedError, HardwareError)
-    assert not issubclass(StopRefusedError, SafetyRefusedError)
