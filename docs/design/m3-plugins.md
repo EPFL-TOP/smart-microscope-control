@@ -2044,6 +2044,71 @@ walked, no frame taken`.
 The scan never moves Z, never turns the turret, never engages an
 autofocus the operator left off, and returns to no start position.
 
+**Refined while planning #213** (measured on the demo, 2026-10-28):
+
+- **The plan's pixel size against the camera's**, before anything moves,
+  after check 2 (FM-103). `p0` must be finite and positive to compare; when
+  it is not, neither this check nor the per-well one runs, and `assumed`
+  gains `the camera reports no pixel size: the plan's size and a change
+  during the scan were not checked`. By `matrix_source`: `profile`, more
+  than 1 % apart is a `PluginRunError` (the plan was made for an objective
+  that was not in place, at binning 1, §7.3, or the binning or the
+  magnification lever changed since); `camera-calibration`, more than 10 %
+  apart (a calibration differs from the camera's report by its own
+  correction, which camera-calibration warns about at 2 %; binning is 2×,
+  the lever 1.5×); `parameter`, not compared, and `assumed` gains `the
+  plan's pixel size was given as a parameter: not compared with the
+  camera's`. Each refusal names both sizes and says to run scan-plan
+  (and, for a calibration, camera-calibration) again with the stand as it
+  is now.
+- **The autofocus is used only when it is engaged and locked** before
+  anything moves (#205: engaging drives Z to the stored offset's plane, so
+  only a lock on this sample proves the offset is the operator's for it).
+  `required` refuses an autofocus that is missing, off or not locked;
+  `if-engaged` refuses one that is on and not locked ("lock it on the
+  sample, or switch it off and run with autofocus=off"); `off` reads
+  nothing from it. A failed `engage()` leaves it off (the protocol); the
+  next unlocked field engages it again, which is the scan's own state, not
+  one the operator left. The scan adds no Z guard of its own around
+  `engage()`: safety guards live in the layer, and that guard is #205's.
+- **Paths are checked before anything moves.** Every frame's path is the
+  text `scan/<token>/<well>/<name>.tif`; `well` and `name` must match
+  `[A-Za-z0-9_-]+`, no two fields may share a path, and each text goes
+  through `resolve_in_run`; a failure is a `PluginRunError`. The
+  checkpoint's `token` is constrained to `^[0-9a-f]{12}$` (`new_token()`),
+  so a run document from elsewhere cannot point a write outside the run
+  folder: `ctx.checkpoint` then raises `ResumeError`.
+- **A resume** is a `PluginRunError` when `wells_done` names a well the
+  plan does not hold, or a frame of the checkpoint has no file (a folder
+  cleaned between attempts). A well partly done when the scan stopped is
+  scanned again whole, its files rewritten.
+- **The disk**: the itemsize is `camera.bit_depth()`'s, 1 byte up to 8
+  bits, 2 up to 16, else 4 (the frame is not snapped to learn it); the
+  need is `ceil(1.1 × fields left × H × W × itemsize)` and `free` must
+  exceed it.
+- **Per well**, `camera.image_shape()` is read with the objective and the
+  pixel size. **Per field**, a frame whose shape is not the plan's ends
+  the scan with a `PluginRunError` and is not written: every later frame
+  would be wrong too.
+- **Counts in a row** span wells and restart at 0 on a resume.
+  `max_failed_in_row` counts failed fields, reset by a frame written;
+  `max_unlocked_in_row` counts unlocked fields, reset by a locked one, and
+  the field that reaches it raises before its snap. Reads per well that
+  fail (`HardwareError`) are not a field's: they end the scan.
+- **A move that timed out** on a stand that refuses `stop()` (m2 §11) is a
+  failed field. The stage may still be running to its target; the layer's
+  motion guard refuses the next moves while it is (`MotionInProgressError`,
+  a failed field too), so such a stage fails the scan through
+  `max_failed_in_row`. The scan never waits a motion out.
+- **The dry run** runs the checks before anything moves, the disk's
+  included, and walks the moves; it never snaps (`SampleCamera` ignores the
+  dry run, measured) and never calls `engage()`. The demo's dry-run move
+  returns its target and leaves the stage where it is (measured).
+- A frame's TIFF carries `ScanFrame.model_dump(mode="json")` as
+  `tifffile`'s JSON metadata, written into a `BytesIO` (measured with
+  tifffile 2024.1.30 on Python 3.10 and 2026.9.20 on 3.13). `assumed`
+  gains `the autofocus was engaged again on <n> fields` when `n > 0`.
+
 **Tests** (demo with `SampleCamera` unless said): `test_a_scan_writes_one_tiff_per_field_and_records_the_readback`;
 `test_the_wrong_objective_is_refused_before_anything_moves` (fake turret,
 empty move log); `test_a_turret_turned_mid_scan_stops_at_the_next_well`;
