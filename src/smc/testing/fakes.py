@@ -36,6 +36,10 @@ pymmcore 12.5.0.75.0), unless labelled *assumed*:
   ``Error (code 43)``. Enabled reads locked at once, as on the demo
   (assumed: a real lock takes time), unless ``autofocus_lockable`` is
   ``False``.
+* **A device can hold whole units** (``hold_whole_units``; the Ti2-E's
+  ``PFSOffset``, session 1, #207): a position or offset it is sent reads back
+  truncated towards zero. The demo's hold floats, so only a device a test
+  asks for does (FM-119).
 * **Config groups** (measured on the demo 2026-10-19, m2 §8.1). Groups and
   presets list sorted. ``defineConfig`` *merges*: it changes or adds one
   setting and keeps the others, creates a missing group, and accepts a
@@ -50,6 +54,7 @@ pymmcore 12.5.0.75.0), unless labelled *assumed*:
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
@@ -156,6 +161,11 @@ class FakeCore:
       switch-on from off (run 1: locked read True, then Z jumped).
     * ``config_groups``: group -> preset -> its settings, which the
       config-group calls read and write; a test may fill it directly.
+
+    Knobs a test sets through a method, because it validates the label:
+
+    * ``hold_whole_units(label)``: a ``Stage`` or ``AutoFocus`` device that
+      reads back what it is sent truncated to a whole number (FM-119).
     """
 
     def __init__(
@@ -192,6 +202,8 @@ class FakeCore:
         self._locked_reads = 0
         self.config_groups: dict[str, dict[str, Settings]] = {}
         self._channel_group = ""
+        #: Labels of the devices that hold whole units (``hold_whole_units``).
+        self._whole_units: set[str] = set()
 
         self._devices: dict[str, FakeDevice] = {}
         for device in devices:
@@ -378,10 +390,42 @@ class FakeCore:
         core._channel_group = "Channel"
         return core
 
+    def hold_whole_units(self, label: str) -> None:
+        """Make ``label`` hold whole units, as the Ti2-E's ``PFSOffset`` does.
+
+        Session 1 read 7927.5 back as 7927 and saw 7925.75 land on 7925
+        (#207): a contract that moved the offset by halves failed on the stand
+        although the layer behaved, and the demo's float offset could not show
+        it. A ``setPosition(label, v)`` or, for the AutoFocus slot's device, a
+        ``setAutoFocusOffset(v)`` now stores ``v`` truncated towards zero. That
+        is measured above zero only, and whether the device truncates or
+        rounds is unsettled (7927.5 fits both), so there is one mode. ``log``
+        keeps ``v`` as sent, and a value that is not finite is stored as given.
+
+        Raises:
+            ValueError: ``label`` names no loaded ``Stage`` or ``AutoFocus``
+                device. A misspelled label would otherwise change nothing and
+                build a stand that holds fractions, with every test passing
+                (FM-119).
+        """
+        device = self._devices.get(label)
+        if device is None or device.type not in (
+            DeviceType.Stage,
+            DeviceType.AutoFocus,
+        ):
+            raise ValueError(f"{label!r} names no loaded Stage or AutoFocus device")
+        self._whole_units.add(label)
+
     # --- helpers -------------------------------------------------------------
 
     def _record(self, name: str, *args: object) -> None:
         self.log.append(f"{name}({', '.join(map(repr, args))})")
+
+    def _held(self, label: str, value: float) -> float:
+        """What device ``label`` stores of ``value``: whole units if it holds them."""
+        if label in self._whole_units and math.isfinite(value):
+            return float(math.trunc(value))
+        return value
 
     def _device(self, label: str) -> FakeDevice:
         """The device ``label`` names, after raising its ``failing`` entry, if any."""
@@ -522,7 +566,7 @@ class FakeCore:
         """Move a stage at once; on the focus device, the Nikon quirk may apply (FM-12)."""
         self._record("setPosition", label, z_um)
         self._typed(label, DeviceType.Stage)
-        self._z[label] = float(z_um)
+        self._z[label] = self._held(label, float(z_um))
         autofocus = self._slots["autofocus"]
         if (
             self.quirk_z_move_disables_autofocus
@@ -807,7 +851,7 @@ class FakeCore:
         label = self._autofocus()
         if not label:
             raise RuntimeError(_NO_AUTOFOCUS_OFFSET)
-        self._af_offset[label] = float(offset)
+        self._af_offset[label] = self._held(label, float(offset))
 
     # --- config groups -------------------------------------------------------
 
@@ -930,6 +974,7 @@ class FakeCore:
         self._open.pop(label, None)
         self._continuous.pop(label, None)
         self._af_offset.pop(label, None)
+        self._whole_units.discard(label)
         for slot, named in self._slots.items():
             if named == label:
                 self._slots[slot] = ""
