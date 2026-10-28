@@ -15,10 +15,10 @@ from contextlib import contextmanager
 from typing import cast
 
 import pytest
-from pymmcore_plus import CMMCorePlus
+from pymmcore_plus import CMMCorePlus, DeviceType
 
 from smc.hardware import Microscope
-from smc.hardware.capabilities import XYStage
+from smc.hardware.capabilities import Autofocus, XYStage
 from smc.hardware.errors import (
     HardwareError,
     MotionStoppedError,
@@ -28,9 +28,14 @@ from smc.hardware.errors import (
     StopRefusedError,
     stop_notes,
 )
-from smc.hardware.profile import Profile
+from smc.hardware.profile import (
+    MicroscopeSection,
+    Profile,
+    RolesSection,
+    SafetySection,
+)
 from smc.hardware.roles import Role
-from smc.testing import FakeCore
+from smc.testing import FakeCore, FakeDevice
 
 LOGGER = "smc.hardware.microscope"
 
@@ -391,6 +396,80 @@ def test_close_on_a_declared_stand_says_the_move_runs_to_its_target(
         "close: xy_stage XY still moving; stopped: autofocus Autofocus off; "
         "refused, as the profile declares ([safety] stop_refused_by), so a move "
         "under way runs to its target: xy_stage XY, z Z"
+    )
+
+
+def _ti2_stand() -> tuple[FakeCore, Microscope]:
+    """The Ti2-E's layout, refusing every stop as measured (#208), and declaring it."""
+    core = FakeCore(
+        [
+            FakeDevice("ZDrive", DeviceType.Stage),
+            FakeDevice("PFS", DeviceType.AutoFocus),
+            FakeDevice("PFSOffset", DeviceType.Stage),
+            FakeDevice("XYStage", DeviceType.XYStage),
+        ],
+        xy_stage="XYStage",
+        focus="ZDrive",
+        autofocus="PFS",
+    )
+    core.stop_refused = {"XYStage", "ZDrive", "PFSOffset"}
+    profile = Profile(
+        microscope=MicroscopeSection(name="ti2e-fake"),
+        roles=RolesSection.model_validate(
+            {"assign": {"autofocus": "PFS", "autofocus_offset": "PFSOffset"}}
+        ),
+        safety=SafetySection.model_validate(
+            {"stop_refused_by": ["xy_stage", "focus", "autofocus_offset"]}
+        ),
+    )
+    microscope = Microscope.from_core(cast("CMMCorePlus", core), profile)
+    core.log.clear()
+    return core, microscope
+
+
+def test_the_emergency_stop_on_the_ti2_names_the_pfs_offset_too() -> None:
+    # The offset device is stopped by its role, with the profile's declaration.
+    core, microscope = _ti2_stand()
+    try:
+        with pytest.raises(StopRefusedError) as refused:
+            microscope.stop()
+        assert core.log == [
+            "enableContinuousFocus(False)",
+            "stop('PFSOffset')",
+            "stop('XYStage')",
+            "stop('ZDrive')",
+        ]
+    finally:
+        microscope.close()
+    assert refused.value.refused == (
+        "autofocus_offset PFSOffset",
+        "xy_stage XYStage",
+        "z ZDrive",
+    )
+    assert str(refused.value).startswith(
+        "the emergency stop halted the microscope and switched autofocus PFS off, "
+        "but autofocus_offset PFSOffset, xy_stage XYStage and z ZDrive refused the "
+        "stop, as the profile declares"
+    )
+
+
+def test_ctrl_c_during_an_offset_move_on_the_ti2_notes_the_declared_refusal() -> None:
+    # The autofocus waits for its offset device's move with the same Motion
+    # the emergency stop builds, declaration included (m2 §11.4).
+    core, microscope = _ti2_stand()
+    try:
+        core.busy_devices = {"PFSOffset"}
+        undo = _interrupt_the_first_busy_poll(core)
+        try:
+            with pytest.raises(KeyboardInterrupt) as interrupted:
+                microscope.require(Autofocus).set_offset_native(10.0)
+        finally:
+            undo()
+        assert "stop('PFSOffset')" in core.log
+    finally:
+        microscope.close()
+    assert stop_notes(interrupted.value) == (
+        StopNote("autofocus_offset PFSOffset", StopOutcome.refused, True),
     )
 
 

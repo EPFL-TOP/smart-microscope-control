@@ -799,9 +799,9 @@ def test_the_ctrl_c_line_says_what_the_stop_did(
     assert capsys.readouterr().out.splitlines() == [f"✗ {line}"]
 
 
-def _declaring(tmp_path: Path, roles: str) -> Path:
+def _declaring(tmp_path: Path, roles: str, name: str = "declared") -> Path:
     """The demo devices, with ``[safety] stop_refused_by = <roles>``."""
-    path = tmp_path / "declared.toml"
+    path = tmp_path / f"{name}.toml"
     path.write_text(
         f'[microscope]\nname = "declared"\n\n[safety]\nstop_refused_by = {roles}\n',
         encoding="utf-8",
@@ -821,17 +821,20 @@ _XY_DECLARED_LINE = (
 def test_a_move_on_a_declared_axis_prints_that_ctrl_c_will_not_stop_it(
     tmp_path: Path,
 ) -> None:
-    profile = str(_declaring(tmp_path, '["xy_stage"]'))
+    # Both axes declared: an XY move names the XY stage only.
+    both = str(_declaring(tmp_path, '["xy_stage", "focus"]', "both"))
     for args in (["stage", "move", "10", "0"], ["stage", "jog", "5", "0"]):
-        result = runner.invoke(app, [*args, "-p", profile])
+        result = runner.invoke(app, [*args, "-p", both])
         assert result.exit_code == 0, result.output
         lines = result.output.splitlines()
         # Once, before the position the move landed at.
         assert lines.count(_XY_DECLARED_LINE) == 1, result.output
         assert lines.index(_XY_DECLARED_LINE) < len(lines) - 1
         assert lines[-1].startswith("XY (")
+        assert "focus" not in result.output
     # Z is not declared on this stand: its moves say nothing.
-    result = runner.invoke(app, ["z", "jog", "1", "-p", profile])
+    xy_only = str(_declaring(tmp_path, '["xy_stage"]', "xy-only"))
+    result = runner.invoke(app, ["z", "jog", "1", "-p", xy_only])
     assert result.exit_code == 0, result.output
     assert "! the profile declares" not in result.output
 
