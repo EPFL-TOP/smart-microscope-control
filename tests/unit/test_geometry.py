@@ -9,6 +9,7 @@ on purpose (FM-73): a swapped ``(height, width)`` is invisible on a square one.
 from __future__ import annotations
 
 import math
+import random
 import re
 
 import numpy as np
@@ -380,6 +381,168 @@ def test_pitch_and_size_of_a_plate_that_is_not_square_follow_useq() -> None:
     assert geometry.size_um == pytest.approx((6000.0, 2000.0))
     assert geometry.circular is False
     assert geometry.rotation_deg == 20.0
+
+
+def _wells_for_the_twin(rng: random.Random) -> list[WellGeometry]:
+    """400 wells, round and rectangular, anisotropic ones included, at any rotation.
+
+    A quarter of them sit at rotation exactly 0.0, where ``center + (half, 0)``
+    and ``center + (0, half)`` are on the boundary to the last bit.
+    """
+    wells = []
+    for _ in range(400):
+        circular = rng.random() < 0.5
+        width = rng.uniform(500.0, 8000.0)
+        height = width if circular else rng.uniform(300.0, 8000.0)
+        wells.append(
+            WellGeometry(
+                well="A1",
+                center_um=(rng.uniform(-5e4, 5e4), rng.uniform(-5e4, 5e4)),
+                size_um=(width, height),
+                circular=circular,
+                rotation_deg=0.0 if rng.random() < 0.25 else rng.uniform(-180.0, 180.0),
+            )
+        )
+    return wells
+
+
+@pytest.mark.filterwarnings("error::RuntimeWarning")
+def test_contains_many_agrees_with_contains_on_every_point() -> None:
+    """The vectorised twin says what the scalar says, on the edge and on a point that is not finite (FM-132).
+
+    numpy warns ``overflow`` and ``invalid value`` where Python's floats go to
+    ``inf`` silently, so the points at 1e200 and the infinities are in the set.
+    """
+    rng = random.Random(20261028)
+    far = [
+        (1e200, 1e200),
+        (-1e200, 3.0),
+        (math.nan, 1.0),
+        (1.0, math.inf),
+        (-math.inf, math.inf),
+    ]
+    checked = 0
+    for well in _wells_for_the_twin(rng):
+        for margin in (
+            0.0,
+            10.0,
+            300.0,
+            well.size_um[1]
+            / 2.0,  # a rectangle's half-height: nothing left on that axis
+            well.size_um[0] / 2.0,
+            well.size_um[0],
+        ):
+            points = [
+                (
+                    well.center_um[0] + rng.uniform(-6000.0, 6000.0),
+                    well.center_um[1] + rng.uniform(-6000.0, 6000.0),
+                )
+                for _ in range(60)
+            ]
+            half_u, half_v = well.size_um[0] / 2.0, well.size_um[1] / 2.0
+            # On the edge, on each plate axis: the wall of a rectangle, the rim of a disc.
+            points += [
+                _at(well, half_u - margin, 0.0),
+                _at(well, 0.0, (half_u if well.circular else half_v) - margin),
+                _at(well, -(half_u - margin), 0.0),
+            ]
+            points += far
+            xs = np.array([p[0] for p in points], dtype=np.float64)
+            ys = np.array([p[1] for p in points], dtype=np.float64)
+            twin = well.contains_many(xs, ys, margin_um=margin)
+            assert twin.dtype == np.bool_
+            assert twin.tolist() == [
+                well.contains(x, y, margin_um=margin) for x, y in points
+            ]
+            checked += len(points)
+    assert checked > 100_000
+
+
+def test_contains_many_counts_the_edge_of_an_unrotated_well_inside() -> None:
+    """At rotation exactly 0.0 the wall is on the boundary to the last bit: ``<=`` made ``<`` drops it."""
+    rectangle = WellGeometry("A1", (100.0, 200.0), (3000.0, 2000.0), False, 0.0)
+    disc = WellGeometry("A1", (100.0, 200.0), (3000.0, 3000.0), True, 0.0)
+    edge_x = np.array([1600.0, 100.0, -1400.0, 1600.0001], dtype=np.float64)
+    edge_y = np.array([200.0, 1200.0, 200.0, 200.0], dtype=np.float64)
+
+    assert rectangle.contains_many(edge_x, edge_y).tolist() == [True, True, True, False]
+    assert disc.contains_many(edge_x, np.full(4, 200.0)).tolist() == [
+        True,
+        True,
+        True,
+        False,
+    ]
+    assert disc.contains_many(
+        np.array([100.0, 100.0]), np.array([1700.0, 1700.0001])
+    ).tolist() == [True, False]
+
+
+def test_contains_many_reads_the_height_of_a_wide_flat_well_from_its_second_size() -> (
+    None
+):
+    """Anisotropic and turned (FM-73): 2900 along the long side is inside, 1100 along the short one is not."""
+    well = WellGeometry("A1", (0.0, 0.0), (6000.0, 2000.0), False, 30.0)
+    points = [
+        _at(well, 2900.0, 900.0),
+        _at(well, 2900.0, 1100.0),
+        _at(well, 3100.0, 0.0),
+        _at(well, 900.0, 2900.0),
+    ]
+    xs = np.array([p[0] for p in points])
+    ys = np.array([p[1] for p in points])
+
+    assert well.contains_many(xs, ys).tolist() == [True, False, False, False]
+    # The plate's turn has a sign: the same offsets turned the other way are elsewhere.
+    mirrored = WellGeometry("A1", (0.0, 0.0), (6000.0, 2000.0), False, -30.0)
+    assert mirrored.contains_many(xs, ys).tolist() == [
+        mirrored.contains(x, y) for x, y in points
+    ]
+    assert mirrored.contains_many(xs, ys).tolist() != [True, False, False, False]
+
+
+def test_contains_many_broadcasts_a_row_against_a_column() -> None:
+    well = well_geometry(_plan("384-well", 17.0), "C4")
+    row = np.array(
+        [well.center_um[0] + d for d in (-1900.0, -500.0, 0.0, 800.0, 2000.0)]
+    )
+    column = np.array([well.center_um[1] + d for d in (-1500.0, 0.0, 1600.0)])
+
+    grid = well.contains_many(row[None, :], column[:, None])
+
+    assert grid.shape == (3, 5)
+    assert grid.tolist() == [
+        [well.contains(float(x), float(y)) for x in row] for y in column
+    ]
+    # Each axis alone broadcasts against a scalar-shaped array.
+    assert well.contains_many(row, np.float64(well.center_um[1])).shape == (5,)
+    # A margin that leaves nothing answers in the same shape, all False (not x's).
+    nothing = well.contains_many(row[None, :], column[:, None], margin_um=2000.0)
+    assert nothing.shape == (3, 5)
+    assert not nothing.any()
+
+
+def test_a_margin_of_half_the_height_leaves_a_rectangle_nothing_even_on_its_centre_line() -> (
+    None
+):
+    """2000 x 1000 µm with a margin of 500: the height is used up while the width is not, and the centre is outside."""
+    well = WellGeometry("A1", (0.0, 0.0), (2000.0, 1000.0), False, 0.0)
+    centre = np.array([0.0])
+
+    assert well.contains(0.0, 0.0, margin_um=500.0) is False
+    assert well.contains_many(centre, centre, margin_um=500.0).tolist() == [False]
+    assert well.contains_many(centre, centre, margin_um=499.0).tolist() == [True]
+
+
+@pytest.mark.parametrize("bad", [-1.0, math.nan, math.inf])
+def test_contains_many_refuses_a_margin_that_is_not_a_distance(bad: float) -> None:
+    geometry = well_geometry(_plan("96-well"), "A1")
+    message = f"margin_um must be finite and not negative, got {bad!r}"
+    with pytest.raises(ValueError, match=_exactly(message)):
+        geometry.contains_many(
+            np.array([geometry.center_um[0]]),
+            np.array([geometry.center_um[1]]),
+            margin_um=bad,
+        )
 
 
 def test_a_wide_flat_well_is_a_rectangle_not_a_square() -> None:
