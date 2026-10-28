@@ -213,6 +213,7 @@ class Microscope:
             max_autofocus_offset_jog=safety.max_autofocus_offset_jog,
             autofocus_offset_soft_limits=safety.autofocus_offset_soft_limits,
             offset_unit=profile.autofocus.offset_unit,
+            stop_refused_by=frozenset(role.value for role in safety.stop_refused_by),
         )
         self._lock = threading.RLock()
         # FM-15: waiting for the lock is bounded like a device call.
@@ -816,7 +817,13 @@ class Microscope:
         if capability is None:
             label = self.roles.get(role)
             if label is not None:
-                self._executor.stop(autofocus_offset_motion(self.core, label))
+                self._executor.stop(
+                    autofocus_offset_motion(
+                        self.core,
+                        label,
+                        stop_refused=role.value in self._safety.stop_refused_by,
+                    )
+                )
             return
         found = self._lookup(capability)
         if found is None:

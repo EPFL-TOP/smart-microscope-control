@@ -195,7 +195,14 @@ def as_hardware_errors(core: CMMCorePlus, role: str) -> CMMCorePlus:
     return cast("CMMCorePlus", _FaultTranslator(core, role))
 
 
-def _motion(core: CMMCorePlus, label: str, name: str, *, stoppable: bool) -> Motion:
+def _motion(
+    core: CMMCorePlus,
+    label: str,
+    name: str,
+    *,
+    stoppable: bool,
+    stop_refused: bool = False,
+) -> Motion:
     def stop() -> None:
         core.stop(label)
 
@@ -204,20 +211,28 @@ def _motion(core: CMMCorePlus, label: str, name: str, *, stoppable: bool) -> Mot
         name=name,
         is_busy=lambda: bool(core.deviceBusy(label)),
         stop=stop if stoppable else None,
+        stop_refused=stop_refused,
     )
 
 
-def autofocus_offset_motion(core: CMMCorePlus, label: str) -> Motion:
+def autofocus_offset_motion(
+    core: CMMCorePlus, label: str, *, stop_refused: bool = False
+) -> Motion:
     """The ``autofocus_offset`` device's move, as the ``Executor`` sees it (m2 §3.6).
 
     One definition for ``MMAutofocus``, which waits for it, and for the
     emergency stop, which stops that device by its role (m2 §3.11): the same
     key, so that the stop cancels the move under way, and the same name in
-    the lines.
+    the lines. Both pass the profile's declaration (``stop_refused``, m2
+    §11.4), so both build the same ``Motion``.
     """
     role = Role.autofocus_offset.value
     return _motion(
-        as_hardware_errors(core, role), label, f"{role} {label}", stoppable=True
+        as_hardware_errors(core, role),
+        label,
+        f"{role} {label}",
+        stoppable=True,
+        stop_refused=stop_refused,
     )
 
 
@@ -238,7 +253,13 @@ class MMXYStage:
         self._safety = safety
         # From the proxied core: a busy poll or a stop that faults is a
         # HardwareError too, and the Executor treats it as a failed wait (FM-19).
-        self._motion = _motion(self._core, label, f"xy_stage {label}", stoppable=True)
+        self._motion = _motion(
+            self._core,
+            label,
+            f"xy_stage {label}",
+            stoppable=True,
+            stop_refused=Role.xy_stage.value in safety.stop_refused_by,
+        )
 
     def _read_position(self) -> XY:
         return XY(
@@ -365,7 +386,13 @@ class MMZStage:
         self._label = label
         self._executor = executor
         self._safety = safety
-        self._motion = _motion(self._core, label, f"z {label}", stoppable=True)
+        self._motion = _motion(
+            self._core,
+            label,
+            f"z {label}",
+            stoppable=True,
+            stop_refused=Role.focus.value in safety.stop_refused_by,
+        )
         self._autofocus = autofocus
 
     def _read_position(self) -> float:
@@ -901,7 +928,11 @@ class MMAutofocus:
         offset_motion = (
             None
             if offset_label is None
-            else autofocus_offset_motion(core, offset_label)
+            else autofocus_offset_motion(
+                core,
+                offset_label,
+                stop_refused=Role.autofocus_offset.value in safety.stop_refused_by,
+            )
         )
         core = self._core = as_hardware_errors(core, Role.autofocus.value)
         self._label = label

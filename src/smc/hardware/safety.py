@@ -106,7 +106,11 @@ class Safety:
         max_autofocus_offset_jog: float | None = None,
         autofocus_offset_soft_limits: tuple[float, float] | None = None,
         offset_unit: str = "",
+        stop_refused_by: frozenset[str] = frozenset(),
     ) -> None:
+        #: The roles' values whose device refuses ``stop()`` (``"xy_stage"``):
+        #: the backends set ``Motion.stop_refused`` from it (m2 §11.3).
+        self.stop_refused_by = frozenset(stop_refused_by)
         if not math.isfinite(max_jog_um) or max_jog_um < 0:
             raise ValueError(f"max_jog_um must be finite and >= 0, got {max_jog_um!r}")
         self.max_jog_um = float(max_jog_um)
@@ -320,6 +324,8 @@ class Motion:
     name: str  # for messages: "xy_stage XY", "z Z", "Dichroic"
     is_busy: Callable[[], bool]
     stop: Callable[[], None] | None  # None: cannot be stopped (a State device)
+    # The profile declares that the device refuses stop() (m2 §11).
+    stop_refused: bool = False
 
 
 @dataclass(frozen=True)
