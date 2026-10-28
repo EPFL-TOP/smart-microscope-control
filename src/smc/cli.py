@@ -20,7 +20,7 @@ import shutil
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,9 +42,19 @@ from smc.hardware.errors import (
     HardwareError,
     ProfileError,
     SafetyRefusedError,
+    StopNote,
+    StopOutcome,
+    join_names,
+    stop_notes,
 )
 from smc.hardware.microscope import Microscope, MicroscopeState
-from smc.hardware.profile import DEMO_NAME, Profile, list_profiles, search_paths
+from smc.hardware.profile import (
+    DEMO_NAME,
+    ROLES_WITH_A_STOP,
+    Profile,
+    list_profiles,
+    search_paths,
+)
 from smc.hardware.roles import Role
 from smc.plugins import (
     ParamsError,
@@ -209,8 +219,9 @@ class _Reported:
 
     Wrapped around the ``with Microscope.open(...)`` block, so the stand is
     released before the line is printed. Ctrl-C is the ``KeyboardInterrupt``
-    the Executor already turned into a stop of any move under way (FM-17);
-    there is no signal handler (FM-70).
+    on which the Executor sent a stop to any move under way (FM-17) and noted
+    what that stop did, which the line says (m2 §11.6); there is no signal
+    handler (FM-70).
 
     A class, not a ``@contextmanager`` generator: a generator that converts an
     exception into another keeps the command's frames, and the stand with
@@ -275,10 +286,7 @@ def _report(exc: BaseException, force_hint: str) -> int:
         _fail(str(exc))
         return _EXIT_ERROR
     if isinstance(exc, KeyboardInterrupt):
-        _fail(
-            "interrupted — any move under way was stopped; read the position "
-            "(smc stage get, smc z get) before the next move"
-        )
+        _fail(_interrupted_line(stop_notes(exc)))
         return _EXIT_INTERRUPTED
     # Plugin errors (m3 §1.9): a refusal the operator fixes with a command exits 2,
     # a plugin that does not load, a stand that lacks a capability and a run
@@ -294,6 +302,71 @@ def _report(exc: BaseException, force_hint: str) -> int:
         "for the traceback, and file an issue"
     )
     return _EXIT_ERROR
+
+
+def _interrupted_line(notes: Sequence[StopNote]) -> str:
+    """The Ctrl-C line: what each stop the interrupt caused did (m2 §11.6, #206).
+
+    It said "any move under way was stopped" whatever the stop did, and on
+    the Ti2-E, which refuses every stop, the stage went the full 20000 µm
+    (#208, FM-117). The layer sends a move only inside the ``Executor``'s
+    ``_move``, and every Ctrl-C there leaves a note, so no note means that no
+    move was under way.
+    """
+    read = "read the position (smc stage get, smc z get) before the next move"
+    if not notes:
+        return f"interrupted — no move was under way; {read}"
+    clauses = "; ".join(_note_clause(note) for note in notes)
+    if any(note.outcome is not StopOutcome.accepted for note in notes):
+        read = f"let it finish or stop it with the stand's own controls, then {read}"
+    return f"interrupted — {clauses}; {read}"
+
+
+def _note_clause(note: StopNote) -> str:
+    """One stop of the Ctrl-C line, in the words of m2 §11.6."""
+    name = note.motion
+    if note.outcome is StopOutcome.accepted:
+        return f"{name} was stopped"
+    if note.outcome is StopOutcome.refused:
+        if note.declared:
+            return (
+                f"{name} refuses a stop on this stand ([safety] stop_refused_by), "
+                f"so it runs to its target"
+            )
+        return f"{name} refused the stop, so it may still be moving"
+    if note.outcome is StopOutcome.impossible:
+        return f"{name} cannot be stopped from smc, so it may still be moving"
+    return f"the stop of {name} was cut by a second Ctrl-C, so it may still be moving"
+
+
+def _stop_refused_line(roles: Iterable[Role]) -> str | None:
+    """The ``!`` line before a move on a role whose stop the stand refuses; ``None`` if none.
+
+    Printed once the stand is open and before anything is sent, never in
+    dry-run (m2 §11.6): on such a stand, Ctrl-C ends smc and not the move,
+    and the operator must know it before the move, not after it.
+    """
+    declared = set(roles)
+    named = [role.value for role in ROLES_WITH_A_STOP if role in declared]
+    if not named:
+        return None
+    return (
+        f"! the profile declares that this stand refuses stop() on "
+        f"{join_names(named)} ([safety] stop_refused_by): once sent, a move runs "
+        f"to its target, and Ctrl-C ends smc, not the move"
+    )
+
+
+def _say_stop_refused(
+    microscope: Microscope, roles: Iterable[Role] | None = None
+) -> None:
+    """Print ``_stop_refused_line`` for ``roles`` the profile declares (every one by default)."""
+    declared = microscope.profile.safety.stop_refused_by
+    line = _stop_refused_line(
+        declared if roles is None else [r for r in roles if r in declared]
+    )
+    if line is not None:
+        _say(line)
 
 
 def tolerate_unencodable_output(stream: TextIO) -> None:
@@ -588,6 +661,7 @@ def doctor(
                 name = loaded.microscope.name
                 _say(f"Profile {name} ({loaded.source or 'built in'})")
                 _print_roles(microscope)
+                _say_stop_refused(microscope)
                 # One read decides the exit code and is the line printed: a
                 # flaky device read twice could show "XY ?" beside the ✓.
                 state = microscope.state()
@@ -1275,6 +1349,8 @@ def _move_xy(
         Microscope.open(profile, dry_run=dry_run) as microscope,
     ):
         stage = microscope.require(XYStage)
+        if not dry_run:
+            _say_stop_refused(microscope, [Role.xy_stage])
         landed = move(stage)
         # In dry-run the move returns the commanded target; the stage itself
         # is read again to show that it did not move.
@@ -1298,6 +1374,8 @@ def _move_z(
         Microscope.open(profile, dry_run=dry_run) as microscope,
     ):
         drive = microscope.require(ZStage)
+        if not dry_run:
+            _say_stop_refused(microscope, [Role.focus])
         landed = move(drive)
         here = drive.position_um() if dry_run else None
     if here is None:
@@ -1843,6 +1921,8 @@ def run_command(
             resume=resume,
         )
         with Microscope.open(loaded, dry_run=dry_run) as microscope:
+            if not dry_run:
+                _say_stop_refused(microscope)
             record = run_plugin(
                 entry.plugin,
                 microscope,
