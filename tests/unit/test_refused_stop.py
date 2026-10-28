@@ -288,3 +288,123 @@ def test_a_timeout_on_a_declared_stand_says_the_move_runs_to_its_target() -> Non
         "xy_stage XY is still busy after 0.05 s; the stand refuses its stop, as the "
         "profile declares ([safety] stop_refused_by), so it runs to its target. "
     )
+
+
+# --- the emergency stop and close() (m2 §11.5) ---------------------------------
+
+
+def test_the_emergency_stop_on_a_declared_stand_raises_stop_refused_error_naming_what_it_did() -> (
+    None
+):
+    with _stand() as (_, microscope):
+        with pytest.raises(StopRefusedError) as refused:
+            microscope.stop()
+        assert microscope.state().halted
+    assert refused.value.refused == ("xy_stage XY", "z Z")
+    assert str(refused.value) == (
+        "the emergency stop halted the microscope and switched autofocus Autofocus "
+        "off, but xy_stage XY and z Z refused the stop, as the profile declares "
+        "([safety] stop_refused_by): a move under way runs to its target. The "
+        "microscope stays halted: stop the stage with the stand's own controls if "
+        "it must not finish its move, then call `resume()`"
+    )
+
+
+def test_the_emergency_stop_with_a_refusal_and_a_failure_raises_hardware_error_listing_both() -> (
+    None
+):
+    # Any failure keeps today's text, with the declared refusal added.
+    with _stand(_declared(Role.xy_stage), refused=("XY",)) as (core, microscope):
+        core.failing["Z"] = RuntimeError("device fault")
+        try:
+            with pytest.raises(HardwareError) as failed:
+                microscope.stop()
+        finally:
+            core.failing.clear()
+    assert type(failed.value) is HardwareError
+    message = str(failed.value)
+    assert message.startswith(
+        "the emergency stop failed for ZStage 'Z' (HardwareError(\"focus: stop('Z') "
+        "failed (device fault); check the device"
+    )
+    assert message.endswith(
+        "; xy_stage XY refused the stop, as the profile declares ([safety] "
+        "stop_refused_by), so a move under way runs to its target. The microscope "
+        "stays halted: stop the stage at the stand if it still moves, then call "
+        "`resume()`"
+    )
+
+
+def test_every_stop_is_still_sent_in_order_on_a_declared_stand() -> None:
+    # FM-17, FM-62: the declaration changes no send and no order (m2 §11.2).
+    with _stand() as (core, microscope):
+        with pytest.raises(StopRefusedError):
+            microscope.stop()
+        assert core.log == ["enableContinuousFocus(False)", "stop('XY')", "stop('Z')"]
+
+
+def _left_moving(core: FakeCore, microscope: Microscope) -> None:
+    """A Ctrl-C during an XY move that stays busy: the motion outlives its action."""
+    core.busy_devices = {"XY"}
+    undo = _interrupt_the_first_busy_poll(core)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            microscope.require(XYStage).move_to_um(10.0, 0.0)
+    finally:
+        undo()
+    assert microscope.state().moving == ("xy_stage XY",)
+    core.log.clear()
+
+
+def test_close_logs_stopped_only_for_the_stops_that_were_accepted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # #206: "the stages were stopped" was written whatever each stop did.
+    with _stand(_declared(Role.xy_stage), refused=("XY",)) as (core, microscope):
+        _left_moving(core, microscope)
+        with caplog.at_level(logging.WARNING, logger=LOGGER):
+            microscope.close()
+        assert core.log == [
+            "enableContinuousFocus(False)",
+            "stop('XY')",
+            "stop('Z')",
+            "unloadAllDevices()",
+        ]
+    assert caplog.messages[-1] == (
+        "close: xy_stage XY still moving; stopped: autofocus Autofocus off, z Z; "
+        "refused, as the profile declares ([safety] stop_refused_by), so a move "
+        "under way runs to its target: xy_stage XY"
+    )
+    assert not any("the stages were stopped" in line for line in caplog.messages)
+
+
+def test_close_on_a_declared_stand_says_the_move_runs_to_its_target(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Unloading does not wait for the refused move: the stand finishes it.
+    with _stand() as (core, microscope):
+        _left_moving(core, microscope)
+        with caplog.at_level(logging.WARNING, logger=LOGGER):
+            microscope.close()
+        assert core.log[-1] == "unloadAllDevices()"
+    assert caplog.messages[-1] == (
+        "close: xy_stage XY still moving; stopped: autofocus Autofocus off; "
+        "refused, as the profile declares ([safety] stop_refused_by), so a move "
+        "under way runs to its target: xy_stage XY, z Z"
+    )
+
+
+def test_close_counts_an_undeclared_refusal_as_a_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with _stand(Profile.demo(), refused=("XY",)) as (core, microscope):
+        _left_moving(core, microscope)
+        with caplog.at_level(logging.WARNING, logger=LOGGER):
+            microscope.close()
+    warning = (
+        "close: xy_stage XY still moving; stopped: autofocus Autofocus off, z Z; "
+        "not stopped: 1 failed"
+    )
+    assert warning in caplog.messages
+    after = caplog.messages[caplog.messages.index(warning) + 1 :]
+    assert after[0].startswith("close: the stop failed for XYStage 'XY' (")
