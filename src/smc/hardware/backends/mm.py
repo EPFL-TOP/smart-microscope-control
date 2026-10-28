@@ -705,6 +705,7 @@ class _EngageGuard:
         excursion_um: float | None,
         settle_s: float,
         tolerance_um: float,
+        limit_s: float,
     ) -> None:
         self._autofocus = autofocus
         self._focus = focus
@@ -727,6 +728,10 @@ class _EngageGuard:
         self.why = ""
         self.tripped_z_um: float | None = None
         self.failure = ""
+        #: The lock wait's deadline, taken before the switch-on, so never after
+        #: the ``Executor``'s: from then on the wait is over, and a poll is a
+        #: give-up's busy check, which reports only whether it is on (FM-133).
+        self._deadline = time.monotonic() + limit_s
         #: The last poll read locked but not settled, and how far Z moved then.
         self.settling = False
         self.spread_um = 0.0
@@ -755,7 +760,13 @@ class _EngageGuard:
     def is_busy(self) -> bool:
         autofocus = self._autofocus
         engaged = autofocus._read_engaged()
-        if self.ended:
+        if self.ended or time.monotonic() >= self._deadline:
+            # The wait is over: a poll now is a give-up's busy check, or a
+            # later action's guard. On, it may move Z, so it counts as moving
+            # whatever Z reads (FM-127, FM-133); a Z read here only names what
+            # happened.
+            if not self.ended:
+                self._read_z()
             return engaged
         locked = engaged and autofocus._read_locked(record=False)
         z_um = self._read_z()
@@ -770,7 +781,12 @@ class _EngageGuard:
         now = time.monotonic()
         if not self._window:
             self._since = now
-        window = [(t, z) for t, z in self._window if t >= now - self._settle_s]
+        # The newest read older than the window stays in it: after a poll
+        # late by more than settle_s, the new Z is still compared with one
+        # from before the gap, never with itself alone.
+        cut = now - self._settle_s
+        older = [read for read in self._window if read[0] < cut]
+        window = [*older[-1:], *(read for read in self._window if read[0] >= cut)]
         window.append((now, z_um))
         self._window = window
         values = [z for _, z in window]
@@ -1427,7 +1443,7 @@ class MMAutofocus:
         def step() -> Step[_AfterWait]:
             nonlocal guard
             self._check_slot()  # in dry-run too
-            guard = self._check_engage(z_held)  # in dry-run too
+            guard = self._check_engage(z_held, limit_s)  # in dry-run too
             return Step(
                 log=description,
                 send=self._send_on,
@@ -1532,7 +1548,9 @@ class MMAutofocus:
             or self._settle_s > 0
         )
 
-    def _check_engage(self, z_held: float | None) -> _EngageGuard | None:
+    def _check_engage(
+        self, z_held: float | None, limit_s: float
+    ) -> _EngageGuard | None:
         """Refuse an engage before the switch-on, and build its guard (m2 §12.4).
 
         Under the lock, inside the action's step, in dry-run too, as the
@@ -1571,6 +1589,7 @@ class MMAutofocus:
                 excursion_um=self._safety.max_engage_excursion_um,
                 settle_s=self._settle_s,
                 tolerance_um=self._settle_tolerance_um,
+                limit_s=limit_s,
             )
         if not self._declared:
             return guard
@@ -1593,19 +1612,31 @@ class MMAutofocus:
                 _named(exc),
             )
             on = True
-        if on:
-            self._executor.safe(self._off, lambda: None)
         unit = f" {self._offset_unit}" if self._offset_unit else ""
         with_objective = "" if objective is None else f" with objective {objective!r}"
         known = ", ".join(f"{value:g}" for value in sorted(seen)) or "none"
-        switched = "; it was on and searching, so it was switched off" if on else ""
-        raise _EngageRefusedError(
+        unseen = (
             f"on this stand engaging drives Z to the plane the offset names "
             f"([autofocus] engage_drives_z_to_offset, m2 §12), and offset "
             f"{offset:g}{unit} has not been seen locked{with_objective} since the "
-            f"stand was opened (seen: {known}){switched}. Focus on the sample, "
-            f"switch {label} on with the stand's own controls and set the offset "
-            f"until the sample is sharp; smc then reads the lock",
+            f"stand was opened (seen: {known})"
+        )
+        if on:
+            try:
+                self._executor.safe(self._off, lambda: None)
+            except Exception as exc:
+                # Not the bare switch-off fault: it would drop why it was being
+                # switched off, and that it may now drive Z (FM-127).
+                raise HardwareError(
+                    f"autofocus {label}: not engaged: {unseen}; it was on and "
+                    f"searching, and it could not be switched off ({_named(exc)}); "
+                    f"it may still move Z: stop() and check the stand, then resume()"
+                ) from exc
+        switched = "; it was on and searching, so it was switched off" if on else ""
+        raise _EngageRefusedError(
+            f"{unseen}{switched}. Focus on the sample, switch {label} on with the "
+            f"stand's own controls and set the offset until the sample is sharp; "
+            f"smc then reads the lock",
             label=label,
         )
 

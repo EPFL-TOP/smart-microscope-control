@@ -3441,6 +3441,26 @@ def test_a_failed_z_read_for_an_error_message_logs_no_exception_object(
             {"offset_per_um": {"4x": math.inf}},
             "offset_per_um for objective '4x' must be finite and non-zero",
         ),
+        # m2 §12.3; the default lock wait is LOCK_S here (short_lock).
+        ({"settle_s": -1.0}, "settle_s must be finite and in [0, 60] s"),
+        ({"settle_s": math.nan}, "settle_s must be finite and in [0, 60] s"),
+        (
+            {"settle_s": 61.0, "lock_timeout_s": 600.0},
+            "settle_s must be finite and in [0, 60] s",
+        ),
+        (
+            {"settle_s": LOCK_S},
+            f"settle_s must be below the lock timeout ({LOCK_S:g} s)",
+        ),
+        (
+            {"settle_s": 1.0, "lock_timeout_s": 1.0},
+            "settle_s must be below the lock timeout (1 s)",
+        ),
+        ({"settle_tolerance_um": 0.0}, "settle_tolerance_um must be finite and > 0"),
+        (
+            {"settle_tolerance_um": math.inf},
+            "settle_tolerance_um must be finite and > 0",
+        ),
     ],
 )
 def test_mm_autofocus_built_in_code_refuses_what_the_profile_would(

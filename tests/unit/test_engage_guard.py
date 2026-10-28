@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -321,6 +322,17 @@ def test_a_relock_back_to_where_pfs_held_is_inside_the_band() -> None:
         assert stand.af.is_locked() is True
 
 
+def test_a_relock_back_down_to_where_pfs_held_is_inside_the_band() -> None:
+    # The mirror of the test above: Z moved up, so where PFS held is the
+    # band's lower side.
+    with _stand() as stand:
+        stand.engage_directly()
+        _relock_drives_to(stand, Z0)
+        assert stand.z.move_to_um(Z0 + 70.0) == Z0 + 70.0
+        assert stand.core.log == [OFF, f"setPosition('ZDrive', {Z0 + 70.0})", ON]
+        assert stand.z.position_um() == Z0
+
+
 def test_a_relock_that_overshoots_where_pfs_held_trips_the_guard() -> None:
     with _stand() as stand:
         stand.engage_directly()
@@ -395,6 +407,71 @@ def test_a_trip_whose_switch_off_fails_says_pfs_may_still_move_z(
         stand.microscope.resume()
 
 
+def test_a_deadline_whose_switch_off_fails_stays_registered_whatever_z_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-127: the give-up's busy check comes after the stop; PFS still on may
+    # move Z, so it counts as moving even when Z can no longer be read.
+    with _stand() as stand:
+        stand.core.autofocus_lockable = False  # searching until the deadline
+        switch, read = stand.core.enableContinuousFocus, stand.core.getPosition
+        stuck: list[bool] = []
+
+        def stuck_on(enable: bool) -> None:
+            if enable:
+                switch(True)
+                return
+            stuck.append(True)
+            raise RuntimeError("PFS: stuck on")
+
+        def unreadable_once_stuck(label: str | None = None) -> float:
+            if label == "ZDrive" and stuck:
+                raise RuntimeError("ZDrive: no answer")
+            return read(label)
+
+        monkeypatch.setattr(stand.core, "enableContinuousFocus", stuck_on)
+        monkeypatch.setattr(stand.core, "getPosition", unreadable_once_stuck)
+        with pytest.raises(DeviceTimeoutError) as stuck_error:
+            stand.af.engage()
+        assert str(stuck_error.value).endswith(
+            "; it may still move Z: stop() and check the stand, then resume()"
+        )
+        assert stand.core.isContinuousFocusEnabled() is True
+        assert stand.microscope.state().moving == ("autofocus PFS",)
+        monkeypatch.setattr(stand.core, "enableContinuousFocus", switch)
+        monkeypatch.setattr(stand.core, "getPosition", read)
+        stand.microscope.resume()
+
+
+def test_an_unseen_offset_whose_switch_off_fails_says_it_may_still_move_z(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with _stand(_guarded(declared=True), offset=STALE_OFFSET) as stand:
+        stand.engage_directly(lockable=False)
+        switch = stand.core.enableContinuousFocus
+
+        def stuck_on(enable: bool) -> None:
+            if enable:
+                switch(True)
+                return
+            raise RuntimeError("PFS: stuck on")
+
+        monkeypatch.setattr(stand.core, "enableContinuousFocus", stuck_on)
+        with pytest.raises(HardwareError) as stuck:
+            stand.af.engage()
+        reason = _unseen().removeprefix("autofocus PFS: not engaged: ")
+        reason = reason.split(". Focus on the sample")[0]
+        assert not isinstance(stuck.value, SafetyRefusedError)
+        assert str(stuck.value) == (
+            f"autofocus PFS: not engaged: {reason}; it was on and searching, and it "
+            "could not be switched off (autofocus: enableContinuousFocus(False) "
+            "failed (PFS: stuck on); check the device: power, cable, another "
+            "program holding it); it may still move Z: stop() and check the stand, "
+            "then resume()"
+        )
+        monkeypatch.setattr(stand.core, "enableContinuousFocus", switch)
+
+
 def test_no_focus_drive_engages_without_a_guard_and_warns(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -427,6 +504,76 @@ def test_engage_returns_true_only_once_z_has_settled() -> None:
         _jumps_to(stand, Z0 + 20.0, after_reads=3)
         assert stand.af.engage() is True
         assert stand.z.position_um() == Z0 + 20.0
+
+
+def test_a_settle_window_alone_still_waits_for_z() -> None:
+    # No soft limit and no band: the window is enough for the guard to read Z.
+    profile = _profile(autofocus={"settle_s": 0.3, "lock_timeout_s": 2.0})
+    with _stand(profile) as stand:
+        _jumps_to(stand, Z0 + 20.0, after_reads=3)
+        assert stand.af.engage() is True
+        assert stand.z.position_um() == Z0 + 20.0
+
+
+def test_a_lock_lost_in_the_settle_window_starts_it_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # m2 §12.2 D3: True needs settle_s of stillness since the last relock, not
+    # since the first lock.
+    settle_s = 1.0
+    profile = _guarded(settle_s=settle_s, lock_timeout_s=3.0)
+    with _stand(profile) as stand:
+        real = stand.core.isContinuousFocusLocked
+        reads: list[float] = []
+
+        def lost_once() -> bool:
+            reads.append(time.monotonic())
+            if len(reads) == 10:
+                return False
+            return real()
+
+        monkeypatch.setattr(stand.core, "isContinuousFocusLocked", lost_once)
+        assert stand.af.engage() is True
+        assert time.monotonic() - reads[9] >= settle_s
+
+
+def test_a_poll_late_by_more_than_the_window_still_compares_z_with_before(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A stall longer than settle_s (an antivirus pause, a slow read) must not
+    # leave a window of one read, which would read as still (m2 §12.2 D3).
+    clock = [0.0]
+    monkeypatch.setattr(mm.time, "monotonic", lambda: clock[0])
+    z = [Z0]
+
+    class _Read:
+        def _read_engaged(self) -> bool:
+            return True
+
+        def _read_locked(self, *, record: bool = True) -> bool:
+            return True
+
+        def position_um(self) -> float:
+            return z[0]
+
+    read = _Read()
+    guard = mm._EngageGuard(
+        read,  # type: ignore[arg-type]
+        read,  # type: ignore[arg-type]
+        z_start_um=Z0,
+        z_held_um=None,
+        limits_um=None,
+        excursion_um=None,
+        settle_s=0.05,
+        tolerance_um=0.5,
+        limit_s=10.0,
+    )
+    for step in range(3):
+        clock[0], z[0] = 0.016 * step, Z0 + step
+        assert guard.is_busy() is True
+    clock[0], z[0] = 0.092, Z0 + 7.0
+    assert guard.is_busy() is True
+    assert guard.spread_um >= 5.0
 
 
 def test_without_a_settle_window_engage_returns_at_the_first_locked_read() -> None:
