@@ -53,6 +53,8 @@ dev = [
   "types-pyserial>=3.5",
   "pre-commit>=3.7",
 ]
+# Cell detection (m3 §9): the trained Faster R-CNN; imported only inside TorchDetector.
+detect = ["torch>=2.2", "torchvision>=0.17"]
 # Zeiss stands reached through Zeiss MTB 2011 (.NET) — Windows only.
 zeiss = ["pythonnet>=3.0; sys_platform == 'win32'"]
 # User interface extra: populated once ADR-0006 is accepted.
@@ -66,6 +68,8 @@ smc = "smc.cli:main"
 # the value names a class, which the registry instantiates with no argument.
 [project.entry-points."smc.plugins"]
 camera-calibration = "smc.plugins.camera_calibration.plugin:CameraCalibrationPlugin"
+cells = "smc.plugins.cells.plugin:CellsPlugin"
+scan-plan = "smc.plugins.scan_plan.plugin:ScanPlanPlugin"
 stage-report = "smc.plugins.stage_report:StageReport"
 
 [project.urls]
@@ -154,6 +158,12 @@ disable_error_code = ["type-abstract"]
 module = ["pymmcore.*", "pymmcore_plus.*", "useq.*"]
 ignore_missing_imports = true
 follow_untyped_imports = true
+
+# torch is an optional extra: typed as Any with or without it, so mypy agrees on every PC (measured, m3 §9.0).
+[[tool.mypy.overrides]]
+module = ["torch", "torch.*", "torchvision", "torchvision.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
 
 # ----------------------------------------------------------------------------
 # Tests
