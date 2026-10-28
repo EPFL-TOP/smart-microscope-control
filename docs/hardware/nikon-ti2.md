@@ -1,10 +1,12 @@
-# Nikon Ti2-E — PC survey and session 0
+# Nikon Ti2-E — PC survey, session 0 and session 1
 
-Two visits are curated here. The **PC survey** (2026-09-25, below down to
+Three visits are curated here. The **PC survey** (2026-09-25, below down to
 *Surprises*) read the PC without initialising anything. **Session 0**
 (2026-10-07, state re-read 2026-10-14; [its section](#session-0--the-stand-through-pymmcore))
 initialised the stand through pymmcore and moved nothing. Session 0
-answers most of the survey's surprises; each one says so.
+answers most of the survey's surprises; each one says so. **Session 1**
+(2026-10-21 and 2026-10-26, #208; [its section](#session-1--first-moves-contracts-pfs))
+moved the stand through the layer, ran the contracts and read PFS.
 
 Curated by the design session from the raw survey in `local/surveys/nikon-ti2/` (private, never committed)
 (issue #16), collected 2026-09-25 with the hardware connected and the
@@ -491,3 +493,84 @@ the NI breakout box, the piezo insert, the TI2-CTRE, and the
 
 Nothing is left open from session 0. COM3 was confirmed as the Spectra's
 USB link on 2026-10-16.
+
+## Session 1 — first moves, contracts, PFS
+
+2026-10-21 (no sample, 10×, PFS off) and 2026-10-26 (a glass-bottom dish
+with cells, 10×), the owner at the stand, commit `a5cfa51`. Report: #208,
+with the raw excerpts. The PFS reads went through pymmcore directly (a
+throwaway script, posted on #16), every 100 ms.
+
+### Stopping
+
+- **`stop()` is refused by every axis**: `XYStage`, `ZDrive` and
+  `PFSOffset` answer `Unsupported device command (11)`, idle or moving;
+  `PFS` answers `Cannot stop "PFS": not a stage`. A move that was sent
+  runs to its target: a Ctrl-C during `smc stage jog 20000 0 --force`
+  left the stage 20000 µm on (#204). The CLI still printed "any move under
+  way was stopped" (#206).
+- **Switching PFS off stops a Z move that PFS drives**, at once (one
+  trial: Z stopped after +4.2 µm of about +6.7 µm). It is the only stop
+  measured to work on this stand.
+- The stand's own controls stop everything: the joystick, the focus knob
+  and the PFS button.
+
+### PFS (m2 §4)
+
+| § | Read | Result |
+|---|---|---|
+| 4.1 | Lock | `locked` True at the first read (0.1 s) in all three engagements, and once 0.5 s **before** Z moved (below). `PFS in Range` reads `In Range` whenever a sample reflects, PFS on or off. |
+| 4.2 | No reference | No sample, PFS on for 10 s: never locked, Z within 0.02 µm, `Out of Range`. |
+| 4.3 | #1815 | `setPosition(ZDrive, z − 5)` with PFS locked switches PFS off. |
+| 4.4 | Offset under lock | A larger offset gives a larger Z. +50 units: +6.68 µm (7.5 units/µm); −50: −4.64 µm (10.8); a manual re-set of −1443 units: −243 µm (5.9). Each round trip leaves Z higher. Z settles in about 0.3 s, then creeps by about 0.3 µm over 5 s. |
+| 4.5 | Offset, PFS off | Z does not move (+10, +50). |
+| 4.6 | Limits, stop | `PFSOffset` exposes no property, so no limits. `stop` is refused. Values seen: 7803, 7927, 9370. |
+| 4.7 | Slot API | `getAutoFocusOffset()` equals `PFSOffset`'s position; `setAutoFocusOffset()` moves it. |
+| 4.8 | Switch-off under motion | Z stops at once. |
+| 4.9 | Z busy | `deviceBusy("ZDrive")` never read True, in 928 reads, during PFS-driven moves included. `PFSOffset` neither; it reads its target at once. |
+
+- **Engaging PFS drives Z to the plane of the stored offset**, not to
+  the operator's focus. With an offset of 9370 left from earlier use,
+  Z went from 4269.44 to 4504.76 µm between two reads, 155 µm above the
+  4350 µm limit. The stand's PFS button did the same (about 200 µm).
+  Once the offset was set with the knob (PFS on, the knob turns the
+  offset), engaging moved nothing. At 40× such a jump reaches the sample;
+  the 40× reads were skipped for that reason (#205).
+- **`PFSOffset` holds whole units**: 7927.5 reads 7927, 7925.75 lands on
+  7925 (#207).
+- `PFS Status` (16 characters): `0000000000000000` off with no sample,
+  `0000000100000000` off with a sample, `…1000001001` / `…1000011001`
+  searching, `0000001100001001` / `0000001100001010` locked. It read
+  `…1001` while Z was still to move and `…1010` once it had. That a bit
+  means "settled" is a hypothesis.
+- Loading the configuration leaves PFS as the stand had it: on and locked
+  if the button left it on. The offset is whatever the last user left.
+
+### Contracts
+
+Without autofocus, no sample: 40 passed, 10 skipped (the expected skips),
+2 failed: `test_stop_on_an_idle_stage_is_harmless` on XY and Z, the
+refused stop. Autofocus, the dish in focus: 13 passed, 1 skipped (no
+`offset_per_um` then), 1 failed: the offset jog contract, on the
+whole-unit offset.
+
+### Positions and the profile
+
+- A glass-bottom dish at 10× focuses at Z 4261–4269 µm, 80–90 µm under
+  the 4350 µm limit.
+- The profile now has `[autofocus]` `offset_unit`, `in_range_property`,
+  `in_range_values`, `offset_per_um` for the 10× (5.9, the smallest of
+  the three factors), and `[safety] max_autofocus_offset_jog = 50`
+  (chosen). `lock_timeout_s` stays assumed; `autofocus_offset_soft_limits`
+  stays unknown.
+
+### Not settled by session 1
+
+- Which way Z goes, seen from the side (#98). The reads say that a larger
+  Z is closer to the sample on this inverted stand (a larger offset under
+  lock gives a larger Z, and the knob fully down reads 5–6 µm); nobody
+  watched the objective.
+- `smc snap` on the Prime 95B (#125): the snap ran without `-p` and used
+  the demo camera.
+- The 40× (factor, lock), what `IntermediateMagnification` reads at 1.0×
+  and 1.5×, and the turret block of m2 §8.9.
