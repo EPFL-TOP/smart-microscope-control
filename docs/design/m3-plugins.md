@@ -2580,10 +2580,15 @@ is not committed, with numpy 2.5.3 on Python 3.13 and numpy 1.26.0 and
 - **Membership and overlap.** A cell is in a field when its pixel offset
   from the field's centre is within `W / 2` and `H / 2`, edges included.
   Two fields overlap when `|d_col| < W − 1e-6` and `|d_row| < H − 1e-6`:
-  fields that touch are allowed. A candidate's count is made once, since
-  chosen fields do not overlap and so hold different cells; the `counts` of
-  a chosen field and `uncovered` count only cells that no earlier field
-  held, so a cell exactly on a shared edge is still counted once.
+  fields that touch are allowed. Each candidate is counted once, and a
+  count only goes down, so the greedy is lazy: the best candidate is
+  counted again over the cells that no chosen field holds, and when its
+  count fell (a cell exactly on the edge that two touching fields share
+  was held by the first) the new count replaces the old one and the round
+  starts again. That is the exact greedy (equal to recounting every
+  candidate every round on 150 inputs with cells on the lattice's edges),
+  it never chooses a field with fewer than `min_cells` new cells, and it
+  counts a cell once; `counts` and `uncovered` follow from it.
 - **Another objective.** The scan's own objective is not "another one": it
   needs no turret and gains no line. The scan's `z_um` and `pfs_offset`
   belong to its objective (FM-118: an autofocus offset is one recorded for
