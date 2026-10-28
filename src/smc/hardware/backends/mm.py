@@ -124,6 +124,9 @@ Z_STOP_OUTCOME_WAIT_S = 5.0
 #: The longest lock wait ``engage`` accepts: the wait holds the microscope
 #: lock, so every other action waits behind it (FM-32).
 MAX_LOCK_TIMEOUT_S = 600.0
+#: The longest settle window ``[autofocus] settle_s`` may set (m2 §12.3): it
+#: holds the microscope lock, as the lock wait does.
+_MAX_SETTLE_S = 60.0
 
 #: The note a message carries when the lock wait is the default.
 _ASSUMED_TIMEOUT = " (assumed: the profile sets no [autofocus] lock_timeout_s)"
@@ -909,9 +912,33 @@ class MMAutofocus:
         in_range_values: Sequence[str] = (),
         objective_label: Callable[[], str | None] = lambda: None,
         focus: Callable[[], ZStage | None] = lambda: None,
+        engage_drives_z_to_offset: bool = False,
+        settle_s: float = 0.0,
+        settle_tolerance_um: float = 0.5,
     ) -> None:
         if lock_timeout_s is not None:
             lock_timeout_s = _checked_lock_timeout(lock_timeout_s, "lock_timeout_s")
+        # As the profile validates them (m2 §12.3), for code that builds this.
+        settle_s = float(settle_s)
+        if not (math.isfinite(settle_s) and 0 <= settle_s <= _MAX_SETTLE_S):
+            raise ValueError(
+                f"settle_s must be finite and in [0, {_MAX_SETTLE_S:g}] s, got "
+                f"{settle_s!r}"
+            )
+        bound = (
+            float(DEFAULT_LOCK_TIMEOUT_S) if lock_timeout_s is None else lock_timeout_s
+        )
+        if settle_s >= bound:
+            raise ValueError(
+                f"settle_s must be below the lock timeout ({bound:g} s), which bounds "
+                f"the lock and the settling together; got {settle_s!r}"
+            )
+        settle_tolerance_um = float(settle_tolerance_um)
+        if not (math.isfinite(settle_tolerance_um) and settle_tolerance_um > 0):
+            raise ValueError(
+                f"settle_tolerance_um must be finite and > 0, got "
+                f"{settle_tolerance_um!r}"
+            )
         for objective, factor in offset_per_um.items():
             # A zero factor would make focus_by_um a move of nothing, reported
             # as done; the profile refuses it too, but code may build this.
@@ -946,6 +973,17 @@ class MMAutofocus:
         self._in_range_values = tuple(in_range_values)
         self._objective_label = objective_label
         self._focus = focus
+        self._declared = bool(engage_drives_z_to_offset)
+        self._settle_s = settle_s
+        self._settle_tolerance_um = settle_tolerance_um
+        #: Per objective label (``None`` without a turret): the offsets read
+        #: locked since this was built (m2 §12.2 D1). Recorded on a declared
+        #: stand only, and replaced whole at each change: one store, no lock
+        #: (FM-70).
+        self._seen: dict[str | None, frozenset[float]] = {}
+        #: Where Z was when ``suspend()`` found it locked, for the relock that
+        #: follows in the same compound (the band, m2 §12.2 D2).
+        self._z_held: float | None = None
         # Not `self._send_off`: a bound method stored on self is a cycle that
         # keeps the core alive until the cyclic collector (#142).
         self._off = SafeCall(

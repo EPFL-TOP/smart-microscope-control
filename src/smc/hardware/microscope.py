@@ -238,6 +238,7 @@ class Microscope:
             autofocus_offset_soft_limits=safety.autofocus_offset_soft_limits,
             offset_unit=profile.autofocus.offset_unit,
             stop_refused_by=frozenset(role.value for role in safety.stop_refused_by),
+            max_engage_excursion_um=safety.max_engage_excursion_um,
         )
         self._lock = threading.RLock()
         # FM-15: waiting for the lock is bounded like a device call.
@@ -453,6 +454,9 @@ class Microscope:
                 focus=lambda: cast(
                     "ZStage | None", _owned(owner, "Autofocus")._lookup(ZStage)
                 ),
+                engage_drives_z_to_offset=af.engage_drives_z_to_offset,
+                settle_s=af.settle_s,
+                settle_tolerance_um=af.settle_tolerance_um,
             )
         if (
             capability is ObjectiveTurret
