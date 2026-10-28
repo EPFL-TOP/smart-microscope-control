@@ -8,6 +8,11 @@ from smc.hardware.errors import (
     CapabilityMissingError,
     HardwareError,
     SafetyRefusedError,
+    StopNote,
+    StopOutcome,
+    StopRefusedError,
+    note_stop,
+    stop_notes,
 )
 from smc.hardware.roles import DeviceInfo, Role
 
@@ -83,3 +88,86 @@ def test_autofocus_lost_survives_a_worker_process() -> None:
     error = AutofocusLostError("z: moved, no lock", 12.0, False)
     copy = pickle.loads(pickle.dumps(error))
     assert (str(copy), copy.z_um, copy.in_range) == ("z: moved, no lock", 12.0, False)
+
+
+# --- a stop the device refuses (m2 §11.4) -------------------------------------
+
+
+def test_stop_refused_error_says_the_move_runs_to_its_target() -> None:
+    error = StopRefusedError(("xy_stage XYStage", "z ZDrive", "autofocus_offset PFS"))
+    assert str(error) == (
+        "`xy_stage XYStage`, `z ZDrive` and `autofocus_offset PFS` refused the stop, "
+        "as the profile declares ([safety] stop_refused_by): a move under way runs "
+        "to its target; stop it with the stand's own controls if it must not finish"
+    )
+    assert str(StopRefusedError(("xy_stage XY",), "the facade's own text")) == (
+        "the facade's own text"
+    )
+
+
+def test_stop_refused_error_pickles_with_its_names() -> None:
+    for error in (
+        StopRefusedError(("xy_stage XY", "z Z")),
+        StopRefusedError(("xy_stage XY",), "the facade's own text"),
+    ):
+        copy = pickle.loads(pickle.dumps(error))
+        assert (type(copy), str(copy), copy.refused) == (
+            StopRefusedError,
+            str(error),
+            error.refused,
+        )
+
+
+def _raised_with_context(first: BaseException, second: BaseException) -> BaseException:
+    """``second`` raised while ``first`` is handled, as a second Ctrl-C in a give-up."""
+    try:
+        try:
+            raise first
+        except BaseException:
+            raise second from None
+    except BaseException as caught:
+        return caught
+
+
+def test_stop_notes_reads_the_context_chain_oldest_first() -> None:
+    accepted = StopNote("xy_stage XY", StopOutcome.accepted, False)
+    refused = StopNote("z Z", StopOutcome.refused, True)
+    cut = StopNote("xy_stage XY", StopOutcome.interrupted, False)
+    first, second = KeyboardInterrupt(), KeyboardInterrupt()
+    note_stop(first, accepted)
+    note_stop(first, refused)
+    note_stop(second, cut)
+    # `from None` sets the cause aside, not the context: the walk reads it.
+    raised = _raised_with_context(first, second)
+    assert raised is second
+    assert raised.__context__ is first
+    assert stop_notes(raised) == (accepted, refused, cut)
+
+
+def test_stop_notes_ends_on_a_context_chain_that_loops() -> None:
+    first, second = KeyboardInterrupt(), KeyboardInterrupt()
+    note = StopNote("xy_stage XY", StopOutcome.refused, True)
+    note_stop(first, note)
+    first.__context__, second.__context__ = second, first
+    assert stop_notes(first) == (note,)
+
+
+def test_stop_notes_of_an_exception_without_notes_is_empty() -> None:
+    assert stop_notes(KeyboardInterrupt()) == ()
+    assert stop_notes(_raised_with_context(ValueError(), KeyboardInterrupt())) == ()
+
+
+def test_a_stop_note_holds_no_exception() -> None:
+    # FM-98: a note that held the error would keep its traceback, and the core.
+    note = StopNote("xy_stage XY", StopOutcome.refused, True)
+    assert all(
+        isinstance(value, str | bool)
+        for value in (note.motion, note.outcome, note.declared)
+    )
+
+
+def test_stop_refused_error_is_a_hardware_error_and_not_a_refusal() -> None:
+    # FM-64: a move under way runs on; a tool that skips on a refusal must
+    # not read it as a move that was never sent.
+    assert issubclass(StopRefusedError, HardwareError)
+    assert not issubclass(StopRefusedError, SafetyRefusedError)

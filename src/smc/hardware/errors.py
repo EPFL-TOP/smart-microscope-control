@@ -7,11 +7,22 @@ did not write this code.
 
 from __future__ import annotations
 
+import contextlib
 import functools
+from collections.abc import Sequence
+from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from smc.hardware.roles import Role
+
+
+def join_names(names: Sequence[str]) -> str:
+    """``a``, ``a and b``, ``a, b and c``: names in a message."""
+    if len(names) <= 1:
+        return "".join(names)
+    return f"{', '.join(names[:-1])} and {names[-1]}"
 
 
 class HardwareError(RuntimeError):
@@ -146,6 +157,92 @@ class MotionStoppedError(HardwareError):
 
     def __reduce__(self) -> tuple[type[MotionStoppedError], tuple[object, ...]]:
         return (type(self), (self.device, self.detail))
+
+
+class StopRefusedError(HardwareError):
+    """A stop the device refused, as the profile declares ([safety] stop_refused_by).
+
+    Not a fault: nothing is broken, and a move under way runs to its target.
+    The Ti2-E answers every ``stop()`` of its XY stage, Z drive and PFS offset
+    with ``Unsupported device command (11)``, still or moving, and a move that
+    was sent went all the way (m2 §11.1). Not a ``SafetyRefusedError`` either
+    (FM-64): a tool that skips a target on a refusal must not read a move that
+    is running as one that was never sent. ``refused`` holds the motions'
+    names (``"xy_stage XYStage"``).
+    """
+
+    def __init__(self, refused: tuple[str, ...], message: str = "") -> None:
+        self.refused = refused
+        super().__init__(
+            message
+            or (
+                f"{join_names([f'`{name}`' for name in refused])} refused the stop, "
+                f"as the profile declares ([safety] stop_refused_by): a move under "
+                f"way runs to its target; stop it with the stand's own controls if "
+                f"it must not finish"
+            )
+        )
+
+    def __reduce__(self) -> tuple[type[StopRefusedError], tuple[object, ...]]:
+        # Rebuilt from the constructor's arguments, so the error survives a
+        # worker process (pickle).
+        return (type(self), (self.refused, str(self)))
+
+
+class StopOutcome(str, Enum):
+    """What a stop sent on giving up on a motion did (m2 §11.4)."""
+
+    accepted = "accepted"  # the device took the stop
+    refused = "refused"  # the device raised: a move under way may run to its target
+    impossible = "impossible"  # no stop from smc (a State device)
+    interrupted = "interrupted"  # a second Ctrl-C cut the stop: it may not have reached the device
+
+
+@dataclass(frozen=True, slots=True)
+class StopNote:
+    """One give-up's stop, noted on the exception that ended the wait (m2 §11.4).
+
+    Strings, an enum and a bool: a note holds no exception, so it cannot keep
+    a traceback, and the core with it (FM-98).
+    """
+
+    motion: str  # "xy_stage XYStage"
+    outcome: StopOutcome
+    declared: bool  # the motion's stop_refused
+
+
+#: The attribute the notes ride on. A tuple, replaced whole by ``note_stop``.
+_NOTES = "_smc_stop_notes"
+
+
+def note_stop(exc: BaseException, note: StopNote) -> None:
+    """Append ``note`` to the notes ``exc`` carries.
+
+    It runs on the path a Ctrl-C re-enters (``Executor._move``'s ``except``),
+    so it takes no lock and does no I/O: it reads one attribute, builds one
+    tuple and stores it (FM-70). An exception that takes no attribute keeps
+    no note, and it still propagates: the note never replaces it.
+    """
+    with contextlib.suppress(AttributeError, TypeError):
+        setattr(exc, _NOTES, (*getattr(exc, _NOTES, ()), note))
+
+
+def stop_notes(exc: BaseException) -> tuple[StopNote, ...]:
+    """The notes of ``exc`` and of its ``__context__`` chain, oldest first.
+
+    ``__context__``, not ``__cause__``: a second Ctrl-C inside a give-up's
+    stop raises a new ``KeyboardInterrupt`` whose context is the first, and
+    the two notes are on the two exceptions. It stops at an exception it has
+    already seen, so a chain that loops ends.
+    """
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__context__
+    return tuple(note for link in reversed(chain) for note in getattr(link, _NOTES, ()))
 
 
 class AutofocusLostError(HardwareError):
