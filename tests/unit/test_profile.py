@@ -979,11 +979,16 @@ def test_nikon_ti2_profile_holds_the_owner_limits_and_filter_turret2() -> None:
     assert loaded.safety.turret_requires_confirm is True
     assert loaded.micromanager.device_timeout_ms == 60_000
     assert loaded.config_path() == (PROFILES_DIR / "nikon-ti2.cfg").resolve()
-    # What no session has measured stays unknown, never guessed.
+    # What session 1 measured at 10x (#208), and the offset jog chosen from it.
+    assert loaded.autofocus.offset_per_um == {"2-Plan Fluor 10x": 5.9}
+    assert loaded.autofocus.offset_unit == "PFSOffset units"
+    assert loaded.autofocus.in_range_property == "PFS in Range"
+    assert loaded.autofocus.in_range_values == ["In Range"]
+    assert loaded.safety.max_autofocus_offset_jog == 50.0
+    # What no session has measured stays unknown, never guessed: the offset
+    # device exposes no limits, and the lock time is not a settling time.
     assert loaded.camera.pixel_size_um == {}
-    assert loaded.autofocus.offset_per_um == {}
-    assert loaded.autofocus.offset_unit == ""
-    assert loaded.safety.max_autofocus_offset_jog is None
+    assert loaded.autofocus.lock_timeout_s is None
     assert loaded.safety.autofocus_offset_soft_limits is None
 
 

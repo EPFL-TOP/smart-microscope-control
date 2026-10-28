@@ -46,6 +46,16 @@ New findings arrive as *Hardware session report* issues and land here.
   and `PFS Status` (read-only), `DichroicMirrorInserted`, `LEDIntensity`.
   Speeds are properties as well: `ZDrive` 0.5–2.5 mm/s, `XYStage`
   0.25–51 mm/s.
+- **No axis accepts `stop()`**: `XYStage`, `ZDrive` and `PFSOffset`
+  refuse it (`Unsupported device command (11)`), so a sent move runs to
+  its target. Switching PFS off stops a Z move that PFS drives (session 1,
+  #208; #204).
+- **Engaging PFS drives Z to the stored offset's plane**, hundreds of µm
+  if the offset was left by another sample, with `locked` already True
+  and `ZDrive` never busy (#205). `PFS in Range` means a reflection is
+  seen, PFS on or off. A Z move with PFS locked switches PFS off (#1815,
+  confirmed). `PFSOffset` holds whole units, has no property limits, and
+  moves Z only while PFS is on; at 10× about 6–11 units per µm.
 - The stand adapter never provides the camera. On our Ti2-E it is a
   **Photometrics Prime 95B** through `PVCAM` (`Camera-1`, 1412×1412, 16-bit;
   PVCAM despeckle filters on by default). nikon-control's notes named a
