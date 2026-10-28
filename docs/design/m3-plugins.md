@@ -2991,8 +2991,8 @@ modes *select* (default) and *drive* (`goto-well`, an explicit toggle,
 `nikon-control`'s "armed mode"); the tools in workflow order, each with
 its key parameters and an *advanced* fold from `describe_params`, a Run
 button and the progress; the run document as a checklist. A periodic
-callback every 250 ms drains the progress queue and refreshes the view on
-the server's thread (Bokeh models are not touched from the worker). A
+callback every second (§15.3: 250 ms in the first draft) reads `status()`
+on the server's thread (Bokeh models are not touched from the worker). A
 browser session that ends (a closed or reloaded tab) does nothing: the
 controller belongs to the server, not to a tab (§15.3). When the server
 stops, `close()` runs `stop()` if a run is going, then nothing else; the
@@ -3269,11 +3269,11 @@ class PlatePage:
   `RunDocumentError` that carries a record (FM-34). There is no `resume` in the
   page: `smc run --resume` is the way to continue a stopped stage in M3.
 - **`status()`** drains the progress queue (the latest `Progress` is kept, so
-  two sessions see the same) and reads the stand now; the page calls it every
-  tick and the stand every fourth tick (once a second): a scan must not be slowed
-  by a status poll, and the poll's cost on a real stand is not measured. **`view()`**
-  runs on an event (a click, a typed range, a capture, the end of a run) and on
-  a *Refresh* button, never on the tick.
+  two sessions see the same) and reads the stand now; the page's periodic
+  callback calls it once a second (`period=1000`) and no faster: a scan must
+  not be slowed by a status poll, and the poll's cost on a real stand is not
+  measured. **`view()`** runs on an event (a click, a typed range, a capture, the
+  end of a run) and on a *Refresh* button, never on the tick.
 - **`stop()`** sets the run's stop event (a plain attribute read, then
   `Event.set()`; no lock of the controller, FM-70), then `microscope.stop()`,
   and keeps what it did as `stop_note`, said by its outcome and never "stopped"
@@ -3332,7 +3332,7 @@ imports Panel). Decided so that the executor guesses nothing:
   controller, new widgets. A `PlatePageView` class holds the widgets and the
   figure, with `tick()` (the periodic callback's body, called by tests
   directly), `refresh()` (`view()` then redraw) and one method per handler.
-  `build` registers `pn.state.add_periodic_callback(view.tick, period=250)`.
+  `build` registers `pn.state.add_periodic_callback(view.tick, period=1000)`.
 - The map: `bokeh.plotting.figure(match_aspect=True)`, stage µm, Y up. One
   `ColumnDataSource` for the wells with the columns `name, x, y, w, h, angle,
   value, outline, outline_width, tip` (`angle` in radians, counter-clockwise,
