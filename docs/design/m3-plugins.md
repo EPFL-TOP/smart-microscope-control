@@ -2530,7 +2530,7 @@ def path_length_um(
   below `min_cells` or `n` fields are chosen, and removes the candidates
   whose footprint would overlap the chosen one (same orientation:
   `|d_col| < W` and `|d_row| < H` in pixels), so no cell is imaged twice.
-  Counting is numpy over cells × candidates in chunks (FM-74).
+  Counting is numpy in chunks (FM-74); what is counted is refined below.
 - **`order_route`**: nearest neighbour from `start`, then 2-opt on the
   open path with the first point fixed, Euclidean, until no swap shortens
   it by more than 1e-9 µm. The cost is distance: `timing.py`'s model is
@@ -2545,14 +2545,79 @@ def path_length_um(
   label inside the footprint. `travel_s` is the sum of `timings.move_ms`
   over the route when `timings` is usable, else `None`.
 
+**Refined while planning #194** (measured 2026-10-28 on a prototype that
+is not committed, with numpy 2.5.3 on Python 3.13 and numpy 1.26.0 and
+2.2.6 on Python 3.10):
+
+- **Counting is not cells × candidates.** Per cell, only the lattice
+  points inside the footprint's bounding box around it can hold it: a
+  window of `floor(W_um / step) + 3` by `floor(H_um / step) + 3` points
+  (`W_um`, `H_um` are `fov_um`), each then tested exactly. It gave the
+  counts of the brute force on 283 random cases (rotated, mirrored,
+  non-square, round and square wells). For 300 000 cells in a 96-well
+  well at 40× it took 0.6 s where cells × candidates took 12 s, and 0.6 s
+  again in a 6-well well, whose lattice has 34 times more candidates.
+  Bounds, checked before anything is allocated and on Python numbers, not
+  numpy integers (FM-74): the lattice holds at most 250 000 points (a step
+  of 5e-324 µm makes `int(half / step)` an `OverflowError`, and
+  `candidate_step_fraction` accepts 1e-9); cells × window at most 2³¹
+  tests; a chunk of at most 2¹⁸ elements (about 94 bytes each at the peak:
+  25 MB). A refusal is a `ValueError`, which the plugin turns into a
+  `PluginRunError` that names the field's size.
+- **No matrix product.** The pixel offset is computed from the four
+  entries of the inverse, written out: numpy 2.2.6 (Python 3.10, macOS
+  arm64) raised `RuntimeWarning: divide by zero encountered in matmul` for
+  `@` of a finite (N, 2) array by a 2 × 2 matrix from N = 2000 up (not for
+  1500, and not with numpy 1.26.0 or 2.5.3), which `-W error` turns into a
+  failure. The inverse comes from `pixel_of_stage` at three points, so the
+  sign convention stays in `geometry.py` and a singular matrix is refused
+  as it is there.
+- **The lattice** is centred on the well's centre (the centre is a
+  candidate and the lattice is symmetric) and reaches `floor(half /
+  step)` steps each way, `half` being the half-extent of the well's shape
+  in the stage axes (a square well turned by the plate: that of the
+  rotated rectangle). Numbering is row by row from +Y down, then +X.
+- **Membership and overlap.** A cell is in a field when its pixel offset
+  from the field's centre is within `W / 2` and `H / 2`, edges included.
+  Two fields overlap when `|d_col| < W − 1e-6` and `|d_row| < H − 1e-6`:
+  fields that touch are allowed. Each candidate is counted once, and a
+  count only goes down, so the greedy is lazy: the best candidate is
+  counted again over the cells that no chosen field holds, and when its
+  count fell (a cell exactly on the edge that two touching fields share
+  was held by the first) the new count replaces the old one and the round
+  starts again. That is the exact greedy (equal to recounting every
+  candidate every round on 150 inputs with cells on the lattice's edges),
+  it never chooses a field with fewer than `min_cells` new cells, and it
+  counts a cell once; `counts` and `uncovered` follow from it.
+- **Another objective.** The scan's own objective is not "another one": it
+  needs no turret and gains no line. The scan's `z_um` and `pfs_offset`
+  belong to its objective (FM-118: an autofocus offset is one recorded for
+  a sample and an objective), so for another objective every position's
+  `z_um` and `pfs_offset` are `None`, and `assumed` gains `z_um and
+  pfs_offset are unknown for <objective>: the scan's were measured with
+  <scan objective>` and `no offset between the two objectives is applied`.
+- **Reported.** `assumed` always says that the route minimises the
+  Euclidean distance between fields and that the stage's move time against
+  it is not measured. `uncovered` has every scanned well, in plan order,
+  zeros included; `counts` of a position has every wanted label, zeros
+  included. `distance_um` and `travel_s` cover the legs between wells too:
+  the first position has no leg. `name`'s `k` counts from 0 along the
+  well's route. `fov_um` is the extent of the (scaled) footprint.
+- **No route is no result.** When no well has a chosen field the stage is
+  a `PluginRunError` that says which of two things happened: the cells
+  stage found none of the wanted labels, or it found some and no allowed
+  field holds `min_cells` of them. A route of no position is of no use to
+  the export, and `done` would say that it is.
+
 **Tests** (hypothesis where marked): `test_no_field_leaves_its_well_or_enters_an_exclusion`
 (hypothesis over margins, exclusions, rotations); `test_chosen_fields_never_overlap`;
 `test_the_greedy_takes_the_densest_field_first`;
 `test_the_route_visits_every_field_once` (hypothesis);
 `test_two_opt_never_lengthens_the_route` (hypothesis, against the
 nearest-neighbour path); `test_wells_follow_the_scan_order`;
-`test_another_objective_scales_the_field`; `test_travel_time_is_none_without_timings`.
-**Failure modes**: FM-73, FM-74.
+`test_another_objective_scales_the_field`; `test_travel_time_is_none_without_timings`;
+the plan of #194 lists the rest. **Failure modes**: FM-73, FM-74, FM-98,
+FM-104, FM-118, FM-121, FM-124.
 
 ## 12. Timing (#24)
 
