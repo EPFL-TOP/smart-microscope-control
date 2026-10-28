@@ -96,6 +96,13 @@ the plan, do what it unlocks (labels, dependents), and end the session.
   cannot fail). #13's plan met both. Run `ruff check` and `mypy` on the
   prototype too: #148's plan prescribed a `del` of a closure variable,
   which ruff rejects (F821).
+  A library's behaviour holds for the version measured only: CI's
+  py3.10 job resolves older releases than a 3.13 venv, so a plan that
+  relies on one names the version and is checked on the oldest release
+  the project allows, too (`tifffile`'s `TiffFileError` is not a
+  `ValueError` in 2025.5.10, #23; `argparse` differed across 3.13 and
+  3.14, #177). A formula the design fixes is copied from it, not re-typed
+  (#21's grid size disagreed with §7.2).
 - **A new checklist entry is named by its text, never by a number.** The
   develop session takes the next free id when it writes the entry
   (`scripts/dev/next_fm_id.py`): #131's plan named FM-85, which #130 had
