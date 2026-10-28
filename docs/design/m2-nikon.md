@@ -3,7 +3,7 @@
 - **Status**: design for issue #13 (§1–§6, 2026-10-16); §3.3.1 and
   §3.11's stop rules decided in #144 (2026-10-18); §7 for #12
   (2026-10-19); §8 for #14 (2026-10-19); §8.10 for #167 (2026-10-20); §9
-  for #48 (2026-10-20); §10 for #15 (2026-10-20).
+  for #48 (2026-10-20); §10 for #15 (2026-10-20); §11 for #204 and #206 (2026-10-28).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1, this document is the contract between issues that are
   built in parallel. Names, module paths and signatures below are fixed; an
@@ -21,7 +21,7 @@ M2 brings the Nikon stands under the layer: the `Autofocus` capability and
 the Z interlock (#13), `ObjectiveTurret`, `LightSource` and `Channels`
 (#14), the stand knowledge from `nikon-control` (#12), the configuration
 builder (#15) and a truthful probe (#48). §1–§6 fix #13; §7 fixes #12;
-§8 fixes #14; §9 fixes #48; §10 is #15's.
+§8 fixes #14; §9 fixes #48; §10 is #15's; §11 is #204's, a stand that refuses `stop()`.
 
 Not in #13: one-shot autofocus (`fullFocus`), a CLI command for the
 autofocus, the piezo (§2), camera-clocked sequences, and the Zeiss
@@ -232,7 +232,7 @@ completed and PFS stayed on, following it.
 | Locked `focus_by_um`: the offset move and the relock | the offset device's; `disengage()` | PFS off, offset device stopped, then Z's stop (#140) | yes | yes |
 | A direct `engage()`'s lock wait (`PFS`) | `disengage()` | **PFS off, then Z's stop** | yes | yes |
 | A direct `set_offset_native` / `offset_by_native`, PFS on (`PFSOffset`, or `PFS` without an offset device) | the offset device's | **PFS off, offset device stopped, then Z's stop** | yes | yes |
-| The same move, PFS off | the offset device's | no: it moves no Z (assumed, §4 item 5) | yes | yes |
+| The same move, PFS off | the offset device's | no: it moves no Z (measured, §4.5, §11.9) | yes | yes |
 | PFS holding focus, no action running | (not a motion) | no | PFS off | no: left as it is |
 
 "yes" in the last two columns: the emergency stop's order (§3.11), PFS off
@@ -318,6 +318,9 @@ first, then the offset device, then the stages.
   move with PFS off*: the Z stop would stop a lens move that moves no Z, and
   report PFS "left off" when it was never on. If #16 finds that an offset
   move with PFS off does move Z (§4 item 5), the condition becomes "always".
+- **On a stand that refuses the Z or offset stop** (the Ti2-E), every
+  stop is still sent in this order, and PFS off is what ends a Z move PFS
+  drives (§11.9).
 - **Halted, no link is called** (#140): the emergency stop sends every stop
   itself, in its own order. `close()` keeps the links (§3.11).
 
@@ -587,6 +590,8 @@ of the Z move. The CLI prints it as any `HardwareError` (exit 1).
   correction. A failure is one more entry in the `HardwareError` that names
   each failure. `close()` with nothing moving leaves the autofocus as it is:
   PFS holding focus after smc exits is a legitimate state.
+- **A refused stop** (a stand that declares `[safety] stop_refused_by`)
+  is reported as such, never as a fault or as a stop: §11.5.
 - **The offset device is stopped next** (#140): right after the switch-off
   and before the stages, by its `autofocus_offset` role, whether or not the
   autofocus was built or overridden. Its failure entry is
@@ -2425,3 +2430,336 @@ for it.
   aside, never dropped.
 - That a carried line with bytes that are not UTF-8 means to MMCore what it
   meant before: the bytes are kept, and MMCore reads bytes.
+
+## 11. A stand that refuses `stop()` (#204, #206)
+
+Extends M1 §13 (*Stop and halt*), §3.3.1 and §3.11. **Merging this section
+decides it**: §11.2 puts the four questions of #204 with the options not
+chosen and why. #206 (the Ctrl-C line) is built with it, since both change
+the same stop paths. Segmenting a long move is #221.
+
+### 11.1 What is known
+
+Measured in Ti2-E session 1 (#208; `nikon-ti2.md`, *Session 1*), unless
+labelled:
+- `core.stop()` raises `RuntimeError('Error in device "XYStage":
+  Unsupported device command (11)')` for `XYStage`, `ZDrive` and
+  `PFSOffset`, still or moving. `PFS` answers `Cannot stop "PFS": not a
+  stage`. Two refusals came back within 1 ms (B1: 6.737 s, 6.738 s).
+- **A move that was sent runs to its target.** In stop drill 2 (`smc stage
+  jog 20000 0 --force`, then Ctrl-C under way), the stage went the full
+  20000 µm.
+- **Switching PFS off stops a Z move that PFS drives**, at once (B5, one
+  trial). With PFS off, an offset move moves no Z (§4.5: +10 and +50 units,
+  Z unchanged).
+- `deviceBusy("ZDrive")` and `deviceBusy("PFSOffset")` never read True
+  (§4.9). Two things were not read, since the console of drill 2 was not
+  kept: whether `deviceBusy("XYStage")` reads True during a move, and
+  whether `setXYPosition` returns before the move ends.
+- **What the layer does today**, reproduced on a `FakeCore` whose `stop()`
+  raises that error (2026-10-28, `main` b09fe21):
+  - A Ctrl-C during an XY move logs `xy_stage XY: stop after
+    KeyboardInterrupt failed (HardwareError('xy_stage: stop('XY') failed
+    (…Unsupported device command (11)); check the device: power, cable,
+    another program holding it')); it still reads busy, so it counts as
+    moving until it is idle`. The CLI then prints `interrupted — any move
+    under way was stopped` (#206).
+  - `close()` sends every stop again, and every one is refused. It logs
+    `close: xy_stage XY still moving; the stages were stopped`, then one
+    ERROR per refusal.
+  - `Microscope.stop()` switches the autofocus off, sends every stop and
+    raises `the emergency stop failed for XYStage 'XY' (…check the device:
+    power, cable…); ZStage 'Z' (…)`.
+
+  "Check the device: power, cable" is the wrong advice for this refusal:
+  nothing is broken.
+
+### 11.2 Decisions
+
+**D1. How a stand declares it: a profile key, `[safety] stop_refused_by`.**
+It lists the roles whose device refuses `stop()`. A hardware session fills
+it, and a hardware contract checks it at each later session (§11.7).
+- **The stop is still sent** to a declared role. It costs one call that
+  returns at once (§11.1), and if the declaration is wrong (a firmware that
+  accepts the stop), the stop works. The declaration changes what the layer
+  promises and says. It never changes what the layer sends.
+- An **undeclared** refusal is still a failure, as today, but its message
+  says the move may still be running.
+- Not chosen: *a probe at open* (`stop()` on each stage as the stand opens).
+  Every `smc` command would then send a command to every stage. A transient
+  fault would be read as a refusal. On a stand whose stop works, the probe
+  would cancel a move started from the stand's own controls.
+- Not chosen: *learning from the first refusal*. By then the first move,
+  the one that matters, is already running, and nothing could be said
+  before it.
+
+**D2. Long moves: not segmented for now** (#221). Every message says that
+a sent move runs to its target. Only today's guards bound such a move:
+- the jog limits;
+- the soft limits;
+- a plugin's stop event, which m3's tools check between moves. A STOP
+  during a scan therefore ends it after the current field move (m3 §15.1).
+
+Why that is enough for now:
+- On an inverted stand, the axis that crashes is Z. A Z move sent by smc
+  is bounded by `max_z_jog_um` and `z_soft_limits_um`, and a Z move that
+  PFS drives stops when PFS is switched off (§11.9).
+- An XY move ends inside `xy_soft_limits_um`.
+
+Not chosen now:
+- *Cutting a long move into segments* that can be abandoned between sends,
+  with a profile cap on one segment. This is safe only if the layer knows
+  that a segment has ended before it sends the next. The Ti2-E's Z drive
+  never reads busy (§4.9), and neither the XY busy state nor whether
+  `setXYPosition` blocks has been read. Until session 2 makes the two reads
+  that #221 lists, the end of a segment would be assumed.
+- *Refusing a long move on such a stand.* A plate traverse is legitimate,
+  and the jog guard already refuses a long relative move without `--force`.
+
+**D3. Contracts.** For a declared role:
+- `test_stop_on_an_idle_stage_is_harmless` is skipped, citing the
+  declaration, as the turret's skips cite §8.8.
+- A new contract checks the declaration on the stand (§11.7). A firmware
+  that starts to accept the stop fails it, and the profile is then
+  corrected.
+
+**D4. Z under PFS: §3.3.1's table holds** (§11.9). Every row in which PFS
+drives Z switches PFS off first, and that works on this stand. Only the
+plain Z move loses its stop.
+
+### 11.3 Profile — `profile.py`, `safety.py`
+
+```toml
+[safety]
+# stop_refused_by = []  # roles whose device refuses stop(): "xy_stage", "focus", "autofocus_offset"; measured at a stand (m2 §11)
+```
+
+```python
+class SafetySection(_Section):  # gains, after its M2 keys
+    stop_refused_by: tuple[Role, ...] = ()
+```
+
+Validation, each a `ProfileError` naming `safety.stop_refused_by`: every
+value is one of `xy_stage`, `focus` and `autofocus_offset`, the roles with a
+stop (the message lists them), and no value appears twice. `Profile.demo()`
+and `profiles/demo.toml` stay equal: the demo declares nothing, and the
+commented line above goes into `demo.toml`. `profiles/README.md` documents
+the key. `profiles/nikon-ti2.toml` sets `stop_refused_by = ["xy_stage",
+"focus", "autofocus_offset"]`, measured in session 1 (#208).
+
+`Safety(..., stop_refused_by: frozenset[str] = frozenset())` takes the
+roles' values, since `safety.py` reads no profile model. The facade passes
+`frozenset(role.value for role in safety.stop_refused_by)`.
+
+### 11.4 Motion, the Executor and errors — `safety.py`, `errors.py`, `backends/mm.py`
+
+```python
+@dataclass(frozen=True, slots=True)
+class Motion:  # gains, last
+    # The profile declares that the device refuses stop() (m2 §11).
+    stop_refused: bool = False
+```
+
+`mm._motion(core, label, name, *, stoppable: bool, stop_refused: bool =
+False)` and `autofocus_offset_motion(core, label, *, stop_refused: bool =
+False)`. Each sets the field from `safety.stop_refused_by`:
+- `MMXYStage` from `"xy_stage"`;
+- `MMZStage` from `"focus"`;
+- the offset device's motion from `"autofocus_offset"`, in `MMAutofocus`
+  and in the facade's `_stop_one` alike, so both build the same `Motion`.
+
+The autofocus lock wait (its stop switches PFS off) and the `State`
+devices are unchanged.
+
+```python
+class StopRefusedError(HardwareError):
+    """A stop the device refused, as the profile declares ([safety] stop_refused_by).
+
+    Not a fault: nothing is broken, and a move under way runs to its target.
+    """
+
+    def __init__(self, refused: tuple[str, ...], message: str = "") -> None:
+        self.refused = refused  # motion names: ("xy_stage XYStage",)
+        ...  # default message below; __reduce__ as MotionStoppedError's
+
+
+class StopOutcome(str, Enum):
+    accepted = "accepted"  # the device took the stop
+    refused = "refused"  # the device raised: a move under way may run to its target
+    impossible = "impossible"  # no stop from smc (a State device)
+    interrupted = "interrupted"  # a second Ctrl-C cut the stop: it may not have reached the device
+
+
+@dataclass(frozen=True, slots=True)
+class StopNote:
+    motion: str  # "xy_stage XYStage"
+    outcome: StopOutcome
+    declared: bool  # the motion's stop_refused
+
+
+def note_stop(exc: BaseException, note: StopNote) -> None: ...
+def stop_notes(exc: BaseException) -> tuple[StopNote, ...]: ...
+```
+
+- **Default message** of `StopRefusedError`: `` `xy_stage XYStage` refused
+  the stop, as the profile declares ([safety] stop_refused_by): a move under
+  way runs to its target; stop it with the stand's own controls if it must
+  not finish ``. Several names are joined with `, ` and `and`.
+- **Notes ride on the exception** that ended the wait (a
+  `KeyboardInterrupt`, usually), in an attribute `_smc_stop_notes`. It is a
+  tuple, and `note_stop` appends to it. A note holds only strings, an enum
+  and a bool, so it can hold no traceback (FM-98). `stop_notes` collects the
+  notes of `exc` and of its `__context__` chain, oldest first, and stops at
+  an exception it has already seen. Measured on Python 3.13 (2026-10-28): a
+  `KeyboardInterrupt` takes the attribute, and the attribute survives a
+  re-raise. CI's 3.10 job runs the same tests.
+- **`Executor.stop(motion)`.** When `motion.stop_refused` is set and the
+  device's own stop raised, it raises `StopRefusedError((motion.name,))`,
+  chained from the device's error. A failing linked call is unchanged. The
+  WARNING line keeps its form, `<name>: stop failed (<error>)`, and gains
+  the note `; the profile declares this refusal ([safety] stop_refused_by),
+  so a move under way runs to its target`.
+- **The give-up** (`_give_up`, internal) returns its text and its
+  `StopOutcome`. For a declared refusal, the text is `the stand refuses its
+  stop, as the profile declares ([safety] stop_refused_by), so it runs to its
+  target`. An undeclared refusal keeps `the stop failed (<error>), so it may
+  still be moving`. `DeviceTimeoutError` and the timeout's
+  `MotionStoppedError` carry that text, as today. The public `give_up()`
+  still returns the text alone.
+- **`_move`'s `except BaseException`** notes the give-up's outcome on the
+  exception, once `_give_up` has returned (`StopNote(motion.name, outcome,
+  motion.stop_refused)`). If `_give_up` itself raises (a second Ctrl-C
+  inside the stop call), that new exception gets `StopNote(motion.name,
+  interrupted, motion.stop_refused)` before it propagates. Its `__context__`
+  is the first exception, which `stop_notes` also reads.
+- **A stop requested during a move on a declared device** (the generation
+  moved, then the device read idle) still raises `MotionStoppedError`: the
+  caller asked for a stop, so the plan's next step must not run (M1 §13).
+  Its detail becomes `a stop was requested during the move, but the profile
+  declares that it refuses its stop ([safety] stop_refused_by), so it may
+  have run to its target`.
+- Nothing changes in what is sent, or in the order of the sends (FM-17,
+  FM-62). Every stop is still sent before any line.
+
+### 11.5 Facade — `microscope.py`
+
+- `_stop_stages()` returns a private `_Stops(done: list[str], refused:
+  list[str], failed: list[str])`, collected past every failure as today:
+  - `done` gets `autofocus <label> off` for a `disengage()` that returned,
+    and the motion name of each stop that was accepted;
+  - `refused` gets the names of each `StopRefusedError.refused`;
+  - `failed` gets today's entries, unchanged.
+- **`stop()`**:
+  - Nothing refused or failed: it returns, as today.
+  - Refusals only: it raises `StopRefusedError(refused, message)`:
+    `the emergency stop halted the microscope[ and switched autofocus PFS
+    off], but xy_stage XYStage, z ZDrive and autofocus_offset PFSOffset
+    refused the stop, as the profile declares ([safety] stop_refused_by): a
+    move under way runs to its target. The microscope stays halted: stop
+    the stage with the stand's own controls if it must not finish its move,
+    then call `resume()``.
+  - Any failure: today's `HardwareError` text, `the emergency stop failed
+    for <failed>`. When there were refusals too, it adds `; <names> refused
+    the stop, as the profile declares ([safety] stop_refused_by), so a move
+    under way runs to its target`, then today's ending.
+- **`close()`** (`_stop_if_moving`) logs after the stops, as today (FM-62).
+  It writes one WARNING, `close: <moving> still moving; <outcome>`. The
+  outcome is made of these clauses, joined with `; `:
+  - `stopped: <done>`, when `done` is not empty;
+  - `refused, as the profile declares ([safety] stop_refused_by), so a move
+    under way runs to its target: <refused>`;
+  - `not stopped: <n> failed`.
+
+  Then it writes one ERROR per failure, as today. It never writes "the
+  stages were stopped" (#206). Unloading does not wait for a refused move
+  to end: Ctrl-C must let smc exit, and the stand finishes the move on its
+  own. What unloading does to a stage that is still moving is unverified
+  (§11.10).
+
+### 11.6 CLI — `cli.py`
+
+- **The Ctrl-C line** (`_report`, #206) is built from
+  `stop_notes(exc)`. Its tail stays `read the position (smc stage get, smc z
+  get) before the next move`, and the exit code stays 130.
+  - No note: `interrupted — no move was under way; read the position …`.
+    The layer sends a move only inside `_move`'s `try`, and every Ctrl-C
+    inside it leaves a note.
+  - Notes: `interrupted — <clauses>; …`, one clause per note, joined with
+    `; `:
+    - accepted: `<name> was stopped`;
+    - refused, declared: `<name> refuses a stop on this stand ([safety]
+      stop_refused_by), so it runs to its target`;
+    - refused, undeclared: `<name> refused the stop, so it may still be
+      moving`;
+    - impossible: `<name> cannot be stopped from smc, so it may still be
+      moving`;
+    - interrupted: `the stop of <name> was cut by a second Ctrl-C, so it
+      may still be moving`.
+  - When any note is not *accepted*, the tail starts with `let it finish
+    or stop it with the stand's own controls, then read the position …`.
+- **Before a move**, one line `! the profile declares that this stand
+  refuses stop() on <roles> ([safety] stop_refused_by): once sent, a move
+  runs to its target, and Ctrl-C ends smc, not the move`. It is printed
+  after the stand opens and before anything is sent, never in dry-run:
+  - by `stage move` and `stage jog`, when `xy_stage` is declared;
+  - by `z move` and `z jog`, when `focus` is declared;
+  - by `smc run`, when any role is declared, listing every declared role.
+
+  `smc doctor` prints the same line after the role table, with every
+  declared role. One helper builds the line.
+
+### 11.7 Contracts — `tests/contracts/test_xy_stage.py`, `test_z_stage.py`
+
+- `test_stop_on_an_idle_stage_is_harmless` skips when its role is declared:
+  `the profile declares that this stand refuses a stop of xy_stage ([safety]
+  stop_refused_by, m2 §11)`, and the same with `focus`.
+- `test_a_declared_stop_refusal_still_holds`, in both files, skips when its
+  role is not declared. Otherwise the stage's `stop()` must raise
+  `StopRefusedError`, and the next move must still run and land (the same
+  move and tolerance as the idle-stop contract). The envelope keeps
+  `stop_refused_by`, since it copies every `[safety]` key it does not
+  replace (`model_dump`).
+
+### 11.8 FakeCore — `smc/testing/fakes.py`
+
+`stop_refused: set[str]` is a new knob. It lists the labels whose `stop()`
+is logged, then raises `RuntimeError('Error in device "<label>":
+Unsupported device command (11)')`, the Ti2-E's text. `busy_devices` is
+left alone, so a busy device stays busy: the move goes on. Through
+`as_hardware_errors`, the error reaches the layer as `xy_stage: stop('XY')
+failed (…)`, measured with a prototype (2026-10-28).
+
+### 11.9 §3.3.1 on the Ti2-E
+
+Every stop is still sent in §3.3.1's order. With `ZDrive` and `PFSOffset`
+refusing theirs:
+
+| Motion | What still stops it |
+|---|---|
+| Z move (`ZDrive`) | nothing from smc: it runs to its target, inside `max_z_jog_um` and `z_soft_limits_um` |
+| Relock after an interlocked Z move | PFS off (`disengage()`, `ZStage.stop()`'s link, the emergency stop) |
+| Locked `focus_by_um` | PFS off. The offset lens finishes its move, which with PFS off moves no Z (§4.5) |
+| A direct `engage()` | PFS off |
+| A direct offset move, PFS on | PFS off, then as above |
+| The same move, PFS off | nothing, and nothing needs to: it moves no Z (§4.5, measured) |
+| PFS holding focus | PFS off (the emergency stop) |
+
+`ZStage.stop()` on a link still switches PFS off first. Then Z's own
+refusal raises `StopRefusedError`, and the compound reports its
+`MotionStoppedError` naming Z, "so autofocus PFS was left off", which is
+true. #205 (engaging PFS drives Z to the stored offset's plane) is a
+separate decision: it is about where `engage()` takes Z, not how the move
+is stopped.
+
+### 11.10 Not verified
+
+- Whether `deviceBusy("XYStage")` reads True for the whole of a move, and
+  whether `setXYPosition` blocks (#221, session 2). Until then, a Ctrl-C
+  during an XY move on the Ti2-E may arrive only once the move has ended.
+- What `unloadAllDevices()` does to a Ti2-E stage that is still moving.
+  Drill 2 suggests no harm, but its console was not kept.
+- B5's "PFS off stops Z at once" rests on one trial.
+- `test_a_declared_stop_refusal_still_holds` on the Ti2-E: the owner runs
+  it at session 2.
+- The wording of m3 §15's STOP on such a stand. The page shows `stop()`'s
+  error text (§15.1), and its own label is m3's, after #214.
