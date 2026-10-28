@@ -795,9 +795,11 @@ def test_a_step_derived_from_the_reported_pixel_size_is_capped(
     with pytest.raises(PluginRunError, match="step 2000 µm"):
         _run(demo_microscope, tmp_path)  # 2000 µm is far beyond the field: no fit
 
-    assert stage.targets[:2] == pytest.approx(
-        [(start[0] + 2000.0, start[1]), (start[0], start[1] + 2000.0)]
-    )
+    # One target at a time: pytest 9.2 refuses `approx` on a list of tuples.
+    expected = [(start[0] + 2000.0, start[1]), (start[0], start[1] + 2000.0)]
+    assert len(stage.targets) >= 2
+    for target, wanted in zip(stage.targets[:2], expected, strict=True):
+        assert target == pytest.approx(wanted)
 
 
 def test_a_capped_step_says_so_in_the_result(
