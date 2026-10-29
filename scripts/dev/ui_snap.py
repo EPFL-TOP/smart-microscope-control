@@ -59,7 +59,8 @@ ALLOWED_STANDS = ("demo-sample", "demo")
 SERVING_LINE = "serving the plate page"
 #: The page redraws on a 1 s tick (m5 §3): one pause after each action.
 SETTLE_MS = 1500
-#: Playwright waits 30 s for a disabled control by default: a state is not worth that.
+#: Playwright waits 30 s for a disabled control by default: a state is not worth that
+#: (FM-162).
 DEFAULT_TIMEOUT_MS = 10_000
 STEP_TIMEOUT_S = 120.0
 SERVE_TIMEOUT_S = 60.0
