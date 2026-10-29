@@ -85,11 +85,14 @@ Paused until this works: M4, M5 (except the plate page), M6, the Ti-E
 
 ## M5 — Web UI
 
-- Framework spike per ADR-0006: the same minimal shell in Panel and in
-  NiceGUI on the demo devices; the owner decides by looking.
+- Panel, per ADR-0006 (accepted 2026-10-26 without the spike). The M3
+  plate page is the shell's first version; M5 grows it (design:
+  `docs/design/m5-web-ui.md`).
 - The shell: connect, status strip with Stop, live view, drive, tools rail
   grouped by workflow stage, generated plugin forms, run document as a
   checklist. Identical on every microscope; deployable as a service.
+  Issues: #28 (`smc ui`, every plugin, result cards, Snap), #262 (live),
+  #263 (drive, with a command per action), #264 (service, Connect).
 
 ## M6 — Viventis LS1 (×2)
 
