@@ -57,8 +57,9 @@ dev = [
 detect = ["torch>=2.2", "torchvision>=0.17"]
 # Zeiss stands reached through Zeiss MTB 2011 (.NET) — Windows only.
 zeiss = ["pythonnet>=3.0; sys_platform == 'win32'"]
-# User interface extra: populated once ADR-0006 is accepted.
-ui = []
+# The plate page (m3 §15, ADR-0006): Panel on Bokeh; imported only by `smc.ui.plate_page`.
+# 1.9 is the oldest measured (Python 3.10); a floor below what CI resolves proves nothing.
+ui = ["panel>=1.9,<2"]
 
 [project.scripts]
 smc = "smc.cli:main"
@@ -169,6 +170,13 @@ follow_untyped_imports = true
 # torch is an optional extra: typed as Any with or without it, so mypy agrees on every PC (measured, m3 §9.0).
 [[tool.mypy.overrides]]
 module = ["torch", "torch.*", "torchvision", "torchvision.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
+# Panel is an optional extra: without the skip, `pn.widgets.Button(...)` is a no-untyped-call
+# with it installed and an import-not-found without it (measured, m3 §15.3), as torch's.
+[[tool.mypy.overrides]]
+module = ["panel", "panel.*", "bokeh", "bokeh.*", "param", "param.*"]
 ignore_missing_imports = true
 follow_imports = "skip"
 
