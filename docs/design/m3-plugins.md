@@ -3177,8 +3177,8 @@ smc ui plate [-p PROFILE] --run-doc PATH [--port 5006] [--dry-run]
 It checks `--run-doc` as `smc run` does (§1.10, step 2), opens the stand
 once for the page's life (one connection at a time), serves the page with
 `panel.serve` on `localhost`, and closes the stand when the server stops.
-Without the `ui` extra it exits 1 with "install the ui extra: pip install
--e .[ui]".
+Without the `ui` extra it exits 1 with `install the ui extra: pip install
+-e ".[ui]"` (§15.3 fixes the order of its checks and its Ctrl-C).
 
 ### 15.1 The controller
 
@@ -3218,12 +3218,13 @@ class PlatePage:
   to** is `goto-well`.
 - `stop()` sets the stop event, then `microscope.stop()` (the emergency
   stop of M1 §13), in that order.
-- `view()` is a pure snapshot built from a fresh `RunDocument.load_or_new`
-  and the stand's state: every well (`well_geometry` of the `plate` slot,
-  or of the nominal plate before one exists), the selection, the density
-  per label when `density` is usable, the route's points when `route` is,
-  the stage position, the objective, the autofocus state, and the
-  checklist of the slots of §2.2 with `unusable`'s reason for each.
+- `view()` is a pure snapshot built from a fresh `RunDocument.load_or_new`:
+  every well (`well_geometry` of the `plate` slot, or of the nominal plate
+  before one exists), the selection, the density per label when `density`
+  is usable, the route's points when `route` is, and the checklist of the
+  slots of §2.2 with `unusable`'s reason for each. The stand's state (the
+  stage position, the objective, the autofocus state) is `status()`'s, not
+  `view()`'s: they refresh at different rhythms (§15.3).
 
 ### 15.2 The page
 
@@ -3235,21 +3236,414 @@ modes *select* (default) and *drive* (`goto-well`, an explicit toggle,
 `nikon-control`'s "armed mode"); the tools in workflow order, each with
 its key parameters and an *advanced* fold from `describe_params`, a Run
 button and the progress; the run document as a checklist. A periodic
-callback every 250 ms drains the progress queue and refreshes the view on
-the server's thread (Bokeh models are not touched from the worker). On
-session end: `stop()` if a run is going, then nothing else; the stand
-closes with the server. No turret control, no Z control: the page offers
-none in M3.
+callback every second (§15.3) reads `status()`
+on the server's thread (Bokeh models are not touched from the worker). A
+browser session that ends (a closed or reloaded tab) does nothing: the
+controller belongs to the server, not to a tab (§15.3). When the server
+stops, `close()` runs `stop()` if a run is going, then nothing else; the
+stand closes with the command. No turret control, no Z control: the page
+offers none in M3.
 
 **Tests**: the controller on `fake_microscope` and the demo, with stub
 plugins through `EntryPoint`s (§1.12): `test_a_click_and_a_typed_range_build_the_same_selection`;
 `test_run_goes_through_the_same_parameters_as_the_cli`;
 `test_a_second_run_while_one_runs_is_refused`; `test_stop_sets_the_event_then_stops_the_stand`;
 `test_captured_references_reach_plate_registration`;
-`test_the_view_shows_why_a_stage_is_unusable`. The page itself:
+`test_the_view_shows_why_a_stage_is_unusable`;
+`test_a_drive_click_on_another_plates_map_moves_nothing`. The page itself:
 `test_the_page_builds_on_the_demo` with `pytest.importorskip("panel")`;
-CI installs `.[dev,ui]` (#197 edits the workflow). **Failure modes**:
+CI's `test` job installs `.[dev,ui]` (#197 edits the workflow; `lint` keeps
+`.[dev]`, so that `mypy` is proved without the extra, §15.3). **Failure modes**:
 FM-98, FM-70 (the stop path takes no lock the worker holds), FM-44.
+
+### 15.3 Refined while planning #197
+
+Measured 2026-10-28 on throwaway prototypes that are not committed: Panel
+1.10.0 with Bokeh 3.10.1 on Python 3.13.0 and Panel 1.9.4 with Bokeh 3.9.2 on
+Python 3.10.10 (what `panel>=1.4` resolves to on each today), macOS,
+`useq-schema` 0.9.2.
+
+- **Without a browser** these work: `figure.on_event(Tap, f)` is called by
+  `figure._trigger_event(Tap(figure, x=12.5, y=-3.0, sx=1, sy=2))` with the
+  data coordinates; `source.data = {...}` replaces a source's data with no
+  document; `pn.Column(...).get_root()` builds the Bokeh model; `button.clicks
+  += 1` calls an `on_click` handler; `pn.state.add_periodic_callback(f,
+  period=250, start=False)` returns a `PeriodicCallback`.
+- **Serving**: `pn.serve({"": factory}, port=p, address="127.0.0.1",
+  show=False, threaded=True)` returns a `StoppableThread`; `GET /` answers
+  200 (11 to 16 kB) and a page of a button and a text holds no external URL;
+  `stop()` returns at once, and on 3.10 `is_alive()` is still true right after
+  it, so `join(timeout=10)` follows. **A taken port is silent**: the thread
+  dies with an `OSError` traceback on stderr and `serve` has already returned.
+- **A blocking `pn.serve` swallows Ctrl-C.** Bokeh installs its own SIGINT
+  handler: `serve` returns normally (exit 0), no `KeyboardInterrupt` reaches
+  the caller, and nothing in the caller says that the operator interrupted.
+  With `threaded=True` and the main thread in a loop of `thread.join(0.1)`,
+  SIGINT is a `KeyboardInterrupt` in the main thread (exit 130, the server
+  stops in 0 s). Both Pythons, POSIX; Windows not measured (the 0.1 s slice is
+  M1's FM-83 remedy).
+- **Cost of a plate.** `well_geometry` for every well takes 0.2 ms (6 wells),
+  1.7 ms (96), 22 ms (384) and **339 ms (1536)**; `all_well_positions` 5 ms for
+  1536. 96-well wells are round; 384- and 1536-well wells are squares
+  (`circular=False`). A view rebuilt every 250 ms would spend the 1536-well
+  time four times a second.
+- **mypy.** `mypy --strict` passes with Panel installed and not when `panel.*`,
+  `bokeh.*` and `param.*` are `ignore_missing_imports` with `follow_imports =
+  "skip"` (as torch, §9.0); without it, `pn.widgets.Button(...)` is a
+  `no-untyped-call` with Panel installed and `import-not-found` without.
+  `sys.modules["panel"] = None` makes `import panel` raise `ModuleNotFoundError`.
+- **Names that warn.** Panel 1.9.4 and 1.10.0 raise a `PendingDeprecationWarning`
+  for a widget's `name=` and for `Button(button_type=...)`. With `label=` and
+  `color="danger"`, and with the figure, `circle`, `rect`, `scatter`, `line`,
+  `LabelSet`, `ColorBar`, `LinearColorMapper(nan_color=...)`, `Accordion`, `Card`,
+  `Toggle`, `Select`, `TextInput`, `pane.Markdown` and `pane.Bokeh`, a prototype
+  builds under `warnings.simplefilter("error")` on both. The page uses those
+  spellings, and its tests run with `PendingDeprecationWarning` as an error.
+- **Not measured**: a real browser (the click that raises `Tap`, the periodic
+  callback of a session, the look), Windows, RDP, a PC with no internet, and
+  the cost of `Microscope.state()` on a real stand. The one-second tick runs
+  it on Bokeh's server loop, the loop that also handles a click on STOP: a
+  device read that hangs in a vendor SDK would delay the STOP click, whatever
+  the lock (`state()` takes none, FM-16). The first hardware session times the
+  tick on the Ti2-E.
+
+**The types** (`smc/ui/controller.py`, no Panel import):
+
+```python
+@dataclass(frozen=True, slots=True)
+class WellView:
+    well: str
+    center_um: tuple[float, float]
+    size_um: tuple[float, float]
+    circular: bool
+    rotation_deg: float
+    selected: bool
+    counts: dict[str, int] | None
+    per_mm2: dict[str, float] | None
+```
+
+`counts` and `per_mm2` are the well's `DensityWell` values per label, `None`
+when `density` is not usable or does not list the well; `per_mm2` is also
+`None` where the density is unknown (area 0).
+
+```python
+@dataclass(frozen=True, slots=True)
+class RouteStop:
+    order: int
+    well: str
+    x_um: float
+    y_um: float
+```
+
+```python
+@dataclass(frozen=True, slots=True)
+class CheckItem:
+    slot: str
+    optional: bool
+    state: Literal["ok", "not run", "unusable"]
+    reason: str | None
+```
+
+`state` is `not run` when the slot has no provider and `unusable` when
+`RunDocument.unusable` gives a reason (its text, as it is); `reason` is `None`
+for `ok`. The slots, in this order: `camera-calibration` (optional), `plate`,
+`timings` (optional), `scan-plan`, `scan`, `cells`, `density`, `route`,
+`report`, `nis-export`.
+
+```python
+@dataclass(frozen=True, slots=True)
+class PlateView:
+    plate: str
+    nominal: bool
+    wells: tuple[WellView, ...]
+    labels: tuple[str, ...]
+    route: tuple[RouteStop, ...]
+    checklist: tuple[CheckItem, ...]
+    blocked: dict[str, str]
+    problems: tuple[str, ...]
+```
+
+`nominal` is true when the wells are those of the plate type with A1 at (0, 0)
+and rotation 0, not a registered plate. `labels` are `DensityResult.labels`
+(`()` without a usable density). `blocked` maps a registered tool's name to why
+it cannot run now: the first `unusable` reason of a slot in its `reads`, else
+`this stand has no <Capability>` for the first of its `requires` that
+`microscope.has` refuses; a tool that can run is absent. `problems` are one-line
+texts of what `view()` could not read and did not hide: `run document: <the
+RunDocumentError>` (the view then shows `RunDocument.new()`: every slot `not
+run`, the nominal plate), and `<slot>: result does not validate: <first
+error>` for a usable slot whose result its model refuses (FM-125); `view()`
+raises nothing for a document or a result.
+
+```python
+@dataclass(frozen=True, slots=True)
+class ToolView:
+    name: str
+    summary: str
+    stage: str
+    key: tuple[tuple[str, str, str, str], ...]
+    advanced: tuple[tuple[str, str, str, str], ...]
+```
+
+The rows are `describe_params` rows (name, type, default, notes) without the
+keys the page fills itself; `key` holds the keys of `KEY_PARAMS[name]` in that
+order, `advanced` the rest in declaration order. A tool is shown only when the
+registry holds it and `STAGES` names it (a plugin the table does not name is
+not on the page in M3):
+
+```python
+STAGES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Set up", ("camera-calibration", "plate-registration", "plate-finding", "timing")),
+    ("Choose", ("scan-plan",)),
+    ("Acquire", ("scan",)),
+    ("Find", ("cells", "density", "route")),
+    ("Report", ("report", "nis-export")),
+)
+KEY_PARAMS: dict[str, tuple[str, ...]] = {
+    "camera-calibration": ("step_um",),
+    "scan-plan": ("objective", "overlap", "coverage"),
+    "scan": ("autofocus",),
+    "cells": ("score_threshold",),
+    "route": ("labels", "fields_per_well"),
+}
+PAGE_PARAMS: dict[str, tuple[str, ...]] = {
+    "plate-registration": ("plate", "refs", "walls"),
+    "scan-plan": ("wells",),
+}
+```
+
+```python
+@dataclass(frozen=True, slots=True)
+class PageStatus:
+    dry_run: bool
+    running: str | None
+    progress: Progress | None
+    outcome: str | None
+    stop_note: str | None
+    xy_um: tuple[float, float] | None
+    z_um: float | None
+    objective: str | None
+    autofocus: str
+    light_on: bool | None
+    moving: tuple[str, ...]
+    halted: bool
+    stop_refused: tuple[str, ...]
+    problems: tuple[str, ...]
+```
+
+`xy_um` to `moving` and `halted` are `Microscope.state()`'s (a read that takes
+no lock and tolerates a failed device: its `errors` become `problems`);
+`light_on` is `LightSource.is_on()` (`None` unknown or no light source);
+`autofocus` is one of `no autofocus`, `autofocus ?`, `autofocus off`,
+`autofocus on, not locked`, `autofocus locked` (the words of
+`Microscope.describe`); `stop_refused` are the roles of the profile's
+`[safety] stop_refused_by`, so the page can say that STOP does not stop a move
+in flight on this stand (FM-117).
+
+**What §15.1 gains** (additive; every name below is new):
+
+```python
+class PlatePage:
+    def __init__(
+        self,
+        microscope: Microscope,
+        run_doc: Path,
+        *,
+        entry_points: Iterable[EntryPoint] | None = None,
+    ) -> None: ...
+
+    current: str | None
+
+    @property
+    def plate(self) -> str: ...
+    def choose_plate(self, name: str) -> None: ...
+    def tools(self) -> tuple[ToolView, ...]: ...
+    def click(
+        self, x_um: float, y_um: float, *, drive: bool, side: str = "centre"
+    ) -> str | None: ...
+    def goto(self, well: str, side: str = "centre") -> None: ...
+    def forget(self, well: str | None = None) -> None: ...
+    def page_params(self, plugin: str) -> list[str]: ...
+    def resume(self) -> None: ...
+    def join(self, timeout_s: float | None = None) -> bool: ...
+```
+
+- **`entry_points`** is handed to `discover` and `load`; `None` reads the
+  installed group. It is how a test puts stub plugins on the page (§1.12).
+- **`plate`** starts as the latest `plate-registration` record's
+  `params["plate"]`, else the usable `plate` slot's `plate`, else `96-well`;
+  `choose_plate` takes a name of `useq.registered_well_plate_keys()` (else
+  `ValueError` with the names) and, when it differs, clears `selection`,
+  `refs`, `walls` and `current`. The map draws the `plate` slot's wells only
+  when it is usable **and** its `plate` equals `self.plate`; otherwise it draws
+  the nominal wells (`nominal=True`). The wells of a registered plate are built
+  once per `(plate, a1_center_xy_um, rotation_deg)` and kept (339 ms for 1536
+  wells): `view()` and `click` reuse them.
+- **`click(x_um, y_um, drive=, side=)`** finds the well whose `WellGeometry`
+  contains the point (none: returns `None` and does nothing, as for a point
+  that is not finite), sets `current`, and then `toggle`s it, or, with
+  `drive`, `goto`es it. It returns the well. The mode is the page's: `drive`
+  is **one click**, and the page returns to *select* after it.
+- **`goto(well, side)`** is `run("goto-well", [f"well={well}", f"side={side}"])`
+  and sets `current`. **It refuses a plate the map does not show.** `goto-well`
+  takes a well's name only and reads the registered plate (`reads = ("plate",)`,
+  `well_geometry(plate.to_plan(), params.well)`), while the map of a plate the
+  operator chose with `choose_plate` is the nominal one when the usable `plate`
+  slot names another: a click on C5 of the nominal 96-well map would drive the
+  stage to C5 of the registered 384-well plate, with nothing on the page to
+  say so. So `goto`, and `click` with `drive`, raise the `ValueError` of
+  `page_params("scan-plan")` for that mismatch (the same check, one private
+  helper), before `current` changes and before a thread starts. An unusable
+  `plate` slot needs no check here: `check_ready` refuses `goto-well` itself and
+  the refusal is the `outcome`. **`capture_centre(well)`** and `capture_wall(well, side)`
+  normalise the well (`normalise_well`), refuse one that is not on `plate`
+  (`ValueError`: `<well> is not a well of the <plate> plate`), and **replace**
+  the earlier capture of the same well (and side): the operator centres it
+  again, and `plate-registration` refuses a well given twice. `forget(well)`
+  drops the captures of one well, `forget()` all of them.
+- **`select_text`** and `toggle` take the wells of `plate`; a text or a well
+  that is not on it raises `ValueError` (`parse_wells`' message; for `toggle`,
+  `<well> is not a well of the <plate> plate`) and leaves `selection` as it
+  was. The page shows the message and keeps no exception (FM-98).
+- **`page_params(plugin)`** gives the pairs the page fills itself, named by
+  `PAGE_PARAMS`: for `scan-plan` `[f"wells={','.join(selection)}"]`, and
+  `ValueError("select at least one well first")` when there is none, and
+  `ValueError("the registered plate is a <p>; calibrate the <plate> plate
+  again, or choose <p>")` when a usable `plate` slot names another plate than
+  `plate`; for `plate-registration`, `[f"plate={plate}", f"refs={json}",
+  f"walls={json}"]` with the captures dumped by `model_dump(mode="json")` as
+  `json.dumps` (a single line); any other plugin `[]`. The page runs
+  `run(plugin, page_params(plugin) + typed)`, `typed` being the form's
+  non-empty fields as `key=value`.
+- **`run(plugin, params)` validates before it starts a thread**, with what
+  `smc run` does before it opens the stand: `load`, `parse_params`,
+  `RunDocument.load_or_new`, `check_ready(..., resume=False)`. Any
+  `PluginError` or `RunDocumentError` there is an `outcome`
+  (`<plugin>: <Type>: <message on one line>`), nothing is written and no thread
+  starts. The only exceptions `run` raises are `RuntimeError("<plugin> is
+  running")` (a run is going) and `RuntimeError("the page is closed")`. The
+  worker is a daemon thread (a stuck plugin never keeps the process alive after
+  `close`) running `run_plugin(..., stop=<a new Event for this run>,
+  on_progress=<SimpleQueue>.put, plugin_version=entry.version)` and keeping, as
+  text, `outcome`: `<plugin> done in <s:.1f> s`, `<plugin> stopped`,
+  `<plugin>: <Type>: <message on one line>` for any `Exception`, and
+  `<plugin> ran, but its record could not be written: <message>` for a
+  `RunDocumentError` that carries a record (FM-34). There is no `resume` in the
+  page: `smc run --resume` is the way to continue a stopped stage in M3.
+- **`status()`** drains the progress queue (the latest `Progress` is kept, so
+  two sessions see the same) and reads the stand now; the page's periodic
+  callback calls it once a second (`period=1000`) and no faster: a scan must
+  not be slowed by a status poll, and the poll's cost on a real stand is not
+  measured. **`view()`** runs on an event (a click, a typed range, a capture, the
+  end of a run) and on a *Refresh* button, never on the tick.
+- **`stop()`** sets the run's stop event (a plain attribute read, then
+  `Event.set()`; no lock of the controller, FM-70), then `microscope.stop()`,
+  and keeps what it did as `stop_note`, said by its outcome and never "stopped"
+  by default (FM-117): `stopped: the stand is halted (Resume clears the halt)`;
+  `halted, but <the StopRefusedError, on one line>`; `the stop failed: <the
+  HardwareError, on one line>`; each starts with `<plugin> told to stop;`
+  and a space when a run was going. It never raises for a stop that fails. STOP is always
+  offered, a run or not. **`resume()`** refuses while a run is going
+  (`RuntimeError("<plugin> is running")`), then `microscope.resume()` and clears
+  `stop_note`; the page offers **Resume** only while `status().halted`, because
+  after STOP every action raises `MicroscopeHaltedError` until the halt is
+  cleared. **`join(timeout_s)`** waits for the worker and says whether none is
+  left (tests, `close`). **`close()`** is idempotent: when a run is going,
+  `stop()`, then `join(10.0)`; if the worker is still alive it says so in
+  `outcome`. It does not close the stand: the command owns it.
+- **The lock** the controller holds (`_lock`, a plain `Lock`) guards only the
+  attributes a worker and a callback both write (`running`, `progress`,
+  `outcome`), never across a device call, and `stop()` does not take it.
+
+**The command** `smc ui plate`, in `smc/cli.py` (`smc.ui.*` is imported inside
+the command, so `smc` starts without the extra), in this order:
+
+1. `--run-doc` as `smc run` checks it (exit 2); `--port` an integer in 1 to
+   65535, default 5006 (exit 2).
+2. `import smc.ui.plate_page`: an `ImportError` (the extra is missing, or
+   broken) prints `install the ui extra: pip install -e ".[ui]"` and the error's
+   text, exit 1.
+3. A socket binds `localhost:<port>` and is closed again: when that fails,
+   `port <port> is in use; choose another with --port` (exit 2). `serve` below
+   checks again, since between the two another process may take the port.
+4. `Profile.load`, then `RunDocument.load_or_new` (an unreadable document: its
+   text, exit 1, the file untouched), then `Microscope.open(profile,
+   dry_run=dry_run)`, then `_say_stop_refused` unless `--dry-run`.
+5. `PlatePage(microscope, path)`, then `plate_page.serve(page, port=port)`,
+   which builds the layout per session, serves with `pn.serve(...,
+   address="localhost", show=False, threaded=True)` and waits in a loop of
+   `thread.join(0.1)`. It prints `serving the plate page on
+   http://localhost:<port>/ — Ctrl-C stops it` once the thread is up. On
+   `KeyboardInterrupt` it stops the server and `join(timeout=10)`s it, and
+   returns; if the thread ended **without** Ctrl-C it raises
+   `PageServerError` (a `RuntimeError` in `smc/ui/controller.py`: `the plate
+   page's server stopped on its own (is port <port> taken?)`), which `_report`
+   prints with exit 1.
+6. `page.close()` in a `finally`, then the stand is released by the `with`;
+   exit 0 after a Ctrl-C (a server's normal end), the last line saying
+   `<plugin> was stopped` when `close()` stopped a run. `serve` takes the
+   first Ctrl-C; a second one, during `close()`'s join, is the `_Reported`
+   wrapper's own `KeyboardInterrupt` path (its interrupted line, exit 130,
+   FM-71). It loses neither the stop, which `close()` sent **before** it
+   joined, nor the release of the stand, which the `with` does on any exit.
+
+The page listens on `localhost` only and takes no `--host`: it has no login, so
+whoever reaches the port can move the stage. A desk is reached by RDP in M3. An
+SSH tunnel is not tried: Bokeh checks a websocket's origin against
+`localhost:<port>`, so it can work only with the same port number on both ends,
+and that is not verified; `docs/ui/plate-page.md` says so or leaves it out.
+
+**The page** (`smc/ui/plate_page.py`, the only module besides the command that
+imports Panel). Decided so that the executor guesses nothing:
+
+- `build(page: PlatePage) -> pn.viewable.Viewable` builds one session: the same
+  controller, new widgets. A `PlatePageView` class holds the widgets and the
+  figure, with `tick()` (the periodic callback's body, called by tests
+  directly), `refresh()` (`view()` then redraw) and one method per handler.
+  `build` registers `pn.state.add_periodic_callback(view.tick, period=1000)`.
+- The map: `bokeh.plotting.figure(match_aspect=True)`, stage µm, Y up. One
+  `ColumnDataSource` for the wells with the columns `name, x, y, w, h, angle,
+  value, outline, outline_width, tip` (`angle` in radians, counter-clockwise,
+  `rotation_deg` converted; `w` and `h` are `size_um`; a circle takes
+  `radius = w / 2`), drawn as `circle` when `circular` and `rect` otherwise;
+  `value` is the chosen label's `per_mm2` and `nan` where unknown, mapped by a
+  `LinearColorMapper(palette=Viridis256, low=0, high=max, nan_color="#eeeeee")`
+  with a `ColorBar`; a selected well has `outline_width=3` in blue and the
+  others `1` in grey, so a selected well keeps its density colour. The names
+  are drawn when there are at most 96 wells. The route is a `line` and a
+  `scatter` of its stops, the stage a `cross` at `status.xy_um`.
+- The click: `figure.on_event(Tap, handler)` calls `controller.click(event.x,
+  event.y, drive=<toggle>, side=<select>)`, shows an exception's message and
+  puts the toggle back to *select*; while *drive* is on the status strip says
+  so in the warning colour. The tools: one `Accordion` card per `STAGES`
+  entry, one section per tool with its `key` fields, an *Advanced* card with
+  the rest, a Run button (disabled, with `blocked[name]` beside it, when the
+  tool is blocked or a run is going) and the progress as `done/total message`;
+  an empty field is not sent, so the plugin's default holds. `plate-registration`
+  also has the plate choice, **Capture centre**, **Capture wall** (a side
+  choice) and **Forget** on `current`, and the captures as a list.
+- The status strip: XY, Z, objective, autofocus, light, `DRY RUN` when it is
+  one, `HALTED` with **Resume** when it is, `outcome`, `stop_note`, the run's
+  progress and **STOP**, in the order of ADR-0006's picture. The checklist is
+  `view.checklist` as `✓ <slot>`, `· <slot>` and `✗ <slot>: <reason>`. A
+  `problems` text is shown above the map, in the warning colour.
+- **Tests of the page** call `PlatePageView` methods and read the models:
+  `wells_source.data`, `figure.renderers`, the widgets' `value` and `disabled`,
+  `source.selected` is not used.
+
+**Dependencies**: `ui = ["panel>=1.9,<2"]` (the oldest measured is 1.9.4 on
+Python 3.10; a floor below what CI resolves would be a claim nothing proves);
+CI's `test` job installs `.[dev,ui]` and sets `SMC_REQUIRE_UI`; `lint` keeps
+`.[dev]`, so that `mypy` is proved without the extra, as a contributor who does
+not install it runs it; `pyproject.toml` gains the mypy override above. The
+page's HTML is not checked offline.
+
+**Failure modes**: FM-98, FM-70, FM-44, FM-117, FM-125, FM-30, FM-36, FM-37,
+FM-20, FM-24, FM-71, FM-73, FM-45, FM-50, and the entries the develop session
+adds for what this section measured: a server that swallows the operator's
+Ctrl-C, a port taken that no one is told of, a refresh that rebuilds an O(wells)
+structure on every tick, and a view lifetime that is not the work's lifetime
+(a closed tab must not stop a scan).
 
 ## 16. Sequencing
 
@@ -3286,4 +3680,6 @@ For session 2 the critical path is #199 → #22, #19, #21, #213, #23 →
 - `merge_radius_um = 5.0` and the overlap of 10 % against real cells.
 - Whether the stage's move time follows the Euclidean distance (§11).
 - The NIS-Elements format (§14).
-- Panel's version and behaviour on the microscope PC over RDP.
+- Panel's version and behaviour on the microscope PC over RDP; a real
+  browser's click (the `Tap` event of §15.3), the periodic callback of a
+  session, Ctrl-C on Windows, and the page on a PC with no internet.

@@ -18,6 +18,8 @@ Plugins with a page of their own: [`camera-calibration`](camera-calibration.md)
 [`plate-registration` and `goto-well`](plate-registration.md) (where the plate is on
 the stage, from wells you centred and walls you touched, and the move to a well or
 its wall),
+[`plate-finding`](plate-finding.md) (which plate it is and where, from a coarse survey
+of the plate with the stage and the camera; it switches the autofocus off),
 [`cells`](cells.md) (single cells and doublets on a scan's frames, in stage µm,
 each counted once; needs the `detect` extra and the trained weights),
 [`scan-plan`](scan-plan.md) (which wells and which fields of each to image, from the
