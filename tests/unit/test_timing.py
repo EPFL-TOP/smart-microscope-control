@@ -199,6 +199,21 @@ def test_a_budget_says_which_channel_cost_is_not_a_measurement() -> None:
     )
 
 
+def test_a_budget_lists_the_timings_lines_first_and_then_its_own() -> None:
+    """Both sources at once: the timings' own, in their order, then what ``plan`` filled in."""
+    lines = ("first, as measured", "second, as measured")
+    budget = plan(fixed(assumed=lines, channel_switch_ms=None), ["BF", "YFP"], 300)
+
+    mean = (50 + 300 + 300) / 3
+    assert budget.assumed == (
+        *lines,
+        f"channel switch {ASSUMED_CHANNEL_SWITCH_MS:.0f} ms is assumed: "
+        "the timings hold none",
+        f"channel YFP costs {mean:.0f} ms, the mean of the measured channels: "
+        "it was not measured",
+    )
+
+
 def test_a_budget_carries_what_the_timings_assumed() -> None:
     line = "refocus 400 ms is assumed: the autofocus was off"
     budget = plan(fixed(assumed=(line,)), ["BF"], interval_s=300)

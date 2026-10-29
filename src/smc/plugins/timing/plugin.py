@@ -57,6 +57,9 @@ _MAX_DISTANCE_UM = 50_000.0
 #: fraction of the distance) is not a measurement of that distance (FM-142).
 _REACH_FLOOR_UM = 5.0
 _REACH_FRACTION = 0.02
+#: The stage reading further than this from where it started, after the return, is
+#: reported: the probe's own tolerance is between two readbacks and does not see it.
+_RETURN_TOLERANCE_UM = 5.0
 
 T = TypeVar("T")
 
@@ -296,7 +299,7 @@ class TimingPlugin:
         except BaseException:
             # A stop, a halt, a fault or a refused move: nothing is restored and
             # nothing is caught (FM-88, FM-64); a WARNING says what was left.
-            _warn_left(ctx, left, xy, start, channels, found)
+            _warn_left(ctx, left, xy, start, autofocus, channels, found)
             raise
 
         if left.autofocus_off:
@@ -369,6 +372,7 @@ def _direction(xy: XYStage, start: XY, long_um: float) -> tuple[float, str | Non
     ``+1`` unless the soft limits put the long probe outside the X travel on
     that side and inside it on the other. Soft limits of ``None`` mean unknown,
     not unlimited: the probe goes ``+X`` and the result says it was unchecked.
+    A start outside the limits is refused before anything moves.
     """
     limits = xy.limits_um()
     if limits is None:
@@ -376,7 +380,21 @@ def _direction(xy: XYStage, start: XY, long_um: float) -> tuple[float, str | Non
             "the stage reports no soft limits: the probe moves were not checked "
             "against its travel"
         )
-    low_um, high_um = limits[0].low_um, limits[0].high_um
+    x_limits, y_limits = limits
+    low_um, high_um = x_limits.low_um, x_limits.high_um
+    # The start is where the stage must come back to: one outside the limits has
+    # a return that the layer refuses, after the stage has gone out.
+    if not (
+        low_um <= start.x_um <= high_um
+        and y_limits.low_um <= start.y_um <= y_limits.high_um
+    ):
+        raise PluginRunError(
+            _NAME,
+            f"the stage stands at ({start.x_um:g}, {start.y_um:g}) µm, outside its "
+            f"soft limits x [{low_um:g}, {high_um:g}], y [{y_limits.low_um:g}, "
+            f"{y_limits.high_um:g}] µm, so the return to it would be refused; "
+            "nothing was moved. Move the stage inside its limits first",
+        )
     if low_um <= start.x_um + long_um <= high_um:
         return 1.0, None
     if low_um <= start.x_um - long_um <= high_um:
@@ -457,13 +475,28 @@ def _probe_stage(
             )
         )
         step(f"stage {distance_um:g} µm")
+    # The tolerance of a probe is between two readbacks: a return that stopped
+    # short of the start, by up to 2 % of the distance, would pass it unseen.
+    off_um = math.hypot(here.x_um - start.x_um, here.y_um - start.y_um)
+    back_short = not off_um <= _RETURN_TOLERANCE_UM
+    if back_short:
+        ctx.logger.warning(
+            "the stage reads (%.1f, %.1f) µm after its return, %.1f µm from where "
+            "it started (%.1f, %.1f) µm: it came back short",
+            here.x_um + 0.0,
+            here.y_um + 0.0,
+            off_um,
+            start.x_um + 0.0,
+            start.y_um + 0.0,
+        )
     problem = _reach_problem(moves)
     if problem is not None:
         raise PluginRunError(
             _NAME,
-            f"{problem}; the stage was sent back to where it started and nothing "
-            "was fitted. A stage that stops short (a soft limit, a stop, a "
-            "stall) did not time the distance it was asked",
+            f"{problem}; the stage was sent back to where it started"
+            + (f" and reads {off_um:.1f} µm from it" if back_short else "")
+            + " and nothing was fitted. A stage that stops short (a soft limit, a "
+            "stop, a stall) did not time the distance it was asked",
         )
     return points, len(moves)
 
@@ -592,6 +625,7 @@ def _warn_left(
     left: _Left,
     xy: XYStage,
     start: XY,
+    autofocus: Autofocus | None,
     channels: Channels | None,
     found: str | None,
 ) -> None:
@@ -619,11 +653,32 @@ def _warn_left(
                 start.x_um + 0.0,
                 start.y_um + 0.0,
             )
-    if left.autofocus_off:
-        ctx.logger.warning(
-            "the autofocus was switched off by this run and is left off, not "
-            "engaged again: engaging drives Z"
-        )
+    if left.autofocus_off and autofocus is not None:
+        # The flag says the run switched it off and it did not lock again, not
+        # that it is off: a `disengage()` that faulted, or an `engage()` that
+        # raised after it switched on, leaves it on, and possibly driving Z.
+        engaged: bool | None
+        try:
+            engaged = autofocus.is_engaged()
+        except Exception:
+            engaged = None
+        if engaged is None:
+            ctx.logger.warning(
+                "the autofocus was switched off by this run and its state cannot be "
+                "read now: it may be on and driving Z, so check it before anything "
+                "else moves Z"
+            )
+        elif engaged:
+            ctx.logger.warning(
+                "the autofocus is still ON: this run switched it off or tried to "
+                "engage it and the call failed. It may be searching and driving Z: "
+                "switch it off before anything else moves Z"
+            )
+        else:
+            ctx.logger.warning(
+                "the autofocus was switched off by this run and is left off, not "
+                "engaged again: engaging drives Z"
+            )
     if left.channel_changed and channels is not None:
         try:
             current = channels.current()

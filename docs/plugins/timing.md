@@ -21,7 +21,9 @@ as for any stage move:
   edge of its travel**, and check that the objective has clearance. When the soft
   limits put `+X` outside the travel and `-X` inside it, the probe goes `-X`; when
   neither fits, the run is refused before anything moves, with the limits, the start
-  and the distance in the text.
+  and the distance in the text. A start that is itself outside the soft limits, in X or
+  in Y, is refused the same way: the layer would refuse the return to it, after the
+  stage had gone out.
 - **The autofocus must be on and locked on the sample.** Each lock is timed from
   disengaged: it is switched off and on again `repeats` times, and engaging drives Z
   on the Ti2-E. The plugin never switches on an autofocus that was off (that is the
@@ -38,7 +40,11 @@ smc -v run timing -p <profile> --run-doc run.json --param repeats=5
 smc run timing -p <profile> --run-doc run.json --param 'channels=["DAPI","FITC"]'
 ```
 
-`-v` goes before `run`: it prints the measured model, one line each.
+`-v` goes before `run`: it prints the measured model, one line each. The JSON values
+(`channels`, `distances_um`) are quoted for bash; on a Windows PC, `cmd.exe` and PowerShell
+5.1 strip the inner double quotes, so escape them as
+[Running a plugin](README.md#running-a-plugin-smc-run) shows
+(`--param "channels=[\"DAPI\",\"FITC\"]"`).
 
 | Parameter | Default | Meaning |
 |---|---|---|
@@ -102,9 +108,15 @@ was** (a measured run ends on a lock, so it is on and locked again) and the **ch
 stand was on is selected back**. After **a stop, a halt or a fault nothing is put back**: a return, an
 engage or a select after the operator's stop would be another motion nobody asked
 for, and an engage drives Z. A WARNING says what was left: where the stage is and where
-it started, that the autofocus was switched off by this run and is left off, and which
-channel the stand is on and which it was found on. A stop before the first move, or
-between two steps that left nothing changed, says nothing.
+it started; the autofocus the run switched off, **read back** (`left off`, `still ON`
+when a failed call left it on and possibly driving Z, or that its state cannot be read);
+and which channel the stand is on and which it was found on. A stop before the first
+move, or between two steps that left nothing changed, says nothing.
+
+A stage that **comes back short** is also reported on a normal end: the readback after
+the return is compared with the start, and one more than 5 µm from it gets a WARNING
+with both positions (the tolerance of a probe is between two readbacks, so a return that
+stopped 150 µm short of a 9000 µm probe would pass it unseen).
 
 The one exception on a normal end: a lock that did not come leaves the autofocus **off**,
 and the result and a WARNING say so (below). Engage it again before the scan.

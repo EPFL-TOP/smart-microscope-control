@@ -686,16 +686,21 @@ def test_the_estimate_carries_what_the_timings_assumed(
 ) -> None:
     """An estimate whose refocus was assumed must not read as measured (m3 §12)."""
     microscope = _stand(demo_microscope_with_sample, tmp_path)
-    line = "refocus 400 ms is assumed: the autofocus was off"
+    lines = (
+        "the stage reports no soft limits: the probe moves were not checked",
+        "refocus 400 ms is assumed: the autofocus was off",
+        "no switch was timed: the one channel given is the one the stand was on",
+    )
 
     without = _result(_run(microscope, tmp_path, wells="A1", **SMALL))
     assert not any(a.startswith("timings:") for a in without.assumed)
 
-    _write_timings(tmp_path / "run.json", assumed=(line,))
+    _write_timings(tmp_path / "run.json", assumed=lines)
     result = _result(_run(microscope, tmp_path, wells="A1", **SMALL))
 
     assert result.estimate_s is not None
-    assert result.assumed == (*without.assumed, f"timings: {line}")
+    # Every line, in the timings' order, after the plan's own.
+    assert result.assumed == (*without.assumed, *(f"timings: {line}" for line in lines))
 
 
 def test_the_estimate_counts_refocus_on_a_stand_with_autofocus(

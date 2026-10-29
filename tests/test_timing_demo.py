@@ -24,6 +24,7 @@ import copy
 import logging
 import math
 import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -85,18 +86,22 @@ class _Clock:
 class _CostedStage:
     """The stand's stage, except that every move advances a clock by a known cost.
 
-    The cost of a move is ``overhead_ms + ms_per_mm * distance / 1000`` from
-    where the stage stands to the target, and ``extra_ms[n]`` more for the
-    n-th move. It implements the seven methods of ``XYStage``
-    (``Microscope.override`` refuses an implementation that lacks one) and
-    keeps ``moves`` and ``targets`` so that a test can say what was asked and
-    that nothing was asked after a stop.
+    The cost of a move is ``overhead_ms + ms_per_mm * distance / 1000``, the
+    distance being the one the stage really goes (from where it stands to where
+    it lands), and ``extra_ms[n]`` more for the n-th move. It implements the
+    seven methods of ``XYStage`` (``Microscope.override`` refuses an
+    implementation that lacks one) and keeps ``moves`` and ``targets`` so that a
+    test can say what was asked and that nothing was asked after a stop.
 
     * ``land``: where the stage really goes for a commanded X (a stage that
       stops short, FM-142); the readback is where it went.
+    * ``land_y``: the Y it lands at for a commanded ``(x, y)``.
     * ``on_move``: called with the move's number before the move is made.
+    * ``fault_after``: the n-th move is made and then raises ``HardwareError``.
     * ``limits``: what ``limits_um`` answers.
     * ``start_reads``: what ``position_um`` answers instead of the stage's.
+    * ``travelling``: what ``position_um`` answers until ``wait()`` is called
+      (a stage still moving, FM-85); ``waits`` counts the calls.
     * ``unreadable_after``: ``position_um`` raises once this many moves were made.
     """
 
@@ -110,8 +115,11 @@ class _CostedStage:
         extra_ms: dict[int, float] | None = None,
         limits: tuple[Limits, Limits] | None = None,
         land: Callable[[float], float] | None = None,
+        land_y: Callable[[float, float], float] | None = None,
         on_move: Callable[[int], None] | None = None,
+        fault_after: int | None = None,
         start_reads: XY | None = None,
+        travelling: XY | None = None,
         unreadable_after: int | None = None,
     ) -> None:
         self._real = real
@@ -121,10 +129,14 @@ class _CostedStage:
         self._extra_ms = extra_ms or {}
         self._limits = limits
         self._land = land
+        self._land_y = land_y
         self._on_move = on_move
+        self._fault_after = fault_after
         self._start_reads = start_reads
+        self._travelling = travelling
         self._unreadable_after = unreadable_after
         self.moves = 0
+        self.waits = 0
         self.targets: list[tuple[float, float]] = []
 
     def position_um(self) -> XY:
@@ -132,13 +144,19 @@ class _CostedStage:
             raise HardwareError("the position cannot be read")
         if self._start_reads is not None:
             return self._start_reads
+        if self._travelling is not None and self.waits == 0:
+            return self._travelling
         return self._real.position_um()
 
     def move_to_um(self, x_um: float, y_um: float) -> XY:
         self.moves += 1
         self.targets.append((x_um, y_um))
         here = self._real.position_um()
-        distance_mm = math.hypot(x_um - here.x_um, y_um - here.y_um) / 1000.0
+        landed_x_um = x_um if self._land is None else self._land(x_um)
+        landed_y_um = y_um if self._land_y is None else self._land_y(x_um, y_um)
+        distance_mm = (
+            math.hypot(landed_x_um - here.x_um, landed_y_um - here.y_um) / 1000.0
+        )
         self._clock.advance_ms(
             self._overhead_ms
             + self._ms_per_mm * distance_mm
@@ -146,13 +164,16 @@ class _CostedStage:
         )
         if self._on_move is not None:
             self._on_move(self.moves)
-        landed_x_um = x_um if self._land is None else self._land(x_um)
-        return self._real.move_to_um(landed_x_um, y_um)
+        arrived = self._real.move_to_um(landed_x_um, landed_y_um)
+        if self.moves == self._fault_after:
+            raise HardwareError("the stage answered and then faulted")
+        return arrived
 
     def move_by_um(self, dx_um: float, dy_um: float, *, force: bool = False) -> XY:
         return self._real.move_by_um(dx_um, dy_um, force=force)
 
     def wait(self, timeout_s: float | None = None) -> None:
+        self.waits += 1
         self._real.wait(timeout_s)
 
     def is_busy(self) -> bool:
@@ -302,10 +323,13 @@ def test_a_measured_run_fills_the_slot_on_the_demo(
     record = _run(demo_microscope, tmp_path, repeats=1, distances_um=SHORT)
 
     result = _result(record)
+    # A lock that was timed, not the 400 ms assumed: no `refocus` line, and the
+    # autofocus sample is counted (4 stage + 1 autofocus + 1 bare snap). No
+    # duration is asserted: a loaded runner may be slow (FM-44).
     assert result.refocus_ms is not None
-    assert result.refocus_ms < ASSUMED_REFOCUS_MS
-    assert result.move_ms_per_mm > 0.0
     assert not any("refocus" in line for line in result.assumed)
+    assert result.samples == 6
+    assert result.move_ms_per_mm > 0.0
     assert NO_LIMITS in result.assumed
     # The slot, as the scan plan reads it.
     filling = RunDocument.load(tmp_path / "run.json").provider("timings")
@@ -583,7 +607,9 @@ def test_limits_that_fit_neither_way_refuse_before_anything_moves(
 
 @pytest.mark.parametrize(
     ("short_by_um", "accepted"),
-    [(1.0, True), (4.5, True), (6.0, False)],
+    # 4.5 is above ``min(5 µm, 2 %)`` and 5.0 is on the edge of ``max``: the
+    # tolerance is a closed bound; 6.0 is over it.
+    [(1.0, True), (4.5, True), (5.0, True), (6.0, False)],
 )
 def test_a_stage_that_lands_a_little_short_is_judged_by_its_tolerance(
     fake_microscope: Microscope,
@@ -612,15 +638,142 @@ def test_a_stage_that_lands_a_little_short_is_judged_by_its_tolerance(
 def test_a_stage_that_falls_short_in_proportion_is_judged_by_the_percentage(
     fake_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """1 % short is 2 µm at 200 and 90 µm at 9000: inside ``max(5 µm, 2 %)`` both times."""
+    """1.5 % short is 3 µm at 200 and 135 µm at 9000: inside ``max(5 µm, 2 %)`` both times.
+
+    The stage's cost follows the distance it really went, 197 and 8865 µm, so the
+    fit through the *readback* distances recovers 100 ms and 50 ms/mm; one through
+    the commanded 200 and 9000 gives another line (FM-142).
+    """
     clock = _with_clock(monkeypatch)
-    _costed(fake_microscope, clock, land=lambda x: x * 0.99)
+    _costed(fake_microscope, clock, land=lambda x: x * 0.985)
+
+    result = _result(
+        _run(fake_microscope, tmp_path, repeats=1, distances_um=(200.0, 9000.0))
+    )
+
+    assert result.move_overhead_ms == pytest.approx(100.0)
+    assert result.move_ms_per_mm == pytest.approx(50.0)
+
+
+def test_a_stage_that_goes_too_far_fails_the_run(
+    fake_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An overshoot is no more a measurement of the distance asked than a short move is."""
+    clock = _with_clock(monkeypatch)
+    _costed(fake_microscope, clock, land=lambda x: x * 2.0)
+
+    with pytest.raises(
+        PluginRunError, match=r"the stage went 400\.0 µm when it was asked for 200 µm"
+    ):
+        _run(fake_microscope, tmp_path, repeats=1, distances_um=(200.0, 9000.0))
+
+
+def test_a_stage_that_lands_off_in_y_fails_the_run(
+    fake_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The distance the stage went is the straight line between readbacks, Y included."""
+    clock = _with_clock(monkeypatch)
+    _costed(
+        fake_microscope,
+        clock,
+        land_y=lambda x, y: y + 200.0 if x > 0.0 else y,
+    )
+
+    with pytest.raises(
+        PluginRunError,
+        match=r"the stage went 282\.8 µm when it was asked for 200 µm",
+    ):
+        _run(fake_microscope, tmp_path, repeats=1, distances_um=(200.0, 9000.0))
+
+
+def test_a_return_that_comes_back_short_is_warned_about(
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """150 µm is inside 2 % of 9000 µm, so the probe's tolerance does not see it."""
+    clock = _with_clock(monkeypatch)
+    stage = _costed(fake_microscope, clock)
+    real = fake_microscope.require(XYStage)
+    original = stage.move_to_um
+
+    def move_to_um(x_um: float, y_um: float) -> XY:
+        # Every return that starts more than 1 mm out stops 150 µm after the start.
+        here = real.position_um()
+        if x_um == 0.0 and here.x_um > 1000.0:
+            return original(150.0, y_um)
+        return original(x_um, y_um)
+
+    stage.move_to_um = move_to_um  # type: ignore[method-assign]
 
     result = _result(
         _run(fake_microscope, tmp_path, repeats=1, distances_um=(200.0, 9000.0))
     )
 
     assert result.move_ms_per_mm > 0.0
+    assert _warnings(caplog) == [
+        "the stage reads (150.0, 0.0) µm after its return, 150.0 µm from where it "
+        "started (0.0, 0.0) µm: it came back short"
+    ]
+
+
+def test_a_return_that_comes_back_far_short_says_where_the_stage_is(
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Beyond the tolerance the run fails, and its text no longer says the stage is at the start."""
+    clock = _with_clock(monkeypatch)
+    stage = _costed(fake_microscope, clock)
+    real = fake_microscope.require(XYStage)
+    original = stage.move_to_um
+
+    def move_to_um(x_um: float, y_um: float) -> XY:
+        here = real.position_um()
+        if x_um == 0.0 and here.x_um > 1000.0:
+            return original(300.0, y_um)
+        return original(x_um, y_um)
+
+    stage.move_to_um = move_to_um  # type: ignore[method-assign]
+
+    with pytest.raises(PluginRunError) as caught:
+        _run(fake_microscope, tmp_path, repeats=1, distances_um=(200.0, 9000.0))
+
+    assert (
+        "the stage was sent back to where it started and reads 300.0 µm from it"
+        in str(caught.value)
+    )
+    assert _warnings(caplog) == [
+        "the stage reads (300.0, 0.0) µm after its return, 300.0 µm from where it "
+        "started (0.0, 0.0) µm: it came back short"
+    ]
+
+
+def test_a_return_within_the_tolerance_says_nothing(
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """5 µm from the start, on the edge: the bound is closed and nothing is warned."""
+    clock = _with_clock(monkeypatch)
+    stage = _costed(fake_microscope, clock)
+    real = fake_microscope.require(XYStage)
+    original = stage.move_to_um
+
+    def move_to_um(x_um: float, y_um: float) -> XY:
+        here = real.position_um()
+        if x_um == 0.0 and here.x_um > 1000.0:
+            return original(5.0, y_um)
+        return original(x_um, y_um)
+
+    stage.move_to_um = move_to_um  # type: ignore[method-assign]
+
+    _result(_run(fake_microscope, tmp_path, repeats=1, distances_um=(200.0, 9000.0)))
+
+    assert _warnings(caplog) == []
 
 
 def test_a_probe_that_ends_exactly_on_the_limit_still_fits_that_way(
@@ -1177,3 +1330,385 @@ def test_a_stop_before_a_sample_does_not_switch_the_autofocus_off(
     assert _autofocus_calls(fake_core) == []
     assert _warnings(caplog) == []
     assert fake_microscope.require(Autofocus).is_engaged()
+
+
+def _patch_autofocus(
+    microscope: Microscope, **methods: Callable[..., Any]
+) -> Autofocus:
+    """Replace methods of the stand's autofocus on a copy of it; return the real one."""
+    real = microscope.require(Autofocus)
+    patched = copy.copy(real)
+    for name, method in methods.items():
+        setattr(patched, name, method)
+    microscope.override(Autofocus, patched)
+    return real
+
+
+STILL_ON = (
+    "the autofocus is still ON: this run switched it off or tried to engage it and "
+    "the call failed. It may be searching and driving Z: switch it off before "
+    "anything else moves Z"
+)
+
+
+def test_a_disengage_that_faults_says_the_autofocus_is_still_on(
+    fake_core: FakeCore,
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """FM-127: the flag says it was switched off for the run; the device says it was not."""
+    _engaged(fake_core)
+
+    def disengage() -> None:
+        raise HardwareError("the switch-off faulted")
+
+    _patch_autofocus(fake_microscope, disengage=disengage)
+
+    with pytest.raises(HardwareError, match="the switch-off faulted"):
+        _run(fake_microscope, tmp_path, repeats=1, distances_um=SHORT)
+
+    assert fake_core.isContinuousFocusEnabled()  # the premise: it is still on
+    assert _warnings(caplog) == [STILL_ON]
+
+
+def test_an_engage_that_raises_after_it_switched_on_says_the_autofocus_is_still_on(
+    fake_core: FakeCore,
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A search that was stopped may leave the autofocus on and Z moving (FM-118)."""
+    real = fake_microscope.require(Autofocus)
+    _engaged(fake_core)
+
+    def engage(timeout_s: float | None = None) -> bool:
+        real.engage(timeout_s)
+        raise HardwareError("search stopped; Z may still be moving")
+
+    _patch_autofocus(fake_microscope, engage=engage)
+
+    with pytest.raises(HardwareError, match="Z may still be moving"):
+        _run(fake_microscope, tmp_path, repeats=1, distances_um=SHORT)
+
+    assert fake_core.isContinuousFocusEnabled()
+    assert _warnings(caplog) == [STILL_ON]
+
+
+def test_an_autofocus_whose_state_cannot_be_read_after_a_fault_is_said_unknown(
+    fake_core: FakeCore,
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The warning's own read is in a ``try``: it says what it does not know, and the fault arrives."""
+    real = fake_microscope.require(Autofocus)
+    _engaged(fake_core)
+    faulted = False
+
+    def disengage() -> None:
+        nonlocal faulted
+        faulted = True
+        raise HardwareError("the switch-off faulted")
+
+    def is_engaged() -> bool:
+        if faulted:
+            raise HardwareError("the autofocus does not answer")
+        return real.is_engaged()
+
+    _patch_autofocus(fake_microscope, disengage=disengage, is_engaged=is_engaged)
+
+    with pytest.raises(HardwareError, match="the switch-off faulted"):
+        _run(fake_microscope, tmp_path, repeats=1, distances_um=SHORT)
+
+    assert _warnings(caplog) == [
+        "the autofocus was switched off by this run and its state cannot be read "
+        "now: it may be on and driving Z, so check it before anything else moves Z"
+    ]
+
+
+def test_an_engage_that_fails_with_the_autofocus_off_says_it_is_left_off(
+    fake_core: FakeCore,
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A plain fault of the engage, with the real switch-off done: the old, true, message."""
+    _engaged(fake_core)
+
+    def engage(timeout_s: float | None = None) -> bool:
+        raise HardwareError("the autofocus did not answer")
+
+    _patch_autofocus(fake_microscope, engage=engage)
+
+    with pytest.raises(HardwareError, match="did not answer"):
+        _run(fake_microscope, tmp_path, repeats=1, distances_um=SHORT)
+
+    assert not fake_core.isContinuousFocusEnabled()
+    assert _warnings(caplog) == [
+        "the autofocus was switched off by this run and is left off, not engaged "
+        "again: engaging drives Z"
+    ]
+
+
+# ------------------------------------------------ faults and what a stop leaves
+
+
+def test_a_fault_ends_the_measurement_and_says_where_the_stage_is(
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """FM-88 asks for a stop, a halt and a fault: a plain ``HardwareError`` leaves the stage too."""
+    clock = _with_clock(monkeypatch)
+    stage = _costed(fake_microscope, clock, fault_after=3)
+
+    with pytest.raises(HardwareError, match="answered and then faulted"):
+        _run(fake_microscope, tmp_path, repeats=1, distances_um=(200.0, 3000.0))
+
+    assert stage.moves == 3  # no return was sent
+    assert _stored(tmp_path).status is StageStatus.failed
+    assert _warnings(caplog) == [
+        "the stage is left at (3000.0, 0.0) µm, not returned to (0.0, 0.0) µm"
+    ]
+
+
+def test_a_channel_that_cannot_be_read_after_a_stop_is_said_unknown(
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    stop = threading.Event()
+    real = fake_microscope.require(Channels)
+    selected: list[str] = []
+
+    def select(name: str) -> str | None:
+        selected.append(name)
+        stop.set()
+        return real.select(name)
+
+    def current() -> str | None:
+        if selected:
+            raise HardwareError("the channel group does not answer")
+        return real.current()
+
+    patched = copy.copy(real)
+    patched.select = select  # type: ignore[method-assign]
+    patched.current = current  # type: ignore[method-assign]
+    fake_microscope.override(Channels, patched)
+
+    record = _run(
+        fake_microscope,
+        tmp_path,
+        stop=stop,
+        repeats=1,
+        distances_um=SHORT,
+        channels=("FITC",),
+    )
+
+    assert record.status is StageStatus.stopped
+    assert selected == ["FITC"]
+    assert _warnings(caplog) == [
+        "the stand's channel is unknown, not selected back to DAPI"
+    ]
+
+
+def test_a_stop_while_the_stand_is_on_the_channel_found_says_nothing(
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The channel found is visited last: a stop during its snaps leaves the stand where it was found."""
+    stop = threading.Event()
+    real = fake_microscope.require(Camera)
+    snaps = 0
+
+    def snap() -> Any:
+        nonlocal snaps
+        snaps += 1
+        if snaps == 5:  # 2 bare + 2 FITC come first; this is the first DAPI snap
+            stop.set()
+        return real.snap()
+
+    patched = copy.copy(real)
+    patched.snap = snap  # type: ignore[method-assign]
+    fake_microscope.override(Camera, patched)
+
+    record = _run(
+        fake_microscope,
+        tmp_path,
+        stop=stop,
+        repeats=2,
+        distances_um=SHORT,
+        channels=("FITC", "DAPI"),
+    )
+
+    assert record.status is StageStatus.stopped
+    assert snaps == 5
+    assert fake_microscope.require(Channels).current() == "DAPI"
+    assert _warnings(caplog) == []
+
+
+# ------------------------------------------------------- the start of the probe
+
+
+@pytest.mark.parametrize(
+    ("limits", "stands"),
+    [
+        # X: the start is below the low limit; the out move is allowed, the return is not.
+        ((Limits(100.0, 20000.0), Limits(-1000.0, 1000.0)), (0.0, 0.0)),
+        # Y: the start is outside the Y limits, which nothing else looks at.
+        ((Limits(-20000.0, 20000.0), Limits(100.0, 1000.0)), (0.0, 0.0)),
+    ],
+)
+def test_a_start_outside_the_soft_limits_is_refused_before_anything_moves(
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limits: tuple[Limits, Limits],
+    stands: tuple[float, float],
+) -> None:
+    clock = _with_clock(monkeypatch)
+    stage = _costed(fake_microscope, clock, limits=limits)
+
+    with pytest.raises(PluginRunError) as caught:
+        _run(fake_microscope, tmp_path, repeats=1, distances_um=(200.0, 9000.0))
+
+    x, y = limits
+    assert (
+        f"the stage stands at ({stands[0]:g}, {stands[1]:g}) µm, outside its soft "
+        f"limits x [{x.low_um:g}, {x.high_um:g}], y [{y.low_um:g}, {y.high_um:g}] µm, "
+        "so the return to it would be refused; nothing was moved. Move the stage "
+        "inside its limits first"
+    ) in str(caught.value)
+    assert stage.moves == 0
+
+
+def test_a_start_on_the_soft_limits_is_inside_them(
+    fake_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The limits are a closed range, in X and in Y."""
+    clock = _with_clock(monkeypatch)
+    stage = _costed(
+        fake_microscope,
+        clock,
+        limits=(Limits(0.0, 20000.0), Limits(0.0, 1000.0)),
+    )
+
+    _run(fake_microscope, tmp_path, repeats=1, distances_um=(200.0, 9000.0))
+
+    assert stage.targets[0] == (200.0, 0.0)
+
+
+def test_the_start_is_read_after_the_stage_has_settled(
+    fake_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FM-85: a stage still travelling reads a fraction of its move until ``wait()`` returns."""
+    clock = _with_clock(monkeypatch)
+    real = fake_microscope.require(XYStage)
+    real.move_to_um(1000.0, -250.0)
+    stage = _costed(fake_microscope, clock, travelling=XY(1004.0, -250.0))
+
+    _run(fake_microscope, tmp_path, repeats=1, distances_um=(300.0, 7000.0))
+
+    assert stage.waits >= 1
+    assert stage.targets[:2] == [(1300.0, -250.0), (1000.0, -250.0)]
+
+
+def test_the_autofocus_is_read_before_the_stage_moves(
+    fake_core: FakeCore,
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """m2 §12: the lock read before any move decides; the operator's switch-off during the probe is theirs."""
+    clock = _with_clock(monkeypatch)
+    _engaged(fake_core)
+    _costed(
+        fake_microscope,
+        clock,
+        on_move=lambda n: fake_core.enableContinuousFocus(False) if n == 1 else None,
+    )
+
+    result = _result(_run(fake_microscope, tmp_path, repeats=2, distances_um=SHORT))
+
+    assert (
+        f"refocus {ASSUMED_REFOCUS_MS:.0f} ms is assumed: something else switched "
+        "the autofocus off during the measurement; no sample locked"
+    ) in result.assumed
+    # Only the operator's call: the plugin sent nothing.
+    assert _autofocus_calls(fake_core) == ["enableContinuousFocus(False)"]
+
+
+def test_the_clock_is_perf_counter() -> None:
+    """``time.monotonic`` ticks every 15.6 ms on Windows and ``time.time`` can step back."""
+    assert timing_plugin._clock is time.perf_counter
+
+
+# ------------------------------------------------ what each timed call costs
+
+
+def _advancing(
+    clock: _Clock, costs_ms: list[float], call: Callable[..., Any]
+) -> Callable[..., Any]:
+    """``call``, after the clock has moved by the next scripted cost."""
+
+    def timed(*args: Any, **kwargs: Any) -> Any:
+        clock.advance_ms(costs_ms.pop(0))
+        return call(*args, **kwargs)
+
+    return timed
+
+
+def test_the_medians_of_the_lock_the_snaps_and_the_switches_are_the_costs_given(
+    fake_core: FakeCore,
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each timed call advances the clock by a scripted cost, none in order: a median is not the first sample.
+
+    The costs are out of order on purpose (300, 100, 200 has the median 200, the
+    first 300 and the largest 300), and the lists are empty at the end, so a loop
+    that takes fewer samples than ``repeats`` leaves a cost unread (FM-124).
+    """
+    clock = _with_clock(monkeypatch)
+    _costed(fake_microscope, clock)
+    _engaged(fake_core)
+    engage_ms = [300.0, 100.0, 200.0]
+    # Three bare snaps, then three in FITC, then three in Cy5.
+    snap_ms = [10.0, 30.0, 20.0, 5.0, 25.0, 15.0, 40.0, 60.0, 50.0]
+    # FITC, Cy5, then the untimed select back to the channel found (DAPI).
+    select_ms = [7.0, 9.0, 0.0]
+
+    real_autofocus = fake_microscope.require(Autofocus)
+    autofocus = copy.copy(real_autofocus)
+    autofocus.engage = _advancing(clock, engage_ms, real_autofocus.engage)  # type: ignore[method-assign]
+    fake_microscope.override(Autofocus, autofocus)
+    real_camera = fake_microscope.require(Camera)
+    camera = copy.copy(real_camera)
+    camera.snap = _advancing(clock, snap_ms, real_camera.snap)  # type: ignore[method-assign]
+    fake_microscope.override(Camera, camera)
+    real_channels = fake_microscope.require(Channels)
+    channels = copy.copy(real_channels)
+    channels.select = _advancing(clock, select_ms, real_channels.select)  # type: ignore[method-assign]
+    fake_microscope.override(Channels, channels)
+
+    result = _result(
+        _run(
+            fake_microscope,
+            tmp_path,
+            repeats=3,
+            distances_um=SHORT,
+            channels=("FITC", "Cy5"),
+        )
+    )
+
+    assert result.refocus_ms == pytest.approx(200.0)
+    assert result.snap_ms == pytest.approx(20.0)
+    assert result.channel_ms == pytest.approx({"FITC": 15.0, "Cy5": 50.0})
+    assert result.channel_switch_ms == pytest.approx(8.0)
+    # 12 stage + 3 autofocus + 3 bare snaps + 2 channels x 3 snaps + 2 switches.
+    assert result.samples == 26
+    assert (engage_ms, snap_ms, select_ms) == ([], [], [])
