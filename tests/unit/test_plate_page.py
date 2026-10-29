@@ -242,7 +242,13 @@ def test_the_page_builds_every_tool_the_registry_holds_in_workflow_order(
     page: PlatePage,
 ) -> None:
     view = PlatePageView(page)
-    assert list(view.tool_runs) == ["plate-registration", "scan-plan", "scan"]
+    # `goto-well` is no stage of the workflow: it follows under `More`.
+    assert list(view.tool_runs) == [
+        "plate-registration",
+        "scan-plan",
+        "scan",
+        "goto-well",
+    ]
     assert list(view.tool_fields["scan-plan"]) == [
         "objective",
         "overlap",

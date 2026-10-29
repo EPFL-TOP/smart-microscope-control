@@ -39,6 +39,7 @@ from typing import Any, ClassVar, cast
 import numpy as np
 import pytest
 import useq
+from pydantic import Field
 from pymmcore_plus import CMMCorePlus
 
 import smc.ui.controller as controller_module
@@ -1344,7 +1345,13 @@ def test_the_view_shows_why_a_stage_is_unusable(
         CheckItem("report", False, "not run", None),
         CheckItem("nis-export", False, "not run", None),
     )
-    assert view.blocked == {"cells": failed}
+    # Every registered plugin is on the page: the stub `reader` is blocked as well.
+    assert view.blocked == {
+        "cells": failed,
+        "reader": (
+            "the run document has no up; smc run --list shows which plugin provides it"
+        ),
+    }
 
 
 def test_a_blocked_tool_says_what_the_stand_lacks(
@@ -1881,13 +1888,23 @@ def test_tools_follow_the_workflow_order_and_hide_what_the_page_fills(
         ],
     )
     tools = page.tools()
+    # The plugins `STAGES` does not name follow under `More`, by name.
     assert [t.name for t in tools] == [
         "plate-registration",
         "scan-plan",
         "scan",
         "cells",
+        "goto-well",
+        "stub",
     ]
-    assert [t.stage for t in tools] == ["Set up", "Choose", "Acquire", "Find"]
+    assert [t.stage for t in tools] == [
+        "Set up",
+        "Choose",
+        "Acquire",
+        "Find",
+        "More",
+        "More",
+    ]
     by_name = {t.name: t for t in tools}
     plan = by_name["scan-plan"]
     plan_rows = [row[0] for row in (*plan.key, *plan.advanced)]
@@ -1905,6 +1922,159 @@ def test_tools_follow_the_workflow_order_and_hide_what_the_page_fills(
     assert registration_rows == {"max_rotation_deg"}
     assert registration.summary.startswith("Locate a well plate on the stage")
     assert by_name["scan"].key[0][0] == "autofocus"
+
+
+class Alpha(Stub):
+    name = provides = "alpha-tool"
+
+
+class Zeta(Stub):
+    name = provides = "zeta-tool"
+
+
+class NeedyParams(PluginParams):
+    zebra: int
+    apple: int = 2
+    mango: str
+
+
+class KeyedParams(PluginParams):
+    labels: str = ""
+    fields_per_well: int = 1
+    zebra: int
+    apple: int = 2
+    mango: str
+
+
+class PlanParams(PluginParams):
+    objective: str = ""
+    wells: str
+    must: int
+
+
+class Needy:
+    """A plugin no table names, with two required fields around an optional one."""
+
+    name = provides = "needy"
+    summary = "A test plugin with required fields."
+    Params = NeedyParams
+    Result = StubResult
+    requires: tuple[type, ...] = ()
+    reads: tuple[str, ...] = ()
+    reads_optional: tuple[str, ...] = ()
+
+    def run(self, microscope: Any, params: NeedyParams, ctx: RunContext) -> StubResult:
+        return StubResult()
+
+
+class NeedyRoute(Needy):
+    """Registered as ``route``: ``KEY_PARAMS`` names two of its fields, and two more are required."""
+
+    name = provides = "route"
+    Params = KeyedParams  # type: ignore[assignment]
+
+
+class NeedyPlan(Needy):
+    """Registered as ``scan-plan``: its required ``wells`` is the page's, and ``must`` is not."""
+
+    name = provides = "scan-plan"
+    Params = PlanParams  # type: ignore[assignment]
+
+
+def _unbuildable_default() -> int:
+    raise RuntimeError("cannot build the default\nof this field")
+
+
+class BrokenParams(PluginParams):
+    n: int = Field(default_factory=_unbuildable_default)
+
+
+class Broken(Needy):
+    """Third-party parameters that ``describe_params`` cannot read (FM-113)."""
+
+    name = provides = "broken"
+    Params = BrokenParams  # type: ignore[assignment]
+
+
+def test_every_registered_plugin_is_a_tool_and_the_unnamed_are_under_more(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _page(
+        fake_microscope,
+        run_doc,
+        [_ep(Zeta), _ep(Alpha), *_real("scan", "plate-registration")],
+    )
+    tools = page.tools()
+    # What `STAGES` names, in its order; then every other plugin, by name.
+    assert [t.name for t in tools] == [
+        "plate-registration",
+        "scan",
+        "alpha-tool",
+        "failing",
+        "goto-well",
+        "progressing",
+        "reader",
+        "slow",
+        "stub",
+        "zeta-tool",
+    ]
+    assert [t.stage for t in tools] == ["Set up", "Acquire", *["More"] * 8]
+    assert tools[-1].name == "zeta-tool"
+    assert tools[-1].summary == "A test plugin."
+
+
+def test_a_required_field_is_never_folded(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _page(
+        fake_microscope,
+        run_doc,
+        [_ep(Needy), _ep(NeedyRoute), _ep(NeedyPlan)],
+    )
+    by_name = {t.name: t for t in page.tools()}
+    needy = by_name["needy"]
+    assert [row[0] for row in needy.key] == ["zebra", "mango"]
+    assert [row[0] for row in needy.advanced] == ["apple"]
+    assert [row[2] for row in needy.key] == ["(required)", "(required)"]
+    # `KEY_PARAMS` first, in its order; then the required ones, in declaration order.
+    route = by_name["route"]
+    assert [row[0] for row in route.key] == [
+        "labels",
+        "fields_per_well",
+        "zebra",
+        "mango",
+    ]
+    assert [row[0] for row in route.advanced] == ["apple"]
+    # A field the page fills is not offered, required or not.
+    plan = by_name["scan-plan"]
+    assert [row[0] for row in plan.key] == ["objective", "must"]
+    assert plan.advanced == ()
+
+
+def test_a_plugin_that_failed_to_load_is_a_problem(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    ghost = EntryPoint(name="ghost", value="no_such_module_xyz:Plugin", group=GROUP)
+    page = _page(fake_microscope, run_doc, [ghost])
+    assert "ghost" not in [t.name for t in page.tools()]
+    assert page.view().problems == (
+        "plugin ghost: could not be imported: ModuleNotFoundError: No module "
+        "named 'no_such_module_xyz'",
+    )
+
+
+def test_a_plugin_whose_parameters_cannot_be_described_is_a_problem_and_no_crash(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _page(fake_microscope, run_doc, [_ep(Broken)])
+    names = [t.name for t in page.tools()]
+    assert "broken" not in names
+    assert "stub" in names
+    said = "plugin broken: RuntimeError: cannot build the default of this field"
+    assert page.view().problems == (said,)
+    # Described once: the same answer, and not a second line, the next time.
+    assert [t.name for t in page.tools()] == names
+    assert page.view().problems == (said,)
 
 
 def test_the_controller_imports_without_panel() -> None:

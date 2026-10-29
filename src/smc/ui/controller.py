@@ -89,7 +89,8 @@ __all__ = [
 log = logging.getLogger("smc.ui")
 
 #: The tools of the workflow in the order the page shows them, grouped by stage.
-#: A plugin the table does not name is not on the page in M3.
+#: Every other registered plugin is on the page too, under ``MORE_STAGE``, by name
+#: (m5 §2.3): a plugin nobody listed here is usable all the same.
 STAGES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Set up", ("camera-calibration", "plate-registration", "plate-finding", "timing")),
     ("Choose", ("scan-plan",)),
@@ -98,8 +99,12 @@ STAGES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Report", ("report", "nis-export")),
 )
 
+#: The stage of a tool that ``STAGES`` does not name: the literal name the page shows.
+MORE_STAGE = "More"
+
 #: The parameters worth a field of their own, in the order the page shows them;
-#: every other parameter is under the tool's *Advanced* fold.
+#: every other parameter is under the tool's *Advanced* fold, except a required one,
+#: which is never folded.
 KEY_PARAMS: dict[str, tuple[str, ...]] = {
     "camera-calibration": ("step_um",),
     "scan-plan": ("objective", "overlap", "coverage"),
@@ -317,6 +322,7 @@ class PlatePage:
         # A list, so that a generator handed in is not spent by the first use.
         self._entry_points = None if entry_points is None else list(entry_points)
         self._registry_found: Registry | None = None
+        self._tools_found: tuple[tuple[ToolView, ...], tuple[str, ...]] | None = None
         self._geometry: dict[
             tuple[str, tuple[float, float], float], tuple[WellGeometry, ...]
         ] = {}
@@ -881,36 +887,59 @@ class PlatePage:
     # --- the view ---------------------------------------------------------------
 
     def tools(self) -> tuple[ToolView, ...]:
-        """The registered tools ``STAGES`` names, in the workflow's order.
+        """Every registered tool: those ``STAGES`` names in the workflow's order, then the others under ``More``, by name.
 
         A stage with no registered tool has none in the result; the stage's name
-        is on each tool.
+        is on each tool. A tool's ``key`` rows are ``KEY_PARAMS``' in its order and
+        then every **required** field it does not name, so a plugin with no line
+        in ``KEY_PARAMS`` is usable all the same; ``advanced`` is the rest. A
+        plugin whose parameters cannot be described is left out and is a line of
+        ``view().problems``, never an error here (FM-113).
         """
-        plugins = self._registry().plugins
-        views: list[ToolView] = []
-        for stage, names in STAGES:
-            for name in names:
-                entry = plugins.get(name)
-                if entry is None:
+        return self._tools_and_problems()[0]
+
+    def _tools_and_problems(self) -> tuple[tuple[ToolView, ...], tuple[str, ...]]:
+        """The tools and what could not be read for them, built once: the registry does not change (FM-112)."""
+        if self._tools_found is None:
+            plugins = self._registry().plugins
+            staged = {name: stage for stage, names in STAGES for name in names}
+            order = [
+                name for _stage, names in STAGES for name in names if name in plugins
+            ]
+            order += sorted(name for name in plugins if name not in staged)
+            views: list[ToolView] = []
+            problems: list[str] = []
+            for name in order:
+                entry = plugins[name]
+                try:
+                    described = describe_params(entry.plugin.Params)
+                except Exception as exc:
+                    # Third-party code: a model whose defaults or types cannot be
+                    # described is a finding, not the end of the page (FM-113).
+                    problems.append(
+                        f"plugin {name}: {type(exc).__name__}: {_one_line(exc)}"
+                    )
                     continue
                 hidden = PAGE_PARAMS.get(name, ())
-                rows = [
-                    r
-                    for r in describe_params(entry.plugin.Params)
-                    if r[0] not in hidden
-                ]
+                rows = [r for r in described if r[0] not in hidden]
                 by_name = {row[0]: row for row in rows}
                 keys = [k for k in KEY_PARAMS.get(name, ()) if k in by_name]
+                keys += [
+                    row[0]
+                    for row in rows
+                    if row[2] == "(required)" and row[0] not in keys
+                ]
                 views.append(
                     ToolView(
                         name=name,
                         summary=entry.plugin.summary,
-                        stage=stage,
+                        stage=staged.get(name, MORE_STAGE),
                         key=tuple(by_name[k] for k in keys),
                         advanced=tuple(r for r in rows if r[0] not in keys),
                     )
                 )
-        return tuple(views)
+            self._tools_found = (tuple(views), tuple(problems))
+        return self._tools_found
 
     def view(self) -> PlateView:
         """A snapshot built from a fresh read of the run document; it raises nothing for it.
@@ -963,7 +992,7 @@ class PlatePage:
             route=stops,
             checklist=self._checklist(doc),
             blocked=self._blocked(doc),
-            problems=tuple(problems),
+            problems=(*problems, *self._plugin_problems()),
         )
 
     # --- internals of the view -----------------------------------------------------
@@ -973,6 +1002,14 @@ class PlatePage:
         if self._registry_found is None:
             self._registry_found = discover(self._entry_points)
         return self._registry_found
+
+    def _plugin_problems(self) -> tuple[str, ...]:
+        """A line for each plugin that did not load, and for each whose parameters could not be described."""
+        failed = tuple(
+            f"plugin {failure.name}: {' '.join(failure.reason.split())}"
+            for failure in self._registry().failures
+        )
+        return (*failed, *self._tools_and_problems()[1])
 
     def _document(self) -> tuple[RunDocument, str | None]:
         """The run document as it is now, or a new one and why the file could not be read."""
@@ -1019,35 +1056,24 @@ class PlatePage:
         return tuple(items)
 
     def _blocked(self, doc: RunDocument) -> dict[str, str]:
-        """Why each registered tool of ``STAGES`` cannot run now; a tool that can is absent."""
-        plugins = self._registry().plugins
+        """Why each registered tool cannot run now; a tool that can is absent."""
         blocked: dict[str, str] = {}
-        for _stage, names in STAGES:
-            for name in names:
-                entry = plugins.get(name)
-                if entry is None:
-                    continue
+        for name, entry in self._registry().plugins.items():
+            reason = next(
+                (r for r in (self._unusable(doc, s) for s in entry.plugin.reads) if r),
+                None,
+            )
+            if reason is None:
                 reason = next(
                     (
-                        r
-                        for r in (self._unusable(doc, s) for s in entry.plugin.reads)
-                        if r
+                        lack
+                        for lack in (self.lacks(cap) for cap in entry.plugin.requires)
+                        if lack
                     ),
                     None,
                 )
-                if reason is None:
-                    reason = next(
-                        (
-                            lack
-                            for lack in (
-                                self.lacks(cap) for cap in entry.plugin.requires
-                            )
-                            if lack
-                        ),
-                        None,
-                    )
-                if reason is not None:
-                    blocked[name] = reason
+            if reason is not None:
+                blocked[name] = reason
         return blocked
 
     def _geometries(self, doc: RunDocument) -> tuple[tuple[WellGeometry, ...], bool]:
