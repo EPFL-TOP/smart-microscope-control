@@ -27,8 +27,11 @@ camera's real field of view), [`scan`](scan.md) (one TIFF per planned field, wit
 the stage's readback and the focus state), [`density`](density.md) (the cells of each
 well and class, divided by the area that was imaged), [`route`](route.md) (the
 fields that hold the most cells of the wanted classes, then the shortest route
-through them) and [`report`](report.md) (one static HTML file: the plate's density
-per class, the cells and fields of each well, and the route).
+through them), [`report`](report.md) (one static HTML file: the plate's density
+per class, the cells and fields of each well, and the route) and
+[`timing`](timing.md) (what a stage move, an autofocus lock, a channel switch and a
+snap cost on this stand, and how many positions fit in an interval; it moves the stage
+and switches the autofocus off and on).
 
 ## Running a plugin: `smc run`
 

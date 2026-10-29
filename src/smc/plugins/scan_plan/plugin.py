@@ -234,6 +234,12 @@ class ScanPlanPlugin:
             if timings is not None
             else None
         )
+        # An estimate whose refocus was assumed must not read as measured.
+        assumed = (
+            basis.assumed
+            if timings is None
+            else (*basis.assumed, *(f"timings: {line}" for line in timings.assumed))
+        )
         return ScanPlanResult(
             plate_plan=plate_plan,
             wells=wells,
@@ -248,7 +254,7 @@ class ScanPlanPlugin:
             columns=columns,
             fields=fields,
             estimate_s=estimate,
-            assumed=basis.assumed,
+            assumed=assumed,
         )
 
 

@@ -79,6 +79,7 @@ route = "smc.plugins.route.plugin:RoutePlugin"
 scan = "smc.plugins.scan.plugin:ScanPlugin"
 scan-plan = "smc.plugins.scan_plan.plugin:ScanPlanPlugin"
 stage-report = "smc.plugins.stage_report:StageReport"
+timing = "smc.plugins.timing.plugin:TimingPlugin"
 
 [project.urls]
 Homepage = "https://github.com/EPFL-TOP/smart-microscope-control"

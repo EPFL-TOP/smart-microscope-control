@@ -225,9 +225,11 @@ the scan without a word.
 
 `estimate_s` is the time of the scan in seconds, **only when a `timings` stage is in the
 run document**: each stage move between two fields (the first field costs none), a refocus
-when the stand has an autofocus and the timings know its cost, and each snap, all as
-measured. Without timings it is `null`: unknown, not guessed. A dry run is the same
-plan, and gives the same estimate.
+when the stand has an autofocus and the timings know its cost, and each snap, as
+measured, and what the timings assumed (a refocus that was not timed, soft limits the
+stage did not report) is named in `assumed`, one line each starting with `timings:`.
+Without timings it is `null`: unknown, not guessed. A dry run is the same plan, and
+gives the same estimate.
 
 ## The result
 
