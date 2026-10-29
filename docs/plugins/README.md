@@ -173,6 +173,7 @@ a plugin never builds one.
 | `ctx.save_checkpoint(state)`, `ctx.checkpoint(Model)` | Save what you would not want to repeat after each unit (a well, a field); read the one an attempt resumed from. |
 | `ctx.logger` | `smc.plugins.<name>`. Log through it; `smc -v` shows it. A plugin never prints. |
 | `ctx.run_dir` | The folder of the run document. Write files under it and store their paths relative to it, as `Path.as_posix()` strings (a Windows `str(Path)` has backslashes, which another OS does not read as a separator), so the folder moves as a whole. |
+| `ctx.run_doc` | The run document's path as the runner was given it, for its `.name` (the report prints it). Never written by a plugin and never put in a result: a path does not go into a record or a report (FM-50). |
 | `ctx.dry_run` | `microscope.dry_run`, for a plugin that must label what it did not do. |
 
 A loop that can be stopped:
