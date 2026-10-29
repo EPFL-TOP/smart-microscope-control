@@ -790,11 +790,20 @@ def test_join_waits_in_short_slices(
     worker = page._worker
     assert worker is not None
     now = [0.0]
+    reads = [0]
     waits: list[float | None] = []
+
+    def clock() -> float:
+        # Only a wait moves it, so a loop that spins on the clock without waiting
+        # fails here instead of hanging.
+        reads[0] += 1
+        if reads[0] > 200:
+            raise AssertionError("join read the clock 200 times without waiting")
+        return now[0]
 
     def spy(timeout: float | None = None) -> None:
         # The worker stays alive; a slice takes exactly as long as it was given. A wait
-        # with no limit, or a loop that never ends, fails here instead of hanging.
+        # with no limit, or one wait too many, fails here instead of hanging.
         waits.append(timeout)
         if timeout is None or len(waits) > 50:
             raise AssertionError(f"join not sliced against the deadline: {waits[-5:]}")
@@ -802,9 +811,7 @@ def test_join_waits_in_short_slices(
 
     # The name, not `time.monotonic`: the worker reads the real clock when it ends.
     with monkeypatch.context() as patch:
-        patch.setattr(
-            controller_module, "time", SimpleNamespace(monotonic=lambda: now[0])
-        )
+        patch.setattr(controller_module, "time", SimpleNamespace(monotonic=clock))
         with _replaced(worker, "join", spy):
             assert not page.join(0.35)
     assert waits == pytest.approx([0.1, 0.1, 0.1, 0.05])
