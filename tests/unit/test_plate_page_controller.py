@@ -28,7 +28,7 @@ import subprocess
 import sys
 import threading
 import weakref
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import EntryPoint
@@ -36,13 +36,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar, cast
 
+import numpy as np
 import pytest
 import useq
 from pymmcore_plus import CMMCorePlus
 
 import smc.ui.controller as controller_module
 from smc.hardware import Microscope
-from smc.hardware.capabilities import Autofocus, XYStage, ZStage
+from smc.hardware.capabilities import Autofocus, Camera, XYStage, ZStage
 from smc.hardware.errors import HardwareError, StopRefusedError
 from smc.hardware.profile import Profile
 from smc.hardware.roles import Role
@@ -1512,6 +1513,330 @@ def test_wells_are_built_once_per_registered_plate(
     assert len(built) == 192
     page.view()
     assert len(built) == 192
+
+
+# --- a snap and its frame ------------------------------------------------------------------
+
+
+class FrameCamera:
+    """The six methods of ``Camera``, giving the frame it is handed; every one is bounded (FM-44).
+
+    ``entered`` is set when a snap starts and, when ``block`` is set, the snap waits
+    for ``release``: a snap in flight, as a driver that takes its time is.
+    """
+
+    def __init__(
+        self,
+        frame: np.ndarray,
+        *,
+        exposure_ms: float = 5.0,
+        bit_depth: int = 16,
+        pixel_size_um: float = 0.65,
+        block: bool = False,
+        fail_with: Callable[[], Exception] | None = None,
+    ) -> None:
+        self.frame = frame
+        self._exposure_ms = exposure_ms
+        self._bit_depth = bit_depth
+        self._pixel_size_um = pixel_size_um
+        self._block = block
+        self._fail_with = fail_with
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def snap(self) -> np.ndarray:
+        self.entered.set()
+        if self._block:
+            assert self.release.wait(10), "the test never released the snap"
+        if self._fail_with is not None:
+            # Built here, so that nothing the camera holds keeps the error (FM-98).
+            raise self._fail_with()
+        return self.frame
+
+    def exposure_ms(self) -> float:
+        return self._exposure_ms
+
+    def set_exposure_ms(self, value_ms: float) -> float:
+        self._exposure_ms = value_ms
+        return value_ms
+
+    def image_shape(self) -> tuple[int, int]:
+        return (int(self.frame.shape[0]), int(self.frame.shape[1]))
+
+    def bit_depth(self) -> int:
+        return self._bit_depth
+
+    def pixel_size_um(self) -> float:
+        return self._pixel_size_um
+
+
+def _ramp_frame() -> np.ndarray:
+    """A 6 x 10 ``uint16`` frame, non-square and not symmetric, whose min is 7 and max 5907."""
+    return (np.arange(60, dtype=np.uint16).reshape(6, 10) * 100 + 7).astype(np.uint16)
+
+
+def _without(missing: type) -> Any:
+    def has(capability: type) -> bool:
+        return capability is not missing
+
+    return has
+
+
+def test_snap_keeps_the_frame_and_says_its_summary(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    fake_microscope.require(XYStage).move_to_um(1000.0, -500.0)
+    fake_microscope.override(
+        Camera, FrameCamera(_ramp_frame(), exposure_ms=5.0, bit_depth=12)
+    )
+    assert page.frame() is None
+    page.snap()
+    assert page.join(10.0)
+    frame = page.frame()
+    assert frame is not None
+    assert frame.image.shape == (6, 10)
+    assert frame.image.dtype == np.uint16
+    assert (frame.image == _ramp_frame()).all()
+    assert frame.number == 1
+    assert frame.bit_depth == 12
+    assert frame.exposure_ms == 5.0
+    assert frame.pixel_size_um == 0.65
+    assert frame.xy_um == (1000.0, -500.0)
+    assert frame.taken_utc.tzinfo is timezone.utc
+    assert abs((datetime.now(timezone.utc) - frame.taken_utc).total_seconds()) < 60
+    summary = "6x10 uint16, exposure 5 ms, min 7, max 5907"
+    assert frame.summary == summary
+    status = page.status()
+    assert status.outcome == f"snap: {summary}"
+    assert status.running is None
+
+
+def test_a_snap_of_an_unknown_pixel_size_is_zero_and_never_a_guess(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    fake_microscope.override(Camera, FrameCamera(_ramp_frame(), pixel_size_um=0.0))
+    page.snap()
+    assert page.join(10.0)
+    frame = page.frame()
+    assert frame is not None
+    assert frame.pixel_size_um == 0.0
+
+
+def test_each_snap_is_a_new_number_and_a_read_only_frame(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    camera = FrameCamera(_ramp_frame())
+    fake_microscope.override(Camera, camera)
+    page.snap()
+    assert page.join(10.0)
+    first = page.frame()
+    assert first is not None
+    page.snap()
+    assert page.join(10.0)
+    second = page.frame()
+    assert second is not None
+    assert (first.number, second.number) == (1, 2)
+    assert first is not second
+    assert not second.image.flags.writeable
+    with pytest.raises(ValueError, match="read-only"):
+        second.image[0, 0] = 1
+    # The camera hands out its own buffer again and writes to it: what the page
+    # keeps is a copy, so no session draws the camera's next frame.
+    camera.frame[0, 0] = 9999
+    assert second.image[0, 0] == 7
+
+
+def test_snap_on_a_stand_without_a_camera_is_an_outcome_and_starts_no_thread(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    threads = threading.active_count()
+    with _replaced(fake_microscope, "has", _without(Camera)):
+        page.snap()
+        assert page.lacks(Camera) == "this stand has no Camera"
+    assert page.status().outcome == "snap: this stand has no Camera"
+    assert page.status().running is None
+    assert page.frame() is None
+    assert threading.active_count() == threads
+
+
+def test_lacks_names_the_missing_capability(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    assert page.lacks(Camera) is None
+    assert page.lacks(XYStage) is None
+    with _replaced(fake_microscope, "has", _without(XYStage)):
+        assert page.lacks(XYStage) == "this stand has no XYStage"
+        assert page.lacks(Camera) is None
+
+
+def test_a_frame_the_page_cannot_show_is_an_outcome_and_not_kept(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    camera = FrameCamera(_ramp_frame())
+    fake_microscope.override(Camera, camera)
+    page.snap()
+    assert page.join(10.0)
+    kept = page.frame()
+    assert kept is not None
+    camera.frame = np.zeros((3, 4, 3), dtype=np.uint8)
+    page.snap()
+    assert page.join(10.0)
+    assert page.status().outcome == (
+        "snap: the camera returned a uint8 frame of shape (3, 4, 3); the page "
+        "shows 2-D uint8 or uint16 frames"
+    )
+    assert page.frame() is kept
+    # int16 has two bytes like a uint16, but is signed, and uint32 is unsigned but
+    # wide: only the kind and the size together tell them from a frame we show.
+    for dtype in (np.float32, np.int16, np.uint32):
+        camera.frame = np.zeros((3, 4), dtype=dtype)
+        page.snap()
+        assert page.join(10.0)
+        assert page.status().outcome == (
+            f"snap: the camera returned a {np.dtype(dtype)} frame of shape (3, 4); "
+            f"the page shows 2-D uint8 or uint16 frames"
+        )
+        assert page.frame() is kept
+
+
+def test_a_snap_that_fails_keeps_no_exception(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    raised: list[weakref.ref[BaseException]] = []
+
+    def failing() -> HardwareError:
+        error = HardwareError("the camera timed out\nafter 5 s")
+        raised.append(weakref.ref(error))
+        return error
+
+    fake_microscope.override(Camera, FrameCamera(_ramp_frame(), fail_with=failing))
+    gc.disable()
+    try:
+        page.snap()
+        assert page.join(10.0)
+        assert len(raised) == 1
+        # Dead without the cyclic collector: nothing the page holds reaches it (FM-98).
+        assert raised[0]() is None
+        assert page.status().outcome == (
+            "snap: HardwareError: the camera timed out after 5 s"
+        )
+        assert page.frame() is None
+        assert page.status().running is None
+    finally:
+        gc.enable()
+
+
+def test_a_snap_and_a_run_refuse_each_other(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    camera = FrameCamera(_ramp_frame(), block=True)
+    fake_microscope.override(Camera, camera)
+    try:
+        page.snap()
+        assert camera.entered.wait(5)
+        assert page.status().running == "snap"
+        with _refuses(RuntimeError, "snap is running"):
+            page.run("stub", [])
+        with _refuses(RuntimeError, "snap is running"):
+            page.snap()
+        with _refuses(RuntimeError, "snap is running"):
+            page.resume()
+    finally:
+        camera.release.set()
+    assert page.join(10.0)
+    assert page.status().running is None
+    assert Stub.seen == []
+    page.run("slow", [])
+    try:
+        assert Slow.started.wait(5)
+        with _refuses(RuntimeError, "slow is running"):
+            page.snap()
+    finally:
+        Slow.release.set()
+    assert page.join(10.0)
+    assert page.frame() is not None
+    assert page.frame().number == 1  # type: ignore[union-attr]
+
+
+def test_a_snap_leaves_the_run_documents_progress_and_the_next_run_alone(
+    page: PlatePage, fake_microscope: Microscope, run_doc: Path
+) -> None:
+    fake_microscope.override(Camera, FrameCamera(_ramp_frame()))
+    page.snap()
+    assert page.join(10.0)
+    assert not run_doc.exists()
+    _run_and_join(page, "stub")
+    assert page.status().outcome is not None
+    assert page.status().outcome.startswith("stub done in ")
+    assert page.frame() is not None
+
+
+def test_stop_during_a_snap_tells_it_and_halts_the_stand(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    camera = FrameCamera(_ramp_frame(), block=True)
+    fake_microscope.override(Camera, camera)
+    try:
+        page.snap()
+        assert camera.entered.wait(5)
+        page.stop()
+    finally:
+        camera.release.set()
+    assert page.join(10.0)
+    status = page.status()
+    assert status.stop_note == (
+        "snap told to stop; stopped: the stand is halted (Resume clears the halt)"
+    )
+    assert status.halted
+    assert status.running is None
+
+
+def test_close_waits_for_a_snap_and_says_what_the_stop_did(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    camera = FrameCamera(_ramp_frame(), block=True)
+    fake_microscope.override(Camera, camera)
+    try:
+        page.snap()
+        assert camera.entered.wait(5)
+        # A snap is one device call: it ends when the driver returns, and the close
+        # waits for it, then says what the stop did and how the snap ended.
+        threading.Timer(0.3, camera.release.set).start()
+        page.close()
+    finally:
+        camera.release.set()
+    assert page.close_ended
+    assert page.close_lines == (
+        "snap told to stop; stopped: the stand is halted (Resume clears the halt)",
+        "snap: 6x10 uint16, exposure 5 ms, min 7, max 5907",
+    )
+    with _refuses(RuntimeError, "the page is closed"):
+        page.snap()
+
+
+def test_a_snap_while_the_stand_is_halted_is_the_facades_refusal(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # The fake core's own camera, not an override: an override bypasses the halt.
+    page.stop()
+    with pytest.raises(HardwareError) as refusal:
+        fake_microscope.require(Camera).snap()
+    said = " ".join(str(refusal.value).split())
+    name = type(refusal.value).__name__
+    del refusal
+    page.snap()
+    assert page.join(10.0)
+    assert page.status().outcome == f"snap: {name}: {said}"
+    assert page.frame() is None
+
+
+def test_a_snap_on_the_fake_stand_reads_its_own_camera(page: PlatePage) -> None:
+    page.snap()
+    assert page.join(10.0)
+    frame = page.frame()
+    assert frame is not None, page.status().outcome
+    assert frame.image.ndim == 2
+    assert page.status().outcome == f"snap: {frame.summary}"
 
 
 # --- the tools ----------------------------------------------------------------------------

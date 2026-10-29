@@ -29,15 +29,17 @@ import threading
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from importlib.metadata import EntryPoint
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
 import numpy as np
+import numpy.typing as npt
 import useq
 from pydantic import ValidationError
 
-from smc.hardware.capabilities import Autofocus, LightSource, XYStage
+from smc.hardware.capabilities import Autofocus, Camera, LightSource, XYStage
 from smc.hardware.errors import HardwareError, StopRefusedError
 from smc.plugins import (
     ParamsError,
@@ -65,6 +67,7 @@ from smc.plugins.slots import (
     well_geometry,
 )
 from smc.run import RunDocument, RunDocumentError, StageStatus
+from smc.ui.frames import Frame
 
 if TYPE_CHECKING:
     from smc.hardware.microscope import Microscope
@@ -324,6 +327,7 @@ class PlatePage:
         self._current_run: tuple[str, threading.Event] | None = None
         self._progress: Progress | None = None
         self._outcome: str | None = None
+        self._frame: Frame | None = None
         self._queue: queue.SimpleQueue[Progress] = queue.SimpleQueue()
         self._worker: threading.Thread | None = None
         self._closed = False
@@ -632,6 +636,90 @@ class PlatePage:
         if record.status is StageStatus.done:
             return f"{plugin} done in {time.monotonic() - started:.1f} s"
         return f"{plugin} stopped"
+
+    def lacks(self, capability: type) -> str | None:
+        """Why the stand cannot offer ``capability``, or ``None``: the one text of a disabled control.
+
+        A control the stand cannot honour says so instead of failing when it is
+        pressed (ADR-0006, principle 1).
+        """
+        if self._microscope.has(capability):
+            return None
+        return f"this stand has no {capability.__name__}"
+
+    def snap(self) -> None:
+        """Snap one frame on the worker and keep it as ``frame()``; what it did is the ``outcome``.
+
+        An activity like a run (m5 §2.1): refused while another goes. A stand
+        without a camera is an outcome and no thread starts. A snap writes nothing
+        to disk and nothing to the run document: ``smc snap --out`` writes a
+        frame.
+
+        Raises:
+            RuntimeError: An activity is going (``<name> is running``), or the page
+                is closed.
+        """
+        self._refuse_if_busy()
+        reason = self.lacks(Camera)
+        if reason is not None:
+            self._set_outcome(f"snap: {reason}")
+            return
+        self._start_activity("snap", self._snap)
+
+    def frame(self) -> Frame | None:
+        """The latest frame, ``None`` before the first; the same for every session."""
+        with self._lock:
+            return self._frame
+
+    def _snap(self, event: threading.Event) -> str:
+        """One snap on the worker, and its outcome as text: no exception is kept (FM-98).
+
+        Read as ``smc snap`` reads: the exposure, the frame, then the stand's
+        position and pixel size. The camera's array is copied: MMCore may hand out
+        a view of its own buffer, and the page keeps the frame for as long as a
+        session draws it.
+        """
+        log.info("snap: started from the plate page")
+        try:
+            camera = self._microscope.require(Camera)
+            exposure_ms = camera.exposure_ms()
+            image = camera.snap()
+            if not (
+                image.ndim == 2
+                and image.dtype.kind == "u"
+                and image.dtype.itemsize <= 2
+            ):
+                return (
+                    f"snap: the camera returned a {image.dtype} frame of shape "
+                    f"{image.shape}; the page shows 2-D uint8 or uint16 frames"
+                )
+            bit_depth = camera.bit_depth()
+            state = self._microscope.state()
+            kept = np.array(image)
+            kept.flags.writeable = False
+            height, width = kept.shape
+            summary = (
+                f"{height}x{width} {kept.dtype}, exposure {exposure_ms:g} ms, "
+                f"min {int(kept.min())}, max {int(kept.max())}"
+            )
+            taken_utc = datetime.now(timezone.utc)
+            xy_um = None if state.xy is None else (state.xy.x_um, state.xy.y_um)
+            with self._lock:
+                previous = self._frame
+                self._frame = Frame(
+                    number=1 if previous is None else previous.number + 1,
+                    image=cast("npt.NDArray[np.uint8] | npt.NDArray[np.uint16]", kept),
+                    bit_depth=bit_depth,
+                    exposure_ms=exposure_ms,
+                    # 0.0 is the camera (or a failed read) saying "unknown".
+                    pixel_size_um=state.pixel_size_um or 0.0,
+                    xy_um=xy_um,
+                    taken_utc=taken_utc,
+                    summary=summary,
+                )
+        except Exception as exc:
+            return f"snap: {type(exc).__name__}: {_one_line(exc)}"
+        return f"snap: {summary}"
 
     def stop(self) -> None:
         """Ask the run to stop, then stop the stand; say what the stop did, never "stopped" by default.
@@ -948,16 +1036,16 @@ class PlatePage:
                     None,
                 )
                 if reason is None:
-                    lacking = next(
+                    reason = next(
                         (
-                            cap
-                            for cap in entry.plugin.requires
-                            if not self._microscope.has(cap)
+                            lack
+                            for lack in (
+                                self.lacks(cap) for cap in entry.plugin.requires
+                            )
+                            if lack
                         ),
                         None,
                     )
-                    if lacking is not None:
-                        reason = f"this stand has no {lacking.__name__}"
                 if reason is not None:
                     blocked[name] = reason
         return blocked
