@@ -106,7 +106,8 @@ def test_the_page_builds_on_the_demo(
         pytest.importorskip("panel")
     from smc.ui.plate_page import PlatePageView, build
 
-    page = PlatePage(demo_microscope, tmp_path / "run.json")
+    # The plugins are listed, not read from the checkout's install (FM-112).
+    page = PlatePage(demo_microscope, tmp_path / "run.json", entry_points=[GOTO_WELL])
     try:
         assert build(page).get_root() is not None
         view = PlatePageView(page)

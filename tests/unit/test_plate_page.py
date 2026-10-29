@@ -23,12 +23,12 @@ import threading
 import time
 import urllib.request
 import weakref
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import EntryPoint
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 import pytest
 
@@ -40,14 +40,17 @@ else:
 import useq
 from bokeh.events import Tap
 from bokeh.models import Circle, Rect
+from pymmcore_plus import CMMCorePlus
 
 import smc.ui.plate_page as plate_page
 from smc.hardware import Microscope
-from smc.hardware.capabilities import XYStage
+from smc.hardware.capabilities import LightSource, XYStage
+from smc.hardware.profile import Profile
 from smc.plugins.api import PluginParams, PluginResult, RunContext
 from smc.plugins.registry import GROUP
 from smc.plugins.slots import DensityResult, DensityWell, PlateResult
 from smc.run import RunDocument, StageRecord, StageStatus, write_stage
+from smc.testing import FakeCore
 from smc.ui.controller import (
     PageServerError,
     PageStatus,
@@ -838,9 +841,19 @@ def test_the_plate_choice_redraws_the_map(page: PlatePage) -> None:
 class _Thread:
     """What ``pn.serve(..., threaded=True)`` returns, as far as ``serve`` uses it."""
 
-    def __init__(self, *, alive: bool, interrupt: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        alive: bool,
+        interrupt: bool = False,
+        events: list[str] | None = None,
+        stop_waits_for: threading.Event | None = None,
+    ) -> None:
         self.alive = alive
         self.interrupt = interrupt
+        self.events = events if events is not None else []
+        # Panel's `stop` ends with a join that has no limit: this one waits for the test.
+        self.stop_waits_for = stop_waits_for
         self.calls: list[tuple[str, float | None]] = []
 
     def is_alive(self) -> bool:
@@ -854,13 +867,55 @@ class _Thread:
 
     def stop(self) -> None:
         self.calls.append(("stop", None))
+        self.events.append("server stop")
+        if self.stop_waits_for is not None:
+            self.stop_waits_for.wait(30)
         self.alive = False
+
+
+@pytest.fixture
+def served_thread(
+    page: PlatePage, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Callable[..., list[str]]]:
+    """Put a ``_Thread`` where ``pn.serve`` would; the list is what happened, in order.
+
+    The page's own ``close`` and the console's ``_say`` are recorded in it, so a test
+    reads the order of the stop of the run and the stop of the server (FM-94: the
+    assertion is after, never inside a callback).
+    """
+    released: list[threading.Event] = []
+
+    def install(
+        thread: _Thread, *, say: Callable[[str], None] | None = None
+    ) -> list[str]:
+        events = thread.events
+
+        def close() -> None:
+            events.append("page close")
+
+        monkeypatch.setattr(pn, "serve", lambda apps, **kwargs: thread)
+        monkeypatch.setattr(
+            "smc.cli._say", say or (lambda text: events.append(f"say: {text}"))
+        )
+        setattr(page, "close", close)  # noqa: B010  (an instance attribute, removed below)
+        if thread.stop_waits_for is not None:
+            released.append(thread.stop_waits_for)
+        return events
+
+    try:
+        yield install
+    finally:
+        for event in released:
+            event.set()  # a stopper thread a failed test left behind ends
+        if "close" in vars(page):
+            delattr(page, "close")
 
 
 def test_serve_returns_on_ctrl_c_and_stops_the_server(
     page: PlatePage, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    thread = _Thread(alive=True, interrupt=True)
+    events: list[str] = []
+    thread = _Thread(alive=True, interrupt=True, events=events)
     served: list[dict[str, Any]] = []
     said: list[str] = []
     bokeh_levels: list[int] = []
@@ -876,8 +931,13 @@ def test_serve_returns_on_ctrl_c_and_stops_the_server(
     monkeypatch.setattr(pn, "serve", fake_serve)
     monkeypatch.setattr("smc.cli._say", said.append)
     before = bokeh_log.level
-    serve(page, port=5123)
-    assert thread.calls == [("join", 0.1), ("stop", None), ("join", 10)]
+    with _replaced(page, "close", lambda: events.append("page close")):
+        serve(page, port=5123)
+    # The run is told to stop before the server is touched (it can wait on a busy
+    # tick, measured at twice the tick), and the server is then stopped and waited for.
+    assert events == ["page close", "server stop"]
+    assert thread.calls[0] == ("join", 0.1)
+    assert ("stop", None) in thread.calls
     assert served == [
         {
             "apps": [""],
@@ -911,10 +971,80 @@ def test_serve_says_when_the_server_stopped_on_its_own(
     assert logging.getLogger("bokeh").level == before
 
 
+_ANNOUNCED = "say: serving the plate page on http://localhost:5006/ — Ctrl-C stops it"
+
+
+def test_a_server_that_will_not_stop_is_waited_for_a_while_and_said(
+    page: PlatePage,
+    served_thread: Callable[..., list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Panel's `stop` ends with a join that has no limit, and the server waits for the
+    # callback in flight: asked directly it would hold the console for as long as a slow
+    # device read. The stub's `stop` waits for the test, as that join would.
+    release = threading.Event()
+    thread = _Thread(alive=True, interrupt=True, stop_waits_for=release)
+    events = served_thread(thread)
+    monkeypatch.setattr(plate_page, "SERVER_STOP_WAIT_S", 1.0)
+    started = time.monotonic()
+    serve(page, port=5006)
+    waited = time.monotonic() - started
+    release.set()
+    assert events == [
+        _ANNOUNCED,
+        "page close",
+        "server stop",
+        "say: the plate page's server did not stop within 1 s",
+    ]
+    assert waited < 10  # not the 30 s that the stub's stop would take
+
+
+def test_a_ctrl_c_before_the_server_is_announced_still_stops_the_run_and_the_server(
+    page: PlatePage, served_thread: Callable[..., list[str]]
+) -> None:
+    def say(text: str) -> None:
+        raise KeyboardInterrupt  # from the stub, never a signal (FM-44)
+
+    thread = _Thread(alive=True)
+    events = served_thread(thread, say=say)
+    serve(page, port=5006)
+    assert events == ["page close", "server stop"]
+
+
+def test_a_console_that_fails_still_stops_the_server(
+    page: PlatePage, served_thread: Callable[..., list[str]]
+) -> None:
+    def say(text: str) -> None:
+        raise BrokenPipeError("the console is closed")
+
+    thread = _Thread(alive=True)
+    events = served_thread(thread, say=say)
+    with pytest.raises(BrokenPipeError):
+        serve(page, port=5006)
+    # Panel's thread is not a daemon: left running it would keep the process alive.
+    assert events == ["server stop"]
+
+
+def test_a_second_ctrl_c_while_the_run_is_stopped_still_stops_the_server(
+    page: PlatePage, served_thread: Callable[..., list[str]]
+) -> None:
+    thread = _Thread(alive=True, interrupt=True)
+    events = served_thread(thread)
+
+    def close() -> None:
+        events.append("page close")
+        raise KeyboardInterrupt  # the operator's second Ctrl-C (FM-71)
+
+    with _replaced(page, "close", close), pytest.raises(KeyboardInterrupt):
+        serve(page, port=5006)
+    assert events == [_ANNOUNCED, "page close", "server stop"]
+
+
 def test_the_served_page_answers(page: PlatePage) -> None:
     with socket.socket() as probe:
         probe.bind(("localhost", 0))
         port = probe.getsockname()[1]
+    direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     thread = pn.serve(
         {"": lambda: build(page)},
         address="localhost",
@@ -928,9 +1058,9 @@ def test_the_served_page_answers(page: PlatePage) -> None:
         body = b""
         while time.monotonic() < deadline:
             try:
-                with urllib.request.urlopen(
-                    f"http://localhost:{port}/", timeout=20
-                ) as reply:
+                # No proxy: a PC's proxy settings (the environment, and Windows' Internet
+                # Options) would send a request for localhost to the proxy.
+                with direct.open(f"http://localhost:{port}/", timeout=20) as reply:
                     status, body = reply.status, reply.read()
                 break
             except OSError:
@@ -941,3 +1071,182 @@ def test_the_served_page_answers(page: PlatePage) -> None:
         thread.stop()
         thread.join(timeout=10)
     assert not thread.is_alive()
+
+
+# --- the widgets are wired to what they say -----------------------------------------
+
+
+def test_a_drive_tap_goes_to_the_wall_the_side_select_says(
+    run_doc: Path, page: PlatePage
+) -> None:
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    view = PlatePageView(page)
+    view.side_select.value = "left"
+    view.drive_toggle.value = True
+    _tap(view, *_centre("C5"))
+    assert page.join(10.0)
+    record = RunDocument.load(run_doc).stages["goto-well"]
+    assert record.params == {"well": "C5", "side": "left"}
+    assert record.status is StageStatus.done
+
+
+def test_each_run_button_starts_its_own_tool(run_doc: Path, page: PlatePage) -> None:
+    view = PlatePageView(page)
+    page.select_text("A1")
+    sent: list[tuple[str, list[str]]] = []
+
+    def record(plugin: str, params: list[str]) -> None:
+        sent.append((plugin, list(params)))
+
+    with _replaced(page, "run", record):
+        for name in ("plate-registration", "scan-plan", "scan"):
+            sent.clear()
+            view.tool_runs[
+                name
+            ].disabled = False  # a click is what is tested, not `blocked`
+            view.tool_runs[name].clicks += 1
+            assert [plugin for plugin, _ in sent] == [name]
+
+
+def test_the_refresh_button_redraws_the_view_after_the_run_document_changed(
+    run_doc: Path, page: PlatePage
+) -> None:
+    view = PlatePageView(page)
+    unregistered = (
+        "96-well: nominal map (A1 at 0, 0, not turned), the plate is not registered"
+    )
+    assert view.figure.title.text == unregistered
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    assert view.figure.title.text == unregistered  # a tick never reads the view
+    view.refresh_button.clicks += 1
+    assert view.figure.title.text == "96-well: the registered plate"
+    assert "✓ plate" in view.checklist_text.object
+
+
+def test_build_registers_one_callback_that_ticks_the_view_every_second(
+    page: PlatePage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registered: list[tuple[Any, Any]] = []
+
+    def recorder(callback: Any, period: Any = 500, *args: Any, **kwargs: Any) -> None:
+        registered.append((callback, period))
+
+    monkeypatch.setattr(pn.state, "add_periodic_callback", recorder)
+    build(page)
+    [(callback, period)] = registered
+    assert isinstance(callback.__self__, PlatePageView)
+    assert callback.__func__ is PlatePageView.tick
+    # One second, and no faster: a scan must not be slowed by a status poll.
+    assert period == 1000
+
+
+def test_a_device_error_reaches_the_problems_line_after_a_tick(
+    page: PlatePage, fake_core: FakeCore
+) -> None:
+    def refuses(*args: object, **kwargs: object) -> list[float]:
+        raise RuntimeError("the stage does not answer")
+
+    with _replaced(fake_core, "getXYPosition", refuses):
+        view = PlatePageView(page)
+        view.tick()
+        problems = page.status().problems
+    assert problems == (
+        "xy: HardwareError: xy_stage: getXPosition('XY') failed (the stage does not "
+        "answer); check the device: power, cable, another program holding it",
+    )
+    assert view.problems_text.object == "\n".join(problems)
+    assert view.status_text.object.startswith("XY ? | ")
+
+
+def test_the_light_that_is_on_is_said_on(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    class LampOn:
+        def is_on(self) -> bool:
+            return True
+
+    real_get = fake_microscope.get
+
+    def get(capability: object) -> object:
+        return LampOn() if capability is LightSource else real_get(capability)
+
+    with _replaced(fake_microscope, "get", get):
+        view = PlatePageView(page)
+        status = page.status()
+    assert status.light_on is True
+    assert "light on" in view.status_text.object
+
+
+def test_a_stage_that_is_moving_is_listed(
+    page: PlatePage, fake_core: FakeCore, fake_microscope: Microscope
+) -> None:
+    label = fake_core.getXYStageDevice()
+    fake_core.busy_devices.add(label)
+    stage = fake_microscope.require(XYStage)
+    mover = threading.Thread(
+        target=lambda: stage.move_to_um(5.0, 5.0), daemon=True, name="smc-test-move"
+    )
+    mover.start()
+    seen: tuple[str, ...] = ()
+    try:
+        deadline = time.monotonic() + 5.0
+        while not seen and time.monotonic() < deadline:
+            seen = page.status().moving
+            time.sleep(0.01)
+        assert seen == ("xy_stage XY",)
+        view = PlatePageView(page)
+        assert "moving: xy_stage XY" in view.status_text.object
+    finally:
+        fake_core.busy_devices.discard(label)
+        mover.join(10.0)
+    assert not mover.is_alive()
+
+
+def test_a_dry_run_is_said_on_the_strip(run_doc: Path, fake_core: FakeCore) -> None:
+    dry = Microscope.from_core(
+        cast("CMMCorePlus", fake_core), Profile.demo(), dry_run=True
+    )
+    controller = PlatePage(dry, run_doc, entry_points=_entry_points("goto-well"))
+    try:
+        assert controller.status().dry_run
+        assert "DRY RUN" in PlatePageView(controller).status_text.object
+    finally:
+        controller.close()
+        dry.close()
+
+
+def test_a_selection_made_in_another_tab_is_drawn_by_the_next_tick(
+    page: PlatePage,
+) -> None:
+    # The controller is the server's: a tab that does not redraw would run
+    # `scan-plan` with wells it does not show.
+    first, second = PlatePageView(page), PlatePageView(page)
+    _tap(first, *_centre("A1"))
+    assert page.selection == ("A1",)
+    assert _wells_by_name(second)["A1"]["outline_width"] == 1
+    second.tick()
+    assert _wells_by_name(second)["A1"]["outline_width"] == 3
+    page.choose_plate("24-well")
+    second.tick()
+    assert second.plate_select.value == "24-well"
+    assert len(_wells_by_name(second)) == 24
+
+
+def test_a_tick_redraws_the_view_only_when_something_changed(page: PlatePage) -> None:
+    view = PlatePageView(page)
+    counted = {"view": 0}
+    real_view = page.view
+
+    def counting_view() -> Any:
+        counted["view"] += 1
+        return real_view()
+
+    with _replaced(page, "view", counting_view):
+        view.tick()
+        view.tick()
+        assert counted["view"] == 0
+        page.select_text("A1")
+        view.tick()
+        assert counted["view"] == 1
+        view.tick()
+        assert counted["view"] == 1

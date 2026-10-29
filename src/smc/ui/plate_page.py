@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -55,6 +57,9 @@ NAMES_UP_TO_WELLS = 96
 #: stand is not measured (m3 §15.3): a click or a button acts at once through its
 #: own handler.
 TICK_MS = 1000
+
+#: How long ``serve`` waits for Panel's server to stop, in seconds.
+SERVER_STOP_WAIT_S = 10.0
 
 DRIVE_TEXT = "DRIVE: the next click on a well moves the stage there"
 
@@ -154,6 +159,7 @@ class PlatePageView:
         self._problems_view: tuple[str, ...] = ()
         self._problems_status: tuple[str, ...] = ()
         self._circular: bool | None = None
+        self._seen_state: tuple[Any, ...] | None = None
         self._tools = page.tools()
 
         self.wells_source = ColumnDataSource(
@@ -474,9 +480,22 @@ class PlatePageView:
         self._draw_buttons()
         if previous is not None and status.running is None:
             self.refresh()
+        elif self._shared_state() != self._seen_state:
+            # Another tab chose wells or a plate, or took a capture: the controller is
+            # the server's, so a tab that does not redraw would run `scan-plan` with
+            # wells it does not show. Reading five attributes is no view: the view is
+            # rebuilt only when one of them changed.
+            self.refresh()
+
+    def _shared_state(self) -> tuple[Any, ...]:
+        """What the controller holds that every tab draws: compared, never rebuilt."""
+        page = self.page
+        return (page.plate, page.selection, page.refs, page.walls, page.current)
 
     def refresh(self) -> None:
         """Read the run document again and redraw the map, the route and the checklist."""
+        # Taken before the view is: a change made meanwhile is seen by the next tick.
+        self._seen_state = self._shared_state()
         view = self.page.view()
         self._view = view
         self._blocked = dict(view.blocked)
@@ -627,6 +646,7 @@ def serve(page: PlatePage, *, port: int) -> None:
     bokeh_log = logging.getLogger("bokeh")
     level = bokeh_log.level
     bokeh_log.setLevel(logging.WARNING)
+    interrupted = False
     try:
         thread = pn.serve(
             {"": lambda: build(page)},
@@ -636,16 +656,54 @@ def serve(page: PlatePage, *, port: int) -> None:
             threaded=True,
             verbose=False,
         )
-        _say(f"serving the plate page on http://localhost:{port}/ — Ctrl-C stops it")
+        # Panel's thread is not a daemon: whatever ends this block, it is stopped, or
+        # the process waits for it at exit.
         try:
-            while thread.is_alive():
-                thread.join(0.1)
-        except KeyboardInterrupt:
-            thread.stop()
-            thread.join(timeout=10)
-            return
+            try:
+                _say(
+                    f"serving the plate page on http://localhost:{port}/ — Ctrl-C stops it"
+                )
+                while thread.is_alive():
+                    thread.join(0.1)
+            except KeyboardInterrupt:
+                interrupted = True
+                # The run is told to stop before the server is touched: stopping the
+                # server waits for the callback in flight (measured: 12 s for a tick
+                # that takes 6 s), and the stop of a scan must not wait behind it.
+                page.close()
+        finally:
+            if thread.is_alive() and not _stop_server(thread):
+                _say(
+                    f"the plate page's server did not stop within {SERVER_STOP_WAIT_S:.0f} s"
+                )
     finally:
         bokeh_log.setLevel(level)
+    if interrupted:
+        return
     raise PageServerError(
         f"the plate page's server stopped on its own (is port {port} taken?)"
     )
+
+
+def _stop_server(thread: Any) -> bool:
+    """Stop Panel's server thread within ``SERVER_STOP_WAIT_S``; whether it ended.
+
+    ``StoppableThread.stop`` ends with a join that has no limit, and the server's own
+    shutdown waits for the callback in flight and then 5 s, so asking for the stop
+    directly holds the console for as long as a slow device read does, and on Windows
+    Ctrl-C does not interrupt that wait (FM-83). It is asked from a daemon thread and
+    waited for in slices, and Panel 1.9's ``stop`` does not join, so the server
+    thread is waited for too.
+    """
+    stopper = threading.Thread(
+        target=thread.stop, name="smc-ui-stop-server", daemon=True
+    )
+    stopper.start()
+    deadline = time.monotonic() + SERVER_STOP_WAIT_S
+    while time.monotonic() < deadline:
+        stopper.join(0.1)
+        if not stopper.is_alive():
+            thread.join(min(0.1, max(0.0, deadline - time.monotonic())))
+            if not thread.is_alive():
+                return True
+    return False

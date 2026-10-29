@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import codecs
 import contextlib
+import errno
 import gc
 import importlib
 import json
@@ -1999,19 +2000,17 @@ def ui_plate_command(
             _fail(_UI_EXTRA_FIX)
             _say(missing)
             raise typer.Exit(code=_EXIT_ERROR)
-        try:
-            with socket.socket() as probe:
-                probe.bind(("localhost", port))
-        except OSError:
+        if _port_is_taken(port):
             _fail(f"port {port} is in use; choose another with --port")
-            raise typer.Exit(code=_EXIT_REFUSED) from None
+            raise typer.Exit(code=_EXIT_REFUSED)
         from smc.ui.controller import PlatePage
 
         loaded = Profile.load(profile)
         # Read before the stand is opened: an unreadable document is refused as it
         # is, and left untouched.
         RunDocument.load_or_new(path)
-        stopped: str | None = None
+        closing: tuple[str, ...] = ()
+        ended = True
         with Microscope.open(loaded, dry_run=dry_run) as microscope:
             if not dry_run:
                 _say_stop_refused(microscope)
@@ -2021,11 +2020,45 @@ def ui_plate_command(
             finally:
                 # The stop is sent before the wait, so a second Ctrl-C during it
                 # still loses nothing, and the stand is released by the `with`
-                # whatever ends this (FM-71).
+                # whatever ends this (FM-71). A page that `serve` already closed
+                # returns at once.
                 page.close()
-                stopped = page.stopped_by_close
-        if stopped is not None:
-            _say(f"{stopped} was stopped")
+                closing, ended = page.close_lines, page.close_ended
+        # After the stand is released: what the stop did and how the run ended, as the
+        # page worded them. A run that did not end is a failure, and the stand was
+        # released under it (FM-117: never "stopped" by default).
+        for line in closing[:-1]:
+            _say(line)
+        if closing:
+            (_say if ended else _fail)(closing[-1])
+        if not ended:
+            raise typer.Exit(code=_EXIT_ERROR)
+
+
+def _port_is_taken(port: int) -> bool:
+    """Whether ``localhost:<port>`` is held, on any address the page's server will bind.
+
+    Tornado resolves ``localhost`` with ``AF_UNSPEC`` and binds each address it
+    gets (``::1`` and ``127.0.0.1``), so a probe of the IPv4 one alone passes a port
+    that is held on ``[::1]`` only, and the stand is opened for a server that then
+    dies (measured). An address this host cannot bind at all (no IPv6) is not a
+    taken port.
+    """
+    try:
+        found = socket.getaddrinfo(
+            "localhost", port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+        )
+    except socket.gaierror:
+        found = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("127.0.0.1", port))]
+    for family, kind, proto, _name, address in found:
+        try:
+            with socket.socket(family, kind, proto) as probe:
+                probe.bind(address)
+        except OSError as exc:
+            if exc.errno in (errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL):
+                continue
+            return True
+    return False
 
 
 def main() -> None:

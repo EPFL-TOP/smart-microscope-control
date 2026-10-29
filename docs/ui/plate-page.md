@@ -40,18 +40,28 @@ tunnel is **untried**: it could work only with the same port number on both ends
 |---|---|
 | No `--run-doc` | exit 2, `a run needs --run-doc` |
 | The `ui` extra is missing | exit 1, `install the ui extra: pip install -e ".[ui]"` and the import error |
-| The port is taken | exit 2, `port N is in use; choose another with --port`; the stand is not opened |
+| The port is taken (on `127.0.0.1` or on `::1`) | exit 2, `port N is in use; choose another with --port`; the stand is not opened |
 | The run document cannot be read | exit 1, its reason; the file is left as it is |
 | The server stops by itself | exit 1, `the plate page's server stopped on its own (is port N taken?)` |
 
 **Ctrl-C** ends the server. If a run is going it is **told to stop first** (the same
-stop as the STOP button), the page waits up to 10 s for it, and the stand is released
-after. The last line then says `<plugin> was stopped`. A second Ctrl-C during that
-wait still releases the stand, and the command exits 130.
+stop as the STOP button, sent before the server is touched, because stopping the
+server can wait for a slow read of the stand), the page waits up to 10 s for the run,
+then stops the server (up to 10 s, and says so if it does not), and the stand is
+released after. What the command prints last depends on what happened:
 
-A closed or reloaded browser tab does **nothing** to a run: the page belongs to the
-server, not to the tab. Only STOP, Ctrl-C of the command and the plugin's own end
-stop a scan.
+| What happened | The last lines |
+|---|---|
+| The stand took the stop and the run ended stopped | `<plugin> was stopped`, exit 0 |
+| The stand refused the stop (the Ti2-E's does) | `<plugin> told to stop; halted, but <why>`, then how the run ended: a move under way runs to its target, so it is never "stopped" by default |
+| The run failed while it was stopped | the stop's line, then `<plugin>: <Error>: <message>`, exit 0 |
+| The run did not end within the wait | the stop's line, then `✗ <plugin> did not end within 10 s`, **exit 1**; the stand is released under a run that is still alive |
+
+A second Ctrl-C during the wait still releases the stand, and the command exits 130;
+the stop was already sent. A closed or reloaded browser tab does **nothing** to a run:
+the page belongs to the server, not to the tab. Only STOP, Ctrl-C of the command and
+the plugin's own end stop a scan. Two tabs on one server share the selection, the plate
+and the captures: a tab draws what another tab changed within a second.
 
 ## What is on the page
 
@@ -101,6 +111,14 @@ is not offered: the wells of `scan-plan`, and the plate and the captures of
 (`the run document has no plate; ...`, `this stand has no XYStage`), and so is every
 tool while a run is going. A tool that is not registered (a plugin that has not been
 written, or an install that predates it) is not on the page.
+
+**Run starts a stage afresh, and never continues one.** After STOP (or a failure) a
+stage's record is `stopped` or `failed`, the checklist says `run it again`, and the page's
+Run button starts it **from the beginning**: the record, with the checkpoint that
+`--resume` would continue from, is replaced (`smc run` without `--resume` does the same,
+and logs it). What the first attempt wrote to disk (a scan's frames) is kept, but
+`smc run NAME --resume` can no longer reach it. **To continue a stopped stage, close
+the page and run `smc run NAME --run-doc ... --resume` first.**
 
 **Calibrating the plate.** Under `plate-registration`: centre a well under the objective
 by hand, click it on the map, press **Capture centre**; for a wall, put the objective on

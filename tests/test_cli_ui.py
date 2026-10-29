@@ -10,6 +10,7 @@ stand-in, never sent as a signal (FM-44).
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 import socket
@@ -17,7 +18,7 @@ import subprocess
 import sys
 import threading
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from importlib.metadata import EntryPoint
 from pathlib import Path
 from typing import Any, ClassVar, cast
@@ -26,11 +27,14 @@ import pytest
 from pymmcore_plus import CMMCorePlus
 from typer.testing import CliRunner, Result
 
+import smc.cli as cli
 import smc.ui.controller as controller_module
 from smc.cli import app
 from smc.hardware import Microscope
 from smc.hardware.profile import Profile
-from smc.plugins.api import PluginParams, PluginResult, RunContext
+from smc.hardware.roles import Role
+from smc.plugins.api import PluginParams, PluginResult, RunContext, StopRequested
+from smc.plugins.errors import PluginRunError
 from smc.plugins.registry import GROUP
 from smc.testing import FakeCore
 from smc.ui.controller import PageServerError, PlatePage
@@ -69,9 +73,40 @@ class Slow:
             ctx.wait_s(0.05)
 
 
+class FailsOnStop(Slow):
+    """A run that is inside a move when the stop lands: the move fails and so does the run."""
+
+    name = provides = "fails"
+
+    def run(self, microscope: Any, params: NoParams, ctx: RunContext) -> NoResult:
+        Slow.started.set()
+        try:
+            while True:
+                ctx.wait_s(0.05)
+        except StopRequested:
+            raise PluginRunError("fails", "the move was stopped") from None
+
+
+class Stubborn(Slow):
+    """A run that ignores the stop until the test lets it go."""
+
+    name = provides = "stubborn"
+    release: ClassVar[threading.Event] = threading.Event()
+
+    def run(self, microscope: Any, params: NoParams, ctx: RunContext) -> NoResult:
+        Slow.started.set()
+        Stubborn.release.wait(30)
+        return NoResult()
+
+
 @pytest.fixture(autouse=True)
-def _fresh_started() -> None:
+def _fresh_started() -> Iterator[None]:
     Slow.started = threading.Event()
+    Stubborn.release = threading.Event()
+    try:
+        yield
+    finally:
+        Stubborn.release.set()  # a worker a failed test left behind ends
 
 
 def _plain(result: Result) -> str:
@@ -262,7 +297,14 @@ def test_ui_plate_dry_run_opens_the_stand_dry(
     assert dry == [True]
 
 
+@pytest.fixture
+def demo(mm_available: bool) -> None:
+    if not mm_available:
+        pytest.skip("Micro-Manager demo adapters not installed")
+
+
 @pytest.mark.demo
+@pytest.mark.usefixtures("demo")
 def test_ui_plate_serves_the_demo_and_releases_the_stand(
     monkeypatch: pytest.MonkeyPatch, closes: list[Microscope], tmp_path: Path
 ) -> None:
@@ -279,6 +321,7 @@ class _SpyPage(PlatePage):
 
     closed: ClassVar[list[str]] = []
     order: ClassVar[list[str]] = []
+    plugins: ClassVar[tuple[type, ...]] = (Slow,)
 
     def __init__(
         self,
@@ -287,8 +330,15 @@ class _SpyPage(PlatePage):
         *,
         entry_points: Any = None,
     ) -> None:
-        slow = EntryPoint(name="slow", value=f"{__name__}:Slow", group=GROUP)
-        super().__init__(microscope, run_doc, entry_points=[slow])
+        found = [
+            EntryPoint(
+                name=cast("Any", cls).name,
+                value=f"{__name__}:{cls.__name__}",
+                group=GROUP,
+            )
+            for cls in _SpyPage.plugins
+        ]
+        super().__init__(microscope, run_doc, entry_points=found)
 
     def stop(self) -> None:
         _SpyPage.order.append("stop")
@@ -303,6 +353,7 @@ class _SpyPage(PlatePage):
 def spy_page(monkeypatch: pytest.MonkeyPatch) -> type[_SpyPage]:
     _SpyPage.closed = []
     _SpyPage.order = []
+    _SpyPage.plugins = (Slow, FailsOnStop, Stubborn)
     monkeypatch.setattr(controller_module, "PlatePage", _SpyPage)
     return _SpyPage
 
@@ -365,6 +416,164 @@ def test_a_run_that_is_going_when_the_server_ends_is_stopped_and_said_last(
     assert result.output.splitlines()[-1] == "slow was stopped"
     assert spy_page.order == ["stop"]
     assert closes == fake_stand
+
+
+def _starts(name: str) -> Callable[..., None]:
+    """A stand-in ``serve`` that starts the run ``name`` and returns, as a Ctrl-C does."""
+
+    def serve(page: PlatePage, *, port: int) -> None:
+        page.run(name, [])
+        assert Slow.started.wait(5)
+
+    return serve
+
+
+@pytest.fixture
+def refusing_stand(monkeypatch: pytest.MonkeyPatch) -> list[Microscope]:
+    """A stand whose XY stage refuses ``stop()``, as the Ti2-E's does, and says so in its profile."""
+    opened: list[Microscope] = []
+
+    def open_stand(
+        cls: type[Microscope], profile: object = "demo", *, dry_run: bool = False
+    ) -> Microscope:
+        core = FakeCore.demo_like()
+        core.stop_refused = {"XY"}
+        demo = Profile.demo()
+        declared = demo.model_copy(
+            update={
+                "safety": demo.safety.model_copy(
+                    update={"stop_refused_by": (Role.xy_stage,)}
+                )
+            }
+        )
+        microscope = Microscope.from_core(
+            cast("CMMCorePlus", core), declared, dry_run=dry_run
+        )
+        opened.append(microscope)
+        return microscope
+
+    monkeypatch.setattr(Microscope, "open", classmethod(open_stand))
+    return opened
+
+
+def test_a_stand_that_refuses_the_stop_is_not_told_as_stopped(
+    monkeypatch: pytest.MonkeyPatch,
+    refusing_stand: list[Microscope],
+    spy_page: type[_SpyPage],
+    tmp_path: Path,
+) -> None:
+    # FM-117: the run left its loop, but the stand said that a move under way runs to
+    # its target. "was stopped" would be the incident of the Ti2-E again.
+    _stand_in(monkeypatch, _starts("slow"))
+    result = _plate(doc=tmp_path / "run.json")
+    lines = result.output.splitlines()
+    assert result.exit_code == 0, result.output
+    assert "slow was stopped" not in lines
+    [note] = [line for line in lines if line.startswith("slow told to stop; ")]
+    assert note.startswith("slow told to stop; halted, but ")
+    assert "refused the stop" in note
+    assert lines[-2:] == [note, "slow stopped"]
+
+
+def test_a_run_that_fails_while_it_is_stopped_says_how_it_ended(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_stand: list[Microscope],
+    spy_page: type[_SpyPage],
+    tmp_path: Path,
+) -> None:
+    _stand_in(monkeypatch, _starts("fails"))
+    result = _plate(doc=tmp_path / "run.json")
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines()[-2:] == [
+        "fails told to stop; stopped: the stand is halted (Resume clears the halt)",
+        "fails: PluginRunError: fails: the move was stopped",
+    ]
+    assert "fails was stopped" not in result.output
+
+
+def test_a_run_that_does_not_end_is_a_failure_and_the_stand_is_still_released(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_stand: list[Microscope],
+    closes: list[Microscope],
+    spy_page: type[_SpyPage],
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(controller_module, "_CLOSE_WAIT_S", 1.0)
+    _stand_in(monkeypatch, _starts("stubborn"))
+    result = _plate(doc=tmp_path / "run.json")
+    lines = result.output.splitlines()
+    Stubborn.release.set()
+    assert result.exit_code == 1, result.output
+    assert lines[-2:] == [
+        "stubborn told to stop; stopped: the stand is halted (Resume clears the halt)",
+        "✗ stubborn did not end within 1 s",
+    ]
+    assert closes == fake_stand
+
+
+# --- the port probe ---------------------------------------------------------------
+
+
+def _holds(family: int, address: str) -> socket.socket:
+    held = socket.socket(family, socket.SOCK_STREAM)
+    held.bind((address, 0))
+    return held
+
+
+def test_a_port_is_taken_on_either_loopback_address() -> None:
+    for family, address in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+        try:
+            held = _holds(family, address)
+        except OSError:
+            continue  # this host has no such loopback address
+        with held:
+            assert cli._port_is_taken(held.getsockname()[1]), address
+    assert not cli._port_is_taken(_free_port())
+
+
+def test_a_port_held_on_ipv6_only_is_refused_before_the_stand_is_opened(
+    monkeypatch: pytest.MonkeyPatch, no_stand: None, tmp_path: Path
+) -> None:
+    # Tornado binds every address `localhost` has, so the probe must try them all
+    # (measured: held on [::1] only, an IPv4 probe passed and the stand was opened).
+    try:
+        held = _holds(socket.AF_INET6, "::1")
+    except OSError:
+        pytest.skip("this host has no IPv6 loopback")
+    _stand_in(monkeypatch, lambda page, *, port: None)
+    with held:
+        port = held.getsockname()[1]
+        result = _plate(doc=tmp_path / "run.json", port=port)
+    assert result.exit_code == 2, result.output
+    assert (
+        f"✗ port {port} is in use; choose another with --port"
+        in result.output.splitlines()
+    )
+
+
+def test_an_address_this_host_cannot_bind_is_not_a_taken_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    port = _free_port()
+    real = socket.socket
+
+    def make(
+        family: int = -1, kind: int = -1, proto: int = -1, fileno: Any = None
+    ) -> Any:
+        if family == socket.AF_INET6:
+            raise OSError(errno.EAFNOSUPPORT, "no IPv6 here")
+        return real(family, kind, proto, fileno)
+
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *args, **kwargs: [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", port, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port)),
+        ],
+    )
+    monkeypatch.setattr(socket, "socket", make)
+    assert not cli._port_is_taken(port)
 
 
 def test_a_second_ctrl_c_during_close_still_releases_the_stand(

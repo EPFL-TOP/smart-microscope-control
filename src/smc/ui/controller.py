@@ -132,6 +132,14 @@ _SIDES = ("left", "right", "top", "bottom")
 #: How long ``close`` waits for a stopped run to end, in seconds.
 _CLOSE_WAIT_S = 10.0
 
+#: A wait on the worker is made of slices this long (FM-83: Windows does not deliver
+#: Ctrl-C during one long wait on a thread).
+_WAIT_SLICE_S = 0.1
+
+#: What ``stop`` says when the stand took the stop: the one wording that may be told
+#: as "stopped" (FM-117).
+_STOP_ACCEPTED = "stopped: the stand is halted (Resume clears the halt)"
+
 #: Wells built for a plate are kept (339 ms for 1536 of them); a registration
 #: changes the key rarely, so a handful is plenty.
 _GEOMETRY_KEPT = 4
@@ -274,15 +282,20 @@ class PlatePage:
         walls: The wall touches, for plate registration.
         current: The well last clicked or driven to; where *Capture* and
             *Forget* act.
-        stopped_by_close: The plugin whose run ``close()`` stopped and saw end
-            ``stopped``, else ``None``: what ``smc ui plate`` says last.
+        close_lines: What ``close()`` has to tell the operator about the run it
+            stopped, as lines: ``<plugin> was stopped`` when the stand took the
+            stop and the run ended stopped, else what the stop did and how the run
+            ended. ``()`` when no run was going: what ``smc ui plate`` says last.
+        close_ended: ``False`` when the run it stopped was still alive after the
+            wait.
     """
 
     selection: tuple[str, ...]
     refs: tuple[WellRef, ...]
     walls: tuple[WallTouch, ...]
     current: str | None
-    stopped_by_close: str | None
+    close_lines: tuple[str, ...]
+    close_ended: bool
 
     def __init__(
         self,
@@ -317,7 +330,8 @@ class PlatePage:
         # A plain attribute, written by ``stop()`` and ``resume()``, which take no lock.
         self._stop_note: str | None = None
         self.current = None
-        self.stopped_by_close = None
+        self.close_lines = ()
+        self.close_ended = True
         self.selection = ()
         self.refs = ()
         self.walls = ()
@@ -613,7 +627,7 @@ class PlatePage:
         except HardwareError as exc:
             note = f"{prefix}the stop failed: {_one_line(exc)}"
         else:
-            note = f"{prefix}stopped: the stand is halted (Resume clears the halt)"
+            note = f"{prefix}{_STOP_ACCEPTED}"
         log.info("stop: %s", note)
         self._stop_note = note
 
@@ -682,30 +696,62 @@ class PlatePage:
         )
 
     def join(self, timeout_s: float | None = None) -> bool:
-        """Wait for the worker; whether none is left alive."""
+        """Wait for the worker, in slices of 0.1 s; whether none is left alive.
+
+        On Windows one long wait on a thread is not interrupted by Ctrl-C (FM-83),
+        so the wait returns to Python between two slices.
+        """
         worker = self._worker
-        if worker is not None:
-            worker.join(timeout_s)
-        return worker is None or not worker.is_alive()
+        if worker is None:
+            return True
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        while worker.is_alive():
+            if deadline is None:
+                worker.join(_WAIT_SLICE_S)
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            worker.join(min(_WAIT_SLICE_S, remaining))
+        return not worker.is_alive()
 
     def close(self) -> None:
         """Stop a run that is going and wait for it; afterwards ``run`` refuses.
 
-        Idempotent. It never closes the stand (the command that serves the page
-        owns it) and never raises for a refused stop. A run that is still alive
-        after the wait is said so in ``outcome``. A Ctrl-C during the wait is not
-        caught: the stop was sent before it (FM-71).
+        Idempotent: the first call does the work, and a later one (the command's
+        ``finally`` after ``serve`` already closed the page) returns at once, so a
+        second Ctrl-C never waits twice. It never closes the stand (the command
+        that serves the page owns it) and never raises for a refused stop. What it
+        tells the operator is ``close_lines``: what the stop did and how the run
+        ended, never "stopped" by default (FM-117). A Ctrl-C during the wait is
+        not caught: the stop was sent before it (FM-71).
         """
+        if self._closed:
+            return
         self._closed = True
         current = self._current_run
         if current is None:
             return
+        plugin = current[0]
         self.stop()
-        if not self.join(_CLOSE_WAIT_S):
-            self._set_outcome(f"{current[0]} did not end within {_CLOSE_WAIT_S:.0f} s")
-        elif self._outcome == f"{current[0]} stopped":
-            # What the command says last: only a run that really ended stopped.
-            self.stopped_by_close = current[0]
+        ended = self.join(_CLOSE_WAIT_S)
+        if not ended:
+            self._set_outcome(f"{plugin} did not end within {_CLOSE_WAIT_S:.0f} s")
+        with self._lock:
+            outcome = self._outcome
+        note = self._stop_note
+        if (
+            ended
+            and outcome == f"{plugin} stopped"
+            and note == f"{plugin} told to stop; {_STOP_ACCEPTED}"
+        ):
+            # The stand took the stop and the run ended stopped: the one case in which
+            # "was stopped" is the whole truth.
+            lines: tuple[str, ...] = (f"{plugin} was stopped",)
+        else:
+            lines = tuple(line for line in (note, outcome) if line)
+        self.close_lines = lines
+        self.close_ended = ended
 
     def _refuse_if_busy(self) -> None:
         if self._closed:

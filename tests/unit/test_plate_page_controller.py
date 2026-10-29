@@ -51,6 +51,7 @@ from smc.plugins.api import (
     PluginResult,
     Progress,
     RunContext,
+    StopRequested,
 )
 from smc.plugins.errors import PluginRunError
 from smc.plugins.params import parse_params
@@ -213,6 +214,39 @@ class Progressing(Stub):
         return StubResult()
 
 
+class Stubborn:
+    """Ignores the stop: it never calls ``ctx.wait_s``, and ends only when released."""
+
+    name = provides = "stubborn"
+    summary = "A test plugin that ignores the stop."
+    Params = NoParams
+    Result = StubResult
+    requires: tuple[type, ...] = ()
+    reads: tuple[str, ...] = ()
+    reads_optional: tuple[str, ...] = ()
+    started: ClassVar[threading.Event] = threading.Event()
+    release: ClassVar[threading.Event] = threading.Event()
+
+    def run(self, microscope: Any, params: NoParams, ctx: RunContext) -> StubResult:
+        Stubborn.started.set()
+        Stubborn.release.wait(30)
+        return StubResult()
+
+
+class FailsOnStop(Slow):
+    """Inside a move when the stop lands: the move fails, and so does the run."""
+
+    name = provides = "fails"
+
+    def run(self, microscope: Any, params: NoParams, ctx: RunContext) -> StubResult:
+        Slow.started.set()
+        try:
+            while True:
+                ctx.wait_s(0.05)
+        except StopRequested:
+            raise PluginRunError("fails", "the move was stopped") from None
+
+
 class StubScan(Stub):
     """Registered as ``scan``, and needs an XY stage."""
 
@@ -242,10 +276,13 @@ def _fresh_state() -> Iterator[None]:
     Slow.started = threading.Event()
     Slow.release = threading.Event()
     Slow.ended = threading.Event()
+    Stubborn.started = threading.Event()
+    Stubborn.release = threading.Event()
     try:
         yield
     finally:
         Slow.release.set()  # a worker a failed test left behind ends
+        Stubborn.release.set()
 
 
 @pytest.fixture
@@ -290,6 +327,7 @@ def _seed(
     params: dict[str, Any] | None = None,
     minute: int = 0,
     profile: str = "demo",
+    dry_run: bool = False,
 ) -> None:
     """A record as an earlier run of ``plugin`` left it; ``minute`` orders the starts."""
     then = T0 + timedelta(minutes=minute)
@@ -303,7 +341,7 @@ def _seed(
             started_utc=then,
             finished_utc=then,
             profile=profile,
-            dry_run=False,
+            dry_run=dry_run,
             smc_version="0",
             params=params or {},
             result=None if result is None else result.model_dump(mode="json"),
@@ -405,14 +443,23 @@ def test_a_click_on_no_well_or_a_point_that_is_not_finite_does_nothing(
 
 
 def test_a_click_in_select_mode_moves_nothing(
-    page: PlatePage, fake_microscope: Microscope
+    fake_microscope: Microscope, run_doc: Path
 ) -> None:
+    # A registered plate and the real `goto-well`: a click that also drove would move
+    # the stage, and the run document would hold its record.
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    page = PlatePage(fake_microscope, run_doc, entry_points=_real("goto-well"))
     stage = fake_microscope.require(XYStage)
     before = stage.position_um()
     for well in ("A1", "C5", "H12"):
-        assert page.click(*_centre(well), drive=False) == well
+        x, y = _centre(well, a1=A1_OFF, rotation_deg=TURN_DEG)
+        assert page.click(x, y, drive=False) == well
+    assert page.join(10.0)
     assert stage.position_um() == before
     assert page.status().running is None
+    assert page.status().outcome is None
+    assert "goto-well" not in RunDocument.load(run_doc).stages
+    assert page.selection == ("A1", "C5", "H12")
 
 
 def test_a_drive_click_on_another_plates_map_moves_nothing(
@@ -721,6 +768,218 @@ def test_close_says_when_a_run_does_not_end(
     assert page.status().outcome == "slow did not end within 10 s"
     Slow.release.set()
     assert page.join(10.0)
+
+
+def test_join_says_that_a_worker_is_still_alive(page: PlatePage) -> None:
+    page.run("slow", [])
+    assert Slow.started.wait(5)
+    assert not page.join(0.0)
+    Slow.release.set()
+    assert page.join(10.0)
+
+
+def test_join_waits_in_short_slices(page: PlatePage) -> None:
+    # On Windows one long wait on a thread is not interrupted by Ctrl-C (FM-83).
+    page.run("slow", [])
+    assert Slow.started.wait(5)
+    worker = page._worker
+    assert worker is not None
+    waits: list[float | None] = []
+    real = worker.join
+
+    def spy(timeout: float | None = None) -> None:
+        waits.append(timeout)
+        real(timeout)
+
+    with _replaced(worker, "join", spy):
+        assert not page.join(0.35)
+    assert len(waits) >= 3
+    assert all(t is not None and t <= 0.1 + 1e-9 for t in waits)
+
+
+_ACCEPTED = "stopped: the stand is halted (Resume clears the halt)"
+
+
+def test_close_says_was_stopped_when_the_stand_took_the_stop_and_the_run_ended(
+    page: PlatePage,
+) -> None:
+    page.run("slow", [])
+    assert Slow.started.wait(5)
+    page.close()
+    assert page.close_lines == ("slow was stopped",)
+    assert page.close_ended
+
+
+def test_close_says_what_a_refused_stop_did_and_never_that_the_run_was_stopped(
+    run_doc: Path,
+) -> None:
+    with _refusing_stand(("XY",), (Role.xy_stage,)) as microscope:
+        # The facade's own words for the refusal, taken once; the stand is resumed.
+        with pytest.raises(StopRefusedError) as refusal:
+            microscope.stop()
+        said = " ".join(str(refusal.value).split())
+        microscope.resume()
+        page = _page(microscope, run_doc)
+        page.run("slow", [])
+        assert Slow.started.wait(5)
+        page.close()
+    assert page.close_lines == (
+        f"slow told to stop; halted, but {said}",
+        "slow stopped",
+    )
+    assert page.close_ended
+
+
+def test_close_says_how_a_run_that_failed_while_it_was_stopped_ended(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _page(fake_microscope, run_doc, [_ep(FailsOnStop)])
+    page.run("fails", [])
+    assert Slow.started.wait(5)
+    page.close()
+    assert page.close_lines == (
+        f"fails told to stop; {_ACCEPTED}",
+        "fails: PluginRunError: fails: the move was stopped",
+    )
+    assert page.close_ended
+
+
+def test_close_does_not_say_stopped_for_a_run_that_ended_done(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _page(fake_microscope, run_doc, [_ep(Stubborn)])
+    page.run("stubborn", [])
+    assert Stubborn.started.wait(5)
+    timer = threading.Timer(0.3, Stubborn.release.set)
+    timer.start()
+    try:
+        page.close()
+    finally:
+        timer.cancel()
+        Stubborn.release.set()
+    outcome = page.status().outcome
+    assert outcome is not None
+    assert outcome.startswith("stubborn done in ")
+    assert page.close_lines == (f"stubborn told to stop; {_ACCEPTED}", outcome)
+    assert page.close_ended
+
+
+def test_close_says_a_run_that_does_not_end_and_a_second_close_does_not_wait_again(
+    fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(controller_module, "_CLOSE_WAIT_S", 1.0)
+    page = _page(fake_microscope, run_doc, [_ep(Stubborn)])
+    page.run("stubborn", [])
+    assert Stubborn.started.wait(5)
+    stops: list[str] = []
+    real_stop = page.stop
+
+    def counting_stop() -> None:
+        stops.append("stop")
+        real_stop()
+
+    with _replaced(page, "stop", counting_stop):
+        page.close()
+        page.close()  # the command's `finally` after `serve` already closed it
+    Stubborn.release.set()
+    assert page.join(10.0)
+    assert stops == ["stop"]
+    assert not page.close_ended
+    assert page.close_lines == (
+        f"stubborn told to stop; {_ACCEPTED}",
+        "stubborn did not end within 1 s",
+    )
+
+
+@pytest.mark.parametrize(
+    "read_between", [True, False], ids=["status-between", "no-status-between"]
+)
+def test_a_new_run_starts_with_no_outcome_and_no_progress(
+    page: PlatePage, read_between: bool
+) -> None:
+    _run_and_join(page, "progressing")
+    if read_between:
+        assert page.status().progress == Progress("progressing", 1, 3, "one of three")
+    page.run("slow", [])
+    assert Slow.started.wait(5)
+    status = page.status()
+    assert (status.outcome, status.progress) == (None, None)
+
+
+# --- records of another stand, or of a dry run ----------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("profile", "dry_run", "why"),
+    [
+        pytest.param(
+            "nikon-ti2",
+            False,
+            "plate-registration was run on nikon-ti2, this is demo; run "
+            "plate-registration again on this profile",
+            id="another-stand",
+        ),
+        pytest.param(
+            "demo",
+            True,
+            "plate-registration was a dry run; run it without --dry-run",
+            id="dry-run",
+        ),
+    ],
+)
+def test_a_plate_of_another_stand_or_a_dry_run_is_neither_drawn_nor_driven_to(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    profile: str,
+    dry_run: bool,
+    why: str,
+) -> None:
+    _seed(
+        run_doc,
+        "plate-registration",
+        "plate",
+        _plate(),
+        profile=profile,
+        dry_run=dry_run,
+    )
+    page = _page(fake_microscope, run_doc)
+    view = page.view()
+    assert view.nominal
+    assert {i.slot: (i.state, i.reason) for i in view.checklist}["plate"] == (
+        "unusable",
+        why,
+    )
+    stage = fake_microscope.require(XYStage)
+    before = stage.position_um()
+    page.goto("C5")
+    assert page.status().outcome == (
+        f"goto-well: UpstreamError: goto-well reads plate, but {why}"
+    )
+    assert StubGoto.ran == []
+    assert stage.position_um() == before
+    assert page.status().running is None
+
+
+@pytest.mark.parametrize(
+    "recorded_dry", [False, True], ids=["real-record", "dry-record"]
+)
+def test_a_dry_run_page_reads_the_plate_a_real_or_a_dry_run_registered(
+    run_doc: Path, fake_core: FakeCore, recorded_dry: bool
+) -> None:
+    # A dry run may read a real result, and a dry run's own: only a real run refuses
+    # a dry run's.
+    dry = Microscope.from_core(
+        cast("CMMCorePlus", fake_core), Profile.demo(), dry_run=True
+    )
+    try:
+        _seed(run_doc, "plate-registration", "plate", _plate(), dry_run=recorded_dry)
+        page = _page(dry, run_doc)
+        assert not page.view().nominal
+        page.goto("C5")
+        assert page.join(10.0)
+        assert StubGoto.ran == [("C5", "centre")]
+    finally:
+        dry.close()
 
 
 # --- status ------------------------------------------------------------------------
