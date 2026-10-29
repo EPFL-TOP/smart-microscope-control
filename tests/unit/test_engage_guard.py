@@ -228,7 +228,10 @@ def test_a_z_move_under_the_operators_lock_relocks_without_a_prior_read() -> Non
     # suspend() reads the lock before the move ends it (m2 §12.4). No band:
     # with one, suspend() would read the lock for z_held anyway.
     profile = _profile(
-        autofocus={"engage_drives_z_to_offset": True},
+        autofocus={
+            "engage_drives_z_to_offset": True,
+            "lock_timeout_s": LOCK_TIMEOUT_S,
+        },
         safety={"z_soft_limits_um": (10.0, 4350.0)},
     )
     with _stand(profile) as stand:
