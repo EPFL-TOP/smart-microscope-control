@@ -39,7 +39,7 @@ has both.
 .venv/bin/python scripts/dev/ui_snap.py --out <scratchpad>/ui-check
 ```
 
-(Windows: `.venv\Scripts\python`.) About 30 s on macOS, 18 s of them the `scan` of
+(Windows: `.venv\Scripts\python`.) 33 s on macOS (measured), 19 s of them the `scan` of
 the chain; `--no-results` skips the chain when the change has nothing to do with
 results, and then the last two states are named as not reached. `--stand demo` serves
 the demo whose camera images no sample. Nothing else is a parameter: there is no

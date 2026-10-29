@@ -535,9 +535,12 @@ def run_step(
             raise
         capture.seek(0)
         output = capture.read().decode("utf-8", errors="replace")
+    # A Windows child writes CRLF, and a text-mode write would turn each "\n" of it
+    # into "\r\n" again: normalise, and write "\n" as it is on every system.
+    output = output.replace("\r\n", "\n")
     seconds = time.monotonic() - started
     shown = "timeout" if code is None else str(code)
-    with log.open("a", encoding="utf-8") as handle:
+    with log.open("a", encoding="utf-8", newline="\n") as handle:
         handle.write(f"$ {label} exit {shown} in {seconds:.1f} s\n{output}")
         if output and not output.endswith("\n"):
             handle.write("\n")
@@ -639,13 +642,23 @@ def _outputs(out: Path, name: str) -> list[Path]:
     return [out / f"{name}.png", out / f"{name}-full.png", out / f"{name}-FAILED.png"]
 
 
+def _remove(path: Path) -> None:
+    """Delete a stale output. A file that Windows will not release (a viewer has it
+    open, an orphaned server holds the log) is a note and the run goes on: the
+    state that needs that name then fails by itself, named (FM-24)."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        _say(f"note: could not remove {path} ({exc})")
+
+
 def clear_outputs(out: Path) -> None:
     """Remove what an earlier run left, so that nothing in ``out`` is stale."""
     for name in STATE_NAMES:
         for path in _outputs(out, name):
-            path.unlink(missing_ok=True)
+            _remove(path)
     for name in ("summary.txt", "server.log", "chain.log"):
-        (out / name).unlink(missing_ok=True)
+        _remove(out / name)
 
 
 def drive(
@@ -701,7 +714,7 @@ def drive(
                 else _first_line(str(exc))
             )
             for stale in _outputs(out, plan.name)[:2]:
-                stale.unlink(missing_ok=True)
+                _remove(stale)
             # A page that is gone has no picture: the reason is what there is to say.
             with contextlib.suppress(pw.Error):
                 page.screenshot(path=str(out / f"{plan.name}-FAILED.png"))

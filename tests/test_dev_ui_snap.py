@@ -14,6 +14,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -39,6 +40,23 @@ _IGNORES_SIGINT = (
     "time.sleep(60)\n"
 )
 _WAITS = "import time\nprint('ready', flush=True)\ntime.sleep(60)\n"
+#: What `smc ui` does on Ctrl-C: the interrupt is caught, the page is closed, exit 0.
+_EXITS_ZERO_ON_SIGINT = (
+    "import signal, sys, time\n"
+    "signal.signal(signal.SIGINT, signal.default_int_handler)\n"
+    "print('ready', flush=True)\n"
+    "try:\n"
+    "    time.sleep(60)\n"
+    "except KeyboardInterrupt:\n"
+    "    sys.exit(0)\n"
+)
+_IGNORES_SIGINT_AND_SIGTERM = (
+    "import signal, time\n"
+    "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "print('ready', flush=True)\n"
+    "time.sleep(60)\n"
+)
 
 
 @pytest.fixture(scope="module")
@@ -58,6 +76,29 @@ def snap():
 def children():
     """Real children of a test; whatever is still alive at the end is killed."""
     started: list[subprocess.Popen[bytes]] = []
+    yield started
+    for child in started:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=10)
+
+
+@pytest.fixture
+def popen_log(snap, monkeypatch):
+    """Every child the script starts, so that a test can ask whether it is dead.
+
+    Whatever is still alive at the end is killed (FM-86: a failing test must not
+    leave a plugin that sleeps for a minute behind).
+    """
+    started: list[subprocess.Popen[bytes]] = []
+    real = subprocess.Popen
+
+    class Recorded(real):  # type: ignore[valid-type, misc]
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            started.append(self)
+
+    monkeypatch.setattr(snap.subprocess, "Popen", Recorded)
     yield started
     for child in started:
         if child.poll() is None:
@@ -136,6 +177,75 @@ class _Child:
 
     def poll(self) -> int | None:
         return self.polls.pop(0) if len(self.polls) > 1 else self.polls[0]
+
+
+class _Immortal:
+    """A child that no signal ends: ``wait`` always times out, on the test's clock."""
+
+    def __init__(self, clock: _Clock) -> None:
+        self.clock = clock
+        self.sent: list[int] = []
+        self.terminated = False
+        self.killed = False
+
+    def poll(self) -> None:
+        return None
+
+    def send_signal(self, number: int) -> None:
+        self.sent.append(number)
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.killed = True
+
+    def wait(self, timeout: float | None = None) -> int:
+        assert timeout is not None, "a wait with no limit"
+        self.clock.step(timeout)
+        raise subprocess.TimeoutExpired("child", timeout)
+
+
+class _FakeError(Exception):
+    """Stands for ``playwright.sync_api.Error`` in the driver's own tests."""
+
+
+def _fake_page(*, fails_on_text: str | None = None) -> MagicMock:
+    """A page on which every control is there, and the one named in ``fails_on_text``
+    times out when it is clicked, with the first line Playwright gives."""
+    page = MagicMock()
+    page.locator.return_value.count.return_value = 0
+    page.locator.return_value.all_inner_texts.return_value = ["a pane"]
+    page.get_by_label.return_value.count.return_value = 0
+
+    def get_by_text(text: str, exact: bool = False) -> MagicMock:
+        found = MagicMock()
+        if text == fails_on_text:
+            error = _FakeError(
+                "Locator.click: Timeout 10000ms exceeded.\nCall log:\n  - waiting"
+            )
+            found.click.side_effect = error
+            found.first.click.side_effect = error
+        return found
+
+    page.get_by_text.side_effect = get_by_text
+    return page
+
+
+def _drive(snap, tmp_path: Path, page: MagicMock, run_chain):
+    """``drive`` on a fake page, with the chain replaced by ``run_chain``."""
+    context = MagicMock()
+    context.new_page.return_value = page
+    return snap.drive(
+        SimpleNamespace(Error=_FakeError),
+        context,
+        port=1,
+        plans=snap.plan_states("demo-sample", results=True),
+        stand_name="demo-sample",
+        results=True,
+        stand=SimpleNamespace(run_chain=run_chain),
+        out=tmp_path,
+    )
 
 
 # --- the guard -------------------------------------------------------------
@@ -406,9 +516,24 @@ def test_stop_server_sends_sigint_and_reports_how_it_ended(
     child = _start(children, tmp_path, _WAITS_FOR_SIGINT)
     outcome = snap.stop_server(child, windows=False, grace_s=20.0)
     assert outcome.how == "sigint"
-    assert outcome.returncode in (-2, 0, 130)
+    # Killed by the interrupt, its `finally` never run: an end, but not a clean one.
+    assert outcome.returncode in (-2, 130)
+    assert not outcome.clean
     assert outcome.text.startswith("stopped by SIGINT, exit ")
     assert child.poll() is not None
+
+
+@POSIX_ONLY
+def test_a_server_that_exits_0_on_sigint_is_a_clean_stop(
+    snap, children, tmp_path
+) -> None:
+    child = _start(children, tmp_path, _EXITS_ZERO_ON_SIGINT)
+    outcome = snap.stop_server(child, windows=False, grace_s=20.0)
+    assert outcome.how == "sigint"
+    assert outcome.returncode == 0
+    assert outcome.clean
+    assert outcome.text.startswith("stopped by SIGINT, exit 0 in ")
+    assert child.poll() == 0
 
 
 @POSIX_ONLY
@@ -422,6 +547,39 @@ def test_stop_server_terminates_a_child_that_ignores_sigint(
     assert not outcome.clean
     assert "did not end on SIGINT within 0.5 s; terminated" in outcome.text
     assert child.poll() is not None
+
+
+@POSIX_ONLY
+def test_stop_server_kills_a_child_that_ignores_sigint_and_sigterm(
+    snap, children, tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(snap, "TERMINATE_GRACE_S", 0.5)
+    child = _start(children, tmp_path, _IGNORES_SIGINT_AND_SIGTERM)
+    outcome = snap.stop_server(child, windows=False, grace_s=0.5)
+    assert outcome.how == "killed"
+    assert outcome.returncode == -signal.SIGKILL
+    assert not outcome.clean
+    assert outcome.text == (
+        "did not end on SIGINT within 0.5 s; "
+        "did not end on terminate() within 0.5 s; killed, exit -9"
+    )
+    assert child.poll() is not None
+
+
+def test_stop_server_says_when_a_child_cannot_be_killed_and_does_not_wait_for_it(
+    snap, monkeypatch
+) -> None:
+    """FM-35: ``kill()`` is sent, the wait after it ends, and the text says the child may be there."""
+    clock = _Clock()
+    monkeypatch.setattr(snap, "time", clock.namespace())
+    child = _Immortal(clock)
+    outcome = snap.stop_server(child, windows=False, grace_s=1.0)
+    assert outcome.how == "unkillable"
+    assert child.sent == [signal.SIGINT]
+    assert child.terminated
+    assert child.killed
+    assert not outcome.clean
+    assert "may still be running" in outcome.text
 
 
 def test_stop_server_on_windows_terminates_and_says_that_ctrl_c_was_not_tried(
@@ -483,7 +641,7 @@ def test_a_step_that_passes_is_appended_to_the_chain_log(snap, tmp_path) -> None
     assert text.index("$ scan") < text.index("$ density")
 
 
-def test_a_step_that_hangs_is_killed_and_named(snap, tmp_path) -> None:
+def test_a_step_that_hangs_is_killed_and_named(snap, tmp_path, popen_log) -> None:
     outcome = snap.run_step(
         [sys.executable, "-c", _WAITS],
         label="scan",
@@ -497,6 +655,57 @@ def test_a_step_that_hangs_is_killed_and_named(snap, tmp_path) -> None:
     failure = outcome.failure()
     assert failure is not None
     assert failure.startswith("scan did not end within 1 s")
+    # A hung `scan` left running would go on driving the stage and rewriting the
+    # run document while the script moves on to the next state.
+    assert len(popen_log) == 1
+    assert popen_log[0].poll() is not None
+
+
+def test_a_ctrl_c_during_a_step_leaves_no_child_behind(
+    snap, tmp_path, popen_log, monkeypatch
+) -> None:
+    """FM-83: the interrupt arrives from the first wait, against a real child."""
+    real_wait = snap.wait_in_slices
+    waits: list[float] = []
+
+    def interrupted_once(child, timeout_s, slice_s=snap.WAIT_SLICE_S):
+        waits.append(timeout_s)
+        if len(waits) == 1:
+            raise KeyboardInterrupt
+        return real_wait(child, timeout_s, slice_s)
+
+    monkeypatch.setattr(snap, "wait_in_slices", interrupted_once)
+    with pytest.raises(KeyboardInterrupt):
+        snap.run_step(
+            [sys.executable, "-c", _WAITS],
+            label="scan",
+            log=tmp_path / "chain.log",
+            cwd=tmp_path,
+            env=dict(os.environ),
+            timeout_s=60.0,
+        )
+    assert len(popen_log) == 1
+    assert popen_log[0].poll() is not None
+
+
+def test_a_child_that_writes_crlf_leaves_single_line_ends_in_the_chain_log(
+    snap, tmp_path
+) -> None:
+    """A Windows child writes CRLF; a text-mode append would double the CR (`\\r\\r\\n`)."""
+    log = tmp_path / "chain.log"
+    code = "import sys; sys.stdout.buffer.write(b'a\\r\\nb\\r\\n')"
+    outcome = snap.run_step(
+        [sys.executable, "-c", code],
+        label="cells",
+        log=log,
+        cwd=tmp_path,
+        env=dict(os.environ),
+        timeout_s=60.0,
+    )
+    assert outcome.last_line == "b"
+    data = log.read_bytes()
+    assert b"\r" not in data
+    assert data.endswith(b"a\nb\n")
 
 
 # --- what is read back -----------------------------------------------------
@@ -637,3 +846,122 @@ def test_a_stand_that_is_not_a_demo_is_refused_by_the_command_line(snap) -> None
     with pytest.raises(SystemExit) as raised:
         snap.main(["--profile", "nikon-ti2"])
     assert raised.value.code == 2
+
+
+def test_a_refused_profile_file_ends_the_run_with_exit_2_and_writes_nothing(
+    snap, tmp_path, monkeypatch, capsys
+) -> None:
+    """The guard's refusal reaches the exit code, and SIGINT is made a default again.
+
+    ``main`` sets the default handler for itself before anything else (FM-160):
+    the test starts it as a background shell would, with SIGINT ignored.
+    """
+
+    def refuse(name: str) -> Path:
+        raise snap.RefusedStandError(
+            "demo.toml names a Micro-Manager configuration ('x.cfg')"
+        )
+
+    monkeypatch.setattr(snap, "stand_profile", refuse)
+    out = tmp_path / "out"
+    before = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        code = snap.main(["--stand", "demo", "--out", str(out)])
+        handler = signal.getsignal(signal.SIGINT)
+    finally:
+        signal.signal(signal.SIGINT, before)
+    assert code == 2
+    assert handler is signal.default_int_handler
+    assert (
+        "refused: demo.toml names a Micro-Manager configuration"
+        in capsys.readouterr().err
+    )
+    assert not out.exists()
+
+
+# --- what an earlier run leaves ---------------------------------------------
+
+
+def _output_names(snap) -> list[str]:
+    names = [
+        f"{state}{suffix}"
+        for state in snap.STATE_NAMES
+        for suffix in (".png", "-full.png", "-FAILED.png")
+    ]
+    return [*names, "summary.txt", "server.log", "chain.log"]
+
+
+def test_clear_outputs_removes_every_fixed_name_and_nothing_else(
+    snap, tmp_path
+) -> None:
+    names = _output_names(snap)
+    for name in [*names, "notes.txt"]:
+        (tmp_path / name).write_text("old", encoding="utf-8")
+    snap.clear_outputs(tmp_path)
+    assert [name for name in names if (tmp_path / name).exists()] == []
+    assert (tmp_path / "notes.txt").exists()
+
+
+def test_a_file_that_cannot_be_removed_is_a_note_and_the_rest_are_removed(
+    snap, tmp_path, monkeypatch, capsys
+) -> None:
+    """Windows refuses to delete a file that a viewer holds open (FM-24)."""
+    names = _output_names(snap)
+    for name in names:
+        (tmp_path / name).write_text("old", encoding="utf-8")
+    real_unlink = Path.unlink
+
+    def unlink(self: Path, missing_ok: bool = False) -> None:
+        if self.name == "empty.png":
+            raise PermissionError(13, "in use")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", unlink)
+    snap.clear_outputs(tmp_path)
+    said = capsys.readouterr().out
+    assert "note: could not remove" in said
+    assert "empty.png" in said
+    assert [name for name in names if (tmp_path / name).exists()] == ["empty.png"]
+
+
+# --- the driver, on a fake page ---------------------------------------------
+
+
+def test_a_failed_chain_names_the_states_that_needed_it(snap, tmp_path) -> None:
+    def run_chain(steps) -> None:
+        raise snap.ChainFailedError("cells exited 1: x")
+
+    records, errors, warnings = _drive(snap, tmp_path, _fake_page(), run_chain)
+    assert [(r.name, r.reached) for r in records] == [
+        ("empty", True),
+        ("wells-selected", True),
+        ("snap", True),
+        ("after-density", False),
+        ("with-route", False),
+    ]
+    assert records[3].reason == "cells exited 1: x"
+    assert records[4].reason == "needs the chain: cells exited 1: x"
+    assert (errors, warnings) == ([], 0)
+
+
+def test_a_state_whose_control_times_out_is_named_and_the_next_state_runs(
+    snap, tmp_path
+) -> None:
+    page = _fake_page(fails_on_text="Image")
+    records, _, _ = _drive(snap, tmp_path, page, lambda steps: None)
+    assert [r.reached for r in records] == [True, True, False, True, True]
+    assert records[2].reason == "Locator.click: Timeout 10000ms exceeded."
+    page.screenshot.assert_any_call(path=str(tmp_path / "snap-FAILED.png"))
+
+
+# --- the chain against the plugins ------------------------------------------
+
+
+def test_every_param_of_the_chain_is_a_param_of_its_plugin(snap) -> None:
+    """A renamed key would end each `smc run` with exit 2, at the first browser run."""
+    from smc.plugins.params import parse_params
+    from smc.plugins.registry import load
+
+    for step in [*snap.CHAIN, snap.ROUTE_STEP]:
+        params = load(step.plugin).plugin.Params
+        parse_params(params, [f"{key}={value}" for key, value in step.params])
