@@ -27,7 +27,10 @@ goes in here. Hazards, measured on #148:
 from __future__ import annotations
 
 import logging
+import socket
+import sys
 import threading
+import types
 import weakref
 from collections.abc import Callable, Iterator
 from importlib.metadata import EntryPoint
@@ -50,6 +53,7 @@ from smc.plugins import registry as registry_mod
 from smc.plugins.api import PluginParams, PluginResult, RunContext, StopRequested
 from smc.plugins.registry import GROUP
 from smc.testing import FakeCore, PlateSample, SampleCamera
+from smc.ui.controller import PageServerError
 
 _FACADE_AND_CORE_FREED = {"facade": False, "core": False}
 
@@ -941,3 +945,48 @@ def test_a_sample_camera_outliving_its_microscope_refuses_to_snap(
         "Microscope alive for as long as the camera is in use",
     )
     assert core.log == []
+
+
+# --- smc ui plate (m3 §15.3, #197) ---------------------------------------------
+
+
+def _serve_returns(page: Any, *, port: int) -> None:
+    """The operator's Ctrl-C, which ``serve`` takes: it returns."""
+
+
+def _serve_ends_alone(page: Any, *, port: int) -> None:
+    raise PageServerError("the plate page's server stopped on its own")
+
+
+def _serve_has_a_bug(page: Any, *, port: int) -> None:
+    raise RuntimeError("a bug in the page")
+
+
+@pytest.mark.parametrize(
+    ("serve", "code"),
+    [
+        pytest.param(_serve_returns, 0, id="ctrl-c"),
+        pytest.param(_serve_ends_alone, 1, id="server-ended-alone"),
+        pytest.param(_serve_has_a_bug, 1, id="bug"),
+    ],
+)
+def test_smc_ui_plate_that_ends_frees_its_core(
+    no_cyclic_gc: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    serve: Callable[..., None],
+    code: int,
+) -> None:
+    # The page holds the facade and the stand-in `serve` is handed the page: neither
+    # may outlive the command in a cycle (FM-92, FM-98). The page module is a stand-in,
+    # so no Panel is needed.
+    module = types.ModuleType("smc.ui.plate_page")
+    module.__dict__["serve"] = serve
+    monkeypatch.setitem(sys.modules, "smc.ui.plate_page", module)
+    with socket.socket() as probe:
+        probe.bind(("localhost", 0))
+        port = probe.getsockname()[1]
+    args = ["ui", "plate", "--run-doc", str(tmp_path / "run.json"), "--port", str(port)]
+    exit_code, watched = _run_cli(monkeypatch, FakeCore, args)
+    assert exit_code == code
+    assert _alive(watched) == _FACADE_AND_CORE_FREED
