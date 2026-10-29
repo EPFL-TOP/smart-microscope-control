@@ -134,6 +134,10 @@ smc run route -p demo-sample --run-doc run.json --param 'labels=["single","doubl
 smc run report -p demo-sample --run-doc run.json
 ```
 
+The commands are written for a POSIX shell. In `cmd.exe` and PowerShell 5.1, escape
+each inner double quote of a JSON value with a backslash, as the **Parameters**
+paragraph above says (`--param "labels=[\"single\",\"doublet\"]"`).
+
 `plate-finding` is the slow stage: it surveys the plate with the demo stage, which
 takes about 7 minutes (measured: 407 s). To skip it, register the plate from its two
 corners, which takes no time (on the centred plate, A1 is at (−49 500, 31 500) µm and

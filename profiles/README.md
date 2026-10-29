@@ -158,7 +158,7 @@ origin; `profiles/demo-sample.toml` writes each one out.
 | `camera_rotation_deg`, `mirrored` | `0.0`, `false` | How the camera sits on the stage: its rotation in [−180, 180], and whether the image is flipped left to right. |
 | `cells_per_well` | `40` | The mean over the plate's columns, 0 to 500: the first column holds half of it and the last one and a half times, so density and route have something to tell apart. |
 | `doublet_fraction` | `0.3` | The share of cells that are two spots side by side, in [0, 1]. |
-| `cell_radius_um` | `5.0` | The radius of a cell's spot, in (0, 50] µm. |
+| `cell_radius_um` | `5.0` | The radius of a cell's spot, in [1e-6, 50] µm. |
 | `seed` | `0` | The same seed gives the same cells, texture and noise. |
 
 A `[sample]` is refused with a `micromanager.config` other than `""` (synthetic frames

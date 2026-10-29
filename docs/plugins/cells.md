@@ -88,6 +88,17 @@ bright debris, a well's rim and bubbles the same way, so the result says so in
 bright round spots for the synthetic plate of the demo-sample profile; on a real
 sample its counts are not cells`. It never replaces the model on a stand.
 
+**Its limits on the synthetic plate.** It is tuned for the sample at the camera's
+default exposure, 10 ms. The sample's texture grows with the exposure and its noise
+does not, and the detector measures only the noise: from 50 ms up it counts speckle
+in empty wells (tens to hundreds per frame, measured), and nothing on the page or in
+`scan` sets an exposure, so only a deliberate `set_exposure_ms` or `smc snap
+--exposure-ms` gets there. And it can count a wedge of well: a frame whose corner
+just enters a well (by up to about 50 µm at 0.5 µm per pixel; a scan of the whole well,
+`coverage` 1, keeps such frames) shows that wedge, which is under 5 % of the frame, as a
+`doublet` boxed at the corner. Scans of the middle of a well, as the `coverage=0.4` of
+the commands above, do not have such frames.
+
 In the result, `model` is `blobs`, `model_sha256` is the SHA-256 of a string that
 names the detector's version and rules (so a resume after a change of those rules
 is refused, like a change of weights), `classes` are `single` and `doublet` (no
