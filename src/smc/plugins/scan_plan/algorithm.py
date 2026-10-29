@@ -25,14 +25,12 @@ from collections.abc import Callable, Iterator, Sequence
 
 import useq
 
-from smc.plugins.geometry import Matrix2, footprint
 from smc.plugins.scan_plan.wells import well_indices
 from smc.plugins.slots import PlannedField, PlateResult, TimingsResult, WellGeometry
 from smc.plugins.slots.plate import normalise_well, well_geometry
 
 __all__ = [
     "estimate_s",
-    "fov_of",
     "gap_overlap",
     "grid_size",
     "plan_fields",
@@ -85,19 +83,6 @@ def grid_size(
         return math.ceil(min(ratio, _RATIO_CAP)) + 1
 
     return along(fov_um[1], well_size_um[1]), along(fov_um[0], well_size_um[0])
-
-
-def fov_of(matrix: Matrix2, image_shape_px: tuple[int, int]) -> tuple[float, float]:
-    """``(width, height)`` of the frame's footprint in stage axes, in µm.
-
-    The extent of the four corners at the origin: for a camera turned by the
-    stage, the bounding box of the rotated frame, which is what an axis-aligned
-    grid steps by.
-    """
-    corners = footprint(0.0, 0.0, matrix=matrix, image_shape_px=image_shape_px)
-    xs = [x for x, _ in corners]
-    ys = [y for _, y in corners]
-    return (max(xs) - min(xs), max(ys) - min(ys))
 
 
 def gap_overlap(rotation_deg: float, overlap: float) -> float | None:

@@ -17,6 +17,12 @@ that NIS-Elements will visit rest on it:
   here knows the offset between two objectives, and the Z and the autofocus offset
   of the scan are for the scan's objective, so they are dropped for another one
   (FM-118) and the result says so in ``assumed``.
+* **A stop's Z is a frame's the autofocus had not lost.** ``z_um`` and
+  ``pfs_offset`` come together from the nearest frame of the well that is not
+  ``unlocked``: on an unlocked frame the Z is wherever the search had got to and
+  the offset is one that nobody read locked on this sample (FM-118), which the
+  export would hand on as the operator's. A well whose every frame is unlocked
+  gives ``None`` for both, and ``assumed`` counts the stops the rule changed.
 * **A size that is not a number is not a size** (FM-104): a pixel size of 0 means
   "not measured", infinity is above 0, and either is refused, not defaulted.
 * **The lattice is derived from a value that may be wrong** (FM-121): a scan matrix
@@ -40,13 +46,12 @@ from pydantic import Field, field_validator
 from smc.hardware.capabilities import ObjectiveTurret
 from smc.plugins.api import PluginParams, RunContext
 from smc.plugins.errors import PluginRunError
-from smc.plugins.geometry import Matrix2, pixel_of_stage
+from smc.plugins.geometry import Matrix2, fov_of, pixel_of_stage
 from smc.plugins.route.algorithm import (
     ChosenField,
     LatticeTooLarge,
     TooMuchWork,
     choose_fields,
-    fov_of,
     order_route,
     path_length_um,
 )
@@ -226,6 +231,8 @@ class RoutePlugin:
         uncovered: dict[str, int] = {}
         previous: tuple[float, float] | None = None
         total_wanted = 0
+        nearest_unlocked = 0
+        without_candidate = 0
         for done, well in enumerate(scanned):
             ctx.raise_if_stopped()
             wanted = sum(
@@ -243,13 +250,23 @@ class RoutePlugin:
                     previous if previous is not None else _first_field_of(plan, well)
                 )
                 stops = _stops(chosen, reference)
+                taken = frames_of.get(well, [])
+                candidates = _candidates(scan, taken)
                 for k, index in enumerate(stops):
                     field = chosen[index]
                     frame = (
                         None
                         if imaging.other
-                        else _nearest_frame(scan, frames_of.get(well, []), field)
+                        else _nearest_frame(scan, candidates, field)
                     )
+                    if not imaging.other and len(candidates) < len(taken):
+                        # The rule changed this stop's answer only when the nearest
+                        # of all the well's frames is the unlocked one.
+                        nearest = _nearest_frame(scan, taken, field)
+                        if nearest is not None and nearest.focus == "unlocked":
+                            nearest_unlocked += 1
+                            if frame is None:
+                                without_candidate += 1
                     positions.append(
                         RoutePosition(
                             order=len(positions),
@@ -305,6 +322,15 @@ class RoutePlugin:
                 "the route minimises the Euclidean distance between fields; whether "
                 "the stage's move time follows it is not measured",
                 *imaging.assumed,
+                *(
+                    (
+                        _unlocked_line(
+                            nearest_unlocked, len(positions), without_candidate
+                        ),
+                    )
+                    if nearest_unlocked
+                    else ()
+                ),
             ),
         )
 
@@ -464,13 +490,43 @@ def _stops(
     return order_route([(f.x_um, f.y_um) for f in chosen], start=start)
 
 
+def _candidates(scan: ScanResult, positions: list[int]) -> list[int]:
+    """The frames of a well that a stop may take its Z and autofocus offset from: every one the autofocus had not lost the sample on.
+
+    ``unlocked`` means the autofocus was on and searching, so the frame's Z is
+    wherever the search had got to and its offset is the stored one that nobody
+    read locked on this sample (FM-118): the export would hand it on as the
+    operator's. ``off`` and ``none`` stay: the scan did not use the autofocus, so
+    their Z is what the focus stage read under the operator's focus and their
+    offset is ``None``, which is what the stop then says.
+    """
+    return [p for p in positions if scan.frames[p].focus != "unlocked"]
+
+
+def _unlocked_line(n: int, total: int, without_candidate: int) -> str:
+    """The ``assumed`` line for the stops whose nearest frame was ``unlocked``, said once for all of them.
+
+    ``n`` of ``total`` stops had one as their nearest frame; ``without_candidate``
+    of those have no Z and no offset because every frame of their well was
+    ``unlocked``, the rest took both from the nearest frame that was not.
+    """
+    return (
+        f"{n} of {total} stops had an unlocked frame as their nearest frame "
+        f"(the autofocus had not locked on it): {n - without_candidate} took z_um "
+        f"and pfs_offset from the nearest frame that was not unlocked, "
+        f"{without_candidate} have none because every frame of their well was "
+        f"unlocked"
+    )
+
+
 def _nearest_frame(
     scan: ScanResult, positions: list[int], field: ChosenField
 ) -> ScanFrame | None:
-    """The frame of this well that the stage reached nearest to ``field``; ``None`` when the well has none.
+    """The frame, among ``positions``, that the stage reached nearest to ``field``; ``None`` when there are none.
 
     By the frame's readback, which is where the stage really was (the demo
-    rounds a command); ties go to the lowest index in ``scan.frames``.
+    rounds a command); ties go to the lowest index in ``scan.frames``. It takes
+    whatever indices it is given: which frames may answer is ``_candidates``'.
     """
     if not positions:
         return None

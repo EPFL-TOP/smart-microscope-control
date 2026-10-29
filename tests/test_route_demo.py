@@ -19,7 +19,7 @@ from __future__ import annotations
 import itertools
 import math
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +40,7 @@ from smc.plugins.slots import (
     CellsFile,
     CellsResult,
     FailedField,
+    FocusState,
     PlateResult,
     RoutePosition,
     RouteResult,
@@ -169,6 +170,7 @@ def _seed(
     shape: tuple[int, int] = SHAPE,
     scan_objective: str | None = IN_PLACE,
     failed_wells: tuple[str, ...] = (),
+    focus_of: Mapping[tuple[str, int], FocusState] | None = None,
     file_token: str = "t1",
 ) -> Seed:
     """The plan, the scan and the cells of ``wells``, in ``tmp_path/run.json``.
@@ -180,6 +182,11 @@ def _seed(
     test that wants to know says them different. Frames are at the planned fields,
     their readback a little off the target and their Z and autofocus offset
     distinct; the wells in ``failed_wells`` have no frame, only failed fields.
+
+    ``focus_of`` gives the autofocus state of the frames it names, keyed by ``(well,
+    field index)``; every other frame is ``locked``. A frame that is ``off`` or
+    ``none`` has no autofocus offset, as the scan records none when it did not use the
+    autofocus; ``locked`` and ``unlocked`` keep theirs.
     """
     path = tmp_path / "run.json"
     plate = PlateResult(
@@ -236,6 +243,7 @@ def _seed(
                 )
             )
             continue
+        focus: FocusState = (focus_of or {}).get((field.well, field.index), "locked")
         frames.append(
             ScanFrame(
                 well=field.well,
@@ -245,8 +253,8 @@ def _seed(
                 x_um=field.x_um + 0.3,
                 y_um=field.y_um - 0.2,
                 z_um=1000.0 + 10.0 * k,
-                focus="locked",
-                pfs_offset=2000.0 + 10.0 * k,
+                focus=focus,
+                pfs_offset=None if focus in ("off", "none") else 2000.0 + 10.0 * k,
                 t_s=float(k),
             )
         )
@@ -427,6 +435,87 @@ def _positions_of(result: RouteResult, well: str) -> list[RoutePosition]:
 
 def _singles(well: str) -> int:
     return sum(1 for w, _, _, label in LAYOUT if w == well and label == "single")
+
+
+# The oracle of the focus rule (m3 §11, "Decided for #232"), written from the frames
+# of the seed and the stops of the result, never from the plugin's helpers.
+
+
+def _frames_of(seed: Seed, well: str) -> list[ScanFrame]:
+    return [f for f in seed.scan.frames if f.well == well]
+
+
+def _nearest_of(frames: Sequence[ScanFrame], position: RoutePosition) -> ScanFrame:
+    """The frame whose readback is nearest the stop; ties go to the first in ``frames``."""
+    return min(
+        frames,
+        key=lambda f: math.dist((f.x_um, f.y_um), (position.x_um, position.y_um)),
+    )
+
+
+def _nearest_was_unlocked(seed: Seed, position: RoutePosition) -> bool:
+    frames = _frames_of(seed, position.well)
+    return bool(frames) and _nearest_of(frames, position).focus == "unlocked"
+
+
+def _expected_pair(
+    seed: Seed, position: RoutePosition
+) -> tuple[float | None, float | None]:
+    """``(z_um, pfs_offset)`` of the nearest frame that was not unlocked, from that one frame; ``(None, None)`` without one."""
+    candidates = [f for f in _frames_of(seed, position.well) if f.focus != "unlocked"]
+    if not candidates:
+        return (None, None)
+    nearest = _nearest_of(candidates, position)
+    return (nearest.z_um, nearest.pfs_offset)
+
+
+def _unlocked_line(n: int, total: int, m: int) -> str:
+    """The line of ``assumed`` for ``n`` of ``total`` stops, ``m`` of which have no other frame: the design's wording, spelled out."""
+    return (
+        f"{n} of {total} stops had an unlocked frame as their nearest frame "
+        f"(the autofocus had not locked on it): {n - m} took z_um and pfs_offset "
+        f"from the nearest frame that was not unlocked, {m} have none because "
+        f"every frame of their well was unlocked"
+    )
+
+
+def _nearest_frames_of_first_stops(
+    seed: Seed, result: RouteResult, state: FocusState, wells: Sequence[str] = WELLS
+) -> dict[tuple[str, int], FocusState]:
+    """``state`` for the frame nearest the first stop of each of ``wells``, keyed as ``_seed``'s ``focus_of``."""
+    marks: dict[tuple[str, int], FocusState] = {}
+    for well in wells:
+        first = _positions_of(result, well)[0]
+        frame = _nearest_of(_frames_of(seed, well), first)
+        marks[(well, frame.index)] = state
+    return marks
+
+
+def _route_twice(
+    microscope: Microscope,
+    tmp_path: Path,
+    marks_of: Callable[[Seed, RouteResult], Mapping[tuple[str, int], FocusState]],
+    **params: object,
+) -> tuple[RouteResult, Seed, RouteResult]:
+    """The route on an all-locked seed, then on a seed whose frames ``marks_of`` names marked.
+
+    The stops of the first run say which frame is nearest to which, and the second
+    seed marks those frames. The stops do not move between the two: the choice of
+    fields reads the cells and never a frame's focus, which is asserted here.
+    Returns ``(before, marked seed, after)``.
+    """
+    locked_dir = tmp_path / "locked"
+    locked_dir.mkdir()
+    locked = _seed(locked_dir)
+    before = _result(_run(microscope, locked_dir, **params))
+    marked_dir = tmp_path / "marked"
+    marked_dir.mkdir()
+    marked = _seed(marked_dir, focus_of=marks_of(locked, before))
+    after = _result(_run(microscope, marked_dir, **params))
+    assert [(p.well, p.x_um, p.y_um) for p in after.positions] == [
+        (p.well, p.x_um, p.y_um) for p in before.positions
+    ]
+    return before, marked, after
 
 
 # ------------------------------------------------------------- registration
@@ -892,6 +981,234 @@ def test_z_and_pfs_come_from_the_nearest_taken_frame(
         assert (p.z_um, p.pfs_offset) == (nearest.z_um, nearest.pfs_offset)
     # More than one frame supplies a Z: it is not the well's first or last frame's.
     assert len({p.z_um for p in _positions_of(result, "A1")}) > 1
+
+
+def test_z_comes_from_a_locked_frame_when_the_nearest_frame_is_unlocked(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """The nearest frame of the first stop of every well was not locked on: its Z and offset are not handed on, and the pair is one frame's (FM-118)."""
+    before, seed, after = _route_twice(
+        demo_microscope,
+        tmp_path,
+        lambda seed, result: _nearest_frames_of_first_stops(seed, result, "unlocked"),
+    )
+
+    concerned = [p for p in after.positions if _nearest_was_unlocked(seed, p)]
+    assert concerned  # the test would prove nothing without one
+    for p in concerned:
+        # Another frame answers, and one that every well still has.
+        assert (p.z_um, p.pfs_offset) == _expected_pair(seed, p)
+        assert p.z_um is not None
+        assert p.pfs_offset is not None
+        assert p.pfs_offset - 2000.0 == p.z_um - 1000.0  # both of the same frame
+        unlocked = _nearest_of(_frames_of(seed, p.well), p)
+        assert (p.z_um, p.pfs_offset) != (unlocked.z_um, unlocked.pfs_offset)
+    # A stop whose nearest frame stayed locked is where it was.
+    for p, was in zip(after.positions, before.positions, strict=True):
+        if p not in concerned:
+            assert (p.z_um, p.pfs_offset) == (was.z_um, was.pfs_offset)
+    # Every concerned stop found another frame: m is 0, and the line says `0 have none`.
+    assert after.assumed[-1] == _unlocked_line(len(concerned), len(after.positions), 0)
+
+
+@pytest.mark.parametrize("state", ["off", "none"])
+def test_off_and_none_frames_give_z_and_no_offset(
+    demo_microscope: Microscope, tmp_path: Path, state: FocusState
+) -> None:
+    """An autofocus the scan did not use is not one that lost the sample: the frame's Z is what was measured, and it has no offset."""
+    _, seed, after = _route_twice(
+        demo_microscope,
+        tmp_path,
+        lambda seed, result: _nearest_frames_of_first_stops(seed, result, state),
+    )
+
+    concerned = [
+        p
+        for p in after.positions
+        if _nearest_of(_frames_of(seed, p.well), p).focus == state
+    ]
+    assert concerned
+    for p in concerned:
+        nearest = _nearest_of(_frames_of(seed, p.well), p)
+        assert (p.z_um, p.pfs_offset) == (nearest.z_um, None)
+    assert not any("unlocked" in line for line in after.assumed)
+
+
+def test_a_well_whose_frames_are_all_unlocked_has_no_z_and_no_offset(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    before, _, after = _route_twice(
+        demo_microscope,
+        tmp_path,
+        lambda seed, result: {
+            (f.well, f.index): "unlocked" for f in _frames_of(seed, "A1")
+        },
+    )
+
+    a1 = _positions_of(after, "A1")
+    assert a1
+    assert all((p.z_um, p.pfs_offset) == (None, None) for p in a1)
+    assert all(
+        (p.z_um, p.pfs_offset) == (b.z_um, b.pfs_offset)
+        for p, b in zip(after.positions, before.positions, strict=True)
+        if p.well != "A1"
+    )
+    assert after.assumed[-1] == _unlocked_line(len(a1), len(after.positions), len(a1))
+
+
+def test_assumed_counts_the_stops_whose_nearest_frame_was_unlocked(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """Three wells with one unlocked frame, one well with all of them: ``n``, ``total`` and ``m`` come from the seed."""
+
+    def marks(seed: Seed, result: RouteResult) -> dict[tuple[str, int], FocusState]:
+        marks = _nearest_frames_of_first_stops(
+            seed, result, "unlocked", wells=("A1", "A2", "B2")
+        )
+        marks.update({(f.well, f.index): "unlocked" for f in _frames_of(seed, "B1")})
+        return marks
+
+    _, seed, after = _route_twice(demo_microscope, tmp_path, marks)
+
+    n = sum(1 for p in after.positions if _nearest_was_unlocked(seed, p))
+    m = sum(1 for p in after.positions if _expected_pair(seed, p) == (None, None))
+    total = len(after.positions)
+    assert 0 < m < n < total  # every kind of stop is there
+    assert after.assumed == (
+        "the route minimises the Euclidean distance between fields; whether the "
+        "stage's move time follows it is not measured",
+        _unlocked_line(n, total, m),
+    )
+    for p in after.positions:
+        assert (p.z_um, p.pfs_offset) == _expected_pair(seed, p)
+
+
+def test_a_single_stop_with_an_unlocked_nearest_frame_is_counted_alone(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """One stop of four is concerned and it found another frame: the line says ``1 of 4`` and ``0 have none``."""
+    _, seed, after = _route_twice(
+        demo_microscope,
+        tmp_path,
+        lambda seed, result: _nearest_frames_of_first_stops(
+            seed, result, "unlocked", wells=("A1",)
+        ),
+        fields_per_well=1,
+    )
+
+    assert len(after.positions) == len(WELLS)
+    assert [p.well for p in after.positions if _nearest_was_unlocked(seed, p)] == ["A1"]
+    assert after.assumed == (
+        "the route minimises the Euclidean distance between fields; whether the "
+        "stage's move time follows it is not measured",
+        _unlocked_line(1, len(WELLS), 0),
+    )
+
+
+@pytest.mark.parametrize("state", ["off", "none"])
+def test_an_off_or_none_nearest_frame_is_not_counted_as_unlocked_in_a_well_that_has_one(
+    demo_microscope: Microscope, tmp_path: Path, state: FocusState
+) -> None:
+    """The count is of ``unlocked`` frames, not of frames that are not locked: the nearest is ``off``, another frame of the well is ``unlocked``."""
+
+    def marks(seed: Seed, result: RouteResult) -> dict[tuple[str, int], FocusState]:
+        chosen: dict[tuple[str, int], FocusState] = {}
+        for well in WELLS:
+            frames = _frames_of(seed, well)
+            nearest = _nearest_of(frames, _positions_of(result, well)[0])
+            other = next(f for f in frames if f.index != nearest.index)
+            chosen[(well, nearest.index)] = state
+            chosen[(well, other.index)] = "unlocked"
+        return chosen
+
+    _, seed, after = _route_twice(demo_microscope, tmp_path, marks, fields_per_well=1)
+
+    assert len(after.positions) == len(WELLS)
+    assert sum(1 for f in seed.scan.frames if f.focus == "unlocked") == len(WELLS)
+    for p in after.positions:
+        nearest = _nearest_of(_frames_of(seed, p.well), p)
+        assert nearest.focus == state
+        assert (p.z_um, p.pfs_offset) == (nearest.z_um, None)
+    assert after.assumed == (
+        "the route minimises the Euclidean distance between fields; whether the "
+        "stage's move time follows it is not measured",
+    )
+
+
+def test_an_unlocked_frame_that_is_not_the_nearest_changes_nothing(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """One stop a well: every frame but the nearest is unlocked, so each farther frame is."""
+
+    def marks(seed: Seed, result: RouteResult) -> dict[tuple[str, int], FocusState]:
+        kept = {
+            (
+                well,
+                _nearest_of(
+                    _frames_of(seed, well), _positions_of(result, well)[0]
+                ).index,
+            )
+            for well in WELLS
+        }
+        return {
+            (f.well, f.index): "unlocked"
+            for f in seed.scan.frames
+            if (f.well, f.index) not in kept
+        }
+
+    before, seed, after = _route_twice(
+        demo_microscope, tmp_path, marks, fields_per_well=1
+    )
+
+    assert sum(1 for f in seed.scan.frames if f.focus == "unlocked") >= len(WELLS)
+    assert len(after.positions) == len(WELLS)
+    assert [(p.z_um, p.pfs_offset) for p in after.positions] == [
+        (b.z_um, b.pfs_offset) for b in before.positions
+    ]
+    assert after.assumed == before.assumed
+    assert not any("unlocked" in line for line in after.assumed)
+
+
+@pytest.mark.parametrize("state", ["locked", "off", "none"])
+def test_a_scan_without_unlocked_frames_adds_no_line_to_assumed(
+    demo_microscope: Microscope, tmp_path: Path, state: FocusState
+) -> None:
+    _, _, after = _route_twice(
+        demo_microscope,
+        tmp_path,
+        lambda seed, result: _nearest_frames_of_first_stops(seed, result, state),
+    )
+
+    assert after.assumed == (
+        "the route minimises the Euclidean distance between fields; whether the "
+        "stage's move time follows it is not measured",
+    )
+
+
+def test_another_objective_adds_no_unlocked_line(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """Every stop already has no Z and no offset for another objective: there is nothing the rule changed to report."""
+    # Every frame unlocked (a well has at most four fields: a 2 x 2 grid).
+    seed = _seed(
+        tmp_path,
+        scan_objective=FORTY,
+        focus_of={(well, i): "unlocked" for well in WELLS for i in range(4)},
+    )
+    assert seed.scan.frames
+    assert all(f.focus == "unlocked" for f in seed.scan.frames)
+
+    result = _result(_run(demo_microscope, tmp_path, objective=IN_PLACE))
+
+    assert result.positions
+    assert all(p.z_um is None and p.pfs_offset is None for p in result.positions)
+    assert result.assumed == (
+        "the route minimises the Euclidean distance between fields; whether the "
+        "stage's move time follows it is not measured",
+        f"the field of {IN_PLACE} is the scan's scaled by the profile's pixel sizes",
+        "no offset between the two objectives is applied",
+        f"z_um and pfs_offset are unknown for {IN_PLACE}: the scan's were measured with {FORTY}",
+    )
 
 
 # --------------------------------------------------------------- uncovered

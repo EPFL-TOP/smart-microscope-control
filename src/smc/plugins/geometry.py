@@ -25,6 +25,7 @@ import math
 __all__ = [
     "Matrix2",
     "footprint",
+    "fov_of",
     "pixel_matrix",
     "pixel_of_stage",
     "stage_of_pixel",
@@ -132,6 +133,21 @@ def footprint(
         )
         for col, row in corners
     )
+
+
+def fov_of(matrix: Matrix2, image_shape_px: tuple[int, int]) -> tuple[float, float]:
+    """``(width, height)`` of the frame's footprint in stage axes, in µm.
+
+    The extent of the four corners at the origin: for a camera turned by the
+    stage, the bounding box of the rotated frame. The scan plan's axis-aligned
+    grid steps by it, and so do the route's candidate lattice and the window that
+    counts cells; the fields' own footprints stay the rotated rectangle, so the
+    route's overlap rule is on pixel offsets, not on this.
+    """
+    corners = footprint(0.0, 0.0, matrix=matrix, image_shape_px=image_shape_px)
+    xs = [x for x, _ in corners]
+    ys = [y for _, y in corners]
+    return (max(xs) - min(xs), max(ys) - min(ys))
 
 
 def _centre(image_shape_px: tuple[int, int]) -> tuple[float, float]:

@@ -34,10 +34,15 @@ from pydantic import Field, model_validator
 from smc.hardware.capabilities import Autofocus, Camera, ObjectiveTurret
 from smc.plugins.api import PluginParams, RunContext
 from smc.plugins.errors import PluginRunError
-from smc.plugins.geometry import Matrix2, footprint, pixel_matrix, pixel_of_stage
+from smc.plugins.geometry import (
+    Matrix2,
+    footprint,
+    fov_of,
+    pixel_matrix,
+    pixel_of_stage,
+)
 from smc.plugins.scan_plan.algorithm import (
     estimate_s,
-    fov_of,
     gap_overlap,
     grid_size,
     plan_fields,

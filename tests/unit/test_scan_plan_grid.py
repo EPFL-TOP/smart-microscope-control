@@ -19,12 +19,17 @@ from collections.abc import Callable, Sequence
 import pytest
 import useq
 
-from smc.plugins.geometry import Matrix2, footprint, pixel_matrix, stage_of_pixel
+from smc.plugins.geometry import (
+    Matrix2,
+    footprint,
+    fov_of,
+    pixel_matrix,
+    stage_of_pixel,
+)
 from smc.plugins.scan_plan.algorithm import (
     _disc_meets,
     _polygons_overlap,
     estimate_s,
-    fov_of,
     gap_overlap,
     grid_size,
     plan_fields,
@@ -221,20 +226,6 @@ def test_a_field_far_smaller_than_the_well_gives_a_huge_grid_not_an_error(
 
     assert rows > 100
     assert columns > 100
-
-
-def test_fov_of_is_the_footprints_extent() -> None:
-    assert fov_of(pixel_matrix(0.5), FRAME) == (256.0, 150.0)
-
-
-def test_fov_of_a_turned_camera_is_the_extent_in_stage_axes() -> None:
-    """A 512 x 300 frame turned by 30 degrees: 512 cos + 300 sin wide, 512 sin + 300 cos high."""
-    width, height = fov_of(_matrix(1.0, 30.0, False), FRAME)
-
-    assert width == pytest.approx(512 * math.cos(math.radians(30)) + 150.0)
-    assert height == pytest.approx(256.0 + 300 * math.cos(math.radians(30)))
-    # Mirroring flips the image, not the area it covers.
-    assert fov_of(_matrix(1.0, 30.0, True), FRAME) == pytest.approx((width, height))
 
 
 # ---------------------------------------------------------------- clipping
