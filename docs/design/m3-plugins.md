@@ -969,6 +969,7 @@ def pixel_of_stage(
 def footprint(
     x_um: float, y_um: float, *, matrix: Matrix2, image_shape_px: tuple[int, int]
 ) -> tuple[tuple[float, float], ...]: ...
+def fov_of(matrix: Matrix2, image_shape_px: tuple[int, int]) -> tuple[float, float]: ...
 ```
 
 - **The matrix** `M` maps a pixel offset `(d_col, d_row)` from the frame
@@ -994,6 +995,13 @@ def footprint(
 - `footprint` gives the four stage corners of the frame, in the order of
   the pixel corners `(0, 0)`, `(W, 0)`, `(W, H)`, `(0, H)` (the outer edges
   of the edge pixels, `−0.5` and `W − 0.5`), a rotated rectangle.
+- `fov_of` gives `(width, height)` of the frame's footprint in stage axes,
+  in µm: the extent of the four corners of `footprint(0, 0, ...)`, so for a
+  camera turned by the stage the bounding box of the rotated frame. It was
+  defined twice, in `scan_plan.algorithm` (the grid steps by it) and
+  `route.algorithm` (the candidate lattice and its counting window use it),
+  and lives here since #232 (the footprints themselves stay rotated
+  rectangles; only the extent is a box).
 
 ### 3.2 Plate — `slots/plate.py` (slot `plate`)
 
@@ -2834,7 +2842,8 @@ def path_length_um(
   route starts at its field nearest the first planned field of that well,
   every later one at its field nearest the previous well's last position.
 - Each position takes `z_um` and `pfs_offset` from the nearest taken
-  frame of its well; `name` is `<well>_r<k:03d>`; `counts` holds every
+  frame of its well that is not `unlocked` (decided for #232, below);
+  `name` is `<well>_r<k:03d>`; `counts` holds every
   label inside the footprint. `travel_s` is the sum of `timings.move_ms`
   over the route when `timings` is usable, else `None`.
 
@@ -2901,6 +2910,47 @@ is not committed, with numpy 2.5.3 on Python 3.13 and numpy 1.26.0 and
   stage found none of the wanted labels, or it found some and no allowed
   field holds `min_cells` of them. A route of no position is of no use to
   the export, and `done` would say that it is.
+
+**Decided for #232** (the owner's call, 2026-10-29; found by the adversarial
+review of #230): a stop's `z_um` and `pfs_offset` do not come from a frame
+whose autofocus had lost the sample.
+
+- **The rule.** A scan frame's `focus` is `locked`, `unlocked`, `off` or
+  `none` (§3.4). The *candidates* of a well are its frames whose `focus` is
+  not `unlocked`. A stop takes **both** values from one frame, the nearest
+  candidate by the frame's readback (ties: the lowest index in
+  `scan.frames`, as before), and both are `None` when the well has no
+  candidate: no frame at all, or only `unlocked` ones. The two values never
+  come from different frames.
+- **Why `off` and `none` count.** `off` is an autofocus the scan did not
+  touch, and `none` a stand without one: their `z_um` is the focus stage's
+  reading under the operator's focus, which is what the scan measured, and
+  their `pfs_offset` is `None`. Only `unlocked` says the reading was taken
+  while the autofocus was on and searching, so its `z_um` is wherever the
+  search had got to and its `pfs_offset` is the stored one that nobody read
+  locked on this sample (FM-118): the export (§14) would hand it on as the
+  operator's. Unknown beats guessed.
+- **Reported.** When the rule changed the answer of at least one stop, that
+  is when the nearest frame of **all** the well's frames was `unlocked`,
+  `assumed` gains one line, after the lines above and with `n` the stops
+  concerned, `total` all stops and `m` those of the `n` that have no
+  candidate: `{n} of {total} stops had an unlocked frame as their nearest
+  frame (the autofocus had not locked on it): {n - m} took z_um and
+  pfs_offset from the nearest frame that was not unlocked, {m} have none
+  because every frame of their well was unlocked`. A stop whose nearest
+  frame is not `unlocked` is not counted, whether or not a farther
+  `unlocked` frame exists; a scan without `unlocked` frames adds no line;
+  for another objective every stop has `None` already and the line is not
+  added.
+- **`fov_of`** is one function, `smc.plugins.geometry.fov_of` (§3.1);
+  `route.algorithm` and `scan_plan.algorithm` import it and no longer define
+  it.
+- **Not changed.** A stop is looked at between two wells and not inside
+  one: the check inside `choose_fields` would need a callable in its
+  signature for a well that takes 0.3 to 0.45 s at the default step, and
+  17 s only at the bound (760 000 cells and a step of 0.02 of the field,
+  both the operator's choice); Ctrl-C ends it at once. Reopen it if the
+  plate page's Stop shows the wait at a stand.
 
 **Tests** (hypothesis where marked): `test_no_field_leaves_its_well_or_enters_an_exclusion`
 (hypothesis over margins, exclusions, rotations); `test_chosen_fields_never_overlap`;
