@@ -13,7 +13,7 @@ and why.
 | [0003](0003-capabilities-roles-and-profiles.md) | The abstraction layer: capabilities, roles and profiles | accepted |
 | [0004](0004-plugin-architecture.md) | Tools are plugins over capabilities | accepted |
 | [0005](0005-testing-strategy.md) | Testing strategy: simulator first, hardware by session | accepted |
-| [0006](0006-user-interface.md) | User interface: CLI first, then a web UI | **proposed** |
+| [0006](0006-user-interface.md) | User interface: one simple interface for every microscope | accepted |
 | [0007](0007-non-micromanager-hardware.md) | Hardware without a Micro-Manager adapter (Zeiss MTB, Viventis) | **proposed** |
 | [0008](0008-repository-workflow.md) | Repository workflow: issues, branches, PRs, CI | accepted |
 

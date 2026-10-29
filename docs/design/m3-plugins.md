@@ -1283,7 +1283,9 @@ def load_cells(run_dir: Path, result: CellsResult) -> tuple[Cell, ...]: ...
   `result.counts` (a file replaced behind the result). Readers turn that
   into a `PluginRunError` that says to run `cells` again.
 - `model` is the weights' file name (never its full path: FM-50, run
-  documents are attached to issues); `model_sha256` its SHA-256;
+  documents are attached to issues), or `blobs` for the blob detector of
+  §9.1; `model_sha256` its SHA-256 (of the detector's identity for
+  `blobs`);
   `classes` the detector's, background excluded.
 
 ```python
@@ -2475,6 +2477,50 @@ def load_detector(
   an unavailable device), with its message. The file is checked first so
   that a PC without torch still says where it looked.
 
+**The blob detector (#260).** The trained model does not see the
+synthetic cells of the demo-sample stand (M1 §8, "The demo-sample
+stand": at most 2 `single` among 14 objects), so the workflow could not
+be followed on images past the scan. A second detector, in the same
+module, numpy and scikit-image only:
+
+```python
+BLOB_DETECTOR = "blobs"  # CellsResult.model when it ran
+BLOB_DETECTOR_IDENTITY = (
+    "smc BlobDetector 1: p75 + 8 sigma, 9 px to 5 % of the frame, "
+    "axis ratio >= 0.3, single from 0.75"
+)  # its SHA-256 is CellsResult.model_sha256
+
+
+class BlobDetector:
+    classes = ("single", "doublet")
+    device = "cpu"
+
+    def detect(self, frame: npt.NDArray[Any]) -> list[Detection]: ...
+```
+
+`detect` refuses a frame that is not 2-D (`ValueError`), as
+`TorchDetector` does. On the frame as `float64`: the background is its
+75th percentile and the noise `σ = 1.4826 × median(|Δ|) / √2`, `Δ` the
+differences of neighbouring pixels along a row (a well wall is a step,
+which a spread around the median would count as noise); `σ` not finite or
+not positive gives no detection. The mask is `frame > background + 8 σ`,
+its connected components `skimage.measure.label` (8-connected, the
+default) and `regionprops`. A component is dropped when its area is under
+9 pixels or over 5 % of the frame (a sliver of well seen past a wall), or
+when `axis_minor_length / axis_major_length` is under 0.3 (a strip) or the
+major axis is 0; it is a `single` from a ratio of 0.75 up, else a
+`doublet`. Its box is its `bbox` as floats, its score 1.0. **Measured
+2026-10-29** (scikit-image 0.26.0) on `PlateSample` frames of 5 single and
+3 paired spots of radius 5 µm, `CELL_INTENSITY` above the well: exactly 5
+`single` and 3 `doublet` at 0.1625, 0.25, 0.5, 1.0 and 2.0 µm per pixel;
+no detection on 21 cell-free frames across a well wall (centre from −½
+to +½ frame past it) nor at a corner, at every one of those pixel sizes.
+With the median for background and its spread for `σ` (the first
+prototype), a frame centred on the wall gave 5 false cells at 1.0 µm.
+With 2 % for the largest area, the doublets vanished at 0.1625 µm. It
+knows nothing of cells: it is for the synthetic sample, and the result
+says so.
+
 ### 9.2 Algorithm
 
 `overlap.py` is `nikon-control`'s `overlap.py`, typed, with its 17 tests
@@ -2544,6 +2590,8 @@ def merge_across_fields(
 
 ```python
 class CellsParams(PluginParams):
+    # blobs: §9.1, for the demo-sample stand only (#260)
+    detector: Literal["model", "blobs"] = "model"
     model_path: Path | None = None
     device: Literal["auto", "cpu", "cuda", "mps"] = "auto"
     score_threshold: float = Field(0.5, ge=0.05, le=1.0)
@@ -2605,6 +2653,18 @@ parameters; `frames = len(scan.frames)`; `counts` for every well of
 checkpoint;
 `seconds_per_frame` the mean `detect` time of this attempt, `None` when
 it detected no frame. `assumed` names the merge radius as chosen.
+
+`detector` (#260): `model` loads the weights as above; `blobs` builds
+`BlobDetector()` and never touches `model_path` or torch. `CellsParams`
+refuses, with a `ValueError` naming the fix, `detector=blobs` with a
+`model_path` ("model_path is for detector=model") or with a `device`
+other than `auto` or `cpu` ("the blob detector runs on the cpu"). With
+`blobs`, step 2 hashes `BLOB_DETECTOR_IDENTITY` (UTF-8) instead of a file,
+so a resume across a change of its rules is refused like a change of
+weights; `CellsResult.model` is `BLOB_DETECTOR`, `device` `cpu`, and
+`assumed` adds "cells were found by the blob detector (detector=blobs),
+which counts bright round spots for the synthetic plate of the
+demo-sample profile; on a real sample its counts are not cells".
 
 `merge_radius_um = 5.0` is **chosen, not measured**: half the size of a
 yeast cell, well above the calibration's error, well below two cells
@@ -3329,12 +3389,13 @@ FM-98, FM-111, FM-114, FM-124, FM-125, FM-131, FM-138, and two new entries
 (markup built from a result's text; an output bounded per unit but not in
 all).
 
-## 14. The NIS-Elements export (#196) — interface only
+## 14. The NIS-Elements export (#196)
 
 `smc/plugins/nis_export/format.py` and `plugin.py`, entry point
-`nis-export`. **The format is not designed here**: it waits for a real XY
-position list exported by NIS-Elements 6.20 on the Ti2-E (#196), and is
-not to be guessed.
+`nis-export`. The format is the one of a real XY position list (multipoint)
+that NIS-Elements 6.20 exported on the Ti2-E on 2026-10-29 (#196); what
+was measured and decided from it is under *Refined while planning #196*
+below.
 
 ```python
 SUFFIX: str
@@ -3364,9 +3425,68 @@ positions are the route's, in order. `out=None` writes
 `nis-export/<token><SUFFIX>`; an `out` elsewhere (a folder NIS reads) is
 written there, refused when it exists and `overwrite` is false, and stored
 as its absolute POSIX path. `z_mode` says which of `z_um` and
-`pfs_offset` the format carries, once known. **Acceptance** is #196's: the
+`pfs_offset` the format carries. **Acceptance** is #196's: the
 sample's structure round-trips (`decode(encode(x)) == x` and the sample
 decodes), and the owner loads one export into NIS on the stand.
+
+**Refined while planning #196** (measured 2026-10-29 on the sample,
+`local/nikon-positions/multipoints.xml`, 8846 bytes, 10 points, with a
+prototype that is not committed, on Python 3.13 and 3.10):
+
+- **The file.** UTF-16 little-endian with a byte-order mark (`FF FE`), no
+  line break anywhere, none at the end. The text is the declaration
+  `<?xml version="1.0" encoding="UTF-16"?>`, then `<variant
+  version="1.0"><no_name runtype="CLxListVariant">`, two flags
+  `bIncludeZ` and `bPFSEnabled` (`runtype="bool"`, `value="true"` or
+  `"false"`), one `Point00000`, `Point00001`, … per position (five digits,
+  from 0, `runtype="NDSetupMultipointListItem"`), and
+  `</no_name></variant>`. Every leaf is `<tag runtype="…" value="…"/>`,
+  `runtype` first, no space before `/>`. A point holds, in this order:
+  `bChecked` (bool), `strName` (`CLxStringW`), `dXPosition`,
+  `dYPosition`, `dZPosition`, `dPFSOffset` (`double`), `baUserData`
+  (`CLxByteArray`, `value=""`). A double is written with 15 decimals
+  (`f"{v:.15f}"`: `-11613.300000000001091`).
+- **What the sample says about units.** The positions are those of a 96-well
+  plate in µm (X −13 000 to −4 000, Y 3 500 to 9 800, Z 4089.0 to 4089.12),
+  on the same 0.1 µm steps as Micro-Manager's readings of this stage
+  (`-28779.100000000002` in session 1). `dPFSOffset` is 9370 in every point
+  although `bPFSEnabled` is false: NIS writes its current offset whatever
+  the flag. 9370 is also the offset Micro-Manager's `PFSOffset` read in
+  session 1 ("left from earlier use", FM-118), so the two share a unit.
+  That NIS shares Micro-Manager's origin and direction of X, Y and Z is
+  consistent with these numbers and **not measured**.
+- **The encoder reproduces NIS's bytes.** With the sample's own values
+  (offset 9370 included), the prototype's output equals the sample byte for
+  byte except the `bPFSEnabled` flag it set; with the offset absent it
+  differs only in the ten `dPFSOffset` values (below).
+- **A flag carries the field.** `encode` sets `bIncludeZ` when every
+  position has `z_um`, `bPFSEnabled` when every one has `pfs_offset`, and
+  refuses a list where only some have one (`ValueError`): a list NIS reads
+  with one flag cannot say that a value is unknown for one point.
+  `decode` reads `dZPosition` as `z_um` only under `bIncludeZ`, and
+  `dPFSOffset` as `pfs_offset` only under `bPFSEnabled`, else `None`. A
+  field without its flag is written as `0.000000000000000`, a number that
+  is plainly no reading; the sample's unused 9370 is not reproduced.
+- **The plugin's three modes.** `pfs-offset` when every route position has
+  both values (both flags true), else `z` when every one has `z_um` (Z
+  only), else `none` (neither): the route's per-stop `None` (§11, #232)
+  becomes one mode for the whole list, and `assumed` names how many
+  positions lacked the value that decided it.
+- **Round trip.** `float(f"{v:.15f}") == v` for every `|v| >= 10` (0 of
+  100 000 random values failed) and not below (26 % failed in `[1, 10)`,
+  off by less than 1e-15 µm). `decode(encode(x)) == x` is exact for the
+  stage's values (Z and the offset are thousands, X and Y are within 10 µm
+  of 0 only at the stage's centre) and within 1e-15 below 10.
+- **The sample is committed as a test fixture**, under `tests/data/nis/`,
+  marked `binary` in `.gitattributes` and excluded from pre-commit's
+  `end-of-file-fixer` and `trailing-whitespace`: `identify` tags a `.xml`
+  as text, and `end-of-file-fixer` appended one byte to the sample
+  (8847 bytes, an odd length that no UTF-16 decoder reads), measured with
+  the hook's v6.0.0.
+
+Not verified: that NIS-Elements 6.20 loads a file this encoder wrote, in
+each mode (a `pfs-offset` list sets both flags, which the sample does not
+show), and that a stop exported this way is the field the scan imaged.
 
 ## 15. The plate page (#197)
 
@@ -3607,7 +3727,7 @@ KEY_PARAMS: dict[str, tuple[str, ...]] = {
     "camera-calibration": ("step_um",),
     "scan-plan": ("objective", "overlap", "coverage"),
     "scan": ("autofocus",),
-    "cells": ("score_threshold",),
+    "cells": ("detector", "score_threshold"),  # detector: #260
     "route": ("labels", "fields_per_well"),
 }
 PAGE_PARAMS: dict[str, tuple[str, ...]] = {
@@ -3883,7 +4003,8 @@ For session 2 the critical path is #199 → #22, #19, #21, #213, #23 →
   Pro); a well of 305 frames would take about 2 minutes at that speed.
 - `merge_radius_um = 5.0` and the overlap of 10 % against real cells.
 - Whether the stage's move time follows the Euclidean distance (§11).
-- The NIS-Elements format (§14).
+- That NIS-Elements 6.20 loads the export in each of its modes, and that
+  its stage coordinates are Micro-Manager's (§14).
 - Panel's version and behaviour on the microscope PC over RDP; a real
   browser's click (the `Tap` event of §15.3), the periodic callback of a
   session, Ctrl-C on Windows, and the page on a PC with no internet.

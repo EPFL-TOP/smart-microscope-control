@@ -55,6 +55,7 @@ src/smc/
     fakes.py           FakeCore                                          #9
     fixtures.py        pytest plugin: demo_core, demo_microscope, fake_*  #9
     synthetic.py       PlateSample renderer + SampleCamera               #10
+    sample_stand.py    [sample] of a profile: the demo-sample stand      #260
   cli.py               (exists) + profiles/devices/stage/z/snap/discover  #11 #30
 tests/
   conftest.py          loads smc.testing.fixtures (which adds --profile) and pytester
@@ -377,6 +378,9 @@ turret_requires_confirm = true
 pixel_size_um = { "Nikon 10X S Fluor" = 0.65, "Nikon 40X Plan Fluor ELWD" = 0.1625 }
 
 [quirks]                       # free-form, consumed by backends; documented per key in M2
+
+# [sample]                     # the demo configuration only: a synthetic plate under the camera (§8, #260)
+# plate = "96-well"
 ```
 
 Model:
@@ -418,6 +422,7 @@ class Profile(BaseModel):
     safety: SafetySection = SafetySection()
     camera: CameraSection = CameraSection()
     quirks: dict[str, Any] = {}
+    sample: SampleSection | None = None  # §8, "The demo-sample stand" (#260)
     source: Path | None = Field(default=None, exclude=True)  # where it was loaded from
 
     @classmethod
@@ -445,7 +450,9 @@ allowed values; a non-empty `config` must exist at load time, and every
 (`ProfileError` naming `micromanager.adapter_search_paths` and the entry,
 #77). `adapter_search_dirs()` expands `~` and resolves a relative entry
 against the profile file's directory, exactly as `config_path()` does,
-and keeps the file's order.
+and keeps the file's order. A `[sample]` table is refused unless `config`
+is `""` (the demo configuration): synthetic frames over a real stage
+would look like a working stand (§8, "The demo-sample stand").
 
 **Text encoding (#93).** A profile is UTF-8, with or without a byte-order
 mark: Notepad before Windows 10 1903 writes the mark for "UTF-8", and
@@ -1157,6 +1164,182 @@ it again replaces the camera. On `fake_microscope`, a test builds the
 well wall; the texture shifts by `Δ / ps` pixels for a stage move `Δ`; a
 blob appears where its stage position says; and the geometry is checked
 against `useq`'s own well positions, not against the sample's arithmetic.
+
+### The demo-sample stand (`smc/testing/sample_stand.py`, #260)
+
+The synthetic sample above is reached only through the fixture, so the
+plate tools could not be seen working on images outside `pytest`. A
+profile with a `[sample]` table (`profiles/demo-sample.toml`) is the demo
+stand whose camera images that sample: `smc run <tool> -p demo-sample`,
+`smc ui plate -p demo-sample` and `Microscope.open("demo-sample")` in a
+notebook all get the same stand, because the facade builds it from the
+profile, as it builds every other capability.
+
+**Measured 2026-10-29** (pymmcore-plus 0.18.1, useq-schema 0.9.2, numpy
+2.5.3, scikit-image 0.26.0, pydantic 2.13.5, Python 3.13.0), on throwaway
+prototypes that are not committed:
+- The demo opens with `Nikon 10X S Fluor` in place and the stage at
+  (0, 0); its camera reports **1.0 µm per pixel** (MMCore's `Res10x`,
+  which wins over the profile's 0.65, §6), 512 × 512, 10 ms. Every device
+  comes from the `DemoCamera` library except `LED Shutter` (`Utilities`).
+- With the 96-well plate centred on the stage origin, A1 is at
+  (−49 500, 31 500) µm (384-well: (−51 750, 33 750)); a frame at the
+  origin is plastic (mean 800), one at A1 is well (mean 3000).
+- Rendering costs 6, 12 and 21 ms per 512 × 512 frame with 5 000, 20 000
+  and 40 000 blobs; a snap through the wrapper below, with 4 967 blobs,
+  18 ms.
+- On the demo with the wrapper below and a 96-well `[sample]` at its
+  defaults, `plate-registration` → `scan-plan` (`B2,B11`, `coverage=0.4`,
+  72 fields) → `scan` (18 s) → `cells` with the blob detector of m3 §9.1
+  (0.6 s) → `density` → `route` → `report` all end `done`; the cells
+  found grow with the column as `scatter_cells` makes them (B2: 7, B11:
+  16 in the middle 40 %). `plate-finding`
+  at its defaults (centred on the stage, 1 120 survey points) took 407 s
+  and put A1 at (−49 465, 31 723) µm, turned −0.32°, for the sample's
+  (−49 500, 31 500) and 0°; `scan` of B2 at `coverage=0.4` then took 5 s.
+- The trained model of m3 §9.1 does **not** see the sample's cells: on
+  frames of 7 single and 7 paired Gaussian spots (radius 4, 6 and 10 µm,
+  bright or dark, at 0.1625 and 0.65 µm per pixel) it returns at most 2
+  `single` at a score of 0.5, the rest `debris` or nothing (torch 2.13,
+  torchvision 0.28). Hence the blob detector.
+
+```python
+# smc/hardware/profile.py (the profile cannot import smc.testing)
+MAX_SAMPLE_CELLS = 50_000  # cells_per_well x wells; about 50 ms per frame at the bound
+
+
+class SampleSection(_Section):
+    plate: str = "96-well"  # a useq name ending in "-well"
+    # None: the plate centred on the stage origin
+    a1_center_xy_um: tuple[float, float] | None = None
+    rotation_deg: float = 0.0  # [-45, 45], the plate's, as PlateSample
+    camera_rotation_deg: float = 0.0  # [-180, 180]
+    mirrored: bool = False
+    cells_per_well: int = 40  # [0, 500]; the mean over the columns
+    doublet_fraction: float = 0.3  # [0, 1]
+    cell_radius_um: float = 5.0  # (0, 50]
+    seed: int = 0  # >= 0
+
+
+# smc/testing/sample_stand.py
+CELL_INTENSITY = 3000.0  # counts above the level at REFERENCE_EXPOSURE_MS
+CELL_REACH = 0.85  # a cell's centre lies within this fraction of the well's half-size
+# a doublet's two spots lie this many radii either side of its centre
+DOUBLET_OFFSET = 0.8
+
+
+def centred_a1_um(plate: str) -> tuple[float, float]: ...
+def scatter_cells(section: SampleSection) -> tuple[Blob, ...]: ...
+def sample_of(section: SampleSection) -> PlateSample: ...
+def sample_lines(section: SampleSection) -> tuple[str, ...]: ...
+
+
+class StandSampleCamera:  # implements Camera
+    def __init__(
+        self,
+        microscope: Microscope,
+        sample: PlateSample,
+        inner: Camera,
+        *,
+        camera_rotation_deg: float = 0.0,
+        mirrored: bool = False,
+    ) -> None: ...
+
+
+def install_sample(
+    microscope: Microscope, section: SampleSection
+) -> StandSampleCamera: ...
+```
+
+**The profile.** `[sample]` is optional (`Profile.sample is None` on every
+stand but this one; `Profile.demo()` and `profiles/demo.toml` do not
+change). It forbids unknown keys like every section, refuses a boolean
+where a number goes (`_no_boolean`) and a number that is not finite or is
+out of the bounds above (FM-32), a plate that `useq.WellPlate.from_str`
+does not know or whose name does not end in `-well`, and
+`cells_per_well × rows × columns > MAX_SAMPLE_CELLS`. A `field_validator`
+on `Profile.sample` refuses `[sample]` with a `micromanager.config` other
+than `""`: synthetic frames over a real stage would look like a working
+stand. It reads the validated `micromanager` from `info.data` (fields are
+validated in their order, and one that failed is absent: then the other
+error stands alone), so the error is located at `sample`; a root
+`model_validator` would print an empty key (measured, pydantic 2.13.5). Each is a
+`value_error` whose message says what to change, so `ProfileError` names
+the key (`sample.plate`).
+
+**The cells.** `scatter_cells` is deterministic in `seed`
+(`numpy.random.default_rng(seed)`, draws in a fixed order). Wells are
+visited row by row (A1, A2, …, B1, …) from `useq.WellPlatePlan(plate,
+a1_center_xy, rotation).all_well_positions`. A well in column index `c`
+(0-based) of `C` holds `round(cells_per_well × (0.5 + c / (C − 1)))`
+cells (`cells_per_well` when `C = 1`): from half the mean in the first
+column to one and a half times it in the last, so density and route have
+something to tell apart, and the mean over the columns is
+`cells_per_well`. A cell's centre is uniform over the disc of radius
+`CELL_REACH × well_size[0] / 2` (a circular well) or over the square of
+half-sides `CELL_REACH × well_size / 2`, turned with the plate (a square
+well); it is a doublet with probability `doublet_fraction`, two spots
+`DOUBLET_OFFSET × cell_radius_um` either side of the centre along a
+uniform angle, else one spot. Every spot is a `Blob(x, y,
+cell_radius_um, CELL_INTENSITY)`, so a cell is brighter than the well
+around it and lies inside it (`PlateSample.well_at` says which).
+
+**The camera.** `StandSampleCamera` keeps the stand's own camera
+(`inner`, the `MMCamera`) and replaces only the pixels: `snap()` calls
+`inner.snap()` first, so the halt, the motion guard and the lock of the
+`Executor` apply as on any stand (a frame during a move is refused, a dry
+run snaps), then reads `inner.pixel_size_um()`, the XY position, Z (0.0
+without a Z stage) and `inner.exposure_ms()`, and renders the sample at
+the shape of the frame it got, under a lock of its own (the sample's
+random generator is not thread-safe). So the objective, the binning and
+the exposure the stand has are the ones the frame shows. It raises
+`HardwareError`, never `ValueError`, when the facade is gone (held weakly,
+FM-92), when the frame is not 2-D, when the pixel size is not finite and
+positive (it names the objective and `[camera] pixel_size_um`: a sample
+is never rendered at a guessed scale), and when `render` refuses (its
+message kept). Above `TEXTURE_TILE_UM` it logs one WARNING per camera:
+the texture aliases there (above). Every other method is `inner`'s. A
+move by another thread between the snap and the position read is
+rendered at the new position: the page and `smc run` run one tool at a
+time, and that is the limit of an overlay over a demo device.
+
+**The install.** `Microscope.from_core` (so `open` too) calls
+`install_sample(microscope, profile.sample)` when the profile has one,
+importing `smc.testing.sample_stand` there, inside the call, so that no
+real stand imports it; a failure closes the facade and is raised.
+`install_sample` raises `ProfileError` when no device fills the camera
+role, or when that device's library is not `DemoCamera` (the profile's
+`config = ""` already says so; this is what was loaded), then wraps
+`microscope.require(Camera)` with `sample_of(section)` (A1 at
+`centred_a1_um(plate)` when `a1_center_xy_um` is `None`), puts it in with
+`Microscope.override(Camera, …)` and logs at INFO that the frames are
+rendered from a synthetic plate. The fixture `demo_microscope_with_sample`
+does not change: a test that needs exact pixel sizes or shapes keeps
+`SampleCamera`.
+
+**What the operator sees.** `smc doctor -p demo-sample` prints
+`sample_lines(section)` after the role table:
+
+```text
+Sample: a synthetic 96-well plate, A1 at (-49500.0, 31500.0) µm, turned 0°; 40 cells per well on average, 30 % of them doublets (seed 0)
+  frames are rendered where the stage is, not imaged: one flat plane at z = 0 (Z only blurs), no optics
+  pixel sizes up to 4 µm (the texture aliases above); the cells are bright round spots: run cells with detector=blobs
+```
+
+The run document records the profile's name (`demo-sample`) on every
+stage, so a result made on it says so.
+
+**Tests.** The section's bounds, the config refusal and the plate check
+(unit); `scatter_cells`: the count per column, every spot inside its well
+(`well_at`), the same seed giving the same spots; `StandSampleCamera` on
+`fake_microscope` with an inner stub of a non-square frame (FM-73): the
+shape is the inner frame's, a blob east of the centre lies right of it,
+and the pixel size of 0 is a `HardwareError`; on the demo: a frame changes
+when the stage moves onto a well, a snap is refused while halted (it went
+through the `Executor`), and a profile with `[sample]` over a library
+other than `DemoCamera` is refused and leaves no core loaded; through the
+CLI, `smc snap -p <demo-sample.toml>` writes a plastic frame where
+`-p demo` writes the demo camera's; `smc doctor` prints the sample lines.
 
 ## 9. CLI — `smc/cli.py` (#11)
 
