@@ -1,0 +1,997 @@
+"""What the plate page shows and does, with no Panel in sight (m3 §15, ADR-0006).
+
+The page is a view over plugins and capabilities, so everything it decides is
+here and testable on the demo devices: which well a click lands on, what a stage
+of the workflow can run now and why not, what a stop did. ``plate_page.py`` only
+turns these values into widgets.
+
+The page runs a plugin exactly as ``smc run`` does (``load``, ``parse_params``,
+``check_ready``, ``run_plugin``), in one daemon worker thread, so every button
+has its command-line equivalent. Three rules shape the code:
+
+* **The stop path takes no lock** (FM-70). ``stop()`` reads one attribute, sets
+  an event and calls ``Microscope.stop()``; the lock guards the few attributes a
+  worker and a status poll both write and is never held across a device call.
+* **No exception is kept** (FM-98). A run's failure becomes one line of text in
+  ``outcome`` before the worker ends, so no traceback keeps the facade, and so
+  the core, alive after the page is closed.
+* **A view's life is not the work's.** The controller belongs to the server: a
+  closed or reloaded browser tab never stops a scan; only STOP, the end of the
+  server (``close()``) and the plugin's own end do.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import queue
+import threading
+import time
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from importlib.metadata import EntryPoint
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
+
+import numpy as np
+import useq
+from pydantic import ValidationError
+
+from smc.hardware.capabilities import Autofocus, LightSource, XYStage
+from smc.hardware.errors import HardwareError, StopRefusedError
+from smc.plugins import (
+    ParamsError,
+    PluginEntry,
+    PluginError,
+    PluginParams,
+    Progress,
+    Registry,
+    check_ready,
+    describe_params,
+    discover,
+    load,
+    parse_params,
+    run_plugin,
+)
+from smc.plugins.scan_plan.wells import parse_wells
+from smc.plugins.slots import (
+    DensityResult,
+    PlateResult,
+    RouteResult,
+    WallTouch,
+    WellGeometry,
+    WellRef,
+    normalise_well,
+    well_geometry,
+)
+from smc.run import RunDocument, RunDocumentError, StageStatus
+
+if TYPE_CHECKING:
+    from smc.hardware.microscope import Microscope
+
+__all__ = [
+    "KEY_PARAMS",
+    "PAGE_PARAMS",
+    "STAGES",
+    "CheckItem",
+    "PageServerError",
+    "PageStatus",
+    "PlatePage",
+    "PlateView",
+    "RouteStop",
+    "ToolView",
+    "WellView",
+]
+
+log = logging.getLogger("smc.ui")
+
+#: The tools of the workflow in the order the page shows them, grouped by stage.
+#: A plugin the table does not name is not on the page in M3.
+STAGES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Set up", ("camera-calibration", "plate-registration", "plate-finding", "timing")),
+    ("Choose", ("scan-plan",)),
+    ("Acquire", ("scan",)),
+    ("Find", ("cells", "density", "route")),
+    ("Report", ("report", "nis-export")),
+)
+
+#: The parameters worth a field of their own, in the order the page shows them;
+#: every other parameter is under the tool's *Advanced* fold.
+KEY_PARAMS: dict[str, tuple[str, ...]] = {
+    "camera-calibration": ("step_um",),
+    "scan-plan": ("objective", "overlap", "coverage"),
+    "scan": ("autofocus",),
+    "cells": ("score_threshold",),
+    "route": ("labels", "fields_per_well"),
+}
+
+#: The parameters the page fills itself (``PlatePage.page_params``), so a form
+#: does not offer them.
+PAGE_PARAMS: dict[str, tuple[str, ...]] = {
+    "plate-registration": ("plate", "refs", "walls"),
+    "scan-plan": ("wells",),
+}
+
+#: The checklist, in the order of the stages of m3 §2.2; the second item says
+#: whether a workflow can do without the slot.
+_CHECKLIST: tuple[tuple[str, bool], ...] = (
+    ("camera-calibration", True),
+    ("plate", False),
+    ("timings", True),
+    ("scan-plan", False),
+    ("scan", False),
+    ("cells", False),
+    ("density", False),
+    ("route", False),
+    ("report", False),
+    ("nis-export", False),
+)
+
+_SIDES = ("left", "right", "top", "bottom")
+
+#: How long ``close`` waits for a stopped run to end, in seconds.
+_CLOSE_WAIT_S = 10.0
+
+#: Wells built for a plate are kept (339 ms for 1536 of them); a registration
+#: changes the key rarely, so a handful is plenty.
+_GEOMETRY_KEPT = 4
+
+_Capture = TypeVar("_Capture", WellRef, WallTouch)
+
+
+class PageServerError(RuntimeError):
+    """The page's server ended without the operator stopping it."""
+
+
+@dataclass(frozen=True, slots=True)
+class WellView:
+    """One well as the map draws it, in stage µm; ``None`` is unknown, never zero."""
+
+    well: str
+    center_um: tuple[float, float]
+    size_um: tuple[float, float]
+    circular: bool
+    rotation_deg: float
+    selected: bool
+    counts: dict[str, int] | None
+    per_mm2: dict[str, float] | None
+
+
+@dataclass(frozen=True, slots=True)
+class RouteStop:
+    """One stop of the route, in stage µm."""
+
+    order: int
+    well: str
+    x_um: float
+    y_um: float
+
+
+@dataclass(frozen=True, slots=True)
+class CheckItem:
+    """One slot of the run document: ``reason`` is ``RunDocument.unusable``'s words for it."""
+
+    slot: str
+    optional: bool
+    state: Literal["ok", "not run", "unusable"]
+    reason: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class PlateView:
+    """A snapshot of what the run document says, as the page needs it (a pure read).
+
+    ``nominal`` is true when the wells are those of the plate type with A1 at
+    (0, 0) and no rotation, not a registered plate. ``blocked`` maps a registered
+    tool to why it cannot run now. ``problems`` are what ``view()`` could not read
+    and did not hide.
+    """
+
+    plate: str
+    nominal: bool
+    wells: tuple[WellView, ...]
+    labels: tuple[str, ...]
+    route: tuple[RouteStop, ...]
+    checklist: tuple[CheckItem, ...]
+    blocked: dict[str, str]
+    problems: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolView:
+    """A tool the page can run: its rows are ``describe_params`` rows (name, type, default, notes)."""
+
+    name: str
+    summary: str
+    stage: str
+    key: tuple[tuple[str, str, str, str], ...]
+    advanced: tuple[tuple[str, str, str, str], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PageStatus:
+    """The stand and the run, read now.
+
+    ``xy_um`` to ``halted`` are ``Microscope.state()``'s; ``stop_refused`` are the
+    roles the profile declares refuse their stop, so that the page can say that
+    STOP does not stop a move in flight on this stand (FM-117).
+    """
+
+    dry_run: bool
+    running: str | None
+    progress: Progress | None
+    outcome: str | None
+    stop_note: str | None
+    xy_um: tuple[float, float] | None
+    z_um: float | None
+    objective: str | None
+    autofocus: str
+    light_on: bool | None
+    moving: tuple[str, ...]
+    halted: bool
+    stop_refused: tuple[str, ...]
+    problems: tuple[str, ...]
+
+
+def _one_line(error: BaseException) -> str:
+    """The message of ``error`` on one line; an error whose message cannot be built says nothing."""
+    try:
+        return " ".join(str(error).split())
+    except (
+        Exception
+    ):  # a message that cannot be printed is not worth losing the outcome
+        return ""
+
+
+def _autofocus_words(engaged: bool | None, locked: bool | None) -> str:
+    """The words of ``Microscope.describe``: ``?`` whenever a read the answer needs is unknown."""
+    if engaged is None:
+        return "autofocus ?"
+    if not engaged:
+        return "autofocus off"
+    if locked is None:
+        return "autofocus ?"
+    return "autofocus locked" if locked else "autofocus on, not locked"
+
+
+def _first_problem(error: ValidationError) -> str:
+    """``<where>: <what>`` of the first validation error."""
+    first = error.errors()[0]
+    where = ".".join(str(part) for part in first["loc"]) or "result"
+    return f"{where}: {first['msg']}"
+
+
+class PlatePage:
+    """The plate page's logic over one stand and one run document.
+
+    The controller never opens or closes the stand: the command that serves the
+    page does, once, for the page's life. Everything an operator does here is a
+    plugin run with the strings ``smc run`` takes, or a read of a capability.
+
+    Attributes:
+        selection: The wells the operator chose, in the order they chose them.
+        refs: The wells centred under the objective, for plate registration.
+        walls: The wall touches, for plate registration.
+        current: The well last clicked or driven to; where *Capture* and
+            *Forget* act.
+    """
+
+    selection: tuple[str, ...]
+    refs: tuple[WellRef, ...]
+    walls: tuple[WallTouch, ...]
+    current: str | None
+
+    def __init__(
+        self,
+        microscope: Microscope,
+        run_doc: Path,
+        *,
+        entry_points: Iterable[EntryPoint] | None = None,
+    ) -> None:
+        """Start from the run document: its plate, the wells chosen and the references taken.
+
+        Never raises for a document: one that cannot be read starts the page
+        empty, and ``view()`` says why in its ``problems``.
+        """
+        self._microscope = microscope
+        self._run_doc = run_doc
+        # A list, so that a generator handed in is not spent by the first use.
+        self._entry_points = None if entry_points is None else list(entry_points)
+        self._registry_found: Registry | None = None
+        self._geometry: dict[
+            tuple[str, tuple[float, float], float], tuple[WellGeometry, ...]
+        ] = {}
+        self._names: dict[str, frozenset[str]] = {}
+        # What a worker and a status poll both write, under ``_lock``; never held
+        # across a device call, and ``stop()`` never takes it (FM-70).
+        self._lock = threading.Lock()
+        self._current_run: tuple[str, threading.Event] | None = None
+        self._progress: Progress | None = None
+        self._outcome: str | None = None
+        self._queue: queue.SimpleQueue[Progress] = queue.SimpleQueue()
+        self._worker: threading.Thread | None = None
+        self._closed = False
+        # A plain attribute, written by ``stop()`` and ``resume()``, which take no lock.
+        self._stop_note: str | None = None
+        self.current = None
+        self.selection = ()
+        self.refs = ()
+        self.walls = ()
+        doc, _unreadable = self._document()
+        self._plate = self._initial_plate(doc)
+        self._restore(doc)
+
+    # --- plate and selection -------------------------------------------------
+
+    @property
+    def plate(self) -> str:
+        """The plate the page is about, a name of ``useq``'s registry."""
+        return self._plate
+
+    def choose_plate(self, name: str) -> None:
+        """Change the plate; the selection, the captures and ``current`` belong to the old one.
+
+        Raises:
+            ValueError: ``name`` is not a plate of ``useq``'s registry; the
+                message lists them.
+        """
+        plates = sorted(useq.registered_well_plate_keys())
+        if name not in plates:
+            raise ValueError(
+                f"{name!r} is not a plate; the plates are {', '.join(plates)}"
+            )
+        if name == self._plate:
+            return
+        self._plate = name
+        self.selection = ()
+        self.refs = ()
+        self.walls = ()
+        self.current = None
+
+    def select_text(self, text: str) -> None:
+        """Replace the selection by the wells ``text`` names (``A1:D6``, ``C*``, ``all``).
+
+        Raises:
+            ValueError: ``parse_wells``' message; the selection is as it was.
+        """
+        self.selection = parse_wells(self._plate, text)
+
+    def toggle(self, well: str) -> None:
+        """Add ``well`` to the selection, or remove it.
+
+        Raises:
+            ValueError: The well is not on the plate; the selection is as it was.
+        """
+        name = self._on_plate(well)
+        if name in self.selection:
+            self.selection = tuple(w for w in self.selection if w != name)
+        else:
+            self.selection = (*self.selection, name)
+
+    def click(
+        self, x_um: float, y_um: float, *, drive: bool, side: str = "centre"
+    ) -> str | None:
+        """The well under a point of the map: selected, or (``drive``) driven to.
+
+        A point that is on no well, or is not finite, does nothing and returns
+        ``None``. In select mode nothing moves, whatever the map shows.
+
+        Raises:
+            ValueError: ``drive`` on a map of another plate than the registered
+                one (see ``goto``).
+            RuntimeError: ``drive`` while a run is going, or after ``close``.
+        """
+        geometries, _nominal = self._geometries(self._document()[0])
+        for geometry in geometries:
+            if geometry.contains(x_um, y_um):
+                well = geometry.well
+                break
+        else:
+            return None
+        if drive:
+            self.goto(well, side)
+        else:
+            self.current = well
+            self.toggle(well)
+        return well
+
+    def goto(self, well: str, side: str = "centre") -> None:
+        """Run ``goto-well`` for ``well``.
+
+        ``goto-well`` takes a well's name and reads the registered plate, while the
+        map of a plate chosen with ``choose_plate`` is the nominal one when the
+        registered plate is another: a click on C5 of the nominal 96-well map would
+        drive the stage to C5 of the registered 384-well plate with nothing on the
+        page to say so. So it refuses that mismatch before anything changes.
+
+        Raises:
+            ValueError: A usable ``plate`` slot names another plate than ``plate``.
+            RuntimeError: A run is going, or the page is closed.
+        """
+        self._refuse_if_busy()
+        self._refuse_another_registered_plate(self._document()[0])
+        name = normalise_well(well)
+        self.current = name
+        self.run("goto-well", [f"well={name}", f"side={side}"])
+
+    # --- captures --------------------------------------------------------------
+
+    def capture_centre(self, well: str) -> WellRef:
+        """Record the stage position as the centre of ``well``; a second capture replaces the first.
+
+        Raises:
+            ValueError: The well is not on the plate.
+            CapabilityMissingError: The stand has no XY stage.
+        """
+        name = self._on_plate(well)
+        position = self._microscope.require(XYStage).position_um()
+        ref = WellRef(well=name, x_um=position.x_um, y_um=position.y_um)
+        kept = tuple(r for r in self.refs if normalise_well(r.well) != name)
+        self.refs = (*kept, ref)
+        return ref
+
+    def capture_wall(self, well: str, side: str) -> WallTouch:
+        """Record the stage position as a point of ``well``'s ``side`` wall; replaces the same side.
+
+        Raises:
+            ValueError: ``side`` is not left, right, top or bottom, or the well is
+                not on the plate.
+            CapabilityMissingError: The stand has no XY stage.
+        """
+        if side not in _SIDES:
+            raise ValueError(f"side must be one of {', '.join(_SIDES)}, got {side!r}")
+        name = self._on_plate(well)
+        position = self._microscope.require(XYStage).position_um()
+        touch = WallTouch(
+            well=name,
+            side=side,  # type: ignore[arg-type]  # checked against _SIDES above
+            x_um=position.x_um,
+            y_um=position.y_um,
+        )
+        kept = tuple(
+            w
+            for w in self.walls
+            if not (normalise_well(w.well) == name and w.side == side)
+        )
+        self.walls = (*kept, touch)
+        return touch
+
+    def forget(self, well: str | None = None) -> None:
+        """Drop the captures of ``well`` (its centre and its walls), or all of them."""
+        if well is None:
+            self.refs = ()
+            self.walls = ()
+            return
+        name = normalise_well(well)
+        self.refs = tuple(r for r in self.refs if normalise_well(r.well) != name)
+        self.walls = tuple(w for w in self.walls if normalise_well(w.well) != name)
+
+    def page_params(self, plugin: str) -> list[str]:
+        """The ``key=value`` pairs the page fills itself for ``plugin`` (``PAGE_PARAMS``).
+
+        Raises:
+            ValueError: ``scan-plan`` with nothing selected, or with a selection
+                on another plate than the registered one.
+        """
+        if plugin == "scan-plan":
+            if not self.selection:
+                raise ValueError("select at least one well first")
+            self._refuse_another_registered_plate(self._document()[0])
+            return [f"wells={','.join(self.selection)}"]
+        if plugin == "plate-registration":
+            refs = json.dumps([r.model_dump(mode="json") for r in self.refs])
+            walls = json.dumps([w.model_dump(mode="json") for w in self.walls])
+            return [f"plate={self._plate}", f"refs={refs}", f"walls={walls}"]
+        return []
+
+    # --- runs, stop, status ---------------------------------------------------------
+
+    def run(self, plugin: str, params: Sequence[str]) -> None:
+        """Run ``plugin`` with ``key=value`` strings, as ``smc run`` would, in one worker thread.
+
+        What ``smc run`` checks before it opens the stand is checked here before a
+        thread starts: the plugin, its parameters, the run document and what the
+        plugin reads. A refusal there is the ``outcome`` (``<plugin>: <Type>:
+        <message>``); nothing is written and no thread starts. What the run does is
+        shown by ``status()``.
+
+        Raises:
+            RuntimeError: A run is going (``<plugin> is running``), or the page is
+                closed.
+        """
+        self._refuse_if_busy()
+        try:
+            entry = load(plugin, self._entry_points)
+            try:
+                parsed = parse_params(entry.plugin.Params, params)
+            except ParamsError as exc:
+                # parse_params knows the model, not the plugin: name the plugin, as
+                # `smc run` does, so the advice (--show-params) is for the right one.
+                raise ParamsError(plugin, exc.problems) from None
+            doc = RunDocument.load_or_new(self._run_doc)
+            check_ready(
+                entry.plugin,
+                doc,
+                parsed,
+                profile=self._microscope.profile.microscope.name,
+                dry_run=self._microscope.dry_run,
+                resume=False,
+            )
+        except (PluginError, RunDocumentError) as exc:
+            # Text, never the error (FM-98).
+            self._set_outcome(f"{plugin}: {type(exc).__name__}: {_one_line(exc)}")
+            return
+        event = threading.Event()
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("the page is closed")
+            if self._current_run is not None:
+                raise RuntimeError(f"{self._current_run[0]} is running")
+            self._current_run = (plugin, event)
+            self._progress = None
+            self._outcome = None
+            while True:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+            # Daemon: a plugin stuck in a vendor call must not keep the process
+            # alive after the page is closed.
+            worker = threading.Thread(
+                target=self._work,
+                args=(plugin, entry, parsed, event),
+                name=f"smc-ui-{plugin}",
+                daemon=True,
+            )
+            self._worker = worker
+            worker.start()
+
+    def _work(
+        self,
+        plugin: str,
+        entry: PluginEntry,
+        parsed: PluginParams,
+        event: threading.Event,
+    ) -> None:
+        """The worker's body: the run, and its outcome as text before anything else ends."""
+        log.info("%s: started from the plate page", plugin)
+        started = time.monotonic()
+        outcome = f"{plugin}: ended without an outcome"
+        try:
+            try:
+                record = run_plugin(
+                    entry.plugin,
+                    self._microscope,
+                    parsed,
+                    self._run_doc,
+                    on_progress=self._queue.put,
+                    stop=event,
+                    plugin_version=entry.version,
+                )
+            except RunDocumentError as exc:
+                if exc.record is not None and exc.record.result is not None:
+                    outcome = (
+                        f"{plugin} ran, but its record could not be written: "
+                        f"{_one_line(exc)}"
+                    )
+                else:
+                    outcome = f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
+            except Exception as exc:
+                outcome = f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
+            else:
+                if record.status is StageStatus.done:
+                    outcome = f"{plugin} done in {time.monotonic() - started:.1f} s"
+                else:
+                    outcome = f"{plugin} stopped"
+        finally:
+            with self._lock:
+                self._outcome = outcome
+                self._current_run = None
+            log.info("%s", outcome)
+
+    def stop(self) -> None:
+        """Ask the run to stop, then stop the stand; say what the stop did, never "stopped" by default.
+
+        The event is set first, so the plugin leaves its loop as the stand halts,
+        and the log line comes after the stop (FM-62). It takes no lock the worker
+        holds (FM-70) and never raises for a stop that is refused or fails
+        (FM-117): the outcome is ``stop_note``. STOP with nothing running still
+        halts the stand.
+        """
+        current = self._current_run
+        if current is not None:
+            current[1].set()
+        prefix = "" if current is None else f"{current[0]} told to stop; "
+        try:
+            self._microscope.stop()
+        except StopRefusedError as exc:
+            note = f"{prefix}halted, but {_one_line(exc)}"
+        except HardwareError as exc:
+            note = f"{prefix}the stop failed: {_one_line(exc)}"
+        else:
+            note = f"{prefix}stopped: the stand is halted (Resume clears the halt)"
+        log.info("stop: %s", note)
+        self._stop_note = note
+
+    def resume(self) -> None:
+        """Clear the halt; refused while a run is going.
+
+        Raises:
+            RuntimeError: A run is going (``<plugin> is running``).
+        """
+        current = self._current_run
+        if current is not None:
+            raise RuntimeError(f"{current[0]} is running")
+        self._microscope.resume()
+        self._stop_note = None
+
+    def status(self) -> PageStatus:
+        """The run and the stand now: the progress queue is drained and the stand is read.
+
+        The latest ``Progress`` is kept, so that every session sees the same. The
+        stand's read takes no lock and tolerates a failed device: what failed is in
+        ``problems``.
+        """
+        latest: Progress | None = None
+        while True:
+            try:
+                latest = self._queue.get_nowait()
+            except queue.Empty:
+                break
+        with self._lock:
+            if latest is not None:
+                self._progress = latest
+            running = None if self._current_run is None else self._current_run[0]
+            progress = self._progress
+            outcome = self._outcome
+        state = self._microscope.state()
+        problems = list(state.errors)
+        light_on: bool | None = None
+        light = self._microscope.get(LightSource)
+        if light is not None:
+            try:
+                light_on = light.is_on()
+            except Exception as exc:
+                problems.append(f"light: {type(exc).__name__}: {_one_line(exc)}")
+        autofocus = (
+            _autofocus_words(state.autofocus_engaged, state.autofocus_locked)
+            if self._microscope.has(Autofocus)
+            else "no autofocus"
+        )
+        return PageStatus(
+            dry_run=self._microscope.dry_run,
+            running=running,
+            progress=progress,
+            outcome=outcome,
+            stop_note=self._stop_note,
+            xy_um=None if state.xy is None else (state.xy.x_um, state.xy.y_um),
+            z_um=state.z_um,
+            objective=state.objective,
+            autofocus=autofocus,
+            light_on=light_on,
+            moving=tuple(state.moving),
+            halted=state.halted,
+            stop_refused=tuple(
+                role.value for role in self._microscope.profile.safety.stop_refused_by
+            ),
+            problems=tuple(problems),
+        )
+
+    def join(self, timeout_s: float | None = None) -> bool:
+        """Wait for the worker; whether none is left alive."""
+        worker = self._worker
+        if worker is not None:
+            worker.join(timeout_s)
+        return worker is None or not worker.is_alive()
+
+    def close(self) -> None:
+        """Stop a run that is going and wait for it; afterwards ``run`` refuses.
+
+        Idempotent. It never closes the stand (the command that serves the page
+        owns it) and never raises for a refused stop. A run that is still alive
+        after the wait is said so in ``outcome``. A Ctrl-C during the wait is not
+        caught: the stop was sent before it (FM-71).
+        """
+        self._closed = True
+        current = self._current_run
+        if current is None:
+            return
+        self.stop()
+        if not self.join(_CLOSE_WAIT_S):
+            self._set_outcome(f"{current[0]} did not end within {_CLOSE_WAIT_S:.0f} s")
+
+    def _refuse_if_busy(self) -> None:
+        if self._closed:
+            raise RuntimeError("the page is closed")
+        current = self._current_run
+        if current is not None:
+            raise RuntimeError(f"{current[0]} is running")
+
+    def _set_outcome(self, outcome: str) -> None:
+        with self._lock:
+            self._outcome = outcome
+
+    # --- the view ---------------------------------------------------------------
+
+    def tools(self) -> tuple[ToolView, ...]:
+        """The registered tools ``STAGES`` names, in the workflow's order.
+
+        A stage with no registered tool has none in the result; the stage's name
+        is on each tool.
+        """
+        plugins = self._registry().plugins
+        views: list[ToolView] = []
+        for stage, names in STAGES:
+            for name in names:
+                entry = plugins.get(name)
+                if entry is None:
+                    continue
+                hidden = PAGE_PARAMS.get(name, ())
+                rows = [
+                    r
+                    for r in describe_params(entry.plugin.Params)
+                    if r[0] not in hidden
+                ]
+                by_name = {row[0]: row for row in rows}
+                keys = [k for k in KEY_PARAMS.get(name, ()) if k in by_name]
+                views.append(
+                    ToolView(
+                        name=name,
+                        summary=entry.plugin.summary,
+                        stage=stage,
+                        key=tuple(by_name[k] for k in keys),
+                        advanced=tuple(r for r in rows if r[0] not in keys),
+                    )
+                )
+        return tuple(views)
+
+    def view(self) -> PlateView:
+        """A snapshot built from a fresh read of the run document; it raises nothing for it.
+
+        An unreadable document, or a result its model refuses, is a line in
+        ``problems`` and is drawn as absent (FM-125); the file is never written.
+        """
+        doc, unreadable = self._document()
+        problems: list[str] = []
+        if unreadable is not None:
+            problems.append(f"run document: {unreadable}")
+        registered = self._slot(doc, "plate", PlateResult, problems)
+        density = self._slot(doc, "density", DensityResult, problems)
+        route = self._slot(doc, "route", RouteResult, problems)
+        geometries, nominal = self._registered_geometries(registered)
+        selected = frozenset(self.selection)
+        measured = {} if density is None else {w.well: w for w in density.wells}
+        wells: list[WellView] = []
+        for geometry in geometries:
+            found = measured.get(geometry.well)
+            wells.append(
+                WellView(
+                    well=geometry.well,
+                    center_um=geometry.center_um,
+                    size_um=geometry.size_um,
+                    circular=geometry.circular,
+                    rotation_deg=geometry.rotation_deg,
+                    selected=geometry.well in selected,
+                    counts=None if found is None else dict(found.counts),
+                    per_mm2=(
+                        None
+                        if found is None or found.per_mm2 is None
+                        else dict(found.per_mm2)
+                    ),
+                )
+            )
+        stops = (
+            ()
+            if route is None
+            else tuple(
+                RouteStop(p.order, p.well, p.x_um, p.y_um)
+                for p in sorted(route.positions, key=lambda p: p.order)
+            )
+        )
+        return PlateView(
+            plate=self._plate,
+            nominal=nominal,
+            wells=tuple(wells),
+            labels=() if density is None else density.labels,
+            route=stops,
+            checklist=self._checklist(doc),
+            blocked=self._blocked(doc),
+            problems=tuple(problems),
+        )
+
+    # --- internals of the view -----------------------------------------------------
+
+    def _registry(self) -> Registry:
+        """The plugins, found once: a registration changes only with an install (FM-112)."""
+        if self._registry_found is None:
+            self._registry_found = discover(self._entry_points)
+        return self._registry_found
+
+    def _document(self) -> tuple[RunDocument, str | None]:
+        """The run document as it is now, or a new one and why the file could not be read."""
+        try:
+            return RunDocument.load_or_new(self._run_doc), None
+        except RunDocumentError as exc:
+            # The text, never the error: a kept error keeps its traceback (FM-98).
+            return RunDocument.new(), str(exc)
+
+    def _unusable(self, doc: RunDocument, slot: str) -> str | None:
+        return doc.unusable(
+            slot,
+            profile=self._microscope.profile.microscope.name,
+            dry_run=self._microscope.dry_run,
+        )
+
+    def _slot(
+        self, doc: RunDocument, slot: str, model: type[Any], problems: list[str]
+    ) -> Any | None:
+        """The result of a usable ``slot`` as ``model``; ``None`` and a problem when it refuses."""
+        if self._unusable(doc, slot) is not None:
+            return None
+        provider = doc.provider(slot)
+        if provider is None:  # unreachable once the slot is usable
+            return None
+        try:
+            return model.model_validate(provider.result)
+        except ValidationError as exc:
+            problem = _first_problem(exc)
+        problems.append(f"{slot}: result does not validate: {problem}")
+        return None
+
+    def _checklist(self, doc: RunDocument) -> tuple[CheckItem, ...]:
+        items: list[CheckItem] = []
+        for slot, optional in _CHECKLIST:
+            if doc.provider(slot) is None:
+                items.append(CheckItem(slot, optional, "not run", None))
+                continue
+            reason = self._unusable(doc, slot)
+            if reason is None:
+                items.append(CheckItem(slot, optional, "ok", None))
+            else:
+                items.append(CheckItem(slot, optional, "unusable", reason))
+        return tuple(items)
+
+    def _blocked(self, doc: RunDocument) -> dict[str, str]:
+        """Why each registered tool of ``STAGES`` cannot run now; a tool that can is absent."""
+        plugins = self._registry().plugins
+        blocked: dict[str, str] = {}
+        for _stage, names in STAGES:
+            for name in names:
+                entry = plugins.get(name)
+                if entry is None:
+                    continue
+                reason = next(
+                    (
+                        r
+                        for r in (self._unusable(doc, s) for s in entry.plugin.reads)
+                        if r
+                    ),
+                    None,
+                )
+                if reason is None:
+                    lacking = next(
+                        (
+                            cap
+                            for cap in entry.plugin.requires
+                            if not self._microscope.has(cap)
+                        ),
+                        None,
+                    )
+                    if lacking is not None:
+                        reason = f"this stand has no {lacking.__name__}"
+                if reason is not None:
+                    blocked[name] = reason
+        return blocked
+
+    def _geometries(self, doc: RunDocument) -> tuple[tuple[WellGeometry, ...], bool]:
+        """The wells the map draws for ``doc``: what ``view`` and ``click`` both use."""
+        registered = self._slot(doc, "plate", PlateResult, [])
+        return self._registered_geometries(registered)
+
+    def _registered_geometries(
+        self, registered: PlateResult | None
+    ) -> tuple[tuple[WellGeometry, ...], bool]:
+        """The registered plate's wells when it is the page's plate, else the nominal plate's.
+
+        Built once per ``(plate, a1_center_xy_um, rotation_deg)`` and kept: 1536
+        wells cost 339 ms, which a click or a refresh must not pay again.
+        """
+        if registered is not None and registered.plate == self._plate:
+            key = (self._plate, registered.a1_center_xy_um, registered.rotation_deg)
+            nominal = False
+        else:
+            key = (self._plate, (0.0, 0.0), 0.0)
+            nominal = True
+        found = self._geometry.get(key)
+        if found is None:
+            if nominal or registered is None:
+                plan = useq.WellPlatePlan(
+                    plate=useq.WellPlate.from_str(self._plate), a1_center_xy=(0.0, 0.0)
+                )
+            else:
+                plan = registered.to_plan()
+            found = tuple(
+                well_geometry(plan, str(name))
+                for name in np.asarray(plan.all_well_names).ravel()
+            )
+            if len(self._geometry) >= _GEOMETRY_KEPT:
+                self._geometry.clear()
+            self._geometry[key] = found
+        return found, nominal
+
+    def _plate_names(self) -> frozenset[str]:
+        found = self._names.get(self._plate)
+        if found is None:
+            plan = useq.WellPlatePlan(
+                plate=useq.WellPlate.from_str(self._plate), a1_center_xy=(0.0, 0.0)
+            )
+            found = frozenset(str(n) for n in np.asarray(plan.all_well_names).ravel())
+            self._names[self._plate] = found
+        return found
+
+    def _on_plate(self, well: str) -> str:
+        """``well`` as ``useq`` names it, or a ``ValueError`` when the plate has no such well."""
+        name = normalise_well(well)
+        if name not in self._plate_names():
+            raise ValueError(f"{name} is not a well of the {self._plate} plate")
+        return name
+
+    def _refuse_another_registered_plate(self, doc: RunDocument) -> None:
+        """Refuse a usable ``plate`` slot that names another plate than the page's.
+
+        A slot whose result its model refuses is no case for this check: the plugin
+        that reads it says so.
+        """
+        registered = self._slot(doc, "plate", PlateResult, [])
+        if registered is not None and registered.plate != self._plate:
+            raise ValueError(
+                f"the registered plate is a {registered.plate}; calibrate the "
+                f"{self._plate} plate again, or choose {registered.plate}"
+            )
+
+    def _initial_plate(self, doc: RunDocument) -> str:
+        """The plate of the latest registration, else of the usable ``plate`` slot, else 96-well."""
+        known = useq.registered_well_plate_keys()
+        record = doc.stages.get("plate-registration")
+        if record is not None:
+            plate = record.params.get("plate")
+            if isinstance(plate, str) and plate in known:
+                return plate
+        registered = self._slot(doc, "plate", PlateResult, [])
+        if registered is not None and registered.plate in known:
+            return str(registered.plate)
+        return "96-well"
+
+    def _restore(self, doc: RunDocument) -> None:
+        """The selection and the captures the document already holds; what does not parse is dropped."""
+        scan_plan = doc.stages.get("scan-plan")
+        if scan_plan is not None:
+            wells = scan_plan.params.get("wells")
+            try:
+                if isinstance(wells, str):
+                    self.selection = parse_wells(self._plate, wells)
+            except ValueError as exc:
+                log.info(
+                    "the scan-plan record's wells %r are not read: %s",
+                    wells,
+                    _one_line(exc),
+                )
+        registration = doc.stages.get("plate-registration")
+        if registration is not None:
+            self.refs = self._captured(registration.params, "refs", WellRef)
+            self.walls = self._captured(registration.params, "walls", WallTouch)
+
+    @staticmethod
+    def _captured(
+        params: dict[str, Any], key: str, model: type[_Capture]
+    ) -> tuple[_Capture, ...]:
+        raw = params.get(key)
+        try:
+            return tuple(model.model_validate(item) for item in raw or ())
+        except (ValueError, TypeError) as exc:
+            log.info(
+                "the plate-registration record's %s are not read: %s",
+                key,
+                _one_line(exc),
+            )
+            return ()
