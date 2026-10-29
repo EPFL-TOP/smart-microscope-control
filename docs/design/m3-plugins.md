@@ -2914,28 +2914,182 @@ FM-104, FM-118, FM-121, FM-124.
 
 ## 12. Timing (#24)
 
-`smc/plugins/timing/algorithm.py` and `plugin.py`, entry point `timing`,
-slot `timings`. A port of `timing.py` with its 19 tests; `Budget` and
-`plan()` stay in `algorithm.py`.
+`smc/plugins/timing/algorithm.py` and `plugin.py`, entry point
+`timing = "smc.plugins.timing.plugin:TimingPlugin"`, slot `timings`. A port
+of `timing.py` with its 19 tests; `Budget` and `plan()` stay in
+`algorithm.py`. `TimingsResult` (§3.5, `slots/timings.py`) is merged and does
+not change: `scan-plan` and `route` already read it.
 
 ```python
 class TimingParams(PluginParams):
     repeats: int = Field(3, ge=1, le=20)
     distances_um: tuple[float, float] = (200.0, 9000.0)
     with_autofocus: bool = True
-    channels: tuple[str, ...] = ()
+    channels: tuple[str, ...] = Field((), max_length=32)
 ```
 
-`requires = (XYStage, Camera)`. Stage: from the start, `+d` in X and back,
-`repeats` times per distance, the median of each, a line fit clamped at 0
-(`_fit_line`). Autofocus (when present, engaged, and `with_autofocus`):
-`repeats` × (`disengage()`, timed `engage()`); a sample that does not
-lock makes `refocus_ms` the assumed 400 ms with a note, as the port's
-regression test pins. `snap_ms`: the median of `repeats` bare snaps.
-Channels, when given: the port's switch and snap timings, the channel
-found restored on the normal path. The return to the start and the
-restored channel run only after a normal end (FM-88). A dry run is
-refused. **Failure modes**: FM-88, FM-64, FM-12.
+`requires = (XYStage, Camera)`, `reads = ()`, `reads_optional = ()`,
+`provides = "timings"`. `distances_um` is `(short, long)`: each in `(0,
+50 000]` and strictly increasing, since two equal distances fit no line
+(`fit_line` would return their mean as an overhead and a rate of 0, with no
+warning). `channels` holds no empty name and no repeat (a repeat would
+overwrite its own entry in `channel_ms`).
+
+**Refined while planning #24** (measured 2026-10-29 on the demo and on
+`FakeCore.demo_like()`, Python 3.13.0, pymmcore-plus as in the venv):
+
+- **What the demo costs.** A 200 µm move reads 25 ms, 9000 µm 904 ms (the
+  demo stage moves at 10 mm/s: the fit is an overhead of about 5 ms and
+  100 ms/mm). A snap reads 11 ms at a 10 ms exposure. `engage()` returns
+  `True` in 0.1 ms, from off and while on. The demo has `Autofocus` and
+  `Channels` (`Cy5`, `DAPI`, `FITC`, `Rhodamine`; current `DAPI`); a switch
+  reads 0.1 to 0.3 ms. `limits_um()` is `None`. The defaults take 5.5 s of
+  stage time on the demo.
+- **Stage.** `xy.wait()`, then `start = xy.position_um()` (FM-85); a start that
+  is not finite refuses the run before anything moves (FM-125). For each
+  distance, `repeats` times: `ctx.raise_if_stopped()`, the timed
+  `move_to_um(start.x_um + s·d, start.y_um)`, `ctx.raise_if_stopped()`, the
+  timed `move_to_um(start.x_um, start.y_um)`. `s` is `+1`, or `-1` when the
+  soft limits (`limits_um()`) put `start.x_um + d_long` outside the X travel and
+  `start.x_um - d_long` inside it; when neither fits, the run is refused before
+  anything moves, with the limits, the start and the distance in the text. With
+  limits `None` the moves go `+X` and `assumed` says `the stage reports no soft
+  limits: the probe moves were not checked against its travel`. The timed call
+  is the facade's `move_to_um`, which returns once the stage has arrived: the
+  cost the scan pays. The model's distance of a point is the **median of the
+  distances the stage read back** (FM-142), not the commanded one, and its time
+  is the median of its `2·repeats` samples. A move whose readback distance
+  differs from the one it was asked by more than `max(5 µm, 2 %)`, or is not
+  finite, is not a measurement of that distance: the loop completes (the stage
+  is back at the start), then the run fails with a `PluginRunError` that says
+  how far the stage went. The line fit is `fit_line`, clamped at 0, as in the
+  port.
+- **Autofocus.** Read **before any move**: `Autofocus` present, `with_autofocus`,
+  `is_engaged()` and `is_locked()`. The `is_locked()` read is what makes the
+  stand's offset a *seen* offset on a stand that declares
+  `engage_drives_z_to_offset` (m2 §12 D1; a `disengage()` does not forget it),
+  so the engage below is allowed there. Measured iff all four hold. Then,
+  `repeats` times: `ctx.raise_if_stopped()`; `is_engaged()`: if it is no longer
+  on, something else switched it off (the operator, or a lost lock that the
+  protocol answered), so the loop **does not switch it on** (FM-129) and stops;
+  `disengage()`, then the timed `engage()`. The first sample that does not lock
+  (`engage()` returns `False`) or whose `engage()` is refused
+  (`SafetyRefusedError`: nothing was sent) **ends the section**: another sample
+  would wait the whole lock timeout again, and a search drives Z. `refocus_ms`
+  is then `ASSUMED_REFOCUS_MS` (400) and `assumed` says why, how many samples
+  locked and their median (the median may exceed 400). Every other error
+  propagates, a halt and an excursion among them (FM-64): the port's `except
+  Exception` took them for "did not lock". Autofocus present but not measured
+  (`with_autofocus` false, off, or on but not locked): `refocus_ms = 400`,
+  assumed, saying which. Autofocus absent: `refocus_ms = None`. After the
+  section, if the plugin switched the autofocus off and it did not lock again,
+  it stays off and `assumed` says `the autofocus was switched off for the
+  measurement and did not lock again; engage it again before the scan`; the
+  plugin never engages it again after a non-lock (FM-88).
+- **Snap and channels.** `snap_ms` is the median of `repeats` bare snaps, at the
+  channel and exposure the stand has. With `channels`: the stand needs
+  `Channels` and every name must be one of `names()`, else the run is refused
+  before anything moves or switches. The channel found is `current()`; the
+  names are visited in the order given, except the one equal to the channel
+  found, which goes **last**, so that every timed switch changes channel (a
+  switch to the channel already selected can cost nothing and would pull the
+  median down). Per name: `ctx.raise_if_stopped()`, the timed `select(name)` (one
+  switch sample), then `repeats` timed snaps whose median is `channel_ms[name]`.
+  When the only name is the channel found, nothing is selected,
+  `channel_switch_ms` is `None`, and `assumed` says no switch was timed.
+  `channel_switch_ms` is the median of the switch samples, or `None` with no
+  `channels`. A `current()` of `None` (the stand matches no channel) cannot be
+  restored: a WARNING says the stand is left on the last channel, and the run
+  goes on. After a **normal** end, a stand not on the channel found is selected
+  back to it (a restore that raises propagates). `samples` counts the timed
+  operations whose median is in the result: `4·repeats` (stage), `repeats`
+  (autofocus, when measured), `repeats` (bare snaps), and per channel `repeats`
+  snaps plus the switch samples.
+- **Not normal.** After a stop, a halt or a fault nothing is restored and
+  nothing is caught (FM-88, FM-64): a WARNING per thing left, each read in its
+  own `try` (the stage between its two moves: where it is and where it started;
+  the autofocus the plugin switched off; the channel it left the stand on). A
+  stop is the `StopRequested` of `ctx.raise_if_stopped()`, so the record is
+  `stopped` and no slot is filled.
+- **Dry run** is refused with a `PluginRunError`: the calls that would be timed
+  are skipped, and their durations are not the stand's. No checkpoint is kept:
+  a stopped timing is measured again, and nothing half-done is stored (FM-106).
+- **Clock.** `time.perf_counter` through a module attribute `_clock` that the
+  helper `_time_ms(fn)` reads at call time, so a test replaces it
+  (`time.monotonic` ticks every 15.6 ms on Windows).
+
+```python
+ASSUMED_CHANNEL_SWITCH_MS = 100.0
+ASSUMED_REFOCUS_MS = 400.0
+
+
+def fit_line(points: Sequence[tuple[float, float]]) -> tuple[float, float]: ...
+def channel_cost_ms(timings: TimingsResult, channel: str) -> float: ...
+def position_ms(
+    timings: TimingsResult,
+    channels: Sequence[str],
+    move_um: float = 0.0,
+    *,
+    refocus: bool = True,
+) -> float: ...
+def describe_timings(timings: TimingsResult) -> list[str]: ...
+def plan(
+    timings: TimingsResult,
+    channels: Sequence[str],
+    interval_s: float,
+    *,
+    requested: int = 0,
+    move_um: float = 2000.0,
+    refocus: bool = True,
+    headroom: float = 0.8,
+    duration_h: float = 0.0,
+) -> Budget: ...
+```
+
+```python
+@dataclass(frozen=True, slots=True)
+class Budget:
+    per_position_ms: float
+    interval_s: float
+    positions: int
+    requested: int = 0
+    duration_h: float = 0.0
+    assumed: tuple[str, ...] = ()
+```
+
+`Budget` has the port's properties `timepoint_s`, `fits`, `timepoints`, `duty`
+and `describe()`. `fit_line` is the port's `_fit_line`, public. The three
+functions replace the methods of the port's `Timings`, which is now
+`TimingsResult`. `channel_cost_ms` is the channel's measured cost, else the
+mean of the measured channels, else `snap_ms` (the port returned 0, which
+counted an exposure as free). `position_ms` is `move_ms(move_um)`, plus
+`refocus_ms` when `refocus` and it is not `None`, plus, for each channel,
+`channel_switch_ms` (`ASSUMED_CHANNEL_SWITCH_MS` when it is `None`) and its
+cost; with no channel, one `snap_ms` and no switch. `plan` raises `ValueError`
+for an `interval_s` that is not finite and positive, a `headroom` outside
+`(0, 1]`, or a `requested`, `duration_h` or `move_um` that is not finite and at
+least 0 (FM-32; the port clamped a headroom). `Budget.assumed` is the timings'
+own `assumed`, plus a line for the switch cost that `plan` assumed and one for
+each channel whose cost is a mean or a bare snap. A per-position cost of 0
+gives `positions = 0`, as in the port. `describe_timings` is the port's
+`Timings.describe`: the move model, the refocus (`not applicable: no
+autofocus` for `None`), the switch (`not measured` for `None`), each channel,
+the snap, and the assumptions; the plugin logs it at INFO (`smc run -v`).
+There is no CLI command or page for `plan` in M3 (the scan takes one channel
+per field and has no interval): a program calls it, and a surface for it is a
+later issue.
+
+`scan-plan`'s plugin carries the timings' `assumed` into the plan's own
+`assumed` as `timings: <line>`, one per line, whenever it computes an
+estimate: an estimate whose refocus was assumed must not read as measured.
+
+**Tests** (the plan of #24 lists them): the port's twelve pure tests and its
+seven loop tests (the demo ones on the facade, the `FakeCore` ones on
+`fake_microscope`); a fake clock and a stage that advances it by a known cost
+make the fit exact (FM-124); a stage that stops short (FM-142); a PFS that
+never locks (FM-88, FM-118); a PFS switched off from outside (FM-129); a halt
+during the engage (FM-64). **Failure modes**: FM-12, FM-19, FM-43, FM-44,
+FM-64, FM-85, FM-88, FM-118, FM-124, FM-125, FM-129, FM-142.
 
 ## 13. The static report (#195)
 
