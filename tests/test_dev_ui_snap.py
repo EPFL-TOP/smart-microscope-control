@@ -501,23 +501,33 @@ def test_a_step_that_hangs_is_killed_and_named(snap, tmp_path) -> None:
 
 # --- what is read back -----------------------------------------------------
 
-# The two lines of a #277 session's log that name the failure: Tornado's ERROR
-# line and the start of the traceback it prints after it (copied from the
-# server.log of the script's first run).
+# What typing `A1:B2` in the Wells box wrote to the server's log (#277), copied from
+# the server.log of the script's first run, with the frames between cut out. Four
+# lines name the failure, two from Panel's callback and two from Bokeh's.
 _WELLS_LOG = (
-    "serving the plate page on http://localhost:5006/ - Ctrl-C stops it\n"
-    "2026-10-29 17:31:02,115 ERROR    tornado.application: Exception in callback\n"
+    "serving the plate page on http://localhost:62757/ - Ctrl-C stops it\n"
+    "2026-10-29 20:59:27,112 ERROR: panel.reactive - Callback failed for object "
+    "named 'Wells' changing properties {'value': 'A1:B2', 'value_input': 'A1:B2'} \n"
     "Traceback (most recent call last):\n"
-    '  File "panel/io/server.py", line 1, in wrapper\n'
-    "RuntimeError: _pending_writes should be non-None when we have a document lock\n"
+    '  File "panel/reactive.py", line 491, in _process_events\n'
+    "    self.param.update(**self_params)\n"
+    "RuntimeError: _pending_writes should be non-None when we have a document lock, "
+    "and we should have the lock when the document changes\n"
+    "ERROR:bokeh.util.asyncio:Error thrown from callback:\n"
+    "ERROR:bokeh.util.asyncio:Traceback (most recent call last):\n"
+    '  File "bokeh/server/session.py", line 297, in unlocked_callback\n'
+    "RuntimeError: _pending_writes should be non-None when we have a document lock, "
+    "and we should have the lock when the document changes\n"
 )
 
 
 def test_server_errors_finds_the_wells_traceback_and_ignores_a_clean_log(snap) -> None:
     found = snap.server_errors(_WELLS_LOG)
-    assert len(found) == 2
-    assert "ERROR" in found[0]
-    assert found[1].startswith("Traceback (most recent call last)")
+    assert len(found) == 4
+    assert "Callback failed for object named 'Wells'" in found[0]
+    assert found[1] == "Traceback (most recent call last):"
+    assert found[2] == "ERROR:bokeh.util.asyncio:Error thrown from callback:"
+    assert found[3].startswith("ERROR:bokeh.util.asyncio:Traceback")
     clean = "serving the plate page on http://localhost:5006/ - Ctrl-C stops it\n"
     assert snap.server_errors(clean) == []
     # A word that only contains the letters is not a log level.
