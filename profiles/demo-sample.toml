@@ -1,0 +1,70 @@
+# The demo devices of demo.toml, with a camera that images a synthetic plate.
+# Every other table is demo.toml's. Design: docs/design/m1-hardware-layer.md §8,
+# "The demo-sample stand" (#260); the table is loaded by smc.hardware.profile.
+
+[microscope]
+name = "demo-sample"
+vendor = "Micro-Manager"
+description = "The demo stand whose camera images a synthetic 96-well plate (smc.testing.sample_stand): for trying the plate tools without a microscope."
+
+[micromanager]
+config = ""                    # "" = the demo configuration shipped with the device adapters
+device_timeout_ms = 60000      # a plate traverse exceeds MMCore's 5 s default
+adapter_search_paths = []
+
+[roles.assign]                 # overrides only; anything not listed is resolved (core slots, then heuristics)
+# xy_stage = "XY"
+# objective_turret = "Objective"
+
+[roles.exclude]                # extra name substrings a role must never match
+# focus = ["piezo"]
+
+[safety]
+max_jog_um = 5000.0            # a relative move above this is refused unless forced
+max_z_jog_um = 100.0           # a relative Z move above this is refused unless forced
+z_soft_limits_um = [-1000.0, 1000.0]
+turret_requires_confirm = true
+# max_autofocus_offset_jog = 50.0                # in [autofocus] offset_unit; omitted: every relative offset change needs force=True
+# autofocus_offset_soft_limits = [0.0, 15000.0]  # in [autofocus] offset_unit; not forceable
+# stop_refused_by = []  # roles whose device refuses stop(): "xy_stage", "focus", "autofocus_offset"; measured at a stand (m2 §11)
+# max_engage_excursion_um = 50.0  # how far Z may move while the autofocus engages, beyond where it starts or held; omitted: only z_soft_limits_um bound it (m2 §12)
+
+[autofocus]
+# The demo's DAutoFocus measures nothing, so every key is left unknown.
+# offset_unit = ""          # what the offset's numbers are ("PFS offset steps"); "" = unknown, shown as "device units"
+# lock_timeout_s = 5.0      # engage() and the Z interlock wait this long for a lock; omitted: 5 s, assumed
+# offset_per_um = {}        # objective label -> offset change per µm of focus, measured with the autofocus locked; sign included
+# in_range_property = ""    # a property of the autofocus device that says whether its reference is in range; "" = the stand does not say
+# in_range_values = []      # the values of that property that mean "in range"; any other value means out of range
+# engage_drives_z_to_offset = false  # engaging drives Z to the plane the stored offset names; then the layer engages only at an offset it has seen locked (m2 §12)
+# settle_s = 0.0                     # after the first locked read, engage() waits until Z has been still this long; 0: the lock is taken as read
+# settle_tolerance_um = 0.5          # how far apart the Z reads of that window may lie
+
+[camera]
+# µm per pixel per objective label, at binning 1 and a magnification factor of
+# 1.0 (scaled by the current binning, divided by the core's factor); missing =
+# unknown (0.0), never guessed.
+pixel_size_um = { "Nikon 10X S Fluor" = 0.65, "Nikon 40X Plan Fluor ELWD" = 0.1625 }
+
+# [light_source]
+# intensity_property = ""   # the light_source device's property that sets how bright; "" = found by hints (m2 §8.4)
+
+# [channels]
+# group = ""                # the config group whose presets are channels; "" = chosen (m2 §8.5)
+# exclude = []              # device labels that capture() never records
+
+[quirks]
+# Behaviours the facade must encode for this stand. None for the simulator.
+
+[sample]
+# What the camera images: frames are rendered where the stage is, not imaged.
+# Only with the demo configuration (micromanager.config = "").
+plate = "96-well"              # a useq plate name ending in "-well"
+# a1_center_xy_um = [-49500.0, 31500.0]  # omitted: the plate centred on the stage origin, (-49500, 31500) for 96 wells
+rotation_deg = 0.0             # the plate's rotation about A1, in [-45, 45]
+camera_rotation_deg = 0.0      # the camera's, in [-180, 180]
+mirrored = false               # the image flipped left-right
+cells_per_well = 40            # the mean over the columns: half in the first, one and a half times in the last; at most 500
+doublet_fraction = 0.3         # the share of cells that are two spots side by side, in [0, 1]
+cell_radius_um = 5.0           # the radius of a cell's spot, in (0, 50]
+seed = 0                       # the same seed gives the same cells, texture and noise

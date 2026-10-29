@@ -295,8 +295,38 @@ class Microscope:
         """Wrap a core that is already loaded (tests, a ``FakeCore``); ``open`` minus loading.
 
         The facade then owns the core: :meth:`close` unloads its devices.
+
+        A profile with a ``[sample]`` table is the demo stand whose camera
+        images a synthetic plate: it is installed here, from the profile, so
+        ``open``, the CLI, the page and a notebook all get it (m1 §8, "The
+        demo-sample stand"). The module that does it is imported inside this
+        call, so that no other stand ever loads it.
+
+        Raises:
+            ProfileError: The profile has a ``[sample]`` and the stand's camera
+                is not the demo's; the facade is closed first.
         """
-        return cls(core, profile, dry_run=dry_run)
+        microscope = cls(core, profile, dry_run=dry_run)
+        if profile.sample is not None:
+            from smc.testing.sample_stand import install_sample
+
+            try:
+                install_sample(microscope, profile.sample)
+            except BaseException:
+                # The facade owns the core now, and the caller never gets it to
+                # close. A close that fails too must not replace the refusal the
+                # operator needs (FM-49): it is logged, and the refusal is raised.
+                try:
+                    microscope.close()
+                except Exception as exc:
+                    log.warning(
+                        "%s: closing after the failed [sample] install also "
+                        "failed (%s)",
+                        profile.microscope.name,
+                        exc,
+                    )
+                raise
+        return microscope
 
     @property
     def dry_run(self) -> bool:

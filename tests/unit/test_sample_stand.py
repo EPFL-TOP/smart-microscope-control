@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import logging
 import math
+import subprocess
+import sys
 import weakref
 from collections import Counter
 from typing import TYPE_CHECKING, cast
@@ -18,12 +20,13 @@ import numpy as np
 import numpy.typing as npt
 import pytest
 import useq
+from pymmcore_plus import DeviceType
 
-from smc.hardware.capabilities import Camera, ZStage
-from smc.hardware.errors import HardwareError, MicroscopeHaltedError
+from smc.hardware.capabilities import Camera, XYStage, ZStage
+from smc.hardware.errors import HardwareError, MicroscopeHaltedError, ProfileError
 from smc.hardware.microscope import Microscope
 from smc.hardware.profile import Profile, SampleSection
-from smc.testing import FakeCore
+from smc.testing import FakeCore, FakeDevice
 from smc.testing.sample_stand import (
     CELL_INTENSITY,
     CELL_REACH,
@@ -538,3 +541,118 @@ def test_an_installed_sample_camera_frees_the_core(no_cyclic_gc: None) -> None:
         "facade": False,
         "core": False,
     }
+
+
+# -- the facade installs it from the profile ------------------------------------------
+
+
+def _sample_profile(**sample: object) -> Profile:
+    return Profile.demo().model_copy(
+        update={"sample": SampleSection(**sample)}  # type: ignore[arg-type]
+    )
+
+
+def test_from_core_installs_the_sample_when_the_profile_has_one(
+    fake_core: FakeCore,
+) -> None:
+    microscope = Microscope.from_core(
+        cast("CMMCorePlus", fake_core), _sample_profile(cells_per_well=0)
+    )
+    try:
+        camera = microscope.require(Camera)
+        assert isinstance(camera, StandSampleCamera)
+        # The origin is plastic and E7 is a well: the frames follow the stage.
+        at_origin = float(camera.snap().mean())
+        microscope.require(XYStage).move_to_um(4500.0, -4500.0)
+        on_a_well = float(camera.snap().mean())
+        assert at_origin < 1500
+        assert on_a_well > 2500
+    finally:
+        microscope.close()
+
+
+def test_from_core_leaves_a_profile_without_a_sample_on_the_stands_own_camera(
+    fake_core: FakeCore,
+) -> None:
+    microscope = Microscope.from_core(cast("CMMCorePlus", fake_core), Profile.demo())
+    try:
+        assert not isinstance(microscope.require(Camera), StandSampleCamera)
+    finally:
+        microscope.close()
+
+
+def test_a_stand_without_a_sample_never_imports_the_sample_stand() -> None:
+    # In a fresh interpreter: another test may have imported the module already.
+    code = (
+        "import sys\n"
+        "from smc.hardware.microscope import Microscope\n"
+        "from smc.hardware.profile import Profile\n"
+        "from smc.testing import FakeCore\n"
+        "microscope = Microscope.from_core(FakeCore.demo_like(), Profile.demo())\n"
+        "microscope.close()\n"
+        "assert 'smc.testing.sample_stand' not in sys.modules, 'imported'\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-I", "-c", code], capture_output=True, text=True, check=False
+    )
+    assert done.returncode == 0, done.stderr
+
+
+def test_install_refuses_a_camera_that_is_not_the_demo_camera(
+    fake_core: FakeCore,
+) -> None:
+    fake_core._device("Camera").library = "PVCAM"
+
+    with pytest.raises(ProfileError, match="PVCAM") as info:
+        Microscope.from_core(cast("CMMCorePlus", fake_core), _sample_profile())
+
+    assert "DemoCamera" in str(info.value)
+    # The refusal closed the facade: the connection is not left held.
+    assert "unloadAllDevices()" in fake_core.log
+
+
+def test_install_refuses_a_stand_with_no_camera() -> None:
+    core = FakeCore([FakeDevice("XY", DeviceType.XYStage)], xy_stage="XY")
+
+    with pytest.raises(ProfileError, match="camera role"):
+        Microscope.from_core(cast("CMMCorePlus", core), _sample_profile())
+
+    assert "unloadAllDevices()" in core.log
+
+
+def test_a_failed_install_whose_close_also_fails_still_raises_the_refusal(
+    fake_core: FakeCore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # FM-49: the close is attempted, and its own failure is named without
+    # replacing the refusal the operator needs.
+    fake_core._device("Camera").library = "PVCAM"
+
+    def busy(self: Microscope) -> None:
+        raise HardwareError("another call holds the lock")
+
+    monkeypatch.setattr(Microscope, "close", busy)
+
+    with (
+        caplog.at_level(logging.WARNING, logger="smc.hardware.microscope"),
+        pytest.raises(ProfileError, match="PVCAM"),
+    ):
+        Microscope.from_core(cast("CMMCorePlus", fake_core), _sample_profile())
+
+    assert any("another call holds the lock" in r.getMessage() for r in caplog.records)
+
+
+def test_install_logs_that_the_frames_are_rendered(
+    fake_core: FakeCore, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO, logger="smc.testing.sample_stand"):
+        microscope = Microscope.from_core(
+            cast("CMMCorePlus", fake_core), _sample_profile(plate="384-well")
+        )
+    microscope.close()
+
+    assert any(
+        "synthetic 384-well plate" in r.getMessage() and r.levelno == logging.INFO
+        for r in caplog.records
+    )

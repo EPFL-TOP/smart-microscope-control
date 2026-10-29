@@ -9,7 +9,7 @@ import pytest
 import smc.hardware.backends.mm as mm
 import smc.hardware.profile as profile_module
 from smc.hardware.errors import HardwareError, ProfileError
-from smc.hardware.profile import Profile, list_profiles, search_paths
+from smc.hardware.profile import Profile, SampleSection, list_profiles, search_paths
 from smc.hardware.roles import Role
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -1138,6 +1138,28 @@ def test_profile_demo_has_no_sample() -> None:
     assert Profile.load(DEMO_TOML).sample is None
 
 
+DEMO_SAMPLE_TOML = REPO_ROOT / "profiles" / "demo-sample.toml"
+
+
+def test_demo_sample_toml_loads_and_names_its_sample() -> None:
+    loaded = Profile.load(DEMO_SAMPLE_TOML)
+
+    assert loaded.microscope.name == "demo-sample"
+    assert loaded.source == DEMO_SAMPLE_TOML.resolve()
+    # Every key of [sample] is written out at its default.
+    assert loaded.sample == SampleSection()
+    # The rest is the demo's, so a tool behaves as it does on `demo`.
+    rest = {"microscope", "sample"}
+    assert loaded.model_dump(exclude=rest) == Profile.demo().model_dump(exclude=rest)
+
+
+def test_demo_sample_toml_writes_every_sample_key() -> None:
+    # A key added to SampleSection without a line here would go undocumented.
+    text = DEMO_SAMPLE_TOML.read_text(encoding="utf-8")
+    for key in SampleSection.model_fields:
+        assert key in text
+
+
 def test_a_sample_table_is_refused_with_a_micromanager_config(tmp_path: Path) -> None:
     path = write_profile(
         tmp_path / "p.toml", '[micromanager]\nconfig = "stand.cfg"\n[sample]\n'
@@ -1278,7 +1300,12 @@ SHIPPED = sorted(PROFILES_DIR.glob("*.toml"))
 
 def test_the_profiles_directory_holds_the_profiles_this_repository_ships() -> None:
     # A glob that finds nothing would pass the parametrised test below by not running it.
-    assert {path.stem for path in SHIPPED} >= {"demo", "nikon-ti2", "nikon-tie"}
+    assert {path.stem for path in SHIPPED} >= {
+        "demo",
+        "demo-sample",
+        "nikon-ti2",
+        "nikon-tie",
+    }
 
 
 @pytest.mark.parametrize("path", SHIPPED, ids=lambda path: path.stem)
