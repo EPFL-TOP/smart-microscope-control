@@ -36,7 +36,7 @@ from dataclasses import dataclass
 import numpy as np
 import numpy.typing as npt
 
-from smc.plugins.geometry import Matrix2, footprint, pixel_of_stage
+from smc.plugins.geometry import Matrix2, footprint, fov_of, pixel_of_stage
 from smc.plugins.slots import Cell, WellGeometry
 
 __all__ = [
@@ -45,7 +45,6 @@ __all__ = [
     "TooMuchWork",
     "allowed",
     "choose_fields",
-    "fov_of",
     "order_route",
     "path_length_um",
 ]
@@ -127,20 +126,6 @@ def allowed(
     if exclude_centre_um <= 0.0:
         return True
     return _distance_to_polygon(well.center_um, corners) >= exclude_centre_um
-
-
-def fov_of(matrix: Matrix2, image_shape_px: tuple[int, int]) -> tuple[float, float]:
-    """``(width, height)`` of the frame's footprint in stage axes, in µm.
-
-    The extent of the four corners at the origin: for a camera turned by the
-    stage, the bounding box of the rotated frame. The candidate lattice's step
-    and the window that counts cells use it; the fields' own footprints stay the
-    rotated rectangle, so the overlap rule is on pixel offsets, not on this.
-    """
-    corners = footprint(0.0, 0.0, matrix=matrix, image_shape_px=image_shape_px)
-    xs = [x for x, _ in corners]
-    ys = [y for _, y in corners]
-    return (max(xs) - min(xs), max(ys) - min(ys))
 
 
 def choose_fields(

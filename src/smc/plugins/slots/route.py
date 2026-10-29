@@ -15,9 +15,11 @@ __all__ = ["RoutePosition", "RouteResult"]
 class RoutePosition(SlotValue):
     """One stop of the route: a field, its stage position and the cells it holds.
 
-    ``z_um`` and ``pfs_offset`` are what the scan recorded at that field,
-    ``None`` when it recorded none; ``counts`` are the wanted labels' cells in
-    the field.
+    ``z_um`` and ``pfs_offset`` are what the scan recorded, both from one frame,
+    at the nearest frame of the well that was not ``unlocked`` (the autofocus had
+    not lost the sample on it, FM-118): ``None`` when the well has no such frame,
+    and ``pfs_offset`` ``None`` also when that frame did not use the autofocus.
+    ``counts`` are the wanted labels' cells in the field.
     """
 
     order: int = Field(ge=0)
