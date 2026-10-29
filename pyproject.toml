@@ -52,6 +52,9 @@ dev = [
   "mypy>=1.10",
   "types-pyserial>=3.5",
   "pre-commit>=3.7",
+  # scripts/dev/ui_snap.py (/ui-check) looks at the plate page. 1.64 is the measured
+  # version (#268). The browser is a separate download: python -m playwright install chromium
+  "playwright>=1.64",
 ]
 # Cell detection (m3 §9): the trained Faster R-CNN; imported only inside TorchDetector.
 detect = ["torch>=2.2", "torchvision>=0.17"]
