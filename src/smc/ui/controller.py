@@ -382,7 +382,7 @@ class PlatePage:
         close_lines: What ``close()`` has to tell the operator about the run it
             stopped, as lines: ``<plugin> was stopped`` when the stand took the
             stop and the run ended stopped, else what the stop did and how the run
-            ended. ``()`` when no run was going: what ``smc ui plate`` says last.
+            ended. ``()`` when no run was going: what ``smc ui`` says last.
         close_ended: ``False`` when the run it stopped was still alive after the
             wait.
     """

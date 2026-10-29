@@ -297,6 +297,77 @@ def test_ui_plate_dry_run_opens_the_stand_dry(
     assert dry == [True]
 
 
+def _ui(*args: str, doc: Path, port: int | None = None) -> Result:
+    """``smc ui`` without the page word: the command as m5 §1 names it."""
+    return runner.invoke(
+        app, ["ui", "--run-doc", str(doc), "--port", str(port or _free_port()), *args]
+    )
+
+
+def test_ui_and_ui_plate_serve_the_same_page(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_stand: list[Microscope],
+    closes: list[Microscope],
+    tmp_path: Path,
+) -> None:
+    seen: list[tuple[type, Path, int, bool]] = []
+
+    def serve(page: PlatePage, *, port: int) -> None:
+        seen.append((type(page), page._run_doc, port, page._microscope.dry_run))
+
+    _stand_in(monkeypatch, serve)
+    doc = tmp_path / "run.json"
+    port = _free_port()
+    assert _ui("--dry-run", doc=doc, port=port).exit_code == 0
+    assert _plate("--dry-run", doc=doc, port=port).exit_code == 0
+    # The word may also come after the options, as Typer parses it.
+    after = runner.invoke(
+        app, ["ui", "--run-doc", str(doc), "--port", str(port), "--dry-run", "plate"]
+    )
+    assert after.exit_code == 0, after.output
+    assert seen == [(PlatePage, doc, port, True)] * 3
+    assert len(closes) == 3
+
+
+def test_ui_refuses_a_page_it_does_not_have(
+    monkeypatch: pytest.MonkeyPatch, no_stand: None, tmp_path: Path
+) -> None:
+    served: list[object] = []
+    _stand_in(monkeypatch, lambda page, *, port: served.append(page))
+    # The word is checked first: with a run document, and without one.
+    for args in (
+        ["ui", "other", "--run-doc", str(tmp_path / "run.json")],
+        ["ui", "other"],
+    ):
+        result = runner.invoke(app, args)
+        assert result.exit_code == 2, result.output
+        assert (
+            "✗ unknown page other: smc ui serves one page" in result.output.splitlines()
+        )
+        assert "--run-doc" not in result.output
+    assert served == []
+    assert not tmp_path.joinpath("run.json").exists()
+
+
+def test_ui_refuses_a_word_that_looks_like_markup_as_the_text_it_is(
+    no_stand: None,
+) -> None:
+    # FM-36: the word is the operator's, printed as it is.
+    result = runner.invoke(app, ["ui", "[red]plate[/red]"])
+    assert result.exit_code == 2, result.output
+    assert (
+        "✗ unknown page [red]plate[/red]: smc ui serves one page"
+        in result.output.splitlines()
+    )
+
+
+def test_ui_without_a_run_document_exits_2(no_stand: None) -> None:
+    result = runner.invoke(app, ["ui"])
+    assert result.exit_code == 2, result.output
+    assert "--run-doc" in _plain(result)
+    assert "a run needs --run-doc" in _plain(result)
+
+
 @pytest.fixture
 def demo(mm_available: bool) -> None:
     if not mm_available:
@@ -628,7 +699,15 @@ def test_smc_starts_without_importing_panel() -> None:
     assert done.returncode == 0, done.stderr
 
 
-def test_smc_ui_lists_its_pages() -> None:
+def test_smc_ui_help_says_what_it_serves_and_lists_its_options() -> None:
     result = runner.invoke(app, ["ui", "--help"])
     assert result.exit_code == 0, result.output
-    assert re.search(r"\bplate\b", _plain(result))
+    text = _plain(result)
+    assert "Serve the plate page" in text
+    for option in ("--profile", "--run-doc", "--port", "--dry-run"):
+        assert option in text
+    # `ui` is a command, not a group of pages, and the page word is not offered.
+    assert "Commands" not in text
+    assert "Arguments" not in text
+    top = runner.invoke(app, ["--help"])
+    assert re.search(r"\bui\b.*Serve the plate page", _plain(top))
