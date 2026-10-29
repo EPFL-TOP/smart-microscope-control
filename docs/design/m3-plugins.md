@@ -3004,9 +3004,11 @@ plugins through `EntryPoint`s (§1.12): `test_a_click_and_a_typed_range_build_th
 `test_run_goes_through_the_same_parameters_as_the_cli`;
 `test_a_second_run_while_one_runs_is_refused`; `test_stop_sets_the_event_then_stops_the_stand`;
 `test_captured_references_reach_plate_registration`;
-`test_the_view_shows_why_a_stage_is_unusable`. The page itself:
+`test_the_view_shows_why_a_stage_is_unusable`;
+`test_a_drive_click_on_another_plates_map_moves_nothing`. The page itself:
 `test_the_page_builds_on_the_demo` with `pytest.importorskip("panel")`;
-CI installs `.[dev,ui]` (#197 edits the workflow). **Failure modes**:
+CI's `test` job installs `.[dev,ui]` (#197 edits the workflow; `lint` keeps
+`.[dev]`, so that `mypy` is proved without the extra, §15.3). **Failure modes**:
 FM-98, FM-70 (the stop path takes no lock the worker holds), FM-44.
 
 ### 15.3 Refined while planning #197
@@ -3053,7 +3055,12 @@ Python 3.10.10 (what `panel>=1.4` resolves to on each today), macOS,
   builds under `warnings.simplefilter("error")` on both. The page uses those
   spellings, and its tests run with `PendingDeprecationWarning` as an error.
 - **Not measured**: a real browser (the click that raises `Tap`, the periodic
-  callback of a session, the look), Windows, RDP, a PC with no internet.
+  callback of a session, the look), Windows, RDP, a PC with no internet, and
+  the cost of `Microscope.state()` on a real stand. The one-second tick runs
+  it on Bokeh's server loop, the loop that also handles a click on STOP: a
+  device read that hangs in a vendor SDK would delay the STOP click, whatever
+  the lock (`state()` takes none, FM-16). The first hardware session times the
+  tick on the Ti2-E.
 
 **The types** (`smc/ui/controller.py`, no Panel import):
 
@@ -3233,7 +3240,17 @@ class PlatePage:
   `drive`, `goto`es it. It returns the well. The mode is the page's: `drive`
   is **one click**, and the page returns to *select* after it.
 - **`goto(well, side)`** is `run("goto-well", [f"well={well}", f"side={side}"])`
-  and sets `current`. **`capture_centre(well)`** and `capture_wall(well, side)`
+  and sets `current`. **It refuses a plate the map does not show.** `goto-well`
+  takes a well's name only and reads the registered plate (`reads = ("plate",)`,
+  `well_geometry(plate.to_plan(), params.well)`), while the map of a plate the
+  operator chose with `choose_plate` is the nominal one when the usable `plate`
+  slot names another: a click on C5 of the nominal 96-well map would drive the
+  stage to C5 of the registered 384-well plate, with nothing on the page to
+  say so. So `goto`, and `click` with `drive`, raise the `ValueError` of
+  `page_params("scan-plan")` for that mismatch (the same check, one private
+  helper), before `current` changes and before a thread starts. An unusable
+  `plate` slot needs no check here: `check_ready` refuses `goto-well` itself and
+  the refusal is the `outcome`. **`capture_centre(well)`** and `capture_wall(well, side)`
   normalise the well (`normalise_well`), refuse one that is not on `plate`
   (`ValueError`: `<well> is not a well of the <plate> plate`), and **replace**
   the earlier capture of the same well (and side): the operator centres it
@@ -3319,11 +3336,17 @@ the command, so `smc` starts without the extra), in this order:
    prints with exit 1.
 6. `page.close()` in a `finally`, then the stand is released by the `with`;
    exit 0 after a Ctrl-C (a server's normal end), the last line saying
-   `<plugin> was stopped` when `close()` stopped a run.
+   `<plugin> was stopped` when `close()` stopped a run. `serve` takes the
+   first Ctrl-C; a second one, during `close()`'s join, is the `_Reported`
+   wrapper's own `KeyboardInterrupt` path (its interrupted line, exit 130,
+   FM-71). It loses neither the stop, which `close()` sent **before** it
+   joined, nor the release of the stand, which the `with` does on any exit.
 
 The page listens on `localhost` only and takes no `--host`: it has no login, so
-whoever reaches the port can move the stage. A desk is reached by RDP or an SSH
-tunnel in M3.
+whoever reaches the port can move the stage. A desk is reached by RDP in M3. An
+SSH tunnel is not tried: Bokeh checks a websocket's origin against
+`localhost:<port>`, so it can work only with the same port number on both ends,
+and that is not verified; `docs/ui/plate-page.md` says so or leaves it out.
 
 **The page** (`smc/ui/plate_page.py`, the only module besides the command that
 imports Panel). Decided so that the executor guesses nothing:
@@ -3365,8 +3388,10 @@ imports Panel). Decided so that the executor guesses nothing:
 
 **Dependencies**: `ui = ["panel>=1.9,<2"]` (the oldest measured is 1.9.4 on
 Python 3.10; a floor below what CI resolves would be a claim nothing proves);
-CI's `lint` and `test` jobs install `.[dev,ui]`; `pyproject.toml` gains the
-mypy override above. The page's HTML is not checked offline.
+CI's `test` job installs `.[dev,ui]` and sets `SMC_REQUIRE_UI`; `lint` keeps
+`.[dev]`, so that `mypy` is proved without the extra, as a contributor who does
+not install it runs it; `pyproject.toml` gains the mypy override above. The
+page's HTML is not checked offline.
 
 **Failure modes**: FM-98, FM-70, FM-44, FM-117, FM-125, FM-30, FM-36, FM-37,
 FM-20, FM-24, FM-71, FM-73, FM-45, FM-50, and the entries the develop session
