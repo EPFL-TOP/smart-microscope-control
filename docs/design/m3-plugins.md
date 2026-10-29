@@ -1907,6 +1907,109 @@ and a coarse step; `test_an_engaged_autofocus_is_switched_off_and_not_relocked`
 (fake); `test_a_failed_fit_keeps_the_survey_for_a_resume`. **Failure
 modes**: FM-64, FM-88, FM-12.
 
+**Refined while planning #20** (measured 2026-10-28 on a prototype that is
+not committed: `plate_find.py` copied from `nikon-control@1aad7c9`, which
+holds it unchanged, with useq-schema 0.9.2, numpy 2.5.3, pydantic 2.13.5,
+pymmcore-plus 0.18.1, Python 3.13):
+
+- **The original tests pass on the copy**, all 16 that do not need
+  `nikon-control`'s `plate` and `wells`, also with `-W error::RuntimeWarning`.
+  They take 17 s together. One `fit` over the seven `-well` plates takes
+  about 2 s on a 96-well survey of 1120 points, and 7.9 s on a 1536-well
+  survey of 14 800 points.
+- **Units in names.** `PlateFit` has the fields `plate`, `a1_center_xy_um`,
+  `rotation_deg`, `score`, `polarity: Literal[1, -1]`, `n_samples`,
+  `n_inside` and `notes`, and keeps `usable` and `describe()`. The helpers
+  the tests use are public: `plate_pitch_um`, `plate_shape` (rows, columns),
+  `well_size_um`, `survey_bounds_um`, `grid_points`, `inside_mask`,
+  `lattice_score` and `fit_one`. The search's numbers (spans, step counts,
+  the order of the stages) do not change. The geometry may be computed once
+  per `fit_one` instead of once per score (about 0.5 s of the 2.9 s is
+  useq's validation), if the results stay the same.
+- **The survey is walked in snake order.** `grid_points` makes the same
+  points from the same seed as `plate_find.py`, row by row from the lowest Y,
+  and then reverses every other row. The demo stage moves at its `Velocity`
+  property, 10 mm/s by default: 3 mm takes 0.30 s and 30 mm 3.0 s. The
+  original raster ends every row with a return across the whole survey, 27
+  returns of 117 mm on a 96-well plate. The fit does not depend on the order.
+- **A bound on the number of points**, `MAX_SURVEY_POINTS = 25_000` (FM-74,
+  FM-32). `survey_points` counts the points in Python integers before it
+  makes any, and raises `ValueError` beyond the bound: `the survey would take
+  <n> points, more than 25000: give a larger step_um or a smaller
+  margin_pitches`. At the default step and margin a plate takes 130 (6-well),
+  208, 352, 616, 1120, 3952 and 14 800 (1536-well) points. At a margin of 5
+  the 1536-well plate takes 21 328.
+- **The extent check is a function of its own.** `survey_extent_note(points_um:
+  Sequence[tuple[float, float]], plate: str) -> str | None` is
+  `plate_find.py`'s check, and returns its text. `fit_one` puts that text in
+  its notes, as before. The plugin calls it twice, and each time a note is a
+  `PluginRunError`:
+  1. **Before anything moves**, on the planned points inside the soft limits,
+     for `params.plate`.
+  2. **After the fit**, on the sampled points, for the winner's plate. A
+     skipped edge, or a winner larger than the plate surveyed, can leave A1
+     unpinned. A fit that may be whole wells off is not usable.
+
+  A survey without margin still placed a 96-well plate within 440 µm while
+  the check reported it. Whether A1 is right is exactly what such a survey
+  cannot show, so it is refused, not reported.
+- **Soft limits are applied before the survey.** When `XYStage.limits_um()`
+  is not `None`, a planned point is kept when `low ≤ x ≤ high` on both axes,
+  which is the layer's own test (`check_xy_target_um`). The rest are not
+  visited, and `assumed` gains `<n> of <N> survey points are outside the
+  stage's soft limits and were not sampled`. On the demo and the fake,
+  `limits_um()` is `None`.
+- **On the Ti2-E as profiled, every plate is refused before it moves.** The
+  soft limits span 98 × 58 mm. The extent check needs the wells' span plus
+  one pitch: 108 × 72 mm for the 96- and 384-well plates, 116 × 77 mm for the
+  24-well plate. Whether the limits can be widened is the owner's call at
+  the stand (#198). At one pitch of margin, a 96-well survey (117 × 81 mm, ±
+  1.5 mm of jitter) stays inside the plate's SBS footprint of 127.8 × 85.5
+  mm. A 6-well survey (156 × 117 mm) and any larger margin do not.
+- **The checkpoint** is `SurveyCheckpoint(centre_um: tuple[float, float],
+  next_index: int, skipped: int, points: tuple[SurveyPoint, ...])`.
+  `next_index` counts the planned points handled, sampled or skipped, in the
+  list left after the soft limits. The centre is kept because without
+  parameters it is the stage's position at the start, and on a resume the
+  stage is elsewhere. A resume rebuilds the planned list from the parameters
+  and the kept centre. It is refused when `next_index` exceeds the list's
+  length, or `skipped + len(points) != next_index`, with `run plate-finding
+  without --resume`. A pydantic model built from Python objects does not
+  validate a nested dataclass instance again: a `SurveyPoint` holding `nan`
+  is accepted, and refused only when the JSON is read back. So the loop never
+  builds a `SurveyPoint` whose value is not finite. Such a point is a skipped
+  point (`the frame's <statistic> is not finite`).
+- **Skips.** `skipped * 10 > total`, checked at each skip in integers, where
+  `total` is the length of the planned list, saves the checkpoint and raises
+  `PluginRunError`: `<k> of <N> survey points could not be sampled, the last
+  at (<x>, <y>) µm: <Type>: <first line>; check the stage, then run
+  plate-finding --resume`. When the survey ends, `assumed` gains `<k> of <N>
+  survey points could not be sampled and were skipped` for `k > 0`.
+- **The statistic** is `frame_value(frame, statistic) -> float` in the
+  algorithm: `np.mean` or `np.std` with `dtype=np.float64`.
+- **The autofocus line** is `the autofocus was switched off for the survey;
+  engage it again before the scan`, logged as a WARNING when it is switched
+  off, and added to `assumed`. The autofocus is switched off only when
+  `is_engaged()` and at least one point is left to visit: a resume that only
+  fits moves nothing. On the fake, `disengage()` logs
+  `enableContinuousFocus(False)`.
+- **The result.** `PlateFit.to_result(*, runner_up: str | None, margin:
+  float | None, notes: Sequence[str], assumed: Sequence[str] = ()) ->
+  PlateResult`. `notes` are `decide`'s, which include the winner's own notes
+  and the "barely beats" note. The result is built once, never
+  `model_copy`'d. `runner_up` and `margin` (the winner's score minus the
+  runner-up's) are `None` when one plate was fitted.
+- **No move after the survey.** The stage stays at the last point. Nothing
+  returns, and the autofocus is never engaged again (FM-88).
+- **The demo test** sets the demo stage's `Velocity` to `100000` through
+  `microscope.core`. A 12-well `PlateSample` with A1 at (−40 000, 25 000) µm,
+  rotated by 1.2°, imaged as 24 × 32 frames at 20 µm per pixel, and surveyed
+  from a centre (700, −500) µm off: 208 points in 3.0 s, a fit in 1.5 s, the
+  12-well plate identified (score 0.88, runner-up 0.60), and the worst well
+  centre 0.23 of a well radius off. At the default velocity the same survey
+  takes 350 s. A 96-well survey takes 16 s even at the high velocity (14 ms
+  per point), too long for the default suite.
+
 ## 7. Wells and the scan plan (#21)
 
 `smc/plugins/scan_plan/wells.py`, `algorithm.py`, `plugin.py`, entry point
