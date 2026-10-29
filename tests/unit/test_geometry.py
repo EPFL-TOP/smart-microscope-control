@@ -19,6 +19,7 @@ import useq
 from smc.plugins.geometry import (
     Matrix2,
     footprint,
+    fov_of,
     pixel_matrix,
     pixel_of_stage,
     stage_of_pixel,
@@ -196,6 +197,43 @@ def test_footprint_of_a_rotated_frame_is_the_rotated_rectangle() -> None:
         (150.851, 133.282), abs=1e-3
     )
     assert (sum(xs) / 4, sum(ys) / 4) == pytest.approx((0.0, 0.0), abs=1e-9)
+
+
+# --- fov_of ------------------------------------------------------------------
+
+#: Two frames that are not square (FM-73), as the scan plan's and the route's tests use.
+WIDE_FRAME = (300, 512)  # (height, width)
+SMALL_FRAME = (60, 100)
+
+
+def test_fov_of_is_the_footprints_extent() -> None:
+    assert fov_of(pixel_matrix(0.5), WIDE_FRAME) == (256.0, 150.0)
+    assert fov_of(((1.0, 0.0), (0.0, -1.0)), SMALL_FRAME) == pytest.approx(
+        (100.0, 60.0)
+    )
+
+
+def test_fov_of_a_turned_camera_is_the_extent_in_stage_axes() -> None:
+    """The bounding box of the turned frame: swapped at 90 degrees (FM-73), the same for a mirrored camera."""
+    # A 512 x 300 frame turned by 30 degrees: 512 cos + 300 sin wide, 512 sin + 300 cos high.
+    width, height = fov_of(_matrix(1.0, 30.0, False), WIDE_FRAME)
+
+    assert width == pytest.approx(512 * math.cos(math.radians(30)) + 150.0)
+    assert height == pytest.approx(256.0 + 300 * math.cos(math.radians(30)))
+    # Mirroring flips the image, not the area it covers.
+    assert fov_of(_matrix(1.0, 30.0, True), WIDE_FRAME) == pytest.approx(
+        (width, height)
+    )
+    # Turned by 90°, the frame's width runs along Y: the extents swap.
+    assert fov_of(_matrix(1.0, 90.0, False), SMALL_FRAME) == pytest.approx(
+        (60.0, 100.0)
+    )
+    # At 45° both extents are (W + H) / sqrt(2): the bounding box of the turned rectangle.
+    expected = (100.0 + 60.0) / math.sqrt(2.0)
+    for mirrored in (False, True):
+        assert fov_of(_matrix(1.0, 45.0, mirrored), SMALL_FRAME) == pytest.approx(
+            (expected, expected)
+        )
 
 
 # --- wells -------------------------------------------------------------------

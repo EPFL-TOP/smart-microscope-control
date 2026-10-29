@@ -38,7 +38,6 @@ from smc.plugins.route.algorithm import (
     _pixel_offsets,
     allowed,
     choose_fields,
-    fov_of,
     order_route,
     path_length_um,
 )
@@ -1115,18 +1114,6 @@ def test_pixel_offsets_undo_stage_of_pixel(
 
     assert d_col[0] == pytest.approx(col - (width - 1) / 2.0, abs=1e-6)
     assert d_row[0] == pytest.approx(row - (height - 1) / 2.0, abs=1e-6)
-
-
-def test_the_field_of_view_is_the_extent_of_the_footprint() -> None:
-    assert fov_of(UPRIGHT, FRAME) == pytest.approx((100.0, 60.0))
-    # Turned by 90°, the frame's width runs along Y: the extents swap (FM-73).
-    assert fov_of(_matrix(1.0, 90.0, False), FRAME) == pytest.approx((60.0, 100.0))
-    # At 45° both extents are (W + H) / sqrt(2): the bounding box of the turned rectangle.
-    expected = (100.0 + 60.0) / math.sqrt(2.0)
-    for mirrored in (False, True):
-        assert fov_of(_matrix(1.0, 45.0, mirrored), FRAME) == pytest.approx(
-            (expected, expected)
-        )
 
 
 def test_counting_in_chunks_of_one_cell_equals_one_chunk(

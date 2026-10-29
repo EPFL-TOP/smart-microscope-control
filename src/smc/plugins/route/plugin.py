@@ -46,13 +46,12 @@ from pydantic import Field, field_validator
 from smc.hardware.capabilities import ObjectiveTurret
 from smc.plugins.api import PluginParams, RunContext
 from smc.plugins.errors import PluginRunError
-from smc.plugins.geometry import Matrix2, pixel_of_stage
+from smc.plugins.geometry import Matrix2, fov_of, pixel_of_stage
 from smc.plugins.route.algorithm import (
     ChosenField,
     LatticeTooLarge,
     TooMuchWork,
     choose_fields,
-    fov_of,
     order_route,
     path_length_um,
 )
