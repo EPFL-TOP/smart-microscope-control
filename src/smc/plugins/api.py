@@ -166,6 +166,9 @@ class RunContext:
             ``Path.as_posix()`` strings (a Windows ``str(Path)`` has backslashes,
             which another OS does not read as separators), so the folder moves
             as a whole.
+        run_doc: The run document's path as the runner was given it, for its
+            ``.name``. Never written by a plugin and never put in a result (a
+            report is attached to issues, FM-50): only the name is shown.
         dry_run: ``microscope.dry_run``, for a plugin that must label what it
             did not do.
     """
@@ -173,6 +176,7 @@ class RunContext:
     plugin: str
     logger: logging.Logger
     run_dir: Path
+    run_doc: Path
     dry_run: bool
 
     def __init__(
@@ -192,6 +196,7 @@ class RunContext:
         self.plugin = plugin
         self.logger = logging.getLogger(f"smc.plugins.{plugin}")
         self.run_dir = run_doc.parent
+        self.run_doc = run_doc
         self.dry_run = dry_run
         self._run_doc = run_doc
         self._snapshot = snapshot

@@ -25,9 +25,10 @@ each counted once; needs the `detect` extra and the trained weights),
 [`scan-plan`](scan-plan.md) (which wells and which fields of each to image, from the
 camera's real field of view), [`scan`](scan.md) (one TIFF per planned field, with
 the stage's readback and the focus state), [`density`](density.md) (the cells of each
-well and class, divided by the area that was imaged) and [`route`](route.md) (the
+well and class, divided by the area that was imaged), [`route`](route.md) (the
 fields that hold the most cells of the wanted classes, then the shortest route
-through them).
+through them) and [`report`](report.md) (one static HTML file: the plate's density
+per class, the cells and fields of each well, and the route).
 
 ## Running a plugin: `smc run`
 
@@ -175,6 +176,7 @@ a plugin never builds one.
 | `ctx.save_checkpoint(state)`, `ctx.checkpoint(Model)` | Save what you would not want to repeat after each unit (a well, a field); read the one an attempt resumed from. |
 | `ctx.logger` | `smc.plugins.<name>`. Log through it; `smc -v` shows it. A plugin never prints. |
 | `ctx.run_dir` | The folder of the run document. Write files under it and store their paths relative to it, as `Path.as_posix()` strings (a Windows `str(Path)` has backslashes, which another OS does not read as a separator), so the folder moves as a whole. |
+| `ctx.run_doc` | The run document's path as the runner was given it, for its `.name` (the report prints it). Never written by a plugin and never put in a result: a path does not go into a record or a report (FM-50). |
 | `ctx.dry_run` | `microscope.dry_run`, for a plugin that must label what it did not do. |
 
 A loop that can be stopped:
