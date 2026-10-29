@@ -17,6 +17,10 @@ harm or from lying:
 * **A halt is not a skipped point** (FM-64). A point that fails is counted and
   skipped; more than a tenth skipped ends the survey, and the checkpoint keeps
   what was sampled.
+* **A frame is placed where the stage says it was**, not where it was sent
+  (measured beats assumed). A stage that stops short of a target without an
+  error gives a survey that does not reach the plate's edges, and the extent
+  checks refuse it.
 * **A fit that cannot be trusted is not a result.** The extent is checked again
   after the fit, for the plate that won: a winner larger than the survey, or a
   survey with its edge skipped, can leave A1 a whole well off while the score is
@@ -265,6 +269,11 @@ class PlateFindingPlugin:
             raise PluginRunError(_NAME, problem + cut_clause)
 
         points, skipped, first = _resume(checkpoint, total)
+        if checkpoint is None:
+            # Before the first move: a survey stopped before its 50th point would
+            # leave nothing to keep the centre, and a resume would survey again
+            # around wherever the stage stopped (FM-111).
+            _save(ctx, centre, 0, 0, [])
         autofocus = microscope.get(Autofocus)
         if first < total and autofocus is not None and autofocus.is_engaged():
             autofocus.disengage()
@@ -276,8 +285,10 @@ class PlateFindingPlugin:
             x_um, y_um = kept[i]
             error: str | None = None
             value = math.nan
+            arrived = (math.nan, math.nan)
             try:
-                xy.move_to_um(x_um, y_um)
+                reached = xy.move_to_um(x_um, y_um)
+                arrived = (reached.x_um, reached.y_um)
                 value = frame_value(np.asarray(camera.snap()), params.statistic)
             except (MicroscopeHaltedError, MotionStoppedError):
                 raise
@@ -285,8 +296,13 @@ class PlateFindingPlugin:
                 error = _one_line(exc)
             if error is None and not math.isfinite(value):
                 error = f"the frame's {params.statistic} is not finite"
+            if error is None and not all(math.isfinite(c) for c in arrived):
+                error = "the stage's readback is not a finite position"
             if error is None:
-                points.append(SurveyPoint(x_um, y_um, value))
+                # Where the stage says it was, not where it was sent: a stage
+                # that stops short without an error would otherwise give A1 a
+                # whole well off, and the extent checks would pass on the plan.
+                points.append(SurveyPoint(arrived[0], arrived[1], value))
             else:
                 skipped += 1
                 if skipped * _SKIP_DENOMINATOR > total:

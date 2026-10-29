@@ -166,6 +166,69 @@ def test_a_96_well_plate_is_not_mistaken_for_a_384_well_one() -> None:
     assert by_plate["96-well"] > by_plate["384-well"] + DECISIVE_MARGIN
 
 
+#: What ``plate_find.py`` itself (``nikon-control`` at ``1aad7c9``) finds on the
+#: surveys of ``survey_for``, run once on the original with ``Survey`` built from
+#: the same points: ``(plate, a1, rotation, found A1, found rotation, score,
+#: samples in wells)``. The port gives the same A1 and rotation to the last bit and
+#: the score to 1e-16. The bound of 0.30 of a radius cannot tell the search's
+#: stages apart (without the refinement the worst error is 0.18 to 0.26 radius
+#: against 0.16 to 0.23 with it), so these are pinned to the original's numbers.
+#: In the first two the refinement leaves the rotation off the 0.02 degree grid of
+#: stage 1 (2.0667, -2.1267): a search without stage 3 cannot give them.
+ORIGINAL_FITS = [
+    (
+        "96-well",
+        (-3210.0, 15400.0),
+        1.7,
+        (-3466.5521693869914, 15269.02581834214),
+        2.066666666666672,
+        0.816821674141011,
+        278,
+    ),
+    (
+        "96-well",
+        (20000.0, -5000.0),
+        -2.3,
+        (20314.55630207539, -4750.995743314459),
+        -2.126666666666665,
+        0.7918733701057086,
+        272,
+    ),
+    (
+        "24-well",
+        (500.0, -500.0),
+        -0.8,
+        (1529.0678314025195, 214.81774625949765),
+        -0.559999999999997,
+        0.8037368874614773,
+        89,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("plate", "a1", "rotation", "found_a1", "found_rotation", "score", "n_inside"),
+    ORIGINAL_FITS,
+)
+def test_the_port_finds_what_plate_find_py_finds(
+    plate: str,
+    a1: tuple[float, float],
+    rotation: float,
+    found_a1: tuple[float, float],
+    found_rotation: float,
+    score: float,
+    n_inside: int,
+) -> None:
+    """The four stages are ported unchanged: the same survey gives the original's numbers."""
+    fitted = fit_one(survey_for(plate, a1, rotation), plate)
+
+    assert fitted.a1_center_xy_um == pytest.approx(found_a1, abs=0.01)
+    assert fitted.rotation_deg == pytest.approx(found_rotation, abs=1e-6)
+    assert fitted.score == pytest.approx(score, abs=1e-9)
+    assert fitted.n_inside == n_inside
+    assert fitted.polarity == 1
+
+
 # ------------------------------------------------- why it is built this way
 
 
@@ -251,6 +314,19 @@ def test_a_close_call_between_plate_types_is_flagged() -> None:
     assert any("barely beats" in note for note in notes)
 
 
+def test_a_clear_win_between_plate_types_is_not_flagged() -> None:
+    clear = [
+        PlateFit("96-well", (0, 0), 0.0, 0.90, 1, 100, 20),
+        PlateFit("384-well", (0, 0), 0.0, 0.50, 1, 100, 20),
+    ]
+
+    best, notes = decide(clear)
+
+    assert best is not None
+    assert best.plate == "96-well"
+    assert notes == ()
+
+
 # ------------------------------------------------------------- the output
 
 
@@ -271,6 +347,7 @@ def test_a_fit_becomes_the_plate_result_a_registration_produces() -> None:
     assert result.refs == ()
     assert result.plate == "96-well"
     assert result.a1_center_xy_um == best.a1_center_xy_um
+    assert result.rotation_deg == best.rotation_deg
     assert result.fit is not None
     assert result.fit.score == best.score
     assert result.fit.polarity == best.polarity
@@ -293,6 +370,8 @@ def test_to_result_without_a_runner_up_has_no_margin() -> None:
         runner_up=None, margin=None, notes=("a note",), assumed=("an assumption",)
     )
 
+    assert result.a1_center_xy_um == (10.0, 20.0)
+    assert result.rotation_deg == 0.5
     assert result.fit is not None
     assert result.fit.runner_up is None
     assert result.fit.margin is None
@@ -483,6 +562,27 @@ def test_the_extent_note_names_what_the_plate_needs() -> None:
     )
     assert survey_extent_note([], "96-well") is None
     assert survey_extent_note([(0.0, 0.0)], "96-well") is None
+
+
+def test_the_extent_is_judged_on_each_axis_apart() -> None:
+    """A survey long enough in x and short in y (or the reverse) cannot pin A1 down either.
+
+    A 96-well plate needs 108 x 72 mm. The two surveys are corner to corner: the
+    first spans 120 x 10 mm, the second 10 x 80 mm.
+    """
+    wide_and_short = [(-60_000.0, -5000.0), (60_000.0, 5000.0)]
+    narrow_and_long = [(-5000.0, -40_000.0), (5000.0, 40_000.0)]
+    both_enough = [(-54_000.0, -36_000.0), (54_000.0, 36_000.0)]
+    needs = "this plate needs 108x72 mm — one pitch of margin past the outer wells"
+    pinned = "or which well is A1 cannot be pinned down"
+
+    assert survey_extent_note(wide_and_short, "96-well") == (
+        f"the survey spans 120x10 mm; {needs} — {pinned}"
+    )
+    assert survey_extent_note(narrow_and_long, "96-well") == (
+        f"the survey spans 10x80 mm; {needs} — {pinned}"
+    )
+    assert survey_extent_note(both_enough, "96-well") is None
 
 
 def test_a_fit_notes_the_extent_it_was_given() -> None:

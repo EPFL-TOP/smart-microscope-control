@@ -27,7 +27,7 @@ import threading
 import weakref
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -36,7 +36,11 @@ from pydantic import ValidationError
 
 from smc.hardware import Microscope
 from smc.hardware.capabilities import XY, Autofocus, Camera, FocusStep, Limits, XYStage
-from smc.hardware.errors import DeviceTimeoutError, MicroscopeHaltedError
+from smc.hardware.errors import (
+    DeviceTimeoutError,
+    MicroscopeHaltedError,
+    MotionStoppedError,
+)
 from smc.hardware.profile import Profile
 from smc.plugins import PluginRunError, Progress, load, run_plugin
 from smc.plugins.plate_finding.algorithm import (
@@ -108,16 +112,32 @@ class _Camera(SampleCamera):
 
 
 class _Stage:
-    """The stand's XY stage, except that every ``every``-th move times out; the others delegate.
+    """The stand's XY stage, except where a test makes a move misbehave; the others delegate.
+
+    Every ``every``-th move times out; ``raises`` maps a move number to what it
+    raises; ``clamp_x_um`` sends the stage no further than that in x and returns
+    where it really is (a stall, a hard stop); ``nan_readback_at`` is a move that
+    arrives and reads back a position that is not finite.
 
     It implements the seven methods of ``XYStage``: ``Microscope.override``
     refuses an implementation that lacks one. It bypasses the ``Executor``, so it
     is never used where a halt is the point.
     """
 
-    def __init__(self, inner: XYStage, *, every: int) -> None:
+    def __init__(
+        self,
+        inner: XYStage,
+        *,
+        every: int = 10**9,
+        raises: dict[int, BaseException] | None = None,
+        clamp_x_um: float | None = None,
+        nan_readback_at: int | None = None,
+    ) -> None:
         self._inner = inner
         self._every = every
+        self._raises = raises or {}
+        self._clamp_x_um = clamp_x_um
+        self._nan_readback_at = nan_readback_at
         self.moves = 0
         self.calls: list[str] = []
 
@@ -127,11 +147,19 @@ class _Stage:
 
     def move_to_um(self, x_um: float, y_um: float) -> XY:
         self.moves += 1
+        if self.moves in self._raises:
+            raise self._raises[self.moves]
         if self.moves % self._every == 0:
             raise DeviceTimeoutError(
                 f"xy_stage did not arrive within 30 s (move {self.moves})\nretry"
             )
-        return self._inner.move_to_um(x_um, y_um)
+        if self._clamp_x_um is not None:
+            limit = self._clamp_x_um
+            x_um = max(-limit, min(limit, x_um))
+        reached = self._inner.move_to_um(x_um, y_um)
+        if self.moves == self._nan_readback_at:
+            return XY(math.nan, math.nan)
+        return reached
 
     def move_by_um(self, dx_um: float, dy_um: float, *, force: bool = False) -> XY:
         raise AssertionError("plate-finding makes no relative move")
@@ -279,6 +307,30 @@ def open_limited(mm_available: bool) -> Iterator[Callable[..., Microscope]]:
         microscope.close()
 
 
+@pytest.fixture
+def open_limited_fake(fake_core: FakeCore) -> Iterator[Callable[..., Microscope]]:
+    """The fake core's stand with XY soft limits given: instant moves, no Micro-Manager."""
+    opened: list[Microscope] = []
+
+    def make(limits: tuple[tuple[float, float], tuple[float, float]]) -> Microscope:
+        profile = Profile.demo()
+        limited = profile.model_copy(
+            update={
+                "safety": profile.safety.model_copy(
+                    update={"xy_soft_limits_um": limits}
+                )
+            }
+        )
+        # The facade types its core as CMMCorePlus; the fake is structural.
+        microscope = Microscope.from_core(cast("Any", fake_core), limited)
+        opened.append(microscope)
+        return microscope
+
+    yield make
+    for microscope in opened:
+        microscope.close()
+
+
 # ----------------------------------------------------------------- the helpers
 
 
@@ -414,6 +466,14 @@ def test_the_survey_fills_the_plate_slot_on_the_demo(
         for col in range(4)
     )
     assert worst < 0.30 * RADIUS_UM, f"{worst:.0f} µm off"
+    # A1 is what the scan plan is built from. The turn of a plate this small is
+    # coarse (-0.3 degrees for 1.2: the original does the same, the unit test pins it).
+    assert math.dist(result.a1_center_xy_um, centre) < 0.30 * RADIUS_UM
+    # A decision, not a coin toss: another plate came second, well behind, and
+    # nothing is said about a close call.
+    assert result.fit.runner_up != result.plate
+    assert 0.0 < result.fit.margin < result.fit.score
+    assert result.fit.notes == ()
     assert result.assumed == ()
     assert (progress[-2].done, progress[-2].total, progress[-2].message) == (
         208,
@@ -624,6 +684,47 @@ def test_a_stopped_survey_resumes_where_its_checkpoint_left_it(
     assert result.plate == "12-well"
 
 
+def test_a_survey_stopped_before_its_first_periodic_checkpoint_resumes_around_its_own_centre(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """The checkpoint is saved before the first move, so a stop at point 30 keeps the centre (FM-111).
+
+    Without it a resume would survey again around wherever the stage stopped:
+    here 208 points from -112 mm to +21 mm in x, up to 46 mm past the plate's edge.
+    """
+    camera = _on_fake(fake_microscope, _plate_at((0.0, 0.0)))
+    stop = threading.Event()
+
+    def stop_at_30(progress: Progress) -> None:
+        if progress.done == 30:
+            stop.set()
+
+    first = _run(
+        fake_microscope,
+        tmp_path,
+        plates=["12-well"],
+        on_progress=stop_at_30,
+        stop=stop,
+    )
+
+    assert first.status is StageStatus.stopped
+    assert camera.snaps == 30
+    assert first.checkpoint is not None
+    assert first.checkpoint["centre_um"] == [0.0, 0.0]
+    assert first.checkpoint["next_index"] == 0
+    assert _here(fake_microscope) != pytest.approx((0.0, 0.0), abs=1000.0)
+    planned = survey_points("12-well", (0.0, 0.0))
+
+    camera.positions.clear()
+    record = _run(fake_microscope, tmp_path, resume=True, plates=["12-well"])
+
+    result = _result(record)
+    assert camera.positions[0] == pytest.approx(planned[0], abs=0.05)
+    assert _flat(camera.positions) == pytest.approx(_flat(planned), abs=0.05)
+    assert result.fit is not None
+    assert result.fit.n_samples == 208
+
+
 def test_a_checkpoint_that_is_not_this_surveys_is_refused_before_anything_moves(
     fake_microscope: Microscope, tmp_path: Path
 ) -> None:
@@ -685,6 +786,86 @@ def test_a_halt_ends_the_survey_and_is_not_a_skipped_point(
     assert camera.snaps == 10
 
 
+def test_a_stopped_move_ends_the_survey_and_is_not_a_skipped_point(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """FM-64: ``MotionStoppedError`` is a ``HardwareError``, and the stage is not where the loop believes it is."""
+    camera = _on_fake(fake_microscope, _plate_at())
+    stage = _Stage(
+        fake_microscope.require(XYStage),
+        raises={20: MotionStoppedError("xy_stage XY")},
+    )
+    fake_microscope.override(XYStage, stage)
+
+    with pytest.raises(MotionStoppedError):
+        _run(fake_microscope, tmp_path, plates=["12-well"])
+
+    assert _stored(tmp_path).status is StageStatus.failed
+    assert _stored(tmp_path).result is None
+    # Nothing carried on to the next point.
+    assert stage.moves == 20
+    assert camera.snaps == 19
+
+
+def test_an_error_that_is_not_the_stands_propagates_and_is_not_a_skipped_point(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """Only a ``HardwareError`` is a point that failed: a programming error ends the run."""
+
+    def broken_at_5(snap: int) -> None:
+        if snap == 5:
+            raise ValueError("a frame of the wrong kind")
+
+    camera = _on_fake(fake_microscope, _plate_at(), before=broken_at_5)
+
+    with pytest.raises(ValueError, match="a frame of the wrong kind"):
+        _run(fake_microscope, tmp_path, plates=["12-well"])
+
+    assert _stored(tmp_path).status is StageStatus.failed
+    assert camera.snaps == 5
+
+
+def test_a_stage_that_stops_short_without_an_error_is_not_believed(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """A frame is placed where the stage says it was, not where it was sent.
+
+    The stage reaches no further than 45 mm in x and reports where it is. Placed
+    at the commanded positions the frames gave a fit of the 12-well plate 26 mm
+    (a whole pitch) off, ``done``, with nothing in ``assumed``. Placed where they
+    were taken the survey spans 90 mm in x, 14 mm short of what the plate needs,
+    and is refused.
+    """
+    camera = _on_fake(fake_microscope, _plate_at())
+    fake_microscope.override(
+        XYStage, _Stage(fake_microscope.require(XYStage), clamp_x_um=45_000.0)
+    )
+
+    reason = _refusal(fake_microscope, tmp_path, plates=["12-well"])
+
+    assert "A1 cannot be pinned down" in reason
+    assert camera.snaps == 208
+    assert max(x for x, _ in camera.positions) == pytest.approx(45_000.0, abs=0.05)
+
+
+def test_a_readback_that_is_not_finite_is_a_skipped_point(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    _on_fake(fake_microscope, _plate_at())
+    fake_microscope.override(
+        XYStage, _Stage(fake_microscope.require(XYStage), nan_readback_at=40)
+    )
+
+    record = _run(fake_microscope, tmp_path, plates=["12-well"])
+
+    result = _result(record)
+    assert result.assumed == (
+        "1 of 208 survey points could not be sampled and were skipped",
+    )
+    assert result.fit is not None
+    assert result.fit.n_samples == 207
+
+
 def test_a_few_failed_points_are_skipped_and_counted(
     fake_microscope: Microscope, tmp_path: Path
 ) -> None:
@@ -733,12 +914,13 @@ def test_failed_points_beyond_ten_percent_fail_the_survey(
     reason = _refusal(fake_microscope, tmp_path, plates=["12-well"])
 
     # Move 105 is the 21st failure, and 21 * 10 = 210 is the first count above 208.
-    assert reason.startswith(
-        "plate-finding: 21 of 208 survey points could not be sampled, the last at ("
-    )
-    assert reason.endswith(
-        "µm: DeviceTimeoutError: xy_stage did not arrive within 30 s (move 105); "
-        "check the stage, then run plate-finding --resume"
+    # It was sent to planned point 104, and that is the one named.
+    x_um, y_um = survey_points("12-well", (0.0, 0.0))[104]
+    assert reason == (
+        "plate-finding: 21 of 208 survey points could not be sampled, the last at "
+        f"({x_um:.1f}, {y_um:.1f}) µm: DeviceTimeoutError: xy_stage did not "
+        "arrive within 30 s (move 105); check the stage, then run plate-finding "
+        "--resume"
     )
     stored = _stored(tmp_path)
     assert stored.checkpoint is not None
@@ -854,6 +1036,64 @@ def test_a_survey_the_soft_limits_cut_is_refused_before_moving(
     assert _here(microscope) == before
     assert not MUTATING & set(spy.calls)
     assert spy.engaged is True
+
+
+@pytest.mark.parametrize(
+    ("limits", "limits_text"),
+    [
+        # Wide enough in x for the 12-well plate (130 mm, it needs 104), cut in y.
+        (
+            ((-70_000.0, 70_000.0), (-30_000.0, 30_000.0)),
+            "x [-70000, 70000], y [-30000, 30000]",
+        ),
+        # The reverse: long enough in y (104 mm, it needs 78), cut in x.
+        (
+            ((-40_000.0, 40_000.0), (-60_000.0, 60_000.0)),
+            "x [-40000, 40000], y [-60000, 60000]",
+        ),
+    ],
+    ids=["cut-in-y", "cut-in-x"],
+)
+def test_a_survey_the_limits_cut_on_one_axis_only_is_refused_before_moving(
+    open_limited: Callable[..., Microscope],
+    tmp_path: Path,
+    limits: tuple[tuple[float, float], tuple[float, float]],
+    limits_text: str,
+) -> None:
+    microscope = open_limited(limits)
+    camera = _on_demo(microscope, _plate_at())
+    before = _here(microscope)
+
+    reason = _refusal(microscope, tmp_path, plates=["12-well"])
+
+    assert reason.startswith("plate-finding: the survey spans ")
+    assert f"; the stage's soft limits {limits_text} µm cut the survey: " in reason
+    assert camera.snaps == 0
+    assert _here(microscope) == before
+
+
+def test_limits_that_cut_nothing_say_nothing_and_a_point_on_a_limit_is_visited(
+    open_limited_fake: Callable[..., Microscope], tmp_path: Path
+) -> None:
+    """The layer's own test is ``low <= v <= high``: a point exactly on a limit is inside.
+
+    The limits are the survey's own extremes, so every planned point is on or
+    inside them; a strict comparison would drop the points on the edge, and a
+    survey that cuts nothing would still claim that the limits cut some.
+    """
+    planned = survey_points("12-well", (0.0, 0.0))
+    xs = [p[0] for p in planned]
+    ys = [p[1] for p in planned]
+    microscope = open_limited_fake(((min(xs), max(xs)), (min(ys), max(ys))))
+    camera = _on_fake(microscope, _plate_at())
+
+    record = _run(microscope, tmp_path, plates=["12-well"])
+
+    result = _result(record)
+    assert result.assumed == ()
+    assert camera.snaps == 208
+    assert result.fit is not None
+    assert result.fit.n_samples == 208
 
 
 def test_a_survey_with_no_point_inside_the_limits_is_refused(
