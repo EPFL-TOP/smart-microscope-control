@@ -37,6 +37,7 @@ if os.environ.get("SMC_REQUIRE_UI"):
 else:
     pn = pytest.importorskip("panel")
 
+import numpy as np
 import useq
 from bokeh.events import Tap
 from bokeh.models import Circle, Rect
@@ -44,7 +45,7 @@ from pymmcore_plus import CMMCorePlus
 
 import smc.ui.plate_page as plate_page
 from smc.hardware import Microscope
-from smc.hardware.capabilities import LightSource, XYStage
+from smc.hardware.capabilities import Camera, LightSource, XYStage
 from smc.hardware.profile import Profile
 from smc.plugins.api import PluginParams, PluginResult, RunContext
 from smc.plugins.registry import GROUP
@@ -55,8 +56,10 @@ from smc.ui.controller import (
     PageServerError,
     PageStatus,
     PlatePage,
+    ResultCard,
 )
-from smc.ui.plate_page import PlatePageView, build, serve
+from smc.ui.frames import display_image
+from smc.ui.plate_page import PlatePageView, build, card_text, serve
 
 pytestmark = pytest.mark.filterwarnings(
     "error::DeprecationWarning", "error::PendingDeprecationWarning"
@@ -99,6 +102,21 @@ class SlowScan:
         SlowScan.started.set()
         while not SlowScan.release.is_set():
             ctx.wait_s(0.05)
+        return NoResult()
+
+
+class QuickTool:
+    """A tool that ends at once: no tick of another tab can fall inside its run."""
+
+    name = provides = "quick"
+    summary = "A test plugin that ends at once."
+    Params = NoParams
+    Result = NoResult
+    requires: tuple[type, ...] = ()
+    reads: tuple[str, ...] = ()
+    reads_optional: tuple[str, ...] = ()
+
+    def run(self, microscope: Any, params: NoParams, ctx: RunContext) -> NoResult:
         return NoResult()
 
 
@@ -212,6 +230,7 @@ def _wells_by_name(view: PlatePageView) -> dict[str, dict[str, Any]]:
 
 def _status(**changes: Any) -> PageStatus:
     base: dict[str, Any] = {
+        "stand": "demo",
         "dry_run": False,
         "running": None,
         "progress": None,
@@ -242,7 +261,13 @@ def test_the_page_builds_every_tool_the_registry_holds_in_workflow_order(
     page: PlatePage,
 ) -> None:
     view = PlatePageView(page)
-    assert list(view.tool_runs) == ["plate-registration", "scan-plan", "scan"]
+    # `goto-well` is no stage of the workflow: it follows under `More`.
+    assert list(view.tool_runs) == [
+        "plate-registration",
+        "scan-plan",
+        "scan",
+        "goto-well",
+    ]
     assert list(view.tool_fields["scan-plan"]) == [
         "objective",
         "overlap",
@@ -255,6 +280,394 @@ def test_the_page_builds_every_tool_the_registry_holds_in_workflow_order(
     ]
     assert "wells" not in view.tool_fields["scan-plan"]
     assert set(view.tool_fields["plate-registration"]) == {"max_rotation_deg"}
+
+
+# --- the image, Snap and the result cards ----------------------------------------------
+
+
+class FrameCamera:
+    """The six methods of ``Camera``, handing out ``frame``; a blocking snap is released by the test."""
+
+    def __init__(
+        self, frame: np.ndarray, *, bit_depth: int = 16, block: bool = False
+    ) -> None:
+        self.frame = frame
+        self._bit_depth = bit_depth
+        self._block = block
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def snap(self) -> np.ndarray:
+        self.entered.set()
+        if self._block:
+            assert self.release.wait(10), "the test never released the snap"
+        return self.frame
+
+    def exposure_ms(self) -> float:
+        return 5.0
+
+    def set_exposure_ms(self, value_ms: float) -> float:
+        return value_ms
+
+    def image_shape(self) -> tuple[int, int]:
+        return (int(self.frame.shape[0]), int(self.frame.shape[1]))
+
+    def bit_depth(self) -> int:
+        return self._bit_depth
+
+    def pixel_size_um(self) -> float:
+        return 0.65
+
+
+def _rows_columns(rows: int, columns: int) -> np.ndarray:
+    """``row * 1000 + column``: not symmetric, so a flip or a transposition shows."""
+    grid = np.arange(rows)[:, None] * 1000 + np.arange(columns)[None, :]
+    return grid.astype(np.uint16)
+
+
+def _snap_and_draw(view: PlatePageView, page: PlatePage) -> None:
+    view.snap_button.clicks += 1
+    assert page.join(10.0)
+    view.tick()
+
+
+def test_a_snap_is_drawn_by_the_next_tick_flipped_and_at_the_frames_size(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    fake_microscope.override(Camera, FrameCamera(_rows_columns(6, 10), bit_depth=14))
+    view = PlatePageView(page)
+    assert view.image_figure.title.text == "no frame yet"
+    assert view.tabs.active == 0
+    _snap_and_draw(view, page)
+    frame = page.frame()
+    assert frame is not None
+    drawn = view.image_source.data
+    # Bokeh draws the first row at the bottom: the camera's top row is the last.
+    expected = display_image(frame.image, bit_depth=14)[::-1]
+    assert drawn["image"][0].shape == (6, 10)
+    assert (drawn["image"][0] == expected).all()
+    assert (drawn["image"][0][-1] == display_image(frame.image, bit_depth=14)[0]).all()
+    assert list(drawn["dw"]) == [10]
+    assert list(drawn["dh"]) == [6]
+    assert view.image_figure.title.text == frame.summary
+    assert view.tabs.active == 1
+    # The models with a frame in them still build, with the image tab active.
+    assert view.layout.get_root() is not None
+
+
+def test_a_flat_frame_is_drawn_against_the_cameras_own_bit_depth(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # A saturated 12-bit frame is white and a mid-grey one is mid-grey: the camera's
+    # bit depth reaches `display_image`, or 4095 of 16 bits would be near black.
+    camera = FrameCamera(np.full((6, 10), 4095, dtype=np.uint16), bit_depth=12)
+    fake_microscope.override(Camera, camera)
+    view = PlatePageView(page)
+    _snap_and_draw(view, page)
+    assert (view.image_source.data["image"][0] == 255).all()
+    camera.frame = np.full((6, 10), 2048, dtype=np.uint16)
+    _snap_and_draw(view, page)
+    assert (view.image_source.data["image"][0] == 127).all()
+    camera.frame = np.zeros((6, 10), dtype=np.uint16)
+    _snap_and_draw(view, page)
+    assert (view.image_source.data["image"][0] == 0).all()
+
+
+def test_the_centre_has_a_plate_tab_and_an_image_tab_drawn_only_when_seen(
+    page: PlatePage,
+) -> None:
+    view = PlatePageView(page)
+    assert list(view.tabs._names) == ["Plate", "Image"]
+    # Only the active tab is rendered, so a figure is never laid out hidden.
+    assert view.tabs.dynamic is True
+    assert view.tabs.active == 0
+
+
+def test_a_tool_that_ends_between_two_ticks_of_another_tab_is_drawn_there_too(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    quick = EntryPoint(name="quick", value=f"{__name__}:QuickTool", group=GROUP)
+    controller = PlatePage(fake_microscope, run_doc, entry_points=[quick])
+    try:
+        first = PlatePageView(controller)
+        second = PlatePageView(controller)
+        second.tick()
+        assert second.tool_cards["quick"].object == ""
+        first.on_run("quick")
+        assert controller.join(10.0)
+        # The run was over before `second` looked: it was never seen running.
+        second.tick()
+        first.tick()
+        assert first.tool_cards["quick"].object.startswith("done ")
+        assert second.tool_cards["quick"].object == first.tool_cards["quick"].object
+    finally:
+        controller.close()
+
+
+def test_the_axes_are_the_frames_own_pixels_at_any_stride(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # 2048 rows by 512 columns is shown as 1024 x 256 (a stride of 2): the extent
+    # is the camera's 512 x 2048, or the image would be drawn half its size (FM-136).
+    fake_microscope.override(Camera, FrameCamera(_rows_columns(2048, 512)))
+    view = PlatePageView(page)
+    _snap_and_draw(view, page)
+    drawn = view.image_source.data
+    assert drawn["image"][0].shape == (1024, 256)
+    assert list(drawn["dw"]) == [512]
+    assert list(drawn["dh"]) == [2048]
+
+
+def test_a_tick_without_a_new_frame_draws_nothing(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    fake_microscope.override(Camera, FrameCamera(_rows_columns(6, 10)))
+    view = PlatePageView(page)
+    _snap_and_draw(view, page)
+    before = view.image_source.data
+    view.tick()
+    view.tick()
+    assert view.image_source.data is before
+    # A new frame is a new draw.
+    _snap_and_draw(view, page)
+    assert view.image_source.data is not before
+
+
+def test_a_frame_snapped_in_another_tab_is_drawn_by_the_next_tick(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    fake_microscope.override(Camera, FrameCamera(_rows_columns(6, 10)))
+    first = PlatePageView(page)
+    second = PlatePageView(page)
+    _snap_and_draw(first, page)
+    assert list(second.image_source.data["dw"]) == []
+    second.tick()
+    assert list(second.image_source.data["dw"]) == [10]
+    assert list(second.image_source.data["dh"]) == [6]
+    # Only the tab that clicked is taken to the image.
+    assert second.tabs.active == 0
+    # A tab opened after the snap draws it at once.
+    third = PlatePageView(page)
+    assert list(third.image_source.data["dw"]) == [10]
+
+
+def test_snap_is_disabled_with_the_reason_on_a_stand_without_a_camera(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    view = PlatePageView(page)
+    assert not view.snap_button.disabled
+    assert view.snap_note.object == ""
+    real_has = fake_microscope.has
+
+    def has(capability: type) -> bool:
+        return capability is not Camera and real_has(capability)
+
+    with _replaced(fake_microscope, "has", has):
+        view = PlatePageView(page)
+        assert view.snap_button.disabled
+        assert view.snap_note.object == "this stand has no Camera"
+
+
+def test_snap_and_every_run_button_are_disabled_while_an_activity_goes(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    camera = FrameCamera(_rows_columns(6, 10), block=True)
+    fake_microscope.override(Camera, camera)
+    view = PlatePageView(page)
+    try:
+        view.snap_button.clicks += 1
+        assert camera.entered.wait(5)
+        view.tick()
+        assert view.snap_button.disabled
+        assert view.tool_runs
+        assert all(button.disabled for button in view.tool_runs.values())
+        assert view.run_text.object == "snap is running"
+    finally:
+        camera.release.set()
+    assert page.join(10.0)
+    view.tick()
+    assert not view.snap_button.disabled
+    assert not view.tool_runs["scan"].disabled
+    # And the other way round: a run in flight disables Snap.
+    page.run("scan", [])
+    assert SlowScan.started.wait(5)
+    view.tick()
+    assert view.snap_button.disabled
+    view.on_snap()
+    assert view.message.object == "scan is running"
+
+
+def test_a_refused_snap_is_the_pages_message_and_not_an_exception(
+    page: PlatePage,
+) -> None:
+    view = PlatePageView(page)
+    page.run("scan", [])
+    assert SlowScan.started.wait(5)
+    view.on_snap()
+    assert view.message.object == "scan is running"
+    assert page.frame() is None
+
+
+def _card(**changes: Any) -> ResultCard:
+    base: dict[str, Any] = {
+        "plugin": "scan",
+        "status": "done",
+        "when_utc": "2026-10-29 09:03:00",
+        "profile": "demo",
+        "dry_run": False,
+        "lines": ("n: 3", "text: hello"),
+        "assumed": ("pixel size from the profile",),
+        "error": None,
+    }
+    return ResultCard(**{**base, **changes})
+
+
+def test_card_text_says_status_time_profile_and_dry_run() -> None:
+    assert card_text(None) == ""
+    assert card_text(None, stand="demo") == ""
+    assert card_text(_card(), stand="demo") == (
+        "done 2026-10-29 09:03:00 UTC\n"
+        "  n: 3\n"
+        "  text: hello\n"
+        "assumed: pixel size from the profile"
+    )
+    assert card_text(
+        _card(profile="lightsheet", dry_run=True, assumed=("a", "b")), stand="demo"
+    ) == (
+        "done 2026-10-29 09:03:00 UTC on lightsheet (dry run)\n"
+        "  n: 3\n"
+        "  text: hello\n"
+        "assumed: a\n"
+        "assumed: b"
+    )
+    assert card_text(
+        _card(status="failed", lines=(), assumed=(), error="the camera failed"),
+        stand="demo",
+    ) == ("failed 2026-10-29 09:03:00 UTC\nerror: the camera failed")
+    # A stand that is not known: the card never claims to be this stand's.
+    assert card_text(_card(lines=(), assumed=())) == (
+        "done 2026-10-29 09:03:00 UTC on demo"
+    )
+
+
+def _seed_raw(
+    run_doc: Path,
+    plugin: str,
+    result: dict[str, Any],
+    *,
+    profile: str = "demo",
+    status: StageStatus = StageStatus.done,
+    error: str | None = None,
+) -> None:
+    write_stage(
+        run_doc,
+        StageRecord(
+            plugin=plugin,
+            provides=plugin,
+            attempt="a0",
+            status=status,
+            started_utc=T0,
+            finished_utc=T0 + timedelta(minutes=3),
+            profile=profile,
+            dry_run=False,
+            smc_version="0",
+            params={},
+            result=result,
+            error=error,
+        ),
+    )
+
+
+def test_a_result_card_is_plain_text_under_its_tool(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # Markup in a result must reach the screen as the words it is: a Str pane, not
+    # Markdown (FM-139).
+    _seed_raw(
+        run_doc,
+        "scan",
+        {"assumed": ["<i>[bold]guess[/bold]</i>"], "note": "<b>[red]x</b>"},
+    )
+    view = PlatePageView(page)
+    pane = view.tool_cards["scan"]
+    assert type(pane) is pn.pane.Str
+    assert pane.object == (
+        "done 2026-10-29 09:03:00 UTC\n"
+        "  note: <b>[red]x</b>\n"
+        "assumed: <i>[bold]guess[/bold]</i>"
+    )
+    # Under its Run button (and the note that explains a disabled one), in its own
+    # section; no other tool shows it.
+    run = view.tool_runs["scan"]
+    (accordion,) = view.layout.select(pn.Accordion)
+    (section,) = [s for stage in accordion.objects for s in stage if run in s]
+    assert list(section).index(pane) == list(section).index(run) + 2
+    assert view.tool_cards["goto-well"].object == ""
+
+
+def test_a_card_of_another_stand_names_it_and_one_of_this_stand_does_not(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # The first tick reads the stand's name; the cards the first refresh drew
+    # without it are drawn again then.
+    _seed_raw(run_doc, "scan", {"n": 1}, profile="lightsheet")
+    _seed_raw(run_doc, "scan-plan", {"n": 2}, profile="demo")
+    view = PlatePageView(page)
+    assert view.tool_cards["scan"].object.splitlines()[0] == (
+        "done 2026-10-29 09:03:00 UTC on lightsheet"
+    )
+    assert view.tool_cards["scan-plan"].object.splitlines()[0] == (
+        "done 2026-10-29 09:03:00 UTC"
+    )
+
+
+def test_a_card_follows_the_run_documents_end_of_a_run(page: PlatePage) -> None:
+    view = PlatePageView(page)
+    assert view.tool_cards["scan"].object == ""
+    view.on_run("scan")
+    assert SlowScan.started.wait(5)
+    view.tick()
+    SlowScan.release.set()
+    assert page.join(10.0)
+    view.tick()
+    text = view.tool_cards["scan"].object
+    assert text.startswith("done ")
+    assert text.endswith(" UTC")
+
+
+def test_tools_under_more_are_built(page: PlatePage) -> None:
+    view = PlatePageView(page)
+    # `goto-well` is no stage of the workflow: a section like the others, in the
+    # last card of the accordion, with its required field as a row of its own.
+    assert "goto-well" in view.tool_runs
+    assert "well" in view.tool_fields["goto-well"]
+    (accordion,) = view.layout.select(pn.Accordion)
+    assert len(accordion.objects) == 4
+    last = [b for b in accordion.objects[-1].select(pn.widgets.Button)]
+    assert [b for b in last if b is view.tool_runs["goto-well"]]
+    for earlier in accordion.objects[:-1]:
+        assert view.tool_runs["goto-well"] not in earlier.select(pn.widgets.Button)
+
+
+def test_a_plugin_whose_parameters_cannot_be_described_leaves_the_page_building(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    ghost = EntryPoint(name="ghost", value="no_such_module_xyz:Plugin", group=GROUP)
+    controller = PlatePage(
+        fake_microscope,
+        run_doc,
+        entry_points=[ghost, *_entry_points("goto-well")],
+    )
+    try:
+        view = PlatePageView(controller)
+        assert "ghost" not in view.tool_runs
+        assert view.problems_text.object == (
+            "plugin ghost: could not be imported: ModuleNotFoundError: No module "
+            "named 'no_such_module_xyz'"
+        )
+        assert view.layout.get_root() is not None
+    finally:
+        controller.close()
 
 
 # --- the map ----------------------------------------------------------------------
@@ -529,14 +942,26 @@ def test_the_stage_is_a_cross_at_its_position(
 def test_a_position_that_rounds_to_zero_is_printed_without_a_sign() -> None:
     # The demo stage reads back -0.0 at its origin; the CLI prints it as 0.00 too.
     line = plate_page.status_line(_status(xy_um=(-0.0, -0.04), z_um=-0.0))
-    assert line.startswith("XY (0.0, 0.0) µm | Z 0.00 µm | ")
+    assert line.startswith("demo | XY (0.0, 0.0) µm | Z 0.00 µm | ")
     line = plate_page.status_line(_status(xy_um=(-0.06, 0.0), z_um=-0.001))
-    assert line.startswith("XY (-0.1, 0.0) µm | Z 0.00 µm | ")
+    assert line.startswith("demo | XY (-0.1, 0.0) µm | Z 0.00 µm | ")
+
+
+def test_the_strip_starts_with_the_stand() -> None:
+    assert plate_page.status_line(_status(stand="ti2e-bench")).startswith(
+        "ti2e-bench | XY ("
+    )
+
+
+def test_the_strip_of_a_session_starts_with_the_stand(page: PlatePage) -> None:
+    view = PlatePageView(page)
+    assert view.status_text.object.startswith("demo | XY (")
 
 
 def test_the_stand_is_one_line_and_unknown_is_a_question_mark() -> None:
     assert plate_page.status_line(_status()) == (
-        "XY (1000.0, -500.0) µm | Z 12.50 µm | Nikon 10X S Fluor | autofocus off | light ?"
+        "demo | XY (1000.0, -500.0) µm | Z 12.50 µm | Nikon 10X S Fluor | "
+        "autofocus off | light ?"
     )
     assert plate_page.status_line(
         _status(
@@ -550,7 +975,7 @@ def test_the_stand_is_one_line_and_unknown_is_a_question_mark() -> None:
             stop_refused=("xy_stage", "focus"),
         )
     ) == (
-        "XY ? | Z ? | objective ? | autofocus off | light on | DRY RUN | "
+        "demo | XY ? | Z ? | objective ? | autofocus off | light on | DRY RUN | "
         "moving: xy_stage | HALTED | STOP is refused by xy_stage, focus on this "
         "stand: a move under way runs to its target"
     )
@@ -1155,7 +1580,7 @@ def test_a_device_error_reaches_the_problems_line_after_a_tick(
         "answer); check the device: power, cable, another program holding it",
     )
     assert view.problems_text.object == "\n".join(problems)
-    assert view.status_text.object.startswith("XY ? | ")
+    assert view.status_text.object.startswith("demo | XY ? | ")
 
 
 def test_the_light_that_is_on_is_said_on(
