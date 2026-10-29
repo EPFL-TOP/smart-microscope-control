@@ -66,5 +66,5 @@ camera_rotation_deg = 0.0      # the camera's, in [-180, 180]
 mirrored = false               # the image flipped left-right
 cells_per_well = 40            # the mean over the columns: half in the first, one and a half times in the last; at most 500
 doublet_fraction = 0.3         # the share of cells that are two spots side by side, in [0, 1]
-cell_radius_um = 5.0           # the radius of a cell's spot, in (0, 50]
+cell_radius_um = 5.0           # the radius of a cell's spot, in [1e-6, 50]
 seed = 0                       # the same seed gives the same cells, texture and noise

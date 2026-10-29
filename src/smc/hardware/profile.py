@@ -81,6 +81,10 @@ MAX_SAMPLE_CELLS = 50_000
 _MAX_SAMPLE_POSITION_UM = 1e6
 _MAX_CELLS_PER_WELL = 500
 _MAX_CELL_RADIUS_UM = 50.0
+#: The smallest spot the synthetic sample's renderer accepts (``smc.testing.synthetic``
+#: ``_MIN_RADIUS_UM``, which a test pins): below it the exponent underflows, and a
+#: radius this module let through would fail at open, with no key named.
+_MIN_CELL_RADIUS_UM = 1e-6
 
 
 def _no_boolean(name: str, value: Any) -> Any:
@@ -652,10 +656,12 @@ class SampleSection(_Section):
     @field_validator("cell_radius_um")
     @classmethod
     def _cell_radius_bounded(cls, value: float) -> float:
-        if not (math.isfinite(value) and 0.0 < value <= _MAX_CELL_RADIUS_UM):
+        if not (
+            math.isfinite(value) and _MIN_CELL_RADIUS_UM <= value <= _MAX_CELL_RADIUS_UM
+        ):
             raise ValueError(
-                f"cell_radius_um must be a finite number of µm in (0, "
-                f"{_MAX_CELL_RADIUS_UM:g}], got {value}"
+                f"cell_radius_um must be a finite number of µm in "
+                f"[{_MIN_CELL_RADIUS_UM:g}, {_MAX_CELL_RADIUS_UM:g}], got {value}"
             )
         return value
 

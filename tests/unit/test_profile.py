@@ -1154,10 +1154,13 @@ def test_demo_sample_toml_loads_and_names_its_sample() -> None:
 
 
 def test_demo_sample_toml_writes_every_sample_key() -> None:
-    # A key added to SampleSection without a line here would go undocumented.
+    # A key added to SampleSection without a line here would go undocumented. The
+    # keys are the file's parsed ones, not a substring search (`rotation_deg` is in
+    # `camera_rotation_deg`), and A1's own line is commented out on purpose.
     text = DEMO_SAMPLE_TOML.read_text(encoding="utf-8")
-    for key in SampleSection.model_fields:
-        assert key in text
+    written = set(profile_module.tomllib.loads(text)["sample"])
+    assert written == set(SampleSection.model_fields) - {"a1_center_xy_um"}
+    assert "\n# a1_center_xy_um = " in text
 
 
 def test_a_sample_table_is_refused_with_a_micromanager_config(tmp_path: Path) -> None:
@@ -1223,6 +1226,9 @@ def test_a_sample_plate_named_like_a_well_plate_that_useq_does_not_know_is_refus
         ("cell_radius_um", "0"),
         ("cell_radius_um", "nan"),
         ("cell_radius_um", "51"),
+        # Under the renderer's own smallest spot: it would load, and fail at open.
+        ("cell_radius_um", "1e-9"),
+        ("cell_radius_um", "9.9e-7"),
         ("rotation_deg", "inf"),
         ("camera_rotation_deg", "true"),
         ("seed", "-1"),
@@ -1230,6 +1236,12 @@ def test_a_sample_plate_named_like_a_well_plate_that_useq_does_not_know_is_refus
         ("a1_center_xy_um", "[1e7, 0]"),
         ("a1_center_xy_um", "[0, nan]"),
         ("a1_center_xy_um", "[true, 0]"),
+        # The other side of every two-sided bound, and the other axis.
+        ("rotation_deg", "-46"),
+        ("camera_rotation_deg", "-181"),
+        ("a1_center_xy_um", "[-1e7, 0]"),
+        ("a1_center_xy_um", "[0, 1e7]"),
+        ("a1_center_xy_um", "[0, -1e7]"),
     ],
 )
 def test_sample_numbers_out_of_bounds_or_boolean_are_refused(
@@ -1240,17 +1252,62 @@ def test_sample_numbers_out_of_bounds_or_boolean_are_refused(
     assert f"  - sample.{key}:" in msg
 
 
-def test_sample_numbers_at_their_bounds_load(tmp_path: Path) -> None:
-    body = (
-        "[sample]\nrotation_deg = 45\ncamera_rotation_deg = -180\ncells_per_well = 500\n"
+def test_the_smallest_cell_radius_is_the_renderers_smallest_spot() -> None:
+    # The profile cannot import smc.testing, so it keeps its own copy: a radius it
+    # lets through that the renderer refuses would fail at open, with no key named.
+    from smc.testing.synthetic import _MIN_RADIUS_UM
+
+    assert profile_module._MIN_CELL_RADIUS_UM == _MIN_RADIUS_UM
+
+
+#: Every number of [sample] and the TOML that is a boolean where it stands.
+_BOOLEAN_FOR = {"a1_center_xy_um": "[true, 0]"}
+_NUMERIC_SAMPLE_KEYS = [
+    key for key in SampleSection.model_fields if key not in ("plate", "mirrored")
+]
+
+
+@pytest.mark.parametrize("key", _NUMERIC_SAMPLE_KEYS)
+def test_every_number_of_a_sample_refuses_a_boolean(tmp_path: Path, key: str) -> None:
+    # Built from the model's own fields: a new number that the shared before-validator
+    # does not list fails here, instead of loading `true` as 1 (FM-128, FM-43).
+    msg = _load_error(tmp_path, f"[sample]\n{key} = {_BOOLEAN_FOR.get(key, 'true')}\n")
+
+    assert f"  - sample.{key}:" in msg
+    assert "boolean" in msg
+
+
+def test_the_numeric_sample_keys_are_the_seven_the_design_names() -> None:
+    # The list above is computed: if it shrank, the test it feeds would go quiet.
+    assert _NUMERIC_SAMPLE_KEYS == [
+        "a1_center_xy_um",
+        "rotation_deg",
+        "camera_rotation_deg",
+        "cells_per_well",
+        "doublet_fraction",
+        "cell_radius_um",
+        "seed",
+    ]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "rotation_deg = 45\ncamera_rotation_deg = -180\ncells_per_well = 500\n"
         "doublet_fraction = 1\ncell_radius_um = 50\nseed = 0\n"
-        "a1_center_xy_um = [-1e6, 1e6]\nplate = '6-well'\n"
-    )
-    sample = Profile.load(write_profile(tmp_path / "p.toml", body)).sample
+        "a1_center_xy_um = [-1e6, 1e6]\nplate = '6-well'\n",
+        "rotation_deg = -45\ncamera_rotation_deg = 180\ncells_per_well = 0\n"
+        "doublet_fraction = 0\ncell_radius_um = 1e-6\n"
+        "a1_center_xy_um = [1e6, -1e6]\n",
+    ],
+    ids=["one-end-of-each", "the-other-end"],
+)
+def test_sample_numbers_at_their_bounds_load(tmp_path: Path, body: str) -> None:
+    sample = Profile.load(
+        write_profile(tmp_path / "p.toml", "[sample]\n" + body)
+    ).sample
 
     assert sample is not None
-    assert (sample.rotation_deg, sample.camera_rotation_deg) == (45.0, -180.0)
-    assert sample.cells_per_well == 500
 
 
 def test_an_unknown_sample_key_is_refused_naming_the_allowed_ones(

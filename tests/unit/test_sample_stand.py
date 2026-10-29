@@ -12,6 +12,8 @@ import logging
 import math
 import subprocess
 import sys
+import threading
+import time
 import weakref
 from collections import Counter
 from typing import TYPE_CHECKING, cast
@@ -26,6 +28,7 @@ from smc.hardware.capabilities import Camera, XYStage, ZStage
 from smc.hardware.errors import HardwareError, MicroscopeHaltedError, ProfileError
 from smc.hardware.microscope import Microscope
 from smc.hardware.profile import Profile, SampleSection
+from smc.plugins.cells.detector import BlobDetector
 from smc.testing import FakeCore, FakeDevice
 from smc.testing.sample_stand import (
     CELL_INTENSITY,
@@ -102,11 +105,16 @@ def test_the_count_per_well_grows_from_half_to_one_and_a_half_the_mean() -> None
     assert sum(found.values()) / 96 == pytest.approx(40, abs=0.5)
 
 
-def test_one_column_plates_take_the_mean_for_it() -> None:
-    # The share divides by (columns - 1): a plate of one column must not.
+def test_a_three_column_plate_holds_half_the_mean_first_and_one_and_a_half_last() -> (
+    None
+):
+    # No registered well plate has fewer than three columns, so the guard for one
+    # column in `scatter_cells` (the mean, no division by zero) cannot be reached
+    # through a `[sample]`: this is the smallest plate there is.
     section = SampleSection(plate="6-well", cells_per_well=10, doublet_fraction=0.0)
     found = _counts_by_well(section)
-    assert found["A1"] == 5  # 3 columns: the first is half the mean
+    assert found["A1"] == 5  # the first column is half the mean
+    assert found["A2"] == 10
     assert found["A3"] == 15
 
 
@@ -656,3 +664,203 @@ def test_install_logs_that_the_frames_are_rendered(
         "synthetic 384-well plate" in r.getMessage() and r.levelno == logging.INFO
         for r in caplog.records
     )
+
+
+def test_a_keyboard_interrupt_during_the_install_still_closes_the_facade(
+    fake_core: FakeCore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # FM-49: building the sample takes seconds on a big plate, and the operator's
+    # Ctrl-C lands in it. It is a BaseException, not an Exception.
+    def interrupted(microscope: Microscope, section: SampleSection) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("smc.testing.sample_stand.install_sample", interrupted)
+
+    with pytest.raises(KeyboardInterrupt):
+        Microscope.from_core(cast("CMMCorePlus", fake_core), _sample_profile())
+
+    assert "unloadAllDevices()" in fake_core.log
+
+
+# -- what the stand draws, and what the detector finds in it ----------------------------
+
+
+def test_the_cell_constants_are_the_designs() -> None:
+    # m1 §8 gives them. The tests that use the drawing lose a cell only when a
+    # constant moves a lot, so each is pinned on its own.
+    assert (CELL_INTENSITY, CELL_REACH, DOUBLET_OFFSET) == (3000.0, 0.85, 0.8)
+
+
+def test_the_doublet_share_is_the_one_asked_for() -> None:
+    # 3840 cells: a share of 0.3 is 0.3 +- 0.0074 (one standard deviation).
+    cells = len(scatter_cells(SampleSection(doublet_fraction=0.0)))
+    spots = len(scatter_cells(SampleSection(doublet_fraction=0.3)))
+
+    assert 3800 < cells < 3880  # 96 wells at 40 on average, each rounded
+    assert (spots - cells) / cells == pytest.approx(0.3, abs=0.04)
+
+
+@pytest.mark.parametrize("plate", ["96-well", "384-well"])
+def test_cells_are_spread_evenly_over_their_wells(plate: str) -> None:
+    # Uniform over the disc (96-well) or the square (384-well) of CELL_REACH: a quarter
+    # of the cells lie within half the reach, by area. A radius not taken as a square
+    # root puts half of them there, and a square not centred a different share.
+    section = SampleSection(plate=plate, doublet_fraction=0.0, cells_per_well=40)
+    sample = sample_of(section)
+    wells = useq.WellPlatePlan(
+        plate=plate,  # type: ignore[arg-type]
+        a1_center_xy=centred_a1_um(plate),
+    )
+    centres = {p.name: (p.x, p.y) for p in wells.all_well_positions}
+    half_um = wells.plate.well_size[0] * 500.0
+    inner = 0
+    blobs = scatter_cells(section)
+    for blob in blobs:
+        name = sample.well_at(blob.x_um, blob.y_um)
+        assert name is not None
+        cx, cy = centres[name]
+        dx, dy = blob.x_um - cx, blob.y_um - cy
+        reach = 0.5 * CELL_REACH * half_um
+        inner += (
+            math.hypot(dx, dy) <= reach
+            if wells.plate.circular_wells
+            else max(abs(dx), abs(dy)) <= reach
+        )
+
+    assert inner / len(blobs) == pytest.approx(0.25, abs=0.04)
+
+
+def test_the_blob_detector_finds_what_the_stand_draws() -> None:
+    # H12 of the densest plate (750 cells, 23 per mm2): the frames around its centre
+    # at 1 um per pixel hold about five cells each. Every cell that is in the frame,
+    # away from its edge and from every other cell is found, with its label, at its
+    # place (within 3 um), and nothing is found away from a drawn spot.
+    section = SampleSection(cells_per_well=500, doublet_fraction=0.3)
+    sample = sample_of(section)
+    spots = scatter_cells(section)
+    centre_x, centre_y = 49_500.0, -31_500.0  # H12 on the centred 96-well plate
+    near = [
+        s for s in spots if math.hypot(s.x_um - centre_x, s.y_um - centre_y) < 1000.0
+    ]
+    cells: list[tuple[float, float, str]] = []  # (x, y, label), from consecutive spots
+    index = 0
+    while index < len(near):
+        first = near[index]
+        second = near[index + 1] if index + 1 < len(near) else None
+        if (
+            second is not None
+            and abs(
+                math.hypot(first.x_um - second.x_um, first.y_um - second.y_um) - 8.0
+            )
+            < 1e-6
+        ):
+            cells.append(
+                (
+                    (first.x_um + second.x_um) / 2,
+                    (first.y_um + second.y_um) / 2,
+                    "doublet",
+                )
+            )
+            index += 2
+        else:
+            cells.append((first.x_um, first.y_um, "single"))
+            index += 1
+
+    def alone(x: float, y: float) -> bool:
+        return all(
+            math.hypot(x - ox, y - oy) > 40.0 or (ox, oy) == (x, y)
+            for ox, oy, _ in cells
+        )
+
+    matched = 0
+    for dx, dy in [(-300.0, -300.0), (300.0, -300.0), (-300.0, 300.0), (300.0, 300.0)]:
+        frame_x, frame_y = centre_x + dx, centre_y + dy
+        found = [
+            (
+                frame_x + ((d.col0_px + d.col1_px) / 2 - 255.5),
+                frame_y - ((d.row0_px + d.row1_px) / 2 - 255.5),
+                d.label,
+            )
+            for d in BlobDetector().detect(
+                sample.render(
+                    frame_x, frame_y, 0.0, shape=(512, 512), pixel_size_um=1.0
+                )
+            )
+        ]
+        for x, y, label in cells:
+            if abs(x - frame_x) <= 230 and abs(y - frame_y) <= 230 and alone(x, y):
+                hits = [f for f in found if math.hypot(f[0] - x, f[1] - y) <= 3.0]
+                assert [h[2] for h in hits] == [label], (x, y, label, found)
+                matched += 1
+        for fx, fy, _ in found:
+            if abs(fx - frame_x) <= 230 and abs(fy - frame_y) <= 230:
+                assert any(math.hypot(fx - x, fy - y) <= 40.0 for x, y, _ in cells), (
+                    fx,
+                    fy,
+                )
+
+    assert matched >= 6  # a frame with nothing in it would pass the rest
+
+
+# -- the lock, and a stand with no Z ------------------------------------------------------
+
+
+def test_two_snaps_at_once_never_render_at_once(
+    fake_microscope: Microscope, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The sample owns a random generator that is not thread-safe: the render runs
+    # under the camera's own lock. A render that takes 50 ms makes an overlap certain
+    # when there is none.
+    sample = PlateSample(**DARK)
+    guard = threading.Lock()
+    inside = peak = 0
+
+    def slow_render(*args: object, **kwargs: object) -> npt.NDArray[np.uint16]:
+        nonlocal inside, peak
+        with guard:
+            inside += 1
+            peak = max(peak, inside)
+        time.sleep(0.05)
+        with guard:
+            inside -= 1
+        return np.zeros((60, 80), dtype=np.uint16)
+
+    monkeypatch.setattr(sample, "render", slow_render)
+    camera = _stand_camera(fake_microscope, _Inner(), sample)
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def snap() -> None:
+        try:
+            barrier.wait(timeout=10)
+            camera.snap()
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=snap) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert errors == []
+    assert peak == 1
+
+
+def test_a_stand_without_a_z_stage_renders_at_z_zero() -> None:
+    core = FakeCore(
+        [FakeDevice("XY", DeviceType.XYStage), FakeDevice("Camera", DeviceType.Camera)],
+        camera="Camera",
+        xy_stage="XY",
+    )
+    microscope = Microscope.from_core(cast("CMMCorePlus", core), Profile.demo())
+    try:
+        assert microscope.get(ZStage) is None  # the stand really has no Z
+        sample = PlateSample(blobs=[Blob(0.0, 0.0, 5.0, 3000.0)], **DARK)
+
+        frame = _stand_camera(microscope, _Inner(shape=(64, 64)), sample).snap()
+
+        # Sharp: a blur at some other z would spread the spot's 2900 counts.
+        assert int(frame.max()) > 2500
+    finally:
+        microscope.close()
