@@ -14,7 +14,9 @@ It **moves the stage** (hundreds of absolute moves over the whole plate) and it
 ## What it measures, and how well
 
 One number per frame: the mean of the pixels (or their standard deviation, see
-`statistic`). Light through a well and through the plastic between wells differ by far
+`statistic`), placed where the stage says it was when the frame was taken, not where it
+was sent: a stage that stops short of a target without an error leaves a survey that does
+not reach the plate's edges, and the survey is refused for it. Light through a well and through the plastic between wells differ by far
 more than focus does, so the objective in place is the one used and nothing is
 focused or changed. The fit is the correlation between those numbers and "this point
 is inside a well", for each candidate plate, so the type is identified by the same
@@ -53,7 +55,7 @@ a survey of frames that were never taken has nothing to fit.
 | Parameter | Default | Meaning |
 |---|---|---|
 | `plate` | `96-well` | The plate the survey is **sized for**: it reaches one pitch past the outer wells of this plate. A `useq` plate name ending in `-well`. |
-| `plates` | all `-well` plates | The plates fitted against, JSON (`--param 'plates=["96-well","384-well"]'`). Say it when you know which plates it can be: a fit over seven plates takes about 2 s for a 96-well survey, and a close call between two is a note. |
+| `plates` | all `-well` plates | The plates fitted against, JSON (`--param 'plates=["96-well","384-well"]'`; in `cmd.exe` and PowerShell 5.1 the quotes need the escaping of the [`smc run`](README.md#running-a-plugin-smc-run) page). Say it when you know which plates it can be: a fit over seven plates takes about 2 s for a 96-well survey, and a close call between two is a note. |
 | `centre_x_um`, `centre_y_um` | the stage's position | Where the plate's centre is, both or neither. |
 | `step_um` | a third of the plate's pitch | Distance between survey points. A half was measured failing on three of eight plate types. At most 25 000 points are made. |
 | `margin_pitches` | 1 | How far past the outer wells the survey reaches, 0 to 5. Under 1, the plugin refuses (see below). |
@@ -134,7 +136,12 @@ stays at the last survey point.
 
 ## During the survey
 
-- **Stopping.** Ctrl-C ends the move under way and the run is `stopped`. A halt of the
+- **Stopping.** Ctrl-C ends the survey between two moves and the run is `stopped`; the
+  checkpoint keeps the last 50 points. **A move already sent is the stage's to end.** On
+  a stand whose profile declares `stop_refused_by = ["xy_stage", ...]`, as the Ti2-E's
+  does (FM-117), the stop is refused and the move runs to its target: the first move
+  of a survey, from where the stage stands to the first point, is the longest (up to
+  the width of the travel), the others are about a third of a pitch. A halt of the
   stand (the stop button of the layer) ends the survey and the run is `failed`; it is
   never counted as a point that failed (FM-64).
 - **A point that fails is skipped and counted**: a move that times out, a stage that
@@ -170,9 +177,11 @@ plate=6-well`), or too many points failed.
 ## Resuming
 
 The survey is the checkpoint: the centre, how many points were handled, and what was
-sampled, saved every 50 points and at the end. `--resume` continues from there, with
-the same parameters (the runner refuses otherwise) and from the **first run's centre**,
-not from where the stage stands now. A checkpoint that does not fit the survey (more
+sampled, saved before the first move, every 50 points and at the end. `--resume`
+continues from there, with the same parameters (the runner refuses otherwise) and from
+the **first run's centre**, not from where the stage stands now, even when the survey
+was stopped before its 50th point (then it starts again from the first point, around
+the same centre). A checkpoint that does not fit the survey (more
 points handled than it has, counts that do not add up) is refused with
 `run plate-finding without --resume`.
 
