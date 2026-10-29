@@ -59,8 +59,10 @@ class CellsResult(PluginResult):
     ``file`` is ``cells/<token>.json`` relative to the run folder. ``counts``
     maps well to label to count with every label of ``classes`` present, zeros
     included. ``model`` is the weights' file name, never its full path (run
-    documents are attached to issues: FM-50), ``model_sha256`` its SHA-256 and
-    ``classes`` the detector's, background excluded.
+    documents are attached to issues: FM-50), or ``blobs`` for the blob
+    detector of the synthetic plate (m3 §9.1); ``model_sha256`` its SHA-256
+    (of the detector's identity string for ``blobs``) and ``classes`` the
+    detector's, background excluded.
     """
 
     # ``model`` and ``model_sha256`` are this result's field names; pydantic's

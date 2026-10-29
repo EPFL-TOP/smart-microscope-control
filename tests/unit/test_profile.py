@@ -9,7 +9,7 @@ import pytest
 import smc.hardware.backends.mm as mm
 import smc.hardware.profile as profile_module
 from smc.hardware.errors import HardwareError, ProfileError
-from smc.hardware.profile import Profile, list_profiles, search_paths
+from smc.hardware.profile import Profile, SampleSection, list_profiles, search_paths
 from smc.hardware.roles import Role
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -1097,6 +1097,258 @@ def test_unknown_autofocus_key_is_refused(tmp_path: Path) -> None:
     ) in msg
 
 
+# -- [sample]: the synthetic plate of the demo-sample stand (#260) -------------
+
+
+def test_a_sample_table_loads_with_its_defaults(tmp_path: Path) -> None:
+    profile = Profile.load(write_profile(tmp_path / "p.toml", "[sample]\n"))
+
+    sample = profile.sample
+    assert sample is not None
+    assert (sample.plate, sample.a1_center_xy_um) == ("96-well", None)
+    assert (sample.rotation_deg, sample.camera_rotation_deg) == (0.0, 0.0)
+    assert (sample.mirrored, sample.seed) == (False, 0)
+    assert (sample.cells_per_well, sample.doublet_fraction) == (40, 0.3)
+    assert sample.cell_radius_um == 5.0
+
+
+def test_a_sample_table_loads_every_key_it_has(tmp_path: Path) -> None:
+    body = (
+        "[sample]\nplate = '384-well'\na1_center_xy_um = [100, -200.5]\n"
+        "rotation_deg = -3.5\ncamera_rotation_deg = 90\nmirrored = true\n"
+        "cells_per_well = 10\ndoublet_fraction = 0\ncell_radius_um = 2.5\nseed = 7\n"
+    )
+    sample = Profile.load(write_profile(tmp_path / "p.toml", body)).sample
+
+    assert sample is not None
+    assert sample.plate == "384-well"
+    assert sample.a1_center_xy_um == (100.0, -200.5)
+    assert (sample.rotation_deg, sample.camera_rotation_deg) == (-3.5, 90.0)
+    assert sample.mirrored is True
+    assert (sample.cells_per_well, sample.doublet_fraction) == (10, 0.0)
+    assert (sample.cell_radius_um, sample.seed) == (2.5, 7)
+
+
+def test_a_profile_without_a_sample_table_has_none(tmp_path: Path) -> None:
+    assert Profile.load(write_profile(tmp_path / "p.toml", "")).sample is None
+
+
+def test_profile_demo_has_no_sample() -> None:
+    assert Profile.demo().sample is None
+    assert Profile.load(DEMO_TOML).sample is None
+
+
+DEMO_SAMPLE_TOML = REPO_ROOT / "profiles" / "demo-sample.toml"
+
+
+def test_demo_sample_toml_loads_and_names_its_sample() -> None:
+    loaded = Profile.load(DEMO_SAMPLE_TOML)
+
+    assert loaded.microscope.name == "demo-sample"
+    assert loaded.source == DEMO_SAMPLE_TOML.resolve()
+    # Every key of [sample] is written out at its default.
+    assert loaded.sample == SampleSection()
+    # The rest is the demo's, so a tool behaves as it does on `demo`.
+    rest = {"microscope", "sample"}
+    assert loaded.model_dump(exclude=rest) == Profile.demo().model_dump(exclude=rest)
+
+
+def test_demo_sample_toml_writes_every_sample_key() -> None:
+    # A key added to SampleSection without a line here would go undocumented. The
+    # keys are the file's parsed ones, not a substring search (`rotation_deg` is in
+    # `camera_rotation_deg`), and A1's own line is commented out on purpose.
+    text = DEMO_SAMPLE_TOML.read_text(encoding="utf-8")
+    written = set(profile_module.tomllib.loads(text)["sample"])
+    assert written == set(SampleSection.model_fields) - {"a1_center_xy_um"}
+    assert "\n# a1_center_xy_um = " in text
+
+
+def test_a_sample_table_is_refused_with_a_micromanager_config(tmp_path: Path) -> None:
+    path = write_profile(
+        tmp_path / "p.toml", '[micromanager]\nconfig = "stand.cfg"\n[sample]\n'
+    )
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+
+    lines = str(info.value).splitlines()
+    problem = next(line for line in lines if line.startswith("  - sample:"))
+    assert "config" in problem
+    assert "stand.cfg" in problem
+
+
+def test_a_sample_with_a_micromanager_that_failed_reports_only_that_error(
+    tmp_path: Path,
+) -> None:
+    # `micromanager` is absent from `info.data` when it failed, so the sample
+    # check has nothing to compare with and the real problem stands alone.
+    path = write_profile(
+        tmp_path / "p.toml", "[micromanager]\ndevice_timeout_ms = -1\n[sample]\n"
+    )
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+
+    msg = str(info.value)
+    assert "1 problem(s)" in msg
+    assert "micromanager.device_timeout_ms" in msg
+    assert "  - sample:" not in msg
+
+
+@pytest.mark.parametrize("plate", ["glass", "coverslip-22mm-square", "", "96-WELL"])
+def test_a_sample_plate_that_is_not_a_well_plate_is_refused(
+    tmp_path: Path, plate: str
+) -> None:
+    msg = _load_error(tmp_path, f'[sample]\nplate = "{plate}"\n')
+
+    assert "  - sample.plate:" in msg
+    assert "-well" in msg
+
+
+def test_a_sample_plate_named_like_a_well_plate_that_useq_does_not_know_is_refused(
+    tmp_path: Path,
+) -> None:
+    msg = _load_error(tmp_path, '[sample]\nplate = "97-well"\n')
+
+    assert "  - sample.plate:" in msg
+    assert "97-well" in msg
+    assert "useq" in msg
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("rotation_deg", "46"),
+        ("camera_rotation_deg", "181"),
+        ("cells_per_well", "501"),
+        ("cells_per_well", "-1"),
+        ("cells_per_well", "true"),
+        ("doublet_fraction", "1.5"),
+        ("doublet_fraction", "-0.1"),
+        ("cell_radius_um", "0"),
+        ("cell_radius_um", "nan"),
+        ("cell_radius_um", "51"),
+        # Under the renderer's own smallest spot: it would load, and fail at open.
+        ("cell_radius_um", "1e-9"),
+        ("cell_radius_um", "9.9e-7"),
+        ("rotation_deg", "inf"),
+        ("camera_rotation_deg", "true"),
+        ("seed", "-1"),
+        ("seed", "true"),
+        ("a1_center_xy_um", "[1e7, 0]"),
+        ("a1_center_xy_um", "[0, nan]"),
+        ("a1_center_xy_um", "[true, 0]"),
+        # The other side of every two-sided bound, and the other axis.
+        ("rotation_deg", "-46"),
+        ("camera_rotation_deg", "-181"),
+        ("a1_center_xy_um", "[-1e7, 0]"),
+        ("a1_center_xy_um", "[0, 1e7]"),
+        ("a1_center_xy_um", "[0, -1e7]"),
+    ],
+)
+def test_sample_numbers_out_of_bounds_or_boolean_are_refused(
+    tmp_path: Path, key: str, value: str
+) -> None:
+    msg = _load_error(tmp_path, f"[sample]\n{key} = {value}\n")
+
+    assert f"  - sample.{key}:" in msg
+
+
+def test_the_smallest_cell_radius_is_the_renderers_smallest_spot() -> None:
+    # The profile cannot import smc.testing, so it keeps its own copy: a radius it
+    # lets through that the renderer refuses would fail at open, with no key named.
+    from smc.testing.synthetic import _MIN_RADIUS_UM
+
+    assert profile_module._MIN_CELL_RADIUS_UM == _MIN_RADIUS_UM
+
+
+#: Every number of [sample] and the TOML that is a boolean where it stands.
+_BOOLEAN_FOR = {"a1_center_xy_um": "[true, 0]"}
+_NUMERIC_SAMPLE_KEYS = [
+    key for key in SampleSection.model_fields if key not in ("plate", "mirrored")
+]
+
+
+@pytest.mark.parametrize("key", _NUMERIC_SAMPLE_KEYS)
+def test_every_number_of_a_sample_refuses_a_boolean(tmp_path: Path, key: str) -> None:
+    # Built from the model's own fields: a new number that the shared before-validator
+    # does not list fails here, instead of loading `true` as 1 (FM-128, FM-43).
+    msg = _load_error(tmp_path, f"[sample]\n{key} = {_BOOLEAN_FOR.get(key, 'true')}\n")
+
+    assert f"  - sample.{key}:" in msg
+    assert "boolean" in msg
+
+
+def test_the_numeric_sample_keys_are_the_seven_the_design_names() -> None:
+    # The list above is computed: if it shrank, the test it feeds would go quiet.
+    assert _NUMERIC_SAMPLE_KEYS == [
+        "a1_center_xy_um",
+        "rotation_deg",
+        "camera_rotation_deg",
+        "cells_per_well",
+        "doublet_fraction",
+        "cell_radius_um",
+        "seed",
+    ]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "rotation_deg = 45\ncamera_rotation_deg = -180\ncells_per_well = 500\n"
+        "doublet_fraction = 1\ncell_radius_um = 50\nseed = 0\n"
+        "a1_center_xy_um = [-1e6, 1e6]\nplate = '6-well'\n",
+        "rotation_deg = -45\ncamera_rotation_deg = 180\ncells_per_well = 0\n"
+        "doublet_fraction = 0\ncell_radius_um = 1e-6\n"
+        "a1_center_xy_um = [1e6, -1e6]\n",
+    ],
+    ids=["one-end-of-each", "the-other-end"],
+)
+def test_sample_numbers_at_their_bounds_load(tmp_path: Path, body: str) -> None:
+    sample = Profile.load(
+        write_profile(tmp_path / "p.toml", "[sample]\n" + body)
+    ).sample
+
+    assert sample is not None
+
+
+def test_an_unknown_sample_key_is_refused_naming_the_allowed_ones(
+    tmp_path: Path,
+) -> None:
+    msg = _load_error(tmp_path, "[sample]\ncells = 3\n")
+
+    assert "unknown key in [sample]" in msg
+    assert "allowed keys: plate, a1_center_xy_um" in msg
+
+
+def test_too_many_cells_for_the_plate_are_refused(tmp_path: Path) -> None:
+    # 384 wells x 130 is 49 920 cells; x 131 is 50 304, over the bound.
+    msg = _load_error(tmp_path, '[sample]\nplate = "384-well"\ncells_per_well = 131\n')
+
+    assert "  - sample.cells_per_well:" in msg
+    assert "50304" in msg
+    assert "at most 130" in msg
+
+    loaded = Profile.load(
+        write_profile(
+            tmp_path / "ok.toml", '[sample]\nplate = "384-well"\ncells_per_well = 130\n'
+        )
+    )
+    assert loaded.sample is not None
+    assert loaded.sample.cells_per_well == 130
+
+
+def test_the_cell_bound_is_the_one_the_stand_imports() -> None:
+    assert profile_module.MAX_SAMPLE_CELLS == 50_000
+
+
+def test_an_unknown_plate_does_not_hide_behind_the_cell_count(tmp_path: Path) -> None:
+    # `plate` failed, so it is absent from `info.data` when cells_per_well is
+    # checked: the plate's own error is reported, and nothing else is.
+    msg = _load_error(tmp_path, '[sample]\nplate = "glass"\ncells_per_well = 500\n')
+
+    assert "1 problem(s)" in msg
+    assert "  - sample.plate:" in msg
+
+
 # -- the profiles that ship with the repository ---------------------------------
 
 PROFILES_DIR = REPO_ROOT / "profiles"
@@ -1105,7 +1357,12 @@ SHIPPED = sorted(PROFILES_DIR.glob("*.toml"))
 
 def test_the_profiles_directory_holds_the_profiles_this_repository_ships() -> None:
     # A glob that finds nothing would pass the parametrised test below by not running it.
-    assert {path.stem for path in SHIPPED} >= {"demo", "nikon-ti2", "nikon-tie"}
+    assert {path.stem for path in SHIPPED} >= {
+        "demo",
+        "demo-sample",
+        "nikon-ti2",
+        "nikon-tie",
+    }
 
 
 @pytest.mark.parametrize("path", SHIPPED, ids=lambda path: path.stem)

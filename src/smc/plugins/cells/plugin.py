@@ -13,7 +13,9 @@ and the decisions in it that keep a long run from losing or faking its work:
   models are not one result (FM-111). The result names the weights' file, never
   its path, since run documents are attached to issues (FM-50). The parameter
   ``model_path`` is the one place a path is recorded, as given, like every
-  parameter: ``SMC_MODELS`` is not recorded anywhere.
+  parameter: ``SMC_MODELS`` is not recorded anywhere. ``detector=blobs`` (#260)
+  has no file: the SHA-256 of its identity string stands for it, and the result
+  says that its counts are spots, not cells.
 * **A frame is checked before it is detected on.** The matrix of the scan is
   only right on the scan's own frame shape (FM-73), and a missing, corrupt or
   foreign frame is told by its file name with what to do.
@@ -34,7 +36,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 import numpy.typing as npt
 import tifffile
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from smc.plugins.api import PluginParams, RunContext
 from smc.plugins.cells.algorithm import (
@@ -42,7 +44,14 @@ from smc.plugins.cells.algorithm import (
     suppress_in_frame,
     to_cells,
 )
-from smc.plugins.cells.detector import default_model_path, load_detector
+from smc.plugins.cells.detector import (
+    BLOB_DETECTOR,
+    BLOB_DETECTOR_IDENTITY,
+    BlobDetector,
+    Detector,
+    default_model_path,
+    load_detector,
+)
 from smc.plugins.errors import PluginRunError
 from smc.plugins.slots import (
     Cell,
@@ -68,11 +77,26 @@ __all__ = ["CellsCheckpoint", "CellsParams", "CellsPlugin"]
 _NAME = "cells"
 #: The weights are hashed in pieces of this size: 166 MB are not read at once.
 _HASH_CHUNK_BYTES = 1 << 20
+#: What the result says of a run of the blob detector: a count of spots is not a
+#: count of cells, and a report that quotes it must say where it came from.
+_BLOB_ASSUMED = (
+    "cells were found by the blob detector (detector=blobs), which counts bright "
+    "round spots for the synthetic plate of the demo-sample profile; on a real "
+    "sample its counts are not cells",
+)
 
 
 class CellsParams(PluginParams):
-    """Which weights, on which device, and how sure and how alike a detection must be."""
+    """Which detector, which weights, on which device, and how sure and how alike a detection must be."""
 
+    detector: Literal["model", "blobs"] = Field(
+        "model",
+        description=(
+            "model is the trained network. blobs counts bright round spots and is "
+            "for the synthetic plate of the demo-sample profile only: on a real "
+            "sample its counts are not cells."
+        ),
+    )
     model_path: Path | None = Field(
         None,
         description=(
@@ -104,6 +128,23 @@ class CellsParams(PluginParams):
             "Cells of two fields within this distance are one cell; 0 merges nothing."
         ),
     )
+
+    @model_validator(mode="after")
+    def _blobs_take_no_weights_and_no_gpu(self) -> CellsParams:
+        # The blob detector is numpy: a path or a GPU asked for next to it would
+        # be silently ignored, and the run would not be the one that was asked for.
+        if self.detector == "blobs":
+            if self.model_path is not None:
+                raise ValueError(
+                    "model_path is for detector=model: the blob detector has no "
+                    "weights; remove model_path, or use detector=model"
+                )
+            if self.device not in ("auto", "cpu"):
+                raise ValueError(
+                    f"the blob detector runs on the cpu, not on {self.device}: "
+                    "remove device, or use detector=model"
+                )
+        return self
 
 
 class CellsCheckpoint(BaseModel):
@@ -160,13 +201,25 @@ class CellsPlugin:
                 "failed); run scan again without --dry-run",
             )
 
-        weights = (
-            params.model_path if params.model_path is not None else default_model_path()
-        )
-        detector = load_detector(
-            weights, device=params.device, score_threshold=params.score_threshold
-        )
-        sha256 = _sha256(weights)
+        detector: Detector
+        if params.detector == "blobs":
+            # No file to look for or to hash: the identity string stands for the
+            # detector, so a resume across a change of its rules is refused like
+            # a change of weights (FM-111). Neither torch nor the weights are touched.
+            detector = BlobDetector()
+            model = BLOB_DETECTOR
+            sha256 = hashlib.sha256(BLOB_DETECTOR_IDENTITY.encode("utf-8")).hexdigest()
+        else:
+            weights = (
+                params.model_path
+                if params.model_path is not None
+                else default_model_path()
+            )
+            detector = load_detector(
+                weights, device=params.device, score_threshold=params.score_threshold
+            )
+            model = weights.name
+            sha256 = _sha256(weights)
 
         index = scan.frame_index()
         token, cells, wells_done, merged = _resume(ctx, scan, sha256, detector.classes)
@@ -232,7 +285,7 @@ class CellsPlugin:
         radius = params.merge_radius_um
         return CellsResult(
             file=relative_to_run(ctx.run_dir, final),
-            model=weights.name,
+            model=model,
             model_sha256=sha256,
             classes=detector.classes,
             device=detector.device,
@@ -243,12 +296,15 @@ class CellsPlugin:
             merged=merged,
             seconds_per_frame=sum(seconds) / len(seconds) if seconds else None,
             assumed=(
-                (
-                    f"cells within {radius:g} µm seen by two fields are counted "
-                    f"once: a chosen radius, not measured",
-                )
-                if radius > 0.0
-                else ()
+                *(_BLOB_ASSUMED if params.detector == "blobs" else ()),
+                *(
+                    (
+                        f"cells within {radius:g} µm seen by two fields are counted "
+                        f"once: a chosen radius, not measured",
+                    )
+                    if radius > 0.0
+                    else ()
+                ),
             ),
         )
 

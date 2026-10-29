@@ -38,6 +38,7 @@ from smc.plugins import registry as registry_mod
 from smc.plugins.api import PluginParams, PluginResult, RunContext, StopRequested
 from smc.plugins.errors import PluginRunError
 from smc.plugins.registry import GROUP
+from smc.plugins.slots import CellsResult, ReportResult, RouteResult
 from smc.run import RunDocument, StageRecord, StageStatus, write_stage
 from smc.run import files as files_mod
 from smc.testing import FakeCore
@@ -1086,3 +1087,66 @@ def test_a_run_adds_no_logging_handler_to_the_smc_logger(
     result = _run("-v", "run", "good", "--run-doc", _doc(tmp_path))
     assert result.exit_code == 0, result.output
     assert (logger.level, list(logger.handlers)) == before
+
+
+# --- the whole workflow on the demo-sample stand (#260) --------------------------------
+
+DEMO_SAMPLE_TOML = (
+    Path(smc.__file__).resolve().parents[2] / "profiles" / "demo-sample.toml"
+)
+#: A1 and H12 of the centred 96-well plate: the corners the registration is told.
+CORNER_REFS = '[{"well":"A1","x_um":-49500,"y_um":31500},{"well":"H12","x_um":49500,"y_um":-31500}]'
+
+
+def _dense_demo_sample(tmp_path: Path) -> Path:
+    """A copy of ``demo-sample.toml`` with 400 cells per well: the four fields of E7 then hold some."""
+    text = DEMO_SAMPLE_TOML.read_text(encoding="utf-8")
+    dense = re.sub(r"^cells_per_well = 40\b", "cells_per_well = 400", text, flags=re.M)
+    assert dense != text  # the line this test changes is still there
+    path = tmp_path / "demo-sample.toml"
+    path.write_text(dense, encoding="utf-8")
+    return path
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_the_workflow_runs_end_to_end_on_demo_sample(tmp_path: Path) -> None:
+    profile = _dense_demo_sample(tmp_path)
+    doc = _doc(tmp_path)
+
+    def stage(name: str, *params: str) -> Result:
+        args = ["run", name, "-p", str(profile), "--run-doc", doc]
+        for param in params:
+            args += ["--param", param]
+        result = _run(*args)
+        assert result.exit_code == 0, f"{name}: {result.output}"
+        return result
+
+    # E7 is 6.4 mm from the stage origin; A1 is 59 mm away, about 7 s by demo stage.
+    stage("plate-registration", f"refs={CORNER_REFS}")
+    stage("scan-plan", "wells=E7", "rows=2", "columns=2")
+    stage("scan")
+    stage("cells", "detector=blobs")
+    stage("density")
+    stage("route", 'labels=["single","doublet"]')
+    stage("report")
+
+    stages = RunDocument.load(Path(doc)).stages
+    assert set(stages) == {
+        "plate-registration",
+        "scan-plan",
+        "scan",
+        "cells",
+        "density",
+        "route",
+        "report",
+    }
+    # Every stage says which stand made it: a result on a synthetic plate is not a sample's.
+    assert {record.profile for record in stages.values()} == {"demo-sample"}
+    counts = CellsResult.model_validate(stages["cells"].result).counts["E7"]
+    assert counts["single"] > 0
+    assert counts["doublet"] > 0
+    route = RouteResult.model_validate(stages["route"].result)
+    assert len(route.positions) >= 1
+    report = ReportResult.model_validate(stages["report"].result)
+    assert (tmp_path / report.file).is_file()

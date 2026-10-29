@@ -670,6 +670,12 @@ def doctor(
                 name = loaded.microscope.name
                 _say(f"Profile {name} ({loaded.source or 'built in'})")
                 _print_roles(microscope)
+                if loaded.sample is not None:
+                    # Inside the branch: only this stand loads the module (m1 §8).
+                    from smc.testing.sample_stand import sample_lines
+
+                    for line in sample_lines(loaded.sample):
+                        _say(line)
                 _say_stop_refused(microscope)
                 # One read decides the exit code and is the line printed: a
                 # flaky device read twice could show "XY ?" beside the ✓.

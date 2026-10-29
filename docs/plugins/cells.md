@@ -50,9 +50,10 @@ smc run cells -p <profile> --run-doc run.json --resume
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `model_path` | `local/models/cell_classes_model-cat-v2.pth`, or that file in `$SMC_MODELS` | The weights. |
-| `device` | `auto` | `auto` is `cuda` when the PC has one and `cpu` otherwise: never `mps` unless asked. `cuda` or `mps` asked for and not there is refused (`device cuda is not available on this PC; use device=auto or cpu`), not replaced by the CPU. |
-| `score_threshold` | 0.5 | Detections below it are dropped (0.05 to 1). |
+| `detector` | `model` | `model` is the trained network. `blobs` counts bright round spots and is for the synthetic plate of the `demo-sample` profile only ([below](#the-blob-detector-for-the-synthetic-plate-only)). |
+| `model_path` | `local/models/cell_classes_model-cat-v2.pth`, or that file in `$SMC_MODELS` | The weights. Refused with `detector=blobs`. |
+| `device` | `auto` | `auto` is `cuda` when the PC has one and `cpu` otherwise: never `mps` unless asked. `cuda` or `mps` asked for and not there is refused (`device cuda is not available on this PC; use device=auto or cpu`), not replaced by the CPU. With `detector=blobs` only `auto` and `cpu` are accepted. |
+| `score_threshold` | 0.5 | Detections below it are dropped (0.05 to 1). The blob detector scores every detection 1.0, so it has no effect there. |
 | `max_overlap` | 0.7 | Two boxes of one frame sharing more than this fraction of the smaller one are one object; the more confident label stays. |
 | `merge_radius_um` | 5 | Cells of two fields within this distance are one cell. 0 merges nothing. |
 
@@ -65,6 +66,47 @@ Progress is one report per frame, `<well> <frame name>`, out of the scan's frame
 A stop is looked at before each frame: Ctrl-C ends the stage `stopped`, with the
 checkpoint of the wells done (none, if the first well was not finished).
 
+## The blob detector, for the synthetic plate only
+
+```text
+smc run cells -p demo-sample --run-doc run.json --param detector=blobs
+```
+
+The trained model does not see the cells of the `demo-sample` stand (on frames of 7
+single and 7 paired synthetic spots it found at most 2 `single`), so the workflow
+could not be followed past the scan on that stand. `blobs` is a second detector that
+finds what that sample draws: **bright round spots**, as `single` (round) or `doublet`
+(two side by side). It needs neither torch nor the weights, and it runs on the CPU.
+
+**Why its counts are not cells.** It knows nothing of cells. It finds the pixels that
+stand out of the frame's background (its 75th percentile plus 8 times the noise of
+neighbouring pixels), keeps the connected spots between 9 pixels and 5 % of the frame
+whose shape is not a strip, and calls a spot a `doublet` when it is longer than wide
+(its minor axis is under 0.75 of its major one). Run on a real sample it would count
+bright debris, a well's rim and bubbles the same way, so the result says so in
+`assumed`: `cells were found by the blob detector (detector=blobs), which counts
+bright round spots for the synthetic plate of the demo-sample profile; on a real
+sample its counts are not cells`. It never replaces the model on a stand.
+
+**Its limits on the synthetic plate.** It is tuned for the sample at the camera's
+default exposure, 10 ms. The sample's texture grows with the exposure and its noise
+does not, and the detector measures only the noise: from 50 ms up it counts speckle
+in empty wells (tens to hundreds per frame, measured), and nothing on the page or in
+`scan` sets an exposure, so only a deliberate `set_exposure_ms` or `smc snap
+--exposure-ms` gets there. And it can count a wedge of well: a frame whose corner
+just enters a well (by up to about 50 µm at 0.5 µm per pixel; a scan of the whole well,
+`coverage` 1, keeps such frames) shows that wedge, which is under 5 % of the frame, as a
+`doublet` boxed at the corner. Scans of the middle of a well, as the `coverage=0.4` of
+the commands above, do not have such frames.
+
+In the result, `model` is `blobs`, `model_sha256` is the SHA-256 of a string that
+names the detector's version and rules (so a resume after a change of those rules
+is refused, like a change of weights), `classes` are `single` and `doublet` (no
+`debris`) and `device` is `cpu`. The page's Cells tool shows `detector` as a key
+parameter, next to `score_threshold`. Measured on the synthetic plate, it finds exactly
+the 5 single and 3 paired spots of a frame at 0.1625, 0.25, 0.5, 1 and 2 µm per
+pixel, and nothing on a frame that crosses a well wall.
+
 ## Stop and resume
 
 The unit of work is a well. After each well the cells found so far are written to
@@ -75,9 +117,10 @@ Three refusals and one repair:
 - **Other weights**: the SHA-256 of the weights is in the checkpoint, and a
   resume with a file that hashes differently is refused (`the weights changed
   since the run being resumed; run cells without --resume`): cells of two models
-  are not one result.
+  are not one result. With `detector=blobs` the same check hashes the detector's
+  identity string, so a resume after a release that changed its rules is refused too.
 - **Other parameters or another profile**: the runner refuses it, as for every
-  stage.
+  stage. Another `detector` is a parameter that differs.
 - **A scan produced again**: the runner refuses a resume over inputs that changed.
 - **A partial file that is missing or does not validate** is a WARNING, and every
   well is detected again under the same token, after the checkpoint has been
@@ -98,14 +141,14 @@ The slot `cells` holds a `CellsResult` (`smc.plugins.slots`):
 | Field | Meaning |
 |---|---|
 | `file` | `cells/<token>.json`, relative to the run folder, with forward slashes. |
-| `model`, `model_sha256` | The weights' **file name** (never its path: run documents are attached to issues) and its SHA-256. The parameter `model_path` is recorded as you typed it, in the stage's `params`, like every parameter: when the path names your account, give the folder through `SMC_MODELS`, which is recorded nowhere. |
+| `model`, `model_sha256` | The weights' **file name** (never its path: run documents are attached to issues), or `blobs`, and its SHA-256 (of the blob detector's identity string for `blobs`). The parameter `model_path` is recorded as you typed it, in the stage's `params`, like every parameter: when the path names your account, give the folder through `SMC_MODELS`, which is recorded nowhere. |
 | `classes`, `device` | The detector's labels (`single`, `doublet`, `debris`) and the device it ran on, never `auto`. |
 | `score_threshold`, `merge_radius_um` | The parameters. |
 | `frames` | The number of frames of the scan. |
 | `counts` | Well to label to count, every well of the scan and every label, **zeros included**. A well whose every field failed is absent, as in the scan. |
 | `merged` | How many views were removed as the second sight of a cell, over every well, a resumed run's included. |
 | `seconds_per_frame` | The mean time of `detect` in this attempt; `null` when it detected no frame. |
-| `assumed` | `cells within 5 µm seen by two fields are counted once: a chosen radius, not measured`; empty when `merge_radius_um` is 0. |
+| `assumed` | `cells within 5 µm seen by two fields are counted once: a chosen radius, not measured`; empty when `merge_radius_um` is 0. With `detector=blobs`, first the line that says its counts are of bright round spots and not cells. |
 
 The cells are in the file, not in the run document: a 96-well plate at 40× is
 about 300 frames per well and thousands of cells per well. `load_cells` reads the

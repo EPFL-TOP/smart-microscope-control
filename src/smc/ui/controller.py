@@ -111,7 +111,7 @@ KEY_PARAMS: dict[str, tuple[str, ...]] = {
     "camera-calibration": ("step_um",),
     "scan-plan": ("objective", "overlap", "coverage"),
     "scan": ("autofocus",),
-    "cells": ("score_threshold",),
+    "cells": ("detector", "score_threshold"),  # detector: #260
     "route": ("labels", "fields_per_well"),
 }
 

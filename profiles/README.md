@@ -130,6 +130,7 @@ spelling or remove it; allowed keys: max_jog_um, …`.
 | Profile | Stand | Configuration | State |
 | --- | --- | --- | --- |
 | `demo` | Micro-Manager's demo devices | the one shipped with the adapters | the regression bed of every test |
+| `demo-sample` | The demo devices, with a camera that images a synthetic 96-well plate | the one shipped with the adapters | for trying the plate tools without a microscope; the pixels are drawn, see [`[sample]`](#sample-the-synthetic-plate-of-demo-sample) |
 | `nikon-ti2` | Nikon Ti2-E, Prime 95B on PVCAM | `nikon-ti2.cfg` | measured in session 0 (#126), with the owner's limits |
 | `nikon-tie` | Nikon Ti-E | `nikon-tie.cfg` | **assumed**: written from the adapter's fixed device list, never loaded on the stand |
 
@@ -139,6 +140,32 @@ offset factor and no autofocus soft limit until a session at the stand
 measures them. Each value in `nikon-ti2.toml` says in a comment whether it
 was measured, set by the owner or chosen; `max_z_jog_um` is chosen, not
 measured, and the owner revises it when the PFS session (#16) has run.
+
+## `[sample]`: the synthetic plate of `demo-sample`
+
+An optional table, on the demo stand only: `Microscope.open` (so `smc run`, `smc ui
+plate` and a notebook) then replaces the demo camera's pixels with a rendering of a
+synthetic well plate at the stage's position, so the plate tools can be tried without a
+microscope (`smc.testing.sample_stand`; design in `docs/design/m1-hardware-layer.md` §8).
+Every key has a default, so `[sample]` alone is a 96-well plate centred on the stage
+origin; `profiles/demo-sample.toml` writes each one out.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `plate` | `"96-well"` | A `useq` plate name ending in `-well` (`6-well`, `24-well`, `384-well`, ...). |
+| `a1_center_xy_um` | omitted | Where well A1's centre is on the stage, in µm, within ±1e6. Omitted: the plate centred on the stage origin, (−49 500, 31 500) for 96 wells, so a frame at the origin is plastic. |
+| `rotation_deg` | `0.0` | The plate's rotation about A1, in [−45, 45]. |
+| `camera_rotation_deg`, `mirrored` | `0.0`, `false` | How the camera sits on the stage: its rotation in [−180, 180], and whether the image is flipped left to right. |
+| `cells_per_well` | `40` | The mean over the plate's columns, 0 to 500: the first column holds half of it and the last one and a half times, so density and route have something to tell apart. |
+| `doublet_fraction` | `0.3` | The share of cells that are two spots side by side, in [0, 1]. |
+| `cell_radius_um` | `5.0` | The radius of a cell's spot, in [1e-6, 50] µm. |
+| `seed` | `0` | The same seed gives the same cells, texture and noise. |
+
+A `[sample]` is refused with a `micromanager.config` other than `""` (synthetic frames
+over a real stage would look like a working stand), with a plate that is not a `useq`
+well plate, with a number that is out of its bounds or is a TOML boolean, and when
+`cells_per_well` times the plate's wells is above 50 000. `smc doctor -p demo-sample`
+says what the sample is and what it is not; `Profile.demo()` and `demo.toml` have none.
 
 ## Rebuilding a profile's configuration
 

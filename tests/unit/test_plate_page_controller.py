@@ -2333,6 +2333,27 @@ def test_tools_follow_the_workflow_order_and_hide_what_the_page_fills(
     assert by_name["scan"].key[0][0] == "autofocus"
 
 
+def test_cells_offers_the_detector_as_a_key_parameter(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # On the demo-sample stand the operator picks `blobs` here, not under the fold
+    # with the model path and the device, which `blobs` does not take (#260).
+    page = PlatePage(fake_microscope, run_doc, entry_points=_real("cells"))
+
+    (cells,) = page.tools()
+
+    assert cells.name == "cells"
+    assert [row[0] for row in cells.key] == ["detector", "score_threshold"]
+    assert {row[0] for row in cells.advanced} == {
+        "model_path",
+        "device",
+        "max_overlap",
+        "merge_radius_um",
+    }
+    detector = cells.key[0]
+    assert "blobs" in " ".join(str(part) for part in detector)
+
+
 class Alpha(Stub):
     name = provides = "alpha-tool"
 

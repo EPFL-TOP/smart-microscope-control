@@ -31,6 +31,7 @@ import smc.cli as cli
 import smc.ui.controller as controller_module
 from smc.cli import app
 from smc.hardware import Microscope
+from smc.hardware.capabilities import Camera, XYStage
 from smc.hardware.profile import Profile
 from smc.hardware.roles import Role
 from smc.plugins.api import PluginParams, PluginResult, RunContext, StopRequested
@@ -384,6 +385,35 @@ def test_ui_plate_serves_the_demo_and_releases_the_stand(
     result = _plate(doc=tmp_path / "run.json")
     assert result.exit_code == 0, result.output
     assert [type(page) for page in pages] == [PlatePage]
+    assert len(closes) == 1
+
+
+DEMO_SAMPLE_TOML = Path(__file__).resolve().parents[1] / "profiles" / "demo-sample.toml"
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_ui_plate_on_demo_sample_serves_frames_that_follow_the_stage(
+    monkeypatch: pytest.MonkeyPatch, closes: list[Microscope], tmp_path: Path
+) -> None:
+    # The page is handed the facade `open` built from the profile, so the camera
+    # its tools snap is the sample's: plastic at the origin, a well at E7.
+    means: list[float] = []
+
+    def serve(page: PlatePage, *, port: int) -> None:
+        camera = page._microscope.require(Camera)
+        means.append(float(camera.snap().mean()))
+        page._microscope.require(XYStage).move_to_um(4500.0, -4500.0)
+        means.append(float(camera.snap().mean()))
+
+    _stand_in(monkeypatch, serve)
+
+    result = _plate("-p", str(DEMO_SAMPLE_TOML), doc=tmp_path / "run.json")
+
+    assert result.exit_code == 0, result.output
+    at_origin, on_a_well = means
+    assert at_origin < 1500
+    assert on_a_well > 2500
     assert len(closes) == 1
 
 

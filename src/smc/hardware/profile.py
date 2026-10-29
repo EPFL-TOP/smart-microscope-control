@@ -16,6 +16,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import useq
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -35,6 +36,7 @@ else:  # pragma: no cover - exercised on the 3.10 CI job
     import tomli as tomllib
 
 __all__ = [
+    "MAX_SAMPLE_CELLS",
     "ROLES_WITH_A_STOP",
     "AutofocusSection",
     "CameraSection",
@@ -45,6 +47,7 @@ __all__ = [
     "Profile",
     "RolesSection",
     "SafetySection",
+    "SampleSection",
     "list_profiles",
     "search_paths",
 ]
@@ -68,6 +71,20 @@ _MAX_LOCK_TIMEOUT_S = 600.0
 _DEFAULT_LOCK_TIMEOUT_S = 5.0
 #: The longest settle window a profile may set (m2 §12.3).
 _MAX_SETTLE_S = 60.0
+#: The most cells a ``[sample]`` may scatter over its plate (``cells_per_well``
+#: times the wells): every frame renders the ones in view, about 50 ms at the
+#: bound. ``smc.testing.sample_stand`` imports it, because this pure module
+#: cannot import ``smc.testing`` (m1 §8, "The demo-sample stand").
+MAX_SAMPLE_CELLS = 50_000
+#: How far from the stage origin a ``[sample]`` may put well A1, in µm. A stage
+#: travels centimetres, and the bound keeps a typo (1e30) out of the renderer.
+_MAX_SAMPLE_POSITION_UM = 1e6
+_MAX_CELLS_PER_WELL = 500
+_MAX_CELL_RADIUS_UM = 50.0
+#: The smallest spot the synthetic sample's renderer accepts (``smc.testing.synthetic``
+#: ``_MIN_RADIUS_UM``, which a test pins): below it the exponent underflows, and a
+#: radius this module let through would fail at open, with no key named.
+_MIN_CELL_RADIUS_UM = 1e-6
 
 
 def _no_boolean(name: str, value: Any) -> Any:
@@ -502,6 +519,162 @@ class ChannelsSection(_Section):
         return value
 
 
+class SampleSection(_Section):
+    """The synthetic plate a demo stand's camera images (m1 §8, "The demo-sample stand").
+
+    Present only on ``profiles/demo-sample.toml``: ``Microscope.from_core``
+    then replaces the demo camera's pixels with a rendering of this plate at
+    the stage's position, so the plate tools can be tried without a
+    microscope. Every key has a default, so ``[sample]`` alone is a 96-well
+    plate centred on the stage origin with 40 cells per well on average.
+    ``a1_center_xy_um`` is ``None`` for that centring, which depends on the
+    plate and is worked out where the plate is built.
+    """
+
+    #: A ``useq`` plate name ending in ``-well``.
+    plate: str = "96-well"
+    #: Stage position of well A1's centre; ``None``: the plate centred on the origin.
+    a1_center_xy_um: tuple[float, float] | None = None
+    #: The plate's rotation about A1, as ``PlateSample`` takes it.
+    rotation_deg: float = 0.0
+    camera_rotation_deg: float = 0.0
+    mirrored: bool = False
+    #: The mean over the plate's columns: the first holds half of it, the last one and a half times.
+    cells_per_well: int = 40
+    doublet_fraction: float = 0.3
+    cell_radius_um: float = 5.0
+    seed: int = 0
+
+    @field_validator(
+        "a1_center_xy_um",
+        "rotation_deg",
+        "camera_rotation_deg",
+        "cells_per_well",
+        "doublet_fraction",
+        "cell_radius_um",
+        "seed",
+        mode="before",
+    )
+    @classmethod
+    def _not_boolean(cls, value: Any, info: ValidationInfo) -> Any:
+        # pydantic reads `true` as 1 or 1.0, so `cells_per_well = true` would
+        # load as one cell per well.
+        name = str(info.field_name)
+        if isinstance(value, (list, tuple)):
+            for bound in value:
+                _no_boolean(f"each number of {name}", bound)
+            return value
+        return _no_boolean(name, value)
+
+    @field_validator("plate")
+    @classmethod
+    def _plate_is_a_well_plate(cls, value: str) -> str:
+        # A coverslip is a registered plate too, and has no wells to scatter
+        # cells over: the name must say it is a well plate before useq is asked.
+        if not value.endswith("-well"):
+            raise ValueError(
+                f"plate must name a well plate that ends in '-well' (such as "
+                f"'96-well' or '384-well'), got {value!r}"
+            )
+        try:
+            useq.WellPlate.from_str(value)
+        except ValueError as exc:
+            raise ValueError(
+                f"plate {value!r} is not a plate useq knows ({exc}); name one of "
+                "its well plates, such as '96-well' or '384-well'"
+            ) from exc
+        return value
+
+    @field_validator("a1_center_xy_um")
+    @classmethod
+    def _a1_finite_and_near(
+        cls, value: tuple[float, float] | None
+    ) -> tuple[float, float] | None:
+        if value is not None and not all(
+            math.isfinite(v) and abs(v) <= _MAX_SAMPLE_POSITION_UM for v in value
+        ):
+            raise ValueError(
+                f"a1_center_xy_um must be two finite numbers within "
+                f"[-{_MAX_SAMPLE_POSITION_UM:g}, {_MAX_SAMPLE_POSITION_UM:g}] µm "
+                f"(a stage position), got {list(value)}"
+            )
+        return value
+
+    @field_validator("rotation_deg")
+    @classmethod
+    def _rotation_bounded(cls, value: float) -> float:
+        if not (math.isfinite(value) and -45.0 <= value <= 45.0):
+            raise ValueError(
+                f"rotation_deg must be a finite number of degrees in [-45, 45], "
+                f"got {value}"
+            )
+        return value
+
+    @field_validator("camera_rotation_deg")
+    @classmethod
+    def _camera_rotation_bounded(cls, value: float) -> float:
+        if not (math.isfinite(value) and -180.0 <= value <= 180.0):
+            raise ValueError(
+                f"camera_rotation_deg must be a finite number of degrees in "
+                f"[-180, 180], got {value}"
+            )
+        return value
+
+    @field_validator("cells_per_well")
+    @classmethod
+    def _cells_fit_the_plate(cls, value: int, info: ValidationInfo) -> int:
+        if not 0 <= value <= _MAX_CELLS_PER_WELL:
+            raise ValueError(
+                f"cells_per_well must be a whole number in [0, "
+                f"{_MAX_CELLS_PER_WELL}], got {value}"
+            )
+        # Fields validate in order: a plate that failed is absent, and its own
+        # error then stands alone.
+        plate = info.data.get("plate")
+        if plate is not None:
+            wells = useq.WellPlate.from_str(plate)
+            total = value * wells.rows * wells.columns
+            if total > MAX_SAMPLE_CELLS:
+                allowed = MAX_SAMPLE_CELLS // (wells.rows * wells.columns)
+                raise ValueError(
+                    f"cells_per_well {value} on a {plate} plate "
+                    f"({wells.rows * wells.columns} wells) scatters {total} cells, "
+                    f"above the {MAX_SAMPLE_CELLS} a frame can render quickly; "
+                    f"use at most {allowed}, or a plate with fewer wells"
+                )
+        return value
+
+    @field_validator("doublet_fraction")
+    @classmethod
+    def _doublet_fraction_bounded(cls, value: float) -> float:
+        if not (math.isfinite(value) and 0.0 <= value <= 1.0):
+            raise ValueError(
+                f"doublet_fraction must be a fraction in [0, 1], got {value}"
+            )
+        return value
+
+    @field_validator("cell_radius_um")
+    @classmethod
+    def _cell_radius_bounded(cls, value: float) -> float:
+        if not (
+            math.isfinite(value) and _MIN_CELL_RADIUS_UM <= value <= _MAX_CELL_RADIUS_UM
+        ):
+            raise ValueError(
+                f"cell_radius_um must be a finite number of µm in "
+                f"[{_MIN_CELL_RADIUS_UM:g}, {_MAX_CELL_RADIUS_UM:g}], got {value}"
+            )
+        return value
+
+    @field_validator("seed")
+    @classmethod
+    def _seed_not_negative(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError(
+                f"seed must be zero or a positive whole number, got {value}"
+            )
+        return value
+
+
 class Profile(_Section):
     """One instrument's stand-specific facts, validated.
 
@@ -519,7 +692,28 @@ class Profile(_Section):
     light_source: LightSourceSection = Field(default_factory=LightSourceSection)
     channels: ChannelsSection = Field(default_factory=ChannelsSection)
     quirks: dict[str, Any] = Field(default_factory=dict)
+    #: ``None`` on every stand but the demo-sample one. After ``micromanager``:
+    #: ``_sample_only_on_the_demo`` reads it from ``info.data``.
+    sample: SampleSection | None = None
     source: Path | None = Field(default=None, exclude=True)
+
+    @field_validator("sample")
+    @classmethod
+    def _sample_only_on_the_demo(
+        cls, value: SampleSection | None, info: ValidationInfo
+    ) -> SampleSection | None:
+        # Synthetic frames over a real stage would look like a working stand.
+        # A field validator, not a root one, so the error is located at
+        # `sample`; a `micromanager` that failed is absent, and then its own
+        # error stands alone.
+        micromanager = info.data.get("micromanager")
+        if value is not None and micromanager is not None and micromanager.config != "":
+            raise ValueError(
+                "[sample] replaces the demo camera's pixels and is only for the "
+                "demo configuration; it cannot go with micromanager.config "
+                f'{micromanager.config!r}: set config = "" or remove [sample]'
+            )
+        return value
 
     @classmethod
     def demo(cls) -> Profile:
@@ -802,6 +996,7 @@ _SECTIONS: dict[tuple[str, ...], type[BaseModel]] = {
     ("autofocus",): AutofocusSection,
     ("light_source",): LightSourceSection,
     ("channels",): ChannelsSection,
+    ("sample",): SampleSection,
 }
 
 

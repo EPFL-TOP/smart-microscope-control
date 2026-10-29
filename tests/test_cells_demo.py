@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import sys
 import threading
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
@@ -31,9 +32,18 @@ import tifffile
 from pydantic import BaseModel
 
 from smc.hardware import Microscope
-from smc.plugins import PluginRunError, Progress, RunContext, load, run_plugin
+from smc.plugins import (
+    ParamsError,
+    PluginRunError,
+    Progress,
+    ResumeError,
+    RunContext,
+    load,
+    parse_params,
+    run_plugin,
+)
 from smc.plugins.cells import plugin as plugin_mod
-from smc.plugins.cells.detector import Detection
+from smc.plugins.cells.detector import BLOB_DETECTOR, BLOB_DETECTOR_IDENTITY, Detection
 from smc.plugins.cells.plugin import CellsParams, CellsPlugin
 from smc.plugins.slots import (
     Cell,
@@ -976,3 +986,209 @@ def test_weights_that_cannot_be_read_are_a_plugin_run_error(
         _run(demo_microscope, tmp_path, model_path=tmp_path)
 
     assert "cannot be read to hash it" in caught.value.reason
+
+
+# ------------------------------------------ detector=blobs, for the synthetic plate (#260)
+
+BLOB_SHA256 = hashlib.sha256(BLOB_DETECTOR_IDENTITY.encode("utf-8")).hexdigest()
+
+
+def _blobs(microscope: Microscope, tmp_path: Path, **params: Any) -> StageRecord:
+    """``_run`` with the blob detector: no weights file, no model path."""
+    return _run(microscope, tmp_path, detector="blobs", model_path=None, **params)
+
+
+def _refuse_load_detector(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refused(*args: object, **kwargs: object) -> object:
+        raise AssertionError("detector=blobs must not load the trained model")
+
+    monkeypatch.setattr(plugin_mod, "load_detector", refused)
+
+
+def test_cells_with_detector_blobs_needs_neither_torch_nor_weights(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_scan(tmp_path)  # and no weights file: there is nothing to look for
+    monkeypatch.setitem(sys.modules, "torch", None)  # `import torch` raises
+    _refuse_load_detector(monkeypatch)
+
+    result = _result(_blobs(demo_microscope, tmp_path))
+
+    assert result.model == BLOB_DETECTOR == "blobs"
+    assert result.model_sha256 == BLOB_SHA256
+    assert result.device == "cpu"
+    assert result.classes == ("single", "doublet")
+    assert result.counts == {
+        "A1": {"single": 0, "doublet": 0},
+        "A2": {"single": 0, "doublet": 0},
+    }
+    assert any("blob detector" in line for line in result.assumed)
+    assert any("detector=blobs" in line for line in result.assumed)
+
+
+def test_the_blob_detector_says_in_the_result_that_its_counts_are_not_cells(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    _seed_scan(tmp_path)
+
+    result = _result(_blobs(demo_microscope, tmp_path, merge_radius_um=0.0))
+
+    assert result.assumed == (
+        "cells were found by the blob detector (detector=blobs), which counts bright "
+        "round spots for the synthetic plate of the demo-sample profile; on a real "
+        "sample its counts are not cells",
+    )
+
+
+def test_the_trained_model_leaves_no_blob_statement_in_its_result(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_scan(tmp_path)
+    _weights(tmp_path)
+    _install(monkeypatch, _Stub({}))
+
+    result = _result(_run(demo_microscope, tmp_path))
+
+    assert not any("blob" in line for line in result.assumed)
+    assert result.model == "w.pth"
+
+
+def test_cells_with_detector_blobs_finds_a_spot_where_its_frame_says(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    # A frame of 60 x 80, not square (FM-73): a 10 x 10 spot at rows 25-34 and
+    # columns 35-44, which is `(col, row) = (40, 30)` by its box, a quarter of a
+    # micron from the stage position of the centre pixel (39.5, 29.5) at 0.5 um.
+    _seed_scan(tmp_path, [("A1", 0.0)])
+    frame = np.random.default_rng(0).normal(1000, 20, SHAPE)
+    frame[25:35, 35:45] += 3000
+    tifffile.imwrite(
+        tmp_path / "scan" / "t" / "f0.tif", np.rint(frame).astype(np.uint16)
+    )
+
+    record = _blobs(demo_microscope, tmp_path)
+
+    (cell,) = _cells(tmp_path, record)
+    assert (cell.well, cell.label, cell.frame) == ("A1", "single", 0)
+    assert (cell.x_um, cell.y_um) == pytest.approx((0.25, -0.25), abs=0.01)
+    assert _result(record).counts == {"A1": {"single": 1, "doublet": 0}}
+
+
+def test_a_resume_with_another_detector_is_refused(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The trained model first, the blob detector on the resume: cells of two
+    # detectors are not one result (FM-111). The runner refuses it first, on the
+    # parameters, which say `detector`.
+    _seed_scan(tmp_path)
+    _weights(tmp_path)
+    _stop_in_the_second_well(demo_microscope, tmp_path, monkeypatch)
+
+    with pytest.raises(ResumeError) as caught:
+        _blobs(demo_microscope, tmp_path, resume=True)
+
+    assert "parameters differ" in str(caught.value)
+    assert "detector" in str(caught.value)
+
+
+def test_a_resume_from_the_blob_detector_to_the_model_is_refused(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_scan(tmp_path)
+    _weights(tmp_path)
+    stopped = _blobs_stopped_after_the_first_well(demo_microscope, tmp_path)
+    assert stopped.status is StageStatus.stopped
+    counting = _Stub(SCRIPT)
+    _install(monkeypatch, counting)
+
+    with pytest.raises(ResumeError) as caught:
+        _run(demo_microscope, tmp_path, resume=True)
+
+    assert "detector" in str(caught.value)
+    assert counting.seen == []
+
+
+def test_a_resume_after_the_blob_detectors_rules_changed_is_refused(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The parameters are the same on both sides, so only the identity string
+    # tells that another version of the rules made the cells already kept: the
+    # SHA-256 of that string is checked like the weights' (FM-111).
+    _seed_scan(tmp_path)
+    _blobs_stopped_after_the_first_well(demo_microscope, tmp_path)
+    monkeypatch.setattr(
+        plugin_mod, "BLOB_DETECTOR_IDENTITY", BLOB_DETECTOR_IDENTITY + ", version 2"
+    )
+
+    with pytest.raises(PluginRunError) as caught:
+        _blobs(demo_microscope, tmp_path, resume=True)
+
+    assert "weights changed" in caught.value.reason
+    assert "without --resume" in caught.value.reason
+
+
+def _blobs_stopped_after_the_first_well(
+    microscope: Microscope, tmp_path: Path
+) -> StageRecord:
+    stop = threading.Event()
+
+    def stop_after_the_first_well(progress: Progress) -> None:
+        if progress.done == 2:  # A1's two frames
+            stop.set()
+
+    return _blobs(
+        microscope, tmp_path, stop=stop, on_progress=stop_after_the_first_well
+    )
+
+
+def test_a_resume_with_the_same_blob_detector_continues(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    _seed_scan(tmp_path)
+    _blobs_stopped_after_the_first_well(demo_microscope, tmp_path)
+
+    record = _blobs(demo_microscope, tmp_path, resume=True)
+
+    assert set(_result(record).counts) == {"A1", "A2"}
+
+
+@pytest.mark.parametrize(
+    ("params", "phrase"),
+    [
+        (
+            ["detector=blobs", "model_path=/some/w.pth"],
+            "model_path is for detector=model",
+        ),
+        (["detector=blobs", "device=cuda"], "the blob detector runs on the cpu"),
+        (["detector=blobs", "device=mps"], "the blob detector runs on the cpu"),
+    ],
+)
+def test_detector_blobs_refuses_a_model_path_and_a_gpu(
+    params: list[str], phrase: str
+) -> None:
+    with pytest.raises(ParamsError) as caught:
+        parse_params(CellsParams, params)
+
+    assert phrase in str(caught.value)
+
+
+@pytest.mark.parametrize("extra", [[], ["device=auto"], ["device=cpu"]])
+def test_detector_blobs_takes_the_default_and_the_cpu(extra: list[str]) -> None:
+    params = parse_params(CellsParams, ["detector=blobs", *extra])
+
+    assert params.detector == "blobs"
+    assert params.model_path is None
+
+
+def test_the_model_detector_still_takes_a_model_path_and_a_gpu() -> None:
+    params = parse_params(CellsParams, ["model_path=/some/w.pth", "device=cuda"])
+
+    assert params.detector == "model"
+    assert params.device == "cuda"
+
+
+def test_a_detector_that_is_neither_the_model_nor_blobs_is_refused() -> None:
+    with pytest.raises(ParamsError) as caught:
+        parse_params(CellsParams, ["detector=yolo"])
+
+    assert "detector" in str(caught.value)

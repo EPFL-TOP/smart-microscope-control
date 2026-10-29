@@ -178,6 +178,46 @@ map, in the warning colour, says what the page could not read and did not hide: 
 unreadable run document (the page then shows every stage as not run and the nominal
 map, and never writes the file), or a result that no longer matches its model.
 
+## Trying the workflow without a microscope
+
+```text
+smc ui plate -p demo-sample --run-doc run.json
+```
+
+`demo-sample` is the demo stand whose camera images a synthetic 96-well plate
+(`profiles/demo-sample.toml`), so every tool of the page can be pressed on a PC with
+no microscope, and the frames each one takes follow the stage the page moves. The
+stage and the other devices are the demo's; only the pixels are drawn, at the stage's
+position. Press the tools in the order of the checklist, as at a stand:
+
+- **The plate**: run **plate-finding**, which surveys the plate by itself and takes
+  about 7 minutes on the demo stage. **plate-registration** by captures needs the
+  stage moved by hand, which the page cannot do on a demo stage (it has no jog pad).
+  The plate is centred on the stage origin, so A1 is at (−49 500, 31 500) µm and H12
+  at (49 500, −31 500) µm: register those two before starting the page, with the
+  `plate-registration` command of
+  [the plugins page](../plugins/README.md#trying-the-workflow-without-a-microscope),
+  and the page shows the plate from the run document.
+- **scan-plan** and **scan**: choose wells with the map, and give `coverage` a small
+  value (0.4) so that a scan takes seconds.
+- **cells**: choose **detector** `blobs` in its key parameters. The trained model does
+  not see the synthetic cells, and `blobs` counts bright round spots; the result says
+  that on a real sample those counts are not cells.
+- **density**, **route** and **report** are used as on any stand.
+
+**What is synthetic, and the limits**, as `smc doctor -p demo-sample` prints them
+after the roles:
+
+```text
+Sample: a synthetic 96-well plate, A1 at (-49500.0, 31500.0) µm, turned 0°; 40 cells per well on average, 30 % of them doublets (seed 0)
+  frames are rendered where the stage is, not imaged: one flat plane at z = 0 (Z only blurs), no optics
+  pixel sizes up to 4 µm (the texture aliases above); the cells are bright round spots: run cells with detector=blobs
+```
+
+The same commands, from a terminal, are in
+[Trying the workflow without a microscope](../plugins/README.md#trying-the-workflow-without-a-microscope).
+The page on this stand has not been tried in a browser (see below).
+
 ## What it does not do
 
 No live view (a Snap is one frame; live is [#262](https://github.com/EPFL-TOP/smart-microscope-control/issues/262)),
