@@ -144,9 +144,11 @@ def cmd_setup(path: Path, python: str | None) -> int:
             f"creating {root / '.venv'} with {base} (Python {version[0]}.{version[1]})"
         )
         run(base, "-m", "venv", str(root / ".venv"))
-    print("installing the project (editable) and dev tools ...")
+    # The same extras as CI's test job: a worktree for a UI issue needs panel,
+    # or the page tests fail at import (#273).
+    print("installing the project (editable) with the dev and ui extras ...")
     run(str(py), "-m", "pip", "install", "--quiet", "--upgrade", "pip")
-    run(str(py), "-m", "pip", "install", "--quiet", "-e", ".[dev]", cwd=root)
+    run(str(py), "-m", "pip", "install", "--quiet", "-e", ".[dev,ui]", cwd=root)
 
     probe = "import smc, pathlib; print(pathlib.Path(smc.__file__).resolve())"
     where = Path(run(str(py), "-c", probe).strip())
@@ -471,7 +473,8 @@ def main() -> int:
     )
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser(
-        "setup", help="create this worktree's .venv and install the project"
+        "setup",
+        help="create this worktree's .venv and install the project with [dev,ui]",
     )
     s.add_argument(
         "--path", default=".", help="the worktree (default: current directory)"
