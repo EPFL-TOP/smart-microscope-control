@@ -1007,6 +1007,8 @@ def test_z_comes_from_a_locked_frame_when_the_nearest_frame_is_unlocked(
     for p, was in zip(after.positions, before.positions, strict=True):
         if p not in concerned:
             assert (p.z_um, p.pfs_offset) == (was.z_um, was.pfs_offset)
+    # Every concerned stop found another frame: m is 0, and the line says `0 have none`.
+    assert after.assumed[-1] == _unlocked_line(len(concerned), len(after.positions), 0)
 
 
 @pytest.mark.parametrize("state", ["off", "none"])
@@ -1079,6 +1081,58 @@ def test_assumed_counts_the_stops_whose_nearest_frame_was_unlocked(
     )
     for p in after.positions:
         assert (p.z_um, p.pfs_offset) == _expected_pair(seed, p)
+
+
+def test_a_single_stop_with_an_unlocked_nearest_frame_is_counted_alone(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """One stop of four is concerned and it found another frame: the line says ``1 of 4`` and ``0 have none``."""
+    _, seed, after = _route_twice(
+        demo_microscope,
+        tmp_path,
+        lambda seed, result: _nearest_frames_of_first_stops(
+            seed, result, "unlocked", wells=("A1",)
+        ),
+        fields_per_well=1,
+    )
+
+    assert len(after.positions) == len(WELLS)
+    assert [p.well for p in after.positions if _nearest_was_unlocked(seed, p)] == ["A1"]
+    assert after.assumed == (
+        "the route minimises the Euclidean distance between fields; whether the "
+        "stage's move time follows it is not measured",
+        _unlocked_line(1, len(WELLS), 0),
+    )
+
+
+@pytest.mark.parametrize("state", ["off", "none"])
+def test_an_off_or_none_nearest_frame_is_not_counted_as_unlocked_in_a_well_that_has_one(
+    demo_microscope: Microscope, tmp_path: Path, state: FocusState
+) -> None:
+    """The count is of ``unlocked`` frames, not of frames that are not locked: the nearest is ``off``, another frame of the well is ``unlocked``."""
+
+    def marks(seed: Seed, result: RouteResult) -> dict[tuple[str, int], FocusState]:
+        chosen: dict[tuple[str, int], FocusState] = {}
+        for well in WELLS:
+            frames = _frames_of(seed, well)
+            nearest = _nearest_of(frames, _positions_of(result, well)[0])
+            other = next(f for f in frames if f.index != nearest.index)
+            chosen[(well, nearest.index)] = state
+            chosen[(well, other.index)] = "unlocked"
+        return chosen
+
+    _, seed, after = _route_twice(demo_microscope, tmp_path, marks, fields_per_well=1)
+
+    assert len(after.positions) == len(WELLS)
+    assert sum(1 for f in seed.scan.frames if f.focus == "unlocked") == len(WELLS)
+    for p in after.positions:
+        nearest = _nearest_of(_frames_of(seed, p.well), p)
+        assert nearest.focus == state
+        assert (p.z_um, p.pfs_offset) == (nearest.z_um, None)
+    assert after.assumed == (
+        "the route minimises the Euclidean distance between fields; whether the "
+        "stage's move time follows it is not measured",
+    )
 
 
 def test_an_unlocked_frame_that_is_not_the_nearest_changes_nothing(

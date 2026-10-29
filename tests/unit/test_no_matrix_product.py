@@ -73,6 +73,13 @@ def test_no_module_under_src_takes_a_matrix_product() -> None:
     )
 
 
+def test_every_allowed_module_exists_and_says_why() -> None:
+    """A key that names no module exempts nothing, or a new module that takes its path."""
+    for relative, reason in ALLOWED.items():
+        assert (SRC / relative).is_file(), f"ALLOWED names no module: {relative}"
+        assert reason.strip(), f"ALLOWED gives no reason for {relative}"
+
+
 @pytest.mark.parametrize(
     ("source", "form"),
     [
