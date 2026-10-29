@@ -198,6 +198,7 @@ class RunContext:
     plugin: str
     logger: logging.Logger
     run_dir: Path
+    run_doc: Path
     dry_run: bool
 
     def progress(
@@ -221,6 +222,11 @@ with a run document under `tmp_path`, never by building a context.
 - **`run_dir`** is the folder of the run document. A plugin that writes
   files (the scan's frames, #21) writes them under it and stores their
   paths relative to it in its result, so the folder moves as a whole.
+- **`run_doc`** is the path of the run document as the runner was given it
+  (added for #195, which prints the file's name in its header; the context
+  already held it, privately, for `save_checkpoint`). A plugin reads its
+  `.name`; it never writes the document, and never puts the path in a result
+  (FM-50).
 - **`dry_run`** is `microscope.dry_run`, for a plugin that must label what
   it did not do.
 - **`progress`** builds a `Progress` and hands it to the runner's
@@ -1901,6 +1907,109 @@ and a coarse step; `test_an_engaged_autofocus_is_switched_off_and_not_relocked`
 (fake); `test_a_failed_fit_keeps_the_survey_for_a_resume`. **Failure
 modes**: FM-64, FM-88, FM-12.
 
+**Refined while planning #20** (measured 2026-10-28 on a prototype that is
+not committed: `plate_find.py` copied from `nikon-control@1aad7c9`, which
+holds it unchanged, with useq-schema 0.9.2, numpy 2.5.3, pydantic 2.13.5,
+pymmcore-plus 0.18.1, Python 3.13):
+
+- **The original tests pass on the copy**, all 16 that do not need
+  `nikon-control`'s `plate` and `wells`, also with `-W error::RuntimeWarning`.
+  They take 17 s together. One `fit` over the seven `-well` plates takes
+  about 2 s on a 96-well survey of 1120 points, and 7.9 s on a 1536-well
+  survey of 14 800 points.
+- **Units in names.** `PlateFit` has the fields `plate`, `a1_center_xy_um`,
+  `rotation_deg`, `score`, `polarity: Literal[1, -1]`, `n_samples`,
+  `n_inside` and `notes`, and keeps `usable` and `describe()`. The helpers
+  the tests use are public: `plate_pitch_um`, `plate_shape` (rows, columns),
+  `well_size_um`, `survey_bounds_um`, `grid_points`, `inside_mask`,
+  `lattice_score` and `fit_one`. The search's numbers (spans, step counts,
+  the order of the stages) do not change. The geometry may be computed once
+  per `fit_one` instead of once per score (about 0.5 s of the 2.9 s is
+  useq's validation), if the results stay the same.
+- **The survey is walked in snake order.** `grid_points` makes the same
+  points from the same seed as `plate_find.py`, row by row from the lowest Y,
+  and then reverses every other row. The demo stage moves at its `Velocity`
+  property, 10 mm/s by default: 3 mm takes 0.30 s and 30 mm 3.0 s. The
+  original raster ends every row with a return across the whole survey, 27
+  returns of 117 mm on a 96-well plate. The fit does not depend on the order.
+- **A bound on the number of points**, `MAX_SURVEY_POINTS = 25_000` (FM-74,
+  FM-32). `survey_points` counts the points in Python integers before it
+  makes any, and raises `ValueError` beyond the bound: `the survey would take
+  <n> points, more than 25000: give a larger step_um or a smaller
+  margin_pitches`. At the default step and margin a plate takes 130 (6-well),
+  208, 352, 616, 1120, 3952 and 14 800 (1536-well) points. At a margin of 5
+  the 1536-well plate takes 21 328.
+- **The extent check is a function of its own.** `survey_extent_note(points_um:
+  Sequence[tuple[float, float]], plate: str) -> str | None` is
+  `plate_find.py`'s check, and returns its text. `fit_one` puts that text in
+  its notes, as before. The plugin calls it twice, and each time a note is a
+  `PluginRunError`:
+  1. **Before anything moves**, on the planned points inside the soft limits,
+     for `params.plate`.
+  2. **After the fit**, on the sampled points, for the winner's plate. A
+     skipped edge, or a winner larger than the plate surveyed, can leave A1
+     unpinned. A fit that may be whole wells off is not usable.
+
+  A survey without margin still placed a 96-well plate within 440 µm while
+  the check reported it. Whether A1 is right is exactly what such a survey
+  cannot show, so it is refused, not reported.
+- **Soft limits are applied before the survey.** When `XYStage.limits_um()`
+  is not `None`, a planned point is kept when `low ≤ x ≤ high` on both axes,
+  which is the layer's own test (`check_xy_target_um`). The rest are not
+  visited, and `assumed` gains `<n> of <N> survey points are outside the
+  stage's soft limits and were not sampled`. On the demo and the fake,
+  `limits_um()` is `None`.
+- **On the Ti2-E as profiled, every plate is refused before it moves.** The
+  soft limits span 98 × 58 mm. The extent check needs the wells' span plus
+  one pitch: 108 × 72 mm for the 96- and 384-well plates, 116 × 77 mm for the
+  24-well plate. Whether the limits can be widened is the owner's call at
+  the stand (#198). At one pitch of margin, a 96-well survey (117 × 81 mm, ±
+  1.5 mm of jitter) stays inside the plate's SBS footprint of 127.8 × 85.5
+  mm. A 6-well survey (156 × 117 mm) and any larger margin do not.
+- **The checkpoint** is `SurveyCheckpoint(centre_um: tuple[float, float],
+  next_index: int, skipped: int, points: tuple[SurveyPoint, ...])`.
+  `next_index` counts the planned points handled, sampled or skipped, in the
+  list left after the soft limits. The centre is kept because without
+  parameters it is the stage's position at the start, and on a resume the
+  stage is elsewhere. A resume rebuilds the planned list from the parameters
+  and the kept centre. It is refused when `next_index` exceeds the list's
+  length, or `skipped + len(points) != next_index`, with `run plate-finding
+  without --resume`. A pydantic model built from Python objects does not
+  validate a nested dataclass instance again: a `SurveyPoint` holding `nan`
+  is accepted, and refused only when the JSON is read back. So the loop never
+  builds a `SurveyPoint` whose value is not finite. Such a point is a skipped
+  point (`the frame's <statistic> is not finite`).
+- **Skips.** `skipped * 10 > total`, checked at each skip in integers, where
+  `total` is the length of the planned list, saves the checkpoint and raises
+  `PluginRunError`: `<k> of <N> survey points could not be sampled, the last
+  at (<x>, <y>) µm: <Type>: <first line>; check the stage, then run
+  plate-finding --resume`. When the survey ends, `assumed` gains `<k> of <N>
+  survey points could not be sampled and were skipped` for `k > 0`.
+- **The statistic** is `frame_value(frame, statistic) -> float` in the
+  algorithm: `np.mean` or `np.std` with `dtype=np.float64`.
+- **The autofocus line** is `the autofocus was switched off for the survey;
+  engage it again before the scan`, logged as a WARNING when it is switched
+  off, and added to `assumed`. The autofocus is switched off only when
+  `is_engaged()` and at least one point is left to visit: a resume that only
+  fits moves nothing. On the fake, `disengage()` logs
+  `enableContinuousFocus(False)`.
+- **The result.** `PlateFit.to_result(*, runner_up: str | None, margin:
+  float | None, notes: Sequence[str], assumed: Sequence[str] = ()) ->
+  PlateResult`. `notes` are `decide`'s, which include the winner's own notes
+  and the "barely beats" note. The result is built once, never
+  `model_copy`'d. `runner_up` and `margin` (the winner's score minus the
+  runner-up's) are `None` when one plate was fitted.
+- **No move after the survey.** The stage stays at the last point. Nothing
+  returns, and the autofocus is never engaged again (FM-88).
+- **The demo test** sets the demo stage's `Velocity` to `100000` through
+  `microscope.core`. A 12-well `PlateSample` with A1 at (−40 000, 25 000) µm,
+  rotated by 1.2°, imaged as 24 × 32 frames at 20 µm per pixel, and surveyed
+  from a centre (700, −500) µm off: 208 points in 3.0 s, a fit in 1.5 s, the
+  12-well plate identified (score 0.88, runner-up 0.60), and the worst well
+  centre 0.23 of a well radius off. At the default velocity the same survey
+  takes 350 s. A 96-well survey takes 16 s even at the high velocity (14 ms
+  per point), too long for the default suite.
+
 ## 7. Wells and the scan plan (#21)
 
 `smc/plugins/scan_plan/wells.py`, `algorithm.py`, `plugin.py`, entry point
@@ -2830,11 +2939,14 @@ refused. **Failure modes**: FM-88, FM-64, FM-12.
 
 ## 13. The static report (#195)
 
-`smc/plugins/report/render.py` and `plugin.py`, entry point `report`.
+`smc/plugins/report/svg.py`, `render.py` and `plugin.py`, entry point
+`report`. `svg.py` holds the drawing primitives (numbers, escaping, colours,
+paths, the subsample), `render.py` the page; both are pure and import
+nothing of `smc.hardware`.
 
 ```python
 class ReportParams(PluginParams):
-    max_cells_drawn_per_well: int = Field(5000, ge=0, le=100_000)
+    max_cells_drawn_per_well: int = Field(2000, ge=0, le=20_000)
 ```
 
 `requires = ()`, `reads = ("scan-plan", "scan", "cells", "density")`,
@@ -2849,6 +2961,7 @@ def render(
     density: DensityResult,
     route: RouteResult | None,
     title: str,
+    facts: Sequence[tuple[str, str]],
     assumed: Sequence[str],
     max_cells_drawn_per_well: int,
 ) -> str: ...
@@ -2859,9 +2972,10 @@ def render(
 **no script and no external URL** (it opens offline on the microscope PC
 and attached to an issue). It shows:
 
-1. A header: the run document's file name, the profile, the plate, the
-   objective, the date, and every `assumed` line of the upstream results,
-   labelled by stage.
+1. A header: `title`, then a table of facts (the plate, the objective, the
+   wells scanned, the fields taken and failed, the cells found, then the
+   `facts` the plugin passes, §13 *Refined*), and every `assumed` line of the
+   upstream results, labelled by stage by the plugin (`scan-plan: …`).
 2. The plate map, one per label: each well drawn in stage µm (Y up), its
    fill the density per mm² on one sequential scale per label, the value
    written in it, a legend; unscanned wells outlined only.
@@ -2873,12 +2987,143 @@ and attached to an issue). It shows:
    the chosen fields as rectangles with their order and the route's line.
 5. With a route: the route across the plate, its length and `travel_s`.
 
-Every text from a result goes through `html.escape`. **Tests**:
+Every text from a result goes through `html.escape`.
+
+**Refined while planning #195** (measured 2026-10-28 on a prototype that is
+not committed, Python 3.13, pymmcore-plus 0.18.1, useq-schema 0.9.2;
+rendered by Google Chrome headless on macOS, not by Edge, Firefox or Safari):
+
+- **The signature gained `facts`.** The header asks for the run document's
+  file name, the profile and a date, which no argument of the first
+  signature carried. `facts` is a sequence of `(name, text)` rows that the
+  plugin builds and `render` prints after its own rows, escaped: `("Run
+  document", ctx.run_doc.name)`, `("Profile", …)`, `("Generated", "2026-10-28
+  14:05 UTC")`, `("Detector", "<weights file name> (sha256 <12 hex>), score ≥
+  0.5, merge radius 5 µm, cpu")`. **"Generated", not an experiment date**: no
+  record carries the date of the imaging, and the report does not invent one.
+  The time lives in the plugin, so `render` is a pure function of its
+  arguments (the same records give the same bytes). The file name needs the
+  one **addition to §1.4**: `RunContext.run_doc: Path`, the path the runner
+  was given (the context already held it, privately, for `save_checkpoint`); a
+  plugin reads its `.name` and never writes it. Only the name goes into the
+  report, never a path (FM-50: a report is attached to issues).
+- **Size, measured.** 96 wells, 305 fields each (29 280 footprints), 2 000
+  cells each: **4.7 MB** with one `<path>` per label and well (a dot is the
+  subpath `M<x> <y>h0.1` stroked with a round cap, 16 bytes a cell), **12.2
+  MB** with one `<circle>` per cell; at 5 000 cells 9.2 MB against 27.9 MB
+  (and about 480 000 elements for a browser to lay out). The footprints of a
+  well (305 parallelograms in one `<path>`) are 17 kB; building the whole
+  string takes 0.1 to 0.3 s. So: one path per label and well, never an
+  element per cell. A cap per well is no bound on the page (FM-74: `20 000`
+  cells × 96 wells is 1.9 million dots), so `render` also holds a **total
+  of 300 000 dots** (`MAX_CELLS_DRAWN_TOTAL`, 4.7 MB of dots): each scanned
+  well draws at most `min(max_cells_drawn_per_well, MAX_CELLS_DRAWN_TOTAL //
+  scanned_wells)`, and the caption of a well that was cut says `drawn of
+  total`. The default is 2 000, not 5 000: at 320 px a well holds 2 000 dots
+  at 18 % coverage and 5 000 at 44 %, where the dots stop telling a density
+  from another. The footprints and the route's fields are not capped: each is
+  a frame the scan took (a TIFF on disk) or a position of the route's own
+  record.
+- **The subsample is exact and deterministic**: with `n` cells to draw in a
+  well and a cap `c < n`, the cells at indices `(i * n) // c` for `i` in
+  `range(c)` (distinct, increasing, exactly `c`), in the order of the cells
+  file, so frames are thinned evenly and the same records give the same
+  page. `c = 0` draws none and says so.
+- **Only the cells density counted are drawn**: those `WellGeometry.contains`
+  puts inside the well (the cells that `outside_well` counts are not drawn,
+  and the caption gives their number), so an uncapped panel holds exactly
+  `DensityWell.counts[label]` dots per label.
+- **Coordinates.** A well's panel has the well's centre at the origin and Y
+  down: a point `(x, y)` of the stage is drawn at `(x − cx, cy − y)`, a
+  number rounded to 0.1 µm (`-0` is written `0`, a value that is not finite
+  is a `ValueError`, §13 *Refused*). The plate map and the route map have one
+  origin for the whole plate, Y flipped the same way, so A1 is at the top
+  left when the stage's Y of row A is larger than that of row B (measured on
+  a plate turned by 0.8°). **No `transform` flips a group**, because text in
+  it would be mirrored. A footprint is `footprint(x, y, matrix=…,
+  image_shape_px=…)` of the **scan** (a frame is what the scan saw, FM-124),
+  at the stage's readback, drawn as one closed polygon; a **failed** field,
+  which has only its target, is drawn the same way, dashed; a chosen field of
+  the route with the **route's** matrix and frame shape (another objective is
+  another field). A square well is a polygon of its four corners turned by the
+  plate's rotation, a round one a `<circle>`. A dot's diameter is
+  `max(0.012 × the well's width, 12 µm)`.
+- **Colours.** The label colours are the Okabe-Ito set by the label's index
+  in `density.labels` (`#D55E00`, `#0072B2`, `#009E73`, `#CC79A7`, `#E69F00`,
+  `#56B4E9`, `#7A7A7A`, cycling), so a legend and a dot agree. The scale of a
+  label is white to its colour, linear from 0 to the largest density of that
+  label among the scanned wells: `mix = 0.10 + 0.90 × t`, so that a well of
+  density 0 is paler than any other but not white, and different from an
+  unscanned well, which has no fill. The value is written in black or white,
+  whichever has the larger WCAG contrast with the fill (black when the fill's
+  relative luminance is above 0.179), so at least 4.58 : 1 on every step. The
+  legend is five swatches (`t` = 0, 0.25, 0.5, 0.75, 1) with their values.
+  No `linearGradient`, no `pattern`, no `url(#…)`: a fragment is the only kind
+  of reference in the file. A value is written with no exponent (`1234`,
+  `45.6`, `0.12`: whole numbers from 100, one decimal from 10, two below), and
+  not at all on a plate of more than 384 wells (the table and the `<title>`
+  of the well hold it).
+- **Two unknowns are not one zero.** `per_mm2 is None` with `fields == 0` is
+  written *no frame: unknown*; with `fields > 0` (a field smaller than the
+  area grid's resolution: the sampled zero of FM-138) it is written *area
+  below the grid's resolution (<g> µm)*; a measured 0 is `0`. The header
+  states the area grid and that an edge is known to within half a step (from
+  `density.assumed`).
+- **What a reader can verify** (and the tests do, through
+  `html.parser`, with no browser): the page is HTML that balances; every
+  `<svg>` has `role="img"` and an `aria-label`; the data hooks are
+  `data-` attributes and classes, fixed: `table.density` with one
+  `tr[data-well]` per reported well; `svg.plate-map[data-label]` with one
+  `g.well[data-well][data-state]` (`density`, `unknown` or `unscanned`) and
+  `data-value` for a density; `section.well-detail[data-well]` with, in its
+  `svg`: `path.frames[data-n]`, `path.failed[data-n]`,
+  `path.cells[data-label][data-drawn][data-total]` and, with a route,
+  `path.field[data-order][data-name]` and `polyline.route-well`; `svg.route-map`
+  with `polyline.route[data-stops]`. A well's panel is linked from its map
+  entry by `<a href="#w<k>">`, `k` the well's index in `density.wells`, never
+  built from text.
+- **Text is escaped by one function** (`html.escape`, `quote=True`), and
+  nothing from a record is used as an `id`, a class, a style or a number
+  without passing `num`. Free text from a record is: the plate and objective
+  names, the labels, a route stop's `name`, every `assumed` line, `title` and
+  `facts`. A well's name is not free (it must name a well of the plate, or
+  `well_geometry` refuses it). The CSS is one static `<style>`, with
+  `font-family: system-ui, "Segoe UI", sans-serif`.
+- **Refused** (a `ValueError` of `render` that ends `; run <stage> again`,
+  which the plugin turns into a `PluginRunError`): a well that is not on the
+  plate (`scan-plan`); a coordinate or a size that is not finite, in the
+  plate's registration, a frame, a cell or a stop (the stage that holds it;
+  the plate's `useq` model accepts `nan`, FM-114).
+  The **plugin** refuses, before it draws, a set of records that do not fit
+  each other (FM-111): density's labels are not the cells' classes; a
+  density well whose `fields` or `failed_fields` differ from the scan's, or
+  whose `sum(counts) + outside_well` differs from the number of cells the
+  file holds for it (run `density` again); a cell in a well density does not
+  report; a route with a label the cells do not have or a stop in a well
+  density does not report (run `route` again). A cells file that no longer
+  matches its result is `load_cells`' `ValueError`: run `cells` again.
+- **Written** as `<token>.html` under `report/`, a new token for each run; a
+  write that fails says what is kept (`AtomicWriteError.kept`) and that
+  `report` is to be run again, since nothing is resumed. A stop ends the stage
+  before the write. A dry run writes the report (nothing in it needs the
+  stand).
+
+**Tests** (the first five were this section's first list; the fourth is
+renamed because a well's name cannot carry markup):
 `test_the_report_is_one_file_with_no_script_and_no_url`;
 `test_every_scanned_well_appears_with_its_density`;
-`test_a_well_name_with_markup_is_escaped`;
+`test_text_with_markup_is_escaped_wherever_it_is_shown`;
 `test_the_report_without_a_route_says_so`;
-`test_the_cells_drawn_are_capped_and_the_caption_says_so`.
+`test_the_cells_drawn_are_capped_and_the_caption_says_so`; and, from FM-124,
+`test_footprints_use_the_scans_matrix_and_frame_not_the_plans`,
+`test_the_cells_drawn_are_the_cells_density_counted`,
+`test_route_fields_are_drawn_in_the_routes_frame`,
+`test_the_total_of_cells_drawn_is_bounded_whatever_the_cap`,
+`test_a_non_finite_coordinate_is_refused_naming_the_stage`; the plan of #195
+lists the rest. **Failure modes**: FM-21, FM-24, FM-38, FM-50, FM-73, FM-74,
+FM-98, FM-111, FM-114, FM-124, FM-125, FM-131, FM-138, and two new entries
+(markup built from a result's text; an output bounded per unit but not in
+all).
 
 ## 14. The NIS-Elements export (#196) — interface only
 
