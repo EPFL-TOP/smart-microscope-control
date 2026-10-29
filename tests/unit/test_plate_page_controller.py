@@ -33,6 +33,7 @@ from contextlib import AbstractContextManager, contextmanager
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import EntryPoint
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, ClassVar, cast
 
 import pytest
@@ -778,23 +779,35 @@ def test_join_says_that_a_worker_is_still_alive(page: PlatePage) -> None:
     assert page.join(10.0)
 
 
-def test_join_waits_in_short_slices(page: PlatePage) -> None:
+def test_join_waits_in_short_slices(
+    page: PlatePage, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # On Windows one long wait on a thread is not interrupted by Ctrl-C (FM-83).
+    # The deadline runs on a clock of the test's own: on the macOS runner two joins of
+    # 0.1 s used up 0.35 s of wall clock and left two slices, not three (#255, FM-44).
     page.run("slow", [])
     assert Slow.started.wait(5)
     worker = page._worker
     assert worker is not None
+    now = [0.0]
     waits: list[float | None] = []
-    real = worker.join
 
     def spy(timeout: float | None = None) -> None:
+        # The worker stays alive; a slice takes exactly as long as it was given. A wait
+        # with no limit, or a loop that never ends, fails here instead of hanging.
         waits.append(timeout)
-        real(timeout)
+        if timeout is None or len(waits) > 50:
+            raise AssertionError(f"join not sliced against the deadline: {waits[-5:]}")
+        now[0] += timeout
 
-    with _replaced(worker, "join", spy):
-        assert not page.join(0.35)
-    assert len(waits) >= 3
-    assert all(t is not None and t <= 0.1 + 1e-9 for t in waits)
+    # The name, not `time.monotonic`: the worker reads the real clock when it ends.
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            controller_module, "time", SimpleNamespace(monotonic=lambda: now[0])
+        )
+        with _replaced(worker, "join", spy):
+            assert not page.join(0.35)
+    assert waits == pytest.approx([0.1, 0.1, 0.1, 0.05])
 
 
 _ACCEPTED = "stopped: the stand is halted (Resume clears the halt)"
