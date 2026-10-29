@@ -57,10 +57,15 @@ re-run starts over and gives the same route (nothing in it is random).
    field the scan plan planned in it; each later well starts at its field nearest the
    previous well's last stop. The wells follow the scan plan's order, and the legs
    **between** wells are part of the route and of its length.
-4. **Z and autofocus offset.** Each stop takes `z_um` and `pfs_offset` from the frame
-   of its well that the stage reached nearest to it (by the frame's readback), or
-   `null` for both when the well has no frame, or when you image with another
-   objective (below).
+4. **Z and autofocus offset.** Each stop takes `z_um` and `pfs_offset`, **both from
+   one frame**, from the frame of its well that the stage reached nearest to it (by
+   the frame's readback) **and on which the autofocus had not lost the sample**: a
+   frame whose `focus` is `unlocked` is skipped, because its Z is wherever the
+   search had got to and its offset is one nobody read locked on this sample. Frames
+   whose autofocus was `off` or `none` count: their Z is what the focus stage read,
+   and their `pfs_offset` is `null`, so the stop's is. Both are `null` when the well
+   has no such frame (no frame at all, or only unlocked ones), or when you image
+   with another objective (below).
 
 A field holds the cells inside its frame, the edge included. A cell within a rounding
 error of an edge (a millionth of a pixel) may fall on either side, and it is counted
@@ -76,7 +81,7 @@ The slot `route` holds a `RouteResult` (`smc.plugins.slots`):
 
 | Field | Meaning |
 |---|---|
-| `positions` | The stops in route order: `order` (in the whole route), `well`, `name` (`<well>_r<k>`, `k` from 0 along the well's route, three digits), `x_um`, `y_um`, `z_um`, `pfs_offset` and `counts` (**every** label asked for, zeros included). |
+| `positions` | The stops in route order: `order` (in the whole route), `well`, `name` (`<well>_r<k>`, `k` from 0 along the well's route, three digits), `x_um`, `y_um`, `z_um` and `pfs_offset` (both from the nearest frame that was not `unlocked`, step 4; `null` when there is none), and `counts` (**every** label asked for, zeros included). |
 | `uncovered` | Well to the number of wanted cells that no stop holds. **Every well the cells stage scanned** is a key, zeros included, in the plan's order; a well it did not scan is absent. |
 | `distance_um` | The length of the whole route, between wells included. |
 | `travel_s` | The sum of `timings.move_ms` over the same legs; `null` when no `timing` stage ran. Unknown is not zero. |
@@ -117,6 +122,20 @@ and Y move at once (a time nearer the larger of the two) would prefer another
 route. Which one the Ti2-E is has not been measured (#198). The 2-opt is a
 heuristic: the route is never longer than nearest neighbour's and is not claimed to
 be the shortest.
+
+When the nearest frame of at least one stop was `unlocked` (the autofocus had not
+locked on it), `assumed` ends with one more line, which counts them:
+
+```text
+<n> of <total> stops had an unlocked frame as their nearest frame (the autofocus had
+not locked on it): <n - m> took z_um and pfs_offset from the nearest frame that was
+not unlocked, <m> have none because every frame of their well was unlocked
+```
+
+It is one line (shown wrapped here), `m` may be 0 and it still says `0 have none`.
+A stop whose nearest frame was not unlocked is not counted, whether or not a farther
+frame was; a scan without unlocked frames adds no line; and for **another objective**
+it never appears, because every stop has no Z and no offset already.
 
 For a camera that is turned by the stage, the lattice's step and `fov_um` use the
 bounding box of the turned frame, as `scan-plan` does, so the step is larger than a
