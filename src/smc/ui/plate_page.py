@@ -1,6 +1,6 @@
-"""The plate page: Panel widgets over ``PlatePage`` (m3 §15, ADR-0006).
+"""The plate page: Panel widgets over ``PlatePage`` (m3 §15, m5 §3, ADR-0006).
 
-The only module besides the ``smc ui plate`` command that imports Panel and
+The only module besides the ``smc ui`` command that imports Panel and
 Bokeh. It holds no decision: a tap, a button and a typed range each call the
 controller, and an exception the controller raises for the operator's mistake is
 shown as its message and kept as nothing else (FM-98). Three rules the page
@@ -9,7 +9,10 @@ keeps, each learned by measuring (m3 §15.3):
 * **The tick never rebuilds the view.** The periodic callback reads
   ``PlatePage.status()`` once a second and redraws the strip; the plate's wells
   are redrawn only when something changed them (a click, a typed range, a
-  capture, the end of a run), because building 1536 wells takes 339 ms.
+  capture, the end of a run), because building 1536 wells takes 339 ms. The
+  image is drawn only when ``PlatePage.frame().number`` is one the session has
+  not drawn: a frame snapped in another tab is drawn by the next tick (FM-151),
+  and a tick that sees the same number draws nothing (FM-145).
 * **Bokeh models are touched only by server callbacks**, never by the run's
   worker thread, which only fills a queue.
 * **A closed or reloaded tab does nothing.** The controller belongs to the
@@ -25,6 +28,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+import numpy as np
 import panel as pn
 import useq
 from bokeh.events import Tap
@@ -35,19 +39,22 @@ from bokeh.models import (
     LabelSet,
     LinearColorMapper,
 )
-from bokeh.palettes import Viridis256
+from bokeh.palettes import Greys256, Viridis256
 from bokeh.plotting import figure
 
+from smc.hardware.capabilities import Camera
 from smc.ui.controller import (
     PageServerError,
     PageStatus,
     PlatePage,
     PlateView,
+    ResultCard,
     ToolView,
     WellView,
 )
+from smc.ui.frames import Frame, display_image
 
-__all__ = ["PlatePageView", "build", "serve"]
+__all__ = ["PlatePageView", "build", "card_text", "serve"]
 
 #: Names are drawn on a plate of at most this many wells; on more they are noise.
 NAMES_UP_TO_WELLS = 96
@@ -62,6 +69,12 @@ TICK_MS = 1000
 SERVER_STOP_WAIT_S = 10.0
 
 DRIVE_TEXT = "DRIVE: the next click on a well moves the stage there"
+
+#: The centre's tabs, in the order they are built.
+_PLATE_TAB = 0
+_IMAGE_TAB = 1
+
+NO_FRAME_TEXT = "no frame yet"
 
 _WARNING = "#b45309"
 _SELECTED_OUTLINE = "#1f77b4"
@@ -78,12 +91,14 @@ def _um(value: float, digits: int) -> str:
 
 
 def status_line(status: PageStatus) -> str:
-    """The stand on one line: ``XY (x, y) µm | Z z µm | objective | autofocus | light | ...``.
+    """The stand on one line: ``<stand> | XY (x, y) µm | Z z µm | objective | autofocus | light | ...``.
 
-    ``?`` is an unknown, never a zero; ``DRY RUN``, ``HALTED`` and ``moving`` are
-    added only when they apply, and so is what STOP does not stop (FM-117).
+    The stand's name comes first, where ADR-0006 puts it. ``?`` is an unknown,
+    never a zero; ``DRY RUN``, ``HALTED`` and ``moving`` are added only when they
+    apply, and so is what STOP does not stop (FM-117).
     """
     parts = [
+        status.stand,
         "XY ?"
         if status.xy_um is None
         else f"XY ({_um(status.xy_um[0], 1)}, {_um(status.xy_um[1], 1)}) µm",
@@ -129,6 +144,29 @@ def run_text(status: PageStatus) -> str:
     return "\n".join(lines)
 
 
+def card_text(card: ResultCard | None, *, stand: str | None = None) -> str:
+    """A result card as plain text, for a ``pn.pane.Str``: a result's words are never markup (FM-139).
+
+    The header is ``<status> <when_utc> UTC``, then `` on <profile>`` when the
+    record was made on another stand than ``stand`` (when ``stand`` is not
+    known, the profile is always told: a card never claims it is this stand's),
+    then `` (dry run)``; the result's lines follow, indented by two spaces, then
+    one ``assumed:`` line for each assumption and the record's error.
+    """
+    if card is None:
+        return ""
+    header = f"{card.status} {card.when_utc} UTC"
+    if card.profile != stand:
+        header += f" on {card.profile}"
+    if card.dry_run:
+        header += " (dry run)"
+    lines = [header, *(f"  {line}" for line in card.lines)]
+    lines += [f"assumed: {text}" for text in card.assumed]
+    if card.error is not None:
+        lines.append(f"error: {card.error}")
+    return "\n".join(lines)
+
+
 def _tip(well: WellView, label: str | None) -> str:
     """What a hover says of a well: its name, and the counts and density when there are some."""
     if well.counts is None:
@@ -160,6 +198,10 @@ class PlatePageView:
         self._problems_status: tuple[str, ...] = ()
         self._circular: bool | None = None
         self._seen_state: tuple[Any, ...] | None = None
+        # The number of the frame this session last drew, and the stand's name the
+        # tick last read (a result card names a profile only when it is another).
+        self._seen_frame: int | None = None
+        self._stand: str | None = None
         self._tools = page.tools()
 
         self.wells_source = ColumnDataSource(
@@ -227,6 +269,29 @@ class PlatePageView:
         )
         self.figure.on_event(Tap, self.on_tap)
 
+        # The camera's frame: 8-bit grey from 0 to 255 (``display_image``), whatever
+        # the camera's bit depth is.
+        self.image_source = ColumnDataSource({"image": [], "dw": [], "dh": []})
+        self.image_figure = figure(
+            match_aspect=True,
+            height=560,
+            sizing_mode="stretch_width",
+            title=NO_FRAME_TEXT,
+            x_axis_label="camera x (px)",
+            y_axis_label="camera y (px, from the bottom)",
+            tools="pan,wheel_zoom,box_zoom,reset,save",
+            active_scroll="wheel_zoom",
+        )
+        self.image_figure.image(
+            image="image",
+            x=0,
+            y=0,
+            dw="dw",
+            dh="dh",
+            source=self.image_source,
+            color_mapper=LinearColorMapper(palette=Greys256, low=0, high=255),
+        )
+
         self.message = pn.pane.Str("", styles={"color": _WARNING})
         self.problems_text = pn.pane.Str("", styles={"color": _WARNING})
         self.status_text = pn.pane.Str("")
@@ -263,6 +328,8 @@ class PlatePageView:
             label="Wall", options=list(_WALL_SIDES), value="left"
         )
         self.forget_button = pn.widgets.Button(label="Forget")
+        self.snap_button = pn.widgets.Button(label="Snap")
+        self.snap_note = pn.pane.Str("", styles={"color": _WARNING})
 
         self.plate_select.param.watch(
             lambda event: self.on_choose_plate(event.new), "value"
@@ -280,10 +347,12 @@ class PlatePageView:
         self.capture_centre_button.on_click(lambda event: self.on_capture("centre"))
         self.capture_wall_button.on_click(lambda event: self.on_capture("wall"))
         self.forget_button.on_click(lambda event: self.on_forget())
+        self.snap_button.on_click(lambda event: self.on_snap())
 
         self.tool_runs: dict[str, Any] = {}
         self.tool_fields: dict[str, dict[str, Any]] = {}
         self.tool_notes: dict[str, Any] = {}
+        self.tool_cards: dict[str, Any] = {}
         self.layout = self._layout()
         self.refresh()
         self.tick()
@@ -301,11 +370,27 @@ class PlatePageView:
         controls = pn.Row(
             self.plate_select, self.label_select, self.side_select, self.drive_toggle
         )
-        left = pn.Column(
-            self.problems_text,
+        plate_tab = pn.Column(
             controls,
             pn.Row(self.select_input, self.refresh_button),
             pn.pane.Bokeh(self.figure, sizing_mode="stretch_width"),
+            sizing_mode="stretch_width",
+        )
+        image_tab = pn.Column(
+            pn.Row(self.snap_button, self.snap_note),
+            pn.pane.Bokeh(self.image_figure, sizing_mode="stretch_width"),
+            sizing_mode="stretch_width",
+        )
+        # Only the active tab is rendered, so a figure is never laid out hidden.
+        self.tabs = pn.Tabs(
+            ("Plate", plate_tab),
+            ("Image", image_tab),
+            dynamic=True,
+            sizing_mode="stretch_width",
+        )
+        left = pn.Column(
+            self.problems_text,
+            self.tabs,
             pn.pane.Str("Run document", styles={"font-weight": "bold"}),
             self.checklist_text,
             sizing_mode="stretch_width",
@@ -345,6 +430,9 @@ class PlatePageView:
         self.tool_runs[tool.name] = run
         note = pn.pane.Str("", styles={"color": _WARNING})
         self.tool_notes[tool.name] = note
+        # Plain text, never Markdown: a result's words are not markup (FM-139).
+        card = pn.pane.Str("")
+        self.tool_cards[tool.name] = card
         parts: list[Any] = [pn.pane.Str(tool.summary), *key_widgets]
         if tool.name == "plate-registration":
             parts += [
@@ -354,7 +442,7 @@ class PlatePageView:
             ]
         if advanced_widgets:
             parts.append(pn.Card(*advanced_widgets, title="Advanced", collapsed=True))
-        parts += [run, note]
+        parts += [run, note, card]
         return pn.Column(pn.pane.Str(tool.name, styles={"font-weight": "bold"}), *parts)
 
     def _runner(self, plugin: str) -> Callable[[Any], None]:
@@ -457,16 +545,30 @@ class PlatePageView:
         self._try(self.page.resume)
         self.tick()
 
+    def on_snap(self) -> None:
+        """Snap one frame and show the *Image* tab; the tick that first sees the frame draws it.
+
+        A refusal (an activity is going) is the page's message, as for a run.
+        """
+        self._try(self.page.snap)
+        self.tabs.active = _IMAGE_TAB
+        self.tick()
+
     # --- drawing ------------------------------------------------------------------
 
     def tick(self) -> None:
-        """The periodic callback's body: the strip, the run and the buttons, never the view.
+        """The periodic callback's body: the strip, the run, the buttons and a new frame, never the view.
 
         It reads the stand once (``status()``) and redraws what depends on it. The
-        plate's wells are redrawn by ``refresh`` when a run ends, not here.
+        plate's wells are redrawn by ``refresh`` when a run ends, not here, and
+        the image only when the controller holds a frame this session has not drawn.
         """
         status = self.page.status()
         previous, self._running = self._running, status.running
+        if status.stand != self._stand:
+            # The first tick: the cards drawn by `refresh` did not know the stand.
+            self._stand = status.stand
+            self._draw_cards()
         self.status_text.object = status_line(status)
         self.run_text.object = run_text(status)
         self.resume_button.visible = status.halted
@@ -477,6 +579,7 @@ class PlatePageView:
         }
         self._problems_status = status.problems
         self._draw_problems()
+        self._draw_frame()
         self._draw_buttons()
         if previous is not None and status.running is None:
             self.refresh()
@@ -527,8 +630,39 @@ class PlatePageView:
             for w in self.page.walls
         ]
         self.captures_text.object = "\n".join([*refs, *walls]) or "no capture yet"
+        self._draw_cards()
         self._draw_problems()
         self._draw_buttons()
+
+    def _draw_cards(self) -> None:
+        """The result card under each tool, from the view: a result follows the run document, not the tick."""
+        cards = {} if self._view is None else self._view.cards
+        for name, pane in self.tool_cards.items():
+            pane.object = card_text(cards.get(name), stand=self._stand)
+
+    def _draw_frame(self) -> None:
+        """Draw the controller's frame when it is one this session has not drawn.
+
+        The axes are the frame's own pixels: ``dw`` and ``dh`` are its width and
+        height, not those of the strided picture (FM-136). Bokeh draws an image's
+        first row at the bottom, so the rows are flipped to put the camera's top
+        row on top.
+        """
+        frame = self.page.frame()
+        if frame is None or frame.number == self._seen_frame:
+            return
+        self._seen_frame = frame.number
+        self._draw_image(frame)
+
+    def _draw_image(self, frame: Frame) -> None:
+        shown = display_image(frame.image, bit_depth=frame.bit_depth)
+        height, width = frame.image.shape
+        self.image_source.data = {
+            "image": [np.ascontiguousarray(shown[::-1])],
+            "dw": [width],
+            "dh": [height],
+        }
+        self.image_figure.title.text = frame.summary
 
     def _draw_wells(self) -> None:
         view = self._view
@@ -599,12 +733,15 @@ class PlatePageView:
         )
 
     def _draw_buttons(self) -> None:
-        """A tool that is blocked, or any tool while a run goes, cannot be started."""
+        """A tool that is blocked, or any tool or snap while an activity goes, cannot be started."""
         running = self._running
         for name, button in self.tool_runs.items():
             reason = self._blocked.get(name)
             button.disabled = running is not None or reason is not None
             self.tool_notes[name].object = reason or ""
+        lacks = self.page.lacks(Camera)
+        self.snap_button.disabled = running is not None or lacks is not None
+        self.snap_note.object = lacks or ""
 
 
 def build(page: PlatePage) -> Any:
