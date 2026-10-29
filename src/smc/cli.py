@@ -10,6 +10,7 @@ from __future__ import annotations
 import codecs
 import contextlib
 import gc
+import importlib
 import json
 import logging
 import math
@@ -17,6 +18,7 @@ import os
 import platform
 import secrets
 import shutil
+import socket
 import sys
 import tempfile
 import time
@@ -295,6 +297,12 @@ def _report(exc: BaseException, force_hint: str) -> int:
         _fail(str(exc))
         return _EXIT_REFUSED
     if isinstance(exc, PluginError | RunDocumentError):
+        _fail(str(exc))
+        return _EXIT_ERROR
+    # The plate page's server that ended alone (m3 §15.3). Looked up, not imported:
+    # `smc` starts without the ui modules, and the error exists only once they are.
+    controller = sys.modules.get("smc.ui.controller")
+    if controller is not None and isinstance(exc, controller.PageServerError):
         _fail(str(exc))
         return _EXIT_ERROR
     _fail(
@@ -1933,6 +1941,91 @@ def run_command(
                 plugin_version=entry.version,
             )
         _finish(name, path, record, before)
+
+
+ui_app = typer.Typer(
+    help="Pages over the plugins, served on this PC (they need the ui extra).",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+app.add_typer(ui_app, name="ui")
+
+#: What the operator types to get the page's dependencies (FM-36: the brackets are
+#: part of the advice, and are printed as text).
+_UI_EXTRA_FIX = 'install the ui extra: pip install -e ".[ui]"'
+
+
+@ui_app.command("plate")
+def ui_plate_command(
+    ctx: typer.Context,
+    profile: ProfileOption = DEMO_NAME,
+    run_doc: Annotated[
+        str | None,
+        typer.Option(
+            "--run-doc",
+            help="The run document the page reads and its tools write; the same "
+            "file smc run takes. Required.",
+        ),
+    ] = None,
+    port: Annotated[
+        int,
+        typer.Option(
+            "--port",
+            min=1,
+            max=65535,
+            help="The port to serve on. The page listens on localhost only: it has "
+            "no login, so whoever reaches the port can move the stage.",
+        ),
+    ] = 5006,
+    dry_run: DryRunOption = False,
+) -> None:
+    """Serve the plate page: click wells, run the tools, see the density and the route.
+
+    The page opens the stand once and keeps it until Ctrl-C. Every button is a
+    plugin run with the parameters smc run takes, so each has a command-line
+    equivalent. Ctrl-C stops a run that is going, then the server, then releases
+    the stand.
+    """
+    path = _check_run_doc(run_doc)
+    with _Reported(ctx):
+        # Text, never the error: nothing here keeps it (FM-98). `import_module`
+        # reads `sys.modules` as `import` does, so a test's stand-in is found.
+        missing: str | None = None
+        try:
+            plate_page = importlib.import_module("smc.ui.plate_page")
+        except ImportError as exc:
+            missing = str(exc)
+        if missing is not None:
+            _fail(_UI_EXTRA_FIX)
+            _say(missing)
+            raise typer.Exit(code=_EXIT_ERROR)
+        try:
+            with socket.socket() as probe:
+                probe.bind(("localhost", port))
+        except OSError:
+            _fail(f"port {port} is in use; choose another with --port")
+            raise typer.Exit(code=_EXIT_REFUSED) from None
+        from smc.ui.controller import PlatePage
+
+        loaded = Profile.load(profile)
+        # Read before the stand is opened: an unreadable document is refused as it
+        # is, and left untouched.
+        RunDocument.load_or_new(path)
+        stopped: str | None = None
+        with Microscope.open(loaded, dry_run=dry_run) as microscope:
+            if not dry_run:
+                _say_stop_refused(microscope)
+            page = PlatePage(microscope, path)
+            try:
+                plate_page.serve(page, port=port)
+            finally:
+                # The stop is sent before the wait, so a second Ctrl-C during it
+                # still loses nothing, and the stand is released by the `with`
+                # whatever ends this (FM-71).
+                page.close()
+                stopped = page.stopped_by_close
+        if stopped is not None:
+            _say(f"{stopped} was stopped")
 
 
 def main() -> None:

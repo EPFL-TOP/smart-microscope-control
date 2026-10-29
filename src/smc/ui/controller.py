@@ -274,12 +274,15 @@ class PlatePage:
         walls: The wall touches, for plate registration.
         current: The well last clicked or driven to; where *Capture* and
             *Forget* act.
+        stopped_by_close: The plugin whose run ``close()`` stopped and saw end
+            ``stopped``, else ``None``: what ``smc ui plate`` says last.
     """
 
     selection: tuple[str, ...]
     refs: tuple[WellRef, ...]
     walls: tuple[WallTouch, ...]
     current: str | None
+    stopped_by_close: str | None
 
     def __init__(
         self,
@@ -314,6 +317,7 @@ class PlatePage:
         # A plain attribute, written by ``stop()`` and ``resume()``, which take no lock.
         self._stop_note: str | None = None
         self.current = None
+        self.stopped_by_close = None
         self.selection = ()
         self.refs = ()
         self.walls = ()
@@ -699,6 +703,9 @@ class PlatePage:
         self.stop()
         if not self.join(_CLOSE_WAIT_S):
             self._set_outcome(f"{current[0]} did not end within {_CLOSE_WAIT_S:.0f} s")
+        elif self._outcome == f"{current[0]} stopped":
+            # What the command says last: only a run that really ended stopped.
+            self.stopped_by_close = current[0]
 
     def _refuse_if_busy(self) -> None:
         if self._closed:
