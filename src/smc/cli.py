@@ -1950,21 +1950,19 @@ def run_command(
         _finish(name, path, record, before)
 
 
-ui_app = typer.Typer(
-    help="Pages over the plugins, served on this PC (they need the ui extra).",
-    no_args_is_help=True,
-    rich_markup_mode="rich",
-)
-app.add_typer(ui_app, name="ui")
-
 #: What the operator types to get the page's dependencies (FM-36: the brackets are
 #: part of the advice, and are printed as text).
 _UI_EXTRA_FIX = 'install the ui extra: pip install -e ".[ui]"'
 
+#: The pages ``smc ui`` serves: one, and its name stays accepted (``smc ui plate``),
+#: so the notes written for M3 stay true (m5 §1).
+_UI_PAGES = ("plate",)
 
-@ui_app.command("plate")
-def ui_plate_command(
+
+@app.command("ui")
+def ui_command(
     ctx: typer.Context,
+    page: Annotated[str | None, typer.Argument(hidden=True)] = None,
     profile: ProfileOption = DEMO_NAME,
     run_doc: Annotated[
         str | None,
@@ -1986,13 +1984,17 @@ def ui_plate_command(
     ] = 5006,
     dry_run: DryRunOption = False,
 ) -> None:
-    """Serve the plate page: click wells, run the tools, see the density and the route.
+    """Serve the plate page (needs the ui extra): click wells, run the tools, snap a frame.
 
-    The page opens the stand once and keeps it until Ctrl-C. Every button is a
-    plugin run with the parameters smc run takes, so each has a command-line
-    equivalent. Ctrl-C stops a run that is going, then the server, then releases
-    the stand.
+    The page opens the stand once and keeps it until Ctrl-C. Every tool button is
+    a plugin run with the parameters smc run takes, so each has a command-line
+    equivalent, and each tool shows its last result. Ctrl-C stops what is going,
+    then the server, then releases the stand.
     """
+    # Checked first: a word that names no page is no reason to look at the rest.
+    if page is not None and page not in _UI_PAGES:
+        _fail(f"unknown page {page}: smc ui serves one page")
+        raise typer.Exit(code=_EXIT_REFUSED)
     path = _check_run_doc(run_doc)
     with _Reported(ctx):
         # Text, never the error: nothing here keeps it (FM-98). `import_module`
@@ -2020,16 +2022,16 @@ def ui_plate_command(
         with Microscope.open(loaded, dry_run=dry_run) as microscope:
             if not dry_run:
                 _say_stop_refused(microscope)
-            page = PlatePage(microscope, path)
+            controller = PlatePage(microscope, path)
             try:
-                plate_page.serve(page, port=port)
+                plate_page.serve(controller, port=port)
             finally:
                 # The stop is sent before the wait, so a second Ctrl-C during it
                 # still loses nothing, and the stand is released by the `with`
                 # whatever ends this (FM-71). A page that `serve` already closed
                 # returns at once.
-                page.close()
-                closing, ended = page.close_lines, page.close_ended
+                controller.close()
+                closing, ended = controller.close_lines, controller.close_ended
         # After the stand is released: what the stop did and how the run ended, as the
         # page worded them. A run that did not end is a failure, and the stand was
         # released under it (FM-117: never "stopped" by default).

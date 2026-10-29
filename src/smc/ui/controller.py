@@ -27,17 +27,19 @@ import logging
 import queue
 import threading
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from importlib.metadata import EntryPoint
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
 import numpy as np
+import numpy.typing as npt
 import useq
 from pydantic import ValidationError
 
-from smc.hardware.capabilities import Autofocus, LightSource, XYStage
+from smc.hardware.capabilities import Autofocus, Camera, LightSource, XYStage
 from smc.hardware.errors import HardwareError, StopRefusedError
 from smc.plugins import (
     ParamsError,
@@ -64,13 +66,15 @@ from smc.plugins.slots import (
     normalise_well,
     well_geometry,
 )
-from smc.run import RunDocument, RunDocumentError, StageStatus
+from smc.run import RunDocument, RunDocumentError, StageRecord, StageStatus
+from smc.ui.frames import Frame
 
 if TYPE_CHECKING:
     from smc.hardware.microscope import Microscope
 
 __all__ = [
     "KEY_PARAMS",
+    "MORE_STAGE",
     "PAGE_PARAMS",
     "STAGES",
     "CheckItem",
@@ -78,6 +82,7 @@ __all__ = [
     "PageStatus",
     "PlatePage",
     "PlateView",
+    "ResultCard",
     "RouteStop",
     "ToolView",
     "WellView",
@@ -86,7 +91,8 @@ __all__ = [
 log = logging.getLogger("smc.ui")
 
 #: The tools of the workflow in the order the page shows them, grouped by stage.
-#: A plugin the table does not name is not on the page in M3.
+#: Every other registered plugin is on the page too, under ``MORE_STAGE``, by name
+#: (m5 §2.3): a plugin nobody listed here is usable all the same.
 STAGES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Set up", ("camera-calibration", "plate-registration", "plate-finding", "timing")),
     ("Choose", ("scan-plan",)),
@@ -95,8 +101,12 @@ STAGES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Report", ("report", "nis-export")),
 )
 
+#: The stage of a tool that ``STAGES`` does not name: the literal name the page shows.
+MORE_STAGE = "More"
+
 #: The parameters worth a field of their own, in the order the page shows them;
-#: every other parameter is under the tool's *Advanced* fold.
+#: every other parameter is under the tool's *Advanced* fold, except a required one,
+#: which is never folded.
 KEY_PARAMS: dict[str, tuple[str, ...]] = {
     "camera-calibration": ("step_um",),
     "scan-plan": ("objective", "overlap", "coverage"),
@@ -128,6 +138,13 @@ _CHECKLIST: tuple[tuple[str, bool], ...] = (
 )
 
 _SIDES = ("left", "right", "top", "bottom")
+
+#: A result card shows this many values, each at most this many characters long.
+_CARD_LINES = 8
+_CARD_CHARS = 80
+
+#: A card's time when its record's date cannot be put in UTC: unknown, never a guess.
+_UNKNOWN_TIME = "????-??-?? ??:??:??"
 
 #: How long ``close`` waits for a stopped run to end, in seconds.
 _CLOSE_WAIT_S = 10.0
@@ -186,13 +203,33 @@ class CheckItem:
 
 
 @dataclass(frozen=True, slots=True)
+class ResultCard:
+    """What a tool's last record says, as lines of text: never markup (FM-139).
+
+    ``lines`` are the result's values and are empty unless the record ended
+    ``done``: a stopped or failed record's values are not a result (FM-154).
+    ``assumed`` are the result's own ``assumed`` lines, under the same rule.
+    """
+
+    plugin: str
+    status: str
+    when_utc: str
+    profile: str
+    dry_run: bool
+    lines: tuple[str, ...]
+    assumed: tuple[str, ...]
+    error: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class PlateView:
     """A snapshot of what the run document says, as the page needs it (a pure read).
 
     ``nominal`` is true when the wells are those of the plate type with A1 at
     (0, 0) and no rotation, not a registered plate. ``blocked`` maps a registered
     tool to why it cannot run now. ``problems`` are what ``view()`` could not read
-    and did not hide.
+    and did not hide. ``cards`` has one card for each tool that has a record in
+    the run document, and none for the others.
     """
 
     plate: str
@@ -203,6 +240,7 @@ class PlateView:
     checklist: tuple[CheckItem, ...]
     blocked: dict[str, str]
     problems: tuple[str, ...]
+    cards: dict[str, ResultCard]
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,11 +258,13 @@ class ToolView:
 class PageStatus:
     """The stand and the run, read now.
 
-    ``xy_um`` to ``halted`` are ``Microscope.state()``'s; ``stop_refused`` are the
-    roles the profile declares refuse their stop, so that the page can say that
-    STOP does not stop a move in flight on this stand (FM-117).
+    ``stand`` is the profile's ``microscope.name``. ``xy_um`` to ``halted`` are
+    ``Microscope.state()``'s; ``stop_refused`` are the roles the profile declares
+    refuse their stop, so that the page can say that STOP does not stop a move in
+    flight on this stand (FM-117).
     """
 
+    stand: str
     dry_run: bool
     running: str | None
     progress: Progress | None
@@ -262,6 +302,72 @@ def _autofocus_words(engaged: bool | None, locked: bool | None) -> str:
     return "autofocus locked" if locked else "autofocus on, not locked"
 
 
+def _flat(text: str) -> str:
+    """``text`` on one line: its line breaks are spaces."""
+    return " ".join(text.splitlines())
+
+
+def _cut(text: str) -> str:
+    """``text`` of at most ``_CARD_CHARS`` characters, and a ``…`` when it was longer."""
+    return text if len(text) <= _CARD_CHARS else text[:_CARD_CHARS] + "…"
+
+
+def _value_line(key: str, value: object) -> str:
+    """One ``<key>: <value>`` line of a result card; a list or an object is only counted.
+
+    A value is shown by what it is, never by a ``repr`` that could be as long as the
+    result: the card is a summary, and the run document holds the rest.
+    """
+    label = _cut(_flat(key))
+    if isinstance(value, str):
+        return f"{label}: {_cut(_flat(value))}"
+    if isinstance(value, bool | int) or value is None:
+        return f"{label}: {value}"
+    if isinstance(value, float):
+        return f"{label}: {value:g}"
+    if isinstance(value, list):
+        return f"{label}: {len(value)} items"
+    if isinstance(value, dict):
+        return f"{label}: {len(value)} entries"
+    return f"{label}: {type(value).__name__}"
+
+
+def _card(record: StageRecord) -> ResultCard:
+    """The card of ``record``; its values only when it ended ``done`` (FM-154)."""
+    when = record.finished_utc or record.started_utc
+    try:
+        when_utc = when.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    except (OverflowError, ValueError):
+        # A date a model accepts (year 1 with an offset) that UTC cannot hold: a
+        # hand-edited document must not stop ``view()``, which raises nothing for one.
+        when_utc = _UNKNOWN_TIME
+    lines: list[str] = []
+    assumed: tuple[str, ...] = ()
+    if record.status is StageStatus.done and record.result is not None:
+        lines = [
+            _value_line(key, value)
+            for key, value in record.result.items()
+            if key != "assumed"
+        ]
+        if len(lines) > _CARD_LINES:
+            lines = [*lines[:_CARD_LINES], f"… {len(lines) - _CARD_LINES} more"]
+        found = record.result.get("assumed")
+        if isinstance(found, list):
+            assumed = tuple(_flat(str(item)) for item in found)
+        elif found is not None:
+            assumed = (_flat(str(found)),)
+    return ResultCard(
+        plugin=record.plugin,
+        status=record.status.value,
+        when_utc=when_utc,
+        profile=record.profile,
+        dry_run=record.dry_run,
+        lines=tuple(lines),
+        assumed=assumed,
+        error=None if record.error is None else _flat(record.error),
+    )
+
+
 def _first_problem(error: ValidationError) -> str:
     """``<where>: <what>`` of the first validation error."""
     first = error.errors()[0]
@@ -285,7 +391,7 @@ class PlatePage:
         close_lines: What ``close()`` has to tell the operator about the run it
             stopped, as lines: ``<plugin> was stopped`` when the stand took the
             stop and the run ended stopped, else what the stop did and how the run
-            ended. ``()`` when no run was going: what ``smc ui plate`` says last.
+            ended. ``()`` when no run was going: what ``smc ui`` says last.
         close_ended: ``False`` when the run it stopped was still alive after the
             wait.
     """
@@ -314,6 +420,7 @@ class PlatePage:
         # A list, so that a generator handed in is not spent by the first use.
         self._entry_points = None if entry_points is None else list(entry_points)
         self._registry_found: Registry | None = None
+        self._tools_found: tuple[tuple[ToolView, ...], tuple[str, ...]] | None = None
         self._geometry: dict[
             tuple[str, tuple[float, float], float], tuple[WellGeometry, ...]
         ] = {}
@@ -324,9 +431,11 @@ class PlatePage:
         self._current_run: tuple[str, threading.Event] | None = None
         self._progress: Progress | None = None
         self._outcome: str | None = None
+        self._frame: Frame | None = None
         self._queue: queue.SimpleQueue[Progress] = queue.SimpleQueue()
         self._worker: threading.Thread | None = None
         self._closed = False
+        self._ended = 0
         # A plain attribute, written by ``stop()`` and ``resume()``, which take no lock.
         self._stop_note: str | None = None
         self.current = None
@@ -340,6 +449,17 @@ class PlatePage:
         self._restore(doc)
 
     # --- plate and selection -------------------------------------------------
+
+    @property
+    def activities_ended(self) -> int:
+        """How many activities (runs and snaps) have ended since the page began.
+
+        What every session compares to see that something ended while it was not
+        looking: a tool that takes less than a tick is never seen running by a
+        second tab, and its record, its result card and the checklist are new all
+        the same (FM-151).
+        """
+        return self._ended
 
     @property
     def plate(self) -> str:
@@ -526,6 +646,13 @@ class PlatePage:
                 # parse_params knows the model, not the plugin: name the plugin, as
                 # `smc run` does, so the advice (--show-params) is for the right one.
                 raise ParamsError(plugin, exc.problems) from None
+            except Exception as exc:
+                # A third party's validator is code nobody here reviewed, and pydantic
+                # turns only ValueError and AssertionError into a validation error:
+                # any other exception is the plugin's, and an outcome, never a click
+                # that ends with no word (FM-113).
+                self._set_outcome(f"{plugin}: {type(exc).__name__}: {_one_line(exc)}")
+                return
             doc = RunDocument.load_or_new(self._run_doc)
             check_ready(
                 entry.plugin,
@@ -539,13 +666,33 @@ class PlatePage:
             # Text, never the error (FM-98).
             self._set_outcome(f"{plugin}: {type(exc).__name__}: {_one_line(exc)}")
             return
+        self._start_activity(
+            plugin, lambda event: self._run_plugin(plugin, entry, parsed, event)
+        )
+
+    def _start_activity(
+        self, name: str, body: Callable[[threading.Event], str]
+    ) -> None:
+        """Start the activity ``name`` on the daemon worker; ``body`` returns its outcome text.
+
+        Every action that reaches the stand through a call that may last is such
+        an activity (m5 §2.1): it holds ``_current_run`` under its name, so that a
+        second one is refused and ``stop()``, ``resume()``, ``close()`` and
+        ``join()`` treat it as they treat a run. The lock discipline is that of the
+        class: ``_lock`` guards the activity's name, the progress, the outcome and
+        what the activity keeps, and is never held across a device call.
+
+        Raises:
+            RuntimeError: An activity is going (``<name> is running``), or the page
+                is closed.
+        """
         event = threading.Event()
         with self._lock:
             if self._closed:
                 raise RuntimeError("the page is closed")
             if self._current_run is not None:
                 raise RuntimeError(f"{self._current_run[0]} is running")
-            self._current_run = (plugin, event)
+            self._current_run = (name, event)
             self._progress = None
             self._outcome = None
             while True:
@@ -557,8 +704,8 @@ class PlatePage:
             # alive after the page is closed.
             worker = threading.Thread(
                 target=self._work,
-                args=(plugin, entry, parsed, event),
-                name=f"smc-ui-{plugin}",
+                args=(name, body, event),
+                name=f"smc-ui-{name}",
                 daemon=True,
             )
             self._worker = worker
@@ -566,46 +713,139 @@ class PlatePage:
 
     def _work(
         self,
-        plugin: str,
-        entry: PluginEntry,
-        parsed: PluginParams,
+        name: str,
+        body: Callable[[threading.Event], str],
         event: threading.Event,
     ) -> None:
-        """The worker's body: the run, and its outcome as text before anything else ends."""
-        log.info("%s: started from the plate page", plugin)
-        started = time.monotonic()
-        outcome = f"{plugin}: ended without an outcome"
+        """The worker's body: the activity, and its outcome as text before anything else ends."""
+        outcome = f"{name}: ended without an outcome"
         try:
-            try:
-                record = run_plugin(
-                    entry.plugin,
-                    self._microscope,
-                    parsed,
-                    self._run_doc,
-                    on_progress=self._queue.put,
-                    stop=event,
-                    plugin_version=entry.version,
-                )
-            except RunDocumentError as exc:
-                if exc.record is not None and exc.record.result is not None:
-                    outcome = (
-                        f"{plugin} ran, but its record could not be written: "
-                        f"{_one_line(exc)}"
-                    )
-                else:
-                    outcome = f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
-            except Exception as exc:
-                outcome = f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
-            else:
-                if record.status is StageStatus.done:
-                    outcome = f"{plugin} done in {time.monotonic() - started:.1f} s"
-                else:
-                    outcome = f"{plugin} stopped"
+            outcome = body(event)
         finally:
             with self._lock:
                 self._outcome = outcome
                 self._current_run = None
+                # After the activity's own writes (a run's record is on disk by now),
+                # so a session that sees the count change reads them.
+                self._ended += 1
             log.info("%s", outcome)
+
+    def _run_plugin(
+        self,
+        plugin: str,
+        entry: PluginEntry,
+        parsed: PluginParams,
+        event: threading.Event,
+    ) -> str:
+        """A plugin's run on the worker, and its outcome as text."""
+        log.info("%s: started from the plate page", plugin)
+        started = time.monotonic()
+        try:
+            record = run_plugin(
+                entry.plugin,
+                self._microscope,
+                parsed,
+                self._run_doc,
+                on_progress=self._queue.put,
+                stop=event,
+                plugin_version=entry.version,
+            )
+        except RunDocumentError as exc:
+            if exc.record is not None and exc.record.result is not None:
+                return (
+                    f"{plugin} ran, but its record could not be written: "
+                    f"{_one_line(exc)}"
+                )
+            return f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
+        except Exception as exc:
+            return f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
+        if record.status is StageStatus.done:
+            return f"{plugin} done in {time.monotonic() - started:.1f} s"
+        return f"{plugin} stopped"
+
+    def lacks(self, capability: type) -> str | None:
+        """Why the stand cannot offer ``capability``, or ``None``: the one text of a disabled control.
+
+        A control the stand cannot honour says so instead of failing when it is
+        pressed (ADR-0006, principle 1).
+        """
+        if self._microscope.has(capability):
+            return None
+        return f"this stand has no {capability.__name__}"
+
+    def snap(self) -> None:
+        """Snap one frame on the worker and keep it as ``frame()``; what it did is the ``outcome``.
+
+        An activity like a run (m5 §2.1): refused while another goes. A stand
+        without a camera is an outcome and no thread starts. A snap writes nothing
+        to disk and nothing to the run document: ``smc snap --out`` writes a
+        frame.
+
+        Raises:
+            RuntimeError: An activity is going (``<name> is running``), or the page
+                is closed.
+        """
+        self._refuse_if_busy()
+        reason = self.lacks(Camera)
+        if reason is not None:
+            self._set_outcome(f"snap: {reason}")
+            return
+        self._start_activity("snap", self._snap)
+
+    def frame(self) -> Frame | None:
+        """The latest frame, ``None`` before the first; the same for every session."""
+        with self._lock:
+            return self._frame
+
+    def _snap(self, event: threading.Event) -> str:
+        """One snap on the worker, and its outcome as text: no exception is kept (FM-98).
+
+        Read as ``smc snap`` reads: the exposure, the frame, then the stand's
+        position and pixel size. The camera's array is copied: MMCore may hand out
+        a view of its own buffer, and the page keeps the frame for as long as a
+        session draws it.
+        """
+        log.info("snap: started from the plate page")
+        try:
+            camera = self._microscope.require(Camera)
+            exposure_ms = camera.exposure_ms()
+            image = camera.snap()
+            if not (
+                image.ndim == 2
+                and image.dtype.kind == "u"
+                and image.dtype.itemsize <= 2
+            ):
+                return (
+                    f"snap: the camera returned a {image.dtype} frame of shape "
+                    f"{image.shape}; the page shows 2-D uint8 or uint16 frames"
+                )
+            bit_depth = camera.bit_depth()
+            state = self._microscope.state()
+            kept = np.array(image)
+            kept.flags.writeable = False
+            height, width = kept.shape
+            summary = (
+                f"{height}x{width} {kept.dtype}, exposure {exposure_ms:g} ms, "
+                f"min {int(kept.min())}, max {int(kept.max())}"
+            )
+            taken_utc = datetime.now(timezone.utc)
+            xy_um = None if state.xy is None else (state.xy.x_um, state.xy.y_um)
+            with self._lock:
+                previous = self._frame
+                self._frame = Frame(
+                    number=1 if previous is None else previous.number + 1,
+                    image=cast("npt.NDArray[np.uint8] | npt.NDArray[np.uint16]", kept),
+                    bit_depth=bit_depth,
+                    exposure_ms=exposure_ms,
+                    # 0.0 is the camera (or a failed read) saying "unknown".
+                    pixel_size_um=state.pixel_size_um or 0.0,
+                    xy_um=xy_um,
+                    taken_utc=taken_utc,
+                    summary=summary,
+                )
+        except Exception as exc:
+            return f"snap: {type(exc).__name__}: {_one_line(exc)}"
+        return f"snap: {summary}"
 
     def stop(self) -> None:
         """Ask the run to stop, then stop the stand; say what the stop did, never "stopped" by default.
@@ -677,6 +917,7 @@ class PlatePage:
             else "no autofocus"
         )
         return PageStatus(
+            stand=self._microscope.profile.microscope.name,
             dry_run=self._microscope.dry_run,
             running=running,
             progress=progress,
@@ -767,36 +1008,59 @@ class PlatePage:
     # --- the view ---------------------------------------------------------------
 
     def tools(self) -> tuple[ToolView, ...]:
-        """The registered tools ``STAGES`` names, in the workflow's order.
+        """Every registered tool: those ``STAGES`` names in the workflow's order, then the others under ``More``, by name.
 
         A stage with no registered tool has none in the result; the stage's name
-        is on each tool.
+        is on each tool. A tool's ``key`` rows are ``KEY_PARAMS``' in its order and
+        then every **required** field it does not name, so a plugin with no line
+        in ``KEY_PARAMS`` is usable all the same; ``advanced`` is the rest. A
+        plugin whose parameters cannot be described is left out and is a line of
+        ``view().problems``, never an error here (FM-113).
         """
-        plugins = self._registry().plugins
-        views: list[ToolView] = []
-        for stage, names in STAGES:
-            for name in names:
-                entry = plugins.get(name)
-                if entry is None:
+        return self._tools_and_problems()[0]
+
+    def _tools_and_problems(self) -> tuple[tuple[ToolView, ...], tuple[str, ...]]:
+        """The tools and what could not be read for them, built once: the registry does not change (FM-112)."""
+        if self._tools_found is None:
+            plugins = self._registry().plugins
+            staged = {name: stage for stage, names in STAGES for name in names}
+            order = [
+                name for _stage, names in STAGES for name in names if name in plugins
+            ]
+            order += sorted(name for name in plugins if name not in staged)
+            views: list[ToolView] = []
+            problems: list[str] = []
+            for name in order:
+                entry = plugins[name]
+                try:
+                    described = describe_params(entry.plugin.Params)
+                except Exception as exc:
+                    # Third-party code: a model whose defaults or types cannot be
+                    # described is a finding, not the end of the page (FM-113).
+                    problems.append(
+                        f"plugin {name}: {type(exc).__name__}: {_one_line(exc)}"
+                    )
                     continue
                 hidden = PAGE_PARAMS.get(name, ())
-                rows = [
-                    r
-                    for r in describe_params(entry.plugin.Params)
-                    if r[0] not in hidden
-                ]
+                rows = [r for r in described if r[0] not in hidden]
                 by_name = {row[0]: row for row in rows}
                 keys = [k for k in KEY_PARAMS.get(name, ()) if k in by_name]
+                keys += [
+                    row[0]
+                    for row in rows
+                    if row[2] == "(required)" and row[0] not in keys
+                ]
                 views.append(
                     ToolView(
                         name=name,
                         summary=entry.plugin.summary,
-                        stage=stage,
+                        stage=staged.get(name, MORE_STAGE),
                         key=tuple(by_name[k] for k in keys),
                         advanced=tuple(r for r in rows if r[0] not in keys),
                     )
                 )
-        return tuple(views)
+            self._tools_found = (tuple(views), tuple(problems))
+        return self._tools_found
 
     def view(self) -> PlateView:
         """A snapshot built from a fresh read of the run document; it raises nothing for it.
@@ -849,7 +1113,12 @@ class PlatePage:
             route=stops,
             checklist=self._checklist(doc),
             blocked=self._blocked(doc),
-            problems=tuple(problems),
+            problems=(*problems, *self._plugin_problems()),
+            cards={
+                tool.name: _card(doc.stages[tool.name])
+                for tool in self.tools()
+                if tool.name in doc.stages
+            },
         )
 
     # --- internals of the view -----------------------------------------------------
@@ -859,6 +1128,14 @@ class PlatePage:
         if self._registry_found is None:
             self._registry_found = discover(self._entry_points)
         return self._registry_found
+
+    def _plugin_problems(self) -> tuple[str, ...]:
+        """A line for each plugin that did not load, and for each whose parameters could not be described."""
+        failed = tuple(
+            f"plugin {failure.name}: {' '.join(failure.reason.split())}"
+            for failure in self._registry().failures
+        )
+        return (*failed, *self._tools_and_problems()[1])
 
     def _document(self) -> tuple[RunDocument, str | None]:
         """The run document as it is now, or a new one and why the file could not be read."""
@@ -892,8 +1169,15 @@ class PlatePage:
         return None
 
     def _checklist(self, doc: RunDocument) -> tuple[CheckItem, ...]:
+        """M3's slots in their order, then every other slot a record of the document provides.
+
+        A third-party plugin's stage shows without a line in ``_CHECKLIST``: the
+        extra slots are optional (no workflow of ours needs them) and by name.
+        """
+        named = {slot for slot, _optional in _CHECKLIST}
+        extra = sorted({r.provides for r in doc.stages.values()} - named)
         items: list[CheckItem] = []
-        for slot, optional in _CHECKLIST:
+        for slot, optional in (*_CHECKLIST, *((slot, True) for slot in extra)):
             if doc.provider(slot) is None:
                 items.append(CheckItem(slot, optional, "not run", None))
                 continue
@@ -905,35 +1189,24 @@ class PlatePage:
         return tuple(items)
 
     def _blocked(self, doc: RunDocument) -> dict[str, str]:
-        """Why each registered tool of ``STAGES`` cannot run now; a tool that can is absent."""
-        plugins = self._registry().plugins
+        """Why each registered tool cannot run now; a tool that can is absent."""
         blocked: dict[str, str] = {}
-        for _stage, names in STAGES:
-            for name in names:
-                entry = plugins.get(name)
-                if entry is None:
-                    continue
+        for name, entry in self._registry().plugins.items():
+            reason = next(
+                (r for r in (self._unusable(doc, s) for s in entry.plugin.reads) if r),
+                None,
+            )
+            if reason is None:
                 reason = next(
                     (
-                        r
-                        for r in (self._unusable(doc, s) for s in entry.plugin.reads)
-                        if r
+                        lack
+                        for lack in (self.lacks(cap) for cap in entry.plugin.requires)
+                        if lack
                     ),
                     None,
                 )
-                if reason is None:
-                    lacking = next(
-                        (
-                            cap
-                            for cap in entry.plugin.requires
-                            if not self._microscope.has(cap)
-                        ),
-                        None,
-                    )
-                    if lacking is not None:
-                        reason = f"this stand has no {lacking.__name__}"
-                if reason is not None:
-                    blocked[name] = reason
+            if reason is not None:
+                blocked[name] = reason
         return blocked
 
     def _geometries(self, doc: RunDocument) -> tuple[tuple[WellGeometry, ...], bool]:

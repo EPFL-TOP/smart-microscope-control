@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from importlib.metadata import EntryPoint
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from smc.hardware import Microscope
@@ -97,6 +98,54 @@ def test_a_drive_click_moves_the_demo_stage_to_the_well(
         page.close()
 
 
+def test_a_snap_on_the_demo_camera_is_a_512_square_uint16_frame(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    # Measured on the demo adapter: 512 x 512, 16 bits, 10.8 ms at its default exposure.
+    page = PlatePage(demo_microscope, tmp_path / "run.json", entry_points=[GOTO_WELL])
+    try:
+        page.snap()
+        assert page.join(10.0)
+        frame = page.frame()
+        assert frame is not None, page.status().outcome
+        assert frame.summary.startswith("512x512 uint16, exposure ")
+        assert page.status().outcome == f"snap: {frame.summary}"
+        assert frame.image.shape == (512, 512)
+        assert frame.image.dtype == np.uint16
+        assert frame.bit_depth == 16
+        assert not frame.image.flags.writeable
+        # A snap writes nothing: not a file, not the run document.
+        assert list(tmp_path.iterdir()) == []
+    finally:
+        page.close()
+
+
+def test_a_demo_frame_is_drawn_by_the_page(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    if os.environ.get("SMC_REQUIRE_UI"):
+        import panel  # noqa: F401  (CI must fail, not skip, when the extra is missing)
+    else:
+        pytest.importorskip("panel")
+    from smc.ui.plate_page import PlatePageView
+
+    page = PlatePage(demo_microscope, tmp_path / "run.json", entry_points=[GOTO_WELL])
+    try:
+        view = PlatePageView(page)
+        view.snap_button.clicks += 1
+        assert page.join(10.0)
+        view.tick()
+        drawn = view.image_source.data
+        assert drawn["image"][0].shape == (512, 512)
+        assert drawn["image"][0].dtype == np.uint8
+        assert list(drawn["dw"]) == [512]
+        assert list(drawn["dh"]) == [512]
+        assert view.image_figure.title.text.startswith("512x512 uint16")
+        assert view.layout.get_root() is not None
+    finally:
+        page.close()
+
+
 def test_the_page_builds_on_the_demo(
     demo_microscope: Microscope, tmp_path: Path
 ) -> None:
@@ -111,7 +160,7 @@ def test_the_page_builds_on_the_demo(
     try:
         assert build(page).get_root() is not None
         view = PlatePageView(page)
-        assert view.status_text.object.startswith("XY (0.0, 0.0) µm | Z ")
+        assert view.status_text.object.startswith("demo | XY (0.0, 0.0) µm | Z ")
         assert len(view.wells_source.data["name"]) == 96
         assert not tmp_path.joinpath(
             "run.json"
