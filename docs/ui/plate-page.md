@@ -1,12 +1,14 @@
 # The plate page
 
 A web page on the microscope PC: the plate drawn in stage µm, wells you select with
-a click or a typed range, the tools of the plate-scan workflow with a Run button
-each, and, once the workflow has run, the density of each well and the route. It is
-**a view only**: every button is a [plugin](../plugins/README.md) run with the
-parameters `smc run` takes, or a read of a capability, so each has a command-line
-equivalent ([ADR-0006](../adr/0006-user-interface.md)). The design is
-[`m3-plugins.md`](../design/m3-plugins.md) §15; this page is how to use it.
+a click or a typed range, a **Snap** that shows the camera's frame, every registered
+tool with a Run button and the result of its last run, and, once the workflow has
+run, the density of each well and the route. It is **a view only**: every button is a
+[plugin](../plugins/README.md) run with the parameters `smc run` takes, or a read of
+a capability, so each has a command-line equivalent
+([ADR-0006](../adr/0006-user-interface.md)). The design is
+[`m3-plugins.md`](../design/m3-plugins.md) §15 and
+[`m5-web-ui.md`](../design/m5-web-ui.md); this page is how to use it.
 
 It needs the `ui` extra (Panel):
 
@@ -14,13 +16,17 @@ It needs the `ui` extra (Panel):
 pip install -e ".[ui]"
 ```
 
-Without it `smc ui plate` exits 1 and says so; the rest of `smc` does not need it.
+Without it `smc ui` exits 1 and says so; the rest of `smc` does not need it.
 
 ## Starting it
 
 ```text
-smc ui plate -p <profile> --run-doc run.json [--port 5006] [--dry-run]
+smc ui -p <profile> --run-doc run.json [--port 5006] [--dry-run]
 ```
+
+`smc ui plate ...` still works and serves the same page (it is the name this page
+had before it grew). Any other word after `ui` exits 2 with `unknown page <word>:
+smc ui serves one page`, before anything else is looked at.
 
 `--run-doc` is the same run document `smc run` takes, and is required for the same
 reason: a file is never created where you did not say. The command checks it, opens
@@ -38,6 +44,7 @@ tunnel is **untried**: it could work only with the same port number on both ends
 
 | Refused | What it says |
 |---|---|
+| A word after `ui` other than `plate` | exit 2, `unknown page <word>: smc ui serves one page`; the stand is not opened |
 | No `--run-doc` | exit 2, `a run needs --run-doc` |
 | The `ui` extra is missing | exit 1, `install the ui extra: pip install -e ".[ui]"` and the import error |
 | The port is taken (on `127.0.0.1` or on `::1`) | exit 2, `port N is in use; choose another with --port`; the stand is not opened |
@@ -65,7 +72,8 @@ and the captures: a tab draws what another tab changed within a second.
 
 ## What is on the page
 
-**The strip, at the top.** The stage `XY (x, y) µm`, `Z`, the objective, the autofocus
+**The strip, at the top.** The stand's name (the profile's `microscope.name`), then
+the stage `XY (x, y) µm`, `Z`, the objective, the autofocus
 (`autofocus locked`, `autofocus on, not locked`, `autofocus off`, `autofocus ?` when a
 read failed), the light, `DRY RUN` when it is one, and `HALTED` with **Resume** when the
 stand is halted. `?` is an unknown, never a zero. It is read once a second, and no
@@ -80,7 +88,10 @@ what the last STOP did.
 runs to its target. After STOP every action is refused until **Resume**, which is
 refused while a run is going.
 
-**The map.** The plate in stage µm, X right and Y up, wells as circles (96-well and
+**The centre has two tabs, *Plate* and *Image*.** Only the tab you see is drawn. The
+run document's checklist stays under both.
+
+**The map** (*Plate*). The plate in stage µm, X right and Y up, wells as circles (96-well and
 below) or squares (384 and 1536), turned by the plate's rotation. Its title says which
 map it is: **the registered plate** (A1 and the rotation from plate registration), or
 a **nominal map** (A1 at 0, 0, not turned) when no plate is registered or the plate
@@ -102,15 +113,45 @@ goes back to select after it, even if the click found no well or was refused. Th
 the stage to the same-named well of the other plate): choose the registered plate, or
 calibrate the one you chose.
 
+**Snap and the image** (*Image*). **Snap** takes one frame from the camera, makes the
+*Image* tab the one you see and draws the frame within a second. The title is the frame's
+own summary, as `smc snap` prints it (`512x512 uint16, exposure 10 ms, min 706, max
+5846`); before the first frame it says `no frame yet`. The frame is kept as the camera
+gave it, **never rescaled**, and a snap writes nothing: not a file, not the run
+document (`smc snap --out` writes a TIFF). What is drawn is a copy for the screen: 8-bit
+grey, stretched between the 0.5 and 99.5 percentiles of the frame, so a hot pixel does
+not decide the contrast; a **flat** frame is shown against the camera's range instead, so
+a saturated frame is white and a dark one black and not a stretched grey. A frame larger
+than 1024 px on a side is shown at every n-th pixel (n = 2 for a 1412 px camera), and the
+axes are still the **camera's pixels**. The frame is the same for every tab of the server: a
+frame snapped in one tab is drawn by the others within a second. Snap is disabled with
+`this stand has no Camera` when the stand has none, and, as every Run button, while
+something else is going: a snap is one activity like a run, so only one runs at a time
+(`snap is running`, `<plugin> is running`), and STOP during a snap says `snap told to
+stop; ...` and halts the stand. A frame the page cannot show (not 2-D `uint8` or
+`uint16`) is an outcome under the strip and is not kept.
+
 **The tools.** One section per stage of the workflow (*Set up*, *Choose*, *Acquire*,
-*Find*, *Report*), one block per registered tool: its key parameters as fields, the
-rest under *Advanced*, a **Run** button and the progress. An empty field is not sent, so
-the plugin's default holds; the placeholder is that default. What the page fills itself
-is not offered: the wells of `scan-plan`, and the plate and the captures of
-`plate-registration`. A tool that cannot run now is disabled with the reason beside it
-(`the run document has no plate; ...`, `this stand has no XYStage`), and so is every
-tool while a run is going. A tool that is not registered (a plugin that has not been
-written, or an install that predates it) is not on the page.
+*Find*, *Report*), and a last one, **More**, for every other registered plugin by name
+(`goto-well`, a third party's): every registered plugin is a tool. One block per tool:
+its key parameters as fields, the rest under *Advanced*, a **Run** button and the
+progress. A **required** parameter with no default is never folded under *Advanced*:
+it is a field of its own. An empty field is not sent, so the plugin's default holds; the
+placeholder is that default. What the page fills itself is not offered: the wells of
+`scan-plan`, and the plate and the captures of `plate-registration`. A tool that cannot
+run now is disabled with the reason beside it (`the run document has no plate; ...`,
+`this stand has no XYStage`), and so is every tool while a run is going. A plugin that
+failed to load, or whose parameters cannot be described, is not a tool: a line above the
+map says `plugin <name>: <why>`.
+
+**A tool's result**, under its Run button, as plain text (a result's words are never
+read as markup): `<status> <time> UTC`, then ` on <profile>` when the record was made
+on another stand and ` (dry run)` when it was one, then the result's values, two
+spaces in, a line each (a text cut at 80 characters, a list or an object only counted,
+at most eight, then `… n more`), then what the result **assumed** and the error. A tool
+whose last run was stopped or failed shows its status and its error and **no values**:
+they are not a result. The card follows the run document, so it is drawn when a run
+ends and when you press **Refresh**, not every second.
 
 **Run starts a stage afresh, and never continues one.** After STOP (or a failure) a
 stage's record is `stopped` or `failed`, the checklist says `run it again`, and the page's
@@ -130,21 +171,27 @@ clears the selection and the captures.
 
 **The run document**, as a checklist: `✓ plate` (usable), `· cells` (not run),
 `✗ scan: the last run of scan ended failed; run it again` (there, and not usable, with
-why). A line above the map, in the warning colour, says what the page could not read
-and did not hide: an unreadable run document (the page then shows every stage as not
-run and the nominal map, and never writes the file), or a result that no longer
-matches its model.
+why). The slots of the plate-scan workflow come first, in its order; any other slot the
+document holds (a third-party plugin's stage) follows by name. A line above the
+map, in the warning colour, says what the page could not read and did not hide: an
+unreadable run document (the page then shows every stage as not run and the nominal
+map, and never writes the file), or a result that no longer matches its model.
 
 ## What it does not do
 
-No live view, no jog pad, no Z or turret control, no `--resume` (continue a stopped
-stage with `smc run --resume`), no `--host`, no login. The report and the NIS-Elements
+No live view (a Snap is one frame; live is [#262](https://github.com/EPFL-TOP/smart-microscope-control/issues/262)),
+no jog pad, no Z or turret control (drive is [#263](https://github.com/EPFL-TOP/smart-microscope-control/issues/263)),
+no Connect / Disconnect and no service ([#264](https://github.com/EPFL-TOP/smart-microscope-control/issues/264)),
+no `--resume` (continue a stopped stage with `smc run --resume`), no `--host`, no login. The report and the NIS-Elements
 export appear as tools when their plugins are registered; they have no page of their
 own.
 
 ## Not verified yet
 
-A real browser's tap and click, the page's look, the periodic callback of a real
+A real browser's tap and click, **the switch to the *Image* tab and the frame's
+orientation** (Bokeh draws an image's first row at the bottom, so the page flips the
+rows to put the camera's top row on top: that is its documented convention, checked
+here on the data and not by eye), **a snap on a stand's camera**, the page's look, the periodic callback of a real
 session, Windows (Ctrl-C of the command, the 0.1 s wait), RDP, a PC with no internet
 (the served page of a few widgets has no external address; the figure's was not
 checked offline), Panel's resolution on Windows with Python 3.14, the **cost of
