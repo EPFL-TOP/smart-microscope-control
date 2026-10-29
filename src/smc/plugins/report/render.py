@@ -66,6 +66,12 @@ _UNKNOWN_FILL = "#e3e3e3"
 
 _NO_FRAME = "no frame: unknown"
 
+#: Side of a class swatch in the legend, in px. The stylesheet's ``svg { height:
+#: auto }`` lets an svg that has a viewBox and no size fill its container (1252
+#: px in Chrome), so the swatch carries a size of its own, and ``svg.dot-key`` in
+#: ``_CSS`` makes it follow the text.
+_SWATCH_PX = 16
+
 Point = tuple[float, float]
 
 _CSS = """
@@ -74,6 +80,7 @@ body { font-family: system-ui, "Segoe UI", sans-serif; color: #1b1b1b; backgroun
 h1 { margin-bottom: 0.4rem; }
 h2 { margin-top: 2rem; border-bottom: 1px solid #d0d0d0; padding-bottom: 0.2rem; }
 svg { max-width: 100%; height: auto; }
+svg.dot-key { width: 1em; height: 1em; vertical-align: -0.15em; }
 table { border-collapse: collapse; }
 th, td { border: 1px solid #cfcfcf; padding: 0.2rem 0.6rem; text-align: right; }
 th:first-child, td:first-child { text-align: left; }
@@ -742,7 +749,8 @@ def _panel_legend(density: DensityResult) -> str:
     """What the outlines, the dashes, the dots and the numbered rectangles are, once."""
     dots = "".join(
         f'<svg class="dot-key" role="img" aria-label="{escape(label)}" '
-        f'viewBox="0 0 10 10"><circle cx="5" cy="5" r="4" fill="{label_colour(i)}"/></svg>'
+        f'width="{_SWATCH_PX}" height="{_SWATCH_PX}" viewBox="0 0 10 10">'
+        f'<circle cx="5" cy="5" r="4" fill="{label_colour(i)}"/></svg>'
         f" {escape(label)} "
         for i, label in enumerate(density.labels)
     )

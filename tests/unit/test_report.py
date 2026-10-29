@@ -398,8 +398,29 @@ def test_the_report_is_one_file_with_no_script_and_no_url() -> None:
         assert attrs.get("role") == "img"
         assert attrs.get("aria-label")
         assert attrs.get("viewbox")
-        assert "width" not in attrs
+        if "dot-key" in attrs.get("class", "").split():
+            continue  # a glyph beside a word, sized on purpose: the next test
+        assert "width" not in attrs  # a map and a panel scale with their container
         assert "height" not in attrs
+
+
+def test_a_class_swatch_has_a_size_of_its_own_so_it_cannot_fill_its_container() -> None:
+    # The stylesheet's ``svg { max-width: 100%; height: auto }`` lets an svg with a
+    # viewBox and no size fill its container: in Chrome each swatch was 1252 px
+    # square and the panels started several screens down. The auditor reads
+    # markup and not CSS, so both places that give the size are read.
+    text, page = _page(_records())
+    keys = _find(page, "svg", "dot-key")
+    assert [key["aria-label"] for key in keys] == list(CLASSES)
+    for key in keys:
+        assert key["width"] == "16"
+        assert key["height"] == "16"
+    style = re.search(r"<style>(.*?)</style>", text, re.DOTALL)
+    assert style is not None
+    rule = re.search(r"svg\.dot-key\s*\{([^}]*)\}", style.group(1))
+    assert rule is not None
+    assert re.search(r"(?<![-\w])width:\s*1em\b", rule.group(1))
+    assert re.search(r"(?<![-\w])height:\s*1em\b", rule.group(1))
 
 
 def test_the_page_is_utf8_with_the_charset_first() -> None:
