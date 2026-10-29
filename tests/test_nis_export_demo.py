@@ -287,6 +287,41 @@ def test_the_count_of_a_stop_without_z_is_not_the_count_without_an_offset(
     assert result.assumed[1].startswith("2 of 3 positions have no z_um:")
 
 
+def test_a_stop_with_an_offset_but_no_z_exports_no_focus(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    # A scan writes both values from one frame, so this is a record edited behind the
+    # runner's back: Z decides first, and an offset alone does not carry the list.
+    stops = (STOPS[0], _stop(1, "A1_r001", -8271.25, 5612.6, None, 9368.0), STOPS[2])
+    _seed(tmp_path, stops)
+
+    record = _run(demo_microscope, tmp_path)
+
+    result = _result(record)
+    assert result.z_mode == "none"
+    assert result.assumed[1].startswith("1 of 3 positions have no z_um:")
+    assert all(
+        p.z_um is None and p.pfs_offset is None for p in _points_of(tmp_path, record)
+    )
+
+
+def test_a_successful_run_logs_the_file_the_positions_and_the_mode(
+    demo_microscope: Microscope, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _seed(tmp_path)
+
+    with caplog.at_level("INFO", logger="smc.plugins.nis-export"):
+        record = _run(demo_microscope, tmp_path)
+
+    ours = [
+        r.getMessage() for r in caplog.records if r.name == "smc.plugins.nis-export"
+    ]
+    assert ours == [
+        f"NIS-Elements export written: {_result(record).file} "
+        f"(3 positions, z_mode pfs-offset)"
+    ]
+
+
 def test_a_dry_run_writes_the_export_like_any_other(
     demo_microscope_dry: Microscope, tmp_path: Path
 ) -> None:
@@ -313,19 +348,33 @@ def test_an_empty_route_is_refused(demo_microscope: Microscope, tmp_path: Path) 
     )
 
 
+@pytest.mark.parametrize(
+    ("orders", "position", "found"),
+    [
+        pytest.param((0, 2, 1), 1, 2, id="an order above its position"),
+        pytest.param((0, 0, 1), 1, 0, id="a duplicate: an order below its position"),
+        pytest.param((1, 2, 3), 0, 1, id="a route that starts at 1"),
+    ],
+)
 def test_a_route_whose_orders_are_not_0_to_n_is_refused(
-    demo_microscope: Microscope, tmp_path: Path
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    orders: tuple[int, ...],
+    position: int,
+    found: int,
 ) -> None:
-    stops = (
-        STOPS[0],
-        STOPS[1].model_copy(update={"order": 2}),
-        STOPS[2].model_copy(update={"order": 1}),
+    # `!=` and not `>`: the slot model refuses neither a duplicate nor a late start.
+    stops = tuple(
+        stop.model_copy(update={"order": order})
+        for stop, order in zip(STOPS, orders, strict=True)
     )
     _seed(tmp_path, stops)
 
     refused = _refused(demo_microscope, tmp_path)
 
-    assert refused.reason == "the route's position 1 has order 2; run route again"
+    assert refused.reason == (
+        f"the route's position {position} has order {found}; run route again"
+    )
 
 
 def test_a_name_the_list_cannot_carry_is_refused_naming_the_route(
@@ -491,8 +540,24 @@ def test_the_defaults_write_into_the_run_folder_and_do_not_overwrite() -> None:
     assert params.overwrite is False
 
 
+@pytest.mark.parametrize(
+    ("error", "shown"),
+    [
+        pytest.param(
+            (64, "The specified network name is no longer available"),
+            "The specified network name is no longer available",
+            id="with an errno and its text",
+        ),
+        # Some Windows network failures carry a message and no errno: `strerror` is None.
+        pytest.param(("the share dropped",), "the share dropped", id="a message only"),
+    ],
+)
 def test_a_resolve_that_fails_is_a_plugin_run_error(
-    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: tuple[Any, ...],
+    shown: str,
 ) -> None:
     # FM-116: Windows re-raises a few network errors out of `resolve` (a share that
     # drops). Only the operator's `out` fails: the runner resolves paths too.
@@ -502,10 +567,39 @@ def test_a_resolve_that_fails_is_a_plugin_run_error(
 
     def resolve(self: Path, strict: bool = False) -> Path:
         if self == out:
-            raise OSError(64, "The specified network name is no longer available")
+            raise OSError(*error)
         return real(self, strict=strict)
 
     monkeypatch.setattr(Path, "resolve", resolve)
+
+    refused = _refused(demo_microscope, tmp_path, out=out)
+
+    assert refused.reason == (
+        f"cannot resolve out {out} ({shown}); check the path, then run nis-export again"
+    )
+
+
+@pytest.mark.parametrize("check", ["is_dir", "exists"])
+def test_a_filesystem_error_from_a_check_of_out_is_a_plugin_run_error(
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    check: str,
+) -> None:
+    # FM-116: `is_dir` and `exists` raise what pathlib does not ignore (a folder the
+    # user cannot search, a share that drops), and the stage must name the path, not
+    # end with a bare exception. Both calls are tried: `exists` runs after `is_dir`.
+    _seed(tmp_path)
+    out = tmp_path / "share" / "list.xml"
+    target = out.resolve()
+    real = getattr(Path, check)
+
+    def failing(self: Path, *args: Any, **kwargs: Any) -> bool:
+        if self == target:
+            raise OSError(64, "The specified network name is no longer available")
+        return bool(real(self, *args, **kwargs))
+
+    monkeypatch.setattr(Path, check, failing)
 
     refused = _refused(demo_microscope, tmp_path, out=out)
 
@@ -606,6 +700,51 @@ def test_an_out_inside_the_run_folder_is_named_in_a_write_error_relative_to_it(
     assert refused.reason == (
         "cannot write list.xml (No space left on device); check that its folder "
         "exists and can be written, then run nis-export again"
+    )
+
+
+def test_a_write_error_names_an_out_by_its_absolute_path_when_it_cannot_be_compared_to_the_run_folder(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `relative_to_run` resolves both paths, and `resolve` re-raises a few network errors
+    # (FM-116): naming the file in the error must not be what ends the stage.
+    _seed(tmp_path)
+    out = tmp_path / "list.xml"
+
+    def cannot_compare(run_dir: Path, path: Path) -> str:
+        raise OSError(64, "The specified network name is no longer available")
+
+    def disk_full(path: Path, data: bytes, **kwargs: Any) -> None:
+        raise AtomicWriteError(OSError(28, "No space left on device"))
+
+    monkeypatch.setattr(plugin_module, "relative_to_run", cannot_compare)
+    monkeypatch.setattr(plugin_module, "write_atomically", disk_full)
+
+    refused = _refused(demo_microscope, tmp_path, out=out)
+
+    assert refused.reason == (
+        f"cannot write {out.resolve().as_posix()} (No space left on device); check "
+        f"that its folder exists and can be written, then run nis-export again"
+    )
+
+
+def test_a_write_error_without_a_text_does_not_print_none(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed(tmp_path)
+    monkeypatch.setattr(plugin_module, "new_token", lambda: "abc123abc123")
+
+    def no_text(path: Path, data: bytes, **kwargs: Any) -> None:
+        raise AtomicWriteError(OSError("the share dropped"))
+
+    monkeypatch.setattr(plugin_module, "write_atomically", no_text)
+
+    refused = _refused(demo_microscope, tmp_path)
+
+    assert refused.reason.startswith("cannot write nis-export/abc123abc123.xml (")
+    assert "(None)" not in refused.reason
+    assert refused.reason.endswith(
+        "); check that its folder exists and can be written, then run nis-export again"
     )
 
 

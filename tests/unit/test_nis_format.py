@@ -436,6 +436,30 @@ REFUSED = [
         id="flags swapped",
     ),
     pytest.param(
+        lambda t: t[: t.index("<bIncludeZ")] + "</no_name></variant>",
+        "no_name: expected <bIncludeZ> and <bPFSEnabled> first, found nothing",
+        id="a list with no element",
+    ),
+    pytest.param(
+        lambda t: t[: t.index("<bPFSEnabled")] + "</no_name></variant>",
+        "no_name: expected <bIncludeZ> and <bPFSEnabled> first, found bIncludeZ",
+        id="a list with one flag only",
+    ),
+    pytest.param(
+        lambda t: _once(
+            t,
+            'bPFSEnabled runtype="bool" value="false"',
+            'bPFSEnabled runtype="bool" value="yes"',
+        ),
+        "no_name/bPFSEnabled: 'yes' is not 'true' or 'false'",
+        id="the second flag is a bool that is yes",
+    ),
+    pytest.param(
+        lambda t: _once(t, '<variant version="1.0">', '<variant version="1.0" x="1">'),
+        'the root element is <variant version="1.0" x="1">, not <variant version="1.0">',
+        id="an extra attribute on the root",
+    ),
+    pytest.param(
         lambda t: _once(
             t,
             'bIncludeZ runtype="bool" value="true"',
