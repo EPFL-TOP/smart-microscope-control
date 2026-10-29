@@ -44,6 +44,7 @@ from smc.plugins.plate_finding.algorithm import (
     survey_points,
     well_size_um,
 )
+from smc.plugins.plate_finding.plugin import PlateFindingParams
 from smc.plugins.plate_registration.algorithm import calibrate
 from smc.plugins.slots import WellRef
 
@@ -562,6 +563,28 @@ def test_the_extent_note_names_what_the_plate_needs() -> None:
     )
     assert survey_extent_note([], "96-well") is None
     assert survey_extent_note([(0.0, 0.0)], "96-well") is None
+
+
+@pytest.mark.parametrize("plate", ["96-well", "12-well", "24-well"])
+def test_the_extent_check_begins_at_half_a_pitch_of_margin_on_each_side(
+    plate: str,
+) -> None:
+    """The check asks for the wells' span plus one pitch: half a pitch past the outer wells on each side.
+
+    With no jitter it is a note at 0.48 and none at 0.52, on every plate. The
+    parameter's description says so, where it said "Under 1" (#248).
+    """
+    under = survey_points(plate, (0.0, 0.0), margin_pitches=0.48, jitter=0.0)
+    over = survey_points(plate, (0.0, 0.0), margin_pitches=0.52, jitter=0.0)
+
+    assert survey_extent_note(under, plate) is not None
+    assert survey_extent_note(over, plate) is None
+
+    description = PlateFindingParams.model_fields["margin_pitches"].description
+    assert description is not None
+    assert "each side" in description
+    assert "plus one pitch" in description
+    assert "Under 1" not in description
 
 
 def test_the_extent_is_judged_on_each_axis_apart() -> None:
