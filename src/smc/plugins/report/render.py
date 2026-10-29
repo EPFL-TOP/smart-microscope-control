@@ -27,11 +27,18 @@ import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
+import numpy as np
+import numpy.typing as npt
+
+from smc.plugins.geometry import Matrix2, footprint
 from smc.plugins.report.svg import (
+    MAX_CELLS_DRAWN_TOTAL,
+    MAX_COORDINATE_UM,
     density_text,
     escape,
     label_colour,
     num,
+    sample_indices,
     shade,
     text_colour_on,
 )
@@ -39,6 +46,7 @@ from smc.plugins.slots import (
     Cell,
     DensityResult,
     DensityWell,
+    RoutePosition,
     RouteResult,
     ScanPlanResult,
     ScanResult,
@@ -156,6 +164,9 @@ def render(
     """
     plate = _plate_of(plan)
     scanned = _scanned_index(plate, density)
+    _require_matrix(scan.matrix_um_per_px, stage="scan")
+    if route is not None:
+        _require_matrix(route.matrix_um_per_px, stage="route")
     body = [
         _header(
             title=title,
@@ -168,6 +179,15 @@ def render(
         ),
         _plate_maps(plate, density, scanned),
         _density_table(density, route),
+        _route(plate, route),
+        _panels(
+            plate=plate,
+            scan=scan,
+            cells=cells,
+            density=density,
+            route=route,
+            max_cells_drawn_per_well=max_cells_drawn_per_well,
+        ),
     ]
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
@@ -472,15 +492,26 @@ def _map_well(
 
 
 def _well_shape(plate: _Plate, geometry: WellGeometry, fill: str) -> str:
-    """A round well is a circle, a square one a path of its four corners turned by the plate."""
+    """A well of a map, filled."""
+    return _shape(geometry, plate.at, f'fill="{fill}"')
+
+
+def _shape(
+    geometry: WellGeometry, at: Callable[[float, float], Point], attributes: str
+) -> str:
+    """A round well is a circle, a square one a path of its four corners turned by the plate.
+
+    ``at`` puts a stage point on the page (the plate's frame or one well's), so
+    a map and a panel draw the same shape.
+    """
     if geometry.circular:
-        cx, cy = plate.at(*geometry.center_um)
+        cx, cy = at(*geometry.center_um)
         return (
             f'<circle cx="{_plate_num(cx)}" cy="{_plate_num(cy)}" '
-            f'r="{_plate_num(geometry.size_um[0] / 2.0)}" fill="{fill}"/>'
+            f'r="{_plate_num(geometry.size_um[0] / 2.0)}" {attributes}/>'
         )
-    points = [plate.at(x, y) for x, y in _corners(geometry)]
-    return f'<path d="{_polygon(points, _plate_num)}" fill="{fill}"/>'
+    points = [at(x, y) for x, y in _corners(geometry)]
+    return f'<path d="{_polygon(points, _plate_num)}" {attributes}/>'
 
 
 def _polygon(points: Sequence[Point], printed: Callable[[float], str]) -> str:
@@ -550,3 +581,427 @@ def _density_table(density: DensityResult, route: RouteResult | None) -> str:
         f'<table class="density"><thead><tr>{"".join(head)}</tr></thead>'
         f"<tbody>{''.join(rows)}</tbody></table>"
     )
+
+
+# ------------------------------------------------------------------ the route
+
+
+def _require_matrix(matrix: Matrix2, *, stage: str) -> None:
+    """Refuse a camera matrix that is not finite: every footprint drawn from it would be ``nan``.
+
+    Named here so that the refusal says "a camera matrix" and not "a frame's
+    position", which the frames would show a step later.
+    """
+    for row in matrix:
+        for entry in row:
+            num(entry, what="a camera matrix", stage=stage)
+
+
+def _stop_num(value: float) -> str:
+    """A coordinate of a stop, which the route holds."""
+    return num(value, what="a stop's position", stage="route")
+
+
+def _route(plate: _Plate, route: RouteResult | None) -> str:
+    """The route across the plate, its length and its time; or the sentence that there is none."""
+    if route is None:
+        return (
+            '<h2>Route</h2><p class="note">'
+            "no route: run route to add the fields to image</p>"
+        )
+    stops = sorted(route.positions, key=lambda stop: stop.order)
+    # The rank of a well is the order of its first stop; the stop's well must be on the plate.
+    rank: dict[str, int] = {}
+    for stop in stops:
+        name = normalise_well(stop.well)
+        if name not in plate.geometries:
+            raise ValueError(
+                f"the route has a stop in well {stop.well!r}, which is not on the "
+                f"{len(plate.geometries)}-well plate; run route again"
+            )
+        rank.setdefault(name, len(rank) + 1)
+    outlines = "".join(
+        _shape(
+            geometry,
+            plate.at,
+            'class="outline visited"' if name in rank else 'class="outline"',
+        )
+        for name, geometry in plate.geometries.items()
+    )
+    parts = [outlines]
+    if stops:
+        points = [plate.at(stop.x_um, stop.y_um) for stop in stops]
+        line = " ".join(f"{_stop_num(x)},{_stop_num(y)}" for x, y in points)
+        parts.append(
+            f'<polyline class="route" data-stops="{len(stops)}" points="{line}"/>'
+        )
+        radius = _plate_num(0.12 * plate.well_um)
+        sx, sy = points[0]
+        parts.append(
+            f'<circle class="start" cx="{_stop_num(sx)}" cy="{_stop_num(sy)}" r="{radius}"/>'
+        )
+        if len(points) > 1:
+            ex, ey = points[-1]
+            parts.append(
+                f'<circle class="end" cx="{_stop_num(ex)}" cy="{_stop_num(ey)}" r="{radius}"/>'
+            )
+    if len(plate.geometries) <= _MAX_WELLS_WITH_TEXT:
+        font = _plate_num(0.35 * plate.well_um)
+        for name, order in rank.items():
+            x, y = plate.at(*plate.geometries[name].center_um)
+            parts.append(
+                f'<text class="rank" x="{_plate_num(x)}" y="{_plate_num(y)}" '
+                f'font-size="{font}" text-anchor="middle" '
+                f'dominant-baseline="central" fill="#1b1b1b">{order}</text>'
+            )
+    travel = (
+        "not estimated: no timing model"
+        if route.travel_s is None
+        else "{} min {} s".format(*divmod(round(route.travel_s), 60))
+    )
+    uncovered = sum(route.uncovered.values())
+    wanted = escape(", ".join(route.labels))
+    return (
+        "<h2>Route</h2>"
+        '<svg class="route-map" role="img" '
+        'aria-label="The route across the plate, from the green start to the red end" '
+        f'viewBox="0 0 {_plate_num(plate.width_um)} {_plate_num(plate.height_um)}">'
+        "<title>The route across the plate</title>" + "".join(parts) + "</svg>"
+        f'<p class="route-summary">{_count(len(stops), "stop", "stops")} in '
+        f"{_count(len(rank), 'well', 'wells')} · {route.distance_um / 1000.0:.1f} mm · "
+        f"{travel}</p>"
+        f'<p class="note">{_count(uncovered, "cell", "cells")} of the wanted labels '
+        f"({wanted}) {'is' if uncovered == 1 else 'are'} in no chosen field.</p>"
+    )
+
+
+# ------------------------------------------------------------------ the panels
+
+
+@dataclass(frozen=True)
+class _Scene:
+    """What every panel draws from: the scan, the route, the labels and the cap of dots."""
+
+    scan: ScanResult
+    density: DensityResult
+    route: RouteResult | None
+    label_index: dict[str, int]
+    frames_of: dict[str, list[int]]
+    cap: int
+
+
+def _panels(
+    *,
+    plate: _Plate,
+    scan: ScanResult,
+    cells: Sequence[Cell],
+    density: DensityResult,
+    route: RouteResult | None,
+    max_cells_drawn_per_well: int,
+) -> str:
+    """One panel per scanned well, in the density's order, linked from the maps by index.
+
+    The dots of the whole page are bounded: a cap per well times 96 wells is no
+    bound (FM-74), so each well draws at most its share of ``MAX_CELLS_DRAWN_TOTAL``.
+    """
+    if not density.wells:
+        return '<h2>Wells</h2><p class="note">No well was scanned.</p>'
+    by_well: dict[str, list[Cell]] = {}
+    for cell in cells:
+        by_well.setdefault(cell.well, []).append(cell)
+    stops_of: dict[str, list[RoutePosition]] = {}
+    if route is not None:
+        for stop in sorted(route.positions, key=lambda stop: stop.order):
+            stops_of.setdefault(stop.well, []).append(stop)
+    scene = _Scene(
+        scan=scan,
+        density=density,
+        route=route,
+        label_index={label: i for i, label in enumerate(density.labels)},
+        frames_of=scan.frame_index(),
+        cap=min(
+            max_cells_drawn_per_well,
+            MAX_CELLS_DRAWN_TOTAL // max(1, len(density.wells)),
+        ),
+    )
+    sections = [
+        _panel(
+            k=k,
+            reported=reported,
+            geometry=plate.geometries[_plate_name(plate, reported.well)],
+            scene=scene,
+            cells_here=by_well.get(reported.well, []),
+            stops_here=stops_of.get(reported.well, []),
+        )
+        for k, reported in enumerate(density.wells)
+    ]
+    return f'<h2>Wells</h2>{_panel_legend(density)}<div class="wells">{"".join(sections)}</div>'
+
+
+def _panel_legend(density: DensityResult) -> str:
+    """What the outlines, the dashes, the dots and the numbered rectangles are, once."""
+    dots = "".join(
+        f'<svg class="dot-key" role="img" aria-label="{escape(label)}" '
+        f'viewBox="0 0 10 10"><circle cx="5" cy="5" r="4" fill="{label_colour(i)}"/></svg>'
+        f" {escape(label)} "
+        for i, label in enumerate(density.labels)
+    )
+    return (
+        '<p class="legend">'
+        '<span class="key frames"></span> fields the scan imaged · '
+        '<span class="key failed"></span> fields that failed · '
+        f"dots: detected cells, {dots}· "
+        '<span class="key field"></span> numbered: the fields of the route, in order'
+        "</p>"
+    )
+
+
+def _panel(
+    *,
+    k: int,
+    reported: DensityWell,
+    geometry: WellGeometry,
+    scene: _Scene,
+    cells_here: list[Cell],
+    stops_here: list[RoutePosition],
+) -> str:
+    """One well: its outline, the footprints of its frames, its cells, and the route's fields.
+
+    The centre of the well is the origin and a stage point ``(x, y)`` is drawn
+    at ``(x - cx, cy - y)``. The frames are the scan's footprints at the stage's
+    readback, with the scan's matrix and frame shape; a failed field has only
+    its target; a chosen field of the route has the route's own matrix and shape
+    (FM-124). The viewBox is the well's circumscribed square plus a tenth, and
+    grows to hold a footprint that reaches past the wall (fields are clipped by
+    their footprint meeting the well, so the outer ones stick out).
+    """
+    scan = scene.scan
+    well = reported.well
+    cx, cy = geometry.center_um
+    reach = max(max(abs(x - cx), abs(y - cy)) for x, y in _extent_points(geometry))
+
+    def local(corners: Sequence[Point]) -> list[Point]:
+        return [(x - cx, cy - y) for x, y in corners]
+
+    def farthest(points: Sequence[Point]) -> float:
+        return max(max(abs(px), abs(py)) for px, py in points)
+
+    positions = scene.frames_of.get(well, [])
+    frame_paths: list[str] = []
+    for position in positions:
+        frame = scan.frames[position]
+        corners = local(
+            footprint(
+                frame.x_um,
+                frame.y_um,
+                matrix=scan.matrix_um_per_px,
+                image_shape_px=scan.image_shape_px,
+            )
+        )
+        reach = max(reach, farthest(corners))
+        frame_paths.append(_polygon(corners, _frame_num))
+    failed_here = [failed for failed in scan.failed if failed.well == well]
+    failed_paths: list[str] = []
+    for failed in failed_here:
+        corners = local(
+            footprint(
+                failed.x_um,
+                failed.y_um,
+                matrix=scan.matrix_um_per_px,
+                image_shape_px=scan.image_shape_px,
+            )
+        )
+        reach = max(reach, farthest(corners))
+        failed_paths.append(_polygon(corners, _failed_num))
+
+    outside, drawn, total, dots = _dots(geometry, cells_here, scene)
+    diameter = _plate_num(max(0.012 * geometry.size_um[0], 12.0))
+
+    body = [
+        _shape(geometry, lambda x, y: (x - cx, cy - y), 'class="outline"'),
+        f'<path class="frames" data-n="{len(positions)}" d="{"".join(frame_paths)}"/>',
+    ]
+    if failed_paths:
+        body.append(
+            f'<path class="failed" data-n="{len(failed_paths)}" '
+            f'd="{"".join(failed_paths)}"/>'
+        )
+    for label, label_dots in dots.items():
+        index = scene.label_index[label]
+        body.append(
+            f'<path class="cells" data-label="{escape(label)}" '
+            f'data-drawn="{len(label_dots)}" data-total="{total[label]}" '
+            f'd="{"".join(label_dots)}" fill="none" stroke="{label_colour(index)}" '
+            f'stroke-width="{diameter}" stroke-linecap="round"/>'
+        )
+    route = scene.route
+    if route is not None and stops_here:
+        fields, numbers, reach = _route_fields(
+            stops_here, route, cx, cy, geometry.size_um[0], reach
+        )
+        points = " ".join(
+            f"{_stop_num(stop.x_um - cx)},{_stop_num(cy - stop.y_um)}"
+            for stop in stops_here
+        )
+        body.extend(fields)
+        if len(stops_here) > 1:
+            body.append(f'<polyline class="route-well" points="{points}"/>')
+        body.extend(numbers)
+
+    view = 1.1 * reach
+    return (
+        f'<section class="well-detail" id="w{k}" data-well="{escape(well)}">'
+        f"<h3>{escape(well)}</h3>"
+        f'<p class="counts">{_counts_line(reported, scene.density)}</p>'
+        f'<svg class="well-panel" role="img" '
+        f'aria-label="Well {escape(well)}: its fields, its cells and the route" '
+        f'viewBox="{_plate_num(-view)} {_plate_num(-view)} '
+        f'{_plate_num(2.0 * view)} {_plate_num(2.0 * view)}">'
+        f"<title>Well {escape(well)}</title>" + "".join(body) + "</svg>"
+        f'<p class="caption">{_caption(reported, len(failed_here), drawn, sum(total.values()), outside, scene.cap)}</p>'
+        "</section>"
+    )
+
+
+def _frame_num(value: float) -> str:
+    return num(value, what="a frame's position", stage="scan")
+
+
+def _failed_num(value: float) -> str:
+    return num(value, what="a failed field's position", stage="scan")
+
+
+def _counts_line(reported: DensityWell, density: DensityResult) -> str:
+    """Each label's count with its density: ``single 5 (12.5 per mm²) · doublet 2 (5.00 per mm²)``."""
+    parts = []
+    for label in density.labels:
+        value = _value(reported, label)
+        shown = (
+            _unknown_text(reported, density.area_grid_um)
+            if value is None
+            else f"{density_text(value)} per mm²"
+        )
+        parts.append(
+            f"{escape(label)} {reported.counts.get(label, 0)} ({escape(shown)})"
+        )
+    return " · ".join(parts)
+
+
+def _caption(
+    reported: DensityWell,
+    failed: int,
+    drawn: int,
+    total: int,
+    outside: int,
+    cap: int,
+) -> str:
+    """How many fields, how many cells are drawn of how many, and what is not drawn and why."""
+    text = (
+        f"{reported.fields} fields ({failed} failed) · {drawn} of {total} cells drawn"
+    )
+    if total and drawn < total:
+        text += (
+            " (none: the cap per well is 0)" if cap <= 0 else " (a regular subsample)"
+        )
+    if outside:
+        text += (
+            f" · {_count(outside, 'detection', 'detections')} outside the well "
+            f"shape {'is' if outside == 1 else 'are'} not drawn"
+        )
+    return text
+
+
+def _require_finite_cells(
+    xs: npt.NDArray[np.float64], ys: npt.NDArray[np.float64]
+) -> None:
+    """Refuse a cell whose position is not finite or is beyond 1e12 µm, naming the cells stage.
+
+    ``contains_many`` calls a point that is not finite *outside*, which would
+    leave it uncounted and undrawn without a word (FM-114); this says so.
+    """
+    for values in (xs, ys):
+        finite = np.isfinite(values)
+        bad = ~finite | (np.abs(np.where(finite, values, 0.0)) > MAX_COORDINATE_UM)
+        if bad.any():
+            num(float(values[bad][0]), what="a cell's position", stage="cells")
+
+
+def _dots(
+    geometry: WellGeometry, cells_here: list[Cell], scene: _Scene
+) -> tuple[int, int, dict[str, int], dict[str, list[str]]]:
+    """The dots of a well's cells: how many lie outside the shape, how many are drawn, per label.
+
+    Only the cells inside the well's shape (``contains_many``, the set density
+    counted, FM-132) are candidates; they are thinned once across labels,
+    evenly and in the order of the cells file, to the well's cap. A dot is
+    ``M x y h0.1`` stroked with a round cap: a path per label and well, never
+    an element per cell, is the difference between 4.7 MB and 12.2 MB on a
+    plate of 96. Returns the number of cells outside the shape, the number
+    drawn, the number of candidates per label and the subpaths per label.
+    """
+    cx, cy = geometry.center_um
+    xs = np.array([cell.x_um for cell in cells_here], dtype=np.float64)
+    ys = np.array([cell.y_um for cell in cells_here], dtype=np.float64)
+    _require_finite_cells(xs, ys)
+    inside = [bool(flag) for flag in geometry.contains_many(xs, ys)]
+    candidates = [
+        cell
+        for cell, held in zip(cells_here, inside, strict=True)
+        if held and cell.label in scene.label_index
+    ]
+    total = {label: 0 for label in scene.label_index}
+    for cell in candidates:
+        total[cell.label] += 1
+    dots: dict[str, list[str]] = {label: [] for label in scene.label_index}
+    chosen = sample_indices(len(candidates), scene.cap)
+    for position in chosen:
+        cell = candidates[position]
+        x = num(cell.x_um - cx, what="a cell's position", stage="cells")
+        y = num(cy - cell.y_um, what="a cell's position", stage="cells")
+        dots[cell.label].append(f"M{x} {y}h0.1")
+    return len(cells_here) - sum(inside), len(chosen), total, dots
+
+
+def _route_fields(
+    stops: list[RoutePosition],
+    route: RouteResult,
+    cx: float,
+    cy: float,
+    well_um: float,
+    reach: float,
+) -> tuple[list[str], list[str], float]:
+    """The chosen fields of one well as numbered rectangles, in the route's matrix and frame shape.
+
+    Another objective is another field, so the footprint is the route's and not
+    the scan's (FM-124). Returns the rectangles, their numbers (``order + 1``,
+    drawn after the line so that nothing hides them) and the grown reach.
+    """
+    fields: list[str] = []
+    numbers: list[str] = []
+    font = _plate_num(0.045 * well_um)
+    for stop in stops:
+        corners = [
+            (x - cx, cy - y)
+            for x, y in footprint(
+                stop.x_um,
+                stop.y_um,
+                matrix=route.matrix_um_per_px,
+                image_shape_px=route.image_shape_px,
+            )
+        ]
+        reach = max(reach, *(max(abs(x), abs(y)) for x, y in corners))
+        held = (
+            ", ".join(f"{n} {label}" for label, n in stop.counts.items())
+            or "no wanted cell"
+        )
+        fields.append(
+            f'<path class="field" data-order="{stop.order}" data-name="{escape(stop.name)}" '
+            f'd="{_polygon(corners, _stop_num)}">'
+            f"<title>{escape(stop.name)}: {escape(held)}</title></path>"
+        )
+        numbers.append(
+            f'<text class="order" x="{_stop_num(stop.x_um - cx)}" '
+            f'y="{_stop_num(cy - stop.y_um)}" font-size="{font}" text-anchor="middle" '
+            f'dominant-baseline="central" fill="#1b1b1b">{stop.order + 1}</text>'
+        )
+    return fields, numbers, reach

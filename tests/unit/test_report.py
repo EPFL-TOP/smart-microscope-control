@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Sequence
+from collections import Counter
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from html.parser import HTMLParser
 
@@ -31,6 +32,8 @@ from smc.plugins.slots import (
     DensityWell,
     FailedField,
     PlateResult,
+    RoutePosition,
+    RouteResult,
     ScanFrame,
     ScanPlanResult,
     ScanResult,
@@ -152,7 +155,9 @@ def _cell(
     well: str, dx: float, dy: float, label: str, rotation_deg: float = 0.0
 ) -> Cell:
     cx, cy = _centre(well, rotation_deg)
-    return Cell(
+    # Built without validation: a plate of 96 wells with 4 000 cells each is
+    # 384 000 of them, and the seed is trusted (the tests of ``nan`` do the same).
+    return Cell.model_construct(
         well=well,
         x_um=cx + dx,
         y_um=cy + dy,
@@ -189,8 +194,8 @@ def _records(
     plan_matrix: Matrix2 | None = None,
     plan_shape: tuple[int, int] | None = None,
     area_mm2: float = 0.4,
-    failed_wells: Sequence[str] = (),
-    unknown_wells: dict[str, int] | None = None,
+    failed: Mapping[str, int] | None = None,
+    below_grid: Sequence[str] = (),
     rows: int = 2,
     columns: int = 2,
     objective: str | None = "Nikon 10X S Fluor",
@@ -198,9 +203,10 @@ def _records(
 ) -> Records:
     """The plan, the scan, the cells and the density of ``wells``; the density is built from the seed.
 
-    A well in ``unknown_wells`` has no density: the number is its ``fields``
-    (0: no frame at all, 1: one field of an area below the grid). A well in
-    ``failed_wells`` has one failed field besides its frames.
+    ``failed`` maps a well to the number of its first fields that failed (all of
+    them: no frame, a density of ``None`` and 0 fields). A well in ``below_grid``
+    keeps one frame and has no density either: the imaged area is under the
+    grid's resolution (FM-138).
     """
     laid = plan_matrix if plan_matrix is not None else matrix
     laid_shape = plan_shape if plan_shape is not None else shape
@@ -244,12 +250,13 @@ def _records(
         estimate_s=None,
     )
     frames: list[ScanFrame] = []
-    failed: list[FailedField] = []
-    seen_failed: set[str] = set()
+    failures: list[FailedField] = []
+    to_fail = dict(failed or {})
+    kept: dict[str, int] = {}
     for k, planned in enumerate(fields):
-        if planned.well in failed_wells and planned.well not in seen_failed:
-            seen_failed.add(planned.well)
-            failed.append(
+        if to_fail.get(planned.well, 0) > 0:
+            to_fail[planned.well] -= 1
+            failures.append(
                 FailedField(
                     well=planned.well,
                     index=planned.index,
@@ -260,8 +267,9 @@ def _records(
                 )
             )
             continue
-        if unknown_wells is not None and planned.well in unknown_wells:
+        if planned.well in below_grid and kept.get(planned.well, 0) >= 1:
             continue
+        kept[planned.well] = kept.get(planned.well, 0) + 1
         frames.append(
             ScanFrame(
                 well=planned.well,
@@ -285,51 +293,31 @@ def _records(
         image_shape_px=shape,
         exposure_ms=10.0,
         frames=tuple(frames),
-        failed=tuple(failed),
+        failed=tuple(failures),
     )
     cells = tuple(
         _cell(well, dx, dy, label, rotation_deg) for well, dx, dy, label in layout
     )
-    in_frames: dict[str, int] = {}
-    for frame in frames:
-        in_frames[frame.well] = in_frames.get(frame.well, 0) + 1
+    inside_counts = Counter(
+        (name, label) for name, dx, dy, label in layout if _inside(dx, dy)
+    )
+    outside_counts = Counter(name for name, dx, dy, _ in layout if not _inside(dx, dy))
     reported = []
     for well in wells:
-        counts = {
-            label: sum(
-                1
-                for name, dx, dy, lab in layout
-                if name == well and lab == label and _inside(dx, dy)
-            )
-            for label in labels
-        }
-        outside = sum(
-            1 for name, dx, dy, _ in layout if name == well and not _inside(dx, dy)
-        )
-        n_fields = in_frames.get(well, 0)
-        failed_in = sum(1 for f in failed if f.well == well)
-        if unknown_wells is not None and well in unknown_wells:
-            reported.append(
-                DensityWell(
-                    well=well,
-                    fields=unknown_wells[well],
-                    failed_fields=failed_in,
-                    area_mm2=0.0,
-                    counts=counts,
-                    outside_well=outside,
-                    per_mm2=None,
-                )
-            )
-            continue
+        counts = {label: inside_counts[(well, label)] for label in labels}
+        n_fields = kept.get(well, 0)
+        unknown = n_fields == 0 or well in below_grid
         reported.append(
             DensityWell(
                 well=well,
                 fields=n_fields,
-                failed_fields=failed_in,
-                area_mm2=area_mm2,
+                failed_fields=sum(1 for f in failures if f.well == well),
+                area_mm2=0.0 if unknown else area_mm2,
                 counts=counts,
-                outside_well=outside,
-                per_mm2={label: counts[label] / area_mm2 for label in labels},
+                outside_well=outside_counts[well],
+                per_mm2=None
+                if unknown
+                else {label: counts[label] / area_mm2 for label in labels},
             )
         )
     density = DensityResult(
@@ -461,7 +449,7 @@ def test_every_assumed_line_is_listed() -> None:
 
 
 def test_a_scan_that_has_failed_fields_says_so_in_words() -> None:
-    text, _ = _page(_records(failed_wells=("A1", "B1")))
+    text, _ = _page(_records(failed={"A1": 1, "B1": 1}))
     assert (
         '<p class="warn">2 fields failed in 2 wells: their area is not in the '
         "density</p>"
@@ -471,7 +459,7 @@ def test_a_scan_that_has_failed_fields_says_so_in_words() -> None:
 
 
 def test_one_failed_field_reads_in_the_singular() -> None:
-    text, _ = _page(_records(failed_wells=("A1",)))
+    text, _ = _page(_records(failed={"A1": 1}))
     assert (
         '<p class="warn">1 field failed in 1 well: its area is not in the density</p>'
     ) in text
@@ -649,8 +637,9 @@ def test_the_legend_has_five_swatches_and_the_unit() -> None:
 
 
 def test_unknown_density_is_not_zero_and_a_sampled_zero_is_not_unknown() -> None:
-    # A1: no frame at all; A2: one field of an area below the grid; B1: measured.
-    records = _records(unknown_wells={"A1": 0, "A2": 1})
+    # A1: every field failed, so no frame; A2: one field of an area below the grid;
+    # B1: measured.
+    records = _records(failed={"A1": 4}, below_grid=("A2",))
     text, page = _page(records)
     wells = _wells_of_map(page, "single")
     assert wells["A1"]["data-state"] == "unknown"
@@ -713,3 +702,627 @@ def test_a_well_tooltip_holds_the_value_the_counts_the_area_and_the_fields() -> 
     assert "A1 — single 12.5 per mm² (5 cells in 0.4 mm², 4 fields)" in text
     assert "A1 — not scanned" not in text
     assert "A4 — not scanned" in text
+
+
+# ------------------------------------------------------------------ the panels
+
+
+def _section(page: Audit, well: str) -> list[tuple[str, dict[str, str]]]:
+    """The tags of the well's panel: from its ``section`` to the next one."""
+    out: list[tuple[str, dict[str, str]]] = []
+    inside = False
+    for tag, attrs in page.tags:
+        if tag == "section" and "well-detail" in attrs.get("class", "").split():
+            if inside:
+                break
+            inside = attrs.get("data-well") == well
+        if inside:
+            out.append((tag, attrs))
+    return out
+
+
+def _paths(section: list[tuple[str, dict[str, str]]], cls: str) -> list[dict[str, str]]:
+    return [
+        a for tag, a in section if tag == "path" and cls in a.get("class", "").split()
+    ]
+
+
+def _polygons(d: str) -> list[list[tuple[float, float]]]:
+    """Each closed subpath of a ``d``, as its corners."""
+    return [_points(sub) for sub in d.split("M") if sub]
+
+
+def _dots(d: str) -> list[tuple[float, float]]:
+    """The dots of a ``path.cells``: the point of each ``M x y h0.1``."""
+    return [
+        (float(x), float(y)) for x, y in re.findall(r"M(-?[\d.]+) (-?[\d.]+)h0\.1", d)
+    ]
+
+
+Stop = tuple[int, str, float, float, str, dict[str, int]]
+
+#: ``(order, well, dx, dy, name, counts)``: A1 is visited twice, then A2, then B1.
+STOPS: list[Stop] = [
+    (0, "A1", -1500.0, 1200.0, "A1_r000", {"single": 5}),
+    (1, "A1", 1400.0, -900.0, "A1_r001", {"single": 0, "doublet": 2}),
+    (2, "A2", 900.0, 800.0, "A2_r000", {"single": 4}),
+    (3, "B1", 0.0, 1800.0, "B1_r000", {"doublet": 3}),
+]
+
+
+def _stops(
+    rotation_deg: float = 0.0, stops: Sequence[Stop] = STOPS
+) -> tuple[RoutePosition, ...]:
+    positions = []
+    for order, well, dx, dy, name, counts in stops:
+        cx, cy = _centre(well, rotation_deg)
+        positions.append(
+            RoutePosition(
+                order=order,
+                well=well,
+                name=name,
+                x_um=cx + dx,
+                y_um=cy + dy,
+                z_um=None,
+                pfs_offset=None,
+                counts=counts,
+            )
+        )
+    return tuple(positions)
+
+
+def _route(
+    records: Records,
+    *,
+    matrix: Matrix2 = ((10.0, 0.0), (0.0, -10.0)),
+    shape: tuple[int, int] = SHAPE,
+    objective: str | None = "Nikon 20X Plan Fluor ELWD",
+    travel_s: float | None = 247.0,
+    uncovered: dict[str, int] | None = None,
+) -> RouteResult:
+    """A route imaged by another objective: the scan's camera at twice the pixel size."""
+    return RouteResult(
+        objective=objective,
+        matrix_um_per_px=matrix,
+        image_shape_px=shape,
+        fov_um=(800.0, 600.0),
+        labels=("single", "doublet"),
+        positions=_stops(records.rotation_deg),
+        uncovered={"A1": 1} if uncovered is None else uncovered,
+        distance_um=12_345.0,
+        travel_s=travel_s,
+        assumed=("the route minimises the Euclidean distance",),
+    )
+
+
+def test_every_scanned_well_has_a_panel_linked_from_its_map_and_its_row_by_index() -> (
+    None
+):
+    text, page = _page(_records())
+    sections = _find(page, "section", "well-detail")
+    assert [(s["id"], s["data-well"]) for s in sections] == [
+        ("w0", "A1"),
+        ("w1", "A2"),
+        ("w2", "B1"),
+    ]
+    links = [a["href"] for a in _find(page, "a") if "href" in a]
+    # Each well is linked from its row of the table and from its entry in each of the
+    # three maps; an unscanned well is not linked at all.
+    assert links.count("#w0") == 1 + 3
+    assert links.count("#w2") == 1 + 3
+    assert len(links) == 3 * 4
+    assert '<td><a href="#w1">A2</a></td>' in text
+
+
+def test_footprints_use_the_scans_matrix_and_frame_not_the_plans() -> None:
+    # FM-124: the plan was laid for another camera and frame (2 µm, 90 x 120);
+    # the scan turned by 30 degrees, mirrored, on a frame of 60 x 80.
+    matrix = _turned(5.0, 30.0, True)
+    records = _records(
+        matrix=matrix, plan_matrix=_turned(2.0, 0.0, False), plan_shape=(90, 120)
+    )
+    _, page = _page(records)
+    frames = _paths(_section(page, "A1"), "frames")
+    assert len(frames) == 1
+    in_a1 = [f for f in records.scan.frames if f.well == "A1"]
+    assert frames[0]["data-n"] == str(len(in_a1))
+    drawn = _polygons(frames[0]["d"])
+    assert len(drawn) == len(in_a1)
+    cx, cy = _centre("A1")
+    for polygon, frame in zip(drawn, in_a1, strict=True):
+        # The scan's matrix and shape at the *readback* position, from the well's centre.
+        expected = footprint(
+            frame.x_um, frame.y_um, matrix=matrix, image_shape_px=SHAPE
+        )
+        assert len(polygon) == 4
+        for (px, py), (x, y) in zip(polygon, expected, strict=True):
+            assert px == pytest.approx(x - cx, abs=0.06)
+            assert py == pytest.approx(cy - y, abs=0.06)
+    # The readback is not the plan's field: a corner drawn at the target would be 0.3 off.
+    planned = records.plan.fields[0]
+    assert (in_a1[0].x_um, in_a1[0].y_um) != (planned.x_um, planned.y_um)
+
+
+def test_the_cells_drawn_are_the_cells_density_counted() -> None:
+    text, page = _page(_records())
+    section = _section(page, "A1")
+    cells = {a["data-label"]: a for a in _paths(section, "cells")}
+    assert set(cells) == set(CLASSES)
+    # A1 holds 5 single and 2 doublet inside; one single is on the plastic: not drawn.
+    assert (cells["single"]["data-drawn"], cells["single"]["data-total"]) == ("5", "5")
+    assert (cells["doublet"]["data-drawn"], cells["doublet"]["data-total"]) == (
+        "2",
+        "2",
+    )
+    assert (cells["debris"]["data-drawn"], cells["debris"]["data-total"]) == ("0", "0")
+    expected = sorted(
+        (dx, -dy)
+        for well, dx, dy, label in LAYOUT
+        if well == "A1" and label == "single" and _inside(dx, dy)
+    )
+    drawn = sorted(_dots(cells["single"]["d"]))
+    assert len(drawn) == len(expected) == 5
+    for (px, py), (x, y) in zip(drawn, expected, strict=True):
+        assert px == pytest.approx(x, abs=0.06)
+        assert py == pytest.approx(y, abs=0.06)
+    # The cell on the plastic is not drawn, and the caption gives its number, whole.
+    assert not any(abs(px - 3500.0) < 1.0 for px, _ in _dots(cells["single"]["d"]))
+    assert (
+        '<p class="caption">4 fields (0 failed) · 7 of 7 cells drawn · '
+        "1 detection outside the well shape is not drawn</p>"
+    ) in text
+    # A2 has nothing on the plastic: no sentence about it.
+    assert '<p class="caption">4 fields (0 failed) · 4 of 4 cells drawn</p>' in text
+
+
+def test_a_dot_is_a_round_capped_subpath_of_the_diameter_the_well_asks_for() -> None:
+    _, page = _page(_records())
+    single = _paths(_section(page, "A1"), "cells")[0]
+    assert single["stroke-linecap"] == "round"
+    assert single["fill"] == "none"
+    assert single["stroke"] == label_colour(0)
+    # max(0.012 x 6400, 12) = 76.8, to the tenth.
+    assert single["stroke-width"] == "76.8"
+    assert re.fullmatch(r"(M-?[\d.]+ -?[\d.]+h0\.1)+", single["d"])
+
+
+def _grid(n: int, spacing: float = 70.0) -> list[tuple[float, float]]:
+    """The first ``n`` points of a lattice that lie well inside a well of 3 200 µm radius."""
+    points = []
+    for i in range(90):
+        for j in range(90):
+            dx, dy = -3100.0 + spacing * i + 0.37, -3100.0 + spacing * j + 0.37
+            if math.hypot(dx, dy) <= 3100.0:
+                points.append((dx, dy))
+    return points[:n]
+
+
+def test_the_cells_drawn_are_capped_and_the_caption_says_so() -> None:
+    points = _grid(5000)
+    assert len(points) == 5000
+    layout = [
+        ("A1", dx, dy, "single" if k % 2 == 0 else "doublet")
+        for k, (dx, dy) in enumerate(points)
+    ]
+    records = _records(wells=("A1",), layout=layout)
+    text, page = _page(records, max_cells_drawn_per_well=1000)
+    cells = {a["data-label"]: a for a in _paths(_section(page, "A1"), "cells")}
+    drawn = int(cells["single"]["data-drawn"]) + int(cells["doublet"]["data-drawn"])
+    total = int(cells["single"]["data-total"]) + int(cells["doublet"]["data-total"])
+    assert (drawn, total) == (1000, 5000)
+    assert (
+        '<p class="caption">4 fields (0 failed) · 1000 of 5000 cells drawn '
+        "(a regular subsample)</p>"
+    ) in text
+    # The cells at (i * 5000) // 1000 = 5 i, in the order of the file: written from the spec.
+    chosen = [layout[(i * 5000) // 1000] for i in range(1000)]
+    for label in ("single", "doublet"):
+        want = sorted((dx, -dy) for _, dx, dy, lab in chosen if lab == label)
+        have = sorted(_dots(cells[label]["d"]))
+        assert len(have) == len(want)
+        for (px, py), (x, y) in zip(have, want, strict=True):
+            assert px == pytest.approx(x, abs=0.06)
+            assert py == pytest.approx(y, abs=0.06)
+    # The same records give the same bytes.
+    assert _render(records, max_cells_drawn_per_well=1000) == text
+
+
+def test_a_cap_of_zero_draws_no_cell_and_says_so() -> None:
+    text, page = _page(_records(), max_cells_drawn_per_well=0)
+    for path in _paths(_section(page, "A1"), "cells"):
+        assert path["data-drawn"] == "0"
+        assert path["d"] == ""
+    assert (
+        '<p class="caption">4 fields (0 failed) · 0 of 7 cells drawn '
+        "(none: the cap per well is 0) · 1 detection outside the well shape "
+        "is not drawn</p>"
+    ) in text
+
+
+def test_the_total_of_cells_drawn_is_bounded_whatever_the_cap() -> None:
+    # FM-74: a cap per well times 96 wells is no bound. 4 000 cells in each of the
+    # 96 wells, at the largest cap the parameter allows.
+    names = [f"{row}{col}" for row in "ABCDEFGH" for col in range(1, 13)]
+    points = _grid(4000, spacing=60.0)
+    assert len(points) == 4000
+    layout = [(well, dx, dy, "single") for well in names for dx, dy in points]
+    records = _records(
+        wells=names, layout=layout, rows=1, columns=1, labels=("single",)
+    )
+    text, page = _page(records, max_cells_drawn_per_well=20_000)
+    paths = _find(page, "path", "cells")
+    dots = [int(a["data-drawn"]) for a in paths]
+    assert len(dots) == 96
+    assert sum(dots) <= 300_000
+    # Each well draws its share: 300 000 // 96 = 3 125.
+    assert set(dots) == {3125}
+    assert sum(len(_dots(a["d"])) for a in paths) == 96 * 3125
+    assert len(text.encode("utf-8")) < 8_000_000
+
+
+# ---------------------------------------------------------------------- failed
+
+
+def test_a_failed_field_is_drawn_dashed_and_named_in_the_header() -> None:
+    # The scan's camera is turned and mirrored, the plan's is not (FM-124).
+    matrix = _turned(5.0, 30.0, True)
+    records = _records(failed={"A1": 1}, matrix=matrix, plan_matrix=UPRIGHT)
+    text, page = _page(records)
+    failed = _paths(_section(page, "A1"), "failed")
+    assert len(failed) == 1
+    assert failed[0]["data-n"] == "1"
+    # At the target, with the scan's matrix and frame: the field the scan could not take.
+    target = records.scan.failed[0]
+    cx, cy = _centre("A1")
+    (polygon,) = _polygons(failed[0]["d"])
+    expected = footprint(target.x_um, target.y_um, matrix=matrix, image_shape_px=SHAPE)
+    for (px, py), (x, y) in zip(polygon, expected, strict=True):
+        assert px == pytest.approx(x - cx, abs=0.06)
+        assert py == pytest.approx(cy - y, abs=0.06)
+    assert "1 field failed in 1 well: its area is not in the density" in text
+    assert '<p class="caption">3 fields (1 failed) · 7 of 7 cells drawn' in text
+    # A well that lost none has no such path.
+    assert _paths(_section(page, "A2"), "failed") == []
+
+
+def test_a_well_whose_every_field_failed_has_no_frames_and_says_unknown() -> None:
+    text, page = _page(_records(failed={"A1": 4}))
+    (frames,) = _paths(_section(page, "A1"), "frames")
+    assert frames["data-n"] == "0"
+    assert frames["d"] == ""
+    assert '<p class="counts">single 5 (no frame: unknown)' in text
+    assert _wells_of_map(page, "single")["A1"]["data-state"] == "unknown"
+    assert "4 fields failed in 1 well: their area is not in the density" in text
+
+
+def test_the_panel_is_the_wells_circumscribed_square_plus_a_tenth() -> None:
+    # The 96-well plate's wells are 6 400 µm: half 3 200, and the fields of the
+    # seed stay inside it, so the view is 3 200 x 1.1 on each side.
+    _, page = _page(_records())
+    (panel,) = [a for t, a in _section(page, "A1") if t == "svg"]
+    assert panel["viewbox"] == "-3520 -3520 7040 7040"
+
+
+def test_the_panel_grows_to_hold_a_footprint_that_reaches_past_the_wall() -> None:
+    # One field per well, centred. At 120 µm per pixel a frame of 60 x 80 px is
+    # 9 600 x 7 200 µm: its corner is 4 800 µm from the centre (plus the 0.3 µm
+    # by which the stage's readback differs from the target), past the 3 200 µm wall.
+    huge = ((120.0, 0.0), (0.0, -120.0))
+    records = _records(
+        matrix=huge, plan_matrix=UPRIGHT, plan_shape=SHAPE, rows=1, columns=1
+    )
+    _, page = _page(records)
+    (panel,) = [a for t, a in _section(page, "A1") if t == "svg"]
+    _, _, w, h = _numbers(panel["viewbox"])
+    assert w == h == pytest.approx(2.2 * 4800.3, abs=0.2)
+    # A footprint inside the wall does not shrink the view below the well's square.
+    small = ((50.0, 0.0), (0.0, -50.0))
+    records = _records(
+        matrix=small, plan_matrix=UPRIGHT, plan_shape=SHAPE, rows=1, columns=1
+    )
+    _, page = _page(records)
+    (panel,) = [a for t, a in _section(page, "A1") if t == "svg"]
+    assert panel["viewbox"] == "-3520 -3520 7040 7040"
+
+
+# ----------------------------------------------------------------------- route
+
+
+def test_route_fields_are_drawn_in_the_routes_frame() -> None:
+    records = _records()
+    route = _route(
+        records
+    )  # the scan's camera at twice the pixel size: another objective
+    text, page = _page(records, route=route)
+    section = _section(page, "A1")
+    fields = _paths(section, "field")
+    assert [f["data-order"] for f in fields] == ["0", "1"]
+    assert [f["data-name"] for f in fields] == ["A1_r000", "A1_r001"]
+    cx, cy = _centre("A1")
+    for drawn, stop in zip(fields, route.positions[:2], strict=True):
+        (polygon,) = _polygons(drawn["d"])
+        expected = footprint(
+            stop.x_um, stop.y_um, matrix=route.matrix_um_per_px, image_shape_px=SHAPE
+        )
+        for (px, py), (x, y) in zip(polygon, expected, strict=True):
+            assert px == pytest.approx(x - cx, abs=0.06)
+            assert py == pytest.approx(cy - y, abs=0.06)
+        # The route's frame is 800 µm wide; the scan's would be 400.
+        assert max(px for px, _ in polygon) - min(px for px, _ in polygon) == (
+            pytest.approx(800.0, abs=0.2)
+        )
+    assert "<title>A1_r000: 5 single</title>" in text
+    assert "<title>A1_r001: 0 single, 2 doublet</title>" in text
+    # The numbers are order + 1, across the whole page, in the order of the route.
+    assert re.findall(r'class="order"[^>]*>(\d+)</text>', text) == ["1", "2", "3", "4"]
+    (line,) = [a for t, a in section if t == "polyline" and a["class"] == "route-well"]
+    pairs = _points(line["points"].replace(",", " "))
+    assert len(pairs) == 2
+    for (px, py), stop in zip(pairs, route.positions[:2], strict=True):
+        assert px == pytest.approx(stop.x_um - cx, abs=0.06)
+        assert py == pytest.approx(cy - stop.y_um, abs=0.06)
+    # A well with one stop has its field and no line of its own.
+    assert [a for t, a in _section(page, "A2") if t == "polyline"] == []
+    assert len(_paths(_section(page, "A2"), "field")) == 1
+
+
+def test_the_route_is_drawn_in_the_order_of_its_stops_whatever_the_list_order() -> None:
+    records = _records()
+    route = _route(records)
+    shuffled = route.model_copy(update={"positions": tuple(reversed(route.positions))})
+    text, page = _page(records, route=shuffled)
+    cx, cy = _centre("A1")
+    (line,) = [
+        a
+        for t, a in _section(page, "A1")
+        if t == "polyline" and a["class"] == "route-well"
+    ]
+    pairs = _points(line["points"].replace(",", " "))
+    # A1_r000 first, then A1_r001, as the stops' own order says.
+    for (px, py), stop in zip(pairs, _stops()[:2], strict=True):
+        assert px == pytest.approx(stop.x_um - cx, abs=0.06)
+        assert py == pytest.approx(cy - stop.y_um, abs=0.06)
+    assert [f["data-order"] for f in _paths(_section(page, "A1"), "field")] == [
+        "0",
+        "1",
+    ]
+    # The whole route: the start is the first stop (green), whatever the list says.
+    (route_line,) = _find(page, "polyline", "route")
+    pairs = _points(route_line["points"].replace(",", " "))
+    first, second = _stops()[:2]
+    assert pairs[1][0] - pairs[0][0] == pytest.approx(
+        second.x_um - first.x_um, abs=0.11
+    )
+    assert re.findall(r'class="order"[^>]*>(\d+)</text>', text) == ["1", "2", "3", "4"]
+
+
+def test_the_report_without_a_route_says_so() -> None:
+    text, page = _page(_records())
+    assert (
+        '<h2>Route</h2><p class="note">no route: run route to add the fields '
+        "to image</p>"
+    ) in text
+    assert _find(page, "svg", "route-map") == []
+    assert _find(page, "path", "field") == []
+    assert _find(page, "polyline") == []
+    # And no column for what a route leaves out.
+    assert "Not in a chosen field" not in text
+
+
+def test_the_route_map_gives_distance_and_travel_time_or_says_there_is_none() -> None:
+    records = _records()
+    text, page = _page(records, route=_route(records))
+    (line,) = _find(page, "polyline", "route")
+    assert line["data-stops"] == "4"
+    # 4 stops in 3 wells; 12 345 µm is 12.3 mm; 247 s is 4 min 7 s.
+    assert (
+        '<p class="route-summary">4 stops in 3 wells · 12.3 mm · 4 min 7 s</p>' in text
+    )
+    assert (
+        '<p class="note">1 cell of the wanted labels (single, doublet) is in no '
+        "chosen field.</p>"
+    ) in text
+    # The ranks of the visited wells, in the order of their first stop.
+    assert re.findall(r'class="rank"[^>]*>(\d+)</text>', text) == ["1", "2", "3"]
+    markers = [a["class"] for t, a in page.tags if t == "circle" and "class" in a]
+    assert "start" in markers
+    assert "end" in markers
+    # The line goes through the stops in order, in the plate's one frame.
+    pairs = _points(line["points"].replace(",", " "))
+    assert len(pairs) == 4
+    first, second = _stops()[:2]
+    assert pairs[1][0] - pairs[0][0] == pytest.approx(
+        second.x_um - first.x_um, abs=0.11
+    )
+    assert pairs[1][1] - pairs[0][1] == pytest.approx(
+        first.y_um - second.y_um, abs=0.11
+    )
+    # The table has the column the route adds.
+    assert "<th>Not in a chosen field (single, doublet)</th>" in text
+    unknown, _ = _page(records, route=_route(records, travel_s=None))
+    assert (
+        '<p class="route-summary">4 stops in 3 wells · 12.3 mm · not estimated: '
+        "no timing model</p>"
+    ) in unknown
+
+
+def test_the_header_names_the_objective_the_route_was_imaged_with_when_it_differs() -> (
+    None
+):
+    records = _records()
+    text, _ = _page(records, route=_route(records))
+    assert (
+        "<tr><th>Route imaged with</th><td>Nikon 20X Plan Fluor ELWD</td></tr>" in text
+    )
+    same, _ = _page(records, route=_route(records, objective="Nikon 10X S Fluor"))
+    assert "Route imaged with" not in same
+    unrecorded, _ = _page(records, route=_route(records, objective=None))
+    assert "<tr><th>Route imaged with</th><td>not recorded</td></tr>" in unrecorded
+
+
+# --------------------------------------------------------------------- escaping
+
+_HOSTILE = "<img src=x onerror=alert(1)>\"'"
+
+
+def _classes_and_ids(page: Audit) -> tuple[set[str], set[str]]:
+    classes: set[str] = set()
+    ids: set[str] = set()
+    for _, attrs in page.tags:
+        classes.update(attrs.get("class", "").split())
+        if "id" in attrs:
+            ids.add(attrs["id"])
+    return classes, ids
+
+
+def test_text_with_markup_is_escaped_wherever_it_is_shown() -> None:
+    label = 'single"><b>'
+    layout = [
+        (w, dx, dy, label if lab == "single" else lab) for w, dx, dy, lab in LAYOUT
+    ]
+    records = _records(
+        layout=layout, labels=(label, "doublet", "debris"), objective=_HOSTILE
+    )
+    route = _route(records, objective=_HOSTILE + "!")  # differs: it is shown
+    renamed = route.positions[0].model_copy(update={"name": _HOSTILE})
+    route = route.model_copy(
+        update={
+            "positions": (renamed, *route.positions[1:]),
+            "labels": (label, "doublet"),
+        }
+    )
+    text, page = _page(
+        records,
+        route=route,
+        title=_HOSTILE,
+        facts=((_HOSTILE, _HOSTILE),),
+        assumed=(_HOSTILE,),
+    )
+    escaped = "&lt;img src=x onerror=alert(1)&gt;&quot;&#x27;"
+    # <title> and <h1>, both sides of a fact, an assumed line, the objective and the
+    # route's, a stop's name (in its attribute and its tooltip).
+    assert text.count(escaped) == 9
+    assert "<img" not in text
+    assert [t for t, _ in page.tags if t in {"img", "b"}] == []
+    assert not any("onerror" in attrs for _, attrs in page.tags)
+    assert "single&quot;&gt;&lt;b&gt;" in text
+    assert page.unbalanced == []
+    # Nothing from a record became an id or a class: the same sets as a benign page.
+    benign = _records()
+    _, clean = _page(benign, route=_route(benign))
+    assert _classes_and_ids(page) == _classes_and_ids(clean)
+    # The data attributes carry the label, escaped on the way out and whole on the way back.
+    assert {a["data-label"] for a in _find(page, "path", "cells")} == {
+        label,
+        "doublet",
+        "debris",
+    }
+
+
+# --------------------------------------------------------------------- refusals
+
+
+def _refused(records: Records, message: str, **overrides: object) -> None:
+    with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
+        _render(records, **overrides)
+
+
+def _cell_at(x_um: float) -> Cell:
+    return Cell.model_construct(
+        well="A1",
+        x_um=x_um,
+        y_um=0.0,
+        label="single",
+        score=0.9,
+        frame=0,
+        box_px=(0.0, 0.0, 1.0, 1.0),
+    )
+
+
+def test_a_non_finite_coordinate_is_refused_naming_the_stage() -> None:
+    nan = float("nan")
+    records = _records()
+    # The plate's registration: useq accepts nan (FM-114); a copy skips validation.
+    bad_plate = records.plan.plate_plan.model_copy(update={"a1_center_xy": (nan, 0.0)})
+    _refused(
+        records,
+        "the plate's A1 centre is not a finite number; run scan-plan again",
+        plan=records.plan.model_copy(update={"plate_plan": bad_plate}),
+    )
+    # A frame, a failed field, a cell and a stop, built without validation.
+    frame = records.scan.frames[0].model_copy(update={"x_um": nan})
+    _refused(
+        records,
+        "a frame's position is not a finite number; run scan again",
+        scan=records.scan.model_copy(
+            update={"frames": (frame, *records.scan.frames[1:])}
+        ),
+    )
+    failing = _records(failed={"A1": 1})
+    lost = failing.scan.failed[0].model_copy(update={"y_um": nan})
+    _refused(
+        failing,
+        "a failed field's position is not a finite number; run scan again",
+        scan=failing.scan.model_copy(update={"failed": (lost,)}),
+    )
+    _refused(
+        records,
+        "a cell's position is not a finite number; run cells again",
+        cells=(_cell_at(nan), *records.cells),
+    )
+    route = _route(records)
+    stop = route.positions[0].model_copy(update={"x_um": nan})
+    _refused(
+        records,
+        "a stop's position is not a finite number; run route again",
+        route=route.model_copy(update={"positions": (stop, *route.positions[1:])}),
+    )
+
+
+def test_a_camera_matrix_that_is_not_finite_names_the_stage_that_holds_it() -> None:
+    inf = float("inf")
+    records = _records()
+    _refused(
+        records,
+        "a camera matrix is not a finite number; run scan again",
+        scan=records.scan.model_copy(
+            update={"matrix_um_per_px": ((inf, 0.0), (0.0, -5.0))}
+        ),
+    )
+    _refused(
+        records,
+        "a camera matrix is not a finite number; run route again",
+        route=_route(records).model_copy(
+            update={"matrix_um_per_px": ((10.0, 0.0), (0.0, inf))}
+        ),
+    )
+
+
+def test_a_coordinate_beyond_1e12_um_is_refused_not_printed() -> None:
+    # f"{1e300:.1f}" is 303 characters: a position that far is a corrupt record.
+    records = _records()
+    frame = records.scan.frames[0].model_copy(update={"x_um": 1e300})
+    _refused(
+        records,
+        "a frame's position is beyond 1e12 µm; run scan again",
+        scan=records.scan.model_copy(
+            update={"frames": (frame, *records.scan.frames[1:])}
+        ),
+    )
+    _refused(
+        records,
+        "a cell's position is beyond 1e12 µm; run cells again",
+        cells=(_cell_at(1e13), *records.cells),
+    )
+
+
+def test_a_route_stop_in_a_well_that_is_not_on_the_plate_is_refused() -> None:
+    records = _records()
+    route = _route(records)
+    stop = route.positions[0].model_copy(update={"well": "Z99"})
+    _refused(
+        records,
+        "the route has a stop in well 'Z99', which is not on the 96-well plate; "
+        "run route again",
+        route=route.model_copy(update={"positions": (stop, *route.positions[1:])}),
+    )
