@@ -406,12 +406,18 @@ def survey_extent_note(
 def frame_value(frame: npt.NDArray[Any], statistic: Literal["mean", "std"]) -> float:
     """The survey's one number for a frame: its mean or its standard deviation, in float64.
 
-    ``dtype=np.float64`` because a ``uint16`` frame would otherwise be
-    accumulated in a narrower type.
+    ``dtype=np.float64`` because a ``float32`` frame would otherwise add up in
+    ``float32``, which loses what is small beside the sum. A frame with nothing
+    in it, or with an infinity, gives ``nan`` and not a warning: the survey
+    skips a point whose value is not finite, and says so.
     """
-    if statistic == "mean":
-        return float(np.mean(frame, dtype=np.float64))
-    return float(np.std(frame, dtype=np.float64))
+    if frame.size == 0:
+        return math.nan
+    # numpy warns `invalid value` where Python's floats go to `nan` without a word.
+    with np.errstate(over="ignore", invalid="ignore"):
+        if statistic == "mean":
+            return float(np.mean(frame, dtype=np.float64))
+        return float(np.std(frame, dtype=np.float64))
 
 
 # ----------------------------------------------------------------- scoring

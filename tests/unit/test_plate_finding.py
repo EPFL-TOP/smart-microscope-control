@@ -513,6 +513,17 @@ def test_frame_value_is_the_float64_mean_or_std() -> None:
     assert isinstance(frame_value(extremes, "mean"), float)
 
 
+def test_a_frame_that_cannot_give_a_number_gives_nan_and_no_warning() -> None:
+    """The survey skips a point whose value is not finite; numpy's warning would end the run under ``-W error``."""
+    empty = np.zeros((0, 4), dtype=np.uint16)
+    infinite = np.array([[1.0, math.inf]], dtype=np.float32)
+
+    assert math.isnan(frame_value(empty, "mean"))
+    assert math.isnan(frame_value(empty, "std"))
+    assert frame_value(infinite, "mean") == math.inf
+    assert math.isnan(frame_value(infinite, "std"))
+
+
 # ------------------------------------------------------- the score's edges
 
 
