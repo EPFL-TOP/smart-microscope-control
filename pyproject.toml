@@ -71,6 +71,7 @@ camera-calibration = "smc.plugins.camera_calibration.plugin:CameraCalibrationPlu
 cells = "smc.plugins.cells.plugin:CellsPlugin"
 density = "smc.plugins.density.plugin:DensityPlugin"
 goto-well = "smc.plugins.goto_well:GotoWellPlugin"
+plate-finding = "smc.plugins.plate_finding.plugin:PlateFindingPlugin"
 plate-registration = "smc.plugins.plate_registration.plugin:PlateRegistrationPlugin"
 route = "smc.plugins.route.plugin:RoutePlugin"
 scan = "smc.plugins.scan.plugin:ScanPlugin"
