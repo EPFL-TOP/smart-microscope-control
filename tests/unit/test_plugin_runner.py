@@ -105,6 +105,7 @@ class Echo(Base):
             "checkpoint": loaded.checkpoint,
             "logger": ctx.logger.name,
             "run_dir": ctx.run_dir,
+            "run_doc": ctx.run_doc,
             "dry_run": ctx.dry_run,
             "plugin": ctx.plugin,
         }
@@ -370,6 +371,7 @@ def test_the_running_record_is_written_before_run_and_the_context_is_wired(
         "checkpoint": None,
         "logger": "smc.plugins.echo",
         "run_dir": tmp_path,
+        "run_doc": tmp_path / "run.json",
         "dry_run": False,
         "plugin": "echo",
     }
