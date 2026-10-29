@@ -9,6 +9,7 @@ messages) is [`docs/design/m3-plugins.md`](../design/m3-plugins.md) §1; this pa
 is how to use it.
 
 - [Running a plugin: `smc run`](#running-a-plugin-smc-run)
+- [Trying the workflow without a microscope](#trying-the-workflow-without-a-microscope)
 - [Writing a plugin](#writing-a-plugin)
 - [The run document](#the-run-document)
 - [Testing a plugin](#testing-a-plugin)
@@ -112,6 +113,63 @@ either: its checkpoint was made against inputs that no longer match.
 When a run makes other stages stale (their input was produced again), one
 `! <plugin> read <slot> from an earlier run; run it again` line says so. Nothing
 is deleted or refused: running the stale stage again is the operator's call.
+
+## Trying the workflow without a microscope
+
+The `demo-sample` profile is the demo stand whose camera images a **synthetic
+96-well plate**, so the whole plate-scan workflow can be followed on images, on any
+PC, before there is a stand to follow it on. Everything that reads the stand reads
+this one, because the facade builds it from the profile: `smc run`, `smc ui plate`
+(see [the plate page](../ui/plate-page.md#trying-the-workflow-without-a-microscope))
+and `Microscope.open("demo-sample")` in a notebook. From the smc folder:
+
+```text
+smc doctor -p demo-sample
+smc run plate-finding -p demo-sample --run-doc run.json
+smc run scan-plan -p demo-sample --run-doc run.json --param wells=B2,B11 --param coverage=0.4
+smc run scan -p demo-sample --run-doc run.json
+smc run cells -p demo-sample --run-doc run.json --param detector=blobs
+smc run density -p demo-sample --run-doc run.json
+smc run route -p demo-sample --run-doc run.json --param 'labels=["single","doublet"]'
+smc run report -p demo-sample --run-doc run.json
+```
+
+`plate-finding` is the slow stage: it surveys the plate with the demo stage, which
+takes about 7 minutes (measured: 407 s). To skip it, register the plate from its two
+corners, which takes no time (on the centred plate, A1 is at (−49 500, 31 500) µm and
+H12 at (49 500, −31 500) µm):
+
+```text
+smc run plate-registration -p demo-sample --run-doc run.json --param 'refs=[{"well": "A1", "x_um": -49500, "y_um": 31500}, {"well": "H12", "x_um": 49500, "y_um": -31500}]'
+```
+
+`smc doctor -p demo-sample` prints, after the roles, three lines that say what this
+stand is and what it is not:
+
+```text
+Sample: a synthetic 96-well plate, A1 at (-49500.0, 31500.0) µm, turned 0°; 40 cells per well on average, 30 % of them doublets (seed 0)
+  frames are rendered where the stage is, not imaged: one flat plane at z = 0 (Z only blurs), no optics
+  pixel sizes up to 4 µm (the texture aliases above); the cells are bright round spots: run cells with detector=blobs
+```
+
+**What is synthetic.** The pixels. The stage, the focus drive, the turret and the
+exposure are the demo devices, and so are the halt, the motion guard and the lock:
+the camera snaps the demo camera first, then draws the plate at the stage's position,
+at the demo camera's frame size and pixel size. The plate is centred on the stage
+origin (the stage starts on plastic), its cells are bright round spots (one, or two
+side by side for a doublet), and there are more of them towards the last column than
+towards the first, so that `density` and `route` have something to tell apart. The
+`[sample]` table of `profiles/demo-sample.toml` sets the plate, where A1 is, the
+rotations, the cells per well, the share of doublets, the cells' size and the seed.
+
+**The limits.** The sample is one flat plane at z = 0: Z only blurs the frame (the
+same blur on either side of 0), so there is no focus to find and no z-stack to take.
+There is no optics, no shading and no illumination. Its texture is built for pixel sizes up
+to 4 µm; above that the stand logs a warning, since only whole-pixel shifts correlate.
+The trained model does **not** see these cells (at most 2 `single` of 14 objects), so
+`cells` needs `--param detector=blobs`; its counts are of bright round spots, and the
+result says that on a real sample they are not cells. A result made here carries the
+profile name `demo-sample` in the run document, so it is never taken for a sample's.
 
 ## Writing a plugin
 
