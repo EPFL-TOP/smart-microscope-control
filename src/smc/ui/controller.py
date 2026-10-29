@@ -27,7 +27,7 @@ import logging
 import queue
 import threading
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from importlib.metadata import EntryPoint
 from pathlib import Path
@@ -539,13 +539,33 @@ class PlatePage:
             # Text, never the error (FM-98).
             self._set_outcome(f"{plugin}: {type(exc).__name__}: {_one_line(exc)}")
             return
+        self._start_activity(
+            plugin, lambda event: self._run_plugin(plugin, entry, parsed, event)
+        )
+
+    def _start_activity(
+        self, name: str, body: Callable[[threading.Event], str]
+    ) -> None:
+        """Start the activity ``name`` on the daemon worker; ``body`` returns its outcome text.
+
+        Every action that reaches the stand through a call that may last is such
+        an activity (m5 §2.1): it holds ``_current_run`` under its name, so that a
+        second one is refused and ``stop()``, ``resume()``, ``close()`` and
+        ``join()`` treat it as they treat a run. The lock discipline is that of the
+        class: ``_lock`` guards the activity's name, the progress, the outcome and
+        what the activity keeps, and is never held across a device call.
+
+        Raises:
+            RuntimeError: An activity is going (``<name> is running``), or the page
+                is closed.
+        """
         event = threading.Event()
         with self._lock:
             if self._closed:
                 raise RuntimeError("the page is closed")
             if self._current_run is not None:
                 raise RuntimeError(f"{self._current_run[0]} is running")
-            self._current_run = (plugin, event)
+            self._current_run = (name, event)
             self._progress = None
             self._outcome = None
             while True:
@@ -557,8 +577,8 @@ class PlatePage:
             # alive after the page is closed.
             worker = threading.Thread(
                 target=self._work,
-                args=(plugin, entry, parsed, event),
-                name=f"smc-ui-{plugin}",
+                args=(name, body, event),
+                name=f"smc-ui-{name}",
                 daemon=True,
             )
             self._worker = worker
@@ -566,46 +586,52 @@ class PlatePage:
 
     def _work(
         self,
-        plugin: str,
-        entry: PluginEntry,
-        parsed: PluginParams,
+        name: str,
+        body: Callable[[threading.Event], str],
         event: threading.Event,
     ) -> None:
-        """The worker's body: the run, and its outcome as text before anything else ends."""
-        log.info("%s: started from the plate page", plugin)
-        started = time.monotonic()
-        outcome = f"{plugin}: ended without an outcome"
+        """The worker's body: the activity, and its outcome as text before anything else ends."""
+        outcome = f"{name}: ended without an outcome"
         try:
-            try:
-                record = run_plugin(
-                    entry.plugin,
-                    self._microscope,
-                    parsed,
-                    self._run_doc,
-                    on_progress=self._queue.put,
-                    stop=event,
-                    plugin_version=entry.version,
-                )
-            except RunDocumentError as exc:
-                if exc.record is not None and exc.record.result is not None:
-                    outcome = (
-                        f"{plugin} ran, but its record could not be written: "
-                        f"{_one_line(exc)}"
-                    )
-                else:
-                    outcome = f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
-            except Exception as exc:
-                outcome = f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
-            else:
-                if record.status is StageStatus.done:
-                    outcome = f"{plugin} done in {time.monotonic() - started:.1f} s"
-                else:
-                    outcome = f"{plugin} stopped"
+            outcome = body(event)
         finally:
             with self._lock:
                 self._outcome = outcome
                 self._current_run = None
             log.info("%s", outcome)
+
+    def _run_plugin(
+        self,
+        plugin: str,
+        entry: PluginEntry,
+        parsed: PluginParams,
+        event: threading.Event,
+    ) -> str:
+        """A plugin's run on the worker, and its outcome as text."""
+        log.info("%s: started from the plate page", plugin)
+        started = time.monotonic()
+        try:
+            record = run_plugin(
+                entry.plugin,
+                self._microscope,
+                parsed,
+                self._run_doc,
+                on_progress=self._queue.put,
+                stop=event,
+                plugin_version=entry.version,
+            )
+        except RunDocumentError as exc:
+            if exc.record is not None and exc.record.result is not None:
+                return (
+                    f"{plugin} ran, but its record could not be written: "
+                    f"{_one_line(exc)}"
+                )
+            return f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
+        except Exception as exc:
+            return f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
+        if record.status is StageStatus.done:
+            return f"{plugin} done in {time.monotonic() - started:.1f} s"
+        return f"{plugin} stopped"
 
     def stop(self) -> None:
         """Ask the run to stop, then stop the stand; say what the stop did, never "stopped" by default.
