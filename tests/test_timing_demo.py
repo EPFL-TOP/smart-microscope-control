@@ -2,9 +2,9 @@
 
 Three kinds of test, because a timing has three things to get wrong:
 
-* **The demo** runs the whole loop on Micro-Manager's devices. A demo move cannot
-  return early, so the only duration asserted is ``move_ms_per_mm > 0``; the
-  rest is order and presence (FM-44).
+* **The demo** runs the whole loop on Micro-Manager's devices. What a demo move
+  costs depends on the runner (a 100 and a 400 µm move read the same on the macOS
+  job), so no duration is asserted there: order and presence only (FM-44).
 * **A fake clock** (``_clock`` is read at call time) and a stage that advances it
   by a known cost make the fit exact, and the targets of the moves are asserted
   against a list written here and not read from the code (FM-124). These run on
@@ -325,11 +325,12 @@ def test_a_measured_run_fills_the_slot_on_the_demo(
     result = _result(record)
     # A lock that was timed, not the 400 ms assumed: no `refocus` line, and the
     # autofocus sample is counted (4 stage + 1 autofocus + 1 bare snap). No
-    # duration is asserted: a loaded runner may be slow (FM-44).
+    # duration is asserted, not even `move_ms_per_mm > 0`: the macOS runner read
+    # 0.0 for it, a 100 and a 400 µm move of the demo stage costing the same there
+    # (FM-44). The fit is exact in the fake-clock tests below.
     assert result.refocus_ms is not None
     assert not any("refocus" in line for line in result.assumed)
     assert result.samples == 6
-    assert result.move_ms_per_mm > 0.0
     assert NO_LIMITS in result.assumed
     # The slot, as the scan plan reads it.
     filling = RunDocument.load(tmp_path / "run.json").provider("timings")
