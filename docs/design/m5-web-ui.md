@@ -1,7 +1,9 @@
 # M5 design — the web UI's shell
 
-- **Status**: design for issue #28 (§1 to §4, 2026-10-29); the directions of
-  #262, #263 and #264 (§5 to §7), which their plans fix.
+- **Status**: design for issue #28 (§1 to §4, 2026-10-29), as built by #270 and
+  settled by #272 (§2.1, §2.4, §3: the stale card, the card's bounds,
+  `card_text`'s signature); the directions of #262, #263 and #264 (§5 to §7),
+  which their plans fix.
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 to M3, this document is the contract between issues.
   Names, module paths and signatures below are fixed; an executor who needs to
@@ -73,6 +75,20 @@ plugin names, and a plugin of the same name changes nothing.
 `run()` and `snap()` share one private helper that holds the lock discipline of
 M3 §15.3 (`_lock` guards `_current_run`, `_progress`, `_outcome` and the frame;
 never held across a device call; `stop()` takes none, FM-70).
+
+`PlatePage.activities_ended` counts the **activities** that have ended (a run,
+a snap, a live session, a drive action), once each, after what the activity
+wrote is on disk. It is part of the shared state, and a tab that sees it change
+calls `refresh()` (FM-151): it reads the run document and redraws the plate, the
+route and the checklist. Measured here on `FakeCore`, 2026-10-29, on a 1536-well
+plate: the first `view()` takes 591 ms (the plate's geometry, FM-145's 339 ms,
+which `view()` then keeps), a later `view()` 1 ms and a `refresh()` 1 to 2 ms;
+what each one then costs is the redraw, which assigns the wells' column data
+again, 11 columns of 1536 rows (122 kB as JSON) that the server sends to every
+browser (not measured: no browser). That is right for the end of a run and a
+small cost to a snap, and it is wrong for anything that happens *inside* an
+activity: **what an activity does while it goes is never an activity**, so a
+live frame (§5) never counts.
 
 ### 2.2 A snap and its frame
 
@@ -172,20 +188,76 @@ class ResultCard:
     lines: tuple[str, ...]
     assumed: tuple[str, ...]
     error: str | None
+    stale: bool = False
 ```
 
 `PlateView` gains `cards: dict[str, ResultCard]` (last field): one card per tool
 that has a record in the run document (`doc.stages[name]`), none otherwise.
 `status` is the record's `StageStatus` value; `when_utc` is `finished_utc`, else
-`started_utc`, as `YYYY-MM-DD HH:MM:SS`; `error` is the record's, on one line.
-**`lines` come from the result only when the status is `done`** (a stopped or
-failed record's values are not a result, FM-154): one line per top-level key of
-`record.result` in its order, `assumed` excepted — `<key>: <value>` for a string
-(newlines as spaces, cut to 80 characters and `…`), a bool, an int or `None`,
-`<key>: <value:g>` for a float, `<key>: <n> items` for a list and `<key>: <n>
-entries` for an object; at most 8 lines, then `… <n> more`. `assumed` is the
-result's `assumed` list as strings (`()` when it has none). The card is built by
-`view()`, so it follows the run document, not the tick.
+`started_utc`, as `YYYY-MM-DD HH:MM:SS`; `profile` and `error` are the record's,
+each on one line and cut as below. **`lines` come from the result only when the
+status is `done`** (a stopped or failed record's values are not a result,
+FM-154): one line per top-level key of `record.result` in its order, `assumed`
+excepted — `<key>: <value>` for a string (newlines as spaces, cut to 80
+characters and `…`), a bool, an int or `None`, `<key>: <value:g>` for a float,
+`<key>: <n> items` for a list and `<key>: <n> entries` for an object; at most 8
+lines, then `… <n> more`. `assumed` is the result's `assumed` list as strings (a
+bare value is one entry; `()` when it has none), under the same rule as `lines`.
+The card is built by `view()`, so it follows the run document, not the tick.
+
+**A stale card says so** (#272). `stale` is `True` when the record's status is
+`done` and `RunDocument.is_stale(plugin)`: the tool read an input that has been
+produced again since, and the checklist beside it says `<plugin> read its inputs
+from an earlier run; run it again`. The card **keeps** its `lines` and
+`assumed`, and its header ends with `(stale)` (§3). `view()` passes
+`doc.is_stale(name)` to the card's builder, `_card(record, *, stale=False)`,
+which applies the status rule, so the rule is in one pure function.
+
+- *A mark, not a card without values.* A stale `done` record's values are a
+  result, of inputs that are no longer the document's: they are shown and
+  marked. FM-154 hides the values of a record that never was a result (stopped,
+  failed). The header already says every other reason the checklist gives for an
+  unusable slot (a status that is not `done`, another profile, a dry run); stale
+  is the one it did not.
+- *Only a `done` record is marked.* `is_stale` ignores the status (measured, on
+  `FakeCore`: a `failed` record that read an earlier input is stale), and a card
+  that is not `done` has no values to mislead: its status already says `run it
+  again`.
+- `is_stale` is a pure read of the document that no cycle can make raise (the
+  walk keeps its visited names), measured at 0.004 ms: `view()` calls it for
+  each card.
+
+**A card is bounded whatever its record holds** (#272). Measured on `FakeCore`,
+2026-10-29, as the card is built by #270: 2000 assumptions of 300 characters
+give a card of 620,035 characters, an `error` of 100 kB one of 100,038, and an
+`assumed` that is one string of 1 MB one of 1,000,038. The bounds:
+
+| What | Bound | When it is cut |
+|---|---|---|
+| `lines` | at most 8, `_CARD_LINES` | then `… <n> more` as the last line (as today) |
+| `assumed` | at most 8, the same constant | then `… <n> more` as its **last entry**, so `card_text` shows `assumed: … 3 more` and needs no new code |
+| a key, a string value, `profile` | 80 characters, `_CARD_CHARS` | the text and `…` (as today; `profile` is new) |
+| an assumption, `error` | 600 characters, `_CARD_TEXT_CHARS` (new) | the text and `…` |
+
+Each text is made one line first (`_flat`), then cut: `_cut(text, limit=_CARD_CHARS)`
+takes the limit as a parameter, and a non-string item of `assumed` is `str()`-ed
+before it, since it can print as long as it likes. 600 characters is more than
+twice the longest assumption of a built-in plugin (236, the route's unlocked-frame
+line for 1536 stops; measured), so no assumption a plugin writes today is cut,
+and an error is a diagnosis whose end often says what to do, so it is cut late.
+The worst card is about 7,000 characters (a prototype of the format, not the
+code: a header with an 80-character profile, 8 lines of 166, 8 assumptions of
+610, an error of 607), two orders of magnitude under the cases above. The run
+document and the log hold the rest; a card never changes a record.
+`profile` is cut so that the bound is the card's, not only two of its fields: a
+profile longer than 80 characters then differs from `stand` and is named on
+every card, which errs towards naming it.
+
+**The code of this section's stale mark and bounds** (the `stale` field,
+`_card`'s parameter, `_CARD_TEXT_CHARS`, the cut of `assumed`, `error` and
+`profile`, and the line of `docs/ui/plate-page.md` that says what a card
+shows) goes to the next issue that edits `controller.py`: **#262** (§8). Its
+plan lists it as steps with the tests of #272's plan.
 
 ### 2.5 The strip and the checklist
 
@@ -220,10 +292,16 @@ without a line in `_CHECKLIST`.
   (within a second); a tick that sees the same number draws nothing.
 - **The result card** of a tool is a `pn.pane.Str` under its Run button, never
   Markdown (a result's text is not markup, FM-139), built by a pure
-  `card_text(card: ResultCard | None) -> str`: `""` without a card, else the
-  header `<status> <when_utc> UTC`, then ` on <profile>` when it is not this
-  stand's, then ` (dry run)` when it was one; then the `lines`, each indented
-  by two spaces; then `assumed: <text>` per assumption; then `error: <error>`.
+  `card_text(card: ResultCard | None, *, stand: str | None = None) -> str`:
+  `""` without a card, else the header `<status> <when_utc> UTC`, then
+  ` on <profile>` when it is not `stand`, then ` (dry run)` when it was one,
+  then ` (stale)` when `card.stale` (§2.4); then the `lines`, each indented by
+  two spaces; then `assumed: <text>` per assumption; then `error: <error>`.
+  `stand` is `PageStatus.stand`, keyword-only (the signature #270 applied, see
+  its `## Plan deviation` on #28: the card alone cannot say what "this stand's"
+  is). With `stand=None` (the view has not yet read the stand: its first
+  `refresh()` draws before its first tick, which then draws the cards again) the
+  profile is always told: a card never claims to be this stand's.
 - **Tools under `More`** are sections like the others, in a last `Accordion`
   card.
 
@@ -253,6 +331,18 @@ third-party plugin's `Params` read by `describe_params`).
 - The page redraws the image on a second periodic callback of its own, faster
   than the 1 s tick, that does nothing but compare `frame().number` (FM-145);
   the status tick stays at 1 s.
+- **A live frame is not an ended activity** (#272). `live` is **one** activity
+  (§2.1): one `_start_activity("live", …)` and one worker whose loop keeps each
+  `Frame` through the step `_snap` uses, and which never calls `snap()` or
+  `_start_activity` again. A frame raises `frame().number` and nothing else; the
+  activity's end (STOP, `live(False)` or an exception) raises `activities_ended`
+  once, as any activity's does. Measured on `FakeCore`, 2026-10-29: five
+  successive `snap()` calls raise the count from 0 to 5, so a live built as a
+  loop of snaps would refresh every open tab at the frame rate: on a 1536-well
+  plate, 122 kB of wells re-sent to each browser up to 10 times a second (§2.1).
+  The plan names the test: the count is the same after several frames of a live
+  that goes, and one higher after it ends
+  (`test_live_frames_do_not_count_as_ended_activities`).
 - **To decide in its plan**: how live gives way when the operator starts a tool,
   a snap or a drive action (refused with `live is running`, or live ended first
   and the action started after its worker has joined), and the redraw period.
@@ -272,6 +362,10 @@ third-party plugin's `Params` read by `describe_params`).
   stand lacks the capability. An objective change asks for a confirmation on
   the page (FM-14). Risk: moves-hardware; its plan is written on Opus and its
   review includes `/code-review`.
+- **To decide in its plan**: §2.1's rule holds, so each action's end refreshes
+  every open tab. A control that repeats while it is held (a jog) is one
+  activity per press, or one for the whole hold, as the plan decides, and says
+  which.
 
 ## 7. The stand's lifetime and the service (#264) — direction
 
@@ -289,7 +383,9 @@ third-party plugin's `Params` read by `describe_params`).
 1. **#28** first and alone: it fixes the one-activity rule, `Frame` and the
    regions the others fill.
 2. Then **#262** and **#263**, one after the other (both edit `controller.py`
-   and `plate_page.py`), and **#264** after them.
+   and `plate_page.py`), and **#264** after them. **#262 carries the code of
+   §2.4's stale mark and bounds** (#272), being the first of the two to edit
+   `controller.py`.
 3. **#251** and **#252** edit the same modules: never at the same time as one of
    the above.
 
