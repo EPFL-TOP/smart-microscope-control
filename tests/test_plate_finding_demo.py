@@ -740,19 +740,24 @@ def test_an_autofocus_that_cannot_be_read_at_the_end_is_a_finding_not_a_lost_sur
     )
 
 
+@pytest.mark.parametrize(
+    "stop",
+    [MicroscopeHaltedError(), MotionStoppedError("autofocus PFS")],
+    ids=["halt", "motion-stopped"],
+)
 def test_a_halt_while_the_autofocus_is_read_at_the_end_is_not_swallowed(
-    fake_microscope: Microscope, tmp_path: Path
+    fake_microscope: Microscope, tmp_path: Path, stop: HardwareError
 ) -> None:
     """FM-64: the halt is a ``HardwareError``, and an end read that turned it into a line would end ``done`` on a halted stand.
 
-    The survey is complete and checkpointed before the read, so ``--resume``
-    fits it again without moving.
+    So is a motion stopped by the halt. The survey is complete and checkpointed
+    before the read, so ``--resume`` fits it again without moving.
     """
-    spy = _AutofocusReadAtTheEnd(engaged=True, at_the_end=MicroscopeHaltedError())
+    spy = _AutofocusReadAtTheEnd(engaged=True, at_the_end=stop)
     fake_microscope.override(Autofocus, spy)
     camera = _on_fake(fake_microscope, _plate_at())
 
-    with pytest.raises(MicroscopeHaltedError):
+    with pytest.raises(type(stop)):
         _run(fake_microscope, tmp_path, plates=["12-well"])
 
     stored = _stored(tmp_path)
@@ -1290,6 +1295,34 @@ def test_a_dead_stage_ends_the_survey_at_the_bound_not_at_the_tenth(
     assert stored.checkpoint["next_index"] == 3
     assert stored.checkpoint["skipped"] == 3
     assert stored.checkpoint["points"] == []
+
+
+def test_when_both_rules_apply_the_one_in_a_row_is_named(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """The 21st failure of 208 is also the third in a row: the order of the two rules is the message.
+
+    Moves 2, 4, ..., 36 fail alone (18 points, each followed by a success), then
+    moves 38, 39 and 40: the 21st failure is over a tenth (210 > 208) and the
+    third in a row at once.
+    """
+    _on_fake(fake_microscope, _plate_at())
+    timeout = _timeout()
+    failing = {move: timeout for move in (*range(2, 37, 2), 38, 39, 40)}
+    assert len(failing) == 21
+    fake_microscope.override(
+        XYStage, _Stage(fake_microscope.require(XYStage), raises=failing)
+    )
+
+    reason = _refusal(fake_microscope, tmp_path, plates=["12-well"])
+
+    assert reason.startswith(
+        "plate-finding: 3 survey points in a row could not be sampled, the last at ("
+    )
+    stored = _stored(tmp_path)
+    assert stored.checkpoint is not None
+    assert stored.checkpoint["next_index"] == 40
+    assert stored.checkpoint["skipped"] == 21
 
 
 def test_a_point_that_is_sampled_resets_the_count(
