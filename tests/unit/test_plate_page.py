@@ -14,6 +14,7 @@ test at the call, and is not filtered.
 from __future__ import annotations
 
 import gc
+import logging
 import math
 import os
 import socket
@@ -289,6 +290,22 @@ def test_round_wells_are_circles_and_square_ones_rectangles(
     assert (
         len([r for r in view.figure.renderers if r.data_source is view.wells_source])
         == 1
+    )
+
+
+def test_the_map_says_whether_the_plate_is_registered(
+    run_doc: Path, page: PlatePage
+) -> None:
+    view = PlatePageView(page)
+    assert view.figure.title.text == (
+        "96-well: nominal map (A1 at 0, 0, not turned), the plate is not registered"
+    )
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    view.refresh()
+    assert view.figure.title.text == "96-well: the registered plate"
+    view.plate_select.value = "384-well"
+    assert view.figure.title.text == (
+        "384-well: nominal map (A1 at 0, 0, not turned), the plate is not registered"
     )
 
 
@@ -846,13 +863,19 @@ def test_serve_returns_on_ctrl_c_and_stops_the_server(
     thread = _Thread(alive=True, interrupt=True)
     served: list[dict[str, Any]] = []
     said: list[str] = []
+    bokeh_levels: list[int] = []
+    bokeh_log = logging.getLogger("bokeh")
 
     def fake_serve(apps: dict[str, Any], **kwargs: Any) -> _Thread:
         served.append({"apps": list(apps), **kwargs})
+        bokeh_levels.append(
+            bokeh_log.level
+        )  # asserted after: the call is not ours (FM-94)
         return thread
 
     monkeypatch.setattr(pn, "serve", fake_serve)
     monkeypatch.setattr("smc.cli._say", said.append)
+    before = bokeh_log.level
     serve(page, port=5123)
     assert thread.calls == [("join", 0.1), ("stop", None), ("join", 10)]
     assert served == [
@@ -862,11 +885,16 @@ def test_serve_returns_on_ctrl_c_and_stops_the_server(
             "port": 5123,
             "show": False,
             "threaded": True,
+            "verbose": False,
         }
     ]
     assert said == [
         "serving the plate page on http://localhost:5123/ — Ctrl-C stops it"
     ]
+    # Bokeh is quiet while the page serves (its console would block the loop that
+    # handles STOP), and its level is put back.
+    assert bokeh_levels == [logging.WARNING]
+    assert bokeh_log.level == before
 
 
 def test_serve_says_when_the_server_stopped_on_its_own(
@@ -874,11 +902,13 @@ def test_serve_says_when_the_server_stopped_on_its_own(
 ) -> None:
     monkeypatch.setattr(pn, "serve", lambda apps, **kwargs: _Thread(alive=False))
     monkeypatch.setattr("smc.cli._say", lambda text: None)
+    before = logging.getLogger("bokeh").level
     with pytest.raises(PageServerError) as stopped:
         serve(page, port=5006)
     assert str(stopped.value) == (
         "the plate page's server stopped on its own (is port 5006 taken?)"
     )
+    assert logging.getLogger("bokeh").level == before
 
 
 def test_the_served_page_answers(page: PlatePage) -> None:

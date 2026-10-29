@@ -18,6 +18,7 @@ keeps, each learned by measuring (m3 §15.3):
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Callable
 from typing import Any
@@ -541,6 +542,12 @@ class PlatePageView:
         self.mapper.low = 0.0
         self.mapper.high = max(known) if known and max(known) > 0.0 else 1.0
         self.names.visible = len(view.wells) <= NAMES_UP_TO_WELLS
+        # Where the wells are drawn is only as good as the registration: say which map it is.
+        self.figure.title.text = (
+            f"{view.plate}: nominal map (A1 at 0, 0, not turned), the plate is not registered"
+            if view.nominal
+            else f"{view.plate}: the registered plate"
+        )
 
     def _ensure_renderer(self, circular: bool) -> None:
         """Round wells are circles and square ones rectangles: swap the glyph when the plate changes."""
@@ -611,21 +618,34 @@ def serve(page: PlatePage, *, port: int) -> None:
     # The command's own printing: plain text, no markup (FM-36, FM-37).
     from smc.cli import _say
 
-    thread = pn.serve(
-        {"": lambda: build(page)},
-        address="localhost",
-        port=port,
-        show=False,
-        threaded=True,
-    )
-    _say(f"serving the plate page on http://localhost:{port}/ — Ctrl-C stops it")
+    # Bokeh logs through its own console handler at the root's level, and
+    # pymmcore-plus leaves the root at DEBUG once a core is open: a route table at
+    # the start and chatter through the session. A console that blocks (a QuickEdit
+    # selection on Windows) would block the server's loop, which is the one that
+    # handles the click on STOP (FM-62). The level is the page's for as long as it
+    # serves, and put back after.
+    bokeh_log = logging.getLogger("bokeh")
+    level = bokeh_log.level
+    bokeh_log.setLevel(logging.WARNING)
     try:
-        while thread.is_alive():
-            thread.join(0.1)
-    except KeyboardInterrupt:
-        thread.stop()
-        thread.join(timeout=10)
-        return
+        thread = pn.serve(
+            {"": lambda: build(page)},
+            address="localhost",
+            port=port,
+            show=False,
+            threaded=True,
+            verbose=False,
+        )
+        _say(f"serving the plate page on http://localhost:{port}/ — Ctrl-C stops it")
+        try:
+            while thread.is_alive():
+                thread.join(0.1)
+        except KeyboardInterrupt:
+            thread.stop()
+            thread.join(timeout=10)
+            return
+    finally:
+        bokeh_log.setLevel(level)
     raise PageServerError(
         f"the plate page's server stopped on its own (is port {port} taken?)"
     )

@@ -76,6 +76,8 @@ src/smc/
   run/
     document.py           the run document: stages, slots, staleness  (M3)
     files.py              atomic writes, tokens and run-folder paths  (M3)
+  ui/                     the plate page, a view over plugins: controller.py (no Panel),
+                          plate_page.py (Panel; the `ui` extra)       (M3, ADR-0006)
 profiles/                 one TOML per instrument
 tests/                    unit/ · simulator (demo) · contracts/ · hardware/
 docs/adr/                 decisions

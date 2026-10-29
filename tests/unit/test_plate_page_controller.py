@@ -21,8 +21,11 @@ import gc
 import json
 import logging
 import math
+import os
 import re
 import string
+import subprocess
+import sys
 import threading
 import weakref
 from collections.abc import Iterator
@@ -1298,3 +1301,24 @@ def test_tools_follow_the_workflow_order_and_hide_what_the_page_fills(
     assert registration_rows == {"max_rotation_deg"}
     assert registration.summary.startswith("Locate a well plate on the stage")
     assert by_name["scan"].key[0][0] == "autofocus"
+
+
+def test_the_controller_imports_without_panel() -> None:
+    # A child process, so that the blocked modules do not outlive the test: `None`
+    # in `sys.modules` makes `import panel` raise, as on a PC without the extra.
+    code = (
+        "import sys\n"
+        "sys.modules['panel'] = None\n"
+        "sys.modules['bokeh'] = None\n"
+        "import smc.ui.controller\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-I", "-c", code],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        timeout=120,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr
