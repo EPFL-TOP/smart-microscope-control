@@ -252,18 +252,41 @@ def _require_records_that_fit(
             )
 
 
+def _encode(ctx: RunContext, page: str) -> bytes:
+    """The page as UTF-8, a lone surrogate written as ``?`` (FM-05) and said once.
+
+    A Micro-Manager ``.cfg`` saved in an ANSI code page reads, through pymmcore's
+    ``surrogateescape``, as a label with a lone surrogate for its ``µ``. The run
+    document is ASCII JSON and keeps it, so it reaches here, and UTF-8 refuses it:
+    a report that cannot be written for the spelling of an objective is no report.
+    The mark stays on the page, where the person reading it can see which text
+    was damaged.
+    """
+    try:
+        return page.encode("utf-8")
+    except UnicodeEncodeError:
+        pass
+    ctx.logger.warning(
+        "a text in the records holds a lone surrogate (a Micro-Manager .cfg saved "
+        "in an ANSI code page, not UTF-8); the report writes it as '?'"
+    )
+    return page.encode("utf-8", "replace")
+
+
 def _write(ctx: RunContext, page: str) -> str:
     """Write the page under a new token and return its POSIX path relative to the run folder.
 
     The write is all or nothing (FM-38). Only the rename failing, which on
     Windows is a program holding the file, leaves the whole new page in a
-    hidden file that the message names.
+    temporary file that the message names (``.smc-tmp``: it is renamed, not
+    opened, to be read).
     """
     path = ctx.run_dir / "report" / f"{new_token()}.html"
     where = relative_to_run(ctx.run_dir, path)
+    data = _encode(ctx, page)
     problem = ""
     try:
-        write_atomically(path, page.encode("utf-8"))
+        write_atomically(path, data)
     except AtomicWriteError as exc:
         if exc.kept is not None:
             advice = (

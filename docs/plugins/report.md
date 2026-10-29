@@ -110,9 +110,11 @@ again, and never draws records that do not describe one scan:
   characters.
 - **A well that is not on the plate.** `run scan-plan again`.
 - **A file that cannot be written.** The reason names the file. When only the final
-  rename failed (on Windows, a program holds the file) the whole page is kept in a hidden
-  file next to it and the reason names it; when the disk is full it says to free some
-  space. Either way, run `report` again.
+  rename failed (on Windows, a program such as an antivirus holds the file just written)
+  the whole page is kept in a temporary file next to it, named `.<token>.html.<hex>.smc-tmp`
+  (a leading dot hides nothing on Windows), and the reason names it; to read that page
+  rename it to end in `.html`. When the disk is full the reason says to free some space.
+  Either way, run `report` again.
 
 ## Limits
 

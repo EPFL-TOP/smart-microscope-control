@@ -36,6 +36,7 @@ from smc.plugins.slots import (
     CellsFile,
     CellsResult,
     DensityResult,
+    FailedField,
     PlateResult,
     ReportResult,
     RouteResult,
@@ -186,8 +187,11 @@ def _seed(
     plan_matrix: Matrix2 | None = None,
     plan_shape: tuple[int, int] | None = None,
     scan_objective: str | None = IN_PLACE,
+    fail: tuple[str, ...] = (),
 ) -> Seed:
     """The plate, the plan, the scan and the cells of ``WELLS``, in ``tmp_path/run.json``.
+
+    The first field of each well in ``fail`` is a failed field and not a frame.
 
     ``plan_matrix`` and ``plan_shape`` are the camera the plan was laid for when
     it is not the scan's: the report must draw the scan's (FM-124). The frames are
@@ -234,21 +238,37 @@ def _seed(
         estimate_s=None,
         assumed=("the plate is where the registration says",),
     )
-    frames = tuple(
-        ScanFrame(
-            well=f.well,
-            index=f.index,
-            name=f.name,
-            file=f"scan/t/{f.name}.tif",
-            x_um=f.x_um + 0.3,
-            y_um=f.y_um - 0.2,
-            z_um=1000.0 + 10.0 * k,
-            focus="locked",
-            pfs_offset=2000.0 + 10.0 * k,
-            t_s=float(k),
+    frames: list[ScanFrame] = []
+    failures: list[FailedField] = []
+    to_fail = set(fail)
+    for k, f in enumerate(fields):
+        if f.well in to_fail:
+            to_fail.discard(f.well)  # the first field of the well fails
+            failures.append(
+                FailedField(
+                    well=f.well,
+                    index=f.index,
+                    name=f.name,
+                    x_um=f.x_um,
+                    y_um=f.y_um,
+                    error="the stage did not reach it",
+                )
+            )
+            continue
+        frames.append(
+            ScanFrame(
+                well=f.well,
+                index=f.index,
+                name=f.name,
+                file=f"scan/t/{f.name}.tif",
+                x_um=f.x_um + 0.3,
+                y_um=f.y_um - 0.2,
+                z_um=1000.0 + 10.0 * k,
+                focus="locked",
+                pfs_offset=2000.0 + 10.0 * k,
+                t_s=float(k),
+            )
         )
-        for k, f in enumerate(fields)
-    )
     scan = ScanResult(
         folder="scan/t",
         objective=scan_objective,
@@ -256,8 +276,8 @@ def _seed(
         matrix_um_per_px=matrix,
         image_shape_px=SHAPE,
         exposure_ms=10.0,
-        frames=frames,
-        failed=(),
+        frames=tuple(frames),
+        failed=tuple(failures),
         assumed=("the frames' Z is the focus drive's reading",),
     )
     cells = tuple(
@@ -368,6 +388,8 @@ def _refused(microscope: Microscope, tmp_path: Path, **params: Any) -> PluginRun
     assert _stored(tmp_path).status is StageStatus.failed
     assert _stored(tmp_path).result is None
     assert not list((tmp_path / "report").glob("*.html"))
+    assert info.value.__context__ is None
+    assert info.value.__cause__ is None
     return info.value
 
 
@@ -520,6 +542,28 @@ def test_the_header_names_the_run_document_the_profile_the_detector_and_every_as
         "<li>route: the route minimises the Euclidean distance between fields" in text
     )
     assert text.index("<li>density:") < text.index("<li>route:")
+
+
+def test_the_time_of_the_report_is_utc_whatever_the_clock_of_the_pc_says(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A PC in Lausanne reads 16:05 local time while it is 14:05 UTC: the page says UTC,
+    # so it must be the UTC time. The clock is the plugin's, asked for with a zone.
+    _chain(demo_microscope, tmp_path)
+    asked: list[object] = []
+
+    class Clock:
+        @staticmethod
+        def now(tz: Any) -> datetime:
+            asked.append(tz)
+            return datetime(2026, 10, 28, 14, 5, 30, tzinfo=timezone.utc).astimezone(tz)
+
+    monkeypatch.setattr(plugin_module, "datetime", Clock)
+
+    text = _page_of(tmp_path, _run(demo_microscope, tmp_path))
+
+    assert asked == [timezone.utc]
+    assert "<tr><th>Generated</th><td>2026-10-28 14:05 UTC</td></tr>" in text
 
 
 def test_no_path_is_in_the_report(demo_microscope: Microscope, tmp_path: Path) -> None:
@@ -680,6 +724,44 @@ def test_a_density_that_does_not_match_the_cells_is_refused(
         "stage detected ['single', 'doublet', 'debris']; run density again"
     )
 
+    # The other direction too: a count or a number of fields *below* what the files hold.
+    changed = [dict(w) for w in wells]
+    changed[0]["counts"] = {**changed[0]["counts"], "single": 7}
+    _edit(tmp_path, "density", wells=changed, labels=["single", "doublet", "debris"])
+    assert _refused(demo_microscope, tmp_path).reason == (
+        "density counted 10 cells in well 'A1' and the cells file holds 11; "
+        "run density again"
+    )
+    changed = [dict(w) for w in wells]
+    changed[0]["fields"] = 3
+    _edit(tmp_path, "density", wells=changed)
+    assert _refused(demo_microscope, tmp_path).reason == (
+        "density reports 3 fields for well 'A1' and the scan holds 4; run density again"
+    )
+
+
+def test_a_density_that_reports_fewer_failed_fields_than_the_scan_holds_is_refused(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    # The scan failed A1's first field; density counted it (1). A record that says 0
+    # would draw the area of a field that was never imaged as if it were.
+    _chain(demo_microscope, tmp_path, route=False, fail=("A1",))
+    density = DensityResult.model_validate(_stored(tmp_path, "density").result)
+    assert density.wells[0].failed_fields == 1
+    assert density.wells[0].fields == 3
+    stored = _stored(tmp_path, "density").result
+    assert stored is not None
+    changed = [dict(w) for w in stored["wells"]]
+    changed[0]["failed_fields"] = 0
+    _edit(tmp_path, "density", wells=changed)
+
+    refused = _refused(demo_microscope, tmp_path)
+
+    assert refused.reason == (
+        "density reports 0 failed fields for well 'A1' and the scan holds 1; "
+        "run density again"
+    )
+
 
 def test_a_cell_in_a_well_density_does_not_report_is_refused(
     demo_microscope: Microscope, tmp_path: Path
@@ -743,7 +825,7 @@ def test_a_write_that_fails_names_the_file_and_says_to_run_report_again(
 def test_a_write_that_only_failed_to_rename_names_the_kept_file(
     demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Only the rename failed: the whole new page waits in a hidden file, which the error names (FM-38)."""
+    """Only the rename failed: the whole new page waits in a temporary file, which the error names (FM-38)."""
     _chain(demo_microscope, tmp_path, route=False)
     monkeypatch.setattr(plugin_module, "new_token", lambda: "abc123abc123")
     kept = tmp_path / "report" / ".abc123abc123.html.1234abcd.smc-tmp"
@@ -760,6 +842,26 @@ def test_a_write_that_only_failed_to_rename_names_the_kept_file(
         "is kept as report/.abc123abc123.html.1234abcd.smc-tmp; close any program "
         "that holds report/abc123abc123.html, then run report again"
     )
+
+
+def test_a_lone_surrogate_in_a_record_is_written_as_a_question_mark_and_warned(
+    demo_microscope: Microscope, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # FM-05: a Micro-Manager .cfg saved in cp1252 reads, through pymmcore's
+    # surrogateescape, as an objective label with a lone surrogate for the µ. The run
+    # document is ASCII JSON, so it survives to here, and UTF-8 cannot encode it.
+    label = "Plan Apo 20x/0.75 " + chr(0xDCB5) + "m"
+    _chain(demo_microscope, tmp_path, route=False, scan_objective=label)
+
+    with caplog.at_level("WARNING", logger="smc.plugins.report"):
+        record = _run(demo_microscope, tmp_path)
+
+    text = _page_of(tmp_path, record)  # strict UTF-8: the file is valid
+    assert "<tr><th>Objective</th><td>Plan Apo 20x/0.75 ?m</td></tr>" in text
+    assert [r.getMessage() for r in caplog.records] == [
+        "a text in the records holds a lone surrogate (a Micro-Manager .cfg saved in "
+        "an ANSI code page, not UTF-8); the report writes it as '?'"
+    ]
 
 
 def test_a_stop_set_before_the_run_leaves_no_file(

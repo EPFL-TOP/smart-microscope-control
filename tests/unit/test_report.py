@@ -199,9 +199,15 @@ def _records(
     rows: int = 2,
     columns: int = 2,
     objective: str | None = "Nikon 10X S Fluor",
+    plan_pixel_um: float = PIXEL_UM,
+    plan_objective: str | None = "the scan's",
     labels: Sequence[str] = CLASSES,
 ) -> Records:
     """The plan, the scan, the cells and the density of ``wells``; the density is built from the seed.
+
+    ``plan_matrix``, ``plan_shape``, ``plan_pixel_um`` and ``plan_objective`` are
+    the camera and the objective the plan was laid for when they are not the
+    scan's: the page must show the scan's (FM-124).
 
     ``failed`` maps a well to the number of its first fields that failed (all of
     them: no frame, a density of ``None`` and 0 fields). A well in ``below_grid``
@@ -237,8 +243,8 @@ def _records(
     plan = ScanPlanResult(
         plate_plan=plate_plan,
         wells=tuple(wells),
-        objective=objective,
-        pixel_size_um=PIXEL_UM,
+        objective=objective if plan_objective == "the scan's" else plan_objective,
+        pixel_size_um=plan_pixel_um,
         matrix_um_per_px=laid,
         matrix_source="parameter",
         image_shape_px=laid_shape,
@@ -415,7 +421,12 @@ def test_the_same_records_give_the_same_bytes() -> None:
 
 
 def test_the_header_names_the_plate_the_frame_of_the_scan_and_the_facts() -> None:
-    records = _records(plan_matrix=_turned(2.0, 0.0, False), plan_shape=(90, 120))
+    records = _records(
+        plan_matrix=_turned(2.0, 0.0, False),
+        plan_shape=(90, 120),
+        plan_pixel_um=2.0,
+        plan_objective="Nikon 4X Plan",
+    )
     text, _ = _page(
         records, facts=(("Profile", "demo"), ("Generated", "2026-10-28 14:05 UTC"))
     )
@@ -435,7 +446,8 @@ def test_the_header_names_the_plate_the_frame_of_the_scan_and_the_facts() -> Non
 
 
 def test_the_objective_is_not_recorded_rather_than_guessed() -> None:
-    text, _ = _page(_records(objective=None))
+    # The plan was laid for an objective; the scan recorded none: the page says so.
+    text, _ = _page(_records(objective=None, plan_objective="Nikon 4X Plan"))
     assert "<tr><th>Objective</th><td>not recorded</td></tr>" in text
 
 
@@ -581,14 +593,37 @@ def test_a_384_well_plate_draws_square_wells_as_paths_turned_with_the_plate() ->
     assert math.degrees(math.atan2(y1 - y0, x1 - x0)) == pytest.approx(-10.0, abs=0.1)
 
 
+def _well_texts(page: Audit) -> list[dict[str, str]]:
+    """The ``text`` of every ``g.well`` of the maps: the value written in a well."""
+    found: list[dict[str, str]] = []
+    in_well = False
+    for tag, attrs in page.tags:
+        if tag == "g":
+            in_well = "well" in attrs.get("class", "").split()
+        elif tag == "rect":
+            in_well = False  # the legend follows the last well
+        elif tag == "text" and in_well:
+            found.append(attrs)
+    return found
+
+
 def test_a_value_is_written_in_a_well_up_to_384_wells_and_not_beyond() -> None:
-    small, _ = _page(_records(plate="384-well", wells=("A1", "A2"), layout=()))
-    assert small.count("<text") > 0
-    assert re.search(r">0</text>", small) is not None
-    big, _ = _page(_records(plate="1536-well", wells=("A1", "A2"), layout=()))
-    # No text per well on a plate of 1 536: only the legend's own texts (5 + 1 per label).
-    assert big.count("<text") == 3 * 6
-    assert "A1 — single 0 per mm²" in big  # the tooltip still holds the value
+    # The threshold is 384 wells: the value of each of the 2 scanned wells in each of
+    # the 3 maps on a 384-well plate, none on a plate of 1 536, and the route map's
+    # rank of each visited well follows the same rule.
+    small = _records(plate="384-well", wells=("A1", "A2"), layout=())
+    text, page = _page(small, route=_route(small))
+    assert len(_well_texts(page)) == 2 * 3
+    assert re.findall(r'class="rank"[^>]*>(\d+)</text>', text) == ["1", "2", "3"]
+    big = _records(plate="1536-well", wells=("A1", "A2"), layout=())
+    text, page = _page(big, route=_route(big))
+    assert _well_texts(page) == []
+    assert 'class="rank"' not in text
+    # The tooltip still holds the value, and the legend's own texts remain.
+    assert "A1 — single 0 per mm²" in text
+    # Legend: 5 swatch values and the unit in each of 3 maps; and the numbers of the 3
+    # fields that A1 and A2 hold (B1 has a stop and no panel here).
+    assert text.count("<text") == 3 * 6 + 3
 
 
 def test_the_density_scale_is_per_label_and_the_largest_well_has_the_full_colour() -> (
@@ -1030,9 +1065,9 @@ def test_the_panel_grows_to_hold_a_footprint_that_reaches_past_the_wall() -> Non
 
 def test_route_fields_are_drawn_in_the_routes_frame() -> None:
     records = _records()
-    route = _route(
-        records
-    )  # the scan's camera at twice the pixel size: another objective
+    # Another objective: the scan's camera at twice the pixel size, on a frame of
+    # 45 x 100 pixels (the scan's is 60 x 80): the route's own matrix and shape.
+    route = _route(records, shape=(45, 100))
     text, page = _page(records, route=route)
     section = _section(page, "A1")
     fields = _paths(section, "field")
@@ -1042,14 +1077,21 @@ def test_route_fields_are_drawn_in_the_routes_frame() -> None:
     for drawn, stop in zip(fields, route.positions[:2], strict=True):
         (polygon,) = _polygons(drawn["d"])
         expected = footprint(
-            stop.x_um, stop.y_um, matrix=route.matrix_um_per_px, image_shape_px=SHAPE
+            stop.x_um,
+            stop.y_um,
+            matrix=route.matrix_um_per_px,
+            image_shape_px=(45, 100),
         )
         for (px, py), (x, y) in zip(polygon, expected, strict=True):
             assert px == pytest.approx(x - cx, abs=0.06)
             assert py == pytest.approx(cy - y, abs=0.06)
-        # The route's frame is 800 µm wide; the scan's would be 400.
+        # The route's frame is 100 x 10 = 1 000 µm wide and 450 high; the scan's would
+        # be 400 and 300.
         assert max(px for px, _ in polygon) - min(px for px, _ in polygon) == (
-            pytest.approx(800.0, abs=0.2)
+            pytest.approx(1000.0, abs=0.2)
+        )
+        assert max(py for _, py in polygon) - min(py for _, py in polygon) == (
+            pytest.approx(450.0, abs=0.2)
         )
     assert "<title>A1_r000: 5 single</title>" in text
     assert "<title>A1_r001: 0 single, 2 doublet</title>" in text
@@ -1149,7 +1191,8 @@ def test_the_route_map_gives_distance_and_travel_time_or_says_there_is_none() ->
 def test_the_header_names_the_objective_the_route_was_imaged_with_when_it_differs() -> (
     None
 ):
-    records = _records()
+    # The plan was laid for a third objective: the comparison is with the scan's.
+    records = _records(plan_objective="Nikon 4X Plan")
     text, _ = _page(records, route=_route(records))
     assert (
         "<tr><th>Route imaged with</th><td>Nikon 20X Plan Fluor ELWD</td></tr>" in text
@@ -1184,7 +1227,10 @@ def test_text_with_markup_is_escaped_wherever_it_is_shown() -> None:
         layout=layout, labels=(label, "doublet", "debris"), objective=_HOSTILE
     )
     route = _route(records, objective=_HOSTILE + "!")  # differs: it is shown
-    renamed = route.positions[0].model_copy(update={"name": _HOSTILE})
+    # The stop's counts are keyed by the hostile label too: they reach its tooltip.
+    renamed = route.positions[0].model_copy(
+        update={"name": _HOSTILE, "counts": {label: 5, "doublet": 1}}
+    )
     route = route.model_copy(
         update={
             "positions": (renamed, *route.positions[1:]),
@@ -1326,3 +1372,186 @@ def test_a_route_stop_in_a_well_that_is_not_on_the_plate_is_refused() -> None:
         "run route again",
         route=route.model_copy(update={"positions": (stop, *route.positions[1:])}),
     )
+
+
+# ------------------------------------- where each thing is drawn (the Y flip)
+
+
+def _contrast(foreground: str, background: str) -> float:
+    """The WCAG 2 contrast ratio, written here from the definition and not taken from the code."""
+
+    def luminance(colour: str) -> float:
+        parts = [int(colour[k : k + 2], 16) / 255.0 for k in (1, 3, 5)]
+        red, green, blue = (
+            c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in parts
+        )
+        return 0.2126 * red + 0.7152 * green + 0.0722 * blue
+
+    lighter, darker = sorted(
+        (luminance(foreground), luminance(background)), reverse=True
+    )
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def test_the_route_markers_the_ranks_and_the_numbers_are_where_the_stops_and_wells_are() -> (
+    None
+):
+    records = _records()
+    route = _route(records)
+    _, page = _page(records, route=route)
+    circles = _circles(page, "single")
+    a1x, a1y = _centre("A1")
+
+    def on_the_page(x: float, y: float) -> tuple[float, float]:
+        """A stage point in the plate's frame, by A1's circle: X right, Y flipped."""
+        return (circles["A1"][0] + (x - a1x), circles["A1"][1] - (y - a1y))
+
+    # The green start is the first stop and the red end the last, not the other way round.
+    start = [a for t, a in page.tags if t == "circle" and a.get("class") == "start"]
+    end = [a for t, a in page.tags if t == "circle" and a.get("class") == "end"]
+    assert len(start) == len(end) == 1
+    first, last = route.positions[0], route.positions[-1]
+    for marker, stop in ((start[0], first), (end[0], last)):
+        want = on_the_page(stop.x_um, stop.y_um)
+        assert float(marker["cx"]) == pytest.approx(want[0], abs=0.11)
+        assert float(marker["cy"]) == pytest.approx(want[1], abs=0.11)
+    # The rank of each visited well is written at that well's centre.
+    ranks = [a for t, a in page.tags if t == "text" and a.get("class") == "rank"]
+    assert len(ranks) == 3
+    for rank, well in zip(ranks, ("A1", "A2", "B1"), strict=True):
+        assert (float(rank["x"]), float(rank["y"])) == pytest.approx(
+            circles[well], abs=0.001
+        )
+    # The number of a field is written at the field, in its well's panel.
+    cx, cy = _centre("A1")
+    numbers = [
+        a for t, a in _section(page, "A1") if t == "text" and a.get("class") == "order"
+    ]
+    assert len(numbers) == 2
+    for number, stop in zip(numbers, route.positions[:2], strict=True):
+        assert float(number["x"]) == pytest.approx(stop.x_um - cx, abs=0.06)
+        assert float(number["y"]) == pytest.approx(cy - stop.y_um, abs=0.06)
+
+
+def test_the_value_in_a_well_is_at_its_centre_and_readable_on_every_step() -> None:
+    _, page = _page(_records())
+    for label in ("single", "doublet"):
+        circles = _circles(page, label)
+        texts = _well_texts_of(page, label)
+        assert set(texts) == {"A1", "A2", "B1"}
+        for well, attrs in texts.items():
+            # Written at the well's centre, in the page's own frame.
+            assert (float(attrs["x"]), float(attrs["y"])) == pytest.approx(
+                circles[well], abs=0.001
+            )
+    # The text colour is the one with the larger contrast on the fill: the darkest
+    # step of the blue label (#0072B2) is white, the full orange one black.
+    for label in ("single", "doublet"):
+        section = _map_section(_render(_records()), label)
+        for well in ("A1", "A2", "B1"):
+            markup = _well_markup(section, well)
+            fill = re.search(r'<(?:circle|path)[^>]* fill="(#[0-9a-f]{6})"', markup)
+            colour = re.search(r'<text[^>]* fill="(#[0-9A-F]{6})"', markup)
+            assert fill is not None
+            assert colour is not None
+            best = max(
+                ("#000000", "#FFFFFF"), key=lambda c: _contrast(c, fill.group(1))
+            )
+            assert colour.group(1) == best, (label, well, fill.group(1))
+    doublet_full = _well_markup(_map_section(_render(_records()), "doublet"), "B1")
+    assert 'fill="#FFFFFF"' in doublet_full
+
+
+def _well_texts_of(page: Audit, label: str) -> dict[str, dict[str, str]]:
+    """The ``text`` inside each ``g.well`` of the map of ``label``, by well."""
+    found: dict[str, dict[str, str]] = {}
+    inside, well = False, ""
+    for tag, attrs in page.tags:
+        if tag == "svg":
+            inside = (
+                "plate-map" in attrs.get("class", "").split()
+                and attrs.get("data-label") == label
+            )
+        elif inside and tag == "g" and "well" in attrs.get("class", "").split():
+            well = attrs["data-well"]
+        elif inside and tag == "rect":
+            well = ""  # the legend follows the last well
+        elif inside and tag == "text" and well:
+            found.setdefault(well, attrs)
+    return found
+
+
+def test_a_square_wells_panel_outline_is_the_plates_turn_flipped_like_everything_else() -> (
+    None
+):
+    # A 384-well plate turned by 10 degrees: the well's corners (3 400 µm square, so
+    # 1 700 µm from the centre in each axis) in the plate's axes, turned by +10 degrees
+    # on the stage, and drawn with Y down. A round well would hide a wrong sign.
+    records = _records(plate="384-well", wells=("A1",), rotation_deg=10.0, layout=())
+    _, page = _page(records)
+    (outline,) = [
+        a
+        for t, a in _section(page, "A1")
+        if t == "path" and a.get("class") == "outline"
+    ]
+    angle = math.radians(10.0)
+    cos, sin = math.cos(angle), math.sin(angle)
+    want = [
+        (cos * u - sin * v, -(sin * u + cos * v))
+        for u, v in (
+            (-1700.0, -1700.0),
+            (1700.0, -1700.0),
+            (1700.0, 1700.0),
+            (-1700.0, 1700.0),
+        )
+    ]
+    corners = _points(outline["d"])
+    assert len(corners) == 4
+    for (px, py), (x, y) in zip(corners, want, strict=True):
+        assert px == pytest.approx(x, abs=0.06)
+        assert py == pytest.approx(y, abs=0.06)
+
+
+def test_the_table_gives_the_detections_outside_each_well_and_what_the_route_leaves() -> (
+    None
+):
+    records = _records()
+    route = _route(records, uncovered={"A1": 1, "B1": 2})
+    text, _ = _page(records, route=route)
+
+    def row(well: str) -> list[str]:
+        found = re.search(rf'<tr data-well="{well}">(.*?)</tr>', text)
+        assert found is not None
+        return re.findall(r"<td[^>]*>(.*?)</td>", found.group(1))
+
+    # The last two cells: outside the well's shape, and not in a chosen field.
+    assert row("A1")[-2:] == ["1", "1"]  # one detection on the plastic
+    assert row("A2")[-2:] == ["0", "0"]
+    assert row("B1")[-2:] == ["0", "2"]
+    # The note under the route map is the sum over wells, not the largest.
+    assert (
+        '<p class="note">3 cells of the wanted labels (single, doublet) are in no '
+        "chosen field.</p>"
+    ) in text
+
+
+def test_a_count_of_thousands_is_set_apart_by_a_no_break_space() -> None:
+    layout = [("A1", dx, dy, "single") for dx, dy in _grid(1234)]
+    text, _ = _page(_records(wells=("A1",), layout=layout))
+    nbsp = "\N{NO-BREAK SPACE}"
+    assert (
+        f"<tr><th>Cells</th><td>single 1{nbsp}234 · doublet 0 · debris 0</td></tr>"
+        in text
+    )
+
+
+def test_the_time_of_the_report_is_not_in_render_but_in_the_facts_it_is_given() -> None:
+    # `render` is a pure function of its arguments: the same records give the same
+    # bytes whenever it is run, and a time is only what the caller passes.
+    records = _records()
+    first = _render(records, facts=(("Generated", "2026-10-28 14:05 UTC"),))
+    again = _render(records, facts=(("Generated", "2026-10-28 14:05 UTC"),))
+    other = _render(records, facts=(("Generated", "2026-10-29 09:00 UTC"),))
+    assert first == again
+    assert first != other
+    assert "<tr><th>Generated</th><td>2026-10-28 14:05 UTC</td></tr>" in first

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import itertools
+import math
 import re
 
 import pytest
@@ -113,6 +115,23 @@ def test_sample_indices_never_exceed_the_cap_and_are_distinct_increasing(
     assert len(chosen) == min(n, cap)
     assert chosen == sorted(set(chosen))
     assert all(0 <= k < n for k in chosen)
+    if n > cap:
+        # Regular, not a prefix: the last cell chosen is within one step of the end of
+        # the list, and no gap between two is more than a step and a bit.
+        step = n / cap
+        assert chosen[-1] >= n - math.ceil(step)
+        assert all(b - a <= math.ceil(step) for a, b in itertools.pairwise(chosen))
+
+
+def test_sample_indices_reach_the_end_of_a_list_that_cap_does_not_divide() -> None:
+    # The spec's (i * n) // cap, by hand: 3999 / 2000 is a step of 1.9995, so the last
+    # index is 1999 x 3999 // 2000 = 3997. A thinning by `n // cap` would stop at 1999.
+    chosen = sample_indices(3999, 2000)
+    assert chosen[0] == 0
+    assert chosen[-1] == 3997
+    assert chosen[1] == 1  # 3999 // 2000
+    assert chosen[2] == 3  # 7998 // 2000
+    assert sample_indices(5999, 2000)[-1] == 5996
 
 
 def test_label_colour_cycles_through_the_seven_and_agrees_with_the_set() -> None:
