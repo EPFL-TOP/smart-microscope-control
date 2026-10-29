@@ -65,6 +65,12 @@ _SIDES = ("centre", "left", "right", "top", "bottom")
 _WALL_SIDES = ("left", "right", "top", "bottom")
 
 
+def _um(value: float, digits: int) -> str:
+    """A position in µm; the demo stage's ``-0.0`` is printed as ``0.0``, as the CLI does."""
+    text = f"{value:.{digits}f}"
+    return text[1:] if text.startswith("-") and float(text) == 0.0 else text
+
+
 def status_line(status: PageStatus) -> str:
     """The stand on one line: ``XY (x, y) µm | Z z µm | objective | autofocus | light | ...``.
 
@@ -74,8 +80,8 @@ def status_line(status: PageStatus) -> str:
     parts = [
         "XY ?"
         if status.xy_um is None
-        else f"XY ({status.xy_um[0]:.1f}, {status.xy_um[1]:.1f}) µm",
-        "Z ?" if status.z_um is None else f"Z {status.z_um:.2f} µm",
+        else f"XY ({_um(status.xy_um[0], 1)}, {_um(status.xy_um[1], 1)}) µm",
+        "Z ?" if status.z_um is None else f"Z {_um(status.z_um, 2)} µm",
         status.objective or "objective ?",
         status.autofocus,
         "light ?"

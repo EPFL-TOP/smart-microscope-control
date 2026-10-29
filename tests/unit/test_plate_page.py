@@ -506,6 +506,14 @@ def test_the_stage_is_a_cross_at_its_position(
 # --- the strip, STOP and the tools ---------------------------------------------------
 
 
+def test_a_position_that_rounds_to_zero_is_printed_without_a_sign() -> None:
+    # The demo stage reads back -0.0 at its origin; the CLI prints it as 0.00 too.
+    line = plate_page.status_line(_status(xy_um=(-0.0, -0.04), z_um=-0.0))
+    assert line.startswith("XY (0.0, 0.0) µm | Z 0.00 µm | ")
+    line = plate_page.status_line(_status(xy_um=(-0.06, 0.0), z_um=-0.001))
+    assert line.startswith("XY (-0.1, 0.0) µm | Z 0.00 µm | ")
+
+
 def test_the_stand_is_one_line_and_unknown_is_a_question_mark() -> None:
     assert plate_page.status_line(_status()) == (
         "XY (1000.0, -500.0) µm | Z 12.50 µm | Nikon 10X S Fluor | autofocus off | light ?"
