@@ -1097,6 +1097,179 @@ def test_unknown_autofocus_key_is_refused(tmp_path: Path) -> None:
     ) in msg
 
 
+# -- [sample]: the synthetic plate of the demo-sample stand (#260) -------------
+
+
+def test_a_sample_table_loads_with_its_defaults(tmp_path: Path) -> None:
+    profile = Profile.load(write_profile(tmp_path / "p.toml", "[sample]\n"))
+
+    sample = profile.sample
+    assert sample is not None
+    assert (sample.plate, sample.a1_center_xy_um) == ("96-well", None)
+    assert (sample.rotation_deg, sample.camera_rotation_deg) == (0.0, 0.0)
+    assert (sample.mirrored, sample.seed) == (False, 0)
+    assert (sample.cells_per_well, sample.doublet_fraction) == (40, 0.3)
+    assert sample.cell_radius_um == 5.0
+
+
+def test_a_sample_table_loads_every_key_it_has(tmp_path: Path) -> None:
+    body = (
+        "[sample]\nplate = '384-well'\na1_center_xy_um = [100, -200.5]\n"
+        "rotation_deg = -3.5\ncamera_rotation_deg = 90\nmirrored = true\n"
+        "cells_per_well = 10\ndoublet_fraction = 0\ncell_radius_um = 2.5\nseed = 7\n"
+    )
+    sample = Profile.load(write_profile(tmp_path / "p.toml", body)).sample
+
+    assert sample is not None
+    assert sample.plate == "384-well"
+    assert sample.a1_center_xy_um == (100.0, -200.5)
+    assert (sample.rotation_deg, sample.camera_rotation_deg) == (-3.5, 90.0)
+    assert sample.mirrored is True
+    assert (sample.cells_per_well, sample.doublet_fraction) == (10, 0.0)
+    assert (sample.cell_radius_um, sample.seed) == (2.5, 7)
+
+
+def test_a_profile_without_a_sample_table_has_none(tmp_path: Path) -> None:
+    assert Profile.load(write_profile(tmp_path / "p.toml", "")).sample is None
+
+
+def test_profile_demo_has_no_sample() -> None:
+    assert Profile.demo().sample is None
+    assert Profile.load(DEMO_TOML).sample is None
+
+
+def test_a_sample_table_is_refused_with_a_micromanager_config(tmp_path: Path) -> None:
+    path = write_profile(
+        tmp_path / "p.toml", '[micromanager]\nconfig = "stand.cfg"\n[sample]\n'
+    )
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+
+    lines = str(info.value).splitlines()
+    problem = next(line for line in lines if line.startswith("  - sample:"))
+    assert "config" in problem
+    assert "stand.cfg" in problem
+
+
+def test_a_sample_with_a_micromanager_that_failed_reports_only_that_error(
+    tmp_path: Path,
+) -> None:
+    # `micromanager` is absent from `info.data` when it failed, so the sample
+    # check has nothing to compare with and the real problem stands alone.
+    path = write_profile(
+        tmp_path / "p.toml", "[micromanager]\ndevice_timeout_ms = -1\n[sample]\n"
+    )
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+
+    msg = str(info.value)
+    assert "1 problem(s)" in msg
+    assert "micromanager.device_timeout_ms" in msg
+    assert "  - sample:" not in msg
+
+
+@pytest.mark.parametrize("plate", ["glass", "coverslip-22mm-square", "", "96-WELL"])
+def test_a_sample_plate_that_is_not_a_well_plate_is_refused(
+    tmp_path: Path, plate: str
+) -> None:
+    msg = _load_error(tmp_path, f'[sample]\nplate = "{plate}"\n')
+
+    assert "  - sample.plate:" in msg
+    assert "-well" in msg
+
+
+def test_a_sample_plate_named_like_a_well_plate_that_useq_does_not_know_is_refused(
+    tmp_path: Path,
+) -> None:
+    msg = _load_error(tmp_path, '[sample]\nplate = "97-well"\n')
+
+    assert "  - sample.plate:" in msg
+    assert "97-well" in msg
+    assert "useq" in msg
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("rotation_deg", "46"),
+        ("camera_rotation_deg", "181"),
+        ("cells_per_well", "501"),
+        ("cells_per_well", "-1"),
+        ("cells_per_well", "true"),
+        ("doublet_fraction", "1.5"),
+        ("doublet_fraction", "-0.1"),
+        ("cell_radius_um", "0"),
+        ("cell_radius_um", "nan"),
+        ("cell_radius_um", "51"),
+        ("rotation_deg", "inf"),
+        ("camera_rotation_deg", "true"),
+        ("seed", "-1"),
+        ("seed", "true"),
+        ("a1_center_xy_um", "[1e7, 0]"),
+        ("a1_center_xy_um", "[0, nan]"),
+        ("a1_center_xy_um", "[true, 0]"),
+    ],
+)
+def test_sample_numbers_out_of_bounds_or_boolean_are_refused(
+    tmp_path: Path, key: str, value: str
+) -> None:
+    msg = _load_error(tmp_path, f"[sample]\n{key} = {value}\n")
+
+    assert f"  - sample.{key}:" in msg
+
+
+def test_sample_numbers_at_their_bounds_load(tmp_path: Path) -> None:
+    body = (
+        "[sample]\nrotation_deg = 45\ncamera_rotation_deg = -180\ncells_per_well = 500\n"
+        "doublet_fraction = 1\ncell_radius_um = 50\nseed = 0\n"
+        "a1_center_xy_um = [-1e6, 1e6]\nplate = '6-well'\n"
+    )
+    sample = Profile.load(write_profile(tmp_path / "p.toml", body)).sample
+
+    assert sample is not None
+    assert (sample.rotation_deg, sample.camera_rotation_deg) == (45.0, -180.0)
+    assert sample.cells_per_well == 500
+
+
+def test_an_unknown_sample_key_is_refused_naming_the_allowed_ones(
+    tmp_path: Path,
+) -> None:
+    msg = _load_error(tmp_path, "[sample]\ncells = 3\n")
+
+    assert "unknown key in [sample]" in msg
+    assert "allowed keys: plate, a1_center_xy_um" in msg
+
+
+def test_too_many_cells_for_the_plate_are_refused(tmp_path: Path) -> None:
+    # 384 wells x 130 is 49 920 cells; x 131 is 50 304, over the bound.
+    msg = _load_error(tmp_path, '[sample]\nplate = "384-well"\ncells_per_well = 131\n')
+
+    assert "  - sample.cells_per_well:" in msg
+    assert "50304" in msg
+    assert "at most 130" in msg
+
+    loaded = Profile.load(
+        write_profile(
+            tmp_path / "ok.toml", '[sample]\nplate = "384-well"\ncells_per_well = 130\n'
+        )
+    )
+    assert loaded.sample is not None
+    assert loaded.sample.cells_per_well == 130
+
+
+def test_the_cell_bound_is_the_one_the_stand_imports() -> None:
+    assert profile_module.MAX_SAMPLE_CELLS == 50_000
+
+
+def test_an_unknown_plate_does_not_hide_behind_the_cell_count(tmp_path: Path) -> None:
+    # `plate` failed, so it is absent from `info.data` when cells_per_well is
+    # checked: the plate's own error is reported, and nothing else is.
+    msg = _load_error(tmp_path, '[sample]\nplate = "glass"\ncells_per_well = 500\n')
+
+    assert "1 problem(s)" in msg
+    assert "  - sample.plate:" in msg
+
+
 # -- the profiles that ship with the repository ---------------------------------
 
 PROFILES_DIR = REPO_ROOT / "profiles"
