@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import stat
+import subprocess
 import sys
 from collections import Counter
 from collections.abc import Callable, Iterator, Sequence
@@ -335,6 +336,81 @@ def test_doctor_with_profile_prints_the_role_table() -> None:
     assert "loads and answers" in result.output
     for line in expected:
         assert line in result.output
+
+
+DEMO_SAMPLE_TOML = Path(__file__).resolve().parents[1] / "profiles" / "demo-sample.toml"
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_doctor_names_the_sample_and_its_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(DEMO_SAMPLE_TOML.parent.parent)  # `-p demo-sample` is a name
+
+    result = runner.invoke(app, ["doctor", "-p", "demo-sample"])
+
+    assert result.exit_code == 0, result.output
+    assert "Profile demo-sample" in result.output
+    assert "Sample: a synthetic 96-well plate" in result.output
+    assert "z = 0" in result.output
+    assert "detector=blobs" in result.output
+    # After the role table, which is the stand's and does not change.
+    roles = _demo_role_lines()
+    assert result.output.index(roles[-1]) < result.output.index("Sample:")
+    # The default demo says nothing of a sample.
+    plain = runner.invoke(app, ["doctor", "-p", "demo"])
+    assert plain.exit_code == 0, plain.output
+    assert "Sample:" not in plain.output
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_doctor_prints_the_sample_under_cp1252(tmp_path: Path) -> None:
+    # A redirected Windows stream is cp1252 with strict errors: `µ` and `°` have a
+    # byte there, and the line must reach the file whole (FM-20, FM-42).
+    out = tmp_path / "doctor.txt"
+    with out.open("wb") as handle:
+        done = subprocess.run(
+            [sys.executable, "-m", "smc.cli", "doctor", "-p", str(DEMO_SAMPLE_TOML)],
+            stdout=handle,
+            stderr=subprocess.PIPE,
+            env={
+                **os.environ,
+                "PYTHONIOENCODING": "cp1252",
+                "PYTHONUTF8": "0",
+                "COLUMNS": "200",
+            },
+            check=False,
+            timeout=120,
+        )
+
+    assert done.returncode == 0, done.stderr.decode("utf-8", errors="replace")
+    text = out.read_bytes().decode("cp1252")
+    assert "Sample: a synthetic 96-well plate, A1 at (-49500.0, 31500.0) µm" in text
+    assert "turned 0°" in text
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_snap_on_demo_sample_writes_the_plate_not_the_demo_camera(
+    tmp_path: Path,
+) -> None:
+    sample_frame, demo_frame = tmp_path / "sample.tif", tmp_path / "demo.tif"
+
+    on_sample = runner.invoke(
+        app, ["snap", "-p", str(DEMO_SAMPLE_TOML), "--out", str(sample_frame)]
+    )
+    on_demo = runner.invoke(app, ["snap", "-p", "demo", "--out", str(demo_frame)])
+
+    assert on_sample.exit_code == 0, on_sample.output
+    assert on_demo.exit_code == 0, on_demo.output
+    # The stage is at the origin: plastic (800) on the sample, and the demo
+    # camera's noise (3276 at 10 ms) where it ignores the stage.
+    assert float(tifffile.imread(sample_frame).mean()) < 1500
+    assert float(tifffile.imread(demo_frame).mean()) > 2500
+    with tifffile.TiffFile(sample_frame) as tif:
+        assert tif.shaped_metadata[0]["profile"] == "demo-sample"
 
 
 @pytest.mark.demo
