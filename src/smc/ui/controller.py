@@ -66,7 +66,7 @@ from smc.plugins.slots import (
     normalise_well,
     well_geometry,
 )
-from smc.run import RunDocument, RunDocumentError, StageStatus
+from smc.run import RunDocument, RunDocumentError, StageRecord, StageStatus
 from smc.ui.frames import Frame
 
 if TYPE_CHECKING:
@@ -74,6 +74,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "KEY_PARAMS",
+    "MORE_STAGE",
     "PAGE_PARAMS",
     "STAGES",
     "CheckItem",
@@ -81,6 +82,7 @@ __all__ = [
     "PageStatus",
     "PlatePage",
     "PlateView",
+    "ResultCard",
     "RouteStop",
     "ToolView",
     "WellView",
@@ -136,6 +138,10 @@ _CHECKLIST: tuple[tuple[str, bool], ...] = (
 )
 
 _SIDES = ("left", "right", "top", "bottom")
+
+#: A result card shows this many values, each at most this many characters long.
+_CARD_LINES = 8
+_CARD_CHARS = 80
 
 #: How long ``close`` waits for a stopped run to end, in seconds.
 _CLOSE_WAIT_S = 10.0
@@ -194,13 +200,33 @@ class CheckItem:
 
 
 @dataclass(frozen=True, slots=True)
+class ResultCard:
+    """What a tool's last record says, as lines of text: never markup (FM-139).
+
+    ``lines`` are the result's values and are empty unless the record ended
+    ``done``: a stopped or failed record's values are not a result (FM-154).
+    ``assumed`` are the result's own ``assumed`` lines, under the same rule.
+    """
+
+    plugin: str
+    status: str
+    when_utc: str
+    profile: str
+    dry_run: bool
+    lines: tuple[str, ...]
+    assumed: tuple[str, ...]
+    error: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class PlateView:
     """A snapshot of what the run document says, as the page needs it (a pure read).
 
     ``nominal`` is true when the wells are those of the plate type with A1 at
     (0, 0) and no rotation, not a registered plate. ``blocked`` maps a registered
     tool to why it cannot run now. ``problems`` are what ``view()`` could not read
-    and did not hide.
+    and did not hide. ``cards`` has one card for each tool that has a record in
+    the run document, and none for the others.
     """
 
     plate: str
@@ -211,6 +237,7 @@ class PlateView:
     checklist: tuple[CheckItem, ...]
     blocked: dict[str, str]
     problems: tuple[str, ...]
+    cards: dict[str, ResultCard]
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,11 +255,13 @@ class ToolView:
 class PageStatus:
     """The stand and the run, read now.
 
-    ``xy_um`` to ``halted`` are ``Microscope.state()``'s; ``stop_refused`` are the
-    roles the profile declares refuse their stop, so that the page can say that
-    STOP does not stop a move in flight on this stand (FM-117).
+    ``stand`` is the profile's ``microscope.name``. ``xy_um`` to ``halted`` are
+    ``Microscope.state()``'s; ``stop_refused`` are the roles the profile declares
+    refuse their stop, so that the page can say that STOP does not stop a move in
+    flight on this stand (FM-117).
     """
 
+    stand: str
     dry_run: bool
     running: str | None
     progress: Progress | None
@@ -268,6 +297,66 @@ def _autofocus_words(engaged: bool | None, locked: bool | None) -> str:
     if locked is None:
         return "autofocus ?"
     return "autofocus locked" if locked else "autofocus on, not locked"
+
+
+def _flat(text: str) -> str:
+    """``text`` on one line: its line breaks are spaces."""
+    return " ".join(text.splitlines())
+
+
+def _cut(text: str) -> str:
+    """``text`` of at most ``_CARD_CHARS`` characters, and a ``…`` when it was longer."""
+    return text if len(text) <= _CARD_CHARS else text[:_CARD_CHARS] + "…"
+
+
+def _value_line(key: str, value: object) -> str:
+    """One ``<key>: <value>`` line of a result card; a list or an object is only counted.
+
+    A value is shown by what it is, never by a ``repr`` that could be as long as the
+    result: the card is a summary, and the run document holds the rest.
+    """
+    label = _cut(_flat(key))
+    if isinstance(value, str):
+        return f"{label}: {_cut(_flat(value))}"
+    if isinstance(value, bool | int) or value is None:
+        return f"{label}: {value}"
+    if isinstance(value, float):
+        return f"{label}: {value:g}"
+    if isinstance(value, list):
+        return f"{label}: {len(value)} items"
+    if isinstance(value, dict):
+        return f"{label}: {len(value)} entries"
+    return f"{label}: {type(value).__name__}"
+
+
+def _card(record: StageRecord) -> ResultCard:
+    """The card of ``record``; its values only when it ended ``done`` (FM-154)."""
+    when = (record.finished_utc or record.started_utc).astimezone(timezone.utc)
+    lines: list[str] = []
+    assumed: tuple[str, ...] = ()
+    if record.status is StageStatus.done and record.result is not None:
+        lines = [
+            _value_line(key, value)
+            for key, value in record.result.items()
+            if key != "assumed"
+        ]
+        if len(lines) > _CARD_LINES:
+            lines = [*lines[:_CARD_LINES], f"… {len(lines) - _CARD_LINES} more"]
+        found = record.result.get("assumed")
+        if isinstance(found, list):
+            assumed = tuple(_flat(str(item)) for item in found)
+        elif found is not None:
+            assumed = (_flat(str(found)),)
+    return ResultCard(
+        plugin=record.plugin,
+        status=record.status.value,
+        when_utc=when.strftime("%Y-%m-%d %H:%M:%S"),
+        profile=record.profile,
+        dry_run=record.dry_run,
+        lines=tuple(lines),
+        assumed=assumed,
+        error=None if record.error is None else _flat(record.error),
+    )
 
 
 def _first_problem(error: ValidationError) -> str:
@@ -797,6 +886,7 @@ class PlatePage:
             else "no autofocus"
         )
         return PageStatus(
+            stand=self._microscope.profile.microscope.name,
             dry_run=self._microscope.dry_run,
             running=running,
             progress=progress,
@@ -993,6 +1083,11 @@ class PlatePage:
             checklist=self._checklist(doc),
             blocked=self._blocked(doc),
             problems=(*problems, *self._plugin_problems()),
+            cards={
+                tool.name: _card(doc.stages[tool.name])
+                for tool in self.tools()
+                if tool.name in doc.stages
+            },
         )
 
     # --- internals of the view -----------------------------------------------------
@@ -1043,8 +1138,15 @@ class PlatePage:
         return None
 
     def _checklist(self, doc: RunDocument) -> tuple[CheckItem, ...]:
+        """M3's slots in their order, then every other slot a record of the document provides.
+
+        A third-party plugin's stage shows without a line in ``_CHECKLIST``: the
+        extra slots are optional (no workflow of ours needs them) and by name.
+        """
+        named = {slot for slot, _optional in _CHECKLIST}
+        extra = sorted({r.provides for r in doc.stages.values()} - named)
         items: list[CheckItem] = []
-        for slot, optional in _CHECKLIST:
+        for slot, optional in (*_CHECKLIST, *((slot, True) for slot in extra)):
             if doc.provider(slot) is None:
                 items.append(CheckItem(slot, optional, "not run", None))
                 continue

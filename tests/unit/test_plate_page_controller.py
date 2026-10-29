@@ -1007,6 +1007,19 @@ def test_a_dry_run_page_reads_the_plate_a_real_or_a_dry_run_registered(
 # --- status ------------------------------------------------------------------------
 
 
+def test_status_names_the_stand(run_doc: Path) -> None:
+    core = FakeCore.demo_like()
+    demo = Profile.demo()
+    named = demo.model_copy(
+        update={"microscope": demo.microscope.model_copy(update={"name": "ti2e-bench"})}
+    )
+    microscope = Microscope.from_core(cast("CMMCorePlus", core), named)
+    try:
+        assert _page(microscope, run_doc).status().stand == "ti2e-bench"
+    finally:
+        microscope.close()
+
+
 def test_status_reads_the_stand(page: PlatePage, fake_microscope: Microscope) -> None:
     fake_microscope.require(XYStage).move_to_um(1000.0, -500.0)
     fake_microscope.require(ZStage).move_to_um(12.5)
@@ -1844,6 +1857,210 @@ def test_a_snap_on_the_fake_stand_reads_its_own_camera(page: PlatePage) -> None:
     assert frame is not None, page.status().outcome
     assert frame.image.ndim == 2
     assert page.status().outcome == f"snap: {frame.summary}"
+
+
+# --- the result card and the checklist -------------------------------------------------------
+
+
+def _record(
+    run_doc: Path,
+    plugin: str,
+    *,
+    provides: str | None = None,
+    status: StageStatus = StageStatus.done,
+    result: dict[str, Any] | None = None,
+    error: str | None = None,
+    started_minute: int = 0,
+    finished_minute: int | None = 0,
+    profile: str = "demo",
+    dry_run: bool = False,
+) -> None:
+    """A record whose result is the dict given as it stands, for values no model would dump."""
+    write_stage(
+        run_doc,
+        StageRecord(
+            plugin=plugin,
+            provides=provides or plugin,
+            attempt="a0",
+            status=status,
+            started_utc=T0 + timedelta(minutes=started_minute),
+            finished_utc=(
+                None
+                if finished_minute is None
+                else T0 + timedelta(minutes=finished_minute)
+            ),
+            profile=profile,
+            dry_run=dry_run,
+            smc_version="0",
+            params={},
+            result=result,
+            error=error,
+        ),
+    )
+
+
+def test_a_done_record_is_a_card_with_its_result_lines(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _record(
+        run_doc,
+        "stub",
+        started_minute=1,
+        finished_minute=3,
+        result={
+            "assumed": ["pixel size 0.65 um from the profile", "no stage calibration"],
+            "text": "x" * 90,
+            "note": "line one\nline two",
+            "ratio": 12.3456789,
+            "count": 3,
+            "flag": True,
+            "nothing": None,
+            "wells": ["A1", "A2", "A3"],
+            "stats": {"a": 1, "b": 2},
+        },
+    )
+    cards = _page(fake_microscope, run_doc).view().cards
+    assert list(cards) == ["stub"]
+    card = cards["stub"]
+    assert card.plugin == "stub"
+    assert card.status == "done"
+    # The finish, not the start.
+    assert card.when_utc == "2026-10-29 09:03:00"
+    assert card.profile == "demo"
+    assert card.dry_run is False
+    assert card.error is None
+    assert card.lines == (
+        f"text: {'x' * 80}…",
+        "note: line one line two",
+        "ratio: 12.3457",
+        "count: 3",
+        "flag: True",
+        "nothing: None",
+        "wells: 3 items",
+        "stats: 2 entries",
+    )
+    assert card.assumed == (
+        "pixel size 0.65 um from the profile",
+        "no stage calibration",
+    )
+
+
+def test_a_string_of_exactly_eighty_characters_is_not_cut(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _record(run_doc, "stub", result={"text": "y" * 80})
+    card = _page(fake_microscope, run_doc).view().cards["stub"]
+    assert card.lines == (f"text: {'y' * 80}",)
+
+
+def test_a_card_shows_at_most_eight_values_and_says_how_many_more(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    ten = {f"k{i}": i for i in range(10)}
+    _record(run_doc, "stub", result={"assumed": ["a"], **ten})
+    card = _page(fake_microscope, run_doc).view().cards["stub"]
+    assert card.lines == (*(f"k{i}: {i}" for i in range(8)), "… 2 more")
+    eight = {f"k{i}": i for i in range(8)}
+    _record(run_doc, "stub", result=eight)
+    card = _page(fake_microscope, run_doc).view().cards["stub"]
+    assert card.lines == tuple(f"k{i}: {i}" for i in range(8))
+
+
+def test_a_card_says_when_it_was_a_dry_run_on_another_profile_and_without_a_finish(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _record(
+        run_doc,
+        "stub",
+        status=StageStatus.running,
+        started_minute=7,
+        finished_minute=None,
+        profile="lightsheet",
+        dry_run=True,
+    )
+    card = _page(fake_microscope, run_doc).view().cards["stub"]
+    assert (card.status, card.when_utc) == ("running", "2026-10-29 09:07:00")
+    assert (card.profile, card.dry_run) == ("lightsheet", True)
+
+
+@pytest.mark.parametrize(
+    "status", [StageStatus.stopped, StageStatus.failed, StageStatus.running]
+)
+def test_a_stopped_or_failed_record_shows_no_result_values(
+    fake_microscope: Microscope, run_doc: Path, status: StageStatus
+) -> None:
+    # FM-154: the values of a record that did not end done are not a result.
+    _record(
+        run_doc,
+        "stub",
+        status=status,
+        result={"assumed": ["a guess"], "n": 7, "text": "partial"},
+        error="the camera\nfailed",
+    )
+    card = _page(fake_microscope, run_doc).view().cards["stub"]
+    assert card.status == status.value
+    assert card.lines == ()
+    assert card.assumed == ()
+    assert card.error == "the camera failed"
+
+
+def test_a_card_is_made_for_a_tool_with_a_record_and_for_no_other(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _record(run_doc, "stub", result={"n": 1})
+    _record(run_doc, "slow", result={"n": 2})
+    # A record of a plugin this registry does not hold is no tool of the page.
+    _record(run_doc, "gone", result={"n": 3})
+    cards = _page(fake_microscope, run_doc).view().cards
+    assert sorted(cards) == ["slow", "stub"]
+    assert _page(fake_microscope, run_doc.with_name("none.json")).view().cards == {}
+
+
+def test_a_record_with_no_result_is_a_card_with_no_lines(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _record(run_doc, "stub", result=None)
+    card = _page(fake_microscope, run_doc).view().cards["stub"]
+    assert (card.status, card.lines, card.assumed) == ("done", (), ())
+
+
+def test_the_checklist_lists_a_slot_the_workflow_does_not_name(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _record(run_doc, "zeta-tool", status=StageStatus.done, result={})
+    _record(run_doc, "alpha-tool", status=StageStatus.failed)
+    _record(run_doc, "scan", result={})
+    items = _page(fake_microscope, run_doc).view().checklist
+    named = [item.slot for item in items[:10]]
+    assert named == [
+        "camera-calibration",
+        "plate",
+        "timings",
+        "scan-plan",
+        "scan",
+        "cells",
+        "density",
+        "route",
+        "report",
+        "nis-export",
+    ]
+    # M3's slots keep their order and their state; the others follow by name, optional.
+    assert items[4] == CheckItem("scan", False, "ok", None)
+    assert items[10:] == (
+        CheckItem(
+            "alpha-tool",
+            True,
+            "unusable",
+            "the last run of alpha-tool ended failed; run it again",
+        ),
+        CheckItem("zeta-tool", True, "ok", None),
+    )
+
+
+def test_a_checklist_without_other_slots_is_m3s(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    assert len(_page(fake_microscope, run_doc).view().checklist) == 10
 
 
 # --- the tools ----------------------------------------------------------------------------

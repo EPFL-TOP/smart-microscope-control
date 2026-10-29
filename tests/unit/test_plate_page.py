@@ -212,6 +212,7 @@ def _wells_by_name(view: PlatePageView) -> dict[str, dict[str, Any]]:
 
 def _status(**changes: Any) -> PageStatus:
     base: dict[str, Any] = {
+        "stand": "demo",
         "dry_run": False,
         "running": None,
         "progress": None,
