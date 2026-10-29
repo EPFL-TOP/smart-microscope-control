@@ -3329,12 +3329,13 @@ FM-98, FM-111, FM-114, FM-124, FM-125, FM-131, FM-138, and two new entries
 (markup built from a result's text; an output bounded per unit but not in
 all).
 
-## 14. The NIS-Elements export (#196) — interface only
+## 14. The NIS-Elements export (#196)
 
 `smc/plugins/nis_export/format.py` and `plugin.py`, entry point
-`nis-export`. **The format is not designed here**: it waits for a real XY
-position list exported by NIS-Elements 6.20 on the Ti2-E (#196), and is
-not to be guessed.
+`nis-export`. The format is the one of a real XY position list (multipoint)
+that NIS-Elements 6.20 exported on the Ti2-E on 2026-10-29 (#196); what
+was measured and decided from it is under *Refined while planning #196*
+below.
 
 ```python
 SUFFIX: str
@@ -3364,9 +3365,68 @@ positions are the route's, in order. `out=None` writes
 `nis-export/<token><SUFFIX>`; an `out` elsewhere (a folder NIS reads) is
 written there, refused when it exists and `overwrite` is false, and stored
 as its absolute POSIX path. `z_mode` says which of `z_um` and
-`pfs_offset` the format carries, once known. **Acceptance** is #196's: the
+`pfs_offset` the format carries. **Acceptance** is #196's: the
 sample's structure round-trips (`decode(encode(x)) == x` and the sample
 decodes), and the owner loads one export into NIS on the stand.
+
+**Refined while planning #196** (measured 2026-10-29 on the sample,
+`local/nikon-positions/multipoints.xml`, 8846 bytes, 10 points, with a
+prototype that is not committed, on Python 3.13 and 3.10):
+
+- **The file.** UTF-16 little-endian with a byte-order mark (`FF FE`), no
+  line break anywhere, none at the end. The text is the declaration
+  `<?xml version="1.0" encoding="UTF-16"?>`, then `<variant
+  version="1.0"><no_name runtype="CLxListVariant">`, two flags
+  `bIncludeZ` and `bPFSEnabled` (`runtype="bool"`, `value="true"` or
+  `"false"`), one `Point00000`, `Point00001`, … per position (five digits,
+  from 0, `runtype="NDSetupMultipointListItem"`), and
+  `</no_name></variant>`. Every leaf is `<tag runtype="…" value="…"/>`,
+  `runtype` first, no space before `/>`. A point holds, in this order:
+  `bChecked` (bool), `strName` (`CLxStringW`), `dXPosition`,
+  `dYPosition`, `dZPosition`, `dPFSOffset` (`double`), `baUserData`
+  (`CLxByteArray`, `value=""`). A double is written with 15 decimals
+  (`f"{v:.15f}"`: `-11613.300000000001091`).
+- **What the sample says about units.** The positions are those of a 96-well
+  plate in µm (X −13 000 to −4 000, Y 3 500 to 9 800, Z 4089.0 to 4089.12),
+  on the same 0.1 µm steps as Micro-Manager's readings of this stage
+  (`-28779.100000000002` in session 1). `dPFSOffset` is 9370 in every point
+  although `bPFSEnabled` is false: NIS writes its current offset whatever
+  the flag. 9370 is also the offset Micro-Manager's `PFSOffset` read in
+  session 1 ("left from earlier use", FM-118), so the two share a unit.
+  That NIS shares Micro-Manager's origin and direction of X, Y and Z is
+  consistent with these numbers and **not measured**.
+- **The encoder reproduces NIS's bytes.** With the sample's own values
+  (offset 9370 included), the prototype's output equals the sample byte for
+  byte except the `bPFSEnabled` flag it set; with the offset absent it
+  differs only in the ten `dPFSOffset` values (below).
+- **A flag carries the field.** `encode` sets `bIncludeZ` when every
+  position has `z_um`, `bPFSEnabled` when every one has `pfs_offset`, and
+  refuses a list where only some have one (`ValueError`): a list NIS reads
+  with one flag cannot say that a value is unknown for one point.
+  `decode` reads `dZPosition` as `z_um` only under `bIncludeZ`, and
+  `dPFSOffset` as `pfs_offset` only under `bPFSEnabled`, else `None`. A
+  field without its flag is written as `0.000000000000000`, a number that
+  is plainly no reading; the sample's unused 9370 is not reproduced.
+- **The plugin's three modes.** `pfs-offset` when every route position has
+  both values (both flags true), else `z` when every one has `z_um` (Z
+  only), else `none` (neither): the route's per-stop `None` (§11, #232)
+  becomes one mode for the whole list, and `assumed` names how many
+  positions lacked the value that decided it.
+- **Round trip.** `float(f"{v:.15f}") == v` for every `|v| >= 10` (0 of
+  100 000 random values failed) and not below (26 % failed in `[1, 10)`,
+  off by less than 1e-15 µm). `decode(encode(x)) == x` is exact for the
+  stage's values (Z and the offset are thousands, X and Y are within 10 µm
+  of 0 only at the stage's centre) and within 1e-15 below 10.
+- **The sample is committed as a test fixture**, under `tests/data/nis/`,
+  marked `binary` in `.gitattributes` and excluded from pre-commit's
+  `end-of-file-fixer` and `trailing-whitespace`: `identify` tags a `.xml`
+  as text, and `end-of-file-fixer` appended one byte to the sample
+  (8847 bytes, an odd length that no UTF-16 decoder reads), measured with
+  the hook's v6.0.0.
+
+Not verified: that NIS-Elements 6.20 loads a file this encoder wrote, in
+each mode (a `pfs-offset` list sets both flags, which the sample does not
+show), and that a stop exported this way is the field the scan imaged.
 
 ## 15. The plate page (#197)
 
@@ -3883,7 +3943,8 @@ For session 2 the critical path is #199 → #22, #19, #21, #213, #23 →
   Pro); a well of 305 frames would take about 2 minutes at that speed.
 - `merge_radius_um = 5.0` and the overlap of 10 % against real cells.
 - Whether the stage's move time follows the Euclidean distance (§11).
-- The NIS-Elements format (§14).
+- That NIS-Elements 6.20 loads the export in each of its modes, and that
+  its stage coordinates are Micro-Manager's (§14).
 - Panel's version and behaviour on the microscope PC over RDP; a real
   browser's click (the `Tap` event of §15.3), the periodic callback of a
   session, Ctrl-C on Windows, and the page on a PC with no internet.
