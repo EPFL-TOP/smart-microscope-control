@@ -80,14 +80,15 @@ never held across a device call; `stop()` takes none, FM-70).
 a snap, a live session, a drive action), once each, after what the activity
 wrote is on disk. It is part of the shared state, and a tab that sees it change
 calls `refresh()` (FM-151): it reads the run document and redraws the plate, the
-route and the checklist. The review of #270 measured about 0.34 s for that on a
-1536-well plate. Measured here on `FakeCore`, 2026-10-29: the first `view()` of
-that plate takes 591 ms and a later one 1 ms, and the redraw assigns the wells'
-column data again, 11 columns of 1536 rows (122 kB as JSON), which the server
-then sends to every browser (the send is not measured: no browser). That is
-right for the end of a run and a cost to a snap, and it is wrong for anything
-that happens *inside* an activity: **what an activity does while it goes is
-never an activity**, so a live frame (§5) never counts.
+route and the checklist. Measured here on `FakeCore`, 2026-10-29, on a 1536-well
+plate: the first `view()` takes 591 ms (the plate's geometry, FM-145's 339 ms,
+which `view()` then keeps), a later `view()` 1 ms and a `refresh()` 1 to 2 ms;
+what each one then costs is the redraw, which assigns the wells' column data
+again, 11 columns of 1536 rows (122 kB as JSON) that the server sends to every
+browser (not measured: no browser). That is right for the end of a run and a
+small cost to a snap, and it is wrong for anything that happens *inside* an
+activity: **what an activity does while it goes is never an activity**, so a
+live frame (§5) never counts.
 
 ### 2.2 A snap and its frame
 
