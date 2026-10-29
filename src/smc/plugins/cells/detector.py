@@ -339,8 +339,8 @@ class BlobDetector:
     ``score`` is always 1.0: a threshold on it would mean nothing here.
     """
 
-    classes = ("single", "doublet")
-    device = "cpu"
+    classes: tuple[str, ...] = ("single", "doublet")
+    device: str = "cpu"
 
     def detect(self, frame: npt.NDArray[Any]) -> list[Detection]:
         """The spots of one frame, in no particular order; none on a flat or noiseless one.
