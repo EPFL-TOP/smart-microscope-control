@@ -1204,7 +1204,10 @@ prototypes that are not committed:
   torchvision 0.28). Hence the blob detector.
 
 ```python
-# smc/hardware/profile.py
+# smc/hardware/profile.py (the profile cannot import smc.testing)
+MAX_SAMPLE_CELLS = 50_000  # cells_per_well x wells; about 50 ms per frame at the bound
+
+
 class SampleSection(_Section):
     plate: str = "96-well"  # a useq name ending in "-well"
     # None: the plate centred on the stage origin
@@ -1223,7 +1226,6 @@ CELL_INTENSITY = 3000.0  # counts above the level at REFERENCE_EXPOSURE_MS
 CELL_REACH = 0.85  # a cell's centre lies within this fraction of the well's half-size
 # a doublet's two spots lie this many radii either side of its centre
 DOUBLET_OFFSET = 0.8
-MAX_SAMPLE_CELLS = 50_000  # cells_per_well x wells; about 50 ms per frame at the bound
 
 
 def centred_a1_um(plate: str) -> tuple[float, float]: ...
