@@ -1283,7 +1283,9 @@ def load_cells(run_dir: Path, result: CellsResult) -> tuple[Cell, ...]: ...
   `result.counts` (a file replaced behind the result). Readers turn that
   into a `PluginRunError` that says to run `cells` again.
 - `model` is the weights' file name (never its full path: FM-50, run
-  documents are attached to issues); `model_sha256` its SHA-256;
+  documents are attached to issues), or `blobs` for the blob detector of
+  §9.1; `model_sha256` its SHA-256 (of the detector's identity for
+  `blobs`);
   `classes` the detector's, background excluded.
 
 ```python
@@ -2475,6 +2477,50 @@ def load_detector(
   an unavailable device), with its message. The file is checked first so
   that a PC without torch still says where it looked.
 
+**The blob detector (#260).** The trained model does not see the
+synthetic cells of the demo-sample stand (M1 §8, "The demo-sample
+stand": at most 2 `single` among 14 objects), so the workflow could not
+be followed on images past the scan. A second detector, in the same
+module, numpy and scikit-image only:
+
+```python
+BLOB_DETECTOR = "blobs"  # CellsResult.model when it ran
+BLOB_DETECTOR_IDENTITY = (
+    "smc BlobDetector 1: p75 + 8 sigma, 9 px to 5 % of the frame, "
+    "axis ratio >= 0.3, single from 0.75"
+)  # its SHA-256 is CellsResult.model_sha256
+
+
+class BlobDetector:
+    classes = ("single", "doublet")
+    device = "cpu"
+
+    def detect(self, frame: npt.NDArray[Any]) -> list[Detection]: ...
+```
+
+`detect` refuses a frame that is not 2-D (`ValueError`), as
+`TorchDetector` does. On the frame as `float64`: the background is its
+75th percentile and the noise `σ = 1.4826 × median(|Δ|) / √2`, `Δ` the
+differences of neighbouring pixels along a row (a well wall is a step,
+which a spread around the median would count as noise); `σ` not finite or
+not positive gives no detection. The mask is `frame > background + 8 σ`,
+its connected components `skimage.measure.label` (8-connected, the
+default) and `regionprops`. A component is dropped when its area is under
+9 pixels or over 5 % of the frame (a sliver of well seen past a wall), or
+when `axis_minor_length / axis_major_length` is under 0.3 (a strip) or the
+major axis is 0; it is a `single` from a ratio of 0.75 up, else a
+`doublet`. Its box is its `bbox` as floats, its score 1.0. **Measured
+2026-10-29** (scikit-image 0.26.0) on `PlateSample` frames of 5 single and
+3 paired spots of radius 5 µm, `CELL_INTENSITY` above the well: exactly 5
+`single` and 3 `doublet` at 0.1625, 0.25, 0.5, 1.0 and 2.0 µm per pixel;
+no detection on 21 cell-free frames across a well wall (centre from −½
+to +½ frame past it) nor at a corner, at every one of those pixel sizes.
+With the median for background and its spread for `σ` (the first
+prototype), a frame centred on the wall gave 5 false cells at 1.0 µm.
+With 2 % for the largest area, the doublets vanished at 0.1625 µm. It
+knows nothing of cells: it is for the synthetic sample, and the result
+says so.
+
 ### 9.2 Algorithm
 
 `overlap.py` is `nikon-control`'s `overlap.py`, typed, with its 17 tests
@@ -2544,6 +2590,8 @@ def merge_across_fields(
 
 ```python
 class CellsParams(PluginParams):
+    # blobs: §9.1, for the demo-sample stand only (#260)
+    detector: Literal["model", "blobs"] = "model"
     model_path: Path | None = None
     device: Literal["auto", "cpu", "cuda", "mps"] = "auto"
     score_threshold: float = Field(0.5, ge=0.05, le=1.0)
@@ -2605,6 +2653,18 @@ parameters; `frames = len(scan.frames)`; `counts` for every well of
 checkpoint;
 `seconds_per_frame` the mean `detect` time of this attempt, `None` when
 it detected no frame. `assumed` names the merge radius as chosen.
+
+`detector` (#260): `model` loads the weights as above; `blobs` builds
+`BlobDetector()` and never touches `model_path` or torch. `CellsParams`
+refuses, with a `ValueError` naming the fix, `detector=blobs` with a
+`model_path` ("model_path is for detector=model") or with a `device`
+other than `auto` or `cpu` ("the blob detector runs on the cpu"). With
+`blobs`, step 2 hashes `BLOB_DETECTOR_IDENTITY` (UTF-8) instead of a file,
+so a resume across a change of its rules is refused like a change of
+weights; `CellsResult.model` is `BLOB_DETECTOR`, `device` `cpu`, and
+`assumed` adds "cells were found by the blob detector (detector=blobs),
+which counts bright round spots for the synthetic plate of the
+demo-sample profile; on a real sample its counts are not cells".
 
 `merge_radius_um = 5.0` is **chosen, not measured**: half the size of a
 yeast cell, well above the calibration's error, well below two cells
@@ -3607,7 +3667,7 @@ KEY_PARAMS: dict[str, tuple[str, ...]] = {
     "camera-calibration": ("step_um",),
     "scan-plan": ("objective", "overlap", "coverage"),
     "scan": ("autofocus",),
-    "cells": ("score_threshold",),
+    "cells": ("detector", "score_threshold"),  # detector: #260
     "route": ("labels", "fields_per_well"),
 }
 PAGE_PARAMS: dict[str, tuple[str, ...]] = {
