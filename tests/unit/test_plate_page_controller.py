@@ -39,7 +39,7 @@ from typing import Any, ClassVar, cast
 import numpy as np
 import pytest
 import useq
-from pydantic import Field
+from pydantic import Field, field_validator
 from pymmcore_plus import CMMCorePlus
 
 import smc.ui.controller as controller_module
@@ -58,7 +58,7 @@ from smc.plugins.api import (
 )
 from smc.plugins.errors import PluginRunError
 from smc.plugins.params import parse_params
-from smc.plugins.registry import GROUP
+from smc.plugins.registry import GROUP, LoadFailure, Registry
 from smc.plugins.slots import (
     DensityResult,
     DensityWell,
@@ -703,6 +703,69 @@ def test_a_failed_run_keeps_no_exception(page: PlatePage) -> None:
         )
     finally:
         gc.enable()
+
+
+class PickyParams(PluginParams):
+    n: int = 1
+
+    @field_validator("n")
+    @classmethod
+    def _known(cls, value: int) -> int:
+        # Raises a KeyError, not a ValueError: pydantic does not turn it into a
+        # validation error, so it reaches whoever called `parse_params`.
+        return {1: 1}[value]
+
+
+class Picky:
+    """A third party's plugin whose validator raises something other than a ValueError (FM-113)."""
+
+    name = provides = "picky"
+    summary = "A test plugin with a validator that raises a KeyError."
+    Params = PickyParams
+    Result = StubResult
+    requires: tuple[type, ...] = ()
+    reads: tuple[str, ...] = ()
+    reads_optional: tuple[str, ...] = ()
+
+    def run(self, microscope: Any, params: PickyParams, ctx: RunContext) -> StubResult:
+        return StubResult()
+
+
+def test_a_validator_that_raises_something_else_is_an_outcome_and_starts_no_thread(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _page(fake_microscope, run_doc, [_ep(Picky)])
+    threads = threading.active_count()
+    # `n=3` is an int, so the type check passes and the plugin's own validator runs.
+    page.run("picky", ["n=3"])
+    assert page.status().outcome == "picky: KeyError: 3"
+    assert page.status().running is None
+    assert threading.active_count() == threads
+    assert not run_doc.exists()
+    # The same plugin with a value it accepts still runs.
+    _run_and_join(page, "picky", ["n=1"])
+    assert page.status().outcome is not None
+    assert page.status().outcome.startswith("picky done in ")
+
+
+def test_activities_ended_counts_runs_and_snaps_and_not_refusals(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    assert page.activities_ended == 0
+    _run_and_join(page, "stub")
+    assert page.activities_ended == 1
+    fake_microscope.override(Camera, FrameCamera(_ramp_frame()))
+    page.snap()
+    assert page.join(10.0)
+    assert page.activities_ended == 2
+    # A refusal before a thread starts is no activity.
+    page.run("nope", [])
+    page.run("stub", ["n=abc"])
+    assert page.activities_ended == 2
+    # A run that fails ends too, and a second look at the count changes nothing.
+    _run_and_join(page, "failing")
+    assert page.activities_ended == 3
+    assert page.activities_ended == 3
 
 
 def test_a_run_record_that_could_not_be_written_still_says_so(
@@ -1551,7 +1614,7 @@ class FrameCamera:
         *,
         exposure_ms: float = 5.0,
         bit_depth: int = 16,
-        pixel_size_um: float = 0.65,
+        pixel_size_um: float | None = 0.65,
         block: bool = False,
         fail_with: Callable[[], Exception] | None = None,
     ) -> None:
@@ -1587,6 +1650,9 @@ class FrameCamera:
         return self._bit_depth
 
     def pixel_size_um(self) -> float:
+        # ``None`` is a camera whose read fails: the facade's state() then says unknown.
+        if self._pixel_size_um is None:
+            raise HardwareError("the pixel size cannot be read")
         return self._pixel_size_um
 
 
@@ -1642,6 +1708,38 @@ def test_a_snap_of_an_unknown_pixel_size_is_zero_and_never_a_guess(
     assert frame.pixel_size_um == 0.0
 
 
+def test_a_snap_whose_pixel_size_cannot_be_read_still_keeps_the_frame_as_unknown(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # state() says None for a read that failed: the frame says 0.0, unknown, and
+    # the snap is not lost for it.
+    fake_microscope.override(Camera, FrameCamera(_ramp_frame(), pixel_size_um=None))
+    assert fake_microscope.state().pixel_size_um is None
+    page.snap()
+    assert page.join(10.0)
+    frame = page.frame()
+    assert frame is not None, page.status().outcome
+    assert frame.pixel_size_um == 0.0
+
+
+def test_a_snap_on_a_stand_whose_stage_cannot_be_read_keeps_the_frame_without_a_position(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    def unreadable() -> None:
+        raise HardwareError("the XY stage did not answer")
+
+    fake_microscope.override(Camera, FrameCamera(_ramp_frame()))
+    stage = fake_microscope.require(XYStage)
+    with _replaced(stage, "position_um", unreadable):
+        assert fake_microscope.state().xy is None
+        page.snap()
+        assert page.join(10.0)
+    frame = page.frame()
+    assert frame is not None, page.status().outcome
+    assert frame.xy_um is None
+    assert page.status().outcome == f"snap: {frame.summary}"
+
+
 def test_each_snap_is_a_new_number_and_a_read_only_frame(
     page: PlatePage, fake_microscope: Microscope
 ) -> None:
@@ -1677,6 +1775,26 @@ def test_snap_on_a_stand_without_a_camera_is_an_outcome_and_starts_no_thread(
     assert page.status().running is None
     assert page.frame() is None
     assert threading.active_count() == threads
+
+
+def test_snap_refuses_a_busy_or_a_closed_page_even_when_the_stand_has_no_camera(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # The refusal comes before the missing camera: a click that cannot start is told
+    # why, as a run's is, and is not an outcome that hides the run that is going.
+    with _replaced(fake_microscope, "has", _without(Camera)):
+        page.run("slow", [])
+        try:
+            assert Slow.started.wait(5)
+            with _refuses(RuntimeError, "slow is running"):
+                page.snap()
+        finally:
+            Slow.release.set()
+        assert page.join(10.0)
+        page.close()
+        with _refuses(RuntimeError, "the page is closed"):
+            page.snap()
+    assert page.frame() is None
 
 
 def test_lacks_names_the_missing_capability(
@@ -2057,6 +2175,80 @@ def test_the_checklist_lists_a_slot_the_workflow_does_not_name(
     )
 
 
+def _record_at(
+    run_doc: Path,
+    plugin: str,
+    started: datetime,
+    finished: datetime | None = None,
+    *,
+    result: dict[str, Any] | None = None,
+) -> None:
+    """A done record with the dates given as they are, offsets included."""
+    write_stage(
+        run_doc,
+        StageRecord(
+            plugin=plugin,
+            provides=plugin,
+            attempt="a0",
+            status=StageStatus.done,
+            started_utc=started,
+            finished_utc=finished,
+            profile="demo",
+            dry_run=False,
+            smc_version="0",
+            params={},
+            result=result,
+        ),
+    )
+
+
+def test_a_card_time_is_utc_whatever_the_offset_of_the_record(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # 11:00 at +02:00 is 09:00 UTC: the card says UTC, so it must be.
+    zone = timezone(timedelta(hours=2))
+    _record_at(run_doc, "stub", datetime(2026, 10, 29, 11, 0, tzinfo=zone))
+    card = _page(fake_microscope, run_doc).view().cards["stub"]
+    assert card.when_utc == "2026-10-29 09:00:00"
+
+
+@pytest.mark.parametrize(
+    "when",
+    [
+        datetime.fromisoformat("0001-01-01T00:00:00+05:00"),
+        datetime.fromisoformat("9999-12-31T23:00:00-05:00"),
+    ],
+    ids=["year-1-ahead-of-utc", "year-9999-behind-utc"],
+)
+def test_a_date_utc_cannot_hold_is_an_unknown_time_and_the_view_still_builds(
+    fake_microscope: Microscope, run_doc: Path, when: datetime
+) -> None:
+    # A document nobody should edit by hand, edited: `view()` raises nothing for it.
+    _record_at(run_doc, "stub", when)
+    view = _page(fake_microscope, run_doc).view()
+    assert view.cards["stub"].when_utc == "????-??-?? ??:??:??"
+    assert view.cards["stub"].status == "done"
+
+
+def test_an_assumed_that_is_a_text_or_has_line_breaks_is_one_line_each(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _record(run_doc, "stub", result={"assumed": ["pixel size\ntaken as given", "x"]})
+    card = _page(fake_microscope, run_doc).view().cards["stub"]
+    assert card.assumed == ("pixel size taken as given", "x")
+    _record(run_doc, "stub", result={"assumed": "one\ntwo"})
+    card = _page(fake_microscope, run_doc).view().cards["stub"]
+    assert card.assumed == ("one two",)
+
+
+def test_a_key_of_a_result_is_cut_and_flattened_like_a_value(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _record(run_doc, "stub", result={"k" * 100: 1, "two\nlines": 2})
+    card = _page(fake_microscope, run_doc).view().cards["stub"]
+    assert card.lines == (f"{'k' * 80}…: 1", "two lines: 2")
+
+
 def test_a_checklist_without_other_slots_is_m3s(
     fake_microscope: Microscope, run_doc: Path
 ) -> None:
@@ -2266,6 +2458,64 @@ def test_a_required_field_is_never_folded(
     plan = by_name["scan-plan"]
     assert [row[0] for row in plan.key] == ["objective", "must"]
     assert plan.advanced == ()
+
+
+class RequiredKeyParams(PluginParams):
+    objective: str
+    wells: str
+
+
+class KeyedPlan(Needy):
+    """Registered as ``scan-plan``: its required ``objective`` is also named by ``KEY_PARAMS``."""
+
+    name = provides = "scan-plan"
+    Params = RequiredKeyParams  # type: ignore[assignment]
+
+
+def test_a_required_field_that_key_params_names_is_one_row_and_not_two(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _page(fake_microscope, run_doc, [_ep(KeyedPlan)])
+    (plan,) = [t for t in page.tools() if t.name == "scan-plan"]
+    assert [row[0] for row in plan.key] == ["objective"]
+    assert plan.advanced == ()
+
+
+def test_the_tools_are_described_once_and_not_at_every_view(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A tap rebuilds the view: describing every plugin's parameters again each time
+    # is the work FM-112 keeps out of it.
+    described: list[object] = []
+    real = controller_module.describe_params
+
+    def counting(model: Any) -> Any:
+        described.append(model)
+        return real(model)
+
+    monkeypatch.setattr(controller_module, "describe_params", counting)
+    page = _page(fake_microscope, run_doc)
+    for _ in range(3):
+        page.tools()
+        page.view()
+    assert len(described) == len(STUBS)
+
+
+def test_a_reason_a_plugin_failed_to_load_is_one_line(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _page(fake_microscope, run_doc)
+    page._registry_found = Registry(
+        plugins=page._registry().plugins,
+        failures=(
+            LoadFailure(
+                "ghost", "ghost:Plugin", None, "could not be imported:\n  boom"
+            ),
+        ),
+    )
+    assert page.view().problems == ("plugin ghost: could not be imported: boom",)
 
 
 def test_a_plugin_that_failed_to_load_is_a_problem(

@@ -143,6 +143,9 @@ _SIDES = ("left", "right", "top", "bottom")
 _CARD_LINES = 8
 _CARD_CHARS = 80
 
+#: A card's time when its record's date cannot be put in UTC: unknown, never a guess.
+_UNKNOWN_TIME = "????-??-?? ??:??:??"
+
 #: How long ``close`` waits for a stopped run to end, in seconds.
 _CLOSE_WAIT_S = 10.0
 
@@ -331,7 +334,13 @@ def _value_line(key: str, value: object) -> str:
 
 def _card(record: StageRecord) -> ResultCard:
     """The card of ``record``; its values only when it ended ``done`` (FM-154)."""
-    when = (record.finished_utc or record.started_utc).astimezone(timezone.utc)
+    when = record.finished_utc or record.started_utc
+    try:
+        when_utc = when.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    except (OverflowError, ValueError):
+        # A date a model accepts (year 1 with an offset) that UTC cannot hold: a
+        # hand-edited document must not stop ``view()``, which raises nothing for one.
+        when_utc = _UNKNOWN_TIME
     lines: list[str] = []
     assumed: tuple[str, ...] = ()
     if record.status is StageStatus.done and record.result is not None:
@@ -350,7 +359,7 @@ def _card(record: StageRecord) -> ResultCard:
     return ResultCard(
         plugin=record.plugin,
         status=record.status.value,
-        when_utc=when.strftime("%Y-%m-%d %H:%M:%S"),
+        when_utc=when_utc,
         profile=record.profile,
         dry_run=record.dry_run,
         lines=tuple(lines),
@@ -426,6 +435,7 @@ class PlatePage:
         self._queue: queue.SimpleQueue[Progress] = queue.SimpleQueue()
         self._worker: threading.Thread | None = None
         self._closed = False
+        self._ended = 0
         # A plain attribute, written by ``stop()`` and ``resume()``, which take no lock.
         self._stop_note: str | None = None
         self.current = None
@@ -439,6 +449,17 @@ class PlatePage:
         self._restore(doc)
 
     # --- plate and selection -------------------------------------------------
+
+    @property
+    def activities_ended(self) -> int:
+        """How many activities (runs and snaps) have ended since the page began.
+
+        What every session compares to see that something ended while it was not
+        looking: a tool that takes less than a tick is never seen running by a
+        second tab, and its record, its result card and the checklist are new all
+        the same (FM-151).
+        """
+        return self._ended
 
     @property
     def plate(self) -> str:
@@ -625,6 +646,13 @@ class PlatePage:
                 # parse_params knows the model, not the plugin: name the plugin, as
                 # `smc run` does, so the advice (--show-params) is for the right one.
                 raise ParamsError(plugin, exc.problems) from None
+            except Exception as exc:
+                # A third party's validator is code nobody here reviewed, and pydantic
+                # turns only ValueError and AssertionError into a validation error:
+                # any other exception is the plugin's, and an outcome, never a click
+                # that ends with no word (FM-113).
+                self._set_outcome(f"{plugin}: {type(exc).__name__}: {_one_line(exc)}")
+                return
             doc = RunDocument.load_or_new(self._run_doc)
             check_ready(
                 entry.plugin,
@@ -697,6 +725,9 @@ class PlatePage:
             with self._lock:
                 self._outcome = outcome
                 self._current_run = None
+                # After the activity's own writes (a run's record is on disk by now),
+                # so a session that sees the count change reads them.
+                self._ended += 1
             log.info("%s", outcome)
 
     def _run_plugin(

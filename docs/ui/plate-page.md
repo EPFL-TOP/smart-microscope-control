@@ -150,8 +150,9 @@ on another stand and ` (dry run)` when it was one, then the result's values, two
 spaces in, a line each (a text cut at 80 characters, a list or an object only counted,
 at most eight, then `… n more`), then what the result **assumed** and the error. A tool
 whose last run was stopped or failed shows its status and its error and **no values**:
-they are not a result. The card follows the run document, so it is drawn when a run
-ends and when you press **Refresh**, not every second.
+they are not a result. The card follows the run document, so it is drawn, in every
+tab, when a run or a snap ends (a tool that takes less than a second included) and when
+you press **Refresh**, not every second.
 
 **Run starts a stage afresh, and never continues one.** After STOP (or a failure) a
 stage's record is `stopped` or `failed`, the checklist says `run it again`, and the page's

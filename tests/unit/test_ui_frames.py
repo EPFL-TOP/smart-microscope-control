@@ -34,7 +34,13 @@ def test_display_keeps_the_cameras_orientation() -> None:
 
 @pytest.mark.parametrize(
     ("shape", "expected"),
-    [((512, 2048), (256, 1024)), ((1200, 1200), (600, 600)), ((300, 700), (300, 700))],
+    [
+        ((512, 2048), (256, 1024)),
+        ((2048, 512), (1024, 256)),
+        ((1500, 700), (750, 350)),
+        ((1200, 1200), (600, 600)),
+        ((300, 700), (300, 700)),
+    ],
 )
 def test_display_strides_a_large_frame_to_at_most_max_side(
     shape: tuple[int, int], expected: tuple[int, int]
@@ -87,6 +93,19 @@ def test_a_bit_depth_the_dtype_cannot_hold_falls_back_to_its_maximum(
     # An 8-bit frame's maximum is 255, whatever the camera claims.
     eight = np.full((6, 10), 255, dtype=np.uint8)
     assert (display_image(eight, bit_depth=16) == 255).all()
+
+
+def test_the_stretch_is_between_the_half_and_the_ninety_nine_and_a_half_percentile() -> (
+    None
+):
+    # 0..999 on 25 x 40: the 0.5 and 99.5 percentiles are 4.995 and 994.005, so a
+    # value v is shown as floor((v - 4.995) * 255 / 989.01), worked out by hand. The
+    # pixels are chosen so that 5/95, 1/99, 0.5/99 and 0/100 each give another grey.
+    image = np.arange(1000, dtype=np.uint16).reshape(25, 40)
+    shown = display_image(image, bit_depth=16)
+    pinned = [(0, 0), (5, 0), (250, 63), (500, 127), (750, 192), (994, 254), (999, 255)]
+    for value, grey in pinned:
+        assert shown[value // 40, value % 40] == grey, value
 
 
 def test_a_frame_with_a_range_is_stretched_between_its_percentiles() -> None:

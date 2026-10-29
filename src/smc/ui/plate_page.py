@@ -591,9 +591,21 @@ class PlatePageView:
             self.refresh()
 
     def _shared_state(self) -> tuple[Any, ...]:
-        """What the controller holds that every tab draws: compared, never rebuilt."""
+        """What the controller holds that every tab draws: compared, never rebuilt.
+
+        ``activities_ended`` is there for the tab that did not start a tool: one that
+        ends between two of its ticks is never seen running, and its result card,
+        the checklist and the blocked tools are new all the same (FM-151).
+        """
         page = self.page
-        return (page.plate, page.selection, page.refs, page.walls, page.current)
+        return (
+            page.plate,
+            page.selection,
+            page.refs,
+            page.walls,
+            page.current,
+            page.activities_ended,
+        )
 
     def refresh(self) -> None:
         """Read the run document again and redraw the map, the route and the checklist."""

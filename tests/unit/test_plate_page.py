@@ -105,6 +105,21 @@ class SlowScan:
         return NoResult()
 
 
+class QuickTool:
+    """A tool that ends at once: no tick of another tab can fall inside its run."""
+
+    name = provides = "quick"
+    summary = "A test plugin that ends at once."
+    Params = NoParams
+    Result = NoResult
+    requires: tuple[type, ...] = ()
+    reads: tuple[str, ...] = ()
+    reads_optional: tuple[str, ...] = ()
+
+    def run(self, microscope: Any, params: NoParams, ctx: RunContext) -> NoResult:
+        return NoResult()
+
+
 def _entry_points(*names: str) -> list[EntryPoint]:
     found = [EntryPoint(name=n, value=REAL[n], group=GROUP) for n in names]
     found.append(EntryPoint(name="scan", value=f"{__name__}:SlowScan", group=GROUP))
@@ -338,6 +353,55 @@ def test_a_snap_is_drawn_by_the_next_tick_flipped_and_at_the_frames_size(
     assert view.tabs.active == 1
     # The models with a frame in them still build, with the image tab active.
     assert view.layout.get_root() is not None
+
+
+def test_a_flat_frame_is_drawn_against_the_cameras_own_bit_depth(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # A saturated 12-bit frame is white and a mid-grey one is mid-grey: the camera's
+    # bit depth reaches `display_image`, or 4095 of 16 bits would be near black.
+    camera = FrameCamera(np.full((6, 10), 4095, dtype=np.uint16), bit_depth=12)
+    fake_microscope.override(Camera, camera)
+    view = PlatePageView(page)
+    _snap_and_draw(view, page)
+    assert (view.image_source.data["image"][0] == 255).all()
+    camera.frame = np.full((6, 10), 2048, dtype=np.uint16)
+    _snap_and_draw(view, page)
+    assert (view.image_source.data["image"][0] == 127).all()
+    camera.frame = np.zeros((6, 10), dtype=np.uint16)
+    _snap_and_draw(view, page)
+    assert (view.image_source.data["image"][0] == 0).all()
+
+
+def test_the_centre_has_a_plate_tab_and_an_image_tab_drawn_only_when_seen(
+    page: PlatePage,
+) -> None:
+    view = PlatePageView(page)
+    assert list(view.tabs._names) == ["Plate", "Image"]
+    # Only the active tab is rendered, so a figure is never laid out hidden.
+    assert view.tabs.dynamic is True
+    assert view.tabs.active == 0
+
+
+def test_a_tool_that_ends_between_two_ticks_of_another_tab_is_drawn_there_too(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    quick = EntryPoint(name="quick", value=f"{__name__}:QuickTool", group=GROUP)
+    controller = PlatePage(fake_microscope, run_doc, entry_points=[quick])
+    try:
+        first = PlatePageView(controller)
+        second = PlatePageView(controller)
+        second.tick()
+        assert second.tool_cards["quick"].object == ""
+        first.on_run("quick")
+        assert controller.join(10.0)
+        # The run was over before `second` looked: it was never seen running.
+        second.tick()
+        first.tick()
+        assert first.tool_cards["quick"].object.startswith("done ")
+        assert second.tool_cards["quick"].object == first.tool_cards["quick"].object
+    finally:
+        controller.close()
 
 
 def test_the_axes_are_the_frames_own_pixels_at_any_stride(
