@@ -414,6 +414,89 @@ def test_ctrl_c_outside_a_move_leaves_no_note() -> None:
     assert stop_notes(interrupted.value) == ()
 
 
+_STILL_BUSY = "; it still reads busy, so it counts as moving until it is idle"
+_DECLARES = (
+    "; the profile declares this refusal ([safety] stop_refused_by), so a move "
+    "under way runs to its target"
+)
+
+
+_CAUSES = [
+    pytest.param("ctrl-c", "KeyboardInterrupt", id="ctrl-c"),
+    pytest.param("timeout", "0.05 s timeout", id="timeout"),
+]
+
+
+def _give_up_line(
+    caplog: pytest.LogCaptureFixture,
+    profile: Profile,
+    *,
+    ctrl_c: bool,
+    refused: tuple[str, ...] = ("XY", "Z"),
+) -> str:
+    """The WARNING a give-up writes for XY's stop, after a move left busy.
+
+    Ended by a Ctrl-C at the first busy poll, or by the move's 50 ms timeout.
+    """
+    micromanager = profile.micromanager.model_copy(update={"device_timeout_ms": 50})
+    profile = profile.model_copy(update={"micromanager": micromanager})
+    with _stand(profile, refused=refused) as (core, microscope):
+        core.busy_devices = {"XY"}
+        undo = _interrupt_the_first_busy_poll(core) if ctrl_c else None
+        try:
+            with (
+                caplog.at_level(logging.WARNING, logger=LOGGER),
+                pytest.raises((KeyboardInterrupt, HardwareError)),
+            ):
+                microscope.require(XYStage).move_to_um(10.0, 0.0)
+        finally:
+            if undo is not None:
+                undo()
+    (line,) = [m for m in caplog.messages if m.startswith("xy_stage XY: stop after")]
+    return line
+
+
+@pytest.mark.parametrize(("cause", "why"), _CAUSES)
+def test_the_give_up_line_on_a_declared_role_says_the_move_runs_to_its_target(
+    cause: str, why: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The CLI line said it; the log contradicted it by naming the failure alone
+    # (#224 item 2). Order: the failure, the declaration, the busy note.
+    line = _give_up_line(
+        caplog, _declared(Role.xy_stage, Role.focus), ctrl_c=cause == "ctrl-c"
+    )
+    assert line == (
+        f"xy_stage XY: stop after {why} failed (HardwareError({_XY_REFUSED!r}))"
+        f"{_DECLARES}{_STILL_BUSY}"
+    )
+
+
+@pytest.mark.parametrize(("cause", "why"), _CAUSES)
+def test_the_give_up_line_on_an_undeclared_role_has_no_declaration_note(
+    cause: str, why: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    line = _give_up_line(caplog, Profile.demo(), ctrl_c=cause == "ctrl-c")
+    assert line == (
+        f"xy_stage XY: stop after {why} failed (HardwareError({_XY_REFUSED!r}))"
+        f"{_STILL_BUSY}"
+    )
+
+
+@pytest.mark.parametrize(("cause", "why"), _CAUSES)
+def test_the_give_up_line_of_an_accepted_stop_on_a_declared_role_has_no_refusal_note(
+    cause: str, why: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A firmware that took the stop of a role the profile declares refused: the
+    # declaration is a statement about a stop that raised, and this one did not.
+    line = _give_up_line(
+        caplog,
+        _declared(Role.xy_stage, Role.focus),
+        ctrl_c=cause == "ctrl-c",
+        refused=(),
+    )
+    assert line == f"xy_stage XY: stop after {why}{_STILL_BUSY}"
+
+
 def test_a_second_ctrl_c_inside_the_stop_is_noted_as_interrupted() -> None:
     with _stand() as (core, microscope):
         core.busy_devices = {"XY"}

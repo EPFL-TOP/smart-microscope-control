@@ -1571,6 +1571,19 @@ class Executor:
             note = "; it still reads busy"
         return f"{note}, so it counts as moving until it is idle"
 
+    def _give_up_note(
+        self, motion: Motion, registration: _Registration, failed: bool
+    ) -> str:
+        """The note on a give-up's line: the declaration of a failed stop, then the busy note.
+
+        The CLI line says that a move on a declared role runs to its target,
+        so the log must not name the failure alone (#224). The registration
+        is checked in every case: ``_keep_while_moving`` drops it once the
+        device reads idle, and the line is written whatever it answers.
+        """
+        declared = _DECLARED_LINE_NOTE if failed and motion.stop_refused else ""
+        return declared + self._keep_while_moving(motion, registration)
+
     def _track(self, motion: Motion) -> _Registration:
         registration = _Registration(motion)
         with self._registry_lock:
@@ -1643,7 +1656,7 @@ class Executor:
         error = self._send_safe(
             send,
             f"{motion.name}: stop after {why}",
-            then=lambda _: self._keep_while_moving(motion, registration),
+            then=lambda failed: self._give_up_note(motion, registration, failed),
         )
         try:
             if error is None:
