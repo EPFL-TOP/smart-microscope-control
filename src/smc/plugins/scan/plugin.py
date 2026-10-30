@@ -6,21 +6,33 @@ encoding) is ``algorithm.py``. This is the loop, and the decisions in it that
 keep a night's scan from producing frames nobody can trust:
 
 * **Everything that can be checked is checked before anything moves** (FM-30):
-  the checkpoint being resumed and its files, every frame's path, the objective
-  in place, the camera's frame and pixel size against the plan's, the
-  autofocus, the free disk. A refusal leaves the stage where it was and writes
-  no file.
+  the checkpoint being resumed and its files, the plan's field of view, every
+  frame's path (resolved once, here; on Windows, its length while it is
+  written), the objective in place, the camera's frame and pixel size against
+  the plan's, the autofocus, the free disk. A refusal leaves the stage where it
+  was and writes no file.
 * **The stand is checked again at both ends of every well.** A turret turned
   by hand, a binning changed, the magnifier lever moved (FM-103) make every
   later frame the wrong size for the plan's matrix: the scan ends, and the
   checkpoint keeps only the wells whose stand was the same from first to last
   field.
 * **An autofocus switched off during the scan stays off.** A lost lock is
-  engaged again once per field; one the operator switched off is not, and its
+  engaged again once per field, and so is the scan's own failed engage (one
+  that raised too, FM-129); one the operator switched off is not, and its
   fields are counted as unlocked.
+* **A move that returned is not a move that arrived** (FM-167). The readback is
+  compared with the target, on both axes, before the autofocus, Z or the
+  camera are touched: a field that landed off target is a failed field, not a
+  frame of the wrong place. A dry run's readback is the target, so it is not
+  compared.
 * **A field that fails is recorded and skipped; a halt is not a failure**
   (FM-64). ``max_failed_in_row`` failures in a row end the scan: a stage that
-  refuses every move must not read as a scan of failed fields.
+  refuses every move must not read as a scan of failed fields. A scan that ends
+  with no frame at all is a failure too (FM-166), not a ``done`` that ``cells``
+  refuses hours later.
+* **A frame that cannot be written ends the scan** as a ``PluginRunError`` that
+  names the frame and says what to do (a file a viewer holds open, a full disk,
+  a share that dropped), with the checkpoint keeping the wells done.
 * **The autofocus is used only as the operator left it.** One the operator
   left off is never engaged, and one that is on must have locked on this
   sample: engaging drives Z to the plane of whatever offset is stored (#205),
@@ -193,7 +205,8 @@ class ScanPlugin:
             PluginRunError: A check before the scan refused it (nothing moved);
                 the stand changed at a well; ``max_failed_in_row`` fields
                 failed or ``max_unlocked_in_row`` would not lock in a row; a
-                frame came back in another shape; a frame could not be
+                frame came back in another shape; every field failed (a scan
+                with no frame at all); a frame could not be
                 written (a full disk, a share that dropped or a file a
                 viewer holds open is not a field's fault). The checkpoint
                 keeps the wells done.
