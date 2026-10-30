@@ -54,7 +54,7 @@ from smc.run.document import (
 if TYPE_CHECKING:
     from smc.hardware.microscope import Microscope
 
-__all__ = ["check_ready", "run_plugin"]
+__all__ = ["check_ready", "reachable_checkpoint", "run_plugin"]
 
 log = logging.getLogger("smc.plugins.runner")
 
@@ -120,6 +120,41 @@ def check_ready(
             f"{name} read its inputs from an earlier run, so its checkpoint no "
             f"longer matches them; run it without --resume",
         )
+
+
+def reachable_checkpoint(
+    name: str, doc: RunDocument, *, profile: str, dry_run: bool
+) -> StageStatus | None:
+    """The status of ``name``'s record when a run afresh would drop a checkpoint ``--resume`` can reach.
+
+    A page that has no ``--resume`` must not start a stopped stage over the work
+    the stop saved (#252): an hours-long scan is lost by one click, and no command
+    brings it back. It protects only what ``--resume`` could continue, so it uses
+    the three tests of ``check_ready`` that need no ``params`` (the profile, a
+    dry run's checkpoint for a real run, a stale record); a checkpoint that
+    ``--resume`` would refuse anyway is replaced as it always was. The parameters
+    are not compared: a stage stopped on purpose is lost by a changed ``step`` as
+    surely as by an unchanged one. ``running`` is not covered: it is the run
+    itself, or a process that died, and ``unusable`` already says so.
+
+    It touches neither hardware nor files, like ``check_ready``.
+
+    Returns:
+        ``StageStatus.stopped`` or ``StageStatus.failed``, or ``None`` when there
+        is no such record, no checkpoint, or ``--resume`` would refuse it.
+    """
+    record = doc.stages.get(name)
+    if (
+        record is None
+        or record.status not in (StageStatus.stopped, StageStatus.failed)
+        or record.checkpoint is None
+        or record.profile != profile
+        or (record.dry_run and not dry_run)
+        # The dearest test last: it walks what the record read.
+        or doc.is_stale(name)
+    ):
+        return None
+    return record.status
 
 
 def run_plugin(

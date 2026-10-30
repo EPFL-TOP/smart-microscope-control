@@ -41,7 +41,7 @@ from smc.plugins.errors import (
     ResumeError,
     UpstreamError,
 )
-from smc.plugins.runner import check_ready, run_plugin
+from smc.plugins.runner import check_ready, reachable_checkpoint, run_plugin
 from smc.run import (
     ReadRecord,
     RunDocument,
@@ -1029,6 +1029,125 @@ def test_check_ready_reports_the_first_unusable_read_in_the_order_of_reads() -> 
     with pytest.raises(UpstreamError) as raised:
         _check(_doc(), Two())
     assert raised.value.slot == "first"
+
+
+def _with_checkpoint(
+    status: StageStatus, *, checkpoint: dict[str, Any] | None = None, **kw: Any
+) -> StageRecord:
+    """A ``resumable`` record as a stop or a failure left it, with its checkpoint."""
+    return _done_record("resumable", status=status, **kw).model_copy(
+        update={
+            "params": {"n": 1},
+            "result": None,
+            "checkpoint": {"done": 1} if checkpoint is None else checkpoint,
+        }
+    )
+
+
+def _reachable(record: StageRecord | None, **kw: Any) -> StageStatus | None:
+    return reachable_checkpoint(
+        "resumable",
+        _doc() if record is None else _doc(record),
+        profile=kw.pop("profile", "demo"),
+        dry_run=kw.pop("dry_run", False),
+    )
+
+
+@pytest.mark.parametrize("status", [StageStatus.stopped, StageStatus.failed])
+def test_reachable_checkpoint_names_the_status_of_a_stopped_or_failed_stage_with_a_checkpoint(
+    status: StageStatus,
+) -> None:
+    assert _reachable(_with_checkpoint(status)) is status
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        pytest.param(None, id="no-record"),
+        pytest.param(_with_checkpoint(StageStatus.done), id="done"),
+        pytest.param(_with_checkpoint(StageStatus.running), id="running"),
+        pytest.param(
+            _done_record("resumable", status=StageStatus.stopped), id="no-checkpoint"
+        ),
+    ],
+)
+def test_reachable_checkpoint_is_none_where_there_is_nothing_to_continue(
+    record: StageRecord | None,
+) -> None:
+    # `done` clears its checkpoint, a `running` record is the run itself or a
+    # process that died (`unusable` already says so), and no checkpoint is no work.
+    assert _reachable(record) is None
+
+
+def test_reachable_checkpoint_ignores_a_checkpoint_resume_would_refuse() -> None:
+    # One case each of the three tests `check_ready` makes without the parameters:
+    # a checkpoint nothing can reach is not protected, it is replaced as today.
+    stopped = _with_checkpoint(StageStatus.stopped)
+    assert _reachable(stopped.model_copy(update={"profile": "other"})) is None
+    assert _reachable(stopped.model_copy(update={"dry_run": True})) is None
+    origin = _done_record("origin", minute=1)  # attempt origin-1
+    stale = stopped.model_copy(
+        update={"reads": {"origin": ReadRecord(plugin="origin", attempt="origin-0")}}
+    )
+    assert (
+        reachable_checkpoint(
+            "resumable", _doc(origin, stale), profile="demo", dry_run=False
+        )
+        is None
+    )
+    # The same record against the current attempt is not stale, so it is reachable.
+    current = stopped.model_copy(
+        update={"reads": {"origin": ReadRecord(plugin="origin", attempt="origin-1")}}
+    )
+    assert (
+        reachable_checkpoint(
+            "resumable", _doc(origin, current), profile="demo", dry_run=False
+        )
+        is StageStatus.stopped
+    )
+
+
+def test_reachable_checkpoint_of_a_dry_run_is_reachable_by_a_dry_run_only() -> None:
+    # The other way round is harmless (check_ready allows it): a dry run's record
+    # with a dry run now is still the operator's work to continue.
+    dry = _with_checkpoint(StageStatus.stopped, dry_run=True)
+    assert _reachable(dry, dry_run=True) is StageStatus.stopped
+    assert _reachable(dry, dry_run=False) is None
+    real = _with_checkpoint(StageStatus.stopped)
+    assert _reachable(real, dry_run=True) is StageStatus.stopped
+
+
+def test_reachable_checkpoint_agrees_with_what_resume_accepts() -> None:
+    # The refusal protects what `--resume` could continue and nothing else: for the
+    # same document, a checkpoint is reachable exactly when `check_ready(resume=True)`
+    # with the stage's own parameters accepts it.
+    stopped = _with_checkpoint(StageStatus.stopped)
+    origin = _done_record("origin", minute=1)  # attempt origin-1
+    stale = stopped.model_copy(
+        update={"reads": {"origin": ReadRecord(plugin="origin", attempt="origin-0")}}
+    )
+    docs = [
+        _doc(stopped),
+        _doc(stopped.model_copy(update={"status": StageStatus.failed})),
+        _doc(stopped.model_copy(update={"status": StageStatus.done})),
+        _doc(stopped.model_copy(update={"profile": "other"})),
+        _doc(stopped.model_copy(update={"dry_run": True})),
+        _doc(origin, stale),
+    ]
+    agreed: list[bool] = []
+    for doc in docs:
+        try:
+            _check(doc, Resumable(), resume=True)
+            resumable = True
+        except ResumeError:
+            resumable = False
+        reachable = reachable_checkpoint(
+            "resumable", doc, profile="demo", dry_run=False
+        )
+        assert (reachable is not None) is resumable
+        agreed.append(resumable)
+    # Both answers occur: a parity of two constants would prove nothing.
+    assert agreed == [True, True, False, False, False, False]
 
 
 # --- context -----------------------------------------------------------------
