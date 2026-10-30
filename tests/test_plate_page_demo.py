@@ -27,7 +27,11 @@ from smc.plugins.slots import PlateResult
 from smc.run import StageRecord, StageStatus, write_stage
 from smc.ui.controller import PlatePage
 
-pytestmark = pytest.mark.demo
+pytestmark = [
+    pytest.mark.demo,
+    # A failure a handler swallowed fails the test that did not expect it (#277).
+    pytest.mark.usefixtures("handler_failures"),
+]
 
 GOTO_WELL = EntryPoint(
     name="goto-well", value="smc.plugins.goto_well:GotoWellPlugin", group=GROUP

@@ -305,6 +305,16 @@ without a line in `_CHECKLIST`.
   profile is always told: a card never claims to be this stand's.
 - **Tools under `More`** are sections like the others, in a last `Accordion`
   card.
+- **Every handler is registered through `PlatePageView._handler`** (#277): it
+  runs inside `pn.io.unlocked()`, and what it raises is the page's message
+  (`that action failed on the page: <Exc>: <text> (see the server's log)`, the
+  text cut to 300 characters), never only a traceback on the console. Panel runs
+  a handler without the session's document lock when an event flushes a change
+  it had queued (the Enter of a text field; a Run click right after a typed
+  field), and the page's own Bokeh models are then written outside the lock
+  (FM-171). The periodic `tick` and `frame_tick` are Bokeh callbacks, run
+  locked, and are not wrapped; a method called directly, as the tests do,
+  still raises.
 
 Measured 2026-10-29 on a throwaway prototype (not committed), Panel 1.10.0 /
 Bokeh 3.10.1 / Python 3.13.0 and Panel 1.9.4 / Bokeh 3.9.2 / Python 3.10.10,
