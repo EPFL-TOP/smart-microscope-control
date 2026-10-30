@@ -65,6 +65,7 @@ from smc.plugins import (
     parse_params,
     run_plugin,
 )
+from smc.plugins.runner import reachable_checkpoint
 from smc.plugins.scan_plan.wells import parse_wells
 from smc.plugins.slots import (
     DensityResult,
@@ -249,7 +250,9 @@ class PlateView:
 
     ``nominal`` is true when the wells are those of the plate type with A1 at
     (0, 0) and no rotation, not a registered plate. ``blocked`` maps a registered
-    tool to why it cannot run now. ``problems`` are what ``view()`` could not read
+    tool to why it cannot run now: what it reads, what the stand lacks, or a
+    stopped or failed run's checkpoint that ``smc run --resume`` could continue
+    (``run()`` refuses to start such a stage afresh). ``problems`` are what ``view()`` could not read
     and did not hide. ``cards`` has one card for each tool that has a record in
     the run document, and none for the others.
     """
@@ -311,6 +314,22 @@ def _one_line(error: BaseException) -> str:
         Exception
     ):  # a message that cannot be printed is not worth losing the outcome
         return ""
+
+
+def _checkpoint_reason(name: str, status: StageStatus) -> str:
+    """Why the page will not start ``name`` afresh, and the command that continues it (m3 §15.3).
+
+    The page has no Resume (``smc run --resume`` is the way in M3), so a stage the
+    operator stopped, or that failed, with a checkpoint would be lost by one click
+    on Run. No path is named: the run document is the one this page was started
+    with, and the command needs ``--run-doc`` whatever the text says. ``smc run``
+    without ``--resume`` is the deliberate way to give the checkpoint up.
+    """
+    return (
+        f"{status.value} with a checkpoint: continue it with `smc run {name} "
+        f"--resume` (close this page first); `smc run {name}` without --resume "
+        f"starts afresh and drops it"
+    )
 
 
 def _autofocus_words(engaged: bool | None, locked: bool | None) -> str:
@@ -682,11 +701,19 @@ class PlatePage:
         <message>``); nothing is written and no thread starts. What the run does is
         shown by ``status()``.
 
+        The page never starts a stage afresh over a checkpoint that ``smc run
+        --resume`` could still continue (#252): a stage whose record is ``stopped``
+        or ``failed`` with such a checkpoint is the outcome ``<plugin>: <status>
+        with a checkpoint: continue it with ...``, and nothing is written. It is
+        not an exception, and ``view().blocked`` says the same beforehand.
+
         Raises:
             RuntimeError: A run is going (``<plugin> is running``), or the page is
                 closed.
         """
         self._refuse_if_busy()
+        profile = self._microscope.profile.microscope.name
+        dry_run = self._microscope.dry_run
         try:
             entry = load(plugin, self._entry_points)
             try:
@@ -707,13 +734,21 @@ class PlatePage:
                 entry.plugin,
                 doc,
                 parsed,
-                profile=self._microscope.profile.microscope.name,
-                dry_run=self._microscope.dry_run,
+                profile=profile,
+                dry_run=dry_run,
                 resume=False,
+            )
+            # After the checks that say a run cannot start at all, so that a stage
+            # which cannot run says that first (the order of `view().blocked`).
+            kept = reachable_checkpoint(
+                entry.plugin.name, doc, profile=profile, dry_run=dry_run
             )
         except (PluginError, RunDocumentError) as exc:
             # Text, never the error (FM-98).
             self._set_outcome(f"{plugin}: {type(exc).__name__}: {_one_line(exc)}")
+            return
+        if kept is not None:
+            self._set_outcome(f"{plugin}: {_checkpoint_reason(plugin, kept)}")
             return
         self._start_activity(
             plugin, lambda event: self._run_plugin(plugin, entry, parsed, event)
@@ -1540,8 +1575,16 @@ class PlatePage:
         return tuple(items)
 
     def _blocked(self, doc: RunDocument) -> dict[str, str]:
-        """Why each registered tool cannot run now; a tool that can is absent."""
+        """Why each registered tool cannot run now; a tool that can is absent.
+
+        The reasons, in the order the first that applies wins: what the tool
+        reads, what it requires of the stand, and last a checkpoint that ``smc run
+        --resume`` could continue (#252), which ``run()`` refuses to drop. A tool
+        that cannot run at all says so before it offers a way to continue.
+        """
         blocked: dict[str, str] = {}
+        profile = self._microscope.profile.microscope.name
+        dry_run = self._microscope.dry_run
         for name, entry in self._registry().plugins.items():
             reason = next(
                 (r for r in (self._unusable(doc, s) for s in entry.plugin.reads) if r),
@@ -1556,6 +1599,10 @@ class PlatePage:
                     ),
                     None,
                 )
+            if reason is None:
+                kept = reachable_checkpoint(name, doc, profile=profile, dry_run=dry_run)
+                if kept is not None:
+                    reason = _checkpoint_reason(name, kept)
             if reason is not None:
                 blocked[name] = reason
         return blocked

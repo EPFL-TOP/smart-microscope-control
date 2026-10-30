@@ -111,6 +111,16 @@ class SlowScan:
         return NoResult()
 
 
+class CheckpointingScan(SlowScan):
+    """A ``scan`` that saves a checkpoint, then waits for the stop: a scan after its first well."""
+
+    def run(self, microscope: Any, params: NoParams, ctx: RunContext) -> NoResult:
+        ctx.save_checkpoint(NoResult())
+        SlowScan.started.set()
+        while True:
+            ctx.wait_s(0.05)
+
+
 class QuickTool:
     """A tool that ends at once: no tick of another tab can fall inside its run."""
 
@@ -1450,6 +1460,41 @@ def test_a_blocked_tool_is_disabled_with_its_reason(page: PlatePage) -> None:
     assert not view.tool_runs["plate-registration"].disabled
     assert view.tool_notes["plate-registration"].object == ""
     assert not view.tool_runs["scan"].disabled
+
+
+def test_the_run_button_of_a_stopped_stage_is_disabled_with_the_resume_command(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # #252: a Run after STOP would start the scan afresh and drop its checkpoint.
+    scan = EntryPoint(name="scan", value=f"{__name__}:CheckpointingScan", group=GROUP)
+    page = PlatePage(fake_microscope, run_doc, entry_points=[scan])
+    try:
+        view = PlatePageView(page)
+        assert not view.tool_runs["scan"].disabled
+        assert view.tool_notes["scan"].object == ""
+        view.on_run("scan")
+        assert SlowScan.started.wait(5)
+        view.on_stop()
+        assert page.join(10.0)
+        # The end of the run redraws the view: the button is disabled by that tick,
+        # not only after a Refresh.
+        view.tick()
+        assert view.tool_runs["scan"].disabled
+        assert view.tool_notes["scan"].object == (
+            "stopped with a checkpoint: continue it with `smc run scan --resume` "
+            "(close this page first); `smc run scan` without --resume starts afresh "
+            "and drops it"
+        )
+        # A click that gets through anyway (a stale tab) is refused by the controller
+        # and the record is what the stop left.
+        stopped = run_doc.read_bytes()
+        view.on_run("scan")
+        assert view.run_text.object.startswith(
+            "scan: stopped with a checkpoint: continue it with `smc run scan --resume`"
+        )
+        assert run_doc.read_bytes() == stopped
+    finally:
+        page.close()
 
 
 def test_a_running_tool_disables_every_run_button_until_it_ends(

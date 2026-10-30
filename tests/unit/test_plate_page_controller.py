@@ -254,6 +254,18 @@ class FailsOnStop(Slow):
             raise PluginRunError("fails", "the move was stopped") from None
 
 
+class Saves(Slow):
+    """Saves a checkpoint, then waits for the stop: what a scan does after its first well."""
+
+    name = provides = "saves"
+
+    def run(self, microscope: Any, params: NoParams, ctx: RunContext) -> StubResult:
+        ctx.save_checkpoint(StubResult(n=1))
+        Slow.started.set()
+        while True:
+            ctx.wait_s(0.05)
+
+
 class StubScan(Stub):
     """Registered as ``scan``, and needs an XY stage."""
 
@@ -335,8 +347,15 @@ def _seed(
     minute: int = 0,
     profile: str = "demo",
     dry_run: bool = False,
+    checkpoint: dict[str, Any] | None = None,
+    reads: dict[str, ReadRecord | None] | None = None,
 ) -> None:
-    """A record as an earlier run of ``plugin`` left it; ``minute`` orders the starts."""
+    """A record as an earlier run of ``plugin`` left it; ``minute`` orders the starts.
+
+    ``reads`` names the attempt of each slot the record read (``a<minute>`` of
+    the provider): a record that read an older attempt than the current one is
+    stale.
+    """
     then = T0 + timedelta(minutes=minute)
     write_stage(
         run_doc,
@@ -352,6 +371,8 @@ def _seed(
             smc_version="0",
             params=params or {},
             result=None if result is None else result.model_dump(mode="json"),
+            checkpoint=checkpoint,
+            reads=reads or {},
         ),
     )
 
@@ -566,6 +587,135 @@ def test_run_refuses_an_unreadable_run_document_and_leaves_it_alone(
     )
     assert run_doc.read_bytes() == b"not json"
     assert page.status().running is None
+
+
+def _checkpoint_text(name: str, status: str) -> str:
+    """What the page says of a stage it will not start afresh (m3 §15.3), written out."""
+    return (
+        f"{status} with a checkpoint: continue it with `smc run {name} --resume` "
+        f"(close this page first); `smc run {name}` without --resume starts afresh "
+        f"and drops it"
+    )
+
+
+def test_run_refuses_a_stage_stopped_with_a_checkpoint_and_says_how_to_resume(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # #252: one click after STOP must not drop the work the stop saved, and no
+    # command brings it back.
+    _seed(run_doc, "stub", "stub", status=StageStatus.stopped, checkpoint={"done": 1})
+    before = run_doc.read_bytes()
+    threads = threading.active_count()
+    page.run("stub", [])
+    assert page.status().outcome == f"stub: {_checkpoint_text('stub', 'stopped')}"
+    assert run_doc.read_bytes() == before
+    assert Stub.seen == []
+    assert page.status().running is None
+    assert page.activities_ended == 0
+    assert threading.active_count() == threads
+
+
+def test_a_failed_stage_with_a_checkpoint_is_refused_too(
+    page: PlatePage, run_doc: Path
+) -> None:
+    _seed(run_doc, "stub", "stub", status=StageStatus.failed, checkpoint={"done": 1})
+    before = run_doc.read_bytes()
+    page.run("stub", [])
+    assert page.status().outcome == f"stub: {_checkpoint_text('stub', 'failed')}"
+    assert run_doc.read_bytes() == before
+    assert Stub.seen == []
+
+
+@pytest.mark.parametrize("case", ["another-profile", "a-dry-run", "stale"])
+def test_a_checkpoint_resume_would_refuse_does_not_block_a_run(
+    page: PlatePage, run_doc: Path, case: str
+) -> None:
+    # Nothing is lost by replacing what no command can reach: the run goes on, as
+    # `smc run` without --resume does.
+    name = "stub"
+    checkpoint = {"done": 1}
+    if case == "stale":
+        name = "reader"
+        _seed(run_doc, "up", "up", minute=0)
+        _seed(
+            run_doc,
+            "reader",
+            "reader",
+            status=StageStatus.stopped,
+            checkpoint=checkpoint,
+            minute=1,
+            reads={"up": ReadRecord(plugin="up", attempt="a0")},
+        )
+        _seed(run_doc, "up", "up", minute=2)  # produced again since the checkpoint
+    else:
+        _seed(
+            run_doc,
+            "stub",
+            "stub",
+            status=StageStatus.stopped,
+            checkpoint=checkpoint,
+            profile="another" if case == "another-profile" else "demo",
+            dry_run=case == "a-dry-run",
+        )
+    _run_and_join(page, name)
+    record = RunDocument.load(run_doc).stages[name]
+    assert record.status is StageStatus.done
+    assert record.checkpoint is None
+    assert page.status().outcome is not None
+    assert page.status().outcome.startswith(f"{name} done in ")
+
+
+def test_a_stopped_stage_without_a_checkpoint_runs_afresh(
+    page: PlatePage, run_doc: Path
+) -> None:
+    _seed(run_doc, "stub", "stub", status=StageStatus.stopped)
+    _run_and_join(page, "stub")
+    assert RunDocument.load(run_doc).stages["stub"].status is StageStatus.done
+    assert len(Stub.seen) == 1
+
+
+def test_changed_parameters_do_not_lift_the_refusal(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # Decided in m3 §15.3: the form changes between clicks, and the loss is the same.
+    _seed(
+        run_doc,
+        "stub",
+        "stub",
+        status=StageStatus.stopped,
+        params={"n": 1, "names": []},
+        checkpoint={"done": 1},
+    )
+    before = run_doc.read_bytes()
+    page.run("stub", ["n=2"])
+    assert page.status().outcome == f"stub: {_checkpoint_text('stub', 'stopped')}"
+    assert run_doc.read_bytes() == before
+    assert Stub.seen == []
+
+
+def test_a_run_that_stops_on_its_own_page_blocks_the_next_click(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # End to end: the stop is the page's own, and so is the click that follows it.
+    page = _page(fake_microscope, run_doc, [_ep(Saves)])
+    try:
+        page.run("saves", [])
+        assert Slow.started.wait(5)
+        page.stop()
+        assert page.join(10.0)
+        record = RunDocument.load(run_doc).stages["saves"]
+        assert record.status is StageStatus.stopped
+        assert record.checkpoint == StubResult(n=1).model_dump(mode="json")
+        # The end of a run redraws from `view()`: the button is blocked then, not
+        # only after a Refresh.
+        assert page.view().blocked["saves"] == _checkpoint_text("saves", "stopped")
+        stopped = run_doc.read_bytes()
+        page.run("saves", [])
+        assert page.status().outcome == f"saves: {_checkpoint_text('saves', 'stopped')}"
+        assert run_doc.read_bytes() == stopped
+        assert page.activities_ended == 1
+    finally:
+        page.close()
 
 
 def test_a_second_run_while_one_runs_is_refused(page: PlatePage) -> None:
@@ -1446,6 +1596,47 @@ def test_a_blocked_tool_says_what_the_stand_lacks(
     with _replaced(fake_microscope, "has", has):
         assert page.view().blocked == {"scan": "this stand has no XYStage"}
     assert page.view().blocked == {}
+
+
+def test_view_blocks_a_stage_with_a_reachable_checkpoint_after_its_other_reasons(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # A tool that cannot run at all says why first; the checkpoint is the last reason.
+    page = _page(fake_microscope, run_doc, [_ep(StubScan)])
+    for name in ("stub", "scan", "reader"):
+        _seed(run_doc, name, name, status=StageStatus.stopped, checkpoint={"done": 1})
+    blocked = page.view().blocked
+    assert blocked["stub"] == _checkpoint_text("stub", "stopped")
+    assert blocked["scan"] == _checkpoint_text("scan", "stopped")
+    # What it reads comes before the checkpoint: `reader` reads `up`, which is absent.
+    assert blocked["reader"] == (
+        "the run document has no up; smc run --list shows which plugin provides it"
+    )
+
+    def has(capability: type) -> bool:
+        return capability is not XYStage
+
+    # What the stand lacks too: the capability is the reason, not the checkpoint.
+    with _replaced(fake_microscope, "has", has):
+        assert page.view().blocked["scan"] == "this stand has no XYStage"
+    assert page.view().blocked["scan"] == _checkpoint_text("scan", "stopped")
+
+
+def test_view_does_not_block_a_stage_whose_checkpoint_resume_would_refuse(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed(
+        run_doc,
+        "stub",
+        "stub",
+        status=StageStatus.stopped,
+        checkpoint={"done": 1},
+        profile="another",
+    )
+    _seed(run_doc, "failing", "failing", status=StageStatus.done)
+    page = _page(fake_microscope, run_doc)
+    assert "stub" not in page.view().blocked
+    assert "failing" not in page.view().blocked
 
 
 def test_the_view_survives_an_unreadable_run_document(
