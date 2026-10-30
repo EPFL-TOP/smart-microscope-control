@@ -2,8 +2,8 @@
 
 - **Status**: design for issue #28 (§1 to §4, 2026-10-29), as built by #270 and
   settled by #272 (§2.1, §2.4, §3: the stale card, the card's bounds,
-  `card_text`'s signature); the directions of #262, #263 and #264 (§5 to §7),
-  which their plans fix.
+  `card_text`'s signature); live fixed by #262's plan (§5, 2026-10-29); the
+  directions of #263 and #264 (§6, §7), which their plans fix.
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 to M3, this document is the contract between issues.
   Names, module paths and signatures below are fixed; an executor who needs to
@@ -322,7 +322,7 @@ FM-125, FM-139, FM-145, FM-146, FM-147, FM-151, FM-154, FM-136, FM-73 (a
 non-square frame in every image test), FM-44, FM-43, FM-36, FM-37, FM-113 (a
 third-party plugin's `Params` read by `describe_params`).
 
-## 5. Live view (#262) — direction
+## 5. Live view (#262)
 
 - `live` is an activity (§2.1): `PlatePage.live(on: bool) -> None` starts a
   worker that snaps until its event is set and keeps each `Frame` (§2.2), as
@@ -331,6 +331,95 @@ third-party plugin's `Params` read by `describe_params`).
 - The page redraws the image on a second periodic callback of its own, faster
   than the 1 s tick, that does nothing but compare `frame().number` (FM-145);
   the status tick stays at 1 s.
+
+### 5.1 The controller
+
+```python
+#: smc/ui/controller.py
+LIVE_PERIOD_S = 0.1
+
+
+class PlatePage:
+    def live(self, on: bool) -> None: ...
+    @property
+    def is_live(self) -> bool: ...
+```
+
+- **`live(True)`** refuses as `snap` does (`RuntimeError`: `<name> is running`,
+  `the page is closed`; `live is running` when live already goes). A stand
+  without a `Camera` is the outcome `live: this stand has no Camera`, and no
+  thread starts. Otherwise one `_start_activity("live", self._live)`, whose
+  event the page keeps (`_start_activity` returns it).
+- **`live(False)`** sets the event of the live it started, and only that one
+  (compared by identity, never by the name `live`, so a plugin named `live`
+  is not stopped), and returns at once: it never joins and never calls
+  `microscope.stop()` (ending a live view is not an emergency; STOP is). It
+  does nothing when no live goes, after `close()` included, and never raises.
+- **`is_live`** is `True` while the activity going is the live that `live(True)`
+  started: what the page's button reads.
+- **The worker** takes frames through `_take_frame()`, the step `_snap` uses:
+  `_take_frame() -> Frame | str` keeps and returns the `Frame`, or returns
+  the failure as text without a prefix (`the camera returned a ... frame of
+  shape ...; the page shows 2-D uint8 or uint16 frames`, `<Type>: <message on
+  one line>`), so that no exception is kept (FM-98). `_snap` is
+  `snap: <summary>` or `snap: <text>`, as in #28. After each frame the worker
+  puts `Progress(plugin="live", done=<frames>, total=None, message="frames")`
+  on the progress queue, so the run line reads `live: <n> frames` while it goes,
+  and waits on its event for what is left of `LIVE_PERIOD_S` since the frame
+  began (`max(0.0, ...)`): the cap is a period, so a camera slower than 10
+  frames a second runs at its own rate.
+- **Its outcome**: ended by its event (`live(False)`, STOP, `close()`): `live
+  ended: <n> frames in <s:.1f> s` (the rate the owner reads at a stand); a
+  frame that fails ends it: `live ended after <n> frames: <text>`; the last
+  good frame stays `frame()`. A live while the stand is halted ends at its
+  first frame with the facade's refusal, as a snap does.
+
+### 5.2 How live gives way
+
+**A tool's Run and a Snap are refused while live goes** (`live is running`),
+as every activity refuses another (§2.1), and their buttons are disabled; the
+operator ends live with one click. Live is not ended for them:
+
+- an action that silently ends what the operator is watching changes the
+  screen with no word;
+- ending live first means waiting for its worker (up to one exposure, seconds on
+  a dim sample) either in a server callback, on the loop that handles STOP
+  (FM-62, FM-148), or in a chained start with failure cases of its own;
+- the rule costs no code: every button is already disabled while an activity
+  goes (#28).
+
+**A drive action is #263's** (§6): moving the stage and Z while watching is what
+live is for (focusing, finding a field), so #263 decides how a drive action
+reaches the stand while live goes without two threads on the devices (for
+example, the live worker runs a queued drive action between two frames).
+Until #263, a drive click on the map (`goto`) is refused with `live is running`.
+
+### 5.3 The page
+
+```python
+#: smc/ui/plate_page.py
+FRAME_TICK_MS = 100
+
+
+class PlatePageView:
+    live_button: pn.widgets.Button
+
+    def on_live(self) -> None: ...
+    def frame_tick(self) -> None: ...
+```
+
+- **Live** is a button beside Snap. Its label is `Live`, and `End live` while
+  `page.is_live`; it is disabled with `lacks(Camera)`'s note on a stand without
+  a camera, and while an activity other than this live goes. A click calls
+  `page.live(not page.is_live)` (an exception's message is the page's message,
+  FM-98); starting it makes *Image* the active tab; then `tick()`.
+- **`frame_tick()`** calls `_draw_frame()` and nothing else: no `status()`, no
+  `view()`. `build` registers it with `FRAME_TICK_MS` beside the tick
+  (`TICK_MS`, unchanged), so a session has two periodic callbacks, both its
+  own (FM-146). The tick keeps its `_draw_frame()`, which draws nothing when
+  `frame_tick` already drew that number.
+- `FRAME_TICK_MS` matches `LIVE_PERIOD_S`: a faster callback would find no new
+  frame, a slower one would drop frames the camera took.
 - **A live frame is not an ended activity** (#272). `live` is **one** activity
   (§2.1): one `_start_activity("live", …)` and one worker whose loop keeps each
   `Frame` through the step `_snap` uses, and which never calls `snap()` or
@@ -343,13 +432,19 @@ third-party plugin's `Params` read by `describe_params`).
   The plan names the test: the count is the same after several frames of a live
   that goes, and one higher after it ends
   (`test_live_frames_do_not_count_as_ended_activities`).
-- **To decide in its plan**: how live gives way when the operator starts a tool,
-  a snap or a drive action (refused with `live is running`, or live ended first
-  and the action started after its worker has joined), and the redraw period.
+- How live gives way, and the redraw period, are §5.2 and §5.3.
 - Measured here: the demo camera snaps in 10.8 ms (92 frames a second), a frame's
   conversion takes 0.8 ms and a new `source.data` 0.02 ms: nothing on the server
   limits 5 frames a second on the demo. What a browser shows, locally and over
   RDP, is the owner's to measure, and is ADR-0006's revisit criterion for Panel.
+- Measured while planning #262 (2026-10-29, Python 3.13.0, the demo stand, a
+  throwaway subclass of `PlatePage` with §5.1's loop): `_snap`'s step takes
+  10.9 ms, of which `microscope.state()` 0.14 ms; over 2 s, 20 frames at the
+  cap; `activities_ended` unchanged while live goes and one higher after
+  `live(False)`; a snap while live goes refused with `live is running`; STOP and
+  `close()` end it within one period (`close_lines`: the stop note, then `live
+  ended: 3 frames in 0.2 s`). Not measured: `state()` on a real stand, read once
+  per frame, which lowers the rate by what it costs.
 
 ## 6. Drive (#263) — direction
 
@@ -365,7 +460,9 @@ third-party plugin's `Params` read by `describe_params`).
 - **To decide in its plan**: §2.1's rule holds, so each action's end refreshes
   every open tab. A control that repeats while it is held (a jog) is one
   activity per press, or one for the whole hold, as the plan decides, and says
-  which.
+  which. And how a drive action reaches the stand **while live goes** (§5.2):
+  focusing and finding a field are what live is for, so refusing every drive
+  action during live is not an answer.
 
 ## 7. The stand's lifetime and the service (#264) — direction
 
