@@ -96,7 +96,7 @@ from smc.hardware.safety import DEFAULT_MAX_Z_JOG_UM, Executor, Safety
 if TYPE_CHECKING:
     from pymmcore_plus import CMMCorePlus
 
-__all__ = ["CAPABILITY_ROLES", "Microscope", "MicroscopeState"]
+__all__ = ["CAPABILITY_ROLES", "Microscope", "MicroscopeState", "describe_autofocus"]
 
 log = logging.getLogger("smc.hardware.microscope")
 
@@ -705,7 +705,7 @@ class Microscope:
             else:
                 parts.append("shutter open" if state.shutter_open else "shutter closed")
         if self._lookup(Autofocus) is not None:
-            parts.append(_describe_autofocus(state))
+            parts.append(describe_autofocus(state))
         if state.moving:
             parts.append("moving: " + ", ".join(state.moving))
         if state.halted:
@@ -1029,7 +1029,7 @@ def _owned(owner: weakref.ref[Microscope], asked_by: str) -> Microscope:
     return microscope
 
 
-def _describe_autofocus(state: MicroscopeState) -> str:
+def describe_autofocus(state: MicroscopeState) -> str:
     """The status line's autofocus part; ``autofocus ?`` when a read it needs failed."""
     engaged, locked = state.autofocus_engaged, state.autofocus_locked
     if engaged is None:

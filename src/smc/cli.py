@@ -36,6 +36,7 @@ from rich.table import Table
 from rich.text import Text
 
 from smc import __version__
+from smc.drive import xy_text, z_text
 from smc.hardware import core as core_mod
 from smc.hardware.backends import nikon
 from smc.hardware.backends.mm import as_hardware_errors
@@ -191,20 +192,6 @@ def _aligned(rows: Sequence[Sequence[str]]) -> list[str]:
         ).rstrip()
         for row in rows
     ]
-
-
-def _um(value: float) -> str:
-    """Two decimals; a stage that reads ``-0.0`` at the origin shows ``0.00``."""
-    text = f"{value:.2f}"
-    return "0.00" if text == "-0.00" else text
-
-
-def _xy(position: XY) -> str:
-    return f"XY ({_um(position.x_um)}, {_um(position.y_um)}) µm"
-
-
-def _z(z_um: float) -> str:
-    return f"Z {_um(z_um)} µm"
 
 
 # --- errors ------------------------------------------------------------------
@@ -1385,9 +1372,11 @@ def _move_xy(
         # is read again to show that it did not move.
         here = stage.position_um() if dry_run else None
     if here is None:
-        _say(_xy(landed))
+        _say(xy_text(landed))
     else:
-        _say(f"[dry-run] would move to {_xy(landed)}; the stage is at {_xy(here)}")
+        _say(
+            f"[dry-run] would move to {xy_text(landed)}; the stage is at {xy_text(here)}"
+        )
 
 
 def _move_z(
@@ -1408,9 +1397,11 @@ def _move_z(
         landed = move(drive)
         here = drive.position_um() if dry_run else None
     if here is None:
-        _say(_z(landed))
+        _say(z_text(landed))
     else:
-        _say(f"[dry-run] would move to {_z(landed)}; the drive is at {_z(here)}")
+        _say(
+            f"[dry-run] would move to {z_text(landed)}; the drive is at {z_text(here)}"
+        )
 
 
 @stage_app.command("get")
@@ -1418,7 +1409,7 @@ def stage_get(ctx: typer.Context, profile: ProfileOption = DEMO_NAME) -> None:
     """Print where the XY stage reports it is, in µm."""
     with _Reported(ctx), Microscope.open(profile) as microscope:
         position = microscope.require(XYStage).position_um()
-    _say(_xy(position))
+    _say(xy_text(position))
 
 
 @stage_app.command("move", context_settings=_NUMBERS)
@@ -1471,7 +1462,7 @@ def z_get(ctx: typer.Context, profile: ProfileOption = DEMO_NAME) -> None:
     """Print where the focus drive reports it is, in µm."""
     with _Reported(ctx), Microscope.open(profile) as microscope:
         z_um = microscope.require(ZStage).position_um()
-    _say(_z(z_um))
+    _say(z_text(z_um))
 
 
 @z_app.command("move", context_settings=_NUMBERS)
