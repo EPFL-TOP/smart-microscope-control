@@ -967,3 +967,148 @@ def test_close_counts_an_undeclared_refusal_as_a_failure(
     assert warning in caplog.messages
     after = caplog.messages[caplog.messages.index(warning) + 1 :]
     assert after[0].startswith("close: the stop failed for XYStage 'XY' (")
+
+
+# --- what the registry still tracks when the stand is released (m2 §11.11 E6) -----
+
+
+def _xy_stand_that_gives_up_after_50_ms(
+    *, refuses_stop: bool = True
+) -> tuple[FakeCore, Microscope]:
+    """The demo stand, its moves giving up after 50 ms; XY refuses its stop, declared, by default."""
+    core = FakeCore.demo_like()
+    if refuses_stop:
+        core.stop_refused = {"XY"}
+    profile = _declared(Role.xy_stage) if refuses_stop else Profile.demo()
+    micromanager = profile.micromanager.model_copy(update={"device_timeout_ms": 50})
+    stand = Microscope.from_core(
+        cast("CMMCorePlus", core),
+        profile.model_copy(update={"micromanager": micromanager}),
+    )
+    return core, stand
+
+
+def _ctrl_c_in_a_wait_on_a_move_left_tracked(
+    core: FakeCore, microscope: Microscope
+) -> None:
+    """Inside the ``with``: a move times out and stays tracked, then a Ctrl-C lands in ``wait()``.
+
+    The earlier give-up was refused (declared), so the stage reads busy and
+    stays tracked. The wait is no move of its own: it gives up on nothing and
+    notes nothing, which is what #224 item 6 measured (notes ``()``,
+    ``moving()`` ``("xy_stage XY",)``).
+    """
+    stage = microscope.require(XYStage)
+    core.busy_devices = {"XY"}
+    with pytest.raises(HardwareError):
+        stage.move_to_um(10.0, 0.0)
+    assert microscope.state().moving == ("xy_stage XY",)
+    real, polled = core.deviceBusy, list[str]()
+
+    def busy(label: str) -> bool:
+        polled.append(label)
+        if len(polled) == 3:
+            raise KeyboardInterrupt
+        return real(label)
+
+    core.deviceBusy = busy  # type: ignore[method-assign]
+    try:
+        stage.wait(5.0)
+    finally:
+        del core.deviceBusy
+
+
+def test_a_ctrl_c_in_a_wait_on_a_stage_still_tracked_is_noted_when_the_stand_is_released() -> (
+    None
+):
+    core, microscope = _xy_stand_that_gives_up_after_50_ms()
+    with pytest.raises(KeyboardInterrupt) as interrupted, microscope:
+        _ctrl_c_in_a_wait_on_a_move_left_tracked(core, microscope)
+    assert stop_notes(interrupted.value) == (
+        StopNote("xy_stage XY", StopOutcome.still_moving),
+    )
+
+
+def _ctrl_c_in_a_move_left_tracked(core: FakeCore, microscope: Microscope) -> None:
+    """A Ctrl-C in a move on the declared XY: its refused give-up leaves it tracked."""
+    core.busy_devices = {"XY"}
+    undo = _interrupt_the_first_busy_poll(core)
+    try:
+        microscope.require(XYStage).move_to_um(10.0, 0.0)
+    finally:
+        undo()
+
+
+def _a_tool_error_after_a_caught_ctrl_c(core: FakeCore, microscope: Microscope) -> None:
+    with pytest.raises(KeyboardInterrupt):  # a tool that caught an earlier Ctrl-C
+        _ctrl_c_in_a_move_left_tracked(core, microscope)
+    assert microscope.state().moving == ("xy_stage XY",)
+    raise ValueError("a tool's own error")
+
+
+def test_a_move_that_noted_its_own_give_up_is_not_noted_again_at_release() -> None:
+    # The stage reads busy and its stop was refused, so it is still tracked at
+    # the release: only its own note keeps `still_moving` from being added.
+    core, microscope = _xy_stand_that_gives_up_after_50_ms()
+    with pytest.raises(KeyboardInterrupt) as interrupted, microscope:
+        _ctrl_c_in_a_move_left_tracked(core, microscope)
+    assert stop_notes(interrupted.value) == (
+        StopNote("xy_stage XY", StopOutcome.refused),
+    )
+
+
+def test_an_error_that_is_not_an_interrupt_leaves_the_block_with_no_note() -> None:
+    # `still_moving` is for a Ctrl-C only: any other error has its own message,
+    # and the Ctrl-C line is the one that reads the notes.
+    core, microscope = _xy_stand_that_gives_up_after_50_ms()
+    with pytest.raises(ValueError, match="a tool's own error") as failed, microscope:
+        _a_tool_error_after_a_caught_ctrl_c(core, microscope)
+    assert stop_notes(failed.value) == ()
+
+
+def test_a_close_that_raises_still_leaves_the_still_moving_note() -> None:
+    # The note is added in a `finally`: a close() that raises (a busy lock, a
+    # call from inside an action) loses none of it.
+    core, microscope = _xy_stand_that_gives_up_after_50_ms()
+
+    def failing_close() -> None:
+        raise RuntimeError("close failed")
+
+    microscope.close = failing_close  # type: ignore[method-assign]
+    try:
+        with pytest.raises(RuntimeError, match="close failed") as failed, microscope:
+            _ctrl_c_in_a_wait_on_a_move_left_tracked(core, microscope)
+    finally:
+        del microscope.close
+        microscope.close()
+    # The Ctrl-C is the context of close()'s error, and `stop_notes` reads it.
+    assert isinstance(failed.value.__context__, KeyboardInterrupt)
+    assert stop_notes(failed.value) == (
+        StopNote("xy_stage XY", StopOutcome.still_moving),
+    )
+
+
+def test_the_still_moving_note_is_read_before_close_stops_the_stage() -> None:
+    # close() sends the stop and, the device then reading idle, drops the
+    # registration: read after it, the registry would say nothing was tracked.
+    core, microscope = _xy_stand_that_gives_up_after_50_ms(refuses_stop=False)
+    real_stop, xy_stops = core.stop, list[str]()
+
+    def stop(label: str) -> None:
+        real_stop(label)
+        if label == "XY":
+            xy_stops.append(label)
+            if len(xy_stops) > 1:  # close()'s, after the timeout give-up's
+                core.busy_devices.discard("XY")
+
+    core.stop = stop  # type: ignore[method-assign]
+    try:
+        with pytest.raises(KeyboardInterrupt) as interrupted, microscope:
+            _ctrl_c_in_a_wait_on_a_move_left_tracked(core, microscope)
+    finally:
+        del core.stop
+    assert len(xy_stops) == 2  # the give-up's, and close()'s that released it
+    assert core.busy_devices == set()
+    assert stop_notes(interrupted.value) == (
+        StopNote("xy_stage XY", StopOutcome.still_moving),
+    )

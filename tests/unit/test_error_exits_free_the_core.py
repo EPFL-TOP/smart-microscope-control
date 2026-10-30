@@ -45,7 +45,12 @@ from pymmcore_plus import CMMCorePlus
 import smc.cli as cli
 from smc.hardware import Microscope
 from smc.hardware.capabilities import Autofocus, Camera, XYStage, ZStage
-from smc.hardware.errors import HardwareError, SafetyRefusedError, StopRefusedError
+from smc.hardware.errors import (
+    HardwareError,
+    SafetyRefusedError,
+    StopRefusedError,
+    stop_notes,
+)
 from smc.hardware.profile import Profile
 from smc.hardware.roles import Role
 from smc.hardware.safety import Executor, Motion
@@ -662,6 +667,47 @@ def _ctrl_c_inside_the_timeouts_give_up(
     return outcome
 
 
+@_declaring(Role.xy_stage)
+@_timing_out_after(50)
+def _ctrl_c_leaving_the_with_after_a_move_left_tracked(
+    core: FakeCore, microscope: Microscope
+) -> tuple[str, str]:
+    """A move that timed out and stayed tracked, then a Ctrl-C in ``wait()`` that leaves the ``with``.
+
+    ``__exit__`` reads what the registry tracks before ``close()`` and notes it
+    afterwards (m2 §11.11 E6): the second item is the note's outcome. As in
+    ``_ctrl_c_whose_stop_is_refused``, the motion keeps the core through the
+    Executor by decision until ``resume()``.
+    """
+    core.stop_refused, core.busy_devices = {"XY"}, {"XY"}
+    real, polled = core.deviceBusy, list[str]()
+
+    def busy(label: str) -> bool:
+        polled.append(label)
+        if len(polled) == 3:
+            raise KeyboardInterrupt
+        return real(label)
+
+    try:
+        with microscope:
+            stage = microscope.require(XYStage)
+            _outcome(lambda: stage.move_to_um(10.0, 0.0))  # times out, stays tracked
+            core.deviceBusy = busy  # type: ignore[method-assign]
+            try:
+                stage.wait(5.0)
+            finally:
+                del core.deviceBusy
+    except KeyboardInterrupt as ctrl_c:
+        outcome = (
+            "KeyboardInterrupt",
+            ", ".join(note.outcome.value for note in stop_notes(ctrl_c)),
+        )
+    else:
+        outcome = ("", "")
+    microscope.resume()
+    return outcome
+
+
 @_declaring(Role.focus)
 def _declared_z_stop_whose_link_refuses_too(
     core: FakeCore, microscope: Microscope
@@ -790,6 +836,12 @@ _DECLARED_EMERGENCY_STOP = (
             "KeyboardInterrupt",
             "Ctrl-C in the stop",
             id="ctrl-c-inside-the-timeouts-give-up",
+        ),
+        pytest.param(
+            _ctrl_c_leaving_the_with_after_a_move_left_tracked,
+            "KeyboardInterrupt",
+            "still_moving",
+            id="ctrl-c-leaving-the-with-after-a-move-left-tracked",
         ),
         pytest.param(
             _declared_z_stop_whose_link_refuses_too,

@@ -319,8 +319,11 @@ def _interrupted_line(notes: Sequence[StopNote]) -> str:
     It said "any move under way was stopped" whatever the stop did, and on
     the Ti2-E, which refuses every stop, the stage went the full 20000 µm
     (#208, FM-117). The layer sends a move only inside the ``Executor``'s
-    ``_move``, and every Ctrl-C there leaves a note, so no note means that no
-    move was under way.
+    ``_move``, and every Ctrl-C there leaves a note; one that leaves the
+    stand's ``with`` is also noted with each motion the registry still tracks
+    (``Microscope.__exit__``, m2 §11.11 E6). So no note means that no move was
+    under way that the layer knows of: the Ti2-E's Z drive never reads busy,
+    so a Z move still running there is not tracked (m2 §11.10).
     """
     read = "read the position (smc stage get, smc z get) before the next move"
     if not notes:
