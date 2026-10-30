@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import cast
@@ -19,7 +20,7 @@ import pytest
 from pymmcore_plus import CMMCorePlus, DeviceType
 
 from smc.hardware import Microscope
-from smc.hardware.capabilities import Autofocus, ObjectiveTurret, XYStage
+from smc.hardware.capabilities import Autofocus, ObjectiveTurret, XYStage, ZStage
 from smc.hardware.errors import (
     HardwareError,
     MotionStoppedError,
@@ -167,6 +168,144 @@ def test_a_failed_linked_call_wins_over_a_declared_refusal() -> None:
     ):
         executor.stop(z)
     assert sent == ["PFS off", "Z"]
+
+
+_LINK_NAME = "autofocus_offset PFSOffset"
+
+
+def _refusal_of_the_link() -> Exception:
+    return StopRefusedError((_LINK_NAME,))
+
+
+def _refusal_of_the_device() -> Exception:
+    return RuntimeError('Error in device "Z": Unsupported device command (11)')
+
+
+def _fault_of_the_link() -> Exception:
+    return ConnectionError("PFS: stuck on")
+
+
+def _fault_of_the_device() -> Exception:
+    return ConnectionError("Z: stuck")
+
+
+@pytest.mark.parametrize(
+    ("link", "device", "declared", "raises", "text", "cause"),
+    [
+        pytest.param(
+            _refusal_of_the_link,
+            _refusal_of_the_device,
+            True,
+            StopRefusedError,
+            str(StopRefusedError((_LINK_NAME, "z Z"))),
+            RuntimeError,
+            id="refusal-refusal-merged",
+        ),
+        pytest.param(
+            _refusal_of_the_link,
+            None,
+            True,
+            StopRefusedError,
+            str(StopRefusedError((_LINK_NAME,))),
+            None,
+            id="refusal-accepted-the-links",
+        ),
+        pytest.param(
+            None,
+            _refusal_of_the_device,
+            True,
+            StopRefusedError,
+            str(StopRefusedError(("z Z",))),
+            RuntimeError,
+            id="accepted-refusal-the-devices",
+        ),
+        pytest.param(
+            _fault_of_the_link,
+            _refusal_of_the_device,
+            True,
+            ConnectionError,
+            "PFS: stuck on",
+            None,
+            id="fault-refusal-the-fault",
+        ),
+        pytest.param(
+            _refusal_of_the_link,
+            _fault_of_the_device,
+            False,
+            ConnectionError,
+            "Z: stuck",
+            None,
+            id="refusal-fault-the-devices-fault",
+        ),
+        pytest.param(
+            _fault_of_the_link,
+            _fault_of_the_device,
+            False,
+            ConnectionError,
+            "Z: stuck",
+            None,
+            id="fault-fault-the-devices-fault",
+        ),
+    ],
+)
+def test_a_linked_stop_raises_one_error_by_the_table_of_m2_11_11(
+    link: Callable[[], Exception] | None,
+    device: Callable[[], Exception] | None,
+    declared: bool,
+    raises: type[Exception],
+    text: str,
+    cause: type[Exception] | None,
+) -> None:
+    # Of the linked call and the device's own stop, one error is raised. Two
+    # refusals used to leave Z's own out of `.refused` (m2 §11.11 E1, #224), and
+    # a fault still wins over a refusal (FM-127).
+    executor = Executor(
+        dry_run=False, lock=threading.RLock(), logger=logging.getLogger(LOGGER)
+    )
+    sent: list[str] = []
+
+    def linked_call() -> None:
+        sent.append("link")
+        if link is not None:
+            raise link()
+
+    def stop() -> None:
+        sent.append("Z")
+        if device is not None:
+            raise device()
+
+    z = Motion("Z", "z Z", lambda: False, stop, stop_refused=declared)
+    with (
+        executor.linked_stop("Z", linked_call),
+        pytest.raises(Exception) as raised,  # noqa: PT011 - the table decides the type
+    ):
+        executor.stop(z)
+    assert sent == ["link", "Z"]
+    assert type(raised.value) is raises
+    assert str(raised.value) == text
+    assert type(raised.value.__cause__) is (cause or type(None))
+
+
+def test_the_merged_refusal_names_each_stop_once_link_first() -> None:
+    # `refused` is the link's names, then the device's, each once, whichever
+    # of them the two lists repeat (m2 §11.11 E1, `_Stops.refused` alike).
+    executor = Executor(
+        dry_run=False, lock=threading.RLock(), logger=logging.getLogger(LOGGER)
+    )
+
+    def linked_call() -> None:
+        raise StopRefusedError((_LINK_NAME, "z Z"))
+
+    def stop() -> None:
+        raise RuntimeError("Unsupported device command (11)")
+
+    z = Motion("Z", "z Z", lambda: False, stop, stop_refused=True)
+    with (
+        executor.linked_stop("Z", linked_call),
+        pytest.raises(StopRefusedError) as raised,
+    ):
+        executor.stop(z)
+    assert raised.value.refused == (_LINK_NAME, "z Z")
 
 
 def test_stop_refused_error_is_not_a_safety_refusal() -> None:
@@ -574,6 +713,107 @@ def test_close_on_the_ti2_names_an_accepted_offset_stop(
         "autofocus_offset PFSOffset; refused, as the profile declares ([safety] "
         "stop_refused_by), so a move under way runs to its target: xy_stage "
         "XYStage, z ZDrive"
+    )
+
+
+class _Mover:
+    """``target`` in a thread: whether it ended, and the type of what it raised."""
+
+    def __init__(self, target: Callable[[], object]) -> None:
+        self.raised: str | None = None
+        self._target = target
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            self._target()
+        except BaseException as exc:
+            # The type's name, not the error: its traceback holds this frame.
+            self.raised = type(exc).__name__
+
+    def join(self) -> None:
+        self._thread.join(timeout=5.0)
+        assert not self._thread.is_alive(), "thread did not finish: deadlock?"
+
+
+def _wait_until(condition: Callable[[], bool], what: str) -> None:
+    deadline = time.monotonic() + 5.0
+    while not condition():
+        assert time.monotonic() < deadline, f"timed out waiting for {what}"
+        time.sleep(0.01)
+
+
+def _offset_move_with_pfs_on(core: FakeCore, microscope: Microscope) -> _Mover:
+    """A direct offset move with PFS on, waiting for the offset device to go idle.
+
+    PFS on, the autofocus follows its offset and drives Z, so the compound
+    links Z's stop to the offset's (m2 §3.3.1). The offset device reads busy
+    until the test clears it, since the Ti2-E refuses its stop (#208).
+    """
+    core.enableContinuousFocus(True)
+    core.busy_devices = {"PFSOffset"}
+    mover = _Mover(lambda: microscope.require(Autofocus).set_offset_native(10.0))
+    _wait_until(
+        lambda: _LINK_NAME in microscope.state().moving, "the offset move to wait"
+    )
+    return mover
+
+
+def test_z_stop_during_an_offset_move_on_the_ti2_names_z_and_the_offset() -> None:
+    # #224 item 1: the link's refusal (the offset's) won over Z's own, so
+    # `.refused` missed `z ZDrive`.
+    core, microscope = _ti2_stand()
+    try:
+        mover = _offset_move_with_pfs_on(core, microscope)
+        try:
+            with pytest.raises(StopRefusedError) as refused:
+                microscope.require(ZStage).stop()
+        finally:
+            core.busy_devices.clear()  # the move ends; the stage was never stopped
+            mover.join()
+    finally:
+        microscope.close()
+    assert refused.value.refused == (_LINK_NAME, "z ZDrive")
+    assert mover.raised == "MotionStoppedError"
+
+
+def test_close_from_another_thread_lists_each_refused_stage_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # `close()` sends the offset's stop, then Z's, whose link stops the offset
+    # again: the line named the offset twice and, by the link winning, Z not at
+    # all (#224 item 1, measured).
+    core, microscope = _ti2_stand()
+    real_stop = core.stop
+
+    def stop(label: str) -> None:
+        # Z's stop is the last one `close()` sends; the offset device, which
+        # refuses its own, reads idle after it (the fake raises for a refused
+        # label, hence the `finally`), or `close()` would wait 60 s for the lock.
+        try:
+            real_stop(label)
+        finally:
+            if label == "ZDrive":
+                core.busy_devices.discard("PFSOffset")
+
+    try:
+        mover = _offset_move_with_pfs_on(core, microscope)
+        core.stop = stop  # type: ignore[method-assign]
+        try:
+            with caplog.at_level(logging.WARNING, logger=LOGGER):
+                microscope.close()
+        finally:
+            del core.stop
+            core.busy_devices.clear()
+            mover.join()
+    finally:
+        microscope.close()
+    lines = [line for line in caplog.messages if line.startswith("close: ")]
+    assert len(lines) == 1, lines
+    assert lines[0].endswith(
+        "so a move under way runs to its target: "
+        "autofocus_offset PFSOffset, xy_stage XYStage, z ZDrive"
     )
 
 

@@ -1328,6 +1328,10 @@ class Executor:
             if interrupted is not None:
                 raise interrupted
             if isinstance(error, StopRefusedError) and failure is not None:
+                if isinstance(failure, StopRefusedError):
+                    # Two refusals say nothing is broken, and the caller must
+                    # hear of both: the link's alone left Z's own out (#224).
+                    return _merged_refusal(failure, error)
                 # A declared refusal is no fault, and a link that failed (PFS
                 # still on, so still driving Z) is: the caller hears of it.
                 return failure
@@ -1734,6 +1738,20 @@ def _declared_refusal(motion: Motion, error: Exception) -> StopRefusedError:
     refused = StopRefusedError((motion.name,))
     refused.__cause__ = error
     return refused
+
+
+def _merged_refusal(link: StopRefusedError, own: StopRefusedError) -> StopRefusedError:
+    """One ``StopRefusedError`` for a linked call and a device that both refused.
+
+    Names in the order the stops were sent, the link's first, each once, with
+    the default message. Its cause is the device's own refusal's, the error of
+    the device the caller asked to stop (m2 §11.11 E1). A module function, like
+    ``_declared_refusal``: no frame that is on a traceback holds an error
+    (FM-98).
+    """
+    merged = StopRefusedError(tuple(dict.fromkeys((*link.refused, *own.refused))))
+    merged.__cause__ = own.__cause__
+    return merged
 
 
 def _repr_of(error: BaseException) -> str:

@@ -901,7 +901,12 @@ class Microscope:
             try:
                 done = self._stop_one(capability, role)
             except StopRefusedError as exc:
-                stops.refused.extend(exc.refused)
+                # Once each, in order of first appearance: Z's stop reaches
+                # the offset again through its link, and `refused` also names
+                # the offset device's own (m2 §11.11 E1).
+                for name in exc.refused:
+                    if name not in stops.refused:
+                        stops.refused.append(name)
             except Exception as exc:
                 label = self.roles.get(role)
                 kind = role.value if capability is None else capability.__name__

@@ -45,7 +45,7 @@ from pymmcore_plus import CMMCorePlus
 import smc.cli as cli
 from smc.hardware import Microscope
 from smc.hardware.capabilities import Autofocus, Camera, XYStage, ZStage
-from smc.hardware.errors import HardwareError, SafetyRefusedError
+from smc.hardware.errors import HardwareError, SafetyRefusedError, StopRefusedError
 from smc.hardware.profile import Profile
 from smc.hardware.roles import Role
 from smc.hardware.safety import Executor, Motion
@@ -619,6 +619,24 @@ def _declared_emergency_stop(core: FakeCore, microscope: Microscope) -> tuple[st
     return _outcome(microscope.stop)
 
 
+@_declaring(Role.focus)
+def _declared_z_stop_whose_link_refuses_too(
+    core: FakeCore, microscope: Microscope
+) -> tuple[str, str]:
+    """A Z stop whose link refuses as well: one refusal, built by ``_merged_refusal``.
+
+    The link's error and the device's own both reach ``_stop_linked``'s frame
+    through their tracebacks; the merged refusal holds neither (#224, FM-98).
+    """
+    core.stop_refused = {"Z"}
+
+    def link() -> None:
+        raise StopRefusedError(("autofocus_offset PFSOffset",))
+
+    with microscope._executor.linked_stop("Z", link):
+        return _outcome(microscope.require(ZStage).stop)
+
+
 @_declaring(Role.xy_stage)
 def _ctrl_c_whose_stop_is_refused(
     core: FakeCore, microscope: Microscope
@@ -650,6 +668,11 @@ _DECLARED_XY = (
     "`xy_stage XY` refused the stop, as the profile declares ([safety] "
     "stop_refused_by): a move under way runs to its target; stop it with the "
     "stand's own controls if it must not finish"
+)
+_DECLARED_Z_AND_ITS_LINK = (
+    "`autofocus_offset PFSOffset` and `z Z` refused the stop, as the profile "
+    "declares ([safety] stop_refused_by): a move under way runs to its target; "
+    "stop it with the stand's own controls if it must not finish"
 )
 _DECLARED_EMERGENCY_STOP = (
     "the emergency stop halted the microscope and switched autofocus Autofocus "
@@ -718,6 +741,12 @@ _DECLARED_EMERGENCY_STOP = (
             "StopRefusedError",
             _DECLARED_EMERGENCY_STOP,
             id="declared-emergency-stop",
+        ),
+        pytest.param(
+            _declared_z_stop_whose_link_refuses_too,
+            "StopRefusedError",
+            _DECLARED_Z_AND_ITS_LINK,
+            id="declared-z-stop-whose-link-refuses-too",
         ),
         pytest.param(
             _ctrl_c_whose_stop_is_refused,
