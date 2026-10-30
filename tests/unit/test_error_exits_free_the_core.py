@@ -81,16 +81,24 @@ def _stand(
     dry_run: bool = False,
     declares: tuple[Role, ...] = (),
     engage_drives_z: bool = False,
+    device_timeout_ms: int | None = None,
 ) -> tuple[FakeCore, Microscope]:
     """A fake demo stand; ``declares`` goes into ``[safety] stop_refused_by``.
 
-    ``engage_drives_z`` sets ``[autofocus] engage_drives_z_to_offset`` (m2 §12).
+    ``engage_drives_z`` sets ``[autofocus] engage_drives_z_to_offset`` (m2 §12),
+    ``device_timeout_ms`` ``[micromanager] device_timeout_ms``: how long a move
+    waits before it gives up.
     """
     core = FakeCore.demo_like()
     profile = Profile.demo()
     if declares:
         safety = profile.safety.model_copy(update={"stop_refused_by": declares})
         profile = profile.model_copy(update={"safety": safety})
+    if device_timeout_ms is not None:
+        micromanager = profile.micromanager.model_copy(
+            update={"device_timeout_ms": device_timeout_ms}
+        )
+        profile = profile.model_copy(update={"micromanager": micromanager})
     if engage_drives_z:
         autofocus = profile.autofocus.model_copy(
             update={"engage_drives_z_to_offset": True}
@@ -619,6 +627,41 @@ def _declared_emergency_stop(core: FakeCore, microscope: Microscope) -> tuple[st
     return _outcome(microscope.stop)
 
 
+def _timing_out_after(device_timeout_ms: int) -> Callable[[Scenario], Scenario]:
+    """Run the scenario on a stand whose moves give up after ``device_timeout_ms``."""
+
+    def mark(scenario: Scenario) -> Scenario:
+        scenario.device_timeout_ms = device_timeout_ms  # type: ignore[attr-defined]
+        return scenario
+
+    return mark
+
+
+@_declaring(Role.xy_stage)
+@_timing_out_after(50)
+def _ctrl_c_inside_the_timeouts_give_up(
+    core: FakeCore, microscope: Microscope
+) -> tuple[str, str]:
+    """A Ctrl-C in the stop that the move's timeout sends: noted, not given up on twice.
+
+    The motion stays registered (it reads busy) until ``resume()``, and keeps
+    the core through the Executor by decision, as ``_ctrl_c_whose_stop_is_refused``'s
+    (#224).
+    """
+    core.busy_devices = {"XY"}
+
+    def cut(label: str) -> None:
+        raise KeyboardInterrupt("Ctrl-C in the stop")
+
+    core.stop = cut  # type: ignore[method-assign]
+    try:
+        outcome = _outcome(lambda: microscope.require(XYStage).move_to_um(10.0, 0.0))
+    finally:
+        del core.stop
+    microscope.resume()
+    return outcome
+
+
 @_declaring(Role.focus)
 def _declared_z_stop_whose_link_refuses_too(
     core: FakeCore, microscope: Microscope
@@ -743,6 +786,12 @@ _DECLARED_EMERGENCY_STOP = (
             id="declared-emergency-stop",
         ),
         pytest.param(
+            _ctrl_c_inside_the_timeouts_give_up,
+            "KeyboardInterrupt",
+            "Ctrl-C in the stop",
+            id="ctrl-c-inside-the-timeouts-give-up",
+        ),
+        pytest.param(
             _declared_z_stop_whose_link_refuses_too,
             "StopRefusedError",
             _DECLARED_Z_AND_ITS_LINK,
@@ -804,6 +853,7 @@ def test_a_failed_stop_or_switch_off_frees_the_core(
     core, microscope = _stand(
         declares=getattr(scenario, "declares", ()),
         engage_drives_z=getattr(scenario, "engage_drives_z", False),
+        device_timeout_ms=getattr(scenario, "device_timeout_ms", None),
     )
     assert scenario(core, microscope) == (kind, message)
     core.failing.clear()

@@ -497,6 +497,39 @@ def test_the_give_up_line_of_an_accepted_stop_on_a_declared_role_has_no_refusal_
     assert line == f"xy_stage XY: stop after {why}{_STILL_BUSY}"
 
 
+def test_a_ctrl_c_inside_the_timeouts_give_up_sends_one_stop_and_is_noted_interrupted() -> (
+    None
+):
+    # #224 item 4: the Ctrl-C cut the timeout's give-up, and `_move`'s outer
+    # `except` gave up again: two stops, the second one's `accepted` noted. The
+    # Ctrl-C is the first here, so nothing says "second".
+    profile = _declared(Role.xy_stage)
+    micromanager = profile.micromanager.model_copy(update={"device_timeout_ms": 50})
+    with _stand(profile.model_copy(update={"micromanager": micromanager})) as (
+        core,
+        microscope,
+    ):
+        core.busy_devices = {"XY"}
+        stops: list[str] = []
+
+        def cut(label: str) -> None:
+            stops.append(label)
+            raise KeyboardInterrupt("Ctrl-C in the stop")
+
+        core.stop = cut  # type: ignore[method-assign]
+        try:
+            with pytest.raises(KeyboardInterrupt) as interrupted:
+                microscope.require(XYStage).move_to_um(10.0, 0.0)
+        finally:
+            del core.stop
+        # Sent once, before the stand closes; `close()` sends the retry.
+        assert stops == ["XY"]
+    assert str(interrupted.value) == "Ctrl-C in the stop"
+    assert stop_notes(interrupted.value) == (
+        StopNote("xy_stage XY", StopOutcome.interrupted),
+    )
+
+
 def test_a_second_ctrl_c_inside_the_stop_is_noted_as_interrupted() -> None:
     with _stand() as (core, microscope):
         core.busy_devices = {"XY"}
