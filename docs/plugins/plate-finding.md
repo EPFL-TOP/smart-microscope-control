@@ -58,10 +58,11 @@ a survey of frames that were never taken has nothing to fit.
 | `plates` | all `-well` plates | The plates fitted against, JSON (`--param 'plates=["96-well","384-well"]'`; in `cmd.exe` and PowerShell 5.1 the quotes need the escaping of the [`smc run`](README.md#running-a-plugin-smc-run) page). Say it when you know which plates it can be: a fit over seven plates takes about 2 s for a 96-well survey, and a close call between two is a note. |
 | `centre_x_um`, `centre_y_um` | the stage's position | Where the plate's centre is, both or neither. |
 | `step_um` | a third of the plate's pitch | Distance between survey points. A half was measured failing on three of eight plate types. At most 25 000 points are made. |
-| `margin_pitches` | 1 | How far past the outer wells the survey reaches, 0 to 5. Under 1, the plugin refuses (see below). |
+| `margin_pitches` | 1 | How far past the outer wells the survey reaches on each side, in pitches, 0 to 5. A survey that spans less than the outer wells plus one pitch is refused, because A1 cannot be pinned down: that is about 0.5 here, a little less with jitter (see below). |
 | `jitter` | 0.5 | Random nudge of each point, as a fraction of the step, 0 to 1. A regular raster beats against the plate's lattice. |
 | `seed` | 0 | Seeds the nudge: the same seed gives the same survey. |
 | `statistic` | `mean` | `mean` or `std` of each frame. Use `std` where wells and plastic differ by texture and not by brightness. |
+| `max_failed_in_row` | 3 | This many survey points failing in a row end the survey (1 to 100); the checkpoint keeps what was sampled. `scan`'s parameter of the same name. |
 
 The survey has, at the default step and one pitch of margin, 130 points on a 6-well
 plate, 208 on 12-well, 352 on 24-well, 616 on 48-well, 1120 on 96-well, 3952 on
@@ -79,10 +80,11 @@ In this order; the first that fails ends the run with nothing moved:
    (`the survey would take 9477198001 points, more than 25000: give a larger step_um
    or a smaller margin_pitches`).
 4. **The stage's soft limits.** Only the points inside the limits are visited. What is
-   left must still reach one pitch past the outer wells of `plate`: **the margin is
-   evidence, not padding.** Without samples beyond the last wells, nothing contradicts
-   a lattice that slides along itself by a whole well, and the fit can score 0.99 while
-   A1 is a well off. A survey that cannot show that is refused, not reported:
+   left must still span the outer wells of `plate` plus one pitch, which is half a pitch
+   past them on each side: **the margin is evidence, not padding.** Without samples
+   beyond the last wells, nothing contradicts a lattice that slides along itself by a
+   whole well, and the fit can score 0.99 while A1 is a well off. A survey that cannot
+   show that is refused, not reported:
 
    ```text
    plate-finding: the survey spans 98x58 mm; this plate needs 108x72 mm — one pitch
@@ -95,7 +97,10 @@ In this order; the first that fails ends the run with nothing moved:
    1120 points are inside.) The line about the limits is there only when the limits
    removed points. When they removed some but not enough to matter, the result says so
    in `assumed` (`3 of 208 survey points are outside the stage's soft limits and were
-   not sampled`).
+   not sampled`). A stand that **reports no soft limits** (`nikon-tie`, the demo) is surveyed
+   with nothing cut, and the result says so in `assumed` (`the stage reports no soft
+   limits, so the survey's moves were not checked against any travel`): the layer
+   checked no move against any travel, and that is all the line claims.
 5. Then the autofocus is switched off, if it is on (below), and the survey starts.
 
 ### The Ti2-E's soft limits refuse every plate as profiled
@@ -122,7 +127,7 @@ distance is short.
 The autofocus cannot lock over the plastic between wells, and a survey that waited for
 a lock at every point would take longer than the scan it replaces. So when the
 autofocus is **engaged**, the plugin switches it off before the first move (a safe
-call; it moves nothing), logs a WARNING, and adds to the result's `assumed`:
+call; it moves nothing) and logs a WARNING:
 
 ```text
 the autofocus was switched off for the survey; engage it again before the scan
@@ -133,6 +138,22 @@ is stored (#205). The scan, which uses the autofocus only as you left it, then f
 off. Lock PFS on the sample, at the first well of the scan, before you run `scan`.
 Nothing here moves Z or turns the turret, and nothing moves the stage afterwards: it
 stays at the last survey point.
+
+What the **result** says is the autofocus's state at the end of the survey, read and not
+remembered:
+
+```text
+the autofocus is off after the survey; the scan never switches it on: lock it on the sample before the scan
+```
+
+So a survey that was stopped and resumed says it too (the resume finds the autofocus
+already off and has nothing to switch), and so does a survey that found the autofocus
+off from the start: the scan finds it off whoever did it. An autofocus that you locked
+again before the end is not reported, and a stand without an autofocus says nothing. A
+state that cannot be read at the end is a line of its own (`the autofocus's state could
+not be read after the survey (…); check it before the scan`), not a lost survey; a halt
+of the stand during that read ends the run as a halt does (`failed`, the checkpoint
+complete, so `--resume` fits it again without moving).
 
 ## During the survey
 
@@ -145,11 +166,18 @@ stays at the last survey point.
   stand (the stop button of the layer) ends the survey and the run is `failed`; it is
   never counted as a point that failed (FM-64).
 - **A point that fails is skipped and counted**: a move that times out, a stage that
-  refuses a target. More than a tenth of the points failing (in whole numbers: 19 of
-  180 is too many, 18 of 180 is not) ends the survey and keeps what was sampled:
-  `21 of 208 survey points could not be sampled, the last at (…) µm: DeviceTimeoutError:
-  …; check the stage, then run plate-finding --resume`. A frame whose mean is not a
-  finite number is a skipped point too.
+  refuses a target, a frame whose mean is not a finite number, a readback that is not a
+  position. Two rules end the survey and keep what was sampled, **the first that
+  applies**:
+  - `max_failed_in_row` points failing **in a row** (3 by default; a point that is
+    sampled resets the count, and a resume starts it again at 0): `3 survey points in a
+    row could not be sampled, the last at (…) µm: DeviceTimeoutError: …; check the stage,
+    then run plate-finding --resume`. A stage that times out at every move is over in
+    three moves: 3 minutes at a 60 s move timeout, where the second rule alone would wait
+    for a tenth of a 96-well survey (113 of 1120 points, 1.9 h).
+  - **More than a tenth of the points** failing, in whole numbers (19 of 180 is too many,
+    18 of 180 is not): `21 of 208 survey points could not be sampled, the last at (…) µm:
+    …`, with the same ending.
 - A survey that ends with some points skipped says `<k> of <N> survey points could not
   be sampled and were skipped` in `assumed`.
 
@@ -176,14 +204,23 @@ plate=6-well`), or too many points failed.
 
 ## Resuming
 
-The survey is the checkpoint: the centre, how many points were handled, and what was
-sampled, saved before the first move, every 50 points and at the end. `--resume`
-continues from there, with the same parameters (the runner refuses otherwise) and from
-the **first run's centre**, not from where the stage stands now, even when the survey
-was stopped before its 50th point (then it starts again from the first point, around
-the same centre). A checkpoint that does not fit the survey (more
-points handled than it has, counts that do not add up) is refused with
-`run plate-finding without --resume`.
+The survey is the checkpoint: the centre, **how many points the survey has**, how many
+were handled, and what was sampled, saved before the first move, every 50 points and at
+the end. `--resume` continues from there, with the same parameters (the runner refuses
+otherwise) and from the **first run's centre**, not from where the stage stands now, even
+when the survey was stopped before its 50th point (then it starts again from the first
+point, around the same centre).
+
+The survey's size is kept because the points are the plan **minus those outside the
+stage's soft limits**, and the limits are read again at each attempt. Changing a profile's
+`[safety]` between a stop and `--resume` would shift every index and nothing would say so;
+a checkpoint made for a survey of another size is refused before anything moves, with
+`the checkpoint was made for a survey of 154 points inside the soft limits and this one
+has 173: the stage's soft limits changed; run plate-finding without --resume`. The count
+is not a fingerprint: limits that move and keep the count are not noticed. A checkpoint
+that does not fit the survey in other ways (more points handled than it has, counts that
+do not add up) is refused with `run plate-finding without --resume`, and one that does not
+hold the size at all (made before it was kept) is refused by the runner.
 
 A fit that failed keeps its survey, and `--resume` fits it again **without moving the
 stage or touching the autofocus**. With the same parameters it gives the same refusal;
@@ -198,6 +235,11 @@ Nothing in this page was run on a microscope. For the first hardware session (#1
 - the Ti2-E's soft limits, which refuse every plate as profiled (computed from the
   profile, not measured), and what the true travel is;
 - how long a survey takes on the Ti2-E, whose stage is not the demo's;
+- what `is_engaged()` answers on the Ti2-E right after `disengage()` (the demo and the
+  fake say off; the real PFS was not read), which is what the line at the end of the
+  survey is built on;
+- whether 3 failures in a row is the right bound on a stage that times out at 60 s (3
+  minutes, computed, not measured);
 - whether a frame's mean separates well from plastic at 40×, and through a black-walled
   plate;
 - the clearance of the objective over the plate's holder where the survey leaves the

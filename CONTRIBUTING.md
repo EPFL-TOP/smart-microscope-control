@@ -14,6 +14,14 @@ pre-commit install
 smc doctor && pytest
 ```
 
+Working on the plate page (`area: ui`)? Also install the page's extra and the
+browser that `scripts/dev/ui_snap.py` (`/ui-check`) drives, once per PC:
+
+```sh
+pip install -e ".[dev,ui]"
+python -m playwright install chromium   # on a bare Linux add --with-deps
+```
+
 ## The loop
 
 1. **Issue first.** Use a template. Write acceptance criteria; add a short

@@ -38,11 +38,12 @@ from smc.hardware import Microscope
 from smc.hardware.capabilities import XY, Autofocus, Camera, FocusStep, Limits, XYStage
 from smc.hardware.errors import (
     DeviceTimeoutError,
+    HardwareError,
     MicroscopeHaltedError,
     MotionStoppedError,
 )
 from smc.hardware.profile import Profile
-from smc.plugins import PluginRunError, Progress, load, run_plugin
+from smc.plugins import PluginRunError, Progress, ResumeError, load, run_plugin
 from smc.plugins.plate_finding.algorithm import (
     DECISIVE_MARGIN,
     survey_extent_note,
@@ -61,8 +62,19 @@ PIXEL_UM = 20.0
 PITCH_UM = 26_000.0  # the 12-well plate's
 RADIUS_UM = 11_000.0  # ... and its wells'
 LOGGER = "smc.plugins.plate-finding"
+#: The WARNING logged when the survey switches the autofocus off.
 AUTOFOCUS_LINE = (
     "the autofocus was switched off for the survey; engage it again before the scan"
+)
+#: Written out here, not imported: a test that reads the plugin's own text cannot
+#: notice that the text changed.
+NO_LIMITS_LINE = (
+    "the stage reports no soft limits, so the survey's moves were not checked "
+    "against any travel"
+)
+AUTOFOCUS_OFF_LINE = (
+    "the autofocus is off after the survey; the scan never switches it on: lock it "
+    "on the sample before the scan"
 )
 #: What an autofocus does that the survey must never do.
 MUTATING = {
@@ -231,6 +243,29 @@ class _Autofocus:
         raise AssertionError("plate-finding never focuses")
 
 
+class _AutofocusReadAtTheEnd(_Autofocus):
+    """An autofocus whose first ``is_engaged()`` is the stand's and whose later ones answer as the test says.
+
+    The survey reads the autofocus twice on a fresh run: at the start, to
+    switch it off, and at the end, to say what the scan will find. The second
+    read is ``at_the_end``: what it answers, or what it raises.
+    """
+
+    def __init__(self, *, engaged: bool, at_the_end: bool | BaseException) -> None:
+        super().__init__(engaged=engaged)
+        self._at_the_end = at_the_end
+        self._reads = 0
+
+    def is_engaged(self) -> bool:
+        self._reads += 1
+        if self._reads == 1:
+            return super().is_engaged()
+        self.calls.append("is_engaged")
+        if isinstance(self._at_the_end, BaseException):
+            raise self._at_the_end
+        return self._at_the_end
+
+
 def _plate_at(
     plate_centre: tuple[float, float] = (0.0, 0.0),
     rotation_deg: float = 0.0,
@@ -372,9 +407,15 @@ def _here(microscope: Microscope) -> tuple[float, float]:
 
 
 def _refusal(microscope: Microscope, tmp_path: Path, **params: Any) -> str:
-    """What the survey refused with, after checking it is recorded ``failed`` with no result."""
+    """What the survey refused with, after checking it is recorded ``failed`` with no result.
+
+    A refusal is raised outside any ``except`` (FM-98): it holds no caught
+    exception, as its cause or its context, for its traceback to reach.
+    """
     with pytest.raises(PluginRunError) as info:
         _run(microscope, tmp_path, **params)
+    assert info.value.__cause__ is None
+    assert info.value.__context__ is None
     assert _stored(tmp_path).status is StageStatus.failed
     assert _stored(tmp_path).result is None
     return str(info.value)
@@ -406,14 +447,15 @@ def _snake(columns: list[float], rows: list[float]) -> list[tuple[float, float]]
     ]
 
 
-def _tamper(tmp_path: Path, **checkpoint: Any) -> None:
-    """Replace fields of the stored checkpoint, as a hand-edited or foreign run document would."""
+def _tamper(tmp_path: Path, *, drop: tuple[str, ...] = (), **checkpoint: Any) -> None:
+    """Replace or drop fields of the stored checkpoint, as a hand-edited or foreign run document would."""
     path = tmp_path / "run.json"
     record = RunDocument.load(path).stages["plate-finding"]
     assert record.checkpoint is not None
+    kept = {k: v for k, v in record.checkpoint.items() if k not in drop}
     write_stage(
         path,
-        record.model_copy(update={"checkpoint": {**record.checkpoint, **checkpoint}}),
+        record.model_copy(update={"checkpoint": {**kept, **checkpoint}}),
     )
 
 
@@ -474,7 +516,8 @@ def test_the_survey_fills_the_plate_slot_on_the_demo(
     assert result.fit.runner_up != result.plate
     assert 0.0 < result.fit.margin < result.fit.score
     assert result.fit.notes == ()
-    assert result.assumed == ()
+    # The demo's stage says nothing about its travel, and its autofocus is off.
+    assert result.assumed == (NO_LIMITS_LINE, AUTOFOCUS_OFF_LINE)
     assert (progress[-2].done, progress[-2].total, progress[-2].message) == (
         208,
         208,
@@ -585,7 +628,8 @@ def test_an_engaged_autofocus_is_switched_off_and_not_relocked(
     assert log.index("enableContinuousFocus(False)") < first_move
     assert "enableContinuousFocus(True)" not in log
     assert autofocus.is_engaged() is False
-    assert AUTOFOCUS_LINE in _result(record).assumed
+    # The result says what the scan will find, not what the survey did.
+    assert _result(record).assumed == (NO_LIMITS_LINE, AUTOFOCUS_OFF_LINE)
     assert [r.getMessage() for r in caplog.records if r.name == LOGGER] == [
         AUTOFOCUS_LINE
     ]
@@ -594,6 +638,7 @@ def test_an_engaged_autofocus_is_switched_off_and_not_relocked(
 def test_an_autofocus_that_is_off_is_left_alone(
     fake_microscope: Microscope, tmp_path: Path
 ) -> None:
+    """Off before the survey is reported too: the scan finds it off, whoever switched it off."""
     spy = _Autofocus(engaged=False)
     fake_microscope.override(Autofocus, spy)
     _on_fake(fake_microscope, _plate_at())
@@ -601,7 +646,158 @@ def test_an_autofocus_that_is_off_is_left_alone(
     record = _run(fake_microscope, tmp_path, plates=["12-well"])
 
     assert not MUTATING & set(spy.calls)
-    assert _result(record).assumed == ()
+    assert _result(record).assumed == (NO_LIMITS_LINE, AUTOFOCUS_OFF_LINE)
+
+
+def test_a_resumed_survey_still_says_the_autofocus_is_off(
+    fake_core: FakeCore,
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The first attempt switched it off and was stopped; the resume finds it off and must still say so.
+
+    The line is the autofocus's state at the end, read, so it does not depend on
+    which attempt switched it off (#248: the resume returned ``done`` with
+    nothing in ``assumed`` and the scan then ran without a lock).
+    """
+    _on_fake(fake_microscope, _plate_at())
+    autofocus = fake_microscope.require(Autofocus)
+    assert autofocus.engage() is True
+    fake_core.log.clear()
+    stop = threading.Event()
+
+    def stop_at_120(progress: Progress) -> None:
+        if progress.done == 120:
+            stop.set()
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        first = _run(
+            fake_microscope,
+            tmp_path,
+            plates=["12-well"],
+            on_progress=stop_at_120,
+            stop=stop,
+        )
+        assert first.status is StageStatus.stopped
+        assert autofocus.is_engaged() is False
+        record = _run(fake_microscope, tmp_path, resume=True, plates=["12-well"])
+
+    assert _result(record).assumed == (NO_LIMITS_LINE, AUTOFOCUS_OFF_LINE)
+    assert "enableContinuousFocus(True)" not in fake_core.log
+    # Logged once, by the attempt that switched it off.
+    assert [r.getMessage() for r in caplog.records if r.name == LOGGER] == [
+        AUTOFOCUS_LINE
+    ]
+
+
+def test_a_stand_without_an_autofocus_says_nothing_about_it(
+    fake_core: FakeCore, tmp_path: Path
+) -> None:
+    fake_core.unloadDevice("Autofocus")
+    microscope = Microscope.from_core(cast("Any", fake_core), Profile.demo())
+    try:
+        assert microscope.get(Autofocus) is None
+        _on_fake(microscope, _plate_at())
+
+        record = _run(microscope, tmp_path, plates=["12-well"])
+
+        assert _result(record).assumed == (NO_LIMITS_LINE,)
+    finally:
+        microscope.close()
+
+
+def test_an_autofocus_engaged_again_before_the_end_is_not_reported_off(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """What is said is what the autofocus is at the end, read: a flag set at the switch-off would say off here.
+
+    The operator locked it again between the switch-off and the end of the
+    survey: the scan will find it on, and a line saying it is off would send the
+    operator to lock a PFS that is already locked.
+    """
+    spy = _AutofocusReadAtTheEnd(engaged=True, at_the_end=True)
+    fake_microscope.override(Autofocus, spy)
+    _on_fake(fake_microscope, _plate_at())
+
+    record = _run(fake_microscope, tmp_path, plates=["12-well"])
+
+    assert spy.calls.count("disengage") == 1
+    assert spy.calls.count("is_engaged") == 2
+    assert _result(record).assumed == (NO_LIMITS_LINE,)
+
+
+def test_an_autofocus_that_cannot_be_read_at_the_end_is_a_finding_not_a_lost_survey(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """A survey of 208 points is not thrown away for a state that could not be read: it is said, in one line."""
+    spy = _AutofocusReadAtTheEnd(
+        engaged=True, at_the_end=HardwareError("pfs did not answer\nretry")
+    )
+    fake_microscope.override(Autofocus, spy)
+    _on_fake(fake_microscope, _plate_at())
+
+    record = _run(fake_microscope, tmp_path, plates=["12-well"])
+
+    assert _result(record).assumed == (
+        NO_LIMITS_LINE,
+        "the autofocus's state could not be read after the survey (HardwareError: "
+        "pfs did not answer); check it before the scan",
+    )
+
+
+@pytest.mark.parametrize(
+    "stop",
+    [MicroscopeHaltedError(), MotionStoppedError("autofocus PFS")],
+    ids=["halt", "motion-stopped"],
+)
+def test_a_halt_while_the_autofocus_is_read_at_the_end_is_not_swallowed(
+    fake_microscope: Microscope, tmp_path: Path, stop: HardwareError
+) -> None:
+    """FM-64: the halt is a ``HardwareError``, and an end read that turned it into a line would end ``done`` on a halted stand.
+
+    So is a motion stopped by the halt. The survey is complete and checkpointed
+    before the read, so ``--resume`` fits it again without moving.
+    """
+    spy = _AutofocusReadAtTheEnd(engaged=True, at_the_end=stop)
+    fake_microscope.override(Autofocus, spy)
+    camera = _on_fake(fake_microscope, _plate_at())
+
+    with pytest.raises(type(stop)):
+        _run(fake_microscope, tmp_path, plates=["12-well"])
+
+    stored = _stored(tmp_path)
+    assert stored.status is StageStatus.failed
+    assert stored.result is None
+    assert stored.checkpoint is not None
+    assert stored.checkpoint["next_index"] == 208
+    assert len(stored.checkpoint["points"]) == 208
+    assert camera.snaps == 208
+
+
+def test_a_resume_with_nothing_left_to_visit_still_says_the_autofocus_is_off(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """The label does not die with an attempt that visited points (FM-165).
+
+    A halt at the end read leaves a complete survey. Its resume visits nothing,
+    fits the 208 points, and the end read is its first read of the autofocus:
+    the scan finds the autofocus off all the same.
+    """
+    halting = _AutofocusReadAtTheEnd(engaged=True, at_the_end=MicroscopeHaltedError())
+    fake_microscope.override(Autofocus, halting)
+    camera = _on_fake(fake_microscope, _plate_at())
+    with pytest.raises(MicroscopeHaltedError):
+        _run(fake_microscope, tmp_path, plates=["12-well"])
+    assert camera.snaps == 208
+    spy = _Autofocus(engaged=False)
+    fake_microscope.override(Autofocus, spy)
+
+    record = _run(fake_microscope, tmp_path, resume=True, plates=["12-well"])
+
+    assert _result(record).assumed == (NO_LIMITS_LINE, AUTOFOCUS_OFF_LINE)
+    assert camera.snaps == 208
+    assert spy.calls == ["is_engaged"]
 
 
 # --------------------------------------------------- the checkpoint and a resume
@@ -625,12 +821,15 @@ def test_a_failed_fit_keeps_the_survey_for_a_resume(
     stored = _stored(tmp_path)
     assert stored.status is StageStatus.failed
     assert stored.checkpoint is not None
+    assert stored.checkpoint["total"] == 208
     assert stored.checkpoint["next_index"] == 208
     assert stored.checkpoint["skipped"] == 0
     assert len(stored.checkpoint["points"]) == 208
     assert camera.snaps == 208
 
-    # The resume refits without moving: not a snap, not a move, not an autofocus call.
+    # The resume refits without moving: not a snap, not a move, not an autofocus
+    # call. The autofocus is read after the fit's checks, so a refused fit reads
+    # nothing either.
     spy = _Autofocus(engaged=True)
     fake_microscope.override(Autofocus, spy)
     fake_core.log.clear()
@@ -640,7 +839,7 @@ def test_a_failed_fit_keeps_the_survey_for_a_resume(
     assert "too low to trust" in str(again.value)
     assert camera.snaps == 208
     assert fake_core.log == []
-    assert not MUTATING & set(spy.calls)
+    assert spy.calls == []
     assert spy.engaged is True
 
 
@@ -711,6 +910,8 @@ def test_a_survey_stopped_before_its_first_periodic_checkpoint_resumes_around_it
     assert camera.snaps == 30
     assert first.checkpoint is not None
     assert first.checkpoint["centre_um"] == [0.0, 0.0]
+    # The save before the first move holds the survey's size too.
+    assert first.checkpoint["total"] == 208
     assert first.checkpoint["next_index"] == 0
     assert _here(fake_microscope) != pytest.approx((0.0, 0.0), abs=1000.0)
     planned = survey_points("12-well", (0.0, 0.0))
@@ -754,6 +955,172 @@ def test_a_checkpoint_that_is_not_this_surveys_is_refused_before_anything_moves(
         "plate-finding: the checkpoint says 207 points were handled but holds "
         f"208 samples and 0 skipped: {ending}"
     )
+    assert camera.snaps == snaps
+
+
+def _inside(
+    planned: list[tuple[float, float]],
+    limits: tuple[tuple[float, float], tuple[float, float]],
+) -> int:
+    """How many of ``planned`` lie on or inside ``limits``: the test's own count, not the plugin's."""
+    (x_low, x_high), (y_low, y_high) = limits
+    return sum(1 for x, y in planned if x_low <= x <= x_high and y_low <= y <= y_high)
+
+
+NARROW = ((-60_000.0, 60_000.0), (-48_000.0, 48_000.0))  # keeps 154 of 208
+WIDE = ((-64_000.0, 64_000.0), (-52_000.0, 52_000.0))  # keeps 173
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [(NARROW, WIDE), (WIDE, NARROW)],
+    ids=["narrow-then-wide", "wide-then-narrow"],
+)
+def test_a_resume_on_other_soft_limits_is_refused_before_anything_moves(
+    open_limited_fake: Callable[..., Microscope],
+    tmp_path: Path,
+    first: tuple[tuple[float, float], tuple[float, float]],
+    second: tuple[tuple[float, float], tuple[float, float]],
+) -> None:
+    """``next_index`` indexes the points left after the limits: other limits, other indices, and nothing said (#248).
+
+    In both directions ``next_index`` (50) is below both totals, so the check
+    that the checkpoint is not beyond the survey cannot refuse: only the saved
+    size can.
+    """
+    planned = survey_points("12-well", (0.0, 0.0))
+    counts = {NARROW: 154, WIDE: 173}
+    assert _inside(planned, first) == counts[first]
+    assert _inside(planned, second) == counts[second]
+    stand_one = open_limited_fake(first)
+    camera_one = _on_fake(stand_one, _plate_at())
+    stand_two = open_limited_fake(second)
+    camera_two = _on_fake(stand_two, _plate_at())
+    stop = threading.Event()
+
+    def stop_at_60(progress: Progress) -> None:
+        if progress.done == 60:
+            stop.set()
+
+    stopped = _run(
+        stand_one,
+        tmp_path,
+        plates=["12-well"],
+        centre_x_um=0.0,
+        centre_y_um=0.0,
+        on_progress=stop_at_60,
+        stop=stop,
+    )
+    assert stopped.status is StageStatus.stopped
+    assert stopped.checkpoint is not None
+    assert stopped.checkpoint["next_index"] == 50
+    before = _here(stand_two)
+    # The step after the checks is the autofocus switch-off: a refused resume
+    # must leave an engaged autofocus engaged (FM-30, FM-88).
+    spy = _Autofocus(engaged=True)
+    stand_two.override(Autofocus, spy)
+
+    with pytest.raises(PluginRunError) as refused:
+        _run(
+            stand_two,
+            tmp_path,
+            resume=True,
+            plates=["12-well"],
+            centre_x_um=0.0,
+            centre_y_um=0.0,
+        )
+
+    assert str(refused.value) == (
+        f"plate-finding: the checkpoint was made for a survey of {counts[first]} "
+        f"points inside the soft limits and this one has {counts[second]}: the "
+        "stage's soft limits changed; run plate-finding without --resume"
+    )
+    assert camera_two.snaps == 0
+    assert _here(stand_two) == before
+    assert not MUTATING & set(spy.calls)
+    assert spy.engaged is True
+
+    # The refusal keeps the checkpoint: on the first limits again it resumes.
+    kept = _stored(tmp_path)
+    assert kept.status is StageStatus.failed
+    assert kept.checkpoint is not None
+    assert kept.checkpoint["total"] == counts[first]
+    assert kept.checkpoint["next_index"] == 50
+    record = _run(
+        stand_one,
+        tmp_path,
+        resume=True,
+        plates=["12-well"],
+        centre_x_um=0.0,
+        centre_y_um=0.0,
+    )
+
+    result = _result(record)
+    assert result.fit is not None
+    assert result.fit.n_samples == counts[first]
+    assert camera_one.snaps == 60 + (counts[first] - 50)
+
+
+def test_a_resume_on_other_soft_limits_names_the_size_before_the_index(
+    open_limited_fake: Callable[..., Microscope], tmp_path: Path
+) -> None:
+    """The size is checked first: it is the reason the other checks would be wrong.
+
+    A checkpoint of 160 points handled on a survey of 173, resumed on limits
+    that leave 154: ``next_index > total`` is true as well, and "handled 160
+    points and this survey has 154" would hide that the limits changed. The
+    counts of samples and skips add up, so only the order picks the message.
+    """
+    stand_wide = open_limited_fake(WIDE)
+    _on_fake(stand_wide, _plate_at())
+    stand_narrow = open_limited_fake(NARROW)
+    camera_narrow = _on_fake(stand_narrow, _plate_at())
+    stop = threading.Event()
+
+    def stop_at_60(progress: Progress) -> None:
+        if progress.done == 60:
+            stop.set()
+
+    params: dict[str, Any] = {
+        "plates": ["12-well"],
+        "centre_x_um": 0.0,
+        "centre_y_um": 0.0,
+    }
+    stopped = _run(stand_wide, tmp_path, on_progress=stop_at_60, stop=stop, **params)
+    assert stopped.checkpoint is not None
+    assert stopped.checkpoint["total"] == 173
+    assert len(stopped.checkpoint["points"]) == 50
+    _tamper(tmp_path, next_index=160, skipped=110)
+
+    with pytest.raises(PluginRunError) as refused:
+        _run(stand_narrow, tmp_path, resume=True, **params)
+
+    assert str(refused.value) == (
+        "plate-finding: the checkpoint was made for a survey of 173 points inside "
+        "the soft limits and this one has 154: the stage's soft limits changed; "
+        "run plate-finding without --resume"
+    )
+    assert camera_narrow.snaps == 0
+
+
+def test_a_checkpoint_without_the_surveys_size_is_refused(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """A checkpoint from before the size was kept cannot say what its indices index; the runner refuses it."""
+    camera = _on_fake(
+        fake_microscope,
+        _plate_at(
+            well_level=800.0, plastic_level=800.0, texture_std=0.0, noise_std=0.0
+        ),
+    )
+    with pytest.raises(PluginRunError):
+        _run(fake_microscope, tmp_path, plates=["12-well"])
+    snaps = camera.snaps
+    _tamper(tmp_path, drop=("total",))
+
+    with pytest.raises(ResumeError, match="total"):
+        _run(fake_microscope, tmp_path, resume=True, plates=["12-well"])
+
     assert camera.snaps == snaps
 
 
@@ -860,7 +1227,9 @@ def test_a_readback_that_is_not_finite_is_a_skipped_point(
 
     result = _result(record)
     assert result.assumed == (
+        NO_LIMITS_LINE,
         "1 of 208 survey points could not be sampled and were skipped",
+        AUTOFOCUS_OFF_LINE,
     )
     assert result.fit is not None
     assert result.fit.n_samples == 207
@@ -878,7 +1247,9 @@ def test_a_few_failed_points_are_skipped_and_counted(
     result = _result(record)
     # Moves 20, 40, ..., 200 of 208 time out.
     assert result.assumed == (
+        NO_LIMITS_LINE,
         "10 of 208 survey points could not be sampled and were skipped",
+        AUTOFOCUS_OFF_LINE,
     )
     assert result.fit is not None
     assert result.fit.n_samples == 198
@@ -899,7 +1270,9 @@ def test_exactly_a_tenth_of_the_points_failing_is_not_too_many(
 
     result = _result(record)
     assert result.assumed == (
+        NO_LIMITS_LINE,
         "18 of 180 survey points could not be sampled and were skipped",
+        AUTOFOCUS_OFF_LINE,
     )
     assert result.fit is not None
     assert result.fit.n_samples == 162
@@ -928,6 +1301,202 @@ def test_failed_points_beyond_ten_percent_fail_the_survey(
     assert stored.checkpoint["skipped"] == 21
     assert len(stored.checkpoint["points"]) == 84
     assert camera.snaps == 84
+
+
+def _timeout() -> DeviceTimeoutError:
+    return DeviceTimeoutError("xy_stage did not arrive within 60 s\nretry")
+
+
+def test_three_failed_moves_in_a_row_end_the_survey(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """A stage that times out at every move failed at a tenth of the points: 1.9 h on a 96-well survey (#248)."""
+    camera = _on_fake(fake_microscope, _plate_at())
+    timeout = _timeout()
+    stage = _Stage(
+        fake_microscope.require(XYStage), raises={5: timeout, 6: timeout, 7: timeout}
+    )
+    fake_microscope.override(XYStage, stage)
+
+    reason = _refusal(fake_microscope, tmp_path, plates=["12-well"])
+
+    # Move 7 was sent to planned point 6.
+    x_um, y_um = survey_points("12-well", (0.0, 0.0))[6]
+    assert reason == (
+        "plate-finding: 3 survey points in a row could not be sampled, the last at "
+        f"({x_um:.1f}, {y_um:.1f}) µm: DeviceTimeoutError: xy_stage did not arrive "
+        "within 60 s; check the stage, then run plate-finding --resume"
+    )
+    stored = _stored(tmp_path)
+    assert stored.checkpoint is not None
+    assert stored.checkpoint["next_index"] == 7
+    assert stored.checkpoint["skipped"] == 3
+    assert len(stored.checkpoint["points"]) == 4
+    assert stage.moves == 7
+    assert camera.snaps == 4
+
+    # The resume starts its count at 0: a count carried over from the first
+    # attempt (3) would end it at its first failure. Points 7 and 8 fail, and 9
+    # is the first one sampled.
+    again = _Stage(fake_microscope.require(XYStage), raises={1: timeout, 2: timeout})
+    fake_microscope.override(XYStage, again)
+    camera.positions.clear()
+    record = _run(fake_microscope, tmp_path, resume=True, plates=["12-well"])
+
+    result = _result(record)
+    assert result.assumed == (
+        NO_LIMITS_LINE,
+        "5 of 208 survey points could not be sampled and were skipped",
+        AUTOFOCUS_OFF_LINE,
+    )
+    assert result.fit is not None
+    assert result.fit.n_samples == 203
+    assert camera.positions[0] == pytest.approx(
+        survey_points("12-well", (0.0, 0.0))[9], abs=0.05
+    )
+
+
+def test_a_dead_stage_ends_the_survey_at_the_bound_not_at_the_tenth(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """Every move times out: 3 moves, where the tenth of the points took 21 (and 113 on a 96-well plate)."""
+    camera = _on_fake(fake_microscope, _plate_at())
+    stage = _Stage(fake_microscope.require(XYStage), every=1)
+    fake_microscope.override(XYStage, stage)
+
+    reason = _refusal(fake_microscope, tmp_path, plates=["12-well"])
+
+    assert "3 survey points in a row could not be sampled" in reason
+    assert stage.moves == 3
+    assert camera.snaps == 0
+    stored = _stored(tmp_path)
+    assert stored.checkpoint is not None
+    assert stored.checkpoint["next_index"] == 3
+    assert stored.checkpoint["skipped"] == 3
+    assert stored.checkpoint["points"] == []
+
+
+def test_when_both_rules_apply_the_one_in_a_row_is_named(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """The 21st failure of 208 is also the third in a row: the order of the two rules is the message.
+
+    Moves 2, 4, ..., 36 fail alone (18 points, each followed by a success), then
+    moves 38, 39 and 40: the 21st failure is over a tenth (210 > 208) and the
+    third in a row at once.
+    """
+    _on_fake(fake_microscope, _plate_at())
+    timeout = _timeout()
+    failing = {move: timeout for move in (*range(2, 37, 2), 38, 39, 40)}
+    assert len(failing) == 21
+    fake_microscope.override(
+        XYStage, _Stage(fake_microscope.require(XYStage), raises=failing)
+    )
+
+    reason = _refusal(fake_microscope, tmp_path, plates=["12-well"])
+
+    assert reason.startswith(
+        "plate-finding: 3 survey points in a row could not be sampled, the last at ("
+    )
+    stored = _stored(tmp_path)
+    assert stored.checkpoint is not None
+    assert stored.checkpoint["next_index"] == 40
+    assert stored.checkpoint["skipped"] == 21
+
+
+def test_a_point_that_is_sampled_resets_the_count(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """Two in a row twice is not three in a row."""
+    _on_fake(fake_microscope, _plate_at())
+    timeout = _timeout()
+    stage = _Stage(
+        fake_microscope.require(XYStage),
+        raises={5: timeout, 6: timeout, 9: timeout, 10: timeout},
+    )
+    fake_microscope.override(XYStage, stage)
+
+    record = _run(fake_microscope, tmp_path, plates=["12-well"])
+
+    result = _result(record)
+    assert result.assumed == (
+        NO_LIMITS_LINE,
+        "4 of 208 survey points could not be sampled and were skipped",
+        AUTOFOCUS_OFF_LINE,
+    )
+    assert result.fit is not None
+    assert result.fit.n_samples == 204
+
+
+def test_max_failed_in_row_is_the_parameter_not_a_constant(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    _on_fake(fake_microscope, _plate_at())
+    timeout = _timeout()
+    stage = _Stage(fake_microscope.require(XYStage), raises={5: timeout})
+    fake_microscope.override(XYStage, stage)
+
+    reason = _refusal(
+        fake_microscope, tmp_path, plates=["12-well"], max_failed_in_row=1
+    )
+
+    assert "1 survey points in a row could not be sampled" in reason
+    stored = _stored(tmp_path)
+    assert stored.checkpoint is not None
+    assert stored.checkpoint["next_index"] == 5
+
+    # Four in a row is under 5, and 4 of 208 is under a tenth.
+    four = {5: timeout, 6: timeout, 7: timeout, 8: timeout}
+    fake_microscope.override(
+        XYStage, _Stage(fake_microscope.require(XYStage), raises=four)
+    )
+    record = _run(
+        fake_microscope,
+        tmp_path,
+        name="five.json",
+        plates=["12-well"],
+        max_failed_in_row=5,
+    )
+
+    result = _result(record)
+    assert result.fit is not None
+    assert result.fit.n_samples == 204
+
+
+def test_every_kind_of_failed_point_counts_in_a_row(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """A move that raises, a frame that is ``nan`` and a readback that is ``nan``: three in a row, whichever kind.
+
+    A failed move has no snap, so move 21's is snap 20.
+    """
+
+    def nan_at_20(snap: int, frame: npt.NDArray[np.uint16]) -> npt.NDArray[Any]:
+        if snap == 20:
+            return np.full(frame.shape, np.nan, dtype=np.float32)
+        return frame
+
+    _on_fake(fake_microscope, _plate_at(), spoil=nan_at_20)
+    fake_microscope.override(
+        XYStage,
+        _Stage(
+            fake_microscope.require(XYStage),
+            raises={20: _timeout()},
+            nan_readback_at=22,
+        ),
+    )
+
+    reason = _refusal(fake_microscope, tmp_path, plates=["12-well"])
+
+    assert "3 survey points in a row could not be sampled" in reason
+    assert reason.endswith(
+        ": the stage's readback is not a finite position; check the stage, then "
+        "run plate-finding --resume"
+    )
+    stored = _stored(tmp_path)
+    assert stored.checkpoint is not None
+    assert stored.checkpoint["next_index"] == 22
+    assert stored.checkpoint["skipped"] == 3
 
 
 def test_a_frame_value_that_is_not_finite_is_a_skipped_point(
@@ -968,7 +1537,9 @@ def test_a_frame_value_that_is_not_finite_is_a_skipped_point(
 
     result = _result(record)
     assert result.assumed == (
+        NO_LIMITS_LINE,
         "1 of 208 survey points could not be sampled and were skipped",
+        AUTOFOCUS_OFF_LINE,
     )
     assert result.fit is not None
     assert result.fit.n_samples == 207
@@ -1010,6 +1581,7 @@ def test_points_outside_the_soft_limits_are_not_visited(
     assert result.assumed == (
         f"{len(planned) - len(inside)} of {len(planned)} survey points are "
         "outside the stage's soft limits and were not sampled",
+        AUTOFOCUS_OFF_LINE,
     )
     assert result.fit is not None
     assert result.fit.n_samples == len(inside)
@@ -1090,7 +1662,7 @@ def test_limits_that_cut_nothing_say_nothing_and_a_point_on_a_limit_is_visited(
     record = _run(microscope, tmp_path, plates=["12-well"])
 
     result = _result(record)
-    assert result.assumed == ()
+    assert result.assumed == (AUTOFOCUS_OFF_LINE,)
     assert camera.snaps == 208
     assert result.fit is not None
     assert result.fit.n_samples == 208
@@ -1185,6 +1757,10 @@ def test_a_winner_larger_than_the_survey_is_refused(
         0.8,
     )
     camera = _on_fake(fake_microscope, sample)
+    # Off at the start: the survey reads it once, to know there is nothing to
+    # switch off. A refused fit is not a result, so nothing reads it again.
+    spy = _Autofocus(engaged=False)
+    fake_microscope.override(Autofocus, spy)
     planned = survey_points("24-well", centre, margin_pitches=0.52, jitter=0.0)
     assert survey_extent_note(planned, "24-well") is None
     assert survey_extent_note(planned, "6-well") is not None
@@ -1202,6 +1778,7 @@ def test_a_winner_larger_than_the_survey_is_refused(
     assert reason.startswith("plate-finding: 6-well fits best, but the survey spans ")
     assert reason.endswith(": run plate-finding with plate=6-well")
     assert camera.snaps == len(planned) == 247
+    assert spy.calls == ["is_engaged"]
 
     # Control: with a full pitch of margin the same plate is found.
     control = _run(fake_microscope, tmp_path, name="control.json", **params)
@@ -1303,6 +1880,8 @@ def test_an_unknown_or_non_well_plate_is_refused() -> None:
         {"seed": -1},
         {"centre_x_um": 2e6, "centre_y_um": 0.0},
         {"statistic": "median"},
+        {"max_failed_in_row": 0},
+        {"max_failed_in_row": 101},
     ],
 )
 def test_parameters_out_of_bounds_are_refused(bad: dict[str, Any]) -> None:
