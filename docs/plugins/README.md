@@ -95,12 +95,14 @@ the capabilities the plugin requires are checked before anything is written: a
 stand that lacks the XY stage gets one error naming every missing capability and
 `[roles.assign]`, and an untouched run document.
 
-**Stopping.** Ctrl-C stops any move under way, records the stage as `stopped`
-(its checkpoint kept) and exits 130. `--resume` continues the last attempt from
-its checkpoint, when the parameters and the profile are the same. A real run does
-not resume a dry run's checkpoint: it stands for work that was never done. A stage
-that is stale (something it read has been produced again since) is not resumed
-either: its checkpoint was made against inputs that no longer match.
+**Stopping.** Ctrl-C sends a stop to any move under way, records the stage as
+`stopped` (its checkpoint kept) and exits 130. The line it prints says what each
+stop did: on a stand whose profile declares `[safety] stop_refused_by`, a move
+that was sent runs to its target (m2 §11). `--resume` continues the last attempt
+from its checkpoint, when the parameters and the profile are the same. A real run
+does not resume a dry run's checkpoint: it stands for work that was never done. A
+stage that is stale (something it read has been produced again since) is not
+resumed either: its checkpoint was made against inputs that no longer match.
 
 **Exit codes.**
 

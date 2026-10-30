@@ -81,8 +81,12 @@ from smc.hardware.errors import (
     CapabilityMissingError,
     HardwareError,
     MicroscopeBusyError,
+    StopNote,
+    StopOutcome,
     StopRefusedError,
     join_names,
+    note_stop,
+    stop_notes,
 )
 from smc.hardware.profile import Profile
 from smc.hardware.roles import DeviceInfo, Role, RoleMap, core_roles, devices_from_core
@@ -151,6 +155,25 @@ class _Stops:
     done: list[str] = field(default_factory=list)
     refused: list[str] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
+
+
+def _note_still_moving(exc: BaseException | None, tracked: tuple[str, ...]) -> None:
+    """Note on ``exc`` each motion in ``tracked`` that its own notes do not name.
+
+    A Ctrl-C in a call that sends no move of its own (``wait()`` on a stage an
+    earlier give-up left tracked) carries no note, and the Ctrl-C line would say
+    that no move was under way while the stage travels (m2 §11.11 E6). A
+    motion whose give-up already left a note is not noted again, and a name is
+    noted once. A module function: it holds ``exc`` only as a parameter and
+    raises nothing, so no frame on a traceback keeps an exception (FM-98).
+    """
+    if exc is None or not tracked:
+        return
+    noted = {note.motion for note in stop_notes(exc)}
+    for name in tracked:
+        if name not in noted:
+            noted.add(name)
+            note_stop(exc, StopNote(name, StopOutcome.still_moving))
 
 
 @dataclass
@@ -835,7 +858,26 @@ class Microscope:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        self.close()
+        """Release the stand; a Ctrl-C leaving the block is noted with what is still tracked.
+
+        What the registry tracks is read before ``close()``, which sends the
+        stops and may drop a motion that reads idle, and noted in a ``finally``
+        after it, so a ``close()`` that raises loses no note. Only for a
+        ``KeyboardInterrupt``: it is the one error whose line reads the notes
+        (m2 §11.11 E6). Nothing is kept on ``self``, no other lock is taken
+        and nothing is written (FM-70). The read is inside its own ``try``
+        whose ``finally`` is ``close()``: a second Ctrl-C in the read loses the
+        note, never the release.
+        """
+        tracked: tuple[str, ...] = ()
+        try:
+            try:
+                if isinstance(exc, KeyboardInterrupt):
+                    tracked = self._executor.moving()
+            finally:
+                self.close()
+        finally:
+            _note_still_moving(exc, tracked)
 
     def _stop_if_moving(self) -> bool:
         """For ``close()``: stop every stage if anything still moves; whether it did.
@@ -901,7 +943,12 @@ class Microscope:
             try:
                 done = self._stop_one(capability, role)
             except StopRefusedError as exc:
-                stops.refused.extend(exc.refused)
+                # Once each, in order of first appearance: Z's stop reaches
+                # the offset again through its link, and `refused` also names
+                # the offset device's own (m2 §11.11 E1).
+                for name in exc.refused:
+                    if name not in stops.refused:
+                        stops.refused.append(name)
             except Exception as exc:
                 label = self.roles.get(role)
                 kind = role.value if capability is None else capability.__name__

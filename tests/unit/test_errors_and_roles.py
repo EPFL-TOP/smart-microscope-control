@@ -1,3 +1,4 @@
+import dataclasses
 import pickle
 
 import pytest
@@ -149,9 +150,9 @@ def _raised_with_context(first: BaseException, second: BaseException) -> BaseExc
 
 
 def test_stop_notes_reads_the_context_chain_oldest_first() -> None:
-    accepted = StopNote("xy_stage XY", StopOutcome.accepted, False)
-    refused = StopNote("z Z", StopOutcome.refused, True)
-    cut = StopNote("xy_stage XY", StopOutcome.interrupted, False)
+    accepted = StopNote("xy_stage XY", StopOutcome.accepted)
+    refused = StopNote("z Z", StopOutcome.refused)
+    cut = StopNote("xy_stage XY", StopOutcome.interrupted)
     first, second = KeyboardInterrupt(), KeyboardInterrupt()
     note_stop(first, accepted)
     note_stop(first, refused)
@@ -163,9 +164,41 @@ def test_stop_notes_reads_the_context_chain_oldest_first() -> None:
     assert stop_notes(raised) == (accepted, refused, cut)
 
 
+def test_stop_notes_ignores_an_older_error_the_interrupt_was_raised_inside() -> None:
+    # A plugin catches a failed move and a Ctrl-C lands in its handler: the old
+    # stop is the plugin's earlier business, not what this interrupt did (E5).
+    old = StopNote("xy_stage XY", StopOutcome.failed)
+    failed = HardwareError("xy_stage: stop('XY') failed")
+    note_stop(failed, old)
+    interrupt = _raised_with_context(failed, KeyboardInterrupt())
+    assert isinstance(interrupt.__context__, HardwareError)
+    assert stop_notes(interrupt) == ()
+    # Its own note is read, and still only its own.
+    own = StopNote("z Z", StopOutcome.accepted)
+    note_stop(interrupt, own)
+    assert stop_notes(interrupt) == (own,)
+
+
+def test_stop_notes_follows_a_chain_of_interrupts_only() -> None:
+    # A second Ctrl-C inside a give-up's stop belongs with the first; the error
+    # that the first was raised inside does not.
+    older = ValueError("a plugin's own error")
+    note_stop(older, StopNote("xy_stage XY", StopOutcome.failed))
+    first, second = KeyboardInterrupt(), KeyboardInterrupt()
+    a = StopNote("xy_stage XY", StopOutcome.refused)
+    b = StopNote("xy_stage XY", StopOutcome.interrupted)
+    note_stop(first, a)
+    note_stop(second, b)
+    last = _raised_with_context(_raised_with_context(older, first), second)
+    assert last is second
+    assert last.__context__ is first
+    assert first.__context__ is older
+    assert stop_notes(last) == (a, b)
+
+
 def test_stop_notes_ends_on_a_context_chain_that_loops() -> None:
     first, second = KeyboardInterrupt(), KeyboardInterrupt()
-    note = StopNote("xy_stage XY", StopOutcome.refused, True)
+    note = StopNote("xy_stage XY", StopOutcome.refused)
     note_stop(first, note)
     first.__context__, second.__context__ = second, first
     assert stop_notes(first) == (note,)
@@ -182,7 +215,7 @@ def test_a_note_on_an_exception_that_takes_none_is_dropped_not_raised() -> None:
     # `_move` notes every exception a move raises: a note that raised would
     # replace that exception with its own AttributeError.
     frozen = _FrozenError("the plugin's own error")
-    note_stop(frozen, StopNote("xy_stage XY", StopOutcome.refused, True))
+    note_stop(frozen, StopNote("xy_stage XY", StopOutcome.refused))
     assert stop_notes(frozen) == ()
 
 
@@ -193,8 +226,12 @@ def test_stop_notes_of_an_exception_without_notes_is_empty() -> None:
 
 def test_a_stop_note_holds_no_exception() -> None:
     # FM-98: a note that held the error would keep its traceback, and the core.
-    note = StopNote("xy_stage XY", StopOutcome.refused, True)
-    assert all(
-        isinstance(value, str | bool)
-        for value in (note.motion, note.outcome, note.declared)
-    )
+    note = StopNote("xy_stage XY", StopOutcome.refused)
+    # Two fields, a string and an enum: whether the role is declared is the
+    # outcome (`refused` or `failed`), not a bool beside it (m2 §11.11 E4).
+    assert [field.name for field in dataclasses.fields(StopNote)] == [
+        "motion",
+        "outcome",
+    ]
+    assert type(note.motion) is str
+    assert isinstance(note.outcome, StopOutcome)

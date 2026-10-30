@@ -319,8 +319,11 @@ def _interrupted_line(notes: Sequence[StopNote]) -> str:
     It said "any move under way was stopped" whatever the stop did, and on
     the Ti2-E, which refuses every stop, the stage went the full 20000 µm
     (#208, FM-117). The layer sends a move only inside the ``Executor``'s
-    ``_move``, and every Ctrl-C there leaves a note, so no note means that no
-    move was under way.
+    ``_move``, and every Ctrl-C there leaves a note; one that leaves the
+    stand's ``with`` is also noted with each motion the registry still tracks
+    (``Microscope.__exit__``, m2 §11.11 E6). So no note means that no move was
+    under way that the layer knows of: the Ti2-E's Z drive never reads busy,
+    so a Z move still running there is not tracked (m2 §11.10).
     """
     read = "read the position (smc stage get, smc z get) before the next move"
     if not notes:
@@ -334,18 +337,29 @@ def _interrupted_line(notes: Sequence[StopNote]) -> str:
 def _note_clause(note: StopNote) -> str:
     """One stop of the Ctrl-C line, in the words of m2 §11.6."""
     name = note.motion
-    if note.outcome is StopOutcome.accepted:
+    outcome = note.outcome
+    # One branch per outcome, so that a member added later fails here and never
+    # falls into another one's text (it read "second Ctrl-C" for every member
+    # that had no branch).
+    if outcome is StopOutcome.accepted:
         return f"{name} was stopped"
-    if note.outcome is StopOutcome.refused:
-        if note.declared:
-            return (
-                f"{name} refuses a stop on this stand ([safety] stop_refused_by), "
-                f"so it runs to its target"
-            )
-        return f"{name} refused the stop, so it may still be moving"
-    if note.outcome is StopOutcome.impossible:
+    if outcome is StopOutcome.refused:
+        return (
+            f"{name} refuses a stop on this stand ([safety] stop_refused_by), "
+            f"so it runs to its target"
+        )
+    if outcome is StopOutcome.failed:
+        return f"the stop of {name} failed, so it may still be moving"
+    if outcome is StopOutcome.impossible:
         return f"{name} cannot be stopped from smc, so it may still be moving"
-    return f"the stop of {name} was cut by a second Ctrl-C, so it may still be moving"
+    if outcome is StopOutcome.interrupted:
+        return f"the stop of {name} was cut by a Ctrl-C, so it may still be moving"
+    if outcome is StopOutcome.still_moving:
+        return (
+            f"{name} was still tracked as moving when the stand was released; "
+            f"close()'s log line says what its stop did"
+        )
+    raise AssertionError(f"no Ctrl-C clause for {outcome!r}")
 
 
 def _stop_refused_line(roles: Iterable[Role]) -> str | None:
@@ -1898,7 +1912,9 @@ def run_command(
     and the run document read, before the stand is opened. The result is printed
     after the stand is released, and is in the run document, which is rewritten
     atomically and never overwritten when it cannot be read. A plugin may take
-    a while: Ctrl-C stops any move under way and records the stage as stopped.
+    a while: Ctrl-C sends a stop to any move under way and records the stage as
+    stopped; a stand that refuses stop() lets a sent move run to its target, and
+    the line printed says what each stop did.
     """
     with _Reported(ctx, after_report=_print_unsaved_result):
         if list_plugins:

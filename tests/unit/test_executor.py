@@ -1739,9 +1739,11 @@ def test_a_second_ctrl_c_in_the_give_up_log_still_leaves_the_motion_tracked() ->
             _move(executor, xy, timeout_s=0.05)
     finally:
         LOGGER.removeHandler(handler)
-    # The interrupted give-up runs again from the action's except: a second
-    # stop is harmless, a missing one is not.
-    assert xy.stops >= 1
+    # The interrupted give-up is not run again from the action's except: its
+    # stop was sent once, and `close()` sends it again to what stays tracked
+    # (m2 §11.11 E3). A second stop from `_move` would run under the hazard that
+    # cut the first.
+    assert xy.stops == 1
     assert executor.moving() == ("xy_stage XY",)
 
 

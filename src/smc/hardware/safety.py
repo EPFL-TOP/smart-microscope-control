@@ -886,6 +886,19 @@ class Executor:
         deadline = time.monotonic() + limit_s
         sending = idle = gave_up = False
         previous: str | None = None
+
+        def registered() -> None:
+            # Run by the give-up right after it registered the motion. The flag
+            # goes up here, not before the give-up: a Ctrl-C that cuts the give-up
+            # before the motion is registered leaves nothing for ``close()`` to
+            # retry, so the `except` below must give up again, as it always did.
+            # Once the motion is registered, ``close()`` is the retry, and a
+            # second give-up from here would run under the hazard that cut the
+            # first (m2 §11.11 E3, FM-168).
+            nonlocal gave_up
+            gave_up = True
+            self._set_waiting(previous)
+
         try:
             previous = self._set_waiting(motion.name)
             try:
@@ -907,12 +920,20 @@ class Executor:
                 )
             idle = self._poll_until_idle(motion, deadline)
             if not idle:
-                outcome, _ = self._give_up(
-                    motion,
-                    f"{limit_s:g} s timeout",
-                    registered=lambda: self._set_waiting(previous),
-                )
-                gave_up = True
+                try:
+                    outcome, _ = self._give_up(
+                        motion, f"{limit_s:g} s timeout", registered=registered
+                    )
+                except BaseException as cut:
+                    # A Ctrl-C that cut the stop (or its line): it may not have
+                    # got through, and the motion is registered, so it is not
+                    # given up on again below; ``close()`` sends the stop once
+                    # more. Without the note the Ctrl-C line would say that no
+                    # move was under way. A cut before the registration is not
+                    # noted: the `except` below gives up, and notes what that did.
+                    if gave_up:
+                        note_stop(cut, StopNote(motion.name, StopOutcome.interrupted))
+                    raise
                 if self._generation(motion.device) != generation:
                     # The caller asked for the stop: the move ended as stopped,
                     # and the timeout is no reason to raise device_timeout_ms.
@@ -946,24 +967,18 @@ class Executor:
             if sending and not (idle or gave_up):
                 try:
                     _, stopped = self._give_up(
-                        motion,
-                        type(exc).__name__,
-                        registered=lambda: self._set_waiting(previous),
+                        motion, type(exc).__name__, registered=registered
                     )
                 except BaseException as cut:
                     # A second Ctrl-C inside the stop: its stop may not have
                     # reached the device. Noted on the new exception, whose
-                    # context is ``exc`` (m2 §11.4).
-                    note_stop(
-                        cut,
-                        StopNote(
-                            motion.name, StopOutcome.interrupted, motion.stop_refused
-                        ),
-                    )
+                    # context is ``exc`` (m2 §11.4); the try covers the call's own
+                    # set-up too, and no further stop is sent (§11.11 E3).
+                    note_stop(cut, StopNote(motion.name, StopOutcome.interrupted))
                     raise
                 # Only once the give-up has returned: a note never says
                 # "accepted" for a stop that was not sent.
-                note_stop(exc, StopNote(motion.name, stopped, motion.stop_refused))
+                note_stop(exc, StopNote(motion.name, stopped))
             raise
         finally:
             self._set_waiting(previous)
@@ -1333,6 +1348,10 @@ class Executor:
             if interrupted is not None:
                 raise interrupted
             if isinstance(error, StopRefusedError) and failure is not None:
+                if isinstance(failure, StopRefusedError):
+                    # Two refusals say nothing is broken, and the caller must
+                    # hear of both: the link's alone left Z's own out (#224).
+                    return _merged_refusal(failure, error)
                 # A declared refusal is no fault, and a link that failed (PFS
                 # still on, so still driving Z) is: the caller hears of it.
                 return failure
@@ -1572,6 +1591,19 @@ class Executor:
             note = "; it still reads busy"
         return f"{note}, so it counts as moving until it is idle"
 
+    def _give_up_note(
+        self, motion: Motion, registration: _Registration, failed: bool
+    ) -> str:
+        """The note on a give-up's line: the declaration of a failed stop, then the busy note.
+
+        The CLI line says that a move on a declared role runs to its target,
+        so the log must not name the failure alone (#224). The registration
+        is checked in every case: ``_keep_while_moving`` drops it once the
+        device reads idle, and the line is written whatever it answers.
+        """
+        declared = _DECLARED_LINE_NOTE if failed and motion.stop_refused else ""
+        return declared + self._keep_while_moving(motion, registration)
+
     def _track(self, motion: Motion) -> _Registration:
         registration = _Registration(motion)
         with self._registry_lock:
@@ -1644,7 +1676,7 @@ class Executor:
         error = self._send_safe(
             send,
             f"{motion.name}: stop after {why}",
-            then=lambda _: self._keep_while_moving(motion, registration),
+            then=lambda failed: self._give_up_note(motion, registration, failed),
         )
         try:
             if error is None:
@@ -1653,7 +1685,7 @@ class Executor:
                 return _GAVE_UP_DECLARED, StopOutcome.refused
             return (
                 f"the stop failed ({error!r}), so it may still be moving",
-                StopOutcome.refused,
+                StopOutcome.failed,
             )
         finally:
             # A returned error reaches this frame through its traceback's
@@ -1739,6 +1771,20 @@ def _declared_refusal(motion: Motion, error: Exception) -> StopRefusedError:
     refused = StopRefusedError((motion.name,))
     refused.__cause__ = error
     return refused
+
+
+def _merged_refusal(link: StopRefusedError, own: StopRefusedError) -> StopRefusedError:
+    """One ``StopRefusedError`` for a linked call and a device that both refused.
+
+    Names in the order the stops were sent, the link's first, each once, with
+    the default message. Its cause is the device's own refusal's, the error of
+    the device the caller asked to stop (m2 §11.11 E1). A module function, like
+    ``_declared_refusal``: no frame that is on a traceback holds an error
+    (FM-98).
+    """
+    merged = StopRefusedError(tuple(dict.fromkeys((*link.refused, *own.refused))))
+    merged.__cause__ = own.__cause__
+    return merged
 
 
 def _repr_of(error: BaseException) -> str:
