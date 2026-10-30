@@ -1886,27 +1886,31 @@ class PlateFindingParams(PluginParams):
     step_um: float | None = Field(None, gt=0.0, le=20_000.0)
     margin_pitches: float = Field(1.0, ge=0.0, le=5.0)
     jitter: float = Field(0.5, ge=0.0, le=1.0)
-    seed: int = 0
+    seed: int = Field(0, ge=0)
     statistic: Literal["mean", "std"] = "mean"
+    max_failed_in_row: int = Field(3, ge=1, le=100)
 ```
 
 `plate` sets the survey's extent; `plates` the candidates fitted (empty:
 every registered `-well` plate). The centre is both coordinates or
-neither (a model validator); neither is the stage's position.
+neither (a model validator), each within ±1 000 000 µm (FM-32); neither
+is the stage's position. `max_failed_in_row` is `scan`'s (§8), and is
+decided in *Refined while planning #248* below.
 
 - **The autofocus.** It cannot lock over the plastic between wells. When
   it is engaged, the plugin calls `disengage()` (a safe call, no motion)
-  before the first move, never engages it again (FM-88: engaging drives
-  Z), and adds a note `PFS was switched off for the survey; engage it
-  again before the scan`.
+  before the first move, logs a WARNING, and never engages it again
+  (FM-88: engaging drives Z). What the result says about it is the
+  autofocus's state at the end of the survey, decided in *Refined while
+  planning #248* below.
 - **The loop**: per point `ctx.raise_if_stopped()`, `move_to_um`, `snap`,
   the statistic, `ctx.progress`. A `SafetyRefusedError` (a point outside
   the soft limits) and any other `HardwareError` except the halt and the
-  motion stop skip the point, counted; more than 10 % skipped is a
-  `PluginRunError`. The survey is the checkpoint
-  (`SurveyCheckpoint(points: tuple[SurveyPoint, ...])`, saved every 50
-  points and at the end), so a failed fit keeps it and `--resume` refits
-  without moving (§1.4).
+  motion stop skip the point, counted; more than 10 % skipped, or
+  `max_failed_in_row` in a row, is a `PluginRunError`. The survey is the
+  checkpoint (`SurveyCheckpoint`, below), saved before the first move,
+  every 50 points and at the end, so a failed fit keeps it and `--resume`
+  refits without moving (§1.4).
 - `decide` returning `None` is a `PluginRunError` with its notes; a
   "barely beats" note goes into `fit.notes` of a usable result. A dry run
   is refused as in §4.
@@ -1915,7 +1919,7 @@ neither (a model validator); neither is the stage's position.
 `test_the_survey_fills_the_plate_slot_on_the_demo` with a `PlateSample`
 and a coarse step; `test_an_engaged_autofocus_is_switched_off_and_not_relocked`
 (fake); `test_a_failed_fit_keeps_the_survey_for_a_resume`. **Failure
-modes**: FM-64, FM-88, FM-12.
+modes**: FM-64, FM-88, FM-12, FM-141, FM-142.
 
 **Refined while planning #20** (measured 2026-10-28 on a prototype that is
 not committed: `plate_find.py` copied from `nikon-control@1aad7c9`, which
@@ -1971,24 +1975,46 @@ pymmcore-plus 0.18.1, Python 3.13):
   `limits_um()` is `None`.
 - **On the Ti2-E as profiled, every plate is refused before it moves.** The
   soft limits span 98 × 58 mm. The extent check needs the wells' span plus
-  one pitch: 108 × 72 mm for the 96- and 384-well plates, 116 × 77 mm for the
-  24-well plate. Whether the limits can be widened is the owner's call at
-  the stand (#198). At one pitch of margin, a 96-well survey (117 × 81 mm, ±
-  1.5 mm of jitter) stays inside the plate's SBS footprint of 127.8 × 85.5
-  mm. A 6-well survey (156 × 117 mm) and any larger margin do not.
+  one pitch: 108 × 72 mm for the 96- and 384-well plates, 114 × 76 mm for the
+  24-well plate (6 × 4 wells at a 19 mm pitch). Whether the limits can be
+  widened is the owner's call at the stand (#198). At one pitch of margin, a
+  96-well survey (117 × 81 mm, ± 1.5 mm of jitter) stays inside the plate's
+  SBS footprint of 127.8 × 85.5 mm. A 6-well survey (156 × 117 mm) and any
+  larger margin do not.
 - **The checkpoint** is `SurveyCheckpoint(centre_um: tuple[float, float],
-  next_index: int, skipped: int, points: tuple[SurveyPoint, ...])`.
+  total: int, next_index: int, skipped: int, points: tuple[SurveyPoint,
+  ...])` (`total` is decided in *Refined while planning #248* below).
   `next_index` counts the planned points handled, sampled or skipped, in the
   list left after the soft limits. The centre is kept because without
   parameters it is the stage's position at the start, and on a resume the
-  stage is elsewhere. A resume rebuilds the planned list from the parameters
-  and the kept centre. It is refused when `next_index` exceeds the list's
-  length, or `skipped + len(points) != next_index`, with `run plate-finding
-  without --resume`. A pydantic model built from Python objects does not
-  validate a nested dataclass instance again: a `SurveyPoint` holding `nan`
-  is accepted, and refused only when the JSON is read back. So the loop never
-  builds a `SurveyPoint` whose value is not finite. Such a point is a skipped
-  point (`the frame's <statistic> is not finite`).
+  stage is elsewhere. **It is saved before the first move** (FM-141), then
+  every 50 points and at the end: a survey stopped before its 50th point
+  would otherwise leave no centre, and the resume would survey around
+  wherever the stage stopped (reproduced in the review of #20: 208 points
+  from −112 mm to +21 mm in x, `done`, nothing in `assumed`). A resume
+  rebuilds the planned list from the parameters and the kept centre. It is
+  refused when `next_index` exceeds the list's length, or `skipped +
+  len(points) != next_index`, with `run plate-finding without --resume`. A
+  pydantic model built from Python objects does not validate a nested
+  dataclass instance again: a `SurveyPoint` holding `nan` is accepted, and
+  refused only when the JSON is read back. So the loop never builds a
+  `SurveyPoint` whose value is not finite. Such a point is a skipped point
+  (`the frame's <statistic> is not finite`).
+- **A point is where the stage says it was** (FM-142). `move_to_um` returns
+  the position reached, and the `SurveyPoint` is built from it, not from the
+  target. A stage that stops short of a target without an error (clamped at
+  45 mm in the test) gave a survey of the 12-well plate that was `done`,
+  scored 0.6, had A1 26 mm (a pitch) off and an empty `assumed`; placed
+  where the stage says it was, the survey spans 90 mm and the extent check
+  refuses it. A readback that is not finite is a skipped point (`the
+  stage's readback is not a finite position`).
+- **Bounds the plan left out** (FM-32, from the review of #20). `seed >= 0`;
+  a centre coordinate within ±1 000 000 µm (no stage travels a metre: a
+  centre that far out is a unit slip); a plate named twice in `plates` is
+  refused (`plate-finding fits each plate once`). A survey with fewer than
+  2 points inside the soft limits is refused before moving (`only <n> of
+  <N> survey points are inside the stage's soft limits`). Limits that cut
+  nothing say nothing, and a point exactly on a limit is visited.
 - **Skips.** `skipped * 10 > total`, checked at each skip in integers, where
   `total` is the length of the planned list, saves the checkpoint and raises
   `PluginRunError`: `<k> of <N> survey points could not be sampled, the last
@@ -1999,10 +2025,10 @@ pymmcore-plus 0.18.1, Python 3.13):
   algorithm: `np.mean` or `np.std` with `dtype=np.float64`.
 - **The autofocus line** is `the autofocus was switched off for the survey;
   engage it again before the scan`, logged as a WARNING when it is switched
-  off, and added to `assumed`. The autofocus is switched off only when
-  `is_engaged()` and at least one point is left to visit: a resume that only
-  fits moves nothing. On the fake, `disengage()` logs
-  `enableContinuousFocus(False)`.
+  off (since #248 the result's own line is the measured one, below). The
+  autofocus is switched off only when `is_engaged()` and at least one point
+  is left to visit: a resume that only fits moves nothing. On the fake,
+  `disengage()` logs `enableContinuousFocus(False)`.
 - **The result.** `PlateFit.to_result(*, runner_up: str | None, margin:
   float | None, notes: Sequence[str], assumed: Sequence[str] = ()) ->
   PlateResult`. `notes` are `decide`'s, which include the winner's own notes
@@ -2019,6 +2045,73 @@ pymmcore-plus 0.18.1, Python 3.13):
   centre 0.23 of a well radius off. At the default velocity the same survey
   takes 350 s. A 96-well survey takes 16 s even at the high velocity (14 ms
   per point), too long for the default suite.
+
+**Refined while planning #248** (2026-10-29; each behaviour below was
+reproduced on the merged code with a throwaway test on the fake core, and
+the pass rates of the margin on `survey_points` and `survey_extent_note`
+over eight seeds):
+
+- **A stage that fails every move ends the survey at the third.** Today
+  three failed moves in a row leave a `done` survey with 205 samples, and a
+  stage that fails every move ends it only at the 21st of 208 points, when
+  `skipped * 10 > total`. On a 96-well survey that is 113 failures, 1.9 h at
+  the 60 s move timeout of the shipped profiles. `max_failed_in_row` (default
+  3, 1 to 100, as `scan`'s, §8) counts the skipped points in a row of every
+  kind: a failed move, a frame whose value is not finite, a readback that is
+  not finite. A sampled point resets it, and a resume restarts it at 0 (the
+  operator checked the stage). It is checked first at each skip; either
+  rule saves the checkpoint (`next_index = i + 1`) and raises
+  `PluginRunError`: `<n> survey points in a row could not be sampled, the
+  last at (<x>, <y>) µm: <Type>: <first line>; check the stage, then run
+  plate-finding --resume`. The text of the rule of a tenth does not change.
+- **The checkpoint keeps the survey's size.** `SurveyCheckpoint.total`
+  (`int`, `ge=0`, required) is `len(kept)`, the points left inside the soft
+  limits. The checkpoint's `next_index` indexes the list `kept`, which is
+  rebuilt from the limits each attempt reads, and the runner compares the
+  profile's name, not its `[safety]`. Reproduced: stopped at 50 of 154
+  points on limits that kept 154, resumed on limits that keep 173: `done`,
+  173 samples, every index shifted. A resume is refused when `total`
+  differs from this attempt's, before the other two checks: `the checkpoint
+  was made for a survey of <a> points inside the soft limits and this one
+  has <b>: the stage's soft limits changed; run plate-finding without
+  --resume`. A checkpoint without `total` (made before #248) is refused by
+  `ctx.checkpoint` as any the model does not accept. The count is not a
+  fingerprint: limits that move and keep the count pass it, which takes two
+  edits at once and is not guarded.
+- **What the result says about the autofocus is measured at the end.** A
+  survey that switched the autofocus off, was stopped, and was resumed ended
+  `done` with an empty `assumed` (reproduced): the line died with the first
+  attempt, and the resume found the autofocus off. Recording the switch-off
+  in the checkpoint would still be silent when the operator switched it off,
+  and would be stale when the operator engaged it again between attempts.
+  So the result says what is true when it is built: when an `Autofocus`
+  exists and `is_engaged()` is false, `assumed` gains `the autofocus is off
+  after the survey; the scan never switches it on: lock it on the sample
+  before the scan`. Nothing is added when it is engaged or the stand has no
+  autofocus (the demo and the fake do have one, switched off). The WARNING at
+  the switch-off stays and the line in `assumed` made at the switch-off goes:
+  one line, not two. The read at the end is made after the fit has passed
+  its checks. `MicroscopeHaltedError` and `MotionStoppedError` propagate
+  from it (FM-64); another `HardwareError` is a finding and not a lost
+  survey: `the autofocus's state could not be read after the survey
+  (<Type>: <first line>); check it before the scan`.
+- **Unknown soft limits are labelled.** `limits_um()` is `None` on the
+  demo, the fake and every stand whose profile has no `xy_soft_limits_um`
+  (the Ti2-E's is the only one): `assumed` gains `the stage reports no soft
+  limits, so the survey's moves were not checked against any travel`.
+- **The order of `assumed`**: the limits line (cut points, or unknown
+  limits), the skipped-points line, the autofocus line.
+- **`margin_pitches` is a margin on each side, and the check is one pitch in
+  all.** `survey_extent_note` asks for the wells' span plus one pitch, which
+  is 0.5 of a margin on each side. Measured on the 96-, 12- and 24-well
+  plates: with `jitter=0` the check passes from 0.50 and not at 0.48; with
+  the default jitter it passes at 0.45 on every seed, and at 0.40 on all
+  eight for the 96-well plate and 7 of 8 for the others, because the nudge
+  moves the outermost points outwards. The parameter's description says: how
+  far past the outer wells the survey reaches on each side, in pitches; a
+  survey that spans less than the outer wells plus one pitch is refused,
+  because A1 cannot be pinned down: about 0.5 here, a little less with
+  jitter. The extent note's own text is a port and does not change.
 
 ## 7. Wells and the scan plan (#21)
 
