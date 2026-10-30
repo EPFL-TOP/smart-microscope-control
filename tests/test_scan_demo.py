@@ -29,6 +29,7 @@ import numpy.typing as npt
 import pytest
 import tifffile
 
+import smc.plugins.scan.plugin as scan_plugin
 from smc.hardware import Microscope
 from smc.hardware.capabilities import (
     XY,
@@ -695,6 +696,14 @@ def _foreign_well(fields: list[dict[str, Any]]) -> None:
     fields[1]["name"] = "Z9_0000"
 
 
+def _device_name(fields: list[dict[str, Any]]) -> None:
+    fields[1]["name"] = "nul"
+
+
+def _case_only(fields: list[dict[str, Any]]) -> None:
+    fields[1]["name"] = fields[0]["name"].lower()
+
+
 @pytest.mark.parametrize(
     ("edit", "reason"),
     [
@@ -713,8 +722,19 @@ def _foreign_well(fields: list[dict[str, Any]]) -> None:
             "field 'Z9_0000' is of well 'Z9', which the scan plan does not list: "
             "run scan-plan again with the stand as it is now",
         ),
+        (
+            _device_name,
+            "field 'nul' of well 'A1': 'nul' is a Windows device name and cannot be "
+            "a frame's field name in a file path",
+        ),
+        (
+            _case_only,
+            "fields 'A1_0000' of well 'A1' and 'a1_0000' of well 'A1' would write "
+            "one file, as the file system does not tell upper from lower case: run "
+            "scan-plan again with the stand as it is now",
+        ),
     ],
-    ids=["dot-dot", "duplicate", "foreign-well"],
+    ids=["dot-dot", "duplicate", "foreign-well", "device-name", "case-only"],
 )
 def test_a_plan_whose_paths_cannot_be_written_is_refused_before_anything_moves(
     edit: Callable[[list[dict[str, Any]]], None], reason: str, rig: _Rig
@@ -723,6 +743,84 @@ def test_a_plan_whose_paths_cannot_be_written_is_refused_before_anything_moves(
     _edit_plan(rig, edit)
 
     assert _refused(rig) == reason
+
+
+def test_the_paths_are_resolved_once_before_the_scan(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FM-116: a ``resolve`` at every frame is a share that can drop at every frame (24 calls before)."""
+    real = scan_plugin.resolve_in_run
+    calls: list[str] = []
+
+    def counted(run_dir: Path, relative: str) -> Path:
+        calls.append(relative)
+        return real(run_dir, relative)
+
+    monkeypatch.setattr(scan_plugin, "resolve_in_run", counted)
+
+    assert len(_result(_scan(rig)).frames) == 12
+
+    assert len(calls) == 12
+    assert len(set(calls)) == 12
+
+
+def test_a_share_that_drops_while_the_paths_are_checked_is_unreadable_not_a_plan_error(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FM-116: a ``ValueError`` whose cause is an ``OSError`` is the folder, not the plan's text."""
+
+    def dropped(run_dir: Path, relative: str) -> Path:
+        cause = OSError(64, "The specified network name is no longer available")
+        raise ValueError(f"{relative!r} cannot be resolved") from cause
+
+    monkeypatch.setattr(scan_plugin, "resolve_in_run", dropped)
+
+    assert _refused(rig) == (
+        "the run folder cannot be read (The specified network name is no longer "
+        "available): check the disk or the network share, then run scan --resume"
+    )
+
+
+# The longest path the scan writes is the temporary file beside a frame, 18
+# characters longer than its name. Every frame of the 12 has the same length.
+_TEMPORARY_BESIDE_A_FRAME = len("/scan/" + "t" * 12 + "/A1/A1_0000.tif") + 18
+
+
+def _longest_path_chars(rig: _Rig) -> int:
+    return len(str(rig.run_dir.resolve())) + _TEMPORARY_BESIDE_A_FRAME
+
+
+def test_a_path_that_windows_would_refuse_is_refused_before_anything_moves(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Item 4: a path of 260 characters or more fails at the first write on a PC without long paths."""
+    n = _longest_path_chars(rig)
+    monkeypatch.setattr(scan_plugin, "ON_WINDOWS", True)
+    monkeypatch.setattr(scan_plugin, "MAX_PATH", n)
+
+    assert _refused(rig) == (
+        f"a frame's path would reach {n} characters while it is written, and "
+        f"Windows takes {n - 1} at most unless long paths are enabled (not "
+        "assumed): move the run document to a shorter folder, then run scan again"
+    )
+
+
+def test_a_path_one_short_of_the_limit_is_written(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scan_plugin, "ON_WINDOWS", True)
+    monkeypatch.setattr(scan_plugin, "MAX_PATH", _longest_path_chars(rig) + 1)
+
+    assert len(_result(_scan(rig)).frames) == 12
+
+
+def test_a_long_path_is_not_refused_off_windows(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scan_plugin, "ON_WINDOWS", False)
+    monkeypatch.setattr(scan_plugin, "MAX_PATH", 1)
+
+    assert len(_result(_scan(rig)).frames) == 12
 
 
 # ------------------------------------------------------------- at every well
@@ -960,31 +1058,134 @@ def test_a_stopped_motion_is_not_a_failed_field(rig: _Rig) -> None:
     assert rig.stage.moves == 3
 
 
-def test_an_oserror_writing_a_frame_ends_the_scan(
-    rig: _Rig, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import smc.plugins.scan.plugin as scan_plugin
-
+def _fail_write(monkeypatch: pytest.MonkeyPatch, call: int, error: OSError) -> None:
+    """Make the ``call``-th frame write of the scan raise ``error``; the others are real."""
     real = scan_plugin.write_atomically
     calls = 0
 
-    def full_disk(path: Path, data: bytes, *, make_parents: bool = True) -> None:
+    def write(path: Path, data: bytes, *, make_parents: bool = True) -> None:
         nonlocal calls
         calls += 1
-        if calls == 2:
-            raise AtomicWriteError(OSError(errno.ENOSPC, "No space left on device"))
+        if calls == call:
+            raise error
         real(path, data, make_parents=make_parents)
 
-    monkeypatch.setattr(scan_plugin, "write_atomically", full_disk)
+    monkeypatch.setattr(scan_plugin, "write_atomically", write)
 
-    with pytest.raises(OSError, match="No space left on device") as raised:
+
+def _token(rig: _Rig) -> str:
+    """The folder of the frames under ``scan/``: the token the scan chose."""
+    (folder,) = (rig.run_dir / "scan").iterdir()
+    return folder.name
+
+
+def test_a_full_disk_writing_a_frame_ends_the_scan_with_what_to_do(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fail_write(
+        monkeypatch,
+        2,
+        AtomicWriteError(OSError(errno.ENOSPC, "No space left on device")),
+    )
+
+    with pytest.raises(PluginRunError) as raised:
         _scan(rig)
 
-    assert isinstance(raised.value, AtomicWriteError)
+    assert raised.value.reason == (
+        f"the frame scan/{_token(rig)}/A1/A1_0001.tif could not be written (No "
+        "space left on device): free some space if the disk is full, or check the "
+        "network share, then run scan --resume"
+    )
+    assert raised.value.__context__ is None  # raised outside the handler (FM-98)
     stored = _stored(rig)
     assert stored.status is StageStatus.failed
     assert stored.checkpoint is None  # no well was done: no failed field anywhere
     assert rig.stage.moves == 2
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        AtomicWriteError(
+            OSError(64, "The specified network name is no longer available")
+        ),
+        OSError(64, "The specified network name is no longer available"),
+    ],
+    ids=["atomic-write-error", "plain-oserror"],
+)
+def test_a_share_that_drops_while_a_frame_is_written_says_check_the_share(
+    error: OSError, rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FM-116: a share that drops is an ``OSError`` of the write, whoever raises it, and never a ``ValueError``."""
+    _fail_write(monkeypatch, 3, error)
+
+    with pytest.raises(PluginRunError) as raised:
+        _scan(rig)
+
+    assert raised.value.reason == (
+        f"the frame scan/{_token(rig)}/A1/A1_0002.tif could not be written (The "
+        "specified network name is no longer available): free some space if the "
+        "disk is full, or check the network share, then run scan --resume"
+    )
+    assert rig.stage.moves == 3
+
+
+def test_a_frame_held_open_is_a_plugin_run_error_that_says_close_it(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows refuses to replace a file a viewer holds open: ``kept`` is set, the cause is a ``PermissionError``."""
+    held = AtomicWriteError(
+        PermissionError(errno.EACCES, "Permission denied"), kept=Path("held.smc-tmp")
+    )
+    # An AtomicWriteError is an OSError, not a PermissionError: the cause says which.
+    assert not isinstance(held, PermissionError)
+    _fail_write(monkeypatch, 2, held)
+
+    with pytest.raises(PluginRunError) as raised:
+        _scan(rig)
+
+    assert raised.value.reason == (
+        f"the frame scan/{_token(rig)}/A1/A1_0001.tif cannot be replaced: another "
+        "program holds it open (a viewer, a backup or antivirus agent): close it, "
+        "then run scan --resume"
+    )
+    assert raised.value.__context__ is None  # raised outside the handler (FM-98)
+    assert rig.stage.moves == 2
+    assert _stored(rig).status is StageStatus.failed
+
+
+def test_a_permission_error_with_nothing_kept_is_not_a_held_file(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read-only folder refuses the temporary file: nothing is kept, and no viewer holds anything."""
+    _fail_write(
+        monkeypatch,
+        2,
+        AtomicWriteError(PermissionError(errno.EACCES, "Permission denied")),
+    )
+
+    with pytest.raises(PluginRunError) as raised:
+        _scan(rig)
+
+    assert raised.value.reason == (
+        f"the frame scan/{_token(rig)}/A1/A1_0001.tif could not be written "
+        "(Permission denied): free some space if the disk is full, or check the "
+        "network share, then run scan --resume"
+    )
+
+
+def test_an_interrupt_writing_a_frame_is_not_turned_into_a_run_error(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only an ``OSError`` is the write's failure: the operator's Ctrl-C passes through."""
+
+    def interrupted(path: Path, data: bytes, *, make_parents: bool = True) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(scan_plugin, "write_atomically", interrupted)
+
+    with pytest.raises(KeyboardInterrupt):
+        _scan(rig)
 
 
 # ------------------------------------------------------------------- resume
@@ -1061,7 +1262,6 @@ def test_a_run_folder_that_cannot_be_read_is_not_a_missing_frame(
     stopped: _Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """FM-116: Windows raises a dropped share out of ``resolve``; ``--resume`` must stay the advice."""
-    import smc.plugins.scan.plugin as scan_plugin
 
     def dropped(run_dir: Path, relative: str) -> Path:
         cause = OSError(64, "The specified network name is no longer available")
@@ -1078,6 +1278,38 @@ def test_a_run_folder_that_cannot_be_read_is_not_a_missing_frame(
     )
     assert stopped.stage.moves == 0
     assert _checkpoint(stopped).wells_done == ("A1",)  # kept for that --resume
+
+
+def test_a_resume_after_a_frame_held_open_rewrites_the_well(
+    stopped: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The well a viewer blocked is scanned again whole once the viewer is closed."""
+    token = _checkpoint(stopped).token
+    with monkeypatch.context() as patch:
+        _fail_write(
+            patch,
+            1,
+            AtomicWriteError(
+                PermissionError(errno.EACCES, "Permission denied"),
+                kept=Path("held.smc-tmp"),
+            ),
+        )
+        with pytest.raises(PluginRunError) as raised:
+            _scan(stopped, resume=True)
+
+    assert raised.value.reason == (
+        f"the frame scan/{token}/A2/A2_0000.tif cannot be replaced: another "
+        "program holds it open (a viewer, a backup or antivirus agent): close it, "
+        "then run scan --resume"
+    )
+    assert _stored(stopped).status is StageStatus.failed
+    assert _checkpoint(stopped).wells_done == ("A1",)  # kept for that --resume
+
+    result = _result(_scan(stopped, resume=True))
+
+    assert len(result.frames) == 12
+    assert result.folder == f"scan/{token}"
+    assert len(_tiffs(stopped)) == 12
 
 
 def test_a_resume_after_the_plan_was_made_again_is_refused(stopped: _Rig) -> None:

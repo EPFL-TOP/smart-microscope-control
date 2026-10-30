@@ -32,10 +32,12 @@ keep a night's scan from producing frames nobody can trust:
 from __future__ import annotations
 
 import math
+import os
 import shutil
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
@@ -54,6 +56,7 @@ from smc.plugins.scan.algorithm import (
     CALIBRATION_TOLERANCE,
     PROFILE_TOLERANCE,
     bytes_needed,
+    collision_key,
     encode_frame,
     focus_state,
     frame_path,
@@ -68,7 +71,13 @@ from smc.plugins.slots import (
     ScanPlanResult,
     ScanResult,
 )
-from smc.run.files import new_token, resolve_in_run, write_atomically
+from smc.run.files import (
+    AtomicWriteError,
+    new_token,
+    resolve_in_run,
+    temporary_path,
+    write_atomically,
+)
 
 if TYPE_CHECKING:
     from smc.hardware.microscope import Microscope
@@ -77,6 +86,12 @@ __all__ = ["ScanCheckpoint", "ScanParams", "ScanPlugin"]
 
 _NAME = "scan"
 _AGAIN = "run scan-plan again with the stand as it is now"
+
+#: Windows' MAX_PATH, which counts the terminating NUL: a path of 260
+#: characters or more fails where long paths are not enabled. Module
+#: attributes, read at the call, so that a test sets them.
+MAX_PATH: int = 260
+ON_WINDOWS: bool = os.name == "nt"
 
 
 class ScanParams(PluginParams):
@@ -164,13 +179,13 @@ class ScanPlugin:
             PluginRunError: A check before the scan refused it (nothing moved);
                 the stand changed at a well; ``max_failed_in_row`` fields
                 failed or ``max_unlocked_in_row`` would not lock in a row; a
-                frame came back in another shape. The checkpoint keeps the
-                wells done.
+                frame came back in another shape; a frame could not be
+                written (a full disk, a share that dropped or a file a
+                viewer holds open is not a field's fault). The checkpoint
+                keeps the wells done.
             MicroscopeHaltedError, MotionStoppedError: The stand was stopped;
                 the scan ends where it is.
             StopRequested: The operator stopped it; ``--resume`` continues.
-            OSError: A frame could not be written (a full disk is not a
-                field's fault).
         """
         xy = microscope.require(XYStage)
         camera = microscope.require(Camera)
@@ -258,18 +273,18 @@ class ScanPlugin:
 
                 failed_in_row = 0
                 if not ctx.dry_run:
+                    target = paths[planned.well, planned.name]
                     frames.append(
                         _write_frame(
-                            ctx,
                             plan,
                             planned,
-                            paths[planned.well, planned.name],
+                            target,
                             np.asarray(pixels),
                             ScanFrame(
                                 well=planned.well,
                                 index=planned.index,
                                 name=planned.name,
-                                file=paths[planned.well, planned.name],
+                                file=target.relative,
                                 x_um=readback.x_um,
                                 y_um=readback.y_um,
                                 z_um=z_um,
@@ -385,17 +400,31 @@ def _unreadable(cause: OSError) -> PluginRunError:
     )
 
 
+class _Target(NamedTuple):
+    """Where a field's frame goes: the text the result names, and the path it is written to."""
+
+    #: ``scan/<token>/<well>/<name>.tif``, POSIX, as ``ScanFrame.file``.
+    relative: str
+    #: What ``resolve_in_run`` made of it, once, before anything moved (FM-116).
+    absolute: Path
+
+
 def _paths(
     ctx: RunContext, plan: ScanPlanResult, token: str
-) -> dict[tuple[str, str], str]:
+) -> dict[tuple[str, str], _Target]:
     """Every field's frame path, keyed by well and name; refused before anything moves.
 
     The plan is a run document's, which may have been edited or copied: a
-    field of a well the plan does not list, a name that is not a file name, or
-    two fields sharing one file are refused here, not at the field.
+    field of a well the plan does not list, a name that is not a file name (or
+    is a Windows device), two fields sharing one file (compared without case:
+    NTFS and APFS do not tell ``A1_0001`` from ``a1_0001``), or a path Windows
+    would refuse are refused here, not at the field. Each path is resolved
+    once, here: resolving it again at every frame would let a share that drops
+    mid-scan end the run as a ``ValueError`` (FM-116).
     """
     wells = set(plan.wells)
-    paths: dict[tuple[str, str], str] = {}
+    targets: dict[tuple[str, str], _Target] = {}
+    first_of: dict[tuple[str, str], tuple[str, str]] = {}
     for planned in plan.fields:
         if planned.well not in wells:
             raise PluginRunError(
@@ -404,25 +433,52 @@ def _paths(
                 f"scan plan does not list: {_AGAIN}",
             )
         problem = ""
+        unreadable: OSError | None = None
         try:
-            path = frame_path(token, planned.well, planned.name)
-            resolve_in_run(ctx.run_dir, path)
+            relative = frame_path(token, planned.well, planned.name)
+            absolute = resolve_in_run(ctx.run_dir, relative)
         except ValueError as exc:
-            problem = str(exc)
+            if isinstance(exc.__cause__, OSError):
+                unreadable = exc.__cause__
+            else:
+                problem = str(exc)
+        # Raised outside the handler: nothing here keeps the path's error.
+        if unreadable is not None:
+            raise _unreadable(unreadable)
         if problem:
-            # Raised outside the handler: nothing here keeps the path's error.
             raise PluginRunError(
                 _NAME, f"field {planned.name!r} of well {planned.well!r}: {problem}"
             )
         key = (planned.well, planned.name)
-        if key in paths:
+        if key in targets:
             raise PluginRunError(
                 _NAME,
                 f"two fields of well {planned.well} are named {planned.name}, so "
                 f"they would write one file: {_AGAIN}",
             )
-        paths[key] = path
-    return paths
+        folded = collision_key(planned.well, planned.name)
+        if folded in first_of:
+            first_well, first_name = first_of[folded]
+            raise PluginRunError(
+                _NAME,
+                f"fields {first_name!r} of well {first_well!r} and "
+                f"{planned.name!r} of well {planned.well!r} would write one file, "
+                f"as the file system does not tell upper from lower case: {_AGAIN}",
+            )
+        if ON_WINDOWS:
+            # The temporary file is the longest path the write makes.
+            length = len(str(temporary_path(absolute)))
+            if length >= MAX_PATH:
+                raise PluginRunError(
+                    _NAME,
+                    f"a frame's path would reach {length} characters while it is "
+                    f"written, and Windows takes {MAX_PATH - 1} at most unless "
+                    "long paths are enabled (not assumed): move the run document "
+                    "to a shorter folder, then run scan again",
+                )
+        first_of[folded] = key
+        targets[key] = _Target(relative, absolute)
+    return targets
 
 
 def _check_stand(
@@ -592,17 +648,19 @@ def _check_well(camera: Camera, plan: ScanPlanResult, stand: _Stand, at: str) ->
 
 
 def _write_frame(
-    ctx: RunContext,
     plan: ScanPlanResult,
     planned: PlannedField,
-    path: str,
+    target: _Target,
     pixels: np.ndarray,
     meta: ScanFrame,
 ) -> ScanFrame:
     """Write one frame whole (FM-38) and return its record; a frame of another shape is not written.
 
-    An ``OSError`` writing it propagates: a full disk or a lost share is not
-    the field's fault, and every next frame would fail the same way.
+    An ``OSError`` writing it is not the field's fault (a full disk, a share
+    that dropped, a file a viewer holds open) and every next frame would fail
+    the same way: it ends the scan as a ``PluginRunError`` that names the
+    frame and says what to do, with the checkpoint keeping the wells done. A
+    ``BaseException`` that is not an ``OSError`` (a Ctrl-C) passes.
     """
     if tuple(pixels.shape) != tuple(plan.image_shape_px):
         raise PluginRunError(
@@ -611,7 +669,34 @@ def _write_frame(
             f"plan's frames are {tuple(plan.image_shape_px)}: check the camera's "
             "binning and region of interest, then run scan --resume",
         )
-    write_atomically(resolve_in_run(ctx.run_dir, path), encode_frame(pixels, meta))
+    data = encode_frame(pixels, meta)
+    failure: OSError | None = None
+    try:
+        write_atomically(target.absolute, data)
+    except OSError as exc:
+        failure = exc
+    # Raised outside the handler: nothing here keeps the OS's error (FM-98).
+    if failure is not None:
+        # ``AtomicWriteError`` is an ``OSError`` that is not a ``PermissionError``:
+        # its cause says which refusal it wraps.
+        cause = failure.cause if isinstance(failure, AtomicWriteError) else failure
+        kept = failure.kept if isinstance(failure, AtomicWriteError) else None
+        if kept is not None and isinstance(cause, PermissionError):
+            # Only the final rename failed, and Windows refuses to replace a
+            # file another program holds open, as a viewer on a well that a
+            # ``--resume`` rewrites.
+            raise PluginRunError(
+                _NAME,
+                f"the frame {target.relative} cannot be replaced: another program "
+                "holds it open (a viewer, a backup or antivirus agent): close it, "
+                "then run scan --resume",
+            )
+        raise PluginRunError(
+            _NAME,
+            f"the frame {target.relative} could not be written "
+            f"({failure.strerror or failure}): free some space if the disk is "
+            "full, or check the network share, then run scan --resume",
+        )
     return meta
 
 
