@@ -3,8 +3,8 @@
 - **Status**: design for issue #28 (§1 to §4, 2026-10-29), as built by #270 and
   settled by #272 (§2.1, §2.4, §3: the stale card, the card's bounds,
   `card_text`'s signature); live fixed by #262's plan (§5, 2026-10-29); drive
-  fixed by #263's plan (§6, 2026-10-30); the direction of #264 (§7), which its
-  plan fixes.
+  fixed by #263's plan (§6, 2026-10-30); the stand's lifetime and the service
+  fixed by #264's plan with the owner (§7, 2026-10-30).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 to M3, this document is the contract between issues.
   Names, module paths and signatures below are fixed; an executor who needs to
@@ -33,7 +33,7 @@ What the shell lacks, against ADR-0006's picture, and where it is built:
 | Drive | none (a drive click on a well) | #263, with a command for each action (§6) |
 | Tools rail, tool panel | the tools `STAGES` names | **every** registered plugin, a result card: #28 |
 | Run document | a checklist of M3's slots | every slot the document holds: #28 |
-| Deployable as a service | no | #264 |
+| Deployable as a service | no | #264: NSSM, `localhost` only (§7) |
 
 The page keeps its module names (`smc/ui/controller.py`, `smc/ui/plate_page.py`)
 and its class names (`PlatePage`, `PlatePageView`) through M5: a rename is churn
@@ -775,16 +775,359 @@ Tests are named in #263's plan. **Failure modes**: FM-14, FM-12, FM-88, FM-89,
 FM-118, FM-117, FM-64, FM-98, FM-70, FM-44, FM-96, FM-73, FM-125, FM-147,
 FM-151, FM-155, FM-167, FM-36, FM-37, FM-32, FM-43, FM-45, FM-47, FM-161.
 
-## 7. The stand's lifetime and the service (#264) — direction
+## 7. The stand's lifetime and the service (#264)
 
-- Today the command opens the stand when it starts and holds it until Ctrl-C. A
-  Windows service is never sent Ctrl-C, and a stand held by smc cannot be taken
-  by NIS-Elements: **Connect / Disconnect on the page** come with the service.
-- The lab's route to a service is NSSM (`nikon-control/docs/windows-deploy.md`).
-- **To decide in its plan, with the owner**: whether the page stays on
-  `localhost` only (no login, M3 §15.3) when it is a service; whether a vendor
-  SDK and the camera driver run in a service's session 0 (measured at a stand
-  only).
+Fixed by #264's plan (2026-10-30). Until #264, the command opens the stand when it
+starts and holds it until Ctrl-C. A service runs for weeks, and a stand that smc
+holds cannot be taken by NIS-Elements or ZEN. So the stand's lifetime becomes the
+operator's: **Connect** opens it and **Disconnect** releases it, on the page. The
+server's lifetime stays the command's.
+
+**Decided with the owner (2026-10-30)**:
+
+- **The page listens on `localhost` only**, as a service too, and the command
+  has no option to change it. The page has no login (M3 §15.3), so whoever
+  reaches the port can move the stage. From a desk, the route is the PC's remote
+  desktop. ADR-0006's "served from a lab server" needs an ADR first, which
+  decides authentication (who may drive which stand, over TLS). Until then it is
+  not allowed.
+- **The page always starts with the stand closed**, from a console as in a
+  service. There is no `--connect`: the page behaves one way, and a service that
+  starts at boot, or restarts after a crash, never takes the stand from the
+  vendor's software.
+
+**Also decided here**:
+
+- The page connects to **the profile the command names**. ADR-0006's row of
+  stands under *Connect* is not built: one PC serves one stand, and the demo is
+  another `smc ui -p demo` on another port.
+- The profile is read **once**, when the command starts, as today: the strip, the
+  jog limits and the run document's checks use it while the stand is closed.
+  A profile edited on disk takes effect when the command, or the service,
+  restarts.
+
+### 7.1 The command (`smc/cli.py`)
+
+The options are §1's, unchanged. What changes is the order:
+
+1. The checks are as they are today, and so are their texts and exit codes:
+   - the page word;
+   - `--run-doc`;
+   - the `ui` extra;
+   - the port;
+   - `Profile.load` (a profile that does not load exits as today);
+   - `RunDocument.load_or_new`.
+2. Unless `--dry-run`, the line `_stop_refused_line(loaded.safety.stop_refused_by)`
+   is printed from the profile, when there is one. `_say_stop_refused` needed the
+   facade.
+3. `controller = PlatePage.closed(loaded, path, dry_run=dry_run)`, then
+   `plate_page.serve(controller, port=port)`.
+4. Whatever ends `serve`, a `finally` calls `controller.close()` and keeps
+   `close_lines` and `close_ended`. An inner `finally` then calls
+   `controller.release()`. The stand is released whatever ends this, a second
+   Ctrl-C during the wait included (FM-71), as the `with Microscope.open(...)`
+   block did. An error that `release()` raises is reported by `_Reported` as the
+   `with` block's was.
+5. After the release, `close_lines` and the exit code are as today (§1, M3 §15.3).
+
+The help says:
+
+> Serve the plate page (needs the ui extra): connect the stand, click wells, run
+> the tools, snap a frame.
+>
+> The page starts with the stand closed: Connect opens the profile's stand and
+> Disconnect releases it, for NIS-Elements or ZEN. Every tool button is a plugin
+> run with the parameters smc run takes, so each has a command-line equivalent,
+> and each tool shows its last result. Ctrl-C stops what is going, then the
+> server, then releases the stand.
+
+### 7.2 The controller (`smc/ui/controller.py`)
+
+```python
+#: smc/ui/controller.py
+NOT_CONNECTED = "the stand is not connected"
+
+
+class PageStatus:
+    ...
+    connected: bool = True  # the last field
+
+
+class PlatePage:
+    def __init__(
+        self,
+        microscope: Microscope,
+        run_doc: Path,
+        *,
+        opener: Callable[[], Microscope] | None = None,
+        entry_points: Iterable[EntryPoint] | None = None,
+    ) -> None: ...
+    @classmethod
+    def closed(
+        cls,
+        profile: Profile,
+        run_doc: Path,
+        *,
+        dry_run: bool = False,
+        opener: Callable[[], Microscope] | None = None,
+        entry_points: Iterable[EntryPoint] | None = None,
+    ) -> PlatePage: ...
+    @property
+    def connected(self) -> bool: ...
+    def connect(self) -> None: ...
+    def disconnect(self) -> None: ...
+    def release(self) -> None: ...
+```
+
+**Building the page**
+
+- `PlatePage(microscope, run_doc)` starts **connected** to that facade, as every
+  test and notebook builds it today.
+- `PlatePage.closed(profile, run_doc, dry_run=...)` starts **closed**. It is
+  what `smc ui` builds.
+- The page keeps the profile (`_profile`) and the dry run (`_dry_run`), and takes
+  them from the facade when it is given one. Every read that does not need the
+  stand uses them instead of `self._microscope.profile` and `.dry_run`:
+  - `status().stand`, `status().dry_run` and `status().stop_refused`;
+  - the profile and dry run that `run()` hands `check_ready`;
+  - `_unusable`;
+  - `jog_limits_um()`.
+
+  The checklist, the plate map, the selection and the result cards therefore
+  work with the stand closed.
+- `opener` is the connection: a call that returns an open facade. It defaults to
+  `Microscope.open(profile, dry_run=dry_run)`, which is looked up **when Connect
+  calls it**, so that a test's `monkeypatch.setattr(Microscope, "open", ...)` is
+  the one used. The import of `Microscope` stays out of the module's top: it is
+  inside the private function `_open_stand(profile, dry_run)`.
+- `closed` builds the instance with `cls.__new__(cls)` and a private
+  `_setup(...)`, which `__init__` also calls, so `__init__`'s signature does not
+  change for its 79 callers.
+- `connected` is `self._microscope is not None`.
+
+**Connect and Disconnect are activities** (§2.1). Each one starts on the worker
+under its name, `connect` or `disconnect`, raises `activities_ended` when it ends
+(every open tab then calls `refresh()`), and is refused while another activity
+goes with `<name> is running`. So **Disconnect is refused while a run, a snap,
+live or a drive action goes**, and no activity can find the facade changed under
+it.
+
+- **`connect()`** checks, in this order:
+  1. The page is closed: `RuntimeError("the page is closed")`.
+  2. Another activity goes: `RuntimeError("<name> is running")`.
+  3. The page is already connected: the outcome `connect: <stand> is already
+     connected`, and no thread starts.
+  4. Otherwise it starts the `connect` activity, whose body:
+     - calls `opener()`. An exception becomes the outcome `connect: <Type>:
+       <message on one line>`, kept as text (FM-98). That covers a
+       `CoreError` from a stand that NIS-Elements holds, and a `ProfileError`
+       for a `[sample]` stand.
+     - then takes `_lock`. **When the page was closed meanwhile** (`close()`
+       gave up waiting for a slow open), it does not keep the facade: it releases
+       it outside the lock, and the outcome is `connect: <stand> was opened after
+       the page closed, and released`. A stand is never left open with no owner.
+     - otherwise keeps the facade, clears `_stop_note` (a new facade is not
+       halted) and clears `_light_lacks_found`.
+     - **when the activity's event is set** (STOP was pressed while the stand
+       connected), it calls `self.stop()` on the new facade, so the stand is
+       halted as the operator asked. The outcome then ends with `, and halted:
+       STOP was pressed while it connected`.
+     - The outcome is `connect: <stand> connected, <n> devices`, where `<n>` is
+       `len(microscope.devices)`, then ` (dry run)` when it is a dry run.
+- **`disconnect()`** checks, in this order:
+  1. The page is closed: `RuntimeError("the page is closed")`.
+  2. Another activity goes: `RuntimeError("<name> is running")`.
+  3. The page is not connected: the outcome `disconnect: the stand is not
+     connected`, and no thread starts.
+  4. Otherwise it starts the `disconnect` activity, whose body:
+     - under `_lock`, drops the facade (`_microscope = None`) and clears
+       `_light_lacks_found`;
+     - **outside** the lock, calls `Microscope.close()`. That stops what still
+       moves, then unloads every device, and it switches nothing off: a light
+       or an autofocus stays as the stand keeps it (§6);
+     - has the outcome `disconnect: <stand> released`, or `disconnect: <Type>:
+       <message on one line>` when `close()` raises. The page has let go of the
+       facade either way. `close()` logs what to do when unloading fails.
+  - The facade is dropped **before** it is closed, so no read that starts after
+    the drop reaches a closed facade.
+  - Measured (§7.5): a closed facade's `state()` reads `HardwareError ...
+    another program holding it` for XY and Z, which would mislead, and its
+    `has(XYStage)` still answers `True`.
+- **`release()`** releases the facade the page holds, if any:
+  - It drops it under `_lock`, then calls `Microscope.close()` outside it, and
+    raises what that raises.
+  - It is for the command, after `close()`. Before it, it raises
+    `RuntimeError("release() comes after close()")`, because the facade could
+    otherwise be pulled from under an activity.
+  - It is idempotent, and it does nothing on a page that holds no facade.
+  - It releases a facade handed to the constructor too. The tests that build a
+    page over a fixture's facade never call it.
+- **`close()`** keeps its contract: it stops the activity, waits up to
+  `_CLOSE_WAIT_S`, never releases the stand, and never raises for a refused
+  stop. Once it has run, `connect` and `disconnect` refuse with `the page is
+  closed`. A `connect` still opening when the wait ends releases what it opens
+  (above).
+
+**What needs the stand, when the stand is closed** (principle 1: disabled with the
+reason, never failing when pressed):
+
+| Call | With the stand closed |
+|---|---|
+| `lacks(capability)` | `NOT_CONNECTED`, checked first. So a snap, live and every drive action have the outcome `<name>: the stand is not connected`, through the paths they already have (§2.2, §5.1, §6.3), and start nothing. `light_lacks()` gives the same. |
+| `run(plugin, ...)` | after `_refuse_if_busy`, the outcome `<plugin>: the stand is not connected`, and no thread starts. `smc run` opens the stand for every plugin, so the page's Run needs it too. `goto` is a run of `goto-well`. |
+| `_blocked(doc)` | every tool, `NOT_CONNECTED`, ahead of any other reason: what the tool's note says. |
+| `capture_centre`, `capture_wall` | `RuntimeError(NOT_CONNECTED)`, through a private `_stand() -> Microscope` that raises it. |
+| `objective_labels()` | `()` |
+| `stop()` | sets the activity's event as before. The note is `<prefix>the stand is not connected: nothing to stop`, with the usual `<name> told to stop; ` prefix. It never raises. |
+| `resume()` | `RuntimeError(NOT_CONNECTED)` |
+| `status()` | `PageStatus(connected=False, ...)`: `stand`, `dry_run`, `running`, `progress`, `outcome`, `stop_note` and `stop_refused` as when connected; `xy_um`, `z_um`, `objective` and `light_on` are `None`; `autofocus` is `"?"`; `moving` and `problems` are `()`; `halted` is `False`. |
+| `frame()` | the last frame, kept: it is a picture taken, with its time. |
+
+- **`status()` and the facade.** `status()` reads the facade once, into a
+  local, and reads the stand from that. If the page no longer holds that facade
+  after the read, because a `disconnect` dropped it meanwhile, the status is the
+  closed stand's. The stand's read is never reported as a fault of a stand that
+  was released.
+- **Every other method** that reads the facade on the server's loop
+  (`lacks`, `objective_labels`, `light_lacks`, the captures) also takes it into
+  a local first, never `self._microscope` twice.
+- **A halt does not outlive the facade.** The note of a STOP stays after a
+  Disconnect. A Connect clears it, because the new facade is not halted.
+  `smc` commands each open a fresh facade too.
+
+### 7.3 The page (`smc/ui/plate_page.py`)
+
+```python
+class PlatePageView:
+    connect_button: pn.widgets.Button
+    disconnect_button: pn.widgets.Button
+    connection_text: pn.pane.Str
+
+    def on_connect(self) -> None: ...
+    def on_disconnect(self) -> None: ...
+```
+
+- **The region** is ADR-0006's *Connect*: a row **above** the strip, made of
+  `Connect`, `Disconnect` and `connection_text`.
+- `connection_text` depends on the state:
+  - closed: `<stand> is not connected: Connect opens it, and the controls that
+    need the stand are disabled until then`;
+  - connected: `Disconnect releases <stand> for another program (NIS-Elements,
+    ZEN)`;
+  - in both cases, then ` (dry run)` when it is a dry run.
+
+  This one line is the reason for every control that needs the stand.
+- **Disabled**:
+  - `Connect` while connected, or while an activity goes;
+  - `Disconnect` while closed, or while an activity goes (live included);
+  - the capture buttons while closed.
+
+  Each controller method refuses on its own, so a click on a disabled button is
+  refused all the same (FM-169).
+- **The handlers** call `page.connect` and `page.disconnect` through `_try` (a
+  refusal is the page's message, FM-98), then `tick()`, as `on_snap` does.
+- **Closed, the regions say it**:
+  - the strip: `status_line` gives `<stand> | not connected`, then `| DRY RUN`
+    when it is a dry run, and nothing else;
+  - the tools' notes: `_blocked`;
+  - `snap_note`: `lacks(Camera)`;
+  - `drive_note`: the one line `the stand is not connected`, not five.
+- **The objective's choices follow the connection.** The tick keeps the
+  `connected` it last saw. When `status.connected` changes, it reads
+  `page.objective_labels()` again, sets `objective_select.options` (as
+  `_build_drive` does), lets the next tick set the select to the objective in
+  place, and disarms the confirmation. The drive region is built once per
+  session, while the stand may be closed. `jog_limits_um()` comes from the
+  profile and does not change.
+
+### 7.4 The service (`docs/ui/service.md`, new)
+
+NSSM, as the lab runs `nikon-control`'s dashboard
+(`nikon-control/docs/windows-deploy.md`). The document gives the commands to
+install, start, stop, restart and remove the service, named `smc-ui`, and says
+what it changes for whoever uses the PC. It fixes the following:
+
+- **What the service runs**: the venv's `python.exe -m smc.cli ui -p <profile>
+  --run-doc <absolute path> --port 5006`. It is one process: a console-script
+  `.exe` launcher would run Python as a child, which a stop must then also
+  reach.
+- **The account**: the Windows account for which Micro-Manager, the vendor
+  drivers and the venv were set up on that PC, given as `ObjectName .\<account>
+  <password>`. It is not `LocalSystem`, which has none of that account's
+  environment.
+- **The working directory and the environment**:
+  - `AppDirectory` is the checkout, whose `profiles\` is on the search path;
+  - `AppEnvironmentExtra` is `SMC_PROFILES=<site profiles>` and `PYTHONUTF8=1`.
+    The log is a file, which Windows would otherwise write in cp1252 (FM-20).
+- **The log**:
+  - `AppStdout` and `AppStderr` are both `C:\smc\logs\smc-ui.log`;
+  - rotation is on (`AppRotateFiles 1`, `AppRotateOnline 1`, `AppRotateBytes
+    10485760`).
+- **The stop**: NSSM's first stop method is a Ctrl-C to the console it creates.
+  That is the command's own Ctrl-C (§7.1, FM-143): the activity is told to
+  stop, then the server stops, then the stand is released. NSSM waits only 1.5 s
+  by default before its next method, and ends with `TerminateProcess`. So
+  `AppStopMethodConsole 30000` covers `close()`'s 10 s and the server's 10 s.
+  `AppNoConsole` stays `0`: without a console, there is no Ctrl-C.
+- **The start**: `Start SERVICE_AUTO_START`. `AppExit` stays at its default,
+  `Restart`, with NSSM's throttle. A restart never takes the stand, since the
+  page starts closed.
+- **What it changes for whoever uses the PC**:
+  - **The port is always held**. A `smc ui` started by hand on 5006 is refused
+    with `port 5006 is in use`: use `http://localhost:5006/`, or give another
+    `--port`.
+  - **The stand is held only between Connect and Disconnect.** While it is
+    held, NIS-Elements, ZEN and the `smc` commands cannot open it: Disconnect
+    first. Disconnect switches nothing off.
+  - **Anyone logged on to the PC** (any account, at the PC or over RDP) reaches
+    `localhost:5006` and can drive the stand. There is no login.
+  - **The service survives a logoff and a reboot**, and starts with the stand
+    closed.
+  - **Files**: the run document and what the tools write belong to the service's
+    account, so their folder must be writable by it. A service does not see
+    mapped drive letters (`Z:`): give local or UNC paths.
+  - **Restarts**: a changed profile, or another run document, needs `nssm set
+    smc-ui AppParameters ...` or `nssm restart smc-ui`. A restart ends a run
+    that is going, as Ctrl-C does.
+  - **What the page says** goes to the log file, not to a console.
+- **Stopping the PC**: Disconnect first. How long Windows lets a service stop at
+  shutdown is not known here.
+
+### 7.5 Tests and failure modes
+
+The tests are named in #264's plan.
+
+**Failure modes**: FM-98, FM-70, FM-71, FM-92, FM-143, FM-146, FM-149, FM-151,
+FM-169, FM-161, FM-117, FM-125, FM-44, FM-96, FM-43, FM-45, FM-36, FM-37, FM-20,
+FM-24, FM-69.
+
+**Measured 2026-10-30** (Python 3.13.0, on the demo, `demo-sample` and
+`FakeCore.demo_like()`; throwaway scripts):
+
+- **Opening and closing the demo stand**:
+  - `Microscope.open("demo")` on a worker thread takes 6 ms, then 2 ms to open
+    again after a close; `demo-sample` takes 17 ms, then 8 ms;
+  - the facade is then used from the main thread (a snap, a jog), and closed
+    from a third thread;
+  - a closed facade's `state()` has `xy=None` and the errors `xy:
+    HardwareError: ... No device with label "XY"; check the device: power,
+    cable, another program holding it` (and Z's), and `has(XYStage)` is still
+    `True`;
+  - a `FakeCore` facade, once closed, lists only `Core` among its loaded
+    devices, which is what a test checks to see a release. Two `close()` calls
+    are harmless.
+- **The activities**, on a throwaway subclass of `PlatePage` with
+  `disconnect`/`connect` built on `_start_activity`:
+  - a disconnect then a connect each raise `activities_ended` by one;
+  - a connect whose opener was still waiting when `close()` gave up (wait
+    shortened to 0.2 s) released, once the open ended, the facade it opened,
+    with the outcome above;
+  - with the facade dropped, today's `status()` and `stop()` raise
+    `AttributeError`, which §7.2 replaces.
+
+**Not measured**: a stand opened on a worker thread. Until #264, the command
+opened the stand on the main thread. A vendor adapter that cares which thread
+loaded it is the owner's finding (§8.1).
 
 ## 8. Sequencing
 
@@ -796,6 +1139,10 @@ FM-151, FM-155, FM-167, FM-36, FM-37, FM-32, FM-43, FM-45, FM-47, FM-161.
    `controller.py`.
 3. **#251** and **#252** edit the same modules: never at the same time as one of
    the above.
+4. **#264** after #277, which edits `plate_page.py`. It touches the
+   controller's every read of the facade, so no other issue that edits
+   `controller.py`, `plate_page.py` or `smc ui` in `cli.py` runs at the same time:
+   #251, #287, #293, #295 and #297 come before it or after it.
 
 ### 8.1 Not verified (for the owner)
 
@@ -814,3 +1161,16 @@ FM-151, FM-155, FM-167, FM-36, FM-37, FM-32, FM-43, FM-45, FM-47, FM-161.
   off.
 - A newcomer registers a plate on the `demo-sample` stand from the page, without
   a manual (#28's last criterion), with a lab member.
+- **The service on a microscope PC** (§7.4):
+  - under NSSM in session 0: whether the vendor SDK (Ti2 SDK, PVCAM, Zeiss MTB)
+    and the camera driver open there, under the account chosen;
+  - Connect, then Disconnect, then NIS-Elements taking the stand, then Connect
+    again;
+  - `nssm stop` while a run goes: the Ctrl-C reaches Python, and the stand is
+    released within `AppStopMethodConsole`;
+  - a reboot and a logoff;
+  - how long Windows lets the service stop at shutdown;
+  - whether the lab's NSSM version names its rotation parameter
+    `AppRotateFiles`.
+- **A stand opened on the worker thread** that Connect starts and that then ends,
+  where the command used to open it on the main thread.
