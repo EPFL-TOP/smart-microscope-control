@@ -1388,13 +1388,13 @@ never wrapped to the console width (FM-37). Positions have two decimals:
 | 0 | done |
 | 1 | a hardware, profile or file error (a device fault and a profile that is not UTF-8 included, #93), or an unexpected exception, which is a bug (one line naming its type; `--debug` for the traceback) |
 | 2 | refused, nothing sent: a guard (`SafetyRefusedError`, `MotionInProgressError` included) or a bad argument (Click's usage errors exit 2 as well) |
-| 130 | interrupted (Ctrl-C): the Executor stopped any move under way (FM-17), and the stand was released |
+| 130 | interrupted (Ctrl-C): the Executor sent a stop to any move under way (FM-17) and the line says what each stop did, since a stand may refuse it (M2 §11.6), and the stand was released |
 
 Errors print one line, `✗ reason — how to force / fix`; for a jog, the
 fix is `--force`, not the API's `force=True`. Every command opens the
 microscope in a `with` block, so the stand is released before the line is
-printed. No signal handler: Ctrl-C is the `KeyboardInterrupt` the Executor
-already turns into a stop (FM-70). No `smc stop`: a second process cannot
+printed. No signal handler: Ctrl-C is the `KeyboardInterrupt` for which the
+Executor already sends a stop (FM-70). No `smc stop`: a second process cannot
 connect to a stand that the first one holds.
 
 **`smc snap`.** `--out` must end in `.tif` or `.tiff`, and its folder must

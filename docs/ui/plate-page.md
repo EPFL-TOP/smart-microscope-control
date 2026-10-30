@@ -1,7 +1,7 @@
 # The plate page
 
 A web page on the microscope PC: the plate drawn in stage µm, wells you select with
-a click or a typed range, a **Snap** that shows the camera's frame, every registered
+a click or a typed range, a **Snap** and a **Live** view of the camera's frame, every registered
 tool with a Run button and the result of its last run, and, once the workflow has
 run, the density of each well and the route. It is **a view only**: every button is a
 [plugin](../plugins/README.md) run with the parameters `smc run` takes, or a read of
@@ -124,12 +124,31 @@ not decide the contrast; a **flat** frame is shown against the camera's range in
 a saturated frame is white and a dark one black and not a stretched grey. A frame larger
 than 1024 px on a side is shown at every n-th pixel (n = 2 for a 1412 px camera), and the
 axes are still the **camera's pixels**. The frame is the same for every tab of the server: a
-frame snapped in one tab is drawn by the others within a second. Snap is disabled with
+frame snapped in one tab is drawn by the others the next time they look for a new
+frame, every 0.1 s. Snap is disabled with
 `this stand has no Camera` when the stand has none, and, as every Run button, while
 something else is going: a snap is one activity like a run, so only one runs at a time
 (`snap is running`, `<plugin> is running`), and STOP during a snap says `snap told to
 stop; ...` and halts the stand. A frame the page cannot show (not 2-D `uint8` or
 `uint16`) is an outcome under the strip and is not kept.
+
+**Live** (*Image*, beside Snap). **Live** takes frames from the camera one after the
+other, **at most 10 a second**, and the page draws each new frame: the frame number is
+what it compares, every 0.1 s, so it draws nothing when there is nothing new. The
+button then says **End live**. While live goes the line under the strip reads
+`live: <n> frames`. A camera slower than 10 frames a second runs at its own rate. Live
+is **one activity**, like a run: **Snap and every Run button are disabled**, a click on
+the map in drive mode is refused, and each says `live is running`. Live is never ended
+for them: end it with **End live**, which ends only the live view and **does not halt
+the stand** (it says `live ended: <n> frames in <s> s`). **STOP** ends it **and halts the
+stand**, as it halts a run (`live told to stop; stopped: the stand is halted (Resume
+clears the halt)`). A frame that fails, or that is not 2-D `uint8` or `uint16`, ends
+live with `live ended after <n> frames: <why>`, and the last good frame stays. Live is
+disabled with `this stand has no Camera` when the stand has none, and while another
+activity goes. **A closed or reloaded tab does not end live**: the page belongs to the
+server, so a live view with no tab open keeps the camera taking frames until STOP,
+*End live* from a tab, or Ctrl-C of the command. A live view writes nothing to disk and
+nothing to the run document. Every frame is sent to every open tab, up to 10 a second.
 
 **The tools.** One section per stage of the workflow (*Set up*, *Choose*, *Acquire*,
 *Find*, *Report*), and a last one, **More**, for every other registered plugin by name
@@ -146,12 +165,16 @@ map says `plugin <name>: <why>`.
 
 **A tool's result**, under its Run button, as plain text (a result's words are never
 read as markup): `<status> <time> UTC`, then ` on <profile>` when the record was made
-on another stand and ` (dry run)` when it was one, then the result's values, two
-spaces in, a line each (a text cut at 80 characters, a list or an object only counted,
-at most eight, then `… n more`), then what the result **assumed** and the error. A tool
-whose last run was stopped or failed shows its status and its error and **no values**:
-they are not a result. The card follows the run document, so it is drawn, in every
-tab, when a run or a snap ends (a tool that takes less than a second included) and when
+on another stand, ` (dry run)` when it was one and ` (stale)` when the tool read an
+input that has been produced again since (the checklist says `<plugin> read its
+inputs from an earlier run; run it again`; the values are kept, and marked), then the
+result's values, two spaces in, a line each (a text cut at 80 characters, a list or an
+object only counted, at most eight, then `… n more`), then what the result **assumed**
+(at most eight, then `… n more`, each cut at 600 characters) and the error (cut at 600
+characters too). A card is a summary, bounded whatever the record holds: the run
+document and the log hold the rest. A tool whose last run was stopped or failed shows
+its status and its error and **no values**: they are not a result. The card follows the run document, so it is drawn, in every
+tab, when a run, a snap or a live view ends (a tool that takes less than a second included) and when
 you press **Refresh**, not every second.
 
 **Run starts a stage afresh, and never continues one.** After STOP (or a failure) a
@@ -220,8 +243,9 @@ The page on this stand has not been tried in a browser (see below).
 
 ## What it does not do
 
-No live view (a Snap is one frame; live is [#262](https://github.com/EPFL-TOP/smart-microscope-control/issues/262)),
-no jog pad, no Z or turret control (drive is [#263](https://github.com/EPFL-TOP/smart-microscope-control/issues/263)),
+No jog pad, no Z or turret control, and so no moving the stage or the focus while live
+goes (drive is [#263](https://github.com/EPFL-TOP/smart-microscope-control/issues/263)), no camera
+settings (exposure, ROI, binning) and no time limit on live,
 no Connect / Disconnect and no service ([#264](https://github.com/EPFL-TOP/smart-microscope-control/issues/264)),
 no `--resume` (continue a stopped stage with `smc run --resume`), no `--host`, no login. The report and the NIS-Elements
 export appear as tools when their plugins are registered; they have no page of their
@@ -240,3 +264,10 @@ reading the stand once a second during a scan** (it runs on the loop that handle
 click on STOP: a device read that hangs in a vendor driver would delay STOP; it is to
 be timed on the Ti2-E) and what STOP's note says there. These are for the first session
 at the stand ([#198](https://github.com/EPFL-TOP/smart-microscope-control/issues/198)).
+
+**Live** adds: the rate a real browser shows, locally and over RDP (the demo camera
+gives 10 frames a second on the server; ADR-0006's revisit criterion for Panel is what a
+browser shows); the Ti2-E's camera at full frame (Prime 95B, 1412×1412, a stride of 2);
+the cost of `Microscope.state()`, which is read for every frame, on a real stand;
+a mechanical shutter under auto-shutter, which opens and closes for every frame (up to
+10 times a second); and the frame's orientation in a browser.
