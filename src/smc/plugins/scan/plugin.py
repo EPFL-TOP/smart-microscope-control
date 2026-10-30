@@ -206,6 +206,7 @@ class ScanPlugin:
         plan = ctx.upstream("scan-plan", ScanPlanResult)
 
         token, wells_done, frames, failed = _resume(ctx, plan)
+        resumed_frames = len(frames)
         if not all(side > 0.0 for side in plan.fov_um):
             # An edited run document (a ``nan`` is refused too): a tolerance of
             # nothing would fail every field.
@@ -224,6 +225,9 @@ class ScanPlugin:
         z_stage = microscope.get(ZStage)
         af = stand.autofocus
         done = 0
+        # The fields of this attempt that ended without an error: a frame
+        # written, or in a dry run a move walked.
+        walked_ok = 0
         failed_in_row = 0
         unlocked_in_row = 0
         engage_attempts = 0
@@ -343,6 +347,7 @@ class ScanPlugin:
                             ),
                         )
                     )
+                walked_ok += 1
                 ctx.progress(done, total, planned.name)
 
             # Again after the last field: a lever moved in the middle of the
@@ -357,6 +362,17 @@ class ScanPlugin:
                     frames=tuple(frames),
                     failed=tuple(failed),
                 )
+            )
+
+        if failed and walked_ok == 0 and resumed_frames == 0:
+            # A scan of nothing is not ``done``: ``cells`` refuses it hours
+            # later. The checkpoint keeps every well, so a resume meets this
+            # again: the way out is a scan without it.
+            raise PluginRunError(
+                _NAME,
+                f"every field failed ({len(failed)}), the first {failed[0].name}: "
+                f"{failed[0].error}: check the stage and the camera, then run scan "
+                "again without --resume (a resume skips the wells already walked)",
             )
 
         assumed = stand.assumed

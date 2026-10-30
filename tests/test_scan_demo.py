@@ -1037,6 +1037,85 @@ def test_failures_in_a_row_are_counted_across_a_well(rig: _Rig) -> None:
     assert len(checkpoint.frames) == 3
 
 
+def test_a_scan_where_every_field_failed_is_failed_with_its_checkpoint_kept(
+    rig: _Rig,
+) -> None:
+    """A stage that refuses 12 moves is not a scan of 12 failed fields that is ``done``: ``cells`` would refuse it hours later."""
+    timeout = DeviceTimeoutError("the stage did not answer in 60 s")
+    rig.stage.fail = {n: timeout for n in range(1, 13)}
+    reason = (
+        "every field failed (12), the first A1_0000: DeviceTimeoutError: the stage "
+        "did not answer in 60 s: check the stage and the camera, then run scan "
+        "again without --resume (a resume skips the wells already walked)"
+    )
+
+    with pytest.raises(PluginRunError) as raised:
+        _scan(rig, max_failed_in_row=100)
+
+    assert raised.value.reason == reason
+    assert _stored(rig).status is StageStatus.failed
+    checkpoint = _checkpoint(rig)
+    assert checkpoint.wells_done == ("A1", "A2", "B2")
+    assert len(checkpoint.failed) == 12
+    assert checkpoint.frames == ()
+    assert rig.camera.snaps == 0
+    assert _tiffs(rig) == []
+
+    # The checkpoint keeps every well, so a resume meets the same refusal, with no move.
+    with pytest.raises(PluginRunError) as again:
+        _scan(rig, resume=True, max_failed_in_row=100)
+    assert again.value.reason == reason
+    assert rig.stage.moves == 12
+
+    # The way out is the one the message says: without --resume, on a stage that answers.
+    rig.stage.fail = {}
+    assert len(_result(_scan(rig)).frames) == 12
+
+
+def test_one_frame_among_failed_fields_keeps_the_scan_done(rig: _Rig) -> None:
+    rig.stage.fail = {n: HardwareError("no answer") for n in range(1, 12)}
+
+    result = _result(_scan(rig, max_failed_in_row=100))
+
+    assert len(result.frames) == 1
+    assert len(result.failed) == 11
+
+
+def test_a_resume_whose_remaining_fields_all_failed_keeps_the_frames_and_is_done(
+    rig: _Rig,
+) -> None:
+    """The checkpoint's four frames are a scan: the failed wells are listed, not the end of it.
+
+    Stopped here and not by the ``stopped`` fixture: a resume refuses parameters
+    that differ, and this one runs with ``max_failed_in_row=100``.
+    """
+    stop = threading.Event()
+    _scan(rig, stop=stop, on_progress=_at(5, stop.set), max_failed_in_row=100)
+    assert _checkpoint(rig).wells_done == ("A1",)
+    rig.stage.moves = 0
+    rig.stage.fail = {n: HardwareError("no answer") for n in range(1, 9)}
+
+    result = _result(_scan(rig, resume=True, max_failed_in_row=100))
+
+    assert len(result.frames) == 4
+    assert len(result.failed) == 8
+    assert rig.stage.moves == 8
+
+
+def test_a_dry_run_where_every_move_failed_is_failed_too(
+    demo_microscope_dry: Microscope, tmp_path: Path
+) -> None:
+    """In a dry run the walked moves are the fields: none walked is a scan of nothing."""
+    rig = _build(demo_microscope_dry, tmp_path)
+    _plan(rig)
+    rig.stage.fail = {n: HardwareError("no answer") for n in range(1, 13)}
+
+    with pytest.raises(PluginRunError, match="every field failed"):
+        _scan(rig, max_failed_in_row=100)
+
+    assert _stored(rig).status is StageStatus.failed
+
+
 def test_a_snap_that_times_out_is_a_failed_field(rig: _Rig) -> None:
     plan = _plan(rig)
     rig.camera.fail = {3: DeviceTimeoutError("the camera did not answer in 5 s")}
