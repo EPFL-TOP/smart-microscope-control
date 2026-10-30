@@ -2031,6 +2031,22 @@ def test_live_keeps_frames_until_ended_and_says_how_many(
     assert not status.halted
 
 
+def test_live_logs_its_start_and_its_end_and_not_a_line_per_frame(
+    page: PlatePage, fake_microscope: Microscope, caplog: pytest.LogCaptureFixture
+) -> None:
+    # FM-62, FM-148: a console that blocks must not hold the worker ten times a second.
+    fake_microscope.override(Camera, FrameCamera(_ramp_frame()))
+    with caplog.at_level(logging.INFO, logger="smc.ui"):
+        page.live(True)
+        _wait_for_frames(page, 5)
+        page.live(False)
+        assert page.join(10.0)
+    lines = [r.getMessage() for r in caplog.records if r.name == "smc.ui"]
+    assert len(lines) == 2, lines
+    assert lines[0] == "live: started from the plate page"
+    assert re.fullmatch(r"live ended: \d+ frames in \d+\.\d s", lines[1]), lines
+
+
 def test_live_frames_do_not_count_as_ended_activities(
     page: PlatePage, fake_microscope: Microscope
 ) -> None:
