@@ -18,11 +18,16 @@ import tifffile
 from smc.plugins.scan.algorithm import (
     CALIBRATION_TOLERANCE,
     PROFILE_TOLERANCE,
+    RESERVED_NAMES,
     bytes_needed,
+    collision_key,
     encode_frame,
     focus_state,
     frame_path,
     itemsize_of,
+    landed_off_target,
+    landing_error_um,
+    landing_tolerance_um,
     size_differs,
     wells_to_scan,
 )
@@ -101,6 +106,75 @@ def test_a_frame_path_refuses_a_part_that_could_leave_its_folder(bad: str) -> No
         frame_path(TOKEN, bad, "A1_0000")
     with pytest.raises(ValueError, match="cannot be a frame's"):
         frame_path(TOKEN, "A1", bad)
+
+
+@pytest.mark.parametrize("device", ["CON", "nul", "Com1", "LPT0", "aux", "PRN", "com0"])
+def test_a_frame_path_refuses_a_windows_device_name_in_any_case(device: str) -> None:
+    """FM-24: ``NUL.tif`` is the null device on Windows, whatever the case."""
+    quoted = repr(device)
+    with pytest.raises(ValueError, match="a Windows device name") as as_well:
+        frame_path(TOKEN, device, "A1_0000")
+    with pytest.raises(ValueError, match="a Windows device name") as as_name:
+        frame_path(TOKEN, "A1", device)
+
+    assert str(as_well.value) == (
+        f"{quoted} is a Windows device name and cannot be a frame's well in a file path"
+    )
+    assert str(as_name.value) == (
+        f"{quoted} is a Windows device name and cannot be a frame's field name in a "
+        "file path"
+    )
+
+
+@pytest.mark.parametrize(
+    "name", ["COM10", "CONSOLE", "NULL", "AUX1", "LPT", "COM", "A1"]
+)
+def test_only_the_whole_part_is_a_device_name(name: str) -> None:
+    assert frame_path(TOKEN, name, name) == f"scan/{TOKEN}/{name}/{name}.tif"
+
+
+def test_every_device_name_of_the_list_is_refused_and_it_is_the_whole_list() -> None:
+    expected = {"CON", "PRN", "AUX", "NUL"}
+    expected |= {f"COM{n}" for n in range(10)} | {f"LPT{n}" for n in range(10)}
+
+    assert expected == RESERVED_NAMES
+    for device in sorted(expected):
+        with pytest.raises(ValueError, match="is a Windows device name"):
+            frame_path(TOKEN, "A1", device)
+
+
+# ----------------------------------------------------------- the landing and names
+
+
+def test_the_landing_error_is_the_distance_of_both_axes() -> None:
+    assert landing_error_um((0.0, 0.0), (3.0, 4.0)) == 5.0
+    assert landing_error_um((10.0, -5.0), (10.0, -5.0)) == 0.0
+    # Both axes count, in either direction.
+    assert landing_error_um((1.0, 1.0), (-2.0, -3.0)) == 5.0
+
+
+def test_the_landing_tolerance_is_a_fraction_of_the_smaller_side() -> None:
+    """FM-73: the frame is not square; the larger side would let a field land short."""
+    assert landing_tolerance_um((128.0, 96.0), 0.05) == pytest.approx(4.8)
+    assert landing_tolerance_um((96.0, 128.0), 0.05) == pytest.approx(4.8)
+    assert landing_tolerance_um((128.0, 96.0), 0.5) == pytest.approx(48.0)
+
+
+def test_a_landing_that_is_not_a_number_is_off_target() -> None:
+    """FM-104: ``nan <= tolerance`` is False, so a test written as ``>`` lets it pass."""
+    assert landed_off_target(math.nan, 4.8)
+    assert landed_off_target(math.inf, 4.8)
+    assert not landed_off_target(4.8, 4.8)  # the tolerance itself is a landing
+    assert landed_off_target(4.9, 4.8)
+    assert not landed_off_target(0.0, 4.8)
+
+
+def test_a_collision_key_ignores_case() -> None:
+    """NTFS and the default APFS do not tell ``A1_0001`` from ``a1_0001``."""
+    assert collision_key("A1", "A1_0001") == collision_key("a1", "a1_0001")
+    assert collision_key("A1", "A1_0001") == ("a1", "a1_0001")
+    assert collision_key("A1", "A1_0001") != collision_key("A1", "A1_0002")
+    assert collision_key("A1", "X") != collision_key("A2", "X")
 
 
 # -------------------------------------------------------------------- the disk

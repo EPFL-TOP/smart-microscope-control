@@ -6,21 +6,33 @@ encoding) is ``algorithm.py``. This is the loop, and the decisions in it that
 keep a night's scan from producing frames nobody can trust:
 
 * **Everything that can be checked is checked before anything moves** (FM-30):
-  the checkpoint being resumed and its files, every frame's path, the objective
-  in place, the camera's frame and pixel size against the plan's, the
-  autofocus, the free disk. A refusal leaves the stage where it was and writes
-  no file.
+  the checkpoint being resumed and its files, the plan's field of view, every
+  frame's path (resolved once, here; on Windows, its length while it is
+  written), the objective in place, the camera's frame and pixel size against
+  the plan's, the autofocus, the free disk. A refusal leaves the stage where it
+  was and writes no file.
 * **The stand is checked again at both ends of every well.** A turret turned
   by hand, a binning changed, the magnifier lever moved (FM-103) make every
   later frame the wrong size for the plan's matrix: the scan ends, and the
   checkpoint keeps only the wells whose stand was the same from first to last
   field.
 * **An autofocus switched off during the scan stays off.** A lost lock is
-  engaged again once per field; one the operator switched off is not, and its
+  engaged again once per field, and so is the scan's own failed engage (one
+  that raised too, FM-129); one the operator switched off is not, and its
   fields are counted as unlocked.
+* **A move that returned is not a move that arrived** (FM-167). The readback is
+  compared with the target, on both axes, before the autofocus, Z or the
+  camera are touched: a field that landed off target is a failed field, not a
+  frame of the wrong place. A dry run's readback is the target, so it is not
+  compared.
 * **A field that fails is recorded and skipped; a halt is not a failure**
   (FM-64). ``max_failed_in_row`` failures in a row end the scan: a stage that
-  refuses every move must not read as a scan of failed fields.
+  refuses every move must not read as a scan of failed fields. A scan that ends
+  with no frame at all is a failure too (FM-166), not a ``done`` that ``cells``
+  refuses hours later.
+* **A frame that cannot be written ends the scan** as a ``PluginRunError`` that
+  names the frame and says what to do (a file a viewer holds open, a full disk,
+  a share that dropped), with the checkpoint keeping the wells done.
 * **The autofocus is used only as the operator left it.** One the operator
   left off is never engaged, and one that is on must have locked on this
   sample: engaging drives Z to the plane of whatever offset is stored (#205),
@@ -32,10 +44,12 @@ keep a night's scan from producing frames nobody can trust:
 from __future__ import annotations
 
 import math
+import os
 import shutil
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
@@ -54,10 +68,14 @@ from smc.plugins.scan.algorithm import (
     CALIBRATION_TOLERANCE,
     PROFILE_TOLERANCE,
     bytes_needed,
+    collision_key,
     encode_frame,
     focus_state,
     frame_path,
     itemsize_of,
+    landed_off_target,
+    landing_error_um,
+    landing_tolerance_um,
     size_differs,
     wells_to_scan,
 )
@@ -68,7 +86,13 @@ from smc.plugins.slots import (
     ScanPlanResult,
     ScanResult,
 )
-from smc.run.files import new_token, resolve_in_run, write_atomically
+from smc.run.files import (
+    AtomicWriteError,
+    new_token,
+    resolve_in_run,
+    temporary_path,
+    write_atomically,
+)
 
 if TYPE_CHECKING:
     from smc.hardware.microscope import Microscope
@@ -78,9 +102,15 @@ __all__ = ["ScanCheckpoint", "ScanParams", "ScanPlugin"]
 _NAME = "scan"
 _AGAIN = "run scan-plan again with the stand as it is now"
 
+#: Windows' MAX_PATH, which counts the terminating NUL: a path of 260
+#: characters or more fails where long paths are not enabled. Module
+#: attributes, read at the call, so that a test sets them.
+MAX_PATH: int = 260
+ON_WINDOWS: bool = os.name == "nt"
+
 
 class ScanParams(PluginParams):
-    """How the autofocus is used, and how many bad fields in a row end the scan."""
+    """How the autofocus is used, how many bad fields in a row end the scan, how far a landing may be."""
 
     autofocus: Literal["if-engaged", "required", "off"] = Field(
         "if-engaged",
@@ -103,6 +133,17 @@ class ScanParams(PluginParams):
         description=(
             "This many fields in a row on which the autofocus would not lock "
             "end the scan."
+        ),
+    )
+    landing_tolerance: float = Field(
+        0.05,
+        gt=0.0,
+        le=0.5,
+        description=(
+            "How far a field may land from its target, as a fraction of the "
+            "smaller side of the plan's field of view; a field that landed "
+            "farther is failed, not photographed. 0.05 is 4.8 µm for the "
+            "demo's 10x (a field of view of 128 x 96 µm)."
         ),
     )
 
@@ -164,19 +205,30 @@ class ScanPlugin:
             PluginRunError: A check before the scan refused it (nothing moved);
                 the stand changed at a well; ``max_failed_in_row`` fields
                 failed or ``max_unlocked_in_row`` would not lock in a row; a
-                frame came back in another shape. The checkpoint keeps the
-                wells done.
+                frame came back in another shape; every field failed (a scan
+                with no frame at all); a frame could not be
+                written (a full disk, a share that dropped or a file a
+                viewer holds open is not a field's fault). The checkpoint
+                keeps the wells done.
             MicroscopeHaltedError, MotionStoppedError: The stand was stopped;
                 the scan ends where it is.
             StopRequested: The operator stopped it; ``--resume`` continues.
-            OSError: A frame could not be written (a full disk is not a
-                field's fault).
         """
         xy = microscope.require(XYStage)
         camera = microscope.require(Camera)
         plan = ctx.upstream("scan-plan", ScanPlanResult)
 
         token, wells_done, frames, failed = _resume(ctx, plan)
+        resumed_frames = len(frames)
+        if not all(side > 0.0 for side in plan.fov_um):
+            # An edited run document (a ``nan`` is refused too): a tolerance of
+            # nothing would fail every field.
+            raise PluginRunError(
+                _NAME,
+                f"the plan's field of view {tuple(plan.fov_um)} µm is not positive: "
+                f"{_AGAIN}",
+            )
+        tolerance_um = landing_tolerance_um(plan.fov_um, params.landing_tolerance)
         paths = _paths(ctx, plan, token)
         stand = _check_stand(microscope, camera, plan, params)
         groups = wells_to_scan(plan.wells, plan.fields, set(wells_done))
@@ -186,11 +238,16 @@ class ScanPlugin:
         z_stage = microscope.get(ZStage)
         af = stand.autofocus
         done = 0
+        # The fields of this attempt that ended without an error: a frame
+        # written, or in a dry run a move walked.
+        walked_ok = 0
         failed_in_row = 0
         unlocked_in_row = 0
-        engaged_again = 0
+        engage_attempts = 0
+        engage_locks = 0
         # Whether the scan's own engage left the autofocus off (the protocol
-        # switches it off when no lock comes): that one is the scan's to retry.
+        # switches it off when no lock comes, whether it returns or raises):
+        # that one is the scan's to retry, until a field reads it locked.
         off_by_the_scan = False
         t0 = time.monotonic()
         for well, fields in groups:
@@ -201,15 +258,39 @@ class ScanPlugin:
                 try:
                     readback = xy.move_to_um(planned.x_um, planned.y_um)
                     if not ctx.dry_run:
+                        # Before anything else is read or moved: a field that
+                        # did not arrive is not photographed, and engaging the
+                        # autofocus for it would drive Z for nothing. A dry
+                        # run's readback is the target, so nothing is measured.
+                        off_um = landing_error_um(
+                            (planned.x_um, planned.y_um),
+                            (readback.x_um, readback.y_um),
+                        )
+                        if landed_off_target(off_um, tolerance_um):
+                            error = (
+                                f"StageOffTarget: the readback is {off_um:.1f} µm "
+                                f"from the target, more than {tolerance_um:.1f} µm "
+                                f"(target ({planned.x_um:.1f}, {planned.y_um:.1f}), "
+                                f"readback ({readback.x_um:.1f}, {readback.y_um:.1f}))"
+                            )
+                    if not ctx.dry_run and error is None:
                         locked = False
                         if stand.used and af is not None:
                             locked = af.is_locked()
                             # A lost lock is engaged again; an autofocus the
                             # operator switched off during the scan stays off,
                             # and its fields count as unlocked.
-                            if not locked and (off_by_the_scan or af.is_engaged()):
+                            if locked:
+                                # A lock someone else took ends the scan's own
+                                # failure: a switch-off after it is not ours.
+                                off_by_the_scan = False
+                            elif off_by_the_scan or af.is_engaged():
+                                engage_attempts += 1
+                                # Set before the call: one that raises leaves
+                                # the autofocus off too (FM-129).
+                                off_by_the_scan = True
                                 locked = af.engage()
-                                engaged_again += 1
+                                engage_locks += int(locked)
                                 off_by_the_scan = not locked
                             unlocked_in_row = 0 if locked else unlocked_in_row + 1
                             if unlocked_in_row >= params.max_unlocked_in_row:
@@ -258,18 +339,18 @@ class ScanPlugin:
 
                 failed_in_row = 0
                 if not ctx.dry_run:
+                    target = paths[planned.well, planned.name]
                     frames.append(
                         _write_frame(
-                            ctx,
                             plan,
                             planned,
-                            paths[planned.well, planned.name],
+                            target,
                             np.asarray(pixels),
                             ScanFrame(
                                 well=planned.well,
                                 index=planned.index,
                                 name=planned.name,
-                                file=paths[planned.well, planned.name],
+                                file=target.relative,
                                 x_um=readback.x_um,
                                 y_um=readback.y_um,
                                 z_um=z_um,
@@ -279,6 +360,7 @@ class ScanPlugin:
                             ),
                         )
                     )
+                walked_ok += 1
                 ctx.progress(done, total, planned.name)
 
             # Again after the last field: a lever moved in the middle of the
@@ -295,9 +377,24 @@ class ScanPlugin:
                 )
             )
 
+        if failed and walked_ok == 0 and resumed_frames == 0:
+            # A scan of nothing is not ``done``: ``cells`` refuses it hours
+            # later. The checkpoint keeps every well, so a resume meets this
+            # again: the way out is a scan without it.
+            raise PluginRunError(
+                _NAME,
+                f"every field failed ({len(failed)}), the first {failed[0].name}: "
+                f"{failed[0].error}: check the stage and the camera, then run scan "
+                "again without --resume (a resume skips the wells already walked)",
+            )
+
         assumed = stand.assumed
-        if engaged_again:
-            assumed.append(f"the autofocus was engaged again on {engaged_again} fields")
+        if engage_attempts:
+            # Attempts and locks: an engage that gave up is one, and not the other.
+            assumed.append(
+                f"the autofocus was engaged again on {engage_attempts} fields and "
+                f"locked on {engage_locks} of them"
+            )
         if ctx.dry_run:
             assumed.append(f"dry run: {done} fields walked, no frame taken")
         return ScanResult(
@@ -385,17 +482,31 @@ def _unreadable(cause: OSError) -> PluginRunError:
     )
 
 
+class _Target(NamedTuple):
+    """Where a field's frame goes: the text the result names, and the path it is written to."""
+
+    #: ``scan/<token>/<well>/<name>.tif``, POSIX, as ``ScanFrame.file``.
+    relative: str
+    #: What ``resolve_in_run`` made of it, once, before anything moved (FM-116).
+    absolute: Path
+
+
 def _paths(
     ctx: RunContext, plan: ScanPlanResult, token: str
-) -> dict[tuple[str, str], str]:
+) -> dict[tuple[str, str], _Target]:
     """Every field's frame path, keyed by well and name; refused before anything moves.
 
     The plan is a run document's, which may have been edited or copied: a
-    field of a well the plan does not list, a name that is not a file name, or
-    two fields sharing one file are refused here, not at the field.
+    field of a well the plan does not list, a name that is not a file name (or
+    is a Windows device), two fields sharing one file (compared without case:
+    NTFS and APFS do not tell ``A1_0001`` from ``a1_0001``), or a path Windows
+    would refuse are refused here, not at the field. Each path is resolved
+    once, here: resolving it again at every frame would let a share that drops
+    mid-scan end the run as a ``ValueError`` (FM-116).
     """
     wells = set(plan.wells)
-    paths: dict[tuple[str, str], str] = {}
+    targets: dict[tuple[str, str], _Target] = {}
+    first_of: dict[tuple[str, str], tuple[str, str]] = {}
     for planned in plan.fields:
         if planned.well not in wells:
             raise PluginRunError(
@@ -404,25 +515,57 @@ def _paths(
                 f"scan plan does not list: {_AGAIN}",
             )
         problem = ""
+        unreadable: OSError | None = None
         try:
-            path = frame_path(token, planned.well, planned.name)
-            resolve_in_run(ctx.run_dir, path)
+            relative = frame_path(token, planned.well, planned.name)
+            absolute = resolve_in_run(ctx.run_dir, relative)
         except ValueError as exc:
-            problem = str(exc)
+            if isinstance(exc.__cause__, OSError):
+                unreadable = exc.__cause__
+            else:
+                problem = str(exc)
+        # Raised outside the handler. The OSError's traceback holds the
+        # resolver's frame, whose caller is this one: the local goes before this
+        # frame can be left, or the plan and the context stay alive with it (FM-98).
+        if unreadable is not None:
+            try:
+                raise _unreadable(unreadable)
+            finally:
+                del unreadable
         if problem:
-            # Raised outside the handler: nothing here keeps the path's error.
             raise PluginRunError(
                 _NAME, f"field {planned.name!r} of well {planned.well!r}: {problem}"
             )
         key = (planned.well, planned.name)
-        if key in paths:
+        if key in targets:
             raise PluginRunError(
                 _NAME,
                 f"two fields of well {planned.well} are named {planned.name}, so "
                 f"they would write one file: {_AGAIN}",
             )
-        paths[key] = path
-    return paths
+        folded = collision_key(planned.well, planned.name)
+        if folded in first_of:
+            first_well, first_name = first_of[folded]
+            raise PluginRunError(
+                _NAME,
+                f"fields {first_name!r} of well {first_well!r} and "
+                f"{planned.name!r} of well {planned.well!r} would write one file, "
+                f"as the file system does not tell upper from lower case: {_AGAIN}",
+            )
+        if ON_WINDOWS:
+            # The temporary file is the longest path the write makes.
+            length = len(str(temporary_path(absolute)))
+            if length >= MAX_PATH:
+                raise PluginRunError(
+                    _NAME,
+                    f"a frame's path would reach {length} characters while it is "
+                    f"written, and Windows takes {MAX_PATH - 1} at most unless "
+                    "long paths are enabled (not assumed): move the run document "
+                    "to a shorter folder, then run scan again",
+                )
+        first_of[folded] = key
+        targets[key] = _Target(relative, absolute)
+    return targets
 
 
 def _check_stand(
@@ -592,17 +735,19 @@ def _check_well(camera: Camera, plan: ScanPlanResult, stand: _Stand, at: str) ->
 
 
 def _write_frame(
-    ctx: RunContext,
     plan: ScanPlanResult,
     planned: PlannedField,
-    path: str,
+    target: _Target,
     pixels: np.ndarray,
     meta: ScanFrame,
 ) -> ScanFrame:
     """Write one frame whole (FM-38) and return its record; a frame of another shape is not written.
 
-    An ``OSError`` writing it propagates: a full disk or a lost share is not
-    the field's fault, and every next frame would fail the same way.
+    An ``OSError`` writing it is not the field's fault (a full disk, a share
+    that dropped, a file a viewer holds open) and every next frame would fail
+    the same way: it ends the scan as a ``PluginRunError`` that names the
+    frame and says what to do, with the checkpoint keeping the wells done. A
+    ``BaseException`` that is not an ``OSError`` (a Ctrl-C) passes.
     """
     if tuple(pixels.shape) != tuple(plan.image_shape_px):
         raise PluginRunError(
@@ -611,7 +756,37 @@ def _write_frame(
             f"plan's frames are {tuple(plan.image_shape_px)}: check the camera's "
             "binning and region of interest, then run scan --resume",
         )
-    write_atomically(resolve_in_run(ctx.run_dir, path), encode_frame(pixels, meta))
+    data = encode_frame(pixels, meta)
+    failure: OSError | None = None
+    try:
+        write_atomically(target.absolute, data)
+    except OSError as exc:
+        failure = exc
+    # Raised outside the handler (FM-98).
+    if failure is not None:
+        # ``AtomicWriteError`` is an ``OSError`` that is not a ``PermissionError``:
+        # its cause says which refusal it wraps.
+        cause = failure.cause if isinstance(failure, AtomicWriteError) else failure
+        kept = failure.kept if isinstance(failure, AtomicWriteError) else None
+        if kept is not None and isinstance(cause, PermissionError):
+            # Only the final rename failed, and Windows refuses to replace a
+            # file another program holds open, as a viewer on a well that a
+            # ``--resume`` rewrites.
+            reason = (
+                f"the frame {target.relative} cannot be replaced: another program "
+                "holds it open (a viewer, a backup or antivirus agent): close it, "
+                "then run scan --resume"
+            )
+        else:
+            reason = (
+                f"the frame {target.relative} could not be written "
+                f"({failure.strerror or failure}): free some space if the disk is "
+                "full, or check the network share, then run scan --resume"
+            )
+        # The error's traceback reaches this frame: a local that keeps it is a
+        # cycle that holds this frame, and what it holds, until the collector.
+        del failure, cause
+        raise PluginRunError(_NAME, reason)
     return meta
 
 
