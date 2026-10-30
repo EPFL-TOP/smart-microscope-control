@@ -39,8 +39,18 @@ import numpy.typing as npt
 import useq
 from pydantic import ValidationError
 
-from smc.hardware.capabilities import Autofocus, Camera, LightSource, XYStage
+from smc import drive
+from smc.drive import DriveResult
+from smc.hardware.capabilities import (
+    Autofocus,
+    Camera,
+    LightSource,
+    ObjectiveTurret,
+    XYStage,
+    ZStage,
+)
 from smc.hardware.errors import HardwareError, StopRefusedError
+from smc.hardware.safety import DEFAULT_MAX_Z_JOG_UM
 from smc.plugins import (
     ParamsError,
     PluginEntry,
@@ -465,6 +475,11 @@ class PlatePage:
         # The event of the live this page started, to tell it from any other activity
         # by identity. Written on the server's loop only; read without a lock (FM-70).
         self._live_event: threading.Event | None = None
+        # The one drive action handed to the live worker and not yet taken, under
+        # ``_lock`` (m5 §6.3): its name and the call that returns its outcome text.
+        self._drive_waiting: tuple[str, Callable[[], str]] | None = None
+        # ``light_lacks()``'s answer, kept after the first read that did not raise.
+        self._light_lacks_found: tuple[str | None] | None = None
         self._closed = False
         self._ended = 0
         # A plain attribute, written by ``stop()`` and ``resume()``, which take no lock.
@@ -483,7 +498,10 @@ class PlatePage:
 
     @property
     def activities_ended(self) -> int:
-        """How many activities (runs, snaps and live sessions) have ended since the page began.
+        """How many activities (runs, snaps, live sessions, drive actions) have ended since the page began.
+
+        A drive action handed to the live worker is not an activity (m5 §6.3), and
+        is not counted.
 
         What every session compares to see that something ended while it was not
         looking: a tool that takes less than a tick is never seen running by a
@@ -833,7 +851,8 @@ class PlatePage:
         ``on`` is an activity like a snap (m5 §2.1) that takes frames until its event
         is set, and keeps each one as ``frame()``. It refuses as a snap does, and a
         stand without a camera is an outcome and no thread starts. Run and Snap are
-        refused while it goes, and it is never ended for them (m5 §5.2).
+        refused while it goes, and it is never ended for them (m5 §5.2). A drive
+        action is not refused: the live worker runs it between two frames (m5 §6.3).
 
         ``not on`` sets the event of the live this page started, and only that one
         (compared by identity, never by the name, so a plugin called ``live`` is
@@ -872,16 +891,51 @@ class PlatePage:
         """Frames until ``event`` is set or one fails, and the outcome as text.
 
         The cap is a period: the wait is what is left of ``LIVE_PERIOD_S`` since the
-        frame began, so a camera slower than that runs at its own rate, and the wait
+        turn began, so a camera slower than that runs at its own rate, and the wait
         is on the event, so STOP ends it within one period (FM-83). A frame in flight
-        when the event is set completes and is kept. Nothing is logged inside the
-        loop (FM-62, FM-148): the start and the outcome are the log's.
+        when the event is set completes and is kept. Nothing is logged for a frame
+        (FM-62, FM-148): the start, a drive action and the outcome are the log's.
+
+        At the top of each turn, before the frame, the worker takes the drive action
+        that waits (m5 §6.3) and runs it outside the lock: one thread on the
+        devices, and the next frame shows where it went. A drive action that fails
+        is its outcome, and live goes on; only a frame that fails ends live.
+        Whatever ends the loop, the event is set **first**, then the action still
+        waiting is dropped and never sent (FM-88): a failed frame ends the loop
+        without the event, and a ``_drive`` that took the lock after the drop would
+        otherwise keep an action that no loop takes. ``_drive`` reads the event
+        under the lock, so an action is either taken by the loop or refused.
         """
         log.info("live: started from the plate page")
+        try:
+            outcome = self._live_frames(event)
+        finally:
+            event.set()
+            with self._lock:
+                dropped, self._drive_waiting = self._drive_waiting, None
+        if dropped is not None:
+            outcome += f"; {dropped[0]} was not run"
+        return outcome
+
+    def _live_frames(self, event: threading.Event) -> str:
+        """``_live``'s loop: a waiting drive action, then a frame, then the rest of the period."""
         started = time.monotonic()
         frames = 0
         while not event.is_set():
             began = time.monotonic()
+            with self._lock:
+                waiting = None
+                if not event.is_set():
+                    waiting, self._drive_waiting = self._drive_waiting, None
+            if waiting is not None:
+                done = waiting[1]()
+                with self._lock:
+                    self._outcome = done
+                log.info("%s", done)
+                if event.is_set():
+                    # STOP during the action: the stand is halted, and a frame now
+                    # would end live with the halt's refusal instead of the stop.
+                    break
             taken = self._take_frame()
             if isinstance(taken, str):
                 return f"live ended after {frames} frames: {taken}"
@@ -957,6 +1011,192 @@ class PlatePage:
         except Exception as exc:
             return f"{type(exc).__name__}: {_one_line(exc)}"
         return taken
+
+    # --- drive (m5 §6.3) ---------------------------------------------------------
+
+    def jog_xy(self, dx_um: float, dy_um: float) -> None:
+        """``smc stage jog dx dy``: one activity per click, or between two frames of live.
+
+        Raises:
+            RuntimeError: Another activity is going (``<name> is running``), the
+                page is closed, or live is ending or holds a waiting action.
+        """
+        self._drive(
+            "stage jog",
+            XYStage,
+            lambda: drive.jog_xy(self._microscope, dx_um, dy_um),
+        )
+
+    def jog_z(self, dz_um: float) -> None:
+        """``smc z jog dz``; the layer's interlock suspends and relocks a locked autofocus (FM-12).
+
+        Raises:
+            RuntimeError: As ``jog_xy``.
+        """
+        self._drive("z jog", ZStage, lambda: drive.jog_z(self._microscope, dz_um))
+
+    def objective(self, label: str, *, confirm: bool) -> None:
+        """``smc objective set label``: the turret turns only with ``confirm`` (FM-14).
+
+        The page passes the ``confirm`` its *Turn the turret* button gives; without
+        it the layer refuses and the refusal is the outcome.
+
+        Raises:
+            RuntimeError: As ``jog_xy``.
+        """
+        self._drive(
+            "objective set",
+            ObjectiveTurret,
+            lambda: drive.set_objective(self._microscope, label, confirm=confirm),
+        )
+
+    def autofocus(self, on: bool) -> None:
+        """``smc autofocus engage`` or ``disengage``; switching off runs while halted.
+
+        Raises:
+            RuntimeError: As ``jog_xy``.
+        """
+        if on:
+            self._drive(
+                "autofocus engage",
+                Autofocus,
+                lambda: drive.engage_autofocus(self._microscope),
+            )
+        else:
+            self._drive(
+                "autofocus disengage",
+                Autofocus,
+                lambda: drive.disengage_autofocus(self._microscope),
+            )
+
+    def light(self, on: bool) -> None:
+        """``smc light on`` or ``off``; on is held back by ``light_lacks()``, off never is.
+
+        A light whose on/off smc does not know gets the facade's own error for an
+        off, which says to use the shutter.
+
+        Raises:
+            RuntimeError: As ``jog_xy``.
+        """
+        self._drive(
+            "light on" if on else "light off",
+            LightSource,
+            lambda: drive.switch_light(self._microscope, on),
+            lacks=self.light_lacks if on else None,
+        )
+
+    def objective_labels(self) -> tuple[str, ...]:
+        """The turret's labels in position order; ``()`` without a turret or when the read fails."""
+        turret = self._microscope.get(ObjectiveTurret)
+        if turret is None:
+            return ()
+        try:
+            return tuple(turret.labels())
+        except Exception as exc:
+            log.warning(
+                "objective: its positions could not be read: %s: %s",
+                type(exc).__name__,
+                _one_line(exc),
+            )
+            return ()
+
+    def light_lacks(self) -> str | None:
+        """Why the light cannot be switched on from the page, or ``None``.
+
+        ``lacks(LightSource)``, else a light source whose ``is_on()`` reads
+        ``None`` (a ``State`` device such as the demo's ``LED``). A read that
+        raises is ``None``: the click then says what fails. The answer is kept
+        after the first read that does not raise, since a device's type does not
+        change while the stand is held. It takes no lock: the page calls it.
+        """
+        lack = self.lacks(LightSource)
+        if lack is not None:
+            return lack
+        found = self._light_lacks_found
+        if found is not None:
+            return found[0]
+        light = self._microscope.get(LightSource)
+        if light is None:  # unreachable once lacks() said it is there
+            return None
+        try:
+            answer = (
+                f"the light source {light.device()} has no on/off that smc knows"
+                if light.is_on() is None
+                else None
+            )
+        except Exception:
+            return None
+        self._light_lacks_found = (answer,)
+        return answer
+
+    def jog_limits_um(self) -> tuple[float, float]:
+        """The profile's XY and Z jog limits, in µm: what the page's steps are bounded by.
+
+        A profile that sets no ``max_z_jog_um`` is held to the layer's assumed
+        default, as the facade holds it.
+        """
+        safety = self._microscope.profile.safety
+        z_limit = (
+            DEFAULT_MAX_Z_JOG_UM if safety.max_z_jog_um is None else safety.max_z_jog_um
+        )
+        return (safety.max_jog_um, z_limit)
+
+    def _drive(
+        self,
+        name: str,
+        capability: type,
+        action: Callable[[], DriveResult],
+        *,
+        lacks: Callable[[], str | None] | None = None,
+    ) -> None:
+        """What every drive action does, in m5 §6.3's order.
+
+        The page is closed; another activity than this page's live goes; the stand
+        lacks the capability (an outcome, nothing starts or waits); live goes (the
+        action is handed to its worker); else the action is an activity of its own.
+        ``lacks`` is a second reason after ``lacks(capability)``.
+
+        Raises:
+            RuntimeError: ``the page is closed``, ``<name> is running``, ``live is
+                ending`` or ``<name> is waiting``.
+        """
+        if self._closed:
+            raise RuntimeError("the page is closed")
+        current = self._current_run
+        live = current is not None and current[1] is self._live_event
+        if current is not None and not live:
+            raise RuntimeError(f"{current[0]} is running")
+        reason = self.lacks(capability)
+        if reason is None and lacks is not None:
+            reason = lacks()
+        if reason is not None:
+            self._set_outcome(f"{name}: {reason}")
+            return
+
+        def outcome() -> str:
+            return self._drive_outcome(name, action)
+
+        if live:
+            with self._lock:
+                now = self._current_run
+                if now is None or now[1] is not self._live_event or now[1].is_set():
+                    raise RuntimeError("live is ending")
+                if self._drive_waiting is not None:
+                    # Refused, never queued: a queue would move the stage after the
+                    # operator stopped clicking.
+                    raise RuntimeError(f"{self._drive_waiting[0]} is waiting")
+                self._drive_waiting = (name, outcome)
+            return
+        self._start_activity(name, lambda event: outcome())
+
+    @staticmethod
+    def _drive_outcome(name: str, action: Callable[[], DriveResult]) -> str:
+        """Run ``action``; its outcome text, an exception kept only as text (FM-98)."""
+        try:
+            result = action()
+        except Exception as exc:
+            return f"{name}: {type(exc).__name__}: {_one_line(exc)}"
+        return f"{name}: {result.text}"
 
     def stop(self) -> None:
         """Ask the run to stop, then stop the stand; say what the stop did, never "stopped" by default.
