@@ -693,6 +693,19 @@ def test_changed_parameters_do_not_lift_the_refusal(
     assert Stub.seen == []
 
 
+def test_run_says_what_the_stage_reads_before_the_checkpoint(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # The order of `view().blocked` is the order of `run()`: a stage that cannot run
+    # at all says so before it offers a way to continue.
+    _seed(run_doc, "reader", "reader", status=StageStatus.stopped, checkpoint={"d": 1})
+    page.run("reader", [])
+    assert page.status().outcome == (
+        "reader: UpstreamError: reader reads up, but the run document has no up; "
+        "smc run --list shows which plugin provides it"
+    )
+
+
 def test_a_run_that_stops_on_its_own_page_blocks_the_next_click(
     fake_microscope: Microscope, run_doc: Path
 ) -> None:

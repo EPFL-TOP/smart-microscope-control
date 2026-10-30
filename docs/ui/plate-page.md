@@ -223,13 +223,21 @@ its status and its error and **no values**: they are not a result. The card foll
 tab, when a run, a snap or a live view ends (a tool that takes less than a second included) and when
 you press **Refresh**, not every second.
 
-**Run starts a stage afresh, and never continues one.** After STOP (or a failure) a
-stage's record is `stopped` or `failed`, the checklist says `run it again`, and the page's
-Run button starts it **from the beginning**: the record, with the checkpoint that
-`--resume` would continue from, is replaced (`smc run` without `--resume` does the same,
-and logs it). What the first attempt wrote to disk (a scan's frames) is kept, but
-`smc run NAME --resume` can no longer reach it. **To continue a stopped stage, close
-the page and run `smc run NAME --run-doc ... --resume` first.**
+**Run never drops a checkpoint that `--resume` can continue, and never continues one.**
+After STOP (or a failure) a stage's record is `stopped` or `failed`, and the checklist
+says `run it again`. When that record holds a checkpoint that `smc run NAME --resume`
+could still continue (made on this stand, not a dry run's checkpoint for a real run, and
+nothing the stage read produced again since), its Run button is **disabled** with
+``stopped with a checkpoint: continue it with `smc run NAME --resume` (close this page
+first); `smc run NAME` without --resume starts afresh and drops it`` beside it. A click
+that gets through anyway (a tab that was not redrawn) is refused with the same words, and
+nothing is written. **To continue it, close the page (it holds the stand's connection) and
+run `smc run NAME --run-doc ... --resume`.** To give the checkpoint up, `smc run NAME
+--run-doc ...` without `--resume` starts afresh (and logs that it does); the page does not
+offer that. The fields are not compared: typing another value does not lift the refusal.
+A stage with no checkpoint, or whose checkpoint `--resume` would refuse (another stand, a
+dry run's, a stale one), is started from the beginning by the button, as it always was.
+What the first attempt wrote to disk (a scan's frames) is kept either way.
 
 **Calibrating the plate.** Under `plate-registration`: centre a well under the objective
 by hand, click it on the map, press **Capture centre**; for a wall, put the objective on
@@ -295,7 +303,8 @@ press-and-hold jog, no drive click on the map while live goes (it is a `goto-wel
 run, which writes a record), no camera settings (exposure, ROI, binning) and no time
 limit on live,
 no Connect / Disconnect and no service ([#264](https://github.com/EPFL-TOP/smart-microscope-control/issues/264)),
-no `--resume` (continue a stopped stage with `smc run --resume`), no `--host`, no login. The report and the NIS-Elements
+no `--resume` (continue a stopped stage with `smc run --resume`: the Run button of such a
+stage is disabled and says so), no `--host`, no login. The report and the NIS-Elements
 export appear as tools when their plugins are registered; they have no page of their
 own.
 

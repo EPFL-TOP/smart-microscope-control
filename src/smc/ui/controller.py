@@ -252,9 +252,9 @@ class PlateView:
     (0, 0) and no rotation, not a registered plate. ``blocked`` maps a registered
     tool to why it cannot run now: what it reads, what the stand lacks, or a
     stopped or failed run's checkpoint that ``smc run --resume`` could continue
-    (``run()`` refuses to start such a stage afresh). ``problems`` are what ``view()`` could not read
-    and did not hide. ``cards`` has one card for each tool that has a record in
-    the run document, and none for the others.
+    (``run()`` refuses to start such a stage afresh). ``problems`` are what
+    ``view()`` could not read and did not hide. ``cards`` has one card for each
+    tool that has a record in the run document, and none for the others.
     """
 
     plate: str
@@ -738,8 +738,9 @@ class PlatePage:
                 dry_run=dry_run,
                 resume=False,
             )
-            # After the checks that say a run cannot start at all, so that a stage
-            # which cannot run says that first (the order of `view().blocked`).
+            # After `check_ready`, so that a stage that reads what is not usable says
+            # that first, as `view().blocked` does. The stand's capabilities are the
+            # runner's, in the worker, and come after.
             kept = reachable_checkpoint(
                 entry.plugin.name, doc, profile=profile, dry_run=dry_run
             )
