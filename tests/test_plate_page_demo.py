@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from datetime import datetime, timezone
 from importlib.metadata import EntryPoint
 from pathlib import Path
@@ -116,6 +117,36 @@ def test_a_snap_on_the_demo_camera_is_a_512_square_uint16_frame(
         assert not frame.image.flags.writeable
         # A snap writes nothing: not a file, not the run document.
         assert list(tmp_path.iterdir()) == []
+    finally:
+        page.close()
+
+
+def test_live_gives_at_least_five_frames_a_second_on_the_demo_camera(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    # The acceptance of #262: the demo camera snaps in 10.8 ms and live is capped at
+    # ten frames a second, so 2 s give 20 (measured). Ten is the five a second the
+    # issue asks for, with the margin a loaded CI runner needs. The only timing test
+    # on the demo; the cap itself is proved on FakeCore.
+    page = PlatePage(demo_microscope, tmp_path / "run.json", entry_points=[GOTO_WELL])
+    try:
+        page.live(True)
+        deadline = time.monotonic() + 10.0
+        first = page.frame()
+        while first is None:
+            assert time.monotonic() < deadline, page.status().outcome
+            time.sleep(0.005)
+            first = page.frame()
+        time.sleep(2.0)
+        last = page.frame()
+        page.live(False)
+        assert page.join(10.0)
+        assert last is not None
+        assert last.number - first.number >= 10, (first.number, last.number)
+        outcome = page.status().outcome
+        assert outcome is not None
+        assert outcome.startswith("live ended: "), outcome
+        assert not page.status().halted
     finally:
         page.close()
 
