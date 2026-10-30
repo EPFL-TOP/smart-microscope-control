@@ -886,6 +886,19 @@ class Executor:
         deadline = time.monotonic() + limit_s
         sending = idle = gave_up = False
         previous: str | None = None
+
+        def registered() -> None:
+            # Run by the give-up right after it registered the motion. The flag
+            # goes up here, not before the give-up: a Ctrl-C that cuts the give-up
+            # before the motion is registered leaves nothing for ``close()`` to
+            # retry, so the `except` below must give up again, as it always did.
+            # Once the motion is registered, ``close()`` is the retry, and a
+            # second give-up from here would run under the hazard that cut the
+            # first (m2 §11.11 E3, FM-168).
+            nonlocal gave_up
+            gave_up = True
+            self._set_waiting(previous)
+
         try:
             previous = self._set_waiting(motion.name)
             try:
@@ -907,15 +920,20 @@ class Executor:
                 )
             idle = self._poll_until_idle(motion, deadline)
             if not idle:
-                # Set before the call, not after it: a Ctrl-C inside the
-                # give-up would otherwise reach the `except` below with the
-                # flag still down, and give up on the motion a second time.
-                gave_up = True
-                outcome, _ = self._give_up_noting_a_cut(
-                    motion,
-                    f"{limit_s:g} s timeout",
-                    registered=lambda: self._set_waiting(previous),
-                )
+                try:
+                    outcome, _ = self._give_up(
+                        motion, f"{limit_s:g} s timeout", registered=registered
+                    )
+                except BaseException as cut:
+                    # A Ctrl-C that cut the stop (or its line): it may not have
+                    # got through, and the motion is registered, so it is not
+                    # given up on again below; ``close()`` sends the stop once
+                    # more. Without the note the Ctrl-C line would say that no
+                    # move was under way. A cut before the registration is not
+                    # noted: the `except` below gives up, and notes what that did.
+                    if gave_up:
+                        note_stop(cut, StopNote(motion.name, StopOutcome.interrupted))
+                    raise
                 if self._generation(motion.device) != generation:
                     # The caller asked for the stop: the move ended as stopped,
                     # and the timeout is no reason to raise device_timeout_ms.
@@ -947,13 +965,17 @@ class Executor:
             return step.readback()
         except BaseException as exc:
             if sending and not (idle or gave_up):
-                # A second Ctrl-C inside the stop is noted on the new
-                # exception, whose context is ``exc`` (m2 §11.4).
-                _, stopped = self._give_up_noting_a_cut(
-                    motion,
-                    type(exc).__name__,
-                    registered=lambda: self._set_waiting(previous),
-                )
+                try:
+                    _, stopped = self._give_up(
+                        motion, type(exc).__name__, registered=registered
+                    )
+                except BaseException as cut:
+                    # A second Ctrl-C inside the stop: its stop may not have
+                    # reached the device. Noted on the new exception, whose
+                    # context is ``exc`` (m2 §11.4); the try covers the call's own
+                    # set-up too, and no further stop is sent (§11.11 E3).
+                    note_stop(cut, StopNote(motion.name, StopOutcome.interrupted))
+                    raise
                 # Only once the give-up has returned: a note never says
                 # "accepted" for a stop that was not sent.
                 note_stop(exc, StopNote(motion.name, stopped))
@@ -1670,29 +1692,6 @@ class Executor:
             # `f_back` (`_send_safe`'s frame): exception -> traceback -> frame
             # -> local (#163, FM-98).
             del error
-
-    def _give_up_noting_a_cut(
-        self,
-        motion: Motion,
-        why: str,
-        *,
-        registered: Callable[[], object] | None = None,
-    ) -> tuple[str, StopOutcome]:
-        """``_give_up``, and a ``BaseException`` that cuts it is noted ``interrupted`` and goes on.
-
-        A Ctrl-C inside the stop (or in its log line) means the stop may not
-        have got through. It is not given up on a second time, on either path
-        of ``_move``: the motion stays registered, and ``close()``, which every
-        command runs on leaving its ``with``, sends the stop again to what is
-        still tracked (m2 §11.11 E3). The note is part of it: without it the
-        Ctrl-C line would say that no move was under way. A bare ``raise`` and
-        nothing kept, so no frame on the traceback holds the exception (FM-98).
-        """
-        try:
-            return self._give_up(motion, why, registered=registered)
-        except BaseException as cut:
-            note_stop(cut, StopNote(motion.name, StopOutcome.interrupted))
-            raise
 
     def _send_safe(
         self,

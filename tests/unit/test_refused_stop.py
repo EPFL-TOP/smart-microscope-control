@@ -10,10 +10,12 @@ sent, or when, changes: only what the errors, the notes and the lines say.
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from types import FrameType
 from typing import cast
 
 import pytest
@@ -1111,4 +1113,118 @@ def test_the_still_moving_note_is_read_before_close_stops_the_stage() -> None:
     assert core.busy_devices == set()
     assert stop_notes(interrupted.value) == (
         StopNote("xy_stage XY", StopOutcome.still_moving),
+    )
+
+
+def _a_second_ctrl_c_in_the_handler_of_the_first(
+    core: FakeCore, microscope: Microscope
+) -> None:
+    """A Ctrl-C in a move (noted ``refused``, the stage left tracked) that a tool catches.
+
+    The tool's handler is then interrupted by a second Ctrl-C, whose context
+    is the first and which leaves the ``with``.
+    """
+    try:
+        _ctrl_c_in_a_move_left_tracked(core, microscope)
+    except KeyboardInterrupt:
+        raise KeyboardInterrupt("a second Ctrl-C, in the tool's handler") from None
+
+
+def test_a_ctrl_c_in_the_handler_of_a_noted_ctrl_c_is_not_noted_again_at_release() -> (
+    None
+):
+    # The first Ctrl-C's note is on the exception that is the context of the one
+    # that leaves the block: the dedupe reads the chain, not that exception alone.
+    core, microscope = _xy_stand_that_gives_up_after_50_ms()
+    with pytest.raises(KeyboardInterrupt, match="second Ctrl-C") as second, microscope:
+        _a_second_ctrl_c_in_the_handler_of_the_first(core, microscope)
+    assert isinstance(second.value.__context__, KeyboardInterrupt)
+    assert stop_notes(second.value) == (StopNote("xy_stage XY", StopOutcome.refused),)
+
+
+def test_a_second_ctrl_c_in_the_release_reading_what_is_tracked_still_closes_the_stand() -> (
+    None
+):
+    # `close()` was the first call of `__exit__`; reading `moving()` before it
+    # must not let an interrupt there skip the stops and the unload (#224 review).
+    core, microscope = _xy_stand_that_gives_up_after_50_ms(refuses_stop=False)
+    executor = microscope._executor
+    real_moving, reads = executor.moving, list[int]()
+
+    def moving() -> tuple[str, ...]:
+        reads.append(1)
+        if len(reads) == 1:  # the read of `__exit__`; `close()` reads it again
+            raise KeyboardInterrupt("a second Ctrl-C, in the release")
+        return real_moving()
+
+    executor.moving = moving  # type: ignore[method-assign]
+    try:
+        with pytest.raises(KeyboardInterrupt, match="in the release"), microscope:
+            raise KeyboardInterrupt("the first Ctrl-C")
+    finally:
+        del executor.moving
+    assert microscope._closed
+    assert core.log[-1] == "unloadAllDevices()"
+
+
+def test_a_ctrl_c_before_the_timeouts_give_up_registered_the_motion_gives_up_again() -> (
+    None
+):
+    # FM-168: nothing is tracked yet, so `close()` could not send a retry. The
+    # move's own `except` gives up as it did before #224, and notes what that did.
+    core, microscope = _xy_stand_that_gives_up_after_50_ms()
+    executor = microscope._executor
+    real_track, cut = executor._track, list[str]()
+
+    def track(motion: Motion) -> object:
+        if not cut:
+            cut.append(motion.name)
+            raise KeyboardInterrupt("Ctrl-C before the registration")
+        return real_track(motion)
+
+    core.busy_devices = {"XY"}
+    executor._track = track  # type: ignore[method-assign]
+    try:
+        with pytest.raises(KeyboardInterrupt, match="before the registration") as cut_c:
+            microscope.require(XYStage).move_to_um(10.0, 0.0)
+        stops = [line for line in core.log if line.startswith("stop(")]
+        tracked = microscope.state().moving
+    finally:
+        del executor._track
+        microscope.close()
+    assert stops == ["stop('XY')"]  # sent once, by the give-up that ran again
+    assert tracked == ("xy_stage XY",)
+    assert stop_notes(cut_c.value) == (StopNote("xy_stage XY", StopOutcome.refused),)
+
+
+def test_a_second_ctrl_c_as_the_handler_enters_the_give_up_is_noted_interrupted() -> (
+    None
+):
+    # The call's own set-up is inside the `try` too: a signal handler runs at a
+    # function's first bytecode, which a trace function raising at the `call`
+    # event stands in for (FM-70). Nothing was sent or registered then, and the
+    # line must still say the stop was cut, not that no move was under way.
+    core, microscope = _xy_stand_that_gives_up_after_50_ms()
+    core.busy_devices = {"XY"}
+    undo = _interrupt_the_first_busy_poll(core)
+
+    def second_ctrl_c(frame: FrameType, event: str, arg: object) -> None:
+        # Raised once: an error in a trace function unsets it.
+        if event == "call" and frame.f_code.co_name == "_give_up":
+            raise KeyboardInterrupt("a second Ctrl-C, as the give-up is entered")
+
+    previous = sys.gettrace()
+    sys.settrace(second_ctrl_c)
+    try:
+        with pytest.raises(
+            KeyboardInterrupt, match="as the give-up is entered"
+        ) as second:
+            microscope.require(XYStage).move_to_um(10.0, 0.0)
+    finally:
+        sys.settrace(previous)
+        undo()
+        microscope.close()
+    assert isinstance(second.value.__context__, KeyboardInterrupt)
+    assert stop_notes(second.value) == (
+        StopNote("xy_stage XY", StopOutcome.interrupted),
     )

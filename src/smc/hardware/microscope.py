@@ -865,11 +865,17 @@ class Microscope:
         after it, so a ``close()`` that raises loses no note. Only for a
         ``KeyboardInterrupt``: it is the one error whose line reads the notes
         (m2 §11.11 E6). Nothing is kept on ``self``, no other lock is taken
-        and nothing is written (FM-70).
+        and nothing is written (FM-70). The read is inside its own ``try``
+        whose ``finally`` is ``close()``: a second Ctrl-C in the read loses the
+        note, never the release.
         """
-        tracked = self._executor.moving() if isinstance(exc, KeyboardInterrupt) else ()
+        tracked: tuple[str, ...] = ()
         try:
-            self.close()
+            try:
+                if isinstance(exc, KeyboardInterrupt):
+                    tracked = self._executor.moving()
+            finally:
+                self.close()
         finally:
             _note_still_moving(exc, tracked)
 
