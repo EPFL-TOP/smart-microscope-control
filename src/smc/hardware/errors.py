@@ -230,12 +230,16 @@ def note_stop(exc: BaseException, note: StopNote) -> None:
 
 
 def stop_notes(exc: BaseException) -> tuple[StopNote, ...]:
-    """The notes of ``exc`` and of its ``__context__`` chain, oldest first.
+    """The notes of ``exc`` and of the Ctrl-Cs it interrupted, oldest first.
 
     ``__context__``, not ``__cause__``: a second Ctrl-C inside a give-up's
     stop raises a new ``KeyboardInterrupt`` whose context is the first, and
-    the two notes are on the two exceptions. It stops at an exception it has
-    already seen, so a chain that loops ends.
+    the two notes are on the two exceptions. The walk goes on only through
+    ``KeyboardInterrupt``s: a Ctrl-C raised inside the handler of an earlier,
+    noted error (a plugin that catches a failed move) must not report that
+    old stop as its own, so the first other exception ends the walk unread
+    (m2 §11.11 E5). It also stops at an exception it has already seen, so a
+    chain that loops ends.
     """
     chain: list[BaseException] = []
     seen: set[int] = set()
@@ -243,7 +247,8 @@ def stop_notes(exc: BaseException) -> tuple[StopNote, ...]:
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         chain.append(current)
-        current = current.__context__
+        older = current.__context__
+        current = older if isinstance(older, KeyboardInterrupt) else None
     return tuple(note for link in reversed(chain) for note in getattr(link, _NOTES, ()))
 
 
