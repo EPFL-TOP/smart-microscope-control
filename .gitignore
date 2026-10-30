@@ -26,6 +26,8 @@ htmlcov/
 # execution sessions live under the checkout and are never committed
 .claude/settings.local.json
 .claude/worktrees/
+# What scripts/dev/ui_snap.py (/ui-check) writes by default: PNGs of the plate page
+/.claude/ui-check/
 
 # Experimental data and model weights are never committed
 /data/

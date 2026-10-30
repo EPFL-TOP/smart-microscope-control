@@ -10,13 +10,15 @@ harm or from lying:
   the stage where it was and the autofocus as it was.
 * **The autofocus is switched off and never engaged again** (FM-12, FM-88). It
   cannot lock over the plastic between wells, and engaging it drives Z. The
-  survey says so in its result and the scan, which reads the autofocus as the
-  operator left it, finds it off.
+  result says what the scan will find: the autofocus's state, read at the end of
+  the survey and not remembered from its start, so a resumed survey says it too.
 * **Nothing moves to put something back** (FM-88): the stage stays at the last
   point, there is no return and no ``finally`` that moves. No Z, no turret.
 * **A halt is not a skipped point** (FM-64). A point that fails is counted and
-  skipped; more than a tenth skipped ends the survey, and the checkpoint keeps
-  what was sampled.
+  skipped; ``max_failed_in_row`` of them in a row, or more than a tenth of the
+  survey, end it, and the checkpoint keeps what was sampled. The bound in a row
+  comes first: a tenth of 1120 points at the 60 s move timeout is 1.9 h of a
+  dead stage.
 * **A frame is placed where the stage says it was**, not where it was sent
   (measured beats assumed). A stage that stops short of a target without an
   error gives a survey that does not reach the plate's edges, and the extent
@@ -63,8 +65,17 @@ _CHECKPOINT_EVERY = 50
 _SKIP_DENOMINATOR = 10
 #: No stage travels a metre: a centre this far out is a unit slip (FM-32).
 _MAX_CENTRE_UM = 1_000_000.0
+#: The WARNING logged when the survey switches the autofocus off.
 _AUTOFOCUS_LINE = (
     "the autofocus was switched off for the survey; engage it again before the scan"
+)
+_AUTOFOCUS_OFF_LINE = (
+    "the autofocus is off after the survey; the scan never switches it on: lock it "
+    "on the sample before the scan"
+)
+_NO_LIMITS_LINE = (
+    "the stage reports no soft limits, so the survey's moves were not checked "
+    "against any travel"
 )
 
 
@@ -117,8 +128,10 @@ class PlateFindingParams(PluginParams):
         ge=0.0,
         le=5.0,
         description=(
-            "How far past the outer wells the survey reaches, in pitches. Under "
-            "1, A1 cannot be pinned down and the survey is refused."
+            "How far past the outer wells the survey reaches on each side, in "
+            "pitches. A survey that spans less than the outer wells plus one "
+            "pitch is refused, because A1 cannot be pinned down: about 0.5 here, "
+            "a little less with jitter."
         ),
     )
     jitter: float = Field(
@@ -140,6 +153,15 @@ class PlateFindingParams(PluginParams):
         description=(
             "The number taken from each frame: its mean, or its standard "
             "deviation (for a contrast that sets wells apart by texture)."
+        ),
+    )
+    max_failed_in_row: int = Field(
+        default=3,
+        ge=1,
+        le=100,
+        description=(
+            "This many survey points failing in a row end the survey; the "
+            "checkpoint keeps what was sampled."
         ),
     )
 
@@ -185,12 +207,16 @@ def _well_plate(name: str) -> str:
 
 
 class SurveyCheckpoint(BaseModel):
-    """What a resume needs: the centre, how far the survey got, and what it sampled.
+    """What a resume needs: the centre, the survey's size, how far it got, and what it sampled.
 
     ``next_index`` counts the planned points handled, sampled or skipped, in the
-    list left after the soft limits. The centre is kept because without
-    parameters it is the stage's position at the start, and on a resume the
-    stage is elsewhere. A pydantic model built from Python objects does not
+    list left after the soft limits. That list is rebuilt from the limits each
+    attempt reads, so ``total``, its size, is kept: a checkpoint that indexes a
+    list rebuilt from state outside itself keeps the list's size, or other
+    limits shift every index and nothing says so (FM-141). The count is not a
+    fingerprint: limits that move and keep the count pass it. The centre is
+    kept because without parameters it is the stage's position at the start, and
+    on a resume the stage is elsewhere. A pydantic model built from Python objects does not
     validate a nested dataclass again, so a ``SurveyPoint`` holding ``nan`` is
     accepted when built and refused when the JSON is read back: the loop never
     builds one.
@@ -199,6 +225,7 @@ class SurveyCheckpoint(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
 
     centre_um: tuple[float, float]
+    total: int = Field(ge=0)
     next_index: int = Field(ge=0)
     skipped: int = Field(ge=0)
     points: tuple[SurveyPoint, ...]
@@ -230,9 +257,10 @@ class PlateFindingPlugin:
         Raises:
             PluginRunError: A dry run was asked to survey; the survey is too big,
                 or cannot pin A1 down inside the stage's soft limits (nothing
-                moved); the checkpoint is not this survey's; too many points
-                failed; the fit is unusable, or its winner is a larger plate
-                than the survey reaches.
+                moved); the checkpoint is not this survey's, or was made for
+                another survey size; ``max_failed_in_row`` points in a row, or
+                more than a tenth of them, failed; the fit is unusable, or its
+                winner is a larger plate than the survey reaches.
             MicroscopeHaltedError, MotionStoppedError: The stand was stopped; the
                 stage is where it is and the checkpoint keeps the last 50.
             StopRequested: The operator stopped it; ``--resume`` continues.
@@ -273,13 +301,13 @@ class PlateFindingPlugin:
             # Before the first move: a survey stopped before its 50th point would
             # leave nothing to keep the centre, and a resume would survey again
             # around wherever the stage stopped (FM-111).
-            _save(ctx, centre, 0, 0, [])
+            _save(ctx, centre, total, 0, 0, [])
         autofocus = microscope.get(Autofocus)
         if first < total and autofocus is not None and autofocus.is_engaged():
             autofocus.disengage()
             ctx.logger.warning(_AUTOFOCUS_LINE)
-            assumed.append(_AUTOFOCUS_LINE)
 
+        failed_in_row = 0
         for i in range(first, total):
             ctx.raise_if_stopped()
             x_um, y_um = kept[i]
@@ -299,26 +327,36 @@ class PlateFindingPlugin:
             if error is None and not all(math.isfinite(c) for c in arrived):
                 error = "the stage's readback is not a finite position"
             if error is None:
+                failed_in_row = 0
                 # Where the stage says it was, not where it was sent: a stage
                 # that stops short without an error would otherwise give A1 a
                 # whole well off, and the extent checks would pass on the plan.
                 points.append(SurveyPoint(arrived[0], arrived[1], value))
             else:
                 skipped += 1
-                if skipped * _SKIP_DENOMINATOR > total:
-                    _save(ctx, centre, i + 1, skipped, points)
+                failed_in_row += 1
+                # In a row first: a stage that fails every move would otherwise
+                # be left to fail a tenth of the survey, 113 moves of 1120 at a
+                # 60 s timeout each.
+                if failed_in_row >= params.max_failed_in_row:
+                    head = f"{failed_in_row} survey points in a row"
+                elif skipped * _SKIP_DENOMINATOR > total:
+                    head = f"{skipped} of {total} survey points"
+                else:
+                    head = ""
+                if head:
+                    _save(ctx, centre, total, i + 1, skipped, points)
                     raise PluginRunError(
                         _NAME,
-                        f"{skipped} of {total} survey points could not be "
-                        f"sampled, the last at ({x_um + 0.0:.1f}, {y_um + 0.0:.1f}) "
-                        f"µm: {error}; check the stage, then run plate-finding "
-                        "--resume",
+                        f"{head} could not be sampled, the last at "
+                        f"({x_um + 0.0:.1f}, {y_um + 0.0:.1f}) µm: {error}; check "
+                        "the stage, then run plate-finding --resume",
                     )
             ctx.progress(i + 1, total, "survey")
             if (i + 1) % _CHECKPOINT_EVERY == 0:
-                _save(ctx, centre, i + 1, skipped, points)
+                _save(ctx, centre, total, i + 1, skipped, points)
 
-        _save(ctx, centre, total, skipped, points)
+        _save(ctx, centre, total, total, skipped, points)
         ctx.progress(total, total, "fitting")
         fits = fit(points, list(params.plates) or None)
         best, notes = decide(fits)
@@ -339,6 +377,8 @@ class PlateFindingPlugin:
                 f"{skipped} of {total} survey points could not be sampled and "
                 "were skipped"
             )
+        # After every check that can refuse the fit: a refused fit reads nothing.
+        assumed.extend(_autofocus_lines(autofocus))
         ctx.logger.info(best.describe())
         return best.to_result(
             runner_up=runner_up.plate if runner_up is not None else None,
@@ -375,12 +415,13 @@ def _inside_the_limits(
 
     The test is the layer's own (``low <= v <= high`` on both axes), so a point
     kept here is one the move will not refuse. ``limits_um()`` is ``None`` when
-    the stand does not say, and then nothing is cut. The clause is empty when
-    the limits removed no point.
+    the stand does not say, and then nothing is cut and the result says that no
+    travel was checked: what is true of the layer, not what to do about it. The
+    clause is empty when the limits removed no point.
     """
     limits = xy.limits_um()
     if limits is None:
-        return planned, "", []
+        return planned, "", [_NO_LIMITS_LINE]
     x_limits, y_limits = limits
     x_low, x_high = x_limits.low_um, x_limits.high_um
     y_low, y_high = y_limits.low_um, y_limits.high_um
@@ -405,12 +446,22 @@ def _resume(
 ) -> tuple[list[SurveyPoint], int, int]:
     """The points, the skipped count and the index to continue from; a fresh start has none.
 
-    A checkpoint is refused when it says more points were handled than the
-    survey has, or when the points it holds and the ones it skipped do not add
-    up to the points it says were handled: it is of another survey, or edited.
+    A checkpoint is refused when it was made for a survey of another size (the
+    soft limits changed, and every index with them), when it says more points
+    were handled than the survey has, or when the points it holds and the ones
+    it skipped do not add up to the points it says were handled: it is of
+    another survey, or edited. The size is checked first: it is the reason the
+    others would be wrong.
     """
     if checkpoint is None:
         return [], 0, 0
+    if checkpoint.total != total:
+        raise PluginRunError(
+            _NAME,
+            f"the checkpoint was made for a survey of {checkpoint.total} points "
+            f"inside the soft limits and this one has {total}: the stage's soft "
+            "limits changed; run plate-finding without --resume",
+        )
     if checkpoint.next_index > total:
         raise PluginRunError(
             _NAME,
@@ -430,6 +481,7 @@ def _resume(
 def _save(
     ctx: RunContext,
     centre: tuple[float, float],
+    total: int,
     next_index: int,
     skipped: int,
     points: list[SurveyPoint],
@@ -437,11 +489,39 @@ def _save(
     ctx.save_checkpoint(
         SurveyCheckpoint(
             centre_um=centre,
+            total=total,
             next_index=next_index,
             skipped=skipped,
             points=tuple(points),
         )
     )
+
+
+def _autofocus_lines(autofocus: Autofocus | None) -> list[str]:
+    """What the scan will find of the autofocus: its state now, read, never remembered.
+
+    A flag kept from the switch-off would be silent when the operator switched
+    it off, and stale when the operator locked it again. The price is a line on
+    every survey of a stand whose autofocus is off, including when it was off
+    before: the scan finds it off whoever did it. Only a read is made here: no
+    ``engage``, no ``disengage`` (FM-88). A read that fails is a finding, not a
+    lost survey, and a halt or a motion stop is not (FM-64).
+    """
+    if autofocus is None:
+        return []
+    try:
+        engaged = autofocus.is_engaged()
+    except (MicroscopeHaltedError, MotionStoppedError):
+        raise
+    except HardwareError as exc:
+        problem = _one_line(exc)
+    else:
+        return [] if engaged else [_AUTOFOCUS_OFF_LINE]
+    # Built outside the handler (FM-98).
+    return [
+        f"the autofocus's state could not be read after the survey ({problem}); "
+        "check it before the scan"
+    ]
 
 
 def _one_line(exc: BaseException) -> str:

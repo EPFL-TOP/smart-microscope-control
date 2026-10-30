@@ -6,13 +6,17 @@ The fake reproduces it with ``autofocus_target_um`` and
 ``autofocus_drive_after_reads`` (m2 §12.7). Unless a test says otherwise:
 ``z_soft_limits_um = [10, 4350]``, Z at 4269.44 µm (the dish at 10x),
 ``max_engage_excursion_um = 50``, ``settle_s = 0.05``, objective ``10x``,
-and the default lock wait shortened to ``LOCK_S``. "Declared" is
+``lock_timeout_s = LOCK_TIMEOUT_S`` (the autofocus's default lock wait is
+still shortened to ``LOCK_S``, for a profile that sets none). "Declared" is
 ``[autofocus] engage_drives_z_to_offset = true``.
 
 A test whose point is that something happens *inside* the settle window
 widens the window, so that a slow poll (Windows sleeps in 15.6 ms steps)
-cannot let the window end first. Threads meet on events (FM-44); messages
-are compared whole (FM-45).
+cannot let the window end first. A test that expects the lock to come waits
+under a deadline of ``LOCK_TIMEOUT_S``, since a runner can be late by 0.15 s
+(measured, #275); a test whose point is the deadline passes
+``lock_timeout_s=LOCK_S``. Threads meet on events (FM-44); messages are
+compared whole (FM-45).
 """
 
 from __future__ import annotations
@@ -69,6 +73,8 @@ UNSEEN = (
 SWITCHED = "; it was on and searching, so it was switched off"
 OUTSIDE = "outside the soft limits [10, 4350] µm"
 BEYOND = "more than [safety] max_engage_excursion_um (50 µm) beyond where it started"
+# A deadline a stalled runner cannot reach, as the settle-window tests' 2-3 s (#275).
+LOCK_TIMEOUT_S = 3.0
 
 
 @pytest.fixture(autouse=True)
@@ -94,6 +100,7 @@ def _guarded(*, declared: bool = False, **autofocus: Any) -> Profile:
             "settle_s": 0.05,
             "settle_tolerance_um": 0.5,
             "engage_drives_z_to_offset": declared,
+            "lock_timeout_s": LOCK_TIMEOUT_S,
             **autofocus,
         },
         safety=LIMITS,
@@ -221,7 +228,10 @@ def test_a_z_move_under_the_operators_lock_relocks_without_a_prior_read() -> Non
     # suspend() reads the lock before the move ends it (m2 §12.4). No band:
     # with one, suspend() would read the lock for z_held anyway.
     profile = _profile(
-        autofocus={"engage_drives_z_to_offset": True},
+        autofocus={
+            "engage_drives_z_to_offset": True,
+            "lock_timeout_s": LOCK_TIMEOUT_S,
+        },
         safety={"z_soft_limits_um": (10.0, 4350.0)},
     )
     with _stand(profile) as stand:
@@ -412,7 +422,7 @@ def test_a_deadline_whose_switch_off_fails_stays_registered_whatever_z_reads(
 ) -> None:
     # FM-127: the give-up's busy check comes after the stop; PFS still on may
     # move Z, so it counts as moving even when Z can no longer be read.
-    with _stand() as stand:
+    with _stand(_guarded(lock_timeout_s=LOCK_S)) as stand:
         stand.core.autofocus_lockable = False  # searching until the deadline
         switch, read = stand.core.enableContinuousFocus, stand.core.getPosition
         stuck: list[bool] = []
@@ -584,10 +594,32 @@ def test_without_a_settle_window_engage_returns_at_the_first_locked_read() -> No
         assert stand.z.position_um() == Z0
 
 
+def test_a_first_poll_late_by_more_than_lock_s_does_not_end_the_engage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # One stall of 0.3 s, on the first poll after the switch-on: more than
+    # LOCK_S, so it closes the short deadline on any runner, and a tenth of
+    # LOCK_TIMEOUT_S. No elapsed time is asserted (FM-44, #275).
+    with _stand() as stand:
+        real = stand.core.isContinuousFocusEnabled
+        stalled: list[bool] = []
+
+        def late_once_on() -> bool:
+            if ON in stand.core.log and not stalled:
+                stalled.append(True)
+                time.sleep(0.3)
+            return real()
+
+        # An instance attribute: the facade's proxy looks it up at each call.
+        monkeypatch.setattr(stand.core, "isContinuousFocusEnabled", late_once_on)
+        assert stand.af.engage() is True
+        assert stalled == [True]
+
+
 def test_a_lock_whose_z_never_settles_is_given_up_switched_off_and_named(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    with _stand() as stand:
+    with _stand(_guarded(lock_timeout_s=LOCK_S)) as stand:
         reads: list[int] = []
 
         def creeping() -> float:

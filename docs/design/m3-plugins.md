@@ -2286,6 +2286,7 @@ class ScanParams(PluginParams):
     autofocus: Literal["if-engaged", "required", "off"] = "if-engaged"
     max_failed_in_row: int = Field(3, ge=1, le=100)
     max_unlocked_in_row: int = Field(5, ge=1, le=1000)
+    landing_tolerance: float = Field(0.05, gt=0.0, le=0.5)  # #228, below
 ```
 
 ```python
@@ -2321,13 +2322,19 @@ only), `Autofocus`, `ObjectiveTurret`.
    fields left × `H × W × itemsize` of a frame (about 4 MB at 1412²,
    1.2 GB per 96-well well), else `PluginRunError` naming both numbers.
 
-**Per well**, before its first field: the objective (when checked) and the
-pixel size are read again; a change of objective, or a pixel size more
-than 1 % from `p0` (the magnifier lever, FM-103), is a `PluginRunError`,
-the checkpoint keeping the wells done.
+**Per well**, before its first field **and after its last** (FM-130): the
+objective (when checked) and the pixel size are read again; a change of
+objective, or a pixel size more than 1 % from `p0` (the magnifier lever,
+FM-103), is a `PluginRunError`, the checkpoint keeping the wells done. A
+well is marked done only when the stand was the same at both ends, so a
+change in the middle of a well leaves that well out of the checkpoint.
 
 **Per field**: `ctx.raise_if_stopped()`; `readback = xy.move_to_um(x, y)`;
-when the autofocus is used and not `is_locked()`, one
+a readback farther from the target than `landing_tolerance` of the plan's
+smaller field side is a failed field, and nothing else is read or moved for
+it (#228, below);
+when the autofocus is used, not `is_locked()`, and either still engaged (a
+lost lock) or switched off by the scan's own failed `engage()` (FM-129), one
 `engage()` (the profile's lock timeout; it drives Z, which is what PFS is
 for, as `nikon-control` engaged on every field); `focus` is `locked` or
 `unlocked`, and `max_unlocked_in_row` unlocked fields in a row are a
@@ -2343,8 +2350,11 @@ to `scan/<token>/<well>/<name>.tif`; `ctx.progress(done, total,
 pass first (FM-64); any other `HardwareError`, `SafetyRefusedError`
 included, records a `FailedField` (one line, `<Type>: <message>`) and goes
 on; `max_failed_in_row` failures in a row are a `PluginRunError`. An
-`OSError` writing a frame ends the scan as it is (a full disk is not a
-field's fault).
+`OSError` writing a frame is not a field's fault (a full disk, a lost
+share, a file held open): it ends the scan as a `PluginRunError` that names
+the frame's file and says what to do, never as an unexpected `OSError`
+(#228, below). A scan that ends with no frame because every field failed is
+a `PluginRunError` too (#228).
 
 **Checkpoint** after each well (`ctx.save_checkpoint`); a resume skips
 `wells_done`, keeps the token and the frames. **Dry run**: no frame is
@@ -2378,14 +2388,18 @@ autofocus the operator left off, and returns to no start position.
   `required` refuses an autofocus that is missing, off or not locked;
   `if-engaged` refuses one that is on and not locked ("lock it on the
   sample, or switch it off and run with autofocus=off"); `off` reads
-  nothing from it. A failed `engage()` leaves it off (the protocol); the
-  next unlocked field engages it again, which is the scan's own state, not
-  one the operator left. The scan adds no Z guard of its own around
+  nothing from it. A failed `engage()` (one that returns False, or raises)
+  leaves it off (the protocol); the next unlocked field engages it again,
+  which is the scan's own state, not one the operator left. An autofocus the
+  operator switches off during the scan is not engaged again (FM-129; its
+  fields are `unlocked`). The scan adds no Z guard of its own around
   `engage()`: safety guards live in the layer, and that guard is #205's.
 - **Paths are checked before anything moves.** Every frame's path is the
   text `scan/<token>/<well>/<name>.tif`; `well` and `name` must match
-  `[A-Za-z0-9_-]+`, no two fields may share a path, and each text goes
-  through `resolve_in_run`; a failure is a `PluginRunError`. The
+  `[A-Za-z0-9_-]+` and be no Windows device name, no two fields may share a
+  path (compared without case), and each text goes
+  through `resolve_in_run`; a failure is a `PluginRunError` (#228 adds the
+  rules for names and the length). The
   checkpoint's `token` is constrained to `^[0-9a-f]{12}$` (`new_token()`),
   so a run document from elsewhere cannot point a write outside the run
   folder: `ctx.checkpoint` then raises `ResumeError`.
@@ -2418,7 +2432,123 @@ autofocus the operator left off, and returns to no start position.
 - A frame's TIFF carries `ScanFrame.model_dump(mode="json")` as
   `tifffile`'s JSON metadata, written into a `BytesIO` (measured with
   tifffile 2024.1.30 on Python 3.10 and 2026.9.20 on 3.13). `assumed`
-  gains `the autofocus was engaged again on <n> fields` when `n > 0`.
+  gains one line when the autofocus was engaged again (#228: it counts
+  attempts and locks).
+
+**Refined while planning #228** (measured on the demo, 2026-10-30, Python
+3.13; the leftovers of #213, items numbered as in #228):
+
+- **A scan with no frame is not `done`** (item 1). Reproduced: all 12
+  fields of the demo plan failing with `max_failed_in_row=100` gave `done`,
+  0 frames, 12 failed fields, and `cells` refuses such a scan. After the
+  last well's checkpoint, when `failed` is not empty, no field of this
+  attempt ended without an error and the checkpoint held no frame, the scan
+  raises `PluginRunError`: `every field failed (<n>), the first <name>:
+  <error>: check the stage and the camera, then run scan again without
+  --resume (a resume skips the wells already walked)`. The checkpoint
+  keeps every well, so a resume meets the same refusal: the message says
+  so. A scan with one frame, from this attempt or from the checkpoint,
+  stays `done` with its failures listed (the failures in a row are
+  `max_failed_in_row`'s). A dry run is held to the same rule, its walked
+  moves being the fields.
+- **The readback is compared with the target** (item 2). The frame records
+  the readback and `cells` maps from it, so a short landing does not
+  misplace a cell: it leaves a gap in the coverage, or repeats a place.
+  `landing_tolerance` is a fraction of the smaller side of the plan's
+  `fov_um`, default 0.05, `0 < x <= 0.5`. Measured: the demo's readback is
+  within 0.015 µm of the target on all 12 fields, and `fov_um` is (128, 96),
+  so the default is 4.8 µm there. At the default overlap of 10 %, two
+  neighbours that each land the tolerance away from each other, along their
+  step, just keep touching: a landing within the tolerance leaves no gap on
+  an axis-aligned grid. The distance is the `math.hypot` of the two axes
+  and the test is `not distance <= tolerance`, so a readback that is not a
+  number fails the field (FM-104). A field off target is a **failed field**:
+  recorded with its target, error `StageOffTarget: the readback is <d> µm
+  from the target, more than <t> µm (target (<x>, <y>), readback (<x>,
+  <y>))`, one decimal each, counted by `max_failed_in_row`, and **nothing
+  else is read or moved for it**: no autofocus call (an `engage()` drives
+  Z), no snap. No retry and no wait (§8 above, m2 §11). Not checked in a dry
+  run: the layer's dry-run readback is the target (measured), so nothing is
+  measured. A plan whose smaller side of `fov_um` is not above 0 (an edited
+  run document) is refused before anything moves: `the plan's field of view
+  <fov> µm is not positive: run scan-plan again with the stand as it is now`.
+- **A frame that cannot be written** (items 3 and 7).
+  `write_atomically` raises `AtomicWriteError` for every `OSError`; it
+  keeps the cause, and `kept` when only the rename failed. The scan turns
+  it into a `PluginRunError`, raised outside the handler (FM-98). When
+  `kept` is set and the cause is a `PermissionError` (Windows refuses to
+  replace a file another program holds open, as a viewer on a well that a
+  `--resume` rewrites): `the frame <file> cannot be replaced: another
+  program holds it open (a viewer, a backup or antivirus agent): close it,
+  then run scan --resume`. Any other: `the frame <file> could not be
+  written (<strerror>): free some space if the disk is full, or check the
+  network share, then run scan --resume`. `<file>` is the run-relative text,
+  `scan/<token>/A1/A1_0001.tif`. The checkpoint keeps the wells done; the
+  well in progress is scanned again whole. The retry of `write_atomically`
+  stays 5 × 0.05 s: a viewer holds the file until it is closed, so a longer
+  wait only delays the message, and the scan has no `time.sleep` of its own.
+  The files are not tested for "held open" before the scan: opening a file
+  does not show the condition that blocks its replacement, and the
+  condition cannot be produced here. The absolute path of each frame is the
+  one `_paths` resolved before anything moved, and the write does not
+  resolve again, so no `OSError` of `resolve` becomes a `ValueError` at a
+  field (measured: 24 `resolve_in_run` calls for 12 fields, 12 after). A
+  `ValueError` whose cause is an `OSError`, from `resolve_in_run` in
+  `_paths` (a share that drops during the check), is `_unreadable` there
+  too, as in `_is_file_in_run` (FM-116).
+- **MAX_PATH** (item 4). On Windows only (`os.name == "nt"`), before
+  anything moves, the longest path the scan writes must be shorter than 260
+  characters (MAX_PATH counts the terminating NUL). That path is the
+  temporary file of `write_atomically`, `.<name>.<8 hex>.smc-tmp` beside the
+  frame, 18 characters longer than the frame's own name (measured): its
+  folder is then at least 24 characters under the 248 a directory may
+  have, so one check covers both. `smc.run.files.temporary_path(path)` makes
+  that name for `write_atomically` and for this check, so the two cannot
+  differ. Refusal: `a frame's path would reach <n> characters while it is
+  written, and Windows takes 259 at most unless long paths are enabled (not
+  assumed): move the run document to a shorter folder, then run scan
+  again`. Whether long paths are enabled is not read: the registry key does
+  not say whether this Python honours it, and unknown beats guessed. A PC
+  that has them enabled is refused too, and the fix costs a folder move.
+- **Names** (item 8). `frame_path` refuses the Windows device names `CON`,
+  `PRN`, `AUX`, `NUL`, `COM0`..`COM9`, `LPT0`..`LPT9`, in any case, for the
+  well and for the field name alike (a part has no dot, so `NUL.tif` is the
+  same device). The list is its own: `PurePath.is_reserved` is deprecated
+  in 3.13 and removed in 3.15 (#203 holds the same rule for
+  `resolve_in_run`; this one is the scan's own parts and stays). Two
+  fields collide when their well and name agree after `str.casefold`:
+  NTFS and the default APFS do not tell `A1_0001` from `a1_0001`. Measured
+  on an APFS volume: a plan with `A1_0000` and `a1_0000` in one well was
+  `done` with 12 frames in the result and 11 files on disk. The refusal
+  names both frames' paths.
+- **The autofocus flag** (item 6, FM-129). The scan's own failed `engage()`
+  switches the autofocus off, and the flag that lets the next field engage
+  it again (`off_by_the_scan`) was set after the call returned, so an
+  `engage()` that raised left it unset (measured: one `engage()` call, then
+  the scan ended with "lock it on the sample" for a switch-off nobody made).
+  The flag is set before the call and is `not locked` after it. A second
+  hole, found while planning: the flag also outlived a lock someone else
+  took (measured: the scan's engage fails at field 2, the operator locks
+  PFS by hand and switches it off again, and the scan engaged it a second
+  time). The flag is cleared whenever a field reads the autofocus locked.
+- **The `assumed` line** (item 9): `the autofocus was engaged again on <a>
+  fields and locked on <l> of them`, when `a > 0`; an attempt is an
+  `engage()` call started, one that raised included.
+- **Closed, with a reason.** Item 5: `ScanResult.assumed` does not carry the
+  plan's lines: the report gathers the `assumed` of `scan-plan`, `scan`,
+  `cells`, `density` and `route`, each with its stage's name, so a copy
+  would list the plan's lines twice, and `cells` needs none of them. Item
+  10: the start check of a well stays after the end check of the one
+  before. Skipping it saves three reads per well; the checkpoint write
+  between the two is time in which a lever can move, and nothing measured
+  what the reads cost on the Ti2-E.
+
+**Tests of #228** (names in the plan on the issue; demo with `SampleCamera`,
+the stage wrapper gaining a landing error by move number): every decision
+above has one, and each is checked from both sides of its bound (a landing
+of 4.0 µm passes and 6.0 µm fails a tolerance of 4.8 µm, on the x axis and
+on the smaller side of a non-square frame, FM-73). **Failure modes**: FM-24,
+FM-30, FM-38, FM-64, FM-88, FM-98, FM-104, FM-116, FM-129, FM-130.
 
 **Tests** (demo with `SampleCamera` unless said): `test_a_scan_writes_one_tiff_per_field_and_records_the_readback`;
 `test_the_wrong_objective_is_refused_before_anything_moves` (fake turret,
