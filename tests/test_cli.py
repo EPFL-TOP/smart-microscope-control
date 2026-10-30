@@ -831,36 +831,43 @@ _LET_IT_FINISH = f"let it finish or stop it with the stand's own controls, then 
     [
         pytest.param((), f"interrupted — no move was under way; {_READ}", id="none"),
         pytest.param(
-            (StopNote("xy_stage XY", StopOutcome.accepted, False),),
+            (StopNote("xy_stage XY", StopOutcome.accepted),),
             f"interrupted — xy_stage XY was stopped; {_READ}",
             id="accepted",
         ),
         pytest.param(
-            (StopNote("xy_stage XYStage", StopOutcome.refused, True),),
+            (StopNote("xy_stage XYStage", StopOutcome.refused),),
             "interrupted — xy_stage XYStage refuses a stop on this stand ([safety] "
             f"stop_refused_by), so it runs to its target; {_LET_IT_FINISH}",
             id="declared-refusal",
         ),
         pytest.param(
-            (StopNote("xy_stage XY", StopOutcome.refused, False),),
-            "interrupted — xy_stage XY refused the stop, so it may still be moving; "
+            (StopNote("xy_stage XY", StopOutcome.failed),),
+            "interrupted — the stop of xy_stage XY failed, so it may still be moving; "
             f"{_LET_IT_FINISH}",
-            id="undeclared-refusal",
+            id="failed",
         ),
         pytest.param(
-            (StopNote("Dichroic", StopOutcome.impossible, False),),
+            (StopNote("Dichroic", StopOutcome.impossible),),
             "interrupted — Dichroic cannot be stopped from smc, so it may still be "
             f"moving; {_LET_IT_FINISH}",
             id="impossible",
         ),
         pytest.param(
             (
-                StopNote("z Z", StopOutcome.accepted, False),
-                StopNote("xy_stage XY", StopOutcome.interrupted, False),
+                StopNote("z Z", StopOutcome.accepted),
+                StopNote("xy_stage XY", StopOutcome.interrupted),
             ),
             "interrupted — z Z was stopped; the stop of xy_stage XY was cut by a "
-            f"second Ctrl-C, so it may still be moving; {_LET_IT_FINISH}",
+            f"Ctrl-C, so it may still be moving; {_LET_IT_FINISH}",
             id="interrupted",
+        ),
+        pytest.param(
+            (StopNote("xy_stage XY", StopOutcome.still_moving),),
+            "interrupted — xy_stage XY was still tracked as moving when the stand "
+            "was released; close()'s log line says what its stop did; "
+            f"{_LET_IT_FINISH}",
+            id="still-moving",
         ),
     ],
 )
@@ -873,6 +880,21 @@ def test_the_ctrl_c_line_says_what_the_stop_did(
         note_stop(interrupt, note)
     assert cli._report(interrupt, "") == 130
     assert capsys.readouterr().out.splitlines() == [f"✗ {line}"]
+
+
+def test_every_stop_outcome_has_its_own_ctrl_c_clause() -> None:
+    # A member with no branch of its own used to fall into the last one's text:
+    # `interrupted` said "second Ctrl-C" for whatever came after it.
+    clauses = {
+        outcome: cli._note_clause(StopNote("xy_stage XY", outcome))
+        for outcome in StopOutcome
+    }
+    assert len(set(clauses.values())) == len(StopOutcome), clauses
+    cut = clauses[StopOutcome.interrupted]
+    assert [o for o, text in clauses.items() if text == cut] == [
+        StopOutcome.interrupted
+    ]
+    assert all("second" not in text for text in clauses.values()), clauses
 
 
 def _declaring(tmp_path: Path, roles: str, name: str = "declared") -> Path:

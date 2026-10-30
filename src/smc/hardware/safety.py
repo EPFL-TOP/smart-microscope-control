@@ -954,16 +954,11 @@ class Executor:
                     # A second Ctrl-C inside the stop: its stop may not have
                     # reached the device. Noted on the new exception, whose
                     # context is ``exc`` (m2 §11.4).
-                    note_stop(
-                        cut,
-                        StopNote(
-                            motion.name, StopOutcome.interrupted, motion.stop_refused
-                        ),
-                    )
+                    note_stop(cut, StopNote(motion.name, StopOutcome.interrupted))
                     raise
                 # Only once the give-up has returned: a note never says
                 # "accepted" for a stop that was not sent.
-                note_stop(exc, StopNote(motion.name, stopped, motion.stop_refused))
+                note_stop(exc, StopNote(motion.name, stopped))
             raise
         finally:
             self._set_waiting(previous)
@@ -1653,7 +1648,7 @@ class Executor:
                 return _GAVE_UP_DECLARED, StopOutcome.refused
             return (
                 f"the stop failed ({error!r}), so it may still be moving",
-                StopOutcome.refused,
+                StopOutcome.failed,
             )
         finally:
             # A returned error reaches this frame through its traceback's

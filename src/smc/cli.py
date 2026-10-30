@@ -334,18 +334,29 @@ def _interrupted_line(notes: Sequence[StopNote]) -> str:
 def _note_clause(note: StopNote) -> str:
     """One stop of the Ctrl-C line, in the words of m2 §11.6."""
     name = note.motion
-    if note.outcome is StopOutcome.accepted:
+    outcome = note.outcome
+    # One branch per outcome, so that a member added later fails here and never
+    # falls into another one's text (it read "second Ctrl-C" for every member
+    # that had no branch).
+    if outcome is StopOutcome.accepted:
         return f"{name} was stopped"
-    if note.outcome is StopOutcome.refused:
-        if note.declared:
-            return (
-                f"{name} refuses a stop on this stand ([safety] stop_refused_by), "
-                f"so it runs to its target"
-            )
-        return f"{name} refused the stop, so it may still be moving"
-    if note.outcome is StopOutcome.impossible:
+    if outcome is StopOutcome.refused:
+        return (
+            f"{name} refuses a stop on this stand ([safety] stop_refused_by), "
+            f"so it runs to its target"
+        )
+    if outcome is StopOutcome.failed:
+        return f"the stop of {name} failed, so it may still be moving"
+    if outcome is StopOutcome.impossible:
         return f"{name} cannot be stopped from smc, so it may still be moving"
-    return f"the stop of {name} was cut by a second Ctrl-C, so it may still be moving"
+    if outcome is StopOutcome.interrupted:
+        return f"the stop of {name} was cut by a Ctrl-C, so it may still be moving"
+    if outcome is StopOutcome.still_moving:
+        return (
+            f"{name} was still tracked as moving when the stand was released; "
+            f"close()'s log line says what its stop did"
+        )
+    raise AssertionError(f"no Ctrl-C clause for {outcome!r}")
 
 
 def _stop_refused_line(roles: Iterable[Role]) -> str | None:

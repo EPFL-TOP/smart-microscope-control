@@ -198,13 +198,16 @@ def test_ctrl_c_during_a_move_notes_the_declared_refusal() -> None:
             undo()
         assert core.log == ["setXYPosition('XY', 10.0, 0.0)", "stop('XY')"]
     assert stop_notes(interrupted.value) == (
-        StopNote("xy_stage XY", StopOutcome.refused, True),
+        StopNote("xy_stage XY", StopOutcome.refused),
     )
 
 
-def test_ctrl_c_during_a_move_on_an_undeclared_stand_notes_a_refusal_not_declared() -> (
+def test_ctrl_c_during_a_move_on_an_undeclared_stand_notes_a_failure_not_a_refusal() -> (
     None
 ):
+    # The layer never parses the device's text: a stop that raised on a role the
+    # profile does not declare is a fault, and the line must not call it a
+    # refusal (m2 §11.11 E4).
     with _stand(Profile.demo()) as (core, microscope):
         core.busy_devices = {"XY"}
         undo = _interrupt_the_first_busy_poll(core)
@@ -214,7 +217,7 @@ def test_ctrl_c_during_a_move_on_an_undeclared_stand_notes_a_refusal_not_declare
         finally:
             undo()
     assert stop_notes(interrupted.value) == (
-        StopNote("xy_stage XY", StopOutcome.refused, False),
+        StopNote("xy_stage XY", StopOutcome.failed),
     )
 
 
@@ -229,7 +232,7 @@ def test_ctrl_c_during_a_move_notes_an_accepted_stop() -> None:
             undo()
         assert core.log == ["setXYPosition('XY', 10.0, 0.0)", "stop('XY')"]
     assert stop_notes(interrupted.value) == (
-        StopNote("xy_stage XY", StopOutcome.accepted, False),
+        StopNote("xy_stage XY", StopOutcome.accepted),
     )
 
 
@@ -250,7 +253,7 @@ def test_ctrl_c_during_a_turret_move_notes_that_it_cannot_be_stopped() -> None:
             core.busy_devices.clear()
         assert "stop('Objective')" not in core.log
     assert stop_notes(interrupted.value) == (
-        StopNote("objective_turret Objective", StopOutcome.impossible, False),
+        StopNote("objective_turret Objective", StopOutcome.impossible),
     )
 
 
@@ -292,9 +295,7 @@ def test_a_second_ctrl_c_inside_the_stop_is_noted_as_interrupted() -> None:
     # The first Ctrl-C is the context, and it carries no note of its own: its
     # give-up never returned.
     assert isinstance(second.__context__, KeyboardInterrupt)
-    assert stop_notes(second) == (
-        StopNote("xy_stage XY", StopOutcome.interrupted, True),
-    )
+    assert stop_notes(second) == (StopNote("xy_stage XY", StopOutcome.interrupted),)
 
 
 def test_a_stop_during_a_move_on_a_declared_stand_says_it_may_have_run_to_its_target() -> (
@@ -592,7 +593,7 @@ def test_ctrl_c_during_an_offset_move_on_the_ti2_notes_the_declared_refusal() ->
     finally:
         microscope.close()
     assert stop_notes(interrupted.value) == (
-        StopNote("autofocus_offset PFSOffset", StopOutcome.refused, True),
+        StopNote("autofocus_offset PFSOffset", StopOutcome.refused),
     )
 
 

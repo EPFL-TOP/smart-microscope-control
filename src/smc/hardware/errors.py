@@ -193,22 +193,24 @@ class StopOutcome(str, Enum):
     """What a stop sent on giving up on a motion did (m2 §11.4)."""
 
     accepted = "accepted"  # the device took the stop
-    refused = "refused"  # the device raised: a move under way may run to its target
+    refused = "refused"  # raised on a declared role: the move runs to its target
+    failed = "failed"  # raised on an undeclared role: a fault, the move may still run
     impossible = "impossible"  # no stop from smc (a State device)
-    interrupted = "interrupted"  # a second Ctrl-C cut the stop: it may not have reached the device
+    interrupted = "interrupted"  # a Ctrl-C cut the stop: it may not have got through
+    still_moving = "still_moving"  # tracked as moving when the stand was released
 
 
 @dataclass(frozen=True, slots=True)
 class StopNote:
-    """One give-up's stop, noted on the exception that ended the wait (m2 §11.4).
+    """One stop's outcome, noted on the exception that ended the wait (m2 §11.4).
 
-    Strings, an enum and a bool: a note holds no exception, so it cannot keep
-    a traceback, and the core with it (FM-98).
+    A string and an enum: a note holds no exception, so it cannot keep a
+    traceback, and the core with it (FM-98). Whether the role is declared is
+    in the outcome (``refused`` or ``failed``), not a field of its own.
     """
 
     motion: str  # "xy_stage XYStage"
     outcome: StopOutcome
-    declared: bool  # the motion's stop_refused
 
 
 #: The attribute the notes ride on. A tuple, replaced whole by ``note_stop``.
