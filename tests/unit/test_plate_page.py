@@ -1497,6 +1497,19 @@ def test_the_run_button_of_a_stopped_stage_is_disabled_with_the_resume_command(
         page.close()
 
 
+def test_a_tools_note_wraps_where_the_text_is_the_command_that_continues(
+    page: PlatePage,
+) -> None:
+    # Measured in Chromium (#252, /ui-check): a `white-space` in `styles` lands on the
+    # pane's host while the `<pre>` inside its shadow root keeps `pre`, so a reason
+    # of 190 characters ran past the column and ended at `smc run sca`. The rule is
+    # on the `<pre>`; a test cannot see a rendering, only that it is still there.
+    view = PlatePageView(page)
+    for note in view.tool_notes.values():
+        assert note.stylesheets == ["pre { white-space: pre-wrap; }"]
+        assert "white-space" not in note.styles
+
+
 def test_a_running_tool_disables_every_run_button_until_it_ends(
     page: PlatePage,
 ) -> None:
