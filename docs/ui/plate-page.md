@@ -231,13 +231,20 @@ nothing the stage read produced again since), its Run button is **disabled** wit
 ``stopped with a checkpoint: continue it with `smc run NAME --resume` (close this page
 first); `smc run NAME` without --resume starts afresh and drops it`` beside it. A click
 that gets through anyway (a tab that was not redrawn) is refused with the same words, and
-nothing is written. **To continue it, close the page (it holds the stand's connection) and
-run `smc run NAME --run-doc ... --resume`.** To give the checkpoint up, `smc run NAME
---run-doc ...` without `--resume` starts afresh (and logs that it does); the page does not
-offer that. The fields are not compared: typing another value does not lift the refusal.
-A stage with no checkpoint, or whose checkpoint `--resume` would refuse (another stand, a
-dry run's, a stale one), is started from the beginning by the button, as it always was.
-What the first attempt wrote to disk (a scan's frames) is kept either way.
+nothing is written. **To continue it, stop `smc ui` (Ctrl-C in its console) and run `smc
+run NAME --run-doc ... --profile <this stand> --param KEY=VALUE ... --resume`.** The
+page's "close this page first" means that: the stand is held by the command, and a closed
+tab releases nothing. `smc run` takes the demo profile unless `--profile` (or
+`SMC_PROFILE`) says otherwise, and `--resume` refuses parameters that differ from the
+stopped run's, so give again every field you typed on the page as `--param KEY=VALUE`.
+To give the checkpoint up, `smc run NAME --run-doc ...` without `--resume` starts afresh
+(and logs that it does); the page does not offer that, and it is also the way out when
+`--resume` itself is refused by the plugin (a scan whose frames were moved out of its run
+folder: the page cannot know it and stays disabled). The fields are not compared: typing
+another value does not lift the refusal. A stage with no checkpoint, or whose checkpoint
+`--resume` would refuse for what the document tells (another stand, a dry run's, a stale
+one), is started from the beginning by the button, as it always was. What the first
+attempt wrote to disk (a scan's frames) is kept either way.
 
 **Calibrating the plate.** Under `plate-registration`: centre a well under the objective
 by hand, click it on the map, press **Capture centre**; for a wall, put the objective on

@@ -139,6 +139,11 @@ def reachable_checkpoint(
 
     It touches neither hardware nor files, like ``check_ready``.
 
+    "Reachable" is what the document can tell, not what the plugin will accept: a
+    plugin may still refuse on resume (``scan`` when frame files were moved out of
+    its run folder, a checkpoint its model no longer reads), and the page then
+    stays blocked while ``smc run`` without ``--resume`` is the only way out.
+
     Returns:
         ``StageStatus.stopped`` or ``StageStatus.failed``, or ``None`` when there
         is no such record, no checkpoint, or ``--resume`` would refuse it.

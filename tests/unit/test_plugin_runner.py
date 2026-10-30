@@ -1117,6 +1117,35 @@ def test_reachable_checkpoint_of_a_dry_run_is_reachable_by_a_dry_run_only() -> N
     assert _reachable(real, dry_run=True) is StageStatus.stopped
 
 
+def test_reachable_checkpoint_asks_is_stale_only_of_a_record_that_passed_the_cheap_tests(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `is_stale` walks what a record read, and `view()` asks for every registered tool
+    # on every event (#252): the answer is the same in any order, so only a spy can
+    # pin that the cheap tests come first.
+    asked: list[str] = []
+    real = RunDocument.is_stale
+
+    def spy(self: RunDocument, plugin: str) -> bool:
+        asked.append(plugin)
+        return real(self, plugin)
+
+    monkeypatch.setattr(RunDocument, "is_stale", spy)
+    stopped = _with_checkpoint(StageStatus.stopped)
+    for record in (
+        None,
+        _with_checkpoint(StageStatus.done),
+        _with_checkpoint(StageStatus.running),
+        _done_record("resumable", status=StageStatus.stopped),  # no checkpoint
+        stopped.model_copy(update={"profile": "other"}),
+        stopped.model_copy(update={"dry_run": True}),
+    ):
+        assert _reachable(record) is None
+    assert asked == []
+    assert _reachable(stopped) is StageStatus.stopped
+    assert asked == ["resumable"]
+
+
 def test_reachable_checkpoint_agrees_with_what_resume_accepts() -> None:
     # The refusal protects what `--resume` could continue and nothing else: for the
     # same document, a checkpoint is reachable exactly when `check_ready(resume=True)`

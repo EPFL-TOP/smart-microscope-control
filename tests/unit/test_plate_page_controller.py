@@ -1616,10 +1616,16 @@ def test_view_blocks_a_stage_with_a_reachable_checkpoint_after_its_other_reasons
 ) -> None:
     # A tool that cannot run at all says why first; the checkpoint is the last reason.
     page = _page(fake_microscope, run_doc, [_ep(StubScan)])
-    for name in ("stub", "scan", "reader"):
-        _seed(run_doc, name, name, status=StageStatus.stopped, checkpoint={"done": 1})
+    # `stub` failed and the others were stopped: the text says which, per stage.
+    statuses = {
+        "stub": StageStatus.failed,
+        "scan": StageStatus.stopped,
+        "reader": StageStatus.stopped,
+    }
+    for name, status in statuses.items():
+        _seed(run_doc, name, name, status=status, checkpoint={"done": 1})
     blocked = page.view().blocked
-    assert blocked["stub"] == _checkpoint_text("stub", "stopped")
+    assert blocked["stub"] == _checkpoint_text("stub", "failed")
     assert blocked["scan"] == _checkpoint_text("scan", "stopped")
     # What it reads comes before the checkpoint: `reader` reads `up`, which is absent.
     assert blocked["reader"] == (
@@ -1635,21 +1641,57 @@ def test_view_blocks_a_stage_with_a_reachable_checkpoint_after_its_other_reasons
     assert page.view().blocked["scan"] == _checkpoint_text("scan", "stopped")
 
 
+@pytest.mark.parametrize("fault", ["another-profile", "a-dry-run"])
 def test_view_does_not_block_a_stage_whose_checkpoint_resume_would_refuse(
-    fake_microscope: Microscope, run_doc: Path
+    fake_microscope: Microscope, run_doc: Path, fault: str
 ) -> None:
+    # A real page and a record `--resume` would refuse: nothing is protected, and a
+    # blocked button here would trap the operator with no way out on the page.
     _seed(
         run_doc,
         "stub",
         "stub",
         status=StageStatus.stopped,
         checkpoint={"done": 1},
-        profile="another",
+        profile="another" if fault == "another-profile" else "demo",
+        dry_run=fault == "a-dry-run",
     )
     _seed(run_doc, "failing", "failing", status=StageStatus.done)
     page = _page(fake_microscope, run_doc)
     assert "stub" not in page.view().blocked
     assert "failing" not in page.view().blocked
+
+
+@pytest.mark.parametrize(
+    "recorded_dry", [False, True], ids=["real-record", "dry-record"]
+)
+def test_a_dry_run_page_protects_a_checkpoint_resume_can_reach(
+    run_doc: Path, fake_core: FakeCore, recorded_dry: bool
+) -> None:
+    # `smc run --resume --dry-run` accepts a real record's checkpoint and a dry run's
+    # own: only a real run refuses a dry run's. The page asks the same question, from
+    # the stand it is on, in `view()` and in `run()`.
+    dry = Microscope.from_core(
+        cast("CMMCorePlus", fake_core), Profile.demo(), dry_run=True
+    )
+    try:
+        _seed(
+            run_doc,
+            "stub",
+            "stub",
+            status=StageStatus.stopped,
+            checkpoint={"done": 1},
+            dry_run=recorded_dry,
+        )
+        page = _page(dry, run_doc)
+        assert page.view().blocked["stub"] == _checkpoint_text("stub", "stopped")
+        before = run_doc.read_bytes()
+        page.run("stub", [])
+        assert page.status().outcome == f"stub: {_checkpoint_text('stub', 'stopped')}"
+        assert run_doc.read_bytes() == before
+        assert Stub.seen == []
+    finally:
+        dry.close()
 
 
 def test_the_view_survives_an_unreadable_run_document(
