@@ -976,6 +976,141 @@ def test_a_typed_range_selects_and_draws(page: PlatePage) -> None:
     ]
 
 
+# --- the handlers and the document lock (#277, FM-161) ----------------------------------
+#
+# A handler that raised in a real session when Enter was pressed in the Wells box passed
+# every test above: they set the widget on a view that no session owns, where nothing
+# holds a lock. These tests cannot open a session (a `pull_session` client does not
+# reproduce the interleaving, #277); they prove the pieces that make a session work, and
+# `/ui-check` looks at the page in a browser.
+
+
+def _type_wells(view: PlatePageView) -> None:
+    view.select_input.value = "A1:A3"
+
+
+def _click_refresh(view: PlatePageView) -> None:
+    view.refresh_button.clicks += 1
+
+
+def _tap_nowhere(view: PlatePageView) -> None:
+    _tap(view, 0.0, 0.0)
+
+
+_HANDLER_TRIGGERS = pytest.mark.parametrize(
+    "trigger",
+    [_type_wells, _click_refresh, _tap_nowhere],
+    ids=["typed-range", "refresh-button", "tap"],
+)
+
+
+@_HANDLER_TRIGGERS
+def test_a_handler_runs_inside_panels_unlocked_context(
+    page: PlatePage, monkeypatch: pytest.MonkeyPatch, trigger: Callable[..., None]
+) -> None:
+    view = PlatePageView(page)
+    active = {"now": False}
+    seen: list[bool] = []
+
+    @contextmanager
+    def unlocked() -> Iterator[None]:
+        active["now"] = True
+        try:
+            yield
+        finally:
+            active["now"] = False
+
+    def redraw() -> None:
+        seen.append(active["now"])
+
+    monkeypatch.setattr(pn.io, "unlocked", unlocked)
+    with _replaced(view, "refresh", redraw):
+        trigger(view)
+    assert seen
+    assert all(seen)
+
+
+@_HANDLER_TRIGGERS
+def test_an_unexpected_failure_in_a_handler_is_a_line_of_the_page(
+    page: PlatePage, caplog: pytest.LogCaptureFixture, trigger: Callable[..., None]
+) -> None:
+    view = PlatePageView(page)
+
+    def redraw() -> None:
+        raise KeyError("boom")
+
+    with (
+        caplog.at_level(logging.ERROR, logger="smc.ui"),
+        _replaced(view, "refresh", redraw),
+    ):
+        trigger(view)
+    assert view.message.object.startswith("that action failed on the page: KeyError: ")
+    assert "boom" in view.message.object
+    failures = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(failures) == 1
+    assert failures[0].name.startswith("smc.ui")
+    assert failures[0].exc_info is not None
+
+
+@pytest.mark.parametrize(
+    ("size", "cut"), [(10_000, True), (301, True), (300, False), (299, False)]
+)
+def test_the_failure_line_of_a_handler_is_bounded(
+    page: PlatePage, size: int, cut: bool
+) -> None:
+    view = PlatePageView(page)
+    text = "x" * size
+
+    def redraw() -> None:
+        raise OSError(text)
+
+    with _replaced(view, "refresh", redraw):
+        view.refresh_button.clicks += 1
+    prefix = "that action failed on the page: OSError: "
+    suffix = " (see the server's log)"
+    line = view.message.object
+    assert len(line) <= 400
+    assert line.startswith(prefix)
+    assert line.endswith(suffix)
+    body = line[len(prefix) : -len(suffix)]
+    assert body == ("x" * 300 + "…" if cut else text)
+
+
+def test_a_keyboard_interrupt_in_a_handler_is_not_swallowed(page: PlatePage) -> None:
+    view = PlatePageView(page)
+
+    def interrupted() -> None:
+        raise KeyboardInterrupt
+
+    with _replaced(view, "refresh", interrupted), pytest.raises(KeyboardInterrupt):
+        view.refresh_button.clicks += 1
+    assert view.message.object == ""
+
+
+def test_every_handler_the_page_registers_is_guarded(page: PlatePage) -> None:
+    view = PlatePageView(page)
+    registered: list[Any] = [
+        watcher.fn
+        for widget in view.layout.select(pn.widgets.Widget)
+        for by_name in widget.param.watchers.values()
+        for watchers in by_name.values()
+        for watcher in watchers
+    ]
+    registered += view.figure._event_callbacks["tap"]
+    # Panel registers watchers of its own on the same widgets: ours are the functions
+    # of this module, which `functools.wraps` leaves a `__wrapped__` on.
+    ours = [
+        fn for fn in registered if getattr(fn, "__module__", "") == plate_page.__name__
+    ]
+    assert len(ours) >= 20, "the test found no handlers to check"
+    unguarded = [
+        getattr(fn, "__qualname__", repr(fn))
+        for fn in ours
+        if not hasattr(fn, "__wrapped__")
+    ]
+    assert unguarded == []
+
+
 def test_a_tap_in_drive_mode_moves_once(
     run_doc: Path, page: PlatePage, fake_microscope: Microscope
 ) -> None:
