@@ -3,8 +3,8 @@
 The only module besides the ``smc ui`` command that imports Panel and
 Bokeh. It holds no decision: a tap, a button and a typed range each call the
 controller, and an exception the controller raises for the operator's mistake is
-shown as its message and kept as nothing else (FM-98). Three rules the page
-keeps, each learned by measuring (m3 §15.3):
+shown as its message and kept as nothing else (FM-98). Four rules the page
+keeps, each learned by measuring (m3 §15.3, #277):
 
 * **The tick never rebuilds the view.** The periodic callback reads
   ``PlatePage.status()`` once a second and redraws the strip; the plate's wells
@@ -18,10 +18,16 @@ keeps, each learned by measuring (m3 §15.3):
   worker thread, which only fills a queue.
 * **A closed or reloaded tab does nothing.** The controller belongs to the
   server; a session's widgets and its periodic callback are the tab's.
+* **A handler is registered through ``PlatePageView._handler``**: Panel runs one
+  without the document lock when an event flushes a change it had queued (the
+  Enter of a text field), and the page's own Bokeh models are then written
+  outside the lock (FM-171). The periodic callbacks are locked and are not
+  wrapped.
 """
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 import threading
@@ -110,6 +116,12 @@ _PLATE_TAB = 0
 _IMAGE_TAB = 1
 
 NO_FRAME_TEXT = "no frame yet"
+
+log = logging.getLogger("smc.ui")
+
+#: The longest exception text a handler's failure line shows, in characters: the line
+#: is for the operator, and the traceback with the whole text is in the server's log.
+_FAILURE_TEXT_CHARS = 300
 
 _WARNING = "#b45309"
 _SELECTED_OUTLINE = "#1f77b4"
@@ -321,7 +333,7 @@ class PlatePageView:
             line_width=3,
             color="#000000",
         )
-        self.figure.on_event(Tap, self.on_tap)
+        self.figure.on_event(Tap, self._handler(self.on_tap))
 
         # The camera's frame: 8-bit grey from 0 to 255 (``display_image``), whatever
         # the camera's bit depth is.
@@ -386,24 +398,34 @@ class PlatePageView:
         self.live_button = pn.widgets.Button(label="Live")
         self.snap_note = pn.pane.Str("", styles={"color": _WARNING})
 
+        # Every handler goes through `_handler` (the document lock, a failure is a line).
         self.plate_select.param.watch(
-            lambda event: self.on_choose_plate(event.new), "value"
+            self._handler(lambda event: self.on_choose_plate(event.new)), "value"
         )
-        self.label_select.param.watch(lambda event: self._draw_wells(), "value")
+        self.label_select.param.watch(
+            self._handler(lambda event: self._draw_wells()), "value"
+        )
         self.drive_toggle.param.watch(
-            lambda event: setattr(self.drive_text, "visible", bool(event.new)), "value"
+            self._handler(
+                lambda event: setattr(self.drive_text, "visible", bool(event.new))
+            ),
+            "value",
         )
         self.select_input.param.watch(
-            lambda event: self.on_select_text(event.new), "value"
+            self._handler(lambda event: self.on_select_text(event.new)), "value"
         )
-        self.refresh_button.on_click(lambda event: self.refresh())
-        self.stop_button.on_click(lambda event: self.on_stop())
-        self.resume_button.on_click(lambda event: self.on_resume())
-        self.capture_centre_button.on_click(lambda event: self.on_capture("centre"))
-        self.capture_wall_button.on_click(lambda event: self.on_capture("wall"))
-        self.forget_button.on_click(lambda event: self.on_forget())
-        self.snap_button.on_click(lambda event: self.on_snap())
-        self.live_button.on_click(lambda event: self.on_live())
+        self.refresh_button.on_click(self._handler(lambda event: self.refresh()))
+        self.stop_button.on_click(self._handler(lambda event: self.on_stop()))
+        self.resume_button.on_click(self._handler(lambda event: self.on_resume()))
+        self.capture_centre_button.on_click(
+            self._handler(lambda event: self.on_capture("centre"))
+        )
+        self.capture_wall_button.on_click(
+            self._handler(lambda event: self.on_capture("wall"))
+        )
+        self.forget_button.on_click(self._handler(lambda event: self.on_forget()))
+        self.snap_button.on_click(self._handler(lambda event: self.on_snap()))
+        self.live_button.on_click(self._handler(lambda event: self.on_live()))
         self._build_drive()
 
         self.tool_runs: dict[str, Any] = {}
@@ -487,19 +509,29 @@ class PlatePageView:
         self._objective_shown = False
 
         for direction, button in self.jog_buttons.items():
-            button.on_click(self._jogger(direction))
+            button.on_click(self._handler(self._jogger(direction)))
         for direction, button in self.z_buttons.items():
-            button.on_click(self._focuser(direction))
-        self.autofocus_on_button.on_click(lambda event: self.on_autofocus(True))
-        self.autofocus_off_button.on_click(lambda event: self.on_autofocus(False))
-        self.objective_button.on_click(lambda event: self.on_objective())
-        self.objective_confirm_button.on_click(
-            lambda event: self.on_objective_confirm()
+            button.on_click(self._handler(self._focuser(direction)))
+        self.autofocus_on_button.on_click(
+            self._handler(lambda event: self.on_autofocus(True))
         )
-        self.objective_cancel_button.on_click(lambda event: self.on_objective_cancel())
-        self.objective_select.param.watch(lambda event: self._disarm(), "value")
-        self.light_on_button.on_click(lambda event: self.on_light(True))
-        self.light_off_button.on_click(lambda event: self.on_light(False))
+        self.autofocus_off_button.on_click(
+            self._handler(lambda event: self.on_autofocus(False))
+        )
+        self.objective_button.on_click(self._handler(lambda event: self.on_objective()))
+        self.objective_confirm_button.on_click(
+            self._handler(lambda event: self.on_objective_confirm())
+        )
+        self.objective_cancel_button.on_click(
+            self._handler(lambda event: self.on_objective_cancel())
+        )
+        self.objective_select.param.watch(
+            self._handler(lambda event: self._disarm()), "value"
+        )
+        self.light_on_button.on_click(self._handler(lambda event: self.on_light(True)))
+        self.light_off_button.on_click(
+            self._handler(lambda event: self.on_light(False))
+        )
 
     def _jogger(self, direction: str) -> Callable[[Any], None]:
         def clicked(event: Any) -> None:
@@ -599,7 +631,7 @@ class PlatePageView:
         key_widgets = [fields[row[0]] for row in tool.key]
         advanced_widgets = [fields[row[0]] for row in tool.advanced]
         run = pn.widgets.Button(label=f"Run {tool.name}")
-        run.on_click(self._runner(tool.name))
+        run.on_click(self._handler(self._runner(tool.name)))
         self.tool_runs[tool.name] = run
         note = pn.pane.Str("", styles={"color": _WARNING})
         self.tool_notes[tool.name] = note
@@ -625,6 +657,39 @@ class PlatePageView:
         return clicked
 
     # --- handlers ---------------------------------------------------------------
+
+    def _handler(self, fn: Callable[..., Any]) -> Callable[..., None]:
+        """``fn`` as Panel and Bokeh should call it: under the document lock, and never raising.
+
+        Panel runs a handler without the session's lock when an event flushes a change
+        it had queued: the Enter of a text field arrives with the field's change, and
+        the watcher then writes the page's own Bokeh models (a ``ColumnDataSource``, a
+        title) outside the lock, where Bokeh raises and the browser shows nothing
+        (#277, FM-171). ``pn.io.unlocked()`` is what Panel's widgets use for each of
+        their own writes; inside a locked callback it hands the events back to Bokeh,
+        so it is safe for a tap and a click too. What a handler raises is a line of the
+        page, not only a traceback in a console the operator does not read; ``Exception``
+        only, so that Ctrl-C passes. The exception is formatted and kept nowhere
+        (FM-98). Every handler the page registers goes through here.
+        """
+
+        @functools.wraps(fn)
+        def run(*args: Any, **kwargs: Any) -> None:
+            try:
+                # Looked up at call time: a test replaces it with a spy.
+                with pn.io.unlocked():
+                    fn(*args, **kwargs)
+            except Exception as exc:
+                log.exception("a handler of the plate page failed")
+                text = str(exc)
+                if len(text) > _FAILURE_TEXT_CHARS:
+                    text = text[:_FAILURE_TEXT_CHARS] + "…"
+                self.message.object = (
+                    f"that action failed on the page: {type(exc).__name__}: {text}"
+                    " (see the server's log)"
+                )
+
+        return run
 
     def _try(self, action: Callable[[], object]) -> bool:
         """Run ``action``; an operator's mistake becomes the message, and nothing else is kept."""
