@@ -149,6 +149,52 @@ activity goes. **A closed or reloaded tab does not end live**: the page belongs 
 server, so a live view with no tab open keeps the camera taking frames until STOP,
 *End live* from a tab, or Ctrl-C of the command. A live view writes nothing to disk and
 nothing to the run document. Every frame is sent to every open tab, up to 10 a second.
+The **Drive** controls stay usable while live goes (below).
+
+**Drive** (the right-hand column, above the tools). Each control is the call of a
+command, so each has its command-line twin:
+
+| Control | Command |
+| --- | --- |
+| the pad `↑` `←` `→` `↓` | `smc stage jog DX DY` |
+| `Z +`, `Z −` | `smc z jog DZ` |
+| **Autofocus on**, **Autofocus off** | `smc autofocus engage`, `smc autofocus disengage` |
+| **Change objective**, then **Turn the turret** | `smc objective set LABEL --confirm` |
+| **Light on**, **Light off** | `smc light on`, `smc light off` |
+
+The pad is in the **stage's axes**, as the map (X right, Y up): `→` jogs `+step` in
+X, `↑` `+step` in Y. Which way the *image* moves for `↑` depends on how the camera is
+turned on the stand, and is not known yet. The step is chosen under **XY step** (1, 10,
+100 or 1000 µm; 100 at the start) and **Z step** (0.5, 1, 5, 10 or 50 µm; 1 at the
+start); only the steps up to the profile's jog limits (`[safety] max_jog_um` and
+`max_z_jog_um`) are offered. **A jog is one click**: there is no repeat while a button is
+held, and no typed distance. With the autofocus locked, `Z +` and `Z −` suspend it and
+lock it again after the move (the layer's interlock); on a stand whose autofocus drives Z
+to its offset when it engages (the Ti2-E's PFS), that relock may bring Z back to the
+offset's plane, so **focus by hand with the autofocus off** there.
+
+**The objective needs a confirmation.** Choose it, press **Change objective**: the page
+asks `Turn the turret to '<label>'? A turn can drive an objective into a loaded plate:
+check that the stage is clear. The autofocus is switched off and not engaged again.`
+Only **Turn the turret** turns it; **Cancel**, another choice, or a run starting in
+any tab takes the question back. An empty turret position is offered as `(no label)`.
+The choice starts at the objective in place and is never changed by the page after
+that: the strip says which objective is in place.
+
+Each action is **one activity**, like a snap: it is disabled, and refused, while a run
+or a snap goes, and its result is the line under the strip (`stage jog: XY (100.00,
+0.00) µm`, `objective set: objective 'Nikon 20X Plan Fluor ELWD'`, `autofocus engage:
+autofocus did not lock; it is off`, or the layer's refusal, such as the jog limit).
+**While live goes, the drive controls work**: the live view runs the action between two
+frames, and the next frame shows where the stage went. One action waits at most: a
+second click while one waits is refused (`stage jog is waiting`), never queued. STOP,
+*End live*, Ctrl-C or a frame that fails **drop** an action that still waits: it is
+never sent, and live's last line says `; <action> was not run`. After STOP, a move, a
+turn, an engage and *Light on* are refused (`MicroscopeHaltedError: ...`); *Autofocus
+off* and *Light off* still run. A control is **disabled with the reason** when the stand
+lacks it, one line each under the region: `pad: this stand has no XYStage`, `objective:
+its positions could not be read`, `light: the light source LED has no on/off that smc
+knows` (the demo stands' light, a `State` device: switch the light with its shutter).
 
 **The tools.** One section per stage of the workflow (*Set up*, *Choose*, *Acquire*,
 *Find*, *Report*), and a last one, **More**, for every other registered plugin by name
@@ -214,13 +260,14 @@ stage and the other devices are the demo's; only the pixels are drawn, at the st
 position. Press the tools in the order of the checklist, as at a stand:
 
 - **The plate**: run **plate-finding**, which surveys the plate by itself and takes
-  about 7 minutes on the demo stage. **plate-registration** by captures needs the
-  stage moved by hand, which the page cannot do on a demo stage (it has no jog pad).
-  The plate is centred on the stage origin, so A1 is at (−49 500, 31 500) µm and H12
-  at (49 500, −31 500) µm: register those two before starting the page, with the
-  `plate-registration` command of
-  [the plugins page](../plugins/README.md#trying-the-workflow-without-a-microscope),
-  and the page shows the plate from the run document.
+  about 7 minutes on the demo stage. Or register it **by captures**, as at a stand:
+  start **Live**, centre a well with the **Drive** pad (the frames follow the stage),
+  click it on the map, **Capture centre**, and again for a second well, then **Run
+  plate-registration**. The plate is centred on the stage origin, so A1 is at
+  (−49 500, 31 500) µm and H12 at (49 500, −31 500) µm: drive there in 1000 µm steps,
+  then finish with smaller ones. The `plate-registration` command of
+  [the plugins page](../plugins/README.md#trying-the-workflow-without-a-microscope)
+  registers the same two wells from a terminal.
 - **scan-plan** and **scan**: choose wells with the map, and give `coverage` a small
   value (0.4) so that a scan takes seconds.
 - **cells**: choose **detector** `blobs` in its key parameters. The trained model does
@@ -243,9 +290,10 @@ The page on this stand has not been tried in a browser (see below).
 
 ## What it does not do
 
-No jog pad, no Z or turret control, and so no moving the stage or the focus while live
-goes (drive is [#263](https://github.com/EPFL-TOP/smart-microscope-control/issues/263)), no camera
-settings (exposure, ROI, binning) and no time limit on live,
+No light intensity or channel, no focusing through the autofocus offset, no
+press-and-hold jog, no drive click on the map while live goes (it is a `goto-well`
+run, which writes a record), no camera settings (exposure, ROI, binning) and no time
+limit on live,
 no Connect / Disconnect and no service ([#264](https://github.com/EPFL-TOP/smart-microscope-control/issues/264)),
 no `--resume` (continue a stopped stage with `smc run --resume`), no `--host`, no login. The report and the NIS-Elements
 export appear as tools when their plugins are registered; they have no page of their
@@ -271,3 +319,12 @@ browser shows); the Ti2-E's camera at full frame (Prime 95B, 1412×1412, a strid
 the cost of `Microscope.state()`, which is read for every frame, on a real stand;
 a mechanical shutter under auto-shutter, which opens and closes for every frame (up to
 10 times a second); and the frame's orientation in a browser.
+
+**Drive** adds: the drive at a stand; which way the image moves for `↑` and `→`; a
+jog, a focus step and an engage on the Ti2-E while live goes, and how long a click
+waits for the frame in flight on a real exposure; a turret turn under a plate; *Light
+on* and *Light off* on the Ti2-E's `DiaLamp`; what the stand keeps on after the page
+or a command ends (the light, the autofocus: closing the stand switches nothing off);
+`Z +` and `Z −` with the autofocus locked on the Ti2-E (the relock may bring Z back to
+the offset's plane); and **a newcomer registering a plate on the `demo-sample` stand
+from the page without a manual**, with a lab member.
