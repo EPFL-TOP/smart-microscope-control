@@ -643,6 +643,35 @@ def test_frame_tick_draws_a_new_frame_and_reads_nothing_else(
     assert counts == {"view": 0, "status": 0}
 
 
+class _ReadSpy:
+    """Stands for the controller and notes the name of every attribute the view reads."""
+
+    def __init__(self, page: PlatePage) -> None:
+        self._page = page
+        self.read: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        self.read.append(name)
+        return getattr(self._page, name)
+
+
+def test_frame_tick_reads_nothing_but_the_frame_from_the_controller(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # FM-145: it runs ten times a second on the loop that handles STOP. Not the status,
+    # not the view, and not the buttons either (`lacks`, `is_live`): `tick` has those.
+    fake_microscope.override(Camera, FrameCamera(_rows_columns(6, 10)))
+    view = PlatePageView(page)
+    page.snap()
+    assert page.join(10.0)
+    spy = _ReadSpy(page)
+    view.page = cast("PlatePage", spy)
+    view.frame_tick()  # a new frame: drawn
+    view.frame_tick()  # the same one: nothing
+    assert list(view.image_source.data["dw"]) == [10]
+    assert spy.read == ["frame", "frame"]
+
+
 def test_a_closed_tab_does_not_end_live(
     page: PlatePage, fake_microscope: Microscope
 ) -> None:

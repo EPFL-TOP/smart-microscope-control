@@ -2035,16 +2035,46 @@ def test_live_logs_its_start_and_its_end_and_not_a_line_per_frame(
     page: PlatePage, fake_microscope: Microscope, caplog: pytest.LogCaptureFixture
 ) -> None:
     # FM-62, FM-148: a console that blocks must not hold the worker ten times a second.
+    # The root at DEBUG, as pymmcore-plus leaves it once a core is open: every record
+    # of every logger is a console line, so all of them are counted, not one logger's.
     fake_microscope.override(Camera, FrameCamera(_ramp_frame()))
-    with caplog.at_level(logging.INFO, logger="smc.ui"):
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
         page.live(True)
-        _wait_for_frames(page, 5)
+        # The first frames may light up what the stand reads lazily, once (a backend
+        # says that a light has no intensity property); after them, five more frames
+        # are taken and no record, of any logger, is written for any of them.
+        _wait_for_frames(page, 3)
+        before = [(r.name, r.getMessage()) for r in caplog.records]
+        _wait_for_frames(page, 8)
+        after = [(r.name, r.getMessage()) for r in caplog.records]
         page.live(False)
         assert page.join(10.0)
-    lines = [r.getMessage() for r in caplog.records if r.name == "smc.ui"]
-    assert len(lines) == 2, lines
-    assert lines[0] == "live: started from the plate page"
-    assert re.fullmatch(r"live ended: \d+ frames in \d+\.\d s", lines[1]), lines
+    assert after == before
+    lines = [(r.name, r.getMessage()) for r in caplog.records]
+    assert lines[0] == ("smc.ui", "live: started from the plate page")
+    assert lines[-1][0] == "smc.ui"
+    assert re.fullmatch(r"live ended: \d+ frames in \d+\.\d s", lines[-1][1]), lines
+
+
+def test_live_leaves_no_backlog_of_progress_when_no_session_reads_the_status(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # A live view outlives every tab, and the tick of a tab is the only reader of the
+    # progress queue: nothing a frame writes may wait there for a status() call.
+    fake_microscope.override(Camera, FrameCamera(_ramp_frame()))
+    page.live(True)
+    try:
+        _wait_for_frames(page, 5)
+        assert page._queue.empty()
+    finally:
+        page.live(False)
+    assert page.join(10.0)
+    # And the count is still what the next status() reads.
+    progress = page.status().progress
+    assert progress is not None
+    assert progress == Progress("live", progress.done, None, "frames")
+    assert progress.done >= 5
 
 
 def test_live_frames_do_not_count_as_ended_activities(
@@ -2078,6 +2108,79 @@ def test_live_keeps_at_most_ten_frames_a_second(
     assert delta <= elapsed / LIVE_PERIOD_S + 1, f"{delta} frames in {elapsed:.2f} s"
     # The cap is not a stall: frames do come.
     assert delta >= 3, f"{delta} frames in {elapsed:.2f} s"
+    # The seconds the outcome tells are the live's own, from its start, not the last
+    # frame's: the rate the owner reads at a stand is frames over these seconds.
+    found = re.fullmatch(
+        r"live ended: (\d+) frames in (\d+\.\d) s", page.status().outcome or ""
+    )
+    assert found is not None, page.status().outcome
+    assert float(found.group(2)) >= 0.9, found.group(0)
+
+
+class SlowCamera(FrameCamera):
+    """A camera whose snap takes ``snap_s``; ``began`` is when each snap started (FM-157)."""
+
+    def __init__(self, frame: np.ndarray, *, snap_s: float) -> None:
+        super().__init__(frame)
+        self._snap_s = snap_s
+        self.began: list[float] = []
+
+    def snap(self) -> np.ndarray:
+        self.began.append(time.monotonic())
+        time.sleep(self._snap_s)
+        return super().snap()
+
+
+def test_a_camera_as_slow_as_the_period_runs_at_its_own_rate_and_not_slower(
+    page: PlatePage, fake_microscope: Microscope, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The cap is a period: the wait is what is left of it since the frame began, so a
+    # frame that takes a whole period is followed by the next at once. A wait of the
+    # whole period after each frame would give 0.4 s between two snaps, not 0.2 s.
+    monkeypatch.setattr(controller_module, "LIVE_PERIOD_S", 0.2)
+    camera = SlowCamera(_ramp_frame(), snap_s=0.2)
+    fake_microscope.override(Camera, camera)
+    page.live(True)
+    try:
+        _wait_for_frames(page, 6, timeout_s=10.0)
+    finally:
+        page.live(False)
+    assert page.join(10.0)
+    gaps = len(camera.began) - 1
+    mean_gap_s = (camera.began[-1] - camera.began[0]) / gaps
+    assert 0.18 <= mean_gap_s < 0.3, f"{gaps} gaps of {mean_gap_s:.3f} s on average"
+
+
+def test_end_live_and_is_live_return_at_once_and_take_no_lock(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # FM-70: ending live is not an emergency but it runs on the loop that handles STOP,
+    # so it never waits for the worker (a frame in flight may last for seconds) and
+    # takes no lock the signal handler could re-enter. The lock is held by this thread
+    # while another asks, under a join timeout (FM-44).
+    camera = FrameCamera(_ramp_frame(), block=True)
+    fake_microscope.override(Camera, camera)
+    page.live(True)
+    try:
+        assert camera.entered.wait(5)
+        answers: list[bool] = []
+
+        def end_and_ask() -> None:
+            page.live(False)
+            answers.append(page.is_live)
+
+        asker = threading.Thread(target=end_and_ask, daemon=True)
+        with page._lock:
+            asker.start()
+            asker.join(2.0)
+            answered = not asker.is_alive()
+        assert answered, "live(False) or is_live waited for the worker or for the lock"
+        # The frame in flight is still the activity going: it ends at its next check.
+        assert answers == [True]
+    finally:
+        camera.release.set()
+    assert page.join(10.0)
+    assert not page.is_live
 
 
 def test_live_and_every_other_activity_refuse_each_other(
@@ -2527,6 +2630,21 @@ def test_a_key_of_a_result_is_cut_and_flattened_like_a_value(
     _record(run_doc, "stub", result={"k" * 100: 1, "two\nlines": 2})
     card = _page(fake_microscope, run_doc).view().cards["stub"]
     assert card.lines == (f"{'k' * 80}…: 1", "two lines: 2")
+
+
+def test_a_bare_assumption_and_a_profile_with_a_line_break_are_bounded_and_one_line(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # The `assumed` that is one text or an object, not a list, and the profile that a
+    # hand-edited document gives a line break: each is bounded like the rest of the card.
+    _record(run_doc, "stub", result={"assumed": "a" * 5000}, profile="x\ny")
+    card = _page(fake_microscope, run_doc).view().cards["stub"]
+    assert card.assumed == (f"{'a' * 600}…",)
+    assert card.profile == "x y"
+    _record(run_doc, "stub", result={"assumed": {"note": "v" * 1000}})
+    card = _page(fake_microscope, run_doc).view().cards["stub"]
+    assert len(card.assumed) == 1
+    assert len(card.assumed[0]) == 601
 
 
 def _stale_reader(run_doc: Path, *, read_attempt: str, **kwargs: Any) -> None:

@@ -568,9 +568,11 @@ class PlatePageView:
     def on_live(self) -> None:
         """Start live, or end it, and show the *Image* tab when it starts.
 
-        The button's label says which it will do; ``is_live`` is the controller's, so
-        a second tab that sees live going offers *End live* too. Ending is not STOP:
-        the stand is not halted. A refusal is the page's message, as for a run.
+        Which of the two is read from the controller at the click (``is_live``, m5
+        §5.3), not from the label, which the last tick drew: a click in the second
+        before the label follows the state does what the state says now. Ending is
+        not STOP: the stand is not halted. A refusal is the page's message, as for
+        a run.
         """
         starting = not self.page.is_live
         self._try(lambda: self.page.live(starting))

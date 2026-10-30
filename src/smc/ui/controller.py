@@ -886,9 +886,14 @@ class PlatePage:
             if isinstance(taken, str):
                 return f"live ended after {frames} frames: {taken}"
             frames += 1
-            self._queue.put(
-                Progress(plugin="live", done=frames, total=None, message="frames")
-            )
+            # Not on the progress queue: its only reader is a session's tick, and a
+            # live view outlives every session, so with no tab open it would grow by
+            # ten items a second for as long as the camera runs. The latest count is
+            # all ``status()`` ever keeps of a queue.
+            with self._lock:
+                self._progress = Progress(
+                    plugin="live", done=frames, total=None, message="frames"
+                )
             event.wait(max(0.0, LIVE_PERIOD_S - (time.monotonic() - began)))
         return f"live ended: {frames} frames in {time.monotonic() - started:.1f} s"
 
