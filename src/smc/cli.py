@@ -36,10 +36,31 @@ from rich.table import Table
 from rich.text import Text
 
 from smc import __version__
+from smc.drive import (
+    DriveResult,
+    autofocus_text,
+    disengage_autofocus,
+    engage_autofocus,
+    jog_xy,
+    jog_z,
+    set_objective,
+    switch_light,
+    xy_text,
+    z_text,
+)
 from smc.hardware import core as core_mod
 from smc.hardware.backends import nikon
 from smc.hardware.backends.mm import as_hardware_errors
-from smc.hardware.capabilities import XY, Autofocus, Camera, Shutter, XYStage, ZStage
+from smc.hardware.capabilities import (
+    XY,
+    Autofocus,
+    Camera,
+    LightSource,
+    ObjectiveTurret,
+    Shutter,
+    XYStage,
+    ZStage,
+)
 from smc.hardware.errors import (
     CoreError,
     HardwareError,
@@ -191,20 +212,6 @@ def _aligned(rows: Sequence[Sequence[str]]) -> list[str]:
         ).rstrip()
         for row in rows
     ]
-
-
-def _um(value: float) -> str:
-    """Two decimals; a stage that reads ``-0.0`` at the origin shows ``0.00``."""
-    text = f"{value:.2f}"
-    return "0.00" if text == "-0.00" else text
-
-
-def _xy(position: XY) -> str:
-    return f"XY ({_um(position.x_um)}, {_um(position.y_um)}) µm"
-
-
-def _z(z_um: float) -> str:
-    return f"Z {_um(z_um)} µm"
 
 
 # --- errors ------------------------------------------------------------------
@@ -1365,6 +1372,49 @@ app.add_typer(z_app, name="z")
 _JOG_FORCE_HINT = "re-run with --force if the distance is intended"
 
 
+def _drive_command(
+    ctx: typer.Context,
+    profile: str,
+    dry_run: bool,
+    capability: type,
+    action: Callable[[Microscope], DriveResult],
+    *,
+    force_hint: str = "",
+    stop_refused: Sequence[Role] = (),
+    refusals: tuple[type[Exception], ...] = (),
+) -> None:
+    """Open the stand, run one ``smc.drive`` action, print its text (m5 §6.2).
+
+    The page calls the same action (ADR-0006, principle 5), so what a command
+    prints is what the page's outcome says. ``capability`` is required before
+    anything is printed: a stand without it exits 1 with the facade's text and
+    no warning line. ``stop_refused`` are the roles whose refused stop the line
+    of ``_say_stop_refused`` names before a move; a turret, an autofocus and a
+    light send no move that a refused stop leaves running (FM-117). An exception
+    of ``refusals`` is a refusal whose message is the line (exit 2): only its
+    text is kept, so no traceback keeps the stand open (FM-92).
+    """
+    refused: str | None = None
+    with (
+        _Reported(ctx, force_hint=force_hint),
+        Microscope.open(profile, dry_run=dry_run) as microscope,
+    ):
+        microscope.require(capability)
+        if stop_refused and not dry_run:
+            _say_stop_refused(microscope, stop_refused)
+        try:
+            result = action(microscope)
+        except refusals as exc:
+            refused = str(exc)
+    if refused is not None:
+        _fail(refused)
+        raise typer.Exit(code=_EXIT_REFUSED)
+    if not result.reached:
+        _fail(result.text)
+        raise typer.Exit(code=_EXIT_ERROR)
+    _say(result.text)
+
+
 def _move_xy(
     ctx: typer.Context,
     profile: str,
@@ -1385,9 +1435,11 @@ def _move_xy(
         # is read again to show that it did not move.
         here = stage.position_um() if dry_run else None
     if here is None:
-        _say(_xy(landed))
+        _say(xy_text(landed))
     else:
-        _say(f"[dry-run] would move to {_xy(landed)}; the stage is at {_xy(here)}")
+        _say(
+            f"[dry-run] would move to {xy_text(landed)}; the stage is at {xy_text(here)}"
+        )
 
 
 def _move_z(
@@ -1408,9 +1460,11 @@ def _move_z(
         landed = move(drive)
         here = drive.position_um() if dry_run else None
     if here is None:
-        _say(_z(landed))
+        _say(z_text(landed))
     else:
-        _say(f"[dry-run] would move to {_z(landed)}; the drive is at {_z(here)}")
+        _say(
+            f"[dry-run] would move to {z_text(landed)}; the drive is at {z_text(here)}"
+        )
 
 
 @stage_app.command("get")
@@ -1418,7 +1472,7 @@ def stage_get(ctx: typer.Context, profile: ProfileOption = DEMO_NAME) -> None:
     """Print where the XY stage reports it is, in µm."""
     with _Reported(ctx), Microscope.open(profile) as microscope:
         position = microscope.require(XYStage).position_um()
-    _say(_xy(position))
+    _say(xy_text(position))
 
 
 @stage_app.command("move", context_settings=_NUMBERS)
@@ -1457,12 +1511,14 @@ def stage_jog(
     A jog longer than the profile's safety.max_jog_um is refused, because a
     typo in a relative move (1000 for 100) is how a stage leaves the well.
     """
-    _move_xy(
+    _drive_command(
         ctx,
         profile,
         dry_run,
-        lambda stage: stage.move_by_um(dx_um, dy_um, force=force),
+        XYStage,
+        lambda microscope: jog_xy(microscope, dx_um, dy_um, force=force),
         force_hint=_JOG_FORCE_HINT,
+        stop_refused=[Role.xy_stage],
     )
 
 
@@ -1471,7 +1527,7 @@ def z_get(ctx: typer.Context, profile: ProfileOption = DEMO_NAME) -> None:
     """Print where the focus drive reports it is, in µm."""
     with _Reported(ctx), Microscope.open(profile) as microscope:
         z_um = microscope.require(ZStage).position_um()
-    _say(_z(z_um))
+    _say(z_text(z_um))
 
 
 @z_app.command("move", context_settings=_NUMBERS)
@@ -1508,13 +1564,174 @@ def z_jog(
     --force passes that guard only: the profile's safety.z_soft_limits_um
     still bound the target.
     """
-    _move_z(
+    _drive_command(
         ctx,
         profile,
         dry_run,
-        lambda drive: drive.move_by_um(dz_um, force=force),
+        ZStage,
+        lambda microscope: jog_z(microscope, dz_um, force=force),
         force_hint=_JOG_FORCE_HINT,
+        stop_refused=[Role.focus],
     )
+
+
+# --- objective, autofocus and light (m5 §6.2) ------------------------------------
+# One command per drive action, each the same smc.drive call as the page's
+# control (ADR-0006, principle 5). None takes a free number (FM-32), and none
+# forces a guard: the turret's confirmation is the one the operator answers.
+
+objective_app = typer.Typer(
+    help="The objective turret; a turn needs --confirm.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+autofocus_app = typer.Typer(
+    help="The autofocus (Nikon PFS, Zeiss Definite Focus): engage, disengage, read.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+light_app = typer.Typer(
+    help="The light source: on, off, read.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+app.add_typer(objective_app, name="objective")
+app.add_typer(autofocus_app, name="autofocus")
+app.add_typer(light_app, name="light")
+
+#: For a turn the fix is the CLI flag, not the API's ``confirm=True``.
+_CONFIRM_HINT = "re-run with --confirm once the stage is clear"
+
+SwitchDryRunOption = Annotated[
+    bool,
+    typer.Option(
+        "--dry-run",
+        help="Log the action and do not send it; switching off is sent all the same.",
+    ),
+]
+
+
+@objective_app.command("get")
+def objective_get(ctx: typer.Context, profile: ProfileOption = DEMO_NAME) -> None:
+    """Print the objective in the light path, as the turret names it."""
+    with _Reported(ctx), Microscope.open(profile) as microscope:
+        label = microscope.require(ObjectiveTurret).current()
+    _say(f"objective {label!r}")
+
+
+@objective_app.command("list")
+def objective_list(ctx: typer.Context, profile: ProfileOption = DEMO_NAME) -> None:
+    """Print the turret's labels in position order; the current one is marked."""
+    with _Reported(ctx), Microscope.open(profile) as microscope:
+        turret = microscope.require(ObjectiveTurret)
+        labels = turret.labels()
+        current = turret.current()
+    for label in labels:
+        _say(f"{label!r}  (current)" if label == current else repr(label))
+
+
+@objective_app.command("set")
+def objective_set(
+    ctx: typer.Context,
+    label: Annotated[
+        str,
+        typer.Argument(
+            help="The objective, exactly as the turret names it (smc objective list)."
+        ),
+    ],
+    confirm: Annotated[
+        bool,
+        typer.Option(
+            "--confirm",
+            help="The stage is clear: turning the turret can drive an objective "
+            "into a loaded plate.",
+        ),
+    ] = False,
+    dry_run: DryRunOption = False,
+    profile: ProfileOption = DEMO_NAME,
+) -> None:
+    """Turn the turret to an objective; refused without --confirm.
+
+    A turn switches an engaged autofocus off and does not engage it again: the
+    new objective's offset is not known.
+    """
+    _drive_command(
+        ctx,
+        profile,
+        dry_run,
+        ObjectiveTurret,
+        lambda microscope: set_objective(microscope, label, confirm=confirm),
+        force_hint=_CONFIRM_HINT,
+        # The facade checks the confirmation, then the label: an unknown label
+        # sent nothing, and is the operator's to fix.
+        refusals=(ValueError,),
+    )
+
+
+@autofocus_app.command("get")
+def autofocus_get(ctx: typer.Context, profile: ProfileOption = DEMO_NAME) -> None:
+    """Print whether the autofocus is off, on, or locked; a read that fails exits 1 with its cause."""
+    with _Reported(ctx), Microscope.open(profile) as microscope:
+        microscope.require(Autofocus)
+        words = autofocus_text(microscope)
+    if words.startswith("autofocus ?"):
+        # Unknown is not off: a script must not read it as a state (as `smc z get`).
+        _fail(words)
+        raise typer.Exit(code=_EXIT_ERROR)
+    _say(words)
+
+
+@autofocus_app.command("engage")
+def autofocus_engage(
+    ctx: typer.Context,
+    dry_run: SwitchDryRunOption = False,
+    profile: ProfileOption = DEMO_NAME,
+) -> None:
+    """Engage the autofocus and wait for the lock (the profile's lock timeout)."""
+    _drive_command(ctx, profile, dry_run, Autofocus, engage_autofocus)
+
+
+@autofocus_app.command("disengage")
+def autofocus_disengage(
+    ctx: typer.Context,
+    dry_run: SwitchDryRunOption = False,
+    profile: ProfileOption = DEMO_NAME,
+) -> None:
+    """Switch the autofocus off; never refused, sent in dry run too."""
+    _drive_command(ctx, profile, dry_run, Autofocus, disengage_autofocus)
+
+
+@light_app.command("get")
+def light_get(ctx: typer.Context, profile: ProfileOption = DEMO_NAME) -> None:
+    """Print whether the light is on or off; a light with no on/off that smc knows says so."""
+    with _Reported(ctx), Microscope.open(profile) as microscope:
+        light = microscope.require(LightSource)
+        on = light.is_on()
+        device = light.device()
+    if on is None:
+        _say(f"light {device}: no on/off that smc knows")
+    else:
+        _say("light on" if on else "light off")
+
+
+@light_app.command("on")
+def light_on(
+    ctx: typer.Context,
+    dry_run: SwitchDryRunOption = False,
+    profile: ProfileOption = DEMO_NAME,
+) -> None:
+    """Switch the light source on."""
+    _drive_command(ctx, profile, dry_run, LightSource, lambda m: switch_light(m, True))
+
+
+@light_app.command("off")
+def light_off(
+    ctx: typer.Context,
+    dry_run: SwitchDryRunOption = False,
+    profile: ProfileOption = DEMO_NAME,
+) -> None:
+    """Switch the light source off; never refused, sent in dry run too."""
+    _drive_command(ctx, profile, dry_run, LightSource, lambda m: switch_light(m, False))
 
 
 # --- snap ----------------------------------------------------------------------

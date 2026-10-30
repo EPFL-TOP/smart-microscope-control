@@ -43,7 +43,13 @@ from bokeh.models import (
 from bokeh.palettes import Greys256, Viridis256
 from bokeh.plotting import figure
 
-from smc.hardware.capabilities import Camera
+from smc.hardware.capabilities import (
+    Autofocus,
+    Camera,
+    ObjectiveTurret,
+    XYStage,
+    ZStage,
+)
 from smc.ui.controller import (
     PageServerError,
     PageStatus,
@@ -75,6 +81,29 @@ FRAME_TICK_MS = 100
 SERVER_STOP_WAIT_S = 10.0
 
 DRIVE_TEXT = "DRIVE: the next click on a well moves the stage there"
+
+#: The jog steps the Drive region offers, in µm (m5 §6.4): one jog per click, by a
+#: step the operator chooses, never a number typed (a typo is how a stage leaves the
+#: well). Only the steps up to the profile's jog limits are offered.
+XY_STEPS_UM = (1.0, 10.0, 100.0, 1000.0)
+Z_STEPS_UM = (0.5, 1.0, 5.0, 10.0, 50.0)
+
+_XY_DEFAULT_UM = 100.0
+_Z_DEFAULT_UM = 1.0
+
+#: The pad is in the stage's axes, as ``smc stage`` and the plate map (X right, Y
+#: up): a direction is the sign of each axis.
+_XY_DIRECTIONS = {
+    "up": (0.0, 1.0),
+    "left": (-1.0, 0.0),
+    "right": (1.0, 0.0),
+    "down": (0.0, -1.0),
+}
+_Z_DIRECTIONS = {"up": 1.0, "down": -1.0}
+
+#: How an empty turret position is offered: a label too (FM-125), but one a select
+#: cannot show as nothing.
+NO_LABEL = "(no label)"
 
 #: The centre's tabs, in the order they are built.
 _PLATE_TAB = 0
@@ -174,6 +203,22 @@ def card_text(card: ResultCard | None, *, stand: str | None = None) -> str:
     if card.error is not None:
         lines.append(f"error: {card.error}")
     return "\n".join(lines)
+
+
+def _steps(steps: tuple[float, ...], limit_um: float) -> dict[str, float]:
+    """The steps up to ``limit_um``, as a select's options; the smallest one when none is.
+
+    A profile whose limit is under every step still offers the smallest one, and
+    the layer's refusal then says why (m5 §6.4).
+    """
+    offered = [step for step in steps if step <= limit_um] or [steps[0]]
+    return {f"{step:g} µm": step for step in offered}
+
+
+def _default_step(options: dict[str, float], preferred: float) -> float:
+    """``preferred`` when it is offered, else the largest step offered."""
+    values = list(options.values())
+    return preferred if preferred in values else max(values)
 
 
 def _tip(well: WellView, label: str | None) -> str:
@@ -359,6 +404,7 @@ class PlatePageView:
         self.forget_button.on_click(lambda event: self.on_forget())
         self.snap_button.on_click(lambda event: self.on_snap())
         self.live_button.on_click(lambda event: self.on_live())
+        self._build_drive()
 
         self.tool_runs: dict[str, Any] = {}
         self.tool_fields: dict[str, dict[str, Any]] = {}
@@ -369,6 +415,121 @@ class PlatePageView:
         self.tick()
 
     # --- layout ---------------------------------------------------------------
+
+    def _build_drive(self) -> None:
+        """The Drive region's widgets (m5 §6.4): each one calls the controller's action.
+
+        A button's disabled state is a courtesy, not a guard: a click on a disabled
+        Panel button still calls its handler on the server (measured), so the
+        controller's refusals are what keeps the stand still.
+        """
+        page = self.page
+        xy_limit_um, z_limit_um = page.jog_limits_um()
+        xy_steps = _steps(XY_STEPS_UM, xy_limit_um)
+        z_steps = _steps(Z_STEPS_UM, z_limit_um)
+        self.xy_step_select = pn.widgets.Select(
+            label="XY step",
+            options=xy_steps,
+            value=_default_step(xy_steps, _XY_DEFAULT_UM),
+            width=110,
+        )
+        self.z_step_select = pn.widgets.Select(
+            label="Z step",
+            options=z_steps,
+            value=_default_step(z_steps, _Z_DEFAULT_UM),
+            width=110,
+        )
+        self.jog_buttons = {
+            direction: pn.widgets.Button(label=label, width=50)
+            for direction, label in (
+                ("up", "↑"),
+                ("left", "←"),
+                ("right", "→"),
+                ("down", "↓"),
+            )
+        }
+        self.z_buttons = {
+            "up": pn.widgets.Button(label="Z +", width=60),
+            # A minus sign, as wide as the plus: a hyphen reads as a dash.
+            "down": pn.widgets.Button(label="Z \N{MINUS SIGN}", width=60),
+        }
+        self.autofocus_on_button = pn.widgets.Button(label="Autofocus on")
+        self.autofocus_off_button = pn.widgets.Button(label="Autofocus off")
+        self._objective_labels = page.objective_labels()
+        self.objective_select = pn.widgets.Select(
+            label="Objective",
+            options={label or NO_LABEL: label for label in self._objective_labels},
+            width=220,
+        )
+        self.objective_button = pn.widgets.Button(label="Change objective")
+        self.objective_confirm_text = pn.pane.Str(
+            "", styles={"color": _WARNING, "white-space": "pre-wrap"}, width=380
+        )
+        self.objective_confirm_button = pn.widgets.Button(
+            label="Turn the turret", color="danger"
+        )
+        self.objective_cancel_button = pn.widgets.Button(label="Cancel")
+        self.objective_confirm = pn.Row(
+            pn.Column(
+                self.objective_confirm_text,
+                pn.Row(self.objective_confirm_button, self.objective_cancel_button),
+            ),
+            visible=False,
+        )
+        self.light_on_button = pn.widgets.Button(label="Light on")
+        self.light_off_button = pn.widgets.Button(label="Light off")
+        self.drive_note = pn.pane.Str(
+            "", styles={"color": _WARNING, "white-space": "pre-wrap"}, width=380
+        )
+        # The label the confirmation was armed with, in a tuple: an empty label is
+        # one too (FM-125). The select is set once, at the first tick, never after.
+        self._armed: tuple[str] | None = None
+        self._objective_shown = False
+
+        for direction, button in self.jog_buttons.items():
+            button.on_click(self._jogger(direction))
+        for direction, button in self.z_buttons.items():
+            button.on_click(self._focuser(direction))
+        self.autofocus_on_button.on_click(lambda event: self.on_autofocus(True))
+        self.autofocus_off_button.on_click(lambda event: self.on_autofocus(False))
+        self.objective_button.on_click(lambda event: self.on_objective())
+        self.objective_confirm_button.on_click(
+            lambda event: self.on_objective_confirm()
+        )
+        self.objective_cancel_button.on_click(lambda event: self.on_objective_cancel())
+        self.objective_select.param.watch(lambda event: self._disarm(), "value")
+        self.light_on_button.on_click(lambda event: self.on_light(True))
+        self.light_off_button.on_click(lambda event: self.on_light(False))
+
+    def _jogger(self, direction: str) -> Callable[[Any], None]:
+        def clicked(event: Any) -> None:
+            self.on_jog(direction)
+
+        return clicked
+
+    def _focuser(self, direction: str) -> Callable[[Any], None]:
+        def clicked(event: Any) -> None:
+            self.on_z(direction)
+
+        return clicked
+
+    def _drive_region(self) -> Any:
+        """ADR-0006's *Drive*: the pad, the focus, the autofocus, the objective, the light."""
+        jog = self.jog_buttons
+        pad = pn.Column(
+            pn.Row(pn.Spacer(width=60), jog["up"]),
+            pn.Row(jog["left"], jog["down"], jog["right"]),
+        )
+        return pn.Column(
+            pn.pane.Str("Drive", styles={"font-weight": "bold"}),
+            pn.Row(pad, self.xy_step_select),
+            pn.Row(self.z_buttons["up"], self.z_buttons["down"], self.z_step_select),
+            pn.Row(self.autofocus_on_button, self.autofocus_off_button),
+            pn.Row(self.objective_select, self.objective_button),
+            self.objective_confirm,
+            pn.Row(self.light_on_button, self.light_off_button),
+            self.drive_note,
+        )
 
     def _layout(self) -> Any:
         strip = pn.Row(
@@ -410,6 +571,7 @@ class PlatePageView:
         for tool in self._tools:
             stages.setdefault(tool.stage, []).append(self._tool_section(tool))
         right = pn.Column(
+            self._drive_region(),
             pn.Accordion(
                 *((stage, pn.Column(*sections)) for stage, sections in stages.items()),
                 active=list(range(len(stages))),
@@ -580,6 +742,81 @@ class PlatePageView:
             self.tabs.active = _IMAGE_TAB
         self.tick()
 
+    def on_jog(self, direction: str) -> None:
+        """An arrow of the pad: one jog by the chosen step, in the stage's axes (FM-73)."""
+
+        def jog() -> None:
+            sign = _XY_DIRECTIONS.get(direction)
+            if sign is None:
+                raise ValueError(f"no jog {direction!r}; up, left, right or down")
+            step = float(self.xy_step_select.value)
+            self.page.jog_xy(sign[0] * step, sign[1] * step)
+
+        self._try(jog)
+        self.tick()
+
+    def on_z(self, direction: str) -> None:
+        """``Z +`` or ``Z -``: one focus jog by the chosen step; the layer's interlock applies."""
+
+        def jog() -> None:
+            sign = _Z_DIRECTIONS.get(direction)
+            if sign is None:
+                raise ValueError(f"no Z jog {direction!r}; up or down")
+            self.page.jog_z(sign * float(self.z_step_select.value))
+
+        self._try(jog)
+        self.tick()
+
+    def on_autofocus(self, on: bool) -> None:
+        """Engage or disengage the autofocus."""
+        self._try(lambda: self.page.autofocus(on))
+        self.tick()
+
+    def on_objective(self) -> None:
+        """*Change objective*: arm the confirmation with the chosen label; nothing turns yet (FM-14)."""
+
+        def arm() -> None:
+            label = self.objective_select.value
+            if label is None:
+                raise ValueError("choose an objective first")
+            self._armed = (str(label),)
+            self.objective_confirm_text.object = (
+                f"Turn the turret to {str(label)!r}? A turn can drive an objective "
+                f"into a loaded plate: check that the stage is clear. The autofocus "
+                f"is switched off and not engaged again."
+            )
+            self.objective_confirm.visible = True
+
+        self._try(arm)
+
+    def on_objective_confirm(self) -> None:
+        """*Turn the turret*: the armed label, with ``confirm=True``; then disarmed.
+
+        With nothing armed (a stale browser shows the button after a disarm), it
+        turns nothing and says so.
+        """
+        armed = self._armed
+        self._disarm()
+        if armed is None:
+            self.message.object = "choose the objective again"
+            self.tick()
+            return
+        self._try(lambda: self.page.objective(armed[0], confirm=True))
+        self.tick()
+
+    def on_objective_cancel(self) -> None:
+        """*Cancel*: disarm; nothing turns."""
+        self._disarm()
+
+    def on_light(self, on: bool) -> None:
+        """Switch the light on or off."""
+        self._try(lambda: self.page.light(on))
+        self.tick()
+
+    def _disarm(self) -> None:
+        self._armed = None
+        self.objective_confirm.visible = False
+
     # --- drawing ------------------------------------------------------------------
 
     def tick(self) -> None:
@@ -604,9 +841,16 @@ class PlatePageView:
             "y": [] if status.xy_um is None else [status.xy_um[1]],
         }
         self._problems_status = status.problems
+        if not self._objective_shown:
+            # Once: the select starts at the objective in place, and the tick never
+            # moves it after (the strip says which one is in place).
+            self._objective_shown = True
+            if status.objective in self._objective_labels:
+                self.objective_select.value = status.objective
         self._draw_problems()
         self._draw_frame()
         self._draw_buttons()
+        self._draw_drive()
         if previous is not None and status.running is None:
             self.refresh()
         elif self._shared_state() != self._seen_state:
@@ -679,6 +923,7 @@ class PlatePageView:
         self._draw_cards()
         self._draw_problems()
         self._draw_buttons()
+        self._draw_drive()
 
     def _draw_cards(self) -> None:
         """The result card under each tool, from the view: a result follows the run document, not the tick."""
@@ -795,6 +1040,45 @@ class PlatePageView:
             running is not None and not live
         )
         self.snap_note.object = lacks or ""
+
+    def _draw_drive(self) -> None:
+        """Every drive control disabled while an activity other than this page's live goes.
+
+        Enabled while live goes: the live worker runs a drive action between two
+        frames (m5 §6.3). A control whose stand lacks its capability is disabled
+        too, and ``drive_note`` says why, one line each. A tick that finds the
+        controls disabled disarms the objective's confirmation.
+        """
+        page = self.page
+        busy = self._running is not None and not page.is_live
+        objective = page.lacks(ObjectiveTurret)
+        if objective is None and not self._objective_labels:
+            objective = "its positions could not be read"
+        reasons = {
+            "pad": page.lacks(XYStage),
+            "focus": page.lacks(ZStage),
+            "autofocus": page.lacks(Autofocus),
+            "objective": objective,
+            "light": page.light_lacks(),
+        }
+        controls: dict[str, list[Any]] = {
+            "pad": [*self.jog_buttons.values()],
+            "focus": [*self.z_buttons.values()],
+            "autofocus": [self.autofocus_on_button, self.autofocus_off_button],
+            "objective": [self.objective_button, self.objective_confirm_button],
+            "light": [self.light_on_button, self.light_off_button],
+        }
+        for name, widgets in controls.items():
+            for widget in widgets:
+                widget.disabled = busy or reasons[name] is not None
+        self.xy_step_select.disabled = reasons["pad"] is not None
+        self.z_step_select.disabled = reasons["focus"] is not None
+        self.objective_select.disabled = reasons["objective"] is not None
+        if busy or reasons["objective"] is not None:
+            self._disarm()
+        self.drive_note.object = "\n".join(
+            f"{name}: {reason}" for name, reason in reasons.items() if reason
+        )
 
 
 def build(page: PlatePage) -> Any:

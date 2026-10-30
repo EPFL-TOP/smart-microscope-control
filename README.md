@@ -44,6 +44,9 @@ mmcore install --test-adapters      # Micro-Manager's simulated microscope (any 
 smc doctor                          # can this machine drive the simulator?
 smc devices                         # the demo devices and the role each one fills
 smc stage jog 100 0 --dry-run       # what a jog would send; the stage stays put
+smc objective list                  # the turret's objectives; `smc objective set <label> --confirm` turns it
+smc autofocus engage                # engage, disengage or get the autofocus
+smc light get                       # the light source: get, on, off
 smc snap --out frame.tif            # one frame from the simulated camera
 smc discover                        # read-only survey of this PC (docs/hardware/microscope-pc-setup.md)
 pytest                              # the suite runs against the simulator

@@ -1,16 +1,17 @@
-"""The plate page on Micro-Manager's demo devices (m3 §15, #197).
+"""The plate page on Micro-Manager's demo devices (m3 §15, #197; m5 §6, #263).
 
-A click in drive mode is the one thing the page does that moves a stage, so it is
-proved once on the demo stage: the click finds the well from the registered plate,
-``goto-well`` runs through the layer, and the stage reads back within 0.5 µm of
-where the forward model of m3 §2.1 puts the well's centre. The demo stage travels,
-so the position is read after the facade's wait (FM-85).
+A click in drive mode and the Drive region are what the page does that moves a
+stage, so they are proved on the demo stage: the click finds the well from the
+registered plate, ``goto-well`` runs through the layer, and the stage reads back
+within 0.5 µm of where the forward model of m3 §2.1 puts the well's centre. The
+demo stage travels, so the position is read after the facade's wait (FM-85).
 """
 
 from __future__ import annotations
 
 import math
 import os
+import re
 import time
 from datetime import datetime, timezone
 from importlib.metadata import EntryPoint
@@ -20,7 +21,7 @@ import numpy as np
 import pytest
 
 from smc.hardware import Microscope
-from smc.hardware.capabilities import XYStage
+from smc.hardware.capabilities import ObjectiveTurret, XYStage, ZStage
 from smc.plugins.registry import GROUP
 from smc.plugins.slots import PlateResult
 from smc.run import StageRecord, StageStatus, write_stage
@@ -196,5 +197,101 @@ def test_the_page_builds_on_the_demo(
         assert not tmp_path.joinpath(
             "run.json"
         ).exists()  # building the page writes nothing
+    finally:
+        page.close()
+
+
+def _wait_for_outcome(page: PlatePage, prefix: str, timeout_s: float = 10.0) -> str:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        outcome = page.status().outcome
+        if outcome is not None and outcome.startswith(prefix):
+            return outcome
+        assert time.monotonic() < deadline, f"{prefix!r} not seen: {outcome!r}"
+        time.sleep(0.005)
+
+
+def test_the_drive_region_moves_the_demo_stand(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    if os.environ.get("SMC_REQUIRE_UI"):
+        import panel  # noqa: F401  (CI must fail, not skip, when the extra is missing)
+    else:
+        pytest.importorskip("panel")
+    from smc.ui.plate_page import PlatePageView
+
+    page = PlatePage(demo_microscope, tmp_path / "run.json", entry_points=[GOTO_WELL])
+    try:
+        view = PlatePageView(page)
+        # The demo's LED is a State device: the light is the one control it lacks.
+        assert view.drive_note.object == (
+            "light: the light source LED has no on/off that smc knows"
+        )
+        assert view.light_on_button.disabled
+        view.xy_step_select.value = 100.0
+        view.jog_buttons["right"].clicks += 1
+        assert page.join(10.0)
+        stage = demo_microscope.require(XYStage)
+        stage.wait(10.0)
+        position = stage.position_um()
+        # Measured: the demo lands at (100.005, 0.0) for a 100 µm jog (FM-85).
+        assert (position.x_um, position.y_um) == pytest.approx((100.0, 0.0), abs=0.5)
+        view.z_step_select.value = 5.0
+        view.z_buttons["up"].clicks += 1
+        assert page.join(10.0)
+        assert demo_microscope.require(ZStage).position_um() == pytest.approx(
+            5.0, abs=0.5
+        )
+        view.objective_select.value = "Nikon 20X Plan Fluor ELWD"
+        view.objective_button.clicks += 1
+        assert demo_microscope.require(ObjectiveTurret).current() == (
+            "Nikon 10X S Fluor"
+        )
+        view.objective_confirm_button.clicks += 1
+        assert page.join(10.0)
+        assert page.status().outcome == (
+            "objective set: objective 'Nikon 20X Plan Fluor ELWD'"
+        )
+        view.autofocus_on_button.clicks += 1
+        assert page.join(10.0)
+        assert page.status().outcome == "autofocus engage: autofocus locked"
+        view.autofocus_off_button.clicks += 1
+        assert page.join(10.0)
+        assert page.status().outcome == "autofocus disengage: autofocus off"
+        assert view.message.object == ""
+    finally:
+        page.close()
+
+
+def test_a_jog_during_live_on_the_demo_moves_the_stage_and_live_goes_on(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    page = PlatePage(demo_microscope, tmp_path / "run.json", entry_points=[GOTO_WELL])
+    try:
+        page.live(True)
+        deadline = time.monotonic() + 10.0
+        while page.frame() is None:
+            assert time.monotonic() < deadline, page.status().outcome
+            time.sleep(0.005)
+        before = page.activities_ended
+        page.jog_xy(100.0, 0.0)
+        outcome = _wait_for_outcome(page, "stage jog: ")
+        assert re.fullmatch(r"stage jog: XY \(100\.\d\d, -?0\.\d\d\) µm", outcome), (
+            outcome
+        )
+        at_outcome = page.frame()
+        assert at_outcome is not None
+        deadline = time.monotonic() + 10.0
+        while (frame := page.frame()) is None or frame.number <= at_outcome.number:
+            assert time.monotonic() < deadline, page.status().outcome
+            time.sleep(0.005)
+        # A frame taken after the jog shows where it went (FM-96).
+        assert frame.xy_um is not None
+        assert frame.xy_um == pytest.approx((100.0, 0.0), abs=0.5)
+        assert page.is_live
+        assert page.activities_ended == before
+        page.live(False)
+        assert page.join(10.0)
+        assert not page.status().halted
     finally:
         page.close()
