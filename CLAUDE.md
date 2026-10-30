@@ -156,7 +156,9 @@ executable plan · `/review <pr>` light review against the plan, the rules
 and the adversarial review · `/adr` propose a decision · `/hardware-session`
 prepare and write up a session at a stand.
 Execution session: `/develop <issue>` implement one planned issue to a PR;
-it runs `/adversarial-review <issue>` before the PR.
+it runs `/adversarial-review <issue>` before the PR, and `/ui-check` (the plate
+page served on a demo stand and photographed with Playwright) first when the
+issue is `area: ui`; `/review` runs it on an `area: ui` PR.
 Scaffolds: `/new-plugin`, `/new-backend`. Shortcut: `/feature` (plan +
 develop in one session, small issues only).
 
