@@ -3915,7 +3915,8 @@ and rotation 0, not a registered plate. `labels` are `DensityResult.labels`
 (`()` without a usable density). `blocked` maps a registered tool's name to why
 it cannot run now: the first `unusable` reason of a slot in its `reads`, else
 `this stand has no <Capability>` for the first of its `requires` that
-`microscope.has` refuses; a tool that can run is absent. `problems` are one-line
+`microscope.has` refuses, else the **checkpoint** reason below; a tool that can
+run is absent. `problems` are one-line
 texts of what `view()` could not read and did not hide: `run document: <the
 RunDocumentError>` (the view then shows `RunDocument.new()`: every slot `not
 run`, the nominal plate), and `<slot>: result does not validate: <first
@@ -4076,7 +4077,49 @@ class PlatePage:
   `<plugin>: <Type>: <message on one line>` for any `Exception`, and
   `<plugin> ran, but its record could not be written: <message>` for a
   `RunDocumentError` that carries a record (FM-34). There is no `resume` in the
-  page: `smc run --resume` is the way to continue a stopped stage in M3.
+  page: `smc run --resume` is the way to continue a stopped stage in M3, and
+  so the page never starts a stage afresh over a checkpoint that `--resume`
+  could still reach (#252):
+  - **The checkpoint refusal.** `smc.plugins.runner` gains
+    `reachable_checkpoint(name: str, doc: RunDocument, *, profile: str,
+    dry_run: bool) -> StageStatus | None` (in `__all__`; it touches neither
+    hardware nor files, like `check_ready`). It returns the record's status
+    (`stopped` or `failed`) when the stage's record has one of those statuses,
+    a `checkpoint` that is not `None`, and `--resume` would not refuse it for
+    what it knows without the new parameters: the record's `profile` is
+    `profile`, it is not a dry run's while this run is not (`record.dry_run and
+    not dry_run`), and `doc.is_stale(name)` is false (the three tests of
+    `check_ready` that need no `params`); otherwise `None`. A checkpoint that
+    `--resume` refuses anyway (another profile, a dry run's, stale) is not
+    protected: nothing is lost by replacing what no command can reach. The
+    parameters are **not** compared: the page's parameters are the form's and
+    change between clicks, and a stage that was stopped on purpose is lost by a
+    changed `step` as surely as by an unchanged one. A `running` record is not
+    covered (it is the run itself, or a process that died; `unusable` already
+    says `still running or was interrupted`).
+  - Its text, built by the controller (`_checkpoint_reason(name, status)`), is
+    ``<status> with a checkpoint: continue it with `smc run <name> --resume`
+    (close this page first); `smc run <name>` without --resume starts afresh and
+    drops it``, `<status>` being `stopped` or `failed`. It says no path: the
+    operator's run document is the one this page was started with, and
+    `--run-doc` is required by the command whatever the text says.
+  - **In `view()`** it is the last reason of `blocked[name]` (after `reads` and
+    `requires`: a tool that cannot run at all says why first), so the Run
+    button is disabled with that text beside it and nothing else in the page
+    changes. **In `run()`**, after `check_ready` and before a thread starts, a
+    tool with such a record is an `outcome` `<plugin>: <the text>`: nothing is
+    written, and the stale tab whose button was still enabled, or a caller of
+    the controller, gets the same refusal. `smc run` without `--resume` is
+    **unchanged**: it starts afresh and logs that it does (§1.8); it is the
+    deliberate way to give a checkpoint up, and the page does not offer it.
+  - **Tests**: `test_run_refuses_a_stage_stopped_with_a_checkpoint_and_says_how_to_resume`,
+    `test_a_failed_stage_with_a_checkpoint_is_refused_too`,
+    `test_a_checkpoint_resume_would_refuse_does_not_block_a_run` (another
+    profile, a dry run's, a stale record: one case each),
+    `test_a_stopped_stage_without_a_checkpoint_runs_afresh`,
+    `test_view_blocks_a_stage_with_a_reachable_checkpoint_after_its_other_reasons`,
+    `test_the_run_button_of_a_stopped_stage_is_disabled_with_the_resume_command`
+    (the page), and `reachable_checkpoint`'s own cases in `test_plugin_runner.py`.
 - **`status()`** drains the progress queue (the latest `Progress` is kept, so
   two sessions see the same) and reads the stand now; the page's periodic
   callback calls it once a second (`period=1000`) and no faster: a scan must
