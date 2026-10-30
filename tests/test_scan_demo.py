@@ -13,10 +13,13 @@ nothing moved and nothing was written.
 
 from __future__ import annotations
 
+import contextlib
 import errno
+import gc
 import math
 import shutil
 import threading
+import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -57,6 +60,7 @@ from smc.plugins.slots import (
     CameraCalibration,
     PlannedField,
     PlateResult,
+    ScanFrame,
     ScanPlanResult,
     ScanResult,
     load_frame,
@@ -765,6 +769,25 @@ def test_a_plan_whose_paths_cannot_be_written_is_refused_before_anything_moves(
     assert _refused(rig) == reason
 
 
+def test_two_fields_of_wells_that_differ_only_in_case_would_write_one_file(
+    rig: _Rig,
+) -> None:
+    """The well is folded too: ``a1`` and ``A1`` are one folder on NTFS and the default APFS."""
+
+    def edit(result: dict[str, Any]) -> None:
+        result["wells"] = [*result["wells"], "a1"]
+        result["fields"][1]["well"] = "a1"
+        result["fields"][1]["name"] = result["fields"][0]["name"]
+
+    _edit_plan_result(rig, edit)
+
+    assert _refused(rig) == (
+        "fields 'A1_0000' of well 'A1' and 'A1_0000' of well 'a1' would write one "
+        "file, as the file system does not tell upper from lower case: run "
+        "scan-plan again with the stand as it is now"
+    )
+
+
 def test_the_paths_are_resolved_once_before_the_scan(
     rig: _Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -795,10 +818,16 @@ def test_a_share_that_drops_while_the_paths_are_checked_is_unreadable_not_a_plan
 
     monkeypatch.setattr(scan_plugin, "resolve_in_run", dropped)
 
-    assert _refused(rig) == (
+    with pytest.raises(PluginRunError) as raised:
+        _scan(rig)
+
+    assert raised.value.reason == (
         "the run folder cannot be read (The specified network name is no longer "
         "available): check the disk or the network share, then run scan --resume"
     )
+    assert raised.value.__context__ is None  # raised outside the handler (FM-98)
+    assert rig.stage.moves == 0
+    assert not (rig.run_dir / "scan").exists()
 
 
 # The longest path the scan writes is the temporary file beside a frame, 18
@@ -840,6 +869,33 @@ def test_a_long_path_is_not_refused_off_windows(
     monkeypatch.setattr(scan_plugin, "ON_WINDOWS", False)
     monkeypatch.setattr(scan_plugin, "MAX_PATH", 1)
 
+    assert len(_result(_scan(rig)).frames) == 12
+
+
+def _longer_last_name(fields: list[dict[str, Any]]) -> None:
+    fields[-1]["name"] = "B2_0003_a_longer_name"
+
+
+def test_the_longest_path_of_all_the_fields_is_the_one_checked(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Not the first field's: a well of a bigger plate, or a longer name, comes later."""
+    _edit_plan(rig, _longer_last_name)
+    longest = len(str(rig.run_dir.resolve())) + len(
+        "/scan/" + "t" * 12 + "/B2/B2_0003_a_longer_name.tif"
+    )
+    n = longest + 18
+    monkeypatch.setattr(scan_plugin, "ON_WINDOWS", True)
+    monkeypatch.setattr(scan_plugin, "MAX_PATH", n)
+
+    # The first eleven fields are shorter than the limit: only the last is refused.
+    assert _refused(rig) == (
+        f"a frame's path would reach {n} characters while it is written, and "
+        f"Windows takes {n - 1} at most unless long paths are enabled (not "
+        "assumed): move the run document to a shorter folder, then run scan again"
+    )
+
+    monkeypatch.setattr(scan_plugin, "MAX_PATH", n + 1)
     assert len(_result(_scan(rig)).frames) == 12
 
 
@@ -1110,10 +1166,30 @@ def test_a_dry_run_where_every_move_failed_is_failed_too(
     _plan(rig)
     rig.stage.fail = {n: HardwareError("no answer") for n in range(1, 13)}
 
-    with pytest.raises(PluginRunError, match="every field failed"):
+    with pytest.raises(PluginRunError) as raised:
         _scan(rig, max_failed_in_row=100)
 
+    assert raised.value.reason == (
+        "every field failed (12), the first A1_0000: HardwareError: no answer: "
+        "check the stage and the camera, then run scan again without --resume (a "
+        "resume skips the wells already walked)"
+    )
     assert _stored(rig).status is StageStatus.failed
+
+
+def test_a_dry_run_with_one_failed_move_among_the_walked_ones_is_done(
+    demo_microscope_dry: Microscope, tmp_path: Path
+) -> None:
+    """The walked moves are a dry run's frames: eleven of them make a scan."""
+    rig = _build(demo_microscope_dry, tmp_path)
+    _plan(rig)
+    rig.stage.fail = {3: HardwareError("no answer")}
+
+    result = _result(_scan(rig, max_failed_in_row=100))
+
+    assert [f.name for f in result.failed] == ["A1_0002"]
+    assert rig.stage.moves == 12
+    assert result.assumed == ("dry run: 12 fields walked, no frame taken",)
 
 
 def test_a_snap_that_times_out_is_a_failed_field(rig: _Rig) -> None:
@@ -1209,8 +1285,14 @@ def test_a_full_disk_writing_a_frame_ends_the_scan_with_what_to_do(
             OSError(64, "The specified network name is no longer available")
         ),
         OSError(64, "The specified network name is no longer available"),
+        # Only the final rename failed, so the temporary file is kept: a share
+        # that dropped is still not a viewer holding the file open.
+        AtomicWriteError(
+            OSError(64, "The specified network name is no longer available"),
+            kept=Path("kept.smc-tmp"),
+        ),
     ],
-    ids=["atomic-write-error", "plain-oserror"],
+    ids=["atomic-write-error", "plain-oserror", "rename-failed-with-kept"],
 )
 def test_a_share_that_drops_while_a_frame_is_written_says_check_the_share(
     error: OSError, rig: _Rig, monkeypatch: pytest.MonkeyPatch
@@ -1285,6 +1367,79 @@ def test_an_interrupt_writing_a_frame_is_not_turned_into_a_run_error(
 
     with pytest.raises(KeyboardInterrupt):
         _scan(rig)
+
+
+class _Held:
+    """Something only a callee's frame holds: alive exactly as long as that frame is."""
+
+    def __init__(self, run_dir: Path | None = None) -> None:
+        self.run_dir = run_dir
+
+
+def test_a_failed_write_leaves_no_reference_cycle(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """FM-98: the caught ``OSError``'s traceback reaches ``_write_frame``'s frame, so no local may keep it.
+
+    A frame kept alive keeps what it holds (the core, through ``run()``'s frame)
+    until the cyclic collector, which an exception escaping the command does not
+    wait for. The collector is off here, so only reference counts free it.
+    """
+    plan = _plan(rig)
+    planned = plan.fields[0]
+    target = scan_plugin._Target("scan/tok/A1/A1_0000.tif", tmp_path / "A1_0000.tif")
+    meta = ScanFrame(
+        well=planned.well,
+        index=planned.index,
+        name=planned.name,
+        file=target.relative,
+        x_um=planned.x_um,
+        y_um=planned.y_um,
+        z_um=None,
+        focus="none",
+        pfs_offset=None,
+        t_s=0.0,
+    )
+
+    def full_disk(path: Path, data: bytes, *, make_parents: bool = True) -> None:
+        raise AtomicWriteError(OSError(errno.ENOSPC, "No space left on device"))
+
+    monkeypatch.setattr(scan_plugin, "write_atomically", full_disk)
+    pixels = np.zeros(SHAPE, dtype=np.uint16)
+    alive = weakref.ref(pixels)
+    gc.disable()
+    try:
+        with contextlib.suppress(PluginRunError):
+            scan_plugin._write_frame(plan, planned, target, pixels, meta)
+        del pixels
+        assert alive() is None
+    finally:
+        gc.enable()
+
+
+def test_a_refused_path_check_leaves_no_reference_cycle(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FM-98: the dropped share's ``OSError`` carries the resolver's frame, whose caller is ``_paths``."""
+    plan = _plan(rig)
+
+    def dropped(run_dir: Path, relative: str) -> Path:
+        try:
+            raise OSError(64, "The specified network name is no longer available")
+        except OSError as exc:
+            raise ValueError(f"{relative!r} cannot be resolved") from exc
+
+    monkeypatch.setattr(scan_plugin, "resolve_in_run", dropped)
+    ctx = _Held(rig.run_dir)
+    alive = weakref.ref(ctx)
+    gc.disable()
+    try:
+        with contextlib.suppress(PluginRunError):
+            scan_plugin._paths(ctx, plan, "0123456789ab")  # type: ignore[arg-type]
+        del ctx
+        assert alive() is None
+    finally:
+        gc.enable()
 
 
 # ---------------------------------------------------------------- the landing
@@ -1406,6 +1561,16 @@ def test_the_tolerance_is_a_parameter(rig: _Rig) -> None:
     for bad in (0.0, 0.6, math.nan):
         with pytest.raises(ValueError, match="landing_tolerance"):
             ScanParams(landing_tolerance=bad)
+
+
+def test_the_tolerance_bound_is_open_below_and_closed_above() -> None:
+    """FM-43: a fraction of nothing fails every field, and half a side is the most one may take."""
+    assert ScanParams(landing_tolerance=0.5).landing_tolerance == 0.5
+    assert ScanParams(landing_tolerance=1e-9).landing_tolerance == 1e-9
+    with pytest.raises(ValueError, match=r"less than or equal to 0\.5"):
+        ScanParams(landing_tolerance=0.5000001)
+    with pytest.raises(ValueError, match="greater than 0"):
+        ScanParams(landing_tolerance=0.0)
 
 
 def test_failures_off_target_not_in_a_row_do_not_fail_the_scan(rig: _Rig) -> None:

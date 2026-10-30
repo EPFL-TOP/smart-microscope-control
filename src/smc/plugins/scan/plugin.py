@@ -524,9 +524,14 @@ def _paths(
                 unreadable = exc.__cause__
             else:
                 problem = str(exc)
-        # Raised outside the handler: nothing here keeps the path's error.
+        # Raised outside the handler. The OSError's traceback holds the
+        # resolver's frame, whose caller is this one: the local goes before this
+        # frame can be left, or the plan and the context stay alive with it (FM-98).
         if unreadable is not None:
-            raise _unreadable(unreadable)
+            try:
+                raise _unreadable(unreadable)
+            finally:
+                del unreadable
         if problem:
             raise PluginRunError(
                 _NAME, f"field {planned.name!r} of well {planned.well!r}: {problem}"
@@ -757,7 +762,7 @@ def _write_frame(
         write_atomically(target.absolute, data)
     except OSError as exc:
         failure = exc
-    # Raised outside the handler: nothing here keeps the OS's error (FM-98).
+    # Raised outside the handler (FM-98).
     if failure is not None:
         # ``AtomicWriteError`` is an ``OSError`` that is not a ``PermissionError``:
         # its cause says which refusal it wraps.
@@ -767,18 +772,21 @@ def _write_frame(
             # Only the final rename failed, and Windows refuses to replace a
             # file another program holds open, as a viewer on a well that a
             # ``--resume`` rewrites.
-            raise PluginRunError(
-                _NAME,
+            reason = (
                 f"the frame {target.relative} cannot be replaced: another program "
                 "holds it open (a viewer, a backup or antivirus agent): close it, "
-                "then run scan --resume",
+                "then run scan --resume"
             )
-        raise PluginRunError(
-            _NAME,
-            f"the frame {target.relative} could not be written "
-            f"({failure.strerror or failure}): free some space if the disk is "
-            "full, or check the network share, then run scan --resume",
-        )
+        else:
+            reason = (
+                f"the frame {target.relative} could not be written "
+                f"({failure.strerror or failure}): free some space if the disk is "
+                "full, or check the network share, then run scan --resume"
+            )
+        # The error's traceback reaches this frame: a local that keeps it is a
+        # cycle that holds this frame, and what it holds, until the collector.
+        del failure, cause
+        raise PluginRunError(_NAME, reason)
     return meta
 
 
