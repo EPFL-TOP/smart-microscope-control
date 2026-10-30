@@ -1912,7 +1912,9 @@ def run_command(
     and the run document read, before the stand is opened. The result is printed
     after the stand is released, and is in the run document, which is rewritten
     atomically and never overwritten when it cannot be read. A plugin may take
-    a while: Ctrl-C stops any move under way and records the stage as stopped.
+    a while: Ctrl-C sends a stop to any move under way and records the stage as
+    stopped; a stand that refuses stop() lets a sent move run to its target, and
+    the line printed says what each stop did.
     """
     with _Reported(ctx, after_report=_print_unsaved_result):
         if list_plugins:

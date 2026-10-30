@@ -897,6 +897,18 @@ def test_every_stop_outcome_has_its_own_ctrl_c_clause() -> None:
     assert all("second" not in text for text in clauses.values()), clauses
 
 
+def test_smc_run_help_says_ctrl_c_sends_a_stop() -> None:
+    # A stand may refuse the stop and let a sent move run to its target, so
+    # "stops any move" promised what the Ti2-E cannot do (m2 §11.11 E8, #224).
+    result = runner.invoke(app, ["run", "--help"])
+    assert result.exit_code == 0, result.output
+    # Plain text (typer forces colour on CI, FM-72), joined: the help wraps lines.
+    help_text = " ".join(_ANSI.sub("", result.output).split())
+    assert "Ctrl-C sends a stop to any move under way" in help_text
+    assert "a stand that refuses stop() lets a sent move run to its target" in help_text
+    assert "Ctrl-C stops any move" not in help_text
+
+
 def _declaring(tmp_path: Path, roles: str, name: str = "declared") -> Path:
     """The demo devices, with ``[safety] stop_refused_by = <roles>``."""
     path = tmp_path / f"{name}.toml"
