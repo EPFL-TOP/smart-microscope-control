@@ -226,9 +226,11 @@ class ScanPlugin:
         done = 0
         failed_in_row = 0
         unlocked_in_row = 0
-        engaged_again = 0
+        engage_attempts = 0
+        engage_locks = 0
         # Whether the scan's own engage left the autofocus off (the protocol
-        # switches it off when no lock comes): that one is the scan's to retry.
+        # switches it off when no lock comes, whether it returns or raises):
+        # that one is the scan's to retry, until a field reads it locked.
         off_by_the_scan = False
         t0 = time.monotonic()
         for well, fields in groups:
@@ -261,9 +263,17 @@ class ScanPlugin:
                             # A lost lock is engaged again; an autofocus the
                             # operator switched off during the scan stays off,
                             # and its fields count as unlocked.
-                            if not locked and (off_by_the_scan or af.is_engaged()):
+                            if locked:
+                                # A lock someone else took ends the scan's own
+                                # failure: a switch-off after it is not ours.
+                                off_by_the_scan = False
+                            elif off_by_the_scan or af.is_engaged():
+                                engage_attempts += 1
+                                # Set before the call: one that raises leaves
+                                # the autofocus off too (FM-129).
+                                off_by_the_scan = True
                                 locked = af.engage()
-                                engaged_again += 1
+                                engage_locks += int(locked)
                                 off_by_the_scan = not locked
                             unlocked_in_row = 0 if locked else unlocked_in_row + 1
                             if unlocked_in_row >= params.max_unlocked_in_row:
@@ -350,8 +360,12 @@ class ScanPlugin:
             )
 
         assumed = stand.assumed
-        if engaged_again:
-            assumed.append(f"the autofocus was engaged again on {engaged_again} fields")
+        if engage_attempts:
+            # Attempts and locks: an engage that gave up is one, and not the other.
+            assumed.append(
+                f"the autofocus was engaged again on {engage_attempts} fields and "
+                f"locked on {engage_locks} of them"
+            )
         if ctx.dry_run:
             assumed.append(f"dry run: {done} fields walked, no frame taken")
         return ScanResult(

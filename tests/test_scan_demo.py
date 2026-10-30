@@ -201,7 +201,8 @@ class _Autofocus:
         self.offset = 4242.0
         self.calls: list[str] = []
         #: What successive ``engage`` calls return (and leave); empty: they lock.
-        self.engage_results: list[bool] = []
+        #: An exception is raised, after the fake switched itself off.
+        self.engage_results: list[bool | BaseException] = []
 
     def lose_lock(self) -> None:
         self.locked = False
@@ -221,7 +222,11 @@ class _Autofocus:
     def engage(self, timeout_s: float | None = None) -> bool:
         self.calls.append("engage")
         result = self.engage_results.pop(0) if self.engage_results else True
-        # A failed engage leaves it off (the protocol's promise).
+        # A failed engage leaves it off (the protocol's promise), one that
+        # raises as well.
+        if isinstance(result, BaseException):
+            self.engaged = self.locked = False
+            raise result
         self.engaged = self.locked = result
         return result
 
@@ -1599,7 +1604,9 @@ def test_an_unlocked_autofocus_is_engaged_once_per_field(rig: _Rig) -> None:
     assert af.calls.count("engage") == 2
     assert [f.focus for f in result.frames] == ["locked"] * 12
     assert {f.pfs_offset for f in result.frames} == {af.offset}
-    assert result.assumed == ("the autofocus was engaged again on 2 fields",)
+    assert result.assumed == (
+        "the autofocus was engaged again on 2 fields and locked on 2 of them",
+    )
     assert not {"disengage", "set_offset_native", "offset_by_native"} & set(af.calls)
 
 
@@ -1613,6 +1620,62 @@ def test_a_failed_engage_records_unlocked_frames(rig: _Rig) -> None:
 
     assert [f.focus for f in result.frames] == ["locked", "unlocked"] + ["locked"] * 10
     assert af.calls.count("engage") == 2  # field 2 failed to lock, field 3 locked
+    # Item 9: two attempts, one lock: the line counts both.
+    assert result.assumed == (
+        "the autofocus was engaged again on 2 fields and locked on 1 of them",
+    )
+
+
+def test_an_engage_that_raises_is_the_scans_own_failure_and_is_retried(
+    rig: _Rig,
+) -> None:
+    """FM-129: the protocol leaves PFS off when it gives up; the next field must not read that as the operator's switch-off."""
+    af = _Autofocus(engaged=True, locked=True)
+    af.engage_results = [HardwareError("engage gave up")]
+    rig.microscope.override(Autofocus, af)
+    rig.stage.after_move = lambda n: af.lose_lock() if n == 2 else None
+
+    result = _result(_scan(rig, max_unlocked_in_row=3))
+
+    assert [f.error for f in result.failed] == ["HardwareError: engage gave up"]
+    assert len(result.frames) == 11
+    assert [f.focus for f in result.frames] == ["locked"] * 11
+    assert af.calls.count("engage") == 2  # field 2's raised, field 3's locked
+    assert result.assumed == (
+        "the autofocus was engaged again on 2 fields and locked on 1 of them",
+    )
+
+
+def test_a_lock_the_operator_took_ends_the_scans_own_failure(rig: _Rig) -> None:
+    """The flag is the scan's own failure only: a lock someone else took clears it.
+
+    The scan's engage fails at field 2; the operator locks PFS by hand before
+    field 3 and switches it off before field 4: that switch-off is theirs, and
+    the scan must not engage it again (it did, measured while planning #228).
+    """
+    af = _Autofocus(engaged=True, locked=True)
+    af.engage_results = [False]
+    rig.microscope.override(Autofocus, af)
+
+    def operator(n: int) -> None:
+        if n == 2:
+            af.lose_lock()
+        elif n == 3:
+            af.engaged = af.locked = True
+        elif n == 4:
+            af.engaged = af.locked = False
+
+    rig.stage.after_move = operator
+
+    result = _result(_scan(rig, max_unlocked_in_row=100))
+
+    assert af.calls.count("engage") == 1
+    assert [f.focus for f in result.frames] == ["locked", "unlocked", "locked"] + [
+        "unlocked"
+    ] * 9
+    assert result.assumed == (
+        "the autofocus was engaged again on 1 fields and locked on 0 of them",
+    )
 
 
 def test_unlocked_fields_in_a_row_fail_the_scan(rig: _Rig) -> None:
