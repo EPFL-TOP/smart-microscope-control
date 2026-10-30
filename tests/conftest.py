@@ -22,6 +22,7 @@ runs the plugin's own tests (``test_testing_fixtures.py``).
 from __future__ import annotations
 
 import gc
+import logging
 from collections.abc import Iterator
 
 import pytest
@@ -45,3 +46,31 @@ def no_cyclic_gc() -> Iterator[None]:
         yield
     finally:
         gc.enable()
+
+
+@pytest.fixture
+def handler_failures() -> Iterator[list[logging.LogRecord]]:
+    """The failures of the plate page's handlers during the test; one the test did not expect fails it.
+
+    ``PlatePageView._handler`` swallows what a handler raises (it becomes a line of
+    the page), and a test that triggers a handler through a widget asserts effects
+    that may all have happened before the failure: a warning escalated to an error
+    (FM-147) on a handler's last line would pass every one of them (#277). The page's
+    test modules ask for it with ``pytestmark``; a test that expects a failure
+    asserts it and clears the list.
+    """
+    seen: list[logging.LogRecord] = []
+
+    class Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.getMessage() == "a handler of the plate page failed":
+                seen.append(record)
+
+    collector = Collect()
+    logger = logging.getLogger("smc.ui")
+    logger.addHandler(collector)
+    try:
+        yield seen
+    finally:
+        logger.removeHandler(collector)
+    assert not seen, [repr(r.exc_info[1]) if r.exc_info else None for r in seen]

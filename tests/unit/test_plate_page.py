@@ -63,9 +63,13 @@ from smc.ui.controller import (
 from smc.ui.frames import display_image
 from smc.ui.plate_page import PlatePageView, build, card_text, serve
 
-pytestmark = pytest.mark.filterwarnings(
-    "error::DeprecationWarning", "error::PendingDeprecationWarning"
-)
+pytestmark = [
+    pytest.mark.filterwarnings(
+        "error::DeprecationWarning", "error::PendingDeprecationWarning"
+    ),
+    # A failure a handler swallowed fails the test that did not expect it (#277).
+    pytest.mark.usefixtures("handler_failures"),
+]
 
 T0 = datetime(2026, 10, 29, 9, 0, tzinfo=timezone.utc)
 A1_OFF = (1000.0, -500.0)
@@ -1032,31 +1036,34 @@ def test_a_handler_runs_inside_panels_unlocked_context(
 
 @_HANDLER_TRIGGERS
 def test_an_unexpected_failure_in_a_handler_is_a_line_of_the_page(
-    page: PlatePage, caplog: pytest.LogCaptureFixture, trigger: Callable[..., None]
+    page: PlatePage,
+    handler_failures: list[logging.LogRecord],
+    trigger: Callable[..., None],
 ) -> None:
     view = PlatePageView(page)
 
     def redraw() -> None:
         raise KeyError("boom")
 
-    with (
-        caplog.at_level(logging.ERROR, logger="smc.ui"),
-        _replaced(view, "refresh", redraw),
-    ):
+    with _replaced(view, "refresh", redraw):
         trigger(view)
     assert view.message.object.startswith("that action failed on the page: KeyError: ")
     assert "boom" in view.message.object
-    failures = [r for r in caplog.records if r.levelno == logging.ERROR]
-    assert len(failures) == 1
-    assert failures[0].name.startswith("smc.ui")
-    assert failures[0].exc_info is not None
+    assert len(handler_failures) == 1
+    assert handler_failures[0].levelno == logging.ERROR
+    assert handler_failures[0].name.startswith("smc.ui")
+    assert handler_failures[0].exc_info is not None
+    handler_failures.clear()  # expected here: the fixture fails a test that leaves one
 
 
 @pytest.mark.parametrize(
     ("size", "cut"), [(10_000, True), (301, True), (300, False), (299, False)]
 )
 def test_the_failure_line_of_a_handler_is_bounded(
-    page: PlatePage, size: int, cut: bool
+    page: PlatePage,
+    handler_failures: list[logging.LogRecord],
+    size: int,
+    cut: bool,
 ) -> None:
     view = PlatePageView(page)
     text = "x" * size
@@ -1066,6 +1073,8 @@ def test_the_failure_line_of_a_handler_is_bounded(
 
     with _replaced(view, "refresh", redraw):
         view.refresh_button.clicks += 1
+    assert len(handler_failures) == 1
+    handler_failures.clear()
     prefix = "that action failed on the page: OSError: "
     suffix = " (see the server's log)"
     line = view.message.object
@@ -1087,11 +1096,30 @@ def test_a_keyboard_interrupt_in_a_handler_is_not_swallowed(page: PlatePage) -> 
     assert view.message.object == ""
 
 
+def _page_widgets(view: PlatePageView) -> list[Any]:
+    """Every widget of the view: the layout's, the tool column's too, and the view's attributes.
+
+    ``Viewable.select`` does not go into the panels of an ``Accordion`` (measured: 26
+    widgets, and none of the four Run buttons, Capture centre, Capture wall or Forget),
+    so each panel is walked, and the widgets the view holds as attributes (a widget or a
+    dict of them) are added: a container this walk does not know cannot hide one.
+    """
+    found: dict[int, Any] = {id(w): w for w in view.layout.select(pn.widgets.Widget)}
+    for accordion in view.layout.select(pn.Accordion):
+        for panel in accordion.objects:
+            found.update({id(w): w for w in panel.select(pn.widgets.Widget)})
+    for value in vars(view).values():
+        for item in value.values() if isinstance(value, dict) else [value]:
+            if isinstance(item, pn.widgets.Widget):
+                found[id(item)] = item
+    return list(found.values())
+
+
 def test_every_handler_the_page_registers_is_guarded(page: PlatePage) -> None:
     view = PlatePageView(page)
     registered: list[Any] = [
         watcher.fn
-        for widget in view.layout.select(pn.widgets.Widget)
+        for widget in _page_widgets(view)
         for by_name in widget.param.watchers.values()
         for watchers in by_name.values()
         for watcher in watchers
@@ -1102,13 +1130,42 @@ def test_every_handler_the_page_registers_is_guarded(page: PlatePage) -> None:
     ours = [
         fn for fn in registered if getattr(fn, "__module__", "") == plate_page.__name__
     ]
-    assert len(ours) >= 20, "the test found no handlers to check"
+    # 30 widgets' handlers and the tap at the time of writing: a floor that a lost
+    # container (the Accordion's 7) would go under.
+    assert len(ours) >= 30, "the test found too few handlers to check"
     unguarded = [
         getattr(fn, "__qualname__", repr(fn))
         for fn in ours
         if not hasattr(fn, "__wrapped__")
     ]
     assert unguarded == []
+
+
+def test_a_handler_failure_is_kept_nowhere(
+    page: PlatePage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    view = PlatePageView(page)
+    refs: list[weakref.ref[BaseException]] = []
+
+    def redraw() -> None:
+        raise _track(_RefusedError("boom"), refs)
+
+    # A log record keeps its `exc_info`, and pytest keeps the records: what is asked
+    # here is what the guard itself keeps (FM-98).
+    monkeypatch.setattr(plate_page.log, "exception", lambda *args, **kwargs: None)
+    gc.disable()
+    try:
+        with _replaced(view, "refresh", redraw):
+            view.refresh_button.clicks += 1
+        assert view.message.object.startswith(
+            "that action failed on the page: _RefusedError: boom"
+        )
+        assert len(refs) == 1
+        assert (
+            refs[0]() is None
+        )  # dead without the cyclic collector: nothing holds it (FM-98)
+    finally:
+        gc.enable()
 
 
 def test_a_tap_in_drive_mode_moves_once(
