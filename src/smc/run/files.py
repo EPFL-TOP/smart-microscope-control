@@ -36,6 +36,7 @@ __all__ = [
     "relative_to_run",
     "resolve_in_run",
     "retry_on_permission_error",
+    "temporary_path",
     "write_atomically",
 ]
 
@@ -94,7 +95,7 @@ def write_atomically(path: Path, data: bytes, *, make_parents: bool = True) -> N
         AtomicWriteError: The file could not be written; it is as it was.
             ``kept`` is set when only the rename failed.
     """
-    temporary = path.with_name(f".{path.name}.{secrets.token_hex(4)}.smc-tmp")
+    temporary = temporary_path(path)
     renaming = False
     opened = False
     try:
@@ -125,6 +126,17 @@ def write_atomically(path: Path, data: bytes, *, make_parents: bool = True) -> N
         if isinstance(exc, OSError):
             raise AtomicWriteError(exc) from exc
         raise
+
+
+def temporary_path(path: Path) -> Path:
+    """The file ``write_atomically`` writes first, beside ``path``: ``.<name>.<8 hex>.smc-tmp``.
+
+    It is 18 characters longer than ``path``'s own name, so it is the longest
+    path a write makes: a caller that checks a path against Windows' MAX_PATH
+    asks for this one, and the name is made here only so that the check and
+    the write cannot differ.
+    """
+    return path.with_name(f".{path.name}.{secrets.token_hex(4)}.smc-tmp")
 
 
 def retry_on_permission_error(action: Callable[[], T]) -> T:
