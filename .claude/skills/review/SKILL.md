@@ -29,7 +29,15 @@ a verdict, do what it unlocks (labels, dependents), and end the session.
       guards that cannot be bypassed, measured versus assumed.
    3. **Evidence** — the plan's named tests exist; the adversarial review ran
       with the lenses its risk requires; every confirmed blocking finding is
-      fixed or deferred with a reason.
+      fixed or deferred with a reason. **An `area: ui` PR**: look at the page
+      with `/ui-check`, from the PR's own worktree and its `.venv` (the
+      develop session's `.claude/worktrees/issue-<N>-<slug>`, or `git worktree
+      add .claude/worktrees/pr-<N> <branch>` and `python scripts/dev/worktree.py
+      setup`), never by switching the main checkout, with `--out` your
+      scratchpad. Read the viewport PNG of each state the PR changes and the
+      summary's server-error line, and cite what you saw
+      (`ui-check <state>.png: …`). The Report's **Verified** line names the
+      develop session's own run.
    4. **The default path** — the question a cheap reviewer may miss: on the
       path the owner will actually use, can this change fail silently?
    5. **Report honesty** — "Verified / Not verified" matches the diff and CI.

@@ -113,24 +113,31 @@ them if it is not the one you run on.
     through `--also-file`.
     Never restore a mutant with `git checkout`: it discards uncommitted work
     (#93).
-11. Run **`/adversarial-review $ARGUMENTS`**: cheap reviewer agents attack
+11. **An `area: ui` issue only**: look at the page you changed, with
+    **`/ui-check`** (`scripts/dev/ui_snap.py`, from the worktree's `.venv`,
+    `--out` your scratchpad). Read the viewport PNGs of the states the change
+    touches and `summary.txt`; a server error line or a state not reached is
+    a finding to fix or to put in the Report. The tests build the page and
+    never open a session, so a handler that fails only in one passes them all
+    (FM-161). It never replaces a test: it is for looking.
+12. Run **`/adversarial-review $ARGUMENTS`**: cheap reviewer agents attack
     the change for its risk level, a verifier reproduces or refutes each
     finding, and you fix what is confirmed and in scope. Re-run step 10.
 
 ## PR and report
 
-12. Push (`git push -u origin <type>/<N>-<slug>`; the SSH workaround of step 5
+13. Push (`git push -u origin <type>/<N>-<slug>`; the SSH workaround of step 5
     if needed), open the PR with the template (`gh pr create --fill
     --body-file …`, `Closes #N`, conventional title), and watch CI:
     `gh pr checks --watch`. Fix failures; never disable a check.
-13. Comment on the issue, exactly in this format, and set `status: in-review`:
+14. Comment on the issue, exactly in this format, and set `status: in-review`:
 
     ```markdown
     ## Report (develop session, YYYY-MM-DD)
 
     **PR**: #N · branch `feat/…` · head `<sha>` · worktree `.claude/worktrees/issue-…`
     **Done**: 3–6 lines — what exists now that did not before
-    **Verified**: ruff · format · mypy · pytest (N passed, M skipped) · CI <green|link>
+    **Verified**: ruff · format · mypy · pytest (N passed, M skipped) · CI <green|link> · `area: ui`: ui-check (exit code, states reached, where the PNGs are)
     **Adversarial review**: <the summary /adversarial-review produced>
     **Beyond the plan**: none | defensive fixes that changed no interface
     **Not verified**: what a human or hardware must still check
@@ -139,7 +146,7 @@ them if it is not the one you run on.
     **Follow-ups**: issues to open (not opened by you unless trivial)
     ```
 
-14. Call **`ExitWorktree`** with `action: "keep"`. This leaves the worktree
+15. Call **`ExitWorktree`** with `action: "keep"`. This leaves the worktree
     and branch on disk for the fix rounds a review may send you back to,
     but releases this session's own lock on it, so a dead session does not
     leave `worktree.py clean` unable to remove it later. Then stop: do not
@@ -159,7 +166,8 @@ When the latest `## Review` on the PR says **Verdict: changes requested**:
 3. If `main` moved: `git fetch origin main`, then `git merge origin/main`
    (never rebase a pushed branch).
 4. Verify (step 10); if the fixes change behaviour, run
-   `/adversarial-review` on them (step 11). Push, watch CI.
+   `/adversarial-review` on them (step 12), and `/ui-check` (step 11) when the
+   fixes touch the page. Push, watch CI.
 5. Comment on the PR `## Review addressed (develop session, YYYY-MM-DD)`,
    one line per blocking item: what changed and where, then a
    `**Follow-ups**:` line for what the fix round found and deferred, as in
