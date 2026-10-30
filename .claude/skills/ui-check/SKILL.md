@@ -1,6 +1,6 @@
 ---
 name: ui-check
-description: Look at the plate page like a user does — serve it on a demo stand in dry run, drive it with headless Chromium through five states (empty, a typed well range, a snap, after density, with the route), and read the PNGs and summary.txt it writes. Use it on every area:ui issue, in /develop before the adversarial review and in /review of an area:ui PR; it also says how a session drives the served page through a Chrome MCP (untried). Never an assertion or a baseline.
+description: Look at the plate page like a user does — serve it on a demo stand in dry run, drive it with headless Chromium through five states (empty, a typed well range, a snap, after density, with the route), and read the PNGs and summary.txt it writes. Use it on every area:ui issue, in /develop before the adversarial review and in /review of an area:ui PR; it also says how a session drives the served page through a Chrome MCP (tried once: screenshots and clicks, no page reading). Never an assertion or a baseline.
 ---
 
 # /ui-check
@@ -106,12 +106,19 @@ would not choose) is reported as what it shows, not as a defect.
 - Compare a PNG with another, or put one in a test.
 - Put a browser in `pytest` or in CI.
 
-## Live mode through a Chrome MCP — **untried**
+## Live mode through a Chrome MCP — tried once
 
 For a design session with the owner, who watches the page change while the
-session drives it. Nothing here has been run: **the first session that uses it
-writes what it learned into this section** (which tools exist, what they return,
-what the page's shadow DOM allows).
+session drives it. **What one session learned** (Claude in Chrome, `demo-sample`,
+dry run, 2026-10-30, Report on #293): the MCP's page reading (`read_page`,
+`find`, `get_page_text`) returns **nothing** on a Panel page, because its
+widgets live in a shadow DOM; everything was done from **screenshots and clicks
+at coordinates**, and the Wells box was filled by clicking it and typing. The
+chain (`plate-registration`, `scan-plan`, `scan`, `cells`, `density`,
+`route`) ran from a terminal beside the page, as the procedure says, and the
+page was redrawn with Refresh; no Run button was pressed. It found #297 and the
+seven first-run findings on #293. **Every later session adds what it learns
+here** (another MCP, keyboard use, a narrow window, Live, Drive).
 
 1. **The owner installs** Claude in Chrome or a Chrome DevTools MCP server on the
    machine. No such MCP is configured today; without one this section does not apply
@@ -130,7 +137,7 @@ what the page's shadow DOM allows).
    websocket accepts `localhost` only, not `127.0.0.1`.
 4. **It drives the page with the MCP's own tools.** What can be inspected: buttons,
    inputs, selects, tabs and the `pre` text panes, in Panel's shadow DOM (whether
-   the MCP's page snapshot pierces it is untried). What cannot: the plate map and
+   Claude in Chrome's page snapshot does not pierce it; see above). What cannot: the plate map and
    the image are two canvases, pixels only. The tabs are dynamic: the Snap button
    does not exist until the Image tab is active.
 5. **One session on the page at a time.** The page owns the stand; a second would
