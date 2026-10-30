@@ -10,9 +10,10 @@ keeps, each learned by measuring (m3 §15.3):
   ``PlatePage.status()`` once a second and redraws the strip; the plate's wells
   are redrawn only when something changed them (a click, a typed range, a
   capture, the end of a run), because building 1536 wells takes 339 ms. The
-  image is drawn only when ``PlatePage.frame().number`` is one the session has
-  not drawn: a frame snapped in another tab is drawn by the next tick (FM-151),
-  and a tick that sees the same number draws nothing (FM-145).
+  image is drawn by a callback of its own, every 0.1 s, that compares
+  ``PlatePage.frame().number`` and reads nothing else: a frame is drawn only
+  when its number is one the session has not drawn, whichever tab took it
+  (FM-151), and a callback that sees the same number draws nothing (FM-145).
 * **Bokeh models are touched only by server callbacks**, never by the run's
   worker thread, which only fills a queue.
 * **A closed or reloaded tab does nothing.** The controller belongs to the
@@ -64,6 +65,11 @@ NAMES_UP_TO_WELLS = 96
 #: stand is not measured (m3 §15.3): a click or a button acts at once through its
 #: own handler.
 TICK_MS = 1000
+
+#: How often the page looks for a new frame, in milliseconds. It matches
+#: ``LIVE_PERIOD_S``: a faster callback would find no new frame, a slower one would
+#: drop frames the camera took. It reads ``PlatePage.frame()`` and nothing else.
+FRAME_TICK_MS = 100
 
 #: How long ``serve`` waits for Panel's server to stop, in seconds.
 SERVER_STOP_WAIT_S = 10.0
@@ -150,8 +156,9 @@ def card_text(card: ResultCard | None, *, stand: str | None = None) -> str:
     The header is ``<status> <when_utc> UTC``, then `` on <profile>`` when the
     record was made on another stand than ``stand`` (when ``stand`` is not
     known, the profile is always told: a card never claims it is this stand's),
-    then `` (dry run)``; the result's lines follow, indented by two spaces, then
-    one ``assumed:`` line for each assumption and the record's error.
+    then `` (dry run)``, then `` (stale)`` when the record read an input that has
+    been produced again since; the result's lines follow, indented by two spaces,
+    then one ``assumed:`` line for each assumption and the record's error.
     """
     if card is None:
         return ""
@@ -160,6 +167,8 @@ def card_text(card: ResultCard | None, *, stand: str | None = None) -> str:
         header += f" on {card.profile}"
     if card.dry_run:
         header += " (dry run)"
+    if card.stale:
+        header += " (stale)"
     lines = [header, *(f"  {line}" for line in card.lines)]
     lines += [f"assumed: {text}" for text in card.assumed]
     if card.error is not None:
@@ -329,6 +338,7 @@ class PlatePageView:
         )
         self.forget_button = pn.widgets.Button(label="Forget")
         self.snap_button = pn.widgets.Button(label="Snap")
+        self.live_button = pn.widgets.Button(label="Live")
         self.snap_note = pn.pane.Str("", styles={"color": _WARNING})
 
         self.plate_select.param.watch(
@@ -348,6 +358,7 @@ class PlatePageView:
         self.capture_wall_button.on_click(lambda event: self.on_capture("wall"))
         self.forget_button.on_click(lambda event: self.on_forget())
         self.snap_button.on_click(lambda event: self.on_snap())
+        self.live_button.on_click(lambda event: self.on_live())
 
         self.tool_runs: dict[str, Any] = {}
         self.tool_fields: dict[str, dict[str, Any]] = {}
@@ -377,7 +388,7 @@ class PlatePageView:
             sizing_mode="stretch_width",
         )
         image_tab = pn.Column(
-            pn.Row(self.snap_button, self.snap_note),
+            pn.Row(self.snap_button, self.live_button, self.snap_note),
             pn.pane.Bokeh(self.image_figure, sizing_mode="stretch_width"),
             sizing_mode="stretch_width",
         )
@@ -554,6 +565,19 @@ class PlatePageView:
         self.tabs.active = _IMAGE_TAB
         self.tick()
 
+    def on_live(self) -> None:
+        """Start live, or end it, and show the *Image* tab when it starts.
+
+        The button's label says which it will do; ``is_live`` is the controller's, so
+        a second tab that sees live going offers *End live* too. Ending is not STOP:
+        the stand is not halted. A refusal is the page's message, as for a run.
+        """
+        starting = not self.page.is_live
+        self._try(lambda: self.page.live(starting))
+        if starting:
+            self.tabs.active = _IMAGE_TAB
+        self.tick()
+
     # --- drawing ------------------------------------------------------------------
 
     def tick(self) -> None:
@@ -589,6 +613,14 @@ class PlatePageView:
             # wells it does not show. Reading five attributes is no view: the view is
             # rebuilt only when one of them changed.
             self.refresh()
+
+    def frame_tick(self) -> None:
+        """The frame callback's body: draw the controller's frame when it is new, and nothing else.
+
+        It reads no status and no view (FM-145): it runs ten times a second, and the
+        stand's read and the run document's belong to ``tick``.
+        """
+        self._draw_frame()
 
     def _shared_state(self) -> tuple[Any, ...]:
         """What the controller holds that every tab draws: compared, never rebuilt.
@@ -753,17 +785,26 @@ class PlatePageView:
             self.tool_notes[name].object = reason or ""
         lacks = self.page.lacks(Camera)
         self.snap_button.disabled = running is not None or lacks is not None
+        # While live goes its own button is the one that ends it; any other activity
+        # leaves it nothing to do.
+        live = self.page.is_live
+        self.live_button.label = "End live" if live else "Live"
+        self.live_button.disabled = lacks is not None or (
+            running is not None and not live
+        )
         self.snap_note.object = lacks or ""
 
 
 def build(page: PlatePage) -> Any:
-    """One session's layout over the server's controller, with its own periodic callback.
+    """One session's layout over the server's controller, with its own periodic callbacks.
 
-    The callback belongs to the session (Panel stops it with it); the controller
-    does not, so a closed or reloaded tab leaves a run going.
+    The callbacks (the tick and the frame tick) belong to the session (Panel stops
+    them with it); the controller does not, so a closed or reloaded tab leaves a run,
+    or a live view, going (FM-146).
     """
     view = PlatePageView(page)
     pn.state.add_periodic_callback(view.tick, period=TICK_MS)
+    pn.state.add_periodic_callback(view.frame_tick, period=FRAME_TICK_MS)
     return view.layout
 
 
