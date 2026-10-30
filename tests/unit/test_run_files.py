@@ -18,6 +18,7 @@ from smc.run.files import (
     relative_to_run,
     resolve_in_run,
     retry_on_permission_error,
+    temporary_path,
     write_atomically,
 )
 
@@ -219,6 +220,38 @@ def test_a_temporary_name_that_is_taken_is_refused_and_not_removed(
     assert raised.value.kept is None
     assert squatter.read_bytes() == b"not ours"
     assert path.read_bytes() == b"old"
+
+
+def test_temporary_path_is_the_sibling_write_atomically_writes_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A check of a path's length must be of the longest path a write makes (#228)."""
+    monkeypatch.setattr(files_mod.secrets, "token_hex", lambda nbytes: "deadbeef")
+    path = Path("run") / "A1_0001.tif"
+
+    temporary = temporary_path(path)
+
+    assert temporary == Path("run") / ".A1_0001.tif.deadbeef.smc-tmp"
+    assert len(temporary.name) == len(path.name) + 18
+
+
+def test_write_atomically_writes_the_file_temporary_path_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The check and the write cannot differ: a name ``temporary_path`` gives is the one written."""
+    target = tmp_path / "A1_0001.tif"
+    target.write_bytes(b"old")
+    monkeypatch.setattr(
+        files_mod, "temporary_path", lambda path: path.with_name("named-by-the-helper")
+    )
+    monkeypatch.setattr(files_mod.os, "replace", _refuse_replace)
+    monkeypatch.setattr(files_mod.time, "sleep", lambda _s: None)
+
+    with pytest.raises(AtomicWriteError) as raised:
+        write_atomically(target, b"new")
+
+    assert raised.value.kept == tmp_path / "named-by-the-helper"
+    assert (tmp_path / "named-by-the-helper").read_bytes() == b"new"
 
 
 def test_a_short_write_is_continued_until_every_byte_is_written(

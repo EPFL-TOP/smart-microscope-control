@@ -17,6 +17,7 @@ import gc
 import logging
 import math
 import os
+import re
 import socket
 import string
 import threading
@@ -53,6 +54,7 @@ from smc.plugins.slots import DensityResult, DensityWell, PlateResult
 from smc.run import RunDocument, StageRecord, StageStatus, write_stage
 from smc.testing import FakeCore
 from smc.ui.controller import (
+    LIVE_PERIOD_S,
     PageServerError,
     PageStatus,
     PlatePage,
@@ -508,6 +510,187 @@ def test_a_refused_snap_is_the_pages_message_and_not_an_exception(
     assert page.frame() is None
 
 
+def _wait_for_frame_number(
+    page: PlatePage, number: int, timeout_s: float = 5.0
+) -> None:
+    """Poll the controller until it holds frame ``number`` or later; bounded (FM-44)."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        frame = page.frame()
+        if frame is not None and frame.number >= number:
+            return
+        assert time.monotonic() < deadline, (
+            f"frame {number} not seen within {timeout_s} s: {page.status().outcome}"
+        )
+        time.sleep(0.005)
+
+
+def test_live_button_starts_and_ends_live_and_says_which(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    fake_microscope.override(Camera, FrameCamera(_rows_columns(6, 10)))
+    view = PlatePageView(page)
+    assert (view.live_button.label, view.live_button.disabled) == ("Live", False)
+    assert view.tabs.active == 0
+    view.live_button.clicks += 1
+    assert page.is_live
+    assert view.live_button.label == "End live"
+    assert view.tabs.active == 1
+    view.live_button.clicks += 1
+    assert page.join(10.0)
+    view.tick()
+    assert view.live_button.label == "Live"
+    assert not page.is_live
+    # Ending live is not STOP: the stand is not halted.
+    assert not page.status().halted
+
+
+def test_live_is_disabled_with_the_reason_on_a_stand_without_a_camera(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    real_has = fake_microscope.has
+
+    def has(capability: type) -> bool:
+        return capability is not Camera and real_has(capability)
+
+    with _replaced(fake_microscope, "has", has):
+        view = PlatePageView(page)
+        assert view.live_button.disabled
+        assert view.live_button.label == "Live"
+        assert view.snap_note.object == "this stand has no Camera"
+
+
+def test_live_stays_enabled_while_it_goes_and_is_disabled_while_another_activity_goes(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    fake_microscope.override(Camera, FrameCamera(_rows_columns(6, 10)))
+    view = PlatePageView(page)
+    view.on_live()
+    try:
+        assert view.live_button.label == "End live"
+        assert not view.live_button.disabled
+        # Snap and every Run button are disabled as they are for any activity.
+        assert view.snap_button.disabled
+        assert view.tool_runs
+        assert all(button.disabled for button in view.tool_runs.values())
+    finally:
+        view.on_live()
+    assert page.join(10.0)
+    view.tick()
+    assert not view.live_button.disabled
+    page.run("scan", [])
+    assert SlowScan.started.wait(5)
+    view.tick()
+    assert view.live_button.disabled
+    assert view.live_button.label == "Live"
+    # A click that cannot start says why, as a refused snap does.
+    view.on_live()
+    assert view.message.object == "scan is running"
+    assert not page.is_live
+
+
+def test_the_run_line_says_live_and_its_frames(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    fake_microscope.override(Camera, FrameCamera(_rows_columns(6, 10)))
+    view = PlatePageView(page)
+    view.on_live()
+    try:
+        _wait_for_frame_number(page, 3)
+        view.tick()
+        assert re.fullmatch(r"live: \d+ frames", view.run_text.object), (
+            view.run_text.object
+        )
+    finally:
+        view.on_live()
+    assert page.join(10.0)
+
+
+def test_frame_tick_draws_a_new_frame_and_reads_nothing_else(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    fake_microscope.override(Camera, FrameCamera(_rows_columns(6, 10)))
+    view = PlatePageView(page)
+    counts = {"view": 0, "status": 0}
+    real_view, real_status = page.view, page.status
+
+    def counting_view() -> Any:
+        counts["view"] += 1
+        return real_view()
+
+    def counting_status() -> Any:
+        counts["status"] += 1
+        return real_status()
+
+    with (
+        _replaced(page, "view", counting_view),
+        _replaced(page, "status", counting_status),
+    ):
+        page.snap()
+        assert page.join(10.0)
+        view.frame_tick()
+        drawn = view.image_source.data
+        assert list(drawn["dw"]) == [10]
+        assert list(drawn["dh"]) == [6]
+        # The same number: nothing is drawn, the very same data stays.
+        view.frame_tick()
+        view.frame_tick()
+        assert view.image_source.data is drawn
+        page.snap()
+        assert page.join(10.0)
+        view.frame_tick()
+        assert view.image_source.data is not drawn
+    assert counts == {"view": 0, "status": 0}
+
+
+class _ReadSpy:
+    """Stands for the controller and notes the name of every attribute the view reads."""
+
+    def __init__(self, page: PlatePage) -> None:
+        self._page = page
+        self.read: list[str] = []
+
+    def __getattr__(self, name: str) -> Any:
+        self.read.append(name)
+        return getattr(self._page, name)
+
+
+def test_frame_tick_reads_nothing_but_the_frame_from_the_controller(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # FM-145: it runs ten times a second on the loop that handles STOP. Not the status,
+    # not the view, and not the buttons either (`lacks`, `is_live`): `tick` has those.
+    fake_microscope.override(Camera, FrameCamera(_rows_columns(6, 10)))
+    view = PlatePageView(page)
+    page.snap()
+    assert page.join(10.0)
+    spy = _ReadSpy(page)
+    view.page = cast("PlatePage", spy)
+    view.frame_tick()  # a new frame: drawn
+    view.frame_tick()  # the same one: nothing
+    assert list(view.image_source.data["dw"]) == [10]
+    assert spy.read == ["frame", "frame"]
+
+
+def test_a_closed_tab_does_not_end_live(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # FM-146: the controller is the server's, and live is its activity, not the tab's.
+    fake_microscope.override(Camera, FrameCamera(_rows_columns(6, 10)))
+    first = PlatePageView(page)
+    first.on_live()
+    PlatePageView(page)  # a second tab, built and dropped
+    del first  # and the first one closed
+    gc.collect()
+    frame = page.frame()
+    seen = 0 if frame is None else frame.number
+    _wait_for_frame_number(page, seen + 2)
+    assert page.is_live
+    assert not page.status().halted
+    page.live(False)
+    assert page.join(10.0)
+
+
 def _card(**changes: Any) -> ResultCard:
     base: dict[str, Any] = {
         "plugin": "scan",
@@ -550,6 +733,18 @@ def test_card_text_says_status_time_profile_and_dry_run() -> None:
     )
 
 
+def test_card_text_ends_a_stale_card_with_stale_after_dry_run() -> None:
+    assert card_text(
+        _card(dry_run=True, stale=True, lines=(), assumed=()), stand="demo"
+    ) == ("done 2026-10-29 09:03:00 UTC (dry run) (stale)")
+    assert card_text(_card(stale=True, lines=(), assumed=()), stand="demo") == (
+        "done 2026-10-29 09:03:00 UTC (stale)"
+    )
+    assert card_text(
+        _card(profile="lightsheet", stale=True, lines=(), assumed=()), stand="demo"
+    ) == ("done 2026-10-29 09:03:00 UTC on lightsheet (stale)")
+
+
 def _seed_raw(
     run_doc: Path,
     plugin: str,
@@ -576,6 +771,20 @@ def _seed_raw(
             error=error,
         ),
     )
+
+
+def test_the_card_text_of_a_worst_case_record_is_bounded(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # 2000 assumptions of 700 characters, 2000 keys, an error of 100,000 and a profile
+    # of 5,000: a card of 620,000 characters before the bounds (m5 §2.4).
+    result: dict[str, Any] = {"assumed": ["a" * 700] * 2000}
+    result.update({f"key{i}": i for i in range(2000)})
+    _seed_raw(run_doc, "scan", result, profile="p" * 5000, error="e" * 100_000)
+    text = PlatePageView(page).tool_cards["scan"].object
+    assert len(text) < 7_500
+    assert text.splitlines()[-1] == f"error: {'e' * 600}…"
+    assert "assumed: … 1992 more" in text.splitlines()
 
 
 def test_a_result_card_is_plain_text_under_its_tool(
@@ -1548,7 +1757,7 @@ def test_the_refresh_button_redraws_the_view_after_the_run_document_changed(
     assert "✓ plate" in view.checklist_text.object
 
 
-def test_build_registers_one_callback_that_ticks_the_view_every_second(
+def test_build_registers_the_tick_every_second_and_the_frame_tick_every_tenth(
     page: PlatePage, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     registered: list[tuple[Any, Any]] = []
@@ -1558,11 +1767,17 @@ def test_build_registers_one_callback_that_ticks_the_view_every_second(
 
     monkeypatch.setattr(pn.state, "add_periodic_callback", recorder)
     build(page)
-    [(callback, period)] = registered
-    assert isinstance(callback.__self__, PlatePageView)
-    assert callback.__func__ is PlatePageView.tick
-    # One second, and no faster: a scan must not be slowed by a status poll.
-    assert period == 1000
+    assert len(registered) == 2
+    views = {callback.__self__ for callback, _period in registered}
+    assert len(views) == 1  # both are the one session's own
+    assert isinstance(next(iter(views)), PlatePageView)
+    # The status poll is one second, and no faster: a scan must not be slowed by it.
+    # The frame tick is a tenth: the live view's period, and it reads only the frame.
+    assert {(callback.__func__, period) for callback, period in registered} == {
+        (PlatePageView.tick, 1000),
+        (PlatePageView.frame_tick, 100),
+    }
+    assert plate_page.FRAME_TICK_MS / 1000 == LIVE_PERIOD_S
 
 
 def test_a_device_error_reaches_the_problems_line_after_a_tick(

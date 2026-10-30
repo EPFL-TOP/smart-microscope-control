@@ -7,7 +7,13 @@ must not get wrong before it starts:
   come from a run document that may have been copied or edited, and each
   becomes a folder or a file name: only letters, digits, ``_`` and ``-`` are
   accepted, so no part is ``..``, a drive, a separator of either OS or a name
-  that Windows trims (a trailing space or dot, FM-24).
+  that Windows trims (a trailing space or dot, FM-24) or keeps for a device
+  (``NUL``, ``COM1``). Two fields whose names differ only in case would write
+  one file on NTFS and APFS, so ``collision_key`` compares without case.
+* **A move that arrived is a move whose readback is near its target.** The
+  distance is measured on both axes against a fraction of the smaller side of
+  the field of view, and a readback that is not a number is off target
+  (FM-104, FM-73).
 * **The disk is checked for the whole scan.** A full disk at well 60 of 96
   loses the night; a tenth more than the frames covers the TIFF headers and
   what else writes to the disk meanwhile.
@@ -33,17 +39,30 @@ __all__ = [
     "CALIBRATION_TOLERANCE",
     "FRAME_PART",
     "PROFILE_TOLERANCE",
+    "RESERVED_NAMES",
     "bytes_needed",
+    "collision_key",
     "encode_frame",
     "focus_state",
     "frame_path",
     "itemsize_of",
+    "landed_off_target",
+    "landing_error_um",
+    "landing_tolerance_um",
     "size_differs",
     "wells_to_scan",
 ]
 
 #: What a well, a field's name or a token may be to become part of a path.
 FRAME_PART = re.compile(r"[A-Za-z0-9_-]+")
+#: The names Windows keeps for devices, in upper case: a file named ``NUL.tif``
+#: is the null device there, so no part of a frame's path may be one (FM-24).
+#: The list is its own: ``PurePath.is_reserved`` is deprecated in Python 3.13.
+RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{n}" for n in range(10)}
+    | {f"LPT{n}" for n in range(10)}
+)
 #: How far the camera's pixel size may be from a plan made from the profile,
 #: and from the size read at the start of the scan: the lever is 50 %, a
 #: rounding in a profile far below 1 %.
@@ -91,7 +110,52 @@ def frame_path(token: str, well: str, name: str) -> str:
                 f"{part!r} cannot be a frame's {what} in a file path: only "
                 f"letters, digits, '_' and '-' are"
             )
+        if part.upper() in RESERVED_NAMES:
+            raise ValueError(
+                f"{part!r} is a Windows device name and cannot be a frame's "
+                f"{what} in a file path"
+            )
     return f"scan/{token}/{well}/{name}.tif"
+
+
+def collision_key(well: str, name: str) -> tuple[str, str]:
+    """What two fields share when they would write one file on a volume that folds case.
+
+    NTFS and the default APFS do not tell ``A1_0001`` from ``a1_0001``: two
+    fields whose keys are equal write one file, and the result would name two
+    frames for one TIFF on disk (FM-24).
+    """
+    return (well.casefold(), name.casefold())
+
+
+def landing_error_um(
+    target: tuple[float, float], readback: tuple[float, float]
+) -> float:
+    """The distance of both axes between where a move was sent and where the stage says it is.
+
+    One axis is not enough: a stage short by 3.5 µm on x and 3.5 µm on y is
+    4.95 µm off, past a 4.8 µm tolerance that neither axis reaches.
+    """
+    return math.hypot(readback[0] - target[0], readback[1] - target[1])
+
+
+def landing_tolerance_um(fov_um: tuple[float, float], fraction: float) -> float:
+    """``fraction`` of the smaller side of the field of view, in µm.
+
+    The smaller side, because the frame is not square (FM-73): a short landing
+    along it is the one that leaves a gap in the coverage first.
+    """
+    return fraction * min(fov_um)
+
+
+def landed_off_target(error_um: float, tolerance_um: float) -> bool:
+    """Whether a landing is farther than the tolerance; a landing that is not a number is.
+
+    Written as ``not error <= tolerance`` and not as ``error > tolerance``: a
+    readback that is ``nan`` compares False both ways, and only this form
+    fails it (FM-104).
+    """
+    return not error_um <= tolerance_um
 
 
 def itemsize_of(bit_depth: int) -> int:
