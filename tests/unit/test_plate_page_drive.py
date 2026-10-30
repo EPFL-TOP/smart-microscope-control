@@ -810,3 +810,137 @@ def test_stop_during_a_drive_action_ends_live_as_a_stop(
     assert outcome is not None
     assert re.fullmatch(r"live ended: \d+ frames in \d+\.\d s", outcome), outcome
     assert page.status().halted
+
+
+@pytest.mark.parametrize("live", [False, True], ids=["alone", "during-live"])
+def test_an_xy_jog_over_the_limit_is_refused_by_the_layer_from_the_page(
+    page: PlatePage, fake_microscope: Microscope, live: bool
+) -> None:
+    # The page never passes force=True: the jog limit holds for a click as for a
+    # command, and a disabled button is no guard (FM-169).
+    over_um = fake_microscope.profile.safety.max_jog_um + 1.0
+    refusal = _refusal(
+        lambda: fake_microscope.require(XYStage).move_by_um(over_um, 0.0)
+    )
+    assert refusal.startswith("SafetyRefusedError: ")
+    if live:
+        fake_microscope.override(Camera, FrameCamera())
+        page.live(True)
+    try:
+        if live:
+            _wait_for_frame_after(page, 1)
+        page.jog_xy(over_um, 0.0)
+        if live:
+            _wait_for_outcome(page, f"stage jog: {refusal}")
+            assert page.is_live
+        else:
+            assert page.join(10.0)
+            assert page.status().outcome == f"stage jog: {refusal}"
+    finally:
+        page.live(False)
+    assert page.join(10.0)
+    assert fake_microscope.state().xy == XY(0.0, 0.0)
+
+
+class _ClickAfterRelease:
+    """``_lock``, with a hook run once, on the thread that releases it, after the next release.
+
+    Armed when the live loop has returned: the next release on the live worker is
+    the drop's, and the hook clicks right after it, before the activity ends.
+    """
+
+    def __init__(self, lock: Any, on_release: Callable[[], None]) -> None:
+        self._inner = lock
+        self._on_release = on_release
+        self.armed_on: threading.Thread | None = None
+
+    def acquire(self, *args: Any, **kwargs: Any) -> bool:
+        return bool(self._inner.acquire(*args, **kwargs))
+
+    def release(self) -> None:
+        self._inner.release()
+        if self.armed_on is threading.current_thread():
+            self.armed_on = None
+            self._on_release()
+
+    def locked(self) -> bool:
+        return bool(self._inner.locked())
+
+    def __enter__(self) -> _ClickAfterRelease:
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.release()
+
+
+def test_a_click_right_after_the_drop_is_refused_because_the_event_is_set_first(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # The order the plan names (FM-88): the live's event is set, then the waiting
+    # action is dropped. Dropped first, a click between the drop and the event would
+    # be kept with no loop to take it, and run by the next live, long after.
+    fake_microscope.override(
+        Camera, FrameCamera(fail_with=lambda: HardwareError("the camera timed out"))
+    )
+    said: list[str] = []
+
+    def click() -> None:
+        try:
+            page.jog_xy(10.0, 0.0)
+            said.append("kept")
+        except RuntimeError as exc:
+            said.append(str(exc))
+
+    spy = _ClickAfterRelease(page._lock, click)
+    original = page._live_frames
+
+    def frames_then_arm(event: threading.Event) -> str:
+        outcome = original(event)
+        spy.armed_on = threading.current_thread()
+        return outcome
+
+    with (
+        _replaced(page, "_lock", spy),
+        _replaced(page, "_live_frames", frames_then_arm),
+    ):
+        page.live(True)
+        assert page.join(10.0)
+    assert said == ["live is ending"]
+    assert page._drive_waiting is None
+    assert fake_microscope.state().xy == XY(0.0, 0.0)
+
+
+def test_a_click_that_finds_another_activity_once_it_holds_the_lock_is_refused(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # `_drive` reads the activity without the lock, then keeps the action under it.
+    # Live ends and a run starts in between: the action must not be kept under the
+    # run's event, which is not set, for a live that no longer goes.
+    fake_microscope.override(Camera, FrameCamera())
+    page.live(True)
+    _wait_for_frame_after(page, 1)
+    real_lacks = page.lacks
+    raced: list[bool] = []
+
+    def end_live_and_start_a_run(capability: type) -> str | None:
+        if not raced:
+            raced.append(True)
+            page.live(False)
+            assert page.join(10.0)
+            page.run("slow", [])
+            assert Slow.started.wait(5)
+        return real_lacks(capability)
+
+    try:
+        with (
+            _replaced(page, "lacks", end_live_and_start_a_run),
+            _refuses(RuntimeError, "live is ending"),
+        ):
+            page.jog_xy(10.0, 0.0)
+        assert page._drive_waiting is None
+    finally:
+        Slow.release.set()
+        page.live(False)
+    assert page.join(10.0)
+    assert fake_microscope.state().xy == XY(0.0, 0.0)

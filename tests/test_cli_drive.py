@@ -15,7 +15,9 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
+import smc.cli as cli
 from smc.cli import app
+from smc.drive import DriveResult
 
 runner = CliRunner(env={"COLUMNS": "200", "SMC_PROFILE": None, "SMC_PROFILES": None})
 
@@ -255,3 +257,24 @@ def test_the_three_groups_are_listed_with_their_help() -> None:
         assert any(
             re.search(rf"\b{name}\s", row) and text in row for row in plain.splitlines()
         ), (name, plain)
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_a_drive_result_not_reached_exits_1_with_its_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A turret that stops short of its label: a script chaining `smc objective set
+    # ... && smc scan` must stop there.
+    text = f"objective '{TEN_X}', although '{TWENTY_X}' was asked"
+
+    def stops_short(microscope: object, label: str, *, confirm: bool) -> DriveResult:
+        return DriveResult(text, reached=False)
+
+    monkeypatch.setattr(cli, "set_objective", stops_short)
+
+    result = runner.invoke(app, ["objective", "set", TWENTY_X, "--confirm"])
+
+    assert result.exit_code == 1, result.output
+    assert result.output.splitlines()[-1] == f"✗ {text}"
+    assert text not in result.output.splitlines()

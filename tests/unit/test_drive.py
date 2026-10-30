@@ -448,3 +448,29 @@ def test_drive_reaches_the_stand_only_through_the_facade() -> None:
         "smc.hardware.capabilities",
         "smc.hardware.microscope",
     }
+
+
+class StaysEngaged(NeverLocks):
+    """An autofocus that reads engaged and locked whatever ``disengage`` sent."""
+
+    def is_engaged(self) -> bool:
+        return True
+
+    def is_locked(self) -> bool:
+        return True
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["real", "dry-run"])
+def test_a_disengage_that_leaves_the_autofocus_on_is_not_reached(
+    dry_run: bool,
+) -> None:
+    # Switching off is sent in dry run too, so what the stand reads after it is a
+    # readback in both modes.
+    microscope = _open(dry_run=dry_run)
+    try:
+        microscope.override(Autofocus, StaysEngaged())
+        result = drive.disengage_autofocus(microscope)
+    finally:
+        microscope.close()
+    suffix = " (dry run: switching off is sent all the same)" if dry_run else ""
+    assert result == DriveResult(f"autofocus locked{suffix}", reached=False)

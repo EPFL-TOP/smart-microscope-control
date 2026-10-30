@@ -596,3 +596,60 @@ def test_a_jog_during_live_reaches_the_stage_from_the_page(
     finally:
         page.live(False)
     assert page.join(10.0)
+
+
+_GROUPS: list[tuple[type, str, Callable[[PlatePageView], list[Any]]]] = [
+    (
+        XYStage,
+        "pad: this stand has no XYStage",
+        lambda v: [*v.jog_buttons.values(), v.xy_step_select],
+    ),
+    (
+        ZStage,
+        "focus: this stand has no ZStage",
+        lambda v: [*v.z_buttons.values(), v.z_step_select],
+    ),
+    (
+        Autofocus,
+        "autofocus: this stand has no Autofocus",
+        lambda v: [v.autofocus_on_button, v.autofocus_off_button],
+    ),
+    (
+        ObjectiveTurret,
+        "objective: this stand has no ObjectiveTurret",
+        lambda v: [v.objective_button, v.objective_select],
+    ),
+    (
+        LightSource,
+        "light: this stand has no LightSource",
+        lambda v: [v.light_on_button, v.light_off_button],
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("missing", "note", "widgets"), _GROUPS, ids=[g[0].__name__ for g in _GROUPS]
+)
+def test_a_stand_lacking_one_capability_disables_that_group_and_no_other(
+    stand: Microscope,
+    run_doc: Path,
+    missing: type,
+    note: str,
+    widgets: Callable[[PlatePageView], list[Any]],
+) -> None:
+    # FM-43: the table of groups is checked row by row, not all at once.
+    with _replaced(stand, "has", lambda capability: capability is not missing):
+        page = _controller(stand, run_doc)
+        try:
+            view = PlatePageView(page)
+            lacking = widgets(view)
+            everything = [
+                *_drive_controls(view).values(),
+                view.xy_step_select,
+                view.z_step_select,
+                view.objective_select,
+            ]
+            assert [w for w in everything if w.disabled] == lacking
+            assert view.drive_note.object == note
+        finally:
+            page.close()
