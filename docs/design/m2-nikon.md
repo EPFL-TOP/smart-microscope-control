@@ -3,8 +3,8 @@
 - **Status**: design for issue #13 (§1–§6, 2026-10-16); §3.3.1 and
   §3.11's stop rules decided in #144 (2026-10-18); §7 for #12
   (2026-10-19); §8 for #14 (2026-10-19); §8.10 for #167 (2026-10-20); §9
-  for #48 (2026-10-20); §10 for #15 (2026-10-20); §11 for #204 and #206 (2026-10-28); §12 for
-  #205 (2026-10-28).
+  for #48 (2026-10-20); §10 for #15 (2026-10-20); §11 for #204 and #206
+  (2026-10-28), §11.11 for #224 (2026-10-30); §12 for #205 (2026-10-28).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1, this document is the contract between issues that are
   built in parallel. Names, module paths and signatures below are fixed; an
@@ -2611,18 +2611,19 @@ class StopRefusedError(HardwareError):
         ...  # default message below; __reduce__ as MotionStoppedError's
 
 
-class StopOutcome(str, Enum):
+class StopOutcome(str, Enum):  # extended by §11.11 E4, E6
     accepted = "accepted"  # the device took the stop
-    refused = "refused"  # the device raised: a move under way may run to its target
+    refused = "refused"  # raised on a declared role: the move runs to its target
+    failed = "failed"  # raised on an undeclared role: a fault
     impossible = "impossible"  # no stop from smc (a State device)
-    interrupted = "interrupted"  # a second Ctrl-C cut the stop: it may not have reached the device
+    interrupted = "interrupted"  # a Ctrl-C cut the stop: it may not have got through
+    still_moving = "still_moving"  # tracked as moving when the stand was released
 
 
 @dataclass(frozen=True, slots=True)
-class StopNote:
+class StopNote:  # `declared` removed by §11.11 E4
     motion: str  # "xy_stage XYStage"
     outcome: StopOutcome
-    declared: bool  # the motion's stop_refused
 
 
 def note_stop(exc: BaseException, note: StopNote) -> None: ...
@@ -2635,31 +2636,36 @@ def stop_notes(exc: BaseException) -> tuple[StopNote, ...]: ...
   not finish ``. Several names are joined with `, ` and `and`.
 - **Notes ride on the exception** that ended the wait (a
   `KeyboardInterrupt`, usually), in an attribute `_smc_stop_notes`. It is a
-  tuple, and `note_stop` appends to it. A note holds only strings, an enum
-  and a bool, so it can hold no traceback (FM-98). `stop_notes` collects the
+  tuple, and `note_stop` appends to it. A note holds only a string and an enum,
+  so it can hold no traceback (FM-98). `stop_notes` collects the
   notes of `exc` and of its `__context__` chain, oldest first, and stops at
-  an exception it has already seen. Measured on Python 3.13 (2026-10-28): a
+  an exception it has already seen, and at the first one that is not a
+  `KeyboardInterrupt` (§11.11 E5). Measured on Python 3.13 (2026-10-28): a
   `KeyboardInterrupt` takes the attribute, and the attribute survives a
   re-raise. CI's 3.10 job runs the same tests.
 - **`Executor.stop(motion)`.** When `motion.stop_refused` is set and the
   device's own stop raised, it raises `StopRefusedError((motion.name,))`,
-  chained from the device's error. A failing linked call is unchanged. The
-  WARNING line keeps its form, `<name>: stop failed (<error>)`, and gains
-  the note `; the profile declares this refusal ([safety] stop_refused_by),
-  so a move under way runs to its target`.
+  chained from the device's error. A failing linked call is unchanged, and
+  two refusals are merged (§11.11 E1). The WARNING line keeps its form,
+  `<name>: stop failed (<error>)`, and gains the note `; the profile declares
+  this refusal ([safety] stop_refused_by), so a move under way runs to its
+  target`.
 - **The give-up** (`_give_up`, internal) returns its text and its
   `StopOutcome`. For a declared refusal, the text is `the stand refuses its
   stop, as the profile declares ([safety] stop_refused_by), so it runs to its
   target`. An undeclared refusal keeps `the stop failed (<error>), so it may
-  still be moving`. `DeviceTimeoutError` and the timeout's
-  `MotionStoppedError` carry that text, as today. The public `give_up()`
-  still returns the text alone.
+  still be moving`. Its outcome is `refused` on a declared role and `failed`
+  on any other (§11.11 E4); its WARNING line carries the declaration's note,
+  as `Executor.stop`'s does (§11.11 E2). `DeviceTimeoutError` and the
+  timeout's `MotionStoppedError` carry that text, as today. The public
+  `give_up()` still returns the text alone.
 - **`_move`'s `except BaseException`** notes the give-up's outcome on the
-  exception, once `_give_up` has returned (`StopNote(motion.name, outcome,
-  motion.stop_refused)`). If `_give_up` itself raises (a second Ctrl-C
-  inside the stop call), that new exception gets `StopNote(motion.name,
-  interrupted, motion.stop_refused)` before it propagates. Its `__context__`
-  is the first exception, which `stop_notes` also reads.
+  exception, once `_give_up` has returned (`StopNote(motion.name,
+  outcome)`). If `_give_up` itself raises (a second Ctrl-C inside the stop
+  call), that new exception gets `StopNote(motion.name, interrupted)` before
+  it propagates, and no second stop is sent. The same holds for the give-up
+  at the move's timeout (§11.11 E3). Its `__context__` is the first
+  exception, which `stop_notes` also reads.
 - **A stop requested during a move on a declared device** (the generation
   moved, then the device read idle) still raises `MotionStoppedError`: the
   caller asked for a stop, so the plan's next step must not run (M1 §13).
@@ -2675,7 +2681,8 @@ def stop_notes(exc: BaseException) -> tuple[StopNote, ...]: ...
   list[str], failed: list[str])`, collected past every failure as today:
   - `done` gets `autofocus <label> off` for a `disengage()` that returned,
     and the motion name of each stop that was accepted;
-  - `refused` gets the names of each `StopRefusedError.refused`;
+  - `refused` gets the names of each `StopRefusedError.refused`, each once
+    (§11.11 E1);
   - `failed` gets today's entries, unchanged.
 - **`stop()`**:
   - Nothing refused or failed: it returns, as today.
@@ -2703,6 +2710,10 @@ def stop_notes(exc: BaseException) -> tuple[StopNote, ...]: ...
   to end: Ctrl-C must let smc exit, and the stand finishes the move on its
   own. What unloading does to a stage that is still moving is unverified
   (§11.10).
+- **`__exit__`** notes what is still tracked as moving when a Ctrl-C leaves
+  the `with` block (§11.11 E6): `moving()` is read before `close()`, and
+  `StopNote(name, still_moving)` is added to the `KeyboardInterrupt`, for
+  each name its notes do not carry.
 
 ### 11.6 CLI — `cli.py`
 
@@ -2711,18 +2722,21 @@ def stop_notes(exc: BaseException) -> tuple[StopNote, ...]: ...
   get) before the next move`, and the exit code stays 130.
   - No note: `interrupted — no move was under way; read the position …`.
     The layer sends a move only inside `_move`'s `try`, and every Ctrl-C
-    inside it leaves a note.
+    inside it leaves a note; a move the registry still tracks, whoever sent
+    it, is noted when the stand is released (§11.11 E6).
   - Notes: `interrupted — <clauses>; …`, one clause per note, joined with
     `; `:
     - accepted: `<name> was stopped`;
-    - refused, declared: `<name> refuses a stop on this stand ([safety]
+    - refused: `<name> refuses a stop on this stand ([safety]
       stop_refused_by), so it runs to its target`;
-    - refused, undeclared: `<name> refused the stop, so it may still be
-      moving`;
+    - failed: `the stop of <name> failed, so it may still be moving`
+      (§11.11 E4);
     - impossible: `<name> cannot be stopped from smc, so it may still be
       moving`;
-    - interrupted: `the stop of <name> was cut by a second Ctrl-C, so it
-      may still be moving`.
+    - interrupted: `the stop of <name> was cut by a Ctrl-C, so it may still
+      be moving` (§11.11 E3);
+    - still moving: `<name> was still tracked as moving when the stand was
+      released; close()'s log line says what its stop did` (§11.11 E6).
   - When any note is not *accepted*, the tail starts with `let it finish
     or stop it with the stand's own controls, then read the position …`.
 - **Before a move**, one line `! the profile declares that this stand
@@ -2786,10 +2800,125 @@ about where the move goes, not how it is stopped.
 - What `unloadAllDevices()` does to a Ti2-E stage that is still moving.
   Drill 2 suggests no harm, but its console was not kept.
 - B5's "PFS off stops Z at once" rests on one trial.
+- Whether a Z move still running on the Ti2-E is noted when the stand is
+  released (§11.11 E6): the drive never reads busy (§4.9), so nothing tracks
+  it, and the Ctrl-C line then says "no move was under way". The `!` line
+  before the move (§11.6) is what warns.
 - `test_a_declared_stop_refusal_still_holds` on the Ti2-E: the owner runs
   it at session 2.
 - The wording of m3 §15's STOP on such a stand. The page shows `stop()`'s
   error text (§15.1), and its own label is m3's, after #214.
+
+### 11.11 What the first build left open (#224)
+
+The review of #223 and its adversarial review left seven cases (#224). Each
+was reproduced on a `FakeCore` (2026-10-30, `main` cf79b98), and none changes
+what is sent. **Merging this section decides them**: E1-E3 are the fixes the
+issue names, E4-E7 answer the questions it left to the design, E8 is the
+wording. The edits are in place in §11.4-§11.6.
+
+**E1. Two refusals, one error (#224 item 1).** On a Ti2-E fake, `Z.stop()`
+during an offset move with PFS on raised `StopRefusedError(("autofocus_offset
+PFSOffset",))`: the link's refusal won over Z's own, so `.refused` missed
+`z ZDrive`, and `close()` from another thread listed the offset twice and Z
+not at all. In `Executor._stop_linked`, when the linked call and the device's
+own stop both raise `StopRefusedError`, one is raised whose `refused` is the
+link's names, then the device's, each once, with the default message and the
+`__cause__` of the device's own refusal (the error of the device the caller
+asked to stop). Every other pair is as today:
+
+| linked call | device's own stop | `stop()` raises |
+|---|---|---|
+| refusal | refusal | one refusal naming both (new) |
+| refusal | accepted | the link's refusal |
+| accepted | refusal | the device's refusal |
+| a fault | a refusal | the fault (FM-127) |
+| a refusal | a fault | the device's fault |
+| a fault | a fault | the device's fault |
+
+`_Stops.refused` (§11.5) lists a name once, in the order of first
+appearance: `close()` sends the offset's stop, then Z's, whose link stops the
+offset again.
+
+**E2. The give-up's line says what the profile declares (item 2).** On a
+declared role, the WARNING of a failed stop in a give-up (at the timeout, or
+after an exception) is `<name>: stop after <why> failed (<error>)`, then the
+note `; the profile declares this refusal ([safety] stop_refused_by), so a
+move under way runs to its target`, then the busy note (`; it still reads
+busy, so it counts as moving until it is idle`). The CLI line was right; the
+log contradicted it.
+
+**E3. A give-up is not given up twice (item 4).** Measured: a Ctrl-C inside
+the *timeout's* give-up made `_move`'s outer `except` give up again, so two
+`stop()` were sent and the note said `accepted`, the second stop's. Now
+`gave_up` is set before the timeout's give-up, and a `BaseException` that
+escapes a give-up, on either path, is noted `interrupted` and propagates; no
+second stop is sent. The note is part of the fix: setting the flag alone
+leaves a cut stop with no note, and the Ctrl-C line would say "no move was
+under way". On the timeout path the cut Ctrl-C is the first, so the clause
+no longer says "second" (§11.6).
+- Not chosen: *keeping the second stop as a retry*. It runs under the same
+  hazard as the first, and `close()`, which every command runs on leaving
+  its `with`, sends every stop again to what is still tracked as moving. The
+  give-up registers the motion before it sends the stop, so a cut stop
+  leaves it tracked.
+
+**E4. `failed` is an outcome, and `declared` goes (item 5).** The `Executor`
+never parses a device's text (D1), so a stop that raised on a role the
+profile does not declare is a failure: a lost connection reads the same as a
+refusal. The Ctrl-C line said "refused the stop" for it. `StopOutcome.failed`
+is that case, and `refused` is the declared one, the same two words
+`_Stops.refused` and `_Stops.failed` already use. `_give_up` returns
+`refused` iff `motion.stop_refused`, else `failed`. `StopNote.declared` then
+says nothing the outcome does not, and has no value for `still_moving`: it
+is removed, and a note is `(motion, outcome)`.
+
+**E5. `stop_notes` stops at the first exception that is not a
+`KeyboardInterrupt` (item 3).** A note is the interrupt's own, or belongs to
+the interrupt it interrupted (a second Ctrl-C inside a give-up's stop). A
+Ctrl-C raised inside the handler of an earlier, noted `HardwareError` (a
+plugin that catches a failed move) reported that old stop as its own. The
+walk still follows `__context__`, since `from None` leaves it, but only
+through `KeyboardInterrupt`s; the first other exception ends it and is not
+read.
+- Not chosen: *keeping the walk and documenting it*. The line exists to say
+  what this interrupt did.
+
+**E6. What the registry still tracks is noted when the stand is released
+(item 6).** A Ctrl-C inside `XYStage.wait()` on a stage that an earlier
+refused give-up left tracked carried no note, so the line said "no move was
+under way" while it travelled (measured: notes `()`, `moving()`
+`('xy_stage XY',)`). `Microscope.__exit__`, when the exception that leaves
+the block is a `KeyboardInterrupt`, reads `self._executor.moving()` before
+`close()`, and in a `finally` after it adds `StopNote(name,
+StopOutcome.still_moving)` for each name that `stop_notes(exc)` does not
+carry. Nothing here takes a lock beyond what `close()` takes, or does I/O,
+and a failing `close()` loses no note. It makes the line's "no note, no
+move" true for what the registry knows.
+- Not chosen: *`wait()` notes its own interrupt*: it covers one place, and a
+  Ctrl-C between two calls on a stand with a leftover would still say "no
+  move". *Reading `moving()` in `_report`*: the stand is released by then
+  (`_Reported` wraps the `with`).
+- What it cannot say: the Ti2-E's Z drive never reads busy (§4.9), so a Z
+  move that is still running is not tracked (§11.10).
+
+**E7. On a declared role, any raise is the declared refusal: kept (item 7).**
+The declaration is the profile's statement that this stop does not work.
+Whatever `stop()` raised, the refusal or a lost connection, the move under
+way runs to its target, which is what every text says. The device's own error
+stays in the WARNING line and in `__cause__`, and is not parsed (D1); a lost
+connection shows on the next read, with that read's diagnosis.
+- Not chosen: *the error's text in the give-up's message*. It carries the
+  translator's "check the device: power, cable" (§11.1), the wrong advice for
+  a refusal.
+
+**E8. The words.** Ctrl-C *sends a stop* to any move under way, and the line
+it prints says what that stop did; a stand may refuse it. Three texts said
+"stops": M1 §9's exit-code table (corrected with this section),
+`docs/plugins/README.md` (*Stopping*) and `smc run --help`.
+
+**Tests** (`tests/unit/test_refused_stop.py`, `test_errors_and_roles.py`,
+`test_cli.py`): one per decision, each on a `FakeCore`; the plan names them.
 
 ## 12. Engaging an autofocus that drives Z to its offset's plane (#205)
 
