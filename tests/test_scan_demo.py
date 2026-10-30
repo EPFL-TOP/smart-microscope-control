@@ -55,6 +55,7 @@ from smc.plugins.scan.plugin import ScanCheckpoint, ScanParams, ScanPlugin
 from smc.plugins.scan_plan.plugin import ScanPlanParams, ScanPlanPlugin
 from smc.plugins.slots import (
     CameraCalibration,
+    PlannedField,
     PlateResult,
     ScanPlanResult,
     ScanResult,
@@ -84,7 +85,13 @@ MUTATING = {
 
 
 class _Stage:
-    """The demo's XY stage, counting moves; ``offset_um`` is added to every target."""
+    """The demo's XY stage, counting moves; ``offset_um`` is added to every target.
+
+    The dicts are keyed by the move's number, counted from 1 after it is
+    incremented: ``fail`` raises before the inner move, ``landing_error_um``
+    is added to that move's target only (a stage that lands short), and
+    ``report`` is what that move returns, whatever the inner stage did.
+    """
 
     def __init__(self, inner: XYStage) -> None:
         self.inner = inner
@@ -92,6 +99,8 @@ class _Stage:
         self.moves = 0
         self.readbacks: list[XY] = []
         self.fail: dict[int, BaseException] = {}
+        self.landing_error_um: dict[int, tuple[float, float]] = {}
+        self.report: dict[int, XY] = {}
         self.after_move: Callable[[int], None] | None = None
 
     def position_um(self) -> XY:
@@ -101,9 +110,13 @@ class _Stage:
         self.moves += 1
         if self.moves in self.fail:
             raise self.fail[self.moves]
+        short_x_um, short_y_um = self.landing_error_um.get(self.moves, (0.0, 0.0))
         readback = self.inner.move_to_um(
-            x_um + self.offset_um[0], y_um + self.offset_um[1]
+            x_um + self.offset_um[0] + short_x_um,
+            y_um + self.offset_um[1] + short_y_um,
         )
+        if self.moves in self.report:
+            readback = self.report[self.moves]
         self.readbacks.append(readback)
         if self.after_move is not None:
             self.after_move(self.moves)
@@ -671,16 +684,18 @@ def test_a_disk_that_cannot_be_read_is_refused_before_moving(
     )
 
 
-def _edit_plan(rig: _Rig, edit: Callable[[list[dict[str, Any]]], None]) -> None:
-    """Rewrite the stored plan's fields as a copied or hand-edited run document would."""
+def _edit_plan_result(rig: _Rig, edit: Callable[[dict[str, Any]], None]) -> None:
+    """Rewrite the stored plan as a copied or hand-edited run document would; its fields are copies."""
     record = RunDocument.load(rig.run_doc).stages["scan-plan"]
     assert record.result is not None
-    fields = [dict(field) for field in record.result["fields"]]
-    edit(fields)
-    write_stage(
-        rig.run_doc,
-        record.model_copy(update={"result": {**record.result, "fields": fields}}),
-    )
+    result = {**record.result, "fields": [dict(f) for f in record.result["fields"]]}
+    edit(result)
+    write_stage(rig.run_doc, record.model_copy(update={"result": result}))
+
+
+def _edit_plan(rig: _Rig, edit: Callable[[list[dict[str, Any]]], None]) -> None:
+    """Rewrite the stored plan's fields."""
+    _edit_plan_result(rig, lambda result: edit(result["fields"]))
 
 
 def _rename_second(fields: list[dict[str, Any]]) -> None:
@@ -1186,6 +1201,213 @@ def test_an_interrupt_writing_a_frame_is_not_turned_into_a_run_error(
 
     with pytest.raises(KeyboardInterrupt):
         _scan(rig)
+
+
+# ---------------------------------------------------------------- the landing
+
+
+def _off_target_line(planned: PlannedField, by_um: float) -> str:
+    """A failed field's error for a landing ``by_um`` along x, against the 10x's 4.8 µm.
+
+    Built from the plan's field and the error the test added, not read from
+    the code: the demo rounds a command by up to 0.015 µm, which no ``.1f``
+    digit of these numbers shows.
+    """
+    return (
+        f"StageOffTarget: the readback is {by_um:.1f} µm from the target, more "
+        f"than 4.8 µm (target ({planned.x_um:.1f}, {planned.y_um:.1f}), readback "
+        f"({planned.x_um + by_um:.1f}, {planned.y_um:.1f}))"
+    )
+
+
+def test_a_field_that_lands_off_target_is_a_failed_field_and_nothing_else_is_done(
+    rig: _Rig,
+) -> None:
+    """FM-104: a move that returned is not a move that arrived; no frame of the wrong place."""
+    plan = _plan(rig)
+    af = _Autofocus(engaged=True, locked=True)
+    rig.microscope.override(Autofocus, af)
+    rig.stage.landing_error_um = {2: (6.0, 0.0)}
+
+    result = _result(_scan(rig))
+
+    second = plan.fields[1]
+    assert len(result.failed) == 1
+    failed = result.failed[0]
+    assert (failed.well, failed.index, failed.name) == (
+        second.well,
+        second.index,
+        second.name,
+    )
+    assert (failed.x_um, failed.y_um) == (second.x_um, second.y_um)  # the target
+    assert failed.error == _off_target_line(second, 6.0)
+    assert len(result.frames) == 11
+    assert second.name not in {f.name for f in result.frames}
+    assert len(_tiffs(rig)) == 11
+    assert rig.camera.snaps == 11
+    # The failed field read nothing from the autofocus: the lock once before the
+    # scan and once for each of the 11 frames, the offset for the frames only.
+    assert af.calls.count("is_locked") == 12
+    assert af.calls.count("offset_native") == 11
+    assert "engage" not in af.calls
+
+
+def test_a_field_off_target_does_not_engage_the_autofocus(rig: _Rig) -> None:
+    """An ``engage()`` drives Z: it is not spent on a field that is not photographed."""
+    af = _Autofocus(engaged=True, locked=True)
+    rig.microscope.override(Autofocus, af)
+    rig.stage.landing_error_um = {2: (6.0, 0.0)}
+    rig.stage.after_move = lambda n: af.lose_lock() if n in (2, 3) else None
+
+    result = _result(_scan(rig))
+
+    assert len(result.failed) == 1
+    assert af.calls.count("engage") == 1  # field 3's, not field 2's
+    assert [f.focus for f in result.frames] == ["locked"] * 11
+
+
+def test_a_landing_within_the_tolerance_is_a_frame(rig: _Rig) -> None:
+    plan = _plan(rig)
+    rig.stage.landing_error_um = {2: (4.0, 0.0)}
+
+    result = _result(_scan(rig))
+
+    assert len(result.frames) == 12
+    assert result.failed == ()
+    assert result.frames[1].x_um == pytest.approx(plan.fields[1].x_um + 4.0, abs=0.05)
+
+
+@pytest.mark.parametrize(
+    ("landing", "failed"),
+    [((3.5, 3.5), 1), ((3.5, 0.0), 0), ((0.0, -3.5), 0), ((-3.5, -3.5), 1)],
+    ids=["both-axes", "x-only", "y-only", "both-negative"],
+)
+def test_the_landing_error_is_the_distance_not_one_axis(
+    landing: tuple[float, float], failed: int, rig: _Rig
+) -> None:
+    """3.5 µm on each axis is 4.95 µm off, past the 4.8 µm that neither axis reaches."""
+    rig.stage.landing_error_um = {2: landing}
+
+    result = _result(_scan(rig))
+
+    assert len(result.failed) == failed
+    assert len(result.frames) == 12 - failed
+
+
+@pytest.mark.parametrize(
+    "landing", [(5.5, 0.0), (0.0, 5.5)], ids=["along-x", "along-y"]
+)
+def test_the_tolerance_is_of_the_smaller_side_of_the_field(
+    landing: tuple[float, float], rig: _Rig
+) -> None:
+    """FM-73: the field is 128 x 96 µm; 5 % of the larger side (6.4 µm) would take a 5.5 µm landing."""
+    plan = _plan(rig)
+    assert plan.fov_um == (128.0, 96.0)
+    rig.stage.landing_error_um = {2: landing}
+
+    result = _result(_scan(rig))
+
+    assert [f.name for f in result.failed] == [plan.fields[1].name]
+    assert len(result.frames) == 11
+
+
+def test_the_tolerance_is_a_parameter(rig: _Rig) -> None:
+    rig.stage.landing_error_um = {2: (6.0, 0.0)}
+
+    # 10 % of 96 µm is 9.6 µm: the 6.0 µm landing is a frame.
+    result = _result(_scan(rig, landing_tolerance=0.1))
+
+    assert len(result.frames) == 12
+    assert result.failed == ()
+    for bad in (0.0, 0.6, math.nan):
+        with pytest.raises(ValueError, match="landing_tolerance"):
+            ScanParams(landing_tolerance=bad)
+
+
+def test_failures_off_target_not_in_a_row_do_not_fail_the_scan(rig: _Rig) -> None:
+    """The next frame resets the count: two off-target fields apart are not two in a row."""
+    rig.stage.landing_error_um = {2: (6.0, 0.0), 4: (6.0, 0.0)}
+
+    result = _result(_scan(rig, max_failed_in_row=2))
+
+    assert [f.name for f in result.failed] == ["A1_0001", "A1_0003"]
+    assert len(result.frames) == 10
+
+
+def test_a_readback_that_is_not_a_number_is_a_failed_field(rig: _Rig) -> None:
+    """FM-104: ``nan`` is not within any tolerance, and is not a pydantic error out of ``ScanFrame``."""
+    plan = _plan(rig)
+    rig.stage.report = {2: XY(math.nan, math.nan)}
+
+    result = _result(_scan(rig))
+
+    second = plan.fields[1]
+    assert len(result.failed) == 1
+    assert result.failed[0].error == (
+        "StageOffTarget: the readback is nan µm from the target, more than 4.8 µm "
+        f"(target ({second.x_um:.1f}, {second.y_um:.1f}), readback (nan, nan))"
+    )
+    assert len(result.frames) == 11
+
+
+def test_three_fields_off_target_in_a_row_fail_the_scan(rig: _Rig) -> None:
+    """A stage that is stuck lands off target at every field: ``max_failed_in_row`` ends it."""
+    plan = _plan(rig)
+    rig.stage.landing_error_um = {n: (6.0, 0.0) for n in (1, 2, 3)}
+
+    with pytest.raises(PluginRunError) as raised:
+        _scan(rig)
+
+    assert raised.value.reason == (
+        f"3 fields failed in a row, the last A1_0002: "
+        f"{_off_target_line(plan.fields[2], 6.0)}; the checkpoint keeps 0 wells: "
+        "check the stage, then run scan --resume"
+    )
+    assert rig.stage.moves == 3
+    assert rig.camera.snaps == 0
+
+
+def test_a_dry_run_does_not_compare_the_readback(
+    demo_microscope_dry: Microscope, tmp_path: Path
+) -> None:
+    """The layer's dry-run readback is the target: nothing is measured, so nothing is compared."""
+    rig = _build(demo_microscope_dry, tmp_path)
+    plan = _plan(rig)
+    rig.stage.report = {2: XY(1e6, 1e6)}
+
+    result = _result(_scan(rig))
+
+    assert result.failed == ()
+    assert rig.stage.moves == len(plan.fields)
+    assert result.assumed == ("dry run: 12 fields walked, no frame taken",)
+
+
+def test_the_same_readback_on_a_real_stand_is_a_failed_field(rig: _Rig) -> None:
+    rig.stage.report = {2: XY(1e6, 1e6)}
+
+    result = _result(_scan(rig))
+
+    assert [f.name for f in result.failed] == ["A1_0001"]
+    assert result.failed[0].error.endswith("readback (1000000.0, 1000000.0))")
+
+
+@pytest.mark.parametrize(
+    "fov", [(0.0, 96.0), (128.0, -1.0)], ids=["no-width", "negative"]
+)
+def test_a_plan_with_no_field_of_view_is_refused_before_anything_moves(
+    fov: tuple[float, float], rig: _Rig
+) -> None:
+    """An edited run document: a tolerance of nothing would fail every field, or none."""
+
+    def edit(result: dict[str, Any]) -> None:
+        result["fov_um"] = list(fov)
+
+    _edit_plan_result(rig, edit)
+
+    assert _refused(rig) == (
+        f"the plan's field of view {fov} µm is not positive: run scan-plan again "
+        "with the stand as it is now"
+    )
 
 
 # ------------------------------------------------------------------- resume

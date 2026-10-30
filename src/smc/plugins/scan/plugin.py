@@ -61,6 +61,9 @@ from smc.plugins.scan.algorithm import (
     focus_state,
     frame_path,
     itemsize_of,
+    landed_off_target,
+    landing_error_um,
+    landing_tolerance_um,
     size_differs,
     wells_to_scan,
 )
@@ -95,7 +98,7 @@ ON_WINDOWS: bool = os.name == "nt"
 
 
 class ScanParams(PluginParams):
-    """How the autofocus is used, and how many bad fields in a row end the scan."""
+    """How the autofocus is used, how many bad fields in a row end the scan, how far a landing may be."""
 
     autofocus: Literal["if-engaged", "required", "off"] = Field(
         "if-engaged",
@@ -118,6 +121,17 @@ class ScanParams(PluginParams):
         description=(
             "This many fields in a row on which the autofocus would not lock "
             "end the scan."
+        ),
+    )
+    landing_tolerance: float = Field(
+        0.05,
+        gt=0.0,
+        le=0.5,
+        description=(
+            "How far a field may land from its target, as a fraction of the "
+            "smaller side of the plan's field of view; a field that landed "
+            "farther is failed, not photographed. 0.05 is 4.8 µm for the "
+            "demo's 10x (a field of view of 128 x 96 µm)."
         ),
     )
 
@@ -192,6 +206,15 @@ class ScanPlugin:
         plan = ctx.upstream("scan-plan", ScanPlanResult)
 
         token, wells_done, frames, failed = _resume(ctx, plan)
+        if not all(side > 0.0 for side in plan.fov_um):
+            # An edited run document (a ``nan`` is refused too): a tolerance of
+            # nothing would fail every field.
+            raise PluginRunError(
+                _NAME,
+                f"the plan's field of view {tuple(plan.fov_um)} µm is not positive: "
+                f"{_AGAIN}",
+            )
+        tolerance_um = landing_tolerance_um(plan.fov_um, params.landing_tolerance)
         paths = _paths(ctx, plan, token)
         stand = _check_stand(microscope, camera, plan, params)
         groups = wells_to_scan(plan.wells, plan.fields, set(wells_done))
@@ -216,6 +239,22 @@ class ScanPlugin:
                 try:
                     readback = xy.move_to_um(planned.x_um, planned.y_um)
                     if not ctx.dry_run:
+                        # Before anything else is read or moved: a field that
+                        # did not arrive is not photographed, and engaging the
+                        # autofocus for it would drive Z for nothing. A dry
+                        # run's readback is the target, so nothing is measured.
+                        off_um = landing_error_um(
+                            (planned.x_um, planned.y_um),
+                            (readback.x_um, readback.y_um),
+                        )
+                        if landed_off_target(off_um, tolerance_um):
+                            error = (
+                                f"StageOffTarget: the readback is {off_um:.1f} µm "
+                                f"from the target, more than {tolerance_um:.1f} µm "
+                                f"(target ({planned.x_um:.1f}, {planned.y_um:.1f}), "
+                                f"readback ({readback.x_um:.1f}, {readback.y_um:.1f}))"
+                            )
+                    if not ctx.dry_run and error is None:
                         locked = False
                         if stand.used and af is not None:
                             locked = af.is_locked()
