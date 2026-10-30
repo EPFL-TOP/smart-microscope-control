@@ -278,3 +278,18 @@ def test_a_drive_result_not_reached_exits_1_with_its_text(
     assert result.exit_code == 1, result.output
     assert result.output.splitlines()[-1] == f"✗ {text}"
     assert text not in result.output.splitlines()
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_autofocus_get_that_cannot_read_exits_1_with_the_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Unknown is not off: a script must not take "autofocus ?" for a state.
+    text = "autofocus ? (autofocus: HardwareError: autofocus 'PFS': cannot read)"
+    monkeypatch.setattr(cli, "autofocus_text", lambda microscope: text)
+
+    result = runner.invoke(app, ["autofocus", "get"])
+
+    assert result.exit_code == 1, result.output
+    assert result.output.splitlines()[-1] == f"✗ {text}"

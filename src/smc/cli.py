@@ -38,6 +38,7 @@ from rich.text import Text
 from smc import __version__
 from smc.drive import (
     DriveResult,
+    autofocus_text,
     disengage_autofocus,
     engage_autofocus,
     jog_xy,
@@ -70,7 +71,7 @@ from smc.hardware.errors import (
     join_names,
     stop_notes,
 )
-from smc.hardware.microscope import Microscope, MicroscopeState, describe_autofocus
+from smc.hardware.microscope import Microscope, MicroscopeState
 from smc.hardware.profile import (
     DEMO_NAME,
     ROLES_WITH_A_STOP,
@@ -1669,10 +1670,14 @@ def objective_set(
 
 @autofocus_app.command("get")
 def autofocus_get(ctx: typer.Context, profile: ProfileOption = DEMO_NAME) -> None:
-    """Print whether the autofocus is off, on, or locked."""
+    """Print whether the autofocus is off, on, or locked; a read that fails exits 1 with its cause."""
     with _Reported(ctx), Microscope.open(profile) as microscope:
         microscope.require(Autofocus)
-        words = describe_autofocus(microscope.state())
+        words = autofocus_text(microscope)
+    if words.startswith("autofocus ?"):
+        # Unknown is not off: a script must not read it as a state (as `smc z get`).
+        _fail(words)
+        raise typer.Exit(code=_EXIT_ERROR)
     _say(words)
 
 

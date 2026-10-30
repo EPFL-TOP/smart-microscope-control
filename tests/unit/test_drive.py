@@ -28,7 +28,7 @@ from smc.hardware.capabilities import (
     XYStage,
     ZStage,
 )
-from smc.hardware.errors import SafetyRefusedError
+from smc.hardware.errors import HardwareError, SafetyRefusedError
 from smc.hardware.profile import Profile
 from smc.hardware.roles import Role
 from smc.testing import FakeCore
@@ -474,3 +474,45 @@ def test_a_disengage_that_leaves_the_autofocus_on_is_not_reached(
         microscope.close()
     suffix = " (dry run: switching off is sent all the same)" if dry_run else ""
     assert result == DriveResult(f"autofocus locked{suffix}", reached=False)
+
+
+class EngagesButLeavesItOn(StaysEngaged):
+    """``engage`` returns ``False``, as with no lock, yet the autofocus still reads locked."""
+
+
+def test_an_engage_that_returns_false_says_what_the_stand_reads(
+    fake_microscope: Microscope,
+) -> None:
+    # FM-155: "it is off" is what the contract promises for False, not a readback.
+    fake_microscope.override(Autofocus, EngagesButLeavesItOn())
+
+    result = drive.engage_autofocus(fake_microscope)
+
+    assert result == DriveResult(
+        "autofocus did not lock; autofocus locked", reached=False
+    )
+
+
+class ReadsFail(NeverLocks):
+    """An autofocus whose state cannot be read."""
+
+    def is_engaged(self) -> bool:
+        raise HardwareError("autofocus 'PFS': cannot read")
+
+    def is_locked(self) -> bool:
+        raise HardwareError("autofocus 'PFS': cannot read")
+
+
+def test_an_autofocus_that_cannot_be_read_says_why(
+    fake_microscope: Microscope,
+) -> None:
+    fake_microscope.override(Autofocus, ReadsFail())
+
+    result = drive.disengage_autofocus(fake_microscope)
+
+    # The cause once, although both reads failed with it.
+    assert result == DriveResult(
+        "autofocus ? (autofocus: HardwareError: autofocus 'PFS': cannot read)",
+        reached=False,
+    )
+    assert drive.autofocus_text(fake_microscope) == result.text
