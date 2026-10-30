@@ -27,6 +27,7 @@ import string
 import subprocess
 import sys
 import threading
+import time
 import weakref
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
@@ -68,6 +69,7 @@ from smc.plugins.slots import (
     WellRef,
 )
 from smc.run import (
+    ReadRecord,
     RunDocument,
     RunDocumentError,
     StageRecord,
@@ -77,11 +79,13 @@ from smc.run import (
 from smc.testing import FakeCore
 from smc.ui.controller import (
     KEY_PARAMS,
+    LIVE_PERIOD_S,
     PAGE_PARAMS,
     CheckItem,
     PlatePage,
     _autofocus_words,
 )
+from smc.ui.frames import Frame
 
 T0 = datetime(2026, 10, 29, 9, 0, tzinfo=timezone.utc)
 PITCH_96_UM = 9000.0
@@ -1977,6 +1981,263 @@ def test_a_snap_on_the_fake_stand_reads_its_own_camera(page: PlatePage) -> None:
     assert page.status().outcome == f"snap: {frame.summary}"
 
 
+# --- live ------------------------------------------------------------------------------------
+
+
+class LivePlugin(Slow):
+    """A plugin that is merely *named* ``live``: ending the live view must not end it."""
+
+    name = provides = "live"
+
+
+def _wait_for_frames(page: PlatePage, count: int, *, timeout_s: float = 5.0) -> Frame:
+    """The frame numbered ``count`` or later; bounded, with the outcome in the failure (FM-44)."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        frame = page.frame()
+        if frame is not None and frame.number >= count:
+            return frame
+        assert time.monotonic() < deadline, (
+            f"{count} frames not seen within {timeout_s} s: {page.status().outcome}"
+        )
+        time.sleep(0.005)
+
+
+def test_live_keeps_frames_until_ended_and_says_how_many(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    fake_microscope.override(Camera, FrameCamera(_ramp_frame()))
+    page.live(True)
+    _wait_for_frames(page, 3)
+    status = page.status()
+    assert status.running == "live"
+    assert page.is_live
+    assert status.progress is not None
+    # A frame is kept before its progress is put: the progress may be one behind.
+    assert status.progress.done >= 2
+    assert status.progress == Progress("live", status.progress.done, None, "frames")
+    page.live(False)
+    assert page.join(10.0)
+    status = page.status()
+    kept = page.frame()
+    assert kept is not None
+    assert status.outcome is not None
+    found = re.fullmatch(r"live ended: (\d+) frames in \d+\.\d s", status.outcome)
+    assert found is not None, status.outcome
+    assert int(found.group(1)) == kept.number
+    assert status.running is None
+    assert not page.is_live
+    # Ending a live view is not an emergency: the stand is not halted.
+    assert not status.halted
+
+
+def test_live_frames_do_not_count_as_ended_activities(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    fake_microscope.override(Camera, FrameCamera(_ramp_frame()))
+    before = page.activities_ended
+    page.live(True)
+    _wait_for_frames(page, 3)
+    assert page.activities_ended == before
+    page.live(False)
+    assert page.join(10.0)
+    assert page.activities_ended == before + 1
+
+
+def test_live_keeps_at_most_ten_frames_a_second(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # A camera that answers at once: only the period holds the rate down.
+    fake_microscope.override(Camera, FrameCamera(_ramp_frame()))
+    page.live(True)
+    first = _wait_for_frames(page, 1)
+    began = time.monotonic()
+    time.sleep(1.0)
+    last = page.frame()
+    elapsed = time.monotonic() - began
+    page.live(False)
+    assert page.join(10.0)
+    assert last is not None
+    delta = last.number - first.number
+    assert delta <= elapsed / LIVE_PERIOD_S + 1, f"{delta} frames in {elapsed:.2f} s"
+    # The cap is not a stall: frames do come.
+    assert delta >= 3, f"{delta} frames in {elapsed:.2f} s"
+
+
+def test_live_and_every_other_activity_refuse_each_other(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    fake_microscope.override(Camera, FrameCamera(_ramp_frame()))
+    page.live(True)
+    try:
+        assert page.status().running == "live"
+        with _refuses(RuntimeError, "live is running"):
+            page.run("stub", [])
+        with _refuses(RuntimeError, "live is running"):
+            page.snap()
+        with _refuses(RuntimeError, "live is running"):
+            page.live(True)
+        with _refuses(RuntimeError, "live is running"):
+            page.resume()
+        with _refuses(RuntimeError, "live is running"):
+            page.goto("A1")
+    finally:
+        page.live(False)
+    assert page.join(10.0)
+    assert Stub.seen == []
+    page.run("slow", [])
+    try:
+        assert Slow.started.wait(5)
+        with _refuses(RuntimeError, "slow is running"):
+            page.live(True)
+    finally:
+        Slow.release.set()
+    assert page.join(10.0)
+    assert not page.is_live
+
+
+def test_end_live_stops_only_the_live_it_started(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _page(fake_microscope, run_doc, [_ep(LivePlugin)])
+    try:
+        # Nothing runs: ending a live view that is not there changes nothing.
+        page.live(False)
+        assert page.status().outcome is None
+        assert not page.status().halted
+        page.run("live", [])
+        assert Slow.started.wait(5)
+        page.live(False)
+        # A run of a plugin called "live" is not the live view: it is still going.
+        assert not Slow.ended.wait(0.3)
+        status = page.status()
+        assert status.running == "live"
+        assert not page.is_live
+        assert not status.halted
+    finally:
+        page.close()
+    assert Slow.ended.is_set()
+
+
+def test_live_on_a_stand_without_a_camera_is_an_outcome_and_starts_no_thread(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    threads = threading.active_count()
+    before = page.activities_ended
+    with _replaced(fake_microscope, "has", _without(Camera)):
+        page.live(True)
+    status = page.status()
+    assert status.outcome == "live: this stand has no Camera"
+    assert status.running is None
+    assert not page.is_live
+    assert page.activities_ended == before
+    assert threading.active_count() == threads
+
+
+def test_stop_during_live_ends_it_and_halts_the_stand(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    camera = FrameCamera(_ramp_frame(), block=True)
+    fake_microscope.override(Camera, camera)
+    try:
+        page.live(True)
+        assert camera.entered.wait(5)
+        page.stop()
+    finally:
+        camera.release.set()
+    assert page.join(10.0)
+    status = page.status()
+    assert status.stop_note == (
+        "live told to stop; stopped: the stand is halted (Resume clears the halt)"
+    )
+    assert status.halted
+    assert status.running is None
+    # The frame in flight completes and is kept; the loop ends at its next check.
+    assert status.outcome is not None
+    assert status.outcome.startswith("live ended: ")
+
+
+def test_close_ends_live_and_says_what_the_stop_did(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    fake_microscope.override(Camera, FrameCamera(_ramp_frame()))
+    page.live(True)
+    _wait_for_frames(page, 2)
+    page.close()
+    assert page.close_ended
+    assert len(page.close_lines) == 2
+    assert page.close_lines[0] == (
+        "live told to stop; stopped: the stand is halted (Resume clears the halt)"
+    )
+    assert re.fullmatch(r"live ended: \d+ frames in \d+\.\d s", page.close_lines[1])
+    with _refuses(RuntimeError, "the page is closed"):
+        page.live(True)
+    page.live(False)  # ends nothing, raises nothing
+
+
+def test_a_live_frame_of_the_wrong_shape_ends_live_and_keeps_the_last_good_frame(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    camera = FrameCamera(_ramp_frame())
+    fake_microscope.override(Camera, camera)
+    before = page.activities_ended
+    page.live(True)
+    _wait_for_frames(page, 2)
+    camera.frame = np.zeros((2, 3, 4), dtype=np.uint16)
+    assert page.join(10.0)
+    kept = page.frame()
+    assert kept is not None
+    assert page.status().outcome == (
+        f"live ended after {kept.number} frames: the camera returned a uint16 "
+        f"frame of shape (2, 3, 4); the page shows 2-D uint8 or uint16 frames"
+    )
+    assert kept.image.shape == (6, 10)
+    assert page.activities_ended == before + 1
+
+
+def test_a_live_whose_camera_fails_keeps_no_exception(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    raised: list[weakref.ref[BaseException]] = []
+
+    def failing() -> HardwareError:
+        error = HardwareError("the camera timed out\nafter 5 s")
+        raised.append(weakref.ref(error))
+        return error
+
+    fake_microscope.override(Camera, FrameCamera(_ramp_frame(), fail_with=failing))
+    gc.disable()
+    try:
+        page.live(True)
+        assert page.join(10.0)
+        assert len(raised) == 1
+        # Dead without the cyclic collector: nothing the page holds reaches it (FM-98).
+        assert raised[0]() is None
+        assert page.status().outcome == (
+            "live ended after 0 frames: HardwareError: the camera timed out after 5 s"
+        )
+        assert page.frame() is None
+        assert page.status().running is None
+    finally:
+        gc.enable()
+
+
+def test_live_while_the_stand_is_halted_ends_at_its_first_frame_with_the_facades_refusal(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # The fake core's own camera, not an override: an override bypasses the halt.
+    page.stop()
+    with pytest.raises(HardwareError) as refusal:
+        fake_microscope.require(Camera).snap()
+    said = " ".join(str(refusal.value).split())
+    name = type(refusal.value).__name__
+    del refusal
+    page.live(True)
+    assert page.join(10.0)
+    assert page.status().outcome == f"live ended after 0 frames: {name}: {said}"
+    assert page.frame() is None
+
+
 # --- the result card and the checklist -------------------------------------------------------
 
 
@@ -1992,6 +2253,8 @@ def _record(
     finished_minute: int | None = 0,
     profile: str = "demo",
     dry_run: bool = False,
+    attempt: str = "a0",
+    reads: dict[str, ReadRecord | None] | None = None,
 ) -> None:
     """A record whose result is the dict given as it stands, for values no model would dump."""
     write_stage(
@@ -1999,7 +2262,8 @@ def _record(
         StageRecord(
             plugin=plugin,
             provides=provides or plugin,
-            attempt="a0",
+            attempt=attempt,
+            reads=reads or {},
             status=status,
             started_utc=T0 + timedelta(minutes=started_minute),
             finished_utc=(
@@ -2247,6 +2511,117 @@ def test_a_key_of_a_result_is_cut_and_flattened_like_a_value(
     _record(run_doc, "stub", result={"k" * 100: 1, "two\nlines": 2})
     card = _page(fake_microscope, run_doc).view().cards["stub"]
     assert card.lines == (f"{'k' * 80}…: 1", "two lines: 2")
+
+
+def _stale_reader(run_doc: Path, *, read_attempt: str, **kwargs: Any) -> None:
+    """``reader`` read the ``up`` slot at ``read_attempt``; ``up``'s provider is attempt ``a2``."""
+    _record(
+        run_doc,
+        "upstream",
+        provides="up",
+        attempt="a2",
+        started_minute=2,
+        finished_minute=2,
+        result={},
+    )
+    _record(
+        run_doc,
+        "reader",
+        started_minute=3,
+        finished_minute=3,
+        reads={"up": ReadRecord(plugin="upstream", attempt=read_attempt)},
+        **kwargs,
+    )
+
+
+def test_a_done_record_that_read_an_earlier_input_has_a_stale_card(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _stale_reader(run_doc, read_attempt="a1", result={"n": 4, "assumed": ["a guess"]})
+    assert RunDocument.load(run_doc).is_stale("reader")
+    card = _page(fake_microscope, run_doc).view().cards["reader"]
+    assert card.stale is True
+    # Marked, not hidden: a stale result is still a result, of inputs that moved.
+    assert card.lines == ("n: 4",)
+    assert card.assumed == ("a guess",)
+
+
+def test_a_fresh_record_and_a_failed_stale_one_have_no_stale_mark(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _stale_reader(run_doc, read_attempt="a2", result={"n": 1})
+    assert not RunDocument.load(run_doc).is_stale("reader")
+    assert _page(fake_microscope, run_doc).view().cards["reader"].stale is False
+    for status in (StageStatus.failed, StageStatus.stopped):
+        _stale_reader(run_doc, read_attempt="a1", status=status, error="it failed")
+        # The document calls it stale whatever its status; the card marks a result.
+        assert RunDocument.load(run_doc).is_stale("reader")
+        card = _page(fake_microscope, run_doc).view().cards["reader"]
+        assert (card.status, card.stale) == (status.value, False)
+
+
+def test_a_card_is_bounded_whatever_its_record_holds(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    result: dict[str, Any] = {"assumed": ["a" * 700] * 2000}
+    result.update({f"key{i}": i for i in range(2000)})
+    _record(run_doc, "stub", result=result, error="e" * 100_000, profile="p" * 5000)
+    card = _page(fake_microscope, run_doc).view().cards["stub"]
+    assert len(card.assumed) == 9
+    assert card.assumed[:8] == (f"{'a' * 600}…",) * 8
+    assert card.assumed[8] == "… 1992 more"
+    assert card.lines == (*(f"key{i}: {i}" for i in range(8)), "… 1992 more")
+    assert card.error == f"{'e' * 600}…"
+    assert card.profile == f"{'p' * 80}…"
+
+
+def test_eight_assumptions_are_shown_whole_and_nine_are_cut_to_eight_and_a_count(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    items = [f"assumption {i}" for i in range(9)]
+    _record(run_doc, "stub", result={"assumed": items[:8]})
+    card = _page(fake_microscope, run_doc).view().cards["stub"]
+    assert card.assumed == tuple(items[:8])
+    _record(run_doc, "stub", result={"assumed": items})
+    card = _page(fake_microscope, run_doc).view().cards["stub"]
+    assert card.assumed == (*items[:8], "… 1 more")
+
+
+def test_an_assumption_a_plugin_writes_today_is_shown_whole(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # 236 characters is the longest a built-in plugin writes (the route's
+    # unlocked-frame line for 1536 stops); 600 is the bound, and 601 is cut.
+    _record(
+        run_doc,
+        "stub",
+        result={"assumed": ["z" * 236, "y" * 600, "x" * 601]},
+    )
+    card = _page(fake_microscope, run_doc).view().cards["stub"]
+    assert card.assumed == ("z" * 236, "y" * 600, f"{'x' * 600}…")
+
+
+def test_a_non_string_assumption_and_a_stopped_records_error_are_cut_too(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _record(run_doc, "stub", result={"assumed": [{"note": "v" * 1000}, 7]})
+    card = _page(fake_microscope, run_doc).view().cards["stub"]
+    assert len(card.assumed) == 2
+    assert card.assumed[0].startswith("{'note': 'vvv")
+    assert len(card.assumed[0]) == 601
+    assert card.assumed[1] == "7"
+    _record(
+        run_doc,
+        "stub",
+        status=StageStatus.stopped,
+        result={"assumed": ["hidden"]},
+        error="line one\n" + "s" * 5000,
+    )
+    card = _page(fake_microscope, run_doc).view().cards["stub"]
+    assert card.assumed == ()
+    assert card.error is not None
+    assert len(card.error) == 601
+    assert card.error.startswith("line one sss")
 
 
 def test_a_checklist_without_other_slots_is_m3s(

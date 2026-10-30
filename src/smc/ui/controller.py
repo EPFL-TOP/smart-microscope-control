@@ -74,6 +74,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "KEY_PARAMS",
+    "LIVE_PERIOD_S",
     "MORE_STAGE",
     "PAGE_PARAMS",
     "STAGES",
@@ -143,6 +144,10 @@ _SIDES = ("left", "right", "top", "bottom")
 _CARD_LINES = 8
 _CARD_CHARS = 80
 
+#: An assumption and an error are diagnoses whose end often says what to do: they are
+#: cut later than a value (more than twice the longest assumption a plugin writes).
+_CARD_TEXT_CHARS = 600
+
 #: A card's time when its record's date cannot be put in UTC: unknown, never a guess.
 _UNKNOWN_TIME = "????-??-?? ??:??:??"
 
@@ -152,6 +157,10 @@ _CLOSE_WAIT_S = 10.0
 #: A wait on the worker is made of slices this long (FM-83: Windows does not deliver
 #: Ctrl-C during one long wait on a thread).
 _WAIT_SLICE_S = 0.1
+
+#: A live view takes a frame at most once in this many seconds: the cap is a period,
+#: so a camera slower than 10 frames a second runs at its own rate (m5 §5.1).
+LIVE_PERIOD_S = 0.1
 
 #: What ``stop`` says when the stand took the stop: the one wording that may be told
 #: as "stopped" (FM-117).
@@ -209,6 +218,8 @@ class ResultCard:
     ``lines`` are the result's values and are empty unless the record ended
     ``done``: a stopped or failed record's values are not a result (FM-154).
     ``assumed`` are the result's own ``assumed`` lines, under the same rule.
+    ``stale`` marks a ``done`` record that read an input produced again since.
+    Every text is bounded, whatever the record holds: the card is a summary.
     """
 
     plugin: str
@@ -219,6 +230,7 @@ class ResultCard:
     lines: tuple[str, ...]
     assumed: tuple[str, ...]
     error: str | None
+    stale: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -307,9 +319,9 @@ def _flat(text: str) -> str:
     return " ".join(text.splitlines())
 
 
-def _cut(text: str) -> str:
-    """``text`` of at most ``_CARD_CHARS`` characters, and a ``…`` when it was longer."""
-    return text if len(text) <= _CARD_CHARS else text[:_CARD_CHARS] + "…"
+def _cut(text: str, limit: int = _CARD_CHARS) -> str:
+    """``text`` of at most ``limit`` characters, and a ``…`` when it was longer."""
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def _value_line(key: str, value: object) -> str:
@@ -332,8 +344,14 @@ def _value_line(key: str, value: object) -> str:
     return f"{label}: {type(value).__name__}"
 
 
-def _card(record: StageRecord) -> ResultCard:
-    """The card of ``record``; its values only when it ended ``done`` (FM-154)."""
+def _card(record: StageRecord, *, stale: bool = False) -> ResultCard:
+    """The card of ``record``; its values only when it ended ``done`` (FM-154).
+
+    ``stale`` is ``RunDocument.is_stale`` of the record, and marks only a ``done``
+    one: a record that did not end done has no values to mislead, and its status
+    already says to run it again. The stale card keeps its values (they are a result,
+    of inputs that are no longer the document's).
+    """
     when = record.finished_utc or record.started_utc
     try:
         when_utc = when.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -353,18 +371,28 @@ def _card(record: StageRecord) -> ResultCard:
             lines = [*lines[:_CARD_LINES], f"… {len(lines) - _CARD_LINES} more"]
         found = record.result.get("assumed")
         if isinstance(found, list):
-            assumed = tuple(_flat(str(item)) for item in found)
+            items = [
+                _cut(_flat(str(item)), _CARD_TEXT_CHARS) for item in found[:_CARD_LINES]
+            ]
+            if len(found) > _CARD_LINES:
+                items.append(f"… {len(found) - _CARD_LINES} more")
+            assumed = tuple(items)
         elif found is not None:
-            assumed = (_flat(str(found)),)
+            assumed = (_cut(_flat(str(found)), _CARD_TEXT_CHARS),)
     return ResultCard(
         plugin=record.plugin,
         status=record.status.value,
         when_utc=when_utc,
-        profile=record.profile,
+        profile=_cut(_flat(record.profile)),
         dry_run=record.dry_run,
         lines=tuple(lines),
         assumed=assumed,
-        error=None if record.error is None else _flat(record.error),
+        error=(
+            None
+            if record.error is None
+            else _cut(_flat(record.error), _CARD_TEXT_CHARS)
+        ),
+        stale=stale and record.status is StageStatus.done,
     )
 
 
@@ -434,6 +462,9 @@ class PlatePage:
         self._frame: Frame | None = None
         self._queue: queue.SimpleQueue[Progress] = queue.SimpleQueue()
         self._worker: threading.Thread | None = None
+        # The event of the live this page started, to tell it from any other activity
+        # by identity. Written on the server's loop only; read without a lock (FM-70).
+        self._live_event: threading.Event | None = None
         self._closed = False
         self._ended = 0
         # A plain attribute, written by ``stop()`` and ``resume()``, which take no lock.
@@ -452,7 +483,7 @@ class PlatePage:
 
     @property
     def activities_ended(self) -> int:
-        """How many activities (runs and snaps) have ended since the page began.
+        """How many activities (runs, snaps and live sessions) have ended since the page began.
 
         What every session compares to see that something ended while it was not
         looking: a tool that takes less than a tick is never seen running by a
@@ -672,8 +703,11 @@ class PlatePage:
 
     def _start_activity(
         self, name: str, body: Callable[[threading.Event], str]
-    ) -> None:
+    ) -> threading.Event:
         """Start the activity ``name`` on the daemon worker; ``body`` returns its outcome text.
+
+        Returns the activity's event, which ends it when set: a caller that must
+        tell its own activity from another one (``live``) keeps it.
 
         Every action that reaches the stand through a call that may last is such
         an activity (m5 §2.1): it holds ``_current_run`` under its name, so that a
@@ -710,6 +744,7 @@ class PlatePage:
             )
             self._worker = worker
             worker.start()
+        return event
 
     def _work(
         self,
@@ -792,20 +827,90 @@ class PlatePage:
             return
         self._start_activity("snap", self._snap)
 
+    def live(self, on: bool) -> None:
+        """Start a live view, or end the one this page started; at most ten frames a second.
+
+        ``on`` is an activity like a snap (m5 §2.1) that takes frames until its event
+        is set, and keeps each one as ``frame()``. It refuses as a snap does, and a
+        stand without a camera is an outcome and no thread starts. Run and Snap are
+        refused while it goes, and it is never ended for them (m5 §5.2).
+
+        ``not on`` sets the event of the live this page started, and only that one
+        (compared by identity, never by the name, so a plugin called ``live`` is
+        not stopped), and returns at once. Ending a live view is not an emergency:
+        it never calls ``Microscope.stop()`` (STOP is that), never joins, takes no
+        lock (FM-70) and never raises, a closed page included.
+
+        Raises:
+            RuntimeError: ``on`` while an activity is going (``<name> is running``),
+                or the page is closed.
+        """
+        if on:
+            self._refuse_if_busy()
+            reason = self.lacks(Camera)
+            if reason is not None:
+                self._set_outcome(f"live: {reason}")
+                return
+            self._live_event = self._start_activity("live", self._live)
+            return
+        current = self._current_run
+        if current is not None and current[1] is self._live_event:
+            current[1].set()
+
+    @property
+    def is_live(self) -> bool:
+        """Whether the activity going is the live view ``live(True)`` started: what the button reads."""
+        current = self._current_run
+        return current is not None and current[1] is self._live_event
+
     def frame(self) -> Frame | None:
         """The latest frame, ``None`` before the first; the same for every session."""
         with self._lock:
             return self._frame
 
-    def _snap(self, event: threading.Event) -> str:
-        """One snap on the worker, and its outcome as text: no exception is kept (FM-98).
+    def _live(self, event: threading.Event) -> str:
+        """Frames until ``event`` is set or one fails, and the outcome as text.
 
-        Read as ``smc snap`` reads: the exposure, the frame, then the stand's
-        position and pixel size. The camera's array is copied: MMCore may hand out
-        a view of its own buffer, and the page keeps the frame for as long as a
-        session draws it.
+        The cap is a period: the wait is what is left of ``LIVE_PERIOD_S`` since the
+        frame began, so a camera slower than that runs at its own rate, and the wait
+        is on the event, so STOP ends it within one period (FM-83). A frame in flight
+        when the event is set completes and is kept. Nothing is logged inside the
+        loop (FM-62, FM-148): the start and the outcome are the log's.
         """
+        log.info("live: started from the plate page")
+        started = time.monotonic()
+        frames = 0
+        while not event.is_set():
+            began = time.monotonic()
+            taken = self._take_frame()
+            if isinstance(taken, str):
+                return f"live ended after {frames} frames: {taken}"
+            frames += 1
+            self._queue.put(
+                Progress(plugin="live", done=frames, total=None, message="frames")
+            )
+            event.wait(max(0.0, LIVE_PERIOD_S - (time.monotonic() - began)))
+        return f"live ended: {frames} frames in {time.monotonic() - started:.1f} s"
+
+    def _snap(self, event: threading.Event) -> str:
+        """One snap on the worker, and its outcome as text: no exception is kept (FM-98)."""
         log.info("snap: started from the plate page")
+        taken = self._take_frame()
+        if isinstance(taken, str):
+            return f"snap: {taken}"
+        return f"snap: {taken.summary}"
+
+    def _take_frame(self) -> Frame | str:
+        """One frame, kept as ``frame()`` and returned; or the failure as text, with no prefix.
+
+        The step a snap and a live view share. Read as ``smc snap`` reads: the
+        exposure, the frame, then the stand's position and pixel size. The camera's
+        array is copied: MMCore may hand out a view of its own buffer, and the page
+        keeps the frame for as long as a session draws it. It logs nothing: a live
+        view calls it ten times a second, and a console that blocks must not hold
+        the worker (FM-62, FM-148). A failure is text, never the exception (FM-98),
+        so no traceback keeps the facade, and so the core, alive.
+        """
         try:
             camera = self._microscope.require(Camera)
             exposure_ms = camera.exposure_ms()
@@ -816,7 +921,7 @@ class PlatePage:
                 and image.dtype.itemsize <= 2
             ):
                 return (
-                    f"snap: the camera returned a {image.dtype} frame of shape "
+                    f"the camera returned a {image.dtype} frame of shape "
                     f"{image.shape}; the page shows 2-D uint8 or uint16 frames"
                 )
             bit_depth = camera.bit_depth()
@@ -832,7 +937,7 @@ class PlatePage:
             xy_um = None if state.xy is None else (state.xy.x_um, state.xy.y_um)
             with self._lock:
                 previous = self._frame
-                self._frame = Frame(
+                taken = Frame(
                     number=1 if previous is None else previous.number + 1,
                     image=cast("npt.NDArray[np.uint8] | npt.NDArray[np.uint16]", kept),
                     bit_depth=bit_depth,
@@ -843,9 +948,10 @@ class PlatePage:
                     taken_utc=taken_utc,
                     summary=summary,
                 )
+                self._frame = taken
         except Exception as exc:
-            return f"snap: {type(exc).__name__}: {_one_line(exc)}"
-        return f"snap: {summary}"
+            return f"{type(exc).__name__}: {_one_line(exc)}"
+        return taken
 
     def stop(self) -> None:
         """Ask the run to stop, then stop the stand; say what the stop did, never "stopped" by default.
@@ -1115,7 +1221,7 @@ class PlatePage:
             blocked=self._blocked(doc),
             problems=(*problems, *self._plugin_problems()),
             cards={
-                tool.name: _card(doc.stages[tool.name])
+                tool.name: _card(doc.stages[tool.name], stale=doc.is_stale(tool.name))
                 for tool in self.tools()
                 if tool.name in doc.stages
             },
