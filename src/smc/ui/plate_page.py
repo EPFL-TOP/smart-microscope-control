@@ -3,8 +3,8 @@
 The only module besides the ``smc ui`` command that imports Panel and
 Bokeh. It holds no decision: a tap, a button and a typed range each call the
 controller, and an exception the controller raises for the operator's mistake is
-shown as its message and kept as nothing else (FM-98). Three rules the page
-keeps, each learned by measuring (m3 §15.3):
+shown as its message and kept as nothing else (FM-98). Four rules the page
+keeps, each learned by measuring (m3 §15.3, #277):
 
 * **The tick never rebuilds the view.** The periodic callback reads
   ``PlatePage.status()`` once a second and redraws the strip; the plate's wells
@@ -18,6 +18,11 @@ keeps, each learned by measuring (m3 §15.3):
   worker thread, which only fills a queue.
 * **A closed or reloaded tab does nothing.** The controller belongs to the
   server; a session's widgets and its periodic callback are the tab's.
+* **A handler is registered through ``PlatePageView._handler``**: Panel runs one
+  without the document lock when an event flushes a change it had queued (the
+  Enter of a text field), and the page's own Bokeh models are then written
+  outside the lock (FM-171). The periodic callbacks are locked and are not
+  wrapped.
 """
 
 from __future__ import annotations
@@ -660,7 +665,7 @@ class PlatePageView:
         it had queued: the Enter of a text field arrives with the field's change, and
         the watcher then writes the page's own Bokeh models (a ``ColumnDataSource``, a
         title) outside the lock, where Bokeh raises and the browser shows nothing
-        (#277, FM-161). ``pn.io.unlocked()`` is what Panel's widgets use for each of
+        (#277, FM-171). ``pn.io.unlocked()`` is what Panel's widgets use for each of
         their own writes; inside a locked callback it hands the events back to Bokeh,
         so it is safe for a tap and a click too. What a handler raises is a line of the
         page, not only a traceback in a console the operator does not read; ``Exception``
