@@ -136,12 +136,13 @@ def test_live_without_its_cap_runs_at_least_five_frames_a_second_on_the_demo_cam
     monkeypatch: pytest.MonkeyPatch,
     stall: bool,
 ) -> None:
-    # The demo camera snaps in 11 ms, measured on the macOS runner too (the gap after a
-    # stall). Five a second is 0.2 s a frame. The period is set to 0: that runner
-    # returns timed waits about 0.1 s late, which ran the capped loop at 4.5 a second
-    # (#311), so the cap's wait is proved on an owned clock in test_plate_page_controller
-    # and this test measures what the page does per frame. A stall moves one gap, and
-    # the case says no more than that.
+    # The demo camera snaps in about 11 ms (10.9 ms here; for the macOS runner inferred
+    # from the gap after the stall in the CI log of #311). Five a second is 0.2 s a
+    # frame. The period is set to 0: that runner returned timed waits about 0.1 s late
+    # (inferred, not probed), which ran the capped loop at 4.5 a second, so the cap's
+    # wait is proved on an owned clock in test_plate_page_controller and this test
+    # measures what the page does per frame. A stall moves one gap, and the case says
+    # no more than that.
     frames = 30
     monkeypatch.setattr(controller_module, "LIVE_PERIOD_S", 0.0)
     original = PlatePage._take_frame
@@ -163,9 +164,11 @@ def test_live_without_its_cap_runs_at_least_five_frames_a_second_on_the_demo_cam
     page = PlatePage(demo_microscope, tmp_path / "run.json", entry_points=[GOTO_WELL])
     try:
         page.live(True)
-        # A hang guard and not the measurement: thirty frames take well under a second.
+        # A hang guard and not the measurement: thirty frames at the frame step, and the
+        # 1.2 s stall of one case, are far below 30 s.
         assert page.join(30.0), f"{len(starts)} frames; {page.status().outcome}"
-        assert numbers == list(range(1, frames + 1))
+        # The outcome is the cause when a frame failed or live was refused.
+        assert numbers == list(range(1, frames + 1)), page.status().outcome
         per_frame_s = np.diff(starts).tolist()
         median_s = statistics.median(per_frame_s)
         assert median_s <= 0.2, f"median {median_s:.3f} s a frame in {per_frame_s}"

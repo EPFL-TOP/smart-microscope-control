@@ -489,7 +489,8 @@ class PlatePageView:
   conversion takes 0.8 ms and a new `source.data` 0.02 ms: nothing on the server
   limits 5 frames a second on the demo. The demo test measures the frame step
   with the cap's wait taken out, and the cap is proved on an owned clock,
-  because a timed wait returns late on the macOS runner (#311). What a browser
+  because a timed wait returned late on the macOS runner (inferred from CI logs,
+  not probed on it, #311). What a browser
   shows, locally and over RDP, is the owner's to measure, and is ADR-0006's
   revisit criterion for Panel.
 - Measured while planning #262 (2026-10-29, Python 3.13.0, the demo stand, a

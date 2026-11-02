@@ -2472,6 +2472,14 @@ def test_the_live_wait_is_what_is_left_of_the_period_since_the_frame_began(
     assert np.diff(camera.began).tolist() == pytest.approx([max(snap_s, 0.2)] * 4)
 
 
+def test_the_live_period_leaves_room_for_five_frames_a_second() -> None:
+    # #262's five a second is two bounds: the page's own work per frame (the demo test,
+    # with the period set to 0) and the period itself, which nothing else pins: the
+    # tests above set it to 0.2 or read it, and the tie in test_plate_page.py is
+    # skipped without the `ui` extra. The wait is proved on an owned clock above (#311).
+    assert LIVE_PERIOD_S <= 0.2
+
+
 def test_end_live_and_is_live_return_at_once_and_take_no_lock(
     page: PlatePage, fake_microscope: Microscope
 ) -> None:
