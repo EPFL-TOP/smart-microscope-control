@@ -192,9 +192,12 @@ button then says **End live**. While live goes the line under the strip reads
 is **one activity**, like a run: **Snap and every Run button are disabled**, a click on
 the map in drive mode is refused, and each says `live is running`. Live is never ended
 for them: end it with **End live**, which ends only the live view and **does not halt
-the stand** (it says `live ended: <n> frames in <s> s`). **STOP** ends it **and halts the
-stand**, as it halts a run (`live told to stop; stopped: the stand is halted (Resume
-clears the halt)`). A frame that fails, or that is not 2-D `uint8` or `uint16`, ends
+the stand** (it says `live ended: <n> frames in <s> s`). A click does what the button
+says, so a button that is a second out of date does not do the opposite: a stale
+*Live* in a second tab says `live is running` and leaves the first tab's live going, and
+a stale *End live* after a camera fault ends nothing and starts no new live. **STOP**
+ends it **and halts the stand**, as it halts a run (`live told to stop; stopped: the
+stand is halted (Resume clears the halt)`). A frame that fails, or that is not 2-D `uint8` or `uint16`, ends
 live with `live ended after <n> frames: <why>`, and the last good frame stays. Live is
 disabled with `this stand has no Camera` when the stand has none, and while another
 activity goes. **A closed or reloaded tab does not end live**: the page belongs to the
