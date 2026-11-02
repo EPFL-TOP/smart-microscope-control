@@ -2851,12 +2851,17 @@ log contradicted it.
 **E3. A give-up is not given up twice (item 4).** Measured: a Ctrl-C inside
 the *timeout's* give-up made `_move`'s outer `except` give up again, so two
 `stop()` were sent and the note said `accepted`, the second stop's. Now
-`gave_up` is set before the timeout's give-up, and a `BaseException` that
-escapes a give-up, on either path, is noted `interrupted` and propagates; no
-second stop is sent. The note is part of the fix: setting the flag alone
-leaves a cut stop with no note, and the Ctrl-C line would say "no move was
-under way". On the timeout path the cut Ctrl-C is the first, so the clause
-no longer says "second" (§11.6).
+`gave_up` goes up in the give-up's `registered` callback, right after the
+motion is registered and before the stop is sent, and a `BaseException` that
+escapes a give-up from that point, on either path, is noted `interrupted` and
+propagates; no second stop is sent. Not before the give-up: set there, the
+flag left a window (a Ctrl-C before the registration) in which no stop was sent
+and nothing was tracked, so `close()` could not retry (FM-168, the adversarial
+review of #224). A cut before the registration is not noted: the `except` gives
+up again, as it always did, and notes what that did. The note is part of the
+fix: setting the flag alone leaves a cut stop with no note, and the Ctrl-C
+line would say "no move was under way". On the timeout path the cut Ctrl-C is
+the first, so the clause no longer says "second" (§11.6).
 - Not chosen: *keeping the second stop as a retry*. It runs under the same
   hazard as the first, and `close()`, which every command runs on leaving
   its `with`, sends every stop again to what is still tracked as moving. The
