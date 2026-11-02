@@ -117,6 +117,11 @@ NO_LABEL = "(no label)"
 _PLATE_TAB = 0
 _IMAGE_TAB = 1
 
+#: The two labels of the live button: ``_draw_buttons`` draws them and ``on_live`` reads
+#: them, so that a click does what the button says (m5 §5.3, #287).
+_LIVE_LABEL = "Live"
+_END_LIVE_LABEL = "End live"
+
 NO_FRAME_TEXT = "no frame yet"
 
 log = logging.getLogger("smc.ui")
@@ -470,7 +475,7 @@ class PlatePageView:
         )
         self.forget_button = pn.widgets.Button(label="Forget")
         self.snap_button = pn.widgets.Button(label="Snap")
-        self.live_button = pn.widgets.Button(label="Live")
+        self.live_button = pn.widgets.Button(label=_LIVE_LABEL)
         self.snap_note = pn.pane.Str("", styles={"color": _WARNING})
         # ADR-0006's *Connect* (m5 §7.3): the one line that says why every control
         # that needs the stand is disabled while it is closed.
@@ -959,13 +964,18 @@ class PlatePageView:
     def on_live(self) -> None:
         """Start live, or end it, and show the *Image* tab when it starts.
 
-        Which of the two is read from the controller at the click (``is_live``, m5
-        §5.3), not from the label, which the last tick drew: a click in the second
-        before the label follows the state does what the state says now. Ending is
-        not STOP: the stand is not halted. A refusal is the page's message, as for
-        a run.
+        Which of the two is read from the label the button shows, not from the
+        controller at the click (m5 §5.3, #287): a click does what the button says,
+        and a button up to a second out of date must not do the opposite. A stale
+        *End live* after a camera fault, with no live running, ends nothing and
+        starts no new live on the camera that just failed (a live that another tab
+        started meanwhile is ended, as the label says: ``live(False)`` ends the
+        page's live, not the tab's); a stale *Live* in a second tab is the
+        controller's refusal (``live is running``) and does not end the first
+        tab's live. The tick that follows draws the label again. Ending is not STOP: the stand is
+        not halted. A refusal is the page's message, as for a run.
         """
-        starting = not self.page.is_live
+        starting = self.live_button.label != _END_LIVE_LABEL
         self._try(lambda: self.page.live(starting))
         if starting:
             self.tabs.active = _IMAGE_TAB
@@ -1357,7 +1367,7 @@ class PlatePageView:
         # While live goes its own button is the one that ends it; any other activity
         # leaves it nothing to do.
         live = self.page.is_live
-        self.live_button.label = "End live" if live else "Live"
+        self.live_button.label = _END_LIVE_LABEL if live else _LIVE_LABEL
         self.live_button.disabled = lacks is not None or (
             running is not None and not live
         )
