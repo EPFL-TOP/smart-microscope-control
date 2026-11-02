@@ -585,11 +585,15 @@ class PlatePageView:
             pn.pane.Bokeh(self.image_figure, sizing_mode="stretch_width"),
             sizing_mode="stretch_width",
         )
-        # Only the active tab is rendered, so a figure is never laid out hidden.
+        # Not dynamic: a dynamic tab destroys the figure's view when another tab is
+        # shown, and bokehjs's DataRange1d keeps the bounds of every view it has had,
+        # so the map was framed on the union of the plates it had drawn and neither
+        # Reset nor Refresh took the old ones out (#297). Bokeh keeps the view of a
+        # hidden tab, and its size, so no figure is laid out at zero size.
         self.tabs = pn.Tabs(
             ("Plate", plate_tab),
             ("Image", image_tab),
-            dynamic=True,
+            dynamic=False,
             sizing_mode="stretch_width",
         )
         left = pn.Column(

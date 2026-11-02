@@ -379,13 +379,16 @@ def test_a_flat_frame_is_drawn_against_the_cameras_own_bit_depth(
     assert (view.image_source.data["image"][0] == 0).all()
 
 
-def test_the_centre_has_a_plate_tab_and_an_image_tab_drawn_only_when_seen(
+def test_the_tabs_are_not_dynamic_so_the_plate_figure_keeps_its_view_and_its_frame(
     page: PlatePage,
 ) -> None:
     view = PlatePageView(page)
     assert list(view.tabs._names) == ["Plate", "Image"]
-    # Only the active tab is rendered, so a figure is never laid out hidden.
-    assert view.tabs.dynamic is True
+    # A dynamic tab destroys the figure's view when another tab is shown, and the
+    # figure's DataRange1d keeps the bounds of the dead view: the map is then framed
+    # on the union of every plate it drew, and Reset restores that (#297). Only
+    # /ui-check shows it (pytest has no browser): its `after-density` state.
+    assert view.tabs.dynamic is False
     assert view.tabs.active == 0
 
 
