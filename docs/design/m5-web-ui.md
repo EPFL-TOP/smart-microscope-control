@@ -446,9 +446,25 @@ class PlatePageView:
 
 - **Live** is a button beside Snap. Its label is `Live`, and `End live` while
   `page.is_live`; it is disabled with `lacks(Camera)`'s note on a stand without
-  a camera, and while an activity other than this live goes. A click calls
-  `page.live(not page.is_live)` (an exception's message is the page's message,
-  FM-98); starting it makes *Image* the active tab; then `tick()`.
+  a camera, and while an activity other than this live goes. **A click does
+  what the label it shows says** (#287), not what the controller's state is at
+  the click: the label is what the last tick drew, up to a second ago, and the
+  click reads it, `starting = self.live_button.label != "End live"`, then calls
+  `page.live(starting)` (an exception's message is the page's message, FM-98);
+  starting it makes *Image* the active tab; then `tick()`, which draws the label
+  again. The two labels are constants of the module, the one `_draw_buttons`
+  draws and the one the click reads. So a **stale *Live*** (another tab started
+  live less than a tick ago) is refused by the controller, `live is running`, and
+  does not end that tab's live; and a **stale *End live*** (live ended in the
+  last second: a frame that failed, another tab's *End live*) ends nothing and
+  starts nothing, in particular no live on the camera that just failed: the
+  outcome under the strip already says why it ended, and the redrawn label is
+  the answer to the click. Both were the opposite of the label while the click
+  read `page.is_live` (a `live ended after 0 frames: …` on a camera that had just
+  failed; the first tab's live ended by the second's click). Residual: the label
+  is the server's copy of what the browser draws, so a click made while a new
+  label is on its way acts on the newer one; not removable without a token in
+  the click.
 - **`frame_tick()`** calls `_draw_frame()` and nothing else: no `status()`, no
   `view()`. `build` registers it with `FRAME_TICK_MS` beside the tick
   (`TICK_MS`, unchanged), so a session has two periodic callbacks, both its
