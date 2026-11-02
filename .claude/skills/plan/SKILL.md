@@ -25,7 +25,11 @@ the plan, do what it unlocks (labels, dependents), and end the session.
    and name the entries this code must handle. A gap found later in review
    is a defect of the plan, not of the implementation.
 3. Check dependencies: which issues must be merged first, which run in
-   parallel and must not touch the same modules.
+   parallel and must not touch the same modules. Look at what is **in
+   flight now**, not only at the backlog: `gh pr list` and the issues
+   labelled `status: in-progress` or `status: ready`; name in **Do not run
+   at the same time** every one that edits the files this plan edits (#264's
+   plan missed #252's open PR on the same modules, and the branch conflicted).
 4. Post the plan as a comment, exactly in this format:
 
    ```markdown
