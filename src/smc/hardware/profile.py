@@ -48,6 +48,7 @@ __all__ = [
     "RolesSection",
     "SafetySection",
     "SampleSection",
+    "SuggestSection",
     "list_profiles",
     "search_paths",
 ]
@@ -675,6 +676,53 @@ class SampleSection(_Section):
         return value
 
 
+class SuggestSection(_Section):
+    """What this stand suggests for one plugin's run: its ``--param`` pairs and why (m5 §8.1).
+
+    One ``[suggest.<plugin>]`` table per plugin. The pairs are written as
+    ``smc run --param`` takes them, so the suggestion *is* the command's call
+    and the page runs exactly what it shows. This pure module imports no
+    plugin: it checks the pairs' shape only, and the page checks that the
+    plugin exists and takes those keys (m5 §8.3).
+    """
+
+    params: tuple[str, ...]
+    #: One line, because the page prints it on one line beside the values.
+    why: str
+
+    @field_validator("params")
+    @classmethod
+    def _params_are_pairs_with_distinct_keys(
+        cls, value: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        if not value:
+            raise ValueError(
+                "params needs at least one key=value item, as smc run --param takes it"
+            )
+        seen: set[str] = set()
+        for item in value:
+            key, separator, _ = item.partition("=")
+            if not separator or not key or any(c.isspace() for c in key):
+                raise ValueError(
+                    "each item of params is key=value, as smc run --param takes "
+                    f"it; got '{item}'"
+                )
+            if key in seen:
+                raise ValueError(f"'{key}' given twice")
+            seen.add(key)
+        return value
+
+    @field_validator("why")
+    @classmethod
+    def _why_is_one_line(cls, value: str) -> str:
+        if not value.strip() or "\n" in value or "\r" in value:
+            raise ValueError(
+                "why is one line that the page shows; give a non-empty text "
+                "without a newline"
+            )
+        return value
+
+
 class Profile(_Section):
     """One instrument's stand-specific facts, validated.
 
@@ -695,6 +743,9 @@ class Profile(_Section):
     #: ``None`` on every stand but the demo-sample one. After ``micromanager``:
     #: ``_sample_only_on_the_demo`` reads it from ``info.data``.
     sample: SampleSection | None = None
+    #: Per plugin name; allowed on every stand, since what a real stand
+    #: suggests is the owner's call after a session there (m5 §8.1).
+    suggest: dict[str, SuggestSection] = Field(default_factory=dict)
     source: Path | None = Field(default=None, exclude=True)
 
     @field_validator("sample")
@@ -1002,6 +1053,10 @@ _SECTIONS: dict[tuple[str, ...], type[BaseModel]] = {
 
 def _allowed_keys(section: tuple[str, ...]) -> str:
     model = _SECTIONS.get(section)
+    # `[suggest.<plugin>]`: the table's keys are plugin names, so any second
+    # part is one of them.
+    if model is None and len(section) == 2 and section[0] == "suggest":
+        model = SuggestSection
     if model is None:
         return ""
     keys = [k for k, f in model.model_fields.items() if not f.exclude]
