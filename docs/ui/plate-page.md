@@ -270,8 +270,20 @@ asks `Turn the turret to '<label>'? A turn can drive an objective into a loaded 
 check that the stage is clear. The autofocus is switched off and not engaged again.`
 Only **Turn the turret** turns it; **Cancel**, another choice, or a run starting in
 any tab takes the question back. An empty turret position is offered as `(no label)`.
-The choice starts at the objective in place and is never changed by the page after
-that: the strip says which objective is in place.
+The choice **follows the turret until the page has read the objective in place once**
+(a first read that fails is tried again on the next tick), and is yours after that: the
+page never changes it again, and the strip says which objective is in place. A turret
+whose positions could not be read at first (`objective: its positions could not be
+read`) is read again on every tick until they are offered, and the failure is logged
+once, not once a tick.
+
+On a command line the empty position is `smc objective set "" --confirm`. **In Windows
+PowerShell 5.1** an empty argument is dropped on its way to a program, so there it is
+`smc objective set '""' --confirm` (`cmd.exe` takes `""`). That is PowerShell's
+documented behaviour; it has not been run on a stand. Two turret positions that share a
+label, or two empty ones, are **one choice** in the select, and the layer addresses a
+position by its label too, so that limit is the layer's: whether Micro-Manager allows
+such labels on a real stand is not known yet.
 
 Each action is **one activity**, like a snap: it is disabled, and refused, while a run
 or a snap goes, and its result is the line under the strip (`stage jog: XY (100.00,
@@ -280,8 +292,15 @@ autofocus did not lock; it is off`, or the layer's refusal, such as the jog limi
 **While live goes, the drive controls work**: the live view runs the action between two
 frames, and the next frame shows where the stage went. One action waits at most: a
 second click while one waits is refused (`stage jog is waiting`), never queued. STOP,
-*End live*, Ctrl-C or a frame that fails **drop** an action that still waits: it is
-never sent, and live's last line says `; <action> was not run`. After STOP, a move, a
+*End live*, Ctrl-C or a frame that fails **drop** a move, a turn or an engage that still
+waits: it is never sent, and live's last line says `; <action> was not run`. **A waiting
+*Light off* or *Autofocus off* is run at the end instead**, after STOP too: switching off
+is the call the layer never refuses, halted or not, and it sends no move, so the light is
+not left on behind a STOP. Live's last line then says what it did:
+`live ended: 3 frames in 0.4 s; light off: light off`. **Live's last line keeps the last
+drive action's outcome** (`live ended: 2 frames in 0.1 s; stage jog: XY (100.00, -50.00)
+µm`): the earlier ones were under the strip while live went, and the log has every one.
+After STOP, a move, a
 turn, an engage and *Light on* are refused (`MicroscopeHaltedError: ...`); *Autofocus
 off* and *Light off* still run. A control is **disabled with the reason** when the stand
 lacks it, one line each under the region: `pad: this stand has no XYStage`, `objective:
@@ -350,7 +369,13 @@ attempt wrote to disk (a scan's frames) is kept either way.
 
 **Calibrating the plate.** Under `plate-registration`: centre a well under the objective
 by hand, click it on the map, press **Capture centre**; for a wall, put the objective on
-it, choose the side, press **Capture wall**. A second capture of the same well (and side)
+it, choose the side, press **Capture wall**. A capture records where the stage is, so it
+is **refused while the stage is about to move or moves**: while a drive action waits
+behind a frame or runs during live (`stage jog is waiting`, `stage jog is running`), and
+while a run, a snap or a connect goes (`<name> is running`; `goto-well` is a run). The
+buttons are greyed while an activity other than live goes; during live they stay usable
+and the refusal is the message. A live with no drive action handed to it does not refuse:
+a frame moves nothing. A second capture of the same well (and side)
 replaces the first; **Forget** drops the current well's captures. **Run
 plate-registration** then fits the plate from what was captured, as `smc run
 plate-registration --param refs=... --param walls=...` would. Choosing another plate
@@ -455,7 +480,11 @@ a mechanical shutter under auto-shutter, which opens and closes for every frame 
 **Drive** adds: the drive at a stand; which way the image moves for `↑` and `→`; a
 jog, a focus step and an engage on the Ti2-E while live goes, and how long a click
 waits for the frame in flight on a real exposure; a turret turn under a plate; *Light
-on* and *Light off* on the Ti2-E's `DiaLamp`; what the stand keeps on after the page
+on* and *Light off* on the Ti2-E's `DiaLamp`, and **a *Light off* clicked behind a frame,
+then STOP, on that lamp** (the layer runs the switch-off after the halt; the PFS's
+`disengage()` after a stop is not seen either); `smc objective set '""' --confirm` in
+Windows PowerShell 5.1; a turret with shared or empty labels in Micro-Manager; what the
+stand keeps on after the page
 or a command ends (the light, the autofocus: closing the stand switches nothing off);
 `Z +` and `Z −` with the autofocus locked on the Ti2-E (the relock may bring Z back to
 the offset's plane); and **a newcomer registering a plate on the `demo-sample` stand

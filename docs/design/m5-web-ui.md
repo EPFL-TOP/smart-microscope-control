@@ -963,8 +963,8 @@ Tests are named in #263's plan, and in #295's for the follow-ups above.
 **Failure modes**: FM-14, FM-12, FM-88, FM-89,
 FM-118, FM-117, FM-64, FM-98, FM-70, FM-44, FM-96, FM-73, FM-125, FM-147,
 FM-151, FM-155, FM-167, FM-36, FM-37, FM-32, FM-43, FM-45, FM-47, FM-161. #295
-adds, by the text of the checklist's entries it writes: a drop at STOP that also
-drops the safe call; a position recorded while a move waits or runs.
+adds FM-180 (a drop at STOP that also drops the safe call) and FM-181 (a position
+recorded while a move waits or runs).
 
 ## 7. The stand's lifetime and the service (#264)
 
