@@ -430,6 +430,66 @@ def test_light_lacks_is_none_when_the_read_fails_and_is_read_again(
     assert len(reads) == 1
 
 
+def test_a_failing_light_read_is_made_once_a_tick(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # The tick reads the light in status() and asks light_lacks() right after: a
+    # light that fails was read twice a tick (m5 §6.3, #295).
+    light = fake_microscope.require(LightSource)
+    reads: list[int] = []
+
+    def failing() -> bool | None:
+        reads.append(1)
+        raise HardwareError("the light did not answer")
+
+    with _replaced(light, "is_on", failing):
+        status = page.status()
+        assert page.light_lacks() is None
+        assert len(reads) == 1
+        # The next tick reads once more, and only once.
+        page.status()
+        assert page.light_lacks() is None
+        assert len(reads) == 2
+    assert [p for p in status.problems if p.startswith("light:")] == [
+        "light: HardwareError: the light did not answer"
+    ]
+    # The failure was no answer: the light is read again once it answers.
+    page.status()
+    assert page.light_lacks() == "the light source LED has no on/off that smc knows"
+
+
+def test_light_lacks_keeps_the_answer_status_read(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    light = fake_microscope.require(LightSource)
+    reads: list[int] = []
+
+    def no_on_off() -> bool | None:
+        reads.append(1)
+        return None
+
+    with _replaced(light, "is_on", no_on_off):
+        page.status()
+        assert page.light_lacks() == "the light source LED has no on/off that smc knows"
+        assert page.light_lacks() == "the light source LED has no on/off that smc knows"
+    assert len(reads) == 1
+
+
+def test_light_lacks_called_before_any_status_reads_for_itself(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    light = fake_microscope.require(LightSource)
+    reads: list[int] = []
+
+    def no_on_off() -> bool | None:
+        reads.append(1)
+        return None
+
+    with _replaced(light, "is_on", no_on_off):
+        assert page.light_lacks() == "the light source LED has no on/off that smc knows"
+    assert len(reads) == 1
+
+
 def test_objective_without_confirm_is_refused_by_the_layer(
     page: PlatePage, fake_microscope: Microscope
 ) -> None:

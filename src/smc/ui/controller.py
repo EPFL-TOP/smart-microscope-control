@@ -368,6 +368,16 @@ def _checkpoint_reason(name: str, status: StageStatus) -> str:
     )
 
 
+def _light_lacks_text(light: LightSource, on: bool | None) -> str | None:
+    """Why a light source whose ``is_on()`` read ``on`` cannot be switched on from the page, or ``None``.
+
+    ``None`` is a ``State`` device (the demo's ``LED``): smc knows no on/off for it.
+    """
+    if on is None:
+        return f"the light source {light.device()} has no on/off that smc knows"
+    return None
+
+
 def _flat(text: str) -> str:
     """``text`` on one line: its line breaks are spaces."""
     return " ".join(text.splitlines())
@@ -641,6 +651,9 @@ class PlatePage:
         self._drive_waiting: tuple[str, Callable[[], str]] | None = None
         # ``light_lacks()``'s answer, kept after the first read that did not raise.
         self._light_lacks_found: tuple[str | None] | None = None
+        # The facade whose light ``status()`` read and which raised: ``light_lacks()``
+        # does not read it again for that facade (one read a tick, m5 §6.3).
+        self._light_read_raised: Microscope | None = None
         self._closed = False
         self._ended = 0
         # A plain attribute, written by ``stop()`` and ``resume()``, which take no lock.
@@ -1089,6 +1102,7 @@ class PlatePage:
                 # A new facade is not halted, and its light is read again.
                 self._stop_note = None
                 self._light_lacks_found = None
+                self._light_read_raised = None
         if closed:
             try:
                 microscope.close()
@@ -1132,6 +1146,7 @@ class PlatePage:
         with self._lock:
             microscope, self._microscope = self._microscope, None
             self._light_lacks_found = None
+            self._light_read_raised = None
         if microscope is None:  # unreachable: only an activity drops it
             return f"disconnect: {NOT_CONNECTED}"
         try:
@@ -1448,6 +1463,11 @@ class PlatePage:
         after the first read that does not raise, since a device's type does not
         change while the stand is held; Connect and Disconnect forget it. It
         takes no lock: the page calls it.
+
+        One read a tick: ``status()`` reads ``is_on()`` on every tick and keeps
+        the answer of a read that did not raise (``_note_light_read``), so this
+        reads for itself only when no ``status()`` has read this stand's light,
+        and not at all for a stand whose last ``status()`` read raised.
         """
         microscope = self._microscope
         lack = self._lacks(microscope, LightSource)
@@ -1456,15 +1476,13 @@ class PlatePage:
         found = self._light_lacks_found
         if found is not None:
             return found[0]
+        if self._light_read_raised is microscope:
+            return None
         light = microscope.get(LightSource)
         if light is None:  # unreachable once lacks() said it is there
             return None
         try:
-            answer = (
-                f"the light source {light.device()} has no on/off that smc knows"
-                if light.is_on() is None
-                else None
-            )
+            answer = _light_lacks_text(light, light.is_on())
         except Exception:
             return None
         if self._microscope is microscope:
@@ -1472,6 +1490,36 @@ class PlatePage:
             # meanwhile has cleared the answer for its own stand.
             self._light_lacks_found = (answer,)
         return answer
+
+    def _note_light_read(
+        self,
+        microscope: Microscope,
+        light: LightSource,
+        on: bool | None,
+        *,
+        raised: bool,
+    ) -> None:
+        """What ``status()``'s own read of ``microscope``'s light tells ``light_lacks()`` (one read a tick).
+
+        A read that did not raise gives the answer, kept as ``light_lacks()`` keeps
+        its own; one that raised makes ``light_lacks()`` answer ``None`` without a
+        second read, until a read succeeds. Nothing is kept for a facade the page
+        let go of during the read: its Connect or Disconnect has cleared both for
+        its own stand.
+        """
+        if self._microscope is not microscope:
+            return
+        if raised:
+            self._light_read_raised = microscope
+            return
+        self._light_read_raised = None
+        if self._light_lacks_found is None:
+            try:
+                self._light_lacks_found = (_light_lacks_text(light, on),)
+            except Exception:
+                # ``device()`` failing is no reason to fail the tick: the answer is
+                # not kept, and ``light_lacks()`` reads for itself, as it always did.
+                return
 
     def jog_limits_um(self) -> tuple[float, float]:
         """The profile's XY and Z jog limits, in µm: what the page's steps are bounded by.
@@ -1622,6 +1670,9 @@ class PlatePage:
                     light_on = light.is_on()
                 except Exception as exc:
                     problems.append(f"light: {type(exc).__name__}: {_one_line(exc)}")
+                    self._note_light_read(microscope, light, None, raised=True)
+                else:
+                    self._note_light_read(microscope, light, light_on, raised=False)
             autofocus = (
                 describe_autofocus(state)
                 if microscope.has(Autofocus)
