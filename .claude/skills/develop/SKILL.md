@@ -68,6 +68,14 @@ them if it is not the one you run on.
    with the Write tool into your scratchpad, or into a `mktemp -d` directory
    created by a command on its own, and run them with `.venv/bin/python
    <file>`. Read `gh` output with `--json <fields>` and no filter.
+   Three recipes, each met by several sessions (#224, #248, #260, #263):
+   - **Save a GitHub comment to a file**: run `gh issue view N --comments`
+     (no redirection, no `--jq`), then Write what you read into the file.
+   - **Append to a test file**: Read it, then Edit with the last lines as the
+     anchor, or Write the whole file; never `cat >>` or a heredoc.
+   - **A second Edit of the same lines**: the PostToolUse formatter rewraps
+     a file after every Edit or Write, so Read the region again before you
+     edit it a second time (#213, #224).
 
 ## Implement
 
