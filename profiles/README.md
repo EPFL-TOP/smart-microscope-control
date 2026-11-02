@@ -84,6 +84,10 @@ group = ""                     # "" = the config group named for channels
 exclude = []                   # device labels a capture never records
 
 [quirks]                       # free-form, consumed by backends; documented per key in M2
+
+# [suggest.scan-plan]          # one table per plugin: what this stand suggests for its run
+# params = ["coverage=0.4"]    # smc run --param pairs, as written on the command line
+# why = "a few wells take seconds on the demo stage"   # one line
 ```
 
 | Key | Meaning |
@@ -109,6 +113,7 @@ exclude = []                   # device labels a capture never records
 | `light_source.intensity_property` | The `light_source` device's property that sets how bright, in the device's own units. Used when the device has it and it is writable; otherwise a WARNING, and the hints decide. `""`: the first writable numeric property whose name holds `intensity`, `brightness`, `power`, `level` or `voltage`, one with limits first. With none, the light source has no knob, and `set_intensity_native()` refuses. |
 | `channels.group` | The config group whose presets are channels; printable ASCII, no comma, no leading or trailing space. `""`: the core's channel group if its name holds `channel` and none of `camera`, `objective` or `system`, else the one group so named; with several, none (set this key). It may name a group that does not exist yet: the first `capture()` creates it. |
 | `channels.exclude` | Device labels that `capture()` never records (a `State` device that is not part of a channel). The objective turret is never recorded, listed or not. |
+| `suggest.<plugin>` | What this stand suggests for that plugin's run, shown by the plate page's next step: see [`[suggest]`](#suggest-what-the-stand-suggests-for-a-run). Allowed on every stand. |
 
 **A capture writes the configuration file.** `Channels.capture(name)` replaces
 the preset in the profile's `micromanager.config` file (an atomic text edit:
@@ -166,6 +171,30 @@ over a real stage would look like a working stand), with a plate that is not a `
 well plate, with a number that is out of its bounds or is a TOML boolean, and when
 `cells_per_well` times the plate's wells is above 50 000. `smc doctor -p demo-sample`
 says what the sample is and what it is not; `Profile.demo()` and `demo.toml` have none.
+
+## `[suggest]`: what the stand suggests for a run
+
+An optional table on any stand, one entry per plugin, that the plate page's **Next
+step** reads (`docs/design/m5-web-ui.md` §8.1). Stand-specific knowledge belongs in the
+profile and not in a plugin: which values make a tool useful on this stand, and why.
+
+```toml
+[suggest.scan-plan]
+params = ["coverage=0.4"]
+why = "a scan covers 40 % of each well, so that a few wells take seconds on the demo stage"
+```
+
+| Key | Meaning |
+| --- | --- |
+| `params` | At least one `key=value` item, written as `smc run --param` takes it: the suggestion **is** the command's call. A key has no space and is given once. The profile checks the shape only. |
+| `why` | One non-empty line, with no newline: the page prints it beside the values. |
+
+The table's keys are plugin names. That such a plugin exists and takes those keys is
+checked by the page when it is built: a wrong entry is a line under the page's problems
+and is ignored. A value is not checked there either; a value its plugin refuses is that
+run's own `ParamsError`. Only `demo-sample` has entries today (`coverage=0.4` for
+`scan-plan`, `detector=blobs` for `cells`); what a real stand suggests is the owner's
+call after a session there.
 
 ## Rebuilding a profile's configuration
 

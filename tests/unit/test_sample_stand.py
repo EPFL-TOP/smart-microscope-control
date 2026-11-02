@@ -29,6 +29,7 @@ from smc.hardware.errors import HardwareError, MicroscopeHaltedError, ProfileErr
 from smc.hardware.microscope import Microscope
 from smc.hardware.profile import Profile, SampleSection
 from smc.plugins.cells.detector import BlobDetector
+from smc.plugins.plate_registration.algorithm import calibrate, suggested_refs
 from smc.testing import FakeCore, FakeDevice
 from smc.testing.sample_stand import (
     CELL_INTENSITY,
@@ -39,6 +40,7 @@ from smc.testing.sample_stand import (
     install_sample,
     sample_lines,
     sample_of,
+    sample_refs,
     scatter_cells,
 )
 from smc.testing.synthetic import Blob, PlateSample
@@ -86,6 +88,69 @@ def test_sample_of_puts_a1_where_the_section_says_or_centres_the_plate() -> None
     assert centred.a1_center_xy_um == pytest.approx((-49_500.0, 31_500.0))
     placed = sample_of(SampleSection(a1_center_xy_um=(10.0, -20.0), cells_per_well=0))
     assert placed.a1_center_xy_um == (10.0, -20.0)
+
+
+# -- the references the page registers the plate from (m5 §8.2, #293) --------------
+
+_TURNED = SampleSection(a1_center_xy_um=(-40_000.0, 25_000.0), rotation_deg=3.0)
+_BIG_TURNED = SampleSection(plate="384-well", rotation_deg=-2.5)
+
+
+def test_sample_refs_are_the_plugins_suggested_wells() -> None:
+    refs = sample_refs(SampleSection())
+
+    assert (
+        [ref.well for ref in refs]
+        == list(suggested_refs("96-well"))
+        == [
+            "A1",
+            "A12",
+            "H1",
+        ]
+    )
+    # An unturned plate: A1 is where the section puts it, A12 eleven pitches to
+    # its right, H1 seven pitches below it (useq's own pitch is 9 mm).
+    a1_x, a1_y = centred_a1_um("96-well")
+    assert (refs[0].x_um, refs[0].y_um) == pytest.approx((a1_x, a1_y))
+    assert (refs[1].x_um, refs[1].y_um) == pytest.approx((a1_x + 99_000.0, a1_y))
+    assert (refs[2].x_um, refs[2].y_um) == pytest.approx((a1_x, a1_y - 63_000.0))
+
+
+def test_sample_refs_name_the_wells_of_a_384_well_plate_and_a_6_well_one() -> None:
+    assert [r.well for r in sample_refs(_BIG_TURNED)] == ["A1", "A24", "P1"]
+    assert [r.well for r in sample_refs(SampleSection(plate="6-well"))] == [
+        "A1",
+        "A3",
+        "B1",
+    ]
+
+
+@pytest.mark.parametrize("section", [_TURNED, _BIG_TURNED], ids=["96-3deg", "384"])
+def test_sample_refs_fit_back_to_the_sample(section: SampleSection) -> None:
+    # The page registers the plate from these: the plate it fits is the one the
+    # sample draws, A1 and rotation both, or the scan would image plastic.
+    fitted = calibrate(section.plate, sample_refs(section))
+
+    assert fitted.method == "references"
+    assert fitted.a1_center_xy_um == pytest.approx(
+        sample_of(section).a1_center_xy_um, abs=1e-6
+    )
+    assert fitted.rotation_deg == pytest.approx(section.rotation_deg, abs=1e-6)
+    assert fitted.residual_um is not None
+    assert fitted.residual_um < 1e-6
+    assert fitted.assumed == ()
+
+
+def test_a_reference_lies_inside_its_well_of_the_sample() -> None:
+    # Each centre is the sample's own: `well_at` is the ground truth of cells.
+    sample = sample_of(_without_cells(_TURNED))
+    for ref in sample_refs(_TURNED):
+        assert sample.well_at(ref.x_um, ref.y_um) == ref.well
+
+
+def _without_cells(section: SampleSection) -> SampleSection:
+    """The section without cells: ``sample_of`` then scatters nothing."""
+    return section.model_copy(update={"cells_per_well": 0})
 
 
 # -- the cells ---------------------------------------------------------------------
