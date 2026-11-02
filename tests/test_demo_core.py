@@ -3,13 +3,24 @@
 import logging
 import os
 import re
+import subprocess
+import sys
+import threading
 import weakref
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from smc.hardware.core import CoreError, new_core, open_core, opened
+from smc.hardware.core import (
+    CoreError,
+    close_core,
+    detach_callbacks,
+    new_core,
+    open_core,
+    opened,
+)
+from smc.testing.fakes import FakeCore
 
 pytestmark = pytest.mark.demo
 
@@ -98,7 +109,7 @@ def test_open_core_puts_extra_adapter_dirs_first(tmp_path: Path) -> None:
         # reaching them proves the directory that comes first does not hide them.
         assert len(core.getLoadedDevices()) > 1
     finally:
-        core.unloadAllDevices()
+        close_core(core)
 
 
 @pytest.mark.usefixtures("need_mm", "restored_path")
@@ -133,7 +144,7 @@ def test_open_core_sets_search_paths_before_loading(
         config = tmp_path / "scope.cfg"
         config.write_text("# no devices\n", encoding="utf-8")
     core = open_core(config, adapter_search_paths=[extra])
-    core.unloadAllDevices()
+    close_core(core)
     # Set after loading, the directory would be searched by nobody: the
     # adapters are found while the configuration loads.
     assert [paths[0] for paths in seen] == [str(extra)]
@@ -181,7 +192,7 @@ def test_new_core_searches_as_open_core_does_and_loads_no_device(
         # What a build walks into: nothing is loaded, not even the demo's devices.
         assert list(core.getLoadedDevices()) == ["Core"]
     finally:
-        core.unloadAllDevices()
+        close_core(core)
 
 
 @pytest.mark.usefixtures("restored_path")
@@ -211,7 +222,7 @@ def test_open_core_still_loads_the_demo_after_new_core_was_split_out(
         assert core.getCameraDevice()
         assert _search_paths(core)[0] == str(extra)
     finally:
-        core.unloadAllDevices()
+        close_core(core)
 
 
 @pytest.mark.usefixtures("need_mm", "restored_path")
@@ -238,7 +249,7 @@ def test_open_core_drops_duplicate_adapter_dirs(tmp_path: Path) -> None:
     try:
         assert _search_paths(core) == [str(extra), *default]
     finally:
-        core.unloadAllDevices()
+        close_core(core)
 
 
 @pytest.mark.usefixtures("need_mm", "restored_path")
@@ -250,7 +261,7 @@ def test_open_core_sees_one_directory_spelled_two_ways(tmp_path: Path) -> None:
         # The first spelling keeps the position; the second is the same folder.
         assert _search_paths(core) == [str(detour), *_default_search_paths()]
     finally:
-        core.unloadAllDevices()
+        close_core(core)
 
 
 @pytest.mark.usefixtures("need_mm", "restored_path")
@@ -264,7 +275,7 @@ def test_open_core_makes_each_adapter_dir_an_exact_path_entry(
     extra = _adapters_dir(tmp_path, "mm-2.0")
     monkeypatch.setenv("PATH", str(longer))
     core = open_core(None, adapter_search_paths=[extra])
-    core.unloadAllDevices()
+    close_core(core)
     assert str(extra) in os.environ["PATH"].split(os.pathsep)
 
 
@@ -276,7 +287,7 @@ def test_open_core_puts_the_adapter_dirs_on_path_in_search_order(
     first = _adapters_dir(tmp_path, "first")
     second = _adapters_dir(tmp_path, "second")
     core = open_core(None, adapter_search_paths=[first, second])
-    core.unloadAllDevices()
+    close_core(core)
     effective = _search_paths(core)
     assert effective[:2] == [str(first), str(second)]
     assert os.environ["PATH"].split(os.pathsep)[: len(effective)] == effective
@@ -290,7 +301,7 @@ def test_open_core_leaves_the_rest_of_path_alone(
     monkeypatch.setenv("PATH", os.pathsep.join(kept))
     extra = _adapters_dir(tmp_path)
     core = open_core(None, adapter_search_paths=[extra])
-    core.unloadAllDevices()
+    close_core(core)
     entries = os.environ["PATH"].split(os.pathsep)
     assert entries[len(_search_paths(core)) :] == kept
 
@@ -303,7 +314,7 @@ def test_open_core_logs_the_effective_search_paths(
     extra = _adapters_dir(tmp_path)
     with caplog.at_level(logging.INFO, logger="smc.hardware.core"):
         core = open_core(None, adapter_search_paths=[extra])
-    core.unloadAllDevices()
+    close_core(core)
     expected = "Micro-Manager adapter search paths, first wins: " + "; ".join(
         [str(extra), *default]
     )
@@ -319,7 +330,7 @@ def test_open_core_without_extra_dirs_keeps_the_default(
     default = _default_search_paths()
     with caplog.at_level(logging.INFO, logger="smc.hardware.core"):
         core = open_core(None)
-    core.unloadAllDevices()
+    close_core(core)
     assert _search_paths(core) == default
     # The same line on every open, so a stand's log always says what was searched.
     assert "first wins: " + "; ".join(default) in caplog.text
@@ -341,7 +352,7 @@ def test_open_core_without_extras_still_makes_the_install_an_exact_path_entry(
     default = _default_search_paths()
     monkeypatch.setenv("PATH", default[0] + "-old")
     core = open_core(None)
-    core.unloadAllDevices()
+    close_core(core)
     assert default[0] in os.environ["PATH"].split(os.pathsep)
 
 
@@ -352,7 +363,7 @@ def test_open_core_makes_a_relative_adapter_dir_absolute(
     _adapters_dir(tmp_path)
     monkeypatch.chdir(tmp_path)
     core = open_core(None, adapter_search_paths=["adapters"])
-    core.unloadAllDevices()
+    close_core(core)
     # A relative entry would follow the working directory at every later load.
     assert _search_paths(core)[0] == str(tmp_path / "adapters")
 
@@ -366,7 +377,7 @@ def test_open_core_expands_the_home_directory_of_an_adapter_dir(
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     core = open_core(None, adapter_search_paths=["~/adapters"])
-    core.unloadAllDevices()
+    close_core(core)
     assert _search_paths(core)[0] == str(tmp_path / "adapters")
 
 
@@ -691,7 +702,7 @@ def test_the_devices_of_the_failing_configs_load_when_the_file_is_valid(
     try:
         assert sorted(_devices_beyond_core(core)) == ["Cam", "Z"]
     finally:
-        core.unloadAllDevices()
+        close_core(core)
 
 
 @pytest.mark.usefixtures("need_mm", "restored_path")
@@ -705,7 +716,7 @@ def test_the_leftover_check_sees_a_device_that_stays_loaded() -> None:
         core.loadDevice("Cam", "DemoCamera", "DCam")
         assert _devices_beyond_core(core) == ["Cam"]
     finally:
-        core.unloadAllDevices()
+        close_core(core)
 
 
 @pytest.mark.usefixtures("need_mm", "restored_path")
@@ -754,3 +765,142 @@ def test_an_interrupt_during_open_is_not_a_core_error_and_frees_the_core(
     # Freed by reference count once the exception is handled; MMCore's
     # destructor then unloads the devices.
     assert refs[0]() is None
+
+
+# -- a core freed on its own notification thread (#311) -----------------------
+
+# MMCore delivers its callbacks on a thread of its own, so pymmcore-plus's relay
+# runs Python there and a garbage collection can start there. A core in a
+# reference cycle freed by that collection while one of its own notifications is
+# still being delivered aborts the process: the C++ destructor calls
+# registerCallback again and throws out of a destructor. The child holds the
+# core in a cycle, keeps the handler busy for 0.3 s, closes the core on the main
+# thread and drops every name, so the collection in the handler is the one that
+# frees it. It runs in a child because the abort takes the interpreter down.
+_FREED_WHILE_DELIVERING = """
+import gc
+import sys
+import threading
+import time
+
+from smc.hardware.core import close_core, open_core
+from smc.hardware.microscope import Microscope
+from smc.hardware.profile import Profile
+
+how = sys.argv[1]
+gc.disable()
+entered = threading.Event()
+
+if how == "close_core":
+    microscope = None
+    core = open_core(None)
+else:
+    microscope = Microscope.open(Profile.demo())
+    core = microscope.core
+
+
+def handler(*_args):
+    entered.set()
+    time.sleep(0.3)
+    gc.collect()
+
+
+core.events.exposureChanged.connect(handler)
+
+
+class Holder:
+    pass
+
+
+holder = Holder()
+holder.me = holder
+holder.core = core
+holder.microscope = microscope
+
+core.setExposure(12)
+assert entered.wait(5), "the notification never arrived"
+if microscope is None:
+    close_core(core)
+else:
+    microscope.close()
+del holder, handler, core, microscope
+time.sleep(1.0)
+print("survived")
+"""
+
+
+@pytest.mark.usefixtures("need_mm")
+@pytest.mark.parametrize("how", ["close_core", "Microscope.close"])
+def test_a_core_freed_while_it_delivers_a_notification_does_not_abort_the_process(
+    how: str,
+) -> None:
+    # Windows ends an abort with exit code 3 and POSIX with -6: only "0" is
+    # asserted, never a failure code (FM-44).
+    done = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _FREED_WHILE_DELIVERING,
+            how,
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=60,
+    )
+    why = (
+        f"the child ended with exit code {done.returncode}; "
+        f"stderr ends: {done.stderr[-400:]!r}"
+    )
+    assert done.returncode == 0, why
+    assert "survived" in done.stdout, why
+
+
+@pytest.mark.usefixtures("need_mm")
+def test_detaching_from_inside_a_callback_of_the_same_core_warns_and_returns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The one case where the wait cannot be done: MMCore refuses to unregister
+    # from inside its own handler. A warning, not an exception and not an abort.
+    core = open_core(None)
+    finished = threading.Event()
+    returned: list[bool] = []
+
+    def handler(*_args: Any) -> None:
+        detach_callbacks(core)
+        returned.append(True)
+        finished.set()
+
+    core.events.exposureChanged.connect(handler)
+    try:
+        with caplog.at_level(logging.WARNING, logger="smc.hardware.core"):
+            core.setExposure(12)
+            assert finished.wait(10), "the handler never ran"
+    finally:
+        # The handler holds the core, and the signal holds the handler.
+        core.events.exposureChanged.disconnect(handler)
+        close_core(core)
+    assert returned == [True]
+    warnings = [
+        (r.levelno, r.getMessage())
+        for r in caplog.records
+        if r.name == "smc.hardware.core" and r.levelno >= logging.WARNING
+    ]
+    assert len(warnings) == 1
+    level, message = warnings[0]
+    assert level == logging.WARNING
+    assert (
+        "Cannot call registerCallback from within an MMEventCallback handler" in message
+    )
+    assert "may abort the process if it is freed now" in message
+
+
+def test_detach_callbacks_leaves_a_core_that_is_not_mmcore_alone(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake = FakeCore()
+    with caplog.at_level(logging.DEBUG, logger="smc.hardware.core"):
+        detach_callbacks(fake)
+    assert fake.log == []
+    # Calling MMCore's method on a stand-in raises, and the guard would log it.
+    assert [r for r in caplog.records if r.name == "smc.hardware.core"] == []
