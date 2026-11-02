@@ -1081,15 +1081,24 @@ def test_a_sample_camera_outliving_its_microscope_refuses_to_snap(
 # --- smc ui plate (m3 §15.3, #197) ---------------------------------------------
 
 
+def _connected(page: Any) -> None:
+    """The operator's Connect: the page starts with the stand closed (m5 §7)."""
+    page.connect()
+    assert page.join(5)
+
+
 def _serve_returns(page: Any, *, port: int) -> None:
     """The operator's Ctrl-C, which ``serve`` takes: it returns."""
+    _connected(page)
 
 
 def _serve_ends_alone(page: Any, *, port: int) -> None:
+    _connected(page)
     raise PageServerError("the plate page's server stopped on its own")
 
 
 def _serve_has_a_bug(page: Any, *, port: int) -> None:
+    _connected(page)
     raise RuntimeError("a bug in the page")
 
 
@@ -1108,9 +1117,9 @@ def test_smc_ui_plate_that_ends_frees_its_core(
     serve: Callable[..., None],
     code: int,
 ) -> None:
-    # The page holds the facade and the stand-in `serve` is handed the page: neither
-    # may outlive the command in a cycle (FM-92, FM-98). The page module is a stand-in,
-    # so no Panel is needed.
+    # The page holds the facade that Connect opened on its worker, and the stand-in
+    # `serve` is handed the page: neither may outlive the command in a cycle (FM-92,
+    # FM-98). The page module is a stand-in, so no Panel is needed.
     module = types.ModuleType("smc.ui.plate_page")
     module.__dict__["serve"] = serve
     monkeypatch.setitem(sys.modules, "smc.ui.plate_page", module)

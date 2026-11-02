@@ -32,6 +32,7 @@ import smc.ui.controller as controller_module
 from smc.cli import app
 from smc.hardware import Microscope
 from smc.hardware.capabilities import Camera, XYStage
+from smc.hardware.errors import MicroscopeBusyError
 from smc.hardware.profile import Profile
 from smc.hardware.roles import Role
 from smc.plugins.api import PluginParams, PluginResult, RunContext, StopRequested
@@ -172,6 +173,13 @@ def closes(monkeypatch: pytest.MonkeyPatch) -> list[Microscope]:
     return closed
 
 
+def _connected(page: PlatePage) -> None:
+    """Connect, as the operator's click does: the page starts with the stand closed (m5 §7)."""
+    page.connect()
+    assert page.join(5)
+    assert page.connected, page.status().outcome
+
+
 def _plate(*args: str, doc: Path, port: int | None = None) -> Result:
     return runner.invoke(
         app,
@@ -262,40 +270,109 @@ def test_an_unreadable_run_document_is_refused_and_left_alone(
 # --- serving ----------------------------------------------------------------------------
 
 
-def test_ui_plate_hands_the_page_the_stand_and_releases_it_after(
+def test_ui_serves_with_the_stand_closed_and_releases_what_connect_opened(
     monkeypatch: pytest.MonkeyPatch,
     fake_stand: list[Microscope],
     closes: list[Microscope],
     tmp_path: Path,
 ) -> None:
-    seen: list[tuple[PlatePage, int, bool]] = []
+    seen: list[tuple[PlatePage, int, bool, int, int, bool]] = []
 
     def serve(page: PlatePage, *, port: int) -> None:
-        seen.append((page, port, bool(closes)))
+        closed_at_start, opened_at_start = not page.connected, len(fake_stand)
+        _connected(page)
+        seen.append(
+            (
+                page,
+                port,
+                closed_at_start,
+                opened_at_start,
+                len(fake_stand),
+                bool(closes),
+            )
+        )
 
     _stand_in(monkeypatch, serve)
     port = _free_port()
     result = _plate(doc=tmp_path / "run.json", port=port)
     assert result.exit_code == 0, result.output
-    [(page, served_port, closed_while_serving)] = seen
+    [(page, served_port, closed_at_start, before, after, closed_while_serving)] = seen
     assert isinstance(page, PlatePage)
     assert served_port == port
+    assert closed_at_start
+    assert (before, after) == (0, 1)
     assert not closed_while_serving
     assert closes == fake_stand
+    assert not page.connected
     assert not tmp_path.joinpath(
         "run.json"
     ).exists()  # the page writes nothing by itself
 
 
-def test_ui_plate_dry_run_opens_the_stand_dry(
+def test_ui_never_opens_the_stand_until_connect(
+    monkeypatch: pytest.MonkeyPatch, no_stand: None, tmp_path: Path
+) -> None:
+    served: list[bool] = []
+    _stand_in(monkeypatch, lambda page, *, port: served.append(page.connected))
+    result = _plate(doc=tmp_path / "run.json")
+    assert result.exit_code == 0, result.output
+    assert served == [False]
+
+
+def test_ui_dry_run_connects_the_stand_dry(
     monkeypatch: pytest.MonkeyPatch,
     fake_stand: list[Microscope],
     tmp_path: Path,
 ) -> None:
-    dry: list[bool] = []
-    _stand_in(monkeypatch, lambda page, *, port: dry.append(page._microscope.dry_run))
+    def serve(page: PlatePage, *, port: int) -> None:
+        _connected(page)
+
+    _stand_in(monkeypatch, serve)
     assert _plate("--dry-run", doc=tmp_path / "run.json").exit_code == 0
-    assert dry == [True]
+    assert [microscope.dry_run for microscope in fake_stand] == [True]
+
+
+def test_ui_prints_the_stop_refused_line_from_the_profile(
+    monkeypatch: pytest.MonkeyPatch, no_stand: None, tmp_path: Path
+) -> None:
+    profile = tmp_path / "refusing.toml"
+    profile.write_text(
+        '[microscope]\nname = "refusing"\n\n[safety]\nstop_refused_by = ["xy_stage"]\n',
+        encoding="utf-8",
+    )
+    _stand_in(monkeypatch, lambda page, *, port: None)
+    result = _plate("-p", str(profile), doc=tmp_path / "run.json")
+    assert result.exit_code == 0, result.output
+    assert (
+        "! the profile declares that this stand refuses stop() on xy_stage "
+        "([safety] stop_refused_by): once sent, a move runs to its target, and "
+        "Ctrl-C ends smc, not the move" in result.output.splitlines()
+    )
+    dry = _plate("-p", str(profile), "--dry-run", doc=tmp_path / "run.json")
+    assert dry.exit_code == 0, dry.output
+    assert "refuses stop()" not in dry.output
+
+
+def test_a_release_that_raises_is_reported_and_exits_1(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_stand: list[Microscope],
+    tmp_path: Path,
+) -> None:
+    def busy(self: Microscope) -> None:
+        raise MicroscopeBusyError("another call", 2.0, at_least=True)
+
+    def serve(page: PlatePage, *, port: int) -> None:
+        _connected(page)
+        monkeypatch.setattr(Microscope, "close", busy)
+
+    _stand_in(monkeypatch, serve)
+    result = _plate(doc=tmp_path / "run.json")
+    monkeypatch.undo()
+    for microscope in fake_stand:
+        microscope.close()
+    assert result.exit_code == 1, result.output
+    [line] = [line for line in result.output.splitlines() if line.startswith("✗ ")]
+    assert line == f"✗ {MicroscopeBusyError('another call', 2.0, at_least=True)}"
 
 
 def _ui(*args: str, doc: Path, port: int | None = None) -> Result:
@@ -314,7 +391,7 @@ def test_ui_and_ui_plate_serve_the_same_page(
     seen: list[tuple[type, Path, int, bool]] = []
 
     def serve(page: PlatePage, *, port: int) -> None:
-        seen.append((type(page), page._run_doc, port, page._microscope.dry_run))
+        seen.append((type(page), page._run_doc, port, page.status().dry_run))
 
     _stand_in(monkeypatch, serve)
     doc = tmp_path / "run.json"
@@ -327,7 +404,7 @@ def test_ui_and_ui_plate_serve_the_same_page(
     )
     assert after.exit_code == 0, after.output
     assert seen == [(PlatePage, doc, port, True)] * 3
-    assert len(closes) == 3
+    assert closes == []  # nothing connected, so nothing opened
 
 
 def test_ui_refuses_a_page_it_does_not_have(
@@ -381,7 +458,12 @@ def test_ui_plate_serves_the_demo_and_releases_the_stand(
     monkeypatch: pytest.MonkeyPatch, closes: list[Microscope], tmp_path: Path
 ) -> None:
     pages: list[PlatePage] = []
-    _stand_in(monkeypatch, lambda page, *, port: pages.append(page))
+
+    def serve(page: PlatePage, *, port: int) -> None:
+        _connected(page)
+        pages.append(page)
+
+    _stand_in(monkeypatch, serve)
     result = _plate(doc=tmp_path / "run.json")
     assert result.exit_code == 0, result.output
     assert [type(page) for page in pages] == [PlatePage]
@@ -396,14 +478,15 @@ DEMO_SAMPLE_TOML = Path(__file__).resolve().parents[1] / "profiles" / "demo-samp
 def test_ui_plate_on_demo_sample_serves_frames_that_follow_the_stage(
     monkeypatch: pytest.MonkeyPatch, closes: list[Microscope], tmp_path: Path
 ) -> None:
-    # The page is handed the facade `open` built from the profile, so the camera
-    # its tools snap is the sample's: plastic at the origin, a well at E7.
+    # Connect opens the facade `open` builds from the profile, so the camera its
+    # tools snap is the sample's: plastic at the origin, a well at E7.
     means: list[float] = []
 
     def serve(page: PlatePage, *, port: int) -> None:
-        camera = page._microscope.require(Camera)
+        _connected(page)
+        camera = page._stand().require(Camera)
         means.append(float(camera.snap().mean()))
-        page._microscope.require(XYStage).move_to_um(4500.0, -4500.0)
+        page._stand().require(XYStage).move_to_um(4500.0, -4500.0)
         means.append(float(camera.snap().mean()))
 
     _stand_in(monkeypatch, serve)
@@ -420,18 +503,13 @@ def test_ui_plate_on_demo_sample_serves_frames_that_follow_the_stage(
 class _SpyPage(PlatePage):
     """A page that says when it was closed, and loads a slow plugin besides the installed ones."""
 
-    closed: ClassVar[list[str]] = []
+    close_calls: ClassVar[list[str]] = []
     order: ClassVar[list[str]] = []
     plugins: ClassVar[tuple[type, ...]] = (Slow,)
 
-    def __init__(
-        self,
-        microscope: Microscope,
-        run_doc: Path,
-        *,
-        entry_points: Any = None,
-    ) -> None:
-        found = [
+    def _setup(self, *args: Any, **kwargs: Any) -> None:
+        # Both constructors (`PlatePage(...)` and `PlatePage.closed(...)`) call it.
+        kwargs["entry_points"] = [
             EntryPoint(
                 name=cast("Any", cls).name,
                 value=f"{__name__}:{cls.__name__}",
@@ -439,20 +517,20 @@ class _SpyPage(PlatePage):
             )
             for cls in _SpyPage.plugins
         ]
-        super().__init__(microscope, run_doc, entry_points=found)
+        super()._setup(*args, **kwargs)
 
     def stop(self) -> None:
         _SpyPage.order.append("stop")
         super().stop()
 
     def close(self) -> None:
-        _SpyPage.closed.append("close")
+        _SpyPage.close_calls.append("close")
         super().close()
 
 
 @pytest.fixture
 def spy_page(monkeypatch: pytest.MonkeyPatch) -> type[_SpyPage]:
-    _SpyPage.closed = []
+    _SpyPage.close_calls = []
     _SpyPage.order = []
     _SpyPage.plugins = (Slow, FailsOnStop, Stubborn)
     monkeypatch.setattr(controller_module, "PlatePage", _SpyPage)
@@ -490,13 +568,15 @@ def test_the_page_is_closed_whatever_ends_serve(
     line: str,
 ) -> None:
     def serve(page: PlatePage, *, port: int) -> None:
+        _connected(page)
         raise raises
 
     _stand_in(monkeypatch, serve)
     result = _plate(doc=tmp_path / "run.json")
     assert result.exit_code == code, result.output
     assert line in result.output.splitlines()
-    assert spy_page.closed == ["close"]
+    assert spy_page.close_calls == ["close"]
+    assert len(fake_stand) == 1
     assert closes == fake_stand
 
 
@@ -508,6 +588,7 @@ def test_a_run_that_is_going_when_the_server_ends_is_stopped_and_said_last(
     tmp_path: Path,
 ) -> None:
     def serve(page: PlatePage, *, port: int) -> None:
+        _connected(page)
         page.run("slow", [])
         assert Slow.started.wait(5)
 
@@ -523,6 +604,7 @@ def _starts(name: str) -> Callable[..., None]:
     """A stand-in ``serve`` that starts the run ``name`` and returns, as a Ctrl-C does."""
 
     def serve(page: PlatePage, *, port: int) -> None:
+        _connected(page)
         page.run(name, [])
         assert Slow.started.wait(5)
 
@@ -697,6 +779,9 @@ def test_a_second_ctrl_c_during_close_still_releases_the_stand(
     monkeypatch.setattr(controller_module, "PlatePage", Interrupted)
 
     def serve(page: PlatePage, *, port: int) -> None:
+        # The base class's join: this page's own raises the second Ctrl-C.
+        page.connect()
+        assert PlatePage.join(page, 5)
         page.run("slow", [])
         assert Slow.started.wait(5)
 
@@ -733,7 +818,15 @@ def test_smc_ui_help_says_what_it_serves_and_lists_its_options() -> None:
     result = runner.invoke(app, ["ui", "--help"])
     assert result.exit_code == 0, result.output
     text = _plain(result)
-    assert "Serve the plate page" in text
+    words = " ".join(text.split())  # the help is wrapped to the terminal's width
+    assert (
+        "Serve the plate page (needs the ui extra): connect the stand, click wells, "
+        "run the tools, snap a frame." in words
+    )
+    assert (
+        "The page starts with the stand closed: Connect opens the profile's stand "
+        "and Disconnect releases it, for NIS-Elements or ZEN." in words
+    )
     for option in ("--profile", "--run-doc", "--port", "--dry-run"):
         assert option in text
     # `ui` is a command, not a group of pages, and the page word is not offered.
