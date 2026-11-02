@@ -29,6 +29,7 @@ from smc.hardware.capabilities import (
     ZStage,
 )
 from smc.hardware.errors import HardwareError, SafetyRefusedError
+from smc.hardware.microscope import MicroscopeState, autofocus_known, describe_autofocus
 from smc.hardware.profile import Profile
 from smc.hardware.roles import Role
 from smc.testing import FakeCore
@@ -515,4 +516,93 @@ def test_an_autofocus_that_cannot_be_read_says_why(
         "autofocus ? (autofocus: HardwareError: autofocus 'PFS': cannot read)",
         reached=False,
     )
-    assert drive.autofocus_text(fake_microscope) == result.text
+    reading = drive.read_autofocus(fake_microscope)
+    assert reading == drive.AutofocusReading(result.text, None, False)
+
+
+class ReadsFailOverTwoLines(NeverLocks):
+    """An autofocus whose driver's message spans two lines, as a vendor's can."""
+
+    def is_engaged(self) -> bool:
+        raise HardwareError("line one\nline two")
+
+    def is_locked(self) -> bool:
+        raise HardwareError("line one\nline two")
+
+
+def test_an_autofocus_cause_reaches_the_text_on_one_line(
+    fake_microscope: Microscope,
+) -> None:
+    fake_microscope.override(Autofocus, ReadsFailOverTwoLines())
+
+    reading = drive.read_autofocus(fake_microscope)
+
+    # A one-line outcome (the page's strip, a command's last line) must not
+    # carry a driver's line break (FM-98).
+    assert reading.text == "autofocus ? (autofocus: HardwareError: line one line two)"
+    assert "\n" not in reading.text
+
+
+@pytest.mark.parametrize(
+    ("engaged", "locked", "words", "known"),
+    [
+        (None, None, "autofocus ?", False),
+        (None, False, "autofocus ?", False),
+        (None, True, "autofocus ?", False),
+        (False, None, "autofocus off", True),
+        (False, False, "autofocus off", True),
+        (False, True, "autofocus off", True),
+        (True, None, "autofocus ?", False),
+        (True, False, "autofocus on, not locked", True),
+        (True, True, "autofocus locked", True),
+    ],
+)
+def test_autofocus_known_is_false_exactly_when_describe_says_unknown(
+    engaged: bool | None, locked: bool | None, words: str, known: bool
+) -> None:
+    state = MicroscopeState(autofocus_engaged=engaged, autofocus_locked=locked)
+
+    assert describe_autofocus(state) == words
+    assert autofocus_known(state) is known
+    # The two are one rule: a decision reads the field, the words follow it.
+    assert known == (words != "autofocus ?")
+
+
+def test_disengage_is_reached_from_the_state_and_not_from_the_words(
+    fake_microscope: Microscope, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # FM-155: rewording describe_autofocus must not flip a ``reached``.
+    monkeypatch.setattr(drive, "describe_autofocus", lambda state: "autofocus gone")
+
+    result = drive.disengage_autofocus(fake_microscope)
+
+    assert result == DriveResult("autofocus gone")
+
+
+def test_engage_that_did_not_lock_says_it_is_off_from_the_state(
+    fake_microscope: Microscope, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_microscope.override(Autofocus, NeverLocks())
+    monkeypatch.setattr(drive, "describe_autofocus", lambda state: "autofocus gone")
+
+    result = drive.engage_autofocus(fake_microscope)
+
+    assert result == DriveResult("autofocus did not lock; it is off", reached=False)
+
+
+def test_read_autofocus_reads_the_state_once(
+    fake_microscope: Microscope, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reads: list[None] = []
+    real = fake_microscope.state
+
+    def counted() -> MicroscopeState:
+        reads.append(None)
+        return real()
+
+    monkeypatch.setattr(fake_microscope, "state", counted)
+
+    reading = drive.read_autofocus(fake_microscope)
+
+    assert reading == drive.AutofocusReading("autofocus off", False, True)
+    assert len(reads) == 1

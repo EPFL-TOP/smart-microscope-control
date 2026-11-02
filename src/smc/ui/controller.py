@@ -50,6 +50,7 @@ from smc.hardware.capabilities import (
     ZStage,
 )
 from smc.hardware.errors import HardwareError, StopRefusedError
+from smc.hardware.microscope import describe_autofocus
 from smc.hardware.safety import DEFAULT_MAX_Z_JOG_UM
 from smc.plugins import (
     ParamsError,
@@ -365,17 +366,6 @@ def _checkpoint_reason(name: str, status: StageStatus) -> str:
         f"--resume` (close this page first); `smc run {name}` without --resume "
         f"starts afresh and drops it"
     )
-
-
-def _autofocus_words(engaged: bool | None, locked: bool | None) -> str:
-    """The words of ``Microscope.describe``: ``?`` whenever a read the answer needs is unknown."""
-    if engaged is None:
-        return "autofocus ?"
-    if not engaged:
-        return "autofocus off"
-    if locked is None:
-        return "autofocus ?"
-    return "autofocus locked" if locked else "autofocus on, not locked"
 
 
 def _flat(text: str) -> str:
@@ -1632,7 +1622,7 @@ class PlatePage:
                 except Exception as exc:
                     problems.append(f"light: {type(exc).__name__}: {_one_line(exc)}")
             autofocus = (
-                _autofocus_words(state.autofocus_engaged, state.autofocus_locked)
+                describe_autofocus(state)
                 if microscope.has(Autofocus)
                 else "no autofocus"
             )

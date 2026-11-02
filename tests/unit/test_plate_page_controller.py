@@ -83,7 +83,6 @@ from smc.ui.controller import (
     PAGE_PARAMS,
     CheckItem,
     PlatePage,
-    _autofocus_words,
 )
 from smc.ui.frames import Frame
 
@@ -1268,22 +1267,6 @@ def test_status_reads_the_stand(page: PlatePage, fake_microscope: Microscope) ->
     assert status.stop_note is None
     assert status.stop_refused == ()
     assert status.problems == ()
-
-
-@pytest.mark.parametrize(
-    ("engaged", "locked", "words"),
-    [
-        (None, None, "autofocus ?"),
-        (None, True, "autofocus ?"),
-        (True, None, "autofocus ?"),
-        (False, None, "autofocus off"),
-        (False, True, "autofocus off"),
-        (True, False, "autofocus on, not locked"),
-        (True, True, "autofocus locked"),
-    ],
-)
-def test_autofocus_words(engaged: bool | None, locked: bool | None, words: str) -> None:
-    assert _autofocus_words(engaged, locked) == words
 
 
 def test_status_says_no_autofocus_without_the_capability(

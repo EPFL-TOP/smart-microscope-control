@@ -39,11 +39,11 @@ from typing_extensions import assert_never
 from smc import __version__
 from smc.drive import (
     DriveResult,
-    autofocus_text,
     disengage_autofocus,
     engage_autofocus,
     jog_xy,
     jog_z,
+    read_autofocus,
     set_objective,
     switch_light,
     xy_text,
@@ -1675,12 +1675,12 @@ def autofocus_get(ctx: typer.Context, profile: ProfileOption = DEMO_NAME) -> Non
     """Print whether the autofocus is off, on, or locked; a read that fails exits 1 with its cause."""
     with _Reported(ctx), Microscope.open(profile) as microscope:
         microscope.require(Autofocus)
-        words = autofocus_text(microscope)
-    if words.startswith("autofocus ?"):
+        reading = read_autofocus(microscope)
+    if not reading.known:
         # Unknown is not off: a script must not read it as a state (as `smc z get`).
-        _fail(words)
+        _fail(reading.text)
         raise typer.Exit(code=_EXIT_ERROR)
-    _say(words)
+    _say(reading.text)
 
 
 @autofocus_app.command("engage")

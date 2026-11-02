@@ -25,18 +25,19 @@ from smc.hardware.capabilities import (
     XYStage,
     ZStage,
 )
-from smc.hardware.microscope import describe_autofocus
+from smc.hardware.microscope import autofocus_known, describe_autofocus
 
 if TYPE_CHECKING:
     from smc.hardware.microscope import Microscope
 
 __all__ = [
+    "AutofocusReading",
     "DriveResult",
-    "autofocus_text",
     "disengage_autofocus",
     "engage_autofocus",
     "jog_xy",
     "jog_z",
+    "read_autofocus",
     "set_objective",
     "switch_light",
     "um_text",
@@ -60,6 +61,20 @@ class DriveResult:
 
     text: str
     reached: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class AutofocusReading:
+    """What one read of the autofocus says, and what a decision may be made from.
+
+    ``engaged`` is the state's field (``None`` when the read failed) and ``known``
+    is ``autofocus_known`` of the same state; ``text`` is for the operator and is
+    never compared (FM-155).
+    """
+
+    text: str
+    engaged: bool | None
+    known: bool
 
 
 def um_text(value: float) -> str:
@@ -146,20 +161,28 @@ def set_objective(microscope: Microscope, label: str, *, confirm: bool) -> Drive
     return DriveResult(f"objective {current!r}")
 
 
-def autofocus_text(microscope: Microscope) -> str:
-    """``describe_autofocus`` of a fresh read; an unknown state says why it is unknown.
+def read_autofocus(microscope: Microscope) -> AutofocusReading:
+    """One fresh read of the autofocus: its words, and the fields a decision is made from.
 
     ``state()`` keeps a failed read as an error and the words say only ``autofocus
-    ?``: the cause follows in brackets, once, so the operator gets a finding and not
-    a question mark (CLAUDE.md: failures are findings).
+    ?``: when the state is not ``known`` the causes follow in brackets, once each and
+    each on one line (a driver's message may span several, and an outcome is one
+    line, FM-98), so the operator gets a finding and not a question mark (CLAUDE.md:
+    failures are findings). A caller decides from ``engaged`` and ``known``, never
+    from ``text`` (FM-155).
     """
     state = microscope.state()
-    words = describe_autofocus(state)
-    if words == "autofocus ?":
-        causes = [e for e in state.errors if e.startswith("autofocus:")]
+    known = autofocus_known(state)
+    text = describe_autofocus(state)
+    if not known:
+        causes = [
+            " ".join(error.split())
+            for error in state.errors
+            if error.startswith("autofocus:")
+        ]
         if causes:
-            words += f" ({'; '.join(dict.fromkeys(causes))})"
-    return words
+            text += f" ({'; '.join(dict.fromkeys(causes))})"
+    return AutofocusReading(text, state.autofocus_engaged, known)
 
 
 def engage_autofocus(microscope: Microscope) -> DriveResult:
@@ -174,17 +197,17 @@ def engage_autofocus(microscope: Microscope) -> DriveResult:
     locked = microscope.require(Autofocus).engage()
     if microscope.dry_run:
         return DriveResult(
-            f"[dry-run] would engage the autofocus; {autofocus_text(microscope)}"
+            f"[dry-run] would engage the autofocus; {read_autofocus(microscope).text}"
         )
     if locked:
         return DriveResult("autofocus locked")
     # ``False`` means off by the capability's contract, but a search left running
     # drives Z: what the stand reads is said, never what the contract promises
     # (FM-155).
-    now = autofocus_text(microscope)
-    if now == "autofocus off":
+    now = read_autofocus(microscope)
+    if now.engaged is False:
         return DriveResult("autofocus did not lock; it is off", reached=False)
-    return DriveResult(f"autofocus did not lock; {now}", reached=False)
+    return DriveResult(f"autofocus did not lock; {now.text}", reached=False)
 
 
 def disengage_autofocus(microscope: Microscope) -> DriveResult:
@@ -194,13 +217,13 @@ def disengage_autofocus(microscope: Microscope) -> DriveResult:
         CapabilityMissingError: The stand has no autofocus.
     """
     microscope.require(Autofocus).disengage()
-    words = autofocus_text(microscope)
+    now = read_autofocus(microscope)
     # Switching off is sent in dry run, so what the stand reads after it is a
     # readback in both modes, and an autofocus still on is not reached in either.
-    reached = words == "autofocus off"
+    reached = now.engaged is False
     if microscope.dry_run:
-        return DriveResult(words + _OFF_IN_DRY_RUN, reached=reached)
-    return DriveResult(words, reached=reached)
+        return DriveResult(now.text + _OFF_IN_DRY_RUN, reached=reached)
+    return DriveResult(now.text, reached=reached)
 
 
 def switch_light(microscope: Microscope, on: bool) -> DriveResult:
