@@ -310,6 +310,7 @@ what the result **assumed**
 (at most eight, then `… n more`, each cut at 600 characters) and the error (cut at 600
 characters too). Where the result is: each `file` and `folder` the result names, as an
 indented `file: <absolute path>` line (a relative one is under the run document's folder;
+an absolute one is shown as written, in whichever OS's style the run document holds it;
 each is cut at 600 characters), or an indented `in the run document` when it names none:
 **every result card says where its result is**. The page shows the path and never opens it: open it
 from the PC. A card is a summary, bounded whatever the record holds: the run

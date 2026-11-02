@@ -11,6 +11,8 @@ asserted whole (FM-45), and the pairs a step shows are read back through
 from __future__ import annotations
 
 import shlex
+import subprocess
+import sys
 from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import EntryPoint
@@ -112,7 +114,8 @@ class Registration(Tool):
 class Finding(Tool):
     name = "plate-finding"
     provides = "plate"
-    summary = "A test finder."
+    # Two lines, as a third party's summary may be: a step's line holds one.
+    summary = "A test finder.\nIt surveys the plate."
 
 
 class Calibration(Tool):
@@ -463,7 +466,7 @@ def test_the_step_names_the_other_tools_of_its_slot(
     step = make_page(tools=(*WORKFLOW, Finding)).view().next_step
     assert step is not None
     assert step.plugin == "plate-registration"
-    assert step.why[-1] == "or plate-finding: A test finder."
+    assert step.why[-1] == "or plate-finding: A test finder. It surveys the plate."
     # Only the plate has another way: the scan plan has none.
     assert not any(line.startswith("or ") for line in make_page().view().next_step.why)  # type: ignore[union-attr]
 
@@ -646,6 +649,37 @@ def test_a_suggested_key_is_a_key_row_with_its_value(
     assert suggested["cells"] == plain["cells"]
 
 
+def test_a_suggestion_of_a_key_that_is_already_a_key_row_is_one_row(
+    make_page: Callable[..., PlatePage],
+) -> None:
+    # What the shipped demo-sample suggests: `coverage` of scan-plan and `detector`
+    # of cells are lines of KEY_PARAMS already. A second row would be the same field
+    # twice in the column.
+    profile = _profile(
+        suggest={
+            "scan-plan": {"params": ["coverage=0.4"], "why": "fast"},
+            "cells": {"params": ["detector=blobs"], "why": "spots"},
+        }
+    )
+    tools = {t.name: t for t in make_page(profile).tools()}
+    assert [row[0] for row in tools["scan-plan"].key] == ["overlap", "coverage"]
+    assert [row[0] for row in tools["cells"].key] == ["detector", "score_threshold"]
+    assert tools["scan-plan"].suggested == (("coverage", "0.4"),)
+    assert tools["cells"].suggested == (("detector", "blobs"),)
+
+
+def test_a_suggested_value_may_hold_an_equals_sign(
+    make_page: Callable[..., PlatePage],
+) -> None:
+    # `parse_params` splits at the first `=`: the value is whatever follows, so the
+    # controller reads the key the same way, and does not call `a=b` a parameter.
+    profile = _profile(suggest={"scan": {"params": ["label=a=b"], "why": "x"}})
+    page = make_page(profile)
+    assert page.view().problems == ()
+    (scan,) = [t for t in page.tools() if t.name == "scan"]
+    assert scan.suggested == (("label", "a=b"),)
+
+
 # --- blocked: the reason that holds first -----------------------------------------------
 
 
@@ -782,3 +816,36 @@ def test_running_the_step_records_the_params_its_command_names(
     after = page.view().next_step
     assert after is not None
     assert after.plugin == "scan-plan"
+
+
+def test_a_page_loads_smc_testing_only_for_a_profile_with_a_sample() -> None:
+    # `smc.testing` is a stand-in for a stand (FakeCore, a synthetic plate): a real
+    # stand's page must not load it, so the controller imports `sample_stand` inside the
+    # step that reads a `[sample]`. In a fresh interpreter, since another test may have
+    # imported it, and with a positive control: the same page does load it for a sample.
+    code = (
+        "import sys, tempfile\n"
+        "from pathlib import Path\n"
+        "from smc.hardware.profile import Profile\n"
+        "from smc.ui.controller import PlatePage\n"
+        "with tempfile.TemporaryDirectory() as tmp:\n"
+        "    run_doc = Path(tmp) / 'run.json'\n"
+        "    bare = PlatePage.closed(Profile.demo(), run_doc)\n"
+        "    step = bare.view().next_step\n"
+        "    assert step is not None and step.plugin == 'plate-registration', step\n"
+        "    assert 'smc.testing' not in sys.modules, 'loaded without a sample'\n"
+        "    named = {'microscope': {'name': 's'}, 'sample': {}}\n"
+        "    sampled = PlatePage.closed(Profile.model_validate(named), run_doc)\n"
+        "    assert sampled.view().next_step is not None\n"
+        "    assert 'smc.testing.sample_stand' in sys.modules, 'not loaded for a sample'\n"
+    )
+    # No `-I`: the interpreter keeps PYTHONPATH, so it imports the code under test
+    # (`scripts/dev/mutant.py` puts a copy's `src` there) and not another checkout's.
+    done = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    assert done.returncode == 0, done.stderr

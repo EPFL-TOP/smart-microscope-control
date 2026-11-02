@@ -31,7 +31,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import EntryPoint
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
 
 import numpy as np
@@ -408,20 +408,30 @@ def _value_line(key: str, value: object) -> str:
     return f"{label}: {type(value).__name__}"
 
 
-def _file_path(value: str, run_dir: Path | None) -> str:
-    """Where a result's ``file`` is: an absolute path as it is, a relative one under the run folder.
+def _file_path(value: str, run_dir: PurePath | None) -> str:
+    """Where a result's ``file`` is: an absolute path as written, a relative one under the run folder.
 
     The plugins write a relative one (``report/<token>.html``) beside the run
     document, which is the folder ``ctx.run_dir`` names; ``nis-export --param out=``
-    writes an absolute one, which ``/`` keeps as it is (pathlib drops the left side
-    for an absolute right one). The path is shown, never opened or checked: a card
-    reads the document only. With no run folder (a card built alone) it is as written.
+    writes an absolute one, as POSIX text (``/data/p.xml``) whatever the OS it ran
+    on. A run document moves between PCs, so a value that is absolute in *either*
+    flavour is shown as written: joined on Windows, ``/data/p.xml`` is rooted
+    but not absolute there, and the run folder's drive would be put in front of
+    it, naming a path that does not exist. The path is shown, never opened or
+    checked: a card reads the document only. With no run folder (a card built
+    alone) it is as written.
     """
-    return value if run_dir is None else str(run_dir / value)
+    if (
+        run_dir is None
+        or PurePosixPath(value).is_absolute()
+        or PureWindowsPath(value).is_absolute()
+    ):
+        return value
+    return str(run_dir / value)
 
 
 def _card(
-    record: StageRecord, *, stale: bool = False, run_dir: Path | None = None
+    record: StageRecord, *, stale: bool = False, run_dir: PurePath | None = None
 ) -> ResultCard:
     """The card of ``record``; its values only when it ended ``done`` (FM-154).
 

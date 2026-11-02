@@ -33,7 +33,7 @@ from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import EntryPoint
-from pathlib import Path
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from types import SimpleNamespace
 from typing import Any, ClassVar, cast
 
@@ -2879,6 +2879,49 @@ def test_a_card_made_without_a_run_folder_shows_the_file_as_written(
     assert controller_module._card(record, run_dir=folder).files == (
         f"file: {folder / 'report' / 't1.html'}",
     )
+
+
+@pytest.mark.parametrize(
+    ("value", "shown"),
+    [
+        # Absolute in the flavour of the PC that wrote it: shown as written, never
+        # joined to this run folder (on Windows `/data/p.xml` is rooted, not absolute,
+        # and the run folder's drive would invent `C:\data\p.xml`).
+        ("/data/exports/p.xml", "/data/exports/p.xml"),
+        ("D:/export/p.xml", "D:/export/p.xml"),
+        ("//srv/share/p.xml", "//srv/share/p.xml"),
+        # Relative: under the run folder, in the separators of this PC.
+        ("report/t1.html", None),
+    ],
+)
+@pytest.mark.parametrize("flavour", [PureWindowsPath, PurePosixPath])
+def test_a_file_in_either_flavour_is_shown_as_written_and_a_relative_one_is_joined(
+    flavour: type[PurePath], value: str, shown: str | None
+) -> None:
+    # By flavour, not by this OS: every runner proves both (FM-24).
+    run_dir = flavour("C:/runs/exp1" if flavour is PureWindowsPath else "/runs/exp1")
+    expected = str(run_dir / value) if shown is None else shown
+    assert controller_module._file_path(value, run_dir) == expected
+    if shown is None:
+        assert expected.startswith(str(run_dir))
+
+
+def test_the_run_documents_path_is_absolute_not_resolved(
+    fake_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # What the operator copies is the path as the command was given it: a link in the
+    # run folder's path stays a link (m5 §8.4).
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(real, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("this PC cannot make a symbolic link")
+    monkeypatch.chdir(tmp_path)
+    page = _page(fake_microscope, Path("link") / "run.json")
+    assert page.run_doc == tmp_path.absolute() / "link" / "run.json"
+    assert page.run_doc != real.resolve() / "run.json"
 
 
 def test_the_run_documents_path_is_absolute_and_the_cards_files_follow_it(

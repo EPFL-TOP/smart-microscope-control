@@ -39,7 +39,7 @@ from smc.run import RunDocument, StageRecord, StageStatus, write_stage
 from smc.testing import FakeCore
 from smc.ui.controller import NOT_CONNECTED, PlatePage
 from smc.ui.guide import NextStep
-from smc.ui.plate_page import PlatePageView, next_step_text
+from smc.ui.plate_page import _WARNING, PlatePageView, next_step_text
 
 pytestmark = [
     pytest.mark.filterwarnings(
@@ -322,6 +322,41 @@ def test_the_next_step_region_heads_the_right_column(
     assert view.next_button.visible
     assert not view.next_button.disabled
     assert view.next_note.object == ""
+    # The reason a step cannot run is in the warning colour, as a tool's own note is.
+    assert view.next_note.styles["color"] == _WARNING
+
+
+class SlowScanPlan(ScanPlan):
+    """The scan plan, held until released: the run the Next button starts goes on."""
+
+    def run(self, microscope: Any, params: Any, ctx: RunContext) -> NoResult:
+        Slow.started.set()
+        while not Slow.release.is_set():
+            ctx.wait_s(0.05)
+        return NoResult()
+
+
+def test_a_click_on_the_next_button_draws_the_run_at_once(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # As every Run handler, `on_next` ends with a tick: the strip, the buttons and the
+    # activity follow the click, not the periodic callback up to a second later, so a
+    # second click is met by a disabled button and not only by the controller.
+    _seed_plate(run_doc)
+    page = make_page(tools=(Registration, SlowScanPlan))
+    view = PlatePageView(page)
+    page.select_text("B2")
+    view.refresh()
+    assert not view.next_button.disabled
+    assert view.run_text.object == "connect: demo-sample connected, 13 devices"
+    _click(view.next_button)
+    try:
+        assert Slow.started.wait(5)
+        assert view.run_text.object == "scan-plan is running"
+        assert view.next_button.disabled
+    finally:
+        Slow.release.set()
+        assert page.join(10.0)
 
 
 def test_the_next_button_runs_the_pairs_it_drew(
@@ -442,15 +477,51 @@ def test_the_next_steps_stage_opens_and_others_stay_open(
     assert view.accordion.active == [0, 1]
     # A step that moves to a stage already open leaves the open cards as they are.
     view.accordion.active = [0, 1]
-    write_stage(run_doc, _stopped_plate())
+    write_stage(run_doc, _failed("plate-registration", "plate"))
     view.refresh()
     assert view.accordion.active == [0, 1]
 
 
-def _stopped_plate() -> StageRecord:
+def test_a_redraw_with_the_same_tool_does_not_open_a_card_the_operator_folded(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # The card opens when the step *moves* to a tool: a click on a well, Refresh and the
+    # end of a run redraw with the same tool, and must not undo the operator's fold.
+    _seed_plate(run_doc)
+    page = make_page()
+    view = PlatePageView(page)
+    assert "scan-plan" in view.next_text.object.splitlines()[0]
+    view.accordion.active = [0]  # the scan plan's card (1) is folded
+    page.select_text("B2")
+    view.refresh()
+    assert view.accordion.active == [0]
+    view.tick()
+    assert view.accordion.active == [0]
+
+
+def test_a_step_that_comes_back_to_a_tool_opens_its_card_again(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # Tool, then no tool (the scan has no plugin here), then the tool again: the card
+    # opens at the return, which is a move, as it did the first time.
+    _seed_plate(run_doc)
+    page = make_page()
+    view = PlatePageView(page)
+    view.accordion.active = [0]
+    _seed_raw(run_doc, "scan-plan", {})
+    view.refresh()
+    assert not view.next_button.visible  # no registered plugin provides the scan
+    assert view.accordion.active == [0]
+    write_stage(run_doc, _failed("scan-plan", "scan-plan"))
+    view.refresh()
+    assert view.next_button.label == "Run scan-plan"
+    assert view.accordion.active == [0, 1]
+
+
+def _failed(plugin: str, provides: str) -> StageRecord:
     return StageRecord(
-        plugin="plate-registration",
-        provides="plate",
+        plugin=plugin,
+        provides=provides,
         attempt="a2",
         status=StageStatus.failed,
         started_utc=T0,
