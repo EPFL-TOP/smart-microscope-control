@@ -616,6 +616,9 @@ def _act_after_density(page: Any, stand: Stand) -> None:
 
 def _act_with_route(page: Any, stand: Stand) -> None:
     stand.run_chain([ROUTE_STEP])
+    # Refresh is on the Plate tab: a state before this one that failed on the Image
+    # tab would otherwise leave this one waiting for a button that is hidden.
+    page.get_by_text("Plate", exact=True).first.click()
     page.get_by_role("button", name="Refresh").click()
 
 

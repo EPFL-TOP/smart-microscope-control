@@ -392,6 +392,21 @@ def test_the_tabs_are_not_dynamic_so_the_plate_figure_keeps_its_view_and_its_fra
     assert view.tabs.active == 0
 
 
+def test_both_figures_stay_in_the_model_tree_whichever_tab_is_shown(
+    page: PlatePage,
+) -> None:
+    view = PlatePageView(page)
+    root = view.layout.get_root()
+    # A figure that leaves the model tree has its view destroyed in the browser, and
+    # its ranges keep the bounds of the dead one (FM-174): what a dynamic tab does to
+    # the figure of the tab not shown. The parameter pinned above is how it is avoided.
+    for active in (1, 0, 1):
+        view.tabs.active = active
+        in_tree = {model.id for model in root.references()}
+        assert view.figure.id in in_tree
+        assert view.image_figure.id in in_tree
+
+
 def test_a_tool_that_ends_between_two_ticks_of_another_tab_is_drawn_there_too(
     fake_microscope: Microscope, run_doc: Path
 ) -> None:
