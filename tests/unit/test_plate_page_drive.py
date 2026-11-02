@@ -657,7 +657,51 @@ def test_a_drive_action_during_live_runs_between_two_frames_and_live_goes_on(
     assert page.join(10.0)
     outcome = page.status().outcome
     assert outcome is not None
-    assert re.fullmatch(r"live ended: \d+ frames in \d+\.\d s", outcome), outcome
+    # live's own line keeps the last action's outcome (m5 §6.3, #295).
+    assert re.fullmatch(
+        r"live ended: \d+ frames in \d+\.\d s; stage jog: XY \(100\.00, -50\.00\) µm",
+        outcome,
+    ), outcome
+
+
+def test_live_keeps_the_last_drive_actions_outcome_when_it_ends(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # Before #295 the end of live replaced the last action's outcome with its own,
+    # and only the log kept it.
+    fake_microscope.override(Camera, FrameCamera())
+    page.live(True)
+    try:
+        _wait_for_frame_after(page, 1)
+        page.jog_xy(100.0, -50.0)
+        _wait_for_outcome(page, "stage jog: XY (100.00, -50.00) µm")
+    finally:
+        page.live(False)
+    assert page.join(10.0)
+    assert re.fullmatch(
+        r"live ended: \d+ frames in \d+\.\d s; stage jog: XY \(100\.00, -50\.00\) µm",
+        page.status().outcome or "",
+    )
+
+
+def test_live_keeps_only_the_last_of_several_drive_outcomes(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    fake_microscope.override(Camera, FrameCamera())
+    page.live(True)
+    try:
+        _wait_for_frame_after(page, 1)
+        page.jog_xy(100.0, -50.0)
+        _wait_for_outcome(page, "stage jog: XY (100.00, -50.00) µm")
+        page.jog_xy(10.0, 0.0)
+        _wait_for_outcome(page, "stage jog: XY (110.00, -50.00) µm")
+    finally:
+        page.live(False)
+    assert page.join(10.0)
+    assert re.fullmatch(
+        r"live ended: \d+ frames in \d+\.\d s; stage jog: XY \(110\.00, -50\.00\) µm",
+        page.status().outcome or "",
+    )
 
 
 def test_a_drive_action_during_live_is_logged(
@@ -804,6 +848,218 @@ def test_a_failed_frame_drops_a_waiting_drive_action(
     assert page.activities_ended == before + 1
 
 
+# --- a switch-off waiting when live ends is run (m5 §6.3, #295) -----------------------
+
+_LIVE_THEN_LIGHT_OFF = r"live ended: \d+ frames in \d+\.\d s; light off: light off"
+_MOVES = ("setXYPosition", "setPosition", "setRelative")
+
+
+def _light_on(microscope: Microscope) -> None:
+    """The shutter light open, as an operator at the stand's own controls would leave it."""
+    _fake(microscope).setShutterOpen(SHUTTER_LIGHT, True)
+    assert microscope.require(LightSource).is_on() is True
+
+
+def test_a_switch_off_waiting_at_stop_is_run_and_the_light_goes_off(
+    light_page: PlatePage, shutter_light: Microscope, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Measured before #295: `light off` clicked behind a frame, then STOP, ended live
+    # as "...; light off was not run" and the light still read on.
+    _light_on(shutter_light)
+    camera = FrameCamera(block=True)
+    shutter_light.override(Camera, camera)
+    seen = _on_thread(monkeypatch, "switch_light", light_page)
+    light_page.live(True)
+    try:
+        assert camera.entered.wait(5)
+        light_page.light(False)
+        light_page.stop()
+    finally:
+        camera.release.set()
+    assert light_page.join(10.0)
+    status = light_page.status()
+    assert status.outcome is not None
+    assert re.fullmatch(_LIVE_THEN_LIGHT_OFF, status.outcome), status.outcome
+    assert shutter_light.require(LightSource).is_on() is False
+    assert status.halted
+    # Run on the live worker, with `_lock` free (a held lock would have failed the
+    # bounded acquire of the recorder), and nothing is left waiting or running.
+    assert seen == [("smc-ui-live", True)]
+    assert light_page._drive_waiting is None
+    assert light_page._drive_running is None
+
+
+def test_a_switch_off_run_at_stop_sends_no_move(
+    light_page: PlatePage, shutter_light: Microscope
+) -> None:
+    # FM-88: what was dropped at STOP was dropped because it could move the stage
+    # after the halt; a switch-off is no restore step and moves nothing.
+    _light_on(shutter_light)
+    camera = FrameCamera(block=True)
+    shutter_light.override(Camera, camera)
+    light_page.live(True)
+    try:
+        assert camera.entered.wait(5)
+        _fake(shutter_light).log.clear()
+        light_page.light(False)
+        light_page.stop()
+    finally:
+        camera.release.set()
+    assert light_page.join(10.0)
+    log = _fake(shutter_light).log
+    assert [line for line in log if line.startswith("setShutterOpen")], log
+    assert not [line for line in log if line.startswith(_MOVES)], log
+    assert shutter_light.state().xy == XY(0.0, 0.0)
+
+
+def test_an_autofocus_off_waiting_when_live_ends_is_run(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    autofocus = fake_microscope.require(Autofocus)
+    autofocus.engage()
+    assert autofocus.is_engaged()
+    camera = FrameCamera(block=True)
+    fake_microscope.override(Camera, camera)
+    page.live(True)
+    try:
+        assert camera.entered.wait(5)
+        page.autofocus(False)
+        page.live(False)
+    finally:
+        camera.release.set()
+    assert page.join(10.0)
+    status = page.status()
+    assert status.outcome is not None
+    assert re.fullmatch(
+        r"live ended: \d+ frames in \d+\.\d s; autofocus disengage: autofocus off",
+        status.outcome,
+    ), status.outcome
+    assert not autofocus.is_engaged()
+    assert not status.halted
+
+
+def test_a_switch_off_waiting_when_a_frame_fails_is_run(
+    light_page: PlatePage, shutter_light: Microscope
+) -> None:
+    _light_on(shutter_light)
+    camera = FrameCamera(
+        block=True, fail_with=lambda: HardwareError("the camera timed out")
+    )
+    shutter_light.override(Camera, camera)
+    light_page.live(True)
+    try:
+        assert camera.entered.wait(5)
+        light_page.light(False)
+    finally:
+        camera.release.set()
+    assert light_page.join(10.0)
+    assert light_page.status().outcome == (
+        "live ended after 0 frames: HardwareError: the camera timed out; "
+        "light off: light off"
+    )
+    assert shutter_light.require(LightSource).is_on() is False
+
+
+def test_a_switch_off_that_fails_at_the_end_is_its_outcome_and_live_ends(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # The demo's LED is a State device: the facade's own error says to use the
+    # shutter. It is the end's outcome as text, and nothing is raised (FM-98).
+    refusal = _refusal(lambda: fake_microscope.require(LightSource).set_on(False))
+    camera = FrameCamera(block=True)
+    fake_microscope.override(Camera, camera)
+    page.live(True)
+    try:
+        assert camera.entered.wait(5)
+        page.light(False)
+        page.live(False)
+    finally:
+        camera.release.set()
+    assert page.join(10.0)
+    outcome = page.status().outcome
+    assert outcome is not None
+    assert re.fullmatch(
+        r"live ended: \d+ frames in \d+\.\d s; light off: " + re.escape(refusal),
+        outcome,
+    ), outcome
+    assert not page.is_live
+    assert page._drive_running is None
+
+
+def test_close_runs_a_waiting_switch_off_and_says_so(
+    light_page: PlatePage, shutter_light: Microscope
+) -> None:
+    _light_on(shutter_light)
+    camera = FrameCamera(block=True)
+    shutter_light.override(Camera, camera)
+    light_page.live(True)
+    assert camera.entered.wait(5)
+    light_page.light(False)
+    closer = threading.Thread(target=light_page.close, daemon=True)
+    closer.start()
+    try:
+        _wait_for(lambda: light_page.status().halted, "the halt of close()")
+    finally:
+        camera.release.set()
+    closer.join(15.0)
+    assert not closer.is_alive()
+    assert light_page.close_ended
+    assert re.fullmatch(_LIVE_THEN_LIGHT_OFF, light_page.close_lines[-1]), (
+        light_page.close_lines
+    )
+    assert shutter_light.require(LightSource).is_on() is False
+
+
+def test_live_ends_with_the_last_actions_outcome_then_the_switch_off(
+    light_page: PlatePage, shutter_light: Microscope
+) -> None:
+    # The order m5 §6.3 gives: live's text, the last action the loop ran, then what
+    # the end did with the switch-off still waiting.
+    _light_on(shutter_light)
+    shutter_light.override(Camera, FrameCamera())
+    light_page.live(True)
+    blocking = FrameCamera(block=True)
+    try:
+        _wait_for_frame_after(light_page, 1)
+        light_page.jog_xy(100.0, -50.0)
+        _wait_for_outcome(light_page, "stage jog: XY (100.00, -50.00) µm")
+        shutter_light.override(Camera, blocking)
+        assert blocking.entered.wait(5)
+        light_page.light(False)
+        light_page.live(False)
+    finally:
+        blocking.release.set()
+    assert light_page.join(10.0)
+    assert re.fullmatch(
+        r"live ended: \d+ frames in \d+\.\d s; stage jog: XY \(100\.00, -50\.00\) µm; "
+        r"light off: light off",
+        light_page.status().outcome or "",
+    )
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_drive_running_is_cleared_when_an_action_escapes_with_a_base_exception(
+    page: PlatePage, fake_microscope: Microscope, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An escaping BaseException ends the worker whatever it was running, and must
+    # not leave a capture refused for ever: `_drive_running` is cleared around the
+    # action. (The thread's traceback is the point of the test, not a finding.)
+    class Escape(BaseException):
+        pass
+
+    def escaping(*args: Any, **kwargs: Any) -> Any:
+        raise Escape
+
+    monkeypatch.setattr(drive_module, "jog_xy", escaping)
+    fake_microscope.override(Camera, FrameCamera())
+    page.live(True)
+    _wait_for_frame_after(page, 1)
+    page.jog_xy(10.0, 0.0)
+    assert page.join(10.0)
+    assert page._drive_running is None
+    assert page._drive_waiting is None
+
+
 def test_a_drive_action_once_live_is_ending_is_refused(
     page: PlatePage, fake_microscope: Microscope
 ) -> None:
@@ -898,7 +1154,13 @@ def test_stop_during_a_drive_action_ends_live_as_a_stop(
     assert page.join(10.0)
     outcome = page.status().outcome
     assert outcome is not None
-    assert re.fullmatch(r"live ended: \d+ frames in \d+\.\d s", outcome), outcome
+    # Live ends as the stop it is (no frame after the halt), and keeps the last
+    # action's outcome: the jog the halt refused (m5 §6.3, #295).
+    assert re.fullmatch(
+        r"live ended: \d+ frames in \d+\.\d s; stage jog: MicroscopeHaltedError: .*",
+        outcome,
+    ), outcome
+    assert "ended after" not in outcome
     assert page.status().halted
 
 

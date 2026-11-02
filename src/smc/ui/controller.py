@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import EntryPoint
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
-from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeVar, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -313,6 +313,20 @@ class _Suggestion:
     why: str
 
 
+class _Handed(NamedTuple):
+    """A drive action handed to the live worker, waiting for the next turn of its loop (m5 §6.3).
+
+    ``run`` returns the outcome text and never raises an ``Exception``. ``switch_off``
+    is ``True`` for the two switch-offs, ``light off`` and ``autofocus disengage``:
+    the one kind of action that is still run when live ends, because the facade
+    never refuses it, also halted, and it sends no move (#295).
+    """
+
+    name: str
+    run: Callable[[], str]
+    switch_off: bool
+
+
 @dataclass(frozen=True, slots=True)
 class PageStatus:
     """The stand and the run, read now.
@@ -376,6 +390,11 @@ def _light_lacks_text(light: LightSource, on: bool | None) -> str | None:
     if on is None:
         return f"the light source {light.device()} has no on/off that smc knows"
     return None
+
+
+def _then(text: str, last: str | None) -> str:
+    """``text``, then ``; <last>`` when there is a last drive action's outcome to keep."""
+    return text if last is None else f"{text}; {last}"
 
 
 def _flat(text: str) -> str:
@@ -647,8 +666,10 @@ class PlatePage:
         # by identity. Written on the server's loop only; read without a lock (FM-70).
         self._live_event: threading.Event | None = None
         # The one drive action handed to the live worker and not yet taken, under
-        # ``_lock`` (m5 §6.3): its name and the call that returns its outcome text.
-        self._drive_waiting: tuple[str, Callable[[], str]] | None = None
+        # ``_lock`` (m5 §6.3), and the name of the one the live worker is running
+        # now, which a capture reads (#295): the stage is about to move or moves.
+        self._drive_waiting: _Handed | None = None
+        self._drive_running: str | None = None
         # ``light_lacks()``'s answer, kept after the first read that did not raise.
         self._light_lacks_found: tuple[str | None] | None = None
         # The facade whose light ``status()`` read and which raised: ``light_lacks()``
@@ -1251,44 +1272,88 @@ class PlatePage:
         devices, and the next frame shows where it went. A drive action that fails
         is its outcome, and live goes on; only a frame that fails ends live.
         Whatever ends the loop, the event is set **first**, then the action still
-        waiting is dropped and never sent (FM-88): a failed frame ends the loop
-        without the event, and a ``_drive`` that took the lock after the drop would
-        otherwise keep an action that no loop takes. ``_drive`` reads the event
-        under the lock, so an action is either taken by the loop or refused.
+        waiting is taken under the lock: a failed frame ends the loop without the
+        event, and a ``_drive`` that took the lock after the drop would otherwise
+        keep an action that no loop takes. ``_drive`` reads the event under the
+        lock, so an action is either taken by the loop, run or dropped at the end,
+        or refused. **A switch-off is run** (``light off``, ``autofocus
+        disengage``, #295), after the lock is released and as any drive action runs;
+        every other action is dropped and never sent (FM-88: a move, a turn or an
+        engage must not be sent after a STOP). A switch-off is the safe call the
+        facade never refuses, also halted, and it sends no move, so what makes a
+        drop right for the others does not apply: dropping it left the light on
+        after a STOP. STOP does not wait for it (``stop()`` joins nothing, FM-70);
+        ``close()`` waits for it as for a frame. The outcome ends with what the end
+        did: ``; <the switch-off's outcome>`` or ``; <name> was not run``.
         """
         log.info("live: started from the plate page")
+        ran: str | None = None
         try:
             outcome = self._live_frames(event)
         finally:
             event.set()
             with self._lock:
-                dropped, self._drive_waiting = self._drive_waiting, None
-        if dropped is not None:
-            outcome += f"; {dropped[0]} was not run"
-        return outcome
+                waiting, self._drive_waiting = self._drive_waiting, None
+                if waiting is not None and waiting.switch_off:
+                    # Held in the same critical section as the take, so a capture
+                    # never finds the action neither waiting nor running.
+                    self._drive_running = waiting.name
+            if waiting is not None and waiting.switch_off:
+                ran = self._run_handed(waiting)
+        if waiting is None:
+            return outcome
+        if ran is not None:
+            return f"{outcome}; {ran}"
+        return f"{outcome}; {waiting.name} was not run"
+
+    def _run_handed(self, handed: _Handed) -> str:
+        """Run an action handed to the live worker, outside ``_lock``; its outcome text, kept and logged.
+
+        Whoever took ``handed`` from ``_drive_waiting`` set ``_drive_running`` in
+        the same critical section; it is cleared here whatever the action does, so
+        that an escaping ``BaseException`` never leaves a capture refused for ever.
+        A drive action is logged (a frame never is, FM-148), after its outcome is
+        kept (FM-62).
+        """
+        try:
+            done = handed.run()
+        except BaseException:
+            with self._lock:
+                self._drive_running = None
+            raise
+        with self._lock:
+            self._drive_running = None
+            self._outcome = done
+        log.info("%s", done)
+        return done
 
     def _live_frames(self, event: threading.Event) -> str:
-        """``_live``'s loop: a waiting drive action, then a frame, then the rest of the period."""
+        """``_live``'s loop: a waiting drive action, then a frame, then the rest of the period.
+
+        Its text is live's own, then ``; <outcome of the last action it ran>`` when
+        there was one (#295): the earlier ones were on the strip while live went,
+        and the log has every one.
+        """
         started = time.monotonic()
         frames = 0
+        last: str | None = None
         while not event.is_set():
             began = time.monotonic()
             with self._lock:
                 waiting = None
                 if not event.is_set():
                     waiting, self._drive_waiting = self._drive_waiting, None
+                    if waiting is not None:
+                        self._drive_running = waiting.name
             if waiting is not None:
-                done = waiting[1]()
-                with self._lock:
-                    self._outcome = done
-                log.info("%s", done)
+                last = self._run_handed(waiting)
                 if event.is_set():
                     # STOP during the action: the stand is halted, and a frame now
                     # would end live with the halt's refusal instead of the stop.
                     break
             taken = self._take_frame()
             if isinstance(taken, str):
-                return f"live ended after {frames} frames: {taken}"
+                return _then(f"live ended after {frames} frames: {taken}", last)
             frames += 1
             # Not on the progress queue: its only reader is a session's tick, and a
             # live view outlives every session, so with no tab open it would grow by
@@ -1299,7 +1364,9 @@ class PlatePage:
                     plugin="live", done=frames, total=None, message="frames"
                 )
             event.wait(max(0.0, LIVE_PERIOD_S - (time.monotonic() - began)))
-        return f"live ended: {frames} frames in {time.monotonic() - started:.1f} s"
+        return _then(
+            f"live ended: {frames} frames in {time.monotonic() - started:.1f} s", last
+        )
 
     def _snap(self, event: threading.Event) -> str:
         """One snap on the worker, and its outcome as text: no exception is kept (FM-98)."""
@@ -1418,6 +1485,7 @@ class PlatePage:
                 "autofocus disengage",
                 Autofocus,
                 lambda: drive.disengage_autofocus(self._stand()),
+                switch_off=True,
             )
 
     def light(self, on: bool) -> None:
@@ -1434,6 +1502,7 @@ class PlatePage:
             LightSource,
             lambda: drive.switch_light(self._stand(), on),
             lacks=self.light_lacks if on else None,
+            switch_off=not on,
         )
 
     def objective_labels(self) -> tuple[str, ...]:
@@ -1542,13 +1611,17 @@ class PlatePage:
         action: Callable[[], DriveResult],
         *,
         lacks: Callable[[], str | None] | None = None,
+        switch_off: bool = False,
     ) -> None:
         """What every drive action does, in m5 §6.3's order.
 
         The page is closed; another activity than this page's live goes; the stand
         lacks the capability (an outcome, nothing starts or waits); live goes (the
         action is handed to its worker); else the action is an activity of its own.
-        ``lacks`` is a second reason after ``lacks(capability)``.
+        ``lacks`` is a second reason after ``lacks(capability)``. ``switch_off`` is
+        ``True`` for ``light off`` and ``autofocus disengage`` only: handed to the
+        live worker, such an action is still run when live ends (#295), where any
+        other is dropped.
 
         Raises:
             RuntimeError: ``the page is closed``, ``<name> is running``, ``live is
@@ -1578,8 +1651,8 @@ class PlatePage:
                 if self._drive_waiting is not None:
                     # Refused, never queued: a queue would move the stage after the
                     # operator stopped clicking.
-                    raise RuntimeError(f"{self._drive_waiting[0]} is waiting")
-                self._drive_waiting = (name, outcome)
+                    raise RuntimeError(f"{self._drive_waiting.name} is waiting")
+                self._drive_waiting = _Handed(name, outcome, switch_off)
             return
         self._start_activity(name, lambda event: outcome())
 
