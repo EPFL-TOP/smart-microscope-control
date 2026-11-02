@@ -34,6 +34,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 from rich.text import Text
+from typing_extensions import assert_never
 
 from smc import __version__
 from smc.drive import (
@@ -347,7 +348,8 @@ def _note_clause(note: StopNote) -> str:
     outcome = note.outcome
     # One branch per outcome, so that a member added later fails here and never
     # falls into another one's text (it read "second Ctrl-C" for every member
-    # that had no branch).
+    # that had no branch). mypy reports the member with no branch at the
+    # `assert_never`; the test of the same name is its twin at run time.
     if outcome is StopOutcome.accepted:
         return f"{name} was stopped"
     if outcome is StopOutcome.refused:
@@ -366,7 +368,7 @@ def _note_clause(note: StopNote) -> str:
             f"{name} was still tracked as moving when the stand was released; "
             f"close()'s log line says what its stop did"
         )
-    raise AssertionError(f"no Ctrl-C clause for {outcome!r}")
+    assert_never(outcome)
 
 
 def _stop_refused_line(roles: Iterable[Role]) -> str | None:
