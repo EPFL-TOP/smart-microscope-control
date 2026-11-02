@@ -573,6 +573,22 @@ def test_an_autofocus_that_cannot_be_read_says_why(
     assert reading == drive.AutofocusReading(result.text, None, False)
 
 
+def test_an_engage_that_did_not_lock_on_an_autofocus_that_cannot_be_read_does_not_say_off(
+    fake_microscope: Microscope,
+) -> None:
+    # FM-155: an unreadable autofocus that did not lock may still be searching and
+    # driving Z; "it is off" is only for a state that read as off.
+    fake_microscope.override(Autofocus, ReadsFail())
+
+    result = drive.engage_autofocus(fake_microscope)
+
+    assert result == DriveResult(
+        "autofocus did not lock; "
+        "autofocus ? (autofocus: HardwareError: autofocus 'PFS': cannot read)",
+        reached=False,
+    )
+
+
 class ReadsFailOverTwoLines(NeverLocks):
     """An autofocus whose driver's message spans two lines, as a vendor's can."""
 

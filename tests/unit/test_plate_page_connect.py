@@ -23,7 +23,7 @@ from pymmcore_plus import CMMCorePlus
 
 import smc.ui.controller as controller_module
 from smc.hardware import Microscope
-from smc.hardware.capabilities import LightSource, XYStage
+from smc.hardware.capabilities import LightSource, ObjectiveTurret, XYStage
 from smc.hardware.errors import CoreError, MicroscopeBusyError
 from smc.hardware.profile import Profile
 from smc.hardware.roles import Role
@@ -563,6 +563,73 @@ def test_a_light_answer_read_across_a_reconnect_is_not_kept_for_the_new_stand(
         assert page.light_lacks() is None
     finally:
         del opener.opened[1].get
+
+
+def test_a_status_light_read_across_a_reconnect_is_not_kept_for_the_new_stand(
+    page: PlatePage, opener: Opener
+) -> None:
+    # The tick's own read of the first stand's light outlasts a Disconnect and a
+    # Connect (#295, `_note_light_read`): its answer belongs to a stand the page no
+    # longer holds, and must not become the new stand's.
+    with _replaced(page, "_opener", _with_light(opener, Light("LED", None))):
+        _connected(page)
+    first = opener.opened[0]
+    real_get = first.get
+
+    class Across(Light):
+        def is_on(self) -> bool | None:
+            page.disconnect()
+            assert page.join(5)
+            with _replaced(page, "_opener", _with_light(opener, Light("Lamp", False))):
+                _connected(page)
+            return None
+
+    def get(capability: type) -> Any:
+        return (
+            Across("LED", None) if capability is LightSource else real_get(capability)
+        )
+
+    with _replaced(first, "get", get):
+        page.status()
+    try:
+        assert page.light_lacks() is None
+    finally:
+        del opener.opened[1].get
+
+
+def test_a_labels_failure_is_logged_again_for_the_next_stand(
+    page: PlatePage, opener: Opener, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A failing streak is one line (FM-148); a Disconnect ends it, so a second stand
+    # that fails the same way is news again.
+    def failing() -> list[str]:
+        raise CoreError("the turret did not answer")
+
+    def lines() -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "smc.ui"
+            and "its positions could not be read" in r.getMessage()
+        ]
+
+    _connected(page)
+    with (
+        caplog.at_level("WARNING", logger="smc.ui"),
+        _replaced(opener.opened[0].require(ObjectiveTurret), "labels", failing),
+    ):
+        assert page.objective_labels() == ()
+        assert page.objective_labels() == ()
+    assert len(lines()) == 1
+    page.disconnect()
+    assert page.join(5)
+    _connected(page)
+    with (
+        caplog.at_level("WARNING", logger="smc.ui"),
+        _replaced(opener.opened[1].require(ObjectiveTurret), "labels", failing),
+    ):
+        assert page.objective_labels() == ()
+    assert len(lines()) == 2
 
 
 # --- Disconnect -------------------------------------------------------------------

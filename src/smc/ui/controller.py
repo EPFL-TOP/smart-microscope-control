@@ -27,6 +27,7 @@ import logging
 import queue
 import threading
 import time
+import weakref
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -674,7 +675,10 @@ class PlatePage:
         self._light_lacks_found: tuple[str | None] | None = None
         # The facade whose light ``status()`` read and which raised: ``light_lacks()``
         # does not read it again for that facade (one read a tick, m5 §6.3).
-        self._light_read_raised: Microscope | None = None
+        # A weak reference: the page keeps text and flags about a released facade,
+        # never the facade, which would keep its core alive after ``release()``
+        # (FM-92).
+        self._light_read_raised: weakref.ref[Microscope] | None = None
         # Whether ``objective_labels()`` has logged the failure of its streak.
         self._labels_failure_logged = False
         self._closed = False
@@ -1564,7 +1568,8 @@ class PlatePage:
         found = self._light_lacks_found
         if found is not None:
             return found[0]
-        if self._light_read_raised is microscope:
+        raised = self._light_read_raised
+        if raised is not None and raised() is microscope:
             return None
         light = microscope.get(LightSource)
         if light is None:  # unreachable once lacks() said it is there
@@ -1598,7 +1603,7 @@ class PlatePage:
         if self._microscope is not microscope:
             return
         if raised:
-            self._light_read_raised = microscope
+            self._light_read_raised = weakref.ref(microscope)
             return
         self._light_read_raised = None
         if self._light_lacks_found is None:

@@ -16,6 +16,7 @@ import pytest
 from typer.testing import CliRunner
 
 import smc.cli as cli
+import smc.drive as drive
 from smc.cli import app
 from smc.drive import AutofocusReading, DriveResult
 
@@ -297,3 +298,21 @@ def test_autofocus_get_that_cannot_read_exits_1_with_the_cause(
 
     assert result.exit_code == 1, result.output
     assert result.output.splitlines()[-1] == f"✗ {text}"
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_autofocus_get_decides_from_the_state_and_not_from_the_words(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-155: the exit code follows `known`, the state's own answer. The demo's
+    # autofocus is off and known; words that happen to start like an unknown one
+    # (a rewording of describe_autofocus) must not turn the reading into a failure.
+    monkeypatch.setattr(
+        drive, "describe_autofocus", lambda state: "autofocus ? (reworded)"
+    )
+
+    result = runner.invoke(app, ["autofocus", "get"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines()[-1] == "autofocus ? (reworded)"
