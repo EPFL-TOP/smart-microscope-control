@@ -754,9 +754,15 @@ before `_closed = True`, so "closed" still means released; no smc handler takes
 that lock, so the wait cannot deadlock on it. A core that is not an MMCore (a
 `FakeCore`) is left alone, and a failure is a WARNING and never raised: the one
 case is a `close()` from inside a callback of the same core, which no smc path
-does. The wait has no limit of its own, so a subscriber to `core.events` that
-blocks would hang `close()`; the Ctrl-C path calls `stop()` and not `close()`,
-so it does not gain this wait (FM-70). Not verified at a stand: a real
+does. The detach is in a `finally` after the unload, so a second Ctrl-C inside
+the unload (not an `Exception`) still detaches (FM-49). A wrapper that
+delegates to a core is not an MMCore and is not detached: its owner releases
+the core it wraps through `close_core`. The wait has no limit of its own, so a
+subscriber to `core.events` that blocks would hang `close()`, and a Ctrl-C
+does not end it: it is one native call (measured: two interrupts sent during
+the wait took effect only once the handler returned, after 5.0 s). The signal
+handler's `stop()` never gets here (FM-70), but a Ctrl-C that unwinds a `with
+Microscope.open()` block or `opened()` does. Not verified at a stand: a real
 stand's adapters may deliver notifications from their own threads for longer
 than the demo's.
 
