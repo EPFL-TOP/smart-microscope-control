@@ -967,10 +967,12 @@ class PlatePageView:
         Which of the two is read from the label the button shows, not from the
         controller at the click (m5 §5.3, #287): a click does what the button says,
         and a button up to a second out of date must not do the opposite. A stale
-        *End live* after a camera fault ends nothing and starts no new live on the
-        camera that just failed; a stale *Live* in a second tab is the controller's
-        refusal (``live is running``) and does not end the first tab's live. The
-        tick that follows draws the label again. Ending is not STOP: the stand is
+        *End live* after a camera fault, with no live running, ends nothing and
+        starts no new live on the camera that just failed (a live that another tab
+        started meanwhile is ended, as the label says: ``live(False)`` ends the
+        page's live, not the tab's); a stale *Live* in a second tab is the
+        controller's refusal (``live is running``) and does not end the first
+        tab's live. The tick that follows draws the label again. Ending is not STOP: the stand is
         not halted. A refusal is the page's message, as for a run.
         """
         starting = self.live_button.label != _END_LIVE_LABEL

@@ -195,7 +195,9 @@ for them: end it with **End live**, which ends only the live view and **does not
 the stand** (it says `live ended: <n> frames in <s> s`). A click does what the button
 says, so a button that is a second out of date does not do the opposite: a stale
 *Live* in a second tab says `live is running` and leaves the first tab's live going, and
-a stale *End live* after a camera fault ends nothing and starts no new live. **STOP**
+a stale *End live* after a camera fault, with no live running, ends nothing and starts no
+new live (if another tab has started a live since, it ends that one: live belongs to the
+page, not to a tab). **STOP**
 ends it **and halts the stand**, as it halts a run (`live told to stop; stopped: the
 stand is halted (Resume clears the halt)`). A frame that fails, or that is not 2-D `uint8` or `uint16`, ends
 live with `live ended after <n> frames: <why>`, and the last good frame stays. Live is
