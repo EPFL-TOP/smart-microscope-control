@@ -226,6 +226,54 @@ def test_disconnect_through_a_click_closes_the_page_again(
     assert list(opened[0].core.getLoadedDevices()) == ["Core"]
 
 
+def test_connect_is_disabled_while_a_connect_goes(
+    tmp_path: Path, opened: list[Microscope]
+) -> None:
+    gate = threading.Event()
+    entered = threading.Event()
+    page = _page(tmp_path / "run.json", opened)
+    real_opener = page._opener
+
+    def slow() -> Microscope:
+        entered.set()
+        assert gate.wait(5)
+        return real_opener()
+
+    page._opener = slow
+    view = PlatePageView(page)
+    try:
+        view.connect_button.clicks += 1
+        assert entered.wait(5)
+        view.tick()
+        assert view.connect_button.disabled
+        assert view.disconnect_button.disabled
+    finally:
+        gate.set()
+        assert page.join(5)
+        page.close()
+        page.release()
+
+
+def test_a_confirmation_armed_for_one_stand_is_dropped_when_the_connection_changes(
+    page: PlatePage,
+) -> None:
+    view = PlatePageView(page)
+    _connect(view)
+    view.objective_select.value = list(view.objective_select.options.values())[1]
+    view.on_objective()
+    assert view.objective_confirm.visible
+    # Disconnect and Connect between two ticks: the drive controls never read as
+    # disabled, so only the change of connection can drop the confirmation.
+    page.disconnect()
+    assert page.join(5)
+    page.connect()
+    assert page.join(5)
+    view._seen_connected = False
+    view.tick()
+    assert not view.objective_confirm.visible
+    assert view._armed is None
+
+
 @pytest.mark.parametrize("activity", ["run", "live"])
 def test_disconnect_is_disabled_while_an_activity_goes(
     page: PlatePage, activity: str

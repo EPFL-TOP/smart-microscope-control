@@ -1359,7 +1359,8 @@ class PlatePage:
         except Exception:
             return None
         if self._microscope is microscope:
-            # Not kept for a facade a Disconnect dropped during the read.
+            # Not kept for a facade dropped during the read: a Connect that ended
+            # meanwhile has cleared the answer for its own stand.
             self._light_lacks_found = (answer,)
         return answer
 

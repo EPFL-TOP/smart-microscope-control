@@ -24,7 +24,7 @@ from pymmcore_plus import CMMCorePlus
 import smc.ui.controller as controller_module
 from smc.hardware import Microscope
 from smc.hardware.capabilities import LightSource, XYStage
-from smc.hardware.errors import CoreError
+from smc.hardware.errors import CoreError, MicroscopeBusyError
 from smc.hardware.profile import Profile
 from smc.hardware.roles import Role
 from smc.plugins.api import PluginParams, PluginResult, RunContext
@@ -449,6 +449,47 @@ def test_a_connect_that_ends_after_close_releases_what_it_opened(
     page.release()
 
 
+def test_a_late_connect_whose_release_fails_says_so_and_the_page_stays_closed(
+    run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(controller_module, "_CLOSE_WAIT_S", 0.2)
+    gate = threading.Event()
+    opener = Opener(gate=gate)
+    real_open = opener.__call__
+
+    def opening() -> Microscope:
+        microscope = real_open()
+        microscope.close = _busy  # type: ignore[method-assign]
+        return microscope
+
+    page = _closed(run_doc, opening)
+    try:
+        page.connect()
+        assert opener.entered.wait(5)
+        page.close()
+    finally:
+        gate.set()
+    assert page.join(5)
+    assert _outcome(page) == (
+        "connect: demo was opened after the page closed, and its release failed: "
+        f"MicroscopeBusyError: {BUSY_TEXT}"
+    )
+    assert not page.connected
+    del opener.opened[0].close  # the fixture-less opener's stand, released for real
+    opener.opened[0].close()
+
+
+BUSY_TEXT = (
+    "another call has held the microscope for at least 2.0 s; the device driver may "
+    "be hung. If the call is legitimately long, raise [micromanager] "
+    "device_timeout_ms in the profile; otherwise restart the device or the program."
+)
+
+
+def _busy() -> None:
+    raise MicroscopeBusyError("another call", 2.0, at_least=True)
+
+
 def test_a_connect_clears_the_stop_note_and_the_light_answer(
     page: PlatePage, opener: Opener
 ) -> None:
@@ -460,28 +501,65 @@ def test_a_connect_clears_the_stop_note_and_the_light_answer(
     page.disconnect()
     assert page.join(5)
     assert page.status().stop_note is not None  # the note outlives the facade
+    with _replaced(page, "_opener", _with_light(opener, Light("Lamp", False))):
+        _connected(page)
+    try:
+        assert page.status().stop_note is None
+        assert page.light_lacks() is None
+    finally:
+        del opener.opened[1].get
 
-    class Switchable:
-        def device(self) -> str:
-            return "Lamp"
 
-        def is_on(self) -> bool | None:
-            return False
+class Light:
+    """A light source's two reads that ``light_lacks`` makes."""
+
+    def __init__(self, name: str, on: bool | None) -> None:
+        self.name = name
+        self.on = on
+
+    def device(self) -> str:
+        return self.name
+
+    def is_on(self) -> bool | None:
+        return self.on
+
+
+def _with_light(opener: Opener, light: Light) -> Callable[[], Microscope]:
+    """An opener whose stand's ``get(LightSource)`` is ``light`` (an instance attribute)."""
 
     def opening() -> Microscope:
         microscope = opener()
         real_get = microscope.get
         microscope.get = (  # type: ignore[method-assign]
             lambda capability: (
-                Switchable() if capability is LightSource else real_get(capability)
+                light if capability is LightSource else real_get(capability)
             )
         )
         return microscope
 
-    with _replaced(page, "_opener", opening):
+    return opening
+
+
+def test_a_light_answer_read_across_a_reconnect_is_not_kept_for_the_new_stand(
+    page: PlatePage, opener: Opener
+) -> None:
+    # A read of the first stand's light that outlasts a Disconnect and a Connect: its
+    # answer belongs to a stand the page no longer holds (m5 §7.2).
+    with _replaced(page, "_opener", _with_light(opener, Light("LED", None))):
         _connected(page)
+    first = opener.opened[0]
+
+    class Across(Light):
+        def is_on(self) -> bool | None:
+            page.disconnect()
+            assert page.join(5)
+            with _replaced(page, "_opener", _with_light(opener, Light("Lamp", False))):
+                _connected(page)
+            return None
+
+    with _replaced(first, "get", lambda capability: Across("LED", None)):
+        assert page.light_lacks() == "the light source LED has no on/off that smc knows"
     try:
-        assert page.status().stop_note is None
         assert page.light_lacks() is None
     finally:
         del opener.opened[1].get
@@ -500,6 +578,44 @@ def test_disconnect_releases_the_stand_and_is_an_activity(
     assert not page.connected
     assert _released(opener.opened[0])
     assert page.activities_ended == 2
+
+
+def test_disconnect_drops_the_stand_before_closing_it_even_when_the_close_fails(
+    page: PlatePage, opener: Opener
+) -> None:
+    _connected(page)
+    held_during_close: list[bool] = []
+
+    def failing() -> None:
+        held_during_close.append(page.connected)
+        _busy()
+
+    with _replaced(opener.opened[0], "close", failing):
+        page.disconnect()
+        assert page.join(5)
+    # No read that starts once the close has begun reaches a closing facade (§7.2).
+    assert held_during_close == [False]
+    assert _outcome(page) == f"disconnect: MicroscopeBusyError: {BUSY_TEXT}"
+    assert not page.connected
+
+
+def test_release_lets_go_of_the_stand_even_when_its_close_fails(
+    page: PlatePage, opener: Opener
+) -> None:
+    _connected(page)
+    page.close()
+    held_during_close: list[bool] = []
+
+    def failing() -> None:
+        held_during_close.append(page.connected)
+        _busy()
+
+    with _replaced(opener.opened[0], "close", failing):
+        with _refuses(MicroscopeBusyError, BUSY_TEXT):
+            page.release()
+        assert not page.connected
+        page.release()  # idempotent: the facade is not closed a second time
+    assert held_during_close == [False]
 
 
 @pytest.mark.parametrize("activity", ["run", "live"])
