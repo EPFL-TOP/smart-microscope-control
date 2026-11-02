@@ -723,6 +723,70 @@ def test_a_closed_tab_does_not_end_live(
     assert page.join(10.0)
 
 
+class _FaultableCamera(FrameCamera):
+    """A camera that counts its snaps and fails each one once ``fail`` is set."""
+
+    def __init__(self) -> None:
+        super().__init__(_rows_columns(6, 10))
+        self.snaps = 0
+        self.fail = threading.Event()
+
+    def snap(self) -> np.ndarray:
+        self.snaps += 1
+        if self.fail.is_set():
+            raise RuntimeError("the camera timed out")
+        return super().snap()
+
+
+def test_a_click_on_a_stale_end_live_ends_nothing_and_starts_no_live(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # FM-177: the click acts on the label it shows, and no tick has redrawn it since
+    # the fault: this test never ticks between the fault and the click.
+    camera = _FaultableCamera()
+    fake_microscope.override(Camera, camera)
+    view = PlatePageView(page)
+    view.on_live()
+    assert view.live_button.label == "End live"
+    _wait_for_frame_number(page, 2)
+    camera.fail.set()
+    assert page.join(10.0)
+    assert not page.is_live
+    # No tick since: the label is the stale one this test is about.
+    assert view.live_button.label == "End live"
+    snaps, outcome = camera.snaps, page.status().outcome
+    assert outcome is not None
+    assert outcome.startswith("live ended after ")
+    view.on_live()
+    assert page.join(10.0)
+    assert camera.snaps == snaps
+    assert not page.is_live
+    assert page.status().outcome == outcome
+    assert view.message.object == ""
+    assert view.live_button.label == "Live"
+
+
+def test_a_click_on_a_stale_live_is_refused_and_does_not_end_the_other_tabs_live(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    fake_microscope.override(Camera, FrameCamera(_rows_columns(6, 10)))
+    first, second = PlatePageView(page), PlatePageView(page)
+    first.on_live()
+    try:
+        assert page.is_live
+        assert second.live_button.label == "Live"
+        second.on_live()
+        assert second.message.object == "live is running"
+        frame = page.frame()
+        seen = 0 if frame is None else frame.number
+        _wait_for_frame_number(page, seen + 2)
+        assert page.is_live
+        assert second.live_button.label == "End live"
+    finally:
+        page.live(False)
+    assert page.join(10.0)
+
+
 def _card(**changes: Any) -> ResultCard:
     base: dict[str, Any] = {
         "plugin": "scan",
