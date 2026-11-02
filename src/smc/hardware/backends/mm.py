@@ -1152,6 +1152,11 @@ class MMAutofocus:
         #: stand only, and replaced whole at each change: one store, no lock
         #: (FM-70).
         self._seen: dict[str | None, frozenset[float]] = {}
+        #: Whether the last lock read could not read its offset or objective:
+        #: ``state()`` makes that read for every frame of a live view, so the
+        #: line is written when it starts to fail, not on every call (FM-178).
+        #: A plain flag, like ``_seen``: no lock (FM-70).
+        self._seen_unreadable = False
         #: Where Z was when ``suspend()`` found it locked, for the relock that
         #: follows in the same compound (the band, m2 §12.2 D2).
         self._z_held: float | None = None
@@ -1211,14 +1216,21 @@ class MMAutofocus:
             objective = self._objective_label()
             offset = self._read_offset()
         except Exception as exc:
-            # Text, never the error: a record that keeps it keeps its traceback (FM-92).
-            logger.debug(
-                "autofocus %s: read locked, but its offset or objective could not "
-                "be read (%s); not recorded as seen",
-                self._label,
-                _named(exc),
-            )
+            # Once per failure (FM-178), as the facade logs its own read of the
+            # same offset.
+            starts = not self._seen_unreadable
+            self._seen_unreadable = True
+            if starts:
+                # Text, never the error: a record that keeps it keeps its
+                # traceback (FM-92).
+                logger.debug(
+                    "autofocus %s: read locked, but its offset or objective could "
+                    "not be read (%s); not recorded as seen",
+                    self._label,
+                    _named(exc),
+                )
             return
+        self._seen_unreadable = False
         seen = self._seen
         known = seen.get(objective, frozenset())
         if offset not in known:
