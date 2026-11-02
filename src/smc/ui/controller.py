@@ -51,7 +51,7 @@ from smc.hardware.capabilities import (
 )
 from smc.hardware.errors import HardwareError, StopRefusedError
 from smc.hardware.microscope import describe_autofocus
-from smc.hardware.safety import DEFAULT_MAX_Z_JOG_UM
+from smc.hardware.safety import Safety
 from smc.plugins import (
     ParamsError,
     PluginEntry,
@@ -1476,15 +1476,16 @@ class PlatePage:
     def jog_limits_um(self) -> tuple[float, float]:
         """The profile's XY and Z jog limits, in µm: what the page's steps are bounded by.
 
-        A profile that sets no ``max_z_jog_um`` is held to the layer's assumed
-        default, as the facade holds it. Read from the profile, so the same with
-        the stand closed.
+        The numbers are the ones of a ``Safety`` built from the profile's two,
+        the class the facade enforces a jog with and the one that owns "no
+        ``max_z_jog_um`` means the layer's assumed default": this page repeats no
+        rule, and a test checks that what it offers the facade accepts. Built from
+        the profile and not read from the facade, so the same with the stand closed
+        (the page builds its steps before Connect, m5 §7.3).
         """
         safety = self._profile.safety
-        z_limit = (
-            DEFAULT_MAX_Z_JOG_UM if safety.max_z_jog_um is None else safety.max_z_jog_um
-        )
-        return (safety.max_jog_um, z_limit)
+        guard = Safety(max_jog_um=safety.max_jog_um, max_z_jog_um=safety.max_z_jog_um)
+        return (guard.max_jog_um, guard.max_z_jog_um)
 
     def _drive(
         self,

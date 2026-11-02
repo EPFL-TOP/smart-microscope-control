@@ -34,7 +34,7 @@ from smc.hardware.capabilities import (
     XYStage,
     ZStage,
 )
-from smc.hardware.errors import HardwareError
+from smc.hardware.errors import HardwareError, SafetyRefusedError
 from smc.hardware.profile import Profile
 from smc.hardware.roles import Role
 from smc.hardware.safety import DEFAULT_MAX_Z_JOG_UM
@@ -534,6 +534,36 @@ def test_jog_limits_follow_the_profile_and_the_assumed_z_default(
             assert _page(microscope, run_doc).jog_limits_um() == (250.0, expected_z)
         finally:
             microscope.close()
+
+
+@pytest.mark.parametrize("max_z", [None, 20.0], ids=["z-limit-assumed", "z-limit-set"])
+def test_jog_limits_are_what_the_facade_accepts(
+    run_doc: Path, max_z: float | None
+) -> None:
+    # The limits the page offers its steps from must be the ones the facade holds
+    # a jog to: two copies of the rule would drift (m5 §6.3). XY is per axis.
+    profile = Profile.demo().model_copy(deep=True)
+    profile.safety.max_jog_um = 250.0
+    profile.safety.max_z_jog_um = max_z
+    microscope = Microscope.from_core(
+        cast("CMMCorePlus", FakeCore.demo_like()), profile
+    )
+    try:
+        xy_limit, z_limit = _page(microscope, run_doc).jog_limits_um()
+        stage = microscope.require(XYStage)
+        focus = microscope.require(ZStage)
+        for dx, dy in ((xy_limit, 0.0), (0.0, xy_limit), (xy_limit, xy_limit)):
+            drive_module.jog_xy(microscope, dx, dy)
+            stage.move_to_um(0.0, 0.0)
+        for dx, dy in ((xy_limit + 0.01, 0.0), (0.0, xy_limit + 0.01)):
+            with pytest.raises(SafetyRefusedError):
+                drive_module.jog_xy(microscope, dx, dy)
+        drive_module.jog_z(microscope, z_limit)
+        focus.move_to_um(0.0)
+        with pytest.raises(SafetyRefusedError):
+            drive_module.jog_z(microscope, z_limit + 0.01)
+    finally:
+        microscope.close()
 
 
 # --- during live ---------------------------------------------------------------------
