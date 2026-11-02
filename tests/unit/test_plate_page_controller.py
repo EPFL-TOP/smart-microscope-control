@@ -2363,38 +2363,79 @@ def test_live_keeps_at_most_ten_frames_a_second(
     assert float(found.group(2)) >= 0.9, found.group(0)
 
 
-class SlowCamera(FrameCamera):
-    """A camera whose snap takes ``snap_s``; ``began`` is when each snap started (FM-157)."""
+class ClockedCamera(FrameCamera):
+    """A camera whose snap costs ``snap_s`` on a clock the test owns; ``began`` is when each started.
 
-    def __init__(self, frame: np.ndarray, *, snap_s: float) -> None:
+    The first snap waits for ``go``, so that the test can put its spy on the live
+    wait before the loop reaches it (FM-44, FM-157).
+    """
+
+    def __init__(self, frame: np.ndarray, *, now: list[float], snap_s: float) -> None:
         super().__init__(frame)
+        self._now = now
         self._snap_s = snap_s
         self.began: list[float] = []
+        self.go = threading.Event()
 
     def snap(self) -> np.ndarray:
-        self.began.append(time.monotonic())
-        time.sleep(self._snap_s)
+        assert self.go.wait(10), "the test never let the first snap go"
+        self.began.append(self._now[0])
+        self._now[0] += self._snap_s
         return super().snap()
 
 
-def test_a_camera_as_slow_as_the_period_runs_at_its_own_rate_and_not_slower(
-    page: PlatePage, fake_microscope: Microscope, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("snap_s", "wait_s"),
+    [(0.2, 0.0), (0.05, 0.15), (0.3, 0.0)],
+    ids=["snap-equals-period", "snap-shorter", "snap-longer"],
+)
+def test_the_live_wait_is_what_is_left_of_the_period_since_the_frame_began(
+    page: PlatePage,
+    fake_microscope: Microscope,
+    monkeypatch: pytest.MonkeyPatch,
+    snap_s: float,
+    wait_s: float,
 ) -> None:
     # The cap is a period: the wait is what is left of it since the frame began, so a
-    # frame that takes a whole period is followed by the next at once. A wait of the
-    # whole period after each frame would give 0.4 s between two snaps, not 0.2 s.
+    # frame that takes a whole period is followed by the next at once, and one that
+    # takes less waits for the rest. A wait of the whole period after each frame would
+    # put 0.4 s between two snaps in the first case. A clock the test owns, moved
+    # only by the snap and the wait: a mean of wall-clock gaps failed on a stalled runner
+    # (#311).
     monkeypatch.setattr(controller_module, "LIVE_PERIOD_S", 0.2)
-    camera = SlowCamera(_ramp_frame(), snap_s=0.2)
+    now = [100.0]
+    camera = ClockedCamera(_ramp_frame(), now=now, snap_s=snap_s)
     fake_microscope.override(Camera, camera)
-    page.live(True)
-    try:
-        _wait_for_frames(page, 6, timeout_s=10.0)
-    finally:
-        page.live(False)
-    assert page.join(10.0)
-    gaps = len(camera.began) - 1
-    mean_gap_s = (camera.began[-1] - camera.began[0]) / gaps
-    assert 0.18 <= mean_gap_s < 0.3, f"{gaps} gaps of {mean_gap_s:.3f} s on average"
+    waits: list[float | None] = []
+
+    def spy(timeout: float | None = None) -> bool:
+        # A wait with no limit, or one wait too many, fails here instead of hanging.
+        waits.append(timeout)
+        if timeout is None or len(waits) > 50:
+            raise AssertionError(f"the live wait is not bounded: {waits[-5:]}")
+        now[0] += timeout
+        if len(waits) == 5:
+            event.set()
+        return event.is_set()
+
+    # The name, not `time.monotonic`: the worker reads the real clock afterwards.
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            controller_module, "time", SimpleNamespace(monotonic=lambda: now[0])
+        )
+        page.live(True)
+        current = page._current_run
+        assert current is not None
+        event = current[1]
+        try:
+            with _replaced(event, "wait", spy):
+                camera.go.set()
+                assert page.join(10.0)
+        finally:
+            camera.go.set()
+            event.set()
+    assert waits == pytest.approx([wait_s] * 5)
+    assert np.diff(camera.began).tolist() == pytest.approx([max(snap_s, 0.2)] * 4)
 
 
 def test_end_live_and_is_live_return_at_once_and_take_no_lock(
