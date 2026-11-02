@@ -34,6 +34,8 @@ from smc.hardware.capabilities import Camera, ObjectiveTurret, XYStage, ZStage
 from smc.hardware.errors import HardwareError, ProfileError
 from smc.hardware.profile import SampleSection
 from smc.hardware.roles import Role
+from smc.plugins.plate_registration.algorithm import suggested_refs
+from smc.plugins.slots import WellRef, well_geometry
 from smc.testing.synthetic import TEXTURE_TILE_UM, Blob, PlateSample
 
 if TYPE_CHECKING:
@@ -48,6 +50,7 @@ __all__ = [
     "install_sample",
     "sample_lines",
     "sample_of",
+    "sample_refs",
     "scatter_cells",
 ]
 
@@ -155,6 +158,29 @@ def sample_of(section: SampleSection) -> PlateSample:
         blobs=scatter_cells(section),
         seed=section.seed,
     )
+
+
+def sample_refs(section: SampleSection) -> tuple[WellRef, ...]:
+    """The centres of the wells plate registration asks for, where this sample puts them.
+
+    These are the wells of ``suggested_refs`` (A1 and the two far corners), in
+    its order, each centre read from the ``WellPlatePlan`` that ``scatter_cells``
+    draws the cells in: the references and the pixels share one source of
+    truth, so ``calibrate`` fits A1 and the rotation of the sample back exactly
+    (m5 §8.2). The plate page registers the plate from them in one click on a
+    stand whose profile has a ``[sample]``; they are *known*, not measured, and
+    the page says so.
+    """
+    plan = useq.WellPlatePlan(
+        plate=section.plate,  # type: ignore[arg-type]
+        a1_center_xy=_a1_of(section),
+        rotation=section.rotation_deg,
+    )
+    refs: list[WellRef] = []
+    for well in suggested_refs(section.plate):
+        x_um, y_um = well_geometry(plan, well).center_um
+        refs.append(WellRef(well=well, x_um=x_um, y_um=y_um))
+    return tuple(refs)
 
 
 def sample_lines(section: SampleSection) -> tuple[str, ...]:
