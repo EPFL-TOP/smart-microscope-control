@@ -4,7 +4,8 @@
   settled by #272 (§2.1, §2.4, §3: the stale card, the card's bounds,
   `card_text`'s signature); live fixed by #262's plan (§5, 2026-10-29); drive
   fixed by #263's plan (§6, 2026-10-30); the stand's lifetime and the service
-  fixed by #264's plan with the owner (§7, 2026-10-30).
+  fixed by #264's plan with the owner (§7, 2026-10-30); the first run fixed by
+  #293's plan with the owner (§8, 2026-11-02).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 to M3, this document is the contract between issues.
   Names, module paths and signatures below are fixed; an executor who needs to
@@ -257,7 +258,7 @@ every card, which errs towards naming it.
 **The code of this section's stale mark and bounds** (the `stale` field,
 `_card`'s parameter, `_CARD_TEXT_CHARS`, the cut of `assumed`, `error` and
 `profile`, and the line of `docs/ui/plate-page.md` that says what a card
-shows) goes to the next issue that edits `controller.py`: **#262** (§8). Its
+shows) goes to the next issue that edits `controller.py`: **#262** (§9). Its
 plan lists it as steps with the tests of #272's plan.
 
 ### 2.5 The strip and the checklist
@@ -1137,9 +1138,403 @@ FM-24, FM-69.
 
 **Not measured**: a stand opened on a worker thread. Until #264, the command
 opened the stand on the main thread. A vendor adapter that cares which thread
-loaded it is the owner's finding (§8.1).
+loaded it is the owner's finding (§9.1).
 
-## 8. Sequencing
+## 8. The first run (#293)
+
+Fixed by #293's plan (2026-11-02). The owner followed the plate-scan workflow on
+`demo-sample` from `docs/ui/plate-page.md` and found it hard. **Decided with the
+owner (2026-11-02)**, the four points that cost the most, which are #293's
+acceptance criteria:
+
+- **registering the plate** needed a terminal command with a JSON `refs`, or the
+  7 minutes of `plate-finding`;
+- **which tool comes next, with which values** (`coverage` 0.4, `detector` =
+  `blobs`) had to be known and typed;
+- **where the files are** (the run document, the report, the export) was known
+  only from the terminal;
+- **choosing the wells**: a click selects a well, and the *Wells* box does not
+  show it.
+
+Also decided with the owner: **on a stand whose profile has a `[sample]`, the page
+registers the plate in one click from the sample's known geometry**, and says
+that those positions come from the profile and are not measured. Captures, when
+the operator made any, win.
+
+The page gains a **next step**: the tool the run document needs next, the values
+this stand suggests, why each one, its command, and one Run button. Nothing moves
+without that click, and the button is `run(plugin, pairs)` with the pairs the
+step shows, the call its command makes (principle 5). The guide is computed from
+the run document's checklist, the page's selection and captures, and the
+profile; it holds no state of its own and adds no region of its own to
+ADR-0006's picture (principle 3): it is the head of the tool panel.
+
+### 8.1 What the profile suggests (`[suggest]`, `smc/hardware/profile.py`)
+
+Stand-specific knowledge goes into the profile. A new optional table, one entry
+per plugin:
+
+```toml
+[suggest.scan-plan]
+params = ["coverage=0.4"]
+why = "a scan covers 40 % of each well, so that a few wells take seconds on the demo stage"
+
+[suggest.cells]
+params = ["detector=blobs"]
+why = "the synthetic cells are bright round spots that the trained model does not see; on a real sample blobs are not cells"
+```
+
+```python
+class SuggestSection(_Section):
+    params: tuple[str, ...]
+    why: str
+
+
+class Profile(_Section):
+    ...
+    suggest: dict[str, SuggestSection] = Field(default_factory=dict)
+```
+
+- `params` are `smc run --param` pairs, as written on the command line: the
+  suggestion **is** the command's call. The model checks their shape only, since
+  `smc.hardware` imports no plugin. Each item has an `=` and a key with no
+  surrounding space, else `each item of params is key=value, as smc run --param
+  takes it; got '<item>'`. A key is given at most once, else `'<key>' given
+  twice`. At least one item is required.
+- `why` is one non-empty line (the page shows it on one line), else `why is one
+  line that the page shows; give a non-empty text without a newline`.
+- The table's keys are plugin names. Whether such a plugin exists and takes those
+  keys is checked by the page (§8.3), not by the profile.
+- `_allowed_keys` names `SuggestSection`'s keys for an unknown key in any
+  `[suggest.<name>]`, so the refusal lists `params, why`.
+- `[suggest]` is allowed on every stand, unlike `[sample]`. In this issue,
+  `profiles/demo-sample.toml` gains the two entries above, with these texts.
+  `demo.toml`, `Profile.demo()` and the Nikon profiles gain none: what a real
+  stand suggests is the owner's call after a session there.
+
+### 8.2 The sample's references (`smc/testing/sample_stand.py`)
+
+```python
+def sample_refs(section: SampleSection) -> tuple[WellRef, ...]: ...
+```
+
+These are the wells of `suggested_refs(section.plate)` (A1 and the two far
+corners, the plugin's own choice: A1, A12 and H1 on 96 wells), in that order.
+Each centre comes from the `useq.WellPlatePlan(plate, a1_center_xy=_a1_of(section),
+rotation=section.rotation_deg)` that `scatter_cells` draws the cells in, so the
+references and the pixels share one source of truth.
+
+The function lives beside the sample, not in the page: it is the sample's truth,
+and the controller imports it inside the step's code, only when the profile
+has a `[sample]`. `smc.cli` already imports this module for `smc doctor`.
+
+Measured 2026-11-02 (Python 3.13.0, a throwaway script): `calibrate` fitted back
+the sample's A1 and rotation exactly, residual 0 to 1.5e-11 µm, nothing
+assumed, for four cases:
+
+- the default 96-well plate, centred;
+- A1 at (−40 000, 25 000) µm, turned 3°;
+- a 384-well plate turned −2.5° (A1, A24, P1);
+- a 6-well plate (A1, A3, B1).
+
+### 8.3 The next step (`smc/ui/guide.py`, new; `smc/ui/controller.py`)
+
+```python
+#: smc/ui/guide.py: no Panel, no device
+SELECT_WELLS = (
+    "select the wells to scan: click them on the map, or type a range in Wells "
+    "(A1:D6, C*, all)"
+)
+CAPTURE_WELLS = (
+    "centre a well under the objective (Live and the Drive pad), click it on the "
+    "map and press Capture centre; a second well, far from the first, fits the "
+    "rotation too"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class NextStep:
+    plugin: str | None
+    params: tuple[str, ...]
+    why: tuple[str, ...]
+    command: str
+    blocked: str | None
+
+
+def next_slot(checklist: Sequence[CheckItem]) -> CheckItem | None: ...
+def command_line(
+    plugin: str,
+    params: Sequence[str],
+    *,
+    profile: str,
+    run_doc: Path,
+    dry_run: bool,
+) -> str: ...
+```
+
+```python
+#: smc/ui/controller.py
+class PlateView:
+    ...
+    next_step: NextStep | None = None  # the last field
+
+
+class ToolView:
+    ...
+    suggested: tuple[tuple[str, str], ...] = ()  # (key, value)
+    suggested_why: str | None = None
+
+
+class PlatePage:
+    @property
+    def run_doc(self) -> Path: ...
+```
+
+`guide.py` imports `CheckItem` from the controller only for typing (`if
+TYPE_CHECKING`), and the controller imports `guide.py`.
+
+**`next_slot`** is the first item of the checklist that is not `optional` and
+whose `state` is not `ok`, else `None`. The optional slots (`camera-calibration`,
+`timings`, a third party's) are never a next step: the workflow runs without
+them.
+
+**`view()` builds `next_step`** from the document it has just read, in
+`PlatePage._next_step(checklist, blocked, cards)`:
+
+1. **No slot left**: `NextStep(plugin=None, params=(), command="", blocked=None,
+   why=("every stage of the workflow is done; what it wrote:", *files))`.
+   `files` are the `files` lines (§8.4) of every card, in tool order.
+2. **The tool**: the first tool of `tools()` (the stage order, then `More`)
+   whose plugin `provides` the slot. None is registered: `plugin=None`,
+   `why=("no registered plugin provides <slot>; smc run --list shows the
+   plugins",)`, and the walk stops there.
+3. **Why this tool**: the first `why` line is the item's `reason` when the slot
+   is `unusable` (the run document's own words: `run it again`, another
+   profile, stale, a dry run), else `the run document has no <slot> yet`.
+4. **The pairs and the lines that say where each value comes from**, in this
+   order:
+   - **`plate-registration`**:
+     - the page has captures (`refs` or `walls` not empty): the pairs are
+       `page_params("plate-registration")`, and the line is `plate, refs, walls:
+       the <n> centres and <m> walls captured on this page`;
+     - no capture, and the profile has a `[sample]` whose `plate` is `self.plate`:
+       the pairs are `plate=<plate>`, `refs=<json of sample_refs(...)>` and
+       `walls=[]`, dumped as `page_params` dumps them. The line is `refs: the
+       centres of <A1, A12, H1> where the profile's [sample] puts the plate; this
+       stand's plate is synthetic, so they are known, not measured`;
+     - a `[sample]` of another plate: `blocked` is `the profile's sample is a <p>
+       plate: choose <p> under plate-registration`;
+     - otherwise `blocked` is `CAPTURE_WELLS`.
+   - **`scan-plan`**: `page_params("scan-plan")`, and the line is `wells: the <n>
+     wells selected on the map`. With no selection, `blocked` is
+     `SELECT_WELLS`. Any other `ValueError` of `page_params` (a map of another
+     plate than the registered one) is `blocked`, with its message.
+   - **The profile's suggestion** for the tool, when it is valid (below): its
+     pairs follow, and its line is `<pairs joined by a space>: suggested by the
+     profile <stand>: <why>`.
+5. **Blocked by the run document or the stand**: `blocked[tool]` from the view
+   (a read slot unusable, `this stand has no <Capability>`, the checkpoint
+   refusal of #252, `the stand is not connected` of #264) wins over step 4's
+   `blocked`: it is the reason that holds first.
+6. **Another way**: for every other registered tool that provides the same
+   slot, a last line `or <name>: <its summary>`. On the plate this is
+   `plate-finding`.
+7. **`command`** is `command_line(tool, pairs, profile=<profile>, run_doc=self.run_doc,
+   dry_run=<dry run>)`. `<profile>` is `str(profile.source)` when the profile
+   was loaded from a file, else `profile.microscope.name`.
+
+**`command_line`** gives `smc run <plugin> -p <profile> --run-doc <run_doc>`,
+then `--dry-run` when it is one, then `--param <pair>` for each pair. It is
+quoted for a POSIX shell by `shlex.join`, so a JSON value is one
+single-quoted word. How it pastes into PowerShell or `cmd.exe` is not verified
+(§9.1). The run document's record of the run is the reference, whatever shell
+reads the line.
+
+**`run_doc`** is `self._run_doc.absolute()`, which is the path as the command
+was given it, made absolute against the server's working directory. Symbolic
+links are not resolved.
+
+**The suggestions are checked when the page is built**, against the registry,
+and kept as `(key, value)` pairs and `why`. For each `[suggest.<name>]`:
+
+| What is wrong | The `problems` line of `view()`, and the entry is ignored |
+|---|---|
+| No registered plugin is called `<name>` | `profile [suggest.<name>]: no plugin named <name>` |
+| A key is not a field of its `Params` | `profile [suggest.<name>]: <key> is not a parameter of <name> (keys: <the fields>)` |
+| A key that the page fills itself (`PAGE_PARAMS`) | `profile [suggest.<name>]: <key> is filled by the page` |
+
+A value is not checked there: a value that its plugin refuses is `run()`'s
+outcome, `<plugin>: ParamsError: ...`, which names the profile's mistake when
+the step is run.
+
+**The tool's form agrees with the step.** In `tools()`, a suggested key is a
+`key` row, after `KEY_PARAMS` and before the required fields, even when
+`KEY_PARAMS` does not name it: what the stand suggests is never folded under
+*Advanced*. `ToolView.suggested` carries the pairs and `suggested_why` carries
+`why`. On the page, the field of a suggested key **starts with the suggested
+value**, so a click on the tool's own Run sends it, as the step does. The step
+never reads the form. It runs its own pairs, so what the operator reads is what
+runs (#287's lesson). The two differ only after the operator edits the form.
+
+The profile, the stand's name and the dry run are the page's `_profile` and
+`_dry_run` (§7.2): the step works with the stand closed, and says so through
+`blocked`.
+
+### 8.4 Where the files are (the result card, the run document)
+
+```python
+class ResultCard:
+    ...
+    stale: bool = False
+    files: tuple[str, ...] = ()  # the last field
+```
+
+```python
+#: smc/ui/controller.py
+_FILE_KEYS = ("file", "folder")
+
+
+def _card(
+    record: StageRecord, *, stale: bool = False, run_dir: Path | None = None
+) -> ResultCard: ...
+```
+
+- **Which keys are files.** A top-level key of a `done` result that `_FILE_KEYS`
+  names, with a string value, is a file. The built-in plugins call them so:
+  - `scan`'s `folder`;
+  - the `file` of `cells`, `report` and `nis-export`.
+
+  A third party that follows the convention is shown the same way. Such a key
+  is not one of the card's `lines`; it is a `files` entry, `<key>: <path>`.
+- **The path.**
+  - An absolute value is kept as it is: `nis-export --param out=...` writes one.
+  - A relative value is relative to the run folder (`ctx.run_dir`, the run
+    document's folder), so it is shown as `str(run_dir / value)`, with
+    `run_dir = self.run_doc.parent`.
+  - With `run_dir=None` it is shown as it is written. That is for the tests that
+    build `_card` alone.
+
+  The path is shown, not opened or checked: a card reads the document only.
+  Each entry is cut at `_CARD_TEXT_CHARS`, like an assumption. Only a `done`
+  record has `files` (FM-154, as its `lines`).
+- **`card_text`** shows the `files`, each indented by two spaces, after the
+  `lines` and before `assumed`. A `done` card with none says `  in the run
+  document` there, so **every result card says where its result is**.
+- **The run document's path** heads the checklist: the bold `Run document` pane
+  says `Run document  <page.run_doc>`.
+- **A card wraps.** Every card pane, and the step's text, are `pn.pane.Str(...,
+  styles={"white-space": "pre-wrap", "overflow-wrap": "anywhere"})`. A path or
+  an assumption longer than the column now wraps, where #293's ui-check found
+  `assumed: no camera calibration for Nikon 10X S Fluor: ro...` cut at the
+  column's edge. It is still text, never markup (FM-139).
+
+### 8.5 The page (`smc/ui/plate_page.py`)
+
+```python
+class PlatePageView:
+    next_text: pn.pane.Str
+    next_note: pn.pane.Str
+    next_button: pn.widgets.Button
+
+    def on_next(self) -> None: ...
+
+
+def next_step_text(step: NextStep | None) -> str: ...
+```
+
+- **The region** is the head of the right-hand column, **above** *Drive*: a
+  bold `Next step`, then `next_text`, `next_button` and `next_note` (in the
+  warning colour). It is the first thing the column shows, and it is above the
+  fold at any height where the column starts on screen.
+- **`next_step_text`** is pure:
+  - `""` for `None`;
+  - with a tool: its name, then each `why` line indented by two spaces, then
+    `  command: <command>`;
+  - without a tool: the `why` lines, unindented.
+- **`next_button`**:
+  - its label is `Run <plugin>` (`label=`, `color="primary"`, FM-147);
+  - `visible=False` when the step has no tool;
+  - disabled when `blocked` is not `None`, or while an activity goes, as every
+    Run button is (`_draw_buttons`);
+  - `next_note` says `blocked`.
+- **`on_next`** runs **the step drawn**: the page keeps the `NextStep` that its
+  last redraw drew (`_next_drawn`), and the click calls
+  `page.run(drawn.plugin, list(drawn.params))` through `_try`, then `tick()`. It
+  never computes the step again at the click: the operator runs the pairs they
+  read (#287). With nothing drawn, or a drawn step that has no tool, it says
+  `nothing to run: press Refresh` and runs nothing. A click on the disabled
+  button still reaches the server (FM-169), and `run()`'s own refusals are the
+  guard.
+- **The tool's stage opens.** When the drawn step's tool changes, the stage's
+  `Accordion` card that holds the tool is added to the open cards (`active =
+  sorted({*active, index})`). It never closes a card the operator opened.
+- **Registered through `_handler`** (§3, FM-171), as every handler.
+
+**The *Wells* box follows the selection** (the owner's fourth point).
+
+- The view keeps `_wells_shown`, the selection that the box stands for.
+- After a typed range is applied, `_wells_shown` is `page.selection`, and the box
+  **keeps what was typed** (`A1:D6` stays `A1:D6`).
+- At every redraw, when `page.selection` differs from `_wells_shown` (a click,
+  another tab, a plate chosen, a run document read), the box is set to
+  `",".join(page.selection)` (`""` for none), and `_wells_shown` follows.
+- The box is set under a guard, `_echoing = True` around the assignment, and
+  `on_select_text` returns at once while it is set.
+- Measured on Panel 1.10.0 / Bokeh 3.10.1 / Python 3.13.0 and Panel 1.9.4 /
+  Bokeh 3.9.2 / Python 3.10.10 (2026-11-02, a throwaway script under
+  `warnings.simplefilter("error")`):
+  - a `param.watch` on `value` is called **synchronously** by the assignment, so
+    the guard skips it;
+  - the same value typed twice calls the watcher once;
+  - `pn.pane.Str(..., styles={...})`, `Button(label=, color="primary")` with
+    `label` and `disabled` changed later, and `Accordion.active` set to a
+    larger list all build with `get_root()` and warn nothing.
+
+  What a browser does with a box changed while the operator types in it is not
+  measured. The box is changed only by a redraw, which a click or the end of an
+  activity starts, never by the tick.
+
+### 8.6 What this does not do
+
+- The next step does not run a tool by itself, chain tools, or choose the wells.
+- It does not suggest a value from an earlier result. The route's `labels` keep
+  their default (`single`): the cells' classes are the route's to choose, and
+  `single` is what the plugin defaults to.
+- #293 does not move the map (#297), the *Density of* menu or the wheel over the
+  map, and it does not tell the page that a run from a terminal has ended (#251's
+  refresh).
+- The page does not open a file. It names the file, and the operator opens it
+  from the PC.
+
+### 8.7 Tests and failure modes
+
+The tests are named in #293's plan. **Failure modes**: FM-98, FM-125 (a
+profile's suggestion and a result's `file` taken as they come), FM-139, FM-145
+and FM-151 (the step is built by `view()`, never by the tick), FM-147, FM-153
+(the region looked at with `/ui-check`), FM-154, FM-161 (the Wells echo through
+a session's watcher, not only a direct call), FM-169, FM-171, FM-43, FM-44,
+FM-45, FM-36, FM-37.
+
+**Measured 2026-11-02** (Python 3.13.0, `profiles/demo-sample.toml`, Micro-Manager's
+demo devices, `smc run` from a terminal; nis-export through `run_plugin`
+because the main checkout's venv had stale entry points), the whole chain with
+the sample's three references:
+
+| Step | Time |
+|---|---|
+| `plate-registration` | 0.5 s |
+| `scan-plan` (`wells=B2,B11`, `coverage=0.4`) | 0.4 s |
+| `scan` | 18.1 s |
+| `cells` (`detector=blobs`) | 1.0 s |
+| `density` | 0.3 s |
+| `route` | 0.3 s |
+| `report` | 0.3 s |
+| `nis-export` (10 positions) | under 0.1 s |
+
+Every step was `done`. The report is `report/<token>.html` and the export is
+`nis-export/<token>.xml`, both under the run document's folder.
+
+## 9. Sequencing
 
 1. **#28** first and alone: it fixes the one-activity rule, `Frame` and the
    regions the others fill.
@@ -1153,8 +1548,12 @@ loaded it is the owner's finding (§8.1).
    controller's every read of the facade, so no other issue that edits
    `controller.py`, `plate_page.py` or `smc ui` in `cli.py` runs at the same time:
    #251, #287, #293, #295 and #297 come before it or after it.
+5. **#293** after #264 and #252 (PR #301): it reads #264's `_profile` and
+   `_dry_run`, and its step carries #252's checkpoint refusal. It edits
+   `controller.py`, `plate_page.py`, `profile.py` and `sample_stand.py`, so
+   #251, #287, #295 and #297 run before it or after it, never alongside.
 
-### 8.1 Not verified (for the owner)
+### 9.1 Not verified (for the owner)
 
 - The page in a real browser: the *Image* tab, the frame's orientation, a snap
   on a stand's camera (Ti2-E: Prime 95B, 1412×1412 `uint16`, a stride of 2
@@ -1184,3 +1583,10 @@ loaded it is the owner's finding (§8.1).
     `AppRotateFiles`.
 - **A stand opened on the worker thread** that Connect starts and that then ends,
   where the command used to open it on the main thread.
+- **The first run (§8)**:
+  - a newcomer follows the next step on `demo-sample`, from Connect to the
+    export, in a browser, with no terminal and no documentation open;
+  - the step's command pasted into PowerShell and `cmd.exe` (it is quoted for a
+    POSIX shell);
+  - the *Wells* box set by a redraw while the operator types in it;
+  - the wrapped cards and the step's region on the PC's screen and over RDP.
