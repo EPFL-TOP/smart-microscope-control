@@ -533,6 +533,42 @@ def test_objective_labels_that_cannot_be_read_are_empty_and_logged(
     ) in [(r.name, r.getMessage()) for r in caplog.records]
 
 
+def test_objective_labels_logs_a_failing_read_once_until_it_succeeds(
+    page: PlatePage, fake_microscope: Microscope, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Measured before #295: five failing reads logged five lines. The tick reads
+    # again while the choices are empty, and a line a tick would fill the log (FM-148).
+    turret = fake_microscope.require(ObjectiveTurret)
+
+    def failing() -> list[str]:
+        raise HardwareError("the turret did not answer")
+
+    def lines() -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "smc.ui"
+            and "its positions could not be read" in r.getMessage()
+        ]
+
+    with (
+        caplog.at_level("WARNING", logger="smc.ui"),
+        _replaced(turret, "labels", failing),
+    ):
+        for _ in range(5):
+            assert page.objective_labels() == ()
+        assert len(lines()) == 1
+    # A read that succeeds ends the streak: the next failure is news again.
+    assert TWENTY_X in page.objective_labels()
+    with (
+        caplog.at_level("WARNING", logger="smc.ui"),
+        _replaced(turret, "labels", failing),
+    ):
+        assert page.objective_labels() == ()
+        assert page.objective_labels() == ()
+    assert len(lines()) == 2
+
+
 def test_a_drive_action_without_live_counts_as_an_ended_activity(
     page: PlatePage,
 ) -> None:

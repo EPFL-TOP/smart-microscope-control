@@ -134,6 +134,42 @@ class StubTurret:
         return 0.0
 
 
+class FlakyTurret:
+    """The stand's own turret, some of whose first reads raise, as a driver that is not ready yet.
+
+    Put in through ``stand.override(ObjectiveTurret, ...)`` (an assignment on the
+    facade's cached instance would not be what ``get`` returns). ``label_reads``
+    counts the calls of ``labels()``.
+    """
+
+    def __init__(
+        self, real: Any, *, current_fails: int = 0, labels_fail: int = 0
+    ) -> None:
+        self._real = real
+        self.current_fails = current_fails
+        self.labels_fail = labels_fail
+        self.label_reads = 0
+
+    def labels(self) -> list[str]:
+        self.label_reads += 1
+        if self.labels_fail > 0:
+            self.labels_fail -= 1
+            raise RuntimeError("the turret did not answer")
+        return cast("list[str]", self._real.labels())
+
+    def current(self) -> str:
+        if self.current_fails > 0:
+            self.current_fails -= 1
+            raise RuntimeError("the turret did not answer")
+        return cast("str", self._real.current())
+
+    def select(self, label: str, *, confirm: bool = False) -> str:
+        return cast("str", self._real.select(label, confirm=confirm))
+
+    def pixel_size_um(self, label: str | None = None) -> float:
+        return cast("float", self._real.pixel_size_um(label))
+
+
 @pytest.fixture(autouse=True)
 def _fresh_state() -> Iterator[None]:
     SlowScan.started = threading.Event()
@@ -295,6 +331,52 @@ def test_drive_controls_are_disabled_while_a_run_goes_and_enabled_while_live_goe
     finally:
         page.live(False)
     assert page.join(10.0)
+
+
+def test_the_capture_buttons_are_disabled_while_an_activity_other_than_live_goes(
+    page: PlatePage, stand: Microscope, run_doc: Path
+) -> None:
+    view = PlatePageView(page)
+    page.current = "A1"
+    view.tick()
+    assert not view.capture_centre_button.disabled
+    assert not view.capture_wall_button.disabled
+
+    _click(view.tool_runs["scan"])
+    try:
+        assert SlowScan.started.wait(5)
+        view.tick()
+        assert view.capture_centre_button.disabled
+        assert view.capture_wall_button.disabled
+        # Panel still calls the handler of a disabled button (measured): the
+        # controller is the guard, and its refusal is the message (FM-169).
+        _click(view.capture_centre_button)
+        assert view.message.object == "scan is running"
+        _click(view.capture_wall_button)
+        assert view.message.object == "scan is running"
+        assert page.refs == ()
+        assert page.walls == ()
+    finally:
+        SlowScan.release.set()
+    assert page.join(10.0)
+
+    # Live goes: only the controller knows whether a drive action waits or runs,
+    # so the buttons stay enabled and the refusal is the message.
+    stand.override(Camera, FrameCamera())
+    view.on_live()
+    try:
+        assert page.is_live
+        view.tick()
+        assert not view.capture_centre_button.disabled
+        assert not view.capture_wall_button.disabled
+    finally:
+        page.live(False)
+    assert page.join(10.0)
+
+    closed = PlatePageView(PlatePage.closed(Profile.demo(), run_doc))
+    assert closed.capture_centre_button.disabled
+    assert closed.capture_wall_button.disabled
+    closed.page.close()
 
 
 # --- the pad and the focus -----------------------------------------------------------
@@ -485,6 +567,150 @@ def test_the_tick_never_moves_the_objective_choice(
     stand.require(ObjectiveTurret).select(TWENTY_X, confirm=True)
     view.tick()
     assert view.objective_select.value == FORTY_X
+
+
+def test_the_objective_select_follows_the_turret_after_a_first_read_that_failed(
+    stand: Microscope, run_doc: Path
+) -> None:
+    # Measured before #295: a first `current()` that raised left the select on its
+    # first option (the 40X) for good, while the 10X was in place: *Change
+    # objective* then turned to the 40X and not to the objective in place.
+    stand.override(
+        ObjectiveTurret, FlakyTurret(stand.require(ObjectiveTurret), current_fails=1)
+    )
+    page = _controller(stand, run_doc)
+    try:
+        view = PlatePageView(page)
+        # The build's own tick read nothing: the select is where Panel put it.
+        assert view.objective_select.value == FORTY_X
+        view.tick()
+        assert view.objective_select.value == TEN_X
+        # Once it has followed the turret it follows it no more.
+        view.objective_select.value = FORTY_X
+        view.tick()
+        view.tick()
+        assert view.objective_select.value == FORTY_X
+    finally:
+        page.close()
+
+
+def test_a_confirmation_armed_before_the_sync_is_taken_back_by_it(
+    stand: Microscope, run_doc: Path
+) -> None:
+    flaky = FlakyTurret(stand.require(ObjectiveTurret), current_fails=1)
+    stand.override(ObjectiveTurret, flaky)
+    page = _controller(stand, run_doc)
+    try:
+        view = PlatePageView(page)
+        assert view.objective_select.value == FORTY_X
+        _click(view.objective_button)
+        assert view.objective_confirm.visible
+
+        view.tick()
+
+        # The sync moved the select, and the select's own watcher took the
+        # confirmation back: the turn that follows is to a label the operator
+        # chose after the sync.
+        assert view.objective_select.value == TEN_X
+        assert not view.objective_confirm.visible
+        _click(view.objective_confirm_button)
+        assert view.message.object == "choose the objective again"
+        assert page.join(10.0)
+        assert flaky.current() == TEN_X
+    finally:
+        page.close()
+
+
+@pytest.mark.parametrize(
+    ("failures", "filled_by_the_build"), [(1, True), (2, False)], ids=["once", "twice"]
+)
+def test_a_turret_whose_labels_failed_at_the_build_is_read_again_on_the_tick(
+    stand: Microscope, run_doc: Path, failures: int, filled_by_the_build: bool
+) -> None:
+    # Measured before #295: one failed `labels()` at the build left the options empty
+    # and the control disabled for the life of the tab. The build reads once and its
+    # own tick reads again, so a turret that fails twice is still empty after it.
+    flaky = FlakyTurret(stand.require(ObjectiveTurret), labels_fail=failures)
+    stand.override(ObjectiveTurret, flaky)
+    page = _controller(stand, run_doc)
+    try:
+        view = PlatePageView(page)
+        if filled_by_the_build:
+            assert view.objective_select.options
+        else:
+            assert view.objective_select.options == {}
+            assert view.objective_button.disabled
+            assert view.drive_note.object == (
+                "objective: its positions could not be read"
+            )
+
+            view.tick()
+
+        assert next(iter(view.objective_select.options.values())) == FORTY_X
+        assert not view.objective_button.disabled
+        assert "its positions could not be read" not in view.drive_note.object
+        # The sync starts again with the options: the objective in place.
+        assert view.objective_select.value == TEN_X
+        assert not view.objective_confirm.visible
+        reads = flaky.label_reads
+        view.tick()
+        # Read again only while there is nothing to offer.
+        assert flaky.label_reads == reads
+    finally:
+        page.close()
+
+
+def test_a_labels_read_that_keeps_failing_is_logged_once_across_ticks(
+    stand: Microscope, run_doc: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The tick reads the labels again while there are none; a line a tick would fill
+    # the log and block the loop that handles STOP (FM-62, FM-148).
+    flaky = FlakyTurret(stand.require(ObjectiveTurret), labels_fail=1000)
+    stand.override(ObjectiveTurret, flaky)
+    page = _controller(stand, run_doc)
+    try:
+        with caplog.at_level("WARNING", logger="smc.ui"):
+            view = PlatePageView(page)
+            for _ in range(5):
+                view.tick()
+        assert flaky.label_reads >= 6  # the build, then a read per tick
+        lines = [
+            r.getMessage()
+            for r in caplog.records
+            if "its positions could not be read" in r.getMessage()
+        ]
+        assert lines == [
+            "objective: its positions could not be read: RuntimeError: "
+            "the turret did not answer"
+        ]
+    finally:
+        page.close()
+
+
+def test_a_stand_without_a_turret_logs_nothing_while_the_tick_looks_for_labels(
+    stand: Microscope, run_doc: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # No turret is no failure: the tick's look for labels reads no device, and a
+    # warning per tick for a stand that never had one would be noise.
+    real_get = stand.get
+
+    def get(capability: type) -> Any:
+        return None if capability is ObjectiveTurret else real_get(capability)
+
+    with (
+        _replaced(stand, "get", get),
+        _replaced(stand, "has", lambda capability: capability is not ObjectiveTurret),
+    ):
+        page = _controller(stand, run_doc)
+        try:
+            with caplog.at_level("WARNING", logger="smc.ui"):
+                view = PlatePageView(page)
+                for _ in range(3):
+                    view.tick()
+            assert view.objective_select.options == {}
+            assert not [r for r in caplog.records if r.name == "smc.ui"]
+        finally:
+            page.close()
 
 
 def test_an_empty_turret_label_is_offered_as_no_label(

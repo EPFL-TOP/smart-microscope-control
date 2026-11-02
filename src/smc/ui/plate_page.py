@@ -597,7 +597,8 @@ class PlatePageView:
             "", styles={"color": _WARNING, "white-space": "pre-wrap"}, width=380
         )
         # The label the confirmation was armed with, in a tuple: an empty label is
-        # one too (FM-125). The select is set once, at the first tick, never after.
+        # one too (FM-125). The select follows the turret until the tick has read the
+        # objective in place and set it, once; never after.
         self._armed: tuple[str] | None = None
         self._objective_shown = False
 
@@ -1073,6 +1074,8 @@ class PlatePageView:
             self._draw_cards()
         if status.connected != self._seen_connected:
             self._follow_connection(status.connected)
+        elif status.connected and not self.objective_select.options:
+            self._read_objectives_again()
         self._draw_connection(status)
         self.status_text.object = status_line(status)
         self.run_text.object = run_text(status)
@@ -1083,12 +1086,15 @@ class PlatePageView:
             "y": [] if status.xy_um is None else [status.xy_um[1]],
         }
         self._problems_status = status.problems
-        if not self._objective_shown:
-            # Once: the select starts at the objective in place, and the tick never
-            # moves it after (the strip says which one is in place).
+        if not self._objective_shown and status.objective in self._objective_labels:
+            # Until it has, once: the select starts at the objective in place, and
+            # the tick never moves it after (the strip says which one is in place).
+            # A read that failed gives ``None``, which is no option: the next tick
+            # tries again, so a first ``current()`` that raised does not leave
+            # the select on its first option, with *Change objective* turning to
+            # that one and not to the objective in place (#295).
             self._objective_shown = True
-            if status.objective in self._objective_labels:
-                self.objective_select.value = status.objective
+            self.objective_select.value = status.objective
         self._draw_problems()
         self._draw_frame()
         self._draw_buttons()
@@ -1109,10 +1115,28 @@ class PlatePageView:
         step, armed again here; a confirmation armed for the old stand is dropped.
         """
         self._seen_connected = connected
-        self._objective_labels = self.page.objective_labels()
-        self.objective_select.options = {
-            label or NO_LABEL: label for label in self._objective_labels
-        }
+        self._offer_objectives(self.page.objective_labels())
+
+    def _read_objectives_again(self) -> None:
+        """Read the turret's labels again on a connected stand that offered none (#295).
+
+        One failed ``labels()`` at the build, or at Connect, left the control
+        disabled for the life of the tab. The tick reads again while the choices
+        are empty, and offers them when the read gives some; a stand without a
+        turret answers ``()`` without a device read and without a log line, and a
+        read that keeps failing is logged once by the controller.
+        """
+        labels = self.page.objective_labels()
+        if labels:
+            self._offer_objectives(labels)
+
+    def _offer_objectives(self, labels: tuple[str, ...]) -> None:
+        """Offer ``labels`` as the select's choices, and let the tick set it to the objective in place.
+
+        A confirmation armed for other choices is dropped.
+        """
+        self._objective_labels = labels
+        self.objective_select.options = {label or NO_LABEL: label for label in labels}
         self._objective_shown = False
         self._disarm()
 
@@ -1348,7 +1372,8 @@ class PlatePageView:
         """A tool that is blocked, or any tool or snap while an activity goes, cannot be started.
 
         The captures read the stage, so they are disabled while the stand is
-        closed; the *Connect* row says why.
+        closed (the *Connect* row says why) and while an activity other than this
+        page's live goes (the controller refuses a capture then, #295).
         """
         running = self._running
         for name, button in self.tool_runs.items():
@@ -1359,14 +1384,18 @@ class PlatePageView:
         blocked = None if self._next_drawn is None else self._next_drawn.blocked
         self.next_button.disabled = running is not None or blocked is not None
         self.next_note.object = blocked or ""
-        closed = not self.page.connected
-        self.capture_centre_button.disabled = closed
-        self.capture_wall_button.disabled = closed
+        live = self.page.is_live
+        # The captures read the stage: disabled with the stand closed, and while an
+        # activity other than this page's live goes, which the controller refuses a
+        # capture for. While live goes they stay enabled: only the controller knows
+        # whether a drive action waits or runs, and its refusal is the message.
+        capture_off = not self.page.connected or (running is not None and not live)
+        self.capture_centre_button.disabled = capture_off
+        self.capture_wall_button.disabled = capture_off
         lacks = self.page.lacks(Camera)
         self.snap_button.disabled = running is not None or lacks is not None
         # While live goes its own button is the one that ends it; any other activity
         # leaves it nothing to do.
-        live = self.page.is_live
         self.live_button.label = _END_LIVE_LABEL if live else _LIVE_LABEL
         self.live_button.disabled = lacks is not None or (
             running is not None and not live

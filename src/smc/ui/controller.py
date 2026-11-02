@@ -675,6 +675,8 @@ class PlatePage:
         # The facade whose light ``status()`` read and which raised: ``light_lacks()``
         # does not read it again for that facade (one read a tick, m5 §6.3).
         self._light_read_raised: Microscope | None = None
+        # Whether ``objective_labels()`` has logged the failure of its streak.
+        self._labels_failure_logged = False
         self._closed = False
         self._ended = 0
         # A plain attribute, written by ``stop()`` and ``resume()``, which take no lock.
@@ -1128,6 +1130,7 @@ class PlatePage:
                 self._stop_note = None
                 self._light_lacks_found = None
                 self._light_read_raised = None
+                self._labels_failure_logged = False
         if closed:
             try:
                 microscope.close()
@@ -1172,6 +1175,7 @@ class PlatePage:
             microscope, self._microscope = self._microscope, None
             self._light_lacks_found = None
             self._light_read_raised = None
+            self._labels_failure_logged = False
         if microscope is None:  # unreachable: only an activity drops it
             return f"disconnect: {NOT_CONNECTED}"
         try:
@@ -1510,7 +1514,14 @@ class PlatePage:
         )
 
     def objective_labels(self) -> tuple[str, ...]:
-        """The turret's labels in position order; ``()`` with the stand closed, without a turret or when the read fails."""
+        """The turret's labels in position order; ``()`` with the stand closed, without a turret or when the read fails.
+
+        A failure is logged at WARNING **once** per failing streak (#295): the tick
+        reads again while the choices are empty, and a line a tick would fill the
+        log and block the loop that handles STOP (FM-62, FM-148). A read that
+        succeeds ends the streak, and so do Connect and Disconnect (a new stand
+        has not failed yet).
+        """
         microscope = self._microscope
         if microscope is None:
             return ()
@@ -1518,14 +1529,18 @@ class PlatePage:
         if turret is None:
             return ()
         try:
-            return tuple(turret.labels())
+            labels = tuple(turret.labels())
         except Exception as exc:
-            log.warning(
-                "objective: its positions could not be read: %s: %s",
-                type(exc).__name__,
-                _one_line(exc),
-            )
+            if not self._labels_failure_logged:
+                self._labels_failure_logged = True
+                log.warning(
+                    "objective: its positions could not be read: %s: %s",
+                    type(exc).__name__,
+                    _one_line(exc),
+                )
             return ()
+        self._labels_failure_logged = False
+        return labels
 
     def light_lacks(self) -> str | None:
         """Why the light cannot be switched on from the page, or ``None``.
