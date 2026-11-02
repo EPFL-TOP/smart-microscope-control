@@ -35,8 +35,14 @@ def stand() -> Iterator[tuple[FakeCore, Microscope]]:
 
 
 def _read_failed(caplog: pytest.LogCaptureFixture) -> list[str]:
-    """The message of every record, of any logger, that tells of a failed read."""
-    return [m for m in caplog.messages if " read failed (" in m]
+    """The message of every record, of any logger, that tells of a failed read.
+
+    Every one is a DEBUG line: the record of when a read began to fail must not
+    become a console line at the default level, once per failure or not.
+    """
+    records = [r for r in caplog.records if " read failed (" in r.getMessage()]
+    assert {r.levelno for r in records} <= {logging.DEBUG}
+    return [r.getMessage() for r in records]
 
 
 def _line(state: MicroscopeState, name: str) -> str:
@@ -108,3 +114,79 @@ def test_a_second_facade_logs_a_failed_read_of_its_own(
     line = _line(states[0][0], "z")
     assert _line(states[0][1], "z") == line
     assert _read_failed(caplog) == [line, line]
+
+
+def test_a_channel_read_that_fails_after_a_failed_lookup_is_logged_too(
+    stand: tuple[FakeCore, Microscope],
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The two reads named `channel` never fail in one call (the second needs the
+    # first), so only across calls can their keys collide: the lookup of the channel
+    # group fails and is retried at the next call, which then finds the presets
+    # unreadable. The second failure is a new one and has its line.
+    core, microscope = stand
+    core.config_groups = {"Channel": {"BF": [("Camera", "Exposure", "10")]}}
+    real_groups = core.getAvailableConfigGroups
+    calls = 0
+
+    def groups() -> tuple[str, ...]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("config: no answer")
+        return real_groups()
+
+    def presets(group: str) -> tuple[str, ...]:
+        raise RuntimeError("presets: no answer")
+
+    monkeypatch.setattr(core, "getAvailableConfigGroups", groups)
+    with caplog.at_level(logging.DEBUG):
+        lookup = microscope.state()
+        monkeypatch.setattr(core, "getAvailableConfigs", presets)
+        current = microscope.state()
+    assert _read_failed(caplog) == [_line(lookup, "channel"), _line(current, "channel")]
+    assert "getAvailableConfigGroups" in _line(lookup, "channel")
+    assert "getAvailableConfigs" in _line(current, "channel")
+
+
+class _InterruptOnce(logging.Handler):
+    """Raises ``KeyboardInterrupt`` from ``emit`` on the first line of a failed read.
+
+    A Ctrl-C that lands while the console is written, FM-62.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.attempts = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if " read failed (" not in record.getMessage():
+            return
+        self.attempts += 1
+        if self.attempts == 1:
+            raise KeyboardInterrupt
+
+
+def test_a_line_cut_by_an_interrupt_is_not_written_again_by_the_next_call(
+    stand: tuple[FakeCore, Microscope], caplog: pytest.LogCaptureFixture
+) -> None:
+    # The memory is rebound before the lines are written: a write that is cut short
+    # (a blocked console, a second Ctrl-C) leaves it updated, so the next state(), the
+    # stop path's describe() for one, does not write the same line to the same console.
+    core, microscope = stand
+    core.failing["Z"] = RuntimeError("Z: no answer")
+    handler = _InterruptOnce()
+    root = logging.getLogger()
+    with caplog.at_level(logging.DEBUG):
+        root.addHandler(handler)
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                microscope.state()
+        finally:
+            root.removeHandler(handler)
+        assert handler.attempts == 1
+        before = len(caplog.records)
+        microscope.state()
+    again = [r.getMessage() for r in caplog.records[before:]]
+    assert [m for m in again if " read failed (" in m] == []
