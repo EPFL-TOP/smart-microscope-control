@@ -5,7 +5,10 @@
   `card_text`'s signature); live fixed by #262's plan (§5, 2026-10-29); drive
   fixed by #263's plan (§6, 2026-10-30); the stand's lifetime and the service
   fixed by #264's plan with the owner (§7, 2026-10-30); the first run fixed by
-  #293's plan with the owner (§8, 2026-11-02).
+  #293's plan with the owner (§8, 2026-11-02); the drive's follow-ups fixed by
+  #295's plan (§6.1 to §6.4, 2026-11-02: a switch-off at the end of live, the
+  outcome live keeps, the captures' refusal, the readbacks from the state, the
+  objective select's sync).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 to M3, this document is the contract between issues.
   Names, module paths and signatures below are fixed; an executor who needs to
@@ -399,7 +402,8 @@ class PlatePage:
   and waits on its event for what is left of `LIVE_PERIOD_S` since the frame
   began (`max(0.0, ...)`): the cap is a period, so a camera slower than 10
   frames a second runs at its own rate.
-- **Its outcome**: ended by its event (`live(False)`, STOP, `close()`): `live
+- **Its outcome** (§6.3 adds what the last drive action and a switch-off at the
+  end say after it): ended by its event (`live(False)`, STOP, `close()`): `live
   ended: <n> frames in <s:.1f> s` (the rate the owner reads at a stand); a
   frame that fails ends it: `live ended after <n> frames: <text>`; the last
   good frame stays `frame()`. A live while the stand is halted ends at its
@@ -546,9 +550,20 @@ def set_objective(
 def engage_autofocus(microscope: Microscope) -> DriveResult: ...
 def disengage_autofocus(microscope: Microscope) -> DriveResult: ...
 def switch_light(microscope: Microscope, on: bool) -> DriveResult: ...
+def move_xy(microscope: Microscope, x_um: float, y_um: float) -> DriveResult: ...
+def move_z(microscope: Microscope, z_um: float) -> DriveResult: ...
+def read_autofocus(microscope: Microscope) -> AutofocusReading: ...
 def um_text(value: float) -> str: ...
 def xy_text(position: XY) -> str: ...
 def z_text(z_um: float) -> str: ...
+```
+
+```python
+@dataclass(frozen=True, slots=True)
+class AutofocusReading:
+    text: str
+    engaged: bool | None
+    known: bool
 ```
 
 - Each one is `microscope.require(<capability>)` and **one** capability call, the
@@ -574,7 +589,7 @@ def z_text(z_um: float) -> str: ...
   | `jog_z` | `Z z µm`, the returned position | `[dry-run] would move to Z z µm; the drive is at Z z µm` |
   | `set_objective` | `objective '<current()>'`; when `current()` is not `label`: `objective '<current()>', although '<label>' was asked`, `reached=False` | `[dry-run] would turn to '<label>'; the turret is at '<current()>'` |
   | `engage_autofocus` | `True`: `autofocus locked`; `False`: `autofocus did not lock; it is off`, `reached=False` | `[dry-run] would engage the autofocus; <describe_autofocus>` |
-  | `disengage_autofocus` | `describe_autofocus(microscope.state())`; `reached=False` unless it is `autofocus off` | the same, then ` (dry run: switching off is sent all the same)` |
+  | `disengage_autofocus` | `read_autofocus(...).text`; `reached=False` unless `engaged is False` | the same, then ` (dry run: switching off is sent all the same)` |
   | `switch_light(on=True)` | the readback: `light on`; `light off, although on was sent` with `reached=False` | `[dry-run] would switch the light on; it is <on, off or ?>` |
   | `switch_light(on=False)` | `light off`; `light on, although off was sent` with `reached=False` | `light off (dry run: switching off is sent all the same)` |
 
@@ -586,7 +601,27 @@ def z_text(z_um: float) -> str: ...
   that name (in the module's `__all__`; `Microscope.describe` calls it as
   before). The dry-run texts of `jog_xy` and `jog_z` are the ones `smc stage
   jog --dry-run` and `smc z jog --dry-run` print today, read again from the
-  stage after the call, as `_move_xy` does.
+  stage after the call.
+- **`move_xy` and `move_z`** (#295) are `smc stage move` and `smc z move`:
+  `require` and **one** call, `XYStage.move_to_um(x, y)` or
+  `ZStage.move_to_um(z)`, and the texts of the two jogs, which one private helper
+  builds for all four (the dry-run tail "would move to ...; the stage is at ..."
+  is written once; before #295 `cli.py`'s `_move_xy` and `_move_z` held a second
+  copy, which go). The page has no absolute move: its own is `goto-well`.
+- **A decision is read from a field, never from a text** (#295, FM-155).
+  `read_autofocus` reads `state()` **once** and gives: `engaged`, the state's
+  `autofocus_engaged`; `known`, `autofocus_known(state)`, a public function of
+  `smc.hardware.microscope` that `describe_autofocus` itself calls (`False` exactly
+  when the words are `autofocus ?`: a read that the answer needs failed); and
+  `text`, `describe_autofocus(state)`, to which an unknown state adds its causes,
+  once each, in brackets, **each on one line** (`" ".join(cause.split())`: a driver's
+  multi-line message must not reach a one-line outcome). `disengage_autofocus` is
+  `reached` when `engaged is False`; `engage_autofocus`, after a `False`, says `it is
+  off` when `engaged is False` and `<text>` otherwise; `smc autofocus get` exits 1
+  when `not known`. No decision compares a string, so rewording `describe_autofocus`
+  cannot flip a `reached`. `autofocus_text` (a string) goes: it was `read_autofocus(...).text`.
+  The controller's `status()` calls `describe_autofocus(state)` and no longer keeps
+  its copy `_autofocus_words`.
 
 ### 6.2 The commands (`smc/cli.py`)
 
@@ -607,16 +642,26 @@ smc light off [--dry-run] [-p PROFILE]
   PFS, Zeiss Definite Focus): engage, disengage, read.`) and `light_app` (`The
   light source: on, off, read.`), registered as `objective`, `autofocus` and
   `light`, each `no_args_is_help=True, rich_markup_mode="rich"` as `stage_app`.
-- Each command opens the stand as `_move_xy` does (`_Reported`,
+- Each command goes through `_drive_command` (`_Reported`,
   `Microscope.open(profile, dry_run=dry_run)`), calls its action of §6.1 and
   prints `result.text` with `_say`, or with `_fail` and exit 1 when `not
-  result.reached`. None prints `_say_stop_refused`'s line: none sends a move to
-  `xy_stage`, `focus` or `autofocus_offset` that a refused stop leaves running
-  (a turret cannot be stopped at all, and an engage's Z move is stopped by
-  switching the autofocus off, which the stop does first; FM-117). A stand without the capability
-  exits 1 with `CapabilityMissingError`'s text, as `smc stage get` does.
-- `smc stage jog` and `smc z jog` call `jog_xy` and `jog_z`; their options,
-  texts and exit codes do not change (their tests pin them).
+  result.reached`. None of the three groups below prints `_say_stop_refused`'s
+  line: none sends a move to `xy_stage`, `focus` or `autofocus_offset` that a
+  refused stop leaves running (a turret cannot be stopped at all, and an
+  engage's Z move is stopped by switching the autofocus off, which the stop does
+  first, FM-117; `_drive_command`'s docstring says so). A stand without the
+  capability exits 1 with `CapabilityMissingError`'s text, as `smc stage get`
+  does.
+- `smc stage jog` and `smc z jog` call `jog_xy` and `jog_z`, and (#295) `smc
+  stage move` and `smc z move` call `move_xy` and `move_z`, all four through
+  `_drive_command` with the line `_say_stop_refused` prints for `xy_stage` or
+  `focus`; their options, texts and exit codes do not change (their tests pin
+  them).
+- **An empty turret position** (#295) is named by an empty `LABEL`: `smc objective
+  set "" --confirm`. Windows PowerShell 5.1 drops an empty argument on its way to
+  a program, so there it is `smc objective set '""' --confirm`; `cmd.exe` and the
+  page take `""` and the choice `(no label)`. This is PowerShell's documented
+  behaviour, not measured here (§9.1); `docs/ui/plate-page.md` says it.
 - **`objective set`**: `--confirm` (help: `The stage is clear: turning the turret
   can drive an objective into a loaded plate.`) is passed as `confirm=`. A refusal
   for the missing confirmation exits 2 with the facade's reason and the hint
@@ -675,8 +720,12 @@ class PlatePage:
 - **A drive action while live goes** runs on the live worker, **between two
   frames**: there is one thread on the devices, live goes on, and a frame
   taken after the action shows where it went (focusing and finding a field).
-  The page keeps **one** waiting action, `_drive_waiting: tuple[str,
-  Callable[[], str]] | None`, under `_lock`:
+  The page keeps **one** waiting action, `_drive_waiting: _Handed | None`, under
+  `_lock`, where `_Handed` is a `NamedTuple` of `name: str`, `run: Callable[[],
+  str]` and `switch_off: bool` (#295: `True` for `light off` and `autofocus
+  disengage`, the two switch-offs; `_drive` takes it as a keyword, default
+  `False`). While an action runs on the live worker, `_drive_running: str | None`
+  holds its name, under `_lock` (#295: what a capture reads, below):
   - `_drive` takes `_lock`; if `_current_run` is no longer that live, or the
     live's event is set, it raises `RuntimeError("live is ending")`; if an
     action already waits,
@@ -684,20 +733,47 @@ class PlatePage:
     queued: a queue would move the stage after the operator stopped clicking);
     otherwise it keeps the action and returns.
   - `_live`'s loop, at the top of each turn, before the frame: under `_lock`,
-    takes the waiting action unless the event is set; outside the lock runs it,
-    then puts its outcome text in `_outcome` (under `_lock`) and logs it at INFO
-    (a drive action is logged; a frame never is, FM-148). A drive action that
-    fails is its outcome and **live goes on**; only a frame that fails ends
-    live (§5.1).
+    takes the waiting action unless the event is set and sets `_drive_running`
+    to its name; outside the lock runs it, then, under `_lock`, puts its outcome
+    text in `_outcome`, clears `_drive_running`, and logs it at INFO (a drive
+    action is logged; a frame never is, FM-148). A drive action that fails is its
+    outcome and **live goes on**; only a frame that fails ends live (§5.1). The
+    loop keeps the outcome text of the **last** action it ran (#295: below).
   - Whatever ends the loop (the event, a failed frame), a `finally` **sets the
-    live's event**, then takes the action still waiting, under `_lock`, and
-    drops it: it is **never sent**, and the live's outcome ends with `; <name>
-    was not run`. STOP, End live, `close()` and a failed frame therefore never
-    leave a move to be sent after them (FM-88's shape). The event is set first
-    because a failed frame ends the loop without it: a `_drive` that took the
-    lock after the drop would otherwise keep an action that no loop takes.
-    Since the event is only ever set and `_drive` reads it under the lock, an
-    action is either taken by the loop or refused, never lost.
+    live's event**, then takes the action still waiting, under `_lock`:
+    - **any action but a switch-off is dropped**: it is **never sent**, and the
+      live's outcome ends with `; <name> was not run`. STOP, End live, `close()`
+      and a failed frame therefore never leave a move, a turn or an engage to be
+      sent after them (FM-88's shape);
+    - **a switch-off is run** (#295), once, on the live worker, after the loop and
+      outside the lock, as any drive action runs (`_drive_running` holds its name,
+      its outcome is `<name>: <text>`, a failure is that text and never raised,
+      FM-98), and its outcome ends the live's. Dropping it left the light on
+      after a STOP (measured on `FakeCore.demo_like()` with the White Light
+      Shutter: `light off` clicked behind a frame, then STOP: `live ended: 1
+      frames in 0.0 s; light off was not run`, and the light still read on). It
+      is the safe call the facade never refuses, also while halted (measured: on a
+      halted facade `switch_light(off)` and `disengage_autofocus` run and read back
+      `light off` and `autofocus off`, a jog is refused), and it sends **no move**,
+      so FM-88's reason for dropping a restore step does not apply to it: a
+      switch-off is not a restore and moves nothing. STOP does not wait for it
+      (`stop()` takes no lock and joins nothing, FM-70); `close()` waits for it
+      within `_CLOSE_WAIT_S`, as for a frame.
+
+    The event is set first because a failed frame ends the loop without it: a
+    `_drive` that took the lock after the drop would otherwise keep an action
+    that no loop takes. Since the event is only ever set and `_drive` reads it
+    under the lock, an action is either taken by the loop, run at the end or
+    dropped, or refused, never lost.
+  - **What live's outcome says** (#295). Before, `_start_activity` replaced the
+    outcome of the last drive action with live's own at the end, and only the log
+    kept it. Now live's outcome is `live ended: <n> frames in <s:.1f> s` (or `live
+    ended after <n> frames: <text>`, §5.1), then, each only when it exists: `;
+    <outcome of the last action the loop ran>` (it begins with `<name>: `), then
+    `; <outcome of the switch-off run at the end>` or `; <name> was not run`.
+    Example: `live ended: 2 frames in 0.1 s; stage jog: XY (100.00, -50.00) µm;
+    light off: light off`. Only the last action's outcome is kept: the earlier
+    ones were on the strip while live went, and the log has every one.
   - The action waits for at most what is left of the frame in flight and of
     `LIVE_PERIOD_S`.
   - Measured on a throwaway subclass of `PlatePage` with this loop
@@ -719,16 +795,49 @@ class PlatePage:
   facade (`MicroscopeHaltedError`'s text is the outcome); `autofocus(False)` and
   `light(False)` run, since the facade never refuses switching off. The
   controls are not disabled while halted: the refusal says why.
+- **A capture reads the stage, so it is refused while the stage is about to move
+  or moves** (#295). `capture_centre` and `capture_wall`, after their argument
+  checks (a bad `side`, a well that is not on the plate: `ValueError`, as before)
+  and before they read the stage, raise `RuntimeError("<name> is running")` when
+  an activity other than this page's live goes (a run, a snap, a drive action of
+  its own, `connect`, `disconnect`: `goto-well` and every plugin that moves the
+  stage are runs), and, while live goes, `RuntimeError("<name> is waiting")` when
+  an action waits and `RuntimeError("<name> is running")` when one runs on the
+  live worker (`_drive_running`). Before, a capture clicked behind a jog recorded
+  the stage *before* the jog (measured: a jog of 500 µm waiting behind a frame,
+  `capture_centre` returned (0, 0), and the stage then went to (500, 0); the same
+  with a jog that ran on the live worker, whose `_drive_waiting` was already
+  empty), and the capture takes no busy check at all, so a `goto-well` run's
+  stage is read mid-route by the same code. A live with no action waiting or
+  running does not refuse: a frame moves nothing.
+  The check takes `_lock` briefly and is not atomic with the read: the window is
+  one `position_um()` call, for an operator clicking in two tabs. The view's
+  capture buttons are disabled for the same states as a courtesy (§6.4); the
+  controller is the guard (FM-169).
 - `objective_labels()` is `ObjectiveTurret.labels()` as a tuple, `()` when the
-  stand lacks a turret or the read fails (logged at WARNING).
+  stand lacks a turret or the read fails. **A failure is logged at WARNING once**
+  (#295) and not again until a read succeeds or the connection changes: the tick
+  reads it again while the choices are empty (§6.4), and a line a second would
+  fill the log and block the loop that handles STOP (FM-62, FM-148; measured: five
+  failing reads logged five lines).
 - `light_lacks()` is `lacks(LightSource)`, else, when `LightSource.is_on()`
   reads `None`, `the light source <device()> has no on/off that smc knows`,
   else `None`. A read that raises is `None` (the click then says what fails).
   The answer is kept after the first read that does not raise: a device's type
-  does not change while the stand is held.
-- `jog_limits_um()` is `(profile.safety.max_jog_um, profile.safety.max_z_jog_um
-  or DEFAULT_MAX_Z_JOG_UM)` (`smc.hardware.safety`): what the page's step
-  choices are bounded by (§6.4).
+  does not change while the stand is held. **One read a tick** (#295): `status()`
+  reads `is_on()` on every tick, so it hands its result to `light_lacks()` for the
+  stand it read: a read that did not raise gives the answer (and keeps it), and
+  one that raised gives `None` without a second read (measured: a failing
+  `is_on()` was called twice a tick, by `status()` and by `light_lacks()`).
+  `light_lacks()` called before any `status()` reads for itself.
+- `jog_limits_um()` is `(guard.max_jog_um, guard.max_z_jog_um)` of a
+  `smc.hardware.safety.Safety(max_jog_um=profile.safety.max_jog_um,
+  max_z_jog_um=profile.safety.max_z_jog_um)` (#295): `Safety` is the class the
+  facade enforces the jog with and the one that owns "no `max_z_jog_um` means
+  `DEFAULT_MAX_Z_JOG_UM`", so the controller no longer repeats that rule and
+  imports `DEFAULT_MAX_Z_JOG_UM` no more. It reads the profile and not the facade,
+  because the page builds its steps while the stand may be closed (§7.3). What the
+  page's step choices are bounded by (§6.4).
 - `goto` (a click on the map in drive mode) is a run of the `goto-well` plugin,
   which writes a record: it stays refused while live goes (`live is running`).
 
@@ -786,8 +895,25 @@ class PlatePageView:
   and the facade's refusal says why.
 - **The objective's confirmation** (FM-14). `objective_select` offers
   `objective_labels()`, an empty label shown as `(no label)` (`{label or "(no
-  label)": label}`), and starts at the current objective; the tick never
-  changes it (the strip says which objective is in place). `Change objective`
+  label)": label}`), and starts at the current objective. **The select follows
+  the turret until it has, once** (#295): each tick, while the select has not been
+  set, sets it to `status.objective` when that is one of its options, and only
+  then is it set; a read that failed gives `None`, and the next tick tries again
+  (before #295 the first tick counted, and a first `current()` that raised left
+  the select on its first option: *Change objective* then turned to that option
+  and not to the objective in place; measured with a fake whose first `current()`
+  raised: the select stayed on `Nikon 40X Plan Fluor ELWD` while `Nikon 10X S
+  Fluor` was in place). After that the tick never changes it (the strip says which
+  objective is in place); a change of connection starts it again (§7.3). Setting
+  it disarms a confirmation armed meanwhile (the select's own watcher), so the
+  turn that follows is always to a label the operator chose after the sync.
+  **The choices are read again while there are none** (#295): a tick that finds
+  `objective_select.options` empty on a connected stand calls
+  `page.objective_labels()`; when it returns labels, the options are set and the
+  sync above starts again. Before, one failed `labels()` at the build disabled
+  the control for the life of the tab (measured: still `{}` and disabled after
+  later ticks that would have read). The failing read is logged once (§6.3).
+  `Change objective`
   **arms**: it keeps the chosen label, shows `objective_confirm` with the text
   `Turn the turret to '<label>'? A turn can drive an objective into a loaded
   plate: check that the stage is clear. The autofocus is switched off and not
@@ -808,7 +934,19 @@ class PlatePageView:
   disabled button **still calls its handler** on the server (a browser holds a
   click on a button it shows disabled; one that has not yet drawn the change
   sends it), so the controller's refusals are the guard and the button's state
-  only a courtesy; every handler goes through `_try` as the others do.
+  only a courtesy; every handler goes through `_try` as the others do. **The
+  capture buttons** (*Capture centre*, *Capture wall*, #295) are disabled with the
+  stand closed, as before, and now also while an activity other than this page's
+  live goes (`running is not None and not page.is_live`): the controller refuses a
+  capture then (§6.3), and the button says so before the click. While live goes
+  they stay enabled: only the controller knows whether an action waits or runs,
+  and its refusal is the message.
+- **The labels are the options' keys, so equal labels collapse** (#295, noted and
+  not coded around): `{label or "(no label)": label}` has one option for two
+  positions that share a label, or for two empty ones, and the layer addresses a
+  turret position by its label too (`select(label)`), so the limit is the layer's
+  and not the page's. Whether Micro-Manager allows such labels on a real stand is
+  not known (§9.1).
 - **Each handler** calls its controller action through `_try` (a refusal is the
   page's message, FM-98) and then `tick()`, as `on_snap`.
 - Widget spellings that do not warn on the lab's Panel (FM-147, measured on
@@ -817,9 +955,12 @@ class PlatePageView:
 
 ### 6.5 Tests and failure modes
 
-Tests are named in #263's plan. **Failure modes**: FM-14, FM-12, FM-88, FM-89,
+Tests are named in #263's plan, and in #295's for the follow-ups above.
+**Failure modes**: FM-14, FM-12, FM-88, FM-89,
 FM-118, FM-117, FM-64, FM-98, FM-70, FM-44, FM-96, FM-73, FM-125, FM-147,
-FM-151, FM-155, FM-167, FM-36, FM-37, FM-32, FM-43, FM-45, FM-47, FM-161.
+FM-151, FM-155, FM-167, FM-36, FM-37, FM-32, FM-43, FM-45, FM-47, FM-161. #295
+adds, by the text of the checklist's entries it writes: a drop at STOP that also
+drops the safe call; a position recorded while a move waits or runs.
 
 ## 7. The stand's lifetime and the service (#264)
 
@@ -884,8 +1025,10 @@ The help says:
 > The page starts with the stand closed: Connect opens the profile's stand and
 > Disconnect releases it, for NIS-Elements or ZEN. Every tool button is a plugin
 > run with the parameters smc run takes, so each has a command-line equivalent,
-> and each tool shows its last result. Ctrl-C stops what is going, then the
-> server, then releases the stand.
+> and each tool shows its last result. Ctrl-C sends a stop to any move under way
+> and tells what is going to stop, then ends the server, then releases the
+> stand. A stand that refuses stop() lets a sent move run to its target, and
+> the line printed says what each stop did.
 
 ### 7.2 The controller (`smc/ui/controller.py`)
 
@@ -1603,6 +1746,12 @@ Every step was `done`. The report is `report/<token>.html` and the export is
   after the move (the interlock), which may drive Z back to the offset's plane
   (FM-118): the jog would not stay, and focusing by hand needs the autofocus
   off.
+- **Drive's follow-ups (#295)**: *Light off* clicked behind a frame, then STOP, on
+  the Ti2-E's `DiaLamp`: the light goes off after the stop and the page says so; a
+  turret whose positions share a label, or two empty ones, if Micro-Manager allows
+  them (the select then shows one option for both, §6.4); `smc objective set '""'`
+  in Windows PowerShell 5.1 against an empty position (§6.2 states PowerShell's
+  documented behaviour; it was not run here, nor on any PC).
 - A newcomer registers a plate on the `demo-sample` stand from the page, without
   a manual (#28's last criterion), with a lab member.
 - **The service on a microscope PC** (§7.4):

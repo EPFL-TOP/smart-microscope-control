@@ -3762,7 +3762,9 @@ class PlatePage:
   append to `refs`/`walls`, which start from the latest
   `plate-registration` record's `params`; **Calibrate** is `run(
   "plate-registration", [plate=..., refs=<JSON>, walls=<JSON>])`, **Go
-  to** is `goto-well`.
+  to** is `goto-well`. Since #295 a capture is refused while an activity other
+  than the page's live goes, or while a drive action waits or runs during live,
+  so the position it records is where the stage rests (m5 §6.3).
 - `stop()` sets the stop event, then `microscope.stop()` (the emergency
   stop of M1 §13), in that order.
 - `view()` is a pure snapshot built from a fresh `RunDocument.load_or_new`:
