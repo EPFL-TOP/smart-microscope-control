@@ -57,6 +57,7 @@ from smc.hardware.capabilities import (
     ZStage,
 )
 from smc.ui.controller import (
+    NOT_CONNECTED,
     PageServerError,
     PageStatus,
     PlatePage,
@@ -142,8 +143,15 @@ def status_line(status: PageStatus) -> str:
 
     The stand's name comes first, where ADR-0006 puts it. ``?`` is an unknown,
     never a zero; ``DRY RUN``, ``HALTED`` and ``moving`` are added only when they
-    apply, and so is what STOP does not stop (FM-117).
+    apply, and so is what STOP does not stop (FM-117). With the stand closed it is
+    ``<stand> | not connected``, then ``DRY RUN`` when it applies, and nothing
+    else: a row of ``?`` would read as a stand that does not answer.
     """
+    if not status.connected:
+        closed = [status.stand, "not connected"]
+        if status.dry_run:
+            closed.append("DRY RUN")
+        return " | ".join(closed)
     parts = [
         status.stand,
         "XY ?"
@@ -397,8 +405,17 @@ class PlatePageView:
         self.snap_button = pn.widgets.Button(label="Snap")
         self.live_button = pn.widgets.Button(label="Live")
         self.snap_note = pn.pane.Str("", styles={"color": _WARNING})
+        # ADR-0006's *Connect* (m5 §7.3): the one line that says why every control
+        # that needs the stand is disabled while it is closed.
+        self.connect_button = pn.widgets.Button(label="Connect")
+        self.disconnect_button = pn.widgets.Button(label="Disconnect")
+        self.connection_text = pn.pane.Str("")
 
         # Every handler goes through `_handler` (the document lock, a failure is a line).
+        self.connect_button.on_click(self._handler(lambda event: self.on_connect()))
+        self.disconnect_button.on_click(
+            self._handler(lambda event: self.on_disconnect())
+        )
         self.plate_select.param.watch(
             self._handler(lambda event: self.on_choose_plate(event.new)), "value"
         )
@@ -477,6 +494,9 @@ class PlatePageView:
         }
         self.autofocus_on_button = pn.widgets.Button(label="Autofocus on")
         self.autofocus_off_button = pn.widgets.Button(label="Autofocus off")
+        # Built once per session, while the stand may be closed: the tick reads the
+        # labels again when the connection it sees changes (m5 §7.3).
+        self._seen_connected = page.connected
         self._objective_labels = page.objective_labels()
         self.objective_select = pn.widgets.Select(
             label="Objective",
@@ -564,6 +584,12 @@ class PlatePageView:
         )
 
     def _layout(self) -> Any:
+        connection = pn.Row(
+            self.connect_button,
+            self.disconnect_button,
+            self.connection_text,
+            sizing_mode="stretch_width",
+        )
         strip = pn.Row(
             self.status_text,
             pn.Spacer(sizing_mode="stretch_width"),
@@ -611,6 +637,7 @@ class PlatePageView:
             width=420,
         )
         return pn.Column(
+            connection,
             strip,
             self.drive_text,
             self.run_text,
@@ -773,6 +800,16 @@ class PlatePageView:
         self._try(run)
         self.tick()
 
+    def on_connect(self) -> None:
+        """*Connect*: open the profile's stand on the worker; the tick that sees it connected enables the controls."""
+        self._try(self.page.connect)
+        self.tick()
+
+    def on_disconnect(self) -> None:
+        """*Disconnect*: release the stand for another program; refused while an activity goes."""
+        self._try(self.page.disconnect)
+        self.tick()
+
     def on_stop(self) -> None:
         """STOP: always offered, a run or not; what it did is the stop note."""
         self.page.stop()
@@ -897,6 +934,9 @@ class PlatePageView:
             # The first tick: the cards drawn by `refresh` did not know the stand.
             self._stand = status.stand
             self._draw_cards()
+        if status.connected != self._seen_connected:
+            self._follow_connection(status.connected)
+        self._draw_connection(status)
         self.status_text.object = status_line(status)
         self.run_text.object = run_text(status)
         self.resume_button.visible = status.halted
@@ -924,6 +964,41 @@ class PlatePageView:
             # wells it does not show. Reading five attributes is no view: the view is
             # rebuilt only when one of them changed.
             self.refresh()
+
+    def _follow_connection(self, connected: bool) -> None:
+        """The objective's choices of the stand now held, or none: read again when the connection changes.
+
+        The select is set to the objective in place by the tick's own once-only
+        step, armed again here; a confirmation armed for the old stand is dropped.
+        """
+        self._seen_connected = connected
+        self._objective_labels = self.page.objective_labels()
+        self.objective_select.options = {
+            label or NO_LABEL: label for label in self._objective_labels
+        }
+        self._objective_shown = False
+        self._disarm()
+
+    def _draw_connection(self, status: PageStatus) -> None:
+        """The *Connect* row: what the stand's state is, and which of the two buttons applies.
+
+        Both are disabled while an activity goes (live included), so that
+        Disconnect is never offered under a run; the controller refuses a click
+        all the same (FM-169).
+        """
+        busy = status.running is not None
+        self.connect_button.disabled = busy or status.connected
+        self.disconnect_button.disabled = busy or not status.connected
+        text = (
+            f"Disconnect releases {status.stand} for another program (NIS-Elements, "
+            f"ZEN)"
+            if status.connected
+            else f"{status.stand} is not connected: Connect opens it, and the "
+            f"controls that need the stand are disabled until then"
+        )
+        if status.dry_run:
+            text += " (dry run)"
+        self.connection_text.object = text
 
     def frame_tick(self) -> None:
         """The frame callback's body: draw the controller's frame when it is new, and nothing else.
@@ -1089,12 +1164,19 @@ class PlatePageView:
         )
 
     def _draw_buttons(self) -> None:
-        """A tool that is blocked, or any tool or snap while an activity goes, cannot be started."""
+        """A tool that is blocked, or any tool or snap while an activity goes, cannot be started.
+
+        The captures read the stage, so they are disabled while the stand is
+        closed; the *Connect* row says why.
+        """
         running = self._running
         for name, button in self.tool_runs.items():
             reason = self._blocked.get(name)
             button.disabled = running is not None or reason is not None
             self.tool_notes[name].object = reason or ""
+        closed = not self.page.connected
+        self.capture_centre_button.disabled = closed
+        self.capture_wall_button.disabled = closed
         lacks = self.page.lacks(Camera)
         self.snap_button.disabled = running is not None or lacks is not None
         # While live goes its own button is the one that ends it; any other activity
@@ -1141,9 +1223,13 @@ class PlatePageView:
         self.objective_select.disabled = reasons["objective"] is not None
         if busy or reasons["objective"] is not None:
             self._disarm()
-        self.drive_note.object = "\n".join(
-            f"{name}: {reason}" for name, reason in reasons.items() if reason
-        )
+        if NOT_CONNECTED in reasons.values():
+            # One reason for all five, said once (m5 §7.3).
+            self.drive_note.object = NOT_CONNECTED
+        else:
+            self.drive_note.object = "\n".join(
+                f"{name}: {reason}" for name, reason in reasons.items() if reason
+            )
 
 
 def build(page: PlatePage) -> Any:
