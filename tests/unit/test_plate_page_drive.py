@@ -1296,3 +1296,183 @@ def test_a_click_that_finds_another_activity_once_it_holds_the_lock_is_refused(
         page.live(False)
     assert page.join(10.0)
     assert fake_microscope.state().xy == XY(0.0, 0.0)
+
+
+# --- a capture reads the stage: refused while it is about to move or moves (#295) -------
+
+
+def test_a_capture_behind_a_waiting_jog_is_refused(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # Measured before #295: `capture_centre("A1")` behind a waiting jog of 500 µm
+    # returned (0, 0), and the stage then went to (500, 0).
+    camera = FrameCamera(block=True)
+    fake_microscope.override(Camera, camera)
+    page.live(True)
+    try:
+        assert camera.entered.wait(5)
+        page.jog_xy(500.0, 0.0)
+        with _refuses(RuntimeError, "stage jog is waiting"):
+            page.capture_centre("A1")
+        with _refuses(RuntimeError, "stage jog is waiting"):
+            page.capture_wall("A1", "left")
+        assert page.refs == ()
+        assert page.walls == ()
+    finally:
+        camera.release.set()
+    try:
+        _wait_for_outcome(page, "stage jog: XY (500.00, 0.00) µm")
+        # The jog has landed: the capture records where the stage is.
+        assert page.capture_centre("A1").x_um == 500.0
+    finally:
+        page.live(False)
+    assert page.join(10.0)
+
+
+def test_a_capture_during_a_jog_that_runs_on_the_live_worker_is_refused(
+    page: PlatePage, fake_microscope: Microscope, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `_drive_waiting` is empty from the moment the loop takes the jog, so the
+    # waiting slot alone cannot tell a jog that runs from none (measured).
+    original = drive_module.jog_xy
+    entered = threading.Event()
+    release = threading.Event()
+
+    def waits(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        assert release.wait(10), "the test never released the jog"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(drive_module, "jog_xy", waits)
+    fake_microscope.override(Camera, FrameCamera())
+    page.live(True)
+    try:
+        _wait_for_frame_after(page, 1)
+        page.jog_xy(500.0, 0.0)
+        assert entered.wait(5)
+        assert page._drive_waiting is None
+        with _refuses(RuntimeError, "stage jog is running"):
+            page.capture_centre("A1")
+        with _refuses(RuntimeError, "stage jog is running"):
+            page.capture_wall("A1", "left")
+        assert page.refs == ()
+    finally:
+        release.set()
+    try:
+        _wait_for_outcome(page, "stage jog: XY (500.00, 0.00) µm")
+        assert page._drive_running is None
+        assert page.capture_centre("A1").x_um == 500.0
+    finally:
+        page.live(False)
+    assert page.join(10.0)
+
+
+def test_a_capture_while_the_end_of_live_runs_a_switch_off_is_refused(
+    light_page: PlatePage, shutter_light: Microscope, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The tail of live is a drive action running on the live worker too: it holds
+    # `_drive_running` from the moment it is taken, so a capture never finds it
+    # neither waiting nor running.
+    _light_on(shutter_light)
+    camera = FrameCamera(block=True)
+    shutter_light.override(Camera, camera)
+    original = drive_module.switch_light
+    entered = threading.Event()
+    release = threading.Event()
+
+    def waits(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        assert release.wait(10), "the test never released the switch-off"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(drive_module, "switch_light", waits)
+    light_page.live(True)
+    try:
+        assert camera.entered.wait(5)
+        light_page.light(False)
+        light_page.live(False)
+        camera.release.set()
+        assert entered.wait(5)
+        assert light_page._drive_waiting is None
+        with _refuses(RuntimeError, "light off is running"):
+            light_page.capture_centre("A1")
+    finally:
+        camera.release.set()
+        release.set()
+    assert light_page.join(10.0)
+    assert light_page._drive_running is None
+    assert light_page.refs == ()
+
+
+def test_a_capture_during_a_run_or_a_snap_is_refused(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # A run's stage is read mid-route by the same code (a goto-well run moves it).
+    page.run("slow", [])
+    try:
+        assert Slow.started.wait(5)
+        with _refuses(RuntimeError, "slow is running"):
+            page.capture_centre("A1")
+        with _refuses(RuntimeError, "slow is running"):
+            page.capture_wall("A1", "left")
+    finally:
+        Slow.release.set()
+    assert page.join(10.0)
+
+    camera = FrameCamera(block=True)
+    fake_microscope.override(Camera, camera)
+    page.snap()
+    try:
+        assert camera.entered.wait(5)
+        with _refuses(RuntimeError, "snap is running"):
+            page.capture_centre("A1")
+        with _refuses(RuntimeError, "snap is running"):
+            page.capture_wall("A1", "left")
+    finally:
+        camera.release.set()
+    assert page.join(10.0)
+    assert page.refs == ()
+    assert page.walls == ()
+    # Nothing goes any more: a capture records the stage.
+    assert page.capture_centre("A1").x_um == 0.0
+
+
+def test_a_capture_while_live_goes_with_nothing_waiting_is_taken(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # A frame moves nothing: only a drive action handed to live refuses a capture.
+    fake_microscope.override(Camera, FrameCamera())
+    fake_microscope.require(XYStage).move_to_um(300.0, -200.0)
+    page.live(True)
+    try:
+        _wait_for_frame_after(page, 1)
+        centre = page.capture_centre("A1")
+        wall = page.capture_wall("A1", "left")
+    finally:
+        page.live(False)
+    assert page.join(10.0)
+    assert (centre.x_um, centre.y_um) == (300.0, -200.0)
+    assert (wall.x_um, wall.y_um) == (300.0, -200.0)
+
+
+def test_a_capture_argument_error_is_reported_before_the_busy_refusal(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    camera = FrameCamera(block=True)
+    fake_microscope.override(Camera, camera)
+    page.live(True)
+    try:
+        assert camera.entered.wait(5)
+        page.jog_xy(500.0, 0.0)
+        with _refuses(ValueError, "Z9 is not a well of the 96-well plate"):
+            page.capture_centre("Z9")
+        with _refuses(ValueError, "Z9 is not a well of the 96-well plate"):
+            page.capture_wall("Z9", "left")
+        with _refuses(
+            ValueError, "side must be one of left, right, top, bottom, got 'centre'"
+        ):
+            page.capture_wall("A1", "centre")
+    finally:
+        camera.release.set()
+        page.live(False)
+    assert page.join(10.0)

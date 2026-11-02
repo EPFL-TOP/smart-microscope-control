@@ -813,10 +813,13 @@ class PlatePage:
 
         Raises:
             ValueError: The well is not on the plate.
-            RuntimeError: The stand is not connected (``NOT_CONNECTED``).
+            RuntimeError: The stand is not connected (``NOT_CONNECTED``), or the
+                stage is about to move or moves (``<name> is running`` or ``<name>
+                is waiting``, ``_refuse_if_moving``).
             CapabilityMissingError: The stand has no XY stage.
         """
         name = self._on_plate(well)
+        self._refuse_if_moving()
         position = self._stand().require(XYStage).position_um()
         ref = WellRef(well=name, x_um=position.x_um, y_um=position.y_um)
         kept = tuple(r for r in self.refs if normalise_well(r.well) != name)
@@ -829,12 +832,13 @@ class PlatePage:
         Raises:
             ValueError: ``side`` is not left, right, top or bottom, or the well is
                 not on the plate.
-            RuntimeError: The stand is not connected (``NOT_CONNECTED``).
+            RuntimeError: As ``capture_centre``.
             CapabilityMissingError: The stand has no XY stage.
         """
         if side not in _SIDES:
             raise ValueError(f"side must be one of {', '.join(_SIDES)}, got {side!r}")
         name = self._on_plate(well)
+        self._refuse_if_moving()
         position = self._stand().require(XYStage).position_um()
         touch = WallTouch(
             well=name,
@@ -1845,6 +1849,35 @@ class PlatePage:
             lines = tuple(line for line in (note, outcome) if line)
         self.close_lines = lines
         self.close_ended = ended
+
+    def _refuse_if_moving(self) -> None:
+        """Refuse a capture while the stage is about to move or moves (m5 §6.3, #295).
+
+        A capture records the stage's position, so a position read while a move
+        waits behind a frame, or runs on the live worker, is the one *before* the
+        move. Refused: an activity other than this page's live (a run, a snap, a
+        drive action of its own, ``connect``, ``disconnect``: ``goto-well`` and
+        every plugin that moves the stage are runs), an action running on the live
+        worker (``_drive_running``) and one waiting for it (``_drive_waiting``). A
+        live with nothing handed to it does not refuse: a frame moves nothing.
+
+        The three are read under ``_lock``, never across a device call, and the
+        check is not atomic with the read that follows: the window is one
+        ``position_um()``, for an operator clicking in two tabs.
+
+        Raises:
+            RuntimeError: ``<name> is running`` or ``<name> is waiting``.
+        """
+        with self._lock:
+            current = self._current_run
+            running = self._drive_running
+            waiting = self._drive_waiting
+        if current is not None and current[1] is not self._live_event:
+            raise RuntimeError(f"{current[0]} is running")
+        if running is not None:
+            raise RuntimeError(f"{running} is running")
+        if waiting is not None:
+            raise RuntimeError(f"{waiting.name} is waiting")
 
     def _refuse_if_busy(self) -> None:
         if self._closed:
