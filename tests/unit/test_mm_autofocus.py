@@ -3743,6 +3743,96 @@ def test_a_failed_state_read_logs_no_exception_object(
     assert _logged_exception_objects(caplog) == []
 
 
+def _state_read_failed(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [m for m in caplog.messages if " read failed (" in m]
+
+
+def test_an_autofocus_read_that_starts_to_fail_is_logged_while_a_sibling_keeps_failing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # #288: the three autofocus reads of state() share the name `autofocus`, so the
+    # facade keys them apart. The offset read that starts to fail while PFS keeps
+    # failing is a new failure and has its line (the log is the only record of when).
+    with _ti2() as stand:
+        stand.core.failing["PFS"] = RuntimeError("PFS: no answer")
+        with caplog.at_level(logging.DEBUG):
+            stand.microscope.state()
+            stand.microscope.state()
+            stand.core.failing["PFSOffset"] = RuntimeError("PFSOffset: no answer")
+            stand.microscope.state()
+            stand.microscope.state()
+        stand.core.failing.clear()
+    lines = _state_read_failed(caplog)
+    assert len(lines) == 3, lines
+    engaged, locked, offset = lines
+    assert "isContinuousFocusEnabled" in engaged
+    assert "isContinuousFocusLocked" in locked
+    assert "PFSOffset" in offset
+
+
+def test_three_autofocus_reads_that_fail_in_one_call_are_three_lines(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with _ti2() as stand:
+        stand.core.failing["PFS"] = RuntimeError("PFS: no answer")
+        stand.core.failing["PFSOffset"] = RuntimeError("PFSOffset: no answer")
+        with caplog.at_level(logging.DEBUG):
+            state = stand.microscope.state()
+        stand.core.failing.clear()
+    assert len(state.errors) == 3
+    lines = _state_read_failed(caplog)
+    assert len(lines) == 3, lines
+    # One line per read: none overwrote another of the same name.
+    for read in ("isContinuousFocusEnabled", "isContinuousFocusLocked", "PFSOffset"):
+        assert sum(read in line for line in lines) == 1, lines
+
+
+def _seen_not_recorded(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [m for m in caplog.messages if "not recorded as seen" in m]
+
+
+def _declared() -> Profile:
+    """A stand whose PFS is declared to drive Z to the offset's plane (m2 §12.2)."""
+    return _profile(autofocus={"engage_drives_z_to_offset": True})
+
+
+def test_a_lock_read_whose_offset_cannot_be_read_is_logged_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # #288, FM-178: on a declared stand every lock read that finds PFS locked reads the
+    # offset and the objective to record them as seen, and state() is such a read. With
+    # the offset device silent that read failed on every call, a DEBUG line each: the
+    # live view's ten a second, beside the facade's own line, which is once.
+    with _ti2(_declared()) as stand:
+        stand.engage_directly()
+        stand.core.failing["PFSOffset"] = RuntimeError("PFSOffset: no answer")
+        with caplog.at_level(logging.DEBUG):
+            states = [stand.microscope.state() for _ in range(5)]
+        stand.core.failing.clear()
+    # `errors` is unchanged: the offset read fails on every call.
+    assert all(len(state.errors) == 1 for state in states)
+    assert len(_seen_not_recorded(caplog)) == 1
+    assert len(_state_read_failed(caplog)) == 1
+
+
+def test_a_lock_read_whose_offset_can_be_read_again_and_fails_again_is_logged_again(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with _ti2(_declared()) as stand:
+        stand.engage_directly()
+        with caplog.at_level(logging.DEBUG):
+            stand.core.failing["PFSOffset"] = RuntimeError("PFSOffset: no answer")
+            stand.microscope.state()
+            stand.microscope.state()
+            stand.core.failing.clear()
+            assert stand.microscope.state().errors == []
+            stand.core.failing["PFSOffset"] = RuntimeError("PFSOffset: no answer")
+            stand.microscope.state()
+            stand.microscope.state()
+        stand.core.failing.clear()
+    assert len(_seen_not_recorded(caplog)) == 2
+
+
 def test_describe_shows_the_autofocus() -> None:
     with _ti2() as stand:
         line = "XY (0.0, 0.0) µm | Z 0.00 µm | 10 ms | autofocus"

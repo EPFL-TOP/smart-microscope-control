@@ -626,6 +626,8 @@ class MicroscopeState:
     errors: list[str] = field(default_factory=list)   # "z: <exception>" per failed read
 ```
 
+`state()` is read for every frame of a live view and by every open tab's tick (m5 §5), so a read that fails is written to the log (DEBUG) when it *starts* to fail, not on every call: the facade remembers which of its reads failed on the previous call, per read and per facade. `errors` still lists every failed read on every call; a read that succeeds is forgotten, and nothing is logged for a recovery (FM-62, FM-148).
+
 `open()` = `Profile.load` →
 `open_core(config, adapter_search_paths=profile.adapter_search_dirs())` →
 `setTimeoutMs` →

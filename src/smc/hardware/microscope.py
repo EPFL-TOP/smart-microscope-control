@@ -278,6 +278,9 @@ class Microscope:
         #: The channel group, chosen once (``_channel_group``): a stand without
         #: one would otherwise log the same warning at every ``state()``.
         self._channels_group: tuple[str | None] | None = None
+        #: The reads of ``state()`` that failed on its previous call: a failure
+        #: is logged when it starts, not on every call (``_log_failed_reads``).
+        self._failed_reads: frozenset[str] = frozenset()
         self._closed = False
 
     @classmethod
@@ -639,43 +642,92 @@ class Microscope:
             roles={role.value: label for role, label in self.roles.assigned.items()}
         )
         errors = state.errors
+        failed: dict[str, str] = {}
         xy = cast("XYStage | None", self._lookup(XYStage))
         if xy is not None:
-            state.xy = _read("xy", xy.position_um, errors)
+            state.xy = _read("xy", xy.position_um, errors, failed)
         z = cast("ZStage | None", self._lookup(ZStage))
         if z is not None:
-            state.z_um = _read("z", z.position_um, errors)
+            state.z_um = _read("z", z.position_um, errors, failed)
         camera = cast("Camera | None", self._lookup(Camera))
         if camera is not None:
-            state.exposure_ms = _read("exposure", camera.exposure_ms, errors)
-            state.image_shape = _read("image_shape", camera.image_shape, errors)
-            state.pixel_size_um = _read("pixel_size", camera.pixel_size_um, errors)
+            state.exposure_ms = _read("exposure", camera.exposure_ms, errors, failed)
+            state.image_shape = _read("image_shape", camera.image_shape, errors, failed)
+            state.pixel_size_um = _read(
+                "pixel_size", camera.pixel_size_um, errors, failed
+            )
         shutter = cast("Shutter | None", self._lookup(Shutter))
         if shutter is not None:
-            state.shutter_open = _read("shutter", shutter.is_open, errors)
+            state.shutter_open = _read("shutter", shutter.is_open, errors, failed)
         autofocus = cast("Autofocus | None", self._lookup(Autofocus))
         if autofocus is not None:
-            state.autofocus_engaged = _read("autofocus", autofocus.is_engaged, errors)
-            state.autofocus_locked = _read("autofocus", autofocus.is_locked, errors)
+            state.autofocus_engaged = _read(
+                "autofocus",
+                autofocus.is_engaged,
+                errors,
+                failed,
+                key="autofocus.engaged",
+            )
+            state.autofocus_locked = _read(
+                "autofocus",
+                autofocus.is_locked,
+                errors,
+                failed,
+                key="autofocus.locked",
+            )
             state.autofocus_offset_native = _read(
-                "autofocus", autofocus.offset_native, errors
+                "autofocus",
+                autofocus.offset_native,
+                errors,
+                failed,
+                key="autofocus.offset",
             )
         turret = cast("ObjectiveTurret | None", self._lookup(ObjectiveTurret))
         if turret is not None:
-            state.objective = _read("objective", turret.current, errors)
-        channels = _read("channel", lambda: self._lookup(Channels), errors)
+            state.objective = _read("objective", turret.current, errors, failed)
+        channels = _read("channel", lambda: self._lookup(Channels), errors, failed)
         if channels is not None:
-            state.channel = _read("channel", cast("Channels", channels).current, errors)
+            state.channel = _read(
+                "channel",
+                cast("Channels", channels).current,
+                errors,
+                failed,
+                key="channel.current",
+            )
         light = cast("LightSource | None", self._lookup(LightSource))
         if light is not None:
             state.light_intensity_native = _read(
-                "light", light.intensity_native, errors
+                "light", light.intensity_native, errors, failed
             )
         # Read after the devices: "moving" and "halted" are then at least as
         # recent as the positions shown next to them.
         state.moving = self._executor.moving()
         state.halted = self._executor.halted
+        self._log_failed_reads(failed)
         return state
+
+    def _log_failed_reads(self, failed: dict[str, str]) -> None:
+        """Write the line of each read that was not failing on the previous call.
+
+        The live worker reads :meth:`state` for every frame and every open tab's
+        tick reads it once a second, so a line for every failed read on every
+        call is ten lines a second to a console that may block (FM-62, FM-148).
+        The line is the only record of *when* a read began to fail, so it is
+        kept once per failure; the status line (``errors``) shows the present.
+        Not keyed on the text: a timeout's text carries a duration, and every
+        call would be a new failure.
+
+        No lock: ``state()`` takes none (§13), and one here would be FM-70 if a
+        handler ever read the state. The memory is rebound whole, once; two
+        threads at the same moment cost a repeated or a missed line, never a
+        wrong state.
+        """
+        started = [
+            line for key, line in failed.items() if key not in self._failed_reads
+        ]
+        self._failed_reads = frozenset(failed)
+        for line in started:
+            log.debug("%s", line)
 
     def describe(self) -> str:
         """One status line: ``XY (x, y) µm | Z z µm | exposure ms | shutter open | autofocus off``.
@@ -1053,13 +1105,26 @@ def describe_autofocus(state: MicroscopeState) -> str:
     return "autofocus locked" if locked else "autofocus on, not locked"
 
 
-def _read(name: str, read: Callable[[], R], errors: list[str]) -> R | None:
-    """``read()``, or ``None`` with ``"<name>: <error>"`` added to ``errors``."""
+def _read(
+    name: str,
+    read: Callable[[], R],
+    errors: list[str],
+    failed: dict[str, str],
+    *,
+    key: str | None = None,
+) -> R | None:
+    """``read()``, or ``None`` with ``"<name>: <error>"`` added to ``errors``.
+
+    ``failed`` is filled for ``Microscope._log_failed_reads``: the line of the
+    failure under ``key`` (the name, unless a sibling read shares it), as text,
+    never the error: a record that keeps the error keeps its traceback (FM-92).
+    The line is not written here: a read that keeps failing would be written on
+    every call.
+    """
     try:
         return read()
     except Exception as exc:
         detail = f"{type(exc).__name__}: {exc}"
         errors.append(f"{name}: {detail}")
-        # Text, never the error: a record that keeps it keeps its traceback (FM-92).
-        log.debug("state: %s read failed (%s)", name, detail)
+        failed[key or name] = f"state: {name} read failed ({detail})"
         return None

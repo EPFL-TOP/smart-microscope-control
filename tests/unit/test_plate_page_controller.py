@@ -2303,6 +2303,32 @@ def test_live_logs_its_start_and_its_end_and_not_a_line_per_frame(
     assert re.fullmatch(r"live ended: \d+ frames in \d+\.\d s", lines[-1][1]), lines
 
 
+def test_live_whose_pixel_size_cannot_be_read_logs_the_failed_read_once(
+    page: PlatePage, fake_microscope: Microscope, caplog: pytest.LogCaptureFixture
+) -> None:
+    # #288, FM-62, FM-148: a read of state() that fails was a DEBUG line per frame
+    # (13 lines for 10 frames and 3 status ticks, measured). Both writers of the line,
+    # the live worker and the tab's tick, are in the window; every logger is counted.
+    fake_microscope.override(Camera, FrameCamera(_ramp_frame(), pixel_size_um=None))
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        page.live(True)
+        _wait_for_frames(page, 3)
+        before = [(r.name, r.getMessage()) for r in caplog.records]
+        _wait_for_frames(page, 8)
+        for _ in range(3):
+            page.status()
+        after = [(r.name, r.getMessage()) for r in caplog.records]
+        page.live(False)
+        assert page.join(10.0)
+    assert after == before
+    assert [
+        r.getMessage() for r in caplog.records if r.name == "smc.hardware.microscope"
+    ] == [
+        "state: pixel_size read failed (HardwareError: the pixel size cannot be read)"
+    ]
+
+
 def test_live_leaves_no_backlog_of_progress_when_no_session_reads_the_status(
     page: PlatePage, fake_microscope: Microscope
 ) -> None:
