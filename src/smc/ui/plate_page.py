@@ -633,7 +633,17 @@ class PlatePageView:
         run = pn.widgets.Button(label=f"Run {tool.name}")
         run.on_click(self._handler(self._runner(tool.name)))
         self.tool_runs[tool.name] = run
-        note = pn.pane.Str("", styles={"color": _WARNING})
+        # Wrapped: the reason of a stage with a checkpoint names the command that
+        # continues it, which a line cut at the column's edge would lose (#252). A
+        # `white-space` in `styles` lands on the pane's host, and the `<pre>` inside
+        # its shadow root keeps its own `pre` (measured in Chromium), so the rule
+        # goes to the `<pre>` itself.
+        note = pn.pane.Str(
+            "",
+            styles={"color": _WARNING},
+            width=380,
+            stylesheets=["pre { white-space: pre-wrap; }"],
+        )
         self.tool_notes[tool.name] = note
         # Plain text, never Markdown: a result's words are not markup (FM-139).
         card = pn.pane.Str("")
