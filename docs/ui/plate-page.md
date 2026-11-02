@@ -29,8 +29,10 @@ had before it grew). Any other word after `ui` exits 2 with `unknown page <word>
 smc ui serves one page`, before anything else is looked at.
 
 `--run-doc` is the same run document `smc run` takes, and is required for the same
-reason: a file is never created where you did not say. The command checks it, opens
-the stand **once** and keeps it until you press **Ctrl-C**, then prints
+reason: a file is never created where you did not say. The command checks it and
+serves the page **with the stand closed**: nothing is opened until you press
+**Connect** on the page, so a page left running, or run as a service, never takes the
+stand from NIS-Elements or ZEN. It prints
 
 ```text
 serving the plate page on http://localhost:5006/ — Ctrl-C stops it
@@ -41,6 +43,48 @@ accepts the origin it was served from). The page listens on `localhost` only and
 has no login: whoever reaches the port can move the stage, so it is not offered on
 the network. To use it from another desk, use the PC's remote desktop (RDP). An SSH
 tunnel is **untried**: it could work only with the same port number on both ends.
+
+Unless it is a dry run, a stand whose profile declares that it refuses `stop()` gets
+its `!` line first (`! the profile declares that this stand refuses stop() on ...`),
+read from the profile, before anything is opened.
+
+### Connect and Disconnect
+
+The row above the strip holds **Connect**, **Disconnect** and one line that says
+where the stand is:
+
+| The stand | The row says | Enabled |
+|---|---|---|
+| closed (the page as it opens) | `<stand> is not connected: Connect opens it, and the controls that need the stand are disabled until then` | Connect |
+| held | `Disconnect releases <stand> for another program (NIS-Elements, ZEN)` | Disconnect |
+
+`(dry run)` is added when it is one. Both buttons are disabled while anything goes
+(a run, a snap, live, a drive action, a connect).
+
+- **Connect** opens the profile the command names (one PC serves one stand; the demo
+  is another `smc ui -p demo` on another port), on the page's worker. It says
+  `connect: <stand> connected, <n> devices`, or why it could not, on one line: a
+  stand that NIS-Elements holds is `connect: CoreError: ...`, and the page stays
+  closed. STOP pressed while it opens halts the stand once it is open, and the line
+  ends `, and halted: STOP was pressed while it connected`. A new stand is never
+  halted: Connect clears the last STOP's note.
+- **Disconnect** releases the stand for another program: `disconnect: <stand>
+  released`. It stops what still moves, then unloads the devices, and **switches
+  nothing off**: a light or an autofocus stays as the stand keeps it. It is refused
+  while a run, a snap, live or a drive action goes (`<name> is running`), even if a
+  browser sends the click.
+- **With the stand closed** every control that needs it is disabled, and the row's
+  line is the reason: the strip says `<stand> | not connected` (and `DRY RUN`), every
+  tool's note and the Drive region say `the stand is not connected` once, Snap,
+  Live and the captures are greyed. Every tool needs the stand, as `smc run` opens it
+  for every plugin. The map, the selection, the checklist and the result cards work
+  all the same: they read the profile and the run document, not the stand. The last
+  frame stays on the *Image* tab after a Disconnect, with its time.
+- The profile is read **once**, when the command starts: an edited profile takes
+  effect when the command (or the [service](service.md)) restarts.
+
+To run the page for weeks on a microscope PC, as a Windows service that starts at
+boot, see [The plate page as a service](service.md).
 
 | Refused | What it says |
 |---|---|
@@ -54,8 +98,8 @@ tunnel is **untried**: it could work only with the same port number on both ends
 **Ctrl-C** ends the server. If a run is going it is **told to stop first** (the same
 stop as the STOP button, sent before the server is touched, because stopping the
 server can wait for a slow read of the stand), the page waits up to 10 s for the run,
-then stops the server (up to 10 s, and says so if it does not), and the stand is
-released after. What the command prints last depends on what happened:
+then stops the server (up to 10 s, and says so if it does not), and the stand, if
+Connect opened it, is released after. What the command prints last depends on what happened:
 
 | What happened | The last lines |
 |---|---|
@@ -76,7 +120,8 @@ and the captures: a tab draws what another tab changed within a second.
 the stage `XY (x, y) µm`, `Z`, the objective, the autofocus
 (`autofocus locked`, `autofocus on, not locked`, `autofocus off`, `autofocus ?` when a
 read failed), the light, `DRY RUN` when it is one, and `HALTED` with **Resume** when the
-stand is halted. `?` is an unknown, never a zero. It is read once a second, and no
+stand is halted. `?` is an unknown, never a zero. With the stand closed it is
+`<stand> | not connected` and nothing else. It is read once a second, and no
 faster: a scan must not be slowed by a status poll. **STOP is always offered**, a run
 or not. Under it: the run's progress as `done/total message`, how the last run ended
 (`<plugin> done in 12.3 s`, `<plugin> stopped`, or `<plugin>: <Error>: <message>`) and
@@ -294,7 +339,8 @@ No light intensity or channel, no focusing through the autofocus offset, no
 press-and-hold jog, no drive click on the map while live goes (it is a `goto-well`
 run, which writes a record), no camera settings (exposure, ROI, binning) and no time
 limit on live,
-no Connect / Disconnect and no service ([#264](https://github.com/EPFL-TOP/smart-microscope-control/issues/264)),
+no choice of the stand or of the run document from the page (one of each per
+command), nothing switched off at Disconnect,
 no `--resume` (continue a stopped stage with `smc run --resume`), no `--host`, no login. The report and the NIS-Elements
 export appear as tools when their plugins are registered; they have no page of their
 own.
@@ -328,3 +374,9 @@ or a command ends (the light, the autofocus: closing the stand switches nothing 
 `Z +` and `Z −` with the autofocus locked on the Ti2-E (the relock may bring Z back to
 the offset's plane); and **a newcomer registering a plate on the `demo-sample` stand
 from the page without a manual**, with a lab member.
+
+**Connect and Disconnect** add: Connect, Disconnect, NIS-Elements taking the stand,
+then Connect again, at a real stand; **a stand opened on the page's worker thread**,
+which then ends, where the command used to open it on its main thread (a vendor
+adapter that cares which thread loaded it is the finding); and the service of
+[service.md](service.md), on a microscope PC.
