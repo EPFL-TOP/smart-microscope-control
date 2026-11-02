@@ -81,11 +81,13 @@ from smc.ui.frames import Frame
 
 if TYPE_CHECKING:
     from smc.hardware.microscope import Microscope
+    from smc.hardware.profile import Profile
 
 __all__ = [
     "KEY_PARAMS",
     "LIVE_PERIOD_S",
     "MORE_STAGE",
+    "NOT_CONNECTED",
     "PAGE_PARAMS",
     "STAGES",
     "CheckItem",
@@ -175,6 +177,10 @@ LIVE_PERIOD_S = 0.1
 #: What ``stop`` says when the stand took the stop: the one wording that may be told
 #: as "stopped" (FM-117).
 _STOP_ACCEPTED = "stopped: the stand is halted (Resume clears the halt)"
+
+#: Why everything that needs the stand is refused while the page holds none (m5 §7.2):
+#: the one reason a disabled control gives, and the first one.
+NOT_CONNECTED = "the stand is not connected"
 
 #: Wells built for a plate are kept (339 ms for 1536 of them); a registration
 #: changes the key rarely, so a handful is plenty.
@@ -283,7 +289,8 @@ class PageStatus:
     ``stand`` is the profile's ``microscope.name``. ``xy_um`` to ``halted`` are
     ``Microscope.state()``'s; ``stop_refused`` are the roles the profile declares
     refuse their stop, so that the page can say that STOP does not stop a move in
-    flight on this stand (FM-117).
+    flight on this stand (FM-117). With ``connected`` false the page holds no
+    stand, and every read of it is unknown (``None``, ``?``), never a fault.
     """
 
     stand: str
@@ -301,6 +308,7 @@ class PageStatus:
     halted: bool
     stop_refused: tuple[str, ...]
     problems: tuple[str, ...]
+    connected: bool = True
 
 
 def _one_line(error: BaseException) -> str:
@@ -406,6 +414,18 @@ def _card(record: StageRecord, *, stale: bool = False) -> ResultCard:
     )
 
 
+def _open_stand(profile: Profile, dry_run: bool) -> Microscope:
+    """What Connect calls when the page was given no opener: ``Microscope.open``.
+
+    ``Microscope`` is imported, and ``open`` looked up, at the call: a test's
+    ``monkeypatch.setattr(Microscope, "open", ...)`` made after the page was built is
+    the one used, and the module's import opens nothing.
+    """
+    from smc.hardware.microscope import Microscope
+
+    return Microscope.open(profile, dry_run=dry_run)
+
+
 def _first_problem(error: ValidationError) -> str:
     """``<where>: <what>`` of the first validation error."""
     first = error.errors()[0]
@@ -416,9 +436,18 @@ def _first_problem(error: ValidationError) -> str:
 class PlatePage:
     """The plate page's logic over one stand and one run document.
 
-    The controller never opens or closes the stand: the command that serves the
-    page does, once, for the page's life. Everything an operator does here is a
+    The stand's lifetime is the operator's (m5 §7): ``connect()`` opens the
+    profile's stand and ``disconnect()`` releases it, each an activity, so a stand
+    held by smc can be handed to NIS-Elements or ZEN without stopping the server.
+    ``PlatePage(microscope, ...)`` starts connected to that facade;
+    ``PlatePage.closed(profile, ...)``, what ``smc ui`` builds, starts with none.
+    The profile is the page's from the start, so the map, the checklist and the
+    cards work with the stand closed. Everything an operator does here is a
     plugin run with the strings ``smc run`` takes, or a read of a capability.
+
+    The facade may be dropped by a ``disconnect`` between two reads on the
+    server's loop: a method that reads it there takes it into a local once, never
+    ``self._microscope`` twice, and an activity reaches it through ``_stand()``.
 
     Attributes:
         selection: The wells the operator chose, in the order they chose them.
@@ -446,14 +475,70 @@ class PlatePage:
         microscope: Microscope,
         run_doc: Path,
         *,
+        opener: Callable[[], Microscope] | None = None,
         entry_points: Iterable[EntryPoint] | None = None,
     ) -> None:
-        """Start from the run document: its plate, the wells chosen and the references taken.
+        """Start connected to ``microscope``, from the run document: its plate, the wells chosen and the references taken.
 
+        ``opener`` is what a ``connect()`` after a ``disconnect()`` calls; it
+        defaults to ``Microscope.open`` of the facade's profile and dry run.
         Never raises for a document: one that cannot be read starts the page
         empty, and ``view()`` says why in its ``problems``.
         """
-        self._microscope = microscope
+        self._setup(
+            microscope,
+            microscope.profile,
+            microscope.dry_run,
+            run_doc,
+            opener=opener,
+            entry_points=entry_points,
+        )
+
+    @classmethod
+    def closed(
+        cls,
+        profile: Profile,
+        run_doc: Path,
+        *,
+        dry_run: bool = False,
+        opener: Callable[[], Microscope] | None = None,
+        entry_points: Iterable[EntryPoint] | None = None,
+    ) -> PlatePage:
+        """A page with the stand closed: ``connect()`` opens it with ``opener``.
+
+        What ``smc ui`` builds, so that a service that starts at boot, or restarts
+        after a crash, never takes the stand from the vendor's software (m5 §7).
+        ``opener`` defaults to ``Microscope.open(profile, dry_run=dry_run)``,
+        looked up when Connect calls it.
+        """
+        page = cls.__new__(cls)
+        page._setup(
+            None,
+            profile,
+            dry_run,
+            run_doc,
+            opener=opener,
+            entry_points=entry_points,
+        )
+        return page
+
+    def _setup(
+        self,
+        microscope: Microscope | None,
+        profile: Profile,
+        dry_run: bool,
+        run_doc: Path,
+        *,
+        opener: Callable[[], Microscope] | None,
+        entry_points: Iterable[EntryPoint] | None,
+    ) -> None:
+        """What both constructors do; the profile and the dry run are the page's, held or not."""
+        self._microscope: Microscope | None = microscope
+        self._profile = profile
+        self._dry_run = dry_run
+        self._opener: Callable[[], Microscope] = (
+            (lambda: _open_stand(profile, dry_run)) if opener is None else opener
+        )
         self._run_doc = run_doc
         # A list, so that a generator handed in is not spent by the first use.
         self._entry_points = None if entry_points is None else list(entry_points)
@@ -608,10 +693,11 @@ class PlatePage:
 
         Raises:
             ValueError: The well is not on the plate.
+            RuntimeError: The stand is not connected (``NOT_CONNECTED``).
             CapabilityMissingError: The stand has no XY stage.
         """
         name = self._on_plate(well)
-        position = self._microscope.require(XYStage).position_um()
+        position = self._stand().require(XYStage).position_um()
         ref = WellRef(well=name, x_um=position.x_um, y_um=position.y_um)
         kept = tuple(r for r in self.refs if normalise_well(r.well) != name)
         self.refs = (*kept, ref)
@@ -623,12 +709,13 @@ class PlatePage:
         Raises:
             ValueError: ``side`` is not left, right, top or bottom, or the well is
                 not on the plate.
+            RuntimeError: The stand is not connected (``NOT_CONNECTED``).
             CapabilityMissingError: The stand has no XY stage.
         """
         if side not in _SIDES:
             raise ValueError(f"side must be one of {', '.join(_SIDES)}, got {side!r}")
         name = self._on_plate(well)
-        position = self._microscope.require(XYStage).position_um()
+        position = self._stand().require(XYStage).position_um()
         touch = WallTouch(
             well=name,
             side=side,  # type: ignore[arg-type]  # checked against _SIDES above
@@ -680,13 +767,18 @@ class PlatePage:
         thread starts: the plugin, its parameters, the run document and what the
         plugin reads. A refusal there is the ``outcome`` (``<plugin>: <Type>:
         <message>``); nothing is written and no thread starts. What the run does is
-        shown by ``status()``.
+        shown by ``status()``. ``smc run`` opens the stand for every plugin, so a
+        run with the stand closed is the outcome ``<plugin>: the stand is not
+        connected``.
 
         Raises:
             RuntimeError: A run is going (``<plugin> is running``), or the page is
                 closed.
         """
         self._refuse_if_busy()
+        if self._microscope is None:
+            self._set_outcome(f"{plugin}: {NOT_CONNECTED}")
+            return
         try:
             entry = load(plugin, self._entry_points)
             try:
@@ -707,8 +799,8 @@ class PlatePage:
                 entry.plugin,
                 doc,
                 parsed,
-                profile=self._microscope.profile.microscope.name,
-                dry_run=self._microscope.dry_run,
+                profile=self._profile.microscope.name,
+                dry_run=self._dry_run,
                 resume=False,
             )
         except (PluginError, RunDocumentError) as exc:
@@ -796,7 +888,7 @@ class PlatePage:
         try:
             record = run_plugin(
                 entry.plugin,
-                self._microscope,
+                self._stand(),
                 parsed,
                 self._run_doc,
                 on_progress=self._queue.put,
@@ -820,11 +912,145 @@ class PlatePage:
         """Why the stand cannot offer ``capability``, or ``None``: the one text of a disabled control.
 
         A control the stand cannot honour says so instead of failing when it is
-        pressed (ADR-0006, principle 1).
+        pressed (ADR-0006, principle 1). With the stand closed it is
+        ``NOT_CONNECTED``, whatever the capability.
         """
-        if self._microscope.has(capability):
+        return self._lacks(self._microscope, capability)
+
+    @staticmethod
+    def _lacks(microscope: Microscope | None, capability: type) -> str | None:
+        """``lacks`` of the facade a caller already took into a local."""
+        if microscope is None:
+            return NOT_CONNECTED
+        if microscope.has(capability):
             return None
         return f"this stand has no {capability.__name__}"
+
+    @property
+    def connected(self) -> bool:
+        """Whether the page holds a stand: what *Connect* and *Disconnect* read."""
+        return self._microscope is not None
+
+    def _stand(self) -> Microscope:
+        """The facade the page holds, for an activity or a capture.
+
+        Raises:
+            RuntimeError: ``NOT_CONNECTED``.
+        """
+        microscope = self._microscope
+        if microscope is None:
+            raise RuntimeError(NOT_CONNECTED)
+        return microscope
+
+    def connect(self) -> None:
+        """Open the profile's stand on the worker, as the activity ``connect``.
+
+        Its outcome is ``connect: <stand> connected, <n> devices``, or what the
+        opener raised, as one line (a stand that NIS-Elements holds). STOP pressed
+        while it opens halts the new facade once it is kept. A connect that ends
+        after ``close()`` gave up waiting releases what it opened: a stand is never
+        left open with no owner.
+
+        Raises:
+            RuntimeError: The page is closed, or an activity is going (``<name> is
+                running``).
+        """
+        self._refuse_if_busy()
+        if self._microscope is not None:
+            self._set_outcome(
+                f"connect: {self._profile.microscope.name} is already connected"
+            )
+            return
+        self._start_activity("connect", self._connect)
+
+    def _connect(self, event: threading.Event) -> str:
+        """``connect``'s body on the worker; ``_lock`` is never held across the opener or a release."""
+        stand = self._profile.microscope.name
+        log.info("connect: opening %s from the plate page", stand)
+        try:
+            microscope = self._opener()
+        except Exception as exc:
+            # Text, never the error (FM-98): a CoreError from a stand another
+            # program holds, a ProfileError from a `[sample]` stand.
+            return f"connect: {type(exc).__name__}: {_one_line(exc)}"
+        with self._lock:
+            closed = self._closed
+            if not closed:
+                self._microscope = microscope
+                # A new facade is not halted, and its light is read again.
+                self._stop_note = None
+                self._light_lacks_found = None
+        if closed:
+            try:
+                microscope.close()
+            except Exception as exc:
+                return (
+                    f"connect: {stand} was opened after the page closed, and its "
+                    f"release failed: {type(exc).__name__}: {_one_line(exc)}"
+                )
+            return f"connect: {stand} was opened after the page closed, and released"
+        outcome = f"connect: {stand} connected, {len(microscope.devices)} devices"
+        if microscope.dry_run:
+            outcome += " (dry run)"
+        if event.is_set():
+            # STOP was pressed while the stand opened: it found nothing to stop, and
+            # the operator asked for a halted stand. Outside the lock (FM-70).
+            self.stop()
+            outcome += ", and halted: STOP was pressed while it connected"
+        return outcome
+
+    def disconnect(self) -> None:
+        """Release the stand on the worker, as the activity ``disconnect``, for another program.
+
+        The facade is dropped under the lock **before** it is closed, so no read
+        that starts after the drop reaches a closed facade, and the page has let go
+        of it even when ``Microscope.close()`` raises. Nothing is switched off: a
+        light or an autofocus stays as the stand keeps it. Refused while a run, a
+        snap, live or a drive action goes, so none finds the facade gone under it.
+
+        Raises:
+            RuntimeError: The page is closed, or an activity is going (``<name> is
+                running``).
+        """
+        self._refuse_if_busy()
+        if self._microscope is None:
+            self._set_outcome(f"disconnect: {NOT_CONNECTED}")
+            return
+        self._start_activity("disconnect", self._disconnect)
+
+    def _disconnect(self, event: threading.Event) -> str:
+        """``disconnect``'s body on the worker: the drop under the lock, the close outside it."""
+        with self._lock:
+            microscope, self._microscope = self._microscope, None
+            self._light_lacks_found = None
+        if microscope is None:  # unreachable: only an activity drops it
+            return f"disconnect: {NOT_CONNECTED}"
+        try:
+            microscope.close()
+        except Exception as exc:
+            # close() has logged what to do when unloading fails.
+            return f"disconnect: {type(exc).__name__}: {_one_line(exc)}"
+        return f"disconnect: {self._profile.microscope.name} released"
+
+    def release(self) -> None:
+        """Release the stand the page holds, if any: the command's, after ``close()``.
+
+        Idempotent, and it does nothing on a page that holds no stand. It releases
+        a facade handed to the constructor too.
+
+        Raises:
+            RuntimeError: ``release() comes after close()``: before it, the facade
+                could be pulled from under an activity.
+            MicroscopeBusyError: What ``Microscope.close()`` raises; the page has
+                let go of the facade all the same.
+            HardwareError: As ``MicroscopeBusyError``.
+        """
+        if not self._closed:
+            raise RuntimeError("release() comes after close()")
+        with self._lock:
+            microscope, self._microscope = self._microscope, None
+        if microscope is not None:
+            microscope.close()
 
     def snap(self) -> None:
         """Snap one frame on the worker and keep it as ``frame()``; what it did is the ``outcome``.
@@ -971,7 +1197,8 @@ class PlatePage:
         so no traceback keeps the facade, and so the core, alive.
         """
         try:
-            camera = self._microscope.require(Camera)
+            microscope = self._stand()
+            camera = microscope.require(Camera)
             exposure_ms = camera.exposure_ms()
             image = camera.snap()
             if not (
@@ -984,7 +1211,7 @@ class PlatePage:
                     f"{image.shape}; the page shows 2-D uint8 or uint16 frames"
                 )
             bit_depth = camera.bit_depth()
-            state = self._microscope.state()
+            state = microscope.state()
             kept = np.array(image)
             kept.flags.writeable = False
             height, width = kept.shape
@@ -1024,7 +1251,7 @@ class PlatePage:
         self._drive(
             "stage jog",
             XYStage,
-            lambda: drive.jog_xy(self._microscope, dx_um, dy_um),
+            lambda: drive.jog_xy(self._stand(), dx_um, dy_um),
         )
 
     def jog_z(self, dz_um: float) -> None:
@@ -1033,7 +1260,7 @@ class PlatePage:
         Raises:
             RuntimeError: As ``jog_xy``.
         """
-        self._drive("z jog", ZStage, lambda: drive.jog_z(self._microscope, dz_um))
+        self._drive("z jog", ZStage, lambda: drive.jog_z(self._stand(), dz_um))
 
     def objective(self, label: str, *, confirm: bool) -> None:
         """``smc objective set label``: the turret turns only with ``confirm`` (FM-14).
@@ -1047,7 +1274,7 @@ class PlatePage:
         self._drive(
             "objective set",
             ObjectiveTurret,
-            lambda: drive.set_objective(self._microscope, label, confirm=confirm),
+            lambda: drive.set_objective(self._stand(), label, confirm=confirm),
         )
 
     def autofocus(self, on: bool) -> None:
@@ -1060,13 +1287,13 @@ class PlatePage:
             self._drive(
                 "autofocus engage",
                 Autofocus,
-                lambda: drive.engage_autofocus(self._microscope),
+                lambda: drive.engage_autofocus(self._stand()),
             )
         else:
             self._drive(
                 "autofocus disengage",
                 Autofocus,
-                lambda: drive.disengage_autofocus(self._microscope),
+                lambda: drive.disengage_autofocus(self._stand()),
             )
 
     def light(self, on: bool) -> None:
@@ -1081,13 +1308,16 @@ class PlatePage:
         self._drive(
             "light on" if on else "light off",
             LightSource,
-            lambda: drive.switch_light(self._microscope, on),
+            lambda: drive.switch_light(self._stand(), on),
             lacks=self.light_lacks if on else None,
         )
 
     def objective_labels(self) -> tuple[str, ...]:
-        """The turret's labels in position order; ``()`` without a turret or when the read fails."""
-        turret = self._microscope.get(ObjectiveTurret)
+        """The turret's labels in position order; ``()`` with the stand closed, without a turret or when the read fails."""
+        microscope = self._microscope
+        if microscope is None:
+            return ()
+        turret = microscope.get(ObjectiveTurret)
         if turret is None:
             return ()
         try:
@@ -1107,15 +1337,17 @@ class PlatePage:
         ``None`` (a ``State`` device such as the demo's ``LED``). A read that
         raises is ``None``: the click then says what fails. The answer is kept
         after the first read that does not raise, since a device's type does not
-        change while the stand is held. It takes no lock: the page calls it.
+        change while the stand is held; Connect and Disconnect forget it. It
+        takes no lock: the page calls it.
         """
-        lack = self.lacks(LightSource)
-        if lack is not None:
+        microscope = self._microscope
+        lack = self._lacks(microscope, LightSource)
+        if lack is not None or microscope is None:
             return lack
         found = self._light_lacks_found
         if found is not None:
             return found[0]
-        light = self._microscope.get(LightSource)
+        light = microscope.get(LightSource)
         if light is None:  # unreachable once lacks() said it is there
             return None
         try:
@@ -1126,16 +1358,19 @@ class PlatePage:
             )
         except Exception:
             return None
-        self._light_lacks_found = (answer,)
+        if self._microscope is microscope:
+            # Not kept for a facade a Disconnect dropped during the read.
+            self._light_lacks_found = (answer,)
         return answer
 
     def jog_limits_um(self) -> tuple[float, float]:
         """The profile's XY and Z jog limits, in µm: what the page's steps are bounded by.
 
         A profile that sets no ``max_z_jog_um`` is held to the layer's assumed
-        default, as the facade holds it.
+        default, as the facade holds it. Read from the profile, so the same with
+        the stand closed.
         """
-        safety = self._microscope.profile.safety
+        safety = self._profile.safety
         z_limit = (
             DEFAULT_MAX_Z_JOG_UM if safety.max_z_jog_um is None else safety.max_z_jog_um
         )
@@ -1205,20 +1440,25 @@ class PlatePage:
         and the log line comes after the stop (FM-62). It takes no lock the worker
         holds (FM-70) and never raises for a stop that is refused or fails
         (FM-117): the outcome is ``stop_note``. STOP with nothing running still
-        halts the stand.
+        halts the stand. With the stand closed it sets the event all the same (a
+        ``connect`` that is opening halts the stand once it holds it), and the
+        note says there was nothing to stop.
         """
         current = self._current_run
         if current is not None:
             current[1].set()
         prefix = "" if current is None else f"{current[0]} told to stop; "
+        microscope = self._microscope
         try:
-            self._microscope.stop()
+            if microscope is None:
+                note = f"{prefix}{NOT_CONNECTED}: nothing to stop"
+            else:
+                microscope.stop()
+                note = f"{prefix}{_STOP_ACCEPTED}"
         except StopRefusedError as exc:
             note = f"{prefix}halted, but {_one_line(exc)}"
         except HardwareError as exc:
             note = f"{prefix}the stop failed: {_one_line(exc)}"
-        else:
-            note = f"{prefix}{_STOP_ACCEPTED}"
         log.info("stop: %s", note)
         self._stop_note = note
 
@@ -1226,12 +1466,13 @@ class PlatePage:
         """Clear the halt; refused while a run is going.
 
         Raises:
-            RuntimeError: A run is going (``<plugin> is running``).
+            RuntimeError: A run is going (``<plugin> is running``), or the stand is
+                not connected (``NOT_CONNECTED``).
         """
         current = self._current_run
         if current is not None:
             raise RuntimeError(f"{current[0]} is running")
-        self._microscope.resume()
+        self._stand().resume()
         self._stop_note = None
 
     def status(self) -> PageStatus:
@@ -1239,7 +1480,9 @@ class PlatePage:
 
         The latest ``Progress`` is kept, so that every session sees the same. The
         stand's read takes no lock and tolerates a failed device: what failed is in
-        ``problems``.
+        ``problems``. The facade is read once; when a ``disconnect`` dropped it
+        during the read, the status is the closed stand's, so a read of a released
+        stand is never told as its fault (``another program holding it``).
         """
         latest: Progress | None = None
         while True:
@@ -1253,38 +1496,61 @@ class PlatePage:
             running = None if self._current_run is None else self._current_run[0]
             progress = self._progress
             outcome = self._outcome
-        state = self._microscope.state()
-        problems = list(state.errors)
-        light_on: bool | None = None
-        light = self._microscope.get(LightSource)
-        if light is not None:
-            try:
-                light_on = light.is_on()
-            except Exception as exc:
-                problems.append(f"light: {type(exc).__name__}: {_one_line(exc)}")
-        autofocus = (
-            _autofocus_words(state.autofocus_engaged, state.autofocus_locked)
-            if self._microscope.has(Autofocus)
-            else "no autofocus"
+        stand = self._profile.microscope.name
+        stop_refused = tuple(
+            role.value for role in self._profile.safety.stop_refused_by
         )
+        microscope = self._microscope
+        if microscope is not None:
+            state = microscope.state()
+            problems = list(state.errors)
+            light_on: bool | None = None
+            light = microscope.get(LightSource)
+            if light is not None:
+                try:
+                    light_on = light.is_on()
+                except Exception as exc:
+                    problems.append(f"light: {type(exc).__name__}: {_one_line(exc)}")
+            autofocus = (
+                _autofocus_words(state.autofocus_engaged, state.autofocus_locked)
+                if microscope.has(Autofocus)
+                else "no autofocus"
+            )
+            if self._microscope is microscope:
+                return PageStatus(
+                    stand=stand,
+                    dry_run=self._dry_run,
+                    running=running,
+                    progress=progress,
+                    outcome=outcome,
+                    stop_note=self._stop_note,
+                    xy_um=None if state.xy is None else (state.xy.x_um, state.xy.y_um),
+                    z_um=state.z_um,
+                    objective=state.objective,
+                    autofocus=autofocus,
+                    light_on=light_on,
+                    moving=tuple(state.moving),
+                    halted=state.halted,
+                    stop_refused=stop_refused,
+                    problems=tuple(problems),
+                )
         return PageStatus(
-            stand=self._microscope.profile.microscope.name,
-            dry_run=self._microscope.dry_run,
+            stand=stand,
+            dry_run=self._dry_run,
             running=running,
             progress=progress,
             outcome=outcome,
             stop_note=self._stop_note,
-            xy_um=None if state.xy is None else (state.xy.x_um, state.xy.y_um),
-            z_um=state.z_um,
-            objective=state.objective,
-            autofocus=autofocus,
-            light_on=light_on,
-            moving=tuple(state.moving),
-            halted=state.halted,
-            stop_refused=tuple(
-                role.value for role in self._microscope.profile.safety.stop_refused_by
-            ),
-            problems=tuple(problems),
+            xy_um=None,
+            z_um=None,
+            objective=None,
+            autofocus="?",
+            light_on=None,
+            moving=(),
+            halted=False,
+            stop_refused=stop_refused,
+            problems=(),
+            connected=False,
         )
 
     def join(self, timeout_s: float | None = None) -> bool:
@@ -1499,8 +1765,8 @@ class PlatePage:
     def _unusable(self, doc: RunDocument, slot: str) -> str | None:
         return doc.unusable(
             slot,
-            profile=self._microscope.profile.microscope.name,
-            dry_run=self._microscope.dry_run,
+            profile=self._profile.microscope.name,
+            dry_run=self._dry_run,
         )
 
     def _slot(
@@ -1540,7 +1806,15 @@ class PlatePage:
         return tuple(items)
 
     def _blocked(self, doc: RunDocument) -> dict[str, str]:
-        """Why each registered tool cannot run now; a tool that can is absent."""
+        """Why each registered tool cannot run now; a tool that can is absent.
+
+        Every tool needs the stand, as ``smc run`` opens it for every plugin, so
+        with the stand closed ``NOT_CONNECTED`` is every tool's reason, ahead of
+        any other.
+        """
+        microscope = self._microscope
+        if microscope is None:
+            return {name: NOT_CONNECTED for name in self._registry().plugins}
         blocked: dict[str, str] = {}
         for name, entry in self._registry().plugins.items():
             reason = next(
@@ -1551,7 +1825,10 @@ class PlatePage:
                 reason = next(
                     (
                         lack
-                        for lack in (self.lacks(cap) for cap in entry.plugin.requires)
+                        for lack in (
+                            self._lacks(microscope, cap)
+                            for cap in entry.plugin.requires
+                        )
                         if lack
                     ),
                     None,
