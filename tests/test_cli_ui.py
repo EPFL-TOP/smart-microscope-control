@@ -205,6 +205,17 @@ def test_ui_plate_needs_a_run_document(no_stand: None) -> None:
     assert "a run needs --run-doc" in _plain(result)
 
 
+def test_ui_plate_help_says_ctrl_c_sends_a_stop() -> None:
+    # A stand may refuse the stop and let a sent move run to its target, so "stops
+    # what is going" promised what the Ti2-E cannot do (m2 §11.11 E8, #224, #291).
+    result = runner.invoke(app, ["ui", "plate", "--help"])
+    assert result.exit_code == 0, result.output
+    help_text = " ".join(_plain(result).split())  # the help wraps its lines
+    assert "Ctrl-C sends a stop to any move under way" in help_text
+    assert "A stand that refuses stop() lets a sent move run to its target" in help_text
+    assert "Ctrl-C stops what is going" not in help_text
+
+
 @pytest.mark.parametrize("empty", ["", "   "])
 def test_an_empty_run_document_path_is_refused(no_stand: None, empty: str) -> None:
     # `Path("")` is the current folder (FM-78).
