@@ -76,7 +76,7 @@ from smc.hardware.capabilities import (
     ZStage,
 )
 from smc.hardware.channels import choose_group
-from smc.hardware.core import close_core, open_core
+from smc.hardware.core import close_core, detach_callbacks, open_core
 from smc.hardware.errors import (
     CapabilityMissingError,
     HardwareError,
@@ -835,7 +835,10 @@ class Microscope:
         released here. A stop that fails is logged and does not keep the
         stand connected. Unloading waits for the microscope lock, so it never
         pulls a device from under an action in another thread; that wait is
-        bounded like any action's.
+        bounded like any action's. Once unloaded, the core's notification relay
+        is detached, which waits for the notification being delivered (and has
+        no limit of its own): the core is then never freed inside its own
+        callback (``detach_callbacks``, #311).
 
         A Ctrl-C handler calls :meth:`stop`, not this: landing inside one of
         the ``Executor``'s registry sections, ``close()`` would wait for the
@@ -885,16 +888,25 @@ class Microscope:
             if not stopped:
                 self._stop_if_moving()
             try:
-                self.core.unloadAllDevices()
-            except Exception as exc:
-                # Text, never the error: its traceback holds the facade (FM-92).
-                log.error(
-                    "%s: unloading the devices failed (%s); the stand may still "
-                    "be connected, so restart the program before another one "
-                    "connects to it",
-                    self.profile.microscope.name,
-                    repr(exc),
-                )
+                try:
+                    self.core.unloadAllDevices()
+                except Exception as exc:
+                    # Text, never the error: its traceback holds the facade (FM-92).
+                    log.error(
+                        "%s: unloading the devices failed (%s); the stand may "
+                        "still be connected, so restart the program before "
+                        "another one connects to it",
+                        self.profile.microscope.name,
+                        repr(exc),
+                    )
+            finally:
+                # After the unload, which queues notifications of its own: waits
+                # for the one in flight, so the core is never freed inside a
+                # callback (#311). In a `finally`, because a second Ctrl-C inside
+                # the unload is not an Exception and would skip it (FM-49). Under
+                # the lock, so "closed" still means released; no smc handler
+                # takes the lock, so the wait cannot deadlock on it.
+                detach_callbacks(self.core)
             self._closed = True
         finally:
             if acquired or _owns(self._lock):

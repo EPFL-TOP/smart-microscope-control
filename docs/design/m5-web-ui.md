@@ -487,8 +487,12 @@ class PlatePageView:
 - How live gives way, and the redraw period, are §5.2 and §5.3.
 - Measured here: the demo camera snaps in 10.8 ms (92 frames a second), a frame's
   conversion takes 0.8 ms and a new `source.data` 0.02 ms: nothing on the server
-  limits 5 frames a second on the demo. What a browser shows, locally and over
-  RDP, is the owner's to measure, and is ADR-0006's revisit criterion for Panel.
+  limits 5 frames a second on the demo. The demo test measures the frame step
+  with the cap's wait taken out, and the cap is proved on an owned clock,
+  because a timed wait returned late on the macOS runner (inferred from CI logs,
+  not probed on it, #311). What a browser
+  shows, locally and over RDP, is the owner's to measure, and is ADR-0006's
+  revisit criterion for Panel.
 - Measured while planning #262 (2026-10-29, Python 3.13.0, the demo stand, a
   throwaway subclass of `PlatePage` with §5.1's loop): `_snap`'s step takes
   10.9 ms, of which `microscope.state()` 0.14 ms; over 2 s, 20 frames at the

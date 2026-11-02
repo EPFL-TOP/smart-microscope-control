@@ -30,6 +30,12 @@ Hardware behaviour encoded here (#77):
   the whole process: ``close_core`` does not undo it and ``Microscope.close()``
   does not call it, because closing one core must not take a folder from under
   another that is still open (#110, design §7).
+* **A core must not be freed while it delivers one of its own notifications.**
+  MMCore calls back on a thread of its own, so a core in a reference cycle can
+  be freed by the cyclic collector on that very thread, and the destructor then
+  throws out of a callback and aborts the process. Both ways of releasing a core
+  (``close_core``, ``Microscope.close()``) end with ``detach_callbacks``, which
+  waits for the handler in flight (#311, design §7).
 """
 
 from __future__ import annotations
@@ -52,6 +58,7 @@ __all__ = [
     "CoreError",
     "MicroManagerStatus",
     "close_core",
+    "detach_callbacks",
     "find_install",
     "new_core",
     "open_core",
@@ -343,11 +350,70 @@ def open_core(
     return core
 
 
+def detach_callbacks(core: object) -> None:
+    """Wait for the notification MMCore is delivering, then stop it delivering more.
+
+    MMCore delivers its callbacks on a thread of its own, a moment after the
+    call that caused them, and pymmcore-plus's relay runs Python there. A core
+    that is freed while one of its own notifications is still being delivered
+    aborts the process: ``CMMCorePlus.__del__`` unregisters the callback and the
+    C++ destructor does it again, which throws ``CMMError: Cannot call
+    registerCallback from within an MMEventCallback handler`` out of a
+    destructor. A core in a reference cycle is freed by whichever thread runs
+    the cyclic collector, and that can be the notification thread (#311).
+
+    ``registerCallback(None)`` called from another thread blocks until the
+    handler in flight has returned and releases the GIL while it waits, so the
+    destructor never runs inside a callback afterwards. It is called through
+    ``pymmcore.CMMCore`` because ``CMMCorePlus.registerCallback`` is overridden
+    to refuse. Both ways of releasing a core call this after unloading, which
+    queues notifications of its own: :func:`close_core` and
+    ``Microscope.close()``.
+
+    A core that is not an MMCore (a ``FakeCore``, a wrapper that delegates to
+    one) is left alone, so whoever owns a wrapper releases the core it wraps
+    through :func:`close_core` itself (the doctor tests' ``_FailingCore`` does).
+    A failure is logged, never raised: ``close()`` from inside a callback of the
+    same core is the one case, and the caller can do nothing more than say so.
+
+    The wait has no limit of its own: it lasts as long as the slowest handler
+    connected to ``core.events``, which is only pymmcore-plus's relay today; a
+    subscriber that blocks would hang the close. A Ctrl-C does not end it
+    either: it is one native call, and two interrupts sent during it were
+    measured to take effect only once the handler returned. The signal handler's
+    ``stop()`` never gets here, but a Ctrl-C that unwinds a ``with
+    Microscope.open()`` block or :func:`opened` does.
+    """
+    import pymmcore
+
+    if not isinstance(core, pymmcore.CMMCore):
+        return
+    try:
+        pymmcore.CMMCore.registerCallback(core, None)
+    except Exception as exc:
+        # Text, never the error: its traceback holds the core (FM-92).
+        log.warning(
+            "could not detach the core's callbacks (%s); the core is still "
+            "delivering a notification and may abort the process if it is "
+            "freed now",
+            str(exc),
+        )
+
+
 def close_core(core: CMMCorePlus) -> None:
-    """Release every device. Safe to call twice."""
-    # Nothing useful can be done if unloading fails; the process is ending.
-    with suppress(Exception):
-        core.unloadAllDevices()
+    """Release every device, then detach the notification relay. Safe to call twice.
+
+    Detaching is what keeps the core's destructor out of a callback
+    (:func:`detach_callbacks`, #311).
+    """
+    # Nothing useful can be done if unloading fails; the process is ending. The
+    # detach is in a `finally`: a second Ctrl-C inside the unload is not an
+    # Exception, and a step queued after it would be skipped (FM-49).
+    try:
+        with suppress(Exception):
+            core.unloadAllDevices()
+    finally:
+        detach_callbacks(core)
 
 
 @contextmanager
