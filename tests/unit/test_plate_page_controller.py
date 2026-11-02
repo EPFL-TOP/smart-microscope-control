@@ -2430,10 +2430,18 @@ def test_the_live_wait_is_what_is_left_of_the_period_since_the_frame_began(
         try:
             with _replaced(event, "wait", spy):
                 camera.go.set()
-                assert page.join(10.0)
+                # The thread, not `page.join`: that reads the patched clock, which
+                # only a snap and the spy move, so a worker blocked where the spy
+                # does not see (a wait on another event) would hang the test and
+                # not fail it (FM-44, #311).
+                worker = page._worker
+                assert worker is not None
+                worker.join(10.0)
+                assert not worker.is_alive(), f"the live loop never ended: {waits}"
         finally:
             camera.go.set()
             event.set()
+    assert page.join(10.0)
     assert waits == pytest.approx([wait_s] * 5)
     assert np.diff(camera.began).tolist() == pytest.approx([max(snap_s, 0.2)] * 4)
 

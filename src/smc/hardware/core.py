@@ -371,11 +371,18 @@ def detach_callbacks(core: object) -> None:
     ``Microscope.close()``.
 
     A core that is not an MMCore (a ``FakeCore``, a wrapper that delegates to
-    one) is left alone. A failure is logged, never raised: ``close()`` from
-    inside a callback of the same core is the one case, and the caller can do
-    nothing more than say so. The wait has no limit of its own: it lasts as long
-    as the slowest handler connected to ``core.events``, which is only
-    pymmcore-plus's relay today; a subscriber that blocks would hang the close.
+    one) is left alone, so whoever owns a wrapper releases the core it wraps
+    through :func:`close_core` itself (the doctor tests' ``_FailingCore`` does).
+    A failure is logged, never raised: ``close()`` from inside a callback of the
+    same core is the one case, and the caller can do nothing more than say so.
+
+    The wait has no limit of its own: it lasts as long as the slowest handler
+    connected to ``core.events``, which is only pymmcore-plus's relay today; a
+    subscriber that blocks would hang the close. A Ctrl-C does not end it
+    either: it is one native call, and two interrupts sent during it were
+    measured to take effect only once the handler returned. The signal handler's
+    ``stop()`` never gets here, but a Ctrl-C that unwinds a ``with
+    Microscope.open()`` block or :func:`opened` does.
     """
     import pymmcore
 
@@ -399,10 +406,14 @@ def close_core(core: CMMCorePlus) -> None:
     Detaching is what keeps the core's destructor out of a callback
     (:func:`detach_callbacks`, #311).
     """
-    # Nothing useful can be done if unloading fails; the process is ending.
-    with suppress(Exception):
-        core.unloadAllDevices()
-    detach_callbacks(core)
+    # Nothing useful can be done if unloading fails; the process is ending. The
+    # detach is in a `finally`: a second Ctrl-C inside the unload is not an
+    # Exception, and a step queued after it would be skipped (FM-49).
+    try:
+        with suppress(Exception):
+            core.unloadAllDevices()
+    finally:
+        detach_callbacks(core)
 
 
 @contextmanager

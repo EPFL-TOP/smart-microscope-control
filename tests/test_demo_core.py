@@ -1,5 +1,6 @@
 """The demo configuration is the regression bed; make sure it behaves."""
 
+import importlib
 import logging
 import os
 import re
@@ -20,6 +21,8 @@ from smc.hardware.core import (
     open_core,
     opened,
 )
+from smc.hardware.microscope import Microscope
+from smc.hardware.profile import Profile
 from smc.testing.fakes import FakeCore
 
 pytestmark = pytest.mark.demo
@@ -776,12 +779,19 @@ def test_an_interrupt_during_open_is_not_a_core_error_and_frees_the_core(
 # registerCallback again and throws out of a destructor. The child holds the
 # core in a cycle, keeps the handler busy for 0.3 s, closes the core on the main
 # thread and drops every name, so the collection in the handler is the one that
-# frees it. It runs in a child because the abort takes the interpreter down.
+# frees it. It runs in a child because the abort takes the interpreter down, and
+# the child goes through the discovery probes' crash guard before it loads
+# anything: a regression ends in abort(), which would otherwise open a crash
+# dialog that looks like a hang (FM-03).
 _FREED_WHILE_DELIVERING = """
 import gc
 import sys
 import threading
 import time
+
+from smc.discovery._mm_child import _no_error_dialogs
+
+_no_error_dialogs()
 
 from smc.hardware.core import close_core, open_core
 from smc.hardware.microscope import Microscope
@@ -834,8 +844,10 @@ print("survived")
 def test_a_core_freed_while_it_delivers_a_notification_does_not_abort_the_process(
     how: str,
 ) -> None:
-    # Windows ends an abort with exit code 3 and POSIX with -6: only "0" is
-    # asserted, never a failure code (FM-44).
+    # The exit code of an abort differs by platform and by the crash guard (-6 on
+    # macOS without it, 6 with it): only "0" is asserted, never a failure code. `replace`
+    # because a Windows child writes stderr in cp1252: an accented profile folder
+    # in a log line would otherwise raise here and hide the diagnosis below.
     done = subprocess.run(
         [
             sys.executable,
@@ -846,6 +858,7 @@ def test_a_core_freed_while_it_delivers_a_notification_does_not_abort_the_proces
         capture_output=True,
         text=True,
         encoding="utf-8",
+        errors="replace",
         timeout=60,
     )
     why = (
@@ -881,18 +894,23 @@ def test_detaching_from_inside_a_callback_of_the_same_core_warns_and_returns(
         core.events.exposureChanged.disconnect(handler)
         close_core(core)
     assert returned == [True]
-    warnings = [
-        (r.levelno, r.getMessage())
+    records = [
+        r
         for r in caplog.records
         if r.name == "smc.hardware.core" and r.levelno >= logging.WARNING
     ]
-    assert len(warnings) == 1
-    level, message = warnings[0]
-    assert level == logging.WARNING
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    message = records[0].getMessage()
     assert (
         "Cannot call registerCallback from within an MMEventCallback handler" in message
     )
     assert "may abort the process if it is freed now" in message
+    # Text and never the error (FM-92): a kept record would keep its traceback,
+    # and the traceback the core. `%s` formats both the same, so the message
+    # above cannot tell them apart.
+    assert records[0].exc_info is None
+    assert not any(isinstance(a, BaseException) for a in records[0].args or ())
 
 
 def test_detach_callbacks_leaves_a_core_that_is_not_mmcore_alone(
@@ -904,3 +922,110 @@ def test_detach_callbacks_leaves_a_core_that_is_not_mmcore_alone(
     assert fake.log == []
     # Calling MMCore's method on a stand-in raises, and the guard would log it.
     assert [r for r in caplog.records if r.name == "smc.hardware.core"] == []
+
+
+# -- the detach survives a failing unload (FM-49, #311) -----------------------
+
+
+@pytest.fixture
+def detaches(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """What ``detach_callbacks`` is handed, by either way of releasing a core; the real one still runs."""
+    from smc.hardware import core as core_mod
+
+    microscope_mod = importlib.import_module("smc.hardware.microscope")
+    seen: list[object] = []
+    real = core_mod.detach_callbacks
+
+    def spy(core: object) -> None:
+        seen.append(core)
+        real(core)
+
+    monkeypatch.setattr(core_mod, "detach_callbacks", spy)
+    monkeypatch.setattr(microscope_mod, "detach_callbacks", spy)
+    return seen
+
+
+def _core_that_fails_to_unload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[type[BaseException] | None]:
+    """Make ``open_core`` build a core whose ``unloadAllDevices`` raises what the returned list holds.
+
+    The list starts empty of a failure (``[None]``) and a test sets ``armed[0]``
+    after the open: MMCore unloads inside the load itself. Setting it back to
+    ``None`` releases the core for real at the end of a test. A list because
+    MMCore's classes refuse an attribute assignment.
+    """
+    import pymmcore_plus
+
+    armed: list[type[BaseException] | None] = [None]
+
+    class FailsToUnload(pymmcore_plus.CMMCorePlus):
+        def unloadAllDevices(self) -> None:  # noqa: N802 - MMCore API
+            if armed[0] is not None:
+                raise armed[0]("the unload failed (injected)")
+            super().unloadAllDevices()
+
+    monkeypatch.setattr(pymmcore_plus, "CMMCorePlus", FailsToUnload)
+    return armed
+
+
+# A second Ctrl-C is a KeyboardInterrupt, which is not an Exception (FM-49).
+_UNLOAD_FAILS = pytest.mark.parametrize(
+    "error", [RuntimeError, KeyboardInterrupt], ids=["an-error", "a-second-ctrl-c"]
+)
+
+
+@pytest.mark.usefixtures("need_mm")
+@_UNLOAD_FAILS
+def test_a_failing_unload_does_not_skip_the_detach_in_close_core(
+    monkeypatch: pytest.MonkeyPatch, detaches: list[object], error: type[BaseException]
+) -> None:
+    armed = _core_that_fails_to_unload(monkeypatch)
+    core = open_core(None)
+    try:
+        armed[0] = error
+        if error is KeyboardInterrupt:
+            # No `as`: the ExceptionInfo would hold the traceback, and so the core.
+            with pytest.raises(KeyboardInterrupt):
+                close_core(core)
+        else:
+            close_core(core)
+        assert detaches == [core]
+    finally:
+        armed[0] = None
+        close_core(core)
+
+
+@pytest.mark.usefixtures("need_mm")
+@_UNLOAD_FAILS
+def test_a_failing_unload_does_not_skip_the_detach_in_microscope_close(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    detaches: list[object],
+    error: type[BaseException],
+) -> None:
+    armed = _core_that_fails_to_unload(monkeypatch)
+    microscope = Microscope.open(Profile.demo())
+    try:
+        armed[0] = error
+        with caplog.at_level(logging.ERROR, logger="smc.hardware.microscope"):
+            if error is KeyboardInterrupt:
+                with pytest.raises(KeyboardInterrupt):
+                    microscope.close()
+            else:
+                microscope.close()
+        assert detaches == [microscope.core]
+        # An error is the unload's own ERROR line, as before (FM-49); an interrupt
+        # is not swallowed, so the facade is not closed and `close()` can be retried.
+        said = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        if error is KeyboardInterrupt:
+            assert said == []
+        else:
+            assert len(said) == 1
+            assert (
+                "unloading the devices failed (RuntimeError('the unload failed "
+                "(injected)'))" in said[0]
+            )
+    finally:
+        armed[0] = None
+        microscope.close()

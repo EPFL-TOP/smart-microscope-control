@@ -1178,7 +1178,10 @@ class _FailingCore:
     def unloadAllDevices(self) -> None:  # noqa: N802 - MMCore's name
         self.unloads += 1
         print(_UNLOADED)
-        self._core.unloadAllDevices()  # type: ignore[attr-defined]
+        # Through close_core, not the bare unload: this wrapper is not an MMCore, so
+        # `close_core(wrapper)` cannot detach the core it wraps, and a core freed
+        # while it still delivers a notification aborts the process (#311).
+        core_mod.close_core(self._core)  # type: ignore[arg-type]
 
 
 @pytest.fixture
