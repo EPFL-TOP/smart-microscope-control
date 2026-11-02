@@ -79,6 +79,7 @@ from smc.plugins.slots import (
 )
 from smc.run import RunDocument, RunDocumentError, StageRecord, StageStatus
 from smc.ui.frames import Frame
+from smc.ui.guide import CAPTURE_WELLS, SELECT_WELLS, NextStep, command_line, next_slot
 
 if TYPE_CHECKING:
     from smc.hardware.microscope import Microscope
@@ -269,6 +270,8 @@ class PlateView:
     (``run()`` refuses to start such a stage afresh). ``problems`` are what
     ``view()`` could not read and did not hide. ``cards`` has one card for each
     tool that has a record in the run document, and none for the others.
+    ``next_step`` is the tool the run document needs next and the values to run it
+    with (m5 §8.3), built here from this read and never by the tick.
     """
 
     plate: str
@@ -280,17 +283,33 @@ class PlateView:
     blocked: dict[str, str]
     problems: tuple[str, ...]
     cards: dict[str, ResultCard]
+    next_step: NextStep | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class ToolView:
-    """A tool the page can run: its rows are ``describe_params`` rows (name, type, default, notes)."""
+    """A tool the page can run: its rows are ``describe_params`` rows (name, type, default, notes).
+
+    ``suggested`` are the ``(key, value)`` pairs the profile suggests for the tool
+    and ``suggested_why`` its one-line reason: the page starts those fields with
+    their value, so a click on the tool's own *Run* sends what the next step shows.
+    """
 
     name: str
     summary: str
     stage: str
     key: tuple[tuple[str, str, str, str], ...]
     advanced: tuple[tuple[str, str, str, str], ...]
+    suggested: tuple[tuple[str, str], ...] = ()
+    suggested_why: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _Suggestion:
+    """A profile's ``[suggest.<plugin>]`` that passed the registry's check: pairs and why."""
+
+    pairs: tuple[tuple[str, str], ...]
+    why: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -598,6 +617,9 @@ class PlatePage:
         self._entry_points = None if entry_points is None else list(entry_points)
         self._registry_found: Registry | None = None
         self._tools_found: tuple[tuple[ToolView, ...], tuple[str, ...]] | None = None
+        # Checked once, against the registry, before any tool is described: a tool's
+        # form starts with a suggested value (m5 §8.3).
+        self._suggested, self._suggest_problems = self._check_suggestions(profile)
         self._geometry: dict[
             tuple[str, tuple[float, float], float], tuple[WellGeometry, ...]
         ] = {}
@@ -817,10 +839,16 @@ class PlatePage:
             self._refuse_another_registered_plate(self._document()[0])
             return [f"wells={','.join(self.selection)}"]
         if plugin == "plate-registration":
-            refs = json.dumps([r.model_dump(mode="json") for r in self.refs])
-            walls = json.dumps([w.model_dump(mode="json") for w in self.walls])
-            return [f"plate={self._plate}", f"refs={refs}", f"walls={walls}"]
+            return self._registration_pairs(self.refs, self.walls)
         return []
+
+    def _registration_pairs(
+        self, refs: Sequence[WellRef], walls: Sequence[WallTouch]
+    ) -> list[str]:
+        """The pairs of ``plate-registration`` for this plate: one place dumps them, so a step and a click agree."""
+        dumped_refs = json.dumps([r.model_dump(mode="json") for r in refs])
+        dumped_walls = json.dumps([w.model_dump(mode="json") for w in walls])
+        return [f"plate={self._plate}", f"refs={dumped_refs}", f"walls={dumped_walls}"]
 
     # --- runs, stop, status ---------------------------------------------------------
 
@@ -1744,6 +1772,11 @@ class PlatePage:
                 rows = [r for r in described if r[0] not in hidden]
                 by_name = {row[0]: row for row in rows}
                 keys = [k for k in KEY_PARAMS.get(name, ()) if k in by_name]
+                # What the stand suggests is never folded under *Advanced*, even for a
+                # key `KEY_PARAMS` does not name.
+                suggestion = self._suggested.get(name)
+                suggested = () if suggestion is None else suggestion.pairs
+                keys += [k for k, _value in suggested if k in by_name and k not in keys]
                 keys += [
                     row[0]
                     for row in rows
@@ -1756,6 +1789,8 @@ class PlatePage:
                         stage=staged.get(name, MORE_STAGE),
                         key=tuple(by_name[k] for k in keys),
                         advanced=tuple(r for r in rows if r[0] not in keys),
+                        suggested=suggested,
+                        suggested_why=None if suggestion is None else suggestion.why,
                     )
                 )
             self._tools_found = (tuple(views), tuple(problems))
@@ -1805,25 +1840,195 @@ class PlatePage:
                 for p in sorted(route.positions, key=lambda p: p.order)
             )
         )
+        checklist = self._checklist(doc)
+        blocked = self._blocked(doc)
+        cards = {
+            tool.name: _card(
+                doc.stages[tool.name],
+                stale=doc.is_stale(tool.name),
+                run_dir=run_dir,
+            )
+            for tool in self.tools()
+            if tool.name in doc.stages
+        }
         return PlateView(
             plate=self._plate,
             nominal=nominal,
             wells=tuple(wells),
             labels=() if density is None else density.labels,
             route=stops,
-            checklist=self._checklist(doc),
-            blocked=self._blocked(doc),
-            problems=(*problems, *self._plugin_problems()),
-            cards={
-                tool.name: _card(
-                    doc.stages[tool.name],
-                    stale=doc.is_stale(tool.name),
-                    run_dir=run_dir,
-                )
-                for tool in self.tools()
-                if tool.name in doc.stages
-            },
+            checklist=checklist,
+            blocked=blocked,
+            problems=(*problems, *self._plugin_problems(), *self._suggest_problems),
+            cards=cards,
+            next_step=self._next_step(checklist, blocked, cards),
         )
+
+    # --- the next step (m5 §8.3) ---------------------------------------------------
+
+    def _check_suggestions(
+        self, profile: Profile
+    ) -> tuple[dict[str, _Suggestion], tuple[str, ...]]:
+        """The profile's ``[suggest]`` entries that name a registered plugin and its parameters.
+
+        The profile checks the shape of the pairs and imports no plugin; this is
+        where the plugin and its keys are checked, once. An entry that fails is a
+        line of ``view().problems`` and is ignored whole, so that no step offers a
+        value the plugin would refuse by key. A value is not checked: a value the
+        plugin refuses is that run's own ``ParamsError``, which names the
+        profile's mistake when the step is run.
+        """
+        if not profile.suggest:
+            return {}, ()
+        plugins = self._registry().plugins
+        found: dict[str, _Suggestion] = {}
+        problems: list[str] = []
+        for name, entry in profile.suggest.items():
+            where = f"profile [suggest.{name}]"
+            registered = plugins.get(name)
+            if registered is None:
+                problems.append(f"{where}: no plugin named {name}")
+                continue
+            fields = registered.plugin.Params.model_fields
+            pairs: list[tuple[str, str]] = []
+            wrong: list[str] = []
+            for item in entry.params:
+                key, _separator, value = item.partition("=")
+                if key not in fields:
+                    wrong.append(
+                        f"{where}: {key} is not a parameter of {name} "
+                        f"(keys: {', '.join(fields)})"
+                    )
+                elif key in PAGE_PARAMS.get(name, ()):
+                    wrong.append(f"{where}: {key} is filled by the page")
+                pairs.append((key, value))
+            if wrong:
+                problems += wrong
+            else:
+                found[name] = _Suggestion(tuple(pairs), entry.why)
+        return found, tuple(problems)
+
+    def _next_step(
+        self,
+        checklist: Sequence[CheckItem],
+        blocked: dict[str, str],
+        cards: dict[str, ResultCard],
+    ) -> NextStep:
+        """The tool the run document needs next, with the values to run it and why each (m5 §8.3).
+
+        Computed from this ``view()``'s read, never by the tick. The pairs are the
+        call the page's button makes and the command names, so what the operator
+        reads is what runs. The step never reads the tool's form.
+        """
+        item = next_slot(checklist)
+        if item is None:
+            files = tuple(entry for card in cards.values() for entry in card.files)
+            return NextStep(
+                plugin=None,
+                params=(),
+                why=("every stage of the workflow is done; what it wrote:", *files),
+                command="",
+                blocked=None,
+            )
+        plugins = self._registry().plugins
+        providers = [
+            tool
+            for tool in self.tools()
+            if plugins[tool.name].plugin.provides == item.slot
+        ]
+        if not providers:
+            return NextStep(
+                plugin=None,
+                params=(),
+                why=(
+                    f"no registered plugin provides {item.slot}; "
+                    "smc run --list shows the plugins",
+                ),
+                command="",
+                blocked=None,
+            )
+        tool, others = providers[0], providers[1:]
+        why = [
+            item.reason
+            if item.state == "unusable" and item.reason
+            else f"the run document has no {item.slot} yet"
+        ]
+        pairs: list[str] = []
+        stuck: str | None = None
+        if tool.name == "plate-registration":
+            pairs, stuck = self._registration_step(why)
+        elif tool.name == "scan-plan":
+            try:
+                pairs = self.page_params("scan-plan")
+            except ValueError as exc:
+                # `page_params` refuses an empty selection, and a selection on another
+                # plate than the registered one: the first says what to do, the second
+                # says what is wrong. Text only (FM-98).
+                stuck = SELECT_WELLS if not self.selection else str(exc)
+            else:
+                why.append(
+                    f"wells: the {len(self.selection)} wells selected on the map"
+                )
+        suggestion = self._suggested.get(tool.name)
+        if suggestion is not None:
+            given = [f"{key}={value}" for key, value in suggestion.pairs]
+            pairs += given
+            why.append(
+                f"{' '.join(given)}: suggested by the profile "
+                f"{self._profile.microscope.name}: {suggestion.why}"
+            )
+        why += [f"or {other.name}: {_flat(other.summary)}" for other in others]
+        source = self._profile.source
+        command = command_line(
+            tool.name,
+            pairs,
+            profile=self._profile.microscope.name if source is None else str(source),
+            run_doc=self.run_doc,
+            dry_run=self._dry_run,
+        )
+        # What the run document or the stand says first wins: it is the reason that holds.
+        return NextStep(
+            plugin=tool.name,
+            params=tuple(pairs),
+            why=tuple(why),
+            command=command,
+            blocked=blocked.get(tool.name) or stuck,
+        )
+
+    def _registration_step(self, why: list[str]) -> tuple[list[str], str | None]:
+        """The pairs of ``plate-registration`` and what it waits for, with a line of ``why`` for them.
+
+        The captures made on this page win: they are measured. With none, a stand
+        whose profile has a ``[sample]`` of this plate registers it from the
+        sample's own geometry, which is known and not measured, and the line says
+        so. With neither, the plate is found by centring wells, which only the
+        operator can do.
+        """
+        if self.refs or self.walls:
+            why.append(
+                f"plate, refs, walls: the {len(self.refs)} centres and "
+                f"{len(self.walls)} walls captured on this page"
+            )
+            return self._registration_pairs(self.refs, self.walls), None
+        sample = self._profile.sample
+        if sample is None:
+            return [], CAPTURE_WELLS
+        if sample.plate != self._plate:
+            return [], (
+                f"the profile's sample is a {sample.plate} plate: "
+                f"choose {sample.plate} under plate-registration"
+            )
+        # Imported here: `smc.testing` is a stand-in for a stand, reached only by a
+        # profile that names a sample (m5 §8.2).
+        from smc.testing.sample_stand import sample_refs
+
+        refs = sample_refs(sample)
+        why.append(
+            f"refs: the centres of {', '.join(ref.well for ref in refs)} where the "
+            "profile's [sample] puts the plate; this stand's plate is synthetic, so "
+            "they are known, not measured"
+        )
+        return self._registration_pairs(refs, ()), None
 
     # --- internals of the view -----------------------------------------------------
 
