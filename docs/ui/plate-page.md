@@ -88,8 +88,10 @@ what the last STOP did.
 runs to its target. After STOP every action is refused until **Resume**, which is
 refused while a run is going.
 
-**The centre has two tabs, *Plate* and *Image*.** Only the tab you see is drawn. The
-run document's checklist stays under both.
+**The centre has two tabs, *Plate* and *Image*.** Both are kept: a map redrawn while you
+look at *Image* (a snap ends, a run ends) is framed on the plate when you come back, and
+**Reset** in the map's toolbar returns to that frame. The run document's checklist stays
+under both.
 
 **The map** (*Plate*). The plate in stage µm, X right and Y up, wells as circles (96-well and
 below) or squares (384 and 1536), turned by the plate's rotation. Its title says which
