@@ -949,9 +949,13 @@ def test_a_state_whose_control_times_out_is_named_and_the_next_state_runs(
 ) -> None:
     page = _fake_page(fails_on_text="Image")
     records, _, _ = _drive(snap, tmp_path, page, lambda steps: None)
-    assert [r.reached for r in records] == [True, True, False, True, True]
+    # `after-density` shows the Image tab too (its redraw is the one made while the
+    # Plate tab is hidden, #297), so it fails on the same control; `with-route` runs.
+    assert [r.reached for r in records] == [True, True, False, False, True]
     assert records[2].reason == "Locator.click: Timeout 10000ms exceeded."
+    assert records[3].reason == records[2].reason
     page.screenshot.assert_any_call(path=str(tmp_path / "snap-FAILED.png"))
+    page.screenshot.assert_any_call(path=str(tmp_path / "after-density-FAILED.png"))
 
 
 # --- the chain against the plugins ------------------------------------------

@@ -51,7 +51,7 @@ the demo whose camera images no sample. Nothing else is a parameter: there is no
 | `empty` | nothing: the page as it opens | both stands |
 | `wells-selected` | types `A1:B2` in the Wells box, Enter | both |
 | `snap` | the Image tab, the Snap button | both |
-| `after-density` | runs the workflow while the page is up (`plate-registration`, `scan-plan`, `scan`, `cells`, `density`, on the demo's simulated stage), then Refresh | `demo-sample` |
+| `after-density` | runs the workflow while the page is up (`plate-registration`, `scan-plan`, `scan`, `cells`, `density`, on the demo's simulated stage), then a Snap on the Image tab (the page redraws when it ends, with the Plate tab hidden: #297) and back to the Plate tab, **no Refresh** | `demo-sample` |
 | `with-route` | `route`, then Refresh | `demo-sample` |
 
 A state it cannot reach is **named, never skipped**: `<state>: not reached: <why>`,
@@ -138,8 +138,8 @@ here** (another MCP, keyboard use, a narrow window, Live, Drive).
 4. **It drives the page with the MCP's own tools.** What can be inspected: buttons,
    inputs, selects, tabs and the `pre` text panes, in Panel's shadow DOM (whether
    Claude in Chrome's page snapshot does not pierce it; see above). What cannot: the plate map and
-   the image are two canvases, pixels only. The tabs are dynamic: the Snap button
-   does not exist until the Image tab is active.
+   the image are two canvases, pixels only. The tabs are not dynamic: the Snap
+   button exists while the Plate tab is shown, hidden, and the page cannot click it.
 5. **One session on the page at a time.** The page owns the stand; a second would
    open a second one. Use a port of its own.
 

@@ -597,7 +597,7 @@ def _act_wells_selected(page: Any, stand: Stand) -> None:
 
 
 def _act_snap(page: Any, stand: Stand) -> None:
-    # The tabs are dynamic: the Snap button does not exist until Image is active.
+    # The Snap button is on the Image tab, hidden while Plate is the one in view.
     page.get_by_text("Image", exact=True).click()
     page.get_by_role("button", name="Snap").click()
     page.locator("pre").filter(has_text="snap: ").first.wait_for()
@@ -605,9 +605,13 @@ def _act_snap(page: Any, stand: Stand) -> None:
 
 def _act_after_density(page: Any, stand: Stand) -> None:
     stand.run_chain(CHAIN)
-    # Back to the Plate tab (Refresh is not on the Image tab), and read the file.
+    # The page reads the file again at the end of a snap, and a snap shows the Image
+    # tab: a redraw while the Plate tab is hidden, the case of #297. No Refresh: it
+    # would redraw a map in view and say nothing of the one drawn out of view.
+    page.get_by_text("Image", exact=True).click()
+    page.get_by_role("button", name="Snap").click()
+    page.locator("pre").filter(has_text="✓ density").first.wait_for()
     page.get_by_text("Plate", exact=True).first.click()
-    page.get_by_role("button", name="Refresh").click()
 
 
 def _act_with_route(page: Any, stand: Stand) -> None:
