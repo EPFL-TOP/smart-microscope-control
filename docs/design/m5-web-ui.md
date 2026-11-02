@@ -868,8 +868,10 @@ The help says:
 > The page starts with the stand closed: Connect opens the profile's stand and
 > Disconnect releases it, for NIS-Elements or ZEN. Every tool button is a plugin
 > run with the parameters smc run takes, so each has a command-line equivalent,
-> and each tool shows its last result. Ctrl-C stops what is going, then the
-> server, then releases the stand.
+> and each tool shows its last result. Ctrl-C sends a stop to any move under way
+> and tells what is going to stop, then ends the server, then releases the
+> stand. A stand that refuses stop() lets a sent move run to its target, and
+> the line printed says what each stop did.
 
 ### 7.2 The controller (`smc/ui/controller.py`)
 
