@@ -67,8 +67,9 @@ from smc.ui.controller import (
     WellView,
 )
 from smc.ui.frames import Frame, display_image
+from smc.ui.guide import NextStep
 
-__all__ = ["PlatePageView", "build", "card_text", "serve"]
+__all__ = ["PlatePageView", "build", "card_text", "next_step_text", "serve"]
 
 #: Names are drawn on a plate of at most this many wells; on more they are noise.
 NAMES_UP_TO_WELLS = 96
@@ -125,6 +126,17 @@ log = logging.getLogger("smc.ui")
 _FAILURE_TEXT_CHARS = 300
 
 _WARNING = "#b45309"
+
+#: A text pane that wraps: a path or an assumption longer than the column is read
+#: whole, where a pane's own ``<pre>`` cut it at the column's edge (m5 §8.4). ``styles``
+#: land on the pane's host and the ``<pre>`` inside its shadow root keeps its own
+#: ``white-space`` (measured in Chromium, #252), so the same rule is given to the
+#: ``<pre>`` through a stylesheet. Text, never markup (FM-139).
+_WRAP_STYLES = {"white-space": "pre-wrap", "overflow-wrap": "anywhere"}
+_WRAP_SHEET = "pre { white-space: pre-wrap; overflow-wrap: anywhere; }"
+#: The width of the text panes of the tools column, inside its 420 px.
+_TEXT_WIDTH = 380
+
 _SELECTED_OUTLINE = "#1f77b4"
 _PLAIN_OUTLINE = "#888888"
 _UNKNOWN_FILL = "#eeeeee"
@@ -207,7 +219,9 @@ def card_text(card: ResultCard | None, *, stand: str | None = None) -> str:
     known, the profile is always told: a card never claims it is this stand's),
     then `` (dry run)``, then `` (stale)`` when the record read an input that has
     been produced again since; the result's lines follow, indented by two spaces,
-    then one ``assumed:`` line for each assumption and the record's error.
+    then its files the same way (``in the run document`` for a ``done`` card that
+    names none, so that every result says where it is, m5 §8.4), then one
+    ``assumed:`` line for each assumption and the record's error.
     """
     if card is None:
         return ""
@@ -219,10 +233,45 @@ def card_text(card: ResultCard | None, *, stand: str | None = None) -> str:
     if card.stale:
         header += " (stale)"
     lines = [header, *(f"  {line}" for line in card.lines)]
+    if card.files:
+        lines += [f"  {entry}" for entry in card.files]
+    elif card.status == "done":
+        lines.append("  in the run document")
     lines += [f"assumed: {text}" for text in card.assumed]
     if card.error is not None:
         lines.append(f"error: {card.error}")
     return "\n".join(lines)
+
+
+def next_step_text(step: NextStep | None) -> str:
+    """The next step as plain text, for a ``pn.pane.Str``: never markup (FM-139).
+
+    With a tool, its name, then each line of ``why`` indented by two spaces and the
+    command last. Without one (the workflow is done, or no plugin fills the slot),
+    the lines of ``why`` as they are. ``""`` before the first read.
+    """
+    if step is None:
+        return ""
+    if step.plugin is None:
+        return "\n".join(step.why)
+    lines = [step.plugin, *(f"  {line}" for line in step.why)]
+    lines.append(f"  command: {step.command}")
+    return "\n".join(lines)
+
+
+def _wrapped_text(
+    text: str = "",
+    extra: dict[str, str] | None = None,
+    *,
+    width: int | None = _TEXT_WIDTH,
+) -> Any:
+    """A text pane whose lines wrap at its width, with ``extra`` styles added to the wrapping ones."""
+    return pn.pane.Str(
+        text,
+        styles={**_WRAP_STYLES, **(extra or {})},
+        width=width,
+        stylesheets=[_WRAP_SHEET],
+    )
 
 
 def _steps(steps: tuple[float, ...], limit_um: float) -> dict[str, float]:
@@ -277,6 +326,13 @@ class PlatePageView:
         self._seen_frame: int | None = None
         self._stand: str | None = None
         self._tools = page.tools()
+        # The next step the last redraw drew: the button runs this one, never a step
+        # computed at the click (m5 §8.5). And the selection the *Wells* box stands
+        # for, with the guard that keeps an echo of it from selecting again.
+        self._next_drawn: NextStep | None = None
+        self._wells_shown: tuple[str, ...] = ()
+        self._echoing = False
+        self._next_tool: str | None = None
 
         self.wells_source = ColumnDataSource(
             {
@@ -375,6 +431,17 @@ class PlatePageView:
         )
         self.checklist_text = pn.pane.Str("")
         self.captures_text = pn.pane.Str("")
+        # The run document's path heads its checklist; a path is as long as the
+        # folder it is in, so it wraps (m5 §8.4).
+        self.run_document_text = _wrapped_text(
+            f"Run document  {page.run_doc}", {"font-weight": "bold"}, width=None
+        )
+        # ADR-0006's head of the tools column: the tool the run document needs next.
+        self.next_text = _wrapped_text()
+        self.next_note = _wrapped_text(extra={"color": _WARNING})
+        self.next_button = pn.widgets.Button(
+            label="Run", color="primary", visible=False
+        )
 
         self.plate_select = pn.widgets.Select(
             label="Plate",
@@ -432,6 +499,7 @@ class PlatePageView:
             self._handler(lambda event: self.on_select_text(event.new)), "value"
         )
         self.refresh_button.on_click(self._handler(lambda event: self.refresh()))
+        self.next_button.on_click(self._handler(lambda event: self.on_next()))
         self.stop_button.on_click(self._handler(lambda event: self.on_stop()))
         self.resume_button.on_click(self._handler(lambda event: self.on_resume()))
         self.capture_centre_button.on_click(
@@ -583,6 +651,15 @@ class PlatePageView:
             self.drive_note,
         )
 
+    def _next_region(self) -> Any:
+        """The head of the tools column: the tool the run document needs next, and one button for it (m5 §8.5)."""
+        return pn.Column(
+            pn.pane.Str("Next step", styles={"font-weight": "bold"}),
+            self.next_text,
+            self.next_button,
+            self.next_note,
+        )
+
     def _layout(self) -> Any:
         connection = pn.Row(
             self.connect_button,
@@ -625,19 +702,25 @@ class PlatePageView:
         left = pn.Column(
             self.problems_text,
             self.tabs,
-            pn.pane.Str("Run document", styles={"font-weight": "bold"}),
+            self.run_document_text,
             self.checklist_text,
             sizing_mode="stretch_width",
         )
         stages: dict[str, list[Any]] = {}
         for tool in self._tools:
             stages.setdefault(tool.stage, []).append(self._tool_section(tool))
+        # Where each tool's stage is in the accordion, so that the next step can open it.
+        self._stage_index = {
+            tool.name: list(stages).index(tool.stage) for tool in self._tools
+        }
+        self.accordion = pn.Accordion(
+            *((stage, pn.Column(*sections)) for stage, sections in stages.items()),
+            active=list(range(len(stages))),
+        )
         right = pn.Column(
+            self._next_region(),
             self._drive_region(),
-            pn.Accordion(
-                *((stage, pn.Column(*sections)) for stage, sections in stages.items()),
-                active=list(range(len(stages))),
-            ),
+            self.accordion,
             width=420,
         )
         return pn.Column(
@@ -652,11 +735,18 @@ class PlatePageView:
 
     def _tool_section(self, tool: ToolView) -> Any:
         fields: dict[str, Any] = {}
+        suggested = dict(tool.suggested)
         for name, type_name, default, notes in (*tool.key, *tool.advanced):
+            description = f"{type_name}  {notes}".strip()
+            if name in suggested:
+                # The field starts with what the stand suggests, so that this tool's own
+                # *Run* sends what the next step shows (m5 §8.3).
+                description += f"\nsuggested by the profile: {tool.suggested_why}"
             fields[name] = pn.widgets.TextInput(
                 label=name,
                 placeholder=default,
-                description=f"{type_name}  {notes}".strip(),
+                description=description,
+                value=suggested.get(name, ""),
             )
         self.tool_fields[tool.name] = fields
         key_widgets = [fields[row[0]] for row in tool.key]
@@ -676,8 +766,9 @@ class PlatePageView:
             stylesheets=["pre { white-space: pre-wrap; }"],
         )
         self.tool_notes[tool.name] = note
-        # Plain text, never Markdown: a result's words are not markup (FM-139).
-        card = pn.pane.Str("")
+        # Plain text, never Markdown: a result's words are not markup (FM-139). It wraps:
+        # a file's path is as long as the folder it is in (m5 §8.4).
+        card = _wrapped_text()
         self.tool_cards[tool.name] = card
         parts: list[Any] = [pn.pane.Str(tool.summary), *key_widgets]
         if tool.name == "plate-registration":
@@ -758,11 +849,33 @@ class PlatePageView:
         self.tick()
 
     def on_select_text(self, text: str) -> None:
-        """A typed range (``A1:D6``): the selection becomes exactly those wells."""
-        if text.strip() == "":
+        """A typed range (``A1:D6``): the selection becomes exactly those wells.
+
+        The box keeps what was typed: ``_wells_shown`` is the selection the box now
+        stands for, so the redraw does not rewrite it. The box's own echo of a click
+        (``_echo_wells``) comes back here, synchronously, and selects nothing.
+        """
+        if self._echoing or text.strip() == "":
             return
-        self._try(lambda: self.page.select_text(text))
+        if self._try(lambda: self.page.select_text(text)):
+            self._wells_shown = self.page.selection
         self.refresh()
+
+    def on_next(self) -> None:
+        """Run the next step the last redraw drew: its tool with its pairs, as shown.
+
+        Never the step as it would be computed now, and never the tool's form: the
+        operator runs the pairs they read (m5 §8.5, #287). A click on the disabled
+        button still gets here (FM-169): the refusal is the controller's, as for
+        every Run.
+        """
+        drawn = self._next_drawn
+        if drawn is None or drawn.plugin is None:
+            self.message.object = "nothing to run: press Refresh"
+            return
+        plugin, params = drawn.plugin, list(drawn.params)
+        self._try(lambda: self.page.run(plugin, params))
+        self.tick()
 
     def on_choose_plate(self, name: str) -> None:
         """Another plate: the selection and the captures of the old one are dropped."""
@@ -1054,6 +1167,7 @@ class PlatePageView:
         if self.plate_select.value != view.plate:
             self.plate_select.value = view.plate
         self._draw_wells()
+        self._echo_selection()
         self.route_source.data = {
             "x": [stop.x_um for stop in view.route],
             "y": [stop.y_um for stop in view.route],
@@ -1075,9 +1189,52 @@ class PlatePageView:
         ]
         self.captures_text.object = "\n".join([*refs, *walls]) or "no capture yet"
         self._draw_cards()
+        self._draw_next()
         self._draw_problems()
         self._draw_buttons()
         self._draw_drive()
+
+    def _echo_selection(self) -> None:
+        """Show the selection in the *Wells* box when it is not the one the box stands for (m5 §8.5).
+
+        A click on the map, another tab, a plate chosen or a run document read changes
+        the selection without the box: it is then set to the wells, comma-separated.
+        A range the operator typed stays as typed (``on_select_text`` records it).
+        The assignment calls the box's watcher at once, so it runs under ``_echoing``,
+        which makes ``on_select_text`` return before it selects the same wells again.
+        """
+        selection = self.page.selection
+        if selection == self._wells_shown:
+            return
+        self._wells_shown = selection
+        self._echoing = True
+        try:
+            self.select_input.value = ",".join(selection)
+        finally:
+            self._echoing = False
+
+    def _draw_next(self) -> None:
+        """Draw the view's next step: its text, its button, and its stage opened when the tool changed.
+
+        The step is the one this redraw's ``view()`` built (FM-151); the tick never
+        builds it. It opens the stage's card in the accordion but never closes one the
+        operator opened.
+        """
+        view = self._view
+        step = None if view is None else view.next_step
+        self._next_drawn = step
+        self.next_text.object = next_step_text(step)
+        tool = None if step is None else step.plugin
+        self.next_button.visible = tool is not None
+        if tool is None:
+            self._next_tool = None
+            return
+        self.next_button.label = f"Run {tool}"
+        if tool != self._next_tool:
+            self._next_tool = tool
+            index = self._stage_index.get(tool)
+            if index is not None:
+                self.accordion.active = sorted({*self.accordion.active, index})
 
     def _draw_cards(self) -> None:
         """The result card under each tool, from the view: a result follows the run document, not the tick."""
@@ -1188,6 +1345,10 @@ class PlatePageView:
             reason = self._blocked.get(name)
             button.disabled = running is not None or reason is not None
             self.tool_notes[name].object = reason or ""
+        # The next step's button: while an activity goes, or when the step says why not.
+        blocked = None if self._next_drawn is None else self._next_drawn.blocked
+        self.next_button.disabled = running is not None or blocked is not None
+        self.next_note.object = blocked or ""
         closed = not self.page.connected
         self.capture_centre_button.disabled = closed
         self.capture_wall_button.disabled = closed

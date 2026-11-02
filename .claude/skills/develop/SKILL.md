@@ -137,7 +137,11 @@ them if it is not the one you run on.
 13. Push (`git push -u origin <type>/<N>-<slug>`; the SSH workaround of step 5
     if needed), open the PR with the template (`gh pr create --fill
     --body-file …`, `Closes #N`, conventional title), and watch CI:
-    `gh pr checks --watch`. Fix failures; never disable a check.
+    first `gh pr view --json mergeable`, then `gh pr checks --watch`. A PR
+    that conflicts with `main` gets **no CI** (`--watch` exits at once with
+    `no checks reported`): merge `main` into the branch, push, and watch
+    again (#264, #291, #297 met this when a PR on the same files merged
+    first). Fix failures; never disable a check.
 14. Comment on the issue, exactly in this format, and set `status: in-review`:
 
     ```markdown

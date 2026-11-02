@@ -1149,7 +1149,7 @@ def test_demo_sample_toml_loads_and_names_its_sample() -> None:
     # Every key of [sample] is written out at its default.
     assert loaded.sample == SampleSection()
     # The rest is the demo's, so a tool behaves as it does on `demo`.
-    rest = {"microscope", "sample"}
+    rest = {"microscope", "sample", "suggest"}
     assert loaded.model_dump(exclude=rest) == Profile.demo().model_dump(exclude=rest)
 
 
@@ -1347,6 +1347,102 @@ def test_an_unknown_plate_does_not_hide_behind_the_cell_count(tmp_path: Path) ->
 
     assert "1 problem(s)" in msg
     assert "  - sample.plate:" in msg
+
+
+# -- [suggest]: what a stand suggests for a plugin's run (#293) ----------------
+
+_SUGGEST_TEXT = (
+    "each item of params is key=value, as smc run --param takes it; got '{item}'"
+)
+_WHY_TEXT = (
+    "why is one line that the page shows; give a non-empty text without a newline"
+)
+
+
+def test_a_suggestion_takes_key_value_pairs_and_a_one_line_why(
+    tmp_path: Path,
+) -> None:
+    body = (
+        '[suggest.scan-plan]\nparams = ["coverage=0.4", "wells=A1,B2"]\nwhy = "fast"\n'
+    )
+    loaded = Profile.load(write_profile(tmp_path / "p.toml", body))
+
+    entry = loaded.suggest["scan-plan"]
+    assert entry.params == ("coverage=0.4", "wells=A1,B2")
+    assert entry.why == "fast"
+
+
+@pytest.mark.parametrize(
+    "item", ["coverage", "=0.4", "cover age=1", " coverage=0.4", "coverage =0.4", ""]
+)
+def test_a_suggestion_item_without_a_clean_key_is_refused_with_its_text(
+    tmp_path: Path, item: str
+) -> None:
+    body = f'[suggest.scan-plan]\nparams = ["{item}"]\nwhy = "x"\n'
+    msg = _load_error(tmp_path, body)
+
+    assert f"  - suggest.scan-plan.params: {_SUGGEST_TEXT.format(item=item)}" in msg
+
+
+def test_a_suggestion_value_may_hold_an_equals_sign_and_be_empty(
+    tmp_path: Path,
+) -> None:
+    # parse_params splits at the first `=`: the value is whatever follows.
+    body = '[suggest.x]\nparams = ["a=b=c", "d="]\nwhy = "x"\n'
+    loaded = Profile.load(write_profile(tmp_path / "p.toml", body))
+
+    assert loaded.suggest["x"].params == ("a=b=c", "d=")
+
+
+def test_a_suggestion_needs_at_least_one_item(tmp_path: Path) -> None:
+    msg = _load_error(tmp_path, '[suggest.x]\nparams = []\nwhy = "x"\n')
+
+    assert "  - suggest.x.params: params needs at least one key=value item" in msg
+
+
+@pytest.mark.parametrize("why", ["", "   ", "two\\nlines", "cr\\rhere"])
+def test_a_suggestion_why_is_one_non_empty_line(tmp_path: Path, why: str) -> None:
+    msg = _load_error(tmp_path, f'[suggest.x]\nparams = ["a=1"]\nwhy = "{why}"\n')
+
+    assert f"  - suggest.x.why: {_WHY_TEXT}" in msg
+
+
+def test_a_key_given_twice_in_a_suggestion_is_refused(tmp_path: Path) -> None:
+    body = '[suggest.x]\nparams = ["a=1", "b=2", "a=3"]\nwhy = "x"\n'
+    msg = _load_error(tmp_path, body)
+
+    assert "  - suggest.x.params: 'a' given twice" in msg
+
+
+def test_a_suggestion_without_params_or_why_is_refused(tmp_path: Path) -> None:
+    msg = _load_error(tmp_path, "[suggest.x]\n")
+
+    assert "suggest.x.params: required but missing" in msg
+    assert "suggest.x.why: required but missing" in msg
+
+
+def test_an_unknown_key_in_a_suggestion_lists_params_and_why(tmp_path: Path) -> None:
+    msg = _load_error(
+        tmp_path, '[suggest.scan-plan]\nparams = ["a=1"]\nwhy = "x"\nreason = "y"\n'
+    )
+
+    assert "unknown key in [suggest.scan-plan]" in msg
+    assert "allowed keys: params, why" in msg
+
+
+def test_a_profile_without_a_suggest_table_suggests_nothing(tmp_path: Path) -> None:
+    assert Profile.load(write_profile(tmp_path / "p.toml", "")).suggest == {}
+    assert Profile.demo().suggest == {}
+
+
+def test_demo_sample_suggests_a_small_coverage_and_blobs() -> None:
+    loaded = Profile.load(DEMO_SAMPLE_TOML)
+
+    assert set(loaded.suggest) == {"scan-plan", "cells"}
+    assert loaded.suggest["scan-plan"].params == ("coverage=0.4",)
+    assert loaded.suggest["cells"].params == ("detector=blobs",)
+    assert "40 %" in loaded.suggest["scan-plan"].why
+    assert "blobs are not cells" in loaded.suggest["cells"].why
 
 
 # -- the profiles that ship with the repository ---------------------------------

@@ -152,6 +152,11 @@ a red line with its stops, and the stage is a black cross.
 range in *Wells*: `A1:D6`, `B2-B5`, `C*` (a row), `*3` (a column), `all`. The selection
 becomes `scan-plan`'s `wells`, in the order you chose them. A click moves nothing.
 
+The *Wells* box **follows the selection**: a click on a well writes the selected wells in
+it (`B2,B3`), and so does a plate chosen, a selection another tab made, or a run
+document read at the start. A range you typed **stays as you typed it** (`A1:D6` stays
+`A1:D6`) until something else changes the selection.
+
 **Driving to a well.** Switch **Drive** on (the strip then says `DRIVE: the next
 click on a well moves the stage there`) and click a well: `goto-well` runs for it, at
 its centre or at the wall chosen under *Drive to*. Drive is **one click**: the toggle
@@ -198,7 +203,42 @@ server, so a live view with no tab open keeps the camera taking frames until STO
 nothing to the run document. Every frame is sent to every open tab, up to 10 a second.
 The **Drive** controls stay usable while live goes (below).
 
-**Drive** (the right-hand column, above the tools). Each control is the call of a
+**Next step** (the right-hand column, at its head, above Drive). The tool the run
+document needs next, and the values to run it with, so that a newcomer needs no manual.
+It is the first slot of the checklist that is not optional and not usable
+(`camera-calibration` and `timings` are never a next step), and its tool is the first
+registered one that fills the slot. The region says:
+
+- the tool's name, and why it is next: `the run document has no scan-plan yet`, or the
+  checklist's own reason when the slot is there and not usable (`... ended failed; run it
+  again`, `... read its inputs from an earlier run; ...`);
+- where each value comes from, a line each: the wells **selected on the map**; the
+  centres and walls **captured on this page**; the centres of the profile's `[sample]`
+  (see below); or what the profile **suggests** for the tool (`coverage=0.4: suggested by
+  the profile demo-sample: ...`, from its [`[suggest]`](../../profiles/README.md#suggest-what-the-stand-suggests-for-a-run) table);
+- `or <name>: ...` for each other registered tool that fills the same slot (on the plate,
+  `plate-finding`);
+- `command: smc run ...`, the command that makes the same call, with the profile, the
+  run document's absolute path and `--dry-run` when it is one. It is quoted for a POSIX
+  shell; how it pastes into PowerShell or `cmd.exe` is **not verified**. The run
+  document's record of the run is the reference, whichever shell reads the line;
+- a button, **Run \<tool\>**, which runs **exactly the values the step shows** (never the
+  tool's form, and never a step computed at the click), and a line in the warning colour
+  when it cannot: `the stand is not connected`, a checkpoint to continue, the wells to
+  choose (`select the wells to scan: click them on the map, or type a range in Wells`), or
+  how to capture the plate (`centre a well under the objective ...`) on a stand with no
+  sample. Nothing moves without that click, and the page never runs a tool by itself or
+  chains two.
+
+**The plate from the profile.** On a stand whose profile has a `[sample]` (`demo-sample`),
+with nothing captured on the page, the plate step registers the plate in one click from
+the sample's own geometry: `plate-registration` with the centres of three wells (A1, A12
+and H1 on 96 wells). The step says `... this stand's plate is synthetic, so they are known,
+not measured`: the same fit as a real one, from positions nobody measured. A capture made
+on the page wins over it. When the workflow is done the step lists what it wrote: every
+file and folder a result names, by absolute path.
+
+**Drive** (the right-hand column, below the next step). Each control is the call of a
 command, so each has its command-line twin:
 
 | Control | Command |
@@ -250,7 +290,10 @@ its key parameters as fields, the rest under *Advanced*, a **Run** button and th
 progress. A **required** parameter with no default is never folded under *Advanced*:
 it is a field of its own. An empty field is not sent, so the plugin's default holds; the
 placeholder is that default. What the page fills itself is not offered: the wells of
-`scan-plan`, and the plate and the captures of `plate-registration`. A tool that cannot
+`scan-plan`, and the plate and the captures of `plate-registration`. A parameter the
+profile suggests for a tool (`[suggest]`) is always a field of its own, never under
+*Advanced*, and **starts with the suggested value** (its tooltip says why), so the tool's
+own Run sends what the next step shows. A tool that cannot
 run now is disabled with the reason beside it (`the run document has no plate; ...`,
 `this stand has no XYStage`), and so is every tool while a run is going. A plugin that
 failed to load, or whose parameters cannot be described, is not a tool: a line above the
@@ -262,10 +305,17 @@ on another stand, ` (dry run)` when it was one and ` (stale)` when the tool read
 input that has been produced again since (the checklist says `<plugin> read its
 inputs from an earlier run; run it again`; the values are kept, and marked), then the
 result's values, two spaces in, a line each (a text cut at 80 characters, a list or an
-object only counted, at most eight, then `… n more`), then what the result **assumed**
+object only counted, at most eight, then `… n more`), then **where the result is**, then
+what the result **assumed**
 (at most eight, then `… n more`, each cut at 600 characters) and the error (cut at 600
-characters too). A card is a summary, bounded whatever the record holds: the run
-document and the log hold the rest. A tool whose last run was stopped or failed shows
+characters too). Where the result is: each `file` and `folder` the result names, as an
+indented `file: <absolute path>` line (a relative one is under the run document's folder;
+an absolute one is shown as written, in whichever OS's style the run document holds it;
+each is cut at 600 characters), or an indented `in the run document` when it names none:
+**every result card says where its result is**. The page shows the path and never opens it: open it
+from the PC. A card is a summary, bounded whatever the record holds: the run
+document and the log hold the rest. Cards, the next step and the run document's path
+**wrap** at the column, so a long path is read whole. A tool whose last run was stopped or failed shows
 its status and its error and **no values**: they are not a result. The card follows the run document, so it is drawn, in every
 tab, when a run, a snap or a live view ends (a tool that takes less than a second included) and when
 you press **Refresh**, not every second.
@@ -301,7 +351,9 @@ plate-registration** then fits the plate from what was captured, as `smc run
 plate-registration --param refs=... --param walls=...` would. Choosing another plate
 clears the selection and the captures.
 
-**The run document**, as a checklist: `✓ plate` (usable), `· cells` (not run),
+**The run document**, as a checklist under a bold line with its path, `Run document
+<absolute path>` (the file as the command was given it, made absolute where the server
+runs; the same file the next step's command names): `✓ plate` (usable), `· cells` (not run),
 `✗ scan: the last run of scan ended failed; run it again` (there, and not usable, with
 why). The slots of the plate-scan workflow come first, in its order; any other slot the
 document holds (a third-party plugin's stage) follows by name. A line above the
@@ -319,23 +371,32 @@ smc ui plate -p demo-sample --run-doc run.json
 (`profiles/demo-sample.toml`), so every tool of the page can be pressed on a PC with
 no microscope, and the frames each one takes follow the stage the page moves. The
 stage and the other devices are the demo's; only the pixels are drawn, at the stage's
-position. Press the tools in the order of the checklist, as at a stand:
+position. **Press Connect, then follow the Next step** at the head of the right-hand
+column, one click for each tool, until it says `every stage of the workflow is done`:
 
-- **The plate**: run **plate-finding**, which surveys the plate by itself and takes
-  about 7 minutes on the demo stage. Or register it **by captures**, as at a stand:
-  start **Live**, centre a well with the **Drive** pad (the frames follow the stage),
-  click it on the map, **Capture centre**, and again for a second well, then **Run
-  plate-registration**. The plate is centred on the stage origin, so A1 is at
-  (−49 500, 31 500) µm and H12 at (49 500, −31 500) µm: drive there in 1000 µm steps,
-  then finish with smaller ones. The `plate-registration` command of
-  [the plugins page](../plugins/README.md#trying-the-workflow-without-a-microscope)
-  registers the same two wells from a terminal.
-- **scan-plan** and **scan**: choose wells with the map, and give `coverage` a small
-  value (0.4) so that a scan takes seconds.
-- **cells**: choose **detector** `blobs` in its key parameters. The trained model does
-  not see the synthetic cells, and `blobs` counts bright round spots; the result says
-  that on a real sample those counts are not cells.
-- **density**, **route** and **report** are used as on any stand.
+1. **Connect.** The next step is `plate-registration`, with the centres of A1, A12 and H1
+   from the profile's `[sample]` (known, not measured: the plate is synthetic). **Run**
+   it: no terminal, and no 7 minutes of `plate-finding`.
+2. **Choose the wells** on the map when the step asks (`select the wells to scan`): click
+   one or two wells, and they appear in *Wells*. This is the only choice the page leaves to
+   you. The next step is `scan-plan` with those wells and the profile's `coverage=0.4`
+   (a scan then takes seconds on the demo stage).
+3. **Run** each step as it comes: `scan`, then `cells` with `detector=blobs` (the profile
+   suggests it: the trained model does not see the synthetic cells, and `blobs` counts
+   bright round spots, which on a real sample are not cells), `density`, `route`, `report`
+   and `nis-export`. Each step says why it is next and where each value comes from.
+4. **Read where the files are**: the checklist's heading names the run document, each
+   result card names the files it wrote (the scan's folder, the cells' file, the report and
+   the NIS-Elements position list), and the last step lists them all.
+
+To practise the plate step as at a stand, **capture centres yourself**: start **Live**,
+centre a well with the **Drive** pad (the frames follow the stage), click it on the map,
+**Capture centre**, and again for a second well far from the first; the next step then
+uses your captures, not the sample's. The plate is centred on the stage origin, so A1 is at
+(−49 500, 31 500) µm and H12 at (49 500, −31 500) µm: drive there in 1000 µm steps, then
+finish with smaller ones. Or run **plate-finding**, which surveys the plate by itself and
+takes about 7 minutes on the demo stage. Each step's `command:` line is the same call from a
+terminal.
 
 **What is synthetic, and the limits**, as `smc doctor -p demo-sample` prints them
 after the roles:
@@ -348,7 +409,9 @@ Sample: a synthetic 96-well plate, A1 at (-49500.0, 31500.0) µm, turned 0°; 40
 
 The same commands, from a terminal, are in
 [Trying the workflow without a microscope](../plugins/README.md#trying-the-workflow-without-a-microscope).
-The page on this stand has not been tried in a browser (see below).
+The page on this stand has been walked by a test, from Connect to the exported position
+list (`tests/test_plate_page_first_run_demo.py`), and **not yet by a newcomer in a
+browser** (see below).
 
 ## What it does not do
 
@@ -392,6 +455,13 @@ or a command ends (the light, the autofocus: closing the stand switches nothing 
 `Z +` and `Z −` with the autofocus locked on the Ti2-E (the relock may bring Z back to
 the offset's plane); and **a newcomer registering a plate on the `demo-sample` stand
 from the page without a manual**, with a lab member.
+
+**The first run** adds: a newcomer following the **Next step** on `demo-sample` in a real
+browser, with the owner (the walk of the [issue](https://github.com/EPFL-TOP/smart-microscope-control/issues/293)'s
+live session); the `command:` line pasted into PowerShell and into `cmd.exe` (it is
+quoted for a POSIX shell); the *Wells* box changed by a click while someone types in it
+(it is changed only when the page redraws, never by the periodic callback); and the page
+over RDP.
 
 **Connect and Disconnect** add: Connect, Disconnect, NIS-Elements taking the stand,
 then Connect again, at a real stand; **a stand opened on the page's worker thread**,
