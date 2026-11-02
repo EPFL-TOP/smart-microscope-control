@@ -731,6 +731,35 @@ reason that only a change of who writes `PATH` fixes this. That change
 `_put_on_path` is the only writer) is an owner decision (#119), not part
 of this section.
 
+**A core is released by unloading, then detaching its relay (#311).** MMCore
+delivers its callbacks on a thread of its own, a moment after the call that
+caused them (measured 2026-11-02, macOS, py3.13, pymmcore 12.5.0.75.0,
+pymmcore-plus 0.18.1: `setExposure` returns and `exposureChanged` arrives
+0.1 ms later on a `Dummy-N` thread), and pymmcore-plus's relay runs Python
+there. A core in a reference cycle (FM-92) can therefore be freed by a
+garbage collection that starts on that thread while a notification of its own
+is still being delivered, and the process aborts: `CMMCorePlus.__del__`
+unregisters the callback, the C++ destructor does it again and throws `CMMError:
+Cannot call registerCallback from within an MMEventCallback handler` out of a
+destructor (FM-179). Both release paths therefore end with
+`detach_callbacks(core)`, after `unloadAllDevices()`, which queues
+notifications of its own: `close_core`, and `Microscope.close()`, which still
+does not call `close_core` but calls the guard itself. It is
+`pymmcore.CMMCore.registerCallback(core, None)` from the releasing thread,
+called through the base class because `CMMCorePlus.registerCallback` is
+overridden to refuse. It blocks until the handler in flight has returned
+(measured: 313 ms against a handler that took 0.3 s) and releases the GIL while
+it waits. In `Microscope.close()` it stays under the microscope lock and
+before `_closed = True`, so "closed" still means released; no smc handler takes
+that lock, so the wait cannot deadlock on it. A core that is not an MMCore (a
+`FakeCore`) is left alone, and a failure is a WARNING and never raised: the one
+case is a `close()` from inside a callback of the same core, which no smc path
+does. The wait has no limit of its own, so a subscriber to `core.events` that
+blocks would hang `close()`; the Ctrl-C path calls `stop()` and not `close()`,
+so it does not gain this wait (FM-70). Not verified at a stand: a real
+stand's adapters may deliver notifications from their own threads for longer
+than the demo's.
+
 **A failed load leaves nothing loaded (#132).** `open_core` does not call
 `unloadAllDevices()` when `loadSystemConfiguration` raises, because MMCore
 has already unloaded what it loaded. Measured 2026-10-19 on macOS
