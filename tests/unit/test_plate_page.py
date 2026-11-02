@@ -1382,6 +1382,29 @@ def test_the_strip_starts_with_the_stand() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("dry_run", "line"),
+    [(False, "demo | not connected"), (True, "demo | not connected | DRY RUN")],
+)
+def test_status_line_of_a_closed_stand_says_not_connected_and_nothing_else(
+    dry_run: bool, line: str
+) -> None:
+    # Whatever else the status holds: a closed stand has no position, no halt and
+    # no move to report, and STOP's refusal is said once the stand is held.
+    closed = _status(
+        connected=False,
+        dry_run=dry_run,
+        xy_um=None,
+        z_um=None,
+        objective=None,
+        autofocus="?",
+        moving=("xy_stage",),
+        halted=True,
+        stop_refused=("xy_stage",),
+    )
+    assert plate_page.status_line(closed) == line
+
+
 def test_the_strip_of_a_session_starts_with_the_stand(page: PlatePage) -> None:
     view = PlatePageView(page)
     assert view.status_text.object.startswith("demo | XY (")

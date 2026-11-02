@@ -62,6 +62,9 @@ SETTLE_MS = 1500
 #: Playwright waits 30 s for a disabled control by default: a state is not worth that
 #: (FM-162).
 DEFAULT_TIMEOUT_MS = 10_000
+#: How long Connect may take to show on the strip: the demo opens in 17 ms, and the
+#: strip follows on the next 1 s tick.
+CONNECT_TIMEOUT_MS = 15_000
 STEP_TIMEOUT_S = 120.0
 SERVE_TIMEOUT_S = 60.0
 READY_POLL_S = 0.1
@@ -76,6 +79,9 @@ STATE_NAMES = ("empty", "wells-selected", "snap", "after-density", "with-route")
 # A child sharing the console can change its code page (FM-22).
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _ERROR_LINE = re.compile(r"\bERROR\b")
+#: The strip of a closed stand (``<stand> | not connected``); the Connect row's own
+#: line says ``is not connected:``, never this.
+_CLOSED_STRIP = re.compile(r"\| not connected\b")
 _TRACEBACK = "Traceback (most recent call last)"
 _DROPPED_FROM_CHILD_ENV = ("SMC_PROFILE", "SMC_PROFILES")
 
@@ -587,10 +593,27 @@ class Stand:
 
 
 def _act_empty(page: Any, stand: Stand) -> None:
-    """The page as it opens: nothing to do."""
+    """The page as it opens, with the stand closed (m5 §7): nothing to do."""
+
+
+def _connect(page: Any) -> None:
+    """Click *Connect*, then wait until the strip no longer says ``not connected``.
+
+    Only an enabled button is clicked: Playwright waits out its timeout on a
+    disabled one, and a later state would then start on a page that never
+    connected (FM-162). The wait has its own bound for the same reason. The name is
+    exact, since *Disconnect* contains *Connect*.
+    """
+    button = page.get_by_role("button", name="Connect", exact=True)
+    if button.is_enabled():
+        button.click()
+    page.locator("pre").filter(has_text=_CLOSED_STRIP).wait_for(
+        state="detached", timeout=CONNECT_TIMEOUT_MS
+    )
 
 
 def _act_wells_selected(page: Any, stand: Stand) -> None:
+    _connect(page)
     box = page.get_by_label("Wells")
     box.fill("A1:B2")
     box.press("Enter")

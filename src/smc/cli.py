@@ -2217,12 +2217,13 @@ def ui_command(
     ] = 5006,
     dry_run: DryRunOption = False,
 ) -> None:
-    """Serve the plate page (needs the ui extra): click wells, run the tools, snap a frame.
+    """Serve the plate page (needs the ui extra): connect the stand, click wells, run the tools, snap a frame.
 
-    The page opens the stand once and keeps it until Ctrl-C. Every tool button is
-    a plugin run with the parameters smc run takes, so each has a command-line
-    equivalent, and each tool shows its last result. Ctrl-C stops what is going,
-    then the server, then releases the stand.
+    The page starts with the stand closed: Connect opens the profile's stand and
+    Disconnect releases it, for NIS-Elements or ZEN. Every tool button is a plugin
+    run with the parameters smc run takes, so each has a command-line equivalent,
+    and each tool shows its last result. Ctrl-C stops what is going, then the
+    server, then releases the stand.
     """
     # Checked first: a word that names no page is no reason to look at the rest.
     if page is not None and page not in _UI_PAGES:
@@ -2247,24 +2248,32 @@ def ui_command(
         from smc.ui.controller import PlatePage
 
         loaded = Profile.load(profile)
-        # Read before the stand is opened: an unreadable document is refused as it
+        # Read before the page is served: an unreadable document is refused as it
         # is, and left untouched.
         RunDocument.load_or_new(path)
+        if not dry_run:
+            # From the profile: the stand is not open yet, and the operator must
+            # know before the first move that Ctrl-C does not end it (m2 §11.6).
+            line = _stop_refused_line(loaded.safety.stop_refused_by)
+            if line is not None:
+                _say(line)
         closing: tuple[str, ...] = ()
         ended = True
-        with Microscope.open(loaded, dry_run=dry_run) as microscope:
-            if not dry_run:
-                _say_stop_refused(microscope)
-            controller = PlatePage(microscope, path)
+        # The stand is the operator's: Connect opens it on the page, Disconnect
+        # releases it. A service that (re)starts never takes it (m5 §7).
+        controller = PlatePage.closed(loaded, path, dry_run=dry_run)
+        try:
+            plate_page.serve(controller, port=port)
+        finally:
             try:
-                plate_page.serve(controller, port=port)
-            finally:
                 # The stop is sent before the wait, so a second Ctrl-C during it
-                # still loses nothing, and the stand is released by the `with`
-                # whatever ends this (FM-71). A page that `serve` already closed
+                # still loses nothing, and the inner `finally` releases whatever
+                # stand the page holds (FM-71). A page that `serve` already closed
                 # returns at once.
                 controller.close()
                 closing, ended = controller.close_lines, controller.close_ended
+            finally:
+                controller.release()
         # After the stand is released: what the stop did and how the run ended, as the
         # page worded them. A run that did not end is a failure, and the stand was
         # released under it (FM-117: never "stopped" by default).

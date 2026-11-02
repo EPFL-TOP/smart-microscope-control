@@ -48,8 +48,8 @@ the demo whose camera images no sample. Nothing else is a parameter: there is no
 
 | State | What the script does | Reached on |
 |---|---|---|
-| `empty` | nothing: the page as it opens | both stands |
-| `wells-selected` | types `A1:B2` in the Wells box, Enter | both |
+| `empty` | nothing: the page as it opens, with the stand closed (#264) | both stands |
+| `wells-selected` | clicks Connect (when enabled) and waits for the strip, then types `A1:B2` in the Wells box, Enter | both |
 | `snap` | the Image tab, the Snap button | both |
 | `after-density` | runs the workflow while the page is up (`plate-registration`, `scan-plan`, `scan`, `cells`, `density`, on the demo's simulated stage), then a Snap on the Image tab (the page redraws when it ends, with the Plate tab hidden: #297) and back to the Plate tab, **no Refresh** | `demo-sample` |
 | `with-route` | `route`, then Refresh | `demo-sample` |
