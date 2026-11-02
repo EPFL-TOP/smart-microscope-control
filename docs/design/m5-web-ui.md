@@ -274,9 +274,14 @@ without a line in `_CHECKLIST`.
 - **The strip** starts with the stand: `status_line` gives `<stand> | XY ... |
   ...` (the rest as in M3).
 - **The centre** is `pn.Tabs(("Plate", <the map's column>), ("Image", <the
-  image's column>), dynamic=True)`: the plate map as today, and the image. Only
-  the active tab is rendered (`dynamic=True`), so a figure is never laid out
-  hidden. The checklist stays under the tabs, on both.
+  image's column>), dynamic=False)`: the plate map as today, and the image. The
+  tabs are **not dynamic** (#297): a dynamic tab destroys the figure's view when
+  another tab is shown, and bokehjs's `DataRange1d` keeps one bounds entry per
+  view and never drops a dead one, so a map redrawn while *Image* was shown came
+  back framed on the union of every plate it had drawn, and Reset and Refresh
+  recomputed from the same entries. Bokeh keeps the view of a hidden tab and its
+  size, so no figure is laid out at zero size. The checklist stays under the
+  tabs, on both.
 - **The image** is a `figure(match_aspect=True)` with one `image` glyph from an
   `image_source` (`ColumnDataSource` with the columns `image`, `dw`, `dh`),
   coloured by `LinearColorMapper(palette=Greys256, low=0, high=255)`. The data
@@ -324,8 +329,22 @@ under `warnings.simplefilter("error")`: `pn.Tabs(..., dynamic=True)` of a
 dw=, dh=, source=, color_mapper=LinearColorMapper(palette=Greys256, low=0,
 high=255))` with `uint8` data, a new `source.data` and `figure.title.text` all
 build with `get_root()` and warn nothing; `button.clicks += 1` calls the
-handler. Not measured: a real browser (the tab switch, the image's orientation
-and look).
+handler. Not measured then: a real browser (the tab switch, the image's
+orientation and look).
+
+Measured 2026-11-02 in headless Chromium 1248 (Playwright), Panel 1.10.0 / Bokeh
+3.10.1 and Panel 1.9.4 / Bokeh 3.9.2, reading `Bokeh.documents[0]` (#297): with
+`dynamic=True` the map's `DataRange1d._plot_bounds` held the bounds of the
+nominal map's dead view and of the registered plate's, after a registration, a
+snap on *Image* and the return to *Plate*, and the frame was their union (x
+−80996 to 130496 µm for a plate of ±52800); with `dynamic=False` it held one
+entry and the frame was the plate's alone (x ±78521, the canvas's aspect, 2.057
+at 1008 x 490 px), after the same steps, after Reset and after Refresh. A
+resize made while a tab is hidden was matched when it was shown (1.037 at 508 x
+490, 2.057 back at 1008 x 490), and an image drawn while *Plate* was shown was
+framed on the first show of *Image*. Not measured: Windows, and a live view
+drawn by another session into the figure of a tab nobody looks at (ten frames a
+second, localhost only).
 
 ## 4. Tests and failure modes (#28)
 

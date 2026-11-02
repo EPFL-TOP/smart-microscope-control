@@ -210,13 +210,20 @@ class _FakeError(Exception):
     """Stands for ``playwright.sync_api.Error`` in the driver's own tests."""
 
 
-def _fake_page(*, fails_on_text: str | None = None) -> MagicMock:
+def _fake_page(
+    *, fails_on_text: str | None = None, fails_on_fill: bool = False
+) -> MagicMock:
     """A page on which every control is there, and the one named in ``fails_on_text``
-    times out when it is clicked, with the first line Playwright gives."""
+    times out when it is clicked (or the Wells box when it is filled, with
+    ``fails_on_fill``), with the first line Playwright gives."""
     page = MagicMock()
     page.locator.return_value.count.return_value = 0
     page.locator.return_value.all_inner_texts.return_value = ["a pane"]
     page.get_by_label.return_value.count.return_value = 0
+    if fails_on_fill:
+        page.get_by_label.return_value.fill.side_effect = _FakeError(
+            "Locator.fill: Timeout 10000ms exceeded.\nCall log:\n  - waiting"
+        )
 
     def get_by_text(text: str, exact: bool = False) -> MagicMock:
         found = MagicMock()
@@ -949,9 +956,70 @@ def test_a_state_whose_control_times_out_is_named_and_the_next_state_runs(
 ) -> None:
     page = _fake_page(fails_on_text="Image")
     records, _, _ = _drive(snap, tmp_path, page, lambda steps: None)
-    assert [r.reached for r in records] == [True, True, False, True, True]
+    # `after-density` shows the Image tab too (its redraw is the one made while the
+    # Plate tab is hidden, #297), so it fails on the same control; `with-route` runs.
+    assert [r.reached for r in records] == [True, True, False, False, True]
     assert records[2].reason == "Locator.click: Timeout 10000ms exceeded."
+    assert records[3].reason == records[2].reason
     page.screenshot.assert_any_call(path=str(tmp_path / "snap-FAILED.png"))
+    page.screenshot.assert_any_call(path=str(tmp_path / "after-density-FAILED.png"))
+
+
+def test_a_state_whose_control_times_out_alone_is_the_only_one_named(
+    snap, tmp_path
+) -> None:
+    page = _fake_page(fails_on_fill=True)
+    records, _, _ = _drive(snap, tmp_path, page, lambda steps: None)
+    assert [r.reached for r in records] == [True, False, True, True, True]
+    assert records[1].reason == "Locator.fill: Timeout 10000ms exceeded."
+    page.screenshot.assert_any_call(path=str(tmp_path / "wells-selected-FAILED.png"))
+
+
+def _no_chain() -> SimpleNamespace:
+    return SimpleNamespace(run_chain=lambda steps: None)
+
+
+def test_after_density_redraws_on_the_image_tab_and_presses_no_refresh(snap) -> None:
+    """#297: the page reads the run document again at the end of a snap, with the Plate
+    tab hidden. A Refresh on the visible map says nothing of a frame drawn out of view,
+    and a wait that is dropped reads the page before it has redrawn."""
+    page = MagicMock()
+    snap._act_after_density(page, _no_chain())
+    calls = page.mock_calls
+    assert [call[0] for call in calls] == [
+        "get_by_text",
+        "get_by_text().click",
+        "get_by_role",
+        "get_by_role().click",
+        "locator",
+        "locator().filter",
+        "locator().filter().first.wait_for",
+        "get_by_text",
+        "get_by_text().first.click",
+    ]
+    assert [c.args for c in calls if c[0] == "get_by_text"] == [("Image",), ("Plate",)]
+    assert [c.kwargs for c in calls if c[0] == "get_by_role"] == [{"name": "Snap"}]
+    assert [c.kwargs for c in calls if c[0] == "locator().filter"] == [
+        {"has_text": "✓ density"}
+    ]
+
+
+def test_with_route_shows_the_plate_tab_before_it_presses_refresh(snap) -> None:
+    """Refresh is on the Plate tab and hidden on the other: a state before this one that
+    failed on the Image tab must not make this one fail for a reason it does not name."""
+    page = MagicMock()
+    chains: list[list[object]] = []
+    snap._act_with_route(page, SimpleNamespace(run_chain=chains.append))
+    assert chains == [[snap.ROUTE_STEP]]
+    roots = [
+        (c[0], c.args, c.kwargs)
+        for c in page.mock_calls
+        if c[0] in ("get_by_text", "get_by_role")
+    ]
+    assert roots == [
+        ("get_by_text", ("Plate",), {"exact": True}),
+        ("get_by_role", ("button",), {"name": "Refresh"}),
+    ]
 
 
 # --- the chain against the plugins ------------------------------------------
