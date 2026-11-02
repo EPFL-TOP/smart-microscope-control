@@ -43,6 +43,8 @@ from smc.drive import (
     engage_autofocus,
     jog_xy,
     jog_z,
+    move_xy,
+    move_z,
     read_autofocus,
     set_objective,
     switch_light,
@@ -53,7 +55,6 @@ from smc.hardware import core as core_mod
 from smc.hardware.backends import nikon
 from smc.hardware.backends.mm import as_hardware_errors
 from smc.hardware.capabilities import (
-    XY,
     Autofocus,
     Camera,
     LightSource,
@@ -1391,10 +1392,13 @@ def _drive_command(
     prints is what the page's outcome says. ``capability`` is required before
     anything is printed: a stand without it exits 1 with the facade's text and
     no warning line. ``stop_refused`` are the roles whose refused stop the line
-    of ``_say_stop_refused`` names before a move; a turret, an autofocus and a
-    light send no move that a refused stop leaves running (FM-117). An exception
-    of ``refusals`` is a refusal whose message is the line (exit 2): only its
-    text is kept, so no traceback keeps the stand open (FM-92).
+    of ``_say_stop_refused`` names before a move: the four moves of the stage and
+    the focus drive pass theirs. A turret, an autofocus and a light pass none: a
+    turn is no move of those axes and cannot be stopped at all, a light moves
+    nothing, and an engage's Z move is ended by the stop's first act, switching
+    the autofocus off, so no refused stop leaves it running (FM-117, m5 §6.2). An
+    exception of ``refusals`` is a refusal whose message is the line (exit 2):
+    only its text is kept, so no traceback keeps the stand open (FM-92).
     """
     refused: str | None = None
     with (
@@ -1417,58 +1421,6 @@ def _drive_command(
     _say(result.text)
 
 
-def _move_xy(
-    ctx: typer.Context,
-    profile: str,
-    dry_run: bool,
-    move: Callable[[XYStage], XY],
-    force_hint: str = "",
-) -> None:
-    """Open the stand, run ``move`` on its XY stage, print where it landed."""
-    with (
-        _Reported(ctx, force_hint=force_hint),
-        Microscope.open(profile, dry_run=dry_run) as microscope,
-    ):
-        stage = microscope.require(XYStage)
-        if not dry_run:
-            _say_stop_refused(microscope, [Role.xy_stage])
-        landed = move(stage)
-        # In dry-run the move returns the commanded target; the stage itself
-        # is read again to show that it did not move.
-        here = stage.position_um() if dry_run else None
-    if here is None:
-        _say(xy_text(landed))
-    else:
-        _say(
-            f"[dry-run] would move to {xy_text(landed)}; the stage is at {xy_text(here)}"
-        )
-
-
-def _move_z(
-    ctx: typer.Context,
-    profile: str,
-    dry_run: bool,
-    move: Callable[[ZStage], float],
-    force_hint: str = "",
-) -> None:
-    """Open the stand, run ``move`` on its focus drive, print where it landed."""
-    with (
-        _Reported(ctx, force_hint=force_hint),
-        Microscope.open(profile, dry_run=dry_run) as microscope,
-    ):
-        drive = microscope.require(ZStage)
-        if not dry_run:
-            _say_stop_refused(microscope, [Role.focus])
-        landed = move(drive)
-        here = drive.position_um() if dry_run else None
-    if here is None:
-        _say(z_text(landed))
-    else:
-        _say(
-            f"[dry-run] would move to {z_text(landed)}; the drive is at {z_text(here)}"
-        )
-
-
 @stage_app.command("get")
 def stage_get(ctx: typer.Context, profile: ProfileOption = DEMO_NAME) -> None:
     """Print where the XY stage reports it is, in µm."""
@@ -1486,7 +1438,14 @@ def stage_move(
     profile: ProfileOption = DEMO_NAME,
 ) -> None:
     """Move the XY stage to a position in µm; the profile's soft limits apply."""
-    _move_xy(ctx, profile, dry_run, lambda stage: stage.move_to_um(x_um, y_um))
+    _drive_command(
+        ctx,
+        profile,
+        dry_run,
+        XYStage,
+        lambda microscope: move_xy(microscope, x_um, y_um),
+        stop_refused=[Role.xy_stage],
+    )
 
 
 @stage_app.command("jog", context_settings=_NUMBERS)
@@ -1540,7 +1499,14 @@ def z_move(
     profile: ProfileOption = DEMO_NAME,
 ) -> None:
     """Move the focus drive to a position in µm; the profile's soft limits apply."""
-    _move_z(ctx, profile, dry_run, lambda drive: drive.move_to_um(z_um))
+    _drive_command(
+        ctx,
+        profile,
+        dry_run,
+        ZStage,
+        lambda microscope: move_z(microscope, z_um),
+        stop_refused=[Role.focus],
+    )
 
 
 @z_app.command("jog", context_settings=_NUMBERS)

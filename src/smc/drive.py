@@ -14,6 +14,7 @@ does not lock and a light whose readback disagrees say so, with ``reached`` fals
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -37,6 +38,8 @@ __all__ = [
     "engage_autofocus",
     "jog_xy",
     "jog_z",
+    "move_xy",
+    "move_z",
     "read_autofocus",
     "set_objective",
     "switch_light",
@@ -106,14 +109,28 @@ def jog_xy(
     """
     stage = microscope.require(XYStage)
     landed = stage.move_by_um(dx_um, dy_um, force=force)
-    if microscope.dry_run:
-        # The move returned the target it would command; the stage is read again
-        # to show that it did not move.
-        here = stage.position_um()
-        return DriveResult(
-            f"[dry-run] would move to {xy_text(landed)}; the stage is at {xy_text(here)}"
-        )
-    return DriveResult(xy_text(landed))
+    return _moved(
+        microscope, xy_text(landed), lambda: xy_text(stage.position_um()), "stage"
+    )
+
+
+def move_xy(microscope: Microscope, x_um: float, y_um: float) -> DriveResult:
+    """Move the XY stage to ``(x_um, y_um)``; the position it returns, or what dry run would do.
+
+    ``smc stage move``'s call (#295). Only the profile's soft limits apply: an
+    absolute target has no jog limit to refuse, and the page has no such control
+    (its own absolute move is ``goto-well``).
+
+    Raises:
+        CapabilityMissingError: The stand has no XY stage.
+        SafetyRefusedError: The target is outside the soft limits.
+        MicroscopeHaltedError: The stand is halted.
+    """
+    stage = microscope.require(XYStage)
+    landed = stage.move_to_um(x_um, y_um)
+    return _moved(
+        microscope, xy_text(landed), lambda: xy_text(stage.position_um()), "stage"
+    )
 
 
 def jog_z(microscope: Microscope, dz_um: float, *, force: bool = False) -> DriveResult:
@@ -127,12 +144,43 @@ def jog_z(microscope: Microscope, dz_um: float, *, force: bool = False) -> Drive
     """
     drive = microscope.require(ZStage)
     landed = drive.move_by_um(dz_um, force=force)
+    return _moved(
+        microscope, z_text(landed), lambda: z_text(drive.position_um()), "drive"
+    )
+
+
+def move_z(microscope: Microscope, z_um: float) -> DriveResult:
+    """Move the focus drive to ``z_um``; the position it returns, or what dry run would do.
+
+    ``smc z move``'s call (#295); the interlock and the soft limits are the
+    facade's, as for a jog.
+
+    Raises:
+        CapabilityMissingError: The stand has no focus drive.
+        SafetyRefusedError: The target is outside the soft limits.
+        MicroscopeHaltedError: The stand is halted.
+    """
+    drive = microscope.require(ZStage)
+    landed = drive.move_to_um(z_um)
+    return _moved(
+        microscope, z_text(landed), lambda: z_text(drive.position_um()), "drive"
+    )
+
+
+def _moved(
+    microscope: Microscope, landed: str, here: Callable[[], str], mover: str
+) -> DriveResult:
+    """The text of the four moves (``jog_*``, ``move_*``): where it landed, or what dry run would do.
+
+    In dry run the move returned the target it would command, so the drive or the
+    stage (``mover``) is read again, through ``here``, to show that it did not move;
+    outside dry run nothing is read twice.
+    """
     if microscope.dry_run:
-        here = drive.position_um()
         return DriveResult(
-            f"[dry-run] would move to {z_text(landed)}; the drive is at {z_text(here)}"
+            f"[dry-run] would move to {landed}; the {mover} is at {here()}"
         )
-    return DriveResult(z_text(landed))
+    return DriveResult(landed)
 
 
 def set_objective(microscope: Microscope, label: str, *, confirm: bool) -> DriveResult:

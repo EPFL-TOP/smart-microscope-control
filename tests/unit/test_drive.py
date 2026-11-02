@@ -216,6 +216,48 @@ def test_jog_z_text_is_the_position_the_drive_returns(
     assert drive.jog_z(fake_microscope, 2.5) == DriveResult("Z -5.00 µm")
 
 
+def test_move_xy_and_move_z_say_what_the_jogs_say(
+    fake_microscope: Microscope, dry: Microscope
+) -> None:
+    # The same landing, the same words: one helper builds the text of the four
+    # moves, so the dry-run tail is written once (m5 §6.1).
+    moved = drive.move_xy(fake_microscope, 10.0, -20.0)
+    fake_microscope.require(XYStage).move_to_um(0.0, 0.0)
+    assert moved == drive.jog_xy(fake_microscope, 10.0, -20.0)
+    assert moved == DriveResult("XY (10.00, -20.00) µm")
+
+    moved_z = drive.move_z(fake_microscope, 5.0)
+    fake_microscope.require(ZStage).move_to_um(0.0)
+    assert moved_z == drive.jog_z(fake_microscope, 5.0)
+    assert moved_z == DriveResult("Z 5.00 µm")
+
+    assert drive.move_xy(dry, 10.0, -20.0) == drive.jog_xy(dry, 10.0, -20.0)
+    assert drive.move_z(dry, 5.0) == drive.jog_z(dry, 5.0)
+
+
+def test_move_xy_text_is_the_position_the_stage_returns(
+    fake_microscope: Microscope,
+) -> None:
+    fake_microscope.override(XYStage, LandsElsewhere())
+
+    # Where the stage says it landed, not where it was asked to go (FM-155).
+    assert drive.move_xy(fake_microscope, 100.0, 100.0) == DriveResult(
+        "XY (0.00, 100.00) µm"
+    )
+
+
+def test_move_xy_and_move_z_are_absolute_and_the_stand_goes_there(
+    fake_microscope: Microscope,
+) -> None:
+    drive.move_xy(fake_microscope, 300.0, -400.0)
+    drive.move_z(fake_microscope, 12.5)
+    drive.move_xy(fake_microscope, 300.0, -400.0)
+
+    state = fake_microscope.state()
+    assert state.xy == XY(300.0, -400.0)
+    assert state.z_um == 12.5
+
+
 def test_the_formatters_show_minus_zero_as_zero() -> None:
     assert drive.um_text(-0.004) == "0.00"
     assert drive.um_text(-0.005) == "-0.01"
@@ -232,6 +274,16 @@ _DRY_RUN_CASES: list[tuple[str, Callable[[Microscope], DriveResult], str]] = [
     (
         "jog_z",
         lambda m: drive.jog_z(m, 5.0),
+        "[dry-run] would move to Z 5.00 µm; the drive is at Z 0.00 µm",
+    ),
+    (
+        "move_xy",
+        lambda m: drive.move_xy(m, 10.0, -20.0),
+        "[dry-run] would move to XY (10.00, -20.00) µm; the stage is at XY (0.00, 0.00) µm",
+    ),
+    (
+        "move_z",
+        lambda m: drive.move_z(m, 5.0),
         "[dry-run] would move to Z 5.00 µm; the drive is at Z 0.00 µm",
     ),
     (
@@ -444,6 +496,7 @@ def test_drive_reaches_the_stand_only_through_the_facade() -> None:
     }
     assert imported == {
         "__future__",
+        "collections.abc",
         "dataclasses",
         "typing",
         "smc.hardware.capabilities",
