@@ -161,6 +161,11 @@ _CARD_CHARS = 80
 #: cut later than a value (more than twice the longest assumption a plugin writes).
 _CARD_TEXT_CHARS = 600
 
+#: The keys of a ``done`` result that name a file or a folder the tool wrote: ``scan``'s
+#: ``folder`` and the ``file`` of ``cells``, ``report`` and ``nis-export``. A third party
+#: that follows the convention is shown the same way (m5 §8.4).
+_FILE_KEYS = ("file", "folder")
+
 #: A card's time when its record's date cannot be put in UTC: unknown, never a guess.
 _UNKNOWN_TIME = "????-??-?? ??:??:??"
 
@@ -236,6 +241,8 @@ class ResultCard:
     ``done``: a stopped or failed record's values are not a result (FM-154).
     ``assumed`` are the result's own ``assumed`` lines, under the same rule.
     ``stale`` marks a ``done`` record that read an input produced again since.
+    ``files`` are ``<key>: <path>`` for each file the result names, under the same
+    rule as ``lines``: where the result is, so that the operator can open it.
     Every text is bounded, whatever the record holds: the card is a summary.
     """
 
@@ -248,6 +255,7 @@ class ResultCard:
     assumed: tuple[str, ...]
     error: str | None
     stale: bool = False
+    files: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,13 +389,31 @@ def _value_line(key: str, value: object) -> str:
     return f"{label}: {type(value).__name__}"
 
 
-def _card(record: StageRecord, *, stale: bool = False) -> ResultCard:
+def _file_path(value: str, run_dir: Path | None) -> str:
+    """Where a result's ``file`` is: an absolute path as it is, a relative one under the run folder.
+
+    The plugins write a relative one (``report/<token>.html``) beside the run
+    document, which is the folder ``ctx.run_dir`` names; ``nis-export --param out=``
+    writes an absolute one, which ``/`` keeps as it is (pathlib drops the left side
+    for an absolute right one). The path is shown, never opened or checked: a card
+    reads the document only. With no run folder (a card built alone) it is as written.
+    """
+    return value if run_dir is None else str(run_dir / value)
+
+
+def _card(
+    record: StageRecord, *, stale: bool = False, run_dir: Path | None = None
+) -> ResultCard:
     """The card of ``record``; its values only when it ended ``done`` (FM-154).
 
     ``stale`` is ``RunDocument.is_stale`` of the record, and marks only a ``done``
     one: a record that did not end done has no values to mislead, and its status
     already says to run it again. The stale card keeps its values (they are a result,
     of inputs that are no longer the document's).
+
+    A ``_FILE_KEYS`` key with a text in it is a file, not a value: it is a
+    ``files`` entry, and does not count against the card's lines. A number, a
+    list or a blank text under such a key is no path and stays a line (FM-125).
     """
     when = record.finished_utc or record.started_utc
     try:
@@ -397,13 +423,21 @@ def _card(record: StageRecord, *, stale: bool = False) -> ResultCard:
         # hand-edited document must not stop ``view()``, which raises nothing for one.
         when_utc = _UNKNOWN_TIME
     lines: list[str] = []
+    files: list[str] = []
     assumed: tuple[str, ...] = ()
     if record.status is StageStatus.done and record.result is not None:
-        lines = [
-            _value_line(key, value)
-            for key, value in record.result.items()
-            if key != "assumed"
-        ]
+        for key, value in record.result.items():
+            if key == "assumed":
+                continue
+            if key in _FILE_KEYS and isinstance(value, str) and value.strip():
+                files.append(
+                    _cut(
+                        _flat(f"{key}: {_file_path(value, run_dir)}"),
+                        _CARD_TEXT_CHARS,
+                    )
+                )
+            else:
+                lines.append(_value_line(key, value))
         if len(lines) > _CARD_LINES:
             lines = [*lines[:_CARD_LINES], f"… {len(lines) - _CARD_LINES} more"]
         found = record.result.get("assumed")
@@ -430,6 +464,7 @@ def _card(record: StageRecord, *, stale: bool = False) -> ResultCard:
             else _cut(_flat(record.error), _CARD_TEXT_CHARS)
         ),
         stale=stale and record.status is StageStatus.done,
+        files=tuple(files),
     )
 
 
@@ -613,6 +648,16 @@ class PlatePage:
         the same (FM-151).
         """
         return self._ended
+
+    @property
+    def run_doc(self) -> Path:
+        """The run document's path, made absolute where the server runs (m5 §8.4).
+
+        What the operator reads on the page and what a copied command names:
+        a relative ``--run-doc`` would mean another file from another folder.
+        Symbolic links are not resolved: it is the path as the command was given.
+        """
+        return self._run_doc.absolute()
 
     @property
     def plate(self) -> str:
@@ -1723,6 +1768,7 @@ class PlatePage:
         ``problems`` and is drawn as absent (FM-125); the file is never written.
         """
         doc, unreadable = self._document()
+        run_dir = self.run_doc.parent
         problems: list[str] = []
         if unreadable is not None:
             problems.append(f"run document: {unreadable}")
@@ -1769,7 +1815,11 @@ class PlatePage:
             blocked=self._blocked(doc),
             problems=(*problems, *self._plugin_problems()),
             cards={
-                tool.name: _card(doc.stages[tool.name], stale=doc.is_stale(tool.name))
+                tool.name: _card(
+                    doc.stages[tool.name],
+                    stale=doc.is_stale(tool.name),
+                    run_dir=run_dir,
+                )
                 for tool in self.tools()
                 if tool.name in doc.stages
             },

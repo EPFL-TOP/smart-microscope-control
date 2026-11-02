@@ -2769,6 +2769,132 @@ def test_a_record_with_no_result_is_a_card_with_no_lines(
     _record(run_doc, "stub", result=None)
     card = _page(fake_microscope, run_doc).view().cards["stub"]
     assert (card.status, card.lines, card.assumed) == ("done", (), ())
+    assert card.files == ()
+
+
+# --- where the files are: a card names them (m5 §8.4, #293) ---------------------------------
+
+
+def test_a_card_names_its_files_under_the_run_folder(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _record(
+        run_doc,
+        "stub",
+        result={"folder": "scan/t1", "n": 3, "file": "report/t1.html"},
+    )
+    card = _page(fake_microscope, run_doc).view().cards["stub"]
+    # A file key is a `files` entry, in the result's order, and not a value line.
+    assert card.files == (
+        f"folder: {run_doc.parent / 'scan' / 't1'}",
+        f"file: {run_doc.parent / 'report' / 't1.html'}",
+    )
+    assert card.lines == ("n: 3",)
+
+
+def test_an_absolute_file_is_shown_as_given(
+    fake_microscope: Microscope, run_doc: Path, tmp_path: Path
+) -> None:
+    elsewhere = tmp_path / "elsewhere" / "positions.xml"
+    _record(run_doc, "stub", result={"file": str(elsewhere)})
+    card = _page(fake_microscope, run_doc).view().cards["stub"]
+    assert card.files == (f"file: {elsewhere}",)
+
+
+@pytest.mark.parametrize(
+    "status", [StageStatus.stopped, StageStatus.failed, StageStatus.running]
+)
+def test_a_failed_card_names_no_file(
+    fake_microscope: Microscope, run_doc: Path, status: StageStatus
+) -> None:
+    # FM-154: a record that did not end done wrote no result to point at.
+    _record(
+        run_doc,
+        "stub",
+        status=status,
+        result={"file": "report/partial.html", "folder": "scan/t1"},
+        error="the camera failed",
+    )
+    card = _page(fake_microscope, run_doc).view().cards["stub"]
+    assert card.files == ()
+    assert card.lines == ()
+
+
+def test_a_files_entry_is_cut_at_the_text_bound(
+    fake_microscope: Microscope, run_doc: Path, tmp_path: Path
+) -> None:
+    long = tmp_path / ("d" * 700)
+    _record(run_doc, "stub", result={"file": str(long)})
+    entry = _page(fake_microscope, run_doc).view().cards["stub"].files[0]
+    assert len(entry) == 601
+    assert entry.startswith("file: ")
+    assert entry.endswith("d…")
+    # Exactly at the bound it is whole: a relative value, joined to the run folder.
+    room = 600 - len("file: ") - len(str(run_doc.parent / "x")) + 1
+    whole = "w" * room
+    _record(run_doc, "stub", result={"file": whole})
+    entry = _page(fake_microscope, run_doc).view().cards["stub"].files[0]
+    assert entry == f"file: {run_doc.parent / whole}"
+    assert len(entry) == 600
+
+
+def test_a_path_with_a_line_break_is_one_line(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _record(run_doc, "stub", result={"file": "a\nb.html"})
+    entry = _page(fake_microscope, run_doc).view().cards["stub"].files[0]
+    assert "\n" not in entry
+    assert entry.endswith("a b.html")
+
+
+@pytest.mark.parametrize("value", [3, None, True, ["a"], {"a": 1}, "", "   "])
+def test_a_file_key_with_no_path_in_it_is_a_value_line_like_any_other(
+    fake_microscope: Microscope, run_doc: Path, value: object
+) -> None:
+    # `files` claim a path: a number, a list or a blank text is no path (FM-125).
+    _record(run_doc, "stub", result={"file": value})
+    card = _page(fake_microscope, run_doc).view().cards["stub"]
+    assert card.files == ()
+    assert len(card.lines) == 1
+    assert card.lines[0].startswith("file:")
+
+
+def test_file_keys_do_not_count_against_the_eight_values_of_a_card(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    eight = {f"k{i}": i for i in range(8)}
+    _record(run_doc, "stub", result={"file": "f.txt", "folder": "d", **eight})
+    card = _page(fake_microscope, run_doc).view().cards["stub"]
+    assert card.lines == tuple(f"k{i}: {i}" for i in range(8))
+    assert len(card.files) == 2
+
+
+def test_a_card_made_without_a_run_folder_shows_the_file_as_written(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _record(run_doc, "stub", result={"file": "report/t1.html"})
+    record = RunDocument.load(run_doc).stages["stub"]
+    assert controller_module._card(record).files == ("file: report/t1.html",)
+    folder = run_doc.parent / "elsewhere"
+    assert controller_module._card(record, run_dir=folder).files == (
+        f"file: {folder / 'report' / 't1.html'}",
+    )
+
+
+def test_the_run_documents_path_is_absolute_and_the_cards_files_follow_it(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(run_doc.parent)
+    relative = Path("run.json")
+    _record(relative, "stub", result={"file": "report/t1.html"})
+    page = _page(fake_microscope, relative)
+    # The path as the command was given it, made absolute where the server runs.
+    assert page.run_doc == Path.cwd() / "run.json"
+    assert page.run_doc.is_absolute()
+    entry = page.view().cards["stub"].files[0]
+    assert entry == f"file: {Path.cwd() / 'report' / 't1.html'}"
 
 
 def test_the_checklist_lists_a_slot_the_workflow_does_not_name(

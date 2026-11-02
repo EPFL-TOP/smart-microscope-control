@@ -207,7 +207,9 @@ def card_text(card: ResultCard | None, *, stand: str | None = None) -> str:
     known, the profile is always told: a card never claims it is this stand's),
     then `` (dry run)``, then `` (stale)`` when the record read an input that has
     been produced again since; the result's lines follow, indented by two spaces,
-    then one ``assumed:`` line for each assumption and the record's error.
+    then its files the same way (``in the run document`` for a ``done`` card that
+    names none, so that every result says where it is, m5 §8.4), then one
+    ``assumed:`` line for each assumption and the record's error.
     """
     if card is None:
         return ""
@@ -219,6 +221,10 @@ def card_text(card: ResultCard | None, *, stand: str | None = None) -> str:
     if card.stale:
         header += " (stale)"
     lines = [header, *(f"  {line}" for line in card.lines)]
+    if card.files:
+        lines += [f"  {entry}" for entry in card.files]
+    elif card.status == "done":
+        lines.append("  in the run document")
     lines += [f"assumed: {text}" for text in card.assumed]
     if card.error is not None:
         lines.append(f"error: {card.error}")

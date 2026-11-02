@@ -744,6 +744,7 @@ def test_card_text_says_status_time_profile_and_dry_run() -> None:
         "done 2026-10-29 09:03:00 UTC\n"
         "  n: 3\n"
         "  text: hello\n"
+        "  in the run document\n"
         "assumed: pixel size from the profile"
     )
     assert card_text(
@@ -752,6 +753,7 @@ def test_card_text_says_status_time_profile_and_dry_run() -> None:
         "done 2026-10-29 09:03:00 UTC on lightsheet (dry run)\n"
         "  n: 3\n"
         "  text: hello\n"
+        "  in the run document\n"
         "assumed: a\n"
         "assumed: b"
     )
@@ -761,20 +763,45 @@ def test_card_text_says_status_time_profile_and_dry_run() -> None:
     ) == ("failed 2026-10-29 09:03:00 UTC\nerror: the camera failed")
     # A stand that is not known: the card never claims to be this stand's.
     assert card_text(_card(lines=(), assumed=())) == (
-        "done 2026-10-29 09:03:00 UTC on demo"
+        "done 2026-10-29 09:03:00 UTC on demo\n  in the run document"
     )
 
 
 def test_card_text_ends_a_stale_card_with_stale_after_dry_run() -> None:
     assert card_text(
         _card(dry_run=True, stale=True, lines=(), assumed=()), stand="demo"
-    ) == ("done 2026-10-29 09:03:00 UTC (dry run) (stale)")
+    ) == ("done 2026-10-29 09:03:00 UTC (dry run) (stale)\n  in the run document")
     assert card_text(_card(stale=True, lines=(), assumed=()), stand="demo") == (
-        "done 2026-10-29 09:03:00 UTC (stale)"
+        "done 2026-10-29 09:03:00 UTC (stale)\n  in the run document"
     )
     assert card_text(
         _card(profile="lightsheet", stale=True, lines=(), assumed=()), stand="demo"
-    ) == ("done 2026-10-29 09:03:00 UTC on lightsheet (stale)")
+    ) == ("done 2026-10-29 09:03:00 UTC on lightsheet (stale)\n  in the run document")
+
+
+def test_card_text_shows_files_then_says_in_the_run_document_without_one() -> None:
+    # The files follow the values and come before the assumptions; each is
+    # indented as a value is (m5 §8.4).
+    assert card_text(
+        _card(files=("file: /runs/a/report/t.html", "folder: /runs/a/scan/t")),
+        stand="demo",
+    ) == (
+        "done 2026-10-29 09:03:00 UTC\n"
+        "  n: 3\n"
+        "  text: hello\n"
+        "  file: /runs/a/report/t.html\n"
+        "  folder: /runs/a/scan/t\n"
+        "assumed: pixel size from the profile"
+    )
+    # Every done card says where its result is: its files, else the document.
+    assert card_text(_card(), stand="demo").splitlines()[3] == "  in the run document"
+    # A card that did not end done has no result to point at, and says nothing of one.
+    for status in ("failed", "stopped", "running"):
+        text = card_text(
+            _card(status=status, lines=(), assumed=(), error="x"), stand="demo"
+        )
+        assert "in the run document" not in text
+        assert "file" not in text
 
 
 def _seed_raw(
@@ -835,6 +862,7 @@ def test_a_result_card_is_plain_text_under_its_tool(
     assert pane.object == (
         "done 2026-10-29 09:03:00 UTC\n"
         "  note: <b>[red]x</b>\n"
+        "  in the run document\n"
         "assumed: <i>[bold]guess[/bold]</i>"
     )
     # Under its Run button (and the note that explains a disabled one), in its own
@@ -873,7 +901,9 @@ def test_a_card_follows_the_run_documents_end_of_a_run(page: PlatePage) -> None:
     view.tick()
     text = view.tool_cards["scan"].object
     assert text.startswith("done ")
-    assert text.endswith(" UTC")
+    # The stub names no file: the card says where its result is all the same.
+    assert text.splitlines()[0].endswith(" UTC")
+    assert text.endswith("\n  in the run document")
 
 
 def test_tools_under_more_are_built(page: PlatePage) -> None:
