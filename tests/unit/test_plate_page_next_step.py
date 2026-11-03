@@ -23,7 +23,7 @@ import pytest
 from pymmcore_plus import CMMCorePlus
 
 from smc.hardware import Microscope
-from smc.hardware.capabilities import XYStage
+from smc.hardware.capabilities import Camera, XYStage
 from smc.hardware.profile import Profile
 from smc.plugins.api import PluginParams, PluginResult, RunContext
 from smc.plugins.params import parse_params
@@ -33,7 +33,7 @@ from smc.run import ReadRecord, RunDocument, StageRecord, StageStatus, write_sta
 from smc.testing import FakeCore
 from smc.testing.sample_stand import sample_refs
 from smc.ui.controller import NOT_CONNECTED, PlatePage
-from smc.ui.guide import CAPTURE_WELLS, SELECT_WELLS
+from smc.ui.guide import CAPTURE_WELLS, DRY_RUN_NO_FRAME, SELECT_WELLS
 
 T0 = datetime(2026, 11, 2, 9, 0, tzinfo=timezone.utc)
 STAND = "demo-sample"
@@ -126,6 +126,12 @@ class ScanPlan(Tool):
     name = provides = "scan-plan"
     Params = ScanPlanParams
     reads = ("plate",)
+
+
+class CameraScanPlan(ScanPlan):
+    """The scan plan as the real one is: it requires the camera, for the pixel size."""
+
+    requires = (Camera,)
 
 
 class Scan(Tool):
@@ -258,6 +264,8 @@ def _seed(
     reads: dict[str, ReadRecord | None] | None = None,
     checkpoint: dict[str, Any] | None = None,
     profile: str = STAND,
+    dry_run: bool = False,
+    params: dict[str, Any] | None = None,
 ) -> None:
     """A record an earlier run of ``plugin`` left; ``minute`` orders the starts and names the attempt."""
     then = T0 + timedelta(minutes=minute)
@@ -272,9 +280,9 @@ def _seed(
             started_utc=then,
             finished_utc=then,
             profile=profile,
-            dry_run=False,
+            dry_run=dry_run,
             smc_version="0",
-            params={},
+            params=params or {},
             result=result,
             checkpoint=checkpoint,
         ),
@@ -293,6 +301,30 @@ def _plate_done(run_doc: Path, *, minute: int = 0, plate: str = "96-well") -> No
         n_refs=1,
     ).model_dump(mode="json")
     _seed(run_doc, "plate-registration", "plate", minute=minute, result=result)
+
+
+def _chain_to_scan(run_doc: Path, *, scan_dry_run: bool | None = None) -> None:
+    """The plate and the scan plan done, and a ``scan`` too when ``scan_dry_run`` is not ``None``.
+
+    Every record read its upstream's current attempt, so none is stale. The scan
+    plan was a dry run when the scan was: a dry run reads what a dry run made.
+    """
+    _plate_done(run_doc)
+    _seed(
+        run_doc,
+        "scan-plan",
+        minute=1,
+        reads={"plate": ReadRecord(plugin="plate-registration", attempt="a0")},
+        dry_run=bool(scan_dry_run),
+    )
+    if scan_dry_run is not None:
+        _seed(
+            run_doc,
+            "scan",
+            minute=2,
+            reads={"scan-plan": ReadRecord(plugin="scan-plan", attempt="a1")},
+            dry_run=scan_dry_run,
+        )
 
 
 def _pairs_of(command: str) -> list[str]:
@@ -510,6 +542,110 @@ def test_a_selection_on_another_plate_than_the_registered_one_blocks_the_step_wi
         "the registered plate is a 96-well; calibrate the 384-well plate again, "
         "or choose 96-well"
     )
+
+
+# --- a dry-run page does not lead to a dead end (m5 §8.8.1) -----------------------------
+
+
+def test_a_dry_run_page_stops_the_step_at_scan_and_says_why(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    _chain_to_scan(run_doc)
+    profile = _profile(suggest={"scan": {"params": ["label=t1"], "why": "a name"}})
+    step = make_page(profile, dry_run=True).view().next_step
+    assert step is not None
+    assert step.plugin == "scan"
+    assert step.blocked == DRY_RUN_NO_FRAME
+    # The step stops advising; the call stays as the page makes it.
+    assert step.params == ("label=t1",)
+    words = shlex.split(step.command)
+    assert words[:3] == ["smc", "run", "scan"]
+    assert "--dry-run" in words
+    assert _pairs_of(step.command) == ["label=t1"]
+
+
+def test_a_dry_run_page_stops_the_step_at_a_tool_that_reads_a_dry_run_scan(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    _chain_to_scan(run_doc, scan_dry_run=True)
+    page = make_page(dry_run=True)
+    step = page.view().next_step
+    assert step is not None
+    assert step.plugin == "cells"
+    assert step.blocked == DRY_RUN_NO_FRAME
+
+    # The walk's loop: `cells` ran, failed on the missing frame, and the step is
+    # `cells` again. It says why instead of advising a run that cannot work.
+    _seed(
+        run_doc,
+        "cells",
+        minute=3,
+        status=StageStatus.failed,
+        reads={"scan": ReadRecord(plugin="scan", attempt="a2")},
+        dry_run=True,
+    )
+    again = page.view().next_step
+    assert again is not None
+    assert again.plugin == "cells"
+    assert again.why[0] == "the last run of cells ended failed; run it again"
+    assert again.blocked == DRY_RUN_NO_FRAME
+
+
+def test_a_dry_run_page_that_reads_a_real_scan_is_not_stopped(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # A dry run may read a real result: the scan was made in a terminal.
+    _chain_to_scan(run_doc, scan_dry_run=False)
+    step = make_page(dry_run=True).view().next_step
+    assert step is not None
+    assert step.plugin == "cells"
+    assert step.blocked is None
+
+
+def test_a_page_that_is_not_a_dry_run_is_never_stopped_at_scan(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # The newcomer's path: the page served without --dry-run on a simulated stand.
+    _chain_to_scan(run_doc)
+    at_scan = make_page().view().next_step
+    assert at_scan is not None
+    assert at_scan.plugin == "scan"
+    assert at_scan.blocked is None
+
+    _seed(
+        run_doc,
+        "scan",
+        minute=2,
+        reads={"scan-plan": ReadRecord(plugin="scan-plan", attempt="a1")},
+    )
+    at_cells = make_page().view().next_step
+    assert at_cells is not None
+    assert at_cells.plugin == "cells"
+    assert at_cells.blocked is None
+
+
+def test_a_dry_run_page_does_not_stop_a_tool_that_merely_requires_the_camera(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # `scan-plan` requires a camera (for the pixel size) and computes the same in a
+    # dry run: the rule is by the plugin's name, not by a capability (§8.8.1).
+    _plate_done(run_doc)
+    page = make_page(tools=(Registration, CameraScanPlan, Scan, Cells), dry_run=True)
+    page.select_text("B2")
+    step = page.view().next_step
+    assert step is not None
+    assert step.plugin == "scan-plan"
+    assert step.blocked is None
+
+
+def test_the_stand_not_connected_wins_over_the_dry_run_note(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    _chain_to_scan(run_doc)
+    step = make_page(dry_run=True, connect=False).view().next_step
+    assert step is not None
+    assert step.plugin == "scan"
+    assert step.blocked == NOT_CONNECTED
 
 
 # --- what the profile suggests ----------------------------------------------------------

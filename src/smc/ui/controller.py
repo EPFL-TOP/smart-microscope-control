@@ -81,7 +81,14 @@ from smc.plugins.slots import (
 )
 from smc.run import RunDocument, RunDocumentError, StageRecord, StageStatus
 from smc.ui.frames import Frame
-from smc.ui.guide import CAPTURE_WELLS, SELECT_WELLS, NextStep, command_line, next_slot
+from smc.ui.guide import (
+    CAPTURE_WELLS,
+    DRY_RUN_NO_FRAME,
+    SELECT_WELLS,
+    NextStep,
+    command_line,
+    next_slot,
+)
 
 if TYPE_CHECKING:
     from smc.hardware.microscope import Microscope
@@ -2147,6 +2154,22 @@ class PlatePage:
                 why.append(
                     f"wells: the {len(self.selection)} wells selected on the map"
                 )
+        if (
+            stuck is None
+            and self._dry_run
+            and (
+                tool.name == "scan"
+                or (
+                    "scan" in plugins[tool.name].plugin.reads
+                    and "scan" in cards
+                    and cards["scan"].dry_run
+                )
+            )
+        ):
+            # By the plugin's name, not by a capability: `scan-plan` also requires a
+            # camera and computes the same in a dry run. A dry run may read a real
+            # scan, so `cells` is stuck only when the scan it would read was a dry run.
+            stuck = DRY_RUN_NO_FRAME
         suggestion = self._suggested.get(tool.name)
         if suggestion is not None:
             given = [f"{key}={value}" for key, value in suggestion.pairs]

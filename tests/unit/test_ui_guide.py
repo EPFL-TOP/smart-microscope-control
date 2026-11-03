@@ -17,6 +17,7 @@ from hypothesis import strategies as st
 from smc.ui.controller import CheckItem
 from smc.ui.guide import (
     CAPTURE_WELLS,
+    DRY_RUN_NO_FRAME,
     SELECT_WELLS,
     NextStep,
     command_line,
@@ -87,6 +88,17 @@ def test_the_two_waiting_texts_are_the_designs() -> None:
         "centre a well under the objective (Live and the Drive pad), click it on the "
         "map and press Capture centre; a second well, far from the first, fits the "
         "rotation too"
+    )
+
+
+def test_the_dry_run_note_says_what_to_do() -> None:
+    # Whole (FM-45): the page cannot take the way out, so the text must name both.
+    assert DRY_RUN_NO_FRAME == (
+        "this page is a dry run: scan walks the fields and takes no frame, so cells and "
+        "the tools after it have nothing to read. Serve the page without --dry-run on a "
+        "stand whose stage is simulated (demo-sample), or run the chain with smc run "
+        "from plate-registration, without --dry-run: a run that is not a dry run "
+        "refuses what a dry run made"
     )
 
 

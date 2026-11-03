@@ -18,7 +18,14 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from smc.ui.controller import CheckItem
 
-__all__ = ["CAPTURE_WELLS", "SELECT_WELLS", "NextStep", "command_line", "next_slot"]
+__all__ = [
+    "CAPTURE_WELLS",
+    "DRY_RUN_NO_FRAME",
+    "SELECT_WELLS",
+    "NextStep",
+    "command_line",
+    "next_slot",
+]
 
 #: What the scan plan waits for. The page cannot choose wells for the operator:
 #: which wells to image is the experiment (m5 §8.6).
@@ -33,6 +40,18 @@ CAPTURE_WELLS = (
     "centre a well under the objective (Live and the Drive pad), click it on the "
     "map and press Capture centre; a second well, far from the first, fits the "
     "rotation too"
+)
+
+#: Why the step stops at ``scan`` on a page served with ``--dry-run`` (m5 §8.8.1): a dry
+#: run walks the fields and takes no frame, so ``cells`` and what follows fail on a
+#: missing frame, and the way out of a terminal run is not obvious (a run that is not a
+#: dry run refuses what a dry run made).
+DRY_RUN_NO_FRAME = (
+    "this page is a dry run: scan walks the fields and takes no frame, so cells and "
+    "the tools after it have nothing to read. Serve the page without --dry-run on a "
+    "stand whose stage is simulated (demo-sample), or run the chain with smc run "
+    "from plate-registration, without --dry-run: a run that is not a dry run "
+    "refuses what a dry run made"
 )
 
 
