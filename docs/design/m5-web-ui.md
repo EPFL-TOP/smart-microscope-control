@@ -8,7 +8,7 @@
   #293's plan with the owner (§8, 2026-11-02); the drive's follow-ups fixed by
   #295's plan (§6.1 to §6.4, 2026-11-02: a switch-off at the end of live, the
   outcome live keeps, the captures' refusal, the readbacks from the state, the
-  objective select's sync).
+  objective select's sync); presets fixed by #319's plan (§10, 2026-11-03).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 to M3, this document is the contract between issues.
   Names, module paths and signatures below are fixed; an executor who needs to
@@ -1883,6 +1883,9 @@ Every step was `done`. The report is `report/<token>.html` and the export is
    `_dry_run`, and its step carries #252's checkpoint refusal. It edits
    `controller.py`, `plate_page.py`, `profile.py` and `sample_stand.py`, so
    #251, #287, #295 and #297 run before it or after it, never alongside.
+6. **#319** (presets, §10) edits `controller.py`, `plate_page.py`, `guide.py`,
+   `cli.py`, `profile.py`, `document.py` and `runner.py`: no other issue that
+   edits one of them runs at the same time.
 
 ### 9.1 Not verified (for the owner)
 
@@ -1930,3 +1933,572 @@ Every step was `done`. The report is `report/<token>.html` and the export is
     POSIX shell);
   - the *Wells* box set by a redraw while the operator types in it;
   - the wrapped cards and the step's region on the PC's screen and over RDP.
+- **Presets (§10)**:
+  - the owner's own assay saved, then loaded on another day, at a stand;
+  - a preset saved from the service (§7.4) into the profile's folder: whether
+    the service's account may write there;
+  - a preset file edited in Notepad (a BOM, CRLF line ends) and read back on
+    Windows.
+
+## 10. Presets (#319)
+
+Fixed by #319's plan (2026-11-03), from the owner's feedback: the page asks for
+the same choices at every run, and an assay repeated every week is typed again
+each time.
+
+A **preset** is the set of choices an assay repeats, named and kept in a TOML
+file: the plate type, the wells, and the plugins' `--param` pairs. It is a
+convenience. **The run document stays the truth**: each record keeps the
+values the run used (`params`), and names the preset that was loaded (§10.4).
+A preset never holds a position (`refs`, `walls`, a position list) and never
+moves anything.
+
+### 10.1 The file (`smc/plugins/presets.py`, new)
+
+```toml
+# A preset of smc: the choices an assay repeats. See docs/ui/plate-page.md, Presets.
+stand = "demo-sample"
+plate = "96-well"
+wells = "B2,B11"
+saved_utc = 2026-11-03 10:00:00+00:00
+
+[params]
+scan-plan = ["coverage=0.4"]
+cells = ["detector=blobs"]
+```
+
+```python
+class Preset(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    stand: str | None = None
+    plate: str | None = None
+    wells: str | None = None
+    saved_utc: AwareDatetime | None = None
+    params: dict[str, tuple[str, ...]] = Field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class PresetFile:
+    name: str
+    path: Path
+    preset: Preset | None
+    error: str | None = None
+
+
+class PresetError(Exception): ...
+
+
+class PresetExistsError(PresetError):
+    path: Path
+
+
+def check_name(name: str) -> str: ...
+def preset_dirs(profile: Profile) -> tuple[Path, ...]: ...
+def list_presets(profile: Profile) -> tuple[PresetFile, ...]: ...
+def load_preset(source: str, profile: Profile) -> PresetFile: ...
+def dumps_preset(preset: Preset) -> str: ...
+def save_preset(
+    name: str, preset: Preset, profile: Profile, *, overwrite: bool = False
+) -> Path: ...
+```
+
+The module imports no Panel and reaches no device: the command and the page
+share it.
+
+**The fields.**
+
+- `stand` is the profile's `microscope.name` where it was saved.
+- `plate` is a `useq` plate key.
+- `wells` is the text `scan-plan`'s `wells` takes (`A1:D6`, `C*`, `B2,B11`).
+- `params` holds, per plugin name, `smc run --param` pairs, as `[suggest]`
+  does (§8.1): the preset *is* the command's call.
+- Every field may be left out.
+- `stand`, `plate` and `wells`, when given, are one non-blank line, else `<field>
+  is one non-empty line; leave it out for none`.
+- Each list of `params` has the shape `[suggest]`'s `params` has, with the same
+  texts. That check moves out of `SuggestSection` into a public
+  `check_pairs(items: Sequence[str]) -> None` of `smc/hardware/profile.py`,
+  which both call. The one difference is the list's length: an empty list is
+  allowed here and is not in `[suggest]`.
+- An unknown key is refused (`extra="forbid"`), as in a profile.
+
+**The name** is the file's stem.
+
+- `check_name` accepts 1 to 64 characters, lower-case letters, digits, `-` and
+  `_`, starting with a letter or a digit (`[a-z0-9][a-z0-9_-]{0,63}`). Any other
+  name raises `PresetError("a preset's name is 1 to 64 lower-case letters,
+  digits, - and _, starting with a letter or a digit; got '<name>'")`.
+- A name whose upper case is in `RESERVED_NAMES` (`smc.plugins.scan.algorithm`)
+  raises `PresetError("'<name>' is a name Windows keeps for a device; choose
+  another")`.
+- Lower case only, so two names never differ by case alone, and NTFS and APFS
+  see two presets where the code sees two (FM-24).
+
+**Where the presets are.** `preset_dirs(profile)` is, in this order, without
+duplicates:
+
+1. `<profile.source's folder>/presets`, when the profile was loaded from a file;
+2. `<d>/presets` for each `d` of `search_paths()` (`$SMC_PROFILES`, `./profiles`,
+   `.`).
+
+Duplicates are compared as `os.path.normcase(os.path.abspath(d))`. A preset of
+the stand sits beside its profile, and `profiles/presets/` serves every stand
+of the checkout. A missing folder is skipped when presets are read.
+
+- **`list_presets`** reads every `*.toml` of each folder, sorted by name. The
+  first file of a name wins, as for profiles. A file that cannot be read, is not
+  a valid preset, or whose stem `check_name` refuses is listed with `preset=None`
+  and its `error`, never dropped: a failure is a finding.
+- **`load_preset(source, profile)`** reads a path as given, by the profile's rule:
+  a string that ends in `.toml` or contains `/` or `os.sep`. Its name is the
+  stem. Any other source is a name: `check_name`, then the first
+  `<dir>/<name>.toml` of `preset_dirs`. It always returns `preset` set; every
+  failure is a `PresetError` whose message is the whole diagnosis, on one line:
+  - none found: `no preset named <name>; looked in <dirs, joined by ", ">; smc
+    presets list shows the presets`;
+  - unreadable: `<path>: cannot be read: <strerror>`;
+  - not TOML: `<path>: not TOML: <message>`;
+  - invalid: `<path>: <loc>: <msg>`, the pydantic errors joined by `; `.
+
+  The text is read as `encoding="utf-8-sig"`: a BOM that Notepad writes is not
+  an error.
+- **`dumps_preset`** is a header comment, `# A preset of smc: the choices an
+  assay repeats. See docs/ui/plate-page.md, Presets.`, then
+  `tomli_w.dumps(preset.model_dump(mode="python", exclude_none=True))`.
+  `tomli-w>=1.0` becomes a dependency: nothing in the project writes TOML today.
+- **`save_preset`** checks the name, then looks for the name as `load_preset`
+  does. When one is found and `overwrite` is false, it raises
+  `PresetExistsError` with that `path`: `preset <name> exists: <path>`. It then
+  writes `preset_dirs(profile)[0] / f"{name}.toml"` through `write_atomically`
+  (`smc.run.files`, FM-38, its folder made if missing), as UTF-8 without a BOM,
+  and returns the path.
+  - An `AtomicWriteError` is a `PresetError`, `<path>: not saved: <strerror>`,
+    with `; the new preset is in <kept>` when only the rename failed.
+  - An overwrite of a preset found in a later folder writes the first folder's
+    file, which then shadows the other. The message of `PresetExistsError` names
+    the file that exists, and the page says where it saved (§10.6).
+
+Measured 2026-11-03 (a throwaway prototype of `Preset` and `dumps_preset`,
+tomli-w 1.0.0 on Python 3.13.0 with pydantic 2.13.5, and on Python 3.10.10 with
+tomli 2.0.1 and pydantic 2.7.0):
+
+- the file above, a key `my.plugin`, a pair with `"`, `é`, `U+007F` and an emoji,
+  and an empty list all came back equal through `tomllib.loads`;
+- the same text behind a BOM read back equal through `utf-8-sig`;
+- an unknown top-level key was refused;
+- tomli-w writes a quoted key only where TOML needs one (`"my.plugin"`) and the
+  datetime as `2026-11-03 10:00:00+00:00`. The page saves `saved_utc` to the
+  second.
+
+### 10.2 A preset checked against a stand
+
+```python
+NOT_IN_PARAMS: dict[str, dict[str, str]] = {
+    "plate-registration": {
+        "plate": "the preset's plate holds it",
+        "refs": "a preset holds no positions",
+        "walls": "a preset holds no positions",
+    },
+    "scan-plan": {"wells": "the preset's wells hold them"},
+}
+
+
+@dataclass(frozen=True, slots=True)
+class PresetCheck:
+    name: str
+    plate: str | None
+    wells: str | None
+    params: dict[str, tuple[str, ...]]
+    mismatches: tuple[str, ...]
+
+
+def registered_plate(doc: RunDocument) -> str | None: ...
+def check_preset(
+    file: PresetFile,
+    models: Mapping[str, type[BaseModel]],
+    *,
+    stand: str,
+    registered: str | None,
+    only: str | None = None,
+) -> PresetCheck: ...
+def command_pairs(
+    check: PresetCheck, plugin: str, overrides: Sequence[str]
+) -> list[str]: ...
+```
+
+**A mismatch is named, never refused silently.** `check_preset` gives what
+applies and one `mismatches` line for everything else. `models` maps a plugin's
+name to its `Params`. With `only`, only that plugin's pairs are checked and
+returned, and the other plugins of the file are not mismatches (the command
+runs one plugin, §10.3).
+
+| What is wrong | The line | What is not applied |
+|---|---|---|
+| `stand` differs from `stand=` | `preset <n> was saved on <stand>; this stand is <stand>` | nothing: it is a note |
+| `plate` is not a `useq` plate | `preset <n>: <plate> is not a plate useq knows` | `plate` and `wells` |
+| `registered` is set and differs from `plate` | `preset <n> is for a <plate> plate; this run document's plate is registered as a <registered>: its plate and wells are not applied` | `plate` and `wells` |
+| a plugin that `models` does not hold | `preset <n> [params.<plugin>]: no plugin named <plugin>` | its pairs |
+| a key that is not a field of its `Params` | `preset <n> [params.<plugin>]: <key> is not a parameter of <plugin> (keys: <fields, joined by ", ">)` | that pair |
+| a key that `NOT_IN_PARAMS` names | `preset <n> [params.<plugin>]: <key> is not kept under params: <reason>` | that pair |
+
+`PresetCheck.plate` and `wells` are the preset's when applied, else `None`.
+`params` keeps the applied pairs in the file's order, and a plugin left with
+none is not a key. A value is not checked: a value its plugin refuses is that
+run's `ParamsError`, as for `[suggest]`.
+
+The difference from `[suggest]` (§8.3) is deliberate. A suggestion with a bad
+key is ignored whole. A preset drops only the pair: a plugin that renamed one
+parameter keeps the rest of the assay.
+
+**`registered_plate(doc)`** is the plate this run document has registered:
+
+- it reads the `done` records that provide the slot `plate`
+  (`plate-registration`, `plate-finding`);
+- among them, the one with the latest `finished_utc`;
+- the value is its `result["plate"]` when that is a string, else `None`;
+- `None` when there is none.
+
+It reads the document only.
+
+**`command_pairs(check, plugin, overrides)`** gives the pairs the command line
+runs, in this order:
+
+1. The preset's held field:
+   - `plate=<check.plate>` for `plate-registration`;
+   - `wells=<check.wells>` for `scan-plan`;
+   - each when it is applied.
+2. Then `check.params[plugin]`.
+3. Then `overrides`.
+
+A key that an override gives is dropped from 1 and 2, so `--param` wins. The
+key of an item is its text before the first `=`. A malformed override is
+passed on as it is, and `parse_params` names it.
+
+### 10.3 The command line (`smc/cli.py`)
+
+```
+smc run NAME -p PROFILE --run-doc PATH [--preset NAME|PATH] [--param k=v ...] [--dry-run] [--resume]
+smc presets list [-p PROFILE]
+smc presets show NAME|PATH [-p PROFILE] [--run-doc PATH]
+```
+
+**`smc run --preset`**. Without `--preset`, `run_command` is unchanged and in
+its order. With it, the order is:
+
+1. `load_plugin`.
+2. `Profile.load`.
+3. `load_preset`. A `PresetError` is `typer.BadParameter(<message>,
+   param_hint="--preset")`, which exits 2.
+4. `_check_run_doc`.
+5. `RunDocument.load_or_new`.
+6. `check_preset(file, {name: entry.plugin.Params}, stand=<microscope.name>,
+   registered=registered_plate(doc), only=name)`.
+7. Each mismatch is printed with `_say`, before the run starts.
+8. `parse_params(Params, command_pairs(check, name, param or []))`.
+9. The rest as today.
+10. `run_plugin(..., preset=file.name)`.
+
+Only the plugin run is loaded: the command does not import every plugin to
+check a preset.
+
+**`smc presets`** is a Typer group, `presets_app`, attached as `presets`, like
+`objective_app`.
+
+- `list` prints one row per preset, aligned by `_aligned`: `<name>  <stand or
+  ->  <plate or ->  <plugins, joined by ",">  <path>`. A broken file's row is
+  `<name>  cannot be read: <error>  <path>`.
+  - Then `searched: <dirs, joined by ", ">`.
+  - With none, the output is `no presets; searched: <dirs>`.
+  - Exit 0.
+- `show` prints the preset:
+  - its first line is `preset <name>  <path>`;
+  - then `stand`, `plate`, `wells` and `saved_utc`, one per line;
+  - then `<plugin>: <pairs, joined by a space>` per plugin.
+
+  It then checks the preset against the whole registry (`discover()`), the
+  profile's stand, and `registered_plate` of `--run-doc` when it is given (a
+  missing file registers nothing). After that come the mismatches, or `no
+  mismatch on <stand>`. Exit 0. A `PresetError` is `_fail(<message>)` and exit
+  2 (`_EXIT_REFUSED`).
+
+### 10.4 The run document (`smc/run/document.py`, `smc/plugins/runner.py`)
+
+```python
+class StageRecord(BaseModel):
+    ...
+    error: str | None = None
+    preset: str | None = None  # the last field
+```
+
+- `preset` is the name of the preset the run was given: `--preset`, or the one
+  loaded on the page (§10.5).
+- The record's `params` are the values used. When the operator edits a field
+  after loading, the record keeps the preset's name and the edited value.
+- A `model_serializer(mode="wrap")` drops the key when it is `None`, so a
+  record without a preset is written exactly as before.
+- `SCHEMA_VERSION` stays 1:
+  - an older smc reads every document that names no preset;
+  - an older smc refuses a record that names one, by its unknown key `preset`.
+- `run_plugin(..., preset: str | None = None)` writes it into **every** record
+  the run writes:
+  - the first;
+  - its checkpoints;
+  - the last.
+
+Measured 2026-11-03 with the prototype, pydantic 2.13.5 and 2.7.0:
+
+- the wrap serializer drops `preset: None`, inside a document's `stages` too;
+- it keeps `preset: "weekly"`;
+- a model without the field (an older smc) reads the record that has none;
+- `model_json_schema()` still lists the field;
+- `mypy --strict` passes on the serializer's signature,
+  `(self, handler: SerializerFunctionWrapHandler, info: SerializationInfo) ->
+  dict[str, Any]`.
+
+### 10.5 The controller (`smc/ui/controller.py`)
+
+```python
+@dataclass(frozen=True, slots=True)
+class LoadedPreset:
+    file: PresetFile
+    check: PresetCheck
+    fields: dict[str, dict[str, str]]
+    selection: tuple[str, ...] | None
+    mismatches: tuple[str, ...]
+
+
+class PlatePage:
+    @property
+    def preset(self) -> LoadedPreset | None: ...
+    def presets(self) -> tuple[PresetFile, ...]: ...
+    def load_preset(self, source: str) -> LoadedPreset: ...
+    def forget_preset(self) -> None: ...
+    def save_preset(
+        self,
+        name: str,
+        fields: Mapping[str, Sequence[str]],
+        wells: str,
+        *,
+        overwrite: bool = False,
+    ) -> LoadedPreset: ...
+```
+
+The loaded preset is the page's shared state, as the plate and the selection
+are. Every tab sees it, and it is kept under `_lock`.
+
+**`presets()`** is `list_presets(self._profile)`.
+
+**`load_preset(source)`**:
+
+1. `load_preset(source, self._profile)`. A `PresetError` propagates, and the
+   view shows its message.
+2. `check_preset` against every registered plugin's `Params`, with
+   `stand=self._profile.microscope.name` and `registered=registered_plate(<the
+   run document>)`.
+3. The page's own mismatch: when the check applies a plate that is not
+   `self.plate` while the page holds captures (`refs` or `walls`), the line is
+   `preset <n> is for a <p> plate; this page has captures on a <q> plate: its
+   plate and wells are not applied`, and neither is applied. `choose_plate`
+   would drop the captures.
+4. An applied plate is `choose_plate(plate)`.
+5. Applied wells are `select_text(wells)`. Its `ValueError` is the mismatch
+   `preset <n>: wells <wells>: <message>`, and the selection stays as it was.
+   `selection` is the selection the load set, else `None`.
+6. `fields` is `check.params` split at each pair's first `=`.
+7. `mismatches` are the check's, then the page's.
+
+It needs no stand and is allowed while an activity goes: it reaches no device,
+and a run in flight has already read its pairs.
+
+**`forget_preset()`** sets it back to `None`.
+
+**`run()`** passes `preset=self.preset.file.name` to `run_plugin` when a preset
+is loaded. The next step's command says it too, below.
+
+**`save_preset(name, fields, wells, *, overwrite=False)`**.
+
+`fields` are the tools' non-empty fields, as the view's `on_run` collects them,
+per plugin. Each plugin's pairs go through `parse_params` against its `Params`.
+A `ParamsError` is `PresetError("<plugin>: <problems, joined by "; ">; nothing
+saved")`, and a plugin that is not registered is `PresetError("no plugin named
+<plugin>; nothing saved")`. A preset that its next run would refuse is never
+written.
+
+`wells` is the *Wells* box's text:
+
+- with no selection, the preset has no `wells`;
+- when the text, stripped, names exactly the selection on this plate
+  (`parse_wells(self.plate, text) == self.selection`), it is kept as typed
+  (`A1:D6` stays `A1:D6`);
+- otherwise the preset's `wells` is `",".join(self.selection)`.
+
+The preset is `Preset(stand=self._profile.microscope.name, plate=self.plate,
+wells=..., saved_utc=<now, UTC, to the second>, params=<the pairs of each plugin
+that has any>)`.
+
+- `save_preset(name, preset, self._profile, overwrite=overwrite)` writes it.
+  `PresetExistsError` propagates: the view asks before overwriting.
+- What it saved becomes the loaded preset: the method returns
+  `self.load_preset(str(path))`. Loading it again is a no-op on the page: same
+  plate, same selection.
+
+**The next step** (§8.3, step 4) takes the loaded preset as its suggestion when
+the preset names the tool:
+
+- the pairs are the page's pairs;
+- then the profile's suggested pairs whose key the preset does not give;
+- then the preset's pairs for the tool.
+
+The why lines are:
+
+- the profile's line, with only the pairs that remain, and none when none
+  remain;
+- then `<pairs, joined by a space>: from the preset <name>`.
+
+`command_line` gains `preset: str | None = None`, and gives `--preset <preset>`
+after `--dry-run` and before the pairs. The step passes `str(file.path)`, as it
+passes the profile's path. Run from a terminal, the command then applies the
+preset, whose pairs the `--param` pairs repeat, and its record names the preset
+as the page's would.
+
+### 10.6 The page (`smc/ui/plate_page.py`, `smc/ui/guide.py`)
+
+```python
+class PlatePageView:
+    preset_select: pn.widgets.Select
+    preset_load_button: pn.widgets.Button
+    preset_name: pn.widgets.TextInput
+    preset_save_button: pn.widgets.Button
+    preset_confirm: pn.Row
+    preset_note: pn.pane.Str
+
+    def on_load_preset(self) -> None: ...
+    def on_save_preset(self) -> None: ...
+    def on_preset_overwrite(self) -> None: ...
+    def on_preset_cancel(self) -> None: ...
+```
+
+```python
+#: smc/ui/guide.py: no Panel, no device
+def preset_differences(
+    expected: Mapping[str, Mapping[str, str]],
+    actual: Mapping[str, Mapping[str, str]],
+) -> tuple[str, ...]: ...
+def preset_note_text(
+    loaded: LoadedPreset | None, differences: Sequence[str]
+) -> str: ...
+```
+
+**The region** is a bold `Preset`, at the head of the right-hand column, above
+*Next step*. A preset is what the operator chooses before the first step.
+
+- One row: `preset_select` (`label="Preset"`, options `{"(none)": "", <name>:
+  <name>, ...}` from `presets()`, the broken files left out), then
+  `preset_load_button` (`label="Load"`).
+- A second row: `preset_name` (`label="Save as"`, `placeholder="weekly"`), then
+  `preset_save_button` (`label="Save"`).
+- Then `preset_confirm`: a text, then `Overwrite` and `Cancel`, hidden unless
+  armed, as `objective_confirm` is.
+- Then `preset_note`, wrapped text as the cards are (§8.4), never Markdown
+  (FM-139).
+- The options are read at `refresh()` and after a save, never by the tick.
+
+**What Load sets** (`on_load_preset`):
+
+- With `(none)`, the button calls `forget_preset()` and the note says `no preset
+  loaded`.
+- Otherwise it calls `page.load_preset(name)` through `_try`.
+- Then it sets **every** field of every tool on the page to the preset's value,
+  else the profile's suggested value (`ToolView.suggested`), else `""`. The form
+  shows what a fresh page with this preset shows. A field typed before the load
+  is replaced: loading is choosing the preset's values.
+- These expected values are kept in `_preset_expected`, with the loaded preset.
+- `preset_name` takes the preset's name, so that a Save after edits asks to
+  overwrite it.
+- Then `refresh()`, which draws the plate, the *Wells* box and the next step.
+- The fields are set under a guard, `_filling`, so the field watchers below draw
+  the note once, after the last.
+
+**The note** is `preset_note_text(page.preset, differences)`:
+
+- `no preset loaded`;
+- or `loaded: <name>  (<path>)`, then each mismatch indented by two spaces, then
+  either `changed since loading:` with each difference indented, or `the page
+  holds the preset's values`;
+- the mismatches and the differences are each cut at 8 lines, then `… <n> more`,
+  as a card's lines (§2.4).
+
+`preset_differences` compares each expected field with the field's value,
+stripped. It gives `<plugin> <key>: <value> (the preset: <expected>)` per field
+that differs, in tool order, with `(default)` for an empty text. The view adds
+the page's own two lines:
+
+- `plate: <plate> (the preset: <p>)` when the loaded check applied a plate that
+  is not `page.plate`;
+- `wells: <n> selected (the preset: <wells>)` when the load set a `selection`
+  and `page.selection` differs from it.
+
+**When the note is drawn**:
+
+- at every redraw;
+- from a watcher on the `value` of every tool field, of the *Wells* box and of
+  `plate_select`;
+- each watcher registered through `_handler` (FM-171) and proved through a
+  session, not only by a direct call (FM-161).
+
+Another tab keeps its own fields: its note names the loaded preset and lists
+how its fields differ, which is true of what its Run sends.
+
+**Save** (`on_save_preset`):
+
+- An empty name says `type a name to save the preset under` and saves nothing.
+- Otherwise it calls `page.save_preset(name, <the non-empty fields per tool, as
+  on_run collects them>, self.select_input.value)`.
+- `PresetExistsError` arms the confirmation: `_preset_armed = (name,)`, the text
+  `<its message>: overwrite it?`, and `preset_confirm` shown.
+- A save that worked:
+  - refreshes the options and selects the saved name;
+  - sets `_preset_expected` to the fields as they are;
+  - says `saved <name> to <path>`, then the note.
+- Any other `PresetError` is the page's message, through `_try`.
+
+**The confirmation**:
+
+- `on_preset_overwrite` saves the armed name with `overwrite=True`. It collects
+  the fields at that click, which are what the operator sees then.
+- When `preset_name` no longer holds the armed name, the click saves nothing and
+  says `the name changed: press Save again`.
+- `on_preset_cancel` and any change of `preset_name` disarm.
+
+**Every button** is registered through `_handler` (§3, FM-171). Its label is
+given as `label=` (FM-147). None is disabled while an activity goes: no button
+here reaches the stand.
+
+### 10.7 What this does not do
+
+- **No positions**, and nothing that moves.
+- **No exposure or channel.** The page offers neither as a plugin parameter:
+  `scan`'s `Params` has none. The objective a scan is planned for is
+  `scan-plan`'s `objective`, which a preset holds like any field. *Drive*'s
+  objective select, the light and the autofocus are actions, not parameters.
+- **No `smc presets save` in this issue.** The CLI's equivalent of *Save* is,
+  for now, the file written by hand, in the documented format. A command that
+  saves a run document's parameters as a preset is a follow-up issue.
+- **No *Delete* button**: a preset is deleted as a file.
+- **No `smc ui --preset`**: the page starts with no preset loaded.
+- **The profile's `[suggest]` is unchanged.** A loaded preset wins over it, key
+  by key.
+
+### 10.8 Tests and failure modes
+
+The tests are named in #319's plan. **Failure modes**:
+
+- FM-24: a name, a Windows device name, case, the folders;
+- FM-38: the write, through `write_atomically`;
+- FM-98, FM-125 (a preset's values taken as they come), FM-139;
+- FM-147, FM-151 (the options and the note are never drawn by the tick);
+- FM-153 (the region looked at with `/ui-check`);
+- FM-161, FM-169, FM-171;
+- FM-36, FM-37 and FM-72 (the commands' output and help);
+- FM-43, FM-44, FM-45.
