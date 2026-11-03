@@ -827,9 +827,18 @@ class PlatePage:
     def select_text(self, text: str) -> None:
         """Replace the selection by the wells ``text`` names (``A1:D6``, ``C*``, ``all``).
 
+        A blank text (empty, or only white space) is the *Wells* box emptied: no
+        wells, so the selection is cleared and nothing is raised (m5 §8.8.5).
+        ``parse_wells`` itself refuses an empty text, which is right for ``smc run
+        scan-plan --param wells=``: that is not a selection but a missing value.
+
         Raises:
-            ValueError: ``parse_wells``' message; the selection is as it was.
+            ValueError: ``parse_wells``' message for any other text that names no
+                well; the selection is as it was.
         """
+        if text.strip() == "":
+            self.selection = ()
+            return
         self.selection = parse_wells(self._plate, text)
 
     def toggle(self, well: str) -> None:

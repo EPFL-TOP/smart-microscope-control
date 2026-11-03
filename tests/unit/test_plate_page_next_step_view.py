@@ -697,6 +697,67 @@ def test_a_typed_range_stays_as_typed(
     assert view.select_input.value == "A1,A2,A3,B2"
 
 
+def test_an_emptied_wells_box_clears_the_selection_and_the_box_follows_again(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # The owner's sixth point: an emptied box changed nothing, and then stood for a
+    # selection it no longer showed until the selection changed (m5 §8.8.5). The box
+    # is set by `value=`, the way a session's change arrives (FM-161).
+    _seed_plate(run_doc)
+    page = make_page()
+    view = PlatePageView(page)
+    view.select_input.value = "A1:A3"
+    assert page.selection == ("A1", "A2", "A3")
+
+    view.select_input.value = ""
+
+    assert page.selection == ()
+    assert view.select_input.value == ""
+    assert view.message.object == ""
+    # The next click is a change again: the box follows it.
+    _tap(view, "B2")
+    assert page.selection == ("B2",)
+    assert view.select_input.value == "B2"
+
+
+def test_a_box_of_blanks_clears_the_selection_too(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    _seed_plate(run_doc)
+    page = make_page()
+    view = PlatePageView(page)
+    view.select_input.value = "A1:A3"
+    view.select_input.value = "  "
+    assert page.selection == ()
+    assert view.message.object == ""
+    # As a typed range does, the box keeps what was typed: it stands for no wells.
+    assert view.select_input.value == "  "
+
+
+def test_the_echo_of_an_emptied_selection_does_not_select_again(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # The click that takes the last well off empties the box by the echo; the guard
+    # alone stops that assignment from calling `select_text("")` (it no longer returns
+    # at a blank text, m5 §8.8.5).
+    _seed_plate(run_doc)
+    page = make_page()
+    view = PlatePageView(page)
+    calls: list[str] = []
+    real = page.select_text
+
+    def spy(text: str) -> None:
+        calls.append(text)
+        real(text)
+
+    with _replaced(page, "select_text", spy):
+        _tap(view, "B2")
+        _tap(view, "B2")
+        assert view.select_input.value == ""
+        assert page.selection == ()
+        assert calls == []
+
+
 def test_a_range_that_is_refused_stays_in_the_box_with_the_reason(
     make_page: Callable[..., PlatePage], run_doc: Path
 ) -> None:

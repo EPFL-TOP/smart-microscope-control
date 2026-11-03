@@ -1657,6 +1657,31 @@ def test_select_text_and_toggle_name_what_is_not_on_the_plate_and_keep_the_selec
     assert page.selection == ("A1", "A2")
 
 
+@pytest.mark.parametrize("blank", ["", "   ", "\t", " \n "])
+def test_select_text_with_a_blank_text_clears_the_selection(
+    page: PlatePage, blank: str
+) -> None:
+    # An emptied Wells box means "no wells" (m5 §8.8.5); `parse_wells` itself refuses
+    # an empty text, which is right for `smc run scan-plan --param wells=`.
+    page.select_text("A1:A3")
+    assert page.selection == ("A1", "A2", "A3")
+    page.select_text(blank)
+    assert page.selection == ()
+    # And again: nothing selected stays nothing selected, without a refusal.
+    page.select_text(blank)
+    assert page.selection == ()
+
+
+def test_a_text_that_names_no_well_but_is_not_blank_keeps_its_refusal_and_the_selection(
+    page: PlatePage,
+) -> None:
+    # Only a blank text means "no wells": a stray comma is a mistake, and says so.
+    page.select_text("A1,A2")
+    with _refuses(ValueError, "no wells selected"):
+        page.select_text(",")
+    assert page.selection == ("A1", "A2")
+
+
 def test_plate_registration_params_are_the_plate_and_the_captures(
     page: PlatePage, fake_microscope: Microscope
 ) -> None:

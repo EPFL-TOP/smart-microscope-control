@@ -871,9 +871,12 @@ class PlatePageView:
 
         The box keeps what was typed: ``_wells_shown`` is the selection the box now
         stands for, so the redraw does not rewrite it. The box's own echo of a click
-        (``_echo_wells``) comes back here, synchronously, and selects nothing.
+        (``_echo_wells``) comes back here, synchronously, and selects nothing: the
+        ``_echoing`` guard alone stops it. A box the operator empties is a blank
+        text, which clears the selection (m5 §8.8.5), and ``_wells_shown`` is then
+        ``()``, so the next click is echoed again.
         """
-        if self._echoing or text.strip() == "":
+        if self._echoing:
             return
         if self._try(lambda: self.page.select_text(text)):
             self._wells_shown = self.page.selection
