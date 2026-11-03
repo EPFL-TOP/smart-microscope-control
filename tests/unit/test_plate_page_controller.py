@@ -265,6 +265,28 @@ class Saves(Slow):
             ctx.wait_s(0.05)
 
 
+class Assuming(Stub):
+    """Ends ``done`` with the ``assumed`` lines a test sets in ``assumed``, as ``scan-plan`` does."""
+
+    name = provides = "assuming"
+    assumed: ClassVar[tuple[str, ...]] = ()
+
+    def run(self, microscope: Any, params: StubParams, ctx: RunContext) -> StubResult:
+        return StubResult(assumed=Assuming.assumed)
+
+
+class SavesAssuming(Saves):
+    """Saves a checkpoint that holds an assumption, then waits for the stop."""
+
+    name = provides = "saves-assuming"
+
+    def run(self, microscope: Any, params: NoParams, ctx: RunContext) -> StubResult:
+        ctx.save_checkpoint(StubResult(n=1, assumed=("a guess",)))
+        Slow.started.set()
+        while True:
+            ctx.wait_s(0.05)
+
+
 class StubScan(Stub):
     """Registered as ``scan``, and needs an XY stage."""
 
@@ -290,6 +312,7 @@ def _fresh_state() -> Iterator[None]:
     """The stubs' class-level Events and logs are new for every test, and released after it."""
     Stub.seen = []
     StubGoto.ran = []
+    Assuming.assumed = ()
     Failing.raised = []
     Slow.started = threading.Event()
     Slow.release = threading.Event()
@@ -728,6 +751,156 @@ def test_a_run_that_stops_on_its_own_page_blocks_the_next_click(
         assert page.activities_ended == 1
     finally:
         page.close()
+
+
+# --- the strip says what a run assumed (m5 §8.8.2) ---------------------------------------
+
+
+def test_a_done_run_says_its_first_assumption_on_the_strip(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    Assuming.assumed = ("first line", "second line")
+    page = _page(fake_microscope, run_doc, [_ep(Assuming)])
+    try:
+        _run_and_join(page, "assuming")
+        outcome = page.status().outcome
+        assert outcome is not None
+        assert re.fullmatch(
+            r"assuming done in \d+\.\d s; assumed: first line \(\+1 more, on the card\)",
+            outcome,
+        ), outcome
+        # The card holds all of them: the strip is a pointer, not a copy.
+        assert page.view().cards["assuming"].assumed == ("first line", "second line")
+    finally:
+        page.close()
+
+
+def test_a_done_run_with_one_assumption_does_not_count_more(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    Assuming.assumed = ("only line",)
+    page = _page(fake_microscope, run_doc, [_ep(Assuming)])
+    try:
+        _run_and_join(page, "assuming")
+        outcome = page.status().outcome
+        assert outcome is not None
+        assert re.fullmatch(
+            r"assuming done in \d+\.\d s; assumed: only line", outcome
+        ), outcome
+    finally:
+        page.close()
+
+
+def test_a_done_run_with_no_assumption_has_the_outcome_it_had(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _page(fake_microscope, run_doc, [_ep(Assuming)])
+    try:
+        _run_and_join(page, "assuming")
+        outcome = page.status().outcome
+        assert outcome is not None
+        assert re.fullmatch(r"assuming done in \d+\.\d s", outcome), outcome
+    finally:
+        page.close()
+
+
+def test_a_long_assumption_is_cut_on_the_strip(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    Assuming.assumed = ("a" * 400,)
+    page = _page(fake_microscope, run_doc, [_ep(Assuming)])
+    try:
+        _run_and_join(page, "assuming")
+        outcome = page.status().outcome
+        assert outcome is not None
+        assert re.fullmatch(
+            rf"assuming done in \d+\.\d s; assumed: {'a' * 160}…", outcome
+        ), outcome
+        # The card is cut later: the strip's cut loses nothing the card holds.
+        assert page.view().cards["assuming"].assumed == ("a" * 400,)
+    finally:
+        page.close()
+
+
+def test_an_assumption_with_a_line_break_is_one_line_on_the_strip(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    Assuming.assumed = ("pixel size\ntaken as given",)
+    page = _page(fake_microscope, run_doc, [_ep(Assuming)])
+    try:
+        _run_and_join(page, "assuming")
+        outcome = page.status().outcome
+        assert outcome is not None
+        assert "\n" not in outcome
+        assert outcome.endswith("; assumed: pixel size taken as given"), outcome
+    finally:
+        page.close()
+
+
+def test_a_stopped_or_failed_run_never_carries_an_assumption(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # A stopped run's checkpoint holds an assumption, and a failed run's error is its
+    # own text: neither is a result, so the strip says no assumption (FM-154).
+    page = _page(fake_microscope, run_doc, [_ep(SavesAssuming)])
+    try:
+        page.run("saves-assuming", [])
+        assert Slow.started.wait(5)
+        page.stop()
+        assert page.join(10.0)
+        assert page.status().outcome == "saves-assuming stopped"
+        _run_and_join(page, "failing")
+        outcome = page.status().outcome
+        assert outcome is not None
+        assert "assumed" not in outcome, outcome
+    finally:
+        page.close()
+
+
+# --- Refresh forgets the outcome (m5 §8.8.3) ----------------------------------------------
+
+
+def test_clear_outcome_forgets_the_last_outcome_when_nothing_runs(
+    page: PlatePage,
+) -> None:
+    _run_and_join(page, "stub")
+    assert page.status().outcome is not None
+    page.clear_outcome()
+    assert page.status().outcome is None
+    # A second call has nothing to forget and raises nothing.
+    page.clear_outcome()
+    assert page.status().outcome is None
+
+
+def test_clear_outcome_leaves_the_stop_note_alone(page: PlatePage) -> None:
+    page.run("slow", [])
+    assert Slow.started.wait(5)
+    page.stop()
+    assert page.join(10.0)
+    status = page.status()
+    assert status.outcome == "slow stopped"
+    assert status.stop_note is not None
+    page.clear_outcome()
+    after = page.status()
+    assert after.outcome is None
+    assert after.stop_note == status.stop_note
+
+
+def test_clear_outcome_does_nothing_while_an_activity_runs(page: PlatePage) -> None:
+    page.run("slow", [])
+    try:
+        assert Slow.started.wait(5)
+        # A text the running activity's page holds: it is not for a button to drop.
+        page._set_outcome("kept")
+        page.clear_outcome()
+        assert page.status().outcome == "kept"
+        assert page.status().running == "slow"
+    finally:
+        Slow.release.set()
+    assert page.join(10.0)
+    # The run's own end replaces the text, as it always does.
+    assert page.status().outcome is not None
+    assert page.status().outcome.startswith("slow done in ")
 
 
 def test_a_second_run_while_one_runs_is_refused(page: PlatePage) -> None:
@@ -1481,6 +1654,31 @@ def test_select_text_and_toggle_name_what_is_not_on_the_plate_and_keep_the_selec
         page.select_text("Z99")
     with _refuses(ValueError, "Z99 is not a well of the 96-well plate"):
         page.toggle("Z99")
+    assert page.selection == ("A1", "A2")
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t", " \n "])
+def test_select_text_with_a_blank_text_clears_the_selection(
+    page: PlatePage, blank: str
+) -> None:
+    # An emptied Wells box means "no wells" (m5 §8.8.5); `parse_wells` itself refuses
+    # an empty text, which is right for `smc run scan-plan --param wells=`.
+    page.select_text("A1:A3")
+    assert page.selection == ("A1", "A2", "A3")
+    page.select_text(blank)
+    assert page.selection == ()
+    # And again: nothing selected stays nothing selected, without a refusal.
+    page.select_text(blank)
+    assert page.selection == ()
+
+
+def test_a_text_that_names_no_well_but_is_not_blank_keeps_its_refusal_and_the_selection(
+    page: PlatePage,
+) -> None:
+    # Only a blank text means "no wells": a stray comma is a mistake, and says so.
+    page.select_text("A1,A2")
+    with _refuses(ValueError, "no wells selected"):
+        page.select_text(",")
     assert page.selection == ("A1", "A2")
 
 
@@ -3564,8 +3762,10 @@ def test_the_controller_imports_without_panel() -> None:
         "sys.modules['bokeh'] = None\n"
         "import smc.ui.controller\n"
     )
+    # No `-I`: the interpreter keeps PYTHONPATH, so it imports the code under test
+    # (`scripts/dev/mutant.py` puts a copy's `src` there) and not another checkout's.
     done = subprocess.run(
-        [sys.executable, "-I", "-c", code],
+        [sys.executable, "-c", code],
         capture_output=True,
         text=True,
         encoding="utf-8",

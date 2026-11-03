@@ -29,7 +29,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from importlib.metadata import EntryPoint
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
@@ -81,7 +81,14 @@ from smc.plugins.slots import (
 )
 from smc.run import RunDocument, RunDocumentError, StageRecord, StageStatus
 from smc.ui.frames import Frame
-from smc.ui.guide import CAPTURE_WELLS, SELECT_WELLS, NextStep, command_line, next_slot
+from smc.ui.guide import (
+    CAPTURE_WELLS,
+    DRY_RUN_NO_FRAME,
+    SELECT_WELLS,
+    NextStep,
+    command_line,
+    next_slot,
+)
 
 if TYPE_CHECKING:
     from smc.hardware.microscope import Microscope
@@ -163,6 +170,15 @@ _CARD_CHARS = 80
 #: An assumption and an error are diagnoses whose end often says what to do: they are
 #: cut later than a value (more than twice the longest assumption a plugin writes).
 _CARD_TEXT_CHARS = 600
+
+#: The strip says a finished run's first assumption, cut here: a pointer to the card, which
+#: holds every line at ``_CARD_TEXT_CHARS`` (m5 §8.8.2).
+_STRIP_ASSUMED_CHARS = 160
+
+#: Two reference centres are the same when they differ by at most this: a JSON dump
+#: rounds, and a capture made by hand is never within a hundredth of a micrometre of the
+#: sample's (m5 §8.8.4).
+_SAME_REF_UM = 0.01
 
 #: The keys of a ``done`` result that name a file or a folder the tool wrote: ``scan``'s
 #: ``folder`` and the ``file`` of ``cells``, ``report`` and ``nis-export``. A third party
@@ -517,6 +533,68 @@ def _card(
     )
 
 
+def _sample_refs_text(refs: Sequence[WellRef]) -> str:
+    """Where references that are the profile's ``[sample]``'s come from: the step's line and the card's.
+
+    One text, so that the step before the click and the card after it say the
+    same thing (m5 §8.8.4): the plugin was given the references and cannot tell a
+    synthetic plate's from a measured one, so the page says it.
+    """
+    return (
+        f"refs: the centres of {', '.join(ref.well for ref in refs)} where the "
+        "profile's [sample] puts the plate; this stand's plate is synthetic, so "
+        "they are known, not measured"
+    )
+
+
+def _are_the_refs(found: object, refs: Sequence[WellRef]) -> bool:
+    """Whether ``found``, a record's ``params["refs"]`` as it came, is ``refs`` within ``_SAME_REF_UM``.
+
+    A run document is a file an operator may have edited: anything that is not a
+    list of objects with a text ``well`` and numbers ``x_um`` and ``y_um``, with
+    the wells of ``refs`` and no other, is not the sample's, and is never an
+    exception (FM-125). A flag is not a number.
+    """
+    if not isinstance(found, list) or len(found) != len(refs):
+        return False
+    centres: dict[str, tuple[float, float]] = {}
+    for item in found:
+        if not isinstance(item, dict):
+            return False
+        well = item.get("well")
+        if not isinstance(well, str):
+            return False
+        numbers: list[float] = []
+        for value in (item.get("x_um"), item.get("y_um")):
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                return False
+            numbers.append(value)
+        centres[well] = (numbers[0], numbers[1])
+    return len(centres) == len(refs) and all(
+        ref.well in centres
+        and abs(centres[ref.well][0] - ref.x_um) <= _SAME_REF_UM
+        and abs(centres[ref.well][1] - ref.y_um) <= _SAME_REF_UM
+        for ref in refs
+    )
+
+
+def _assumed_tail(record: StageRecord) -> str:
+    """What the strip adds to a ``done`` run: its first assumption, and how many more the card holds.
+
+    A dry-run ``scan`` ended ``scan done in 0.0 s`` while its record said ``dry run:
+    36 fields walked, no frame taken``, which only the card showed (m5 §8.8.2). The
+    lines are the card's, so they are flat, bounded and never markup (FM-125,
+    FM-139), and empty unless the record ended ``done`` (FM-154).
+    """
+    assumed = _card(record).assumed
+    if not assumed:
+        return ""
+    tail = f"; assumed: {_cut(assumed[0], _STRIP_ASSUMED_CHARS)}"
+    if len(assumed) > 1:
+        tail += f" (+{len(assumed) - 1} more, on the card)"
+    return tail
+
+
 def _open_stand(profile: Profile, dry_run: bool) -> Microscope:
     """What Connect calls when the page was given no opener: ``Microscope.open``.
 
@@ -749,9 +827,18 @@ class PlatePage:
     def select_text(self, text: str) -> None:
         """Replace the selection by the wells ``text`` names (``A1:D6``, ``C*``, ``all``).
 
+        A blank text (empty, or only white space) is the *Wells* box emptied: no
+        wells, so the selection is cleared and nothing is raised (m5 §8.8.5).
+        ``parse_wells`` itself refuses an empty text, which is right for ``smc run
+        scan-plan --param wells=``: that is not a selection but a missing value.
+
         Raises:
-            ValueError: ``parse_wells``' message; the selection is as it was.
+            ValueError: ``parse_wells``' message for any other text that names no
+                well; the selection is as it was.
         """
+        if text.strip() == "":
+            self.selection = ()
+            return
         self.selection = parse_wells(self._plate, text)
 
     def toggle(self, well: str) -> None:
@@ -1058,7 +1145,8 @@ class PlatePage:
         except Exception as exc:
             return f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
         if record.status is StageStatus.done:
-            return f"{plugin} done in {time.monotonic() - started:.1f} s"
+            seconds = time.monotonic() - started
+            return f"{plugin} done in {seconds:.1f} s{_assumed_tail(record)}"
         return f"{plugin} stopped"
 
     def lacks(self, capability: type) -> str | None:
@@ -1910,6 +1998,19 @@ class PlatePage:
         with self._lock:
             self._outcome = outcome
 
+    def clear_outcome(self) -> None:
+        """Forget the last activity's outcome, when no activity goes (m5 §8.8.3).
+
+        The outcome stays on the strip until the next activity replaces it, so that
+        ``cells: ... run scan again`` was still there after the chain had been run
+        from a terminal and the page refreshed. Only the *Refresh* button calls
+        this: ``view()``'s redraw is also what the end of a run triggers, and must
+        not drop the outcome it is about to show. The stop note is not touched.
+        """
+        with self._lock:
+            if self._current_run is None:
+                self._outcome = None
+
     # --- the view ---------------------------------------------------------------
 
     def tools(self) -> tuple[ToolView, ...]:
@@ -2029,6 +2130,7 @@ class PlatePage:
             for tool in self.tools()
             if tool.name in doc.stages
         }
+        cards = self._with_sample_source(doc, cards)
         return PlateView(
             plate=self._plate,
             nominal=nominal,
@@ -2147,6 +2249,22 @@ class PlatePage:
                 why.append(
                     f"wells: the {len(self.selection)} wells selected on the map"
                 )
+        if (
+            stuck is None
+            and self._dry_run
+            and (
+                tool.name == "scan"
+                or (
+                    "scan" in plugins[tool.name].plugin.reads
+                    and "scan" in cards
+                    and cards["scan"].dry_run
+                )
+            )
+        ):
+            # By the plugin's name, not by a capability: `scan-plan` also requires a
+            # camera and computes the same in a dry run. A dry run may read a real
+            # scan, so `cells` is stuck only when the scan it would read was a dry run.
+            stuck = DRY_RUN_NO_FRAME
         suggestion = self._suggested.get(tool.name)
         if suggestion is not None:
             given = [f"{key}={value}" for key, value in suggestion.pairs]
@@ -2201,12 +2319,38 @@ class PlatePage:
         from smc.testing.sample_stand import sample_refs
 
         refs = sample_refs(sample)
-        why.append(
-            f"refs: the centres of {', '.join(ref.well for ref in refs)} where the "
-            "profile's [sample] puts the plate; this stand's plate is synthetic, so "
-            "they are known, not measured"
-        )
+        why.append(_sample_refs_text(refs))
         return self._registration_pairs(refs, ()), None
+
+    def _with_sample_source(
+        self, doc: RunDocument, cards: dict[str, ResultCard]
+    ) -> dict[str, ResultCard]:
+        """``cards``, with the plate card's last ``assumed`` line saying the references are the sample's (m5 §8.8.4).
+
+        Afterwards the card read ``method: references``, ``residual_um: 0`` and
+        nothing about where the references came from. The line is added when the
+        profile has a ``[sample]`` and the record ended ``done`` on this stand with
+        the sample's own references (``_are_the_refs``): captures an operator made
+        are measured, read differently, and never match. ``smc.testing`` is reached
+        only for a profile that names a sample, as in the step (FM-176).
+        """
+        sample = self._profile.sample
+        card = cards.get("plate-registration")
+        record = doc.stages.get("plate-registration")
+        if sample is None or card is None or record is None:
+            return cards
+        if (
+            record.status is not StageStatus.done
+            or record.profile != self._profile.microscope.name
+        ):
+            return cards
+        from smc.testing.sample_stand import sample_refs
+
+        refs = sample_refs(sample)
+        if not _are_the_refs(record.params.get("refs"), refs):
+            return cards
+        said = replace(card, assumed=(*card.assumed, _sample_refs_text(refs)))
+        return {**cards, "plate-registration": said}
 
     # --- internals of the view -----------------------------------------------------
 

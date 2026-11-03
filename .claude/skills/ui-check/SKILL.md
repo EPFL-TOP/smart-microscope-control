@@ -102,7 +102,9 @@ would not choose) is reported as what it shows, not as a defect.
 ## Never
 
 - Run a tool, drive the stage or press STOP through the page; start the page on any
-  other stand, or without `--dry-run`; run two sessions on the same page.
+  other stand, or without `--dry-run` (the one exception is below: a simulated stand
+  in a live walk where the owner wants the Run buttons pressed); run two sessions on
+  the same page.
 - Compare a PNG with another, or put one in a test.
 - Put a browser in `pytest` or in CI.
 
@@ -117,8 +119,20 @@ at coordinates**, and the Wells box was filled by clicking it and typing. The
 chain (`plate-registration`, `scan-plan`, `scan`, `cells`, `density`,
 `route`) ran from a terminal beside the page, as the procedure says, and the
 page was redrawn with Refresh; no Run button was pressed. It found #297 and the
-seven first-run findings on #293. **Every later session adds what it learns
-here** (another MCP, keyboard use, a narrow window, Live, Drive).
+seven first-run findings on #293.
+
+**The walk of 2026-11-03** (Claude in Chrome, macOS, `demo-sample`, `main` at
+9b9cc75, findings on #310): a newcomer's Connect and then the Next step each time, to
+the export, with **the Run buttons pressed** at the owner's request. Screenshots and
+clicks again; the Wells box was filled by **clicking the wells on the map** (B2, B11),
+which the page echoes into the box. The page had been served with `--dry-run`, as the
+guard says, and the path **ended at `cells`**: a dry-run `scan` takes no frame, `cells`
+fails on it, and the step said `cells` again, advice the page cannot follow (#310). The
+page now stops the step at `scan` on a dry run and says why; the guard below is the
+other half of that decision.
+
+**Every later session adds what it learns here** (another MCP, keyboard use, a narrow
+window, Live, Drive).
 
 1. **The owner installs** Claude in Chrome or a Chrome DevTools MCP server on the
    machine. No such MCP is configured today; without one this section does not apply
@@ -133,6 +147,21 @@ here** (another MCP, keyboard use, a narrow window, Live, Drive).
    with `SMC_PROFILE` and `SMC_PROFILES` unset in that shell, and the profile given
    by path: a name is looked up in the working directory. At the end it stops the
    server with SIGINT (never `kill -9`) and reads the exit code.
+
+   **When the owner wants the Run buttons pressed** (a newcomer's walk to the export),
+   serve a profile whose `[micromanager] config` is `""` **without** `--dry-run`: such a
+   profile (`demo.toml`, `demo-sample.toml`) loads only Micro-Manager's own demo
+   devices, so its stage is simulated and there is nothing real to move. In a dry run
+   `scan` takes no frame and the path ends at `cells` (#310). Check it first, with one
+   line of Python in that shell, and read the answer before serving:
+
+   ```text
+   .venv/bin/python -c "from smc.hardware.profile import Profile; print(repr(Profile.load('profiles/demo-sample.toml').micromanager.config))"
+   ```
+
+   (Windows: `.venv\Scripts\python`.) It must print `''`. **Every other profile keeps
+   `--dry-run`**, and so does every walk that only reads: `scripts/dev/ui_snap.py`
+   never presses Run and always serves in dry run.
 3. **It opens `http://localhost:<port>/`**, exactly as the command prints it: the
    websocket accepts `localhost` only, not `127.0.0.1`.
 4. **It drives the page with the MCP's own tools.** What can be inspected: buttons,

@@ -10,6 +10,8 @@ asserted whole (FM-45), and the pairs a step shows are read back through
 
 from __future__ import annotations
 
+import json
+import os
 import shlex
 import subprocess
 import sys
@@ -23,7 +25,7 @@ import pytest
 from pymmcore_plus import CMMCorePlus
 
 from smc.hardware import Microscope
-from smc.hardware.capabilities import XYStage
+from smc.hardware.capabilities import Camera, XYStage
 from smc.hardware.profile import Profile
 from smc.plugins.api import PluginParams, PluginResult, RunContext
 from smc.plugins.params import parse_params
@@ -33,7 +35,7 @@ from smc.run import ReadRecord, RunDocument, StageRecord, StageStatus, write_sta
 from smc.testing import FakeCore
 from smc.testing.sample_stand import sample_refs
 from smc.ui.controller import NOT_CONNECTED, PlatePage
-from smc.ui.guide import CAPTURE_WELLS, SELECT_WELLS
+from smc.ui.guide import CAPTURE_WELLS, DRY_RUN_NO_FRAME, SELECT_WELLS
 
 T0 = datetime(2026, 11, 2, 9, 0, tzinfo=timezone.utc)
 STAND = "demo-sample"
@@ -126,6 +128,12 @@ class ScanPlan(Tool):
     name = provides = "scan-plan"
     Params = ScanPlanParams
     reads = ("plate",)
+
+
+class CameraScanPlan(ScanPlan):
+    """The scan plan as the real one is: it requires the camera, for the pixel size."""
+
+    requires = (Camera,)
 
 
 class Scan(Tool):
@@ -258,6 +266,8 @@ def _seed(
     reads: dict[str, ReadRecord | None] | None = None,
     checkpoint: dict[str, Any] | None = None,
     profile: str = STAND,
+    dry_run: bool = False,
+    params: dict[str, Any] | None = None,
 ) -> None:
     """A record an earlier run of ``plugin`` left; ``minute`` orders the starts and names the attempt."""
     then = T0 + timedelta(minutes=minute)
@@ -272,16 +282,24 @@ def _seed(
             started_utc=then,
             finished_utc=then,
             profile=profile,
-            dry_run=False,
+            dry_run=dry_run,
             smc_version="0",
-            params={},
+            params=params or {},
             result=result,
             checkpoint=checkpoint,
         ),
     )
 
 
-def _plate_done(run_doc: Path, *, minute: int = 0, plate: str = "96-well") -> None:
+def _plate_done(
+    run_doc: Path,
+    *,
+    minute: int = 0,
+    plate: str = "96-well",
+    profile: str = STAND,
+    params: dict[str, Any] | None = None,
+    status: StageStatus = StageStatus.done,
+) -> None:
     """The ``plate`` slot filled, as a registration of an earlier session left it."""
     result = PlateResult(
         plate=plate,
@@ -292,7 +310,40 @@ def _plate_done(run_doc: Path, *, minute: int = 0, plate: str = "96-well") -> No
         scale_error=None,
         n_refs=1,
     ).model_dump(mode="json")
-    _seed(run_doc, "plate-registration", "plate", minute=minute, result=result)
+    _seed(
+        run_doc,
+        "plate-registration",
+        "plate",
+        minute=minute,
+        result=result if status is StageStatus.done else None,
+        profile=profile,
+        params=params,
+        status=status,
+    )
+
+
+def _chain_to_scan(run_doc: Path, *, scan_dry_run: bool | None = None) -> None:
+    """The plate and the scan plan done, and a ``scan`` too when ``scan_dry_run`` is not ``None``.
+
+    Every record read its upstream's current attempt, so none is stale. The scan
+    plan was a dry run when the scan was: a dry run reads what a dry run made.
+    """
+    _plate_done(run_doc)
+    _seed(
+        run_doc,
+        "scan-plan",
+        minute=1,
+        reads={"plate": ReadRecord(plugin="plate-registration", attempt="a0")},
+        dry_run=bool(scan_dry_run),
+    )
+    if scan_dry_run is not None:
+        _seed(
+            run_doc,
+            "scan",
+            minute=2,
+            reads={"scan-plan": ReadRecord(plugin="scan-plan", attempt="a1")},
+            dry_run=scan_dry_run,
+        )
 
 
 def _pairs_of(command: str) -> list[str]:
@@ -396,6 +447,175 @@ def test_the_plate_step_registers_from_the_sample_when_nothing_is_captured(
         "refs: the centres of A1, A12, H1 where the profile's [sample] puts the "
         "plate; this stand's plate is synthetic, so they are known, not measured",
     )
+
+
+# --- the plate card says where its references came from (m5 §8.8.4) -------------------
+
+#: The step's own line, whole: the card says it too, so that one text says it twice.
+SAMPLE_REFS_LINE = (
+    "refs: the centres of A1, A12, H1 where the profile's [sample] puts the plate; "
+    "this stand's plate is synthetic, so they are known, not measured"
+)
+
+
+def _the_samples_refs(profile: Profile) -> list[dict[str, Any]]:
+    """``params["refs"]`` of a registration made from the step: the sample's centres, as JSON."""
+    assert profile.sample is not None
+    return [ref.model_dump(mode="json") for ref in sample_refs(profile.sample)]
+
+
+def test_the_plate_card_says_the_refs_are_the_samples(
+    make_page: Callable[..., PlatePage],
+) -> None:
+    page = make_page(_profile(sample={"rotation_deg": 3.0}))
+    step = page.view().next_step
+    assert step is not None
+    assert step.plugin == "plate-registration"
+    page.run(step.plugin, list(step.params))
+    assert page.join(10.0)
+
+    card = page.view().cards["plate-registration"]
+    assert card.status == "done"
+    assert card.assumed[-1] == SAMPLE_REFS_LINE
+    # The step said it before the click, with the same text.
+    assert step.why[1] == SAMPLE_REFS_LINE
+
+
+def test_the_plate_card_keeps_what_the_result_assumed_and_adds_the_source_last(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    profile = _profile(sample={})
+    result = PlateResult(
+        plate="96-well",
+        a1_center_xy_um=(0.0, 0.0),
+        rotation_deg=0.0,
+        method="references",
+        residual_um=0.0,
+        scale_error=None,
+        n_refs=3,
+        assumed=("pitch taken from the plate type",),
+    ).model_dump(mode="json")
+    _seed(
+        run_doc,
+        "plate-registration",
+        "plate",
+        result=result,
+        params={"refs": _the_samples_refs(profile)},
+    )
+    card = make_page(profile).view().cards["plate-registration"]
+    assert card.assumed == ("pitch taken from the plate type", SAMPLE_REFS_LINE)
+
+
+def test_a_ref_within_the_tolerance_is_still_the_samples(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    profile = _profile(sample={})
+    refs = _the_samples_refs(profile)
+    refs[1]["x_um"] += 0.005  # the tolerance is 0.01 µm: a rounded JSON is the same ref
+    _plate_done(run_doc, params={"refs": refs})
+    card = make_page(profile).view().cards["plate-registration"]
+    assert card.assumed == (SAMPLE_REFS_LINE,)
+
+
+def _moved(refs: list[dict[str, Any]], by_um: float) -> list[dict[str, Any]]:
+    refs[1]["y_um"] += by_um
+    return refs
+
+
+def _moved_x(refs: list[dict[str, Any]], by_um: float) -> list[dict[str, Any]]:
+    # Each axis is compared on its own: a ref moved along x only, with y as it was.
+    refs[1]["x_um"] += by_um
+    return refs
+
+
+def _without_a_key(refs: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
+    del refs[0][key]
+    return refs
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        pytest.param(lambda refs: _moved(refs, 100.0), id="moved-100-um"),
+        pytest.param(lambda refs: _moved(refs, 0.05), id="moved-past-the-tolerance"),
+        pytest.param(lambda refs: _moved_x(refs, 100.0), id="x-moved-100-um"),
+        pytest.param(lambda refs: _moved_x(refs, 0.05), id="x-moved-past-tolerance"),
+        pytest.param(lambda refs: refs[:2], id="one-ref-missing"),
+        pytest.param(lambda refs: [*refs, refs[0]], id="one-ref-more"),
+        pytest.param(lambda refs: [refs[0], refs[0], refs[1]], id="a-well-twice"),
+        pytest.param(lambda refs: [*refs[:2], {**refs[2], "well": "H2"}], id="a-well"),
+        pytest.param(lambda refs: [*refs[:2], 7], id="an-item-that-is-a-number"),
+        pytest.param(lambda refs: [*refs[:2], "H1"], id="an-item-that-is-a-text"),
+        pytest.param(lambda refs: _without_a_key(refs, "x_um"), id="no-x"),
+        pytest.param(lambda refs: _without_a_key(refs, "well"), id="no-well"),
+        pytest.param(lambda refs: [{**refs[0], "y_um": "0"}, *refs[1:]], id="y-text"),
+        pytest.param(lambda refs: [{**refs[0], "y_um": False}, *refs[1:]], id="y-bool"),
+        pytest.param(lambda refs: [{**refs[0], "well": 1}, *refs[1:]], id="well-int"),
+        # Unhashable: used as a dict key, they would raise and `view()` must not.
+        pytest.param(
+            lambda refs: [{**refs[0], "well": ["A1"]}, *refs[1:]], id="well-list"
+        ),
+        pytest.param(
+            lambda refs: [{**refs[0], "well": {"A1": 1}}, *refs[1:]], id="well-obj"
+        ),
+        pytest.param(lambda refs: json.dumps(refs), id="a-text"),
+        pytest.param(lambda refs: {"A1": refs[0]}, id="an-object"),
+        pytest.param(lambda refs: None, id="none"),
+        pytest.param(lambda refs: [], id="empty"),
+    ],
+)
+def test_the_plate_card_says_nothing_of_refs_that_are_not_the_samples(
+    make_page: Callable[..., PlatePage],
+    run_doc: Path,
+    tamper: Callable[[list[dict[str, Any]]], object],
+) -> None:
+    # A1 at the origin: a flag in place of a 0 would equal it, were it taken for a number.
+    profile = _profile(sample={"a1_center_xy_um": [0.0, 0.0]})
+    _plate_done(run_doc, params={"refs": tamper(_the_samples_refs(profile))})
+    view = make_page(profile).view()  # never an exception: the record is read as it is
+    assert view.cards["plate-registration"].assumed == ()
+
+
+def test_the_plate_card_says_nothing_of_a_record_with_no_refs_key(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    _plate_done(run_doc, params={})
+    card = make_page(_profile(sample={})).view().cards["plate-registration"]
+    assert card.assumed == ()
+
+
+def test_the_plate_card_says_nothing_of_a_record_made_on_another_stand(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    profile = _profile(sample={})
+    _plate_done(run_doc, profile="demo", params={"refs": _the_samples_refs(profile)})
+    card = make_page(profile).view().cards["plate-registration"]
+    assert card.assumed == ()
+    assert card.profile == "demo"
+
+
+def test_the_plate_card_says_nothing_of_a_registration_that_did_not_finish(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    profile = _profile(sample={})
+    _plate_done(
+        run_doc,
+        params={"refs": _the_samples_refs(profile)},
+        status=StageStatus.failed,
+    )
+    card = make_page(profile).view().cards["plate-registration"]
+    assert card.status == "failed"
+    assert card.assumed == ()
+
+
+def test_the_plate_card_says_nothing_on_a_profile_with_no_sample(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # The refs are the sample's, but this profile has none: captured by hand, they
+    # are measured, and a stand that is not the demo's never claims otherwise.
+    _plate_done(run_doc, params={"refs": _the_samples_refs(_profile(sample={}))})
+    card = make_page(_profile()).view().cards["plate-registration"]
+    assert card.assumed == ()
 
 
 def test_captures_win_over_the_sample(make_page: Callable[..., PlatePage]) -> None:
@@ -510,6 +730,141 @@ def test_a_selection_on_another_plate_than_the_registered_one_blocks_the_step_wi
         "the registered plate is a 96-well; calibrate the 384-well plate again, "
         "or choose 96-well"
     )
+
+
+# --- a dry-run page does not lead to a dead end (m5 §8.8.1) -----------------------------
+
+
+def test_a_dry_run_page_stops_the_step_at_scan_and_says_why(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    _chain_to_scan(run_doc)
+    profile = _profile(suggest={"scan": {"params": ["label=t1"], "why": "a name"}})
+    step = make_page(profile, dry_run=True).view().next_step
+    assert step is not None
+    assert step.plugin == "scan"
+    assert step.blocked == DRY_RUN_NO_FRAME
+    # The step stops advising; the call stays as the page makes it.
+    assert step.params == ("label=t1",)
+    words = shlex.split(step.command)
+    assert words[:3] == ["smc", "run", "scan"]
+    assert "--dry-run" in words
+    assert _pairs_of(step.command) == ["label=t1"]
+
+
+def test_a_dry_run_page_stops_the_step_at_a_tool_that_reads_a_dry_run_scan(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    _chain_to_scan(run_doc, scan_dry_run=True)
+    page = make_page(dry_run=True)
+    step = page.view().next_step
+    assert step is not None
+    assert step.plugin == "cells"
+    assert step.blocked == DRY_RUN_NO_FRAME
+
+    # The walk's loop: `cells` ran, failed on the missing frame, and the step is
+    # `cells` again. It says why instead of advising a run that cannot work.
+    _seed(
+        run_doc,
+        "cells",
+        minute=3,
+        status=StageStatus.failed,
+        reads={"scan": ReadRecord(plugin="scan", attempt="a2")},
+        dry_run=True,
+    )
+    again = page.view().next_step
+    assert again is not None
+    assert again.plugin == "cells"
+    assert again.why[0] == "the last run of cells ended failed; run it again"
+    assert again.blocked == DRY_RUN_NO_FRAME
+
+
+def test_a_dry_run_page_that_reads_a_real_scan_is_not_stopped(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # A dry run may read a real result: the scan was made in a terminal.
+    _chain_to_scan(run_doc, scan_dry_run=False)
+    step = make_page(dry_run=True).view().next_step
+    assert step is not None
+    assert step.plugin == "cells"
+    assert step.blocked is None
+
+
+def test_a_page_that_is_not_a_dry_run_is_never_stopped_at_scan(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # The newcomer's path: the page served without --dry-run on a simulated stand.
+    _chain_to_scan(run_doc)
+    at_scan = make_page().view().next_step
+    assert at_scan is not None
+    assert at_scan.plugin == "scan"
+    assert at_scan.blocked is None
+
+    _seed(
+        run_doc,
+        "scan",
+        minute=2,
+        reads={"scan-plan": ReadRecord(plugin="scan-plan", attempt="a1")},
+    )
+    at_cells = make_page().view().next_step
+    assert at_cells is not None
+    assert at_cells.plugin == "cells"
+    assert at_cells.blocked is None
+
+
+def test_a_dry_run_page_does_not_stop_a_tool_that_merely_requires_the_camera(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # `scan-plan` requires a camera (for the pixel size) and computes the same in a
+    # dry run: the rule is by the plugin's name, not by a capability (§8.8.1).
+    _plate_done(run_doc)
+    page = make_page(tools=(Registration, CameraScanPlan, Scan, Cells), dry_run=True)
+    page.select_text("B2")
+    step = page.view().next_step
+    assert step is not None
+    assert step.plugin == "scan-plan"
+    assert step.blocked is None
+
+
+def test_a_dry_run_page_does_not_stop_a_tool_that_does_not_read_a_dry_run_scan(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # A dry-run `scan` is in the run document, and the plate was registered again after
+    # it: the step is `scan-plan`, which reads the plate and not the scan. A rule that
+    # stopped every tool while a dry-run scan is there would stop it (§8.8.1).
+    _chain_to_scan(run_doc, scan_dry_run=True)
+    _plate_done(run_doc, minute=10)
+    page = make_page(dry_run=True)
+    page.select_text("B2")
+    step = page.view().next_step
+    assert step is not None
+    assert step.plugin == "scan-plan"
+    assert step.blocked is None
+
+
+def test_a_dry_run_page_with_a_scan_record_and_no_scan_plugin_raises_nothing(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # A `scan` record is in the run document and no plugin named `scan` is registered
+    # (it failed to load, or the document came from another install): there is no card
+    # for it, and `view()` raises nothing (FM-125). `cells` reads a scan it cannot show
+    # was a dry run, so it is not stopped.
+    _chain_to_scan(run_doc, scan_dry_run=True)
+    page = make_page(tools=(Registration, ScanPlan, Cells), dry_run=True)
+    step = page.view().next_step
+    assert step is not None
+    assert step.plugin == "cells"
+    assert step.blocked is None
+
+
+def test_the_stand_not_connected_wins_over_the_dry_run_note(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    _chain_to_scan(run_doc)
+    step = make_page(dry_run=True, connect=False).view().next_step
+    assert step is not None
+    assert step.plugin == "scan"
+    assert step.blocked == NOT_CONNECTED
 
 
 # --- what the profile suggests ----------------------------------------------------------
@@ -821,12 +1176,17 @@ def test_running_the_step_records_the_params_its_command_names(
 def test_a_page_loads_smc_testing_only_for_a_profile_with_a_sample() -> None:
     # `smc.testing` is a stand-in for a stand (FakeCore, a synthetic plate): a real
     # stand's page must not load it, so the controller imports `sample_stand` inside the
-    # step that reads a `[sample]`. In a fresh interpreter, since another test may have
-    # imported it, and with a positive control: the same page does load it for a sample.
+    # step that reads a `[sample]`, and in the card that says where a registration's
+    # references came from (m5 §8.8.4). In a fresh interpreter, since another test may
+    # have imported it, and with a positive control: the same page does load it for a
+    # sample.
     code = (
         "import sys, tempfile\n"
+        "from datetime import datetime, timezone\n"
         "from pathlib import Path\n"
         "from smc.hardware.profile import Profile\n"
+        "from smc.plugins.slots import PlateResult\n"
+        "from smc.run import StageRecord, StageStatus, write_stage\n"
         "from smc.ui.controller import PlatePage\n"
         "with tempfile.TemporaryDirectory() as tmp:\n"
         "    run_doc = Path(tmp) / 'run.json'\n"
@@ -834,6 +1194,19 @@ def test_a_page_loads_smc_testing_only_for_a_profile_with_a_sample() -> None:
         "    step = bare.view().next_step\n"
         "    assert step is not None and step.plugin == 'plate-registration', step\n"
         "    assert 'smc.testing' not in sys.modules, 'loaded without a sample'\n"
+        "    # A registration done on this stand: its card is built, and loads nothing.\n"
+        "    when = datetime(2026, 11, 2, tzinfo=timezone.utc)\n"
+        "    plate = PlateResult(plate='96-well', a1_center_xy_um=(0.0, 0.0),\n"
+        "        rotation_deg=0.0, method='references', residual_um=0.0,\n"
+        "        scale_error=None, n_refs=3)\n"
+        "    write_stage(Path(tmp) / 'cards.json', StageRecord(\n"
+        "        plugin='plate-registration', provides='plate', attempt='a0',\n"
+        "        status=StageStatus.done, started_utc=when, finished_utc=when,\n"
+        "        profile='demo', dry_run=False, smc_version='0', params={'refs': []},\n"
+        "        result=plate.model_dump(mode='json')))\n"
+        "    cards = PlatePage.closed(Profile.demo(), Path(tmp) / 'cards.json').view().cards\n"
+        "    assert cards['plate-registration'].status == 'done', cards\n"
+        "    assert 'smc.testing' not in sys.modules, 'loaded by a plate card'\n"
         "    named = {'microscope': {'name': 's'}, 'sample': {}}\n"
         "    sampled = PlatePage.closed(Profile.model_validate(named), run_doc)\n"
         "    assert sampled.view().next_step is not None\n"
@@ -845,6 +1218,11 @@ def test_a_page_loads_smc_testing_only_for_a_profile_with_a_sample() -> None:
         [sys.executable, "-c", code],
         capture_output=True,
         text=True,
+        # Without `-I` the child honours PYTHONIOENCODING, which a mutant run sets: the
+        # parent must read what the child writes, not the PC's code page.
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         check=False,
         timeout=120,
     )

@@ -19,7 +19,7 @@ import pytest
 
 from smc.hardware.profile import Profile
 from smc.ui.controller import PlatePage
-from smc.ui.guide import SELECT_WELLS
+from smc.ui.guide import DRY_RUN_NO_FRAME, SELECT_WELLS
 
 pytestmark = [
     pytest.mark.demo,
@@ -99,6 +99,52 @@ def test_a_newcomer_reaches_the_export_by_next_steps_alone(
             )
         suffixes = [Path(path).suffix for _key, path in written[1:]]
         assert suffixes[1:] == [".html", ".xml"]  # the report, then the export
+    finally:
+        page.close()
+        page.release()
+
+
+def test_a_dry_run_page_ends_its_next_steps_at_scan_and_says_why(
+    mm_available: bool, tmp_path: Path
+) -> None:
+    # The owner's walk (#310): a page served with --dry-run led the newcomer to `scan`,
+    # which takes no frame in a dry run, then to `cells`, which failed on it, then to
+    # `cells` again. The step now stops at `scan`, before the loop (m5 §8.8.1). The two
+    # runs before it take under a second (measured 2026-11-03, Python 3.13.0), so the
+    # test needs no `scan`.
+    if not mm_available:
+        pytest.skip("Micro-Manager demo adapters not installed")
+    page = PlatePage.closed(
+        Profile.load(DEMO_SAMPLE), tmp_path / "run.json", dry_run=True
+    )
+    try:
+        page.connect()
+        assert page.join(60.0), "connect did not end"
+        assert page.connected, page.status().outcome
+
+        ran: list[str] = []
+        for _walk in range(MAX_WALKS):
+            step = page.view().next_step
+            assert step is not None
+            assert step.plugin is not None, step.why
+            if step.blocked == SELECT_WELLS:
+                page.select_text("B2")
+                continue
+            if step.blocked is not None:
+                break
+            page.run(step.plugin, list(step.params))
+            assert page.join(120.0), f"{step.plugin} did not end"
+            outcome = page.status().outcome
+            assert outcome is not None
+            assert outcome.startswith(f"{step.plugin} done in "), outcome
+            ran.append(step.plugin)
+        else:
+            pytest.fail(f"the next steps did not stop in {MAX_WALKS} walks: {ran}")
+
+        assert ran == ["plate-registration", "scan-plan"]
+        assert step.plugin == "scan"
+        assert step.blocked == DRY_RUN_NO_FRAME
+        assert "--dry-run" in step.command.split()
     finally:
         page.close()
         page.release()

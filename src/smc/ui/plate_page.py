@@ -30,6 +30,7 @@ from __future__ import annotations
 import functools
 import logging
 import math
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -248,12 +249,18 @@ def card_text(card: ResultCard | None, *, stand: str | None = None) -> str:
     return "\n".join(lines)
 
 
-def next_step_text(step: NextStep | None) -> str:
+def next_step_text(step: NextStep | None, *, windows: bool | None = None) -> str:
     """The next step as plain text, for a ``pn.pane.Str``: never markup (FM-139).
 
     With a tool, its name, then each line of ``why`` indented by two spaces and the
     command last. Without one (the workflow is done, or no plugin fills the slot),
     the lines of ``why`` as they are. ``""`` before the first read.
+
+    ``command`` is quoted for a POSIX shell (``shlex.join``), and ``cmd.exe`` and
+    PowerShell 5.1 read quotes differently from each other, so no one quoting is
+    right for a Windows PC (FM-175): a page served there says so under the line, and
+    the button, which makes the same call, is the way on. ``windows`` is ``None`` for
+    "the PC this runs on" and is given by a test (m5 §8.8.6).
     """
     if step is None:
         return ""
@@ -261,6 +268,12 @@ def next_step_text(step: NextStep | None) -> str:
         return "\n".join(step.why)
     lines = [step.plugin, *(f"  {line}" for line in step.why)]
     lines.append(f"  command: {step.command}")
+    if sys.platform == "win32" if windows is None else windows:
+        lines.append(
+            "  that line is quoted for a POSIX shell (bash, zsh); PowerShell and "
+            "cmd.exe read quotes differently: press the button, which makes the "
+            "same call"
+        )
     return "\n".join(lines)
 
 
@@ -503,7 +516,7 @@ class PlatePageView:
         self.select_input.param.watch(
             self._handler(lambda event: self.on_select_text(event.new)), "value"
         )
-        self.refresh_button.on_click(self._handler(lambda event: self.refresh()))
+        self.refresh_button.on_click(self._handler(lambda event: self.on_refresh()))
         self.next_button.on_click(self._handler(lambda event: self.on_next()))
         self.stop_button.on_click(self._handler(lambda event: self.on_stop()))
         self.resume_button.on_click(self._handler(lambda event: self.on_resume()))
@@ -854,14 +867,29 @@ class PlatePageView:
         self.refresh()
         self.tick()
 
+    def on_refresh(self) -> None:
+        """The *Refresh* button: forget the last outcome, then read the run document and the stand again.
+
+        Only the button forgets the strip's outcome (m5 §8.8.3): ``refresh()`` is also
+        what every other handler and the end of a run call, and must not drop the
+        outcome it is about to show. The tick then redraws the strip, so the old
+        text is gone at once and not at the next period.
+        """
+        self.page.clear_outcome()
+        self.refresh()
+        self.tick()
+
     def on_select_text(self, text: str) -> None:
         """A typed range (``A1:D6``): the selection becomes exactly those wells.
 
         The box keeps what was typed: ``_wells_shown`` is the selection the box now
         stands for, so the redraw does not rewrite it. The box's own echo of a click
-        (``_echo_wells``) comes back here, synchronously, and selects nothing.
+        (``_echo_wells``) comes back here, synchronously, and selects nothing: the
+        ``_echoing`` guard alone stops it. A box the operator empties is a blank
+        text, which clears the selection (m5 §8.8.5), and ``_wells_shown`` is then
+        ``()``, so the next click is echoed again.
         """
-        if self._echoing or text.strip() == "":
+        if self._echoing:
             return
         if self._try(lambda: self.page.select_text(text)):
             self._wells_shown = self.page.selection

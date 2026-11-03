@@ -17,6 +17,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import EntryPoint
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, ClassVar, cast
 
 import pytest
@@ -29,6 +30,7 @@ else:
 from bokeh.events import Tap
 from pymmcore_plus import CMMCorePlus
 
+import smc.ui.plate_page as plate_page
 from smc.hardware import Microscope
 from smc.hardware.capabilities import XYStage
 from smc.hardware.profile import Profile
@@ -284,7 +286,8 @@ def test_next_step_text_is_pure_text_in_three_shapes() -> None:
         command="smc run scan-plan --param wells=B2",
         blocked=None,
     )
-    assert next_step_text(with_tool) == (
+    # `windows=False`: the text of a POSIX page, whatever PC runs the test (CI has all three).
+    assert next_step_text(with_tool, windows=False) == (
         "scan-plan\n"
         "  the run document has no scan-plan yet\n"
         "  wells: the 1 wells selected\n"
@@ -295,6 +298,50 @@ def test_next_step_text_is_pure_text_in_three_shapes() -> None:
         None, (), ("every stage of the workflow is done:", "<b>[x]</b>"), "", None
     )
     assert next_step_text(done) == "every stage of the workflow is done:\n<b>[x]</b>"
+
+
+POSIX_ONLY_LINE = (
+    "  that line is quoted for a POSIX shell (bash, zsh); PowerShell and cmd.exe "
+    "read quotes differently: press the button, which makes the same call"
+)
+
+
+def test_next_step_text_says_the_command_is_posix_only_on_windows_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-175: `shlex.join` is POSIX quoting, and no one quoting is right for both
+    # Windows shells, so the page says so under the line instead of guessing (m5 §8.8.6).
+    step = NextStep(
+        plugin="scan-plan",
+        params=("wells=B2",),
+        why=("the run document has no scan-plan yet",),
+        command="smc run scan-plan --param wells=B2",
+        blocked=None,
+    )
+    posix = (
+        "scan-plan\n"
+        "  the run document has no scan-plan yet\n"
+        "  command: smc run scan-plan --param wells=B2"
+    )
+    assert next_step_text(step, windows=False) == posix
+    assert next_step_text(step, windows=True) == f"{posix}\n{POSIX_ONLY_LINE}"
+
+    # Not given, it is the PC the page is served from. Only the page module's view of
+    # `sys` is replaced: the real `sys.platform` is read by pytest and the standard
+    # library while the test runs.
+    for platform, expected in (("win32", True), ("darwin", False), ("linux", False)):
+        monkeypatch.setattr(plate_page, "sys", SimpleNamespace(platform=platform))
+        said = f"{posix}\n{POSIX_ONLY_LINE}" if expected else posix
+        assert next_step_text(step) == said, platform
+        # Given, it wins over the PC, on whichever the test runs: on a Windows PC a
+        # page asked for `windows=False` says nothing, and on another one it can say it.
+        assert next_step_text(step, windows=False) == posix, platform
+        assert next_step_text(step, windows=True) == f"{posix}\n{POSIX_ONLY_LINE}"
+
+    # No tool, no command, no line to say it about.
+    done = NextStep(None, (), ("every stage of the workflow is done:",), "", None)
+    assert next_step_text(done, windows=True) == "every stage of the workflow is done:"
+    assert next_step_text(None, windows=True) == ""
 
 
 # --- the region, its button, and what it runs ------------------------------------------------
@@ -357,6 +404,33 @@ def test_a_click_on_the_next_button_draws_the_run_at_once(
     finally:
         Slow.release.set()
         assert page.join(10.0)
+
+
+def test_the_refresh_button_forgets_the_last_outcome_and_a_redraw_does_not(
+    make_page: Callable[..., PlatePage],
+) -> None:
+    # The walk's strip kept `cells: ... run scan again` after the chain was run in a
+    # terminal and the page refreshed (m5 §8.8.3). Only the button forgets; the redraw
+    # that the end of a run makes must show the outcome it has just got.
+    page = make_page(tools=(Registration, ScanPlan, Slow))
+    view = PlatePageView(page)
+    page.run("slow", [])
+    try:
+        assert Slow.started.wait(5)
+        view.tick()
+    finally:
+        Slow.release.set()
+    assert page.join(10.0)
+    view.tick()  # the tick that sees the run end refreshes the view
+    assert view.run_text.object.startswith("slow done in ")
+    view.refresh()
+    view.tick()
+    assert view.run_text.object.startswith("slow done in ")
+
+    _click(view.refresh_button)
+
+    assert page.status().outcome is None
+    assert view.run_text.object == ""
 
 
 def test_the_next_button_runs_the_pairs_it_drew(
@@ -668,6 +742,67 @@ def test_a_typed_range_stays_as_typed(
     # A later click is another change: the box then says what is selected.
     _tap(view, "B2")
     assert view.select_input.value == "A1,A2,A3,B2"
+
+
+def test_an_emptied_wells_box_clears_the_selection_and_the_box_follows_again(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # The owner's sixth point: an emptied box changed nothing, and then stood for a
+    # selection it no longer showed until the selection changed (m5 §8.8.5). The box
+    # is set by `value=`, the way a session's change arrives (FM-161).
+    _seed_plate(run_doc)
+    page = make_page()
+    view = PlatePageView(page)
+    view.select_input.value = "A1:A3"
+    assert page.selection == ("A1", "A2", "A3")
+
+    view.select_input.value = ""
+
+    assert page.selection == ()
+    assert view.select_input.value == ""
+    assert view.message.object == ""
+    # The next click is a change again: the box follows it.
+    _tap(view, "B2")
+    assert page.selection == ("B2",)
+    assert view.select_input.value == "B2"
+
+
+def test_a_box_of_blanks_clears_the_selection_too(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    _seed_plate(run_doc)
+    page = make_page()
+    view = PlatePageView(page)
+    view.select_input.value = "A1:A3"
+    view.select_input.value = "  "
+    assert page.selection == ()
+    assert view.message.object == ""
+    # As a typed range does, the box keeps what was typed: it stands for no wells.
+    assert view.select_input.value == "  "
+
+
+def test_the_echo_of_an_emptied_selection_does_not_select_again(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # The click that takes the last well off empties the box by the echo; the guard
+    # alone stops that assignment from calling `select_text("")` (it no longer returns
+    # at a blank text, m5 §8.8.5).
+    _seed_plate(run_doc)
+    page = make_page()
+    view = PlatePageView(page)
+    calls: list[str] = []
+    real = page.select_text
+
+    def spy(text: str) -> None:
+        calls.append(text)
+        real(text)
+
+    with _replaced(page, "select_text", spy):
+        _tap(view, "B2")
+        _tap(view, "B2")
+        assert view.select_input.value == ""
+        assert page.selection == ()
+        assert calls == []
 
 
 def test_a_range_that_is_refused_stays_in_the_box_with_the_reason(
