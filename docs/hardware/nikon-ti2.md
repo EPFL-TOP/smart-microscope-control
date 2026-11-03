@@ -1,12 +1,15 @@
-# Nikon Ti2-E — PC survey, session 0 and session 1
+# Nikon Ti2-E — PC survey, sessions 0, 1 and 2
 
-Three visits are curated here. The **PC survey** (2026-09-25, below down to
+Four visits are curated here. The **PC survey** (2026-09-25, below down to
 *Surprises*) read the PC without initialising anything. **Session 0**
 (2026-10-07, state re-read 2026-10-14; [its section](#session-0--the-stand-through-pymmcore))
 initialised the stand through pymmcore and moved nothing. Session 0
 answers most of the survey's surprises; each one says so. **Session 1**
 (2026-10-21 and 2026-10-26, #208; [its section](#session-1--first-moves-contracts-pfs))
 moved the stand through the layer, ran the contracts and read PFS.
+**Session 2** (2026-11-03, #334; [its section](#session-2--a-24-well-plate-at-10-the-reads-the-page))
+put a 24-well plate under the 10× and used the plate page for the first
+time.
 
 Curated by the design session from the raw survey in `local/surveys/nikon-ti2/` (private, never committed)
 (issue #16), collected 2026-09-25 with the hardware connected and the
@@ -574,3 +577,88 @@ whole-unit offset.
   the demo camera.
 - The 40× (factor, lock), what `IntermediateMagnification` reads at 1.0×
   and 1.5×, and the turret block of m2 §8.9.
+
+## Session 2 — a 24-well plate at 10×, the reads, the page
+
+2026-11-03, the owner at the stand, commit `ef866eb`. Report: #334, with
+the raw excerpts. The sample was a 24-well plate with cells, imaged
+through its bottom with the 10× only. The reads went through pymmcore
+directly (a throwaway script, every 10–50 ms). The session ended before
+the 40×, the chain on the plate and NIS-Elements (#198).
+
+### Moves and reads
+
+- **XY and Z moves return only once they have ended**, and busy never
+  reads True: `setXYPosition` 10 mm in 0.59–0.67 s, 1 mm in 0.22–0.25 s;
+  `setPosition(ZDrive)` 50 µm in 0.23–0.35 s. The position reads the
+  target at the first read after the call; landing within 0.1 µm (#221).
+- **Reads cost nothing**: Z, XY, the offset, the lock, `PFS Status` and
+  busy each take 0.00–0.05 ms (a cache in the adapter, inferred).
+- **`Microscope.state()`** takes 0.4 ms idle and 133 ms median, 464 ms
+  at most, while snaps run (a 10 ms exposure; a snap takes 166 ms). The
+  waiting is probably a camera read behind the snap (#333).
+- **The Ctrl-C drill** printed the lines of #206 and #223 (errorlevel
+  130): a Ctrl-C after about 0.5 s let a 20 mm jog run to its end, and one
+  at once moved nothing.
+- **The camera** applied 20 ms as 20 and 12.345 ms as 12.35 (#125).
+
+### The turret block of m2 §8.9
+
+| Read | Result |
+|---|---|
+| Magnifier | `getMagnificationFactor()` reads 1.0 at the lever's 1.0× and 1.5 at 1.5×; the property is `Magnification` (`1.0x`, `1.5x`). The pixel size reads 0 (no preset). |
+| `DiaLamp` `Intensity` | Limits [0, 2100]. A read 0.3 s after a set returns the new value; a read 9 ms after a set returns the **previous** one (#330). |
+| `setConfig("Channel", "BF")` | Returns after **7.1 s**, no device of the preset ever busy. Every value then matches the preset, yet `getCurrentConfig` reads `""`: `Exposure` reads `10.0000` for the preset's `10` (FM-100). |
+| Nosepiece 10× → 4× → 10× | Each `setState` returns after about 1.0 s, never busy. **The stand switched PFS off by itself** (it was on and searching). **Z moved by itself**: 500.0 µm at the call's return (from 561.5), 570.2 µm with the 4× (+8.7 µm), 561.4 µm back with the 10×. A different mechanical noise and a beep (#330). |
+
+### PFS on the plate
+
+- **The stand's button jumped +206.6 µm** (Z 4191.34 → 4397.92 µm, 48 µm
+  past the 4350 µm limit), to the plane of the stored offset 9370: the
+  value session 1 also started from. Nobody noticed until a later command
+  refused. smc's engage refused twice, as designed: outside the soft
+  limits at 4398.14 µm, and at an offset not seen locked at about 4202 µm.
+  The refusal's advice, "switch PFS on with the stand's own controls", is
+  the step that jumped (#331).
+- **The way out**: the button again with Z already in the offset's plane
+  (no jump), then the knob with PFS on until sharp. The offset went
+  9370 → 8141 and Z came back to 4195.26 µm: 6.0 units/µm.
+- **At an offset seen locked**, PFS off for 1 s then on locked after
+  0.016 s and moved Z by 0.00 µm.
+- **Offset moves under lock**: +10 units moved Z 0.00 µm; +50 moved it
+  +5.22 µm (9.6 units/µm), starting 0.47 s after the write and within
+  0.1 µm of its end after 1.18 s; −50 moved it −4.78 µm (10.5), starting
+  after 0.15 s. The round trip left Z 0.44 µm higher (#233).
+- `PFS Status` alternated `…1001` and `…1010` at every read while Z
+  moved, so neither bit means "settled".
+- The 24-well plate focuses at Z 4191–4195 µm at 10×, 155 µm under the
+  limit.
+
+### Contracts
+
+Without autofocus, no sample: 42 passed, 12 skipped (the declared
+refusals and the expected skips), none failed. Autofocus: the first run
+started at Z 4398 and every test failed in its set-up (the stand too
+close to its soft limit); after the knob, 16 passed and 1 skipped (the
+fake-only whole-unit test).
+
+### The page
+
+- Connect, Live (5.9 frames/s at full frame), the drive and *Light off*
+  worked. `↑` (stage +Y) moves the image content up, `→` (+X) right; the
+  owner keeps this convention.
+- **Wall sides are named in the stage frame while the operator reads them
+  on the image.** A one-wall-per-axis seed put B3's centre 15.5 mm off on
+  both axes; snaps of B3's four walls put it at (10267.7, −10038.1) µm,
+  15599 µm wide in X and 15401 µm in Y against a nominal 15600 (#327).
+- A second attempt recorded B3's right wall under B4, and failed. The
+  owner found the page very hard to get to grips with (#332, #328).
+
+### Not settled by session 2
+
+- Which way Z goes, seen from the side (#98: "not visible"), and which way
+  the knob moves Z with PFS on (#208).
+- How a first lock is reached at 40× without the jump (#331), and what a
+  turn does to Z under a plate (#330).
+- The 40×, the chain on the plate, the NIS export (#198); the plate's brand
+  (a marking on one long edge, to read next time).
