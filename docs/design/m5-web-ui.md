@@ -1660,6 +1660,8 @@ them.
      wells selected on the map`. With no selection, `blocked` is
      `SELECT_WELLS`. Any other `ValueError` of `page_params` (a map of another
      plate than the registered one) is `blocked`, with its message.
+   - **A dry-run page** (§8.8.1): `blocked` is `DRY_RUN_NO_FRAME` for `scan`, and
+     for a tool that reads a `scan` that was a dry run.
    - **The profile's suggestion** for the tool, when it is valid (below): its
      pairs follow, and its line is `<pairs joined by a space>: suggested by the
      profile <stand>: <why>`.
@@ -1678,8 +1680,8 @@ them.
 then `--dry-run` when it is one, then `--param <pair>` for each pair. It is
 quoted for a POSIX shell by `shlex.join`, so a JSON value is one
 single-quoted word. How it pastes into PowerShell or `cmd.exe` is not verified
-(§9.1). The run document's record of the run is the reference, whatever shell
-reads the line.
+(§9.1), and a page served on Windows says so under the line (§8.8.6). The run
+document's record of the run is the reference, whatever shell reads the line.
 
 **`run_doc`** is `self._run_doc.absolute()`, which is the path as the command
 was given it, made absolute against the server's working directory. Symbolic
@@ -1780,7 +1782,7 @@ def next_step_text(step: NextStep | None) -> str: ...
 - **`next_step_text`** is pure:
   - `""` for `None`;
   - with a tool: its name, then each `why` line indented by two spaces, then
-    `  command: <command>`;
+    `  command: <command>` (and on Windows one more line, §8.8.6);
   - without a tool: the `why` lines, unindented.
 - **`next_button`**:
   - its label is `Run <plugin>` (`label=`, `color="primary"`, FM-147);
@@ -1810,7 +1812,8 @@ def next_step_text(step: NextStep | None) -> str: ...
   another tab, a plate chosen, a run document read), the box is set to
   `",".join(page.selection)` (`""` for none), and `_wells_shown` follows.
 - The box is set under a guard, `_echoing = True` around the assignment, and
-  `on_select_text` returns at once while it is set.
+  `on_select_text` returns at once while it is set. A box the operator empties
+  clears the selection (§8.8.5).
 - Measured on Panel 1.10.0 / Bokeh 3.10.1 / Python 3.13.0 and Panel 1.9.4 /
   Bokeh 3.9.2 / Python 3.10.10 (2026-11-02, a throwaway script under
   `warnings.simplefilter("error")`):
@@ -1865,6 +1868,140 @@ the sample's three references:
 Every step was `done`. The report is `report/<token>.html` and the export is
 `nis-export/<token>.xml`, both under the run document's folder.
 
+### 8.8 The first run's follow-ups (#310)
+
+Fixed by #310's plan (2026-11-03). The owner's live walk of the first run
+(`demo-sample`, Claude in Chrome, `main` at 9b9cc75, a newcomer's Connect and then the
+next step each time) found what the first run still costs; its findings are
+on #310. What it decides, in the order of their cost:
+
+**8.8.1 A dry-run page does not lead to a dead end.** The documented newcomer
+command has no `--dry-run` (`docs/ui/plate-page.md`); the page of the walk had it
+(the guard of `/ui-check` and of a live walk), and there the step path ended in a
+loop. Reproduced headlessly on `PlatePage.closed(demo-sample, run_doc,
+dry_run=True)` on 2026-11-03 (Python 3.13.0): `plate-registration`, `scan-plan` and
+`scan` are `done`; the scan's card says `(dry run)` and `assumed: dry run: 36
+fields walked, no frame taken`; the step is then `cells`, not blocked, and `cells`
+ends `PluginRunError: cells: the scan has no frame (it was a dry run, or every
+field failed); run scan again without --dry-run`, after which the step is `cells`
+again. That advice cannot be followed from the page, and in a terminal a run that
+is not a dry run refuses what a dry run made (`scan reads scan-plan, but
+scan-plan was a dry run`), so the whole chain starts again at `plate-registration`.
+
+```python
+#: smc/ui/guide.py
+DRY_RUN_NO_FRAME = (
+    "this page is a dry run: scan walks the fields and takes no frame, so cells and "
+    "the tools after it have nothing to read. Serve the page without --dry-run on a "
+    "stand whose stage is simulated (demo-sample), or run the chain with smc run "
+    "from plate-registration, without --dry-run: a run that is not a dry run "
+    "refuses what a dry run made"
+)
+```
+
+- In `PlatePage._next_step`, step 4 gains one row, after the `scan-plan` one and
+  before the profile's suggestion: when the page is a dry run, `stuck` is
+  `DRY_RUN_NO_FRAME` for the tool `scan`, and for any tool whose plugin `reads`
+  `scan` while `cards["scan"]` exists and is a dry run (`ResultCard.dry_run`). A
+  page that reads a `scan` of a terminal run without `--dry-run` is not stuck: a
+  dry run may read a real result. Step 5 is unchanged: `blocked[tool]` wins.
+- The step stops advising; nothing is taken away. The tool's own *Run* button, and
+  so a dry-run `scan` to see the walk, stay as they are. `command:` keeps
+  `--dry-run`, as it is the page's call.
+- **By the plugin's name, not by a capability.** Measured 2026-11-03: `scan` and
+  `scan-plan` both `require` `Camera` (the second for the pixel size) and
+  `scan-plan` computes the same in a dry run, so "requires a camera" does not mean
+  "takes no frame". That `scan` takes none in a dry run is the plugin's own fact
+  (`scan/plugin.py`: `frames=() if ctx.dry_run`), and `_next_step` already names
+  `plate-registration` and `scan-plan` where the page's values differ.
+- The next step of a dry-run page that read a real chain (the walk's Refresh after
+  the terminal chain) is the ordinary one: `route`, then `report`, `nis-export`.
+
+**8.8.2 The strip says what a run assumed.** A dry-run `scan` ended `scan done in
+0.0 s`, and the run document held `assumed: dry run: 36 fields walked, no frame
+taken`, which only its card showed. In `PlatePage._run_plugin`, a record that ended
+`done` gives the outcome `<plugin> done in <s> s` followed by
+`; assumed: <first>` and, with more than one, a space and `(+<n> more, on the card)`.
+The lines are `_card(record).assumed` (flat, bounded, never markup: FM-125, FM-139), the
+first one cut at `_STRIP_ASSUMED_CHARS = 160`. A record with none has the outcome
+it has today. A stopped or failed one never has them (FM-154). Measured on the same
+chain: `scan-plan` has `assumed: no camera calibration for Nikon 10X S Fluor:
+rotation 0 and no mirror assumed`, so the strip says that too.
+
+**8.8.3 The strip no longer keeps an old error after a Refresh.** The outcome of
+the last activity stays on the strip until the next activity replaces it, so that
+`cells: PluginRunError: ... run scan again without --dry-run` was still there after
+the chain had been run from a terminal and the page refreshed. `PlatePage.clear_outcome()`
+sets `_outcome` to `None` under `_lock` when no activity goes (`_current_run is
+None`), and does nothing otherwise. **Only the *Refresh* button** calls it, then
+`refresh()` and `tick()`: `refresh()` itself is called by every other handler and by
+the tick when a run ends, and must not drop the outcome it is about to show. The
+stop note and the drive's kept outcome are not touched.
+
+**8.8.4 The plate card says where its references came from.** The step says `known,
+not measured` before the click; afterwards the card read `method: references`,
+`residual_um: 0` and no `assumed:` line, because the plugin was given three
+references and cannot tell a synthetic plate's from a measured one. In `view()`,
+after the cards are built, the card of `plate-registration` gets one more
+`assumed` line, last, when **all** of these hold: the profile has a `[sample]`; the
+record is `done`, was made on this stand (`record.profile` is the stand's name) and
+its `params["refs"]` are the sample's own: the same wells as `sample_refs(sample)`,
+each centre within 0.01 µm (the record is read as it comes, FM-125: anything that is
+not a list of objects with a text `well` and numbers `x_um` and `y_um` is not the
+sample's). The line is the step's own, so that one text says it twice:
+
+```text
+refs: the centres of A1, A12, H1 where the profile's [sample] puts the plate; this stand's plate is synthetic, so they are known, not measured
+```
+
+The text is built by one function that `_registration_step` and the card share.
+`smc.testing.sample_stand` is imported inside the function and only when
+`profile.sample` is not `None`, as in §8.2: a real stand never loads it. Captures
+the operator made are measured and read differently from the sample's, so they
+never match.
+
+**8.8.5 The Wells box emptied clears the selection.** A box the operator empties
+changed nothing (`on_select_text` returned at once on an empty text, because
+`select_text("")` raises `no wells selected`, measured 2026-11-03), and the box then
+stood for a selection it no longer showed until the selection changed. Now
+`PlatePage.select_text` takes a blank text (empty or only white space) as "no
+wells": `selection` becomes `()` and nothing is raised. `on_select_text` no longer
+returns on a blank text; the `_echoing` guard alone stops the echo of the box's own
+assignment. After a blank text `_wells_shown` is `()`, so the next click echoes
+again. A text that does not parse (`Z99`) keeps its refusal and the old selection.
+
+**8.8.6 The command on Windows.** FM-175: `shlex.join` is POSIX quoting; no
+Windows shell was at hand (this session was on macOS), and `cmd.exe` and
+PowerShell 5.1 read quotes differently from each other, so no one quoting is right for
+both. The page does not guess one; it says so. `next_step_text` gains a keyword:
+
+```python
+def next_step_text(step: NextStep | None, *, windows: bool | None = None) -> str: ...
+```
+
+`windows=None` is `sys.platform == "win32"`; a test passes it. With a tool and
+`windows` true, one more line follows the `command:` line, indented like it:
+
+```text
+  that line is quoted for a POSIX shell (bash, zsh); PowerShell and cmd.exe read quotes differently: press the button, which makes the same call
+```
+
+`command_line` and `NextStep` do not change here (§10.5 gives `command_line` a
+`preset` keyword, a separate change). A paste that fails fails loudly; the
+line says why before it does. What the PC's shells do with it stays in §9.1.
+
+**8.8.7 What this does not do.** The map does not draw the scan plan's fields
+(finding 4, #320); a file's path is still text, not a link (§8.6 decided it); the
+`dry_run: true` that `route`, `report` and `nis-export` record while writing complete
+files is harmless today and is not changed; Bokeh's `AssertionError` in
+`on_close` seen once at a closing tab is not reproduced and not handled here.
+
+**8.8.8 Tests and failure modes.** The tests are named in #310's plan.
+**Failure modes**: FM-98, FM-125, FM-139, FM-145 and FM-151 (the step and the cards
+are built by `view()`, never by the tick), FM-154, FM-161 (the blank box and the
+Refresh button reach their handler through a session), FM-169, FM-171, FM-175,
+FM-176, FM-43.
+
 ## 9. Sequencing
 
 1. **#28** first and alone: it fixes the one-activity rule, `Frame` and the
@@ -1883,9 +2020,13 @@ Every step was `done`. The report is `report/<token>.html` and the export is
    `_dry_run`, and its step carries #252's checkpoint refusal. It edits
    `controller.py`, `plate_page.py`, `profile.py` and `sample_stand.py`, so
    #251, #287, #295 and #297 run before it or after it, never alongside.
-6. **#319** (presets, §10) edits `controller.py`, `plate_page.py`, `guide.py`,
+6. **#310** after #293 (PR #309) and #317: it edits `controller.py`, `plate_page.py`
+   and `guide.py` (§8.8), so no other issue that edits them runs at the same time;
+   #320 (the scan plan on the map) comes after it.
+7. **#319** (presets, §10) edits `controller.py`, `plate_page.py`, `guide.py`,
    `cli.py`, `profile.py`, `document.py` and `runner.py`: no other issue that
-   edits one of them runs at the same time.
+   edits one of them runs at the same time, #310 included (one before the other,
+   never alongside).
 
 ### 9.1 Not verified (for the owner)
 
@@ -1930,9 +2071,15 @@ Every step was `done`. The report is `report/<token>.html` and the export is
   - a newcomer follows the next step on `demo-sample`, from Connect to the
     export, in a browser, with no terminal and no documentation open;
   - the step's command pasted into PowerShell and `cmd.exe` (it is quoted for a
-    POSIX shell);
-  - the *Wells* box set by a redraw while the operator types in it;
-  - the wrapped cards and the step's region on the PC's screen and over RDP.
+    POSIX shell; the page says so on Windows, §8.8.6, and what the Windows shells
+    do with it is still not run);
+  - the *Wells* box set by a redraw while the operator types in it, and emptied
+    by the operator in a real browser (§8.8.5);
+  - the wrapped cards and the step's region on the PC's screen and over RDP;
+  - the owner's walk with Live, Drive, the keyboard alone and a narrow window
+    (the walk of #310 pressed none of them);
+  - the strip's `assumed:` tail and the Refresh that clears the outcome (§8.8.2,
+    §8.8.3) looked at in a browser: `/ui-check` never presses a Run button.
 - **Presets (§10)**:
   - the owner's own assay saved, then loaded on another day, at a stand;
   - a preset saved from the service (§7.4) into the profile's folder: whether
