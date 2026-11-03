@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import subprocess
 import sys
 import threading
@@ -668,7 +669,15 @@ def test_a_stand_without_a_sample_never_imports_the_sample_stand() -> None:
     # No `-I`: the interpreter keeps PYTHONPATH, so it imports the code under test
     # (`scripts/dev/mutant.py` puts a copy's `src` there) and not another checkout's.
     done = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, check=False
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        # Without `-I` the child honours PYTHONIOENCODING, which a mutant run sets: the
+        # parent must read what the child writes, not the PC's code page.
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+        check=False,
     )
     assert done.returncode == 0, done.stderr
 

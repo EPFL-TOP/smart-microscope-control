@@ -14,6 +14,16 @@ PLUGINS = SMC / "plugins"
 STAND_INS = ("testing", "plugins")
 
 
+def _package_of(path: Path) -> list[str]:
+    """The dotted package a relative import in ``path`` is resolved against: the directory it is in.
+
+    ``with_suffix("")`` leaves ``__init__`` as the last part of a package's own file,
+    and it is dropped like the module's name: ``smc/ui/__init__.py`` and
+    ``smc/ui/controller.py`` are both in ``smc.ui``.
+    """
+    return list(path.relative_to(SMC.parent).with_suffix("").parts)[:-1]
+
+
 def test_version_is_exposed() -> None:
     assert smc.__version__
     assert smc.__version__ != "0.0.0+unknown"
@@ -123,12 +133,10 @@ def test_no_plugin_imports_smc_testing() -> None:
     assert len(files) > 10  # a glob that finds nothing would pass by not looking
     offenders = []
     for path in files:
-        parts = list(path.relative_to(PLUGINS.parent.parent).with_suffix("").parts)
-        package = parts if path.name == "__init__.py" else parts[:-1]
         source = path.read_text(encoding="utf-8")
         offenders += [
             f"{path.relative_to(PLUGINS)}:{line}"
-            for line in _lines_importing_smc_testing(source, package)
+            for line in _lines_importing_smc_testing(source, _package_of(path))
         ]
     assert offenders == []
 
@@ -168,6 +176,42 @@ def test_the_module_level_import_check_leaves_an_import_inside_a_function_alone(
     assert _module_level_lines_importing_smc_testing(source, ["smc", "ui"]) == []
 
 
+@pytest.mark.parametrize(
+    ("relative", "package"),
+    [
+        ("ui/controller.py", ["smc", "ui"]),
+        ("ui/__init__.py", ["smc", "ui"]),
+        ("__init__.py", ["smc"]),
+        ("plugins/cells/plugin.py", ["smc", "plugins", "cells"]),
+        ("plugins/cells/__init__.py", ["smc", "plugins", "cells"]),
+    ],
+)
+def test_the_package_of_a_file_is_the_directory_it_is_in(
+    relative: str, package: list[str]
+) -> None:
+    assert _package_of(SMC / relative) == package
+
+
+@pytest.mark.parametrize(
+    ("relative", "source"),
+    [
+        ("__init__.py", "from .testing import FakeCore"),
+        ("__init__.py", "from . import testing"),
+        ("ui/__init__.py", "from ..testing import FakeCore"),
+        ("ui/__init__.py", "from .. import testing"),
+        ("ui/controller.py", "from ..testing import FakeCore"),
+        ("hardware/backends/__init__.py", "from ...testing import FakeCore"),
+    ],
+)
+def test_the_module_level_import_check_sees_a_relative_hoist_in_a_packages_init(
+    relative: str, source: str
+) -> None:
+    # Relative re-exports are what an `__init__.py` is made of: the package that the
+    # rule resolves them against is that of the file's own directory (FM-43, FM-176).
+    package = _package_of(SMC / relative)
+    assert _module_level_lines_importing_smc_testing(source, package) != []
+
+
 def test_no_module_loads_smc_testing_at_import() -> None:
     # `smc.testing` stands in for a stand (FakeCore, a synthetic plate): a module that
     # loads it when it is imported loads it on every real stand, however it is used
@@ -182,11 +226,11 @@ def test_no_module_loads_smc_testing_at_import() -> None:
     assert len(files) > 20  # a glob that finds nothing would pass by not looking
     offenders = []
     for path in files:
-        parts = list(path.relative_to(SMC.parent).with_suffix("").parts)
-        package = parts if path.name == "__init__.py" else parts[:-1]
         source = path.read_text(encoding="utf-8")
         offenders += [
             f"{path.relative_to(SMC)}:{line}"
-            for line in _module_level_lines_importing_smc_testing(source, package)
+            for line in _module_level_lines_importing_smc_testing(
+                source, _package_of(path)
+            )
         ]
     assert offenders == []

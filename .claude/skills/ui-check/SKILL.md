@@ -159,9 +159,9 @@ window, Live, Drive).
    .venv/bin/python -c "from smc.hardware.profile import Profile; print(repr(Profile.load('profiles/demo-sample.toml').micromanager.config))"
    ```
 
-   It must print `''`. **Every other profile keeps `--dry-run`**, and so does every
-   walk that only reads: `scripts/dev/ui_snap.py` never presses Run and always serves
-   in dry run.
+   (Windows: `.venv\Scripts\python`.) It must print `''`. **Every other profile keeps
+   `--dry-run`**, and so does every walk that only reads: `scripts/dev/ui_snap.py`
+   never presses Run and always serves in dry run.
 3. **It opens `http://localhost:<port>/`**, exactly as the command prints it: the
    websocket accepts `localhost` only, not `127.0.0.1`.
 4. **It drives the page with the MCP's own tools.** What can be inspected: buttons,

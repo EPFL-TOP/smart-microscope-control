@@ -333,6 +333,10 @@ def test_next_step_text_says_the_command_is_posix_only_on_windows_only(
         monkeypatch.setattr(plate_page, "sys", SimpleNamespace(platform=platform))
         said = f"{posix}\n{POSIX_ONLY_LINE}" if expected else posix
         assert next_step_text(step) == said, platform
+        # Given, it wins over the PC, on whichever the test runs: on a Windows PC a
+        # page asked for `windows=False` says nothing, and on another one it can say it.
+        assert next_step_text(step, windows=False) == posix, platform
+        assert next_step_text(step, windows=True) == f"{posix}\n{POSIX_ONLY_LINE}"
 
     # No tool, no command, no line to say it about.
     done = NextStep(None, (), ("every stage of the workflow is done:",), "", None)

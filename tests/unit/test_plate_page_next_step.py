@@ -11,6 +11,7 @@ asserted whole (FM-45), and the pairs a step shows are read back through
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -521,6 +522,12 @@ def _moved(refs: list[dict[str, Any]], by_um: float) -> list[dict[str, Any]]:
     return refs
 
 
+def _moved_x(refs: list[dict[str, Any]], by_um: float) -> list[dict[str, Any]]:
+    # Each axis is compared on its own: a ref moved along x only, with y as it was.
+    refs[1]["x_um"] += by_um
+    return refs
+
+
 def _without_a_key(refs: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
     del refs[0][key]
     return refs
@@ -531,6 +538,8 @@ def _without_a_key(refs: list[dict[str, Any]], key: str) -> list[dict[str, Any]]
     [
         pytest.param(lambda refs: _moved(refs, 100.0), id="moved-100-um"),
         pytest.param(lambda refs: _moved(refs, 0.05), id="moved-past-the-tolerance"),
+        pytest.param(lambda refs: _moved_x(refs, 100.0), id="x-moved-100-um"),
+        pytest.param(lambda refs: _moved_x(refs, 0.05), id="x-moved-past-tolerance"),
         pytest.param(lambda refs: refs[:2], id="one-ref-missing"),
         pytest.param(lambda refs: [*refs, refs[0]], id="one-ref-more"),
         pytest.param(lambda refs: [refs[0], refs[0], refs[1]], id="a-well-twice"),
@@ -542,6 +551,13 @@ def _without_a_key(refs: list[dict[str, Any]], key: str) -> list[dict[str, Any]]
         pytest.param(lambda refs: [{**refs[0], "y_um": "0"}, *refs[1:]], id="y-text"),
         pytest.param(lambda refs: [{**refs[0], "y_um": False}, *refs[1:]], id="y-bool"),
         pytest.param(lambda refs: [{**refs[0], "well": 1}, *refs[1:]], id="well-int"),
+        # Unhashable: used as a dict key, they would raise and `view()` must not.
+        pytest.param(
+            lambda refs: [{**refs[0], "well": ["A1"]}, *refs[1:]], id="well-list"
+        ),
+        pytest.param(
+            lambda refs: [{**refs[0], "well": {"A1": 1}}, *refs[1:]], id="well-obj"
+        ),
         pytest.param(lambda refs: json.dumps(refs), id="a-text"),
         pytest.param(lambda refs: {"A1": refs[0]}, id="an-object"),
         pytest.param(lambda refs: None, id="none"),
@@ -807,6 +823,37 @@ def test_a_dry_run_page_does_not_stop_a_tool_that_merely_requires_the_camera(
     step = page.view().next_step
     assert step is not None
     assert step.plugin == "scan-plan"
+    assert step.blocked is None
+
+
+def test_a_dry_run_page_does_not_stop_a_tool_that_does_not_read_a_dry_run_scan(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # A dry-run `scan` is in the run document, and the plate was registered again after
+    # it: the step is `scan-plan`, which reads the plate and not the scan. A rule that
+    # stopped every tool while a dry-run scan is there would stop it (§8.8.1).
+    _chain_to_scan(run_doc, scan_dry_run=True)
+    _plate_done(run_doc, minute=10)
+    page = make_page(dry_run=True)
+    page.select_text("B2")
+    step = page.view().next_step
+    assert step is not None
+    assert step.plugin == "scan-plan"
+    assert step.blocked is None
+
+
+def test_a_dry_run_page_with_a_scan_record_and_no_scan_plugin_raises_nothing(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # A `scan` record is in the run document and no plugin named `scan` is registered
+    # (it failed to load, or the document came from another install): there is no card
+    # for it, and `view()` raises nothing (FM-125). `cells` reads a scan it cannot show
+    # was a dry run, so it is not stopped.
+    _chain_to_scan(run_doc, scan_dry_run=True)
+    page = make_page(tools=(Registration, ScanPlan, Cells), dry_run=True)
+    step = page.view().next_step
+    assert step is not None
+    assert step.plugin == "cells"
     assert step.blocked is None
 
 
@@ -1171,6 +1218,11 @@ def test_a_page_loads_smc_testing_only_for_a_profile_with_a_sample() -> None:
         [sys.executable, "-c", code],
         capture_output=True,
         text=True,
+        # Without `-I` the child honours PYTHONIOENCODING, which a mutant run sets: the
+        # parent must read what the child writes, not the PC's code page.
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         check=False,
         timeout=120,
     )
