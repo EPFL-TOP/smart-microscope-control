@@ -265,6 +265,28 @@ class Saves(Slow):
             ctx.wait_s(0.05)
 
 
+class Assuming(Stub):
+    """Ends ``done`` with the ``assumed`` lines a test sets in ``assumed``, as ``scan-plan`` does."""
+
+    name = provides = "assuming"
+    assumed: ClassVar[tuple[str, ...]] = ()
+
+    def run(self, microscope: Any, params: StubParams, ctx: RunContext) -> StubResult:
+        return StubResult(assumed=Assuming.assumed)
+
+
+class SavesAssuming(Saves):
+    """Saves a checkpoint that holds an assumption, then waits for the stop."""
+
+    name = provides = "saves-assuming"
+
+    def run(self, microscope: Any, params: NoParams, ctx: RunContext) -> StubResult:
+        ctx.save_checkpoint(StubResult(n=1, assumed=("a guess",)))
+        Slow.started.set()
+        while True:
+            ctx.wait_s(0.05)
+
+
 class StubScan(Stub):
     """Registered as ``scan``, and needs an XY stage."""
 
@@ -290,6 +312,7 @@ def _fresh_state() -> Iterator[None]:
     """The stubs' class-level Events and logs are new for every test, and released after it."""
     Stub.seen = []
     StubGoto.ran = []
+    Assuming.assumed = ()
     Failing.raised = []
     Slow.started = threading.Event()
     Slow.release = threading.Event()
@@ -726,6 +749,110 @@ def test_a_run_that_stops_on_its_own_page_blocks_the_next_click(
         assert page.status().outcome == f"saves: {_checkpoint_text('saves', 'stopped')}"
         assert run_doc.read_bytes() == stopped
         assert page.activities_ended == 1
+    finally:
+        page.close()
+
+
+# --- the strip says what a run assumed (m5 §8.8.2) ---------------------------------------
+
+
+def test_a_done_run_says_its_first_assumption_on_the_strip(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    Assuming.assumed = ("first line", "second line")
+    page = _page(fake_microscope, run_doc, [_ep(Assuming)])
+    try:
+        _run_and_join(page, "assuming")
+        outcome = page.status().outcome
+        assert outcome is not None
+        assert re.fullmatch(
+            r"assuming done in \d+\.\d s; assumed: first line \(\+1 more, on the card\)",
+            outcome,
+        ), outcome
+        # The card holds all of them: the strip is a pointer, not a copy.
+        assert page.view().cards["assuming"].assumed == ("first line", "second line")
+    finally:
+        page.close()
+
+
+def test_a_done_run_with_one_assumption_does_not_count_more(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    Assuming.assumed = ("only line",)
+    page = _page(fake_microscope, run_doc, [_ep(Assuming)])
+    try:
+        _run_and_join(page, "assuming")
+        outcome = page.status().outcome
+        assert outcome is not None
+        assert re.fullmatch(
+            r"assuming done in \d+\.\d s; assumed: only line", outcome
+        ), outcome
+    finally:
+        page.close()
+
+
+def test_a_done_run_with_no_assumption_has_the_outcome_it_had(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _page(fake_microscope, run_doc, [_ep(Assuming)])
+    try:
+        _run_and_join(page, "assuming")
+        outcome = page.status().outcome
+        assert outcome is not None
+        assert re.fullmatch(r"assuming done in \d+\.\d s", outcome), outcome
+    finally:
+        page.close()
+
+
+def test_a_long_assumption_is_cut_on_the_strip(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    Assuming.assumed = ("a" * 400,)
+    page = _page(fake_microscope, run_doc, [_ep(Assuming)])
+    try:
+        _run_and_join(page, "assuming")
+        outcome = page.status().outcome
+        assert outcome is not None
+        assert re.fullmatch(
+            rf"assuming done in \d+\.\d s; assumed: {'a' * 160}…", outcome
+        ), outcome
+        # The card is cut later: the strip's cut loses nothing the card holds.
+        assert page.view().cards["assuming"].assumed == ("a" * 400,)
+    finally:
+        page.close()
+
+
+def test_an_assumption_with_a_line_break_is_one_line_on_the_strip(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    Assuming.assumed = ("pixel size\ntaken as given",)
+    page = _page(fake_microscope, run_doc, [_ep(Assuming)])
+    try:
+        _run_and_join(page, "assuming")
+        outcome = page.status().outcome
+        assert outcome is not None
+        assert "\n" not in outcome
+        assert outcome.endswith("; assumed: pixel size taken as given"), outcome
+    finally:
+        page.close()
+
+
+def test_a_stopped_or_failed_run_never_carries_an_assumption(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # A stopped run's checkpoint holds an assumption, and a failed run's error is its
+    # own text: neither is a result, so the strip says no assumption (FM-154).
+    page = _page(fake_microscope, run_doc, [_ep(SavesAssuming)])
+    try:
+        page.run("saves-assuming", [])
+        assert Slow.started.wait(5)
+        page.stop()
+        assert page.join(10.0)
+        assert page.status().outcome == "saves-assuming stopped"
+        _run_and_join(page, "failing")
+        outcome = page.status().outcome
+        assert outcome is not None
+        assert "assumed" not in outcome, outcome
     finally:
         page.close()
 

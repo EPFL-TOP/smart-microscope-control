@@ -171,6 +171,10 @@ _CARD_CHARS = 80
 #: cut later than a value (more than twice the longest assumption a plugin writes).
 _CARD_TEXT_CHARS = 600
 
+#: The strip says a finished run's first assumption, cut here: a pointer to the card, which
+#: holds every line at ``_CARD_TEXT_CHARS`` (m5 §8.8.2).
+_STRIP_ASSUMED_CHARS = 160
+
 #: The keys of a ``done`` result that name a file or a folder the tool wrote: ``scan``'s
 #: ``folder`` and the ``file`` of ``cells``, ``report`` and ``nis-export``. A third party
 #: that follows the convention is shown the same way (m5 §8.4).
@@ -522,6 +526,23 @@ def _card(
         stale=stale and record.status is StageStatus.done,
         files=tuple(files),
     )
+
+
+def _assumed_tail(record: StageRecord) -> str:
+    """What the strip adds to a ``done`` run: its first assumption, and how many more the card holds.
+
+    A dry-run ``scan`` ended ``scan done in 0.0 s`` while its record said ``dry run:
+    36 fields walked, no frame taken``, which only the card showed (m5 §8.8.2). The
+    lines are the card's, so they are flat, bounded and never markup (FM-125,
+    FM-139), and empty unless the record ended ``done`` (FM-154).
+    """
+    assumed = _card(record).assumed
+    if not assumed:
+        return ""
+    tail = f"; assumed: {_cut(assumed[0], _STRIP_ASSUMED_CHARS)}"
+    if len(assumed) > 1:
+        tail += f" (+{len(assumed) - 1} more, on the card)"
+    return tail
 
 
 def _open_stand(profile: Profile, dry_run: bool) -> Microscope:
@@ -1065,7 +1086,8 @@ class PlatePage:
         except Exception as exc:
             return f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
         if record.status is StageStatus.done:
-            return f"{plugin} done in {time.monotonic() - started:.1f} s"
+            seconds = time.monotonic() - started
+            return f"{plugin} done in {seconds:.1f} s{_assumed_tail(record)}"
         return f"{plugin} stopped"
 
     def lacks(self, capability: type) -> str | None:
