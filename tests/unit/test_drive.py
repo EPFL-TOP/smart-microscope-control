@@ -29,6 +29,7 @@ from smc.hardware.capabilities import (
     ZStage,
 )
 from smc.hardware.errors import HardwareError, SafetyRefusedError
+from smc.hardware.microscope import MicroscopeState, autofocus_known, describe_autofocus
 from smc.hardware.profile import Profile
 from smc.hardware.roles import Role
 from smc.testing import FakeCore
@@ -215,6 +216,48 @@ def test_jog_z_text_is_the_position_the_drive_returns(
     assert drive.jog_z(fake_microscope, 2.5) == DriveResult("Z -5.00 µm")
 
 
+def test_move_xy_and_move_z_say_what_the_jogs_say(
+    fake_microscope: Microscope, dry: Microscope
+) -> None:
+    # The same landing, the same words: one helper builds the text of the four
+    # moves, so the dry-run tail is written once (m5 §6.1).
+    moved = drive.move_xy(fake_microscope, 10.0, -20.0)
+    fake_microscope.require(XYStage).move_to_um(0.0, 0.0)
+    assert moved == drive.jog_xy(fake_microscope, 10.0, -20.0)
+    assert moved == DriveResult("XY (10.00, -20.00) µm")
+
+    moved_z = drive.move_z(fake_microscope, 5.0)
+    fake_microscope.require(ZStage).move_to_um(0.0)
+    assert moved_z == drive.jog_z(fake_microscope, 5.0)
+    assert moved_z == DriveResult("Z 5.00 µm")
+
+    assert drive.move_xy(dry, 10.0, -20.0) == drive.jog_xy(dry, 10.0, -20.0)
+    assert drive.move_z(dry, 5.0) == drive.jog_z(dry, 5.0)
+
+
+def test_move_xy_text_is_the_position_the_stage_returns(
+    fake_microscope: Microscope,
+) -> None:
+    fake_microscope.override(XYStage, LandsElsewhere())
+
+    # Where the stage says it landed, not where it was asked to go (FM-155).
+    assert drive.move_xy(fake_microscope, 100.0, 100.0) == DriveResult(
+        "XY (0.00, 100.00) µm"
+    )
+
+
+def test_move_xy_and_move_z_are_absolute_and_the_stand_goes_there(
+    fake_microscope: Microscope,
+) -> None:
+    drive.move_xy(fake_microscope, 300.0, -400.0)
+    drive.move_z(fake_microscope, 12.5)
+    drive.move_xy(fake_microscope, 300.0, -400.0)
+
+    state = fake_microscope.state()
+    assert state.xy == XY(300.0, -400.0)
+    assert state.z_um == 12.5
+
+
 def test_the_formatters_show_minus_zero_as_zero() -> None:
     assert drive.um_text(-0.004) == "0.00"
     assert drive.um_text(-0.005) == "-0.01"
@@ -231,6 +274,16 @@ _DRY_RUN_CASES: list[tuple[str, Callable[[Microscope], DriveResult], str]] = [
     (
         "jog_z",
         lambda m: drive.jog_z(m, 5.0),
+        "[dry-run] would move to Z 5.00 µm; the drive is at Z 0.00 µm",
+    ),
+    (
+        "move_xy",
+        lambda m: drive.move_xy(m, 10.0, -20.0),
+        "[dry-run] would move to XY (10.00, -20.00) µm; the stage is at XY (0.00, 0.00) µm",
+    ),
+    (
+        "move_z",
+        lambda m: drive.move_z(m, 5.0),
         "[dry-run] would move to Z 5.00 µm; the drive is at Z 0.00 µm",
     ),
     (
@@ -443,6 +496,7 @@ def test_drive_reaches_the_stand_only_through_the_facade() -> None:
     }
     assert imported == {
         "__future__",
+        "collections.abc",
         "dataclasses",
         "typing",
         "smc.hardware.capabilities",
@@ -515,4 +569,109 @@ def test_an_autofocus_that_cannot_be_read_says_why(
         "autofocus ? (autofocus: HardwareError: autofocus 'PFS': cannot read)",
         reached=False,
     )
-    assert drive.autofocus_text(fake_microscope) == result.text
+    reading = drive.read_autofocus(fake_microscope)
+    assert reading == drive.AutofocusReading(result.text, None, False)
+
+
+def test_an_engage_that_did_not_lock_on_an_autofocus_that_cannot_be_read_does_not_say_off(
+    fake_microscope: Microscope,
+) -> None:
+    # FM-155: an unreadable autofocus that did not lock may still be searching and
+    # driving Z; "it is off" is only for a state that read as off.
+    fake_microscope.override(Autofocus, ReadsFail())
+
+    result = drive.engage_autofocus(fake_microscope)
+
+    assert result == DriveResult(
+        "autofocus did not lock; "
+        "autofocus ? (autofocus: HardwareError: autofocus 'PFS': cannot read)",
+        reached=False,
+    )
+
+
+class ReadsFailOverTwoLines(NeverLocks):
+    """An autofocus whose driver's message spans two lines, as a vendor's can."""
+
+    def is_engaged(self) -> bool:
+        raise HardwareError("line one\nline two")
+
+    def is_locked(self) -> bool:
+        raise HardwareError("line one\nline two")
+
+
+def test_an_autofocus_cause_reaches_the_text_on_one_line(
+    fake_microscope: Microscope,
+) -> None:
+    fake_microscope.override(Autofocus, ReadsFailOverTwoLines())
+
+    reading = drive.read_autofocus(fake_microscope)
+
+    # A one-line outcome (the page's strip, a command's last line) must not
+    # carry a driver's line break (FM-98).
+    assert reading.text == "autofocus ? (autofocus: HardwareError: line one line two)"
+    assert "\n" not in reading.text
+
+
+@pytest.mark.parametrize(
+    ("engaged", "locked", "words", "known"),
+    [
+        (None, None, "autofocus ?", False),
+        (None, False, "autofocus ?", False),
+        (None, True, "autofocus ?", False),
+        (False, None, "autofocus off", True),
+        (False, False, "autofocus off", True),
+        (False, True, "autofocus off", True),
+        (True, None, "autofocus ?", False),
+        (True, False, "autofocus on, not locked", True),
+        (True, True, "autofocus locked", True),
+    ],
+)
+def test_autofocus_known_is_false_exactly_when_describe_says_unknown(
+    engaged: bool | None, locked: bool | None, words: str, known: bool
+) -> None:
+    state = MicroscopeState(autofocus_engaged=engaged, autofocus_locked=locked)
+
+    assert describe_autofocus(state) == words
+    assert autofocus_known(state) is known
+    # The two are one rule: a decision reads the field, the words follow it.
+    assert known == (words != "autofocus ?")
+
+
+def test_disengage_is_reached_from_the_state_and_not_from_the_words(
+    fake_microscope: Microscope, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # FM-155: rewording describe_autofocus must not flip a ``reached``.
+    monkeypatch.setattr(drive, "describe_autofocus", lambda state: "autofocus gone")
+
+    result = drive.disengage_autofocus(fake_microscope)
+
+    assert result == DriveResult("autofocus gone")
+
+
+def test_engage_that_did_not_lock_says_it_is_off_from_the_state(
+    fake_microscope: Microscope, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_microscope.override(Autofocus, NeverLocks())
+    monkeypatch.setattr(drive, "describe_autofocus", lambda state: "autofocus gone")
+
+    result = drive.engage_autofocus(fake_microscope)
+
+    assert result == DriveResult("autofocus did not lock; it is off", reached=False)
+
+
+def test_read_autofocus_reads_the_state_once(
+    fake_microscope: Microscope, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reads: list[None] = []
+    real = fake_microscope.state
+
+    def counted() -> MicroscopeState:
+        reads.append(None)
+        return real()
+
+    monkeypatch.setattr(fake_microscope, "state", counted)
+
+    reading = drive.read_autofocus(fake_microscope)
+
+    assert reading == drive.AutofocusReading("autofocus off", False, True)
+    assert len(reads) == 1

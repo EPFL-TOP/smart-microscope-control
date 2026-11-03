@@ -27,12 +27,13 @@ import logging
 import queue
 import threading
 import time
+import weakref
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import EntryPoint
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
-from typing import TYPE_CHECKING, Any, Literal, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeVar, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -50,7 +51,8 @@ from smc.hardware.capabilities import (
     ZStage,
 )
 from smc.hardware.errors import HardwareError, StopRefusedError
-from smc.hardware.safety import DEFAULT_MAX_Z_JOG_UM
+from smc.hardware.microscope import describe_autofocus
+from smc.hardware.safety import Safety
 from smc.plugins import (
     ParamsError,
     PluginEntry,
@@ -312,6 +314,20 @@ class _Suggestion:
     why: str
 
 
+class _Handed(NamedTuple):
+    """A drive action handed to the live worker, waiting for the next turn of its loop (m5 §6.3).
+
+    ``run`` returns the outcome text and never raises an ``Exception``. ``switch_off``
+    is ``True`` for the two switch-offs, ``light off`` and ``autofocus disengage``:
+    the one kind of action that is still run when live ends, because the facade
+    never refuses it, also halted, and it sends no move (#295).
+    """
+
+    name: str
+    run: Callable[[], str]
+    switch_off: bool
+
+
 @dataclass(frozen=True, slots=True)
 class PageStatus:
     """The stand and the run, read now.
@@ -367,15 +383,19 @@ def _checkpoint_reason(name: str, status: StageStatus) -> str:
     )
 
 
-def _autofocus_words(engaged: bool | None, locked: bool | None) -> str:
-    """The words of ``Microscope.describe``: ``?`` whenever a read the answer needs is unknown."""
-    if engaged is None:
-        return "autofocus ?"
-    if not engaged:
-        return "autofocus off"
-    if locked is None:
-        return "autofocus ?"
-    return "autofocus locked" if locked else "autofocus on, not locked"
+def _light_lacks_text(light: LightSource, on: bool | None) -> str | None:
+    """Why a light source whose ``is_on()`` read ``on`` cannot be switched on from the page, or ``None``.
+
+    ``None`` is a ``State`` device (the demo's ``LED``): smc knows no on/off for it.
+    """
+    if on is None:
+        return f"the light source {light.device()} has no on/off that smc knows"
+    return None
+
+
+def _then(text: str, last: str | None) -> str:
+    """``text``, then ``; <last>`` when there is a last drive action's outcome to keep."""
+    return text if last is None else f"{text}; {last}"
 
 
 def _flat(text: str) -> str:
@@ -647,10 +667,20 @@ class PlatePage:
         # by identity. Written on the server's loop only; read without a lock (FM-70).
         self._live_event: threading.Event | None = None
         # The one drive action handed to the live worker and not yet taken, under
-        # ``_lock`` (m5 §6.3): its name and the call that returns its outcome text.
-        self._drive_waiting: tuple[str, Callable[[], str]] | None = None
+        # ``_lock`` (m5 §6.3), and the name of the one the live worker is running
+        # now, which a capture reads (#295): the stage is about to move or moves.
+        self._drive_waiting: _Handed | None = None
+        self._drive_running: str | None = None
         # ``light_lacks()``'s answer, kept after the first read that did not raise.
         self._light_lacks_found: tuple[str | None] | None = None
+        # The facade whose light ``status()`` read and which raised: ``light_lacks()``
+        # does not read it again for that facade (one read a tick, m5 §6.3).
+        # A weak reference: the page keeps text and flags about a released facade,
+        # never the facade, which would keep its core alive after ``release()``
+        # (FM-92).
+        self._light_read_raised: weakref.ref[Microscope] | None = None
+        # Whether ``objective_labels()`` has logged the failure of its streak.
+        self._labels_failure_logged = False
         self._closed = False
         self._ended = 0
         # A plain attribute, written by ``stop()`` and ``resume()``, which take no lock.
@@ -789,10 +819,13 @@ class PlatePage:
 
         Raises:
             ValueError: The well is not on the plate.
-            RuntimeError: The stand is not connected (``NOT_CONNECTED``).
+            RuntimeError: The stand is not connected (``NOT_CONNECTED``), or the
+                stage is about to move or moves (``<name> is running`` or ``<name>
+                is waiting``, ``_refuse_if_moving``).
             CapabilityMissingError: The stand has no XY stage.
         """
         name = self._on_plate(well)
+        self._refuse_if_moving()
         position = self._stand().require(XYStage).position_um()
         ref = WellRef(well=name, x_um=position.x_um, y_um=position.y_um)
         kept = tuple(r for r in self.refs if normalise_well(r.well) != name)
@@ -805,12 +838,13 @@ class PlatePage:
         Raises:
             ValueError: ``side`` is not left, right, top or bottom, or the well is
                 not on the plate.
-            RuntimeError: The stand is not connected (``NOT_CONNECTED``).
+            RuntimeError: As ``capture_centre``.
             CapabilityMissingError: The stand has no XY stage.
         """
         if side not in _SIDES:
             raise ValueError(f"side must be one of {', '.join(_SIDES)}, got {side!r}")
         name = self._on_plate(well)
+        self._refuse_if_moving()
         position = self._stand().require(XYStage).position_um()
         touch = WallTouch(
             well=name,
@@ -1099,6 +1133,8 @@ class PlatePage:
                 # A new facade is not halted, and its light is read again.
                 self._stop_note = None
                 self._light_lacks_found = None
+                self._light_read_raised = None
+                self._labels_failure_logged = False
         if closed:
             try:
                 microscope.close()
@@ -1142,6 +1178,8 @@ class PlatePage:
         with self._lock:
             microscope, self._microscope = self._microscope, None
             self._light_lacks_found = None
+            self._light_read_raised = None
+            self._labels_failure_logged = False
         if microscope is None:  # unreachable: only an activity drops it
             return f"disconnect: {NOT_CONNECTED}"
         try:
@@ -1246,44 +1284,88 @@ class PlatePage:
         devices, and the next frame shows where it went. A drive action that fails
         is its outcome, and live goes on; only a frame that fails ends live.
         Whatever ends the loop, the event is set **first**, then the action still
-        waiting is dropped and never sent (FM-88): a failed frame ends the loop
-        without the event, and a ``_drive`` that took the lock after the drop would
-        otherwise keep an action that no loop takes. ``_drive`` reads the event
-        under the lock, so an action is either taken by the loop or refused.
+        waiting is taken under the lock: a failed frame ends the loop without the
+        event, and a ``_drive`` that took the lock after the drop would otherwise
+        keep an action that no loop takes. ``_drive`` reads the event under the
+        lock, so an action is either taken by the loop, run or dropped at the end,
+        or refused. **A switch-off is run** (``light off``, ``autofocus
+        disengage``, #295), after the lock is released and as any drive action runs;
+        every other action is dropped and never sent (FM-88: a move, a turn or an
+        engage must not be sent after a STOP). A switch-off is the safe call the
+        facade never refuses, also halted, and it sends no move, so what makes a
+        drop right for the others does not apply: dropping it left the light on
+        after a STOP. STOP does not wait for it (``stop()`` joins nothing, FM-70);
+        ``close()`` waits for it as for a frame. The outcome ends with what the end
+        did: ``; <the switch-off's outcome>`` or ``; <name> was not run``.
         """
         log.info("live: started from the plate page")
+        ran: str | None = None
         try:
             outcome = self._live_frames(event)
         finally:
             event.set()
             with self._lock:
-                dropped, self._drive_waiting = self._drive_waiting, None
-        if dropped is not None:
-            outcome += f"; {dropped[0]} was not run"
-        return outcome
+                waiting, self._drive_waiting = self._drive_waiting, None
+                if waiting is not None and waiting.switch_off:
+                    # Held in the same critical section as the take, so a capture
+                    # never finds the action neither waiting nor running.
+                    self._drive_running = waiting.name
+            if waiting is not None and waiting.switch_off:
+                ran = self._run_handed(waiting)
+        if waiting is None:
+            return outcome
+        if ran is not None:
+            return f"{outcome}; {ran}"
+        return f"{outcome}; {waiting.name} was not run"
+
+    def _run_handed(self, handed: _Handed) -> str:
+        """Run an action handed to the live worker, outside ``_lock``; its outcome text, kept and logged.
+
+        Whoever took ``handed`` from ``_drive_waiting`` set ``_drive_running`` in
+        the same critical section; it is cleared here whatever the action does, so
+        that an escaping ``BaseException`` never leaves a capture refused for ever.
+        A drive action is logged (a frame never is, FM-148), after its outcome is
+        kept (FM-62).
+        """
+        try:
+            done = handed.run()
+        except BaseException:
+            with self._lock:
+                self._drive_running = None
+            raise
+        with self._lock:
+            self._drive_running = None
+            self._outcome = done
+        log.info("%s", done)
+        return done
 
     def _live_frames(self, event: threading.Event) -> str:
-        """``_live``'s loop: a waiting drive action, then a frame, then the rest of the period."""
+        """``_live``'s loop: a waiting drive action, then a frame, then the rest of the period.
+
+        Its text is live's own, then ``; <outcome of the last action it ran>`` when
+        there was one (#295): the earlier ones were on the strip while live went,
+        and the log has every one.
+        """
         started = time.monotonic()
         frames = 0
+        last: str | None = None
         while not event.is_set():
             began = time.monotonic()
             with self._lock:
                 waiting = None
                 if not event.is_set():
                     waiting, self._drive_waiting = self._drive_waiting, None
+                    if waiting is not None:
+                        self._drive_running = waiting.name
             if waiting is not None:
-                done = waiting[1]()
-                with self._lock:
-                    self._outcome = done
-                log.info("%s", done)
+                last = self._run_handed(waiting)
                 if event.is_set():
                     # STOP during the action: the stand is halted, and a frame now
                     # would end live with the halt's refusal instead of the stop.
                     break
             taken = self._take_frame()
             if isinstance(taken, str):
-                return f"live ended after {frames} frames: {taken}"
+                return _then(f"live ended after {frames} frames: {taken}", last)
             frames += 1
             # Not on the progress queue: its only reader is a session's tick, and a
             # live view outlives every session, so with no tab open it would grow by
@@ -1294,7 +1376,9 @@ class PlatePage:
                     plugin="live", done=frames, total=None, message="frames"
                 )
             event.wait(max(0.0, LIVE_PERIOD_S - (time.monotonic() - began)))
-        return f"live ended: {frames} frames in {time.monotonic() - started:.1f} s"
+        return _then(
+            f"live ended: {frames} frames in {time.monotonic() - started:.1f} s", last
+        )
 
     def _snap(self, event: threading.Event) -> str:
         """One snap on the worker, and its outcome as text: no exception is kept (FM-98)."""
@@ -1413,6 +1497,7 @@ class PlatePage:
                 "autofocus disengage",
                 Autofocus,
                 lambda: drive.disengage_autofocus(self._stand()),
+                switch_off=True,
             )
 
     def light(self, on: bool) -> None:
@@ -1429,10 +1514,18 @@ class PlatePage:
             LightSource,
             lambda: drive.switch_light(self._stand(), on),
             lacks=self.light_lacks if on else None,
+            switch_off=not on,
         )
 
     def objective_labels(self) -> tuple[str, ...]:
-        """The turret's labels in position order; ``()`` with the stand closed, without a turret or when the read fails."""
+        """The turret's labels in position order; ``()`` with the stand closed, without a turret or when the read fails.
+
+        A failure is logged at WARNING **once** per failing streak (#295): the tick
+        reads again while the choices are empty, and a line a tick would fill the
+        log and block the loop that handles STOP (FM-62, FM-148). A read that
+        succeeds ends the streak, and so do Connect and Disconnect (a new stand
+        has not failed yet).
+        """
         microscope = self._microscope
         if microscope is None:
             return ()
@@ -1440,14 +1533,18 @@ class PlatePage:
         if turret is None:
             return ()
         try:
-            return tuple(turret.labels())
+            labels = tuple(turret.labels())
         except Exception as exc:
-            log.warning(
-                "objective: its positions could not be read: %s: %s",
-                type(exc).__name__,
-                _one_line(exc),
-            )
+            if not self._labels_failure_logged:
+                self._labels_failure_logged = True
+                log.warning(
+                    "objective: its positions could not be read: %s: %s",
+                    type(exc).__name__,
+                    _one_line(exc),
+                )
             return ()
+        self._labels_failure_logged = False
+        return labels
 
     def light_lacks(self) -> str | None:
         """Why the light cannot be switched on from the page, or ``None``.
@@ -1458,6 +1555,11 @@ class PlatePage:
         after the first read that does not raise, since a device's type does not
         change while the stand is held; Connect and Disconnect forget it. It
         takes no lock: the page calls it.
+
+        One read a tick: ``status()`` reads ``is_on()`` on every tick and keeps
+        the answer of a read that did not raise (``_note_light_read``), so this
+        reads for itself only when no ``status()`` has read this stand's light,
+        and not at all for a stand whose last ``status()`` read raised.
         """
         microscope = self._microscope
         lack = self._lacks(microscope, LightSource)
@@ -1466,15 +1568,14 @@ class PlatePage:
         found = self._light_lacks_found
         if found is not None:
             return found[0]
+        raised = self._light_read_raised
+        if raised is not None and raised() is microscope:
+            return None
         light = microscope.get(LightSource)
         if light is None:  # unreachable once lacks() said it is there
             return None
         try:
-            answer = (
-                f"the light source {light.device()} has no on/off that smc knows"
-                if light.is_on() is None
-                else None
-            )
+            answer = _light_lacks_text(light, light.is_on())
         except Exception:
             return None
         if self._microscope is microscope:
@@ -1483,18 +1584,49 @@ class PlatePage:
             self._light_lacks_found = (answer,)
         return answer
 
+    def _note_light_read(
+        self,
+        microscope: Microscope,
+        light: LightSource,
+        on: bool | None,
+        *,
+        raised: bool,
+    ) -> None:
+        """What ``status()``'s own read of ``microscope``'s light tells ``light_lacks()`` (one read a tick).
+
+        A read that did not raise gives the answer, kept as ``light_lacks()`` keeps
+        its own; one that raised makes ``light_lacks()`` answer ``None`` without a
+        second read, until a read succeeds. Nothing is kept for a facade the page
+        let go of during the read: its Connect or Disconnect has cleared both for
+        its own stand.
+        """
+        if self._microscope is not microscope:
+            return
+        if raised:
+            self._light_read_raised = weakref.ref(microscope)
+            return
+        self._light_read_raised = None
+        if self._light_lacks_found is None:
+            try:
+                self._light_lacks_found = (_light_lacks_text(light, on),)
+            except Exception:
+                # ``device()`` failing is no reason to fail the tick: the answer is
+                # not kept, and ``light_lacks()`` reads for itself, as it always did.
+                return
+
     def jog_limits_um(self) -> tuple[float, float]:
         """The profile's XY and Z jog limits, in µm: what the page's steps are bounded by.
 
-        A profile that sets no ``max_z_jog_um`` is held to the layer's assumed
-        default, as the facade holds it. Read from the profile, so the same with
-        the stand closed.
+        The numbers are the ones of a ``Safety`` built from the profile's two,
+        the class the facade enforces a jog with and the one that owns "no
+        ``max_z_jog_um`` means the layer's assumed default": this page repeats no
+        rule, and a test checks that what it offers the facade accepts. Built from
+        the profile and not read from the facade, so the same with the stand closed
+        (the page builds its steps before Connect, m5 §7.3).
         """
         safety = self._profile.safety
-        z_limit = (
-            DEFAULT_MAX_Z_JOG_UM if safety.max_z_jog_um is None else safety.max_z_jog_um
-        )
-        return (safety.max_jog_um, z_limit)
+        guard = Safety(max_jog_um=safety.max_jog_um, max_z_jog_um=safety.max_z_jog_um)
+        return (guard.max_jog_um, guard.max_z_jog_um)
 
     def _drive(
         self,
@@ -1503,13 +1635,17 @@ class PlatePage:
         action: Callable[[], DriveResult],
         *,
         lacks: Callable[[], str | None] | None = None,
+        switch_off: bool = False,
     ) -> None:
         """What every drive action does, in m5 §6.3's order.
 
         The page is closed; another activity than this page's live goes; the stand
         lacks the capability (an outcome, nothing starts or waits); live goes (the
         action is handed to its worker); else the action is an activity of its own.
-        ``lacks`` is a second reason after ``lacks(capability)``.
+        ``lacks`` is a second reason after ``lacks(capability)``. ``switch_off`` is
+        ``True`` for ``light off`` and ``autofocus disengage`` only: handed to the
+        live worker, such an action is still run when live ends (#295), where any
+        other is dropped.
 
         Raises:
             RuntimeError: ``the page is closed``, ``<name> is running``, ``live is
@@ -1539,8 +1675,8 @@ class PlatePage:
                 if self._drive_waiting is not None:
                     # Refused, never queued: a queue would move the stage after the
                     # operator stopped clicking.
-                    raise RuntimeError(f"{self._drive_waiting[0]} is waiting")
-                self._drive_waiting = (name, outcome)
+                    raise RuntimeError(f"{self._drive_waiting.name} is waiting")
+                self._drive_waiting = _Handed(name, outcome, switch_off)
             return
         self._start_activity(name, lambda event: outcome())
 
@@ -1631,8 +1767,11 @@ class PlatePage:
                     light_on = light.is_on()
                 except Exception as exc:
                     problems.append(f"light: {type(exc).__name__}: {_one_line(exc)}")
+                    self._note_light_read(microscope, light, None, raised=True)
+                else:
+                    self._note_light_read(microscope, light, light_on, raised=False)
             autofocus = (
-                _autofocus_words(state.autofocus_engaged, state.autofocus_locked)
+                describe_autofocus(state)
                 if microscope.has(Autofocus)
                 else "no autofocus"
             )
@@ -1730,6 +1869,35 @@ class PlatePage:
             lines = tuple(line for line in (note, outcome) if line)
         self.close_lines = lines
         self.close_ended = ended
+
+    def _refuse_if_moving(self) -> None:
+        """Refuse a capture while the stage is about to move or moves (m5 §6.3, #295).
+
+        A capture records the stage's position, so a position read while a move
+        waits behind a frame, or runs on the live worker, is the one *before* the
+        move. Refused: an activity other than this page's live (a run, a snap, a
+        drive action of its own, ``connect``, ``disconnect``: ``goto-well`` and
+        every plugin that moves the stage are runs), an action running on the live
+        worker (``_drive_running``) and one waiting for it (``_drive_waiting``). A
+        live with nothing handed to it does not refuse: a frame moves nothing.
+
+        The three are read under ``_lock``, never across a device call, and the
+        check is not atomic with the read that follows: the window is one
+        ``position_um()``, for an operator clicking in two tabs.
+
+        Raises:
+            RuntimeError: ``<name> is running`` or ``<name> is waiting``.
+        """
+        with self._lock:
+            current = self._current_run
+            running = self._drive_running
+            waiting = self._drive_waiting
+        if current is not None and current[1] is not self._live_event:
+            raise RuntimeError(f"{current[0]} is running")
+        if running is not None:
+            raise RuntimeError(f"{running} is running")
+        if waiting is not None:
+            raise RuntimeError(f"{waiting.name} is waiting")
 
     def _refuse_if_busy(self) -> None:
         if self._closed:

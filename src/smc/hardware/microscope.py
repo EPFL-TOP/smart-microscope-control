@@ -96,7 +96,13 @@ from smc.hardware.safety import DEFAULT_MAX_Z_JOG_UM, Executor, Safety
 if TYPE_CHECKING:
     from pymmcore_plus import CMMCorePlus
 
-__all__ = ["CAPABILITY_ROLES", "Microscope", "MicroscopeState", "describe_autofocus"]
+__all__ = [
+    "CAPABILITY_ROLES",
+    "Microscope",
+    "MicroscopeState",
+    "autofocus_known",
+    "describe_autofocus",
+]
 
 log = logging.getLogger("smc.hardware.microscope")
 
@@ -1093,16 +1099,25 @@ def _owned(owner: weakref.ref[Microscope], asked_by: str) -> Microscope:
     return microscope
 
 
+def autofocus_known(state: MicroscopeState) -> bool:
+    """Whether the state answers "is the autofocus on, and locked?"; ``False`` when a read it needs failed.
+
+    ``engaged`` is always needed, ``locked`` only when it is engaged: an autofocus
+    that reads off needs no lock. A caller that must decide (is it off? did the
+    read fail?) asks this and the fields, never the words of
+    :func:`describe_autofocus`, so rewording them cannot flip a decision (FM-155).
+    """
+    engaged = state.autofocus_engaged
+    return engaged is not None and (not engaged or state.autofocus_locked is not None)
+
+
 def describe_autofocus(state: MicroscopeState) -> str:
-    """The status line's autofocus part; ``autofocus ?`` when a read it needs failed."""
-    engaged, locked = state.autofocus_engaged, state.autofocus_locked
-    if engaged is None:
+    """The status line's autofocus part; ``autofocus ?`` when :func:`autofocus_known` is false."""
+    if not autofocus_known(state):
         return "autofocus ?"
-    if not engaged:
+    if not state.autofocus_engaged:
         return "autofocus off"
-    if locked is None:
-        return "autofocus ?"
-    return "autofocus locked" if locked else "autofocus on, not locked"
+    return "autofocus locked" if state.autofocus_locked else "autofocus on, not locked"
 
 
 def _read(

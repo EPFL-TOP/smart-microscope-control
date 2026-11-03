@@ -226,6 +226,26 @@ def test_disconnect_through_a_click_closes_the_page_again(
     assert list(opened[0].core.getLoadedDevices()) == ["Core"]
 
 
+def test_the_objective_select_follows_the_turret_of_a_second_connection(
+    page: PlatePage,
+) -> None:
+    # `_offer_objectives` starts the once-only sync over for the stand now held: the
+    # first connection's sync has been done, and the second stand's turret is where
+    # *its* objective is, not where the select was left (#295).
+    view = PlatePageView(page)
+    _connect(view)
+    assert view.objective_select.value == "Nikon 10X S Fluor"
+    view.objective_select.value = "Nikon 40X Plan Fluor ELWD"
+    view.disconnect_button.clicks += 1
+    assert page.join(5)
+    view.tick()
+    assert view.objective_select.options == {}
+
+    _connect(view)
+
+    assert view.objective_select.value == "Nikon 10X S Fluor"
+
+
 def test_connect_is_disabled_while_a_connect_goes(
     tmp_path: Path, opened: list[Microscope]
 ) -> None:
