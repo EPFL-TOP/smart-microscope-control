@@ -91,6 +91,8 @@ from smc.ui.guide import (
 )
 
 if TYPE_CHECKING:
+    from types import TracebackType
+
     from smc.hardware.microscope import Microscope
     from smc.hardware.profile import Profile
 
@@ -190,6 +192,17 @@ _UNKNOWN_TIME = "????-??-?? ??:??:??"
 
 #: How long ``close`` waits for a stopped run to end, in seconds.
 _CLOSE_WAIT_S = 10.0
+
+#: How long a Disconnect or ``release()`` waits for the reads in flight before it
+#: unloads, in seconds: as long as a slow device read, and a hung one is not waited
+#: on for ever (FM-15, m5 §7.2). Polled every ``_READS_POLL_S``.
+_READS_WAIT_S = 5.0
+_READS_POLL_S = 0.01
+
+#: How long ``release()`` waits for a connect that ``close()`` gave up on, in
+#: seconds. 10 (``close``) + 10 (the server's stop) + 8 is 28 s, inside the service's
+#: ``AppStopMethodConsole 30000`` (``docs/ui/service.md``).
+_RELEASE_WAIT_S = 8.0
 
 #: A wait on the worker is made of slices this long (FM-83: Windows does not deliver
 #: Ctrl-C during one long wait on a thread).
@@ -614,6 +627,42 @@ def _first_problem(error: ValidationError) -> str:
     return f"{where}: {first['msg']}"
 
 
+class _Reading:
+    """A read of the stand that takes no lock, registered so that a Disconnect can wait for it (m5 §7.2).
+
+    The facade's reads (``state()``, the light's and the turret's, a capture's
+    position, STOP) take no lock by design (FM-70), so ``unloadAllDevices`` could
+    run while one was inside the core. ``__enter__`` adds a token to the page's
+    ``_readers`` **first**, then returns the facade the page holds, or ``None``:
+    a Disconnect drops the facade and only then looks at ``_readers``, so a reader
+    that took the facade before the drop is in the set when it looks, and one that
+    comes after gets ``None``. Reversing either order reopens the race, and no
+    test on a fast fake shows it.
+
+    A class, not a ``@contextmanager`` (FM-98, FM-92: a generator frame would hold
+    the facade), and no lock: ``set.add`` and ``set.discard`` are atomic, so STOP
+    can use it (FM-70). A second Ctrl-C landing in ``stop()`` between ``add`` and
+    the ``with`` body leaks a token (FM-65); it costs one ``_READS_WAIT_S`` of a
+    Disconnect, never a hang, and is accepted.
+    """
+
+    def __init__(self, page: PlatePage) -> None:
+        self._page = page
+        self._token = object()
+
+    def __enter__(self) -> Microscope | None:
+        self._page._readers.add(self._token)
+        return self._page._microscope
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self._page._readers.discard(self._token)
+
+
 class PlatePage:
     """The plate page's logic over one stand and one run document.
 
@@ -715,6 +764,9 @@ class PlatePage:
     ) -> None:
         """What both constructors do; the profile and the dry run are the page's, held or not."""
         self._microscope: Microscope | None = microscope
+        # The reads in flight, one token each (``_Reading``): no lock, so that STOP
+        # can register (FM-70). A Disconnect waits for it to empty (``_wait_for_reads``).
+        self._readers: set[object] = set()
         self._profile = profile
         self._dry_run = dry_run
         self._opener: Callable[[], Microscope] = (
@@ -913,7 +965,10 @@ class PlatePage:
         """
         name = self._on_plate(well)
         self._refuse_if_moving()
-        position = self._stand().require(XYStage).position_um()
+        with self._reading() as microscope:
+            if microscope is None:
+                raise RuntimeError(NOT_CONNECTED)
+            position = microscope.require(XYStage).position_um()
         ref = WellRef(well=name, x_um=position.x_um, y_um=position.y_um)
         kept = tuple(r for r in self.refs if normalise_well(r.well) != name)
         self.refs = (*kept, ref)
@@ -932,7 +987,10 @@ class PlatePage:
             raise ValueError(f"side must be one of {', '.join(_SIDES)}, got {side!r}")
         name = self._on_plate(well)
         self._refuse_if_moving()
-        position = self._stand().require(XYStage).position_um()
+        with self._reading() as microscope:
+            if microscope is None:
+                raise RuntimeError(NOT_CONNECTED)
+            position = microscope.require(XYStage).position_um()
         touch = WallTouch(
             well=name,
             side=side,  # type: ignore[arg-type]  # checked against _SIDES above
@@ -1171,6 +1229,28 @@ class PlatePage:
     def connected(self) -> bool:
         """Whether the page holds a stand: what *Connect* and *Disconnect* read."""
         return self._microscope is not None
+
+    def _reading(self) -> _Reading:
+        """The registration of a lock-free read: ``with self._reading() as microscope:``.
+
+        The facade comes from the ``with`` and nowhere else, so that a Disconnect
+        that dropped it can see the read and wait for it (``_Reading``).
+        """
+        return _Reading(self)
+
+    def _wait_for_reads(self) -> int:
+        """Wait, bounded, for the reads in flight to end; how many were left.
+
+        Called after the facade is dropped and before it is closed, so that
+        ``unloadAllDevices`` never runs under a read that took the facade before the
+        drop. A read that does not end within ``_READS_WAIT_S`` is not waited on for
+        ever (FM-15): the unload goes ahead, the read fails with a line on the page
+        (``_handler``), and the Disconnect's outcome says so.
+        """
+        deadline = time.monotonic() + _READS_WAIT_S
+        while self._readers and time.monotonic() < deadline:
+            time.sleep(_READS_POLL_S)
+        return len(self._readers)
 
     def _stand(self) -> Microscope:
         """The facade the page holds, for an activity or a capture.
@@ -1614,25 +1694,25 @@ class PlatePage:
         succeeds ends the streak, and so do Connect and Disconnect (a new stand
         has not failed yet).
         """
-        microscope = self._microscope
-        if microscope is None:
-            return ()
-        turret = microscope.get(ObjectiveTurret)
-        if turret is None:
-            return ()
-        try:
-            labels = tuple(turret.labels())
-        except Exception as exc:
-            if not self._labels_failure_logged:
-                self._labels_failure_logged = True
-                log.warning(
-                    "objective: its positions could not be read: %s: %s",
-                    type(exc).__name__,
-                    _one_line(exc),
-                )
-            return ()
-        self._labels_failure_logged = False
-        return labels
+        with self._reading() as microscope:
+            if microscope is None:
+                return ()
+            turret = microscope.get(ObjectiveTurret)
+            if turret is None:
+                return ()
+            try:
+                labels = tuple(turret.labels())
+            except Exception as exc:
+                if not self._labels_failure_logged:
+                    self._labels_failure_logged = True
+                    log.warning(
+                        "objective: its positions could not be read: %s: %s",
+                        type(exc).__name__,
+                        _one_line(exc),
+                    )
+                return ()
+            self._labels_failure_logged = False
+            return labels
 
     def light_lacks(self) -> str | None:
         """Why the light cannot be switched on from the page, or ``None``.
@@ -1649,28 +1729,28 @@ class PlatePage:
         reads for itself only when no ``status()`` has read this stand's light,
         and not at all for a stand whose last ``status()`` read raised.
         """
-        microscope = self._microscope
-        lack = self._lacks(microscope, LightSource)
-        if lack is not None or microscope is None:
-            return lack
-        found = self._light_lacks_found
-        if found is not None:
-            return found[0]
-        raised = self._light_read_raised
-        if raised is not None and raised() is microscope:
-            return None
-        light = microscope.get(LightSource)
-        if light is None:  # unreachable once lacks() said it is there
-            return None
-        try:
-            answer = _light_lacks_text(light, light.is_on())
-        except Exception:
-            return None
-        if self._microscope is microscope:
-            # Not kept for a facade dropped during the read: a Connect that ended
-            # meanwhile has cleared the answer for its own stand.
-            self._light_lacks_found = (answer,)
-        return answer
+        with self._reading() as microscope:
+            lack = self._lacks(microscope, LightSource)
+            if lack is not None or microscope is None:
+                return lack
+            found = self._light_lacks_found
+            if found is not None:
+                return found[0]
+            raised = self._light_read_raised
+            if raised is not None and raised() is microscope:
+                return None
+            light = microscope.get(LightSource)
+            if light is None:  # unreachable once lacks() said it is there
+                return None
+            try:
+                answer = _light_lacks_text(light, light.is_on())
+            except Exception:
+                return None
+            if self._microscope is microscope:
+                # Not kept for a facade dropped during the read: a Connect that ended
+                # meanwhile has cleared the answer for its own stand.
+                self._light_lacks_found = (answer,)
+            return answer
 
     def _note_light_read(
         self,
@@ -1787,22 +1867,28 @@ class PlatePage:
         halts the stand. With the stand closed it sets the event all the same (a
         ``connect`` that is opening halts the stand once it holds it), and the
         note says there was nothing to stop.
+
+        STOP is a read that never waits (m5 §7.2): it registers, sends the stop to
+        the facade it took and unregisters, so a Disconnect that began meanwhile
+        waits for it and the stop reaches loaded devices. One that finds the facade
+        dropped says there was nothing to stop, and ``Microscope.close()`` stops
+        what still moves before it unloads.
         """
         current = self._current_run
         if current is not None:
             current[1].set()
         prefix = "" if current is None else f"{current[0]} told to stop; "
-        microscope = self._microscope
-        try:
-            if microscope is None:
-                note = f"{prefix}{NOT_CONNECTED}: nothing to stop"
-            else:
-                microscope.stop()
-                note = f"{prefix}{_STOP_ACCEPTED}"
-        except StopRefusedError as exc:
-            note = f"{prefix}halted, but {_one_line(exc)}"
-        except HardwareError as exc:
-            note = f"{prefix}the stop failed: {_one_line(exc)}"
+        with self._reading() as microscope:
+            try:
+                if microscope is None:
+                    note = f"{prefix}{NOT_CONNECTED}: nothing to stop"
+                else:
+                    microscope.stop()
+                    note = f"{prefix}{_STOP_ACCEPTED}"
+            except StopRefusedError as exc:
+                note = f"{prefix}halted, but {_one_line(exc)}"
+            except HardwareError as exc:
+                note = f"{prefix}the stop failed: {_one_line(exc)}"
         log.info("stop: %s", note)
         self._stop_note = note
 
@@ -1844,43 +1930,49 @@ class PlatePage:
         stop_refused = tuple(
             role.value for role in self._profile.safety.stop_refused_by
         )
-        microscope = self._microscope
-        if microscope is not None:
-            state = microscope.state()
-            problems = list(state.errors)
-            light_on: bool | None = None
-            light = microscope.get(LightSource)
-            if light is not None:
-                try:
-                    light_on = light.is_on()
-                except Exception as exc:
-                    problems.append(f"light: {type(exc).__name__}: {_one_line(exc)}")
-                    self._note_light_read(microscope, light, None, raised=True)
-                else:
-                    self._note_light_read(microscope, light, light_on, raised=False)
-            autofocus = (
-                describe_autofocus(state)
-                if microscope.has(Autofocus)
-                else "no autofocus"
-            )
-            if self._microscope is microscope:
-                return PageStatus(
-                    stand=stand,
-                    dry_run=self._dry_run,
-                    running=running,
-                    progress=progress,
-                    outcome=outcome,
-                    stop_note=self._stop_note,
-                    xy_um=None if state.xy is None else (state.xy.x_um, state.xy.y_um),
-                    z_um=state.z_um,
-                    objective=state.objective,
-                    autofocus=autofocus,
-                    light_on=light_on,
-                    moving=tuple(state.moving),
-                    halted=state.halted,
-                    stop_refused=stop_refused,
-                    problems=tuple(problems),
+        # The whole read of the facade, from ``state()`` to the status built for it, is
+        # registered: a Disconnect waits for it before it unloads (m5 §7.2).
+        with self._reading() as microscope:
+            if microscope is not None:
+                state = microscope.state()
+                problems = list(state.errors)
+                light_on: bool | None = None
+                light = microscope.get(LightSource)
+                if light is not None:
+                    try:
+                        light_on = light.is_on()
+                    except Exception as exc:
+                        problems.append(
+                            f"light: {type(exc).__name__}: {_one_line(exc)}"
+                        )
+                        self._note_light_read(microscope, light, None, raised=True)
+                    else:
+                        self._note_light_read(microscope, light, light_on, raised=False)
+                autofocus = (
+                    describe_autofocus(state)
+                    if microscope.has(Autofocus)
+                    else "no autofocus"
                 )
+                if self._microscope is microscope:
+                    return PageStatus(
+                        stand=stand,
+                        dry_run=self._dry_run,
+                        running=running,
+                        progress=progress,
+                        outcome=outcome,
+                        stop_note=self._stop_note,
+                        xy_um=None
+                        if state.xy is None
+                        else (state.xy.x_um, state.xy.y_um),
+                        z_um=state.z_um,
+                        objective=state.objective,
+                        autofocus=autofocus,
+                        light_on=light_on,
+                        moving=tuple(state.moving),
+                        halted=state.halted,
+                        stop_refused=stop_refused,
+                        problems=tuple(problems),
+                    )
         return PageStatus(
             stand=stand,
             dry_run=self._dry_run,

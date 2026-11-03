@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 import threading
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, suppress
 from datetime import datetime, timezone
 from importlib.metadata import EntryPoint
 from pathlib import Path
@@ -774,3 +774,117 @@ def test_release_lets_go_of_a_facade_handed_to_the_constructor(run_doc: Path) ->
     page.release()
     assert _released(stand)
     assert not page.connected
+
+
+# --- reads in flight (#305, m5 §7.2) -----------------------------------------------
+
+
+class _Holder:
+    """A page's slots as ``_Reading`` sees them: it logs how many readers were in when the facade was taken."""
+
+    def __init__(self) -> None:
+        self._readers: set[object] = set()
+        self.seen: list[int] = []
+
+    @property
+    def _microscope(self) -> None:
+        self.seen.append(len(self._readers))
+        return None
+
+
+def test_a_reading_registers_before_it_takes_the_facade() -> None:
+    # The order is the whole fix: a reader that took the facade before a drop must
+    # be in the set when the Disconnect looks, which only holds if it registered
+    # first. A fast fake never shows it, so the order is read here.
+    holder = _Holder()
+    reading = controller_module._Reading(cast("PlatePage", holder))
+    with reading as microscope:
+        assert microscope is None
+        assert len(holder._readers) == 1
+    assert holder.seen == [1]
+    assert holder._readers == set()
+
+
+def test_a_reading_unregisters_when_its_block_raises_and_never_swallows() -> None:
+    holder = _Holder()
+    with (
+        pytest.raises(KeyError, match="boom"),
+        controller_module._Reading(cast("PlatePage", holder)),
+    ):
+        raise KeyError("boom")
+    assert holder._readers == set()
+
+
+def _probe(
+    page: PlatePage, seen: list[int], real: Callable[..., Any], raises: bool
+) -> Callable[..., Any]:
+    """A wrapper for a device call: how many reads are registered inside it, then the call or an error."""
+
+    def probing(*args: Any, **kwargs: Any) -> Any:
+        seen.append(len(page._readers))
+        if raises:
+            raise RuntimeError("boom")
+        return real(*args, **kwargs)
+
+    return probing
+
+
+@pytest.mark.parametrize("raises", [False, True], ids=["answers", "raises"])
+@pytest.mark.parametrize(
+    "method",
+    [
+        "status",
+        "light_lacks",
+        "objective_labels",
+        "capture_centre",
+        "capture_wall",
+        "stop",
+    ],
+)
+def test_every_read_of_the_page_registers_itself(
+    page: PlatePage, opener: Opener, method: str, raises: bool
+) -> None:
+    _connected(page)
+    microscope = opener.opened[0]
+    call: dict[str, Callable[[], object]] = {
+        "status": page.status,
+        "light_lacks": page.light_lacks,
+        "objective_labels": page.objective_labels,
+        "capture_centre": lambda: page.capture_centre("A1"),
+        "capture_wall": lambda: page.capture_wall("A1", "left"),
+        "stop": page.stop,
+    }
+    # The device call each method makes on the facade it took from the `with`.
+    through = {
+        "status": "state",
+        "light_lacks": "get",
+        "objective_labels": "get",
+        "capture_centre": "require",
+        "capture_wall": "require",
+        "stop": "stop",
+    }[method]
+    seen: list[int] = []
+    probe = _probe(page, seen, getattr(microscope, through), raises)
+    assert page._readers == set()
+    # A read that fails, as asked: what counts is that it let go.
+    with _replaced(microscope, through, probe), suppress(RuntimeError):
+        call[method]()
+    assert seen, f"{method} never reached the facade's {through}"
+    assert min(seen) >= 1
+    assert page._readers == set()
+
+
+def test_no_info_line_is_written_by_a_read_or_a_tick(
+    page: PlatePage, opener: Opener, caplog: pytest.LogCaptureFixture
+) -> None:
+    # `smc ui` puts `smc.ui` at INFO (m5 §7.1): a line a tick wrote would fill the
+    # service's log and block the loop that handles STOP (FM-148, FM-62).
+    _connected(page)
+    with caplog.at_level("INFO", logger="smc.ui"):
+        caplog.clear()
+        for _ in range(5):
+            page.status()
+        page.light_lacks()
+        page.objective_labels()
+        page.lacks(XYStage)
+    assert [r.getMessage() for r in caplog.records if r.name == "smc.ui"] == []
