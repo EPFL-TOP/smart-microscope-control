@@ -288,6 +288,21 @@ class Microscope:
         #: is logged when it starts, not on every call (``_log_failed_reads``).
         self._failed_reads: frozenset[str] = frozenset()
         self._closed = False
+        self._unload_error: str | None = None
+
+    @property
+    def unload_error(self) -> str | None:
+        """Why the last unload failed, or ``None``: the stand may still be held.
+
+        ``close()`` logs an ``unloadAllDevices`` that raises and returns, with
+        the facade closed, so a second ``close()`` is a no-op and could not
+        say it again. A caller that must tell the operator whether the stand is
+        free (the plate page's Disconnect, m5 §7.2) reads it after ``close()``.
+        ``close()`` does not raise for it, so no command's exit code changes (m1
+        §7). It is the ``repr`` of the error, text and never the error: a
+        traceback would keep the facade alive (FM-92).
+        """
+        return self._unload_error
 
     @classmethod
     def open(
@@ -898,6 +913,7 @@ class Microscope:
                     self.core.unloadAllDevices()
                 except Exception as exc:
                     # Text, never the error: its traceback holds the facade (FM-92).
+                    self._unload_error = repr(exc)
                     log.error(
                         "%s: unloading the devices failed (%s); the stand may "
                         "still be connected, so restart the program before "
