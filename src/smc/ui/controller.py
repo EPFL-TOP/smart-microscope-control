@@ -1365,6 +1365,9 @@ class PlatePage:
             return f"disconnect: {NOT_CONNECTED}"
         stand = self._profile.microscope.name
         in_flight = self._wait_for_reads()
+        # The reads that did not end in time: the readers of a facade that is about
+        # to be gone (a reader that starts after the drop holds ``None``).
+        stuck = frozenset(self._readers) if in_flight else frozenset()
         try:
             microscope.close()
         except MicroscopeBusyError as exc:
@@ -1382,7 +1385,13 @@ class PlatePage:
         except Exception as exc:
             # close() has logged what to do when unloading fails. The facade may
             # be half unloaded: the page has let go of it for good.
+            self._readers.difference_update(stuck)
             return f"disconnect: {type(exc).__name__}: {_one_line(exc)}"
+        # The facade is gone: a read that never ends belongs to it, and its token
+        # must not make every later Disconnect wait the bound again and report a read
+        # that no stand has. Not on a busy close above, which gives the facade (and
+        # the read still inside it) back to the page.
+        self._readers.difference_update(stuck)
         unload_error = microscope.unload_error
         if unload_error is not None:
             return (
@@ -1411,7 +1420,9 @@ class PlatePage:
         ``with Microscope.open(...)`` block did: ``unwinding`` is the exception the
         command is leaving with (``None`` on the normal path), so that a Ctrl-C is
         noted with the motions still tracked (m2 §11.11 E6), which a second Ctrl-C
-        during ``close()`` lost when ``release()`` called ``close()`` directly.
+        during ``close()`` lost when ``release()`` called ``close()`` directly. The
+        waits and the drop are one ``try`` whose ``finally`` ends the facade, so a
+        second Ctrl-C in a wait still unloads the stand and is not swallowed (FM-187).
 
         Raises:
             RuntimeError: ``release() comes after close()``: before it, the facade
@@ -1422,17 +1433,27 @@ class PlatePage:
         """
         if not self._closed:
             raise RuntimeError("release() comes after close()")
-        if self._gave_up == "connect":
-            self._wait_for_the_connect()
-        with self._lock:
-            microscope, self._microscope = self._microscope, None
-        self._wait_for_reads()
-        if microscope is not None:
-            microscope.__exit__(
-                None if unwinding is None else type(unwinding),
-                unwinding,
-                None if unwinding is None else unwinding.__traceback__,
-            )
+        microscope: Microscope | None = None
+        try:
+            if self._gave_up == "connect":
+                self._wait_for_the_connect()
+            with self._lock:
+                microscope, self._microscope = self._microscope, None
+            self._wait_for_reads()
+        finally:
+            # In a `finally`: a second Ctrl-C lands in one of the two waits above, and
+            # the facade, dropped from the page and held by this local only, would
+            # never be unloaded (FM-71, FM-49). A Ctrl-C before the drop finds the
+            # page still holding it.
+            if microscope is None:
+                with self._lock:
+                    microscope, self._microscope = self._microscope, None
+            if microscope is not None:
+                microscope.__exit__(
+                    None if unwinding is None else type(unwinding),
+                    unwinding,
+                    None if unwinding is None else unwinding.__traceback__,
+                )
 
     def _wait_for_the_connect(self) -> None:
         """The wait of ``release()`` for the ``connect`` that ``close()`` gave up on, and a closing line for it.
@@ -1967,8 +1988,10 @@ class PlatePage:
                 note = f"{prefix}halted, but {_one_line(exc)}"
             except HardwareError as exc:
                 note = f"{prefix}the stop failed: {_one_line(exc)}"
-        log.info("stop: %s", note)
+        # Kept before it is logged: the stop is sent, and a handler that blocks (a
+        # Windows console in QuickEdit) must not keep the page from its note (FM-148).
         self._stop_note = note
+        log.info("stop: %s", note)
 
     def resume(self) -> None:
         """Clear the halt; refused while a run is going.

@@ -101,7 +101,10 @@ nssm restart smc-ui
   for a Connect still opening a slow stand: 10 + 10 + 8 = 28 s. A test keeps the
   number above the sum. What `Microscope.close()` then waits for (a driver that does
   not answer, up to `device_timeout_ms`, 60 s by default) cannot be fitted in: NSSM
-  ends the process, as it always did, and the closing line says what is not known.
+  ends the process, as it always did, and **no closing line is written**, since the
+  command prints them only once the stand is released. The log then ends with its last
+  line before the release, and whether the stand was released is not known. Not
+  measured on Windows.
 - **The start**: `SERVICE_AUTO_START`, at boot, before anyone logs on.
 
 ## What it changes for whoever uses the PC

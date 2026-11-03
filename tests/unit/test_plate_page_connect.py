@@ -9,11 +9,12 @@ release is seen as a core that lists only ``Core``. Texts are asserted whole
 
 from __future__ import annotations
 
+import logging
 import re
 import threading
 import time
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager, suppress
+from contextlib import AbstractContextManager, ExitStack, contextmanager, suppress
 from datetime import datetime, timezone
 from importlib.metadata import EntryPoint
 from pathlib import Path
@@ -862,19 +863,23 @@ def _probe(
 
 @pytest.mark.parametrize("raises", [False, True], ids=["answers", "raises"])
 @pytest.mark.parametrize(
-    "method",
+    ("method", "device_call"),
     [
-        "status",
-        "light_lacks",
-        "objective_labels",
-        "capture_centre",
-        "capture_wall",
-        "stop",
+        ("status", "state"),
+        ("status", "is_on"),
+        ("light_lacks", "is_on"),
+        ("objective_labels", "labels"),
+        ("capture_centre", "position_um"),
+        ("capture_wall", "position_um"),
+        ("stop", "stop"),
     ],
 )
 def test_every_read_of_the_page_registers_itself(
-    page: PlatePage, opener: Opener, method: str, raises: bool
+    page: PlatePage, opener: Opener, method: str, device_call: str, raises: bool
 ) -> None:
+    # Registered at the call that reaches the device (the core's read), not at the
+    # lookup of the capability before it: a read moved out of the `with` while its
+    # lookup stays in must fail here, since that read is what an unload would meet.
     _connected(page)
     microscope = opener.opened[0]
     call: dict[str, Callable[[], object]] = {
@@ -885,22 +890,36 @@ def test_every_read_of_the_page_registers_itself(
         "capture_wall": lambda: page.capture_wall("A1", "left"),
         "stop": page.stop,
     }
-    # The device call each method makes on the facade it took from the `with`.
-    through = {
-        "status": "state",
-        "light_lacks": "get",
-        "objective_labels": "get",
-        "capture_centre": "require",
-        "capture_wall": "require",
-        "stop": "stop",
-    }[method]
+    owners: dict[str, object] = {
+        "state": microscope,
+        "stop": microscope,
+        "is_on": Light("LED", None),
+        "labels": microscope.require(ObjectiveTurret),
+        "position_um": microscope.require(XYStage),
+    }
+    owner = owners[device_call]
     seen: list[int] = []
-    probe = _probe(page, seen, getattr(microscope, through), raises)
+    probe = _probe(page, seen, getattr(owner, device_call), raises)
     assert page._readers == set()
+    real_get = microscope.get
+    held: list[AbstractContextManager[Any]] = [_replaced(owner, device_call, probe)]
+    if isinstance(owner, Light):
+        # The stand's light is this stub, whose `is_on` is the probe.
+        held.append(
+            _replaced(
+                microscope,
+                "get",
+                lambda capability: (
+                    owner if capability is LightSource else real_get(capability)
+                ),
+            )
+        )
     # A read that fails, as asked: what counts is that it let go.
-    with _replaced(microscope, through, probe), suppress(RuntimeError):
+    with suppress(RuntimeError), ExitStack() as stack:
+        for context in held:
+            stack.enter_context(context)
         call[method]()
-    assert seen, f"{method} never reached the facade's {through}"
+    assert seen, f"{method} never reached the device's {device_call}"
     assert min(seen) >= 1
     assert page._readers == set()
 
@@ -1288,3 +1307,152 @@ def test_release_ends_the_facade_through_its_exit_with_the_exception_it_is_given
         ("xy", StopOutcome.still_moving)
     ]
     assert _released(microscope)
+
+
+@pytest.mark.parametrize("wait", ["the reads", "the connect"])
+def test_a_ctrl_c_in_a_wait_of_release_still_unloads_the_stand(
+    page: PlatePage, opener: Opener, wait: str
+) -> None:
+    # A second Ctrl-C lands in a wait of `release()`: the facade, dropped from the page
+    # and held by a local only, was never unloaded (FM-71, FM-49). The Ctrl-C itself is
+    # not swallowed. After the reads' wait the page has let go of the facade already;
+    # a Ctrl-C in the connect's wait comes before the drop, and the page still holds it.
+    _connected(page)
+    microscope = opener.opened[0]
+    page.close()
+
+    def interrupted(*args: object) -> None:
+        raise KeyboardInterrupt
+
+    if wait == "the connect":
+        page._gave_up = "connect"  # as if close() had given up on a connect
+    name = "_wait_for_reads" if wait == "the reads" else "_wait_for_the_connect"
+    with _replaced(page, name, interrupted), pytest.raises(KeyboardInterrupt):
+        page.release()
+    assert _released(microscope)
+    assert not page.connected
+    page.release()  # idempotent after it
+
+
+def test_stop_keeps_its_note_before_it_logs_it(
+    page: PlatePage, caplog: pytest.LogCaptureFixture
+) -> None:
+    # `smc ui` puts `smc.ui` at INFO, so the line reaches a console: a handler that
+    # blocks there (Windows QuickEdit) must not keep the page from its note (FM-148).
+    _connected(page)
+    seen: list[str | None] = []
+
+    class Spy(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            if record.getMessage().startswith("stop: "):
+                seen.append(page.status().stop_note)
+
+    logger = logging.getLogger("smc.ui")
+    spy = Spy()
+    logger.addHandler(spy)
+    try:
+        with caplog.at_level("INFO", logger="smc.ui"):
+            page.stop()
+    finally:
+        logger.removeHandler(spy)
+    assert seen == ["stopped: the stand is halted (Resume clears the halt)"]
+
+
+def test_a_read_that_never_ends_does_not_slow_the_next_disconnect(
+    page: PlatePage, opener: Opener, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The token of a read stuck in a device call belongs to the facade that was
+    # released: kept, it made every later Disconnect wait the bound again and report a
+    # read that no stand had.
+    monkeypatch.setattr(controller_module, "_READS_WAIT_S", 0.2)
+    _connected(page)
+    first = opener.opened[0]
+    held = _HeldRead(first.state)
+    first.state = held  # type: ignore[method-assign]
+    try:
+        reader = _threaded(page.status)
+        assert held.inside.wait(5)
+        page.disconnect()
+        assert page.join(5)
+        assert _outcome(page) == (
+            "disconnect: demo released, with 1 read(s) still in flight after 0.2 s"
+        )
+        assert reader.is_alive()  # the read is still stuck, and its facade is gone
+        assert page._readers == set()
+        _connected(page)
+        started = time.monotonic()
+        page.disconnect()
+        assert page.join(5)
+        assert _outcome(page) == "disconnect: demo released"
+        assert time.monotonic() - started < 2.0
+    finally:
+        held.go.set()
+        del first.state
+    reader.join(5)
+    assert not reader.is_alive()
+    assert page._readers == set()
+
+
+def test_a_busy_close_keeps_the_token_of_a_read_that_never_ends(
+    page: PlatePage, opener: Opener, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The page gets the facade back on a busy close, with the stuck read still inside
+    # it: the retry must wait for it, and say so, as the first Disconnect did.
+    monkeypatch.setattr(controller_module, "_READS_WAIT_S", 0.2)
+    _connected(page)
+    microscope = opener.opened[0]
+    held = _HeldRead(microscope.state)
+    real_close = microscope.close
+    calls: list[int] = []
+
+    def busy_once() -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            _busy()
+        real_close()
+
+    microscope.state = held  # type: ignore[method-assign]
+    try:
+        with _replaced(microscope, "close", busy_once):
+            reader = _threaded(page.status)
+            assert held.inside.wait(5)
+            page.disconnect()
+            assert page.join(5)
+            assert page.connected
+            assert len(page._readers) == 1
+            page.disconnect()
+            assert page.join(5)
+            assert _outcome(page) == (
+                "disconnect: demo released, with 1 read(s) still in flight after 0.2 s"
+            )
+    finally:
+        held.go.set()
+        del microscope.state
+    reader.join(5)
+    assert not reader.is_alive()
+
+
+def test_release_adds_no_line_for_a_connect_that_ended_inside_closes_wait(
+    run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The usual Ctrl-C during a slow Connect: it ends while close() still waits. Only
+    # an activity close() gave up on is waited for again, and told once.
+    monkeypatch.setattr(controller_module, "_CLOSE_WAIT_S", 5.0)
+    gate = threading.Event()
+    opener = Opener(gate=gate)
+    page = _closed(run_doc, opener)
+    page.connect()
+    assert opener.entered.wait(5)
+    opening = threading.Timer(0.05, gate.set)
+    opening.start()
+    try:
+        page.close()
+    finally:
+        gate.set()
+        opening.join(5)
+    assert page.close_ended
+    lines = page.close_lines
+    page.release()
+    assert page.close_lines == lines
+    assert page.close_ended
+    assert _released(opener.opened[0])

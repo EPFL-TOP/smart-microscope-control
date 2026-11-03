@@ -352,7 +352,10 @@ def test_the_connection_row_says_connecting_and_disconnecting_while_the_activity
 def test_the_capture_buttons_are_disabled_while_disconnect_runs(
     page: PlatePage, opened: list[Microscope]
 ) -> None:
-    # #317 disabled them while any activity goes; the Disconnect case is added here.
+    # While a Disconnect closes the stand the facade is already dropped, so `not
+    # connected` alone switches the buttons off: this does not pin #317's rule for an
+    # activity (its test does). What it adds is the controller's own refusal, which a
+    # click on a disabled button still reaches (FM-169).
     view = PlatePageView(page)
     _connect(view)
     page.current = "A1"
@@ -387,10 +390,12 @@ def test_the_capture_buttons_are_disabled_while_disconnect_runs(
 
 
 def test_the_stop_budget_in_the_service_doc_covers_the_pages_waits() -> None:
-    # `close()`'s wait, the server's stop and `release()`'s wait for a connect still
-    # opening run one after the other inside NSSM's console stop (m5 §7.4): if one of
-    # them grows past the number the document gives NSSM, the service is ended by
-    # `TerminateProcess`, which releases nothing.
+    # `close()`'s wait, the server's stop and one wait of `release()` run one after the
+    # other inside NSSM's console stop (m5 §7.4): if one of them grows past the number
+    # the document gives NSSM, the service is ended by `TerminateProcess`, which
+    # releases nothing. `release()` pays one of its two waits: for a connect that
+    # `close()` gave up on, which never keeps a facade, or for the reads on a facade
+    # the page holds. So the longer of them counts, and a change to either is seen.
     doc = Path(__file__).resolve().parents[2] / "docs" / "ui" / "service.md"
     found = re.search(r"AppStopMethodConsole (\d+)", doc.read_text(encoding="utf-8"))
     assert found is not None, "docs/ui/service.md no longer sets AppStopMethodConsole"
@@ -398,7 +403,7 @@ def test_the_stop_budget_in_the_service_doc_covers_the_pages_waits() -> None:
     waits_s = (
         controller_module._CLOSE_WAIT_S
         + plate_page_module.SERVER_STOP_WAIT_S
-        + controller_module._RELEASE_WAIT_S
+        + max(controller_module._RELEASE_WAIT_S, controller_module._READS_WAIT_S)
     )
     assert waits_s <= budget_s, (waits_s, budget_s)
 
