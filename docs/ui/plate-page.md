@@ -125,7 +125,12 @@ stand is halted. `?` is an unknown, never a zero. With the stand closed it is
 faster: a scan must not be slowed by a status poll. **STOP is always offered**, a run
 or not. Under it: the run's progress as `done/total message`, how the last run ended
 (`<plugin> done in 12.3 s`, `<plugin> stopped`, or `<plugin>: <Error>: <message>`) and
-what the last STOP did.
+what the last STOP did. A run that ended `done` and **assumed** something says its first
+assumption: `scan done in 0.0 s; assumed: dry run: 36 fields walked, no frame taken`, cut
+at 160 characters, then `(+2 more, on the card)` when there are others; the tool's card
+holds them all. **Refresh** also forgets how the last run ended, so that a line like
+`cells: ... run scan again` does not outlive the chain that was run elsewhere; the
+redraw that a run's end makes keeps it.
 
 **STOP says what it did.** `<plugin> told to stop; stopped: the stand is halted
 (Resume clears the halt)`, or `halted, but <why the stand refused>`, or `the stop failed:
@@ -155,7 +160,9 @@ becomes `scan-plan`'s `wells`, in the order you chose them. A click moves nothin
 The *Wells* box **follows the selection**: a click on a well writes the selected wells in
 it (`B2,B3`), and so does a plate chosen, a selection another tab made, or a run
 document read at the start. A range you typed **stays as you typed it** (`A1:D6` stays
-`A1:D6`) until something else changes the selection.
+`A1:D6`) until something else changes the selection. **Emptying the box clears the
+selection** (no wells), and the next click is written in it again; a text that names
+no well (`Z99`) is refused with the reason, and the old selection stays.
 
 **Driving to a well.** Switch **Drive** on (the strip then says `DRIVE: the next
 click on a well moves the stage there`) and click a well: `goto-well` runs for it, at
@@ -225,22 +232,33 @@ registered one that fills the slot. The region says:
   `plate-finding`);
 - `command: smc run ...`, the command that makes the same call, with the profile, the
   run document's absolute path and `--dry-run` when it is one. It is quoted for a POSIX
-  shell; how it pastes into PowerShell or `cmd.exe` is **not verified**. The run
-  document's record of the run is the reference, whichever shell reads the line;
+  shell, and a page served on Windows says so under it (`that line is quoted for a POSIX
+  shell (bash, zsh); PowerShell and cmd.exe read quotes differently: press the button,
+  which makes the same call`); what the two Windows shells do with it is **not
+  verified**. The run document's record of the run is the reference, whichever shell
+  reads the line;
 - a button, **Run \<tool\>**, which runs **exactly the values the step shows** (never the
   tool's form, and never a step computed at the click), and a line in the warning colour
   when it cannot: `the stand is not connected`, a checkpoint to continue, the wells to
   choose (`select the wells to scan: click them on the map, or type a range in Wells`), or
   how to capture the plate (`centre a well under the objective ...`) on a stand with no
   sample. Nothing moves without that click, and the page never runs a tool by itself or
-  chains two.
+  chains two;
+- on a page served with **`--dry-run`**, the step **stops at `scan`** (and at a tool that
+  reads a `scan` that was a dry run) and says why: a dry run walks the fields and takes
+  no frame, so `cells` and what follows have nothing to read, and a run that is not a
+  dry run refuses what a dry run made. The tools' own Run buttons stay, and so does a
+  dry-run `scan` to see the walk; a `scan` made in a terminal without `--dry-run` is
+  read as it is.
 
 **The plate from the profile.** On a stand whose profile has a `[sample]` (`demo-sample`),
 with nothing captured on the page, the plate step registers the plate in one click from
 the sample's own geometry: `plate-registration` with the centres of three wells (A1, A12
 and H1 on 96 wells). The step says `... this stand's plate is synthetic, so they are known,
-not measured`: the same fit as a real one, from positions nobody measured. A capture made
-on the page wins over it. When the workflow is done the step lists what it wrote: every
+not measured`: the same fit as a real one, from positions nobody measured, and the
+registration's card ends with the same line once it has run (it reads `method:
+references`, `residual_um: 0`, and the plugin cannot tell). A capture made on the page
+wins over it, and its card says nothing of the kind: it is measured. When the workflow is done the step lists what it wrote: every
 file and folder a result names, by absolute path.
 
 **Drive** (the right-hand column, below the next step). Each control is the call of a
@@ -401,7 +419,9 @@ smc ui plate -p demo-sample --run-doc run.json
 (`profiles/demo-sample.toml`), so every tool of the page can be pressed on a PC with
 no microscope, and the frames each one takes follow the stage the page moves. The
 stage and the other devices are the demo's; only the pixels are drawn, at the stage's
-position. **Press Connect, then follow the Next step** at the head of the right-hand
+position. Serve it **without** `--dry-run`, as above: the stage is simulated, so there is
+nothing to protect, and in a dry run `scan` takes no frame, so the next step stops there
+and says so. **Press Connect, then follow the Next step** at the head of the right-hand
 column, one click for each tool, until it says `every stage of the workflow is done`:
 
 1. **Connect.** The next step is `plate-registration`, with the centres of A1, A12 and H1
@@ -493,9 +513,11 @@ from the page without a manual**, with a lab member.
 **The first run** adds: a newcomer following the **Next step** on `demo-sample` in a real
 browser, with the owner (the walk of the [issue](https://github.com/EPFL-TOP/smart-microscope-control/issues/293)'s
 live session); the `command:` line pasted into PowerShell and into `cmd.exe` (it is
-quoted for a POSIX shell); the *Wells* box changed by a click while someone types in it
-(it is changed only when the page redraws, never by the periodic callback); and the page
-over RDP.
+quoted for a POSIX shell, and a Windows page says so; what the two shells do with it is
+not known); the page on a Windows PC at all (the POSIX line); a real browser's emptied
+*Wells* box; the strip's `assumed:` tail and **Refresh** with a Run pressed on the page;
+the *Wells* box changed by a click while someone types in it (it is changed only when the
+page redraws, never by the periodic callback); and the page over RDP.
 
 **Connect and Disconnect** add: Connect, Disconnect, NIS-Elements taking the stand,
 then Connect again, at a real stand; **a stand opened on the page's worker thread**,
