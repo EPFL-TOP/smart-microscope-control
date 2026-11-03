@@ -83,16 +83,25 @@ nssm restart smc-ui
 - **The log**: stdout and stderr both go to `C:\smc\logs\smc-ui.log`, rotated at
   10 MB while the service runs. It holds what the command prints (the `!` line of a
   stand that refuses its stop, the serving line, and the closing lines: what the
-  stop did to a run that was going) and every warning and error. A Connect's outcome
-  and a STOP's note are logged at INFO, which the command does not print without
-  `-v`: they are on the page only. `-v` prints them, with the hardware layer's own
-  INFO lines (not measured: how fast they fill the log).
+  stop did to a run that was going), every warning and error, and, since the command
+  puts the page's own logger (`smc.ui`) at INFO for its length, what the page did:
+  each activity's outcome (`INFO connect: demo connected, 14 devices`, a Connect
+  that failed, `INFO disconnect: demo released`) and STOP's note. Nothing is written
+  per tick. The hardware layer's INFO lines (one per command sent to a device) stay
+  off without `-v`, which prints them too (not measured: how fast they fill the
+  log). **The format has no time** (`%(levelname)s %(message)s`): the lines are in
+  order and undated, and a timestamp changes every `smc` log line, so it is the
+  owner's to ask for.
 - **The stop**: NSSM's first stop method is a Ctrl-C to the console it creates
   (`AppNoConsole 0`: without a console there is no Ctrl-C). That is the command's own
   Ctrl-C: a run that is going is told to stop, then the server stops, then the stand
   is released. NSSM waits only 1.5 s by default before its next method and ends with
   `TerminateProcess`, which releases nothing; `AppStopMethodConsole 30000` covers the
-  page's 10 s wait for a run and the server's 10 s.
+  page's 10 s wait for a run, the server's 10 s and the 8 s that `release()` waits
+  for a Connect still opening a slow stand: 10 + 10 + 8 = 28 s. A test keeps the
+  number above the sum. What `Microscope.close()` then waits for (a driver that does
+  not answer, up to `device_timeout_ms`, 60 s by default) cannot be fitted in: NSSM
+  ends the process, as it always did, and the closing line says what is not known.
 - **The start**: `SERVICE_AUTO_START`, at boot, before anyone logs on.
 
 ## What it changes for whoever uses the PC
@@ -111,7 +120,8 @@ nssm restart smc-ui
 - **Restarts**: a changed profile, or another run document, needs `nssm set smc-ui
   AppParameters ...` or `nssm restart smc-ui`. A restart ends a run that is going,
   as Ctrl-C does.
-- **What the command prints** goes to the log file, not to a console.
+- **What the command prints**, and what the page did (above), goes to the log file,
+  not to a console.
 - **Stopping the PC**: press Disconnect first. How long Windows lets a service stop
   at shutdown is not known here.
 
@@ -124,8 +134,17 @@ None of this has run on a microscope PC yet. To check, at a stand:
 - Connect, then Disconnect, then NIS-Elements taking the stand, then Connect again;
 - `nssm stop smc-ui` while a run goes: the Ctrl-C reaches the interpreter, the child
   of the venv's launcher, and the stand is released within `AppStopMethodConsole`;
-- `nssm restart smc-ui` while a Connect is still opening a slow stand: the old
-  process ends after its 10 s wait with the open still going, on a daemon thread;
+- `nssm restart smc-ui` while a Connect is still opening a slow stand: after the
+  page's 10 s wait, `release()` waits 8 s more for the open and the log says what
+  became of it (`was opened after the page closed, and released`, or `is still opening
+  after 18 s: ... whether the stand is left connected is not known`); whether the
+  stand is free for NIS-Elements afterwards is the finding;
+- a Disconnect pressed while a status tick reads a slow device, and an unload while a
+  call is inside a device of a real core: the page waits up to 5 s for the read before
+  it unloads, and whether MMCore survives an unload under a read when that wait gives
+  up is not known (`disconnect: ..., with 1 read(s) still in flight after 5 s`);
+- a Disconnect that finds the microscope busy (a hung driver): the page stays
+  connected, says `the stand is still connected`, and a second Disconnect retries;
 - a reboot and a logoff;
 - how long Windows lets the service stop at shutdown;
 - whether the lab's NSSM version names its rotation parameter `AppRotateFiles`, and
