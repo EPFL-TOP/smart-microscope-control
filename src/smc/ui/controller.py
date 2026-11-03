@@ -561,13 +561,15 @@ def _are_the_refs(found: object, refs: Sequence[WellRef]) -> bool:
     for item in found:
         if not isinstance(item, dict):
             return False
-        well, x_um, y_um = item.get("well"), item.get("x_um"), item.get("y_um")
+        well = item.get("well")
         if not isinstance(well, str):
             return False
-        for value in (x_um, y_um):
+        numbers: list[float] = []
+        for value in (item.get("x_um"), item.get("y_um")):
             if isinstance(value, bool) or not isinstance(value, int | float):
                 return False
-        centres[well] = (x_um, y_um)
+            numbers.append(value)
+        centres[well] = (numbers[0], numbers[1])
     return len(centres) == len(refs) and all(
         ref.well in centres
         and abs(centres[ref.well][0] - ref.x_um) <= _SAME_REF_UM
