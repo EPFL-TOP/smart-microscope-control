@@ -29,7 +29,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from importlib.metadata import EntryPoint
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
@@ -174,6 +174,11 @@ _CARD_TEXT_CHARS = 600
 #: The strip says a finished run's first assumption, cut here: a pointer to the card, which
 #: holds every line at ``_CARD_TEXT_CHARS`` (m5 §8.8.2).
 _STRIP_ASSUMED_CHARS = 160
+
+#: Two reference centres are the same when they differ by at most this: a JSON dump
+#: rounds, and a capture made by hand is never within a hundredth of a micrometre of the
+#: sample's (m5 §8.8.4).
+_SAME_REF_UM = 0.01
 
 #: The keys of a ``done`` result that name a file or a folder the tool wrote: ``scan``'s
 #: ``folder`` and the ``file`` of ``cells``, ``report`` and ``nis-export``. A third party
@@ -525,6 +530,49 @@ def _card(
         ),
         stale=stale and record.status is StageStatus.done,
         files=tuple(files),
+    )
+
+
+def _sample_refs_text(refs: Sequence[WellRef]) -> str:
+    """Where references that are the profile's ``[sample]``'s come from: the step's line and the card's.
+
+    One text, so that the step before the click and the card after it say the
+    same thing (m5 §8.8.4): the plugin was given the references and cannot tell a
+    synthetic plate's from a measured one, so the page says it.
+    """
+    return (
+        f"refs: the centres of {', '.join(ref.well for ref in refs)} where the "
+        "profile's [sample] puts the plate; this stand's plate is synthetic, so "
+        "they are known, not measured"
+    )
+
+
+def _are_the_refs(found: object, refs: Sequence[WellRef]) -> bool:
+    """Whether ``found``, a record's ``params["refs"]`` as it came, is ``refs`` within ``_SAME_REF_UM``.
+
+    A run document is a file an operator may have edited: anything that is not a
+    list of objects with a text ``well`` and numbers ``x_um`` and ``y_um``, with
+    the wells of ``refs`` and no other, is not the sample's, and is never an
+    exception (FM-125). A flag is not a number.
+    """
+    if not isinstance(found, list) or len(found) != len(refs):
+        return False
+    centres: dict[str, tuple[float, float]] = {}
+    for item in found:
+        if not isinstance(item, dict):
+            return False
+        well, x_um, y_um = item.get("well"), item.get("x_um"), item.get("y_um")
+        if not isinstance(well, str):
+            return False
+        for value in (x_um, y_um):
+            if isinstance(value, bool) or not isinstance(value, int | float):
+                return False
+        centres[well] = (x_um, y_um)
+    return len(centres) == len(refs) and all(
+        ref.well in centres
+        and abs(centres[ref.well][0] - ref.x_um) <= _SAME_REF_UM
+        and abs(centres[ref.well][1] - ref.y_um) <= _SAME_REF_UM
+        for ref in refs
     )
 
 
@@ -2071,6 +2119,7 @@ class PlatePage:
             for tool in self.tools()
             if tool.name in doc.stages
         }
+        cards = self._with_sample_source(doc, cards)
         return PlateView(
             plate=self._plate,
             nominal=nominal,
@@ -2259,12 +2308,38 @@ class PlatePage:
         from smc.testing.sample_stand import sample_refs
 
         refs = sample_refs(sample)
-        why.append(
-            f"refs: the centres of {', '.join(ref.well for ref in refs)} where the "
-            "profile's [sample] puts the plate; this stand's plate is synthetic, so "
-            "they are known, not measured"
-        )
+        why.append(_sample_refs_text(refs))
         return self._registration_pairs(refs, ()), None
+
+    def _with_sample_source(
+        self, doc: RunDocument, cards: dict[str, ResultCard]
+    ) -> dict[str, ResultCard]:
+        """``cards``, with the plate card's last ``assumed`` line saying the references are the sample's (m5 §8.8.4).
+
+        Afterwards the card read ``method: references``, ``residual_um: 0`` and
+        nothing about where the references came from. The line is added when the
+        profile has a ``[sample]`` and the record ended ``done`` on this stand with
+        the sample's own references (``_are_the_refs``): captures an operator made
+        are measured, read differently, and never match. ``smc.testing`` is reached
+        only for a profile that names a sample, as in the step (FM-176).
+        """
+        sample = self._profile.sample
+        card = cards.get("plate-registration")
+        record = doc.stages.get("plate-registration")
+        if sample is None or card is None or record is None:
+            return cards
+        if (
+            record.status is not StageStatus.done
+            or record.profile != self._profile.microscope.name
+        ):
+            return cards
+        from smc.testing.sample_stand import sample_refs
+
+        refs = sample_refs(sample)
+        if not _are_the_refs(record.params.get("refs"), refs):
+            return cards
+        said = replace(card, assumed=(*card.assumed, _sample_refs_text(refs)))
+        return {**cards, "plate-registration": said}
 
     # --- internals of the view -----------------------------------------------------
 
