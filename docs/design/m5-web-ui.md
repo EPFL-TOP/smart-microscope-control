@@ -997,6 +997,22 @@ server's lifetime stays the command's.
   A profile edited on disk takes effect when the command, or the service,
   restarts.
 
+**Decided in #305's plan (2026-11-03)**, after the review of #264's PR:
+
+- **A Disconnect whose `close()` raised `MicroscopeBusyError` keeps the facade**,
+  so that the page tells the truth (the stand is still held) and Disconnect can
+  retry. Any other error from `close()` lets the facade go, as before.
+- **The facade reports a failed unload** (`Microscope.unload_error`, m1 §7), and
+  `close()` still does not raise for it: a command that did its work must not exit
+  1 because a driver would not let go, and its ERROR line is already printed.
+  Disconnect says `may still be held`, never `released`.
+- **The page counts its own lock-free reads** and Disconnect waits for them,
+  bounded (§7.2, *Reads in flight*). The facade is not changed for it.
+- **`release()` waits for a connect that is still opening**, bounded, inside the
+  service's stop budget, and the closing lines say what became of it.
+- **The log**: `smc ui` puts `smc.ui` at INFO (§7.1), so the page's outcomes and
+  STOP's note are in the service's log without `-v`.
+
 ### 7.1 The command (`smc/cli.py`)
 
 The options are §1's, unchanged. What changes is the order:
@@ -1008,18 +1024,26 @@ The options are §1's, unchanged. What changes is the order:
    - the port;
    - `Profile.load` (a profile that does not load exits as today);
    - `RunDocument.load_or_new`.
-2. Unless `--dry-run`, the line `_stop_refused_line(loaded.safety.stop_refused_by)`
-   is printed from the profile, when there is one. `_say_stop_refused` needed the
-   facade.
+2. Unless `--dry-run`, `_say_stop_refused(loaded.safety)` prints the line, when
+   the profile declares one. Since #305 the helper takes the profile's safety
+   section (`SafetySection`) and not the facade, so that the decision lives in one
+   place: the three commands that hold a stand pass `microscope.profile.safety`,
+   and this one passes the profile it has loaded, before any stand is open.
 3. `controller = PlatePage.closed(loaded, path, dry_run=dry_run)`, then
-   `plate_page.serve(controller, port=port)`.
-4. Whatever ends `serve`, a `finally` calls `controller.close()` and keeps
-   `close_lines` and `close_ended`. An inner `finally` then calls
-   `controller.release()`. The stand is released whatever ends this, a second
-   Ctrl-C during the wait included (FM-71), as the `with Microscope.open(...)`
-   block did. An error that `release()` raises is reported by `_Reported` as the
-   `with` block's was.
-5. After the release, `close_lines` and the exit code are as today (§1, M3 §15.3).
+   `plate_page.serve(controller, port=port)`. From the command's start to its end,
+   the `smc.ui` logger is at INFO if it was above (`-v` and `--debug` keep their
+   lower levels), and put back after, so the log holds what the page did (§7.4).
+4. Whatever ends `serve`, a `finally` calls `controller.close()`. An inner
+   `finally` then calls `controller.release(sys.exc_info()[1])`, which is the
+   exception the command is unwinding with, or `None`. The stand is released
+   whatever ends this, a second Ctrl-C during the wait included (FM-71), as the
+   `with Microscope.open(...)` block did, and the release ends the facade as that
+   block's exit did: a Ctrl-C leaving it is noted with the motions still tracked
+   (m2 §11.11 E6). An error that `release()` raises is reported by `_Reported` as
+   the `with` block's was.
+5. `close_lines` and `close_ended` are read **after** the release, because
+   `release()` may add to them (a Connect that was still opening, §7.2). The exit
+   code is as today (§1, M3 §15.3).
 
 The help says:
 
@@ -1069,7 +1093,7 @@ class PlatePage:
     def connected(self) -> bool: ...
     def connect(self) -> None: ...
     def disconnect(self) -> None: ...
-    def release(self) -> None: ...
+    def release(self, unwinding: BaseException | None = None) -> None: ...
 ```
 
 **Building the page**
@@ -1135,23 +1159,62 @@ it.
   4. Otherwise it starts the `disconnect` activity, whose body:
      - under `_lock`, drops the facade (`_microscope = None`) and clears
        `_light_lacks_found`;
+     - **outside** the lock, waits for the reads that started on that facade
+       (*Reads in flight*, below), for at most `_READS_WAIT_S` (5 s);
      - **outside** the lock, calls `Microscope.close()`. That stops what still
        moves, then unloads every device, and it switches nothing off: a light
        or an autofocus stays as the stand keeps it (§6);
-     - has the outcome `disconnect: <stand> released`, or `disconnect: <Type>:
-       <message on one line>` when `close()` raises. The page has let go of the
-       facade either way. `close()` logs what to do when unloading fails.
+     - has one of these outcomes, in this order of precedence:
+       - `close()` raised `MicroscopeBusyError`: `disconnect: MicroscopeBusyError:
+         <message on one line>; the stand is still connected`. Nothing was
+         unloaded and `close()` may be called again (m1 §7), so **the page keeps
+         the facade**: it puts it back under `_lock`, unless the page is closed,
+         and is then connected again, with Disconnect a click away. A page that
+         shows `not connected` for a stand this process still holds would be a
+         lie, and a stand held until the process ends, with no way to retry, was
+         the first version's gap (#305);
+       - `close()` raised anything else: `disconnect: <Type>: <message on one
+         line>`, and the page has let go of the facade for good (it may be half
+         unloaded);
+       - `close()` returned and `microscope.unload_error` is not `None`:
+         `disconnect: <stand> may still be held: its devices did not unload
+         (<unload_error on one line>); restart smc ui before another program
+         takes it`. The page is not connected, and a later Connect says what
+         happened;
+       - otherwise `disconnect: <stand> released`, then `, with <n> read(s) still
+         in flight after 5 s` when the wait for the reads gave up.
   - The facade is dropped **before** it is closed, so no read that starts after
     the drop reaches a closed facade.
   - Measured (§7.5): a closed facade's `state()` reads `HardwareError ...
     another program holding it` for XY and Z, which would mislead, and its
     `has(XYStage)` still answers `True`.
-- **`release()`** releases the facade the page holds, if any:
-  - It drops it under `_lock`, then calls `Microscope.close()` outside it, and
-    raises what that raises.
+- **`release(unwinding=None)`** releases the facade the page holds, if any:
   - It is for the command, after `close()`. Before it, it raises
     `RuntimeError("release() comes after close()")`, because the facade could
     otherwise be pulled from under an activity.
+  - **A `connect` that `close()` gave up on is waited for**, for at most
+    `_RELEASE_WAIT_S` (8 s), with `join()`'s slices (FM-83): `close()` waited its
+    own 10 s, and the worker's late release (above) can only run while the process
+    lives. `close()` keeps the name of the activity it gave up on, so that the wait
+    is the same whether the connect ended before `release()` began or after.
+    10 + 10 (the server's stop) + 8 is 28 s, inside `AppStopMethodConsole 30000`
+    (§7.4). Only a `connect` is waited for: a run stuck in a vendor call is not
+    made to wait longer, and `Microscope.close()` below meets it as before. What
+    became of the connect is a closing line, added to `close_lines`:
+    - it ended: its own outcome (`connect: <stand> was opened after the page
+      closed, and released`, or what the opener raised), and `close_ended` is
+      `True`: the stand is not held;
+    - it did not: `connect: <stand> is still opening after <n> s: the process
+      ends now, and whether the stand is left connected is not known`, with
+      `<n>` the two waits' sum, and `close_ended` stays `False` (exit 1).
+  - It drops the facade under `_lock`, waits for the reads in flight (below),
+    then ends the facade as the `with Microscope.open(...)` block did, outside
+    the lock: `microscope.__exit__(...)` with `unwinding`, so that a Ctrl-C the
+    command is unwinding with is noted with the motions still tracked, as
+    `Microscope.__exit__` does (m2 §11.11 E6). That is what a second Ctrl-C during
+    `close()` lost when `release()` called `close()` directly. It raises what
+    `close()` raises. A failed unload is not raised: `close()` logs it as an ERROR,
+    which the command prints at any level, as it does for every other command.
   - It is idempotent, and it does nothing on a page that holds no facade.
   - It releases a facade handed to the constructor too. The tests that build a
     page over a fixture's facade never call it.
@@ -1188,6 +1251,41 @@ reason, never failing when pressed):
   Disconnect. A Connect clears it, because the new facade is not halted.
   `smc` commands each open a fresh facade too.
 
+**Reads in flight (#305).** The facade's reads take no lock, by design (FM-70): a
+status tick, the light's and the turret's reads, a capture's position and STOP
+all reach the devices while an activity holds the microscope lock. So
+`unloadAllDevices` could run while one of them was inside the core, which was
+reproduced on `FakeCore` (§7.5). `Microscope.close()` cannot see them: the page
+holds the reads, and Disconnect is what makes the race a normal path. So the
+page counts its own, with no lock.
+
+- A private class `_Reading(readers, page)` is the registration. Its `__enter__`
+  adds a token to the page's set `_readers` **first**, then returns the facade
+  the page holds (or `None`); its `__exit__` discards the token. A class, not a
+  `@contextmanager` (FM-98, FM-92), and `set.add` and `set.discard` take no lock
+  and are atomic, so STOP can use it (FM-70).
+- The order is the whole point. A reader that gets the facade registered before
+  it took it; Disconnect drops the facade, then looks at the set. A reader that
+  took the facade before the drop is therefore in the set when Disconnect looks,
+  and one that comes after the drop gets `None`.
+- **Which methods are reads**: `status`, `light_lacks`, `objective_labels`,
+  `capture_centre`, `capture_wall` and `stop`. `lacks`, `_blocked` and `run` only
+  look at which capabilities the roles give, which is no device read.
+- **`_wait_for_reads()`** polls the set every 10 ms for at most `_READS_WAIT_S`
+  (5 s, as long as a slow device read, and a hung one is not waited on for ever,
+  FM-15) and says how many were left. `disconnect` and `release` call it after the
+  drop and before `close()`. When it gives up, `close()` unloads under the read,
+  which fails with a line on the page and never a crash (`_handler`), and the
+  outcome says so.
+- **STOP is a read that never waits.** It registers, sends the stop to the facade
+  it took and unregisters: a Disconnect that began meanwhile waits for it, so the
+  stop reaches loaded devices. A STOP that finds the facade dropped says `not
+  connected: nothing to stop`, and `Microscope.close()` stops what still moves
+  before it unloads.
+- A token leaked by a Ctrl-C between `add` and the `with` body (FM-65) costs one
+  `_READS_WAIT_S`, never a hang. Only the main thread gets a Ctrl-C, and it
+  reads only in `stop()`, so a second Ctrl-C inside it is the one case.
+
 ### 7.3 The page (`smc/ui/plate_page.py`)
 
 ```python
@@ -1207,13 +1305,19 @@ class PlatePageView:
     need the stand are disabled until then`;
   - connected: `Disconnect releases <stand> for another program (NIS-Elements,
     ZEN)`;
-  - in both cases, then ` (dry run)` when it is a dry run.
+  - while the `connect` activity goes (`status.running == "connect"`):
+    `connecting <stand>…`, and while `disconnect` goes: `disconnecting
+    <stand>…`. On a slow stand the row would otherwise say `Connect opens it`
+    beside a greyed-out button, and the page would look stuck (#305);
+  - in every case, then ` (dry run)` when it is a dry run.
 
   This one line is the reason for every control that needs the stand.
 - **Disabled**:
   - `Connect` while connected, or while an activity goes;
   - `Disconnect` while closed, or while an activity goes (live included);
-  - the capture buttons while closed.
+  - the capture buttons while closed, and while an activity other than this page's
+    live goes (#295; the controller refuses a capture then, `_refuse_if_moving`,
+    `connect` and `disconnect` included).
 
   Each controller method refuses on its own, so a click on a disabled button is
   refused all the same (FM-169).
@@ -1241,9 +1345,12 @@ install, start, stop, restart and remove the service, named `smc-ui`, and says
 what it changes for whoever uses the PC. It fixes the following:
 
 - **What the service runs**: the venv's `python.exe -m smc.cli ui -p <profile>
-  --run-doc <absolute path> --port 5006`. It is one process: a console-script
-  `.exe` launcher would run Python as a child, which a stop must then also
-  reach.
+  --run-doc <absolute path> --port 5006`. It is **two processes** on Windows
+  (corrected by #305; #264's plan said one): a venv's `Scripts\python.exe` is
+  itself a launcher (a copy of `venvlauncher.exe`) that runs the base interpreter
+  as a child, as the `smc.exe` console script does, and the interpreter that holds
+  the stand is that child. It shares NSSM's console, so the Ctrl-C reaches it;
+  that is to be checked at a stand (§9.1).
 - **The account**: the Windows account for which Micro-Manager, the vendor
   drivers and the venv were set up on that PC, given as `ObjectName .\<account>
   <password>`. It is not `LocalSystem`, which has none of that account's
@@ -1260,7 +1367,10 @@ what it changes for whoever uses the PC. It fixes the following:
   That is the command's own Ctrl-C (§7.1, FM-143): the activity is told to
   stop, then the server stops, then the stand is released. NSSM waits only 1.5 s
   by default before its next method, and ends with `TerminateProcess`. So
-  `AppStopMethodConsole 30000` covers `close()`'s 10 s and the server's 10 s.
+  `AppStopMethodConsole 30000` covers `close()`'s 10 s, the server's 10 s and
+  `release()`'s 8 s wait for a connect still opening (§7.2). A `Microscope.close()`
+  that waits for a hung driver is bounded by `device_timeout_ms` (60 s by
+  default) and cannot be fitted in: NSSM then ends the process, as it always did.
   `AppNoConsole` stays `0`: without a console, there is no Ctrl-C.
 - **The start**: `Start SERVICE_AUTO_START`. `AppExit` stays at its default,
   `Restart`, with NSSM's throttle. A restart never takes the stand, since the
@@ -1282,7 +1392,12 @@ what it changes for whoever uses the PC. It fixes the following:
   - **Restarts**: a changed profile, or another run document, needs `nssm set
     smc-ui AppParameters ...` or `nssm restart smc-ui`. A restart ends a run
     that is going, as Ctrl-C does.
-  - **What the page says** goes to the log file, not to a console.
+  - **What the page says** goes to the log file, not to a console. Since #305
+    the command puts the `smc.ui` logger at INFO (§7.1), so the file holds each
+    activity's outcome (`connect: ... connected`, a failed Connect, `disconnect:
+    ... released`) and STOP's note, as well as every warning and error. The
+    format has no time (`%(levelname)s %(message)s`): a timestamp is the
+    owner's to ask for, as it changes every `smc` log line.
 - **Stopping the PC**: Disconnect first. How long Windows lets a service stop at
   shutdown is not known here.
 
@@ -1292,7 +1407,36 @@ The tests are named in #264's plan.
 
 **Failure modes**: FM-98, FM-70, FM-71, FM-92, FM-143, FM-146, FM-149, FM-151,
 FM-169, FM-161, FM-117, FM-125, FM-44, FM-96, FM-43, FM-45, FM-36, FM-37, FM-20,
-FM-24, FM-69.
+FM-24, FM-69. #305 adds FM-15, FM-49, FM-62, FM-65, FM-83 and three new
+entries, named by what they say, whose ids the develop session takes when it
+writes them: an unload during an unlocked read; a documented log content that the
+default level drops; a venv's `python.exe` that is a launcher with a child
+process (Windows).
+
+**Measured 2026-11-03** (#305; Python 3.13.0, `FakeCore.demo_like()` and
+`Profile.demo()`; throwaway scripts):
+
+- **An unload during a lock-free read.** A `state()` replaced by a wrapper that
+  holds inside the read (an `Event`): `close()` from another thread returned, and
+  the core listed only `Core`, while the read was still inside it.
+- **`close()` that raises.** With the microscope lock held by another thread and
+  `_lock_timeout_s = 0.2`, `close()` raised `MicroscopeBusyError` after 0.20 s, with
+  `_closed` still `False` and 14 devices loaded; once the lock was free, a second
+  `close()` unloaded them. After an `unloadAllDevices` that raises,
+  `close()` returned normally with `_closed` `True` (so a retry is a no-op),
+  which `Microscope.unload_error` reports (m1 §7).
+- **`sys.exc_info()` in a `finally`**: in the inner `finally` of a `try/finally`
+  that an exception unwinds, `sys.exc_info()[1]` is that exception, and `None` on
+  the normal path. It is what the command passes to `release()` (§7.1).
+- **The three mechanisms of §7.2**, on a throwaway subclass of `PlatePage`
+  (`mypy --strict` clean): a `status()` held inside its read kept Disconnect from
+  unloading (14 devices while it held, `Core` alone after it ended, and its
+  status read `connected=False`); with the wait shortened to 0.2 s, Disconnect
+  unloaded under the read and said so; a Disconnect whose `close()` raised
+  `MicroscopeBusyError` left the page connected, and a second one released; a
+  connect still opening when `close()` gave up (wait 0.2 s), with `release()`
+  waiting, returned after 0.60 s, with the outcome `connect: demo was opened
+  after the page closed, and released` and the core listing only `Core`.
 
 **Measured 2026-10-30** (Python 3.13.0, on the demo, `demo-sample` and
 `FakeCore.demo_like()`; throwaway scripts):
@@ -1317,6 +1461,11 @@ FM-24, FM-69.
     with the outcome above;
   - with the facade dropped, today's `status()` and `stop()` raise
     `AttributeError`, which §7.2 replaces.
+
+**Not measured (#305)**: an unload during a read on a real core (whether MMCore
+survives it is not known here: the page treats it as a failure to avoid);
+`device_timeout_ms` at its default in a Disconnect
+that waits for a hung driver; the log's growth at INFO.
 
 **Not measured**: a stand opened on a worker thread. Until #264, the command
 opened the stand on the main thread. A vendor adapter that cares which thread
@@ -1907,8 +2056,11 @@ FM-176, FM-43.
     and the camera driver open there, under the account chosen;
   - Connect, then Disconnect, then NIS-Elements taking the stand, then Connect
     again;
-  - `nssm stop` while a run goes: the Ctrl-C reaches Python, and the stand is
-    released within `AppStopMethodConsole`;
+  - `nssm stop` while a run goes: the Ctrl-C reaches Python, the child of the
+    venv's launcher, and the stand is released within `AppStopMethodConsole`;
+  - `nssm restart` while a Connect is still opening a slow stand: `release()`'s
+    wait (8 s) and the late release (§7.2);
+  - a Disconnect pressed while a status tick reads a slow device (§7.2);
   - a reboot and a logoff;
   - how long Windows lets the service stop at shutdown;
   - whether the lab's NSSM version names its rotation parameter

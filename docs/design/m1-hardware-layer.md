@@ -641,6 +641,20 @@ message lists what *is* available and points at `[roles.assign]`.
 all devices (one connection per stand), and is idempotent. The `Executor` gets
 `lock_timeout_s = profile.micromanager.device_timeout_ms / 1000`.
 
+**What `close()` could not do (#305).** An `unloadAllDevices` that raises is
+logged as an ERROR and `close()` returns, with the facade closed: the stand may
+still be connected, and a second `close()` is a no-op (measured). The text of the
+failure (`repr` of the error, never the error: FM-92) is kept in the read-only
+`Microscope.unload_error: str | None`, `None` until an unload has failed. It is
+for a caller that must tell the operator whether the stand is free, as the plate
+page's Disconnect does (m5 §7.2). `close()` still does not raise for it, so no
+command's exit code changes: a run that did its work does not exit 1 because a
+driver would not let go. `close()` raises only `MicroscopeBusyError` (nothing was
+unloaded, and `close()` may be called again) and, from inside an action,
+`HardwareError`. The facade's reads (`state()` and every capability read) take no
+lock and are not waited for by `close()`: a caller that reads while another thread
+closes waits for its own reads (m5 §7.2, *Reads in flight*).
+
 **Adapter search paths (#77).** `core.py` gains a keyword-only argument:
 
 ```python
