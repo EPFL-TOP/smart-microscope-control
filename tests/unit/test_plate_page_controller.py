@@ -3564,8 +3564,10 @@ def test_the_controller_imports_without_panel() -> None:
         "sys.modules['bokeh'] = None\n"
         "import smc.ui.controller\n"
     )
+    # No `-I`: the interpreter keeps PYTHONPATH, so it imports the code under test
+    # (`scripts/dev/mutant.py` puts a copy's `src` there) and not another checkout's.
     done = subprocess.run(
-        [sys.executable, "-I", "-c", code],
+        [sys.executable, "-c", code],
         capture_output=True,
         text=True,
         encoding="utf-8",

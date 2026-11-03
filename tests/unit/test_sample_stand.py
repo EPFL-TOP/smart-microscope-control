@@ -665,8 +665,10 @@ def test_a_stand_without_a_sample_never_imports_the_sample_stand() -> None:
         "microscope.close()\n"
         "assert 'smc.testing.sample_stand' not in sys.modules, 'imported'\n"
     )
+    # No `-I`: the interpreter keeps PYTHONPATH, so it imports the code under test
+    # (`scripts/dev/mutant.py` puts a copy's `src` there) and not another checkout's.
     done = subprocess.run(
-        [sys.executable, "-I", "-c", code], capture_output=True, text=True, check=False
+        [sys.executable, "-c", code], capture_output=True, text=True, check=False
     )
     assert done.returncode == 0, done.stderr
 

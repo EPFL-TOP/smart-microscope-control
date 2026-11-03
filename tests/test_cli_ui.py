@@ -813,8 +813,10 @@ def test_smc_starts_without_importing_panel() -> None:
         "if m in sys.modules]\n"
         "assert not loaded, loaded\n"
     )
+    # No `-I`: the interpreter keeps PYTHONPATH, so it imports the code under test
+    # (`scripts/dev/mutant.py` puts a copy's `src` there) and not another checkout's.
     done = subprocess.run(
-        [sys.executable, "-I", "-c", code],
+        [sys.executable, "-c", code],
         capture_output=True,
         text=True,
         encoding="utf-8",

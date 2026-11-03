@@ -8,6 +8,7 @@ generic sentence otherwise, and that a hint never raises on adapter text.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 
@@ -109,14 +110,17 @@ def test_the_nikon_module_and_the_diagnosis_module_import_in_either_order(
     first, second = order
     code = f"import {first}\nimport {second}\n"
 
+    # No `-I`: the interpreter keeps PYTHONPATH, so it imports the code under test
+    # (`scripts/dev/mutant.py` puts a copy's `src` there) and not another checkout's.
     run = subprocess.run(
-        [sys.executable, "-I", "-c", code],
+        [sys.executable, "-c", code],
         capture_output=True,
         text=True,
         encoding="utf-8",
-        # A Windows child writes the ANSI code page, and `-I` ignores
-        # PYTHONIOENCODING: a traceback naming an accented profile folder must
-        # show as text, not as a UnicodeDecodeError in place of the failure.
+        # A Windows child writes the ANSI code page unless told otherwise: a
+        # traceback naming an accented profile folder must show as text, not as a
+        # UnicodeDecodeError in place of the failure.
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         errors="replace",
         timeout=120,
         check=False,
