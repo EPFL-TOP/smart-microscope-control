@@ -30,6 +30,7 @@ from __future__ import annotations
 import functools
 import logging
 import math
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -248,12 +249,18 @@ def card_text(card: ResultCard | None, *, stand: str | None = None) -> str:
     return "\n".join(lines)
 
 
-def next_step_text(step: NextStep | None) -> str:
+def next_step_text(step: NextStep | None, *, windows: bool | None = None) -> str:
     """The next step as plain text, for a ``pn.pane.Str``: never markup (FM-139).
 
     With a tool, its name, then each line of ``why`` indented by two spaces and the
     command last. Without one (the workflow is done, or no plugin fills the slot),
     the lines of ``why`` as they are. ``""`` before the first read.
+
+    ``command`` is quoted for a POSIX shell (``shlex.join``), and ``cmd.exe`` and
+    PowerShell 5.1 read quotes differently from each other, so no one quoting is
+    right for a Windows PC (FM-175): a page served there says so under the line, and
+    the button, which makes the same call, is the way on. ``windows`` is ``None`` for
+    "the PC this runs on" and is given by a test (m5 §8.8.6).
     """
     if step is None:
         return ""
@@ -261,6 +268,12 @@ def next_step_text(step: NextStep | None) -> str:
         return "\n".join(step.why)
     lines = [step.plugin, *(f"  {line}" for line in step.why)]
     lines.append(f"  command: {step.command}")
+    if sys.platform == "win32" if windows is None else windows:
+        lines.append(
+            "  that line is quoted for a POSIX shell (bash, zsh); PowerShell and "
+            "cmd.exe read quotes differently: press the button, which makes the "
+            "same call"
+        )
     return "\n".join(lines)
 
 

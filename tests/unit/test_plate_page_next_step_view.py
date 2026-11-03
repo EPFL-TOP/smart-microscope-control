@@ -17,6 +17,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import EntryPoint
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, ClassVar, cast
 
 import pytest
@@ -29,6 +30,7 @@ else:
 from bokeh.events import Tap
 from pymmcore_plus import CMMCorePlus
 
+import smc.ui.plate_page as plate_page
 from smc.hardware import Microscope
 from smc.hardware.capabilities import XYStage
 from smc.hardware.profile import Profile
@@ -284,7 +286,8 @@ def test_next_step_text_is_pure_text_in_three_shapes() -> None:
         command="smc run scan-plan --param wells=B2",
         blocked=None,
     )
-    assert next_step_text(with_tool) == (
+    # `windows=False`: the text of a POSIX page, whatever PC runs the test (CI has all three).
+    assert next_step_text(with_tool, windows=False) == (
         "scan-plan\n"
         "  the run document has no scan-plan yet\n"
         "  wells: the 1 wells selected\n"
@@ -295,6 +298,46 @@ def test_next_step_text_is_pure_text_in_three_shapes() -> None:
         None, (), ("every stage of the workflow is done:", "<b>[x]</b>"), "", None
     )
     assert next_step_text(done) == "every stage of the workflow is done:\n<b>[x]</b>"
+
+
+POSIX_ONLY_LINE = (
+    "  that line is quoted for a POSIX shell (bash, zsh); PowerShell and cmd.exe "
+    "read quotes differently: press the button, which makes the same call"
+)
+
+
+def test_next_step_text_says_the_command_is_posix_only_on_windows_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-175: `shlex.join` is POSIX quoting, and no one quoting is right for both
+    # Windows shells, so the page says so under the line instead of guessing (m5 §8.8.6).
+    step = NextStep(
+        plugin="scan-plan",
+        params=("wells=B2",),
+        why=("the run document has no scan-plan yet",),
+        command="smc run scan-plan --param wells=B2",
+        blocked=None,
+    )
+    posix = (
+        "scan-plan\n"
+        "  the run document has no scan-plan yet\n"
+        "  command: smc run scan-plan --param wells=B2"
+    )
+    assert next_step_text(step, windows=False) == posix
+    assert next_step_text(step, windows=True) == f"{posix}\n{POSIX_ONLY_LINE}"
+
+    # Not given, it is the PC the page is served from. Only the page module's view of
+    # `sys` is replaced: the real `sys.platform` is read by pytest and the standard
+    # library while the test runs.
+    for platform, expected in (("win32", True), ("darwin", False), ("linux", False)):
+        monkeypatch.setattr(plate_page, "sys", SimpleNamespace(platform=platform))
+        said = f"{posix}\n{POSIX_ONLY_LINE}" if expected else posix
+        assert next_step_text(step) == said, platform
+
+    # No tool, no command, no line to say it about.
+    done = NextStep(None, (), ("every stage of the workflow is done:",), "", None)
+    assert next_step_text(done, windows=True) == "every stage of the workflow is done:"
+    assert next_step_text(None, windows=True) == ""
 
 
 # --- the region, its button, and what it runs ------------------------------------------------
