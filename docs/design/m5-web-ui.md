@@ -1181,8 +1181,8 @@ it.
          (<unload_error on one line>); restart smc ui before another program
          takes it`. The page is not connected, and a later Connect says what
          happened;
-       - otherwise `disconnect: <stand> released`, then ` (<n> reads were still in
-         flight after 5 s)` when the wait for the reads gave up.
+       - otherwise `disconnect: <stand> released`, then `, with <n> read(s) still
+         in flight after 5 s` when the wait for the reads gave up.
   - The facade is dropped **before** it is closed, so no read that starts after
     the drop reaches a closed facade.
   - Measured (§7.5): a closed facade's `state()` reads `HardwareError ...
@@ -1192,18 +1192,21 @@ it.
   - It is for the command, after `close()`. Before it, it raises
     `RuntimeError("release() comes after close()")`, because the facade could
     otherwise be pulled from under an activity.
-  - **A `connect` still opening is waited for**, for at most `_RELEASE_WAIT_S`
-    (8 s), with `join()`'s slices (FM-83): `close()` gave up after its own 10 s,
-    and the worker's late release (above) can only run while the process lives.
+  - **A `connect` that `close()` gave up on is waited for**, for at most
+    `_RELEASE_WAIT_S` (8 s), with `join()`'s slices (FM-83): `close()` waited its
+    own 10 s, and the worker's late release (above) can only run while the process
+    lives. `close()` keeps the name of the activity it gave up on, so that the wait
+    is the same whether the connect ended before `release()` began or after.
     10 + 10 (the server's stop) + 8 is 28 s, inside `AppStopMethodConsole 30000`
     (§7.4). Only a `connect` is waited for: a run stuck in a vendor call is not
     made to wait longer, and `Microscope.close()` below meets it as before. What
     became of the connect is a closing line, added to `close_lines`:
-    - it ended within the wait: its own outcome (`connect: <stand> was opened
-      after the page closed, and released`), and `close_ended` is `True`;
+    - it ended: its own outcome (`connect: <stand> was opened after the page
+      closed, and released`, or what the opener raised), and `close_ended` is
+      `True`: the stand is not held;
     - it did not: `connect: <stand> is still opening after <n> s: the process
-      ends now, and whether the stand is left connected is not known`, and
-      `close_ended` stays `False` (exit 1).
+      ends now, and whether the stand is left connected is not known`, with
+      `<n>` the two waits' sum, and `close_ended` stays `False` (exit 1).
   - It drops the facade under `_lock`, waits for the reads in flight (below),
     then ends the facade as the `with Microscope.open(...)` block did, outside
     the lock: `microscope.__exit__(...)` with `unwinding`, so that a Ctrl-C the
