@@ -359,6 +359,33 @@ def test_a_click_on_the_next_button_draws_the_run_at_once(
         assert page.join(10.0)
 
 
+def test_the_refresh_button_forgets_the_last_outcome_and_a_redraw_does_not(
+    make_page: Callable[..., PlatePage],
+) -> None:
+    # The walk's strip kept `cells: ... run scan again` after the chain was run in a
+    # terminal and the page refreshed (m5 §8.8.3). Only the button forgets; the redraw
+    # that the end of a run makes must show the outcome it has just got.
+    page = make_page(tools=(Registration, ScanPlan, Slow))
+    view = PlatePageView(page)
+    page.run("slow", [])
+    try:
+        assert Slow.started.wait(5)
+        view.tick()
+    finally:
+        Slow.release.set()
+    assert page.join(10.0)
+    view.tick()  # the tick that sees the run end refreshes the view
+    assert view.run_text.object.startswith("slow done in ")
+    view.refresh()
+    view.tick()
+    assert view.run_text.object.startswith("slow done in ")
+
+    _click(view.refresh_button)
+
+    assert page.status().outcome is None
+    assert view.run_text.object == ""
+
+
 def test_the_next_button_runs_the_pairs_it_drew(
     make_page: Callable[..., PlatePage], run_doc: Path
 ) -> None:

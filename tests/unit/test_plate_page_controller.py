@@ -857,6 +857,52 @@ def test_a_stopped_or_failed_run_never_carries_an_assumption(
         page.close()
 
 
+# --- Refresh forgets the outcome (m5 §8.8.3) ----------------------------------------------
+
+
+def test_clear_outcome_forgets_the_last_outcome_when_nothing_runs(
+    page: PlatePage,
+) -> None:
+    _run_and_join(page, "stub")
+    assert page.status().outcome is not None
+    page.clear_outcome()
+    assert page.status().outcome is None
+    # A second call has nothing to forget and raises nothing.
+    page.clear_outcome()
+    assert page.status().outcome is None
+
+
+def test_clear_outcome_leaves_the_stop_note_alone(page: PlatePage) -> None:
+    page.run("slow", [])
+    assert Slow.started.wait(5)
+    page.stop()
+    assert page.join(10.0)
+    status = page.status()
+    assert status.outcome == "slow stopped"
+    assert status.stop_note is not None
+    page.clear_outcome()
+    after = page.status()
+    assert after.outcome is None
+    assert after.stop_note == status.stop_note
+
+
+def test_clear_outcome_does_nothing_while_an_activity_runs(page: PlatePage) -> None:
+    page.run("slow", [])
+    try:
+        assert Slow.started.wait(5)
+        # A text the running activity's page holds: it is not for a button to drop.
+        page._set_outcome("kept")
+        page.clear_outcome()
+        assert page.status().outcome == "kept"
+        assert page.status().running == "slow"
+    finally:
+        Slow.release.set()
+    assert page.join(10.0)
+    # The run's own end replaces the text, as it always does.
+    assert page.status().outcome is not None
+    assert page.status().outcome.startswith("slow done in ")
+
+
 def test_a_second_run_while_one_runs_is_refused(page: PlatePage) -> None:
     page.run("slow", [])
     assert Slow.started.wait(5)

@@ -503,7 +503,7 @@ class PlatePageView:
         self.select_input.param.watch(
             self._handler(lambda event: self.on_select_text(event.new)), "value"
         )
-        self.refresh_button.on_click(self._handler(lambda event: self.refresh()))
+        self.refresh_button.on_click(self._handler(lambda event: self.on_refresh()))
         self.next_button.on_click(self._handler(lambda event: self.on_next()))
         self.stop_button.on_click(self._handler(lambda event: self.on_stop()))
         self.resume_button.on_click(self._handler(lambda event: self.on_resume()))
@@ -851,6 +851,18 @@ class PlatePageView:
         if drive:
             # One click: an armed stage that stays armed after a mis-click is the danger.
             self.drive_toggle.value = False
+        self.refresh()
+        self.tick()
+
+    def on_refresh(self) -> None:
+        """The *Refresh* button: forget the last outcome, then read the run document and the stand again.
+
+        Only the button forgets the strip's outcome (m5 §8.8.3): ``refresh()`` is also
+        what every other handler and the end of a run call, and must not drop the
+        outcome it is about to show. The tick then redraws the strip, so the old
+        text is gone at once and not at the next period.
+        """
+        self.page.clear_outcome()
         self.refresh()
         self.tick()
 

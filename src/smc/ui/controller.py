@@ -1939,6 +1939,19 @@ class PlatePage:
         with self._lock:
             self._outcome = outcome
 
+    def clear_outcome(self) -> None:
+        """Forget the last activity's outcome, when no activity goes (m5 §8.8.3).
+
+        The outcome stays on the strip until the next activity replaces it, so that
+        ``cells: ... run scan again`` was still there after the chain had been run
+        from a terminal and the page refreshed. Only the *Refresh* button calls
+        this: ``view()``'s redraw is also what the end of a run triggers, and must
+        not drop the outcome it is about to show. The stop note is not touched.
+        """
+        with self._lock:
+            if self._current_run is None:
+                self._outcome = None
+
     # --- the view ---------------------------------------------------------------
 
     def tools(self) -> tuple[ToolView, ...]:
