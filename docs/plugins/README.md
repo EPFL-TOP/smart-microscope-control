@@ -40,7 +40,9 @@ and switches the autofocus off and on).
 ```text
 smc run --list
 smc run NAME --show-params
-smc run NAME [-p PROFILE] --run-doc PATH [--param KEY=VALUE]... [--dry-run] [--resume]
+smc run NAME [-p PROFILE] --run-doc PATH [--preset NAME|PATH] [--param KEY=VALUE]... [--dry-run] [--resume]
+smc presets list [-p PROFILE]
+smc presets show NAME|PATH [-p PROFILE] [--run-doc PATH]
 ```
 
 `--list` and `--show-params` open no stand. A run needs `--run-doc`: the JSON file
@@ -116,6 +118,52 @@ resumed either: its checkpoint was made against inputs that no longer match.
 When a run makes other stages stale (their input was produced again), one
 `! <plugin> read <slot> from an earlier run; run it again` line says so. Nothing
 is deleted or refused: running the stale stage again is the operator's call.
+
+## Presets: `smc run --preset` and `smc presets`
+
+A **preset** is the plate, the wells and the `--param` pairs an assay repeats, named
+and kept in a TOML file (the format and where the files are:
+[profiles/README.md](../../profiles/README.md#presets-the-assays-choices); on the plate
+page: [Presets](../ui/plate-page.md#presets)). It is a convenience: the run document
+keeps the values a run used.
+
+```text
+smc run scan-plan -p demo-sample --preset weekly --run-doc run.json
+smc run scan-plan -p demo-sample --preset weekly --param coverage=0.5 --run-doc run.json
+```
+
+`--preset` takes a name (looked for in the preset folders) or the path of a `.toml`
+file. The command applies **the preset first, then `--param`**: a key given by
+`--param` replaces the preset's value, so the preset is only ever a default. For the
+plugin that is run, the preset gives:
+
+- `scan-plan`'s `wells` and `plate-registration`'s `plate`, from the preset's own `wells`
+  and `plate` fields (they are not kept under `params`);
+- the pairs it names under `[params.<plugin>]`.
+
+Only the plugin run is looked at: the command imports no other plugin to check a
+preset. What of the preset does not apply is **printed before the run starts, one line
+each, and left out**; the rest of the assay still runs:
+
+```text
+preset weekly was saved on nikon-ti2; this stand is demo-sample
+preset weekly [params.scan-plan]: overlap is not a parameter of scan-plan (keys: <the plugin's parameters>)
+preset weekly is for a 96-well plate; this run document's plate is registered as a 384-well: its plate and wells are not applied
+```
+
+A value the plugin refuses is that run's own error (exit 2), as for a profile's
+`[suggest]`. An unknown or invalid preset is a usage error (exit 2) that names the
+folders searched, or the file and the field. The stage's record then holds
+`"preset": "weekly"`; `--resume` compares the parameters as it always does, so a preset
+that changed between the two runs is refused there for the parameters that differ.
+
+`smc presets list` shows each preset as `name  stand  plate  plugins  path`
+(`-` for what it leaves out), a file that cannot be read with its error, and the folders
+searched. `smc presets show NAME|PATH` prints one preset: its fields and pairs, then
+what would not apply here (against every registered plugin, the profile's stand and, with
+`--run-doc`, the plate that document registered; a missing file registers nothing), or
+`no mismatch on <stand>`. Neither opens a stand. There is no `smc presets save` yet: a
+preset is written by hand in the documented format, or from the plate page.
 
 ## Trying the workflow without a microscope
 
