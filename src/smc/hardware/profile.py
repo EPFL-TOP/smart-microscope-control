@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +50,7 @@ __all__ = [
     "SafetySection",
     "SampleSection",
     "SuggestSection",
+    "check_pairs",
     "list_profiles",
     "search_paths",
 ]
@@ -676,6 +678,33 @@ class SampleSection(_Section):
         return value
 
 
+def check_pairs(items: Sequence[str]) -> None:
+    """Refuse ``items`` unless each is a ``key=value`` pair with a key of its own.
+
+    The shape ``smc run --param`` takes, checked in one place for ``[suggest]``
+    and for a preset's ``params`` (m5 §10.1), so that what a stand suggests and
+    what an operator saves are refused with the same words. The key is the text
+    before the first ``=``: a value may hold more, and may be empty. Whether
+    the plugin has that key, and whether the value suits it, is the run's
+    business (``parse_params``), not this pure module's.
+
+    Raises:
+        ValueError: An item has no ``=``, an empty key or a key with a blank,
+            or two items give the same key.
+    """
+    seen: set[str] = set()
+    for item in items:
+        key, separator, _ = item.partition("=")
+        if not separator or not key or any(c.isspace() for c in key):
+            raise ValueError(
+                "each item of params is key=value, as smc run --param takes "
+                f"it; got '{item}'"
+            )
+        if key in seen:
+            raise ValueError(f"'{key}' given twice")
+        seen.add(key)
+
+
 class SuggestSection(_Section):
     """What this stand suggests for one plugin's run: its ``--param`` pairs and why (m5 §8.1).
 
@@ -699,17 +728,7 @@ class SuggestSection(_Section):
             raise ValueError(
                 "params needs at least one key=value item, as smc run --param takes it"
             )
-        seen: set[str] = set()
-        for item in value:
-            key, separator, _ = item.partition("=")
-            if not separator or not key or any(c.isspace() for c in key):
-                raise ValueError(
-                    "each item of params is key=value, as smc run --param takes "
-                    f"it; got '{item}'"
-                )
-            if key in seen:
-                raise ValueError(f"'{key}' given twice")
-            seen.add(key)
+        check_pairs(value)
         return value
 
     @field_validator("why")
