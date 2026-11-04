@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 import sys
+import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -131,6 +133,20 @@ class Cells(Tool):
     Params = CellsParams
 
 
+class Gate(Tool):
+    """A tool that runs until the test lets it go: an activity that is going, for as long as needed."""
+
+    name = provides = "gate"
+    entered = threading.Event()
+    release = threading.Event()
+
+    def run(self, microscope: Any, params: Any, ctx: RunContext) -> PluginResult:
+        Gate.entered.set()
+        # Bounded (FM-44): a test that never lets it go ends the run on its own.
+        Gate.release.wait(10.0)
+        return self.Result()
+
+
 WORKFLOW = (Registration, ScanPlan, Cells)
 
 SUGGEST = {
@@ -162,9 +178,14 @@ def _ep(cls: type[Tool]) -> EntryPoint:
 
 
 @pytest.fixture(autouse=True)
-def _work_in_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _work_in_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("SMC_PROFILES", raising=False)
+    Gate.entered.clear()
+    Gate.release.clear()
+    yield
+    # A test that failed with the gate shut must not leave its run waiting.
+    Gate.release.set()
 
 
 @pytest.fixture
@@ -193,14 +214,23 @@ def make_page(run_doc: Path) -> Iterator[Callable[..., PlatePage]]:
         stands.append(stand)
         return stand
 
-    def make(profile: Profile | None = None) -> PlatePage:
+    def make(
+        profile: Profile | None = None,
+        *,
+        tools: tuple[type[Tool], ...] = WORKFLOW,
+        connect: bool = False,
+    ) -> PlatePage:
         page = PlatePage.closed(
             profile or _profile(),
             run_doc,
             opener=open_stand,
-            entry_points=[_ep(cls) for cls in WORKFLOW],
+            entry_points=[_ep(cls) for cls in tools],
         )
         pages.append(page)
+        if connect:
+            page.connect()
+            assert page.join(5), "connect did not end"
+            assert page.connected, page.status().outcome
         return page
 
     try:
@@ -268,6 +298,15 @@ def _plate_done(run_doc: Path) -> None:
             result=result,
         ),
     )
+
+
+def _command_words(view: PlatePageView) -> list[str]:
+    """The words of the next step's ``command:`` line, as a POSIX shell splits them."""
+    prefix = "  command: "
+    (line,) = [
+        line for line in view.next_text.object.split("\n") if line.startswith(prefix)
+    ]
+    return shlex.split(line.removeprefix(prefix))
 
 
 def _field(view: PlatePageView, tool: str, key: str) -> Any:
@@ -361,7 +400,10 @@ def test_load_fills_every_field_from_the_preset_then_the_suggestion_then_empty(
     assert view.next_text.object is not None
     assert "overlap=0.2: suggested by the profile demo-sample" in view.next_text.object
     assert "coverage=0.7: from the preset weekly" in view.next_text.object
-    assert f"--preset {path}" in view.next_text.object
+    # Read back the way a shell reads it: a Windows path has backslashes, which
+    # `shlex.join` quotes, so the raw text of the path is not in the line there (FM-24).
+    words = _command_words(view)
+    assert words[words.index("--preset") + 1] == str(path)
 
 
 def test_a_field_changed_through_a_session_is_listed_in_the_note(
@@ -734,6 +776,44 @@ def test_the_preset_options_are_never_read_by_the_tick(
         _click(view.preset_save_button)
         # The save lists them for the select and `refresh()` lists them once more.
         assert len(calls) <= 3
+
+
+def test_no_preset_control_is_disabled_while_a_run_goes_and_each_one_works(
+    make_page: Callable[..., PlatePage], tmp_path: Path
+) -> None:
+    # None of them reaches the stand (m5 §10.6). The tools' buttons are greyed while an
+    # activity goes: that one is the contrast that shows the region is not.
+    _put(tmp_path)
+    page = make_page(tools=(Gate, *WORKFLOW), connect=True)
+    view = PlatePageView(page)
+    page.run("gate", [])
+    assert Gate.entered.wait(5.0), "the run did not start"
+    try:
+        view.tick()
+        assert view._running == "gate"
+        assert view.tool_runs["cells"].disabled
+        region = (
+            view.preset_select,
+            view.preset_load_button,
+            view.preset_name,
+            view.preset_save_button,
+            view.preset_overwrite_button,
+            view.preset_cancel_button,
+        )
+        assert not any(widget.disabled for widget in region)
+
+        _load(view)
+        assert page.preset is not None
+        assert page.preset.file.name == "weekly"
+        view.preset_name.value = "mine"
+        _click(view.preset_save_button)
+        assert view.message.object.startswith("saved mine to ")
+        assert page.preset.file.name == "mine"
+        # Still going: nothing the region did ended or refused the run.
+        assert page.status().running == "gate"
+    finally:
+        Gate.release.set()
+    assert page.join(10.0), "the run did not end"
 
 
 # --- another tab --------------------------------------------------------------------

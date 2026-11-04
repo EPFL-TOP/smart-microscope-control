@@ -11,6 +11,7 @@ import codecs
 import json
 import os
 import pickle
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,6 +20,7 @@ import pytest
 from pydantic import BaseModel
 
 from smc.hardware.profile import Profile
+from smc.plugins import presets as presets_module
 from smc.plugins.presets import (
     NOT_IN_PARAMS,
     Preset,
@@ -474,6 +476,122 @@ def test_a_preset_exists_error_survives_pickle(tmp_path: Path) -> None:
     assert isinstance(again, PresetExistsError)
     assert again.path == error.path
     assert str(again) == str(error)
+
+
+# -- what Notepad writes, and a path or a name -----------------------------------
+
+
+def _preset_text() -> str:
+    return 'stand = "bench"\nwells = "B2,B11"\n\n[params]\ncells = ["detector=blobs"]\n'
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        _preset_text().replace("\n", "\r\n").encode("utf-8"),
+        codecs.BOM_UTF8 + _preset_text().replace("\n", "\r\n").encode("utf-8"),
+    ],
+    ids=["crlf", "bom-and-crlf"],
+)
+def test_a_preset_saved_by_notepad_with_crlf_reads_back_as_the_same_preset(
+    profile: Profile, tmp_path: Path, raw: bytes
+) -> None:
+    # FM-80: Windows' editors write CRLF, with or without the byte-order mark. Written
+    # as bytes, so that the test is the same on every OS.
+    path = tmp_path / "notepad.toml"
+    path.write_bytes(raw)
+
+    loaded = load_preset(str(path), profile).preset
+
+    assert loaded == Preset(
+        stand="bench", wells="B2,B11", params={"cells": ("detector=blobs",)}
+    )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        'stand = "bé"\n'.encode("cp1252"),
+        _preset_text().encode("utf-16"),
+    ],
+    ids=["cp1252-ansi", "utf-16-unicode"],
+)
+def test_a_preset_not_saved_as_utf8_is_one_line_that_says_how_to_save_it(
+    profile: Profile, tmp_path: Path, raw: bytes
+) -> None:
+    path = tmp_path / "notepad.toml"
+    path.write_bytes(raw)
+
+    with pytest.raises(PresetError) as refused:
+        load_preset(str(path), profile)
+
+    message = str(refused.value)
+    assert message.startswith(f"{path}: cannot be read: not UTF-8 text (")
+    assert message.endswith("); save it as UTF-8")
+    assert "\n" not in message
+
+
+def test_saving_needs_tomli_w_and_nothing_else_does(
+    profile: Profile, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A PC updated with `git pull` and not reinstalled lacks the new package: every
+    # command must still start, and a save must say what is missing.
+    path = save_preset("mine", Preset(wells="A1"), profile)
+
+    with monkeypatch.context() as patched:
+        patched.setitem(sys.modules, "tomli_w", None)
+        with pytest.raises(PresetError, match=r"needs the tomli-w package"):
+            dumps_preset(Preset())
+        with pytest.raises(PresetError, match=r"needs the tomli-w package"):
+            save_preset("other", Preset(), profile)
+        # Reading, listing and checking use the standard library only.
+        assert load_preset("mine", profile).preset == Preset(wells="A1")
+        assert [entry.name for entry in list_presets(profile)] == ["mine"]
+    assert path.is_file()
+    assert not (path.parent / "other.toml").exists()
+
+
+def test_the_presets_module_imports_without_tomli_w() -> None:
+    # `smc.cli` imports it at its top: a missing package must not end every command.
+    code = (
+        "import sys; sys.modules['tomli_w'] = None; "
+        "import smc.cli, smc.plugins.presets as p; print(p.__file__)"
+    )
+    # The environment is kept (no `-I`): a copy of the tree under test is found by its
+    # `PYTHONPATH`, and the file printed says which code the child imported.
+    done = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=120,
+        check=False,
+    )
+
+    assert done.returncode == 0, done.stderr
+    assert Path(done.stdout.strip()) == Path(presets_module.__file__)
+
+
+def test_a_source_is_a_path_when_it_ends_in_toml_or_holds_a_separator(
+    profile: Profile, tmp_path: Path
+) -> None:
+    # Each clause of the rule on its own: `Profile.load` reads a path the same way.
+    folder = tmp_path / "work" / "profiles" / "presets"
+    _put(folder, "weekly", 'wells = "A1"\n')
+    (tmp_path / "work" / "plain.toml").write_text('wells = "B2"\n', encoding="utf-8")
+    (tmp_path / "work" / "noext").write_text('wells = "C3"\n', encoding="utf-8")
+
+    # A name is looked for in the folders.
+    assert load_preset("weekly", profile).path == folder / "weekly.toml"
+    # `.toml` alone makes it a path: read where the working directory is, never as a name.
+    by_extension = load_preset("plain.toml", profile)
+    assert (by_extension.name, by_extension.preset) == ("plain", Preset(wells="B2"))
+    # A separator alone makes it a path, with no extension.
+    by_separator = load_preset(f".{os.sep}noext", profile)
+    assert (by_separator.name, by_separator.preset) == ("noext", Preset(wells="C3"))
+    # And a name that is not a file is a name: the folders are named in the refusal.
+    with pytest.raises(PresetError, match=r"^no preset named plain; looked in "):
+        load_preset("plain", profile)
 
 
 # -- the check -------------------------------------------------------------------

@@ -31,7 +31,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import tomli_w
 import useq
 from pydantic import (
     AwareDatetime,
@@ -334,7 +333,22 @@ def dumps_preset(preset: Preset) -> str:
     Fields that are ``None`` are left out, so a preset that names no wells has
     no ``wells`` key. ``tomli-w`` quotes a key only where TOML needs it
     (``"my.plugin"``) and writes the time as ``2026-11-03 10:00:00+00:00``.
+
+    ``tomli-w`` is imported here and not at the top: only a save needs it, and
+    this module is imported by every ``smc`` command. A PC updated with ``git
+    pull`` and not reinstalled (no internet at the stand) must still run
+    ``smc doctor`` and the rest, and say what is missing when a preset is saved.
+
+    Raises:
+        PresetError: ``tomli-w`` is not installed.
     """
+    try:
+        import tomli_w
+    except ImportError:
+        raise PresetError(
+            "saving a preset needs the tomli-w package, which this install lacks: "
+            "run pip install -e . in the smc folder, then save again"
+        ) from None
     return _HEADER + tomli_w.dumps(preset.model_dump(mode="python", exclude_none=True))
 
 

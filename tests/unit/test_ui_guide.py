@@ -240,6 +240,28 @@ def test_preset_differences_name_each_changed_field_with_default_for_empty() -> 
     assert preset_differences({}, actual) == ()
 
 
+def test_preset_differences_compare_stripped_text_on_both_sides() -> None:
+    # A hand-edited `coverage= 0.4` puts " 0.4" in the field; what a run sends is the
+    # stripped text, so the page right after the load differs in nothing.
+    expected = {"scan-plan": {"coverage": " 0.4", "overlap": "0.1"}}
+
+    assert (
+        preset_differences(
+            expected, {"scan-plan": {"coverage": " 0.4 ", "overlap": "0.1"}}
+        )
+        == ()
+    )
+    assert (
+        preset_differences(
+            expected, {"scan-plan": {"coverage": "0.4", "overlap": "0.1"}}
+        )
+        == ()
+    )
+    assert preset_differences(
+        expected, {"scan-plan": {"coverage": "0.5", "overlap": "0.1"}}
+    ) == ("scan-plan coverage: 0.5 (the preset: 0.4)",)
+
+
 def test_preset_differences_show_a_long_value_on_one_cut_line_and_compare_it_whole() -> (
     None
 ):

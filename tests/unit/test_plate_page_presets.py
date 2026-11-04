@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import shlex
 import sys
+import threading
 from collections.abc import Callable, Iterator
 from datetime import datetime, timezone
 from importlib.metadata import EntryPoint
@@ -116,6 +117,20 @@ class Cells(Tool):
     Params = CellsParams
 
 
+class Gate(Tool):
+    """A tool that runs until the test lets it go: an activity that is going, for as long as needed."""
+
+    name = provides = "gate"
+    entered = threading.Event()
+    release = threading.Event()
+
+    def run(self, microscope: Any, params: Any, ctx: RunContext) -> PluginResult:
+        Gate.entered.set()
+        # Bounded (FM-44): a test that never lets it go ends the run on its own.
+        Gate.release.wait(10.0)
+        return self.Result()
+
+
 WORKFLOW = (Registration, ScanPlan, Cells)
 
 
@@ -124,10 +139,15 @@ def _ep(cls: type[Tool]) -> EntryPoint:
 
 
 @pytest.fixture(autouse=True)
-def _work_in_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _work_in_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """The preset folders are the test's own: ``./profiles/presets`` and ``./presets``."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("SMC_PROFILES", raising=False)
+    Gate.entered.clear()
+    Gate.release.clear()
+    yield
+    # A test that failed with the gate shut must not leave its run waiting.
+    Gate.release.set()
 
 
 @pytest.fixture
@@ -156,12 +176,17 @@ def make_page(run_doc: Path) -> Iterator[Callable[..., PlatePage]]:
         stands.append(stand)
         return stand
 
-    def make(profile: Profile | None = None, *, connect: bool = False) -> PlatePage:
+    def make(
+        profile: Profile | None = None,
+        *,
+        connect: bool = False,
+        tools: tuple[type[Tool], ...] = WORKFLOW,
+    ) -> PlatePage:
         page = PlatePage.closed(
             profile or _profile(),
             run_doc,
             opener=open_stand,
-            entry_points=[_ep(cls) for cls in WORKFLOW],
+            entry_points=[_ep(cls) for cls in tools],
         )
         pages.append(page)
         if connect:
@@ -371,6 +396,84 @@ def test_a_load_is_allowed_while_the_stand_is_not_connected(
     assert not page.connected
 
     assert page.load_preset(str(_put(tmp_path))).file.name == "weekly"
+
+
+def test_a_load_and_a_save_are_allowed_while_a_run_goes(
+    make_page: Callable[..., PlatePage], tmp_path: Path
+) -> None:
+    # No preset action reaches the stand, and a run in flight has already read its
+    # pairs: nothing is refused for an activity (m5 §10.5, the plan's "decided here").
+    path = _put(tmp_path)
+    page = make_page(connect=True, tools=(Gate, *WORKFLOW))
+    page.run("gate", [])
+    assert Gate.entered.wait(5.0), "the run did not start"
+    try:
+        assert page.status().running == "gate"
+
+        loaded = page.load_preset(str(path))
+        saved = page.save_preset("mine", {"cells": ["detector=blobs"]}, "")
+
+        assert page.status().running == "gate"
+        assert loaded.file.name == "weekly"
+        assert saved.file.name == "mine"
+    finally:
+        Gate.release.set()
+    assert page.join(10.0), "the run did not end"
+
+
+def test_load_preset_keeps_walls_alone_on_another_plate(
+    make_page: Callable[..., PlatePage], tmp_path: Path
+) -> None:
+    # Walls are captures like centres: `choose_plate` would drop them as well.
+    path = _put(tmp_path, text=WEEKLY.replace("96-well", "384-well"))
+    page = make_page()
+    walls = (WallTouch(well="A1", side="left", x_um=1.0, y_um=2.0),)
+    page.walls = walls
+
+    loaded = page.load_preset(str(path))
+
+    assert page.plate == "96-well"
+    assert page.walls == walls
+    assert loaded.selection is None
+    assert loaded.mismatches == (
+        "preset weekly is for a 384-well plate; this page has captures on a "
+        "96-well plate: its plate and wells are not applied",
+    )
+
+
+def test_captures_on_the_presets_own_plate_do_not_stop_its_wells(
+    make_page: Callable[..., PlatePage], tmp_path: Path
+) -> None:
+    # The same plate: nothing would be dropped, so nothing is withheld. A guard that
+    # looked only at the captures would refuse the preset's wells here.
+    path = _put(tmp_path)
+    page = make_page()
+    refs = (WellRef(well="A1", x_um=1.0, y_um=2.0),)
+    page.refs = refs
+
+    loaded = page.load_preset(str(path))
+
+    assert page.refs == refs
+    assert page.selection == ("B2", "B11")
+    assert loaded.selection == ("B2", "B11")
+    assert loaded.mismatches == ()
+
+
+def test_a_save_on_a_page_with_captures_is_not_a_mismatch_of_its_own_preset(
+    make_page: Callable[..., PlatePage],
+) -> None:
+    # `save_preset` ends in a load of what it wrote: the page's own plate, so no capture
+    # is at risk and nothing is withheld.
+    page = make_page()
+    refs = (WellRef(well="A1", x_um=1.0, y_um=2.0),)
+    page.refs = refs
+    page.select_text("A1:B2")
+
+    saved = page.save_preset("mine", {}, "A1:B2")
+
+    assert page.refs == refs
+    assert saved.mismatches == ()
+    assert saved.selection == page.selection
 
 
 # --- the record -------------------------------------------------------------------

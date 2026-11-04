@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from pydantic import BaseModel
 from pymmcore_plus import CMMCorePlus
 from typer.testing import CliRunner, Result
 
@@ -27,7 +28,7 @@ from smc.cli import app
 from smc.hardware import Microscope
 from smc.hardware.profile import Profile
 from smc.plugins import registry as registry_mod
-from smc.plugins.api import PluginParams, PluginResult, RunContext
+from smc.plugins.api import PluginParams, PluginResult, RunContext, StopRequested
 from smc.plugins.registry import GROUP
 from smc.plugins.scan_plan.plugin import ScanPlanParams
 from smc.plugins.slots import PlateResult
@@ -104,6 +105,20 @@ class Registration:
 
     def run(self, microscope: Any, params: PlateParams, ctx: RunContext) -> EchoResult:
         return EchoResult(plate=params.plate)
+
+
+class Seen(BaseModel):
+    done: int
+
+
+class StoppingPlan(Plan):
+    """``scan-plan`` that stops itself after one unit; the attempt resumed from it finishes."""
+
+    def run(self, microscope: Any, params: PlanParams, ctx: RunContext) -> EchoResult:
+        if ctx.checkpoint(Seen) is None:
+            ctx.save_checkpoint(Seen(done=1))
+            raise StopRequested
+        return EchoResult(wells=params.wells, coverage=params.coverage)
 
 
 def _register(monkeypatch: pytest.MonkeyPatch, *classes: type) -> None:
@@ -392,6 +407,54 @@ def test_the_plate_of_a_preset_reaches_plate_registration_and_refs_do_not(
     ) in _lines(result)
 
 
+def test_a_bare_toml_file_name_is_a_path_not_a_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_stand: list[bool]
+) -> None:
+    # `NAME|PATH`: `mine.toml` in the working directory is read as the file it is, and its
+    # name is its stem; it is in no preset folder, so a name would not find it.
+    _register(monkeypatch, Cells)
+    _put(tmp_path, "mine", WEEKLY)
+
+    result = _run("run", "cells", "--preset", "mine.toml", "--run-doc", _doc(tmp_path))
+
+    assert result.exit_code == 0, result.output
+    assert _stored(tmp_path, "cells").preset == "mine"
+    assert _stored(tmp_path, "cells").params == {"detector": "blobs"}
+
+
+def test_a_resumed_stage_names_the_preset_and_a_changed_preset_is_the_guards_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_stand: list[bool]
+) -> None:
+    # The resume guard compares the parameters as it always did; no rule of its own for a
+    # preset (the plan's "do not add a preset-specific rule").
+    _register(monkeypatch, StoppingPlan)
+    path = _weekly(tmp_path)
+    doc = _doc(tmp_path)
+    stopped = _run("run", "scan-plan", "--preset", str(path), "--run-doc", doc)
+    assert stopped.exit_code == 130, stopped.output
+    assert _stored(tmp_path, "scan-plan").status is StageStatus.stopped
+    assert _stored(tmp_path, "scan-plan").preset == "weekly"
+
+    path.write_text(WEEKLY.replace("coverage=0.4", "coverage=0.9"), encoding="utf-8")
+    changed = _run(
+        "run", "scan-plan", "--preset", str(path), "--resume", "--run-doc", doc
+    )
+    assert changed.exit_code == 2
+    assert "the parameters differ from the run being resumed: coverage" in _plain(
+        changed
+    )
+    assert _stored(tmp_path, "scan-plan").status is StageStatus.stopped
+
+    path.write_text(WEEKLY, encoding="utf-8")
+    resumed = _run(
+        "run", "scan-plan", "--preset", str(path), "--resume", "--run-doc", doc
+    )
+    assert resumed.exit_code == 0, resumed.output
+    record = _stored(tmp_path, "scan-plan")
+    assert record.status is StageStatus.done
+    assert record.preset == "weekly"
+
+
 def test_an_unknown_preset_exits_2_and_names_the_folders(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_stand: None
 ) -> None:
@@ -481,6 +544,30 @@ def test_presets_list_shows_each_preset_and_a_broken_file(tmp_path: Path) -> Non
     assert broken.endswith(f"  {bad}")
     assert lines[-1] == f"searched: {folders}"
     assert [line.split()[0] for line in lines[:-1]] == ["alpha", "bad", "weekly"]
+
+
+def test_presets_list_looks_in_the_folder_of_the_profile_it_is_given(
+    tmp_path: Path,
+) -> None:
+    # `-p` names the stand whose presets are listed: a preset beside a profile that is
+    # outside the working directory is found, and its folder heads the search.
+    stand = tmp_path / "stand"
+    stand.mkdir()
+    profile = stand / "bench.toml"
+    profile.write_text('[microscope]\nname = "bench"\n', encoding="utf-8")
+    own = _put(stand / "presets", "own", 'stand = "bench"\n')
+
+    result = _run("presets", "list", "-p", str(profile))
+
+    assert result.exit_code == 0, result.output
+    lines = _lines(result)
+    assert lines[0] == f"own  bench  -  -  {own}"
+    assert lines[-1] == (
+        f"searched: {stand / 'presets'}, {tmp_path / 'profiles' / 'presets'}, "
+        f"{tmp_path / 'presets'}"
+    )
+    # Without -p it is the demo's folders, and the stand's preset is not there.
+    assert _run("presets", "list").output.splitlines()[0].startswith("no presets;")
 
 
 def test_presets_list_with_none_says_where_it_searched(tmp_path: Path) -> None:

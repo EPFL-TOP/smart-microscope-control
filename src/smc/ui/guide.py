@@ -138,9 +138,12 @@ def preset_differences(
     lines: list[str] = []
     for plugin, fields in expected.items():
         now = actual.get(plugin, {})
-        for key, wanted in fields.items():
+        for key, given in fields.items():
+            # Both sides stripped: what a run sends is the stripped text, and a value
+            # a hand edit left a space in is not a difference.
+            wanted = given.strip()
             found = now.get(key, "").strip()
-            if found != wanted.strip():
+            if found != wanted:
                 lines.append(
                     f"{plugin} {key}: {_shown(found)} (the preset: {_shown(wanted)})"
                 )
