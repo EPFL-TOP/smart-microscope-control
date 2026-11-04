@@ -691,9 +691,9 @@ class PlatePageView:
             label="Save as", placeholder="weekly", width=280
         )
         self.preset_save_button = pn.widgets.Button(label="Save", width=80)
-        self.preset_confirm_text = pn.pane.Str(
-            "", styles={"color": _WARNING, "white-space": "pre-wrap"}, width=380
-        )
+        # Wrapped anywhere: the question names the file that exists, a path with no
+        # space in it, which `pre-wrap` alone cut at the column's edge (/ui-check, FM-153).
+        self.preset_confirm_text = _wrapped_text(extra={"color": _WARNING})
         self.preset_overwrite_button = pn.widgets.Button(
             label="Overwrite", color="danger"
         )

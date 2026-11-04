@@ -302,6 +302,12 @@ def test_the_preset_region_heads_the_right_column(
     assert not view.preset_confirm.visible
     assert view.preset_note.object == "no preset loaded"
     assert view.preset_select.options == {"(none)": ""}
+    # The note and the question hold paths with no space in them: both wrap anywhere,
+    # which `pre-wrap` alone did not (the question was cut at the column's edge,
+    # seen with /ui-check, FM-153).
+    for text in (view.preset_note, view.preset_confirm_text):
+        assert text.styles["overflow-wrap"] == "anywhere"
+        assert text.styles["white-space"] == "pre-wrap"
 
 
 def test_the_options_are_the_presets_of_the_folders_and_leave_a_broken_file_out(
