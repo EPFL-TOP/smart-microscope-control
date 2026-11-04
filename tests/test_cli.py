@@ -42,6 +42,8 @@ from smc.hardware.errors import (
     note_stop,
 )
 from smc.hardware.microscope import MicroscopeState
+from smc.hardware.profile import Profile
+from smc.hardware.roles import Role
 
 runner = CliRunner(env={"COLUMNS": "200", "SMC_PROFILE": None, "SMC_PROFILES": None})
 
@@ -924,6 +926,36 @@ _XY_DECLARED_LINE = (
     "stop_refused_by): once sent, a move runs to its target, and Ctrl-C ends smc, "
     "not the move"
 )
+
+
+def test_say_stop_refused_reads_the_profile_section_and_filters_by_roles(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # One decision in one place (#305): the commands that hold a stand pass
+    # `microscope.profile.safety`, `smc ui` the section of the profile it has loaded.
+    demo = Profile.demo().safety
+    cli._say_stop_refused(demo)
+    assert capsys.readouterr().out == ""
+    declared = demo.model_copy(update={"stop_refused_by": (Role.xy_stage, Role.focus)})
+    cli._say_stop_refused(declared)
+    assert capsys.readouterr().out.splitlines() == [
+        "! the profile declares that this stand refuses stop() on xy_stage and "
+        "focus ([safety] stop_refused_by): once sent, a move runs to its target, "
+        "and Ctrl-C ends smc, not the move"
+    ]
+    # `roles` narrows what is named to what the profile declares of them.
+    cli._say_stop_refused(declared, [Role.focus, Role.autofocus])
+    assert capsys.readouterr().out.splitlines() == [
+        "! the profile declares that this stand refuses stop() on focus "
+        "([safety] stop_refused_by): once sent, a move runs to its target, and "
+        "Ctrl-C ends smc, not the move"
+    ]
+    cli._say_stop_refused(declared, [Role.autofocus])
+    assert capsys.readouterr().out == ""
+    # A role the move touches but the profile does not declare is not named.
+    only_xy = demo.model_copy(update={"stop_refused_by": (Role.xy_stage,)})
+    cli._say_stop_refused(only_xy, [Role.xy_stage, Role.focus])
+    assert capsys.readouterr().out.splitlines() == [_XY_DECLARED_LINE]
 
 
 @pytest.mark.demo

@@ -56,10 +56,14 @@ where the stand is:
 | The stand | The row says | Enabled |
 |---|---|---|
 | closed (the page as it opens) | `<stand> is not connected: Connect opens it, and the controls that need the stand are disabled until then` | Connect |
+| Connect is opening it | `connecting <stand>…` | neither |
 | held | `Disconnect releases <stand> for another program (NIS-Elements, ZEN)` | Disconnect |
+| Disconnect is releasing it | `disconnecting <stand>…` | neither |
 
 `(dry run)` is added when it is one. Both buttons are disabled while anything goes
-(a run, a snap, live, a drive action, a connect).
+(a run, a snap, live, a drive action, a connect, a disconnect), and the capture
+buttons with them. A slow stand takes seconds to open: `connecting…` is what says the
+page is not stuck.
 
 - **Connect** opens the profile the command names (one PC serves one stand; the demo
   is another `smc ui -p demo` on another port), on the page's worker. It says
@@ -69,10 +73,23 @@ where the stand is:
   ends `, and halted: STOP was pressed while it connected`. A new stand is never
   halted: Connect clears the last STOP's note.
 - **Disconnect** releases the stand for another program: `disconnect: <stand>
-  released`. It stops what still moves, then unloads the devices, and **switches
+  released`. It waits, for up to 5 s, for a status read or a STOP that is inside the
+  stand, then stops what still moves and unloads the devices, and **switches
   nothing off**: a light or an autofocus stays as the stand keeps it. It is refused
   while a run, a snap, live or a drive action goes (`<name> is running`), even if a
-  browser sends the click.
+  browser sends the click. It says `released` only when it is true:
+  - `disconnect: <stand> released, with <n> read(s) still in flight after 5 s`: a
+    read did not end in time, and the devices were unloaded under it. The page showed
+    a line, never a crash;
+  - `disconnect: MicroscopeBusyError: <why>; the stand is still connected`: another
+    call held the stand too long (a driver that does not answer), nothing was
+    unloaded, and **the page is connected again**: press Disconnect to retry;
+  - `disconnect: <stand> may still be held: its devices did not unload (<why>);
+    restart smc ui before another program takes it`: the driver would not let go. The
+    page is not connected, but the stand may be held until the process ends: do not
+    start NIS-Elements or ZEN before restarting `smc ui`;
+  - `disconnect: <Type>: <why>` for any other error: the page has let go of the
+    stand, which may be half unloaded.
 - **With the stand closed** every control that needs it is disabled, and the row's
   line is the reason: the strip says `<stand> | not connected` (and `DRY RUN`), every
   tool's note and the Drive region say `the stand is not connected` once, Snap,
@@ -107,9 +124,11 @@ Connect opened it, is released after. What the command prints last depends on wh
 | The stand refused the stop (the Ti2-E's does) | `<plugin> told to stop; halted, but <why>`, then how the run ended: a move under way runs to its target, so it is never "stopped" by default |
 | The run failed while it was stopped | the stop's line, then `<plugin>: <Error>: <message>`, exit 0 |
 | The run did not end within the wait | the stop's line, then `✗ <plugin> did not end within 10 s`, **exit 1**; the stand is released under a run that is still alive |
+| A Connect was still opening a slow stand | the command waits up to 8 s more, then `connect: <stand> was opened after the page closed, and released` (exit 0), or `✗ connect: <stand> is still opening after 18 s: the process ends now, and whether the stand is left connected is not known` (**exit 1**) |
 
 A second Ctrl-C during the wait still releases the stand, and the command exits 130;
-the stop was already sent. A closed or reloaded browser tab does **nothing** to a run:
+the stop was already sent. The line it prints still names the motions the layer was
+tracking when the stand was released. A closed or reloaded browser tab does **nothing** to a run:
 the page belongs to the server, not to the tab. Only STOP, Ctrl-C of the command and
 the plugin's own end stop a scan. Two tabs on one server share the selection, the plate
 and the captures: a tab draws what another tab changed within a second.

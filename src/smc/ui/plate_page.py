@@ -1173,18 +1173,27 @@ class PlatePageView:
 
         Both are disabled while an activity goes (live included), so that
         Disconnect is never offered under a run; the controller refuses a click
-        all the same (FM-169).
+        all the same (FM-169). While ``connect`` or ``disconnect`` is the activity
+        the row says so: on a slow stand it would otherwise read ``Connect opens it``
+        beside a greyed-out button, and the page would look stuck (m5 §7.3, #305).
         """
         busy = status.running is not None
         self.connect_button.disabled = busy or status.connected
         self.disconnect_button.disabled = busy or not status.connected
-        text = (
-            f"Disconnect releases {status.stand} for another program (NIS-Elements, "
-            f"ZEN)"
-            if status.connected
-            else f"{status.stand} is not connected: Connect opens it, and the "
-            f"controls that need the stand are disabled until then"
-        )
+        if status.running == "connect":
+            text = f"connecting {status.stand}…"
+        elif status.running == "disconnect":
+            text = f"disconnecting {status.stand}…"
+        elif status.connected:
+            text = (
+                f"Disconnect releases {status.stand} for another program "
+                f"(NIS-Elements, ZEN)"
+            )
+        else:
+            text = (
+                f"{status.stand} is not connected: Connect opens it, and the "
+                f"controls that need the stand are disabled until then"
+            )
         if status.dry_run:
             text += " (dry run)"
         self.connection_text.object = text

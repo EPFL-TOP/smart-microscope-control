@@ -78,6 +78,7 @@ from smc.hardware.profile import (
     DEMO_NAME,
     ROLES_WITH_A_STOP,
     Profile,
+    SafetySection,
     list_profiles,
     search_paths,
 )
@@ -176,6 +177,28 @@ def _configure_logging(level: int) -> Callable[[], None]:
 
     def undo() -> None:
         logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+
+    return undo
+
+
+def _log_ui_at_info() -> Callable[[], None]:
+    """Put the ``smc.ui`` logger at INFO, unless it is lower already; return the call that puts its level back.
+
+    The page's outcomes (``connect: ... connected``, a failed Connect, ``disconnect:
+    ... released``) and STOP's note are INFO lines, and a service has no ``-v``: at
+    the default WARNING its log would hold none of what the page did (m5 §7.1, #305).
+    Only this logger: nothing from ``smc.hardware`` changes level, so a device
+    command per tick is still not written. ``-v`` and ``--debug`` keep their lower
+    levels. Put back when the command ends, as ``_configure_logging``'s undo does:
+    ``app`` also runs inside other programs, whose loggers outlive it.
+    """
+    logger = logging.getLogger("smc.ui")
+    previous_level = logger.level
+    if logger.getEffectiveLevel() > logging.INFO:
+        logger.setLevel(logging.INFO)
+
+    def undo() -> None:
         logger.setLevel(previous_level)
 
     return undo
@@ -391,10 +414,15 @@ def _stop_refused_line(roles: Iterable[Role]) -> str | None:
 
 
 def _say_stop_refused(
-    microscope: Microscope, roles: Iterable[Role] | None = None
+    safety: SafetySection, roles: Iterable[Role] | None = None
 ) -> None:
-    """Print ``_stop_refused_line`` for ``roles`` the profile declares (every one by default)."""
-    declared = microscope.profile.safety.stop_refused_by
+    """Print ``_stop_refused_line`` for ``roles`` the profile declares (every one by default).
+
+    Takes the profile's safety section, not the facade, so that the decision is
+    made in one place: the commands that hold a stand pass ``microscope.profile.safety``,
+    and ``smc ui`` the profile it has loaded, before any stand is open (m5 §7.1).
+    """
+    declared = safety.stop_refused_by
     line = _stop_refused_line(
         declared if roles is None else [r for r in roles if r in declared]
     )
@@ -700,7 +728,7 @@ def doctor(
 
                     for line in sample_lines(loaded.sample):
                         _say(line)
-                _say_stop_refused(microscope)
+                _say_stop_refused(microscope.profile.safety)
                 # One read decides the exit code and is the line printed: a
                 # flaky device read twice could show "XY ?" beside the ✓.
                 state = microscope.state()
@@ -1407,7 +1435,7 @@ def _drive_command(
     ):
         microscope.require(capability)
         if stop_refused and not dry_run:
-            _say_stop_refused(microscope, stop_refused)
+            _say_stop_refused(microscope.profile.safety, stop_refused)
         try:
             result = action(microscope)
         except refusals as exc:
@@ -2138,7 +2166,7 @@ def run_command(
         )
         with Microscope.open(loaded, dry_run=dry_run) as microscope:
             if not dry_run:
-                _say_stop_refused(microscope)
+                _say_stop_refused(microscope.profile.safety)
             record = run_plugin(
                 entry.plugin,
                 microscope,
@@ -2224,26 +2252,33 @@ def ui_command(
         if not dry_run:
             # From the profile: the stand is not open yet, and the operator must
             # know before the first move that Ctrl-C does not end it (m2 §11.6).
-            line = _stop_refused_line(loaded.safety.stop_refused_by)
-            if line is not None:
-                _say(line)
-        closing: tuple[str, ...] = ()
-        ended = True
-        # The stand is the operator's: Connect opens it on the page, Disconnect
-        # releases it. A service that (re)starts never takes it (m5 §7).
-        controller = PlatePage.closed(loaded, path, dry_run=dry_run)
+            _say_stop_refused(loaded.safety)
+        # The checks have passed: from here the log holds what the page does, at
+        # the default level too (m5 §7.1). Put back by the outermost `finally`.
+        restore_log_level = _log_ui_at_info()
         try:
-            plate_page.serve(controller, port=port)
-        finally:
+            # The stand is the operator's: Connect opens it on the page, Disconnect
+            # releases it. A service that (re)starts never takes it (m5 §7).
+            controller = PlatePage.closed(loaded, path, dry_run=dry_run)
             try:
-                # The stop is sent before the wait, so a second Ctrl-C during it
-                # still loses nothing, and the inner `finally` releases whatever
-                # stand the page holds (FM-71). A page that `serve` already closed
-                # returns at once.
-                controller.close()
-                closing, ended = controller.close_lines, controller.close_ended
+                plate_page.serve(controller, port=port)
             finally:
-                controller.release()
+                try:
+                    # The stop is sent before the wait, so a second Ctrl-C during it
+                    # still loses nothing, and the inner `finally` releases whatever
+                    # stand the page holds (FM-71). A page that `serve` already
+                    # closed returns at once.
+                    controller.close()
+                finally:
+                    # The exception this command is leaving with, or None: the
+                    # release ends the facade as the old `with` block did, so a
+                    # Ctrl-C is noted with the motions still tracked (m2 §11.11 E6).
+                    controller.release(sys.exc_info()[1])
+        finally:
+            restore_log_level()
+        # `release()` may add to these (a Connect that was still opening), so they
+        # are read after it.
+        closing, ended = controller.close_lines, controller.close_ended
         # After the stand is released: what the stop did and how the run ended, as the
         # page worded them. A run that did not end is a failure, and the stand was
         # released under it (FM-117: never "stopped" by default).

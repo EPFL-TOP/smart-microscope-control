@@ -11,6 +11,7 @@ stand-in, never sent as a signal (FM-44).
 from __future__ import annotations
 
 import errno
+import logging
 import os
 import re
 import socket
@@ -804,6 +805,102 @@ def test_a_second_ctrl_c_during_close_still_releases_the_stand(
     assert result.exit_code == 130, result.output
     assert "✗ interrupted" in result.output
     assert "slow was stopped" not in result.output
+
+
+def test_a_second_ctrl_c_in_close_keeps_the_note_of_the_motions_still_tracked(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_stand: list[Microscope],
+    closes: list[Microscope],
+    tmp_path: Path,
+) -> None:
+    # A Ctrl-C landing after `close()` set its flag: `release()` refuses before that.
+    # `release()` used to call `close()` directly, which lost the note that
+    # `Microscope.__exit__` writes for the motions still tracked (m2 §11.11 E6, #305).
+    class LateCtrlC(PlatePage):
+        def close(self) -> None:
+            super().close()
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(controller_module, "PlatePage", LateCtrlC)
+
+    def serve(page: PlatePage, *, port: int) -> None:
+        _connected(page)
+        fake_stand[0]._executor.moving = lambda: ("xy",)  # type: ignore[method-assign]
+
+    _stand_in(monkeypatch, serve)
+    result = _plate(doc=tmp_path / "run.json")
+    assert closes == fake_stand
+    assert result.exit_code == 130, result.output
+    line = next(ln for ln in result.output.splitlines() if ln.startswith("✗ "))
+    assert "xy was still tracked as moving when the stand was released" in line
+
+
+def test_ui_prints_what_release_added_to_the_closing_lines(
+    monkeypatch: pytest.MonkeyPatch, no_stand: None, tmp_path: Path
+) -> None:
+    # `release()` may add to `close_lines` (a Connect that was still opening): they
+    # are read after it, and `close_ended=False` is the exit code 1 (m5 §7.1).
+    seen: list[str] = []
+    added = {"ended": True}
+
+    def release(self: PlatePage, unwinding: BaseException | None = None) -> None:
+        seen.append("release")
+        self.close_lines = (*self.close_lines, "connect: demo says what became of it")
+        self.close_ended = added["ended"]
+
+    monkeypatch.setattr(PlatePage, "release", release)
+    _stand_in(monkeypatch, lambda page, *, port: None)
+    result = _plate(doc=tmp_path / "run.json")
+    assert seen == ["release"]
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines()[-1] == "connect: demo says what became of it"
+    added["ended"] = False
+    failed = _plate(doc=tmp_path / "run.json")
+    assert failed.exit_code == 1, failed.output
+    assert failed.output.splitlines()[-1] == "✗ connect: demo says what became of it"
+
+
+def test_ui_logs_the_pages_outcomes_at_the_default_level_and_puts_the_level_back(
+    monkeypatch: pytest.MonkeyPatch, no_stand: None, tmp_path: Path
+) -> None:
+    # A service has no `-v`: at the default WARNING its log held none of what the page
+    # did (m5 §7.1, #305). Only `smc.ui` is raised, never the hardware layer's.
+    ui_log = logging.getLogger("smc.ui")
+    before = ui_log.level
+    while_serving: list[int] = []
+
+    def serve(page: PlatePage, *, port: int) -> None:
+        while_serving.append(ui_log.level)
+        ui_log.info("connect: demo connected, 14 devices")
+        ui_log.debug("a debug line of the page")
+        logging.getLogger("smc.hardware.microscope").info("a command sent to a device")
+
+    _stand_in(monkeypatch, serve)
+    result = _plate(doc=tmp_path / "run.json")
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert "INFO connect: demo connected, 14 devices" in lines
+    assert "a command sent to a device" not in result.output
+    assert "a debug line of the page" not in result.output
+    assert while_serving == [logging.INFO]
+    assert ui_log.level == before
+
+    # `--debug` keeps its lower level: the command never raises a logger.
+    debug = runner.invoke(
+        app,
+        [
+            "--debug",
+            "ui",
+            "--run-doc",
+            str(tmp_path / "run.json"),
+            "--port",
+            str(_free_port()),
+        ],
+    )
+    assert debug.exit_code == 0, debug.output
+    assert "DEBUG a debug line of the page" in debug.output.splitlines()
+    assert while_serving[-1] == before
+    assert ui_log.level == before
 
 
 def test_smc_starts_without_importing_panel() -> None:
