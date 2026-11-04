@@ -12,6 +12,7 @@ from __future__ import annotations
 import shlex
 import sys
 from collections.abc import Callable, Iterator
+from datetime import datetime, timezone
 from importlib.metadata import EntryPoint
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -198,8 +199,6 @@ def _put(tmp_path: Path, name: str = "weekly", text: str = WEEKLY) -> Path:
 
 
 def _plate_done(run_doc: Path, plate: str = "96-well") -> None:
-    from datetime import datetime, timezone
-
     then = datetime(2026, 11, 3, 9, 0, tzinfo=timezone.utc)
     result = PlateResult(
         plate=plate,
