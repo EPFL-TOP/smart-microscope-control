@@ -280,10 +280,14 @@ def test_preset_differences_show_a_long_value_on_one_cut_line_and_compare_it_who
     assert len(line) < 220
 
 
-def _loaded(
-    mismatches: Sequence[str] = (), *, path: str = "/p/weekly.toml"
-) -> LoadedPreset:
-    file = PresetFile("weekly", Path(path), Preset())
+#: The note writes the path as the OS spells it (`\p\weekly.toml` on Windows, FM-24), so
+#: the expected text is made from the path and not typed.
+PRESET_PATH = Path("/p/weekly.toml")
+LOADED_LINE = f"loaded: weekly  ({PRESET_PATH})"
+
+
+def _loaded(mismatches: Sequence[str] = ()) -> LoadedPreset:
+    file = PresetFile("weekly", PRESET_PATH, Preset())
     return LoadedPreset(
         file=file,
         check=PresetCheck("weekly", None, None, {}, ()),
@@ -296,7 +300,7 @@ def _loaded(
 def test_preset_note_text_says_none_loaded_and_when_the_page_holds_the_values() -> None:
     assert preset_note_text(None, ()) == "no preset loaded"
     assert preset_note_text(_loaded(), ()) == (
-        "loaded: weekly  (/p/weekly.toml)\nthe page holds the preset's values"
+        f"{LOADED_LINE}\nthe page holds the preset's values"
     )
 
 
@@ -307,7 +311,7 @@ def test_preset_note_text_lists_the_mismatches_then_what_changed() -> None:
     )
 
     assert note.split("\n") == [
-        "loaded: weekly  (/p/weekly.toml)",
+        LOADED_LINE,
         "  preset weekly was saved on nikon-ti2; this stand is demo",
         "changed since loading:",
         "  scan-plan coverage: 0.5 (the preset: 0.4)",
@@ -321,7 +325,7 @@ def test_preset_note_text_cuts_mismatches_and_differences_at_eight() -> None:
     lines = preset_note_text(_loaded(mismatches), differences).split("\n")
 
     assert lines == [
-        "loaded: weekly  (/p/weekly.toml)",
+        LOADED_LINE,
         *[f"  mismatch {n}" for n in range(8)],
         "  … 3 more",
         "changed since loading:",
