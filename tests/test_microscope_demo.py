@@ -1119,3 +1119,32 @@ def test_close_behind_a_hung_snap_fails_with_a_diagnosis(demo_core: Any) -> None
     assert spy.calls[-1] == "unloadAllDevices"
     m.close()  # and a third close is a no-op
     assert spy.calls.count("unloadAllDevices") == 1
+
+
+def test_a_close_whose_unload_fails_is_told_by_unload_error_and_does_not_raise(
+    demo_core: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    # #305, m1 §7: close() logs a failed unload and returns, so a second close()
+    # is a no-op; the plate page's Disconnect needs the text to tell the operator
+    # that the stand may still be held.
+    spy = _Spy(demo_core)
+    m = Microscope.from_core(spy, Profile.demo())
+    assert m.unload_error is None
+
+    def broken() -> None:
+        raise RuntimeError("unload: no answer")
+
+    spy.unloadAllDevices = broken  # type: ignore[method-assign]
+    with caplog.at_level(logging.ERROR, logger=LOGGER):
+        m.close()
+    assert m.unload_error == "RuntimeError('unload: no answer')"
+    assert any("unloading the devices failed" in line for line in caplog.messages)
+    m.close()  # a no-op, and it keeps what it knew
+    assert m.unload_error == "RuntimeError('unload: no answer')"
+
+
+def test_a_close_that_unloads_leaves_unload_error_empty(demo_core: Any) -> None:
+    m = Microscope.from_core(_Spy(demo_core), Profile.demo())
+    m.close()
+    assert m.unload_error is None
+    assert list(demo_core.getLoadedDevices()) == ["Core"]

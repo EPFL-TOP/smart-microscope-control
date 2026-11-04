@@ -11,8 +11,10 @@ warnings are errors here (FM-147).
 from __future__ import annotations
 
 import os
+import re
 import threading
 from collections.abc import Iterator
+from contextlib import contextmanager
 from importlib.metadata import EntryPoint
 from pathlib import Path
 from typing import Any, ClassVar, cast
@@ -26,6 +28,8 @@ else:
 
 from pymmcore_plus import CMMCorePlus
 
+import smc.ui.controller as controller_module
+import smc.ui.plate_page as plate_page_module
 from smc.hardware import Microscope
 from smc.hardware.capabilities import Autofocus, ObjectiveTurret
 from smc.hardware.profile import Profile
@@ -135,6 +139,16 @@ def _drive_controls(view: PlatePageView) -> list[Any]:
         view.light_on_button,
         view.light_off_button,
     ]
+
+
+@contextmanager
+def _replaced(obj: object, name: str, replacement: object) -> Iterator[None]:
+    """An instance attribute for the length of the block, then removed (never kept: FM-92)."""
+    setattr(obj, name, replacement)
+    try:
+        yield
+    finally:
+        delattr(obj, name)
 
 
 def _connect(view: PlatePageView) -> None:
@@ -272,6 +286,126 @@ def test_connect_is_disabled_while_a_connect_goes(
         assert page.join(5)
         page.close()
         page.release()
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["live-stand", "dry-run"])
+def test_the_connection_row_says_connecting_and_disconnecting_while_the_activity_goes(
+    tmp_path: Path, opened: list[Microscope], dry_run: bool
+) -> None:
+    # On a slow stand the row read `Connect opens it` beside a greyed-out button, and
+    # the page looked stuck (#305, m5 §7.3). Texts whole (FM-45), the ellipsis U+2026.
+    suffix = " (dry run)" if dry_run else ""
+    gate, entered = threading.Event(), threading.Event()
+    page = _page(tmp_path / "run.json", opened, dry_run=dry_run)
+    real_opener = page._opener
+
+    def slow() -> Microscope:
+        entered.set()
+        assert gate.wait(5)
+        return real_opener()
+
+    view = PlatePageView(page)
+    try:
+        with _replaced(page, "_opener", slow):
+            view.connect_button.clicks += 1
+            assert entered.wait(5)
+            view.tick()
+            assert (
+                view.connection_text.object
+                == f"connecting demo\N{HORIZONTAL ELLIPSIS}{suffix}"
+            )
+            assert view.connect_button.disabled
+            assert view.disconnect_button.disabled
+            gate.set()
+            assert page.join(5)
+        view.tick()
+        assert view.connection_text.object == f"{CONNECTED_TEXT}{suffix}"
+
+        closing, held = threading.Event(), threading.Event()
+        stand = opened[0]
+        real_close = stand.close
+
+        def slow_close() -> None:
+            closing.set()
+            assert held.wait(5)
+            real_close()
+
+        with _replaced(stand, "close", slow_close):
+            view.disconnect_button.clicks += 1
+            assert closing.wait(5)
+            view.tick()
+            assert view.connection_text.object == (
+                f"disconnecting demo\N{HORIZONTAL ELLIPSIS}{suffix}"
+            )
+            assert view.connect_button.disabled
+            assert view.disconnect_button.disabled
+            held.set()
+            assert page.join(5)
+        view.tick()
+        assert view.connection_text.object == f"{CLOSED_TEXT}{suffix}"
+    finally:
+        gate.set()
+        page.close()
+        page.release()
+
+
+def test_the_capture_buttons_are_disabled_while_disconnect_runs(
+    page: PlatePage, opened: list[Microscope]
+) -> None:
+    # While a Disconnect closes the stand the facade is already dropped, so `not
+    # connected` alone switches the buttons off: this does not pin #317's rule for an
+    # activity (its test does). What it adds is the controller's own refusal, which a
+    # click on a disabled button still reaches (FM-169).
+    view = PlatePageView(page)
+    _connect(view)
+    page.current = "A1"
+    view.tick()
+    assert not view.capture_centre_button.disabled
+    closing, held = threading.Event(), threading.Event()
+    stand = opened[0]
+    real_close = stand.close
+
+    def slow_close() -> None:
+        closing.set()
+        assert held.wait(5)
+        real_close()
+
+    try:
+        with _replaced(stand, "close", slow_close):
+            view.disconnect_button.clicks += 1
+            assert closing.wait(5)
+            view.tick()
+            assert view.capture_centre_button.disabled
+            assert view.capture_wall_button.disabled
+            # Panel still calls the handler of a disabled button: the controller
+            # refuses, and says why (FM-169).
+            view.capture_centre_button.clicks += 1
+            assert view.message.object == "disconnect is running"
+            assert page.refs == ()
+            held.set()
+            assert page.join(5)
+    finally:
+        held.set()
+    assert not page.connected
+
+
+def test_the_stop_budget_in_the_service_doc_covers_the_pages_waits() -> None:
+    # `close()`'s wait, the server's stop and one wait of `release()` run one after the
+    # other inside NSSM's console stop (m5 §7.4): if one of them grows past the number
+    # the document gives NSSM, the service is ended by `TerminateProcess`, which
+    # releases nothing. `release()` pays one of its two waits: for a connect that
+    # `close()` gave up on, which never keeps a facade, or for the reads on a facade
+    # the page holds. So the longer of them counts, and a change to either is seen.
+    doc = Path(__file__).resolve().parents[2] / "docs" / "ui" / "service.md"
+    found = re.search(r"AppStopMethodConsole (\d+)", doc.read_text(encoding="utf-8"))
+    assert found is not None, "docs/ui/service.md no longer sets AppStopMethodConsole"
+    budget_s = int(found.group(1)) / 1000
+    waits_s = (
+        controller_module._CLOSE_WAIT_S
+        + plate_page_module.SERVER_STOP_WAIT_S
+        + max(controller_module._RELEASE_WAIT_S, controller_module._READS_WAIT_S)
+    )
+    assert waits_s <= budget_s, (waits_s, budget_s)
 
 
 def test_a_confirmation_armed_for_one_stand_is_dropped_when_the_connection_changes(

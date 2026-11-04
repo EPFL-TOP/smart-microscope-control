@@ -50,7 +50,7 @@ from smc.hardware.capabilities import (
     XYStage,
     ZStage,
 )
-from smc.hardware.errors import HardwareError, StopRefusedError
+from smc.hardware.errors import HardwareError, MicroscopeBusyError, StopRefusedError
 from smc.hardware.microscope import describe_autofocus
 from smc.hardware.safety import Safety
 from smc.plugins import (
@@ -91,6 +91,8 @@ from smc.ui.guide import (
 )
 
 if TYPE_CHECKING:
+    from types import TracebackType
+
     from smc.hardware.microscope import Microscope
     from smc.hardware.profile import Profile
 
@@ -190,6 +192,17 @@ _UNKNOWN_TIME = "????-??-?? ??:??:??"
 
 #: How long ``close`` waits for a stopped run to end, in seconds.
 _CLOSE_WAIT_S = 10.0
+
+#: How long a Disconnect or ``release()`` waits for the reads in flight before it
+#: unloads, in seconds: as long as a slow device read, and a hung one is not waited
+#: on for ever (FM-15, m5 §7.2). Polled every ``_READS_POLL_S``.
+_READS_WAIT_S = 5.0
+_READS_POLL_S = 0.01
+
+#: How long ``release()`` waits for a connect that ``close()`` gave up on, in
+#: seconds. 10 (``close``) + 10 (the server's stop) + 8 is 28 s, inside the service's
+#: ``AppStopMethodConsole 30000`` (``docs/ui/service.md``).
+_RELEASE_WAIT_S = 8.0
 
 #: A wait on the worker is made of slices this long (FM-83: Windows does not deliver
 #: Ctrl-C during one long wait on a thread).
@@ -614,6 +627,42 @@ def _first_problem(error: ValidationError) -> str:
     return f"{where}: {first['msg']}"
 
 
+class _Reading:
+    """A read of the stand that takes no lock, registered so that a Disconnect can wait for it (m5 §7.2).
+
+    The facade's reads (``state()``, the light's and the turret's, a capture's
+    position, STOP) take no lock by design (FM-70), so ``unloadAllDevices`` could
+    run while one was inside the core. ``__enter__`` adds a token to the page's
+    ``_readers`` **first**, then returns the facade the page holds, or ``None``:
+    a Disconnect drops the facade and only then looks at ``_readers``, so a reader
+    that took the facade before the drop is in the set when it looks, and one that
+    comes after gets ``None``. Reversing either order reopens the race, and no
+    test on a fast fake shows it.
+
+    A class, not a ``@contextmanager`` (FM-98, FM-92: a generator frame would hold
+    the facade), and no lock: ``set.add`` and ``set.discard`` are atomic, so STOP
+    can use it (FM-70). A second Ctrl-C landing in ``stop()`` between ``add`` and
+    the ``with`` body leaks a token (FM-65); it costs one ``_READS_WAIT_S`` of a
+    Disconnect, never a hang, and is accepted.
+    """
+
+    def __init__(self, page: PlatePage) -> None:
+        self._page = page
+        self._token = object()
+
+    def __enter__(self) -> Microscope | None:
+        self._page._readers.add(self._token)
+        return self._page._microscope
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self._page._readers.discard(self._token)
+
+
 class PlatePage:
     """The plate page's logic over one stand and one run document.
 
@@ -715,6 +764,9 @@ class PlatePage:
     ) -> None:
         """What both constructors do; the profile and the dry run are the page's, held or not."""
         self._microscope: Microscope | None = microscope
+        # The reads in flight, one token each (``_Reading``): no lock, so that STOP
+        # can register (FM-70). A Disconnect waits for it to empty (``_wait_for_reads``).
+        self._readers: set[object] = set()
         self._profile = profile
         self._dry_run = dry_run
         self._opener: Callable[[], Microscope] = (
@@ -760,6 +812,9 @@ class PlatePage:
         # Whether ``objective_labels()`` has logged the failure of its streak.
         self._labels_failure_logged = False
         self._closed = False
+        # The name of the activity ``close()`` gave up waiting for, so that
+        # ``release()`` waits for a ``connect`` whether it ended before it began or not.
+        self._gave_up: str | None = None
         self._ended = 0
         # A plain attribute, written by ``stop()`` and ``resume()``, which take no lock.
         self._stop_note: str | None = None
@@ -913,7 +968,10 @@ class PlatePage:
         """
         name = self._on_plate(well)
         self._refuse_if_moving()
-        position = self._stand().require(XYStage).position_um()
+        with self._reading() as microscope:
+            if microscope is None:
+                raise RuntimeError(NOT_CONNECTED)
+            position = microscope.require(XYStage).position_um()
         ref = WellRef(well=name, x_um=position.x_um, y_um=position.y_um)
         kept = tuple(r for r in self.refs if normalise_well(r.well) != name)
         self.refs = (*kept, ref)
@@ -932,7 +990,10 @@ class PlatePage:
             raise ValueError(f"side must be one of {', '.join(_SIDES)}, got {side!r}")
         name = self._on_plate(well)
         self._refuse_if_moving()
-        position = self._stand().require(XYStage).position_um()
+        with self._reading() as microscope:
+            if microscope is None:
+                raise RuntimeError(NOT_CONNECTED)
+            position = microscope.require(XYStage).position_um()
         touch = WallTouch(
             well=name,
             side=side,  # type: ignore[arg-type]  # checked against _SIDES above
@@ -1172,6 +1233,28 @@ class PlatePage:
         """Whether the page holds a stand: what *Connect* and *Disconnect* read."""
         return self._microscope is not None
 
+    def _reading(self) -> _Reading:
+        """The registration of a lock-free read: ``with self._reading() as microscope:``.
+
+        The facade comes from the ``with`` and nowhere else, so that a Disconnect
+        that dropped it can see the read and wait for it (``_Reading``).
+        """
+        return _Reading(self)
+
+    def _wait_for_reads(self) -> int:
+        """Wait, bounded, for the reads in flight to end; how many were left.
+
+        Called after the facade is dropped and before it is closed, so that
+        ``unloadAllDevices`` never runs under a read that took the facade before the
+        drop. A read that does not end within ``_READS_WAIT_S`` is not waited on for
+        ever (FM-15): the unload goes ahead, the read fails with a line on the page
+        (``_handler``), and the Disconnect's outcome says so.
+        """
+        deadline = time.monotonic() + _READS_WAIT_S
+        while self._readers and time.monotonic() < deadline:
+            time.sleep(_READS_POLL_S)
+        return len(self._readers)
+
     def _stand(self) -> Microscope:
         """The facade the page holds, for an activity or a capture.
 
@@ -1190,7 +1273,9 @@ class PlatePage:
         opener raised, as one line (a stand that NIS-Elements holds). STOP pressed
         while it opens halts the new facade once it is kept. A connect that ends
         after ``close()`` gave up waiting releases what it opened: a stand is never
-        left open with no owner.
+        left open with no owner. ``release()`` waits for it once more, bounded, and
+        says what became of it, because that late release only runs while the
+        process lives.
 
         Raises:
             RuntimeError: The page is closed, or an activity is going (``<name> is
@@ -1245,11 +1330,19 @@ class PlatePage:
     def disconnect(self) -> None:
         """Release the stand on the worker, as the activity ``disconnect``, for another program.
 
-        The facade is dropped under the lock **before** it is closed, so no read
-        that starts after the drop reaches a closed facade, and the page has let go
-        of it even when ``Microscope.close()`` raises. Nothing is switched off: a
-        light or an autofocus stays as the stand keeps it. Refused while a run, a
-        snap, live or a drive action goes, so none finds the facade gone under it.
+        The facade is dropped under the lock **before** the reads in flight are
+        waited for and before it is closed (m5 §7.2): a read that took it before
+        the drop is in ``_readers`` when the wait looks, and one that starts after
+        gets none, so ``unloadAllDevices`` never runs under a read and none reaches
+        a closed facade. Nothing is switched off: a light or an autofocus stays as
+        the stand keeps it. Refused while a run, a snap, live or a drive action
+        goes, so none finds the facade gone under it.
+
+        The outcome never says ``released`` for a stand that is still held: a
+        ``close()`` that raised ``MicroscopeBusyError`` unloaded nothing, so the page
+        keeps the facade and Disconnect can retry; a failed unload is ``may still be
+        held`` (``Microscope.unload_error``); any other error lets the facade go,
+        for it may be half unloaded.
 
         Raises:
             RuntimeError: The page is closed, or an activity is going (``<name> is
@@ -1262,7 +1355,7 @@ class PlatePage:
         self._start_activity("disconnect", self._disconnect)
 
     def _disconnect(self, event: threading.Event) -> str:
-        """``disconnect``'s body on the worker: the drop under the lock, the close outside it."""
+        """``disconnect``'s body on the worker: the drop under the lock, the wait and the close outside it."""
         with self._lock:
             microscope, self._microscope = self._microscope, None
             self._light_lacks_found = None
@@ -1270,18 +1363,66 @@ class PlatePage:
             self._labels_failure_logged = False
         if microscope is None:  # unreachable: only an activity drops it
             return f"disconnect: {NOT_CONNECTED}"
+        stand = self._profile.microscope.name
+        in_flight = self._wait_for_reads()
+        # The reads that did not end in time: the readers of a facade that is about
+        # to be gone (a reader that starts after the drop holds ``None``).
+        stuck = frozenset(self._readers) if in_flight else frozenset()
         try:
             microscope.close()
+        except MicroscopeBusyError as exc:
+            # Nothing was unloaded and close() may be called again (m1 §7): the
+            # page still holds the stand, and says so. Not on a closed page: the
+            # command's release() has already looked, and a facade put back then
+            # would have no owner.
+            with self._lock:
+                if not self._closed:
+                    self._microscope = microscope
+            return (
+                f"disconnect: MicroscopeBusyError: {_one_line(exc)}; "
+                f"the stand is still connected"
+            )
         except Exception as exc:
-            # close() has logged what to do when unloading fails.
+            # close() has logged what to do when unloading fails. The facade may
+            # be half unloaded: the page has let go of it for good.
+            self._readers.difference_update(stuck)
             return f"disconnect: {type(exc).__name__}: {_one_line(exc)}"
-        return f"disconnect: {self._profile.microscope.name} released"
+        # The facade is gone: a read that never ends belongs to it, and its token
+        # must not make every later Disconnect wait the bound again and report a read
+        # that no stand has. Not on a busy close above, which gives the facade (and
+        # the read still inside it) back to the page.
+        self._readers.difference_update(stuck)
+        unload_error = microscope.unload_error
+        if unload_error is not None:
+            return (
+                f"disconnect: {stand} may still be held: its devices did not "
+                f"unload ({' '.join(unload_error.split())}); restart smc ui "
+                f"before another program takes it"
+            )
+        outcome = f"disconnect: {stand} released"
+        if in_flight:
+            outcome += (
+                f", with {in_flight} read(s) still in flight after {_READS_WAIT_S:g} s"
+            )
+        return outcome
 
-    def release(self) -> None:
+    def release(self, unwinding: BaseException | None = None) -> None:
         """Release the stand the page holds, if any: the command's, after ``close()``.
 
         Idempotent, and it does nothing on a page that holds no stand. It releases
         a facade handed to the constructor too.
+
+        A ``connect`` that ``close()`` gave up on is waited for, at most
+        ``_RELEASE_WAIT_S``, because its late release of what it opens can only run
+        while the process lives (m5 §7.2): what became of it is added to
+        ``close_lines``, and ``close_ended`` is whether it ended. Then the facade is
+        dropped, the reads in flight are waited for, and the facade is ended as the
+        ``with Microscope.open(...)`` block did: ``unwinding`` is the exception the
+        command is leaving with (``None`` on the normal path), so that a Ctrl-C is
+        noted with the motions still tracked (m2 §11.11 E6), which a second Ctrl-C
+        during ``close()`` lost when ``release()`` called ``close()`` directly. The
+        waits and the drop are one ``try`` whose ``finally`` ends the facade, so a
+        second Ctrl-C in a wait still unloads the stand and is not swallowed (FM-187).
 
         Raises:
             RuntimeError: ``release() comes after close()``: before it, the facade
@@ -1292,10 +1433,48 @@ class PlatePage:
         """
         if not self._closed:
             raise RuntimeError("release() comes after close()")
-        with self._lock:
-            microscope, self._microscope = self._microscope, None
-        if microscope is not None:
-            microscope.close()
+        microscope: Microscope | None = None
+        try:
+            if self._gave_up == "connect":
+                self._wait_for_the_connect()
+            with self._lock:
+                microscope, self._microscope = self._microscope, None
+            self._wait_for_reads()
+        finally:
+            # In a `finally`: a second Ctrl-C lands in one of the two waits above, and
+            # the facade, dropped from the page and held by this local only, would
+            # never be unloaded (FM-71, FM-49). A Ctrl-C before the drop finds the
+            # page still holding it.
+            if microscope is None:
+                with self._lock:
+                    microscope, self._microscope = self._microscope, None
+            if microscope is not None:
+                microscope.__exit__(
+                    None if unwinding is None else type(unwinding),
+                    unwinding,
+                    None if unwinding is None else unwinding.__traceback__,
+                )
+
+    def _wait_for_the_connect(self) -> None:
+        """The wait of ``release()`` for the ``connect`` that ``close()`` gave up on, and a closing line for it.
+
+        ``join()`` returns at once when the connect ended meanwhile. The line is the
+        connect's own outcome when it ended (it released what it opened, or the
+        opener raised), else that its end is not known: the process ends now.
+        """
+        stand = self._profile.microscope.name
+        ended = self.join(_RELEASE_WAIT_S)
+        if ended:
+            with self._lock:
+                line = self._outcome or f"connect: {stand} ended without an outcome"
+        else:
+            line = (
+                f"connect: {stand} is still opening after "
+                f"{_CLOSE_WAIT_S + _RELEASE_WAIT_S:g} s: the process ends now, "
+                f"and whether the stand is left connected is not known"
+            )
+        self.close_lines = (*self.close_lines, line)
+        self.close_ended = ended
 
     def snap(self) -> None:
         """Snap one frame on the worker and keep it as ``frame()``; what it did is the ``outcome``.
@@ -1614,25 +1793,25 @@ class PlatePage:
         succeeds ends the streak, and so do Connect and Disconnect (a new stand
         has not failed yet).
         """
-        microscope = self._microscope
-        if microscope is None:
-            return ()
-        turret = microscope.get(ObjectiveTurret)
-        if turret is None:
-            return ()
-        try:
-            labels = tuple(turret.labels())
-        except Exception as exc:
-            if not self._labels_failure_logged:
-                self._labels_failure_logged = True
-                log.warning(
-                    "objective: its positions could not be read: %s: %s",
-                    type(exc).__name__,
-                    _one_line(exc),
-                )
-            return ()
-        self._labels_failure_logged = False
-        return labels
+        with self._reading() as microscope:
+            if microscope is None:
+                return ()
+            turret = microscope.get(ObjectiveTurret)
+            if turret is None:
+                return ()
+            try:
+                labels = tuple(turret.labels())
+            except Exception as exc:
+                if not self._labels_failure_logged:
+                    self._labels_failure_logged = True
+                    log.warning(
+                        "objective: its positions could not be read: %s: %s",
+                        type(exc).__name__,
+                        _one_line(exc),
+                    )
+                return ()
+            self._labels_failure_logged = False
+            return labels
 
     def light_lacks(self) -> str | None:
         """Why the light cannot be switched on from the page, or ``None``.
@@ -1649,28 +1828,28 @@ class PlatePage:
         reads for itself only when no ``status()`` has read this stand's light,
         and not at all for a stand whose last ``status()`` read raised.
         """
-        microscope = self._microscope
-        lack = self._lacks(microscope, LightSource)
-        if lack is not None or microscope is None:
-            return lack
-        found = self._light_lacks_found
-        if found is not None:
-            return found[0]
-        raised = self._light_read_raised
-        if raised is not None and raised() is microscope:
-            return None
-        light = microscope.get(LightSource)
-        if light is None:  # unreachable once lacks() said it is there
-            return None
-        try:
-            answer = _light_lacks_text(light, light.is_on())
-        except Exception:
-            return None
-        if self._microscope is microscope:
-            # Not kept for a facade dropped during the read: a Connect that ended
-            # meanwhile has cleared the answer for its own stand.
-            self._light_lacks_found = (answer,)
-        return answer
+        with self._reading() as microscope:
+            lack = self._lacks(microscope, LightSource)
+            if lack is not None or microscope is None:
+                return lack
+            found = self._light_lacks_found
+            if found is not None:
+                return found[0]
+            raised = self._light_read_raised
+            if raised is not None and raised() is microscope:
+                return None
+            light = microscope.get(LightSource)
+            if light is None:  # unreachable once lacks() said it is there
+                return None
+            try:
+                answer = _light_lacks_text(light, light.is_on())
+            except Exception:
+                return None
+            if self._microscope is microscope:
+                # Not kept for a facade dropped during the read: a Connect that ended
+                # meanwhile has cleared the answer for its own stand.
+                self._light_lacks_found = (answer,)
+            return answer
 
     def _note_light_read(
         self,
@@ -1787,24 +1966,32 @@ class PlatePage:
         halts the stand. With the stand closed it sets the event all the same (a
         ``connect`` that is opening halts the stand once it holds it), and the
         note says there was nothing to stop.
+
+        STOP is a read that never waits (m5 §7.2): it registers, sends the stop to
+        the facade it took and unregisters, so a Disconnect that began meanwhile
+        waits for it and the stop reaches loaded devices. One that finds the facade
+        dropped says there was nothing to stop, and ``Microscope.close()`` stops
+        what still moves before it unloads.
         """
         current = self._current_run
         if current is not None:
             current[1].set()
         prefix = "" if current is None else f"{current[0]} told to stop; "
-        microscope = self._microscope
-        try:
-            if microscope is None:
-                note = f"{prefix}{NOT_CONNECTED}: nothing to stop"
-            else:
-                microscope.stop()
-                note = f"{prefix}{_STOP_ACCEPTED}"
-        except StopRefusedError as exc:
-            note = f"{prefix}halted, but {_one_line(exc)}"
-        except HardwareError as exc:
-            note = f"{prefix}the stop failed: {_one_line(exc)}"
-        log.info("stop: %s", note)
+        with self._reading() as microscope:
+            try:
+                if microscope is None:
+                    note = f"{prefix}{NOT_CONNECTED}: nothing to stop"
+                else:
+                    microscope.stop()
+                    note = f"{prefix}{_STOP_ACCEPTED}"
+            except StopRefusedError as exc:
+                note = f"{prefix}halted, but {_one_line(exc)}"
+            except HardwareError as exc:
+                note = f"{prefix}the stop failed: {_one_line(exc)}"
+        # Kept before it is logged: the stop is sent, and a handler that blocks (a
+        # Windows console in QuickEdit) must not keep the page from its note (FM-148).
         self._stop_note = note
+        log.info("stop: %s", note)
 
     def resume(self) -> None:
         """Clear the halt; refused while a run is going.
@@ -1844,43 +2031,49 @@ class PlatePage:
         stop_refused = tuple(
             role.value for role in self._profile.safety.stop_refused_by
         )
-        microscope = self._microscope
-        if microscope is not None:
-            state = microscope.state()
-            problems = list(state.errors)
-            light_on: bool | None = None
-            light = microscope.get(LightSource)
-            if light is not None:
-                try:
-                    light_on = light.is_on()
-                except Exception as exc:
-                    problems.append(f"light: {type(exc).__name__}: {_one_line(exc)}")
-                    self._note_light_read(microscope, light, None, raised=True)
-                else:
-                    self._note_light_read(microscope, light, light_on, raised=False)
-            autofocus = (
-                describe_autofocus(state)
-                if microscope.has(Autofocus)
-                else "no autofocus"
-            )
-            if self._microscope is microscope:
-                return PageStatus(
-                    stand=stand,
-                    dry_run=self._dry_run,
-                    running=running,
-                    progress=progress,
-                    outcome=outcome,
-                    stop_note=self._stop_note,
-                    xy_um=None if state.xy is None else (state.xy.x_um, state.xy.y_um),
-                    z_um=state.z_um,
-                    objective=state.objective,
-                    autofocus=autofocus,
-                    light_on=light_on,
-                    moving=tuple(state.moving),
-                    halted=state.halted,
-                    stop_refused=stop_refused,
-                    problems=tuple(problems),
+        # The whole read of the facade, from ``state()`` to the status built for it, is
+        # registered: a Disconnect waits for it before it unloads (m5 §7.2).
+        with self._reading() as microscope:
+            if microscope is not None:
+                state = microscope.state()
+                problems = list(state.errors)
+                light_on: bool | None = None
+                light = microscope.get(LightSource)
+                if light is not None:
+                    try:
+                        light_on = light.is_on()
+                    except Exception as exc:
+                        problems.append(
+                            f"light: {type(exc).__name__}: {_one_line(exc)}"
+                        )
+                        self._note_light_read(microscope, light, None, raised=True)
+                    else:
+                        self._note_light_read(microscope, light, light_on, raised=False)
+                autofocus = (
+                    describe_autofocus(state)
+                    if microscope.has(Autofocus)
+                    else "no autofocus"
                 )
+                if self._microscope is microscope:
+                    return PageStatus(
+                        stand=stand,
+                        dry_run=self._dry_run,
+                        running=running,
+                        progress=progress,
+                        outcome=outcome,
+                        stop_note=self._stop_note,
+                        xy_um=None
+                        if state.xy is None
+                        else (state.xy.x_um, state.xy.y_um),
+                        z_um=state.z_um,
+                        objective=state.objective,
+                        autofocus=autofocus,
+                        light_on=light_on,
+                        moving=tuple(state.moving),
+                        halted=state.halted,
+                        stop_refused=stop_refused,
+                        problems=tuple(problems),
+                    )
         return PageStatus(
             stand=stand,
             dry_run=self._dry_run,
@@ -1926,10 +2119,15 @@ class PlatePage:
         Idempotent: the first call does the work, and a later one (the command's
         ``finally`` after ``serve`` already closed the page) returns at once, so a
         second Ctrl-C never waits twice. It never closes the stand (the command
-        that serves the page owns it) and never raises for a refused stop. What it
-        tells the operator is ``close_lines``: what the stop did and how the run
-        ended, never "stopped" by default (FM-117). A Ctrl-C during the wait is
-        not caught: the stop was sent before it (FM-71).
+        that serves the page owns it, through ``release()``) and never raises for a
+        refused stop. What it tells the operator is ``close_lines``: what the stop
+        did and how the run ended, never "stopped" by default (FM-117). A Ctrl-C
+        during the wait is not caught: the stop was sent before it (FM-71).
+
+        An activity that does not end within ``_CLOSE_WAIT_S`` is kept by name
+        (``_gave_up``): a ``connect`` is waited for again by ``release()``, which
+        adds a line for it to ``close_lines`` (m5 §7.2). A ``connect`` that ends
+        after ``close()`` releases what it opened.
         """
         if self._closed:
             return
@@ -1941,7 +2139,12 @@ class PlatePage:
         self.stop()
         ended = self.join(_CLOSE_WAIT_S)
         if not ended:
-            self._set_outcome(f"{plugin} did not end within {_CLOSE_WAIT_S:.0f} s")
+            self._gave_up = plugin
+            with self._lock:
+                # Not over an outcome the worker has just written: ``release()``
+                # tells a connect's outcome as a closing line.
+                if self._current_run is not None:
+                    self._outcome = f"{plugin} did not end within {_CLOSE_WAIT_S:.0f} s"
         with self._lock:
             outcome = self._outcome
         note = self._stop_note
