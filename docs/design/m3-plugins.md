@@ -1,7 +1,8 @@
 # M3 design — plate tools as plugins
 
 - **Status**: design for issue #18 (§1, 2026-10-26); the plate-scan
-  workflow, §2 to §16, for issue #192 (2026-10-27).
+  workflow, §2 to §16, for issue #192 (2026-10-27); the plate from images of
+  the walls, §17, for issue #328 (2026-11-05).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 and M2, this document is the contract between issues
   that are built in parallel. Names, module paths and signatures below are
@@ -828,6 +829,7 @@ scratchpad, not committed):
 ```text
 camera-calibration ─────────────(optional)──────────┐
 plate-registration ─┐                                │
+plate-walls ────────┤                                │
 plate-finding ──────┴─ plate ──► scan-plan ◄─────────┘ ◄── timings (optional)
                                     │
                                    scan ──► cells ──► density ──┐
@@ -844,6 +846,7 @@ plate-finding ──────┴─ plate ──► scan-plan ◄────
 | `plate-registration` | `plate` | — | — | — | #19 | 5 |
 | `goto-well` | `goto-well` | `plate` | — | `XYStage` | #19 | 5 |
 | `plate-finding` | `plate` | — | — | `XYStage`, `Camera` | #20 | 6 |
+| `plate-walls` | `plate` | `camera-calibration` | — | `XYStage`, `Camera` | #328 | 17 |
 | `scan-plan` | `scan-plan` | `plate` | `camera-calibration`, `timings` | `Camera` | #21 | 7 |
 | `scan` | `scan` | `scan-plan` | — | `XYStage`, `Camera` | #213 | 8 |
 | `cells` | `cells` | `scan` | — | — | #23 | 9 |
@@ -1036,16 +1039,21 @@ class PlateResult(PluginResult):
     plate: str
     a1_center_xy_um: tuple[float, float]
     rotation_deg: float = Field(ge=-180.0, le=180.0)
-    method: Literal["seed", "references", "lattice-fit"]
+    method: Literal["seed", "references", "lattice-fit", "wall-images"]
     residual_um: float | None = Field(ge=0.0)
     scale_error: float | None
     n_refs: int = Field(ge=0)
     refs: tuple[WellRef, ...] = ()
     fit: LatticeFit | None = None
+    walls: WallImages | None = None
 
     def to_plan(self, **kwargs: Any) -> useq.WellPlatePlan: ...
     def well_center_um(self, well: str) -> tuple[float, float]: ...
 ```
+
+`method="wall-images"` and `walls` (the model is §17.2's) are #328's: the
+plate fitted to the centres of wells measured from images of their walls.
+Both are additive; a run document written before them validates unchanged.
 
 - `plate` is validated by `useq.WellPlate.from_str` (an unknown name is a
   validation error). Well names are useq's (`A1`, `H12`, `AA3`), always
@@ -4276,3 +4284,508 @@ For session 2 the critical path is #199 → #22, #19, #21, #213, #23 →
 - Panel's version and behaviour on the microscope PC over RDP; a real
   browser's click (the `Tap` event of §15.3), the periodic callback of a
   session, Ctrl-C on Windows, and the page on a PC with no internet.
+
+## 17. Plate registration from images of the walls (#328)
+
+`smc/plugins/plate_walls/algorithm.py` and `plugin.py`, entry point
+`plate-walls = "smc.plugins.plate_walls.plugin:PlateWallsPlugin"`. It fills
+`plate` with `method="wall-images"`, so nothing downstream changes.
+
+**What the operator does** (the owner's form, 2026-11-05): with the joystick,
+put the stage roughly at the centre of a well, and record that position for
+that well; do it for 2 or 3 wells far apart. The tool does the rest: around
+each recorded position it images the well's four walls, fits a circle to the
+edges (the well's centre and diameter), and fits the plate to the centres.
+Recording a position is a stage read (`smc stage get`, or the page's capture,
+§17.5); the tool moves XY only, around the recorded positions.
+
+**Not here**: a stage put in the first well only, the tool driving to the
+others from the nominal pitch (the owner's second step, once this one works:
+it drives blind on a plate whose rotation is unknown); square wells (`384-well`,
+`1536-well`); a mode of `plate-registration` (that plugin moves nothing and
+runs in a dry run; this one moves and cannot); measuring the camera on the
+spot. `plate-finding` stays for the hands-off survey.
+
+### 17.1 What was measured (2026-11-05, planning #328)
+
+On throwaway prototypes that are not committed; numpy 2.5.3, tifffile
+2026.9.20, useq-schema 0.9.2, Python 3.13.
+
+- **The B3 frames of Ti2-E session 2** (`local/surveys/nikon-ti2/session2/`,
+  private: Prime 95B, 1412 × 1412 px, 10×, brightfield, a 24-well plate,
+  #334). The file names are the side on the *image*; the stage positions are
+  `walls.txt`'s.
+
+  | file | stage XY (µm) | wall on the stage's side | edge from the centre (px) |
+  |---|---|---|---|
+  | `B3-right.tif` | (2468.0, −9737.3) | −X | −29 (column) |
+  | `B3-left.tif` | (18067.4, −9737.3) | +X | +183 (column) |
+  | `B3-bottom.tif` | (10226.7, −2337.6) | +Y | −122 (row) |
+  | `B3-top.tif` | (10226.7, −17738.5) | −Y | +28 (row) |
+
+  - **The camera at 10× is turned 180° and not mirrored.** The wall the
+    operator saw on the image's right is the −X one, and the image's bottom
+    is +Y: a +column offset is −X and a +row offset is +Y, `M = 1.1 ·
+    ((−1, 0), (0, 1))` µm per pixel (`det M < 0`: not mirrored, §3.1;
+    rotation 180°). This is read from the frames and the stage positions;
+    `camera-calibration` was not run at 10× (step 7 of the session was not
+    reached), and 1.1 µm per pixel is the nominal size.
+  - **The edges.** Each frame's dark class (below the midpoint of its 2nd
+    and 98th percentiles) covers 53–64 % of it, at 0.057–0.093 of the bright
+    class's mean. The 2nd percentile is 157–198 counts and the 98th
+    9276–10 372. Inside the well the level falls towards the wall (9000 →
+    6400 → 1750 → 200 counts over 700 px of `B3-right.tif`): the meniscus.
+    The centre frame `B3-center.tif` reads 31 000–35 500.
+  - **The fit.** §17.3's `find_wall` gives 173–176 edge points per frame (of
+    176 lines) in 15 ms each. `fit_circle` on the four frames' 698 points
+    keeps 696: centre (10 182.0, −10 087.9) µm, diameter 15 298 µm (nominal
+    15 600, −1.9 %), rms 41.9 µm. The rms is the well's shape, not noise: the
+    X walls lie 40 µm outside the circle and the Y walls 38 µm inside it
+    (wall to wall, 15 366 µm in X and 15 236 µm in Y).
+  - **Against the walls' midpoint** of the session's own table (#334: the
+    half-intensity edges −30, +181, −123 and +26 px, with the matrix above),
+    (10 184.7, −10 091.4) µm: the fitted centre is 4.4 µm away.
+  - **The camera's turn matters.** With the matrix of an upright camera
+    (rotation 0, `pixel_matrix(1.1)`), `find_wall` finds no wall in any of
+    the four frames: the outward direction points into the plastic, every
+    line starts dark, and no line gives a point. A wrong calibration is a
+    refusal, not a centre one well-width off (#327's failure).
+- **Synthetic wells** (`PlateSample.render`, no stage), the whole walk of
+  §17.4 with §17.3's functions, rough centres off by up to half a radius:
+
+  | plate | px (µm) | frame | camera | off by (µm) | frames | worst centre error |
+  |---|---|---|---|---|---|---|
+  | 96-well, 1.2° | 0.65 | 384 × 512 | 30°, mirrored | (300, −200) | 135 for 3 wells | 0.01 µm |
+  | 96-well, −3° | 1.625 | 512 × 384 | −75° | (−900, 700) | 48 for 2 | 0.07 µm |
+  | 24-well, 2° | 1.1 | 1412 × 1412 | 180° | (1500, −1200) | 72 for 3 | 0.00 µm |
+  | 24-well | 2.75 | 1412 × 1412 | 90°, mirrored | (−2500, 2000) | 26 for 2 | 0.01 µm |
+  | 6-well, 0.5° | 1.625 | 512 × 512 | 10° | (3000, 0) | 76 for 2 | 0.09 µm |
+  | 48-well, 0.5° | 1.625 | 512 × 512 | 10° | (1000, −1000) | 60 for 2 | 0.04 µm |
+
+  The diameter came back within 0.07 µm and the rms within 0.3 µm. Those
+  frames walked from the inside outwards. §17.4's alternating order took 14
+  frames per well for the first case (45 before), and a calibration 2 % too
+  large and 0.5° off, or 2 % too small and −0.5° off, moved the centres by
+  0.06 µm at most: the centred frame puts the wall where the matrix matters
+  least. `find_wall` also finds the wall under noise of 600 counts (well
+  3000, plastic 800), and finds none in: a frame wholly inside a well (the
+  texture's dark ratio 0.72), a linear ramp from 6000 to 9000 counts (0.82,
+  the meniscus without the wall), a frame on the plastic between wells (1
+  line of 48), and a frame whose only edge is the neighbouring well's near
+  wall (0 of 48: its lines start dark). On a 48-well plate at 5 µm per
+  pixel, a frame holding both our wall and the neighbour's took ours (971 µm
+  from the frame's centre, the wall at 950).
+- **A plate of another pitch.** A synthetic 96-well plate of pitch 9.03 mm,
+  fitted as the 96-well plate (9.0): residuals of 196 µm (A1, H12), 197 µm
+  (A1, H12, D7) and 231 µm (A1, A12, H1), scale error +0.0033, below
+  `SCALE_TOLERANCE`. The residual bound of §17.4 refuses it.
+- **useq's round plates** (0.9.2): the 6-, 12-, 24-, 48- and 96-well plates,
+  with gaps between wells (pitch minus diameter) of 4.32, 4.0, 3.4, 1.9 and
+  2.6 mm. The 384- and 1536-well wells are square.
+
+### 17.2 The slot models — `slots/plate.py`
+
+```python
+WallSide = Literal["+X", "+Y", "-X", "-Y"]
+
+
+class WallFrame(SlotValue):
+    side: WallSide
+    x_um: float
+    y_um: float
+    n_points: int = Field(ge=0)
+    frames: int = Field(ge=1)
+    file: str | None = None
+```
+
+```python
+class WellFit(SlotValue):
+    well: str
+    recorded_xy_um: tuple[float, float]
+    center_xy_um: tuple[float, float]
+    diameter_um: float = Field(gt=0.0)
+    size_error: float
+    rms_um: float = Field(ge=0.0)
+    n_points: int = Field(ge=0)
+    walls: tuple[WallFrame, ...]
+```
+
+```python
+class WallImages(SlotValue):
+    objective: str | None
+    pixel_size_um: float = Field(gt=0.0)
+    image_shape_px: tuple[int, int]
+    search_um: float = Field(gt=0.0)
+    wells: tuple[WellFit, ...]
+    frames: int = Field(ge=0)
+    folder: str | None
+    elapsed_s: float = Field(ge=0.0)
+```
+
+- **Sides are stage directions**, never image sides: `+X` is the wall the
+  stage reaches by going +X from the well's centre. No operator names a side
+  on this path, so #327's confusion cannot arise here.
+- `WallFrame` is the frame whose edge points were used for that side (the
+  one centred on the wall, §17.4): `x_um`, `y_um` are the stage's readback
+  where it was taken, `n_points` its edge points, `frames` how many frames
+  that side took in all (the walk and the centred one), `file` its name in
+  `WallImages.folder` (`B3_+X.tif`), `None` when frames are not saved or this
+  one could not be.
+- `WellFit`: `recorded_xy_um` is where the operator put the stage;
+  `center_xy_um`, `diameter_um`, `rms_um` and `n_points` (the points kept)
+  are `fit_circle`'s; `size_error` is the diameter over the nominal, minus 1.
+  `walls` in the order `+X`, `+Y`, `-X`, `-Y`.
+- `WallImages`: the objective in place (`None` without a turret), the pixel
+  size and frame of the calibration used, the search distance used, the wells
+  in the order given, `frames` in all, `folder` (run-relative, `plate-walls/
+  <token>`; `None` when frames are not saved) and the run's duration
+  (`time.monotonic`, from the first move to the result).
+- **`PlateResult`** gains `walls: WallImages | None = None` and the method
+  `wall-images` (§3.2). For this method, `refs` are the fitted centres
+  (`WellRef(well, *center_xy_um)`, the wells in the order given) and `n_refs`
+  their count; `fit` is `None`.
+
+### 17.3 Algorithm — `plate_walls/algorithm.py`
+
+Pure: numpy only, no device, no file. No matrix product anywhere (`@`,
+`.dot`, `.matmul`: FM-131, `tests/unit/test_no_matrix_product.py`); the 2 × 2
+products and the inverse are written out.
+
+```python
+BAND_PX = 8
+MIN_CLASS_FRACTION = 0.02
+MAX_DARK_RATIO = 0.5
+MIN_LINE_FRACTION = 0.5
+STEP_FRACTION = 0.75
+DEFAULT_SEARCH_FRACTION = 0.5
+MAX_RMS_FRACTION = 0.02
+MIN_FRAME_SIDE_PX = 128
+MAX_FRAMES = 600
+SIDES: tuple[WallSide, ...] = ("+X", "+Y", "-X", "-Y")
+OUTWARD: dict[WallSide, tuple[float, float]] = {
+    "+X": (1.0, 0.0),
+    "+Y": (0.0, 1.0),
+    "-X": (-1.0, 0.0),
+    "-Y": (0.0, -1.0),
+}
+
+
+@dataclass(frozen=True, slots=True)
+class WallEdge:
+    points_px: npt.NDArray[np.float64]
+    n_lines: int
+    threshold: float
+    dark_ratio: float
+
+
+@dataclass(frozen=True, slots=True)
+class CircleFit:
+    center_xy_um: tuple[float, float]
+    diameter_um: float
+    rms_um: float
+    n_points: int
+    n_used: int
+
+
+def find_wall(
+    frame: npt.NDArray[Any], *, outward_xy: tuple[float, float], matrix: Matrix2
+) -> WallEdge | None: ...
+def wall_points_um(
+    points_px: npt.NDArray[np.float64],
+    x_um: float,
+    y_um: float,
+    *,
+    matrix: Matrix2,
+    image_shape_px: tuple[int, int],
+) -> npt.NDArray[np.float64]: ...
+def along_um(
+    points_um: npt.NDArray[np.float64],
+    centre_xy_um: tuple[float, float],
+    outward_xy: tuple[float, float],
+) -> float: ...
+def walk_offsets_um(
+    radius_um: float, search_um: float, step_um: float
+) -> tuple[float, ...]: ...
+def fit_circle(points_um: npt.NDArray[np.float64], *, floor_um: float) -> CircleFit: ...
+def encode_wall_frame(frame: npt.NDArray[Any], meta: dict[str, Any]) -> bytes: ...
+```
+
+- **`find_wall`** finds a well's wall in one frame, the inside bright and
+  the outside dark (brightfield, §17.1), looking outwards along `outward_xy`
+  (a stage direction). In order:
+  1. A frame that is not 2-D is a `ValueError`. It is cast to `float64`.
+     `threshold` is the mean of its 2nd and 98th percentiles; the dark class
+     is the pixels below it.
+  2. **Two classes or none.** `None` when the dark class covers less than
+     `MIN_CLASS_FRACTION` of the frame or more than `1 −
+     MIN_CLASS_FRACTION`, or when the bright class's mean is not positive, or
+     when `dark_ratio`, the dark class's mean over the bright class's, exceeds
+     `MAX_DARK_RATIO` (a frame inside a well, shading included, §17.1).
+  3. **The lines.** `v = M⁻¹ · outward_xy` is the outward direction in pixels
+     (`(d_col, d_row)`, §3.1's convention). When `|v_col| >= |v_row|` the lines
+     are bands of `BAND_PX` rows (from row 0, the rows left over dropped),
+     each averaged across its rows and walked along the columns in the
+     direction of `v_col`'s sign; otherwise bands of `BAND_PX` columns walked
+     along the rows. `n_lines` counts the bands.
+  4. **A line's point.** A line counts only when the mean of its first
+     `BAND_PX` samples, at the inward end, is at least `threshold`: it starts
+     inside a well. Its edge is the first sample below `threshold` after the
+     first, interpolated linearly with the sample before it; the point is
+     `(col, row)` with the band's middle (`start + (BAND_PX − 1) / 2`) on the
+     other axis. A line that never falls below gives no point. This is what
+     keeps a neighbouring well's walls out: going outwards, our wall is the
+     first fall from bright to dark; the neighbour's near wall is a rise, and
+     a line that starts in the plastic is not read.
+  5. `None` when fewer than `MIN_LINE_FRACTION × n_lines` lines give a point;
+     otherwise the `WallEdge`, `points_px` of shape `(n, 2)`.
+- **`wall_points_um`** maps the points to the stage, the frame taken at
+  `(x_um, y_um)`: §3.1's `stage_of_pixel` over arrays (the centre `((W −
+  1) / 2, (H − 1) / 2)`, the products written out), agreeing with it.
+- **`along_um`** is the median, over the points, of their offset from
+  `centre_xy_um` projected on `outward_xy` (a unit vector): how far out the
+  wall is from the recorded centre, on that side.
+- **`walk_offsets_um`** is the walk of one side, the distances from the
+  recorded centre at which frames are taken until a wall is found: `r`, then
+  `r + s`, `r − s`, `r + 2s`, `r − 2s`, ... while `k · s <= search_um`
+  (`r` the radius, `s` the step). It raises `ValueError` for an input that is
+  not finite and positive. Its length is `1 + 2 · floor(search_um / step_um)`.
+- **`fit_circle`** is the algebraic (Kåsa) fit, `x² + y² = 2ax + 2by + c` by
+  `np.linalg.lstsq`, then twice: the residuals `|p − centre| − radius` of
+  all points, the points kept those within `max(5 × 1.4826 × MAD, floor_um)`
+  (`MAD` the median absolute deviation of the kept points' residuals), and
+  the fit again on them. `rms_um` is over the kept points, `n_points` the
+  points given, `n_used` the points kept. It raises `ValueError` for fewer
+  than 3 points, a points array not of shape `(n, 2)` or not finite, a
+  rank-deficient system (collinear points), fewer than 3 points kept, or a
+  radius that is not finite and positive.
+- **`encode_wall_frame`** is `scan.algorithm.encode_frame`'s three lines with
+  a dict as the metadata: a TIFF in memory, written whole by
+  `write_atomically` (FM-38).
+
+### 17.4 Plugin — `plate_walls/plugin.py`
+
+```python
+class PlateWallsParams(PluginParams):
+    plate: str = Field("96-well", description=...)
+    refs: tuple[WellRef, ...] = Field((), description=...)
+    search_um: float | None = Field(None, gt=0.0, le=20_000.0)
+    max_residual_um: float = Field(100.0, gt=0.0, le=1000.0)
+    max_rotation_deg: float = Field(10.0, gt=0.0, le=45.0)
+    settle_ms: float = Field(0.0, ge=0.0, le=10_000.0)
+    save_frames: bool = True
+```
+
+`requires = (XYStage, Camera)`, `reads = ("camera-calibration",)`,
+`reads_optional = ()`, `provides = "plate"`. The objective is
+`microscope.get(ObjectiveTurret)`'s `current()`, `None` without a turret. No
+checkpoint: a run takes about a minute, and a stopped one is run again.
+
+- `plate` is checked by `useq.WellPlate.from_str` in a field validator (an
+  unknown name is a parameter error, before the stand opens). `refs` are the
+  same `WellRef`s as `plate-registration`'s (the page's captures feed both),
+  given as JSON: `--param 'refs=[{"well": "B3", "x_um": 10200, "y_um":
+  -9700}, ...]'`. `search_um` is how far, on each axis, the wall may lie
+  from where the recorded centre puts it: the default is half the well's
+  radius (3900 µm on a 24-well plate, 1600 µm on a 96-well one).
+  `max_residual_um` is set here, 100 µm, and revisited at the stand (§17.7).
+
+**Before anything moves**, in this order, each failure a `PluginRunError`
+and nothing moved:
+
+1. A dry run: `a dry run cannot image the walls; run it without --dry-run`.
+2. The plate's wells are square: `plate-walls fits round wells, and the
+   <plate> plate's are square: register it with plate-registration`.
+3. The references: fewer than 2 (`give at least two wells in refs, each with
+   the stage position where it was centred by eye`), more than 6, a well not
+   on the plate (`<well> is not a well of the <plate> plate`), a well given
+   twice after `normalise_well`, or a coordinate beyond ±1 000 000 µm (FM-32).
+4. The calibration (`ctx.upstream("camera-calibration", CameraCalibration)`):
+   its `objective` must equal the objective in place and its
+   `image_shape_px` `camera.image_shape()`, with scan-plan's words for each
+   (§7.3, `it is of <a>, the camera is at <b>`), and `|det M| >= 1e-12`
+   (FM-125), each refused with `run camera-calibration with <objective> in
+   place, on a field with texture: a well's wall will do`.
+5. The frame: its smaller side under `MIN_FRAME_SIDE_PX` (`a frame of <h> ×
+   <w> px is too small to find a wall in`), or the larger extent of `fov_of`
+   at least the well's diameter (`the field of <f> µm holds a whole well of
+   <d> µm: use a higher magnification`).
+6. The walk. `r` is the nominal radius (`well_size[0] × 500`), `search_um`
+   the parameter or `DEFAULT_SEARCH_FRACTION × r`; a given `search_um`
+   above `r` is refused (`search_um <s> is more than the well's radius <r>
+   µm`). The step is `STEP_FRACTION × min(H, W) × pixel_size_um`: the
+   inscribed circle of the frame, so that it holds whatever the camera's
+   turn and consecutive frames overlap by a quarter. The worst case,
+   `len(refs) × 4 × (len(walk_offsets_um(r, search_um, step)) + 1)`, above
+   `MAX_FRAMES` is refused (`up to <n> frames: use a lower magnification or a
+   smaller search_um`; FM-74).
+7. **The soft limits.** When `xy.limits_um()` is not `None`, every frame of
+   every walk (the recorded centre plus `OUTWARD[side] × offset`) must lie
+   within them (`low <= v <= high`, the layer's own test), else `<well>'s
+   <side> wall would be looked for at (<x>, <y>) µm, outside the stage's soft
+   limits`. With `None`, `assumed` gains `the stage reports no soft limits, so
+   the frames' moves were not checked against any travel` (as §6.2's).
+
+Then `xy.wait()` (FM-85), the start position is read (for the warning
+below), and the clock starts.
+
+**Each well, in the order given; each side, in `SIDES` order**:
+
+1. **The walk.** For each `d` of `walk_offsets_um(r, search_um, step)`:
+   `ctx.raise_if_stopped()`; `at = xy.move_to_um(recorded + OUTWARD[side] ×
+   d)`; a readback that is not finite is refused (`the stage's readback is
+   not a finite position`); `ctx.wait_s(settle_ms / 1000)`; `frame =
+   camera.snap()`, whose shape must equal the calibration's (`the frame has
+   shape <s>, the calibration <c>: check the camera's binning and region`);
+   `find_wall(frame, outward_xy=OUTWARD[side], matrix=M)`. With an edge,
+   `e = along_um(wall_points_um(..., *at, ...), recorded, OUTWARD[side])`;
+   the walk ends when `|e − r| <= search_um`, and goes on otherwise. The
+   frame is placed where the stage says it was, never at the target (FM-142).
+2. **No wall** after the last offset: `no wall found on <well>'s <side> side
+   in <k> frames, from <r − search> to <r + search> µm out of the recorded
+   centre (<x>, <y>) µm: check that the light is on (the inside of a well is
+   brighter than the plastic in brightfield) and that the stage was in
+   <well> when it was recorded, then record it again`.
+3. **The centred frame.** One more move, to `recorded + OUTWARD[side] × e`,
+   puts the wall at the frame's centre; settle, snap, shape check,
+   `find_wall`. No edge there, or one whose `|e − r| > search_um`: `the wall
+   of <well>'s <side> side was lost in the frame centred on it at (<x>, <y>)
+   µm`. Only this frame's points are kept: every side is then framed the
+   same way, so that the threshold's bias (the meniscus, §17.1) is the same
+   on opposite walls and cancels in the centre.
+4. With `save_frames`, the centred frame is written to
+   `<run_dir>/plate-walls/<token>/<well>_<side>.tif` (`new_token()` once per
+   run) by `encode_wall_frame` and `write_atomically`, its metadata the
+   well, the side and the readback. An `OSError` there is not the
+   registration's failure: that frame's `file` is `None`, and `assumed`
+   gains, once, `<n> frames could not be saved: <the first error, on one
+   line>`. Any other exception passes.
+5. `ctx.progress(i, 4 × len(refs), "<well> <side>")`, `i` counting the sides
+   done.
+
+After a well's four sides: `fit_circle(points, floor_um=2 × pixel_size_um)`;
+its `ValueError` is refused (`<well>'s walls do not fit a circle: <text>`);
+then, each refused and naming the well and its frames' positions:
+
+- `|size_error| > DIAMETER_TOLERANCE` (`plate_registration.algorithm`, 0.10):
+  `<well> measures <D> µm across and the <plate> plate's wells <D0> µm: is it
+  the right plate type?`;
+- `rms_um > MAX_RMS_FRACTION × r`: `<well>'s wall points lie <rms> µm from a
+  circle on average, more than <bound> µm: a frame may show something else
+  than the wall (a bubble, a scratch, a label); look at its frames`.
+
+**The plate**, once every well is measured: `calibrate(plate, refs=<the
+fitted centres>, max_rotation_deg=params.max_rotation_deg)`; its
+`ValueError` is refused with its text. Then each well's distance from the
+fitted plate's centre for it (`well_center_um`); the worst above
+`max_residual_um` is refused: `<well> is <n> µm from where the other wells
+put it (bound <b> µm): record it again, or check the plate type`.
+
+**The end.** `ctx.raise_if_stopped()`, then one move to the last well's
+fitted centre: the operator sees on Live that the stage sits in the middle
+of a well. Then the result: `calibrate`'s A1, rotation, residual and scale
+error, `method="wall-images"`, `refs` and `walls` as §17.2. `assumed`, in this
+order: the soft limits line (step 7); with two wells, `two wells: the
+residual checks their distance only; a third well checks the fit`; the
+saving line (step 4). The result is built once, never `model_copy`'d.
+
+**On any exception during the moves** (a stop, a halt, a fault, a refusal of
+the layer) the stage is left where it is: a WARNING names where
+(`position_um()` read in its own `try`, `unknown` when that read fails too),
+the well, the side and the start, and the exception propagates (FM-88,
+FM-64). A `SafetyRefusedError` from a move (the soft limits, or a move
+already under way) is refused as `<well>'s <side> wall: the move to (<x>,
+<y>) µm was refused: <its text>`; `MicroscopeHaltedError` and
+`MotionStoppedError` are not `SafetyRefusedError`s and pass unchanged. After
+a refusal of the fit the stage stays at the last frame.
+
+**Autofocus, turret, Z, light**: none is touched. The PFS stays as it is;
+the tool reads no Z and moves none. The camera's exposure is the one set
+(by Live, or by `smc snap`).
+
+**Objective.** The tool works with the objective in place. On the Ti2-E,
+10× is the one measured (§17.1), with a field of 1.55 mm; at 4× (a field of
+about 3.9 mm) a recorded centre may be further off and a side takes fewer
+frames, but no wall was imaged there yet (#198's next visit). On the 24-well
+plate at 10×, `search_um` 3900 and a step of 1165 µm give 7 walk offsets: 2
+frames per side when the recorded centre is within about 600 µm, 8 at most.
+
+### 17.5 On the page (interface for #346)
+
+What this fixes for the page, so that the page's issue can be planned
+against it; the page's own design goes in `m5-web-ui.md` with that issue.
+
+- `STAGES`' *Set up* gains `plate-walls` after `plate-registration`;
+  `PAGE_PARAMS["plate-walls"] = ("plate", "refs")`, and `page_params(
+  "plate-walls")` is `[f"plate={plate}", f"refs={json}"]` with the same
+  `refs` captures as `plate-registration` (§15.3): one capture of a centre
+  per well, a stage read, no move.
+- Its next step, and the button that runs it, need at least two captured
+  centres on the chosen plate; the card shows, per well, the centre, the
+  diameter and the frames, then the residual and the rotation, from
+  `walls`.
+
+### 17.6 Tests
+
+- `tests/unit/test_plate_walls.py` (`find_wall` and the rest on frames
+  rendered by `PlateSample.render`, no stage):
+  `test_a_wall_is_found_on_each_side_with_a_turned_mirrored_camera` (384 ×
+  512, 30°, mirrored: FM-73); `test_the_centre_of_a_well_is_recovered_within_a_micrometre`
+  (the cases of §17.1's table, with rough centres up to half a radius off);
+  `test_a_frame_inside_a_well_has_no_wall`; `test_shading_without_a_wall_is_not_a_wall`
+  (a ramp from 6000 to 9000); `test_a_frame_on_the_plastic_has_no_wall`;
+  `test_the_neighbours_near_wall_is_not_taken`; `test_of_two_walls_in_a_frame_ours_is_taken`
+  (48-well at 5 µm per pixel); `test_a_wrong_camera_turn_finds_no_wall`;
+  `test_wall_points_agree_with_stage_of_pixel`; `test_walk_offsets_alternate_and_stay_within_the_search`;
+  `test_fit_circle_recovers_a_circle_from_four_arcs`; `test_fit_circle_drops_an_outlying_arc`;
+  `test_fit_circle_refuses_collinear_points`.
+- **On the B3 frames**, in the same module, skipped (with the reason) when
+  the frames are not there: they are private and not in a worktree. The
+  folder is `SMC_SESSION2_DIR` when set, else
+  `<checkout>/local/surveys/nikon-ti2/session2`.
+  `test_b3s_centre_agrees_with_the_midpoint_of_its_walls`: §17.1's matrix
+  and positions, the centre within 25 µm of (10 184.7, −10 091.4) µm (4.4
+  measured), the diameter within 1 % of 15 300 µm (15 298 measured);
+  `test_b3_with_an_upright_camera_finds_no_wall`. The develop session runs
+  them once with the variable set and says so in its report.
+- `tests/test_plate_walls_demo.py`, on `demo_microscope_with_sample` (the
+  stage's `Velocity` at 100 000, as §6's test), `camera-calibration` run first
+  on the same document (the seam, FM-124):
+  `test_two_wells_register_the_plate_of_the_sample` (A1 within 2 µm, the
+  rotation within 0.01°, of a 96-well sample turned 1.2° under a camera turned
+  30° and mirrored, recorded centres 300 µm off);
+  `test_three_wells_fill_the_plate_slot_with_their_walls` (`method`, `refs`,
+  `walls`, 12 frames saved and named);
+  `test_a_plate_of_another_pitch_is_refused_by_the_residual` (a sample of
+  pitch 9.03 mm fitted as `96-well`); `test_a_recorded_centre_outside_its_well_is_refused_and_named`;
+  `test_a_calibration_of_another_frame_is_refused_before_anything_moves`;
+  `test_a_dry_run_is_refused`; `test_square_wells_are_refused`;
+  `test_a_stop_leaves_the_stage_where_it_is`, `test_a_halt_leaves_the_stage_where_it_is`,
+  `test_a_walk_outside_the_soft_limits_is_refused_before_anything_moves`
+  (`limits_um` patched: the demo has none), `test_a_refused_move_names_the_well_and_the_side`
+  (`move_to_um` raising `SafetyRefusedError` on its third call);
+  `test_a_frame_that_cannot_be_saved_does_not_fail_the_registration`;
+  `test_the_stage_ends_at_the_last_wells_centre`.
+- `tests/unit/test_slots.py` gains the round trip of `WallFrame`, `WellFit`
+  and `WallImages`, and a `PlateResult` written before #328 (no `walls`)
+  still validating.
+
+**Failure modes**: FM-32, FM-38, FM-50 (the B3 frames stay out of the
+repository), FM-64, FM-73, FM-74, FM-75 (casts: frames are only read as
+`float64`), FM-85, FM-88, FM-98, FM-121 (the default search obeys its
+bound), FM-124, FM-125, FM-131, FM-142.
+
+### 17.7 Not verified (for the owner)
+
+- A registration at the Ti2-E: three wells, the residual, the time it
+  takes, and `goto-well` to a fourth well. The check: record the fourth
+  well where `goto-well` left the stage and run `plate-walls` on it with one
+  of the first three; its `center_xy_um − recorded_xy_um` is how far
+  `goto-well` landed from its centre, to be under 100 µm.
+- **Which way the plate's columns run on the stage.** If the Ti2-E's stage
+  puts column 2 at −X from column 1 (#327's question), two wells fit a
+  rotation near 180° and `calibrate` refuses it as beyond `max_rotation_deg`.
+  That is the safe answer, but not a registration: what the layer then does
+  is #327's.
+- `max_residual_um = 100`: no plate was registered from images yet.
+- 4×, the light and exposure the walls need, other plates than the 24-well,
+  and whether the PFS holds its lock while the stage looks at the walls.
