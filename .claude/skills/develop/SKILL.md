@@ -137,11 +137,19 @@ them if it is not the one you run on.
 13. Push (`git push -u origin <type>/<N>-<slug>`; the SSH workaround of step 5
     if needed), open the PR with the template (`gh pr create --fill
     --body-file …`, `Closes #N`, conventional title), and watch CI:
-    first `gh pr view --json mergeable`, then `gh pr checks --watch`. A PR
-    that conflicts with `main` gets **no CI** (`--watch` exits at once with
-    `no checks reported`): merge `main` into the branch, push, and watch
-    again (#264, #291, #297 met this when a PR on the same files merged
-    first). Fix failures; never disable a check.
+    first `gh pr view --json mergeable`, then `gh pr checks --watch`. **The
+    label**: when the plan's *Definition of done* has the line `the PR carries
+    the label ci: full`, open the PR with `--label "ci: full"` (the CI reads
+    the label when a run starts, so the first run already has the full
+    matrix). Without the label a PR runs the light set only (`lint & types`,
+    `tests (ubuntu-latest, py3.13)`, `tests (windows-latest, py3.14)`,
+    ADR-0009): three checks are green, not five. A PR that conflicts with
+    `main` gets **no CI** (`--watch` exits at once with `no checks
+    reported`): merge `main` into the branch, push, and watch again (#264,
+    #291, #297 met this when a PR on the same files merged first). A PR that
+    is only *behind* `main` needs no merge: `main` no longer requires an up
+    to date branch (ADR-0009), so do not merge `main` for that alone. Fix
+    failures; never disable a check.
 14. Comment on the issue, exactly in this format, and set `status: in-review`:
 
     ```markdown

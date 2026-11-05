@@ -55,6 +55,7 @@ the plan, do what it unlocks (labels, dependents), and end the session.
    ### Definition of done
    - [ ] the issue's acceptance criteria, made concrete
    - [ ] `ruff check . && ruff format --check . && mypy && pytest` green; CI green
+   - [ ] the PR carries the label ci: full   ← only when the failure class is platform-specific (see Rules)
    - [ ] adversarial review run for this risk level; confirmed findings fixed or deferred with a reason
    - [ ] what only the owner can run (`pytest -m hardware`, even with
          `--profile demo`, or anything at a stand) is listed under *Not
@@ -81,6 +82,14 @@ the plan, do what it unlocks (labels, dependents), and end the session.
   block its review: `docs` nothing; `pure` tests; `tooling` tests and
   Windows; `reads-hardware` failure modes, tests and Windows;
   `moves-hardware` all of that plus `/code-review` in the design review.
+- **The label `ci: full`** (ADR-0009). A PR runs the light set (Linux py3.13
+  and Windows py3.14) and the full matrix runs every night, so a failure that
+  only another platform shows would be found the next morning, after the
+  merge. A plan whose failure class is platform-specific (paths, encodings,
+  subprocesses, file locking, a hardware bridge, the minimum Python) puts the
+  line `- [ ] the PR carries the label ci: full` in its *Definition of done*;
+  `/develop` then opens the PR with the label. There is no new field in the
+  plan format: `point.py` and `/develop` read the format as it is.
 - Do not write the implementation here. Keep the plan consistent with the
   design doc; if reality contradicts the doc, update the doc in a PR.
 - **Measured beats assumed, in plans too.** A fact the plan states about

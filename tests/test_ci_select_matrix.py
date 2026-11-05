@@ -169,6 +169,38 @@ def test_the_workflow_takes_its_matrix_from_the_select_step() -> None:
     assert "scripts/ci/select_matrix.py" in text
 
 
+def _marker_expressions(text: str) -> list[str]:
+    """The expressions given to ``-m`` in ``text``, quoted with ' or "."""
+    return [
+        m.group("expr")
+        for m in re.finditer(r"""\s-m\s+(?P<q>["'])(?P<expr>.*?)(?P=q)""", text)
+    ]
+
+
+def test_a_marker_expression_without_not_hardware_is_found() -> None:
+    # The positive control of the next test: the reader must see a bad expression,
+    # or the next test passes by finding nothing (FM-43).
+    sample = """
+        run: pytest -n auto -m "not wallclock" --junitxml=junit.xml
+        run: pytest -m 'wallclock and not hardware'
+        run: pytest -m "hardware"
+    """
+    found = _marker_expressions(sample)
+    assert found == ["not wallclock", "wallclock and not hardware", "hardware"]
+    assert [e for e in found if "not hardware" not in e] == [
+        "not wallclock",
+        "hardware",
+    ]
+
+
+def test_every_marker_expression_of_the_workflow_excludes_hardware() -> None:
+    # FM-192: a `-m` on the command line replaces the `-m 'not hardware'` of addopts,
+    # and `-m "not wallclock"` alone selects the 71 hardware tests too.
+    text = CI_YML.read_text(encoding="utf-8")
+    bad = [e for e in _marker_expressions(text) if "not hardware" not in e]
+    assert bad == []
+
+
 # --- pr_labels: the one place that talks to GitHub ---------------------------
 
 
