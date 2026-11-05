@@ -2987,9 +2987,11 @@ the relock raises `AutofocusLostError` (§12.5).
   jump is bounded by the sample's own shape, which D2 bounds.
 - **Not forceable.** A forced engage of an unknown offset at 40× is the
   crash itself, and D2 cannot stop a jump that ends between two reads. The
-  route for a new sample or objective is the stand's own: focus by eye,
-  PFS on with the button, the knob until the sample is sharp. That is how
-  run 2 got its offset, and it happens under the operator's eyes.
+  route for a new sample or objective is a first lock from below (§12.10,
+  D4-D7): the offset set to its floor with PFS off, an engage that drives Z
+  away from the sample, then the knob until the sample is sharp. *Amended
+  by #331*: this bullet first named the stand's button, which jumped
+  +206.6 µm in session 2 at an unseen offset.
 - **PFS on, searching, at an unseen offset** is switched off before the
   refusal (a safe call, `disengage()`): left searching, it would drive Z to
   that offset's plane the moment it found the reference. The refusal says
@@ -3197,9 +3199,8 @@ class AutofocusExcursionError(HardwareError):  # not a SafetyRefusedError (FM-64
   names ([autofocus] engage_drives_z_to_offset, m2 §12), and offset 9370
   PFSOffset units has not been seen locked with objective '40x' since the
   stand was opened (seen: 7927, 7977 | seen: none)[; it was on and
-  searching, so it was switched off]. Focus on the sample, switch PFS on
-  with the stand's own controls and set the offset until the sample is
-  sharp; smc then reads the lock ``.
+  searching, so it was switched off]. <the advice of §12.10.5> ``. The
+  advice never names the stand's button (#331).
 - **Z outside the soft limits before the switch-on** (`SafetyRefusedError`,
   `how_to_force=""`): `autofocus PFS: not engaged: Z is at 4400.00 µm,
   outside the soft limits [10, 4350] µm`.
@@ -3271,3 +3272,337 @@ Limits of the design, named:
 - **A lock read in the 0.5 s before a jump** that the operator started at
   the stand (the button) is seen like any lock. The jump is then the
   operator's own; the layer's later engages of that offset run under D2.
+
+### 12.10 A first lock from below (#331)
+
+Extends D1 and D2 (§12.2), §12.4, §12.5 and the drive commands of m5 §6.
+**Merging this section decides it.** The owner chose this route on #331
+(2026-11-05): smc sets the floor and engages under its guard, the direction
+is seen at the stand before it is declared, and E stays 50 µm. D1's route
+and §12.5's text are edited in place to point here.
+
+#### 12.10.1 What is known
+
+Measured in Ti2-E sessions 1 and 2 (#208, #334), unless labelled:
+- **The stand's button jumped again.** Session 2, a 24-well plate, the 10×,
+  PFS off, focused by eye at Z 4191.34 µm, stored offset 9370: the button
+  drove Z to 4397.92 µm, +206.6 µm and 48 µm past the 4350 µm soft limit.
+  Session 1 jumped +235 µm from the same 9370. D1's refusal then advised
+  that same button.
+- **PFS drives Z to the plane its offset names, wherever Z starts.** What
+  makes a first lock safe is therefore the offset that is set, not where Z
+  is: a lower start only makes the jump longer.
+- **With PFS off, an offset write moves no Z** (+10 and +50 units, §4.5),
+  and only software writes it: the knob changes the offset only with PFS
+  on.
+- **Under lock, a larger offset gives a larger Z.** Every factor measured
+  at 10× is positive, 5.9-10.8 units/µm (#208, #334); 9370 → 8141 brought Z
+  from 4397.92 to 4195.26 µm (6.1 units/µm).
+- **At an offset seen locked, PFS off then on moved Z by 0.00 µm** (#334,
+  P1).
+- **A larger Z is closer to the sample: inferred, not seen** (#98). The
+  knob fully down reads 5-6 µm and samples focus near 4200 µm; the 100 µm
+  jog of session 2 was too small to see from the side.
+- **Inferred from the optics, not measured.** The offset lens changes the
+  vergence of the PFS beam ahead of the objective, so an offset change
+  moves the focal plane by about f² times that change: the same sign with
+  every objective, and about 16 times fewer µm per unit at 40× than at 10×
+  (f = 5 mm against 20 mm behind a 200 mm tube lens). Nothing below rests
+  on the factor; D4 rests on the sign, and D5 bounds the case where the
+  sign is wrong.
+- **The 40×** is `3-Plan Apo LmbdD0.25 40x`. Nikon's catalogue gives the CFI
+  Plan Apochromat Lambda D 40X NA 0.95 and a working distance of
+  0.17-0.25 mm (not read at the stand, P6). On session 2's plate, if the
+  40× is parfocal with the 10×, contact lies near 4365-4445 µm: the 4350 µm
+  soft limit is 15-95 µm short of it, a bound and not a procedure.
+- **A turn moves Z by itself** (+8.7 µm with the 4×) and switches PFS off
+  (#330).
+- **`PFSOffset` exposes no property limits**; the values seen are
+  7803-9420 (#208). Which values the device accepts is unknown.
+
+#### 12.10.2 Decisions
+
+**D4. A first lock: `engage()` at an unseen offset at or below the floor.**
+On a declared stand, `engage()` also engages an offset that has not been
+seen locked when that offset, as read back, is at or below the *floor*: the
+lower bound of `[safety] autofocus_offset_soft_limits`. Under lock a larger
+offset gives a larger Z, so the floor names the lowest plane smc can set,
+below the focus of a sample that rests on the vessel's bottom: engaging
+there drives Z away from the sample. The operator then brings the focus up
+with the knob, PFS on, under their own eyes; smc reads the lock, and the
+offset becomes seen (D1).
+- **Only when the guard can bound the case where the floor is not below**:
+  the floor, a focus drive to read, `[safety] max_engage_excursion_um` and
+  `[safety] z_away_from_sample` (D5). With any of them missing, the unseen
+  offset is refused as today, and the refusal names what is missing
+  (§12.10.5).
+- **`engage()` only.** The relock and `focus_by_um`'s relock keep D1 as it
+  is: they bring Z back to where PFS held it, so an unseen offset there is
+  a lost lock, not a first lock.
+- **Not forceable, and nothing new to force**: the signature of `engage()`
+  and the `Autofocus` Protocol do not change.
+- **One floor for every objective**: there is one offset lens, and the sign
+  of its effect does not depend on the objective (inferred, §12.10.1). A
+  floor per objective is a later change, if a visit shows that PFS cannot
+  lock from one floor with every objective.
+- Not chosen: *the stand's button from the floor* (smc writes the floor,
+  the operator presses). It is the same procedure while the inference
+  holds, and an unguarded jump when it does not; the first lock at 40× is
+  exactly where the inference has not been checked.
+- Not chosen: *a `first_lock()` call* that writes the floor and engages
+  under one lock. It changes the Protocol for every backend, and with D4
+  and D6 each of the two calls is safe on its own, whatever the operator
+  does between them.
+- Not chosen: *carrying the offset from the 10×* (#331, option 3). It needs
+  a relation between the two objectives' offsets that is not measured; the
+  offset it gives is still unseen at 40×, with an error of unknown sign;
+  and a turn moves Z and switches PFS off (#330). The visit below records
+  the 10× and 40× focus offsets on one plate, should that relation ever be
+  wanted.
+- Not chosen: *an operator procedure alone* (#331, option 1). Only software
+  writes the offset with PFS off, so any safe procedure contains D4's
+  write.
+- Not chosen: *a key of its own for the first offset*. The floor is the
+  lowest offset smc may set, so it is the lowest plane smc can name; another
+  key could only be higher.
+
+**D5. A first lock's band is one-sided: it bounds Z toward the sample
+only.** `[safety] z_away_from_sample = "decreasing" | "increasing"` declares
+which way Z moves away from the sample. A first lock's band is
+`(−∞, z_start + E]` when it is `"decreasing"` and `[z_start − E, +∞)` when
+it is `"increasing"`, with `E` = `max_engage_excursion_um`; the Z soft
+limits still bound both sides, as in D2. D2's symmetric band would trip on
+the drop that D4 asks for.
+- **A trip is D2's**: switched off at once, `AutofocusExcursionError`, and
+  the offset forgotten (it was never seen). It means that the floor's plane
+  was not below where Z started: either the operator had not focused first
+  (Z was below the focus), or §12.10.1's inference is wrong for this
+  objective. The message names both (§12.10.5).
+- **The value names the reading, not a gesture.** On an upright or a
+  light-sheet stand, "down" is not a sign of Z. This is the key #98 asks
+  for; whether the Z contracts read it stays #98's.
+- **Unset is unknown**, and no first lock runs. The Ti2-E's profile
+  declares it once it has been seen from the side (the owner, 2026-11-05:
+  seen, not inferred).
+- `E` stays 50 µm on the Ti2-E (the owner, 2026-11-05). The 40×'s working
+  distance leaves 170-250 µm (catalogue), and the guard reads Z after a jump
+  has started.
+
+**D6. On a declared stand, an offset move with the autofocus on needs a
+lock and a factor.** `set_offset_native` and `offset_by_native` are refused,
+not forceable, while the autofocus reads on, unless it reads locked and the
+profile has an `[autofocus.offset_per_um]` factor for the current
+objective. In that case §3.6's implied-Z check bounds it, as today.
+- **On and searching**, a new offset is an engage at an unseen offset by
+  another route: PFS drives Z to its plane the moment it finds the
+  reference.
+- **Locked with no factor**, the Z it implies is unknown, which is why
+  `focus_by_um` already refuses it (§3.2).
+- **Off**, the offset moves no Z (§4.5), and the write is free.
+- This closes the way around D4's guard: the floor written while PFS is on.
+  Undeclared stands keep §3.6. At 40×, until its factor is in the profile,
+  the knob is the way to move the focus under lock, under the operator's
+  eyes.
+
+**D7. The operator's route, and the advice.** A first lock is two commands,
+each a single mutating capability call (m5 §6.1):
+1. PFS off, focus on the sample by eye (with PFS off, the knob moves Z);
+2. `smc autofocus offset --floor`: the offset to its floor, Z does not move;
+3. `smc autofocus engage`: Z drops to the floor's plane, away from the
+   sample;
+4. the knob, PFS on, until the sample is sharp. PFS holds that lock on the
+   stand; the first read of the next `Microscope` (`smc autofocus get`, the
+   scan's `is_locked()`, m3 §8) sees it, and the offset is seen for as long
+   as that `Microscope` is open (D1).
+
+D1's refusal of an unseen offset gives exactly this advice, and never the
+stand's button (§12.10.5). The page gains no control here: its autofocus
+control engages as today and shows the same refusal. A control for the
+floor on the page is M5's (m5 §6.2), if the operator asks for one.
+
+#### 12.10.3 Profile — `profile.py`
+
+```toml
+[safety]
+# z_away_from_sample = "decreasing"  # which way Z moves away from the sample, "decreasing" or "increasing"; seen at the stand, never guessed (m2 §12.10, #98)
+```
+
+```python
+class SafetySection(_Section):  # gains, after max_engage_excursion_um
+    z_away_from_sample: Literal["decreasing", "increasing"] | None = None
+```
+
+- Any other value, a boolean included, is a `ProfileError` that names the
+  key and its two values.
+- `Profile.demo()` and `profiles/demo.toml` stay equal: the commented line
+  goes into `demo.toml`, and `profiles/README.md` documents the key.
+- `profiles/nikon-ti2.toml` gets the line commented, labelled *inferred, not
+  seen (#98): declared at the visit once seen from the side*.
+  `autofocus_offset_soft_limits` stays commented until the visit measures
+  it (§12.10.7). Until both are set, the Ti2-E refuses a first lock and
+  says why.
+
+#### 12.10.4 Backend — `backends/mm.py`, `safety.py`
+
+- **`Safety`** gains `z_away_from_sample: Literal["decreasing",
+  "increasing"] | None = None` (keyword, last); the facade passes it
+  (§12.6).
+- **The engage check** (`_check_engage`, §12.4) gains a keyword that only
+  `engage()` sets (the relocks do not). On a declared stand, when the
+  offset read is unseen and that keyword is set and the offset is at or
+  below the floor, it checks the first lock's conditions in this order: the
+  floor, a focus drive, `max_engage_excursion_um`, `z_away_from_sample`.
+  With all of them, the guard is built one-sided (D5) and the engage goes
+  on; with one missing, it gives today's refusal with §12.10.5's advice. As
+  D1's check, it runs inside the action, before the switch-on, in dry-run
+  too.
+- **`_EngageGuard`** gains `open_side: Literal["below", "above"] | None =
+  None`: the band has no bound on that side (`"below"` when
+  `z_away_from_sample` is `"decreasing"`). `what_happened()` names a first
+  lock (§12.10.5).
+- **D6** runs in the steps of `set_offset_native` and `offset_by_native`,
+  beside `_check_implied_z`, before anything is sent, in dry-run too: on a
+  declared stand, it reads whether the autofocus is on, then locked, then
+  the factor. A read that fails refuses with its cause (unknown counts as
+  on, FM-19). `focus_by_um` does not change: it already refuses when the
+  autofocus is on without a factor.
+
+#### 12.10.5 Errors and messages — `errors.py`
+
+- **Unseen offset, a first lock possible** (§12.5's advice): `` … (seen:
+  none)[; it was on and searching, so it was switched off]. Lock it from
+  below (m2 §12.10): with PFS off, focus on the sample by eye, set the
+  offset to its floor (5000 PFSOffset units), engage, then turn the knob
+  with PFS on until the sample is sharp; smc then reads the lock ``.
+- **Unseen offset, no first lock** (§12.5's advice): `` … (seen: none). A
+  first lock from below (m2 §12.10) needs <[safety]
+  autofocus_offset_soft_limits | a focus drive to read | [safety]
+  max_engage_excursion_um | [safety] z_away_from_sample>, which this stand
+  does not have; until then smc engages only at an offset it has read
+  locked ``.
+- **An unseen offset above the floor** gets the first of the two, with the
+  floor's value.
+- **Excursion during a first lock** (`AutofocusExcursionError`): ``
+  autofocus PFS: Z went from 4195.00 µm to 4260.00 µm while it engaged from
+  the offset's floor, more than [safety] max_engage_excursion_um (50 µm)
+  toward the sample; it was switched off. The floor's plane is not below
+  where Z started: focus on the sample by eye before a first lock; if Z was
+  already there, the floor is not below this objective's focus (m2 §12.10),
+  so do not try a first lock with it again. The guard reads Z every 10 ms:
+  it stops PFS once a jump is read, it does not prevent one ``.
+- **D6** (`SafetyRefusedError`, `how_to_force=""`): `` autofocus PFS:
+  offset not moved: it is <on and not locked | locked, with no
+  [autofocus.offset_per_um] factor for objective '3-Plan Apo LmbdD0.25
+  40x'>, and on this stand it drives Z to the plane the offset names (m2
+  §12.10). Switch it off to set the offset (that moves no Z), or turn the
+  knob while it is locked ``.
+
+#### 12.10.6 Drive and CLI — `drive.py`, `cli.py`
+
+```python
+def read_autofocus_offset(microscope: Microscope) -> DriveResult: ...
+def set_autofocus_offset(microscope: Microscope, value: float | None) -> DriveResult:
+    """``None``: the floor, the lower bound of the offset's soft limits."""
+```
+
+- `smc autofocus offset` reads only: `offset 8141 PFSOffset units, soft
+  limits [5000, 12000]`, or `…, no soft limits in the profile (no floor:
+  no first lock)`.
+- `smc autofocus offset --to VALUE` or `--floor` (one of the two;
+  `--dry-run` as the other drive commands) calls `set_offset_native`, then
+  prints the readback: `offset 5000 PFSOffset units`. A readback that
+  differs from the value asked says so, `reached` false (FM-155).
+- `--floor` with no soft limits exits 1 before anything is sent: `no floor:
+  [safety] autofocus_offset_soft_limits is not set (m2 §12.10)`.
+- Reading the floor (`offset_limits_native()`) is a read, so
+  `set_autofocus_offset` stays one mutating call (m5 §6.1).
+
+#### 12.10.7 The next visit to the Ti2-E (#198)
+
+In this order, every command with `--profile nikon-ti2`. Nothing before
+step 4 brings an objective toward a sample at 40×.
+1. **Which way is away (#98).** No plate on the stage, the 10×: `smc z move
+   500`, then `smc z move 4000`, watching the nosepiece from the side
+   (3.5 mm). Write `z_away_from_sample` in the profile.
+2. **The floor.** The 10×, PFS off (`smc autofocus disengage`): `smc
+   autofocus offset --to V` for falling values (7000, 5000, 3000, 1000, 0),
+   each read back, with `smc z get` before and after (no move expected,
+   §4.5); then rising values the same way, to find the top. Write
+   `autofocus_offset_soft_limits` from the lowest and highest values read
+   back as written.
+3. **A rehearsal at 10× on the plate.** The working distance is 15.2 mm, so
+   a wrong move is harmless. Focus by eye with PFS off, then `smc autofocus
+   offset --floor` and `smc autofocus engage`. Expected: Z goes down, then
+   locks. `smc autofocus get` must then read locked: if it reads off, the
+   end of the `engage` command switched PFS off (§12.10.9), and the engage
+   of steps 3 and 4 is made from the page, which stays open. Then the knob,
+   PFS on, until sharp; then `smc z get` and `smc autofocus offset`. If it
+   does not lock from the floor, raise the floor
+   by steps until it does, and write that floor. If Z goes up: stop, and
+   do not take the 40×.
+4. **The 40×.**
+   - `smc autofocus disengage`, `smc z get`, `smc objective set "3-Plan Apo
+     LmbdD0.25 40x" --confirm`, `smc z get` (#330).
+   - Focus by eye with PFS off; `smc z get` gives the by-eye focus.
+   - `smc autofocus offset --floor`, `smc autofocus engage`, and `smc z
+     get` at once: Z must be below the by-eye focus.
+   - The knob, PFS on, until sharp; then `smc z get` and `smc autofocus
+     offset`, read against the by-eye focus.
+   - Two or three knob positions under lock, each with both reads, give
+     the 40×'s factor for `[autofocus.offset_per_um]`.
+
+#### 12.10.8 FakeCore and tests
+
+No new knob: `autofocus_target_um` (§12.7) returns a plane below or above
+where Z starts, from the offset the test writes.
+- **Unit** (`tests/unit/test_engage_guard.py`, the Ti2-E fake):
+  - a first lock at the floor drops Z more than E below where it started
+    and returns `True`, with the offset seen; the mutant that keeps D2's
+    symmetric band is killed;
+  - a first lock whose plane lies above `z_start + E` trips: switched off,
+    `AutofocusExcursionError` with the first lock's text;
+  - a drop past the lower Z soft limit trips;
+  - each missing condition (the floor, a focus drive, E, the direction)
+    refuses with an empty send log and names what is missing;
+  - an unseen offset one unit above the floor is refused, and one at the
+    floor engages: the mutants `<` and `≤` both die;
+  - the relock at an unseen offset at the floor raises
+    `AutofocusLostError`;
+  - `"increasing"` mirrors the band;
+  - an undeclared stand engages as today.
+- **D6** (`tests/unit/test_mm_autofocus.py`): on and searching, and locked
+  with no factor, are refused with nothing sent, in dry-run too; off is
+  sent and moves no Z; locked with a factor gets today's implied-Z check;
+  an undeclared stand is unchanged; a failed read refuses.
+- **Profile**: the two values, any other string, a boolean, the demo's
+  equality.
+- **Drive and CLI**: the read; `--floor` with and without soft limits (exit
+  1, nothing sent); `--to`; both options together; dry run; a readback
+  that differs.
+- **Freeing** (FM-98): the first lock's trip and D6's refusal go into
+  `test_error_exits_free_the_core.py`.
+- **No contract runs a first lock**: it moves Z by what the stand decides.
+  The visit runs it by hand (§12.10.7).
+
+#### 12.10.9 Not verified
+
+- That PFS locks from the floor at all, at 10× and at 40× (steps 3 and 4).
+- That the floor's plane lies below the focus at 40×: the sign is inferred,
+  and D5 bounds the other case.
+- The 40×'s factor: about 16 times the 10×'s if §12.10.1's inference holds.
+- How long a long drop takes, against the 5 s lock timeout and the 1 s
+  settle window.
+- Which way the knob moves Z with PFS on (#208); the operator reads the
+  image either way.
+- Whether switching PFS off in the middle of a jump stops Z at once (#205).
+- Whether a lock taken by `smc autofocus engage` holds once the command has
+  ended and unloaded the stand. Loading leaves PFS as the last user left it
+  (§12.1); unloading was never read. The floor is written with PFS off, so
+  only the engage depends on it (§12.10.7, step 3).
+
+Limits of the design, named:
+- **The stand's button stays outside smc.** A press at an unseen offset
+  jumps whatever smc says; D7 only stops smc from advising it.
+- **A first lock rests on a sign and on the operator's by-eye focus.** The
+  guard limits a wrong sign to E plus what Z covers between two reads; it
+  does not prevent it.
