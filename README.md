@@ -46,6 +46,7 @@ smc devices                         # the demo devices and the role each one fil
 smc stage jog 100 0 --dry-run       # what a jog would send; the stage stays put
 smc objective list                  # the turret's objectives; `smc objective set <label> --confirm` turns it
 smc autofocus engage                # engage, disengage or get the autofocus
+smc autofocus offset --floor        # the offset to its floor, before a first lock (m2 §12.10)
 smc light get                       # the light source: get, on, off
 smc snap --out frame.tif            # one frame from the simulated camera
 smc discover                        # read-only survey of this PC (docs/hardware/microscope-pc-setup.md)

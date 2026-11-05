@@ -316,3 +316,125 @@ def test_autofocus_get_decides_from_the_state_and_not_from_the_words(
 
     assert result.exit_code == 0, result.output
     assert result.output.splitlines()[-1] == "autofocus ? (reworded)"
+
+
+# --- smc autofocus offset (m2 §12.10.6) ---------------------------------------------
+
+
+@pytest.fixture
+def offset_limits_profile(tmp_path: Path) -> Path:
+    """The demo devices with the offset's soft limits [5000, 12000]: a floor of 5000."""
+    path = tmp_path / "floor.toml"
+    path.write_text(
+        '[microscope]\nname = "floor"\n\n'
+        "[safety]\nautofocus_offset_soft_limits = [5000.0, 12000.0]\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _never_opened(monkeypatch: pytest.MonkeyPatch) -> None:
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise AssertionError("the stand was opened")
+
+    monkeypatch.setattr(cli.Microscope, "open", refuse)
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_autofocus_offset_reads_without_sending(
+    monkeypatch: pytest.MonkeyPatch, offset_limits_profile: Path
+) -> None:
+    def no_write(microscope: object, value: float | None) -> DriveResult:
+        raise AssertionError("the offset was written")
+
+    monkeypatch.setattr(cli, "set_autofocus_offset", no_write)
+
+    plain = runner.invoke(app, ["autofocus", "offset"])
+    limited = runner.invoke(
+        app, ["autofocus", "offset", "-p", str(offset_limits_profile)]
+    )
+
+    assert plain.exit_code == 0, plain.output
+    assert plain.output.splitlines()[-1] == (
+        "offset 0 device units, no soft limits in the profile (no floor: no first lock)"
+    )
+    # The brackets survive the console: no rich markup is read in them.
+    assert limited.exit_code == 0, limited.output
+    assert limited.output.splitlines()[-1] == (
+        "offset 0 device units, soft limits [5000, 12000]"
+    )
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_autofocus_offset_to_sets_and_prints_the_readback() -> None:
+    result = runner.invoke(app, ["autofocus", "offset", "--to", "12.5"])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines()[-1] == "offset 12.5 device units"
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_autofocus_offset_floor_sets_the_lower_bound(
+    offset_limits_profile: Path,
+) -> None:
+    result = runner.invoke(
+        app, ["autofocus", "offset", "--floor", "-p", str(offset_limits_profile)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines()[-1] == "offset 5000 device units"
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_autofocus_offset_floor_without_soft_limits_exits_1() -> None:
+    result = runner.invoke(app, ["autofocus", "offset", "--floor"])
+
+    assert result.exit_code == 1, result.output
+    assert result.output.splitlines()[-1] == (
+        "✗ no floor: [safety] autofocus_offset_soft_limits is not set (m2 §12.10)"
+    )
+
+
+def test_autofocus_offset_with_both_options_exits_2_before_opening(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _never_opened(monkeypatch)
+
+    result = runner.invoke(app, ["autofocus", "offset", "--to", "5000", "--floor"])
+
+    assert result.exit_code == 2, result.output
+    assert "use --to or --floor, not both" in _ANSI.sub("", result.output)
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_autofocus_offset_to_nan_exits_2_before_opening(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    # typer parses them as floats (FM-32): the command refuses them itself.
+    _never_opened(monkeypatch)
+
+    result = runner.invoke(app, ["autofocus", "offset", "--to", value])
+
+    assert result.exit_code == 2, result.output
+    shown = str(float(value))
+    assert f"--to must be a finite number, got {shown}" in _ANSI.sub("", result.output)
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_autofocus_offset_dry_run_sends_nothing(offset_limits_profile: Path) -> None:
+    profile = ["-p", str(offset_limits_profile)]
+
+    # The offset is read again inside the same stand: it stayed where it was.
+    result = runner.invoke(
+        app, ["autofocus", "offset", "--floor", "--dry-run", *profile]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines()[-1] == (
+        "[dry-run] would set the offset to 5000 device units; it is at 0 device units"
+    )
