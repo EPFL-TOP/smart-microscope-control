@@ -218,7 +218,8 @@ Every key may be left out, and an unknown key is refused as in a profile. `stand
 `plate` and `wells` are one non-blank line. Each list under `[params]` has the shape of a
 `[suggest]`'s `params` (`key=value`, a key given once, no space in a key) and may be
 empty. `wells`, `plate`, `refs` and `walls` are not kept under `params`: the first two are
-the preset's own fields, and a preset never holds a position. The checked-in example
+the preset's own fields, and a preset never holds a position (`plate-finding`'s
+`centre_x_um` and `centre_y_um`, a stage position, join them). The checked-in example
 is [`presets/weekly.toml`](presets/weekly.toml), for `demo-sample`.
 
 **The name** is the file's stem: 1 to 64 lower-case letters, digits, `-` and `_`,

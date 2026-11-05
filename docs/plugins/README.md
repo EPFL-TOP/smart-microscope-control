@@ -43,6 +43,7 @@ smc run NAME --show-params
 smc run NAME [-p PROFILE] --run-doc PATH [--preset NAME|PATH] [--param KEY=VALUE]... [--dry-run] [--resume]
 smc presets list [-p PROFILE]
 smc presets show NAME|PATH [-p PROFILE] [--run-doc PATH]
+smc presets save NAME --run-doc PATH [-p PROFILE] [--overwrite]
 ```
 
 `--list` and `--show-params` open no stand. A run needs `--run-doc`: the JSON file
@@ -162,8 +163,37 @@ that changed between the two runs is refused there for the parameters that diffe
 searched. `smc presets show NAME|PATH` prints one preset: its fields and pairs, then
 what would not apply here (against every registered plugin, the profile's stand and, with
 `--run-doc`, the plate that document registered; a missing file registers nothing), or
-`no mismatch on <stand>`. Neither opens a stand. There is no `smc presets save` yet: a
-preset is written by hand in the documented format, or from the plate page.
+`no mismatch on <stand>`. Neither opens a stand.
+
+**`smc presets save NAME --run-doc PATH`** writes a preset from a run document, so that
+the next run takes its choices from the last one and not from a retyped command. It saves
+what the document's **finished** stages (`done`, a dry run's included) used: the plate the
+document registered, `scan-plan`'s wells, and for each plugin the parameters that **differ
+from the plugin's default**: a value equal to its default is not saved, so the preset follows
+the plugin's default as a profile's `[suggest]` does. A `stopped`, `failed` or `running`
+stage is not saved. It is written beside the profile (`-p`), as the plate page's *Save*
+writes it; a name that exists is refused (exit 2) unless `--overwrite` is given. It opens no
+stand and moves nothing.
+
+What it leaves out is **said, never dropped**: the positions (`plate-registration`'s `refs`
+and `walls`, `plate-finding`'s centre) are never saved, and a plugin whose recorded values
+do not read back as the same values (the string `null` in a field that also admits an
+absent value), do not encode as text, or are no longer valid for this smc loses **all** its
+pairs, with one line that names the key. The lines after the preset are those notes, and
+`a stage was run on another stand` is one of them. It does not judge a value: a path such as
+`nis-export`'s `out` is saved like any other pair, and every pair written is printed.
+
+```text
+$ smc presets save weekly --run-doc run.json -p demo-sample
+saved weekly to profiles/presets/weekly.toml
+stand: demo-sample
+plate: 96-well
+wells: B2,B11
+saved_utc: 2026-11-05T11:21:59+00:00
+scan: autofocus=off
+scan-plan: coverage=0.4
+$ smc run scan-plan -p demo-sample --preset weekly --run-doc next.json   # next.json has its plate registered
+```
 
 ## Trying the workflow without a microscope
 

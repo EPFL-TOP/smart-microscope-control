@@ -515,8 +515,10 @@ terminal applies the preset and its record names it.
 sees it. The fields are each tab's own, so another tab's note lists how its own fields
 differ.
 
-**From a terminal**, `smc run NAME --preset NAME|PATH` applies a preset, and `smc
-presets list` and `smc presets show` look at them (see
+**From a terminal**, `smc run NAME --preset NAME|PATH` applies a preset, `smc presets
+list` and `smc presets show` look at them, and `smc presets save NAME --run-doc PATH`
+writes one from a run document's finished stages, as the page's *Save* does from its
+fields (see
 [plugins/README.md](../plugins/README.md#presets-smc-run---preset-and-smc-presets)).
 There is no *Delete* button and no `smc ui --preset`: a preset is deleted as a file, and
 the page starts with none loaded.
