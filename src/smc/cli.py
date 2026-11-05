@@ -46,6 +46,8 @@ from smc.drive import (
     move_xy,
     move_z,
     read_autofocus,
+    read_autofocus_offset,
+    set_autofocus_offset,
     set_objective,
     switch_light,
     xy_text,
@@ -1588,8 +1590,9 @@ def z_jog(
 
 # --- objective, autofocus and light (m5 §6.2) ------------------------------------
 # One command per drive action, each the same smc.drive call as the page's
-# control (ADR-0006, principle 5). None takes a free number (FM-32), and none
-# forces a guard: the turret's confirmation is the one the operator answers.
+# control (ADR-0006, principle 5). Only `smc autofocus offset --to` takes a free
+# number: finite, then the offset's soft limits (FM-32). None forces a guard: the
+# turret's confirmation is the one the operator answers.
 
 objective_app = typer.Typer(
     help="The objective turret; a turn needs --confirm.",
@@ -1597,7 +1600,8 @@ objective_app = typer.Typer(
     rich_markup_mode="rich",
 )
 autofocus_app = typer.Typer(
-    help="The autofocus (Nikon PFS, Zeiss Definite Focus): engage, disengage, read.",
+    help="The autofocus (Nikon PFS, Zeiss Definite Focus): engage, disengage, read, "
+    "set the offset.",
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
@@ -1710,6 +1714,52 @@ def autofocus_disengage(
 ) -> None:
     """Switch the autofocus off; never refused, sent in dry run too."""
     _drive_command(ctx, profile, dry_run, Autofocus, disengage_autofocus)
+
+
+@autofocus_app.command("offset", context_settings=_NUMBERS)
+def autofocus_offset(
+    ctx: typer.Context,
+    to: Annotated[
+        float | None,
+        typer.Option(
+            "--to",
+            help="Set the offset to this value, in its own units (the profile's "
+            "autofocus.offset_unit); the soft limits apply.",
+        ),
+    ] = None,
+    floor: Annotated[
+        bool,
+        typer.Option(
+            "--floor",
+            help="Set the offset to its floor, the lower bound of "
+            "safety.autofocus_offset_soft_limits: before a first lock (m2 §12.10).",
+        ),
+    ] = False,
+    dry_run: DryRunOption = False,
+    profile: ProfileOption = DEMO_NAME,
+) -> None:
+    """Read the autofocus offset, or set it with --to or --floor; prints the readback.
+
+    A first lock from below (m2 §12.10): with the autofocus off, focus on the
+    sample by eye, then `smc autofocus offset --floor` (Z does not move), `smc
+    autofocus engage` (Z drops away from the sample), then turn the knob with
+    the autofocus on until the sample is sharp.
+    """
+    if to is not None and floor:
+        raise typer.BadParameter("use --to or --floor, not both")
+    if to is not None and not math.isfinite(to):
+        raise typer.BadParameter(f"--to must be a finite number, got {to}")
+    if to is None and not floor:
+        _drive_command(ctx, profile, dry_run, Autofocus, read_autofocus_offset)
+        return
+    value = None if floor else to
+    _drive_command(
+        ctx,
+        profile,
+        dry_run,
+        Autofocus,
+        lambda microscope: set_autofocus_offset(microscope, value),
+    )
 
 
 @light_app.command("get")

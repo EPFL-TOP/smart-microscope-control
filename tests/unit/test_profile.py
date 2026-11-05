@@ -1090,6 +1090,31 @@ def test_new_numeric_engage_keys_refuse_a_toml_boolean(
     assert getattr(getattr(loaded, section), key) == 1.0
 
 
+# -- a first lock from below (m2 §12.10.3) ------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["decreasing", "increasing"])
+def test_z_away_from_sample_accepts_its_two_values(tmp_path: Path, value: str) -> None:
+    path = write_profile(
+        tmp_path / "p.toml", f'[safety]\nz_away_from_sample = "{value}"\n'
+    )
+    assert Profile.load(path).safety.z_away_from_sample == value
+    # Omitted, it is unknown: no first lock runs.
+    assert Profile.demo().safety.z_away_from_sample is None
+
+
+@pytest.mark.parametrize("value", ['"down"', '"Decreasing"', "true"])
+def test_z_away_from_sample_refuses_another_value_or_a_boolean(
+    tmp_path: Path, value: str
+) -> None:
+    # A boolean would say nothing of which way; a case variant is refused
+    # rather than guessed, since the key names a direction (#98).
+    msg = _load_error(tmp_path, f"[safety]\nz_away_from_sample = {value}\n")
+    assert "safety.z_away_from_sample" in msg
+    assert "'decreasing'" in msg
+    assert "'increasing'" in msg
+
+
 def test_the_default_lock_timeout_mirror_matches_the_backend() -> None:
     # A pure module imports no backend, so it keeps its own copy (m2 §12.3).
     assert profile_module._DEFAULT_LOCK_TIMEOUT_S == mm.DEFAULT_LOCK_TIMEOUT_S

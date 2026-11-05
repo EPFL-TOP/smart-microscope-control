@@ -268,6 +268,7 @@ class Microscope:
             offset_unit=profile.autofocus.offset_unit,
             stop_refused_by=frozenset(role.value for role in safety.stop_refused_by),
             max_engage_excursion_um=safety.max_engage_excursion_um,
+            z_away_from_sample=safety.z_away_from_sample,
         )
         self._lock = threading.RLock()
         # FM-15: waiting for the lock is bounded like a device call.

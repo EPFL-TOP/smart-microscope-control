@@ -41,6 +41,8 @@ __all__ = [
     "move_xy",
     "move_z",
     "read_autofocus",
+    "read_autofocus_offset",
+    "set_autofocus_offset",
     "set_objective",
     "switch_light",
     "um_text",
@@ -272,6 +274,69 @@ def disengage_autofocus(microscope: Microscope) -> DriveResult:
     if microscope.dry_run:
         return DriveResult(now.text + _OFF_IN_DRY_RUN, reached=reached)
     return DriveResult(now.text, reached=reached)
+
+
+def _offset_text(autofocus: Autofocus, value: float) -> str:
+    """``5000 PFSOffset units``: the offset in its own units, never converted."""
+    return f"{value:g} {autofocus.offset_unit() or 'device units'}"
+
+
+def read_autofocus_offset(microscope: Microscope) -> DriveResult:
+    """The autofocus offset and its soft limits, whose lower bound is a first lock's floor (m2 §12.10).
+
+    Reads only: ``smc autofocus offset`` with no option.
+
+    Raises:
+        CapabilityMissingError: The stand has no autofocus.
+    """
+    autofocus = microscope.require(Autofocus)
+    here = _offset_text(autofocus, autofocus.offset_native())
+    limits = autofocus.offset_limits_native()
+    if limits is None:
+        return DriveResult(
+            f"offset {here}, no soft limits in the profile (no floor: no first lock)"
+        )
+    return DriveResult(f"offset {here}, soft limits [{limits[0]:g}, {limits[1]:g}]")
+
+
+def set_autofocus_offset(microscope: Microscope, value: float | None) -> DriveResult:
+    """Set the autofocus offset; ``None``: the floor, the lower bound of the offset's soft limits.
+
+    Step 2 of a first lock from below (m2 §12.10 D7): with the autofocus off the
+    write moves no Z. One mutating call (m5 §6.1): the soft limits and the
+    offset are reads. The text is the readback, and one that differs from the
+    value asked says so with ``reached`` false (FM-155): the Ti2-E holds whole
+    units, so 7927.5 honestly reads 7927.
+
+    Raises:
+        CapabilityMissingError: The stand has no autofocus.
+        SafetyRefusedError: Outside the offset's soft limits; or, on a stand that
+            declares ``engage_drives_z_to_offset``, the autofocus is on and not
+            locked with a factor (m2 §12.10 D6).
+        MicroscopeHaltedError: The stand is halted.
+    """
+    autofocus = microscope.require(Autofocus)
+    if value is None:
+        limits = autofocus.offset_limits_native()
+        if limits is None:
+            return DriveResult(
+                "no floor: [safety] autofocus_offset_soft_limits is not set (m2 "
+                "§12.10)",
+                reached=False,
+            )
+        value = limits[0]
+    landed = autofocus.set_offset_native(value)
+    if microscope.dry_run:
+        return DriveResult(
+            f"[dry-run] would set the offset to {_offset_text(autofocus, value)}; it "
+            f"is at {_offset_text(autofocus, autofocus.offset_native())}"
+        )
+    if landed != value:
+        return DriveResult(
+            f"offset {_offset_text(autofocus, landed)}, although {value:g} was asked",
+            reached=False,
+        )
+    return DriveResult(f"offset {_offset_text(autofocus, landed)}")
 
 
 def switch_light(microscope: Microscope, on: bool) -> DriveResult:
