@@ -253,14 +253,16 @@ def test_a_push_run_still_in_progress_does_not_decide(point) -> None:
     assert point.red_main([green, _run("2026-10-01T10:00:00Z", "", "feat: b")]) is None
 
 
-def test_a_cancelled_push_run_does_not_make_main_red(point) -> None:
+@pytest.mark.parametrize("conclusion", ["cancelled", "skipped", "neutral"])
+def test_a_cancelled_push_run_does_not_make_main_red(point, conclusion) -> None:
     # A push to main cancels the older run of main (concurrency): a cancellation is
     # not a verdict on the code, and it is the usual state of the older of two merges.
+    # A skipped or neutral run ran no test either: it neither makes main red nor clears it.
     green = _run("2026-10-01T09:00:00Z", "success", "feat: a")
-    cancelled = _run("2026-10-01T10:00:00Z", "cancelled", "feat: b")
-    assert point.red_main([green, cancelled]) is None
+    no_verdict = _run("2026-10-01T10:00:00Z", conclusion, "feat: b")
+    assert point.red_main([green, no_verdict]) is None
     red = _run("2026-10-01T08:00:00Z", "failure", "feat: z")
-    assert point.red_main([red, cancelled]) == red
+    assert point.red_main([red, no_verdict]) == red
 
 
 def test_only_the_ci_workflow_decides_whether_main_is_red(point) -> None:

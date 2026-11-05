@@ -162,6 +162,33 @@ def test_the_workflow_keeps_the_names_of_its_jobs() -> None:
     assert _workflow_template() == "tests (${{ matrix.os }}, py${{ matrix.python }})"
 
 
+@pytest.mark.parametrize(
+    "line",
+    [
+        # what select_matrix.py reads: without these a PR silently runs the full matrix again
+        "PR_NUMBER: ${{ github.event.pull_request.number }}",
+        "GH_TOKEN: ${{ github.token }}",
+        "pull-requests: read",
+        # the test job is the matrix entry it is named for, on its system and its Python
+        "runs-on: ${{ matrix.os }}",
+        "python-version: ${{ matrix.python }}",
+        "fail-fast: false",
+        # the triggers: a missing one is a dead nightly, whose first run cannot be seen in a PR
+        "branches: [main]",
+        '- cron: "17 2 * * *"',
+        "workflow_dispatch:",
+        # what nightly_report.py reads back (it names a job's artifact from the job's name)
+        "name: junit-${{ matrix.os }}-py${{ matrix.python }}",
+        "pattern: junit-*",
+        "path: junit\n",
+        "retention-days: 7",
+    ],
+)
+def test_the_workflow_keeps_the_wiring_its_scripts_read(line: str) -> None:
+    text = CI_YML.read_text(encoding="utf-8").replace("\r\n", "\n")
+    assert line in text
+
+
 def test_the_workflow_takes_its_matrix_from_the_select_step() -> None:
     text = CI_YML.read_text(encoding="utf-8")
     assert "matrix: ${{ fromJSON(needs.lint.outputs.matrix) }}" in text
@@ -170,26 +197,58 @@ def test_the_workflow_takes_its_matrix_from_the_select_step() -> None:
 
 
 def _marker_expressions(text: str) -> list[str]:
-    """The expressions given to ``-m`` in ``text``, quoted with ' or "."""
-    return [
-        m.group("expr")
-        for m in re.finditer(r"""\s-m\s+(?P<q>["'])(?P<expr>.*?)(?P=q)""", text)
-    ]
+    """The expressions given to ``-m`` in ``text``: quoted with ' or ", or a bare word."""
+    found = re.finditer(
+        r"""\s-m\s+(?:(?P<q>["'])(?P<expr>.*?)(?P=q)|(?P<bare>[^\s"']+))""", text
+    )
+    return [m.group("expr") or m.group("bare") for m in found]
 
 
-def test_a_marker_expression_without_not_hardware_is_found() -> None:
-    # The positive control of the next test: the reader must see a bad expression,
-    # or the next test passes by finding nothing (FM-43).
+# The marks a hardware test can carry: it is the combination, not the word, that selects it.
+_HARDWARE_TESTS = [
+    {"hardware"},
+    {"hardware", "demo"},
+    {"hardware", "wallclock"},
+    {"hardware", "demo", "wallclock"},
+]
+
+
+def _selects_a_hardware_test(expression: str) -> bool:
+    """Whether pytest's own evaluation of ``-m expression`` keeps any hardware test."""
+    from _pytest.mark.expression import Expression
+
+    compiled = Expression.compile(expression)
+    return any(
+        compiled.evaluate(lambda name, _marks=marks, **kw: name in _marks)
+        for marks in _HARDWARE_TESTS
+    )
+
+
+def test_a_marker_expression_that_selects_hardware_is_found() -> None:
+    # The positive control of the next test: the reader must see a bad expression and
+    # the evaluation must call it bad, or the next test passes by finding nothing (FM-43).
     sample = """
         run: pytest -n auto -m "not wallclock" --junitxml=junit.xml
         run: pytest -m 'wallclock and not hardware'
         run: pytest -m "hardware"
+        run: pytest -m "not wallclock or not hardware"
+        run: pytest -m wallclock
+        run: pytest -m "not hardware and not wallclock"
     """
     found = _marker_expressions(sample)
-    assert found == ["not wallclock", "wallclock and not hardware", "hardware"]
-    assert [e for e in found if "not hardware" not in e] == [
+    assert found == [
+        "not wallclock",
+        "wallclock and not hardware",
+        "hardware",
+        "not wallclock or not hardware",
+        "wallclock",
+        "not hardware and not wallclock",
+    ]
+    assert [e for e in found if _selects_a_hardware_test(e)] == [
         "not wallclock",
         "hardware",
+        "not wallclock or not hardware",
+        "wallclock",  # keeps a test that is both hardware and wallclock
     ]
 
 
@@ -197,8 +256,11 @@ def test_every_marker_expression_of_the_workflow_excludes_hardware() -> None:
     # FM-192: a `-m` on the command line replaces the `-m 'not hardware'` of addopts,
     # and `-m "not wallclock"` alone selects the 71 hardware tests too.
     text = CI_YML.read_text(encoding="utf-8")
-    bad = [e for e in _marker_expressions(text) if "not hardware" not in e]
-    assert bad == []
+    expressions = _marker_expressions(text)
+    assert (
+        len(expressions) >= 2
+    )  # the two parallel-run steps: a reader that finds none is blind
+    assert [e for e in expressions if _selects_a_hardware_test(e)] == []
 
 
 def test_the_wallclock_marker_is_registered() -> None:
@@ -263,6 +325,8 @@ def test_pr_labels_reads_one_label_per_line(sel, monkeypatch) -> None:
     def fake_run(cmd, **kwargs):
         calls.append(cmd)
         assert kwargs.get("encoding") == "utf-8"
+        # a stalled gh would hold `lint & types`, which every required check waits for
+        assert 0 < kwargs.get("timeout", 0) <= 600
         return _completed(0, "type: chore\r\nci: full\n\n")
 
     monkeypatch.setattr(sel.subprocess, "run", fake_run)
