@@ -148,6 +148,14 @@ def test_the_light_set_is_a_subset_of_the_full_matrix(sel) -> None:
     assert set(_names(sel, light)) < set(_names(sel, full))
 
 
+def test_the_full_label_is_in_the_label_file_that_the_bootstrap_creates(sel) -> None:
+    # A label the script waits for but that no repository has can never be put on a PR.
+    labels = json.loads(
+        (ROOT / "scripts" / "github" / "labels.json").read_text(encoding="utf-8")
+    )
+    assert sel.FULL_LABEL in {label["name"] for label in labels}
+
+
 def test_the_workflow_keeps_the_names_of_its_jobs() -> None:
     text = CI_YML.read_text(encoding="utf-8")
     assert re.search(r"^    name: lint & types\s*$", text, re.MULTILINE)
