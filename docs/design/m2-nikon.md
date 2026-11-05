@@ -1875,7 +1875,9 @@ Callable[[], ZStage | None] = lambda: None`; `_build` passes `lambda:
 cast("ZStage | None", _owned(owner, "ObjectiveTurret")._lookup(ZStage))`
 (FM-92: nothing the capability stores is a bound method of itself, and the
 lookup at the call raises once the facade is gone, as the autofocus's does).
-In `_turn`, after the already-at check and the switch-off, unless in
+In `_turn` the two lookups, the autofocus's and `z_stage()`, come right after
+the already-at check and **before** the switch-off, so that a facade that is
+gone raises before anything is switched off or sent. Then, unless in
 dry-run, and only when `z_stage()` is not `None`:
 
 1. Z is read before the send, with `ZStage.position_um()`.
