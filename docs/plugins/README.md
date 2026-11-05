@@ -179,7 +179,7 @@ writes it; a name that exists is refused (exit 2) unless `--overwrite` is given.
 stand and moves nothing.
 
 What it leaves out is **said, never dropped**: the positions (`plate-registration`'s `refs`
-and `walls`, `plate-finding`'s centre) are never saved, and a plugin whose recorded values
+and `walls`, `plate-walls`' `refs`, `plate-finding`'s centre) are never saved, and a plugin whose recorded values
 do not read back as the same values (the string `null` in a field that also admits an
 absent value), do not encode as text, or are no longer valid for this smc loses **all** its
 pairs, with one line that names the key. The lines after the preset are those notes, and

@@ -218,6 +218,31 @@ def test_plate_finding_centre_is_not_kept_under_params_for_a_hand_written_preset
     )
 
 
+def test_plate_walls_refs_are_never_saved_and_not_kept_for_a_hand_written_preset() -> (
+    None
+):
+    # plate-walls (#328) landed after this module's first cases: its `refs` are the
+    # stage positions of wells centred by eye, as plate-registration's are.
+    refs = [
+        {"well": "A1", "x_um": 1.0, "y_um": 2.0},
+        {"well": "B2", "x_um": 3.0, "y_um": 4.0},
+    ]
+    recorded = _recorded("plate-walls", plate="24-well", refs=refs, search_um=500.0)
+
+    made = _preset_of(_record("plate-walls", recorded, result={"plate": "24-well"}))
+
+    assert made.preset.params == {"plate-walls": ("plate=24-well", "search_um=500.0")}
+    assert made.notes == ()
+
+    preset = Preset(params={"plate-walls": ("refs=[]",)})
+    check = check_preset(_file(preset), MODELS, stand=STAND, registered=None)
+    assert check.params == {}
+    assert check.mismatches == (
+        "preset weekly [params.plate-walls]: refs is not kept under params: "
+        "a preset holds no positions",
+    )
+
+
 @pytest.mark.parametrize(
     "status", [StageStatus.stopped, StageStatus.failed, StageStatus.running]
 )
@@ -316,6 +341,20 @@ CASES: dict[str, list[dict[str, Any]]] = {
             "refs": [{"well": "A1", "x_um": 1.0, "y_um": 2.0}],
             "walls": [{"well": "A1", "side": "left", "x_um": 1.0, "y_um": 2.0}],
             "max_rotation_deg": 5.0,
+        }
+    ],
+    "plate-walls": [
+        {
+            "plate": "24-well",
+            "refs": [
+                {"well": "A1", "x_um": 1.0, "y_um": 2.0},
+                {"well": "B2", "x_um": 3.0, "y_um": 4.0},
+            ],
+            "search_um": 500.0,
+            "max_residual_um": 50.0,
+            "max_rotation_deg": 5.0,
+            "settle_ms": 30.0,
+            "save_frames": False,
         }
     ],
     "report": [{"max_cells_drawn_per_well": 500}],
