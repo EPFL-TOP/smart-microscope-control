@@ -542,6 +542,7 @@ def test_a_settle_window_alone_still_waits_for_z() -> None:
         assert stand.z.position_um() == Z0 + 20.0
 
 
+@pytest.mark.wallclock
 def test_a_lock_lost_in_the_settle_window_starts_it_again(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

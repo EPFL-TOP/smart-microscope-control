@@ -53,6 +53,9 @@ dependencies = [
 dev = [
   "pytest>=8",
   "pytest-cov>=5",
+  # The light CI runs the suite with `-n auto` (ADR-0009, #353); the tests marked
+  # `wallclock` run afterwards, serially.
+  "pytest-xdist>=3.5",
   "hypothesis>=6",
   "ruff>=0.6",
   "mypy>=1.10",
@@ -202,6 +205,7 @@ addopts = "-ra -m 'not hardware'"
 markers = [
   "hardware: needs a real microscope; deselected by default (see ADR-0005)",
   "demo: runs against Micro-Manager's demo devices (needs `mmcore install`)",
+  "wallclock: asserts on a measured duration or a frame rate; the CI runs it serially, after the parallel run (ADR-0009)",
 ]
 filterwarnings = ["error::DeprecationWarning:smc.*"]
 

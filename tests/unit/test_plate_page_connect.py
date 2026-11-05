@@ -1271,6 +1271,7 @@ def test_close_does_not_overwrite_the_outcome_of_a_connect_that_just_ended(
     assert _released(opener.opened[0])
 
 
+@pytest.mark.wallclock
 def test_release_does_not_wait_for_an_activity_other_than_a_connect(
     page: PlatePage, opener: Opener, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1358,6 +1359,7 @@ def test_stop_keeps_its_note_before_it_logs_it(
     assert seen == ["stopped: the stand is halted (Resume clears the halt)"]
 
 
+@pytest.mark.wallclock
 def test_a_read_that_never_ends_does_not_slow_the_next_disconnect(
     page: PlatePage, opener: Opener, monkeypatch: pytest.MonkeyPatch
 ) -> None:
