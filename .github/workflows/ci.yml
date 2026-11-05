@@ -103,3 +103,33 @@ jobs:
           path: junit.xml
           if-no-files-found: ignore
           retention-days: 7
+
+  # ADR-0009: the nightly and a dispatch report themselves in one issue
+  # (`CI nightly red`): opened on a red run, one line on the next red run,
+  # closed on a green one. A pull request or a push never runs this job.
+  nightly-report:
+    name: nightly report
+    needs: [lint, test]
+    # always(): the report must run when the tests failed, which is its point.
+    if: ${{ always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+      # One folder per test job under junit/. A job whose process aborted
+      # uploaded nothing (FM-179), and a run with no artifact at all must still
+      # open its issue: the report reads the jobs' own conclusions too.
+      - uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          pattern: junit-*
+          path: junit
+      - name: Open, update or close the nightly's issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+        run: python3 scripts/ci/nightly_report.py
