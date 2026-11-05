@@ -2935,8 +2935,8 @@ While `plate_chosen` is `False`:
 - captures stay allowed: a capture is a stage read, and `choose_plate` dropping them
   is the operator's own act, shown on the page.
 
-The first sentence of `CAPTURE_WELLS` becomes the plate's: `choose the plate on the
-stage, then centre a well ...` is the guide's first words on a stand with no sample.
+`CAPTURE_WELLS` is unchanged: the step shows it once the plate is chosen, and
+`PLATE_NOT_CHOSEN` before.
 
 *Decided against:* a plate in the stand's profile. A profile is an instrument's, and
 the plate changes between experiments; what a real stand suggests is the owner's call
