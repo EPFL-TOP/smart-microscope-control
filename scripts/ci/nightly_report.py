@@ -49,6 +49,8 @@ MAX_TESTS = 40
 _GH_TIMEOUT_S = 120
 # The conclusions of a job that did not fail: anything else is listed.
 _NOT_FAILED = {None, "success", "skipped", "neutral"}
+# The conclusions that say a job's tests ran and failed (a cancelled job did not run them).
+_FAILED = {"failure", "timed_out"}
 
 # ``gh`` takes the arguments after the program name and the text for its standard input.
 Gh = Callable[[list[str], str | None], str]
@@ -158,6 +160,17 @@ def _artifact_of(job_name: str) -> str | None:
     """``tests (ubuntu-latest, py3.13)`` -> ``ubuntu-latest-py3.13`` (the artifact's name)."""
     match = re.fullmatch(r"tests \((?P<os>[^,]+), py(?P<py>[^)]+)\)", job_name)
     return f"{match['os']}-py{match['py']}" if match else None
+
+
+def has_failed_job(jobs: list[tuple[str, str | None]]) -> bool:
+    """Whether a job of the run failed or timed out, from the jobs' own conclusions.
+
+    A cancelled job is not one: it did not run the tests. The report's own job has
+    no conclusion yet while it runs, and is left out by name besides.
+    """
+    return any(
+        conclusion in _FAILED and name != "nightly report" for name, conclusion in jobs
+    )
 
 
 def _failed_jobs(jobs: list[tuple[str, str | None]]) -> list[tuple[str, str]]:
@@ -340,12 +353,19 @@ def main(gh: Gh | None = None, today: str | None = None) -> int:
         raw = json.loads(listing or "[]")
         existing = find_issue(raw, title)
         text = ""
-        if status == "red":
+        jobs: list[tuple[str, str | None]] | None = None
+        if status != "green":
             try:
-                jobs: list[tuple[str, str | None]] | None = list_jobs(gh, repo, run_id)
+                jobs = list_jobs(gh, repo, run_id)
             except GhError as error:
                 print(f"::warning::{error}")
-                jobs = None
+        # The matrix's own result is `abandoned` when one entry never got a runner (a
+        # starved macOS job, measured on the demo run of #353), whatever the other
+        # entries did: four failed jobs and one abandoned made `unknown`. A job that
+        # failed is a failure whatever the aggregate says.
+        if status == "unknown" and jobs is not None and has_failed_job(jobs):
+            status = "red"
+        if status == "red":
             junit = failed_tests(Path(os.environ.get("JUNIT_DIR", "junit")))
             text = body(today, ref, sha, run_url, jobs, junit)
         done = act(status, title, existing, text, run_url, gh, today=today)

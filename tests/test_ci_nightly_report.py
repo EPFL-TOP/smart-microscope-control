@@ -8,6 +8,7 @@ through an injected ``gh``, so these tests never touch the network.
 import importlib.util
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -127,6 +128,10 @@ def test_a_failed_job_makes_the_nightly_red(rep, lint, test) -> None:
         ("skipped", "skipped"),
         ("", ""),
         ("success", "something-new"),
+        (
+            "success",
+            "abandoned",
+        ),  # a matrix entry that never got a runner (measured, #353)
     ],
 )
 def test_a_cancelled_or_skipped_run_is_neither_red_nor_green(rep, lint, test) -> None:
@@ -472,6 +477,187 @@ def test_main_leaves_the_issue_alone_for_a_cancelled_run(
     gh = FakeGh(issues=[{"number": 42, "title": "CI nightly red"}])
     assert rep.main(gh=gh, today=TODAY) == 0
     assert gh.verbs() == []
+
+
+def test_a_matrix_abandoned_by_a_starved_runner_is_red_when_a_job_failed(
+    rep, monkeypatch, ci_env
+) -> None:
+    # Measured on the demo dispatch of #353: four test jobs failed, the macOS job never got a
+    # runner (cancelled, no steps), and `needs.test.result` was `abandoned`, not `failure`.
+    # The first version read that as unknown and opened no issue.
+    _write_junit(ci_env, "junit-ubuntu-latest-py3.13", _suite(FAIL))
+    monkeypatch.setenv("LINT_RESULT", "success")
+    monkeypatch.setenv("TEST_RESULT", "abandoned")
+    gh = FakeGh(
+        jobs=[
+            {"name": "lint & types", "conclusion": "success"},
+            {"name": "tests (ubuntu-latest, py3.13)", "conclusion": "failure"},
+            {"name": "tests (windows-latest, py3.14)", "conclusion": "failure"},
+            {"name": "tests (macos-latest, py3.13)", "conclusion": "cancelled"},
+            {"name": "nightly report", "conclusion": None},
+        ]
+    )
+
+    assert rep.main(gh=gh, today=TODAY) == 0
+
+    assert gh.verbs() == ["issue create"]
+    _, text = next((a, s) for a, s in gh.calls if a[:2] == ["issue", "create"])
+    assert text is not None
+    assert "`tests (ubuntu-latest, py3.13)`: failure" in text
+    assert "`tests (macos-latest, py3.13)`: cancelled" in text
+    assert "tests.unit.test_b::test_breaks[case-1]" in text
+
+
+def test_an_abandoned_matrix_with_no_failed_job_touches_no_issue(
+    rep, monkeypatch, ci_env
+) -> None:
+    # A starved runner alone says nothing about the code: no issue opens, none closes.
+    monkeypatch.setenv("LINT_RESULT", "success")
+    monkeypatch.setenv("TEST_RESULT", "abandoned")
+    jobs = [
+        {"name": "tests (ubuntu-latest, py3.13)", "conclusion": "success"},
+        {"name": "tests (macos-latest, py3.13)", "conclusion": "cancelled"},
+    ]
+    gh = FakeGh(issues=[{"number": 42, "title": "CI nightly red"}], jobs=jobs)
+    assert rep.main(gh=gh, today=TODAY) == 0
+    assert gh.verbs() == []
+    gh = FakeGh(jobs=jobs)
+    assert rep.main(gh=gh, today=TODAY) == 0
+    assert gh.verbs() == []
+
+
+def test_an_unknown_run_whose_jobs_cannot_be_listed_touches_no_issue(
+    rep, monkeypatch, ci_env
+) -> None:
+    monkeypatch.setenv("LINT_RESULT", "success")
+    monkeypatch.setenv("TEST_RESULT", "abandoned")
+    gh = FakeGh()
+    inner = gh.__call__
+
+    def flaky(args: list[str], stdin: str | None = None) -> str:
+        if args[0] == "api":
+            raise rep.GhError("HTTP 502")
+        return inner(args, stdin)
+
+    assert rep.main(gh=flaky, today=TODAY) == 0
+    assert gh.verbs() == []
+
+
+def _completed(
+    returncode: int, stdout: str = "", stderr: str = ""
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.CompletedProcess(
+        args=[], returncode=returncode, stdout=stdout, stderr=stderr
+    )
+
+
+def test_run_gh_sends_the_text_on_stdin_and_returns_what_gh_printed(
+    rep, monkeypatch
+) -> None:
+    seen: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"], seen["kwargs"] = cmd, kwargs
+        return _completed(0, "printed")
+
+    monkeypatch.setattr(rep.subprocess, "run", fake_run)
+
+    assert rep.run_gh(["issue", "create", "--body-file", "-"], "THE BODY") == "printed"
+
+    assert seen["cmd"] == ["gh", "issue", "create", "--body-file", "-"]
+    # `--body-file -` reads the standard input: without it the issue has an empty body
+    assert seen["kwargs"]["input"] == "THE BODY"
+    assert seen["kwargs"]["encoding"] == "utf-8"
+    assert seen["kwargs"]["text"] is True
+    # a hung gh must not hold the report job for ever
+    assert 0 < seen["kwargs"]["timeout"] <= 600
+
+
+def test_run_gh_raises_with_what_gh_said_when_it_fails(rep, monkeypatch) -> None:
+    # A failed `issue list` returning "" would read as "no open issue" and open a second one.
+    monkeypatch.setattr(
+        rep.subprocess, "run", lambda *a, **k: _completed(1, "", "HTTP 403: forbidden")
+    )
+    with pytest.raises(rep.GhError, match=r"issue list.*HTTP 403"):
+        rep.run_gh(["issue", "list"], None)
+
+
+def test_run_gh_raises_when_gh_is_missing_or_hangs(rep, monkeypatch) -> None:
+    def missing(*a, **k):
+        raise FileNotFoundError("gh")
+
+    def hangs(*a, **k):
+        raise subprocess.TimeoutExpired(cmd="gh", timeout=1)
+
+    monkeypatch.setattr(rep.subprocess, "run", missing)
+    with pytest.raises(rep.GhError):
+        rep.run_gh(["issue", "list"], None)
+    monkeypatch.setattr(rep.subprocess, "run", hangs)
+    with pytest.raises(rep.GhError):
+        rep.run_gh(["issue", "list"], None)
+
+
+def test_run_gh_points_gh_at_the_repository_without_a_checkout(
+    rep, monkeypatch
+) -> None:
+    seen: list[dict] = []
+
+    def fake_run(cmd, **kwargs):
+        seen.append(kwargs["env"])
+        return _completed(0, "")
+
+    monkeypatch.setattr(rep.subprocess, "run", fake_run)
+    monkeypatch.delenv("GH_REPO", raising=False)
+    monkeypatch.setenv("GITHUB_REPOSITORY", "EPFL-TOP/smart-microscope-control")
+    rep.run_gh(["issue", "list"], None)
+    assert seen[-1]["GH_REPO"] == "EPFL-TOP/smart-microscope-control"
+    # an explicit GH_REPO of the caller is kept
+    monkeypatch.setenv("GH_REPO", "someone/else")
+    rep.run_gh(["issue", "list"], None)
+    assert seen[-1]["GH_REPO"] == "someone/else"
+
+
+def test_the_jobs_of_every_page_are_read(rep) -> None:
+    # `gh api --paginate` prints one JSON document per page, one after another.
+    page1 = {"total_count": 3, "jobs": [{"name": "a", "conclusion": "success"}]}
+    page2 = {"total_count": 3, "jobs": [{"name": "b", "conclusion": "failure"}]}
+    page3 = {"total_count": 3, "jobs": [{"name": "c", "conclusion": None}]}
+
+    def gh(args: list[str], stdin: str | None = None) -> str:
+        assert args[0] == "api"
+        assert "repos/EPFL-TOP/x/actions/runs/9/jobs" in args
+        assert "--paginate" in args
+        return json.dumps(page1) + json.dumps(page2) + "\n" + json.dumps(page3) + "\n"
+
+    assert rep.list_jobs(gh, "EPFL-TOP/x", "9") == [
+        ("a", "success"),
+        ("b", "failure"),
+        ("c", None),
+    ]
+
+
+def test_the_issue_listing_is_long_enough_for_every_open_ci_issue(
+    rep, monkeypatch, ci_env
+) -> None:
+    monkeypatch.setenv("LINT_RESULT", "success")
+    monkeypatch.setenv("TEST_RESULT", "success")
+    gh = FakeGh()
+    assert rep.main(gh=gh, today=TODAY) == 0
+    listing = next(a for a, _ in gh.calls if a[:2] == ["issue", "list"])
+    assert int(listing[listing.index("--limit") + 1]) >= 100
+    assert listing[listing.index("--state") + 1] == "open"
+
+
+def test_a_timed_out_job_failed_and_a_cancelled_one_did_not(rep) -> None:
+    assert rep.has_failed_job([("tests (a, py1)", "timed_out")])
+    assert rep.has_failed_job([("tests (a, py1)", "failure")])
+    assert not rep.has_failed_job([("tests (a, py1)", "cancelled")])
+    assert not rep.has_failed_job(
+        [("tests (a, py1)", "skipped"), ("lint & types", None)]
+    )
+    # the report's own job is left out even if it ever had a conclusion
+    assert not rep.has_failed_job([("nightly report", "failure")])
+    assert not rep.has_failed_job([])
 
 
 def test_main_names_a_branch_in_the_title_of_a_dispatch_on_it(
