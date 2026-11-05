@@ -25,7 +25,11 @@ from smc.plugins.slots.base import SlotValue
 __all__ = [
     "LatticeFit",
     "PlateResult",
+    "WallFrame",
+    "WallImages",
+    "WallSide",
     "WallTouch",
+    "WellFit",
     "WellGeometry",
     "WellRef",
     "normalise_well",
@@ -33,6 +37,11 @@ __all__ = [
 ]
 
 _WELL = re.compile(r"([A-Za-z]+)\s*([0-9]+)")
+
+#: A wall of a well by the stage direction that reaches it from the well's centre.
+#: Never an image side: ``+X`` is the wall the stage reaches by going +X, whatever
+#: the camera's turn, so no operator names a side on the image-wall path (m3 §17.2).
+WallSide = Literal["+X", "+Y", "-X", "-Y"]
 
 
 class WellRef(SlotValue):
@@ -68,6 +77,65 @@ class LatticeFit(SlotValue):
     notes: tuple[str, ...] = ()
 
 
+class WallFrame(SlotValue):
+    """The frame whose edge points were used for one wall of a well (m3 §17.2).
+
+    It is the frame centred on the wall, the last of the side's walk: every
+    side is framed the same way, so the threshold's bias is the same on
+    opposite walls and cancels in the centre. ``x_um`` and ``y_um`` are the
+    stage's readback where it was taken, never the target (FM-142). ``frames``
+    counts every frame the side took, the walk and the centred one; ``file`` is
+    its name in ``WallImages.folder``, ``None`` when frames are not saved or
+    this one could not be.
+    """
+
+    side: WallSide
+    x_um: float
+    y_um: float
+    n_points: int = Field(ge=0)
+    frames: int = Field(ge=1)
+    file: str | None = None
+
+
+class WellFit(SlotValue):
+    """One well as its walls measured it: where the operator put the stage, and the circle fitted.
+
+    ``center_xy_um``, ``diameter_um``, ``rms_um`` and ``n_points`` (the points
+    kept) are the circle fit's; ``size_error`` is the diameter over the
+    nominal, minus 1. ``walls`` are in the order ``+X``, ``+Y``, ``-X``, ``-Y``.
+    """
+
+    well: str
+    recorded_xy_um: tuple[float, float]
+    center_xy_um: tuple[float, float]
+    diameter_um: float = Field(gt=0.0)
+    size_error: float
+    rms_um: float = Field(ge=0.0)
+    n_points: int = Field(ge=0)
+    walls: tuple[WallFrame, ...]
+
+
+class WallImages(SlotValue):
+    """What ``plate-walls`` measured, kept beside the plate it fitted (m3 §17.2).
+
+    ``objective`` is the one in place (``None`` without a turret);
+    ``pixel_size_um`` and ``image_shape_px`` are the calibration's. ``folder`` is
+    run-relative (``plate-walls/<token>``), ``None`` when frames are not saved;
+    ``elapsed_s`` runs from the first move to the result. Both ``objective``
+    and ``folder`` are required fields that may hold ``None``: a producer must
+    say that it does not know.
+    """
+
+    objective: str | None
+    pixel_size_um: float = Field(gt=0.0)
+    image_shape_px: tuple[int, int]
+    search_um: float = Field(gt=0.0)
+    wells: tuple[WellFit, ...]
+    frames: int = Field(ge=0)
+    folder: str | None
+    elapsed_s: float = Field(ge=0.0)
+
+
 class PlateResult(PluginResult):
     """Where the plate is: A1's centre and the plate's rotation, and how that was found.
 
@@ -75,18 +143,22 @@ class PlateResult(PluginResult):
     well centre; ``None`` when nothing measured it (a seed, a lattice fit).
     ``scale_error`` is the measured spacing over the nominal, minus 1; ``None``
     with fewer than two references. Both are required fields that may hold
-    ``None``: a producer must say that it does not know.
+    ``None``: a producer must say that it does not know. ``walls`` is filled
+    by ``method="wall-images"`` only; the ``refs`` of that method are the
+    fitted well centres, and its ``fit`` is ``None``. A result written before
+    ``walls`` existed has none, and still validates.
     """
 
     plate: str
     a1_center_xy_um: tuple[float, float]
     rotation_deg: float = Field(ge=-180.0, le=180.0)
-    method: Literal["seed", "references", "lattice-fit"]
+    method: Literal["seed", "references", "lattice-fit", "wall-images"]
     residual_um: float | None = Field(ge=0.0)
     scale_error: float | None
     n_refs: int = Field(ge=0)
     refs: tuple[WellRef, ...] = ()
     fit: LatticeFit | None = None
+    walls: WallImages | None = None
 
     @field_validator("plate")
     @classmethod
