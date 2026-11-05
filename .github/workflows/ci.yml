@@ -1,21 +1,52 @@
 name: CI
 
+# ADR-0009: a pull request and a push to main run the light set (`lint & types`
+# and two test jobs); the nightly, a manual dispatch and a pull request that
+# carries the label `ci: full` run the full matrix. scripts/ci/select_matrix.py
+# owns the choice. The names of the jobs below are the contract with the
+# required checks of `main`: do not rename them.
 on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # 02:17 UTC: GitHub delays the runs that are queued on the hour.
+    - cron: "17 2 * * *"
   workflow_dispatch:
 
+# A newer push cancels the older run of the same PR, and a push to main cancels
+# the older run of main's push (the newer commit contains the older). The
+# nightly and a dispatch are never cancelled by a push: the event is in the
+# group.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
+
+permissions:
+  contents: read
 
 jobs:
   lint:
     name: lint & types
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # select_matrix.py reads the labels of the pull request.
+      pull-requests: read
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7
+      # The label is read from the API when the run starts, not from the event
+      # payload: `gh pr create --label` may attach it after `opened` fired, and
+      # a re-run replays its original payload. A label added later takes effect
+      # on the next run (a push, or "Re-run all jobs").
+      - name: Choose the test jobs (the light set or the full matrix)
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: python3 scripts/ci/select_matrix.py
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
@@ -31,13 +62,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - { os: ubuntu-latest, python: "3.10" }
-          - { os: ubuntu-latest, python: "3.13" }
-          - { os: windows-latest, python: "3.11" } # the oldest Python seen on a lab Windows PC
-          - { os: windows-latest, python: "3.14" } # what the microscope PCs run (surveys, 2026-09)
-          - { os: macos-latest, python: "3.13" }
+      # Each entry is {os, python}; the entries and why they are there are in
+      # scripts/ci/select_matrix.py.
+      matrix: ${{ fromJSON(needs.lint.outputs.matrix) }}
     env:
       # The demo devices are the regression bed: a missing install must fail,
       # not skip.
@@ -60,9 +87,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python scripts/ci/install_mm_test_adapters.py
       - name: Run tests
-        run: pytest --cov=smc --cov-report=term --cov-report=xml
+        run: pytest --cov=smc --cov-report=term --cov-report=xml --junitxml=junit.xml
       - uses: actions/upload-artifact@v7
         with:
           name: coverage-${{ matrix.os }}-py${{ matrix.python }}
           path: coverage.xml
           if-no-files-found: ignore
+      # The nightly's report names the failing tests from these files. A job
+      # whose process aborted leaves none (FM-179), so the report also reads the
+      # jobs' own conclusions.
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: junit-${{ matrix.os }}-py${{ matrix.python }}
+          path: junit.xml
+          if-no-files-found: ignore
+          retention-days: 7

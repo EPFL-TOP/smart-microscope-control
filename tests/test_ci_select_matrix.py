@@ -154,6 +154,13 @@ def test_the_workflow_keeps_the_names_of_its_jobs() -> None:
     assert _workflow_template() == "tests (${{ matrix.os }}, py${{ matrix.python }})"
 
 
+def test_the_workflow_takes_its_matrix_from_the_select_step() -> None:
+    text = CI_YML.read_text(encoding="utf-8")
+    assert "matrix: ${{ fromJSON(needs.lint.outputs.matrix) }}" in text
+    assert "matrix: ${{ steps.select.outputs.matrix }}" in text
+    assert "scripts/ci/select_matrix.py" in text
+
+
 # --- pr_labels: the one place that talks to GitHub ---------------------------
 
 
