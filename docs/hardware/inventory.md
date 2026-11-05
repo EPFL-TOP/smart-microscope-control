@@ -55,7 +55,19 @@ New findings arrive as *Hardware session report* issues and land here.
   and `ZDrive` never busy (#205). `PFS in Range` means a reflection is
   seen, PFS on or off. A Z move with PFS locked switches PFS off (#1815,
   confirmed). `PFSOffset` holds whole units, has no property limits, and
-  moves Z only while PFS is on; at 10× about 6–11 units per µm.
+  moves Z only while PFS is on; at 10× about 6–11 units per µm. The
+  stand's **PFS button ignores smc's soft limits**: it jumped +206.6 µm
+  on a new plate (session 2, #334; #331).
+- **XY and Z moves return only once they have ended**, and neither reads
+  busy: 10 mm of XY in about 0.6 s, 50 µm of Z in 0.2–0.35 s (#221). A read
+  takes under 0.05 ms (a cache in the adapter, inferred).
+- **A nosepiece turn** returns after about 1 s and never reads busy; the
+  stand switches PFS off by itself and moves Z by itself (+8.7 µm with the
+  4× against the 10×). `setConfig` of the lab's `BF` preset takes 7.1 s.
+  `DiaLamp`'s `Intensity` (0–2100) reads its previous value for a moment
+  after a set (session 2, #330).
+- `IntermediateMagnification`'s `Magnification` reads `1.0x`/`1.5x`, and
+  `getMagnificationFactor()` 1.0/1.5 (session 2).
 - The stand adapter never provides the camera. On our Ti2-E it is a
   **Photometrics Prime 95B** through `PVCAM` (`Camera-1`, 1412×1412, 16-bit;
   PVCAM despeckle filters on by default). nikon-control's notes named a
