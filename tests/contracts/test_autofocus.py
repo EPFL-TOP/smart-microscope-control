@@ -43,7 +43,18 @@ def _engage(autofocus: Autofocus, backend: str) -> bool:
     operator has not locked at the stand is refused, and so is Z outside the
     contracts' window (m2 §12.4); the skip names the reason. On ``fake`` and
     ``demo`` a refusal fails the case.
+
+    No contract runs a first lock from below (m2 §12.10.8): it moves Z by what
+    the stand decides, and the visit runs it by hand. On ``hardware`` an offset
+    at its floor skips before anything is sent.
     """
+    if backend == "hardware":
+        limits = autofocus.offset_limits_native()
+        if limits is not None and autofocus.offset_native() <= limits[0]:
+            pytest.skip(
+                "the offset is at its floor: engaging there may be a first lock (m2 "
+                "§12.10), which no contract runs"
+            )
     try:
         return autofocus.engage()
     except SafetyRefusedError as refused:
@@ -289,6 +300,9 @@ def test_engage_at_an_unseen_offset_is_refused(
             "plane ([autofocus] engage_drives_z_to_offset)"
         )
     o0, tol = _offset_start(envelope), envelope.offset_tolerance
+    # Above the floor, so never a first lock from below (m2 §12.10 D4).
+    limits = autofocus.offset_limits_native()
+    assert limits is None or o0 + 1.0 > limits[0]
     autofocus.disengage()
     # With PFS off, an offset change moves no Z (m2 §4.5); the microscope
     # fixture puts the offset back.

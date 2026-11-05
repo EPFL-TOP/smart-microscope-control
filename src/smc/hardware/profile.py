@@ -15,7 +15,7 @@ import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import useq
 from pydantic import (
@@ -208,6 +208,9 @@ class SafetySection(_Section):
     #: How far Z may move while the autofocus engages, beyond where it started
     #: or held its lock; ``None``: only ``z_soft_limits_um`` bound it (m2 §12).
     max_engage_excursion_um: float | None = None
+    #: Which way Z moves away from the sample, seen at the stand, never guessed
+    #: (#98); ``None``: unknown, and no first lock from below runs (m2 §12.10).
+    z_away_from_sample: Literal["decreasing", "increasing"] | None = None
 
     @field_validator("stop_refused_by", mode="before")
     @classmethod
