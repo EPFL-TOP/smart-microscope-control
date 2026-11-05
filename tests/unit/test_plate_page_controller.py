@@ -2543,6 +2543,7 @@ def test_live_frames_do_not_count_as_ended_activities(
     assert page.activities_ended == before + 1
 
 
+@pytest.mark.wallclock
 def test_live_keeps_at_most_ten_frames_a_second(
     page: PlatePage, fake_microscope: Microscope
 ) -> None:

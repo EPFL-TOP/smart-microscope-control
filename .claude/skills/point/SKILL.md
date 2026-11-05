@@ -12,7 +12,9 @@ you hand implementation to `/develop`. Read the script's output, not GitHub.
 The session ends when the list is posted.
 
 1. **Facts.** Run `python scripts/dev/point.py` and read only its Markdown:
-   open PRs with checks and the latest design verdict, issues by status,
+   first the **CI that stops the merges** (a red `main`, an open `CI nightly
+   red` issue: ADR-0009), then open PRs with checks and the latest design
+   verdict, issues by status,
    blocked issues whose dependencies are now merged, what develop sessions
    reported since the last point (follow-ups, not verified, deviations),
    the owner's own notes, survey folders not yet curated, ADR statuses,
@@ -47,7 +49,11 @@ The session ends when the list is posted.
    `Point: next steps` (create and pin it if missing; one comment per point,
    in English), then give the owner the same list in their language, at most
    about fifteen lines. It leads with **Today**: a numbered sequence that the
-   owner can follow without judgement. Each step says what to launch
+   owner can follow without judgement. **A red `main`, or an open `CI nightly
+   red` issue, is step 0**, above everything: no other PR is merged until the
+   owner has chosen to revert or to fix forward (ADR-0009). Name the run or
+   the issue, the tests it names, and the command that fixes it (a `/develop`
+   or a revert), and put every merge of the day after it. Each step says what to launch
    (command and model), what it waits for (a posted plan, a merge), and what
    to merge. A step runs at most three sessions in parallel. Follow every
    issue of the day from its plan to its merge: `/plan` → merge the design
@@ -58,6 +64,7 @@ The session ends when the list is posted.
 
    ```markdown
    **Today**, in this order:
+   0. Only when the CI stops the merges: main is red (run <url>) or #N `CI nightly red` is open: revert or `/develop <n>` for the fix, before any merge.
    1. Now, in parallel: `/plan 144` (Opus) · `/plan 101` (Opus) · `/plan 132` (Sonnet). Merge #145.
    2. As each plan is posted: merge its design PR, then `/develop <n>` with the plan's model, unless its **Depends on** is still open.
    3. As each develop session opens its PR: `/review <pr>` (Opus if moves-hardware, else Sonnet), then merge on "ready to merge"; on "changes requested", `/develop <n>` again (fix round).

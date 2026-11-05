@@ -411,6 +411,7 @@ _REFUSAL: dict[str, type[BaseException]] = {
 @pytest.mark.parametrize(
     "call", ["read", "wait", "mutation", "acquisition", "move", "stop", "close"]
 )
+@pytest.mark.wallclock
 def test_every_kind_of_call_under_every_condition(call: str, condition: str) -> None:
     # The Definition of done of #54: each row of the table (read, action,
     # safe) against "another action holds the lock", "a motion outlived its
@@ -466,6 +467,7 @@ def test_every_kind_of_call_under_every_condition(call: str, condition: str) -> 
 # --- actions and the lock -----------------------------------------------------
 
 
+@pytest.mark.wallclock
 def test_move_holds_the_lock_through_its_wait_and_refuses_others_at_once() -> None:
     # #59 findings 12/13: the readback ran in its own lock section, and other
     # callers could act between the wait and the readback.

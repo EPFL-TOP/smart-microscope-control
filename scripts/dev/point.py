@@ -30,6 +30,13 @@ _DEPENDS = re.compile(r"\*\*Depends on\*\*:?\s*(.*)", re.IGNORECASE)
 _REF = re.compile(r"#(\d+)")
 _ADR_STATUS = re.compile(r"\*\*Status\*\*:\s*(.+)")
 _FAILING = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+# A run that ended without a verdict on the code: a push to main cancels the older run of
+# main (ADR-0009, `concurrency`), which is the usual fate of the older of two merges.
+_NO_VERDICT = {"CANCELLED", "SKIPPED", "NEUTRAL"}
+# The title of the nightly's issue (scripts/ci/nightly_report.py writes it; a test pins both).
+NIGHTLY_TITLE = "CI nightly red"
+# What a CI run's trigger is called in the report.
+_EVENTS = {"push": "push", "schedule": "nightly", "workflow_dispatch": "manual"}
 
 
 # -- pure helpers (tested) ----------------------------------------------------
@@ -176,17 +183,100 @@ def main_ci(runs: list[dict[str, Any]], stamp: str) -> list[str]:
     last = ci[-1]
     state = str(last.get("conclusion") or last.get("status") or "unknown")
     out = [
-        f"- latest: {state} ({str(last.get('createdAt', ''))[:16]},"
+        f"- latest: {state}, {event_label(last)} ({str(last.get('createdAt', ''))[:16]},"
         f" {clip(str(last.get('displayTitle', '')), 70)})"
     ]
     for r in ci:
         failed = str(r.get("conclusion") or "").upper() in _FAILING
         if failed and str(r.get("createdAt", "")) >= stamp:
             out.append(
-                f"- FAILED {str(r['createdAt'])[:16]}"
+                f"- FAILED {str(r['createdAt'])[:16]} {event_label(r)}"
                 f" {clip(str(r.get('displayTitle', '')), 70)} {r.get('url', '')}"
             )
     return out
+
+
+def event_label(run: dict[str, Any]) -> str:
+    """``push``, ``nightly`` or ``manual`` for a run's trigger; ``?`` when it has none.
+
+    The nightly and a dispatch are runs of main too (ADR-0009): a line that does
+    not say which one failed sends the reader to the Actions tab.
+    """
+    event = str(run.get("event") or "")
+    return _EVENTS.get(event, event or "?")
+
+
+def red_main(runs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The push run that makes ``main`` red, or ``None``.
+
+    The latest *completed* push run of the workflow ``CI`` decides, and it is red
+    when it failed. The nightly never decides: a red full matrix has its own issue
+    and a green one does not clear a red push (only a later push does). A run
+    still in progress, or cancelled by a newer push, is no verdict on the code.
+    """
+    pushes = sorted(
+        (
+            r
+            for r in runs
+            if r.get("workflowName") == "CI"
+            and r.get("event") == "push"
+            and str(r.get("conclusion") or "").upper() not in {"", *_NO_VERDICT}
+        ),
+        key=lambda r: str(r.get("createdAt", "")),
+    )
+    if pushes and str(pushes[-1].get("conclusion")).upper() in _FAILING:
+        return pushes[-1]
+    return None
+
+
+def is_nightly_issue(issue: dict[str, Any]) -> bool:
+    """``CI nightly red`` or ``CI nightly red (<branch>)``: the nightly's own issue."""
+    title = str(issue.get("title", ""))
+    return title == NIGHTLY_TITLE or title.startswith(NIGHTLY_TITLE + " (")
+
+
+def nightly_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The open issues the nightly opened, oldest first."""
+    return sorted(
+        (i for i in issues if is_nightly_issue(i)), key=lambda i: int(i["number"])
+    )
+
+
+def merge_stoppers(
+    runs: list[dict[str, Any]], issues: list[dict[str, Any]]
+) -> list[str]:
+    """The lines of *CI that stops the merges*: a red ``main``, an open nightly issue.
+
+    Both stop the merges of the code they name until the owner has chosen to
+    revert or to fix forward (ADR-0009), so they come before anything else.
+    """
+    out: list[str] = []
+    red = red_main(runs)
+    if red is not None:
+        out.append(
+            f"- main is RED since {str(red.get('createdAt', ''))[:16]}:"
+            f" {clip(str(red.get('displayTitle', '')), 70)} {red.get('url', '')}"
+        )
+    out += [
+        f"- #{i['number']} {clip(str(i['title']), 90)} (open: the full matrix is red)"
+        for i in nightly_issues(issues)
+    ]
+    return out or ["- none"]
+
+
+def work_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The open issues that are work: not the tracking issue, not the nightly's."""
+    return [
+        i for i in issues if i["title"] != TRACKING_TITLE and not is_nightly_issue(i)
+    ]
+
+
+def status_groups(work: list[dict[str, Any]]) -> dict[str, list[str]]:
+    """``#N`` numbers of ``work`` grouped by their ``status:`` label."""
+    groups: dict[str, list[str]] = {}
+    for issue in sorted(work, key=lambda i: i["number"]):
+        groups.setdefault(status_of(issue), []).append(f"#{issue['number']}")
+    return groups
 
 
 def status_of(issue: dict[str, Any]) -> str:
@@ -300,13 +390,18 @@ def main() -> int:
         "--limit",
         "50",
         "--json",
-        "conclusion,status,displayTitle,createdAt,workflowName,url",
+        "conclusion,status,displayTitle,createdAt,workflowName,url,event",
     )
 
     out = [
         f"# Point facts ({datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC, since {stamp})",
         "",
     ]
+
+    # First, above everything: a red main and a red nightly stop the merges (ADR-0009).
+    out.append("## CI that stops the merges")
+    out.extend(merge_stoppers(runs, issues))
+    out.append("")
 
     out.append("## Open pull requests")
     for pr in prs:
@@ -331,10 +426,9 @@ def main() -> int:
         out.append("- none")
     out.append("")
 
-    work = [i for i in issues if i["title"] != TRACKING_TITLE]
-    groups: dict[str, list[str]] = {}
-    for issue in sorted(work, key=lambda i: i["number"]):
-        groups.setdefault(status_of(issue), []).append(f"#{issue['number']}")
+    # The nightly's issue is listed above, and is not a piece of work to plan or review.
+    work = work_issues(issues)
+    groups = status_groups(work)
     out.append("## Open issues by status")
     for name in (
         "ready",
@@ -364,7 +458,7 @@ def main() -> int:
 
     out.append("## Since the last point: reports, deviations, reviews, owner notes")
     seen = False
-    for issue in [*work, *closed]:
+    for issue in [*work, *(i for i in closed if not is_nightly_issue(i))]:
         for c in issue.get("comments", []):
             if str(c.get("createdAt", "")) < stamp:
                 continue
@@ -386,7 +480,14 @@ def main() -> int:
                 seen = True
                 out.append(f"- {ref} PLAN DEVIATION: {clip(body[len(head) :])}")
             elif head.startswith(
-                ("## Plan", "## Review", "## Point", "## Applied", "Starting")
+                (
+                    "## Plan",
+                    "## Review",
+                    "## Point",
+                    "## Applied",
+                    "## CI nightly",
+                    "Starting",
+                )
             ):
                 continue
             elif not head.startswith("## "):

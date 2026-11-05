@@ -148,5 +148,10 @@
     "name": "good first issue",
     "color": "7057FF",
     "description": "Self-contained; good for a newcomer"
+  },
+  {
+    "name": "ci: full",
+    "color": "FBCA04",
+    "description": "Run the full CI matrix on this PR (ADR-0009)"
   }
 ]

@@ -161,14 +161,16 @@ def test_merged_pr_lists_the_follow_ups_its_fix_round_named(point) -> None:
     ]
 
 
-def _run(at: str, conclusion: str, title: str = "feat: x") -> dict:
+def _run(at: str, conclusion: str, title: str = "feat: x", event: str = "push") -> dict:
+    # `gh run list` leaves the conclusion empty while a run is in progress.
     return {
         "workflowName": "CI",
         "createdAt": at,
         "conclusion": conclusion,
-        "status": "completed",
+        "status": "completed" if conclusion else "in_progress",
         "displayTitle": title,
         "url": f"u/{at}",
+        "event": event,
     }
 
 
@@ -180,9 +182,29 @@ def test_a_flake_that_failed_main_since_the_last_point_is_listed(point) -> None:
         {**_run("2026-10-01T11:00:00Z", "failure"), "workflowName": "Dependabot"},
     ]
     assert point.main_ci(runs, "2026-10-01T00:00:00Z") == [
-        "- latest: success (2026-10-01T10:00, fix: b)",
-        "- FAILED 2026-10-01T09:00 fix: a u/2026-10-01T09:00:00Z",
+        "- latest: success, push (2026-10-01T10:00, fix: b)",
+        "- FAILED 2026-10-01T09:00 push fix: a u/2026-10-01T09:00:00Z",
     ]
+
+
+def test_the_ci_lines_of_main_say_the_event(point) -> None:
+    runs = [
+        _run("2026-10-01T09:00:00Z", "failure", "feat: a", event="schedule"),
+        _run("2026-10-01T10:00:00Z", "failure", "feat: b", event="workflow_dispatch"),
+        _run("2026-10-01T11:00:00Z", "success", "feat: c", event="schedule"),
+    ]
+    assert point.main_ci(runs, "2026-10-01T00:00:00Z") == [
+        "- latest: success, nightly (2026-10-01T11:00, feat: c)",
+        "- FAILED 2026-10-01T09:00 nightly feat: a u/2026-10-01T09:00:00Z",
+        "- FAILED 2026-10-01T10:00 manual feat: b u/2026-10-01T10:00:00Z",
+    ]
+    # an older `gh` or a run without the field is shown, not guessed
+    bare = {
+        k: v for k, v in _run("2026-10-01T09:00:00Z", "success").items() if k != "event"
+    }
+    assert point.main_ci([bare], "2026-10-01T00:00:00Z")[0].startswith(
+        "- latest: success, ?"
+    )
 
 
 def test_main_without_ci_runs_says_so(point) -> None:
@@ -194,3 +216,243 @@ def test_an_open_pr_shows_the_issues_github_will_close(point) -> None:
     assert point.closes(pr) == "closes #13 #16"
     assert point.closes({"closingIssuesReferences": []}) == "closes no issue"
     assert point.closes({}) == "closes no issue"
+
+
+# --- the CI that stops the merges (ADR-0009) ---------------------------------
+
+
+def test_a_red_main_is_the_latest_failed_push_run_not_a_nightly(point) -> None:
+    red_push = _run("2026-10-01T09:00:00Z", "failure", "feat: a")
+    runs = [
+        red_push,
+        _run("2026-10-01T10:00:00Z", "success", "nightly", event="schedule"),
+    ]
+    # a green nightly does not clear a red push: only a later push does
+    assert point.red_main(runs) == red_push
+    # and a red nightly does not make main red: it has its own issue
+    runs = [
+        _run("2026-10-01T09:00:00Z", "success", "feat: a"),
+        _run("2026-10-01T10:00:00Z", "failure", "nightly", event="schedule"),
+        _run("2026-10-01T11:00:00Z", "failure", "manual", event="workflow_dispatch"),
+    ]
+    assert point.red_main(runs) is None
+
+
+def test_a_green_push_after_a_red_one_clears_main(point) -> None:
+    runs = [
+        _run("2026-10-01T09:00:00Z", "failure", "feat: a"),
+        _run("2026-10-01T10:00:00Z", "success", "fix: a"),
+    ]
+    assert point.red_main(runs) is None
+
+
+def test_a_push_run_still_in_progress_does_not_decide(point) -> None:
+    red = _run("2026-10-01T09:00:00Z", "failure", "feat: a")
+    assert point.red_main([red, _run("2026-10-01T10:00:00Z", "", "fix: a")]) == red
+    green = _run("2026-10-01T09:00:00Z", "success", "feat: a")
+    assert point.red_main([green, _run("2026-10-01T10:00:00Z", "", "feat: b")]) is None
+
+
+@pytest.mark.parametrize("conclusion", ["cancelled", "skipped", "neutral"])
+def test_a_cancelled_push_run_does_not_make_main_red(point, conclusion) -> None:
+    # A push to main cancels the older run of main (concurrency): a cancellation is
+    # not a verdict on the code, and it is the usual state of the older of two merges.
+    # A skipped or neutral run ran no test either: it neither makes main red nor clears it.
+    green = _run("2026-10-01T09:00:00Z", "success", "feat: a")
+    no_verdict = _run("2026-10-01T10:00:00Z", conclusion, "feat: b")
+    assert point.red_main([green, no_verdict]) is None
+    red = _run("2026-10-01T08:00:00Z", "failure", "feat: z")
+    assert point.red_main([red, no_verdict]) == red
+
+
+def test_only_the_ci_workflow_decides_whether_main_is_red(point) -> None:
+    other = {
+        **_run("2026-10-01T11:00:00Z", "failure"),
+        "workflowName": "closing references",
+    }
+    assert point.red_main([other]) is None
+    assert point.red_main([]) is None
+
+
+def _nightly(number: int, title: str = "CI nightly red") -> dict:
+    return {
+        "number": number,
+        "title": title,
+        "labels": [{"name": "area: ci"}],
+        "comments": [],
+        "body": "## CI nightly (workflow, 2026-11-06)",
+    }
+
+
+def test_an_open_nightly_issue_is_listed_among_the_ci_that_stops_the_merges(
+    point,
+) -> None:
+    issues = [
+        _nightly(77),
+        _nightly(80, "CI nightly red (chore/x)"),
+        _issue(5, "feat: y", []),
+    ]
+    lines = point.merge_stoppers([_run("2026-10-01T09:00:00Z", "success")], issues)
+    assert len(lines) == 2
+    assert lines[0].startswith("- #77 ")
+    assert "CI nightly red" in lines[0]
+    assert lines[1].startswith("- #80 ")
+    assert "(chore/x)" in lines[1]
+
+
+def test_a_red_main_is_listed_with_its_run_and_nothing_else_is_none(point) -> None:
+    red = _run("2026-10-01T09:00:00Z", "failure", "feat: a")
+    lines = point.merge_stoppers([red], [])
+    assert len(lines) == 1
+    assert "main is RED" in lines[0]
+    assert "feat: a" in lines[0]
+    assert "u/2026-10-01T09:00:00Z" in lines[0]
+    assert point.merge_stoppers([_run("2026-10-01T09:00:00Z", "success")], []) == [
+        "- none"
+    ]
+    assert point.merge_stoppers([], []) == ["- none"]
+
+
+def test_both_stoppers_are_listed_red_main_first(point) -> None:
+    red = _run("2026-10-01T09:00:00Z", "failure", "feat: a")
+    lines = point.merge_stoppers([red], [_nightly(77)])
+    assert "main is RED" in lines[0]
+    assert lines[1].startswith("- #77 ")
+
+
+def test_a_title_that_only_resembles_the_nightly_is_not_a_nightly_issue(point) -> None:
+    # A work issue about the nightly may start with its words: only the exact title, or the
+    # title with a branch, is what nightly_report.py writes.
+    issues = [
+        _nightly(1),
+        _issue(2, "Fix the CI nightly red flag in point.py", []),
+        _issue(3, "CI nightly red: make the report name the failing job", []),
+        _issue(4, "CI nightly redesign", []),
+        _nightly(5, "CI nightly red (chore/x)"),
+    ]
+    assert [i["number"] for i in point.nightly_issues(issues)] == [1, 5]
+
+
+def test_the_nightly_issue_title_is_the_one_the_report_writes(point) -> None:
+    spec = importlib.util.spec_from_file_location(
+        "nightly_report_for_point", ROOT / "scripts" / "ci" / "nightly_report.py"
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    report = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = report
+    spec.loader.exec_module(report)
+    assert point.NIGHTLY_TITLE == report.TITLE
+    assert point.nightly_issues([_nightly(1, report.issue_title("chore/x"))])
+
+
+def _issue(number: int, title: str, labels: list[str]) -> dict:
+    return {
+        "number": number,
+        "title": title,
+        "labels": [{"name": n} for n in labels],
+        "comments": [],
+        "body": "",
+    }
+
+
+def test_the_nightly_issue_is_not_counted_among_the_issues_by_status(point) -> None:
+    issues = [
+        _issue(3, "feat: a", ["status: ready"]),
+        _issue(4, "feat: b", ["status: ready"]),
+        _nightly(77),
+        _issue(9, point.TRACKING_TITLE, []),
+    ]
+    assert point.status_groups(point.work_issues(issues)) == {"ready": ["#3", "#4"]}
+    # the nightly's issue has no status label, so it would have been "no status" otherwise
+    assert "no status" not in point.status_groups(point.work_issues(issues))
+
+
+# --- the report, end to end on canned data ------------------------------------
+
+
+def _canned(runs: list[dict], issues: list[dict], seen: list[tuple[str, ...]]):
+    def fake(*args: str):
+        seen.append(args)
+        if args[:2] == ("repo", "view"):
+            return {"nameWithOwner": "EPFL-TOP/smart-microscope-control"}
+        if args[:2] == ("issue", "list"):
+            return issues if "open" in args else []
+        if args[:2] == ("pr", "list"):
+            return []
+        if args[0] == "run":
+            return runs
+        if args[0] == "api":
+            return []
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    return fake
+
+
+def test_the_report_opens_with_the_ci_that_stops_the_merges(
+    point, monkeypatch, capsys
+) -> None:
+    seen: list[tuple[str, ...]] = []
+    red = _run("2026-11-05T09:00:00Z", "failure", "feat: a")
+    issues = [_nightly(77), _issue(3, "feat: b", ["status: ready"])]
+    monkeypatch.setattr(point, "gh_json", _canned([red], issues, seen))
+    monkeypatch.setattr(sys, "argv", ["point.py", "--since", "2026-11-01"])
+
+    assert point.main() == 0
+
+    out = capsys.readouterr().out
+    # the sections this change writes stay ASCII (#42); the ADR section quotes the docs as they are
+    assert out.split("## Merged since")[0].isascii()
+    headings = [line for line in out.splitlines() if line.startswith("## ")]
+    assert headings[0] == "## CI that stops the merges"
+    assert headings[1] == "## Open pull requests"
+    first = out.split("## Open pull requests")[0]
+    assert "main is RED" in first
+    assert "#77" in first
+    # the nightly's issue is neither a ready, an in-progress nor a "no status" issue
+    status = out.split("## Open issues by status")[1].split("## ")[0]
+    assert "- ready: #3" in status
+    assert "#77" not in status
+    # the run list asks for the event
+    run_call = next(a for a in seen if a[0] == "run")
+    assert "event" in run_call[run_call.index("--json") + 1].split(",")
+
+
+def test_the_report_says_none_when_the_ci_is_clear(point, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(
+        point, "gh_json", _canned([_run("2026-11-05T09:00:00Z", "success")], [], [])
+    )
+    monkeypatch.setattr(sys, "argv", ["point.py", "--since", "2026-11-01"])
+    assert point.main() == 0
+    section = (
+        capsys.readouterr().out.split("## CI that stops the merges")[1].split("## ")[0]
+    )
+    assert section.strip() == "- none"
+
+
+def test_the_nightly_issue_is_left_out_of_the_owner_notes(
+    point, monkeypatch, capsys
+) -> None:
+    # Its comments are the workflow's (`## CI nightly`), and a plain line on it would
+    # read as an owner note on a piece of work: the nightly's issue is not one.
+    nightly = {
+        **_nightly(77),
+        "comments": [
+            {
+                "body": "## CI nightly (workflow, 2026-11-06)\n\nStill red: u",
+                "createdAt": "2026-11-06T03:00:00Z",
+            },
+            {
+                "body": "looking at the macOS failure",
+                "createdAt": "2026-11-06T04:00:00Z",
+            },
+        ],
+    }
+    monkeypatch.setattr(point, "gh_json", _canned([], [nightly], []))
+    monkeypatch.setattr(sys, "argv", ["point.py", "--since", "2026-11-01"])
+    assert point.main() == 0
+    notes = (
+        capsys.readouterr().out.split("## Since the last point")[1].split("\n## ")[0]
+    )
+    assert "nothing new" in notes
+    assert "#77 owner note" not in notes

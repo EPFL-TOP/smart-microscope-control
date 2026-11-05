@@ -20,7 +20,10 @@ a verdict, do what it unlocks (labels, dependents), and end the session.
 1. Read: `gh pr view N` (body), `gh pr checks N`, the issue's `## Plan` and
    `## Report` (with its **Adversarial review** line), `gh pr diff N
    --name-only`, and only the parts of the diff that implement the
-   interfaces the design doc names.
+   interfaces the design doc names. **What a green PR looks like** (ADR-0009):
+   three checks, `lint & types`, `tests (ubuntu-latest, py3.13)` and `tests
+   (windows-latest, py3.14)`, plus `closing references`; five test jobs with
+   the label `ci: full`. A PR that is only behind `main` is not a finding.
 2. Decide on these points only, in order:
    1. **Scope** — the plan, plus "Beyond the plan" fixes that change no
       interface. A renamed or changed fixed interface is blocking.
@@ -29,7 +32,14 @@ a verdict, do what it unlocks (labels, dependents), and end the session.
       guards that cannot be bypassed, measured versus assumed.
    3. **Evidence** — the plan's named tests exist; the adversarial review ran
       with the lenses its risk requires; every confirmed blocking finding is
-      fixed or deferred with a reason. **An `area: ui` PR**: look at the page
+      fixed or deferred with a reason. **The label**: when the diff is
+      platform-specific (paths, encodings, subprocesses, file locking, a
+      hardware bridge, the minimum Python) and the PR runs only the light set,
+      add `ci: full` (`gh pr edit N --add-label "ci: full"`) and say in the
+      review that its jobs must be re-run: the label is read when a run
+      starts, so `gh run rerun <id>` (it runs `lint` again) or a push, not
+      the label alone. Do not give a ready verdict before the five jobs are
+      green. **An `area: ui` PR**: look at the page
       with `/ui-check`, from the PR's own worktree and its `.venv` (the
       develop session's `.claude/worktrees/issue-<N>-<slug>`, or `git worktree
       add .claude/worktrees/pr-<N> <branch>` and `python scripts/dev/worktree.py

@@ -483,6 +483,7 @@ def test_device_timeout_is_set_from_the_profile() -> None:
         assert m.core.getTimeoutMs() == 45_000
 
 
+@pytest.mark.wallclock
 def test_the_lock_timeout_follows_the_device_timeout(demo_core: Any) -> None:
     spy = _Spy(demo_core)
     spy.snap_release = threading.Event()
@@ -996,6 +997,7 @@ def test_close_stops_the_stages_when_something_moves(
     assert spy.autofocus_offs == 1
 
 
+@pytest.mark.wallclock
 def test_close_during_a_move_stops_it_instead_of_waiting_for_it(
     demo_core: Any,
 ) -> None:
@@ -1093,6 +1095,7 @@ def test_close_from_inside_a_registry_section_stops_and_unloads(
     assert spy.calls == ["stop XY", "stop Z", "unloadAllDevices"]
 
 
+@pytest.mark.wallclock
 def test_close_behind_a_hung_snap_fails_with_a_diagnosis(demo_core: Any) -> None:
     spy = _Spy(demo_core)
     spy.snap_release = threading.Event()

@@ -130,6 +130,7 @@ def test_a_snap_on_the_demo_camera_is_a_512_square_uint16_frame(
 
 
 @pytest.mark.parametrize("stall", [False, True], ids=["steady", "one-stall"])
+@pytest.mark.wallclock
 def test_live_without_its_cap_runs_at_least_five_frames_a_second_on_the_demo_camera(
     demo_microscope: Microscope,
     tmp_path: Path,

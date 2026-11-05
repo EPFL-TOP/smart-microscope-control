@@ -524,6 +524,7 @@ def test_an_unreadable_binning_is_reported_before_the_magnification_factor_is_re
     ]
 
 
+@pytest.mark.wallclock
 def test_wait_times_out_cleanly() -> None:
     core = _AlwaysBusyCore()
     stage = MMXYStage(core, "XY", _executor(), Safety(max_jog_um=1.0))  # type: ignore[arg-type]
@@ -759,6 +760,7 @@ def _moving_stand(
 
 
 @pytest.mark.parametrize("kind", ["xy", "z", "turret"])
+@pytest.mark.wallclock
 def test_while_an_action_waits_reads_and_closing_get_through_and_actions_are_refused(
     kind: str,
 ) -> None:

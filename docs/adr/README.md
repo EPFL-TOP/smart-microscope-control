@@ -12,15 +12,18 @@ and why.
 | [0002](0002-pymmcore-plus-as-the-hardware-core.md) | Python, Micro-Manager and pymmcore-plus as the hardware core | accepted |
 | [0003](0003-capabilities-roles-and-profiles.md) | The abstraction layer: capabilities, roles and profiles | accepted |
 | [0004](0004-plugin-architecture.md) | Tools are plugins over capabilities | accepted |
-| [0005](0005-testing-strategy.md) | Testing strategy: simulator first, hardware by session | accepted |
+| [0005](0005-testing-strategy.md) | Testing strategy: simulator first, hardware by session | accepted (amended in part by 0009) |
 | [0006](0006-user-interface.md) | User interface: one simple interface for every microscope | accepted |
 | [0007](0007-non-micromanager-hardware.md) | Hardware without a Micro-Manager adapter (Zeiss MTB, Viventis) | **proposed** |
-| [0008](0008-repository-workflow.md) | Repository workflow: issues, branches, PRs, CI | accepted |
-| [0009](0009-light-ci-full-nightly.md) | A light CI on pull requests, the full matrix every night (amends 0005, 0008) | **proposed** |
+| [0008](0008-repository-workflow.md) | Repository workflow: issues, branches, PRs, CI | accepted (amended in part by 0009) |
+| [0009](0009-light-ci-full-nightly.md) | A light CI on pull requests, the full matrix every night (amends 0005, 0008) | accepted |
 
 ## Statuses
 
 `proposed` → `accepted` | `rejected` → later `superseded by NNNN` or `deprecated`.
+An accepted record that a later one changes in part, without replacing it,
+reads `accepted (amended in part by NNNN)`; the later record's *Amends* line
+says which parts.
 
 ## Template
 
