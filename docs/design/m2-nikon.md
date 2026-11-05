@@ -3785,7 +3785,8 @@ where they are written.
 ### 13.6 What session 3 measures (for `/hardware-session`)
 
 The procedure for the session's checklist, with PFS off (a turn switches
-it off anyway) and the operator focusing by hand or with `smc z jog`:
+it off anyway), the magnifier lever at 1.0× (the offsets are for it,
+FM-103) and the operator focusing by hand or with `smc z jog`:
 
 1. **A point, not a line.** A small, sharp feature visible with all three
    objectives: a stage micrometer's cross, the corner of a printed grid, a
@@ -3831,6 +3832,8 @@ nothing is entered.
 - Whether the Ti2-E's own Z correction on a turn (§13.1) is the whole
   parfocality, leaving `z_offset_um` near 0.
 - Whether `current()` reads the new objective right after a turn (#330).
+- Whether the magnifier lever at 1.5× moves the image's centre: the
+  offsets are keyed by objective only and measured at 1.0× (FM-103).
 - Whether NIS-Elements applies an offset of its own when its objective
   changes, which decides how the route's positions for another objective
   are handed on (m3 §11, §18).
