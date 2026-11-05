@@ -42,7 +42,10 @@ from smc.plugins.slots import (
     ScanResult,
     SlotValue,
     TimingsResult,
+    WallFrame,
+    WallImages,
     WallTouch,
+    WellFit,
     WellRef,
 )
 
@@ -60,6 +63,39 @@ _FIT = {
     "n_inside": 31,
     "notes": ["two samples on the rim"],
 }
+_WALL_FRAME: dict[str, Any] = {
+    "side": "+X",
+    "x_um": 17967.4,
+    "y_um": -9737.3,
+    "n_points": 173,
+    "frames": 3,
+    "file": "B3_+X.tif",
+}
+_WELL_FIT: dict[str, Any] = {
+    "well": "B3",
+    "recorded_xy_um": [10200.0, -9700.0],
+    "center_xy_um": [10182.0, -10087.9],
+    "diameter_um": 15298.0,
+    "size_error": -0.0194,
+    "rms_um": 41.9,
+    "n_points": 696,
+    "walls": [
+        _WALL_FRAME,
+        {**_WALL_FRAME, "side": "+Y", "y_um": -2337.6, "frames": 2},
+        {**_WALL_FRAME, "side": "-X", "x_um": 2468.0},
+        {**_WALL_FRAME, "side": "-Y", "y_um": -17738.5},
+    ],
+}
+_WALLS: dict[str, Any] = {
+    "objective": "Nikon 10X Plan Fluor",
+    "pixel_size_um": 1.1,
+    "image_shape_px": [1412, 1412],
+    "search_um": 3900.0,
+    "wells": [_WELL_FIT],
+    "frames": 11,
+    "folder": "plate-walls/0123456789ab",
+    "elapsed_s": 64.5,
+}
 _PLATE: dict[str, Any] = {
     "assumed": ["well pitch from the plate definition"],
     "plate": "96-well",
@@ -71,6 +107,7 @@ _PLATE: dict[str, Any] = {
     "n_refs": 2,
     "refs": [_REF, {"well": "H12", "x_um": 100000.0, "y_um": -63000.0}],
     "fit": _FIT,
+    "walls": _WALLS,
 }
 
 _CALIBRATION: dict[str, Any] = {
@@ -250,6 +287,12 @@ SAMPLES: dict[type[BaseModel], Sample] = {
             "n_samples": 0,
             "n_inside": 0,
         },
+    ),
+    WallFrame: (_WALL_FRAME, {**_WALL_FRAME, "file": None}),
+    WellFit: (_WELL_FIT, {**_WELL_FIT, "walls": []}),
+    WallImages: (
+        _WALLS,
+        {**_WALLS, "objective": None, "wells": [], "frames": 0, "folder": None},
     ),
     PlateResult: (
         _PLATE,
@@ -449,6 +492,15 @@ RANGES: list[tuple[type[BaseModel], tuple[Any, ...], list[Any], list[Any]]] = [
     (PlateResult, ("rotation_deg",), [-180.5, 180.5], [-180.0, 180.0]),
     (PlateResult, ("residual_um",), [-0.1], [0.0]),
     (PlateResult, ("n_refs",), [-1], [0]),
+    (WallFrame, ("n_points",), [-1], [0]),
+    (WallFrame, ("frames",), [0, -1], [1]),
+    (WellFit, ("diameter_um",), [0.0, -1.0], [1e-6]),
+    (WellFit, ("rms_um",), [-0.1], [0.0]),
+    (WellFit, ("n_points",), [-1], [0]),
+    (WallImages, ("pixel_size_um",), [0.0, -1.0], [1e-6]),
+    (WallImages, ("search_um",), [0.0, -1.0], [1e-6]),
+    (WallImages, ("frames",), [-1], [0]),
+    (WallImages, ("elapsed_s",), [-0.1], [0.0]),
     (CameraCalibration, ("pixel_size_um",), [0.0, -1.0], [1e-6]),
     (CameraCalibration, ("rotation_deg",), [-180.5, 180.5], [-180.0, 180.0]),
     (CameraCalibration, ("residual_um",), [-0.1], [0.0]),
@@ -539,6 +591,8 @@ MUST_BE_PRESENT: list[tuple[type[BaseModel], tuple[Any, ...]]] = [
     (PlateResult, ("scale_error",)),
     (LatticeFit, ("runner_up",)),
     (LatticeFit, ("margin",)),
+    (WallImages, ("objective",)),
+    (WallImages, ("folder",)),
     (CameraCalibration, ("objective",)),
     (CameraCalibration, ("return_error_um",)),
     (ScanPlanResult, ("objective",)),
@@ -580,6 +634,38 @@ def test_plate_refuses_a_plate_that_useq_does_not_know(name: str) -> None:
     assert [(error["type"], error["loc"]) for error in errors] == [
         ("value_error", ("plate",))
     ]
+
+
+def test_a_plate_result_written_before_walls_existed_still_validates() -> None:
+    # #328 added `walls` and the method `wall-images`: a run document written
+    # earlier has neither key, and is read, not refused as a document of the past.
+    older = {key: value for key, value in _PLATE.items() if key != "walls"}
+    loaded = PlateResult.model_validate(older)
+    assert loaded.walls is None
+    assert PlateResult.model_validate({**older, "method": "wall-images"}).walls is None
+
+
+def test_a_plate_result_by_wall_images_keeps_its_walls_through_a_dump() -> None:
+    loaded = PlateResult.model_validate(
+        {**_PLATE, "method": "wall-images", "fit": None}
+    )
+    assert loaded.method == "wall-images"
+    assert loaded.walls is not None
+    assert [w.side for w in loaded.walls.wells[0].walls] == ["+X", "+Y", "-X", "-Y"]
+    assert PlateResult.model_validate(loaded.model_dump(mode="json")) == loaded
+
+
+@pytest.mark.parametrize("side", ["left", "x", "+x", "X+", "", "+Z"])
+def test_a_wall_side_is_a_stage_direction_and_nothing_else(side: str) -> None:
+    # Sides are stage directions, never the image's or the plate's (§17.2): the
+    # words of `WallTouch` (`left`, `top`) are the page's and mean something else.
+    assert _error_types(WallFrame, {**_WALL_FRAME, "side": side}) == ["literal_error"]
+    for direction in ("+X", "+Y", "-X", "-Y"):
+        WallFrame.model_validate({**_WALL_FRAME, "side": direction})
+
+
+def test_a_method_the_plate_slot_does_not_know_is_refused() -> None:
+    assert _error_types(PlateResult, {**_PLATE, "method": "guess"}) == ["literal_error"]
 
 
 def test_a_subclass_of_a_slot_model_is_refused_through_the_base() -> None:
@@ -747,7 +833,11 @@ SLOTS_MAP = {
     "ScanResult",
     "SlotValue",
     "TimingsResult",
+    "WallFrame",
+    "WallImages",
+    "WallSide",
     "WallTouch",
+    "WellFit",
     "WellGeometry",
     "WellRef",
     "load_cells",
