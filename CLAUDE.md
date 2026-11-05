@@ -77,6 +77,10 @@ relies on it).
    #16 on the merge of #127; "fix #13" closed #13 on the merge of #136).
    The *closing references* check fails a PR that would close another
    issue than its branch's, and a `docs/` or `adr/` PR that closes any.
+   A change whose failure class is platform-specific (paths, encodings,
+   subprocesses, file locking, a hardware bridge, the minimum Python) carries
+   the label `ci: full`, which runs the full matrix on that PR; `/plan` names
+   it (ADR-0009).
 7. Report outcomes faithfully. If a test fails or a step was skipped, say
    so with the output.
 
@@ -129,7 +133,11 @@ relies on it).
 - Every new capability gets a contract test; every backend runs the
   contracts. Vendor quirks that the simulator cannot show get a `FakeCore`
   test.
-- CI must be green on Linux, macOS and Windows.
+- The light set (Linux py3.13, Windows py3.14) is green before a merge; the
+  full matrix (Linux, macOS, Windows, Python 3.10 to 3.14) before a release
+  and every night (ADR-0009).
+- A red `main`, or an open `CI nightly red` issue, stops the merges of the
+  code it names until the owner has chosen to revert or to fix forward.
 
 ## Hardware sessions
 

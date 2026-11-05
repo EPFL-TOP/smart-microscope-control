@@ -1,6 +1,6 @@
 # 0005 — Testing strategy: simulator first, hardware by session
 
-- **Status**: accepted
+- **Status**: accepted (amended in part by 0009)
 - **Date**: 2026-09-22
 
 ## Context
@@ -24,8 +24,9 @@ Four layers, cheapest first, and every PR states which it exercised:
    visits every well once).
 2. **Simulator tests** against Micro-Manager's demo devices
    (`@pytest.mark.demo`, fixture `demo_core` / `demo_microscope`): the
-   regression bed. They run in CI on Linux, macOS and Windows. In CI a
-   missing install **fails** (`SMC_REQUIRE_MM=1`); locally it skips.
+   regression bed. They run in CI on every PR on Linux and Windows, and every
+   night on Linux, macOS and Windows (ADR-0009). In CI a missing install
+   **fails** (`SMC_REQUIRE_MM=1`); locally it skips.
 3. **Fake-core tests** for behaviours the simulator cannot show: a
    `FakeCore` that records calls and models the quirk (Z move → PFS off).
    Each such test is named for the failure it prevents.
@@ -42,7 +43,8 @@ session report* issue; anything learned becomes a test, a profile entry or a
 doc line before the next session.
 
 Tooling: `pytest`, `pytest-cov` (reported, not yet gated), `ruff`, `mypy
---strict` on `src/`, `pre-commit`. CI runs lint → tests on a 4-job matrix.
+--strict` on `src/`, `pre-commit`. CI runs lint → tests: the light set per PR,
+the full matrix nightly (ADR-0009).
 
 ## Alternatives considered
 

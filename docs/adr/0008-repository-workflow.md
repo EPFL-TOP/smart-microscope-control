@@ -1,6 +1,6 @@
 # 0008 — Repository workflow: issues, branches, PRs, CI
 
-- **Status**: accepted
+- **Status**: accepted (amended in part by 0009)
 - **Date**: 2026-09-22
 
 ## Context
@@ -15,8 +15,9 @@ which made its history useless as documentation.
 
 - **Everything starts as an issue** (feature, bug, ADR, hardware session).
   Issues carry acceptance criteria and, before coding, a short plan.
-- **`main` is protected**: no direct pushes, PR required, CI green required,
-  squash merge, linear history. (GitHub settings — configured by the owner.)
+- **`main` is protected**: no direct pushes, PR required, the light set's CI
+  green required (a branch need not be up to date, ADR-0009), squash merge,
+  linear history. (GitHub settings — configured by the owner.)
 - **Branches**: `feat/<issue>-<slug>`, `fix/…`, `docs/…`, `chore/…`, `adr/…`.
 - **Commits** follow Conventional Commits (`feat(core): …`, `fix(zeiss): …`,
   `docs(adr): …`, `test: …`, `chore(ci): …`). The squash-merge title is the
@@ -24,7 +25,8 @@ which made its history useless as documentation.
 - **Pull requests** use the template: what, why, how verified, safety, docs.
   A PR that moves real hardware says so and links its session report.
 - **CI gates**: `ruff check`, `ruff format --check`, `mypy --strict`, tests
-  on Linux/macOS/Windows against the demo devices.
+  against the demo devices: the light set per PR (Linux and Windows), the full
+  matrix (Linux, macOS, Windows) every night (ADR-0009).
 - **Labels** (created by `scripts/github/bootstrap.py`): `type: *`,
   `area: *`, `scope: <microscope>`, `status: *`, `priority: p0–p2`,
   `good first issue`. **Milestones** track the roadmap (`docs/roadmap.md`).
