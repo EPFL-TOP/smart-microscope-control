@@ -28,6 +28,7 @@ import re
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -41,8 +42,12 @@ from pydantic import (
     ValidationInfo,
     field_validator,
 )
+from pydantic_core import to_jsonable_python
 
 from smc.hardware.profile import Profile, check_pairs, search_paths
+from smc.plugins.api import PluginParams
+from smc.plugins.errors import ParamsError
+from smc.plugins.params import format_param, parse_params
 from smc.plugins.scan.algorithm import RESERVED_NAMES
 from smc.run.document import RunDocument, StageStatus
 from smc.run.files import AtomicWriteError, retry_on_permission_error, write_atomically
@@ -59,6 +64,7 @@ __all__ = [
     "PresetError",
     "PresetExistsError",
     "PresetFile",
+    "PresetFromRun",
     "check_name",
     "check_preset",
     "command_pairs",
@@ -66,6 +72,7 @@ __all__ = [
     "list_presets",
     "load_preset",
     "preset_dirs",
+    "preset_from_document",
     "registered_plate",
     "save_preset",
 ]
@@ -82,11 +89,16 @@ _HEADER = (
 #: plate and the wells are the preset's own fields, and positions are never
 #: kept (m5 §10.2). Per plugin, the key and the reason the note gives.
 NOT_IN_PARAMS: dict[str, dict[str, str]] = {
+    "plate-finding": {
+        "centre_x_um": "a preset holds no positions",
+        "centre_y_um": "a preset holds no positions",
+    },
     "plate-registration": {
         "plate": "the preset's plate holds it",
         "refs": "a preset holds no positions",
         "walls": "a preset holds no positions",
     },
+    "plate-walls": {"refs": "a preset holds no positions"},
     "scan-plan": {"wells": "the preset's wells hold them"},
 }
 
@@ -514,3 +526,178 @@ def command_pairs(
     pairs.extend(check.params.get(plugin, ()))
     kept = [item for item in pairs if item.partition("=")[0] not in taken]
     return [*kept, *overrides]
+
+
+# -- a preset from a run document -----------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class PresetFromRun:
+    """A preset made from a run document, and one note for everything left out of it."""
+
+    preset: Preset
+    notes: tuple[str, ...]
+
+
+def preset_from_document(
+    doc: RunDocument,
+    models: Mapping[str, type[PluginParams]],
+    *,
+    stand: str,
+    saved_utc: datetime,
+) -> PresetFromRun:
+    """The preset the ``done`` records of ``doc`` would be run again from (m5 §10.9).
+
+    Only a finished run's values are the assay's: a ``stopped``, ``failed`` or
+    ``running`` record is left out, and a dry run's is in, its values being the
+    operator's. A pair that equals its plugin's default is left out too, so the
+    preset follows the plugin's default as ``[suggest]`` does. What cannot be
+    saved is a note, never silence (FM-107): a plugin whose pairs would be read
+    back as other values loses all of them, because a subset may be refused
+    (``rows`` without ``columns``), and the note names the key.
+
+    Raises:
+        PresetError: The document has no finished stage, saves nothing, or
+            holds a ``wells`` text that is not one line.
+    """
+    done = {
+        plugin: record
+        for plugin, record in sorted(doc.stages.items())
+        if record.status is StageStatus.done
+    }
+    if not done:
+        raise PresetError(
+            "the run document has no finished stage; there is nothing to save"
+        )
+    params: dict[str, tuple[str, ...]] = {}
+    notes: list[str] = []
+    only_defaults: list[str] = []
+    wells: str | None = None
+    for plugin, record in done.items():
+        pairs, note = _pairs_of(plugin, models.get(plugin), record.params)
+        if pairs:
+            params[plugin] = pairs
+        elif note is None:
+            only_defaults.append(plugin)
+        if note is not None:
+            notes.append(note)
+        if plugin == "scan-plan":
+            wells = record.params.get("wells")
+            if not isinstance(wells, str) or not wells.strip():
+                wells = None
+            elif not _is_text(wells):
+                notes.append(
+                    "scan-plan: wells holds a character that is not text; not saved"
+                )
+                wells = None
+        if record.profile != stand:
+            notes.append(f"{plugin} was run on {record.profile}, not on {stand}")
+    plate = registered_plate(doc)
+    if plate is not None and not _is_text(plate):
+        # A plate name read from a result that carries a lone surrogate (FM-05):
+        # it would end the save at the encoding, with no word about which value.
+        notes.append("plate holds a character that is not text; not saved")
+        plate = None
+    if plate is None and wells is None and not params:
+        # The refused plugins are named too: "used only default values" would be
+        # untrue of a plugin whose values did not read back.
+        named = [
+            f"nothing to save: {', '.join(only_defaults)} used only default values"
+            if only_defaults
+            else "nothing to save"
+        ]
+        raise PresetError("; ".join([*named, *notes]))
+    try:
+        preset = Preset(
+            stand=stand, plate=plate, wells=wells, saved_utc=saved_utc, params=params
+        )
+    except ValidationError as exc:
+        first = " ".join(
+            str(exc.errors()[0]["msg"]).removeprefix("Value error, ").split()
+        )
+        raise PresetError(f"nothing saved: {first}") from None
+    return PresetFromRun(preset, tuple(notes))
+
+
+def _pairs_of(
+    plugin: str, model: type[PluginParams] | None, recorded: Mapping[str, Any]
+) -> tuple[tuple[str, ...], str | None]:
+    """The ``key=value`` pairs a record's parameters leave in a preset, or why there are none.
+
+    ``recorded`` is data taken as it comes (FM-125): the plugin may have changed
+    since the run, so the ``Params`` validates it again. A pair is saved when its
+    field is required or differs from its default, in the model's declaration
+    order, except the keys a preset holds elsewhere (``NOT_IN_PARAMS``).
+
+    The pairs are then **read back** the way ``smc run --preset`` reads them, with
+    what the run takes from elsewhere (the plate, the wells, the operator's
+    positions) given as the record has it, and the result must equal the record
+    key by key. A text that reads back as another value (the string ``null`` in a
+    ``str | None`` field) would make a later run use a value the operator never
+    chose, and nothing would say so.
+    """
+    if model is None:
+        return (), (
+            f"{plugin}: no plugin of that name is loaded; its parameters are not saved"
+        )
+    try:
+        validated = model.model_validate(recorded)
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"{'.'.join(str(part) for part in error['loc']) or 'parameters'}: "
+            f"{error['msg']}"
+            for error in exc.errors()
+        )
+        return (), (
+            f"{plugin}: its recorded parameters are not valid for this smc "
+            f"({problems}); not saved"
+        )
+    values = validated.model_dump(mode="json")
+    fields = model.model_fields
+    held = NOT_IN_PARAMS.get(plugin, {})
+    items = [
+        f"{key}={format_param(field, values[key])}"
+        for key, field in fields.items()
+        if key not in held
+        and (
+            field.is_required()
+            or values[key]
+            != to_jsonable_python(field.get_default(call_default_factory=True))
+        )
+    ]
+    if not items:
+        return (), None
+    elsewhere = [
+        f"{key}={format_param(fields[key], values[key])}"
+        for key in held
+        if key in fields
+    ]
+    try:
+        back = parse_params(model, [*items, *elsewhere]).model_dump(mode="json")
+    except ParamsError as exc:
+        return (), (
+            f"{plugin}: its pairs do not read back ({'; '.join(exc.problems)}); "
+            "not saved"
+        )
+    changed = [key for key in fields if back[key] != values[key]]
+    if changed:
+        return (), (
+            f"{plugin}: {', '.join(changed)} would read back as another value; "
+            "not saved"
+        )
+    for item in items:
+        if not _is_text(item):
+            return (), (
+                f"{plugin}: {item.partition('=')[0]} holds a character that is not "
+                "text; not saved"
+            )
+    return tuple(items), None
+
+
+def _is_text(text: str) -> bool:
+    """Whether ``text`` encodes as UTF-8: a lone surrogate, left by a label read in cp1252, does not (FM-05)."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True

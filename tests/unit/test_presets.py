@@ -89,10 +89,23 @@ class RegistrationParams(BaseModel):
     walls: str = ""
 
 
+class FindingParams(BaseModel):
+    plate: str = ""
+    centre_x_um: float | None = None
+    centre_y_um: float | None = None
+
+
+class WallsParams(BaseModel):
+    plate: str = ""
+    refs: str = ""
+
+
 MODELS: dict[str, type[BaseModel]] = {
     "scan-plan": ScanPlanParams,
     "cells": CellsParams,
     "plate-registration": RegistrationParams,
+    "plate-finding": FindingParams,
+    "plate-walls": WallsParams,
 }
 
 

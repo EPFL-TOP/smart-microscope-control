@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from datetime import datetime, timezone
 from importlib.metadata import EntryPoint
 from pathlib import Path
@@ -672,7 +673,7 @@ def test_the_weekly_example_loads_on_demo_sample_without_a_mismatch(
 
 
 @pytest.mark.parametrize("env", [None, {"GITHUB_ACTIONS": "1"}])
-def test_presets_help_lists_list_and_show(env: dict[str, str] | None) -> None:
+def test_presets_help_lists_list_show_and_save(env: dict[str, str] | None) -> None:
     # FM-72: typer forces colour on GitHub Actions, so the text is compared plain.
     result = _run("presets", "--help", env=env)
 
@@ -680,6 +681,7 @@ def test_presets_help_lists_list_and_show(env: dict[str, str] | None) -> None:
     plain = _plain(result)
     assert re.search(r"\blist\b", plain)
     assert re.search(r"\bshow\b", plain)
+    assert re.search(r"\bsave\b", plain)
 
 
 @pytest.mark.parametrize("env", [None, {"GITHUB_ACTIONS": "1"}])
@@ -744,3 +746,281 @@ def test_the_weekly_preset_runs_scan_plan_on_demo_sample(
     assert again.params["coverage"] == 0.5
     assert again.params["wells"] == "B2,B11"
     assert again.preset == "weekly"
+
+
+# -- smc presets save (m5 §10.9, #324) -----------------------------------------------
+
+
+def _stage(
+    tmp_path: Path,
+    plugin: str,
+    params: dict[str, Any],
+    *,
+    provides: str | None = None,
+    status: StageStatus = StageStatus.done,
+    profile: str = "demo",
+    document: str = "a.json",
+) -> Path:
+    """A record as the runner leaves it, in ``tmp_path/document``; the file is returned."""
+    then = datetime(2026, 11, 5, 9, 0, tzinfo=timezone.utc)
+    write_stage(
+        tmp_path / document,
+        StageRecord(
+            plugin=plugin,
+            provides=provides or plugin,
+            attempt="a1",
+            status=status,
+            started_utc=then,
+            finished_utc=None if status is StageStatus.running else then,
+            profile=profile,
+            dry_run=False,
+            smc_version="0",
+            params=params,
+        ),
+    )
+    return tmp_path / document
+
+
+def _saved(tmp_path: Path) -> Path:
+    """Where a save on the demo stand writes ``weekly``: the first folder searched."""
+    return tmp_path / "profiles" / "presets" / "weekly.toml"
+
+
+def test_presets_save_writes_a_preset_that_run_preset_reproduces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_stand: list[bool]
+) -> None:
+    _register(monkeypatch, Plan, Cells, Registration)
+    first = str(tmp_path / "a.json")
+    for stage in (
+        ("plate-registration", "plate=96-well"),
+        ("scan-plan", "wells=B2,B11", "coverage=0.4"),
+        ("cells", "detector=blobs"),
+    ):
+        args = ["run", stage[0], "--run-doc", first]
+        for pair in stage[1:]:
+            args += ["--param", pair]
+        assert _run(*args).exit_code == 0
+
+    saved = _run("presets", "save", "weekly", "--run-doc", first)
+
+    assert saved.exit_code == 0, saved.output
+    assert _saved(tmp_path).is_file()
+    _register_plate(tmp_path, "96-well")
+    again = _run("run", "scan-plan", "--preset", "weekly", "--run-doc", _doc(tmp_path))
+    assert again.exit_code == 0, again.output
+    recorded = RunDocument.load(tmp_path / "a.json").stages["scan-plan"]
+    reproduced = _stored(tmp_path, "scan-plan")
+    assert reproduced.params == recorded.params == {"wells": "B2,B11", "coverage": 0.4}
+    assert reproduced.preset == "weekly"
+    shown = _run("presets", "show", "weekly")
+    assert _lines(shown)[-1] == "no mismatch on demo"
+
+
+@pytest.mark.usefixtures("demo")
+def test_the_demo_sample_chain_is_saved_and_reproduced(tmp_path: Path) -> None:
+    # The acceptance of #324 on the real chain. The profile is a copy in `tmp_path`:
+    # a preset is written beside its profile, and the repository's own
+    # `profiles/presets` must stay as it is.
+    checked_in = REPO / "profiles" / "presets" / "weekly.toml"
+    untouched = checked_in.read_bytes()
+    profile = tmp_path / "demo-sample.toml"
+    profile.write_text(
+        (REPO / "profiles" / "demo-sample.toml").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    refs = (
+        '[{"well":"A1","x_um":-49500,"y_um":31500},'
+        '{"well":"A12","x_um":49500,"y_um":31500},'
+        '{"well":"H1","x_um":-49500,"y_um":-31500}]'
+    )
+    first = str(tmp_path / "a.json")
+
+    def stage(name: str, *pairs: str, document: str = first, preset: str = "") -> None:
+        args = ["run", name, "-p", str(profile), "--run-doc", document]
+        args += ["--preset", preset] if preset else []
+        for pair in pairs:
+            args += ["--param", pair]
+        result = _run(*args)
+        assert result.exit_code == 0, f"{name}: {result.output}"
+
+    stage("plate-registration", f"refs={refs}")
+    stage("scan-plan", "wells=B2,B11", "coverage=0.4")
+
+    saved = _run("presets", "save", "weekly", "--run-doc", first, "-p", str(profile))
+
+    assert saved.exit_code == 0, saved.output
+    assert (tmp_path / "presets" / "weekly.toml").is_file()
+    assert checked_in.read_bytes() == untouched
+    _register_plate(tmp_path, "96-well", profile="demo-sample")
+    stage("scan-plan", document=_doc(tmp_path), preset="weekly")
+    recorded = RunDocument.load(tmp_path / "a.json").stages["scan-plan"]
+    reproduced = _stored(tmp_path, "scan-plan")
+    assert reproduced.params == recorded.params
+    assert reproduced.preset == "weekly"
+
+
+def test_presets_save_refuses_an_existing_name_without_overwrite_and_overwrite_replaces_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_stand: None
+) -> None:
+    _register(monkeypatch, Plan)
+    first = _stage(tmp_path, "scan-plan", {"wells": "B2", "coverage": 0.4})
+    second = _stage(
+        tmp_path, "scan-plan", {"wells": "B2", "coverage": 0.5}, document="b.json"
+    )
+    assert _run("presets", "save", "weekly", "--run-doc", str(first)).exit_code == 0
+    before = _saved(tmp_path).read_bytes()
+
+    refused = _run("presets", "save", "weekly", "--run-doc", str(second))
+
+    assert refused.exit_code == 2
+    assert _lines(refused) == [
+        f"✗ preset weekly exists: {_saved(tmp_path)}; pass --overwrite to replace it"
+    ]
+    assert _saved(tmp_path).read_bytes() == before
+
+    replaced = _run(
+        "presets", "save", "weekly", "--run-doc", str(second), "--overwrite"
+    )
+
+    assert replaced.exit_code == 0, replaced.output
+    assert _saved(tmp_path).read_bytes() != before
+    assert "coverage=0.5" in _saved(tmp_path).read_text(encoding="utf-8")
+
+
+def test_presets_save_refuses_a_bad_name_before_it_reads_the_document(
+    tmp_path: Path, no_stand: None
+) -> None:
+    result = _run(
+        "presets", "save", "Weekly", "--run-doc", str(tmp_path / "nowhere.json")
+    )
+
+    assert result.exit_code == 2
+    plain = _plain(result)
+    assert (
+        "Invalid value for NAME: a preset's name is 1 to 64 lower-case letters, "
+        "digits, - and _, starting with a letter or a digit; got 'Weekly'"
+    ) in plain
+    assert "does not exist" not in plain
+    assert not (tmp_path / "profiles").exists()
+
+
+def test_presets_save_of_a_missing_run_document_exits_1_and_writes_nothing(
+    tmp_path: Path, no_stand: None
+) -> None:
+    missing = tmp_path / "nowhere.json"
+
+    result = _run("presets", "save", "weekly", "--run-doc", str(missing))
+
+    assert result.exit_code == 1
+    assert _lines(result) == [f"✗ {missing}: does not exist"]
+    assert not (tmp_path / "profiles").exists()
+
+
+def test_presets_save_of_a_document_with_nothing_finished_exits_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_stand: None
+) -> None:
+    _register(monkeypatch, Plan)
+    path = _stage(tmp_path, "scan-plan", {"wells": "B2"}, status=StageStatus.failed)
+
+    result = _run("presets", "save", "weekly", "--run-doc", str(path))
+
+    assert result.exit_code == 2
+    assert _lines(result) == [
+        "✗ the run document has no finished stage; there is nothing to save"
+    ]
+    assert not (tmp_path / "profiles").exists()
+
+
+def test_presets_save_prints_the_saved_line_the_preset_and_the_notes_in_that_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_stand: None
+) -> None:
+    _register(monkeypatch, Plan, Cells)
+    _stage(tmp_path, "scan-plan", {"wells": "B2", "coverage": 0.4}, profile="nikon-ti2")
+    path = _stage(tmp_path, "cells", {"detector": "blobs"})
+
+    result = _run("presets", "save", "weekly", "--run-doc", str(path))
+
+    assert result.exit_code == 0, result.output
+    lines = _lines(result)
+    assert lines[0] == f"saved weekly to {_saved(tmp_path)}"
+    assert lines[1:4] == ["stand: demo", "plate: -", "wells: B2"]
+    # To the second, in UTC: the page's own `saved_utc`.
+    assert re.fullmatch(r"saved_utc: \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\+00:00", lines[4])
+    assert lines[5:] == [
+        "cells: detector=blobs",
+        "scan-plan: coverage=0.4",
+        "scan-plan was run on nikon-ti2, not on demo",
+    ]
+
+
+def test_presets_save_writes_the_stand_of_the_profile_it_is_given_beside_that_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_stand: None
+) -> None:
+    # `-p` is a path whose text is not the stand's name: the preset holds the name.
+    _register(monkeypatch, Cells)
+    folder = tmp_path / "bench"
+    folder.mkdir()
+    profile = folder / "bench.toml"
+    profile.write_text('[microscope]\nname = "bench-ti2"\n', encoding="utf-8")
+    path = _stage(tmp_path, "cells", {"detector": "blobs"}, profile="bench-ti2")
+
+    result = _run(
+        "presets", "save", "weekly", "--run-doc", str(path), "-p", str(profile)
+    )
+
+    written = folder / "presets" / "weekly.toml"
+    assert result.exit_code == 0, result.output
+    assert _lines(result)[:2] == [f"saved weekly to {written}", "stand: bench-ti2"]
+    assert 'stand = "bench-ti2"' in written.read_text(encoding="utf-8")
+    # The stage was run on that stand: no note.
+    assert _lines(result)[-1] == "cells: detector=blobs"
+
+
+def test_presets_save_reports_a_folder_it_cannot_write_and_exits_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_stand: None
+) -> None:
+    _register(monkeypatch, Cells)
+    path = _stage(tmp_path, "cells", {"detector": "blobs"})
+    (tmp_path / "profiles").mkdir()
+    (tmp_path / "profiles" / "presets").write_text("a file, not a folder", "utf-8")
+
+    result = _run("presets", "save", "weekly", "--run-doc", str(path))
+
+    assert result.exit_code == 1
+    lines = _lines(result)
+    assert len(lines) == 1
+    assert lines[0].startswith(f"✗ {_saved(tmp_path)}: not saved: ")
+
+
+def test_presets_save_without_tomli_w_says_what_to_install_and_exits_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_stand: None
+) -> None:
+    _register(monkeypatch, Cells)
+    path = _stage(tmp_path, "cells", {"detector": "blobs"})
+    monkeypatch.setitem(sys.modules, "tomli_w", None)
+
+    result = _run("presets", "save", "weekly", "--run-doc", str(path))
+
+    assert result.exit_code == 1
+    lines = _lines(result)
+    assert len(lines) == 1
+    assert lines[0].startswith("✗ saving a preset needs the tomli-w package")
+    assert not _saved(tmp_path).exists()
+
+
+@pytest.mark.parametrize("env", [None, {"GITHUB_ACTIONS": "1"}])
+def test_presets_save_needs_run_doc_and_the_help_names_the_command_and_its_options(
+    env: dict[str, str] | None,
+) -> None:
+    # FM-72: typer forces colour on GitHub Actions, so the text is compared plain.
+    missing = _run("presets", "save", "weekly", env=env)
+    group = _run("presets", "--help", env=env)
+    command = _run("presets", "save", "--help", env=env)
+
+    assert missing.exit_code == 2
+    assert re.search(r"Missing option\s+'--run-doc'", _plain(missing))
+    assert group.exit_code == 0, group.output
+    assert re.search(r"\bsave\b", _plain(group))
+    assert command.exit_code == 0, command.output
+    assert re.search(r"--run-doc\b", _plain(command))
+    assert re.search(r"--overwrite\b", _plain(command))

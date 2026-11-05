@@ -257,10 +257,15 @@ def _plate_done(run_doc: Path, plate: str = "96-well") -> None:
 
 def test_what_a_preset_does_not_keep_under_params_is_what_the_page_fills() -> None:
     # Two lists that must agree: a key the page fills itself is one the preset's
-    # own fields hold, and the other way round.
-    assert {plugin: set(keys) for plugin, keys in NOT_IN_PARAMS.items()} == {
-        plugin: set(keys) for plugin, keys in PAGE_PARAMS.items()
-    }
+    # own fields hold, and the other way round. The exceptions are the stage
+    # positions that the page does not fill but a preset never holds: plate-finding's
+    # centre and plate-walls' refs, which `smc presets save` leaves out as well
+    # (#324, m5 §10.9).
+    kept_elsewhere = {plugin: set(keys) for plugin, keys in NOT_IN_PARAMS.items()}
+    filled = {plugin: set(keys) for plugin, keys in PAGE_PARAMS.items()}
+    assert kept_elsewhere.pop("plate-finding") == {"centre_x_um", "centre_y_um"}
+    assert kept_elsewhere.pop("plate-walls") == {"refs"}
+    assert kept_elsewhere == filled
 
 
 # --- loading ----------------------------------------------------------------------

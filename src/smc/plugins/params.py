@@ -16,7 +16,7 @@ import json
 import types
 from collections.abc import Sequence
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Literal, Union, get_args, get_origin
 
 from pydantic import ValidationError
@@ -25,7 +25,7 @@ from pydantic.fields import FieldInfo
 from smc.plugins.api import P, PluginParams
 from smc.plugins.errors import ParamsError
 
-__all__ = ["describe_params", "parse_params"]
+__all__ = ["describe_params", "format_param", "parse_params"]
 
 _SCALARS: tuple[type, ...] = (str, int, float, bool, Path)
 
@@ -105,6 +105,35 @@ def _decode(field: FieldInfo, text: str) -> Any:
         return json.loads(text)
     except ValueError:
         return _NOT_JSON
+
+
+def format_param(field: FieldInfo, value: Any) -> str:
+    """The text that ``--param key=<text>`` takes for ``value``: the inverse of ``_decode``.
+
+    ``value`` is a recorded one, in the JSON form a run document keeps (a string
+    for a ``Path`` or an enum member, a list for a tuple). A preset is a list of
+    these texts, so the preset *is* the command's call (m5 §10.1).
+
+    It does not promise that the text reads back as ``value``: a ``str | None``
+    field that holds the string ``null`` reads back as ``None``, because ``null``
+    is how ``_decode`` spells "absent" for a field that admits it. The caller
+    that saves the text reads it back through ``parse_params`` and compares.
+    ``json.dumps`` stays ASCII, so a label read in a cp1252 console is still text.
+    """
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    annotation, _ = _without_none(field.annotation)
+    if not _is_scalar(annotation):
+        return json.dumps(value)
+    # Handed in as they are, an enum member and a path would give ``Mode.slow`` and
+    # ``PosixPath('a')``: the text of a scalar is the text the decoding takes.
+    if isinstance(value, Enum):
+        value = value.value
+    if isinstance(value, PurePath):
+        value = str(value)
+    return value if isinstance(value, str) else repr(value)
 
 
 def _without_none(annotation: Any) -> tuple[Any, bool]:

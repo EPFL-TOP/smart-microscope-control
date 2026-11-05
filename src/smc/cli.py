@@ -101,13 +101,18 @@ from smc.plugins import discover as discover_plugins
 from smc.plugins import load as load_plugin
 from smc.plugins.api import P
 from smc.plugins.presets import (
+    Preset,
     PresetError,
+    PresetExistsError,
+    check_name,
     check_preset,
     command_pairs,
     list_presets,
     load_preset,
     preset_dirs,
+    preset_from_document,
     registered_plate,
+    save_preset,
 )
 from smc.run import RunDocument, RunDocumentError, StageRecord, StageStatus
 
@@ -2372,16 +2377,90 @@ def presets_show(
         stand = loaded.microscope.name
         check = check_preset(found, models, stand=stand, registered=registered)
         _say(f"preset {found.name}  {found.path}")
-        _say(f"stand: {preset.stand or '-'}")
-        _say(f"plate: {preset.plate or '-'}")
-        _say(f"wells: {preset.wells or '-'}")
-        _say(f"saved_utc: {preset.saved_utc.isoformat() if preset.saved_utc else '-'}")
-        for plugin_name, pairs in preset.params.items():
-            _say(f"{plugin_name}: {' '.join(pairs)}")
+        _say_preset_lines(preset)
         for mismatch in check.mismatches:
             _say(mismatch)
         if not check.mismatches:
             _say(f"no mismatch on {stand}")
+
+
+def _say_preset_lines(preset: Preset) -> None:
+    """What a preset holds, one field per line: ``show`` and ``save`` print it the same way."""
+    _say(f"stand: {preset.stand or '-'}")
+    _say(f"plate: {preset.plate or '-'}")
+    _say(f"wells: {preset.wells or '-'}")
+    _say(f"saved_utc: {preset.saved_utc.isoformat() if preset.saved_utc else '-'}")
+    for plugin_name, pairs in preset.params.items():
+        _say(f"{plugin_name}: {' '.join(pairs)}")
+
+
+@presets_app.command("save")
+def presets_save(
+    ctx: typer.Context,
+    name: Annotated[
+        str,
+        typer.Argument(
+            metavar="NAME",
+            help="The preset's name: 1 to 64 lower-case letters, digits, - and _.",
+        ),
+    ],
+    run_doc: Annotated[
+        str,
+        typer.Option(
+            "--run-doc",
+            help="The run document whose finished stages give the preset: their "
+            "plate, wells and the parameters that differ from the plugins' defaults.",
+        ),
+    ],
+    profile: ProfileOption = DEMO_NAME,
+    overwrite: Annotated[
+        bool,
+        typer.Option(
+            "--overwrite",
+            help="Replace a preset of that name; it is refused otherwise.",
+        ),
+    ] = False,
+) -> None:
+    """Save what a run document's finished stages used as a preset.
+
+    Written beside the profile (smc presets list shows where). A stage that did
+    not finish, a position (refs, walls, the search's centre) and a value equal
+    to its plugin's default are left out; whatever else is left out is printed
+    after the preset. Opens no stand and moves nothing.
+    """
+    try:
+        check_name(name)
+    except PresetError as exc:
+        raise typer.BadParameter(str(exc), param_hint="NAME") from None
+    with _Reported(ctx):
+        loaded = Profile.load(profile)
+        document = RunDocument.load(Path(run_doc))
+        models = {
+            plugin_name: entry.plugin.Params
+            for plugin_name, entry in discover_plugins().plugins.items()
+        }
+        try:
+            made = preset_from_document(
+                document,
+                models,
+                stand=loaded.microscope.name,
+                saved_utc=datetime.now(timezone.utc).replace(microsecond=0),
+            )
+        except PresetError as exc:
+            _fail(str(exc))
+            raise typer.Exit(code=_EXIT_REFUSED) from None
+        try:
+            path = save_preset(name, made.preset, loaded, overwrite=overwrite)
+        except PresetExistsError as exc:
+            _fail(f"{exc}; pass --overwrite to replace it")
+            raise typer.Exit(code=_EXIT_REFUSED) from None
+        except PresetError as exc:
+            _fail(str(exc))
+            raise typer.Exit(code=_EXIT_ERROR) from None
+        _say(f"saved {name} to {path}")
+        _say_preset_lines(made.preset)
+        for note in made.notes:
+            _say(note)
 
 
 #: What the operator types to get the page's dependencies (FM-36: the brackets are
