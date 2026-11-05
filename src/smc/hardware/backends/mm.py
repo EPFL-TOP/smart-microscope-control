@@ -558,6 +558,13 @@ def _yes_no(value: bool | None) -> str:
     return "unknown" if value is None else ("yes" if value else "no")
 
 
+def _joined(items: Sequence[str]) -> str:
+    """``A``, ``A and B``, ``A, B and C``: a list for a sentence."""
+    if len(items) <= 1:
+        return "".join(items)
+    return f"{', '.join(items[:-1])} and {items[-1]}"
+
+
 def _named(failure: BaseException) -> str:
     """``failure`` for a message: an interrupt's ``str()`` is empty, so its type names it.
 
@@ -685,6 +692,10 @@ class _EngageGuard:
 
     The band is ``[min(z_start, z_held) - E, max(z_start, z_held) + E]``: a
     relock brings Z back to where PFS held it, so the way back is inside it.
+    A first lock from the offset's floor (m2 §12.10 D5) has a band open on
+    ``open_side``, the side away from the sample: the floor's plane lies
+    there, and a drop to it is what was asked; only Z toward the sample is
+    bounded, by ``E``, and the soft limits still bound both sides.
     The window is settled once every Z read of the last ``settle_s`` lies
     within ``tolerance_um`` of each other, still locked; a lock lost meanwhile
     starts it again at the next locked read.
@@ -706,14 +717,21 @@ class _EngageGuard:
         settle_s: float,
         tolerance_um: float,
         limit_s: float,
+        open_side: Literal["below", "above"] | None = None,
     ) -> None:
         self._autofocus = autofocus
         self._focus = focus
         self.z_start_um = z_start_um
         self._limits = limits_um
         self._excursion_um = excursion_um
+        #: The side a first lock leaves unbounded; ``None``: not a first lock.
+        self.open_side = open_side
         self._band: tuple[float, float] | None = None
-        if excursion_um is not None:
+        if excursion_um is not None and open_side == "below":
+            self._band = (-math.inf, z_start_um + excursion_um)
+        elif excursion_um is not None and open_side == "above":
+            self._band = (z_start_um - excursion_um, math.inf)
+        elif excursion_um is not None:
             held = z_start_um if z_held_um is None else z_held_um
             self._band = (
                 min(z_start_um, held) - excursion_um,
@@ -748,13 +766,34 @@ class _EngageGuard:
         """The give-up's reason, for its log line."""
         return "a Z read that failed" if self.failure else "Z out of its bound"
 
+    @property
+    def first_lock(self) -> bool:
+        """Whether it guards a first lock from the offset's floor (m2 §12.10)."""
+        return self.open_side is not None
+
+    @property
+    def toward_sample(self) -> bool:
+        """Whether the read that tripped it lies on the bounded side of ``z_start``.
+
+        A first lock's trip there means the floor's plane was not away from
+        the sample; on the open side, only a soft limit can trip it, and the
+        floor's plane lies past it (m2 §12.10.5).
+        """
+        z_um = self.tripped_z_um
+        if z_um is None or self.open_side is None:
+            return False
+        if self.open_side == "below":
+            return z_um > self.z_start_um
+        return z_um < self.z_start_um
+
     def what_happened(self) -> str:
-        """The first clause of the error (m2 §12.5)."""
+        """The first clause of the error (m2 §12.5, §12.10.5)."""
+        engaged = "engaged from the offset's floor" if self.first_lock else "engaged"
         if self.tripped_z_um is None:
-            return f"Z could not be read while it engaged ({self.failure})"
+            return f"Z could not be read while it {engaged} ({self.failure})"
         return (
             f"Z went from {self.z_start_um:.2f} µm to {self.tripped_z_um:.2f} µm "
-            f"while it engaged, {self.why}"
+            f"while it {engaged}, {self.why}"
         )
 
     def is_busy(self) -> bool:
@@ -808,9 +847,12 @@ class _EngageGuard:
         if limits is not None and not limits[0] <= z_um <= limits[1]:
             self.why = f"outside the soft limits [{limits[0]:g}, {limits[1]:g}] µm"
         elif band is not None and not band[0] <= z_um <= band[1]:
+            where = (
+                "toward the sample" if self.first_lock else "beyond where it started"
+            )
             self.why = (
                 f"more than [safety] max_engage_excursion_um ({self._excursion_um:g} "
-                f"µm) beyond where it started"
+                f"µm) {where}"
             )
         else:
             return z_um
@@ -1360,14 +1402,26 @@ class MMAutofocus:
         an offset not seen locked with this objective (D1). While it waits, Z
         out of the soft limits or the band switches it off (D2).
 
+        One exception to D1, here and not in the relocks: a *first lock from
+        below* (m2 §12.10 D4). An unseen offset at or below the floor (the
+        lower bound of ``[safety] autofocus_offset_soft_limits``), with the
+        autofocus off, engages when the profile also gives
+        ``max_engage_excursion_um`` and ``z_away_from_sample`` and there is a
+        focus drive to read: under lock a larger offset gives a larger Z, so
+        the floor's plane lies away from a sample focused by eye. Its band is
+        open on that side and bounds Z toward the sample only (D5).
+
         Raises:
             ValueError: ``timeout_s`` is not finite or not in (0, 600] s, or
                 not above ``settle_s``; nothing was sent.
             SafetyRefusedError: Z is outside the soft limits, or the offset was
-                not seen locked on a declared stand (switched off first if it
-                was searching); nothing else was sent. Not forceable.
+                not seen locked on a declared stand and is not a first lock
+                (switched off first if it was on); nothing else was sent. The
+                message says how to lock it from below, or what the profile
+                lacks for it. Not forceable.
             AutofocusExcursionError: Z left its bound while it engaged; it was
-                switched off, and its offset is no longer a seen one.
+                switched off, and its offset is no longer a seen one. During a
+                first lock: Z went toward the sample, or past a soft limit.
             DeviceTimeoutError: No lock, and it could not be switched off (or
                 still reads on); or Z left its bound and it could not be
                 switched off. The wait stays registered as a motion, so the
@@ -1388,7 +1442,9 @@ class MMAutofocus:
 
         def run() -> bool:
             with self._ended_by_a_z_stop(description, suspended=False):
-                return self._engage(description, limit_s, assumed).locked
+                return self._engage(
+                    description, limit_s, assumed, first_lock=True
+                ).locked
 
         # Its own compound, so that the link and the check for a Z stop made
         # while it waited for the lock have a record to compare against.
@@ -1401,12 +1457,15 @@ class MMAutofocus:
         assumed: bool,
         *,
         z_held: float | None = None,
+        first_lock: bool = False,
     ) -> _Lock:
         """``engage``'s action, also run nested by the relocks; how the wait ended.
 
         Its step runs the engage check before the switch-on (m2 §12.4), and
         the wait polls the Z guard when there is one: ``z_held`` is where PFS
-        held Z before a relock's Z move, which widens the band.
+        held Z before a relock's Z move, which widens the band. Only
+        ``engage()`` passes ``first_lock``: a relock brings Z back to where
+        PFS held it, so an unseen offset there is a lost lock (m2 §12.10 D4).
         """
         label = self._label
         switch_off_failures: list[Exception] = []
@@ -1455,10 +1514,15 @@ class MMAutofocus:
         def step() -> Step[_AfterWait]:
             nonlocal guard
             self._check_slot()  # in dry-run too
-            guard = self._check_engage(z_held, limit_s)  # in dry-run too
+            # In dry-run too.
+            guard = self._check_engage(z_held, limit_s, first_lock=first_lock)
+            send = self._send_on
+            seen = None if guard is None else guard.seen
+            if guard is not None and guard.first_lock and seen is not None:
+                send = functools.partial(self._send_on_for_a_first_lock, seen[1])
             return Step(
                 log=description,
-                send=self._send_on,
+                send=send,
                 readback=after_wait,
                 dry_result="locked",
             )
@@ -1560,8 +1624,29 @@ class MMAutofocus:
             or self._settle_s > 0
         )
 
+    def _new_guard(
+        self,
+        focus: ZStage,
+        z_start: float,
+        z_held: float | None,
+        limit_s: float,
+        open_side: Literal["below", "above"] | None = None,
+    ) -> _EngageGuard:
+        return _EngageGuard(
+            self,
+            focus,
+            z_start_um=z_start,
+            z_held_um=z_held,
+            limits_um=self._safety.z_soft_limits_um,
+            excursion_um=self._safety.max_engage_excursion_um,
+            settle_s=self._settle_s,
+            tolerance_um=self._settle_tolerance_um,
+            limit_s=limit_s,
+            open_side=open_side,
+        )
+
     def _check_engage(
-        self, z_held: float | None, limit_s: float
+        self, z_held: float | None, limit_s: float, *, first_lock: bool = False
     ) -> _EngageGuard | None:
         """Refuse an engage before the switch-on, and build its guard (m2 §12.4).
 
@@ -1573,6 +1658,15 @@ class MMAutofocus:
         propagates with nothing sent, since it decides whether Z moves
         (FM-19). Neither refusal can be forced: a forced engage of an unknown
         offset at 40x is the crash itself (m2 §12.2 D1).
+
+        With ``first_lock`` (``engage()`` only), an unseen offset at or below
+        the floor engages as a first lock from below (m2 §12.10 D4), under a
+        band open away from the sample (D5), when nothing it needs is missing
+        and the autofocus reads off: ``z_start`` must be where the operator
+        focused, not where a search has already taken Z. Otherwise the refusal
+        says how to lock from below, or what the profile lacks for it; it
+        never names the stand's own controls, whose button jumped at an unseen
+        offset (#331).
         """
         label = self._label
         focus = self._focus()
@@ -1592,17 +1686,7 @@ class MMAutofocus:
                     f"[{limits[0]:g}, {limits[1]:g}] µm",
                     label=label,
                 )
-            guard = _EngageGuard(
-                self,
-                focus,
-                z_start_um=z_start,
-                z_held_um=z_held,
-                limits_um=limits,
-                excursion_um=self._safety.max_engage_excursion_um,
-                settle_s=self._settle_s,
-                tolerance_um=self._settle_tolerance_um,
-                limit_s=limit_s,
-            )
+            guard = self._new_guard(focus, z_start, z_held, limit_s)
         if not self._declared:
             return guard
         self._read_locked()  # the operator's lock, if it holds now, is seen
@@ -1624,6 +1708,28 @@ class MMAutofocus:
                 _named(exc),
             )
             on = True
+        missing = self._first_lock_missing(focus)
+        offset_limits = self._safety.autofocus_offset_soft_limits
+        direction = self._safety.z_away_from_sample
+        if (
+            first_lock
+            and not missing
+            and not on
+            and offset_limits is not None
+            and offset <= offset_limits[0]
+            # Always, with a focus drive and E: for the type checker.
+            and focus is not None
+            and guard is not None
+        ):
+            guard = self._new_guard(
+                focus,
+                guard.z_start_um,
+                None,
+                limit_s,
+                open_side="below" if direction == "decreasing" else "above",
+            )
+            guard.seen = (objective, offset)
+            return guard
         unit = f" {self._offset_unit}" if self._offset_unit else ""
         with_objective = "" if objective is None else f" with objective {objective!r}"
         known = ", ".join(f"{value:g}" for value in sorted(seen)) or "none"
@@ -1645,12 +1751,56 @@ class MMAutofocus:
                     f"it may still move Z: stop() and check the stand, then resume()"
                 ) from exc
         switched = "; it was on and searching, so it was switched off" if on else ""
-        raise _EngageRefusedError(
-            f"{unseen}{switched}. Focus on the sample, switch {label} on with the "
-            f"stand's own controls and set the offset until the sample is sharp; "
-            f"smc then reads the lock",
-            label=label,
+        if missing or offset_limits is None:
+            advice = (
+                f"A first lock from below (m2 §12.10) needs {_joined(missing)}, which "
+                f"this stand does not have; until then smc engages only at an offset "
+                f"it has read locked"
+            )
+        else:
+            advice = (
+                f"Lock it from below (m2 §12.10): with {label} off, focus on the "
+                f"sample by eye, set the offset to its floor "
+                f"({offset_limits[0]:g}{unit}), engage, then turn the knob with "
+                f"{label} on until the sample is sharp; smc then reads the lock"
+            )
+        raise _EngageRefusedError(f"{unseen}{switched}. {advice}", label=label)
+
+    def _first_lock_missing(self, focus: ZStage | None) -> list[str]:
+        """What a first lock from below needs and this stand lacks, in the decided order.
+
+        Each is what lets the guard bound the case where the floor's plane is
+        not away from the sample (m2 §12.10 D4): the floor itself, a Z to read,
+        a band toward the sample, and which side that is.
+        """
+        safety = self._safety
+        needs = (
+            (
+                safety.autofocus_offset_soft_limits is None,
+                "[safety] autofocus_offset_soft_limits",
+            ),
+            (focus is None, "a focus drive to read"),
+            (
+                safety.max_engage_excursion_um is None,
+                "[safety] max_engage_excursion_um",
+            ),
+            (safety.z_away_from_sample is None, "[safety] z_away_from_sample"),
         )
+        return [name for lacking, name in needs if lacking]
+
+    def _send_on_for_a_first_lock(self, offset: float) -> None:
+        """The switch-on of a first lock, after the line that says what Z may do."""
+        unit = f" {self._offset_unit}" if self._offset_unit else ""
+        excursion = self._safety.max_engage_excursion_um  # never None for a first lock
+        logger.info(
+            "autofocus %s: a first lock from the offset's floor (%s%s, m2 §12.10): Z "
+            "may move away from the sample, and at most %s µm toward it",
+            self._label,
+            f"{offset:g}",
+            unit,
+            "an unknown number of" if excursion is None else f"{excursion:g}",
+        )
+        self._send_on()
 
     def _guard_ended(
         self, guard: _EngageGuard, switch_off_failures: list[Exception]
@@ -1688,6 +1838,31 @@ class MMAutofocus:
             label,
             z_um,
         )
+        guards = (
+            f"The guard reads Z every {POLL_INTERVAL_S * 1000:g} ms: it stops {label} "
+            f"once a jump is read, it does not prevent one"
+        )
+        if guard.first_lock and guard.toward_sample:
+            # The floor's plane was not away from the sample (m2 §12.10.5): the
+            # operator had not focused first, or the sign is wrong here.
+            raise AutofocusExcursionError(
+                f"autofocus {label}: {what}; it was switched off. The floor's plane "
+                f"is not below where Z started: focus on the sample by eye before a "
+                f"first lock; if Z was already there, the floor is not below this "
+                f"objective's focus (m2 §12.10), so do not try a first lock with it "
+                f"again. {guards}",
+                guard.z_start_um,
+                z_um,
+            )
+        if guard.first_lock:
+            raise AutofocusExcursionError(
+                f"autofocus {label}: {what}; it was switched off. The floor's plane "
+                f"lies past the Z soft limits, away from the sample: raise the floor "
+                f"([safety] autofocus_offset_soft_limits) by steps until a first "
+                f"lock stays inside them (m2 §12.10.7). {guards}",
+                guard.z_start_um,
+                z_um,
+            )
         again = (
             f"; on this stand, lock {label} on the sample at the stand before "
             f"engaging again"
@@ -1985,6 +2160,48 @@ class MMAutofocus:
             timeout_s=_core_timeout(timed),
         )
 
+    def _refuse_offset_move_under_autofocus(self) -> None:
+        """On a declared stand, refuse an offset move while on, unless locked with a factor (m2 §12.10 D6).
+
+        On and searching, a new offset is an engage at an unseen offset by
+        another route: PFS drives Z to its plane the moment it finds the
+        reference. Locked with no factor, the Z it implies is unknown. Off, the
+        offset moves no Z (m2 §4.5), and the write is free. A read that fails
+        refuses with its cause: unknown counts as on (FM-19). Inside the
+        action's step, before anything is sent, in dry-run too (FM-90).
+        """
+        if not self._declared:
+            return
+        label = self._label
+        self._check_slot()  # a slot naming another device refuses as such (FM-87)
+        try:
+            if not self._read_engaged():
+                return
+            locked = self._read_locked()
+            objective = self._objective_label() if locked else None
+        except Exception as exc:
+            state = f"of unknown state ({_named(exc)})"
+        else:
+            if not locked:
+                state = "on and not locked"
+            elif objective is None:
+                state = (
+                    "locked, with no [autofocus.offset_per_um] factor, since no "
+                    "objective turret is resolved"
+                )
+            elif objective not in self._offset_per_um:
+                state = (
+                    f"locked, with no [autofocus.offset_per_um] factor for objective "
+                    f"{objective!r}"
+                )
+            else:
+                return
+        raise SafetyRefusedError(
+            f"autofocus {label}: offset not moved: it is {state}, and on this stand "
+            f"it drives Z to the plane the offset names (m2 §12.10). Switch it off "
+            f"to set the offset (that moves no Z), or turn the knob while it is locked"
+        )
+
     def _check_implied_z(self, target: float, current: float | None = None) -> None:
         """While locked, refuse an offset ``target`` that would drive Z past its soft limits (FM-90).
 
@@ -2020,9 +2237,15 @@ class MMAutofocus:
         bound it. With it on, a ``ZStage.stop()`` ends the move too
         (``_linked_offset_move``).
 
+        On a stand that declares ``engage_drives_z_to_offset``, it is refused
+        while the autofocus is on, unless it is locked and the profile has a
+        factor for the current objective (m2 §12.10 D6): off, the write is free.
+
         Raises:
             SafetyRefusedError: Outside the offset's soft limits, or, locked,
-                past the Z soft limits; nothing was sent.
+                past the Z soft limits; or, on a declared stand, on and not
+                locked, locked with no factor, or of unknown state; nothing was
+                sent. Not forceable.
             MotionStoppedError: The offset device was stopped; or, with the
                 autofocus on, ``ZStage.stop()`` was called (named ``z
                 <label>``): during the move, it was switched off and the
@@ -2050,12 +2273,13 @@ class MMAutofocus:
         soft limits, which cannot be forced, and, locked, the Z it implies
         against the Z soft limits, as for ``set_offset_native``. With the
         autofocus on, a ``ZStage.stop()`` ends the move too, as for
-        ``set_offset_native``.
+        ``set_offset_native``. On a declared stand, D6 refuses it as it does
+        ``set_offset_native`` (m2 §12.10).
 
         Raises:
             SafetyRefusedError: The jog is too large (forceable); the target
                 is outside the offset's soft limits or, locked, past the Z soft
-                limits (not forceable); nothing was sent.
+                limits, or D6 refuses it (not forceable); nothing was sent.
             MotionStoppedError: As for ``set_offset_native``.
             HardwareError: As for ``set_offset_native``.
         """
@@ -2063,7 +2287,8 @@ class MMAutofocus:
         self._safety.check_offset_jog_native(delta, force=force)
         description = self._describe_move_by(delta)
         return self._linked_offset_move(
-            description, lambda: self._offset_by(description, delta)
+            description,
+            lambda: self._offset_by(description, delta, check_autofocus=True),
         )
 
     def _describe_move_to(self, value: float) -> str:
@@ -2076,18 +2301,23 @@ class MMAutofocus:
         """``set_offset_native``'s action, not linked to the Z stop; its caller guarded ``value``."""
 
         def step() -> Step[float]:
+            self._refuse_offset_move_under_autofocus()
             self._check_implied_z(value)
             return self._offset_step(description, value)
 
         return self._offset_move(description, step)
 
-    def _offset_by(self, description: str, delta: float) -> float:
+    def _offset_by(
+        self, description: str, delta: float, *, check_autofocus: bool = False
+    ) -> float:
         """``offset_by_native``'s action, not linked: ``focus_by_um`` holds its own link.
 
         A second link, nested in ``focus_by_um``'s, would send the switch-off
         and the offset device's stop twice on one Z stop. Its caller ran the
         jog guard; the target's guards run here, on the anchor read inside
-        the action.
+        the action. ``check_autofocus`` (``offset_by_native`` only) adds D6's
+        refusal (m2 §12.10): ``focus_by_um`` has read locked and found a
+        factor already.
         """
         unit = self._unit()
 
@@ -2095,6 +2325,8 @@ class MMAutofocus:
             here = self._read_offset()
             value = here + delta
             self._safety.check_offset_target_native(value)
+            if check_autofocus:
+                self._refuse_offset_move_under_autofocus()
             self._check_implied_z(value, here)
             return self._offset_step(
                 f"autofocus_offset: move_by {delta} {unit} to {value} {unit}", value
@@ -2266,7 +2498,13 @@ class MMAutofocus:
             f"autofocus {self._label} is locked, so focus_by_um() would move its "
             f"offset, but"
         )
-        instead = "or use offset_by_native() in the offset's own units"
+        # On a declared stand, offset_by_native() is refused there too (m2
+        # §12.10 D6): the knob, under the operator's eyes, is the way.
+        instead = (
+            "or turn the knob while it is locked (m2 §12.10)"
+            if self._declared
+            else "or use offset_by_native() in the offset's own units"
+        )
         if objective is None:
             raise SafetyRefusedError(
                 f"{locked} no objective turret is resolved, so no [autofocus] "

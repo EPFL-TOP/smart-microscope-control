@@ -971,6 +971,132 @@ def test_offset_change_with_pfs_on_but_not_locked_is_not_held_to_the_z_limits() 
         assert stand.af.set_offset_native(7796.0) == 7796.0
 
 
+# --- D6: an offset move on a declared stand (m2 §12.10) --------------------------
+
+_D6 = (
+    "autofocus PFS: offset not moved: it is {state}, and on this stand it drives Z "
+    "to the plane the offset names (m2 §12.10). Switch it off to set the offset (that "
+    "moves no Z), or turn the knob while it is locked"
+)
+
+
+def _declared_offset(factors: dict[str, float] | None = None) -> Profile:
+    return _profile(
+        autofocus={"engage_drives_z_to_offset": True, "offset_per_um": factors or {}},
+        safety=_Z_LIMITS,
+    )
+
+
+def _move_offset(af: Autofocus, how: str) -> float:
+    """A small offset move, 4 units down, absolute or relative."""
+    return af.set_offset_native(7796.0) if how == "set" else af.offset_by_native(-4.0)
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["live", "dry"])
+@pytest.mark.parametrize("how", ["set", "by"])
+def test_an_offset_move_on_a_declared_stand_while_searching_is_refused_with_nothing_sent(
+    how: str, dry_run: bool
+) -> None:
+    # Searching, a new offset is an engage at an unseen offset by another route.
+    with _ti2(_declared_offset(), dry_run=dry_run, core=_at_offset_and_z()) as stand:
+        stand.engage_directly(lockable=False)
+        with pytest.raises(SafetyRefusedError) as refused:
+            _move_offset(stand.af, how)
+        assert str(refused.value) == _D6.format(state="on and not locked")
+        assert refused.value.how_to_force == ""
+        assert stand.core.log == []
+        assert stand.af.offset_native() == 7800.0
+
+
+@pytest.mark.parametrize("how", ["set", "by"])
+def test_an_offset_move_on_a_declared_stand_locked_without_a_factor_is_refused(
+    how: str,
+) -> None:
+    core = _at_offset_and_z()
+    core.setState("Nosepiece", 2)  # the 40x, with a factor for the 4x only
+    with _ti2(_declared_offset({"4x": -2.0}), core=core) as stand:
+        stand.engage_directly()
+        with pytest.raises(SafetyRefusedError) as refused:
+            _move_offset(stand.af, how)
+        assert str(refused.value) == _D6.format(
+            state="locked, with no [autofocus.offset_per_um] factor for objective '40x'"
+        )
+        assert stand.core.log == []
+
+
+def test_an_offset_move_on_a_declared_stand_locked_without_a_turret_is_refused() -> (
+    None
+):
+    with _ti2(_declared_offset({"4x": -2.0}), core=_at_offset_and_z(turret=False)) as (
+        stand
+    ):
+        stand.engage_directly()
+        with pytest.raises(SafetyRefusedError) as refused:
+            stand.af.set_offset_native(7796.0)
+        assert str(refused.value) == _D6.format(
+            state="locked, with no [autofocus.offset_per_um] factor, since no "
+            "objective turret is resolved"
+        )
+        assert stand.core.log == []
+
+
+@pytest.mark.parametrize("how", ["set", "by"])
+def test_an_offset_move_on_a_declared_stand_with_pfs_off_is_sent_and_moves_no_z(
+    how: str,
+) -> None:
+    with _ti2(_declared_offset(), core=_at_offset_and_z()) as stand:
+        assert _move_offset(stand.af, how) == 7796.0
+        assert stand.core.log == ["setPosition('PFSOffset', 7796.0)"]
+        assert stand.z.position_um() == 9.0
+
+
+def test_an_offset_move_on_a_declared_stand_locked_with_a_factor_gets_the_implied_z_check() -> (
+    None
+):
+    with _ti2(_declared_offset({"4x": -2.0}), core=_at_offset_and_z()) as stand:
+        stand.engage_directly()
+        with pytest.raises(SafetyRefusedError) as refused:
+            stand.af.set_offset_native(7796.0)  # Z 11 µm, past the 10 µm limit
+        assert refused.value.reason == (
+            "Z target 11.0 µm is outside the soft limits [-10.0, 10.0] µm; change "
+            "[safety] in the profile if the limits are wrong"
+        )
+        assert stand.core.log == []
+        assert stand.af.offset_by_native(4.0) == 7804.0  # Z 7 µm
+        assert stand.core.log == ["setPosition('PFSOffset', 7804.0)"]
+
+
+@pytest.mark.parametrize("how", ["set", "by"])
+def test_an_offset_move_on_an_undeclared_stand_while_searching_is_sent_as_before(
+    how: str,
+) -> None:
+    with _ti2(_profile(safety=_Z_LIMITS), core=_at_offset_and_z()) as stand:
+        stand.engage_directly(lockable=False)
+        assert _move_offset(stand.af, how) == 7796.0
+        assert stand.core.log == ["setPosition('PFSOffset', 7796.0)"]
+
+
+def test_an_offset_move_whose_state_read_fails_is_refused_with_nothing_sent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Unknown counts as on (FM-19). A fresh error at each call: one kept and
+    # raised twice would grow its traceback (FM-98's test hazard).
+    with _ti2(_declared_offset(), core=_at_offset_and_z()) as stand:
+
+        def unreadable() -> bool:
+            raise RuntimeError("PFS: no answer")
+
+        monkeypatch.setattr(stand.core, "isContinuousFocusEnabled", unreadable)
+        with pytest.raises(SafetyRefusedError) as refused:
+            stand.af.set_offset_native(7796.0)
+        assert str(refused.value) == _D6.format(
+            state="of unknown state (autofocus: isContinuousFocusEnabled() failed "
+            "(PFS: no answer); check the device: power, cable, another program "
+            "holding it)"
+        )
+        assert stand.core.log == []
+
+
 # --- focus_by_um (m2 §3.5) ---------------------------------------------------
 
 
@@ -1051,6 +1177,33 @@ def test_focus_by_while_locked_without_a_factor_for_this_objective_is_refused() 
         )
         assert refused.value.how_to_force == ""
         assert stand.core.log == []
+
+
+def test_focus_by_um_without_a_factor_on_a_declared_stand_names_the_knob() -> None:
+    # offset_by_native() is refused there too (m2 §12.10 D6).
+    profile = _factor({"40x": 1.0}, engage_drives_z_to_offset=True)
+    with _ti2(profile, core=_at_offset(7800.0)) as stand:
+        stand.engage_directly()
+        with pytest.raises(SafetyRefusedError) as refused:
+            stand.af.focus_by_um(2.0)
+        assert refused.value.reason == (
+            "autofocus PFS is locked, so focus_by_um() would move its offset, but "
+            "the profile has no [autofocus] offset_per_um factor for objective "
+            "'4x'; measure it with the autofocus locked and add it, or turn the "
+            "knob while it is locked (m2 §12.10)"
+        )
+        assert stand.core.log == []
+
+
+def test_focus_by_um_locked_with_a_factor_still_moves_the_offset_on_a_declared_stand() -> (
+    None
+):
+    # It read locked and found a factor: D6 has nothing to add (m2 §12.10.4).
+    profile = _factor({"4x": -3.0}, engage_drives_z_to_offset=True)
+    with _ti2(profile, core=_at_offset(7800.0)) as stand:
+        stand.engage_directly()
+        assert stand.af.focus_by_um(2.0) == FocusStep("offset", 0.0, 7794.0)
+        assert stand.core.log == ["setPosition('PFSOffset', 7794.0)", ON]
 
 
 def test_focus_by_without_an_objective_turret_is_refused_while_locked() -> None:

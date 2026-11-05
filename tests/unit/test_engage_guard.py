@@ -65,10 +65,20 @@ LIMITS = {"z_soft_limits_um": (10.0, 4350.0), "max_engage_excursion_um": 50.0}
 UNSEEN = (
     "autofocus PFS: not engaged: on this stand engaging drives Z to the plane the "
     "offset names ([autofocus] engage_drives_z_to_offset, m2 §12), and offset "
-    "{offset} has not been seen locked with objective {objective!r} since the "
-    "stand was opened (seen: {seen}){switched}. Focus on the sample, switch PFS on "
-    "with the stand's own controls and set the offset until the sample is sharp; "
-    "smc then reads the lock"
+    "{offset}{unit} has not been seen locked with objective {objective!r} since the "
+    "stand was opened (seen: {seen}){switched}. {advice}"
+)
+# The advice of m2 §12.10.5: it never names the stand's button (#331).
+NO_FIRST_LOCK = (
+    "A first lock from below (m2 §12.10) needs {missing}, which this stand does not "
+    "have; until then smc engages only at an offset it has read locked"
+)
+# What _guarded's profile lacks: it has a focus drive and E.
+LACKS = "[safety] autofocus_offset_soft_limits and [safety] z_away_from_sample"
+FROM_BELOW = (
+    "Lock it from below (m2 §12.10): with PFS off, focus on the sample by eye, set "
+    "the offset to its floor (5000 PFSOffset units), engage, then turn the knob with "
+    "PFS on until the sample is sharp; smc then reads the lock"
 )
 SWITCHED = "; it was on and searching, so it was switched off"
 OUTSIDE = "outside the soft limits [10, 4350] µm"
@@ -88,9 +98,16 @@ def _unseen(
     objective: str = "10x",
     seen: str = "none",
     switched: str = "",
+    advice: str = NO_FIRST_LOCK.format(missing=LACKS),
+    unit: str = "",
 ) -> str:
     return UNSEEN.format(
-        offset=f"{offset:g}", objective=objective, seen=seen, switched=switched
+        offset=f"{offset:g}",
+        unit=unit,
+        objective=objective,
+        seen=seen,
+        switched=switched,
+        advice=advice,
     )
 
 
@@ -470,7 +487,7 @@ def test_an_unseen_offset_whose_switch_off_fails_says_it_may_still_move_z(
         with pytest.raises(HardwareError) as stuck:
             stand.af.engage()
         reason = _unseen().removeprefix("autofocus PFS: not engaged: ")
-        reason = reason.split(". Focus on the sample")[0]
+        reason = reason.split(". A first lock from below")[0]
         assert not isinstance(stuck.value, SafetyRefusedError)
         assert str(stuck.value) == (
             f"autofocus PFS: not engaged: {reason}; it was on and searching, and it "
@@ -667,3 +684,303 @@ def test_disengage_during_the_settle_window_cancels_the_engage() -> None:
         caller.join()
         assert isinstance(caller.error, MotionStoppedError), caller.error
         assert stand.af.is_engaged() is False
+
+
+# --- D4, D5: a first lock from below (m2 §12.10) ----------------------------------
+#
+# Unless a test says otherwise: declared, the offset's soft limits [5000, 12000]
+# (the floor 5000), z_away_from_sample "decreasing", and PFS drives Z to
+# Z0 + (offset - 7927) / 6 once locked: the floor's plane is 3781.61 µm, 487.8 µm
+# below Z0, more than E (measured on main 43b8e79, the plan of #331).
+
+FLOOR = 5000.0
+FLOOR_PLANE = Z0 + (FLOOR - SEEN_OFFSET) / 6.0
+UNIT = " PFSOffset units"
+TOWARD = (
+    "autofocus PFS: Z went from {z_start:.2f} µm to {z_um:.2f} µm while it engaged "
+    "from the offset's floor, more than [safety] max_engage_excursion_um (50 µm) "
+    "toward the sample; it was switched off. The floor's plane is not below where Z "
+    "started: focus on the sample by eye before a first lock; if Z was already "
+    "there, the floor is not below this objective's focus (m2 §12.10), so do not "
+    "try a first lock with it again. The guard reads Z every 10 ms: it stops PFS "
+    "once a jump is read, it does not prevent one"
+)
+
+
+def _first_lock(*, declared: bool = True, **safety: Any) -> Profile:
+    return _profile(
+        autofocus={
+            "settle_s": 0.05,
+            "settle_tolerance_um": 0.5,
+            "engage_drives_z_to_offset": declared,
+            "lock_timeout_s": LOCK_TIMEOUT_S,
+            "offset_unit": "PFSOffset units",
+        },
+        safety={
+            **LIMITS,
+            "autofocus_offset_soft_limits": (FLOOR, 12000.0),
+            "z_away_from_sample": "decreasing",
+            **safety,
+        },
+    )
+
+
+def _plane_follows_the_offset(stand: Stand) -> None:
+    """PFS, once locked, drives Z to the plane the offset now set names."""
+    core = stand.core
+    core.autofocus_target_um = lambda: (
+        Z0 + (core.getPosition("PFSOffset") - SEEN_OFFSET) / 6.0
+    )
+
+
+def _unseen_at(offset: float = FLOOR, **kwargs: Any) -> str:
+    return _unseen(offset, unit=UNIT, **kwargs)
+
+
+def test_a_first_lock_at_the_floor_drops_z_away_from_the_sample_and_returns_true(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # D2's symmetric band would trip on this drop (measured on main): only the
+    # one-sided band lets it through.
+    with _stand(_first_lock(), offset=FLOOR) as stand:
+        _plane_follows_the_offset(stand)
+        with caplog.at_level(logging.INFO, logger="smc.hardware.backends.mm"):
+            assert stand.af.engage() is True
+        assert stand.z.position_um() == FLOOR_PLANE
+        assert Z0 - FLOOR_PLANE > 50.0
+        assert stand.core.log == [ON]
+        assert (
+            "autofocus PFS: a first lock from the offset's floor (5000 PFSOffset "
+            "units, m2 §12.10): Z may move away from the sample, and at most 50 µm "
+            "toward it"
+        ) in caplog.messages
+
+
+def test_a_first_lock_makes_the_floor_a_seen_offset() -> None:
+    # The relock never takes a first lock (the test below): it engages at the
+    # floor only because the first lock's lock was read, and so seen.
+    with _stand(_first_lock(), offset=FLOOR) as stand:
+        _plane_follows_the_offset(stand)
+        assert stand.af.engage() is True
+        stand.core.log.clear()
+        assert stand.z.move_by_um(1.0) == FLOOR_PLANE + 1.0
+        assert stand.core.log == [
+            OFF,
+            f"setPosition('ZDrive', {FLOOR_PLANE + 1.0})",
+            ON,
+        ]
+        assert stand.af.is_locked() is True
+
+
+def test_the_relock_at_an_unseen_offset_at_the_floor_raises_autofocus_lost_error() -> (
+    None
+):
+    with _stand(_first_lock(), offset=FLOOR) as stand:
+        stand.engage_directly(lockable=False)  # searching: no lock read, none seen
+        with pytest.raises(AutofocusLostError) as lost:
+            stand.z.move_to_um(4260.0)
+        reason = _unseen_at(advice=FROM_BELOW).removeprefix(
+            "autofocus PFS: not engaged: "
+        )
+        assert str(lost.value) == (
+            f"z: moved to 4260.00 µm, but autofocus PFS was not engaged again: "
+            f"{reason}; it is off, or move Z with keep_autofocus=False"
+        )
+        assert stand.core.log == [OFF, "setPosition('ZDrive', 4260.0)"]
+
+
+def test_a_first_lock_whose_plane_is_toward_the_sample_trips_and_says_so() -> None:
+    # Inside the soft limits, beyond E: the floor's plane was not below Z.
+    with _stand(_first_lock(), offset=FLOOR) as stand:
+        _jumps_to(stand, Z0 + 60.0)
+        with pytest.raises(AutofocusExcursionError) as jumped:
+            stand.af.engage()
+        assert str(jumped.value) == TOWARD.format(z_start=Z0, z_um=Z0 + 60.0)
+        assert (jumped.value.z_start_um, jumped.value.z_um) == (Z0, Z0 + 60.0)
+        assert stand.core.log == [ON, OFF]
+        assert stand.af.is_engaged() is False
+
+
+def test_a_first_lock_that_drops_past_the_z_soft_limit_trips_and_says_raise_the_floor() -> (
+    None
+):
+    with _stand(_first_lock(z_soft_limits_um=(4000.0, 4350.0)), offset=FLOOR) as stand:
+        _plane_follows_the_offset(stand)
+        with pytest.raises(AutofocusExcursionError) as jumped:
+            stand.af.engage()
+        assert str(jumped.value) == (
+            f"autofocus PFS: Z went from {Z0:.2f} µm to {FLOOR_PLANE:.2f} µm while it "
+            "engaged from the offset's floor, outside the soft limits [4000, 4350] "
+            "µm; it was switched off. The floor's plane lies past the Z soft limits, "
+            "away from the sample: raise the floor ([safety] "
+            "autofocus_offset_soft_limits) by steps until a first lock stays inside "
+            "them (m2 §12.10.7). The guard reads Z every 10 ms: it stops PFS once a "
+            "jump is read, it does not prevent one"
+        )
+        assert stand.core.log == [ON, OFF]
+
+
+def _no_focus_drive_core() -> FakeCore:
+    """The stand of ``test_no_focus_drive_engages_without_a_guard_and_warns``, at the floor."""
+    devices = [
+        FakeDevice("PFS", DeviceType.AutoFocus),
+        FakeDevice("PFSOffset", DeviceType.Stage),
+        FakeDevice("XYStage", DeviceType.XYStage),
+        FakeDevice("Camera-1", DeviceType.Camera),
+        FakeDevice("Nosepiece", DeviceType.State, state_labels=("4x", "10x", "40x")),
+    ]
+    core = FakeCore(devices, camera="Camera-1", xy_stage="XYStage", autofocus="PFS")
+    core.setPosition("PFSOffset", FLOOR)
+    core.setState("Nosepiece", TEN_X)
+    return core
+
+
+@pytest.mark.parametrize(
+    ("safety", "missing"),
+    [
+        (
+            {"autofocus_offset_soft_limits": None},
+            "[safety] autofocus_offset_soft_limits",
+        ),
+        ({}, "a focus drive to read"),
+        ({"max_engage_excursion_um": None}, "[safety] max_engage_excursion_um"),
+        ({"z_away_from_sample": None}, "[safety] z_away_from_sample"),
+    ],
+    ids=["floor", "focus", "excursion", "direction"],
+)
+def test_a_first_lock_with_a_condition_missing_is_refused_with_nothing_sent(
+    safety: dict[str, Any], missing: str
+) -> None:
+    no_focus = missing == "a focus drive to read"
+    with (
+        _ti2(_first_lock(**safety), core=_no_focus_drive_core())
+        if no_focus
+        else _stand(_first_lock(**safety), offset=FLOOR)
+    ) as stand:
+        if not no_focus:
+            _plane_follows_the_offset(stand)
+        with pytest.raises(SafetyRefusedError) as refused:
+            stand.af.engage()
+        assert str(refused.value) == _unseen_at(
+            advice=NO_FIRST_LOCK.format(missing=missing)
+        )
+        assert refused.value.how_to_force == ""
+        assert stand.core.log == []
+
+
+def test_a_first_lock_with_every_condition_missing_names_all_four_in_order() -> None:
+    profile = _first_lock(
+        autofocus_offset_soft_limits=None,
+        max_engage_excursion_um=None,
+        z_away_from_sample=None,
+    )
+    with _ti2(profile, core=_no_focus_drive_core()) as stand:
+        with pytest.raises(SafetyRefusedError) as refused:
+            stand.af.engage()
+        assert str(refused.value) == _unseen_at(
+            advice=NO_FIRST_LOCK.format(
+                missing="[safety] autofocus_offset_soft_limits, a focus drive to "
+                "read, [safety] max_engage_excursion_um and [safety] "
+                "z_away_from_sample"
+            )
+        )
+        assert stand.core.log == []
+
+
+def test_an_unseen_offset_one_unit_above_the_floor_is_refused_with_the_lock_from_below_advice() -> (
+    None
+):
+    with _stand(_first_lock(), offset=FLOOR + 1.0) as stand:
+        _plane_follows_the_offset(stand)
+        with pytest.raises(SafetyRefusedError) as refused:
+            stand.af.engage()
+        assert str(refused.value) == _unseen_at(FLOOR + 1.0, advice=FROM_BELOW)
+        assert stand.core.log == []
+
+
+def test_an_unseen_offset_at_the_floor_engages() -> None:
+    # With the test above, `<` and `<= floor + 1` both die.
+    with _stand(_first_lock(), offset=FLOOR) as stand:
+        _plane_follows_the_offset(stand)
+        assert stand.af.engage() is True
+        assert stand.core.log == [ON]
+
+
+def test_an_unseen_offset_below_the_floor_engages_as_a_first_lock() -> None:
+    # Written through the fake, as the stand's last user may have left it.
+    with _stand(_first_lock(), offset=4000.0) as stand:
+        _plane_follows_the_offset(stand)
+        assert stand.af.engage() is True
+        assert stand.z.position_um() == Z0 + (4000.0 - SEEN_OFFSET) / 6.0
+        assert stand.core.log == [ON]
+
+
+def test_a_first_lock_at_an_autofocus_left_searching_is_switched_off_and_refused() -> (
+    None
+):
+    # z_start must be where the operator focused, not where a search took Z.
+    with _stand(_first_lock(), offset=FLOOR) as stand:
+        stand.engage_directly(lockable=False)
+        with pytest.raises(SafetyRefusedError) as refused:
+            stand.af.engage()
+        assert str(refused.value) == _unseen_at(switched=SWITCHED, advice=FROM_BELOW)
+        assert stand.core.log == [OFF]
+        assert stand.af.is_engaged() is False
+
+
+def test_an_increasing_stand_mirrors_the_first_lock_band() -> None:
+    profile = _first_lock(z_away_from_sample="increasing")
+    # 400 µm above Z: away from the sample on this stand, past E, inside the limits.
+    with _stand(profile, offset=FLOOR, z_um=3000.0) as stand:
+        _jumps_to(stand, 3400.0)
+        assert stand.af.engage() is True
+        assert stand.z.position_um() == 3400.0
+    # 60 µm below Z: toward the sample.
+    with _stand(profile, offset=FLOOR, z_um=3000.0) as stand:
+        _jumps_to(stand, 2940.0)
+        with pytest.raises(AutofocusExcursionError) as jumped:
+            stand.af.engage()
+        assert str(jumped.value) == TOWARD.format(z_start=3000.0, z_um=2940.0)
+        assert stand.core.log == [ON, OFF]
+
+
+def test_an_undeclared_stand_keeps_the_symmetric_band_whatever_z_away_from_sample_says() -> (
+    None
+):
+    with _stand(_first_lock(declared=False), offset=FLOOR) as stand:
+        _plane_follows_the_offset(stand)
+        with pytest.raises(AutofocusExcursionError) as jumped:
+            stand.af.engage()
+        assert str(jumped.value) == _excursion(Z0, FLOOR_PLANE, BEYOND, declared=False)
+
+
+def test_dry_run_first_lock_returns_true_and_sends_nothing() -> None:
+    with _stand(_first_lock(), offset=FLOOR, dry_run=True) as stand:
+        _plane_follows_the_offset(stand)
+        assert stand.af.engage() is True
+        assert stand.core.log == []
+        assert stand.z.position_um() == Z0
+
+
+def test_dry_run_first_lock_with_a_condition_missing_is_refused_too() -> None:
+    profile = _first_lock(z_away_from_sample=None)
+    with _stand(profile, offset=FLOOR, dry_run=True) as stand:
+        with pytest.raises(SafetyRefusedError) as refused:
+            stand.af.engage()
+        assert str(refused.value) == _unseen_at(
+            advice=NO_FIRST_LOCK.format(missing="[safety] z_away_from_sample")
+        )
+        assert stand.core.log == []
+
+
+def test_z_outside_the_soft_limits_is_refused_before_the_first_lock_check() -> None:
+    # FM-43: both checks would refuse; the Z text wins.
+    profile = _first_lock(z_away_from_sample=None)
+    with _stand(profile, offset=FLOOR, z_um=4400.0) as stand:
+        with pytest.raises(SafetyRefusedError) as refused:
+            stand.af.engage()
+        assert str(refused.value) == (
+            "autofocus PFS: not engaged: Z is at 4400.00 µm, outside the soft limits "
+            "[10, 4350] µm"
+        )
+        assert stand.core.log == []

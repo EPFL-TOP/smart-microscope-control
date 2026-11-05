@@ -87,17 +87,28 @@ def _stand(
     declares: tuple[Role, ...] = (),
     engage_drives_z: bool = False,
     device_timeout_ms: int | None = None,
+    first_lock: bool = False,
 ) -> tuple[FakeCore, Microscope]:
     """A fake demo stand; ``declares`` goes into ``[safety] stop_refused_by``.
 
     ``engage_drives_z`` sets ``[autofocus] engage_drives_z_to_offset`` (m2 §12),
     ``device_timeout_ms`` ``[micromanager] device_timeout_ms``: how long a move
-    waits before it gives up.
+    waits before it gives up. ``first_lock`` gives what a first lock from below
+    needs (m2 §12.10): the demo's offset 0 as the floor, E and the direction.
     """
     core = FakeCore.demo_like()
     profile = Profile.demo()
     if declares:
         safety = profile.safety.model_copy(update={"stop_refused_by": declares})
+        profile = profile.model_copy(update={"safety": safety})
+    if first_lock:
+        safety = profile.safety.model_copy(
+            update={
+                "autofocus_offset_soft_limits": (0.0, 100.0),
+                "max_engage_excursion_um": 50.0,
+                "z_away_from_sample": "decreasing",
+            }
+        )
         profile = profile.model_copy(update={"safety": safety})
     if device_timeout_ms is not None:
         micromanager = profile.micromanager.model_copy(
@@ -597,6 +608,29 @@ def _engage_refused_after_switch_off(
 
 _engage_refused_after_switch_off.engage_drives_z = True  # type: ignore[attr-defined]
 
+
+def _first_lock_excursion(core: FakeCore, microscope: Microscope) -> tuple[str, str]:
+    """A first lock from the floor whose plane lies toward the sample (m2 §12.10)."""
+    core.autofocus_target_um = lambda: 60.0
+    return _outcome(microscope.require(Autofocus).engage)
+
+
+_first_lock_excursion.engage_drives_z = True  # type: ignore[attr-defined]
+_first_lock_excursion.first_lock = True  # type: ignore[attr-defined]
+
+
+def _offset_move_refused_while_searching(
+    core: FakeCore, microscope: Microscope
+) -> tuple[str, str]:
+    """D6 (m2 §12.10): on a declared stand, an offset move while it searches."""
+    autofocus = microscope.require(Autofocus)
+    core.autofocus_lockable = False
+    core.enableContinuousFocus(True)
+    return _outcome(lambda: autofocus.set_offset_native(5.0))
+
+
+_offset_move_refused_while_searching.engage_drives_z = True  # type: ignore[attr-defined]
+
 _ENGAGE_EXCURSION = (
     "autofocus Autofocus: Z went from 0.00 µm to 5000.00 µm while it engaged, "
     "outside the soft limits [-1000, 1000] µm"
@@ -887,10 +921,34 @@ _DECLARED_EMERGENCY_STOP = (
             "the plane the offset names ([autofocus] engage_drives_z_to_offset, m2 "
             "§12), and offset 0 has not been seen locked with objective "
             "'Nikon 10X S Fluor' since the stand was opened (seen: none); it was on "
-            "and searching, so it was switched off. Focus on the sample, switch "
-            "Autofocus on with the stand's own controls and set the offset until "
-            "the sample is sharp; smc then reads the lock",
+            "and searching, so it was switched off. A first lock from below (m2 "
+            "§12.10) needs [safety] autofocus_offset_soft_limits, [safety] "
+            "max_engage_excursion_um and [safety] z_away_from_sample, which this "
+            "stand does not have; until then smc engages only at an offset it has "
+            "read locked",
             id="engage-refused-after-switch-off",
+        ),
+        pytest.param(
+            _first_lock_excursion,
+            "AutofocusExcursionError",
+            "autofocus Autofocus: Z went from 0.00 µm to 60.00 µm while it engaged "
+            "from the offset's floor, more than [safety] max_engage_excursion_um (50 "
+            "µm) toward the sample; it was switched off. The floor's plane is not "
+            "below where Z started: focus on the sample by eye before a first lock; "
+            "if Z was already there, the floor is not below this objective's focus "
+            "(m2 §12.10), so do not try a first lock with it again. The guard reads "
+            "Z every 10 ms: it stops Autofocus once a jump is read, it does not "
+            "prevent one",
+            id="first-lock-excursion",
+        ),
+        pytest.param(
+            _offset_move_refused_while_searching,
+            "SafetyRefusedError",
+            "autofocus Autofocus: offset not moved: it is on and not locked, and on "
+            "this stand it drives Z to the plane the offset names (m2 §12.10). "
+            "Switch it off to set the offset (that moves no Z), or turn the knob "
+            "while it is locked",
+            id="offset-move-refused-while-searching",
         ),
     ],
 )
@@ -906,6 +964,7 @@ def test_a_failed_stop_or_switch_off_frees_the_core(
         declares=getattr(scenario, "declares", ()),
         engage_drives_z=getattr(scenario, "engage_drives_z", False),
         device_timeout_ms=getattr(scenario, "device_timeout_ms", None),
+        first_lock=getattr(scenario, "first_lock", False),
     )
     assert scenario(core, microscope) == (kind, message)
     core.failing.clear()
