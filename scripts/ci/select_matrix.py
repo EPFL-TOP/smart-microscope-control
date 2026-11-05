@@ -11,8 +11,8 @@ the ``tests (<os>, py<python>)`` template and this file keeps the entries, and
 
 reads ``GITHUB_EVENT_NAME``, ``GITHUB_REPOSITORY`` and ``PR_NUMBER`` (the
 workflow passes the pull request's number), asks the API for the pull
-request's labels, and writes ``matrix=<json>`` to ``$GITHUB_OUTPUT`` and the
-reason to ``$GITHUB_STEP_SUMMARY``.
+request's labels, and writes ``matrix=<json>`` and ``serial=true|false`` to
+``$GITHUB_OUTPUT`` and the reason to ``$GITHUB_STEP_SUMMARY``.
 
 The labels are read from the API when the run starts, not from the event
 payload: ``gh pr create --label`` may attach the label after ``opened`` has
@@ -84,6 +84,18 @@ def select(event: str, labels: list[str] | None) -> tuple[Matrix, str]:
     )
 
 
+def is_serial(event: str) -> bool:
+    """Whether the suite runs in order, with coverage (the nightly and a dispatch).
+
+    A pull request and a push run it in parallel (``pytest -n auto``) with the
+    wall-clock tests apart, which is what makes the light set light. The nightly
+    is where a failure that parallelism hides would show, so it keeps the whole
+    suite in order and the coverage report (two invocations cannot share one
+    coverage file, so the parallel runs drop it).
+    """
+    return event in ("schedule", "workflow_dispatch")
+
+
 def pr_labels(repo: str, number: int) -> list[str] | None:
     """The labels of pull request ``number``, or ``None`` when ``gh`` cannot say.
 
@@ -140,7 +152,7 @@ def main() -> int:
         print(f"::error::{error}")
         return 1
 
-    line = f"matrix={json.dumps(matrix)}\n"
+    line = f"matrix={json.dumps(matrix)}\nserial={str(is_serial(event)).lower()}\n"
     output = os.environ.get("GITHUB_OUTPUT")
     if output:
         _append(output, line)

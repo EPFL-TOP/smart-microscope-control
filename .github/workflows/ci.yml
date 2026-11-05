@@ -35,6 +35,7 @@ jobs:
       pull-requests: read
     outputs:
       matrix: ${{ steps.select.outputs.matrix }}
+      serial: ${{ steps.select.outputs.serial }}
     steps:
       - uses: actions/checkout@v7
       # The label is read from the API when the run starts, not from the event
@@ -86,8 +87,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python scripts/ci/install_mm_test_adapters.py
+      # The nightly and a dispatch run the whole suite in order, with coverage.
       - name: Run tests
+        if: ${{ needs.lint.outputs.serial == 'true' }}
         run: pytest --cov=smc --cov-report=term --cov-report=xml --junitxml=junit.xml
+      # A pull request and a push run in parallel, without coverage (two
+      # invocations cannot share one coverage file), the tests that assert on a
+      # measured duration or a frame rate (marker `wallclock`) apart. Every `-m`
+      # carries `not hardware`: a `-m` on the command line replaces the
+      # `-m 'not hardware'` of addopts (FM-192). Two steps, not two commands in
+      # one `run:`: on a Windows runner a multi-line `run:` reports only the
+      # exit code of its last command.
+      - name: Run tests in parallel
+        if: ${{ needs.lint.outputs.serial != 'true' }}
+        run: pytest -n auto -m "not hardware and not wallclock" --junitxml=junit.xml
+      - name: Run the wall-clock tests in order
+        if: ${{ !cancelled() && needs.lint.outputs.serial != 'true' }}
+        run: pytest -m "wallclock and not hardware" --junitxml=junit-wallclock.xml
       - uses: actions/upload-artifact@v7
         with:
           name: coverage-${{ matrix.os }}-py${{ matrix.python }}
@@ -100,7 +116,9 @@ jobs:
         if: ${{ !cancelled() }}
         with:
           name: junit-${{ matrix.os }}-py${{ matrix.python }}
-          path: junit.xml
+          path: |
+            junit.xml
+            junit-wallclock.xml
           if-no-files-found: ignore
           retention-days: 7
 

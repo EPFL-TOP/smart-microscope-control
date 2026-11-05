@@ -201,6 +201,53 @@ def test_every_marker_expression_of_the_workflow_excludes_hardware() -> None:
     assert bad == []
 
 
+def test_the_wallclock_marker_is_registered() -> None:
+    text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    markers = text.split("markers = [", 1)[1].split("]", 1)[0]
+    assert '"wallclock:' in markers
+    assert '"hardware:' in markers  # the neighbour: still there, still registered
+
+
+def _steps_running(text: str, command: str) -> list[str]:
+    """The steps of ``ci.yml`` (as text, comments of the step included) that run ``command``.
+
+    A step starts at a line of six spaces and a dash and ends before the next one or
+    before the next job, so that what follows it in the file is not read as its own.
+    """
+    blocks = re.split(r"(?m)^(?=      - |  \S)", text)
+    return [b for b in blocks if b.startswith("      - ") and command in b]
+
+
+def test_the_workflow_runs_the_suite_in_parallel_unless_the_select_step_says_serial() -> (
+    None
+):
+    text = CI_YML.read_text(encoding="utf-8")
+    assert "serial: ${{ steps.select.outputs.serial }}" in text
+    # the serial run keeps coverage and the whole suite
+    (serial,) = _steps_running(text, "pytest --cov=smc")
+    assert "needs.lint.outputs.serial == 'true'" in serial
+    assert "-n auto" not in serial
+    # the parallel run: not serial, drops coverage, leaves the wall-clock tests and hardware out
+    (parallel,) = _steps_running(
+        text, 'pytest -n auto -m "not hardware and not wallclock"'
+    )
+    assert "needs.lint.outputs.serial != 'true'" in parallel
+    assert "--cov" not in parallel  # two invocations cannot share one coverage file
+    (wallclock,) = _steps_running(text, 'pytest -m "wallclock and not hardware"')
+    assert "needs.lint.outputs.serial != 'true'" in wallclock
+    # two steps, not one multi-line run: on Windows only the last command's exit code counts
+    assert parallel != wallclock
+
+
+def test_the_wallclock_step_runs_even_when_the_parallel_step_failed() -> None:
+    # Both steps must be able to fail the job and both must report: a red parallel step
+    # must not hide a wall-clock test that also failed (and the other way round).
+    text = CI_YML.read_text(encoding="utf-8")
+    (step,) = _steps_running(text, 'pytest -m "wallclock and not hardware"')
+    assert "!cancelled()" in step
+    assert "continue-on-error" not in step
+
+
 # --- pr_labels: the one place that talks to GitHub ---------------------------
 
 
@@ -251,6 +298,14 @@ def test_an_empty_label_list_is_not_a_failed_read(sel, monkeypatch) -> None:
 # --- main: the outputs the workflow reads ---------------------------------
 
 
+def _outputs(path: Path) -> dict[str, str]:
+    """``$GITHUB_OUTPUT`` as the runner reads it: one ``key=value`` per line."""
+    pairs = (
+        line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines()
+    )
+    return {key: value for key, value in pairs}
+
+
 @pytest.fixture
 def ci_env(monkeypatch, tmp_path):
     for name in _CI_VARIABLES:
@@ -284,11 +339,11 @@ def test_main_writes_the_outputs_the_workflow_reads(
     assert (
         "\r" not in raw
     )  # the runner reads LF; a text-mode write on Windows would add CR
-    lines = raw.splitlines()
-    assert len(lines) == 1
-    assert lines[0].startswith("matrix=")
-    matrix = json.loads(lines[0].removeprefix("matrix="))
+    assert [line.split("=", 1)[0] for line in raw.splitlines()] == ["matrix", "serial"]
+    matrix = json.loads(_outputs(output)["matrix"])
     assert [sel.job_name(e) for e in matrix["include"]] == FIVE_TEST_JOBS_OF_BEFORE
+    # a pull request is run in parallel even with the full matrix: only the nightly is serial
+    assert _outputs(output)["serial"] == "false"
     text = summary.read_text(encoding="utf-8")
     assert "full" in text
     assert "::warning::" not in capsys.readouterr().out
@@ -305,10 +360,9 @@ def test_main_on_a_push_does_not_ask_github_for_labels(
 
     monkeypatch.setattr(sel, "pr_labels", boom)
     assert sel.main() == 0
-    matrix = json.loads(
-        output.read_text(encoding="utf-8").removeprefix("matrix=").strip()
-    )
+    matrix = json.loads(_outputs(output)["matrix"])
     assert [sel.job_name(e) for e in matrix["include"]] == REQUIRED_TEST_JOBS
+    assert _outputs(output)["serial"] == "false"
 
 
 def test_main_warns_and_runs_the_full_matrix_when_the_labels_cannot_be_read(
@@ -322,9 +376,7 @@ def test_main_warns_and_runs_the_full_matrix_when_the_labels_cannot_be_read(
     assert sel.main() == 0
 
     assert "::warning::" in capsys.readouterr().out
-    matrix = json.loads(
-        output.read_text(encoding="utf-8").removeprefix("matrix=").strip()
-    )
+    matrix = json.loads(_outputs(output)["matrix"])
     assert [sel.job_name(e) for e in matrix["include"]] == FIVE_TEST_JOBS_OF_BEFORE
     assert "could not" in summary.read_text(encoding="utf-8")
 
@@ -340,10 +392,31 @@ def test_main_without_a_pull_request_number_runs_the_full_matrix(
     )
     assert sel.main() == 0
     assert "::warning::" in capsys.readouterr().out
-    matrix = json.loads(
-        output.read_text(encoding="utf-8").removeprefix("matrix=").strip()
-    )
+    matrix = json.loads(_outputs(output)["matrix"])
     assert len(matrix["include"]) == 5
+
+
+@pytest.mark.parametrize(
+    ("event", "serial"),
+    [
+        ("schedule", True),
+        ("workflow_dispatch", True),
+        ("push", False),
+        ("pull_request", False),
+    ],
+)
+def test_only_the_nightly_and_a_dispatch_run_the_suite_serially(
+    sel, event, serial
+) -> None:
+    # The nightly keeps the whole suite in order, with coverage; a PR and a push run in parallel.
+    assert sel.is_serial(event) is serial
+
+
+def test_main_writes_serial_true_for_the_nightly(sel, monkeypatch, ci_env) -> None:
+    output, _ = ci_env
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
+    assert sel.main() == 0
+    assert _outputs(output)["serial"] == "true"
 
 
 def test_main_refuses_an_event_without_a_rule(sel, monkeypatch, ci_env, capsys) -> None:
