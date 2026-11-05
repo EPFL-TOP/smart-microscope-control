@@ -13,7 +13,9 @@ development machine you prepare and you write up; you never run
 
 Produce a one-page checklist for the operator:
 
-1. Goal and the issues it unblocks.
+1. Goal and the issues it unblocks. Order the steps by what they unblock
+   and say which can be dropped: a visit cut short then still gives the
+   most (Ti2-E session 2, #334, ended before steps 6–8).
 2. Power-on order and vendor-software state (NIS-Elements / ZEN / Ti2
    Control closed; Ti2: stand before controller; Observer 7: restart PC,
    camera, then stand).
@@ -40,6 +42,17 @@ Produce a one-page checklist for the operator:
    into `terminal.log`), so the console comes back as well as the notes.
 8. Every item left over from earlier notes on the session issue goes
    into the checklist, or is marked as left for later.
+9. Ask the owner what is on the stage before writing wells, coverage or
+   wall positions: the plate type (and its brand, if known), or a dish.
+   Ti2-E session 2 met a 24-well plate where the checklist assumed a
+   96-well one.
+10. Right after any switch-on of an autofocus that drives Z to its
+    offset's plane (the Ti2-E's PFS, from smc or from the stand's own
+    button), the next line of the checklist reads Z and compares it with
+    the focus found by eye, before anything else runs. It says what to do
+    if Z moved: switch the autofocus off with the stand's button, then
+    write down both values. The jump went unnoticed in Ti2-E sessions 1
+    and 2 (+235 µm, +206.6 µm; #205, #331).
 
 ## After
 
@@ -54,3 +67,6 @@ From the raw log the operator pastes:
    heuristic with a test, or a line in `docs/hardware/inventory.md`.
 3. Open follow-up issues with the right `scope:` label; link them from the
    report.
+4. Post a `## Note (hardware session write-up, <date>)` on every open
+   issue the session measured something for, and on the session issue
+   what is left for the next visit.
