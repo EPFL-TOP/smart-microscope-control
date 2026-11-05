@@ -2,7 +2,8 @@
 
 - **Status**: design for issue #18 (§1, 2026-10-26); the plate-scan
   workflow, §2 to §16, for issue #192 (2026-10-27); the plate from images of
-  the walls, §17, for issue #328 (2026-11-05).
+  the walls, §17, for issue #328 (2026-11-05); objectives' offsets, §18,
+  for issue #340 (2026-11-05).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 and M2, this document is the contract between issues
   that are built in parallel. Names, module paths and signatures below are
@@ -4789,3 +4790,181 @@ bound), FM-124, FM-125, FM-131, FM-142.
 - `max_residual_um = 100`: no plate was registered from images yet.
 - 4×, the light and exposure the walls need, other plates than the 24-well,
   and whether the PFS holds its lock while the stage looks at the walls.
+
+## 18. The plate in another objective's frame (#340)
+
+A plate registered with the 4× or the 10× is scanned with the 40×. The
+offsets between objectives are the profile's, handed out by
+`ObjectiveTurret.offset()` (m2 §13); this section records which objective a
+plate was registered with and moves the plate into the frame of the
+objective that uses it. Only XY moves: the layer applies no Z offset (m2
+§13.2).
+
+### 18.1 The plate slot records its objective — `slots/plate.py`
+
+`PlateResult` (§3.2) gains, after `fit` (and after `walls`, §17.2, once
+#328 has added it):
+
+```python
+objective: str | None = None
+```
+
+The turret label of the objective the plate's positions were taken with;
+`None` when the stand has no turret, and in every document written before
+#340 (unknown, not the one in place). It is a field with a default so that
+older run documents still load.
+
+It is the plate's own objective, for every method. `walls.objective`
+(§17.2) stays as #328 defines it: the objective the wall frames were
+taken with, which for `wall-images` is the same label.
+
+### 18.2 Moving a plate between objectives — `smc/plugins/objectives.py` (new)
+
+```python
+def objective_for(
+    stage: str, requested: str | None, turret: ObjectiveTurret | None
+) -> tuple[str | None, bool]: ...
+
+
+def objective_shift_um(
+    origin: ObjectiveOffset, target: ObjectiveOffset
+) -> tuple[float, float] | None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class PlateInFrame:
+    plate: PlateResult
+    objective: str | None
+    shift_um: tuple[float, float] | None
+    assumed: tuple[str, ...]
+
+
+def plate_for_objective(
+    plate: PlateResult, objective: str | None, turret: ObjectiveTurret | None
+) -> PlateInFrame: ...
+```
+
+- **`objective_for`** is `scan-plan`'s `_objective_for` (§7.3) moved here
+  unchanged, messages included, with the stage's name as its first
+  argument: the requested objective, checked against the turret, or the one
+  in place; an empty position or a requested objective on a stand with no
+  turret is a `PluginRunError` of `stage`. `scan-plan` imports it.
+- **`objective_shift_um(origin, target)`** is `target.xy_um −
+  origin.xy_um`, per axis; `None` when either is `None` or the two
+  references differ.
+- **`plate_for_objective`**, in this order:
+  1. `objective == plate.objective` (both `None` included): `plate`
+     itself, `shift_um=(0.0, 0.0)`, no line.
+  2. `plate.objective is None`: `plate` itself, `shift_um=None`, the line
+     `the plate does not record the objective it was registered with: no
+     offset between objectives is applied for <objective>`.
+  3. `objective is None`: `plate` itself, `shift_um=None`, the line `the
+     objective in use is unknown: the plate's positions are
+     <plate.objective>'s, and no offset between objectives is applied`.
+  4. `turret is None`, or `objective_shift_um(turret.offset(plate.objective),
+     turret.offset(objective))` is `None`: `plate` itself, `shift_um=None`,
+     the line `the offset between <plate.objective> and <objective> is not
+     measured (the profile's [objectives]): the positions are
+     <plate.objective>'s, not corrected`.
+  5. Otherwise the plate **translated**: a new `PlateResult`, built once by
+     `PlateResult.model_validate` from the dump (never `model_copy`, which
+     skips validation), with `a1_center_xy_um` and every `refs` entry's
+     `x_um`, `y_um` plus `shift_um`, `objective=objective`, everything else
+     as it was (the rotation is unchanged: the shift is a translation, m2
+     §13.2). No line: the offset is measured. The plugin logs at INFO the
+     shift and both offsets' `measured`.
+
+  The line of 2, 3 or 4 is also logged at WARNING by the plugin that
+  receives it. `plate.assumed` is left as it is: the caller copies it as it
+  does today.
+
+Translating `a1_center_xy_um` moves every well centre and wall point by
+exactly the shift (measured: 0.0 µm of difference on A1, D7 and H12 of a
+96-well plate at 3°, centres and left walls, useq-schema 0.9.2).
+
+### 18.3 Who fills it, who uses it
+
+- **`plate-registration`** (§5.3): `PlateRegistrationParams` gains
+  `objective: str | None = Field(None, description="The objective the
+  references were centred with, by its turret label; default the one in
+  place when the registration runs.")`. `run` calls
+  `objective_for(_NAME, params.objective, microscope.get(ObjectiveTurret))`
+  first, before the fit, and the result carries it. A turret read that
+  raises is not caught (the runner records the stage `failed`).
+- **`plate-finding`** (§6): `objective_for(_NAME, None, turret)` at the
+  start of every attempt, before anything moves. `SurveyCheckpoint` gains
+  `objective: str | None = None`, written by the attempt that creates the
+  checkpoint. A resumed attempt whose objective differs from a checkpoint's
+  that is not `None` is refused before anything moves: `the survey began
+  with <a> and the objective in place is <b>: turn the turret back to <a>
+  and resume, or run the survey again without --resume`. After the last
+  point and before the fit, the objective is read again; a different one
+  ends the attempt with `the objective changed during the survey, from <a>
+  to <b>: run the survey again without --resume`. The result carries it.
+- **`plate-walls`** (§17.4, #328): its result sets `objective` to
+  `WallImages.objective`, the objective in place. Of #328 and #340, the
+  issue developed second adds that line and its test
+  (`test_the_wall_registration_records_its_objective`); if #340 lands
+  first, #328 reads the objective with `objective_for(_NAME, None, turret)`,
+  so that an empty position is refused as everywhere else.
+- **`goto-well`** (§5.3): `objective_for(_NAME, None, turret)`, then
+  `plate_for_objective(plate, objective, turret)` before the target is
+  computed; the target is the frame's plate's centre or wall point.
+  `GotoWellResult` gains `objective: str | None`, `plate_objective: str |
+  None` and `shift_um: tuple[float, float] | None`; the frame's line joins
+  `assumed` after the plate's.
+- **`scan-plan`** (§7.3): after `objective_for`, `plate_for_objective(plate,
+  objective, turret)`; every later use of the plate in `run` (the grid's
+  well size, `plan_fields`) takes the frame's plate, so `plate_plan` and
+  every field are in the plan's objective's frame. That objective is the
+  requested one when it is not in place: the plan is for it, and `scan`
+  refuses to run it with another (§8). `ScanPlanResult` (§3.4) gains
+  `plate_objective: str | None = None` and `objective_shift_um: tuple[float,
+  float] | None = None` (defaults for older documents: unknown). The
+  frame's line joins `assumed` before the basis's.
+- **`scan`** (§8): unchanged. It visits the plan's fields, which are in the
+  plan's objective's frame, and already refuses another objective in place
+  at the start and at both ends of every well.
+- **Downstream** (`cells`, `density`, `route`, `report`, `nis-export`, the
+  page's maps of the scan) reads wells from `plan.plate_plan`, now in the
+  scan's frame, and is unchanged. `route` to another objective keeps its
+  `assumed` line `no offset between the two objectives is applied`: whether
+  NIS-Elements applies its own is not known (m2 §13.8), and applying ours
+  is a later issue.
+- **The plate page** is unchanged: it registers through `plate-registration`
+  with the objective in place, and goes to a well through `goto-well`. Its
+  map of the plate draws the registration's frame; a shift of tens of µm
+  does not show at the scale of a plate.
+
+### 18.4 Tests
+
+- `tests/unit/test_objective_offsets.py` (pure, a stub turret):
+  `objective_shift_um`'s sign (target minus origin, with neither offset
+  zero), unknown on either side, differing references; each rule of
+  `plate_for_objective` with its exact line; the translated plate's A1,
+  every ref, `objective`, rotation and fields unchanged, and a refusal of
+  the translated values by validation not bypassed.
+- `tests/test_goto_well_demo.py`: on a demo profile whose `[objectives]`
+  names `Nikon 20X Plan Fluor ELWD` as the reference, with the 10× at
+  `(5.0, -2.5)` and the 40× at `(-32.5, 9.75)` (a shift 10× → 40× of
+  `(-37.5, 12.25)`, anisotropic, FM-73), a plate registered with the 10×
+  and the 40× turned in: the target is the registration's plus the shift,
+  written from the numbers above and not from the code (FM-124); the same
+  objective: no shift, no line; an offset unknown: the target unshifted and
+  the line.
+- `tests/test_scan_plan_demo.py`: a plate registered with the 10× planned
+  for the 40× (requested, not turned in): every field and every well of
+  `plate_plan` is the 10× plan's plus the shift; `plate_objective` and
+  `objective_shift_um` are recorded; a plate with no objective gives the
+  line of rule 2.
+- `tests/test_plate_registration_demo.py`, `tests/test_plate_finding_demo.py`:
+  the result records the objective in place and the one requested; an
+  objective not on the turret is refused; the survey's resume with another
+  objective and a turn during the survey are refused.
+- `tests/unit/test_slots.py`: a `PlateResult` dump without `objective`
+  loads with `None`; the same for `ScanPlanResult`'s two fields.
+
+### 18.5 Not verified
+
+- m2 §13.8. A plate registered at 4× and scanned at 40× at the stand is the
+  first real test of the whole.
