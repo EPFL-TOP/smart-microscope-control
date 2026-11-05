@@ -898,6 +898,16 @@ def test_an_unseen_offset_one_unit_above_the_floor_is_refused_with_the_lock_from
         assert stand.core.log == []
 
 
+def test_an_unseen_offset_half_a_unit_above_the_floor_is_refused() -> None:
+    # Between whole units, on a device that would hold them: `<= floor + 0.5` dies.
+    with _stand(_first_lock(), offset=FLOOR + 0.5) as stand:
+        _plane_follows_the_offset(stand)
+        with pytest.raises(SafetyRefusedError) as refused:
+            stand.af.engage()
+        assert str(refused.value) == _unseen_at(FLOOR + 0.5, advice=FROM_BELOW)
+        assert stand.core.log == []
+
+
 def test_an_unseen_offset_at_the_floor_engages() -> None:
     # With the test above, `<` and `<= floor + 1` both die.
     with _stand(_first_lock(), offset=FLOOR) as stand:

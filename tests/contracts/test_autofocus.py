@@ -301,7 +301,8 @@ def test_engage_at_an_unseen_offset_is_refused(
         )
     o0, tol = _offset_start(envelope), envelope.offset_tolerance
     # Above the floor, so never a first lock from below (m2 §12.10 D4).
-    assert o0 + 1.0 > o0 - envelope.offset_span
+    limits = autofocus.offset_limits_native()
+    assert limits is None or o0 + 1.0 > limits[0]
     autofocus.disengage()
     # With PFS off, an offset change moves no Z (m2 §4.5); the microscope
     # fixture puts the offset back.

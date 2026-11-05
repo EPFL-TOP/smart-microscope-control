@@ -1097,6 +1097,34 @@ def test_an_offset_move_whose_state_read_fails_is_refused_with_nothing_sent(
         assert stand.core.log == []
 
 
+def test_an_offset_move_on_a_declared_stand_whose_slot_names_another_device_says_so() -> (
+    None
+):
+    # FM-87: without a focus drive no linked move checks the slot first, so D6
+    # does; the slot is a configuration error, not a state of unknown value.
+    devices = [
+        FakeDevice("PFS", DeviceType.AutoFocus),
+        FakeDevice("PFSOffset", DeviceType.Stage),
+        FakeDevice("XYStage", DeviceType.XYStage),
+        FakeDevice("Camera-1", DeviceType.Camera),
+    ]
+    core = FakeCore(devices, camera="Camera-1", xy_stage="XYStage", autofocus="PFS")
+    core.setPosition("PFSOffset", 7800.0)
+    with _ti2(_declared_offset(), core=core) as stand:
+        assert stand.microscope.roles.get(Role.focus) is None
+        stand.engage_directly()
+        stand.core.setAutoFocusDevice("")  # behind the layer
+        stand.core.log.clear()
+        with pytest.raises(HardwareError) as refused:
+            stand.af.set_offset_native(7796.0)
+        assert not isinstance(refused.value, SafetyRefusedError)
+        assert str(refused.value).startswith(
+            "autofocus 'PFS' is not the device the core's AutoFocus slot names ('')"
+        )
+        assert stand.core.log == []
+        stand.core.setAutoFocusDevice("PFS")
+
+
 # --- focus_by_um (m2 §3.5) ---------------------------------------------------
 
 
