@@ -2027,6 +2027,9 @@ FM-176, FM-43.
    `cli.py`, `profile.py`, `document.py` and `runner.py`: no other issue that
    edits one of them runs at the same time, #310 included (one before the other,
    never alongside).
+8. **#324** (`smc presets save`, §10.9) edits `presets.py`, `params.py` and `cli.py`,
+   and the tests of the presets: not at the same time as #338 (the review's
+   leftovers of #337, which edit `presets.py`, `cli.py` and the page).
 
 ### 9.1 Not verified (for the owner)
 
@@ -2242,6 +2245,10 @@ tomli 2.0.1 and pydantic 2.7.0):
 
 ```python
 NOT_IN_PARAMS: dict[str, dict[str, str]] = {
+    "plate-finding": {
+        "centre_x_um": "a preset holds no positions",
+        "centre_y_um": "a preset holds no positions",
+    },
     "plate-registration": {
         "plate": "the preset's plate holds it",
         "refs": "a preset holds no positions",
@@ -2328,6 +2335,7 @@ passed on as it is, and `parse_params` names it.
 smc run NAME -p PROFILE --run-doc PATH [--preset NAME|PATH] [--param k=v ...] [--dry-run] [--resume]
 smc presets list [-p PROFILE]
 smc presets show NAME|PATH [-p PROFILE] [--run-doc PATH]
+smc presets save NAME --run-doc PATH [-p PROFILE] [--overwrite]   # §10.9, #324
 ```
 
 **`smc run --preset`**. Without `--preset`, `run_command` is unchanged and in
@@ -2629,9 +2637,8 @@ here reaches the stand.
   `scan`'s `Params` has none. The objective a scan is planned for is
   `scan-plan`'s `objective`, which a preset holds like any field. *Drive*'s
   objective select, the light and the autofocus are actions, not parameters.
-- **No `smc presets save` in this issue.** The CLI's equivalent of *Save* is,
-  for now, the file written by hand, in the documented format. A command that
-  saves a run document's parameters as a preset is a follow-up issue.
+- **No `smc presets save` in #319.** The CLI's equivalent of *Save*, which writes
+  a run document's parameters as a preset, is §10.9 (#324).
 - **No *Delete* button**: a preset is deleted as a file.
 - **No `smc ui --preset`**: the page starts with no preset loaded.
 - **The profile's `[suggest]` is unchanged.** A loaded preset wins over it, key
@@ -2649,3 +2656,142 @@ The tests are named in #319's plan. **Failure modes**:
 - FM-161, FM-169, FM-171;
 - FM-36, FM-37 and FM-72 (the commands' output and help);
 - FM-43, FM-44, FM-45.
+
+### 10.9 `smc presets save` (#324)
+
+Fixed by #324's plan (2026-11-05). It is the command line's equivalent of the
+page's *Save*: it writes a preset from the values a run document's `done` records
+used, so that the next run takes them from the last one and not from a retyped
+file. It reads a document and writes a file; it opens no stand and moves nothing.
+
+```
+smc presets save NAME --run-doc PATH [-p PROFILE] [--overwrite]
+```
+
+**Value to text** (`smc/plugins/params.py`).
+
+```python
+def format_param(field: FieldInfo, value: Any) -> str: ...
+```
+
+It is public, beside `parse_params`, and is the inverse of `_decode`: for a
+recorded JSON value, the text that `--param key=<text>` takes.
+
+- `None` is `null`.
+- A `bool` is `true` or `false`.
+- The value of a scalar field (`str`, `int`, `float`, `Path`, an `Enum` member, a
+  `Literal`; the fields `_is_scalar` names) is its text, a float by `repr`.
+- The value of any other field is `json.dumps(value)`, which is ASCII.
+
+It does not promise that the text reads back as the value: a `str | None` field
+that holds the string `null` reads back as `None`. The caller reads it back.
+
+**The preset from a document** (`smc/plugins/presets.py`).
+
+```python
+@dataclass(frozen=True, slots=True)
+class PresetFromRun:
+    preset: Preset
+    notes: tuple[str, ...]
+
+
+def preset_from_document(
+    doc: RunDocument,
+    models: Mapping[str, type[PluginParams]],
+    *,
+    stand: str,
+    saved_utc: datetime,
+) -> PresetFromRun: ...
+```
+
+`models` maps a plugin's name to its `Params`. The fields of the preset:
+
+- `stand` and `saved_utc` are the arguments.
+- `plate` is `registered_plate(doc)`.
+- `wells` is the `scan-plan` record's `wells`, as typed, when that record is
+  `done` and the value is text.
+- `params` has a key for each plugin that has at least one pair, in the order of
+  the plugins' names.
+
+**Which records.** The `done` ones. A `stopped`, `failed` or `running` record's
+values are not those of a finished run; a dry run's record counts, its values
+being the operator's. A document with no `done` record is
+`PresetError("the run document has no finished stage; there is nothing to
+save")`. When the `done` records give no plate, no wells and no pair, it is
+`PresetError("nothing to save: <the plugins' names, joined by ", ">
+used only default values")`.
+
+**The pairs of a plugin**, from its record's `params`, which are data taken as
+they come (FM-125):
+
+1. A plugin that `models` does not hold gives the note `<plugin>: no plugin of
+   that name is loaded; its parameters are not saved`.
+2. The record's `params` go through the plugin's `Params.model_validate`; the
+   plugin may have changed since the run. A `ValidationError` gives the note
+   `<plugin>: its recorded parameters are not valid for this smc (<loc>: <msg>,
+   joined by "; "); not saved`.
+3. A pair, `<key>=<format_param(field, value)>`, for each field in the model's
+   declaration order (the order `smc run --show-params` prints) that is required,
+   or whose JSON value differs from the JSON form of its default
+   (`to_jsonable_python(field.get_default(call_default_factory=True))`), except
+   the keys that `NOT_IN_PARAMS` names for the plugin. A value equal to its
+   default is left out: the preset follows the plugin's default, as `[suggest]`
+   does.
+4. **The pairs are read back.** `parse_params` reads them, with one pair for each
+   key `NOT_IN_PARAMS` names (what the run takes from elsewhere: the preset's own
+   plate and wells, the operator's positions), and the JSON dump of the result
+   must equal the JSON dump of the validated record, key by key. When `parse_params` raises, or a key
+   differs, **none of the plugin's pairs is saved**, because a subset may be
+   refused (`rows` without `columns`): the note is `<plugin>: <keys, joined by
+   ", "> would read back as another value; not saved`, or, when it raised,
+   `<plugin>: its pairs do not read back (<the problems, joined by "; ">); not
+   saved`.
+5. A pair that does not encode as UTF-8 (a lone surrogate, which an objective
+   label from a `.cfg` saved in cp1252 leaves in the run document, FM-05) saves
+   none of the plugin's pairs: `<plugin>: <key> holds a character that is not
+   text; not saved`. A `wells` text that does not encode is left out: `scan-plan:
+   wells holds a character that is not text; not saved`.
+6. A record whose `profile` is not `stand` gives the note `<plugin> was run on
+   <profile>, not on <stand>`, and its pairs are saved.
+
+The `Preset` is built last. A `ValidationError` (a `wells` of several lines) is
+`PresetError("nothing saved: <the first message>")`.
+
+**`NOT_IN_PARAMS` gains `plate-finding`'s `centre_x_um` and `centre_y_um`** (§10.2):
+the search's centre is a stage position, and a preset holds none. The check then
+says so for a hand-written preset that gives one.
+
+**The command** (`smc/cli.py`), in this order:
+
+1. `check_name(NAME)`. A `PresetError` is `typer.BadParameter(<message>,
+   param_hint="NAME")`, which exits 2, before any file is read.
+2. `Profile.load`.
+3. `RunDocument.load(Path(--run-doc))`. A missing or unreadable document is a
+   `RunDocumentError`, which exits 1 as `_report` maps it, and nothing is written.
+4. `preset_from_document(doc, <the registry's Params>, stand=<microscope.name>,
+   saved_utc=<now, UTC, to the second>)`, the registry from `discover_plugins()`
+   as `show` reads it. A `PresetError` is `_fail(<message>)`, exit 2.
+5. `save_preset(name, preset, profile, overwrite=--overwrite)`. A
+   `PresetExistsError` is `_fail("<message>; pass --overwrite to replace it")`,
+   exit 2: the message is the exception's own, so that it says what the page
+   says. Any other `PresetError` (the write, a missing `tomli-w`) is
+   `_fail(<message>)`, exit 1.
+6. On success, through `_say`: `saved <name> to <path>`; then the preset's lines
+   as `show` prints them (`stand`, `plate`, `wells`, `saved_utc`, `<plugin>: <pairs,
+   joined by a space>`), from one helper that both commands call; then each note.
+
+`--run-doc` is required (a usage error, exit 2). A preset that `smc run
+scan-plan --preset NAME` then reads, on a document whose plate is registered,
+gives `scan-plan` the params the saved document's record holds.
+
+**What it does not do.** It takes no `--plugin` to choose among the records and
+no `--dry-run`: it writes a file that moves nothing. It does not judge a value:
+a `nis-export` `out` or a `camera-calibration` `from_run_doc` is saved like any
+other pair, and `smc presets save` prints every pair it wrote.
+
+**Failure modes**: FM-05 (the surrogate), FM-24 (the name; a Windows path in a
+value), FM-36, FM-37 and FM-72 (the output and the help), FM-38 (the write, through
+`save_preset`), FM-43 and FM-45 (the tests), FM-107 (what the generator leaves
+out is said, not dropped), FM-125 (the record validated again). Its new kind,
+for the checklist: *a text generated from a value that its reader reads back as
+another value*.
