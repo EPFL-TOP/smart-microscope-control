@@ -1,0 +1,8 @@
+# A preset of smc: the choices an assay repeats. See docs/ui/plate-page.md, Presets.
+stand = "demo-sample"
+plate = "96-well"
+wells = "B2,B11"
+
+[params]
+scan-plan = ["coverage=0.4"]
+cells = ["detector=blobs"]

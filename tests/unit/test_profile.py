@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import errno
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -9,7 +10,13 @@ import pytest
 import smc.hardware.backends.mm as mm
 import smc.hardware.profile as profile_module
 from smc.hardware.errors import HardwareError, ProfileError
-from smc.hardware.profile import Profile, SampleSection, list_profiles, search_paths
+from smc.hardware.profile import (
+    Profile,
+    SampleSection,
+    check_pairs,
+    list_profiles,
+    search_paths,
+)
 from smc.hardware.roles import Role
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -1382,6 +1389,19 @@ def test_a_suggestion_item_without_a_clean_key_is_refused_with_its_text(
     msg = _load_error(tmp_path, body)
 
     assert f"  - suggest.scan-plan.params: {_SUGGEST_TEXT.format(item=item)}" in msg
+
+
+def test_check_pairs_refuses_with_the_suggest_texts() -> None:
+    # The preset file checks its pairs with the same function and the same texts.
+    check_pairs(["coverage=0.4", "a=b=c", "d="])
+    check_pairs([])  # a preset may hold an empty list; [suggest] checks its own length
+
+    text = re.escape(_SUGGEST_TEXT.format(item="cover age=1"))
+    with pytest.raises(ValueError, match=f"^{text}$"):
+        check_pairs(["coverage=0.4", "cover age=1"])
+
+    with pytest.raises(ValueError, match=r"^'a' given twice$"):
+        check_pairs(["a=1", "b=2", "a=3"])
 
 
 def test_a_suggestion_value_may_hold_an_equals_sign_and_be_empty(

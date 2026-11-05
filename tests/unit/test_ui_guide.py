@@ -8,13 +8,15 @@ from __future__ import annotations
 
 import json
 import shlex
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from smc.ui.controller import CheckItem
+from smc.plugins.presets import Preset, PresetCheck, PresetFile
+from smc.ui.controller import CheckItem, LoadedPreset
 from smc.ui.guide import (
     CAPTURE_WELLS,
     DRY_RUN_NO_FRAME,
@@ -22,6 +24,8 @@ from smc.ui.guide import (
     NextStep,
     command_line,
     next_slot,
+    preset_differences,
+    preset_note_text,
 )
 
 
@@ -176,6 +180,161 @@ def test_command_line_names_the_profile_the_dry_run_and_the_run_doc() -> None:
         str(run_doc),
         "--dry-run",
     ]
+
+
+def test_command_line_puts_the_preset_after_dry_run_and_before_the_pairs() -> None:
+    run_doc = Path("/runs/run.json")
+
+    said = shlex.split(
+        command_line(
+            "scan-plan",
+            ["wells=B2,B11", "coverage=0.4"],
+            profile="demo-sample",
+            run_doc=run_doc,
+            dry_run=True,
+            preset="/p/my presets/weekly.toml",
+        )
+    )
+
+    assert said == [
+        "smc",
+        "run",
+        "scan-plan",
+        "-p",
+        "demo-sample",
+        "--run-doc",
+        str(run_doc),
+        "--dry-run",
+        "--preset",
+        "/p/my presets/weekly.toml",
+        "--param",
+        "wells=B2,B11",
+        "--param",
+        "coverage=0.4",
+    ]
+    without = shlex.split(
+        command_line("scan-plan", [], profile="demo", run_doc=run_doc, dry_run=False)
+    )
+    assert "--preset" not in without
+
+
+def test_preset_differences_name_each_changed_field_with_default_for_empty() -> None:
+    expected = {
+        "scan-plan": {"coverage": "0.4", "objective": "", "overlap": "0.1"},
+        "cells": {"detector": "blobs"},
+        "density": {"labels": "x"},
+    }
+    actual = {
+        "scan-plan": {"coverage": " 0.5 ", "objective": "10x", "overlap": ""},
+        "cells": {"detector": "blobs "},
+        # `density` is not on the page any more: its fields read as empty.
+    }
+
+    assert preset_differences(expected, actual) == (
+        "scan-plan coverage: 0.5 (the preset: 0.4)",
+        "scan-plan objective: 10x (the preset: (default))",
+        "scan-plan overlap: (default) (the preset: 0.1)",
+        "density labels: (default) (the preset: x)",
+    )
+    assert preset_differences(expected, expected) == ()
+    assert preset_differences({}, actual) == ()
+
+
+def test_preset_differences_compare_stripped_text_on_both_sides() -> None:
+    # A hand-edited `coverage= 0.4` puts " 0.4" in the field; what a run sends is the
+    # stripped text, so the page right after the load differs in nothing.
+    expected = {"scan-plan": {"coverage": " 0.4", "overlap": "0.1"}}
+
+    assert (
+        preset_differences(
+            expected, {"scan-plan": {"coverage": " 0.4 ", "overlap": "0.1"}}
+        )
+        == ()
+    )
+    assert (
+        preset_differences(
+            expected, {"scan-plan": {"coverage": "0.4", "overlap": "0.1"}}
+        )
+        == ()
+    )
+    assert preset_differences(
+        expected, {"scan-plan": {"coverage": "0.5", "overlap": "0.1"}}
+    ) == ("scan-plan coverage: 0.5 (the preset: 0.4)",)
+
+
+def test_preset_differences_show_a_long_value_on_one_cut_line_and_compare_it_whole() -> (
+    None
+):
+    long = "[" + ",".join(["1"] * 100) + "]"
+    expected = {"route": {"labels": long}}
+
+    same = preset_differences(expected, {"route": {"labels": long}})
+    other = preset_differences(expected, {"route": {"labels": long + "\n,2"}})
+
+    assert same == ()
+    assert len(other) == 1
+    line = other[0]
+    assert "\n" not in line
+    assert line.startswith("route labels: [1,1,1")
+    assert line.count("…") == 2  # both values are cut
+    assert len(line) < 220
+
+
+#: The note writes the path as the OS spells it (`\p\weekly.toml` on Windows, FM-24), so
+#: the expected text is made from the path and not typed.
+PRESET_PATH = Path("/p/weekly.toml")
+LOADED_LINE = f"loaded: weekly  ({PRESET_PATH})"
+
+
+def _loaded(mismatches: Sequence[str] = ()) -> LoadedPreset:
+    file = PresetFile("weekly", PRESET_PATH, Preset())
+    return LoadedPreset(
+        file=file,
+        check=PresetCheck("weekly", None, None, {}, ()),
+        fields={},
+        selection=None,
+        mismatches=tuple(mismatches),
+    )
+
+
+def test_preset_note_text_says_none_loaded_and_when_the_page_holds_the_values() -> None:
+    assert preset_note_text(None, ()) == "no preset loaded"
+    assert preset_note_text(_loaded(), ()) == (
+        f"{LOADED_LINE}\nthe page holds the preset's values"
+    )
+
+
+def test_preset_note_text_lists_the_mismatches_then_what_changed() -> None:
+    note = preset_note_text(
+        _loaded(["preset weekly was saved on nikon-ti2; this stand is demo"]),
+        ["scan-plan coverage: 0.5 (the preset: 0.4)"],
+    )
+
+    assert note.split("\n") == [
+        LOADED_LINE,
+        "  preset weekly was saved on nikon-ti2; this stand is demo",
+        "changed since loading:",
+        "  scan-plan coverage: 0.5 (the preset: 0.4)",
+    ]
+
+
+def test_preset_note_text_cuts_mismatches_and_differences_at_eight() -> None:
+    mismatches = [f"mismatch {n}" for n in range(11)]
+    differences = [f"difference {n}" for n in range(9)]
+
+    lines = preset_note_text(_loaded(mismatches), differences).split("\n")
+
+    assert lines == [
+        LOADED_LINE,
+        *[f"  mismatch {n}" for n in range(8)],
+        "  … 3 more",
+        "changed since loading:",
+        *[f"  difference {n}" for n in range(8)],
+        "  … 1 more",
+    ]
+    # Eight is not cut: nothing is hidden behind a "… 0 more".
+    exact = preset_note_text(_loaded(mismatches[:8]), differences[:8])
+    assert "more" not in exact
 
 
 @given(

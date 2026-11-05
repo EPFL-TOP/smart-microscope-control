@@ -41,6 +41,9 @@ dependencies = [
   "tifffile>=2024.1",
   # TOML profiles on Python 3.10 (tomllib is stdlib from 3.11).
   "tomli>=2.0; python_version < '3.11'",
+  # Presets (m5 §10) are TOML files that the page writes: nothing else writes TOML.
+  # 1.0 ships py.typed; measured on Python 3.10.10 and 3.13.0.
+  "tomli-w>=1.0",
   # `assert_never` (typing's own is 3.11+): mypy names an enum member with no branch.
   # 4.6.1 is pydantic's floor, so this adds no constraint, only declares the import.
   "typing_extensions>=4.6.1",

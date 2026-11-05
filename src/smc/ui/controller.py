@@ -28,7 +28,7 @@ import queue
 import threading
 import time
 import weakref
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from importlib.metadata import EntryPoint
@@ -38,7 +38,7 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple, TypeVar, cast
 import numpy as np
 import numpy.typing as npt
 import useq
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from smc import drive
 from smc.drive import DriveResult
@@ -67,6 +67,19 @@ from smc.plugins import (
     parse_params,
     run_plugin,
 )
+from smc.plugins.presets import (
+    NOT_IN_PARAMS,
+    Preset,
+    PresetCheck,
+    PresetError,
+    PresetFile,
+    check_name,
+    check_preset,
+    list_presets,
+    registered_plate,
+)
+from smc.plugins.presets import load_preset as read_preset
+from smc.plugins.presets import save_preset as write_preset
 from smc.plugins.runner import reachable_checkpoint
 from smc.plugins.scan_plan.wells import parse_wells
 from smc.plugins.slots import (
@@ -104,6 +117,7 @@ __all__ = [
     "PAGE_PARAMS",
     "STAGES",
     "CheckItem",
+    "LoadedPreset",
     "PageServerError",
     "PageStatus",
     "PlatePage",
@@ -333,6 +347,24 @@ class ToolView:
     advanced: tuple[tuple[str, str, str, str], ...]
     suggested: tuple[tuple[str, str], ...] = ()
     suggested_why: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedPreset:
+    """The preset the page was given, what of it applied and what did not (m5 §10.5).
+
+    ``check`` is the preset checked against this stand and run document, whose
+    ``params`` are the pairs that apply; ``fields`` are those pairs split at their
+    first ``=``, per tool, for the view to put in its fields. ``selection`` is the
+    selection the load set, ``None`` when it set none. ``mismatches`` are the
+    check's lines and then the page's own: every one a note, never a refusal.
+    """
+
+    file: PresetFile
+    check: PresetCheck
+    fields: dict[str, dict[str, str]]
+    selection: tuple[str, ...] | None
+    mismatches: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -780,6 +812,9 @@ class PlatePage:
         # Checked once, against the registry, before any tool is described: a tool's
         # form starts with a suggested value (m5 §8.3).
         self._suggested, self._suggest_problems = self._check_suggestions(profile)
+        # The preset loaded on this page, shared by every tab and kept under
+        # ``_lock``, as the plate and the selection are (m5 §10.5).
+        self._preset: LoadedPreset | None = None
         self._geometry: dict[
             tuple[str, tuple[float, float], float], tuple[WellGeometry, ...]
         ] = {}
@@ -1042,6 +1077,169 @@ class PlatePage:
         dumped_walls = json.dumps([w.model_dump(mode="json") for w in walls])
         return [f"plate={self._plate}", f"refs={dumped_refs}", f"walls={dumped_walls}"]
 
+    # --- presets (m5 §10.5) -----------------------------------------------------------
+
+    @property
+    def preset(self) -> LoadedPreset | None:
+        """The preset loaded on the page, or ``None``; every tab sees it."""
+        with self._lock:
+            return self._preset
+
+    def presets(self) -> tuple[PresetFile, ...]:
+        """The presets of this stand's folders, a broken file with its error (never read by the tick)."""
+        return list_presets(self._profile)
+
+    def load_preset(self, source: str) -> LoadedPreset:
+        """Apply the preset ``source`` names (a name or a ``.toml`` path) and keep it as the loaded one.
+
+        The plate and the wells are applied, and the pairs are for the view to put
+        in the tools' fields; every mismatch is a line of the result, never a
+        refusal. It needs no stand and is allowed while an activity goes: it reaches
+        no device, and a run in flight has already read its pairs.
+
+        A plate that this page holds captures on is not changed for a preset of
+        another one, and neither are its wells: ``choose_plate`` would drop the
+        captures, which are measured and cannot be brought back by a click.
+
+        Raises:
+            PresetError: No such preset, or the file cannot be read or is invalid;
+                the message is the diagnosis, on one line.
+        """
+        file = read_preset(source, self._profile)
+        models: dict[str, type[BaseModel]] = {
+            name: entry.plugin.Params
+            for name, entry in self._registry().plugins.items()
+        }
+        check = check_preset(
+            file,
+            models,
+            stand=self._profile.microscope.name,
+            registered=registered_plate(self._document()[0]),
+        )
+        mismatches = list(check.mismatches)
+        plate, wells = check.plate, check.wells
+        if plate is not None and plate != self._plate and (self.refs or self.walls):
+            mismatches.append(
+                f"preset {file.name} is for a {plate} plate; this page has captures "
+                f"on a {self._plate} plate: its plate and wells are not applied"
+            )
+            plate = wells = None
+        if plate is not None:
+            self.choose_plate(plate)
+        selection: tuple[str, ...] | None = None
+        if wells is not None:
+            try:
+                self.select_text(wells)
+            except ValueError as exc:
+                mismatches.append(f"preset {file.name}: wells {wells}: {exc}")
+            else:
+                selection = self.selection
+        loaded = LoadedPreset(
+            file=file,
+            check=check,
+            fields={
+                plugin: dict(item.split("=", 1) for item in items)
+                for plugin, items in check.params.items()
+            },
+            selection=selection,
+            mismatches=tuple(mismatches),
+        )
+        with self._lock:
+            self._preset = loaded
+        return loaded
+
+    def forget_preset(self) -> None:
+        """No preset is loaded: a run records none, and the next step suggests none."""
+        with self._lock:
+            self._preset = None
+
+    def save_preset(
+        self,
+        name: str,
+        fields: Mapping[str, Sequence[str]],
+        wells: str,
+        *,
+        overwrite: bool = False,
+    ) -> LoadedPreset:
+        """Save the page's choices as the preset ``name`` and make it the loaded one.
+
+        ``fields`` are the ``key=value`` pairs of each tool's non-empty fields, as
+        a run collects them. Each tool's pairs must be ones its ``Params`` accepts,
+        so that a preset its next run would refuse is never written. What the page
+        itself fills when a tool runs (``PAGE_PARAMS``: the wells, the plate and the
+        captures) is added for that check only, since a tool's other fields cannot
+        be checked without it; the wells it adds when none are selected are a
+        stand-in, and the preset keeps none.
+
+        ``wells`` is the *Wells* box's text: kept as typed when it names exactly the
+        selection (``A1:D6`` stays ``A1:D6``), else the selection is joined. With
+        no selection the preset has no wells.
+
+        Raises:
+            PresetError: The name or a value is refused (nothing is written), the
+                file cannot be written, or the name is taken and ``overwrite`` is
+                false (``PresetExistsError``).
+        """
+        check_name(name)
+        plugins = self._registry().plugins
+        params: dict[str, tuple[str, ...]] = {}
+        for plugin, pairs in fields.items():
+            if not pairs:
+                continue
+            entry = plugins.get(plugin)
+            if entry is None:
+                raise PresetError(f"no plugin named {plugin}; nothing saved")
+            for pair in pairs:
+                key = pair.partition("=")[0]
+                if key in NOT_IN_PARAMS.get(plugin, {}):
+                    raise PresetError(
+                        f"{plugin}: {key} is not kept under params: "
+                        f"{NOT_IN_PARAMS[plugin][key]}; nothing saved"
+                    )
+            try:
+                parse_params(
+                    entry.plugin.Params, [*pairs, *self._pairs_the_page_adds(plugin)]
+                )
+            except ParamsError as exc:
+                raise PresetError(
+                    f"{plugin}: {'; '.join(exc.problems)}; nothing saved"
+                ) from None
+            params[plugin] = tuple(pairs)
+        preset = Preset(
+            stand=self._profile.microscope.name,
+            plate=self._plate,
+            wells=self._wells_to_save(wells),
+            saved_utc=datetime.now(timezone.utc).replace(microsecond=0),
+            params=params,
+        )
+        path = write_preset(name, preset, self._profile, overwrite=overwrite)
+        return self.load_preset(str(path))
+
+    def _pairs_the_page_adds(self, plugin: str) -> list[str]:
+        """What a run of ``plugin`` adds to its fields, so that its other fields can be checked alone."""
+        if plugin not in PAGE_PARAMS:
+            return []
+        try:
+            return self.page_params(plugin)
+        except ValueError:
+            # `scan-plan` with nothing selected, or a selection on another plate than
+            # the registered one: a run is refused for that, a preset is not (it keeps
+            # no wells then). Its other fields still need a well to be looked at.
+            return ["wells=A1"]
+
+    def _wells_to_save(self, text: str) -> str | None:
+        """The ``wells`` a preset keeps: the box's text when it names the selection, else the selection."""
+        if not self.selection:
+            return None
+        typed = text.strip()
+        if typed and "\n" not in typed and "\r" not in typed:
+            try:
+                if parse_wells(self._plate, typed) == self.selection:
+                    return typed
+            except ValueError:
+                pass
+        return ",".join(self.selection)
+
     # --- runs, stop, status ---------------------------------------------------------
 
     def run(self, plugin: str, params: Sequence[str]) -> None:
@@ -1071,6 +1269,10 @@ class PlatePage:
             return
         profile = self._profile.microscope.name
         dry_run = self._dry_run
+        # Read at the click, not when the worker starts: the preset the operator
+        # saw loaded is the one the record names (m5 §10.5).
+        loaded = self.preset
+        preset = None if loaded is None else loaded.file.name
         try:
             entry = load(plugin, self._entry_points)
             try:
@@ -1109,7 +1311,8 @@ class PlatePage:
             self._set_outcome(f"{plugin}: {_checkpoint_reason(plugin, kept)}")
             return
         self._start_activity(
-            plugin, lambda event: self._run_plugin(plugin, entry, parsed, event)
+            plugin,
+            lambda event: self._run_plugin(plugin, entry, parsed, event, preset),
         )
 
     def _start_activity(
@@ -1182,6 +1385,7 @@ class PlatePage:
         entry: PluginEntry,
         parsed: PluginParams,
         event: threading.Event,
+        preset: str | None = None,
     ) -> str:
         """A plugin's run on the worker, and its outcome as text."""
         log.info("%s: started from the plate page", plugin)
@@ -1195,6 +1399,7 @@ class PlatePage:
                 on_progress=self._queue.put,
                 stop=event,
                 plugin_version=entry.version,
+                preset=preset,
             )
         except RunDocumentError as exc:
             if exc.record is not None and exc.record.result is not None:
@@ -2468,14 +2673,30 @@ class PlatePage:
             # camera and computes the same in a dry run. A dry run may read a real
             # scan, so `cells` is stuck only when the scan it would read was a dry run.
             stuck = DRY_RUN_NO_FRAME
+        # The preset wins over the profile's suggestion key by key (m5 §10.5): a
+        # suggestion the preset gives another value for is not offered at all.
+        loaded = self.preset
+        from_preset = (
+            [] if loaded is None else list(loaded.fields.get(tool.name, {}).items())
+        )
         suggestion = self._suggested.get(tool.name)
         if suggestion is not None:
-            given = [f"{key}={value}" for key, value in suggestion.pairs]
-            pairs += given
-            why.append(
-                f"{' '.join(given)}: suggested by the profile "
-                f"{self._profile.microscope.name}: {suggestion.why}"
-            )
+            overridden = {key for key, _value in from_preset}
+            given = [
+                f"{key}={value}"
+                for key, value in suggestion.pairs
+                if key not in overridden
+            ]
+            if given:
+                pairs += given
+                why.append(
+                    f"{' '.join(given)}: suggested by the profile "
+                    f"{self._profile.microscope.name}: {suggestion.why}"
+                )
+        if loaded is not None and from_preset:
+            named = [f"{key}={value}" for key, value in from_preset]
+            pairs += named
+            why.append(f"{' '.join(named)}: from the preset {loaded.file.name}")
         why += [f"or {other.name}: {_flat(other.summary)}" for other in others]
         source = self._profile.source
         command = command_line(
@@ -2484,6 +2705,7 @@ class PlatePage:
             profile=self._profile.microscope.name if source is None else str(source),
             run_doc=self.run_doc,
             dry_run=self._dry_run,
+            preset=None if loaded is None else str(loaded.file.path),
         )
         # What the run document or the stand says first wins: it is the reason that holds.
         return NextStep(

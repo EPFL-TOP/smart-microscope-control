@@ -32,7 +32,15 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, ValidationError
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    SerializationInfo,
+    SerializerFunctionWrapHandler,
+    ValidationError,
+    model_serializer,
+)
 
 from smc.run.files import AtomicWriteError, retry_on_permission_error, write_atomically
 
@@ -90,6 +98,21 @@ class StageRecord(BaseModel):
     checkpoint: dict[str, Any] | None = None
     reads: dict[str, ReadRecord | None] = {}
     error: str | None = None
+    #: The name of the preset the run was given (m5 §10.4); ``params`` stay the
+    #: values the run used, whatever was edited after the preset was loaded.
+    preset: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _leave_out_a_missing_preset(
+        self, handler: SerializerFunctionWrapHandler, info: SerializationInfo
+    ) -> dict[str, Any]:
+        # A record that names no preset is written exactly as before the field
+        # existed, so an older smc still reads the document: its model refuses
+        # a key it does not know (FM-107), and SCHEMA_VERSION stays 1.
+        data: dict[str, Any] = handler(self)
+        if self.preset is None:
+            data.pop("preset", None)
+        return data
 
 
 class RunDocumentError(Exception):

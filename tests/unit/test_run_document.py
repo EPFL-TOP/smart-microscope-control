@@ -42,6 +42,7 @@ def _record(
     dry_run: bool = False,
     reads: dict[str, ReadRecord | None] | None = None,
     result: dict[str, Any] | None = None,
+    preset: str | None = None,
 ) -> StageRecord:
     started = T0 + timedelta(minutes=minute)
     return StageRecord(
@@ -57,6 +58,7 @@ def _record(
         params={},
         result=result if result is not None else ({} if status is DONE else None),
         reads=reads or {},
+        preset=preset,
     )
 
 
@@ -101,6 +103,30 @@ def test_a_written_document_loads_back_equal(tmp_path: Path) -> None:
     text = path.read_text(encoding="utf-8")
     assert text.endswith("}\n")
     assert '\n  "schema_version": 1,' in text  # indent=2
+
+
+def test_a_record_without_preset_is_written_without_the_key(tmp_path: Path) -> None:
+    # A run that named no preset is written exactly as before the field existed,
+    # so an older smc still reads the document (m5 §10.4).
+    path = tmp_path / "run.json"
+    write_stage(path, _record("a"))
+
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert "preset" not in stored["stages"]["a"]
+    assert RunDocument.load(path).stages["a"].preset is None
+
+
+def test_a_record_with_preset_round_trips(tmp_path: Path) -> None:
+    path = tmp_path / "run.json"
+    write_stage(path, _record("a", preset="weekly"))
+    write_stage(path, _record("b"))
+
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["stages"]["a"]["preset"] == "weekly"
+    assert "preset" not in stored["stages"]["b"]
+    loaded = RunDocument.load(path)
+    assert loaded.stages["a"].preset == "weekly"
+    assert loaded.stages["b"].preset is None
 
 
 def test_a_lone_surrogate_in_a_result_is_written_as_ascii_and_reads_back(

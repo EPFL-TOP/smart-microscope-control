@@ -532,6 +532,47 @@ def test_stop_requested_records_stopped_and_returns_the_record(
     assert _stored(tmp_path, "stops") == record
 
 
+class SeesItsRecords(Base):
+    """Reads its own record at the start and after a checkpoint, as the document holds it."""
+
+    name = provides = "sees-its-records"
+
+    def body(self, microscope: Any, params: Params, ctx: RunContext) -> Result:
+        path = ctx.run_dir / "run.json"
+        self.seen["running"] = RunDocument.load(path).stages[self.name]
+        ctx.save_checkpoint(Seen(done=1))
+        self.seen["checkpoint"] = RunDocument.load(path).stages[self.name]
+        return Result(value=1)
+
+
+def test_run_plugin_writes_the_preset_into_every_record(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    # A run that is stopped keeps the preset of its last record, so every record
+    # of the run names it: the first, the checkpoints and the last (m5 §10.4).
+    plugin = SeesItsRecords()
+    done = _run(plugin, fake_microscope, tmp_path, preset="weekly")
+
+    assert plugin.seen["running"].status is StageStatus.running
+    assert plugin.seen["running"].preset == "weekly"
+    assert plugin.seen["checkpoint"].checkpoint == {"done": 1}
+    assert plugin.seen["checkpoint"].preset == "weekly"
+    assert done.preset == "weekly"
+    assert _stored(tmp_path, "sees-its-records").preset == "weekly"
+
+    stopped = _run(Stops(), fake_microscope, tmp_path, preset="weekly")
+    assert stopped.status is StageStatus.stopped
+    assert stopped.preset == "weekly"
+
+
+def test_a_run_without_a_preset_records_none(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    plugin = SeesItsRecords()
+    assert _run(plugin, fake_microscope, tmp_path).preset is None
+    assert plugin.seen["checkpoint"].preset is None
+
+
 def test_a_wrong_result_type_records_failed(
     fake_microscope: Microscope, tmp_path: Path
 ) -> None:
