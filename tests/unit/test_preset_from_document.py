@@ -15,9 +15,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import model_validator
 from pydantic_core import to_jsonable_python
 
 from smc.plugins import discover
+from smc.plugins.api import PluginParams
 from smc.plugins.params import format_param, parse_params
 from smc.plugins.presets import (
     NOT_IN_PARAMS,
@@ -41,7 +43,13 @@ T0 = datetime(2026, 11, 5, 9, 0, tzinfo=timezone.utc)
 SAVED = datetime(2026, 11, 5, 10, 0, tzinfo=timezone.utc)
 STAND = "demo-sample"
 
-_REGISTRY = discover().plugins
+# Only this distribution's plugins: a lab's own plugin, installed in the same venv
+# through the entry-point group, is not a case this module can write.
+_REGISTRY = {
+    name: entry
+    for name, entry in discover().plugins.items()
+    if entry.distribution == "smart-microscope-control"
+}
 MODELS: dict[str, Any] = {
     name: entry.plugin.Params for name, entry in _REGISTRY.items()
 }
@@ -73,7 +81,7 @@ def _record(
     started = T0 + timedelta(minutes=minute)
     return StageRecord(
         plugin=plugin,
-        provides=PROVIDES[plugin],
+        provides=PROVIDES.get(plugin, plugin),
         attempt=f"{plugin}-{minute}",
         status=status,
         started_utc=started,
@@ -511,3 +519,61 @@ def test_a_cross_field_rule_is_read_back_on_the_whole_set_not_pair_by_pair() -> 
 
     assert made.preset.params == {"scan-plan": ("rows=3", "columns=2")}
     assert made.notes == ()
+
+
+class _NeedsALabel(PluginParams):
+    """A plugin whose ``count`` is refused without a ``label``: a rule between two fields."""
+
+    label: str | None = None
+    count: int
+
+    @model_validator(mode="after")
+    def _count_needs_a_label(self) -> _NeedsALabel:
+        if self.count and self.label is None:
+            raise ValueError("count needs a label")
+        return self
+
+
+def test_pairs_that_the_plugin_refuses_as_a_whole_are_not_saved_and_the_note_says_why() -> (
+    None
+):
+    # `label="null"` is valid in the record, but its text reads back as None, and then
+    # the whole set is refused: not one of the plugin's pairs is saved.
+    recorded = {"label": "null", "count": 2}
+
+    made = _preset_of(
+        _record("needs-a-label", recorded),
+        _plan(wells="B2"),
+        models={**MODELS, "needs-a-label": _NeedsALabel},
+    )
+
+    assert made.preset.params == {}
+    assert made.preset.wells == "B2"
+    assert made.notes == (
+        "needs-a-label: its pairs do not read back "
+        "(parameters: Value error, count needs a label); not saved",
+    )
+
+
+def test_a_plate_name_that_does_not_encode_is_left_out_and_named() -> None:
+    made = _preset_of(_registered("96-well" + SURROGATE), _plan(wells="B2"))
+
+    assert made.preset.plate is None
+    assert made.preset.wells == "B2"
+    assert made.notes == ("plate holds a character that is not text; not saved",)
+    assert dumps_preset(made.preset).encode("utf-8")
+
+
+def test_a_record_is_validated_again_before_its_values_are_used() -> None:
+    # FM-125: a record written by an older smc lacks the keys added since, and one edited
+    # by hand holds `"0.4"` for a float. Neither is a reason to fail or to drop the pair.
+    older = _record("scan-plan", {"wells": "B2", "coverage": 0.4})
+    typed = _record(
+        "scan-plan", {**_recorded("scan-plan", wells="B2"), "coverage": "0.4"}
+    )
+
+    for record in (older, typed):
+        made = _preset_of(record)
+
+        assert made.preset.params == {"scan-plan": ("coverage=0.4",)}
+        assert made.notes == ()

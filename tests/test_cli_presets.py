@@ -953,6 +953,29 @@ def test_presets_save_prints_the_saved_line_the_preset_and_the_notes_in_that_ord
     ]
 
 
+def test_presets_save_writes_the_stand_of_the_profile_it_is_given_beside_that_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_stand: None
+) -> None:
+    # `-p` is a path whose text is not the stand's name: the preset holds the name.
+    _register(monkeypatch, Cells)
+    folder = tmp_path / "bench"
+    folder.mkdir()
+    profile = folder / "bench.toml"
+    profile.write_text('[microscope]\nname = "bench-ti2"\n', encoding="utf-8")
+    path = _stage(tmp_path, "cells", {"detector": "blobs"}, profile="bench-ti2")
+
+    result = _run(
+        "presets", "save", "weekly", "--run-doc", str(path), "-p", str(profile)
+    )
+
+    written = folder / "presets" / "weekly.toml"
+    assert result.exit_code == 0, result.output
+    assert _lines(result)[:2] == [f"saved weekly to {written}", "stand: bench-ti2"]
+    assert 'stand = "bench-ti2"' in written.read_text(encoding="utf-8")
+    # The stage was run on that stand: no note.
+    assert _lines(result)[-1] == "cells: detector=blobs"
+
+
 def test_presets_save_reports_a_folder_it_cannot_write_and_exits_1(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_stand: None
 ) -> None:

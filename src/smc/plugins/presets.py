@@ -22,7 +22,6 @@ and its check live here and import no Panel and reach no device:
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -593,6 +592,11 @@ def preset_from_document(
         if record.profile != stand:
             notes.append(f"{plugin} was run on {record.profile}, not on {stand}")
     plate = registered_plate(doc)
+    if plate is not None and not _is_text(plate):
+        # A plate name read from a result that carries a lone surrogate (FM-05):
+        # it would end the save at the encoding, with no word about which value.
+        notes.append("plate holds a character that is not text; not saved")
+        plate = None
     if plate is None and wells is None and not params:
         # The refused plugins are named too: "used only default values" would be
         # untrue of a plugin whose values did not read back.
@@ -674,10 +678,7 @@ def _pairs_of(
             f"{plugin}: its pairs do not read back ({'; '.join(exc.problems)}); "
             "not saved"
         )
-    # Dumped, so that ``True`` is not ``1`` and ``1.0`` is not ``1``.
-    changed = [
-        key for key in fields if json.dumps(back[key]) != json.dumps(values[key])
-    ]
+    changed = [key for key in fields if back[key] != values[key]]
     if changed:
         return (), (
             f"{plugin}: {', '.join(changed)} would read back as another value; "
