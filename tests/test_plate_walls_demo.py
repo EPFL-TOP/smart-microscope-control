@@ -71,7 +71,12 @@ STEP_UM = 0.75 * 384 * PIXEL_UM
 FULL_WALK = 1 + 2 * math.floor(0.5 * RADIUS_UM / STEP_UM)
 LOGGER = "smc.plugins.plate-walls"
 #: Where each well is off from where the operator "centred" it: up to 300 µm.
-ROUGH_UM = {"A1": (300.0, -200.0), "H12": (-250.0, 150.0), "H1": (200.0, 250.0)}
+ROUGH_UM = {
+    "A1": (300.0, -200.0),
+    "H12": (-250.0, 150.0),
+    "H1": (200.0, 250.0),
+    "A12": (-100.0, 200.0),
+}
 #: The wells' (column, row) indices, written out here and not read from useq.
 INDEX = {"A1": (0, 0), "H1": (0, 7), "H12": (11, 7), "A12": (11, 0), "D7": (6, 3)}
 
@@ -193,9 +198,11 @@ class _Stage:
     every target, so the stage lands off it and reads back where it really is;
     ``nan_readback_at`` is a move that arrives and reads back a position that is
     not finite; ``limits`` is what ``limits_um()`` says (the demo has none);
-    ``unreadable_after_fault`` makes the position unreadable once a move raised.
-    It implements the seven methods of ``XYStage``: ``Microscope.override``
-    refuses an implementation that lacks one, and it bypasses the ``Executor``.
+    ``unreadable_after_fault`` makes the position unreadable once a move raised;
+    ``travelling`` is the position a stage still on its way from an earlier move
+    reads until ``wait()`` is called (FM-85). It implements the seven methods of
+    ``XYStage``: ``Microscope.override`` refuses an implementation that lacks
+    one, and it bypasses the ``Executor``.
     """
 
     def __init__(
@@ -207,6 +214,7 @@ class _Stage:
         nan_readback_at: int | None = None,
         limits: tuple[Limits, Limits] | None = None,
         unreadable_after_fault: bool = False,
+        travelling: tuple[float, float] | None = None,
     ) -> None:
         self._inner = inner
         self._raises = raises or {}
@@ -214,6 +222,7 @@ class _Stage:
         self._nan_readback_at = nan_readback_at
         self._limits = limits
         self._unreadable_after_fault = unreadable_after_fault
+        self._travelling = travelling
         self._faulted = False
         self.moves = 0
         self.targets: list[tuple[float, float]] = []
@@ -221,6 +230,8 @@ class _Stage:
     def position_um(self) -> XY:
         if self._faulted and self._unreadable_after_fault:
             raise HardwareError("the position cannot be read")
+        if self._travelling is not None:
+            return XY(*self._travelling)
         return self._inner.position_um()
 
     def move_to_um(self, x_um: float, y_um: float) -> XY:
@@ -240,6 +251,7 @@ class _Stage:
         raise AssertionError("plate-walls makes no relative move")
 
     def wait(self, timeout_s: float | None = None) -> None:
+        self._travelling = None
         self._inner.wait(timeout_s)
 
     def is_busy(self) -> bool:
@@ -428,6 +440,11 @@ def _refused(
     with pytest.raises(PluginRunError) as raised:
         _run(stand, run_doc, refs, **params)
     assert raised.value.plugin == "plate-walls"
+    # FM-98: a refusal is raised outside the handler of the error it stands for
+    # (the layer's `SafetyRefusedError`, the fit's `ValueError`), so that error is
+    # not on its traceback, where it would keep the core's frames alive.
+    assert raised.value.__context__ is None
+    assert raised.value.__cause__ is None
     return raised.value
 
 
@@ -540,9 +557,16 @@ def test_three_wells_fill_the_plate_slot_with_their_walls(
         assert math.dist(fitted.center_xy_um, truth) < 1.0
         assert fitted.diameter_um == pytest.approx(2 * RADIUS_UM, abs=2.0)
         assert fitted.size_error == pytest.approx(0.0, abs=1e-3)
-        assert fitted.rms_um < 2.0
-        assert fitted.n_points >= 0.95 * sum(w.n_points for w in fitted.walls)
+        # The well's points are the walls' points, none trimmed on a clean circle,
+        # and they lie a pixel or less from it: not 0 (the pixels are quantised).
+        assert 0.0 < fitted.rms_um < 2.0
+        assert fitted.n_points == sum(w.n_points for w in fitted.walls)
         for wall in fitted.walls:
+            # Under a camera turned 30° and mirrored, +X and -X run along the 384
+            # rows' bands (48 lines) and +Y and -Y along the 512 columns' (64); a
+            # wall is found by at least half of them, and by no more than all.
+            lines = 48 if wall.side in ("+X", "-X") else 64
+            assert lines / 2 <= wall.n_points <= lines
             first += wall.frames
             # The frame was taken where the stage says it was (the camera read it
             # there), and it is centred on the wall: its distance from the well's
@@ -856,6 +880,84 @@ def test_a_walk_outside_the_soft_limits_is_refused_before_anything_moves(
     assert camera.snaps == 0
 
 
+@pytest.mark.parametrize(
+    ("limit", "well", "side", "direction"),
+    [
+        ("y_high", "A1", "+Y", (0.0, 1.0)),
+        ("y_low", "H12", "-Y", (0.0, -1.0)),
+        ("x_low", "A1", "-X", (-1.0, 0.0)),
+    ],
+)
+def test_a_walk_that_leaves_the_travel_on_any_axis_is_refused_before_anything_moves(
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    limit: str,
+    well: str,
+    side: str,
+    direction: tuple[float, float],
+) -> None:
+    """The check is on both axes and both ends (FM-73): one limit short each time, 1000 µm past the nominal wall."""
+    camera = _on_fake(fake_microscope)
+    run_doc = tmp_path / "run.json"
+    _seed(run_doc, fake_microscope)
+    refs = _refs("A1", "H12")
+    ref = next(r for r in refs if r.well == well)
+    big = 1e6
+    beyond = RADIUS_UM + 1000.0
+    limits = {
+        "y_high": (Limits(-big, big), Limits(-big, ref.y_um + beyond)),
+        "y_low": (Limits(-big, big), Limits(ref.y_um - beyond, big)),
+        "x_low": (Limits(ref.x_um - beyond, big), Limits(-big, big)),
+    }[limit]
+    stage = _Stage(fake_microscope.require(XYStage), limits=limits)
+    fake_microscope.override(XYStage, stage)
+
+    refused = _refused(fake_microscope, run_doc, refs)
+
+    # The walk goes r, r+s, r-s, r+2s, ...: the first offset past 1000 µm beyond
+    # the nominal wall is r + 6s, on the other axis the recorded coordinate.
+    d = RADIUS_UM + 6 * STEP_UM
+    x = ref.x_um + direction[0] * d
+    y = ref.y_um + direction[1] * d
+    assert refused.reason == (
+        f"{well}'s {side} wall would be looked for at ({x + 0.0:.1f}, {y + 0.0:.1f}) "
+        "µm, outside the stage's soft limits"
+    )
+    assert stage.moves == 0
+    assert camera.snaps == 0
+
+
+def test_a_frame_exactly_on_a_limit_is_inside_it_and_a_run_with_limits_says_nothing_of_none(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """The layer's own test is ``low <= v <= high``: the walk's furthest frame on each of four limits passes."""
+    camera = _on_fake(fake_microscope)
+    run_doc = tmp_path / "run.json"
+    _seed(run_doc, fake_microscope)
+    refs = _refs("A1", "H12")
+    a1, h12 = refs
+    # 1600 µm is 8 steps of 187.2: the furthest offset of the walk is r + 8s.
+    d = RADIUS_UM + 8 * STEP_UM
+    stage = _Stage(
+        fake_microscope.require(XYStage),
+        limits=(
+            Limits(a1.x_um + -1.0 * d, h12.x_um + 1.0 * d),
+            Limits(h12.y_um + -1.0 * d, a1.y_um + 1.0 * d),
+        ),
+    )
+    fake_microscope.override(XYStage, stage)
+
+    result = _result(_run(fake_microscope, run_doc, refs))
+
+    # The stage said where it can go, so there is no line about the travel that
+    # was not checked: only the two-wells line.
+    assert result.assumed == (
+        "two wells: the residual checks their distance only; a third well checks the fit",
+    )
+    assert result.walls is not None
+    assert result.walls.frames == camera.snaps
+
+
 def test_a_calibration_of_another_frame_is_refused_before_anything_moves(
     fake_microscope: Microscope, tmp_path: Path
 ) -> None:
@@ -960,8 +1062,15 @@ def test_square_wells_are_refused(fake_microscope: Microscope, tmp_path: Path) -
             ),
             "A2's recorded position (9e+09, 0) µm is beyond ±1e+06 µm: is it in µm?",
         ),
+        (
+            (
+                WellRef(well="A1", x_um=0.0, y_um=0.0),
+                WellRef(well="A2", x_um=0.0, y_um=-9.0e9),
+            ),
+            "A2's recorded position (0, -9e+09) µm is beyond ±1e+06 µm: is it in µm?",
+        ),
     ],
-    ids=["one", "seven", "off the plate", "twice", "a unit slip"],
+    ids=["one", "seven", "off the plate", "twice", "a unit slip", "a unit slip in y"],
 )
 def test_the_references_are_checked_before_anything_moves(
     fake_microscope: Microscope,
@@ -990,13 +1099,29 @@ def test_the_references_are_checked_before_anything_moves(
             {},
             "a frame of 100 \N{MULTIPLICATION SIGN} 120 px is too small to find a wall in",
         ),
+        # Short on one axis only, each way (FM-73): the smaller side decides.
+        (
+            (100, 512),
+            {},
+            "a frame of 100 \N{MULTIPLICATION SIGN} 512 px is too small to find a wall in",
+        ),
+        (
+            (512, 100),
+            {},
+            "a frame of 512 \N{MULTIPLICATION SIGN} 100 px is too small to find a wall in",
+        ),
         (
             SHAPE,
             {"search_um": 4000.0},
             "search_um 4000 is more than the well's radius 3200 µm",
         ),
     ],
-    ids=["small frame", "search beyond the radius"],
+    ids=[
+        "small frame",
+        "short in rows",
+        "short in columns",
+        "search beyond the radius",
+    ],
 )
 def test_the_frame_and_the_search_are_checked_before_anything_moves(
     fake_microscope: Microscope,
@@ -1018,11 +1143,18 @@ def test_the_frame_and_the_search_are_checked_before_anything_moves(
     assert camera.snaps == 0
 
 
+@pytest.mark.parametrize(
+    ("shape", "field_um"),
+    [((1412, 1412), 7060), ((200, 2000), 10000), ((2000, 200), 10000)],
+    ids=["square", "long in columns", "long in rows"],
+)
 def test_a_field_that_holds_a_whole_well_is_refused(
-    fake_microscope: Microscope, tmp_path: Path
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    shape: tuple[int, int],
+    field_um: int,
 ) -> None:
-    """At 5 µm per pixel the 512-px side is a 2.6 mm field, and the 1412-px frame is 7 mm: wider than a 6.4 mm well."""
-    shape = (1412, 1412)
+    """At 5 µm per pixel a 1412-px frame is a 7 mm field; a 200 x 2000 one is 1 mm by 10 mm: the larger extent is wider than a 6.4 mm well."""
     camera = _on_fake(fake_microscope, shape=shape)
     stage = _Stage(fake_microscope.require(XYStage))
     fake_microscope.override(XYStage, stage)
@@ -1032,7 +1164,8 @@ def test_a_field_that_holds_a_whole_well_is_refused(
     refused = _refused(fake_microscope, run_doc, _refs("A1", "H12"))
 
     assert refused.reason == (
-        "the field of 7060 µm holds a whole well of 6400 µm: use a higher magnification"
+        f"the field of {field_um} µm holds a whole well of 6400 µm: use a higher "
+        "magnification"
     )
     assert stage.moves == 0
     assert camera.snaps == 0
@@ -1404,3 +1537,179 @@ def test_the_warning_survives_a_stage_that_cannot_be_read(
     assert line.startswith(
         "plate-walls stopped at A1's +X wall: the stage is left at an unknown position"
     )
+
+
+# ------------------------------------------- the operator's parameters reach the code
+
+
+def test_a_search_narrower_than_the_error_finds_no_wall_and_says_so(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """A1 is recorded 300 µm off and the search is 200: its walk is 3 frames (the nominal wall and a step either side), and the wall is not in one of them."""
+    camera = _on_fake(fake_microscope)
+    run_doc = tmp_path / "run.json"
+    _seed(run_doc, fake_microscope)
+
+    refused = _refused(fake_microscope, run_doc, _refs("A1", "H12"), search_um=200.0)
+
+    assert refused.reason == (
+        "no wall found on A1's +X side in 3 frames, from 3000 to 3400 µm out of the "
+        "recorded centre (300.0, -200.0) µm: check that the light is on (the inside "
+        "of a well is brighter than the plastic in brightfield) and that the stage "
+        "was in A1 when it was recorded, then record it again"
+    )
+    assert camera.snaps == 3
+
+
+def test_a_wall_seen_beyond_the_search_in_the_centred_frame_is_lost(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """The centred frame shows the wall 90 µm further out than the walk's did, and the search is 60: it is not the wall that was found."""
+    sample = _plate()
+    camera: _Camera | None = None
+
+    def further_out(snap: int, frame: npt.NDArray[np.uint16]) -> npt.NDArray[Any]:
+        # A1 is recorded exactly and the search (60 µm) is under a step, so the walk
+        # is its first frame alone and the centred frame is snap 2: rendered 90 µm
+        # in from the wall, which then appears 90 µm further out of the stage's
+        # position than it is.
+        if snap != 2:
+            return frame
+        assert camera is not None
+        x, y = camera.positions[-1]
+        return sample.render(
+            x - 90.0,
+            y,
+            0.0,
+            shape=SHAPE,
+            pixel_size_um=PIXEL_UM,
+            camera_rotation_deg=CAMERA_DEG,
+            mirrored=MIRRORED,
+        )
+
+    camera = _on_fake(fake_microscope, sample, spoil=further_out)
+    run_doc = tmp_path / "run.json"
+    _seed(run_doc, fake_microscope)
+    truth = _truth("A1")
+    refs = (WellRef(well="A1", x_um=truth[0], y_um=truth[1]), _refs("H12")[0])
+
+    refused = _refused(fake_microscope, run_doc, refs, search_um=60.0)
+
+    x, y = camera.positions[1]
+    assert refused.reason == (
+        f"the wall of A1's +X side was lost in the frame centred on it at "
+        f"({x:.1f}, {y:.1f}) µm"
+    )
+    assert camera.snaps == 2
+
+
+def test_the_residual_bound_is_the_parameter_and_the_residual_is_the_worst_well(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """A plate of pitch 9.03 mm fitted as 9.0, three wells: 231 µm from where the others put it (§17.1), over 150 and under 300."""
+    _on_fake(fake_microscope, _plate(pitch_um=9030.0))
+    refs = _refs("A1", "A12", "H1", pitch_um=9030.0)
+    below = tmp_path / "below.json"
+    _seed(below, fake_microscope)
+
+    refused = _refused(fake_microscope, below, refs, max_residual_um=150.0)
+
+    assert refused.reason.endswith(
+        " µm from where the other wells put it (bound 150 µm): record it again, "
+        "or check the plate type"
+    )
+    shown = float(refused.reason.split(" is ")[1].split(" µm")[0])
+    assert shown == pytest.approx(231.0, abs=6.0)
+
+    above = tmp_path / "above.json"
+    _seed(above, fake_microscope)
+
+    result = _result(_run(fake_microscope, above, refs, max_residual_um=300.0))
+
+    # The worst of the three, 231 µm, is what the result holds, and the scale
+    # error is the 0.33 % of the plate's pitch, under the tolerance of 2 %.
+    assert result.residual_um == pytest.approx(231.0, abs=6.0)
+    assert result.scale_error == pytest.approx(0.0033, abs=3e-4)
+
+
+def test_a_wider_rotation_bound_registers_a_plate_turned_30_degrees(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """The default bound is 10°; a plate really turned by 30° is registered when the operator says so (up to 45°)."""
+    _on_fake(fake_microscope, _plate(rotation_deg=30.0))
+    refs = _refs("A1", "H12", plate_deg=30.0)
+    narrow = tmp_path / "narrow.json"
+    _seed(narrow, fake_microscope)
+
+    refused = _refused(fake_microscope, narrow, refs)
+
+    assert refused.reason == (
+        "the fit turns the plate by 30.0°, beyond ±10°: a reference well is "
+        "misidentified (two references the same distance apart fit either way)"
+    )
+
+    wide = tmp_path / "wide.json"
+    _seed(wide, fake_microscope)
+
+    result = _result(_run(fake_microscope, wide, refs, max_rotation_deg=45.0))
+
+    assert result.rotation_deg == pytest.approx(30.0, abs=0.01)
+
+
+def test_a_well_a_little_smaller_than_the_plate_says_is_measured_and_reported(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """Wells of 6.0 mm on a plate that is called 6.4: 6.25 % under, which the tolerance of 10 % accepts."""
+    sample = PlateSample(
+        useq.WellPlate(
+            name="small-wells",
+            rows=8,
+            columns=12,
+            well_spacing=(9.0, 9.0),
+            well_size=(6.0, 6.0),
+            circular_wells=True,
+        ),
+        (0.0, 0.0),
+        PLATE_DEG,
+        seed=11,
+    )
+    _on_fake(fake_microscope, sample)
+    run_doc = tmp_path / "run.json"
+    _seed(run_doc, fake_microscope)
+    refs = tuple(
+        WellRef(well=well, x_um=_truth(well)[0], y_um=_truth(well)[1])
+        for well in ("A1", "H12")
+    )
+
+    result = _result(_run(fake_microscope, run_doc, refs))
+
+    assert result.walls is not None
+    for fitted in result.walls.wells:
+        assert fitted.diameter_um == pytest.approx(6000.0, abs=2.0)
+        # The diameter over the plate's, minus 1: under, so negative.
+        assert fitted.size_error == pytest.approx(6000.0 / 6400.0 - 1.0, abs=1e-3)
+        assert math.dist(fitted.center_xy_um, _truth(fitted.well)) < 1.0
+
+
+def test_the_start_is_read_after_the_stage_has_arrived(
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """FM-85: a stage still on its way from an earlier move reads a fraction of it; the start is read after ``wait()``."""
+    stop = threading.Event()
+    _on_fake(
+        fake_microscope,
+        before=lambda n: stop.set() if n == 3 else None,
+    )
+    run_doc = tmp_path / "run.json"
+    _seed(run_doc, fake_microscope)
+    stage = _Stage(fake_microscope.require(XYStage), travelling=(12345.0, -6789.0))
+    fake_microscope.override(XYStage, stage)
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        record = _run(fake_microscope, run_doc, _refs("A1", "H12"), stop=stop)
+
+    assert record.status is StageStatus.stopped
+    (line,) = [r.getMessage() for r in caplog.records if r.name == LOGGER]
+    assert line.endswith("not returned to (0.0, 0.0) µm where it started")

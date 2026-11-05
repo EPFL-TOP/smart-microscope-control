@@ -127,6 +127,18 @@ def test_a_wall_along_the_rows_is_read_in_rows_not_columns(
     assert edge.points_px[:, 0] == pytest.approx(np.arange(8) * BAND_PX + 3.5)
 
 
+def test_the_edge_is_interpolated_between_two_samples_not_put_on_one() -> None:
+    # 10000, 7000, 1000 along a line: the threshold (the midpoint of the two
+    # levels, 5500) is crossed a quarter of the way from the 7000 to the 1000, at
+    # column 101.25. A constant half, or the sample itself, would put it elsewhere.
+    frame = _step_frame(last_bright=100)
+    frame[:, 101] = 7_000
+    edge = find_wall(frame, outward_xy=(1.0, 0.0), matrix=_matrix(2.0, 0.0, False))
+    assert edge is not None
+    assert edge.threshold == pytest.approx(5_500.0)
+    assert edge.points_px[:, 0] == pytest.approx(101.25, abs=1e-9)
+
+
 def test_the_dark_class_must_be_dark_enough_to_be_the_plastic() -> None:
     # 0.4 of the bright class's mean is a wall; 0.6 is shading inside a well.
     matrix = _matrix(2.0, 0.0, False)

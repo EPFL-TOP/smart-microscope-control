@@ -506,10 +506,13 @@ def _check_soft_limits(
 ) -> list[str]:
     """Refuse a walk that leaves the stage's soft limits; say when there are none to check.
 
-    The test is the layer's own (``low <= v <= high`` on both axes), so a frame
-    that passes here is one the move will not refuse. ``limits_um()`` is
-    ``None`` when the stand does not say, and then the result says that no
-    travel was checked: what is true of the layer, not what to do about it.
+    The test is the layer's own (``low <= v <= high`` on both axes), so a walk
+    frame that passes here is one the move will not refuse. The frame centred on
+    the wall is not one of them: it lies at the wall's measured distance, which can
+    be a step past the walk's last offset, and the layer refuses it if it leaves the
+    travel (the stage stays where it is). ``limits_um()`` is ``None`` when the
+    stand does not say, and then the result says that no travel was checked: what
+    is true of the layer, not what to do about it.
     """
     limits = xy.limits_um()
     if limits is None:

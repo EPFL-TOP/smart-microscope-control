@@ -53,8 +53,14 @@ walls is **not verified** (see the end).
 
    The commands are written for a POSIX shell. In `cmd.exe` and PowerShell 5.1,
    escape each inner double quote with a backslash, as the
-   [`smc run`](README.md#running-a-plugin-smc-run) page says; that form was not tried
-   on a Windows shell.
+   [`smc run`](README.md#running-a-plugin-smc-run) page says:
+
+   ```bat
+   smc run plate-walls -p <profile> --run-doc run.json --param plate=24-well --param "refs=[{\"well\": \"A1\", \"x_um\": 1000, \"y_um\": -2000}, {\"well\": \"D6\", \"x_um\": 97500, \"y_um\": -59900}]"
+   ```
+
+   That form was **not tried on a Windows shell**: check it at the stand. A value that
+   arrives broken is refused before anything moves (`'refs' takes JSON`).
 
    It takes about a minute. The stage ends in the middle of the last well, which is
    what you see on Live. The plate page shows the same tool under *More* with its own
@@ -177,6 +183,9 @@ hundred µm (A1 and H12 of the centred 96-well plate are at (−49 500, 31 500) 
 smc run camera-calibration -p demo-sample --run-doc run.json
 smc run plate-walls -p demo-sample --run-doc run.json --param plate=96-well --param 'refs=[{"well": "A1", "x_um": -49200, "y_um": 31300}, {"well": "H12", "x_um": 49250, "y_um": -31350}]'
 ```
+
+(Written for a POSIX shell; in `cmd.exe` escape the inner double quotes of `refs` as in
+step 4 of *At the stand*.)
 
 It takes about 20 seconds on the demo stage (21 frames), puts A1 within a micrometre of
 (−49 500, 31 500) and the rotation at 0°. The camera is the demo's, the walls are the
