@@ -234,8 +234,9 @@ server, so a live view with no tab open keeps the camera taking frames until STO
 nothing to the run document. Every frame is sent to every open tab, up to 10 a second.
 The **Drive** controls stay usable while live goes (below).
 
-**Next step** (the right-hand column, at its head, above Drive). The tool the run
-document needs next, and the values to run it with, so that a newcomer needs no manual.
+**Next step** (the right-hand column, under the [Preset](#presets) region and above
+Drive). The tool the run document needs next, and the values to run it with, so that a
+newcomer needs no manual.
 It is the first slot of the checklist that is not optional and not usable
 (`camera-calibration` and `timings` are never a next step), and its tool is the first
 registered one that fills the slot. The region says:
@@ -428,6 +429,116 @@ map, in the warning colour, says what the page could not read and did not hide: 
 unreadable run document (the page then shows every stage as not run and the nominal
 map, and never writes the file), or a result that no longer matches its model.
 
+## Presets
+
+An assay repeated every week is the same choices every time: the plate, the wells, a
+coverage, a detector. A **preset** keeps them under a name, in a file, so that the
+page asks for them once. It is a convenience and never the truth: the run document
+keeps the values each run used. A preset holds **no position** (the centres and walls
+you captured), and no exposure or channel, which no tool takes as a parameter.
+
+**The region** is at the head of the right-hand column, above the next step:
+*Preset* (a select of the presets found, and **Load**), *Save as* (a name, and
+**Save**), and a note.
+
+**Load.** Choose a preset and press **Load**. The page sets:
+
+- the **plate**, and the **wells** (they appear in *Wells* and on the map);
+- **every field of every tool**: the preset's value, else the profile's suggestion,
+  else empty. A field you typed before is replaced: loading is choosing the preset's
+  values. Fields the preset does not name go back to the suggestion or to empty.
+
+Choosing `(none)` and pressing **Load** forgets the preset: the fields stay as they
+are, and the page stops naming it. Loading needs no stand and is allowed while a tool
+runs: a run already started has read its values.
+
+**The note** under the region says what was loaded and how the page stands against it:
+
+```text
+loaded: weekly  (/home/lab/smc/profiles/presets/weekly.toml)
+  preset weekly was saved on nikon-ti2; this stand is demo-sample
+changed since loading:
+  scan-plan coverage: 0.5 (the preset: 0.4)
+  wells: 1 selected (the preset: B2,B11)
+```
+
+Each indented line under `loaded:` is something of the preset that did not apply, and
+every one is a **note, never a refusal**: the rest still applies. They are:
+
+- another stand than the one it was saved on (everything still applies);
+- a **plugin** or a **parameter** that no longer exists, or one that the preset may not
+  hold (`wells`, `plate`, `refs` and `walls` are kept as the preset's own fields): that
+  pair is left out and the others are kept;
+- a **plate** that this run document registered otherwise, or that this page has
+  captures on (a load never drops the captures: they were measured), and then its wells
+  are not applied either;
+- **wells** that do not read on the plate (the selection stays as it was).
+
+Under it, `the page holds the preset's values`, or `changed since loading:` and one
+line for each field, the plate or the wells that now differ (`(default)` stands for an
+empty field, which sends the plugin's own default). The note follows every edit. Each
+list is cut at eight lines.
+
+**Save.** Type a name in *Save as* and press **Save**. The preset holds the plate, the
+*Wells* box (as you typed it when it names exactly the selection, `A1:D6` staying
+`A1:D6`; otherwise the selected wells, joined) and each tool's **non-empty** fields. A
+value its tool refuses (`coverage=lots`) is the message under the strip, and nothing is
+written: a preset that its next run would refuse is never saved. The saved preset
+becomes the loaded one.
+
+A name is 1 to 64 lower-case letters, digits, `-` and `_`, starting with a letter or a
+digit, and not a name Windows keeps for a device (`nul`, `com1`...). The page never
+changes the case of a name: `Weekly` is refused.
+
+**Where it is written.** In the first of the folders presets are searched in: the
+profile's own `presets/` (beside the profile file), or `./profiles/presets` for the
+built-in `demo` profile. See [profiles/README.md](../../profiles/README.md#presets-the-assays-choices).
+
+**Overwrite.** A name that exists asks first: `preset mine exists: <path>: overwrite it?`
+with **Overwrite** and **Cancel**. **Overwrite** saves what the fields show **at that
+click**. Typing another name, or **Cancel**, drops the question and writes nothing. A
+name found in a later folder than the one a save writes is shadowed by the new file; the
+question names the file that exists. **A preset checked in with the repository
+(`profiles/presets/weekly.toml`) is overwritten by that name**, and git then shows it.
+
+**The run document names the preset.** A tool run while a preset is loaded writes
+`"preset": "weekly"` into its record, with the values it used in `params`, whatever was
+edited after the load. A run with no preset loaded writes no such key.
+
+**The next step.** With a preset loaded the step's values are the page's own, then the
+profile's suggestion for the keys the preset does not give, then the preset's: the
+preset wins over the profile key by key, and says so (`coverage=0.7: from the preset
+weekly`). The `command:` line carries `--preset <path>`, so the same run from a
+terminal applies the preset and its record names it.
+
+**Tabs.** The loaded preset is the page's, like the plate and the selection: every tab
+sees it. The fields are each tab's own, so another tab's note lists how its own fields
+differ.
+
+**From a terminal**, `smc run NAME --preset NAME|PATH` applies a preset, and `smc
+presets list` and `smc presets show` look at them (see
+[plugins/README.md](../plugins/README.md#presets-smc-run---preset-and-smc-presets)).
+There is no *Delete* button and no `smc ui --preset`: a preset is deleted as a file, and
+the page starts with none loaded.
+
+A preset file is plain TOML, and can be written by hand. The checked-in example for
+`demo-sample` is [profiles/presets/weekly.toml](../../profiles/presets/weekly.toml):
+
+```toml
+# A preset of smc: the choices an assay repeats. See docs/ui/plate-page.md, Presets.
+stand = "demo-sample"
+plate = "96-well"
+wells = "B2,B11"
+
+[params]
+scan-plan = ["coverage=0.4"]
+cells = ["detector=blobs"]
+```
+
+Walk it on `demo-sample`: **Connect**, choose `weekly`, **Load**, then press **Run** on
+each next step. No field is typed, and the page never asks which wells to scan
+(`tests/test_plate_page_presets_demo.py`).
+
 ## Trying the workflow without a microscope
 
 ```text
@@ -537,6 +648,12 @@ not known); the page on a Windows PC at all (the POSIX line); a real browser's e
 *Wells* box; the strip's `assumed:` tail and **Refresh** with a Run pressed on the page;
 the *Wells* box changed by a click while someone types in it (it is changed only when the
 page redraws, never by the periodic callback); and the page over RDP.
+
+**Presets** add: the region in a real browser, with the owner, on the assay they repeat;
+a preset saved by the service ([service.md](service.md)) into the profile's folder, where
+the service's account may not be allowed to write; a preset edited in Notepad (a
+byte-order mark, CRLF line ends) and read back on Windows; and the width of the region's
+select and buttons in the 420 px column.
 
 **Connect and Disconnect** add: Connect, Disconnect, NIS-Elements taking the stand,
 then Connect again, at a real stand; **a stand opened on the page's worker thread**,

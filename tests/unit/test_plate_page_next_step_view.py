@@ -353,8 +353,10 @@ def test_the_next_step_region_heads_the_right_column(
     page = make_page()
     view = PlatePageView(page)
     _left, right = view.layout[-1]
-    region, drive = right[0], right[1]
-    # Above Drive, and the first thing the column shows (ADR-0006's picture).
+    # The Preset region is above it (m5 §10.6): a preset is what the operator chooses
+    # before the first step. The step is the next thing, above Drive.
+    assert right[0][0].object == "Preset"
+    region, drive = right[1], right[2]
     assert region[0].object == "Next step"
     assert region[1] is view.next_text
     assert region[2] is view.next_button

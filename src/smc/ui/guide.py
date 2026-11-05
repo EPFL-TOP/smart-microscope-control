@@ -10,13 +10,13 @@ pairs it runs, and ``command_line`` is the same call typed in a terminal (princi
 from __future__ import annotations
 
 import shlex
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from smc.ui.controller import CheckItem
+    from smc.ui.controller import CheckItem, LoadedPreset
 
 __all__ = [
     "CAPTURE_WELLS",
@@ -25,6 +25,8 @@ __all__ = [
     "NextStep",
     "command_line",
     "next_slot",
+    "preset_differences",
+    "preset_note_text",
 ]
 
 #: What the scan plan waits for. The page cannot choose wells for the operator:
@@ -94,6 +96,7 @@ def command_line(
     profile: str,
     run_doc: Path,
     dry_run: bool,
+    preset: str | None = None,
 ) -> str:
     """The ``smc run`` command that makes the call a step makes, quoted for a POSIX shell.
 
@@ -101,10 +104,94 @@ def command_line(
     copies it whole. How it pastes into PowerShell or ``cmd.exe`` is not verified
     (m5 §9.1); the run document's record of the run is the reference, whichever
     shell reads the line.
+
+    ``preset`` is what ``smc run --preset`` takes (the page passes the file's
+    path): given, the terminal's run applies the preset as the page's does, and
+    its record names the preset as the page's would (m5 §10.5). The pairs that
+    follow repeat what the preset gives, so the command says all it runs.
     """
     words = ["smc", "run", plugin, "-p", profile, "--run-doc", str(run_doc)]
     if dry_run:
         words.append("--dry-run")
+    if preset is not None:
+        words += ["--preset", preset]
     for pair in params:
         words += ["--param", pair]
     return shlex.join(words)
+
+
+def preset_differences(
+    expected: Mapping[str, Mapping[str, str]],
+    actual: Mapping[str, Mapping[str, str]],
+) -> tuple[str, ...]:
+    """What the page's fields hold that the loaded preset's load did not set, one line each (m5 §10.6).
+
+    ``expected`` is what the load put in every field (the preset's value, else
+    the profile's suggestion, else ``""``), per tool in the page's order, and
+    ``actual`` what the fields hold now. A line is
+    ``<tool> <key>: <value> (the preset: <expected>)`` for each field whose text,
+    stripped, is not the expected one, with ``(default)`` for an empty text: the
+    plugin's own default is what an empty field sends. A field the page no longer
+    shows is read as empty. A value is shown on one line and cut, since a field
+    may hold the whole of a JSON list; it is compared whole.
+    """
+    lines: list[str] = []
+    for plugin, fields in expected.items():
+        now = actual.get(plugin, {})
+        for key, given in fields.items():
+            # Both sides stripped: what a run sends is the stripped text, and a value
+            # a hand edit left a space in is not a difference.
+            wanted = given.strip()
+            found = now.get(key, "").strip()
+            if found != wanted:
+                lines.append(
+                    f"{plugin} {key}: {_shown(found)} (the preset: {_shown(wanted)})"
+                )
+    return tuple(lines)
+
+
+def preset_note_text(loaded: LoadedPreset | None, differences: Sequence[str]) -> str:
+    """The note under the *Preset* region: which preset, what it could not apply, what changed since.
+
+    Plain text with line breaks, never markup (FM-139): the names come from a
+    file a person edited. The mismatches and the differences are each cut at
+    ``_NOTE_LINES`` lines, then ``… <n> more``, as a result card's lines are.
+    """
+    if loaded is None:
+        return "no preset loaded"
+    lines = [f"loaded: {loaded.file.name}  ({loaded.file.path})"]
+    lines += [f"  {line}" for line in _cut_lines(loaded.mismatches)]
+    if differences:
+        lines.append("changed since loading:")
+        lines += [f"  {line}" for line in _cut_lines(differences)]
+    else:
+        lines.append("the page holds the preset's values")
+    return "\n".join(lines)
+
+
+#: A note shows this many lines of each kind, as a result card shows its values (§2.4).
+_NOTE_LINES = 8
+#: A value in a difference is shown at most this long: a field may hold a whole JSON list.
+_VALUE_CHARS = 80
+
+
+def _cut_lines(lines: Sequence[str]) -> list[str]:
+    if len(lines) <= _NOTE_LINES:
+        return [_flat(line) for line in lines]
+    return [
+        *(_flat(line) for line in lines[:_NOTE_LINES]),
+        f"… {len(lines) - _NOTE_LINES} more",
+    ]
+
+
+def _flat(text: str) -> str:
+    """``text`` on one line: its line breaks are spaces."""
+    return " ".join(text.split("\n")).replace("\r", " ")
+
+
+def _shown(text: str) -> str:
+    """A field's text as a difference shows it: ``(default)`` when empty, one line, cut."""
+    if not text:
+        return "(default)"
+    flat = _flat(text)
+    return flat if len(flat) <= _VALUE_CHARS else flat[:_VALUE_CHARS] + "…"

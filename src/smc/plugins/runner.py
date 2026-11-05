@@ -172,8 +172,13 @@ def run_plugin(
     on_progress: Callable[[Progress], None] | None = None,
     stop: threading.Event | None = None,
     plugin_version: str | None = None,
+    preset: str | None = None,
 ) -> StageRecord:
     """Run ``plugin`` on ``microscope`` and record the outcome in ``run_doc``.
+
+    ``preset`` is the name of the preset that gave ``params`` their values
+    (m5 §10.4). It goes into the first record, and every later record of the
+    run is a copy of it, so a checkpoint and a stop name it too.
 
     Returns:
         The stage's record: ``done`` with its result, or ``stopped`` when the
@@ -228,6 +233,7 @@ def run_plugin(
         params=params.model_dump(mode="json"),
         checkpoint=checkpoint,
         reads=_reads_of(plugin, doc, profile=profile, dry_run=dry_run),
+        preset=preset,
     )
     # Before any hardware is touched: a failure here ends the run.
     write_stage(run_doc, running)

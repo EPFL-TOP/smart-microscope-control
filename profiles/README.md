@@ -196,6 +196,48 @@ run's own `ParamsError`. Only `demo-sample` has entries today (`coverage=0.4` fo
 `scan-plan`, `detector=blobs` for `cells`); what a real stand suggests is the owner's
 call after a session there.
 
+## Presets: the assay's choices
+
+A **preset** is a TOML file in a `presets/` folder: the choices an assay repeats, which
+the plate page loads and saves by name and `smc run --preset` applies
+([plate page](../docs/ui/plate-page.md#presets), [commands](../docs/plugins/README.md#presets-smc-run---preset-and-smc-presets)).
+It is not a profile: it has no device and no limit, and moves nothing.
+
+```toml
+stand = "demo-sample"        # the profile's microscope.name where it was saved; another stand is a note
+plate = "96-well"            # a useq plate key
+wells = "B2,B11"             # what scan-plan's wells takes (A1:D6, C*, B2,B11)
+saved_utc = 2026-11-03 10:00:00+00:00   # written by the page
+
+[params]                     # per plugin, the smc run --param pairs
+scan-plan = ["coverage=0.4"]
+cells = ["detector=blobs"]
+```
+
+Every key may be left out, and an unknown key is refused as in a profile. `stand`,
+`plate` and `wells` are one non-blank line. Each list under `[params]` has the shape of a
+`[suggest]`'s `params` (`key=value`, a key given once, no space in a key) and may be
+empty. `wells`, `plate`, `refs` and `walls` are not kept under `params`: the first two are
+the preset's own fields, and a preset never holds a position. The checked-in example
+is [`presets/weekly.toml`](presets/weekly.toml), for `demo-sample`.
+
+**The name** is the file's stem: 1 to 64 lower-case letters, digits, `-` and `_`,
+starting with a letter or a digit, and not a name Windows keeps for a device (`nul`,
+`com1`). Lower case only, so that two presets never differ by case alone on Windows and
+macOS. **Where they are**, in the order a name is looked for (the first file of a name
+wins, and a folder that does not exist is skipped):
+
+1. `presets/` beside the profile file, when the profile was loaded from a file;
+2. `presets/` of each directory of the [search order above](#where-profiles-are-found):
+   `$SMC_PROFILES`, `./profiles`, the working directory.
+
+So a preset of one stand sits beside its profile, and `profiles/presets/` serves every
+stand of the checkout. The plate page saves into the first of them (for the built-in
+`demo` profile, which has no file, the first of the second list). A path to a `.toml`
+file is read wherever it is. The file is read as UTF-8, with or without the byte-order
+mark Notepad writes, and written as UTF-8 without one. `smc presets list` shows what
+was found and what could not be read.
+
 ## Rebuilding a profile's configuration
 
 A profile's `.cfg` is rebuilt from the devices that answer with

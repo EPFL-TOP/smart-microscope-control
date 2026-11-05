@@ -57,8 +57,10 @@ from smc.hardware.capabilities import (
     XYStage,
     ZStage,
 )
+from smc.plugins.presets import PresetError, PresetExistsError
 from smc.ui.controller import (
     NOT_CONNECTED,
+    LoadedPreset,
     PageServerError,
     PageStatus,
     PlatePage,
@@ -68,7 +70,7 @@ from smc.ui.controller import (
     WellView,
 )
 from smc.ui.frames import Frame, display_image
-from smc.ui.guide import NextStep
+from smc.ui.guide import NextStep, preset_differences, preset_note_text
 
 __all__ = ["PlatePageView", "build", "card_text", "next_step_text", "serve"]
 
@@ -124,6 +126,9 @@ _LIVE_LABEL = "Live"
 _END_LIVE_LABEL = "End live"
 
 NO_FRAME_TEXT = "no frame yet"
+
+#: The *Preset* select's first option: no preset, which *Load* turns into a forget (m5 §10.6).
+NO_PRESET = "(none)"
 
 log = logging.getLogger("smc.ui")
 
@@ -351,6 +356,16 @@ class PlatePageView:
         self._wells_shown: tuple[str, ...] = ()
         self._echoing = False
         self._next_tool: str | None = None
+        # The Preset region (m5 §10.6). What a load put in every field, with the
+        # loaded preset it belongs to: another tab's fields are its own, and its note
+        # compares them with what the preset would have put. ``_filling`` keeps the
+        # field watchers quiet while a load assigns dozens of fields, so that the note
+        # is drawn once, after the last. ``_preset_armed`` holds the name an
+        # overwrite waits for, in a tuple.
+        self._preset_expected: dict[str, dict[str, str]] = {}
+        self._expected_of: LoadedPreset | None = None
+        self._filling = False
+        self._preset_armed: tuple[str] | None = None
 
         self.wells_source = ColumnDataSource(
             {
@@ -504,6 +519,11 @@ class PlatePageView:
         self.plate_select.param.watch(
             self._handler(lambda event: self.on_choose_plate(event.new)), "value"
         )
+        # Registered after the choice's own watcher, so that the note reads the plate
+        # the page holds by then.
+        self.plate_select.param.watch(
+            self._handler(lambda event: self._draw_preset_note()), "value"
+        )
         self.label_select.param.watch(
             self._handler(lambda event: self._draw_wells()), "value"
         )
@@ -515,6 +535,9 @@ class PlatePageView:
         )
         self.select_input.param.watch(
             self._handler(lambda event: self.on_select_text(event.new)), "value"
+        )
+        self.select_input.param.watch(
+            self._handler(lambda event: self._draw_preset_note()), "value"
         )
         self.refresh_button.on_click(self._handler(lambda event: self.on_refresh()))
         self.next_button.on_click(self._handler(lambda event: self.on_next()))
@@ -530,6 +553,7 @@ class PlatePageView:
         self.snap_button.on_click(self._handler(lambda event: self.on_snap()))
         self.live_button.on_click(self._handler(lambda event: self.on_live()))
         self._build_drive()
+        self._build_presets()
 
         self.tool_runs: dict[str, Any] = {}
         self.tool_fields: dict[str, dict[str, Any]] = {}
@@ -652,6 +676,68 @@ class PlatePageView:
 
         return clicked
 
+    def _build_presets(self) -> None:
+        """The *Preset* region's widgets (m5 §10.6): none reaches the stand, so none is ever disabled.
+
+        Every button goes through ``_handler`` (FM-171) and carries its text as
+        ``label=`` (FM-147). The select's options are read from the folders by
+        ``refresh()`` and after a save, never by the tick (FM-151).
+        """
+        self.preset_select = pn.widgets.Select(
+            label="Preset", options={NO_PRESET: ""}, value="", width=280
+        )
+        self.preset_load_button = pn.widgets.Button(label="Load", width=80)
+        self.preset_name = pn.widgets.TextInput(
+            label="Save as", placeholder="weekly", width=280
+        )
+        self.preset_save_button = pn.widgets.Button(label="Save", width=80)
+        # Wrapped anywhere: the question names the file that exists, a path with no
+        # space in it, which `pre-wrap` alone cut at the column's edge (/ui-check, FM-153).
+        self.preset_confirm_text = _wrapped_text(extra={"color": _WARNING})
+        self.preset_overwrite_button = pn.widgets.Button(
+            label="Overwrite", color="danger"
+        )
+        self.preset_cancel_button = pn.widgets.Button(label="Cancel")
+        self.preset_confirm = pn.Row(
+            pn.Column(
+                self.preset_confirm_text,
+                pn.Row(self.preset_overwrite_button, self.preset_cancel_button),
+            ),
+            visible=False,
+        )
+        # Text, never Markdown (FM-139): a preset's name and path come from a file.
+        self.preset_note = _wrapped_text("no preset loaded")
+        self.preset_load_button.on_click(
+            self._handler(lambda event: self.on_load_preset())
+        )
+        self.preset_save_button.on_click(
+            self._handler(lambda event: self.on_save_preset())
+        )
+        self.preset_overwrite_button.on_click(
+            self._handler(lambda event: self.on_preset_overwrite())
+        )
+        self.preset_cancel_button.on_click(
+            self._handler(lambda event: self.on_preset_cancel())
+        )
+        # A new name asks nothing about the old one: the confirmation goes.
+        self.preset_name.param.watch(
+            self._handler(lambda event: self._disarm_preset()), "value"
+        )
+
+    def _preset_region(self) -> Any:
+        """The head of the tools column: the preset the assay's choices come from, loaded and saved by name.
+
+        Above the next step, because a preset is what the operator chooses before
+        the first step.
+        """
+        return pn.Column(
+            pn.pane.Str("Preset", styles={"font-weight": "bold"}),
+            pn.Row(self.preset_select, self.preset_load_button),
+            pn.Row(self.preset_name, self.preset_save_button),
+            self.preset_confirm,
+            self.preset_note,
+        )
+
     def _drive_region(self) -> Any:
         """ADR-0006's *Drive*: the pad, the focus, the autofocus, the objective, the light."""
         jog = self.jog_buttons
@@ -737,6 +823,7 @@ class PlatePageView:
             active=list(range(len(stages))),
         )
         right = pn.Column(
+            self._preset_region(),
             self._next_region(),
             self._drive_region(),
             self.accordion,
@@ -767,6 +854,9 @@ class PlatePageView:
                 description=description,
                 value=suggested.get(name, ""),
             )
+            # After the field has its first value: a change of any field redraws the
+            # note, unless a load is assigning them all (m5 §10.6).
+            fields[name].param.watch(self._handler(self._on_field_changed), "value")
         self.tool_fields[tool.name] = fields
         key_widgets = [fields[row[0]] for row in tool.key]
         advanced_widgets = [fields[row[0]] for row in tool.advanced]
@@ -846,7 +936,7 @@ class PlatePageView:
         """Run ``action``; an operator's mistake becomes the message, and nothing else is kept."""
         try:
             action()
-        except (ValueError, RuntimeError) as exc:
+        except (ValueError, RuntimeError, PresetError) as exc:
             self.message.object = str(exc)
             return False
         self.message.object = ""
@@ -951,15 +1041,20 @@ class PlatePageView:
         """Run a tool with what the page fills and the fields the operator typed."""
 
         def run() -> None:
-            typed = [
-                f"{key}={widget.value.strip()}"
-                for key, widget in self.tool_fields.get(plugin, {}).items()
-                if widget.value.strip() != ""
-            ]
-            self.page.run(plugin, [*self.page.page_params(plugin), *typed])
+            self.page.run(
+                plugin, [*self.page.page_params(plugin), *self._typed(plugin)]
+            )
 
         self._try(run)
         self.tick()
+
+    def _typed(self, plugin: str) -> list[str]:
+        """The ``key=value`` pairs of ``plugin``'s non-empty fields: what a run sends and a preset keeps."""
+        return [
+            f"{key}={widget.value.strip()}"
+            for key, widget in self.tool_fields.get(plugin, {}).items()
+            if widget.value.strip() != ""
+        ]
 
     def on_connect(self) -> None:
         """*Connect*: open the profile's stand on the worker; the tick that sees it connected enables the controls."""
@@ -1084,6 +1179,187 @@ class PlatePageView:
     def _disarm(self) -> None:
         self._armed = None
         self.objective_confirm.visible = False
+
+    # --- presets (m5 §10.6) --------------------------------------------------------
+
+    def on_load_preset(self) -> None:
+        """*Load*: the chosen preset's values in the plate, the wells and every field; ``(none)`` forgets it.
+
+        A load is choosing the preset's values: every field of every tool is set to
+        the preset's value, else the profile's suggestion, else empty, so the form
+        shows what a fresh page with this preset shows, and a field typed before is
+        replaced. The fields are set under ``_filling``, so the note is drawn once.
+        A preset the plate's captures refuse to change the plate for is loaded all the
+        same, its mismatch in the note (the controller's rule).
+        """
+        name = str(self.preset_select.value or "")
+        if name == "":
+            self.page.forget_preset()
+            self._expected_of = None
+            self._preset_expected = {}
+            self._disarm_preset()
+            self.message.object = ""
+            self.refresh()
+            return
+        loaded: list[LoadedPreset] = []
+        if not self._try(lambda: loaded.append(self.page.load_preset(name))):
+            self._draw_preset_note()
+            return
+        self._fill_fields(loaded[0])
+        # So that a Save after edits asks to overwrite this preset, not to make another.
+        self.preset_name.value = loaded[0].file.name
+        self._disarm_preset()
+        self.refresh()
+
+    def _fill_fields(self, loaded: LoadedPreset) -> None:
+        """Every field of every tool set to what ``loaded`` gives it, and remembered as what the preset put there."""
+        expected = self._expected_from(loaded)
+        self._filling = True
+        try:
+            for tool, fields in self.tool_fields.items():
+                for key, widget in fields.items():
+                    widget.value = expected[tool][key]
+        finally:
+            # Always: a guard left up would stop the note following the edits.
+            self._filling = False
+        self._preset_expected = expected
+        self._expected_of = loaded
+
+    def on_save_preset(self) -> None:
+        """*Save*: the plate, the *Wells* box and the non-empty fields, under the name typed.
+
+        An existing name arms the confirmation instead of replacing the file. Nothing
+        is written for a value its tool refuses: the message says which.
+        """
+        name = str(self.preset_name.value).strip()
+        if name == "":
+            self.message.object = "type a name to save the preset under"
+            return
+        self._save_preset(name, overwrite=False)
+
+    def on_preset_overwrite(self) -> None:
+        """*Overwrite*: save the armed name over the file that holds it, with the fields as they are now.
+
+        With nothing armed (a stale tab shows the button after a cancel), or a name
+        typed since, nothing is saved and the message says so.
+        """
+        armed = self._preset_armed
+        self._disarm_preset()
+        if armed is None:
+            self.message.object = "nothing to overwrite: press Save again"
+            return
+        if str(self.preset_name.value).strip() != armed[0]:
+            self.message.object = "the name changed: press Save again"
+            return
+        self._save_preset(armed[0], overwrite=True)
+
+    def on_preset_cancel(self) -> None:
+        """*Cancel*: nothing is overwritten."""
+        self._disarm_preset()
+
+    def _disarm_preset(self) -> None:
+        self._preset_armed = None
+        self.preset_confirm.visible = False
+
+    def _save_preset(self, name: str, *, overwrite: bool) -> None:
+        saved: list[LoadedPreset] = []
+        exists: list[str] = []
+
+        def save() -> None:
+            fields = {tool: self._typed(tool) for tool in self.tool_fields}
+            try:
+                saved.append(
+                    self.page.save_preset(
+                        name, fields, str(self.select_input.value), overwrite=overwrite
+                    )
+                )
+            except PresetExistsError as exc:
+                # Text, never the error (FM-98).
+                exists.append(str(exc))
+
+        if not self._try(save):
+            return
+        if exists:
+            self._preset_armed = (name,)
+            self.preset_confirm_text.object = f"{exists[0]}: overwrite it?"
+            self.preset_confirm.visible = True
+            return
+        self._disarm_preset()
+        loaded = saved[0]
+        # The saved preset is what the fields hold: nothing differs until they change.
+        self._preset_expected = self._actual()
+        self._expected_of = loaded
+        self._offer_presets(selected=name)
+        self.refresh()
+        self.message.object = f"saved {name} to {loaded.file.path}"
+
+    def _on_field_changed(self, event: Any) -> None:
+        """A tool's field changed: the note says how the page differs from the preset, unless a load is filling them."""
+        if self._filling:
+            return
+        self._draw_preset_note()
+
+    def _actual(self) -> dict[str, dict[str, str]]:
+        """What every tool's fields hold now, by tool and key."""
+        return {
+            tool: {key: str(widget.value) for key, widget in fields.items()}
+            for tool, fields in self.tool_fields.items()
+        }
+
+    def _expected_from(self, loaded: LoadedPreset) -> dict[str, dict[str, str]]:
+        """What a load of ``loaded`` puts in every field: its value, else the profile's suggestion, else ``""``."""
+        expected: dict[str, dict[str, str]] = {}
+        for tool in self._tools:
+            given = loaded.fields.get(tool.name, {})
+            suggested = dict(tool.suggested)
+            expected[tool.name] = {
+                key: given.get(key, suggested.get(key, ""))
+                for key in self.tool_fields[tool.name]
+            }
+        return expected
+
+    def _offer_presets(self, selected: str | None = None) -> None:
+        """The select's options, read from the folders: a broken file is left out, its error is ``smc presets list``'s.
+
+        Read by ``refresh()`` and after a save, never by the tick (FM-151). The
+        choice stays when it is still offered.
+        """
+        options = {NO_PRESET: ""}
+        for entry in self.page.presets():
+            if entry.preset is not None:
+                options[entry.name] = entry.name
+        keep = selected if selected is not None else self.preset_select.value
+        self.preset_select.options = options
+        self.preset_select.value = keep if keep in options.values() else ""
+
+    def _draw_preset_note(self) -> None:
+        """The note under the region: the preset, what it could not apply, and how the page differs from it."""
+        loaded = self.page.preset
+        differences: tuple[str, ...] = ()
+        if loaded is not None:
+            expected = (
+                self._preset_expected
+                if self._expected_of is loaded
+                else self._expected_from(loaded)
+            )
+            differences = (
+                *preset_differences(expected, self._actual()),
+                *self._page_differences(loaded),
+            )
+        self.preset_note.object = preset_note_text(loaded, differences)
+
+    def _page_differences(self, loaded: LoadedPreset) -> tuple[str, ...]:
+        """The two differences that are not a field's: the plate, and the wells a load selected."""
+        found: list[str] = []
+        applied = loaded.check.plate
+        if applied is not None and applied != self.page.plate:
+            found.append(f"plate: {self.page.plate} (the preset: {applied})")
+        if loaded.selection is not None and self.page.selection != loaded.selection:
+            found.append(
+                f"wells: {len(self.page.selection)} selected "
+                f"(the preset: {loaded.check.wells})"
+            )
+        return tuple(found)
 
     # --- drawing ------------------------------------------------------------------
 
@@ -1221,6 +1497,9 @@ class PlatePageView:
             page.walls,
             page.current,
             page.activities_ended,
+            # The controller's loaded preset, by identity: another tab's load changes
+            # the next step and the note without changing anything above (FM-151).
+            page.preset,
         )
 
     def refresh(self) -> None:
@@ -1264,6 +1543,9 @@ class PlatePageView:
         self._draw_problems()
         self._draw_buttons()
         self._draw_drive()
+        # The options are read here and after a save, never by the tick (§10.6).
+        self._offer_presets()
+        self._draw_preset_note()
 
     def _echo_selection(self) -> None:
         """Show the selection in the *Wells* box when it is not the one the box stands for (m5 §8.5).

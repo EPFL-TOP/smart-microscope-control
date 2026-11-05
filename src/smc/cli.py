@@ -97,6 +97,16 @@ from smc.plugins import (
 )
 from smc.plugins import discover as discover_plugins
 from smc.plugins import load as load_plugin
+from smc.plugins.api import P
+from smc.plugins.presets import (
+    PresetError,
+    check_preset,
+    command_pairs,
+    list_presets,
+    load_preset,
+    preset_dirs,
+    registered_plate,
+)
 from smc.run import RunDocument, RunDocumentError, StageRecord, StageStatus
 
 app = typer.Typer(
@@ -2107,6 +2117,13 @@ def run_command(
             "JSON, and null is none. --show-params lists the keys.",
         ),
     ] = None,
+    preset: Annotated[
+        str | None,
+        typer.Option(
+            "--preset",
+            help="A preset's name or a .toml path: its values first, then --param.",
+        ),
+    ] = None,
     dry_run: DryRunOption = False,
     resume: Annotated[
         bool,
@@ -2128,6 +2145,10 @@ def run_command(
     a while: Ctrl-C sends a stop to any move under way and records the stage as
     stopped; a stand that refuses stop() lets a sent move run to its target, and
     the line printed says what each stop did.
+
+    A preset (smc presets list) gives the parameters an assay repeats: each of
+    its values that does not apply on this stand or run document is printed and
+    left out, and --param wins over the preset. The stage's record names it.
     """
     with _Reported(ctx, after_report=_print_unsaved_result):
         if list_plugins:
@@ -2148,14 +2169,36 @@ def run_command(
             for line in _aligned([list(row) for row in rows]) or ["none"]:
                 _say(line)
             return
-        try:
-            params = parse_params(entry.plugin.Params, param or [])
-        except ParamsError as exc:
-            # parse_params knows the model, not the plugin: name the plugin here.
-            raise ParamsError(name, exc.problems) from None
-        path = _check_run_doc(run_doc)
-        loaded = Profile.load(profile)
-        before = RunDocument.load_or_new(path)
+        preset_name: str | None = None
+        if preset is None:
+            params = _parse_params_of(name, entry.plugin.Params, param or [])
+            path = _check_run_doc(run_doc)
+            loaded = Profile.load(profile)
+            before = RunDocument.load_or_new(path)
+        else:
+            # The preset needs the profile (its folders, its stand) and the
+            # document (its registered plate) before the parameters are known
+            # (m5 §10.3), so this path reads them first.
+            loaded = Profile.load(profile)
+            try:
+                found = load_preset(preset, loaded)
+            except PresetError as exc:
+                raise typer.BadParameter(str(exc), param_hint="--preset") from None
+            path = _check_run_doc(run_doc)
+            before = RunDocument.load_or_new(path)
+            check = check_preset(
+                found,
+                {name: entry.plugin.Params},
+                stand=loaded.microscope.name,
+                registered=registered_plate(before),
+                only=name,
+            )
+            for mismatch in check.mismatches:
+                _say(mismatch)
+            params = _parse_params_of(
+                name, entry.plugin.Params, command_pairs(check, name, param or [])
+            )
+            preset_name = found.name
         check_ready(
             entry.plugin,
             before,
@@ -2175,8 +2218,120 @@ def run_command(
                 resume=resume,
                 on_progress=_progress_printer(),
                 plugin_version=entry.version,
+                preset=preset_name,
             )
         _finish(name, path, record, before)
+
+
+def _parse_params_of(name: str, model: type[P], pairs: Sequence[str]) -> P:
+    """``parse_params``, its error told with the plugin's name, which the model does not know."""
+    try:
+        return parse_params(model, pairs)
+    except ParamsError as exc:
+        raise ParamsError(name, exc.problems) from None
+
+
+presets_app = typer.Typer(
+    help="Presets: the choices an assay repeats, kept in a file and applied by name.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+app.add_typer(presets_app, name="presets")
+
+
+@presets_app.command("list")
+def presets_list(ctx: typer.Context, profile: ProfileOption = DEMO_NAME) -> None:
+    """List the presets of this stand's folders, and the folders searched.
+
+    A file that cannot be read or is not a valid preset is listed with its
+    error: nothing is hidden.
+    """
+    with _Reported(ctx):
+        loaded = Profile.load(profile)
+        listed = list_presets(loaded)
+        searched = ", ".join(str(folder) for folder in preset_dirs(loaded))
+        if not listed:
+            _say(f"no presets; searched: {searched}")
+            return
+        width = max(len(entry.name) for entry in listed)
+        rows = [
+            [
+                entry.name.ljust(width),
+                entry.preset.stand or "-",
+                entry.preset.plate or "-",
+                ",".join(entry.preset.params) or "-",
+                str(entry.path),
+            ]
+            for entry in listed
+            if entry.preset is not None
+        ]
+        lines = iter(_aligned(rows))
+        for entry in listed:
+            if entry.preset is None:
+                _say(
+                    f"{entry.name.ljust(width)}  cannot be read: {entry.error}  "
+                    f"{entry.path}"
+                )
+            else:
+                _say(next(lines))
+        _say(f"searched: {searched}")
+
+
+@presets_app.command("show")
+def presets_show(
+    ctx: typer.Context,
+    source: Annotated[
+        str,
+        typer.Argument(
+            metavar="NAME|PATH",
+            help="A preset's name (smc presets list) or the path to its .toml file.",
+        ),
+    ],
+    profile: ProfileOption = DEMO_NAME,
+    run_doc: Annotated[
+        str | None,
+        typer.Option(
+            "--run-doc",
+            help="Check the preset's plate against the plate this run document has "
+            "registered. A file that does not exist registers nothing.",
+        ),
+    ] = None,
+) -> None:
+    """Print a preset and what of it this stand and run document cannot use.
+
+    Every plugin is looked at, not only the one a run would use. Opens no stand.
+    """
+    with _Reported(ctx):
+        loaded = Profile.load(profile)
+        try:
+            found = load_preset(source, loaded)
+        except PresetError as exc:
+            _fail(str(exc))
+            raise typer.Exit(code=_EXIT_REFUSED) from None
+        preset = found.preset
+        assert preset is not None  # load_preset always sets it, or raises
+        registered = (
+            None
+            if run_doc is None
+            else registered_plate(RunDocument.load_or_new(Path(run_doc)))
+        )
+        models = {
+            plugin_name: entry.plugin.Params
+            for plugin_name, entry in discover_plugins().plugins.items()
+        }
+        stand = loaded.microscope.name
+        check = check_preset(found, models, stand=stand, registered=registered)
+        _say(f"preset {found.name}  {found.path}")
+        _say(f"stand: {preset.stand or '-'}")
+        _say(f"plate: {preset.plate or '-'}")
+        _say(f"wells: {preset.wells or '-'}")
+        _say(f"saved_utc: {preset.saved_utc.isoformat() if preset.saved_utc else '-'}")
+        for plugin_name, pairs in preset.params.items():
+            _say(f"{plugin_name}: {' '.join(pairs)}")
+        for mismatch in check.mismatches:
+            _say(mismatch)
+        if not check.mismatches:
+            _say(f"no mismatch on {stand}")
 
 
 #: What the operator types to get the page's dependencies (FM-36: the brackets are
