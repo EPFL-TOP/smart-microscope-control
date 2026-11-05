@@ -138,6 +138,10 @@ relies on it).
   and every night (ADR-0009).
 - A red `main`, or an open `CI nightly red` issue, stops the merges of the
   code it names until the owner has chosen to revert or to fix forward.
+- A test that asserts on a measured duration or a frame rate carries
+  `@pytest.mark.wallclock`: a pull request runs the suite with `pytest -n
+  auto` and those tests apart, in order; the nightly runs everything in
+  order. Every `-m` expression carries `not hardware` (FM-192).
 
 ## Hardware sessions
 
