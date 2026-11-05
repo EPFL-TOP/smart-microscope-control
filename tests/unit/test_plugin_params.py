@@ -15,7 +15,7 @@ from pydantic import Field, ValidationError
 
 from smc.plugins.api import PluginParams, PluginResult
 from smc.plugins.errors import ParamsError
-from smc.plugins.params import describe_params, parse_params
+from smc.plugins.params import describe_params, format_param, parse_params
 
 
 class Mode(str, Enum):
@@ -231,3 +231,55 @@ def test_describe_params_of_a_model_without_fields_is_empty() -> None:
         pass
 
     assert describe_params(Nothing) == []
+
+
+# -- format_param: the inverse of the decoding (m5 §10.9) ----------------------------
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "text"),
+    [
+        ("note", None, "null"),
+        ("where", None, "null"),
+        ("include_z", True, "true"),
+        ("include_z", False, "false"),
+        ("samples", 7, "7"),
+        ("interval_ms", 1e-05, "1e-05"),
+        ("interval_ms", 0.1, "0.1"),
+        ("label", "a=b", "a=b"),
+        ("mode", "slow", "slow"),
+        ("kind", "b", "b"),
+        ("where", "C:\\runs\\a b\\run.json", "C:\\runs\\a b\\run.json"),
+        ("shape", [200.0, 9000.0], "[200.0, 9000.0]"),
+        ("wells", ["é", "B2"], '["\\u00e9", "B2"]'),
+    ],
+)
+def test_format_param_gives_the_text_parse_params_reads_back_for_each_kind_of_field(
+    key: str, value: object, text: str
+) -> None:
+    given = format_param(Demo.model_fields[key], value)
+
+    assert given == text
+    # What `--param key=<text>` takes: the value comes back through the decoding.
+    assert (
+        parse_params(Demo, ["must=1", f"{key}={given}"]).model_dump(mode="json")[key]
+        == value
+    )
+
+
+def test_format_param_takes_an_enum_member_and_a_path_as_their_text() -> None:
+    # A recorded value is JSON (a string), but the function is public: a member or a
+    # `Path` handed in as it is must not give `Mode.slow` or `PosixPath('...')`.
+    assert format_param(Demo.model_fields["mode"], Mode.slow) == "slow"
+    assert format_param(Demo.model_fields["where"], Path("a b")) == "a b"
+
+
+def test_format_param_of_the_string_null_in_an_optional_field_does_not_read_back() -> (
+    None
+):
+    # The hazard the caller reads back for: `null` is None for a field that admits
+    # it, so the string "null" cannot be written as a pair.
+    text = format_param(Demo.model_fields["note"], "null")
+
+    assert text == "null"
+    assert _parse(f"note={text}").note is None
