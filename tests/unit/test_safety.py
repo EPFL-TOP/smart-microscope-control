@@ -277,3 +277,18 @@ def test_invalid_offset_configuration_is_rejected_at_construction(
 ) -> None:
     with pytest.raises(ValueError, match="must be finite"):
         _offset_safety(**kwargs)
+
+
+@pytest.mark.parametrize("value", ["down", "Decreasing", True])
+def test_safety_refuses_an_unknown_z_away_from_sample(value: object) -> None:
+    # Code builds Safety without a profile (m2 §12.10.4): it validates the key
+    # itself, or a typo would read as a direction.
+    with pytest.raises(ValueError, match="z_away_from_sample must be") as refused:
+        _offset_safety(z_away_from_sample=value)
+    assert str(refused.value) == (
+        f'z_away_from_sample must be "decreasing", "increasing" or None, got {value!r}'
+    )
+    for accepted in ("decreasing", "increasing", None):
+        assert _offset_safety(z_away_from_sample=accepted).z_away_from_sample == (
+            accepted
+        )

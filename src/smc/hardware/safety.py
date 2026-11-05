@@ -50,7 +50,7 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from typing import Generic, TypeVar
+from typing import Generic, Literal, TypeVar
 
 from smc.hardware.errors import (
     DeviceTimeoutError,
@@ -112,10 +112,24 @@ class Safety:
         offset_unit: str = "",
         stop_refused_by: frozenset[str] = frozenset(),
         max_engage_excursion_um: float | None = None,
+        z_away_from_sample: Literal["decreasing", "increasing"] | None = None,
     ) -> None:
         #: The roles' values whose device refuses ``stop()`` (``"xy_stage"``):
         #: the backends set ``Motion.stop_refused`` from it (m2 §11.3).
         self.stop_refused_by = frozenset(stop_refused_by)
+        # As the profile validates it, for code that builds this: any other
+        # value would read as "unknown" and silently refuse every first lock,
+        # or worse, as a direction (m2 §12.10.4).
+        if z_away_from_sample not in (None, "decreasing", "increasing"):
+            raise ValueError(
+                f'z_away_from_sample must be "decreasing", "increasing" or None, '
+                f"got {z_away_from_sample!r}"
+            )
+        #: Which way Z moves away from the sample; ``None``: unknown, and no
+        #: first lock from below runs (m2 §12.10 D5).
+        self.z_away_from_sample: Literal["decreasing", "increasing"] | None = (
+            z_away_from_sample
+        )
         if max_engage_excursion_um is not None and (
             not math.isfinite(max_engage_excursion_um) or max_engage_excursion_um <= 0
         ):

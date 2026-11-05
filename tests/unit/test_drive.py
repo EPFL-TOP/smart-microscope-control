@@ -675,3 +675,115 @@ def test_read_autofocus_reads_the_state_once(
 
     assert reading == drive.AutofocusReading("autofocus off", False, True)
     assert len(reads) == 1
+
+
+# --- the autofocus offset, and its floor (m2 §12.10.6) ------------------------------
+
+
+def _with_offset_limits(*, dry_run: bool = False, at: float = 8141.0) -> Microscope:
+    """The demo with the offset's soft limits [5000, 12000] in PFSOffset units, at ``at``."""
+    profile = Profile.demo().model_copy(deep=True)
+    profile.safety.autofocus_offset_soft_limits = (5000.0, 12000.0)
+    profile.autofocus.offset_unit = "PFSOffset units"
+    core = FakeCore.demo_like()
+    core.setAutoFocusOffset(at)
+    microscope = Microscope.from_core(
+        cast("CMMCorePlus", core), profile, dry_run=dry_run
+    )
+    core.log.clear()
+    return microscope
+
+
+class RoundsDown(NeverLocks):
+    """An offset device that lands one unit below what it was asked."""
+
+    def set_offset_native(self, value: float) -> float:
+        return value - 1.0
+
+    def offset_unit(self) -> str:
+        return "PFSOffset units"
+
+
+def test_read_autofocus_offset_names_the_floor() -> None:
+    microscope = _with_offset_limits()
+    try:
+        result = drive.read_autofocus_offset(microscope)
+    finally:
+        microscope.close()
+
+    assert result == DriveResult(
+        "offset 8141 PFSOffset units, soft limits [5000, 12000]"
+    )
+
+
+def test_read_autofocus_offset_without_soft_limits_says_no_first_lock(
+    fake_microscope: Microscope,
+) -> None:
+    assert drive.read_autofocus_offset(fake_microscope) == DriveResult(
+        "offset 0 device units, no soft limits in the profile (no floor: no first lock)"
+    )
+
+
+def test_set_autofocus_offset_to_the_floor_sends_the_lower_bound() -> None:
+    microscope = _with_offset_limits()
+    try:
+        result = drive.set_autofocus_offset(microscope, None)
+        sent = list(_fake(microscope).log)
+    finally:
+        microscope.close()
+
+    assert result == DriveResult("offset 5000 PFSOffset units")
+    assert sent == ["setAutoFocusOffset(5000.0)"]
+
+
+def test_set_autofocus_offset_floor_without_soft_limits_sends_nothing_and_is_not_reached(
+    fake_microscope: Microscope,
+) -> None:
+    _fake(fake_microscope).log.clear()
+
+    result = drive.set_autofocus_offset(fake_microscope, None)
+
+    assert result == DriveResult(
+        "no floor: [safety] autofocus_offset_soft_limits is not set (m2 §12.10)",
+        reached=False,
+    )
+    assert _fake(fake_microscope).log == []
+
+
+def test_set_autofocus_offset_to_a_value_says_the_readback(
+    fake_microscope: Microscope,
+) -> None:
+    assert drive.set_autofocus_offset(fake_microscope, 12.5) == DriveResult(
+        "offset 12.5 device units"
+    )
+    assert fake_microscope.require(Autofocus).offset_native() == 12.5
+
+
+def test_set_autofocus_offset_whose_readback_differs_is_not_reached(
+    fake_microscope: Microscope,
+) -> None:
+    # The Ti2-E holds whole units: 7927.5 honestly reads 7927 (FM-155).
+    fake_microscope.override(Autofocus, RoundsDown())
+
+    result = drive.set_autofocus_offset(fake_microscope, 7928.0)
+
+    assert result == DriveResult(
+        "offset 7927 PFSOffset units, although 7928 was asked", reached=False
+    )
+
+
+def test_set_autofocus_offset_in_dry_run_says_where_it_is() -> None:
+    microscope = _with_offset_limits(dry_run=True)
+    try:
+        result = drive.set_autofocus_offset(microscope, None)
+        sent = list(_fake(microscope).log)
+        here = microscope.require(Autofocus).offset_native()
+    finally:
+        microscope.close()
+
+    assert result == DriveResult(
+        "[dry-run] would set the offset to 5000 PFSOffset units; it is at 8141 "
+        "PFSOffset units"
+    )
+    assert [line for line in sent if line.startswith("setAutoFocusOffset")] == []
+    assert here == 8141.0
