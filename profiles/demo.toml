@@ -27,6 +27,7 @@ turret_requires_confirm = true
 # autofocus_offset_soft_limits = [0.0, 15000.0]  # in [autofocus] offset_unit; not forceable
 # stop_refused_by = []  # roles whose device refuses stop(): "xy_stage", "focus", "autofocus_offset"; measured at a stand (m2 §11)
 # max_engage_excursion_um = 50.0  # how far Z may move while the autofocus engages, beyond where it starts or held; omitted: only z_soft_limits_um bound it (m2 §12)
+# z_away_from_sample = "decreasing"  # which way Z moves away from the sample, "decreasing" or "increasing"; seen at the stand, never guessed (m2 §12.10, #98)
 
 [autofocus]
 # The demo's DAutoFocus measures nothing, so every key is left unknown.
