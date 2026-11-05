@@ -4,7 +4,8 @@
   §3.11's stop rules decided in #144 (2026-10-18); §7 for #12
   (2026-10-19); §8 for #14 (2026-10-19); §8.10 for #167 (2026-10-20); §9
   for #48 (2026-10-20); §10 for #15 (2026-10-20); §11 for #204 and #206
-  (2026-10-28), §11.11 for #224 (2026-10-30); §12 for #205 (2026-10-28).
+  (2026-10-28), §11.11 for #224 (2026-10-30); §12 for #205 (2026-10-28);
+  §13 for #340 (2026-11-05).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1, this document is the contract between issues that are
   built in parallel. Names, module paths and signatures below are fixed; an
@@ -1196,6 +1197,7 @@ class ObjectiveTurret(Protocol):
     def current(self) -> str: ...
     def select(self, label: str, *, confirm: bool = False) -> str: ...
     def pixel_size_um(self, label: str | None = None) -> float: ...  # 0.0 = unknown
+    def offset(self, label: str) -> ObjectiveOffset: ...  # §13.4, the profile's
 ```
 
 ```python
@@ -3606,3 +3608,229 @@ Limits of the design, named:
 - **A first lock rests on a sign and on the operator's by-eye focus.** The
   guard limits a wrong sign to E plus what Z covers between two reads; it
   does not prevent it.
+
+## 13. Offsets between objectives (#340)
+
+A plate registered with one objective (the 4× or the 10×: a wide field,
+walls easy to see) is scanned with another (the 40×). The same feature is
+not centred at the same stage position under two objectives
+(parcentricity), nor in focus at the same Z (parfocality). This section
+fixes where the stand's offsets are written, how the layer hands them out,
+and how session 3 measures them. Applying them to a plate is m3 §18.
+
+### 13.1 What is known
+
+- The Ti2-E's turret holds `1-Plan Fluor 4x`, `2-Plan Fluor 10x` and
+  `3-Plan Apo LmbdD0.25 40x` (`docs/hardware/nikon-ti2.md`).
+- **A nosepiece turn moves Z by itself** (session 2, #330): 10× → 4× → 10×
+  read 500.0 µm at the call's return (from 561.5 µm), 570.2 µm with the 4×
+  (+8.7 µm) and 561.4 µm back with the 10×. The stand lowers Z for the turn
+  and puts it back with a correction of its own per objective. A Z offset
+  that smc applied on top would count it twice.
+- The stand switches PFS off on a turn (session 2), which m2 §8.3 already
+  assumes.
+- No XY offset between the three objectives has been read. Nothing in the
+  layer or in a plugin carries one today; `route` says so in its `assumed`
+  (m3 §11).
+- A read right after a set returns the previous value on this stand
+  (#330); the turret's `current()` right after a turn is not verified.
+
+### 13.2 Definitions (decided)
+
+The offsets are relative to one **reference objective**, named by the
+profile. For an objective `O`, with the same point-like feature centred in
+the frame under `O` and under the reference, each after a focus:
+
+- `xy_offset_um(O) = (x_O − x_ref, y_O − y_ref)`, the stage positions as
+  `XYStage.position_um()` reads them;
+- `z_offset_um(O) = z_O − z_ref`, the focus stage's readings
+  (`ZStage.position_um()`) after the operator focused, that is **after**
+  the stand's own correction of §13.1.
+
+The reference's own offset is `(0, 0)` and `0` by definition. A position
+`p_A` found with objective `A` is the position `p_B = p_A + xy_offset_um(B)
+− xy_offset_um(A)` with objective `B` (m3 §18). The shift is a translation:
+the same for every position on the stage, which session 3 checks (§13.6).
+
+**The layer applies no Z offset** (in this section or in m3 §18): the
+stand corrects Z itself on a turn, and no plugin sets an absolute Z from a
+record made with another objective. `z_offset_um` is stored and shown so
+that session 3's reading is not lost, and so that a later issue (the route
+to another objective, m3 §11) can use it once its meaning on this stand is
+settled.
+
+### 13.3 Profile — `profile.py`
+
+```toml
+[objectives]
+reference = ""   # the objective every offset is measured from, by its turret label; "" = no offsets (m2 §13)
+
+# [objectives.offsets."1-Plan Fluor 4x"]
+# xy_offset_um = [0.0, 0.0]   # stage XY under this objective minus under the reference, the same feature centred
+# z_offset_um = 0.0           # focused Z under this objective minus under the reference, after the stand's own correction
+# measured = "YYYY-MM-DD, session N (#issue)"
+```
+
+```python
+#: An offset beyond these is a unit or sign mistake, not a measurement
+#: (FM-121): parcentric objectives differ by tens of µm. Chosen, not measured.
+MAX_XY_OFFSET_UM = 1000.0
+MAX_Z_OFFSET_UM = 500.0
+
+
+class ObjectiveOffsetEntry(_Section):
+    xy_offset_um: tuple[float, float] | None = None
+    z_offset_um: float | None = None
+    measured: str = ""
+
+
+class ObjectivesSection(_Section):
+    reference: str = ""
+    offsets: dict[str, ObjectiveOffsetEntry] = Field(default_factory=dict)
+
+    def offset(self, label: str) -> ObjectiveOffset: ...
+
+
+class Profile(_Section):  # gains, after `channels`
+    objectives: ObjectivesSection = Field(default_factory=ObjectivesSection)
+```
+
+Validation, each a `ProfileError` naming the key:
+
+- each number of `xy_offset_um` and `z_offset_um` is finite, not a boolean
+  (`_no_boolean`), and within `±MAX_XY_OFFSET_UM` per axis or
+  `±MAX_Z_OFFSET_UM`; `xy_offset_um` has exactly two numbers;
+- an entry that sets either value has a `measured` that is not blank: an
+  offset with no date and session is a guess;
+- `offsets` that is not empty needs a `reference` that is not blank;
+- the reference has no entry of its own: its offset is zero by definition,
+  and an entry would be a second, contradicting statement;
+- `reference` and the labels are not checked against the turret here (the
+  profile cannot know it); `smc objective offset` shows a label that is not
+  on the turret (§13.5).
+
+`ObjectivesSection.offset(label)` returns, for:
+
+- `label == reference` (not blank): `xy_um=(0.0, 0.0)`, `z_um=0.0`,
+  `measured=""`;
+- a label with an entry: the entry's values (either may be `None`);
+- anything else, `""` included, or any label when `reference` is blank:
+  `xy_um=None`, `z_um=None`, `measured=""`.
+
+`reference` in the result is `None` when the profile names none. It never
+raises and reads nothing from the stand.
+
+`Profile.demo()` and `profiles/demo.toml` stay equal: the demo sets no
+offsets, and `demo.toml` carries the block above, commented.
+`nikon-ti2.toml` gets the same commented block with its three labels and
+`reference = "2-Plan Fluor 10x"` commented too: nothing is entered before
+session 3 has measured it. `profiles/README.md` documents the section, the
+sign convention of §13.2 and the procedure of §13.6.
+
+### 13.4 Capability — `capabilities.py`, `backends/mm.py`, `microscope.py`
+
+```python
+@dataclass(frozen=True, slots=True)
+class ObjectiveOffset:
+    objective: str
+    reference: str | None  # None: the profile names no reference objective
+    xy_um: tuple[float, float] | None  # None: not measured
+    z_um: float | None  # None: not measured
+    measured: str  # when and in which session; "" for the reference and when unknown
+```
+
+`ObjectiveOffset` joins `__all__`. `ObjectiveTurret` (§8.2) gains:
+
+```python
+class ObjectiveTurret(Protocol):  # gains
+    def offset(self, label: str) -> ObjectiveOffset: ...  # the profile's
+```
+
+- `MMObjectiveTurret.__init__` gains the keyword `offset_of:
+  Callable[[str], ObjectiveOffset]`; `_build` passes
+  `offset_of=profile.objectives.offset` (a bound method of the profile's
+  section, not of the capability: FM-92 holds). `offset(label)` returns
+  `offset_of(label)`.
+- **Kind of call** (extends §8.7): none. It reads the profile only: no
+  lock, no executor, allowed while halted, in a dry run and while the stand
+  moves.
+- Every class in `src/` and `tests/` that implements `ObjectiveTurret` for
+  a test gains the method (`runtime_checkable` checks that it exists).
+
+### 13.5 CLI — `smc objective offset`
+
+```text
+smc objective offset [--profile NAME]
+```
+
+Opens the stand as `smc objective list` does and prints one line per
+turret label in position order, empty labels skipped, the current one
+marked as `list` marks it:
+
+```text
+'1-Plan Fluor 4x'  xy (+12.50, -4.00) µm  z -8.70 µm  measured 2026-11-12, session 3 (#NNN)
+'2-Plan Fluor 10x'  (current)  reference
+'3-Plan Apo LmbdD0.25 40x'  xy unknown  z unknown
+```
+
+A known value is printed with its sign and two decimals; an unknown one
+as `unknown`, never `0`. Then, one line per profile entry whose label is
+not on the turret, and one if the reference is not on it: `'<label>' is in
+the profile's [objectives] but not on the turret: check the label`. With
+no reference: one line, `the profile names no reference objective
+([objectives] reference): every offset is unknown`. It exits 0 in every
+case above: it is a read-out. Its help says what the offsets are for and
+where they are written.
+
+### 13.6 What session 3 measures (for `/hardware-session`)
+
+The procedure for the session's checklist, with PFS off (a turn switches
+it off anyway) and the operator focusing by hand or with `smc z jog`:
+
+1. **A point, not a line.** A small, sharp feature visible with all three
+   objectives: a stage micrometer's cross, the corner of a printed grid, a
+   fine pen dot on the underside of a plate. A wall is a line: it centres
+   one axis only.
+2. With the **10×** (`smc objective set "2-Plan Fluor 10x" --confirm`),
+   focus, centre the feature in the frame (within 2 px of the centre of a
+   snap), and read `smc stage get` and `smc z get`.
+3. Turn to the **4×** with the stage clear (objective clearance as the
+   checklist says). Read `smc z get` **before** focusing (the stand's own
+   correction, §13.1), then focus, centre, read XY and Z.
+4. The same with the **40×**: Z after the turn, then focus, centre, XY, Z.
+5. Back to the **10×**: centre again and read. The difference with step 2
+   is the 10×'s own repeatability, and bounds what the offsets can claim.
+6. Repeat steps 2 to 5 once more, at another feature far across the plate
+   if one is available: the offset is a translation only if both places
+   agree within that repeatability.
+
+Each offset is the mean of the two cycles, `p_O − p_10x` within the same
+cycle. It goes into `nikon-ti2.toml` with `reference = "2-Plan Fluor
+10x"` and `measured = "<date>, session 3 (#<report>)"` only if the two
+cycles agree within the 10×'s repeatability plus 2 px of the coarser
+objective (5.5 µm at 4×); otherwise the readings go into the report and
+nothing is entered.
+
+### 13.7 Tests
+
+- `tests/unit/test_profile.py`: the section loads from TOML with quoted
+  labels; each refusal of §13.3 (a value with no `measured`, a blank
+  `measured`, a value beyond each bound, NaN, a boolean, three numbers,
+  offsets with no reference, an entry for the reference); `offset()` for
+  the reference, an entry, an unknown label, `""` and a blank reference.
+- `tests/contracts/test_objective_turret.py`:
+  `test_offset_is_unknown_or_the_profiles` (every label; on `fake` it
+  sends nothing, the call log unchanged).
+- `tests/test_cli_drive.py`: the read-out's lines on a demo profile with
+  offsets (an entry, the reference, an unknown label, a profile label not
+  on the turret) and on the plain demo (no reference).
+
+### 13.8 Not verified
+
+- The offsets themselves, and that they are a translation (§13.6).
+- Whether the Ti2-E's own Z correction on a turn (§13.1) is the whole
+  parfocality, leaving `z_offset_um` near 0.
+- Whether `current()` reads the new objective right after a turn (#330).
+- Whether NIS-Elements applies an offset of its own when its objective
+  changes, which decides how the route's positions for another objective
+  are handed on (m3 §11, §18).
