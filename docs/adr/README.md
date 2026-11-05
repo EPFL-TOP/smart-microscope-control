@@ -16,6 +16,7 @@ and why.
 | [0006](0006-user-interface.md) | User interface: one simple interface for every microscope | accepted |
 | [0007](0007-non-micromanager-hardware.md) | Hardware without a Micro-Manager adapter (Zeiss MTB, Viventis) | **proposed** |
 | [0008](0008-repository-workflow.md) | Repository workflow: issues, branches, PRs, CI | accepted |
+| [0009](0009-light-ci-full-nightly.md) | A light CI on pull requests, the full matrix every night (amends 0005, 0008) | **proposed** |
 
 ## Statuses
 
