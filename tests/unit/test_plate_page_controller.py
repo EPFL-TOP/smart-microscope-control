@@ -462,7 +462,9 @@ def test_a_click_and_a_typed_range_build_the_same_selection(
     x, y = _centre("A1")
     assert clicked.click(x, y, drive=False) == "A1"
     assert clicked.selection == ("A2", "B1", "B2")
-    assert clicked.current == "A1"
+    # A1 was deselected and was not the well the buttons act on: B2, the last well
+    # selected, still is (m5 §11.1).
+    assert clicked.current == "B2"
 
 
 def test_a_click_finds_the_well_on_a_rotated_registered_plate(
@@ -556,6 +558,93 @@ def test_a_click_in_drive_mode_runs_goto_well_with_the_wells_name_and_side(
     assert page.selection == ()
     assert page.status().outcome is not None
     assert page.status().outcome.startswith("goto-well done in ")
+
+
+# --- `current` is a well the operator can see (m5 §11.1, #332) ----------------------
+
+
+def _tap(page: PlatePage, well: str) -> None:
+    """A select-mode click on the centre of ``well`` of the nominal map."""
+    assert page.click(*_centre(well), drive=False) == well
+
+
+def test_a_click_that_deselects_the_current_well_drops_it(page: PlatePage) -> None:
+    _tap(page, "B3")
+    assert (page.selection, page.current) == (("B3",), "B3")
+    # The measured case of the session at the stand: the well the buttons act on
+    # was one the map no longer showed as selected.
+    _tap(page, "B3")
+    assert (page.selection, page.current) == ((), None)
+
+
+def test_a_click_that_deselects_another_well_leaves_current(page: PlatePage) -> None:
+    _tap(page, "B3")
+    _tap(page, "B4")
+    assert page.current == "B4"
+    _tap(page, "B3")
+    assert (page.selection, page.current) == (("B4",), "B4")
+
+
+def test_a_typed_range_drops_a_current_well_it_does_not_hold(page: PlatePage) -> None:
+    # The measured case: B3 selected and current, then `C1:C2` typed.
+    _tap(page, "B3")
+    page.select_text("C1:C2")
+    assert (page.selection, page.current) == (("C1", "C2"), None)
+    # A box the operator emptied replaces the selection by none: the same rule.
+    _tap(page, "C3")
+    assert page.current == "C3"
+    page.select_text("  ")
+    assert (page.selection, page.current) == ((), None)
+
+
+def test_a_typed_range_keeps_a_current_well_it_holds(page: PlatePage) -> None:
+    _tap(page, "B3")
+    page.select_text("B1:B4")
+    assert (page.selection, page.current) == (("B1", "B2", "B3", "B4"), "B3")
+
+
+def test_a_typed_range_that_is_refused_leaves_current_as_it_was(
+    page: PlatePage,
+) -> None:
+    _tap(page, "B3")
+    with _refuses(ValueError, "wells not understood on a 96-well plate: 'Z99'"):
+        page.select_text("Z99")
+    assert (page.selection, page.current) == (("B3",), "B3")
+
+
+def test_goto_sets_current_without_selecting_and_a_typed_range_drops_it(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    page = _page(fake_microscope, run_doc)
+    try:
+        page.goto("B3")
+        assert page.join(10.0)
+        assert (page.selection, page.current) == ((), "B3")
+        # A driven-to well is not selected; a typed range replaces the selection, and
+        # one that does not hold it drops it too.
+        page.select_text("A1")
+        assert (page.selection, page.current) == (("A1",), None)
+    finally:
+        page.close()
+
+
+def test_a_deselect_of_another_well_leaves_a_driven_to_well(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    page = _page(fake_microscope, run_doc)
+    try:
+        x, y = _centre("A1", a1=A1_OFF, rotation_deg=TURN_DEG)
+        page.click(x, y, drive=False)
+        page.goto("B3")
+        assert page.join(10.0)
+        # A1 is selected, B3 is current without being selected: deselecting A1
+        # must not take B3 away.
+        page.toggle("A1")
+        assert (page.selection, page.current) == ((), "B3")
+    finally:
+        page.close()
 
 
 # --- running a plugin ----------------------------------------------------------------

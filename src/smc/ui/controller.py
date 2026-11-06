@@ -928,11 +928,12 @@ class PlatePage:
         """
         if text.strip() == "":
             self.selection = ()
-            return
-        self.selection = parse_wells(self._plate, text)
+        else:
+            self.selection = parse_wells(self._plate, text)
+        self._drop_unselected_current()
 
     def toggle(self, well: str) -> None:
-        """Add ``well`` to the selection, or remove it.
+        """Add ``well`` to the selection, or remove it; removing the well that is ``current`` drops it.
 
         Raises:
             ValueError: The well is not on the plate; the selection is as it was.
@@ -940,8 +941,23 @@ class PlatePage:
         name = self._on_plate(well)
         if name in self.selection:
             self.selection = tuple(w for w in self.selection if w != name)
+            # Only the well that was deselected: a deselect of another well leaves
+            # ``current`` (a well driven to is not selected, and stays) (m5 §11.1).
+            if self.current == name:
+                self._drop_unselected_current()
         else:
             self.selection = (*self.selection, name)
+
+    def _drop_unselected_current(self) -> None:
+        """``current`` is dropped when the selection no longer holds it (m5 §11.1).
+
+        ``current`` is the well *Capture* and *Forget* act on, and the page names it
+        on their labels: a well the map shows as deselected must not stay the one a
+        capture is recorded under. One helper called wherever the selection is
+        replaced, so that no path forgets it.
+        """
+        if self.current is not None and self.current not in self.selection:
+            self.current = None
 
     def click(
         self, x_um: float, y_um: float, *, drive: bool, side: str = "centre"
@@ -966,8 +982,11 @@ class PlatePage:
         if drive:
             self.goto(well, side)
         else:
-            self.current = well
             self.toggle(well)
+            # After the toggle: a click that deselects sets nothing, and the one that
+            # selects makes this well the one the captures act on (m5 §11.1).
+            if well in self.selection:
+                self.current = well
         return well
 
     def goto(self, well: str, side: str = "centre") -> None:
