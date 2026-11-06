@@ -1879,6 +1879,52 @@ def test_a_record_whose_plate_is_not_a_known_plate_is_ignored(
     assert page.refs == ()
 
 
+def test_a_plate_finding_record_names_the_plate_it_found_not_the_one_it_was_sized_for(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # `plate-finding`'s `plate` parameter sizes its survey (default 96-well); its result
+    # is the plate it fitted. Read as the plate on the stage, the parameter opened the
+    # page on a 96-well map and said it had been chosen (adversarial review of #332).
+    _seed(
+        run_doc,
+        "plate-finding",
+        "plate",
+        _plate("24-well"),
+        params={"plate": "96-well", "plates": []},
+    )
+    page = _page(fake_microscope, run_doc)
+    assert (page.plate, page.plate_chosen) == ("24-well", True)
+
+
+def test_a_failed_plate_finding_names_no_plate(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # A survey that failed found no plate, and its parameter is not one: the page asks.
+    _seed(
+        run_doc,
+        "plate-finding",
+        "plate",
+        status=StageStatus.failed,
+        params={"plate": "24-well"},
+    )
+    page = _page(fake_microscope, run_doc)
+    assert (page.plate, page.plate_chosen) == ("96-well", False)
+
+
+def test_a_usable_result_names_the_plate_even_when_its_params_do_not(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed(
+        run_doc,
+        "plate-registration",
+        "plate",
+        _plate("24-well"),
+        params={"plate": "nope"},
+    )
+    page = _page(fake_microscope, run_doc)
+    assert (page.plate, page.plate_chosen) == ("24-well", True)
+
+
 def test_the_profiles_sample_plate_is_chosen(run_doc: Path) -> None:
     sampled = Profile.model_validate(
         {"microscope": {"name": "demo-sample"}, "sample": {"plate": "24-well"}}
@@ -1918,6 +1964,16 @@ def test_choose_plate_with_the_plate_shown_still_confirms_it(
 def test_choosing_another_plate_chooses_it(page: PlatePage) -> None:
     page.choose_plate("24-well")
     assert (page.plate, page.plate_chosen) == ("24-well", True)
+
+
+def test_a_refused_plate_name_does_not_confirm_the_placeholder(
+    page: PlatePage,
+) -> None:
+    plates = ", ".join(sorted(useq.registered_well_plate_keys()))
+    with _refuses(ValueError, f"'nope' is not a plate; the plates are {plates}"):
+        page.choose_plate("nope")
+    # The name is checked before anything changes: a typo does not open the gate.
+    assert (page.plate, page.plate_chosen) == ("96-well", False)
 
 
 def test_restore_reads_the_captures_of_the_latest_provider(

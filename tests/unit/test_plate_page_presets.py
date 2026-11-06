@@ -60,6 +60,9 @@ class RegistrationParams(PluginParams):
     plate: str = "96-well"
     refs: tuple[WellRef, ...] = ()
     walls: tuple[WallTouch, ...] = ()
+    # A field of the tool's own, as the real plugin has: a preset keeps it, and the
+    # check of it needs the pairs the page fills (the plate included) all the same.
+    max_rotation_deg: float = 10.0
 
 
 class ScanPlanParams(PluginParams):
@@ -525,6 +528,7 @@ def test_save_preset_keeps_the_typed_wells_when_they_name_the_selection(
     make_page: Callable[..., PlatePage], tmp_path: Path
 ) -> None:
     page = make_page()
+    page.choose_plate("96-well")  # named: a preset keeps the plate only then
     page.select_text("A1:B2")
 
     saved = page.save_preset("mine", {"scan-plan": ["coverage=0.4"]}, " A1:B2 ")
@@ -539,6 +543,51 @@ def test_save_preset_keeps_the_typed_wells_when_they_name_the_selection(
     assert stored["saved_utc"].microsecond == 0
     assert stored["saved_utc"].utcoffset().total_seconds() == 0  # type: ignore[union-attr]
     assert saved.selection == page.selection
+
+
+def test_a_preset_saved_on_the_placeholder_names_no_plate_and_confirms_nothing(
+    make_page: Callable[..., PlatePage], tmp_path: Path
+) -> None:
+    # The page shows a 96-well that nothing named (m5 §11.3). Written down it would be
+    # read back, by the load that follows a save and by any later load, as a
+    # deliberate choice, and the plate gate would open without anyone choosing.
+    page = make_page()
+    assert not page.plate_chosen
+
+    # A field of `plate-registration` is checked against the pairs the page fills, the
+    # plate included: the gate on the placeholder is not asked for a preset.
+    saved = page.save_preset("mine", {"plate-registration": ["max_rotation_deg=5"]}, "")
+
+    assert "plate" not in _saved(tmp_path, "mine")
+    assert saved.check.plate is None
+    assert not page.plate_chosen
+    with pytest.raises(ValueError, match=r"^choose the plate on the stage first"):
+        page.page_params("plate-registration")
+
+
+def test_a_preset_that_names_a_plate_is_the_operators_choice_and_confirms_it(
+    make_page: Callable[..., PlatePage], tmp_path: Path
+) -> None:
+    # Decided, not incidental: a preset the operator saved after choosing a plate, or a
+    # file that names one, says which plate is on the stage, and loading it chooses it.
+    _put(tmp_path, "plate24", 'stand = "demo-sample"\nplate = "24-well"\n')
+    page = make_page()
+    assert not page.plate_chosen
+
+    page.load_preset("plate24")
+
+    assert (page.plate, page.plate_chosen) == ("24-well", True)
+
+
+def test_a_preset_saved_after_the_plate_was_chosen_keeps_it(
+    make_page: Callable[..., PlatePage], tmp_path: Path
+) -> None:
+    page = make_page()
+    page.choose_plate("24-well")
+
+    page.save_preset("mine", {"cells": ["detector=blobs"]}, "")
+
+    assert _saved(tmp_path, "mine")["plate"] == "24-well"
 
 
 def test_save_preset_joins_the_selection_when_the_box_says_otherwise(

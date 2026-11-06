@@ -243,6 +243,12 @@ _GEOMETRY_KEPT = 4
 _Capture = TypeVar("_Capture", WellRef, WallTouch)
 
 
+#: The providers of ``plate`` whose ``plate`` parameter is the plate on the stage. Another
+#: provider's parameter of that name means something else (``plate-finding``'s sizes its
+#: survey), so what it holds is read from its result only (``_plate_named_by``).
+_PLATE_PARAM_PLUGINS = ("plate-registration", "plate-walls")
+
+
 def _needs_plate(plugin: str) -> bool:
     """Whether the page fills ``plugin``'s ``plate`` itself, so that it needs a plate the operator chose (m5 §11.3).
 
@@ -1262,7 +1268,10 @@ class PlatePage:
             params[plugin] = tuple(pairs)
         preset = Preset(
             stand=self._profile.microscope.name,
-            plate=self._plate,
+            # The placeholder is not a plate anyone named: written down, it would be
+            # read back as a deliberate choice, and the load that follows (and any
+            # later load) would confirm it and open the gate (m5 §11.3).
+            plate=self._plate if self._plate_chosen else None,
             wells=self._wells_to_save(wells),
             saved_utc=datetime.now(timezone.utc).replace(microsecond=0),
             params=params,
@@ -3054,18 +3063,39 @@ class PlatePage:
     def _initial_plate(self, doc: RunDocument) -> tuple[str, bool]:
         """The plate the page starts with, and whether anything named it (m5 §11.3).
 
-        In order: the plate of the latest provider of ``plate`` (a registration or a
-        wall registration, whatever its status: what the operator was working on),
-        the profile's ``[sample]``, which is what the stand's camera images, and
-        last the ``96-well`` placeholder, which nothing named: the page then asks.
+        In order: the plate of the latest provider of ``plate`` (what the operator was
+        working on, whatever its status), the profile's ``[sample]``, which is what
+        the stand's camera images, and last the ``96-well`` placeholder, which
+        nothing named: the page then asks.
         """
-        named = self._plate_of(doc.provider("plate"))
+        named = self._plate_named_by(doc)
         if named is not None:
             return named, True
         sample = self._profile.sample
         if sample is not None and sample.plate in useq.registered_well_plate_keys():
             return sample.plate, True
         return "96-well", False
+
+    def _plate_named_by(self, doc: RunDocument) -> str | None:
+        """The plate the latest provider of ``plate`` holds, read as data (FM-125), or ``None``.
+
+        A usable result is what the record found: its ``plate`` is the truth. Without
+        one (the run failed or was stopped) the record's ``plate`` parameter is what
+        it was asked for, which is the plate on the stage for ``plate-registration``
+        and ``plate-walls`` only: ``plate-finding``'s is the plate its survey was
+        *sized* for (a default of 96-well), and a failed survey found no plate. Read
+        as the plate on the stage, it opened the page on the wrong plate and said it
+        had been chosen (adversarial review of #332).
+        """
+        record = doc.provider("plate")
+        if record is None:
+            return None
+        found = self._slot(doc, "plate", PlateResult, [])
+        if found is not None and found.plate in useq.registered_well_plate_keys():
+            return str(found.plate)
+        if record.plugin in _PLATE_PARAM_PLUGINS:
+            return self._plate_of(record)
+        return None
 
     @staticmethod
     def _plate_of(record: StageRecord | None) -> str | None:
