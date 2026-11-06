@@ -56,7 +56,16 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, suppress
 from dataclasses import dataclass
 from types import MappingProxyType, TracebackType
-from typing import TYPE_CHECKING, Any, Literal, NoReturn, Protocol, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Generic,
+    Literal,
+    NoReturn,
+    Protocol,
+    TypeVar,
+    cast,
+)
 
 from smc.hardware.capabilities import (
     XY,
@@ -243,6 +252,62 @@ def autofocus_offset_motion(
 def _core_timeout(core: CMMCorePlus) -> Callable[[], float]:
     """The core timeout in seconds, resolved inside the action (design §2, §13)."""
     return lambda: core.getTimeoutMs() / 1000.0
+
+
+#: How long a readback that is not what was set is read again before it is
+#: believed (m2 §8.11 D1). Assumed: the Ti2-E's DiaLamp read the previous
+#: value 9 ms after a set and the new one 0.3 s after, and nothing longer
+#: was measured. The visit that measures the lag may set another value.
+FRESH_READ_WINDOW_S = 1.0
+
+T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class _Reread(Generic[T]):
+    """What ``_reread`` found: the last read, whether it was fresh, how long it took."""
+
+    value: T
+    fresh: bool
+    waited_s: float
+
+
+def _reread(read: Callable[[], T], is_fresh: Callable[[T], bool]) -> _Reread[T]:
+    """Read until ``is_fresh`` accepts a read, or ``FRESH_READ_WINDOW_S`` has passed (FM-188).
+
+    A device may answer a read right after a set with the value it held
+    before (the Ti2-E's DiaLamp did, 9 ms after a set), so a readback that
+    stands for what the device now holds is read again, every
+    ``POLL_INTERVAL_S``, before it is believed. A read that is fresh at once
+    costs one read and no sleep. At the end of the window the last read is
+    returned with ``fresh`` false, never the first. The window is read at the
+    call, so that a test can shorten it, and a read that raises propagates.
+    It logs nothing: its callers do, so that a caller that already warns at
+    the bound does not warn twice.
+    """
+    window_s = FRESH_READ_WINDOW_S
+    started = time.monotonic()
+    value = read()
+    if is_fresh(value):
+        return _Reread(value, True, 0.0)
+    while True:
+        waited_s = time.monotonic() - started
+        if waited_s >= window_s:
+            return _Reread(value, False, waited_s)
+        time.sleep(POLL_INTERVAL_S)
+        value = read()
+        if is_fresh(value):
+            return _Reread(value, True, time.monotonic() - started)
+
+
+def _reads_as_set(value: float, read: float) -> bool:
+    """Whether ``read`` is ``value`` as a device may format it back (m2 §8.11 D1).
+
+    The demo reads four decimals (``'50.0000'``) and MMCore writes a double
+    with six, so a readback needs a tolerance of that order: the absolute one
+    covers small values, where a relative one is nothing.
+    """
+    return math.isclose(read, value, rel_tol=1e-6, abs_tol=1e-4)
 
 
 class MMXYStage:
