@@ -17,12 +17,21 @@ yourself.
    point as this change's own changes, reversed (#68).
    Pick one scratch directory outside the repository: your session's
    scratchpad if the system prompt names one, otherwise run `mktemp -d` as a
-   command on its own and note the path it prints. Save the issue's latest
-   `## Plan` comment there as `plan.md` with the Write tool: the latest
-   *comment* is your own `Starting` (#205), so select on the header. Read its
-   **Risk** and **Failure modes to handle** lines. The worktree's sandbox
+   command on its own and note the path it prints. Do **not** retype the plan
+   into a file: the reviewers and the verifier read the issue's latest
+   `## Plan` comment themselves with `gh issue view N --comments` (give them
+   the issue number and the header to select on; the latest *comment* is your
+   own `Starting`, #205). A retyped `plan.md` cost a 3 000-word Write and lost
+   the plan's **Tests that prove it** (#331, #353). Read the plan's **Risk**
+   and **Failure modes to handle** lines yourself. The worktree's sandbox
    refuses heredocs, `$(...)` and pipes into an interpreter: one plain
    command per Bash call, and files through Write.
+   **While the verifiers run their mutants, do not edit the worktree**:
+   `mutant.py` copies the working tree, so an edit under way lands in the
+   copy and can kill or spare a mutant for the wrong reason (#252, #332,
+   #353). Hold the fixes until every verdict is in. A mutant's pattern is
+   taken from `grep -n` of the file as it is, never from memory: the formatter
+   hook reflows a file after every Write or Edit (#328, #353).
 2. **Lenses by risk.**
 
    | Risk | Reviewers |
