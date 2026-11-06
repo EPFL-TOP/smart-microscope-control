@@ -27,13 +27,14 @@ keeps, each learned by measuring (m3 §15.3, #277):
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import logging
 import math
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import numpy as np
@@ -70,7 +71,16 @@ from smc.ui.controller import (
     WellView,
 )
 from smc.ui.frames import Frame, display_image
-from smc.ui.guide import NextStep, preset_differences, preset_note_text
+from smc.ui.guide import (
+    END_LIVE_LABEL,
+    NextStep,
+    busy_note,
+    capture_centre_label,
+    capture_wall_label,
+    forget_label,
+    preset_differences,
+    preset_note_text,
+)
 
 __all__ = ["PlatePageView", "build", "card_text", "next_step_text", "serve"]
 
@@ -121,9 +131,18 @@ _PLATE_TAB = 0
 _IMAGE_TAB = 1
 
 #: The two labels of the live button: ``_draw_buttons`` draws them and ``on_live`` reads
-#: them, so that a click does what the button says (m5 §5.3, #287).
+#: them, so that a click does what the button says (m5 §5.3, #287). The second is the
+#: guide's, which ``busy_note`` quotes: the note and the button cannot differ (m5 §11.2).
 _LIVE_LABEL = "Live"
-_END_LIVE_LABEL = "End live"
+_END_LIVE_LABEL = END_LIVE_LABEL
+
+#: The width of the note under the *Plate* select, in pixels: it wraps inside the map's column.
+_PLATE_NOTE_WIDTH = 520
+
+#: What the captures' note says while the buttons name no well (m5 §11.1).
+_NO_WELL_NOTE = (
+    "click a well on the map first: a capture records the well you clicked last"
+)
 
 NO_FRAME_TEXT = "no frame yet"
 
@@ -353,6 +372,9 @@ class PlatePageView:
         # computed at the click (m5 §8.5). And the selection the *Wells* box stands
         # for, with the guard that keeps an echo of it from selecting again.
         self._next_drawn: NextStep | None = None
+        # The well the capture buttons were last drawn for: a capture records this
+        # one or nothing, never the controller's ``current`` of the moment (FM-177).
+        self._capture_well: str | None = None
         self._wells_shown: tuple[str, ...] = ()
         self._echoing = False
         self._next_tool: str | None = None
@@ -481,6 +503,12 @@ class PlatePageView:
             options=sorted(useq.registered_well_plate_keys()),
             value=page.plate,
         )
+        # What the page asks while nothing named the plate (m5 §11.3): the note says
+        # what the 96-well is, and the button confirms it. Both visible only then.
+        self.plate_note = _wrapped_text(
+            extra={"color": _WARNING}, width=_PLATE_NOTE_WIDTH
+        )
+        self.plate_confirm_button = pn.widgets.Button(label="", color="primary")
         self.label_select = pn.widgets.Select(
             label="Density of", options=[], value=None
         )
@@ -502,6 +530,8 @@ class PlatePageView:
             label="Wall", options=list(_WALL_SIDES), value="left"
         )
         self.forget_button = pn.widgets.Button(label="Forget")
+        # Why the three buttons above are disabled with no well: wrapped, as a tool's note.
+        self.capture_note = _wrapped_text(extra={"color": _WARNING})
         self.snap_button = pn.widgets.Button(label="Snap")
         self.live_button = pn.widgets.Button(label=_LIVE_LABEL)
         self.snap_note = pn.pane.Str("", styles={"color": _WARNING})
@@ -533,11 +563,19 @@ class PlatePageView:
             ),
             "value",
         )
+        # The *Wall* select names the side on *Capture wall*: redrawn at once, not at
+        # the next tick, so the label never says a side the press will not record.
+        self.capture_side_select.param.watch(
+            self._handler(lambda event: self._draw_captures()), "value"
+        )
         self.select_input.param.watch(
             self._handler(lambda event: self.on_select_text(event.new)), "value"
         )
         self.select_input.param.watch(
             self._handler(lambda event: self._draw_preset_note()), "value"
+        )
+        self.plate_confirm_button.on_click(
+            self._handler(lambda event: self.on_confirm_plate())
         )
         self.refresh_button.on_click(self._handler(lambda event: self.on_refresh()))
         self.next_button.on_click(self._handler(lambda event: self.on_next()))
@@ -784,6 +822,7 @@ class PlatePageView:
         )
         plate_tab = pn.Column(
             controls,
+            pn.Row(self.plate_confirm_button, self.plate_note),
             pn.Row(self.select_input, self.refresh_button),
             pn.pane.Bokeh(self.figure, sizing_mode="stretch_width"),
             sizing_mode="stretch_width",
@@ -884,6 +923,7 @@ class PlatePageView:
             parts += [
                 pn.Row(self.capture_centre_button, self.forget_button),
                 pn.Row(self.capture_wall_button, self.capture_side_select),
+                self.capture_note,
                 self.captures_text,
             ]
         if advanced_widgets:
@@ -1008,13 +1048,45 @@ class PlatePageView:
         self._try(lambda: self.page.choose_plate(name))
         self.refresh()
 
+    def _well_the_buttons_name(self) -> str:
+        """The well the capture buttons were drawn for, when it is still the controller's current well (FM-177).
+
+        The label said ``B3``; another tab, or a click between two ticks, may have made
+        ``B4`` current since. Recording ``B3``'s wall at the position the operator took
+        for ``B4``'s is a wrong plate registration with nothing to show it, and
+        recording what the label did not say is what the page must not do. Neither is
+        safe, so the press records nothing and asks again; the redraw that follows
+        shows the well it would record now.
+
+        Raises:
+            ValueError: No well was drawn, or ``current`` is another well now.
+        """
+        drawn, now = self._capture_well, self.page.current
+        if drawn is None:
+            raise ValueError("click a well on the map first")
+        if now != drawn:
+            raise ValueError(
+                f"the well to record changed from {drawn} to "
+                f"{'none' if now is None else now}: check the button, then press it again"
+            )
+        return drawn
+
+    def on_confirm_plate(self) -> None:
+        """The *The plate is a …* button: the plate shown is the one on the stage (m5 §11.3).
+
+        ``choose_plate`` with the plate already shown confirms it and clears nothing:
+        the captures made on the placeholder are the operator's and are kept. A click
+        on a button that is hidden still arrives here (FM-169); confirming a plate
+        already confirmed is harmless.
+        """
+        self._try(lambda: self.page.choose_plate(self.page.plate))
+        self.refresh()
+
     def on_capture(self, kind: str) -> None:
-        """Capture the stage position as the centre, or a wall, of the current well."""
+        """Capture the stage position as the centre, or a wall, of the well the button names."""
 
         def capture() -> None:
-            well = self.page.current
-            if well is None:
-                raise ValueError("click a well first")
+            well = self._well_the_buttons_name()
             if kind == "centre":
                 self.page.capture_centre(well)
             elif kind == "wall":
@@ -1026,13 +1098,10 @@ class PlatePageView:
         self.refresh()
 
     def on_forget(self) -> None:
-        """Forget the captures of the current well."""
+        """Forget the captures of the well the button names."""
 
         def forget() -> None:
-            well = self.page.current
-            if well is None:
-                raise ValueError("click a well first")
-            self.page.forget(well)
+            self.page.forget(self._well_the_buttons_name())
 
         self._try(forget)
         self.refresh()
@@ -1492,6 +1561,9 @@ class PlatePageView:
         page = self.page
         return (
             page.plate,
+            # Another tab's confirmation of the placeholder changes the note, the
+            # button and the tools' notes without changing the plate (FM-151).
+            page.plate_chosen,
             page.selection,
             page.refs,
             page.walls,
@@ -1541,6 +1613,7 @@ class PlatePageView:
         self._draw_cards()
         self._draw_next()
         self._draw_problems()
+        self._draw_plate_ask()
         self._draw_buttons()
         self._draw_drive()
         # The options are read here and after a save, never by the tick (§10.6).
@@ -1690,27 +1763,29 @@ class PlatePageView:
     def _draw_buttons(self) -> None:
         """A tool that is blocked, or any tool or snap while an activity goes, cannot be started.
 
+        A disabled *Run* says why beside the button (m5 §11.2): its own reason, which
+        holds longer than any activity (the stand closed, a missing input, the plate
+        not chosen), else what the running activity is and how to end it. A tool
+        that would replace a usable plate adds that, on the next line (§11.4).
+
         The captures read the stage, so they are disabled while the stand is
         closed (the *Connect* row says why) and while an activity other than this
         page's live goes (the controller refuses a capture then, #295).
         """
         running = self._running
+        live = self.page.is_live
+        busy = None if running is None else busy_note(running, live=live)
+        replaces = {} if self._view is None else self._view.replaces
         for name, button in self.tool_runs.items():
             reason = self._blocked.get(name)
             button.disabled = running is not None or reason is not None
-            self.tool_notes[name].object = reason or ""
+            lines = (reason or busy, replaces.get(name))
+            self.tool_notes[name].object = "\n".join(line for line in lines if line)
         # The next step's button: while an activity goes, or when the step says why not.
         blocked = None if self._next_drawn is None else self._next_drawn.blocked
         self.next_button.disabled = running is not None or blocked is not None
-        self.next_note.object = blocked or ""
-        live = self.page.is_live
-        # The captures read the stage: disabled with the stand closed, and while an
-        # activity other than this page's live goes, which the controller refuses a
-        # capture for. While live goes they stay enabled: only the controller knows
-        # whether a drive action waits or runs, and its refusal is the message.
-        capture_off = not self.page.connected or (running is not None and not live)
-        self.capture_centre_button.disabled = capture_off
-        self.capture_wall_button.disabled = capture_off
+        self.next_note.object = blocked or busy or ""
+        self._draw_captures()
         lacks = self.page.lacks(Camera)
         self.snap_button.disabled = running is not None or lacks is not None
         # While live goes its own button is the one that ends it; any other activity
@@ -1720,6 +1795,55 @@ class PlatePageView:
             running is not None and not live
         )
         self.snap_note.object = lacks or ""
+
+    def _draw_plate_ask(self) -> None:
+        """The note and the button that ask which plate is on the stage, visible only while nothing named it (m5 §11.3).
+
+        The *Plate* select shows the placeholder (its options and value are
+        unchanged) and the page says what it is, with the one button that confirms
+        it. ``refresh`` draws it: ``plate_chosen`` is in the shared state, so another
+        tab's confirmation redraws this one.
+        """
+        asking = not self.page.plate_chosen
+        plate = self.page.plate
+        self.plate_note.visible = asking
+        self.plate_confirm_button.visible = asking
+        if asking:
+            self.plate_note.object = (
+                f"Which plate is on the stage? {plate} is only a placeholder: "
+                f"choose the plate, or press the button if it is a {plate}."
+            )
+            self.plate_confirm_button.label = f"The plate is a {plate}"
+
+    def _draw_captures(self) -> None:
+        """The three capture buttons name the well they record and the side of the *Wall* select (m5 §11.1).
+
+        The well is the controller's ``current`` as it is now, kept as ``_capture_well``:
+        a press records that well, or nothing when ``current`` has moved since
+        (``_well_the_buttons_name``). With no well the buttons are the plain three,
+        disabled, and the note says what to do. The captures read the stage, so they
+        are also disabled with the stand closed (the *Connect* row says why) and
+        while an activity other than this page's live goes, which the controller
+        refuses a capture for; while live goes they stay enabled: only the
+        controller knows whether a drive action waits or runs, and its refusal is
+        the message. *Forget* reads no stage: only a missing well disables it. A
+        disabled button is a courtesy, not a guard (FM-169).
+
+        Called by ``_draw_buttons`` and by the *Wall* select's own watcher.
+        """
+        well = self.page.current
+        self._capture_well = well
+        side = str(self.capture_side_select.value)
+        self.capture_centre_button.label = capture_centre_label(well)
+        self.capture_wall_button.label = capture_wall_label(well, side)
+        self.forget_button.label = forget_label(well)
+        stage_off = not self.page.connected or (
+            self._running is not None and not self.page.is_live
+        )
+        self.capture_centre_button.disabled = stage_off or well is None
+        self.capture_wall_button.disabled = stage_off or well is None
+        self.forget_button.disabled = well is None
+        self.capture_note.object = "" if well is not None else _NO_WELL_NOTE
 
     def _draw_drive(self) -> None:
         """Every drive control disabled while an activity other than this page's live goes.
@@ -1832,10 +1956,17 @@ def serve(page: PlatePage, *, port: int) -> None:
                 # that takes 6 s), and the stop of a scan must not wait behind it.
                 page.close()
         finally:
-            if thread.is_alive() and not _stop_server(thread):
-                _say(
-                    f"the plate page's server did not stop within {SERVER_STOP_WAIT_S:.0f} s"
-                )
+            if thread.is_alive():
+                with _quiet_session_close() as closing:
+                    stopped = _stop_server(thread)
+                if closing.dropped:
+                    log.info(
+                        "the server's stop closed %d open sessions", closing.dropped
+                    )
+                if not stopped:
+                    _say(
+                        f"the plate page's server did not stop within {SERVER_STOP_WAIT_S:.0f} s"
+                    )
     finally:
         bokeh_log.setLevel(level)
     if interrupted:
@@ -1843,6 +1974,49 @@ def serve(page: PlatePage, *, port: int) -> None:
     raise PageServerError(
         f"the plate page's server stopped on its own (is port {port} taken?)"
     )
+
+
+class _ServerStopFilter(logging.Filter):
+    """Drops the one record Bokeh's server logs when it closes an open session, and counts it (m5 §11.5).
+
+    A stop of the server discards its sessions and detaches each connection from its
+    session before the socket's own close reaches ``on_close``, which then reads
+    ``connection.session``: an ``AssertionError`` that Tornado logs as ``Uncaught
+    exception GET /ws`` on every Ctrl-C with the page open in a browser, which is
+    every Ctrl-C of a session. It is Bokeh's order of work, harmless at that point,
+    and a traceback in front of the operator who just stopped the page on purpose.
+
+    The message alone would hide a different failure with the same words, so the
+    exception's class is checked too, and the filter is attached only while the
+    server stops (``_quiet_session_close``). It does not patch Bokeh and closes no
+    socket: both are a vendor's private API and a version's.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        #: How many records it dropped: the sessions the stop closed.
+        self.dropped = 0
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        error = None if record.exc_info is None else record.exc_info[1]
+        if isinstance(error, AssertionError) and record.getMessage().startswith(
+            "Uncaught exception GET /ws"
+        ):
+            self.dropped += 1
+            return False
+        return True
+
+
+@contextlib.contextmanager
+def _quiet_session_close() -> Iterator[_ServerStopFilter]:
+    """``_ServerStopFilter`` on Tornado's application logger for the length of the block, removed after."""
+    closing = _ServerStopFilter()
+    logger = logging.getLogger("tornado.application")
+    logger.addFilter(closing)
+    try:
+        yield closing
+    finally:
+        logger.removeFilter(closing)
 
 
 def _stop_server(thread: Any) -> bool:

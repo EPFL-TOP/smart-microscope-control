@@ -16,17 +16,27 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
+    from smc.plugins.slots import PlateResult
     from smc.ui.controller import CheckItem, LoadedPreset
 
 __all__ = [
     "CAPTURE_WELLS",
     "DRY_RUN_NO_FRAME",
+    "END_LIVE_LABEL",
+    "PLATE_NOT_CHOSEN",
     "SELECT_WELLS",
     "NextStep",
+    "busy_note",
+    "capture_centre_label",
+    "capture_wall_label",
     "command_line",
+    "forget_label",
     "next_slot",
     "preset_differences",
     "preset_note_text",
+    "replace_note",
 ]
 
 #: What the scan plan waits for. The page cannot choose wells for the operator:
@@ -43,6 +53,18 @@ CAPTURE_WELLS = (
     "map and press Capture centre; a second well, far from the first, fits the "
     "rotation too"
 )
+
+#: Why a tool that takes the plate does not run while the page shows the placeholder
+#: (m5 §11.3): the page opens on a 96-well that nothing named, and a registration run
+#: with it on a 24-well plate puts A1 two pitches wrong, with no residual to say so.
+PLATE_NOT_CHOSEN = (
+    "choose the plate on the stage first: the page shows a 96-well placeholder"
+)
+
+#: The label of the live button while a live view runs: ``busy_note`` quotes it and the
+#: page draws it, from this one constant, so that the note never names a button the
+#: page does not have (m5 §11.2).
+END_LIVE_LABEL = "End live"
 
 #: Why the step stops at ``scan`` on a page served with ``--dry-run`` (m5 §8.8.1): a dry
 #: run walks the fields and takes no frame, so ``cells`` and what follows fail on a
@@ -87,6 +109,65 @@ def next_slot(checklist: Sequence[CheckItem]) -> CheckItem | None:
         if not item.optional and item.state != "ok":
             return item
     return None
+
+
+def capture_centre_label(well: str | None) -> str:
+    """The *Capture centre* button's label: the well it records, as the page drew it (m5 §11.1).
+
+    The operator reads the well on the button before pressing it: a capture
+    recorded under a well the operator did not mean is a wall at the wrong place,
+    and nothing else on the page showed which well that was.
+    """
+    return "Capture centre" if well is None else f"Capture centre of {well}"
+
+
+def capture_wall_label(well: str | None, side: str) -> str:
+    """The *Capture wall* button's label: the well and the *Wall* select's value as it stands."""
+    return "Capture wall" if well is None else f"Capture {well} {side} wall"
+
+
+def forget_label(well: str | None) -> str:
+    """The *Forget* button's label: the well whose captures it drops."""
+    return "Forget" if well is None else f"Forget {well}"
+
+
+def busy_note(running: str, *, live: bool) -> str:
+    """Why a tool's *Run* is disabled while an activity goes, beside the button (m5 §11.2).
+
+    A tool does not run during another activity (one at a time, m5 §2.1) and the
+    strip that says what runs is three regions away: the reason is said where the
+    operator looks. Live is told apart because the way out is one button, whose
+    label the note quotes; any other activity ends by itself or by STOP.
+    """
+    if live:
+        return f"Live is running: press {END_LIVE_LABEL}, then run the tool."
+    return f"{running} is running: wait for it to end, or press STOP."
+
+
+def replace_note(result: PlateResult, started_utc: datetime) -> str:
+    """What a *Run* of a tool that provides the plate replaces, said before the click (m5 §11.4).
+
+    The latest attempt decides the ``plate`` slot even when it fails, so a failed
+    run leaves no plate where the older one stood. The page does not refuse: the
+    registration is a pure function of the captures, which stay, so the plate is
+    had again by the same command minus the capture that was wrong. The time is
+    the record's start in the PC's local time, to the minute, and the method and
+    the count are the result's own.
+    """
+    try:
+        when = started_utc.astimezone().strftime("%Y-%m-%d %H:%M")
+    except (OSError, OverflowError, ValueError):
+        # A start the PC cannot show in its own zone (Windows before 1970 or after
+        # year 3000; any system at year 1 or 9999 under an offset): the record's own
+        # value, as it is, not an exception that ends the page's redraw. A run
+        # document is data (FM-125) and ``view()`` raises nothing for it.
+        when = started_utc.isoformat(timespec="minutes")
+    wells = "1 well" if result.n_refs == 1 else f"{result.n_refs} wells"
+    return (
+        f"Run replaces the plate registered {when} ({result.method}, {wells}). "
+        "A failed run leaves no plate; the captures stay, so Forget the wrong one "
+        "and Run again to get a plate back."
+    )
 
 
 def command_line(

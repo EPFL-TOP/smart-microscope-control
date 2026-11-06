@@ -29,7 +29,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from importlib.metadata import EntryPoint
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
@@ -97,10 +97,12 @@ from smc.ui.frames import Frame
 from smc.ui.guide import (
     CAPTURE_WELLS,
     DRY_RUN_NO_FRAME,
+    PLATE_NOT_CHOSEN,
     SELECT_WELLS,
     NextStep,
     command_line,
     next_slot,
+    replace_note,
 )
 
 if TYPE_CHECKING:
@@ -241,6 +243,21 @@ _GEOMETRY_KEPT = 4
 _Capture = TypeVar("_Capture", WellRef, WallTouch)
 
 
+#: The providers of ``plate`` whose ``plate`` parameter is the plate on the stage. Another
+#: provider's parameter of that name means something else (``plate-finding``'s sizes its
+#: survey), so what it holds is read from its result only (``_plate_named_by``).
+_PLATE_PARAM_PLUGINS = ("plate-registration", "plate-walls")
+
+
+def _needs_plate(plugin: str) -> bool:
+    """Whether the page fills ``plugin``'s ``plate`` itself, so that it needs a plate the operator chose (m5 §11.3).
+
+    Read from ``PAGE_PARAMS``, so that a tool the page learns to fill the plate for
+    (``plate-walls``, #346) is gated by naming ``plate`` there, with no further code.
+    """
+    return "plate" in PAGE_PARAMS.get(plugin, ())
+
+
 class PageServerError(RuntimeError):
     """The page's server ended without the operator stopping it."""
 
@@ -316,7 +333,10 @@ class PlateView:
     ``view()`` could not read and did not hide. ``cards`` has one card for each
     tool that has a record in the run document, and none for the others.
     ``next_step`` is the tool the run document needs next and the values to run it
-    with (m5 §8.3), built here from this read and never by the tick.
+    with (m5 §8.3), built here from this read and never by the tick. ``replaces``
+    maps each tool that provides the ``plate`` slot to what a Run of it would replace,
+    while that slot is usable (m5 §11.4); a tool never refused for it, and no other
+    slot has one.
     """
 
     plate: str
@@ -329,6 +349,7 @@ class PlateView:
     problems: tuple[str, ...]
     cards: dict[str, ResultCard]
     next_step: NextStep | None = None
+    replaces: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -860,7 +881,7 @@ class PlatePage:
         self.refs = ()
         self.walls = ()
         doc, _unreadable = self._document()
-        self._plate = self._initial_plate(doc)
+        self._plate, self._plate_chosen = self._initial_plate(doc)
         self._restore(doc)
 
     # --- plate and selection -------------------------------------------------
@@ -894,8 +915,21 @@ class PlatePage:
         """The plate the page is about, a name of ``useq``'s registry."""
         return self._plate
 
+    @property
+    def plate_chosen(self) -> bool:
+        """Whether something named the plate: the run document, the profile's sample, or the operator.
+
+        ``False`` is the placeholder (m5 §11.3): the page shows a 96-well that
+        nothing said was on the stage, and a tool that takes the plate does not run
+        on it.
+        """
+        return self._plate_chosen
+
     def choose_plate(self, name: str) -> None:
         """Change the plate; the selection, the captures and ``current`` belong to the old one.
+
+        Choosing the plate already shown confirms it (``plate_chosen``) and clears
+        nothing: it is the operator saying that the placeholder is right.
 
         Raises:
             ValueError: ``name`` is not a plate of ``useq``'s registry; the
@@ -906,6 +940,7 @@ class PlatePage:
             raise ValueError(
                 f"{name!r} is not a plate; the plates are {', '.join(plates)}"
             )
+        self._plate_chosen = True
         if name == self._plate:
             return
         self._plate = name
@@ -928,11 +963,12 @@ class PlatePage:
         """
         if text.strip() == "":
             self.selection = ()
-            return
-        self.selection = parse_wells(self._plate, text)
+        else:
+            self.selection = parse_wells(self._plate, text)
+        self._drop_unselected_current()
 
     def toggle(self, well: str) -> None:
-        """Add ``well`` to the selection, or remove it.
+        """Add ``well`` to the selection, or remove it; removing the well that is ``current`` drops it.
 
         Raises:
             ValueError: The well is not on the plate; the selection is as it was.
@@ -940,8 +976,23 @@ class PlatePage:
         name = self._on_plate(well)
         if name in self.selection:
             self.selection = tuple(w for w in self.selection if w != name)
+            # Only the well that was deselected: a deselect of another well leaves
+            # ``current`` (a well driven to is not selected, and stays) (m5 §11.1).
+            if self.current == name:
+                self._drop_unselected_current()
         else:
             self.selection = (*self.selection, name)
+
+    def _drop_unselected_current(self) -> None:
+        """``current`` is dropped when the selection no longer holds it (m5 §11.1).
+
+        ``current`` is the well *Capture* and *Forget* act on, and the page names it
+        on their labels: a well the map shows as deselected must not stay the one a
+        capture is recorded under. One helper called wherever the selection is
+        replaced, so that no path forgets it.
+        """
+        if self.current is not None and self.current not in self.selection:
+            self.current = None
 
     def click(
         self, x_um: float, y_um: float, *, drive: bool, side: str = "centre"
@@ -966,8 +1017,11 @@ class PlatePage:
         if drive:
             self.goto(well, side)
         else:
-            self.current = well
             self.toggle(well)
+            # After the toggle: a click that deselects sets nothing, and the one that
+            # selects makes this well the one the captures act on (m5 §11.1).
+            if well in self.selection:
+                self.current = well
         return well
 
     def goto(self, well: str, side: str = "centre") -> None:
@@ -1058,8 +1112,15 @@ class PlatePage:
 
         Raises:
             ValueError: ``scan-plan`` with nothing selected, or with a selection
-                on another plate than the registered one.
+                on another plate than the registered one; a tool that takes the
+                plate while nothing named it (``PLATE_NOT_CHOSEN``).
         """
+        if _needs_plate(plugin) and not self._plate_chosen:
+            raise ValueError(PLATE_NOT_CHOSEN)
+        return self._page_pairs(plugin)
+
+    def _page_pairs(self, plugin: str) -> list[str]:
+        """``page_params`` without the plate's gate: what the page would fill if the plate were chosen."""
         if plugin == "scan-plan":
             if not self.selection:
                 raise ValueError("select at least one well first")
@@ -1207,7 +1268,10 @@ class PlatePage:
             params[plugin] = tuple(pairs)
         preset = Preset(
             stand=self._profile.microscope.name,
-            plate=self._plate,
+            # The placeholder is not a plate anyone named: written down, it would be
+            # read back as a deliberate choice, and the load that follows (and any
+            # later load) would confirm it and open the gate (m5 §11.3).
+            plate=self._plate if self._plate_chosen else None,
             wells=self._wells_to_save(wells),
             saved_utc=datetime.now(timezone.utc).replace(microsecond=0),
             params=params,
@@ -1220,11 +1284,13 @@ class PlatePage:
         if plugin not in PAGE_PARAMS:
             return []
         try:
-            return self.page_params(plugin)
+            return self._page_pairs(plugin)
         except ValueError:
             # `scan-plan` with nothing selected, or a selection on another plate than
             # the registered one: a run is refused for that, a preset is not (it keeps
-            # no wells then). Its other fields still need a well to be looked at.
+            # no wells then). Its other fields still need a well to be looked at. The
+            # plate's gate is not asked: a preset is not a run (m5 §11.3), and the
+            # fields are checked against the pairs the page would fill.
             return ["wells=A1"]
 
     def _wells_to_save(self, text: str) -> str | None:
@@ -1266,6 +1332,12 @@ class PlatePage:
         self._refuse_if_busy()
         if self._microscope is None:
             self._set_outcome(f"{plugin}: {NOT_CONNECTED}")
+            return
+        if _needs_plate(plugin) and not self._plate_chosen:
+            # The controller's own refusal (FM-169): a click on a disabled button
+            # still arrives here, and so does a call that spells `plate=` itself. The
+            # stand's being closed is the reason that holds longer, so it came first.
+            self._set_outcome(f"{plugin}: {PLATE_NOT_CHOSEN}")
             return
         profile = self._profile.microscope.name
         dry_run = self._dry_run
@@ -2550,7 +2622,28 @@ class PlatePage:
             problems=(*problems, *self._plugin_problems(), *self._suggest_problems),
             cards=cards,
             next_step=self._next_step(checklist, blocked, cards),
+            replaces=self._replace_notes(doc),
         )
+
+    def _replace_notes(self, doc: RunDocument) -> dict[str, str]:
+        """What a Run of each tool that provides ``plate`` would replace, while the slot is usable (m5 §11.4).
+
+        For the ``plate`` slot only: a card already says the last result of every
+        other slot, and a note under every tool would teach the operator to read
+        none of them. The slot's problem, if its result does not validate, is
+        ``view()``'s line already; it is not said twice.
+        """
+        result = self._slot(doc, "plate", PlateResult, [])
+        record = doc.provider("plate")
+        if result is None or record is None:
+            return {}
+        note = replace_note(result, record.started_utc)
+        plugins = self._registry().plugins
+        return {
+            tool.name: note
+            for tool in self.tools()
+            if plugins[tool.name].plugin.provides == "plate"
+        }
 
     # --- the next step (m5 §8.3) ---------------------------------------------------
 
@@ -2719,12 +2812,16 @@ class PlatePage:
     def _registration_step(self, why: list[str]) -> tuple[list[str], str | None]:
         """The pairs of ``plate-registration`` and what it waits for, with a line of ``why`` for them.
 
-        The captures made on this page win: they are measured. With none, a stand
-        whose profile has a ``[sample]`` of this plate registers it from the
-        sample's own geometry, which is known and not measured, and the line says
-        so. With neither, the plate is found by centring wells, which only the
-        operator can do.
+        While the plate is the placeholder nothing is offered, whatever the captures
+        are (m5 §11.3): the plugin's own default (``plate=96-well``) must never be
+        what a click runs. Then the captures made on this page win: they are
+        measured. With none, a stand whose profile has a ``[sample]`` of this plate
+        registers it from the sample's own geometry, which is known and not
+        measured, and the line says so. With neither, the plate is found by
+        centring wells, which only the operator can do.
         """
+        if not self._plate_chosen:
+            return [], PLATE_NOT_CHOSEN
         if self.refs or self.walls:
             why.append(
                 f"plate, refs, walls: the {len(self.refs)} centres and "
@@ -2850,7 +2947,8 @@ class PlatePage:
         Every tool needs the stand, as ``smc run`` opens it for every plugin, so
         with the stand closed ``NOT_CONNECTED`` is every tool's reason, ahead of
         any other. Otherwise the reasons, in the order the first that applies
-        wins: what the tool reads, what it requires of the stand, and last a
+        wins: the placeholder plate, for a tool that takes the plate (m5 §11.3);
+        what the tool reads, what it requires of the stand, and last a
         checkpoint that ``smc run --resume`` could continue (#252), which ``run()``
         refuses to drop. A tool that cannot run at all says so before it offers a
         way to continue.
@@ -2862,10 +2960,20 @@ class PlatePage:
         profile = self._profile.microscope.name
         dry_run = self._dry_run
         for name, entry in self._registry().plugins.items():
-            reason = next(
-                (r for r in (self._unusable(doc, s) for s in entry.plugin.reads) if r),
-                None,
+            reason = (
+                PLATE_NOT_CHOSEN
+                if _needs_plate(name) and not self._plate_chosen
+                else None
             )
+            if reason is None:
+                reason = next(
+                    (
+                        r
+                        for r in (self._unusable(doc, s) for s in entry.plugin.reads)
+                        if r
+                    ),
+                    None,
+                )
             if reason is None:
                 reason = next(
                     (
@@ -2952,18 +3060,52 @@ class PlatePage:
                 f"{self._plate} plate again, or choose {registered.plate}"
             )
 
-    def _initial_plate(self, doc: RunDocument) -> str:
-        """The plate of the latest registration, else of the usable ``plate`` slot, else 96-well."""
-        known = useq.registered_well_plate_keys()
-        record = doc.stages.get("plate-registration")
-        if record is not None:
-            plate = record.params.get("plate")
-            if isinstance(plate, str) and plate in known:
-                return plate
-        registered = self._slot(doc, "plate", PlateResult, [])
-        if registered is not None and registered.plate in known:
-            return str(registered.plate)
-        return "96-well"
+    def _initial_plate(self, doc: RunDocument) -> tuple[str, bool]:
+        """The plate the page starts with, and whether anything named it (m5 §11.3).
+
+        In order: the plate of the latest provider of ``plate`` (what the operator was
+        working on, whatever its status), the profile's ``[sample]``, which is what
+        the stand's camera images, and last the ``96-well`` placeholder, which
+        nothing named: the page then asks.
+        """
+        named = self._plate_named_by(doc)
+        if named is not None:
+            return named, True
+        sample = self._profile.sample
+        if sample is not None and sample.plate in useq.registered_well_plate_keys():
+            return sample.plate, True
+        return "96-well", False
+
+    def _plate_named_by(self, doc: RunDocument) -> str | None:
+        """The plate the latest provider of ``plate`` holds, read as data (FM-125), or ``None``.
+
+        A usable result is what the record found: its ``plate`` is the truth. Without
+        one (the run failed or was stopped) the record's ``plate`` parameter is what
+        it was asked for, which is the plate on the stage for ``plate-registration``
+        and ``plate-walls`` only: ``plate-finding``'s is the plate its survey was
+        *sized* for (a default of 96-well), and a failed survey found no plate. Read
+        as the plate on the stage, it opened the page on the wrong plate and said it
+        had been chosen (adversarial review of #332).
+        """
+        record = doc.provider("plate")
+        if record is None:
+            return None
+        found = self._slot(doc, "plate", PlateResult, [])
+        if found is not None and found.plate in useq.registered_well_plate_keys():
+            return str(found.plate)
+        if record.plugin in _PLATE_PARAM_PLUGINS:
+            return self._plate_of(record)
+        return None
+
+    @staticmethod
+    def _plate_of(record: StageRecord | None) -> str | None:
+        """The plate ``record`` was run for, read as data (FM-125): a name ``useq`` knows, else ``None``."""
+        if record is None:
+            return None
+        plate = record.params.get("plate")
+        if isinstance(plate, str) and plate in useq.registered_well_plate_keys():
+            return plate
+        return None
 
     def _restore(self, doc: RunDocument) -> None:
         """The selection and the captures the document already holds; what does not parse is dropped."""
@@ -2979,21 +3121,32 @@ class PlatePage:
                     wells,
                     _one_line(exc),
                 )
-        registration = doc.stages.get("plate-registration")
-        if registration is not None:
-            self.refs = self._captured(registration.params, "refs", WellRef)
-            self.walls = self._captured(registration.params, "walls", WallTouch)
+        # The captures come from the record the plate does: the latest provider of
+        # ``plate`` (m5 §11.3), not the last registration by name, so that a newer
+        # wall registration's centres are the ones the page holds. A record whose
+        # plate the page did not take is no source: its wells are named for a plate
+        # this page cannot build.
+        provider = doc.provider("plate")
+        if provider is None or self._plate_of(provider) != self._plate:
+            return
+        if provider.plugin == "plate-registration":
+            self.refs = self._captured(provider, "refs", WellRef)
+            self.walls = self._captured(provider, "walls", WallTouch)
+        elif provider.plugin == "plate-walls":
+            # It takes centres and measures the walls itself: it has no walls to give.
+            self.refs = self._captured(provider, "refs", WellRef)
 
     @staticmethod
     def _captured(
-        params: dict[str, Any], key: str, model: type[_Capture]
+        record: StageRecord, key: str, model: type[_Capture]
     ) -> tuple[_Capture, ...]:
-        raw = params.get(key)
+        raw = record.params.get(key)
         try:
             return tuple(model.model_validate(item) for item in raw or ())
         except (ValueError, TypeError) as exc:
             log.info(
-                "the plate-registration record's %s are not read: %s",
+                "the %s record's %s are not read: %s",
+                record.plugin,
                 key,
                 _one_line(exc),
             )

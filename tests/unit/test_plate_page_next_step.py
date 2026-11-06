@@ -35,7 +35,12 @@ from smc.run import ReadRecord, RunDocument, StageRecord, StageStatus, write_sta
 from smc.testing import FakeCore
 from smc.testing.sample_stand import sample_refs
 from smc.ui.controller import NOT_CONNECTED, PlatePage
-from smc.ui.guide import CAPTURE_WELLS, DRY_RUN_NO_FRAME, SELECT_WELLS
+from smc.ui.guide import (
+    CAPTURE_WELLS,
+    DRY_RUN_NO_FRAME,
+    PLATE_NOT_CHOSEN,
+    SELECT_WELLS,
+)
 
 T0 = datetime(2026, 11, 2, 9, 0, tzinfo=timezone.utc)
 STAND = "demo-sample"
@@ -651,7 +656,15 @@ def test_walls_alone_are_captures_too(make_page: Callable[..., PlatePage]) -> No
 def test_without_sample_or_captures_the_plate_step_says_how_to_capture(
     make_page: Callable[..., PlatePage],
 ) -> None:
-    step = make_page(_profile()).view().next_step
+    page = make_page(_profile())
+    # Nothing named the plate yet: the step asks for it before it asks for wells
+    # (m5 §11.3), and offers nothing either way.
+    unchosen = page.view().next_step
+    assert unchosen is not None
+    assert unchosen.blocked == PLATE_NOT_CHOSEN
+    assert unchosen.params == ()
+    page.choose_plate("96-well")
+    step = page.view().next_step
     assert step is not None
     assert step.plugin == "plate-registration"
     assert step.blocked == CAPTURE_WELLS
@@ -663,6 +676,9 @@ def test_a_sample_of_another_plate_asks_to_choose_it(
     make_page: Callable[..., PlatePage],
 ) -> None:
     page = make_page(_profile(sample={"plate": "384-well"}))
+    # The page opens on the sample's plate; it is the operator who chose another one.
+    assert (page.plate, page.plate_chosen) == ("384-well", True)
+    page.choose_plate("96-well")
     step = page.view().next_step
     assert step is not None
     assert step.blocked == (

@@ -99,6 +99,7 @@ REAL = {
     "density": "smc.plugins.density.plugin:DensityPlugin",
     "goto-well": "smc.plugins.goto_well:GotoWellPlugin",
     "plate-registration": "smc.plugins.plate_registration.plugin:PlateRegistrationPlugin",
+    "plate-walls": "smc.plugins.plate_walls.plugin:PlateWallsPlugin",
     "route": "smc.plugins.route.plugin:RoutePlugin",
     "scan": "smc.plugins.scan.plugin:ScanPlugin",
     "scan-plan": "smc.plugins.scan_plan.plugin:ScanPlanPlugin",
@@ -377,7 +378,13 @@ def _seed(
     ``reads`` names the attempt of each slot the record read (``a<minute>`` of
     the provider): a record that read an older attempt than the current one is
     stale.
+
+    A plate result with no ``params`` gets the plate it holds, as the runner writes
+    it: the page starts on the plate a record's params name (m5 §11.3), and a real
+    record always names one.
     """
+    if params is None and isinstance(result, PlateResult):
+        params = {"plate": result.plate}
     then = T0 + timedelta(minutes=minute)
     write_stage(
         run_doc,
@@ -462,7 +469,9 @@ def test_a_click_and_a_typed_range_build_the_same_selection(
     x, y = _centre("A1")
     assert clicked.click(x, y, drive=False) == "A1"
     assert clicked.selection == ("A2", "B1", "B2")
-    assert clicked.current == "A1"
+    # A1 was deselected and was not the well the buttons act on: B2, the last well
+    # selected, still is (m5 §11.1).
+    assert clicked.current == "B2"
 
 
 def test_a_click_finds_the_well_on_a_rotated_registered_plate(
@@ -556,6 +565,93 @@ def test_a_click_in_drive_mode_runs_goto_well_with_the_wells_name_and_side(
     assert page.selection == ()
     assert page.status().outcome is not None
     assert page.status().outcome.startswith("goto-well done in ")
+
+
+# --- `current` is a well the operator can see (m5 §11.1, #332) ----------------------
+
+
+def _tap(page: PlatePage, well: str) -> None:
+    """A select-mode click on the centre of ``well`` of the nominal map."""
+    assert page.click(*_centre(well), drive=False) == well
+
+
+def test_a_click_that_deselects_the_current_well_drops_it(page: PlatePage) -> None:
+    _tap(page, "B3")
+    assert (page.selection, page.current) == (("B3",), "B3")
+    # The measured case of the session at the stand: the well the buttons act on
+    # was one the map no longer showed as selected.
+    _tap(page, "B3")
+    assert (page.selection, page.current) == ((), None)
+
+
+def test_a_click_that_deselects_another_well_leaves_current(page: PlatePage) -> None:
+    _tap(page, "B3")
+    _tap(page, "B4")
+    assert page.current == "B4"
+    _tap(page, "B3")
+    assert (page.selection, page.current) == (("B4",), "B4")
+
+
+def test_a_typed_range_drops_a_current_well_it_does_not_hold(page: PlatePage) -> None:
+    # The measured case: B3 selected and current, then `C1:C2` typed.
+    _tap(page, "B3")
+    page.select_text("C1:C2")
+    assert (page.selection, page.current) == (("C1", "C2"), None)
+    # A box the operator emptied replaces the selection by none: the same rule.
+    _tap(page, "C3")
+    assert page.current == "C3"
+    page.select_text("  ")
+    assert (page.selection, page.current) == ((), None)
+
+
+def test_a_typed_range_keeps_a_current_well_it_holds(page: PlatePage) -> None:
+    _tap(page, "B3")
+    page.select_text("B1:B4")
+    assert (page.selection, page.current) == (("B1", "B2", "B3", "B4"), "B3")
+
+
+def test_a_typed_range_that_is_refused_leaves_current_as_it_was(
+    page: PlatePage,
+) -> None:
+    _tap(page, "B3")
+    with _refuses(ValueError, "wells not understood on a 96-well plate: 'Z99'"):
+        page.select_text("Z99")
+    assert (page.selection, page.current) == (("B3",), "B3")
+
+
+def test_goto_sets_current_without_selecting_and_a_typed_range_drops_it(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    page = _page(fake_microscope, run_doc)
+    try:
+        page.goto("B3")
+        assert page.join(10.0)
+        assert (page.selection, page.current) == ((), "B3")
+        # A driven-to well is not selected; a typed range replaces the selection, and
+        # one that does not hold it drops it too.
+        page.select_text("A1")
+        assert (page.selection, page.current) == (("A1",), None)
+    finally:
+        page.close()
+
+
+def test_a_deselect_of_another_well_leaves_a_driven_to_well(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    page = _page(fake_microscope, run_doc)
+    try:
+        x, y = _centre("A1", a1=A1_OFF, rotation_deg=TURN_DEG)
+        page.click(x, y, drive=False)
+        page.goto("B3")
+        assert page.join(10.0)
+        # A1 is selected, B3 is current without being selected: deselecting A1
+        # must not take B3 away.
+        page.toggle("A1")
+        assert (page.selection, page.current) == ((), "B3")
+    finally:
+        page.close()
 
 
 # --- running a plugin ----------------------------------------------------------------
@@ -1478,6 +1574,7 @@ def test_captured_references_reach_plate_registration(
     fake_microscope: Microscope, run_doc: Path
 ) -> None:
     page = _page(fake_microscope, run_doc, _real("plate-registration"))
+    page.choose_plate("96-well")
     stage = fake_microscope.require(XYStage)
     for well in ("A1", "A12"):
         stage.move_to_um(*_centre(well, a1=A1_OFF, rotation_deg=TURN_DEG))
@@ -1685,6 +1782,7 @@ def test_a_text_that_names_no_well_but_is_not_blank_keeps_its_refusal_and_the_se
 def test_plate_registration_params_are_the_plate_and_the_captures(
     page: PlatePage, fake_microscope: Microscope
 ) -> None:
+    page.choose_plate("96-well")
     fake_microscope.require(XYStage).move_to_um(1.5, 2.5)
     page.capture_centre("A1")
     page.capture_wall("A1", "right")
@@ -1695,6 +1793,423 @@ def test_plate_registration_params_are_the_plate_and_the_captures(
         f"refs={refs}",
         f"walls={walls}",
     ]
+
+
+# --- the plate the page starts with (m5 §11.3, #332) --------------------------------
+
+PLACEHOLDER_REFUSAL = (
+    "choose the plate on the stage first: the page shows a 96-well placeholder"
+)
+REF_A1 = {"well": "A1", "x_um": 1000.0, "y_um": -500.0}
+REF_B2 = {"well": "B2", "x_um": 10000.0, "y_um": -9500.0}
+WALL_A1 = {"well": "A1", "side": "left", "x_um": 5.0, "y_um": 6.0}
+
+
+def test_a_fresh_document_names_no_plate_so_the_page_is_unchosen(
+    page: PlatePage,
+) -> None:
+    assert (page.plate, page.plate_chosen) == ("96-well", False)
+
+
+def test_the_plate_of_the_latest_provider_wins_over_an_older_registration(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # PR #351's note on #346: `plate-walls` also provides `plate`, and a document
+    # holding an older registration and a newer wall registration opened on the older.
+    _seed(
+        run_doc,
+        "plate-registration",
+        "plate",
+        _plate("24-well"),
+        params={"plate": "24-well", "refs": [REF_A1]},
+        minute=0,
+    )
+    _seed(
+        run_doc,
+        "plate-walls",
+        "plate",
+        _plate("6-well"),
+        params={"plate": "6-well", "refs": [REF_A1]},
+        minute=1,
+    )
+    page = _page(fake_microscope, run_doc)
+    assert (page.plate, page.plate_chosen) == ("6-well", True)
+
+
+def test_a_failed_latest_provider_still_names_the_plate(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # The latest attempt decides the slot even when it failed (`RunDocument.provider`);
+    # what it was asked to register is still what the operator is working on.
+    _seed(
+        run_doc,
+        "plate-registration",
+        "plate",
+        _plate("96-well"),
+        params={"plate": "96-well"},
+        minute=0,
+    )
+    _seed(
+        run_doc,
+        "plate-registration",
+        "plate",
+        status=StageStatus.failed,
+        params={"plate": "24-well"},
+        minute=1,
+    )
+    page = _page(fake_microscope, run_doc)
+    assert (page.plate, page.plate_chosen) == ("24-well", True)
+
+
+@pytest.mark.parametrize("named", ["nope", "96-WELL", 96, None, ["96-well"]])
+def test_a_record_whose_plate_is_not_a_known_plate_is_ignored(
+    fake_microscope: Microscope, run_doc: Path, named: object
+) -> None:
+    # A record is data (FM-125): nothing raises, the page asks for the plate, and the
+    # captures of a record that names no plate it can build are not taken over.
+    _seed(
+        run_doc,
+        "plate-registration",
+        "plate",
+        status=StageStatus.failed,
+        params={"plate": named, "refs": [REF_A1]},
+    )
+    page = _page(fake_microscope, run_doc)
+    assert (page.plate, page.plate_chosen) == ("96-well", False)
+    assert page.refs == ()
+
+
+def test_a_plate_finding_record_names_the_plate_it_found_not_the_one_it_was_sized_for(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # `plate-finding`'s `plate` parameter sizes its survey (default 96-well); its result
+    # is the plate it fitted. Read as the plate on the stage, the parameter opened the
+    # page on a 96-well map and said it had been chosen (adversarial review of #332).
+    _seed(
+        run_doc,
+        "plate-finding",
+        "plate",
+        _plate("24-well"),
+        params={"plate": "96-well", "plates": []},
+    )
+    page = _page(fake_microscope, run_doc)
+    assert (page.plate, page.plate_chosen) == ("24-well", True)
+
+
+def test_a_failed_plate_finding_names_no_plate(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # A survey that failed found no plate, and its parameter is not one: the page asks.
+    _seed(
+        run_doc,
+        "plate-finding",
+        "plate",
+        status=StageStatus.failed,
+        params={"plate": "24-well"},
+    )
+    page = _page(fake_microscope, run_doc)
+    assert (page.plate, page.plate_chosen) == ("96-well", False)
+
+
+def test_a_usable_result_names_the_plate_even_when_its_params_do_not(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed(
+        run_doc,
+        "plate-registration",
+        "plate",
+        _plate("24-well"),
+        params={"plate": "nope"},
+    )
+    page = _page(fake_microscope, run_doc)
+    assert (page.plate, page.plate_chosen) == ("24-well", True)
+
+
+def test_the_profiles_sample_plate_is_chosen(run_doc: Path) -> None:
+    sampled = Profile.model_validate(
+        {"microscope": {"name": "demo-sample"}, "sample": {"plate": "24-well"}}
+    )
+    page = PlatePage.closed(sampled, run_doc, entry_points=[_ep(c) for c in STUBS])
+    assert (page.plate, page.plate_chosen) == ("24-well", True)
+    # The stand knows what its camera images: a sample whose plate is the default is
+    # chosen too, and a run document that names a plate wins over the sample's.
+    plain = Profile.model_validate(
+        {"microscope": {"name": "demo-sample"}, "sample": {}}
+    )
+    page = PlatePage.closed(plain, run_doc, entry_points=[_ep(c) for c in STUBS])
+    assert (page.plate, page.plate_chosen) == ("96-well", True)
+    _seed(run_doc, "plate-registration", "plate", params={"plate": "6-well"})
+    page = PlatePage.closed(sampled, run_doc, entry_points=[_ep(c) for c in STUBS])
+    assert (page.plate, page.plate_chosen) == ("6-well", True)
+
+
+def test_choose_plate_with_the_plate_shown_still_confirms_it(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    assert not page.plate_chosen
+    fake_microscope.require(XYStage).move_to_um(1.0, 2.0)
+    page.capture_centre("A1")
+    page.choose_plate("96-well")
+    # The early return for the same plate skips the reset, not the confirmation.
+    assert (page.plate, page.plate_chosen) == ("96-well", True)
+    assert [r.well for r in page.refs] == ["A1"]
+    with _refuses(
+        ValueError,
+        "'nope' is not a plate; the plates are "
+        + ", ".join(sorted(useq.registered_well_plate_keys())),
+    ):
+        page.choose_plate("nope")
+
+
+def test_choosing_another_plate_chooses_it(page: PlatePage) -> None:
+    page.choose_plate("24-well")
+    assert (page.plate, page.plate_chosen) == ("24-well", True)
+
+
+def test_a_refused_plate_name_does_not_confirm_the_placeholder(
+    page: PlatePage,
+) -> None:
+    plates = ", ".join(sorted(useq.registered_well_plate_keys()))
+    with _refuses(ValueError, f"'nope' is not a plate; the plates are {plates}"):
+        page.choose_plate("nope")
+    # The name is checked before anything changes: a typo does not open the gate.
+    assert (page.plate, page.plate_chosen) == ("96-well", False)
+
+
+def test_restore_reads_the_captures_of_the_latest_provider(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    refs = [REF_A1, REF_B2]
+    # A registration after a wall registration: its centres and its walls.
+    _seed(
+        run_doc,
+        "plate-walls",
+        "plate",
+        _plate(),
+        params={"plate": "96-well", "refs": [REF_A1]},
+    )
+    _seed(
+        run_doc,
+        "plate-registration",
+        "plate",
+        _plate(),
+        params={"plate": "96-well", "refs": refs, "walls": [WALL_A1]},
+        minute=1,
+    )
+    page = _page(fake_microscope, run_doc)
+    assert page.refs == tuple(WellRef.model_validate(r) for r in refs)
+    assert page.walls == (WallTouch.model_validate(WALL_A1),)
+
+
+def test_restore_reads_only_the_centres_of_a_newer_wall_registration(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed(
+        run_doc,
+        "plate-registration",
+        "plate",
+        _plate(),
+        params={"plate": "96-well", "refs": [REF_A1], "walls": [WALL_A1]},
+    )
+    _seed(
+        run_doc,
+        "plate-walls",
+        "plate",
+        _plate(),
+        params={"plate": "96-well", "refs": [REF_B2]},
+        minute=1,
+    )
+    page = _page(fake_microscope, run_doc)
+    assert page.refs == (WellRef.model_validate(REF_B2),)
+    # `plate-walls` takes no walls: the older registration's are not the page's.
+    assert page.walls == ()
+
+
+def test_restore_takes_no_captures_from_another_provider_of_the_plate(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed(
+        run_doc,
+        "plate-registration",
+        "plate",
+        _plate(),
+        params={"plate": "96-well", "refs": [REF_A1], "walls": [WALL_A1]},
+    )
+    # A third party's `plate-finding` is the latest provider: whatever it holds under
+    # `refs` is not a capture of this page.
+    _seed(
+        run_doc,
+        "plate-finding",
+        "plate",
+        _plate(),
+        params={"plate": "96-well", "refs": [REF_B2]},
+        minute=1,
+    )
+    page = _page(fake_microscope, run_doc)
+    assert (page.refs, page.walls) == ((), ())
+    assert page.plate == "96-well"
+
+
+def _stood_page(fake_microscope: Microscope, run_doc: Path, *names: str) -> PlatePage:
+    return _page(fake_microscope, run_doc, _real(*names))
+
+
+def test_an_unchosen_plate_refuses_plate_registration_in_the_controller(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _stood_page(fake_microscope, run_doc, "plate-registration")
+    try:
+        # A disabled button is a courtesy (FM-169): the controller itself refuses,
+        # before anything is read, and nothing is written.
+        page.run("plate-registration", ["plate=96-well", "refs=[]", "walls=[]"])
+        assert page.status().running is None
+        assert page.status().outcome == f"plate-registration: {PLACEHOLDER_REFUSAL}"
+        assert not run_doc.exists()
+        with _refuses(ValueError, PLACEHOLDER_REFUSAL):
+            page.page_params("plate-registration")
+        # The other pages' tools are not gated: only a tool that takes the plate is.
+        assert page.page_params("stub") == []
+        page.choose_plate("96-well")
+        assert page.page_params("plate-registration")[0] == "plate=96-well"
+    finally:
+        page.close()
+
+
+def test_an_unchosen_plate_is_the_tools_reason_and_the_next_steps_stuck_with_no_pairs(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _stood_page(fake_microscope, run_doc, "plate-registration")
+    try:
+        # With captures made, so that the pairs would not be empty if the step ignored
+        # the plate: the plugin's own default must never be what a click runs.
+        fake_microscope.require(XYStage).move_to_um(1.0, 2.0)
+        page.capture_centre("A1")
+        view = page.view()
+        assert view.blocked["plate-registration"] == PLACEHOLDER_REFUSAL
+        step = view.next_step
+        assert step is not None
+        assert step.plugin == "plate-registration"
+        assert step.params == ()
+        assert step.blocked == PLACEHOLDER_REFUSAL
+        page.choose_plate("96-well")
+        chosen = page.view()
+        assert "plate-registration" not in chosen.blocked
+        assert chosen.next_step is not None
+        assert chosen.next_step.blocked is None
+        assert chosen.next_step.params[0] == "plate=96-well"
+    finally:
+        page.close()
+
+
+def test_a_closed_stand_is_still_the_reason_ahead_of_an_unchosen_plate(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = PlatePage.closed(
+        fake_microscope.profile, run_doc, entry_points=_real("plate-registration")
+    )
+    try:
+        assert page.view().blocked["plate-registration"] == "the stand is not connected"
+        page.run("plate-registration", [])
+        assert page.status().outcome == (
+            "plate-registration: the stand is not connected"
+        )
+    finally:
+        page.close()
+
+
+def test_a_tool_that_names_the_plate_in_page_params_is_gated_with_no_further_code(
+    fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # #346 adds `PAGE_PARAMS["plate-walls"] = ("plate", "refs")`: the gate is the
+    # table's, so that tool is refused on a placeholder with nothing else written.
+    monkeypatch.setitem(PAGE_PARAMS, "plate-walls", ("plate", "refs"))
+    page = _stood_page(fake_microscope, run_doc, "plate-walls")
+    try:
+        assert page.view().blocked["plate-walls"] == PLACEHOLDER_REFUSAL
+        page.run("plate-walls", [])
+        assert page.status().outcome == f"plate-walls: {PLACEHOLDER_REFUSAL}"
+        page.choose_plate("96-well")
+        assert page.view().blocked.get("plate-walls") != PLACEHOLDER_REFUSAL
+    finally:
+        page.close()
+
+
+def test_a_usable_plate_gives_each_plate_tool_a_replace_note(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed(
+        run_doc,
+        "plate-registration",
+        "plate",
+        _plate(),
+        params={"plate": "96-well"},
+    )
+    page = _stood_page(fake_microscope, run_doc, "plate-registration", "plate-walls")
+    try:
+        when = T0.astimezone().strftime("%Y-%m-%d %H:%M")
+        note = (
+            f"Run replaces the plate registered {when} (references, 2 wells). "
+            "A failed run leaves no plate; the captures stay, so Forget the wrong "
+            "one and Run again to get a plate back."
+        )
+        assert page.view().replaces == {
+            "plate-registration": note,
+            "plate-walls": note,
+        }
+    finally:
+        page.close()
+
+
+def test_a_failed_provider_gives_no_replace_note(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed(run_doc, "plate-registration", "plate", _plate(), params={"plate": "96-well"})
+    _seed(
+        run_doc,
+        "plate-registration",
+        "plate",
+        status=StageStatus.failed,
+        params={"plate": "96-well"},
+        minute=1,
+    )
+    page = _stood_page(fake_microscope, run_doc, "plate-registration")
+    try:
+        # Nothing is replaced: the slot is not usable now. A fresh document has none.
+        assert page.view().replaces == {}
+    finally:
+        page.close()
+    assert _stood_page_replaces(fake_microscope, run_doc.with_name("none.json")) == {}
+
+
+def _stood_page_replaces(microscope: Microscope, run_doc: Path) -> dict[str, str]:
+    page = _stood_page(microscope, run_doc, "plate-registration")
+    try:
+        return dict(page.view().replaces)
+    finally:
+        page.close()
+
+
+def test_no_other_slot_gives_a_replace_note(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # A card already says the last result; a note under every tool would teach the
+    # operator to read none of them (§11.4): only the `plate` slot has one.
+    _seed(run_doc, "stub", "stub", StubResult())
+    _seed(run_doc, "scan-plan", "scan-plan", minute=1)
+    page = _stood_page(fake_microscope, run_doc, "plate-registration")
+    try:
+        assert page.view().replaces == {}
+        _seed(
+            run_doc,
+            "plate-registration",
+            "plate",
+            _plate(),
+            params={"plate": "96-well"},
+            minute=2,
+        )
+        assert set(page.view().replaces) == {"plate-registration"}
+    finally:
+        page.close()
 
 
 # --- the view ---------------------------------------------------------------------------

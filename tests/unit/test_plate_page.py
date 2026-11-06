@@ -188,6 +188,7 @@ def _seed(
     *,
     minute: int = 0,
 ) -> None:
+    """A done record of ``plugin``; a plate result's params name its plate, as the runner writes them (m5 §11.3)."""
     then = T0 + timedelta(minutes=minute)
     write_stage(
         run_doc,
@@ -201,7 +202,7 @@ def _seed(
             profile="demo",
             dry_run=False,
             smc_version="0",
-            params={},
+            params={"plate": result.plate} if isinstance(result, PlateResult) else {},
             result=result.model_dump(mode="json"),
         ),
     )
@@ -1237,6 +1238,39 @@ def _page_widgets(view: PlatePageView) -> list[Any]:
     return list(found.values())
 
 
+def _placed(view: PlatePageView) -> set[int]:
+    """The id of every object the layout holds, panes included, the Accordion's panels too.
+
+    ``_page_widgets`` adds what the view holds as attributes, so a widget deleted from
+    the layout is still found there: it cannot tell a widget the operator sees from one
+    only a test reads. This walk goes through the layout alone.
+    """
+    found = {id(o) for o in view.layout.select()}
+    for accordion in view.layout.select(pn.Accordion):
+        for panel in accordion.objects:
+            found.update(id(o) for o in panel.select())
+    return found
+
+
+def test_the_widgets_that_ask_and_explain_are_on_the_page(page: PlatePage) -> None:
+    # The tests of the plate's ask and of the captures drive these widgets through
+    # attributes (`clicks += 1`, `.visible`, `.object`), which a layout that does not
+    # hold them answers all the same: the operator would never see the question, the
+    # button or the note (adversarial review of #332).
+    view = PlatePageView(page)
+    placed = _placed(view)
+    for name in (
+        "plate_note",
+        "plate_confirm_button",
+        "capture_note",
+        "capture_centre_button",
+        "capture_wall_button",
+        "capture_side_select",
+        "forget_button",
+    ):
+        assert id(getattr(view, name)) in placed, f"{name} is not in the layout"
+
+
 def test_every_handler_the_page_registers_is_guarded(page: PlatePage) -> None:
     view = PlatePageView(page)
     registered: list[Any] = [
@@ -1586,6 +1620,7 @@ def test_stop_button_stops_through_a_click(page: PlatePage) -> None:
 
 
 def test_a_blocked_tool_is_disabled_with_its_reason(page: PlatePage) -> None:
+    page.choose_plate("96-well")
     view = PlatePageView(page)
     reason = (
         "the run document has no plate; smc run --list shows which plugin provides it"
@@ -1648,6 +1683,7 @@ def test_a_tools_note_wraps_where_the_text_is_the_command_that_continues(
 def test_a_running_tool_disables_every_run_button_until_it_ends(
     page: PlatePage,
 ) -> None:
+    page.choose_plate("96-well")
     view = PlatePageView(page)
     view.on_run("scan")
     assert SlowScan.started.wait(5)
@@ -1751,7 +1787,7 @@ def test_capture_buttons_act_on_the_current_well(
 ) -> None:
     view = PlatePageView(page)
     view.on_capture("centre")
-    assert view.message.object == "click a well first"
+    assert view.message.object == "click a well on the map first"
     fake_microscope.require(XYStage).move_to_um(10.0, 20.0)
     _tap(view, 0.0, 0.0)
     assert page.current == "A1"
@@ -1772,6 +1808,434 @@ def test_capture_buttons_act_on_the_current_well(
     assert (
         view.message.object == "cannot capture 'nonsense'; capture a centre or a wall"
     )
+
+
+# --- a disabled Run says why beside the button (m5 §11.2, #332) ---------------------
+
+LIVE_NOTE = "Live is running: press End live, then run the tool."
+SCAN_PLAN_REASON = (
+    "the run document has no plate; smc run --list shows which plugin provides it"
+)
+
+
+def test_a_tool_run_greyed_in_live_says_so_beside_the_button(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    page.choose_plate("96-well")
+    # A capture made, so that the next step has no reason of its own (it would be
+    # stuck on `CAPTURE_WELLS`, which holds longer than any activity).
+    fake_microscope.require(XYStage).move_to_um(10.0, 20.0)
+    page.capture_centre("A1")
+    fake_microscope.override(Camera, FrameCamera(_rows_columns(6, 10)))
+    view = PlatePageView(page)
+    assert view.tool_notes["scan"].object == ""
+    view.on_live()
+    try:
+        assert view.tool_runs["scan"].disabled
+        assert view.tool_notes["scan"].object == LIVE_NOTE
+        assert view.tool_notes["plate-registration"].object == LIVE_NOTE
+        # The next step is plate-registration here: its note says the same.
+        assert view.next_button.disabled
+        assert view.next_note.object == LIVE_NOTE
+        # A tool with a reason of its own keeps it: it holds longer than the activity
+        # (both of these read the plate, which the run document does not have yet).
+        assert view.tool_notes["scan-plan"].object == SCAN_PLAN_REASON
+        assert view.tool_notes["goto-well"].object == SCAN_PLAN_REASON
+    finally:
+        view.on_live()
+    assert page.join(10.0)
+    view.tick()
+    assert view.tool_notes["scan"].object == ""
+    assert view.next_note.object == ""
+
+
+def test_a_run_in_progress_says_what_it_waits_for(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    page.choose_plate("96-well")
+    fake_microscope.require(XYStage).move_to_um(10.0, 20.0)
+    page.capture_centre("A1")
+    view = PlatePageView(page)
+    view.on_run("scan")
+    assert SlowScan.started.wait(5)
+    view.tick()
+    try:
+        waiting = "scan is running: wait for it to end, or press STOP."
+        assert view.tool_notes["plate-registration"].object == waiting
+        assert view.tool_notes["scan"].object == waiting
+        assert view.next_note.object == waiting
+    finally:
+        SlowScan.release.set()
+        assert page.join(10.0)
+    view.tick()
+    assert view.tool_notes["plate-registration"].object == ""
+
+
+def test_a_closed_stand_reason_wins_over_the_busy_note(
+    run_doc: Path, fake_microscope: Microscope
+) -> None:
+    gate, entered = threading.Event(), threading.Event()
+    stands: list[Microscope] = []
+
+    def slow_opener() -> Microscope:
+        entered.set()
+        assert gate.wait(5)
+        stand = Microscope.from_core(
+            cast("CMMCorePlus", FakeCore.demo_like()), Profile.demo()
+        )
+        stands.append(stand)
+        return stand
+
+    closed = PlatePage.closed(
+        Profile.demo(),
+        run_doc,
+        opener=slow_opener,
+        entry_points=_entry_points("plate-registration", "scan-plan"),
+    )
+    closed.choose_plate("96-well")
+    view = PlatePageView(closed)
+    try:
+        view.on_connect()
+        assert entered.wait(5)
+        view.tick()
+        assert closed.status().running == "connect"
+        # `connect` goes, and the stand is not there yet: the reason that holds
+        # longer is the one said, not "connect is running".
+        assert view.tool_notes["scan"].object == "the stand is not connected"
+        assert view.next_note.object == "the stand is not connected"
+    finally:
+        gate.set()
+        assert closed.join(5)
+        closed.close()
+        closed.release()
+        for stand in stands:
+            stand.close()
+
+
+def test_the_replace_note_is_drawn_under_the_tool_that_would_replace_the_plate(
+    run_doc: Path, page: PlatePage, fake_microscope: Microscope
+) -> None:
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    # The page was built before the record: the operator named the plate since.
+    page.choose_plate("96-well")
+    view = PlatePageView(page)
+    when = T0.astimezone().strftime("%Y-%m-%d %H:%M")
+    note = (
+        f"Run replaces the plate registered {when} (references, 2 wells). "
+        "A failed run leaves no plate; the captures stay, so Forget the wrong one "
+        "and Run again to get a plate back."
+    )
+    assert view.tool_notes["plate-registration"].object == note
+    # The other tools say nothing of it: a note under every tool teaches none is read.
+    for other in ("scan-plan", "scan", "goto-well"):
+        assert note not in view.tool_notes[other].object
+    # Under a busy note, after a newline: both are said.
+    fake_microscope.override(Camera, FrameCamera(_rows_columns(6, 10)))
+    view.on_live()
+    try:
+        assert view.tool_notes["plate-registration"].object == f"{LIVE_NOTE}\n{note}"
+    finally:
+        view.on_live()
+    assert page.join(10.0)
+
+
+# --- the plate the page asks for (m5 §11.3, #332) -----------------------------------
+
+PLATE_ASK = (
+    "Which plate is on the stage? 96-well is only a placeholder: choose the plate, "
+    "or press the button if it is a 96-well."
+)
+PLATE_NOT_CHOSEN_TEXT = (
+    "choose the plate on the stage first: the page shows a 96-well placeholder"
+)
+
+
+def test_an_unchosen_plate_shows_the_note_and_the_confirm_button(
+    page: PlatePage,
+) -> None:
+    view = PlatePageView(page)
+    assert not page.plate_chosen
+    assert view.plate_note.visible
+    assert view.plate_note.object == PLATE_ASK
+    assert view.plate_confirm_button.visible
+    assert view.plate_confirm_button.label == "The plate is a 96-well"
+    # The select's options and value are unchanged: the placeholder is shown, named.
+    assert view.plate_select.value == "96-well"
+    # The tool that takes the plate says why it is disabled, beside its button.
+    assert view.tool_runs["plate-registration"].disabled
+    assert view.tool_notes["plate-registration"].object == PLATE_NOT_CHOSEN_TEXT
+    assert view.next_note.object == PLATE_NOT_CHOSEN_TEXT
+
+
+def test_the_confirm_button_keeps_the_plate_and_hides_the_note(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    view = PlatePageView(page)
+    fake_microscope.require(XYStage).move_to_um(10.0, 20.0)
+    _tap(view, 0.0, 0.0)
+    view.on_capture("centre")
+    view.plate_confirm_button.clicks += 1
+    assert (page.plate, page.plate_chosen) == ("96-well", True)
+    assert not view.plate_note.visible
+    assert not view.plate_confirm_button.visible
+    # The same plate: the captures and the selection are kept, and the tool runs.
+    assert [r.well for r in page.refs] == ["A1"]
+    assert page.selection == ("A1",)
+    assert not view.tool_runs["plate-registration"].disabled
+    assert view.tool_notes["plate-registration"].object == ""
+    assert view.message.object == ""
+
+
+def test_choosing_another_plate_hides_the_note_too(page: PlatePage) -> None:
+    view = PlatePageView(page)
+    assert view.plate_note.visible
+    view.plate_select.value = "24-well"
+    assert (page.plate, page.plate_chosen) == ("24-well", True)
+    assert not view.plate_note.visible
+    assert not view.plate_confirm_button.visible
+
+
+def test_a_second_tab_redraws_when_the_plate_is_confirmed(page: PlatePage) -> None:
+    first, second = PlatePageView(page), PlatePageView(page)
+    assert second.plate_note.visible
+    first.plate_confirm_button.clicks += 1
+    # Nothing else changed: not the plate, the selection, the captures. The shared
+    # state carries `plate_chosen`, so the other tab's tick redraws (FM-151).
+    assert second.plate_note.visible
+    second.tick()
+    assert not second.plate_note.visible
+    assert not second.plate_confirm_button.visible
+    assert not second.tool_runs["plate-registration"].disabled
+
+
+def test_a_plate_the_run_document_names_needs_no_confirmation(
+    run_doc: Path, fake_microscope: Microscope
+) -> None:
+    _seed(run_doc, "plate-registration", "plate", _plate("24-well"))
+    named = PlatePage(
+        fake_microscope, run_doc, entry_points=_entry_points("plate-registration")
+    )
+    try:
+        view = PlatePageView(named)
+        assert (named.plate, named.plate_chosen) == ("24-well", True)
+        assert not view.plate_note.visible
+        assert not view.plate_confirm_button.visible
+    finally:
+        named.close()
+
+
+# --- the captures name the well they record (m5 §11.1, #332) -----------------------
+
+
+def _nominal(well: str) -> tuple[float, float]:
+    """The centre of ``well`` on the nominal 96-well map (A1 at 0, 0, not turned), written out."""
+    row = string.ascii_uppercase.index(well[0])
+    col = int(well[1:]) - 1
+    return (col * PITCH_96_UM, -row * PITCH_96_UM)
+
+
+def _capture_labels(view: PlatePageView) -> tuple[str, str, str]:
+    return (
+        view.capture_centre_button.label,
+        view.capture_wall_button.label,
+        view.forget_button.label,
+    )
+
+
+NO_WELL_NOTE = (
+    "click a well on the map first: a capture records the well you clicked last"
+)
+
+
+def test_the_capture_buttons_name_the_well_and_follow_the_wall_select(
+    page: PlatePage,
+) -> None:
+    view = PlatePageView(page)
+    _tap(view, *_nominal("B3"))
+    assert page.current == "B3"
+    assert _capture_labels(view) == (
+        "Capture centre of B3",
+        "Capture B3 left wall",
+        "Forget B3",
+    )
+    # The select redraws the label at once: no tick between the change and the read.
+    view.capture_side_select.value = "top"
+    assert view.capture_wall_button.label == "Capture B3 top wall"
+    assert view.capture_centre_button.label == "Capture centre of B3"
+    assert view.capture_note.object == ""
+
+
+def test_the_capture_buttons_are_disabled_with_no_well_and_the_note_says_why(
+    page: PlatePage,
+) -> None:
+    view = PlatePageView(page)
+    assert _capture_labels(view) == ("Capture centre", "Capture wall", "Forget")
+    assert view.capture_centre_button.disabled
+    assert view.capture_wall_button.disabled
+    assert view.forget_button.disabled
+    assert view.capture_note.object == NO_WELL_NOTE
+    # The select still redraws, and names nothing while there is no well.
+    view.capture_side_select.value = "right"
+    assert view.capture_wall_button.label == "Capture wall"
+    _tap(view, *_nominal("A2"))
+    assert not view.capture_centre_button.disabled
+    assert not view.capture_wall_button.disabled
+    assert not view.forget_button.disabled
+    assert view.capture_note.object == ""
+
+
+def test_the_capture_buttons_stay_disabled_with_the_stand_closed_whatever_the_well(
+    run_doc: Path, fake_microscope: Microscope
+) -> None:
+    closed = PlatePage.closed(
+        fake_microscope.profile,
+        run_doc,
+        entry_points=_entry_points("plate-registration"),
+    )
+    try:
+        view = PlatePageView(closed)
+        _tap(view, *_nominal("B3"))
+        assert closed.current == "B3"
+        # The captures read the stage: the *Connect* row says why, and the label still
+        # names the well so that the operator sees what Connect will enable.
+        assert view.capture_centre_button.disabled
+        assert view.capture_wall_button.disabled
+        assert view.capture_centre_button.label == "Capture centre of B3"
+        # *Forget* reads no stage: only a missing well disables it.
+        assert not view.forget_button.disabled
+    finally:
+        closed.close()
+
+
+def test_a_press_on_buttons_drawn_with_no_well_says_to_click_one(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # A disabled button still reaches the handler (FM-169). The buttons were drawn with
+    # no well; another tab has since made B3 current, and this tab has not ticked: what
+    # the label says (no well) is what the press answers, and it records nothing.
+    view = PlatePageView(page)
+    assert view.capture_centre_button.label == "Capture centre"
+    fake_microscope.require(XYStage).move_to_um(10.0, 20.0)
+    page.click(*_nominal("B3"), drive=False)
+    view.on_capture("centre")
+    assert view.message.object == "click a well on the map first"
+    assert page.refs == ()
+    # The redraw that followed names B3: a second press records it.
+    assert view.capture_centre_button.label == "Capture centre of B3"
+    view.on_capture("centre")
+    assert [r.well for r in page.refs] == ["B3"]
+
+
+def test_a_deselecting_tap_disables_the_capture_buttons(page: PlatePage) -> None:
+    view = PlatePageView(page)
+    _tap(view, *_nominal("B3"))
+    assert not view.capture_centre_button.disabled
+    _tap(view, *_nominal("B3"))
+    assert page.current is None
+    assert _capture_labels(view) == ("Capture centre", "Capture wall", "Forget")
+    assert view.capture_centre_button.disabled
+    assert view.capture_wall_button.disabled
+    assert view.forget_button.disabled
+    assert view.capture_note.object == NO_WELL_NOTE
+
+
+def test_a_capture_clicked_on_a_stale_label_records_nothing(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # FM-177: the label said B3; another tab's click (here, the controller's own
+    # `click`) made B4 current before this tab's tick. The wall recorded under B4
+    # at the position the operator took for B3's is the finding of #332.
+    view = PlatePageView(page)
+    fake_microscope.require(XYStage).move_to_um(10.0, 20.0)
+    _tap(view, *_nominal("B3"))
+    page.click(*_nominal("B4"), drive=False)
+    assert page.current == "B4"
+    assert view.capture_wall_button.label == "Capture B3 left wall"
+    stale = (
+        "the well to record changed from B3 to B4: check the button, then press "
+        "it again"
+    )
+    view.on_capture("wall")
+    assert view.message.object == stale
+    assert (page.refs, page.walls) == ((), ())
+    # The view redrew: the label now names what a press would record.
+    assert view.capture_wall_button.label == "Capture B4 left wall"
+    view.on_capture("wall")
+    assert view.message.object == ""
+    assert [(w.well, w.side) for w in page.walls] == [("B4", "left")]
+
+
+def test_a_capture_of_a_centre_clicked_on_a_stale_label_records_nothing(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    view = PlatePageView(page)
+    fake_microscope.require(XYStage).move_to_um(10.0, 20.0)
+    _tap(view, *_nominal("B3"))
+    page.click(*_nominal("B4"), drive=False)
+    view.on_capture("centre")
+    assert view.message.object == (
+        "the well to record changed from B3 to B4: check the button, then press "
+        "it again"
+    )
+    assert page.refs == ()
+
+
+def test_a_forget_clicked_on_a_stale_label_forgets_nothing(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    view = PlatePageView(page)
+    fake_microscope.require(XYStage).move_to_um(10.0, 20.0)
+    _tap(view, *_nominal("B3"))
+    view.on_capture("centre")
+    _tap(view, *_nominal("B4"))
+    view.on_capture("centre")
+    assert [r.well for r in page.refs] == ["B3", "B4"]
+    page.click(*_nominal("C1"), drive=False)
+    assert view.forget_button.label == "Forget B4"
+    view.on_forget()
+    assert view.message.object == (
+        "the well to record changed from B4 to C1: check the button, then press "
+        "it again"
+    )
+    # Neither B4's capture nor B3's went: the click recorded no decision.
+    assert [r.well for r in page.refs] == ["B3", "B4"]
+    assert view.forget_button.label == "Forget C1"
+
+
+def test_a_capture_clicked_after_current_was_dropped_says_none(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    view = PlatePageView(page)
+    fake_microscope.require(XYStage).move_to_um(10.0, 20.0)
+    _tap(view, *_nominal("B3"))
+    page.toggle("B3")  # another tab deselected it: `current` is dropped
+    assert page.current is None
+    view.on_capture("centre")
+    assert view.message.object == (
+        "the well to record changed from B3 to none: check the button, then press "
+        "it again"
+    )
+    assert page.refs == ()
+    # The redraw followed: the buttons are the plain three, disabled, with the note.
+    assert _capture_labels(view) == ("Capture centre", "Capture wall", "Forget")
+    assert view.capture_note.object == NO_WELL_NOTE
+    view.on_forget()
+    assert view.message.object == "click a well on the map first"
+
+
+def test_a_capture_after_a_tick_records_the_well_on_the_label(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    view = PlatePageView(page)
+    fake_microscope.require(XYStage).move_to_um(10.0, 20.0)
+    _tap(view, *_nominal("B3"))
+    page.click(*_nominal("B4"), drive=False)
+    # The tick sees the shared state changed and redraws, as it does for another tab.
+    view.tick()
+    assert view.capture_centre_button.label == "Capture centre of B4"
+    view.on_capture("centre")
+    assert view.message.object == ""
+    assert [(r.well, r.x_um, r.y_um) for r in page.refs] == [("B4", 10.0, 20.0)]
 
 
 def test_the_checklist_says_what_each_slot_is(run_doc: Path, page: PlatePage) -> None:
@@ -2110,6 +2574,7 @@ def test_a_drive_tap_goes_to_the_wall_the_side_select_says(
 
 
 def test_each_run_button_starts_its_own_tool(run_doc: Path, page: PlatePage) -> None:
+    page.choose_plate("96-well")
     view = PlatePageView(page)
     page.select_text("A1")
     sent: list[tuple[str, list[str]]] = []

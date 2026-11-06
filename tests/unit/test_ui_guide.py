@@ -9,23 +9,32 @@ from __future__ import annotations
 import json
 import shlex
 from collections.abc import Sequence
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, ClassVar
 
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
 from smc.plugins.presets import Preset, PresetCheck, PresetFile
+from smc.plugins.slots import PlateResult
 from smc.ui.controller import CheckItem, LoadedPreset
 from smc.ui.guide import (
     CAPTURE_WELLS,
     DRY_RUN_NO_FRAME,
+    END_LIVE_LABEL,
     SELECT_WELLS,
     NextStep,
+    busy_note,
+    capture_centre_label,
+    capture_wall_label,
     command_line,
+    forget_label,
     next_slot,
     preset_differences,
     preset_note_text,
+    replace_note,
 )
 
 
@@ -361,3 +370,106 @@ def test_command_line_gives_back_any_pairs_through_shlex(
     words = shlex.split(line)
     taken = [words[i + 1] for i, word in enumerate(words) if word == "--param"]
     assert taken == items
+
+
+# --- the captures' labels, the busy note, the replace note (m5 §11, #332) ----------
+
+
+def test_capture_labels_name_the_well_and_the_side() -> None:
+    assert capture_centre_label("B3") == "Capture centre of B3"
+    assert capture_wall_label("B3", "left") == "Capture B3 left wall"
+    assert capture_wall_label("B3", "bottom") == "Capture B3 bottom wall"
+    assert forget_label("B3") == "Forget B3"
+    # With no well the labels are the plain three: there is nothing to name.
+    assert capture_centre_label(None) == "Capture centre"
+    assert capture_wall_label(None, "left") == "Capture wall"
+    assert forget_label(None) == "Forget"
+
+
+def test_busy_note_for_live_names_the_button_and_for_another_activity_says_wait_or_stop() -> (
+    None
+):
+    live = busy_note("live", live=True)
+    assert live == "Live is running: press End live, then run the tool."
+    # The button's own label, from the one constant the page's button draws.
+    assert END_LIVE_LABEL in live
+    other = busy_note("scan", live=False)
+    assert other == "scan is running: wait for it to end, or press STOP."
+
+
+def _plate_result(method: str, n_refs: int) -> PlateResult:
+    return PlateResult(
+        plate="96-well",
+        a1_center_xy_um=(0.0, 0.0),
+        rotation_deg=0.0,
+        method=method,  # type: ignore[arg-type]
+        residual_um=None,
+        scale_error=None,
+        n_refs=n_refs,
+    )
+
+
+def test_replace_note_names_the_time_the_method_and_the_wells() -> None:
+    started = datetime(2026, 11, 3, 14, 20, 41, tzinfo=timezone.utc)
+    # The record's start in the PC's local time, to the minute: computed here the
+    # way a reader's clock would show it, never a literal that depends on the zone.
+    local = started.astimezone().strftime("%Y-%m-%d %H:%M")
+    tail = (
+        "A failed run leaves no plate; the captures stay, so Forget the wrong one "
+        "and Run again to get a plate back."
+    )
+
+    one = replace_note(_plate_result("seed", 1), started)
+    assert one == f"Run replaces the plate registered {local} (seed, 1 well). {tail}"
+    two = replace_note(_plate_result("references", 2), started)
+    assert two == (
+        f"Run replaces the plate registered {local} (references, 2 wells). {tail}"
+    )
+    # A method the registration names is the result's own, never a paraphrase.
+    assert "(wall-images, 3 wells)" in replace_note(
+        _plate_result("wall-images", 3), started
+    )
+
+
+def test_replace_note_converts_a_start_that_is_not_in_utc_to_the_pcs_time() -> None:
+    # A start with an offset that is not zero: 14:20 at +05:00 is 09:20 UTC. On a PC
+    # whose zone is UTC (a CI runner's) a note that skips the conversion says 14:20,
+    # so the test fails there, where a UTC start could not (it reads the same either
+    # way). The expected text is the PC's own conversion of this instant.
+    started = datetime(2026, 11, 3, 14, 20, tzinfo=timezone(timedelta(hours=5)))
+    assert started.astimezone(timezone.utc).strftime("%H:%M") == "09:20"
+    local = started.astimezone().strftime("%Y-%m-%d %H:%M")
+    note = replace_note(_plate_result("seed", 1), started)
+    assert note.startswith(
+        f"Run replaces the plate registered {local} (seed, 1 well). "
+    )
+
+
+class _NoLocalTime(datetime):
+    """A start whose conversion to the PC's zone fails, as the PC's C library may refuse it."""
+
+    error: ClassVar[BaseException] = OSError(22, "Invalid argument")
+
+    def astimezone(self, tz: Any = None) -> datetime:  # type: ignore[override]
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [OSError(22, "Invalid argument"), OverflowError("date value out of range")],
+    ids=["os-error", "overflow"],
+)
+def test_replace_note_shows_the_records_own_start_when_the_pc_cannot_convert_it(
+    error: BaseException,
+) -> None:
+    # Windows refuses a time before 1970 or after year 3000, and any system a year 1 or
+    # 9999 under an offset. A run document is data (FM-125): the note says the value
+    # as recorded, and nothing raises (it is called by `view()`, on every redraw).
+    _NoLocalTime.error = error
+    started = _NoLocalTime(1, 1, 1, 0, 0, tzinfo=timezone.utc)
+    note = replace_note(_plate_result("seed", 1), started)
+    assert note == (
+        "Run replaces the plate registered 0001-01-01T00:00+00:00 (seed, 1 well). "
+        "A failed run leaves no plate; the captures stay, so Forget the wrong one "
+        "and Run again to get a plate back."
+    )

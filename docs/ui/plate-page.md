@@ -126,6 +126,13 @@ Connect opened it, is released after. What the command prints last depends on wh
 | The run did not end within the wait | the stop's line, then `✗ <plugin> did not end within 10 s`, **exit 1**; the stand is released under a run that is still alive |
 | A Connect was still opening a slow stand | the command waits up to 8 s more, then `connect: <stand> was opened after the page closed, and released` (exit 0), or `✗ connect: <stand> is still opening after 18 s: the process ends now, and whether the stand is left connected is not known` (**exit 1**) |
 
+A Ctrl-C with the page open in a browser prints **no traceback**: stopping Bokeh's server
+logs an `AssertionError` (`Uncaught exception GET /ws`) for each open session, which is
+how it closes them, and the command drops that one record while it stops the server and
+counts it (`the server's stop closed 1 open sessions`, in the page's log, not on the
+console). Any other error of the page is still logged. Not every Bokeh version raises
+it: the command is silent on Bokeh 3.9 without the filter.
+
 A second Ctrl-C during the wait still releases the stand, and the command exits 130;
 the stop was already sent. The line it prints still names the motions the layer was
 tracking when the stand was released. A closed or reloaded browser tab does **nothing** to a run:
@@ -172,9 +179,34 @@ outline; the cells' **density** colours the wells (grey where unknown, a well wi
 frame is unknown, not zero), for the label chosen under *Density of*. The **route** is
 a red line with its stops, and the stage is a black cross.
 
+**Which plate.** The page starts on the plate the run document names: the plate of the
+latest `plate-registration` or `plate-walls` record, whatever its status (the one you
+were working on). Without one, the profile's `[sample]` names it (the stand's camera
+images that plate). With neither, the *Plate* select shows `96-well` as a
+**placeholder**: nothing said it is on the stage, and a registration run on a 96-well
+map of a 24-well plate puts A1 two pitches wrong, with no residual to say so. So the
+page says it, under the select:
+
+```text
+Which plate is on the stage? 96-well is only a placeholder: choose the plate, or press the button if it is a 96-well.
+```
+
+and offers a button, `The plate is a 96-well`, that confirms it (it clears nothing: the
+captures you made are kept). Choosing a plate in the select confirms it too. Until then
+**a tool that takes the plate does not run**: `plate-registration` is disabled with
+`choose the plate on the stage first: the page shows a 96-well placeholder` beside its
+button, the next step says the same, and the controller refuses the run with that
+sentence if a click gets through. Captures stay allowed: a capture is a stage read.
+
 **Choosing wells.** Click a well to select it, and again to unselect it. Or type a
 range in *Wells*: `A1:D6`, `B2-B5`, `C*` (a row), `*3` (a column), `all`. The selection
 becomes `scan-plan`'s `wells`, in the order you chose them. A click moves nothing.
+
+**The well the captures act on** is the one you last **selected** by a click, or drove
+to. Unselecting it (a click on it again) drops it, so do a typed range or a preset's
+wells that do not hold it; unselecting some other well leaves it alone. The capture
+buttons name it (see *Calibrating the plate*), so the map and the buttons never disagree
+about which well a capture is for.
 
 The *Wells* box **follows the selection**: a click on a well writes the selected wells in
 it (`B2,B3`), and so does a plate chosen, a selection another tab made, or a run
@@ -357,9 +389,24 @@ profile suggests for a tool (`[suggest]`) is always a field of its own, never un
 *Advanced*, and **starts with the suggested value** (its tooltip says why), so the tool's
 own Run sends what the next step shows. A tool that cannot
 run now is disabled with the reason beside it (`the run document has no plate; ...`,
-`this stand has no XYStage`), and so is every tool while a run is going. A plugin that
-failed to load, or whose parameters cannot be described, is not a tool: a line above the
-map says `plugin <name>: <why>`.
+`this stand has no XYStage`), and so is every tool while an activity goes, **with the
+reason beside the button** and not only in the strip: during Live, `Live is running:
+press End live, then run the tool.`; during any other activity, `<activity> is running:
+wait for it to end, or press STOP.` A tool's own reason (the stand closed, a missing
+input, the plate not chosen) wins over it, because it holds longer than the activity.
+A tool does not run during Live: one activity at a time is the page's rule, and
+`plate-registration` is no exception even though it reads nothing from the stand.
+A tool that provides the plate (`plate-registration`, `plate-walls`) says, under its
+note, what a Run would replace once a plate is usable:
+
+```text
+Run replaces the plate registered 2026-11-03 15:20 (seed, 1 well). A failed run leaves no plate; the captures stay, so Forget the wrong one and Run again to get a plate back.
+```
+
+The time is the record's start in the PC's local time. The page does not refuse: a
+registration is a pure function of its captures, which the page keeps. No other tool has
+this note. A plugin that failed to load, or whose parameters cannot be described, is not
+a tool: a line above the map says `plugin <name>: <why>`.
 
 **A tool's result**, under its Run button, as plain text (a result's words are never
 read as markup): `<status> <time> UTC`, then ` on <profile>` when the record was made
@@ -407,14 +454,22 @@ attempt wrote to disk (a scan's frames) is kept either way.
 
 **Calibrating the plate.** Under `plate-registration`: centre a well under the objective
 by hand, click it on the map, press **Capture centre**; for a wall, put the objective on
-it, choose the side, press **Capture wall**. A capture records where the stage is, so it
+it, choose the side, press **Capture wall**. **The buttons name what they record**:
+`Capture centre of B3`, `Capture B3 left wall` (the side is the *Wall* select's value, and
+the label follows it at once), `Forget B3`. With no well selected they read `Capture
+centre`, `Capture wall`, `Forget`, are disabled, and a note says `click a well on the map
+first: a capture records the well you clicked last`. **A press records the well on the
+button, or nothing**: if the well changed since the button was drawn (another tab, or a
+click between two redraws), it records nothing and says `the well to record changed
+from B3 to B4: check the button, then press it again` (`none` when the well was
+unselected); the button then shows the new well. A capture records where the stage is, so it
 is **refused while the stage is about to move or moves**: while a drive action waits
 behind a frame or runs during live (`stage jog is waiting`, `stage jog is running`), and
 while a run, a snap or a connect goes (`<name> is running`; `goto-well` is a run). The
 buttons are greyed while an activity other than live goes; during live they stay usable
 and the refusal is the message. A live with no drive action handed to it does not refuse:
 a frame moves nothing. A second capture of the same well (and side)
-replaces the first; **Forget** drops the current well's captures. **Run
+replaces the first; **Forget** drops the captures of the well on its label. **Run
 plate-registration** then fits the plate from what was captured, as `smc run
 plate-registration --param refs=... --param walls=...` would. Choosing another plate
 clears the selection and the captures.
@@ -484,7 +539,11 @@ list is cut at eight lines.
 `A1:D6`; otherwise the selected wells, joined) and each tool's **non-empty** fields. A
 value its tool refuses (`coverage=lots`) is the message under the strip, and nothing is
 written: a preset that its next run would refuse is never saved. The saved preset
-becomes the loaded one.
+becomes the loaded one. **While the page shows the 96-well placeholder** (nothing named
+the plate, see *Which plate*) the preset holds **no plate**: the placeholder is not a
+plate anyone chose, and a preset that named it would choose it, with nobody having said
+so, whenever it was loaded. A preset that does name a plate (saved after you chose
+one, or written by hand) is your choice: loading it chooses that plate.
 
 A name is 1 to 64 lower-case letters, digits, `-` and `_`, starting with a letter or a
 digit, and not a name Windows keeps for a device (`nul`, `com1`...). The page never
@@ -558,7 +617,9 @@ column, one click for each tool, until it says `every stage of the workflow is d
 
 1. **Connect.** The next step is `plate-registration`, with the centres of A1, A12 and H1
    from the profile's `[sample]` (known, not measured: the plate is synthetic). **Run**
-   it: no terminal, and no 7 minutes of `plate-finding`.
+   it: no terminal, and no 7 minutes of `plate-finding`. The page opens on the sample's
+   plate, so there is no placeholder to answer; on the plain `demo` stand, which has no
+   `[sample]`, the page asks which plate is on the stage first (see *Which plate*).
 2. **Choose the wells** on the map when the step asks (`select the wells to scan`): click
    one or two wells, and they appear in *Wells*. This is the only choice the page leaves to
    you. The next step is `scan-plan` with those wells and the profile's `coverage=0.4`

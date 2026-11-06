@@ -220,6 +220,12 @@ def test_connect_through_a_click_enables_the_controls_and_reads_the_objectives(
     assert view.connect_button.disabled
     assert not view.disconnect_button.disabled
     assert view.connection_text.object == CONNECTED_TEXT
+    # Connected, but no well is selected: the captures wait for one (m5 §11.1), and
+    # are usable as soon as a click on the map names it.
+    assert view.capture_centre_button.disabled
+    assert view.capture_wall_button.disabled
+    assert page.click(0.0, 0.0, drive=False) == "A1"
+    view.tick()
     assert not view.capture_centre_button.disabled
     assert not view.capture_wall_button.disabled
     assert view.status_text.object.startswith("demo | XY (")
