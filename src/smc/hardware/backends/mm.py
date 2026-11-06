@@ -2859,6 +2859,21 @@ class MMShutter:
         )
 
 
+#: How long Z must have been still before a turn is reported (m2 §8.11 D2).
+#: Assumed: Z was at its place 0.02 s after a turn returned (session 2, reads
+#: 10-50 ms apart); the stand returned Z after the call did. Read at the call.
+TURN_Z_SETTLE_S = 0.1
+#: How far two Z reads may differ and count as still. Chosen: Z read 561.48
+#: then 561.44 µm at rest (session 2). Read at the call.
+TURN_Z_STILL_UM = 0.5
+
+
+def _um(value: float) -> str:
+    """Two decimals; a drive that reads ``-0.0`` at the origin shows ``0.00``."""
+    text = f"{value:.2f}"
+    return "0.00" if text == "-0.00" else text
+
+
 class MMObjectiveTurret:
     """``ObjectiveTurret`` over the ``objective_turret`` role's State device (m2 §8.3).
 
@@ -2873,6 +2888,15 @@ class MMObjectiveTurret:
       the lock, and the new objective's offset differs, so engaging it again
       could drive Z anywhere. The autofocus is looked up through the facade at
       each turn (FM-92), never stored.
+    * **A turn moves Z on the Ti2-E, and the call returns before Z is where it
+      goes** (m2 §8.9, §8.11 D2; session 2, #330). Z read 561.5 µm before a
+      turn and 500.0 µm when it returned, then 570.22 µm. The turn reads Z
+      before it and, once still, after it, and logs what the stand did; the
+      layer corrects nothing. The focus drive is looked up through the facade
+      at each turn, as the autofocus is, and both lookups come before the
+      switch-off, so a facade that is gone raises with nothing sent.
+    * **Re-read until fresh** (m2 §8.11 D3, FM-188): the label read back is
+      read again until it is the label asked for, within a bound.
     * **A turret cannot be stopped** (a ``State`` device): one still busy at
       the deadline stays registered as moving until it reads idle or
       ``resume()`` is called.
@@ -2887,6 +2911,7 @@ class MMObjectiveTurret:
         requires_confirm: bool,
         pixel_sizes_um: Mapping[str, float],
         autofocus: Callable[[], Autofocus | None] = lambda: None,
+        z_stage: Callable[[], ZStage | None] = lambda: None,
     ) -> None:
         self._core = as_hardware_errors(core, Role.objective_turret.value)
         self._label = label
@@ -2894,6 +2919,7 @@ class MMObjectiveTurret:
         self._requires_confirm = requires_confirm
         self._pixel_sizes_um = pixel_sizes_um
         self._autofocus = autofocus
+        self._z_stage = z_stage
         self._motion = _motion(
             self._core, label, f"objective_turret {label}", stoppable=False
         )
@@ -2959,18 +2985,28 @@ class MMObjectiveTurret:
     def _turn(self, description: str, label: str) -> str:
         """The compound: nothing if already there, else the switch-off, then the turn.
 
-        The label read back is read again until it is ``label``, within
-        ``FRESH_READ_WINDOW_S`` (m2 §8.11 D3): whether ``getStateLabel`` reads
-        the new label at the return of a turn is not verified. A turret that
-        stays where it was costs the window, and the result is the label it
-        reads, so a caller says ``although`` as before (FM-155).
+        The autofocus and the focus drive are both looked up first, so that a
+        facade that is gone raises before anything is switched off or sent
+        (FM-92). Then the switch-off, then, for a turn that is sent and a
+        stand with a focus drive, Z before it; the turn; Z once it is still
+        (m2 §8.11 D2). The label read back is read again until it is
+        ``label``, within ``FRESH_READ_WINDOW_S`` (D3): whether
+        ``getStateLabel`` reads the new label at the return of a turn is not
+        verified. A turret that stays where it was costs the window, and the
+        result is the label it reads, so a caller says ``although`` as before
+        (FM-155). A turn that raises logs nothing about Z and does not wait
+        for it.
         """
         if self._read_current() == label:
             logger.info("objective_turret: already at %s", label)
             return label
         autofocus = self._autofocus()
+        zstage = self._z_stage()
         if autofocus is not None and not self._executor.dry_run:
             self._switch_off_first(autofocus, label)
+        # Nothing turns in dry-run, so Z is not read around it.
+        watched = None if self._executor.dry_run else zstage
+        z_before = None if watched is None else self._z_read(watched)
         core, turret = self._core, self._label
         # Filled by the readback, under the lock: how the re-read of the label
         # ended and every read it made. Empty in dry-run, which reads nothing.
@@ -3013,7 +3049,95 @@ class MMObjectiveTurret:
                 reads[0],
                 landed,
             )
+        if watched is not None and z_before is not None:
+            self._report_z(watched, label, z_before)
         return landed
+
+    def _z_read(self, zstage: ZStage) -> float | None:
+        """Z now, or ``None`` after a WARNING: a read that informs a report fails no turn.
+
+        The turn was sent, so a Z that cannot be read turns a done turn into
+        an error for nobody's benefit. The cause goes into the line inside the
+        ``except``, and nothing keeps the exception (FM-98).
+        """
+        try:
+            return float(zstage.position_um())
+        except Exception as exc:
+            logger.warning(
+                "objective_turret: Z could not be read around the turn (%s); the "
+                "stand moves Z during a turn (m2 §8.9)",
+                _named(exc),
+            )
+            return None
+
+    def _report_z(self, zstage: ZStage, label: str, z_before: float) -> None:
+        """Wait until Z is still after the turn, then say what the stand did to it."""
+        z_after = self._settle_z(zstage)
+        if z_after is None:
+            return
+        if abs(z_after - z_before) > TURN_Z_STILL_UM:
+            logger.info(
+                "objective_turret: turned to %r; the stand moved Z from %s µm to %s µm "
+                "(%+.2f µm)",
+                label,
+                _um(z_before),
+                _um(z_after),
+                z_after - z_before,
+            )
+        else:
+            logger.info(
+                "objective_turret: turned to %r; Z is %s µm, as before",
+                label,
+                _um(z_before),
+            )
+
+    def _settle_z(self, zstage: ZStage) -> float | None:
+        """Read Z every ``POLL_INTERVAL_S`` until it has been still for ``TURN_Z_SETTLE_S``.
+
+        The call of a turn returned while Z read 500.0 µm and came back to its
+        place within 0.02 s (m2 §8.9): one read at the return would report the
+        stand's escape position as the result, and the next action would start
+        while the stand still moves Z. Still means every read of a stretch
+        lies within ``TURN_Z_STILL_UM`` of the stretch's first; a read outside
+        it starts a new stretch there. The two constants are read at the call.
+
+        Returns the last read once settled, else ``None`` after a WARNING:
+        the core timeout passed first (the bound, so that a Z that never stops
+        cannot hold the lock for ever; the turn still returns its label), the
+        stand was halted, or a read failed. The wait holds the microscope lock,
+        so another action waits behind it; reads, STOP and the safe calls go
+        through (FM-16).
+        """
+        settle_s, still_um = TURN_Z_SETTLE_S, TURN_Z_STILL_UM
+        bound_s = _core_timeout(self._core)()
+        deadline = time.monotonic() + bound_s
+        z = self._z_read(zstage)
+        if z is None:
+            return None
+        anchor_z = z
+        anchor_t = now = time.monotonic()
+        while now - anchor_t < settle_s:
+            if self._executor.halted:
+                logger.warning(
+                    "objective_turret: Z was not waited for: the stand was halted"
+                )
+                return None
+            if now >= deadline:
+                logger.warning(
+                    "objective_turret: Z was still changing %g s after the turn (%s µm "
+                    "at the last read); the stand may still be moving it",
+                    bound_s,
+                    _um(z),
+                )
+                return None
+            time.sleep(POLL_INTERVAL_S)
+            z = self._z_read(zstage)
+            if z is None:
+                return None
+            now = time.monotonic()
+            if abs(z - anchor_z) > still_um:
+                anchor_z, anchor_t = z, now
+        return z
 
     def _switch_off_first(self, autofocus: Autofocus, label: str) -> None:
         """Switch ``autofocus`` off if it is engaged, or if that cannot be read (FM-19)."""

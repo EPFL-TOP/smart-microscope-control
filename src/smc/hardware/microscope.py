@@ -550,6 +550,12 @@ class Microscope:
                     "Autofocus | None",
                     _owned(owner, "ObjectiveTurret")._lookup(Autofocus),
                 ),
+                # Lazy, like the autofocus: a turn moves Z on the Ti2-E and reads
+                # it around the turn (m2 §8.11 D2); a facade that is gone raises.
+                z_stage=lambda: cast(
+                    "ZStage | None",
+                    _owned(owner, "ObjectiveTurret")._lookup(ZStage),
+                ),
             )
         if capability is LightSource and (label := get(Role.light_source)) is not None:
             return MMLightSource(
