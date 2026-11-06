@@ -198,7 +198,9 @@ def test_a_ctrl_c_with_a_session_open_prints_no_traceback(
     problems: list[str] = []
 
     def say(text: str) -> None:
-        # `serve()` says this once the server is up and before its waiting loop.
+        # `serve()` says this after `pn.serve(threaded=True)` returned and before its
+        # waiting loop: the interrupt cannot come earlier. The server may not accept
+        # connections yet (Panel 1.9 does not), which the helper waits for.
         announced.set()
 
     monkeypatch.setattr("smc.cli._say", say)
@@ -213,7 +215,14 @@ def test_a_ctrl_c_with_a_session_open_prints_no_traceback(
             if not announced.wait(WAIT_S):
                 problems.append("the server was not announced")
                 return
-            session = pull_session(url=f"http://localhost:{port}/")
+            deadline = time.monotonic() + WAIT_S
+            while session is None:
+                try:
+                    session = pull_session(url=f"http://localhost:{port}/")
+                except OSError:  # the server is not accepting connections yet
+                    if time.monotonic() > deadline:
+                        raise
+                    time.sleep(0.1)
             session_open.set()
         except Exception as exc:  # the test says it, below
             problems.append(f"{type(exc).__name__}: {exc}")
@@ -254,10 +263,13 @@ def test_a_ctrl_c_with_a_session_open_prints_no_traceback(
         m for m, _ in collected.seen if m.startswith("Uncaught exception GET /ws")
     ] == []
     assert "Traceback" not in capsys.readouterr().err
-    # The page's own log says what the stop did, once, in one line.
+    # The page's own log says what the stop did, once, in one line: that it closed the
+    # one open session. Bokeh 3.9 (Panel 1.9, the floor) closes quietly, so there is no
+    # record to drop and no line (measured, with a probe that stops the server with one
+    # session open); Bokeh 3.10 raises the assertion, and the line is the count of it.
     lines = [
         r.getMessage()
         for r in caplog.records
         if r.name == "smc.ui" and "the server's stop closed" in r.getMessage()
     ]
-    assert lines == ["the server's stop closed 1 open sessions"]
+    assert lines in ([], ["the server's stop closed 1 open sessions"])
