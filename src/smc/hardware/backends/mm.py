@@ -3192,6 +3192,13 @@ class MMLightSource:
     def set_intensity_native(self, value: float) -> float:
         """Set the knob to ``value``, in its own units; return the readback.
 
+        The readback is read again until it is ``value`` (to the tolerance of
+        a device's own formatting) or ``FRESH_READ_WINDOW_S`` has passed,
+        since the Ti2-E's ``DiaLamp`` read its previous value 9 ms after a set
+        (m2 §8.11 D1, FM-188). What is returned is the last read, as before: a
+        caller that compares it with what it sent sees the doubt, and a WARNING
+        says it. In dry-run nothing is read back.
+
         Raises, before anything is sent:
             HardwareError: The device has no knob that smc knows.
             ValueError: ``value`` is not finite, or lies outside the knob's
@@ -3220,15 +3227,49 @@ class MMLightSource:
                     f"limits [{low:g}, {high:g}]; it is never clamped"
                 )
         description = f"light_source: intensity {value}"
-        return self._executor.do(
+        # Filled by the readback, under the lock: what the re-read found, and
+        # every read it made. Empty in dry-run, which reads nothing back.
+        outcome: list[_Reread[float]] = []
+        reads: list[float] = []
+
+        def read() -> float:
+            reads.append(self._read_intensity(knob))
+            return reads[-1]
+
+        def readback() -> float:
+            outcome.append(_reread(read, lambda seen: _reads_as_set(value, seen)))
+            return outcome[0].value
+
+        landed = self._executor.do(
             description,
             Step(
                 log=description,
                 send=lambda: core.setProperty(label, knob, value),
-                readback=lambda: self._read_intensity(knob),
+                readback=readback,
                 dry_result=value,
             ),
         )
+        if outcome and not outcome[0].fresh:
+            logger.warning(
+                "light_source %r: %s still reads %g after %g s, although %g was "
+                "set; the read may predate the set, or the device did not take it",
+                label,
+                knob,
+                landed,
+                FRESH_READ_WINDOW_S,
+                value,
+            )
+        elif outcome and outcome[0].waited_s > 0:
+            logger.info(
+                "light_source %r: %s read %g right after the set of %g, then %g: a "
+                "read right after a set may be the previous value (FM-188)",
+                label,
+                knob,
+                reads[0],
+                value,
+                landed,
+            )
+        return landed
 
     # --- on and off -----------------------------------------------------------
 

@@ -25,6 +25,7 @@ from test_mm_channels import (
     wait_for,
 )
 
+import smc.hardware.backends.mm as mm
 from smc.hardware import Microscope
 from smc.hardware.capabilities import LightSource, PropertyInfo, Shutter, XYStage
 from smc.hardware.errors import HardwareError
@@ -188,7 +189,12 @@ def test_an_intensity_outside_the_limits_is_refused_not_clamped() -> None:
         assert light.set_intensity_native(0.0) == 0.0
 
 
-def test_the_setters_return_what_the_lamp_reads_not_what_was_asked() -> None:
+def test_the_setters_return_what_the_lamp_reads_not_what_was_asked(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The intensity is read again until the window ends (FM-188); a lamp that
+    # ignores the set never reads 210, so the window is shortened here.
+    monkeypatch.setattr(mm, "FRESH_READ_WINDOW_S", 0.05)
     with ti2() as (core, microscope):
         light = microscope.require(LightSource)
 
@@ -197,9 +203,145 @@ def test_the_setters_return_what_the_lamp_reads_not_what_was_asked() -> None:
 
         core.setProperty = ignored  # type: ignore[method-assign]
         core.setShutterOpen = ignored  # type: ignore[method-assign]
-        assert light.set_intensity_native(210.0) == 501.0
-        assert light.set_on(True) is False
+        with caplog.at_level(logging.WARNING):
+            assert light.set_intensity_native(210.0) == 501.0
+            assert light.set_on(True) is False
         del core.setProperty, core.setShutterOpen
+        assert caplog.messages == [STILL_READS.format(read=501, window=0.05, asked=210)]
+
+
+# --- a read right after a set may be the previous value (m2 §8.11 D1, #330) -----
+
+STALE_THEN_FRESH = (
+    "light_source 'DiaLamp': Intensity read 501 right after the set of 210, then "
+    "210: a read right after a set may be the previous value (FM-188)"
+)
+STILL_READS = (
+    "light_source 'DiaLamp': Intensity still reads {read:g} after {window:g} s, "
+    "although {asked:g} was set; the read may predate the set, or the device did "
+    "not take it"
+)
+
+
+def _lamp_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """What the lamp's re-read logged; the executor's own lines name no quoted device."""
+    return [m for m in caplog.messages if m.startswith("light_source 'DiaLamp'")]
+
+
+def _never_sleeps(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail(seconds: float) -> None:
+        raise AssertionError(f"slept {seconds} s")
+
+    monkeypatch.setattr(mm.time, "sleep", fail)
+
+
+def test_a_stale_read_after_a_set_is_read_again_and_the_new_value_returned(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    core = ti2_core()
+    core.make_reads_stale("DiaLamp", "Intensity", reads=3)
+    with ti2(core=core) as (_, microscope):
+        with caplog.at_level(logging.INFO):
+            assert microscope.require(LightSource).set_intensity_native(210) == 210.0
+        assert _lamp_lines(caplog) == [STALE_THEN_FRESH]
+        assert core.log == ["setProperty('DiaLamp', 'Intensity', 210.0)"]
+
+
+def test_a_read_that_stays_stale_returns_the_old_value_and_warns(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(mm, "FRESH_READ_WINDOW_S", 0.05)
+    core = ti2_core()
+    core.make_reads_stale("DiaLamp", "Intensity", reads=10_000)
+    with ti2(core=core) as (_, microscope):
+        with caplog.at_level(logging.INFO):
+            assert microscope.require(LightSource).set_intensity_native(210) == 501.0
+        assert _lamp_lines(caplog) == [
+            STILL_READS.format(read=501, window=0.05, asked=210)
+        ]
+
+
+def test_a_lamp_that_holds_whole_numbers_pays_the_window_and_warns(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The price of not returning an old value as the new one (D1): a device that
+    # holds another value than it was given pays the bound on every set.
+    monkeypatch.setattr(mm, "FRESH_READ_WINDOW_S", 0.05)
+    core = ti2_core()
+    with ti2(core=core) as (_, microscope):
+
+        def whole(label: str, name: str, value: object) -> None:
+            core._devices[label].properties[name].value = str(int(float(str(value))))
+
+        core.setProperty = whole  # type: ignore[method-assign]
+        with caplog.at_level(logging.INFO):
+            assert microscope.require(LightSource).set_intensity_native(210.4) == 210.0
+        del core.setProperty
+        assert _lamp_lines(caplog) == [
+            STILL_READS.format(read=210, window=0.05, asked=210.4)
+        ]
+
+
+def test_a_read_that_is_fresh_at_once_logs_nothing_and_never_sleeps(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _never_sleeps(monkeypatch)
+    with ti2() as (_, microscope):
+        with caplog.at_level(logging.INFO):
+            assert microscope.require(LightSource).set_intensity_native(210) == 210.0
+        assert _lamp_lines(caplog) == []
+
+
+def test_dry_run_intensity_reads_nothing_back_and_waits_for_nothing(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _never_sleeps(monkeypatch)
+    core = ti2_core()
+    core.make_reads_stale("DiaLamp", "Intensity", reads=3)
+    with ti2(core=core, dry_run=True) as (_, microscope):
+        light = microscope.require(LightSource)
+        assert light.intensity_knob() is not None  # the knob is resolved now
+        reads: list[str] = []
+        real = core.getProperty
+
+        def counted(label: str, name: str) -> str:
+            reads.append(name)
+            return real(label, name)
+
+        core.getProperty = counted  # type: ignore[method-assign]
+        with caplog.at_level(logging.INFO):
+            assert light.set_intensity_native(210) == 210.0
+        del core.getProperty
+        assert reads == []
+        assert _lamp_lines(caplog) == []
+        assert core.log == []
+
+
+def test_a_re_read_that_raises_is_a_hardware_error_naming_the_role() -> None:
+    # FM-79: the second read of the re-read fails; the message names the role.
+    core = ti2_core()
+    core.make_reads_stale("DiaLamp", "Intensity", reads=3)
+    with ti2(core=core) as (_, microscope):
+        light = microscope.require(LightSource)
+        assert light.intensity_knob() is not None  # the knob is resolved now
+        calls: list[int] = []
+        real = core.getProperty
+
+        def flaky(label: str, name: str) -> str:
+            calls.append(0)
+            if len(calls) == 2:
+                raise RuntimeError("DiaLamp: no answer")
+            return real(label, name)
+
+        core.getProperty = flaky  # type: ignore[method-assign]
+        with pytest.raises(HardwareError) as failed:
+            light.set_intensity_native(210)
+        del core.getProperty
+        assert str(failed.value) == (
+            "light_source: getProperty('DiaLamp', 'Intensity') failed (DiaLamp: no "
+            "answer); check the device: power, cable, another program holding it"
+        )
+        assert len(calls) == 2
 
 
 @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
