@@ -1238,6 +1238,39 @@ def _page_widgets(view: PlatePageView) -> list[Any]:
     return list(found.values())
 
 
+def _placed(view: PlatePageView) -> set[int]:
+    """The id of every object the layout holds, panes included, the Accordion's panels too.
+
+    ``_page_widgets`` adds what the view holds as attributes, so a widget deleted from
+    the layout is still found there: it cannot tell a widget the operator sees from one
+    only a test reads. This walk goes through the layout alone.
+    """
+    found = {id(o) for o in view.layout.select()}
+    for accordion in view.layout.select(pn.Accordion):
+        for panel in accordion.objects:
+            found.update(id(o) for o in panel.select())
+    return found
+
+
+def test_the_widgets_that_ask_and_explain_are_on_the_page(page: PlatePage) -> None:
+    # The tests of the plate's ask and of the captures drive these widgets through
+    # attributes (`clicks += 1`, `.visible`, `.object`), which a layout that does not
+    # hold them answers all the same: the operator would never see the question, the
+    # button or the note (adversarial review of #332).
+    view = PlatePageView(page)
+    placed = _placed(view)
+    for name in (
+        "plate_note",
+        "plate_confirm_button",
+        "capture_note",
+        "capture_centre_button",
+        "capture_wall_button",
+        "capture_side_select",
+        "forget_button",
+    ):
+        assert id(getattr(view, name)) in placed, f"{name} is not in the layout"
+
+
 def test_every_handler_the_page_registers_is_guarded(page: PlatePage) -> None:
     view = PlatePageView(page)
     registered: list[Any] = [
@@ -2068,8 +2101,29 @@ def test_the_capture_buttons_stay_disabled_with_the_stand_closed_whatever_the_we
         assert view.capture_centre_button.disabled
         assert view.capture_wall_button.disabled
         assert view.capture_centre_button.label == "Capture centre of B3"
+        # *Forget* reads no stage: only a missing well disables it.
+        assert not view.forget_button.disabled
     finally:
         closed.close()
+
+
+def test_a_press_on_buttons_drawn_with_no_well_says_to_click_one(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # A disabled button still reaches the handler (FM-169). The buttons were drawn with
+    # no well; another tab has since made B3 current, and this tab has not ticked: what
+    # the label says (no well) is what the press answers, and it records nothing.
+    view = PlatePageView(page)
+    assert view.capture_centre_button.label == "Capture centre"
+    fake_microscope.require(XYStage).move_to_um(10.0, 20.0)
+    page.click(*_nominal("B3"), drive=False)
+    view.on_capture("centre")
+    assert view.message.object == "click a well on the map first"
+    assert page.refs == ()
+    # The redraw that followed names B3: a second press records it.
+    assert view.capture_centre_button.label == "Capture centre of B3"
+    view.on_capture("centre")
+    assert [r.well for r in page.refs] == ["B3"]
 
 
 def test_a_deselecting_tap_disables_the_capture_buttons(page: PlatePage) -> None:

@@ -539,7 +539,11 @@ list is cut at eight lines.
 `A1:D6`; otherwise the selected wells, joined) and each tool's **non-empty** fields. A
 value its tool refuses (`coverage=lots`) is the message under the strip, and nothing is
 written: a preset that its next run would refuse is never saved. The saved preset
-becomes the loaded one.
+becomes the loaded one. **While the page shows the 96-well placeholder** (nothing named
+the plate, see *Which plate*) the preset holds **no plate**: the placeholder is not a
+plate anyone chose, and a preset that named it would choose it, with nobody having said
+so, whenever it was loaded. A preset that does name a plate (saved after you chose
+one, or written by hand) is your choice: loading it chooses that plate.
 
 A name is 1 to 64 lower-case letters, digits, `-` and `_`, starting with a letter or a
 digit, and not a name Windows keeps for a device (`nul`, `com1`...). The page never

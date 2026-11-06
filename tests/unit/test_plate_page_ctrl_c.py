@@ -33,6 +33,7 @@ if os.environ.get("SMC_REQUIRE_UI"):
 else:
     pytest.importorskip("panel")
 
+import smc.ui.plate_page as plate_page_module
 from smc.hardware import Microscope
 from smc.plugins.registry import GROUP
 from smc.ui.controller import PlatePage
@@ -183,11 +184,76 @@ def page(fake_microscope: Microscope, run_doc: Path) -> Iterator[PlatePage]:
         controller.close()
 
 
+class _FakeServer:
+    """What ``pn.serve(..., threaded=True)`` returns, as far as ``serve()`` uses it.
+
+    The first wait is the operator's Ctrl-C. ``stop`` does what Bokeh's stop does to
+    an open session: it logs the closing assertion once for each session it closes,
+    and says which filters were on the logger while it did.
+    """
+
+    def __init__(self, *, closes: int) -> None:
+        self.closes = closes
+        self.alive = True
+        self.filters_during_stop: list[type] = []
+        self._interrupted = False
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+    def join(self, timeout: float | None = None) -> None:
+        if not self._interrupted:
+            self._interrupted = True
+            raise KeyboardInterrupt
+
+    def stop(self) -> None:
+        self.filters_during_stop = [type(f) for f in logging.getLogger(TORNADO).filters]
+        for _ in range(self.closes):
+            _logged(CLOSING, AssertionError())
+        self.alive = False
+
+
+@pytest.mark.parametrize("closes", [0, 1, 2])
+def test_serve_drops_what_the_stop_logs_and_counts_it(
+    page: PlatePage,
+    collected: _Collect,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    closes: int,
+) -> None:
+    # `serve()` itself, on every Bokeh version: the vendor's record is dropped while the
+    # server stops, the page's log counts it in one line, and the filter is attached
+    # around the stop only (m5 §11.5). The real server shows the traceback; this shows
+    # the wiring, on a version that closes quietly too.
+    server = _FakeServer(closes=closes)
+    monkeypatch.setattr(plate_page_module.pn, "serve", lambda *a, **k: server)
+    monkeypatch.setattr("smc.cli._say", lambda text: None)
+    logger = logging.getLogger(TORNADO)
+    before = list(logger.filters)
+
+    with caplog.at_level(logging.INFO, logger="smc.ui"):
+        serve(page, port=5006)
+
+    assert server.filters_during_stop == [*map(type, before), _ServerStopFilter]
+    assert logger.filters == before
+    assert collected.seen == []
+    lines = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "smc.ui" and "the server's stop closed" in r.getMessage()
+    ]
+    assert lines == (
+        [f"the server's stop closed {closes} open sessions"] if closes else []
+    )
+    # The same record, while the server runs, is a finding and is logged.
+    _logged(CLOSING, AssertionError())
+    assert collected.seen == [(CLOSING, AssertionError)]
+
+
 @main_thread_only
 def test_a_ctrl_c_with_a_session_open_prints_no_traceback(
     page: PlatePage,
     collected: _Collect,
-    capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -196,17 +262,24 @@ def test_a_ctrl_c_with_a_session_open_prints_no_traceback(
     port = _free_port()
     announced = threading.Event()
     problems: list[str] = []
+    said: list[str] = []
 
     def say(text: str) -> None:
         # `serve()` says this after `pn.serve(threaded=True)` returned and before its
         # waiting loop: the interrupt cannot come earlier. The server may not accept
-        # connections yet (Panel 1.9 does not), which the helper waits for.
+        # connections yet (Panel 1.9 does not), which the helper waits for. What it
+        # says is kept: a stop that did not end says so here, and nowhere else.
+        said.append(text)
         announced.set()
 
     monkeypatch.setattr("smc.cli._say", say)
     session_open = threading.Event()
     interrupted = threading.Event()
     done = threading.Event()
+    # Set once `serve()` has returned or raised: no interrupt may follow it. A late one
+    # lands in pytest, not in the test, and aborts the session with the failure of this
+    # test unreported (the helper waits up to WAIT_S for a server that never answers).
+    ended = threading.Event()
 
     def operator() -> None:
         """What a person does: opens the page in a browser, then presses Ctrl-C."""
@@ -216,19 +289,22 @@ def test_a_ctrl_c_with_a_session_open_prints_no_traceback(
                 problems.append("the server was not announced")
                 return
             deadline = time.monotonic() + WAIT_S
-            while session is None:
+            while session is None and not ended.is_set():
                 try:
                     session = pull_session(url=f"http://localhost:{port}/")
                 except OSError:  # the server is not accepting connections yet
                     if time.monotonic() > deadline:
                         raise
                     time.sleep(0.1)
-            session_open.set()
+            if session is not None:
+                session_open.set()
         except Exception as exc:  # the test says it, below
             problems.append(f"{type(exc).__name__}: {exc}")
         finally:
-            interrupted.set()
-            _thread.interrupt_main()
+            # Only while `serve()` still waits for it.
+            if not ended.is_set():
+                interrupted.set()
+                _thread.interrupt_main()
         # The session stays open while the server stops: a closed one would hide it.
         done.wait(WAIT_S)
         if session is not None:
@@ -247,6 +323,7 @@ def test_a_ctrl_c_with_a_session_open_prints_no_traceback(
         with caplog.at_level(logging.INFO, logger="smc.ui"):
             serve(page, port=port)
     finally:
+        ended.set()
         watchdog.cancel()
         done.set()
         helper.join(WAIT_S)
@@ -254,19 +331,28 @@ def test_a_ctrl_c_with_a_session_open_prints_no_traceback(
     assert problems == []
     assert session_open.is_set()
     assert interrupted.is_set()
-    # `serve()` stops the server by itself within its own bound.
+    # `serve()` stops the server by itself, within its own bound, and says so when it
+    # could not: the server thread is not left running (Panel's is not a daemon: it
+    # would hold the process, and the test runner, at exit).
     assert time.monotonic() - started < WAIT_S
+    assert [text for text in said if "did not stop" in text] == []
+    assert [
+        t.name
+        for t in threading.enumerate()
+        if type(t).__name__ == "StoppableThread" and t.is_alive()
+    ] == []
 
-    # What a person would have read: no record of the closing socket's assertion, and
-    # nothing printed to the console.
+    # What a person would have read: no record of the closing socket's assertion. (The
+    # console is not asserted: pytest takes the log records before any stream sees
+    # them, so only this handler on the logger can tell.)
     assert [
         m for m, _ in collected.seen if m.startswith("Uncaught exception GET /ws")
     ] == []
-    assert "Traceback" not in capsys.readouterr().err
     # The page's own log says what the stop did, once, in one line: that it closed the
     # one open session. Bokeh 3.9 (Panel 1.9, the floor) closes quietly, so there is no
     # record to drop and no line (measured, with a probe that stops the server with one
-    # session open); Bokeh 3.10 raises the assertion, and the line is the count of it.
+    # session open); Bokeh 3.10 raises the assertion, and the line is the count of it,
+    # which `test_serve_drops_what_the_stop_logs_and_counts_it` asserts exactly.
     lines = [
         r.getMessage()
         for r in caplog.records
