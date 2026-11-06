@@ -73,6 +73,7 @@ from smc.ui.frames import Frame, display_image
 from smc.ui.guide import (
     END_LIVE_LABEL,
     NextStep,
+    busy_note,
     capture_centre_label,
     capture_wall_label,
     forget_label,
@@ -133,6 +134,9 @@ _IMAGE_TAB = 1
 #: guide's, which ``busy_note`` quotes: the note and the button cannot differ (m5 §11.2).
 _LIVE_LABEL = "Live"
 _END_LIVE_LABEL = END_LIVE_LABEL
+
+#: The width of the note under the *Plate* select, in pixels: it wraps inside the map's column.
+_PLATE_NOTE_WIDTH = 520
 
 #: What the captures' note says while the buttons name no well (m5 §11.1).
 _NO_WELL_NOTE = (
@@ -498,6 +502,12 @@ class PlatePageView:
             options=sorted(useq.registered_well_plate_keys()),
             value=page.plate,
         )
+        # What the page asks while nothing named the plate (m5 §11.3): the note says
+        # what the 96-well is, and the button confirms it. Both visible only then.
+        self.plate_note = _wrapped_text(
+            extra={"color": _WARNING}, width=_PLATE_NOTE_WIDTH
+        )
+        self.plate_confirm_button = pn.widgets.Button(label="", color="primary")
         self.label_select = pn.widgets.Select(
             label="Density of", options=[], value=None
         )
@@ -562,6 +572,9 @@ class PlatePageView:
         )
         self.select_input.param.watch(
             self._handler(lambda event: self._draw_preset_note()), "value"
+        )
+        self.plate_confirm_button.on_click(
+            self._handler(lambda event: self.on_confirm_plate())
         )
         self.refresh_button.on_click(self._handler(lambda event: self.on_refresh()))
         self.next_button.on_click(self._handler(lambda event: self.on_next()))
@@ -808,6 +821,7 @@ class PlatePageView:
         )
         plate_tab = pn.Column(
             controls,
+            pn.Row(self.plate_confirm_button, self.plate_note),
             pn.Row(self.select_input, self.refresh_button),
             pn.pane.Bokeh(self.figure, sizing_mode="stretch_width"),
             sizing_mode="stretch_width",
@@ -1055,6 +1069,17 @@ class PlatePageView:
                 f"{'none' if now is None else now}: check the button, then press it again"
             )
         return drawn
+
+    def on_confirm_plate(self) -> None:
+        """The *The plate is a …* button: the plate shown is the one on the stage (m5 §11.3).
+
+        ``choose_plate`` with the plate already shown confirms it and clears nothing:
+        the captures made on the placeholder are the operator's and are kept. A click
+        on a button that is hidden still arrives here (FM-169); confirming a plate
+        already confirmed is harmless.
+        """
+        self._try(lambda: self.page.choose_plate(self.page.plate))
+        self.refresh()
 
     def on_capture(self, kind: str) -> None:
         """Capture the stage position as the centre, or a wall, of the well the button names."""
@@ -1587,6 +1612,7 @@ class PlatePageView:
         self._draw_cards()
         self._draw_next()
         self._draw_problems()
+        self._draw_plate_ask()
         self._draw_buttons()
         self._draw_drive()
         # The options are read here and after a save, never by the tick (§10.6).
@@ -1736,20 +1762,28 @@ class PlatePageView:
     def _draw_buttons(self) -> None:
         """A tool that is blocked, or any tool or snap while an activity goes, cannot be started.
 
+        A disabled *Run* says why beside the button (m5 §11.2): its own reason, which
+        holds longer than any activity (the stand closed, a missing input, the plate
+        not chosen), else what the running activity is and how to end it. A tool
+        that would replace a usable plate adds that, on the next line (§11.4).
+
         The captures read the stage, so they are disabled while the stand is
         closed (the *Connect* row says why) and while an activity other than this
         page's live goes (the controller refuses a capture then, #295).
         """
         running = self._running
+        live = self.page.is_live
+        busy = None if running is None else busy_note(running, live=live)
+        replaces = {} if self._view is None else self._view.replaces
         for name, button in self.tool_runs.items():
             reason = self._blocked.get(name)
             button.disabled = running is not None or reason is not None
-            self.tool_notes[name].object = reason or ""
+            lines = (reason or busy, replaces.get(name))
+            self.tool_notes[name].object = "\n".join(line for line in lines if line)
         # The next step's button: while an activity goes, or when the step says why not.
         blocked = None if self._next_drawn is None else self._next_drawn.blocked
         self.next_button.disabled = running is not None or blocked is not None
-        self.next_note.object = blocked or ""
-        live = self.page.is_live
+        self.next_note.object = blocked or busy or ""
         self._draw_captures()
         lacks = self.page.lacks(Camera)
         self.snap_button.disabled = running is not None or lacks is not None
@@ -1760,6 +1794,25 @@ class PlatePageView:
             running is not None and not live
         )
         self.snap_note.object = lacks or ""
+
+    def _draw_plate_ask(self) -> None:
+        """The note and the button that ask which plate is on the stage, visible only while nothing named it (m5 §11.3).
+
+        The *Plate* select shows the placeholder (its options and value are
+        unchanged) and the page says what it is, with the one button that confirms
+        it. ``refresh`` draws it: ``plate_chosen`` is in the shared state, so another
+        tab's confirmation redraws this one.
+        """
+        asking = not self.page.plate_chosen
+        plate = self.page.plate
+        self.plate_note.visible = asking
+        self.plate_confirm_button.visible = asking
+        if asking:
+            self.plate_note.object = (
+                f"Which plate is on the stage? {plate} is only a placeholder: "
+                f"choose the plate, or press the button if it is a {plate}."
+            )
+            self.plate_confirm_button.label = f"The plate is a {plate}"
 
     def _draw_captures(self) -> None:
         """The three capture buttons name the well they record and the side of the *Wall* select (m5 §11.1).
