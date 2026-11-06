@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import shlex
 from collections.abc import Sequence
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -16,16 +17,23 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from smc.plugins.presets import Preset, PresetCheck, PresetFile
+from smc.plugins.slots import PlateResult
 from smc.ui.controller import CheckItem, LoadedPreset
 from smc.ui.guide import (
     CAPTURE_WELLS,
     DRY_RUN_NO_FRAME,
+    END_LIVE_LABEL,
     SELECT_WELLS,
     NextStep,
+    busy_note,
+    capture_centre_label,
+    capture_wall_label,
     command_line,
+    forget_label,
     next_slot,
     preset_differences,
     preset_note_text,
+    replace_note,
 )
 
 
@@ -361,3 +369,62 @@ def test_command_line_gives_back_any_pairs_through_shlex(
     words = shlex.split(line)
     taken = [words[i + 1] for i, word in enumerate(words) if word == "--param"]
     assert taken == items
+
+
+# --- the captures' labels, the busy note, the replace note (m5 §11, #332) ----------
+
+
+def test_capture_labels_name_the_well_and_the_side() -> None:
+    assert capture_centre_label("B3") == "Capture centre of B3"
+    assert capture_wall_label("B3", "left") == "Capture B3 left wall"
+    assert capture_wall_label("B3", "bottom") == "Capture B3 bottom wall"
+    assert forget_label("B3") == "Forget B3"
+    # With no well the labels are the plain three: there is nothing to name.
+    assert capture_centre_label(None) == "Capture centre"
+    assert capture_wall_label(None, "left") == "Capture wall"
+    assert forget_label(None) == "Forget"
+
+
+def test_busy_note_for_live_names_the_button_and_for_another_activity_says_wait_or_stop() -> (
+    None
+):
+    live = busy_note("live", live=True)
+    assert live == "Live is running: press End live, then run the tool."
+    # The button's own label, from the one constant the page's button draws.
+    assert END_LIVE_LABEL in live
+    other = busy_note("scan", live=False)
+    assert other == "scan is running: wait for it to end, or press STOP."
+
+
+def _plate_result(method: str, n_refs: int) -> PlateResult:
+    return PlateResult(
+        plate="96-well",
+        a1_center_xy_um=(0.0, 0.0),
+        rotation_deg=0.0,
+        method=method,  # type: ignore[arg-type]
+        residual_um=None,
+        scale_error=None,
+        n_refs=n_refs,
+    )
+
+
+def test_replace_note_names_the_time_the_method_and_the_wells() -> None:
+    started = datetime(2026, 11, 3, 14, 20, 41, tzinfo=timezone.utc)
+    # The record's start in the PC's local time, to the minute: computed here the
+    # way a reader's clock would show it, never a literal that depends on the zone.
+    local = started.astimezone().strftime("%Y-%m-%d %H:%M")
+    tail = (
+        "A failed run leaves no plate; the captures stay, so Forget the wrong one "
+        "and Run again to get a plate back."
+    )
+
+    one = replace_note(_plate_result("seed", 1), started)
+    assert one == f"Run replaces the plate registered {local} (seed, 1 well). {tail}"
+    two = replace_note(_plate_result("references", 2), started)
+    assert two == (
+        f"Run replaces the plate registered {local} (references, 2 wells). {tail}"
+    )
+    # A method the registration names is the result's own, never a paraphrase.
+    assert "(wall-images, 3 wells)" in replace_note(
+        _plate_result("wall-images", 3), started
+    )

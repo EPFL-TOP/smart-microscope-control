@@ -70,7 +70,12 @@ from smc.ui.controller import (
     WellView,
 )
 from smc.ui.frames import Frame, display_image
-from smc.ui.guide import NextStep, preset_differences, preset_note_text
+from smc.ui.guide import (
+    END_LIVE_LABEL,
+    NextStep,
+    preset_differences,
+    preset_note_text,
+)
 
 __all__ = ["PlatePageView", "build", "card_text", "next_step_text", "serve"]
 
@@ -121,9 +126,10 @@ _PLATE_TAB = 0
 _IMAGE_TAB = 1
 
 #: The two labels of the live button: ``_draw_buttons`` draws them and ``on_live`` reads
-#: them, so that a click does what the button says (m5 §5.3, #287).
+#: them, so that a click does what the button says (m5 §5.3, #287). The second is the
+#: guide's, which ``busy_note`` quotes: the note and the button cannot differ (m5 §11.2).
 _LIVE_LABEL = "Live"
-_END_LIVE_LABEL = "End live"
+_END_LIVE_LABEL = END_LIVE_LABEL
 
 NO_FRAME_TEXT = "no frame yet"
 
