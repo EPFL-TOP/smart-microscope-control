@@ -1265,18 +1265,26 @@ The `objective_turret` role; faults through `as_hardware_errors(core,
      3. `executor.do` with `Step(send=setStateLabel(turret, label),
         readback=getStateLabel(turret), dry_result=label)`, the motion
         `_motion(core, turret, f"objective_turret {turret}",
-        stoppable=False)` and `timeout_s=_core_timeout(core)`.
+        stoppable=False)` and `timeout_s=_core_timeout(core)`. The readback
+        is re-read until it is `label`, within a bound (§8.11 D3).
+     4. Unless in dry-run, and when the stand has a focus drive: Z is read
+        before the send and, once the label is read back, again until it
+        has been still for a moment, then logged (§8.11 D2). The stand
+        moves Z during a turn (§8.9).
 
      In dry-run the compound runs and its nested action logs and skips, so
-     nothing is sent, the switch-off included.
+     nothing is sent, the switch-off included, and no Z is read.
   4. It returns the readback.
 
   **Why the switch-off.** A PFS that follows through a turret rotation
   drives Z while no action holds the lock (§3.2). The new objective's
   offset differs (`offset_per_um` is per objective; on the Ti-E, the valid
   range depends on the objective, §1), so engaging again could drive Z
-  anywhere. Whether the Ti2-E switches PFS off by itself on a nosepiece
-  change is unknown (§8.9).
+  anywhere. The Ti2-E switches PFS off by itself on a turn (§8.9, session
+  2: PFS on and searching, no sample; a locked PFS was not tried). The
+  layer's switch-off **stays**: what a stand does by itself is not the
+  layer's guarantee, the layer's own read of the autofocus after a turn
+  must not depend on it, and a locked PFS may behave otherwise.
 - **A turret cannot be stopped** (a `State` device, M1 §13). One still busy
   at the deadline stays registered as moving until it reads idle or
   `resume()` is called. Neither the emergency stop nor `close()` sends it
@@ -1328,6 +1336,9 @@ The `light_source` role; faults through `as_hardware_errors(core,
   Otherwise it is an action, `light_source: intensity <value>`, through
   `executor.do`: `Step(send=setProperty(device, knob, value),
   readback=float(getProperty(...)), dry_result=value)`. It is not a motion.
+  The readback is **re-read until it is the value that was set, within a
+  bound**: the Ti2-E's `DiaLamp` reads the previous value for a while after
+  a set (§8.9). §8.11 D1 fixes the rule, the bound and the words.
 - **`is_on()` / `set_on(on)`**, when the device's type is `Shutter`:
   `getShutterOpen(device)` and `setShutterOpen(device, on)`, with the same
   kinds of call as `MMShutter` (M1 §13). `set_on(False)` is a safe call,
@@ -1416,8 +1427,10 @@ decides between the two. With no group, `Channels` is not available (§8.6).
      {name}", is_busy=<any of the preset's non-Core devices reads busy>,
      stop=None)`, with `timeout_s=_core_timeout(core)`. The readback is
      `name` when every setting of the preset matches what the stand reads
-     (two presets may hold the same settings), else `current()`;
-     `dry_result` is `name`. One command moves several
+     (two presets may hold the same settings), else `current()`; the match
+     is re-read until it holds, within a bound (§8.11 D1, D4), since a
+     setting of the preset may read its previous value right after the
+     set; `dry_result` is `name`. One command moves several
      devices, and no stop reaches a `State` device, so the motion has a
      key of its own. A device labelled `config group <name>` would share
      it; no stand has one.
@@ -1603,6 +1616,19 @@ ends with a line ending. A preset `BF2` is untouched when `BF` is replaced.
 - `demo_like()` gains the demo's six groups with the measured settings, and
   the channel group `Channel`. `tests/test_fake_core_demo.py` compares
   groups, presets and settings with the demo.
+- **Two quirks of the Ti2-E (session 2, §8.9, #330)**, each set through a
+  method that validates its labels (FM-119), off by default, and kept
+  *assumed* in their shape: the Ti2-E showed them once. §8.11 D6 fixes the
+  signatures and what they change. The demo shows neither (measured: 0 of
+  200 `Exposure` sets read back otherwise; its turret turns at once and
+  does not move Z), so `tests/test_fake_core_demo.py` has nothing to
+  compare them with.
+  - `make_reads_stale(device, prop, *, reads)`: the next `reads` reads of
+    that property after each set return the value it held before the set.
+  - `move_z_on_turn(label, delta_um, *, escape_um=None, escape_reads=0)`: a
+    turn of any `State` device to `label` moves the focus slot's Z by
+    `delta_um`, and the next `escape_reads` reads of that Z return
+    `escape_um`.
 
 **Ti2-E layout for unit tests.** Use the session-0 list
 (`tests/data/nikon-ti2-devices.json`), with `Nosepiece`'s six labels,
@@ -1653,19 +1679,43 @@ the filter turrets' labels, and the `Channel` group with `BF` copied from
 
 The plan of #14 names each test.
 
-### 8.9 Not verified
+### 8.9 Measured on the Ti2-E, and not verified (#330)
 
-What the next Ti2-E session reads (#16):
-- whether `Nosepiece` reads busy while it turns, and how long a turn takes;
-- whether the Ti2-E switches PFS off by itself on a nosepiece change (if it
-  does not, and PFS keeps its lock across a change, the switch-off of §8.3
-  can be revisited);
-- `DiaLamp`'s `Intensity` range, and what it reads after a set of 210;
-- that `current()` reads `BF` after `select("BF")`, which depends on
-  what `DiaLamp`'s `Intensity` and `Camera-1`'s `Exposure` read back;
-- how long `setConfig` keeps `FilterTurret2` busy;
-- `getMagnificationFactor()` at each lever position (#167, §8.10): the
-  pixel-size fallbacks trust it.
+Session 2 (2026-11-03, report #334, `docs/hardware/nikon-ti2.md`) read what
+this section used to list, through pymmcore directly (a read every
+10–50 ms), with no sample, the 10× in place, and PFS off except where the
+row says. Each row says what the layer does about it.
+
+| Read | Result | The layer |
+|---|---|---|
+| A turn of `Nosepiece`, 10× → 4× → 10× | `setState` returns after about 1.0 s (0.99 s, 1.07 s); `deviceBusy("Nosepiece")` never reads true. | The call is the wait: the turn's busy poll returns at the first read, as the XY and Z moves do (#221). |
+| PFS during a turn | PFS on and searching (no sample): **the stand switched it off by itself**; `PFS` enabled read false at the call's return. A locked PFS was not tried. | §8.3's switch-off stays (§8.3, "Why the switch-off"). |
+| Z during a turn | Z read 561.5 µm before and **500.0 µm when the call returned**; 0.02 s later 570.26 µm, settled at 570.22 µm with the 4× (+8.7 µm); back with the 10× it read 561.48, then 561.44 µm. The operator heard a different mechanical noise and a beep. | A read of Z at the return can catch the stand mid-move: §8.11 D2 reads Z until still and reports before and after. |
+| `DiaLamp` `Intensity` | Limits [0, 2100]; 501 at the start. Set to 210, read 0.3 s later: 210. Set back to 501, read **9 ms later: 210 (the previous value)**; read 14 s later: 501. | §8.11 D1: the readback is re-read until fresh, within a bound. |
+| `setConfig("Channel", "BF")` | Returns after **7.1 s**; no device of the preset read busy at any point. Before it, `LightPath` read `1-EYE` and `CondenserTurret` `1-OPEN` (the preset sets `4-L100` and `7-N2`). Afterwards every value matched the preset, `Camera-1` `Exposure` reading `10.0000` for the preset's `10`. Which device takes the time is unknown. | §8.11 D5: a 7 s select is acceptable on the page; the page's other actions are refused meanwhile. |
+| `getCurrentConfig("Channel")` after that select | Read `""` (FM-100, confirmed on the stand). | `Channels.current()` compares numbers as numbers (§8.5); not run through smc on the stand. |
+| `getMagnificationFactor()` | 1.0 at the lever's 1.0× and 1.5 at 1.5× (the property is `Magnification`, `1.0x` and `1.5x`); the pixel size reads 0 (no preset). | §8.10's fallbacks are right at both positions. |
+
+**Not verified**, for the next visit (`/hardware-session` copies this list
+into its checklist):
+- the **dip to 500.0 µm**: whether it is a fixed position (an escape) or
+  relative to Z, and what a turn does at the heights the stand will be at.
+  With no sample and the objective clear, turn 10× → 4× → 10× at Z about
+  561, 1500 and 3000 µm, reading Z every 10 ms from the call until 1 s
+  after it. **Before the first turn under a plate** (Z about 4195 µm at
+  the 10×), the same read at the stage's own height without the plate,
+  and PFS off. A turn under a plate is not run until those reads are in;
+- the same turn **with a locked PFS**, no sample, to see whether it ends
+  locked, off or searching, and what Z does;
+- how long `Intensity` lags a set (a read every 10 ms for 2 s after a set,
+  up and down), and whether `getShutterOpen` lags `setShutterOpen`: §8.11
+  D1 does not cover a shutter's state until it is measured;
+- whether `getStateLabel("Nosepiece")` reads the new label at the return
+  of a turn (§8.11 D3);
+- which device of `BF` takes the 7.1 s: set `CondenserTurret` `7-N2` and
+  `LightPath` `4-L100` one at a time from `1-OPEN` and `1-EYE`, timing each;
+- that `Channels.select("BF")` through smc returns `BF` and `current()`
+  reads `BF` (the contracts skipped it: the stand matched no preset).
 
 ### 8.10 The magnification factor in the pixel size (#167)
 
@@ -1688,8 +1738,9 @@ cores:
   `getPixelSizeUm()` then reads infinity, -0.667, NaN or 0.0. Infinity is
   greater than 0, so a check of `getPixelSizeUm() > 0` alone reports it as
   measured.
-- The Ti2-E's `IntermediateMagnification` is a `Magnifier` (session 0). What
-  its factor reads at `1.0x` and at `1.5x` is **unknown** (§8.9).
+- The Ti2-E's `IntermediateMagnification` is a `Magnifier` (session 0). Its
+  factor reads **1.0 at `1.0x` and 1.5 at `1.5x`** (session 2, §8.9), so
+  the rule below holds at both lever positions.
 
 **The rule.** The profile's `[camera] pixel_size_um` is the size at binning 1
 and a magnification factor of 1.0, the convention of MMCore's own pixel-size
@@ -1723,10 +1774,270 @@ turret it runs inside `Executor.read`. `FakeCore` gains
 `demo_like(extra_devices=())`, which appends devices after the demo's own;
 `tests/test_fake_core_demo.py` compares the product with the demo's.
 
-**Not verified.** The factor on the Ti2-E at each lever position (§8.9). If
-`IntermediateMagnification` reads 1.0 at both, the layer still reports a
-1.5× too large size with the lever at 1.5×, and the fix is a pixel-size
-preset keyed to the lever in the stand's configuration, not code.
+**Not verified.** That a size calibrated with the lever at 1.5× is entered
+multiplied by 1.5 (the factor now reads 1.5 there, §8.9, but no calibration
+was run at 1.5×). A stand whose changer MMCore cannot read still gets a
+pixel-size preset keyed to the lever in its configuration, not code.
+
+### 8.11 A read after a set, a turn that moves Z, a slow select (#330)
+
+Extends §8.3–§8.5 with what session 2 measured (§8.9). **Status**: design
+for #330 (2026-11-05). Measured on `FakeCore` and the demo on 2026-11-05
+(pymmcore-plus 0.18.1, pymmcore 12.5.0.75.0), `main` at 5dd657e, unless a
+line names another source.
+
+#### 8.11.1 What is known
+
+- **Today a stale read is the answer.** `MMLightSource.set_intensity_native`
+  reads back once, at once. On the Ti2-E layout (`ti2_core()`) with a
+  `DiaLamp` whose first three reads after a set return the previous value,
+  `set_intensity_native(210.0)` from 501 returns **501.0**, the old value,
+  in 0.000 s (a prototype quirk on `FakeCore`). `drive.switch_light`
+  compares `is_on()` with what it sent, so a `State` that lags the same way
+  would print `light on, although off was sent`; whether it lags is not
+  measured (§8.9).
+- **A bounded re-read finds the value.** The same quirk read every
+  `POLL_INTERVAL_S` (10 ms) returns 210.0 on the fourth read, 0.038 s after
+  the set; one that never turns fresh returns its last read after the
+  window, which is the previous value.
+- **The demo never reads stale and formats short.** 0 of 200 `Exposure`
+  sets read back otherwise. It reads a number with four decimals
+  (`'50.0000'`), while MMCore writes a double with six
+  (`setProperty(camera, "TestProperty1", 0.1234567)` raises `Cannot set
+  property "TestProperty1" to "0.123457"`, outside its limits [-0.1, 0.1],
+  so the text shows the format). A readback compared with the value that
+  was set needs a tolerance of that order.
+- **During a slow select, other actions are refused and reads go
+  through.** With `Channels.select` inside a `setConfig` of 0.6 s on
+  `FakeCore.demo_like()`, a Z jog from another thread was refused after
+  about 0.06 s with `MotionInProgressError` (`channels Channel Cy5 is still
+  moving…`, naming the select); `ZStage.position_um()` and a shutter close
+  returned at once (FM-16: reads and the safe calls never take the lock).
+- **The demo's turret returns at once and reads not busy**, and does not
+  move Z, so the demo cannot show D2. The Ti2-E layout's `FakeCore` can,
+  once it has the quirk of D6.
+- `ZStage.position_um()` is a read through the facade, with no lock, in
+  dry-run and while halted (M1 §13).
+
+#### 8.11.2 Decisions
+
+**D1. A readback that stands for what the device holds is re-read until it
+is fresh, within a bound (FM-188).** Fresh is: the read is what was set. A
+bound passes: the last read is returned, and a WARNING says so.
+
+```python
+#: How long a readback that is not what was set is re-read before it is
+#: believed (m2 §8.11 D1). Assumed: the Ti2-E's DiaLamp read the previous
+#: value 9 ms after a set and the new one 0.3 s after, and nothing longer
+#: was measured. The visit that measures the lag may set another value.
+FRESH_READ_WINDOW_S = 1.0
+```
+
+- A module function in `backends/mm.py`, `_reread(read, is_fresh) ->
+  _Reread[T]`, with `_Reread` a frozen dataclass `(value, fresh, waited_s)`.
+  It reads once; when that is fresh, it returns at once, so a device that
+  reads fresh costs nothing. Otherwise it reads again every
+  `POLL_INTERVAL_S` until a read is fresh or `FRESH_READ_WINDOW_S` (read at
+  the call, so a test can shorten it) has passed since the first read, and
+  returns the last read. A read that raises propagates. It logs nothing: its
+  callers do, so that a caller that already warns does not warn twice.
+- **Where it applies.** `MMLightSource.set_intensity_native` (fresh: the
+  read is the value set within `math.isclose(read, value, rel_tol=1e-6,
+  abs_tol=1e-4)`, which covers the demo's four decimals and MMCore's six),
+  `MMChannels.select`'s match (D4) and the turret's label (D3).
+- **Where it does not.** `LightSource.set_on`, `Shutter.set_open`: a
+  shutter's state was not measured to lag (§8.9), and a re-read after an
+  off, a safe call, would wait the bound for a light the operator was told
+  is off. The helper is written so that one line makes either use it when
+  the visit shows a lag. `Properties.set` is the escape hatch and returns
+  its readback as one read: a lamp's `Intensity` set through it meets §8.9
+  as it is, which this issue leaves alone.
+- **The cost.** None when the read is fresh. When it is not, the action
+  holds the lock for at most the bound more. A device that holds another
+  value than it was given (a quantised intensity, a set that is ignored)
+  pays the bound on every set, then the WARNING: that is the price of not
+  returning an old value as the new one, and the answer is a profile that
+  sets values the device holds.
+- **The return stays the last read.** `LightSource.set_intensity_native ->
+  float` is unchanged (nothing outside the layer calls it): a caller that
+  compares it with what it sent sees the doubt, as before.
+- **Words** (`label` the role's device, `knob` the property, numbers `:g`):
+  - fresh after a wait, INFO: `light_source 'DiaLamp': Intensity read 501
+    right after the set of 210, then 210: a read right after a set may be the
+    previous value (FM-188)`;
+  - not fresh, WARNING: `light_source 'DiaLamp': Intensity still reads 501
+    after 1 s, although 210 was set; the read may predate the set, or the
+    device did not take it`.
+
+**D2. A turn reads Z before and, once Z is still, after, and says what the
+stand did.** `MMObjectiveTurret.__init__` gains the keyword `z_stage:
+Callable[[], ZStage | None] = lambda: None`; `_build` passes `lambda:
+cast("ZStage | None", _owned(owner, "ObjectiveTurret")._lookup(ZStage))`
+(FM-92: nothing the capability stores is a bound method of itself, and the
+lookup at the call raises once the facade is gone, as the autofocus's does).
+In `_turn` the two lookups, the autofocus's and `z_stage()`, come right after
+the already-at check and **before** the switch-off, so that a facade that is
+gone raises before anything is switched off or sent. Then, unless in
+dry-run, and only when `z_stage()` is not `None`:
+
+1. Z is read before the send, with `ZStage.position_um()`.
+2. The turn is the existing `executor.do`.
+3. Once it returns, Z is read every `POLL_INTERVAL_S` until every read of
+   the last `TURN_Z_SETTLE_S` lies within `TURN_Z_STILL_UM` of the first
+   read of that stretch (a read outside it starts a new stretch), or the
+   core timeout passes, or the stand is halted. The settled Z is the last
+   read.
+4. One line is logged (below). The turn's return value is unchanged.
+
+```python
+#: How long Z must have been still before a turn is reported (m2 §8.11 D2).
+#: Assumed: Z was at its place 0.02 s after a turn returned (session 2, reads
+#: 10-50 ms apart); the stand returned Z after the call did.
+TURN_Z_SETTLE_S = 0.1
+#: How far two Z reads may differ and count as still. Chosen: Z read 561.48
+#: then 561.44 µm at rest (session 2).
+TURN_Z_STILL_UM = 0.5
+```
+
+- **Why it waits.** The call returned while Z read 500.0 µm and came back
+  within 0.02 s (§8.9). A report that read Z once at the return would give
+  the stand's escape position as the result, and the next action would
+  start while the stand was still moving Z. The wait is inside the
+  compound, so other actions wait for the lock; a read, STOP and the safe
+  calls go through.
+- **The words** (positions `:.2f`, the delta `:+.2f`):
+  - moved by more than `TURN_Z_STILL_UM`, INFO: `objective_turret: turned to
+    '1-Plan Fluor 4x'; the stand moved Z from 561.52 µm to 570.22 µm
+    (+8.70 µm)`;
+  - moved by no more than that, INFO: `objective_turret: turned to
+    '1-Plan Fluor 4x'; Z is 561.52 µm, as before`;
+  - not still at the core timeout, WARNING: `objective_turret: Z was still
+    changing 5 s after the turn (570.22 µm at the last read); the stand may
+    still be moving it` (the timeout `:g`, in seconds);
+  - halted during the wait, WARNING: `objective_turret: Z was not waited for:
+    the stand was halted`;
+  - a Z read that fails, before or after, WARNING: `objective_turret: Z could
+    not be read around the turn (<_named(exc)>); the stand moves Z during a
+    turn (m2 §8.9)`, and no INFO line. The turn is not failed by it: it
+    was sent, and a read that only informs a report never turns a done turn
+    into an error.
+- **No Protocol change.** `ObjectiveTurret.select -> str` stays, and so does
+  every stub that implements it. The report is the log line and the drive
+  text of D7.
+- **smc applies no Z correction** and checks no Z after a turn: the stand
+  corrects Z itself (§13.2), and the Z soft limits guard the next move. A
+  turn that ends outside them is seen in the line and refused at the next
+  move.
+- **The switch-off is untouched** (§8.3): it comes first, before Z is read.
+
+**D3. The turret's label is re-read until it is the label asked for
+(D1).** Whether `getStateLabel` reads the new label at the return of a turn
+is not verified (§8.9): the turn's readback is one read today. Fresh: the
+read equals `label`. Not fresh, WARNING: `objective_turret 'Nosepiece':
+reads '2-Plan Fluor 10x' after 1 s, although '1-Plan Fluor 4x' was set; the
+read may predate the turn, or the turret did not turn`; fresh after a wait,
+INFO: `objective_turret 'Nosepiece': read '2-Plan Fluor 10x' right after
+the turn, then '1-Plan Fluor 4x': a read right after a set may be the
+previous value (FM-188)`. A turret that stays where it was costs the bound,
+and `drive.set_objective` then says `although` as today (FM-155).
+
+**D4. `Channels.select`'s match is re-read (D1).** The readback's
+`self._mismatches(settings)` is read again until it is empty, within the
+bound: a preset that holds a `DiaLamp` `Intensity` and returns quickly would
+otherwise read its previous value and report `the stand reads otherwise`
+for a select that worked. Fresh: no setting reads otherwise. The WARNING
+`channels: <group> <name> selected, but the stand reads otherwise: …` is
+unchanged and is the only one at the bound (the helper logs nothing); a wait
+that ended fresh logs INFO `channels: <group> <name>: a setting read its
+previous value right after the select (FM-188)`. A preset that names a
+setting the stand never reads as set (a quantised value, a read-only
+property) costs the bound, then the WARNING.
+
+**D5. A 7 s `Channels.select` is acceptable on the page; no code.** The
+7.1 s of `setConfig("Channel", "BF")` is the adapter blocking inside the
+call (no device read busy), so there is no shorter wait to split it into,
+and the layer cannot tell which device takes it. While it runs the lock is
+held: the page's other actions are refused with the select's name
+(`MotionInProgressError`, measured in §8.11.1), and reads (the status
+strip), the light's off and STOP go through. A refusal that
+names `channels Channel BF` and says to wait is the right answer to a
+click during a light-path change, and 7 s is short against the 60 s lock
+timeout. Which device takes it matters only if the owner wants the select
+shorter: the visit times the two devices (§8.9), and the answer goes to
+`docs/hardware/nikon-ti2.md`, not to the layer.
+
+**D6. `FakeCore` gets the two quirks (§8.8).**
+
+```python
+def make_reads_stale(self, device: str, prop: str, *, reads: int) -> None: ...
+def move_z_on_turn(
+    self,
+    label: str,
+    delta_um: float,
+    *,
+    escape_um: float | None = None,
+    escape_reads: int = 0,
+) -> None: ...
+```
+
+- `make_reads_stale`: the next `reads` reads of `(device, prop)` after each
+  write of a **different** value return the value held before that write;
+  a write of the value it already holds leaves nothing stale; each write
+  restarts the count. The reads it covers are `getProperty`, and the
+  dedicated calls that read the same store (§8.1, "One store":
+  `getStateLabel` for `Label`, `getState` for `State`, `getExposure` for
+  `Exposure`). Every path that writes the property restarts it
+  (`setProperty`, `setConfig`'s settings, `setState`, `setStateLabel`,
+  `setExposure`). `reads` is at least 1, and `ValueError` for a device that
+  is not loaded, a property it lacks, or a read-only one: a misspelt label
+  would otherwise build a stand that reads fresh and a test that passes
+  (FM-119). A shutter's open state is not a property in the fake and is not
+  covered, as it is not measured.
+- `move_z_on_turn`: a turn of **any `State` device** to the position named
+  `label` (the labels of the loaded `State` devices, `ValueError` for one
+  that is none) adds `delta_um` to the focus slot's Z, set on the store
+  directly, so that the Nikon quirk (FM-12) does not trip; and the next
+  `escape_reads` reads of the focus slot's position (`getPosition`) return
+  `escape_um` before they return the stored Z. A turn to the position it is
+  already at changes nothing. `escape_um` is given if and only if
+  `escape_reads` is at least 1, else `ValueError`. Several labels may be
+  registered. `ValueError` also with no focus slot filled.
+- The Ti2-E session-2 values are the tests': `4×` +8.70 µm, `10×` −8.70 µm
+  and an escape of 500.0 µm for a few reads.
+
+**D7. The drive's text says what the stand did to Z.** `drive.set_objective`
+reads `ZStage.position_um()` before `turret.select(...)` and after it, when
+the stand has a focus drive and it is not a dry run; a read that raises
+`HardwareError` counts as unknown, without keeping the exception (FM-98),
+and the layer's WARNING has the cause. After the existing text, the
+clause:
+
+- `; the stand moved Z from 561.52 to 570.22 µm (+8.70 µm)` when the two
+  reads differ by more than `_Z_MOVED_UM = 0.5` (chosen: the read noise at
+  rest is 0.04 µm, session 2; the corrections measured are 8.7 µm);
+- nothing when they do not, or when the stand has no focus drive, or in a
+  dry run (nothing turned: the text is today's);
+- `; Z could not be read around the turn` when either read failed.
+
+The clause follows either of today's texts (`objective '4x'` and
+`objective '10x', although '4x' was asked`), and `reached` is today's. It
+is not a second mutating call: the two reads are reads (m5 §6.1).
+`drive.set_objective`'s docstring changes from "reads nothing and sends
+nothing" to "sends nothing" for a refused turn: Z is read first. The CLI
+prints the text, the page shows it as the outcome; neither changes.
+
+#### 8.11.3 Not verified
+
+- D1's bound against the real lag (§8.9): 1 s is assumed, and the visit
+  measures it. A shutter's state is covered by no re-read until it is
+  measured.
+- D2's settle against a turn at a plate's height or with a locked PFS: the
+  escape at 500.0 µm may be fixed or relative (§8.9), and Z may need longer
+  than the core timeout from Z about 4195 µm.
+- D3: that the label is fresh at the return of a turn.
+- That the Ti2-E reads the label, the lamp and Z fast enough for the
+  windows: `POLL_INTERVAL_S` is 10 ms, and a read there costs 0.00–0.05 ms
+  (session 2).
 
 ## 9. A probe that tells the truth (#48)
 
@@ -3626,14 +3937,17 @@ and how session 3 measures them. Applying them to a plate is m3 §18.
   read 500.0 µm at the call's return (from 561.5 µm), 570.2 µm with the 4×
   (+8.7 µm) and 561.4 µm back with the 10×. The stand lowers Z for the turn
   and puts it back with a correction of its own per objective. A Z offset
-  that smc applied on top would count it twice.
+  that smc applied on top would count it twice. A turn now reads Z before
+  and once it is still after, and the drive's text says what the stand did
+  (§8.11 D2, D7); session 3's reading of Z after a turn can start from it.
 - The stand switches PFS off on a turn (session 2), which m2 §8.3 already
   assumes.
 - No XY offset between the three objectives has been read. Nothing in the
   layer or in a plugin carries one today; `route` says so in its `assumed`
   (m3 §11).
 - A read right after a set returns the previous value on this stand
-  (#330); the turret's `current()` right after a turn is not verified.
+  (#330); the turret's `current()` right after a turn is not verified, and
+  the turn re-reads it until it is the label asked for (§8.11 D3).
 
 ### 13.2 Definitions (decided)
 
@@ -3831,7 +4145,8 @@ nothing is entered.
 - The offsets themselves, and that they are a translation (§13.6).
 - Whether the Ti2-E's own Z correction on a turn (§13.1) is the whole
   parfocality, leaving `z_offset_um` near 0.
-- Whether `current()` reads the new objective right after a turn (#330).
+- Whether `current()` reads the new objective right after a turn (§8.11 D3
+  re-reads it, #330).
 - Whether the magnifier lever at 1.5× moves the image's centre: the
   offsets are keyed by objective only and measured at 1.0× (FM-103).
 - Whether NIS-Elements applies an offset of its own when its objective
