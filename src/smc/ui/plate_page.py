@@ -73,6 +73,9 @@ from smc.ui.frames import Frame, display_image
 from smc.ui.guide import (
     END_LIVE_LABEL,
     NextStep,
+    capture_centre_label,
+    capture_wall_label,
+    forget_label,
     preset_differences,
     preset_note_text,
 )
@@ -130,6 +133,11 @@ _IMAGE_TAB = 1
 #: guide's, which ``busy_note`` quotes: the note and the button cannot differ (m5 §11.2).
 _LIVE_LABEL = "Live"
 _END_LIVE_LABEL = END_LIVE_LABEL
+
+#: What the captures' note says while the buttons name no well (m5 §11.1).
+_NO_WELL_NOTE = (
+    "click a well on the map first: a capture records the well you clicked last"
+)
 
 NO_FRAME_TEXT = "no frame yet"
 
@@ -359,6 +367,9 @@ class PlatePageView:
         # computed at the click (m5 §8.5). And the selection the *Wells* box stands
         # for, with the guard that keeps an echo of it from selecting again.
         self._next_drawn: NextStep | None = None
+        # The well the capture buttons were last drawn for: a capture records this
+        # one or nothing, never the controller's ``current`` of the moment (FM-177).
+        self._capture_well: str | None = None
         self._wells_shown: tuple[str, ...] = ()
         self._echoing = False
         self._next_tool: str | None = None
@@ -508,6 +519,8 @@ class PlatePageView:
             label="Wall", options=list(_WALL_SIDES), value="left"
         )
         self.forget_button = pn.widgets.Button(label="Forget")
+        # Why the three buttons above are disabled with no well: wrapped, as a tool's note.
+        self.capture_note = _wrapped_text(extra={"color": _WARNING})
         self.snap_button = pn.widgets.Button(label="Snap")
         self.live_button = pn.widgets.Button(label=_LIVE_LABEL)
         self.snap_note = pn.pane.Str("", styles={"color": _WARNING})
@@ -538,6 +551,11 @@ class PlatePageView:
                 lambda event: setattr(self.drive_text, "visible", bool(event.new))
             ),
             "value",
+        )
+        # The *Wall* select names the side on *Capture wall*: redrawn at once, not at
+        # the next tick, so the label never says a side the press will not record.
+        self.capture_side_select.param.watch(
+            self._handler(lambda event: self._draw_captures()), "value"
         )
         self.select_input.param.watch(
             self._handler(lambda event: self.on_select_text(event.new)), "value"
@@ -890,6 +908,7 @@ class PlatePageView:
             parts += [
                 pn.Row(self.capture_centre_button, self.forget_button),
                 pn.Row(self.capture_wall_button, self.capture_side_select),
+                self.capture_note,
                 self.captures_text,
             ]
         if advanced_widgets:
@@ -1014,13 +1033,34 @@ class PlatePageView:
         self._try(lambda: self.page.choose_plate(name))
         self.refresh()
 
+    def _well_the_buttons_name(self) -> str:
+        """The well the capture buttons were drawn for, when it is still the controller's current well (FM-177).
+
+        The label said ``B3``; another tab, or a click between two ticks, may have made
+        ``B4`` current since. Recording ``B3``'s wall at the position the operator took
+        for ``B4``'s is a wrong plate registration with nothing to show it, and
+        recording what the label did not say is what the page must not do. Neither is
+        safe, so the press records nothing and asks again; the redraw that follows
+        shows the well it would record now.
+
+        Raises:
+            ValueError: No well was drawn, or ``current`` is another well now.
+        """
+        drawn, now = self._capture_well, self.page.current
+        if drawn is None:
+            raise ValueError("click a well on the map first")
+        if now != drawn:
+            raise ValueError(
+                f"the well to record changed from {drawn} to "
+                f"{'none' if now is None else now}: check the button, then press it again"
+            )
+        return drawn
+
     def on_capture(self, kind: str) -> None:
-        """Capture the stage position as the centre, or a wall, of the current well."""
+        """Capture the stage position as the centre, or a wall, of the well the button names."""
 
         def capture() -> None:
-            well = self.page.current
-            if well is None:
-                raise ValueError("click a well first")
+            well = self._well_the_buttons_name()
             if kind == "centre":
                 self.page.capture_centre(well)
             elif kind == "wall":
@@ -1032,13 +1072,10 @@ class PlatePageView:
         self.refresh()
 
     def on_forget(self) -> None:
-        """Forget the captures of the current well."""
+        """Forget the captures of the well the button names."""
 
         def forget() -> None:
-            well = self.page.current
-            if well is None:
-                raise ValueError("click a well first")
-            self.page.forget(well)
+            self.page.forget(self._well_the_buttons_name())
 
         self._try(forget)
         self.refresh()
@@ -1498,6 +1535,9 @@ class PlatePageView:
         page = self.page
         return (
             page.plate,
+            # Another tab's confirmation of the placeholder changes the note, the
+            # button and the tools' notes without changing the plate (FM-151).
+            page.plate_chosen,
             page.selection,
             page.refs,
             page.walls,
@@ -1710,13 +1750,7 @@ class PlatePageView:
         self.next_button.disabled = running is not None or blocked is not None
         self.next_note.object = blocked or ""
         live = self.page.is_live
-        # The captures read the stage: disabled with the stand closed, and while an
-        # activity other than this page's live goes, which the controller refuses a
-        # capture for. While live goes they stay enabled: only the controller knows
-        # whether a drive action waits or runs, and its refusal is the message.
-        capture_off = not self.page.connected or (running is not None and not live)
-        self.capture_centre_button.disabled = capture_off
-        self.capture_wall_button.disabled = capture_off
+        self._draw_captures()
         lacks = self.page.lacks(Camera)
         self.snap_button.disabled = running is not None or lacks is not None
         # While live goes its own button is the one that ends it; any other activity
@@ -1726,6 +1760,36 @@ class PlatePageView:
             running is not None and not live
         )
         self.snap_note.object = lacks or ""
+
+    def _draw_captures(self) -> None:
+        """The three capture buttons name the well they record and the side of the *Wall* select (m5 §11.1).
+
+        The well is the controller's ``current`` as it is now, kept as ``_capture_well``:
+        a press records that well, or nothing when ``current`` has moved since
+        (``_well_the_buttons_name``). With no well the buttons are the plain three,
+        disabled, and the note says what to do. The captures read the stage, so they
+        are also disabled with the stand closed (the *Connect* row says why) and
+        while an activity other than this page's live goes, which the controller
+        refuses a capture for; while live goes they stay enabled: only the
+        controller knows whether a drive action waits or runs, and its refusal is
+        the message. *Forget* reads no stage: only a missing well disables it. A
+        disabled button is a courtesy, not a guard (FM-169).
+
+        Called by ``_draw_buttons`` and by the *Wall* select's own watcher.
+        """
+        well = self.page.current
+        self._capture_well = well
+        side = str(self.capture_side_select.value)
+        self.capture_centre_button.label = capture_centre_label(well)
+        self.capture_wall_button.label = capture_wall_label(well, side)
+        self.forget_button.label = forget_label(well)
+        stage_off = not self.page.connected or (
+            self._running is not None and not self.page.is_live
+        )
+        self.capture_centre_button.disabled = stage_off or well is None
+        self.capture_wall_button.disabled = stage_off or well is None
+        self.forget_button.disabled = well is None
+        self.capture_note.object = "" if well is not None else _NO_WELL_NOTE
 
     def _draw_drive(self) -> None:
         """Every drive control disabled while an activity other than this page's live goes.

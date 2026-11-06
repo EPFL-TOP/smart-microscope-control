@@ -1754,7 +1754,7 @@ def test_capture_buttons_act_on_the_current_well(
 ) -> None:
     view = PlatePageView(page)
     view.on_capture("centre")
-    assert view.message.object == "click a well first"
+    assert view.message.object == "click a well on the map first"
     fake_microscope.require(XYStage).move_to_um(10.0, 20.0)
     _tap(view, 0.0, 0.0)
     assert page.current == "A1"
@@ -1775,6 +1775,199 @@ def test_capture_buttons_act_on_the_current_well(
     assert (
         view.message.object == "cannot capture 'nonsense'; capture a centre or a wall"
     )
+
+
+# --- the captures name the well they record (m5 §11.1, #332) -----------------------
+
+
+def _nominal(well: str) -> tuple[float, float]:
+    """The centre of ``well`` on the nominal 96-well map (A1 at 0, 0, not turned), written out."""
+    row = string.ascii_uppercase.index(well[0])
+    col = int(well[1:]) - 1
+    return (col * PITCH_96_UM, -row * PITCH_96_UM)
+
+
+def _capture_labels(view: PlatePageView) -> tuple[str, str, str]:
+    return (
+        view.capture_centre_button.label,
+        view.capture_wall_button.label,
+        view.forget_button.label,
+    )
+
+
+NO_WELL_NOTE = (
+    "click a well on the map first: a capture records the well you clicked last"
+)
+
+
+def test_the_capture_buttons_name_the_well_and_follow_the_wall_select(
+    page: PlatePage,
+) -> None:
+    view = PlatePageView(page)
+    _tap(view, *_nominal("B3"))
+    assert page.current == "B3"
+    assert _capture_labels(view) == (
+        "Capture centre of B3",
+        "Capture B3 left wall",
+        "Forget B3",
+    )
+    # The select redraws the label at once: no tick between the change and the read.
+    view.capture_side_select.value = "top"
+    assert view.capture_wall_button.label == "Capture B3 top wall"
+    assert view.capture_centre_button.label == "Capture centre of B3"
+    assert view.capture_note.object == ""
+
+
+def test_the_capture_buttons_are_disabled_with_no_well_and_the_note_says_why(
+    page: PlatePage,
+) -> None:
+    view = PlatePageView(page)
+    assert _capture_labels(view) == ("Capture centre", "Capture wall", "Forget")
+    assert view.capture_centre_button.disabled
+    assert view.capture_wall_button.disabled
+    assert view.forget_button.disabled
+    assert view.capture_note.object == NO_WELL_NOTE
+    # The select still redraws, and names nothing while there is no well.
+    view.capture_side_select.value = "right"
+    assert view.capture_wall_button.label == "Capture wall"
+    _tap(view, *_nominal("A2"))
+    assert not view.capture_centre_button.disabled
+    assert not view.capture_wall_button.disabled
+    assert not view.forget_button.disabled
+    assert view.capture_note.object == ""
+
+
+def test_the_capture_buttons_stay_disabled_with_the_stand_closed_whatever_the_well(
+    run_doc: Path, fake_microscope: Microscope
+) -> None:
+    closed = PlatePage.closed(
+        fake_microscope.profile,
+        run_doc,
+        entry_points=_entry_points("plate-registration"),
+    )
+    try:
+        view = PlatePageView(closed)
+        _tap(view, *_nominal("B3"))
+        assert closed.current == "B3"
+        # The captures read the stage: the *Connect* row says why, and the label still
+        # names the well so that the operator sees what Connect will enable.
+        assert view.capture_centre_button.disabled
+        assert view.capture_wall_button.disabled
+        assert view.capture_centre_button.label == "Capture centre of B3"
+    finally:
+        closed.close()
+
+
+def test_a_deselecting_tap_disables_the_capture_buttons(page: PlatePage) -> None:
+    view = PlatePageView(page)
+    _tap(view, *_nominal("B3"))
+    assert not view.capture_centre_button.disabled
+    _tap(view, *_nominal("B3"))
+    assert page.current is None
+    assert _capture_labels(view) == ("Capture centre", "Capture wall", "Forget")
+    assert view.capture_centre_button.disabled
+    assert view.capture_wall_button.disabled
+    assert view.forget_button.disabled
+    assert view.capture_note.object == NO_WELL_NOTE
+
+
+def test_a_capture_clicked_on_a_stale_label_records_nothing(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # FM-177: the label said B3; another tab's click (here, the controller's own
+    # `click`) made B4 current before this tab's tick. The wall recorded under B4
+    # at the position the operator took for B3's is the finding of #332.
+    view = PlatePageView(page)
+    fake_microscope.require(XYStage).move_to_um(10.0, 20.0)
+    _tap(view, *_nominal("B3"))
+    page.click(*_nominal("B4"), drive=False)
+    assert page.current == "B4"
+    assert view.capture_wall_button.label == "Capture B3 left wall"
+    stale = (
+        "the well to record changed from B3 to B4: check the button, then press "
+        "it again"
+    )
+    view.on_capture("wall")
+    assert view.message.object == stale
+    assert (page.refs, page.walls) == ((), ())
+    # The view redrew: the label now names what a press would record.
+    assert view.capture_wall_button.label == "Capture B4 left wall"
+    view.on_capture("wall")
+    assert view.message.object == ""
+    assert [(w.well, w.side) for w in page.walls] == [("B4", "left")]
+
+
+def test_a_capture_of_a_centre_clicked_on_a_stale_label_records_nothing(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    view = PlatePageView(page)
+    fake_microscope.require(XYStage).move_to_um(10.0, 20.0)
+    _tap(view, *_nominal("B3"))
+    page.click(*_nominal("B4"), drive=False)
+    view.on_capture("centre")
+    assert view.message.object == (
+        "the well to record changed from B3 to B4: check the button, then press "
+        "it again"
+    )
+    assert page.refs == ()
+
+
+def test_a_forget_clicked_on_a_stale_label_forgets_nothing(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    view = PlatePageView(page)
+    fake_microscope.require(XYStage).move_to_um(10.0, 20.0)
+    _tap(view, *_nominal("B3"))
+    view.on_capture("centre")
+    _tap(view, *_nominal("B4"))
+    view.on_capture("centre")
+    assert [r.well for r in page.refs] == ["B3", "B4"]
+    page.click(*_nominal("C1"), drive=False)
+    assert view.forget_button.label == "Forget B4"
+    view.on_forget()
+    assert view.message.object == (
+        "the well to record changed from B4 to C1: check the button, then press "
+        "it again"
+    )
+    # Neither B4's capture nor B3's went: the click recorded no decision.
+    assert [r.well for r in page.refs] == ["B3", "B4"]
+    assert view.forget_button.label == "Forget C1"
+
+
+def test_a_capture_clicked_after_current_was_dropped_says_none(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    view = PlatePageView(page)
+    fake_microscope.require(XYStage).move_to_um(10.0, 20.0)
+    _tap(view, *_nominal("B3"))
+    page.toggle("B3")  # another tab deselected it: `current` is dropped
+    assert page.current is None
+    view.on_capture("centre")
+    assert view.message.object == (
+        "the well to record changed from B3 to none: check the button, then press "
+        "it again"
+    )
+    assert page.refs == ()
+    # The redraw followed: the buttons are the plain three, disabled, with the note.
+    assert _capture_labels(view) == ("Capture centre", "Capture wall", "Forget")
+    assert view.capture_note.object == NO_WELL_NOTE
+    view.on_forget()
+    assert view.message.object == "click a well on the map first"
+
+
+def test_a_capture_after_a_tick_records_the_well_on_the_label(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    view = PlatePageView(page)
+    fake_microscope.require(XYStage).move_to_um(10.0, 20.0)
+    _tap(view, *_nominal("B3"))
+    page.click(*_nominal("B4"), drive=False)
+    # The tick sees the shared state changed and redraws, as it does for another tab.
+    view.tick()
+    assert view.capture_centre_button.label == "Capture centre of B4"
+    view.on_capture("centre")
+    assert view.message.object == ""
+    assert [(r.well, r.x_um, r.y_um) for r in page.refs] == [("B4", 10.0, 20.0)]
 
 
 def test_the_checklist_says_what_each_slot_is(run_doc: Path, page: PlatePage) -> None:
