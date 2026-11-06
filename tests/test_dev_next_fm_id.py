@@ -30,7 +30,15 @@ def test_the_highest_id_on_any_branch_wins(fm) -> None:
 
 
 def test_ids_are_compared_as_numbers_not_text(fm) -> None:
-    assert fm.next_id(["FM-9", "FM-10"]) == "FM-11"
+    assert fm.next_id(["- **FM-9 A**", "- **FM-10 B**"]) == "FM-11"
+
+
+def test_a_mention_of_an_id_does_not_reserve_it(fm) -> None:
+    # A Report that names the id it will take, or a line that says "see FM-9",
+    # moved the next id for another branch (#196, #330).
+    main = "- **FM-12 A** text"
+    report = "+this PR adds FM-13 and refers to FM-40 in its text"
+    assert fm.next_id([main, report]) == "FM-13"
 
 
 def test_no_entry_starts_at_one(fm) -> None:

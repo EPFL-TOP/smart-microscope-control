@@ -7,7 +7,8 @@ Parallel branches add entries to ``docs/design/failure-modes.md``, so the
 highest id on ``main`` is not enough: ids collided between #84 and #10, and
 #131's plan named an id that #130 had taken meanwhile. It is one plain
 command because the develop worktree's sandbox refuses the pipe that did
-this before. Ids are never reused, so removed lines count too.
+this before. Ids are never reused, so removed lines count too. Only
+definitions count (the `- **FM-nn` line), never a mention of an id.
 """
 
 from __future__ import annotations
@@ -19,7 +20,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 CHECKLIST = "docs/design/failure-modes.md"
-_ID = re.compile(r"\bFM-(\d+)\b")
+# A definition is a checklist line `- **FM-nn Title.**`, in the file or as a
+# `+` line of a diff. A mention ("see FM-9", a Report that names the id it
+# will take) does not reserve an id: two branches that each quoted the other's
+# next id moved it twice (#196, #330).
+_ID = re.compile(r"^\+?- \*\*FM-(\d+)\b", re.MULTILINE)
 
 
 def next_id(texts: list[str]) -> str:
