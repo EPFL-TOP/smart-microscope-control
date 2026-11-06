@@ -188,6 +188,7 @@ def _seed(
     *,
     minute: int = 0,
 ) -> None:
+    """A done record of ``plugin``; a plate result's params name its plate, as the runner writes them (m5 §11.3)."""
     then = T0 + timedelta(minutes=minute)
     write_stage(
         run_doc,
@@ -201,7 +202,7 @@ def _seed(
             profile="demo",
             dry_run=False,
             smc_version="0",
-            params={},
+            params={"plate": result.plate} if isinstance(result, PlateResult) else {},
             result=result.model_dump(mode="json"),
         ),
     )
@@ -1586,6 +1587,7 @@ def test_stop_button_stops_through_a_click(page: PlatePage) -> None:
 
 
 def test_a_blocked_tool_is_disabled_with_its_reason(page: PlatePage) -> None:
+    page.choose_plate("96-well")
     view = PlatePageView(page)
     reason = (
         "the run document has no plate; smc run --list shows which plugin provides it"
@@ -1648,6 +1650,7 @@ def test_a_tools_note_wraps_where_the_text_is_the_command_that_continues(
 def test_a_running_tool_disables_every_run_button_until_it_ends(
     page: PlatePage,
 ) -> None:
+    page.choose_plate("96-well")
     view = PlatePageView(page)
     view.on_run("scan")
     assert SlowScan.started.wait(5)
@@ -2110,6 +2113,7 @@ def test_a_drive_tap_goes_to_the_wall_the_side_select_says(
 
 
 def test_each_run_button_starts_its_own_tool(run_doc: Path, page: PlatePage) -> None:
+    page.choose_plate("96-well")
     view = PlatePageView(page)
     page.select_text("A1")
     sent: list[tuple[str, list[str]]] = []
