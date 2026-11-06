@@ -2957,7 +2957,14 @@ class MMObjectiveTurret:
         )
 
     def _turn(self, description: str, label: str) -> str:
-        """The compound: nothing if already there, else the switch-off, then the turn."""
+        """The compound: nothing if already there, else the switch-off, then the turn.
+
+        The label read back is read again until it is ``label``, within
+        ``FRESH_READ_WINDOW_S`` (m2 §8.11 D3): whether ``getStateLabel`` reads
+        the new label at the return of a turn is not verified. A turret that
+        stays where it was costs the window, and the result is the label it
+        reads, so a caller says ``although`` as before (FM-155).
+        """
         if self._read_current() == label:
             logger.info("objective_turret: already at %s", label)
             return label
@@ -2965,17 +2972,48 @@ class MMObjectiveTurret:
         if autofocus is not None and not self._executor.dry_run:
             self._switch_off_first(autofocus, label)
         core, turret = self._core, self._label
-        return self._executor.do(
+        # Filled by the readback, under the lock: how the re-read of the label
+        # ended and every read it made. Empty in dry-run, which reads nothing.
+        outcome: list[_Reread[str]] = []
+        reads: list[str] = []
+
+        def read() -> str:
+            reads.append(self._read_current())
+            return reads[-1]
+
+        def readback() -> str:
+            outcome.append(_reread(read, lambda seen: seen == label))
+            return outcome[0].value
+
+        landed = self._executor.do(
             description,
             Step(
                 log=description,
                 send=lambda: core.setStateLabel(turret, label),
-                readback=self._read_current,
+                readback=readback,
                 dry_result=label,
             ),
             motion=self._motion,
             timeout_s=_core_timeout(core),
         )
+        if outcome and not outcome[0].fresh:
+            logger.warning(
+                "objective_turret %r: reads %r after %g s, although %r was set; the "
+                "read may predate the turn, or the turret did not turn",
+                turret,
+                landed,
+                FRESH_READ_WINDOW_S,
+                label,
+            )
+        elif outcome and outcome[0].waited_s > 0:
+            logger.info(
+                "objective_turret %r: read %r right after the turn, then %r: a read "
+                "right after a set may be the previous value (FM-188)",
+                turret,
+                reads[0],
+                landed,
+            )
+        return landed
 
     def _switch_off_first(self, autofocus: Autofocus, label: str) -> None:
         """Switch ``autofocus`` off if it is engaged, or if that cannot be read (FM-19)."""

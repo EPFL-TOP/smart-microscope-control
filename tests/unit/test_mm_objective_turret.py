@@ -24,6 +24,7 @@ from test_mm_channels import (
     wait_for,
 )
 
+import smc.hardware.backends.mm as mm
 from smc.hardware import Microscope
 from smc.hardware.capabilities import ObjectiveTurret, XYStage
 from smc.hardware.errors import (
@@ -259,19 +260,63 @@ def test_dry_run_turns_nothing_and_switches_nothing_off() -> None:
         assert core.getStateLabel("Nosepiece") == TEN
 
 
-def test_a_turret_that_does_not_follow_reports_where_it_is() -> None:
+def test_a_turret_that_does_not_follow_reports_where_it_is(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
     # The readback, not the request: a tool that took the requested label
-    # would scale its images with the wrong objective's pixel size.
+    # would scale its images with the wrong objective's pixel size. The label
+    # is read again until the window ends (m2 §8.11 D3), shortened here.
+    monkeypatch.setattr(mm, "FRESH_READ_WINDOW_S", 0.05)
     with ti2() as (core, microscope):
 
         def ignored(label: str, text: str) -> None:
             core.log.append(f"setStateLabel({label!r}, {text!r})")
 
         core.setStateLabel = ignored  # type: ignore[method-assign]
-        landed = microscope.require(ObjectiveTurret).select(FORTY, confirm=True)
+        with caplog.at_level(logging.WARNING):
+            landed = microscope.require(ObjectiveTurret).select(FORTY, confirm=True)
         del core.setStateLabel
         assert landed == TEN
         assert core.log == [TURN_40]
+        assert caplog.messages == [
+            f"objective_turret 'Nosepiece': reads {TEN!r} after 0.05 s, although "
+            f"{FORTY!r} was set; the read may predate the turn, or the turret did "
+            f"not turn"
+        ]
+
+
+def test_the_turns_label_is_read_again_until_it_is_the_label_asked_for(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # m2 §8.11 D3: whether getStateLabel reads the new label at the return of
+    # a turn is not verified; a label that lags must not come back as the result.
+    core = ti2_core()
+    core.make_reads_stale("Nosepiece", "Label", reads=3)
+    with ti2(core=core) as (_, microscope):
+        with caplog.at_level(logging.INFO):
+            assert (
+                microscope.require(ObjectiveTurret).select(FORTY, confirm=True) == FORTY
+            )
+        assert [m for m in caplog.messages if "FM-188" in m] == [
+            f"objective_turret 'Nosepiece': read {TEN!r} right after the turn, then "
+            f"{FORTY!r}: a read right after a set may be the previous value (FM-188)"
+        ]
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+def test_a_label_that_is_fresh_at_once_logs_nothing_about_the_re_read(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def fail(seconds: float) -> None:
+        raise AssertionError(f"slept {seconds} s")
+
+    monkeypatch.setattr(mm.time, "sleep", fail)
+    with ti2() as (_, microscope):
+        with caplog.at_level(logging.INFO):
+            assert (
+                microscope.require(ObjectiveTurret).select(FORTY, confirm=True) == FORTY
+            )
+        assert [m for m in caplog.messages if "FM-188" in m] == []
 
 
 def test_a_turret_fault_is_a_hardware_error_naming_the_role() -> None:
