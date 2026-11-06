@@ -300,7 +300,13 @@ def _reread(read: Callable[[], T], is_fresh: Callable[[T], bool]) -> _Reread[T]:
         time.sleep(POLL_INTERVAL_S)
         value = read()
         if is_fresh(value):
-            return _Reread(value, True, time.monotonic() - started)
+            # At least the sleep that came before this read: on Windows below
+            # Python 3.13 ``time.monotonic()`` ticks every 15.6 ms, so two
+            # reads 10 ms apart can measure 0.0, and a caller that tells a read
+            # that waited (INFO) from one that did not would lose the line.
+            return _Reread(
+                value, True, max(time.monotonic() - started, POLL_INTERVAL_S)
+            )
 
 
 def _reads_as_set(value: float, read: float) -> bool:
@@ -2991,8 +2997,9 @@ class MMObjectiveTurret:
         The autofocus and the focus drive are both looked up first, so that a
         facade that is gone raises before anything is switched off or sent
         (FM-92). Then the switch-off, then, for a turn that is sent and a
-        stand with a focus drive, Z before it; the turn; Z once it is still
-        (m2 §8.11 D2). The label read back is read again until it is
+        stand with a focus drive, Z before it; the turn; and the wait until Z
+        is still (m2 §8.11 D2), which comes even when Z could not be read
+        before the turn. The label read back is read again until it is
         ``label``, within ``FRESH_READ_WINDOW_S`` (D3): whether
         ``getStateLabel`` reads the new label at the return of a turn is not
         verified. A turret that stays where it was costs the window, and the
@@ -3052,12 +3059,12 @@ class MMObjectiveTurret:
                 reads[0],
                 landed,
             )
-        if watched is not None and z_before is not None:
-            self._report_z(watched, label, z_before)
+        if watched is not None:
+            self._report_z(watched, label, z_before, turned=landed == label)
         return landed
 
-    def _z_read(self, zstage: ZStage) -> float | None:
-        """Z now, or ``None`` after a WARNING: a read that informs a report fails no turn.
+    def _z_read(self, zstage: ZStage, *, say: bool = True) -> float | None:
+        """Z now, or ``None`` (after a WARNING unless ``say`` is false): a read that informs a report fails no turn.
 
         The turn was sent, so a Z that cannot be read turns a done turn into
         an error for nobody's benefit. The cause goes into the line inside the
@@ -3066,17 +3073,29 @@ class MMObjectiveTurret:
         try:
             return float(zstage.position_um())
         except Exception as exc:
-            logger.warning(
-                "objective_turret: Z could not be read around the turn (%s); the "
-                "stand moves Z during a turn (m2 §8.9)",
-                _named(exc),
-            )
+            if say:
+                logger.warning(
+                    "objective_turret: Z could not be read around the turn (%s); the "
+                    "stand moves Z during a turn (m2 §8.9)",
+                    _named(exc),
+                )
             return None
 
-    def _report_z(self, zstage: ZStage, label: str, z_before: float) -> None:
-        """Wait until Z is still after the turn, then say what the stand did to it."""
-        z_after = self._settle_z(zstage)
-        if z_after is None:
+    def _report_z(
+        self, zstage: ZStage, label: str, z_before: float | None, *, turned: bool
+    ) -> None:
+        """Wait until Z is still after the turn, then say what the stand did to it.
+
+        The wait comes whether or not Z could be read before the turn: it is
+        for the next action, which must not start while the stand moves Z. A
+        read that failed before the turn has said so (``z_before`` is
+        ``None``), so a failure after it is not said again, and there is then
+        no line about what the stand did. Nor is there one when the label read
+        back is not the label asked for: the WARNING of the re-read has said
+        that, and "turned to" would contradict it (FM-155).
+        """
+        z_after = self._settle_z(zstage, say_unreadable=z_before is not None)
+        if z_before is None or z_after is None or not turned:
             return
         if abs(z_after - z_before) > TURN_Z_STILL_UM:
             logger.info(
@@ -3094,7 +3113,7 @@ class MMObjectiveTurret:
                 _um(z_before),
             )
 
-    def _settle_z(self, zstage: ZStage) -> float | None:
+    def _settle_z(self, zstage: ZStage, *, say_unreadable: bool = True) -> float | None:
         """Read Z every ``POLL_INTERVAL_S`` until it has been still for ``TURN_Z_SETTLE_S``.
 
         The call of a turn returned while Z read 500.0 µm and came back to its
@@ -3107,14 +3126,15 @@ class MMObjectiveTurret:
         Returns the last read once settled, else ``None`` after a WARNING:
         the core timeout passed first (the bound, so that a Z that never stops
         cannot hold the lock for ever; the turn still returns its label), the
-        stand was halted, or a read failed. The wait holds the microscope lock,
-        so another action waits behind it; reads, STOP and the safe calls go
-        through (FM-16).
+        stand was halted, or a read failed (said once: not when
+        ``say_unreadable`` is false, because the read before the turn said it).
+        The wait holds the microscope lock, so another action waits behind it;
+        reads, STOP and the safe calls go through (FM-16).
         """
         settle_s, still_um = TURN_Z_SETTLE_S, TURN_Z_STILL_UM
         bound_s = _core_timeout(self._core)()
         deadline = time.monotonic() + bound_s
-        z = self._z_read(zstage)
+        z = self._z_read(zstage, say=say_unreadable)
         if z is None:
             return None
         anchor_z = z
@@ -3134,7 +3154,7 @@ class MMObjectiveTurret:
                 )
                 return None
             time.sleep(POLL_INTERVAL_S)
-            z = self._z_read(zstage)
+            z = self._z_read(zstage, say=say_unreadable)
             if z is None:
                 return None
             now = time.monotonic()

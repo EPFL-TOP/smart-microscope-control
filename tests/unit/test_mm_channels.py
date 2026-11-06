@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import stat
@@ -186,6 +187,52 @@ def ti2(
         yield fake, microscope
     finally:
         microscope.close()
+
+
+class FakeClock:
+    """A clock the test owns, put in the place of ``mm.time`` (FM-44).
+
+    ``sleep`` advances it and nothing waits, so a loop that polls every
+    ``POLL_INTERVAL_S`` for a tenth of a second or a bound of seconds runs at
+    once, and its outcome depends on the reads, never on a stall of the real
+    clock. ``sleeps`` records every sleep, so that a test can say that a loop
+    sleeps and for how long. ``tick_s`` makes ``monotonic`` move in ticks of
+    that size, as Windows' clock does (15.625 ms below Python 3.13). A loop that
+    never sleeps would never end here: the clock raises after ``MAX_READS``
+    reads. Everything else of ``time`` is the real module's.
+    """
+
+    MAX_READS = 100_000
+
+    def __init__(self, *, tick_s: float = 0.0) -> None:
+        self.now = 1000.0
+        self.sleeps: list[float] = []
+        self._tick_s = tick_s
+        self._reads = 0
+
+    def monotonic(self) -> float:
+        self._reads += 1
+        if self._reads > self.MAX_READS:
+            raise AssertionError(
+                f"the clock was read {self.MAX_READS} times: a loop that never sleeps"
+            )
+        if self._tick_s:
+            return math.floor(self.now / self._tick_s) * self._tick_s
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
+
+def fake_clock(monkeypatch: pytest.MonkeyPatch, *, tick_s: float = 0.0) -> FakeClock:
+    """A ``FakeClock`` in the place of ``mm.time`` until the test ends."""
+    clock = FakeClock(tick_s=tick_s)
+    monkeypatch.setattr(mm, "time", clock)
+    return clock
 
 
 class Thread:

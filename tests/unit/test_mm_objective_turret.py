@@ -17,6 +17,7 @@ import pytest
 from test_mm_channels import (
     JOIN_S,
     Thread,
+    fake_clock,
     lock_held_by_a_snap,
     ti2,
     ti2_core,
@@ -35,6 +36,7 @@ from smc.hardware.errors import (
     SafetyRefusedError,
 )
 from smc.hardware.profile import CameraSection
+from smc.hardware.safety import POLL_INTERVAL_S
 from smc.testing import FakeCore
 
 if TYPE_CHECKING:
@@ -438,15 +440,21 @@ def _count_positions(core: FakeCore) -> list[str]:
 
 
 def test_a_turn_reads_z_before_and_once_still_after_and_logs_what_the_stand_did(
-    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     # Session 2: Z read 561.52 µm before, 500.0 µm when the call returned, and
     # settled at 570.22 µm. A report that read Z once at the return would say 500.00.
+    # The clock is the test's: the escape lasts three reads whatever the real one does.
+    clock = fake_clock(monkeypatch)
     core = _core_at(561.52, 8.70)
     with ti2(BOUNDED, core=core) as (_, microscope):
         with caplog.at_level(logging.INFO):
             landed = microscope.require(ObjectiveTurret).select(FOUR, confirm=True)
         assert landed == FOUR
+        # Z is read every poll interval until it has been still for the window: a
+        # settle that did not sleep would read as fast as it can, holding the lock.
+        assert clock.sleeps
+        assert set(clock.sleeps) == {POLL_INTERVAL_S}
         assert _z_lines(caplog) == [
             "objective_turret: turned to '1-Plan Fluor 4x'; the stand moved Z from "
             "561.52 µm to 570.22 µm (+8.70 µm)"
@@ -457,9 +465,10 @@ def test_a_turn_reads_z_before_and_once_still_after_and_logs_what_the_stand_did(
 
 
 def test_a_turn_that_leaves_z_within_the_noise_says_z_is_as_before(
-    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     # Z at rest reads 0.04 µm apart (session 2): that is no move.
+    fake_clock(monkeypatch)
     core = _core_at(561.52, 0.04, escape=False)
     with ti2(BOUNDED, core=core) as (_, microscope):
         with caplog.at_level(logging.INFO):
@@ -472,17 +481,32 @@ def test_a_turn_that_leaves_z_within_the_noise_says_z_is_as_before(
 def test_the_settle_reads_its_constants_at_the_call(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # A move of 8.70 µm is within a tolerance of 10 µm: set after the import, as
-    # a test or one day a profile does.
+    # Both are set after the import, as a test or one day a profile does. Z wobbles
+    # by 1 µm between two reads after the turn: still, to a tolerance of 10 µm, but
+    # not to the default 0.5 µm, which would never let the settle end (the INFO
+    # line, whose own threshold is the same constant, is the other place it is read).
     monkeypatch.setattr(mm, "TURN_Z_STILL_UM", 10.0)
     monkeypatch.setattr(mm, "TURN_Z_SETTLE_S", 0.05)
-    core = _core_at(561.52, 8.70, escape=False)
+    clock = fake_clock(monkeypatch)
+    core = _core_at(561.52, 0.0, escape=False)
     with ti2(BOUNDED, core=core) as (_, microscope):
+        reads: list[int] = []
+
+        def wobbling(label: str | None = None) -> float:
+            reads.append(0)
+            return (
+                561.52 + (len(reads) % 2 == 0) * 1.0
+            )  # the first read is the 'before'
+
+        core.getPosition = wobbling  # type: ignore[method-assign]
         with caplog.at_level(logging.INFO):
             microscope.require(ObjectiveTurret).select(FOUR, confirm=True)
+        del core.getPosition
         assert _z_lines(caplog) == [
             "objective_turret: turned to '1-Plan Fluor 4x'; Z is 561.52 µm, as before"
         ]
+        # The window of 0.05 s, not the default 0.1 s: five or six polls, not ten.
+        assert 5 <= len(clock.sleeps) <= 6
 
 
 def test_a_settle_of_zero_seconds_reports_the_first_read_after_the_turn(
@@ -491,6 +515,7 @@ def test_a_settle_of_zero_seconds_reports_the_first_read_after_the_turn(
     # The window is read at the call, and 0 s is no wait: the escape position the
     # stand reports at the return of the turn is then what the line says.
     monkeypatch.setattr(mm, "TURN_Z_SETTLE_S", 0.0)
+    clock = fake_clock(monkeypatch)
     core = _core_at(561.52, 8.70)
     with ti2(BOUNDED, core=core) as (_, microscope):
         with caplog.at_level(logging.INFO):
@@ -499,11 +524,13 @@ def test_a_settle_of_zero_seconds_reports_the_first_read_after_the_turn(
             "objective_turret: turned to '1-Plan Fluor 4x'; the stand moved Z from "
             "561.52 µm to 500.00 µm (-61.52 µm)"
         ]
+        assert clock.sleeps == []
 
 
 def test_a_z_that_never_settles_is_reported_and_the_turn_still_returns_its_label(
-    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    fake_clock(monkeypatch)
     core = _core_at(561.52, 8.70, escape=False)
     with ti2(ti2_profile(device_timeout_ms=100), core=core) as (_, microscope):
         reads: list[int] = []
@@ -530,10 +557,11 @@ def test_a_z_that_never_settles_is_reported_and_the_turn_still_returns_its_label
 
 
 def test_a_z_that_drifts_slowly_is_not_still(
-    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     # Each read lies 0.2 µm from the one before, within the 0.5 µm tolerance, but
     # the stretch is anchored at its first read: ten reads (0.1 s) drift by 2 µm.
+    fake_clock(monkeypatch)
     core = _core_at(561.52, 8.70, escape=False)
     with ti2(ti2_profile(device_timeout_ms=300), core=core) as (_, microscope):
         reads: list[int] = []
@@ -556,8 +584,9 @@ def test_a_z_that_drifts_slowly_is_not_still(
 
 
 def test_a_halt_during_the_settle_stops_the_wait_and_says_so(
-    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    fake_clock(monkeypatch)
     core = _core_at(561.52, 8.70, escape=False)
     with ti2(BOUNDED, core=core) as (_, microscope):
         real = core.getPosition
@@ -582,8 +611,9 @@ def test_a_halt_during_the_settle_stops_the_wait_and_says_so(
 
 
 def test_a_z_read_that_fails_does_not_fail_the_turn(
-    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    fake_clock(monkeypatch)
     core = _core_at(561.52, 8.70)
     with ti2(BOUNDED, core=core) as (_, microscope):
         core.failing["ZDrive"] = RuntimeError("ZDrive: no answer")
@@ -605,8 +635,9 @@ def test_a_z_read_that_fails_does_not_fail_the_turn(
 
 
 def test_a_z_read_that_fails_after_the_turn_says_so_once(
-    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    fake_clock(monkeypatch)
     core = _core_at(561.52, 8.70, escape=False)
     with ti2(BOUNDED, core=core) as (_, microscope):
         real = core.getPosition
@@ -629,6 +660,93 @@ def test_a_z_read_that_fails_after_the_turn_says_so_once(
             "objective_turret: Z could not be read around the turn ("
         )
         assert lines[0].endswith("); the stand moves Z during a turn (m2 §8.9)")
+
+
+def test_a_z_read_that_fails_only_before_the_turn_still_waits_for_z_and_says_so_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The wait is for the next action, which must not start while the stand moves Z:
+    # it comes whether or not Z could be read before the turn. Only the line about
+    # what the stand did is lost, and a read that worked is not warned about again.
+    clock = fake_clock(monkeypatch)
+    core = _core_at(561.52, 8.70)
+    with ti2(BOUNDED, core=core) as (_, microscope):
+        real = core.getPosition
+        calls: list[int] = []
+
+        def failing_once(label: str | None = None) -> float:
+            calls.append(0)
+            if len(calls) == 1:  # the read before the turn
+                raise RuntimeError("ZDrive: no answer")
+            return real(label)
+
+        core.getPosition = failing_once  # type: ignore[method-assign]
+        with caplog.at_level(logging.INFO):
+            landed = microscope.require(ObjectiveTurret).select(FOUR, confirm=True)
+        del core.getPosition
+        assert landed == FOUR
+        assert _z_lines(caplog) == [
+            "objective_turret: Z could not be read around the turn (focus: "
+            "getPosition('ZDrive') failed (ZDrive: no answer); check the device: "
+            "power, cable, another program holding it); the stand moves Z during a "
+            "turn (m2 §8.9)"
+        ]
+        # The settle read past the escape position: Z is where the stand left it.
+        assert core.getPosition("ZDrive") == pytest.approx(570.22)
+        assert clock.sleeps
+
+
+def test_a_turn_the_turret_did_not_follow_says_nothing_of_having_turned(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The label stays stale for the whole window: the WARNING of the re-read says
+    # the turret may not have turned, and "turned to" would contradict it (FM-155).
+    # Z is still waited for: the stand may have moved it all the same.
+    fake_clock(monkeypatch)
+    core = _core_at(561.52, 8.70, escape=False)
+    core.make_reads_stale("Nosepiece", "Label", reads=100_000)
+    with ti2(BOUNDED, core=core) as (_, microscope):
+        calls = _count_positions(core)
+        with caplog.at_level(logging.INFO):
+            landed = microscope.require(ObjectiveTurret).select(FOUR, confirm=True)
+        del core.getPosition
+        assert landed == TEN
+        assert _turned(caplog) == []
+        assert [r.levelname for r in caplog.records if "reads" in r.getMessage()] == [
+            "WARNING"
+        ]
+        assert len(calls) > 1  # the read before, and the settle's reads
+
+
+def test_z_is_read_after_the_switch_off_not_before_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # D2: the switch-off comes first, so that what it does to Z (FM-12) is not
+    # blamed on the stand's turn in the line that says what the stand did.
+    fake_clock(monkeypatch)
+    core = _core_at(561.52, 8.70)
+    with ti2(BOUNDED, core=core) as (_, microscope):
+        core.enableContinuousFocus(True)
+        engaged: list[bool] = []
+        real = core.getPosition
+
+        def watching(label: str | None = None) -> float:
+            engaged.append(core.isContinuousFocusEnabled())
+            return real(label)
+
+        core.getPosition = watching  # type: ignore[method-assign]
+        microscope.require(ObjectiveTurret).select(FOUR, confirm=True)
+        del core.getPosition
+        assert engaged
+        assert not any(engaged)  # every read, the first included, saw PFS off
+
+
+def test_a_drive_that_reads_minus_zero_shows_zero() -> None:
+    # A drive at the origin may read -0.0; the line shows 0.00, as drive.um_text does.
+    assert mm._um(-0.001) == "0.00"
+    assert mm._um(-0.004) == "0.00"
+    assert mm._um(-0.006) == "-0.01"
+    assert mm._um(561.5249) == "561.52"
 
 
 def test_a_stand_with_no_focus_drive_turns_and_says_nothing_about_z(

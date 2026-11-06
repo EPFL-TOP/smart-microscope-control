@@ -44,6 +44,7 @@ from pymmcore_plus import CMMCorePlus
 from test_mm_channels import ti2_core, ti2_profile
 
 import smc.cli as cli
+from smc import drive
 from smc.hardware import Microscope
 from smc.hardware.capabilities import (
     Autofocus,
@@ -1080,6 +1081,36 @@ def test_a_light_re_read_that_raises_frees_the_core(no_cyclic_gc: None) -> None:
         "HardwareError",
         "light_source: getProperty('DiaLamp', 'Intensity') failed (DiaLamp: no "
         "answer); check the device: power, cable, another program holding it",
+    )
+    watched = _watch(microscope, core)
+    del microscope, core
+    assert _alive(watched) == _FACADE_AND_CORE_FREED
+
+
+def _drive_a_turn_whose_z_fails(core: FakeCore, microscope: Microscope) -> str:
+    """``drive.set_objective`` over a ``getPosition`` that raises a fresh error each call.
+
+    The hook is removed with ``del`` before the function returns (FM-92).
+    """
+
+    def position(label: str | None = None) -> float:
+        raise RuntimeError("Z: no answer")  # fresh: not `failing` (FM-98)
+
+    core.getPosition = position  # type: ignore[method-assign]
+    try:
+        return drive.set_objective(microscope, _TWENTY_X, confirm=True).text
+    finally:
+        del core.getPosition
+
+
+def test_a_drive_turn_whose_z_cannot_be_read_frees_the_core(
+    no_cyclic_gc: None,
+) -> None:
+    # `drive._read_z` swallows a HardwareError without keeping it (FM-98): a name
+    # bound to it would be a cycle through the frame, and the core would stay alive.
+    core, microscope = _stand()
+    assert _drive_a_turn_whose_z_fails(core, microscope) == (
+        f"objective '{_TWENTY_X}'; Z could not be read around the turn"
     )
     watched = _watch(microscope, core)
     del microscope, core

@@ -960,6 +960,24 @@ def test_the_escape_is_served_again_by_each_turn_that_moves_z() -> None:
     ]
 
 
+def test_the_escape_is_served_for_the_focus_device_only() -> None:
+    core = FakeCore(
+        [
+            FakeDevice("Z", DeviceType.Stage),
+            FakeDevice("Piezo", DeviceType.Stage),
+            FakeDevice("Nose", DeviceType.State, state_labels=("A", "B")),
+        ],
+        focus="Z",
+    )
+    core.move_z_on_turn("B", 1.0, escape_um=500.0, escape_reads=2)
+    core.setStateLabel("Nose", "B")
+    # Another stage reads its own position, and costs the focus device no escape.
+    assert core.getPosition("Piezo") == 0.0
+    assert core.getPosition("Z") == 500.0
+    assert core.getPosition("Z") == 500.0
+    assert core.getPosition("Z") == 1.0
+
+
 def test_a_turn_to_the_position_it_is_at_moves_no_z_and_serves_no_escape() -> None:
     core = _ti2_at(561.52)  # the nosepiece starts at the 10x
     core.move_z_on_turn(TEN, -8.70, escape_um=500.0, escape_reads=2)

@@ -18,6 +18,7 @@ from pymmcore_plus import DeviceType
 from test_mm_channels import (
     JOIN_S,
     Thread,
+    fake_clock,
     lock_held_by_a_snap,
     ti2,
     ti2_core,
@@ -280,6 +281,44 @@ def test_a_lamp_that_holds_whole_numbers_pays_the_window_and_warns(
         assert _lamp_lines(caplog) == [
             STILL_READS.format(read=210, window=0.05, asked=210.4)
         ]
+
+
+def test_a_stale_read_is_logged_although_the_clock_cannot_see_the_wait(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Windows below Python 3.13: time.monotonic() ticks every 15.625 ms, so a
+    # re-read one poll interval after the first can measure no time at all. The
+    # INFO line is for a read that waited, and this one did.
+    fake_clock(monkeypatch, tick_s=0.015625)
+    core = ti2_core()
+    core.make_reads_stale("DiaLamp", "Intensity", reads=1)
+    with ti2(core=core) as (_, microscope):
+        with caplog.at_level(logging.INFO):
+            assert microscope.require(LightSource).set_intensity_native(210) == 210.0
+        assert _lamp_lines(caplog) == [STALE_THEN_FRESH]
+
+
+def test_a_lamp_that_formats_its_readback_short_is_fresh_at_once(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The demo reads four decimals where MMCore writes six: 0.1235 for 0.1234567 is
+    # the value that was set, not a read that predates the set. Read as different,
+    # it would cost the whole window and a false WARNING on every set.
+    clock = fake_clock(monkeypatch)
+    core = ti2_core()
+    with ti2(core=core) as (_, microscope):
+
+        def short(label: str, name: str, value: object) -> None:
+            core._devices[label].properties[name].value = f"{float(str(value)):.4f}"
+
+        core.setProperty = short  # type: ignore[method-assign]
+        with caplog.at_level(logging.INFO):
+            assert microscope.require(LightSource).set_intensity_native(
+                0.1234567
+            ) == pytest.approx(0.1235)
+        del core.setProperty
+        assert clock.sleeps == []
+        assert _lamp_lines(caplog) == []
 
 
 def test_a_read_that_is_fresh_at_once_logs_nothing_and_never_sleeps(

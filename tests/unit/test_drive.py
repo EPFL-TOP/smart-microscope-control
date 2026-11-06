@@ -13,6 +13,7 @@ from typing import cast
 
 import pytest
 from pymmcore_plus import CMMCorePlus
+from test_mm_channels import fake_clock
 
 from smc import drive
 from smc.drive import DriveResult
@@ -484,6 +485,50 @@ def test_set_objective_says_when_z_could_not_be_read(
         f"objective '{TWENTY_X}'; Z could not be read around the turn"
     )
     assert fake_microscope.require(ObjectiveTurret).current() == TWENTY_X
+
+
+def test_set_objective_says_when_only_the_read_before_the_turn_failed(
+    fake_microscope: Microscope, fake_core: FakeCore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # One read failing is enough for the clause: the turn was sent and is not failed,
+    # and the other read alone says nothing about what the stand did.
+    fake_clock(monkeypatch)
+    real = fake_core.getPosition
+    calls: list[int] = []
+
+    def fails_first(label: str | None = None) -> float:
+        calls.append(0)
+        if len(calls) == 1:  # the drive's own read, before the turn
+            raise RuntimeError("Z: no answer")
+        return real(label)
+
+    fake_core.getPosition = fails_first  # type: ignore[method-assign]
+    result = drive.set_objective(fake_microscope, TWENTY_X, confirm=True)
+    del fake_core.getPosition
+
+    assert result == DriveResult(
+        f"objective '{TWENTY_X}'; Z could not be read around the turn"
+    )
+
+
+def test_set_objective_says_when_only_the_read_after_the_turn_failed(
+    fake_microscope: Microscope, fake_core: FakeCore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake_clock(monkeypatch)
+    real = fake_core.getPosition
+
+    def fails_once_turned(label: str | None = None) -> float:
+        if fake_core.getStateLabel("Objective") == TWENTY_X:
+            raise RuntimeError("Z: no answer")
+        return real(label)
+
+    fake_core.getPosition = fails_once_turned  # type: ignore[method-assign]
+    result = drive.set_objective(fake_microscope, TWENTY_X, confirm=True)
+    del fake_core.getPosition
+
+    assert result == DriveResult(
+        f"objective '{TWENTY_X}'; Z could not be read around the turn"
+    )
 
 
 def test_set_objective_in_dry_run_reads_no_z_and_keeps_todays_text(
