@@ -398,7 +398,9 @@ class ObjectiveTurret(Protocol):
     ``select`` needs ``confirm=True`` unless the profile's ``[safety]
     turret_requires_confirm`` is false. A turn switches the autofocus off
     first and never engages it again: the new objective's offset is not
-    known. A turret cannot be stopped from smc.
+    known. A turret cannot be stopped from smc. The Ti2-E moves Z during a
+    turn; the layer reads it before and, once still, after, and logs it
+    (m2 §8.11).
     """
 
     def labels(self) -> list[str]:
@@ -444,7 +446,11 @@ class LightSource(Protocol):
         ...
 
     def set_intensity_native(self, value: float) -> float:
-        """Set the knob; return the readback. Never clamped: outside its limits, refused."""
+        """Set the knob; return the readback. Never clamped: outside its limits, refused.
+
+        The readback is re-read until it is the value set, within a bound; the
+        return is the last read (m2 §8.11 D1).
+        """
         ...
 
     def is_on(self) -> bool | None:

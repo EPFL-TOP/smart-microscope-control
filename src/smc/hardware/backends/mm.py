@@ -105,8 +105,11 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DEFAULT_LOCK_TIMEOUT_S",
+    "FRESH_READ_WINDOW_S",
     "INTENSITY_HINTS",
     "MAX_LOCK_TIMEOUT_S",
+    "TURN_Z_SETTLE_S",
+    "TURN_Z_STILL_UM",
     "Z_STOP_OUTCOME_WAIT_S",
     "MMAutofocus",
     "MMCamera",
