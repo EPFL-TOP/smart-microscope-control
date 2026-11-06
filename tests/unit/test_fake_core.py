@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import pytest
 from pymmcore_plus import DeviceType
+from test_mm_channels import ti2_core
 
 from smc.hardware import Microscope
 from smc.hardware.backends.mm import as_hardware_errors
@@ -704,3 +705,340 @@ def test_a_failing_magnifier_raises_its_entry_from_the_factor_call() -> None:
     del core.failing["A"]
     core.failing["Camera"] = boom
     assert core.getMagnificationFactor() == 1.0
+
+
+# --- the two quirks of the Ti2-E (m2 §8.11 D6, #330) ---------------------------
+
+FOUR, TEN = "1-Plan Fluor 4x", "2-Plan Fluor 10x"
+
+
+def _lamp_reads(core: FakeCore, count: int) -> list[str]:
+    return [core.getProperty("DiaLamp", "Intensity") for _ in range(count)]
+
+
+def test_make_reads_stale_returns_the_previous_value_for_that_many_reads_then_the_new_one() -> (
+    None
+):
+    # The Ti2-E's DiaLamp read 210 nine milliseconds after a set of 501 (#330).
+    core = ti2_core()
+    core.make_reads_stale("DiaLamp", "Intensity", reads=3)
+    core.setProperty("DiaLamp", "Intensity", 210)
+    assert _lamp_reads(core, 5) == ["501", "501", "501", "210", "210"]
+
+
+def test_a_write_of_the_value_already_held_leaves_nothing_stale() -> None:
+    core = ti2_core()
+    core.make_reads_stale("DiaLamp", "Intensity", reads=3)
+    core.setProperty("DiaLamp", "Intensity", 501)
+    assert _lamp_reads(core, 2) == ["501", "501"]
+    # A write of the value it holds also ends what an earlier write left stale.
+    core.setProperty("DiaLamp", "Intensity", 210)
+    assert _lamp_reads(core, 1) == ["501"]
+    core.setProperty("DiaLamp", "Intensity", 210)
+    assert _lamp_reads(core, 2) == ["210", "210"]
+
+
+def test_each_write_restarts_the_stale_count() -> None:
+    core = ti2_core()
+    core.make_reads_stale("DiaLamp", "Intensity", reads=3)
+    core.setProperty("DiaLamp", "Intensity", 210)
+    assert _lamp_reads(core, 1) == ["501"]
+    core.setProperty("DiaLamp", "Intensity", 300)
+    # What was held before the second write is 210, not the 501 of the first.
+    assert _lamp_reads(core, 5) == ["210", "210", "210", "300", "300"]
+
+
+@pytest.mark.parametrize(
+    ("device", "prop", "write", "read", "before", "after"),
+    [
+        pytest.param(
+            "Nosepiece",
+            "Label",
+            lambda core: core.setStateLabel("Nosepiece", FOUR),
+            lambda core: core.getStateLabel("Nosepiece"),
+            TEN,
+            FOUR,
+            id="Label",
+        ),
+        pytest.param(
+            "Nosepiece",
+            "State",
+            lambda core: core.setState("Nosepiece", 0),
+            lambda core: core.getState("Nosepiece"),
+            1,
+            0,
+            id="State",
+        ),
+        pytest.param(
+            "Camera-1",
+            "Exposure",
+            lambda core: core.setExposure(20.0),
+            lambda core: core.getExposure(),
+            10.0,
+            20.0,
+            id="Exposure",
+        ),
+    ],
+)
+def test_stale_reads_cover_the_dedicated_calls_of_the_same_store(
+    device: str,
+    prop: str,
+    write: Callable[[FakeCore], None],
+    read: Callable[[FakeCore], object],
+    before: object,
+    after: object,
+) -> None:
+    core = ti2_core()
+    core.make_reads_stale(device, prop, reads=2)
+    write(core)
+    assert [read(core) for _ in range(4)] == [before, before, after, after]
+
+
+@pytest.mark.parametrize(
+    ("device", "prop", "write", "before", "after"),
+    [
+        pytest.param(
+            "DiaLamp",
+            "Intensity",
+            lambda core: core.setProperty("DiaLamp", "Intensity", 210),
+            "501",
+            "210",
+            id="setProperty",
+        ),
+        pytest.param(
+            "DiaLamp",
+            "Intensity",
+            lambda core: core.setConfig("Channel", "BF"),
+            "501",
+            "210",
+            id="setConfig",
+        ),
+        pytest.param(
+            "Nosepiece",
+            "State",
+            lambda core: core.setState("Nosepiece", 0),
+            "1",
+            "0",
+            id="setState",
+        ),
+        pytest.param(
+            "Nosepiece",
+            "Label",
+            lambda core: core.setStateLabel("Nosepiece", FOUR),
+            TEN,
+            FOUR,
+            id="setStateLabel",
+        ),
+        pytest.param(
+            "Nosepiece",
+            "Label",
+            lambda core: core.setProperty("Nosepiece", "Label", FOUR),
+            TEN,
+            FOUR,
+            id="setProperty-on-a-State-device",
+        ),
+        pytest.param(
+            "Camera-1",
+            "Exposure",
+            lambda core: core.setExposure(20.0),
+            "10.0000",
+            "20.0000",
+            id="setExposure",
+        ),
+    ],
+)
+def test_every_path_that_writes_a_property_restarts_the_stale_count(
+    device: str,
+    prop: str,
+    write: Callable[[FakeCore], None],
+    before: str,
+    after: str,
+) -> None:
+    core = ti2_core()
+    core.make_reads_stale(device, prop, reads=1)
+    write(core)
+    assert [core.getProperty(device, prop) for _ in range(3)] == [before, after, after]
+
+
+def test_a_property_that_was_not_made_stale_reads_fresh() -> None:
+    core = ti2_core()
+    core.make_reads_stale("Nosepiece", "Label", reads=3)
+    core.setProperty("DiaLamp", "Intensity", 210)
+    assert _lamp_reads(core, 1) == ["210"]
+
+
+def test_make_reads_stale_refuses_a_misspelt_device_a_missing_or_read_only_property_and_zero_reads() -> (
+    None
+):
+    # FM-119: a misspelt label would build a stand that reads fresh, and a test
+    # that passes whatever the layer does.
+    core = FakeCore.demo_like()
+    refusals = [
+        ("Camera", "Exposure", 0, "make_reads_stale: reads must be at least 1, got 0"),
+        (
+            "Camera",
+            "Exposure",
+            -2,
+            "make_reads_stale: reads must be at least 1, got -2",
+        ),
+        ("Camra", "Exposure", 1, "make_reads_stale: no device 'Camra' is loaded"),
+        ("Core", "Camera", 1, "make_reads_stale: no device 'Core' is loaded"),
+        (
+            "Camera",
+            "Exposur",
+            1,
+            "make_reads_stale: device 'Camera' has no property 'Exposur'",
+        ),
+        (
+            "Camera",
+            "CameraName",
+            1,
+            "make_reads_stale: 'Camera' 'CameraName' is read-only, so a write never "
+            "changes it and it is never stale",
+        ),
+    ]
+    for device, prop, reads, message in refusals:
+        with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
+            core.make_reads_stale(device, prop, reads=reads)
+    # None of the refusals registered anything.
+    core.setExposure(20.0)
+    assert core.getExposure() == 20.0
+
+
+def test_a_stale_read_of_a_failing_device_raises_its_failure() -> None:
+    core = ti2_core()
+    core.make_reads_stale("DiaLamp", "Intensity", reads=2)
+    core.setProperty("DiaLamp", "Intensity", 210)
+    boom = RuntimeError("DiaLamp: no answer")
+    core.failing["DiaLamp"] = boom
+    with pytest.raises(RuntimeError) as caught:
+        core.getProperty("DiaLamp", "Intensity")
+    assert caught.value is boom
+    core.failing.clear()
+    # The failed read was no read of the lamp: both stale reads are still owed.
+    assert _lamp_reads(core, 3) == ["501", "501", "210"]
+
+
+def _ti2_at(z_um: float) -> FakeCore:
+    core = ti2_core()
+    core.setPosition("ZDrive", z_um)
+    core.log.clear()
+    return core
+
+
+def test_move_z_on_turn_adds_the_delta_and_serves_the_escape_for_that_many_reads() -> (
+    None
+):
+    # Session 2: Z read 500.0 µm at the return of the turn, then 570.26, and
+    # settled 8.7 µm above where it was (m2 §8.9).
+    core = _ti2_at(561.52)
+    core.move_z_on_turn(FOUR, 8.70, escape_um=500.0, escape_reads=3)
+    assert core.getPosition("ZDrive") == 561.52  # nothing happens before the turn
+    core.setStateLabel("Nosepiece", FOUR)
+    assert core.getPosition("ZDrive") == 500.0
+    assert core.getPosition() == 500.0  # the focus slot's device, named or not
+    assert core.getPosition("ZDrive") == 500.0
+    assert core.getPosition("ZDrive") == pytest.approx(570.22)
+    assert core.getPosition("ZDrive") == pytest.approx(570.22)
+    # The turn is no Z move that the layer sent: only the turn is logged.
+    assert core.log == [f"setStateLabel('Nosepiece', {FOUR!r})"]
+
+
+def test_the_escape_is_served_again_by_each_turn_that_moves_z() -> None:
+    core = _ti2_at(561.52)
+    core.move_z_on_turn(FOUR, 8.70, escape_um=500.0, escape_reads=2)
+    core.move_z_on_turn(TEN, -8.70)
+    core.setStateLabel("Nosepiece", FOUR)
+    assert core.getPosition("ZDrive") == 500.0
+    core.setStateLabel("Nosepiece", TEN)  # the escape of the 4x is dropped
+    assert core.getPosition("ZDrive") == pytest.approx(561.52)
+    core.setStateLabel("Nosepiece", FOUR)
+    assert [core.getPosition("ZDrive") for _ in range(3)] == [
+        500.0,
+        500.0,
+        pytest.approx(570.22),
+    ]
+
+
+def test_a_turn_to_the_position_it_is_at_moves_no_z_and_serves_no_escape() -> None:
+    core = _ti2_at(561.52)  # the nosepiece starts at the 10x
+    core.move_z_on_turn(TEN, -8.70, escape_um=500.0, escape_reads=2)
+    core.setStateLabel("Nosepiece", TEN)
+    core.setState("Nosepiece", 1)
+    assert core.getPosition("ZDrive") == 561.52
+    # A turn to a label nobody registered moves nothing either.
+    core.setStateLabel("Nosepiece", FOUR)
+    assert core.getPosition("ZDrive") == 561.52
+
+
+def test_a_turn_moves_z_without_the_nikon_quirk_switching_the_autofocus_off() -> None:
+    # FM-12: the stand switches PFS off itself in a real turn, and the layer's
+    # own switch-off is what a test of it must see; the fake's Z move on a
+    # turn is not a setPosition.
+    core = _ti2_at(561.52)
+    core.move_z_on_turn(FOUR, 8.70)
+    core.enableContinuousFocus(True)
+    core.setStateLabel("Nosepiece", FOUR)
+    assert core.isContinuousFocusEnabled() is True
+    assert core.getPosition("ZDrive") == pytest.approx(570.22)
+    # A real Z move still trips the quirk.
+    core.setPosition("ZDrive", 561.52)
+    assert core.isContinuousFocusEnabled() is False
+
+
+def test_move_z_on_turn_takes_the_turn_of_any_state_device_and_several_labels() -> None:
+    core = _ti2_at(100.0)
+    core.move_z_on_turn("2-Ph1", 1.5)
+    core.move_z_on_turn(FOUR, 8.0)
+    core.setStateLabel("CondenserTurret", "2-Ph1")
+    assert core.getPosition("ZDrive") == 101.5
+    core.setStateLabel("Nosepiece", FOUR)
+    assert core.getPosition("ZDrive") == 109.5
+
+
+def test_move_z_on_turn_refuses_an_unknown_label_no_focus_slot_and_an_inconsistent_escape() -> (
+    None
+):
+    core = ti2_core()
+    refusals: list[tuple[str, dict[str, Any], str]] = [
+        (
+            "Nope",
+            {},
+            "move_z_on_turn: 'Nope' is no position label of a loaded State device",
+        ),
+        (
+            "Intensity",
+            {},
+            "move_z_on_turn: 'Intensity' is no position label of a loaded State device",
+        ),
+        (
+            FOUR,
+            {"escape_um": 500.0, "escape_reads": -1},
+            "move_z_on_turn: escape_reads must not be negative, got -1",
+        ),
+        (
+            FOUR,
+            {"escape_um": 500.0},
+            "move_z_on_turn: escape_um is given with escape_reads 0, which serves "
+            "none of it",
+        ),
+        (
+            FOUR,
+            {"escape_reads": 2},
+            "move_z_on_turn: escape_reads is 2 but escape_um is missing",
+        ),
+    ]
+    for label, options, message in refusals:
+        with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
+            core.move_z_on_turn(label, 8.70, **options)
+    # None of them registered anything.
+    core.setStateLabel("Nosepiece", FOUR)
+    assert core.getPosition("ZDrive") == 0.0
+    no_focus = FakeCore(
+        [FakeDevice("Nosepiece", DeviceType.State, state_labels=(TEN, FOUR))]
+    )
+    with pytest.raises(
+        ValueError,
+        match=f"^{re.escape('move_z_on_turn: no focus device is in the Focus slot')}$",
+    ):
+        no_focus.move_z_on_turn(FOUR, 8.70)
