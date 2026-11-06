@@ -300,18 +300,73 @@ def test_bf_reads_current_after_select_although_mmcore_formats_the_numbers() -> 
 
 
 def test_a_select_the_stand_does_not_follow_returns_what_it_matches(
-    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    # The match is read again until the window ends (FM-188); a lamp that never
+    # reads 210 pays it, so the window is shortened here. The WARNING stays the
+    # only line at the bound (m2 §8.11 D4).
+    monkeypatch.setattr(mm, "FRESH_READ_WINDOW_S", 0.05)
     core = ti2_core()
     # A set on a read-only property is ignored, as MMCore does.
     core._devices["DiaLamp"].properties["Intensity"].read_only = True
     with ti2(core=core) as (_, microscope):
-        with caplog.at_level(logging.WARNING):
+        with caplog.at_level(logging.INFO):
             assert microscope.require(Channels).select("BF") is None
-        assert caplog.messages == [
+        assert [
+            m for m in caplog.messages if "reads otherwise" in m or "FM-188" in m
+        ] == [
             "channels: Channel BF selected, but the stand reads otherwise: "
             "DiaLamp,Intensity reads '501' (preset: '210'); it matches no preset"
         ]
+
+
+def test_a_select_whose_lamp_reads_stale_for_a_while_still_returns_bf(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # m2 §8.11 D4: BF sets the DiaLamp's Intensity, which read its previous value
+    # for a while after a set on the Ti2-E (FM-188). Without the re-read this
+    # select would warn "the stand reads otherwise" and return None.
+    core = ti2_core()
+    core.make_reads_stale("DiaLamp", "Intensity", reads=3)
+    with ti2(core=core) as (_, microscope):
+        with caplog.at_level(logging.INFO):
+            assert microscope.require(Channels).select("BF") == "BF"
+        assert [
+            r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+        ] == []
+        assert (
+            "channels: Channel BF: a setting read its previous value right after the "
+            "select (FM-188)"
+        ) in caplog.messages
+
+
+def test_a_select_that_reads_fresh_at_once_logs_no_stale_line_and_never_sleeps(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def fail(seconds: float) -> None:
+        raise AssertionError(f"slept {seconds} s")
+
+    monkeypatch.setattr(mm.time, "sleep", fail)
+    with ti2() as (_, microscope):
+        with caplog.at_level(logging.INFO):
+            assert microscope.require(Channels).select("BF") == "BF"
+        assert [m for m in caplog.messages if "FM-188" in m] == []
+
+
+def test_a_select_in_dry_run_reads_nothing_back_and_waits_for_nothing(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def fail(seconds: float) -> None:
+        raise AssertionError(f"slept {seconds} s")
+
+    monkeypatch.setattr(mm.time, "sleep", fail)
+    core = ti2_core()
+    core.make_reads_stale("DiaLamp", "Intensity", reads=3)
+    with ti2(core=core, dry_run=True) as (_, microscope):
+        with caplog.at_level(logging.INFO):
+            assert microscope.require(Channels).select("BF") == "BF"
+        assert core.log == []
+        assert [m for m in caplog.messages if "FM-188" in m] == []
 
 
 def test_an_unknown_channel_is_refused_before_anything_is_sent() -> None:

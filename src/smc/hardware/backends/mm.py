@@ -3522,7 +3522,12 @@ class MMChannels:
         stopped. The preset is read and checked under the lock. The readback
         is ``name`` when every setting matches what the stand reads, else
         ``current()``, with a WARNING naming each setting that reads otherwise.
-        In dry-run it returns ``name`` and sends nothing.
+        The match is read again until nothing reads otherwise or
+        ``FRESH_READ_WINDOW_S`` has passed, since a setting may read its
+        previous value right after the select (m2 §8.11 D4, FM-188): a preset
+        that sets a value the stand never reads as set pays the window, then
+        the WARNING. In dry-run it returns ``name``, sends nothing and reads
+        nothing back.
 
         Raises:
             ValueError: ``name`` is not one of ``names()``; nothing was sent.
@@ -3537,10 +3542,11 @@ class MMChannels:
         self._executor.read(lambda: self._known(name))
         group, core = self._group, self._core
         description = f"channels: select {group} {name}"
-        # Filled by the step, under the lock: what the motion polls and what the
-        # readback found otherwise.
+        # Filled by the step, under the lock: what the motion polls, what the
+        # readback found otherwise, and how its re-read ended (empty in dry-run).
         devices: list[str] = []
         otherwise: list[str] = []
+        outcome: list[_Reread[list[str]]] = []
 
         def step() -> Step[str | None]:
             settings = self._settings(name)
@@ -3559,7 +3565,12 @@ class MMChannels:
             devices[:] = list(dict.fromkeys(d for d, _, _ in settings if d != "Core"))
 
             def readback() -> str | None:
-                otherwise[:] = self._mismatches(settings)
+                result = _reread(
+                    lambda: self._mismatches(settings),
+                    lambda mismatches: not mismatches,
+                )
+                outcome.append(result)
+                otherwise[:] = result.value
                 return name if not otherwise else self._current()
 
             return Step(
@@ -3578,6 +3589,13 @@ class MMChannels:
         landed = self._executor.do(
             description, step, motion=motion, timeout_s=_core_timeout(core)
         )
+        if outcome and outcome[-1].fresh and outcome[-1].waited_s > 0:
+            logger.info(
+                "channels: %s %s: a setting read its previous value right after the "
+                "select (FM-188)",
+                group,
+                name,
+            )
         if landed != name:
             logger.warning(
                 "channels: %s %s selected, but the stand reads otherwise: %s; it "
