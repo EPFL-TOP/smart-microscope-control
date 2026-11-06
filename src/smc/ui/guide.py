@@ -154,7 +154,14 @@ def replace_note(result: PlateResult, started_utc: datetime) -> str:
     the record's start in the PC's local time, to the minute, and the method and
     the count are the result's own.
     """
-    when = started_utc.astimezone().strftime("%Y-%m-%d %H:%M")
+    try:
+        when = started_utc.astimezone().strftime("%Y-%m-%d %H:%M")
+    except (OSError, OverflowError, ValueError):
+        # A start the PC cannot show in its own zone (Windows before 1970 or after
+        # year 3000; any system at year 1 or 9999 under an offset): the record's own
+        # value, as it is, not an exception that ends the page's redraw. A run
+        # document is data (FM-125) and ``view()`` raises nothing for it.
+        when = started_utc.isoformat(timespec="minutes")
     wells = "1 well" if result.n_refs == 1 else f"{result.n_refs} wells"
     return (
         f"Run replaces the plate registered {when} ({result.method}, {wells}). "

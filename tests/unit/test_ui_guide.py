@@ -9,8 +9,9 @@ from __future__ import annotations
 import json
 import shlex
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any, ClassVar
 
 import pytest
 from hypothesis import given
@@ -427,4 +428,48 @@ def test_replace_note_names_the_time_the_method_and_the_wells() -> None:
     # A method the registration names is the result's own, never a paraphrase.
     assert "(wall-images, 3 wells)" in replace_note(
         _plate_result("wall-images", 3), started
+    )
+
+
+def test_replace_note_converts_a_start_that_is_not_in_utc_to_the_pcs_time() -> None:
+    # A start with an offset that is not zero: 14:20 at +05:00 is 09:20 UTC. On a PC
+    # whose zone is UTC (a CI runner's) a note that skips the conversion says 14:20,
+    # so the test fails there, where a UTC start could not (it reads the same either
+    # way). The expected text is the PC's own conversion of this instant.
+    started = datetime(2026, 11, 3, 14, 20, tzinfo=timezone(timedelta(hours=5)))
+    assert started.astimezone(timezone.utc).strftime("%H:%M") == "09:20"
+    local = started.astimezone().strftime("%Y-%m-%d %H:%M")
+    note = replace_note(_plate_result("seed", 1), started)
+    assert note.startswith(
+        f"Run replaces the plate registered {local} (seed, 1 well). "
+    )
+
+
+class _NoLocalTime(datetime):
+    """A start whose conversion to the PC's zone fails, as the PC's C library may refuse it."""
+
+    error: ClassVar[BaseException] = OSError(22, "Invalid argument")
+
+    def astimezone(self, tz: Any = None) -> datetime:  # type: ignore[override]
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [OSError(22, "Invalid argument"), OverflowError("date value out of range")],
+    ids=["os-error", "overflow"],
+)
+def test_replace_note_shows_the_records_own_start_when_the_pc_cannot_convert_it(
+    error: BaseException,
+) -> None:
+    # Windows refuses a time before 1970 or after year 3000, and any system a year 1 or
+    # 9999 under an offset. A run document is data (FM-125): the note says the value
+    # as recorded, and nothing raises (it is called by `view()`, on every redraw).
+    _NoLocalTime.error = error
+    started = _NoLocalTime(1, 1, 1, 0, 0, tzinfo=timezone.utc)
+    note = replace_note(_plate_result("seed", 1), started)
+    assert note == (
+        "Run replaces the plate registered 0001-01-01T00:00+00:00 (seed, 1 well). "
+        "A failed run leaves no plate; the captures stay, so Forget the wrong one "
+        "and Run again to get a plate back."
     )
