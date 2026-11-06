@@ -26,6 +26,7 @@ from smc.hardware.capabilities import (
     XYStage,
     ZStage,
 )
+from smc.hardware.errors import HardwareError
 from smc.hardware.microscope import autofocus_known, describe_autofocus
 
 if TYPE_CHECKING:
@@ -53,6 +54,11 @@ __all__ = [
 #: What a switch-off says in dry run: the facade sends it all the same (design §13),
 #: and the operator must not believe the stand was left as it was.
 _OFF_IN_DRY_RUN = " (dry run: switching off is sent all the same)"
+
+#: How far Z must differ across a turn before the text says the stand moved it.
+#: Chosen: the read noise at rest is 0.04 µm and the corrections measured are
+#: 8.7 µm (Ti2-E session 2, m2 §8.11 D7).
+_Z_MOVED_UM = 0.5
 
 
 @dataclass(frozen=True, slots=True)
@@ -185,11 +191,38 @@ def _moved(
     return DriveResult(landed)
 
 
+def _read_z(zstage: ZStage) -> float | None:
+    """Z now, or ``None`` when the read fails: a turn that was sent is not undone by it.
+
+    The turret's own WARNING has the cause, and nothing here keeps the
+    exception (FM-98).
+    """
+    try:
+        return float(zstage.position_um())
+    except HardwareError:
+        return None
+
+
+def _z_clause(before: float | None, after: float | None) -> str:
+    """What the text says about Z across a turn: a move, nothing, or that it was not read."""
+    if before is None or after is None:
+        return "; Z could not be read around the turn"
+    if abs(after - before) > _Z_MOVED_UM:
+        return (
+            f"; the stand moved Z from {um_text(before)} to {um_text(after)} µm "
+            f"({after - before:+.2f} µm)"
+        )
+    return ""
+
+
 def set_objective(microscope: Microscope, label: str, *, confirm: bool) -> DriveResult:
     """Turn the turret to ``label``; the label it reads afterwards (FM-14, FM-125).
 
-    The facade checks the confirmation first, then the label, so a turn without
-    ``confirm`` reads nothing and sends nothing.
+    The facade checks the confirmation first, then the label, so a refused turn
+    sends nothing. Z is read before the turn, as a read, and again after it (the
+    turret waits until Z is still): the Ti2-E moves Z during a turn, so the text
+    says what the stand did to it (m2 §8.11 D7). A stand with no focus drive, and
+    a dry run, say nothing about Z.
 
     Raises:
         CapabilityMissingError: The stand has no objective turret.
@@ -198,17 +231,21 @@ def set_objective(microscope: Microscope, label: str, *, confirm: bool) -> Drive
         MicroscopeHaltedError: The stand is halted.
     """
     turret = microscope.require(ObjectiveTurret)
+    zstage = None if microscope.dry_run else microscope.get(ZStage)
+    before = None if zstage is None else _read_z(zstage)
     turret.select(label, confirm=confirm)
     current = turret.current()
     if microscope.dry_run:
         return DriveResult(
             f"[dry-run] would turn to {label!r}; the turret is at {current!r}"
         )
+    z_clause = "" if zstage is None else _z_clause(before, _read_z(zstage))
     if current != label:
         return DriveResult(
-            f"objective {current!r}, although {label!r} was asked", reached=False
+            f"objective {current!r}, although {label!r} was asked{z_clause}",
+            reached=False,
         )
-    return DriveResult(f"objective {current!r}")
+    return DriveResult(f"objective {current!r}{z_clause}")
 
 
 def read_autofocus(microscope: Microscope) -> AutofocusReading:

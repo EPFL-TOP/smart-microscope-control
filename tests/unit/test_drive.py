@@ -414,6 +414,113 @@ def test_a_turret_that_stops_short_of_the_label_is_not_reached(
     )
 
 
+# --- what the stand did to Z during a turn (m2 §8.11 D7, #330) --------------------
+
+
+class MovesZ(StubTurret):
+    """A turret that stops short of the label and whose turn moves Z, as the Ti2-E's does."""
+
+    def __init__(self, labels: list[str], stays_at: str, core: FakeCore) -> None:
+        super().__init__(labels, stays_at)
+        self._core = core
+
+    def select(self, label: str, *, confirm: bool = False) -> str:
+        self._core.setPosition("Z", 570.22)
+        return super().select(label, confirm=confirm)
+
+
+def test_set_objective_says_what_the_stand_did_to_z(
+    fake_microscope: Microscope, fake_core: FakeCore
+) -> None:
+    # Session 2: the 4x turn moved Z from 561.52 to 570.22 µm.
+    fake_core.setPosition("Z", 561.52)
+    fake_core.move_z_on_turn(TWENTY_X, 8.70)
+
+    result = drive.set_objective(fake_microscope, TWENTY_X, confirm=True)
+
+    assert result == DriveResult(
+        f"objective '{TWENTY_X}'; the stand moved Z from 561.52 to 570.22 µm (+8.70 µm)"
+    )
+
+
+def test_set_objective_with_a_z_change_below_the_noise_keeps_todays_text(
+    fake_microscope: Microscope, fake_core: FakeCore
+) -> None:
+    # Z at rest reads 0.04 µm apart (session 2): no move to report.
+    fake_core.setPosition("Z", 561.52)
+    fake_core.move_z_on_turn(TWENTY_X, 0.04)
+
+    result = drive.set_objective(fake_microscope, TWENTY_X, confirm=True)
+
+    assert result == DriveResult(f"objective '{TWENTY_X}'")
+
+
+def test_a_turret_that_stops_short_still_says_what_z_did(
+    fake_microscope: Microscope, fake_core: FakeCore
+) -> None:
+    fake_core.setPosition("Z", 561.52)
+    fake_microscope.override(
+        ObjectiveTurret, MovesZ([TEN_X, TWENTY_X], TEN_X, fake_core)
+    )
+
+    result = drive.set_objective(fake_microscope, TWENTY_X, confirm=True)
+
+    assert result == DriveResult(
+        f"objective '{TEN_X}', although '{TWENTY_X}' was asked; the stand moved Z "
+        f"from 561.52 to 570.22 µm (+8.70 µm)",
+        reached=False,
+    )
+
+
+def test_set_objective_says_when_z_could_not_be_read(
+    fake_microscope: Microscope, fake_core: FakeCore
+) -> None:
+    fake_core.failing["Z"] = RuntimeError("Z: no answer")
+
+    result = drive.set_objective(fake_microscope, TWENTY_X, confirm=True)
+    fake_core.failing.clear()
+
+    assert result == DriveResult(
+        f"objective '{TWENTY_X}'; Z could not be read around the turn"
+    )
+    assert fake_microscope.require(ObjectiveTurret).current() == TWENTY_X
+
+
+def test_set_objective_in_dry_run_reads_no_z_and_keeps_todays_text(
+    dry: Microscope,
+) -> None:
+    core = _fake(dry)
+    reads: list[str] = []
+    real = core.getPosition
+
+    def counted(label: str | None = None) -> float:
+        reads.append(str(label))
+        return real(label)
+
+    core.getPosition = counted  # type: ignore[method-assign]
+    result = drive.set_objective(dry, TWENTY_X, confirm=True)
+    del core.getPosition
+
+    assert result == DriveResult(
+        f"[dry-run] would turn to '{TWENTY_X}'; the turret is at '{TEN_X}'"
+    )
+    assert reads == []
+
+
+def test_set_objective_without_a_focus_drive_says_nothing_about_z() -> None:
+    core = FakeCore.demo_like()
+    core.unloadDevice("Z")
+    microscope = Microscope.from_core(cast("CMMCorePlus", core), Profile.demo())
+    try:
+        assert microscope.get(ZStage) is None
+
+        result = drive.set_objective(microscope, TWENTY_X, confirm=True)
+
+        assert result == DriveResult(f"objective '{TWENTY_X}'")
+    finally:
+        microscope.close()
+
+
 def test_an_engage_that_does_not_lock_is_not_reached(
     fake_microscope: Microscope,
 ) -> None:
@@ -500,6 +607,7 @@ def test_drive_reaches_the_stand_only_through_the_facade() -> None:
         "dataclasses",
         "typing",
         "smc.hardware.capabilities",
+        "smc.hardware.errors",
         "smc.hardware.microscope",
     }
 
