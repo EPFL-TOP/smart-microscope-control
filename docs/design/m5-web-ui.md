@@ -8,7 +8,10 @@
   #293's plan with the owner (§8, 2026-11-02); the drive's follow-ups fixed by
   #295's plan (§6.1 to §6.4, 2026-11-02: a switch-off at the end of live, the
   outcome live keeps, the captures' refusal, the readbacks from the state, the
-  objective select's sync); presets fixed by #319's plan (§10, 2026-11-03).
+  objective select's sync); presets fixed by #319's plan (§10, 2026-11-03);
+  the plate page at the stand fixed by #332's plan (§11, 2026-11-05: the captures'
+  target, why a Run is disabled, the plate the page starts with, what a Run
+  replaces, a Ctrl-C that prints one line).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 to M3, this document is the contract between issues.
   Names, module paths and signatures below are fixed; an executor who needs to
@@ -2795,3 +2798,230 @@ value), FM-36, FM-37 and FM-72 (the output and the help), FM-38 (the write, thro
 out is said, not dropped), FM-125 (the record validated again). Its new kind,
 for the checklist: *a text generated from a value that its reader reads back as
 another value*.
+
+## 11. The plate page at the stand (#332)
+
+Fixed by #332's plan (2026-11-05), from Ti2-E session 2 (#198, report #334): the
+first plate registration on the page, on a real stand, where the owner found it
+« encore très difficile à prendre en main ». Five findings, each decided here; the
+tests and the order of the work are #332's plan. Measured 2026-11-05 on the `demo`
+stand (Python 3.13.0, Panel 1.10.0, Bokeh 3.10.1, Tornado 6.6).
+
+This section owns the **captures' target**, **why a tool is disabled**, **the plate
+the page starts with** and **what a Run replaces**. It does not own the capture
+widgets' arrangement for `plate-walls` (#346) or the wall sides' frame (#327): each
+builds on the names below and changes none of them.
+
+### 11.1 Which well a capture records (finding 1)
+
+Measured on the demo with a script that clicks B3, B4, B4 again and B3 again, then
+types `C1:C2`:
+
+```text
+click B3: selection=('B3',)       current=B3
+click B4: selection=('B3', 'B4')  current=B4
+click B4: selection=('B3',)       current=B4   # a click that deselects B4
+click B3: selection=()            current=B3   # and one that deselects B3
+typed C1:C2: selection=('C1','C2') current=B3  # B3 is not even selected
+```
+
+`current` is what *Capture centre*, *Capture wall* and *Forget* act on, and nothing
+on the page showed it. The session's wall was recorded under B4 because the
+operator's last click on the map was B4's.
+
+**Decided: `current` is a well the operator can see.**
+
+- **Rule (controller).** `current` is the well the operator last *selected* by a
+  click, or *drove to* (`goto`, which sets it without selecting the well).
+  - a click that selects a well sets it; a click that deselects the well that is
+    `current` drops it (`None`), and a deselecting click on another well leaves it;
+  - a typed range or a preset's wells replace the selection: `current` stays only
+    when it is in the new selection, so a driven-to well that the new selection does
+    not hold is dropped too;
+  - `choose_plate` drops it, as now.
+
+  It is one helper, `_drop_unselected_current()`, called wherever the selection is
+  assigned (`toggle`, `select_text`, a preset's wells), so that no path forgets it.
+- **The buttons name what they record** (`smc/ui/guide.py`, pure functions, no
+  Panel):
+
+  ```python
+  def capture_centre_label(well: str | None) -> str: ...
+  def capture_wall_label(well: str | None, side: str) -> str: ...
+  def forget_label(well: str | None) -> str: ...
+  ```
+
+  `Capture centre of B3`, `Capture B3 left wall`, `Forget B3`; with no well, the
+  plain `Capture centre`, `Capture wall`, `Forget`, and the three buttons are
+  disabled. The side is the *Wall* select's value as it stands: #327 changes what
+  the select offers, and the label follows its value.
+- **The well on the label is the well recorded** (FM-177). `PlatePageView` keeps
+  `_capture_well`, the well the buttons were last drawn for. A capture or a forget
+  whose `page.current` is not `_capture_well` records **nothing** and says `the
+  well to record changed from B3 to B4: check the button, then press it again`
+  (`none` for a `current` that was dropped); the view then redraws. When the
+  buttons were drawn with no well, the text is `click a well on the map first`.
+  Acting on the label would record B3's walls at a position the operator took for
+  B4's; acting on the controller's state would do what the label did not say.
+  Neither is safe, so the click asks again.
+- **The *Wall* select redraws the label at once**, not at the next tick.
+- A disabled button is a courtesy, not a guard (FM-169): `capture_wall` refuses a
+  `None` well in the controller's own terms, as it refuses a well off the plate.
+
+### 11.2 Why a tool's Run is disabled (finding 2)
+
+`_draw_buttons` disables every Run while an activity goes, and the note under a tool
+read `_blocked` only (a missing input, a closed stand). While Live runs the strip
+says `live is running`, three regions away.
+
+**Decided: it stays refused, and says why beside the button.** Not decided for
+`plate-registration`: it requires and reads nothing (`requires = ()`,
+`reads = ()`), and touches no device, so it could run during Live. Against it:
+
+- one activity at a time is the page's rule (§2.1), and a pure tool goes through the
+  same worker, the same `_current_run` and the same record write as `scan`; a
+  second slot is a change of §2.1 and of STOP, `close()` and `join()` with them
+  (FM-70), for three clicks saved;
+- §5.2 decided that Live is not ended for another action, for the reasons it gives.
+
+```python
+def busy_note(running: str, *, live: bool) -> str: ...
+```
+
+in `guide.py`: `live` gives `Live is running: press End live, then run the tool.`
+(the button's own label, `_END_LIVE_LABEL`); any other activity gives `<running> is
+running: wait for it to end, or press STOP.` `_draw_buttons` puts it in each tool's
+note and in the next step's note when the tool has no `blocked` reason of its own
+(the stand closed, a missing input): that reason holds longer than the activity.
+
+### 11.3 The plate the page starts with (finding 3)
+
+`_initial_plate` took the plate of the `plate-registration` record, else of the usable
+`plate` slot, else `96-well`. The last answer was silent: on a 24-well plate, wells
+captured on a 96-well map and registered with `plate=96-well` put A1 two pitches
+wrong, a seed has no residual, and nothing says so. And it ignored `plate-walls`
+(#328), a second producer of `plate`: a run document holding an older
+`plate-registration` and a newer `plate-walls` opened on the older plate (#346's
+note on PR #351).
+
+**Decided: carried over when anything knows, asked when nothing does.** The sources,
+in order:
+
+1. the plate of `doc.provider("plate")`: the record of the latest start, whatever its
+   status, as the slot is defined (`RunDocument.provider`); its `params["plate"]`;
+2. the profile's `[sample].plate`, when the profile has a `[sample]` (the stand knows
+   what its camera images);
+3. the placeholder `96-well`, which the page **names**.
+
+`PlatePage.plate_chosen: bool` is `True` for 1 and 2, and after `choose_plate(name)`
+for any known name, **including the one already shown** (the early return for the
+same name only skips the reset). Where `_restore` takes the captures from, it follows
+the same record: the latest provider of `plate` when it is `plate-registration`
+(`refs` and `walls`) or `plate-walls` (`refs`), else none.
+
+While `plate_chosen` is `False`:
+
+- a note under the *Plate* select says `Which plate is on the stage? 96-well is only a
+  placeholder: choose the plate, or press the button if it is a 96-well.`, and a
+  button `The plate is a 96-well` (the placeholder's name) confirms it;
+- **a tool whose `PAGE_PARAMS` include `plate` does not run**: `PLATE_NOT_CHOSEN =
+  "choose the plate on the stage first: the page shows a 96-well placeholder"`
+  (`guide.py`) is its `blocked` reason, ahead of every reason but the stand's being
+  closed, it is the next step's `stuck`, and `run()` refuses it in the controller as
+  the outcome `<plugin>: choose the plate on the stage first ...` before anything is
+  read (FM-169). The pairs the next step carries are then empty, as when the step is
+  stuck on `CAPTURE_WELLS`: the plugin's own default (`plate=96-well`) must never be
+  what a click runs;
+- captures stay allowed: a capture is a stage read, and `choose_plate` dropping them
+  is the operator's own act, shown on the page.
+
+`CAPTURE_WELLS` is unchanged: the step shows it once the plate is chosen, and
+`PLATE_NOT_CHOSEN` before.
+
+*Decided against:* a plate in the stand's profile. A profile is an instrument's, and
+the plate changes between experiments; what a real stand suggests is the owner's call
+after a session there (§8.1).
+
+### 11.4 What a Run replaces (finding 4)
+
+`RunDocument.provider` lets the latest attempt decide even when it failed: a re-run of
+plate registration that fails leaves no plate, rather than the older one silently. The
+page did not say it before the click, and after the click the seed that had just been
+usable was gone from the document.
+
+**Decided: say it before, and do not refuse.** FM-172 refuses a click that discards
+work *no command can bring back*; a registration is a pure function of its parameters,
+which are the captures, and the page keeps its captures across a failed run (and
+`_restore` reads them back from the failed record after a restart). So the plate is
+had again by the same command, minus the capture that was wrong, and the page says so:
+
+```python
+def replace_note(result: PlateResult, started_utc: datetime) -> str: ...
+```
+
+in `guide.py`: `Run replaces the plate registered 2026-11-03 15:20 (seed, 1 well). A
+failed run leaves no plate; the captures stay, so Forget the wrong one and Run again
+to get a plate back.` The time is the record's `started_utc` in the PC's local time,
+to the minute; the method and `n_refs` are the result's own (`seed`, `references`,
+`lattice-fit`, `wall-images`); `1 well` and `2 wells`.
+
+`PlateView.replaces: Mapping[str, str]` (new, default empty): a tool's name to the
+note, for each tool whose plugin `provides` the `plate` slot, when that slot is
+usable now (`_slot` returns a result). The page appends it below the tool's own
+note. It is **not** drawn for the other slots: a card already says the last result,
+and a note under every tool teaches the operator to read none of them.
+
+### 11.5 A Ctrl-C that prints one line (finding 5)
+
+Reproduced off Windows, with the page's own server call (`pn.serve(..., threaded=True)`)
+and one open session (`bokeh.client.pull_session`), stopped as `serve()` stops it:
+
+```text
+ERROR:tornado.application:Uncaught exception GET /ws (::1)
+...
+  File ".../bokeh/server/views/ws.py", line 322, in on_close
+    self.connection.session.notify_connection_lost()
+  File ".../bokeh/server/connection.py", line 64, in session
+    assert self._session is not None
+AssertionError
+```
+
+The line numbers are the owner's report's. With no session open the stop is silent
+(0.00 s). Cause: a stop discards the sessions and detaches each connection from its
+session (`_session = None`) before the socket's own close reaches `on_close`, which
+then reads `connection.session`. It is Bokeh's order of work, not a race with a
+connection being opened, and every Ctrl-C with the page open in a browser, which is
+every Ctrl-C of a session, hits it.
+
+**Decided: `serve()` drops that one record while it stops the server.** A
+`logging.Filter` on `tornado.application`, attached around `_stop_server(thread)` and
+removed in a `finally`: it drops a record whose message starts with `Uncaught
+exception GET /ws` and whose `exc_info` holds an `AssertionError`, counts it, and
+every other record passes. The count is one `log.info` line of the page's own logger
+(`smc.ui`, not the console): `the server's stop closed N open sessions`. Measured: with
+the filter the stop took 0.00 s and dropped exactly one `AssertionError`; without it
+the traceback printed. *Decided against:* patching `ServerConnection.session` (a
+vendor's class, and a version's) and closing the sockets first (private API).
+
+### 11.6 What this does not do
+
+- It does not add the *plate-walls* button or its card (#346); `PAGE_PARAMS["plate-walls"]`
+  there gets §11.3's gate for free by naming `plate` in it.
+- It does not change what a wall side means (#327). The *Capture wall* control stays
+  under `plate-registration`, with the manual form of the command line.
+- It does not let a tool run while Live goes, and does not ask for a plate on a stand
+  whose run document or `[sample]` names one.
+
+### 11.7 Tests and failure modes
+
+FM-169 (every refusal is the controller's), FM-172 (a replaced result: decided, with
+the reason), FM-177 (the label a capture acts on), FM-143, FM-149 and FM-83 (the stop
+path), FM-151 (a view that draws what the shared controller holds: `current` is
+shared by every tab), FM-161 (the Ctrl-C test goes through a real server and a real
+session, with `interrupt_main`), FM-98 and FM-139 (text, never the error; plain text,
+never markup). The new kind, for the checklist: *a record that bounds what a vendor
+logs at shutdown by its message alone*, which hides a different failure with the same
+words: the filter checks the exception's class too, and only while the server stops.
+
+**Not verified (for the owner)**: the Ctrl-C of `smc ui` at the Ti2-E's PC, with the
+page open (Python 3.14, Windows 11); the page walked by a newcomer on a real stand.
