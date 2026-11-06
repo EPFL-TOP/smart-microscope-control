@@ -27,13 +27,14 @@ keeps, each learned by measuring (m3 §15.3, #277):
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import logging
 import math
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import numpy as np
@@ -1955,10 +1956,17 @@ def serve(page: PlatePage, *, port: int) -> None:
                 # that takes 6 s), and the stop of a scan must not wait behind it.
                 page.close()
         finally:
-            if thread.is_alive() and not _stop_server(thread):
-                _say(
-                    f"the plate page's server did not stop within {SERVER_STOP_WAIT_S:.0f} s"
-                )
+            if thread.is_alive():
+                with _quiet_session_close() as closing:
+                    stopped = _stop_server(thread)
+                if closing.dropped:
+                    log.info(
+                        "the server's stop closed %d open sessions", closing.dropped
+                    )
+                if not stopped:
+                    _say(
+                        f"the plate page's server did not stop within {SERVER_STOP_WAIT_S:.0f} s"
+                    )
     finally:
         bokeh_log.setLevel(level)
     if interrupted:
@@ -1966,6 +1974,49 @@ def serve(page: PlatePage, *, port: int) -> None:
     raise PageServerError(
         f"the plate page's server stopped on its own (is port {port} taken?)"
     )
+
+
+class _ServerStopFilter(logging.Filter):
+    """Drops the one record Bokeh's server logs when it closes an open session, and counts it (m5 §11.5).
+
+    A stop of the server discards its sessions and detaches each connection from its
+    session before the socket's own close reaches ``on_close``, which then reads
+    ``connection.session``: an ``AssertionError`` that Tornado logs as ``Uncaught
+    exception GET /ws`` on every Ctrl-C with the page open in a browser, which is
+    every Ctrl-C of a session. It is Bokeh's order of work, harmless at that point,
+    and a traceback in front of the operator who just stopped the page on purpose.
+
+    The message alone would hide a different failure with the same words, so the
+    exception's class is checked too, and the filter is attached only while the
+    server stops (``_quiet_session_close``). It does not patch Bokeh and closes no
+    socket: both are a vendor's private API and a version's.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        #: How many records it dropped: the sessions the stop closed.
+        self.dropped = 0
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        error = None if record.exc_info is None else record.exc_info[1]
+        if isinstance(error, AssertionError) and record.getMessage().startswith(
+            "Uncaught exception GET /ws"
+        ):
+            self.dropped += 1
+            return False
+        return True
+
+
+@contextlib.contextmanager
+def _quiet_session_close() -> Iterator[_ServerStopFilter]:
+    """``_ServerStopFilter`` on Tornado's application logger for the length of the block, removed after."""
+    closing = _ServerStopFilter()
+    logger = logging.getLogger("tornado.application")
+    logger.addFilter(closing)
+    try:
+        yield closing
+    finally:
+        logger.removeFilter(closing)
 
 
 def _stop_server(thread: Any) -> bool:
