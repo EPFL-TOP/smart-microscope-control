@@ -41,10 +41,19 @@ import pytest
 import tifffile
 import typer
 from pymmcore_plus import CMMCorePlus
+from test_mm_channels import ti2_core, ti2_profile
 
 import smc.cli as cli
+from smc import drive
 from smc.hardware import Microscope
-from smc.hardware.capabilities import Autofocus, Camera, XYStage, ZStage
+from smc.hardware.capabilities import (
+    Autofocus,
+    Camera,
+    LightSource,
+    ObjectiveTurret,
+    XYStage,
+    ZStage,
+)
 from smc.hardware.errors import (
     HardwareError,
     SafetyRefusedError,
@@ -993,6 +1002,116 @@ def test_a_second_ctrl_c_in_the_emergency_stop_frees_the_core(
     microscope = Microscope.from_core(cast("CMMCorePlus", core), Profile.demo())
     assert _outcome(microscope.stop) == ("KeyboardInterrupt", "second Ctrl-C")
     assert "stop('Z')" in core.log  # the Z stop was sent after the interrupted XY one
+    watched = _watch(microscope, core)
+    del microscope, core
+    assert _alive(watched) == _FACADE_AND_CORE_FREED
+
+
+# --- a turn and a re-read whose read fails (m2 §8.11, #330) ----------------------
+
+_TWENTY_X = "Nikon 20X Plan Fluor ELWD"
+
+
+def _turn_whose_z_fails_at(
+    core: FakeCore, microscope: Microscope, fails_at: int
+) -> tuple[str, str]:
+    """A turn whose ``getPosition`` raises a fresh error from its ``fails_at``-th call (FM-98).
+
+    In a function of its own: the bound method it keeps (``original``) is
+    gone once it returns, which a test body's local would not be.
+    """
+    turret = microscope.require(ObjectiveTurret)
+    original, calls = core.getPosition, list[int]()
+
+    def position(label: str | None = None) -> float:
+        calls.append(0)
+        if len(calls) >= fails_at:
+            raise RuntimeError("Z: no answer")  # fresh: not `failing` (FM-98)
+        return original(label)
+
+    core.getPosition = position  # type: ignore[method-assign]
+    try:
+        return _outcome(lambda: turret.select(_TWENTY_X, confirm=True))
+    finally:
+        del core.getPosition
+
+
+@pytest.mark.parametrize("fails_at", [1, 3], ids=["before-the-turn", "in-the-settle"])
+def test_a_turn_whose_z_cannot_be_read_frees_the_core(
+    no_cyclic_gc: None, fails_at: int
+) -> None:
+    # D2: a Z read that fails is a line, never an exception held where its own
+    # traceback reaches it (FM-98), and the turret reaches the focus drive through
+    # the facade's weak reference (FM-92). The turn itself is not failed by it.
+    core, microscope = _stand()
+    assert _turn_whose_z_fails_at(core, microscope, fails_at) == ("", "")
+    assert core.getStateLabel("Objective") == _TWENTY_X
+    watched = _watch(microscope, core)
+    del microscope, core
+    assert _alive(watched) == _FACADE_AND_CORE_FREED
+
+
+def _light_re_read_that_raises(
+    core: FakeCore, microscope: Microscope
+) -> tuple[str, str]:
+    """A lamp that reads stale once, whose second read raises a fresh error (FM-98)."""
+    light = microscope.require(LightSource)
+    assert light.intensity_knob() is not None  # the knob is resolved before the hook
+    original, calls = core.getProperty, list[int]()
+
+    def read(label: str, name: str) -> str:
+        calls.append(0)
+        if len(calls) == 2:
+            raise RuntimeError("DiaLamp: no answer")  # fresh: not `failing`
+        return original(label, name)
+
+    core.getProperty = read  # type: ignore[method-assign]
+    try:
+        return _outcome(lambda: light.set_intensity_native(210.0))
+    finally:
+        del core.getProperty
+
+
+def test_a_light_re_read_that_raises_frees_the_core(no_cyclic_gc: None) -> None:
+    # D1: the second read of the re-read fails inside the readback, under the lock.
+    core = ti2_core()
+    core.make_reads_stale("DiaLamp", "Intensity", reads=3)
+    microscope = Microscope.from_core(cast("CMMCorePlus", core), ti2_profile())
+    assert _light_re_read_that_raises(core, microscope) == (
+        "HardwareError",
+        "light_source: getProperty('DiaLamp', 'Intensity') failed (DiaLamp: no "
+        "answer); check the device: power, cable, another program holding it",
+    )
+    watched = _watch(microscope, core)
+    del microscope, core
+    assert _alive(watched) == _FACADE_AND_CORE_FREED
+
+
+def _drive_a_turn_whose_z_fails(core: FakeCore, microscope: Microscope) -> str:
+    """``drive.set_objective`` over a ``getPosition`` that raises a fresh error each call.
+
+    The hook is removed with ``del`` before the function returns (FM-92).
+    """
+
+    def position(label: str | None = None) -> float:
+        raise RuntimeError("Z: no answer")  # fresh: not `failing` (FM-98)
+
+    core.getPosition = position  # type: ignore[method-assign]
+    try:
+        return drive.set_objective(microscope, _TWENTY_X, confirm=True).text
+    finally:
+        del core.getPosition
+
+
+def test_a_drive_turn_whose_z_cannot_be_read_frees_the_core(
+    no_cyclic_gc: None,
+) -> None:
+    # `drive._read_z` swallows a HardwareError without keeping it (FM-98): a name
+    # bound to it would be a cycle through the frame, and the core would stay alive.
+    core, microscope = _stand()
+    assert _drive_a_turn_whose_z_fails(core, microscope) == (
+        f"objective '{_TWENTY_X}'; Z could not be read around the turn"
+    )
     watched = _watch(microscope, core)
     del microscope, core
     assert _alive(watched) == _FACADE_AND_CORE_FREED

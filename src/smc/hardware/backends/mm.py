@@ -56,7 +56,16 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager, suppress
 from dataclasses import dataclass
 from types import MappingProxyType, TracebackType
-from typing import TYPE_CHECKING, Any, Literal, NoReturn, Protocol, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Generic,
+    Literal,
+    NoReturn,
+    Protocol,
+    TypeVar,
+    cast,
+)
 
 from smc.hardware.capabilities import (
     XY,
@@ -96,8 +105,11 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DEFAULT_LOCK_TIMEOUT_S",
+    "FRESH_READ_WINDOW_S",
     "INTENSITY_HINTS",
     "MAX_LOCK_TIMEOUT_S",
+    "TURN_Z_SETTLE_S",
+    "TURN_Z_STILL_UM",
     "Z_STOP_OUTCOME_WAIT_S",
     "MMAutofocus",
     "MMCamera",
@@ -243,6 +255,68 @@ def autofocus_offset_motion(
 def _core_timeout(core: CMMCorePlus) -> Callable[[], float]:
     """The core timeout in seconds, resolved inside the action (design §2, §13)."""
     return lambda: core.getTimeoutMs() / 1000.0
+
+
+#: How long a readback that is not what was set is read again before it is
+#: believed (m2 §8.11 D1). Assumed: the Ti2-E's DiaLamp read the previous
+#: value 9 ms after a set and the new one 0.3 s after, and nothing longer
+#: was measured. The visit that measures the lag may set another value.
+FRESH_READ_WINDOW_S = 1.0
+
+T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class _Reread(Generic[T]):
+    """What ``_reread`` found: the last read, whether it was fresh, how long it took."""
+
+    value: T
+    fresh: bool
+    waited_s: float
+
+
+def _reread(read: Callable[[], T], is_fresh: Callable[[T], bool]) -> _Reread[T]:
+    """Read until ``is_fresh`` accepts a read, or ``FRESH_READ_WINDOW_S`` has passed (FM-188).
+
+    A device may answer a read right after a set with the value it held
+    before (the Ti2-E's DiaLamp did, 9 ms after a set), so a readback that
+    stands for what the device now holds is read again, every
+    ``POLL_INTERVAL_S``, before it is believed. A read that is fresh at once
+    costs one read and no sleep. At the end of the window the last read is
+    returned with ``fresh`` false, never the first. The window is read at the
+    call, so that a test can shorten it, and a read that raises propagates.
+    It logs nothing: its callers do, so that a caller that already warns at
+    the bound does not warn twice.
+    """
+    window_s = FRESH_READ_WINDOW_S
+    started = time.monotonic()
+    value = read()
+    if is_fresh(value):
+        return _Reread(value, True, 0.0)
+    while True:
+        waited_s = time.monotonic() - started
+        if waited_s >= window_s:
+            return _Reread(value, False, waited_s)
+        time.sleep(POLL_INTERVAL_S)
+        value = read()
+        if is_fresh(value):
+            # At least the sleep that came before this read: on Windows below
+            # Python 3.13 ``time.monotonic()`` ticks every 15.6 ms, so two
+            # reads 10 ms apart can measure 0.0, and a caller that tells a read
+            # that waited (INFO) from one that did not would lose the line.
+            return _Reread(
+                value, True, max(time.monotonic() - started, POLL_INTERVAL_S)
+            )
+
+
+def _reads_as_set(value: float, read: float) -> bool:
+    """Whether ``read`` is ``value`` as a device may format it back (m2 §8.11 D1).
+
+    The demo reads four decimals (``'50.0000'``) and MMCore writes a double
+    with six, so a readback needs a tolerance of that order: the absolute one
+    covers small values, where a relative one is nothing.
+    """
+    return math.isclose(read, value, rel_tol=1e-6, abs_tol=1e-4)
 
 
 class MMXYStage:
@@ -2794,6 +2868,21 @@ class MMShutter:
         )
 
 
+#: How long Z must have been still before a turn is reported (m2 §8.11 D2).
+#: Assumed: Z was at its place 0.02 s after a turn returned (session 2, reads
+#: 10-50 ms apart); the stand returned Z after the call did. Read at the call.
+TURN_Z_SETTLE_S = 0.1
+#: How far two Z reads may differ and count as still. Chosen: Z read 561.48
+#: then 561.44 µm at rest (session 2). Read at the call.
+TURN_Z_STILL_UM = 0.5
+
+
+def _um(value: float) -> str:
+    """Two decimals; a drive that reads ``-0.0`` at the origin shows ``0.00``."""
+    text = f"{value:.2f}"
+    return "0.00" if text == "-0.00" else text
+
+
 class MMObjectiveTurret:
     """``ObjectiveTurret`` over the ``objective_turret`` role's State device (m2 §8.3).
 
@@ -2808,6 +2897,15 @@ class MMObjectiveTurret:
       the lock, and the new objective's offset differs, so engaging it again
       could drive Z anywhere. The autofocus is looked up through the facade at
       each turn (FM-92), never stored.
+    * **A turn moves Z on the Ti2-E, and the call returns before Z is where it
+      goes** (m2 §8.9, §8.11 D2; session 2, #330). Z read 561.5 µm before a
+      turn and 500.0 µm when it returned, then 570.22 µm. The turn reads Z
+      before it and, once still, after it, and logs what the stand did; the
+      layer corrects nothing. The focus drive is looked up through the facade
+      at each turn, as the autofocus is, and both lookups come before the
+      switch-off, so a facade that is gone raises with nothing sent.
+    * **Re-read until fresh** (m2 §8.11 D3, FM-188): the label read back is
+      read again until it is the label asked for, within a bound.
     * **A turret cannot be stopped** (a ``State`` device): one still busy at
       the deadline stays registered as moving until it reads idle or
       ``resume()`` is called.
@@ -2822,6 +2920,7 @@ class MMObjectiveTurret:
         requires_confirm: bool,
         pixel_sizes_um: Mapping[str, float],
         autofocus: Callable[[], Autofocus | None] = lambda: None,
+        z_stage: Callable[[], ZStage | None] = lambda: None,
     ) -> None:
         self._core = as_hardware_errors(core, Role.objective_turret.value)
         self._label = label
@@ -2829,6 +2928,7 @@ class MMObjectiveTurret:
         self._requires_confirm = requires_confirm
         self._pixel_sizes_um = pixel_sizes_um
         self._autofocus = autofocus
+        self._z_stage = z_stage
         self._motion = _motion(
             self._core, label, f"objective_turret {label}", stoppable=False
         )
@@ -2892,25 +2992,175 @@ class MMObjectiveTurret:
         )
 
     def _turn(self, description: str, label: str) -> str:
-        """The compound: nothing if already there, else the switch-off, then the turn."""
+        """The compound: nothing if already there, else the switch-off, then the turn.
+
+        The autofocus and the focus drive are both looked up first, so that a
+        facade that is gone raises before anything is switched off or sent
+        (FM-92). Then the switch-off, then, for a turn that is sent and a
+        stand with a focus drive, Z before it; the turn; and the wait until Z
+        is still (m2 §8.11 D2), which comes even when Z could not be read
+        before the turn. The label read back is read again until it is
+        ``label``, within ``FRESH_READ_WINDOW_S`` (D3): whether
+        ``getStateLabel`` reads the new label at the return of a turn is not
+        verified. A turret that stays where it was costs the window, and the
+        result is the label it reads, so a caller says ``although`` as before
+        (FM-155). A turn that raises logs nothing about Z and does not wait
+        for it.
+        """
         if self._read_current() == label:
             logger.info("objective_turret: already at %s", label)
             return label
         autofocus = self._autofocus()
+        zstage = self._z_stage()
         if autofocus is not None and not self._executor.dry_run:
             self._switch_off_first(autofocus, label)
+        # Nothing turns in dry-run, so Z is not read around it.
+        watched = None if self._executor.dry_run else zstage
+        z_before = None if watched is None else self._z_read(watched)
         core, turret = self._core, self._label
-        return self._executor.do(
+        # Filled by the readback, under the lock: how the re-read of the label
+        # ended and every read it made. Empty in dry-run, which reads nothing.
+        outcome: list[_Reread[str]] = []
+        reads: list[str] = []
+
+        def read() -> str:
+            reads.append(self._read_current())
+            return reads[-1]
+
+        def readback() -> str:
+            outcome.append(_reread(read, lambda seen: seen == label))
+            return outcome[0].value
+
+        landed = self._executor.do(
             description,
             Step(
                 log=description,
                 send=lambda: core.setStateLabel(turret, label),
-                readback=self._read_current,
+                readback=readback,
                 dry_result=label,
             ),
             motion=self._motion,
             timeout_s=_core_timeout(core),
         )
+        if outcome and not outcome[0].fresh:
+            logger.warning(
+                "objective_turret %r: reads %r after %g s, although %r was set; the "
+                "read may predate the turn, or the turret did not turn",
+                turret,
+                landed,
+                FRESH_READ_WINDOW_S,
+                label,
+            )
+        elif outcome and outcome[0].waited_s > 0:
+            logger.info(
+                "objective_turret %r: read %r right after the turn, then %r: a read "
+                "right after a set may be the previous value (FM-188)",
+                turret,
+                reads[0],
+                landed,
+            )
+        if watched is not None:
+            self._report_z(watched, label, z_before, turned=landed == label)
+        return landed
+
+    def _z_read(self, zstage: ZStage, *, say: bool = True) -> float | None:
+        """Z now, or ``None`` (after a WARNING unless ``say`` is false): a read that informs a report fails no turn.
+
+        The turn was sent, so a Z that cannot be read turns a done turn into
+        an error for nobody's benefit. The cause goes into the line inside the
+        ``except``, and nothing keeps the exception (FM-98).
+        """
+        try:
+            return float(zstage.position_um())
+        except Exception as exc:
+            if say:
+                logger.warning(
+                    "objective_turret: Z could not be read around the turn (%s); the "
+                    "stand moves Z during a turn (m2 §8.9)",
+                    _named(exc),
+                )
+            return None
+
+    def _report_z(
+        self, zstage: ZStage, label: str, z_before: float | None, *, turned: bool
+    ) -> None:
+        """Wait until Z is still after the turn, then say what the stand did to it.
+
+        The wait comes whether or not Z could be read before the turn: it is
+        for the next action, which must not start while the stand moves Z. A
+        read that failed before the turn has said so (``z_before`` is
+        ``None``), so a failure after it is not said again, and there is then
+        no line about what the stand did. Nor is there one when the label read
+        back is not the label asked for: the WARNING of the re-read has said
+        that, and "turned to" would contradict it (FM-155).
+        """
+        z_after = self._settle_z(zstage, say_unreadable=z_before is not None)
+        if z_before is None or z_after is None or not turned:
+            return
+        if abs(z_after - z_before) > TURN_Z_STILL_UM:
+            logger.info(
+                "objective_turret: turned to %r; the stand moved Z from %s µm to %s µm "
+                "(%+.2f µm)",
+                label,
+                _um(z_before),
+                _um(z_after),
+                z_after - z_before,
+            )
+        else:
+            logger.info(
+                "objective_turret: turned to %r; Z is %s µm, as before",
+                label,
+                _um(z_before),
+            )
+
+    def _settle_z(self, zstage: ZStage, *, say_unreadable: bool = True) -> float | None:
+        """Read Z every ``POLL_INTERVAL_S`` until it has been still for ``TURN_Z_SETTLE_S``.
+
+        The call of a turn returned while Z read 500.0 µm and came back to its
+        place within 0.02 s (m2 §8.9): one read at the return would report the
+        stand's escape position as the result, and the next action would start
+        while the stand still moves Z. Still means every read of a stretch
+        lies within ``TURN_Z_STILL_UM`` of the stretch's first; a read outside
+        it starts a new stretch there. The two constants are read at the call.
+
+        Returns the last read once settled, else ``None`` after a WARNING:
+        the core timeout passed first (the bound, so that a Z that never stops
+        cannot hold the lock for ever; the turn still returns its label), the
+        stand was halted, or a read failed (said once: not when
+        ``say_unreadable`` is false, because the read before the turn said it).
+        The wait holds the microscope lock, so another action waits behind it;
+        reads, STOP and the safe calls go through (FM-16).
+        """
+        settle_s, still_um = TURN_Z_SETTLE_S, TURN_Z_STILL_UM
+        bound_s = _core_timeout(self._core)()
+        deadline = time.monotonic() + bound_s
+        z = self._z_read(zstage, say=say_unreadable)
+        if z is None:
+            return None
+        anchor_z = z
+        anchor_t = now = time.monotonic()
+        while now - anchor_t < settle_s:
+            if self._executor.halted:
+                logger.warning(
+                    "objective_turret: Z was not waited for: the stand was halted"
+                )
+                return None
+            if now >= deadline:
+                logger.warning(
+                    "objective_turret: Z was still changing %g s after the turn (%s µm "
+                    "at the last read); the stand may still be moving it",
+                    bound_s,
+                    _um(z),
+                )
+                return None
+            time.sleep(POLL_INTERVAL_S)
+            z = self._z_read(zstage, say=say_unreadable)
+            if z is None:
+                return None
+            now = time.monotonic()
+            if abs(z - anchor_z) > still_um:
+                anchor_z, anchor_t = z, now
+        return z
 
     def _switch_off_first(self, autofocus: Autofocus, label: str) -> None:
         """Switch ``autofocus`` off if it is engaged, or if that cannot be read (FM-19)."""
@@ -3127,6 +3377,13 @@ class MMLightSource:
     def set_intensity_native(self, value: float) -> float:
         """Set the knob to ``value``, in its own units; return the readback.
 
+        The readback is read again until it is ``value`` (to the tolerance of
+        a device's own formatting) or ``FRESH_READ_WINDOW_S`` has passed,
+        since the Ti2-E's ``DiaLamp`` read its previous value 9 ms after a set
+        (m2 §8.11 D1, FM-188). What is returned is the last read, as before: a
+        caller that compares it with what it sent sees the doubt, and a WARNING
+        says it. In dry-run nothing is read back.
+
         Raises, before anything is sent:
             HardwareError: The device has no knob that smc knows.
             ValueError: ``value`` is not finite, or lies outside the knob's
@@ -3155,15 +3412,49 @@ class MMLightSource:
                     f"limits [{low:g}, {high:g}]; it is never clamped"
                 )
         description = f"light_source: intensity {value}"
-        return self._executor.do(
+        # Filled by the readback, under the lock: what the re-read found, and
+        # every read it made. Empty in dry-run, which reads nothing back.
+        outcome: list[_Reread[float]] = []
+        reads: list[float] = []
+
+        def read() -> float:
+            reads.append(self._read_intensity(knob))
+            return reads[-1]
+
+        def readback() -> float:
+            outcome.append(_reread(read, lambda seen: _reads_as_set(value, seen)))
+            return outcome[0].value
+
+        landed = self._executor.do(
             description,
             Step(
                 log=description,
                 send=lambda: core.setProperty(label, knob, value),
-                readback=lambda: self._read_intensity(knob),
+                readback=readback,
                 dry_result=value,
             ),
         )
+        if outcome and not outcome[0].fresh:
+            logger.warning(
+                "light_source %r: %s still reads %g after %g s, although %g was "
+                "set; the read may predate the set, or the device did not take it",
+                label,
+                knob,
+                landed,
+                FRESH_READ_WINDOW_S,
+                value,
+            )
+        elif outcome and outcome[0].waited_s > 0:
+            logger.info(
+                "light_source %r: %s read %g right after the set of %g, then %g: a "
+                "read right after a set may be the previous value (FM-188)",
+                label,
+                knob,
+                reads[0],
+                value,
+                landed,
+            )
+        return landed
 
     # --- on and off -----------------------------------------------------------
 
@@ -3416,7 +3707,12 @@ class MMChannels:
         stopped. The preset is read and checked under the lock. The readback
         is ``name`` when every setting matches what the stand reads, else
         ``current()``, with a WARNING naming each setting that reads otherwise.
-        In dry-run it returns ``name`` and sends nothing.
+        The match is read again until nothing reads otherwise or
+        ``FRESH_READ_WINDOW_S`` has passed, since a setting may read its
+        previous value right after the select (m2 §8.11 D4, FM-188): a preset
+        that sets a value the stand never reads as set pays the window, then
+        the WARNING. In dry-run it returns ``name``, sends nothing and reads
+        nothing back.
 
         Raises:
             ValueError: ``name`` is not one of ``names()``; nothing was sent.
@@ -3431,10 +3727,11 @@ class MMChannels:
         self._executor.read(lambda: self._known(name))
         group, core = self._group, self._core
         description = f"channels: select {group} {name}"
-        # Filled by the step, under the lock: what the motion polls and what the
-        # readback found otherwise.
+        # Filled by the step, under the lock: what the motion polls, what the
+        # readback found otherwise, and how its re-read ended (empty in dry-run).
         devices: list[str] = []
         otherwise: list[str] = []
+        outcome: list[_Reread[list[str]]] = []
 
         def step() -> Step[str | None]:
             settings = self._settings(name)
@@ -3453,7 +3750,12 @@ class MMChannels:
             devices[:] = list(dict.fromkeys(d for d, _, _ in settings if d != "Core"))
 
             def readback() -> str | None:
-                otherwise[:] = self._mismatches(settings)
+                result = _reread(
+                    lambda: self._mismatches(settings),
+                    lambda mismatches: not mismatches,
+                )
+                outcome.append(result)
+                otherwise[:] = result.value
                 return name if not otherwise else self._current()
 
             return Step(
@@ -3472,6 +3774,13 @@ class MMChannels:
         landed = self._executor.do(
             description, step, motion=motion, timeout_s=_core_timeout(core)
         )
+        if outcome and outcome[-1].fresh and outcome[-1].waited_s > 0:
+            logger.info(
+                "channels: %s %s: a setting read its previous value right after the "
+                "select (FM-188)",
+                group,
+                name,
+            )
         if landed != name:
             logger.warning(
                 "channels: %s %s selected, but the stand reads otherwise: %s; it "

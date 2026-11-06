@@ -40,6 +40,16 @@ pymmcore 12.5.0.75.0), unless labelled *assumed*:
   ``PFSOffset``, session 1, #207): a position or offset it is sent reads back
   truncated towards zero. The demo's hold floats, so only a device a test
   asks for does (FM-119).
+* **A read right after a write can return the previous value**
+  (``make_reads_stale``; the Ti2-E's ``DiaLamp`` ``Intensity`` read 210 nine
+  milliseconds after a set of 501, session 2, #330, FM-188). Assumed shape:
+  seen once, so the number of stale reads is the test's, not a measurement.
+  The demo never does it. A shutter's open state is not a property here, so
+  it is not covered; it was not measured to lag.
+* **A turn can move Z by itself** (``move_z_on_turn``; the Ti2-E's nosepiece
+  turn moved Z by +8.7 µm and the call returned while Z read 500.0 µm, 0.02 s
+  before it read the new value, session 2, #330). Assumed shape: seen once.
+  The demo's turret returns at once and does not move Z.
 * **Config groups** (measured on the demo 2026-10-19, m2 §8.1). Groups and
   presets list sorted. ``defineConfig`` *merges*: it changes or adds one
   setting and keeps the others, creates a missing group, and accepts a
@@ -166,6 +176,13 @@ class FakeCore:
 
     * ``hold_whole_units(label)``: a ``Stage`` or ``AutoFocus`` device that
       reads back what it is sent truncated to a whole number (FM-119).
+    * ``make_reads_stale(device, prop, *, reads)``: the next ``reads`` reads of
+      that property after each write of a different value return the value it
+      held before the write; assumed shape: seen once on the Ti2-E (#330).
+    * ``move_z_on_turn(label, delta_um, *, escape_um=None, escape_reads=0)``: a
+      turn of any ``State`` device to the position ``label`` adds ``delta_um``
+      to the focus device's Z, and the next ``escape_reads`` reads of its
+      position return ``escape_um`` first (#330).
     """
 
     def __init__(
@@ -204,6 +221,17 @@ class FakeCore:
         self._channel_group = ""
         #: Labels of the devices that hold whole units (``hold_whole_units``).
         self._whole_units: set[str] = set()
+        #: ``(device, property)`` -> how many reads stay stale after a write
+        #: (``make_reads_stale``), and, per property written since: the value it
+        #: held before that write and the stale reads still owed.
+        self._stale_reads: dict[tuple[str, str], int] = {}
+        self._held_back: dict[tuple[str, str], tuple[str, int]] = {}
+        #: Position label -> ``(delta_um, escape_um, escape_reads)``
+        #: (``move_z_on_turn``); the escape the last such turn left, and the
+        #: reads of the focus device's position it is still served for.
+        self._turn_z: dict[str, tuple[float, float | None, int]] = {}
+        self._escape_um: float | None = None
+        self._escape_left = 0
 
         self._devices: dict[str, FakeDevice] = {}
         for device in devices:
@@ -416,10 +444,154 @@ class FakeCore:
             raise ValueError(f"{label!r} names no loaded Stage or AutoFocus device")
         self._whole_units.add(label)
 
+    def make_reads_stale(self, device: str, prop: str, *, reads: int) -> None:
+        """Make ``prop`` of ``device`` read its previous value for ``reads`` reads after a write.
+
+        The Ti2-E's ``DiaLamp`` read ``210`` nine milliseconds after a set of
+        ``501``, and ``501`` 0.3 s after one (session 2, #330, FM-188): a layer
+        that returns its one readback as what the device holds reports the old
+        value, and the demo, which never reads stale, cannot show it. After
+        each write of a **different** value, the next ``reads`` reads return
+        the value held before that write; a write of the value already held
+        leaves nothing stale; each write restarts the count. The reads covered
+        are ``getProperty`` and the dedicated calls over the same store
+        (``getStateLabel`` for ``Label``, ``getState`` for ``State``,
+        ``getExposure`` for ``Exposure``); every path that writes the property
+        restarts it (``setProperty``, ``setConfig``, ``setState``,
+        ``setStateLabel``, ``setExposure``). A device in ``failing`` raises on
+        a read as always, and that read costs no stale read. A shutter's open
+        state is not a property here and is not covered.
+
+        Raises:
+            ValueError: ``reads`` is below 1, ``device`` is not loaded,
+                ``prop`` is not one of its properties, or it is read-only (a
+                write never changes it): a misspelt label would otherwise
+                build a stand that reads fresh and a test that passes
+                whatever the layer does (FM-119).
+        """
+        if reads < 1:
+            raise ValueError(f"make_reads_stale: reads must be at least 1, got {reads}")
+        found = self._devices.get(device)
+        if found is None:
+            raise ValueError(f"make_reads_stale: no device {device!r} is loaded")
+        held = found.properties.get(prop)
+        if held is None:
+            raise ValueError(
+                f"make_reads_stale: device {device!r} has no property {prop!r}"
+            )
+        if held.read_only:
+            raise ValueError(
+                f"make_reads_stale: {device!r} {prop!r} is read-only, so a write "
+                f"never changes it and it is never stale"
+            )
+        self._stale_reads[(device, prop)] = reads
+
+    def move_z_on_turn(
+        self,
+        label: str,
+        delta_um: float,
+        *,
+        escape_um: float | None = None,
+        escape_reads: int = 0,
+    ) -> None:
+        """Make a turn to the position ``label`` move the focus device's Z by ``delta_um``.
+
+        The Ti2-E's nosepiece turn moved Z from 561.5 µm to 570.22 µm (+8.7 µm
+        with the 4x), and the call returned while Z read 500.0 µm: it read
+        570.26 µm 0.02 s later (session 2, #330, FM-12). A turn of **any**
+        ``State`` device to the position named ``label`` adds ``delta_um`` to
+        the Z of the device in the Focus slot, **on the store**, not through
+        ``setPosition``: the Nikon quirk (FM-12) must not fire, as the stand's
+        own move is not a call of the layer. The next ``escape_reads`` reads of
+        that device's position (``getPosition``, named or not) return
+        ``escape_um`` before they return the stored Z. A turn to the position
+        a device is already at changes nothing and serves no escape. Several
+        labels may be registered; the escape of the latest turn is the one
+        served.
+
+        Raises:
+            ValueError: No device is in the Focus slot, ``label`` is the label
+                of no position of a loaded ``State`` device, ``escape_reads``
+                is negative, or ``escape_um`` is given without
+                ``escape_reads`` (or the reverse): a misspelt label would
+                otherwise build a stand that never moves Z (FM-119).
+        """
+        if not self._slots["focus"]:
+            raise ValueError("move_z_on_turn: no focus device is in the Focus slot")
+        if not any(
+            d.type == DeviceType.State and label in d.state_labels
+            for d in self._devices.values()
+        ):
+            raise ValueError(
+                f"move_z_on_turn: {label!r} is no position label of a loaded State "
+                f"device"
+            )
+        if escape_reads < 0:
+            raise ValueError(
+                f"move_z_on_turn: escape_reads must not be negative, got {escape_reads}"
+            )
+        if escape_um is not None and escape_reads == 0:
+            raise ValueError(
+                "move_z_on_turn: escape_um is given with escape_reads 0, which serves "
+                "none of it"
+            )
+        if escape_um is None and escape_reads >= 1:
+            raise ValueError(
+                f"move_z_on_turn: escape_reads is {escape_reads} but escape_um is "
+                f"missing"
+            )
+        self._turn_z[label] = (float(delta_um), escape_um, escape_reads)
+
     # --- helpers -------------------------------------------------------------
 
     def _record(self, name: str, *args: object) -> None:
         self.log.append(f"{name}({', '.join(map(repr, args))})")
+
+    def _read(self, label: str, name: str) -> str:
+        """The text of a property: the one held back while ``make_reads_stale`` owes reads.
+
+        Called by every read of the store (``getProperty`` and the dedicated
+        calls). ``_device`` raises a ``failing`` entry first, so a read that
+        fails is no read of the device and costs no stale read.
+        """
+        value = self._device(label).properties[name].value
+        key = (label, name)
+        held = self._held_back.get(key)
+        if held is None:
+            return value
+        before, left = held
+        if left > 1:
+            self._held_back[key] = (before, left - 1)
+        else:
+            del self._held_back[key]
+        return before
+
+    def _store(self, device: FakeDevice, name: str, text: str) -> None:
+        """Write a property of the store; every write goes through here (``_wrote``)."""
+        prop = device.properties[name]
+        before, prop.value = prop.value, text
+        self._wrote(device.label, name, before)
+
+    def _wrote(self, label: str, name: str, before: str) -> None:
+        """A property was written: restart its stale count if it changed, end it if not."""
+        key = (label, name)
+        reads = self._stale_reads.get(key)
+        if reads is None:
+            return
+        if self._devices[label].properties[name].value == before:
+            self._held_back.pop(key, None)
+        else:
+            self._held_back[key] = (before, reads)
+
+    def _turned(self, position_label: str) -> None:
+        """A State device changed position: a label registered by ``move_z_on_turn`` moves Z."""
+        turn = self._turn_z.get(position_label)
+        focus = self._slots["focus"]
+        if turn is None or focus not in self._z:
+            return
+        delta_um, escape_um, escape_reads = turn
+        self._z[focus] += delta_um
+        self._escape_um, self._escape_left = escape_um, escape_reads
 
     def _held(self, label: str, value: float) -> float:
         """What device ``label`` stores of ``value``: whole units if it holds them."""
@@ -560,6 +732,14 @@ class FakeCore:
         """The position of ``label``, or of the focus slot's device when omitted."""
         label = self._slot_label("focus", label)
         self._typed(label, DeviceType.Stage)
+        escape = self._escape_um
+        if (
+            label == self._slots["focus"]
+            and self._escape_left > 0
+            and escape is not None
+        ):
+            self._escape_left -= 1
+            return escape
         return self._z[label]
 
     def setPosition(self, label: str, z_um: float) -> None:
@@ -622,7 +802,7 @@ class FakeCore:
         camera = self._camera()
         if camera is None:
             return 0.0
-        return float(camera.properties["Exposure"].value)
+        return float(self._read(camera.label, "Exposure"))
 
     def setExposure(self, exposure_ms: float) -> None:
         """Write the camera's ``Exposure`` property as the demo formats it.
@@ -633,7 +813,7 @@ class FakeCore:
         camera = self._camera()
         if camera is None:
             raise RuntimeError(_NO_CAMERA)
-        camera.properties["Exposure"].value = f"{float(exposure_ms):.4f}"
+        self._store(camera, "Exposure", f"{float(exposure_ms):.4f}")
 
     def getImageHeight(self) -> int:
         return self.image_shape[0] if self._camera() is not None else 0
@@ -696,7 +876,7 @@ class FakeCore:
         found = self._device(label).properties.get(name)
         if found is None:
             raise RuntimeError(f'Cannot get value of property "{name}"')
-        return found.value
+        return self._read(label, name)
 
     def setProperty(self, label: str, name: str, value: str | float | int) -> None:
         """Set a property as MMCore does: read-only is ignored, a bad value raises.
@@ -725,9 +905,9 @@ class FakeCore:
             elif device.type == DeviceType.State and name == "Label":
                 self._set_position(device, device.state_labels.index(text))
             elif device.type == DeviceType.Camera and name == "Exposure":
-                prop.value = f"{float(text):.4f}"
+                self._store(device, name, f"{float(text):.4f}")
             else:
-                prop.value = text
+                self._store(device, name, text)
         except ValueError:
             # Not a number, or not one of the device's labels.
             raise _refused(name, text) from None
@@ -757,15 +937,16 @@ class FakeCore:
     # --- State devices -------------------------------------------------------
 
     def getState(self, label: str) -> int:
-        device = self._typed(label, DeviceType.State)
-        return int(device.properties["State"].value)
+        self._typed(label, DeviceType.State)
+        return int(self._read(label, "State"))
 
     def setState(self, label: str, position: int) -> None:
         self._record("setState", label, position)
         self._set_position(self._typed(label, DeviceType.State), int(position))
 
     def getStateLabel(self, label: str) -> str:
-        return self._typed(label, DeviceType.State).properties["Label"].value
+        self._typed(label, DeviceType.State)
+        return self._read(label, "Label")
 
     def getStateLabels(self, label: str) -> tuple[str, ...]:
         return self._typed(label, DeviceType.State).state_labels
@@ -788,8 +969,11 @@ class FakeCore:
             raise RuntimeError(
                 f'Error in device "{device.label}": (Error message unavailable) (103)'
             )
-        device.properties["State"].value = str(position)
-        device.properties["Label"].value = device.state_labels[position]
+        moved = device.properties["State"].value != str(position)
+        self._store(device, "State", str(position))
+        self._store(device, "Label", device.state_labels[position])
+        if moved:
+            self._turned(device.state_labels[position])
 
     # --- continuous focus ----------------------------------------------------
 
@@ -975,6 +1159,9 @@ class FakeCore:
         self._continuous.pop(label, None)
         self._af_offset.pop(label, None)
         self._whole_units.discard(label)
+        for key in [k for k in self._stale_reads if k[0] == label]:
+            del self._stale_reads[key]
+            self._held_back.pop(key, None)
         for slot, named in self._slots.items():
             if named == label:
                 self._slots[slot] = ""

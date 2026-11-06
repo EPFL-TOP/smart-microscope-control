@@ -7,6 +7,7 @@ that a fresh core then loads.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,23 @@ def test_demo_turret_pixel_size_follows_a_magnifier(
     assert turret.pixel_size_um("Nikon 40X Plan Fluor ELWD") == pytest.approx(
         0.1625 / 1.6
     )
+
+
+def test_a_turn_on_the_demo_reads_z_around_it_and_reports_no_move(
+    demo_microscope: Microscope, caplog: pytest.LogCaptureFixture
+) -> None:
+    # m2 §8.11 D2: the demo's turret returns at once and does not move Z, so the
+    # settle runs against real pymmcore and finds Z where it was.
+    turret = demo_microscope.require(ObjectiveTurret)
+    label = "Nikon 20X Plan Fluor ELWD"
+    with caplog.at_level(logging.INFO):
+        assert turret.select(label, confirm=True) == label
+    assert (
+        f"objective_turret: turned to '{label}'; Z is 0.00 µm, as before"
+        in caplog.messages
+    )
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+    assert turret.current() == label
 
 
 def test_demo_channel_group_is_channel_and_reads_dapi(
