@@ -188,9 +188,200 @@ do, and never gives a route that is empty or that rests on a number that is not 
   rewritten at every stage write. At the default of 10 fields per well, 96 wells are
   about 0.24 MB; at the largest `fields_per_well` (500) they are about 12 MB.
 
+## Selection prototype
+
+`scripts/dev/select_fields.py` is the first step towards choosing fields for what makes
+them **good for the experiment**, and not only for how many wanted cells they hold: the
+density of the cells, the distance between them (isolated cells, or a minimum
+spacing), whether the field holds single cells and not doublets and debris, how far it
+is from the wall, how clean its background is. It is a **prototype to tune on real 40×
+scans**, offline and with the owner looking at the chosen fields, and it is **not the
+plugin**: `route` is unchanged and still picks the fields that hold the most cells.
+Once the weights are settled on two or three scans, `route.choose_fields` takes a
+score and its parameters (an interface change, [`m3-plugins.md`](../design/m3-plugins.md)
+§11, written by the follow-up issue), with the count-based rule above as its default.
+
+### What it does
+
+One command reads a run document that has `scan-plan`, `scan` and `cells` and, for each
+well it scanned:
+
+1. takes the scan's **own frames** as the candidate fields (every frame the autofocus
+   had not lost the sample on) and computes the features of each, from the cells in its
+   footprint and from its pixels;
+2. scores them with the weights it is given, picks fields greedily by score (no two
+   overlapping, as in `route`), and orders them with `route`'s own `order_route`;
+3. prints the ranked fields with their features, draws one PNG per well, and writes
+   `selection.json`;
+4. writes a **copy** of the run document in which a record named `route-prototype`
+   fills the `route` slot, so that `nis-export` exports the list unchanged.
+
+**Why the scan's frames and not `route`'s lattice.** Every feature, and the Z and the
+autofocus offset of a stop, are then measured on the very frame that will be imaged
+again; no candidate lies on an area the scan did not see; and what you look at on the
+picture is what was scored. The features are written for any field centre, so the
+follow-up can move them to a lattice. Whether a cell is in a field, and whether two
+fields overlap, are `route`'s own arithmetic (the script imports its helpers), so the
+prototype and the plugin cannot disagree about either.
+
+### Running the prototype
+
+```text
+python scripts/dev/select_fields.py run.json --labels single --weight density=1 --weight isolation=1
+smc run nis-export -p <profile> --run-doc run-selected.json
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `RUN_DOC` | | A run document with `scan-plan`, `scan` and `cells`, each `done`, not stale, run on the scan's profile. |
+| `--wells A1,B2` | every scanned well | The wells to run, in the plan's order. |
+| `--labels single` | `single` | The wanted classes, comma separated, among the cells stage's classes. |
+| `--weight NAME=VALUE` | `density=1`, the rest 0 | One weight, repeated for several; `NAME` is one of the six below, `VALUE` a number from 0 to 1 000 000, at least one above 0. A weight you give replaces **only its own** default: `--weight isolation=1` leaves the density at 1, and `--weight density=0` removes it. |
+| `--fields-per-well` | 10 | The most fields to choose in a well (1 to 500). |
+| `--min-cells` | 1 | A candidate must hold at least this many wanted cells. |
+| `--min-score` | 0 | The choice stops at the first score below this (0 to 1). |
+| `--wall-margin-um`, `--exclude-centre-um` | 0 | As `route`'s `wall_margin_um` and `exclude_centre_um`: a candidate whose footprint breaks either is not a candidate. |
+| `--min-spacing-um` | measured | Wanted cells closer than this to another cell are not isolated; see below. |
+| `--no-pixels` | | Do not read the frames: no `sharp`, no `bg`, no mosaic. |
+| `--no-png`, `--png-max-px` | 1600 | No pictures; the longer side of a picture (256 to 8000). |
+| `--show` | 15 | Candidates listed per well in the table (the rest are in `selection.json`). |
+| `--out-dir` | `selection/` next to `RUN_DOC` | Where `selection.json` and the pictures go. |
+| `--run-doc-out` | `<stem>-selected.json` next to `RUN_DOC` | The copy of the run document. It is **never** the original, and it is replaced when it exists. |
+
+Every option is bounded and refused with `select_fields: <option> must be ...` before
+any file is read. The exit code is 0 when everything was done, 1 when a file could not
+be written (the table was printed, and the other files were written), 2 for a refusal.
+
+**Iterating on the weights.** Each run reads the wells' frames again, once each: about
+0.02 s for a 1412² frame with a warm cache (measured while planning, on an Apple M-series
+laptop), so 300 frames are about 7 s per well, and 0.28 s for the 72 frames of 512² of
+the demo-sample run below (0.15 s with `--no-png`). `--wells` cuts the wells, `--no-png`
+the mosaic and `--no-pixels` the reading altogether. The microscope PC's disk and CPU
+are not measured. One 8-bit mosaic per well is held until the pictures are written
+(2.6 MB at 1600 pixels: 250 MB for 96 wells): for a whole plate use `--png-max-px 800`
+or `--wells`.
+
+### Reading a picture
+
+`selection/<well>.png` is the plate seen from above **in the stage's axes** (+X to the
+right, +Y up), whatever the camera's turn:
+
+- the scan's frames as a mosaic, stretched between the 1st and the 99.5th percentile of
+  the well's pixels; dark grey where no frame reached;
+- the well's wall in **blue**;
+- every cell as a 3-pixel dot coloured by its class (the cells stage's order: gold,
+  cyan, red, light green, magenta, white), with a **second ring** when the class is
+  wanted;
+- each chosen field as a closed **green** outline, turned or mirrored as the camera is,
+  with its number in route order at its centre, and the route as a thin yellow line;
+- a caption with the well, the number of fields and the weights above 0.
+
+The mosaic is for **looking, not measuring**: a frame is reduced by block means to the
+picture's pixel and placed on the nearest one, with a placement error of at most the
+cropped remainder of an edge (under one picture pixel), and a later frame overwrites an
+earlier one where they overlap.
+
+### The six features
+
+A candidate's score is the weighted mean of six parts, each in [0, 1], over the
+candidates of its well (`sum(w × part) / sum(w)`, so scaling every weight changes
+nothing). The **pool** a rank or a maximum is taken over is the well's candidates before
+`--min-cells`, so that a rank does not depend on how many cells a field holds.
+
+| Weight | The part, in [0, 1] | What you may want it for | Default |
+|---|---|---|---|
+| `density` | the wanted cells per mm² over the pool's largest | most cells per image: what `route` prefers | 1 |
+| `isolation` | the share of the field's wanted cells whose nearest other cell, **of any class and anywhere in the well**, is at least `min_spacing_um` away | cells that can be segmented one by one; a cell alone in its well is isolated | 0 |
+| `purity` | wanted cells over all cells of the field | fields without doublets and debris | 0 |
+| `wall` | the distance from the footprint to the wall over the pool's largest | fields away from the meniscus | 0 |
+| `sharpness` | the rank of `sharp` among the pool: (candidates below + half the ties) / candidates, so 1/6, 3/6, 5/6 for three | the frame that is crisp | 0 |
+| `background` | one less the rank of `bg` among the pool | a dark, clean background | 0 |
+
+Every default but `density=1` is **0**, so with no `--weight` the prototype prefers what
+`route` prefers, and every other criterion is a deliberate step of the owner. The table's
+columns are `n` (wanted cells), `dens/mm2`, `iso` (the isolated count), `purity`,
+`nn_um` (the median nearest-neighbour distance of the field's wanted cells), `wall_um`,
+`sharp`, `bg`, `focus` and `stop` (the route number of a chosen field, `-` otherwise).
+
+- **`min_spacing_um`** is the value given, else **three times the median length of the
+  wanted cells** (the longer side of a cell's box, times the pixel's size), over every
+  well run, so that wells compare. The factor 3 is **chosen, not measured**; the table
+  and the result say which of the two the value is.
+- **`sharp` is not a focus measure.** It is the variance of the 4-neighbour Laplacian of
+  the frame divided by its median squared (so it does not depend on the exposure), and
+  cells add contrast: a frame full of cells reads sharper than an empty one in focus.
+  That is why the column is called `sharp`. It is not corrected.
+- **`bg`** is the frame's median.
+
+### Things to know
+
+- **The candidates overlap, so a chosen field excludes its neighbours.** The scan's
+  frames overlap by the scan plan's `overlap` (10 % by default), and two fields whose
+  frames overlap are never both chosen, as in `route`. Adjacent candidates are therefore
+  never chosen together unless the scan was planned with an overlap of 0, and a cell in
+  the strip a rejected frame shared with a chosen one can be left in no field:
+  `uncovered` counts those cells. On the demo-sample run below, 5 of the 14 wanted
+  cells of B11 were left in no field with 7 of 36 candidates chosen and 10 allowed.
+  `route`'s lattice (a step of a quarter of the field) has no such constraint.
+- **`--min-cells` counts the candidate's own wanted cells**, not only those that no
+  earlier field holds (`route`'s rule). The two differ only for a cell on an edge that
+  two touching fields share, which the first chosen holds.
+- A stop is the frame's **readback** position, and its Z and autofocus offset come
+  together from that frame. An `unlocked` frame is never a candidate (its Z is wherever
+  the autofocus search had got to), and the result says how many were left out. A frame
+  that cannot be read (missing, corrupt, of another shape than the scan's) is counted,
+  skipped and said; it is not a candidate for a pixel weight and stays one otherwise.
+- The score and the copy are the **owner's** to judge; nothing here is tuned, and
+  `assumed` in the copy's record names the weights, the spacing and that the positions
+  are the scan's own frames and not a lattice.
+
+### What it reads and leaves
+
+- It reads the run document, the cells file and the scan's frames, and never writes
+  any of them.
+- `selection.json`: every candidate of every well with its features, score, parts and
+  `stop` (`null` or the route number), the weights and the options. For a notebook;
+  nothing in smc reads it. The run document is named by its file name, not its path.
+- `<well>.png`: the pictures above. Existing ones are replaced, they are derived.
+- The **copy** of the run document: every stage of the original, plus the
+  `route-prototype` record that provides `route`. It is named so and not `route` so that
+  the document says who chose the fields, an older `route` record (if any) stays in the
+  copy, and the later start wins. The record reads the current `scan-plan`, `scan` and
+  `cells`, so it goes stale when one runs again, as `route`'s does. **Keep the copy next
+  to its original**: a run document's file names are relative to its folder, and a copy
+  moved elsewhere loses its frames and cells (`nis-export` reads only the route, and
+  still works).
+
+### What was tried, and what the owner kept
+
+| Scan | Weights | Spacing | What the owner saw | Kept? |
+|---|---|---|---|---|
+| nothing is judged yet: the first 40× scan has not been taken | | | | |
+
+### What was run here
+
+On the `demo-sample` stand (a synthetic plate, simulated devices; the plate registered
+from its two corners, then `scan-plan --param wells=B2,B11 --param coverage=0.4`,
+`scan`, `cells --param detector=blobs`): 72 frames of 512² at 1 µm, 14 single cells and 2
+doublets in B11 and 3 and 4 in B2. `--labels single --weight density=1 --weight
+isolation=1` ran in 0.28 s, chose 7 fields in B11 and 1 in B2, and `nis-export` of the
+copy exported those 8 positions. On the pictures the numbers are on the fields the table
+lists, and the mosaic is the right way up: the grey level in the mosaic around a cell's
+position was 197 and 200 on average against 124 over the well (15 and 7 cells in B11
+and B2), and 122 and 129 at the same cells mirrored through the well's centre (13 and 6
+that fall on the mosaic). The demo's frames are
+noise, so `sharp` and `bg` rank nothing here.
+
 ## Not verified here
 
 Nothing in this page was run on a microscope.
+
+- **The selection prototype on a real 40× scan**: every number above is from the
+  synthetic sample, and the weights have not been judged on real frames (part 2 of the
+  issue, with the owner, fills the table above).
+- **The prototype's cost on the microscope PC** (disk and CPU), and that its numbers
+  hold on Python 3.10's numpy, scipy and Pillow (the full matrix runs it).
+- **That NIS-Elements loads the copy's export** (the same open point as below).
 
 - **The stage's move time against distance** on the Ti2-E: Euclidean, or both axes at
   once (#198). Until it is measured, `travel_s` is the model's estimate and the order
