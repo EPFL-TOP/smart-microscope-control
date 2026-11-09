@@ -96,6 +96,7 @@ from smc.ui.guide import (
     WALLS_NEED_CALIBRATION,
     scan_plan_card_lines,
     walls_centres_problem,
+    walls_square_wells,
 )
 
 T0 = datetime(2026, 10, 29, 9, 0, tzinfo=timezone.utc)
@@ -2320,6 +2321,7 @@ def _walls_page(
     centres: int = 2,
     calibrated: bool = True,
     chosen: bool = True,
+    plate: str = "96-well",
 ) -> PlatePage:
     """A page with the real ``plate-walls`` and ``camera-calibration``, in one state of §12.3's list.
 
@@ -2330,7 +2332,7 @@ def _walls_page(
         _seed(run_doc, "camera-calibration", "camera-calibration")
     page = _stood_page(microscope, run_doc, "plate-walls", "camera-calibration")
     if chosen:
-        page.choose_plate("96-well")
+        page.choose_plate(plate)
     stage = microscope.require(XYStage)
     for index, well in enumerate(["B3", "D5", "F7", "H9", "A1", "C2"][:centres]):
         stage.move_to_um(9000.0 * index, -9000.0 * index)
@@ -2342,12 +2344,12 @@ def _walls_reason(page: PlatePage) -> str | None:
     return page.view().blocked.get("plate-walls")
 
 
-def test_plate_walls_is_blocked_in_the_order_dry_run_calibration_stand_centres(
+def test_plate_walls_is_blocked_in_the_order_dry_run_square_wells_calibration_stand_centres(
     fake_microscope: Microscope, fake_core: FakeCore, run_doc: Path
 ) -> None:
-    # §12.3: the stand closed, the placeholder plate, then a dry run, the calibration,
-    # the stand's capabilities, the centres. Each state alone, then two at once: the
-    # earlier reason wins, so the operator is told the one that holds longest.
+    # §12.3: the stand closed, the placeholder plate, then a dry run, square wells, the
+    # calibration, the stand's capabilities, the centres. Each state alone, then two at
+    # once: the earlier reason wins, so the operator is told the one that holds longest.
     dry = Microscope.from_core(
         cast("CMMCorePlus", fake_core), Profile.demo(), dry_run=True
     )
@@ -2394,6 +2396,27 @@ def test_plate_walls_is_blocked_in_the_order_dry_run_calibration_stand_centres(
         dry_page = _walls_page(dry, run_doc, centres=0, calibrated=False)
         assert _walls_reason(dry_page) == WALLS_DRY_RUN
         dry_page.close()
+
+        # Square wells (#375): ahead of the calibration, the stand and the centres, and
+        # behind the dry run. No calibration, no centre and no camera: the wells' reason.
+        square = _walls_page(
+            fake_microscope, run_doc, centres=0, calibrated=False, plate="384-well"
+        )
+        assert _walls_reason(square) == walls_square_wells("384-well")
+        with _replaced(fake_microscope, "has", _without(Camera)):
+            assert _walls_reason(square) == walls_square_wells("384-well")
+        square.close()
+        # A round plate is not told it: the same page on a 24-well one has the next reason.
+        round_page = _walls_page(
+            fake_microscope, run_doc, centres=0, calibrated=False, plate="24-well"
+        )
+        assert _walls_reason(round_page) == WALLS_NEED_CALIBRATION
+        round_page.close()
+        dry_square = _walls_page(
+            dry, run_doc, centres=0, calibrated=False, plate="1536-well"
+        )
+        assert _walls_reason(dry_square) == WALLS_DRY_RUN
+        dry_square.close()
     finally:
         dry.close()
 
@@ -2465,6 +2488,88 @@ def test_a_dry_run_page_refuses_plate_walls_in_the_controller_and_writes_nothing
             page.close()
     finally:
         dry.close()
+
+
+@pytest.mark.parametrize("plate", ["384-well", "1536-well"])
+def test_a_square_welled_plate_refuses_plate_walls_in_the_controller_and_writes_nothing(
+    fake_microscope: Microscope, run_doc: Path, plate: str
+) -> None:
+    # #375: the plugin fits round wells and refuses a square-welled plate before it
+    # moves, and its refusal is a `failed` record that replaces the usable plate that
+    # plate-registration left (§11.4). The button's state is a courtesy (FM-169): the
+    # controller refuses by itself, before the parameters are read, and writes nothing.
+    _seed(run_doc, "plate-registration", "plate", _plate(plate))
+    _seed(run_doc, "camera-calibration", "camera-calibration", minute=1)
+    page = _walls_page(
+        fake_microscope, run_doc, centres=2, calibrated=False, plate=plate
+    )
+    try:
+        before = run_doc.read_bytes()
+        # Pairs that the parameters would refuse: the refusal is the plate's.
+        page.run("plate-walls", ["bogus=1"])
+        assert page.status().running is None
+        assert page.status().outcome == f"plate-walls: {walls_square_wells(plate)}"
+        assert run_doc.read_bytes() == before
+        provider = RunDocument.load_or_new(run_doc).provider("plate")
+        assert provider is not None
+        assert provider.plugin == "plate-registration"
+        assert provider.status is StageStatus.done
+        # A round plate is not refused by it: the pairs are read, and `bogus` is the
+        # parameters' own refusal (the control that shows the guard is the plate's).
+        page.choose_plate("96-well")
+        page.run("plate-walls", ["bogus=1"])
+        assert "bogus" in (page.status().outcome or "")
+        assert walls_square_wells("96-well") not in (page.status().outcome or "")
+    finally:
+        page.close()
+
+
+def test_the_dry_run_comes_before_square_wells_when_plate_walls_is_run(
+    fake_core: FakeCore, run_doc: Path
+) -> None:
+    dry = Microscope.from_core(
+        cast("CMMCorePlus", fake_core), Profile.demo(), dry_run=True
+    )
+    try:
+        _seed(run_doc, "plate-registration", "plate", _plate("384-well"))
+        page = _walls_page(dry, run_doc, centres=0, calibrated=False, chosen=False)
+        try:
+            assert page.plate == "384-well"
+            page.run("plate-walls", [])
+            assert page.status().outcome == f"plate-walls: {WALLS_DRY_RUN}"
+        finally:
+            page.close()
+    finally:
+        dry.close()
+
+
+def test_plate_walls_params_refuse_the_dry_run_then_square_wells_then_the_count(
+    fake_microscope: Microscope, fake_core: FakeCore, run_doc: Path
+) -> None:
+    # The page's click builds the pairs first, so the text a click shows is this one:
+    # the dry run's ahead of the count's, as the button's reason is (§12.3, #375).
+    dry = Microscope.from_core(
+        cast("CMMCorePlus", fake_core), Profile.demo(), dry_run=True
+    )
+    try:
+        dry_page = _walls_page(dry, run_doc, centres=0, calibrated=False)
+        with _refuses(ValueError, WALLS_DRY_RUN):
+            dry_page.page_params("plate-walls")
+        dry_page.close()
+    finally:
+        dry.close()
+
+    square = _walls_page(
+        fake_microscope, run_doc, centres=0, calibrated=False, plate="384-well"
+    )
+    with _refuses(ValueError, walls_square_wells("384-well")):
+        square.page_params("plate-walls")
+    square.close()
+
+    round_page = _walls_page(fake_microscope, run_doc, centres=0, calibrated=False)
+    with _refuses(ValueError, walls_centres_problem(0) or ""):
+        round_page.page_params("plate-walls")
+    round_page.close()
 
 
 def test_the_plates_refusal_comes_before_a_dry_runs_for_plate_walls(
