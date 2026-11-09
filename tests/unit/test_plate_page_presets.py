@@ -25,6 +25,8 @@ from smc.hardware import Microscope
 from smc.hardware.capabilities import XYStage
 from smc.hardware.profile import Profile
 from smc.plugins.api import PluginParams, PluginResult, RunContext
+from smc.plugins.params import parse_params
+from smc.plugins.plate_walls.plugin import PlateWallsParams
 from smc.plugins.presets import (
     NOT_IN_PARAMS,
     PresetError,
@@ -266,12 +268,6 @@ def test_what_a_preset_does_not_keep_under_params_is_what_the_page_fills() -> No
     kept_elsewhere = {plugin: set(keys) for plugin, keys in NOT_IN_PARAMS.items()}
     filled = {plugin: set(keys) for plugin, keys in PAGE_PARAMS.items()}
     assert kept_elsewhere.pop("plate-finding") == {"centre_x_um", "centre_y_um"}
-    # plate-walls (#346): the page fills its `plate` and its `refs`, and the preset
-    # refuses `refs` only: its `plate` is not yet one the preset holds elsewhere. That
-    # is #371, in the plugins' table, which #346 does not touch: with it fixed, drop
-    # these two pops and let `kept_elsewhere == filled` say it.
-    assert kept_elsewhere.pop("plate-walls") == {"refs"}
-    assert filled.pop("plate-walls") == {"plate", "refs"}
     # objective-offsets (#380): a preset never keeps `confirm_turns`, the operator's word
     # that the stage is clear for the turret to turn over the plate, which holds for one
     # run (FM-14). The page has no step for the tool yet: it will fill the key there,
@@ -677,6 +673,59 @@ def test_a_preset_of_plate_walls_fields_is_checked_with_no_centre_captured(
         assert str(refused.value).startswith("plate-walls: ")
         assert str(refused.value).endswith("; nothing saved")
         assert not (tmp_path / "profiles" / "presets" / "bad.toml").exists()
+    finally:
+        page.close()
+
+
+def test_a_plate_under_plate_walls_is_dropped_by_the_load_and_the_step_fills_it_once(
+    run_doc: Path, tmp_path: Path
+) -> None:
+    # The page fills `plate` for the tool (m5 §12.2); a preset that kept one under
+    # `plate-walls` made the step's pairs name it twice, and `parse_params` refused the
+    # click (#371). The plate is the preset's own field: dropped, with the reason.
+    _put(
+        tmp_path,
+        "w",
+        'stand = "demo-sample"\nplate = "24-well"\n\n[params]\n'
+        'plate-walls = ["plate=24-well", "search_um=3000"]\n',
+    )
+    page = _walls_page(run_doc)
+    try:
+        loaded = page.load_preset("w")
+
+        assert page.plate == "24-well"
+        assert loaded.fields == {"plate-walls": {"search_um": "3000"}}
+        assert loaded.mismatches == (
+            "preset w [params.plate-walls]: plate is not kept under params: "
+            "the preset's plate holds it",
+        )
+        page.refs = (
+            WellRef(well="A1", x_um=1.0, y_um=2.0),
+            WellRef(well="B2", x_um=3.0, y_um=4.0),
+        )
+        step = page.view().next_step
+        assert step is not None
+        assert step.plugin == "plate-walls"
+        assert [p for p in step.params if p.startswith("plate=")] == ["plate=24-well"]
+        parsed = parse_params(PlateWallsParams, list(step.params))
+        assert (parsed.plate, parsed.search_um) == ("24-well", 3000.0)
+    finally:
+        page.close()
+
+
+def test_save_preset_refuses_a_plate_under_plate_walls_with_the_presets_reason(
+    run_doc: Path, tmp_path: Path
+) -> None:
+    page = _walls_page(run_doc)
+    try:
+        with pytest.raises(PresetError) as refused:
+            page.save_preset("bad", {"plate-walls": ["plate=24-well"]}, "")
+
+        assert str(refused.value) == (
+            "plate-walls: plate is not kept under params: the preset's plate holds "
+            "it; nothing saved"
+        )
+        assert not (tmp_path / "profiles").exists()
     finally:
         page.close()
 

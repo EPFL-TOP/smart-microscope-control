@@ -106,14 +106,20 @@ NOT_IN_PARAMS: dict[str, dict[str, str]] = {
         "walls": "a preset holds no positions",
         "objective": "the registration takes the objective in place",
     },
-    "plate-walls": {"refs": "a preset holds no positions"},
+    "plate-walls": {
+        "plate": "the preset's plate holds it",
+        "refs": "a preset holds no positions",
+    },
     "scan-plan": {"wells": "the preset's wells hold them"},
 }
 
 #: The plugin whose parameter a preset's own field stands for: the parameter's
-#: key, and the ``PresetCheck`` attribute that holds its value.
+#: key, and the ``PresetCheck`` attribute that holds its value. A plugin whose
+#: ``plate`` is in ``NOT_IN_PARAMS`` is here too, or a run from the preset would
+#: use the plugin's default plate where the preset named one (#371).
 _HELD_FIELDS: dict[str, tuple[str, str]] = {
     "plate-registration": ("plate", "plate"),
+    "plate-walls": ("plate", "plate"),
     "scan-plan": ("wells", "wells"),
 }
 

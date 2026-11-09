@@ -218,11 +218,12 @@ def test_plate_finding_centre_is_not_kept_under_params_for_a_hand_written_preset
     )
 
 
-def test_plate_walls_refs_are_never_saved_and_not_kept_for_a_hand_written_preset() -> (
+def test_plate_walls_plate_and_refs_are_never_saved_and_not_kept_for_a_hand_written_preset() -> (
     None
 ):
     # plate-walls (#328) landed after this module's first cases: its `refs` are the
-    # stage positions of wells centred by eye, as plate-registration's are.
+    # stage positions of wells centred by eye, as plate-registration's are, and its
+    # `plate` is the preset's own, which the page fills too (#371).
     refs = [
         {"well": "A1", "x_um": 1.0, "y_um": 2.0},
         {"well": "B2", "x_um": 3.0, "y_um": 4.0},
@@ -231,13 +232,16 @@ def test_plate_walls_refs_are_never_saved_and_not_kept_for_a_hand_written_preset
 
     made = _preset_of(_record("plate-walls", recorded, result={"plate": "24-well"}))
 
-    assert made.preset.params == {"plate-walls": ("plate=24-well", "search_um=500.0")}
+    assert made.preset.params == {"plate-walls": ("search_um=500.0",)}
+    assert made.preset.plate == "24-well"
     assert made.notes == ()
 
-    preset = Preset(params={"plate-walls": ("refs=[]",)})
+    preset = Preset(params={"plate-walls": ("plate=24-well", "refs=[]")})
     check = check_preset(_file(preset), MODELS, stand=STAND, registered=None)
     assert check.params == {}
     assert check.mismatches == (
+        "preset weekly [params.plate-walls]: plate is not kept under params: "
+        "the preset's plate holds it",
         "preset weekly [params.plate-walls]: refs is not kept under params: "
         "a preset holds no positions",
     )
