@@ -42,6 +42,7 @@ from smc.ui.guide import (
     SELECT_WELLS,
     WALLS_DRY_RUN,
     WALLS_NEED_CALIBRATION,
+    walls_centres_problem,
 )
 
 T0 = datetime(2026, 11, 2, 9, 0, tzinfo=timezone.utc)
@@ -721,12 +722,13 @@ def test_a_sample_of_another_plate_asks_to_choose_it(
 # replace: a stand that cannot image is a stand with no `Camera`, and a dry-run page is
 # a stand opened with `dry_run=True`.
 
+# In capture order, which is not alphabetical: a step that sorts the wells says so.
 CENTRES = (
-    WellRef(well="B3", x_um=10182.0, y_um=-10087.9),
     WellRef(well="D5", x_um=1.0, y_um=2.0),
+    WellRef(well="B3", x_um=10182.0, y_um=-10087.9),
 )
 WALLS_STEP_WHY = (
-    "plate, refs: the 2 centres of B3, D5 captured on this page; plate-walls images "
+    "plate, refs: the 2 centres of D5, B3 captured on this page; plate-walls images "
     "each well's four walls around its centre and moves the stage in X and Y only"
 )
 
@@ -865,6 +867,71 @@ def test_a_stand_without_a_camera_keeps_plate_registration_the_step(
         assert after.plugin == "plate-registration"
         assert after.blocked is None
         assert page.view().blocked["plate-walls"] == "this stand has no Camera"
+    finally:
+        page.close()
+
+
+@pytest.mark.parametrize("plate", ["384-well", "1536-well"])
+def test_a_plate_with_square_wells_keeps_plate_registration_the_step(
+    fake_microscope: Microscope, run_doc: Path, plate: str
+) -> None:
+    # FM-182: the plugin fits round wells and refuses a square-welled plate before
+    # anything moves, and a failed record would replace a usable plate (§11.4). The step
+    # never offers it there, or it would offer the same refused click again after it.
+    _calibrated(run_doc)
+    page = _walls_page(fake_microscope, run_doc, chosen=False)
+    try:
+        page.choose_plate(plate)  # drops the captures of the other plate
+        page.refs = (
+            WellRef(well="A1", x_um=0.0, y_um=0.0),
+            WellRef(well="A2", x_um=4500.0, y_um=0.0),
+        )
+        step = page.view().next_step
+        assert step is not None
+        assert step.plugin == "plate-registration"
+        assert step.blocked is None
+        assert parse_params(RegistrationParams, step.params).plate == plate
+        assert step.why[-1] == "or plate-walls: A test wall registration."
+    finally:
+        page.close()
+
+
+def test_plate_walls_alone_in_its_slot_never_offers_the_plugins_default_plate(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # `plate-registration` may fail to load (a line of the page's problems, not a tool):
+    # `plate-walls` is then the first provider and is the step whatever the captures are.
+    # With the placeholder plate or too few centres its pairs would be the plugin's own
+    # defaults (`plate=96-well`, no refs), which a click must never run (§11.3), and its
+    # line would say `the 0 centres of  captured`.
+    only = (Calibration, *(t for t in WORKFLOW if t is not Registration), Walls)
+    page = _walls_page(fake_microscope, run_doc, refs=(), chosen=False, tools=only)
+    try:
+        _calibrated(run_doc)
+        unchosen = page.view().next_step
+        assert unchosen is not None
+        assert (unchosen.plugin, unchosen.params) == ("plate-walls", ())
+        assert unchosen.blocked == PLATE_NOT_CHOSEN
+        assert unchosen.why == ("the run document has no plate yet",)
+
+        page.choose_plate("96-well")
+        none = page.view().next_step
+        assert none is not None
+        assert (none.plugin, none.params) == ("plate-walls", ())
+        assert none.blocked == walls_centres_problem(0)
+        assert none.why == ("the run document has no plate yet",)
+
+        page.refs = CENTRES[:1]
+        one = page.view().next_step
+        assert one is not None
+        assert (one.params, one.blocked) == ((), walls_centres_problem(1))
+
+        page.refs = CENTRES
+        two = page.view().next_step
+        assert two is not None
+        assert list(two.params) == page.page_params("plate-walls")
+        assert two.blocked is None
+        assert two.why == ("the run document has no plate yet", WALLS_STEP_WHY)
     finally:
         page.close()
 

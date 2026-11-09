@@ -267,8 +267,9 @@ def test_what_a_preset_does_not_keep_under_params_is_what_the_page_fills() -> No
     filled = {plugin: set(keys) for plugin, keys in PAGE_PARAMS.items()}
     assert kept_elsewhere.pop("plate-finding") == {"centre_x_um", "centre_y_um"}
     # plate-walls (#346): the page fills its `plate` and its `refs`, and the preset
-    # refuses `refs` only: its `plate` is not yet one the preset holds elsewhere (a
-    # follow-up of #346, in the plugins' table, which that issue does not touch).
+    # refuses `refs` only: its `plate` is not yet one the preset holds elsewhere. That
+    # is #371, in the plugins' table, which #346 does not touch: with it fixed, drop
+    # these two pops and let `kept_elsewhere == filled` say it.
     assert kept_elsewhere.pop("plate-walls") == {"refs"}
     assert filled.pop("plate-walls") == {"plate", "refs"}
     assert kept_elsewhere == filled

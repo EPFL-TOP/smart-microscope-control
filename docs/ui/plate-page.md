@@ -284,9 +284,11 @@ registered one that fills the slot. The region says:
   `plate-registration` and `plate-finding`, or `plate-walls` and `plate-finding`);
 - on the plate, **`plate-walls` is the step when you took its path**, and
   `plate-registration` otherwise. All of these hold: the plate is chosen, the page is
-  not a dry run, the stand can image (an `XYStage` and a `Camera`; a closed stand is
-  drawn for the stand you are about to open), **no wall is captured** (touching walls is
-  `plate-registration`'s own path) and **2 to 6 centres** are captured. Its line says
+  not a dry run, the plate's wells are round (`plate-walls` fits circles and refuses the
+  square wells of a 384- or 1536-well plate), the stand can image (an `XYStage` and a
+  `Camera`; a closed stand is drawn for the stand you are about to open), **no wall is
+  captured** (touching walls is `plate-registration`'s own path) and **2 to 6 centres**
+  are captured. Its line says
   `plate, refs: the 2 centres of B3, D5 captured on this page; plate-walls images each
   well's four walls around its centre and moves the stage in X and Y only`. Until
   `camera-calibration` has been run, its button is disabled and says why (see

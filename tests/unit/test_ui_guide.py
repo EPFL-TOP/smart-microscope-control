@@ -613,15 +613,16 @@ def test_walls_card_lines_show_each_well_then_the_plate() -> None:
     result = _walls_result(
         3.24,
         wells=(
-            _fit("B3", (10182.04, -10087.93), (3, 4, 3, 4)),
+            # The order the wells were measured in, which is not alphabetical.
             _fit("D5", (1.0, 2.0), (2, 3, 2, 3)),
+            _fit("B3", (10182.04, -10087.93), (3, 4, 3, 4)),
         ),
     )
     # §12.6, character for character: the frames of the four sides summed, one decimal
     # on the centre, none on the diameter, two on the rotation.
     assert walls_card_lines(result) == (
-        "B3: centre (10182.0, -10087.9) µm, 15298 µm across, 14 frames",
         "D5: centre (1.0, 2.0) µm, 15298 µm across, 10 frames",
+        "B3: centre (10182.0, -10087.9) µm, 15298 µm across, 14 frames",
         "plate 24-well: residual 3.2 µm, rotation 0.12°",
     )
 

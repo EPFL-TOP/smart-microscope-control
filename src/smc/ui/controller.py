@@ -2913,10 +2913,17 @@ class PlatePage:
         ``plate-registration``'s own path); and the centres captured are a count the
         tool takes. It reads the page's captures as ``_registration_step`` does,
         and takes no lock.
+
+        The plate's wells are round too: the plugin fits circles and refuses a
+        square-welled plate (384, 1536) before anything moves, so the step stays
+        ``plate-registration``, which takes them (FM-182, found by the adversarial
+        review: the step offered the refused click, and again after it failed).
         """
         if not any(p.name == "plate-walls" for p in providers):
             return False
         if not self._plate_chosen or self._dry_run or self.walls:
+            return False
+        if not useq.WellPlate.from_str(self._plate).circular_wells:
             return False
         microscope = self._microscope
         if microscope is not None:
@@ -2930,12 +2937,20 @@ class PlatePage:
     def _walls_step(self, why: list[str]) -> tuple[list[str], str | None]:
         """The pairs of ``plate-walls`` and a line of ``why`` for them: the plate and the centres on this page.
 
-        Called only when ``_walls_is_next`` held, so the plate is chosen and the
-        count is one the tool takes: the pairs are never empty here and nothing
-        is stuck. What can still block it (the calibration, a closed stand) is the
-        tool's own ``blocked``, which the step carries.
+        Called when ``plate-walls`` is the step: after ``_walls_is_next``, or because it
+        is the first provider of the slot (``plate-registration`` did not load). In
+        the second case the plate may be the placeholder and the centres may be
+        none: nothing is then offered, as ``_registration_step`` offers nothing
+        (m5 §11.3), and the sentence that says what to do is the step's. What
+        else can block it (the calibration, a closed stand) is the tool's own
+        ``blocked``, which the step carries.
         """
+        if not self._plate_chosen:
+            return [], PLATE_NOT_CHOSEN
         refs = self.refs
+        problem = walls_centres_problem(len(refs))
+        if problem is not None:
+            return [], problem
         centres = ", ".join(ref.well for ref in refs)
         why.append(
             f"plate, refs: the {len(refs)} centres of {centres} captured on this "

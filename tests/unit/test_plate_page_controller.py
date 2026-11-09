@@ -2117,8 +2117,9 @@ def _walls_result(folder: str | None = "plate-walls/tok") -> PlateResult:
             image_shape_px=(100, 100),
             search_um=3900.0,
             wells=(
-                _walls_fit("B3", (10182.04, -10087.93), 4),
+                # In the order the wells were measured, which is not alphabetical.
                 _walls_fit("D5", (1.0, 2.0), 2),
+                _walls_fit("B3", (10182.04, -10087.93), 4),
             ),
             frames=48,
             folder=folder,
@@ -2143,8 +2144,8 @@ def test_a_plate_walls_card_shows_the_wells_the_plate_and_the_frames_folder(
         # §12.6: one line per well (the frames of its four sides summed), then the
         # plate; not the result's first eight keys with the walls cut away.
         assert card.lines == (
-            "B3: centre (10182.0, -10087.9) µm, 15298 µm across, 16 frames",
             "D5: centre (1.0, 2.0) µm, 15298 µm across, 8 frames",
+            "B3: centre (10182.0, -10087.9) µm, 15298 µm across, 16 frames",
             "plate 24-well: residual 3.2 µm, rotation 0.12°",
         )
         # The folder is the frames the operator may open: under the run folder, built
