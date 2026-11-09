@@ -77,9 +77,11 @@ from smc.ui.guide import (
     busy_note,
     capture_centre_label,
     capture_wall_label,
+    centres_text,
     forget_label,
     preset_differences,
     preset_note_text,
+    wall_touches_note,
 )
 
 __all__ = ["PlatePageView", "build", "card_text", "next_step_text", "serve"]
@@ -532,6 +534,15 @@ class PlatePageView:
         self.forget_button = pn.widgets.Button(label="Forget")
         # Why the three buttons above are disabled with no well: wrapped, as a tool's note.
         self.capture_note = _wrapped_text(extra={"color": _WARNING})
+        # `plate-walls`' own captures (m5 §12.5): the centres only, in its section. Widgets
+        # of their own, never the registration's placed twice: a Panel widget placed
+        # twice in one layout is drawn once, so the second place would be empty and
+        # nothing would fail. `_draw_captures` sets both sets from the one `current`.
+        self.walls_capture_button = pn.widgets.Button(label="Capture centre")
+        self.walls_forget_button = pn.widgets.Button(label="Forget")
+        self.walls_capture_note = _wrapped_text(extra={"color": _WARNING})
+        self.walls_captures_text = pn.pane.Str("")
+        self.walls_touches_note = _wrapped_text()
         self.snap_button = pn.widgets.Button(label="Snap")
         self.live_button = pn.widgets.Button(label=_LIVE_LABEL)
         self.snap_note = pn.pane.Str("", styles={"color": _WARNING})
@@ -588,6 +599,10 @@ class PlatePageView:
             self._handler(lambda event: self.on_capture("wall"))
         )
         self.forget_button.on_click(self._handler(lambda event: self.on_forget()))
+        self.walls_capture_button.on_click(
+            self._handler(lambda event: self.on_capture("centre"))
+        )
+        self.walls_forget_button.on_click(self._handler(lambda event: self.on_forget()))
         self.snap_button.on_click(self._handler(lambda event: self.on_snap()))
         self.live_button.on_click(self._handler(lambda event: self.on_live()))
         self._build_drive()
@@ -925,6 +940,16 @@ class PlatePageView:
                 pn.Row(self.capture_wall_button, self.capture_side_select),
                 self.capture_note,
                 self.captures_text,
+            ]
+        elif tool.name == "plate-walls":
+            # The owner's path (m5 §12.1): the centres of two or three wells, recorded
+            # where the operator reads the tool, above its Run. Not the wall captures:
+            # the tool images the walls itself.
+            parts += [
+                pn.Row(self.walls_capture_button, self.walls_forget_button),
+                self.walls_capture_note,
+                self.walls_captures_text,
+                self.walls_touches_note,
             ]
         if advanced_widgets:
             parts.append(pn.Card(*advanced_widgets, title="Advanced", collapsed=True))
@@ -1610,6 +1635,10 @@ class PlatePageView:
             for w in self.page.walls
         ]
         self.captures_text.object = "\n".join([*refs, *walls]) or "no capture yet"
+        # One read of each for the two texts: another tab may capture between two reads.
+        centres, touches = self.page.refs, self.page.walls
+        self.walls_captures_text.object = centres_text(centres)
+        self.walls_touches_note.object = wall_touches_note(len(touches))
         self._draw_cards()
         self._draw_next()
         self._draw_problems()
@@ -1829,21 +1858,33 @@ class PlatePageView:
         the message. *Forget* reads no stage: only a missing well disables it. A
         disabled button is a courtesy, not a guard (FM-169).
 
+        ``plate-walls``' centre buttons are set here too, from the same ``well``
+        (m5 §12.5): ``_capture_well`` stays one value, so a press on either set
+        records the well its label named, and FM-177's check is one check.
+
         Called by ``_draw_buttons`` and by the *Wall* select's own watcher.
         """
         well = self.page.current
         self._capture_well = well
         side = str(self.capture_side_select.value)
-        self.capture_centre_button.label = capture_centre_label(well)
+        centre_label = capture_centre_label(well)
+        drop_label = forget_label(well)
+        self.capture_centre_button.label = centre_label
         self.capture_wall_button.label = capture_wall_label(well, side)
-        self.forget_button.label = forget_label(well)
+        self.forget_button.label = drop_label
+        self.walls_capture_button.label = centre_label
+        self.walls_forget_button.label = drop_label
         stage_off = not self.page.connected or (
             self._running is not None and not self.page.is_live
         )
         self.capture_centre_button.disabled = stage_off or well is None
         self.capture_wall_button.disabled = stage_off or well is None
         self.forget_button.disabled = well is None
-        self.capture_note.object = "" if well is not None else _NO_WELL_NOTE
+        self.walls_capture_button.disabled = stage_off or well is None
+        self.walls_forget_button.disabled = well is None
+        note = "" if well is not None else _NO_WELL_NOTE
+        self.capture_note.object = note
+        self.walls_capture_note.object = note
 
     def _draw_drive(self) -> None:
         """Every drive control disabled while an activity other than this page's live goes.
