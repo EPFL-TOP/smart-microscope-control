@@ -55,6 +55,7 @@ __all__ = [
     "wall_touches_note",
     "walls_card_lines",
     "walls_centres_problem",
+    "walls_square_wells",
 ]
 
 #: What the scan plan waits for. The page cannot choose wells for the operator:
@@ -284,6 +285,21 @@ def walls_centres_problem(captured: int) -> str | None:
             "centres are captured: Forget some"
         )
     return None
+
+
+def walls_square_wells(plate: str) -> str:
+    """Why ``plate-walls`` does not run on ``plate``, whose wells are square (m5 §12.3, #375).
+
+    The plugin's own refusal, word for word: it fits circles and refuses a 384- or
+    1536-well plate before it moves, and its refusal is a ``failed`` record that
+    replaces a usable plate (m5 §11.4). The page says it beside the button and the
+    controller refuses first, so the operator reads one sentence whoever refuses.
+    A test pins the words to the plugin's.
+    """
+    return (
+        f"plate-walls fits round wells, and the {plate} plate's are square: "
+        "register it with plate-registration"
+    )
 
 
 def centres_text(refs: Sequence[WellRef]) -> str:

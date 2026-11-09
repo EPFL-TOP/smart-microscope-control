@@ -62,6 +62,7 @@ from smc.plugins.slots import CameraCalibration, PlateResult, WellRef
 from smc.run import RunDocument, StageRecord, StageStatus, write_stage
 from smc.testing.fixtures import SampleMicroscopeFactory
 from smc.testing.synthetic import PlateSample, SampleCamera
+from smc.ui.guide import walls_square_wells
 
 pytestmark = [pytest.mark.demo, pytest.mark.filterwarnings("error::RuntimeWarning")]
 
@@ -1054,6 +1055,9 @@ def test_square_wells_are_refused(fake_microscope: Microscope, tmp_path: Path) -
         "plate-walls fits round wells, and the 384-well plate's are square: "
         "register it with plate-registration"
     )
+    # The plate page says the same words beside the button and refuses by them (m5
+    # §12.3, #375): whichever side changes its sentence, this fails.
+    assert refused.reason == walls_square_wells("384-well")
 
 
 @pytest.mark.parametrize(
