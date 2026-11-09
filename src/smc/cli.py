@@ -60,6 +60,7 @@ from smc.hardware.capabilities import (
     Autofocus,
     Camera,
     LightSource,
+    ObjectiveOffset,
     ObjectiveTurret,
     Shutter,
     XYStage,
@@ -1643,6 +1644,61 @@ def objective_list(ctx: typer.Context, profile: ProfileOption = DEMO_NAME) -> No
         current = turret.current()
     for label in labels:
         _say(f"{label!r}  (current)" if label == current else repr(label))
+
+
+def _offset_text(offset: ObjectiveOffset) -> str:
+    """One objective's offset as the read-out prints it; unknown stays ``unknown``, never ``0``."""
+    if offset.xy_um is None:
+        xy = "xy unknown"
+    else:
+        # `+ 0.0` turns a `-0.0` read from the profile into `+0.00`.
+        x_um, y_um = (value + 0.0 for value in offset.xy_um)
+        xy = f"xy ({x_um:+.2f}, {y_um:+.2f}) µm"
+    z = "z unknown" if offset.z_um is None else f"z {offset.z_um + 0.0:+.2f} µm"
+    text = f"{xy}  {z}"
+    return f"{text}  measured {offset.measured}" if offset.measured else text
+
+
+@objective_app.command("offset")
+def objective_offset(ctx: typer.Context, profile: ProfileOption = DEMO_NAME) -> None:
+    """Print each objective's XY and Z offset from the profile's reference objective.
+
+    The offsets are what a plate registered with one objective needs to be
+    scanned with another: the same feature is not centred at the same stage
+    position under both. They are written in the profile's objectives section
+    (objectives.reference and objectives.offsets), measured at the stand with
+    the magnifier lever at 1.0x, and signed as the stage under the objective
+    minus the stage under the reference. An offset that was not measured is
+    printed unknown, never 0. This only reads the profile: the turret does not
+    turn.
+    """
+    with _Reported(ctx), Microscope.open(profile) as microscope:
+        turret = microscope.require(ObjectiveTurret)
+        labels = turret.labels()
+        current = turret.current()
+        # An empty position has no label to measure an offset for.
+        offsets = [turret.offset(label) for label in labels if label.strip()]
+        section = microscope.profile.objectives
+    for offset in offsets:
+        label = offset.objective
+        marker = "  (current)" if label == current else ""
+        body = "reference" if label == offset.reference else _offset_text(offset)
+        _say(f"{label!r}{marker}  {body}")
+    # What the profile names and no turret position carries is a typo or another
+    # stand's label: its offset would never be applied, so the read-out says so.
+    stray = [label for label in section.offsets if label not in labels]
+    if section.reference.strip() and section.reference not in labels:
+        stray.append(section.reference)
+    for label in stray:
+        _say(
+            f"{label!r} is in the profile's [objectives] but not on the turret: "
+            "check the label"
+        )
+    if not section.reference.strip():
+        _say(
+            "the profile names no reference objective ([objectives] reference): "
+            "every offset is unknown"
+        )
 
 
 @objective_app.command("set")

@@ -45,6 +45,7 @@ smc doctor                          # can this machine drive the simulator?
 smc devices                         # the demo devices and the role each one fills
 smc stage jog 100 0 --dry-run       # what a jog would send; the stage stays put
 smc objective list                  # the turret's objectives; `smc objective set <label> --confirm` turns it
+smc objective offset                # each objective's XY and Z offset from the profile's reference (m2 §13)
 smc autofocus engage                # engage, disengage or get the autofocus
 smc autofocus offset --floor        # the offset to its floor, before a first lock (m2 §12.10)
 smc light get                       # the light source: get, on, off
