@@ -190,17 +190,35 @@ A `PlateResult` with `method = "lattice-fit"`:
 | `plate`, `a1_center_xy_um`, `rotation_deg` | The winner: which plate, where A1's centre is, how the plate is turned. |
 | `residual_um`, `scale_error` | `None`: a lattice fit measured no reference well. |
 | `n_refs`, `refs` | `0`, empty: nobody centred a well. |
+| `objective` | The objective the survey was made with, by its turret label; `None` on a stand with no turret. A scan with another objective moves the plate by the profile's offset between the two (m3 §18, `[objectives]`). |
 | `fit.score` | 0 to 1: the absolute correlation with "inside a well". Under 0.25, or with 3 or fewer samples in wells, there is no result. |
 | `fit.polarity` | `1`: wells read brighter than the plastic; `-1`: darker. |
 | `fit.runner_up`, `fit.margin` | The second plate and the winner's score minus its score; both `None` when one plate was fitted. A margin under 0.08 is a note: `96-well (0.80) barely beats 384-well (0.79) — sample more finely, or say which plate it is`. |
 | `fit.n_samples`, `fit.n_inside` | Points sampled, and how many the winner puts inside a well. |
 | `fit.notes` | What is worth saying about how clear the win was. |
 
-It fails, with the reason, in three cases: no plate scores 0.25 (`best score 0.12 is too
+It fails, with the reason, in four cases: no plate scores 0.25 (`best score 0.12 is too
 low to trust — the survey may not have crossed enough wells, or brightness does not
 separate wells from plastic on this plate`), the winner is a larger plate than the
 survey reaches (`6-well fits best, but the survey spans … : run plate-finding with
-plate=6-well`), or too many points failed.
+plate=6-well`), too many points failed, or the objective changed during the survey
+(see [The objective](#the-objective)).
+
+## The objective
+
+One survey is made with one objective: the points it samples lie in that objective's
+frame, and one lattice cannot be fitted to the points of two. The plugin reads the
+turret **before anything moves**, keeps the objective in the checkpoint, and reads it
+again after the last point and before the fit:
+
+- A turret at an empty position is refused before anything moves, as everywhere else
+  (`no objective is in place: the turret is at an empty position; ...`). A stand with
+  no turret records none.
+- If the objective changed while the survey ran (somebody turned the turret) the
+  attempt ends with `the objective changed during the survey, from <a> to <b>: run the
+  survey again without --resume`. The points are kept in the checkpoint but are of two
+  frames, so a resume under either is no answer.
+- The result records the objective (`objective`), for the scan that may use another.
 
 ## Resuming
 
@@ -221,6 +239,13 @@ is not a fingerprint: limits that move and keep the count are not noticed. A che
 that does not fit the survey in other ways (more points handled than it has, counts that
 do not add up) is refused with `run plate-finding without --resume`, and one that does not
 hold the size at all (made before it was kept) is refused by the runner.
+
+The checkpoint also keeps **the objective the survey began with**. A `--resume` with
+another objective in place is refused before anything moves: `the survey began with
+<a> and the objective in place is <b>: turn the turret back to <a> and resume, or run
+the survey again without --resume`. A checkpoint made before the objective was kept has
+none, and is not refused: the result then says `the checkpoint does not record its
+objective: the points sampled before the resume are taken as <objective>'s`.
 
 A fit that failed keeps its survey, and `--resume` fits it again **without moving the
 stage or touching the autofocus**. With the same parameters it gives the same refusal;

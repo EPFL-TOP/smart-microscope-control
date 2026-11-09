@@ -84,6 +84,13 @@ intensity_property = ""        # "" = found by hints on the light_source device
 group = ""                     # "" = the config group named for channels
 exclude = []                   # device labels a capture never records
 
+[objectives]                   # offsets between objectives, all unknown until measured (m2 §13)
+reference = ""                 # "" = no offsets: the objective every offset is measured from, by its turret label
+# [objectives.offsets."1-Plan Fluor 4x"]   # one table per objective but the reference, by its turret label
+# xy_offset_um = [12.5, -4.0]  # stage XY under this objective minus under the reference, the same feature centred
+# z_offset_um = -8.7           # focused Z under this objective minus under the reference
+# measured = "2026-11-12, session 3 (#NNN)"   # required with a value
+
 [quirks]                       # free-form, consumed by backends; documented per key in M2
 
 # [suggest.scan-plan]          # one table per plugin: what this stand suggests for its run
@@ -115,6 +122,8 @@ exclude = []                   # device labels a capture never records
 | `light_source.intensity_property` | The `light_source` device's property that sets how bright, in the device's own units. Used when the device has it and it is writable; otherwise a WARNING, and the hints decide. `""`: the first writable numeric property whose name holds `intensity`, `brightness`, `power`, `level` or `voltage`, one with limits first. With none, the light source has no knob, and `set_intensity_native()` refuses. |
 | `channels.group` | The config group whose presets are channels; printable ASCII, no comma, no leading or trailing space. `""`: the core's channel group if its name holds `channel` and none of `camera`, `objective` or `system`, else the one group so named; with several, none (set this key). It may name a group that does not exist yet: the first `capture()` creates it. |
 | `channels.exclude` | Device labels that `capture()` never records (a `State` device that is not part of a channel). The objective turret is never recorded, listed or not. |
+| `objectives.reference` | The objective every offset is measured from, by its turret label. `""` (the default): no offsets, and every one is unknown. It has no entry of its own: its offset is `(0, 0)` and `0` by definition. Needed as soon as `offsets` has an entry. |
+| `objectives.offsets."<label>"` | One objective's `xy_offset_um` (exactly two numbers), `z_offset_um` and `measured`. Each number is finite, not a boolean and within ±1000 µm (XY) or ±500 µm (Z): chosen guards against a unit or a sign slip, not measurements. A value needs a `measured` that is not blank. A key left out is unknown, never `0`. See [`[objectives]`](#objectives-offsets-between-objectives). |
 | `suggest.<plugin>` | What this stand suggests for that plugin's run, shown by the plate page's next step: see [`[suggest]`](#suggest-what-the-stand-suggests-for-a-run). Allowed on every stand. |
 
 **A capture writes the configuration file.** `Channels.capture(name)` replaces
@@ -131,6 +140,42 @@ The new numeric keys (`lock_timeout_s`, `offset_per_um`'s values,
 Errors name the file, the dotted key and what to change, e.g.
 `profiles/x.toml: … safety.max_jog: unknown key in [safety] — fix the
 spelling or remove it; allowed keys: max_jog_um, …`.
+
+## `[objectives]`: offsets between objectives
+
+A plate registered with the 4x or the 10x (a wide field, walls easy to see) is
+scanned with the 40x. Two objectives do not centre the same feature at the same
+stage position (parcentricity), nor focus it at the same Z (parfocality), so the
+stage would visit a position that is tens of µm off. This section holds what a
+session at the stand measured, and `goto-well` and `scan-plan` move the plate
+by it (m3 §18).
+
+- **The sign.** Offsets are from one reference objective, with the same
+  point-like feature centred in the frame under each, each after a focus:
+  `xy_offset_um(O) = (x_O − x_ref, y_O − y_ref)` in the stage positions
+  `smc stage get` reads, and `offset(O) = p_O − p_ref`. A position found with
+  objective `A` is the position `+ offset(B) − offset(A)` with objective `B`.
+  The shift is a translation, the same for every position on the stage.
+- **The magnifier lever at 1.0x.** The offsets are keyed by objective alone and
+  measured with the Ti2-E's intermediate-magnification lever at 1.0x (the same
+  convention as `camera.pixel_size_um`); whether the lever at 1.5x moves the
+  image's centre is not known (FM-103).
+- **Z is stored and shown, never applied.** The Ti2-E corrects Z by itself on a
+  turn (m2 §13.1, #330), so a Z offset on top would count it twice. `z_offset_um`
+  is the focused Z *after* that correction; `smc objective offset` prints it.
+- **Unknown moves unshifted and says so.** A label without an entry, a profile
+  with no reference and a plate that does not record its objective all give an
+  unmeasured offset: `goto-well` and `scan-plan` use the registration's own
+  positions, say so in `assumed` and log a WARNING. An unknown offset is never
+  taken as zero.
+- **Measuring them** is session 3's job: a point (not a wall) seen with every
+  objective, centred under each, XY and Z read, the 10x again to bound its own
+  repeatability, twice, at two places. The procedure is m2 §13.6, and nothing is
+  entered in `nikon-ti2.toml` before it has run.
+
+`smc objective offset` prints one line per turret label with its offset and
+when it was measured, `unknown` for what was not, and a line for every label of
+the profile that no turret position carries.
 
 ## Shipped profiles
 

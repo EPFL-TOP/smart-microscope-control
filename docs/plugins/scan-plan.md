@@ -24,7 +24,7 @@ smc run scan-plan -p <profile> --run-doc run.json --param wells=B2 --param objec
 |---|---|---|
 | `wells` | (required) | The wells to image: see [Choosing wells](#choosing-wells). Put the whole `--param` item in quotes when the list has a comma or a space (`--param "wells=A1, C*"`): PowerShell 5.1 may read an unquoted comma as its array operator and split the argument in two. Not tried on a Windows shell: check it at the stand. |
 | `serpentine` | true | Visit alternate plate rows in reverse: a raster drives back across the plate at the end of every row, a serpentine does not (for rows next to each other: see [Choosing wells](#choosing-wells)). |
-| `objective` | the one in place | The objective to plan for, by its label on the turret. **The turret is never turned**: this is only whose pixel size the plan uses. |
+| `objective` | the one in place | The objective to plan for, by its label on the turret. **The turret is never turned**: this is whose pixel size the plan uses, and whose frame the plate is moved into: see [The plate in the objective's frame](#the-plate-in-the-objectives-frame). |
 | `overlap` | 0.1 | Fraction of a field shared with its neighbour, from 0 to under 0.9. A cell on a boundary then appears whole in one of two fields. |
 | `coverage` | 1.0 | Fraction of the well's width the grid spans: 1 is edge to edge, 0.33 the middle third (up to 1.5, which runs past the well). Ignored when `rows` and `columns` are given. |
 | `rows`, `columns` | derived | Fields along Y and along X, 1 to 100 each. Give both or neither. |
@@ -32,9 +32,9 @@ smc run scan-plan -p <profile> --run-doc run.json --param wells=B2 --param objec
 | `pixel_size_um` | none | Plan with this pixel size (rotation 0, no mirror) instead of a calibration's or the profile's. |
 
 The demo has no plate, so the run document needs a `plate` stage first (here one
-written for the occasion: a 96-well plate with A1 at `(1000, -500)`). The result of a
-run on the demo, with the 10× in place and the camera's own 1.0 µm per pixel, looks
-like this (abridged):
+written for the occasion: a 96-well plate with A1 at `(1000, -500)`, registered with the
+10×). The result of a run on the demo, with the 10× in place and the camera's own 1.0 µm
+per pixel, looks like this (abridged):
 
 ```text
 $ smc run scan-plan -p demo --run-doc run.json --param wells=A1:B2 --param rows=2 --param columns=3
@@ -57,9 +57,37 @@ $ smc run scan-plan -p demo --run-doc run.json --param wells=A1:B2 --param rows=
     { "well": "A1", "index": 0, "name": "A1_0000", "x_um": 539.2, "y_um": -269.6 },
     ...
   ],
-  "estimate_s": null
+  "estimate_s": null,
+  "plate_objective": "Nikon 10X S Fluor",
+  "objective_shift_um": [0.0, 0.0]
 }
 ```
+
+## The plate in the objective's frame
+
+A plate registered with the 4x or the 10x is scanned with the 40x, and two objectives
+do not centre the same feature at the same stage position. The `plate` records the
+objective it was registered with (`objective`, see
+[`plate-registration`](plate-registration.md#the-objective-the-plate-was-registered-with)),
+and the plan moves it into the frame of the objective it is **for** (`objective`, in
+place or asked for) before a field is laid, by the offset between the two in the
+profile's `[objectives]` ([`profiles/README.md`](../../profiles/README.md#objectives-offsets-between-objectives)).
+So `plate_plan`, every field and the `scan` that visits them are the planned
+objective's, and A1, every well centre and every field move by the same shift. Only XY
+moves: no Z offset is applied. It is the planned objective that counts when it is not the
+one in place: `scan` refuses to run a plan with another objective in place.
+
+The result keeps `plate_objective` and `objective_shift_um`:
+
+| `plate_objective`, `objective_shift_um` | Case |
+|---|---|
+| the planned objective, `[0.0, 0.0]` | The plate was registered with the planned objective: nothing is moved, and no line is added. |
+| another objective, `[-37.5, 12.25]` | The offset between them is measured: every field and every well is the registration's plus the shift. |
+| `null` | The plate does not record its objective, the objective in use is unknown (a stand with no turret), or the offset is not measured (no reference, or no entry for one of the two): the fields are the registration's own, **not corrected**. The first line of `assumed`, before the camera's, says which, and a WARNING is logged. Unknown is never taken as zero. |
+
+The profiles hold no offset until session 3 has measured them (m2 §13.6), so until then
+a plan for another objective than the one the plate was registered with says that it is
+not corrected.
 
 ## Choosing wells
 
@@ -238,10 +266,13 @@ The slot `scan-plan` holds a `ScanPlanResult` (`smc.plugins.slots`): `plate_plan
 `GridRowsColumns`), `wells`, `objective`, `pixel_size_um`, `matrix_um_per_px`,
 `matrix_source`, `image_shape_px` (`(height, width)`), `fov_um` (`(width, height)` in
 stage axes), `overlap`, `rows`, `columns`, `fields` (`well`, `index`, `name`, `x_um`,
-`y_um`, in visiting order), `estimate_s` and `assumed`. A failed run fills no slot.
+`y_um`, in visiting order), `estimate_s`, `plate_objective`, `objective_shift_um` and
+`assumed`. A failed run fills no slot.
 
 ## Not verified here
 
 Nothing in this page was measured on a microscope. The Ti2-E's pixel size at 40× (0.275 µm
 per pixel is the datasheet's, assumed) and its camera's rotation, and what a plan costs
-there, are for the first hardware session (#198).
+there, are for the first hardware session (#198). The offsets between objectives, that
+they are a translation, and a plate registered at 4× and scanned at 40× are for session 3
+(m2 §13.6, #340).
