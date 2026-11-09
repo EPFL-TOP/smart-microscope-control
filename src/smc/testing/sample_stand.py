@@ -24,6 +24,7 @@ import logging
 import math
 import threading
 import weakref
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -186,12 +187,13 @@ def sample_refs(section: SampleSection) -> tuple[WellRef, ...]:
 def sample_lines(section: SampleSection) -> tuple[str, ...]:
     """What ``smc doctor`` says about the sample: what it is and what it is not.
 
-    Three lines, printed with ``_say`` and never as markup (FM-36). ASCII
-    apart from ``µ`` and ``°``, which cp1252 has: a redirected doctor on Windows
-    prints them (FM-20).
+    Three lines, and a fourth when the objectives are offset (``[sample]
+    objective_shift_um``), printed with ``_say`` and never as markup (FM-36).
+    ASCII apart from ``µ`` and ``°``, which cp1252 has: a redirected doctor on
+    Windows prints them (FM-20).
     """
     x_um, y_um = _a1_of(section)
-    return (
+    lines = (
         f"Sample: a synthetic {section.plate} plate, A1 at ({x_um:.1f}, {y_um:.1f}) µm, "
         f"turned {section.rotation_deg:g}°; {section.cells_per_well} cells per well on "
         f"average, {section.doublet_fraction * 100:g} % of them doublets "
@@ -201,6 +203,13 @@ def sample_lines(section: SampleSection) -> tuple[str, ...]:
         f"  pixel sizes up to {TEXTURE_TILE_UM:g} µm (the texture aliases above); the "
         "cells are bright round spots: run cells with detector=blobs",
     )
+    if not section.objective_shift_um:
+        return lines
+    shifts = ", ".join(
+        f"'{label}' ({sx:+.2f}, {sy:+.2f}) µm"
+        for label, (sx, sy) in section.objective_shift_um.items()
+    )
+    return (*lines, f"  the objectives are offset: {shifts}")
 
 
 class StandSampleCamera:
@@ -232,6 +241,11 @@ class StandSampleCamera:
         inner: The stand's own camera, which this one wraps.
         camera_rotation_deg: Rotation of the camera about the optical axis.
         mirrored: Whether the image is flipped left-right.
+        objective_shift_um: Turret label -> ``(x, y)`` µm. Under that objective
+            the sample is rendered as if the stage stood at its position minus
+            the shift, so a feature is centred at its position plus the shift
+            (the offsets of m2 §13.2). A label with no entry has none. Empty
+            or ``None``: the turret is never read and nothing is shifted.
     """
 
     def __init__(
@@ -242,12 +256,15 @@ class StandSampleCamera:
         *,
         camera_rotation_deg: float = 0.0,
         mirrored: bool = False,
+        objective_shift_um: Mapping[str, tuple[float, float]] | None = None,
     ) -> None:
         self._microscope = weakref.ref(microscope)
         self._sample = sample
         self._inner = inner
         self._rotation_deg = camera_rotation_deg
         self._mirrored = mirrored
+        # A copy: a profile's table is not edited through the camera.
+        self._shift_um = dict(objective_shift_um) if objective_shift_um else {}
         self._render_lock = threading.Lock()
         self._warned_about_the_texture = False
 
@@ -285,6 +302,13 @@ class StandSampleCamera:
                 "that has it"
             )
         position = microscope.require(XYStage).position_um()
+        at_x_um, at_y_um = position.x_um, position.y_um
+        if self._shift_um:
+            shift_x_um, shift_y_um = self._shift_um.get(
+                _objective_in_place(microscope), (0.0, 0.0)
+            )
+            at_x_um -= shift_x_um
+            at_y_um -= shift_y_um
         z_stage = microscope.get(ZStage)
         z_um = 0.0 if z_stage is None else z_stage.position_um()
         exposure_ms = self._inner.exposure_ms()
@@ -292,8 +316,8 @@ class StandSampleCamera:
         with self._render_lock:
             try:
                 return self._sample.render(
-                    position.x_um,
-                    position.y_um,
+                    at_x_um,
+                    at_y_um,
                     z_um,
                     shape=(int(shape[0]), int(shape[1])),
                     pixel_size_um=pixel_size_um,
@@ -336,6 +360,17 @@ class StandSampleCamera:
     def pixel_size_um(self) -> float:
         """The stand camera's pixel size, for the objective in place: ``0.0`` is unknown."""
         return self._inner.pixel_size_um()
+
+
+def _objective_in_place(microscope: Microscope) -> str:
+    """The turret's label, read for the sample's shift; ``""`` on a stand with no turret.
+
+    A read that fails is not turned into "no shift": the frame would then show
+    the sample where the objective does not put it, and look like a measurement.
+    The ``HardwareError`` is the snap's own refusal.
+    """
+    turret = microscope.get(ObjectiveTurret)
+    return "" if turret is None else turret.current()
 
 
 def _objective_name(microscope: Microscope) -> str:
@@ -381,6 +416,7 @@ def install_sample(microscope: Microscope, section: SampleSection) -> StandSampl
         microscope.require(Camera),
         camera_rotation_deg=section.camera_rotation_deg,
         mirrored=section.mirrored,
+        objective_shift_um=dict(section.objective_shift_um),
     )
     microscope.override(Camera, camera)
     log.info(

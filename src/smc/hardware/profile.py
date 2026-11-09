@@ -715,6 +715,12 @@ class SampleSection(_Section):
     doublet_fraction: float = 0.3
     cell_radius_um: float = 5.0
     seed: int = 0
+    #: Turret label -> ``[x, y]`` µm: under that objective the camera images the
+    #: sample as if the stage stood at its position minus this, so a feature is
+    #: centred at its position plus this (the offsets of m2 §13.2, from an
+    #: objective whose shift is zero). Empty: no objective is offset, and the
+    #: camera reads no turret (m3 §20.8).
+    objective_shift_um: dict[str, tuple[float, float]] = Field(default_factory=dict)
 
     @field_validator(
         "a1_center_xy_um",
@@ -843,6 +849,49 @@ class SampleSection(_Section):
             raise ValueError(
                 f"seed must be zero or a positive whole number, got {value}"
             )
+        return value
+
+    @field_validator("objective_shift_um", mode="before")
+    @classmethod
+    def _shifts_are_two_numbers(cls, value: Any) -> Any:
+        # Anything that is not a table is left to pydantic, which names the type.
+        if not isinstance(value, dict):
+            return value
+        for label, shift in value.items():
+            what = f"objective_shift_um[{label!r}]"
+            if isinstance(shift, (list, tuple)):
+                if len(shift) != 2:
+                    raise ValueError(
+                        f"{what} must be exactly two numbers, [x, y] in µm; got "
+                        f"{len(shift)}: {list(shift)}"
+                    )
+                for number in shift:
+                    # pydantic reads `true` as 1.0 µm, a plausible shift (FM-104).
+                    _no_boolean(f"each number of {what}", number)
+        return value
+
+    @field_validator("objective_shift_um")
+    @classmethod
+    def _shifts_are_finite_and_bounded(
+        cls, value: dict[str, tuple[float, float]]
+    ) -> dict[str, tuple[float, float]]:
+        # A label that is not on the turret is not checked: the profile cannot
+        # know the turret's labels, and such an entry has no effect.
+        for label, shift in value.items():
+            if not label.strip():
+                raise ValueError(
+                    "objective_shift_um must name a turret label: give "
+                    '{ "<label>" = [x, y] }, not an empty one'
+                )
+            if not all(
+                math.isfinite(number) and abs(number) <= MAX_XY_OFFSET_UM
+                for number in shift
+            ):
+                raise ValueError(
+                    f"objective_shift_um[{label!r}] must be two finite numbers of "
+                    f"µm, each within ±{MAX_XY_OFFSET_UM:g} (the bound of the "
+                    f"profile's offsets); got {list(shift)}"
+                )
         return value
 
 

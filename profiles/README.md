@@ -212,6 +212,7 @@ origin; `profiles/demo-sample.toml` writes each one out.
 | `doublet_fraction` | `0.3` | The share of cells that are two spots side by side, in [0, 1]. |
 | `cell_radius_um` | `5.0` | The radius of a cell's spot, in [1e-6, 50] µm. |
 | `seed` | `0` | The same seed gives the same cells, texture and noise. |
+| `objective_shift_um` | `{}` | Turret label → `[x, y]` µm, each within ±1000: under that objective a feature is centred at its stage position plus this, the offsets of `[objectives]` (m2 §13.2) from an objective whose shift is zero. A label with no entry has none. Empty: the camera reads no turret. It lets `objective-offsets` recover a declared shift on the demo (m3 §20.8). |
 
 A `[sample]` is refused with a `micromanager.config` other than `""` (synthetic frames
 over a real stage would look like a working stand), with a plate that is not a `useq`

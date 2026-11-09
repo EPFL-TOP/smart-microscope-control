@@ -68,6 +68,7 @@ cells_per_well = 40            # the mean over the columns: half in the first, o
 doublet_fraction = 0.3         # the share of cells that are two spots side by side, in [0, 1]
 cell_radius_um = 5.0           # the radius of a cell's spot, in [1e-6, 50]
 seed = 0                       # the same seed gives the same cells, texture and noise
+# objective_shift_um = {}      # turret label -> [x, y] µm: under it a feature is centred at its position plus this (m3 §20.8)
 
 # What this stand suggests for a tool's run: the pairs `smc run --param` takes, and why.
 # The plate page offers them in its next step (docs/design/m5-web-ui.md §8.1, #293).

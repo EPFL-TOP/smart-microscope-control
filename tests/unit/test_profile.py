@@ -1458,11 +1458,14 @@ def test_demo_sample_toml_loads_and_names_its_sample() -> None:
 def test_demo_sample_toml_writes_every_sample_key() -> None:
     # A key added to SampleSection without a line here would go undocumented. The
     # keys are the file's parsed ones, not a substring search (`rotation_deg` is in
-    # `camera_rotation_deg`), and A1's own line is commented out on purpose.
+    # `camera_rotation_deg`), and A1's own line and the objectives' shifts are
+    # commented out on purpose (an empty table is the default; m3 §20.8).
     text = DEMO_SAMPLE_TOML.read_text(encoding="utf-8")
     written = set(profile_module.tomllib.loads(text)["sample"])
-    assert written == set(SampleSection.model_fields) - {"a1_center_xy_um"}
+    commented = {"a1_center_xy_um", "objective_shift_um"}
+    assert written == set(SampleSection.model_fields) - commented
     assert "\n# a1_center_xy_um = " in text
+    assert "\n# objective_shift_um = " in text
 
 
 def test_a_sample_table_is_refused_with_a_micromanager_config(tmp_path: Path) -> None:
@@ -1564,8 +1567,12 @@ def test_the_smallest_cell_radius_is_the_renderers_smallest_spot() -> None:
 
 #: Every number of [sample] and the TOML that is a boolean where it stands.
 _BOOLEAN_FOR = {"a1_center_xy_um": "[true, 0]"}
+#: ``objective_shift_um`` is a table of pairs: its booleans are refused in a test of
+#: its own, below.
 _NUMERIC_SAMPLE_KEYS = [
-    key for key in SampleSection.model_fields if key not in ("plate", "mirrored")
+    key
+    for key in SampleSection.model_fields
+    if key not in ("plate", "mirrored", "objective_shift_um")
 ]
 
 
@@ -1636,6 +1643,96 @@ def test_too_many_cells_for_the_plate_are_refused(tmp_path: Path) -> None:
     )
     assert loaded.sample is not None
     assert loaded.sample.cells_per_well == 130
+
+
+def test_a_sample_has_no_objective_shift_by_default(tmp_path: Path) -> None:
+    sample = Profile.load(write_profile(tmp_path / "p.toml", "[sample]\n")).sample
+
+    assert sample is not None
+    assert sample.objective_shift_um == {}
+    # Each section holds a table of its own, not one shared by every default.
+    assert SampleSection().objective_shift_um is not SampleSection().objective_shift_um
+
+
+def test_a_sample_loads_a_shift_per_objective_label(tmp_path: Path) -> None:
+    body = (
+        "[sample]\nobjective_shift_um = { 'Nikon 10X S Fluor' = [5, -2.5], "
+        "'Nikon 40X Plan Fluor ELWD' = [-32.5, 9.75] }\n"
+    )
+
+    sample = Profile.load(write_profile(tmp_path / "p.toml", body)).sample
+
+    assert sample is not None
+    assert sample.objective_shift_um == {
+        "Nikon 10X S Fluor": (5.0, -2.5),
+        "Nikon 40X Plan Fluor ELWD": (-32.5, 9.75),
+    }
+
+
+def test_a_shift_on_the_profiles_bound_loads_and_a_label_off_the_turret_too(
+    tmp_path: Path,
+) -> None:
+    # The profile cannot know the turret's labels: one it does not have loads
+    # and has no effect; the bound is the offsets' own, ±1000 µm, inclusive.
+    body = "[sample]\nobjective_shift_um = { 'no such label' = [1000, -1000] }\n"
+
+    sample = Profile.load(write_profile(tmp_path / "p.toml", body)).sample
+
+    assert sample is not None
+    assert sample.objective_shift_um == {"no such label": (1000.0, -1000.0)}
+
+
+@pytest.mark.parametrize(
+    ("value", "says"),
+    [
+        ("{ 'x' = [true, 0] }", "sample.objective_shift_um: each number of"),
+        ("{ 'x' = [0, false] }", "sample.objective_shift_um: each number of"),
+        ("{ 'x' = [nan, 0] }", "sample.objective_shift_um: objective_shift_um['x']"),
+        ("{ 'x' = [0, inf] }", "sample.objective_shift_um: objective_shift_um['x']"),
+        ("{ 'x' = [1, 2, 3] }", "sample.objective_shift_um: objective_shift_um['x']"),
+        ("{ 'x' = [1] }", "sample.objective_shift_um: objective_shift_um['x']"),
+        ("{ 'x' = [1000.5, 0] }", "sample.objective_shift_um: objective_shift_um['x']"),
+        (
+            "{ 'x' = [0, -1000.5] }",
+            "sample.objective_shift_um: objective_shift_um['x']",
+        ),
+        # pydantic names the label in the place of an entry that is not a pair.
+        ("{ 'x' = 5 }", "sample.objective_shift_um.x: Input should be a valid tuple"),
+        ("[5, 6]", "sample.objective_shift_um: Input should be a valid dictionary"),
+    ],
+    ids=[
+        "boolean-x",
+        "boolean-y",
+        "nan",
+        "inf",
+        "three-numbers",
+        "one-number",
+        "past-the-bound-x",
+        "past-the-bound-y",
+        "a-number-for-a-pair",
+        "a-list-for-a-table",
+    ],
+)
+def test_sample_objective_shift_refuses_a_boolean_nan_three_numbers_and_the_bound(
+    tmp_path: Path, value: str, says: str
+) -> None:
+    msg = _load_error(tmp_path, f"[sample]\nobjective_shift_um = {value}\n")
+
+    # One problem, at the key (or the label in it), and the words that say what to change.
+    assert "1 problem(s)" in msg
+    assert f"  - {says}" in msg
+
+
+@pytest.mark.parametrize("label", ["", " "], ids=["empty", "blank"])
+def test_sample_objective_shift_refuses_a_blank_label(
+    tmp_path: Path, label: str
+) -> None:
+    msg = _load_error(
+        tmp_path, f"[sample]\nobjective_shift_um = {{ '{label}' = [1, 2] }}\n"
+    )
+
+    assert "  - sample.objective_shift_um:" in msg
+    assert "must name a turret label" in msg
 
 
 def test_the_cell_bound_is_the_one_the_stand_imports() -> None:
