@@ -5035,6 +5035,11 @@ def test_cells_offers_the_detector_as_a_key_parameter(
         "device",
         "max_overlap",
         "merge_radius_um",
+        # The model's pre-processing (#342): the page lists every parameter of a plugin.
+        "model_um_per_px",
+        "low_percentile",
+        "high_percentile",
+        "checked_um_per_px",
     }
     detector = cells.key[0]
     assert "blobs" in " ".join(str(part) for part in detector)

@@ -43,7 +43,12 @@ from smc.plugins import (
     run_plugin,
 )
 from smc.plugins.cells import plugin as plugin_mod
-from smc.plugins.cells.detector import BLOB_DETECTOR, BLOB_DETECTOR_IDENTITY, Detection
+from smc.plugins.cells.detector import (
+    BLOB_DETECTOR,
+    BLOB_DETECTOR_IDENTITY,
+    Detection,
+    Preprocessing,
+)
 from smc.plugins.cells.plugin import CellsParams, CellsPlugin
 from smc.plugins.slots import (
     Cell,
@@ -101,9 +106,20 @@ def _install(monkeypatch: pytest.MonkeyPatch, stub: _Stub) -> list[dict[str, Any
     """Make ``load_detector`` give ``stub``; the calls it received are returned."""
     calls: list[dict[str, Any]] = []
 
-    def fake(model_path: Path | None, *, device: str, score_threshold: float) -> _Stub:
+    def fake(
+        model_path: Path | None,
+        *,
+        device: str,
+        score_threshold: float,
+        preprocessing: Preprocessing,
+    ) -> _Stub:
         calls.append(
-            {"path": model_path, "device": device, "threshold": score_threshold}
+            {
+                "path": model_path,
+                "device": device,
+                "threshold": score_threshold,
+                "preprocessing": preprocessing,
+            }
         )
         return stub
 
@@ -296,7 +312,15 @@ def test_the_parameters_reach_the_detector(
 
     record = _run(demo_microscope, tmp_path, score_threshold=0.8)
 
-    assert calls == [{"path": weights, "device": "cpu", "threshold": 0.8}]
+    assert calls == [
+        {
+            "path": weights,
+            "device": "cpu",
+            "threshold": 0.8,
+            # No new parameter: the model as it was trained, its own resize and percentiles.
+            "preprocessing": Preprocessing(percentiles=(0.5, 99.5), input_size_px=None),
+        }
+    ]
     assert _result(record).score_threshold == 0.8
 
 
@@ -364,8 +388,13 @@ def test_the_merge_radius_is_named_as_chosen_and_not_measured(
     _weights(tmp_path)
     _install(monkeypatch, _Stub({}))
 
-    chosen = _result(_run(demo_microscope, tmp_path, merge_radius_um=3.5))
-    off = _result(_run(demo_microscope, tmp_path, merge_radius_um=0.0))
+    # The scan is at 0.5 um per pixel: checked there, the model adds no line of its own.
+    chosen = _result(
+        _run(demo_microscope, tmp_path, merge_radius_um=3.5, checked_um_per_px=0.5)
+    )
+    off = _result(
+        _run(demo_microscope, tmp_path, merge_radius_um=0.0, checked_um_per_px=0.5)
+    )
 
     assert chosen.assumed == (
         "cells within 3.5 µm seen by two fields are counted once: a chosen radius, "
@@ -373,6 +402,245 @@ def test_the_merge_radius_is_named_as_chosen_and_not_measured(
     )
     assert off.assumed == ()
     assert (chosen.merge_radius_um, off.merge_radius_um) == (3.5, 0.0)
+
+
+# ------------------------------------------- the model's pre-processing (m3 §9.4, #342)
+#
+# The scan is 60 x 80 pixels at 0.5 um, not square (FM-73). The expected input
+# sizes are worked out by hand: shown at 0.1 um the frame has 5 times the pixels,
+# 300 x 400; shown at 0.5 it is the frame itself, 60 x 80, far under the 256 pixels
+# the model is given.
+
+MERGE_LINE = "cells within 5 µm seen by two fields are counted once: a chosen radius, not measured"
+UNCHECKED_LINE = (
+    "the model's detections were not measured on frames of this stand: "
+    "checked_um_per_px is not set (docs/plugins/cells.md)"
+)
+
+
+def _preprocessing_of(calls: list[dict[str, Any]]) -> Preprocessing:
+    (call,) = calls
+    preprocessing = call["preprocessing"]
+    assert isinstance(preprocessing, Preprocessing)
+    return preprocessing
+
+
+def test_model_um_per_px_sets_the_model_input_from_the_scan_pixel_size(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_scan(tmp_path)
+    _weights(tmp_path)
+    calls = _install(monkeypatch, _Stub({}))
+
+    _run(demo_microscope, tmp_path, model_um_per_px=0.1)
+
+    # (min_size, max_size) = (short side, long side) = (60, 80) x 0.5 / 0.1.
+    assert _preprocessing_of(calls).input_size_px == (300, 400)
+
+
+def test_without_model_um_per_px_the_model_keeps_its_own_resize(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_scan(tmp_path)
+    _weights(tmp_path)
+    calls = _install(monkeypatch, _Stub({}))
+
+    _run(demo_microscope, tmp_path)
+
+    assert _preprocessing_of(calls).input_size_px is None
+
+
+def test_the_percentiles_reach_the_detector(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_scan(tmp_path)
+    _weights(tmp_path)
+    calls = _install(monkeypatch, _Stub({}))
+
+    _run(demo_microscope, tmp_path, low_percentile=1.0, high_percentile=99.0)
+
+    # Low first, high second: a pair that was exchanged would be refused by
+    # `Preprocessing`, and one built from the wrong parameters would not read (1, 99).
+    assert _preprocessing_of(calls).percentiles == (1.0, 99.0)
+
+
+def test_a_model_input_out_of_bounds_is_refused_before_the_model_loads(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """60 x 80 at 0.5 shown at 0.5 is 60 x 80 pixels: under the 256 the model is given."""
+    _seed_scan(tmp_path)
+    _weights(tmp_path)
+    calls = _install(monkeypatch, _Stub({}))
+
+    with pytest.raises(PluginRunError) as caught:
+        _run(demo_microscope, tmp_path, model_um_per_px=0.5)
+
+    assert "model_um_per_px" in caught.value.reason
+    assert "60x80" in caught.value.reason
+    assert calls == []  # 166 MB of weights were not read for it
+    record = _stored(tmp_path)
+    assert record.status is StageStatus.failed
+
+
+def test_an_unchecked_model_says_so_in_assumed(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_scan(tmp_path)
+    _weights(tmp_path)
+    _install(monkeypatch, _Stub({}))
+
+    result = _result(_run(demo_microscope, tmp_path))
+
+    assert result.assumed == (UNCHECKED_LINE, MERGE_LINE)
+
+
+def test_a_scan_far_from_the_checked_pixel_size_says_so(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_scan(tmp_path)
+    _weights(tmp_path)
+    _install(monkeypatch, _Stub({}))
+
+    # The scan is at 0.5 um per pixel, checked at 0.55: 9.1 % under it.
+    result = _result(_run(demo_microscope, tmp_path, checked_um_per_px=0.55))
+
+    assert result.assumed == (
+        "the frames are at 0.5 µm per pixel and the model was checked at 0.55 µm per "
+        "pixel: its counts at this pixel size are not measured",
+        MERGE_LINE,
+    )
+
+
+def test_a_scan_within_five_percent_of_the_checked_pixel_size_adds_nothing(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_scan(tmp_path)
+    _weights(tmp_path)
+    _install(monkeypatch, _Stub({}))
+
+    # 0.5 against 0.51 is 2.0 % under it.
+    result = _result(_run(demo_microscope, tmp_path, checked_um_per_px=0.51))
+
+    assert result.assumed == (MERGE_LINE,)
+
+
+@pytest.mark.parametrize(
+    ("checked", "says"),
+    [
+        (0.4762, False),  # 0.5 / 0.4762 - 1 = +4.998 %
+        (0.4761, True),  # +5.020 %
+        (0.5262, False),  # 0.5 / 0.5262 - 1 = -4.979 %
+        (0.5264, True),  # -5.015 %
+    ],
+)
+def test_the_tolerance_on_the_checked_pixel_size_is_five_percent_of_the_checked_one(
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checked: float,
+    says: bool,
+) -> None:
+    """Relative to the checked size, on both sides: ``abs(p / c - 1) > 0.05``."""
+    _seed_scan(tmp_path)
+    _weights(tmp_path)
+    _install(monkeypatch, _Stub({}))
+
+    result = _result(_run(demo_microscope, tmp_path, checked_um_per_px=checked))
+
+    assert (len(result.assumed) == 2) is says
+
+
+def test_the_checked_pixel_size_changes_nothing_in_the_detection(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_scan(tmp_path)
+    _weights(tmp_path)
+    calls = _install(monkeypatch, _Stub(SCRIPT))
+
+    result = _result(_run(demo_microscope, tmp_path, checked_um_per_px=0.55))
+
+    assert _preprocessing_of(calls) == Preprocessing()
+    assert result.counts["A1"] == {"single": 1, "doublet": 1, "debris": 0}
+
+
+def test_the_blob_detector_says_nothing_of_a_checked_model(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    _seed_scan(tmp_path)
+
+    result = _result(_blobs(demo_microscope, tmp_path, merge_radius_um=0.0))
+
+    assert not any("checked_um_per_px" in line for line in result.assumed)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "model_um_per_px=0.1",
+        "checked_um_per_px=0.5",
+        "low_percentile=1",
+        "high_percentile=99",
+    ],
+)
+def test_blobs_refuse_the_model_preprocessing(extra: str) -> None:
+    name = extra.split("=")[0]
+
+    with pytest.raises(ParamsError) as caught:
+        parse_params(CellsParams, ["detector=blobs", extra])
+
+    assert f"{name} is for detector=model" in str(caught.value)
+    assert "blob detector" in str(caught.value)
+
+
+def test_blobs_take_the_trained_percentiles_when_they_are_given() -> None:
+    params = parse_params(
+        CellsParams, ["detector=blobs", "low_percentile=0.5", "high_percentile=99.5"]
+    )
+
+    assert params.detector == "blobs"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "model_um_per_px=0",
+        "model_um_per_px=-0.3",
+        "model_um_per_px=nan",
+        "model_um_per_px=inf",
+        "model_um_per_px=11",
+        "checked_um_per_px=0",
+        "checked_um_per_px=nan",
+        "checked_um_per_px=11",
+        "low_percentile=-1",
+        "low_percentile=50",
+        "low_percentile=nan",
+        "high_percentile=50",
+        "high_percentile=101",
+        "high_percentile=nan",
+    ],
+)
+def test_the_preprocessing_parameters_are_bounded(bad: str) -> None:
+    with pytest.raises(ParamsError):
+        parse_params(CellsParams, [bad])
+
+
+def test_a_resume_with_another_model_input_size_is_refused(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cells of two pre-processings are not one result: the runner refuses it on the parameters."""
+    _seed_scan(tmp_path)
+    _weights(tmp_path)
+    stop = threading.Event()
+    _install(monkeypatch, _Stub(SCRIPT, on_frame=_stopping_at(2, stop)))
+    _run(demo_microscope, tmp_path, stop=stop, model_um_per_px=0.1)
+    counting = _Stub(SCRIPT)
+    _install(monkeypatch, counting)
+
+    with pytest.raises(ResumeError) as caught:
+        _run(demo_microscope, tmp_path, resume=True, model_um_per_px=0.11)
+
+    assert "model_um_per_px" in str(caught.value)
+    assert counting.seen == []
 
 
 # --------------------------------------------------------------- bad frames
@@ -734,6 +1002,9 @@ def test_the_parameters_default_to_the_designs_values() -> None:
     assert params.score_threshold == 0.5
     assert params.max_overlap == 0.7
     assert params.merge_radius_um == 5.0
+    assert params.model_um_per_px is None
+    assert (params.low_percentile, params.high_percentile) == (0.5, 99.5)
+    assert params.checked_um_per_px is None
 
 
 def test_seconds_per_frame_is_the_mean_of_the_detect_times(
