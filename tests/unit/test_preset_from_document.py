@@ -362,6 +362,14 @@ CASES: dict[str, list[dict[str, Any]]] = {
         },
     ],
     "density": [{"area_grid_um": 12.5}],
+    "focus-on-cells": [
+        {
+            "range_um": 2.5,
+            "step_um": 0.5,
+            "score": "gradient-energy",
+            "relock": False,
+        }
+    ],
     "goto-well": [{"well": "B2", "side": "-X"}],
     "nis-export": [{"out": "/tmp/x y/out.xml", "overwrite": True}],
     "objective-offsets": [

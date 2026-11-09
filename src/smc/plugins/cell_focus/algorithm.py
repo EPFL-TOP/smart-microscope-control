@@ -41,6 +41,7 @@ __all__ = [
     "first_outside",
     "plan_planes",
     "score_frame",
+    "sweep_size_problem",
 ]
 
 ScoreName = Literal[
@@ -162,6 +163,29 @@ def plan_planes(centre_um: float, range_um: float, step_um: float) -> tuple[floa
             f"planes, more than {MAX_PLANES}"
         )
     return tuple(centre_um + i * step_um for i in range(-k, k + 1))
+
+
+def sweep_size_problem(
+    range_um: float, step_um: float, range_name: str, step_name: str
+) -> str | None:
+    """Why a range and a step make no sweep, naming both parameters; ``None`` when they do.
+
+    The parameters' model validators call it (the tool's and the scan's), so
+    a bad pair is refused when the parameters are read, before the stand
+    opens, rather than at the first field.
+    """
+    if step_um > range_um:
+        return (
+            f"{step_name}={step_um:g} is above {range_name}={range_um:g}: a sweep "
+            "needs at least one step on each side of its centre"
+        )
+    planes = 2 * math.floor(range_um / step_um + _WHOLE_STEPS_SLACK) + 1
+    if planes > MAX_PLANES:
+        return (
+            f"{range_name}={range_um:g} with {step_name}={step_um:g} makes {planes} "
+            f"planes, more than {MAX_PLANES}: take a larger step or a smaller range"
+        )
+    return None
 
 
 def first_outside(

@@ -15,22 +15,109 @@ putting either back would move Z after a stop (FM-88).
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Sequence
-from typing import Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
 
-from smc.hardware.capabilities import Autofocus, Camera, ZStage
-from smc.plugins.cell_focus.algorithm import LANDING_FRACTION, ScoreName, score_frame
+from smc.hardware.capabilities import Autofocus, Camera, Limits, ZStage
+from smc.hardware.safety import DEFAULT_MAX_Z_JOG_UM
+from smc.plugins.cell_focus.algorithm import (
+    LANDING_FRACTION,
+    ScoreName,
+    first_outside,
+    plan_planes,
+    score_frame,
+)
+from smc.plugins.errors import PluginRunError
+
+if TYPE_CHECKING:
+    from smc.hardware.microscope import Microscope
 
 __all__ = [
     "AutofocusStillOn",
     "FocusDriveOffTarget",
+    "SweepBounds",
+    "check_sweep_bounds",
     "move_checked",
+    "outside_limits",
     "sweep",
     "switch_off_for_sweep",
 ]
+
+
+@dataclass(frozen=True)
+class SweepBounds:
+    """What the checks before a sweep read: the soft limits and the Z the first sweep is centred on."""
+
+    limits: Limits
+    z_start_um: float
+
+
+def outside_limits(
+    centre_um: float, planes_um: Sequence[float], limits: Limits
+) -> str | None:
+    """The refusal of a sweep with a plane outside the soft limits (D3), or ``None``."""
+    plane = first_outside(planes_um, limits.low_um, limits.high_um)
+    if plane is None:
+        return None
+    return (
+        f"the focus sweep around {centre_um:g} µm would reach {plane:g} µm, "
+        f"outside the soft limits [{limits.low_um:g}, {limits.high_um:g}] µm"
+    )
+
+
+def check_sweep_bounds(
+    stage: str,
+    subject: str,
+    microscope: Microscope,
+    z: ZStage,
+    range_name: str,
+    range_um: float,
+    step_um: float,
+) -> SweepBounds:
+    """§21.6's checks 2-4, before anything moves (dry run included): the limits, the reach, the planes.
+
+    ``subject`` names what moves Z in the refusal (``cell_focus`` for the
+    scan's parameter, ``focus-on-cells`` for the tool). The sweep's moves are
+    absolute, so the layer's Z jog guard does not reach them (M1 §7): the
+    plugin bounds their reach by the same number, the profile's
+    ``max_z_jog_um``, else the layer's default.
+
+    Raises:
+        PluginRunError: The stand has no Z soft limits (unknown is not
+            unlimited), ``range_um`` exceeds the Z jog limit, or a plane of the
+            sweep around the Z read now lies outside the limits.
+    """
+    limits = z.limits_um()
+    if limits is None:
+        raise PluginRunError(
+            stage,
+            f"{subject} moves Z: the profile must set [safety] z_soft_limits_um",
+        )
+    configured = microscope.profile.safety.max_z_jog_um
+    jog_um = DEFAULT_MAX_Z_JOG_UM if configured is None else float(configured)
+    if range_um > jog_um:
+        raise PluginRunError(
+            stage,
+            f"{range_name}={range_um:g} µm is above the stand's Z jog limit of "
+            f"{jog_um:g} µm ([safety] max_z_jog_um): a sweep reaches no farther "
+            "than a Z jog may",
+        )
+    z_start = z.position_um()
+    if not math.isfinite(z_start):
+        # FM-104: a drive that reads NaN has no plane to sweep around.
+        raise PluginRunError(
+            stage, f"Z reads {z_start!r}: {subject} cannot centre a sweep on it"
+        )
+    planes = plan_planes(z_start, range_um, step_um)
+    refusal = outside_limits(z_start, planes, limits)
+    if refusal is not None:
+        raise PluginRunError(stage, refusal)
+    return SweepBounds(limits, z_start)
 
 
 class FocusDriveOffTarget(Exception):  # noqa: N818 (the name is fixed by m3 §21.4; it reads as a field's error type)
