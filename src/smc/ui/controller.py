@@ -158,9 +158,12 @@ KEY_PARAMS: dict[str, tuple[str, ...]] = {
 }
 
 #: The parameters the page fills itself (``PlatePage.page_params``), so a form
-#: does not offer them.
+#: does not offer them. ``objective`` of ``plate-registration`` is left unset on
+#: purpose: the page registers with the objective in place, which is that
+#: parameter's default (m3 §18.3, #340), and the Drive region's select is where the
+#: operator turns it. A free-text label here would offer a second way to say it.
 PAGE_PARAMS: dict[str, tuple[str, ...]] = {
-    "plate-registration": ("plate", "refs", "walls"),
+    "plate-registration": ("plate", "refs", "walls", "objective"),
     "scan-plan": ("wells",),
 }
 

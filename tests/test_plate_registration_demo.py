@@ -1,8 +1,9 @@
 """``plate-registration`` through ``run_plugin``: references and wall touches in, the ``plate`` slot out (m3 §5, #19).
 
-The plugin touches no device (``requires = ()``): the demo stand is here because
-``run_plugin`` needs a ``Microscope``, and its dry-run twin shows that a dry run
-is the same computation. Every expected value is written here from the cosine and
+The plugin moves no device and sends nothing (``requires = ()``); it reads the turret,
+when there is one, for the objective the plate is seen with (m3 §18.3, #340). The
+demo stand is here because ``run_plugin`` needs a ``Microscope``, and its dry-run
+twin shows that a dry run is the same computation. Every expected value is written here from the cosine and
 the sine of the rotation and the plate's 9 mm pitch and 6.4 mm wells, never read
 from the result's own fields or from ``smc`` code (FM-124). The fit against
 ``useq``'s forward model is the unit tests'.
@@ -18,6 +19,8 @@ import useq
 from useq import _plate_registry
 
 from smc.hardware import Microscope
+from smc.hardware.capabilities import ObjectiveTurret
+from smc.hardware.errors import HardwareError
 from smc.plugins import ParamsError, PluginRunError, load, parse_params, run_plugin
 from smc.plugins.plate_registration.plugin import (
     PlateRegistrationParams,
@@ -443,6 +446,110 @@ def test_a_seed_keeps_its_reference_in_the_record(
     ]
 
 
+# ------------------------------------------ the objective the plate was seen with (#340)
+
+SEED = [{"well": "d 06", "x_um": 50000.0, "y_um": -20000.0}]
+TEN = "Nikon 10X S Fluor"
+FORTY = "Nikon 40X Plan Fluor ELWD"
+TURRET_LABELS = (
+    "Nikon 40X Plan Fluor ELWD, Nikon 10X S Fluor, Objective-2, "
+    "Nikon 20X Plan Fluor ELWD, Objective-4, Objective-5"
+)
+
+
+def test_the_registration_records_the_objective_in_place(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    result = _result(_run(demo_microscope, tmp_path, refs=SEED))
+
+    assert result.objective == TEN
+    # And the run document keeps it, for the scan that comes later.
+    stored = _stored(tmp_path).result
+    assert stored is not None
+    assert stored["objective"] == TEN
+
+
+def test_the_registration_records_the_objective_requested(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    turret = demo_microscope.require(ObjectiveTurret)
+
+    result = _result(_run(demo_microscope, tmp_path, refs=SEED, objective=FORTY))
+
+    assert result.objective == FORTY
+    # Named, not turned: the registration touches no stage and no turret.
+    assert turret.current() == TEN
+
+
+def test_an_objective_not_on_the_turret_is_refused(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    error = _refused(demo_microscope, tmp_path, refs=SEED, objective="Nikon 100X")
+
+    assert str(error) == (
+        f"plate-registration: objective 'Nikon 100X' is not on the turret: {TURRET_LABELS}"
+    )
+
+
+def test_a_stand_without_a_turret_records_no_objective_and_refuses_one_asked_for(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_get = demo_microscope.get
+    monkeypatch.setattr(
+        demo_microscope,
+        "get",
+        lambda wanted: None if wanted is ObjectiveTurret else real_get(wanted),
+    )
+
+    assert _result(_run(demo_microscope, tmp_path, refs=SEED)).objective is None
+    error = _refused(demo_microscope, tmp_path, refs=SEED, objective=TEN)
+    assert str(error) == (
+        "plate-registration: the stand has no turret, so objective cannot be "
+        "checked; leave it unset"
+    )
+
+
+def test_a_turret_at_an_empty_position_is_refused_before_the_fit(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The protocol lists empty positions, whose label is ``""``: no objective, not one called nothing (FM-125)."""
+    monkeypatch.setattr(demo_microscope.require(ObjectiveTurret), "current", lambda: "")
+
+    error = _refused(demo_microscope, tmp_path, refs=SEED)
+
+    assert str(error) == (
+        "plate-registration: no objective is in place: the turret is at an empty "
+        "position; turn it to an objective, or give objective to plan for one"
+    )
+
+
+def test_a_turret_that_cannot_be_read_is_a_fault_and_not_no_objective(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FM-19: a read that fails is not caught and not taken as an unknown objective; no plate is written."""
+    fault = HardwareError("objective_turret: getStateLabel failed (no answer)")
+
+    def fails() -> str:
+        raise fault
+
+    monkeypatch.setattr(demo_microscope.require(ObjectiveTurret), "current", fails)
+
+    with pytest.raises(HardwareError) as info:
+        _run(demo_microscope, tmp_path, refs=SEED)
+
+    assert info.value is fault
+    assert _stored(tmp_path).status is StageStatus.failed
+    assert _stored(tmp_path).result is None
+
+
+def test_the_parameter_that_names_the_objective_says_what_it_is_for() -> None:
+    field = PlateRegistrationParams.model_fields["objective"]
+    assert field.default is None
+    assert field.description is not None
+    assert "turret label" in field.description
+    assert "default the one in place" in field.description
+
+
 def test_no_reference_is_refused(demo_microscope: Microscope, tmp_path: Path) -> None:
     error = _refused(demo_microscope, tmp_path)
     assert str(error) == (
@@ -547,4 +654,4 @@ def test_the_parameters_are_described() -> None:
     from smc.plugins import describe_params
 
     keys = [row[0] for row in describe_params(PlateRegistrationParams)]
-    assert keys == ["plate", "refs", "walls", "max_rotation_deg"]
+    assert keys == ["plate", "refs", "walls", "max_rotation_deg", "objective"]

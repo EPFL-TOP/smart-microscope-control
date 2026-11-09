@@ -35,7 +35,15 @@ import pytest
 from pydantic import ValidationError
 
 from smc.hardware import Microscope
-from smc.hardware.capabilities import XY, Autofocus, Camera, FocusStep, Limits, XYStage
+from smc.hardware.capabilities import (
+    XY,
+    Autofocus,
+    Camera,
+    FocusStep,
+    Limits,
+    ObjectiveTurret,
+    XYStage,
+)
 from smc.hardware.errors import (
     DeviceTimeoutError,
     HardwareError,
@@ -1736,6 +1744,178 @@ def test_a_dry_run_refuses_to_survey(
         "plate-finding: a dry run cannot survey the plate; run it without --dry-run"
     )
     assert _here(demo_microscope_dry) == before
+
+
+# ------------------------------------------- the objective it was surveyed with (#340)
+
+TEN = "Nikon 10X S Fluor"
+FORTY = "Nikon 40X Plan Fluor ELWD"
+
+
+def test_the_survey_records_its_objective(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    _on_fake(fake_microscope, _plate_at((0.0, 0.0)))
+
+    result = _result(_run(fake_microscope, tmp_path, plates=["12-well"]))
+
+    assert result.objective == TEN
+    stored = _stored(tmp_path).result
+    assert stored is not None
+    assert stored["objective"] == TEN
+
+
+@pytest.mark.parametrize("stop_at", [30, 120], ids=["first-save", "periodic-save"])
+def test_the_checkpoint_keeps_the_objective_the_survey_began_with(
+    fake_microscope: Microscope, tmp_path: Path, stop_at: int
+) -> None:
+    # The save before the first move and the save every 50 points both carry it.
+    _on_fake(fake_microscope, _plate_at((0.0, 0.0)))
+    stop = threading.Event()
+
+    def stop_there(progress: Progress) -> None:
+        if progress.done == stop_at:
+            stop.set()
+
+    first = _run(
+        fake_microscope,
+        tmp_path,
+        plates=["12-well"],
+        on_progress=stop_there,
+        stop=stop,
+    )
+
+    assert first.status is StageStatus.stopped
+    assert first.checkpoint is not None
+    assert first.checkpoint["next_index"] == (0 if stop_at == 30 else 100)
+    assert first.checkpoint["objective"] == TEN
+
+
+def test_a_resume_with_another_objective_is_refused_before_any_move(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    camera = _on_fake(fake_microscope, _plate_at((0.0, 0.0)))
+    stop = threading.Event()
+
+    def stop_at_30(progress: Progress) -> None:
+        if progress.done == 30:
+            stop.set()
+
+    first = _run(
+        fake_microscope,
+        tmp_path,
+        plates=["12-well"],
+        on_progress=stop_at_30,
+        stop=stop,
+    )
+    assert first.status is StageStatus.stopped
+    turret = fake_microscope.require(ObjectiveTurret)
+    turret.select(FORTY, confirm=True)
+    snaps, where = camera.snaps, _here(fake_microscope)
+
+    reason = _refusal(fake_microscope, tmp_path, resume=True, plates=["12-well"])
+
+    assert reason == (
+        f"plate-finding: the survey began with {TEN} and the objective in place is "
+        f"{FORTY}: turn the turret back to {TEN} and resume, or run the survey again "
+        "without --resume"
+    )
+    assert (camera.snaps, _here(fake_microscope)) == (snaps, where)
+    # The refusal keeps the checkpoint: turned back, the survey resumes and says TEN.
+    turret.select(TEN, confirm=True)
+    result = _result(_run(fake_microscope, tmp_path, resume=True, plates=["12-well"]))
+    assert result.objective == TEN
+    assert camera.snaps - snaps == 208
+
+
+def test_a_resume_from_a_checkpoint_that_records_no_objective_says_it_assumed_one(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    # A checkpoint written before #340 has none: the points it holds are taken
+    # as the objective in place's, and the result says so.
+    _on_fake(fake_microscope, _plate_at((0.0, 0.0)))
+    stop = threading.Event()
+
+    def stop_at_30(progress: Progress) -> None:
+        if progress.done == 30:
+            stop.set()
+
+    first = _run(
+        fake_microscope,
+        tmp_path,
+        plates=["12-well"],
+        on_progress=stop_at_30,
+        stop=stop,
+    )
+    assert first.status is StageStatus.stopped
+    _tamper(tmp_path, drop=("objective",))
+
+    result = _result(_run(fake_microscope, tmp_path, resume=True, plates=["12-well"]))
+
+    assert result.objective == TEN
+    assert (
+        f"the checkpoint does not record its objective: the points sampled before "
+        f"the resume are taken as {TEN}'s"
+    ) in result.assumed
+
+
+def test_a_turn_during_the_survey_is_refused(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    turret = fake_microscope.require(ObjectiveTurret)
+
+    def turn_at_the_last_point(snap: int) -> None:
+        if snap == 208:
+            turret.select(FORTY, confirm=True)
+
+    camera = _on_fake(
+        fake_microscope, _plate_at((0.0, 0.0)), before=turn_at_the_last_point
+    )
+
+    reason = _refusal(fake_microscope, tmp_path, plates=["12-well"])
+
+    assert reason == (
+        f"plate-finding: the objective changed during the survey, from {TEN} to "
+        f"{FORTY}: run the survey again without --resume"
+    )
+    # The whole survey was taken; its points are kept, and no plate is written.
+    assert camera.snaps == 208
+    checkpoint = _stored(tmp_path).checkpoint
+    assert checkpoint is not None
+    assert (checkpoint["next_index"], checkpoint["objective"]) == (208, TEN)
+
+
+def test_a_turret_at_an_empty_position_is_refused_before_any_move(
+    fake_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    camera = _on_fake(fake_microscope, _plate_at((0.0, 0.0)))
+    monkeypatch.setattr(fake_microscope.require(ObjectiveTurret), "current", lambda: "")
+    where = _here(fake_microscope)
+
+    reason = _refusal(fake_microscope, tmp_path, plates=["12-well"])
+
+    assert reason == (
+        "plate-finding: no objective is in place: the turret is at an empty "
+        "position; turn it to an objective, or give objective to plan for one"
+    )
+    assert (camera.snaps, _here(fake_microscope)) == (0, where)
+    assert _stored(tmp_path).checkpoint is None
+
+
+def test_a_stand_without_a_turret_records_no_objective(
+    fake_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _on_fake(fake_microscope, _plate_at((0.0, 0.0)))
+    real_get = fake_microscope.get
+    monkeypatch.setattr(
+        fake_microscope,
+        "get",
+        lambda wanted: None if wanted is ObjectiveTurret else real_get(wanted),
+    )
+
+    result = _result(_run(fake_microscope, tmp_path, plates=["12-well"]))
+
+    assert result.objective is None
 
 
 # --------------------------------------------------- the fit is judged after it

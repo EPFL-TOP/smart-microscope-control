@@ -97,6 +97,7 @@ NOT_IN_PARAMS: dict[str, dict[str, str]] = {
         "plate": "the preset's plate holds it",
         "refs": "a preset holds no positions",
         "walls": "a preset holds no positions",
+        "objective": "the registration takes the objective in place",
     },
     "plate-walls": {"refs": "a preset holds no positions"},
     "scan-plan": {"wells": "the preset's wells hold them"},

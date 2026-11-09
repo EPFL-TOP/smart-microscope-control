@@ -339,6 +339,9 @@ class PlateWallsPlugin:
             n_refs=len(measured),
             refs=measured,
             fit=None,
+            # The plate's own objective (m3 §18.1): the one the frames were taken
+            # with, which `_check_calibration` has already refused to be an empty position.
+            objective=objective,
             walls=WallImages(
                 objective=objective,
                 pixel_size_um=calibration.pixel_size_um,

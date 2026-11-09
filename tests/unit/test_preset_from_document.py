@@ -341,6 +341,7 @@ CASES: dict[str, list[dict[str, Any]]] = {
             "refs": [{"well": "A1", "x_um": 1.0, "y_um": 2.0}],
             "walls": [{"well": "A1", "side": "left", "x_um": 1.0, "y_um": 2.0}],
             "max_rotation_deg": 5.0,
+            "objective": "Nikon 10X S Fluor",
         }
     ],
     "plate-walls": [
