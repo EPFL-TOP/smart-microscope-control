@@ -64,9 +64,14 @@ the residual mean something.
 The plate page ([`m3-plugins.md`](../design/m3-plugins.md) §15) collects the same
 references by clicks and calls the same plugins with the same parameters. In the
 words of the issue's steps, *seed* is `plate-registration` with one reference,
-*goto-well* and *goto-wall* are `goto-well` (with `side=…`), *capture-edge* is
-`smc stage get` followed by a wall touch in `walls`, and *calibrate* is
-`plate-registration` with every reference and wall.
+*goto-well* and *goto-wall* are `goto-well` (with `side=…`, a stage direction),
+*capture-edge* is `smc stage get` followed by a wall touch in `walls`, and
+*calibrate* is `plate-registration` with every reference and wall. One difference:
+you name a wall on the command line by the **stage's** direction (`-X`, `+X`, `-Y`,
+`+Y`), while the page lets you name it as the **image** shows it (`left`, `right`,
+`top`, `bottom`) and maps it to the stage's with the
+[camera calibration](camera-calibration.md#what-reads-it) (see
+[Wall touches](#wall-touches)).
 
 ### A run on the demo stand
 
@@ -87,12 +92,12 @@ $ smc run plate-registration -p demo --run-doc run.json --param 'refs=[{"well": 
   "objective": "Nikon 10X S Fluor"
 }
 
-$ smc run goto-well -p demo --run-doc run.json --param well=B2 --param side=left
+$ smc run goto-well -p demo --run-doc run.json --param well=B2 --param side=-X
 ✓ goto-well done in 1.0 s — run.json, stage goto-well
 {
   "assumed": ["plate: one reference well (A1): rotation 0° assumed, not measured"],
   "well": "B2",
-  "side": "left",
+  "side": "-X",
   "target_x_um": 6800.0,
   "target_y_um": -7000.0,
   "x_um": 6799.995,
@@ -117,7 +122,7 @@ smc run plate-registration -p <profile> --run-doc run.json --param plate=384-wel
 |---|---|---|
 | `plate` | `96-well` | A `useq` plate name (`6-well` to `1536-well`); the name is exact, `96-WELL` is refused. |
 | `refs` | none | Wells centred under the objective, JSON: `[{"well": "A1", "x_um": 1000, "y_um": 2000}]`. A well name is as you type it: `a1`, `A 1` and `A01` are `A1`. |
-| `walls` | none | Wall touches, JSON: `[{"well": "B2", "side": "left", "x_um": 6800, "y_um": 0}]`. See [Wall touches](#wall-touches). |
+| `walls` | none | Wall touches, JSON: `[{"well": "B2", "side": "-X", "x_um": 6800, "y_um": 0}]`. A `side` is a **stage direction** (`-X`, `+X`, `-Y`, `+Y`); `left`, `right`, `top` and `bottom` are refused. See [Wall touches](#wall-touches). |
 | `max_rotation_deg` | 10 | The largest rotation of the plate that the fit accepts (above 0, up to 45): see [What it refuses](#what-it-refuses). |
 | `objective` | the one in place | The objective the references were centred with, by its turret label (`smc objective list`): see [The objective the plate was registered with](#the-objective-the-plate-was-registered-with). Recorded, never turned to. |
 
@@ -160,15 +165,49 @@ At 40x a well is not visible (the field is about 333 µm, a 96-well well 6 400 �
 so a centre is never judged by eye. Touch a wall instead: drive until the wall sits
 on the crosshair, read `smc stage get`, and give it as a touch.
 
-- `side` is `left`, `right`, `top` or `bottom`. `top` is **+Y, towards row A**.
-  `left` and `right` use only the touch's `x_um`, and `top` and `bottom` only its
-  `y_um`: the other coordinate is never read.
-- A well needs one `left` or `right` and one `top` or `bottom`. An **opposite
-  pair** gives the centre as the midpoint and measures the well's size, a free check
-  that you touched the right wall. **One wall** gives the centre only with the
-  plate's nominal half-size, and the result says so in `assumed` (`B2: the Y centre
-  is one wall plus the nominal half-size, 3200 µm`).
-- `goto-well --param side=left` drives to the point on that wall, along the plate's
+**Three frames meet at a plate, and a direction means something in one only.** The
+**image** you look at (`left`, `right`, `top`, `bottom`), the **stage** (`+X`, `-X`,
+`+Y`, `-Y`: the X and Y of `smc stage get`) and the **plate**, the stage's turned by
+the plate's small rotation. Which stage direction an image side is depends on the
+camera's turn and mirror: on the Ti2-E at 10x the image moves with the stage, so the
+image's *left* is the stage's **+X** (Ti2-E session 2, where a wall named on the image
+and read on the stage put a seed 15.5 mm from the well on both axes, #327).
+
+- **`side` is a stage direction** on the command line: `-X`, `+X`, `-Y` or `+Y`, the
+  wall that the stage reaches by going that way from the well's centre, along the
+  plate's own axes. `+Y` is **towards row A**. `-X` and `+X` use only the touch's
+  `x_um`, and `-Y` and `+Y` only its `y_um`: the other coordinate is never read.
+  **`left`, `right`, `top` and `bottom` are refused**, with the reason (`side 'left'
+  is a side on the image: a wall is named by a stage direction, -X, +X, -Y or +Y`):
+  the same word in two frames was the defect, so an old word is not translated. A run
+  document written before holds them in its `params` and is not migrated.
+- **The plate page names walls on the image** and maps them with the latest usable
+  [camera calibration](camera-calibration.md#what-reads-it), whatever its objective.
+  Without one it refuses to capture a wall (run `camera-calibration`, *Set up*), and
+  it says under the buttons what each side of the image is.
+- **To read the stage's direction from the calibration** (command line): take its
+  `rotation_deg` and `mirrored` and read the row. The page does the same with the
+  matrix.
+
+  | camera | image `left` | `right` | `top` | `bottom` |
+  |---|---|---|---|---|
+  | 0° | `-X` | `+X` | `+Y` | `-Y` |
+  | 0°, mirrored | `+X` | `-X` | `+Y` | `-Y` |
+  | 90° | `-Y` | `+Y` | `-X` | `+X` |
+  | 90°, mirrored | `+Y` | `-Y` | `-X` | `+X` |
+  | 180° (the Ti2-E at 10x) | `+X` | `-X` | `-Y` | `+Y` |
+  | 180°, mirrored | `-X` | `+X` | `-Y` | `+Y` |
+  | −90° | `+Y` | `-Y` | `+X` | `-X` |
+  | −90°, mirrored | `-Y` | `+Y` | `+X` | `-X` |
+
+  A camera more than 5° from a quarter turn names no side: the page refuses, and on the
+  command line an image side is not a stage side there either.
+- A well needs one `-X` or `+X` and one `-Y` or `+Y`. An **opposite pair**, `-X` and
+  `+X` or `-Y` and `+Y`, gives the centre as the midpoint and measures the well's size,
+  a free check that you touched the right wall: **prefer pairs**. **One wall** gives the
+  centre only with the plate's nominal half-size, and the result says so in `assumed`
+  (`B2: the Y centre is one wall plus the nominal half-size, 3200 µm`).
+- `goto-well --param side=-X` drives to the point on that wall, along the plate's
   own axes, so it follows the fitted rotation. The wall is then within a field or
   two. On a turned plate a touch along a stage axis errs by `r (1 − cos θ)` for one
   wall (8 µm at 4°, 49 µm at 10°, for a 96-well well, computed); an opposite pair of
@@ -213,21 +252,23 @@ slot**, and a stage that reads it stops with the reason.
 | `the measured well spacing is off the 384-well definition by +100.0%: wrong plate type, or a misidentified well` | The measured distance between the references is not the plate's, by more than 2 %: check the plate type and the well names. Without this check the fit would succeed and put every position further off across the plate. |
 | `the fit turns the plate by 90.0°, beyond ±10°: a reference well is misidentified` | The fitted rotation is past `max_rotation_deg`. **Two references the same distance apart** (A1 and A2, or A1 and B1) fit a turn of 90° with no residual, so neither the scale check nor the residual can see a misnamed one: a bound on the rotation does. Raise `max_rotation_deg` only for a plate that really is turned. |
 | `H1 is 348 µm from where the others put it: centre it again` | A reference is further than 300 µm from the fit of the others: centre that well again. |
-| `A1's left and right walls are 9200 µm apart, a 96-well well is 6400 µm (+43.8%): a touch of another well, or off the wall` | An opposite pair whose size is off the plate's by more than 10 % (a swapped pair has a negative size): touch both walls again. |
-| `A1: the left wall is given twice`, `a touch of B2 was given for A1`, `no X wall for A1: give left and/or right` | A mistake in `walls`; the text says which. |
+| `A1's -X and +X walls are 9200 µm apart, a 96-well well is 6400 µm (+43.8%): a touch of another well, or off the wall; touch them again` | An opposite pair whose size is off the plate's by more than 10 %: touch both walls again. |
+| `B3's -X and +X walls are swapped: the +X wall is 15599 µm on the -X side of the -X wall, a 24-well well's width; touch them again, each named by its direction from the well's centre` | The pair has a well's size with the wrong sign: the two walls were named in the wrong frame (the image's `left` is not always the stage's `-X`, see [Wall touches](#wall-touches)). Name each by the stage direction that reaches it from the centre. `height` for the Y pair. |
+| `side 'left' is a side on the image: a wall is named by a stage direction, -X, +X, -Y or +Y (the plate page names walls on the image and maps them with the camera calibration)` | An image word in `walls` (or in `goto-well`'s `side`), from an older document or a habit: it is refused, never translated. Use the stage direction; the table of [Wall touches](#wall-touches) reads it from the camera calibration. |
+| `B3: the -X wall is given twice`, `a touch of B2 was given for A1`, `no X wall for A1: give -X and/or +X`, `no Y wall for A1: give -Y and/or +Y` | A mistake in `walls`; the text says which. |
 | `objective 'Nikon 100X' is not on the turret: ...`, `no objective is in place: the turret is at an empty position; ...`, `the stand has no turret, so objective cannot be checked; leave it unset` | The objective is not one the turret can have: see [The objective the plate was registered with](#the-objective-the-plate-was-registered-with). |
 
 ## `goto-well`
 
 ```text
 smc run goto-well -p <profile> --run-doc run.json --param well=H12
-smc run goto-well -p <profile> --run-doc run.json --param well=B2 --param side=top
+smc run goto-well -p <profile> --run-doc run.json --param well=B2 --param side=+Y
 ```
 
 | Parameter | Default | Meaning |
 |---|---|---|
 | `well` | (required) | The well to go to, as `useq` names it (`H12`; `h12` and `H012` are read as `H12`). |
-| `side` | `centre` | `centre`, or the point on a wall: `left`, `right`, `top`, `bottom`. |
+| `side` | `centre` | `centre`, or the point on a wall named by a **stage direction**: `-X`, `+X`, `-Y`, `+Y` (`+Y` is towards row A). `left`, `right`, `top` and `bottom` are sides on an image and are refused, see [Wall touches](#wall-touches). The result echoes the stage direction. |
 
 It sends **one absolute move** and nothing else, and the layer's guards are the
 guards: a target outside the profile's XY soft limits is refused and the stage does

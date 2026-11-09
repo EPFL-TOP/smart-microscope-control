@@ -217,7 +217,13 @@ no well (`Z99`) is refused with the reason, and the old selection stays.
 
 **Driving to a well.** Switch **Drive** on (the strip then says `DRIVE: the next
 click on a well moves the stage there`) and click a well: `goto-well` runs for it, at
-its centre or at the wall chosen under *Drive to*. Drive is **one click**: the toggle
+its centre or at the wall chosen under **Drive to (wall as on the image)**: the wall is
+named as the image shows it (`left`, `right`, `top`, `bottom`), the page maps it to the
+stage's direction with the latest usable `camera-calibration`, and `goto-well` runs with
+that (`side=+X` for the image's left on the Ti2-E at 10x). With no calibration it
+refuses a wall and says to run it (`walls are named on the image, and no camera
+calibration says which stage side that is: run camera-calibration (Set up), then try
+again`); the centre needs none. Drive is **one click**: the toggle
 goes back to select after it, even if the click found no well or was refused. The page
 **refuses** to drive on a map of another plate than the registered one (it would send
 the stage to the same-named well of the other plate): choose the registered plate, or
@@ -337,8 +343,14 @@ command, so each has its command-line twin:
 | **Light on**, **Light off** | `smc light on`, `smc light off` |
 
 The pad is in the **stage's axes**, as the map (X right, Y up): `→` jogs `+step` in
-X, `↑` `+step` in Y. Which way the *image* moves for `↑` depends on how the camera is
-turned on the stand, and is not known yet. The step is chosen under **XY step** (1, 10,
+X, `↑` `+step` in Y. The arrows stay so (it is the stage that moves, so the image is
+normally inverted, and microscopy's standards are kept). **Which way the *image* moves**
+depends on how the camera is turned on the stand, and the note under the pad says it from
+the latest usable `camera-calibration`: `On the image, ↑ moves it up, → moves it right; ↓
+and ← the opposite.` (the Ti2-E at 10x; an upright camera reads `↑ moves it down, →
+moves it left`). With no calibration it says `Which way the image moves for an arrow is
+not known: run camera-calibration (Set up).`, and for a camera more than 5° from a quarter
+turn it gives the reason. The note disables nothing. The step is chosen under **XY step** (1, 10,
 100 or 1000 µm; 100 at the start) and **Z step** (0.5, 1, 5, 10 or 50 µm; 1 at the
 start); only the steps up to the profile's jog limits (`[safety] max_jog_um` and
 `max_z_jog_um`) are offered. **A jog is one click**: there is no repeat while a button is
@@ -472,9 +484,18 @@ attempt wrote to disk (a scan's frames) is kept either way.
 
 **Calibrating the plate.** Under `plate-registration`: centre a well under the objective
 by hand, click it on the map, press **Capture centre**; for a wall, put the objective on
-it, choose the side, press **Capture wall**. **The buttons name what they record**:
-`Capture centre of B3`, `Capture B3 left wall` (the side is the *Wall* select's value, and
-the label follows it at once), `Forget B3`. With no well selected they read `Capture
+it, choose its side **as you see it on the image** under **Wall, as on the image**, press
+**Capture wall**. A note under the buttons says what each side is on the stage, from the
+latest usable `camera-calibration` (`On the image: left is the stage's +X, right -X, top
+-Y, bottom +Y (from the camera calibration).` for the Ti2-E at 10x), and the capture is
+**recorded in the stage's words**: the list shows `B3 +X wall (17967.9, -10237.1)`. With no
+calibration the note says to run it, and **Capture wall** refuses (`walls are named on
+the image, and no camera calibration says which stage side that is: run
+camera-calibration (Set up), then try again`) and records nothing; a camera more than 5°
+from a quarter turn is refused with the reason. Centres need no calibration. Prefer an
+opposite pair per axis: only a pair measures the well. **The buttons name what they
+record**: `Capture centre of B3`, `Capture B3 wall at image left` (the side is the *Wall*
+select's value, and the label follows it at once), `Forget B3`. With no well selected they read `Capture
 centre`, `Capture wall`, `Forget`, are disabled, and a note says `click a well on the map
 first: a capture records the well you clicked last`. **A press records the well on the
 button, or nothing**: if the well changed since the button was drawn (another tab, or a
@@ -486,7 +507,7 @@ behind a frame or runs during live (`stage jog is waiting`, `stage jog is runnin
 while a run, a snap or a connect goes (`<name> is running`; `goto-well` is a run). The
 buttons are greyed while an activity other than live goes; during live they stay usable
 and the refusal is the message. A live with no drive action handed to it does not refuse:
-a frame moves nothing. A second capture of the same well (and side)
+a frame moves nothing. A second capture of the same well and **stage** side
 replaces the first; **Forget** drops the captures of the well on its label. **Run
 plate-registration** then fits the plate from what was captured, as `smc run
 plate-registration --param refs=... --param walls=...` would. Choosing another plate
@@ -747,7 +768,8 @@ the cost of `Microscope.state()`, which is read for every frame, on a real stand
 a mechanical shutter under auto-shutter, which opens and closes for every frame (up to
 10 times a second); and the frame's orientation in a browser.
 
-**Drive** adds: the drive at a stand; which way the image moves for `↑` and `→`; a
+**Drive** adds: the drive at a stand; which way the image moves for `↑` and `→` (the
+note under the pad, against NIS-Elements' own XY control and the stand's joystick); a
 jog, a focus step and an engage on the Ti2-E while live goes, and how long a click
 waits for the frame in flight on a real exposure; a turret turn under a plate; *Light
 on* and *Light off* on the Ti2-E's `DiaLamp`, and **a *Light off* clicked behind a frame,

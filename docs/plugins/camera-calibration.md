@@ -206,6 +206,22 @@ objective with the lever and the camera setting as they were, and measure again
 after changing either (the profile's pixel sizes are for a fixed value of both:
 FM-103).
 
+## What reads it
+
+The scan plan, the cells stage and the route read the matrix as the sections above
+say. **The plate page reads its rotation and mirror for the image's sides and the
+arrows' direction** (#327): a wall is named on the image (`left`, `right`, `top`,
+`bottom`) and the layer takes stage directions (`-X`, `+X`, `-Y`, `+Y`), so the page
+maps one to the other with the latest usable calibration, whatever its objective,
+since the turn belongs to the camera's port and mirrors and not to the objective. It
+also says under the Drive pad what each arrow does to the image. Without a usable
+calibration the page refuses to capture a wall and says to run this plugin; a camera
+more than 5° from a quarter turn names no side. The table that reads a camera's
+sides is in [`plate-registration.md`](plate-registration.md#wall-touches).
+
+**Run it again after a change of camera port or light path**: a calibration is of the
+path it was measured in, and the page does not know that the path changed.
+
 ## Not verified here
 
 Nothing in this page was measured on a microscope. The pixel size at 40× on the
