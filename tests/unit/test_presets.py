@@ -100,12 +100,18 @@ class WallsParams(BaseModel):
     refs: str = ""
 
 
+class OffsetsParams(BaseModel):
+    targets: str = ""
+    confirm_turns: bool = False
+
+
 MODELS: dict[str, type[BaseModel]] = {
     "scan-plan": ScanPlanParams,
     "cells": CellsParams,
     "plate-registration": RegistrationParams,
     "plate-finding": FindingParams,
     "plate-walls": WallsParams,
+    "objective-offsets": OffsetsParams,
 }
 
 
