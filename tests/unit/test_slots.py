@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import json
 import math
 import re
 from collections.abc import Iterator
@@ -26,11 +27,14 @@ from smc.plugins.slots import (
     IMAGE_SIDES,
     CameraCalibration,
     Cell,
+    CellFocusResult,
     CellsFile,
     CellsResult,
     DensityResult,
     DensityWell,
     FailedField,
+    FieldFocus,
+    FocusSweep,
     LatticeFit,
     MeasuredOffset,
     NisExportResult,
@@ -177,6 +181,45 @@ _FRAME: dict[str, Any] = {
     "focus": "locked",
     "pfs_offset": 512.0,
     "t_s": 12.5,
+}
+_SWEEP: dict[str, Any] = {
+    "score": "brenner",
+    "centre_um": 1500.0,
+    "z_um": [1499.0, 1500.0, 1501.0],
+    "scores": [0.12, 0.31, 0.2],
+    "outcome": "peak",
+    "best_z_um": 1500.2,
+}
+_FIELD_FOCUS: dict[str, Any] = {
+    "source": "swept",
+    "sweep": _SWEEP,
+    "dz_um": 0.2,
+    "frame_score": 0.3,
+    "duration_s": 0.25,
+}
+#: A frame of a scan that ran the focus on the cells (m3 §21.6).
+_FRAME_FOCUSED: dict[str, Any] = {
+    **_FRAME,
+    "z_um": 1500.2,
+    "cell_focus": _FIELD_FOCUS,
+}
+_CELL_FOCUS: dict[str, Any] = {
+    "assumed": [],
+    "folder": "cell-focus/0123456789ab",
+    "objective": "Nikon 40X Plan Fluor ELWD",
+    "x_um": 1000.5,
+    "y_um": 2000.25,
+    "autofocus": "locked",
+    "pfs_offset": 512.0,
+    "sweep": _SWEEP,
+    "files": [
+        "cell-focus/0123456789ab/000.tif",
+        "cell-focus/0123456789ab/001.tif",
+        "cell-focus/0123456789ab/002.tif",
+    ],
+    "best_file": "cell-focus/0123456789ab/best.tif",
+    "z_um": 1500.2,
+    "relocked": True,
 }
 _FAILED = {
     "well": "A1",
@@ -374,13 +417,36 @@ SAMPLES: dict[type[BaseModel], Sample] = {
         },
     ),
     ScanFrame: (
-        _FRAME,
+        _FRAME_FOCUSED,
         {**_FRAME, "z_um": None, "focus": "none", "pfs_offset": None},
     ),
     FailedField: (_FAILED, _FAILED),
     ScanResult: (
-        _SCAN,
+        {**_SCAN, "frames": [_FRAME, _FRAME_FOCUSED]},
         {**_SCAN, "objective": None, "frames": [], "failed": []},
+    ),
+    FocusSweep: (
+        _SWEEP,
+        {**_SWEEP, "outcome": "two-peaks", "best_z_um": None},
+    ),
+    FieldFocus: (
+        _FIELD_FOCUS,
+        {**_FIELD_FOCUS, "source": "well", "sweep": None},
+    ),
+    CellFocusResult: (
+        _CELL_FOCUS,
+        {
+            **_CELL_FOCUS,
+            "objective": None,
+            "x_um": None,
+            "y_um": None,
+            "autofocus": "none",
+            "pfs_offset": None,
+            "sweep": {**_SWEEP, "outcome": "flat", "best_z_um": None},
+            "files": [],
+            "best_file": None,
+            "relocked": None,
+        },
     ),
     Cell: (_CELL, _CELL),
     CellsFile: (_CELLS_FILE, {"cells": []}),
@@ -571,6 +637,7 @@ RANGES: list[tuple[type[BaseModel], tuple[Any, ...], list[Any], list[Any]]] = [
     (ScanPlanResult, ("estimate_s",), [-0.1], [0.0]),
     (ScanFrame, ("index",), [-1], [0]),
     (ScanFrame, ("t_s",), [-0.1], [0.0]),
+    (FieldFocus, ("duration_s",), [-0.1], [0.0]),
     (FailedField, ("index",), [-1], [0]),
     (ScanResult, ("pixel_size_um",), [0.0, -1.0], [1e-6]),
     (ScanResult, ("exposure_ms",), [-0.1], [0.0]),
@@ -661,6 +728,11 @@ MUST_BE_PRESENT: list[tuple[type[BaseModel], tuple[Any, ...]]] = [
     (ScanFrame, ("z_um",)),
     (ScanFrame, ("pfs_offset",)),
     (ScanResult, ("objective",)),
+    (CellFocusResult, ("objective",)),
+    (CellFocusResult, ("x_um",)),
+    (CellFocusResult, ("pfs_offset",)),
+    (CellFocusResult, ("best_file",)),
+    (CellFocusResult, ("relocked",)),
     (CellsResult, ("seconds_per_frame",)),
     (DensityWell, ("per_mm2",)),
     (RoutePosition, ("z_um",)),
@@ -838,6 +910,47 @@ def test_a_focus_state_the_scan_does_not_know_is_refused() -> None:
         ScanFrame.model_validate({**_FRAME, "focus": state})
 
 
+def test_a_frame_without_cell_focus_dumps_without_the_key() -> None:
+    # m3 §21.5: a scan without the step reads in an older smc, whose ScanFrame
+    # refuses a key it does not know (FM-107). Nested in a result too.
+    frame = ScanFrame.model_validate(_FRAME)
+    assert frame.cell_focus is None
+    assert "cell_focus" not in frame.model_dump(mode="json")
+    assert "cell_focus" not in frame.model_dump()
+    assert set(frame.model_dump(mode="json")) == set(_FRAME)
+    result = ScanResult.model_validate({**_SCAN, "frames": [_FRAME, _FRAME_FOCUSED]})
+    plain, focused = result.model_dump(mode="json")["frames"]
+    assert "cell_focus" not in plain
+    assert focused["cell_focus"] == FieldFocus.model_validate(_FIELD_FOCUS).model_dump(
+        mode="json"
+    )
+    assert "cell_focus" not in json.loads(frame.model_dump_json())
+
+
+def test_a_sweep_refuses_lists_that_do_not_hold_together() -> None:
+    assert _error_types(FocusSweep, {**_SWEEP, "scores": [0.1, 0.2]}) == ["value_error"]
+    short = {**_SWEEP, "z_um": [0.0, 1.0], "scores": [0.1, 0.2]}
+    assert _error_types(FocusSweep, short) == ["value_error"]
+    # best_z_um is set exactly when the sweep found a peak (D4).
+    assert _error_types(FocusSweep, {**_SWEEP, "best_z_um": None}) == ["value_error"]
+    assert _error_types(FocusSweep, {**_SWEEP, "outcome": "flat"}) == ["value_error"]
+    assert _error_types(FocusSweep, {**_SWEEP, "score": "sharpness"}) == [
+        "literal_error"
+    ]
+
+
+def test_a_field_focus_has_its_sweep_exactly_when_swept() -> None:
+    assert _error_types(FieldFocus, {**_FIELD_FOCUS, "sweep": None}) == ["value_error"]
+    well = {**_FIELD_FOCUS, "source": "well"}
+    assert _error_types(FieldFocus, well) == ["value_error"]
+
+
+def test_a_cell_focus_result_names_one_file_per_plane_or_none() -> None:
+    two = {**_CELL_FOCUS, "files": _CELL_FOCUS["files"][:2]}
+    assert _error_types(CellFocusResult, two) == ["value_error"]
+    CellFocusResult.model_validate({**_CELL_FOCUS, "files": []})
+
+
 def test_frame_index_maps_a_well_to_the_positions_of_its_frames() -> None:
     def frame(well: str, index: int) -> dict[str, Any]:
         return {**_FRAME, "well": well, "index": index, "name": f"{well}_{index:04d}"}
@@ -944,12 +1057,15 @@ def test_the_foundation_imports_no_hardware_and_files_imports_no_plugins() -> No
 SLOTS_MAP = {
     "CameraCalibration",
     "Cell",
+    "CellFocusResult",
     "CellsFile",
     "CellsResult",
     "DensityResult",
     "DensityWell",
     "FailedField",
+    "FieldFocus",
     "FocusState",
+    "FocusSweep",
     "IMAGE_SIDES",
     "ImageSide",
     "LatticeFit",
