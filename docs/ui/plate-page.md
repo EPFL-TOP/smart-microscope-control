@@ -281,7 +281,17 @@ registered one that fills the slot. The region says:
   (see below); or what the profile **suggests** for the tool (`coverage=0.4: suggested by
   the profile demo-sample: ...`, from its [`[suggest]`](../../profiles/README.md#suggest-what-the-stand-suggests-for-a-run) table);
 - `or <name>: ...` for each other registered tool that fills the same slot (on the plate,
-  `plate-finding`);
+  `plate-registration` and `plate-finding`, or `plate-walls` and `plate-finding`);
+- on the plate, **`plate-walls` is the step when you took its path**, and
+  `plate-registration` otherwise. All of these hold: the plate is chosen, the page is
+  not a dry run, the stand can image (an `XYStage` and a `Camera`; a closed stand is
+  drawn for the stand you are about to open), **no wall is captured** (touching walls is
+  `plate-registration`'s own path) and **2 to 6 centres** are captured. Its line says
+  `plate, refs: the 2 centres of B3, D5 captured on this page; plate-walls images each
+  well's four walls around its centre and moves the stage in X and Y only`. Until
+  `camera-calibration` has been run, its button is disabled and says why (see
+  *Registering the plate from images*). Both tools keep their sections and their Run
+  buttons;
 - `command: smc run ...`, the command that makes the same call, with the profile, the
   run document's absolute path and `--dry-run` when it is one. It is quoted for a POSIX
   shell, and a page served on Windows says so under it (`that line is quoted for a POSIX
@@ -384,7 +394,8 @@ its key parameters as fields, the rest under *Advanced*, a **Run** button and th
 progress. A **required** parameter with no default is never folded under *Advanced*:
 it is a field of its own. An empty field is not sent, so the plugin's default holds; the
 placeholder is that default. What the page fills itself is not offered: the wells of
-`scan-plan`, and the plate and the captures of `plate-registration`. A parameter the
+`scan-plan`, and the plate and the captures of `plate-registration` and `plate-walls`
+(the second takes the centres only). A parameter the
 profile suggests for a tool (`[suggest]`) is always a field of its own, never under
 *Advanced*, and **starts with the suggested value** (its tooltip says why), so the tool's
 own Run sends what the next step shows. A tool that cannot
@@ -404,8 +415,9 @@ Run replaces the plate registered 2026-11-03 15:20 (seed, 1 well). A failed run 
 ```
 
 The time is the record's start in the PC's local time. The page does not refuse: a
-registration is a pure function of its captures, which the page keeps. No other tool has
-this note. A plugin that failed to load, or whose parameters cannot be described, is not
+registration is a pure function of its captures, which the page keeps. Under
+`plate-finding`, which runs from no capture, the note ends after `A failed run leaves no
+plate.` No other tool has this note. A plugin that failed to load, or whose parameters cannot be described, is not
 a tool: a line above the map says `plugin <name>: <why>`.
 
 **A tool's result**, under its Run button, as plain text (a result's words are never
@@ -421,7 +433,11 @@ characters too). Where the result is: each `file` and `folder` the result names,
 indented `file: <absolute path>` line (a relative one is under the run document's folder;
 an absolute one is shown as written, in whichever OS's style the run document holds it;
 each is cut at 600 characters), or an indented `in the run document` when it names none:
-**every result card says where its result is**. The page shows the path and never opens it: open it
+**every result card says where its result is**. The card of a plate registered from
+images (`plate-walls`) is the exception to the result's values: it shows **one line per
+well measured**, then one for the plate (`B3: centre (10182.0, -10087.9) µm, 15298 µm
+across, 14 frames`, `plate 24-well: residual 3.2 µm, rotation 0.12°`; `residual unknown`
+when nothing measured it), and the folder of the frames it saved as its file. The page shows the path and never opens it: open it
 from the PC. A card is a summary, bounded whatever the record holds: the run
 document and the log hold the rest. Cards, the next step and the run document's path
 **wrap** at the column, so a long path is read whole. A tool whose last run was stopped or failed shows
@@ -473,6 +489,39 @@ replaces the first; **Forget** drops the captures of the well on its label. **Ru
 plate-registration** then fits the plate from what was captured, as `smc run
 plate-registration --param refs=... --param walls=...` would. Choosing another plate
 clears the selection and the captures.
+
+**Registering the plate from images.** Under `plate-walls` (*Set up*, right after
+`plate-registration`): the tool images each well's four walls itself and fits the plate
+from them, so you centre two or three wells by eye and press a button.
+
+1. **Connect**, and choose the plate on the stage.
+2. **Run `camera-calibration`** (the first tool of *Set up*) with the objective you register
+   with in place, on a field with texture (a well's wall will do): `plate-walls` reads it,
+   and the page does not run it for you, because it moves the stage and measures at a
+   place you chose.
+3. Centre a well under the objective (Live and the **Drive** pad), **click it on the map**,
+   and press **Capture centre of B3** in `plate-walls`' section: the buttons name the
+   well they record and follow the same rules as the registration's (a press records
+   the well on its label, or nothing). Then a second well, far from the first, and a third.
+   The centres are listed under the buttons (`centres captured (2):`, a line each, in
+   capture order). **Forget B3** drops that well's centre and its wall touches.
+4. Press the next step's button, or **Run plate-walls**. The strip counts `plate-walls:
+   3/8 B3 -X` while the stage moves in X and Y only; the plate is then registered, and the
+   card says how well.
+
+Those are the buttons of `plate-walls` only: **the wall captures stay
+`plate-registration`'s**, and `plate-walls` ignores them (a line under the centres says so
+once: `1 wall capture is for plate-registration; plate-walls images the walls itself and
+ignores them`). **Why its Run is disabled**, in this order, beside the button: the stand is
+closed; the plate is the placeholder; the page is a **dry run** (`plate-walls images the
+walls, which a dry run does not do: serve the page without --dry-run (demo-sample's stage
+is simulated), or register with plate-registration`: the page refuses the run itself,
+since the plugin's own refusal would be a failed record that replaces a usable plate);
+there is **no calibration** in the run document (`plate-walls reads the camera's
+calibration: run camera-calibration first ...`; one that exists and is unusable keeps the
+run document's own words); the stand has no `XYStage` or `Camera`; and the **centres**
+(fewer than two, or more than six: `... Forget some`). The count is the page's check and
+the plugin's own: a call the page did not make is refused by the plugin before anything moves.
 
 **The run document**, as a checklist under a bold line with its path, `Run document
 <absolute path>` (the file as the command was given it, made absolute where the server
@@ -641,6 +690,12 @@ finish with smaller ones. Or run **plate-finding**, which surveys the plate by i
 takes about 7 minutes on the demo stage. Each step's `command:` line is the same call from a
 terminal.
 
+Or the owner's path, **registering from images**: **Run** `camera-calibration` (the first
+tool of *Set up*), drive to D6 and D7 with the pad's X and Y steps, **Capture centre of
+D6** and **Capture centre of D7** in `plate-walls`' section, then press the next step's
+button, which is now `plate-walls`. A run on the demo stage took 16.5 s for two wells; it
+needs a page served without `--dry-run`.
+
 **What is synthetic, and the limits**, as `smc doctor -p demo-sample` prints them
 after the roles:
 
@@ -717,6 +772,13 @@ a preset saved by the service ([service.md](service.md)) into the profile's fold
 the service's account may not be allowed to write; a preset edited in Notepad (a
 byte-order mark, CRLF line ends) and read back on Windows; and the width of the region's
 select and buttons in the 420 px column.
+
+**Registering from images** adds, for the owner at the Ti2-E: the walk of the section above
+(steps 3 to 6) with the joystick, Live and the page open; the time of a `plate-walls` run on
+a real stand at 10× (16.5 s is the demo stage's, two wells); whether two captured centres
+should make `plate-walls` the next step, instead of `plate-registration` (the page offers
+the measured path first because it is the one the owner asked for; both stay on the page);
+and `plate-walls` on a 4× frame.
 
 **Connect and Disconnect** add: Connect, Disconnect, NIS-Elements taking the stand,
 then Connect again, at a real stand; **a stand opened on the page's worker thread**,
