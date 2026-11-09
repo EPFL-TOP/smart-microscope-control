@@ -26,6 +26,7 @@ from objective_offsets_stand import (
     NOT_MEASURED,
     SHIFT_TEN_TO_FORTY,
     TEN,
+    TWENTY,
     opened,
     profile_with_offsets,
 )
@@ -457,6 +458,36 @@ def test_goto_well_at_40x_on_a_plate_registered_at_10x_lands_shifted(
     assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
+@pytest.mark.parametrize(
+    ("well", "side", "offset"),
+    [
+        ("B3", "top", (0.0, HALF_UM)),
+        ("C5", "right", (HALF_UM, 0.0)),
+        ("B2", "bottom", (0.0, -HALF_UM)),
+        ("B2", "left", (-HALF_UM, 0.0)),
+    ],
+)
+def test_goto_well_drives_to_the_shifted_wall_point_at_40x_on_a_plate_registered_at_10x(
+    stand_with_offsets: Microscope,
+    tmp_path: Path,
+    well: str,
+    side: str,
+    offset: tuple[float, float],
+) -> None:
+    # The wall of a well is as far from the 40x's A1 as the centre is: the plate is
+    # translated whole, so the wall point moves by the same (-37.5, +12.25) µm.
+    _seed(tmp_path, _plate(objective=TEN))
+    stand_with_offsets.require(ObjectiveTurret).select(FORTY, confirm=True)
+    base = _at(well, *offset)
+    expected = (base[0] - 37.5, base[1] + 12.25)
+
+    result = _result(_run(stand_with_offsets, tmp_path, well=well, side=side))
+
+    assert (result.target_x_um, result.target_y_um) == pytest.approx(expected, abs=1e-6)
+    assert (result.x_um, result.y_um) == pytest.approx(expected, abs=0.02)
+    assert result.shift_um == SHIFT_TEN_TO_FORTY
+
+
 def test_goto_well_with_the_registration_objective_is_unshifted(
     stand_with_offsets: Microscope, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -498,6 +529,59 @@ def test_goto_well_with_an_unmeasured_offset_moves_unshifted_and_says_so(
             r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
         ]
         assert warnings == [line]
+
+
+def test_the_plate_s_assumptions_come_before_the_frame_s_line(
+    mm_available: bool, tmp_path: Path
+) -> None:
+    if not mm_available:
+        pytest.skip("Micro-Manager demo adapters not installed")
+    line = NOT_MEASURED.format(origin=TEN, target=FORTY)
+    with opened(profile_with_offsets(forty=False)) as stand:
+        _seed(tmp_path, _plate(method="seed", assumed=(SEED_LINE,), objective=TEN))
+        stand.require(ObjectiveTurret).select(FORTY, confirm=True)
+
+        result = _result(_run(stand, tmp_path, well="B2"))
+
+    assert result.assumed == (f"plate: {SEED_LINE}", line)
+
+
+def test_the_frame_s_line_comes_before_the_dry_run_line(
+    demo_microscope_dry: Microscope, tmp_path: Path
+) -> None:
+    # The plate, then the frame (a plate that records no objective), then the dry run.
+    _seed(tmp_path, _plate(method="seed", assumed=(SEED_LINE,), objective=None))
+
+    result = _result(_run(demo_microscope_dry, tmp_path, well="A2"))
+
+    assert result.assumed == (
+        f"plate: {SEED_LINE}",
+        "the plate does not record the objective it was registered with: no offset "
+        f"between objectives is applied for {TEN}",
+        DRY_LINE,
+    )
+
+
+def test_the_log_names_the_reference_as_the_reference(
+    stand_with_offsets: Microscope, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A plate registered with the reference objective has no entry to quote: its offset
+    # is zero by definition, and the log says that and not an empty date.
+    _seed(tmp_path, _plate(objective=TWENTY))
+    stand_with_offsets.require(ObjectiveTurret).select(FORTY, confirm=True)
+    base = _at("B2", 0.0, 0.0)
+    expected = (base[0] - 32.5, base[1] + 9.75)
+
+    with caplog.at_level(logging.INFO, logger="smc"):
+        result = _result(_run(stand_with_offsets, tmp_path, well="B2"))
+
+    assert (result.target_x_um, result.target_y_um) == pytest.approx(expected, abs=1e-6)
+    assert result.shift_um == (-32.5, 9.75)
+    assert (
+        f"the plate registered with {TWENTY} is moved into the frame of {FORTY} by "
+        f"(-32.50, +9.75) µm; offsets measured: {TWENTY} (the reference), "
+        f"{FORTY} {MEASURED}"
+    ) in [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
 
 
 def test_goto_well_on_a_plate_that_records_no_objective_moves_unshifted_and_says_so(

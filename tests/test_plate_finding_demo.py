@@ -1878,11 +1878,74 @@ def test_a_turn_during_the_survey_is_refused(
         f"plate-finding: the objective changed during the survey, from {TEN} to "
         f"{FORTY}: run the survey again without --resume"
     )
-    # The whole survey was taken; its points are kept, and no plate is written.
+    # The whole survey was taken, and no plate is written. Its points lie in two
+    # frames, so none is kept: the checkpoint holds the centre and the objective
+    # the survey began with, and no point (a resume would fit the mixed ones).
     assert camera.snaps == 208
     checkpoint = _stored(tmp_path).checkpoint
     assert checkpoint is not None
-    assert (checkpoint["next_index"], checkpoint["objective"]) == (208, TEN)
+    assert (
+        checkpoint["next_index"],
+        checkpoint["skipped"],
+        checkpoint["points"],
+        checkpoint["objective"],
+    ) == (0, 0, [], TEN)
+    assert checkpoint["total"] == 208
+    assert checkpoint["centre_um"] == [0.0, 0.0]
+
+
+def test_a_resume_after_a_turn_surveys_again_and_never_fits_the_mixed_points(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    # A survey turned to the 40x at point 100 is refused. The operator turns back to
+    # the 10x and runs --resume, as the resume refusal's own text suggests: the
+    # survey is made again from the first point, around the same centre, and the
+    # plate is fitted on 208 points of one frame, not on the 100 + 108 of two.
+    turret = fake_microscope.require(ObjectiveTurret)
+
+    def turn_at_100(snap: int) -> None:
+        if snap == 100:
+            turret.select(FORTY, confirm=True)
+
+    camera = _on_fake(fake_microscope, _plate_at((0.0, 0.0)), before=turn_at_100)
+    _refusal(fake_microscope, tmp_path, plates=["12-well"])
+    assert camera.snaps == 208
+    turret.select(TEN, confirm=True)
+    camera.positions.clear()
+    planned = survey_points("12-well", (0.0, 0.0))
+
+    record = _run(fake_microscope, tmp_path, resume=True, plates=["12-well"])
+
+    result = _result(record)
+    assert camera.snaps == 208 + 208
+    assert _flat(camera.positions) == pytest.approx(_flat(planned), abs=0.05)
+    assert result.objective == TEN
+    assert result.fit is not None
+    assert result.fit.n_samples == 208
+
+
+def test_a_resume_after_a_turn_under_the_other_objective_is_still_refused(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    turret = fake_microscope.require(ObjectiveTurret)
+
+    def turn_at_the_last_point(snap: int) -> None:
+        if snap == 208:
+            turret.select(FORTY, confirm=True)
+
+    camera = _on_fake(
+        fake_microscope, _plate_at((0.0, 0.0)), before=turn_at_the_last_point
+    )
+    _refusal(fake_microscope, tmp_path, plates=["12-well"])
+    snaps = camera.snaps
+
+    # The 40x is still in place: the survey began with the 10x.
+    reason = _refusal(fake_microscope, tmp_path, resume=True, plates=["12-well"])
+
+    assert reason.startswith(
+        f"plate-finding: the survey began with {TEN} and the objective in place is {FORTY}"
+    )
+    assert camera.snaps == snaps
 
 
 def test_a_turret_at_an_empty_position_is_refused_before_any_move(

@@ -523,6 +523,17 @@ def test_a_turret_at_an_empty_position_is_refused_before_the_fit(
     )
 
 
+def test_the_objective_is_checked_before_the_references(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both are wrong: no reference at all, and a turret at an empty position. The objective comes first (m3 §18.3)."""
+    monkeypatch.setattr(demo_microscope.require(ObjectiveTurret), "current", lambda: "")
+
+    error = _refused(demo_microscope, tmp_path)
+
+    assert str(error).startswith("plate-registration: no objective is in place: ")
+
+
 def test_a_turret_that_cannot_be_read_is_a_fault_and_not_no_objective(
     demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

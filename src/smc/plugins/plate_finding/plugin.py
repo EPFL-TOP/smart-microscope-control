@@ -386,8 +386,15 @@ class PlateFindingPlugin:
         _save(ctx, centre, total, total, skipped, points, objective)
         # A turn during the survey puts its later points in another objective's
         # frame, and one lattice cannot be fitted to two. Read again here, after the
-        # last point and before the fit; the checkpoint keeps what was sampled.
-        _refuse_a_turn(objective, objective_for(_NAME, None, turret)[0])
+        # last point and before the fit.
+        now, _ = objective_for(_NAME, None, turret)
+        if now != objective:
+            # The points are of two frames, so none is kept: a complete checkpoint
+            # stamped with the objective the survey began with would let a --resume,
+            # after the turret is turned back, fit them and say it was one frame
+            # (FM-141). The centre stays, so a resume surveys the plate again.
+            _save(ctx, centre, total, 0, 0, [], objective)
+            _refuse_a_turn(objective, now)
         ctx.progress(total, total, "fitting")
         fits = fit(points, list(params.plates) or None)
         best, notes = decide(fits)
@@ -555,7 +562,12 @@ def _refuse_another_objective(began_with: str | None, in_place: str | None) -> N
 
 
 def _refuse_a_turn(began_with: str | None, now: str | None) -> None:
-    """End a survey whose objective changed while it ran: its points lie in two frames."""
+    """End a survey whose objective changed while it ran: its points lie in two frames.
+
+    The caller has already reset the checkpoint, which keeps the centre and the
+    objective the survey began with and no point, so that what is refused here cannot
+    be resumed into a plate fitted on two frames.
+    """
     if began_with == now:
         return
     raise PluginRunError(

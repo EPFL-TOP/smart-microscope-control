@@ -17,6 +17,7 @@ from typer.testing import CliRunner
 
 import smc.cli as cli
 import smc.drive as drive
+import smc.hardware.backends.mm as mm
 from smc.cli import app
 from smc.drive import AutofocusReading, DriveResult
 
@@ -146,6 +147,38 @@ def test_objective_offset_names_a_profile_label_not_on_the_turret(
         "'Nikon 100X' is in the profile's [objectives] but not on the turret: check the label",
     ]
     assert not any(line.endswith("reference") for line in lines)
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_objective_offset_skips_an_empty_turret_position_and_prints_a_zero_without_its_sign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The protocol lists empty positions, whose label is ``""``: no objective to
+    # measure an offset for, so no line. A `-0.0` read from the profile is `+0.00`.
+    labels = mm.MMObjectiveTurret.labels
+    monkeypatch.setattr(
+        mm.MMObjectiveTurret, "labels", lambda self: ["", *labels(self)]
+    )
+    path = _write_offsets_profile(
+        tmp_path / "offsets.toml",
+        TWENTY_X,
+        f'\n[objectives.offsets."{TEN_X}"]\nxy_offset_um = [-0.0, 0.0]\n'
+        f'z_offset_um = -0.0\nmeasured = "{MEASURED}"\n',
+    )
+
+    result = runner.invoke(app, ["objective", "offset", "--profile", str(path)])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    # Six lines for the six labels, none for the empty position put first.
+    assert len(lines) == 6
+    assert lines[0] == "'Nikon 40X Plan Fluor ELWD'  xy unknown  z unknown"
+    assert (
+        f"'{TEN_X}'  (current)  xy (+0.00, +0.00) µm  z +0.00 µm  measured {MEASURED}"
+        in lines
+    )
+    assert not any(line.startswith("''") for line in lines)
 
 
 @pytest.mark.demo

@@ -216,8 +216,10 @@ again after the last point and before the fit:
   no turret records none.
 - If the objective changed while the survey ran (somebody turned the turret) the
   attempt ends with `the objective changed during the survey, from <a> to <b>: run the
-  survey again without --resume`. The points are kept in the checkpoint but are of two
-  frames, so a resume under either is no answer.
+  survey again without --resume`. The points are of two frames, so **none is kept**:
+  the checkpoint is reset to the survey's centre and the objective it began with. A
+  `--resume` after turning the turret back to `<a>` surveys the plate again from the
+  first point, around the same centre; under `<b>` it is refused, as above.
 - The result records the objective (`objective`), for the scan that may use another.
 
 ## Resuming

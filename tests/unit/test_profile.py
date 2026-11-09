@@ -732,10 +732,11 @@ def test_an_entry_for_the_reference_is_refused(tmp_path: Path) -> None:
     assert "(0, 0) by definition" in str(info.value)
 
 
-def test_an_entry_with_a_blank_label_is_refused(tmp_path: Path) -> None:
+@pytest.mark.parametrize("label", ["", "   "], ids=["empty", "spaces"])
+def test_an_entry_with_a_blank_label_is_refused(tmp_path: Path, label: str) -> None:
     path = write_profile(
         tmp_path / "p.toml",
-        _entry('xy_offset_um = [1.0, 2.0]\nmeasured = "x"\n', label=""),
+        _entry('xy_offset_um = [1.0, 2.0]\nmeasured = "x"\n', label=label),
     )
     with pytest.raises(ProfileError, match="must name a turret label"):
         Profile.load(path)
