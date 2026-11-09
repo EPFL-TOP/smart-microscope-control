@@ -394,6 +394,91 @@ def test_the_capture_buttons_are_disabled_while_an_activity_other_than_live_goes
     closed.page.close()
 
 
+# --- the image's sides and what the arrows do to it (m5 §13, #327) ------------------
+
+NO_MATRIX_PAD = (
+    "Which way the image moves for an arrow is not known: run camera-calibration "
+    "(Set up)."
+)
+NO_MATRIX_SIDES = (
+    "Walls are named on the image. No camera calibration says which stage side "
+    "each one is: run camera-calibration (Set up) to capture a wall or drive to one."
+)
+
+
+def test_the_pad_note_and_the_capture_note_carry_the_texts_with_and_without_a_matrix(
+    page: PlatePage,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    view = PlatePageView(page)
+    # No calibration: both say what to run, and nothing is disabled for it.
+    assert view.drive_image_note.object == NO_MATRIX_PAD
+    assert view.image_note.object == NO_MATRIX_SIDES
+    assert not view.jog_buttons["up"].disabled
+
+    # The Ti2-E at 10x: the image moves with the stage.
+    seed_camera_calibration(run_doc, ((-1.1, 0.0), (0.0, 1.1)))
+    view.refresh()
+    assert view.drive_image_note.object == (
+        "On the image, ↑ moves it up, → moves it right; ↓ and ← the opposite."
+    )
+    assert view.image_note.object == (
+        "On the image: left is the stage's +X, right -X, top -Y, bottom +Y "
+        "(from the camera calibration)."
+    )
+
+    # An upright camera: the image moves against the stage, as on most stands.
+    seed_camera_calibration(run_doc, ((1.1, 0.0), (0.0, -1.1)))
+    view.refresh()
+    assert view.drive_image_note.object == (
+        "On the image, ↑ moves it down, → moves it left; ↓ and ← the opposite."
+    )
+    assert view.image_note.object == (
+        "On the image: left is the stage's -X, right +X, top +Y, bottom -Y "
+        "(from the camera calibration)."
+    )
+
+    # A camera 30 degrees off a quarter turn names no side: `frames`' words.
+    seed_camera_calibration(run_doc, ((0.9526, 0.55), (0.55, -0.9526)))
+    view.refresh()
+    assert view.drive_image_note.object.startswith(
+        "the camera is turned 30.0° away from the stage's axes"
+    )
+    assert view.image_note.object == view.drive_image_note.object
+
+    # A calibration of another stand is not usable: the notes go back to unknown.
+    seed_camera_calibration(run_doc, profile="another-stand")
+    view.refresh()
+    assert view.drive_image_note.object == NO_MATRIX_PAD
+    assert view.image_note.object == NO_MATRIX_SIDES
+
+
+def test_the_notes_follow_a_calibration_made_while_the_page_is_open(
+    page: PlatePage,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    # A calibration run from the page shows after the run's own refresh; the tick
+    # alone never rebuilds the notes (m5 §13.2), so a stale one is not drawn by it.
+    view = PlatePageView(page)
+    seed_camera_calibration(run_doc)
+    view.tick()
+    assert view.drive_image_note.object == NO_MATRIX_PAD
+    view.refresh()
+    assert view.drive_image_note.object.startswith("On the image, ↑ moves it up")
+
+
+def test_the_selects_say_that_their_sides_are_on_the_image(page: PlatePage) -> None:
+    view = PlatePageView(page)
+    assert view.capture_side_select.name == "Wall, as on the image"
+    assert view.capture_side_select.options == ["left", "right", "top", "bottom"]
+    assert view.capture_side_select.value == "left"
+    assert view.side_select.name == "Drive to (wall as on the image)"
+    assert view.side_select.options == ["centre", "left", "right", "top", "bottom"]
+    assert view.side_select.value == "centre"
+
+
 # --- the pad and the focus -----------------------------------------------------------
 
 

@@ -875,11 +875,20 @@ def _probe(
     ],
 )
 def test_every_read_of_the_page_registers_itself(
-    page: PlatePage, opener: Opener, method: str, device_call: str, raises: bool
+    page: PlatePage,
+    opener: Opener,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
+    method: str,
+    device_call: str,
+    raises: bool,
 ) -> None:
     # Registered at the call that reaches the device (the core's read), not at the
     # lookup of the capability before it: a read moved out of the `with` while its
     # lookup stays in must fail here, since that read is what an unload would meet.
+    # A wall is mapped to the stage's before the stage is read (#327), so the capture
+    # that reaches the device needs a calibration.
+    seed_camera_calibration(run_doc)
     _connected(page)
     microscope = opener.opened[0]
     call: dict[str, Callable[[], object]] = {

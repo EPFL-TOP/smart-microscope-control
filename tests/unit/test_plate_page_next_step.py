@@ -647,8 +647,8 @@ def test_captures_win_over_the_sample(make_page: Callable[..., PlatePage]) -> No
     page = make_page(_profile(sample={}))
     page.refs = (WellRef(well="B2", x_um=-31500.0, y_um=22500.0),)
     page.walls = (
-        WallTouch(well="B2", side="left", x_um=-34000.0, y_um=22500.0),
-        WallTouch(well="B2", side="top", x_um=-31500.0, y_um=25000.0),
+        WallTouch(well="B2", side="-X", x_um=-34000.0, y_um=22500.0),
+        WallTouch(well="B2", side="+Y", x_um=-31500.0, y_um=25000.0),
     )
     step = page.view().next_step
     assert step is not None
@@ -665,7 +665,7 @@ def test_captures_win_over_the_sample(make_page: Callable[..., PlatePage]) -> No
 
 def test_walls_alone_are_captures_too(make_page: Callable[..., PlatePage]) -> None:
     page = make_page(_profile(sample={}))
-    page.walls = (WallTouch(well="B2", side="left", x_um=1.0, y_um=2.0),)
+    page.walls = (WallTouch(well="B2", side="-X", x_um=1.0, y_um=2.0),)
     step = page.view().next_step
     assert step is not None
     assert step.why[1] == (
@@ -794,7 +794,7 @@ def test_one_centre_a_wall_or_seven_centres_keep_plate_registration_the_step(
             page.refs = CENTRES[:1]
         elif case == "a-wall-touch":
             # Touching a wall is registration's own path: whoever did it chose it.
-            page.walls = (WallTouch(well="B3", side="left", x_um=1.0, y_um=2.0),)
+            page.walls = (WallTouch(well="B3", side="-X", x_um=1.0, y_um=2.0),)
         else:
             page.refs = tuple(
                 WellRef(well=f"A{n}", x_um=9000.0 * n, y_um=0.0) for n in range(1, 8)
@@ -954,7 +954,7 @@ def test_a_closed_stand_draws_the_step_the_captures_name_and_says_not_connected(
         assert step.plugin == "plate-walls"
         assert step.blocked == NOT_CONNECTED
         assert list(step.params) == page.page_params("plate-walls")
-        page.walls = (WallTouch(well="B3", side="left", x_um=1.0, y_um=2.0),)
+        page.walls = (WallTouch(well="B3", side="-X", x_um=1.0, y_um=2.0),)
         assert page.view().next_step.plugin == "plate-registration"  # type: ignore[union-attr]
     finally:
         page.close()

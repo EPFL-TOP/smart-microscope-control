@@ -59,6 +59,7 @@ from smc.hardware.capabilities import (
     ZStage,
 )
 from smc.plugins.presets import PresetError, PresetExistsError
+from smc.plugins.slots import IMAGE_SIDES
 from smc.ui.controller import (
     NOT_CONNECTED,
     LoadedPreset,
@@ -78,7 +79,9 @@ from smc.ui.guide import (
     capture_centre_label,
     capture_wall_label,
     centres_text,
+    drive_image_note,
     forget_label,
+    image_sides_note,
     preset_differences,
     preset_note_text,
     wall_touches_note,
@@ -172,8 +175,10 @@ _TEXT_WIDTH = 380
 _SELECTED_OUTLINE = "#1f77b4"
 _PLAIN_OUTLINE = "#888888"
 _UNKNOWN_FILL = "#eeeeee"
-_SIDES = ("centre", "left", "right", "top", "bottom")
-_WALL_SIDES = ("left", "right", "top", "bottom")
+#: The sides the selects offer are sides **on the image**, as the operator names a wall
+#: (m5 §13.1): the controller maps them to the stage's with the camera calibration.
+_SIDES = ("centre", *IMAGE_SIDES)
+_WALL_SIDES = IMAGE_SIDES
 
 
 def _um(value: float, digits: int) -> str:
@@ -518,7 +523,9 @@ class PlatePageView:
             label="Drive (next click moves the stage)", value=False
         )
         self.side_select = pn.widgets.Select(
-            label="Drive to", options=list(_SIDES), value="centre"
+            label="Drive to (wall as on the image)",
+            options=list(_SIDES),
+            value="centre",
         )
         self.select_input = pn.widgets.TextInput(
             label="Wells", placeholder="A1:D6, C*, all"
@@ -529,11 +536,14 @@ class PlatePageView:
         self.capture_centre_button = pn.widgets.Button(label="Capture centre")
         self.capture_wall_button = pn.widgets.Button(label="Capture wall")
         self.capture_side_select = pn.widgets.Select(
-            label="Wall", options=list(_WALL_SIDES), value="left"
+            label="Wall, as on the image", options=list(_WALL_SIDES), value="left"
         )
         self.forget_button = pn.widgets.Button(label="Forget")
         # Why the three buttons above are disabled with no well: wrapped, as a tool's note.
         self.capture_note = _wrapped_text(extra={"color": _WARNING})
+        # What each side of the image is on the stage, from the camera calibration (m5
+        # §13.2): informative, so not in the warning colour, and it disables nothing.
+        self.image_note = _wrapped_text()
         # `plate-walls`' own captures (m5 §12.5): the centres only, in its section. Widgets
         # of their own, never the registration's placed twice: a Panel widget placed
         # twice in one layout is drawn once, so the second place would be empty and
@@ -686,6 +696,9 @@ class PlatePageView:
         self.drive_note = pn.pane.Str(
             "", styles={"color": _WARNING, "white-space": "pre-wrap"}, width=380
         )
+        # What an arrow does to the image on this stand (m5 §13.2): the arrows are in
+        # the stage's axes and stay so, the note says what they do to what is seen.
+        self.drive_image_note = _wrapped_text(width=380)
         # The label the confirmation was armed with, in a tuple: an empty label is
         # one too (FM-125). The select follows the turret until the tick has read the
         # objective in place and set it, once; never after.
@@ -801,6 +814,7 @@ class PlatePageView:
         return pn.Column(
             pn.pane.Str("Drive", styles={"font-weight": "bold"}),
             pn.Row(pad, self.xy_step_select),
+            self.drive_image_note,
             pn.Row(self.z_buttons["up"], self.z_buttons["down"], self.z_step_select),
             pn.Row(self.autofocus_on_button, self.autofocus_off_button),
             pn.Row(self.objective_select, self.objective_button),
@@ -938,6 +952,7 @@ class PlatePageView:
             parts += [
                 pn.Row(self.capture_centre_button, self.forget_button),
                 pn.Row(self.capture_wall_button, self.capture_side_select),
+                self.image_note,
                 self.capture_note,
                 self.captures_text,
             ]
@@ -1639,6 +1654,10 @@ class PlatePageView:
         centres, touches = self.page.refs, self.page.walls
         self.walls_captures_text.object = centres_text(centres)
         self.walls_touches_note.object = wall_touches_note(len(touches))
+        # From the same view as the rest (FM-151); a calibration run from the page shows
+        # after the run's own refresh. Each is text, with three cases (m5 §13.2).
+        self.image_note.object = image_sides_note(view.camera_matrix)
+        self.drive_image_note.object = drive_image_note(view.camera_matrix)
         self._draw_cards()
         self._draw_next()
         self._draw_problems()

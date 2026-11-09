@@ -1608,9 +1608,13 @@ def test_a_capture_during_a_run_or_a_snap_is_refused(
 
 
 def test_a_capture_while_live_goes_with_nothing_waiting_is_taken(
-    page: PlatePage, fake_microscope: Microscope
+    page: PlatePage,
+    fake_microscope: Microscope,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
 ) -> None:
     # A frame moves nothing: only a drive action handed to live refuses a capture.
+    seed_camera_calibration(run_doc)
     fake_microscope.override(Camera, FrameCamera())
     fake_microscope.require(XYStage).move_to_um(300.0, -200.0)
     page.live(True)
