@@ -60,11 +60,13 @@ from smc.plugins.api import (
 from smc.plugins.errors import PluginRunError
 from smc.plugins.params import parse_params
 from smc.plugins.registry import GROUP, LoadFailure, Registry
+from smc.plugins.scan_plan.algorithm import plan_fields
 from smc.plugins.slots import (
     DensityResult,
     DensityWell,
     PlateResult,
     RouteResult,
+    ScanPlanResult,
     WallFrame,
     WallImages,
     WallTouch,
@@ -92,6 +94,7 @@ from smc.ui.guide import (
     NO_CALIBRATION_FOR_SIDES,
     WALLS_DRY_RUN,
     WALLS_NEED_CALIBRATION,
+    scan_plan_card_lines,
     walls_centres_problem,
 )
 
@@ -5156,3 +5159,241 @@ def test_the_controller_imports_without_panel() -> None:
         check=False,
     )
     assert done.returncode == 0, done.stderr
+
+
+# --- the scan plan on the map and its card (m5 §14, #320) ----------------------------
+
+
+def _scan_plan_result(
+    wells: tuple[str, ...] = ("B11", "B2", "A1"),
+    *,
+    rows: int = 2,
+    columns: int = 2,
+    fov_um: tuple[float, float] = (512.0, 512.0),
+    estimate_s: float | None = 42.16,
+) -> ScanPlanResult:
+    """A scan plan built as test_report.py builds one: ``plan_fields`` over a registered plate.
+
+    The default wells are in visiting order, which is neither the alphabetical one
+    (A1, B11, B2) nor the natural one (A1, B2, B11): a sort in the code fails the
+    tests that read the order (FM-204).
+    """
+    plate = PlateResult(
+        plate="96-well",
+        a1_center_xy_um=(0.0, 0.0),
+        rotation_deg=0.0,
+        method="seed",
+        residual_um=None,
+        scale_error=None,
+        n_refs=0,
+    )
+    half_w, half_h = fov_um[0] / 2, fov_um[1] / 2
+    plate_plan, fields = plan_fields(
+        plate,
+        list(wells),
+        fov_um=fov_um,
+        footprint_of=lambda x, y: [
+            (x - half_w, y - half_h),
+            (x + half_w, y - half_h),
+            (x + half_w, y + half_h),
+            (x - half_w, y + half_h),
+        ],
+        rows=rows,
+        columns=columns,
+        overlap=0.1,
+        clip_to_well=True,
+    )
+    return ScanPlanResult(
+        plate_plan=plate_plan,
+        wells=wells,
+        objective="Nikon 10X S Fluor",
+        pixel_size_um=1.0,
+        matrix_um_per_px=((1.0, 0.0), (0.0, -1.0)),
+        matrix_source="parameter",
+        image_shape_px=(512, 512),
+        fov_um=fov_um,
+        overlap=0.1,
+        rows=rows,
+        columns=columns,
+        fields=fields,
+        estimate_s=estimate_s,
+    )
+
+
+def _with_fields(result: ScanPlanResult, count: int) -> ScanPlanResult:
+    """``result`` with ``count`` fields (the planned ones, repeated): for the bound, not for the geometry."""
+    return result.model_copy(
+        update={
+            "fields": tuple(result.fields[i % len(result.fields)] for i in range(count))
+        }
+    )
+
+
+def _plan_page(microscope: Microscope, run_doc: Path) -> PlatePage:
+    return _page(microscope, run_doc, _real("scan-plan"))
+
+
+def test_a_usable_scan_plan_gives_the_view_its_fields_in_visiting_order(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    result = _scan_plan_result()
+    assert [f.well for f in result.fields[:4]] == ["B11"] * 4
+    assert [f.well for f in result.fields[4:8]] == ["B2"] * 4
+    _seed(run_doc, "scan-plan", "scan-plan", result)
+    plan = _plan_page(fake_microscope, run_doc).view().plan
+    assert plan is not None
+    assert (plan.count, plan.wells, plan.fov_um) == (12, 3, (512.0, 512.0))
+    # The plan's order, B11's fields before B2's before A1's: not the wells' order on the plate.
+    assert plan.fields == tuple((f.x_um, f.y_um) for f in result.fields)
+
+
+def test_no_scan_plan_gives_no_layer(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    assert _plan_page(fake_microscope, run_doc).view().plan is None
+
+
+def test_a_stale_scan_plan_gives_no_layer_and_keeps_its_card_marked_stale(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    result = _scan_plan_result()
+    # The plate was registered again (a2) after the plan read its attempt a1.
+    _seed(run_doc, "plate-registration", "plate", _plate(), minute=2)
+    _seed(
+        run_doc,
+        "scan-plan",
+        "scan-plan",
+        result,
+        minute=3,
+        reads={"plate": ReadRecord(plugin="plate-registration", attempt="a1")},
+    )
+    view = _plan_page(fake_microscope, run_doc).view()
+    assert view.plan is None
+    scan_plan = {i.slot: i for i in view.checklist}["scan-plan"]
+    assert (scan_plan.state, scan_plan.reason) == (
+        "unusable",
+        "scan-plan read its inputs from an earlier run; run it again",
+    )
+    # Marked, not hidden: the card is of the inputs the plan read.
+    card = view.cards["scan-plan"]
+    assert card.stale is True
+    assert card.lines == scan_plan_card_lines(result)
+    assert view.problems == ()
+
+
+@pytest.mark.parametrize(
+    ("profile", "dry_run"),
+    [("another-stand", False), ("demo", True)],
+    ids=["another-profile", "dry-run-on-a-live-page"],
+)
+def test_a_scan_plan_of_another_profile_or_a_dry_run_on_a_live_page_gives_no_layer(
+    fake_microscope: Microscope, run_doc: Path, profile: str, dry_run: bool
+) -> None:
+    # The density layer's rule: a result the document calls unusable here is not drawn.
+    _seed(
+        run_doc,
+        "scan-plan",
+        "scan-plan",
+        _scan_plan_result(),
+        profile=profile,
+        dry_run=dry_run,
+    )
+    view = _plan_page(fake_microscope, run_doc).view()
+    assert view.plan is None
+    assert {i.slot: i.state for i in view.checklist}["scan-plan"] == "unusable"
+    assert view.cards["scan-plan"].lines[0] == "wells: 3 (B11, B2, A1)"
+
+
+def test_a_plan_over_the_bound_gives_a_layer_with_no_fields_and_the_count(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # One under, on and one over the bound: it is the boundary the test is about.
+    for count, drawn in ((4999, True), (5000, True), (5001, False)):
+        _seed(
+            run_doc,
+            "scan-plan",
+            "scan-plan",
+            _with_fields(_scan_plan_result(), count),
+        )
+        plan = _plan_page(fake_microscope, run_doc).view().plan
+        assert plan is not None
+        assert plan.count == count
+        assert (len(plan.fields) == count) is drawn
+        assert (plan.fields == ()) is (not drawn)
+        assert plan.wells == 3
+
+
+@pytest.mark.parametrize("fov_um", [(0.0, 512.0), (-512.0, 512.0), (512.0, 0.0)])
+def test_a_plan_whose_field_of_view_is_not_positive_is_a_problem_not_a_layer(
+    fake_microscope: Microscope, run_doc: Path, fov_um: tuple[float, float]
+) -> None:
+    result = _scan_plan_result()
+    # The model does not bound fov_um (measured, #320): this result is valid.
+    _seed(
+        run_doc,
+        "scan-plan",
+        "scan-plan",
+        result.model_copy(update={"fov_um": fov_um}),
+    )
+    view = _plan_page(fake_microscope, run_doc).view()
+    assert view.plan is None
+    assert view.problems == (
+        f"scan-plan: fov_um {fov_um} is not positive; its fields are not drawn",
+    )
+    # The card still says what the plan holds.
+    assert view.cards["scan-plan"].lines[0] == "wells: 3 (B11, B2, A1)"
+
+
+def test_a_scan_plan_that_does_not_validate_is_a_problem_and_the_generic_card(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # FM-125: a hand-edited document is data; view() raises nothing for it.
+    broken = _scan_plan_result().model_dump(mode="json")
+    del broken["estimate_s"]
+    _record(run_doc, "scan-plan", result=broken)
+    view = _plan_page(fake_microscope, run_doc).view()
+    assert view.plan is None
+    assert view.problems == (
+        "scan-plan: result does not validate: estimate_s: Field required",
+    )
+    # The generic card: the first keys as counted values, not the scan plan's lines.
+    lines = view.cards["scan-plan"].lines
+    assert "wells: 3 items" in lines
+    assert not any(line.startswith("estimate: ") for line in lines)
+
+
+def test_the_card_of_a_done_scan_plan_holds_the_estimate_line_the_generic_card_cut(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    result = _scan_plan_result()
+    _seed(run_doc, "scan-plan", "scan-plan", result)
+    card = _plan_page(fake_microscope, run_doc).view().cards["scan-plan"]
+    # Four lines, none of them cut: `estimate_s` was the 14th key of the generic card.
+    assert card.lines == scan_plan_card_lines(result)
+    assert card.lines[3] == (
+        "estimate: about 42 s (the moves, refocus and snaps of the timings)"
+    )
+    assert card.stale is False
+
+
+@pytest.mark.parametrize("status", [StageStatus.stopped, StageStatus.failed])
+def test_a_scan_plan_that_did_not_end_done_has_no_lines(
+    fake_microscope: Microscope, run_doc: Path, status: StageStatus
+) -> None:
+    # FM-154: a stopped or failed record's values are not a result, even when it holds one.
+    _seed(run_doc, "scan-plan", "scan-plan", _scan_plan_result(), status=status)
+    view = _plan_page(fake_microscope, run_doc).view()
+    assert view.cards["scan-plan"].lines == ()
+    assert view.plan is None
+
+
+def test_a_record_that_is_not_a_scan_plan_keeps_its_generic_card(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # The same keys under another `provides`: the tool is not scan-plan, so the card is generic.
+    result = _scan_plan_result().model_dump(mode="json")
+    _record(run_doc, "stub", result=result)
+    lines = _page(fake_microscope, run_doc).view().cards["stub"].lines
+    assert lines[0] == "plate_plan: 5 entries"
+    assert "wells: 3 items" in lines
+    assert not any(line.startswith("estimate: ") for line in lines)
