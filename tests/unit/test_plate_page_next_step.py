@@ -40,6 +40,9 @@ from smc.ui.guide import (
     DRY_RUN_NO_FRAME,
     PLATE_NOT_CHOSEN,
     SELECT_WELLS,
+    WALLS_DRY_RUN,
+    WALLS_NEED_CALIBRATION,
+    walls_centres_problem,
 )
 
 T0 = datetime(2026, 11, 2, 9, 0, tzinfo=timezone.utc)
@@ -116,6 +119,23 @@ class Registration(Tool):
             scale_error=None,
             n_refs=len(params.refs),
         )
+
+
+class WallsParams(PluginParams):
+    plate: str = "96-well"
+    refs: tuple[WellRef, ...] = ()
+
+
+class Walls(Tool):
+    """The registration from images, as the real one is: it reads the calibration and images with the camera."""
+
+    name = "plate-walls"
+    provides = "plate"
+    summary = "A test wall registration."
+    Params = WallsParams
+    Result = PlateResult
+    reads = ("camera-calibration",)
+    requires = (XYStage, Camera)
 
 
 class Finding(Tool):
@@ -694,6 +714,250 @@ def test_a_sample_of_another_plate_asks_to_choose_it(
     parsed = parse_params(RegistrationParams, chosen.params)
     assert parsed.plate == "384-well"
     assert [ref.well for ref in parsed.refs] == ["A1", "A24", "P1"]
+
+
+# --- plate-walls is the step when the operator took that path (m5 §12.4, #346) ------------
+#
+# The pages here are built over `fake_microscope` (profile "demo"), whose `has` a test may
+# replace: a stand that cannot image is a stand with no `Camera`, and a dry-run page is
+# a stand opened with `dry_run=True`.
+
+# In capture order, which is not alphabetical: a step that sorts the wells says so.
+CENTRES = (
+    WellRef(well="D5", x_um=1.0, y_um=2.0),
+    WellRef(well="B3", x_um=10182.0, y_um=-10087.9),
+)
+WALLS_STEP_WHY = (
+    "plate, refs: the 2 centres of D5, B3 captured on this page; plate-walls images "
+    "each well's four walls around its centre and moves the stage in X and Y only"
+)
+
+
+def _walls_page(
+    stand: Microscope,
+    run_doc: Path,
+    *,
+    refs: tuple[WellRef, ...] = CENTRES,
+    chosen: bool = True,
+    tools: tuple[type[Tool], ...] = (Calibration, *WORKFLOW, Walls),
+) -> PlatePage:
+    """A page over ``stand`` with the real tools' stubs and ``refs`` captured, as the operator would have."""
+    page = PlatePage(stand, run_doc, entry_points=[_ep(cls) for cls in tools])
+    if chosen:
+        page.choose_plate("96-well")
+    page.refs = refs
+    return page
+
+
+def _calibrated(run_doc: Path) -> None:
+    """A ``camera-calibration`` record the document calls usable, made on the stand the page is over."""
+    _seed(run_doc, "camera-calibration", profile="demo")
+
+
+def test_two_captured_centres_make_plate_walls_the_step_and_name_registration_as_the_other(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _walls_page(
+        fake_microscope, run_doc, tools=(Calibration, *WORKFLOW, Walls, Finding)
+    )
+    try:
+        step = page.view().next_step
+        assert step is not None
+        assert step.plugin == "plate-walls"
+        # The pairs the click makes are the pairs the step shows and the command passes.
+        assert list(step.params) == page.page_params("plate-walls")
+        assert _pairs_of(step.command) == list(step.params)
+        assert step.why == (
+            "the run document has no plate yet",
+            WALLS_STEP_WHY,
+            "or plate-registration: A test registration.",
+            "or plate-finding: A test finder. It surveys the plate.",
+        )
+        # Until the calibration is run the button is disabled, with the page's sentence.
+        assert step.blocked == WALLS_NEED_CALIBRATION
+        _calibrated(run_doc)
+        ready = page.view().next_step
+        assert ready is not None
+        assert (ready.plugin, ready.blocked) == ("plate-walls", None)
+    finally:
+        page.close()
+
+
+@pytest.mark.parametrize("case", ["one-centre", "a-wall-touch", "seven-centres"])
+def test_one_centre_a_wall_or_seven_centres_keep_plate_registration_the_step(
+    fake_microscope: Microscope, run_doc: Path, case: str
+) -> None:
+    _calibrated(run_doc)
+    page = _walls_page(fake_microscope, run_doc)
+    try:
+        if case == "one-centre":
+            page.refs = CENTRES[:1]
+        elif case == "a-wall-touch":
+            # Touching a wall is registration's own path: whoever did it chose it.
+            page.walls = (WallTouch(well="B3", side="left", x_um=1.0, y_um=2.0),)
+        else:
+            page.refs = tuple(
+                WellRef(well=f"A{n}", x_um=9000.0 * n, y_um=0.0) for n in range(1, 8)
+            )
+        step = page.view().next_step
+        assert step is not None
+        assert step.plugin == "plate-registration"
+        assert list(step.params) == page.page_params("plate-registration")
+        # Both stay on the page: the other tool is named, not hidden.
+        assert step.why[-1] == "or plate-walls: A test wall registration."
+    finally:
+        page.close()
+
+
+def test_an_unchosen_plate_keeps_plate_registrations_reason_with_two_centres(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _calibrated(run_doc)
+    page = _walls_page(fake_microscope, run_doc, chosen=False)
+    try:
+        step = page.view().next_step
+        assert step is not None
+        assert step.plugin == "plate-registration"
+        assert step.blocked == PLATE_NOT_CHOSEN
+        # Nothing is offered while the plate is the placeholder (m5 §11.3).
+        assert step.params == ()
+    finally:
+        page.close()
+
+
+def test_a_dry_run_page_never_makes_plate_walls_the_step(
+    fake_core: FakeCore, run_doc: Path
+) -> None:
+    # FM-182: a path the tool refuses in a mode is not offered in it. A dry run does not
+    # image the walls, and the plugin's refusal would replace a usable plate (§11.4).
+    dry = Microscope.from_core(
+        cast("CMMCorePlus", fake_core), Profile.demo(), dry_run=True
+    )
+    try:
+        _calibrated(run_doc)
+        page = _walls_page(dry, run_doc)
+        try:
+            step = page.view().next_step
+            assert step is not None
+            assert step.plugin == "plate-registration"
+            # The tool itself is refused in the page, with its own reason.
+            assert page.view().blocked["plate-walls"] == WALLS_DRY_RUN
+        finally:
+            page.close()
+    finally:
+        dry.close()
+
+
+def test_a_stand_without_a_camera_keeps_plate_registration_the_step(
+    fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _calibrated(run_doc)
+    page = _walls_page(fake_microscope, run_doc)
+    try:
+        before = page.view().next_step
+        assert before is not None
+        assert before.plugin == "plate-walls"
+
+        def has(capability: type) -> bool:
+            return capability is not Camera
+
+        monkeypatch.setattr(fake_microscope, "has", has)
+        after = page.view().next_step
+        assert after is not None
+        assert after.plugin == "plate-registration"
+        assert after.blocked is None
+        assert page.view().blocked["plate-walls"] == "this stand has no Camera"
+    finally:
+        page.close()
+
+
+@pytest.mark.parametrize("plate", ["384-well", "1536-well"])
+def test_a_plate_with_square_wells_keeps_plate_registration_the_step(
+    fake_microscope: Microscope, run_doc: Path, plate: str
+) -> None:
+    # FM-182: the plugin fits round wells and refuses a square-welled plate before
+    # anything moves, and a failed record would replace a usable plate (§11.4). The step
+    # never offers it there, or it would offer the same refused click again after it.
+    _calibrated(run_doc)
+    page = _walls_page(fake_microscope, run_doc, chosen=False)
+    try:
+        page.choose_plate(plate)  # drops the captures of the other plate
+        page.refs = (
+            WellRef(well="A1", x_um=0.0, y_um=0.0),
+            WellRef(well="A2", x_um=4500.0, y_um=0.0),
+        )
+        step = page.view().next_step
+        assert step is not None
+        assert step.plugin == "plate-registration"
+        assert step.blocked is None
+        assert parse_params(RegistrationParams, step.params).plate == plate
+        assert step.why[-1] == "or plate-walls: A test wall registration."
+    finally:
+        page.close()
+
+
+def test_plate_walls_alone_in_its_slot_never_offers_the_plugins_default_plate(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # `plate-registration` may fail to load (a line of the page's problems, not a tool):
+    # `plate-walls` is then the first provider and is the step whatever the captures are.
+    # With the placeholder plate or too few centres its pairs would be the plugin's own
+    # defaults (`plate=96-well`, no refs), which a click must never run (§11.3), and its
+    # line would say `the 0 centres of  captured`.
+    only = (Calibration, *(t for t in WORKFLOW if t is not Registration), Walls)
+    page = _walls_page(fake_microscope, run_doc, refs=(), chosen=False, tools=only)
+    try:
+        _calibrated(run_doc)
+        unchosen = page.view().next_step
+        assert unchosen is not None
+        assert (unchosen.plugin, unchosen.params) == ("plate-walls", ())
+        assert unchosen.blocked == PLATE_NOT_CHOSEN
+        assert unchosen.why == ("the run document has no plate yet",)
+
+        page.choose_plate("96-well")
+        none = page.view().next_step
+        assert none is not None
+        assert (none.plugin, none.params) == ("plate-walls", ())
+        assert none.blocked == walls_centres_problem(0)
+        assert none.why == ("the run document has no plate yet",)
+
+        page.refs = CENTRES[:1]
+        one = page.view().next_step
+        assert one is not None
+        assert (one.params, one.blocked) == ((), walls_centres_problem(1))
+
+        page.refs = CENTRES
+        two = page.view().next_step
+        assert two is not None
+        assert list(two.params) == page.page_params("plate-walls")
+        assert two.blocked is None
+        assert two.why == ("the run document has no plate yet", WALLS_STEP_WHY)
+    finally:
+        page.close()
+
+
+def test_a_closed_stand_draws_the_step_the_captures_name_and_says_not_connected(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # The step is drawn for the stand the operator is about to open: its tool is the
+    # one the captures name, and the reason is the stand's either way.
+    page = PlatePage.closed(
+        fake_microscope.profile,
+        run_doc,
+        entry_points=[_ep(cls) for cls in (Calibration, *WORKFLOW, Walls)],
+    )
+    try:
+        page.choose_plate("96-well")
+        page.refs = CENTRES
+        step = page.view().next_step
+        assert step is not None
+        assert step.plugin == "plate-walls"
+        assert step.blocked == NOT_CONNECTED
+        assert list(step.params) == page.page_params("plate-walls")
+        page.walls = (WallTouch(well="B3", side="left", x_um=1.0, y_um=2.0),)
+        assert page.view().next_step.plugin == "plate-registration"  # type: ignore[union-attr]
+    finally:
+        page.close()
 
 
 def test_the_step_names_the_other_tools_of_its_slot(

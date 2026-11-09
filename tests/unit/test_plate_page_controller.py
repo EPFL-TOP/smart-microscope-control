@@ -65,7 +65,10 @@ from smc.plugins.slots import (
     DensityWell,
     PlateResult,
     RouteResult,
+    WallFrame,
+    WallImages,
     WallTouch,
+    WellFit,
     WellRef,
 )
 from smc.run import (
@@ -85,6 +88,11 @@ from smc.ui.controller import (
     PlatePage,
 )
 from smc.ui.frames import Frame
+from smc.ui.guide import (
+    WALLS_DRY_RUN,
+    WALLS_NEED_CALIBRATION,
+    walls_centres_problem,
+)
 
 T0 = datetime(2026, 10, 29, 9, 0, tzinfo=timezone.utc)
 PITCH_96_UM = 9000.0
@@ -98,6 +106,7 @@ REAL = {
     "cells": "smc.plugins.cells.plugin:CellsPlugin",
     "density": "smc.plugins.density.plugin:DensityPlugin",
     "goto-well": "smc.plugins.goto_well:GotoWellPlugin",
+    "plate-finding": "smc.plugins.plate_finding.plugin:PlateFindingPlugin",
     "plate-registration": "smc.plugins.plate_registration.plugin:PlateRegistrationPlugin",
     "plate-walls": "smc.plugins.plate_walls.plugin:PlateWallsPlugin",
     "route": "smc.plugins.route.plugin:RoutePlugin",
@@ -1795,6 +1804,428 @@ def test_plate_registration_params_are_the_plate_and_the_captures(
     ]
 
 
+# --- plate-walls on the page (m5 §12, #346) ------------------------------------------
+
+
+def test_plate_walls_is_in_set_up_right_after_plate_registration(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _stood_page(
+        fake_microscope,
+        run_doc,
+        "scan-plan",
+        "plate-walls",
+        "plate-registration",
+        "camera-calibration",
+    )
+    try:
+        # The page's own stub tools come along (`_page`): the real ones are those named.
+        named = {"camera-calibration", "plate-registration", "plate-walls", "scan-plan"}
+        tools = [t for t in page.tools() if t.name in named]
+        # The workflow's order, not the entry points' (§12.2): the owner's path sits
+        # beside the registration it is an alternative to.
+        assert [t.name for t in tools] == [
+            "camera-calibration",
+            "plate-registration",
+            "plate-walls",
+            "scan-plan",
+        ]
+        assert {t.name: t.stage for t in tools}["plate-walls"] == "Set up"
+    finally:
+        page.close()
+
+
+def test_the_form_of_plate_walls_offers_neither_plate_nor_refs(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _stood_page(fake_microscope, run_doc, "plate-walls")
+    try:
+        walls = {t.name: t for t in page.tools()}["plate-walls"]
+        # `plate` and `refs` are the page's (its captures); every other field is under
+        # *Advanced*, closed: a newcomer sees buttons (§12.2), and KEY_PARAMS has no line.
+        assert "plate-walls" not in KEY_PARAMS
+        assert walls.key == ()
+        assert {row[0] for row in walls.advanced} == {
+            "search_um",
+            "max_residual_um",
+            "max_rotation_deg",
+            "settle_ms",
+            "save_frames",
+        }
+        assert PAGE_PARAMS["plate-walls"] == ("plate", "refs")
+    finally:
+        page.close()
+
+
+def test_plate_walls_params_are_the_plate_and_the_captured_centres(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    page.choose_plate("96-well")
+    stage = fake_microscope.require(XYStage)
+    stage.move_to_um(1.5, 2.5)
+    page.capture_centre("A1")
+    stage.move_to_um(9001.5, -9000.5)
+    page.capture_centre("B2")
+    page.capture_wall("A1", "right")  # a wall touch is registration's, never the tool's
+    refs = json.dumps(
+        [
+            {"well": "A1", "x_um": 1.5, "y_um": 2.5},
+            {"well": "B2", "x_um": 9001.5, "y_um": -9000.5},
+        ]
+    )
+    assert page.page_params("plate-walls") == ["plate=96-well", f"refs={refs}"]
+    # The one dump for both tools: a step and a click agree, byte for byte.
+    registration = page.page_params("plate-registration")
+    assert registration[:2] == page.page_params("plate-walls")
+
+
+def test_plate_walls_params_refuse_fewer_than_two_centres_and_more_than_six(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    page.choose_plate("96-well")
+    stage = fake_microscope.require(XYStage)
+    with _refuses(ValueError, walls_centres_problem(0) or ""):
+        page.page_params("plate-walls")
+    for index, well in enumerate(["A1", "A2", "A3", "A4", "A5", "A6", "A7"], start=1):
+        stage.move_to_um(9000.0 * index, 0.0)
+        page.capture_centre(well)
+        if index == 1:
+            with _refuses(ValueError, walls_centres_problem(1) or ""):
+                page.page_params("plate-walls")
+        elif index <= 6:
+            # 2 to 6 centres: the pairs, whatever they are.
+            assert page.page_params("plate-walls")[0] == "plate=96-well"
+    with _refuses(ValueError, walls_centres_problem(7) or ""):
+        page.page_params("plate-walls")
+    # The step's pairs (`_page_pairs`) never raise for the count: a preset's check of
+    # the tool's other fields is not refused for it (§12.2).
+    assert page._page_pairs("plate-walls")[0] == "plate=96-well"
+
+
+def test_the_plates_gate_comes_before_the_count_for_plate_walls(
+    page: PlatePage,
+) -> None:
+    # Unchosen and uncaptured: the plate is the first thing the operator is told.
+    with _refuses(ValueError, PLACEHOLDER_REFUSAL):
+        page.page_params("plate-walls")
+
+
+def _walls_page(
+    microscope: Microscope,
+    run_doc: Path,
+    *,
+    centres: int = 2,
+    calibrated: bool = True,
+    chosen: bool = True,
+) -> PlatePage:
+    """A page with the real ``plate-walls`` and ``camera-calibration``, in one state of §12.3's list.
+
+    The calibration is a record the document calls usable (the page reads its state,
+    never its matrix); the centres are captured on the stage at distinct places.
+    """
+    if calibrated:
+        _seed(run_doc, "camera-calibration", "camera-calibration")
+    page = _stood_page(microscope, run_doc, "plate-walls", "camera-calibration")
+    if chosen:
+        page.choose_plate("96-well")
+    stage = microscope.require(XYStage)
+    for index, well in enumerate(["B3", "D5", "F7", "H9", "A1", "C2"][:centres]):
+        stage.move_to_um(9000.0 * index, -9000.0 * index)
+        page.capture_centre(well)
+    return page
+
+
+def _walls_reason(page: PlatePage) -> str | None:
+    return page.view().blocked.get("plate-walls")
+
+
+def test_plate_walls_is_blocked_in_the_order_dry_run_calibration_stand_centres(
+    fake_microscope: Microscope, fake_core: FakeCore, run_doc: Path
+) -> None:
+    # §12.3: the stand closed, the placeholder plate, then a dry run, the calibration,
+    # the stand's capabilities, the centres. Each state alone, then two at once: the
+    # earlier reason wins, so the operator is told the one that holds longest.
+    dry = Microscope.from_core(
+        cast("CMMCorePlus", fake_core), Profile.demo(), dry_run=True
+    )
+    try:
+        # Each reason alone.
+        ok = _walls_page(fake_microscope, run_doc)
+        assert _walls_reason(ok) is None
+        ok.close()
+        run_doc.unlink()
+
+        none = _walls_page(fake_microscope, run_doc, centres=0)
+        assert _walls_reason(none) == walls_centres_problem(0)
+        none.close()
+        one = _walls_page(fake_microscope, run_doc, centres=1)
+        assert _walls_reason(one) == walls_centres_problem(1)
+        one.close()
+        seven_page = _walls_page(fake_microscope, run_doc, centres=2)
+        stage = fake_microscope.require(XYStage)
+        for index, well in enumerate(["A2", "A3", "A4", "A5", "A6"], start=2):
+            stage.move_to_um(9000.0 * index, 100.0)
+            seven_page.capture_centre(well)
+        assert _walls_reason(seven_page) == walls_centres_problem(7)
+        seven_page.close()
+        run_doc.unlink()
+
+        no_cal = _walls_page(fake_microscope, run_doc, calibrated=False)
+        assert _walls_reason(no_cal) == WALLS_NEED_CALIBRATION
+        with _replaced(fake_microscope, "has", _without(Camera)):
+            # No calibration and no camera: the calibration is asked for first.
+            assert _walls_reason(no_cal) == WALLS_NEED_CALIBRATION
+        no_cal.close()
+
+        no_camera = _walls_page(fake_microscope, run_doc, centres=0)
+        with _replaced(fake_microscope, "has", _without(Camera)):
+            # A stand that cannot image is told before the centres it lacks.
+            assert _walls_reason(no_camera) == "this stand has no Camera"
+        no_camera.close()
+        run_doc.unlink()
+
+        # A dry run: the plate's reason first, then the dry run ahead of the rest.
+        unchosen = _stood_page(dry, run_doc, "plate-walls", "camera-calibration")
+        assert _walls_reason(unchosen) == PLACEHOLDER_REFUSAL
+        unchosen.close()
+        dry_page = _walls_page(dry, run_doc, centres=0, calibrated=False)
+        assert _walls_reason(dry_page) == WALLS_DRY_RUN
+        dry_page.close()
+    finally:
+        dry.close()
+
+    # The stand closed is the reason ahead of all of them.
+    closed = PlatePage.closed(
+        fake_microscope.profile, run_doc, entry_points=_real("plate-walls")
+    )
+    try:
+        assert _walls_reason(closed) == "the stand is not connected"
+    finally:
+        closed.close()
+
+
+def test_with_no_calibration_the_reason_says_to_run_camera_calibration(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _walls_page(fake_microscope, run_doc, calibrated=False)
+    try:
+        # The page's own sentence, not the run document's, which is for a terminal.
+        assert _walls_reason(page) == WALLS_NEED_CALIBRATION
+        assert "smc run --list" not in WALLS_NEED_CALIBRATION
+    finally:
+        page.close()
+
+
+def test_an_unusable_calibration_keeps_the_run_documents_words(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # A calibration that exists and is of another stand is not "run camera-calibration
+    # first": the document says what is wrong with it, as it does for every tool.
+    _seed(run_doc, "camera-calibration", "camera-calibration", profile="lightsheet")
+    page = _walls_page(fake_microscope, run_doc, calibrated=False)
+    try:
+        expected = RunDocument.load_or_new(run_doc).unusable(
+            "camera-calibration", profile="demo", dry_run=False
+        )
+        assert expected is not None
+        assert _walls_reason(page) == expected
+        assert _walls_reason(page) != WALLS_NEED_CALIBRATION
+    finally:
+        page.close()
+
+
+def test_a_dry_run_page_refuses_plate_walls_in_the_controller_and_writes_nothing(
+    fake_core: FakeCore, run_doc: Path
+) -> None:
+    dry = Microscope.from_core(
+        cast("CMMCorePlus", fake_core), Profile.demo(), dry_run=True
+    )
+    try:
+        # A usable plate, as a real registration left it: the plugin's own refusal of a
+        # dry run would be a `failed` record that replaces it (§11.4).
+        _seed(run_doc, "plate-registration", "plate", _plate())
+        _seed(run_doc, "camera-calibration", "camera-calibration", minute=1)
+        page = _walls_page(dry, run_doc, centres=2, calibrated=False, chosen=False)
+        try:
+            before = run_doc.read_bytes()
+            # Pairs that the parameters would refuse: the refusal is the dry run's,
+            # which comes before anything is read (FM-169).
+            page.run("plate-walls", ["bogus=1"])
+            assert page.status().running is None
+            assert page.status().outcome == f"plate-walls: {WALLS_DRY_RUN}"
+            assert run_doc.read_bytes() == before
+            provider = RunDocument.load_or_new(run_doc).provider("plate")
+            assert provider is not None
+            assert provider.plugin == "plate-registration"
+            assert provider.status is StageStatus.done
+        finally:
+            page.close()
+    finally:
+        dry.close()
+
+
+def test_the_plates_refusal_comes_before_a_dry_runs_for_plate_walls(
+    fake_core: FakeCore, run_doc: Path
+) -> None:
+    dry = Microscope.from_core(
+        cast("CMMCorePlus", fake_core), Profile.demo(), dry_run=True
+    )
+    try:
+        page = _stood_page(dry, run_doc, "plate-walls")
+        try:
+            page.run("plate-walls", [])
+            assert page.status().outcome == f"plate-walls: {PLACEHOLDER_REFUSAL}"
+        finally:
+            page.close()
+    finally:
+        dry.close()
+
+
+def _walls_fit(well: str, centre: tuple[float, float], frames: int) -> WellFit:
+    return WellFit(
+        well=well,
+        recorded_xy_um=(centre[0] + 4.0, centre[1] - 4.0),
+        center_xy_um=centre,
+        diameter_um=15298.4,
+        size_error=0.0,
+        rms_um=3.0,
+        n_points=40,
+        walls=tuple(
+            WallFrame(side=side, x_um=0.0, y_um=0.0, n_points=10, frames=frames)
+            for side in ("+X", "+Y", "-X", "-Y")
+        ),
+    )
+
+
+def _walls_result(folder: str | None = "plate-walls/tok") -> PlateResult:
+    """What ``plate-walls`` writes for two wells: four frames on each side of the first, two of the second."""
+    return PlateResult(
+        plate="24-well",
+        a1_center_xy_um=(0.0, 0.0),
+        rotation_deg=0.1234,
+        method="wall-images",
+        residual_um=3.24,
+        scale_error=0.0,
+        n_refs=2,
+        assumed=(
+            "two wells: the residual checks their distance only; a third well "
+            "checks the fit",
+        ),
+        walls=WallImages(
+            objective="10x",
+            pixel_size_um=1.0,
+            image_shape_px=(100, 100),
+            search_um=3900.0,
+            wells=(
+                # In the order the wells were measured, which is not alphabetical.
+                _walls_fit("D5", (1.0, 2.0), 2),
+                _walls_fit("B3", (10182.04, -10087.93), 4),
+            ),
+            frames=48,
+            folder=folder,
+            elapsed_s=16.5,
+        ),
+    )
+
+
+def test_a_plate_walls_card_shows_the_wells_the_plate_and_the_frames_folder(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed(
+        run_doc,
+        "plate-walls",
+        "plate",
+        _walls_result(),
+        params={"plate": "24-well"},
+    )
+    page = _stood_page(fake_microscope, run_doc, "plate-walls")
+    try:
+        card = page.view().cards["plate-walls"]
+        # §12.6: one line per well (the frames of its four sides summed), then the
+        # plate; not the result's first eight keys with the walls cut away.
+        assert card.lines == (
+            "D5: centre (1.0, 2.0) µm, 15298 µm across, 8 frames",
+            "B3: centre (10182.0, -10087.9) µm, 15298 µm across, 16 frames",
+            "plate 24-well: residual 3.2 µm, rotation 0.12°",
+        )
+        # The folder is the frames the operator may open: under the run folder, built
+        # the way the page builds every path (FM-24).
+        assert card.files == (f"folder: {run_doc.parent / 'plate-walls' / 'tok'}",)
+        assert card.assumed == (
+            "two wells: the residual checks their distance only; a third well "
+            "checks the fit",
+        )
+    finally:
+        page.close()
+
+
+@pytest.mark.parametrize("folder", [None, "", "   "], ids=["none", "empty", "blank"])
+def test_a_walls_card_with_no_folder_names_no_file(
+    fake_microscope: Microscope, run_doc: Path, folder: str | None
+) -> None:
+    _seed(run_doc, "plate-walls", "plate", _walls_result(folder))
+    page = _stood_page(fake_microscope, run_doc, "plate-walls")
+    try:
+        card = page.view().cards["plate-walls"]
+        assert card.files == ()
+        assert len(card.lines) == 3
+    finally:
+        page.close()
+
+
+@pytest.mark.parametrize(
+    "walls",
+    [
+        {"wells": "none", "folder": "plate-walls/tok"},
+        {"folder": 7, "wells": []},
+        "not an object",
+        [],
+    ],
+    ids=["wells-not-a-list", "a-folder-that-is-a-number", "text", "a-list"],
+)
+def test_a_walls_result_that_does_not_validate_keeps_the_generic_card(
+    fake_microscope: Microscope, run_doc: Path, walls: object
+) -> None:
+    # The document is data (FM-125) and `view()` raises nothing for it: a `walls` the
+    # model refuses is the generic card of the result's keys, never an exception.
+    _record(
+        run_doc,
+        "plate-walls",
+        provides="plate",
+        result={
+            "plate": "24-well",
+            "a1_center_xy_um": [0.0, 0.0],
+            "rotation_deg": 0.0,
+            "method": "wall-images",
+            "residual_um": 1.0,
+            "scale_error": None,
+            "n_refs": 2,
+            "walls": walls,
+        },
+    )
+    page = _stood_page(fake_microscope, run_doc, "plate-walls")
+    try:
+        card = page.view().cards["plate-walls"]
+        assert "plate: 24-well" in card.lines
+        assert not any(line.startswith("plate 24-well") for line in card.lines)
+    finally:
+        page.close()
+
+
+def test_a_plate_registration_card_keeps_its_generic_lines(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    page = _stood_page(fake_microscope, run_doc, "plate-registration")
+    try:
+        card = page.view().cards["plate-registration"]
+        assert "method: references" in card.lines
+        assert "plate: 96-well" in card.lines
+        assert card.files == ()
+    finally:
+        page.close()
+
+
 # --- the plate the page starts with (m5 §11.3, #332) --------------------------------
 
 PLACEHOLDER_REFUSAL = (
@@ -2117,12 +2548,11 @@ def test_a_closed_stand_is_still_the_reason_ahead_of_an_unchosen_plate(
         page.close()
 
 
-def test_a_tool_that_names_the_plate_in_page_params_is_gated_with_no_further_code(
-    fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+def test_an_unchosen_plate_refuses_plate_walls_in_the_controller(
+    fake_microscope: Microscope, run_doc: Path
 ) -> None:
-    # #346 adds `PAGE_PARAMS["plate-walls"] = ("plate", "refs")`: the gate is the
-    # table's, so that tool is refused on a placeholder with nothing else written.
-    monkeypatch.setitem(PAGE_PARAMS, "plate-walls", ("plate", "refs"))
+    # `PAGE_PARAMS["plate-walls"]` names `plate` (#346): the gate is the table's, so
+    # that tool is refused on a placeholder with no code of its own (m5 §12.2).
     page = _stood_page(fake_microscope, run_doc, "plate-walls")
     try:
         assert page.view().blocked["plate-walls"] == PLACEHOLDER_REFUSAL
@@ -2156,6 +2586,41 @@ def test_a_usable_plate_gives_each_plate_tool_a_replace_note(
             "plate-registration": note,
             "plate-walls": note,
         }
+    finally:
+        page.close()
+
+
+def test_the_replace_note_under_plate_finding_does_not_mention_captures(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # plate-finding fills the plate from the image: it has no capture to forget, so the
+    # sentence about them is false under it (m5 §12.7). The tools that run from the
+    # page's captures keep it.
+    _seed(
+        run_doc,
+        "plate-registration",
+        "plate",
+        _plate(),
+        params={"plate": "96-well"},
+    )
+    page = _stood_page(
+        fake_microscope,
+        run_doc,
+        "plate-registration",
+        "plate-walls",
+        "plate-finding",
+    )
+    try:
+        when = T0.astimezone().strftime("%Y-%m-%d %H:%M")
+        head = f"Run replaces the plate registered {when} (references, 2 wells). "
+        replaces = page.view().replaces
+        assert replaces["plate-finding"] == f"{head}A failed run leaves no plate."
+        keeps = (
+            f"{head}A failed run leaves no plate; the captures stay, so Forget the "
+            "wrong one and Run again to get a plate back."
+        )
+        assert replaces["plate-registration"] == keeps
+        assert replaces["plate-walls"] == keeps
     finally:
         page.close()
 
@@ -3968,6 +4433,7 @@ def test_every_key_and_page_param_is_a_field_of_its_plugin(
     names = (
         "scan-plan",
         "plate-registration",
+        "plate-walls",
         "camera-calibration",
         "scan",
         "cells",
