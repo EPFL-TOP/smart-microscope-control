@@ -2040,6 +2040,9 @@ FM-176, FM-43.
    `controller.py`, `plate_page.py` and `guide.py`: no other issue that edits them
    runs at the same time. #367 (the leftovers of #332: `serve()`'s filter, the stale
    label's plate check) and #327 (the *Wall* select) edit the same captures' region.
+10. **#320** (the scan plan on the map and its estimate, §14) edits `controller.py`,
+    `plate_page.py` and `guide.py`: no other issue that edits them runs at the same
+    time. It comes after #327 (§13, the captures' region of `plate_page.py`).
 
 ### 9.1 Not verified (for the owner)
 
@@ -3406,3 +3409,194 @@ the notes read `left is the stage's +X, …` and `↑ moves it up, → moves it 
 (M3 §19.7), and agree with NIS-Elements' own XY control; B3's four walls captured
 under their image names give a centre within a few tens of µm of the one the walls'
 midpoints give; the page walked by a newcomer, who names a wall as they see it.
+
+
+## 14. The map draws the scan plan's fields, and the card says how long the scan takes (#320)
+
+Fixed by #320's plan (2026-11-09). Finding 4 of the owner's walk of the first run
+(#310): after `scan-plan done` the map was unchanged, so a newcomer could not see what
+`scan` was about to do, and the card did not say how long it would take.
+
+**Measured 2026-11-09 on `demo-sample`** (Python 3.13.0, Panel 1.10.0, Bokeh 3.10.1; a
+throwaway script, not committed): `plate-registration`, then `scan-plan wells=B2,B11
+coverage=0.4` through the page's controller:
+
+- the result holds 72 `PlannedField`s (6 × 6 in each of the two wells), `fov_um` is
+  `(512.0, 512.0)`, `overlap` 0.1, `estimate_s` is `None`; `wells` is `['B11', 'B2']` and
+  the fields come B11's first: **the visiting order is not the alphabetical one**;
+- the card (§2.4) is `plate_plan: 5 entries`, `wells: 2 items`, `objective: ...`,
+  `pixel_size_um: 1`, `matrix_um_per_px: 2 items`, `matrix_source: profile`,
+  `image_shape_px: 2 items`, `fov_um: 2 items`, then `… 5 more`: `fov_um` is the 8th
+  line, and **`fields` and `estimate_s` are in the cut part**, so the estimate never
+  reached the page, `null` or not;
+- after `timing` (5.7 s), the same `scan-plan` has `estimate_s` 42.16 (72 fields,
+  `move_ms_per_mm` 100.5, `refocus_ms` 400, `snap_ms` 18.1);
+- running `timing` again makes `scan-plan` stale: the checklist says `scan-plan read
+  its inputs from an earlier run; run it again` and `view()` holds the card with
+  `stale` set, as §2.4 says;
+- `ScanPlanResult.model_validate` on 5000 and 13,824 fields takes 4 and 9 ms; a Bokeh
+  figure with one `rect` glyph of N fields (four columns of N numbers) serialises to
+  6.7 kB (72 fields, 8 ms), 455 kB (13,824, 24 ms), 672 kB (20,000, 32 ms) and 1.7 MB
+  (50,000, 68 ms): about 33 bytes a field.
+
+### 14.1 The layer
+
+A layer of the plate map, **the fields of the usable scan plan**: one rectangle per
+`PlannedField`, `fov_um[0]` wide and `fov_um[1]` high, centred on `(x_um, y_um)`, in
+stage µm like the wells. The rules:
+
+- **The same rule as the density layer.** `view()` reads the plan with
+  `self._slot(doc, "scan-plan", ScanPlanResult, problems)`: the layer exists only
+  while the slot is usable, so a plan that is stale (it read a plate or a timing that
+  was produced again since, measured above), made on another profile, or a dry run on
+  a page that is not one, draws nothing. The card of such a plan stays, marked as §2.4
+  says. A plan that does not validate is `scan-plan: result does not validate: ...` in
+  `problems`, drawn as absent (FM-125).
+- **The plan's wells, not the selection.** The layer draws every field of the plan
+  whatever the *Wells* box says now: the plan is what `scan` will do, and a selection
+  changed since has not changed the plan.
+- **The footprint's bounding box.** `fov_um` is the footprint's extent *in stage
+  axes* (`ScanPlanResult`'s docstring): exact for a camera at 0° or 90°, larger than
+  the frame for another angle. The layer draws that box and does not claim more.
+- **No field is hoverable** and none is labelled: the wells keep the hover
+  (`hover.renderers` stays the wells' renderer), the title and the card carry the numbers.
+  The visiting order is not drawn (no line between fields: the route draws its own
+  once it exists, and a second line would hide it).
+
+```python
+#: smc/ui/controller.py
+MAP_FIELDS_UP_TO = 5000
+
+
+@dataclass(frozen=True, slots=True)
+class PlanLayer:
+    """The scan plan as the map draws it, in stage µm; ``fields`` is empty when there are too many."""
+
+    count: int  # every field of the plan, drawn or not
+    wells: int  # len(result.wells)
+    fov_um: tuple[float, float]
+    fields: tuple[tuple[float, float], ...]  # (x_um, y_um) in visiting order, or ()
+```
+
+`PlateView` gains `plan: PlanLayer | None = None` as its **last** field. `view()` builds
+it from the slot: `None` when the slot is not usable; otherwise `PlanLayer(count=len(
+result.fields), wells=len(result.wells), fov_um=result.fov_um, fields=<the centres>
+if count <= MAP_FIELDS_UP_TO else ())`. A `fov_um` with a side that is not greater
+than 0 is `None` and the line `scan-plan: fov_um <fov_um> is not positive; its fields
+are not drawn` in `problems` (the model does not bound it, and a rectangle of zero or
+negative size is invisible or flipped).
+
+**The bound** (FM-140: bounded per unit and not in all). A plan holds up to 100 × 100
+fields per axis in each well (the plugin refuses a larger derived grid), so 1536 wells
+at 3 × 3 is 13,824 fields and a plan of 1536 wells at 100 × 100 is 15 million. Past
+`MAP_FIELDS_UP_TO` = 5000 fields **nothing is drawn, not a first part**: a first
+part would show an arbitrary corner of the plan as if it were all of it. The title
+says so (§14.3). The figure is chosen, not measured: 5000 is about 165 kB on the
+websocket at each redraw (33 bytes a field, measured above) and more rectangles than
+the eye separates on a plate. The 15 million fields are the plugin's concern (the
+result would be a document of gigabytes); the bound here keeps the page's payload
+bounded whatever a document holds. `view()` is called when the page redraws (a run
+ended, the document changed, a click), not by the tick (FM-145); validating a plan is
+the 9 ms above.
+
+### 14.2 The page (`smc/ui/plate_page.py`)
+
+`PlatePageView` gains `fields_source = ColumnDataSource({"x": [], "y": [], "w": [],
+"h": []})` and one `figure.rect("x", "y", "w", "h", source=self.fields_source,
+fill_color="#ff7f0e", fill_alpha=0.2, line_color="#ff7f0e", line_width=1)`, **added
+in `__init__` before the route's line**, so that the route is drawn over it, and above
+the wells (which are `underlay`). `refresh()` sets `fields_source.data` from
+`view.plan` (the `fov_um` repeated in `w` and `h` for each row; empty columns when
+`plan` is `None` or has no fields) and `_draw_wells` ends the title with `plan_title(
+view.plan)` (§14.3). The orange is a first choice, chosen to differ from Viridis
+(the wells' fill) and from the route's red; `/ui-check`'s PNG decides whether it
+reads, and a change of colour is not a deviation.
+
+### 14.3 What the title and the card say (`smc/ui/guide.py`, pure)
+
+```python
+def plan_title(
+    plan: PlanLayer | None, *, drawn_up_to: int = MAP_FIELDS_UP_TO
+) -> str: ...
+def duration_text(seconds: float) -> str: ...
+def scan_plan_card_lines(result: ScanPlanResult) -> tuple[str, ...]: ...
+```
+
+(`MAP_FIELDS_UP_TO` lives in `guide.py`, where `controller.py` imports it from; the
+`drawn_up_to` keyword is for the test of the bound.) The figure's title, as `_draw_wells`
+sets it today (`<plate>: the registered plate`, or the nominal text), gets one suffix:
+
+| `plan` | Suffix of the title |
+|---|---|
+| `None` | none (as today) |
+| 72 fields in 2 wells | `; scan plan: 72 fields in 2 wells` |
+| 1 field in 1 well | `; scan plan: 1 field in 1 well` |
+| 20000 fields in 1536 wells | `; scan plan: 20000 fields in 1536 wells, too many to draw (over 5000)` |
+
+`duration_text` rounds to the nearest second (Python's `round`), then: under a minute
+`<s> s`; under an hour `<m> min <ss> s` (two digits); from an hour `<h> h <mm> min`
+(seconds dropped). `0.4` is `0 s`, `42.16` is `42 s`, `192` is `3 min 12 s`, `59.6` is
+`1 min 00 s`, `3900` is `1 h 05 min`, `3599.6` is `1 h 00 min`.
+
+**The scan plan's card** is built from the result, like `walls_card_lines` (§12.6),
+instead of its first keys, which cut `estimate_s` away (measured above). `_card`
+validates `record.result` as `ScanPlanResult` for a `done` record (a result that does
+not validate keeps the generic card, never an exception: FM-125) and takes these lines:
+
+```text
+wells: 2 (B11, B2)
+fields: 72, a grid of 6 × 6 in each well
+field: 512 × 512 µm at Nikon 10X S Fluor, overlap 0.1
+estimate: about 42 s (the moves, refocus and snaps of the timings)
+```
+
+- `wells: <n> (<names>)`: the names in the plan's order (`result.wells`), at most six,
+  then `, … <n - 6> more` inside the parentheses (`wells: 96 (B11, B2, B3, B4, B5, B6, … 90 more)`).
+- `fields: <len(fields)>, a grid of <rows> × <columns> in each well` when `len(fields) ==
+  rows * columns * len(wells)`; else `fields: <len(fields)> of <rows * columns *
+  len(wells)>, a grid of <rows> × <columns> in each well, the fields that miss the
+  well left out`. The two numbers say that clipping happened; the count is the
+  result's own.
+- `field: <w:g> × <h:g> µm` then ` at <objective>` when it is not `None`, then
+  `, overlap <overlap:g>`.
+- `estimate: about <duration_text(estimate_s)> (the moves, refocus and snaps of the
+  timings)` when `estimate_s` is not `None`; otherwise **`estimate: unknown, no usable
+  timing: run timing, then scan-plan again`**. What the figure sums is what
+  `estimate_s()` sums (`scan_plan/algorithm.py`): each move, a refocus when the stand
+  has an autofocus and the timings know its cost, each snap. It does not include a
+  channel change or the cells, the report or the export, and the text says "the moves,
+  refocus and snaps" so as not to claim more. An unknown is not a zero (CLAUDE.md,
+  *unknown beats guessed*): the line says what to run, and says it once.
+
+The `×` is U+00D7; the source carries `# noqa: RUF001` as `scan_plan/plugin.py` does.
+Four lines, never more than `_CARD_LINES`; each goes through `_cut(_flat(...))`
+(FM-139: plain text, an objective's label is the stand's and may hold anything).
+`assumed` is unchanged (`no camera calibration for ...`). A scan plan that did not end
+`done` has no lines (FM-154), and a **stale** one keeps them (§2.4): the estimate on a
+stale card is of the timings it read, and the card is marked stale.
+
+### 14.4 What this does not do
+
+- It does not draw the visiting order, a field's name, a hover on a field, or the
+  fields of a plan the operator has not run (a selection is not a plan).
+- It does not make `timing` a next step: `timings` is an optional slot, never a step
+  (§8.3). The card says what to run, which is where the operator reads the plan.
+- It does not draw the fields of `scan`'s result (what was taken) or of `route`'s
+  stops: the route has its own layer.
+- It does not rotate a field: the box is in stage axes (§14.1).
+- It does not change `scan-plan`, `ScanPlanResult` or the run document.
+
+### 14.5 Tests and failure modes
+
+Named in #320's plan. **Failure modes**: FM-125 (a result and a `fov_um` taken as they
+come), FM-139 (plain text), FM-140 (the bound in all), FM-145 (`view()`, not the
+tick), FM-151 (a second tab draws the shared plan), FM-154 (no lines unless `done`),
+FM-170 (an unknown is said with what makes it unknown), FM-204 (a fixture whose wells
+are not in alphabetical order: B11 before B2 is the demo's), FM-162 (the browser walk
+names what it did not reach).
+
+**Not verified (for the owner)**: the map at a real plate's zoom on the PC's screen
+(5000 rectangles, and 72 of 512 µm at the full plate's extent, are a few pixels each
+in headless Chromium: `/ui-check` shows what a newcomer sees at the default zoom, not
+the stand's screen); the estimate against the time of a real scan on the Ti2-E
+(`timing` measured it on the demo's simulated stage here).
