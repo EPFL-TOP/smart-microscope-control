@@ -103,6 +103,7 @@ from smc.ui.guide import (
     command_line,
     next_slot,
     replace_note,
+    walls_centres_problem,
 )
 
 if TYPE_CHECKING:
@@ -136,7 +137,16 @@ log = logging.getLogger("smc.ui")
 #: Every other registered plugin is on the page too, under ``MORE_STAGE``, by name
 #: (m5 §2.3): a plugin nobody listed here is usable all the same.
 STAGES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("Set up", ("camera-calibration", "plate-registration", "plate-finding", "timing")),
+    (
+        "Set up",
+        (
+            "camera-calibration",
+            "plate-registration",
+            "plate-walls",
+            "plate-finding",
+            "timing",
+        ),
+    ),
     ("Choose", ("scan-plan",)),
     ("Acquire", ("scan",)),
     ("Find", ("cells", "density", "route")),
@@ -161,6 +171,9 @@ KEY_PARAMS: dict[str, tuple[str, ...]] = {
 #: does not offer them.
 PAGE_PARAMS: dict[str, tuple[str, ...]] = {
     "plate-registration": ("plate", "refs", "walls"),
+    # The same captured centres as the registration, never its wall touches: the tool
+    # images the walls itself (m5 §12.2). Naming `plate` is what gates it on §11.3.
+    "plate-walls": ("plate", "refs"),
     "scan-plan": ("wells",),
 }
 
@@ -1113,14 +1126,29 @@ class PlatePage:
         Raises:
             ValueError: ``scan-plan`` with nothing selected, or with a selection
                 on another plate than the registered one; a tool that takes the
-                plate while nothing named it (``PLATE_NOT_CHOSEN``).
+                plate while nothing named it (``PLATE_NOT_CHOSEN``);
+                ``plate-walls`` with fewer than two centres captured or more than
+                six, after the plate's gate (m5 §12.3).
         """
         if _needs_plate(plugin) and not self._plate_chosen:
             raise ValueError(PLATE_NOT_CHOSEN)
+        if plugin == "plate-walls":
+            # One read of the captures for the count and the pairs: another tab may
+            # capture between two reads of `self.refs`.
+            refs = self.refs
+            problem = walls_centres_problem(len(refs))
+            if problem is not None:
+                raise ValueError(problem)
+            return self._dump_refs(refs)
         return self._page_pairs(plugin)
 
     def _page_pairs(self, plugin: str) -> list[str]:
-        """``page_params`` without the plate's gate: what the page would fill if the plate were chosen."""
+        """``page_params`` without the plate's gate: what the page would fill if the plate were chosen.
+
+        Without the count of ``plate-walls``' centres either: that is the gate's
+        (``page_params``), as the plate's is, so that a preset's check of the
+        tool's other fields is not refused for it (m5 §12.2).
+        """
         if plugin == "scan-plan":
             if not self.selection:
                 raise ValueError("select at least one well first")
@@ -1128,15 +1156,25 @@ class PlatePage:
             return [f"wells={','.join(self.selection)}"]
         if plugin == "plate-registration":
             return self._registration_pairs(self.refs, self.walls)
+        if plugin == "plate-walls":
+            return self._dump_refs(self.refs)
         return []
+
+    def _dump_refs(self, refs: Sequence[WellRef]) -> list[str]:
+        """The ``plate`` and ``refs`` pairs of the two tools that register from captured centres.
+
+        One place dumps them, so that ``plate-registration`` and ``plate-walls``
+        are given the same text for the same captures, and a step and a click agree.
+        """
+        dumped = json.dumps([r.model_dump(mode="json") for r in refs])
+        return [f"plate={self._plate}", f"refs={dumped}"]
 
     def _registration_pairs(
         self, refs: Sequence[WellRef], walls: Sequence[WallTouch]
     ) -> list[str]:
         """The pairs of ``plate-registration`` for this plate: one place dumps them, so a step and a click agree."""
-        dumped_refs = json.dumps([r.model_dump(mode="json") for r in refs])
         dumped_walls = json.dumps([w.model_dump(mode="json") for w in walls])
-        return [f"plate={self._plate}", f"refs={dumped_refs}", f"walls={dumped_walls}"]
+        return [*self._dump_refs(refs), f"walls={dumped_walls}"]
 
     # --- presets (m5 §10.5) -----------------------------------------------------------
 

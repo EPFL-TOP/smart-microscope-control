@@ -85,6 +85,7 @@ from smc.ui.controller import (
     PlatePage,
 )
 from smc.ui.frames import Frame
+from smc.ui.guide import walls_centres_problem
 
 T0 = datetime(2026, 10, 29, 9, 0, tzinfo=timezone.utc)
 PITCH_96_UM = 9000.0
@@ -1795,6 +1796,112 @@ def test_plate_registration_params_are_the_plate_and_the_captures(
     ]
 
 
+# --- plate-walls on the page (m5 §12, #346) ------------------------------------------
+
+
+def test_plate_walls_is_in_set_up_right_after_plate_registration(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _stood_page(
+        fake_microscope,
+        run_doc,
+        "scan-plan",
+        "plate-walls",
+        "plate-registration",
+        "camera-calibration",
+    )
+    try:
+        # The page's own stub tools come along (`_page`): the real ones are those named.
+        named = {"camera-calibration", "plate-registration", "plate-walls", "scan-plan"}
+        tools = [t for t in page.tools() if t.name in named]
+        # The workflow's order, not the entry points' (§12.2): the owner's path sits
+        # beside the registration it is an alternative to.
+        assert [t.name for t in tools] == [
+            "camera-calibration",
+            "plate-registration",
+            "plate-walls",
+            "scan-plan",
+        ]
+        assert {t.name: t.stage for t in tools}["plate-walls"] == "Set up"
+    finally:
+        page.close()
+
+
+def test_the_form_of_plate_walls_offers_neither_plate_nor_refs(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _stood_page(fake_microscope, run_doc, "plate-walls")
+    try:
+        walls = {t.name: t for t in page.tools()}["plate-walls"]
+        # `plate` and `refs` are the page's (its captures); every other field is under
+        # *Advanced*, closed: a newcomer sees buttons (§12.2), and KEY_PARAMS has no line.
+        assert "plate-walls" not in KEY_PARAMS
+        assert walls.key == ()
+        assert {row[0] for row in walls.advanced} == {
+            "search_um",
+            "max_residual_um",
+            "max_rotation_deg",
+            "settle_ms",
+            "save_frames",
+        }
+        assert PAGE_PARAMS["plate-walls"] == ("plate", "refs")
+    finally:
+        page.close()
+
+
+def test_plate_walls_params_are_the_plate_and_the_captured_centres(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    page.choose_plate("96-well")
+    stage = fake_microscope.require(XYStage)
+    stage.move_to_um(1.5, 2.5)
+    page.capture_centre("A1")
+    stage.move_to_um(9001.5, -9000.5)
+    page.capture_centre("B2")
+    page.capture_wall("A1", "right")  # a wall touch is registration's, never the tool's
+    refs = json.dumps(
+        [
+            {"well": "A1", "x_um": 1.5, "y_um": 2.5},
+            {"well": "B2", "x_um": 9001.5, "y_um": -9000.5},
+        ]
+    )
+    assert page.page_params("plate-walls") == ["plate=96-well", f"refs={refs}"]
+    # The one dump for both tools: a step and a click agree, byte for byte.
+    registration = page.page_params("plate-registration")
+    assert registration[:2] == page.page_params("plate-walls")
+
+
+def test_plate_walls_params_refuse_fewer_than_two_centres_and_more_than_six(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    page.choose_plate("96-well")
+    stage = fake_microscope.require(XYStage)
+    with _refuses(ValueError, walls_centres_problem(0) or ""):
+        page.page_params("plate-walls")
+    for index, well in enumerate(["A1", "A2", "A3", "A4", "A5", "A6", "A7"], start=1):
+        stage.move_to_um(9000.0 * index, 0.0)
+        page.capture_centre(well)
+        if index == 1:
+            with _refuses(ValueError, walls_centres_problem(1) or ""):
+                page.page_params("plate-walls")
+        elif index <= 6:
+            # 2 to 6 centres: the pairs, whatever they are.
+            assert page.page_params("plate-walls")[0] == "plate=96-well"
+    with _refuses(ValueError, walls_centres_problem(7) or ""):
+        page.page_params("plate-walls")
+    # The step's pairs (`_page_pairs`) never raise for the count: a preset's check of
+    # the tool's other fields is not refused for it (§12.2).
+    assert page._page_pairs("plate-walls")[0] == "plate=96-well"
+
+
+def test_the_plates_gate_comes_before_the_count_for_plate_walls(
+    page: PlatePage,
+) -> None:
+    # Unchosen and uncaptured: the plate is the first thing the operator is told.
+    with _refuses(ValueError, PLACEHOLDER_REFUSAL):
+        page.page_params("plate-walls")
+
+
 # --- the plate the page starts with (m5 §11.3, #332) --------------------------------
 
 PLACEHOLDER_REFUSAL = (
@@ -2117,12 +2224,11 @@ def test_a_closed_stand_is_still_the_reason_ahead_of_an_unchosen_plate(
         page.close()
 
 
-def test_a_tool_that_names_the_plate_in_page_params_is_gated_with_no_further_code(
-    fake_microscope: Microscope, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+def test_an_unchosen_plate_refuses_plate_walls_in_the_controller(
+    fake_microscope: Microscope, run_doc: Path
 ) -> None:
-    # #346 adds `PAGE_PARAMS["plate-walls"] = ("plate", "refs")`: the gate is the
-    # table's, so that tool is refused on a placeholder with nothing else written.
-    monkeypatch.setitem(PAGE_PARAMS, "plate-walls", ("plate", "refs"))
+    # `PAGE_PARAMS["plate-walls"]` names `plate` (#346): the gate is the table's, so
+    # that tool is refused on a placeholder with no code of its own (m5 §12.2).
     page = _stood_page(fake_microscope, run_doc, "plate-walls")
     try:
         assert page.view().blocked["plate-walls"] == PLACEHOLDER_REFUSAL
@@ -3968,6 +4074,7 @@ def test_every_key_and_page_param_is_a_field_of_its_plugin(
     names = (
         "scan-plan",
         "plate-registration",
+        "plate-walls",
         "camera-calibration",
         "scan",
         "cells",

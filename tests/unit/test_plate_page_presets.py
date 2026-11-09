@@ -260,14 +260,17 @@ def _plate_done(run_doc: Path, plate: str = "96-well") -> None:
 
 def test_what_a_preset_does_not_keep_under_params_is_what_the_page_fills() -> None:
     # Two lists that must agree: a key the page fills itself is one the preset's
-    # own fields hold, and the other way round. The exceptions are the stage
-    # positions that the page does not fill but a preset never holds: plate-finding's
-    # centre and plate-walls' refs, which `smc presets save` leaves out as well
-    # (#324, m5 §10.9).
+    # own fields hold, and the other way round. The exception is the stage position
+    # that the page does not fill but a preset never holds: plate-finding's centre,
+    # which `smc presets save` leaves out as well (#324, m5 §10.9).
     kept_elsewhere = {plugin: set(keys) for plugin, keys in NOT_IN_PARAMS.items()}
     filled = {plugin: set(keys) for plugin, keys in PAGE_PARAMS.items()}
     assert kept_elsewhere.pop("plate-finding") == {"centre_x_um", "centre_y_um"}
+    # plate-walls (#346): the page fills its `plate` and its `refs`, and the preset
+    # refuses `refs` only: its `plate` is not yet one the preset holds elsewhere (a
+    # follow-up of #346, in the plugins' table, which that issue does not touch).
     assert kept_elsewhere.pop("plate-walls") == {"refs"}
+    assert filled.pop("plate-walls") == {"plate", "refs"}
     assert kept_elsewhere == filled
 
 
@@ -635,6 +638,39 @@ def test_save_preset_refuses_a_value_the_plugin_refuses_and_writes_nothing(
     assert message.endswith("; nothing saved")
     assert not (tmp_path / "profiles").exists()
     assert page.preset is None
+
+
+def _walls_page(run_doc: Path) -> PlatePage:
+    """A page with the real ``plate-walls`` and no stand: a preset reaches no device."""
+    entry = EntryPoint(
+        name="plate-walls",
+        value="smc.plugins.plate_walls.plugin:PlateWallsPlugin",
+        group=GROUP,
+    )
+    return PlatePage.closed(_profile(), run_doc, entry_points=[entry])
+
+
+def test_a_preset_of_plate_walls_fields_is_checked_with_no_centre_captured(
+    run_doc: Path, tmp_path: Path
+) -> None:
+    # The page fills `plate` and `refs` for the check of the tool's other fields; the
+    # count of centres is the run's gate, not the preset's (m5 §12.2): a preset saved
+    # before a single well is captured is not refused for it, and the tool's own
+    # refusal of a field still is.
+    page = _walls_page(run_doc)
+    try:
+        assert page.refs == ()
+        page.save_preset("walls", {"plate-walls": ["search_um=3000"]}, "")
+        assert _saved(tmp_path, "walls")["params"] == {
+            "plate-walls": ["search_um=3000"]
+        }
+        with pytest.raises(PresetError) as refused:
+            page.save_preset("bad", {"plate-walls": ["search_um=-1"]}, "")
+        assert str(refused.value).startswith("plate-walls: ")
+        assert str(refused.value).endswith("; nothing saved")
+        assert not (tmp_path / "profiles" / "presets" / "bad.toml").exists()
+    finally:
+        page.close()
 
 
 def test_save_preset_refuses_an_unknown_plugin_and_a_key_the_page_fills(
