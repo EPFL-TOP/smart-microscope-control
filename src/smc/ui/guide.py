@@ -15,9 +15,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from smc.plugins.frames import image_direction_of_stage_step, stage_side_of_image_side
+
 if TYPE_CHECKING:
     from datetime import datetime
 
+    from smc.plugins.geometry import Matrix2
     from smc.plugins.slots import PlateResult, WellRef
     from smc.ui.controller import CheckItem, LoadedPreset
 
@@ -25,6 +28,7 @@ __all__ = [
     "CAPTURE_WELLS",
     "DRY_RUN_NO_FRAME",
     "END_LIVE_LABEL",
+    "NO_CALIBRATION_FOR_SIDES",
     "PLATE_NOT_CHOSEN",
     "SELECT_WELLS",
     "WALLS_DRY_RUN",
@@ -37,7 +41,9 @@ __all__ = [
     "capture_wall_label",
     "centres_text",
     "command_line",
+    "drive_image_note",
     "forget_label",
+    "image_sides_note",
     "next_slot",
     "preset_differences",
     "preset_note_text",
@@ -110,6 +116,16 @@ WALLS_NEED_CALIBRATION = (
     "texture (a well's wall will do)"
 )
 
+#: Why a wall cannot be captured, nor driven to, without a ``camera-calibration``
+#: (m5 §13.1): the operator names it on the image, and only the calibration's
+#: rotation and mirror say which stage side that is (FM-189). The same fix as
+#: ``WALLS_NEED_CALIBRATION``, a text of its own: here a side cannot be mapped, there
+#: a tool cannot run.
+NO_CALIBRATION_FOR_SIDES = (
+    "walls are named on the image, and no camera calibration says which stage side "
+    "that is: run camera-calibration (Set up), then try again"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class NextStep:
@@ -154,8 +170,63 @@ def capture_centre_label(well: str | None) -> str:
 
 
 def capture_wall_label(well: str | None, side: str) -> str:
-    """The *Capture wall* button's label: the well and the *Wall* select's value as it stands."""
-    return "Capture wall" if well is None else f"Capture {well} {side} wall"
+    """The *Capture wall* button's label: the well and the *Wall* select's value as it stands.
+
+    The select's values are sides on the image (m5 §13.1), and the label says so
+    (``at image left``): a button that said only ``left`` could be read as the
+    stage's.
+    """
+    return "Capture wall" if well is None else f"Capture {well} wall at image {side}"
+
+
+def image_sides_note(matrix: Matrix2 | None) -> str:
+    """What each side of the image is on the stage, under the capture buttons (m5 §13.2).
+
+    The operator names a wall as the image shows it and the layer takes stage
+    directions: the note says the mapping the page will use, so that a wall named
+    on the image is not a surprise in the capture list. A matrix that ``frames``
+    refuses gives ``frames``' own text (a camera too far from a quarter turn names
+    no side), and no matrix says what to run. Plain text (FM-139).
+    """
+    if matrix is None:
+        return (
+            "Walls are named on the image. No camera calibration says which stage "
+            "side each one is: run camera-calibration (Set up) to capture a wall or "
+            "drive to one."
+        )
+    try:
+        left, right, top, bottom = (
+            stage_side_of_image_side(side, matrix)
+            for side in ("left", "right", "top", "bottom")
+        )
+    except ValueError as exc:
+        return str(exc)
+    return (
+        f"On the image: left is the stage's {left}, right {right}, top {top}, "
+        f"bottom {bottom} (from the camera calibration)."
+    )
+
+
+def drive_image_note(matrix: Matrix2 | None) -> str:
+    """What the Drive pad's arrows do to the image, under the pad (m5 §13.2).
+
+    The arrows stay in the stage's axes (the owner's decision of 2026-11-03: it is
+    the stage that moves, so the image is normally inverted, and microscopy's
+    standards are kept); the note says what each does to the image on this stand,
+    from the camera calibration, and *not known* when there is none. ``↑`` is a
+    +Y step and ``→`` a +X step. Plain text (FM-139).
+    """
+    if matrix is None:
+        return (
+            "Which way the image moves for an arrow is not known: run "
+            "camera-calibration (Set up)."
+        )
+    try:
+        up = image_direction_of_stage_step("+Y", matrix)
+        right = image_direction_of_stage_step("+X", matrix)
+    except ValueError as exc:
+        return str(exc)
+    return f"On the image, ↑ moves it {up}, → moves it {right}; ↓ and ← the opposite."
 
 
 def forget_label(well: str | None) -> str:

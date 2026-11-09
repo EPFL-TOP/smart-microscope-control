@@ -17,6 +17,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from smc.plugins.geometry import Matrix2
 from smc.plugins.presets import Preset, PresetCheck, PresetFile
 from smc.plugins.slots import PlateResult, WallFrame, WallImages, WellFit, WellRef
 from smc.ui.controller import CheckItem, LoadedPreset
@@ -24,6 +25,7 @@ from smc.ui.guide import (
     CAPTURE_WELLS,
     DRY_RUN_NO_FRAME,
     END_LIVE_LABEL,
+    NO_CALIBRATION_FOR_SIDES,
     SELECT_WELLS,
     WALLS_DRY_RUN,
     WALLS_MAX_CENTRES,
@@ -35,7 +37,9 @@ from smc.ui.guide import (
     capture_wall_label,
     centres_text,
     command_line,
+    drive_image_note,
     forget_label,
+    image_sides_note,
     next_slot,
     preset_differences,
     preset_note_text,
@@ -385,13 +389,78 @@ def test_command_line_gives_back_any_pairs_through_shlex(
 
 def test_capture_labels_name_the_well_and_the_side() -> None:
     assert capture_centre_label("B3") == "Capture centre of B3"
-    assert capture_wall_label("B3", "left") == "Capture B3 left wall"
-    assert capture_wall_label("B3", "bottom") == "Capture B3 bottom wall"
     assert forget_label("B3") == "Forget B3"
     # With no well the labels are the plain three: there is nothing to name.
     assert capture_centre_label(None) == "Capture centre"
     assert capture_wall_label(None, "left") == "Capture wall"
     assert forget_label(None) == "Forget"
+
+
+def test_capture_wall_label_names_the_well_and_the_image_side() -> None:
+    # The side is the select's value, a side on the image (m5 §13.2): the button
+    # says so, so that nobody reads it as a stage direction.
+    assert capture_wall_label("B3", "left") == "Capture B3 wall at image left"
+    assert capture_wall_label("B3", "bottom") == "Capture B3 wall at image bottom"
+    assert capture_wall_label("H12", "top") == "Capture H12 wall at image top"
+    assert capture_wall_label(None, "right") == "Capture wall"
+
+
+# --- the image's sides and what the arrows do (m5 §13.2, #327) ----------------------
+
+_TI2E: Matrix2 = ((-1.1, 0.0), (0.0, 1.1))  # the Ti2-E at 10x, a camera at 180 degrees
+_UPRIGHT: Matrix2 = ((1.1, 0.0), (0.0, -1.1))  # a camera at 0 degrees, not mirrored
+_THIRTY_DEGREES: Matrix2 = ((0.9526, 0.55), (0.55, -0.9526))
+
+
+def test_the_no_calibration_text_says_to_run_camera_calibration() -> None:
+    assert NO_CALIBRATION_FOR_SIDES == (
+        "walls are named on the image, and no camera calibration says which stage "
+        "side that is: run camera-calibration (Set up), then try again"
+    )
+
+
+def test_the_image_sides_note_says_what_each_side_is_on_the_stage() -> None:
+    assert image_sides_note(_TI2E) == (
+        "On the image: left is the stage's +X, right -X, top -Y, bottom +Y "
+        "(from the camera calibration)."
+    )
+    # The table is the matrix's, not one camera's: an upright one reads the other way.
+    assert image_sides_note(_UPRIGHT) == (
+        "On the image: left is the stage's -X, right +X, top +Y, bottom -Y "
+        "(from the camera calibration)."
+    )
+
+
+def test_the_image_sides_note_without_a_calibration_says_to_run_it() -> None:
+    assert image_sides_note(None) == (
+        "Walls are named on the image. No camera calibration says which stage side "
+        "each one is: run camera-calibration (Set up) to capture a wall or drive to "
+        "one."
+    )
+
+
+def test_the_drive_note_says_what_the_arrows_do_to_the_image() -> None:
+    assert drive_image_note(_TI2E) == (
+        "On the image, ↑ moves it up, → moves it right; ↓ and ← the opposite."
+    )
+    assert drive_image_note(_UPRIGHT) == (
+        "On the image, ↑ moves it down, → moves it left; ↓ and ← the opposite."
+    )
+    assert drive_image_note(None) == (
+        "Which way the image moves for an arrow is not known: run camera-calibration "
+        "(Set up)."
+    )
+
+
+def test_the_notes_of_a_camera_off_a_quarter_turn_are_frames_text() -> None:
+    # `frames`' own words, taken from its refusal: a camera 30 degrees off names no
+    # side, and the page says why instead of guessing (FM-98).
+    for note in (image_sides_note(_THIRTY_DEGREES), drive_image_note(_THIRTY_DEGREES)):
+        assert note.startswith("the camera is turned 30.0° away from the stage's axes")
+        assert "an image side is not a stage side" in note
+    singular: Matrix2 = ((1.0, 2.0), (2.0, 4.0))
+    assert "cannot be inverted" in image_sides_note(singular)
+    assert "cannot be inverted" in drive_image_note(singular)
 
 
 def test_busy_note_for_live_names_the_button_and_for_another_activity_says_wait_or_stop() -> (
