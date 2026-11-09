@@ -3569,8 +3569,13 @@ estimate: about 42 s (the moves, refocus and snaps of the timings)
   *unknown beats guessed*): the line says what to run, and says it once.
 
 The `×` is U+00D7; the source carries `# noqa: RUF001` as `scan_plan/plugin.py` does.
-Four lines, never more than `_CARD_LINES`; each goes through `_cut(_flat(...))`
-(FM-139: plain text, an objective's label is the stand's and may hold anything).
+Four lines, never more than `_CARD_LINES`; each goes through `_cut(_flat(...,
+_CARD_TEXT_CHARS))`, the limit of a diagnosis (600) and **not a value's 80**: the
+clipped form of the `fields:` line is 90 characters and its end says why the two counts
+differ, so a cut at 80 would drop exactly the words that explain them (found by the
+adversarial review of #320's develop session, `## Plan deviation` on the issue). It is
+still bounded (FM-139: plain text, an objective's label is the stand's and may hold
+anything: a line break is a space and 10 kB is cut at 600).
 `assumed` is unchanged (`no camera calibration for ...`). A scan plan that did not end
 `done` has no lines (FM-154), and a **stale** one keeps them (§2.4): the estimate on a
 stale card is of the timings it read, and the card is marked stale.

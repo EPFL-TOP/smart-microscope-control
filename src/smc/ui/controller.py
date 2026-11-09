@@ -708,7 +708,12 @@ def _card(
                     )
                 )
         elif planned is not None:
-            lines = [_cut(_flat(line)) for line in scan_plan_card_lines(planned)]
+            # Cut at a diagnosis's limit, not a value's 80: the clipped `fields:` line is
+            # 90 characters and its end says why the two counts differ (#320 deviation).
+            lines = [
+                _cut(_flat(line), _CARD_TEXT_CHARS)
+                for line in scan_plan_card_lines(planned)
+            ]
         else:
             for key, value in record.result.items():
                 if key == "assumed":

@@ -476,7 +476,9 @@ each well, the fields that miss the well left out` when clipping to the well rem
 some), `field: 512 × 512 µm at <objective>, overlap 0.1` and `estimate: about 42 s (the
 moves, refocus and snaps of the timings)`. **The estimate sums only that**: each move, a
 refocus when the stand has an autofocus and the timings know its cost, and each snap; it
-leaves out a channel change, the cells, the report and the export. With no usable
+leaves out a channel change, the cells, the report and the export. These four lines are
+cut at 600 characters, as an assumption is, and not at a value's 80: the clipped `fields:`
+line is 90 long. With no usable
 `timing` it says `estimate: unknown, no usable timing: run timing, then scan-plan again`
 (an unknown is not a zero, and `timing` is not a step of the page: it is optional). A
 second `timing` makes the plan stale: run `scan-plan` again to see the new estimate. The page shows the path and never opens it: open it

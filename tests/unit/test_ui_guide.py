@@ -744,6 +744,11 @@ def test_walls_card_lines_stay_under_the_cards_width() -> None:
         # From an hour the seconds are dropped, not rounded up into the minute.
         (3659.0, "1 h 00 min"),
         (36000.0, "10 h 00 min"),
+        # Python's `round` goes to the even second at a half, as §14.3 says: an estimate
+        # is a sum of timings in ms, so an exact half does occur.
+        (2.5, "2 s"),
+        (12.5, "12 s"),
+        (13.5, "14 s"),
     ],
 )
 def test_duration_text_rounds_to_the_second_and_names_the_unit(
@@ -774,6 +779,12 @@ def test_plan_title_says_how_many_fields_in_how_many_wells_and_the_bound() -> No
     # The bound is a keyword, for the test of the boundary; the text quotes it.
     assert plan_title(_layer(5, 1), drawn_up_to=5) == "; scan plan: 5 fields in 1 well"
     assert plan_title(_layer(6, 1, drawn=False), drawn_up_to=5) == (
+        "; scan plan: 6 fields in 1 well, too many to draw (over 5)"
+    )
+    # The title reads the count and not whether fields were kept: an empty plan is not
+    # "too many to draw", and a count over the bound is, whatever the layer holds.
+    assert plan_title(_layer(0, 3, drawn=False)) == "; scan plan: 0 fields in 3 wells"
+    assert plan_title(_layer(6, 1), drawn_up_to=5) == (
         "; scan plan: 6 fields in 1 well, too many to draw (over 5)"
     )
 
@@ -849,6 +860,12 @@ def test_scan_plan_card_lines_say_the_wells_the_fields_the_field_and_the_estimat
     # A plan made without an objective says no `at ...` rather than `at None`.
     without = scan_plan_card_lines(_scan_plan(objective=None, estimate_s=1.0))
     assert without[2] == "field: 512 × 512 µm, overlap 0.1"  # noqa: RUF001
+    # A real field of view is not a whole number of micrometres (0.65 µm x 2048 px):
+    # `:g` shows it, where a rounding to whole micrometres would hide a tenth.
+    real = scan_plan_card_lines(
+        _scan_plan(("B2",), rows=1, columns=1, fov_um=(1331.2, 1331.2), overlap=0.15)
+    )
+    assert real[2] == "field: 1331.2 × 1331.2 µm at Nikon 10X S Fluor, overlap 0.15"  # noqa: RUF001
 
 
 def test_scan_plan_card_says_what_to_run_when_the_estimate_is_unknown() -> None:
@@ -872,6 +889,9 @@ def test_scan_plan_card_names_the_wells_in_the_plans_order_and_cuts_after_six() 
     assert scan_plan_card_lines(_scan_plan(seven, rows=1, columns=1))[0] == (
         "wells: 7 (B11, B2, A1, D4, C3, E5, … 1 more)"
     )
+    # A hand-edited document with no well says so, without an empty pair of brackets.
+    none = _scan_plan(rows=1, columns=1).model_copy(update={"wells": ()})
+    assert scan_plan_card_lines(none)[0] == "wells: 0"
 
 
 def test_scan_plan_card_says_how_many_fields_clipping_left_out() -> None:

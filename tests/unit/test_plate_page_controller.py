@@ -5397,3 +5397,45 @@ def test_a_record_that_is_not_a_scan_plan_keeps_its_generic_card(
     assert lines[0] == "plate_plan: 5 entries"
     assert "wells: 3 items" in lines
     assert not any(line.startswith("estimate: ") for line in lines)
+
+
+def test_the_card_of_a_clipped_plan_says_why_the_two_counts_differ(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # The plan's own measure (coverage 1.0 on B2, B11): 344 fields of 14 x 14 x 2 = 392.
+    # The clipped form of the line is 90 characters, longer than a value's 80: the
+    # sentence that says why the counts differ is the part a cut would drop (§14.3).
+    base = _scan_plan_result(("B11", "B2"))
+    clipped = base.model_copy(
+        update={
+            "rows": 14,
+            "columns": 14,
+            "fields": tuple(base.fields[i % len(base.fields)] for i in range(344)),
+        }
+    )
+    _seed(run_doc, "scan-plan", "scan-plan", clipped)
+    card = _plan_page(fake_microscope, run_doc).view().cards["scan-plan"]
+    assert card.lines[1] == (
+        "fields: 344 of 392, a grid of 14 × 14 in each well, "  # noqa: RUF001
+        "the fields that miss the well left out"
+    )
+    assert len(card.lines[1]) == 90
+
+
+def test_the_cards_scan_plan_lines_are_one_line_each_and_bounded(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # FM-139: the objective is the stand's label and may hold anything. It is the only
+    # free text of the four lines, and it sits before the overlap, which a cut drops.
+    hostile = _scan_plan_result().model_copy(
+        update={"objective": "10X\nPlan Apo" + "x" * 700}
+    )
+    _seed(run_doc, "scan-plan", "scan-plan", hostile)
+    lines = _plan_page(fake_microscope, run_doc).view().cards["scan-plan"].lines
+    assert len(lines) == 4
+    assert all("\n" not in line and "\r" not in line for line in lines)
+    # Cut at the limit of a diagnosis (600) and a `…`: bounded, whatever the label holds.
+    assert all(len(line) <= 601 for line in lines)
+    assert lines[2].startswith("field: 512 × 512 µm at 10X Plan Apoxxx")  # noqa: RUF001
+    assert lines[2].endswith("x…")
+    assert len(lines[2]) == 601
