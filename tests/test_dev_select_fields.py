@@ -1071,3 +1071,313 @@ def test_no_chosen_field_leaves_its_well_or_enters_an_exclusion(
         assert all(well.contains(x, y, margin_um=margin_um) for x, y in corners)
         # The oracle over-estimates a distance by under a um.
         assert _distance_to_polygon(centre, corners) >= exclude_um - 1.0
+
+
+# --------------------------------------------------------------- pixels, PNG
+
+#: A well of 1000 um: a canvas of 1600 pixels is then 0.64 um a pixel, finer than every
+#: camera of these tests, so that a marker of a few pixels is several canvas pixels.
+SMALL_WELL = WellGeometry(
+    well="A1",
+    center_um=(1000.0, -500.0),
+    size_um=(1000.0, 1000.0),
+    circular=True,
+    rotation_deg=0.0,
+)
+TI2E: Matrix2 = ((-1.1, 0.0), (0.0, 1.1))
+GREEN = (0, 255, 0)
+
+
+def _canvas_pixel_of(canvas, x_um: float, y_um: float) -> tuple[float, float]:
+    """The canvas pixel ``(col, row)`` whose centre is at a stage point: the design's formula, ``x = x_min + (c + 0.5) s``."""
+    return (
+        (x_um - canvas.x_min_um) / canvas.um_per_px - 0.5,
+        (canvas.y_max_um - y_um) / canvas.um_per_px - 0.5,
+    )
+
+
+def _marked_frame(rows: int = 3, cols: int = 3, at=(9, 59)) -> np.ndarray:
+    """A 60 x 80 frame of 100 with a bright marker whose top-left pixel is ``at = (row, col)``, off the axes on purpose."""
+    frame = np.full(SHAPE, 100.0, dtype=np.float32)
+    frame[at[0] : at[0] + rows, at[1] : at[1] + cols] = 255.0
+    return frame
+
+
+def _lit_centroid(pixels: np.ndarray) -> tuple[float, float]:
+    rows, cols = np.nonzero(pixels == 255.0)
+    assert len(rows) > 0, "the marker was not placed"
+    return float(cols.mean()), float(rows.mean())
+
+
+def test_the_mosaic_puts_a_marker_where_the_stage_says(sf: ModuleType) -> None:
+    canvas = sf.canvas_of(SMALL_WELL, 1600)
+    seen: list[tuple[float, float]] = []
+    for matrix in [
+        UPRIGHT,
+        TI2E,
+        MATRICES["turned 90"],
+        MATRICES["mirrored"],
+        MATRICES["turned 30"],
+    ]:
+        pixels = canvas.blank()
+        sf.place_frame(
+            pixels,
+            _marked_frame(),
+            1000.0,
+            -500.0,
+            matrix=matrix,
+            x_min_um=canvas.x_min_um,
+            y_max_um=canvas.y_max_um,
+            um_per_px=canvas.um_per_px,
+        )
+        # The marker's middle is pixel (col 60, row 10) of the frame.
+        x, y = stage_of_pixel(
+            1000.0, -500.0, 60.0, 10.0, matrix=matrix, image_shape_px=SHAPE
+        )
+        want = _canvas_pixel_of(canvas, x, y)
+        got = _lit_centroid(pixels)
+        assert got == pytest.approx(want, abs=1.0)
+        seen.append(want)
+    # The markers of the five cameras are far apart, so that a placement that ignored the
+    # matrix would not pass for one of them.
+    for i in range(len(seen)):
+        for j in range(i + 1, len(seen)):
+            assert math.dist(seen[i], seen[j]) > 10.0
+
+
+def test_a_downsampled_tile_keeps_the_marker_in_place(sf: ModuleType) -> None:
+    canvas = sf.canvas_of(SMALL_WELL, 1600)
+    for matrix in [UPRIGHT, MATRICES["turned 30"], MATRICES["mirrored"]]:
+        frame = _marked_frame(
+            rows=4, cols=4, at=(8, 20)
+        )  # on even pixels: whole blocks
+        tile = sf.block_mean(frame, 2)
+        assert tile.shape == (30, 40)
+        pixels = canvas.blank()
+        (m00, m01), (m10, m11) = matrix
+        sf.place_frame(
+            pixels,
+            tile,
+            1000.0,
+            -500.0,
+            matrix=((2 * m00, 2 * m01), (2 * m10, 2 * m11)),
+            x_min_um=canvas.x_min_um,
+            y_max_um=canvas.y_max_um,
+            um_per_px=canvas.um_per_px,
+        )
+        x, y = stage_of_pixel(
+            1000.0, -500.0, 21.5, 9.5, matrix=matrix, image_shape_px=SHAPE
+        )
+        assert _lit_centroid(pixels) == pytest.approx(
+            _canvas_pixel_of(canvas, x, y), abs=1.0
+        )
+
+
+def test_block_mean_averages_whole_blocks_and_crops_the_remainder(
+    sf: ModuleType,
+) -> None:
+    frame = np.arange(35, dtype=np.uint16).reshape(5, 7)
+    tile = sf.block_mean(frame, 2)
+    assert tile.shape == (2, 3)  # the fifth row and seventh column are cropped
+    assert tile.dtype == np.float32
+    assert tile[0, 0] == np.mean([0, 1, 7, 8])
+    assert tile[1, 2] == np.mean([18, 19, 25, 26])
+    assert np.array_equal(sf.block_mean(frame, 1), frame.astype(np.float32))
+    with pytest.raises(ValueError, match="at least 1"):
+        sf.block_mean(frame, 0)
+    with pytest.raises(ValueError, match="larger than"):
+        sf.block_mean(frame, 6)
+
+
+def test_the_reduction_factor_is_bounded_and_refuses_a_pixel_size_that_is_not_one(
+    sf: ModuleType,
+) -> None:
+    assert sf.reduction_factor(4.0, 0.16, (1412, 1412)) == 25
+    assert sf.reduction_factor(0.5, 5.0, SHAPE) == 1
+    assert sf.reduction_factor(4.0, 1e-300, SHAPE) == min(
+        SHAPE
+    )  # bounded on floats first
+    for bad in (0.0, -1.0, math.nan, math.inf):
+        with pytest.raises(ValueError, match="pixel size"):
+            sf.reduction_factor(4.0, bad, SHAPE)
+
+
+def test_the_canvas_is_the_wells_not_the_frames(sf: ModuleType) -> None:
+    import warnings
+
+    round_well = WellGeometry(
+        well="A1",
+        center_um=(1000.0, -500.0),
+        size_um=(6400.0, 6400.0),
+        circular=True,
+        rotation_deg=0.0,
+    )
+    canvas = sf.canvas_of(round_well, 1600)
+    # The well's circumscribed square plus 2 % on each side, at most png_max_px wide.
+    assert canvas.x_min_um == pytest.approx(1000.0 - 3200.0 * 1.02)
+    assert canvas.y_max_um == pytest.approx(-500.0 + 3200.0 * 1.02)
+    assert canvas.um_per_px == pytest.approx(2 * 3200.0 * 1.02 / 1600)
+    assert (canvas.width_px, canvas.height_px) == (1600, 1600)
+    pixels = canvas.blank()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        for far in (1e9, 1e300, -1e9):
+            sf.place_frame(
+                pixels,
+                _marked_frame(),
+                far,
+                -far,
+                matrix=UPRIGHT,
+                x_min_um=canvas.x_min_um,
+                y_max_um=canvas.y_max_um,
+                um_per_px=canvas.um_per_px,
+            )
+    assert pixels.shape == (1600, 1600)
+    assert np.isnan(pixels).all()
+
+
+def test_the_canvas_of_a_square_well_is_the_turned_rectangles_box(
+    sf: ModuleType,
+) -> None:
+    well = WellGeometry(
+        well="A1",
+        center_um=(0.0, 0.0),
+        size_um=(6400.0, 4400.0),
+        circular=False,
+        rotation_deg=17.0,
+    )
+    canvas = sf.canvas_of(well, 1000)
+    cos, sin = math.cos(math.radians(17.0)), math.sin(math.radians(17.0))
+    half_x = (cos * 3200.0 + sin * 2200.0) * 1.02
+    half_y = (sin * 3200.0 + cos * 2200.0) * 1.02
+    assert canvas.x_min_um == pytest.approx(-half_x)
+    assert canvas.y_max_um == pytest.approx(half_y)
+    assert canvas.um_per_px == pytest.approx(2 * max(half_x, half_y) / 1000)
+    assert max(canvas.width_px, canvas.height_px) <= 1000
+    assert canvas.width_px > canvas.height_px  # a wider box than tall
+
+
+def test_the_png_stretch_clips_before_it_casts(sf: ModuleType) -> None:
+    import warnings
+
+    rng = np.random.default_rng(3)
+    pixels = rng.permutation(np.linspace(100.0, 200.0, 2000)).astype(np.float32)
+    pixels = pixels.reshape(40, 50)
+    pixels[0, :20] = np.nan
+    pixels[1, 0] = -1e9
+    pixels[1, 1] = 1e9
+    pixels[1, 2] = 150.0
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        grey = sf.stretch_to_uint8(pixels)
+    assert grey.dtype == np.uint8
+    assert grey[1, 0] == 0
+    assert grey[1, 1] == 255
+    assert 0 < grey[1, 2] < 255
+    assert (grey[0, :20] == 40).all()  # the unplaced pixels are dark grey
+    flat = sf.stretch_to_uint8(np.full((4, 4), 7.0, dtype=np.float32))
+    assert flat.dtype == np.uint8
+    assert len(np.unique(flat)) == 1
+    nothing = sf.stretch_to_uint8(np.full((4, 4), np.nan, dtype=np.float32))
+    assert (nothing == 40).all()
+
+
+def _render(sf: ModuleType, tmp_path: Path, *, stops, cells=(), matrix=UPRIGHT):
+    from PIL import Image
+
+    canvas = sf.canvas_of(SMALL_WELL, 800)
+    grey = np.full((canvas.height_px, canvas.width_px), 40, dtype=np.uint8)
+    image = sf.render_png(
+        grey,
+        canvas,
+        SMALL_WELL,
+        cells=cells,
+        classes=CLASSES,
+        wanted=("single",),
+        stops=stops,
+        matrix=matrix,
+        image_shape_px=SHAPE,
+        caption="A1: test",
+    )
+    path = tmp_path / "A1.png"
+    image.save(path, "PNG")
+    reopened = Image.open(path)
+    reopened.load()
+    return canvas, reopened
+
+
+@pytest.mark.parametrize("name", ["upright", "mirrored", "turned 30"])
+def test_the_png_draws_a_chosen_field_in_green_with_its_number(
+    sf: ModuleType, tmp_path: Path, name: str
+) -> None:
+    matrix = MATRICES[name]
+    canvas, image = _render(
+        sf, tmp_path, stops=[(0, 1000.0, -500.0), (1, 1050.0, -450.0)], matrix=matrix
+    )
+    assert image.mode == "RGB"
+    assert max(image.size) <= 800
+    assert image.size == (canvas.width_px, canvas.height_px)
+    corners = footprint(1000.0, -500.0, matrix=matrix, image_shape_px=SHAPE)
+    for k in range(4):
+        (ax, ay), (bx, by) = corners[k], corners[(k + 1) % 4]
+        c, r = _canvas_pixel_of(canvas, (ax + bx) / 2.0, (ay + by) / 2.0)
+        around = {
+            image.getpixel((round(c) + dc, round(r) + dr))
+            for dc in (-1, 0, 1)
+            for dr in (-1, 0, 1)
+        }
+        assert GREEN in around, f"edge {k} of the footprint is not drawn"
+    # The number of the stop is written at the footprint's centre, in green.
+    centre_col, centre_row = _canvas_pixel_of(canvas, 1000.0, -500.0)
+
+    def greens_around_the_centre(picture) -> int:
+        """Pixels within 8 of the centre that are green-dominant: Pillow's default font is
+        anti-aliased, so a glyph's pixels shade into the background and are not always the
+        outline's pure green (they are on a build without FreeType)."""
+        found = 0
+        for dc in range(-8, 9):
+            for dr in range(-8, 9):
+                red, green, blue = picture.getpixel(
+                    (round(centre_col) + dc, round(centre_row) + dr)
+                )
+                found += green > 150 and red < 60 and blue < 60
+        return found
+
+    assert greens_around_the_centre(image) > 0
+    # And with no stop there is no green anywhere near the centre.
+    _, bare = _render(sf, tmp_path, stops=[], matrix=matrix)
+    assert greens_around_the_centre(bare) == 0
+
+
+def test_the_png_colours_a_cell_by_its_class_and_rings_the_wanted_ones(
+    sf: ModuleType, tmp_path: Path
+) -> None:
+    cells = [
+        cell_at_small(0.0, 0.0, "single"),
+        cell_at_small(60.0, 0.0, "doublet"),
+    ]
+    canvas, image = _render(sf, tmp_path, stops=[], cells=cells)
+    gold, cyan, grey = (255, 215, 0), (0, 200, 255), (40, 40, 40)
+    c, r = _canvas_pixel_of(canvas, 1000.0, -500.0)
+    assert image.getpixel((round(c), round(r))) == gold
+    assert (
+        image.getpixel((round(c) + 5, round(r))) == gold
+    )  # the ring of a wanted class
+    c2, r2 = _canvas_pixel_of(canvas, 1060.0, -500.0)
+    assert image.getpixel((round(c2), round(r2))) == cyan
+    assert (
+        image.getpixel((round(c2) + 5, round(r2))) == grey
+    )  # a class nobody wanted has none
+
+
+def cell_at_small(dx: float, dy: float, label: str) -> Cell:
+    """A cell ``(dx, dy)`` um from the centre of ``SMALL_WELL``."""
+    return Cell(
+        well="A1",
+        x_um=1000.0 + dx,
+        y_um=-500.0 + dy,
+        label=label,
+        score=0.9,
+        frame=0,
+        box_px=(0.0, 0.0, 10.0, 10.0),
+    )

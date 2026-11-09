@@ -58,7 +58,7 @@ import math
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
@@ -595,3 +595,302 @@ def tally(
         counts.append({label: int(tallies[k]) for k, label in enumerate(keys)})
         held[fresh] = True
     return counts, int((~held).sum())
+
+
+# ============================================================== Pixels and the PNG
+#
+# The mosaic is for *looking*, not for measuring: a frame is reduced by block means,
+# placed on the canvas by the nearest pixel, and a later frame overwrites an earlier
+# one where they overlap. The placement error (up to ``k - 1`` source pixels of a
+# cropped remainder) is below one canvas pixel.
+
+#: Dark grey of a canvas pixel no frame reached, so that a hole is not a black pixel.
+_UNPLACED_GREY = 40
+#: A canvas is the well's bounding box plus this much on each side.
+_CANVAS_MARGIN = 0.02
+_CIRCLE_SEGMENTS = 128
+_BLUE = (90, 90, 255)
+_GREEN = (0, 255, 0)
+_ROUTE = (255, 255, 160)
+_WHITE = (255, 255, 255)
+#: The classes, in the cells stage's order: gold, cyan, red, light green, magenta, white.
+_CLASS_COLOURS = (
+    (255, 215, 0),
+    (0, 200, 255),
+    (255, 80, 80),
+    (120, 255, 120),
+    (255, 120, 255),
+    _WHITE,
+)
+
+if TYPE_CHECKING:
+    from PIL import Image
+
+
+def reduction_factor(
+    um_per_canvas_px: float, pixel_size_um: float, shape: tuple[int, int]
+) -> int:
+    """How many source pixels make one tile pixel: the canvas's pixel over the camera's, at least 1.
+
+    Bounded by the frame's smaller side on floats before it becomes an integer, so a
+    pixel size that is far too small (a wrong profile entry, FM-121) gives a one-pixel
+    tile and not an ``OverflowError`` (FM-74).
+
+    Raises:
+        ValueError: The pixel size is not finite and positive (0 means "not measured"
+            and is reported, not defaulted: FM-104).
+    """
+    if not (math.isfinite(pixel_size_um) and pixel_size_um > 0.0):
+        raise ValueError(
+            f"the pixel size must be finite and positive, got {pixel_size_um!r}"
+        )
+    ratio = min(um_per_canvas_px / pixel_size_um, float(min(shape)))
+    return max(1, math.floor(ratio + 0.5))
+
+
+def block_mean(frame: npt.NDArray[Any], k: int) -> npt.NDArray[np.float32]:
+    """The mean of each ``k`` x ``k`` block of a frame, as ``float32``; the remainder of an edge is cropped.
+
+    Raises:
+        ValueError: ``k`` is below 1 or larger than the frame's smaller side.
+    """
+    values = np.asarray(frame)
+    if k < 1:
+        raise ValueError(f"k must be at least 1, got {k!r}")
+    rows, cols = values.shape
+    if k > min(rows, cols):
+        raise ValueError(f"k={k} is larger than the frame ({rows} x {cols} pixels)")
+    if k == 1:
+        return values.astype(np.float32)
+    kept_rows, kept_cols = rows // k, cols // k
+    blocks = values[: kept_rows * k, : kept_cols * k].astype(np.float64)
+    return (
+        blocks.reshape(kept_rows, k, kept_cols, k).mean(axis=(1, 3)).astype(np.float32)
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class Canvas:
+    """Where a well's mosaic is: canvas pixel ``(c, r)`` is centred at ``x = x_min + (c + 0.5) s``, ``y = y_max - (r + 0.5) s``.
+
+    Stage +X is to the right and +Y up, so the picture is the plate seen from above
+    as the stage's axes have it, whatever the camera's turn.
+    """
+
+    x_min_um: float
+    y_max_um: float
+    um_per_px: float
+    width_px: int
+    height_px: int
+
+    def blank(self) -> npt.NDArray[np.float32]:
+        """A canvas of ``nan``: nothing is placed yet."""
+        return np.full((self.height_px, self.width_px), np.nan, dtype=np.float32)
+
+    def px_of(self, x_um: float, y_um: float) -> tuple[float, float]:
+        """The canvas pixel ``(col, row)``, fractional, whose centre is a stage point."""
+        return (
+            (x_um - self.x_min_um) / self.um_per_px - 0.5,
+            (self.y_max_um - y_um) / self.um_per_px - 0.5,
+        )
+
+
+def canvas_of(well: WellGeometry, png_max_px: int) -> Canvas:
+    """The canvas of a well: its bounding box plus 2 % on each side, the longer side ``png_max_px`` pixels.
+
+    The extent is the **well's**, never the frames': a frame read back at a wrong
+    position (a unit slip, a corrupt record) is clipped, and does not grow the canvas
+    to the size of the mistake (FM-136). A disc is its centre plus and minus the
+    radius; a square well, the half-extents of its rectangle turned by the plate.
+    """
+    width, height = well.size_um
+    if well.circular:
+        half_x = half_y = width / 2.0
+    else:
+        angle = math.radians(well.rotation_deg)
+        cos, sin = abs(math.cos(angle)), abs(math.sin(angle))
+        half_x = cos * width / 2.0 + sin * height / 2.0
+        half_y = sin * width / 2.0 + cos * height / 2.0
+    half_x *= 1.0 + _CANVAS_MARGIN
+    half_y *= 1.0 + _CANVAS_MARGIN
+    um_per_px = 2.0 * max(half_x, half_y) / png_max_px
+    return Canvas(
+        x_min_um=well.center_um[0] - half_x,
+        y_max_um=well.center_um[1] + half_y,
+        um_per_px=um_per_px,
+        width_px=min(png_max_px, max(1, math.ceil(2.0 * half_x / um_per_px))),
+        height_px=min(png_max_px, max(1, math.ceil(2.0 * half_y / um_per_px))),
+    )
+
+
+def _clamped(value: float, size: int) -> int:
+    """``value`` as an index in ``[0, size]``, clamped as a float before it becomes an integer (FM-75, FM-74)."""
+    return int(max(0.0, min(float(size), value)))
+
+
+def place_frame(
+    canvas: npt.NDArray[np.float32],
+    tile: npt.NDArray[np.float32],
+    x_um: float,
+    y_um: float,
+    *,
+    matrix: Matrix2,
+    x_min_um: float,
+    y_max_um: float,
+    um_per_px: float,
+) -> None:
+    """Write a tile into a canvas, by inverse mapping: each canvas pixel in the footprint's box looks up the tile pixel at its stage point.
+
+    ``matrix`` is the **tile's** (the camera's times the reduction factor) and
+    ``(x_um, y_um)`` the stage position of the tile's centre. For a canvas pixel at
+    stage ``(x, y)`` the tile pixel is ``col = (W - 1) / 2 + d_col`` and ``row = (H -
+    1) / 2 + d_row`` with ``d_col`` and ``d_row`` the inverse of the matrix written
+    out, and not as a product on arrays (FM-131); the nearest tile pixel is taken when
+    the point is inside the tile. The box is clamped to the canvas on floats first, so
+    a frame far away places nothing and raises nothing.
+
+    Raises:
+        ValueError: The matrix cannot be inverted.
+    """
+    tile_h, tile_w = tile.shape
+    (m00, m01), (m10, m11) = matrix
+    det = m00 * m11 - m01 * m10
+    if not abs(det) > 0.0:
+        raise ValueError(f"the tile's matrix cannot be inverted (determinant {det!r})")
+    n_rows, n_cols = canvas.shape
+    corners = footprint(x_um, y_um, matrix=matrix, image_shape_px=(tile_h, tile_w))
+    xs = [x for x, _ in corners]
+    ys = [y for _, y in corners]
+    col_lo = _clamped((min(xs) - x_min_um) / um_per_px - 1.0, n_cols)
+    col_hi = _clamped((max(xs) - x_min_um) / um_per_px + 2.0, n_cols)
+    row_lo = _clamped((y_max_um - max(ys)) / um_per_px - 1.0, n_rows)
+    row_hi = _clamped((y_max_um - min(ys)) / um_per_px + 2.0, n_rows)
+    if col_lo >= col_hi or row_lo >= row_hi:
+        return
+    cols = np.arange(col_lo, col_hi)
+    rows = np.arange(row_lo, row_hi)
+    dx = (x_min_um + (cols + 0.5) * um_per_px)[None, :] - x_um
+    dy = (y_max_um - (rows + 0.5) * um_per_px)[:, None] - y_um
+    col = (tile_w - 1) / 2.0 + (m11 * dx - m01 * dy) / det
+    row = (tile_h - 1) / 2.0 + (m00 * dy - m10 * dx) / det
+    inside = (col >= -0.5) & (col < tile_w - 0.5) & (row >= -0.5) & (row < tile_h - 0.5)
+    source_col = np.clip(np.floor(col + 0.5), 0, tile_w - 1).astype(np.int64)
+    source_row = np.clip(np.floor(row + 0.5), 0, tile_h - 1).astype(np.int64)
+    target_rows = np.broadcast_to(rows[:, None], inside.shape)[inside]
+    target_cols = np.broadcast_to(cols[None, :], inside.shape)[inside]
+    canvas[target_rows, target_cols] = tile[source_row[inside], source_col[inside]]
+
+
+def stretch_to_uint8(pixels: npt.NDArray[np.float32]) -> npt.NDArray[np.uint8]:
+    """Stretch a canvas to 8 bits between the 1st and the 99.5th percentile of the placed pixels.
+
+    A pixel outside the two percentiles is clipped to 0 or 255 **before** the cast
+    (FM-75: a float outside the type's range, or a ``nan``, is not defined by C and
+    differs by platform), and a pixel no frame reached is dark grey.
+    """
+    grey = np.full(pixels.shape, _UNPLACED_GREY, dtype=np.uint8)
+    placed = np.isfinite(pixels)
+    if not placed.any():
+        return grey
+    values = pixels[placed].astype(np.float64)
+    low, high = np.percentile(values, (1.0, 99.5))
+    if not high > low:
+        high = low + 1.0
+    grey[placed] = np.clip(
+        np.rint((values - low) / (high - low) * 255.0), 0.0, 255.0
+    ).astype(np.uint8)
+    return grey
+
+
+def _outline_of(well: WellGeometry) -> list[tuple[float, float]]:
+    """The well's wall as a closed polyline in stage um: a disc as 128 segments, a square well as its turned rectangle."""
+    cx, cy = well.center_um
+    if well.circular:
+        radius = well.size_um[0] / 2.0
+        points = [
+            (
+                cx + radius * math.cos(2.0 * math.pi * k / _CIRCLE_SEGMENTS),
+                cy + radius * math.sin(2.0 * math.pi * k / _CIRCLE_SEGMENTS),
+            )
+            for k in range(_CIRCLE_SEGMENTS)
+        ]
+    else:
+        angle = math.radians(well.rotation_deg)
+        cos, sin = math.cos(angle), math.sin(angle)
+        half_u, half_v = well.size_um[0] / 2.0, well.size_um[1] / 2.0
+        points = [
+            (cx + cos * u - sin * v, cy + sin * u + cos * v)
+            for u, v in (
+                (-half_u, -half_v),
+                (half_u, -half_v),
+                (half_u, half_v),
+                (-half_u, half_v),
+            )
+        ]
+    return [*points, points[0]]
+
+
+def render_png(
+    grey: npt.NDArray[np.uint8],
+    canvas: Canvas,
+    well: WellGeometry,
+    *,
+    cells: Sequence[Cell],
+    classes: Sequence[str],
+    wanted: Sequence[str],
+    stops: Sequence[tuple[int, float, float]],
+    matrix: Matrix2,
+    image_shape_px: tuple[int, int],
+    caption: str,
+) -> Image.Image:
+    """The picture of a well: the mosaic, the wall, the cells, the chosen fields numbered in route order.
+
+    Blue is the wall; each cell is a 3-pixel dot coloured by its class (the classes in
+    the cells stage's order), with a second, larger ring when its label is wanted; a
+    chosen field is its footprint, a closed 2-pixel green line (turned or mirrored as
+    the camera is) with its number at the centre; the route is a thin yellow line
+    through the stops. ``stops`` are ``(number, x_um, y_um)`` in route order.
+    """
+    from PIL import Image, ImageDraw
+
+    image = Image.fromarray(np.stack([grey, grey, grey], axis=-1))
+    draw = ImageDraw.Draw(image)
+    width, height = image.size
+
+    def at(x_um: float, y_um: float) -> tuple[float, float]:
+        return canvas.px_of(x_um, y_um)
+
+    draw.line([at(x, y) for x, y in _outline_of(well)], fill=_BLUE, width=1)
+    colours = {
+        label: _CLASS_COLOURS[k % len(_CLASS_COLOURS)]
+        for k, label in enumerate(classes)
+    }
+    wanted_labels = set(wanted)
+    for cell in cells:
+        col, row = at(cell.x_um, cell.y_um)
+        # A cell far outside the canvas (a corrupt record) is not drawn.
+        if not (-10.0 <= col <= width + 10.0 and -10.0 <= row <= height + 10.0):
+            continue
+        c, r = round(col), round(row)
+        colour = colours.get(cell.label, _WHITE)
+        draw.ellipse((c - 1, r - 1, c + 1, r + 1), fill=colour)
+        if cell.label in wanted_labels:
+            draw.ellipse((c - 5, r - 5, c + 5, r + 5), outline=colour)
+    if len(stops) > 1:
+        draw.line([at(x, y) for _, x, y in stops], fill=_ROUTE, width=1)
+    for _, x, y in stops:
+        corners = [
+            at(*corner)
+            for corner in footprint(x, y, matrix=matrix, image_shape_px=image_shape_px)
+        ]
+        draw.line([*corners, corners[0]], fill=_GREEN, width=2)
+    for number, x, y in stops:
+        col, row = at(x, y)
+        left, top, right, bottom = draw.textbbox((0, 0), str(number))
+        draw.text(
+            (col - (right - left) / 2.0 - left, row - (bottom - top) / 2.0 - top),
+            str(number),
+            fill=_GREEN,
+        )
+    draw.text((4, 4), caption, fill=_WHITE)
+    return image
