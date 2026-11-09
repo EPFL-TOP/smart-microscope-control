@@ -11,7 +11,9 @@
   objective select's sync); presets fixed by #319's plan (§10, 2026-11-03);
   the plate page at the stand fixed by #332's plan (§11, 2026-11-05: the captures'
   target, why a Run is disabled, the plate the page starts with, what a Run
-  replaces, a Ctrl-C that prints one line).
+  replaces, a Ctrl-C that prints one line); the image's sides and what a move does
+  to the image fixed by #327's plan (§13, 2026-11-09: the captures and the drive
+  take image sides, the notes say what each is on the stage).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 to M3, this document is the contract between issues.
   Names, module paths and signatures below are fixed; an executor who needs to
@@ -894,7 +896,8 @@ class PlatePageView:
 - **Axes**: the pad is in the stage's axes, as `smc stage` (`X right, Y up`) and
   the plate map: `→` is `jog_xy(+step, 0)`, `↑` is `jog_xy(0, +step)`. `Z +` is
   `jog_z(+step)`. How the camera's image is turned against the stage is not
-  known here: a stand where `↑` moves the image down is the owner's finding.
+  known here: a stand where `↑` moves the image down is the owner's finding (§13
+  says it, from the camera calibration).
 - **Steps**: the selects' options are `{f"{step:g} µm": step}` for the steps of
   `XY_STEPS_UM` and `Z_STEPS_UM` that do not exceed `jog_limits_um()`; defaults
   `100 µm` and `1 µm` (the largest offered step when the default is not
@@ -3277,3 +3280,129 @@ second place gets a widget of its own.
 page open (steps 3 to 6 of §12.1); the time of a run on a real stand at 10× (16.5 s is
 the demo's stage); whether two captured centres should make `plate-walls` the next step
 (§12.4); `plate-walls` on a 4× frame.
+
+## 13. The page names the image's sides and what a move does to it (#327)
+
+Fixed by #327's plan (2026-11-09), with the owner's note of 2026-11-03: use the
+standard of the microscope software and keep the arrows (it is the stage that
+moves, so the image is normally inverted: "do not change what is done in
+microscopy"), and say on the controls what a move does to the image. The frames,
+the words of each and the arithmetic that maps one to the other are M3 §19
+(`smc/plugins/frames.py`); this section is the page's part. FM-189 is the
+failure: the operator named a wall as seen on Live, and the layer read it in the
+stage's frame.
+
+### 13.1 The captures and the drive take image sides
+
+- **The widgets.** The *Wall* select is labelled `Wall, as on the image` and the
+  *Drive to* select `Drive to (wall as on the image)`; their options stay `left`,
+  `right`, `top`, `bottom` (and `centre` for the drive). They are image sides
+  (`IMAGE_SIDES`, M3 §19.2). The arrows of the pad stay in the stage's axes (§6.4).
+- **`PlatePage.capture_wall(well, side)`**: `side` is an image side (a `ValueError`
+  for any other word, as now). After the checks it already makes (the well is on the
+  plate, the stage is at rest) and before it reads the stage, it takes the
+  `matrix_um_per_px` of the **latest usable** `camera-calibration` of the run document
+  (`_document()`, then `_slot(doc, "camera-calibration", CameraCalibration, [])`: usable
+  means what `RunDocument.unusable` says: done, not stale, of this profile, and not
+  a dry run's unless this page is one), whatever its objective (M3 §19.3), and records `WallTouch(side=stage_side_of_image_side(side,
+  matrix), …)`. It replaces the earlier touch of the same well and the same
+  **stage** side. Two refusals, raised before anything is recorded (FM-169: the
+  controller's refusal is the guard, the button's state is a courtesy):
+  - no usable calibration: `walls are named on the image, and no camera calibration
+    says which stage side that is: run camera-calibration (Set up), then try again`
+    (`guide.NO_CALIBRATION_FOR_SIDES`);
+  - a calibration whose matrix is off a quarter turn, or cannot be inverted:
+    `frames`' own text.
+- **`PlatePage.goto(well, side="centre")`**: `centre` is as before; an image side is
+  mapped in the same way, and `goto-well` runs with the **stage** side
+  (`side=+X`). The mapping comes after `_refuse_another_registered_plate` and before
+  `current` changes and before a thread starts, and its refusals are the two above.
+  `click(..., drive=True, side=…)` passes the select's value on to `goto`.
+- **`PlatePage.walls`** holds stage-side touches, so `_registration_pairs` dumps
+  what the plugin takes and a click and a step agree (§11, `_registration_pairs`).
+- **`PlateView.camera_matrix: Matrix2 | None = None`**, a field added at the end of
+  the dataclass: the matrix of the latest usable calibration, `None` when there is
+  none. `view()` reads it with the same `_slot` call that reads the other slots, so a
+  calibration whose result does not validate is a line of `problems` and is drawn as
+  absent (FM-125); the file is never written.
+
+- **Beside §12.** `plate-walls`' section (§12.5) holds centre captures only and is
+  not touched. A missing calibration has a precedent there, §12.3's
+  `WALLS_NEED_CALIBRATION`: the same fix (run `camera-calibration`, *Set up*) and a
+  text of its own, because here it is a side that cannot be mapped and not a tool
+  that cannot run. `plate-registration`'s section keeps its widgets by their names.
+
+### 13.2 What the page says
+
+Two pure functions in `smc/ui/guide.py` build the texts (no Panel; plain text,
+FM-139). Each takes the view's `camera_matrix` and has three cases; a matrix that
+`frames` refuses gives `frames`' own text, taken as `str(exc)` where it is caught
+(FM-98).
+
+```python
+def image_sides_note(matrix: Matrix2 | None) -> str: ...
+def drive_image_note(matrix: Matrix2 | None) -> str: ...
+```
+
+| matrix | `image_sides_note` (under the capture buttons) | `drive_image_note` (under the pad) |
+|---|---|---|
+| `None` | `Walls are named on the image. No camera calibration says which stage side each one is: run camera-calibration (Set up) to capture a wall or drive to one.` | `Which way the image moves for an arrow is not known: run camera-calibration (Set up).` |
+| a quarter turn (the Ti2-E at 10×: `((-1.1, 0.0), (0.0, 1.1))`) | `On the image: left is the stage's +X, right -X, top -Y, bottom +Y (from the camera calibration).` | `On the image, ↑ moves it up, → moves it right; ↓ and ← the opposite.` |
+| off a quarter turn | `frames`' text | `frames`' text |
+
+In the second row the words are the matrix's: `left is the stage's {l}, right
+{r}, top {t}, bottom {b}` with `l`, `r`, `t`, `b` from `stage_side_of_image_side`,
+and `↑ moves it {a}, → moves it {b}` with `a` from
+`image_direction_of_stage_step("+Y", …)` and `b` from `("+X", …)`.
+
+- **Where.** `image_note`, a wrapped `pn.pane.Str` beside `capture_note`, under the
+  capture row; and `drive_image_note`, a wrapped `pn.pane.Str` between the pad and
+  `drive_note`. Both are set in `refresh()` from `view.camera_matrix`, the places
+  the rest of the view is drawn; the tick does not rebuild them. A calibration run
+  from the page therefore shows after the run's `refresh()`.
+- **The button's label.** `capture_wall_label(well, side)` keeps its signature
+  (§11.1) and says `Capture B3 wall at image left` (`Capture wall` with no well).
+- **The capture list** shows the touch as recorded, in the stage's words: `B3 +X
+  wall (17967.9, -10237.1)`; the note above it says what each image side is.
+- **A pad that says nothing is not a pad that works on every stand**: the notes are
+  informative and disable nothing; the pad's own refusals are §6.
+
+### 13.3 Tests and failure modes
+
+- `tests/unit/test_ui_guide.py`: the six cells of the table above, written out;
+  `capture_wall_label`'s new text.
+- `tests/unit/test_plate_page_controller.py`: with a calibration seeded in the run
+  document (as `tests/test_scan_plan_demo.py`'s `_seed` writes one), `capture_wall(
+  "B3", "left")` records `+X`; the same call with no calibration is refused with the
+  text above and records nothing; a calibration 6.0° off a quarter turn is refused;
+  a later capture of the same stage side replaces the first; `goto("B3", "left")`
+  runs `goto-well` with `side=+X` and with no calibration is refused before
+  `current` changes and before a run starts.
+- **The end-to-end check of FM-189**, `tests/test_plate_page_walls_demo.py` (new,
+  unique basename): the demo stand, a calibration whose matrix is the Ti2-E's, the
+  stage moved to the four touches of M3 §17.1 and each captured under its image
+  name; `plate-registration` through the page gives B3's centre at (10267.7,
+  −10038.05) within 0.05 µm. Another test captures the incident's two touches
+  (`left`, `bottom`) and finds (10167.9, −10134.1).
+- `tests/unit/test_plate_page_drive_view.py` (or a view test of its own): the two
+  notes carry the texts of the table for a view with and without a matrix, and the
+  labels of the selects are the ones above.
+
+FM-189 (the check itself), FM-169 (every refusal is the controller's), FM-125 (a
+result the page cannot read is a problem, not a crash), FM-98 and FM-139 (text, never
+the error; plain text), FM-177 (the label a capture acts on: the touch's stage side is
+read at the press, from the document then, and a calibration cannot change during a
+press because a capture is refused while a run goes).
+
+### 13.4 Not here
+
+- It does not change the pad's axes, the Z direction or the plate map: the map is the
+  stage's, with A1 at the top left of what `useq` draws.
+- It does not let the page capture a wall without a calibration (M3 §19.6).
+- It does not draw anything on Live (M3 §19.6).
+
+**Not verified (for the owner)**: at the Ti2-E, after `camera-calibration` at 10×,
+the notes read `left is the stage's +X, …` and `↑ moves it up, → moves it right`
+(M3 §19.7), and agree with NIS-Elements' own XY control; B3's four walls captured
+under their image names give a centre within a few tens of µm of the one the walls'
+midpoints give; the page walked by a newcomer, who names a wall as they see it.
