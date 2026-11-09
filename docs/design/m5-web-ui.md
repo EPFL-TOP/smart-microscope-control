@@ -2033,6 +2033,10 @@ FM-176, FM-43.
 8. **#324** (`smc presets save`, §10.9) edits `presets.py`, `params.py` and `cli.py`,
    and the tests of the presets: not at the same time as #338 (the review's
    leftovers of #337, which edit `presets.py`, `cli.py` and the page).
+9. **#346** (the page for `plate-walls`, §12) comes after #332 (PR #362) and edits
+   `controller.py`, `plate_page.py` and `guide.py`: no other issue that edits them
+   runs at the same time. #367 (the leftovers of #332: `serve()`'s filter, the stale
+   label's plate check) and #327 (the *Wall* select) edit the same captures' region.
 
 ### 9.1 Not verified (for the owner)
 
@@ -2971,6 +2975,12 @@ usable now (`_slot` returns a result). The page appends it below the tool's own
 note. It is **not** drawn for the other slots: a card already says the last result,
 and a note under every tool teaches the operator to read none of them.
 
+*Amended by #346 (§12.7)*: the second sentence of the note, `the captures stay, so
+Forget the wrong one and Run again`, is true of the tools that run from the page's
+captures (`plate-registration`, `plate-walls`) and false under `plate-finding`, which
+has none. `replace_note` takes `keeps_captures: bool`, keyword-only, and the note of a
+tool that keeps none ends after `A failed run leaves no plate.`
+
 ### 11.5 A Ctrl-C that prints one line (finding 5)
 
 Reproduced off Windows, with the page's own server call (`pn.serve(..., threaded=True)`)
@@ -3025,3 +3035,245 @@ words: the filter checks the exception's class too, and only while the server st
 
 **Not verified (for the owner)**: the Ctrl-C of `smc ui` at the Ti2-E's PC, with the
 page open (Python 3.14, Windows 11); the page walked by a newcomer on a real stand.
+
+## 12. The plate page registers from images (#346)
+
+Fixed by #346's plan (2026-11-09), on the page of #332 (PR #362) and the plugin of #328
+(PR #351). m3 §17.5 fixes the interface (`STAGES`, `PAGE_PARAMS`, at least two centres,
+a card from `walls`). This section decides the page: where a well is recorded, what the
+button says before and during the run, what the card shows, and when the next step is
+this tool. Measured 2026-11-09 on the `demo-sample` stand (Python 3.13.0, Panel 1.10.0,
+Bokeh 3.10.1), with a script on `PlatePage` that passes the entry point by hand.
+
+**What was measured.**
+
+- *The tool on the page today.* `plate-walls` is there under `More`, with a form that
+  offers `plate` and `refs`, and no captures: `page_params("plate-walls")` is `[]`, so
+  its Run sends the plugin's own defaults. With `camera-calibration` run (0.2 s), the
+  stage moved to A1 and H1 (250 µm and 150 µm off the sample's centres) and
+  `capture_centre` called for each, a run with `plate=96-well` and those two centres as
+  `refs` took **16.5 s** for 20 frames (10 per well) and gave `method: wall-images`,
+  `residual_um` 0.003 and `rotation_deg` 1e-5. **Its card showed the result's first eight
+  keys (`a1_center_xy_um: 2 items`, ...) and `… 2 more`: the walls, the part an operator
+  wants to read, were the part cut away.**
+- *The reason before the calibration* is the run document's own: `the run document has
+  no camera-calibration; smc run --list shows which plugin provides it`. It is a sentence
+  for a terminal, shown on a page that has the tool one region up.
+- `view().replaces` already holds a note for `plate-walls`: it provides `plate`.
+- *A Panel widget placed twice in one layout is drawn once.* `pn.Column(pn.Row(b),
+  pn.Row(b)).get_root()` holds one Bokeh `Button`, and the widget's `_models` one entry
+  per root; two widgets give two models, each with its own label.
+- *The entry point.* The main checkout's venv was installed before #351:
+  `entry_points(group="smc.plugins")` there has no `plate-walls` (FM-112). A worktree
+  set up with `worktree.py setup` has it; the page's tests name the entry points they
+  need, as they do for every other tool.
+
+### 12.1 What the operator does
+
+The owner's form, « positionner à la main avec le joystick sur 2 ou 3 wells (on clique
+sur les wells sélectionnés), puis la calibration se fait toute seule », as the page
+makes it:
+
+1. *Connect*, and choose the plate on the stage (§11.3).
+2. Run *camera-calibration*, the first tool of *Set up*, with the objective the
+   registration is made at in place, on a field with texture (a well's wall will do):
+   `plate-walls` reads it.
+3. Drive to the middle of a well with the joystick (or the Drive pad); Live shows it.
+4. Click that well on the map: the buttons name it (§11.1). Press **Capture centre of
+   B3** in `plate-walls`' section.
+5. Again for a second well, far from the first, and a third.
+6. Press **Run plate-walls**: the next step's button (§12.4) or the tool's own. The
+   strip counts `plate-walls: 3/8 B3 -X` while the stage images each well's four walls;
+   then the plate is registered and the card says how well (§12.6).
+
+### 12.2 The tool on the page (m3 §17.5)
+
+- `STAGES`' *Set up* is `("camera-calibration", "plate-registration", "plate-walls",
+  "plate-finding", "timing")`.
+- `PAGE_PARAMS["plate-walls"] = ("plate", "refs")`: the form offers neither, and §11.3's
+  gate (`_needs_plate`) covers the tool with no further code. `KEY_PARAMS` has no entry
+  for it: `search_um`, `max_residual_um`, `max_rotation_deg`, `settle_ms` and
+  `save_frames` stay under *Advanced*, closed. A newcomer sees buttons.
+- `page_params("plate-walls")` is `[f"plate={plate}", f"refs={json}"]`, the `refs` dumped
+  by the one function that dumps them for `plate-registration` too: a step and a click
+  agree. `_page_pairs` returns them for any number of centres; the number is the gate's
+  (§12.3), as the plate's is (§11.3), so that a preset's check of the tool's other
+  fields is not refused for it.
+- Wall captures stay `plate-registration`'s. `plate-walls` images the walls itself and
+  ignores them; the page says so when some exist (§12.5).
+
+### 12.3 Why its Run is disabled, in order
+
+`_blocked["plate-walls"]` is the first of: the stand closed (`NOT_CONNECTED`); the
+placeholder plate (`PLATE_NOT_CHOSEN`, §11.3); and, new, in this order:
+
+1. **A dry run** (`WALLS_DRY_RUN`): `plate-walls images the walls, which a dry run does
+   not do: serve the page without --dry-run (demo-sample's stage is simulated), or
+   register with plate-registration`. The plugin refuses a dry run before it moves
+   anything, and its refusal is a `failed` record that replaces a usable plate (§11.4):
+   so the controller refuses first, in `run()`, as the outcome `plate-walls: <text>`,
+   nothing written (FM-169).
+2. **The calibration.** What the tool reads, as for every tool; but with **no**
+   `camera-calibration` record at all the reason is `WALLS_NEED_CALIBRATION`:
+   `plate-walls reads the camera's calibration: run camera-calibration first (Set up),
+   with the objective you register with in place, on a field with texture (a well's
+   wall will do)`. A calibration that exists and is unusable (another stand, a dry run,
+   stale) keeps the run document's own words.
+3. **The stand**: what the tool requires (`XYStage`, `Camera`), as for every tool.
+4. **The centres**: `walls_centres_problem(len(page.refs))`.
+
+```python
+WALLS_MIN_CENTRES = 2
+WALLS_MAX_CENTRES = 6
+
+
+def walls_centres_problem(captured: int) -> str | None: ...
+```
+
+in `guide.py`; the two bounds are the plugin's `_MIN_WELLS` and `_MAX_WELLS`, and a test
+pins the pair. The function gives `None` from 2 to 6 centres, else:
+
+- 0: `plate-walls needs the centres of 2 or 3 wells: centre a well under the objective
+  (Live and the Drive pad), click it on the map and press Capture centre; then a second
+  well, far from the first`;
+- 1: `1 centre captured, plate-walls needs 2 or 3 wells: centre a second well, far from
+  the first, click it on the map and press Capture centre`;
+- more than 6: `plate-walls takes at most 6 wells and <n> centres are captured: Forget
+  some`.
+
+`page_params("plate-walls")` raises `ValueError(<that text>)` after the plate's gate. The
+controller's `run()` has no refusal for the count: the pairs it is given may not be the
+page's captures (a step's drawn pairs, a hand-spelled call), and the plugin refuses a
+count it does not accept before anything moves. A disabled button is a courtesy, not a
+guard (FM-169).
+
+### 12.4 The next step is this tool when the operator took this path
+
+The `plate` slot has several providers (`plate-registration`, `plate-walls`,
+`plate-finding`) and §8.3 took the first in `tools()`' order. **Decided: the step is
+`plate-walls` when all of these hold, and `plate-registration` as before otherwise:**
+
+- the plate is chosen (§11.3): else `plate-registration`'s `PLATE_NOT_CHOSEN` stays the
+  step's reason;
+- the page is not a dry run (FM-182: a path the page's own plugin refuses in one mode
+  is not offered there, as `scan` is not, §8.8.1);
+- the stand can image: it has an `XYStage` and a `Camera`, or it is not connected (the
+  step is then drawn for the stand the operator is about to open, and `NOT_CONNECTED`
+  is its reason either way);
+- no wall is captured (`page.walls` is empty): touching walls is `plate-registration`'s
+  own path, and an operator who did it chose it;
+- `walls_centres_problem(len(page.refs))` is `None`.
+
+The step carries `page_params("plate-walls")`'s pairs and the lines of `why`: the slot's
+own (`the run document has no plate yet`), then `plate, refs: the 2 centres of B3, D5
+captured on this page; plate-walls images each well's four walls around its centre and
+moves the stage in X and Y only` (the wells in capture order), then the other providers
+as §8.3 lists them (`or plate-registration: ...`). Its `blocked` is the tool's: until the
+calibration is run, the step says `WALLS_NEED_CALIBRATION` and the button is disabled.
+
+*Decided against:* a step that runs `camera-calibration` first. It moves the stage and
+measures at a place nobody chose, and which objective the registration is made at is the
+operator's. *The owner may flip the rule*: with two centres captured, `plate-registration`
+fits the plate from the centres as they are (by eye), and `plate-walls` measures; the page
+offers the measured one first because it is the path the owner asked for. Both stay on
+the page.
+
+### 12.5 Where a well is recorded: in the tool's section, with its own widgets
+
+**Decided: `plate-walls`' section holds the centre captures, and only those.** The owner
+clicks wells on the map and then presses the tool's button: the capture sits in the
+tool's section, under its summary, above its Run. Top to bottom: the summary;
+`[Capture centre of B3] [Forget B3]`; the note; the centres captured; the wall note; the
+*Advanced* fold, closed; Run; the tool's note; the card.
+
+- **Widgets of their own** (measured above): `walls_capture_button`,
+  `walls_forget_button`, `walls_capture_note`, `walls_captures_text` and
+  `walls_touches_note`, built beside `plate-registration`'s and wired to the same
+  handlers, `on_capture("centre")` and `on_forget()`. `plate-registration`'s section
+  keeps every widget it has, by the same names.
+- **One well, one check.** `_draw_captures()` sets both sets from the one `current` it
+  read, so `_capture_well` stays one value and §11.1's check (FM-177) stays one check: a
+  press records the well its label named, whichever button it is. The labels are
+  `capture_centre_label(well)` and `forget_label(well)`. `Forget B3` drops B3's centre and
+  its wall touches, as `forget` does. Disabling is the registration's: *Capture centre*
+  with the stand closed or an activity other than live going, or with no well; *Forget*
+  with no well. The note is §11.1's `click a well on the map first: ...` with no well.
+- **The centres** are `centres_text(page.refs)`, plain text, never markup (FM-139):
+
+  ```python
+  def centres_text(refs: Sequence[WellRef]) -> str: ...
+  def wall_touches_note(touches: int) -> str: ...
+  ```
+
+  `no centre captured yet`, or `centres captured (2):` and one line for each, in
+  capture order, indented by two spaces: `B3 (10182.0, -10087.9) µm`. `wall_touches_note` is `""` for 0 and
+  `<n> wall captures are for plate-registration; plate-walls images the walls itself and
+  ignores them` otherwise (`1 wall capture is`, `2 wall captures are`): what happens to
+  the wall captures is said once, where the operator would wonder.
+
+### 12.6 What the card shows
+
+`_card` builds `lines` from a `done` record's result. For a `plate` result that holds
+`walls` it builds these instead:
+
+```python
+def walls_card_lines(result: PlateResult) -> tuple[str, ...]: ...
+```
+
+(`guide.py`, pure.) One line per well of `walls.wells`, in the order given, then one for
+the plate:
+
+```text
+B3: centre (10182.0, -10087.9) µm, 15298 µm across, 14 frames
+D5: centre (1.0, 2.0) µm, 15298 µm across, 10 frames
+plate 24-well: residual 3.2 µm, rotation 0.12°
+```
+
+`<well>: centre (<x:.1f>, <y:.1f>) µm, <diameter:.0f> µm across, <n> frames`, where `n`
+is the sum of the `frames` of the well's four sides; `plate <plate>: residual <r:.1f>
+µm, rotation <deg:.2f>°` (`residual unknown` when `residual_um` is `None`). At most six
+wells and the plate line: inside `_CARD_LINES`; the cut `… <n> more` stays the bound for
+a hand-edited document. The result's other keys are in the run document and are not
+lines of this card; `assumed` is unchanged and carries `two wells: the residual checks
+their distance only; a third well checks the fit`. **`files`** gains `folder: <run
+folder>/plate-walls/<token>` from `walls.folder` when it is a non-blank text, through
+`_file_path` (the frames the operator may open, §8.4). The result is read as data (FM-125):
+`PlateResult.model_validate(record.result)`; a result that does not validate, or has no
+`walls`, keeps the generic card, and a `plate-registration` card is unchanged.
+
+### 12.7 The replace note under a tool with no captures (#367, item 3)
+
+`replace_note(result, started_utc, *, keeps_captures: bool)` (§11.4's amendment): with
+`keeps_captures` the text is §11.4's; without, `Run replaces the plate registered
+2026-11-03 15:20 (references, 3 wells). A failed run leaves no plate.`
+`_replace_notes` passes `"refs" in PAGE_PARAMS.get(tool.name, ())`: a tool whose pairs
+the page fills from captures keeps them.
+
+### 12.8 What this does not do
+
+- It does not run `camera-calibration` for the operator (§12.4), and does not drive the
+  stage to a well: the operator drives (joystick, Drive pad). A tool that drives from the
+  nominal pitch is the owner's later step (m3 §17).
+- It does not capture on a click: a click on the map selects, and the press records,
+  because a click does not say the stage is in the well.
+- It adds no wall capture to `plate-walls`, and changes neither the *Wall* select nor
+  what a side means (#327), the plugin, `plate-registration`, `RunDocument` or the
+  profile's `[suggest]` tables.
+
+### 12.9 Tests and failure modes
+
+FM-169 (the dry run is refused by the controller; the count by the plugin, decided in
+§12.3), FM-177 (one `_capture_well` for both button sets), FM-181 (a capture is refused
+while the tool moves the stage: unchanged), FM-182 (the step is walked in the dry-run
+page and on a stand without a camera), FM-151 (a view draws what the shared controller
+holds: the walls widgets redraw with `refs`), FM-125 (a result and the document are
+data), FM-139 and FM-98 (text, never markup or the error), FM-171, FM-161 and FM-162
+(the browser walk), FM-147 (no widget spelling that warns), FM-112 (the venv's entry
+points). The new kind, for the checklist: *the same Panel widget placed twice in a
+layout*, which is drawn once, so that the second place is empty and nothing fails: a
+second place gets a widget of its own.
+
+**Not verified (for the owner)**: the walk at the Ti2-E with the joystick, Live and the
+page open (steps 3 to 6 of §12.1); the time of a run on a real stand at 10× (16.5 s is
+the demo's stage); whether two captured centres should make `plate-walls` the next step
+(§12.4); `plate-walls` on a 4× frame.
