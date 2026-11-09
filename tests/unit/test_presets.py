@@ -928,9 +928,11 @@ def test_every_key_a_preset_holds_as_its_own_field_is_passed_by_command_pairs() 
     ]
     assert ("plate-walls", "plate") in held
 
+    # The key and the `PresetCheck` attribute that holds its value have one name, and
+    # the two values differ: a row bound to the other attribute hands `plate=A1`.
     for plugin, key in held:
         pairs = command_pairs(check, plugin, [])
-        assert any(pair.startswith(f"{key}=") for pair in pairs), (plugin, key, pairs)
+        assert f"{key}={getattr(check, key)}" in pairs, (plugin, key, pairs)
 
 
 def test_command_pairs_leave_out_a_plate_that_was_not_applied() -> None:
