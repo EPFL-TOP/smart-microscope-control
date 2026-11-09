@@ -78,6 +78,7 @@ from smc.ui.guide import (
     wall_touches_note,
     walls_card_lines,
     walls_centres_problem,
+    walls_square_wells,
 )
 from smc.ui.plate_page import PlatePageView, build, card_text, serve
 
@@ -2815,6 +2816,60 @@ def test_a_dry_run_page_says_so_beside_the_walls_run(
             controller.close()
     finally:
         dry.close()
+
+
+def test_a_click_on_walls_run_in_a_dry_run_page_shows_the_dry_runs_reason_not_the_count(
+    run_doc: Path, fake_core: FakeCore
+) -> None:
+    # §12.3's order is the dry run before the centres' count; the click builds the pairs
+    # first, and used to say the count (#375). A stale tab can still click a disabled
+    # button (FM-169).
+    dry = Microscope.from_core(
+        cast("CMMCorePlus", fake_core), Profile.demo(), dry_run=True
+    )
+    try:
+        controller = PlatePage(
+            dry,
+            run_doc,
+            entry_points=_entry_points("camera-calibration", "plate-walls"),
+        )
+        try:
+            controller.choose_plate("96-well")
+            view = PlatePageView(controller)
+            assert controller.refs == ()
+            view.on_run("plate-walls")
+            assert view.message.object == WALLS_DRY_RUN
+            assert walls_centres_problem(0) not in view.message.object
+        finally:
+            controller.close()
+    finally:
+        dry.close()
+
+
+def test_a_square_welled_plate_says_so_beside_the_walls_run(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    controller = PlatePage(
+        fake_microscope,
+        run_doc,
+        entry_points=_entry_points("camera-calibration", "plate-walls"),
+    )
+    try:
+        controller.choose_plate("384-well")
+        view = PlatePageView(controller)
+        assert view.tool_runs["plate-walls"].disabled
+        assert view.tool_notes["plate-walls"].object == walls_square_wells("384-well")
+        # A stale tab that still clicks gets the same words, and nothing is written.
+        view.on_run("plate-walls")
+        assert view.message.object == walls_square_wells("384-well")
+        assert not run_doc.exists()
+        # The same page on a round plate is not told it.
+        controller.choose_plate("24-well")
+        view.tick()
+        assert view.tool_notes["plate-walls"].object != walls_square_wells("24-well")
+        assert "square" not in view.tool_notes["plate-walls"].object
+    finally:
+        controller.close()
 
 
 def test_no_widget_is_placed_twice_in_the_page(walls_page: PlatePage) -> None:
