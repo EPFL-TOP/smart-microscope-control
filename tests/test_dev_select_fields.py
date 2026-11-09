@@ -9,12 +9,10 @@ function under test (FM-124).
 
 from __future__ import annotations
 
-import importlib.util
 import itertools
 import json
 import math
 import os
-import sys
 from collections.abc import Sequence
 from pathlib import Path
 from types import ModuleType
@@ -33,6 +31,7 @@ from select_fields_seed import (
     UPRIGHT,
     Seed,
     cell_at,
+    load_script,
     matrix_of,
     seed_run,
 )
@@ -51,22 +50,13 @@ from smc.plugins.slots import (
 )
 from smc.run import RunDocument, RunDocumentError, StageStatus
 
-ROOT = Path(__file__).resolve().parents[1]
 HEIGHT, WIDTH = SHAPE
 
 
 @pytest.fixture(scope="module")
 def sf() -> ModuleType:
     """The script, loaded as ``tests/test_dev_point.py`` loads ``point.py``."""
-    spec = importlib.util.spec_from_file_location(
-        "select_fields_script", ROOT / "scripts" / "dev" / "select_fields.py"
-    )
-    assert spec is not None
-    assert spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    return load_script()
 
 
 # --------------------------------------------------------------------- helpers
@@ -1770,3 +1760,603 @@ def test_a_copy_that_cannot_be_completed_is_removed(
         sf.write_copy(seed.path, copy, prototype)
     # A copy without the record would read as the original with a route nobody chose.
     assert not copy.exists()
+
+
+def test_the_scans_camera_is_the_camera_not_the_plans(
+    tmp_path: Path, sf: ModuleType
+) -> None:
+    # The plan was laid for a camera of 2.5 um pixels (fields of 200 x 150 um), the scan
+    # imaged with 5 um pixels (400 x 300): a cell 190 um from a frame's centre is in the
+    # scan's footprint and outside the plan's (FM-124).
+    plan_camera = matrix_of(2.5, 0.0, False)
+    seed = seed_run(
+        tmp_path,
+        cells=lambda scan: [
+            Cell(
+                well="A1",
+                x_um=scan.frames[0].x_um + 190.0,
+                y_um=scan.frames[0].y_um,
+                label="single",
+                score=0.9,
+                frame=0,
+                box_px=(0.0, 0.0, 10.0, 10.0),
+            )
+        ],
+        rows=1,
+        columns=1,
+        plan_matrix=plan_camera,
+    )
+    assert seed.plan.matrix_um_per_px == plan_camera != seed.scan.matrix_um_per_px
+    found, _ = _candidates(sf, seed)
+    assert found[0].n_wanted == 1
+    result = _result(sf, seed)
+    assert result.matrix_um_per_px == seed.scan.matrix_um_per_px
+    assert result.fov_um == pytest.approx((400.0, 300.0))
+    assert result.positions[0].counts == {"single": 1}
+
+
+# ------------------------------------------------------------------- command
+
+
+def _two_wells(tmp_path: Path, **given) -> Seed:
+    """Two wells of three touching fields, a cell in each: six stops, whatever the weights."""
+    return seed_run(
+        tmp_path,
+        cells=_one_cell_in_each_frame,
+        wells=("A1", "A2"),
+        rows=1,
+        columns=3,
+        overlap=0.0,
+        **given,
+    )
+
+
+def _main(sf: ModuleType, capsys: pytest.CaptureFixture[str], path: Path, *args: str):
+    code = sf.main([str(path), *args])
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+def _stops_of(copy: Path) -> list:
+    stage = RunDocument.load(copy).stages["route-prototype"]
+    return list(RouteResult.model_validate(stage.result).positions)
+
+
+def test_the_command_prints_the_table_and_writes_the_files(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed = _two_wells(tmp_path)
+    before = seed.path.read_bytes()
+    code, out, err = _main(sf, capsys, seed.path)
+    assert (code, err) == (0, "")
+    assert "== A1: 3 fields chosen of 3 candidates, 3 wanted cells" in out
+    assert "== A2: 3 fields chosen of 3 candidates, 3 wanted cells" in out
+    assert "min_spacing_um 150 (measured, 3 times the median cell length of 6" in out
+    for name in (
+        "selection/selection.json",
+        "selection/A1.png",
+        "selection/A2.png",
+        "run-selected.json",
+    ):
+        assert (tmp_path / name).is_file(), name
+        assert name.split("/")[-1] in out  # every file written is named
+    assert seed.path.read_bytes() == before
+    stops = _stops_of(tmp_path / "run-selected.json")
+    assert [s.name for s in stops] == [
+        f"{w}_r{k:03d}" for w in ("A1", "A2") for k in range(3)
+    ]
+    document = RunDocument.load(tmp_path / "run-selected.json")
+    assert document.provider("route").plugin == "route-prototype"
+
+
+def test_the_table_lists_the_features_of_the_ranked_fields_and_marks_the_chosen(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Four fields that overlap their neighbours (10 %), with 1 to 4 cells each: the table
+    # ranks all four, and the stop column is the route number of the chosen ones only.
+    def cells(scan):
+        return [
+            Cell(
+                well="A1",
+                x_um=frame.x_um - 150.0 + 40.0 * i,
+                y_um=frame.y_um,
+                label="single",
+                score=0.9,
+                frame=k,
+                box_px=(0.0, 0.0, 10.0, 10.0),
+            )
+            for k, frame in enumerate(scan.frames)
+            for i in range(k + 1)
+        ]
+
+    seed = seed_run(tmp_path, cells=cells)
+    code, out, _ = _main(sf, capsys, seed.path, "--min-spacing-um", "50")
+    assert code == 0
+    lines = out.splitlines()
+    header = next(
+        i for i, line in enumerate(lines) if line.split()[:2] == ["rank", "frame"]
+    )
+    assert lines[header].split() == [
+        "rank", "frame", "x_um", "y_um", "score", "n", "dens/mm2", "iso", "purity",
+        "nn_um", "wall_um", "sharp", "bg", "focus", "stop",
+    ]  # fmt: skip
+    rows = []
+    for line in lines[header + 1 :]:
+        if line.strip().startswith("chosen"):
+            break
+        rows.append(line.split())
+    assert len(rows) == 4
+    assert [int(row[0]) for row in rows] == [1, 2, 3, 4]
+    scores = [float(row[4]) for row in rows]
+    assert scores == sorted(scores, reverse=True)
+    chosen = {
+        (f"{s.x_um:.1f}", f"{s.y_um:.1f}"): int(s.name.rsplit("_r", 1)[1])
+        for s in _stops_of(tmp_path / "run-selected.json")
+    }
+    assert 1 <= len(chosen) < 4  # the 10 % overlap rules some out
+    for row in rows:
+        expected = chosen.get((row[2], row[3]))
+        assert row[-1] == ("-" if expected is None else str(expected))
+    # The best field holds the 4 cells, which are 40 um apart: not isolated at 50 um.
+    assert (rows[0][5], rows[0][7]) == ("4", "0")
+    assert "chosen, in route order:" in out
+    assert "uncovered:" in out
+
+
+def test_selection_json_holds_the_printed_numbers(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed = _two_wells(tmp_path)
+    code, out, _ = _main(
+        sf, capsys, seed.path, "--weight", "wall=1", "--min-spacing-um", "40"
+    )
+    assert code == 0
+    data = json.loads(
+        (tmp_path / "selection" / "selection.json").read_text(encoding="utf-8")
+    )
+    assert data["schema_version"] == 1
+    assert data["run_doc"] == "run.json"
+    assert data["labels"] == ["single"]
+    assert data["weights"] == {
+        "density": 1.0, "isolation": 0.0, "purity": 0.0, "wall": 1.0,
+        "sharpness": 0.0, "background": 0.0,
+    }  # fmt: skip
+    assert (data["min_spacing_um"], data["min_spacing_source"]) == (40.0, "given")
+    assert list(data["wells"]) == ["A1", "A2"]
+    stops = {
+        s.name: (s.x_um, s.y_um) for s in _stops_of(tmp_path / "run-selected.json")
+    }
+    for well, entry in data["wells"].items():
+        assert entry["uncovered"] == 0
+        assert len(entry["candidates"]) == 3
+        for candidate in entry["candidates"]:
+            assert 0.0 <= candidate["score"] <= 1.0
+            assert set(candidate["parts"]) == set(sf.WEIGHT_NAMES)
+            assert f"{candidate['score']:.3f}" in out  # a score printed in the table
+            name = f"{well}_r{candidate['stop']:03d}"
+            assert stops[name] == (candidate["x_um"], candidate["y_um"])
+
+
+def test_the_output_is_ascii(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A file name with an accent and an objective with a Greek letter reach the console
+    # as escapes (FM-20): a Windows console decodes with a code page.
+    seed = seed_run(
+        tmp_path,
+        cells=_one_cell_in_each_frame,
+        scan_objective="Plan Apo \N{GREEK SMALL LETTER LAMDA} 20x",
+        rows=1,
+        columns=3,
+        overlap=0.0,
+    )
+    named = tmp_path / "run-\N{LATIN SMALL LETTER E WITH ACUTE}.json"
+    named.write_bytes(seed.path.read_bytes())
+    code, out, err = _main(sf, capsys, named)
+    assert code == 0
+    out.encode("ascii")  # does not raise
+    err.encode("ascii")
+    assert "run-\\xe9.json" in out
+    assert "Plan Apo \\u03bb 20x" in out
+    # And a refusal's text, which names the file, is ASCII as well.
+    code, _, err = _main(
+        sf, capsys, tmp_path / "missing-\N{LATIN SMALL LETTER E WITH ACUTE}.json"
+    )
+    assert code == 2
+    err.encode("ascii")
+
+
+def test_no_absolute_path_reaches_the_record_or_the_json(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed = _two_wells(tmp_path)
+    code, _, _ = _main(sf, capsys, seed.path)
+    assert code == 0
+    document = (tmp_path / "selection" / "selection.json").read_text(encoding="utf-8")
+    stage = RunDocument.load(tmp_path / "run-selected.json").stages["route-prototype"]
+    record = json.dumps(stage.model_dump(mode="json"))
+    for text in (document, record):
+        assert str(tmp_path) not in text
+        assert str(tmp_path.parent) not in text
+
+
+def test_the_table_is_printed_before_a_failed_write_and_the_exit_is_1(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed = _two_wells(tmp_path)
+    (tmp_path / "selection" / "A1.png").mkdir(
+        parents=True
+    )  # a folder where a picture goes
+    code, out, err = _main(sf, capsys, seed.path)
+    assert code == 1
+    assert "== A1:" in out  # the table was printed
+    assert "route: 6 stops" in out
+    assert "A1.png" in err
+    assert err.startswith("select_fields: could not write")
+    # The other files were written all the same.
+    assert (tmp_path / "selection" / "selection.json").is_file()
+    assert (tmp_path / "selection" / "A2.png").is_file()
+    assert (tmp_path / "run-selected.json").is_file()
+
+
+def _rewritten(seed: Seed, edit) -> None:
+    """The run document of ``seed`` with its stages edited by ``edit``."""
+    document = RunDocument.load(seed.path)
+    edited = document.model_copy(update={"stages": edit(dict(document.stages))})
+    seed.path.write_text(
+        json.dumps(edited.model_dump(mode="json"), indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def test_an_upstream_that_is_not_usable_says_what_to_run(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed = _two_wells(tmp_path)
+    _rewritten(seed, lambda stages: {k: v for k, v in stages.items() if k != "cells"})
+    reason = RunDocument.load(seed.path).unusable(
+        "cells", profile="demo", dry_run=False
+    )
+    assert reason is not None
+    assert "no cells" in reason
+    code, out, err = _main(sf, capsys, seed.path)
+    assert (code, out, err) == (2, "", f"select_fields: {reason}\n")
+    assert not (tmp_path / "selection").exists()
+    assert not (tmp_path / "run-selected.json").exists()
+
+    seed = _two_wells(tmp_path)
+    _rewritten(
+        seed,
+        lambda stages: {
+            **stages,
+            "scan": stages["scan"].model_copy(update={"status": StageStatus.failed}),
+        },
+    )
+    reason = RunDocument.load(seed.path).unusable("scan", profile="demo", dry_run=False)
+    assert reason is not None
+    assert "ended failed" in reason
+    code, out, err = _main(sf, capsys, seed.path)
+    assert (code, out, err) == (2, "", f"select_fields: {reason}\n")
+
+
+def test_a_run_document_that_is_missing_or_not_a_run_document_is_refused(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, _, err = _main(sf, capsys, tmp_path / "nope.json")
+    assert code == 2
+    assert "nope.json" in err
+    assert "does not exist" in err
+    (tmp_path / "text.json").write_text("not json", encoding="utf-8")
+    code, _, err = _main(sf, capsys, tmp_path / "text.json")
+    assert code == 2
+    assert "not valid JSON" in err
+
+
+def test_a_label_the_cells_do_not_have_is_refused_with_the_classes(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed = _two_wells(tmp_path)
+    code, out, err = _main(sf, capsys, seed.path, "--labels", "single,nope")
+    assert (code, out) == (2, "")
+    assert "'nope'" in err
+    assert "['single', 'doublet', 'debris']" in err
+    code, _, err = _main(sf, capsys, seed.path, "--labels", "single,single")
+    assert code == 2
+    assert "repeats" in err
+
+
+def test_a_well_without_a_wanted_cell_has_no_field_and_the_table_says_so(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed = seed_run(
+        tmp_path,
+        cells=lambda scan: [
+            *_one_cell_in_each_frame(scan)[:3],
+            cell_at("A2", 0.0, 0.0, "debris"),
+        ],
+        wells=("A1", "A2"),
+        rows=1,
+        columns=3,
+        overlap=0.0,
+    )
+    code, out, _ = _main(sf, capsys, seed.path, "--min-spacing-um", "30")
+    assert code == 0
+    assert "== A2: 0 fields chosen of 3 candidates, 0 wanted cells" in out
+    assert "no wanted cell in this well: no field chosen" in out
+    stage = RunDocument.load(tmp_path / "run-selected.json").stages["route-prototype"]
+    result = RouteResult.model_validate(stage.result)
+    assert {p.well for p in result.positions} == {"A1"}
+    assert result.uncovered == {"A1": 0, "A2": 0}  # every scanned well is a key
+
+
+def test_no_field_in_any_well_writes_no_copy(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed = seed_run(
+        tmp_path,
+        cells=[cell_at("A1", 0.0, 0.0, "debris")],
+        rows=1,
+        columns=3,
+        overlap=0.0,
+    )
+    # The spacing cannot be measured from no wanted cell: asked for, it is refused.
+    code, _, err = _main(sf, capsys, seed.path)
+    assert code == 2
+    assert "spacing cannot be measured" in err
+    code, out, _ = _main(sf, capsys, seed.path, "--min-spacing-um", "30")
+    assert code == 0
+    assert "no field was chosen in any well: no run document copy written" in out
+    assert not (tmp_path / "run-selected.json").exists()
+    assert (tmp_path / "selection" / "selection.json").is_file()
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--fields-per-well", "0"),
+        ("--fields-per-well", "501"),
+        ("--fields-per-well", "abc"),
+        ("--min-cells", "0"),
+        ("--min-score", "1.5"),
+        ("--min-score", "-0.1"),
+        ("--min-score", "nan"),
+        ("--wall-margin-um", "-1"),
+        ("--wall-margin-um", "inf"),
+        ("--exclude-centre-um", "nan"),
+        ("--exclude-centre-um", "2e6"),
+        ("--png-max-px", "100"),
+        ("--png-max-px", "8001"),
+        ("--show", "0"),
+        ("--min-spacing-um", "nan"),
+        ("--min-spacing-um", "0"),
+        ("--min-spacing-um", "inf"),
+        ("--min-spacing-um", "1e6"),
+        ("--weight", "density=-1"),
+        ("--weight", "nope=1"),
+    ],
+)
+def test_options_are_bounded(
+    tmp_path: Path,
+    sf: ModuleType,
+    capsys: pytest.CaptureFixture[str],
+    option: str,
+    value: str,
+) -> None:
+    # The run document is not even there: the options are refused first (FM-32), with the
+    # option's name, and nothing is created.
+    code, out, err = _main(sf, capsys, tmp_path / "missing.json", option, value)
+    assert (code, out) == (2, "")
+    assert err.startswith("select_fields: ")
+    assert err.count("\n") == 1
+    assert option.removeprefix("--") in err.replace("--", "")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_pixel_weight_without_pixels_is_refused_and_says_so(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed = _two_wells(tmp_path)
+    for name in ("sharpness", "background"):
+        code, out, err = _main(
+            sf, capsys, seed.path, "--no-pixels", "--weight", f"{name}=1"
+        )
+        assert (code, out) == (2, "")
+        assert name in err
+        assert "--no-pixels" in err
+    assert not (tmp_path / "selection").exists()
+
+
+def test_the_copy_is_refused_before_any_frame_is_read(
+    tmp_path: Path,
+    sf: ModuleType,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The reading of a frame swallows every failure on purpose (a bad frame is a finding),
+    # so a stub that raises would prove nothing: it records, and the test asserts.
+    reads: list[object] = []
+    monkeypatch.setattr(sf, "load_frame", lambda *args: reads.append(args))
+    seed = _two_wells(tmp_path)
+    before = seed.path.read_bytes()
+    code, _, err = _main(sf, capsys, seed.path, "--run-doc-out", str(seed.path))
+    assert code == 2
+    assert "original" in err
+    code, _, err = _main(
+        sf, capsys, seed.path, "--run-doc-out", str(tmp_path / "no" / "c.json")
+    )
+    assert code == 2
+    assert "folder" in err
+    (tmp_path / "taken").write_text("a file", encoding="utf-8")
+    code, _, err = _main(sf, capsys, seed.path, "--out-dir", str(tmp_path / "taken"))
+    assert code == 2
+    assert "is a file" in err
+    assert seed.path.read_bytes() == before
+    assert not (tmp_path / "selection").exists()
+    assert reads == []  # no frame was opened by any of the three refusals
+
+
+def test_an_unreadable_frame_is_counted_and_never_ends_the_run(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed = _two_wells(tmp_path, write_frames=False)
+    code, out, _ = _main(sf, capsys, seed.path)
+    assert code == 0
+    assert "6 frames could not be read (first: scan/t/A1_0000.tif" in out
+    stops = RouteResult.model_validate(
+        RunDocument.load(tmp_path / "run-selected.json")
+        .stages["route-prototype"]
+        .result
+    )
+    assert len(stops.positions) == 6  # no pixel weight: the candidates stay
+    assert (
+        "6 frames could not be read and were left out of the mosaic and of the pixel features"
+        in stops.assumed
+    )
+    # With a pixel weight a candidate with no pixels cannot be ranked: dropped, and said.
+    (tmp_path / "run-selected.json").unlink()
+    code, out, _ = _main(sf, capsys, seed.path, "--weight", "sharpness=1")
+    assert code == 0
+    assert "6 dropped for a pixel weight" in out
+    assert "no candidate to rank" in out
+    assert "no field was chosen in any well" in out
+    assert not (tmp_path / "run-selected.json").exists()
+
+
+def test_a_frame_of_another_shape_is_left_out_of_the_pixel_features(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def pixels(frame: ScanFrame) -> np.ndarray:
+        shape = (50, 80) if frame.index == 1 else SHAPE
+        return np.full(shape, 1000, dtype=np.uint16)
+
+    seed = seed_run(
+        tmp_path,
+        cells=_one_cell_in_each_frame,
+        rows=1,
+        columns=3,
+        overlap=0.0,
+        frame_pixels=pixels,
+    )
+    code, out, _ = _main(sf, capsys, seed.path)
+    assert code == 0
+    assert "1 frames could not be read" in out
+    assert "A1_0001 is 80 x 50 pixels, the scan says 80 x 60" in out
+
+
+def test_wells_can_be_chosen_and_an_unscanned_one_is_refused(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed = _two_wells(tmp_path)
+    code, out, _ = _main(sf, capsys, seed.path, "--wells", "a2")
+    assert code == 0
+    assert "== A2:" in out
+    assert "== A1:" not in out
+    assert {s.well for s in _stops_of(tmp_path / "run-selected.json")} == {"A2"}
+    assert not (tmp_path / "selection" / "A1.png").exists()
+    code, _, err = _main(sf, capsys, seed.path, "--wells", "A2,Z9")
+    assert code == 2
+    assert "'Z9'" in err
+    assert "A1, A2" in err
+
+
+def test_no_pixels_reads_no_frame_and_no_png_writes_no_picture(
+    tmp_path: Path,
+    sf: ModuleType,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seed = _two_wells(tmp_path)
+    code, out, _ = _main(sf, capsys, seed.path, "--no-png")
+    assert code == 0
+    assert not list((tmp_path / "selection").glob("*.png"))
+    assert (tmp_path / "selection" / "selection.json").is_file()
+
+    reads: list[object] = []  # recorded, not raised: a frame's failure is swallowed
+    monkeypatch.setattr(sf, "load_frame", lambda *args: reads.append(args))
+    code, out, _ = _main(sf, capsys, seed.path, "--no-pixels")
+    assert code == 0
+    assert reads == []
+    assert (tmp_path / "selection" / "A1.png").is_file()  # over a dark canvas
+    first = next(
+        line for line in out.splitlines() if line.split()[:2] == ["rank", "frame"]
+    )
+    row = out.splitlines()[out.splitlines().index(first) + 1].split()
+    assert row[11:13] == ["-", "-"]  # no sharpness, no background
+    data = json.loads(
+        (tmp_path / "selection" / "selection.json").read_text(encoding="utf-8")
+    )
+    assert data["options"]["pixels"] is False
+
+
+def test_a_second_run_rebuilds_the_copy_from_the_original(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed = _two_wells(tmp_path)
+    assert _main(sf, capsys, seed.path)[0] == 0
+    first = RunDocument.load(tmp_path / "run-selected.json")
+    assert _main(sf, capsys, seed.path, "--fields-per-well", "1")[0] == 0
+    second = RunDocument.load(tmp_path / "run-selected.json")
+    assert set(second.stages) == set(first.stages)  # replaced, not stacked
+    assert len(_stops_of(tmp_path / "run-selected.json")) == 2
+    assert (
+        second.stages["route-prototype"].attempt
+        != first.stages["route-prototype"].attempt
+    )
+
+
+@pytest.mark.parametrize("matrix_name", ["upright", "turned 30 and mirrored"])
+def test_the_picture_of_a_well_puts_the_frames_where_the_stage_says(
+    tmp_path: Path,
+    sf: ModuleType,
+    capsys: pytest.CaptureFixture[str],
+    matrix_name: str,
+) -> None:
+    from PIL import Image
+
+    # 256 pixels for a 6400 um well is 25.5 um a pixel: the 5 um frame is reduced by 5.
+    # A bright 15 x 15 pixel block (rows 5-19, columns 55-69, whole 5 x 5 tiles) is the
+    # only thing the stretch maps to white; it must land where the stage puts it.
+    matrix = {
+        "upright": UPRIGHT,
+        "turned 30 and mirrored": matrix_of(PIXEL_UM, 30.0, True),
+    }[matrix_name]
+
+    def pixels(frame: ScanFrame) -> np.ndarray:
+        data = np.full(SHAPE, 100, dtype=np.uint16)
+        data[5:20, 55:70] = 4000
+        return data
+
+    seed = seed_run(
+        tmp_path,
+        cells=[cell_at("A1", 3000.0, 3000.0)],  # far from the frame, out of the way
+        rows=1,
+        columns=1,
+        matrix=matrix,
+        frame_pixels=pixels,
+    )
+    code, _, _ = _main(
+        sf,
+        capsys,
+        seed.path,
+        "--png-max-px",
+        "256",
+        "--min-spacing-um",
+        "30",
+        "--min-cells",
+        "1",
+    )
+    assert code == 0
+    image = Image.open(tmp_path / "selection" / "A1.png")
+    image.load()
+    canvas = sf.canvas_of(_geometry(seed), 256)
+    frame = seed.scan.frames[0]
+    x, y = stage_of_pixel(
+        frame.x_um, frame.y_um, 62.0, 12.0, matrix=matrix, image_shape_px=SHAPE
+    )
+    col, row = _canvas_pixel_of(canvas, x, y)
+    assert image.getpixel((round(col), round(row))) == (255, 255, 255)
+    # The point of the frame opposite through its centre is the dark background.
+    opposite = stage_of_pixel(
+        frame.x_um, frame.y_um, 17.0, 47.0, matrix=matrix, image_shape_px=SHAPE
+    )
+    col, row = _canvas_pixel_of(canvas, *opposite)
+    assert image.getpixel((round(col), round(row))) == (0, 0, 0)

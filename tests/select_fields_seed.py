@@ -19,11 +19,14 @@ and a second attempt of any stage.
 
 from __future__ import annotations
 
+import importlib.util
 import math
+import sys
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import ModuleType
 
 import numpy as np
 import numpy.typing as npt
@@ -59,6 +62,18 @@ CENTRES = {
 RADIUS_UM = 3200.0
 #: What every frame's readback differs from the planned field by.
 READBACK_OFFSET_UM = (0.3, -0.2)
+
+
+def load_script() -> ModuleType:
+    """``scripts/dev/select_fields.py`` as a module, loaded as ``tests/test_dev_point.py`` loads ``point.py``."""
+    path = Path(__file__).resolve().parents[1] / "scripts" / "dev" / "select_fields.py"
+    spec = importlib.util.spec_from_file_location("select_fields_script", path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def matrix_of(pixel_size_um: float, rotation_deg: float, mirrored: bool) -> Matrix2:
@@ -116,6 +131,8 @@ def record(
     *,
     attempt: str = "a1",
     day: int = 28,
+    profile: str = "demo",
+    dry_run: bool = False,
 ) -> None:
     """A stage record as an earlier run of ``plugin`` would have left it, ``done``.
 
@@ -132,8 +149,8 @@ def record(
             status=StageStatus.done,
             started_utc=then,
             finished_utc=then,
-            profile="demo",
-            dry_run=False,
+            profile=profile,
+            dry_run=dry_run,
             smc_version="0",
             params={},
             result=result.model_dump(mode="json"),
@@ -171,8 +188,14 @@ def seed_run(
     file_token: str = "t1",
     profile: str = "demo",
     dry_run: bool = False,
+    plan_matrix: Matrix2 | None = None,
+    plan_shape: tuple[int, int] | None = None,
 ) -> Seed:
     """The plan, the scan and the cells of ``wells``, in ``tmp_path/run.json``.
+
+    ``plan_matrix`` and ``plan_shape`` are the camera the plan was laid for when it is
+    not the scan's (the prototype must take the scan's, FM-124, so a test that wants to
+    know says them different).
 
     ``cells`` is a list, or a function of the scan when the cells are placed
     relative to its frames (their positions are the plan's, which the test cannot
@@ -195,12 +218,16 @@ def seed_run(
         scale_error=None,
         n_refs=0,
     )
-    fov = extent_of(matrix, shape)
+    laid = plan_matrix if plan_matrix is not None else matrix
+    laid_shape = plan_shape if plan_shape is not None else shape
+    fov = extent_of(laid, laid_shape)
     plate_plan, fields = plan_fields(
         plate,
         wells,
         fov_um=fov,
-        footprint_of=lambda x, y: footprint(x, y, matrix=matrix, image_shape_px=shape),
+        footprint_of=lambda x, y: footprint(
+            x, y, matrix=laid, image_shape_px=laid_shape
+        ),
         rows=rows,
         columns=columns,
         overlap=overlap,
@@ -211,9 +238,9 @@ def seed_run(
         wells=wells,
         objective=scan_objective,
         pixel_size_um=PIXEL_UM,
-        matrix_um_per_px=matrix,
+        matrix_um_per_px=laid,
         matrix_source="parameter",
-        image_shape_px=shape,
+        image_shape_px=laid_shape,
         fov_um=fov,
         overlap=overlap,
         rows=rows,
@@ -280,8 +307,9 @@ def seed_run(
         merged=0,
         seconds_per_frame=None,
     )
-    record(path, "plate-registration", "plate", plate)
-    record(path, "scan-plan", "scan-plan", plan)
-    record(path, "scan", "scan", scan)
-    record(path, "cells", "cells", result)
+    where = {"profile": profile, "dry_run": dry_run}
+    record(path, "plate-registration", "plate", plate, **where)
+    record(path, "scan-plan", "scan-plan", plan, **where)
+    record(path, "scan", "scan", scan, **where)
+    record(path, "cells", "cells", result, **where)
     return Seed(path, plan, scan, cell_list, result, matrix, shape)

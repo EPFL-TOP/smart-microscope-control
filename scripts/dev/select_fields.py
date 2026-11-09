@@ -54,19 +54,23 @@ another objective, and any default that the owner has not chosen on a real scan.
 
 from __future__ import annotations
 
+import argparse
 import contextlib
+import json
 import math
 import shutil
+import sys
 import uuid
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn, TypeVar
 
 import numpy as np
 import numpy.typing as npt
+from pydantic import BaseModel, ValidationError
 
 import smc
 
@@ -83,11 +87,16 @@ from smc.plugins.route.algorithm import (
 )
 from smc.plugins.slots import (
     Cell,
+    CellsResult,
     RoutePosition,
     RouteResult,
     ScanPlanResult,
     ScanResult,
     WellGeometry,
+    load_cells,
+    load_frame,
+    normalise_well,
+    well_geometry,
 )
 from smc.run import (
     ReadRecord,
@@ -98,7 +107,9 @@ from smc.run import (
     write_stage,
 )
 
-__all__ = ["Candidate", "Refusal", "Skipped"]
+__all__ = ["Candidate", "Refusal", "Skipped", "main"]
+
+_M = TypeVar("_M", bound=BaseModel)
 
 #: The weights, in the order the table and the files list them.
 WEIGHT_NAMES = ("density", "isolation", "purity", "wall", "sharpness", "background")
@@ -1070,6 +1081,34 @@ def assumed_lines(
     return tuple(lines)
 
 
+def route_orders(
+    plan: ScanPlanResult, choices: Sequence[WellChoice]
+) -> list[list[int]]:
+    """For each well, the order its chosen fields are visited in: indices into ``choice.chosen``.
+
+    Each well starts at the field nearest where the stage is coming from, which is
+    the last stop of the previous well that has one, or, for the first, the well's
+    first planned field (where the scan started in it); then ``route``'s
+    ``order_route``. A well with no chosen field has an empty order.
+    """
+    orders: list[list[int]] = []
+    previous: tuple[float, float] | None = None
+    for choice in choices:
+        if not choice.chosen:
+            orders.append([])
+            continue
+        reference = (
+            previous if previous is not None else first_field_of(plan, choice.well)
+        )
+        order = order_stops(
+            [(s.candidate.x_um, s.candidate.y_um) for s in choice.chosen], reference
+        )
+        orders.append(order)
+        last = choice.chosen[order[-1]].candidate
+        previous = (last.x_um, last.y_um)
+    return orders
+
+
 def route_result(
     scan: ScanResult,
     plan: ScanPlanResult,
@@ -1090,17 +1129,8 @@ def route_result(
     """
     positions: list[RoutePosition] = []
     uncovered: dict[str, int] = {}
-    previous: tuple[float, float] | None = None
-    for choice in choices:
+    for choice, order in zip(choices, route_orders(plan, choices), strict=True):
         uncovered[choice.well] = choice.uncovered
-        if not choice.chosen:
-            continue
-        reference = (
-            previous if previous is not None else first_field_of(plan, choice.well)
-        )
-        order = order_stops(
-            [(s.candidate.x_um, s.candidate.y_um) for s in choice.chosen], reference
-        )
         for k, index in enumerate(order):
             candidate = choice.chosen[index].candidate
             positions.append(
@@ -1115,7 +1145,6 @@ def route_result(
                     counts=dict(choice.counts[index]),
                 )
             )
-        previous = (positions[-1].x_um, positions[-1].y_um)
     points = [(p.x_um, p.y_um) for p in positions]
     return RouteResult(
         objective=scan.objective,
@@ -1240,3 +1269,842 @@ def write_copy(source: Path, target: Path, record: StageRecord) -> None:
         with contextlib.suppress(OSError):
             target.unlink(missing_ok=True)
         raise
+
+
+# ================================================================== Command line
+
+_SELECTION_FILE = "selection.json"
+_SCHEMA_VERSION = 1
+
+
+class _Parser(argparse.ArgumentParser):
+    """An ``ArgumentParser`` whose errors are the command's: ``select_fields: <reason>`` and exit 2, not argparse's usage."""
+
+    def error(self, message: str) -> NoReturn:
+        raise Refusal(message)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The command's options (ASCII only: a Windows console prints help in its code page)."""
+    parser = _Parser(
+        prog="select_fields.py",
+        description=(
+            "Choose the fields to image again from a scan's own frames, scored by "
+            "weights you tune. A prototype (issue 343), not the route plugin."
+        ),
+    )
+    parser.add_argument("run_doc", help="a run document with scan-plan, scan and cells")
+    parser.add_argument(
+        "--wells", help="comma separated wells to run (default: every scanned well)"
+    )
+    parser.add_argument(
+        "--labels",
+        default="single",
+        help="comma separated wanted classes of the cells stage (default: single)",
+    )
+    parser.add_argument(
+        "--weight",
+        action="append",
+        default=[],
+        metavar="NAME=VALUE",
+        help=(
+            f"a weight in 0..{_MAX_WEIGHT:.0f}; NAME is one of "
+            f"{', '.join(WEIGHT_NAMES)}; the default is density=1 and 0 for the rest"
+        ),
+    )
+    parser.add_argument("--fields-per-well", type=int, default=10)
+    parser.add_argument("--min-cells", type=int, default=1)
+    parser.add_argument("--min-score", type=float, default=0.0)
+    parser.add_argument("--wall-margin-um", type=float, default=0.0)
+    parser.add_argument("--exclude-centre-um", type=float, default=0.0)
+    parser.add_argument(
+        "--min-spacing-um",
+        type=float,
+        default=None,
+        help="cells closer than this are not isolated (default: 3 median cell lengths)",
+    )
+    parser.add_argument(
+        "--no-pixels",
+        action="store_true",
+        help="do not read the frames: no sharpness, no background, no mosaic",
+    )
+    parser.add_argument(
+        "--out-dir", default=None, help="default: selection/ next to the run document"
+    )
+    parser.add_argument(
+        "--run-doc-out",
+        default=None,
+        help="default: <run document stem>-selected.json next to it",
+    )
+    parser.add_argument("--no-png", action="store_true", help="write no picture")
+    parser.add_argument("--png-max-px", type=int, default=1600)
+    parser.add_argument(
+        "--show", type=int, default=15, help="candidates listed per well"
+    )
+    return parser
+
+
+@dataclass(frozen=True, slots=True)
+class Request:
+    """What the command line asked, bounded and with its paths made: nothing is read yet."""
+
+    run_doc: Path
+    out_dir: Path
+    copy_path: Path
+    wells: tuple[str, ...] | None
+    labels: tuple[str, ...]
+    weights: dict[str, float]
+    fields_per_well: int
+    min_cells: int
+    min_score: float
+    wall_margin_um: float
+    exclude_centre_um: float
+    min_spacing_um: float | None
+    pixels: bool
+    png: bool
+    png_max_px: int
+    show: int
+
+
+def _number(value: float) -> str:
+    return f"{value:.0f}" if abs(value) >= 1000 else f"{value:g}"
+
+
+def _require_range(
+    option: str,
+    value: float,
+    low: float,
+    high: float,
+    *,
+    integer: bool = False,
+    above: bool = False,
+) -> None:
+    """Refuse a value that is not finite or not in the range, in the words ``select_fields: <option> must be ...``."""
+    in_range = (value > low if above else value >= low) and value <= high
+    if not (math.isfinite(value) and in_range):
+        kind = "an integer" if integer else "a number"
+        where = (
+            f"above {_number(low)} and at most {_number(high)}"
+            if above
+            else f"from {_number(low)} to {_number(high)}"
+        )
+        raise Refusal(f"{option} must be {kind} {where}")
+
+
+def _names(text: str, option: str) -> tuple[str, ...]:
+    """The comma separated names of an option, without blanks and in order."""
+    names = tuple(part.strip() for part in text.split(",") if part.strip())
+    if not names:
+        raise Refusal(f"{option} must name at least one value")
+    return names
+
+
+def parse_request(argv: Sequence[str] | None) -> Request:
+    """Read and bound the command line (FM-32): ``nan``, ``inf``, negative and huge values never reach a file.
+
+    Raises:
+        Refusal: An option is malformed or out of bounds, a weight is refused, or a
+            pixel weight is asked of a run that reads no pixel.
+    """
+    args = build_parser().parse_args(argv)
+    _require_range("--fields-per-well", args.fields_per_well, 1, 500, integer=True)
+    _require_range("--min-cells", args.min_cells, 1, 1e9, integer=True)
+    _require_range("--min-score", args.min_score, 0.0, 1.0)
+    _require_range("--wall-margin-um", args.wall_margin_um, 0.0, 1e6)
+    _require_range("--exclude-centre-um", args.exclude_centre_um, 0.0, 1e6)
+    _require_range("--png-max-px", args.png_max_px, 256, 8000, integer=True)
+    _require_range("--show", args.show, 1, 500, integer=True)
+    if args.min_spacing_um is not None:
+        _require_range("--min-spacing-um", args.min_spacing_um, 0.0, 1e5, above=True)
+    weights = parse_weights(args.weight)
+    if args.no_pixels:
+        for name in ("sharpness", "background"):
+            if weights[name] > 0.0:
+                raise Refusal(
+                    f"--weight {name} needs the frames' pixels, and --no-pixels reads "
+                    f"none: drop --no-pixels or set {name}=0"
+                )
+    labels = _names(args.labels, "--labels")
+    for label in labels:
+        if labels.count(label) > 1:
+            raise Refusal(f"--labels repeats {label!r}")
+    wells = (
+        tuple(normalise_well(name) for name in _names(args.wells, "--wells"))
+        if args.wells is not None
+        else None
+    )
+    run_doc = Path(args.run_doc)
+    return Request(
+        run_doc=run_doc,
+        out_dir=(
+            Path(args.out_dir)
+            if args.out_dir is not None
+            else run_doc.parent / "selection"
+        ),
+        copy_path=(
+            Path(args.run_doc_out)
+            if args.run_doc_out is not None
+            else run_doc.with_name(f"{run_doc.stem}-selected.json")
+        ),
+        wells=wells,
+        labels=labels,
+        weights=weights,
+        fields_per_well=args.fields_per_well,
+        min_cells=args.min_cells,
+        min_score=args.min_score,
+        wall_margin_um=args.wall_margin_um,
+        exclude_centre_um=args.exclude_centre_um,
+        min_spacing_um=args.min_spacing_um,
+        pixels=not args.no_pixels,
+        png=not args.no_png,
+        png_max_px=args.png_max_px,
+        show=args.show,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class Upstream:
+    """The three records the command reads, validated, and the cells they name."""
+
+    plan: ScanPlanResult
+    scan: ScanResult
+    cells_result: CellsResult
+    cells: tuple[Cell, ...]
+    profile: str
+
+
+def _result_of(doc: RunDocument, slot: str, model: type[_M]) -> _M:
+    """The result of the record that fills ``slot``, validated; a record that does not validate says which to run again."""
+    record = doc.provider(slot)
+    assert record is not None  # `unusable` has been asked first
+    problem = ""
+    parsed: _M | None = None
+    try:
+        parsed = model.model_validate(record.result)
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        place = ".".join(str(part) for part in first["loc"]) or slot
+        problem = (
+            f"the {slot} record does not validate ({place}: {first['msg']}); run "
+            f"{record.plugin} again"
+        )
+    if parsed is None:
+        raise Refusal(problem)
+    return parsed
+
+
+def load_upstream(doc: RunDocument, run_doc: Path, labels: Sequence[str]) -> Upstream:
+    """``scan-plan``, ``scan`` and ``cells`` of a run document, each usable for the scan's profile, and the cells file.
+
+    Raises:
+        Refusal: A slot is missing, did not end ``done``, is stale or was run on another
+            profile (the reason of ``RunDocument.unusable``), does not validate, the
+            cells file no longer matches, a label is not one of the cells' classes, or
+            the camera cannot be inverted.
+    """
+    scan_record = doc.provider("scan")
+    if scan_record is None:
+        raise Refusal(
+            "the run document has no scan; smc run --list shows which plugin "
+            "provides it"
+        )
+    for slot in _READS:
+        reason = doc.unusable(
+            slot, profile=scan_record.profile, dry_run=scan_record.dry_run
+        )
+        if reason is not None:
+            raise Refusal(reason)
+    plan = _result_of(doc, "scan-plan", ScanPlanResult)
+    scan = _result_of(doc, "scan", ScanResult)
+    cells_result = _result_of(doc, "cells", CellsResult)
+    unknown = [label for label in labels if label not in cells_result.classes]
+    if unknown:
+        raise Refusal(
+            f"label {unknown[0]!r} is not one of the cells' classes "
+            f"{list(cells_result.classes)}; give --labels among them"
+        )
+    try:
+        _inverse_of(scan.matrix_um_per_px)
+    except ValueError as exc:
+        raise Refusal(str(exc)) from exc
+    if min(scan.image_shape_px) < 1:
+        raise Refusal(f"the scan's frame shape {scan.image_shape_px} is empty")
+    try:
+        cells = load_cells(run_doc.parent, cells_result)
+    except ValueError as exc:
+        raise Refusal(f"{exc}; run cells again") from exc
+    return Upstream(plan, scan, cells_result, cells, scan_record.profile)
+
+
+def wells_to_run(
+    plan: ScanPlanResult, cells_result: CellsResult, requested: Sequence[str] | None
+) -> list[str]:
+    """The wells the cells stage scanned, in the plan's order, or the ones asked for among them.
+
+    Raises:
+        Refusal: The cells hold a well the plan has no field for or does not list (as
+            ``route`` refuses it), a well asked for was not scanned, or none is left.
+    """
+    planned = {field.well for field in plan.fields}
+    listed = set(plan.wells)
+    for well in cells_result.counts:
+        if well not in planned:
+            raise Refusal(
+                f"the cells hold well {well!r}, which the scan plan has no field for; "
+                f"run scan-plan, scan and cells again"
+            )
+        if well not in listed:
+            raise Refusal(
+                f"the cells hold well {well!r}, which the scan plan does not list "
+                f"among its wells; run scan-plan, scan and cells again"
+            )
+    scanned = [well for well in plan.wells if well in cells_result.counts]
+    if requested is not None:
+        missing = [well for well in requested if well not in scanned]
+        if missing:
+            raise Refusal(
+                f"well {missing[0]!r} was not scanned by the cells stage; the wells "
+                f"are {', '.join(scanned) or 'none'}"
+            )
+        scanned = [well for well in scanned if well in requested]
+    if not scanned:
+        raise Refusal("the cells stage scanned no well: nothing to select")
+    return scanned
+
+
+@dataclass(slots=True)
+class Pixels:
+    """What reading the frames gave: each frame's statistics, each well's mosaic, and what could not be read."""
+
+    stats: dict[str, dict[int, tuple[float | None, float] | None]]
+    grey: dict[str, npt.NDArray[np.uint8]]
+    unreadable: int = 0
+    first_problem: str | None = None
+
+
+def read_pixels(
+    run_dir: Path,
+    scan: ScanResult,
+    geometries: Mapping[str, WellGeometry],
+    *,
+    mosaic: bool,
+    png_max_px: int,
+) -> Pixels:
+    """Read each frame of each well **once**: its statistics and, when ``mosaic``, its tile, in the same pass.
+
+    A frame that cannot be read (missing, corrupt, outside the run folder, another
+    shape than the scan says, not finite) is counted and skipped, and never ends the
+    run (failures are findings). A frame is read, reduced and dropped: only the
+    canvas of the well being read is held.
+
+    Raises:
+        Refusal: The scan's pixel size is not a size (FM-104).
+    """
+    frames_of = scan.frame_index()
+    height, width = scan.image_shape_px
+    matrix = scan.matrix_um_per_px
+    found = Pixels(stats={}, grey={})
+    for well, geometry in geometries.items():
+        stats: dict[int, tuple[float | None, float] | None] = {}
+        canvas = canvas_of(geometry, png_max_px) if mosaic else None
+        pixels = canvas.blank() if canvas is not None else None
+        reduction = 1
+        if canvas is not None:
+            try:
+                reduction = reduction_factor(
+                    canvas.um_per_px, scan.pixel_size_um, scan.image_shape_px
+                )
+            except ValueError as exc:
+                raise Refusal(f"the scan's {exc}") from exc
+        tile_matrix: Matrix2 = (
+            (matrix[0][0] * reduction, matrix[0][1] * reduction),
+            (matrix[1][0] * reduction, matrix[1][1] * reduction),
+        )
+        for position in frames_of.get(well, []):
+            frame = scan.frames[position]
+            tile = None
+            problem = ""
+            try:
+                raw = load_frame(run_dir, frame)
+                if tuple(raw.shape) != (height, width):
+                    raise ValueError(
+                        f"{frame.name} is {raw.shape[-1]} x {raw.shape[0]} pixels, "
+                        f"the scan says {width} x {height}"
+                    )
+                stats[position] = frame_stats(raw)
+                if pixels is not None:
+                    tile = block_mean(raw, reduction)
+            except Exception as exc:
+                problem = f"{frame.file}: {exc}"
+            if problem:
+                stats[position] = None
+                found.unreadable += 1
+                found.first_problem = found.first_problem or problem
+                continue
+            if pixels is not None and tile is not None and canvas is not None:
+                place_frame(
+                    pixels,
+                    tile,
+                    frame.x_um,
+                    frame.y_um,
+                    matrix=tile_matrix,
+                    x_min_um=canvas.x_min_um,
+                    y_max_um=canvas.y_max_um,
+                    um_per_px=canvas.um_per_px,
+                )
+        found.stats[well] = stats
+        if pixels is not None:
+            found.grey[well] = stretch_to_uint8(pixels)
+    return found
+
+
+def _ascii(text: str) -> str:
+    """``text`` with everything that is not ASCII written as an escape: a Windows console decodes with a code page (FM-20)."""
+    return text.encode("ascii", "backslashreplace").decode("ascii")
+
+
+def _say(line: str = "") -> None:
+    print(_ascii(line))
+
+
+def _finite(value: float | None) -> float | None:
+    """``value``, or ``None`` when it is unknown or not a finite number: JSON has no ``nan``."""
+    return value if value is not None and math.isfinite(value) else None
+
+
+def _cell(value: float | None, spec: str) -> str:
+    return "-" if value is None else format(value, spec)
+
+
+def table_lines(
+    *,
+    run_name: str,
+    upstream: Upstream,
+    request: Request,
+    options: Options,
+    choices: Sequence[WellChoice],
+    orders: Sequence[Sequence[int]],
+    result: RouteResult,
+    pixels: Pixels | None,
+) -> list[str]:
+    """The table: the settings, then for each well its best candidates by score, its chosen fields in route order and what they leave."""
+    scan = upstream.scan
+    height, width = scan.image_shape_px
+    fov = result.fov_um
+    skipped_unlocked = sum(c.skipped.unlocked for c in choices)
+    skipped_refused = sum(c.skipped.refused for c in choices)
+    candidates = sum(len(c.candidates) for c in choices)
+    dropped = sum(c.dropped for c in choices)
+    weights = " ".join(f"{name}={options.weights[name]:g}" for name in WEIGHT_NAMES)
+    lines = [
+        f"select_fields: {run_name} (a prototype, not the route plugin)",
+        f"  profile {upstream.profile}, objective {scan.objective or 'unknown'}, "
+        f"pixel {scan.pixel_size_um:g} um, frame {width} x {height} px = "
+        f"{fov[0]:.0f} x {fov[1]:.0f} um (field)",
+        f"  labels {', '.join(options.labels)}; weights {weights}",
+        f"  min_spacing_um {options.min_spacing_um:g} "
+        f"({'given' if options.spacing_given else 'measured, 3 times the median cell length of ' + str(options.spacing_cells) + ' wanted cells; the factor 3 is chosen, not measured'})",
+        f"  at most {options.fields_per_well} fields per well, min cells "
+        f"{options.min_cells}, min score {options.min_score:g}, wall margin "
+        f"{options.wall_margin_um:g} um, excluded centre {options.exclude_centre_um:g} um",
+        f"  {candidates} candidates ({skipped_unlocked} frames unlocked and "
+        f"{skipped_refused} over the wall or the excluded centre left out"
+        + (f", {dropped} dropped for a pixel weight" if dropped else "")
+        + ")"
+        + (
+            f"; {pixels.unreadable} frames could not be read"
+            + (
+                f" (first: {pixels.first_problem})"
+                if pixels.first_problem is not None
+                else ""
+            )
+            if pixels is not None and pixels.unreadable
+            else ""
+        ),
+    ]
+    columns = (
+        "rank",
+        "frame",
+        "x_um",
+        "y_um",
+        "score",
+        "n",
+        "dens/mm2",
+        "iso",
+        "purity",
+        "nn_um",
+        "wall_um",
+        "sharp",
+        "bg",
+        "focus",
+        "stop",
+    )
+    for choice, order in zip(choices, orders, strict=True):
+        stop_of = {choice.chosen[i].candidate.frame: k for k, i in enumerate(order)}
+        lines.append("")
+        lines.append(
+            f"== {choice.well}: {len(choice.chosen)} fields chosen of "
+            f"{len(choice.candidates)} candidates, {choice.n_wanted} wanted cells"
+        )
+        if choice.n_wanted == 0:
+            lines.append("   no wanted cell in this well: no field chosen")
+            continue
+        if not choice.scored:
+            lines.append("   no candidate to rank (see the counts above)")
+            continue
+        ranked = sorted(choice.scored, key=lambda s: (-s.score, s.candidate.frame))
+        rows = [list(columns)]
+        for rank, s in enumerate(ranked[: request.show], start=1):
+            c = s.candidate
+            rows.append(
+                [
+                    str(rank),
+                    str(c.frame),
+                    f"{c.x_um:.1f}",
+                    f"{c.y_um:.1f}",
+                    f"{s.score:.3f}",
+                    str(c.n_wanted),
+                    f"{c.density_per_mm2:.1f}",
+                    str(c.isolated),
+                    f"{c.n_wanted / c.n_all:.2f}" if c.n_all else "-",
+                    _cell(c.nn_median_um, ".1f"),
+                    f"{c.wall_um:.0f}",
+                    _cell(c.sharpness, ".3g"),
+                    _cell(c.background, ".1f"),
+                    c.focus,
+                    str(stop_of[c.frame]) if c.frame in stop_of else "-",
+                ]
+            )
+        widths = [max(len(row[i]) for row in rows) for i in range(len(columns))]
+        lines.extend(
+            "   "
+            + "  ".join(
+                cell.rjust(width) for cell, width in zip(row, widths, strict=True)
+            )
+            for row in rows
+        )
+        if len(ranked) > request.show:
+            lines.append(f"   ... {len(ranked) - request.show} more in selection.json")
+        lines.append("   chosen, in route order:")
+        for k, i in enumerate(order):
+            c = choice.chosen[i].candidate
+            counts = " ".join(f"{label}={n}" for label, n in choice.counts[i].items())
+            lines.append(
+                f"     r{k:03d} frame {c.frame} {c.name}  x={c.x_um:.1f} y={c.y_um:.1f} "
+                f"z={_cell(c.z_um, '.1f')} pfs={_cell(c.pfs_offset, 'g')}  {counts}"
+            )
+        lines.append(
+            f"   uncovered: {choice.uncovered} of {choice.n_wanted} wanted cells"
+        )
+    lines.append("")
+    lines.append(
+        f"route: {len(result.positions)} stops, {result.distance_um:.0f} um between "
+        f"fields (travel time not computed)"
+    )
+    return lines
+
+
+def selection_document(
+    *,
+    run_name: str,
+    request: Request,
+    options: Options,
+    choices: Sequence[WellChoice],
+    orders: Sequence[Sequence[int]],
+    pixels: bool,
+) -> dict[str, Any]:
+    """``selection.json``: every candidate of every well with its features, score, parts and stop, for the owner's notebook.
+
+    Nothing in smc reads it. The run document is named by its file name, never its
+    path (FM-50), and no value is ``nan``: an unknown is ``null``.
+    """
+    wells: dict[str, Any] = {}
+    for choice, order in zip(choices, orders, strict=True):
+        stop_of = {choice.chosen[i].candidate.frame: k for k, i in enumerate(order)}
+        scored = {s.candidate.frame: s for s in choice.scored}
+        entries = []
+        for c in choice.candidates:
+            s = scored.get(c.frame)
+            entries.append(
+                {
+                    "frame": c.frame,
+                    "name": c.name,
+                    "x_um": c.x_um,
+                    "y_um": c.y_um,
+                    "z_um": c.z_um,
+                    "pfs_offset": c.pfs_offset,
+                    "focus": c.focus,
+                    "counts": c.counts,
+                    "n_all": c.n_all,
+                    "n_wanted": c.n_wanted,
+                    "density_per_mm2": _finite(c.density_per_mm2),
+                    "isolated": c.isolated,
+                    "nn_median_um": _finite(c.nn_median_um),
+                    "nn_min_um": _finite(c.nn_min_um),
+                    "wall_um": _finite(c.wall_um),
+                    "sharpness": _finite(c.sharpness),
+                    "background": _finite(c.background),
+                    "score": s.score if s is not None else None,
+                    "parts": s.parts if s is not None else None,
+                    "stop": stop_of.get(c.frame),
+                }
+            )
+        wells[choice.well] = {"candidates": entries, "uncovered": choice.uncovered}
+    return {
+        "schema_version": _SCHEMA_VERSION,
+        "run_doc": run_name,
+        "labels": list(options.labels),
+        "weights": {name: options.weights[name] for name in WEIGHT_NAMES},
+        "options": {
+            "fields_per_well": options.fields_per_well,
+            "min_cells": options.min_cells,
+            "min_score": options.min_score,
+            "wall_margin_um": options.wall_margin_um,
+            "exclude_centre_um": options.exclude_centre_um,
+            "pixels": pixels,
+        },
+        "min_spacing_um": options.min_spacing_um,
+        "min_spacing_source": "given" if options.spacing_given else "measured",
+        "wells": wells,
+    }
+
+
+def write_selection(path: Path, document: Mapping[str, Any]) -> None:
+    """Write ``selection.json``: ASCII JSON (``\\uXXXX`` escapes), UTF-8, and never a ``nan``."""
+    text = json.dumps(document, indent=2, ensure_ascii=True, allow_nan=False)
+    path.write_text(text + "\n", encoding="utf-8")
+
+
+def write_picture(image: Image.Image, path: Path) -> None:
+    """Write one well's picture; an existing one is replaced, it is derived."""
+    image.save(path, "PNG")
+
+
+def run(argv: Sequence[str] | None) -> int:
+    """The command: validate, read, choose, print the table, then write the files.
+
+    The order is the plan's (decided in #343): options and destinations are checked
+    before any file is read, the frames are read once, the table is printed **before**
+    any file is written (a write that fails must not hide minutes of work: FM-30,
+    FM-34), and a file that cannot be written is a line on stderr and an exit of 1,
+    with the other files still written.
+
+    Returns:
+        0 when everything was done, 1 when a file could not be written, 2 on a refusal
+        (raised as ``Refusal`` for ``main`` to print).
+    """
+    request = parse_request(argv)
+    run_doc = request.run_doc
+    try:
+        doc = RunDocument.load(run_doc)
+    except RunDocumentError as exc:
+        raise Refusal(f"{run_doc.name}: {exc.reason}") from exc
+    check_copy_target(run_doc, request.copy_path)
+    if request.out_dir.exists() and not request.out_dir.is_dir():
+        raise Refusal(f"--out-dir {request.out_dir} is a file, not a folder")
+    upstream = load_upstream(doc, run_doc, request.labels)
+    plan, scan = upstream.plan, upstream.scan
+    wells = wells_to_run(plan, upstream.cells_result, request.wells)
+    geometries: dict[str, WellGeometry] = {}
+    for well in wells:
+        try:
+            geometries[well] = well_geometry(plan.plate_plan, well)
+        except ValueError as exc:
+            raise Refusal(f"{exc}; run scan-plan again") from exc
+
+    wanted_cells = [
+        c for c in upstream.cells if c.well in geometries and c.label in request.labels
+    ]
+    if request.min_spacing_um is not None:
+        spacing, given = request.min_spacing_um, True
+    else:
+        measured = default_min_spacing_um(wanted_cells, scan.matrix_um_per_px)
+        if measured is None:
+            raise Refusal(
+                f"no wanted cell ({', '.join(request.labels)}) in the wells run: the "
+                f"spacing cannot be measured; give --min-spacing-um or other --labels"
+            )
+        if not 0.0 < measured <= 1e5:
+            raise Refusal(
+                f"the measured min_spacing_um is {measured:g}, which is not above 0 "
+                f"and at most 100000; give --min-spacing-um"
+            )
+        spacing, given = measured, False
+    options = Options(
+        labels=request.labels,
+        weights=request.weights,
+        fields_per_well=request.fields_per_well,
+        min_cells=request.min_cells,
+        min_score=request.min_score,
+        wall_margin_um=request.wall_margin_um,
+        exclude_centre_um=request.exclude_centre_um,
+        min_spacing_um=spacing,
+        spacing_given=given,
+        spacing_cells=len(wanted_cells),
+    )
+
+    pixels: Pixels | None = None
+    if request.pixels:
+        pixels = read_pixels(
+            run_doc.parent,
+            scan,
+            geometries,
+            mosaic=request.png,
+            png_max_px=request.png_max_px,
+        )
+    choices = [
+        select_well(
+            well,
+            scan,
+            upstream.cells,
+            geometries[well],
+            classes=upstream.cells_result.classes,
+            options=options,
+            stats=pixels.stats.get(well, {}) if pixels is not None else {},
+        )
+        for well in wells
+    ]
+    orders = route_orders(plan, choices)
+    result = route_result(
+        scan,
+        plan,
+        choices,
+        options=options,
+        unreadable=pixels.unreadable if pixels is not None else 0,
+    )
+    for line in table_lines(
+        run_name=run_doc.name,
+        upstream=upstream,
+        request=request,
+        options=options,
+        choices=choices,
+        orders=orders,
+        result=result,
+        pixels=pixels,
+    ):
+        _say(line)
+
+    failed = _write_files(
+        request, upstream, doc, options, choices, orders, result, pixels, wells
+    )
+    return 1 if failed else 0
+
+
+def _write_files(
+    request: Request,
+    upstream: Upstream,
+    doc: RunDocument,
+    options: Options,
+    choices: Sequence[WellChoice],
+    orders: Sequence[Sequence[int]],
+    result: RouteResult,
+    pixels: Pixels | None,
+    wells: Sequence[str],
+) -> bool:
+    """Write ``selection.json``, one picture per well and the copy; say each and return whether any failed.
+
+    A failure is one line on stderr and the others are still written (FM-34).
+    """
+    failed = False
+
+    def fail(what: Path, exc: Exception) -> None:
+        nonlocal failed
+        failed = True
+        reason = getattr(exc, "strerror", None) or getattr(exc, "reason", None) or exc
+        print(
+            _ascii(f"select_fields: could not write {what}: {reason}"), file=sys.stderr
+        )
+
+    try:
+        request.out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        fail(request.out_dir, exc)
+        return True
+    target = request.out_dir / _SELECTION_FILE
+    try:
+        write_selection(
+            target,
+            selection_document(
+                run_name=request.run_doc.name,
+                request=request,
+                options=options,
+                choices=choices,
+                orders=orders,
+                pixels=request.pixels,
+            ),
+        )
+        _say(f"wrote {target}")
+    except OSError as exc:
+        fail(target, exc)
+
+    scan = upstream.scan
+    if request.png:
+        weights = " ".join(
+            f"{name}={options.weights[name]:g}"
+            for name in WEIGHT_NAMES
+            if options.weights[name] > 0.0
+        )
+        for choice, order in zip(choices, orders, strict=True):
+            geometry = well_geometry(upstream.plan.plate_plan, choice.well)
+            canvas = canvas_of(geometry, request.png_max_px)
+            grey = pixels.grey.get(choice.well) if pixels is not None else None
+            if grey is None:
+                grey = np.full(
+                    (canvas.height_px, canvas.width_px), _UNPLACED_GREY, dtype=np.uint8
+                )
+            image = render_png(
+                grey,
+                canvas,
+                geometry,
+                cells=[c for c in upstream.cells if c.well == choice.well],
+                classes=upstream.cells_result.classes,
+                wanted=options.labels,
+                stops=[
+                    (
+                        k,
+                        choice.chosen[i].candidate.x_um,
+                        choice.chosen[i].candidate.y_um,
+                    )
+                    for k, i in enumerate(order)
+                ],
+                matrix=scan.matrix_um_per_px,
+                image_shape_px=scan.image_shape_px,
+                caption=f"{choice.well}: {len(order)} fields, {weights}",
+            )
+            path = request.out_dir / f"{choice.well}.png"
+            try:
+                write_picture(image, path)
+                _say(f"wrote {path}")
+            except OSError as exc:
+                fail(path, exc)
+
+    if result.positions:
+        try:
+            record = route_record(
+                doc,
+                result,
+                params=record_params(options, wells, pixels=request.pixels),
+            )
+            write_copy(request.run_doc, request.copy_path, record)
+            _say(
+                f"wrote {request.copy_path} (export it with: smc run nis-export "
+                f"--run-doc {request.copy_path})"
+            )
+        except (OSError, RunDocumentError) as exc:
+            fail(request.copy_path, exc)
+    else:
+        _say("no field was chosen in any well: no run document copy written")
+    return failed
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the command; a refusal is one line on stderr, ``select_fields: <reason>``, and the exit code 2."""
+    try:
+        return run(argv)
+    except Refusal as exc:
+        print(_ascii(f"select_fields: {exc}"), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
