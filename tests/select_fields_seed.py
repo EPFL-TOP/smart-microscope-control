@@ -108,15 +108,27 @@ class Seed:
     shape: tuple[int, int]
 
 
-def record(path: Path, plugin: str, provides: str, result: BaseModel) -> None:
-    """A stage record as an earlier run of ``plugin`` would have left it, ``done``."""
-    then = datetime(2026, 10, 28, 9, 30, tzinfo=timezone.utc)
+def record(
+    path: Path,
+    plugin: str,
+    provides: str,
+    result: BaseModel,
+    *,
+    attempt: str = "a1",
+    day: int = 28,
+) -> None:
+    """A stage record as an earlier run of ``plugin`` would have left it, ``done``.
+
+    A second attempt of a stage is ``attempt="a2"`` on a later ``day`` (the latest start
+    decides which record fills a slot).
+    """
+    then = datetime(2026, 10, day, 9, 30, tzinfo=timezone.utc)
     write_stage(
         path,
         StageRecord(
             plugin=plugin,
             provides=provides,
-            attempt="a1",
+            attempt=attempt,
             status=StageStatus.done,
             started_utc=then,
             finished_utc=then,

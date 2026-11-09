@@ -54,26 +54,49 @@ another objective, and any default that the owner has not chosen on a real scan.
 
 from __future__ import annotations
 
+import contextlib
 import math
+import shutil
+import uuid
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
 
+import smc
+
 # The route's own arithmetic for "inside a field" and for "overlap" (FM-132): private
 # helpers, imported on purpose so that the prototype and the plugin cannot disagree.
-from smc.plugins.geometry import Matrix2, footprint
+from smc.plugins.geometry import Matrix2, footprint, fov_of
 from smc.plugins.route.algorithm import (
     _TOUCH_PX,
     _inverse_of,
     _pixel_offsets,
     allowed,
     order_route,
+    path_length_um,
 )
-from smc.plugins.slots import Cell, ScanResult, WellGeometry
+from smc.plugins.slots import (
+    Cell,
+    RoutePosition,
+    RouteResult,
+    ScanPlanResult,
+    ScanResult,
+    WellGeometry,
+)
+from smc.run import (
+    ReadRecord,
+    RunDocument,
+    RunDocumentError,
+    StageRecord,
+    StageStatus,
+    write_stage,
+)
 
 __all__ = ["Candidate", "Refusal", "Skipped"]
 
@@ -894,3 +917,326 @@ def render_png(
         )
     draw.text((4, 4), caption, fill=_WHITE)
     return image
+
+
+# ========================================================================= Record
+
+#: The record's plugin name. Not ``route``: the document says who chose the fields, the
+#: original ``route`` record (if any) stays in the copy, and ``provider("route")`` takes
+#: the later start, which is this one.
+RECORD_NAME = "route-prototype"
+_READS = ("scan-plan", "scan", "cells")
+
+
+@dataclass(frozen=True, slots=True)
+class Options:
+    """What a run was asked: the labels, the weights, the limits and the spacing that was used.
+
+    ``spacing_given`` says whether ``min_spacing_um`` was typed or measured, and
+    ``spacing_cells`` is the number of wanted cells it was measured over.
+    """
+
+    labels: tuple[str, ...]
+    weights: Mapping[str, float]
+    fields_per_well: int
+    min_cells: int
+    min_score: float
+    wall_margin_um: float
+    exclude_centre_um: float
+    min_spacing_um: float
+    spacing_given: bool
+    spacing_cells: int
+
+
+@dataclass(frozen=True, slots=True)
+class WellChoice:
+    """What was decided for one well: every candidate, its score, the fields chosen and what they leave.
+
+    ``scored`` is in the candidates' order and ``chosen`` in the order chosen, which
+    is the order the cells were given away in; ``counts`` is each chosen field's, as
+    ``tally`` gives it. ``dropped`` counts the candidates that a pixel weight left out
+    because their frame could not be read.
+    """
+
+    well: str
+    candidates: tuple[Candidate, ...]
+    skipped: Skipped
+    scored: list[Scored]
+    chosen: list[Scored]
+    counts: list[dict[str, int]]
+    uncovered: int
+    dropped: int
+    n_wanted: int
+
+
+def select_well(
+    well: str,
+    scan: ScanResult,
+    cells: Sequence[Cell],
+    geometry: WellGeometry,
+    *,
+    classes: Sequence[str],
+    options: Options,
+    stats: Mapping[int, tuple[float | None, float] | None],
+) -> WellChoice:
+    """The candidates of a well, scored, chosen and counted: what one well of the command does, without the files."""
+    candidates, skipped = candidates_of(
+        well,
+        scan,
+        cells,
+        geometry,
+        labels=options.labels,
+        classes=classes,
+        min_spacing_um=options.min_spacing_um,
+        margin_um=options.wall_margin_um,
+        exclude_centre_um=options.exclude_centre_um,
+        stats=stats,
+    )
+    scored = score_candidates(candidates, options.weights)
+    chosen = choose(
+        scored,
+        matrix=scan.matrix_um_per_px,
+        image_shape_px=scan.image_shape_px,
+        n=options.fields_per_well,
+        min_cells=options.min_cells,
+        min_score=options.min_score,
+    )
+    wanted = [c for c in cells if c.well == well and c.label in options.labels]
+    counts, uncovered = tally(
+        [(s.candidate.x_um, s.candidate.y_um) for s in chosen],
+        wanted,
+        labels=options.labels,
+        matrix=scan.matrix_um_per_px,
+        image_shape_px=scan.image_shape_px,
+    )
+    return WellChoice(
+        well=well,
+        candidates=candidates,
+        skipped=skipped,
+        scored=scored,
+        chosen=chosen,
+        counts=counts,
+        uncovered=uncovered,
+        dropped=len(candidates) - len(scored),
+        n_wanted=len(wanted),
+    )
+
+
+def first_field_of(plan: ScanPlanResult, well: str) -> tuple[float, float]:
+    """The first planned field of a well, in the scan's visiting order: where the scan started in it.
+
+    Raises:
+        Refusal: The plan has no field for the well.
+    """
+    for field in plan.fields:
+        if field.well == well:
+            return (field.x_um, field.y_um)
+    raise Refusal(f"the scan plan has no field for well {well!r}; run scan-plan again")
+
+
+def assumed_lines(
+    options: Options, *, unlocked: int, unreadable: int
+) -> tuple[str, ...]:
+    """What the result rests on and did not measure: the texts the plan fixed, in its order."""
+    weights = ", ".join(f"{name}={options.weights[name]:g}" for name in WEIGHT_NAMES)
+    if options.spacing_given:
+        spacing = f"min_spacing_um={options.min_spacing_um:g}, given"
+    else:
+        spacing = (
+            f"min_spacing_um={options.min_spacing_um:g}, measured as 3 times the "
+            f"median cell length of {options.spacing_cells} wanted cells (the factor 3 "
+            f"is chosen, not measured)"
+        )
+    lines = [
+        "positions chosen by scripts/dev/select_fields.py, a prototype and not the "
+        f"route plugin; score weights {weights}",
+        "the candidate fields are the scan's own frames at their readback positions, "
+        "not a lattice",
+        spacing,
+        "the route minimises the Euclidean distance between fields; whether the "
+        "stage's move time follows it is not measured",
+        "travel_s is not computed by the prototype",
+    ]
+    if unlocked:
+        lines.append(
+            f"{unlocked} frames were not candidates because the autofocus had not "
+            f"locked on them (unlocked)"
+        )
+    if unreadable:
+        lines.append(
+            f"{unreadable} frames could not be read and were left out of the mosaic "
+            f"and of the pixel features"
+        )
+    return tuple(lines)
+
+
+def route_result(
+    scan: ScanResult,
+    plan: ScanPlanResult,
+    choices: Sequence[WellChoice],
+    *,
+    options: Options,
+    unreadable: int = 0,
+) -> RouteResult:
+    """The chosen fields as a ``RouteResult``, in the shape ``nis-export`` reads.
+
+    Each well's fields are ordered from the one nearest where the stage is coming
+    from (the previous well's last stop, or the well's first planned field), then by
+    ``route``'s ``order_route``. A stop is the **frame's** readback position, Z and
+    autofocus offset, taken together from the one frame that was scored and will be
+    imaged again (FM-167, FM-154), and its counts have every wanted label, zeros
+    included. ``uncovered`` has every well, in the plan's order, zeros included.
+    ``travel_s`` is ``None``: no timings are read, and unknown is not zero.
+    """
+    positions: list[RoutePosition] = []
+    uncovered: dict[str, int] = {}
+    previous: tuple[float, float] | None = None
+    for choice in choices:
+        uncovered[choice.well] = choice.uncovered
+        if not choice.chosen:
+            continue
+        reference = (
+            previous if previous is not None else first_field_of(plan, choice.well)
+        )
+        order = order_stops(
+            [(s.candidate.x_um, s.candidate.y_um) for s in choice.chosen], reference
+        )
+        for k, index in enumerate(order):
+            candidate = choice.chosen[index].candidate
+            positions.append(
+                RoutePosition(
+                    order=len(positions),
+                    well=choice.well,
+                    name=f"{choice.well}_r{k:03d}",
+                    x_um=candidate.x_um,
+                    y_um=candidate.y_um,
+                    z_um=candidate.z_um,
+                    pfs_offset=candidate.pfs_offset,
+                    counts=dict(choice.counts[index]),
+                )
+            )
+        previous = (positions[-1].x_um, positions[-1].y_um)
+    points = [(p.x_um, p.y_um) for p in positions]
+    return RouteResult(
+        objective=scan.objective,
+        matrix_um_per_px=scan.matrix_um_per_px,
+        image_shape_px=scan.image_shape_px,
+        fov_um=fov_of(scan.matrix_um_per_px, scan.image_shape_px),
+        labels=options.labels,
+        positions=tuple(positions),
+        uncovered=uncovered,
+        distance_um=path_length_um(points, range(len(points))),
+        travel_s=None,
+        assumed=assumed_lines(
+            options,
+            unlocked=sum(choice.skipped.unlocked for choice in choices),
+            unreadable=unreadable,
+        ),
+    )
+
+
+def record_params(
+    options: Options, wells: Sequence[str], *, pixels: bool
+) -> dict[str, Any]:
+    """What the record says it was asked, as JSON values and never a path (FM-50)."""
+    return {
+        "labels": list(options.labels),
+        "weights": {name: options.weights[name] for name in WEIGHT_NAMES},
+        "fields_per_well": options.fields_per_well,
+        "min_cells": options.min_cells,
+        "min_score": options.min_score,
+        "wall_margin_um": options.wall_margin_um,
+        "exclude_centre_um": options.exclude_centre_um,
+        "min_spacing_um": options.min_spacing_um,
+        "min_spacing_source": "given" if options.spacing_given else "measured",
+        "wells": list(wells),
+        "pixels": pixels,
+    }
+
+
+def route_record(
+    doc: RunDocument, result: RouteResult, *, params: dict[str, Any]
+) -> StageRecord:
+    """The ``route-prototype`` record that fills the ``route`` slot of a copy of ``doc``.
+
+    It reads the current providers of ``scan-plan``, ``scan`` and ``cells``, so that
+    it goes stale, as ``route``'s own record does, when one of them runs again; its
+    profile and dry-run flag are the scan's, which is what ``nis-export`` compares
+    with its own run.
+
+    Raises:
+        Refusal: The document has no provider of one of the three slots.
+    """
+    reads: dict[str, ReadRecord | None] = {}
+    for slot in _READS:
+        provider = doc.provider(slot)
+        if provider is None:
+            raise Refusal(
+                f"the run document has no {slot}; smc run --list shows which plugin "
+                f"provides it"
+            )
+        reads[slot] = ReadRecord(plugin=provider.plugin, attempt=provider.attempt)
+    scan_record = doc.provider("scan")
+    assert scan_record is not None  # `scan` is one of _READS: checked above
+    now = datetime.now(timezone.utc)
+    return StageRecord(
+        plugin=RECORD_NAME,
+        provides="route",
+        attempt=uuid.uuid4().hex,
+        status=StageStatus.done,
+        started_utc=now,
+        finished_utc=now,
+        profile=scan_record.profile,
+        dry_run=scan_record.dry_run,
+        smc_version=smc.__version__,
+        plugin_version=None,
+        params=params,
+        result=result.model_dump(mode="json"),
+        reads=reads,
+    )
+
+
+def check_copy_target(source: Path, target: Path) -> None:
+    """Refuse a copy that would be the original, a folder, or in a folder that is not there.
+
+    Checked before any frame is read (FM-30): minutes of work must not end at a
+    destination that was wrong from the start. ``samefile`` follows links, so a hard
+    or symbolic link to the original is the original.
+
+    Raises:
+        Refusal: The target is a folder, the input itself, or has no folder to go in.
+    """
+    if target.is_dir():
+        raise Refusal(f"--run-doc-out {target} is a folder, not a file; name a file")
+    if target.exists() and source.samefile(target):
+        raise Refusal(
+            "--run-doc-out is the input run document: the original is never "
+            "written, name another file"
+        )
+    if not target.parent.is_dir():
+        raise Refusal(
+            f"the folder of --run-doc-out ({target.parent}) does not exist; create "
+            f"it or name another file"
+        )
+
+
+def write_copy(source: Path, target: Path, record: StageRecord) -> None:
+    """Copy the run document and add ``record`` to the copy, which is replaced if it is there.
+
+    The copy is derived (rebuilt from the original at each run), so replacing it
+    loses nothing. Every other stage is kept, byte for byte in its content. A copy
+    that could not be completed is removed: the original with no route nobody chose
+    would otherwise read as a finished copy.
+
+    Raises:
+        OSError: The copy could not be made (a file another program holds open is a
+            ``PermissionError`` on Windows).
+        RunDocumentError: The record could not be written into the copy.
+    """
+    shutil.copyfile(source, target)
+    try:
+        write_stage(target, record)
+    except RunDocumentError:
+        with contextlib.suppress(OSError):
+            target.unlink(missing_ok=True)
+        raise

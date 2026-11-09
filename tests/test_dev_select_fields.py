@@ -10,7 +10,10 @@ function under test (FM-124).
 from __future__ import annotations
 
 import importlib.util
+import itertools
+import json
 import math
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -33,10 +36,12 @@ from select_fields_seed import (
     matrix_of,
     seed_run,
 )
+from select_fields_seed import record as write_record
 from smc.plugins.geometry import Matrix2, footprint, stage_of_pixel
 from smc.plugins.route.algorithm import allowed
 from smc.plugins.slots import (
     Cell,
+    RouteResult,
     ScanFrame,
     ScanResult,
     WellGeometry,
@@ -44,7 +49,7 @@ from smc.plugins.slots import (
     load_frame,
     well_geometry,
 )
-from smc.run import RunDocument
+from smc.run import RunDocument, RunDocumentError, StageStatus
 
 ROOT = Path(__file__).resolve().parents[1]
 HEIGHT, WIDTH = SHAPE
@@ -1381,3 +1386,387 @@ def cell_at_small(dx: float, dy: float, label: str) -> Cell:
         frame=0,
         box_px=(0.0, 0.0, 10.0, 10.0),
     )
+
+
+# -------------------------------------------------------------------- record
+
+
+def _options(sf: ModuleType, **given):
+    base = {
+        "labels": ("single",),
+        "weights": sf.parse_weights([]),
+        "fields_per_well": 10,
+        "min_cells": 1,
+        "min_score": 0.0,
+        "wall_margin_um": 0.0,
+        "exclude_centre_um": 0.0,
+        "min_spacing_um": 30.0,
+        "spacing_given": True,
+        "spacing_cells": 0,
+    }
+    return sf.Options(**{**base, **given})
+
+
+def _choices(sf: ModuleType, seed: Seed, options, wells: Sequence[str] | None = None):
+    cells = load_cells(seed.path.parent, seed.result)
+    return [
+        sf.select_well(
+            well,
+            seed.scan,
+            cells,
+            _geometry(seed, well),
+            classes=CLASSES,
+            options=options,
+            stats={},
+        )
+        for well in (wells if wells is not None else seed.plan.wells)
+    ]
+
+
+def _result(sf: ModuleType, seed: Seed, *, options=None, unreadable: int = 0, **given):
+    options = options if options is not None else _options(sf, **given)
+    return sf.route_result(
+        seed.scan,
+        seed.plan,
+        _choices(sf, seed, options),
+        options=options,
+        unreadable=unreadable,
+    )
+
+
+def _one_cell_in_each_frame(scan: ScanResult) -> list[Cell]:
+    """One single cell at the centre of every frame, so that every frame is a candidate worth choosing."""
+    return [
+        Cell(
+            well=frame.well,
+            x_um=frame.x_um,
+            y_um=frame.y_um,
+            label="single",
+            score=0.9,
+            frame=k,
+            box_px=(0.0, 0.0, 10.0, 10.0),
+        )
+        for k, frame in enumerate(scan.frames)
+    ]
+
+
+def _row_of_three(tmp_path: Path, **given) -> Seed:
+    """Three fields side by side that touch (overlap 0), 400 um apart: all of them can be chosen."""
+    return seed_run(
+        tmp_path,
+        cells=_one_cell_in_each_frame,
+        rows=1,
+        columns=3,
+        overlap=0.0,
+        **given,
+    )
+
+
+def test_a_stop_takes_z_and_offset_from_its_own_frame(
+    tmp_path: Path, sf: ModuleType
+) -> None:
+    seed = _row_of_three(tmp_path, focus_of={("A1", 1): "off"})
+    result = _result(sf, seed)
+    assert len(result.positions) == 3
+    by_x = {round(f.x_um, 3): f for f in seed.scan.frames}
+    for stop in result.positions:
+        frame = by_x[round(stop.x_um, 3)]
+        # The readback, which is 0.3 um off the planned field, and not the target.
+        planned = next(
+            f
+            for f in seed.plan.fields
+            if f.well == frame.well and f.index == frame.index
+        )
+        assert (stop.x_um, stop.y_um) == (frame.x_um, frame.y_um)
+        assert (stop.x_um, stop.y_um) != (planned.x_um, planned.y_um)
+        assert (stop.z_um, stop.pfs_offset) == (frame.z_um, frame.pfs_offset)
+    off = by_x[round(seed.scan.frames[1].x_um, 3)]
+    stop_of_off = next(s for s in result.positions if s.x_um == off.x_um)
+    assert (stop_of_off.z_um, stop_of_off.pfs_offset) == (off.z_um, None)
+
+
+def test_stops_are_named_numbered_and_counted_like_the_routes(
+    tmp_path: Path, sf: ModuleType
+) -> None:
+    seed = seed_run(
+        tmp_path,
+        cells=lambda scan: [
+            *_one_cell_in_each_frame(scan),
+            Cell(
+                well="A1",
+                x_um=scan.frames[0].x_um + 10.0,
+                y_um=scan.frames[0].y_um,
+                label="doublet",
+                score=0.9,
+                frame=0,
+                box_px=(0.0, 0.0, 10.0, 10.0),
+            ),
+        ],
+        wells=("A1", "A2"),
+        rows=1,
+        columns=3,
+        overlap=0.0,
+    )
+    result = _result(sf, seed, labels=("single", "doublet"))
+    assert [s.order for s in result.positions] == list(range(6))
+    assert [s.name for s in result.positions if s.well == "A1"] == [
+        "A1_r000",
+        "A1_r001",
+        "A1_r002",
+    ]
+    assert [s.name for s in result.positions if s.well == "A2"] == [
+        "A2_r000",
+        "A2_r001",
+        "A2_r002",
+    ]
+    assert all(set(s.counts) == {"single", "doublet"} for s in result.positions)
+    first = next(s for s in result.positions if s.x_um == seed.scan.frames[0].x_um)
+    assert first.counts == {"single": 1, "doublet": 1}
+    assert result.labels == ("single", "doublet")
+    assert result.objective == seed.scan.objective
+    assert result.matrix_um_per_px == seed.matrix
+    assert result.image_shape_px == seed.shape
+    assert result.fov_um == pytest.approx((400.0, 300.0))
+
+
+def test_the_first_well_starts_nearest_its_first_planned_field(
+    tmp_path: Path, sf: ModuleType
+) -> None:
+    # Cells in the second and third field only: the first planned field is the left one
+    # (x = 600), so the route starts at the nearer of the two, the middle one, and not at
+    # the last planned (which would start at the right-hand field).
+    seed = seed_run(
+        tmp_path,
+        cells=lambda scan: _one_cell_in_each_frame(scan)[1:],
+        rows=1,
+        columns=3,
+        overlap=0.0,
+    )
+    result = _result(sf, seed)
+    assert [s.x_um for s in result.positions] == [
+        seed.scan.frames[1].x_um,
+        seed.scan.frames[2].x_um,
+    ]
+
+
+def test_a_later_well_starts_nearest_the_previous_wells_last_stop(
+    tmp_path: Path, sf: ModuleType
+) -> None:
+    # A2 is scanned first, left to right, and ends at its right-hand field; A1 lies to the
+    # left, so its route starts at its right-hand field, not at its first planned one.
+    seed = seed_run(
+        tmp_path,
+        cells=_one_cell_in_each_frame,
+        wells=("A2", "A1"),
+        rows=1,
+        columns=3,
+        overlap=0.0,
+    )
+    result = _result(sf, seed)
+    a2 = [s.x_um for s in result.positions if s.well == "A2"]
+    a1 = [s.x_um for s in result.positions if s.well == "A1"]
+    assert a2 == sorted(a2)
+    assert a1 == sorted(a1, reverse=True)
+    assert [s.well for s in result.positions] == ["A2"] * 3 + ["A1"] * 3
+
+
+def test_every_scanned_well_is_a_key_of_uncovered(
+    tmp_path: Path, sf: ModuleType
+) -> None:
+    # A1 has a cell in every field, A2 none that is wanted, B1 has one cell that no field
+    # holds (the margin leaves no candidate): the keys are the wells, zeros included.
+    def cells(scan):
+        return [
+            *_one_cell_in_each_frame(scan)[:3],
+            cell_at("A2", 0.0, 0.0, "debris"),
+            cell_at("B1", 3000.0, 0.0),
+        ]
+
+    seed = seed_run(
+        tmp_path, cells=cells, wells=("A1", "A2", "B1"), rows=1, columns=3, overlap=0.0
+    )
+    result = _result(sf, seed)
+    assert list(result.uncovered) == ["A1", "A2", "B1"]
+    assert result.uncovered == {"A1": 0, "A2": 0, "B1": 1}
+    assert {s.well for s in result.positions} == {"A1"}
+
+
+def test_the_route_is_the_distance_of_its_legs_and_travel_is_unknown(
+    tmp_path: Path, sf: ModuleType
+) -> None:
+    seed = _row_of_three(tmp_path)
+    result = _result(sf, seed)
+    points = [(s.x_um, s.y_um) for s in result.positions]
+    assert result.distance_um == pytest.approx(
+        sum(math.dist(a, b) for a, b in itertools.pairwise(points))
+    )
+    assert result.travel_s is None  # unknown is not zero
+
+
+def test_the_assumed_lines_name_the_score_the_candidates_and_the_spacing(
+    tmp_path: Path, sf: ModuleType
+) -> None:
+    seed = _row_of_three(tmp_path, focus_of={("A1", 0): "unlocked"})
+    given = _result(
+        sf,
+        seed,
+        options=_options(
+            sf, weights=sf.parse_weights(["isolation=2.5", "sharpness=0.5"])
+        ),
+        unreadable=2,
+    )
+    assert given.assumed == (
+        "positions chosen by scripts/dev/select_fields.py, a prototype and not the "
+        "route plugin; score weights density=1, isolation=2.5, purity=0, wall=0, "
+        "sharpness=0.5, background=0",
+        "the candidate fields are the scan's own frames at their readback positions, "
+        "not a lattice",
+        "min_spacing_um=30, given",
+        "the route minimises the Euclidean distance between fields; whether the "
+        "stage's move time follows it is not measured",
+        "travel_s is not computed by the prototype",
+        "1 frames were not candidates because the autofocus had not locked on them "
+        "(unlocked)",
+        "2 frames could not be read and were left out of the mosaic and of the pixel "
+        "features",
+    )
+    measured = _result(
+        sf,
+        seed,
+        options=_options(sf, min_spacing_um=45.0, spacing_given=False, spacing_cells=7),
+    )
+    assert measured.assumed[2] == (
+        "min_spacing_um=45, measured as 3 times the median cell length of 7 wanted "
+        "cells (the factor 3 is chosen, not measured)"
+    )
+    # Nothing left out: neither of the two last lines.
+    (tmp_path / "clean").mkdir()
+    clean = _result(sf, _row_of_three(tmp_path / "clean"))
+    assert len(clean.assumed) == 5
+
+
+def _record_of(sf: ModuleType, seed: Seed, result=None):
+    doc = RunDocument.load(seed.path)
+    result = result if result is not None else _result(sf, seed)
+    return doc, sf.route_record(
+        doc, result, params={"labels": ["single"], "weights": sf.parse_weights([])}
+    )
+
+
+def test_the_record_is_written_to_a_copy_and_the_original_is_untouched(
+    tmp_path: Path, sf: ModuleType
+) -> None:
+    seed = _row_of_three(tmp_path)
+    before = seed.path.read_bytes()
+    doc, record = _record_of(sf, seed)
+    copy = tmp_path / "run-selected.json"
+    sf.write_copy(seed.path, copy, record)
+    assert seed.path.read_bytes() == before
+    written = RunDocument.load(copy)
+    assert set(written.stages) == set(doc.stages) | {"route-prototype"}
+    for name, stage in doc.stages.items():  # every other stage is kept, as it was
+        assert written.stages[name] == stage
+    stored = written.stages["route-prototype"]
+    assert (stored.plugin, stored.provides, stored.status) == (
+        "route-prototype",
+        "route",
+        StageStatus.done,
+    )
+    assert written.provider("route") == stored
+    assert RouteResult.model_validate(stored.result).positions
+    scan_record = doc.stages["scan"]
+    assert (stored.profile, stored.dry_run) == (
+        scan_record.profile,
+        scan_record.dry_run,
+    )
+
+
+def test_the_record_reads_the_current_attempts_and_goes_stale_when_cells_runs_again(
+    tmp_path: Path, sf: ModuleType
+) -> None:
+    seed = _row_of_three(tmp_path)
+    doc, record = _record_of(sf, seed)
+    assert {slot: (r.plugin, r.attempt) for slot, r in record.reads.items()} == {
+        slot: (doc.provider(slot).plugin, doc.provider(slot).attempt)
+        for slot in ("scan-plan", "scan", "cells")
+    }
+    copy = tmp_path / "run-selected.json"
+    sf.write_copy(seed.path, copy, record)
+    assert RunDocument.load(copy).is_stale("route-prototype") is False
+    _cells_run_again(copy, seed, attempt="a2")
+    assert RunDocument.load(copy).is_stale("route-prototype") is True
+
+
+def _cells_run_again(path: Path, seed: Seed, *, attempt: str) -> None:
+    """``cells`` run again: a new attempt of the stage, later than the first."""
+    write_record(path, "cells", "cells", seed.result, attempt=attempt, day=29)
+
+
+def test_an_older_route_record_stays_in_the_copy_and_loses(
+    tmp_path: Path, sf: ModuleType
+) -> None:
+    seed = _row_of_three(tmp_path)
+    older = _result(sf, seed, fields_per_well=1)
+    write_record(seed.path, "route", "route", older)
+    doc, prototype = _record_of(sf, seed)
+    copy = tmp_path / "run-selected.json"
+    sf.write_copy(seed.path, copy, prototype)
+    written = RunDocument.load(copy)
+    assert written.stages["route"] == doc.stages["route"]
+    assert (
+        len(RouteResult.model_validate(written.stages["route"].result).positions) == 1
+    )
+    assert written.provider("route").plugin == "route-prototype"
+
+
+def test_no_absolute_path_reaches_the_record(tmp_path: Path, sf: ModuleType) -> None:
+    seed = _row_of_three(tmp_path)
+    _, record = _record_of(sf, seed)
+    assert str(tmp_path) not in json.dumps(record.model_dump(mode="json"))
+    assert str(tmp_path.parent) not in json.dumps(record.model_dump(mode="json"))
+
+
+def test_the_copy_is_refused_when_it_is_the_original(
+    tmp_path: Path, sf: ModuleType
+) -> None:
+    seed = _row_of_three(tmp_path)
+    with pytest.raises(sf.Refusal, match="original"):
+        sf.check_copy_target(seed.path, seed.path)
+    link = tmp_path / "hard.json"
+    try:
+        os.link(seed.path, link)
+    except OSError:
+        pytest.skip("this file system has no hard links")
+    with pytest.raises(sf.Refusal, match="original"):
+        sf.check_copy_target(seed.path, link)  # the same file under another name
+
+
+def test_the_copy_is_refused_when_its_folder_is_missing_or_it_is_a_folder(
+    tmp_path: Path, sf: ModuleType
+) -> None:
+    seed = _row_of_three(tmp_path)
+    with pytest.raises(sf.Refusal, match="folder"):
+        sf.check_copy_target(seed.path, tmp_path / "missing" / "copy.json")
+    (tmp_path / "a-folder").mkdir()
+    with pytest.raises(sf.Refusal, match="folder"):
+        sf.check_copy_target(seed.path, tmp_path / "a-folder")
+    sf.check_copy_target(seed.path, tmp_path / "fine.json")  # no error
+
+
+def test_a_copy_that_cannot_be_completed_is_removed(
+    tmp_path: Path, sf: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed = _row_of_three(tmp_path)
+    _, prototype = _record_of(sf, seed)
+    copy = tmp_path / "run-selected.json"
+
+    def fail(path: Path, rec: object) -> None:
+        raise RunDocumentError(
+            path, "could not be written (disk full); it is as it was"
+        )
+
+    monkeypatch.setattr(sf, "write_stage", fail)
+    with pytest.raises(RunDocumentError):
+        sf.write_copy(seed.path, copy, prototype)
+    # A copy without the record would read as the original with a route nobody chose.
+    assert not copy.exists()
