@@ -147,6 +147,14 @@ class PlateResult(PluginResult):
     by ``method="wall-images"`` only; the ``refs`` of that method are the
     fitted well centres, and its ``fit`` is ``None``. A result written before
     ``walls`` existed has none, and still validates.
+
+    ``objective`` is the turret label of the objective the plate's positions
+    were taken with (m3 §18.1): two objectives do not centre the same feature
+    at the same stage position, so a tool that uses the plate with another
+    one needs to know which it was. ``None`` is *unknown*, not "the one in
+    place": a stand with no turret, and every result written before ``objective``
+    existed. It is the plate's own objective for every method, and has a
+    default so that older run documents still load.
     """
 
     plate: str
@@ -159,6 +167,7 @@ class PlateResult(PluginResult):
     refs: tuple[WellRef, ...] = ()
     fit: LatticeFit | None = None
     walls: WallImages | None = None
+    objective: str | None = None
 
     @field_validator("plate")
     @classmethod
