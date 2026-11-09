@@ -338,7 +338,8 @@ def test_a_document_that_saves_nothing_but_refused_a_plugin_says_so() -> None:
 
 #: Per plugin, recorded values that differ from every default (a field per case at
 #: least), and that its ``Params`` accepts. ``cells`` has two cases because
-#: ``detector="blobs"`` refuses a ``model_path`` and a ``device``.
+#: ``detector="blobs"`` refuses a ``model_path``, a ``device`` and the model's
+#: pre-processing (``model_um_per_px``, the percentiles, ``checked_um_per_px``).
 CASES: dict[str, list[dict[str, Any]]] = {
     "camera-calibration": [
         {"step_um": 12.5, "settle_ms": 30.0, "from_run_doc": "C:\\runs\\a b\\run.json"}
@@ -350,7 +351,15 @@ CASES: dict[str, list[dict[str, Any]]] = {
             "max_overlap": 0.55,
             "merge_radius_um": 7.5,
         },
-        {"detector": "model", "model_path": "/x/w.pt", "device": "cpu"},
+        {
+            "detector": "model",
+            "model_path": "/x/w.pt",
+            "device": "cpu",
+            "model_um_per_px": 0.49,
+            "low_percentile": 1.0,
+            "high_percentile": 99.0,
+            "checked_um_per_px": 0.2756,
+        },
     ],
     "density": [{"area_grid_um": 12.5}],
     "goto-well": [{"well": "B2", "side": "-X"}],

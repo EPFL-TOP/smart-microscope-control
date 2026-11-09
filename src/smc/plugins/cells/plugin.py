@@ -47,10 +47,13 @@ from smc.plugins.cells.algorithm import (
 from smc.plugins.cells.detector import (
     BLOB_DETECTOR,
     BLOB_DETECTOR_IDENTITY,
+    DEFAULT_PREPROCESSING,
     BlobDetector,
     Detector,
+    Preprocessing,
     default_model_path,
     load_detector,
+    model_input_size_px,
 )
 from smc.plugins.errors import PluginRunError
 from smc.plugins.slots import (
@@ -84,6 +87,13 @@ _BLOB_ASSUMED = (
     "round spots for the synthetic plate of the demo-sample profile; on a real "
     "sample its counts are not cells",
 )
+#: What the model was trained with (``normalize_plane``'s defaults), as the parameters'
+#: defaults: a stand that sets none of them gets the model as it was trained.
+_TRAINED_LOW_PERCENTILE = DEFAULT_PREPROCESSING.percentiles[0]
+_TRAINED_HIGH_PERCENTILE = DEFAULT_PREPROCESSING.percentiles[1]
+#: A scan whose pixel size is further than this, relative to the checked one, from the
+#: pixel size the model was measured at is not covered by that measurement.
+_CHECKED_TOLERANCE = 0.05
 
 
 class CellsParams(PluginParams):
@@ -128,11 +138,53 @@ class CellsParams(PluginParams):
             "Cells of two fields within this distance are one cell; 0 merges nothing."
         ),
     )
+    model_um_per_px: float | None = Field(
+        None,
+        gt=0.0,
+        le=10.0,
+        description=(
+            "The pixel size the model sees, in µm: each frame is resized to it (the "
+            "frame's pixel size over this one). Unset keeps the model's own resize "
+            "(800 px). Refused with detector=blobs."
+        ),
+    )
+    low_percentile: float = Field(
+        _TRAINED_LOW_PERCENTILE,
+        ge=0.0,
+        lt=50.0,
+        description=(
+            "The intensity at this percentile of a frame is black for the model, as "
+            "it was trained (0.5). Refused with detector=blobs unless it is 0.5."
+        ),
+    )
+    high_percentile: float = Field(
+        _TRAINED_HIGH_PERCENTILE,
+        gt=50.0,
+        le=100.0,
+        description=(
+            "The intensity at this percentile of a frame is white for the model, as "
+            "it was trained (99.5). Refused with detector=blobs unless it is 99.5."
+        ),
+    )
+    checked_um_per_px: float | None = Field(
+        None,
+        gt=0.0,
+        le=10.0,
+        description=(
+            "The frames' pixel size, in µm, at which this model and these parameters "
+            "were measured against annotated frames (scripts/dev/cells_check.py). It "
+            "changes nothing in the detection: the result says so when the scan's "
+            "pixel size is not within 5 % of it, or when it is unset. Refused with "
+            "detector=blobs."
+        ),
+    )
 
     @model_validator(mode="after")
     def _blobs_take_no_weights_and_no_gpu(self) -> CellsParams:
         # The blob detector is numpy: a path or a GPU asked for next to it would
         # be silently ignored, and the run would not be the one that was asked for.
+        # The same goes for what only the model has: a resize, percentiles that
+        # scale its input, and a pixel size it was checked at.
         if self.detector == "blobs":
             if self.model_path is not None:
                 raise ValueError(
@@ -143,6 +195,30 @@ class CellsParams(PluginParams):
                 raise ValueError(
                     f"the blob detector runs on the cpu, not on {self.device}: "
                     "remove device, or use detector=model"
+                )
+            if self.model_um_per_px is not None:
+                raise ValueError(
+                    "model_um_per_px is for detector=model: the blob detector does "
+                    "not resize the frame; remove model_um_per_px, or use "
+                    "detector=model"
+                )
+            if self.checked_um_per_px is not None:
+                raise ValueError(
+                    "checked_um_per_px is for detector=model: the blob detector is "
+                    "not a trained model that was checked; remove "
+                    "checked_um_per_px, or use detector=model"
+                )
+            if self.low_percentile != _TRAINED_LOW_PERCENTILE:
+                raise ValueError(
+                    "low_percentile is for detector=model: the blob detector does "
+                    "not scale its input by percentiles; remove low_percentile, or "
+                    "use detector=model"
+                )
+            if self.high_percentile != _TRAINED_HIGH_PERCENTILE:
+                raise ValueError(
+                    "high_percentile is for detector=model: the blob detector does "
+                    "not scale its input by percentiles; remove high_percentile, "
+                    "or use detector=model"
                 )
         return self
 
@@ -215,8 +291,14 @@ class CellsPlugin:
                 if params.model_path is not None
                 else default_model_path()
             )
+            # The input size is worked out first: a size the model is never given is
+            # refused before 166 MB of weights are read for it.
+            preprocessing = _preprocessing(params, scan)
             detector = load_detector(
-                weights, device=params.device, score_threshold=params.score_threshold
+                weights,
+                device=params.device,
+                score_threshold=params.score_threshold,
+                preprocessing=preprocessing,
             )
             model = weights.name
             sha256 = _sha256(weights)
@@ -296,7 +378,11 @@ class CellsPlugin:
             merged=merged,
             seconds_per_frame=sum(seconds) / len(seconds) if seconds else None,
             assumed=(
-                *(_BLOB_ASSUMED if params.detector == "blobs" else ()),
+                *(
+                    _BLOB_ASSUMED
+                    if params.detector == "blobs"
+                    else _unchecked(params, scan)
+                ),
                 *(
                     (
                         f"cells within {radius:g} µm seen by two fields are counted "
@@ -307,6 +393,58 @@ class CellsPlugin:
                 ),
             ),
         )
+
+
+def _preprocessing(params: CellsParams, scan: ScanResult) -> Preprocessing:
+    """What is done to a frame before the model: its percentiles and, if asked, its input size.
+
+    The frame's pixel size is ``scan.pixel_size_um``, the scan plan's, and not one
+    derived from the matrix; the frame is shown to the model at ``model_um_per_px``.
+    Without it the model keeps its own resize.
+
+    Raises:
+        PluginRunError: The size is outside what the model is given. The message
+            names ``model_um_per_px`` and the size it would have been.
+    """
+    size: tuple[int, int] | None = None
+    if params.model_um_per_px is not None:
+        try:
+            size = model_input_size_px(
+                scan.image_shape_px, scan.pixel_size_um, params.model_um_per_px
+            )
+        except ValueError as exc:
+            raise PluginRunError(
+                _NAME,
+                f"model_um_per_px={params.model_um_per_px:g} cannot be used: {exc}",
+            ) from exc
+    return Preprocessing(
+        percentiles=(params.low_percentile, params.high_percentile), input_size_px=size
+    )
+
+
+def _unchecked(params: CellsParams, scan: ScanResult) -> tuple[str, ...]:
+    """The line that says the model was not measured at this scan's pixel size, or none.
+
+    The measurement of a model on annotated frames (``scripts/dev/cells_check.py``)
+    holds for the pixel size of those frames. ``checked_um_per_px`` is the stand's
+    record of it: unset, nothing was measured; set and further than 5 % from the
+    scan's pixel size, the counts of this scan are at a pixel size nobody measured.
+    The test is written so that a number that is not one says it (FM-104).
+    """
+    checked = params.checked_um_per_px
+    if checked is None:
+        return (
+            "the model's detections were not measured on frames of this stand: "
+            "checked_um_per_px is not set (docs/plugins/cells.md)",
+        )
+    pixel = scan.pixel_size_um
+    if not abs(pixel / checked - 1.0) <= _CHECKED_TOLERANCE:
+        return (
+            f"the frames are at {pixel:.4g} µm per pixel and the model was checked "
+            f"at {checked:.4g} µm per pixel: its counts at this pixel size are not "
+            f"measured",
+        )
+    return ()
 
 
 def _sha256(path: Path) -> str:
