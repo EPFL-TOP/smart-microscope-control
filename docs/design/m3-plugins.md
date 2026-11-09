@@ -5283,7 +5283,12 @@ scikit-image 0.26.0, Python 3.13.0.
   one, with no timing in the test. A `plate` record rewritten with
   `write_stage(path, StageRecord.model_validate({**record.model_dump(
   mode="json"), "result": changed}))` stays usable (`unusable` is `None`) and
-  validates as a `PlateResult`.
+  validates as a `PlateResult`. `PlateSample.render` replaced at class level
+  by a wrapper that records `(x_um, y_um)` and calls the original sees every
+  snap of the demo-sample camera. Two snaps at one place are **not** equal
+  (the noise is drawn per snap), and the demo stage reads `(123.495,
+  −45.255)` after a move to `(123.5, −45.25)`: a test compares with the
+  readback, never with the target (FM-142).
 - **tomli-w 1.0.0** (the floor of `pyproject.toml`) writes `{"objectives":
   ...}` as an `[objectives]` table and one `[objectives.offsets."<label>"]`
   table per entry, each array one number per line, a label with `"` and `\`
@@ -5814,9 +5819,12 @@ class StandSampleCamera:  # __init__ gains the keyword
   and the blank label; `tests/unit/test_sample_stand.py` gains the fourth
   line of `sample_lines`.
 - `tests/test_demo_sample_demo.py` gains
-  `test_an_objective_shift_moves_what_the_camera_sees`: under 40X with a
-  shift `(−32.5, 9.75)`, the frame at `p + shift` equals the frame of a stand
-  without the shift at `p`; under 10X, with no entry, the frames are equal.
+  `test_an_objective_shift_moves_where_the_sample_is_rendered`
+  (`PlateSample.render` patched at class level to record its first two
+  arguments, §20.1; frames are not compared, since two snaps at one place
+  differ by their noise): under 40X with a shift `(−32.5, 9.75)` the sample
+  is rendered at the stage's readback minus the shift, under 10X, with no
+  entry, at the readback itself.
 - `tests/test_objective_offsets_demo.py` (new), on the demo-sample stand
   (`profiles/demo-sample.toml` with `[sample]` turned as §20.1: camera 30°
   and mirrored, plate 1.2°, shifts 10X `(5.0, −2.5)`, 20X `(0.0, 0.0)`, 40X
