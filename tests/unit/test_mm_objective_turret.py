@@ -416,8 +416,9 @@ def test_offset_without_a_reference_in_the_profile_is_unknown_for_every_label() 
 def test_offset_answers_while_another_action_holds_the_lock_and_after_a_stop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # m2 §13.4: no lock, no executor. A snap holds the lock; a read through the
-    # executor would queue behind it.
+    # m2 §13.4: the offset is not an action: no lock, and no refusal after a stop.
+    # A snap holds the lock, so an action would queue behind it (a read does not:
+    # `Executor.read` is the bare call, so the test cannot tell a read from none).
     with ti2(_profile_with_offsets()) as (core, microscope):
         turret = microscope.require(ObjectiveTurret)
         with lock_held_by_a_snap(core, microscope, monkeypatch) as queued:
