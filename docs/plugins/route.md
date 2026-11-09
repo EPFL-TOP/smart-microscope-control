@@ -251,6 +251,12 @@ smc run nis-export -p <profile> --run-doc run-selected.json
 Every option is bounded and refused with `select_fields: <option> must be ...` before
 any file is read. The exit code is 0 when everything was done, 1 when a file could not
 be written (the table was printed, and the other files were written), 2 for a refusal.
+A folder for `--out-dir` that cannot be made costs `selection.json` and the pictures,
+and not the copy, which does not go in it. If what reads the table goes away (`| more`,
+then `q`), the table stops and the files are written all the same.
+
+In **PowerShell** quote a comma list: `--wells "B2,B11"`, `--labels "single,doublet"`;
+unquoted, PowerShell passes the two words as two arguments.
 
 **Iterating on the weights.** Each run reads the wells' frames again, once each: about
 0.02 s for a 1412² frame with a warm cache (measured while planning, on an Apple M-series
@@ -331,6 +337,12 @@ columns are `n` (wanted cells), `dens/mm2`, `iso` (the isolated count), `purity`
   the autofocus search had got to), and the result says how many were left out. A frame
   that cannot be read (missing, corrupt, of another shape than the scan's) is counted,
   skipped and said; it is not a candidate for a pixel weight and stays one otherwise.
+  The table gives the first reason in the system's words (`the file is missing`,
+  `Permission denied`) and never a path of this PC: it is pasted into reports.
+- The last line printed gives the command that exports the copy, with the scan's
+  profile (`smc run` defaults to the demo, and `nis-export` refuses a route run on
+  another profile). A path that is not ASCII is not printed as an escape: the line says
+  to take it from the one above.
 - The score and the copy are the **owner's** to judge; nothing here is tuned, and
   `assumed` in the copy's record names the weights, the spacing and that the positions
   are the scan's own frames and not a lattice.

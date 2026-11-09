@@ -190,12 +190,13 @@ def seed_run(
     dry_run: bool = False,
     plan_matrix: Matrix2 | None = None,
     plan_shape: tuple[int, int] | None = None,
+    plan_objective: str | None = "the scan's",
 ) -> Seed:
     """The plan, the scan and the cells of ``wells``, in ``tmp_path/run.json``.
 
-    ``plan_matrix`` and ``plan_shape`` are the camera the plan was laid for when it is
-    not the scan's (the prototype must take the scan's, FM-124, so a test that wants to
-    know says them different).
+    ``plan_matrix``, ``plan_shape`` and ``plan_objective`` are the camera, the frame and
+    the objective the plan was laid for when they are not the scan's (the prototype must
+    take the scan's, FM-124, so a test that wants to know says them different).
 
     ``cells`` is a list, or a function of the scan when the cells are placed
     relative to its frames (their positions are the plan's, which the test cannot
@@ -236,7 +237,7 @@ def seed_run(
     plan = ScanPlanResult(
         plate_plan=plate_plan,
         wells=wells,
-        objective=scan_objective,
+        objective=scan_objective if plan_objective == "the scan's" else plan_objective,
         pixel_size_um=PIXEL_UM,
         matrix_um_per_px=laid,
         matrix_source="parameter",

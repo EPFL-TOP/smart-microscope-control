@@ -90,6 +90,7 @@ from smc.plugins.slots import (
     CellsResult,
     RoutePosition,
     RouteResult,
+    ScanFrame,
     ScanPlanResult,
     ScanResult,
     WellGeometry,
@@ -1311,12 +1312,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("run_doc", help="a run document with scan-plan, scan and cells")
     parser.add_argument(
-        "--wells", help="comma separated wells to run (default: every scanned well)"
+        "--wells",
+        help=(
+            "comma separated wells to run (default: every scanned well); in "
+            'PowerShell quote the list: --wells "B2,B11"'
+        ),
     )
     parser.add_argument(
         "--labels",
         default="single",
-        help="comma separated wanted classes of the cells stage (default: single)",
+        help=(
+            "comma separated wanted classes of the cells stage (default: single); "
+            'in PowerShell quote the list: --labels "single,doublet"'
+        ),
     )
     parser.add_argument(
         "--weight",
@@ -1651,7 +1659,7 @@ def read_pixels(
                 if pixels is not None:
                     tile = block_mean(raw, reduction)
             except Exception as exc:
-                problem = f"{frame.file}: {exc}"
+                problem = _frame_problem(frame, exc, run_dir)
             if problem:
                 stats[position] = None
                 found.unreadable += 1
@@ -1679,8 +1687,50 @@ def _ascii(text: str) -> str:
     return text.encode("ascii", "backslashreplace").decode("ascii")
 
 
+#: Whether stdout still has a reader. The table is printed before any file is written
+#: (FM-30), so a reader that goes away (``| more``, then q) must not end the run before
+#: the files are: after the first failed ``print`` nothing more is printed.
+_CONSOLE = {"open": True}
+
+
 def _say(line: str = "") -> None:
-    print(_ascii(line))
+    if not _CONSOLE["open"]:
+        return
+    try:
+        print(_ascii(line))
+    except (OSError, ValueError):  # a broken pipe, or a stream that was closed
+        _CONSOLE["open"] = False
+
+
+def _pasteable(text: str, placeholder: str) -> str:
+    """``text`` in double quotes, which cmd, PowerShell and a POSIX shell all read as one word; the placeholder when it cannot be pasted.
+
+    Everything printed is ASCII (FM-20), so a name with an accent would be shown as an
+    escape that is not the name: the placeholder says to take it from the line above.
+    """
+    if _ascii(text) != text or '"' in text:
+        return placeholder
+    return f'"{text}"'
+
+
+def _frame_problem(frame: ScanFrame, exc: Exception, run_dir: Path) -> str:
+    """Why a frame could not be read, without a path of this PC: the table is pasted into public reports (FM-50).
+
+    A missing file and an ``OSError`` say what the system said and not its text, which
+    quotes the file's absolute path; any other message is scrubbed of the run folder.
+    """
+    if isinstance(exc, FileNotFoundError):
+        reason = "the file is missing"
+    elif isinstance(exc, OSError):
+        reason = exc.strerror or type(exc).__name__
+    else:
+        reason = str(exc)
+    folders = {str(run_dir), run_dir.as_posix()}
+    with contextlib.suppress(OSError):
+        folders.add(str(run_dir.resolve()))
+    for folder in sorted(folders, key=len, reverse=True):
+        reason = reason.replace(folder, "<run folder>")
+    return f"{frame.file}: {reason}"
 
 
 def _finite(value: float | None) -> float | None:
@@ -1909,6 +1959,7 @@ def run(argv: Sequence[str] | None) -> int:
         0 when everything was done, 1 when a file could not be written, 2 on a refusal
         (raised as ``Refusal`` for ``main`` to print).
     """
+    _CONSOLE["open"] = True
     request = parse_request(argv)
     run_doc = request.run_doc
     try:
@@ -2031,30 +2082,34 @@ def _write_files(
             _ascii(f"select_fields: could not write {what}: {reason}"), file=sys.stderr
         )
 
+    # A folder that cannot be made costs the files that go in it and nothing else: the
+    # copy does not depend on it, and it is the file `nis-export` needs (FM-34).
     try:
         request.out_dir.mkdir(parents=True, exist_ok=True)
+        out_ready = True
     except OSError as exc:
         fail(request.out_dir, exc)
-        return True
+        out_ready = False
     target = request.out_dir / _SELECTION_FILE
-    try:
-        write_selection(
-            target,
-            selection_document(
-                run_name=request.run_doc.name,
-                request=request,
-                options=options,
-                choices=choices,
-                orders=orders,
-                pixels=request.pixels,
-            ),
-        )
-        _say(f"wrote {target}")
-    except OSError as exc:
-        fail(target, exc)
+    if out_ready:
+        try:
+            write_selection(
+                target,
+                selection_document(
+                    run_name=request.run_doc.name,
+                    request=request,
+                    options=options,
+                    choices=choices,
+                    orders=orders,
+                    pixels=request.pixels,
+                ),
+            )
+            _say(f"wrote {target}")
+        except OSError as exc:
+            fail(target, exc)
 
     scan = upstream.scan
-    if request.png:
+    if request.png and out_ready:
         weights = " ".join(
             f"{name}={options.weights[name]:g}"
             for name in WEIGHT_NAMES
@@ -2104,7 +2159,8 @@ def _write_files(
             write_copy(request.run_doc, request.copy_path, record)
             _say(
                 f"wrote {request.copy_path} (export it with: smc run nis-export "
-                f"--run-doc {request.copy_path})"
+                f"-p {_pasteable(upstream.profile, '<the profile above>')} "
+                f"--run-doc {_pasteable(str(request.copy_path), '<the copy named above>')})"
             )
         except (OSError, RunDocumentError) as exc:
             fail(request.copy_path, exc)

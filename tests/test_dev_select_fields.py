@@ -13,6 +13,7 @@ import itertools
 import json
 import math
 import os
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from types import ModuleType
@@ -2381,3 +2382,766 @@ def test_the_picture_of_a_well_puts_the_frames_where_the_stage_says(
     )
     col, row = _canvas_pixel_of(canvas, *opposite)
     assert image.getpixel((round(col), round(row))) == (0, 0, 0)
+
+
+# ------------------------------------------- what the review of #343 found missing
+#
+# Each test below kills mutants that survived the first version of the suite: the
+# options that were never given a non-default value through ``main``, the drawing's
+# elements, the values of the table and of ``selection.json``, the scan's own profile,
+# objective and frame in the record, and the failures of a write or of a console.
+
+
+def _grid_of_nine(tmp_path: Path, counts: Sequence[int] = (1,)) -> Seed:
+    """3 x 3 touching fields (400 x 300 um, 400 um and 300 um apart), frame k holding ``counts[k % len(counts)]`` singles."""
+
+    def cells(scan: ScanResult) -> list[Cell]:
+        return [
+            Cell(
+                well="A1",
+                x_um=frame.x_um - 60.0 + 40.0 * i,
+                y_um=frame.y_um,
+                label="single",
+                score=0.9,
+                frame=k,
+                box_px=(0.0, 0.0, 10.0, 10.0),
+            )
+            for k, frame in enumerate(scan.frames)
+            for i in range(counts[k % len(counts)])
+        ]
+
+    return seed_run(tmp_path, cells=cells, rows=3, columns=3, overlap=0.0)
+
+
+def _chosen_frames(seed: Seed, copy: Path) -> list[int]:
+    """The frames the copy's stops are at, by readback, in route order."""
+    where = {(f.x_um, f.y_um): k for k, f in enumerate(seed.scan.frames)}
+    return [where[(s.x_um, s.y_um)] for s in _stops_of(copy)]
+
+
+def _selection_json(folder: Path) -> dict:
+    return json.loads((folder / "selection.json").read_text(encoding="utf-8"))
+
+
+def test_the_wall_margin_reaches_the_choice(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The farthest corner of the nine fields is 250 um (centre), 493 (above and below),
+    # 619 (left and right) or 751 (corners) from the well's centre in a well of 3200 um:
+    # a margin of 2800 um leaves the centre field alone, and the default leaves all nine.
+    seed = _grid_of_nine(tmp_path)
+    copy = tmp_path / "run-selected.json"
+    assert _main(sf, capsys, seed.path, "--min-spacing-um", "30")[0] == 0
+    assert sorted(_chosen_frames(seed, copy)) == list(range(9))
+    code, _, _ = _main(
+        sf, capsys, seed.path, "--min-spacing-um", "30", "--wall-margin-um", "2800"
+    )
+    assert code == 0
+    assert _chosen_frames(seed, copy) == [4]
+    assert (
+        _selection_json(tmp_path / "selection")["options"]["wall_margin_um"] == 2800.0
+    )
+
+
+def test_the_excluded_centre_reaches_the_choice(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Only the middle field of the nine covers the well's centre: with a disc of 100 um
+    # excluded it goes, and the eight others (the nearest edge is 150 um off) stay.
+    seed = _grid_of_nine(tmp_path)
+    copy = tmp_path / "run-selected.json"
+    code, _, _ = _main(
+        sf, capsys, seed.path, "--min-spacing-um", "30", "--exclude-centre-um", "100"
+    )
+    assert code == 0
+    assert sorted(_chosen_frames(seed, copy)) == [0, 1, 2, 3, 5, 6, 7, 8]
+    assert (
+        _selection_json(tmp_path / "selection")["options"]["exclude_centre_um"] == 100.0
+    )
+
+
+def test_min_cells_reaches_the_choice(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Frames hold 1, 2, 4, 1, 2, 4, 1, 2, 4 cells.
+    seed = _grid_of_nine(tmp_path, counts=(1, 2, 4))
+    copy = tmp_path / "run-selected.json"
+    for minimum, expected in [("2", [1, 2, 4, 5, 7, 8]), ("3", [2, 5, 8])]:
+        code, _, _ = _main(
+            sf, capsys, seed.path, "--min-spacing-um", "30", "--min-cells", minimum
+        )
+        assert code == 0
+        assert sorted(_chosen_frames(seed, copy)) == expected, minimum
+        assert _selection_json(tmp_path / "selection")["options"]["min_cells"] == int(
+            minimum
+        )
+
+
+def test_min_score_reaches_the_choice(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The density alone scores the 1, 2 and 4 cell frames 0.25, 0.5 and 1: a bar of 0.4
+    # drops the first, a bar of 0.9 the first two.
+    seed = _grid_of_nine(tmp_path, counts=(1, 2, 4))
+    copy = tmp_path / "run-selected.json"
+    for bar, expected in [("0.4", [1, 2, 4, 5, 7, 8]), ("0.9", [2, 5, 8])]:
+        code, _, _ = _main(
+            sf, capsys, seed.path, "--min-spacing-um", "30", "--min-score", bar
+        )
+        assert code == 0
+        assert sorted(_chosen_frames(seed, copy)) == expected, bar
+        assert _selection_json(tmp_path / "selection")["options"]["min_score"] == float(
+            bar
+        )
+
+
+def test_the_labels_reach_the_choice_and_the_counts(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A1 holds singles and A2 holds doublets only: the wanted class decides which wells
+    # have stops, and every wanted label is a key of every stop's counts.
+    def cells(scan: ScanResult) -> list[Cell]:
+        return [
+            Cell(
+                well=frame.well,
+                x_um=frame.x_um,
+                y_um=frame.y_um,
+                label="single" if frame.well == "A1" else "doublet",
+                score=0.9,
+                frame=k,
+                box_px=(0.0, 0.0, 10.0, 10.0),
+            )
+            for k, frame in enumerate(scan.frames)
+        ]
+
+    seed = seed_run(
+        tmp_path, cells=cells, wells=("A1", "A2"), rows=1, columns=3, overlap=0.0
+    )
+    copy = tmp_path / "run-selected.json"
+    assert _main(sf, capsys, seed.path, "--min-spacing-um", "30")[0] == 0
+    assert {s.well for s in _stops_of(copy)} == {"A1"}
+    code, _, _ = _main(
+        sf, capsys, seed.path, "--min-spacing-um", "30", "--labels", "single,doublet"
+    )
+    assert code == 0
+    stops = _stops_of(copy)
+    assert len(stops) == 6
+    assert all(set(s.counts) == {"single", "doublet"} for s in stops)
+    assert [s.counts for s in stops if s.well == "A1"] == [
+        {"single": 1, "doublet": 0}
+    ] * 3
+    assert [s.counts for s in stops if s.well == "A2"] == [
+        {"single": 0, "doublet": 1}
+    ] * 3
+    assert _selection_json(tmp_path / "selection")["labels"] == ["single", "doublet"]
+    result = RouteResult.model_validate(
+        RunDocument.load(copy).stages["route-prototype"].result
+    )
+    assert result.labels == ("single", "doublet")
+
+
+def test_the_picture_main_writes_is_the_one_render_png_draws_for_the_same_arguments(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from PIL import Image
+
+    # A camera turned 30 degrees and mirrored, on a frame that is not square; singles
+    # (wanted) in the first and third field, a doublet (not wanted) in the middle one.
+    # The expected picture is drawn here by ``render_png`` itself, from the seed's own
+    # camera, shape, cells, classes and stops, so that every argument `_write_files`
+    # hands it is compared with one written independently (FM-124): the matrix, the
+    # shape (transposed, the footprints are not the same), the cells, the wanted
+    # classes, the stop numbers and the caption.
+    matrix = matrix_of(PIXEL_UM, 30.0, True)
+
+    def cells(scan: ScanResult) -> list[Cell]:
+        frames = scan.frames
+        return [
+            Cell(
+                well="A1",
+                x_um=frames[k].x_um,
+                y_um=frames[k].y_um,
+                label=label,
+                score=0.9,
+                frame=k,
+                box_px=(0.0, 0.0, 10.0, 10.0),
+            )
+            for k, label in ((0, "single"), (1, "doublet"), (2, "single"))
+        ]
+
+    seed = seed_run(
+        tmp_path, cells=cells, rows=1, columns=3, overlap=0.0, matrix=matrix
+    )
+    code, _, _ = _main(
+        sf,
+        capsys,
+        seed.path,
+        "--no-pixels",
+        "--png-max-px",
+        "800",
+        "--min-spacing-um",
+        "30",
+    )
+    assert code == 0
+    first, _, last = seed.scan.frames
+    assert _chosen_frames(seed, tmp_path / "run-selected.json") == [0, 2]
+    geometry = _geometry(seed)
+    canvas = sf.canvas_of(geometry, 800)
+    expected = sf.render_png(
+        np.full((canvas.height_px, canvas.width_px), 40, dtype=np.uint8),
+        canvas,
+        geometry,
+        cells=list(seed.cells),
+        classes=CLASSES,
+        wanted=("single",),
+        stops=[(0, first.x_um, first.y_um), (1, last.x_um, last.y_um)],
+        matrix=matrix,
+        image_shape_px=SHAPE,
+        caption="A1: 2 fields, density=1",
+    )
+    actual = Image.open(tmp_path / "selection" / "A1.png")
+    actual.load()
+    assert actual.size == expected.size
+    assert np.array_equal(np.asarray(actual), np.asarray(expected))
+    # The control that the comparison can fail: the same picture with stop numbers 7 and 8.
+    other = sf.render_png(
+        np.full((canvas.height_px, canvas.width_px), 40, dtype=np.uint8),
+        canvas,
+        geometry,
+        cells=list(seed.cells),
+        classes=CLASSES,
+        wanted=("single",),
+        stops=[(7, first.x_um, first.y_um), (8, last.x_um, last.y_um)],
+        matrix=matrix,
+        image_shape_px=SHAPE,
+        caption="A1: 2 fields, density=1",
+    )
+    assert not np.array_equal(np.asarray(other), np.asarray(expected))
+
+
+def test_the_png_draws_the_wall_the_route_and_the_caption(
+    sf: ModuleType, tmp_path: Path
+) -> None:
+    # Two fields a vertical gap apart (their footprints do not touch the segment's
+    # middle), so that the route's line is not under a green edge there.
+    canvas, image = _render(
+        sf, tmp_path, stops=[(0, 900.0, -300.0), (1, 1100.0, -700.0)]
+    )
+    blue, route = (90, 90, 255), (255, 255, 160)
+
+    def around(x_um: float, y_um: float) -> set[tuple[int, int, int]]:
+        col, row = _canvas_pixel_of(canvas, x_um, y_um)
+        return {
+            image.getpixel((round(col) + dc, round(row) + dr))
+            for dc in (-1, 0, 1)
+            for dr in (-1, 0, 1)
+        }
+
+    # The wall is the disc of 500 um round (1000, -500): four of its points.
+    for x, y in [(1500.0, -500.0), (500.0, -500.0), (1000.0, 0.0), (1000.0, -1000.0)]:
+        assert blue in around(x, y), (x, y)
+    # The middle of the route's segment.
+    assert route in around(1000.0, -500.0)
+    # The caption is white text in the top-left corner (dark grey everywhere else there).
+    corner = [image.getpixel((x, y)) for x in range(0, 90) for y in range(0, 22)]
+    assert any(min(pixel) > 150 for pixel in corner)
+    _, bare = _render(sf, tmp_path, stops=[])
+    assert route not in {bare.getpixel((x, y)) for x in range(800) for y in range(800)}
+
+
+def test_the_png_draws_a_square_wall_turned_by_the_plate(sf: ModuleType) -> None:
+    well = WellGeometry(
+        well="A1",
+        center_um=(1000.0, -500.0),
+        size_um=(400.0, 300.0),
+        circular=False,
+        rotation_deg=17.0,
+    )
+    canvas = sf.canvas_of(well, 800)
+    image = sf.render_png(
+        np.full((canvas.height_px, canvas.width_px), 40, dtype=np.uint8),
+        canvas,
+        well,
+        cells=[],
+        classes=CLASSES,
+        wanted=("single",),
+        stops=[],
+        matrix=UPRIGHT,
+        image_shape_px=SHAPE,
+        caption="",
+    )
+    cos, sin = math.cos(math.radians(17.0)), math.sin(math.radians(17.0))
+    # The plate's rectangle: its corners are the plate's own (+-200, +-150) turned by 17 deg.
+    for u, v in [(-200.0, -150.0), (200.0, -150.0), (200.0, 150.0), (-200.0, 150.0)]:
+        x, y = 1000.0 + cos * u - sin * v, -500.0 + sin * u + cos * v
+        col, row = _canvas_pixel_of(canvas, x, y)
+        near = {
+            image.getpixel((round(col) + dc, round(row) + dr))
+            for dc in (-1, 0, 1)
+            for dr in (-1, 0, 1)
+        }
+        assert (90, 90, 255) in near, (u, v)
+    # A turned wall is not the axis-aligned one: the unturned corner is dark grey.
+    col, row = _canvas_pixel_of(canvas, 1000.0 - 200.0, -500.0 + 150.0)
+    assert image.getpixel((round(col), round(row))) == (40, 40, 40)
+
+
+def _lap_variance_over_median_squared(frame: np.ndarray) -> tuple[float, float]:
+    """The sharpness and the background of the plan, written here from their definition (not the script's)."""
+    f = frame.astype(np.float64)
+    laplacian = (
+        4 * f[1:-1, 1:-1] - f[:-2, 1:-1] - f[2:, 1:-1] - f[1:-1, :-2] - f[1:-1, 2:]
+    )
+    median = float(np.median(f))
+    return float(laplacian.var()) / median**2, median
+
+
+def _features_seed(tmp_path: Path) -> tuple[Seed, list[np.ndarray]]:
+    """Three touching fields whose candidates differ in every feature: counts, purity, spacing, wall, sharpness, background."""
+
+    def single(frame: ScanFrame, dx: float, label: str = "single") -> Cell:
+        return Cell(
+            well="A1",
+            x_um=frame.x_um + dx,
+            y_um=frame.y_um,
+            label=label,
+            score=0.9,
+            frame=0,
+            box_px=(0.0, 0.0, 10.0, 10.0),
+        )
+
+    def cells(scan: ScanResult) -> list[Cell]:
+        f0, f1, f2 = scan.frames
+        return [
+            # four singles at -60, -40, -10 and 60 um and a debris at 90: the nearest
+            # neighbour of each is 20, 20, 30 and 30 um (the median 25 and the minimum
+            # 20 differ), two are isolated at 25 um, and the purity is 4/5
+            single(f0, -60.0),
+            single(f0, -40.0),
+            single(f0, -10.0),
+            single(f0, 60.0),
+            single(f0, 90.0, "debris"),
+            # two singles 100 um apart
+            single(f1, -50.0),
+            single(f1, 50.0),
+            # one single, 350 um from the nearest cell of the well
+            single(f2, 0.0),
+        ]
+
+    frames: list[np.ndarray] = []
+
+    def pixels(frame: ScanFrame) -> np.ndarray:
+        rng = np.random.default_rng(frame.index)
+        # A background of 1000, 2000 and 3000 with noise of 10, 40 and 120: the
+        # sharpness (variance of the Laplacian over the median squared) differs by field.
+        base, spread = [(1000, 10), (2000, 40), (3000, 120)][frame.index]
+        data = (base + rng.integers(-spread, spread + 1, size=SHAPE)).astype(np.uint16)
+        frames.append(data)
+        return data
+
+    seed = seed_run(
+        tmp_path,
+        cells=cells,
+        rows=1,
+        columns=3,
+        overlap=0.0,
+        frame_pixels=pixels,
+    )
+    return seed, frames
+
+
+def test_the_table_and_selection_json_say_the_features_of_each_candidate(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed, arrays = _features_seed(tmp_path)
+    code, out, _ = _main(sf, capsys, seed.path, "--min-spacing-um", "25", "--no-png")
+    assert code == 0
+    # What each field holds, by hand: (wanted, all, isolated at 25 um, nearest neighbour).
+    # The two last numbers are the median and the minimum of the wanted cells' distances.
+    held = {
+        0: (4, 5, 2, 25.0, 20.0),
+        1: (2, 2, 2, 100.0, 100.0),
+        2: (1, 1, 1, 350.0, 350.0),
+    }
+    # The farthest corner: the frames are read back at x = 600.3, 1000.3 and 1400.3 and
+    # y = -500.2, the well's centre is (1000, -500) and a corner is 200 um across and 150
+    # um up or down from the frame's.
+    wall = {
+        k: 3200.0 - math.hypot(across, 150.2)
+        for k, across in enumerate((599.7, 200.3, 600.3))
+    }
+    stats = [_lap_variance_over_median_squared(a) for a in arrays]
+    assert len({round(s, 9) for s, _ in stats}) == 3  # the three frames differ
+    lines = out.splitlines()
+    header = next(
+        i for i, line in enumerate(lines) if line.split()[:2] == ["rank", "frame"]
+    )
+    rows = {}
+    for line in lines[header + 1 :]:
+        if line.strip().startswith("chosen"):
+            break
+        tokens = line.split()
+        rows[int(tokens[1])] = tokens
+    assert sorted(rows) == [0, 1, 2]
+    for k, (n, n_all, isolated, median, _minimum) in held.items():
+        sharp, background = stats[k]
+        # rank frame x_um y_um score n dens/mm2 iso purity nn_um wall_um sharp bg focus stop
+        got = rows[k]
+        assert got[5] == str(n)
+        assert got[6] == f"{n / 0.12:.1f}"
+        assert got[7] == str(isolated)
+        assert got[8] == f"{n / n_all:.2f}"
+        assert got[9] == f"{median:.1f}"  # the table lists the median distance
+        assert got[10] == f"{wall[k]:.0f}"
+        assert got[11] == f"{sharp:.3g}"
+        assert got[12] == f"{background:.1f}"
+        assert got[13] == "locked"
+    data = _selection_json(tmp_path / "selection")["wells"]["A1"]
+    assert data["uncovered"] == 0
+    by_frame = {c["frame"]: c for c in data["candidates"]}
+    for k, (n, n_all, isolated, median, nearest) in held.items():
+        sharp, background = stats[k]
+        c = by_frame[k]
+        assert (c["n_wanted"], c["n_all"], c["isolated"]) == (n, n_all, isolated)
+        assert c["counts"] == {"single": n, "doublet": 0, "debris": n_all - n}
+        assert c["density_per_mm2"] == pytest.approx(n / 0.12)
+        assert c["nn_median_um"] == pytest.approx(median)
+        assert c["nn_min_um"] == pytest.approx(nearest)
+        assert c["wall_um"] == pytest.approx(wall[k])
+        assert c["sharpness"] == pytest.approx(sharp)
+        assert c["background"] == pytest.approx(background)
+
+
+def test_the_table_is_on_stdout_before_the_first_file_is_written(
+    tmp_path: Path,
+    sf: ModuleType,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A write that raised something other than an OSError would end the run, so the table
+    # must already be out when the first file is written (FM-30).
+    seed = _two_wells(tmp_path)
+    seen: dict[str, str] = {}
+    real_selection, real_picture = sf.write_selection, sf.write_picture
+
+    def selection(path: Path, document: object) -> None:
+        seen.setdefault("selection", capsys.readouterr().out)
+        real_selection(path, document)
+
+    def picture(image: object, path: Path) -> None:
+        seen.setdefault("picture", capsys.readouterr().out)
+        real_picture(image, path)
+
+    monkeypatch.setattr(sf, "write_selection", selection)
+    monkeypatch.setattr(sf, "write_picture", picture)
+    assert sf.main([str(seed.path)]) == 0
+    assert set(seen) == {"selection", "picture"}  # both stubs ran
+    assert "== A1:" in seen["selection"]
+    assert "route: 6 stops" in seen["selection"]  # the table's last line
+    assert "wrote" not in seen["selection"]  # and no file had been written yet
+
+
+def test_selection_json_is_ascii_and_refuses_a_nan(
+    sf: ModuleType, tmp_path: Path
+) -> None:
+    path = tmp_path / "selection.json"
+    sf.write_selection(path, {"name": "run-\N{LATIN SMALL LETTER E WITH ACUTE}.json"})
+    text = path.read_bytes().decode("ascii")  # does not raise
+    assert "run-\\u00e9.json" in text
+    with pytest.raises(ValueError, match="Out of range"):
+        sf.write_selection(path, {"x": math.nan})
+
+
+def test_a_write_failure_names_its_file_in_ascii(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed = _two_wells(tmp_path)
+    folder = tmp_path / "s\N{LATIN SMALL LETTER E WITH ACUTE}lection"
+    (folder / "A1.png").mkdir(parents=True)  # a folder where a picture goes
+    code, _, err = _main(sf, capsys, seed.path, "--out-dir", str(folder))
+    assert code == 1
+    err.encode("ascii")  # does not raise: the accent is escaped
+    assert "s\\xe9lection" in err
+
+
+def test_the_record_carries_the_scans_profile_dry_run_objective_and_frame(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The plan names another objective and a transposed frame, the stand is not the demo
+    # and the scan alone was a dry run (a dry run may feed a real one's reads): the record
+    # takes every one of them from the scan, which is what `nis-export` compares (FM-124).
+    seed = seed_run(
+        tmp_path,
+        cells=_one_cell_in_each_frame,
+        rows=1,
+        columns=3,
+        overlap=0.0,
+        profile="nikon-ti2",
+        plan_shape=(80, 60),
+        plan_objective="Plan Apo 40x",
+    )
+    assert seed.plan.objective == "Plan Apo 40x"
+    assert seed.plan.image_shape_px == (80, 60)
+    assert seed.scan.objective != seed.plan.objective
+    _rewritten(
+        seed,
+        lambda stages: {
+            **stages,
+            "scan": stages["scan"].model_copy(update={"dry_run": True}),
+        },
+    )
+    code, _, _ = _main(sf, capsys, seed.path, "--min-spacing-um", "30")
+    assert code == 0
+    stage = RunDocument.load(tmp_path / "run-selected.json").stages["route-prototype"]
+    assert (stage.profile, stage.dry_run) == ("nikon-ti2", True)
+    result = RouteResult.model_validate(stage.result)
+    assert result.objective == seed.scan.objective
+    assert result.image_shape_px == SHAPE
+    assert result.fov_um == pytest.approx(
+        (400.0, 300.0)
+    )  # the plan's would be 300 x 400
+
+
+def test_an_upstream_run_on_another_profile_than_the_scans_is_refused(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed = seed_run(
+        tmp_path,
+        cells=_one_cell_in_each_frame,
+        rows=1,
+        columns=3,
+        overlap=0.0,
+        profile="nikon-ti2",
+    )
+    _rewritten(
+        seed,
+        lambda stages: {
+            **stages,
+            "cells": stages["cells"].model_copy(update={"profile": "demo"}),
+        },
+    )
+    reason = RunDocument.load(seed.path).unusable(
+        "cells", profile="nikon-ti2", dry_run=False
+    )
+    assert reason is not None
+    assert "demo" in reason
+    assert "nikon-ti2" in reason
+    code, out, err = _main(sf, capsys, seed.path)
+    assert (code, out, err) == (2, "", f"select_fields: {reason}\n")
+    assert not (tmp_path / "run-selected.json").exists()
+
+
+def test_a_folder_that_cannot_be_made_costs_its_files_and_not_the_copy(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seed = _two_wells(tmp_path)
+    (tmp_path / "blocker").write_text("a file", encoding="utf-8")
+    inside_a_file = tmp_path / "blocker" / "sub"  # not there, so the pre-check passes
+    code, out, err = _main(sf, capsys, seed.path, "--out-dir", str(inside_a_file))
+    assert code == 1
+    assert "route: 6 stops" in out
+    assert err.startswith("select_fields: could not write")
+    assert (
+        tmp_path / "run-selected.json"
+    ).is_file()  # the copy does not need the folder
+    assert len(_stops_of(tmp_path / "run-selected.json")) == 6
+    assert not inside_a_file.exists()
+
+
+class _GoneReader:
+    """A stdout whose reader went away: every write is a broken pipe."""
+
+    def write(self, text: str) -> int:
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def flush(self) -> None:
+        raise BrokenPipeError(32, "Broken pipe")
+
+
+def test_a_reader_that_goes_away_does_not_cost_the_files(
+    tmp_path: Path,
+    sf: ModuleType,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `select_fields.py run.json | more`, then q: the table cannot be printed, and the
+    # minutes of reading must still end in the files (FM-30).
+    seed = _two_wells(tmp_path)
+    here = sys.stdout
+    monkeypatch.setattr(sys, "stdout", _GoneReader())
+    assert sf.main([str(seed.path)]) == 0
+    monkeypatch.setattr(sys, "stdout", here)
+    for name in ("selection/selection.json", "selection/A1.png", "run-selected.json"):
+        assert (tmp_path / name).is_file(), name
+    assert len(_stops_of(tmp_path / "run-selected.json")) == 6
+    # The next run in the same process prints again.
+    capsys.readouterr()
+    assert sf.main([str(seed.path)]) == 0
+    assert "route: 6 stops" in capsys.readouterr().out
+
+
+def test_the_export_hint_can_be_pasted_and_names_the_scans_profile(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A folder with a space, on a stand that is not the demo: `smc run` defaults to the
+    # demo and `nis-export` refuses a route run on another profile, so the command names
+    # the profile and quotes the path.
+    folder = tmp_path / "Experiment 12"
+    folder.mkdir()
+    seed = seed_run(
+        folder,
+        cells=_one_cell_in_each_frame,
+        rows=1,
+        columns=3,
+        overlap=0.0,
+        profile="nikon-ti2",
+    )
+    code, out, _ = _main(sf, capsys, seed.path, "--no-png")
+    assert code == 0
+    copy = folder / "run-selected.json"
+    last = out.strip().splitlines()[-1]
+    assert last == (
+        f"wrote {copy} (export it with: smc run nis-export "
+        f'-p "nikon-ti2" --run-doc "{copy}")'
+    )
+
+
+def test_an_export_hint_does_not_print_a_path_that_is_not_ascii(
+    tmp_path: Path, sf: ModuleType, capsys: pytest.CaptureFixture[str]
+) -> None:
+    folder = tmp_path / "Exp\N{LATIN SMALL LETTER E WITH ACUTE}rience"
+    folder.mkdir()
+    seed = seed_run(
+        folder, cells=_one_cell_in_each_frame, rows=1, columns=3, overlap=0.0
+    )
+    code, out, _ = _main(sf, capsys, seed.path, "--no-png")
+    assert code == 0
+    out.encode("ascii")
+    last = out.strip().splitlines()[-1]
+    assert (
+        "<the copy named above>" in last
+    )  # an escape is not the path: say where it is
+    assert '--run-doc "' not in last
+    assert '-p "demo"' in last
+
+
+def test_the_first_unreadable_frame_names_no_path_of_this_pc(
+    tmp_path: Path,
+    sf: ModuleType,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The table is pasted into reports on a public repository (FM-50): the reason a frame
+    # could not be read is what the system said, never its text, which quotes the path.
+    def line_of(out: str) -> str:
+        return next(x for x in out.splitlines() if "could not be read" in x)
+
+    seed = _two_wells(
+        tmp_path, write_frames=False
+    )  # `load_frame` raises FileNotFoundError
+    _, out, _ = _main(sf, capsys, seed.path, "--no-png")
+    assert "first: scan/t/A1_0000.tif: the file is missing" in line_of(out)
+    assert str(tmp_path) not in line_of(out)
+
+    def denied(run_dir: Path, frame: ScanFrame) -> None:
+        raise PermissionError(13, "Permission denied", str(run_dir / frame.file))
+
+    monkeypatch.setattr(sf, "load_frame", denied)
+    _, out, _ = _main(sf, capsys, seed.path, "--no-png")
+    assert "first: scan/t/A1_0000.tif: Permission denied" in line_of(out)
+    assert str(tmp_path) not in line_of(out)
+
+    def odd(run_dir: Path, frame: ScanFrame) -> None:
+        raise ValueError(f"cannot decode {run_dir}/x.tif")
+
+    monkeypatch.setattr(sf, "load_frame", odd)
+    _, out, _ = _main(sf, capsys, seed.path, "--no-png")
+    assert "cannot decode <run folder>/x.tif" in line_of(out)
+    assert str(tmp_path) not in line_of(out)
+
+
+@pytest.mark.parametrize("mirrored", [False, True], ids=["upright", "mirrored"])
+def test_a_cell_exactly_on_each_edge_of_the_footprint_is_in_and_one_step_beyond_is_out(
+    sf: ModuleType, mirrored: bool
+) -> None:
+    # 4 um pixels: the footprint is 320 x 240 um, its half-sizes 160 and 120 um, and the
+    # inverse of the matrix is exactly +-0.25, so a cell on an edge is on it to the bit.
+    matrix = matrix_of(4.0, 0.0, mirrored)
+    x0, y0 = 1000.0, -500.0
+    on = [
+        (160.0, 0.0),
+        (-160.0, 0.0),
+        (0.0, 120.0),
+        (0.0, -120.0),
+        (160.0, 120.0),
+        (-160.0, -120.0),
+    ]
+    beyond = [(160.0001, 0.0), (-160.0001, 0.0), (0.0, 120.0001), (0.0, -120.0001)]
+    xy = np.array([(x0 + dx, y0 + dy) for dx, dy in on + beyond], dtype=np.float64)
+    found = sf.cells_in_field(
+        xy, cKDTree(xy), x0, y0, matrix=matrix, image_shape_px=SHAPE
+    )
+    assert sorted(found.tolist()) == list(range(len(on)))
+
+
+@pytest.mark.parametrize("name", list(MATRICES))
+def test_a_cell_near_each_corner_of_the_footprint_is_in_and_just_beyond_it_is_out(
+    sf: ModuleType, name: str
+) -> None:
+    # The ball query reaches the farthest corner (250 um at 5 um a pixel): a cell at
+    # (+-39, +-29) pixels is 243 um from the centre, inside the footprint and near its
+    # corner, and (+-41, +-31) is outside.
+    matrix = MATRICES[name]
+    x0, y0 = 1000.0, -500.0
+    corner = [(sc * 39.0, sr * 29.0) for sc in (1, -1) for sr in (1, -1)]
+    beyond = [(sc * 41.0, sr * 31.0) for sc in (1, -1) for sr in (1, -1)]
+    xy = np.array(
+        [_stage_at(matrix, x0, y0, c, r) for c, r in corner + beyond],
+        dtype=np.float64,
+    )
+    found = sf.cells_in_field(
+        xy, cKDTree(xy), x0, y0, matrix=matrix, image_shape_px=SHAPE
+    )
+    assert sorted(found.tolist()) == [0, 1, 2, 3]
+
+
+def test_the_default_min_spacing_is_a_median_and_not_a_mean(sf: ModuleType) -> None:
+    # Longest sides of 10, 10 and 40 pixels: the median is 10 and the mean 20.
+    boxes = [(0.0, 0.0, 10.0, 4.0), (0.0, 0.0, 3.0, 10.0), (0.0, 0.0, 40.0, 12.0)]
+    cells = [cell_at("A1", 0.0, float(i), box_px=b) for i, b in enumerate(boxes)]
+    assert sf.default_min_spacing_um(cells, UPRIGHT) == pytest.approx(
+        3.0 * 10.0 * PIXEL_UM
+    )
+
+
+def test_a_neighbour_in_another_well_is_not_a_neighbour(
+    tmp_path: Path, sf: ModuleType
+) -> None:
+    # A cell alone in A1 while A2 holds two: its distance is unknown (None), not the
+    # 9 000 um to the nearest cell of the next well.
+    seed = seed_run(
+        tmp_path,
+        cells=[
+            cell_at("A1", 0.0, 0.0),
+            cell_at("A2", 0.0, 0.0),
+            cell_at("A2", 10.0, 0.0),
+        ],
+        wells=("A1", "A2"),
+        rows=1,
+        columns=1,
+    )
+    (candidate,), _ = _candidates(sf, seed, well="A1", min_spacing_um=1e5)
+    assert candidate.nn_median_um is None
+    assert (candidate.n_wanted, candidate.isolated) == (1, 1)
+
+
+def test_a_neighbour_exactly_at_the_spacing_is_isolated(
+    tmp_path: Path, sf: ModuleType
+) -> None:
+    # "At least min_spacing_um away": two cells exactly 30 um apart are isolated at 30,
+    # and not at 30.5.
+    seed = _one_field(tmp_path, [cell_at("A1", 0.0, 0.0), cell_at("A1", 30.0, 0.0)])
+    (at,), _ = _candidates(sf, seed, min_spacing_um=30.0)
+    (over,), _ = _candidates(sf, seed, min_spacing_um=30.5)
+    assert at.nn_median_um == 30.0
+    assert (at.isolated, over.isolated) == (2, 0)
