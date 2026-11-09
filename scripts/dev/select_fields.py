@@ -66,7 +66,13 @@ import numpy.typing as npt
 # The route's own arithmetic for "inside a field" and for "overlap" (FM-132): private
 # helpers, imported on purpose so that the prototype and the plugin cannot disagree.
 from smc.plugins.geometry import Matrix2, footprint
-from smc.plugins.route.algorithm import _inverse_of, _pixel_offsets, allowed
+from smc.plugins.route.algorithm import (
+    _TOUCH_PX,
+    _inverse_of,
+    _pixel_offsets,
+    allowed,
+    order_route,
+)
 from smc.plugins.slots import Cell, ScanResult, WellGeometry
 
 __all__ = ["Candidate", "Refusal", "Skipped"]
@@ -490,3 +496,102 @@ def score_candidates(
         score = sum(weights[name] * parts[name] for name in WEIGHT_NAMES) / total
         scored.append(Scored(c, _unit(score), parts))
     return scored
+
+
+# ========================================================================= Choice
+
+
+def choose(
+    scored: Sequence[Scored],
+    *,
+    matrix: Matrix2,
+    image_shape_px: tuple[int, int],
+    n: int,
+    min_cells: int,
+    min_score: float,
+) -> list[Scored]:
+    """The fields to image, best score first, none overlapping another; at most ``n``.
+
+    Greedy by ``(-score, frame)``, so equal scores go to the lowest frame and the same
+    scan gives the same fields. A candidate with fewer than ``min_cells`` wanted
+    cells is left out, a candidate that overlaps a chosen one is left out, and the
+    choice stops at the first score below ``min_score``. Two fields overlap by the
+    route's rule: with one camera turn for both, the centres differ by less than a frame
+    in both pixel offsets; at exactly a frame they touch, and touching is allowed. A
+    candidate's score is static (it does not depend on what else is chosen), so there
+    is no recount.
+    """
+    inverse = _inverse_of(matrix)
+    height, width = image_shape_px
+    chosen: list[Scored] = []
+    for s in sorted(scored, key=lambda s: (-s.score, s.candidate.frame)):
+        if len(chosen) >= n or s.score < min_score:
+            break
+        if s.candidate.n_wanted < min_cells:
+            continue
+        if chosen:
+            d_col, d_row = _pixel_offsets(
+                np.array([c.candidate.x_um for c in chosen]) - s.candidate.x_um,
+                np.array([c.candidate.y_um for c in chosen]) - s.candidate.y_um,
+                inverse,
+            )
+            overlapping = (np.abs(d_col) < width - _TOUCH_PX) & (
+                np.abs(d_row) < height - _TOUCH_PX
+            )
+            if bool(overlapping.any()):
+                continue
+        chosen.append(s)
+    return chosen
+
+
+def order_stops(
+    points: Sequence[tuple[float, float]], reference: tuple[float, float]
+) -> list[int]:
+    """The visiting order of a well's fields: from the one nearest ``reference``, then the route's shortest path.
+
+    ``reference`` is where the stage is coming from: the previous well's last stop,
+    or the first planned field of the well for the first one. Ties for the nearest
+    go to the field chosen first. The indices are into ``points``.
+    """
+    if not points:
+        return []
+    start = min(range(len(points)), key=lambda i: (math.dist(points[i], reference), i))
+    return order_route(points, start=start)
+
+
+def tally(
+    fields: Sequence[tuple[float, float]],
+    cells: Sequence[Cell],
+    *,
+    labels: Sequence[str],
+    matrix: Matrix2,
+    image_shape_px: tuple[int, int],
+) -> tuple[list[dict[str, int]], int]:
+    """Each field's counts of the wanted cells **no earlier field holds**, and the wanted cells in no field.
+
+    ``fields`` are the centres in the order they were chosen, which is the order the
+    cells are given away in: a cell on the edge two touching fields share goes to the
+    first, so every cell is counted once and the counts and the uncovered add up to
+    the wanted cells, as ``route``'s do. Each count has every wanted label, zeros
+    included. "Inside" is ``cells_in_field``'s.
+    """
+    keys = list(dict.fromkeys(labels))
+    wanted = [c for c in cells if c.label in keys]
+    xy = np.array([(c.x_um, c.y_um) for c in wanted], dtype=np.float64).reshape(-1, 2)
+    which = np.array([keys.index(c.label) for c in wanted], dtype=np.int64)
+    tree: Any = None
+    if len(xy):
+        from scipy.spatial import cKDTree
+
+        tree = cKDTree(xy)
+    held = np.zeros(len(xy), dtype=bool)
+    counts: list[dict[str, int]] = []
+    for x, y in fields:
+        inside = cells_in_field(
+            xy, tree, x, y, matrix=matrix, image_shape_px=image_shape_px
+        )
+        fresh = inside[~held[inside]]
+        tallies = np.bincount(which[fresh], minlength=len(keys))
+        counts.append({label: int(tallies[k]) for k, label in enumerate(keys)})
+        held[fresh] = True
+    return counts, int((~held).sum())

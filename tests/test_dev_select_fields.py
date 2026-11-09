@@ -18,9 +18,12 @@ from types import ModuleType
 
 import numpy as np
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 from scipy.spatial import cKDTree
 
 from select_fields_seed import (
+    CENTRES,
     CLASSES,
     PIXEL_UM,
     SHAPE,
@@ -34,6 +37,8 @@ from smc.plugins.geometry import Matrix2, footprint, stage_of_pixel
 from smc.plugins.route.algorithm import allowed
 from smc.plugins.slots import (
     Cell,
+    ScanFrame,
+    ScanResult,
     WellGeometry,
     load_cells,
     load_frame,
@@ -502,13 +507,18 @@ def _cand(
     wall_um: float = 1000.0,
     sharpness: float | None = None,
     background: float | None = None,
+    at: tuple[float, float] | None = None,
 ):
-    """A candidate with the features a test gives it; the density is the wanted count over a 0.12 mm2 field."""
+    """A candidate with the features a test gives it; the density is the wanted count over a 0.12 mm2 field.
+
+    ``at`` is where its frame was read back (``(frame, 0)`` when a test does not care).
+    """
+    x_um, y_um = at if at is not None else (float(frame), 0.0)
     return sf.Candidate(
         frame=frame,
         name=f"A1_{frame:04d}",
-        x_um=float(frame),
-        y_um=0.0,
+        x_um=x_um,
+        y_um=y_um,
         z_um=None,
         pfs_offset=None,
         focus="locked",
@@ -770,3 +780,294 @@ def test_an_unknown_weight_name_is_refused_with_the_names(sf: ModuleType) -> Non
 def test_a_weight_given_twice_is_refused(sf: ModuleType) -> None:
     with pytest.raises(sf.Refusal, match="twice"):
         sf.parse_weights(["wall=1", "wall=2"])
+
+
+# -------------------------------------------------------------------- choice
+
+# The oracles of the geometry, written here from the polygon of ``footprint()`` and not
+# taken from the script or from the route's helpers (FM-124, FM-132).
+
+
+def _inside(point: tuple[float, float], polygon: Sequence[tuple[float, float]]) -> bool:
+    """All four cross products of one sign, whichever way the corners turn."""
+    crosses = [
+        (polygon[(k + 1) % 4][0] - polygon[k][0]) * (point[1] - polygon[k][1])
+        - (polygon[(k + 1) % 4][1] - polygon[k][1]) * (point[0] - polygon[k][0])
+        for k in range(4)
+    ]
+    return all(c >= 0.0 for c in crosses) or all(c <= 0.0 for c in crosses)
+
+
+def _distance_to_polygon(
+    point: tuple[float, float], polygon: Sequence[tuple[float, float]]
+) -> float:
+    """0 inside; else the smallest distance to 400 points along each edge (an over-estimate by under a um)."""
+    if _inside(point, polygon):
+        return 0.0
+    best = math.inf
+    for k in range(4):
+        (ax, ay), (bx, by) = polygon[k], polygon[(k + 1) % 4]
+        for step in range(401):
+            t = step / 400
+            best = min(best, math.dist(point, (ax + t * (bx - ax), ay + t * (by - ay))))
+    return best
+
+
+def _overlap_has_area(
+    a: Sequence[tuple[float, float]], b: Sequence[tuple[float, float]]
+) -> bool:
+    """Two convex polygons share area unless an edge normal separates them (touching is not an overlap)."""
+    for polygon in (a, b):
+        for k in range(4):
+            (px, py), (qx, qy) = polygon[k], polygon[(k + 1) % 4]
+            nx, ny = qy - py, px - qx
+            norm = math.hypot(nx, ny)
+            proj_a = [(x * nx + y * ny) / norm for x, y in a]
+            proj_b = [(x * nx + y * ny) / norm for x, y in b]
+            if max(proj_a) <= min(proj_b) + 1e-4 or max(proj_b) <= min(proj_a) + 1e-4:
+                return False
+    return True
+
+
+def _choose(sf: ModuleType, scored, *, matrix: Matrix2 = UPRIGHT, **given):
+    options = {"n": 500, "min_cells": 1, "min_score": 0.0} | given
+    return sf.choose(scored, matrix=matrix, image_shape_px=SHAPE, **options)
+
+
+def test_a_cell_on_the_edge_is_in_and_counted_once(sf: ModuleType) -> None:
+    # Two fields that touch exactly (400 um apart for an upright 80-pixel frame): the
+    # cell on their shared edge is in both by the footprint and held by the first.
+    x1, x2, y = 800.0, 1200.0, -500.0
+    xy = np.array([(1000.0, -500.0), (x1 - 50.0, y)], dtype=np.float64)
+    tree = cKDTree(xy)
+    for x in (x1, x2):
+        found = sf.cells_in_field(xy, tree, x, y, matrix=UPRIGHT, image_shape_px=SHAPE)
+        assert 0 in found
+    cells = [cell_at("A1", 0.0, 0.0), cell_at("A1", -250.0, 0.0)]
+    counts, uncovered = sf.tally(
+        [(x1, y), (x2, y)],
+        cells,
+        labels=("single",),
+        matrix=UPRIGHT,
+        image_shape_px=SHAPE,
+    )
+    assert counts == [{"single": 2}, {"single": 0}]
+    assert uncovered == 0
+    # In the other order the second field of the list holds the edge cell, which is
+    # the order of the choice and not of the stage: the first chosen holds it.
+    swapped, _ = sf.tally(
+        [(x2, y), (x1, y)],
+        cells,
+        labels=("single",),
+        matrix=UPRIGHT,
+        image_shape_px=SHAPE,
+    )
+    assert swapped == [{"single": 1}, {"single": 1}]
+
+
+def test_the_counts_and_the_uncovered_add_up_to_the_wanted_cells(
+    sf: ModuleType,
+) -> None:
+    cells = [
+        cell_at("A1", dx, dy, label)
+        for dx, dy, label in [
+            (0.0, 0.0, "single"),
+            (10.0, 5.0, "single"),
+            (500.3, 100.7, "doublet"),
+            (505.3, 101.7, "single"),
+            (2000.0, 2000.0, "single"),
+            (-30.1, 40.2, "debris"),
+        ]
+    ]
+    fields = [(1000.0, -500.0), (1500.0, -400.0)]
+    counts, uncovered = sf.tally(
+        fields,
+        cells,
+        labels=("single", "doublet"),
+        matrix=MATRICES["turned 30"],
+        image_shape_px=SHAPE,
+    )
+    wanted = sum(1 for c in cells if c.label in ("single", "doublet"))
+    assert counts == [
+        {"single": 2, "doublet": 0},
+        {"single": 1, "doublet": 1},
+    ]
+    assert sum(sum(c.values()) for c in counts) + uncovered == wanted
+    assert uncovered == 1  # the cell 2000 um from the centre is in no field
+
+
+def test_chosen_fields_never_overlap(sf: ModuleType) -> None:
+    # A grid of candidates 150.7 um apart (decimals keep any pair off a field's edge), on a
+    # camera turned 30 degrees: many pairs overlap, and the choice must keep none of them.
+    matrix = MATRICES["turned 30"]
+    positions = [
+        (1000.0 + 150.7 * i, -500.0 + 131.3 * j) for i in range(8) for j in range(6)
+    ]
+    candidates = [
+        _cand(sf, k, n_wanted=1 + k % 5, at=at) for k, at in enumerate(positions)
+    ]
+    scored = sf.score_candidates(candidates, sf.parse_weights([]))
+    chosen = _choose(sf, scored, matrix=matrix)
+    assert 2 <= len(chosen) < len(candidates)
+    polygons = [
+        footprint(
+            s.candidate.x_um, s.candidate.y_um, matrix=matrix, image_shape_px=SHAPE
+        )
+        for s in chosen
+    ]
+    for i in range(len(polygons)):
+        for j in range(i + 1, len(polygons)):
+            assert not _overlap_has_area(polygons[i], polygons[j])
+
+
+def test_touching_fields_may_both_be_chosen(sf: ModuleType) -> None:
+    # 400 um apart for an 80-pixel frame of 5 um: they touch. 399.9 um apart they overlap.
+    for gap, kept in [(400.0, 2), (399.9, 1)]:
+        candidates = [
+            _cand(sf, 0, n_wanted=3, at=(1000.0, -500.0)),
+            _cand(sf, 1, n_wanted=2, at=(1000.0 + gap, -500.0)),
+        ]
+        scored = sf.score_candidates(candidates, sf.parse_weights([]))
+        assert len(_choose(sf, scored)) == kept
+    # The 60 rows exchange with the 80 columns when the camera is turned 90 degrees:
+    # the same 400 um apart along Y is then a touching pair and 300 um along Y is not.
+    turned = MATRICES["turned 90"]
+    for dx, dy, kept in [
+        (0.0, 400.0, 2),
+        (0.0, 300.0, 1),
+        (300.0, 0.0, 2),
+        (399.9, 0.0, 2),
+    ]:
+        candidates = [
+            _cand(sf, 0, n_wanted=3, at=(1000.0, -500.0)),
+            _cand(sf, 1, n_wanted=2, at=(1000.0 + dx, -500.0 + dy)),
+        ]
+        scored = sf.score_candidates(candidates, sf.parse_weights([]))
+        assert len(_choose(sf, scored, matrix=turned)) == kept, (dx, dy)
+
+
+def test_fields_per_well_bounds_the_choice(sf: ModuleType) -> None:
+    candidates = [
+        _cand(sf, k, n_wanted=k + 1, at=(1000.0 + 1000.0 * k, 0.0)) for k in range(6)
+    ]
+    scored = sf.score_candidates(candidates, sf.parse_weights([]))
+    chosen = _choose(sf, scored, n=3)
+    assert [s.candidate.frame for s in chosen] == [5, 4, 3]
+
+
+def test_min_cells_drops_the_empty_field(sf: ModuleType) -> None:
+    near_wall = _cand(sf, 0, n_wanted=1, wall_um=3000.0, at=(0.0, 0.0))
+    inside = _cand(sf, 1, n_wanted=3, wall_um=100.0, at=(1000.0, 0.0))
+    empty = _cand(sf, 2, n_wanted=0, wall_um=2000.0, at=(2000.0, 0.0))
+    scored = sf.score_candidates(
+        [near_wall, inside, empty], sf.parse_weights(["density=0", "wall=1"])
+    )
+    assert [s.candidate.frame for s in _choose(sf, scored, min_cells=1)] == [0, 1]
+    assert [s.candidate.frame for s in _choose(sf, scored, min_cells=2)] == [1]
+    # Best score first, which is the order of the choice and not of the frames.
+    assert [s.candidate.frame for s in _choose(sf, scored, min_cells=0)] == [0, 2, 1]
+
+
+def test_min_score_stops_the_choice(sf: ModuleType) -> None:
+    candidates = [
+        _cand(sf, k, n_wanted=n, at=(1000.0 * k, 0.0)) for k, n in enumerate([10, 5, 2])
+    ]
+    scored = sf.score_candidates(candidates, sf.parse_weights([]))  # 1.0, 0.5, 0.2
+    assert len(_choose(sf, scored, min_score=0.0)) == 3
+    assert len(_choose(sf, scored, min_score=0.4)) == 2
+    assert len(_choose(sf, scored, min_score=0.5)) == 2  # a score at the bar is kept
+    assert len(_choose(sf, scored, min_score=1.0)) == 1
+
+
+def test_equal_scores_go_to_the_lowest_frame(sf: ModuleType) -> None:
+    candidates = [_cand(sf, k, n_wanted=4, at=(1000.0 * k, 0.0)) for k in (5, 2, 9)]
+    scored = sf.score_candidates(candidates, sf.parse_weights([]))
+    assert [s.candidate.frame for s in _choose(sf, scored, n=2)] == [2, 5]
+
+
+def test_the_stops_start_at_the_field_nearest_the_previous_well(
+    sf: ModuleType,
+) -> None:
+    points = [(0.0, 0.0), (1000.0, 0.0), (2000.0, 0.0)]
+    # Coming from the right, the route starts at the right-hand field and walks left.
+    assert sf.order_stops(points, (2500.0, 0.0)) == [2, 1, 0]
+    assert sf.order_stops(points, (-500.0, 0.0)) == [0, 1, 2]
+    # Two fields as near as each other: the one chosen first.
+    assert sf.order_stops(points, (500.0, 0.0))[0] == 0
+    assert sf.order_stops([], (0.0, 0.0)) == []
+
+
+@given(
+    rotation_deg=st.floats(0.0, 360.0),
+    margin_um=st.floats(0.0, 2000.0),
+    exclude_um=st.floats(0.0, 1500.0),
+    mirrored=st.booleans(),
+    offsets=st.lists(
+        st.tuples(st.floats(-3600.0, 3600.0), st.floats(-3600.0, 3600.0)),
+        min_size=1,
+        max_size=14,
+    ),
+)
+@settings(max_examples=60, deadline=None)
+def test_no_chosen_field_leaves_its_well_or_enters_an_exclusion(
+    sf: ModuleType,
+    rotation_deg: float,
+    margin_um: float,
+    exclude_um: float,
+    mirrored: bool,
+    offsets: list[tuple[float, float]],
+) -> None:
+    matrix = matrix_of(PIXEL_UM, rotation_deg, mirrored)
+    centre = CENTRES["A1"]
+    well = WellGeometry(
+        well="A1",
+        center_um=centre,
+        size_um=(6400.0, 6400.0),
+        circular=True,
+        rotation_deg=0.0,
+    )
+    frames = tuple(
+        ScanFrame(
+            well="A1",
+            index=k,
+            name=f"A1_{k:04d}",
+            file=f"scan/t/A1_{k:04d}.tif",
+            x_um=centre[0] + dx,
+            y_um=centre[1] + dy,
+            z_um=None,
+            focus="none",
+            pfs_offset=None,
+            t_s=float(k),
+        )
+        for k, (dx, dy) in enumerate(offsets)
+    )
+    scan = ScanResult(
+        folder="scan/t",
+        objective=None,
+        pixel_size_um=PIXEL_UM,
+        matrix_um_per_px=matrix,
+        image_shape_px=SHAPE,
+        exposure_ms=10.0,
+        frames=frames,
+        failed=(),
+    )
+    candidates, _ = sf.candidates_of(
+        "A1",
+        scan,
+        [],
+        well,
+        labels=("single",),
+        classes=CLASSES,
+        min_spacing_um=30.0,
+        margin_um=margin_um,
+        exclude_centre_um=exclude_um,
+        stats={},
+    )
+    scored = sf.score_candidates(candidates, sf.parse_weights([]))
+    for s in _choose(sf, scored, matrix=matrix, min_cells=0):
+        corners = footprint(
+            s.candidate.x_um, s.candidate.y_um, matrix=matrix, image_shape_px=SHAPE
+        )
+        assert all(well.contains(x, y, margin_um=margin_um) for x, y in corners)
+        # The oracle over-estimates a distance by under a um.
+        assert _distance_to_polygon(centre, corners) >= exclude_um - 1.0
