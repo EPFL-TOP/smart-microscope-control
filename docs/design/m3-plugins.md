@@ -4,7 +4,7 @@
   workflow, §2 to §16, for issue #192 (2026-10-27); the plate from images of
   the walls, §17, for issue #328 (2026-11-05); objectives' offsets, §18,
   for issue #340 (2026-11-05); the sides of a wall, §19, for issue #327
-  (2026-11-09).
+  (2026-11-09); the focus on the cells, §21, for issue #341 (2026-11-09).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 and M2, this document is the contract between issues
   that are built in parallel. Names, module paths and signatures below are
@@ -2375,6 +2375,9 @@ walked, no frame taken`.
 
 The scan never moves Z, never turns the turret, never engages an
 autofocus the operator left off, and returns to no start position.
+*Amended by #341*: with `cell_focus` other than `"off"` (default `"off"`),
+the scan moves Z in its focus on the cells, and switches off and engages
+again the autofocus it uses, as §21.6 fixes.
 
 **Refined while planning #213** (measured on the demo, 2026-10-28):
 
@@ -6130,3 +6133,539 @@ FM-190, FM-195, FM-203.
 - Whether a turn at the plate's working height (Z about 4195 µm at 10×)
   settles within the turret's wait (m2 §8.11.3); the tool refuses a Z that
   still moves and says so.
+
+## 21. The focus on the cells (#341)
+
+PFS locks on the plate's bottom and holds the plane its offset names. The
+cells sit some micrometres above that plane, and the sharpest plane differs
+from well to well and from plate to plate. This section adds a software
+autofocus: a sweep of a few planes in Z around a centre, a focus score on
+each frame, and the plane of the best score. It is a tool of its own,
+`focus-on-cells`, and an optional step of `scan` (§8). **Merging this
+section decides it.** It extends §8 additively (new parameters, one new
+optional field of `ScanFrame`) and changes no layer interface: the sweep
+uses `ZStage`, `Camera` and `Autofocus` as they are (m2 §3, §12).
+
+### 21.1 What was measured (2026-11-09, planning #341)
+
+On `main` `188c6d1`, Python 3.13, pymmcore-plus 0.18.1, numpy 2.5.3, in
+throwaway scripts on `profiles/demo-sample.toml` (not committed):
+- **The demo-sample's defocus.** `PlateSample.render` blurs by a Gaussian
+  of `|z| / 10` pixels (capped at 32), sharp at Z = 0, symmetric. The noise
+  is drawn per snap. The texture covers the plastic too, so no field of
+  the demo is flat.
+- **Four scores over Z = −30…30 µm, step 2, in A1** (definitions in §21.3):
+  each peaks at Z = 0. Brenner rises 2.9× from the ends to the peak,
+  normalised variance 3.3×, gradient energy 2.0×, and the variance of the
+  Laplacian only 1.49×: at the demo's noise (σ = 20 counts) the Laplacian
+  measures mostly noise.
+- **The parabolic refinement** (§21.3) on three repeats of each sweep, in a
+  well and on the plastic: ±5 µm step 1 centred on 0 or on 1.3, ±25 µm
+  step 5 centred on 20, ±30 µm step 2 centred on 0. Every estimate lay
+  within 0.30 µm of 0, for each of Brenner, normalised variance and
+  gradient energy. The sweep of the issue's criterion, from Z = 20 µm with
+  `range_um = 25`, `step_um = 5`, gave −0.01 to 0.03 µm.
+- **The relative rise** `(max − min) / max` of a sweep: 0.17–0.31 for ±5 µm
+  step 1, 0.49–0.75 for the wide sweeps. No flat sweep exists on the demo
+  (see above); §21.3's flat bound is chosen.
+- **Time on the demo**: a Z move returns in under 1 ms, a snap of 512 ×
+  512 takes about 20 ms, so 31 planes took 0.8 s. A score of one frame is a
+  few milliseconds. Nothing was timed at the Ti2-E.
+- **The demo's autofocus** (`DAutoFocus`): off when the stand opens;
+  `engage()` returns `True` and moves no Z; `ZStage.move_to_um(z,
+  keep_autofocus=False)` switches it off and leaves it off; `engage()`
+  again returns `True` with Z where it was.
+- **The scan's own autofocus double** (`tests/test_scan_demo.py`'s
+  `_Autofocus`) is installed with `Microscope.override`, so the Z interlock
+  does not reach it (m2 §3.4: an overridden autofocus is not interlocked):
+  the sweep must switch it off itself (§21.4).
+- **Nothing in `src/` or the sibling repositories scores focus**: there is
+  no code to port. Session 3's 40× stacks, which the issue names, are not
+  taken yet (`local/surveys/nikon-ti2/` holds sessions 0 to 2).
+
+### 21.2 Decisions
+
+**D1. The sweep moves Z with the autofocus off, and the frame is taken at
+the best plane with the autofocus off.** The 40×'s `offset_per_um` factor
+is not measured (m2 §12.10.9), so `focus_by_um` refuses under lock (m2
+§3.5), and a step through the offset under lock costs a relock and its
+settle window (1 s on the Ti2-E) per plane. With PFS off, a Z move is a
+plain move under the soft limits, and an engage at the offset the sweep
+started from is an engage at a seen offset, inside D2's band (m2 §12.2):
+the sweep's Z stays within `range_um` of the plane PFS held. So, when the
+autofocus is used: read the lock, switch it off, sweep, move to the best
+plane, snap; the next field's existing re-engage (§8) locks it again, and
+PFS takes Z back to its plane, which carries the plate's tilt to the next
+field. The frame's `z_um` is then the cells' plane, and its `pfs_offset`
+the offset of the lock the sweep was centred on.
+- Not chosen: *the offset under lock* (`focus_by_um`). It needs the factor,
+  and costs a settle window per plane. Once the 40×'s factor is in the
+  profile, carrying a well's `dz_um` into the offset once (so that PFS holds
+  the cells' plane for the rest of the well, with no cost per field) is a
+  later change, measured against this one's cost per field.
+- Not chosen: *a sweep with PFS on* through Z moves: the Z interlock
+  switches PFS off for each move and relocks, which takes Z back to PFS's
+  plane before the snap.
+
+**D2. A sweep is symmetric around its centre, in planes `step_um` apart,
+in increasing Z.** The centre is the Z PFS holds at the field when the
+autofocus is used, else the Z read before anything moved (the operator's
+focus). It never follows the previous field's best plane, so nothing
+drifts from field to field. The direction of "toward the sample" plays no
+part: at 40× the working distance is 170–250 µm (m2 §12.10.1), and
+`range_um` is at most 50 µm and at most the stand's Z jog limit.
+
+**D3. Bounds before the first move.** A sweep runs only when every plane
+lies inside `ZStage.limits_um()`; a stand with no Z soft limits refuses
+the focus on the cells (unknown is not unlimited). `range_um` must not
+exceed the stand's Z jog limit (`profile.safety.max_z_jog_um`, else the
+layer's `DEFAULT_MAX_Z_JOG_UM`): the sweep's absolute moves are not
+jog-guarded by the layer (M1 §7), so the plugin bounds their reach with
+the same number. Every Z readback is compared with its command (FM-167).
+
+**D4. A peak, or the centre is kept.** The score's best plane is taken
+only when the sweep has one clear interior maximum. A flat sweep (an empty
+field), a best at an end of the sweep, or two maxima (brightfield of
+unstained cells can lose contrast exactly at focus and show a maximum on
+either side) keep the centre, and say so. Unknown beats guessed: which of
+these the real 40× stacks show is session 3's (§21.10).
+
+**D5. Per field or per well.** `per-field` sweeps every field.
+`per-well` sweeps the well's fields in order until one finds a peak, then
+moves every later field of the well to its own centre plus that field's
+`dz_um`, with no sweep. An empty first field (flat) therefore does not
+decide a well.
+
+**D6. Offline first, with the tool's own stacks.** `focus-on-cells` keeps
+every frame of its sweep as a TIFF with its Z, so a run at a stand is a
+Z-stack. `scripts/dev/focus_scores.py` scores such stacks with every
+score of §21.3 and prints each curve and peak, so the default score and
+the sweep's defaults are chosen on real 40× stacks before the scan uses
+the step. Until then the defaults are chosen, not measured, and labelled.
+The tool's own run at the Ti2-E is the stack: the sweep stays within
+`range_um` of a plane PFS held, with the relock of D1.
+
+### 21.3 Algorithm — `smc/plugins/cell_focus/algorithm.py`
+
+Pure: numpy only, no capability.
+
+```python
+ScoreName = Literal[
+    "brenner", "normalized-variance", "gradient-energy", "laplacian-variance"
+]
+PeakOutcome = Literal["peak", "flat", "at-edge", "two-peaks"]
+
+#: Chosen from the literature, not measured on cells: session 3's stacks
+#: decide (m3 §21.10). On the demo-sample all four peak at Z = 0.
+DEFAULT_SCORE: ScoreName = "brenner"
+#: The widest half-range of a sweep. Chosen: the 40×'s working distance is
+#: 170-250 µm (catalogue), and a sweep never needs more than a few µm.
+MAX_RANGE_UM = 50.0
+#: Chosen: below the Ti2-E's Z steps that were read (0.01 µm) times ten.
+MIN_STEP_UM = 0.1
+MAX_STEP_UM = 10.0
+#: Bounds the frames of one sweep (FM-74). Chosen.
+MAX_PLANES = 101
+#: A sweep whose (max - min) / max is below this is flat. Chosen: the demo
+#: gives 0.17 at its narrowest sweep; no real flat sweep was read.
+MIN_RISE = 0.05
+#: A second interior maximum whose rise above the sweep's minimum reaches
+#: this fraction of the best's makes the sweep "two-peaks". Chosen.
+SECOND_PEAK_FRACTION = 0.5
+#: A Z readback farther from its command than this fraction of the step
+#: fails the sweep (FM-167). Chosen.
+LANDING_FRACTION = 0.25
+
+
+@dataclass(frozen=True)
+class Peak:
+    outcome: PeakOutcome
+    best_index: int
+    z_um: float | None  # the refined plane; None unless outcome == "peak"
+
+
+def score_frame(frame: npt.NDArray[Any], name: ScoreName) -> float: ...
+def plan_planes(
+    centre_um: float, range_um: float, step_um: float
+) -> tuple[float, ...]: ...
+def first_outside(
+    planes_um: Sequence[float], low_um: float, high_um: float
+) -> float | None: ...
+def find_peak(z_um: Sequence[float], scores: Sequence[float]) -> Peak: ...
+```
+
+**Scores.** The frame is read as `float64`; `m` is its mean. A frame that
+is not 2-D or smaller than 3 × 3 is a `ValueError`. A mean that is not
+finite and above 0 (a dark frame) scores `0.0`. Each score is
+dimensionless or in counts, and only compared within one sweep:
+- `brenner`: `mean((f[:, 2:] - f[:, :-2]) ** 2) / m**2`;
+- `gradient-energy`: with `gx = f[:, 1:] - f[:, :-1]` and
+  `gy = f[1:, :] - f[:-1, :]`,
+  `mean(gx[:-1, :] ** 2 + gy[:, :-1] ** 2) / m**2`;
+- `laplacian-variance`: the variance of `4 f[1:-1, 1:-1]` minus its four
+  neighbours, `/ m**2`;
+- `normalized-variance`: `var(f) / m`.
+
+**`plan_planes`**: `k = floor(range_um / step_um + 1e-9)`; the planes are
+`centre_um + i * step_um` for `i` in `-k…k`, in increasing order. A
+`range_um` or `step_um` that is not finite, `k < 1`, or `2k + 1 >
+MAX_PLANES` is a `ValueError` naming the numbers (the parameters' own
+validators refuse them first, §21.5).
+
+**`first_outside`** returns the first plane outside `[low_um, high_um]`,
+or `None`.
+
+**`find_peak`.** `z_um` strictly increasing, the same length as `scores`,
+at least 3, every value finite, else `ValueError`. With `i` the first index
+of the maximum, in this order:
+1. `(max - min) / max < MIN_RISE`, or `max <= 0`: `flat`;
+2. `i` is 0 or the last: `at-edge`;
+3. another interior index `j`, with `scores[j]` strictly above both its
+   neighbours and `scores[j] - min >= SECOND_PEAK_FRACTION * (max - min)`:
+   `two-peaks`;
+4. otherwise `peak`, and `z_um` is the vertex of the parabola through the
+   points `i - 1`, `i`, `i + 1` (unequal spacing allowed: the readbacks),
+   clamped to `[z[i - 1], z[i + 1]]`; when the three are collinear or
+   convex, `z[i]`.
+
+`best_index` is `i` in every outcome.
+
+### 21.4 The sweep — `smc/plugins/cell_focus/loop.py`
+
+Shared by the tool and the scan.
+
+```python
+class FocusDriveOffTarget(Exception):
+    """A Z readback farther from its command than the sweep allows."""
+```
+
+```python
+class AutofocusStillOn(Exception):
+    """The autofocus still reads on after the sweep switched it off."""
+```
+
+```python
+def switch_off_for_sweep(af: Autofocus) -> None: ...
+def sweep(
+    z: ZStage,
+    camera: Camera,
+    planes_um: Sequence[float],
+    step_um: float,
+    score: ScoreName,
+    *,
+    raise_if_stopped: Callable[[], None],
+    on_plane: Callable[[int, float, npt.NDArray[Any]], None] | None = None,
+) -> tuple[tuple[float, ...], tuple[float, ...]]: ...
+def move_checked(z: ZStage, target_um: float, tolerance_um: float) -> float: ...
+```
+
+Neither exception is a `HardwareError`: each names what the sweep saw,
+and its callers catch both by name.
+
+- **`switch_off_for_sweep`**: `af.disengage()`, then `af.is_engaged()`
+  must read `False`, else `AutofocusStillOn`: `the autofocus still reads on
+  after it was switched off for the focus sweep: nothing was moved`. The
+  explicit switch-off is needed because an overridden autofocus is not
+  interlocked (§21.1), and it is what D1 asks on every stand. Never called
+  in a dry run: `disengage()` is a safe call that acts in dry run too (m2
+  §3.2).
+- **`sweep`**: for each plane, `raise_if_stopped()`, then
+  `move_checked(z, plane, LANDING_FRACTION * step_um)`, then
+  `camera.snap()`, the score, and `on_plane(k,
+  readback, frame)` (the tool writes the frame there, so a failure later
+  keeps the frames taken). It returns the readbacks and the scores.
+  Every move is `move_to_um(plane, keep_autofocus=False)`.
+- **`move_checked`**: `move_to_um(target, keep_autofocus=False)`, and a
+  readback with `not abs(readback - target) <= tolerance` (a NaN fails,
+  FM-104) raises `FocusDriveOffTarget`: `Z read <r> µm after a move to <t>
+  µm, more than <tol> µm away` (two decimals).
+- **Errors pass through**: the sweep catches nothing. A
+  `MicroscopeHaltedError`, a `MotionStoppedError` and `StopRequested` reach
+  the caller as they are (FM-64); so does any `HardwareError`. Nothing is
+  restored after a failure (FM-88): Z stays where it was read last, and
+  the autofocus stays off.
+
+### 21.5 The slot — `smc/plugins/slots/cell_focus.py`
+
+```python
+class FocusSweep(SlotValue):
+    score: ScoreName
+    centre_um: float
+    z_um: tuple[float, ...]  # the readbacks, increasing
+    scores: tuple[float, ...]
+    outcome: PeakOutcome
+    best_z_um: float | None  # set when outcome == "peak", else None
+```
+
+```python
+class FieldFocus(SlotValue):
+    source: Literal["swept", "well"]
+    sweep: FocusSweep | None  # set when source == "swept", else None
+    dz_um: float  # the frame's Z command minus the centre; 0.0 without a peak
+    frame_score: float  # the score of the frame written, by sweep's score
+    duration_s: float = Field(ge=0.0)
+```
+
+```python
+class CellFocusResult(PluginResult):
+    folder: str  # "cell-focus/<token>", relative, POSIX
+    objective: str | None
+    x_um: float | None  # the XY readback, None without an XY stage
+    y_um: float | None
+    autofocus: Literal["locked", "off", "none"]  # at the start
+    pfs_offset: float | None  # the lock's offset, when it was used
+    sweep: FocusSweep
+    files: tuple[str, ...]  # one per plane, in the sweep's order
+    best_file: str | None  # the frame at the best plane, None without one
+    z_um: float  # Z read at the end
+    relocked: bool | None  # None when the autofocus was not used
+```
+
+Validators (each a `ValueError` naming the fields): `z_um` and `scores`
+the same length, at least 3; `best_z_um` set exactly when `outcome ==
+"peak"`; `sweep` set exactly when `source == "swept"`; `files` empty (a
+dry run) or as long as `sweep.z_um`. All four are exported from `slots/__init__.py`.
+
+`ScanFrame` gains `cell_focus: FieldFocus | None = None`, last. **A frame
+without it is written exactly as before**: a wrap serializer drops the key
+when it is `None`, as `StageRecord.preset` does (§1.7), so a scan without
+the step still reads in an older smc and `SCHEMA_VERSION` stays 1. A scan
+with the step does not read in an older smc, which refuses the key
+(FM-107), as intended.
+
+### 21.6 In the scan — `scan/plugin.py`
+
+```python
+class ScanParams(PluginParams):  # gains, last
+    cell_focus: Literal["off", "per-field", "per-well"] = "off"
+    focus_range_um: float = Field(5.0, gt=0.0, le=MAX_RANGE_UM)
+    focus_step_um: float = Field(1.0, ge=MIN_STEP_UM, le=MAX_STEP_UM)
+    focus_score: ScoreName = DEFAULT_SCORE
+```
+
+A model validator refuses `focus_step_um > focus_range_um` and more than
+`MAX_PLANES` planes, naming both. The defaults are chosen (11 planes,
+±5 µm): session 3 measures them (§21.10). A `--resume` of a scan stopped
+by an smc without these keys is refused as "the parameters differ"
+(the runner's rule, §1.8): run it again without `--resume`.
+
+**Before anything moves** (after §8's checks, dry run included), when
+`cell_focus != "off"`:
+1. a `ZStage`, else `PluginRunError`: `cell_focus needs a focus drive, and
+   this stand has none`;
+2. `z.limits_um()` not `None`, else `PluginRunError`: `cell_focus moves Z:
+   the profile must set [safety] z_soft_limits_um`;
+3. `focus_range_um` not above the Z jog limit (D3), else `PluginRunError`
+   naming both;
+4. `z_start = z.position_um()`, and `plan_planes(z_start, …)` inside the
+   limits, else `PluginRunError`: `the focus sweep around <z_start> µm would
+   reach <plane> µm, outside the soft limits [<lo>, <hi>] µm`.
+
+**A resume** of a scan whose checkpoint holds a frame with `focus ==
+"locked"`, when the autofocus is not used now and `autofocus != "off"`,
+is a `PluginRunError`: `the scan being resumed used the autofocus, which is
+not locked now (a stop during the focus on the cells leaves it off): lock
+it on the sample, then run scan --resume`. Without this, `if-engaged`
+would resume silently without PFS.
+
+**Per field**, after §8's lock handling and before the Z and offset reads,
+when `cell_focus != "off"` and not in a dry run:
+1. **No step** when the autofocus is used and the field reads `unlocked`
+   (its Z is where a search left it, FM-154): `cell_focus` stays `None`,
+   counted for `assumed`.
+2. `centre = z.position_um()` when the autofocus is used, else `z_start`;
+   `pfs_offset` is read here, before the switch-off (the lock the sweep
+   was centred on).
+3. `per-well` with the well's `dz_um` known: no sweep; the target is
+   `centre + dz_um`. Otherwise the planes are `plan_planes(centre, …)`,
+   and a plane outside the limits fails the field with nothing moved for
+   it: `SweepOutsideLimits: the focus sweep around <c> µm would reach <p>
+   µm, outside the soft limits [<lo>, <hi>] µm`.
+4. When the autofocus is used: `off_by_focus = True`, then
+   `switch_off_for_sweep(af)`.
+5. The sweep (§21.4), then `find_peak`. With a peak, the target is its
+   `z_um`, and `per-well` keeps `dz_um = target - centre` for the well's
+   later fields; without one, the target is the centre.
+6. `move_checked(z, target, LANDING_FRACTION * focus_step_um)`. Then §8's
+   `z_um` read, the snap, `frame_score = score_frame(frame, focus_score)`,
+   and `FieldFocus(..., duration_s=…)` from `time.perf_counter()` taken
+   before step 4 and after the snap.
+- `FocusDriveOffTarget`, `AutofocusStillOn` and every `HardwareError` of
+  the step are a failed field (`<Type>: <message>`, §8), and a WARNING
+  names the field and says the autofocus is left off when step 4 ran.
+  `MicroscopeHaltedError`, `MotionStoppedError` and `StopRequested` pass.
+- **The next field's lock** is §8's re-engage, whose condition becomes
+  `off_by_the_scan or off_by_focus or af.is_engaged()`. `off_by_focus` is
+  cleared as `off_by_the_scan` is (a field that reads locked, FM-129). The
+  engages that follow a focus step are timed (`time.perf_counter()`) and
+  counted apart: §8's `assumed` line keeps counting only the others.
+- **After the last field**, when the scan ends without an error and
+  `off_by_focus` is set: one `engage()`. `False`, or a `HardwareError`, is a
+  WARNING and an `assumed` line (`the autofocus did not lock again after the
+  last field (<why>): it is off`), not a failure: every frame is written.
+  A failure or a stop leaves it off (FM-88), and §8's `PluginRunError`
+  texts gain `; the focus on the cells left the autofocus off` when
+  `off_by_focus` is set.
+
+**`assumed`** gains, when the step ran:
+- `the focus on the cells added <a> s per field (<n> fields: <b> s to
+  sweep and move, <c> s for the lock after)`, means to two decimals; `<c>`
+  is left out without the autofocus;
+- `the focus on the cells found a peak on <p> of <s> sweeps (flat <f>, at
+  an edge <e>, two peaks <t>): the others kept the centre`;
+- `the focus on the cells was skipped on <u> fields whose autofocus did not
+  lock`, when `u > 0`;
+- with the autofocus used: `each frame's pfs_offset names the plane PFS
+  held, not the cells' plane <min>…<max> µm from it: an export that
+  engages PFS at that offset images the plane PFS held` (route and
+  NIS-Elements: #392);
+- in a dry run, instead: `dry run: the focus on the cells was planned
+  (<n> planes per sweep), not run`.
+
+### 21.7 The tool — `smc/plugins/cell_focus/plugin.py`
+
+Entry point `focus-on-cells = "smc.plugins.cell_focus.plugin:FocusOnCellsPlugin"`.
+`requires = (ZStage, Camera)`, `provides = "cell-focus"`, `reads = ()`,
+optional `XYStage`, `Autofocus`, `ObjectiveTurret` through `get`.
+
+```python
+class FocusOnCellsParams(PluginParams):
+    range_um: float = Field(5.0, gt=0.0, le=MAX_RANGE_UM)
+    step_um: float = Field(1.0, ge=MIN_STEP_UM, le=MAX_STEP_UM)
+    score: ScoreName = DEFAULT_SCORE
+    relock: bool = True
+```
+
+The same model validator as the scan's. It sweeps where the stage is; it
+never moves XY.
+
+**Before anything moves**, in this order, dry run included: the autofocus,
+when the stand has one and it reads engaged, must read locked, else
+`PluginRunError`: `the autofocus is on and not locked: lock it on the
+sample, or switch it off to sweep around the Z where it is`; used means
+engaged and locked, and then its offset is read. Then §21.6's checks 2–4
+around `z.position_um()`. The token is `new_token()`, the folder
+`cell-focus/<token>/`, every path through `resolve_in_run`, and the
+Windows `MAX_PATH` check of §8 on the longest one.
+
+**The run**: `switch_off_for_sweep` when used; the sweep, each frame
+written by `on_plane` with `write_atomically` as a TIFF in its own dtype,
+`<k:03d>.tif` (k from 0), with `{"z_um", "z_command_um", "score",
+"score_name"}` as tifffile's JSON metadata (§8's encoding); then
+`find_peak`. With a peak: `move_checked` to it, a snap written as
+`best.tif` and scored. Without one: `move_checked` back to the centre, no
+best frame. Then, when used and `relock`: `engage()`; `relocked` is its
+return value, and `False` adds `the autofocus did not lock again: it is
+off` to `assumed` with a WARNING. Used and not `relock`: `assumed` gains
+`the autofocus was left off, at the best plane` (or `at the centre`).
+`z_um` is read last.
+
+**Errors**: a failure during the sweep or the moves (`HardwareError`,
+`FocusDriveOffTarget`, `AutofocusStillOn`) is a `PluginRunError`, raised
+outside the handler (FM-98): `the focus sweep ended at plane <k> of <n>
+(<Type>: <message>); the <m> frames taken are kept in
+cell-focus/<token>/[; the autofocus was left off]; Z was left where it
+stopped`, with `k` counted from 1 and `m` the frames written. A failure
+after the sweep (the move to the best plane, its snap) names that step
+instead of a plane.
+An `OSError` writing a frame is §8's `AtomicWriteError` text. Halt, stop
+and `StopRequested` pass. No checkpoint: a run is one sweep, and
+`--resume` starts again.
+
+**Dry run**: the checks, then each plane walked with `move_checked`
+through the layer's dry run (whose readback is the command), with no
+snap, no `sweep()` call and no switch-off. The result's `FocusSweep` has
+the planes as `z_um`, every score `0.0`, `outcome` `"flat"`; `files` is
+empty, `best_file` and `relocked` are `None`, and `assumed` gains `dry run:
+<n> planes walked, no frame taken`.
+
+### 21.8 The offline script — `scripts/dev/focus_scores.py`
+
+`python scripts/dev/focus_scores.py <folder>... [--csv out.csv] [--plot
+dir]`. Each folder is one stack: the TIFFs in it whose JSON metadata has
+`z_um` (the tool's frames; `best.tif` is left out). For each stack it
+prints one row per plane (Z, the four scores) and, per score, the outcome
+and the refined Z of `find_peak`. `--csv` writes every row with its
+folder; `--plot` writes one PNG per stack (score normalised to its
+maximum, against Z) when `matplotlib` imports, and says so and goes on
+when it does not. A folder with fewer than 3 such frames is reported and
+skipped. Exit 0 when one stack was scored, else 1. It imports
+`smc.plugins.cell_focus.algorithm`, so the script and the tool score
+alike. UTF-8 everywhere, `pathlib`, no shell.
+
+### 21.9 Tests
+
+- **Algorithm** (`tests/unit/test_cell_focus_algorithm.py`, synthetic
+  stacks from `PlateSample().render` at known Z, `noise_std` default and
+  0):
+  - `test_each_score_peaks_at_the_sharp_plane` (all four, Z = −20…20 step
+    2, the argmax at Z = 0);
+  - `test_the_peak_is_refined_between_planes` (a sweep centred on 1.3 µm,
+    step 1: the refined Z within 0.3 µm of 0, and not equal to a plane);
+  - `test_a_flat_sweep_keeps_no_peak`, `test_a_best_at_the_end_is_at_edge`,
+    `test_two_maxima_are_two_peaks`, on score lists written out by hand,
+    each from both sides of its bound (`MIN_RISE` at 0.04 and 0.06,
+    `SECOND_PEAK_FRACTION` at 0.4 and 0.6, FM-73);
+  - `test_unequal_spacing_is_refined_through_the_readbacks`;
+  - `test_plan_planes_is_symmetric_and_bounded`, `test_too_many_planes_is_refused`,
+    `test_first_outside_names_the_first_plane_past_a_limit`;
+  - `test_a_dark_frame_scores_zero`, `test_find_peak_refuses_nan_and_unsorted_z`.
+- **The tool** (`tests/test_cell_focus_demo.py`, `profiles/demo-sample.toml`):
+  - `test_a_sweep_from_20_um_finds_the_sharp_plane_within_one_step`
+    (`range_um=25`, `step_um=5`: `best_z_um` within 5 µm of 0 and Z ends
+    there; measured 0.03);
+  - `test_a_sweep_past_the_soft_limit_is_refused_before_any_move` (Z at
+    990, `range_um=25`: `PluginRunError`, Z still 990, no file);
+  - `test_a_guard_trip_ends_the_sweep_and_keeps_the_frames` (a `ZStage`
+    override whose third move raises `SafetyRefusedError`: the error names
+    plane 3 of 11, two files kept, no `engage()` after);
+  - `test_a_locked_autofocus_is_switched_off_for_the_sweep_and_relocked`
+    (the demo's `engage()` first: off during every move, locked after,
+    `relocked is True`);
+  - `test_relock_false_leaves_it_off_at_the_best_plane`;
+  - `test_an_autofocus_on_and_not_locked_is_refused`;
+  - `test_a_halt_during_the_sweep_is_not_a_plugin_error` (FM-64);
+  - `test_a_readback_off_its_command_fails_the_sweep` (FM-167);
+  - `test_a_dry_run_moves_nothing_and_writes_nothing`.
+- **The scan** (`tests/test_scan_demo.py`, its rig; the `_Autofocus`
+  double gains a plane it drives Z to on `engage()`, e.g. 3.0 µm, while the
+  `SampleCamera` is sharp at 0):
+  - `test_per_field_focus_takes_each_frame_at_the_sharp_plane` (every
+    frame's `z_um` within one step of 0, `dz_um` near −3, the autofocus
+    off at every snap and locked after the scan);
+  - `test_per_well_focus_sweeps_until_a_peak_then_reuses_its_dz` (the
+    first field made flat by its camera: the second is swept, the later
+    ones `source == "well"`);
+  - `test_an_unlocked_field_gets_no_focus_step`;
+  - `test_a_failed_sweep_is_a_failed_field_and_leaves_the_autofocus_off`;
+  - `test_the_next_field_relocks_after_the_focus` (the engage count, and
+    §8's `assumed` line not counting them);
+  - `test_the_focus_time_per_field_is_reported` (the line, not a value);
+  - `test_cell_focus_without_soft_limits_is_refused_before_anything_moves`;
+  - `test_a_resume_after_the_autofocus_was_left_off_is_refused`;
+  - `test_a_frame_without_cell_focus_is_written_as_before` (no key in the
+    dump; `tests/unit/test_slots.py`'s `SAMPLES` gain a frame with it).
+- **Script** (`tests/test_dev_focus_scores.py`): a stack written by the
+  tool on the demo-sample, scored: exit 0, a row per plane, the peak near
+  0; a folder of two frames is skipped and exit 1.
+- The presets' round-trip case for `focus-on-cells`
+  (`tests/unit/test_preset_from_document.py`) and the registry's listing.
+
+**Failure modes**: FM-12, FM-19, FM-24, FM-32, FM-38, FM-43, FM-64,
+FM-73, FM-74, FM-88, FM-98, FM-104, FM-111, FM-118, FM-124, FM-129, FM-142,
+FM-154, FM-155, FM-165, FM-167, FM-182, FM-195.
+
+### 21.10 Not verified (for the owner)
+
+At the Ti2-E, 40× on a plate with cells, PFS locked on them (m2 §12.10.7):
+- `smc run focus-on-cells --param range_um=5 --param step_um=0.5` on a
+  few wells, each run's folder copied to `local/`; then
+  `scripts/dev/focus_scores.py` on them: which score peaks at the by-eye
+  focus (within 1 µm), whether the curves show two maxima (D4), and the
+  defaults of range and step.
+- The PFS lock held after the relock (`smc autofocus get`), and how far Z
+  moved in it.
+- The time per plane (a Z move of a step and its settling, FM-195, then a
+  snap) and per field, against §21.6's `assumed` line.
+- Whether a Z readback lands within a quarter step of its command.
+- The 40×'s offset factor, which #392 (route and NIS-Elements) waits for.
