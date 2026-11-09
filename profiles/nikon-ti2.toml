@@ -69,6 +69,10 @@ settle_tolerance_um = 0.5
 # `Magnification` reads 1.0x / 1.5x, and getMagnificationFactor() 1.0 / 1.5.
 
 # [objectives]
+# Written by `smc objective offset --write` (m3 §20) as one block at the end of this file,
+# from the offsets `objective-offsets` measured on the plate; nothing is entered by hand.
+# Below is only the shape of what it writes: a hand-written [objectives] table is refused
+# by the write, and one entered by the hand procedure (m2 §13.6) is deleted before it.
 # Nothing is entered before session 3 has measured it (m2 §13.6, #340): unknown is never zero,
 # and the layer then moves unshifted and says so. For the magnifier lever at 1.0x. The sign is
 # offset(O) = p_O - p_reference, the same feature centred in the frame under each objective;
