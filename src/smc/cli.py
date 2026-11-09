@@ -1769,7 +1769,6 @@ def _offsets_from_run_doc(
     from pydantic import ValidationError
 
     from smc.hardware.profile import ObjectivesSection, profile_text
-    from smc.hardware.profile_write import with_objectives
     from smc.plugins.slots import ObjectiveOffsetsResult
     from smc.run.files import AtomicWriteError, write_atomically
 
@@ -1854,13 +1853,32 @@ def _offsets_from_run_doc(
         if not write:
             _say(f"nothing was written: add --write to write these into {source}")
             return
+        # Only the write needs the writer, and with it `tomli-w`: a PC updated with
+        # `git pull` and not reinstalled still shows the preview, and is told what
+        # is missing when it writes (as `smc presets save` is).
+        missing = False
+        try:
+            from smc.hardware.profile_write import with_objectives
+        except ImportError:
+            missing = True
+        if missing:
+            _fail(
+                "writing the profile needs the tomli-w package, which this install "
+                "lacks: run pip install -e . in the smc folder, then write again"
+            )
+            raise typer.Exit(code=_EXIT_ERROR)
         text = with_objectives(profile_text(source), section, where=str(source))
         failed = ""
         try:
             write_atomically(source, text.encode("utf-8"), make_parents=False)
         except AtomicWriteError as exc:
+            # The profile is as it was. When only the rename failed (Windows: an
+            # editor or a sync client holds the file), the whole new text is kept.
             failed = f"{source} was not changed: {exc.strerror or exc}" + (
-                f"; the whole new text is kept in {exc.kept}" if exc.kept else ""
+                f"; the whole new text is kept in {exc.kept}: close what holds the "
+                "profile and write again, then delete that file"
+                if exc.kept
+                else ""
             )
         if failed:
             _fail(failed)

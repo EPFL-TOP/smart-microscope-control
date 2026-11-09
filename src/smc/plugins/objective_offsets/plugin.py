@@ -37,6 +37,7 @@ The decisions that keep a number that the stage will move by from lying:
 
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -110,6 +111,15 @@ _LEVER_LINE = (
 _Z_LINE = (
     "Z after a turn is where the stand left it once it was still, not a focused "
     "Z: no z_offset_um is measured"
+)
+#: The tool compares each well's centre now with the one plate-walls recorded, so
+#: a plate that moved as a whole in between (re-seated, bumped, drifted) shifts
+#: every well alike: the wells agree and the shift reads as an offset between
+#: objectives. Nothing in the run tells the two apart; the result says so.
+_PLATE_LINE = (
+    "the plate has not moved since plate-walls registered it: a plate that moved "
+    "as a whole is taken for an offset between objectives, and the wells agreeing "
+    "does not show otherwise"
 )
 
 
@@ -441,6 +451,7 @@ class ObjectiveOffsetsPlugin:
 
         assumed.append(_LEVER_LINE)
         assumed.append(_Z_LINE)
+        assumed.append(_PLATE_LINE)
         if reference is None:
             assumed.append(
                 "the profile names no reference objective: the offsets are from "
@@ -643,6 +654,16 @@ def _turn(
     first = z_stage.position_um()
     ctx.wait_s(Z_STILL_S)
     second = z_stage.position_um()
+    # A read that is not a number is refused first: a NaN compares false with
+    # everything, so `abs(nan) > bound` would call it still and start the walk at
+    # an unknown Z (FM-104, FM-195).
+    if not (math.isfinite(first) and math.isfinite(second)):
+        raise PluginRunError(
+            _NAME,
+            f"Z reads {first!r} and {second!r} µm after the turn to {target}: a Z "
+            f"that is not a number is not a still Z; nothing was measured with "
+            f"{target}",
+        )
     if abs(second - first) > Z_STILL_UM:
         raise PluginRunError(
             _NAME,

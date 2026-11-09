@@ -29,7 +29,8 @@ import math
 import re
 import shutil
 import threading
-from collections.abc import Callable, Iterator
+import time
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -252,6 +253,43 @@ class _Z:
 
     def limits_um(self) -> Limits | None:
         return self._inner.limits_um()
+
+
+class _ClockZ(_Z):
+    """A focus drive that, once ``drift()`` is called, creeps with the clock: 10 µm per second.
+
+    ``_Z`` drifts per read, so it is refused however close together the two reads are.
+    This one is refused only if they are ``Z_STILL_S`` apart: a plugin that drops the
+    wait reads it twice in a few microseconds and sees it still (FM-195).
+    """
+
+    def __init__(self, inner: ZStage) -> None:
+        super().__init__(inner)
+        self._armed_at: float | None = None
+
+    def drift(self) -> None:
+        self._armed_at = time.monotonic()
+
+    def position_um(self) -> float:
+        if self._armed_at is None:
+            return self._inner.position_um()
+        return self._inner.position_um() + 10.0 * (time.monotonic() - self._armed_at)
+
+
+class _ScriptedZ(_Z):
+    """A focus drive that, once ``drift()`` is called, answers the reads of ``script`` in order, then the last one again."""
+
+    def __init__(self, inner: ZStage, script: Sequence[float]) -> None:
+        super().__init__(inner)
+        self._script = list(script)
+        self._reads = 0
+
+    def position_um(self) -> float:
+        if not self._drifting:
+            return self._inner.position_um()
+        value = self._script[min(self._reads, len(self._script) - 1)]
+        self._reads += 1
+        return value
 
 
 class _Stage:
@@ -576,6 +614,10 @@ def test_the_samples_offsets_are_recovered_within_a_pixel(
     assert any("magnifier lever" in line for line in result.assumed)
     assert any("no z_offset_um is measured" in line for line in result.assumed)
     assert any("names no reference objective" in line for line in result.assumed)
+    # What the offsets rest on and the run cannot tell: a plate that moved as a whole
+    # since plate-walls registered it shifts every well alike, the wells agree, and the
+    # shift reads as an offset between objectives.
+    assert any("has not moved since plate-walls" in line for line in result.assumed)
     assert result.objective_in_place == TWENTY
 
 
@@ -599,6 +641,15 @@ def test_each_well_is_measured_under_the_target_where_the_sample_puts_it(
     assert measure.shift_xy_um == pytest.approx((-37.5, 12.25), abs=0.5)
     assert measure.pixel_size_um == pytest.approx(0.25, abs=0.01)
     assert measure.calibration_measured != ""
+    # The calibration's path is the one typed (FM-24, FM-50): not resolved, not absolute
+    # by the tool's doing.
+    assert measure.calibration == documents.forty.as_posix()
+    # The frames taken are the sides' own, counted: every side of every well took at
+    # least its walk and its centred frame.
+    assert measure.frames == sum(
+        wall.frames for well in measure.wells for wall in well.fit.walls
+    )
+    assert measure.frames >= 2 * 4 * len(measure.wells)
     # Z reads where the demo left it, still.
     assert measure.z_after_turn_um == pytest.approx(0.0, abs=0.5)
 
@@ -911,6 +962,180 @@ def test_a_walk_that_leaves_the_soft_limits_is_refused_before_the_turret_turns(
     _nothing_moved(rig)
 
 
+def _edited_calibration(
+    documents: Documents, tmp_path: Path, edit: Callable[[dict[str, Any]], None]
+) -> Path:
+    """A copy of the 40X's calibration document whose result went through ``edit``; the record stays a usable one."""
+    path = tmp_path / "cal-40x-edited.json"
+    shutil.copy(documents.forty, path)
+    record = RunDocument.load(path).stages["camera-calibration"]
+    dumped = record.model_dump(mode="json")
+    edit(dumped["result"])
+    write_stage(path, StageRecord.model_validate(dumped))
+    return path
+
+
+def test_a_calibration_that_makes_too_many_frames_is_refused_before_the_turret_turns(
+    open_stand: Callable[..., Microscope],
+    run_doc: Path,
+    documents: Documents,
+    tmp_path: Path,
+) -> None:
+    # A pixel size of 0.01 µm makes the walk's step 3.84 µm: 260 steps either way over
+    # the default search, 3 wells and 4 walls, thousands of frames (FM-74, FM-140). The
+    # demo's own objectives are all coarse enough to stay under the bound of 600.
+    fine = _edited_calibration(
+        documents, tmp_path, lambda result: result.update(pixel_size_um=0.01)
+    )
+    rig = _rig(open_stand())
+
+    refused = _refused(rig.stand, run_doc, (FORTY,), (fine,))
+
+    match = re.fullmatch(
+        r"up to (\d+) frames: use a lower magnification or a smaller search_um",
+        refused.reason,
+    )
+    assert match is not None, refused.reason
+    assert int(match[1]) > 600
+    _nothing_moved(rig)
+
+
+@pytest.mark.parametrize(
+    ("edit", "start"),
+    [
+        (
+            lambda result: result.update(image_shape_px=[256, 256]),
+            "the camera calibration is not of this stand: it is of a frame of "
+            "(256, 256), the camera gives (512, 512); ",
+        ),
+        (
+            lambda result: result.update(matrix_um_per_px=[[0.0, 0.0], [0.0, 0.0]]),
+            "the camera calibration's matrix cannot be inverted (determinant 0.0); ",
+        ),
+    ],
+    ids=["another-frame", "singular-matrix"],
+)
+def test_a_calibration_that_does_not_fit_the_camera_is_refused_before_the_turret_turns(
+    open_stand: Callable[..., Microscope],
+    run_doc: Path,
+    documents: Documents,
+    tmp_path: Path,
+    edit: Callable[[dict[str, Any]], None],
+    start: str,
+) -> None:
+    # Only the objective's match is by construction: the frame and the matrix are the
+    # tool's own check of each calibration (FM-125, FM-43).
+    bad = _edited_calibration(documents, tmp_path, edit)
+    rig = _rig(open_stand())
+
+    refused = _refused(rig.stand, run_doc, (FORTY,), (bad,))
+
+    assert refused.reason == (
+        f"{start}run camera-calibration with {FORTY} in place, on a field with "
+        "texture: a well's wall will do"
+    )
+    _nothing_moved(rig)
+
+
+@pytest.mark.parametrize(
+    ("offset", "shown"),
+    [((-1500.0, 0.0), "(-1500.0, 0.0)"), ((0.0, 1000.5), "(0.0, 1000.5)")],
+    ids=["x-beyond", "y-beyond"],
+)
+def test_an_offset_beyond_the_profiles_bound_is_refused_and_leaves_nothing_to_write(
+    open_stand: Callable[..., Microscope],
+    run_doc: Path,
+    documents: Documents,
+    monkeypatch: pytest.MonkeyPatch,
+    offset: tuple[float, float],
+    shown: str,
+) -> None:
+    # Two parcentric objectives are tens of µm apart. A measured shift cannot pass 1000
+    # (the search stops there), but an offset moved to another reference can: the
+    # arithmetic is tested on its own, this is that the tool refuses what it returns.
+    monkeypatch.setattr(
+        "smc.plugins.objective_offsets.plugin.offsets_from_reference",
+        lambda origin, shifts, reference: (origin, ((FORTY, offset),)),
+    )
+    stand = open_stand()
+
+    refused = _refused(
+        stand, run_doc, (FORTY,), (documents.forty,), wells=("A1", "H12")
+    )
+
+    assert refused.reason == (
+        f"the offset of {FORTY} would be {shown} µm, beyond the profile's ±1000 µm: "
+        "a wrong well or a wrong calibration, not two parcentric objectives"
+    )
+    record = _stored(run_doc)
+    assert record.status is StageStatus.failed
+    assert record.result is None
+
+
+def test_an_offset_on_the_profiles_bound_is_accepted(
+    open_stand: Callable[..., Microscope],
+    run_doc: Path,
+    documents: Documents,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "smc.plugins.objective_offsets.plugin.offsets_from_reference",
+        lambda origin, shifts, reference: (origin, ((FORTY, (1000.0, -1000.0)),)),
+    )
+    stand = open_stand()
+
+    result = _result(
+        _run(stand, run_doc, (FORTY,), (documents.forty,), wells=("A1", "H12"))
+    )
+
+    assert _offsets(result) == {FORTY: (1000.0, -1000.0)}
+
+
+def test_a_calibration_path_is_recorded_as_typed_and_not_resolved(
+    open_stand: Callable[..., Microscope],
+    run_doc: Path,
+    documents: Documents,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A relative path is relative to the working directory, and the result names it so:
+    # an absolute one is a user's folder in a file that is attached to issues (FM-24,
+    # FM-50). The temporary folders here are absolute already, so the test types it
+    # relative, from the folder that holds it.
+    monkeypatch.chdir(documents.forty.parent)
+    stand = open_stand()
+
+    result = _result(
+        _run(
+            stand,
+            run_doc,
+            (FORTY,),
+            (Path(documents.forty.name),),
+            wells=("A1", "H12"),
+        )
+    )
+
+    assert result.measures[0].calibration == "cal-40x.json"
+
+
+def test_search_um_reaches_the_walk_and_its_refusal_names_this_tool(
+    open_stand: Callable[..., Microscope], run_doc: Path, documents: Documents
+) -> None:
+    # Under the 40X the walls lie 37.5 µm (x) and 12.25 µm (y) from where the 10X's
+    # centres put them: a search of 5 µm does not reach them. The refusal comes from
+    # plate-walls' loop, and says whose run it is and what to check for this tool.
+    rig = _rig(open_stand())
+
+    refused = _refused(rig.stand, run_doc, (FORTY,), (documents.forty,), search_um=5.0)
+
+    assert refused.reason.startswith("no wall found on A1's +X side in ")
+    assert refused.reason.endswith(
+        f"check that the light is on, that {FORTY} images the wall as the "
+        "registration's objective did, and that search_um (5 µm) covers the offset"
+    )
+    # The turret was turned, and is left where it is.
+    assert rig.turret.turns == [FORTY]
+
+
 # --------------------------------------------------- refused once it has started
 
 
@@ -1072,6 +1297,127 @@ def test_z_still_moving_after_the_turn_is_refused(
     assert rig.turret.turns == [FORTY]
     assert rig.camera.snaps == 0
     assert rig.stage.moves == 0
+
+
+def _rig_with_z(stand: Microscope, make_z: Callable[[ZStage], _Z]) -> _Rig:
+    """The counting doubles, with a focus drive of this test's own that the turret arms once it has turned."""
+    z = make_z(stand.require(ZStage))
+    stand.override(ZStage, z)
+    return _rig(stand, turret=lambda inner: _DriftingTurret(inner, z))
+
+
+def test_a_z_that_creeps_with_time_is_refused_because_the_two_reads_are_apart(
+    open_stand: Callable[..., Microscope], run_doc: Path, documents: Documents
+) -> None:
+    # `_Z` above drifts per read, which no wait can change. This one drifts 10 µm per
+    # second: reads 0.1 s apart differ by 1 µm (over the 0.5 µm bound), and reads a few
+    # microseconds apart by nothing, so only a plugin that waits between them refuses it.
+    rig = _rig_with_z(open_stand(), _ClockZ)
+
+    refused = _refused(rig.stand, run_doc, (FORTY,), (documents.forty,))
+
+    assert re.fullmatch(
+        r"Z moved from -?\d+\.\d\d to -?\d+\.\d\d µm within 0\.1 s after the turn to "
+        rf"{FORTY}: the stand was still moving it; nothing was measured with {FORTY}",
+        refused.reason,
+    ), refused.reason
+    assert rig.camera.snaps == 0
+    assert rig.stage.moves == 0
+
+
+def test_z_after_the_turn_is_the_second_read_of_a_z_that_is_still(
+    open_stand: Callable[..., Microscope], run_doc: Path, documents: Documents
+) -> None:
+    # Reads of 0.0 and then 0.3 µm: within the 0.5 µm bound, so the run goes on, and
+    # what is recorded is where the stand was once it was still: the second read.
+    rig = _rig_with_z(open_stand(), lambda inner: _ScriptedZ(inner, [0.0, 0.3]))
+
+    result = _result(
+        _run(
+            rig.stand,
+            run_doc,
+            (TWENTY,),
+            (documents.twenty,),
+            wells=("A1", "H12"),
+        )
+    )
+
+    assert result.measures[0].z_after_turn_um == pytest.approx(0.3)
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        [math.nan, math.nan],
+        [math.nan, 0.0],
+        [0.0, math.nan],
+        [math.inf, math.inf],
+        [-math.inf, math.inf],
+    ],
+    ids=["nan-nan", "nan-number", "number-nan", "inf-inf", "minus-inf-inf"],
+)
+def test_a_z_that_is_not_a_number_is_refused_before_anything_is_imaged(
+    open_stand: Callable[..., Microscope],
+    run_doc: Path,
+    documents: Documents,
+    script: list[float],
+) -> None:
+    # A NaN compares false with everything, so `abs(nan) > 0.5` called it still and the
+    # walk started at an unknown Z (FM-104, FM-195).
+    rig = _rig_with_z(open_stand(), lambda inner: _ScriptedZ(inner, script))
+
+    refused = _refused(rig.stand, run_doc, (FORTY,), (documents.forty,))
+
+    assert re.fullmatch(
+        r"Z reads (-?inf|nan|0\.0) and (-?inf|nan|0\.0) µm after the turn to "
+        rf"{FORTY}: a Z that is not a number is not a still Z; nothing was measured "
+        rf"with {FORTY}",
+        refused.reason,
+    ), refused.reason
+    assert rig.turret.turns == [FORTY]
+    assert rig.camera.snaps == 0
+    assert rig.stage.moves == 0
+
+
+def test_a_stop_between_two_targets_turns_nothing_more(
+    open_stand: Callable[..., Microscope], run_doc: Path, documents: Documents
+) -> None:
+    # The stop comes after the last side of the first target's last well (3 wells, 4
+    # sides: the 12th of 24) and before the second target's turn: only the check at the
+    # top of the loop can honour it, and a turn over a loaded plate after a stop is the
+    # failure (FM-14, FM-64, FM-88).
+    stop = threading.Event()
+    rig = _rig(open_stand())
+
+    def after_the_first_target(progress: Progress) -> None:
+        if progress.done == 12:
+            stop.set()
+
+    record = _run(
+        rig.stand,
+        run_doc,
+        (FORTY, TWENTY),
+        (documents.forty, documents.twenty),
+        stop=stop,
+        on_progress=after_the_first_target,
+    )
+
+    assert record.status is StageStatus.stopped
+    assert rig.turret.turns == [FORTY]
+    assert rig.turret.current() == FORTY
+
+
+def test_a_stop_asked_before_the_first_turn_turns_nothing(
+    open_stand: Callable[..., Microscope], run_doc: Path, documents: Documents
+) -> None:
+    stop = threading.Event()
+    stop.set()
+    rig = _rig(open_stand())
+
+    record = _run(rig.stand, run_doc, (FORTY,), (documents.forty,), stop=stop)
+
+    assert record.status is StageStatus.stopped
+    _nothing_moved(rig)
 
 
 def test_a_turn_the_layer_refuses_is_refused_with_its_text(

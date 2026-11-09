@@ -585,6 +585,100 @@ def test_an_objectives_table_the_profile_holds_by_hand_is_refused_by_the_write_o
     assert profile.read_bytes() == before
 
 
+@pytest.mark.parametrize("kept", [True, False], ids=["kept", "not-kept"])
+def test_a_profile_that_cannot_be_replaced_is_one_line_and_is_as_it_was(
+    documents: Documents,
+    measured: Measured,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kept: bool,
+) -> None:
+    # Windows refuses the rename while an editor or a sync client holds the file
+    # (FM-24, FM-38): the write raises, the profile is as it was, and the command says
+    # so in one `✗` line and exits 1. It must not print `✓ wrote ...`.
+    from smc.run.files import AtomicWriteError
+
+    profile = _profile_copy(documents, tmp_path)
+    before = profile.read_bytes()
+    temporary = tmp_path / ".stand.toml.0123abcd.smc-tmp"
+
+    def refuse(path: Path, data: bytes, *, make_parents: bool = True) -> None:
+        raise AtomicWriteError(
+            PermissionError(13, "Access is denied"), temporary if kept else None
+        )
+
+    monkeypatch.setattr("smc.run.files.write_atomically", refuse)
+
+    result = _from_run_doc(profile, measured.run_doc, "--write")
+
+    assert result.exit_code == 1
+    last = _out(result).splitlines()[-1]
+    if kept:
+        assert last == (
+            f"✗ {profile.resolve()} was not changed: Access is denied; the whole new "
+            f"text is kept in {temporary}: close what holds the profile and write "
+            "again, then delete that file"
+        )
+    else:
+        assert last == f"✗ {profile.resolve()} was not changed: Access is denied"
+    assert "✓" not in _out(result)
+    assert profile.read_bytes() == before
+
+
+def test_offsets_the_profile_would_refuse_are_one_line_and_nothing_is_written(
+    documents: Documents, measured: Measured, tmp_path: Path
+) -> None:
+    from smc.run import StageRecord, write_stage
+
+    # A result that names an offset for its own reference objective, which the profile
+    # refuses ("its offset is zero by definition"): the section is validated before
+    # anything is printed as a result or written.
+    run_doc = tmp_path / "run.json"
+    shutil.copy(measured.run_doc, run_doc)
+    record = RunDocument.load(run_doc).stages["objective-offsets"]
+    dumped = record.model_dump(mode="json")
+    dumped["result"]["offsets"].append({"objective": TEN, "xy_offset_um": [1.0, 2.0]})
+    write_stage(run_doc, StageRecord.model_validate(dumped))
+    profile = _profile_copy(documents, tmp_path)
+    before = profile.read_bytes()
+
+    result = _from_run_doc(profile, run_doc, "--write")
+
+    assert result.exit_code == 1
+    lines = _out(result).splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith("✗ the offsets would not be valid in the profile: ")
+    assert f"the reference objective '{TEN}'" in lines[0]
+    assert profile.read_bytes() == before
+
+
+def test_a_pc_without_tomli_w_still_shows_the_preview_and_says_what_is_missing_to_write(
+    documents: Documents,
+    measured: Measured,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An install updated by `git pull` and not reinstalled lacks `tomli-w` (a dependency
+    # since #337). Only the write needs it: the preview must not die on its import, and
+    # the write says what to do, as `smc presets save` does (FM-112).
+    profile = _profile_copy(documents, tmp_path)
+    before = profile.read_bytes()
+    monkeypatch.setitem(sys.modules, "tomli_w", None)
+    monkeypatch.delitem(sys.modules, "smc.hardware.profile_write")
+
+    preview = _from_run_doc(profile, measured.run_doc)
+    written = _from_run_doc(profile, measured.run_doc, "--write")
+
+    assert preview.exit_code == 0, _out(preview)
+    assert _out(preview).splitlines()[-1].startswith("nothing was written")
+    assert written.exit_code == 1
+    assert _out(written).splitlines()[-1] == (
+        "✗ writing the profile needs the tomli-w package, which this install lacks: "
+        "run pip install -e . in the smc folder, then write again"
+    )
+    assert profile.read_bytes() == before
+
+
 # ------------------------------------------------------------------ usage errors
 
 

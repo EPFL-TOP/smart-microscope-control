@@ -67,9 +67,16 @@ OTHER = ObjectivesSection(
 
 @pytest.fixture(scope="module")
 def original() -> str:
-    """The text of ``nikon-ti2.toml``, read as bytes and decoded as the loader does."""
-    text = NIKON.read_bytes().decode("utf-8")
+    """The text of ``nikon-ti2.toml``, read as bytes and decoded as the loader does, with LF line ends.
+
+    A Windows checkout with ``core.autocrlf`` has the file in CRLF, and the writer
+    keeps what it finds (that is its job): the tests that need LF text build it from
+    the committed bytes, not from the working tree's (FM-101). The CRLF case has a
+    test of its own, which converts this text.
+    """
+    text = NIKON.read_bytes().replace(b"\r\n", b"\n").decode("utf-8")
     assert text.endswith("\n")
+    assert "\r" not in text
     assert "objectives" not in tomllib.loads(text)
     return text
 
@@ -155,7 +162,7 @@ def test_the_block_is_appended_and_every_other_line_comes_back(original: str) ->
 
     # The bytes of the profile come first, unchanged (FM-107): nothing outside the
     # block is touched, not a line end, not a comment, not a key.
-    assert written.encode("utf-8").startswith(NIKON.read_bytes())
+    assert written.encode("utf-8").startswith(original.encode("utf-8"))
     # Then one empty line and the block.
     assert written[len(original) :] == "\n" + objectives_block(SECTION)
     # Parsed, it is the profile it was plus the offsets, and the offsets read back.

@@ -42,7 +42,12 @@ distance, the plate's height) first.
 2. **The objective the plate is registered with in place** (the 4×): `camera-calibration`
    and then [`plate-walls`](plate-walls.md) into `run.json`. The plate must come from
    `plate-walls`: a plate registered by eye (`plate-registration`) or fitted
-   (`plate-finding`) has positions nobody measured.
+   (`plate-finding`) has positions nobody measured. **Do not touch the plate between
+   this step and the next, and do not reload it.** The tool compares each well's centre now
+   with the one `plate-walls` recorded, so a plate that moved as a whole (re-seated,
+   bumped, drifted) shifts every well alike: the wells agree, the run ends `done`, and the
+   shift is written as an offset between objectives. Nothing in the run can tell the two
+   apart.
 3. **Measure:**
 
    ```text
@@ -124,8 +129,10 @@ held to, the frames and their folder; then the offsets to write, the reference a
 the profile named it. `assumed` says what it rests on: that the stage reports no soft
 limits when it does not; that the offsets are for the magnifier lever as it was, which the
 profile cannot key (FM-103); that Z after a turn is where the stand left it, not a focused
-Z; and, when the profile names no reference, that `--write` makes the plate's objective
-the reference.
+Z; that the plate has not moved since `plate-walls` registered it (a plate that moved as a
+whole is taken for an offset between objectives, and the wells agreeing does not show
+otherwise); and, when the profile names no reference, that `--write` makes the plate's
+objective the reference.
 
 **Frames.** With `save_frames` the centred frame of each wall is a TIFF under
 `objective-offsets/<token>/<n>/<well>_<side>.tif` beside the run document, `n` the target's
@@ -166,7 +173,9 @@ measured = "2026-11-12, session 3 (#NNN), objective-offsets in run.json"
   nothing. A refused run has no `done` record, so there is nothing to write from.
 - The new text is read back as the loader reads it before it is written, and written
   atomically. On Windows an editor that holds the profile open can make the replace fail:
-  the command then says where the whole new text was kept.
+  the command then says where the whole new text was kept (a `.<name>.<token>.smc-tmp` file
+  beside the profile, which git ignores): close what holds the profile, write again, and
+  delete that file. The profile is as it was.
 
 ## What each refusal means
 
@@ -194,6 +203,7 @@ The others come **after the turret has turned**, which stays where it is:
 | `the turn to <t> was refused: …` | The layer refused the turn; its own text follows. |
 | `the turret reads <x> after the turn to <t>: it did not turn, or its label lags …` | Nothing was measured with that target. Look at the turret. |
 | `Z moved from <a> to <b> µm within 0.1 s after the turn to <t>: the stand was still moving it …` | Z had not settled; nothing was measured. Run it again, or give the stand time. |
+| `Z reads <a> and <b> µm after the turn to <t>: a Z that is not a number is not a still Z …` | The focus drive answered `nan` or `inf`: its readback is not working. Nothing was imaged. |
 | `no wall found on …` | As in `plate-walls`, but the hint is the target's: the light, whether the target images the wall as the registration's objective did, and whether `search_um` covers the offset. |
 | `the wells do not agree on the offset, so it is not a translation or not measured well enough: <t>: <w1> (<dx>, <dy>), <w2> (…) µm, spread <s> µm, bound <b> µm; … look at the frames in <folder>, or give a larger max_spread_um if the stage's repeatability is larger` | Every number is in the message, for every target that failed, and nothing can be written. Look at the frames before raising the bound. |
 | `the offset of <O> would be (<x>, <y>) µm, beyond the profile's ±1000 µm: a wrong well or a wrong calibration, not two parcentric objectives` | The offset could not be written, and it is not an offset. |
