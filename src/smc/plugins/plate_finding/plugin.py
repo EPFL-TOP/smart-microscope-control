@@ -27,6 +27,13 @@ harm or from lying:
   after the fit, for the plate that won: a winner larger than the survey, or a
   survey with its edge skipped, can leave A1 a whole well off while the score is
   high.
+* **One survey, one objective** (m3 §18.3). The plate records the objective it was
+  surveyed with, because the scan may use another and moves the plate by the
+  profile's offset between them. The objective is read before anything moves, kept in
+  the checkpoint, and read again after the last point: a resume under another
+  objective is refused before it moves, and a turn during the survey ends it, since
+  the points of two objectives are in two frames and one lattice cannot fit both.
+  An empty turret position is no objective and is refused.
 """
 
 from __future__ import annotations
@@ -38,10 +45,11 @@ import numpy as np
 import useq
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from smc.hardware.capabilities import Autofocus, Camera, XYStage
+from smc.hardware.capabilities import Autofocus, Camera, ObjectiveTurret, XYStage
 from smc.hardware.errors import HardwareError, MicroscopeHaltedError, MotionStoppedError
 from smc.plugins.api import PluginParams, RunContext
 from smc.plugins.errors import PluginRunError
+from smc.plugins.objectives import objective_for
 from smc.plugins.plate_finding.algorithm import (
     SurveyPoint,
     decide,
@@ -216,10 +224,13 @@ class SurveyCheckpoint(BaseModel):
     limits shift every index and nothing says so (FM-141). The count is not a
     fingerprint: limits that move and keep the count pass it. The centre is
     kept because without parameters it is the stage's position at the start, and
-    on a resume the stage is elsewhere. A pydantic model built from Python objects does not
-    validate a nested dataclass again, so a ``SurveyPoint`` holding ``nan`` is
-    accepted when built and refused when the JSON is read back: the loop never
-    builds one.
+    on a resume the stage is elsewhere. The objective is kept for the same
+    reason as the size: what is sampled lies in the frame of one objective, and
+    a resume under another would mix two frames (FM-141); ``None`` for a stand
+    with no turret and for a checkpoint written before #340. A pydantic model
+    built from Python objects does not validate a nested dataclass again, so a
+    ``SurveyPoint`` holding ``nan`` is accepted when built and refused when the
+    JSON is read back: the loop never builds one.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
@@ -229,6 +240,7 @@ class SurveyCheckpoint(BaseModel):
     next_index: int = Field(ge=0)
     skipped: int = Field(ge=0)
     points: tuple[SurveyPoint, ...]
+    objective: str | None = None
 
 
 class PlateFindingPlugin:
@@ -258,9 +270,12 @@ class PlateFindingPlugin:
             PluginRunError: A dry run was asked to survey; the survey is too big,
                 or cannot pin A1 down inside the stage's soft limits (nothing
                 moved); the checkpoint is not this survey's, or was made for
-                another survey size; ``max_failed_in_row`` points in a row, or
-                more than a tenth of them, failed; the fit is unusable, or its
-                winner is a larger plate than the survey reaches.
+                another survey size, or under another objective than the one in
+                place (nothing moved); the turret is at an empty position;
+                ``max_failed_in_row`` points in a row, or more than a tenth of
+                them, failed; the objective changed during the survey; the fit
+                is unusable, or its winner is a larger plate than the survey
+                reaches.
             MicroscopeHaltedError, MotionStoppedError: The stand was stopped; the
                 stage is where it is and the checkpoint keeps the last 50.
             StopRequested: The operator stopped it; ``--resume`` continues.
@@ -273,8 +288,13 @@ class PlateFindingPlugin:
                 "a dry run cannot survey the plate; run it without --dry-run",
             )
 
+        # Before anything moves, and read like every other turret read: a turret
+        # that cannot be read raises, and is not "no objective" (FM-19).
+        turret = microscope.get(ObjectiveTurret)
+        objective, _ = objective_for(_NAME, None, turret)
         checkpoint = ctx.checkpoint(SurveyCheckpoint)
         if checkpoint is not None:
+            _refuse_another_objective(checkpoint.objective, objective)
             centre = checkpoint.centre_um
         elif params.centre_x_um is not None and params.centre_y_um is not None:
             centre = (params.centre_x_um, params.centre_y_um)
@@ -301,7 +321,14 @@ class PlateFindingPlugin:
             # Before the first move: a survey stopped before its 50th point would
             # leave nothing to keep the centre, and a resume would survey again
             # around wherever the stage stopped (FM-111).
-            _save(ctx, centre, total, 0, 0, [])
+            _save(ctx, centre, total, 0, 0, [], objective)
+        elif checkpoint.objective is None and objective is not None:
+            # Taken as given, and said: what was sampled before the resume was
+            # sampled with an objective nobody recorded.
+            assumed.append(
+                "the checkpoint does not record its objective: the points sampled "
+                f"before the resume are taken as {objective}'s"
+            )
         autofocus = microscope.get(Autofocus)
         if first < total and autofocus is not None and autofocus.is_engaged():
             autofocus.disengage()
@@ -345,7 +372,7 @@ class PlateFindingPlugin:
                 else:
                     head = ""
                 if head:
-                    _save(ctx, centre, total, i + 1, skipped, points)
+                    _save(ctx, centre, total, i + 1, skipped, points, objective)
                     raise PluginRunError(
                         _NAME,
                         f"{head} could not be sampled, the last at "
@@ -354,9 +381,20 @@ class PlateFindingPlugin:
                     )
             ctx.progress(i + 1, total, "survey")
             if (i + 1) % _CHECKPOINT_EVERY == 0:
-                _save(ctx, centre, total, i + 1, skipped, points)
+                _save(ctx, centre, total, i + 1, skipped, points, objective)
 
-        _save(ctx, centre, total, total, skipped, points)
+        _save(ctx, centre, total, total, skipped, points, objective)
+        # A turn during the survey puts its later points in another objective's
+        # frame, and one lattice cannot be fitted to two. Read again here, after the
+        # last point and before the fit.
+        now, _ = objective_for(_NAME, None, turret)
+        if now != objective:
+            # The points are of two frames, so none is kept: a complete checkpoint
+            # stamped with the objective the survey began with would let a --resume,
+            # after the turret is turned back, fit them and say it was one frame
+            # (FM-141). The centre stays, so a resume surveys the plate again.
+            _save(ctx, centre, total, 0, 0, [], objective)
+            _refuse_a_turn(objective, now)
         ctx.progress(total, total, "fitting")
         fits = fit(points, list(params.plates) or None)
         best, notes = decide(fits)
@@ -385,6 +423,7 @@ class PlateFindingPlugin:
             margin=best.score - runner_up.score if runner_up is not None else None,
             notes=notes,
             assumed=assumed,
+            objective=objective,
         )
 
 
@@ -485,6 +524,7 @@ def _save(
     next_index: int,
     skipped: int,
     points: list[SurveyPoint],
+    objective: str | None,
 ) -> None:
     ctx.save_checkpoint(
         SurveyCheckpoint(
@@ -493,7 +533,47 @@ def _save(
             next_index=next_index,
             skipped=skipped,
             points=tuple(points),
+            objective=objective,
         )
+    )
+
+
+def _named(objective: str | None) -> str:
+    """An objective for a sentence; ``None`` is a stand that has no turret, or none read."""
+    return objective if objective is not None else "unknown"
+
+
+def _refuse_another_objective(began_with: str | None, in_place: str | None) -> None:
+    """Refuse a resume under another objective than the survey began with, before anything moves.
+
+    A checkpoint that records none (``None``: written before #340, or on a stand with no
+    turret) is not refused: there is nothing to compare, and ``run`` says what it
+    assumed. The text leaves the choice to the operator: turning back keeps the
+    points already sampled, and a new survey drops them.
+    """
+    if began_with is None or began_with == in_place:
+        return
+    raise PluginRunError(
+        _NAME,
+        f"the survey began with {began_with} and the objective in place is "
+        f"{_named(in_place)}: turn the turret back to {began_with} and resume, or "
+        "run the survey again without --resume",
+    )
+
+
+def _refuse_a_turn(began_with: str | None, now: str | None) -> None:
+    """End a survey whose objective changed while it ran: its points lie in two frames.
+
+    The caller has already reset the checkpoint, which keeps the centre and the
+    objective the survey began with and no point, so that what is refused here cannot
+    be resumed into a plate fitted on two frames.
+    """
+    if began_with == now:
+        return
+    raise PluginRunError(
+        _NAME,
+        f"the objective changed during the survey, from {_named(began_with)} to "
+        f"{_named(now)}: run the survey again without --resume",
     )
 
 

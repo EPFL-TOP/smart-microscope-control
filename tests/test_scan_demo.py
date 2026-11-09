@@ -40,6 +40,7 @@ from smc.hardware.capabilities import (
     Camera,
     FocusStep,
     Limits,
+    ObjectiveOffset,
     ObjectiveTurret,
     XYStage,
     ZStage,
@@ -194,6 +195,9 @@ class _Turret:
 
     def pixel_size_um(self, label: str | None = None) -> float:
         return PIXEL_UM
+
+    def offset(self, label: str) -> ObjectiveOffset:
+        return ObjectiveOffset(label, None, None, None, "")
 
 
 class _Autofocus:

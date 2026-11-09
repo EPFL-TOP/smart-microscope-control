@@ -68,6 +68,23 @@ settle_tolerance_um = 0.5
 # multiplied by 1.5. Measured in session 2 (#334): IntermediateMagnification's
 # `Magnification` reads 1.0x / 1.5x, and getMagnificationFactor() 1.0 / 1.5.
 
+# [objectives]
+# Nothing is entered before session 3 has measured it (m2 §13.6, #340): unknown is never zero,
+# and the layer then moves unshifted and says so. For the magnifier lever at 1.0x. The sign is
+# offset(O) = p_O - p_reference, the same feature centred in the frame under each objective;
+# the reference has no entry of its own (its offset is zero by definition).
+# reference = "2-Plan Fluor 10x"
+#
+# [objectives.offsets."1-Plan Fluor 4x"]
+# xy_offset_um = [0.0, 0.0]
+# z_offset_um = 0.0           # after the stand's own Z correction on a turn (#330); stored and shown, never applied
+# measured = "YYYY-MM-DD, session 3 (#issue)"
+#
+# [objectives.offsets."3-Plan Apo LmbdD0.25 40x"]
+# xy_offset_um = [0.0, 0.0]
+# z_offset_um = 0.0
+# measured = "YYYY-MM-DD, session 3 (#issue)"
+
 [quirks]
 # The direction of focus (which way is up) is unknown (#98).
 # Not read by the layer yet (#204); recorded for the design:

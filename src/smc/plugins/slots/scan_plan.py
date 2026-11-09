@@ -39,6 +39,14 @@ class ScanPlanResult(PluginResult):
     ``fov_um`` is ``(width, height)``, the footprint's extent in stage axes.
     ``matrix_source`` says where the camera matrix came from: a calibration
     that was measured, the profile's pixel size, or a parameter.
+
+    ``plate_plan`` and every field are in the frame of ``objective`` (m3
+    §18.3). ``plate_objective`` is the objective the registration was made
+    with, and ``objective_shift_um`` the XY shift the plan applied to move it
+    from that frame to ``objective``'s: ``(0.0, 0.0)`` for the same objective,
+    ``None`` when it could not be applied (an unknown objective or an offset
+    that was not measured), in which case the fields are the registration's
+    unshifted. Both default to unknown, so that older run documents load.
     """
 
     plate_plan: useq.WellPlatePlan
@@ -54,6 +62,8 @@ class ScanPlanResult(PluginResult):
     columns: int = Field(ge=1)
     fields: tuple[PlannedField, ...]
     estimate_s: float | None = Field(ge=0.0)
+    plate_objective: str | None = None
+    objective_shift_um: tuple[float, float] | None = None
 
     @field_validator("plate_plan", mode="wrap")
     @classmethod

@@ -34,6 +34,7 @@ from smc.hardware.capabilities import (
     Autofocus,
     Camera,
     LightSource,
+    ObjectiveOffset,
     ObjectiveTurret,
     XYStage,
     ZStage,
@@ -133,6 +134,9 @@ class StubTurret:
     def pixel_size_um(self, label: str | None = None) -> float:
         return 0.0
 
+    def offset(self, label: str) -> ObjectiveOffset:
+        return ObjectiveOffset(label, None, None, None, "")
+
 
 class FlakyTurret:
     """The stand's own turret, some of whose first reads raise, as a driver that is not ready yet.
@@ -168,6 +172,9 @@ class FlakyTurret:
 
     def pixel_size_um(self, label: str | None = None) -> float:
         return cast("float", self._real.pixel_size_um(label))
+
+    def offset(self, label: str) -> ObjectiveOffset:
+        return cast("ObjectiveOffset", self._real.offset(label))
 
 
 @pytest.fixture(autouse=True)

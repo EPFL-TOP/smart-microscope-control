@@ -20,6 +20,13 @@ rest on it:
 * **The default grid is derived from the very value that may be wrong** (FM-121),
   so a derived grid beyond 100 fields per axis is refused with the pixel size it
   was derived from; giving ``rows`` and ``columns`` is the way out.
+* **The plan is in the frame of the objective it is for** (m3 §18.3). A plate
+  registered with the 10x and planned for the 40x is moved by the offset between
+  the two, which the profile holds (m2 §13), before any field is laid, so that
+  ``plate_plan``, every field and the ``scan`` that visits them are the 40x's. An
+  offset that is not measured, or a plate that does not record its objective, plans
+  with the registration's positions and says so in ``assumed``, before the camera's
+  lines, and in a WARNING. The result keeps the plate's objective and the shift.
 """
 
 from __future__ import annotations
@@ -41,6 +48,7 @@ from smc.plugins.geometry import (
     pixel_matrix,
     pixel_of_stage,
 )
+from smc.plugins.objectives import log_frame, objective_for, plate_for_objective
 from smc.plugins.scan_plan.algorithm import (
     estimate_s,
     gap_overlap,
@@ -174,7 +182,12 @@ class ScanPlanPlugin:
         plate = ctx.upstream("plate", PlateResult)
 
         wells = _wells_in_order(self.name, plate, params)
-        objective, in_place = _objective_for(self.name, params.objective, turret)
+        objective, in_place = objective_for(self.name, params.objective, turret)
+        # The plan is for `objective`, which may not be the one the plate was
+        # registered with: from here on the plate is the one in its frame (m3 §18.3).
+        frame = plate_for_objective(plate, objective, turret)
+        log_frame(ctx.logger, plate, frame, turret)
+        framed = frame.plate
         height, width = camera.image_shape()
         shape = (int(height), int(width))
         if min(shape) < 1:
@@ -194,7 +207,7 @@ class ScanPlanPlugin:
             rows, columns = params.rows, params.columns
         else:
             # Every registered well has one size (m3 §3.2), so the first stands for all.
-            well_um = well_geometry(plate.to_plan(), wells[0]).size_um
+            well_um = well_geometry(framed.to_plan(), wells[0]).size_um
             rows, columns = grid_size(
                 fov_um, well_um, coverage=params.coverage, overlap=params.overlap
             )
@@ -210,7 +223,7 @@ class ScanPlanPlugin:
         problem = ""
         try:
             built = plan_fields(
-                plate,
+                framed,
                 wells,
                 fov_um=fov_um,
                 footprint_of=lambda x, y: footprint(
@@ -234,11 +247,16 @@ class ScanPlanPlugin:
             if timings is not None
             else None
         )
-        # An estimate whose refocus was assumed must not read as measured.
+        # The frame's line first: the positions are what the rest rests on. An
+        # estimate whose refocus was assumed must not read as measured.
         assumed = (
-            basis.assumed
+            (*frame.assumed, *basis.assumed)
             if timings is None
-            else (*basis.assumed, *(f"timings: {line}" for line in timings.assumed))
+            else (
+                *frame.assumed,
+                *basis.assumed,
+                *(f"timings: {line}" for line in timings.assumed),
+            )
         )
         return ScanPlanResult(
             plate_plan=plate_plan,
@@ -254,6 +272,8 @@ class ScanPlanPlugin:
             columns=columns,
             fields=fields,
             estimate_s=estimate,
+            plate_objective=plate.objective,
+            objective_shift_um=frame.shift_um,
             assumed=assumed,
         )
 
@@ -272,43 +292,6 @@ def _wells_in_order(
         # Raised outside the handler: nothing here keeps the grammar's error.
         raise PluginRunError(name, problem)
     return order_wells(plate.plate, parsed, serpentine=params.serpentine)
-
-
-def _objective_for(
-    name: str, requested: str | None, turret: ObjectiveTurret | None
-) -> tuple[str | None, bool]:
-    """The objective the plan is for, and whether it is the one in place.
-
-    Without a turret the objective is unknown (``None``) and the camera's size is
-    the only one there is, so it counts as in place. An objective that is asked
-    for and cannot be checked (no turret) is refused: a plan for an objective
-    that may not be there is the plan this stage exists not to make. So is a
-    turret at an empty position, whose label is ``""`` (the protocol lists empty
-    positions): that is no objective, and taking it for one would plan with the
-    camera's size for an "objective" that does not exist.
-    """
-    if requested is None:
-        if turret is None:
-            return None, True
-        current = turret.current()
-        if not current:
-            raise PluginRunError(
-                name,
-                "no objective is in place: the turret is at an empty position; "
-                "turn it to an objective, or give objective to plan for one",
-            )
-        return current, True
-    if turret is None:
-        raise PluginRunError(
-            name,
-            "the stand has no turret, so objective cannot be checked; leave it unset",
-        )
-    known = [label for label in turret.labels() if label]
-    if requested not in known:
-        raise PluginRunError(
-            name, f"objective {requested!r} is not on the turret: {', '.join(known)}"
-        )
-    return requested, requested == turret.current()
 
 
 def _require_invertible(name: str, matrix: Matrix2, shape: tuple[int, int]) -> None:

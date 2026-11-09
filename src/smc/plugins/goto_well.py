@@ -17,6 +17,13 @@ the first stage that moves the stand on a position computed from a measurement:
 * **In a dry run nothing moved, and the result says so.** The layer returns the
   target for a move it skipped; the readback is then the target, which the
   result's ``assumed`` states, so that nobody takes it for a measurement.
+* **The target is in the frame of the objective in use** (m3 §18.3). A plate
+  registered with the 10x is not at the same stage positions under the 40x; the
+  profile's offset between them moves the plate before the target is computed.
+  An offset that is not measured, or a plate that does not record its objective,
+  moves to the registration's own positions and says so in ``assumed`` and in a
+  WARNING: unknown is not zero. An empty turret position is no objective and is
+  refused before any move.
 """
 
 from __future__ import annotations
@@ -25,9 +32,10 @@ from typing import TYPE_CHECKING, Literal
 
 from pydantic import Field
 
-from smc.hardware.capabilities import XYStage
+from smc.hardware.capabilities import ObjectiveTurret, XYStage
 from smc.plugins.api import PluginParams, PluginResult, RunContext
 from smc.plugins.errors import PluginRunError
+from smc.plugins.objectives import log_frame, objective_for, plate_for_objective
 from smc.plugins.plate_registration.algorithm import wall_position
 from smc.plugins.slots import PlateResult, well_geometry
 
@@ -53,7 +61,14 @@ class GotoWellParams(PluginParams):
 
 
 class GotoWellResult(PluginResult):
-    """Where the stage was sent and where it arrived, in µm."""
+    """Where the stage was sent and where it arrived, in µm.
+
+    ``objective`` is the one in use, ``plate_objective`` the one the plate was
+    registered with, and ``shift_um`` what the target was moved by between the
+    two: ``(0.0, 0.0)`` for the same objective, ``None`` when no offset could be
+    applied (the target is then the registration's own, and ``assumed`` says so).
+    All three default to unknown, so that older run documents load.
+    """
 
     well: str
     side: str
@@ -61,6 +76,9 @@ class GotoWellResult(PluginResult):
     target_y_um: float
     x_um: float
     y_um: float
+    objective: str | None = None
+    plate_objective: str | None = None
+    shift_um: tuple[float, float] | None = None
 
 
 class GotoWellPlugin:
@@ -84,22 +102,31 @@ class GotoWellPlugin:
         """Send one absolute move to the well's centre or wall and report the readback.
 
         Raises:
-            PluginRunError: The well is not on the plate; nothing was moved.
+            PluginRunError: The well is not on the plate, or the turret is at an
+                empty position; nothing was moved.
             StopRequested: The operator stopped it before the move was sent.
             SafetyRefusedError: The target is outside the soft limits; the stage
-                did not move. The layer's errors are not caught (FM-64).
+                did not move. The layer's errors are not caught (FM-64), and a
+                turret that cannot be read raises its own (FM-19).
         """
         plate = ctx.upstream("plate", PlateResult)
+        turret = microscope.get(ObjectiveTurret)
+        # Before anything moves, and before the well is looked up: the target is
+        # worked out on the plate in the frame of the objective in use.
+        objective, _ = objective_for(_NAME, None, turret)
+        frame = plate_for_objective(plate, objective, turret)
+        log_frame(ctx.logger, plate, frame, turret)
+        framed = frame.plate
 
         problem = ""
         well = ""
         target = (0.0, 0.0)
         try:
-            well = well_geometry(plate.to_plan(), params.well).well
+            well = well_geometry(framed.to_plan(), params.well).well
             target = (
-                plate.well_center_um(well)
+                framed.well_center_um(well)
                 if params.side == "centre"
-                else wall_position(plate, well, params.side)
+                else wall_position(framed, well, params.side)
             )
         except ValueError as exc:
             problem = f"{exc}; give a well of the {plate.plate} plate"
@@ -111,6 +138,7 @@ class GotoWellPlugin:
         landed = microscope.require(XYStage).move_to_um(*target)
 
         assumed = [f"plate: {line}" for line in plate.assumed]
+        assumed.extend(frame.assumed)
         if ctx.dry_run:
             assumed.append(
                 "dry run: the stage did not move; x_um and y_um are the target"
@@ -122,5 +150,8 @@ class GotoWellPlugin:
             target_y_um=target[1],
             x_um=landed.x_um,
             y_um=landed.y_um,
+            objective=objective,
+            plate_objective=plate.objective,
+            shift_um=frame.shift_um,
             assumed=tuple(assumed),
         )

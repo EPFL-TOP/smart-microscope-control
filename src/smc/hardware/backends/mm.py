@@ -100,7 +100,12 @@ if TYPE_CHECKING:
     import numpy as np
     from pymmcore_plus import CMMCorePlus
 
-    from smc.hardware.capabilities import Autofocus, LightSource, ZStage
+    from smc.hardware.capabilities import (
+        Autofocus,
+        LightSource,
+        ObjectiveOffset,
+        ZStage,
+    )
     from smc.hardware.safety import Executor, Safety
 
 __all__ = [
@@ -2919,6 +2924,7 @@ class MMObjectiveTurret:
         *,
         requires_confirm: bool,
         pixel_sizes_um: Mapping[str, float],
+        offset_of: Callable[[str], ObjectiveOffset],
         autofocus: Callable[[], Autofocus | None] = lambda: None,
         z_stage: Callable[[], ZStage | None] = lambda: None,
     ) -> None:
@@ -2927,6 +2933,10 @@ class MMObjectiveTurret:
         self._executor = executor
         self._requires_confirm = requires_confirm
         self._pixel_sizes_um = pixel_sizes_um
+        # A bound method of the profile's section, never of this capability or
+        # the facade (FM-92): it holds neither, so it cannot make a cycle
+        # through the core.
+        self._offset_of = offset_of
         self._autofocus = autofocus
         self._z_stage = z_stage
         self._motion = _motion(
@@ -3222,6 +3232,16 @@ class MMObjectiveTurret:
         if factor is None:
             return 0.0
         return float(size) / factor
+
+    def offset(self, label: str) -> ObjectiveOffset:
+        """The profile's ``[objectives]`` offset of ``label`` from its reference (m2 §13.4).
+
+        It reads the profile and nothing else: no lock, no executor, no core
+        call, so it works while the microscope is halted, in a dry run and
+        while the stand moves. Not measured is ``None``, never zero; the
+        profile's offsets are for a magnifier lever at 1.0x (FM-103).
+        """
+        return self._offset_of(label)
 
 
 #: What a property that sets how bright is called, best first (m2 §8.4).

@@ -37,7 +37,14 @@ import tifffile
 import useq
 
 from smc.hardware import Microscope
-from smc.hardware.capabilities import XY, Camera, Limits, ObjectiveTurret, XYStage
+from smc.hardware.capabilities import (
+    XY,
+    Camera,
+    Limits,
+    ObjectiveOffset,
+    ObjectiveTurret,
+    XYStage,
+)
 from smc.hardware.errors import (
     HardwareError,
     MicroscopeHaltedError,
@@ -189,6 +196,9 @@ class _EmptyTurret:
 
     def pixel_size_um(self, label: str | None = None) -> float:
         return 0.0
+
+    def offset(self, label: str) -> ObjectiveOffset:
+        return ObjectiveOffset(label, None, None, None, "")
 
 
 class _Stage:
@@ -517,6 +527,25 @@ def test_two_wells_register_the_plate_of_the_sample(
         )
     ]
     assert _stored(run_doc) == record
+
+
+def test_the_wall_registration_records_its_objective(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    """The plate carries the objective of its frames (m3 §18.1), for the scan that may use another."""
+    stand, camera = _on_demo(demo_microscope_with_sample)
+    run_doc = tmp_path / "run.json"
+    _calibrate(stand, camera, run_doc)
+
+    record = _run(stand, run_doc, _refs("A1", "H12"))
+
+    result = _result(record)
+    assert result.objective == "Nikon 10X S Fluor"
+    assert result.walls is not None
+    assert result.walls.objective == result.objective
+    stored = _stored(run_doc).result
+    assert stored is not None
+    assert stored["objective"] == "Nikon 10X S Fluor"
 
 
 def test_three_wells_fill_the_plate_slot_with_their_walls(

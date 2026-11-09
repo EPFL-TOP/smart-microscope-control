@@ -12,6 +12,7 @@ import pytest
 from smc.hardware import Microscope
 from smc.hardware.capabilities import ObjectiveTurret
 from smc.hardware.errors import SafetyRefusedError
+from smc.hardware.profile import ObjectivesSection
 from smc.testing import FakeCore
 
 
@@ -89,6 +90,90 @@ def test_dry_run_turns_nothing(
     other = _another(dry_objective_turret)
     assert dry_objective_turret.select(other, confirm=True) == other
     assert dry_objective_turret.current() == start
+
+
+def test_offset_is_unknown_or_the_profiles(
+    objective_turret: ObjectiveTurret,
+    microscope: Microscope,
+    backend: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    # m2 §13.4: the offset is read from the profile and from nothing else, so
+    # on every backend it is what the profile's [objectives] says, and a label
+    # it does not name is unknown (None), never zero.
+    section = microscope.profile.objectives
+    reference = section.reference.strip()
+    if backend == "fake":
+        request.getfixturevalue("fake_core").log.clear()
+    for label in objective_turret.labels():
+        offset = objective_turret.offset(label)
+        assert offset.objective == label
+        assert offset.reference == (reference or None)
+        if reference and label == reference:
+            assert (offset.xy_um, offset.z_um) == ((0.0, 0.0), 0.0)
+        elif reference and label in section.offsets:
+            entry = section.offsets[label]
+            assert (offset.xy_um, offset.z_um) == (
+                entry.xy_offset_um,
+                entry.z_offset_um,
+            )
+            assert offset.measured == entry.measured
+        else:
+            assert (offset.xy_um, offset.z_um, offset.measured) == (None, None, "")
+    if backend == "fake":
+        fake: FakeCore = request.getfixturevalue("fake_core")
+        assert fake.log == []
+
+
+def test_offset_is_the_profiles_reference_and_entries(
+    objective_turret: ObjectiveTurret,
+    microscope: Microscope,
+    backend: str,
+    request: pytest.FixtureRequest,
+) -> None:
+    # No contract profile has an [objectives] section, so the test above only
+    # ever takes the `unknown` branch. Here a facade over the same core is given
+    # one, so that a backend that ignores the profile is seen.
+    if backend == "hardware":
+        pytest.skip(
+            "the hardware profile is the stand's own: its offsets are not set here"
+        )
+    labels = [label for label in objective_turret.labels() if label]
+    reference, measured, unmeasured = labels[0], labels[1], labels[2]
+    profile = microscope.profile.model_copy(
+        update={
+            "objectives": ObjectivesSection.model_validate(
+                {
+                    "reference": reference,
+                    "offsets": {
+                        measured: {
+                            "xy_offset_um": [5.0, -2.5],
+                            "z_offset_um": -1.25,
+                            "measured": "2026-11-12, session 3 (#400)",
+                        }
+                    },
+                }
+            )
+        }
+    )
+    turret = Microscope.from_core(microscope.core, profile).require(ObjectiveTurret)
+    if backend == "fake":
+        request.getfixturevalue("fake_core").log.clear()
+
+    ref = turret.offset(reference)
+    entry = turret.offset(measured)
+    unknown = turret.offset(unmeasured)
+
+    assert (ref.xy_um, ref.z_um, ref.reference) == ((0.0, 0.0), 0.0, reference)
+    assert (entry.xy_um, entry.z_um, entry.measured) == (
+        (5.0, -2.5),
+        -1.25,
+        "2026-11-12, session 3 (#400)",
+    )
+    assert (unknown.xy_um, unknown.z_um, unknown.measured) == (None, None, "")
+    if backend == "fake":
+        fake: FakeCore = request.getfixturevalue("fake_core")
+        assert fake.log == []
 
 
 def test_pixel_size_is_unknown_or_the_profiles(

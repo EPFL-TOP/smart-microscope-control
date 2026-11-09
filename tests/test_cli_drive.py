@@ -17,6 +17,7 @@ from typer.testing import CliRunner
 
 import smc.cli as cli
 import smc.drive as drive
+import smc.hardware.backends.mm as mm
 from smc.cli import app
 from smc.drive import AutofocusReading, DriveResult
 
@@ -76,6 +77,139 @@ def test_objective_list_marks_the_current_label() -> None:
         f"'{label}'  (current)" if label == TEN_X else f"'{label}'"
         for label in DEMO_LABELS
     ]
+
+
+#: Written from the numbers of the profile below, never from the command's own helpers (FM-124).
+MEASURED = "2026-11-12, session 3 (#400)"
+
+
+def _write_offsets_profile(path: Path, reference: str, entries: str) -> Path:
+    # `max_z_jog_um` is set so that the open warns of nothing: the lines are asserted whole.
+    path.write_text(
+        '[microscope]\nname = "offsets"\n\n[safety]\nmax_z_jog_um = 100.0\n\n'
+        f'[objectives]\nreference = "{reference}"\n' + entries,
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_objective_offset_prints_each_label_with_its_provenance(tmp_path: Path) -> None:
+    path = _write_offsets_profile(
+        tmp_path / "offsets.toml",
+        TWENTY_X,
+        f'\n[objectives.offsets."{TEN_X}"]\nxy_offset_um = [5.0, -2.5]\n'
+        f'z_offset_um = -1.25\nmeasured = "{MEASURED}"\n'
+        f'\n[objectives.offsets."Nikon 40X Plan Fluor ELWD"]\n'
+        f'xy_offset_um = [-32.5, 9.75]\nmeasured = "{MEASURED}"\n',
+    )
+
+    result = runner.invoke(app, ["objective", "offset", "--profile", str(path)])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines() == [
+        f"'Nikon 40X Plan Fluor ELWD'  xy (-32.50, +9.75) µm  z unknown  measured {MEASURED}",
+        f"'{TEN_X}'  (current)  xy (+5.00, -2.50) µm  z -1.25 µm  measured {MEASURED}",
+        "'Objective-2'  xy unknown  z unknown",
+        f"'{TWENTY_X}'  reference",
+        "'Objective-4'  xy unknown  z unknown",
+        "'Objective-5'  xy unknown  z unknown",
+    ]
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_objective_offset_names_a_profile_label_not_on_the_turret(
+    tmp_path: Path,
+) -> None:
+    path = _write_offsets_profile(
+        tmp_path / "offsets.toml",
+        "Nikon 100X",
+        f'\n[objectives.offsets."{TEN_X}"]\nxy_offset_um = [0.0, 0.0]\n'
+        f'measured = "{MEASURED}"\n'
+        f'\n[objectives.offsets."Nikon 4X"]\nz_offset_um = 3.0\nmeasured = "{MEASURED}"\n',
+    )
+
+    result = runner.invoke(app, ["objective", "offset", "--profile", str(path)])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    # A zero that was measured is printed as one; the unmeasured labels are not.
+    assert (
+        f"'{TEN_X}'  (current)  xy (+0.00, +0.00) µm  z unknown  measured {MEASURED}"
+    ) in lines
+    assert "'Objective-2'  xy unknown  z unknown" in lines
+    # The profile's labels that no turret position carries: the entry first, then
+    # the reference; "[objectives]" reaches the terminal as written (no markup).
+    assert lines[-2:] == [
+        "'Nikon 4X' is in the profile's [objectives] but not on the turret: check the label",
+        "'Nikon 100X' is in the profile's [objectives] but not on the turret: check the label",
+    ]
+    assert not any(line.endswith("reference") for line in lines)
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_objective_offset_skips_an_empty_turret_position_and_prints_a_zero_without_its_sign(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The protocol lists empty positions, whose label is ``""``: no objective to
+    # measure an offset for, so no line. A `-0.0` read from the profile is `+0.00`.
+    labels = mm.MMObjectiveTurret.labels
+    monkeypatch.setattr(
+        mm.MMObjectiveTurret, "labels", lambda self: ["", *labels(self)]
+    )
+    path = _write_offsets_profile(
+        tmp_path / "offsets.toml",
+        TWENTY_X,
+        f'\n[objectives.offsets."{TEN_X}"]\nxy_offset_um = [-0.0, 0.0]\n'
+        f'z_offset_um = -0.0\nmeasured = "{MEASURED}"\n',
+    )
+
+    result = runner.invoke(app, ["objective", "offset", "--profile", str(path)])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    # Six lines for the six labels, none for the empty position put first.
+    assert len(lines) == 6
+    assert lines[0] == "'Nikon 40X Plan Fluor ELWD'  xy unknown  z unknown"
+    assert (
+        f"'{TEN_X}'  (current)  xy (+0.00, +0.00) µm  z +0.00 µm  measured {MEASURED}"
+        in lines
+    )
+    assert not any(line.startswith("''") for line in lines)
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_objective_offset_without_a_reference_says_every_offset_is_unknown() -> None:
+    result = runner.invoke(app, ["objective", "offset"])
+
+    assert result.exit_code == 0, result.output
+    lines = result.output.splitlines()
+    assert lines[:6] == [
+        (
+            f"'{label}'  (current)  xy unknown  z unknown"
+            if label == TEN_X
+            else f"'{label}'  xy unknown  z unknown"
+        )
+        for label in DEMO_LABELS
+    ]
+    assert lines[6:] == [
+        "the profile names no reference objective ([objectives] reference): every "
+        "offset is unknown"
+    ]
+
+
+def test_objective_offset_help_says_what_the_offsets_are_for() -> None:
+    result = runner.invoke(app, ["objective", "offset", "--help"])
+
+    assert result.exit_code == 0, result.output
+    text = " ".join(_ANSI.sub("", result.output).split())
+    assert "scanned with another" in text
+    assert "objectives.reference and objectives.offsets" in text
+    assert "never 0" in text
 
 
 @pytest.mark.demo

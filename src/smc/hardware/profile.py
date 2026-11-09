@@ -28,6 +28,7 @@ from pydantic import (
     model_validator,
 )
 
+from smc.hardware.capabilities import ObjectiveOffset
 from smc.hardware.errors import ProfileError
 from smc.hardware.roles import Role
 
@@ -38,6 +39,8 @@ else:  # pragma: no cover - exercised on the 3.10 CI job
 
 __all__ = [
     "MAX_SAMPLE_CELLS",
+    "MAX_XY_OFFSET_UM",
+    "MAX_Z_OFFSET_UM",
     "ROLES_WITH_A_STOP",
     "AutofocusSection",
     "CameraSection",
@@ -45,6 +48,8 @@ __all__ = [
     "LightSourceSection",
     "MicroManagerSection",
     "MicroscopeSection",
+    "ObjectiveOffsetEntry",
+    "ObjectivesSection",
     "Profile",
     "RolesSection",
     "SafetySection",
@@ -88,6 +93,11 @@ _MAX_CELL_RADIUS_UM = 50.0
 #: ``_MIN_RADIUS_UM``, which a test pins): below it the exponent underflows, and a
 #: radius this module let through would fail at open, with no key named.
 _MIN_CELL_RADIUS_UM = 1e-6
+#: An offset between objectives beyond these is a unit or a sign mistake, not a
+#: measurement (FM-121): parcentric objectives differ by tens of µm. Chosen
+#: guards, not measurements (m2 §13.3).
+MAX_XY_OFFSET_UM = 1000.0
+MAX_Z_OFFSET_UM = 500.0
 
 
 def _no_boolean(name: str, value: Any) -> Any:
@@ -525,6 +535,161 @@ class ChannelsSection(_Section):
         return value
 
 
+class ObjectiveOffsetEntry(_Section):
+    """One objective's offset from the reference objective, as a session measured it (m2 §13.3).
+
+    Each value defaults to *not measured* (``None``), never zero, and a value
+    carries the date and session it came from: an offset nobody can trace is a
+    guess, and the stage will move by it (m3 §18).
+    """
+
+    #: Stage XY under this objective minus under the reference, the same feature
+    #: centred in the frame, as ``XYStage.position_um()`` reads them.
+    xy_offset_um: tuple[float, float] | None = None
+    #: Focused Z under this objective minus under the reference, after the stand's
+    #: own correction of a turn. Stored and shown; the layer applies none (m2 §13.2).
+    z_offset_um: float | None = None
+    #: When and in which session: "2026-11-12, session 3 (#NNN)".
+    measured: str = ""
+
+    @field_validator("xy_offset_um", mode="before")
+    @classmethod
+    def _xy_is_two_numbers(cls, value: Any) -> Any:
+        if isinstance(value, (list, tuple)):
+            if len(value) != 2:
+                raise ValueError(
+                    "xy_offset_um must be exactly two numbers, [x, y] in µm; got "
+                    f"{len(value)}: {list(value)}"
+                )
+            for number in value:
+                # pydantic reads `true` as 1.0 µm, a plausible offset (FM-104).
+                _no_boolean("each number of xy_offset_um", number)
+        return value
+
+    @field_validator("z_offset_um", mode="before")
+    @classmethod
+    def _z_not_boolean(cls, value: Any) -> Any:
+        return _no_boolean("z_offset_um", value)
+
+    @field_validator("xy_offset_um")
+    @classmethod
+    def _xy_finite_and_bounded(
+        cls, value: tuple[float, float] | None
+    ) -> tuple[float, float] | None:
+        if value is not None and not all(
+            math.isfinite(number) and abs(number) <= MAX_XY_OFFSET_UM
+            for number in value
+        ):
+            raise ValueError(
+                f"xy_offset_um must be two finite numbers of µm, each within "
+                f"±{MAX_XY_OFFSET_UM:g}: objectives differ by tens of µm, and a "
+                f"larger value is a unit or sign mistake; got {list(value)}"
+            )
+        return value
+
+    @field_validator("z_offset_um")
+    @classmethod
+    def _z_finite_and_bounded(cls, value: float | None) -> float | None:
+        if value is not None and not (
+            math.isfinite(value) and abs(value) <= MAX_Z_OFFSET_UM
+        ):
+            raise ValueError(
+                f"z_offset_um must be a finite number of µm within "
+                f"±{MAX_Z_OFFSET_UM:g}: objectives differ by tens of µm, and a "
+                f"larger value is a unit or sign mistake; got {value}"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _a_value_needs_its_provenance(self) -> ObjectiveOffsetEntry:
+        if (
+            self.xy_offset_um is not None or self.z_offset_um is not None
+        ) and not self.measured.strip():
+            raise ValueError(
+                "an entry that sets xy_offset_um or z_offset_um needs measured = "
+                '"<date>, session N (#issue)": an offset with no date and session '
+                "is a guess"
+            )
+        return self
+
+
+class ObjectivesSection(_Section):
+    """The offsets between the turret's objectives, from one reference (m2 §13).
+
+    A plate registered with one objective is scanned with another; the same
+    feature is not centred at the same stage position under both. Everything
+    is *unknown* until a session at the stand has measured it: no reference,
+    no offsets, and the layer then moves unshifted and says so (m3 §18).
+    Measured with the magnifier lever at 1.0x (FM-103): the offsets are keyed
+    by objective alone.
+    """
+
+    #: The objective every offset is measured from, by its turret label; "" = none.
+    reference: str = ""
+    #: Objective label -> its offset. The reference has no entry: its offset is
+    #: zero by definition.
+    offsets: dict[str, ObjectiveOffsetEntry] = Field(default_factory=dict)
+
+    @field_validator("offsets")
+    @classmethod
+    def _offsets_are_from_a_named_reference(
+        cls, value: dict[str, ObjectiveOffsetEntry], info: ValidationInfo
+    ) -> dict[str, ObjectiveOffsetEntry]:
+        for label in value:
+            if not label.strip():
+                raise ValueError(
+                    "an offsets entry must name a turret label: give "
+                    '[objectives.offsets."<label>"], not an empty one'
+                )
+        if not value:
+            return value
+        # A `reference` that failed is absent: its own error stands alone.
+        reference = info.data.get("reference")
+        if reference is None:
+            return value
+        if not reference.strip():
+            raise ValueError(
+                "offsets needs [objectives] reference: the objective every offset "
+                "is measured from, by its turret label"
+            )
+        if reference in value:
+            raise ValueError(
+                f"offsets has an entry for the reference objective {reference!r}: its "
+                "offset is (0, 0) by definition, and an entry would be a second, "
+                "contradicting statement; remove it"
+            )
+        return value
+
+    def offset(self, label: str) -> ObjectiveOffset:
+        """``label``'s offset from the reference: the reference's own, an entry's, or unknown.
+
+        It reads the profile and nothing else, and never raises: an unknown
+        label, the empty position's ``""`` and every label of a profile with
+        no reference give ``None`` values, never zero (m2 §13.3).
+        """
+        reference = self.reference if self.reference.strip() else None
+        if reference is not None and label == reference:
+            return ObjectiveOffset(
+                objective=label,
+                reference=reference,
+                xy_um=(0.0, 0.0),
+                z_um=0.0,
+                measured="",
+            )
+        entry = self.offsets.get(label)
+        if reference is None or entry is None:
+            return ObjectiveOffset(
+                objective=label, reference=reference, xy_um=None, z_um=None, measured=""
+            )
+        return ObjectiveOffset(
+            objective=label,
+            reference=reference,
+            xy_um=entry.xy_offset_um,
+            z_um=entry.z_offset_um,
+            measured=entry.measured,
+        )
+
+
 class SampleSection(_Section):
     """The synthetic plate a demo stand's camera images (m1 §8, "The demo-sample stand").
 
@@ -761,6 +926,7 @@ class Profile(_Section):
     autofocus: AutofocusSection = Field(default_factory=AutofocusSection)
     light_source: LightSourceSection = Field(default_factory=LightSourceSection)
     channels: ChannelsSection = Field(default_factory=ChannelsSection)
+    objectives: ObjectivesSection = Field(default_factory=ObjectivesSection)
     quirks: dict[str, Any] = Field(default_factory=dict)
     #: ``None`` on every stand but the demo-sample one. After ``micromanager``:
     #: ``_sample_only_on_the_demo`` reads it from ``info.data``.
@@ -1069,6 +1235,7 @@ _SECTIONS: dict[tuple[str, ...], type[BaseModel]] = {
     ("autofocus",): AutofocusSection,
     ("light_source",): LightSourceSection,
     ("channels",): ChannelsSection,
+    ("objectives",): ObjectivesSection,
     ("sample",): SampleSection,
 }
 
@@ -1079,6 +1246,9 @@ def _allowed_keys(section: tuple[str, ...]) -> str:
     # part is one of them.
     if model is None and len(section) == 2 and section[0] == "suggest":
         model = SuggestSection
+    # `[objectives.offsets."<label>"]`: the label is the third part.
+    if model is None and len(section) == 3 and section[:2] == ("objectives", "offsets"):
+        model = ObjectiveOffsetEntry
     if model is None:
         return ""
     keys = [k for k, f in model.model_fields.items() if not f.exclude]

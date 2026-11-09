@@ -13,6 +13,7 @@ from smc.hardware.capabilities import (
     Channels,
     FocusStep,
     LightSource,
+    ObjectiveOffset,
     ObjectiveTurret,
     PropertyInfo,
     XYStage,
@@ -131,6 +132,13 @@ def test_focus_step_is_frozen() -> None:
         FocusStep("z", 1.0, None).via = "offset"  # type: ignore[misc]
 
 
+def test_objective_offset_is_frozen_and_says_unknown_with_none() -> None:
+    offset = ObjectiveOffset("1-Plan Fluor 4x", None, None, None, "")
+    assert (offset.reference, offset.xy_um, offset.z_um) == (None, None, None)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        offset.xy_um = (0.0, 0.0)  # type: ignore[misc]
+
+
 def test_channel_preset_is_frozen_and_unsaved_by_default() -> None:
     preset = ChannelPreset("Channel", "BF", (("DiaLamp", "Intensity", "210"),))
     assert preset.saved_to is None
@@ -144,6 +152,25 @@ class _TurretWithoutSelect:
 
     def current(self) -> str:
         return ""
+
+    def pixel_size_um(self, label: str | None = None) -> float:
+        return 0.0
+
+    def offset(self, label: str) -> ObjectiveOffset:
+        return ObjectiveOffset(label, None, None, None, "")
+
+
+class _TurretWithoutOffset:
+    """Everything an ObjectiveTurret was before m2 §13, ``select`` included."""
+
+    def labels(self) -> list[str]:
+        return []
+
+    def current(self) -> str:
+        return ""
+
+    def select(self, label: str, *, confirm: bool = False) -> str:
+        return label
 
     def pixel_size_um(self, label: str | None = None) -> float:
         return 0.0
@@ -202,6 +229,7 @@ class _Channels(_ChannelsWithoutCapture):
     ("protocol", "partial", "whole"),
     [
         (ObjectiveTurret, _TurretWithoutSelect, _Turret),
+        (ObjectiveTurret, _TurretWithoutOffset, _Turret),
         (LightSource, _LightWithoutSwitch, _Light),
         (Channels, _ChannelsWithoutCapture, _Channels),
     ],

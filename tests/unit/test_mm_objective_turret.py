@@ -35,7 +35,7 @@ from smc.hardware.errors import (
     MotionInProgressError,
     SafetyRefusedError,
 )
-from smc.hardware.profile import CameraSection
+from smc.hardware.profile import CameraSection, ObjectivesSection, Profile
 from smc.hardware.safety import POLL_INTERVAL_S
 from smc.testing import FakeCore
 
@@ -368,6 +368,70 @@ def test_pixel_size_comes_from_the_profile_per_objective() -> None:
         assert turret.pixel_size_um("1-Plan Fluor 4x") == 0.0  # unknown, not guessed
     with ti2() as (_, microscope):
         assert microscope.require(ObjectiveTurret).pixel_size_um() == 0.0
+
+
+def _profile_with_offsets() -> Profile:
+    # The 10x is the reference; the 4x was measured, the 40x was not (m2 §13.3).
+    return ti2_profile().model_copy(
+        update={
+            "objectives": ObjectivesSection.model_validate(
+                {
+                    "reference": TEN,
+                    "offsets": {
+                        "1-Plan Fluor 4x": {
+                            "xy_offset_um": [12.5, -4.0],
+                            "z_offset_um": -8.7,
+                            "measured": "2026-11-12, session 3 (#400)",
+                        }
+                    },
+                }
+            )
+        }
+    )
+
+
+def test_offset_comes_from_the_profile_and_sends_nothing() -> None:
+    for dry_run in (False, True):
+        with ti2(_profile_with_offsets(), dry_run=dry_run) as (core, microscope):
+            turret = microscope.require(ObjectiveTurret)
+            four = turret.offset("1-Plan Fluor 4x")
+            assert (four.objective, four.reference) == ("1-Plan Fluor 4x", TEN)
+            assert (four.xy_um, four.z_um) == ((12.5, -4.0), -8.7)
+            assert four.measured == "2026-11-12, session 3 (#400)"
+            ten = turret.offset(TEN)
+            assert (ten.xy_um, ten.z_um) == ((0.0, 0.0), 0.0)
+            forty = turret.offset(FORTY)  # on the turret, not measured
+            assert (forty.xy_um, forty.z_um, forty.measured) == (None, None, "")
+            assert core.log == []
+
+
+def test_offset_without_a_reference_in_the_profile_is_unknown_for_every_label() -> None:
+    with ti2() as (_, microscope):
+        turret = microscope.require(ObjectiveTurret)
+        for label in turret.labels():
+            offset = turret.offset(label)
+            assert (offset.reference, offset.xy_um, offset.z_um) == (None, None, None)
+
+
+def test_offset_answers_while_another_action_holds_the_lock_and_after_a_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # m2 §13.4: the offset is not an action: no lock, and no refusal after a stop.
+    # A snap holds the lock, so an action would queue behind it (a read does not:
+    # `Executor.read` is the bare call, so the test cannot tell a read from none).
+    with ti2(_profile_with_offsets()) as (core, microscope):
+        turret = microscope.require(ObjectiveTurret)
+        with lock_held_by_a_snap(core, microscope, monkeypatch) as queued:
+            asker = Thread(lambda: turret.offset("1-Plan Fluor 4x"))
+            asker.join()
+            assert asker.error is None
+            assert getattr(asker.result, "xy_um", None) == (12.5, -4.0)
+            assert not queued.is_set()
+        microscope.stop()
+        core.log.clear()
+        assert turret.offset("1-Plan Fluor 4x").xy_um == (12.5, -4.0)
+        assert core.log == []
+        microscope.resume()
 
 
 def test_a_turret_outliving_its_microscope_refuses_the_turn_and_sends_nothing(

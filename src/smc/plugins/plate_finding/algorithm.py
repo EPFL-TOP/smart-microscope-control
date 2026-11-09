@@ -171,6 +171,7 @@ class PlateFit:
         margin: float | None,
         notes: Sequence[str],
         assumed: Sequence[str] = (),
+        objective: str | None = None,
     ) -> PlateResult:
         """The fit as the ``plate`` slot's value, built once and validated.
 
@@ -178,7 +179,8 @@ class PlateFit:
         ``scale_error`` are unknown (``None``) and ``n_refs`` is 0. ``notes``
         are ``decide``'s, which include the winner's own and the "barely beats"
         one; ``runner_up`` and ``margin`` are ``None`` when one plate was
-        fitted.
+        fitted. ``objective`` is the one the survey was made with (m3 §18.3),
+        ``None`` when the stand has no turret.
         """
         return PlateResult(
             plate=self.plate,
@@ -198,6 +200,7 @@ class PlateFit:
                 n_inside=self.n_inside,
                 notes=tuple(notes),
             ),
+            objective=objective,
             assumed=tuple(assumed),
         )
 

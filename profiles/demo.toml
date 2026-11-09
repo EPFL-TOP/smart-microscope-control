@@ -53,5 +53,15 @@ pixel_size_um = { "Nikon 10X S Fluor" = 0.65, "Nikon 40X Plan Fluor ELWD" = 0.16
 # group = ""                # the config group whose presets are channels; "" = chosen (m2 §8.5)
 # exclude = []              # device labels that capture() never records
 
+# [objectives]
+# # The offsets between objectives, measured at a stand with the magnifier lever at 1.0x (m2 §13).
+# # None on the simulator: unknown is never zero, and the layer then moves unshifted and says so.
+# reference = ""            # the objective every offset is measured from, by its turret label; "" = no offsets
+#
+# [objectives.offsets."<turret label>"]
+# xy_offset_um = [0.0, 0.0]   # stage XY under this objective minus under the reference, the same feature centred
+# z_offset_um = 0.0           # focused Z under this objective minus under the reference, after the stand's own correction
+# measured = "YYYY-MM-DD, session N (#issue)"   # required with a value: an offset with no date and session is a guess
+
 [quirks]
 # Behaviours the facade must encode for this stand. None for the simulator.

@@ -13,8 +13,8 @@ survives between two runs that the run document does not show:
 
 | Plugin | Does | Moves the stage? |
 |---|---|---|
-| `plate-registration` | Fits the plate from `refs` (wells you centred) and `walls` (wall touches) and fills `plate`. | No. A dry run is the same computation. |
-| `goto-well` | Drives to a well's centre or to the point on one of its walls, through the latest `plate`. | Yes: **one absolute XY move**. |
+| `plate-registration` | Fits the plate from `refs` (wells you centred) and `walls` (wall touches) and fills `plate`, with the objective it was seen with. | No; it only reads the turret. A dry run is the same computation. |
+| `goto-well` | Drives to a well's centre or to the point on one of its walls, through the latest `plate`, in the frame of the objective in use. | Yes: **one absolute XY move**. |
 
 ## The guided loop: never hunt for a well
 
@@ -83,7 +83,8 @@ $ smc run plate-registration -p demo --run-doc run.json --param 'refs=[{"well": 
   "scale_error": null,
   "n_refs": 1,
   "refs": [{"well": "A1", "x_um": 1000.0, "y_um": 2000.0}],
-  "fit": null
+  "fit": null,
+  "objective": "Nikon 10X S Fluor"
 }
 
 $ smc run goto-well -p demo --run-doc run.json --param well=B2 --param side=left
@@ -95,7 +96,10 @@ $ smc run goto-well -p demo --run-doc run.json --param well=B2 --param side=left
   "target_x_um": 6800.0,
   "target_y_um": -7000.0,
   "x_um": 6799.995,
-  "y_um": -7000.005
+  "y_um": -7000.005,
+  "objective": "Nikon 10X S Fluor",
+  "plate_objective": "Nikon 10X S Fluor",
+  "shift_um": [0.0, 0.0]
 }
 ```
 
@@ -115,6 +119,7 @@ smc run plate-registration -p <profile> --run-doc run.json --param plate=384-wel
 | `refs` | none | Wells centred under the objective, JSON: `[{"well": "A1", "x_um": 1000, "y_um": 2000}]`. A well name is as you type it: `a1`, `A 1` and `A01` are `A1`. |
 | `walls` | none | Wall touches, JSON: `[{"well": "B2", "side": "left", "x_um": 6800, "y_um": 0}]`. See [Wall touches](#wall-touches). |
 | `max_rotation_deg` | 10 | The largest rotation of the plate that the fit accepts (above 0, up to 45): see [What it refuses](#what-it-refuses). |
+| `objective` | the one in place | The objective the references were centred with, by its turret label (`smc objective list`): see [The objective the plate was registered with](#the-objective-the-plate-was-registered-with). Recorded, never turned to. |
 
 Give `refs`, `walls` or both: a well given by walls becomes a reference like any
 other, after the ones in `refs`. A well may be given one way only. The shell's
@@ -170,6 +175,30 @@ on the crosshair, read `smc stage get`, and give it as a touch.
   a round well cancels it.
 - The nominal sizes are the plate's, width for X and height for Y.
 
+### The objective the plate was registered with
+
+Register with a wide objective (the 4x or the 10x: the walls are easy to see) and
+scan with the 40x. Two objectives do not centre the same feature at the same stage
+position, so the `plate` records the objective its positions were taken with, in
+`objective`: the turret's label, `null` when the stand has no turret and in a run
+document written before this field existed (unknown, not "the one in place now").
+
+- **It is the objective in place when the registration runs.** Turn the turret
+  first (`smc objective set <label> --confirm`); the registration never turns it.
+- **`--param objective=<label>`** records another label, which must be on the
+  turret, for references centred under an objective that is no longer in place.
+- **A turret at an empty position is refused**: it is no objective. A stand with no
+  turret records none, and refuses an `objective` that was asked for, since it cannot
+  be checked. A turret that cannot be read fails the stage; it is not taken as "no
+  objective".
+- The plate page registers with the objective in place and offers no such field.
+- `plate-finding` and `plate-walls` fill the same field, with the objective of their
+  survey and of their frames.
+
+`goto-well` and `scan-plan` use it: they move the plate by the offset between this
+objective and theirs, which the profile holds (`[objectives]`, see
+[`profiles/README.md`](../../profiles/README.md#objectives-offsets-between-objectives)).
+
 ### What it refuses
 
 A refusal ends the stage `failed`, with no result: **no unusable `plate` fills the
@@ -186,6 +215,7 @@ slot**, and a stage that reads it stops with the reason.
 | `H1 is 348 µm from where the others put it: centre it again` | A reference is further than 300 µm from the fit of the others: centre that well again. |
 | `A1's left and right walls are 9200 µm apart, a 96-well well is 6400 µm (+43.8%): a touch of another well, or off the wall` | An opposite pair whose size is off the plate's by more than 10 % (a swapped pair has a negative size): touch both walls again. |
 | `A1: the left wall is given twice`, `a touch of B2 was given for A1`, `no X wall for A1: give left and/or right` | A mistake in `walls`; the text says which. |
+| `objective 'Nikon 100X' is not on the turret: ...`, `no objective is in place: the turret is at an empty position; ...`, `the stand has no turret, so objective cannot be checked; leave it unset` | The objective is not one the turret can have: see [The objective the plate was registered with](#the-objective-the-plate-was-registered-with). |
 
 ## `goto-well`
 
@@ -209,6 +239,23 @@ plate does not have is refused before any move. The result keeps
 the target (`target_x_um`, `target_y_um`) beside where the stage says it arrived
 (`x_um`, `y_um`, the readback after the move), so a stage that stopped short shows.
 
+**The target is in the frame of the objective in use.** `goto-well` reads the turret
+(a turret at an empty position is refused before any move) and moves the plate from
+the objective it was registered with to the one in place, by the offset between them
+in the profile's `[objectives]`, before it works out the target: a plate registered
+with the 10x and a `goto-well` at the 40x lands where the 40x sees the well, not
+where the 10x did. Only XY moves; no Z offset is applied (the Ti2-E corrects Z on a
+turn). The result says what happened:
+
+| `objective`, `plate_objective`, `shift_um` | Case |
+|---|---|
+| the same objective twice, `[0.0, 0.0]` | The objective in place is the one the plate was registered with: nothing is shifted, and no line is added. |
+| two objectives, `[-37.5, 12.25]` | The offset between them is measured: the target is the registration's plus the shift, and the log says at INFO what was moved and when each offset was measured. |
+| `shift_um` is `null` | The plate does not record its objective, or the offset between the two is not measured (the profile's `[objectives]` has no entry or no reference), or the stand has no turret: the target is the registration's own, **not corrected**, and `assumed` says so after the plate's lines and a WARNING is logged. Unknown is never taken as zero. |
+
+An offset is only as good as session 3's measurement of it (m2 §13.6); until then the
+profile holds none and every change of objective is the third row.
+
 **On the Ti2-E the soft limits are ±49 000 × ±29 000 µm**, a span of 98 × 58 mm,
 while the corner wells of a 96-well plate are 99 × 63 mm apart. Wherever the plate
 sits, some corner `goto-well`s will be refused by the layer. This was computed, not
@@ -228,7 +275,7 @@ session) before using a stand without them.
 
 `goto-well` in a dry run moves nothing, and its readback is the target: the result
 says so in its last `assumed` line (`dry run: the stage did not move; x_um and y_um
-are the target`). `plate-registration` touches no device, but a dry run records
+are the target`). `plate-registration` moves no device, but a dry run records
 `dry_run: true` like any other, so **a `plate` from a dry run cannot drive a real
 `goto-well`**: it is refused with `plate-registration was a dry run; run it without
 --dry-run`. A dry run may read a real `plate`.
@@ -245,6 +292,8 @@ its own result, each line prefixed with "plate: ".
   (#20), which fills the same `plate` slot.
 - **Not verified at a stand.** No `goto-well` has been run on a real stage, and the
   Ti2-E's soft limits against a 96-well plate are computed from the profile, not
-  measured (#198). Parcentricity of the objectives is a constant translation that
-  lands in A1 as a fixed bias of tens of µm, far inside the tolerance; it matters
-  only for hitting one cell across a change of objective.
+  measured (#198). Parcentricity of the objectives is a translation of tens of µm
+  between two objectives (#340): `goto-well` and `scan-plan` apply the profile's
+  offset when it is measured, and none has been measured yet (session 3, m2 §13.6).
+  That it is a translation, and what the magnifier lever at 1.5x does to it, are not
+  verified.

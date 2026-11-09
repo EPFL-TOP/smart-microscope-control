@@ -1,10 +1,18 @@
 """``plate-registration`` fills the ``plate`` slot from wells the operator centred or walls they touched (m3 §5).
 
-The pure part (the fit, the wall arithmetic) is ``algorithm.py``. This touches
-no device, so a dry run is the same computation; it reads the references from
-its parameters and keeps nothing between two runs, so the run document's
-``params`` hold every reference that made the registration. What it decides,
-because every later stage places its fields by the plate it writes:
+The pure part (the fit, the wall arithmetic) is ``algorithm.py``. This moves no
+device and sends nothing, so a dry run is the same computation; it reads the
+references from its parameters and keeps nothing between two runs, so the run
+document's ``params`` hold every reference that made the registration. It reads
+the turret, when there is one, for the objective the plate was seen with. What it
+decides, because every later stage places its fields by the plate it writes:
+
+* **The plate records the objective it was seen with** (m3 §18.3): two objectives
+  do not centre the same feature at the same stage position, and ``goto-well`` and
+  ``scan-plan`` move the plate by the profile's offset between this one and theirs.
+  It is the objective in place unless ``objective`` names another, which is
+  recorded and never turned to; no turret records none (unknown, not guessed), and
+  a turret at an empty position is refused before the fit.
 
 * **A seed is a result, not a fit.** One reference sets A1 and assumes no
   rotation; it says so in ``assumed`` and has no residual, so nothing reads it
@@ -28,8 +36,10 @@ from typing import TYPE_CHECKING
 
 from pydantic import Field
 
+from smc.hardware.capabilities import ObjectiveTurret
 from smc.plugins.api import PluginParams, RunContext
 from smc.plugins.errors import PluginRunError
+from smc.plugins.objectives import objective_for
 from smc.plugins.plate_registration.algorithm import (
     GOOD_RESIDUAL_UM,
     MAX_ROTATION_DEG,
@@ -88,6 +98,14 @@ class PlateRegistrationParams(PluginParams):
             "is really turned."
         ),
     )
+    objective: str | None = Field(
+        None,
+        description=(
+            "The objective the references were centred with, by its turret label; "
+            "default the one in place when the registration runs. It is recorded "
+            "and never turned to."
+        ),
+    )
 
 
 class PlateRegistrationPlugin:
@@ -116,9 +134,16 @@ class PlateRegistrationPlugin:
         Raises:
             PluginRunError: No reference at all; a well given both as a reference
                 and by walls; a plate, well, wall or spacing the algorithm
-                refuses; a rotation beyond ``max_rotation_deg``; or a reference
-                further than ``GOOD_RESIDUAL_UM`` from where the others put it.
+                refuses; a rotation beyond ``max_rotation_deg``; a reference
+                further than ``GOOD_RESIDUAL_UM`` from where the others put it;
+                or an objective that is not on the turret, asked for on a stand
+                with no turret, or a turret at an empty position. A turret that
+                cannot be read raises its own error, not caught (FM-19).
         """
+        # First, before the fit: the objective is part of what the plate says.
+        objective, _ = objective_for(
+            _NAME, params.objective, microscope.get(ObjectiveTurret)
+        )
         walls_of: dict[str, list[WallTouch]] = {}
         for touch in params.walls:
             walls_of.setdefault(normalise_well(touch.well), []).append(touch)
@@ -184,5 +209,9 @@ class PlateRegistrationPlugin:
                     f"nominal half-size, {half_um:.0f} µm"
                 )
         return PlateResult.model_validate(
-            {**fitted.model_dump(), "assumed": (*fitted.assumed, *lines)}
+            {
+                **fitted.model_dump(),
+                "assumed": (*fitted.assumed, *lines),
+                "objective": objective,
+            }
         )

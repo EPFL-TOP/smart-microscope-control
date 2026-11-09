@@ -41,6 +41,7 @@ __all__ = [
     "FocusStep",
     "LightSource",
     "Limits",
+    "ObjectiveOffset",
     "ObjectiveTurret",
     "Properties",
     "PropertyInfo",
@@ -390,6 +391,31 @@ class Autofocus(Protocol):
         ...
 
 
+@dataclass(frozen=True, slots=True)
+class ObjectiveOffset:
+    """Where one objective's image lies relative to the reference objective's (m2 §13.4).
+
+    Two objectives do not centre the same feature at the same stage position
+    (parcentricity) nor focus it at the same Z (parfocality). The profile
+    holds what a session at the stand measured, relative to one reference
+    objective; ``None`` is *not measured*, never zero. The sign is
+    ``p_objective - p_reference``: a position found with objective ``A`` is
+    the position ``+ offset(B) - offset(A)`` with objective ``B`` (m2 §13.2).
+    The layer applies the XY part only (m3 §18); ``z_um`` is shown.
+    """
+
+    objective: str
+    #: ``None``: the profile names no reference objective.
+    reference: str | None
+    #: Stage XY under ``objective`` minus under the reference; ``None``: not measured.
+    xy_um: tuple[float, float] | None
+    #: Focused Z under ``objective`` minus under the reference, after the stand's
+    #: own correction of a turn; ``None``: not measured.
+    z_um: float | None
+    #: When and in which session; ``""`` for the reference itself and when unknown.
+    measured: str
+
+
 @runtime_checkable
 class ObjectiveTurret(Protocol):
     """The nosepiece: which objective is in the light path (m2 §8.3).
@@ -420,6 +446,16 @@ class ObjectiveTurret(Protocol):
 
         The profile's size is for a magnification factor of 1.0; the result is
         divided by the core's factor (m2 §8.10), so it is for the stand as it is.
+        """
+        ...
+
+    def offset(self, label: str) -> ObjectiveOffset:
+        """The profile's offset of ``label`` from its reference objective (m2 §13.4).
+
+        Reads the profile only: it sends nothing, never raises and works when
+        halted, in a dry run and while the stand moves. Not measured, an
+        unknown label and a profile with no reference all give ``None`` values,
+        never zero. The offsets are for a magnifier lever at 1.0x (FM-103).
         """
         ...
 

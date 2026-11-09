@@ -108,6 +108,7 @@ _PLATE: dict[str, Any] = {
     "refs": [_REF, {"well": "H12", "x_um": 100000.0, "y_um": -63000.0}],
     "fit": _FIT,
     "walls": _WALLS,
+    "objective": "Nikon 10X Plan Fluor",
 }
 
 _CALIBRATION: dict[str, Any] = {
@@ -155,6 +156,8 @@ _SCAN_PLAN: dict[str, Any] = {
     "columns": 3,
     "fields": [_PLANNED],
     "estimate_s": 1830.5,
+    "plate_objective": "Nikon 10X Plan Fluor",
+    "objective_shift_um": [-37.5, 12.25],
 }
 
 _FRAME: dict[str, Any] = {
@@ -325,6 +328,8 @@ SAMPLES: dict[type[BaseModel], Sample] = {
             "wells": [],
             "fields": [],
             "estimate_s": None,
+            "plate_objective": None,
+            "objective_shift_um": None,
         },
     ),
     ScanFrame: (
@@ -653,6 +658,32 @@ def test_a_plate_result_by_wall_images_keeps_its_walls_through_a_dump() -> None:
     assert loaded.walls is not None
     assert [w.side for w in loaded.walls.wells[0].walls] == ["+X", "+Y", "-X", "-Y"]
     assert PlateResult.model_validate(loaded.model_dump(mode="json")) == loaded
+
+
+def test_a_plate_without_objective_loads_as_unknown() -> None:
+    # #340 added `objective`: a run document written earlier has no key, and its
+    # objective is unknown, never the one that happens to be in place now.
+    older = {key: value for key, value in _PLATE.items() if key != "objective"}
+    loaded = PlateResult.model_validate(older)
+    assert loaded.objective is None
+    assert PlateResult.model_validate(loaded.model_dump(mode="json")) == loaded
+    assert PlateResult.model_validate(_PLATE).objective == "Nikon 10X Plan Fluor"
+
+
+def test_a_scan_plan_without_the_shift_loads_as_unknown() -> None:
+    older = {
+        key: value
+        for key, value in _SCAN_PLAN.items()
+        if key not in ("plate_objective", "objective_shift_um")
+    }
+    loaded = ScanPlanResult.model_validate(older)
+    assert (loaded.plate_objective, loaded.objective_shift_um) == (None, None)
+    assert ScanPlanResult.model_validate(loaded.model_dump(mode="json")) == loaded
+    full = ScanPlanResult.model_validate(_SCAN_PLAN)
+    assert (full.plate_objective, full.objective_shift_um) == (
+        "Nikon 10X Plan Fluor",
+        (-37.5, 12.25),
+    )
 
 
 @pytest.mark.parametrize("side", ["left", "x", "+x", "X+", "", "+Z"])
