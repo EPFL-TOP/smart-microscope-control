@@ -89,6 +89,7 @@ from smc.ui.controller import (
 )
 from smc.ui.frames import Frame
 from smc.ui.guide import (
+    NO_CALIBRATION_FOR_SIDES,
     WALLS_DRY_RUN,
     WALLS_NEED_CALIBRATION,
     walls_centres_problem,
@@ -562,14 +563,17 @@ def test_a_drive_click_on_another_plates_map_moves_nothing(
 
 
 def test_a_click_in_drive_mode_runs_goto_well_with_the_wells_name_and_side(
-    fake_microscope: Microscope, run_doc: Path
+    fake_microscope: Microscope,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
 ) -> None:
     _seed(run_doc, "plate-registration", "plate", _plate())
+    seed_camera_calibration(run_doc)  # the Ti2-E's: the image's left is stage +X
     page = _page(fake_microscope, run_doc)
     x, y = _centre("B3", a1=A1_OFF, rotation_deg=TURN_DEG)
     assert page.click(x, y, drive=True, side="left") == "B3"
     assert page.join(10.0)
-    assert StubGoto.ran == [("B3", "left")]
+    assert StubGoto.ran == [("B3", "+X")]
     assert page.current == "B3"
     assert page.selection == ()
     assert page.status().outcome is not None
@@ -1600,8 +1604,12 @@ def test_captured_references_reach_plate_registration(
 
 
 def test_a_capture_replaces_the_same_well_and_side(
-    page: PlatePage, fake_microscope: Microscope
+    page: PlatePage,
+    fake_microscope: Microscope,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
 ) -> None:
+    seed_camera_calibration(run_doc)  # the Ti2-E's: left is +X, top is -Y
     stage = fake_microscope.require(XYStage)
     stage.move_to_um(10.0, 20.0)
     page.capture_centre("A1")
@@ -1618,11 +1626,11 @@ def test_a_capture_replaces_the_same_well_and_side(
     page.capture_wall("A1", "top")
     stage.move_to_um(3.0, 4.0)
     assert page.capture_wall("A1", "left") == WallTouch(
-        well="A1", side="left", x_um=3.0, y_um=4.0
+        well="A1", side="+X", x_um=3.0, y_um=4.0
     )
     assert page.walls == (
-        WallTouch(well="A1", side="top", x_um=1.0, y_um=2.0),
-        WallTouch(well="A1", side="left", x_um=3.0, y_um=4.0),
+        WallTouch(well="A1", side="-Y", x_um=1.0, y_um=2.0),
+        WallTouch(well="A1", side="+X", x_um=3.0, y_um=4.0),
     )
 
 
@@ -1642,9 +1650,388 @@ def test_a_capture_of_a_well_that_is_not_on_the_plate_is_refused(
     assert page.walls == ()
 
 
-def test_forget_drops_one_wells_captures_or_all(
+# --- walls named on the image (m5 §13, #327) -------------------------------------------
+
+#: The Ti2-E at 10x: the image's left is the stage's +X and its bottom the stage's +Y.
+TI2E: tuple[tuple[float, float], tuple[float, float]] = ((-1.1, 0.0), (0.0, 1.1))
+#: An upright camera, not mirrored: the image's sides are the stage's.
+UPRIGHT: tuple[tuple[float, float], tuple[float, float]] = ((1.1, 0.0), (0.0, -1.1))
+#: A camera at 90 degrees, mirrored: the one matrix of the table that is neither
+#: diagonal nor symmetric (M3 §19.1: left +Y, right -Y, top -X, bottom +X). The two
+#: above equal their own transpose, so a page that handed the matrix over transposed
+#: passed every test (FM-73: the symmetric case hides the exchange of two axes);
+#: this one's transpose is the -90 degree mirrored camera, opposite on all four sides.
+NINETY_MIRRORED: tuple[tuple[float, float], tuple[float, float]] = (
+    (0.0, 1.1),
+    (-1.1, 0.0),
+)
+
+
+def _turned(deg: float) -> tuple[tuple[float, float], tuple[float, float]]:
+    """``1.1 * R(deg) * diag(1, -1)``: an upright camera turned by ``deg``."""
+    c, s = math.cos(math.radians(deg)), math.sin(math.radians(deg))
+    return ((1.1 * c, 1.1 * s), (1.1 * s, -1.1 * c))
+
+
+@pytest.mark.parametrize(
+    ("matrix", "expected"),
+    [
+        (TI2E, {"left": "+X", "right": "-X", "top": "-Y", "bottom": "+Y"}),
+        (UPRIGHT, {"left": "-X", "right": "+X", "top": "+Y", "bottom": "-Y"}),
+        (
+            NINETY_MIRRORED,
+            {"left": "+Y", "right": "-Y", "top": "-X", "bottom": "+X"},
+        ),
+    ],
+    ids=["ti2e", "upright", "ninety-mirrored"],
+)
+def test_capture_wall_records_the_stage_side_of_the_image_side(
+    page: PlatePage,
+    fake_microscope: Microscope,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
+    matrix: tuple[tuple[float, float], tuple[float, float]],
+    expected: dict[str, str],
+) -> None:
+    seed_camera_calibration(run_doc, matrix)
+    stage = fake_microscope.require(XYStage)
+    for index, image_side in enumerate(("left", "right", "top", "bottom")):
+        x, y = 100.0 * (index + 1), -50.0 * (index + 1)
+        stage.move_to_um(x, y)
+        touch = page.capture_wall("B3", image_side)
+        # The side is the stage's, the position the stage's, and the well normalised.
+        assert touch == WallTouch(
+            well="B3",
+            side=expected[image_side],
+            x_um=x,
+            y_um=y,  # type: ignore[arg-type]
+        )
+    assert [w.side for w in page.walls] == [
+        expected[s] for s in ("left", "right", "top", "bottom")
+    ]
+
+
+def test_capture_wall_without_a_calibration_is_refused_and_records_nothing(
     page: PlatePage, fake_microscope: Microscope
 ) -> None:
+    stage = fake_microscope.require(XYStage)
+    reads: list[None] = []
+    real_position = stage.position_um
+
+    def counting() -> Any:
+        reads.append(None)
+        return real_position()
+
+    with (
+        _replaced(stage, "position_um", counting),
+        _refuses(ValueError, NO_CALIBRATION_FOR_SIDES),
+    ):
+        page.capture_wall("B3", "left")
+    assert page.walls == ()
+    # A wall that cannot be mapped is refused before the stage is read.
+    assert reads == []
+
+
+def test_capture_wall_with_a_calibration_off_a_quarter_turn_is_refused(
+    page: PlatePage, run_doc: Path, seed_camera_calibration: Callable[..., Any]
+) -> None:
+    seed_camera_calibration(run_doc, _turned(6.0))
+    with pytest.raises(ValueError, match=r"the camera is turned 6\.0° away") as raised:
+        page.capture_wall("B3", "left")
+    # `frames`' own text goes through, taken where it is caught (FM-98).
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert page.walls == ()
+    seed_camera_calibration(run_doc, _turned(4.0))  # within the bound: a side again
+    assert page.capture_wall("B3", "left").side == "-X"
+
+
+def test_a_capture_of_the_same_stage_side_replaces_the_first(
+    page: PlatePage,
+    fake_microscope: Microscope,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    stage = fake_microscope.require(XYStage)
+    seed_camera_calibration(run_doc, TI2E)
+    stage.move_to_um(1.0, 2.0)
+    page.capture_wall("B3", "left")  # stage +X
+    # The camera was turned and calibrated again: the image's right is +X now, so a
+    # capture of it is the same stage side, and replaces the first (m5 §13.1).
+    seed_camera_calibration(run_doc, UPRIGHT)
+    stage.move_to_um(3.0, 4.0)
+    page.capture_wall("B3", "right")
+    assert page.walls == (WallTouch(well="B3", side="+X", x_um=3.0, y_um=4.0),)
+
+
+def test_goto_an_image_side_runs_goto_well_with_the_stage_side(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    page = _page(fake_microscope, run_doc)
+    try:
+        seed_camera_calibration(run_doc, TI2E)
+        page.goto("B3", "left")
+        assert page.join(10.0)
+        seed_camera_calibration(run_doc, UPRIGHT)
+        page.goto("B3", "left")
+        assert page.join(10.0)
+        page.goto("B3", "centre")  # no mapping: it needs no calibration to be read
+        assert page.join(10.0)
+        assert StubGoto.ran == [("B3", "+X"), ("B3", "-X"), ("B3", "centre")]
+    finally:
+        page.close()
+
+
+def test_goto_an_image_side_without_a_calibration_is_refused_before_current_changes(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    page = _page(fake_microscope, run_doc)
+    try:
+        with _refuses(ValueError, NO_CALIBRATION_FOR_SIDES):
+            page.goto("B3", "left")
+        x, y = _centre("B3", a1=A1_OFF, rotation_deg=TURN_DEG)
+        with _refuses(ValueError, NO_CALIBRATION_FOR_SIDES):
+            page.click(x, y, drive=True, side="bottom")
+        # Before `current` changes and before a run starts: the page shows no well
+        # that was not driven to.
+        assert page.current is None
+        assert StubGoto.ran == []
+        assert page.status().running is None
+        assert page.status().outcome is None
+    finally:
+        page.close()
+
+
+def test_goto_refuses_a_word_that_is_no_image_side(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    # A stage direction is not a side of the image: it would skip the mapping.
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    seed_camera_calibration(run_doc)
+    page = _page(fake_microscope, run_doc)
+    try:
+        for word in ("+X", "middle"):
+            with _refuses(
+                ValueError,
+                f"side must be one of centre, left, right, top, bottom, got {word!r}",
+            ):
+                page.goto("B3", word)
+        assert StubGoto.ran == []
+        assert page.current is None
+    finally:
+        page.close()
+
+
+def test_view_carries_the_matrix_of_the_latest_usable_calibration(
+    page: PlatePage, run_doc: Path, seed_camera_calibration: Callable[..., Any]
+) -> None:
+    assert page.view().camera_matrix is None
+    seed_camera_calibration(run_doc, TI2E)
+    assert page.view().camera_matrix == TI2E
+    # Rotation and mirror belong to the optical path: another objective's is used.
+    seed_camera_calibration(run_doc, UPRIGHT, objective="Nikon 40X Plan Fluor ELWD")
+    assert page.view().camera_matrix == UPRIGHT
+    # A dry run's record is not usable on a real stand, nor another stand's.
+    seed_camera_calibration(run_doc, TI2E, dry_run=True)
+    assert page.view().camera_matrix is None
+    seed_camera_calibration(run_doc, TI2E, profile="another-stand")
+    assert page.view().camera_matrix is None
+
+
+def test_a_calibration_whose_result_does_not_validate_is_a_problem_not_a_crash(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # The record is `done` and usable, but its result is not a calibration (FM-125):
+    # the view draws it as absent and says why; a capture is refused as without one.
+    _seed(run_doc, "camera-calibration", "camera-calibration", StubResult())
+    view = page.view()
+    assert view.camera_matrix is None
+    assert any(
+        p.startswith("camera-calibration: result does not validate")
+        for p in view.problems
+    )
+    with _refuses(ValueError, NO_CALIBRATION_FOR_SIDES):
+        page.capture_wall("B3", "left")
+
+
+def test_a_run_document_that_names_walls_on_the_image_starts_the_page_with_none(
+    fake_microscope: Microscope, run_doc: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Ti2-E session 2's document holds `left` and `bottom` in its params (smc 0.0.1).
+    # They are not translated, because a translation is a guess of the frame (M3
+    # §19.2): the page shows no capture and says so in its log.
+    walls = [{"well": "B3", "side": "left", "x_um": 5.0, "y_um": 6.0}]
+    _seed(
+        run_doc,
+        "plate-registration",
+        "plate",
+        _plate(),
+        params={"plate": "96-well", "refs": [], "walls": walls},
+    )
+    with caplog.at_level(logging.INFO, logger="smc.ui"):
+        page = _page(fake_microscope, run_doc)
+    try:
+        assert page.walls == ()
+        lines = [r.getMessage() for r in caplog.records if r.name == "smc.ui"]
+        assert any("walls are not read" in line for line in lines)
+    finally:
+        page.close()
+
+
+def test_an_unreadable_run_document_is_the_reason_and_not_a_missing_calibration(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # `run camera-calibration` is advice that cannot work here: the run document is
+    # what cannot be read, and a write would refuse it too. The page says so, in the
+    # words `view().problems` already has, and records nothing.
+    run_doc.write_text("{not json", encoding="utf-8")
+    reason = r"^run document: .*is not valid JSON"
+    with pytest.raises(ValueError, match=reason) as captured:
+        page.capture_wall("B3", "left")
+    with pytest.raises(ValueError, match=reason) as driven:
+        page.goto("B3", "left")
+    for raised in (captured, driven):
+        assert NO_CALIBRATION_FOR_SIDES not in str(raised.value)
+        assert raised.value.__context__ is None  # taken where caught (FM-98)
+    assert page.walls == ()
+    assert StubGoto.ran == []
+    assert page.current is None
+
+
+def test_a_drive_action_that_starts_while_the_side_is_mapped_refuses_the_capture(
+    page: PlatePage,
+    fake_microscope: Microscope,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    # The stage-at-rest guard is not atomic with the read (its docstring says the
+    # window is one `position_um()`). The mapping reads the run document in between,
+    # so a jog that another tab starts during it must meet a second guard: without it
+    # the wall is recorded where the stage was before the jog moved it.
+    seed_camera_calibration(run_doc)
+    stage = fake_microscope.require(XYStage)
+    reads: list[None] = []
+    real_position = stage.position_um
+    real_map = page._stage_side
+
+    def counting() -> Any:
+        reads.append(None)
+        return real_position()
+
+    def maps_while_a_jog_starts(side: Any) -> Any:
+        mapped = real_map(side)
+        with page._lock:
+            page._drive_running = "stage jog"
+        return mapped
+
+    try:
+        with (
+            _replaced(page, "_stage_side", maps_while_a_jog_starts),
+            _replaced(stage, "position_um", counting),
+            _refuses(RuntimeError, "stage jog is running"),
+        ):
+            page.capture_wall("B3", "left")
+    finally:
+        with page._lock:
+            page._drive_running = None
+    assert page.walls == ()
+    assert reads == []
+
+
+@pytest.mark.parametrize("record", ["dry-run", "another-stand", "failed"])
+def test_an_unusable_calibration_is_no_calibration_at_the_press(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
+    record: str,
+) -> None:
+    # The press is the guard (FM-169), and it reads the document itself: a dry run's
+    # synthetic matrix on a real stand, another stand's, or the matrix of a run that
+    # failed since, would map walls the stage then drives to. `view()` was tested for
+    # it; this is the press.
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    if record == "failed":
+        _seed(
+            run_doc,
+            "camera-calibration",
+            "camera-calibration",
+            status=StageStatus.failed,
+        )
+    else:
+        seed_camera_calibration(
+            run_doc,
+            TI2E,
+            dry_run=record == "dry-run",
+            profile="another-stand" if record == "another-stand" else "demo",
+        )
+    page = _page(fake_microscope, run_doc)
+    try:
+        with _refuses(ValueError, NO_CALIBRATION_FOR_SIDES):
+            page.capture_wall("B3", "left")
+        with _refuses(ValueError, NO_CALIBRATION_FOR_SIDES):
+            page.goto("B3", "left")
+        assert page.walls == ()
+        assert StubGoto.ran == []
+        assert page.current is None
+    finally:
+        page.close()
+
+
+def test_a_capture_of_the_same_stage_side_on_another_well_keeps_the_first(
+    page: PlatePage,
+    fake_microscope: Microscope,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    # The replace rule is the same well *and* the same stage side: the operator
+    # captures B3's +X wall and then B4's, and the page must keep both.
+    seed_camera_calibration(run_doc)
+    stage = fake_microscope.require(XYStage)
+    stage.move_to_um(1.0, 2.0)
+    page.capture_wall("A1", "left")
+    stage.move_to_um(3.0, 4.0)
+    page.capture_wall("A2", "left")
+    assert page.walls == (
+        WallTouch(well="A1", side="+X", x_um=1.0, y_um=2.0),
+        WallTouch(well="A2", side="+X", x_um=3.0, y_um=4.0),
+    )
+
+
+def test_goto_an_image_side_on_another_plates_map_says_the_plate_not_the_calibration(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # Two refusals could apply and neither is a courtesy: the plate mismatch comes
+    # first (m5 §13.1), because with it the same-named well of another plate is the
+    # target, which no calibration fixes.
+    _seed(run_doc, "plate-registration", "plate", _plate("384-well"))
+    page = _page(fake_microscope, run_doc)
+    try:
+        page.choose_plate("96-well")
+        with _refuses(
+            ValueError,
+            "the registered plate is a 384-well; calibrate the 96-well plate again, "
+            "or choose 384-well",
+        ):
+            page.goto("C5", "left")
+        assert StubGoto.ran == []
+        assert page.current is None
+    finally:
+        page.close()
+
+
+def test_forget_drops_one_wells_captures_or_all(
+    page: PlatePage,
+    fake_microscope: Microscope,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    seed_camera_calibration(run_doc)
     stage = fake_microscope.require(XYStage)
     stage.move_to_um(1.0, 2.0)
     for well in ("A1", "A2"):
@@ -1665,7 +2052,7 @@ def test_references_and_selection_start_from_the_latest_records(
         {"well": "A1", "x_um": 1000.0, "y_um": -500.0},
         {"well": "A12", "x_um": 100000.0, "y_um": 4000.0},
     ]
-    walls = [{"well": "B2", "side": "left", "x_um": 5.0, "y_um": 6.0}]
+    walls = [{"well": "B2", "side": "-X", "x_um": 5.0, "y_um": 6.0}]
     _seed(
         run_doc,
         "plate-registration",
@@ -1708,8 +2095,12 @@ def test_records_that_do_not_parse_start_the_page_empty_and_say_so(
 
 
 def test_choose_plate_clears_the_selection_and_the_captures(
-    page: PlatePage, fake_microscope: Microscope
+    page: PlatePage,
+    fake_microscope: Microscope,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
 ) -> None:
+    seed_camera_calibration(run_doc)
     page.select_text("A1:A3")
     page.capture_centre("A1")
     page.capture_wall("A1", "top")
@@ -1789,14 +2180,19 @@ def test_a_text_that_names_no_well_but_is_not_blank_keeps_its_refusal_and_the_se
 
 
 def test_plate_registration_params_are_the_plate_and_the_captures(
-    page: PlatePage, fake_microscope: Microscope
+    page: PlatePage,
+    fake_microscope: Microscope,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
 ) -> None:
+    seed_camera_calibration(run_doc)  # the Ti2-E's: the image's right is stage -X
     page.choose_plate("96-well")
     fake_microscope.require(XYStage).move_to_um(1.5, 2.5)
     page.capture_centre("A1")
     page.capture_wall("A1", "right")
     refs = json.dumps([{"well": "A1", "x_um": 1.5, "y_um": 2.5}])
-    walls = json.dumps([{"well": "A1", "side": "right", "x_um": 1.5, "y_um": 2.5}])
+    # The pairs carry the stage side the page mapped, never the word the operator saw.
+    walls = json.dumps([{"well": "A1", "side": "-X", "x_um": 1.5, "y_um": 2.5}])
     assert page.page_params("plate-registration") == [
         "plate=96-well",
         f"refs={refs}",
@@ -1858,8 +2254,12 @@ def test_the_form_of_plate_walls_offers_neither_plate_nor_refs(
 
 
 def test_plate_walls_params_are_the_plate_and_the_captured_centres(
-    page: PlatePage, fake_microscope: Microscope
+    page: PlatePage,
+    fake_microscope: Microscope,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
 ) -> None:
+    seed_camera_calibration(run_doc)
     page.choose_plate("96-well")
     stage = fake_microscope.require(XYStage)
     stage.move_to_um(1.5, 2.5)
@@ -2233,7 +2633,7 @@ PLACEHOLDER_REFUSAL = (
 )
 REF_A1 = {"well": "A1", "x_um": 1000.0, "y_um": -500.0}
 REF_B2 = {"well": "B2", "x_um": 10000.0, "y_um": -9500.0}
-WALL_A1 = {"well": "A1", "side": "left", "x_um": 5.0, "y_um": 6.0}
+WALL_A1 = {"well": "A1", "side": "-X", "x_um": 5.0, "y_um": 6.0}
 
 
 def test_a_fresh_document_names_no_plate_so_the_page_is_unchosen(

@@ -15,6 +15,8 @@ from smc.plugins.slots.cells import Cell, CellsFile, CellsResult, load_cells
 from smc.plugins.slots.density import DensityResult, DensityWell
 from smc.plugins.slots.nis_export import NisExportResult
 from smc.plugins.slots.plate import (
+    IMAGE_SIDES,
+    ImageSide,
     LatticeFit,
     PlateResult,
     WallFrame,
@@ -25,6 +27,7 @@ from smc.plugins.slots.plate import (
     WellGeometry,
     WellRef,
     normalise_well,
+    refuse_image_side,
     well_geometry,
 )
 from smc.plugins.slots.report import ReportResult
@@ -40,6 +43,7 @@ from smc.plugins.slots.scan_plan import PlannedField, ScanPlanResult
 from smc.plugins.slots.timings import TimingsResult
 
 __all__ = [
+    "IMAGE_SIDES",
     "CameraCalibration",
     "Cell",
     "CellsFile",
@@ -48,6 +52,7 @@ __all__ = [
     "DensityWell",
     "FailedField",
     "FocusState",
+    "ImageSide",
     "LatticeFit",
     "NisExportResult",
     "PlannedField",
@@ -70,5 +75,6 @@ __all__ = [
     "load_cells",
     "load_frame",
     "normalise_well",
+    "refuse_image_side",
     "well_geometry",
 ]

@@ -534,10 +534,10 @@ def test_opposite_walls_give_the_centre_with_no_diameter_assumed() -> None:
         "96-well",
         "A1",
         [
-            _touch("A1", "left", 1000 - 3200, 0),
-            _touch("A1", "right", 1000 + 3200, 0),
-            _touch("A1", "bottom", 0, 2000 - 3200),
-            _touch("A1", "top", 0, 2000 + 3200),
+            _touch("A1", "-X", 1000 - 3200, 0),
+            _touch("A1", "+X", 1000 + 3200, 0),
+            _touch("A1", "-Y", 0, 2000 - 3200),
+            _touch("A1", "+Y", 0, 2000 + 3200),
         ],
     )
     assert (e.x_um, e.y_um) == pytest.approx((1000.0, 2000.0))
@@ -551,7 +551,7 @@ def test_a_single_wall_per_axis_uses_the_nominal_half_size() -> None:
     e = centre_from_walls(
         "96-well",
         "a1",
-        [_touch("A1", "left", -2200, 0), _touch("a1", "bottom", 0, -1200)],
+        [_touch("A1", "-X", -2200, 0), _touch("a1", "-Y", 0, -1200)],
     )
     assert (e.x_um, e.y_um) == pytest.approx((1000.0, 2000.0))
     assert e.assumed_axes == ("x", "y")
@@ -563,18 +563,18 @@ def test_a_single_wall_per_axis_uses_the_nominal_half_size() -> None:
 @pytest.mark.parametrize(
     ("side", "x", "y", "expected"),
     [
-        ("left", 100.0, 0.0, (3300.0, 0.0)),
-        ("right", 100.0, 0.0, (-3100.0, 0.0)),
+        ("-X", 100.0, 0.0, (3300.0, 0.0)),
+        ("+X", 100.0, 0.0, (-3100.0, 0.0)),
     ],
 )
 def test_one_x_wall_is_a_half_size_from_the_centre(
     side: str, x: float, y: float, expected: tuple[float, float]
 ) -> None:
     e = centre_from_walls(
-        "96-well", "A1", [_touch("A1", side, x, y), _touch("A1", "top", 0.0, 0.0)]
+        "96-well", "A1", [_touch("A1", side, x, y), _touch("A1", "+Y", 0.0, 0.0)]
     )
     assert e.x_um == pytest.approx(expected[0])
-    assert e.y_um == pytest.approx(-3200.0)  # top is +Y: the centre is below it
+    assert e.y_um == pytest.approx(-3200.0)  # the +Y wall: the centre is below it
     assert e.assumed_axes == ("x", "y")
 
 
@@ -583,7 +583,7 @@ def test_a_single_wall_is_in_stage_units() -> None:
     e = centre_from_walls(
         "384-well",
         "A1",
-        [_touch("A1", "left", 0.0, 0.0), _touch("A1", "bottom", 0.0, 0.0)],
+        [_touch("A1", "-X", 0.0, 0.0), _touch("A1", "-Y", 0.0, 0.0)],
     )
     assert (e.x_um, e.y_um) == pytest.approx((1700.0, 1700.0))
 
@@ -596,10 +596,10 @@ def test_wall_touches_read_each_axis_from_its_own_coordinate(anisotropic: str) -
         anisotropic,
         "B3",
         [
-            _touch("B3", "left", cx - 5000.0, far),
-            _touch("B3", "right", cx + 5000.0, -far),
-            _touch("B3", "bottom", far, cy - 2500.0),
-            _touch("B3", "top", -far, cy + 2500.0),
+            _touch("B3", "-X", cx - 5000.0, far),
+            _touch("B3", "+X", cx + 5000.0, -far),
+            _touch("B3", "-Y", far, cy - 2500.0),
+            _touch("B3", "+Y", -far, cy + 2500.0),
         ],
     )
     assert (pair.x_um, pair.y_um) == pytest.approx((cx, cy))
@@ -607,20 +607,20 @@ def test_wall_touches_read_each_axis_from_its_own_coordinate(anisotropic: str) -
     assert pair.measured_height_um == pytest.approx(5000.0)
 
     one_wall = {
-        "left": centre_from_walls(
+        "-X": centre_from_walls(
             anisotropic,
             "B3",
             [
-                _touch("B3", "left", cx - 5000.0, far),
-                _touch("B3", "bottom", far, cy - 2500.0),
+                _touch("B3", "-X", cx - 5000.0, far),
+                _touch("B3", "-Y", far, cy - 2500.0),
             ],
         ),
-        "right": centre_from_walls(
+        "+X": centre_from_walls(
             anisotropic,
             "B3",
             [
-                _touch("B3", "right", cx + 5000.0, far),
-                _touch("B3", "top", far, cy + 2500.0),
+                _touch("B3", "+X", cx + 5000.0, far),
+                _touch("B3", "+Y", far, cy + 2500.0),
             ],
         ),
     }
@@ -632,15 +632,15 @@ def test_wall_touches_read_each_axis_from_its_own_coordinate(anisotropic: str) -
 def test_touching_the_wrong_well_is_caught_by_the_implied_size() -> None:
     """The free sanity check: two walls imply a size, and a size off by more than 10 % is refused."""
     touches = [
-        _touch("A1", "left", -2200, 0),
-        _touch("A1", "right", 7000, 0),
-        _touch("A1", "bottom", 0, -1200),
-        _touch("A1", "top", 0, 5200),
+        _touch("A1", "-X", -2200, 0),
+        _touch("A1", "+X", 7000, 0),
+        _touch("A1", "-Y", 0, -1200),
+        _touch("A1", "+Y", 0, 5200),
     ]
     with pytest.raises(
         ValueError,
         match=re.escape(
-            "A1's left and right walls are 9200 µm apart, a 96-well well is 6400 µm "
+            "A1's -X and +X walls are 9200 µm apart, a 96-well well is 6400 µm "
             "(+43.8%): a touch of another well, or off the wall; touch them again"
         ),
     ):
@@ -649,14 +649,14 @@ def test_touching_the_wrong_well_is_caught_by_the_implied_size() -> None:
 
 def test_a_wrong_y_pair_is_refused_in_its_own_words() -> None:
     touches = [
-        _touch("A1", "left", -3200, 0),
-        _touch("A1", "right", 3200, 0),
-        _touch("A1", "bottom", 0, 0),
-        _touch("A1", "top", 0, 9000),
+        _touch("A1", "-X", -3200, 0),
+        _touch("A1", "+X", 3200, 0),
+        _touch("A1", "-Y", 0, 0),
+        _touch("A1", "+Y", 0, 9000),
     ]
     with pytest.raises(
         ValueError,
-        match=re.escape("A1's top and bottom walls are 9000 µm apart, a 96-well well"),
+        match=re.escape("A1's -Y and +Y walls are 9000 µm apart, a 96-well well"),
     ):
         centre_from_walls("96-well", "A1", touches)
 
@@ -667,52 +667,179 @@ def test_the_size_tolerance_is_ten_percent() -> None:
         "96-well",
         "A1",
         [
-            _touch("A1", "left", 0, 0),
-            _touch("A1", "right", 6400 * 1.09, 0),
-            _touch("A1", "bottom", 0, 0),
-            _touch("A1", "top", 0, 6400 * 0.91),
+            _touch("A1", "-X", 0, 0),
+            _touch("A1", "+X", 6400 * 1.09, 0),
+            _touch("A1", "-Y", 0, 0),
+            _touch("A1", "+Y", 0, 6400 * 0.91),
         ],
     )
     assert inside.measured_width_um == pytest.approx(6400 * 1.09)
-    with pytest.raises(ValueError, match="left and right walls"):
+    with pytest.raises(ValueError, match=r"-X and \+X walls are 7104 µm apart"):
         centre_from_walls(
             "96-well",
             "A1",
             [
-                _touch("A1", "left", 0, 0),
-                _touch("A1", "right", 6400 * 1.11, 0),
-                _touch("A1", "bottom", 0, 0),
-                _touch("A1", "top", 0, 6400),
+                _touch("A1", "-X", 0, 0),
+                _touch("A1", "+X", 6400 * 1.11, 0),
+                _touch("A1", "-Y", 0, 0),
+                _touch("A1", "+Y", 0, 6400),
             ],
         )
 
 
 def test_swapped_opposite_walls_are_refused() -> None:
-    """Right of left by -6400 µm: a size, signed, that no well has."""
+    """+X is left of -X by 6400 µm: a size, signed, that no well has, and a well's width."""
     touches = [
-        _touch("A1", "left", 3200, 0),
-        _touch("A1", "right", -3200, 0),
-        _touch("A1", "bottom", 0, -3200),
-        _touch("A1", "top", 0, 3200),
+        _touch("A1", "-X", 3200, 0),
+        _touch("A1", "+X", -3200, 0),
+        _touch("A1", "-Y", 0, -3200),
+        _touch("A1", "+Y", 0, 3200),
     ]
     with pytest.raises(
-        ValueError, match=re.escape("A1's left and right walls are -6400 µm apart")
+        ValueError,
+        match=re.escape(
+            "A1's -X and +X walls are swapped: the +X wall is 6400 µm on the -X "
+            "side of the -X wall, a 96-well well's width; touch them again, each "
+            "named by its direction from the well's centre"
+        ),
     ):
         centre_from_walls("96-well", "A1", touches)
 
 
+# Ti2-E session 2 (#334, #327): B3 of a 24-well plate, touched by hand at 10x. The
+# walls are in stage directions, as the layer takes them. The well is 15 600 µm
+# across (half 7 800), and B3's centre was measured at (10182.0, -10087.9).
+_B3_MINUS_X = (2468.0, -9737.3)
+_B3_PLUS_X = (18067.4, -9737.3)
+_B3_MINUS_Y = (10226.7, -17738.5)
+_B3_PLUS_Y = (10226.7, -2337.6)
+
+
+def test_one_wall_per_axis_gives_the_centre_the_stage_directions_say() -> None:
+    """The incident's two touches, named in the stage frame, land on the well.
+
+    On the Ti2-E the operator saw them at the image's left and bottom, which are the
+    stage's +X and +Y there. Read in the stage frame as `left` and `bottom` they gave
+    (25767.9, 5465.9): 15.5 mm from B3. As `+X` and `+Y` they give the centre of the
+    well, 14 and 46 µm from the measured (10182.0, -10087.9).
+    """
+    e = centre_from_walls(
+        "24-well",
+        "B3",
+        [
+            _touch("B3", "+X", 17967.9, -10237.1),
+            _touch("B3", "+Y", 10368.3, -2334.1),
+        ],
+    )
+    assert (e.x_um, e.y_um) == pytest.approx((10167.9, -10134.1), abs=1e-6)
+    assert e.assumed_axes == ("x", "y")
+    assert abs(e.x_um - 25767.9) > 15000.0
+    assert abs(e.y_um - 5465.9) > 15000.0
+
+
+def test_the_four_touches_of_session_2_give_the_centre_and_the_well_size() -> None:
+    e = centre_from_walls(
+        "24-well",
+        "B3",
+        [
+            _touch("B3", "-X", *_B3_MINUS_X),
+            _touch("B3", "+X", *_B3_PLUS_X),
+            _touch("B3", "-Y", *_B3_MINUS_Y),
+            _touch("B3", "+Y", *_B3_PLUS_Y),
+        ],
+    )
+    assert (e.x_um, e.y_um) == pytest.approx((10267.7, -10038.05), abs=1e-6)
+    assert e.measured_width_um == pytest.approx(15599.4, abs=1e-6)
+    assert e.measured_height_um == pytest.approx(15400.9, abs=1e-6)
+    assert e.assumed_axes == ()
+
+
+def test_a_swapped_pair_is_refused_as_swapped() -> None:
+    """The same touches with -X and +X exchanged: the signed size says so."""
+    touches = [
+        _touch("B3", "-X", *_B3_PLUS_X),
+        _touch("B3", "+X", *_B3_MINUS_X),
+        _touch("B3", "-Y", *_B3_MINUS_Y),
+        _touch("B3", "+Y", *_B3_PLUS_Y),
+    ]
+    with pytest.raises(ValueError, match="walls are swapped") as raised:
+        centre_from_walls("24-well", "B3", touches)
+    text = str(raised.value)
+    assert text == (
+        "B3's -X and +X walls are swapped: the +X wall is 15599 µm on the -X side "
+        "of the -X wall, a 24-well well's width; touch them again, each named by "
+        "its direction from the well's centre"
+    )
+    assert "another well" not in text
+
+
+def test_a_swapped_y_pair_is_refused_as_swapped_with_the_height() -> None:
+    touches = [
+        _touch("B3", "-X", *_B3_MINUS_X),
+        _touch("B3", "+X", *_B3_PLUS_X),
+        _touch("B3", "-Y", *_B3_PLUS_Y),
+        _touch("B3", "+Y", *_B3_MINUS_Y),
+    ]
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            "B3's -Y and +Y walls are swapped: the +Y wall is 15401 µm on the -Y "
+            "side of the -Y wall, a 24-well well's height; touch them again"
+        ),
+    ):
+        centre_from_walls("24-well", "B3", touches)
+
+
+@pytest.mark.parametrize(("factor", "swapped"), [(1.09, True), (1.11, False)])
+def test_a_reversed_pair_is_swapped_only_within_the_size_tolerance(
+    factor: float, swapped: bool
+) -> None:
+    # A reversed pair of the wrong size is a touch of another well as well, and says
+    # the size it measured, signed: "swapped" is for a pair that has the right size.
+    touches = [
+        _touch("A1", "-X", 6400 * factor, 0),
+        _touch("A1", "+X", 0, 0),
+        _touch("A1", "-Y", 0, 0),
+        _touch("A1", "+Y", 0, 6400),
+    ]
+    with pytest.raises(ValueError, match=r"-X and \+X walls are") as raised:
+        centre_from_walls("96-well", "A1", touches)
+    text = str(raised.value)
+    assert ("are swapped" in text) is swapped
+    if not swapped:
+        assert "-7104 µm apart" in text
+        assert "a touch of another well" in text
+
+
+def test_a_pair_off_the_size_keeps_the_size_refusal() -> None:
+    touches = [
+        _touch("B3", "-X", 5000.0, -9737.3),
+        _touch("B3", "+X", 5000.0 + 9200.0, -9737.3),
+        _touch("B3", "-Y", 10226.7, -17738.5),
+        _touch("B3", "+Y", 10226.7, -2337.6),
+    ]
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            "B3's -X and +X walls are 9200 µm apart, a 24-well well is 15600 µm "
+            "(-41.0%): a touch of another well, or off the wall; touch them again"
+        ),
+    ):
+        centre_from_walls("24-well", "B3", touches)
+
+
 def test_an_axis_with_no_wall_at_all_is_refused() -> None:
-    with pytest.raises(ValueError, match="no Y wall for A1: give top and/or bottom"):
+    with pytest.raises(ValueError, match=r"no Y wall for A1: give -Y and/or \+Y"):
         centre_from_walls(
             "96-well",
             "A1",
-            [_touch("A1", "left", 0, 0), _touch("A1", "right", 6400, 0)],
+            [_touch("A1", "-X", 0, 0), _touch("A1", "+X", 6400, 0)],
         )
-    with pytest.raises(ValueError, match="no X wall for A1: give left and/or right"):
+    with pytest.raises(ValueError, match=r"no X wall for A1: give -X and/or \+X"):
         centre_from_walls(
             "96-well",
             "A1",
-            [_touch("A1", "bottom", 0, 0), _touch("A1", "top", 0, 6400)],
+            [_touch("A1", "-Y", 0, 0), _touch("A1", "+Y", 0, 6400)],
         )
     with pytest.raises(ValueError, match="give at least one wall touch for A1"):
         centre_from_walls("96-well", "A1", [])
@@ -720,16 +847,16 @@ def test_an_axis_with_no_wall_at_all_is_refused() -> None:
 
 def test_a_side_touched_twice_is_refused() -> None:
     touches = [
-        _touch("A1", "left", 0, 0),
-        _touch("a1", "left", 10, 0),
-        _touch("A1", "bottom", 0, 0),
+        _touch("A1", "-X", 0, 0),
+        _touch("a1", "-X", 10, 0),
+        _touch("A1", "-Y", 0, 0),
     ]
-    with pytest.raises(ValueError, match="A1: the left wall is given twice"):
+    with pytest.raises(ValueError, match="A1: the -X wall is given twice"):
         centre_from_walls("96-well", "A1", touches)
 
 
 def test_a_touch_of_another_well_is_refused() -> None:
-    touches = [_touch("A1", "left", 0, 0), _touch("B2", "bottom", 0, 0)]
+    touches = [_touch("A1", "-X", 0, 0), _touch("B2", "-Y", 0, 0)]
     with pytest.raises(ValueError, match="a touch of B2 was given for A1"):
         centre_from_walls("96-well", "A1", touches)
 
@@ -752,10 +879,10 @@ def test_an_edge_centre_feeds_the_calibration_directly() -> None:
             "96-well",
             name,
             [
-                _touch(name, "left", cx - 3200, 0),
-                _touch(name, "right", cx + 3200, 0),
-                _touch(name, "bottom", 0, cy - 3200),
-                _touch(name, "top", 0, cy + 3200),
+                _touch(name, "-X", cx - 3200, 0),
+                _touch(name, "+X", cx + 3200, 0),
+                _touch(name, "-Y", 0, cy - 3200),
+                _touch(name, "+Y", 0, cy + 3200),
             ],
         )
         refs.append(WellRef(well=e.well, x_um=e.x_um, y_um=e.y_um))
@@ -805,10 +932,10 @@ def test_wall_targets_are_a_half_size_from_the_centre() -> None:
     cal = calibrate("96-well", [WellRef(well="A1", x_um=1000, y_um=2000)])
     cx, cy = cal.well_center_um("A1")
     for side, expect in (
-        ("right", (cx + 3200, cy)),
-        ("left", (cx - 3200, cy)),
-        ("top", (cx, cy + 3200)),
-        ("bottom", (cx, cy - 3200)),
+        ("+X", (cx + 3200, cy)),
+        ("-X", (cx - 3200, cy)),
+        ("+Y", (cx, cy + 3200)),
+        ("-Y", (cx, cy - 3200)),
     ):
         assert wall_position(cal, "A1", side) == pytest.approx(expect)
 
@@ -827,7 +954,7 @@ def test_wall_targets_follow_the_fitted_rotation() -> None:
         ],
     )
     assert rotated.rotation_deg == pytest.approx(5.0, abs=0.01)
-    x, y = wall_position(rotated, "A1", "right")
+    x, y = wall_position(rotated, "A1", "+X")
     assert y > 100, "the wall target ignored the plate rotation"
     assert (x, y) == pytest.approx(
         (3200 * math.cos(math.radians(5)), 3200 * math.sin(math.radians(5))), abs=0.1
@@ -848,10 +975,10 @@ def test_wall_position_on_an_anisotropic_plate_uses_each_axis_s_size(
         a1[1] + sin * 24000.0 + cos * -7000.0,
     )
     for side, (ox, oy) in {
-        "left": (-5000.0, 0.0),
-        "right": (5000.0, 0.0),
-        "top": (0.0, 2500.0),
-        "bottom": (0.0, -2500.0),
+        "-X": (-5000.0, 0.0),
+        "+X": (5000.0, 0.0),
+        "+Y": (0.0, 2500.0),
+        "-Y": (0.0, -2500.0),
     }.items():
         expected = (centre[0] + cos * ox - sin * oy, centre[1] + sin * ox + cos * oy)
         assert wall_position(result, "B3", side) == pytest.approx(expected, abs=1e-6)
@@ -862,16 +989,25 @@ def test_an_unknown_well_is_refused_rather_than_placed() -> None:
     with pytest.raises(
         ValueError, match=re.escape("well 'Z99' is not on the 96-well plate")
     ):
-        wall_position(cal, "Z99", "left")
+        wall_position(cal, "Z99", "-X")
 
 
 def test_an_unknown_side_is_refused() -> None:
     cal = calibrate("96-well", [WellRef(well="A1", x_um=0, y_um=0)])
     with pytest.raises(
         ValueError,
-        match=re.escape("side 'middle' is not one of left, right, top, bottom"),
+        match=re.escape("side 'middle' is not one of -X, +X, -Y, +Y"),
     ):
         wall_position(cal, "A1", "middle")
+
+
+@pytest.mark.parametrize("word", ["left", "right", "top", "bottom"])
+def test_wall_position_refuses_an_image_side_with_the_reason(word: str) -> None:
+    # A direction read in the other frame is the defect itself (FM-189): the word is
+    # refused and says that it is a side on the image, not "not one of ...".
+    cal = calibrate("96-well", [WellRef(well="A1", x_um=0, y_um=0)])
+    with pytest.raises(ValueError, match="is a side on the image"):
+        wall_position(cal, "A1", word)
 
 
 def test_capturing_references_replaces_the_seed_with_a_real_fit() -> None:

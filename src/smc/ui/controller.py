@@ -67,6 +67,8 @@ from smc.plugins import (
     parse_params,
     run_plugin,
 )
+from smc.plugins.frames import stage_side_of_image_side
+from smc.plugins.geometry import Matrix2
 from smc.plugins.presets import (
     NOT_IN_PARAMS,
     Preset,
@@ -83,9 +85,13 @@ from smc.plugins.presets import save_preset as write_preset
 from smc.plugins.runner import reachable_checkpoint
 from smc.plugins.scan_plan.wells import parse_wells
 from smc.plugins.slots import (
+    IMAGE_SIDES,
+    CameraCalibration,
     DensityResult,
+    ImageSide,
     PlateResult,
     RouteResult,
+    WallSide,
     WallTouch,
     WellGeometry,
     WellRef,
@@ -97,6 +103,7 @@ from smc.ui.frames import Frame
 from smc.ui.guide import (
     CAPTURE_WELLS,
     DRY_RUN_NO_FRAME,
+    NO_CALIBRATION_FOR_SIDES,
     PLATE_NOT_CHOSEN,
     SELECT_WELLS,
     WALLS_DRY_RUN,
@@ -198,8 +205,6 @@ _CHECKLIST: tuple[tuple[str, bool], ...] = (
     ("nis-export", False),
 )
 
-_SIDES = ("left", "right", "top", "bottom")
-
 #: A result card shows this many values, each at most this many characters long.
 _CARD_LINES = 8
 _CARD_CHARS = 80
@@ -275,6 +280,21 @@ def _needs_plate(plugin: str) -> bool:
     (``plate-walls``, #346) is gated by naming ``plate`` there, with no further code.
     """
     return "plate" in PAGE_PARAMS.get(plugin, ())
+
+
+def _image_side(side: str, extra: tuple[str, ...] = ()) -> ImageSide:
+    """``side`` as a side of the image, or a ``ValueError`` that lists the words the caller takes.
+
+    ``extra`` are the other words the caller accepts and has already handled (the
+    drive's ``centre``): they only shape the message. Looping over the sides, and not
+    asking ``side in IMAGE_SIDES``, is what narrows the type for mypy.
+    """
+    for known in IMAGE_SIDES:
+        if side == known:
+            return known
+    raise ValueError(
+        f"side must be one of {', '.join((*extra, *IMAGE_SIDES))}, got {side!r}"
+    )
 
 
 class PageServerError(RuntimeError):
@@ -355,7 +375,11 @@ class PlateView:
     with (m5 §8.3), built here from this read and never by the tick. ``replaces``
     maps each tool that provides the ``plate`` slot to what a Run of it would replace,
     while that slot is usable (m5 §11.4); a tool never refused for it, and no other
-    slot has one.
+    slot has one. ``camera_matrix`` is the matrix of the latest usable
+    ``camera-calibration`` (whatever its objective: rotation and mirror belong to the
+    optical path), ``None`` when there is none or its result does not validate; the
+    page says from it what each side of the image is and what the arrows do to it
+    (m5 §13).
     """
 
     plate: str
@@ -369,6 +393,7 @@ class PlateView:
     cards: dict[str, ResultCard]
     next_step: NextStep | None = None
     replaces: Mapping[str, str] = field(default_factory=dict)
+    camera_matrix: Matrix2 | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1085,15 +1110,62 @@ class PlatePage:
         drive the stage to C5 of the registered 384-well plate with nothing on the
         page to say so. So it refuses that mismatch before anything changes.
 
+        ``side`` is ``centre`` or a side **on the image**, as the operator names a wall
+        (m5 §13.1): ``goto-well`` takes stage directions, so the side is mapped with
+        the latest usable ``camera-calibration`` and the run gets the stage's. The
+        mapping comes after the plate's check and before ``current`` changes and a
+        run starts, so a refusal leaves the page as it was.
+
         Raises:
-            ValueError: A usable ``plate`` slot names another plate than ``plate``.
+            ValueError: A usable ``plate`` slot names another plate than ``plate``;
+                ``side`` is not ``centre`` or a side of the image; an image side with
+                no usable calibration (``NO_CALIBRATION_FOR_SIDES``), or one whose
+                camera is off a quarter turn (``frames``' own text).
             RuntimeError: A run is going, or the page is closed.
         """
         self._refuse_if_busy()
         self._refuse_another_registered_plate(self._document()[0])
+        stage_side = (
+            "centre"
+            if side == "centre"
+            else self._stage_side(_image_side(side, ("centre",)))
+        )
         name = normalise_well(well)
         self.current = name
-        self.run("goto-well", [f"well={name}", f"side={side}"])
+        self.run("goto-well", [f"well={name}", f"side={stage_side}"])
+
+    def _stage_side(self, side: ImageSide) -> WallSide:
+        """The stage side that ``side`` of the image is, from the document as it is now (m5 §13.1).
+
+        The operator names a wall as the image shows it (FM-189), and only a
+        camera calibration's rotation and mirror say which stage side that is. The
+        document is read at the press and the matrix is never kept: a capture is
+        refused while a run goes, so no calibration can change during one (FM-177).
+        A refusal is a ``ValueError`` whose text is taken where it is caught and
+        raised outside the handler (FM-98).
+
+        Raises:
+            ValueError: The run document cannot be read (``run document: <why>``, the
+                line ``view().problems`` has: the advice to run a calibration cannot
+                work when nothing can be written to it); no usable
+                ``camera-calibration`` (``NO_CALIBRATION_FOR_SIDES``, the same when
+                its result does not validate); or its matrix is refused by ``frames``
+                (a camera off a quarter turn, a matrix that cannot be inverted or
+                whose axes lie on one stage axis): ``frames``' own text.
+        """
+        doc, unreadable = self._document()
+        if unreadable is not None:
+            # `unreadable` is the text `_document` took where it caught the error
+            # (FM-98): raised here, outside any handler, it keeps no traceback.
+            raise ValueError(f"run document: {unreadable}")
+        calibration = self._slot(doc, "camera-calibration", CameraCalibration, [])
+        if calibration is None:
+            raise ValueError(NO_CALIBRATION_FOR_SIDES)
+        try:
+            return stage_side_of_image_side(side, calibration.matrix_um_per_px)
+        except ValueError as exc:
+            problem = str(exc)
+        raise ValueError(problem)
 
     # --- captures --------------------------------------------------------------
 
@@ -1119,32 +1191,45 @@ class PlatePage:
         return ref
 
     def capture_wall(self, well: str, side: str) -> WallTouch:
-        """Record the stage position as a point of ``well``'s ``side`` wall; replaces the same side.
+        """Record the stage position as a point of ``well``'s wall at ``side`` of the image.
+
+        ``side`` is a side as the operator sees it on the image (m5 §13.1); the touch
+        is recorded in the stage's frame, which is the one the layer takes, mapped with
+        the latest usable ``camera-calibration`` at the press. It replaces the earlier
+        touch of the same well and the same **stage** side: after a camera turn and a
+        new calibration, two image sides can name the same wall.
 
         Raises:
-            ValueError: ``side`` is not left, right, top or bottom, or the well is
-                not on the plate.
+            ValueError: ``side`` is not left, right, top or bottom; the well is not on
+                the plate; no usable calibration (``NO_CALIBRATION_FOR_SIDES``), or a
+                camera off a quarter turn (``frames``' own text). Nothing is recorded.
             RuntimeError: As ``capture_centre``.
             CapabilityMissingError: The stand has no XY stage.
         """
-        if side not in _SIDES:
-            raise ValueError(f"side must be one of {', '.join(_SIDES)}, got {side!r}")
+        image_side = _image_side(side)
         name = self._on_plate(well)
+        self._refuse_if_moving()
+        # After the checks above and before the stage is read: a wall that cannot be
+        # mapped is refused before it is touched (FM-169: this is the guard, the
+        # button's state a courtesy).
+        stage_side = self._stage_side(image_side)
+        # The mapping read the run document, so the guard above is out of date by a
+        # disk read: a jog another tab started meanwhile must be seen before the
+        # stage is read, or the wall is recorded where the stage was (FM-181). The
+        # first call stays where it is: a busy stage is answered before a missing
+        # calibration.
         self._refuse_if_moving()
         with self._reading() as microscope:
             if microscope is None:
                 raise RuntimeError(NOT_CONNECTED)
             position = microscope.require(XYStage).position_um()
         touch = WallTouch(
-            well=name,
-            side=side,  # type: ignore[arg-type]  # checked against _SIDES above
-            x_um=position.x_um,
-            y_um=position.y_um,
+            well=name, side=stage_side, x_um=position.x_um, y_um=position.y_um
         )
         kept = tuple(
             w
             for w in self.walls
-            if not (normalise_well(w.well) == name and w.side == side)
+            if not (normalise_well(w.well) == name and w.side == stage_side)
         )
         self.walls = (*kept, touch)
         return touch
@@ -2653,6 +2738,7 @@ class PlatePage:
         registered = self._slot(doc, "plate", PlateResult, problems)
         density = self._slot(doc, "density", DensityResult, problems)
         route = self._slot(doc, "route", RouteResult, problems)
+        calibration = self._slot(doc, "camera-calibration", CameraCalibration, problems)
         geometries, nominal = self._registered_geometries(registered)
         selected = frozenset(self.selection)
         measured = {} if density is None else {w.well: w for w in density.wells}
@@ -2707,6 +2793,7 @@ class PlatePage:
             cards=cards,
             next_step=self._next_step(checklist, blocked, cards),
             replaces=self._replace_notes(doc),
+            camera_matrix=None if calibration is None else calibration.matrix_um_per_px,
         )
 
     def _replace_notes(self, doc: RunDocument) -> dict[str, str]:

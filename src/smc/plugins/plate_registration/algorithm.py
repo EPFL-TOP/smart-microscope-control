@@ -25,6 +25,7 @@ from smc.plugins.slots import (
     WallTouch,
     WellRef,
     normalise_well,
+    refuse_image_side,
     well_geometry,
 )
 
@@ -57,7 +58,10 @@ DIAMETER_TOLERANCE = 0.10
 #: a well was misnamed (FM-121).
 MAX_ROTATION_DEG = 10.0
 
-_SIDES = ("left", "right", "top", "bottom")
+#: A wall is named by the stage direction that reaches it from the well's centre,
+#: along the plate's own axes. The operator's image words are the plate page's, and
+#: it maps them before it gets here (m3 §19): none is read in this frame.
+_SIDES = ("-X", "+X", "-Y", "+Y")
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,16 +266,20 @@ def centre_from_walls(
     well, which checks that the right wall was touched; one wall gives the
     centre only with the nominal half-size, and the axis is reported as assumed.
 
-    Each axis is read from its own coordinate: ``left`` and ``right`` use ``x_um``,
-    ``top`` and ``bottom`` use ``y_um`` (``top`` is +Y, towards row A), and the
-    other coordinate of a touch is never read (FM-73). The sizes are the
-    plate's, width for X and height for Y.
+    Each axis is read from its own coordinate: ``-X`` and ``+X`` use ``x_um``,
+    ``-Y`` and ``+Y`` use ``y_um`` (``+Y`` is towards row A), and the other
+    coordinate of a touch is never read (FM-73). A side is a stage direction: the
+    ``-X`` wall is the one the stage reaches by going -X from the well's centre,
+    whatever the camera shows there. The sizes are the plate's, width for X and
+    height for Y.
 
     Raises:
         ValueError: The well is not on the plate; no touch, or a touch of
-            another well; a side given twice; no wall for X or for Y; or an
-            opposite pair whose size is off the plate's by more than
-            ``DIAMETER_TOLERANCE``.
+            another well; a side given twice; no wall for X or for Y; an
+            opposite pair that is swapped (its signed size is a well's size
+            with the wrong sign, the symptom of a direction named in another
+            frame); or an opposite pair whose size is off the plate's by more
+            than ``DIAMETER_TOLERANCE``.
     """
     geometry = well_geometry(_plan_at_origin(plate), well)
     name = geometry.well
@@ -285,38 +293,38 @@ def centre_from_walls(
         if touch.side in by_side:
             raise ValueError(f"{name}: the {touch.side} wall is given twice")
         by_side[touch.side] = touch
-    if "left" not in by_side and "right" not in by_side:
-        raise ValueError(f"no X wall for {name}: give left and/or right")
-    if "top" not in by_side and "bottom" not in by_side:
-        raise ValueError(f"no Y wall for {name}: give top and/or bottom")
+    if "-X" not in by_side and "+X" not in by_side:
+        raise ValueError(f"no X wall for {name}: give -X and/or +X")
+    if "-Y" not in by_side and "+Y" not in by_side:
+        raise ValueError(f"no Y wall for {name}: give -Y and/or +Y")
 
     width_um, height_um = geometry.size_um
-    x_walls = [by_side[side] for side in ("left", "right") if side in by_side]
-    y_walls = [by_side[side] for side in ("bottom", "top") if side in by_side]
+    x_walls = [by_side[side] for side in ("-X", "+X") if side in by_side]
+    y_walls = [by_side[side] for side in ("-Y", "+Y") if side in by_side]
     assumed: list[str] = []
 
     measured_width: float | None = None
     if len(x_walls) == 2:
-        left, right = x_walls
-        measured_width = right.x_um - left.x_um
-        _check_size(measured_width, width_um, plate, name, "left and right")
-        x_um = (left.x_um + right.x_um) / 2.0
+        minus_x, plus_x = x_walls
+        measured_width = plus_x.x_um - minus_x.x_um
+        _check_size(measured_width, width_um, plate, name, ("-X", "+X"), "width")
+        x_um = (minus_x.x_um + plus_x.x_um) / 2.0
     else:
         assumed.append("x")
         (only_x,) = x_walls
-        sign = 1.0 if only_x.side == "left" else -1.0
+        sign = 1.0 if only_x.side == "-X" else -1.0
         x_um = only_x.x_um + sign * width_um / 2.0
 
     measured_height: float | None = None
     if len(y_walls) == 2:
-        bottom, top = y_walls
-        measured_height = top.y_um - bottom.y_um
-        _check_size(measured_height, height_um, plate, name, "top and bottom")
-        y_um = (top.y_um + bottom.y_um) / 2.0
+        minus_y, plus_y = y_walls
+        measured_height = plus_y.y_um - minus_y.y_um
+        _check_size(measured_height, height_um, plate, name, ("-Y", "+Y"), "height")
+        y_um = (plus_y.y_um + minus_y.y_um) / 2.0
     else:
         assumed.append("y")
         (only_y,) = y_walls
-        sign = 1.0 if only_y.side == "bottom" else -1.0
+        sign = 1.0 if only_y.side == "-Y" else -1.0
         y_um = only_y.y_um + sign * height_um / 2.0
 
     return EdgeCentre(
@@ -330,14 +338,34 @@ def centre_from_walls(
 
 
 def _check_size(
-    size_um: float, nominal_um: float, plate: str, well: str, walls: str
+    size_um: float,
+    nominal_um: float,
+    plate: str,
+    well: str,
+    sides: tuple[str, str],
+    dimension: str,
 ) -> None:
-    """Refuse an opposite pair whose distance is not the plate's well size, signed: a swapped pair is negative."""
-    if abs(size_um / nominal_um - 1.0) > DIAMETER_TOLERANCE:
+    """Refuse an opposite pair whose distance is not the plate's well size.
+
+    The size is signed (``+`` wall minus ``-`` wall), so a pair whose sides were
+    exchanged measures a well's size with the wrong sign. That is not "another
+    well": it is the symptom of a direction named in one frame and read in
+    another (FM-189), and it says so, where the generic refusal would name a wrong
+    cause. The size refusal is written ``not ... <=`` so that a nan is refused.
+    """
+    lo, hi = sides
+    if size_um < 0.0 and abs(-size_um / nominal_um - 1.0) <= DIAMETER_TOLERANCE:
         raise ValueError(
-            f"{well}'s {walls} walls are {size_um:.0f} µm apart, a {plate} well is "
-            f"{nominal_um:.0f} µm ({size_um / nominal_um - 1:+.1%}): a touch of "
-            f"another well, or off the wall; touch them again"
+            f"{well}'s {lo} and {hi} walls are swapped: the {hi} wall is "
+            f"{-size_um:.0f} µm on the {lo} side of the {lo} wall, a {plate} "
+            f"well's {dimension}; touch them again, each named by its direction "
+            "from the well's centre"
+        )
+    if not abs(size_um / nominal_um - 1.0) <= DIAMETER_TOLERANCE:
+        raise ValueError(
+            f"{well}'s {lo} and {hi} walls are {size_um:.0f} µm apart, a {plate} "
+            f"well is {nominal_um:.0f} µm ({size_um / nominal_um - 1:+.1%}): a "
+            "touch of another well, or off the wall; touch them again"
         )
 
 
@@ -345,22 +373,25 @@ def wall_position(result: PlateResult, well: str, side: str) -> tuple[float, flo
     """The stage point at one wall of a well: the centre plus the half-size along the plate's own axes.
 
     The offset is turned by the plate's rotation, so that on a turned plate the
-    point is on the wall and not on the stage axis. ``side`` is ``left``,
-    ``right`` (along the plate's X) or ``top`` (+Y, towards row A), ``bottom``,
-    and the half-size is the well's width for X and its height for Y (FM-73).
+    point is on the wall and not on the stage axis. ``side`` is a stage direction,
+    ``-X`` or ``+X`` along the plate's X, ``-Y`` or ``+Y`` along its Y (``+Y`` is
+    towards row A), and the half-size is the well's width for X and its height for
+    Y (FM-73). A side named on the image is refused, not read in this frame.
 
     Raises:
-        ValueError: ``side`` is not one of the four; the well is not on the plate.
+        ValueError: ``side`` is not one of the four, or is a side on the image;
+            the well is not on the plate.
     """
+    refuse_image_side(side)
     if side not in _SIDES:
-        raise ValueError(f"side {side!r} is not one of left, right, top, bottom")
+        raise ValueError(f"side {side!r} is not one of -X, +X, -Y, +Y")
     geometry = well_geometry(result.to_plan(), well)
     half_w, half_h = geometry.size_um[0] / 2.0, geometry.size_um[1] / 2.0
     ox, oy = {
-        "left": (-half_w, 0.0),
-        "right": (half_w, 0.0),
-        "top": (0.0, half_h),
-        "bottom": (0.0, -half_h),
+        "-X": (-half_w, 0.0),
+        "+X": (half_w, 0.0),
+        "-Y": (0.0, -half_h),
+        "+Y": (0.0, half_h),
     }[side]
     angle = math.radians(result.rotation_deg)
     cos, sin = math.cos(angle), math.sin(angle)

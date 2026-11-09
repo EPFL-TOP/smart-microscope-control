@@ -69,6 +69,7 @@ from smc.ui.controller import (
 )
 from smc.ui.frames import display_image
 from smc.ui.guide import (
+    NO_CALIBRATION_FOR_SIDES,
     WALLS_DRY_RUN,
     WALLS_NEED_CALIBRATION,
     centres_text,
@@ -1280,6 +1281,10 @@ def test_the_widgets_that_ask_and_explain_are_on_the_page(page: PlatePage) -> No
         "plate_note",
         "plate_confirm_button",
         "capture_note",
+        # What each side of the image is, and what an arrow does to it (m5 §13.2): an
+        # operator who never sees them names a wall on the image and gets the stage's.
+        "image_note",
+        "drive_image_note",
         "capture_centre_button",
         "capture_wall_button",
         "capture_side_select",
@@ -1800,8 +1805,12 @@ def _track(
 
 
 def test_capture_buttons_act_on_the_current_well(
-    page: PlatePage, fake_microscope: Microscope
+    page: PlatePage,
+    fake_microscope: Microscope,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
 ) -> None:
+    seed_camera_calibration(run_doc)  # the Ti2-E's: the image's top is stage -Y
     view = PlatePageView(page)
     view.on_capture("centre")
     assert view.message.object == "click a well on the map first"
@@ -1812,9 +1821,10 @@ def test_capture_buttons_act_on_the_current_well(
     view.capture_side_select.value = "top"
     view.capture_wall_button.clicks += 1
     assert [(r.well, r.x_um, r.y_um) for r in page.refs] == [("A1", 10.0, 20.0)]
-    assert [(w.well, w.side) for w in page.walls] == [("A1", "top")]
+    # The side is the stage's, mapped from the image's `top` with the calibration.
+    assert [(w.well, w.side) for w in page.walls] == [("A1", "-Y")]
     assert (
-        view.captures_text.object == "A1 centre (10.0, 20.0)\nA1 top wall (10.0, 20.0)"
+        view.captures_text.object == "A1 centre (10.0, 20.0)\nA1 -Y wall (10.0, 20.0)"
     )
     view.forget_button.clicks += 1
     assert (page.refs, page.walls) == ((), ())
@@ -2072,12 +2082,12 @@ def test_the_capture_buttons_name_the_well_and_follow_the_wall_select(
     assert page.current == "B3"
     assert _capture_labels(view) == (
         "Capture centre of B3",
-        "Capture B3 left wall",
+        "Capture B3 wall at image left",
         "Forget B3",
     )
     # The select redraws the label at once: no tick between the change and the read.
     view.capture_side_select.value = "top"
-    assert view.capture_wall_button.label == "Capture B3 top wall"
+    assert view.capture_wall_button.label == "Capture B3 wall at image top"
     assert view.capture_centre_button.label == "Capture centre of B3"
     assert view.capture_note.object == ""
 
@@ -2157,17 +2167,21 @@ def test_a_deselecting_tap_disables_the_capture_buttons(page: PlatePage) -> None
 
 
 def test_a_capture_clicked_on_a_stale_label_records_nothing(
-    page: PlatePage, fake_microscope: Microscope
+    page: PlatePage,
+    fake_microscope: Microscope,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
 ) -> None:
     # FM-177: the label said B3; another tab's click (here, the controller's own
     # `click`) made B4 current before this tab's tick. The wall recorded under B4
     # at the position the operator took for B3's is the finding of #332.
+    seed_camera_calibration(run_doc)
     view = PlatePageView(page)
     fake_microscope.require(XYStage).move_to_um(10.0, 20.0)
     _tap(view, *_nominal("B3"))
     page.click(*_nominal("B4"), drive=False)
     assert page.current == "B4"
-    assert view.capture_wall_button.label == "Capture B3 left wall"
+    assert view.capture_wall_button.label == "Capture B3 wall at image left"
     stale = (
         "the well to record changed from B3 to B4: check the button, then press "
         "it again"
@@ -2176,10 +2190,10 @@ def test_a_capture_clicked_on_a_stale_label_records_nothing(
     assert view.message.object == stale
     assert (page.refs, page.walls) == ((), ())
     # The view redrew: the label now names what a press would record.
-    assert view.capture_wall_button.label == "Capture B4 left wall"
+    assert view.capture_wall_button.label == "Capture B4 wall at image left"
     view.on_capture("wall")
     assert view.message.object == ""
-    assert [(w.well, w.side) for w in page.walls] == [("B4", "left")]
+    assert [(w.well, w.side) for w in page.walls] == [("B4", "+X")]
 
 
 def test_a_capture_of_a_centre_clicked_on_a_stale_label_records_nothing(
@@ -2431,8 +2445,12 @@ def test_a_walls_forget_clicked_on_a_stale_label_forgets_nothing(
 
 
 def test_the_centres_and_the_wall_note_are_drawn_for_the_captures_the_page_holds(
-    walls_page: PlatePage, fake_microscope: Microscope
+    walls_page: PlatePage,
+    fake_microscope: Microscope,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
 ) -> None:
+    seed_camera_calibration(run_doc)
     view = PlatePageView(walls_page)
     assert view.walls_captures_text.object == "no centre captured yet"
     assert view.walls_touches_note.object == ""
@@ -2461,10 +2479,14 @@ def test_the_centres_and_the_wall_note_are_drawn_for_the_captures_the_page_holds
 
 
 def test_a_second_tab_redraws_the_walls_captures(
-    walls_page: PlatePage, fake_microscope: Microscope
+    walls_page: PlatePage,
+    fake_microscope: Microscope,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
 ) -> None:
     # FM-151: a capture made through another tab is in the controller, and this tab
     # draws it at its next tick.
+    seed_camera_calibration(run_doc)
     one, two = PlatePageView(walls_page), PlatePageView(walls_page)
     fake_microscope.require(XYStage).move_to_um(10.0, 20.0)
     _tap(one, *_nominal("B3"))
@@ -2933,7 +2955,20 @@ def test_the_served_page_answers(page: PlatePage) -> None:
 # --- the widgets are wired to what they say -----------------------------------------
 
 
-def test_a_drive_tap_goes_to_the_wall_the_side_select_says(
+def test_a_wall_pressed_with_no_calibration_says_why_and_records_nothing(
+    page: PlatePage,
+) -> None:
+    # The press is the guard, not the button's state (FM-169): with no camera
+    # calibration no stage side can be named, and the page says what to run.
+    view = PlatePageView(page)
+    _tap(view, *_nominal("B3"))
+    view.capture_wall_button.clicks += 1
+    assert view.message.object == NO_CALIBRATION_FOR_SIDES
+    assert page.walls == ()
+    assert view.captures_text.object == "no capture yet"
+
+
+def test_a_drive_tap_to_a_wall_with_no_calibration_says_why_and_drives_nowhere(
     run_doc: Path, page: PlatePage
 ) -> None:
     _seed(run_doc, "plate-registration", "plate", _plate())
@@ -2941,9 +2976,28 @@ def test_a_drive_tap_goes_to_the_wall_the_side_select_says(
     view.side_select.value = "left"
     view.drive_toggle.value = True
     _tap(view, *_centre("C5"))
+    assert view.message.object == NO_CALIBRATION_FOR_SIDES
+    # One click, even a refused one: a stage that stays armed is the danger.
+    assert not view.drive_toggle.value
+    assert "goto-well" not in RunDocument.load(run_doc).stages
+    assert page.current is None
+
+
+def test_a_drive_tap_goes_to_the_wall_the_side_select_says(
+    run_doc: Path,
+    page: PlatePage,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    seed_camera_calibration(run_doc)  # the Ti2-E's: the image's left is stage +X
+    view = PlatePageView(page)
+    view.side_select.value = "left"
+    view.drive_toggle.value = True
+    _tap(view, *_centre("C5"))
     assert page.join(10.0)
     record = RunDocument.load(run_doc).stages["goto-well"]
-    assert record.params == {"well": "C5", "side": "left"}
+    # `goto-well` gets the stage's side: the page named the wall on the image.
+    assert record.params == {"well": "C5", "side": "+X"}
     assert record.status is StageStatus.done
 
 

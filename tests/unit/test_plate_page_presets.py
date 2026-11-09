@@ -439,7 +439,7 @@ def test_load_preset_keeps_walls_alone_on_another_plate(
     # Walls are captures like centres: `choose_plate` would drop them as well.
     path = _put(tmp_path, text=WEEKLY.replace("96-well", "384-well"))
     page = make_page()
-    walls = (WallTouch(well="A1", side="left", x_um=1.0, y_um=2.0),)
+    walls = (WallTouch(well="A1", side="-X", x_um=1.0, y_um=2.0),)
     page.walls = walls
 
     loaded = page.load_preset(str(path))

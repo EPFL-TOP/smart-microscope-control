@@ -21,6 +21,10 @@ decides, because every later stage places its fields by the plate it writes:
   well given by walls goes into the fit with the others; an axis where only one
   wall was touched is reported (the centre is one wall plus the nominal
   half-size).
+* **A wall is named by a stage direction** (``-X``, ``+X``, ``-Y``, ``+Y``), the
+  frame of ``smc stage get``. A side as an operator sees it on an image is refused
+  with its reason, never read in this frame (FM-189): the plate page names walls on
+  the image and maps them with the camera calibration before it gets here (m3 §19).
 * **A bad fit is a refusal, not a ``done`` result to be checked.** A reference
   further than ``GOOD_RESIDUAL_UM`` from where the others put it fails the stage
   and names the well, so no unusable ``plate`` fills the slot.
@@ -83,9 +87,13 @@ class PlateRegistrationParams(PluginParams):
         (),
         description=(
             "Stage positions at a well's walls, JSON: "
-            'walls=[{"well": "B2", "side": "left", "x_um": 0, "y_um": 0}]. '
-            "Each well needs one left or right and one top or bottom (top is +Y); "
-            "an opposite pair gives the centre and measures the well."
+            'walls=[{"well": "B2", "side": "+X", "x_um": 0, "y_um": 0}]. '
+            "A side is a stage direction, the wall that the stage reaches by going "
+            "that way from the well's centre: -X or +X, -Y or +Y (+Y is towards "
+            "row A); the plate page's left, right, top and bottom are sides on the "
+            "image, which it maps with the camera calibration, and are refused "
+            "here. Each well needs one -X or +X and one -Y or +Y; an opposite pair "
+            "gives the centre and measures the well."
         ),
     )
     max_rotation_deg: float = Field(

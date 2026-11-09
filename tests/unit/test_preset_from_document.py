@@ -179,7 +179,7 @@ def test_a_required_field_is_always_saved() -> None:
 
 
 def test_positions_are_never_saved() -> None:
-    walls = [{"well": "A1", "side": "left", "x_um": 1.0, "y_um": 2.0}]
+    walls = [{"well": "A1", "side": "-X", "x_um": 1.0, "y_um": 2.0}]
     refs = [{"well": "A1", "x_um": 1.0, "y_um": 2.0}]
 
     made = _preset_of(
@@ -319,7 +319,7 @@ CASES: dict[str, list[dict[str, Any]]] = {
         {"detector": "model", "model_path": "/x/w.pt", "device": "cpu"},
     ],
     "density": [{"area_grid_um": 12.5}],
-    "goto-well": [{"well": "B2", "side": "left"}],
+    "goto-well": [{"well": "B2", "side": "-X"}],
     "nis-export": [{"out": "/tmp/x y/out.xml", "overwrite": True}],
     "plate-finding": [
         {
@@ -339,7 +339,7 @@ CASES: dict[str, list[dict[str, Any]]] = {
         {
             "plate": "24-well",
             "refs": [{"well": "A1", "x_um": 1.0, "y_um": 2.0}],
-            "walls": [{"well": "A1", "side": "left", "x_um": 1.0, "y_um": 2.0}],
+            "walls": [{"well": "A1", "side": "-X", "x_um": 1.0, "y_um": 2.0}],
             "max_rotation_deg": 5.0,
             "objective": "Nikon 10X S Fluor",
         }
