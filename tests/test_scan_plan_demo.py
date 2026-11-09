@@ -12,8 +12,10 @@ is not square (FM-73). Every ``assumed`` line and every reason is asserted whole
 
 from __future__ import annotations
 
+import logging
 import math
 import re
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -21,6 +23,14 @@ import pytest
 import useq
 from pydantic import ValidationError
 
+from objective_offsets_stand import (
+    FORTY,
+    NOT_MEASURED,
+    SHIFT_TEN_TO_FORTY,
+    TEN,
+    opened,
+    profile_with_offsets,
+)
 from smc.hardware import Microscope
 from smc.hardware.capabilities import Autofocus, Camera, ObjectiveTurret
 from smc.plugins import PluginRunError, load, run_plugin
@@ -42,8 +52,7 @@ pytestmark = pytest.mark.demo
 
 SHAPE = (300, 512)  # (height, width): not square, on purpose (FM-73)
 PIXEL_UM = 0.5  # what the camera reports; the profile says 0.65 for the 10x in place
-IN_PLACE = "Nikon 10X S Fluor"
-FORTY = "Nikon 40X Plan Fluor ELWD"
+IN_PLACE = TEN
 #: The labels of the demo's turret, in position order.
 LABELS = (
     "Nikon 40X Plan Fluor ELWD, Nikon 10X S Fluor, Objective-2, "
@@ -100,7 +109,10 @@ def _seed(
     )
 
 
-def _write_plate(path: Path, *, dry_run: bool = False) -> PlateResult:
+def _write_plate(
+    path: Path, *, dry_run: bool = False, objective: str | None = IN_PLACE
+) -> PlateResult:
+    """A registered plate; by default as ``plate-registration`` leaves it, with the objective in place."""
     plate = PlateResult(
         plate="96-well",
         a1_center_xy_um=(1000.0, -500.0),
@@ -109,6 +121,7 @@ def _write_plate(path: Path, *, dry_run: bool = False) -> PlateResult:
         residual_um=None,
         scale_error=None,
         n_refs=0,
+        objective=objective,
     )
     _seed(path, "plate-registration", "plate", plate, dry_run=dry_run)
     return plate
@@ -249,6 +262,7 @@ def test_another_objective_takes_the_profiles_size_and_says_binning_is_not_appli
     assert result.fov_um == pytest.approx((512 * 0.1625, 300 * 0.1625))
     assert result.matrix_source == "profile"
     assert result.assumed == (
+        NOT_MEASURED.format(origin=IN_PLACE, target=FORTY),
         f"pixel size of {FORTY} from the profile, for binning 1: "
         "the camera's binning is not applied",
         NO_CALIBRATION.format(objective=FORTY),
@@ -332,7 +346,9 @@ def test_a_calibration_of_the_objective_asked_for_is_used_though_another_is_in_p
     assert result.objective == FORTY
     assert result.matrix_source == "camera-calibration"
     assert result.pixel_size_um == 0.2
-    assert result.assumed == ()  # measured, not turned: nothing to say
+    # The camera is measured and says nothing; the plate was registered with the
+    # 10x and the demo measures no offset to the 40x, which it does say.
+    assert result.assumed == (NOT_MEASURED.format(origin=IN_PLACE, target=FORTY),)
 
 
 def test_a_calibration_that_the_overlap_covers_says_nothing_and_one_beyond_it_says_so(
@@ -444,6 +460,8 @@ def test_without_a_turret_the_objective_is_none_and_the_cameras_size_is_used(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     microscope = _stand(demo_microscope_with_sample, tmp_path)
+    # A plate registered on a stand with no turret records no objective either.
+    _write_plate(tmp_path / "run.json", objective=None)
     _without(microscope, monkeypatch, ObjectiveTurret)
 
     result = _result(_run(microscope, tmp_path, wells="A1", **SMALL))
@@ -1026,3 +1044,155 @@ def test_a_turret_at_an_empty_position_has_no_objective_in_place(
     named = _result(_run(microscope, tmp_path, wells="A1", objective=FORTY, **SMALL))
     assert named.objective == FORTY
     assert named.pixel_size_um == 0.1625
+
+
+# ------------------------------------- the plate in the plan's objective's frame (#340)
+#
+# The plan is for an objective that is not the one the plate was registered with: its
+# fields are moved by the profile's offset between the two, before they are laid.
+# Expected values come from a plan for a plate registered with the plan's own
+# objective (no shift, rule 1) plus the shift written from the profile's numbers,
+# never from ``plate_for_objective`` (FM-124).
+
+
+@pytest.fixture
+def offsets_stand(mm_available: bool) -> Iterator[Microscope]:
+    """The demo devices on a profile that measures the 10x and the 40x, with the sample stand's 300 x 512 camera."""
+    if not mm_available:
+        pytest.skip("Micro-Manager demo adapters not installed")
+    with opened(profile_with_offsets()) as microscope:
+        microscope.override(
+            Camera,
+            SampleCamera(
+                microscope, PlateSample(), pixel_size_um=PIXEL_UM, shape=SHAPE
+            ),
+        )
+        yield microscope
+
+
+def _plan_for(
+    microscope: Microscope,
+    folder: Path,
+    *,
+    plate_objective: str | None,
+    **params: object,
+) -> ScanPlanResult:
+    """A plan on a run document of its own, whose plate was registered with ``plate_objective``."""
+    folder.mkdir()
+    _write_plate(folder / "run.json", objective=plate_objective)
+    return _result(_run(microscope, folder, **params))
+
+
+def test_a_plate_registered_at_10x_planned_for_40x_shifts_every_field(
+    offsets_stand: Microscope, tmp_path: Path
+) -> None:
+    # The 40x is asked for, not turned in: the plan is for it (m3 §18.3).
+    assert offsets_stand.require(ObjectiveTurret).current() == TEN
+    plan = {"wells": "A1,B2", "objective": FORTY, **SMALL}
+    unshifted = _plan_for(
+        offsets_stand, tmp_path / "plain", plate_objective=FORTY, **plan
+    )
+    shifted = _plan_for(offsets_stand, tmp_path / "moved", plate_objective=TEN, **plan)
+
+    assert unshifted.objective_shift_um == (0.0, 0.0)
+    assert (shifted.objective, shifted.plate_objective) == (FORTY, TEN)
+    assert shifted.objective_shift_um == SHIFT_TEN_TO_FORTY
+    # The same grid on the same 300 x 512 frame, field for field, and each field
+    # is the unshifted one plus (-37.5, +12.25): X and Y by different amounts.
+    assert len(shifted.fields) == len(unshifted.fields) == 8
+    for moved, plain in zip(shifted.fields, unshifted.fields, strict=True):
+        assert (moved.well, moved.index, moved.name) == (
+            plain.well,
+            plain.index,
+            plain.name,
+        )
+        assert (moved.x_um, moved.y_um) == pytest.approx(
+            (plain.x_um - 37.5, plain.y_um + 12.25), abs=1e-6
+        )
+    # Every well of the plan is where the 40x sees it, not only the fields.
+    assert shifted.plate_plan.a1_center_xy == pytest.approx(
+        (1000.0 - 37.5, -500.0 + 12.25), abs=1e-6
+    )
+    for well in shifted.wells:
+        x_um, y_um = well_geometry(unshifted.plate_plan, well).center_um
+        assert well_geometry(shifted.plate_plan, well).center_um == pytest.approx(
+            (x_um - 37.5, y_um + 12.25), abs=1e-6
+        )
+    # The camera, the grid and the estimate are the unshifted plan's.
+    assert shifted.fov_um == unshifted.fov_um
+    assert (shifted.rows, shifted.columns) == (2, 2)
+    # Measured offsets: no line about the frame, only what the camera assumed.
+    assert shifted.assumed == unshifted.assumed
+
+
+def test_a_plate_registered_with_the_plans_objective_is_not_shifted(
+    offsets_stand: Microscope, tmp_path: Path
+) -> None:
+    result = _plan_for(
+        offsets_stand, tmp_path / "same", plate_objective=TEN, wells="A1", **SMALL
+    )
+
+    assert (result.objective, result.plate_objective) == (TEN, TEN)
+    assert result.objective_shift_um == (0.0, 0.0)
+    assert result.plate_plan.a1_center_xy == (1000.0, -500.0)
+    assert result.assumed == (NO_CALIBRATION.format(objective=TEN),)
+
+
+def test_a_plate_without_objective_is_planned_unshifted_and_says_so(
+    offsets_stand: Microscope, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    line = (
+        "the plate does not record the objective it was registered with: no offset "
+        f"between objectives is applied for {TEN}"
+    )
+    unshifted = _plan_for(
+        offsets_stand, tmp_path / "plain", plate_objective=TEN, wells="A1", **SMALL
+    )
+    with caplog.at_level(logging.INFO, logger="smc"):
+        result = _plan_for(
+            offsets_stand,
+            tmp_path / "unknown",
+            plate_objective=None,
+            wells="A1",
+            **SMALL,
+        )
+
+    assert (result.plate_objective, result.objective_shift_um) == (None, None)
+    assert result.plate_plan.a1_center_xy == (1000.0, -500.0)
+    assert result.fields == unshifted.fields
+    # The frame's line comes before the camera's, and is a WARNING too.
+    assert result.assumed == (line, NO_CALIBRATION.format(objective=TEN))
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert line in warnings
+
+
+def test_an_unmeasured_offset_is_planned_unshifted_and_says_so_before_the_timings(
+    mm_available: bool, tmp_path: Path
+) -> None:
+    if not mm_available:
+        pytest.skip("Micro-Manager demo adapters not installed")
+    line = NOT_MEASURED.format(origin=TEN, target=FORTY)
+    with opened(profile_with_offsets(forty=False)) as microscope:
+        microscope.override(
+            Camera,
+            SampleCamera(
+                microscope, PlateSample(), pixel_size_um=PIXEL_UM, shape=SHAPE
+            ),
+        )
+        _write_plate(tmp_path / "run.json", objective=TEN)
+        _write_timings(tmp_path / "run.json", assumed=("refocus assumed",))
+
+        result = _result(
+            _run(microscope, tmp_path, wells="A1", objective=FORTY, **SMALL)
+        )
+
+    assert (result.plate_objective, result.objective_shift_um) == (TEN, None)
+    assert result.plate_plan.a1_center_xy == (1000.0, -500.0)
+    # Frame, then camera, then timings: the positions are what the rest rests on.
+    assert result.assumed == (
+        line,
+        f"pixel size of {FORTY} from the profile, for binning 1: "
+        "the camera's binning is not applied",
+        NO_CALIBRATION.format(objective=FORTY),
+        "timings: refocus assumed",
+    )
