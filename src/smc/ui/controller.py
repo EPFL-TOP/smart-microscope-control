@@ -99,10 +99,14 @@ from smc.ui.guide import (
     DRY_RUN_NO_FRAME,
     PLATE_NOT_CHOSEN,
     SELECT_WELLS,
+    WALLS_DRY_RUN,
+    WALLS_NEED_CALIBRATION,
     NextStep,
     command_line,
     next_slot,
     replace_note,
+    walls_card_lines,
+    walls_centres_problem,
 )
 
 if TYPE_CHECKING:
@@ -136,7 +140,16 @@ log = logging.getLogger("smc.ui")
 #: Every other registered plugin is on the page too, under ``MORE_STAGE``, by name
 #: (m5 §2.3): a plugin nobody listed here is usable all the same.
 STAGES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("Set up", ("camera-calibration", "plate-registration", "plate-finding", "timing")),
+    (
+        "Set up",
+        (
+            "camera-calibration",
+            "plate-registration",
+            "plate-walls",
+            "plate-finding",
+            "timing",
+        ),
+    ),
     ("Choose", ("scan-plan",)),
     ("Acquire", ("scan",)),
     ("Find", ("cells", "density", "route")),
@@ -164,6 +177,9 @@ KEY_PARAMS: dict[str, tuple[str, ...]] = {
 #: operator turns it. A free-text label here would offer a second way to say it.
 PAGE_PARAMS: dict[str, tuple[str, ...]] = {
     "plate-registration": ("plate", "refs", "walls", "objective"),
+    # The same captured centres as the registration, never its wall touches: the tool
+    # images the walls itself (m5 §12.2). Naming `plate` is what gates it on §11.3.
+    "plate-walls": ("plate", "refs"),
     "scan-plan": ("wells",),
 }
 
@@ -535,6 +551,22 @@ def _file_path(value: str, run_dir: PurePath | None) -> str:
     return str(run_dir / value)
 
 
+def _plate_from_images(result: Mapping[str, Any]) -> PlateResult | None:
+    """``result`` as a ``PlateResult`` that holds ``walls``, or ``None``: anything else is the generic card.
+
+    A document is data (FM-125): a result that does not validate, or a plate
+    registered by another method, is no case for the card of this one, and the
+    validation is tried only when the result carries a ``walls`` object.
+    """
+    if not isinstance(result.get("walls"), dict):
+        return None
+    try:
+        found = PlateResult.model_validate(result)
+    except ValidationError:
+        return None
+    return found if found.walls is not None else None
+
+
 def _card(
     record: StageRecord, *, stale: bool = False, run_dir: PurePath | None = None
 ) -> ResultCard:
@@ -548,6 +580,11 @@ def _card(
     A ``_FILE_KEYS`` key with a text in it is a file, not a value: it is a
     ``files`` entry, and does not count against the card's lines. A number, a
     list or a blank text under such a key is no path and stays a line (FM-125).
+
+    A result that is a plate registered from images (``PlateResult`` with
+    ``walls``) shows the wells measured and the plate instead of its first keys,
+    which cut the walls away (m5 §12.6); its frames' folder is a file. A result that
+    does not validate as one is the generic card, never an exception (FM-125).
     """
     when = record.finished_utc or record.started_utc
     try:
@@ -560,18 +597,30 @@ def _card(
     files: list[str] = []
     assumed: tuple[str, ...] = ()
     if record.status is StageStatus.done and record.result is not None:
-        for key, value in record.result.items():
-            if key == "assumed":
-                continue
-            if key in _FILE_KEYS and isinstance(value, str) and value.strip():
+        from_images = _plate_from_images(record.result)
+        if from_images is not None:
+            lines = [_cut(_flat(line)) for line in walls_card_lines(from_images)]
+            folder = None if from_images.walls is None else from_images.walls.folder
+            if folder is not None and folder.strip():
                 files.append(
                     _cut(
-                        _flat(f"{key}: {_file_path(value, run_dir)}"),
+                        _flat(f"folder: {_file_path(folder, run_dir)}"),
                         _CARD_TEXT_CHARS,
                     )
                 )
-            else:
-                lines.append(_value_line(key, value))
+        else:
+            for key, value in record.result.items():
+                if key == "assumed":
+                    continue
+                if key in _FILE_KEYS and isinstance(value, str) and value.strip():
+                    files.append(
+                        _cut(
+                            _flat(f"{key}: {_file_path(value, run_dir)}"),
+                            _CARD_TEXT_CHARS,
+                        )
+                    )
+                else:
+                    lines.append(_value_line(key, value))
         if len(lines) > _CARD_LINES:
             lines = [*lines[:_CARD_LINES], f"… {len(lines) - _CARD_LINES} more"]
         found = record.result.get("assumed")
@@ -1116,14 +1165,29 @@ class PlatePage:
         Raises:
             ValueError: ``scan-plan`` with nothing selected, or with a selection
                 on another plate than the registered one; a tool that takes the
-                plate while nothing named it (``PLATE_NOT_CHOSEN``).
+                plate while nothing named it (``PLATE_NOT_CHOSEN``);
+                ``plate-walls`` with fewer than two centres captured or more than
+                six, after the plate's gate (m5 §12.3).
         """
         if _needs_plate(plugin) and not self._plate_chosen:
             raise ValueError(PLATE_NOT_CHOSEN)
+        if plugin == "plate-walls":
+            # One read of the captures for the count and the pairs: another tab may
+            # capture between two reads of `self.refs`.
+            refs = self.refs
+            problem = walls_centres_problem(len(refs))
+            if problem is not None:
+                raise ValueError(problem)
+            return self._dump_refs(refs)
         return self._page_pairs(plugin)
 
     def _page_pairs(self, plugin: str) -> list[str]:
-        """``page_params`` without the plate's gate: what the page would fill if the plate were chosen."""
+        """``page_params`` without the plate's gate: what the page would fill if the plate were chosen.
+
+        Without the count of ``plate-walls``' centres either: that is the gate's
+        (``page_params``), as the plate's is, so that a preset's check of the
+        tool's other fields is not refused for it (m5 §12.2).
+        """
         if plugin == "scan-plan":
             if not self.selection:
                 raise ValueError("select at least one well first")
@@ -1131,15 +1195,25 @@ class PlatePage:
             return [f"wells={','.join(self.selection)}"]
         if plugin == "plate-registration":
             return self._registration_pairs(self.refs, self.walls)
+        if plugin == "plate-walls":
+            return self._dump_refs(self.refs)
         return []
+
+    def _dump_refs(self, refs: Sequence[WellRef]) -> list[str]:
+        """The ``plate`` and ``refs`` pairs of the two tools that register from captured centres.
+
+        One place dumps them, so that ``plate-registration`` and ``plate-walls``
+        are given the same text for the same captures, and a step and a click agree.
+        """
+        dumped = json.dumps([r.model_dump(mode="json") for r in refs])
+        return [f"plate={self._plate}", f"refs={dumped}"]
 
     def _registration_pairs(
         self, refs: Sequence[WellRef], walls: Sequence[WallTouch]
     ) -> list[str]:
         """The pairs of ``plate-registration`` for this plate: one place dumps them, so a step and a click agree."""
-        dumped_refs = json.dumps([r.model_dump(mode="json") for r in refs])
         dumped_walls = json.dumps([w.model_dump(mode="json") for w in walls])
-        return [f"plate={self._plate}", f"refs={dumped_refs}", f"walls={dumped_walls}"]
+        return [*self._dump_refs(refs), f"walls={dumped_walls}"]
 
     # --- presets (m5 §10.5) -----------------------------------------------------------
 
@@ -1341,6 +1415,13 @@ class PlatePage:
             # still arrives here, and so does a call that spells `plate=` itself. The
             # stand's being closed is the reason that holds longer, so it came first.
             self._set_outcome(f"{plugin}: {PLATE_NOT_CHOSEN}")
+            return
+        if plugin == "plate-walls" and self._dry_run:
+            # The plugin refuses a dry run too, but its refusal is a `failed` record,
+            # and the latest attempt decides the `plate` slot (m5 §11.4): a usable plate
+            # would be replaced by a failure. The page refuses first, nothing written,
+            # before the parameters are read (FM-169, m5 §12.3).
+            self._set_outcome(f"{plugin}: {WALLS_DRY_RUN}")
             return
         profile = self._profile.microscope.name
         dry_run = self._dry_run
@@ -2640,10 +2721,15 @@ class PlatePage:
         record = doc.provider("plate")
         if result is None or record is None:
             return {}
-        note = replace_note(result, record.started_utc)
         plugins = self._registry().plugins
+        # The second sentence of the note says the captures stay: true of the tools
+        # that run from them (their pairs hold `refs`), false of plate-finding (m5 §12.7).
         return {
-            tool.name: note
+            tool.name: replace_note(
+                result,
+                record.started_utc,
+                keeps_captures="refs" in PAGE_PARAMS.get(tool.name, ()),
+            )
             for tool in self.tools()
             if plugins[tool.name].plugin.provides == "plate"
         }
@@ -2732,6 +2818,11 @@ class PlatePage:
                 blocked=None,
             )
         tool, others = providers[0], providers[1:]
+        if self._walls_is_next(providers):
+            # The operator took the path of m5 §12.4: the centres of 2 or more wells,
+            # no wall touched. The other providers stay as the `or ...` lines.
+            tool = next(p for p in providers if p.name == "plate-walls")
+            others = [p for p in providers if p is not tool]
         why = [
             item.reason
             if item.state == "unusable" and item.reason
@@ -2741,6 +2832,8 @@ class PlatePage:
         stuck: str | None = None
         if tool.name == "plate-registration":
             pairs, stuck = self._registration_step(why)
+        elif tool.name == "plate-walls":
+            pairs, stuck = self._walls_step(why)
         elif tool.name == "scan-plan":
             try:
                 pairs = self.page_params("scan-plan")
@@ -2811,6 +2904,63 @@ class PlatePage:
             command=command,
             blocked=blocked.get(tool.name) or stuck,
         )
+
+    def _walls_is_next(self, providers: Sequence[ToolView]) -> bool:
+        """Whether ``plate-walls`` is the tool of the ``plate`` slot's step, not the first provider (m5 §12.4).
+
+        All of these hold: the plate is chosen (else the registration's own reason
+        stays the step's); the page is not a dry run (FM-182: the plugin refuses a
+        dry run, so the page does not offer it there, as it does not offer ``scan``);
+        the stand can image, or is not connected (the step is then drawn for the
+        stand the operator is about to open); no wall is captured (touching walls is
+        ``plate-registration``'s own path); and the centres captured are a count the
+        tool takes. It reads the page's captures as ``_registration_step`` does,
+        and takes no lock.
+
+        The plate's wells are round too: the plugin fits circles and refuses a
+        square-welled plate (384, 1536) before anything moves, so the step stays
+        ``plate-registration``, which takes them (FM-182, found by the adversarial
+        review: the step offered the refused click, and again after it failed).
+        """
+        if not any(p.name == "plate-walls" for p in providers):
+            return False
+        if not self._plate_chosen or self._dry_run or self.walls:
+            return False
+        if not useq.WellPlate.from_str(self._plate).circular_wells:
+            return False
+        microscope = self._microscope
+        if microscope is not None:
+            # What the tool requires of the stand, from the plugin itself: the page
+            # does not offer a path whose own refusal is the stand's lack.
+            requires = self._registry().plugins["plate-walls"].plugin.requires
+            if any(self._lacks(microscope, capability) for capability in requires):
+                return False
+        return walls_centres_problem(len(self.refs)) is None
+
+    def _walls_step(self, why: list[str]) -> tuple[list[str], str | None]:
+        """The pairs of ``plate-walls`` and a line of ``why`` for them: the plate and the centres on this page.
+
+        Called when ``plate-walls`` is the step: after ``_walls_is_next``, or because it
+        is the first provider of the slot (``plate-registration`` did not load). In
+        the second case the plate may be the placeholder and the centres may be
+        none: nothing is then offered, as ``_registration_step`` offers nothing
+        (m5 §11.3), and the sentence that says what to do is the step's. What
+        else can block it (the calibration, a closed stand) is the tool's own
+        ``blocked``, which the step carries.
+        """
+        if not self._plate_chosen:
+            return [], PLATE_NOT_CHOSEN
+        refs = self.refs
+        problem = walls_centres_problem(len(refs))
+        if problem is not None:
+            return [], problem
+        centres = ", ".join(ref.well for ref in refs)
+        why.append(
+            f"plate, refs: the {len(refs)} centres of {centres} captured on this "
+            "page; plate-walls images each well's four walls around its centre and "
+            "moves the stage in X and Y only"
+        )
+        return self._dump_refs(refs), None
 
     def _registration_step(self, why: list[str]) -> tuple[list[str], str | None]:
         """The pairs of ``plate-registration`` and what it waits for, with a line of ``why`` for them.
@@ -2955,6 +3105,11 @@ class PlatePage:
         checkpoint that ``smc run --resume`` could continue (#252), which ``run()``
         refuses to drop. A tool that cannot run at all says so before it offers a
         way to continue.
+
+        ``plate-walls`` has its own words in this order (m5 §12.3): a dry run after
+        the plate (the tool images the walls, which a dry run does not), the page's
+        own sentence when the document has no calibration at all, and the count of
+        centres after what the stand requires.
         """
         microscope = self._microscope
         if microscope is None:
@@ -2968,6 +3123,8 @@ class PlatePage:
                 if _needs_plate(name) and not self._plate_chosen
                 else None
             )
+            if reason is None and name == "plate-walls" and dry_run:
+                reason = WALLS_DRY_RUN
             if reason is None:
                 reason = next(
                     (
@@ -2977,6 +3134,15 @@ class PlatePage:
                     ),
                     None,
                 )
+                if (
+                    reason is not None
+                    and name == "plate-walls"
+                    and doc.provider("camera-calibration") is None
+                ):
+                    # The document's own sentence is for a terminal, and the tool is
+                    # one region up: a calibration that exists keeps the document's
+                    # words (another stand, a dry run, stale).
+                    reason = WALLS_NEED_CALIBRATION
             if reason is None:
                 reason = next(
                     (
@@ -2989,6 +3155,8 @@ class PlatePage:
                     ),
                     None,
                 )
+            if reason is None and name == "plate-walls":
+                reason = walls_centres_problem(len(self.refs))
             if reason is None:
                 kept = reachable_checkpoint(name, doc, profile=profile, dry_run=dry_run)
                 if kept is not None:

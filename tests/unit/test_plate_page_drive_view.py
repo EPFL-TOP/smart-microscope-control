@@ -348,6 +348,8 @@ def test_the_capture_buttons_are_disabled_while_an_activity_other_than_live_goes
     view.tick()
     assert not view.capture_centre_button.disabled
     assert not view.capture_wall_button.disabled
+    # `plate-walls`' centre button reads the stage as well: the same rules (m5 §12.5).
+    assert not view.walls_capture_button.disabled
 
     _click(view.tool_runs["scan"])
     try:
@@ -355,11 +357,15 @@ def test_the_capture_buttons_are_disabled_while_an_activity_other_than_live_goes
         view.tick()
         assert view.capture_centre_button.disabled
         assert view.capture_wall_button.disabled
+        assert view.walls_capture_button.disabled
         # Panel still calls the handler of a disabled button (measured): the
         # controller is the guard, and its refusal is the message (FM-169).
         _click(view.capture_centre_button)
         assert view.message.object == "scan is running"
         _click(view.capture_wall_button)
+        assert view.message.object == "scan is running"
+        view.message.object = ""
+        _click(view.walls_capture_button)
         assert view.message.object == "scan is running"
         assert page.refs == ()
         assert page.walls == ()
@@ -376,6 +382,7 @@ def test_the_capture_buttons_are_disabled_while_an_activity_other_than_live_goes
         view.tick()
         assert not view.capture_centre_button.disabled
         assert not view.capture_wall_button.disabled
+        assert not view.walls_capture_button.disabled
     finally:
         page.live(False)
     assert page.join(10.0)
@@ -383,6 +390,7 @@ def test_the_capture_buttons_are_disabled_while_an_activity_other_than_live_goes
     closed = PlatePageView(PlatePage.closed(Profile.demo(), run_doc))
     assert closed.capture_centre_button.disabled
     assert closed.capture_wall_button.disabled
+    assert closed.walls_capture_button.disabled
     closed.page.close()
 
 

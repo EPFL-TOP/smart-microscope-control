@@ -50,7 +50,14 @@ from smc.hardware.capabilities import Camera, LightSource, XYStage
 from smc.hardware.profile import Profile
 from smc.plugins.api import PluginParams, PluginResult, RunContext
 from smc.plugins.registry import GROUP
-from smc.plugins.slots import DensityResult, DensityWell, PlateResult
+from smc.plugins.slots import (
+    DensityResult,
+    DensityWell,
+    PlateResult,
+    WallFrame,
+    WallImages,
+    WellFit,
+)
 from smc.run import RunDocument, StageRecord, StageStatus, write_stage
 from smc.testing import FakeCore
 from smc.ui.controller import (
@@ -61,6 +68,14 @@ from smc.ui.controller import (
     ResultCard,
 )
 from smc.ui.frames import display_image
+from smc.ui.guide import (
+    WALLS_DRY_RUN,
+    WALLS_NEED_CALIBRATION,
+    centres_text,
+    wall_touches_note,
+    walls_card_lines,
+    walls_centres_problem,
+)
 from smc.ui.plate_page import PlatePageView, build, card_text, serve
 
 pytestmark = [
@@ -77,8 +92,10 @@ TURN_DEG = 7.0
 PITCH_96_UM = 9000.0
 
 REAL = {
+    "camera-calibration": "smc.plugins.camera_calibration.plugin:CameraCalibrationPlugin",
     "goto-well": "smc.plugins.goto_well:GotoWellPlugin",
     "plate-registration": "smc.plugins.plate_registration.plugin:PlateRegistrationPlugin",
+    "plate-walls": "smc.plugins.plate_walls.plugin:PlateWallsPlugin",
     "scan-plan": "smc.plugins.scan_plan.plugin:ScanPlanPlugin",
 }
 
@@ -2236,6 +2253,363 @@ def test_a_capture_after_a_tick_records_the_well_on_the_label(
     view.on_capture("centre")
     assert view.message.object == ""
     assert [(r.well, r.x_um, r.y_um) for r in page.refs] == [("B4", 10.0, 20.0)]
+
+
+# --- plate-walls on the page: its centre captures, its Run, its card (m5 §12, #346) ----
+
+
+@pytest.fixture
+def walls_page(fake_microscope: Microscope, run_doc: Path) -> Iterator[PlatePage]:
+    """A page with the calibration, the registration and the wall registration: the *Set up* stage's three."""
+    controller = PlatePage(
+        fake_microscope,
+        run_doc,
+        entry_points=_entry_points(
+            "camera-calibration", "plate-registration", "plate-walls"
+        ),
+    )
+    try:
+        yield controller
+    finally:
+        controller.close()
+
+
+def _section(view: PlatePageView, tool: str) -> Any:
+    """The tool's section of the accordion: the column whose first line is its name."""
+    for panel in view.accordion.objects:
+        for column in panel.select(pn.Column):
+            first = column.objects[0] if column.objects else None
+            if isinstance(first, pn.pane.Str) and first.object == tool:
+                return column
+    raise AssertionError(f"no section for {tool}")
+
+
+WALLS_WIDGETS = (
+    "walls_capture_button",
+    "walls_forget_button",
+    "walls_capture_note",
+    "walls_captures_text",
+    "walls_touches_note",
+)
+REGISTRATION_WIDGETS = (
+    "capture_centre_button",
+    "forget_button",
+    "capture_wall_button",
+    "capture_side_select",
+    "capture_note",
+    "captures_text",
+)
+
+
+def test_plate_walls_section_holds_the_centre_captures_and_not_the_wall_ones(
+    walls_page: PlatePage,
+) -> None:
+    view = PlatePageView(walls_page)
+    walls = {id(o) for o in _section(view, "plate-walls").select()}
+    registration = {id(o) for o in _section(view, "plate-registration").select()}
+    for name in WALLS_WIDGETS:
+        assert id(getattr(view, name)) in walls, f"{name} is not in plate-walls"
+        assert id(getattr(view, name)) not in registration
+    for name in REGISTRATION_WIDGETS:
+        # The registration keeps every widget it has, by the same names (§12.5), and the
+        # wall captures are its own: `plate-walls` images the walls itself.
+        assert id(getattr(view, name)) in registration, f"{name} left the registration"
+        assert id(getattr(view, name)) not in walls
+    # §12.5's order, top to bottom: the summary, the two buttons, the note, the centres,
+    # the wall note, the Advanced fold, Run, the tool's note, the card.
+    objects = _section(view, "plate-walls").objects
+    assert objects[0].object == "plate-walls"
+    buttons = objects[2]
+    assert [id(o) for o in buttons.objects] == [
+        id(view.walls_capture_button),
+        id(view.walls_forget_button),
+    ]
+    assert objects[3] is view.walls_capture_note
+    assert objects[4] is view.walls_captures_text
+    assert objects[5] is view.walls_touches_note
+    assert isinstance(objects[6], pn.Card)
+    assert objects[7] is view.tool_runs["plate-walls"]
+    assert objects[8] is view.tool_notes["plate-walls"]
+    assert objects[9] is view.tool_cards["plate-walls"]
+
+
+def _walls_labels(view: PlatePageView) -> tuple[str, str]:
+    return view.walls_capture_button.label, view.walls_forget_button.label
+
+
+def test_the_walls_buttons_name_the_well_and_follow_a_tap(
+    walls_page: PlatePage,
+) -> None:
+    view = PlatePageView(walls_page)
+    assert _walls_labels(view) == ("Capture centre", "Forget")
+    _tap(view, *_nominal("B3"))
+    assert _capture_labels(view)[0] == "Capture centre of B3"
+    # The same well on both sets of buttons, from the one `current` they were drawn for.
+    assert _walls_labels(view) == ("Capture centre of B3", "Forget B3")
+    assert view.walls_capture_note.object == ""
+    _tap(view, *_nominal("D5"))
+    assert _walls_labels(view) == ("Capture centre of D5", "Forget D5")
+    # A press records the well the label names, whichever set it is on.
+    view.walls_capture_button.clicks += 1
+    assert [r.well for r in walls_page.refs] == ["D5"]
+
+
+def test_the_walls_buttons_are_disabled_with_no_well_and_with_the_stand_closed(
+    walls_page: PlatePage, run_doc: Path, fake_microscope: Microscope
+) -> None:
+    view = PlatePageView(walls_page)
+    assert view.walls_capture_button.disabled
+    assert view.walls_forget_button.disabled
+    assert view.walls_capture_note.object == NO_WELL_NOTE
+    _tap(view, *_nominal("A2"))
+    assert not view.walls_capture_button.disabled
+    assert not view.walls_forget_button.disabled
+    assert view.walls_capture_note.object == ""
+    _tap(view, *_nominal("A2"))
+    assert view.walls_capture_button.disabled
+    assert _walls_labels(view) == ("Capture centre", "Forget")
+    assert view.walls_capture_note.object == NO_WELL_NOTE
+
+    closed = PlatePage.closed(
+        fake_microscope.profile,
+        run_doc,
+        entry_points=_entry_points("camera-calibration", "plate-walls"),
+    )
+    try:
+        shut = PlatePageView(closed)
+        _tap(shut, *_nominal("B3"))
+        # The captures read the stage: disabled with the stand closed, the label naming
+        # the well all the same; *Forget* reads no stage.
+        assert shut.walls_capture_button.disabled
+        assert shut.walls_capture_button.label == "Capture centre of B3"
+        assert not shut.walls_forget_button.disabled
+    finally:
+        closed.close()
+
+
+def test_a_walls_capture_clicked_on_a_stale_label_records_nothing(
+    walls_page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # FM-177 for the second set of buttons: the label said B3, another tab's click made
+    # B4 current before this tab's tick. `page.click` moves `current` with no tick.
+    view = PlatePageView(walls_page)
+    fake_microscope.require(XYStage).move_to_um(10.0, 20.0)
+    _tap(view, *_nominal("B3"))
+    walls_page.click(*_nominal("B4"), drive=False)
+    assert walls_page.current == "B4"
+    assert view.walls_capture_button.label == "Capture centre of B3"
+    view.walls_capture_button.clicks += 1
+    assert view.message.object == (
+        "the well to record changed from B3 to B4: check the button, then press "
+        "it again"
+    )
+    assert walls_page.refs == ()
+    # The view redrew both sets for the well a press would record now.
+    assert _walls_labels(view) == ("Capture centre of B4", "Forget B4")
+    view.walls_capture_button.clicks += 1
+    assert view.message.object == ""
+    assert [r.well for r in walls_page.refs] == ["B4"]
+
+
+def test_a_walls_forget_clicked_on_a_stale_label_forgets_nothing(
+    walls_page: PlatePage, fake_microscope: Microscope
+) -> None:
+    view = PlatePageView(walls_page)
+    fake_microscope.require(XYStage).move_to_um(10.0, 20.0)
+    _tap(view, *_nominal("B3"))
+    view.walls_capture_button.clicks += 1
+    assert [r.well for r in walls_page.refs] == ["B3"]
+    walls_page.click(*_nominal("C1"), drive=False)
+    assert view.walls_forget_button.label == "Forget B3"
+    view.walls_forget_button.clicks += 1
+    assert view.message.object == (
+        "the well to record changed from B3 to C1: check the button, then press "
+        "it again"
+    )
+    assert [r.well for r in walls_page.refs] == ["B3"]
+    assert view.walls_forget_button.label == "Forget C1"
+
+
+def test_the_centres_and_the_wall_note_are_drawn_for_the_captures_the_page_holds(
+    walls_page: PlatePage, fake_microscope: Microscope
+) -> None:
+    view = PlatePageView(walls_page)
+    assert view.walls_captures_text.object == "no centre captured yet"
+    assert view.walls_touches_note.object == ""
+    stage = fake_microscope.require(XYStage)
+    stage.move_to_um(10182.0, -10087.9)
+    _tap(view, *_nominal("B3"))
+    view.walls_capture_button.clicks += 1
+    stage.move_to_um(1.0, 2.0)
+    _tap(view, *_nominal("D5"))
+    view.walls_capture_button.clicks += 1
+    assert view.walls_captures_text.object == centres_text(walls_page.refs)
+    assert view.walls_captures_text.object == (
+        "centres captured (2):\n  B3 (10182.0, -10087.9) µm\n  D5 (1.0, 2.0) µm"
+    )
+    # A wall touch is the registration's: said once, where the operator wonders.
+    view.capture_wall_button.clicks += 1
+    assert view.walls_touches_note.object == wall_touches_note(1)
+    assert "1 wall capture is for plate-registration" in view.walls_touches_note.object
+    # And forgetting the well clears its centre and its wall.
+    view.walls_forget_button.clicks += 1
+    assert view.walls_touches_note.object == ""
+    assert (
+        view.walls_captures_text.object
+        == "centres captured (1):\n  B3 (10182.0, -10087.9) µm"
+    )
+
+
+def test_a_second_tab_redraws_the_walls_captures(
+    walls_page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # FM-151: a capture made through another tab is in the controller, and this tab
+    # draws it at its next tick.
+    one, two = PlatePageView(walls_page), PlatePageView(walls_page)
+    fake_microscope.require(XYStage).move_to_um(10.0, 20.0)
+    _tap(one, *_nominal("B3"))
+    one.walls_capture_button.clicks += 1
+    assert two.walls_captures_text.object == "no centre captured yet"
+    two.tick()
+    assert two.walls_captures_text.object == centres_text(walls_page.refs)
+    assert two.walls_capture_button.label == "Capture centre of B3"
+    walls_page.capture_wall("B3", "left")
+    two.tick()
+    assert two.walls_touches_note.object == wall_touches_note(1)
+
+
+def test_the_walls_run_is_disabled_with_the_reason_beside_it_and_enabled_when_nothing_blocks(
+    walls_page: PlatePage, run_doc: Path, fake_microscope: Microscope
+) -> None:
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    # The fixture's page opened on an empty document: the plate is what a record names.
+    walls_page.choose_plate("96-well")
+    view = PlatePageView(walls_page)
+    run, note = view.tool_runs["plate-walls"], view.tool_notes["plate-walls"]
+    stage = fake_microscope.require(XYStage)
+    when = T0.astimezone().strftime("%Y-%m-%d %H:%M")
+    replace = (
+        f"Run replaces the plate registered {when} (references, 2 wells). "
+        "A failed run leaves no plate; the captures stay, so Forget the wrong one "
+        "and Run again to get a plate back."
+    )
+    # No calibration, no centre: the page's sentence for the calibration comes first,
+    # and the replace note is below it.
+    assert run.disabled
+    assert note.object == f"{WALLS_NEED_CALIBRATION}\n{replace}"
+    _seed(run_doc, "camera-calibration", "camera-calibration", NoResult(), minute=1)
+    view.refresh()
+    assert run.disabled
+    assert note.object == f"{walls_centres_problem(0)}\n{replace}"
+    for index, well in enumerate(["B3", "D5"]):
+        stage.move_to_um(9000.0 * index, 0.0)
+        # The registered plate is on the map: the wells are where it puts them.
+        _tap(view, *_centre(well))
+        view.walls_capture_button.clicks += 1
+    assert [r.well for r in walls_page.refs] == ["B3", "D5"]
+    assert not run.disabled
+    assert note.object == replace
+
+
+def _walls_plate() -> PlateResult:
+    """What ``plate-walls`` writes for one well: four frames on each of its four sides."""
+    fit = WellFit(
+        well="B3",
+        recorded_xy_um=(10186.0, -10092.0),
+        center_xy_um=(10182.04, -10087.93),
+        diameter_um=15298.4,
+        size_error=0.0,
+        rms_um=3.0,
+        n_points=40,
+        walls=tuple(
+            WallFrame(side=side, x_um=0.0, y_um=0.0, n_points=10, frames=4)
+            for side in ("+X", "+Y", "-X", "-Y")
+        ),
+    )
+    return PlateResult(
+        plate="24-well",
+        a1_center_xy_um=(0.0, 0.0),
+        rotation_deg=0.1234,
+        method="wall-images",
+        residual_um=3.24,
+        scale_error=0.0,
+        n_refs=1,
+        walls=WallImages(
+            objective="10x",
+            pixel_size_um=1.0,
+            image_shape_px=(100, 100),
+            search_um=3900.0,
+            wells=(fit,),
+            frames=16,
+            folder="plate-walls/tok",
+            elapsed_s=16.5,
+        ),
+    )
+
+
+def test_the_card_text_of_a_walls_result_lists_the_wells(
+    walls_page: PlatePage, run_doc: Path
+) -> None:
+    result = _walls_plate()
+    _seed(run_doc, "plate-walls", "plate", result)
+    view = PlatePageView(walls_page)
+    text = view.tool_cards["plate-walls"].object
+    # The wells, then the plate, as the controller's card says them; not the result's
+    # first keys with the walls cut away.
+    for line in walls_card_lines(result):
+        assert line in text
+    assert "B3: centre (10182.0, -10087.9) µm, 15298 µm across, 16 frames" in text
+    assert f"folder: {run_doc.parent / 'plate-walls' / 'tok'}" in text
+
+
+def test_a_dry_run_page_says_so_beside_the_walls_run(
+    run_doc: Path, fake_core: FakeCore
+) -> None:
+    dry = Microscope.from_core(
+        cast("CMMCorePlus", fake_core), Profile.demo(), dry_run=True
+    )
+    try:
+        controller = PlatePage(
+            dry,
+            run_doc,
+            entry_points=_entry_points("camera-calibration", "plate-walls"),
+        )
+        try:
+            controller.choose_plate("96-well")
+            view = PlatePageView(controller)
+            assert view.tool_runs["plate-walls"].disabled
+            assert view.tool_notes["plate-walls"].object == WALLS_DRY_RUN
+        finally:
+            controller.close()
+    finally:
+        dry.close()
+
+
+def test_no_widget_is_placed_twice_in_the_page(walls_page: PlatePage) -> None:
+    # A Panel widget placed twice in one layout is drawn once (measured: one Bokeh model
+    # for two places), so the second place is empty and nothing fails. The tree is the
+    # check, not a look at the page: every object of the layout is found once.
+    view = PlatePageView(walls_page)
+    found = _placements(view)
+    assert len(found) == len(set(found))
+
+
+def _placements(view: PlatePageView) -> list[int]:
+    """The id of every object of the layout, once for each place it is in: the Accordion's panels too."""
+    found = [id(o) for o in view.layout.select()]
+    for accordion in view.layout.select(pn.Accordion):
+        for panel in accordion.objects:
+            found.extend(id(o) for o in panel.select())
+    return found
+
+
+def test_the_check_for_a_widget_placed_twice_can_fail(walls_page: PlatePage) -> None:
+    # The check above must be able to fail: a widget put in two places is found twice.
+    view = PlatePageView(walls_page)
+    _section(view, "plate-registration").append(view.walls_forget_button)
+    found = _placements(view)
+    assert len(found) - len(set(found)) == 1
+    assert found.count(id(view.walls_forget_button)) == 2
 
 
 def test_the_checklist_says_what_each_slot_is(run_doc: Path, page: PlatePage) -> None:
