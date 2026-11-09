@@ -4096,7 +4096,20 @@ no reference: one line, `the profile names no reference objective
 case above: it is a read-out. Its help says what the offsets are for and
 where they are written.
 
+**Writing them (#380).** `smc objective offset --from-run-doc PATH
+[--session TEXT] [--write]` opens no stand: it prints the entries that a run
+of `objective-offsets` measured and what they replace, and with `--write`
+writes them into the profile's `[objectives]`, inside a block between two
+marker lines that it alone edits. The rules are m3 §20.7.
+
 ### 13.6 What session 3 measures (for `/hardware-session`)
+
+**Since #380 the tool measures the XY offsets from the plate** (m3 §20): a
+registration with `plate-walls` under one objective, the same wells
+re-measured under each other one. The procedure below is run **once** at the
+Ti2-E to compare with the tool's values (the same reference, the difference
+per objective against the bound of step 6), and stays the way to read a
+focused Z, which the tool does not measure.
 
 The procedure for the session's checklist, with PFS off (a turn switches
 it off anyway), the magnifier lever at 1.0× (the offsets are for it,

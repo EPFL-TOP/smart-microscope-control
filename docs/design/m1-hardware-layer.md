@@ -1270,6 +1270,9 @@ class SampleSection(_Section):
     doublet_fraction: float = 0.3  # [0, 1]
     cell_radius_um: float = 5.0  # (0, 50]
     seed: int = 0  # >= 0
+    # turret label -> [x, y] µm: under it a feature is centred at its position
+    # plus this; empty: no objective is offset (m3 §20.8, #380)
+    objective_shift_um: dict[str, tuple[float, float]] = Field(default_factory=dict)
 
 
 # smc/testing/sample_stand.py
@@ -1294,6 +1297,7 @@ class StandSampleCamera:  # implements Camera
         *,
         camera_rotation_deg: float = 0.0,
         mirrored: bool = False,
+        objective_shift_um: Mapping[str, tuple[float, float]] | None = None,
     ) -> None: ...
 
 

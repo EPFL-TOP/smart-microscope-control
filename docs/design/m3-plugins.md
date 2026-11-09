@@ -5179,3 +5179,707 @@ and how to read the stage's from the camera calibration (the table of §19.1).
 - **Which way NIS-Elements' own XY control moves the image** (press `→` and `↑`,
   then the joystick the same ways, and note each): the page's note under the pad
   says what the arrows do here, and the owner compares.
+
+## 20. The offsets between objectives, measured from the plate (#380)
+
+The owner (2026-11-09): the plate is registered with the 4×, and the offsets
+4× → 10× and 4× → 40× should come from the plate itself, not from a stage
+micrometer centred by hand (m2 §13.6). `smc/plugins/objective_offsets/`,
+entry point `objective-offsets =
+"smc.plugins.objective_offsets.plugin:ObjectiveOffsetsPlugin"`, slot
+`objective-offsets`. The tool reads `plate` (a registration by `plate-walls`,
+§17), turns the turret to each target objective, re-measures under it the
+centres of the wells the registration measured, with `plate-walls`' own loop
+and the target's own camera calibration, and gives each target's offset from
+the registration's objective. `smc objective offset --from-run-doc` shows what
+that puts into the profile's `[objectives]` (m2 §13.3), and `--write` writes it.
+
+**What the operator does** (the Ti2-E, a 24-well plate):
+
+1. Once per objective, in a run document of its own, which later sessions
+   reuse: `smc objective set "2-Plan Fluor 10x" --confirm`, the stage on a
+   well's wall, `smc run camera-calibration -p nikon-ti2 --run-doc
+   cal-10x.json`; the same with the 40× into `cal-40x.json`.
+2. The 4× in place: `camera-calibration` and `plate-walls` into `run.json`
+   (§17).
+3. `smc run objective-offsets -p nikon-ti2 --run-doc run.json --param
+   'targets=["2-Plan Fluor 10x", "3-Plan Apo LmbdD0.25 40x"]' --param
+   'calibrations=["cal-10x.json", "cal-40x.json"]' --param confirm_turns=true`.
+4. `smc objective offset -p nikon-ti2 --from-run-doc run.json --session
+   "session 3 (#NNN)"` prints what it would write; the same with `--write`
+   writes it; `smc objective offset -p nikon-ti2` reads it back against the
+   turret.
+
+**The same feature is the well's measured centre.** m2 §13.2 compares the
+stage positions that centre one feature under two objectives. Here the
+feature is a well's centre as `plate-walls` measures it from its four walls
+(a point, which one wall is not): under the registration's objective it is
+`plate.walls.wells[i].center_xy_um`, under the target the same loop gives it
+again. The plate's fit is not used: its prediction for a well carries the
+fit's residual (up to `max_residual_um`, §17.4), which the two measured
+centres of one well do not.
+
+**A calibration per target, from another run document.** The camera's turn
+and mirror decide which way every wall lies (§17.1), and the scale changes
+with the objective: a wall is looked for with the target's own matrix or not
+at all. A `camera-calibration` run in `run.json` would replace the one the
+plate was registered with and make `plate` stale (§1.7), so each target's
+calibration comes from a document of its own, loaded by the rule
+`camera-calibration` reuses one with (§4.2, `from_run_doc`).
+
+**Not here**: the plate page (its next step after a registration, the
+objective in place at each step and the turns' confirmation; a follow-up
+issue, after #373); a Z offset (m2 §13.2: the layer applies none; a focused Z
+needs the operator, which a plugin cannot ask, §5.1, or a declared PFS lock
+of #349); a plate registered by `plate-registration` or `plate-finding` (their
+positions are centred by eye or fitted, not measured centres); turning back to
+the registration's objective at the end (FM-88); the magnifier lever (FM-103:
+the offsets are keyed by objective alone, and the result says so).
+
+### 20.1 What was measured (2026-11-09, planning #380)
+
+On throwaway prototypes that are not committed; main at `17d72c7`,
+pymmcore-plus 0.18.1, useq-schema 0.9.2, numpy 2.5.3, pydantic 2.13.5,
+scikit-image 0.26.0, Python 3.13.0.
+
+- **The demo-sample stand** (`profiles/demo-sample.toml`): the turret's labels
+  `Nikon 40X Plan Fluor ELWD`, `Nikon 10X S Fluor` (in place at open),
+  `Objective-2`, `Nikon 20X Plan Fluor ELWD`, `Objective-4`, `Objective-5`;
+  frames of 512 × 512; the camera reports 1.0, 0.5 and 0.25 µm per pixel at
+  10X, 20X and 40X (MMCore's `Res10x`, `Res20x`, `Res40x`, which win over the
+  profile's sizes, m1 §6); the XY stage reports no soft limits; Z reads 0.0
+  before and after a turn; a turn returns in 0.11 s. `select` without
+  `confirm` is a `SafetyRefusedError`: `turning the objective turret can drive
+  an objective into a loaded plate (objective_turret 'Objective') — pass
+  confirm=True once the stage is clear`.
+- **A shift per objective, recovered.** The sample camera patched to render
+  at the stage position minus a shift per objective in place (10X `(5.0,
+  −2.5)`, 20X `(0, 0)`, 40X `(−32.5, 9.75)`), the camera turned 30° and
+  mirrored, the plate turned 1.2°:
+  - `camera-calibration` at each objective, each into its own document:
+    0.99967, 0.4995 and 0.2498 µm per pixel, 29.99°, 29.97° and 29.93°,
+    mirrored each time.
+  - `plate-walls` at 10X on A1, H12 and A12, recorded 300 µm off: 30 frames
+    in 1.0 s, each centre within 0.013 µm of the sample's (shifted by the
+    10X's).
+  - Under 20X and under 40X, §17.4's loop (`_measure_well`) with the
+    target's calibration and the 10X centres as the recorded ones: 24 frames
+    for the three wells (two per side) in 0.8 s each. The mean of the three
+    wells' differences was `(−4.9961, 2.4944)` µm for the declared `(−5.0,
+    2.5)` and `(−37.4941, 12.2530)` for `(−37.5, 12.25)`: within 0.009 µm.
+    The largest distance between two wells' differences was 0.012 and 0.004
+    µm. With a search of 1000 µm the 40X walk has 21 offsets (33 at half the
+    radius, plate-walls' default).
+- **Parameters.** `parse_params` takes `tuple[str, ...]` and `tuple[Path,
+  ...]` as JSON lists (a Windows path's backslashes doubled inside the JSON);
+  `targets=a,b` is refused with `'targets' takes JSON, for example ["A1",
+  "B2"]`, and two missing required fields are named in one error.
+- **Test doubles.** `Microscope.override(ZStage, w)` refuses a delegate that
+  forwards through `__getattr__` (`TypeError`: the protocol check sees no
+  method); with each method written out it passes, and the turret's own wait
+  for Z (m2 §8.11 D2) reads it (11 reads during a demo turn). A turret
+  double whose `select` calls the real one and then sets the Z double
+  drifting (1 µm per read) gives the layer a still Z and the plugin a moving
+  one, with no timing in the test. A `plate` record rewritten with
+  `write_stage(path, StageRecord.model_validate({**record.model_dump(
+  mode="json"), "result": changed}))` stays usable (`unusable` is `None`) and
+  validates as a `PlateResult`.
+- **tomli-w 1.0.0** (the floor of `pyproject.toml`) writes `{"objectives":
+  ...}` as an `[objectives]` table and one `[objectives.offsets."<label>"]`
+  table per entry, each array one number per line, a label with `"` and `\`
+  escaped, floats as their `repr`; `tomllib` reads it back equal.
+
+### 20.2 `plate-walls`' loop, for two tools — `plate_walls/loop.py` (new)
+
+`plate-walls`' hardware loop and its checks before anything moves move out of
+`plate_walls/plugin.py` into `plate_walls/loop.py`, public within the package
+and unchanged in behaviour: `plate-walls`' refusals, warnings, progress and
+files stay character for character what they are, and its tests, untouched,
+prove the move. Every message that named `plate-walls` takes the stage's name
+instead (`WallWalk.stage`, or the `stage` argument).
+
+```python
+@dataclass(frozen=True, slots=True)
+class WallWalk:
+    stage: str
+    plate: str
+    radius_um: float
+    search_um: float
+    step_um: float
+    matrix: Matrix2
+    shape: tuple[int, int]
+    pixel_size_um: float
+    settle_s: float
+    folder: Path | None
+    folder_text: str | None
+    no_wall_hint: str
+```
+
+```python
+class Where:
+    __slots__ = ("text",)
+
+
+def check_calibration(
+    stage: str,
+    calibration: CameraCalibration,
+    objective: str | None,
+    has_turret: bool,
+    shape: tuple[int, int],
+) -> None: ...
+def check_frame(
+    stage: str, matrix: Matrix2, shape: tuple[int, int], diameter_um: float
+) -> None: ...
+def checked_search(
+    stage: str, search_um: float | None, radius_um: float, *, default_um: float
+) -> float: ...
+def check_walk_size(
+    stage: str, n_wells: int, search_um: float, step_um: float
+) -> None: ...
+def check_soft_limits(
+    stage: str, xy: XYStage, refs: tuple[WellRef, ...], offsets: tuple[float, ...]
+) -> list[str]: ...
+def move(
+    stage: str, xy: XYStage, x_um: float, y_um: float, what: str
+) -> tuple[float, float]: ...
+def measure_well(
+    xy: XYStage,
+    camera: Camera,
+    ctx: RunContext,
+    walk: WallWalk,
+    ref: WellRef,
+    offsets: tuple[float, ...],
+    where: Where,
+    save_errors: list[str],
+    on_side: Callable[[str], None],
+) -> tuple[WellFit, int]: ...
+def warn_left(
+    stage: str, ctx: RunContext, xy: XYStage, start: XY, where: Where
+) -> None: ...
+```
+
+- `WallWalk` is today's `_Walk` with two fields: `stage`, the plugin whose
+  refusals these are, and `no_wall_hint`, the end of the "no wall found"
+  refusal after its first clause, with `{well}` where the well's name goes
+  (`str.format(well=...)`). `plate-walls`' is today's text, `check that the
+  light is on (the inside of a well is brighter than the plastic in
+  brightfield) and that the stage was in {well} when it was recorded, then
+  record it again`.
+- `checked_search` takes the default from its caller (`plate-walls`:
+  `DEFAULT_SEARCH_FRACTION × r`, as today) and keeps the bound: a value above
+  the radius is refused, the default included.
+- `measure_well` no longer counts progress: after each side it calls
+  `on_side("<well> <side>")`. `plate-walls` passes a function that counts the
+  sides done and calls `ctx.progress(i, 4 × len(refs), text)`, which is
+  today's call. `_snap`, `_measure_side` and `_save` move as private helpers
+  of `loop.py`; `_save` writes `<folder>/<well>_<side>.tif` as today.
+- `warn_left`'s two texts start with the stage's name where they say
+  `plate-walls` today.
+- Left in `plugin.py`: `PlateWallsParams`, `PlateWallsPlugin.run`,
+  `_checked_refs`, `_fit_plate` and the constants of the refusals that only
+  `plate-walls` makes.
+
+### 20.3 A calibration from another run document — `camera_calibration/plugin.py`
+
+```python
+def calibration_from(
+    stage: str, path: Path, *, profile: str, dry_run: bool
+) -> tuple[CameraCalibration, str]: ...
+```
+
+The first half of today's `_reuse`, public: the document loaded, the rule
+`RunDocument.unusable("camera-calibration", profile=..., dry_run=...)`, the
+record's result validated, each refusal a `PluginRunError` of `stage` with
+`_reuse`'s texts. It returns the calibration and when it was measured (the
+record's `finished_utc`, ISO to the second, or `at an unknown time`). `_reuse`
+calls it with `camera-calibration`, then checks the objective and the frame
+and builds the reused result as today; its texts do not change.
+
+### 20.4 The slot — `slots/objective_offsets.py` (slot `objective-offsets`)
+
+```python
+class OffsetWell(SlotValue):
+    well: str
+    origin_xy_um: tuple[float, float]
+    delta_xy_um: tuple[float, float]
+    fit: WellFit
+```
+
+```python
+class TargetMeasure(SlotValue):
+    objective: str
+    calibration: str
+    calibration_measured: str
+    pixel_size_um: float = Field(gt=0.0)
+    z_after_turn_um: float | None
+    wells: tuple[OffsetWell, ...]
+    shift_xy_um: tuple[float, float]
+    spread_um: float = Field(ge=0.0)
+    max_spread_um: float = Field(gt=0.0)
+    frames: int = Field(ge=0)
+    folder: str | None
+```
+
+```python
+class MeasuredOffset(SlotValue):
+    objective: str
+    xy_offset_um: tuple[float, float]
+```
+
+```python
+class ObjectiveOffsetsResult(PluginResult):
+    plate_objective: str
+    reference: str
+    reference_in_profile: bool
+    measures: tuple[TargetMeasure, ...]
+    offsets: tuple[MeasuredOffset, ...]
+    objective_in_place: str
+    elapsed_s: float = Field(ge=0.0)
+```
+
+- **Every position is a stage position** (`XYStage.position_um()`, M1 §2),
+  never an image side (FM-189).
+- `OffsetWell`: `origin_xy_um` is the centre `plate-walls` measured with the
+  registration's objective (`plate.walls`); `fit` is the well under the
+  target, as `plate-walls` records one (its `recorded_xy_um` is
+  `origin_xy_um`); `delta_xy_um` is `fit.center_xy_um − origin_xy_um`.
+- `TargetMeasure`: `calibration` is the run document given for this target,
+  as typed (`as_posix()`, never resolved: FM-24, FM-50) and
+  `calibration_measured` when it was measured (§20.3); `pixel_size_um` is that
+  calibration's; `z_after_turn_um` is Z where the stand left it after the turn
+  (§20.6), `None` on a stand with no focus drive; `wells` in the order run;
+  `shift_xy_um` the mean of the wells' `delta_xy_um`, the target's offset from
+  the registration's objective; `spread_um` the largest distance between two
+  wells' `delta_xy_um`; `max_spread_um` the bound it was held to; `frames` the
+  frames taken under this target; `folder` run-relative
+  (`objective-offsets/<token>/<n>`, `n` the target's place in `targets` from
+  1; no label in a path) or `None` when frames are not saved.
+- `ObjectiveOffsetsResult`: `plate_objective` is `plate.objective`;
+  `reference` the objective the offsets are from, the profile's (`True` in
+  `reference_in_profile`) or, when it names none, `plate_objective`
+  (`False`); `measures` in the order of `targets`; `offsets` what `--write`
+  writes (§20.5's `offsets_from_reference`): every objective the run measured
+  or registered with, except `reference`, the registration's objective first
+  and then the targets in their order; `objective_in_place` the last target,
+  where the turret is left.
+- `slots/__init__.py` exports the four models.
+
+### 20.5 Algorithm — `objective_offsets/algorithm.py`
+
+Pure: no device, no file, no numpy needed.
+
+```python
+#: The wells may disagree by this many pixels of the coarser of the two
+#: objectives (m2 §13.6: 5.5 µm at the Ti2-E's 4x). Chosen, not measured.
+SPREAD_PIXELS = 2.0
+#: At most this many targets in one run, so that the walks' bound holds in all
+#: (FM-140). Chosen: a turret holds six positions.
+MAX_TARGETS = 5
+
+
+def mean_shift_um(deltas: Sequence[tuple[float, float]]) -> tuple[float, float]: ...
+def spread_um(deltas: Sequence[tuple[float, float]]) -> float: ...
+def default_max_spread_um(origin_pixel_um: float, target_pixel_um: float) -> float: ...
+def offsets_from_reference(
+    origin: str,
+    shifts: Sequence[tuple[str, tuple[float, float]]],
+    reference: str | None,
+) -> tuple[str, tuple[tuple[str, tuple[float, float]], ...]]: ...
+```
+
+- `mean_shift_um` is the mean per axis; `ValueError` for no delta.
+- `spread_um` is the largest `math.dist` between two deltas, `0.0` for one
+  delta; `ValueError` for none.
+- `default_max_spread_um` is `SPREAD_PIXELS × max(origin, target)`;
+  `ValueError` for a size that is not finite and positive.
+- `offsets_from_reference(origin, shifts, reference)`: `d(origin) = (0, 0)`
+  and `d(t) = shift` for each target; `R` is `reference`, or `origin` when it
+  is `None`; `ValueError` when `R` is not `origin` and not among the targets
+  (the plugin refuses that before anything turns, §20.6). The result is `R`
+  and, for `origin` then each target in order, leaving out `R`, the label and
+  `d(label) − d(R)` per axis, each `+ 0.0` (no `-0.0`). With `R = origin`
+  each target's offset is its shift; with `R` a target, the origin's offset
+  is `−d(R)` and every other target's `d(t) − d(R)` (m2 §13.2: `p_O = p_R +
+  offset(O)`).
+
+### 20.6 Plugin — `objective_offsets/plugin.py`
+
+```python
+class ObjectiveOffsetsParams(PluginParams):
+    targets: tuple[str, ...] = Field(min_length=1, max_length=MAX_TARGETS)
+    calibrations: tuple[Path, ...] = Field(min_length=1, max_length=MAX_TARGETS)
+    confirm_turns: bool = False
+    wells: tuple[str, ...] = Field((), max_length=6)
+    search_um: float | None = Field(None, gt=0.0, le=MAX_XY_OFFSET_UM)
+    max_spread_um: float | None = Field(None, gt=0.0, le=100.0)
+    settle_ms: float = Field(0.0, ge=0.0, le=10_000.0)
+    save_frames: bool = True
+```
+
+`requires = (XYStage, Camera, ObjectiveTurret)`, `reads = ("plate",)`,
+`reads_optional = ()`, `provides = "objective-offsets"`. Z is
+`microscope.get(ZStage)`, `None` without one. No checkpoint: a run takes about
+a minute, and a stopped one is run again. Each field has a `description`:
+
+- `targets`: the objectives to measure, by turret label, in the order the
+  turret turns to them (JSON: `targets=["2-Plan Fluor 10x"]`); the last one is
+  left in place.
+- `calibrations`: one run document per target holding a `camera-calibration`
+  done with that target in place (JSON list of paths, as typed; relative to
+  the working directory, as `from_run_doc`).
+- `confirm_turns`: the stage is clear for the turret to turn to each target
+  with the plate on it (FM-14).
+- `wells`: wells the registration measured, at least two; default all of
+  them.
+- `search_um`: how far each wall may lie from where the registration's centre
+  puts it, in µm; default `min(MAX_XY_OFFSET_UM, r)`; never above the radius.
+  An offset larger than the profile's bound could not be written anyway.
+- `max_spread_um`: how far apart the wells' differences may lie; default
+  `SPREAD_PIXELS` pixels of the coarser objective.
+- `settle_ms`, `save_frames`: as `plate-walls`' (frames under
+  `objective-offsets/<token>/<n>/<well>_<side>.tif`).
+
+**Before anything turns or moves**, in this order, each failure a
+`PluginRunError` of `objective-offsets`:
+
+1. A dry run: `a dry run cannot turn the turret or image the walls; run it
+   without --dry-run`.
+2. `confirm_turns` false: `objective-offsets turns the turret to <t1>, <t2>
+   with the plate on the stage: check that each objective clears the plate
+   (its working distance, the plate's height), then give confirm_turns=true`.
+   The tool asks for it on every stand: the profile's
+   `turret_requires_confirm` decides what the layer refuses, not what this
+   tool asks before it turns several times over a plate.
+3. **The plate** (`ctx.upstream("plate", PlateResult)`): its `method` is not
+   `wall-images` or `walls` is `None`: `the plate was registered with
+   <method>: objective-offsets compares the centres plate-walls measured,
+   so register it with plate-walls`; `objective` is `None`: `the plate does
+   not record the objective it was registered with: register it with
+   plate-walls on a stand with a turret`; `walls.objective` is not
+   `objective`: `the plate's record names <a> and its wall images <b>:
+   register it again with plate-walls`.
+4. **The targets**, against `turret.labels()` without the empty ones: one
+   not on the turret, `objective <t> is not on the turret: <labels>`; the
+   plate's own, `<t> is the objective the plate was registered with: its
+   offset from itself is zero; leave it out of targets`; one given twice,
+   `<t> is given twice in targets`.
+5. **The wells**: given, each `normalise_well`'d and among the walls' wells
+   (`<w> is not a well the registration measured: choose among <A1, H12,
+   A12>`), none twice (`<w> is given twice in wells`), at least two (`give
+   at least two wells: the offset is a translation only if they agree`);
+   not given, every well of `plate.walls.wells` in its order. Their
+   `origin_xy_um` are those wells' `center_xy_um`.
+6. **The calibrations**: each path through `calibration_from` (§20.3, its
+   refusals as they are). Then: one whose `objective` is `None` or not a
+   target, `the calibration in <path> is of <objective, or an unknown
+   objective>, which is not in targets: give one calibration per target`;
+   two of one target, `<path a> and <path b> are both calibrations of <t>:
+   give one per target`; a target with none, `no camera calibration of <t>
+   in calibrations: turn to it (smc objective set "<t>" --confirm), run smc
+   run camera-calibration --run-doc <a document of its own> on a well's wall,
+   and add that document to calibrations`. Then, per target,
+   `check_calibration(_NAME, calibration, t, True, camera.image_shape())`
+   (the frame and the matrix; the objective matches by construction) and
+   `check_frame(_NAME, ...)` with the plate's well diameter.
+7. **The reference**: `reference = turret.offset(plate.objective).reference`.
+   When it is not `None` and not the plate's objective nor a target: `the
+   profile's offsets are measured from <R> ([objectives] reference), which
+   this run does not measure: add <R> to targets, or clear the reference`.
+8. **The walks**, per target: `r` the nominal radius, `search =
+   checked_search(_NAME, params.search_um, r, default_um=min(MAX_XY_OFFSET_UM,
+   r))`, `step = STEP_FRACTION × min(shape) × calibration.pixel_size_um`,
+   `check_walk_size(_NAME, len(wells), search, step)` (per target; with at
+   most `MAX_TARGETS` targets the run's frames are bounded in all, FM-140),
+   `check_soft_limits(_NAME, xy, <the wells at origin_xy_um>, offsets)`; its
+   line, when the stage reports no limits, goes into `assumed` once.
+
+Then `xy.wait()` (FM-85), the start position is read, the clock starts, and
+`token = new_token()`.
+
+**Each target, in the order given** (`n` from 1):
+
+1. `ctx.raise_if_stopped()`. **The turn**: `turret.select(t, confirm=True)`.
+   A `SafetyRefusedError` is refused as `the turn to <t> was refused: <its
+   text>` (raised outside the handler, FM-98); a halt passes unchanged
+   (FM-64).
+2. **The readback** (FM-167, FM-188): `turret.current()` not `t`: `the
+   turret reads <x> after the turn to <t>: it did not turn, or its label
+   lags (m2 §8.11 D3); nothing was measured with <t>`.
+3. **Z still** (FM-195), when there is a focus drive: `z1 =
+   position_um()`, `ctx.wait_s(Z_STILL_S)`, `z2 = position_um()`; when
+   `abs(z2 - z1) > Z_STILL_UM` it is refused, `Z moved from <z1> to <z2> µm
+   within <Z_STILL_S> s after the turn to <t>: the stand was still moving it;
+   nothing was measured with <t>` (`:.2f`, the window `:g`). `z_after_turn_um = z2`. A Z
+   read that raises is not caught. `Z_STILL_S = 0.1` and `Z_STILL_UM = 0.5`
+   are m2 §8.11 D2's `TURN_Z_SETTLE_S` and `TURN_Z_STILL_UM`, copied with
+   that reference: a plugin does not import a backend.
+4. **The wells**: `WallWalk(stage="objective-offsets", ...)` from the
+   target's calibration and walk, `folder` `<run_dir>/objective-offsets/
+   <token>/<n>` with `save_frames`, `no_wall_hint` `check that the light is
+   on, that <t> images the wall as the registration's objective did, and
+   that search_um (<s> µm) covers the offset`. For each well,
+   `measure_well(..., WellRef(well, *origin_xy_um), ...)`: `plate-walls`'
+   walk, centred frames, circle fit and refusals (a well of another size, a
+   wall that is not a circle) apply under the target too. `on_side` counts
+   the sides over the whole run and calls `ctx.progress(i, len(targets) × 4 ×
+   len(wells), "<t>: <well> <side>")`.
+5. `shift = mean_shift_um(deltas)`, `spread = spread_um(deltas)`, the bound
+   `params.max_spread_um` or `default_max_spread_um(plate.walls.pixel_size_um,
+   calibration.pixel_size_um)`.
+
+**After the last target**, the stage where the last frame left it:
+
+- Any target whose `spread_um` exceeds its bound: one refusal for all of
+  them, so that the numbers are reported and nothing can be written: `the
+  wells do not agree on the offset, so it is not a translation or not
+  measured well enough: <t>: <w1> (<+dx>, <+dy>), <w2> (...) µm, spread <s>
+  µm, bound <b> µm; <the next target>...; look at the frames in <folder>, or
+  give a larger max_spread_um if the stage's repeatability is larger`
+  (`:+.2f`, the spread and bound `:.2f`; `the frames were not saved` for a
+  `folder` that is `None`).
+- `offsets_from_reference(plate.objective, shifts, reference)`; an offset
+  beyond `±MAX_XY_OFFSET_UM` on either axis: `the offset of <O> would be
+  (<x>, <y>) µm, beyond the profile's ±1000 µm: a wrong well or a wrong
+  calibration, not two parcentric objectives`.
+- `ctx.raise_if_stopped()`, then one move to the last target's last well's
+  fitted centre: the operator sees on Live a well centred under the objective
+  in place.
+
+**On any exception during the turns and the moves** (a stop, a halt, a fault,
+a refusal) nothing is turned back or moved back (FM-88): `warn_left` names
+where the stage is, and a second WARNING the turret, `objective-offsets:
+the turret is left at <current()>, not turned back` (`current()` in its own
+`try`, `unknown` when it fails too); the exception propagates.
+
+**The result**, built once: §20.4's fields, `objective_in_place` the last
+target, `elapsed_s` from the first turn to the result. `assumed`, in this
+order: the soft limits line (step 8); `the offsets are for the magnifier lever
+as it was during this run: the profile keys them by objective alone, for the
+lever at 1.0x (FM-103)`; `Z after a turn is where the stand left it once it
+was still, not a focused Z: no z_offset_um is measured`; when the profile
+names no reference, `the profile names no reference objective: the offsets
+are from <plate objective>, which smc objective offset --write makes the
+reference`; the saving line of `plate-walls` (`<n> frames could not be saved:
+<the first error>`).
+
+**Autofocus, light, Z**: none is set. A turn switches the autofocus off and
+the layer never engages it again (m2 §8.3); the stand moves Z on a turn by
+itself (m2 §13.1) and the tool reads it only.
+
+### 20.7 Writing the profile — `smc/hardware/profile_write.py` (new), `smc objective offset`
+
+**The block.** The tool writes the profile's `[objectives]` as one block
+between two marker lines, and never edits a line outside it (FM-107):
+
+```python
+BLOCK_BEGIN = "# >>> [objectives], written by smc objective offset --write (m2 §13)"
+BLOCK_END = "# <<< [objectives], written by smc objective offset --write"
+
+
+def objectives_block(section: ObjectivesSection, *, newline: str = "\n") -> str: ...
+def with_objectives(text: str, section: ObjectivesSection, *, where: str) -> str: ...
+```
+
+- `objectives_block`: `BLOCK_BEGIN`, the comment line `# The next write
+  replaces everything up to the closing marker; edit values here only if no
+  write follows.`, `tomli_w.dumps({"objectives": ...})` of `reference` and
+  of each entry with its `None` values left out, then `BLOCK_END`; every line
+  ends with `newline`.
+- `with_objectives(text, section, where=<the file>)`, `ProfileError` naming
+  `where` for each refusal: the lines that equal a marker once their line end
+  is removed are found. None of either: the block is appended at the end,
+  after one empty line (a final line end added first if the text has none).
+  One `BLOCK_BEGIN` followed by one `BLOCK_END`: the lines from the first to
+  the second, both included, are replaced. Anything else: `the [objectives]
+  block that smc writes is damaged (<b> opening and <e> closing marker
+  lines): restore it from git, or delete both markers and what lies between,
+  then write again`. The text without the block is read by `tomllib`; an
+  `objectives` key in it is refused: `the profile has an [objectives] table
+  outside the block smc writes: delete it (its values are printed above) or
+  edit it by hand instead of writing`. The new text is read back (`tomllib`,
+  `Profile.model_validate`) and its `objectives` must equal `section`, else
+  `the text written for [objectives] does not read back as the offsets;
+  nothing was written` (FM-156). `newline` is `"\r\n"` when the text holds
+  one, else `"\n"`: a profile saved by Notepad keeps its line ends.
+- `profile.py` gains `profile_text(path: Path) -> str`, the public name of
+  `_read_text` (bytes, `utf-8-sig`, FM-80): a profile with a byte-order mark
+  is written back without it, which the loader reads the same.
+
+**The command** (m2 §13.5 extended):
+
+```text
+smc objective offset [--profile NAME] [--from-run-doc PATH [--session TEXT] [--write]]
+```
+
+Without `--from-run-doc` it is m2 §13.5's read-out, unchanged. `--session` or
+`--write` without `--from-run-doc` is a usage error (exit 2), as is a
+`--session` with a character below `U+0020` (one line in the profile and in
+the read-out). With `--from-run-doc` no stand is opened, and in this order,
+each failure a `✗` line and exit 1:
+
+1. `Profile.load(profile)`; a profile with no `source` (built in code):
+   `<name> is not loaded from a file: give the path of its .toml to -p`.
+2. `RunDocument.load(path)`; `unusable("objective-offsets",
+   profile=<the profile's name>, dry_run=False)` refused with its text; the
+   result validated by `ObjectiveOffsetsResult` (`the objective-offsets
+   result in <path> is not one this smc reads; run objective-offsets
+   again`).
+3. **The reference now**: the profile's `reference` (blank is `None`) must be
+   the result's when `reference_in_profile`, and blank when it is not; else
+   `the profile's offsets are now from <a>, and the run measured them from
+   <b>: run objective-offsets again`.
+4. **The section**: the profile's `offsets`, each label of the result's
+   `offsets` **replaced** by a new entry (FM-99: not merged; a `z_offset_um`
+   it held is dropped and said so) with `xy_offset_um` each value
+   `round(v, 2) + 0.0` and `measured = "<finished date, UTC>, <session, >
+   objective-offsets in <the run document's name>"` (only the name: FM-50);
+   `reference` the result's. `ObjectivesSection.model_validate` of it; a
+   `ValidationError` is printed with its text.
+5. **The lines**, through `_say` (plain: FM-36), in this order: per target,
+   `'<t>'  shift from '<plate objective>' (<+x>, <+y>) µm, spread <s> µm over
+   <A1, H12, A12> (bound <b> µm)`; per written label, `'<label>'  xy (<+x>,
+   <+y>) µm  was unknown` or `was xy (<+x>, <+y>) µm, measured <m>`; per
+   dropped Z, `'<label>': its z_offset_um <+z> µm (measured <m>) is dropped:
+   objective-offsets measures XY only`; `reference '<R>'`, with `  (new: the
+   profile named none)` when it was blank; `measured = "<text>"`.
+6. Without `--write`: `nothing was written: add --write to write these into
+   <source>`, exit 0. With `--write`: `profile_text(source)`,
+   `with_objectives(...)`, `write_atomically(source, text.encode("utf-8"),
+   make_parents=False)` (FM-38), then `✓ wrote [objectives] into <source>;
+   smc objective offset -p <profile> reads them back against the turret`,
+   exit 0.
+
+The preview is the confirmation the issue asks for: the CLI has no prompt
+anywhere (a `--force` or `--overwrite` decides), and a page or a script
+cannot answer one. The old values are printed before they are replaced
+(FM-172), and the file is in git.
+
+### 20.8 The demo-sample stand's objectives — `[sample] objective_shift_um`
+
+So that a declared offset can be recovered on the demo (the issue's first
+criterion) and the page can later be tried on one:
+
+```python
+class SampleSection(_Section):  # gains
+    objective_shift_um: dict[str, tuple[float, float]] = Field(default_factory=dict)
+```
+
+```python
+class StandSampleCamera:  # __init__ gains the keyword
+    objective_shift_um: Mapping[str, tuple[float, float]] | None = None
+```
+
+- **Its meaning**: under the objective of that turret label the camera images
+  the sample as if the stage stood at `position − shift`, so a feature is
+  centred at its position plus the shift: the shifts are the offsets of m2
+  §13.2 from an objective whose shift is zero. A label with no entry has none.
+- **Validation** (`ProfileError` naming the key): labels not blank; two
+  numbers, finite, not booleans (`_no_boolean`), each within
+  `±MAX_XY_OFFSET_UM`. A label that is not on the turret is not checked (the
+  profile cannot know it) and has no effect.
+- `StandSampleCamera.snap` reads the objective in place (`_objective_name`)
+  only when the mapping is not empty, and renders at the shifted position; the
+  default path reads no turret and renders as today. `install_sample` passes
+  the section's mapping (a copy).
+- `sample_lines` gains a fourth line when the mapping is not empty: `  the
+  objectives are offset: '<label>' (<+x>, <+y>) µm, ...` (ASCII apart from
+  `µ`, FM-20). `sample_refs` stays the sample's own frame (a shift of zero).
+- `profiles/demo-sample.toml` gains the key, commented: `# objective_shift_um
+  = {}  # turret label -> [x, y] µm: under it a feature is centred at its
+  position plus this (m3 §20.8)`. `Profile.demo()` and `demo.toml` are
+  unchanged.
+
+### 20.9 Tests
+
+- `tests/unit/test_objective_offsets_algorithm.py` (pure):
+  `test_the_shift_is_the_mean_of_the_wells_differences`,
+  `test_the_spread_is_the_largest_distance_between_two_wells`,
+  `test_one_well_has_no_spread`, `test_no_well_is_refused`,
+  `test_the_default_bound_is_two_pixels_of_the_coarser_objective`,
+  `test_offsets_are_the_shifts_when_the_profile_names_no_reference`,
+  `test_offsets_are_moved_to_a_reference_among_the_targets` (a reference
+  whose own shift is not zero, the values written out by hand: FM-203,
+  FM-124), `test_a_reference_the_run_did_not_measure_is_refused`.
+- `tests/unit/test_profile_write.py`: on the text of
+  `profiles/nikon-ti2.toml` read as bytes:
+  `test_the_block_is_appended_and_every_other_line_comes_back`,
+  `test_a_second_write_replaces_the_block_in_place`,
+  `test_crlf_line_ends_are_kept`, `test_a_profile_with_a_byte_order_mark_is_written_without_it`,
+  `test_an_objectives_table_outside_the_block_is_refused`,
+  `test_a_damaged_block_is_refused` (one marker; two openings),
+  `test_a_label_with_quotes_reads_back` (FM-190),
+  `test_the_written_text_reads_back_as_the_section`.
+- `tests/unit/test_profile.py` gains
+  `test_sample_objective_shift_refuses_a_boolean_nan_three_numbers_and_the_bound`
+  and the blank label; `tests/unit/test_sample_stand.py` gains the fourth
+  line of `sample_lines`.
+- `tests/test_demo_sample_demo.py` gains
+  `test_an_objective_shift_moves_what_the_camera_sees`: under 40X with a
+  shift `(−32.5, 9.75)`, the frame at `p + shift` equals the frame of a stand
+  without the shift at `p`; under 10X, with no entry, the frames are equal.
+- `tests/test_objective_offsets_demo.py` (new), on the demo-sample stand
+  (`profiles/demo-sample.toml` with `[sample]` turned as §20.1: camera 30°
+  and mirrored, plate 1.2°, shifts 10X `(5.0, −2.5)`, 20X `(0.0, 0.0)`, 40X
+  `(−32.5, 9.75)`; the stage's `Velocity` at 100 000): a module fixture runs
+  `camera-calibration` under 20X and under 40X into a document each, and
+  `camera-calibration` and `plate-walls` (A1, H12, A12, recorded 300 µm off)
+  under 10X into `run.json`, through `run_plugin` (the seam, FM-124); each
+  test copies `run.json` and opens its own stand.
+  `test_the_samples_offsets_are_recovered_within_a_pixel` (targets 40X then
+  20X, no reference: `(−37.5, 12.25)` and `(−5.0, 2.5)` within 1.0 µm, one
+  pixel of the 10X; written from the shifts, not from the code);
+  `test_offsets_are_given_from_the_profiles_reference` (reference 20X:
+  10X `(5.0, −2.5)`, 40X `(−32.5, 9.75)`);
+  `test_a_reference_the_run_does_not_measure_is_refused_before_the_turret_turns`;
+  `test_without_confirm_turns_nothing_turns`;
+  `test_a_target_without_a_calibration_is_refused_before_the_turret_turns`;
+  `test_a_calibration_of_another_objective_is_refused`;
+  `test_a_plate_registered_by_eye_is_refused` (`plate-registration` with
+  `sample_refs`); `test_a_well_the_registration_did_not_measure_is_refused`;
+  `test_wells_that_disagree_are_refused_with_their_numbers` (H12's
+  `center_xy_um` in the plate record moved by `(+20.0, 0.0)` with
+  `write_stage`, §20.1: a spread near 20 µm against a bound of 2 µm; the
+  record `failed`, no result);
+  `test_a_turret_that_reads_another_label_after_the_turn_is_refused` and
+  `test_z_still_moving_after_the_turn_is_refused` (the doubles of §20.1;
+  nothing imaged under the target); `test_a_stop_leaves_the_turret_and_the_stage_where_they_are`
+  (the two WARNINGs); `test_the_stage_ends_at_the_last_wells_centre_under_the_last_target`;
+  `test_a_dry_run_is_refused`; `test_frames_are_saved_per_target_without_a_label_in_the_path`.
+- `tests/unit/test_slots.py` gains the round trip of the four models.
+- `tests/test_cli_objective_offsets.py` (new; a profile file in `tmp_path`
+  that is `demo-sample.toml` with the keys above and A1 at the stage origin,
+  `a1_center_xy_um = [0.0, 0.0]`; the documents built as in the demo module,
+  with A1 and B2 registered: each `smc run` opens a stand at the origin with
+  the demo's 10 mm/s, so the wells must be near it; the develop session times
+  the module): `smc run objective-offsets` prints the result with
+  `offsets`, `spread_um` and the wells; `smc objective offset --from-run-doc`
+  prints the lines of §20.7 and leaves the file's bytes as they were;
+  `--write` writes them and `smc objective offset` prints each target with
+  its `measured` line (the numbers compared within 1.0 µm, not as text:
+  `−37.494` is written `-37.49`); a second `--write` replaces the block;
+  `--write` without `--from-run-doc` exits 2; a run document of another
+  profile, and a reference changed since the run, exit 1 with nothing
+  written; `[objectives]` survives in the output (FM-36).
+- `tests/test_plate_walls_demo.py` and `tests/unit/test_plate_walls.py`:
+  unchanged, and green (§20.2); `tests/test_camera_calibration_demo.py`'s
+  reuse tests unchanged (§20.3).
+
+**Failure modes**: FM-14, FM-24, FM-32, FM-36, FM-38, FM-43, FM-50, FM-64,
+FM-73, FM-74, FM-80, FM-85, FM-88, FM-98, FM-99, FM-103, FM-107, FM-121,
+FM-124, FM-125, FM-140, FM-142, FM-156, FM-167, FM-172, FM-188, FM-189,
+FM-190, FM-195, FM-203.
+
+### 20.10 Not verified (for the owner)
+
+- **At the Ti2-E**: the offsets 4× → 10× and 4× → 40× measured on a plate,
+  and compared once with m2 §13.6's procedure by hand; whether the 40×
+  images a well's wall in brightfield as the 4× and 10× do (its depth of
+  field, the meniscus), so that `find_wall` finds it; whether 2 pixels of the
+  4× (5.5 µm) hold the wells' spread, which also carries the stage's
+  repeatability; how long a run takes with the turns and the moves between
+  wells.
+- That the shift is a translation over the plate (m2 §13.8): two wells far
+  apart that agree within the bound are the evidence the tool gives.
+- Whether a turn at the plate's working height (Z about 4195 µm at 10×)
+  settles within the turret's wait (m2 §8.11.3); the tool refuses a Z that
+  still moves and says so.
