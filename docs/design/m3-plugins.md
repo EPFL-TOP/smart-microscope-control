@@ -6518,7 +6518,7 @@ when `cell_focus != "off"` and not in a dry run:
 - with the autofocus used: `each frame's pfs_offset names the plane PFS
   held, not the cells' plane <min>…<max> µm from it: an export that
   engages PFS at that offset images the plane PFS held` (route and
-  NIS-Elements, a follow-up issue);
+  NIS-Elements: #392);
 - in a dry run, instead: `dry run: the focus on the cells was planned
   (<n> planes per sweep), not run`.
 
@@ -6668,4 +6668,4 @@ At the Ti2-E, 40× on a plate with cells, PFS locked on them (m2 §12.10.7):
 - The time per plane (a Z move of a step and its settling, FM-195, then a
   snap) and per field, against §21.6's `assumed` line.
 - Whether a Z readback lands within a quarter step of its command.
-- The follow-up for route and NIS-Elements (§21.6's `pfs_offset` line).
+- The 40×'s offset factor, which #392 (route and NIS-Elements) waits for.
