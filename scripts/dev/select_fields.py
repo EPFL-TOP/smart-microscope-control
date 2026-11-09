@@ -354,3 +354,139 @@ def candidates_of(
             )
         )
     return tuple(found), skipped
+
+
+# ========================================================================= Score
+
+#: What each weight is when it is not given: the density alone, which is what ``route``
+#: prefers, so that every other criterion is a deliberate step of the owner.
+DEFAULT_WEIGHTS: dict[str, float] = {
+    name: (1.0 if name == "density" else 0.0) for name in WEIGHT_NAMES
+}
+_MAX_WEIGHT = 1e6
+
+
+def parse_weights(pairs: Sequence[str]) -> dict[str, float]:
+    """The six weights from ``NAME=VALUE`` pairs: the defaults, each replaced by the pair that names it.
+
+    A weight is finite and in [0, 1e6], at least one is above 0, a name is one of
+    ``WEIGHT_NAMES`` and is given once (a value typed twice is a typo, and the last
+    one silently winning would hide it).
+
+    Raises:
+        Refusal: A pair is malformed, a name unknown or repeated, a value not a
+            number in range, or every weight is 0.
+    """
+    weights = dict(DEFAULT_WEIGHTS)
+    given: set[str] = set()
+    for pair in pairs:
+        name, equals, text = pair.partition("=")
+        if not equals:
+            raise Refusal(f"--weight expects NAME=VALUE, got {pair!r}")
+        if name not in WEIGHT_NAMES:
+            raise Refusal(
+                f"--weight name {name!r} is not one of {', '.join(WEIGHT_NAMES)}"
+            )
+        if name in given:
+            raise Refusal(f"--weight {name} is given twice")
+        given.add(name)
+        try:
+            value = float(text)
+        except ValueError:
+            value = math.nan
+        if not (math.isfinite(value) and 0.0 <= value <= _MAX_WEIGHT):
+            raise Refusal(
+                f"--weight {name} must be a number from 0 to {_MAX_WEIGHT:.0f}, "
+                f"got {text!r}"
+            )
+        weights[name] = value
+    if not any(weight > 0.0 for weight in weights.values()):
+        raise Refusal("at least one weight must be above 0")
+    return weights
+
+
+def percentile_rank(value: float, values: Sequence[float]) -> float:
+    """The share of ``values`` below ``value``, a tie counting for half: in (0, 1), never 0 or 1 for a member.
+
+    The three values 1, 2, 3 rank 1/6, 3/6, 5/6, and a value shared by all of them
+    ranks 1/2, which says "no better than the others" and not "the best".
+    """
+    if len(values) == 0:
+        raise ValueError("a rank needs at least one value")
+    ordered = np.sort(np.asarray(values, dtype=np.float64))
+    below = int(np.searchsorted(ordered, value, side="left"))
+    up_to = int(np.searchsorted(ordered, value, side="right"))
+    return (below + 0.5 * (up_to - below)) / len(ordered)
+
+
+@dataclass(frozen=True, slots=True)
+class Scored:
+    """A candidate, its score in [0, 1] and the six parts that made it, each in [0, 1]."""
+
+    candidate: Candidate
+    score: float
+    parts: dict[str, float]
+
+
+def _unit(value: float) -> float:
+    """``value`` clipped to [0, 1]: a ratio that a rounding put a hair outside is not a different score."""
+    return max(0.0, min(1.0, value))
+
+
+def score_candidates(
+    candidates: Sequence[Candidate], weights: Mapping[str, float]
+) -> list[Scored]:
+    """Score a well's candidates: the weighted mean of six parts, each in [0, 1], in the candidates' order.
+
+    The *pool* is the candidates given, less those that have no ``sharpness`` or
+    ``background`` while that weight is above 0 (the caller counts the difference).
+    Every part is taken over the pool, before ``min_cells``, so that a rank does not
+    depend on how many cells a field holds:
+
+    * ``density``: the density over the pool's largest (0 when that is 0);
+    * ``isolation``: the share of the field's wanted cells that are isolated;
+    * ``purity``: wanted cells over all cells (doublets and debris lower it);
+    * ``wall``: the distance to the wall over the pool's largest (0 when that is 0);
+    * ``sharpness``: its ``percentile_rank`` among the pool;
+    * ``background``: one less the ``percentile_rank`` of the background (darker is
+      better).
+
+    The score divides by the sum of the weights, so that scaling all of them changes
+    nothing and a weight is read as a share.
+    """
+    pool = [
+        c
+        for c in candidates
+        if not (
+            (weights["sharpness"] > 0.0 and c.sharpness is None)
+            or (weights["background"] > 0.0 and c.background is None)
+        )
+    ]
+    if not pool:
+        return []
+    densest = max(c.density_per_mm2 for c in pool)
+    widest = max(c.wall_um for c in pool)
+    sharpnesses = [c.sharpness for c in pool if c.sharpness is not None]
+    backgrounds = [c.background for c in pool if c.background is not None]
+    total = sum(weights[name] for name in WEIGHT_NAMES)
+    scored: list[Scored] = []
+    for c in pool:
+        parts = {
+            "density": _unit(c.density_per_mm2 / densest) if densest > 0.0 else 0.0,
+            "isolation": c.isolated / c.n_wanted if c.n_wanted else 0.0,
+            "purity": c.n_wanted / c.n_all if c.n_all else 0.0,
+            "wall": _unit(c.wall_um / widest) if widest > 0.0 else 0.0,
+            "sharpness": (
+                percentile_rank(c.sharpness, sharpnesses)
+                if c.sharpness is not None
+                else 0.0
+            ),
+            "background": (
+                1.0 - percentile_rank(c.background, backgrounds)
+                if c.background is not None
+                else 0.0
+            ),
+        }
+        score = sum(weights[name] * parts[name] for name in WEIGHT_NAMES) / total
+        scored.append(Scored(c, _unit(score), parts))
+    return scored

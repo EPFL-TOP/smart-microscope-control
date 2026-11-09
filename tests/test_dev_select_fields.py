@@ -487,3 +487,286 @@ def test_a_frame_that_could_not_be_read_has_no_pixel_features(
     (unasked,), _ = _candidates(sf, seed, stats={})
     assert (unread.sharpness, unread.background) == (None, None)
     assert (unasked.sharpness, unasked.background) == (None, None)
+
+
+# --------------------------------------------------------------------- score
+
+
+def _cand(
+    sf: ModuleType,
+    frame: int,
+    *,
+    n_wanted: int = 1,
+    n_all: int | None = None,
+    isolated: int = 0,
+    wall_um: float = 1000.0,
+    sharpness: float | None = None,
+    background: float | None = None,
+):
+    """A candidate with the features a test gives it; the density is the wanted count over a 0.12 mm2 field."""
+    return sf.Candidate(
+        frame=frame,
+        name=f"A1_{frame:04d}",
+        x_um=float(frame),
+        y_um=0.0,
+        z_um=None,
+        pfs_offset=None,
+        focus="locked",
+        counts={"single": n_wanted},
+        n_all=n_wanted if n_all is None else n_all,
+        n_wanted=n_wanted,
+        density_per_mm2=n_wanted / 0.12,
+        isolated=isolated,
+        nn_median_um=None,
+        nn_min_um=None,
+        wall_um=wall_um,
+        sharpness=sharpness,
+        background=background,
+    )
+
+
+def _weights(sf: ModuleType, **given: float) -> dict[str, float]:
+    """All six weights at 0 but the ones given."""
+    return {name: 0.0 for name in sf.WEIGHT_NAMES} | given
+
+
+def _ranked(scored) -> list[int]:
+    """The frames by score, best first, ties to the lowest frame."""
+    return [
+        s.candidate.frame
+        for s in sorted(scored, key=lambda s: (-s.score, s.candidate.frame))
+    ]
+
+
+def test_default_weights_rank_by_the_number_of_cells(sf: ModuleType) -> None:
+    # What route prefers: the field with the most wanted cells, ties to the lowest frame.
+    counts = [3, 7, 7, 0, 5]
+    candidates = [_cand(sf, k, n_wanted=n) for k, n in enumerate(counts)]
+    scored = sf.score_candidates(candidates, sf.parse_weights([]))
+    assert _ranked(scored) == [1, 2, 4, 0, 3]
+
+
+def test_the_defaults_are_the_density_alone_and_a_given_weight_replaces_only_its_own(
+    sf: ModuleType,
+) -> None:
+    assert sf.parse_weights([]) == _weights(sf, density=1.0)
+    assert sf.parse_weights(["isolation=2.5", "wall=0"]) == _weights(
+        sf, density=1.0, isolation=2.5
+    )
+    assert sf.parse_weights(["density=0", "purity=3"]) == _weights(sf, purity=3.0)
+
+
+def test_a_weight_of_zero_removes_a_feature(sf: ModuleType) -> None:
+    few = [_cand(sf, 0, n_wanted=4, isolated=0), _cand(sf, 1, n_wanted=4, isolated=0)]
+    many = [_cand(sf, 0, n_wanted=4, isolated=0), _cand(sf, 1, n_wanted=4, isolated=4)]
+    weights = _weights(sf, density=1.0)
+    assert [s.score for s in sf.score_candidates(few, weights)] == [
+        s.score for s in sf.score_candidates(many, weights)
+    ]
+    with_isolation = _weights(sf, density=1.0, isolation=1.0)
+    scores = [s.score for s in sf.score_candidates(many, with_isolation)]
+    assert scores[1] > scores[0]
+
+
+def test_weights_are_normalised_so_that_the_score_stays_in_zero_one(
+    sf: ModuleType,
+) -> None:
+    candidates = [
+        _cand(
+            sf,
+            0,
+            n_wanted=2,
+            n_all=4,
+            isolated=1,
+            wall_um=500.0,
+            sharpness=0.1,
+            background=900.0,
+        ),
+        _cand(
+            sf,
+            1,
+            n_wanted=9,
+            n_all=9,
+            isolated=9,
+            wall_um=3000.0,
+            sharpness=0.9,
+            background=100.0,
+        ),
+        _cand(
+            sf, 2, n_wanted=0, n_all=0, wall_um=10.0, sharpness=0.5, background=500.0
+        ),
+    ]
+    base = {
+        "density": 1.0,
+        "isolation": 2.0,
+        "purity": 0.5,
+        "wall": 1.0,
+        "sharpness": 1.5,
+        "background": 0.25,
+    }
+    scored = sf.score_candidates(candidates, base)
+    tenfold = sf.score_candidates(candidates, {k: 10.0 * v for k, v in base.items()})
+    assert all(0.0 <= s.score <= 1.0 for s in scored)
+    assert [s.score for s in tenfold] == pytest.approx([s.score for s in scored])
+    # Field 1 is the best on the four counted parts (1 each) and on the two ranks the
+    # best of three (5/6 each; the darkest background is 1 - 1/6).
+    expected = (1.0 + 2.0 + 0.5 + 1.0 + (1.5 + 0.25) * (5.0 / 6.0)) / 6.25
+    assert scored[1].score == pytest.approx(expected)
+    assert all(0.0 <= p <= 1.0 for s in scored for p in s.parts.values())
+    assert set(scored[0].parts) == set(sf.WEIGHT_NAMES)
+    # Two wanted cells of four, one of them isolated: half of the wanted ones, half pure.
+    assert scored[0].parts["isolation"] == 0.5
+    assert scored[0].parts["purity"] == 0.5
+
+
+def test_the_isolation_weight_prefers_the_field_of_isolated_cells(
+    tmp_path: Path, sf: ModuleType
+) -> None:
+    # Field A (frame 0) holds 6 cells within 8 um of each other, field B (frame 1) holds 4
+    # cells 80 um apart. Density alone chooses A; isolation=5 chooses B.
+    def cells(scan):
+        a, b = scan.frames[0], scan.frames[1]
+        crowd = [(a.x_um + 2.0 * i, a.y_um) for i in range(6)]
+        spread = [(b.x_um - 120.0 + 80.0 * i, b.y_um + 20.0) for i in range(4)]
+        return [
+            Cell(
+                well="A1",
+                x_um=x,
+                y_um=y,
+                label="single",
+                score=0.9,
+                frame=0,
+                box_px=(0.0, 0.0, 10.0, 10.0),
+            )
+            for x, y in crowd + spread
+        ]
+
+    seed = seed_run(tmp_path, cells=cells, rows=1, columns=2, overlap=0.0)
+    found, _ = _candidates(sf, seed, min_spacing_um=30.0)
+    assert [(c.n_wanted, c.isolated) for c in found] == [(6, 0), (4, 4)]
+    density_only = sf.score_candidates(found, sf.parse_weights([]))
+    isolation = sf.score_candidates(found, sf.parse_weights(["isolation=5"]))
+    assert _ranked(density_only) == [0, 1]
+    assert _ranked(isolation) == [1, 0]
+
+
+def test_the_purity_weight_penalises_doublets_and_debris(sf: ModuleType) -> None:
+    clean = _cand(sf, 0, n_wanted=5, n_all=5)
+    dirty = _cand(sf, 1, n_wanted=5, n_all=10)
+    scored = sf.score_candidates([clean, dirty], _weights(sf, purity=1.0))
+    assert [s.parts["purity"] for s in scored] == [1.0, 0.5]
+    assert _ranked(scored) == [0, 1]
+    flat = sf.score_candidates([clean, dirty], _weights(sf, density=1.0))
+    assert flat[0].score == flat[1].score
+    nothing = sf.score_candidates(
+        [_cand(sf, 2, n_wanted=0, n_all=0)], _weights(sf, purity=1.0)
+    )
+    assert nothing[0].parts["purity"] == 0.0
+
+
+def test_the_wall_weight_prefers_the_centre(sf: ModuleType) -> None:
+    edge = _cand(sf, 0, wall_um=100.0)
+    middle = _cand(sf, 1, wall_um=2500.0)
+    scored = sf.score_candidates([edge, middle], _weights(sf, wall=1.0))
+    assert [s.parts["wall"] for s in scored] == pytest.approx([0.04, 1.0])
+    assert _ranked(scored) == [1, 0]
+
+
+def test_sharpness_and_background_are_ranks_within_the_well(sf: ModuleType) -> None:
+    candidates = [
+        _cand(sf, k, sharpness=value, background=value)
+        for k, value in enumerate([1.0, 2.0, 3.0])
+    ]
+    sharp = sf.score_candidates(candidates, _weights(sf, sharpness=1.0))
+    dark = sf.score_candidates(candidates, _weights(sf, background=1.0))
+    assert [s.parts["sharpness"] for s in sharp] == pytest.approx([1 / 6, 3 / 6, 5 / 6])
+    assert [s.parts["background"] for s in dark] == pytest.approx([5 / 6, 3 / 6, 1 / 6])
+    tied = [_cand(sf, k, sharpness=2.0, background=2.0) for k in range(3)]
+    assert [
+        s.parts["sharpness"]
+        for s in sf.score_candidates(tied, _weights(sf, sharpness=1.0))
+    ] == [0.5] * 3
+    assert [
+        s.parts["background"]
+        for s in sf.score_candidates(tied, _weights(sf, background=1.0))
+    ] == [0.5] * 3
+
+
+def test_percentile_rank_counts_the_values_below_and_half_the_ties(
+    sf: ModuleType,
+) -> None:
+    values = [10.0, 20.0, 20.0, 40.0]
+    assert sf.percentile_rank(5.0, values) == 0.0
+    assert sf.percentile_rank(10.0, values) == pytest.approx(0.5 / 4)
+    assert sf.percentile_rank(20.0, values) == pytest.approx((1 + 1.0) / 4)
+    assert sf.percentile_rank(40.0, values) == pytest.approx(3.5 / 4)
+    assert sf.percentile_rank(99.0, values) == 1.0
+
+
+def test_an_unreadable_frame_drops_the_candidate_only_when_a_pixel_weight_is_set(
+    sf: ModuleType,
+) -> None:
+    candidates = [
+        _cand(sf, 0, n_wanted=3, sharpness=0.5, background=100.0),
+        _cand(sf, 1, n_wanted=9),  # not read: no pixel features
+        _cand(sf, 2, n_wanted=2, sharpness=0.2, background=200.0),
+    ]
+    assert [
+        s.candidate.frame
+        for s in sf.score_candidates(candidates, _weights(sf, density=1.0))
+    ] == [0, 1, 2]
+    for name in ("sharpness", "background"):
+        scored = sf.score_candidates(
+            candidates, _weights(sf, density=1.0, **{name: 1.0})
+        )
+        assert [s.candidate.frame for s in scored] == [0, 2]
+    # The pool the ranks are taken over is the one that was kept.
+    kept = sf.score_candidates(candidates, _weights(sf, sharpness=1.0))
+    assert [s.parts["sharpness"] for s in kept] == [0.75, 0.25]
+
+
+def test_the_density_part_is_over_the_pools_largest_and_is_zero_for_an_empty_pool(
+    sf: ModuleType,
+) -> None:
+    scored = sf.score_candidates(
+        [_cand(sf, 0, n_wanted=2), _cand(sf, 1, n_wanted=8)], _weights(sf, density=1.0)
+    )
+    assert [s.parts["density"] for s in scored] == pytest.approx([0.25, 1.0])
+    empty = sf.score_candidates([_cand(sf, 0, n_wanted=0)], _weights(sf, density=1.0))
+    assert empty[0].parts["density"] == 0.0
+    assert empty[0].score == 0.0
+
+
+@pytest.mark.parametrize(
+    ("pair", "reason"),
+    [
+        ("density=-1", "from 0 to"),
+        ("density=nan", "from 0 to"),
+        ("density=inf", "from 0 to"),
+        ("density=1e7", "from 0 to"),
+        ("density=abc", "from 0 to"),
+        ("density", "NAME=VALUE"),
+    ],
+)
+def test_a_negative_or_non_finite_weight_is_refused(
+    sf: ModuleType, pair: str, reason: str
+) -> None:
+    with pytest.raises(sf.Refusal, match=reason):
+        sf.parse_weights([pair])
+
+
+def test_all_weights_zero_is_refused(sf: ModuleType) -> None:
+    with pytest.raises(sf.Refusal, match="at least one weight"):
+        sf.parse_weights(["density=0"])
+
+
+def test_an_unknown_weight_name_is_refused_with_the_names(sf: ModuleType) -> None:
+    with pytest.raises(sf.Refusal) as info:
+        sf.parse_weights(["sharpnes=1"])
+    for name in sf.WEIGHT_NAMES:
+        assert name in str(info.value)
+
+
+def test_a_weight_given_twice_is_refused(sf: ModuleType) -> None:
+    with pytest.raises(sf.Refusal, match="twice"):
+        sf.parse_weights(["wall=1", "wall=2"])
