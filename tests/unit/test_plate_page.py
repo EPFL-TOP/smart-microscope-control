@@ -41,7 +41,7 @@ else:
 import numpy as np
 import useq
 from bokeh.events import Tap
-from bokeh.models import Circle, Rect
+from bokeh.models import Circle, Line, Rect
 from pymmcore_plus import CMMCorePlus
 
 import smc.ui.plate_page as plate_page
@@ -50,15 +50,17 @@ from smc.hardware.capabilities import Camera, LightSource, XYStage
 from smc.hardware.profile import Profile
 from smc.plugins.api import PluginParams, PluginResult, RunContext
 from smc.plugins.registry import GROUP
+from smc.plugins.scan_plan.algorithm import plan_fields
 from smc.plugins.slots import (
     DensityResult,
     DensityWell,
     PlateResult,
+    ScanPlanResult,
     WallFrame,
     WallImages,
     WellFit,
 )
-from smc.run import RunDocument, StageRecord, StageStatus, write_stage
+from smc.run import ReadRecord, RunDocument, StageRecord, StageStatus, write_stage
 from smc.testing import FakeCore
 from smc.ui.controller import (
     LIVE_PERIOD_S,
@@ -205,8 +207,13 @@ def _seed(
     result: PluginResult,
     *,
     minute: int = 0,
+    reads: dict[str, ReadRecord | None] | None = None,
 ) -> None:
-    """A done record of ``plugin``; a plate result's params name its plate, as the runner writes them (m5 §11.3)."""
+    """A done record of ``plugin``; a plate result's params name its plate, as the runner writes them (m5 §11.3).
+
+    ``reads`` names the attempt of each slot the record read (``a<minute>`` of the
+    provider): a record that read an older attempt than the current one is stale.
+    """
     then = T0 + timedelta(minutes=minute)
     write_stage(
         run_doc,
@@ -222,6 +229,7 @@ def _seed(
             smc_version="0",
             params={"plate": result.plate} if isinstance(result, PlateResult) else {},
             result=result.model_dump(mode="json"),
+            reads=reads or {},
         ),
     )
 
@@ -1504,6 +1512,208 @@ def test_the_route_is_drawn_in_order(run_doc: Path, page: PlatePage) -> None:
     assert view.route_source.data["x"] == [10.0, 20.0, 30.0]
     assert view.route_source.data["y"] == [1.0, 2.0, 3.0]
     assert view.route_source.data["order"] == [0, 1, 2]
+
+
+# --- the scan plan's fields on the map (m5 §14, #320) ---------------------------------
+
+
+class PlanParams(PluginParams):
+    wells: str = ""
+
+
+class PlanTool:
+    """Registered as ``scan-plan``: ends at once with a plan, so a second tab can see its end."""
+
+    name = provides = "scan-plan"
+    summary = "A test scan plan."
+    Params = PlanParams
+    Result = ScanPlanResult
+    requires: tuple[type, ...] = ()
+    reads: tuple[str, ...] = ()
+    reads_optional: tuple[str, ...] = ()
+
+    def run(
+        self, microscope: Any, params: PlanParams, ctx: RunContext
+    ) -> ScanPlanResult:
+        return _scan_plan_result()
+
+
+def _scan_plan_result(
+    wells: tuple[str, ...] = ("B11", "B2", "A1"),
+    *,
+    fov_um: tuple[float, float] = (512.0, 512.0),
+) -> ScanPlanResult:
+    """A scan plan of 2 x 2 fields in each of ``wells`` (visiting order, not alphabetical), as test_report.py builds one."""
+    plate = PlateResult(
+        plate="96-well",
+        a1_center_xy_um=(0.0, 0.0),
+        rotation_deg=0.0,
+        method="seed",
+        residual_um=None,
+        scale_error=None,
+        n_refs=0,
+    )
+    half_w, half_h = fov_um[0] / 2, fov_um[1] / 2
+    plate_plan, fields = plan_fields(
+        plate,
+        list(wells),
+        fov_um=fov_um,
+        footprint_of=lambda x, y: [
+            (x - half_w, y - half_h),
+            (x + half_w, y - half_h),
+            (x + half_w, y + half_h),
+            (x - half_w, y + half_h),
+        ],
+        rows=2,
+        columns=2,
+        overlap=0.1,
+        clip_to_well=True,
+    )
+    return ScanPlanResult(
+        plate_plan=plate_plan,
+        wells=wells,
+        objective="Nikon 10X S Fluor",
+        pixel_size_um=1.0,
+        matrix_um_per_px=((1.0, 0.0), (0.0, -1.0)),
+        matrix_source="parameter",
+        image_shape_px=(512, 512),
+        fov_um=fov_um,
+        overlap=0.1,
+        rows=2,
+        columns=2,
+        fields=fields,
+        estimate_s=None,
+    )
+
+
+def test_the_map_draws_a_rectangle_for_each_planned_field_and_the_title_says_so(
+    run_doc: Path, page: PlatePage
+) -> None:
+    result = _scan_plan_result(fov_um=(600.0, 400.0))
+    assert len(result.fields) == 12
+    _seed(run_doc, "scan-plan", "scan-plan", result)
+    view = PlatePageView(page)
+    data = view.fields_source.data
+    # Width and height are the field of view's own two sides, in the plan's order.
+    assert data["x"] == [f.x_um for f in result.fields]
+    assert data["y"] == [f.y_um for f in result.fields]
+    assert data["w"] == [600.0] * 12
+    assert data["h"] == [400.0] * 12
+    assert view.figure.title.text == (
+        "96-well: nominal map (A1 at 0, 0, not turned), the plate is not registered"
+        "; scan plan: 12 fields in 3 wells"
+    )
+
+
+def test_the_title_of_a_registered_plate_gets_the_same_suffix(
+    run_doc: Path, page: PlatePage
+) -> None:
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    _seed(run_doc, "scan-plan", "scan-plan", _scan_plan_result(), minute=1)
+    view = PlatePageView(page)
+    assert view.figure.title.text == (
+        "96-well: the registered plate; scan plan: 12 fields in 3 wells"
+    )
+    # A page with no plan says nothing of one.
+    run_doc.unlink()
+    view.refresh()
+    assert (
+        view.figure.title.text
+        == "96-well: nominal map (A1 at 0, 0, not turned), the plate is not registered"
+    )
+
+
+def test_a_plan_over_the_bound_draws_no_field_and_the_title_says_why(
+    run_doc: Path, page: PlatePage
+) -> None:
+    base = _scan_plan_result()
+    big = base.model_copy(
+        update={"fields": tuple(base.fields[i % 12] for i in range(5001))}
+    )
+    _seed(run_doc, "scan-plan", "scan-plan", big)
+    view = PlatePageView(page)
+    assert view.fields_source.data == {"x": [], "y": [], "w": [], "h": []}
+    assert view.figure.title.text.endswith(
+        "; scan plan: 5001 fields in 3 wells, too many to draw (over 5000)"
+    )
+
+
+@pytest.mark.parametrize("how", ["stale", "missing"])
+def test_a_stale_or_missing_plan_clears_the_fields_on_the_next_refresh(
+    run_doc: Path, page: PlatePage, how: str
+) -> None:
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    _seed(
+        run_doc,
+        "scan-plan",
+        "scan-plan",
+        _scan_plan_result(),
+        minute=1,
+        reads={"plate": ReadRecord(plugin="plate-registration", attempt="a0")},
+    )
+    view = PlatePageView(page)
+    assert len(view.fields_source.data["x"]) == 12
+    if how == "stale":
+        # The plate was registered again: the plan read an attempt that is gone.
+        _seed(run_doc, "plate-registration", "plate", _plate(), minute=2)
+    else:
+        run_doc.unlink()
+    view.refresh()
+    assert view.fields_source.data == {"x": [], "y": [], "w": [], "h": []}
+    assert "scan plan" not in view.figure.title.text
+
+
+def test_the_fields_are_drawn_under_the_route_and_the_wells_keep_the_hover(
+    page: PlatePage,
+) -> None:
+    view = PlatePageView(page)
+
+    def order() -> tuple[int, int]:
+        renderers = view.figure.renderers
+        fields = [r for r in renderers if r.data_source is view.fields_source]
+        lines = [
+            r
+            for r in renderers
+            if r.data_source is view.route_source and isinstance(r.glyph, Line)
+        ]
+        assert len(fields) == len(lines) == 1
+        assert isinstance(fields[0].glyph, Rect)
+        assert fields[0] not in view.hover.renderers
+        return renderers.index(fields[0]), renderers.index(lines[0])
+
+    # The route is drawn over the fields: later in the list is on top at one level.
+    fields_at, route_at = order()
+    assert fields_at < route_at
+    assert view.hover.renderers == [view.wells_renderer]
+    assert view.wells_renderer.level == "underlay"
+    # A plate with square wells swaps the wells' renderer, and the fields stay where they were.
+    view.plate_select.value = "384-well"
+    fields_at, route_at = order()
+    assert fields_at < route_at
+    assert view.hover.renderers == [view.wells_renderer]
+
+
+def test_a_second_tab_draws_the_plan_the_first_ran(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # FM-151: the plan was made through the first tab, and the second draws it at its tick.
+    planner = EntryPoint(name="scan-plan", value=f"{__name__}:PlanTool", group=GROUP)
+    controller = PlatePage(fake_microscope, run_doc, entry_points=[planner])
+    try:
+        first, second = PlatePageView(controller), PlatePageView(controller)
+        controller.select_text("B11,B2,A1")
+        assert second.fields_source.data["x"] == []
+        first.on_run("scan-plan")
+        assert controller.join(10.0)
+        first.tick()
+        second.tick()
+        expected = _scan_plan_result()
+        assert len(second.fields_source.data["x"]) == 12
+        assert second.fields_source.data["x"] == [f.x_um for f in expected.fields]
+        assert second.fields_source.data == first.fields_source.data
+        assert second.figure.title.text.endswith("; scan plan: 12 fields in 3 wells")
+    finally:
+        controller.close()
 
 
 def test_the_stage_is_a_cross_at_its_position(
