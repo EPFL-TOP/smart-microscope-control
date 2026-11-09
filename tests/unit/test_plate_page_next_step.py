@@ -43,6 +43,7 @@ from smc.ui.guide import (
     WALLS_DRY_RUN,
     WALLS_NEED_CALIBRATION,
     walls_centres_problem,
+    walls_square_wells,
 )
 
 T0 = datetime(2026, 11, 2, 9, 0, tzinfo=timezone.utc)
@@ -934,6 +935,68 @@ def test_plate_walls_alone_in_its_slot_never_offers_the_plugins_default_plate(
         assert two.why == ("the run document has no plate yet", WALLS_STEP_WHY)
     finally:
         page.close()
+
+
+def test_plate_walls_alone_in_its_slot_offers_nothing_on_a_square_welled_plate(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # #375: with `plate-registration` not loaded, `plate-walls` is the first provider and
+    # so the step on any plate. On a 384-well plate the plugin refuses it before it moves
+    # and a failed record would replace a usable plate (§11.4): the page fills no pair
+    # (`plate`, `refs`), so no command a click or a terminal would run, and the reason is
+    # the plate's. (A profile's suggestion or a preset can still add a pair of its own,
+    # as under the placeholder plate; the step is blocked all the same.)
+    only = (Calibration, *(t for t in WORKFLOW if t is not Registration), Walls)
+    _calibrated(run_doc)
+    page = _walls_page(fake_microscope, run_doc, tools=only)
+    try:
+        round_plate = page.view().next_step
+        assert round_plate is not None
+        assert round_plate.plugin == "plate-walls"
+        assert list(round_plate.params) == page.page_params("plate-walls")
+        assert _pairs_of(round_plate.command) == list(round_plate.params)
+
+        page.choose_plate("384-well")  # drops the captures of the other plate
+        page.refs = CENTRES
+        square = page.view().next_step
+        assert square is not None
+        assert square.plugin == "plate-walls"
+        assert square.params == ()
+        assert square.blocked == walls_square_wells("384-well")
+        assert _pairs_of(square.command) == []
+        assert square.why == ("the run document has no plate yet",)
+        assert page.view().blocked["plate-walls"] == walls_square_wells("384-well")
+        # `_blocked` holds the same text and wins in the step, so the step's own reason
+        # is read where it is made (adversarial review of #375).
+        assert page._walls_step([]) == ([], walls_square_wells("384-well"))
+    finally:
+        page.close()
+
+
+def test_plate_walls_alone_in_its_slot_offers_nothing_on_a_dry_run_page(
+    fake_core: FakeCore, run_doc: Path
+) -> None:
+    # The same class as the square plate, and one helper: a dry-run page never offers
+    # the pairs of a tool whose plugin refuses a dry run (FM-182).
+    dry = Microscope.from_core(
+        cast("CMMCorePlus", fake_core), Profile.demo(), dry_run=True
+    )
+    try:
+        only = (Calibration, *(t for t in WORKFLOW if t is not Registration), Walls)
+        _calibrated(run_doc)
+        page = _walls_page(dry, run_doc, tools=only)
+        try:
+            step = page.view().next_step
+            assert step is not None
+            assert step.plugin == "plate-walls"
+            assert step.params == ()
+            assert step.blocked == WALLS_DRY_RUN
+            assert _pairs_of(step.command) == []
+            assert page._walls_step([]) == ([], WALLS_DRY_RUN)
+        finally:
+            page.close()
+    finally:
+        dry.close()
 
 
 def test_a_closed_stand_draws_the_step_the_captures_name_and_says_not_connected(

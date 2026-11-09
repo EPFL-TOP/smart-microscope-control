@@ -117,6 +117,7 @@ from smc.ui.guide import (
     scan_plan_card_lines,
     walls_card_lines,
     walls_centres_problem,
+    walls_square_wells,
 )
 
 if TYPE_CHECKING:
@@ -1332,12 +1333,18 @@ class PlatePage:
             ValueError: ``scan-plan`` with nothing selected, or with a selection
                 on another plate than the registered one; a tool that takes the
                 plate while nothing named it (``PLATE_NOT_CHOSEN``);
-                ``plate-walls`` with fewer than two centres captured or more than
-                six, after the plate's gate (m5 §12.3).
+                ``plate-walls`` on a dry-run page or a square-welled plate
+                (``_walls_refusal``), then with fewer than two centres captured or
+                more than six, after the plate's gate (m5 §12.3).
         """
         if _needs_plate(plugin) and not self._plate_chosen:
             raise ValueError(PLATE_NOT_CHOSEN)
         if plugin == "plate-walls":
+            # The click shows what the button's reason shows: the mode and the plate
+            # before the count (m5 §12.3, #375).
+            refusal = self._walls_refusal()
+            if refusal is not None:
+                raise ValueError(refusal)
             # One read of the captures for the count and the pairs: another tab may
             # capture between two reads of `self.refs`.
             refs = self.refs
@@ -1582,12 +1589,12 @@ class PlatePage:
             # stand's being closed is the reason that holds longer, so it came first.
             self._set_outcome(f"{plugin}: {PLATE_NOT_CHOSEN}")
             return
-        if plugin == "plate-walls" and self._dry_run:
-            # The plugin refuses a dry run too, but its refusal is a `failed` record,
-            # and the latest attempt decides the `plate` slot (m5 §11.4): a usable plate
-            # would be replaced by a failure. The page refuses first, nothing written,
-            # before the parameters are read (FM-169, m5 §12.3).
-            self._set_outcome(f"{plugin}: {WALLS_DRY_RUN}")
+        if plugin == "plate-walls" and (refusal := self._walls_refusal()) is not None:
+            # The plugin refuses a dry run and square wells too, but its refusal is a
+            # `failed` record, and the latest attempt decides the `plate` slot (m5
+            # §11.4): a usable plate would be replaced by a failure. The page refuses
+            # first, nothing written, before the parameters are read (FM-169, m5 §12.3).
+            self._set_outcome(f"{plugin}: {refusal}")
             return
         profile = self._profile.microscope.name
         dry_run = self._dry_run
@@ -3077,28 +3084,46 @@ class PlatePage:
             blocked=blocked.get(tool.name) or stuck,
         )
 
+    def _walls_refusal(self) -> str | None:
+        """Why the page does not run ``plate-walls`` in this mode or on this plate, or ``None`` (m5 §12.3, #375).
+
+        A dry run, then square wells: the two refusals of the plugin that depend on
+        what the page holds alone, asked before the calibration, the stand and the
+        centres. The plugin refuses both before it moves, but its refusal is a
+        ``failed`` record, and the latest attempt decides the ``plate`` slot (§11.4):
+        a usable plate would be replaced by a failure the page could foresee. One
+        source for the button's reason (``_blocked``), the click (``page_params``
+        and ``run()``) and the next step, so that they agree (FM-169, FM-182).
+
+        It reads the page's plate, never the pairs' ``plate=``: ``self._plate`` is a
+        name of ``useq``'s registry on every path that sets it (``choose_plate``,
+        ``_initial_plate``), so ``from_str`` cannot raise, and it costs a microsecond.
+        """
+        if self._dry_run:
+            return WALLS_DRY_RUN
+        if not useq.WellPlate.from_str(self._plate).circular_wells:
+            return walls_square_wells(self._plate)
+        return None
+
     def _walls_is_next(self, providers: Sequence[ToolView]) -> bool:
         """Whether ``plate-walls`` is the tool of the ``plate`` slot's step, not the first provider (m5 §12.4).
 
         All of these hold: the plate is chosen (else the registration's own reason
-        stays the step's); the page is not a dry run (FM-182: the plugin refuses a
-        dry run, so the page does not offer it there, as it does not offer ``scan``);
-        the stand can image, or is not connected (the step is then drawn for the
-        stand the operator is about to open); no wall is captured (touching walls is
-        ``plate-registration``'s own path); and the centres captured are a count the
-        tool takes. It reads the page's captures as ``_registration_step`` does,
-        and takes no lock.
-
-        The plate's wells are round too: the plugin fits circles and refuses a
-        square-welled plate (384, 1536) before anything moves, so the step stays
-        ``plate-registration``, which takes them (FM-182, found by the adversarial
-        review: the step offered the refused click, and again after it failed).
+        stays the step's); the page is not a dry run and the plate's wells are round
+        (``_walls_refusal``; FM-182: the plugin refuses both, so the page does not
+        offer it there, as it does not offer ``scan``; the step stays
+        ``plate-registration``, which takes a square-welled plate, found by the
+        adversarial review of #346); the stand can image, or is not connected (the
+        step is then drawn for the stand the operator is about to open); no wall is
+        captured (touching walls is ``plate-registration``'s own path); and the
+        centres captured are a count the tool takes. It reads the page's captures as
+        ``_registration_step`` does, and takes no lock.
         """
         if not any(p.name == "plate-walls" for p in providers):
             return False
-        if not self._plate_chosen or self._dry_run or self.walls:
+        if not self._plate_chosen or self.walls:
             return False
-        if not useq.WellPlate.from_str(self._plate).circular_wells:
+        if self._walls_refusal() is not None:
             return False
         microscope = self._microscope
         if microscope is not None:
@@ -3116,12 +3141,20 @@ class PlatePage:
         is the first provider of the slot (``plate-registration`` did not load). In
         the second case the plate may be the placeholder and the centres may be
         none: nothing is then offered, as ``_registration_step`` offers nothing
-        (m5 §11.3), and the sentence that says what to do is the step's. What
-        else can block it (the calibration, a closed stand) is the tool's own
+        (m5 §11.3), and the sentence that says what to do is the step's. The same
+        holds for a dry-run page and a square-welled plate (``_walls_refusal``): the
+        plugin refuses them, so the page fills no pair (``plate``, ``refs``) for it
+        (#375). A profile's suggestion or a preset may still add its own pairs after
+        this, in ``next_step``, as they do under the placeholder plate: the step is
+        blocked by the same reason, which is also the tool's own ``blocked`` and wins
+        there. What else can block it (the calibration, a closed stand) is that
         ``blocked``, which the step carries.
         """
         if not self._plate_chosen:
             return [], PLATE_NOT_CHOSEN
+        refusal = self._walls_refusal()
+        if refusal is not None:
+            return [], refusal
         refs = self.refs
         problem = walls_centres_problem(len(refs))
         if problem is not None:
@@ -3278,10 +3311,11 @@ class PlatePage:
         refuses to drop. A tool that cannot run at all says so before it offers a
         way to continue.
 
-        ``plate-walls`` has its own words in this order (m5 §12.3): a dry run after
-        the plate (the tool images the walls, which a dry run does not), the page's
-        own sentence when the document has no calibration at all, and the count of
-        centres after what the stand requires.
+        ``plate-walls`` has its own words in this order (m5 §12.3): a dry run and then
+        square wells after the plate (``_walls_refusal``: the tool images round
+        wells, which a dry run does not and a 384- or 1536-well plate does not
+        have), the page's own sentence when the document has no calibration at all,
+        and the count of centres after what the stand requires.
         """
         microscope = self._microscope
         if microscope is None:
@@ -3295,8 +3329,8 @@ class PlatePage:
                 if _needs_plate(name) and not self._plate_chosen
                 else None
             )
-            if reason is None and name == "plate-walls" and dry_run:
-                reason = WALLS_DRY_RUN
+            if reason is None and name == "plate-walls":
+                reason = self._walls_refusal()
             if reason is None:
                 reason = next(
                     (

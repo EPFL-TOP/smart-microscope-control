@@ -59,6 +59,7 @@ from smc.ui.guide import (
     wall_touches_note,
     walls_card_lines,
     walls_centres_problem,
+    walls_square_wells,
 )
 
 
@@ -594,6 +595,18 @@ def test_the_walls_texts_are_the_designs() -> None:
         "plate-walls reads the camera's calibration: run camera-calibration first "
         "(Set up), with the objective you register with in place, on a field with "
         "texture (a well's wall will do)"
+    )
+
+
+@pytest.mark.parametrize("plate", ["384-well", "1536-well"])
+def test_the_square_wells_reason_names_the_plate_and_says_to_register_with_plate_registration(
+    plate: str,
+) -> None:
+    # The plugin's own words (m5 §12.3, #375): the operator reads the same sentence
+    # beside the button as the plugin's refusal would have said.
+    assert walls_square_wells(plate) == (
+        f"plate-walls fits round wells, and the {plate} plate's are square: "
+        "register it with plate-registration"
     )
 
 
