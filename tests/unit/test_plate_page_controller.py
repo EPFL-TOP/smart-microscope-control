@@ -85,7 +85,11 @@ from smc.ui.controller import (
     PlatePage,
 )
 from smc.ui.frames import Frame
-from smc.ui.guide import walls_centres_problem
+from smc.ui.guide import (
+    WALLS_DRY_RUN,
+    WALLS_NEED_CALIBRATION,
+    walls_centres_problem,
+)
 
 T0 = datetime(2026, 10, 29, 9, 0, tzinfo=timezone.utc)
 PITCH_96_UM = 9000.0
@@ -1900,6 +1904,177 @@ def test_the_plates_gate_comes_before_the_count_for_plate_walls(
     # Unchosen and uncaptured: the plate is the first thing the operator is told.
     with _refuses(ValueError, PLACEHOLDER_REFUSAL):
         page.page_params("plate-walls")
+
+
+def _walls_page(
+    microscope: Microscope,
+    run_doc: Path,
+    *,
+    centres: int = 2,
+    calibrated: bool = True,
+    chosen: bool = True,
+) -> PlatePage:
+    """A page with the real ``plate-walls`` and ``camera-calibration``, in one state of §12.3's list.
+
+    The calibration is a record the document calls usable (the page reads its state,
+    never its matrix); the centres are captured on the stage at distinct places.
+    """
+    if calibrated:
+        _seed(run_doc, "camera-calibration", "camera-calibration")
+    page = _stood_page(microscope, run_doc, "plate-walls", "camera-calibration")
+    if chosen:
+        page.choose_plate("96-well")
+    stage = microscope.require(XYStage)
+    for index, well in enumerate(["B3", "D5", "F7", "H9", "A1", "C2"][:centres]):
+        stage.move_to_um(9000.0 * index, -9000.0 * index)
+        page.capture_centre(well)
+    return page
+
+
+def _walls_reason(page: PlatePage) -> str | None:
+    return page.view().blocked.get("plate-walls")
+
+
+def test_plate_walls_is_blocked_in_the_order_dry_run_calibration_stand_centres(
+    fake_microscope: Microscope, fake_core: FakeCore, run_doc: Path
+) -> None:
+    # §12.3: the stand closed, the placeholder plate, then a dry run, the calibration,
+    # the stand's capabilities, the centres. Each state alone, then two at once: the
+    # earlier reason wins, so the operator is told the one that holds longest.
+    dry = Microscope.from_core(
+        cast("CMMCorePlus", fake_core), Profile.demo(), dry_run=True
+    )
+    try:
+        # Each reason alone.
+        ok = _walls_page(fake_microscope, run_doc)
+        assert _walls_reason(ok) is None
+        ok.close()
+        run_doc.unlink()
+
+        none = _walls_page(fake_microscope, run_doc, centres=0)
+        assert _walls_reason(none) == walls_centres_problem(0)
+        none.close()
+        one = _walls_page(fake_microscope, run_doc, centres=1)
+        assert _walls_reason(one) == walls_centres_problem(1)
+        one.close()
+        seven_page = _walls_page(fake_microscope, run_doc, centres=2)
+        stage = fake_microscope.require(XYStage)
+        for index, well in enumerate(["A2", "A3", "A4", "A5", "A6"], start=2):
+            stage.move_to_um(9000.0 * index, 100.0)
+            seven_page.capture_centre(well)
+        assert _walls_reason(seven_page) == walls_centres_problem(7)
+        seven_page.close()
+        run_doc.unlink()
+
+        no_cal = _walls_page(fake_microscope, run_doc, calibrated=False)
+        assert _walls_reason(no_cal) == WALLS_NEED_CALIBRATION
+        with _replaced(fake_microscope, "has", _without(Camera)):
+            # No calibration and no camera: the calibration is asked for first.
+            assert _walls_reason(no_cal) == WALLS_NEED_CALIBRATION
+        no_cal.close()
+
+        no_camera = _walls_page(fake_microscope, run_doc, centres=0)
+        with _replaced(fake_microscope, "has", _without(Camera)):
+            # A stand that cannot image is told before the centres it lacks.
+            assert _walls_reason(no_camera) == "this stand has no Camera"
+        no_camera.close()
+        run_doc.unlink()
+
+        # A dry run: the plate's reason first, then the dry run ahead of the rest.
+        unchosen = _stood_page(dry, run_doc, "plate-walls", "camera-calibration")
+        assert _walls_reason(unchosen) == PLACEHOLDER_REFUSAL
+        unchosen.close()
+        dry_page = _walls_page(dry, run_doc, centres=0, calibrated=False)
+        assert _walls_reason(dry_page) == WALLS_DRY_RUN
+        dry_page.close()
+    finally:
+        dry.close()
+
+    # The stand closed is the reason ahead of all of them.
+    closed = PlatePage.closed(
+        fake_microscope.profile, run_doc, entry_points=_real("plate-walls")
+    )
+    try:
+        assert _walls_reason(closed) == "the stand is not connected"
+    finally:
+        closed.close()
+
+
+def test_with_no_calibration_the_reason_says_to_run_camera_calibration(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _walls_page(fake_microscope, run_doc, calibrated=False)
+    try:
+        # The page's own sentence, not the run document's, which is for a terminal.
+        assert _walls_reason(page) == WALLS_NEED_CALIBRATION
+        assert "smc run --list" not in WALLS_NEED_CALIBRATION
+    finally:
+        page.close()
+
+
+def test_an_unusable_calibration_keeps_the_run_documents_words(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # A calibration that exists and is of another stand is not "run camera-calibration
+    # first": the document says what is wrong with it, as it does for every tool.
+    _seed(run_doc, "camera-calibration", "camera-calibration", profile="lightsheet")
+    page = _walls_page(fake_microscope, run_doc, calibrated=False)
+    try:
+        expected = RunDocument.load_or_new(run_doc).unusable(
+            "camera-calibration", profile="demo", dry_run=False
+        )
+        assert expected is not None
+        assert _walls_reason(page) == expected
+        assert _walls_reason(page) != WALLS_NEED_CALIBRATION
+    finally:
+        page.close()
+
+
+def test_a_dry_run_page_refuses_plate_walls_in_the_controller_and_writes_nothing(
+    fake_core: FakeCore, run_doc: Path
+) -> None:
+    dry = Microscope.from_core(
+        cast("CMMCorePlus", fake_core), Profile.demo(), dry_run=True
+    )
+    try:
+        # A usable plate, as a real registration left it: the plugin's own refusal of a
+        # dry run would be a `failed` record that replaces it (§11.4).
+        _seed(run_doc, "plate-registration", "plate", _plate())
+        _seed(run_doc, "camera-calibration", "camera-calibration", minute=1)
+        page = _walls_page(dry, run_doc, centres=2, calibrated=False, chosen=False)
+        try:
+            before = run_doc.read_bytes()
+            # Pairs that the parameters would refuse: the refusal is the dry run's,
+            # which comes before anything is read (FM-169).
+            page.run("plate-walls", ["bogus=1"])
+            assert page.status().running is None
+            assert page.status().outcome == f"plate-walls: {WALLS_DRY_RUN}"
+            assert run_doc.read_bytes() == before
+            provider = RunDocument.load_or_new(run_doc).provider("plate")
+            assert provider is not None
+            assert provider.plugin == "plate-registration"
+            assert provider.status is StageStatus.done
+        finally:
+            page.close()
+    finally:
+        dry.close()
+
+
+def test_the_plates_refusal_comes_before_a_dry_runs_for_plate_walls(
+    fake_core: FakeCore, run_doc: Path
+) -> None:
+    dry = Microscope.from_core(
+        cast("CMMCorePlus", fake_core), Profile.demo(), dry_run=True
+    )
+    try:
+        page = _stood_page(dry, run_doc, "plate-walls")
+        try:
+            page.run("plate-walls", [])
+            assert page.status().outcome == f"plate-walls: {PLACEHOLDER_REFUSAL}"
+        finally:
+            page.close()
+    finally:
+        dry.close()
 
 
 # --- the plate the page starts with (m5 §11.3, #332) --------------------------------

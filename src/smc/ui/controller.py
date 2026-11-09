@@ -99,6 +99,8 @@ from smc.ui.guide import (
     DRY_RUN_NO_FRAME,
     PLATE_NOT_CHOSEN,
     SELECT_WELLS,
+    WALLS_DRY_RUN,
+    WALLS_NEED_CALIBRATION,
     NextStep,
     command_line,
     next_slot,
@@ -1376,6 +1378,13 @@ class PlatePage:
             # still arrives here, and so does a call that spells `plate=` itself. The
             # stand's being closed is the reason that holds longer, so it came first.
             self._set_outcome(f"{plugin}: {PLATE_NOT_CHOSEN}")
+            return
+        if plugin == "plate-walls" and self._dry_run:
+            # The plugin refuses a dry run too, but its refusal is a `failed` record,
+            # and the latest attempt decides the `plate` slot (m5 §11.4): a usable plate
+            # would be replaced by a failure. The page refuses first, nothing written,
+            # before the parameters are read (FM-169, m5 §12.3).
+            self._set_outcome(f"{plugin}: {WALLS_DRY_RUN}")
             return
         profile = self._profile.microscope.name
         dry_run = self._dry_run
@@ -2990,6 +2999,11 @@ class PlatePage:
         checkpoint that ``smc run --resume`` could continue (#252), which ``run()``
         refuses to drop. A tool that cannot run at all says so before it offers a
         way to continue.
+
+        ``plate-walls`` has its own words in this order (m5 §12.3): a dry run after
+        the plate (the tool images the walls, which a dry run does not), the page's
+        own sentence when the document has no calibration at all, and the count of
+        centres after what the stand requires.
         """
         microscope = self._microscope
         if microscope is None:
@@ -3003,6 +3017,8 @@ class PlatePage:
                 if _needs_plate(name) and not self._plate_chosen
                 else None
             )
+            if reason is None and name == "plate-walls" and dry_run:
+                reason = WALLS_DRY_RUN
             if reason is None:
                 reason = next(
                     (
@@ -3012,6 +3028,15 @@ class PlatePage:
                     ),
                     None,
                 )
+                if (
+                    reason is not None
+                    and name == "plate-walls"
+                    and doc.provider("camera-calibration") is None
+                ):
+                    # The document's own sentence is for a terminal, and the tool is
+                    # one region up: a calibration that exists keeps the document's
+                    # words (another stand, a dry run, stale).
+                    reason = WALLS_NEED_CALIBRATION
             if reason is None:
                 reason = next(
                     (
@@ -3024,6 +3049,8 @@ class PlatePage:
                     ),
                     None,
                 )
+            if reason is None and name == "plate-walls":
+                reason = walls_centres_problem(len(self.refs))
             if reason is None:
                 kept = reachable_checkpoint(name, doc, profile=profile, dry_run=dry_run)
                 if kept is not None:
