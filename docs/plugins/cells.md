@@ -134,7 +134,9 @@ spaced (20 by default; all, when there are fewer), and writes a folder that
 run document's file name, never its path; the scan's objective, pixel size and frame
 shape; for each image its frame file, well and stage position; the draft's detector
 and the weights' file name and SHA-256). A folder that exists and is not empty is
-refused: the owner's annotations are never overwritten. The draft is the model's
+refused: the owner's annotations are never overwritten. If a frame cannot be copied
+(another program holds it, after five tries), what the export made is removed and the
+message names the frame, so the same command can be run again. The draft is the model's
 boxes from a score of 0.3 (`--prefill model`, the default; `--prefill blobs` and
 `--prefill none` are the others), each marked `auto`: a proposal to confirm.
 
@@ -152,8 +154,7 @@ boxes are still the draft. About 15 frames are planned for the first scan.
 **3. Measure.**
 
 ```text
-python scripts/dev/cells_check.py measure local/cells-check/<date> \
-    --model-um-per-px native,0.35,0.49 --percentiles 0.5:99.5,1:99 --json numbers.json
+python scripts/dev/cells_check.py measure local/cells-check/<date> --model-um-per-px native,0.35,0.49 --percentiles 0.5:99.5,1:99 --json numbers.json
 ```
 
 For the blob detector (one configuration) and for each pixel size and each pair of

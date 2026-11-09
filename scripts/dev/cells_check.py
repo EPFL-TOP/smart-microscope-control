@@ -22,6 +22,7 @@ Exit codes: 0 when everything asked ran, 1 when something is explained on stderr
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -62,7 +63,7 @@ from smc.plugins.cells.evaluate import (
 from smc.plugins.errors import PluginRunError
 from smc.plugins.slots import ScanFrame, ScanResult, load_frame
 from smc.run import RunDocument, RunDocumentError, StageStatus
-from smc.run.files import resolve_in_run
+from smc.run.files import resolve_in_run, retry_on_permission_error
 
 #: COCO's category ids, as ``nikon-control`` trains and reviews with them.
 CATEGORIES = {"single": 1, "doublet": 2, "debris": 3}
@@ -322,8 +323,8 @@ def _check_out_dir(out_dir: Path) -> None:
             raise CheckError(f"{out_dir} is a file, not a folder")
         if any(out_dir.iterdir()):
             raise CheckError(
-                f"{out_dir} is not empty: the annotations in it are never overwritten; "
-                f"give a new folder"
+                f"{out_dir} is not empty: what is in it is never overwritten (it may "
+                f"be the owner's annotations); give a new folder"
             )
 
 
@@ -494,17 +495,14 @@ def _export(args: argparse.Namespace) -> int:
             for name, frame in zip(names, frames, strict=True)
         ],
     }
+    created = not out_dir.exists()
     try:
-        (out_dir / "images").mkdir(parents=True, exist_ok=True)
-        (out_dir / "annotations").mkdir(parents=True, exist_ok=True)
-        for source, name in zip(sources, names, strict=True):
-            shutil.copyfile(source, out_dir / "images" / name)
-        (out_dir / "annotations" / "val.json").write_text(
-            _dumps(coco), encoding="utf-8"
-        )
-        (out_dir / "manifest.json").write_text(_dumps(manifest), encoding="utf-8")
-    except OSError as exc:
-        raise CheckError(f"cannot write in {out_dir} ({exc.strerror or exc})") from exc
+        _write_dataset(out_dir, sources, frames, names, coco, manifest)
+    except CheckError:
+        # The same command must be runnable again: a half-made folder would be
+        # refused as not empty, and it holds nothing of the owner's yet.
+        _take_back(out_dir, created=created)
+        raise
 
     wells = list(dict.fromkeys(frame.well for frame in frames))
     _say(f"exported {len(frames)} frames of {', '.join(wells)} to {out_dir}")
@@ -517,12 +515,76 @@ def _export(args: argparse.Namespace) -> int:
         )
     )
     _say("next, in the review page:")
-    _say(f"  nikon-control-dashboard --data-dir {out_dir.parent} --show")
+    _say(f"  nikon-control-dashboard --data-dir {_quote(out_dir.parent)} --show")
     _say(
         "  open /review, correct the boxes, mark each frame you checked as reviewed, save"
     )
-    _say(f"then: python scripts/dev/cells_check.py measure {out_dir}")
+    _say(f"then: python scripts/dev/cells_check.py measure {_quote(out_dir)}")
     return 0
+
+
+def _quote(path: Path) -> str:
+    """A path as the owner pastes it into a console: in double quotes when it holds a space.
+
+    cmd, PowerShell and POSIX shells all read double quotes, and a folder under
+    ``C:\\Users\\<first name> <last name>`` is two words without them. A character
+    outside ASCII is still shown as an escape (the output is ASCII), so such a path
+    is for reading, and the lines are for pasting only where the path is plain.
+    """
+    text = str(path)
+    return f'"{text}"' if any(c.isspace() for c in text) else text
+
+
+def _write_dataset(
+    out_dir: Path,
+    sources: Sequence[Path],
+    frames: Sequence[ScanFrame],
+    names: Sequence[str],
+    coco: dict[str, Any],
+    manifest: dict[str, Any],
+) -> None:
+    """Make the folder: the frames copied unchanged, then the two JSON files.
+
+    Raises:
+        CheckError: A frame cannot be copied (the message names it, not the folder:
+            the file that is held is the source) or a file cannot be written.
+    """
+    images = out_dir / "images"
+    try:
+        images.mkdir(parents=True, exist_ok=True)
+        (out_dir / "annotations").mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise CheckError(f"cannot write in {out_dir} ({exc.strerror or exc})") from exc
+    for source, name, frame in zip(sources, names, frames, strict=True):
+        target = images / name
+        try:
+            # Antivirus or a sync client may hold a frame the scan wrote a moment ago (FM-24).
+            retry_on_permission_error(
+                lambda source=source, target=target: shutil.copyfile(source, target)
+            )
+        except OSError as exc:
+            raise CheckError(
+                f"cannot copy frame file {frame.file} ({exc.strerror or exc}); "
+                f"is another program using it?"
+            ) from exc
+    try:
+        (out_dir / "annotations" / "val.json").write_text(
+            _dumps(coco), encoding="utf-8"
+        )
+        (out_dir / "manifest.json").write_text(_dumps(manifest), encoding="utf-8")
+    except OSError as exc:
+        raise CheckError(f"cannot write in {out_dir} ({exc.strerror or exc})") from exc
+
+
+def _take_back(out_dir: Path, *, created: bool) -> None:
+    """Remove what a failed export made. The folder was absent or empty when it began, so all of it is ours."""
+    for name in ("images", "annotations"):
+        shutil.rmtree(out_dir / name, ignore_errors=True)
+    with contextlib.suppress(OSError):
+        (out_dir / "manifest.json").unlink(missing_ok=True)
+    if created:
+        with contextlib.suppress(OSError):
+            out_dir.rmdir()
 
 
 # -------------------------------------------------------------------- measure
@@ -539,7 +601,11 @@ class ReviewedImage:
 
 def _read_json(path: Path) -> Any:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        # utf-8-sig: Notepad before Windows 10 1903 saves "UTF-8" with a byte-order
+        # mark, and the owner may edit a file by hand (FM-80). The retry: the review
+        # page saved the file a moment ago and antivirus may hold it (FM-24).
+        data = retry_on_permission_error(path.read_bytes)
+        return json.loads(data.decode("utf-8-sig"))
     except (OSError, ValueError) as exc:
         raise CheckError(f"cannot read {path.name} ({exc})") from exc
 
@@ -600,7 +666,7 @@ def _reviewed_images(dataset: Path) -> tuple[list[ReviewedImage], int, list[str]
 
 def _read_image(path: Path, name: str) -> npt.NDArray[Any]:
     try:
-        pixels = np.asarray(tifffile.imread(path))
+        pixels = np.asarray(retry_on_permission_error(lambda: tifffile.imread(path)))
     except (OSError, ValueError, tifffile.TiffFileError) as exc:
         raise CheckError(f"image {name} cannot be read ({exc})") from exc
     if pixels.ndim != 2:

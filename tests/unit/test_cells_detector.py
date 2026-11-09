@@ -358,6 +358,13 @@ def test_a_pixel_size_that_is_not_finite_and_positive_is_refused(bad: float) -> 
         model_input_size_px((1412, 1412), 0.2756, bad)
 
 
+def test_preprocessing_takes_the_whole_range_of_percentiles() -> None:
+    """0 and 100 are the minimum and the maximum of the frame: a range, not an error."""
+    assert Preprocessing(percentiles=(0.0, 100.0)).percentiles == (0.0, 100.0)
+    assert Preprocessing(percentiles=(0.0, 0.1)).percentiles == (0.0, 0.1)
+    assert Preprocessing(percentiles=(99.9, 100.0)).percentiles == (99.9, 100.0)
+
+
 def test_preprocessing_refuses_percentiles_that_do_not_order() -> None:
     for bad in [(99.5, 0.5), (50.0, 50.0), (-1.0, 99.0), (1.0, 101.0)]:
         with pytest.raises(ValueError, match="percentiles"):

@@ -1119,3 +1119,529 @@ def test_the_files_are_written_as_ascii_json(check: ModuleType, tmp_path: Path) 
 
     for name in ("annotations/val.json", "manifest.json"):
         assert (out / name).read_bytes().isascii()
+
+
+# ------------------------------------------- what the adversarial review found (#342)
+#
+# One frame in every test above hid what a loop over frames does: the sums, the
+# numbering, the times. These use three frames with spots, none and spots, so that
+# a frame's boxes cannot be taken for another's.
+
+
+def _three_frames(tmp_path: Path) -> Path:
+    """A1 with a frame of spots, an empty one and a frame of spots."""
+    return _seed_run(
+        tmp_path,
+        [("A1", _frame(3)), ("A1", _frame(4, spots=False)), ("A1", _frame(5))],
+    )
+
+
+def _boxes_of(frame: npt.NDArray[Any]) -> list[list[float]]:
+    """What the blob detector finds on ``frame``, as COCO boxes: an oracle that reads nothing of the script."""
+    from smc.plugins.cells.detector import BlobDetector
+
+    return sorted(
+        [d.col0_px, d.row0_px, d.col1_px - d.col0_px, d.row1_px - d.row0_px]
+        for d in BlobDetector().detect(frame)
+    )
+
+
+def test_export_numbers_the_boxes_and_attaches_each_to_its_own_frame(
+    check: ModuleType, tmp_path: Path
+) -> None:
+    """``nikon-control`` keys a box by its id: a repeated id is one box, and a box on the wrong image is on the wrong frame."""
+    run_json = _three_frames(tmp_path)
+    out = tmp_path / "ref"
+
+    assert _export(check, run_json, out) == 0
+
+    coco = _val(out)
+    ids = [a["id"] for a in coco["annotations"]]
+    assert sorted(ids) == list(range(1, 9))
+    by_image: dict[int, list[list[float]]] = {}
+    for a in coco["annotations"]:
+        by_image.setdefault(a["image_id"], []).append(a["bbox"])
+    assert sorted(by_image) == [1, 3]  # the empty frame, image 2, has no box
+    scan_frames = [_frame(3), _frame(4, spots=False), _frame(5)]
+    for image_id in (1, 3):
+        assert sorted(by_image[image_id]) == _boxes_of(scan_frames[image_id - 1])
+        assert len(by_image[image_id]) == 4
+
+
+def test_measure_sums_the_confusions_of_every_reviewed_frame_and_times_them_apart(
+    check: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Three reviewed frames: the sums are of all of them, each reads its own boxes, and cold and warm differ."""
+    from types import SimpleNamespace
+
+    out = tmp_path / "ref"
+    assert _export(check, _three_frames(tmp_path), out) == 0
+    coco = _val(out)
+    for image in coco["images"]:
+        image["reviewed"] = True
+    _save_val(out, coco)
+    # The detector's clock: 1 s, 3 s and 5 s for the three frames.
+    ticks = iter([0.0, 1.0, 10.0, 13.0, 20.0, 25.0])
+    monkeypatch.setattr(
+        check, "time", SimpleNamespace(perf_counter=lambda: next(ticks))
+    )
+    target = tmp_path / "numbers.json"
+    capsys.readouterr()
+
+    code = check.main(
+        ["measure", str(out), "--detector", "blobs", "--json", str(target)]
+    )
+
+    printed = capsys.readouterr().out
+    assert code == 0
+    # Every reference box is blobs' own: 6 singles and 2 doublets, all found. The
+    # empty frame (image 2) has none: it must not be given the first frame's boxes.
+    assert _numbers(printed, "single") == ["6", "6", "6", "1.000", "1.000"]
+    assert _numbers(printed, "doublet") == ["2", "2", "2", "1.000", "1.000"]
+    assert _numbers(printed, "any box") == ["8", "8", "8", "1.000", "1.000"]
+    assert "reviewed frames: 3 of 3" in printed
+    assert "first (cold) 1.000 s, others (warm) 4.000 s" in printed
+    configuration = json.loads(target.read_text("utf-8"))["configurations"][0]
+    assert configuration["frames"] == 3
+    assert configuration["first_frame_s"] == 1.0
+    assert configuration["mean_other_frames_s"] == 4.0
+
+
+def test_measure_with_one_reviewed_frame_has_no_warm_time(
+    check: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dataset = _reviewed_dataset(tmp_path, check)
+    capsys.readouterr()
+
+    assert check.main(["measure", str(dataset), "--detector", "blobs"]) == 0
+
+    assert "others (warm) -" in capsys.readouterr().out
+
+
+def _into_two_splits(dataset: Path) -> None:
+    """Image 2 and its boxes go to ``train.json`` as its image 1, as ``nikon-control`` numbers a split: ids collide."""
+    coco = _val(dataset)
+    second = coco["images"][1]
+    boxes = [a for a in coco["annotations"] if a["image_id"] == second["id"]]
+    train = {
+        "categories": coco["categories"],
+        "images": [{**second, "id": 1, "reviewed": True}],
+        "annotations": [
+            {**a, "id": n, "image_id": 1} for n, a in enumerate(boxes, start=1)
+        ],
+    }
+    coco["images"] = [{**coco["images"][0], "reviewed": True}]
+    coco["annotations"] = [a for a in coco["annotations"] if a["image_id"] == 1]
+    _save_val(dataset, coco)
+    (dataset / "annotations" / "train.json").write_text(
+        json.dumps(train, indent=1), encoding="utf-8"
+    )
+
+
+def test_measure_reads_the_reviewed_frames_of_both_splits(
+    check: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_json = _seed_run(tmp_path, [("A1", _frame(3)), ("A1", _frame(5))])
+    out = tmp_path / "ref"
+    assert _export(check, run_json, out) == 0
+    _into_two_splits(out)
+    capsys.readouterr()
+
+    code = check.main(["measure", str(out), "--detector", "blobs"])
+
+    printed = capsys.readouterr().out
+    assert code == 0
+    # 4 boxes from val.json's frame and 4 from train.json's, each on its own image.
+    assert _numbers(printed, "any box") == ["8", "8", "8", "1.000", "1.000"]
+    assert "reviewed frames: 2 of 2" in printed
+
+
+def test_measure_reads_a_dataset_that_has_only_a_train_split(
+    check: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_json = _seed_run(tmp_path, [("A1", _frame(3)), ("A1", _frame(5))])
+    out = tmp_path / "ref"
+    assert _export(check, run_json, out) == 0
+    _into_two_splits(out)
+    (out / "annotations" / "val.json").unlink()
+    capsys.readouterr()
+
+    code = check.main(["measure", str(out), "--detector", "blobs"])
+
+    assert code == 0
+    assert _numbers(capsys.readouterr().out, "any box") == [
+        "4",
+        "4",
+        "4",
+        "1.000",
+        "1.000",
+    ]
+
+
+def test_the_device_reaches_the_model_in_both_commands(
+    check: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A timing taken on the wrong device is the wrong timing: ``--device cpu`` must reach ``load_detector``, and ``auto`` is the default."""
+    dataset = _reviewed_dataset(tmp_path, check)
+    weights = _weights(tmp_path)
+    calls = _stub_loader(monkeypatch, check, [])
+    run_json = (
+        tmp_path / "run" / "run.json"
+    )  # the scan `_reviewed_dataset` exported from
+
+    export = ["--model-path", str(weights)]
+    assert _export(check, run_json, tmp_path / "e1", *export, prefill="model") == 0
+    assert (
+        _export(
+            check,
+            run_json,
+            tmp_path / "e2",
+            *export,
+            "--device",
+            "cpu",
+            prefill="model",
+        )
+        == 0
+    )
+    measure = [
+        "measure",
+        str(dataset),
+        "--detector",
+        "model",
+        "--model-path",
+        str(weights),
+    ]
+    assert check.main(measure) == 0
+    assert check.main([*measure, "--device", "cpu"]) == 0
+
+    assert [c["device"] for c in calls] == ["auto", "cpu", "auto", "cpu"]
+
+
+# -- refusals that leave nothing behind ----------------------------------------
+
+
+@pytest.mark.parametrize("prefill", ["none", "blobs"])
+def test_export_refuses_a_missing_frame_file_before_it_writes_anything(
+    check: ModuleType,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    prefill: str,
+) -> None:
+    run_json = _seed_run(tmp_path, [("A1", _frame(0)), ("A1", _frame(1))])
+    (run_json.parent / "scan" / "t" / "A1_0001.tif").unlink()
+    out = tmp_path / "ref"
+
+    code = _export(check, run_json, out, prefill=prefill)
+
+    assert code == 1
+    assert not out.exists()
+    assert "scan/t/A1_0001.tif" in capsys.readouterr().err
+
+
+def test_export_finds_a_missing_frame_before_the_model_is_loaded(
+    check: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The frames are looked at first, so that a scan with a hole does not wait for 166 MB of weights (FM-30)."""
+    run_json = _seed_run(tmp_path, [("A1", _frame(0)), ("A1", _frame(1))])
+    (run_json.parent / "scan" / "t" / "A1_0001.tif").unlink()
+    weights = _weights(tmp_path)
+    _refusing_loader(monkeypatch, check)
+
+    code = _export(
+        check, run_json, tmp_path / "ref", "--model-path", str(weights), prefill="model"
+    )
+
+    assert code == 1
+    assert "scan/t/A1_0001.tif" in capsys.readouterr().err
+
+
+def test_export_refuses_a_scan_with_no_frame(
+    check: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_json = _seed_run(tmp_path, [])
+
+    assert _export(check, run_json, tmp_path / "ref") == 1
+
+    assert "no frame" in capsys.readouterr().err
+    assert not (tmp_path / "ref").exists()
+
+
+def test_export_refuses_a_frame_path_that_leaves_the_run_folder(
+    check: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A run document copied from elsewhere must not make the script read any file of the PC."""
+    # `scan/t/../../x.tif` is `run/x.tif`: it exists, so only the path check can refuse it.
+    run_json = _seed_run(tmp_path, [("A1", _frame(0))], names=["../../x"])
+    assert (run_json.parent / "x.tif").is_file()
+
+    assert _export(check, run_json, tmp_path / "ref") == 1
+
+    assert "not usable" in capsys.readouterr().err
+    assert not (tmp_path / "ref").exists()
+
+
+@pytest.mark.parametrize("prefill", ["blobs", "none"])
+@pytest.mark.parametrize(
+    "option",
+    [["--model-path", "w.pth"], ["--device", "cpu"], ["--model-um-per-px", "0.25"]],
+)
+def test_export_refuses_a_model_option_next_to_another_prefill(
+    check: ModuleType,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    prefill: str,
+    option: list[str],
+) -> None:
+    run_json = _seed_run(tmp_path, [("A1", _frame(0))])
+
+    code = _export(check, run_json, tmp_path / "ref", *option, prefill=prefill)
+
+    assert code == 1
+    assert f"{option[0]} is for --prefill model" in capsys.readouterr().err
+    assert not (tmp_path / "ref").exists()
+
+
+def test_export_spaces_a_fractional_count_by_rounding(
+    check: ModuleType, tmp_path: Path
+) -> None:
+    """4 of 6 is ``linspace(0, 5, 4)`` = 0, 1.67, 3.33, 5: rounded, 0, 2, 3 and 5 (a floor gives 1, a ceiling 4)."""
+    run_json = _seed_run(tmp_path, [("A1", _frame(n)) for n in range(6)])
+    out = tmp_path / "ref"
+
+    assert _export(check, run_json, out, "--count", "4") == 0
+
+    assert sorted(p.name for p in (out / "images").iterdir()) == [
+        "A1_0000.tif",
+        "A1_0002.tif",
+        "A1_0003.tif",
+        "A1_0005.tif",
+    ]
+
+
+def test_measure_refuses_an_image_that_is_not_a_2d_frame(
+    check: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dataset = _reviewed_dataset(tmp_path, check)
+    tifffile.imwrite(
+        dataset / "images" / "A1_0000.tif", np.zeros((200, 320, 3), np.uint8)
+    )
+    capsys.readouterr()
+
+    code = check.main(["measure", str(dataset), "--detector", "blobs"])
+
+    assert code == 1
+    assert "not a 2-D frame" in capsys.readouterr().err
+
+
+def test_measure_refuses_an_image_that_is_not_the_size_of_the_scans_frames(
+    check: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The image and its annotation file agree, the manifest does not: the model input size would be worked out on another shape."""
+    dataset = _reviewed_dataset(tmp_path, check)
+    tifffile.imwrite(
+        dataset / "images" / "A1_0000.tif", np.zeros((100, 160), np.uint16)
+    )
+    coco = _val(dataset)
+    coco["images"][0]["height"], coco["images"][0]["width"] = 100, 160
+    _save_val(dataset, coco)
+    capsys.readouterr()
+
+    code = check.main(["measure", str(dataset), "--detector", "blobs"])
+
+    assert code == 1
+    assert "manifest.json says" in capsys.readouterr().err
+
+
+# -- what the Windows review found ----------------------------------------------
+
+
+def _locked(real: Any, *, fail_on: Any, times: int) -> Any:
+    """``real`` that raises a sharing violation ``times`` times on the calls ``fail_on`` accepts, then works."""
+    state = {"left": times}
+
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        if fail_on(*args, **kwargs) and state["left"] > 0:
+            state["left"] -= 1
+            raise PermissionError(
+                13,
+                "The process cannot access the file because it is being used by another process",
+            )
+        return real(*args, **kwargs)
+
+    return wrapper
+
+
+def test_a_frame_that_is_held_for_a_moment_is_still_copied(
+    check: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Antivirus or a sync client holds a frame the scan wrote a moment ago (FM-24)."""
+    import shutil
+
+    run_json = _seed_run(
+        tmp_path, [("A1", _frame(0)), ("A1", _frame(1)), ("A1", _frame(2))]
+    )
+    monkeypatch.setattr(
+        shutil,
+        "copyfile",
+        _locked(
+            shutil.copyfile,
+            fail_on=lambda src, dst: str(src).endswith("A1_0001.tif"),
+            times=2,
+        ),
+    )
+    out = tmp_path / "ref"
+
+    assert _export(check, run_json, out) == 0
+
+    assert len(list((out / "images").iterdir())) == 3
+
+
+def test_a_frame_that_stays_held_names_the_frame_and_leaves_no_half_made_folder(
+    check: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The next export of the same command must not be refused for a folder this one half made."""
+    import shutil
+
+    run_json = _seed_run(
+        tmp_path, [("A1", _frame(0)), ("A1", _frame(1)), ("A1", _frame(2))]
+    )
+    real = shutil.copyfile
+    monkeypatch.setattr(
+        shutil,
+        "copyfile",
+        _locked(
+            real, fail_on=lambda src, dst: str(src).endswith("A1_0001.tif"), times=99
+        ),
+    )
+    out = tmp_path / "ref"
+
+    assert _export(check, run_json, out) == 1
+
+    error = capsys.readouterr().err
+    assert "A1_0001.tif" in error  # the file that is held, not the folder
+    assert not out.exists()
+    monkeypatch.setattr(shutil, "copyfile", real)
+    assert _export(check, run_json, out) == 0
+
+
+def test_an_empty_folder_given_for_the_export_is_kept_when_it_fails(
+    check: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import shutil
+
+    run_json = _seed_run(tmp_path, [("A1", _frame(0)), ("A1", _frame(1))])
+    monkeypatch.setattr(
+        shutil,
+        "copyfile",
+        _locked(
+            shutil.copyfile,
+            fail_on=lambda src, dst: str(src).endswith("A1_0001.tif"),
+            times=99,
+        ),
+    )
+    out = tmp_path / "ref"
+    out.mkdir()
+
+    assert _export(check, run_json, out) == 1
+
+    assert out.is_dir()
+    assert list(out.iterdir()) == []
+
+
+def test_the_refusal_of_a_folder_does_not_claim_it_holds_annotations(
+    check: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run_json = _seed_run(tmp_path, [("A1", _frame(0))])
+    out = tmp_path / "ref"
+    out.mkdir()
+    (out / "notes.txt").write_text("mine", encoding="utf-8")
+
+    assert _export(check, run_json, out) == 1
+
+    error = capsys.readouterr().err
+    assert "not empty" in error
+    assert "never overwritten" in error
+    assert "the annotations in it" not in error
+
+
+def test_a_json_file_saved_with_a_byte_order_mark_is_read(
+    check: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Notepad before Windows 10 1903 saves "UTF-8" with a mark; the owner may edit a file by hand (FM-80)."""
+    dataset = _reviewed_dataset(tmp_path, check)
+    for name in ("annotations/val.json", "manifest.json"):
+        path = dataset / name
+        path.write_bytes(b"\xef\xbb\xbf" + path.read_bytes())
+    capsys.readouterr()
+
+    code = check.main(["measure", str(dataset), "--detector", "blobs"])
+
+    assert code == 0
+    assert _numbers(capsys.readouterr().out, "any box") == [
+        "4",
+        "4",
+        "3",
+        "0.750",
+        "0.750",
+    ]
+
+
+def test_a_file_that_is_held_for_a_moment_is_still_read_by_measure(
+    check: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The review page saved ``val.json`` a moment ago and antivirus holds it, as for the image (FM-24)."""
+    dataset = _reviewed_dataset(tmp_path, check)
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        _locked(Path.read_bytes, fail_on=lambda path: path.name == "val.json", times=2),
+    )
+    monkeypatch.setattr(
+        tifffile,
+        "imread",
+        _locked(
+            tifffile.imread,
+            fail_on=lambda path, *a, **k: Path(path).name == "A1_0000.tif",
+            times=2,
+        ),
+    )
+    capsys.readouterr()
+
+    code = check.main(["measure", str(dataset), "--detector", "blobs"])
+
+    assert code == 0
+    assert _numbers(capsys.readouterr().out, "any box") == [
+        "4",
+        "4",
+        "3",
+        "0.750",
+        "0.750",
+    ]
+
+
+def test_the_next_commands_are_quoted_when_a_folder_has_a_space(
+    check: ModuleType, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The owner copies them into a console: a folder with a space is two words without quotes."""
+    run_json = _seed_run(tmp_path, [("A1", _frame(0))])
+    out = tmp_path / "my check" / "ref"
+
+    assert _export(check, run_json, out) == 0
+
+    lines = capsys.readouterr().out.splitlines()
+    dashboard = next(line for line in lines if "nikon-control-dashboard" in line)
+    measure = next(line for line in lines if line.startswith("then:"))
+    assert f'--data-dir "{out.parent}"' in dashboard
+    assert f'measure "{out}"' in measure

@@ -600,6 +600,17 @@ def test_blobs_take_the_trained_percentiles_when_they_are_given() -> None:
     assert params.detector == "blobs"
 
 
+def test_the_percentiles_take_their_extreme_values() -> None:
+    """``low_percentile`` may be 0 (the minimum) and ``high_percentile`` 100 (the maximum), and no more."""
+    params = parse_params(CellsParams, ["low_percentile=0", "high_percentile=100"])
+
+    assert (params.low_percentile, params.high_percentile) == (0.0, 100.0)
+    just_under = parse_params(
+        CellsParams, ["low_percentile=49.9", "high_percentile=50.1"]
+    )
+    assert (just_under.low_percentile, just_under.high_percentile) == (49.9, 50.1)
+
+
 @pytest.mark.parametrize(
     "bad",
     [
