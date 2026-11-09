@@ -32,7 +32,10 @@ of the plate with the stage and the camera; it switches the autofocus off),
 each counted once; needs the `detect` extra and the trained weights),
 [`scan-plan`](scan-plan.md) (which wells and which fields of each to image, from the
 camera's real field of view), [`scan`](scan.md) (one TIFF per planned field, with
-the stage's readback and the focus state), [`density`](density.md) (the cells of each
+the stage's readback and the focus state, and optionally each frame at the cells' plane),
+[`focus-on-cells`](focus-on-cells.md) (a short Z sweep around where the stage is, kept as
+a Z-stack, and the move to the sharpest plane; it switches the autofocus off for the
+sweep and locks it again), [`density`](density.md) (the cells of each
 well and class, divided by the area that was imaged), [`route`](route.md) (the
 fields that hold the most cells of the wanted classes, then the shortest route
 through them), [`report`](report.md) (one static HTML file: the plate's density
@@ -255,7 +258,9 @@ towards the first, so that `density` and `route` have something to tell apart. T
 rotations, the cells per well, the share of doublets, the cells' size and the seed.
 
 **The limits.** The sample is one flat plane at z = 0: Z only blurs the frame (the
-same blur on either side of 0), so there is no focus to find and no z-stack to take.
+same blur on either side of 0). That blur stands in for defocus, so
+[`focus-on-cells`](focus-on-cells.md) finds Z = 0, but there are no cells above a
+plate's bottom and no optics behind it.
 There is no optics, no shading and no illumination. Its texture is built for pixel sizes up
 to 4 µm; above that the stand logs a warning, since only whole-pixel shifts correlate.
 The trained model does **not** see these cells (at most 2 `single` of 14 objects), so
