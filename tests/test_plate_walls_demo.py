@@ -37,7 +37,14 @@ import tifffile
 import useq
 
 from smc.hardware import Microscope
-from smc.hardware.capabilities import XY, Camera, Limits, ObjectiveTurret, XYStage
+from smc.hardware.capabilities import (
+    XY,
+    Camera,
+    Limits,
+    ObjectiveOffset,
+    ObjectiveTurret,
+    XYStage,
+)
 from smc.hardware.errors import (
     HardwareError,
     MicroscopeHaltedError,
@@ -189,6 +196,9 @@ class _EmptyTurret:
 
     def pixel_size_um(self, label: str | None = None) -> float:
         return 0.0
+
+    def offset(self, label: str) -> ObjectiveOffset:
+        return ObjectiveOffset(label, None, None, None, "")
 
 
 class _Stage:

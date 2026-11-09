@@ -4138,7 +4138,11 @@ def _use_the_stand(core: FakeCore, microscope: Microscope) -> None:
     # m2 §8: the turret looks the autofocus up through the facade, Channels
     # the light source; each does one thing.
     autofocus.engage()
-    microscope.require(ObjectiveTurret).select("10x", confirm=True)  # PFS off first
+    turret = microscope.require(ObjectiveTurret)
+    turret.select("10x", confirm=True)  # PFS off first
+    # m2 §13.4: the offset is read from the profile's section; the callable the
+    # turret keeps must not reach the facade or the core (FM-92).
+    turret.offset("10x")
     channels = microscope.require(Channels)
     channels.select("BF")
     channels.capture("smc")

@@ -526,6 +526,275 @@ def test_an_unknown_key_in_channels_lists_the_allowed_keys(tmp_path: Path) -> No
     assert "allowed keys: group, exclude" in str(info.value)
 
 
+# -- offsets between objectives (m2 §13) ----------------------------------------
+
+_OFFSETS_TOML = (
+    '[objectives]\nreference = "2-Plan Fluor 10x"\n\n'
+    '[objectives.offsets."1-Plan Fluor 4x"]\n'
+    "xy_offset_um = [12.5, -4.0]\n"
+    "z_offset_um = -8.7\n"
+    'measured = "2026-11-12, session 3 (#400)"\n\n'
+    '[objectives.offsets."3-Plan Apo LmbdD0.25 40x"]\n'
+    "xy_offset_um = [-30.0, 9.5]\n"
+    'measured = "2026-11-12, session 3 (#400)"\n'
+)
+
+
+def _entry(body: str, label: str = "1-Plan Fluor 4x") -> str:
+    """A profile body with the 10x as reference and one entry holding ``body``."""
+    return (
+        '[objectives]\nreference = "2-Plan Fluor 10x"\n\n'
+        f'[objectives.offsets."{label}"]\n{body}'
+    )
+
+
+def test_a_profile_without_objectives_has_no_reference_and_no_offsets() -> None:
+    section = Profile.demo().objectives
+    assert (section.reference, section.offsets) == ("", {})
+
+
+def test_objective_offsets_load_from_toml_with_quoted_labels(tmp_path: Path) -> None:
+    profile = Profile.load(write_profile(tmp_path / "p.toml", _OFFSETS_TOML))
+    assert profile.objectives.reference == "2-Plan Fluor 10x"
+    # Labels with spaces, a dot and a leading digit survive as keys.
+    assert set(profile.objectives.offsets) == {
+        "1-Plan Fluor 4x",
+        "3-Plan Apo LmbdD0.25 40x",
+    }
+    four = profile.objectives.offsets["1-Plan Fluor 4x"]
+    assert (four.xy_offset_um, four.z_offset_um) == ((12.5, -4.0), -8.7)
+    forty = profile.objectives.offsets["3-Plan Apo LmbdD0.25 40x"]
+    assert (forty.xy_offset_um, forty.z_offset_um) == ((-30.0, 9.5), None)
+
+
+def test_the_bounds_are_the_ones_the_design_chose() -> None:
+    assert (profile_module.MAX_XY_OFFSET_UM, profile_module.MAX_Z_OFFSET_UM) == (
+        1000.0,
+        500.0,
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["xy_offset_um = [1.0, 2.0]\n", "z_offset_um = 1.0\n"],
+    ids=["xy", "z"],
+)
+def test_an_offset_without_measured_is_refused(tmp_path: Path, body: str) -> None:
+    path = write_profile(tmp_path / "p.toml", _entry(body))
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    message = str(info.value)
+    assert "objectives.offsets.1-Plan Fluor 4x" in message
+    assert 'needs measured = "<date>, session N (#issue)"' in message
+    assert "a guess" in message
+
+
+@pytest.mark.parametrize("measured", ['""', '"   "'])
+def test_a_blank_measured_is_refused(tmp_path: Path, measured: str) -> None:
+    path = write_profile(
+        tmp_path / "p.toml",
+        _entry(f"xy_offset_um = [1.0, 2.0]\nmeasured = {measured}\n"),
+    )
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    assert "needs measured" in str(info.value)
+
+
+@pytest.mark.parametrize(
+    ("body", "key"),
+    [
+        ("xy_offset_um = [1000.5, 0.0]\n", "xy_offset_um"),
+        ("xy_offset_um = [0.0, 1000.5]\n", "xy_offset_um"),
+        ("xy_offset_um = [-1000.5, 0.0]\n", "xy_offset_um"),
+        ("z_offset_um = 500.5\n", "z_offset_um"),
+        ("z_offset_um = -500.5\n", "z_offset_um"),
+    ],
+)
+def test_an_offset_beyond_the_bound_is_refused(
+    tmp_path: Path, body: str, key: str
+) -> None:
+    path = write_profile(
+        tmp_path / "p.toml", _entry(body + 'measured = "2026-11-12, session 3"\n')
+    )
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    assert f"objectives.offsets.1-Plan Fluor 4x.{key}" in str(info.value)
+    assert "a unit or sign mistake" in str(info.value)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "xy_offset_um = [1000.0, -1000.0]\n",
+        "xy_offset_um = [-1000.0, 1000.0]\n",
+        "z_offset_um = 500.0\n",
+        "z_offset_um = -500.0\n",
+    ],
+)
+def test_an_offset_at_the_bound_is_accepted(tmp_path: Path, body: str) -> None:
+    path = write_profile(
+        tmp_path / "p.toml", _entry(body + 'measured = "2026-11-12, session 3"\n')
+    )
+    assert Profile.load(path).objectives.offsets["1-Plan Fluor 4x"].measured != ""
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        "xy_offset_um = [nan, 1.0]\n",
+        "xy_offset_um = [1.0, inf]\n",
+        "xy_offset_um = [1.0, -inf]\n",
+        "xy_offset_um = [true, 1.0]\n",
+        "xy_offset_um = [1.0, false]\n",
+        "xy_offset_um = [1.0, 2.0, 3.0]\n",
+        "xy_offset_um = [1.0]\n",
+        "z_offset_um = nan\n",
+        "z_offset_um = inf\n",
+        "z_offset_um = true\n",
+    ],
+)
+def test_a_non_finite_or_boolean_offset_is_refused(tmp_path: Path, body: str) -> None:
+    path = write_profile(
+        tmp_path / "p.toml", _entry(body + 'measured = "2026-11-12, session 3"\n')
+    )
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    assert "objectives.offsets.1-Plan Fluor 4x" in str(info.value)
+
+
+def test_a_boolean_offset_says_it_is_not_a_number(tmp_path: Path) -> None:
+    # pydantic would read `true` as 1.0 µm, a plausible offset (FM-104).
+    path = write_profile(
+        tmp_path / "p.toml",
+        _entry('z_offset_um = true\nmeasured = "2026-11-12, session 3"\n'),
+    )
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    assert "must be a number, not a boolean" in str(info.value)
+
+
+def test_three_xy_numbers_are_refused_with_the_two_that_are_meant(
+    tmp_path: Path,
+) -> None:
+    path = write_profile(
+        tmp_path / "p.toml",
+        _entry('xy_offset_um = [1.0, 2.0, 3.0]\nmeasured = "2026-11-12, session 3"\n'),
+    )
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    assert "exactly two numbers" in str(info.value)
+
+
+def test_an_integer_offset_is_a_number(tmp_path: Path) -> None:
+    path = write_profile(
+        tmp_path / "p.toml",
+        _entry('xy_offset_um = [3, -2]\nmeasured = "2026-11-12, session 3"\n'),
+    )
+    four = Profile.load(path).objectives.offsets["1-Plan Fluor 4x"]
+    assert four.xy_offset_um == (3.0, -2.0)
+
+
+def test_offsets_without_a_reference_are_refused(tmp_path: Path) -> None:
+    path = write_profile(
+        tmp_path / "p.toml",
+        '[objectives.offsets."1-Plan Fluor 4x"]\nxy_offset_um = [1.0, 2.0]\n'
+        'measured = "2026-11-12, session 3"\n',
+    )
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    assert "objectives.offsets" in str(info.value)
+    assert "needs [objectives] reference" in str(info.value)
+
+
+def test_a_blank_reference_does_not_name_one(tmp_path: Path) -> None:
+    path = write_profile(
+        tmp_path / "p.toml",
+        '[objectives]\nreference = "  "\n\n'
+        '[objectives.offsets."1-Plan Fluor 4x"]\nxy_offset_um = [1.0, 2.0]\n'
+        'measured = "2026-11-12, session 3"\n',
+    )
+    with pytest.raises(ProfileError, match=r"needs \[objectives\] reference"):
+        Profile.load(path)
+
+
+def test_an_entry_for_the_reference_is_refused(tmp_path: Path) -> None:
+    path = write_profile(
+        tmp_path / "p.toml",
+        _entry(
+            'xy_offset_um = [0.0, 0.0]\nmeasured = "2026-11-12, session 3"\n',
+            label="2-Plan Fluor 10x",
+        ),
+    )
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    assert "objectives.offsets" in str(info.value)
+    assert "'2-Plan Fluor 10x'" in str(info.value)
+    assert "(0, 0) by definition" in str(info.value)
+
+
+def test_an_entry_with_a_blank_label_is_refused(tmp_path: Path) -> None:
+    path = write_profile(
+        tmp_path / "p.toml",
+        _entry('xy_offset_um = [1.0, 2.0]\nmeasured = "x"\n', label=""),
+    )
+    with pytest.raises(ProfileError, match="must name a turret label"):
+        Profile.load(path)
+
+
+def test_an_unknown_key_in_objectives_lists_the_allowed_keys(tmp_path: Path) -> None:
+    path = write_profile(tmp_path / "p.toml", '[objectives]\nreferense = "x"\n')
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    assert "allowed keys: reference, offsets" in str(info.value)
+
+
+def test_an_unknown_key_in_an_offset_entry_lists_the_allowed_keys(
+    tmp_path: Path,
+) -> None:
+    path = write_profile(tmp_path / "p.toml", _entry("xy_offset = [1.0, 2.0]\n"))
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    assert "allowed keys: xy_offset_um, z_offset_um, measured" in str(info.value)
+
+
+def test_offset_of_the_reference_is_zero_and_of_an_unknown_label_is_none(
+    tmp_path: Path,
+) -> None:
+    section = Profile.load(write_profile(tmp_path / "p.toml", _OFFSETS_TOML)).objectives
+    reference = section.offset("2-Plan Fluor 10x")
+    assert (reference.xy_um, reference.z_um, reference.measured) == (
+        (0.0, 0.0),
+        0.0,
+        "",
+    )
+    assert (reference.objective, reference.reference) == (
+        "2-Plan Fluor 10x",
+        "2-Plan Fluor 10x",
+    )
+    four = section.offset("1-Plan Fluor 4x")
+    assert four.objective == "1-Plan Fluor 4x"
+    assert four.reference == "2-Plan Fluor 10x"
+    assert (four.xy_um, four.z_um) == ((12.5, -4.0), -8.7)
+    assert four.measured == "2026-11-12, session 3 (#400)"
+    # An entry with only XY: the Z stays unknown, never 0.
+    forty = section.offset("3-Plan Apo LmbdD0.25 40x")
+    assert (forty.xy_um, forty.z_um) == ((-30.0, 9.5), None)
+    # A label the profile does not know, and the empty position's label.
+    for label in ("Objective-2", ""):
+        unknown = section.offset(label)
+        assert (unknown.xy_um, unknown.z_um, unknown.measured) == (None, None, "")
+        assert (unknown.objective, unknown.reference) == (label, "2-Plan Fluor 10x")
+
+
+@pytest.mark.parametrize("label", ["2-Plan Fluor 10x", "", "Objective-2"])
+def test_with_no_reference_every_offset_is_unknown(label: str) -> None:
+    for reference in ("", "   "):
+        section = profile_module.ObjectivesSection(reference=reference)
+        offset = section.offset(label)
+        assert (offset.xy_um, offset.z_um, offset.measured) == (None, None, "")
+        assert (offset.objective, offset.reference) == (label, None)
+
+
 # -- search paths -------------------------------------------------------------
 
 

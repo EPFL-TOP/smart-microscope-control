@@ -546,6 +546,9 @@ class Microscope:
                 executor,
                 requires_confirm=self.profile.safety.turret_requires_confirm,
                 pixel_sizes_um=self.profile.camera.pixel_size_um,
+                # The profile's section, not this facade's: it reads nothing from
+                # the stand and holds no reference back (FM-92, m2 §13.4).
+                offset_of=self.profile.objectives.offset,
                 autofocus=lambda: cast(
                     "Autofocus | None",
                     _owned(owner, "ObjectiveTurret")._lookup(Autofocus),

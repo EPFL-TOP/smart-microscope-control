@@ -24,6 +24,7 @@ from smc.hardware.capabilities import (
     FocusStep,
     LightSource,
     Limits,
+    ObjectiveOffset,
     ObjectiveTurret,
     PropertyInfo,
     XYStage,
@@ -131,6 +132,9 @@ class StubTurret:
 
     def pixel_size_um(self, label: str | None = None) -> float:
         return 0.0
+
+    def offset(self, label: str) -> ObjectiveOffset:
+        return ObjectiveOffset(label, None, None, None, "")
 
 
 class NeverLocks:
