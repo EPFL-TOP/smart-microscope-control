@@ -204,8 +204,11 @@ _INF = float("inf")
         ((1.0, 2.0), (2.0, 4.0)),
         ((0.0, 0.0), (0.0, 0.0)),
         ((1e-7, 0.0), (0.0, 1e-7)),
+        # Finite entries whose determinant overflows to inf: it passes `>= 1e-12`
+        # and a zero vector then reads as 0 degrees off an axis (adversarial review).
+        ((1e200, 0.0), (0.0, 1e200)),
     ],
-    ids=["nan-00", "nan-11", "inf", "singular", "zero", "tiny"],
+    ids=["nan-00", "nan-11", "inf", "singular", "zero", "tiny", "overflow"],
 )
 def test_a_nan_or_singular_matrix_is_refused(matrix: Matrix2) -> None:
     # `not abs(det) >= 1e-12`: a nan must be refused as well as a zero (FM-104).
@@ -213,6 +216,34 @@ def test_a_nan_or_singular_matrix_is_refused(matrix: Matrix2) -> None:
         stage_side_of_image_side("left", matrix)
     with pytest.raises(ValueError, match="run camera-calibration"):
         image_direction_of_stage_step("+X", matrix)
+
+
+@pytest.mark.parametrize("pixel_um", [0.02, 0.002])
+def test_a_small_but_real_pixel_size_is_read_not_refused(pixel_um: float) -> None:
+    # The bound on the determinant is for a camera that images nothing, not for a
+    # fine one: 0.02 µm per pixel is a determinant of 4e-4, 0.002 one of 4e-6. Only
+    # the refusing side was tested, so a bound of 1e-3 passed unseen.
+    ti2e_like: Matrix2 = ((-pixel_um, 0.0), (0.0, pixel_um))
+    assert stage_side_of_image_side("left", ti2e_like) == "+X"
+    assert stage_side_of_image_side("bottom", ti2e_like) == "+Y"
+    assert image_direction_of_stage_step("+X", ti2e_like) == "right"
+    assert image_direction_of_stage_step("+Y", ti2e_like) == "up"
+
+
+def test_a_matrix_whose_two_axes_lie_on_one_stage_axis_is_refused() -> None:
+    # Both columns within 5 degrees of the X axis: the determinant (-0.01) is above
+    # the bound, so only the columns can tell that this is no camera. Without the
+    # refusal `left` and `top` both name -X, and a second capture replaces the first.
+    flat: Matrix2 = ((1.0, 1.0), (0.05, 0.04))
+    for side in IMAGE_SIDES:
+        with pytest.raises(ValueError, match=r"both lie along the stage's X axis"):
+            stage_side_of_image_side(side, flat)
+    for step in ("+X", "-X", "+Y", "-Y"):
+        with pytest.raises(ValueError, match=r"both lie along the stage's X axis"):
+            image_direction_of_stage_step(step, flat)
+    tall: Matrix2 = ((0.05, 0.04), (1.0, 1.0))
+    with pytest.raises(ValueError, match=r"both lie along the stage's Y axis"):
+        stage_side_of_image_side("right", tall)
 
 
 def test_frames_takes_nothing_from_the_hardware_layer() -> None:

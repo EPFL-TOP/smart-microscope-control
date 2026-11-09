@@ -439,6 +439,20 @@ def test_the_pad_note_and_the_capture_note_carry_the_texts_with_and_without_a_ma
         "(from the camera calibration)."
     )
 
+    # A camera at 90 degrees, mirrored, the matrix of the table that is not its own
+    # transpose: the two above are, so a matrix handed to the notes transposed passed
+    # (FM-73). `↑` is a +Y step, which moves this image right; `→` is +X, which moves
+    # it up (M3 §19.1).
+    seed_camera_calibration(run_doc, ((0.0, 1.1), (-1.1, 0.0)))
+    view.refresh()
+    assert view.drive_image_note.object == (
+        "On the image, ↑ moves it right, → moves it up; ↓ and ← the opposite."
+    )
+    assert view.image_note.object == (
+        "On the image: left is the stage's +Y, right -Y, top -X, bottom +X "
+        "(from the camera calibration)."
+    )
+
     # A camera 30 degrees off a quarter turn names no side: `frames`' words.
     seed_camera_calibration(run_doc, ((0.9526, 0.55), (0.55, -0.9526)))
     view.refresh()

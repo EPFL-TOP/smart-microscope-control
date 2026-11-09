@@ -1656,6 +1656,15 @@ def test_a_capture_of_a_well_that_is_not_on_the_plate_is_refused(
 TI2E: tuple[tuple[float, float], tuple[float, float]] = ((-1.1, 0.0), (0.0, 1.1))
 #: An upright camera, not mirrored: the image's sides are the stage's.
 UPRIGHT: tuple[tuple[float, float], tuple[float, float]] = ((1.1, 0.0), (0.0, -1.1))
+#: A camera at 90 degrees, mirrored: the one matrix of the table that is neither
+#: diagonal nor symmetric (M3 §19.1: left +Y, right -Y, top -X, bottom +X). The two
+#: above equal their own transpose, so a page that handed the matrix over transposed
+#: passed every test (FM-73: the symmetric case hides the exchange of two axes);
+#: this one's transpose is the -90 degree mirrored camera, opposite on all four sides.
+NINETY_MIRRORED: tuple[tuple[float, float], tuple[float, float]] = (
+    (0.0, 1.1),
+    (-1.1, 0.0),
+)
 
 
 def _turned(deg: float) -> tuple[tuple[float, float], tuple[float, float]]:
@@ -1669,8 +1678,12 @@ def _turned(deg: float) -> tuple[tuple[float, float], tuple[float, float]]:
     [
         (TI2E, {"left": "+X", "right": "-X", "top": "-Y", "bottom": "+Y"}),
         (UPRIGHT, {"left": "-X", "right": "+X", "top": "+Y", "bottom": "-Y"}),
+        (
+            NINETY_MIRRORED,
+            {"left": "+Y", "right": "-Y", "top": "-X", "bottom": "+X"},
+        ),
     ],
-    ids=["ti2e", "upright"],
+    ids=["ti2e", "upright", "ninety-mirrored"],
 )
 def test_capture_wall_records_the_stage_side_of_the_image_side(
     page: PlatePage,
@@ -1867,6 +1880,147 @@ def test_a_run_document_that_names_walls_on_the_image_starts_the_page_with_none(
         assert page.walls == ()
         lines = [r.getMessage() for r in caplog.records if r.name == "smc.ui"]
         assert any("walls are not read" in line for line in lines)
+    finally:
+        page.close()
+
+
+def test_an_unreadable_run_document_is_the_reason_and_not_a_missing_calibration(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # `run camera-calibration` is advice that cannot work here: the run document is
+    # what cannot be read, and a write would refuse it too. The page says so, in the
+    # words `view().problems` already has, and records nothing.
+    run_doc.write_text("{not json", encoding="utf-8")
+    reason = r"^run document: .*is not valid JSON"
+    with pytest.raises(ValueError, match=reason) as captured:
+        page.capture_wall("B3", "left")
+    with pytest.raises(ValueError, match=reason) as driven:
+        page.goto("B3", "left")
+    for raised in (captured, driven):
+        assert NO_CALIBRATION_FOR_SIDES not in str(raised.value)
+        assert raised.value.__context__ is None  # taken where caught (FM-98)
+    assert page.walls == ()
+    assert StubGoto.ran == []
+    assert page.current is None
+
+
+def test_a_drive_action_that_starts_while_the_side_is_mapped_refuses_the_capture(
+    page: PlatePage,
+    fake_microscope: Microscope,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    # The stage-at-rest guard is not atomic with the read (its docstring says the
+    # window is one `position_um()`). The mapping reads the run document in between,
+    # so a jog that another tab starts during it must meet a second guard: without it
+    # the wall is recorded where the stage was before the jog moved it.
+    seed_camera_calibration(run_doc)
+    stage = fake_microscope.require(XYStage)
+    reads: list[None] = []
+    real_position = stage.position_um
+    real_map = page._stage_side
+
+    def counting() -> Any:
+        reads.append(None)
+        return real_position()
+
+    def maps_while_a_jog_starts(side: Any) -> Any:
+        mapped = real_map(side)
+        with page._lock:
+            page._drive_running = "stage jog"
+        return mapped
+
+    try:
+        with (
+            _replaced(page, "_stage_side", maps_while_a_jog_starts),
+            _replaced(stage, "position_um", counting),
+            _refuses(RuntimeError, "stage jog is running"),
+        ):
+            page.capture_wall("B3", "left")
+    finally:
+        with page._lock:
+            page._drive_running = None
+    assert page.walls == ()
+    assert reads == []
+
+
+@pytest.mark.parametrize("record", ["dry-run", "another-stand", "failed"])
+def test_an_unusable_calibration_is_no_calibration_at_the_press(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
+    record: str,
+) -> None:
+    # The press is the guard (FM-169), and it reads the document itself: a dry run's
+    # synthetic matrix on a real stand, another stand's, or the matrix of a run that
+    # failed since, would map walls the stage then drives to. `view()` was tested for
+    # it; this is the press.
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    if record == "failed":
+        _seed(
+            run_doc,
+            "camera-calibration",
+            "camera-calibration",
+            status=StageStatus.failed,
+        )
+    else:
+        seed_camera_calibration(
+            run_doc,
+            TI2E,
+            dry_run=record == "dry-run",
+            profile="another-stand" if record == "another-stand" else "demo",
+        )
+    page = _page(fake_microscope, run_doc)
+    try:
+        with _refuses(ValueError, NO_CALIBRATION_FOR_SIDES):
+            page.capture_wall("B3", "left")
+        with _refuses(ValueError, NO_CALIBRATION_FOR_SIDES):
+            page.goto("B3", "left")
+        assert page.walls == ()
+        assert StubGoto.ran == []
+        assert page.current is None
+    finally:
+        page.close()
+
+
+def test_a_capture_of_the_same_stage_side_on_another_well_keeps_the_first(
+    page: PlatePage,
+    fake_microscope: Microscope,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    # The replace rule is the same well *and* the same stage side: the operator
+    # captures B3's +X wall and then B4's, and the page must keep both.
+    seed_camera_calibration(run_doc)
+    stage = fake_microscope.require(XYStage)
+    stage.move_to_um(1.0, 2.0)
+    page.capture_wall("A1", "left")
+    stage.move_to_um(3.0, 4.0)
+    page.capture_wall("A2", "left")
+    assert page.walls == (
+        WallTouch(well="A1", side="+X", x_um=1.0, y_um=2.0),
+        WallTouch(well="A2", side="+X", x_um=3.0, y_um=4.0),
+    )
+
+
+def test_goto_an_image_side_on_another_plates_map_says_the_plate_not_the_calibration(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # Two refusals could apply and neither is a courtesy: the plate mismatch comes
+    # first (m5 §13.1), because with it the same-named well of another plate is the
+    # target, which no calibration fixes.
+    _seed(run_doc, "plate-registration", "plate", _plate("384-well"))
+    page = _page(fake_microscope, run_doc)
+    try:
+        page.choose_plate("96-well")
+        with _refuses(
+            ValueError,
+            "the registered plate is a 384-well; calibrate the 96-well plate again, "
+            "or choose 384-well",
+        ):
+            page.goto("C5", "left")
+        assert StubGoto.ran == []
+        assert page.current is None
     finally:
         page.close()
 

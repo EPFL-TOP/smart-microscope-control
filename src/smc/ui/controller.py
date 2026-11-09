@@ -1145,12 +1145,19 @@ class PlatePage:
         raised outside the handler (FM-98).
 
         Raises:
-            ValueError: No usable ``camera-calibration`` (``NO_CALIBRATION_FOR_SIDES``,
-                the same when its result does not validate), or its matrix is
-                refused by ``frames`` (a camera off a quarter turn, or a matrix that
-                cannot be inverted): ``frames``' own text.
+            ValueError: The run document cannot be read (``run document: <why>``, the
+                line ``view().problems`` has: the advice to run a calibration cannot
+                work when nothing can be written to it); no usable
+                ``camera-calibration`` (``NO_CALIBRATION_FOR_SIDES``, the same when
+                its result does not validate); or its matrix is refused by ``frames``
+                (a camera off a quarter turn, a matrix that cannot be inverted or
+                whose axes lie on one stage axis): ``frames``' own text.
         """
-        doc, _unreadable = self._document()
+        doc, unreadable = self._document()
+        if unreadable is not None:
+            # `unreadable` is the text `_document` took where it caught the error
+            # (FM-98): raised here, outside any handler, it keeps no traceback.
+            raise ValueError(f"run document: {unreadable}")
         calibration = self._slot(doc, "camera-calibration", CameraCalibration, [])
         if calibration is None:
             raise ValueError(NO_CALIBRATION_FOR_SIDES)
@@ -1206,6 +1213,12 @@ class PlatePage:
         # mapped is refused before it is touched (FM-169: this is the guard, the
         # button's state a courtesy).
         stage_side = self._stage_side(image_side)
+        # The mapping read the run document, so the guard above is out of date by a
+        # disk read: a jog another tab started meanwhile must be seen before the
+        # stage is read, or the wall is recorded where the stage was (FM-181). The
+        # first call stays where it is: a busy stage is answered before a missing
+        # calibration.
+        self._refuse_if_moving()
         with self._reading() as microscope:
             if microscope is None:
                 raise RuntimeError(NOT_CONNECTED)

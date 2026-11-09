@@ -59,11 +59,12 @@ def stage_side_of_image_side(side: ImageSide, matrix: Matrix2) -> WallSide:
     column), and ``left`` and ``top`` their opposites.
 
     Raises:
-        ValueError: The matrix cannot be inverted or is not finite, or the camera
+        ValueError: The matrix cannot be inverted or is not finite, the camera
             is turned more than ``QUARTER_TURN_TOLERANCE_DEG`` away from the
-            stage's axes: no image side is then a stage side.
+            stage's axes, or its two image axes lie along one stage axis: no image
+            side is then a stage side.
     """
-    _check_invertible(matrix)
+    _check_camera(matrix)
     (m00, m01), (m10, m11) = matrix
     vectors = {
         "right": (m00, m10),
@@ -85,7 +86,7 @@ def image_direction_of_stage_step(step: WallSide, matrix: Matrix2) -> ImageDirec
     Raises:
         ValueError: As ``stage_side_of_image_side``.
     """
-    determinant = _check_invertible(matrix)
+    determinant = _check_camera(matrix)
     (m00, m01), (m10, m11) = matrix
     dx, dy = _STEPS[step]
     d_col = -(m11 * dx - m01 * dy) / determinant
@@ -108,14 +109,37 @@ _IMAGE_DIRECTIONS: dict[tuple[int, bool], ImageDirection] = {
 }
 
 
+def _check_camera(matrix: Matrix2) -> float:
+    """The determinant of a matrix that can be a camera's, or a refusal.
+
+    A matrix that cannot be inverted, a camera turned off a quarter turn (read
+    from each column) and a matrix whose two columns lie along one stage axis are
+    all refused here, for the two public functions alike: only a hand-edited or
+    foreign run document reaches them (the calibration's own rigidity check
+    refuses such a fit), and the answer would otherwise be two image sides on one
+    stage wall, or a direction read from a zero vector.
+    """
+    determinant = _check_invertible(matrix)
+    (m00, m01), (m10, m11) = matrix
+    first, _ = _axis_of((m00, m10))
+    second, _ = _axis_of((m01, m11))
+    if first == second:
+        raise ValueError(
+            "the camera matrix's two image axes both lie along the stage's "
+            f"{'XY'[first]} axis, so no image side is a stage side; run "
+            "camera-calibration"
+        )
+    return determinant
+
+
 def _check_invertible(matrix: Matrix2) -> float:
     """The determinant, or a refusal that says to run the calibration again."""
     (m00, m01), (m10, m11) = matrix
     determinant = m00 * m11 - m01 * m10
-    # `not >=`, not `<`: a nan must be refused too (FM-104). An infinite entry can
-    # leave a determinant that is finite or infinite, so it is refused on its own.
-    finite = all(math.isfinite(v) for v in (m00, m01, m10, m11))
-    if not (finite and abs(determinant) >= _MIN_DETERMINANT):
+    # `not >=`, not `<`: a nan must be refused too (FM-104). `isfinite` is of the
+    # determinant: an infinite or nan entry leaves it non-finite, and so does an
+    # overflow of finite entries (1e200 squared), which would pass `>= 1e-12`.
+    if not (math.isfinite(determinant) and abs(determinant) >= _MIN_DETERMINANT):
         raise ValueError(
             f"the camera matrix cannot be inverted (determinant {determinant!r}); "
             "run camera-calibration"

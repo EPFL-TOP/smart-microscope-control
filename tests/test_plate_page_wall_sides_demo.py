@@ -189,14 +189,41 @@ def test_on_an_upright_camera_the_image_names_are_the_stage_names(
     assert "another well" not in refused.error
 
 
-def test_a_real_calibration_of_a_camera_at_180_degrees_maps_left_to_plus_x(
-    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+@pytest.mark.parametrize(
+    ("rotation_deg", "mirrored", "matrix", "sides"),
+    [
+        # The Ti2-E at 10x: the image's left is the stage's +X, its bottom +Y.
+        (
+            180.0,
+            False,
+            ((-1.0, 0.0), (0.0, 1.0)),
+            {"left": "+X", "right": "-X", "top": "-Y", "bottom": "+Y"},
+        ),
+        # The one camera of the table that is not its own transpose (diagonal and
+        # symmetric ones hide a matrix handed over transposed, FM-73): its transpose
+        # is the -90 degree mirrored camera, opposite on all four sides.
+        (
+            90.0,
+            True,
+            ((0.0, 1.0), (-1.0, 0.0)),
+            {"left": "+Y", "right": "-Y", "top": "-X", "bottom": "+X"},
+        ),
+    ],
+    ids=["180", "90-mirrored"],
+)
+def test_a_real_calibration_names_the_sides_of_its_camera(
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    rotation_deg: float,
+    mirrored: bool,
+    matrix: tuple[tuple[float, float], tuple[float, float]],
+    sides: dict[str, str],
 ) -> None:
     # The matrix is measured, not seeded: `camera-calibration` on a synthetic camera
-    # turned by 180 degrees, run into the page's own run document, is what makes the
-    # image's left the stage's +X.
+    # turned as asked, run into the page's own run document, is what says which stage
+    # side each side of the image is. Pixel size 1.0 µm, so the matrix is the table's.
     microscope = demo_microscope_with_sample(
-        shape=(384, 512), camera_rotation_deg=180.0
+        shape=(384, 512), camera_rotation_deg=rotation_deg, mirrored=mirrored
     )
     run_doc = tmp_path / "run.json"
     record = run_plugin(
@@ -204,20 +231,18 @@ def test_a_real_calibration_of_a_camera_at_180_degrees_maps_left_to_plus_x(
     )
     assert record.status is StageStatus.done
     assert record.result is not None
-    assert CameraCalibration.model_validate(
-        record.result
-    ).rotation_deg == pytest.approx(180.0, abs=0.5)
+    measured = CameraCalibration.model_validate(record.result)
+    assert measured.rotation_deg == pytest.approx(rotation_deg, abs=0.5)
+    assert measured.mirrored is mirrored
     page = _page(microscope, run_doc)
     try:
         microscope.require(XYStage).move_to_um(*PLUS_X)
-        touch = page.capture_wall("B3", "left")
-        assert touch.side == "+X"
-        assert page.capture_wall("B3", "right").side == "-X"
-        assert page.capture_wall("B3", "top").side == "-Y"
-        assert page.capture_wall("B3", "bottom").side == "+Y"
-        # And the page says so, from the same document.
-        matrix = page.view().camera_matrix
-        assert matrix is not None
-        assert matrix[0][0] == pytest.approx(-1.0, abs=0.05)
+        for image_side in ("left", "right", "top", "bottom"):
+            assert page.capture_wall("B3", image_side).side == sides[image_side]
+        # And the page carries the matrix of the same document, not its transpose.
+        seen = page.view().camera_matrix
+        assert seen is not None
+        assert seen[0] == pytest.approx(matrix[0], abs=0.05)
+        assert seen[1] == pytest.approx(matrix[1], abs=0.05)
     finally:
         page.close()
