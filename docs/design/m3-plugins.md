@@ -4060,7 +4060,7 @@ class PlatePage:
   normalise the well (`normalise_well`), refuse one that is not on `plate`
   (`ValueError`: `<well> is not a well of the <plate> plate`), and **replace**
   the earlier capture of the same well (and side; `side` is an image side
-  and the touch's a stage side, m5 §12): the operator centres it
+  and the touch's a stage side, m5 §13): the operator centres it
   again, and `plate-registration` refuses a well given twice. `forget(well)`
   drops the captures of one well, `forget()` all of them.
 - **`select_text`** and `toggle` take the wells of `plate`; a text or a well
@@ -4982,7 +4982,7 @@ rotation. Until #327 one set of words, `left right top bottom`, was typed in the
 image frame by the operator (on the page, and in the docs' steps) and read in the
 stage frame by the layer (`centre_from_walls`, `wall_position`, `goto-well`).
 FM-189 is that failure. This section fixes which words each part uses; the page's
-side of it is m5 §12.
+side of it is m5 §13.
 
 ### 19.1 What was measured (2026-11-09, planning #327)
 
@@ -5111,7 +5111,7 @@ def image_direction_of_stage_step(
   moves the image diagonally and an image side is not a stage side`.
 - **Which matrix.** Rotation and mirror belong to the optical path (the camera's
   port, the mirrors), not to the objective, so the page uses the latest *usable*
-  `camera-calibration` whatever its objective (m5 §12.1). A calibration is of the
+  `camera-calibration` whatever its objective (m5 §13.1). A calibration is of the
   path it was measured in: after a change of camera port or light path,
   `camera-calibration` is run again (said in the plugin's docs).
 
@@ -5122,7 +5122,7 @@ The plugins never see an image side. `plate-registration`, `goto-well` and
 parameters and the `plate` slot: a plugin that read a camera calibration would
 make a registration depend on a slot that its parameters do not show (M3 §1).
 The plate page, whose operator reads the image, names walls on the image and maps
-them with `frames.py` before it builds a parameter (m5 §12). On the command line
+them with `frames.py` before it builds a parameter (m5 §13). On the command line
 the operator names stage directions, and the docs say which frame each word is in
 and how to read the stage's from the camera calibration (the table of §19.1).
 
@@ -5144,7 +5144,7 @@ and how to read the stage's from the camera calibration (the table of §19.1).
   a swapped pair gets the swapped text and an off-size pair the other.
 - `tests/test_goto_well_demo.py`: `side=+X` and `side=-Y` go to the points that
   `left` and `bottom` went to; the demo's wall points are unchanged by the rename.
-- The page's tests (m5 §12.3) hold the end-to-end check: a stand whose matrix is
+- The page's tests (m5 §13.3) hold the end-to-end check: a stand whose matrix is
   the Ti2-E's, walls captured under image names, the centre found where the walls
   are.
 
