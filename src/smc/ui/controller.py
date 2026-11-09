@@ -2815,6 +2815,11 @@ class PlatePage:
                 blocked=None,
             )
         tool, others = providers[0], providers[1:]
+        if self._walls_is_next(providers):
+            # The operator took the path of m5 §12.4: the centres of 2 or more wells,
+            # no wall touched. The other providers stay as the `or ...` lines.
+            tool = next(p for p in providers if p.name == "plate-walls")
+            others = [p for p in providers if p is not tool]
         why = [
             item.reason
             if item.state == "unusable" and item.reason
@@ -2824,6 +2829,8 @@ class PlatePage:
         stuck: str | None = None
         if tool.name == "plate-registration":
             pairs, stuck = self._registration_step(why)
+        elif tool.name == "plate-walls":
+            pairs, stuck = self._walls_step(why)
         elif tool.name == "scan-plan":
             try:
                 pairs = self.page_params("scan-plan")
@@ -2894,6 +2901,48 @@ class PlatePage:
             command=command,
             blocked=blocked.get(tool.name) or stuck,
         )
+
+    def _walls_is_next(self, providers: Sequence[ToolView]) -> bool:
+        """Whether ``plate-walls`` is the tool of the ``plate`` slot's step, not the first provider (m5 §12.4).
+
+        All of these hold: the plate is chosen (else the registration's own reason
+        stays the step's); the page is not a dry run (FM-182: the plugin refuses a
+        dry run, so the page does not offer it there, as it does not offer ``scan``);
+        the stand can image, or is not connected (the step is then drawn for the
+        stand the operator is about to open); no wall is captured (touching walls is
+        ``plate-registration``'s own path); and the centres captured are a count the
+        tool takes. It reads the page's captures as ``_registration_step`` does,
+        and takes no lock.
+        """
+        if not any(p.name == "plate-walls" for p in providers):
+            return False
+        if not self._plate_chosen or self._dry_run or self.walls:
+            return False
+        microscope = self._microscope
+        if microscope is not None:
+            # What the tool requires of the stand, from the plugin itself: the page
+            # does not offer a path whose own refusal is the stand's lack.
+            requires = self._registry().plugins["plate-walls"].plugin.requires
+            if any(self._lacks(microscope, capability) for capability in requires):
+                return False
+        return walls_centres_problem(len(self.refs)) is None
+
+    def _walls_step(self, why: list[str]) -> tuple[list[str], str | None]:
+        """The pairs of ``plate-walls`` and a line of ``why`` for them: the plate and the centres on this page.
+
+        Called only when ``_walls_is_next`` held, so the plate is chosen and the
+        count is one the tool takes: the pairs are never empty here and nothing
+        is stuck. What can still block it (the calibration, a closed stand) is the
+        tool's own ``blocked``, which the step carries.
+        """
+        refs = self.refs
+        centres = ", ".join(ref.well for ref in refs)
+        why.append(
+            f"plate, refs: the {len(refs)} centres of {centres} captured on this "
+            "page; plate-walls images each well's four walls around its centre and "
+            "moves the stage in X and Y only"
+        )
+        return self._dump_refs(refs), None
 
     def _registration_step(self, why: list[str]) -> tuple[list[str], str | None]:
         """The pairs of ``plate-registration`` and what it waits for, with a line of ``why`` for them.
