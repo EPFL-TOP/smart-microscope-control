@@ -3119,14 +3119,27 @@ placeholder plate (`PLATE_NOT_CHOSEN`, §11.3); and, new, in this order:
    anything, and its refusal is a `failed` record that replaces a usable plate (§11.4):
    so the controller refuses first, in `run()`, as the outcome `plate-walls: <text>`,
    nothing written (FM-169).
-2. **The calibration.** What the tool reads, as for every tool; but with **no**
+2. **Square wells** (`walls_square_wells(plate)`, *added by #375*): `plate-walls fits
+   round wells, and the 384-well plate's are square: register it with
+   plate-registration`, the plugin's own words (m3 §17.4, item 2; a test pins the pair).
+   The plugin fits circles and refuses a 384- or 1536-well plate before it moves, and
+   its refusal is a `failed` record that replaces a usable plate (§11.4): the same
+   situation as the dry run, so the same answer. It is asked of the page's plate
+   (`useq.WellPlate.from_str(plate).circular_wells`), after the dry run (a mode is the
+   reason that holds longer) and before the calibration, which the operator would run
+   for nothing. `run()` refuses it as the outcome `plate-walls: <text>`, after the plate's
+   refusal and the dry run's, before the parameters are read, nothing written, so a
+   registered plate stays the slot's provider (FM-169). One helper,
+   `PlatePage._walls_refusal()` (the dry run, then the square wells), is the source of the
+   button's reason, of `page_params` and `run()`, and of the next step (§12.4).
+3. **The calibration.** What the tool reads, as for every tool; but with **no**
    `camera-calibration` record at all the reason is `WALLS_NEED_CALIBRATION`:
    `plate-walls reads the camera's calibration: run camera-calibration first (Set up),
    with the objective you register with in place, on a field with texture (a well's
    wall will do)`. A calibration that exists and is unusable (another stand, a dry run,
    stale) keeps the run document's own words.
-3. **The stand**: what the tool requires (`XYStage`, `Camera`), as for every tool.
-4. **The centres**: `walls_centres_problem(len(page.refs))`.
+4. **The stand**: what the tool requires (`XYStage`, `Camera`), as for every tool.
+5. **The centres**: `walls_centres_problem(len(page.refs))`.
 
 ```python
 WALLS_MIN_CENTRES = 2
@@ -3147,8 +3160,11 @@ pins the pair. The function gives `None` from 2 to 6 centres, else:
 - more than 6: `plate-walls takes at most 6 wells and <n> centres are captured: Forget
   some`.
 
-`page_params("plate-walls")` raises `ValueError(<that text>)` after the plate's gate. The
-controller's `run()` has no refusal for the count: the pairs it is given may not be the
+`page_params("plate-walls")` raises, after the plate's gate and in the order of the list
+above, the dry run's text, then the square wells', then `ValueError(<that text>)` for the
+count (*amended by #375*: it raised the count's first, so a click on a dry-run page showed
+the count while the button said the dry run). The controller's `run()` has no refusal for
+the count: the pairs it is given may not be the
 page's captures (a step's drawn pairs, a hand-spelled call), and the plugin refuses a
 count it does not accept before anything moves. A disabled button is a courtesy, not a
 guard (FM-169).
@@ -3163,6 +3179,9 @@ The `plate` slot has several providers (`plate-registration`, `plate-walls`,
   step's reason;
 - the page is not a dry run (FM-182: a path the page's own plugin refuses in one mode
   is not offered there, as `scan` is not, §8.8.1);
+- the plate's wells are round (*stated by #375*; the plugin fits circles and refuses a
+  384- or 1536-well plate, §12.3 item 2; the step stays `plate-registration`, which takes
+  square wells). The two conditions are one call, `_walls_refusal() is None`;
 - the stand can image: it has an `XYStage` and a `Camera`, or it is not connected (the
   step is then drawn for the stand the operator is about to open, and `NOT_CONNECTED`
   is its reason either way);
@@ -3176,6 +3195,12 @@ captured on this page; plate-walls images each well's four walls around its cent
 moves the stage in X and Y only` (the wells in capture order), then the other providers
 as §8.3 lists them (`or plate-registration: ...`). Its `blocked` is the tool's: until the
 calibration is run, the step says `WALLS_NEED_CALIBRATION` and the button is disabled.
+
+*Amended by #375.* When `plate-walls` is the step only because it is the slot's first
+provider (`plate-registration` did not load), on a dry-run page or a square-welled plate,
+`_walls_step` offers **no pairs**, so the step's command carries no `--param` a click or a
+terminal would run, and its reason is the refusal (§12.3 items 1 and 2), as it is the
+placeholder plate's when the plate is not chosen (§11.3).
 
 *Decided against:* a step that runs `camera-calibration` first. It moves the stage and
 measures at a place nobody chose, and which objective the registration is made at is the
@@ -3268,10 +3293,11 @@ the page fills from captures keeps them.
 
 ### 12.9 Tests and failure modes
 
-FM-169 (the dry run is refused by the controller; the count by the plugin, decided in
-§12.3), FM-177 (one `_capture_well` for both button sets), FM-181 (a capture is refused
-while the tool moves the stage: unchanged), FM-182 (the step is walked in the dry-run
-page and on a stand without a camera), FM-151 (a view draws what the shared controller
+FM-169 (the dry run and, by #375, the square wells are refused by the controller; the
+count by the plugin, decided in §12.3), FM-177 (one `_capture_well` for both button sets),
+FM-181 (a capture is refused while the tool moves the stage: unchanged), FM-182 (the step
+is walked in the dry-run page, on a square-welled plate and on a stand without a camera),
+FM-151 (a view draws what the shared controller
 holds: the walls widgets redraw with `refs`), FM-125 (a result and the document are
 data), FM-139 and FM-98 (text, never markup or the error), FM-171, FM-161 and FM-162
 (the browser walk), FM-147 (no widget spelling that warns), FM-112 (the venv's entry

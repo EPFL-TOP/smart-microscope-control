@@ -570,6 +570,9 @@ closed; the plate is the placeholder; the page is a **dry run** (`plate-walls im
 walls, which a dry run does not do: serve the page without --dry-run (demo-sample's stage
 is simulated), or register with plate-registration`: the page refuses the run itself,
 since the plugin's own refusal would be a failed record that replaces a usable plate);
+the plate's wells are **square** (384- and 1536-well plates: `plate-walls fits round wells,
+and the 384-well plate's are square: register it with plate-registration`; the page refuses
+that run too, and a registered plate stays the plate of the run document);
 there is **no calibration** in the run document (`plate-walls reads the camera's
 calibration: run camera-calibration first ...`; one that exists and is unusable keeps the
 run document's own words); the stand has no `XYStage` or `Camera`; and the **centres**
