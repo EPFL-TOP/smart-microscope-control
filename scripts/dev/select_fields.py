@@ -918,16 +918,32 @@ def render_png(
             for corner in footprint(x, y, matrix=matrix, image_shape_px=image_shape_px)
         ]
         draw.line([*corners, corners[0]], fill=_GREEN, width=2)
+    font = _font(max(12, round(max(width, height) / 80)))
     for number, x, y in stops:
         col, row = at(x, y)
-        left, top, right, bottom = draw.textbbox((0, 0), str(number))
+        left, top, right, bottom = draw.textbbox((0, 0), str(number), font=font)
         draw.text(
             (col - (right - left) / 2.0 - left, row - (bottom - top) / 2.0 - top),
             str(number),
             fill=_GREEN,
+            font=font,
         )
-    draw.text((4, 4), caption, fill=_WHITE)
+    draw.text((4, 4), caption, fill=_WHITE, font=font)
     return image
+
+
+def _font(size: int) -> Any:
+    """Pillow's default font at ``size`` pixels, so that a stop's number can be read on a picture of 1600 pixels.
+
+    A size is accepted from Pillow 10.1 and needs FreeType; an older Pillow, or a build
+    without it, gives the default 10-pixel font, which is small and still correct.
+    """
+    from PIL import ImageFont
+
+    try:
+        return ImageFont.load_default(size=size)
+    except (TypeError, OSError, ImportError):
+        return ImageFont.load_default()
 
 
 # ========================================================================= Record

@@ -1344,6 +1344,27 @@ def test_the_png_draws_a_chosen_field_in_green_with_its_number(
     assert greens_around_the_centre(bare) == 0
 
 
+def test_the_stop_number_font_falls_back_when_pillow_has_no_sized_default(
+    sf: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from PIL import ImageFont
+
+    real = ImageFont.load_default
+    asked: list[object] = []
+
+    def only_the_plain_default(size: object = None) -> object:
+        asked.append(size)
+        if size is not None:
+            raise TypeError("an older Pillow: load_default() takes no size")
+        return real()
+
+    monkeypatch.setattr(ImageFont, "load_default", only_the_plain_default)
+    _, image = _render(sf, tmp_path, stops=[(0, 1000.0, -500.0)])
+    assert asked[0] is not None  # a size was asked for, refused, and the plain one used
+    assert asked[-1] is None
+    assert image.size == (800, 800)  # the picture is drawn all the same
+
+
 def test_the_png_colours_a_cell_by_its_class_and_rings_the_wanted_ones(
     sf: ModuleType, tmp_path: Path
 ) -> None:
