@@ -243,6 +243,40 @@ def test_plate_walls_refs_are_never_saved_and_not_kept_for_a_hand_written_preset
     )
 
 
+def test_a_turn_confirmation_is_never_saved_and_not_kept_for_a_hand_written_preset() -> (
+    None
+):
+    # objective-offsets (#380) turns the turret over a loaded plate: "the stage is clear"
+    # is true of one run, and a preset that kept it would confirm the next session's
+    # turns for the operator (FM-14).
+    recorded = _recorded(
+        "objective-offsets",
+        targets=["Nikon 40X Plan Fluor ELWD"],
+        calibrations=["cal-40x.json"],
+        confirm_turns=True,
+        search_um=500.0,
+    )
+
+    made = _preset_of(_record("objective-offsets", recorded, result={}))
+
+    pairs = made.preset.params["objective-offsets"]
+    assert pairs == (
+        'targets=["Nikon 40X Plan Fluor ELWD"]',
+        'calibrations=["cal-40x.json"]',
+        "search_um=500.0",
+    )
+    assert made.notes == ()
+
+    preset = Preset(params={"objective-offsets": ("confirm_turns=true",)})
+    check = check_preset(_file(preset), MODELS, stand=STAND, registered=None)
+    assert check.params == {}
+    assert check.mismatches == (
+        "preset weekly [params.objective-offsets]: confirm_turns is not kept under "
+        "params: the stage is clear only for the run that confirmed it: every run "
+        "confirms it again",
+    )
+
+
 @pytest.mark.parametrize(
     "status", [StageStatus.stopped, StageStatus.failed, StageStatus.running]
 )
@@ -304,7 +338,8 @@ def test_a_document_that_saves_nothing_but_refused_a_plugin_says_so() -> None:
 
 #: Per plugin, recorded values that differ from every default (a field per case at
 #: least), and that its ``Params`` accepts. ``cells`` has two cases because
-#: ``detector="blobs"`` refuses a ``model_path`` and a ``device``.
+#: ``detector="blobs"`` refuses a ``model_path``, a ``device`` and the model's
+#: pre-processing (``model_um_per_px``, the percentiles, ``checked_um_per_px``).
 CASES: dict[str, list[dict[str, Any]]] = {
     "camera-calibration": [
         {"step_um": 12.5, "settle_ms": 30.0, "from_run_doc": "C:\\runs\\a b\\run.json"}
@@ -316,11 +351,31 @@ CASES: dict[str, list[dict[str, Any]]] = {
             "max_overlap": 0.55,
             "merge_radius_um": 7.5,
         },
-        {"detector": "model", "model_path": "/x/w.pt", "device": "cpu"},
+        {
+            "detector": "model",
+            "model_path": "/x/w.pt",
+            "device": "cpu",
+            "model_um_per_px": 0.49,
+            "low_percentile": 1.0,
+            "high_percentile": 99.0,
+            "checked_um_per_px": 0.2756,
+        },
     ],
     "density": [{"area_grid_um": 12.5}],
     "goto-well": [{"well": "B2", "side": "-X"}],
     "nis-export": [{"out": "/tmp/x y/out.xml", "overwrite": True}],
+    "objective-offsets": [
+        {
+            "targets": ["Nikon 40X Plan Fluor ELWD", "Nikon 20X Plan Fluor ELWD"],
+            "calibrations": ["cal-40x.json", "C:\\runs\\a b\\cal-20x.json"],
+            "confirm_turns": True,
+            "wells": ["A1", "H12"],
+            "search_um": 500.0,
+            "max_spread_um": 5.0,
+            "settle_ms": 30.0,
+            "save_frames": False,
+        }
+    ],
     "plate-finding": [
         {
             "plate": "24-well",

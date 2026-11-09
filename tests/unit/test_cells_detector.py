@@ -30,12 +30,16 @@ from smc.plugins.cells.detector import (
     BLOB_DETECTOR,
     BLOB_DETECTOR_IDENTITY,
     DEFAULT_MODEL,
+    MAX_INPUT_PX,
+    MIN_INPUT_PX,
     BlobDetector,
     Detection,
     Detector,
+    Preprocessing,
     default_model_path,
     detections_from_output,
     load_detector,
+    model_input_size_px,
     normalize_plane,
 )
 from smc.testing import Blob, PlateSample
@@ -267,6 +271,113 @@ def test_a_constant_frame_normalizes_to_zero() -> None:
 
     assert out.dtype == np.float32
     assert not out.any()
+
+
+def test_the_bit_depth_does_not_change_the_normalised_plane() -> None:
+    """A 12-bit frame and the same frame times 16 reach the model alike: no bit-depth parameter (m3 §9.4)."""
+    rng = np.random.default_rng(0)
+    frame = rng.integers(0, 4096, size=(60, 80), dtype=np.uint16)
+
+    low = normalize_plane(frame)
+    high = normalize_plane(frame * np.uint16(16))
+
+    assert float(np.abs(low - high).max()) <= 1e-6
+    # And the frame is not flat, so the equality is not that of two blank planes.
+    assert float(low.max()) == 1.0
+
+
+def test_the_percentiles_asked_for_clip_the_plane() -> None:
+    ramp = np.tile(np.arange(101, dtype=np.uint16), (4, 1))
+
+    wide = normalize_plane(ramp, (0.0, 100.0))
+    narrow = normalize_plane(ramp, (10.0, 90.0))
+
+    # Percentile 10 of 0..100 is 10: the pixel at 10 is the floor, and 95 is above 90.
+    assert float(narrow[0, 10]) == 0.0
+    assert float(narrow[0, 95]) == 1.0
+    assert 0.0 < float(wide[0, 10]) < 0.2
+
+
+# --- pre-processing: the input size and the defaults (m3 §9.4, #342) -------------
+
+
+def test_the_default_preprocessing_is_what_the_model_was_trained_with() -> None:
+    assert Preprocessing() == Preprocessing(percentiles=(0.5, 99.5), input_size_px=None)
+
+
+def test_model_input_size_follows_the_two_pixel_sizes() -> None:
+    # 0.3 um per pixel shown at 0.6: half the pixels. Rows then columns, so the
+    # shorter side first whichever way the frame is oriented.
+    assert model_input_size_px((1200, 1600), 0.3, 0.6) == (600, 800)
+    assert model_input_size_px((1600, 1200), 0.3, 0.6) == (600, 800)
+    # round on the short side, ceil on the long one: 794.2 and 794.2.
+    assert model_input_size_px((1412, 1412), 0.2756, 0.49) == (794, 795)
+
+
+def test_the_long_side_never_binds_by_a_pixel() -> None:
+    """torchvision scales by the smaller of min/short and max/long: a rounded-down long side would bind."""
+    # 499.6 rounds up to 500 and 501.1 up to 502: a rounded long side (501) would give
+    # a scale of 501 / 1003 = 0.4995, under 500 / 1000, and the long side would bind.
+    short, long = model_input_size_px((1000, 1003), 0.4996, 1.0)
+
+    assert (short, long) == (500, 502)
+    assert short / 1000 <= long / 1003
+
+
+@pytest.mark.parametrize(
+    ("model_um", "size"), [(2.0, "195"), (0.09, "4324")], ids=["too small", "too large"]
+)
+def test_a_model_input_out_of_bounds_is_refused(model_um: float, size: str) -> None:
+    assert (MIN_INPUT_PX, MAX_INPUT_PX) == (256, 4096)
+
+    with pytest.raises(ValueError, match="would be") as caught:
+        model_input_size_px((1412, 1412), 0.2756, model_um)
+
+    message = str(caught.value)
+    assert "0.2756" in message
+    assert f"{model_um:g}" in message
+    assert size in message
+    assert message.isascii()
+
+
+def test_the_bounds_are_inclusive() -> None:
+    # 256 px is the smallest short side, 4096 the largest long side.
+    assert model_input_size_px((512, 512), 0.5, 1.0) == (256, 256)
+    assert model_input_size_px((2048, 4096), 1.0, 1.0)[1] == 4096
+    with pytest.raises(ValueError, match="short side"):
+        model_input_size_px((512, 510), 0.5, 1.0)
+    with pytest.raises(ValueError, match="long side"):
+        model_input_size_px((2048, 4097), 1.0, 1.0)
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf, 0.0, -0.3])
+def test_a_pixel_size_that_is_not_finite_and_positive_is_refused(bad: float) -> None:
+    with pytest.raises(ValueError, match="um_per_px"):
+        model_input_size_px((1412, 1412), bad, 0.49)
+    with pytest.raises(ValueError, match="um_per_px"):
+        model_input_size_px((1412, 1412), 0.2756, bad)
+
+
+def test_preprocessing_takes_the_whole_range_of_percentiles() -> None:
+    """0 and 100 are the minimum and the maximum of the frame: a range, not an error."""
+    assert Preprocessing(percentiles=(0.0, 100.0)).percentiles == (0.0, 100.0)
+    assert Preprocessing(percentiles=(0.0, 0.1)).percentiles == (0.0, 0.1)
+    assert Preprocessing(percentiles=(99.9, 100.0)).percentiles == (99.9, 100.0)
+
+
+def test_preprocessing_refuses_percentiles_that_do_not_order() -> None:
+    for bad in [(99.5, 0.5), (50.0, 50.0), (-1.0, 99.0), (1.0, 101.0)]:
+        with pytest.raises(ValueError, match="percentiles"):
+            Preprocessing(percentiles=bad)
+    with pytest.raises(ValueError, match="percentiles"):
+        Preprocessing(percentiles=(math.nan, 99.5))
+
+
+def test_preprocessing_refuses_an_input_size_that_is_not_two_positive_sizes() -> None:
+    with pytest.raises(ValueError, match="input_size_px"):
+        Preprocessing(input_size_px=(0, 800))
+    with pytest.raises(ValueError, match="input_size_px"):
+        Preprocessing(input_size_px=(800, -1))
 
 
 # --- the model's output -------------------------------------------------------
@@ -534,6 +645,7 @@ def _fake_detector(
     *,
     device: str = "cpu",
     score_threshold: float = 0.2,
+    preprocessing: Preprocessing | None = None,
 ) -> Detector:
     """A ``TorchDetector`` built by ``load_detector`` around ``model``, on a real small checkpoint."""
     import torchvision.models.detection as detection
@@ -544,7 +656,14 @@ def _fake_detector(
 
     monkeypatch.setattr(detection, "fasterrcnn_resnet50_fpn", build)
     path = _checkpoint(tmp_path, {"model_state_dict": _state(4), "classes": CLASSES})
-    return load_detector(path, device=device, score_threshold=score_threshold)
+    if preprocessing is None:
+        return load_detector(path, device=device, score_threshold=score_threshold)
+    return load_detector(
+        path,
+        device=device,
+        score_threshold=score_threshold,
+        preprocessing=preprocessing,
+    )
 
 
 def test_detect_labels_thresholds_and_orders_what_the_model_returns(
@@ -632,6 +751,95 @@ def test_a_frame_below_the_models_box_limit_is_no_warning(
         detector.detect(np.zeros((20, 30), np.uint16))
 
     assert not [r for r in caplog.records if r.name == "smc.plugins.cells"]
+
+
+def test_without_an_input_size_the_model_keeps_its_own_resize(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No ``min_size`` or ``max_size`` is passed: torchvision's 800 and 1333, as trained."""
+    model = _FakeModel([], [], [])
+    _fake_detector(tmp_path, monkeypatch, model)
+
+    assert "min_size" not in model.built_with
+    assert "max_size" not in model.built_with
+
+
+def test_the_model_input_size_reaches_the_resize(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Built by torchvision itself: its transform, not a fake, holds the sizes we asked for."""
+    _torch()
+    import torchvision.models.detection as detection
+
+    real = detection.fasterrcnn_resnet50_fpn
+    built: list[Any] = []
+
+    def build(**kwargs: Any) -> Any:
+        model = real(**kwargs)
+        # The checkpoint of the helper is one tensor: what is under test is the resize.
+        model.load_state_dict = lambda state, strict: None
+        built.append(model)
+        return model
+
+    monkeypatch.setattr(detection, "fasterrcnn_resnet50_fpn", build)
+    path = _checkpoint(tmp_path, {"model_state_dict": _state(4), "classes": CLASSES})
+
+    load_detector(
+        path,
+        device="cpu",
+        score_threshold=0.5,
+        preprocessing=Preprocessing(input_size_px=(300, 400)),
+    )
+
+    (model,) = built
+    assert model.transform.min_size == (300,)
+    assert model.transform.max_size == 400
+
+
+def test_the_percentiles_reach_normalize_plane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The seam between the parameter and the plane the model sees (FM-124): a spy on the module's function."""
+    seen: list[tuple[float, float]] = []
+    real = detector_mod.normalize_plane
+
+    def spy(
+        plane: np.ndarray[Any, Any], percentiles: tuple[float, float] = (0.5, 99.5)
+    ) -> np.ndarray[Any, Any]:
+        seen.append(percentiles)
+        return real(plane, percentiles)
+
+    monkeypatch.setattr(detector_mod, "normalize_plane", spy)
+    detector = _fake_detector(
+        tmp_path,
+        monkeypatch,
+        _FakeModel([], [], []),
+        preprocessing=Preprocessing(percentiles=(1.0, 99.0)),
+    )
+
+    detector.detect(np.arange(60 * 80, dtype=np.uint16).reshape(60, 80))
+
+    assert seen == [(1.0, 99.0)]
+
+
+def test_the_default_percentiles_are_the_trained_ones(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[tuple[float, float]] = []
+    real = detector_mod.normalize_plane
+
+    def spy(
+        plane: np.ndarray[Any, Any], percentiles: tuple[float, float] = (0.0, 0.0)
+    ) -> np.ndarray[Any, Any]:
+        seen.append(percentiles)
+        return real(plane, percentiles)
+
+    monkeypatch.setattr(detector_mod, "normalize_plane", spy)
+    detector = _fake_detector(tmp_path, monkeypatch, _FakeModel([], [], []))
+
+    detector.detect(np.arange(60 * 80, dtype=np.uint16).reshape(60, 80))
+
+    assert seen == [(0.5, 99.5)]
 
 
 # --- the trained model (torch and the weights) --------------------------------

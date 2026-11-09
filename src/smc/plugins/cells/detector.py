@@ -36,13 +36,18 @@ __all__ = [
     "BLOB_DETECTOR",
     "BLOB_DETECTOR_IDENTITY",
     "DEFAULT_MODEL",
+    "DEFAULT_PREPROCESSING",
+    "MAX_INPUT_PX",
+    "MIN_INPUT_PX",
     "BlobDetector",
     "Detection",
     "Detector",
+    "Preprocessing",
     "TorchDetector",
     "default_model_path",
     "detections_from_output",
     "load_detector",
+    "model_input_size_px",
     "normalize_plane",
 ]
 
@@ -100,6 +105,91 @@ def normalize_plane(
     low, high = np.percentile(values, percentiles)
     scaled = np.clip((values - low) / (high - low + 1e-6), 0.0, 1.0)
     return np.asarray(scaled, dtype=np.float32)
+
+
+#: The smallest short side and the largest long side, in pixels, that the model is asked
+#: to resize a frame to. Below 256 a cell of the stand's 40x frames is a few pixels and
+#: the backbone has nothing to see; above 4096 a forward pass costs seconds and the
+#: 100-box limit is reached on any frame with cells (m3 §9.4).
+MIN_INPUT_PX = 256
+MAX_INPUT_PX = 4096
+
+
+@dataclass(frozen=True, slots=True)
+class Preprocessing:
+    """What is done to a frame before the model sees it, beyond what it was trained with.
+
+    ``percentiles`` are the intensity scaling of ``normalize_plane``: as trained,
+    0.5 and 99.5. ``input_size_px`` is torchvision's ``(min_size, max_size)``, the size
+    the frame is resized to before the network, and ``None`` keeps the model's own 800
+    and 1333. Its boxes come back in the frame's own pixels either way. The bit depth
+    is not here: a gain changes nothing the percentiles do not undo (measured, §9.4).
+    """
+
+    percentiles: tuple[float, float] = (0.5, 99.5)
+    input_size_px: tuple[int, int] | None = None
+
+    def __post_init__(self) -> None:
+        low, high = self.percentiles
+        # `not (a < b)` and not `a >= b`: nan fails the first and passes the second.
+        if not (0.0 <= low < high <= 100.0):
+            raise ValueError(
+                f"percentiles must satisfy 0 <= low < high <= 100, got {self.percentiles}"
+            )
+        if self.input_size_px is not None and min(self.input_size_px) < 1:
+            raise ValueError(
+                f"input_size_px must be two sizes of at least 1 pixel, "
+                f"got {self.input_size_px}"
+            )
+
+
+#: How the model was trained: its own resize and the 0.5 / 99.5 percentiles. The default
+#: of the two constructors below, a frozen value so that sharing it is safe.
+DEFAULT_PREPROCESSING = Preprocessing()
+
+
+def model_input_size_px(
+    image_shape_px: tuple[int, int],
+    frame_um_per_px: float,
+    model_um_per_px: float,
+) -> tuple[int, int]:
+    """The ``(min_size, max_size)`` that shows a frame to the model at ``model_um_per_px``.
+
+    The model cannot be told a pixel size, only the size its input is resized to, so
+    the scale is the ratio of the two pixel sizes. torchvision scales by the smaller
+    of ``min_size / short side`` and ``max_size / long side``: the short side is
+    rounded and the long side rounded **up**, so that the short side sets the scale
+    and the long one cannot bind by a pixel. A frame of 1412 pixels at 0.2756 µm
+    shown at 0.49 µm is ``(794, 795)``.
+
+    Raises:
+        ValueError: A pixel size is not finite and positive, or the size is under
+            ``MIN_INPUT_PX`` on the short side or over ``MAX_INPUT_PX`` on the long
+            one. The message names both pixel sizes and the size it would give.
+    """
+    for name, value in (
+        ("frame_um_per_px", frame_um_per_px),
+        ("model_um_per_px", model_um_per_px),
+    ):
+        if not (math.isfinite(value) and value > 0.0):
+            raise ValueError(f"{name} must be a finite pixel size above 0, got {value}")
+    scale = frame_um_per_px / model_um_per_px
+    short_px = min(image_shape_px) * scale
+    long_px = max(image_shape_px) * scale
+    if not (math.isfinite(short_px) and math.isfinite(long_px)):
+        raise ValueError(
+            f"frame_um_per_px {frame_um_per_px:g} over model_um_per_px "
+            f"{model_um_per_px:g} is not a usable scale"
+        )
+    size = (round(short_px), math.ceil(long_px))
+    if size[0] < MIN_INPUT_PX or size[1] > MAX_INPUT_PX:
+        raise ValueError(
+            f"a {image_shape_px[0]}x{image_shape_px[1]} px frame at {frame_um_per_px:g} "
+            f"um per pixel shown to the model at {model_um_per_px:g} um per pixel would "
+            f"be {size[0]}x{size[1]} px; the short side must be at least "
+            f"{MIN_INPUT_PX} and the long side at most {MAX_INPUT_PX}"
+        )
+    return size
 
 
 def detections_from_output(
@@ -166,6 +256,10 @@ class TorchDetector:
             unasked, some detection ops are not implemented there), ``cpu``,
             ``cuda`` or ``mps``.
         score_threshold: Detections below it are dropped.
+        preprocessing: The intensity percentiles and the size the frame is resized to
+            before the network. The default is how the model was trained: its own
+            resize (800 and 1333) and the 0.5 and 99.5 percentiles. The resize is
+            built into the model, so it is set here and not per frame.
 
     Raises:
         ImportError: torch or torchvision is not installed, or one of their
@@ -179,7 +273,14 @@ class TorchDetector:
     classes: tuple[str, ...]
     device: str
 
-    def __init__(self, weights: Path, *, device: str, score_threshold: float) -> None:
+    def __init__(
+        self,
+        weights: Path,
+        *,
+        device: str,
+        score_threshold: float,
+        preprocessing: Preprocessing = DEFAULT_PREPROCESSING,
+    ) -> None:
         import torch
         from torchvision.models.detection import fasterrcnn_resnet50_fpn
 
@@ -228,8 +329,17 @@ class TorchDetector:
             )
 
         resolved = _resolve_device(torch, device)
+        # The resize has no weights, so the checkpoint loads strictly whatever the
+        # size. Only an input size that was asked for is passed: without one the
+        # model keeps the 800 and 1333 it was trained with.
+        size: dict[str, int] = {}
+        if preprocessing.input_size_px is not None:
+            size = {
+                "min_size": preprocessing.input_size_px[0],
+                "max_size": preprocessing.input_size_px[1],
+            }
         model = fasterrcnn_resnet50_fpn(
-            weights=None, weights_backbone=None, num_classes=len(names)
+            weights=None, weights_backbone=None, num_classes=len(names), **size
         )
         try:
             model.load_state_dict(state, strict=True)
@@ -250,6 +360,7 @@ class TorchDetector:
             ) from exc
 
         self.score_threshold = score_threshold
+        self.preprocessing = preprocessing
         self.classes = tuple(names[1:])
         self.device = resolved
         self._labels = tuple(names)
@@ -264,9 +375,10 @@ class TorchDetector:
     def detect(self, frame: npt.NDArray[Any]) -> list[Detection]:
         """The cells of one frame above the score threshold, labelled from the full class list.
 
-        One frame per forward pass, under ``no_grad``, with the model's own
-        resize: batching frames is not decided here. The plane is repeated to
-        three channels, which is what the backbone expects.
+        One frame per forward pass, under ``no_grad``, resized by the model as
+        ``preprocessing`` set it: batching frames is not decided here. The plane
+        is scaled with ``preprocessing.percentiles`` and repeated to three
+        channels, which is what the backbone expects.
 
         Raises:
             ValueError: ``frame`` is not 2-D (a colour frame is not a brightfield one).
@@ -277,7 +389,7 @@ class TorchDetector:
                 f"detect takes one 2-D frame, got an array of shape {array.shape}"
             )
         torch = self._torch
-        plane = torch.from_numpy(normalize_plane(array))
+        plane = torch.from_numpy(normalize_plane(array, self.preprocessing.percentiles))
         tensor = plane[None].repeat(3, 1, 1).to(self.device)
         with torch.no_grad():
             out = self._model([tensor])[0]
@@ -408,7 +520,11 @@ def _resolve_device(torch: Any, requested: str) -> str:
 
 
 def load_detector(
-    model_path: Path | None, *, device: str, score_threshold: float
+    model_path: Path | None,
+    *,
+    device: str,
+    score_threshold: float,
+    preprocessing: Preprocessing = DEFAULT_PREPROCESSING,
 ) -> Detector:
     """The trained detector, or a ``PluginRunError`` that says what to do about it.
 
@@ -423,6 +539,7 @@ def load_detector(
         model_path: The checkpoint, or ``None`` for ``default_model_path()``.
         device: As ``TorchDetector``.
         score_threshold: As ``TorchDetector``.
+        preprocessing: As ``TorchDetector``; the default is today's behaviour.
 
     Raises:
         PluginRunError: The file is missing or cannot be looked for, torch is
@@ -446,7 +563,12 @@ def load_detector(
             f"its folder, or give model_path",
         )
     try:
-        return TorchDetector(path, device=device, score_threshold=score_threshold)
+        return TorchDetector(
+            path,
+            device=device,
+            score_threshold=score_threshold,
+            preprocessing=preprocessing,
+        )
     except ImportError as exc:
         # Every ImportError, not ModuleNotFoundError alone: `DLL load failed while
         # importing _imaging` is one, and it is not a missing package.

@@ -11,14 +11,16 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from smc.hardware.capabilities import Camera, XYStage
+from smc.hardware.capabilities import Camera, ObjectiveTurret, XYStage
 from smc.hardware.errors import MicroscopeHaltedError
 from smc.hardware.microscope import Microscope
-from smc.hardware.profile import Profile
+from smc.hardware.profile import Profile, SampleSection
 from smc.testing.sample_stand import StandSampleCamera
+from smc.testing.synthetic import PlateSample
 
 pytestmark = pytest.mark.demo
 
@@ -84,6 +86,87 @@ def test_a_dry_run_snaps(mm_available: bool) -> None:
 
     assert frame.ndim == 2
     assert float(frame.mean()) < 1500  # the origin: plastic
+
+
+TEN = "Nikon 10X S Fluor"
+FORTY = "Nikon 40X Plan Fluor ELWD"
+#: The declared shift of the 40X (m3 §20.8): under it a feature is centred at its
+#: position plus this, so the sample is rendered at the position minus this.
+SHIFT_FORTY = (-32.5, 9.75)
+
+
+@pytest.fixture
+def shifted_stand(mm_available: bool) -> Iterator[Microscope]:
+    """``demo-sample`` whose 40X is offset by ``SHIFT_FORTY`` and whose 10X (in place at open) has no entry."""
+    if not mm_available:
+        pytest.skip("Micro-Manager demo adapters not installed")
+    profile = Profile.load(DEMO_SAMPLE).model_copy(
+        update={"sample": SampleSection(objective_shift_um={FORTY: SHIFT_FORTY})}
+    )
+    microscope = Microscope.open(profile)
+    try:
+        yield microscope
+    finally:
+        microscope.close()
+
+
+@pytest.fixture
+def renders(monkeypatch: pytest.MonkeyPatch) -> list[tuple[float, float]]:
+    """Where each snap of the sample camera is rendered: ``PlateSample.render``'s first two arguments.
+
+    Two snaps at one place are not equal (the noise is drawn per snap), so the
+    frames are never compared: the place the sample is rendered at is what the
+    shift changes (m3 §20.1).
+    """
+    seen: list[tuple[float, float]] = []
+    original = PlateSample.render
+
+    def recording(
+        self: PlateSample, x_um: float, y_um: float, *args: Any, **kwargs: Any
+    ) -> Any:
+        seen.append((x_um, y_um))
+        return original(self, x_um, y_um, *args, **kwargs)
+
+    monkeypatch.setattr(PlateSample, "render", recording)
+    return seen
+
+
+def test_an_objective_shift_moves_where_the_sample_is_rendered(
+    shifted_stand: Microscope, renders: list[tuple[float, float]]
+) -> None:
+    stage = shifted_stand.require(XYStage)
+    camera = shifted_stand.require(Camera)
+    turret = shifted_stand.require(ObjectiveTurret)
+    assert turret.current() == TEN
+    stage.move_to_um(1000.0, -2000.0)
+
+    # Under the 10X, which has no entry, the sample is rendered at the stage's
+    # readback itself, never the target: the demo stage reads (123.495, -45.255)
+    # after a move to (123.5, -45.25), m3 §20.1 (FM-142).
+    here = stage.position_um()
+    camera.snap()
+    assert renders[-1] == pytest.approx((here.x_um, here.y_um), abs=1e-9)
+
+    # Under the 40X it is rendered at the readback minus (-32.5, 9.75): a feature
+    # is centred 32.5 um west and 9.75 um north of where the stage says.
+    turret.select(FORTY, confirm=True)
+    here = stage.position_um()
+    camera.snap()
+    assert renders[-1] == pytest.approx((here.x_um + 32.5, here.y_um - 9.75), abs=1e-9)
+
+
+def test_a_stand_without_shifts_renders_at_the_stage_under_every_objective(
+    sample_stand: Microscope, renders: list[tuple[float, float]]
+) -> None:
+    stage = sample_stand.require(XYStage)
+    camera = sample_stand.require(Camera)
+    sample_stand.require(ObjectiveTurret).select(FORTY, confirm=True)
+    stage.move_to_um(1000.0, -2000.0)
+
+    here = stage.position_um()
+    camera.snap()
+
+    assert renders[-1] == pytest.approx((here.x_um, here.y_um), abs=1e-9)
 
 
 def test_the_default_demo_profile_is_unchanged(mm_available: bool) -> None:

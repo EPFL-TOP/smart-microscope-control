@@ -44,3 +44,8 @@ htmlcov/
 # .cfg files that embed COM ports and serial numbers are not)
 CoreLog*.txt
 /local/
+
+# What write_atomically keeps when only the final rename failed (Windows: an editor
+# holds the file), e.g. profiles/.nikon-ti2.toml.<token>.smc-tmp after
+# `smc objective offset --write`: the whole new text, not to be committed
+*.smc-tmp

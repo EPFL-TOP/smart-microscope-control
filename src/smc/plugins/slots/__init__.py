@@ -14,6 +14,12 @@ from smc.plugins.slots.camera_calibration import CameraCalibration
 from smc.plugins.slots.cells import Cell, CellsFile, CellsResult, load_cells
 from smc.plugins.slots.density import DensityResult, DensityWell
 from smc.plugins.slots.nis_export import NisExportResult
+from smc.plugins.slots.objective_offsets import (
+    MeasuredOffset,
+    ObjectiveOffsetsResult,
+    OffsetWell,
+    TargetMeasure,
+)
 from smc.plugins.slots.plate import (
     IMAGE_SIDES,
     ImageSide,
@@ -54,7 +60,10 @@ __all__ = [
     "FocusState",
     "ImageSide",
     "LatticeFit",
+    "MeasuredOffset",
     "NisExportResult",
+    "ObjectiveOffsetsResult",
+    "OffsetWell",
     "PlannedField",
     "PlateResult",
     "ReportResult",
@@ -64,6 +73,7 @@ __all__ = [
     "ScanPlanResult",
     "ScanResult",
     "SlotValue",
+    "TargetMeasure",
     "TimingsResult",
     "WallFrame",
     "WallImages",

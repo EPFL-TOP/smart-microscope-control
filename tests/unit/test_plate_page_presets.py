@@ -272,6 +272,13 @@ def test_what_a_preset_does_not_keep_under_params_is_what_the_page_fills() -> No
     # these two pops and let `kept_elsewhere == filled` say it.
     assert kept_elsewhere.pop("plate-walls") == {"refs"}
     assert filled.pop("plate-walls") == {"plate", "refs"}
+    # objective-offsets (#380): a preset never keeps `confirm_turns`, the operator's word
+    # that the stage is clear for the turret to turn over the plate, which holds for one
+    # run (FM-14). The page has no step for the tool yet: it will fill the key there,
+    # from its own confirmation (#382). With that step, drop this pop and let
+    # `kept_elsewhere == filled` say it.
+    assert kept_elsewhere.pop("objective-offsets") == {"confirm_turns"}
+    assert "objective-offsets" not in filled
     assert kept_elsewhere == filled
 
 

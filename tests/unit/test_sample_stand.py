@@ -25,7 +25,7 @@ import pytest
 import useq
 from pymmcore_plus import DeviceType
 
-from smc.hardware.capabilities import Camera, XYStage, ZStage
+from smc.hardware.capabilities import Camera, ObjectiveTurret, XYStage, ZStage
 from smc.hardware.errors import HardwareError, MicroscopeHaltedError, ProfileError
 from smc.hardware.microscope import Microscope
 from smc.hardware.profile import Profile, SampleSection
@@ -324,6 +324,26 @@ def test_sample_lines_are_text_a_windows_console_prints() -> None:
         line.encode("cp1252")
 
 
+_SHIFTS = {"Nikon 10X S Fluor": (5.0, -2.5), "Nikon 40X Plan Fluor ELWD": (-32.5, 9.75)}
+
+
+def test_sample_lines_add_a_fourth_line_when_the_objectives_are_offset() -> None:
+    lines = sample_lines(SampleSection(objective_shift_um=_SHIFTS))
+
+    assert len(lines) == 4
+    # The first three lines are the sample's own, whatever the shifts are.
+    assert lines[:3] == sample_lines(SampleSection())
+    assert lines[3] == (
+        "  the objectives are offset: 'Nikon 10X S Fluor' (+5.00, -2.50) µm, "
+        "'Nikon 40X Plan Fluor ELWD' (-32.50, +9.75) µm"
+    )
+    lines[3].encode("cp1252")
+
+
+def test_sample_lines_stay_three_without_a_shift() -> None:
+    assert len(sample_lines(SampleSection(objective_shift_um={}))) == 3
+
+
 # -- the camera ----------------------------------------------------------------------
 
 
@@ -547,6 +567,94 @@ def test_the_pixel_size_the_stand_has_is_the_scale_of_the_frame(
     inner.pixel_size = 2.0
     _, col = np.unravel_index(int(camera.snap().argmax()), (60, 80))
     assert int(col) == 42  # 39.5 + 2.5
+
+
+def test_a_shift_for_the_objective_in_place_moves_the_sample_the_other_way(
+    fake_microscope: Microscope,
+) -> None:
+    # A feature is centred at the stage position plus the shift (m3 §20.8), so a
+    # blob at the origin, with the stage there and a shift of (20, 10) under the
+    # objective in place, lies 20 um east and 10 um north of the frame's centre:
+    # east is right of the centre column (39.5), north above the centre row (29.5).
+    sample = PlateSample(blobs=[Blob(0.0, 0.0, 3.0, 3000.0)], **DARK)
+    camera = _stand_camera(
+        fake_microscope,
+        _Inner(shape=(60, 80)),
+        sample,
+        objective_shift_um={"Nikon 10X S Fluor": (20.0, 10.0)},
+    )
+
+    row, col = np.unravel_index(int(camera.snap().argmax()), (60, 80))
+
+    assert int(col) in (59, 60)
+    assert int(row) in (19, 20)
+
+
+def test_a_shift_for_another_objective_leaves_the_sample_where_it_is(
+    fake_microscope: Microscope,
+) -> None:
+    sample = PlateSample(blobs=[Blob(0.0, 0.0, 3.0, 3000.0)], **DARK)
+    camera = _stand_camera(
+        fake_microscope,
+        _Inner(shape=(60, 80)),
+        sample,
+        objective_shift_um={"Nikon 40X Plan Fluor ELWD": (20.0, 10.0)},
+    )
+
+    row, col = np.unravel_index(int(camera.snap().argmax()), (60, 80))
+
+    assert int(col) in (39, 40)
+    assert int(row) in (29, 30)
+
+
+def test_the_shifts_a_camera_was_given_are_its_own_copy(
+    fake_microscope: Microscope,
+) -> None:
+    shifts = {"Nikon 10X S Fluor": (20.0, 0.0)}
+    sample = PlateSample(blobs=[Blob(0.0, 0.0, 3.0, 3000.0)], **DARK)
+    camera = _stand_camera(
+        fake_microscope, _Inner(shape=(60, 80)), sample, objective_shift_um=shifts
+    )
+
+    shifts.clear()
+
+    _, col = np.unravel_index(int(camera.snap().argmax()), (60, 80))
+    assert int(col) in (59, 60)
+
+
+def test_a_camera_with_no_shift_never_reads_the_turret(
+    fake_microscope: Microscope, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The default path is the camera of every stand that has a [sample] and no
+    # shifts: a turret read it does not need is one more way for a snap to fail.
+    turret = fake_microscope.require(ObjectiveTurret)
+
+    def read() -> str:
+        raise AssertionError("the turret was read")
+
+    monkeypatch.setattr(turret, "current", read)
+    for shifts in (None, {}):
+        camera = _stand_camera(fake_microscope, _Inner(), objective_shift_um=shifts)
+        camera.snap()
+
+
+def test_a_turret_that_cannot_be_read_is_a_hardware_error_not_an_unshifted_frame(
+    fake_microscope: Microscope, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    turret = fake_microscope.require(ObjectiveTurret)
+
+    def read() -> str:
+        raise HardwareError("the turret does not answer")
+
+    monkeypatch.setattr(turret, "current", read)
+    camera = _stand_camera(
+        fake_microscope,
+        _Inner(),
+        objective_shift_um={"Nikon 10X S Fluor": (20.0, 0.0)},
+    )
+
+    with pytest.raises(HardwareError, match="the turret does not answer"):
+        camera.snap()
 
 
 def test_the_stand_camera_reads_z_from_the_stage(fake_microscope: Microscope) -> None:

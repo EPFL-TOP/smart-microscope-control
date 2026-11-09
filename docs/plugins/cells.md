@@ -45,6 +45,7 @@ worktree: set `SMC_MODELS` to the main folder's `local/models`.
 smc run cells -p <profile> --run-doc run.json
 smc run cells -p <profile> --run-doc run.json --param device=cpu
 smc run cells -p <profile> --run-doc run.json --param merge_radius_um=3
+smc run cells -p <profile> --run-doc run.json --param model_um_per_px=0.49
 smc run cells -p <profile> --run-doc run.json --resume
 ```
 
@@ -56,6 +57,9 @@ smc run cells -p <profile> --run-doc run.json --resume
 | `score_threshold` | 0.5 | Detections below it are dropped (0.05 to 1). The blob detector scores every detection 1.0, so it has no effect there. |
 | `max_overlap` | 0.7 | Two boxes of one frame sharing more than this fraction of the smaller one are one object; the more confident label stays. |
 | `merge_radius_um` | 5 | Cells of two fields within this distance are one cell. 0 merges nothing. |
+| `model_um_per_px` | unset | The pixel size the model sees, in µm (above 0, up to 10): each frame is resized by the scan's pixel size over this one. Unset keeps the model's own resize to 800 px. A size the model is not given (a short side under 256 px or a long side over 4096 px) is refused before the weights are read, with the size it would have been. Refused with `detector=blobs`. |
+| `low_percentile`, `high_percentile` | 0.5, 99.5 | The percentiles of a frame's intensities that are black and white for the model, as it was trained (`low` under 50, `high` over 50). Refused with `detector=blobs` unless they are the defaults. |
+| `checked_um_per_px` | unset | The frames' pixel size at which this model and these parameters were measured on annotated frames ([below](#checking-the-model-on-a-stands-frames)). It changes **nothing** in the detection: it is what `assumed` compares the scan's pixel size with. Refused with `detector=blobs`. |
 
 It needs a scan with frames: a dry-run scan, or one whose every field failed, has
 none and is refused (`the scan has no frame ...; run scan again`). `--dry-run`
@@ -107,6 +111,125 @@ parameter, next to `score_threshold`. Measured on the synthetic plate, it finds 
 the 5 single and 3 paired spots of a frame at 0.1625, 0.25, 0.5, 1 and 2 µm per
 pixel, and nothing on a frame that crosses a well wall.
 
+## Checking the model on a stand's frames
+
+The model was trained by `nikon-control` on frames whose camera and pixel size
+nobody recorded: the checkpoint holds none. Before a stand's counts are used, the
+model is **measured on that stand's own frames**, against a reference the owner
+annotated. `scripts/dev/cells_check.py` does the two ends of it; the owner's eye
+is in the middle. Run it with an interpreter that has smc and torch: the stand's
+PC with the `detect` extra, or on a Mac `../nikon-control/.venv/bin/python` with
+`PYTHONPATH=src`. It prints ASCII, reads and writes UTF-8, and moves nothing.
+
+**1. Export a few frames of a finished scan.**
+
+```text
+python scripts/dev/cells_check.py export local/scans/<date>/run.json local/cells-check/<date> --count 15
+```
+
+It takes the frames of `--wells` (all by default), keeps `--count` of them evenly
+spaced (20 by default; all, when there are fewer), and writes a folder that
+`nikon-control`'s review page opens: `images/` (the frames, copied unchanged),
+`annotations/val.json` (COCO, every image `reviewed: false`) and `manifest.json` (the
+run document's file name, never its path; the scan's objective, pixel size and frame
+shape; for each image its frame file, well and stage position; the draft's detector
+and the weights' file name and SHA-256). A folder that exists and is not empty is
+refused: the owner's annotations are never overwritten. If a frame cannot be copied
+(another program holds it, after five tries), what the export made is removed and the
+message names the frame, so the same command can be run again. The draft is the model's
+boxes from a score of 0.3 (`--prefill model`, the default; `--prefill blobs` and
+`--prefill none` are the others), each marked `auto`: a proposal to confirm.
+
+**2. Correct them in the review page.**
+
+```text
+nikon-control-dashboard --data-dir local/cells-check --show
+```
+
+(the folder that holds the dataset, not the dataset itself), then open `/review`,
+delete the wrong boxes, add the missing ones, set the classes, and **mark each frame
+you checked as reviewed**, then save. A frame left unreviewed is not measured: its
+boxes are still the draft. About 15 frames are planned for the first scan.
+
+**3. Measure.**
+
+```text
+python scripts/dev/cells_check.py measure local/cells-check/<date> --model-um-per-px native,0.35,0.49 --percentiles 0.5:99.5,1:99 --json numbers.json
+```
+
+For the blob detector (one configuration) and for each pixel size and each pair of
+percentiles for the model, it runs the detector on every reviewed frame as `cells`
+does (the detector, then the suppression of two boxes of one frame at
+`--max-overlap`, 0.7) and matches each detection to one reference box, one to one,
+greedily from the best IoU, at an IoU of at least `--match-iou` (0.5, as the review
+page does). `native` is the model's own resize; a pixel size is shown to the model as
+`model_um_per_px` would show it, from the pixel size of `manifest.json`. A
+configuration that cannot run (no weights, a size the model is not given) says why
+in its own block and the others still run; the exit code is then 1.
+
+**Reading the table.** One block per configuration, headed by what it is (for the
+model, the weights' file name and the first 12 digits of their SHA-256, so that two
+numbers are never from two files). The numbers below are an illustration, not a
+measurement:
+
+```text
+class    reference  detected  matched  precision  recall
+single           1         3        1      0.333   1.000
+doublet          2         1        1      1.000   0.500
+debris           1         0        0          -   0.000
+any box          4         4        3      0.750   0.750
+```
+
+- `reference` is the boxes the owner left of that class, `detected` the boxes the
+  detector gave, `matched` those that are one object **and** of the same class.
+  `precision = matched / detected`: of what it says, how much is right. `recall =
+  matched / reference`: of what is there, how much it finds.
+- `-` is a ratio with nothing under it. A class the detector never gives (`debris`,
+  for `blobs`) has no precision; a class nobody annotated has no recall. It is
+  neither 0 nor a missing number.
+- A single found as a doublet is **one match with the wrong label**: it counts as a
+  missed single and as a false doublet. The `confusion` list under the table names
+  each `reference -> detected` pair that occurs (`none` is no box on that side), so
+  that "which class is taken for which" is read and not guessed.
+- `any box` ignores the labels: how well cells are found, apart from how well they
+  are named.
+- The time per frame is given cold (the first frame) and warm (the mean of the others)
+  apart, because they differ: 0.49 s then 0.32 s for a 1412² frame on an Apple M5
+  Pro's CPU (measured 2026-10-27). A time on a Mac is not the stand's PC's.
+
+**What the reference is worth.** The draft leans the reference towards the model: a
+box the owner did not touch counts as agreed, and the owner looks for wrong boxes
+more than for cells the draft missed. The model's precision and recall are therefore
+an upper bound. `--prefill blobs` or `--prefill none` gives a reference that is not
+the model's, at the price of more drawing; look for the missing cells, not only for
+the wrong boxes. A reference of 15 frames says little about a class with a few
+boxes: read `reference` before the ratios.
+
+**What the model is shown.** The model resizes every frame so that its short side
+is 800 px: a 1412 px frame at 0.2756 µm per pixel (a Prime 95B at 40×) is seen at
+about 0.49 µm per pixel, whatever the frames it was trained on were. `model_um_per_px`
+sets that pixel size, and the size follows from it: `round(short side × scale)` and
+`ceil(long side × scale)`, `scale` being the frame's pixel size over `model_um_per_px`
+(`(794, 795)` for 1412² at 0.2756 shown at 0.49), so that the short side sets the
+scale and the long one cannot bind by a pixel. A larger input costs time (warm, per
+1412² frame on an Apple M5 Pro's CPU: 0.23 s at 600 px, 0.43 s at 800, 0.58 s at 1100,
+0.96 s at 1412) and from about 1100 px a synthetic frame reached the limit of 100
+boxes. The boxes come back in the frame's own pixels whatever the input size. There is
+no crop and no tiling: a crop does not change the pixel size the model sees.
+
+**Why the bit depth is not a parameter.** The model sees a frame scaled between two
+percentiles, so a gain changes nothing: a 12-bit frame and the same frame times 16
+differ by at most 6e-8 once scaled, and an offset of 100 counts changes nothing
+(measured 2026-11-09). The same frame cut to 8 bits differs by 0.0027, which is
+quantisation; no smc frame is 8-bit. `low_percentile` and `high_percentile` are the
+one intensity setting, as trained.
+
+**Setting `checked_um_per_px`.** Once the numbers are chosen, the profile's
+`[suggest.cells]` gives `model_um_per_px`, the percentiles and `checked_um_per_px`
+(the pixel size of the frames they were measured on), and a scan at another pixel
+size says in `assumed` that the measurement does not cover it. No numbers are given
+here: they come from the first scan at 40× (#342).
+
 ## Stop and resume
 
 The unit of work is a well. After each well the cells found so far are written to
@@ -148,7 +271,7 @@ The slot `cells` holds a `CellsResult` (`smc.plugins.slots`):
 | `counts` | Well to label to count, every well of the scan and every label, **zeros included**. A well whose every field failed is absent, as in the scan. |
 | `merged` | How many views were removed as the second sight of a cell, over every well, a resumed run's included. |
 | `seconds_per_frame` | The mean time of `detect` in this attempt; `null` when it detected no frame. |
-| `assumed` | `cells within 5 µm seen by two fields are counted once: a chosen radius, not measured`; empty when `merge_radius_um` is 0. With `detector=blobs`, first the line that says its counts are of bright round spots and not cells. |
+| `assumed` | What the counts rest on without a measurement, one line each, in this order. With `detector=model`, first a line when the model was not measured at this scan's pixel size: `the model's detections were not measured on frames of this stand: checked_um_per_px is not set (docs/plugins/cells.md)` when it is unset, or `the frames are at 0.2756 µm per pixel and the model was checked at 0.49 µm per pixel: its counts at this pixel size are not measured` when the scan's pixel size is more than 5 % from it (relative to the checked one, on either side); within 5 % there is no such line. With `detector=blobs`, instead, the line that says its counts are of bright round spots and not cells. Then `cells within 5 µm seen by two fields are counted once: a chosen radius, not measured`, absent when `merge_radius_um` is 0. |
 
 The cells are in the file, not in the run document: a 96-well plate at 40× is
 about 300 frames per well and thousands of cells per well. `load_cells` reads the
@@ -198,9 +321,16 @@ Nothing in this page was run on a microscope, and CI has neither torch nor the
 weights: the tests of the plugin use a stub detector, and the tests of the model
 are skipped without them.
 
-- The model on **Prime 95B frames**: it was trained on other frames (1024², of a
-  pixel size the checkpoint does not record) and resizes everything to 800
-  pixels. Detections are checked by eye on the first real scan (#198).
+- The model on **Prime 95B frames**: the frames it was trained on are not recorded
+  (the checkpoint holds no size, pixel size or camera, and `nikon-control`'s one ND2 is
+  a 1412² Prime 95B frame at 0.2756 µm per pixel), and it resizes everything to 800
+  px, so a 1412² frame is seen at about 0.49 µm per pixel. It is measured on the first
+  real scan with `scripts/dev/cells_check.py` ([above](#checking-the-model-on-a-stands-frames),
+  #342); until `checked_um_per_px` is set, `assumed` says it was not.
+- **`cells_check.py` itself**, on a stand's PC, and that `/review` opens the folder
+  `export` writes: the format was read from `nikon-control`'s source and written the
+  way its own save writes it, and the script was run on the demo stand's frames, not on
+  a stand's.
 - Its **speed on the microscope PC's CPU**: 0.34 s per frame on an Apple M5 Pro,
   which would make a well of 305 frames about two minutes.
 - **`merge_radius_um = 5`** against real cells: it is half the size of a yeast

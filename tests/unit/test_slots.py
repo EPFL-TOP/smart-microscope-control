@@ -32,7 +32,10 @@ from smc.plugins.slots import (
     DensityWell,
     FailedField,
     LatticeFit,
+    MeasuredOffset,
     NisExportResult,
+    ObjectiveOffsetsResult,
+    OffsetWell,
     PlannedField,
     PlateResult,
     ReportResult,
@@ -42,6 +45,7 @@ from smc.plugins.slots import (
     ScanPlanResult,
     ScanResult,
     SlotValue,
+    TargetMeasure,
     TimingsResult,
     WallFrame,
     WallImages,
@@ -273,6 +277,41 @@ _NIS = {
     "positions": 12,
     "z_mode": "pfs-offset",
 }
+# One well measured under the registration's objective and again under a target
+# (m3 §20.4): the delta is the fit's centre minus the origin, by hand.
+_OFFSET_WELL: dict[str, Any] = {
+    "well": "B3",
+    "origin_xy_um": [10187.0, -10090.4],
+    "delta_xy_um": [-5.0, 2.5],
+    "fit": {**_WELL_FIT, "recorded_xy_um": [10187.0, -10090.4]},
+}
+_OFFSET_TARGET: dict[str, Any] = {
+    "objective": "Nikon 10X Plan Fluor",
+    "calibration": "cal-10x.json",
+    "calibration_measured": "2026-11-09T10:15:03+00:00",
+    "pixel_size_um": 1.1,
+    "z_after_turn_um": 4195.2,
+    "wells": [_OFFSET_WELL],
+    "shift_xy_um": [-5.0, 2.5],
+    "spread_um": 0.0,
+    "max_spread_um": 5.5,
+    "frames": 44,
+    "folder": "objective-offsets/0123456789ab/1",
+}
+_MEASURED_OFFSET: dict[str, Any] = {
+    "objective": "Nikon 10X Plan Fluor",
+    "xy_offset_um": [-5.0, 2.5],
+}
+_OBJECTIVE_OFFSETS: dict[str, Any] = {
+    "assumed": ["the offsets are for the magnifier lever as it was during this run"],
+    "plate_objective": "Nikon 4X Plan Fluor",
+    "reference": "Nikon 4X Plan Fluor",
+    "reference_in_profile": True,
+    "measures": [_OFFSET_TARGET],
+    "offsets": [_MEASURED_OFFSET],
+    "objective_in_place": "Nikon 10X Plan Fluor",
+    "elapsed_s": 61.5,
+}
 
 #: Every model of ``smc.plugins.slots`` with a full and a sparse sample. A module
 #: that lands later adds its rows here (the first test fails until it does).
@@ -372,6 +411,16 @@ SAMPLES: dict[type[BaseModel], Sample] = {
     ),
     ReportResult: (_REPORT, _REPORT),
     NisExportResult: (_NIS, {**_NIS, "positions": 0, "z_mode": "none"}),
+    OffsetWell: (_OFFSET_WELL, {**_OFFSET_WELL, "fit": {**_WELL_FIT, "walls": []}}),
+    TargetMeasure: (
+        _OFFSET_TARGET,
+        {**_OFFSET_TARGET, "z_after_turn_um": None, "wells": [], "folder": None},
+    ),
+    MeasuredOffset: (_MEASURED_OFFSET, _MEASURED_OFFSET),
+    ObjectiveOffsetsResult: (
+        _OBJECTIVE_OFFSETS,
+        {**_OBJECTIVE_OFFSETS, "assumed": [], "measures": [], "offsets": []},
+    ),
 }
 
 #: Models that hold no float at all, so the finite-number walk has nothing to hit.
@@ -545,6 +594,11 @@ RANGES: list[tuple[type[BaseModel], tuple[Any, ...], list[Any], list[Any]]] = [
     (TimingsResult, ("channel_switch_ms",), [-0.1], [0.0]),
     (TimingsResult, ("samples",), [-1], [0]),
     (NisExportResult, ("positions",), [-1], [0]),
+    (TargetMeasure, ("pixel_size_um",), [0.0, -1.0], [1e-6]),
+    (TargetMeasure, ("spread_um",), [-0.1], [0.0]),
+    (TargetMeasure, ("max_spread_um",), [0.0, -1.0], [1e-6]),
+    (TargetMeasure, ("frames",), [-1], [0]),
+    (ObjectiveOffsetsResult, ("elapsed_s",), [-0.1], [0.0]),
 ]
 
 
@@ -614,6 +668,8 @@ MUST_BE_PRESENT: list[tuple[type[BaseModel], tuple[Any, ...]]] = [
     (RouteResult, ("objective",)),
     (RouteResult, ("travel_s",)),
     (TimingsResult, ("refocus_ms",)),
+    (TargetMeasure, ("z_after_turn_um",)),
+    (TargetMeasure, ("folder",)),
 ]
 
 
@@ -897,7 +953,10 @@ SLOTS_MAP = {
     "IMAGE_SIDES",
     "ImageSide",
     "LatticeFit",
+    "MeasuredOffset",
     "NisExportResult",
+    "ObjectiveOffsetsResult",
+    "OffsetWell",
     "PlannedField",
     "PlateResult",
     "ReportResult",
@@ -907,6 +966,7 @@ SLOTS_MAP = {
     "ScanPlanResult",
     "ScanResult",
     "SlotValue",
+    "TargetMeasure",
     "TimingsResult",
     "WallFrame",
     "WallImages",

@@ -87,8 +87,15 @@ _HEADER = (
 
 #: What a plugin's ``Params`` has as a field but a preset keeps elsewhere: the
 #: plate and the wells are the preset's own fields, and positions are never
-#: kept (m5 §10.2). Per plugin, the key and the reason the note gives.
+#: kept (m5 §10.2). The turn confirmation of ``objective-offsets`` is not kept
+#: either: it says the stage is clear *now*, so a saved one would confirm the next
+#: session's turns over a loaded plate for the operator (FM-14). Per plugin, the
+#: key and the reason the note gives.
 NOT_IN_PARAMS: dict[str, dict[str, str]] = {
+    "objective-offsets": {
+        "confirm_turns": "the stage is clear only for the run that confirmed it: "
+        "every run confirms it again"
+    },
     "plate-finding": {
         "centre_x_um": "a preset holds no positions",
         "centre_y_um": "a preset holds no positions",

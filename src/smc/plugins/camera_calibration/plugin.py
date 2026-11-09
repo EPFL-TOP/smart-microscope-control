@@ -48,7 +48,7 @@ from smc.run.document import RunDocument, RunDocumentError
 if TYPE_CHECKING:
     from smc.hardware.microscope import Microscope
 
-__all__ = ["CameraCalibrationParams", "CameraCalibrationPlugin"]
+__all__ = ["CameraCalibrationParams", "CameraCalibrationPlugin", "calibration_from"]
 
 #: A step this fraction of the smaller side (in pixels) or more may have wrapped
 #: in the correlation (m3 §4.1): the hint is added to a failed fit's reason.
@@ -319,6 +319,57 @@ def _unusable_reason(
     return reason
 
 
+def calibration_from(
+    stage: str, path: Path, *, profile: str, dry_run: bool
+) -> tuple[CameraCalibration, str]:
+    """The calibration another run document holds, and when it was measured; the objective and frame are the caller's to check.
+
+    The first half of reusing one, public because ``objective-offsets`` (m3
+    §20) loads one calibration per objective it turns to, by the same rule: the
+    runner's own ``unusable`` decides whether the other document's stage can be
+    used (not ``done``, another profile, a dry run read by a real one), and the
+    record's result is validated, never trusted. Each refusal is a
+    ``PluginRunError`` of ``stage``, the plugin whose run it is. ``path`` is
+    named as typed, spelt with forward slashes by ``as_posix()`` (FM-24) and
+    never resolved (FM-50: an absolute one names a user's folder). The time is
+    the record's ``finished_utc`` to the second, or ``at an unknown time``.
+
+    Raises:
+        PluginRunError: The document cannot be read, holds no usable
+            ``camera-calibration``, or its result is not one this smc reads.
+    """
+    name = CameraCalibrationPlugin.name
+    where = path.as_posix()
+    problem: str | None = None
+    try:
+        other = RunDocument.load(path)
+    except RunDocumentError as exc:
+        problem = f"{where}: {exc.reason}"
+    if problem is not None:
+        # Raised outside the handler: nothing here keeps the load's error.
+        raise PluginRunError(stage, problem)
+
+    reason = other.unusable(name, profile=profile, dry_run=dry_run)
+    record = other.provider(name)
+    if reason is not None or record is None or record.result is None:
+        raise PluginRunError(stage, f"in {where}: {reason or 'it holds no result'}")
+    try:
+        found = CameraCalibration.model_validate(record.result)
+    except ValidationError:
+        problem = (
+            f"the result in {where} is not one this smc reads; run "
+            f"camera-calibration again there"
+        )
+    if problem is not None:
+        raise PluginRunError(stage, problem)
+    when = (
+        record.finished_utc.isoformat(timespec="seconds")
+        if record.finished_utc is not None
+        else "at an unknown time"
+    )
+    return found, when
+
+
 def _reuse(
     microscope: Microscope,
     path: Path,
@@ -338,31 +389,12 @@ def _reuse(
     """
     name = CameraCalibrationPlugin.name
     where = path.as_posix()
-    problem: str | None = None
-    try:
-        other = RunDocument.load(path)
-    except RunDocumentError as exc:
-        problem = f"{where}: {exc.reason}"
-    if problem is not None:
-        # Raised outside the handler: nothing here keeps the load's error.
-        raise PluginRunError(name, problem)
-
-    reason = other.unusable(
-        name, profile=microscope.profile.microscope.name, dry_run=ctx.dry_run
+    found, when = calibration_from(
+        name,
+        path,
+        profile=microscope.profile.microscope.name,
+        dry_run=ctx.dry_run,
     )
-    record = other.provider(name)
-    if reason is not None or record is None or record.result is None:
-        raise PluginRunError(name, f"in {where}: {reason or 'it holds no result'}")
-    try:
-        found = CameraCalibration.model_validate(record.result)
-    except ValidationError:
-        problem = (
-            f"the result in {where} is not one this smc reads; run "
-            f"camera-calibration again there"
-        )
-    if problem is not None:
-        raise PluginRunError(name, problem)
-
     if objective is not None and found.objective != objective:
         was = found.objective if found.objective is not None else "an unknown objective"
         raise PluginRunError(
@@ -378,11 +410,6 @@ def _reuse(
             f"the camera gives {shape} (binning or the region changed); run "
             f"camera-calibration again with this camera setting",
         )
-    when = (
-        record.finished_utc.isoformat(timespec="seconds")
-        if record.finished_utc is not None
-        else "at an unknown time"
-    )
     line = f"camera calibration reused from {where}, measured {when}"
     # Through validation, never `model_copy`, which skips it.
     return CameraCalibration.model_validate(
