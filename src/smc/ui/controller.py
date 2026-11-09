@@ -2637,7 +2637,7 @@ class PlatePage:
         record = doc.provider("plate")
         if result is None or record is None:
             return {}
-        note = replace_note(result, record.started_utc)
+        note = replace_note(result, record.started_utc, keeps_captures=True)
         plugins = self._registry().plugins
         return {
             tool.name: note

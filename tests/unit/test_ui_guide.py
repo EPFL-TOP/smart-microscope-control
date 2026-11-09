@@ -18,23 +18,31 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from smc.plugins.presets import Preset, PresetCheck, PresetFile
-from smc.plugins.slots import PlateResult
+from smc.plugins.slots import PlateResult, WallFrame, WallImages, WellFit, WellRef
 from smc.ui.controller import CheckItem, LoadedPreset
 from smc.ui.guide import (
     CAPTURE_WELLS,
     DRY_RUN_NO_FRAME,
     END_LIVE_LABEL,
     SELECT_WELLS,
+    WALLS_DRY_RUN,
+    WALLS_MAX_CENTRES,
+    WALLS_MIN_CENTRES,
+    WALLS_NEED_CALIBRATION,
     NextStep,
     busy_note,
     capture_centre_label,
     capture_wall_label,
+    centres_text,
     command_line,
     forget_label,
     next_slot,
     preset_differences,
     preset_note_text,
     replace_note,
+    wall_touches_note,
+    walls_card_lines,
+    walls_centres_problem,
 )
 
 
@@ -419,15 +427,15 @@ def test_replace_note_names_the_time_the_method_and_the_wells() -> None:
         "and Run again to get a plate back."
     )
 
-    one = replace_note(_plate_result("seed", 1), started)
+    one = replace_note(_plate_result("seed", 1), started, keeps_captures=True)
     assert one == f"Run replaces the plate registered {local} (seed, 1 well). {tail}"
-    two = replace_note(_plate_result("references", 2), started)
+    two = replace_note(_plate_result("references", 2), started, keeps_captures=True)
     assert two == (
         f"Run replaces the plate registered {local} (references, 2 wells). {tail}"
     )
     # A method the registration names is the result's own, never a paraphrase.
     assert "(wall-images, 3 wells)" in replace_note(
-        _plate_result("wall-images", 3), started
+        _plate_result("wall-images", 3), started, keeps_captures=True
     )
 
 
@@ -439,7 +447,7 @@ def test_replace_note_converts_a_start_that_is_not_in_utc_to_the_pcs_time() -> N
     started = datetime(2026, 11, 3, 14, 20, tzinfo=timezone(timedelta(hours=5)))
     assert started.astimezone(timezone.utc).strftime("%H:%M") == "09:20"
     local = started.astimezone().strftime("%Y-%m-%d %H:%M")
-    note = replace_note(_plate_result("seed", 1), started)
+    note = replace_note(_plate_result("seed", 1), started, keeps_captures=True)
     assert note.startswith(
         f"Run replaces the plate registered {local} (seed, 1 well). "
     )
@@ -467,9 +475,170 @@ def test_replace_note_shows_the_records_own_start_when_the_pc_cannot_convert_it(
     # as recorded, and nothing raises (it is called by `view()`, on every redraw).
     _NoLocalTime.error = error
     started = _NoLocalTime(1, 1, 1, 0, 0, tzinfo=timezone.utc)
-    note = replace_note(_plate_result("seed", 1), started)
+    note = replace_note(_plate_result("seed", 1), started, keeps_captures=True)
     assert note == (
         "Run replaces the plate registered 0001-01-01T00:00+00:00 (seed, 1 well). "
         "A failed run leaves no plate; the captures stay, so Forget the wrong one "
         "and Run again to get a plate back."
     )
+
+
+# --- the page registers from images (m5 §12, #346) ----------------------------------
+
+
+def test_replace_note_without_captures_does_not_tell_to_forget_them() -> None:
+    # plate-finding fills the plate from the image and has no capture to forget: the
+    # sentence about the captures is false under it (m5 §12.7, #367 item 3).
+    started = datetime(2026, 11, 3, 14, 20, 41, tzinfo=timezone.utc)
+    local = started.astimezone().strftime("%Y-%m-%d %H:%M")
+    note = replace_note(_plate_result("references", 3), started, keeps_captures=False)
+    assert note == (
+        f"Run replaces the plate registered {local} (references, 3 wells). "
+        "A failed run leaves no plate."
+    )
+    assert "captures" not in note
+    assert "Forget" not in note
+    # And the keyword is required, so that no call forgets to say which note it wants.
+    with pytest.raises(TypeError):
+        replace_note(_plate_result("seed", 1), started)  # type: ignore[call-arg]
+
+
+def test_the_walls_texts_are_the_designs() -> None:
+    assert WALLS_DRY_RUN == (
+        "plate-walls images the walls, which a dry run does not do: serve the page "
+        "without --dry-run (demo-sample's stage is simulated), or register with "
+        "plate-registration"
+    )
+    assert WALLS_NEED_CALIBRATION == (
+        "plate-walls reads the camera's calibration: run camera-calibration first "
+        "(Set up), with the objective you register with in place, on a field with "
+        "texture (a well's wall will do)"
+    )
+
+
+def test_walls_centres_problem_names_what_is_missing_and_what_is_too_many() -> None:
+    assert walls_centres_problem(0) == (
+        "plate-walls needs the centres of 2 or 3 wells: centre a well under the "
+        "objective (Live and the Drive pad), click it on the map and press Capture "
+        "centre; then a second well, far from the first"
+    )
+    assert walls_centres_problem(1) == (
+        "1 centre captured, plate-walls needs 2 or 3 wells: centre a second well, far "
+        "from the first, click it on the map and press Capture centre"
+    )
+    # From the plugin's minimum to its maximum there is nothing to say.
+    assert walls_centres_problem(2) is None
+    assert walls_centres_problem(3) is None
+    assert walls_centres_problem(6) is None
+    assert walls_centres_problem(7) == (
+        "plate-walls takes at most 6 wells and 7 centres are captured: Forget some"
+    )
+    assert "12 centres" in (walls_centres_problem(12) or "")
+
+
+def test_the_pages_walls_bounds_are_the_plugins() -> None:
+    # The page's copy of the plugin's bounds: the plugin refuses a count the page let
+    # through, and the page refuses one the plugin accepts, if they drift apart.
+    from smc.plugins.plate_walls import plugin
+
+    assert WALLS_MIN_CENTRES == plugin._MIN_WELLS
+    assert WALLS_MAX_CENTRES == plugin._MAX_WELLS
+
+
+def test_centres_text_lists_each_centre_in_capture_order() -> None:
+    assert centres_text(()) == "no centre captured yet"
+    refs = (
+        WellRef(well="D5", x_um=1.0, y_um=2.0),
+        WellRef(well="B3", x_um=10182.04, y_um=-10087.9),
+    )
+    # The wells in capture order, never sorted; two spaces; one decimal; plain text.
+    assert centres_text(refs) == (
+        "centres captured (2):\n  D5 (1.0, 2.0) µm\n  B3 (10182.0, -10087.9) µm"
+    )
+
+
+def test_wall_touches_note_says_they_are_ignored_and_is_empty_for_none() -> None:
+    assert wall_touches_note(0) == ""
+    assert wall_touches_note(1) == (
+        "1 wall capture is for plate-registration; plate-walls images the walls "
+        "itself and ignores them"
+    )
+    assert wall_touches_note(2) == (
+        "2 wall captures are for plate-registration; plate-walls images the walls "
+        "itself and ignores them"
+    )
+
+
+def _fit(well: str, centre: tuple[float, float], frames: tuple[int, ...]) -> WellFit:
+    return WellFit(
+        well=well,
+        recorded_xy_um=(centre[0] + 5.0, centre[1] - 5.0),
+        center_xy_um=centre,
+        diameter_um=15298.4,
+        size_error=0.0,
+        rms_um=3.0,
+        n_points=40,
+        walls=tuple(
+            WallFrame(side=side, x_um=0.0, y_um=0.0, n_points=10, frames=n)
+            for side, n in zip(("+X", "+Y", "-X", "-Y"), frames, strict=True)
+        ),
+    )
+
+
+def _walls_result(
+    residual: float | None, *, wells: tuple[WellFit, ...], plate: str = "24-well"
+) -> PlateResult:
+    return PlateResult(
+        plate=plate,
+        a1_center_xy_um=(0.0, 0.0),
+        rotation_deg=0.1234,
+        method="wall-images",
+        residual_um=residual,
+        scale_error=None,
+        n_refs=len(wells),
+        walls=WallImages(
+            objective="10x",
+            pixel_size_um=1.0,
+            image_shape_px=(100, 100),
+            search_um=3900.0,
+            wells=wells,
+            frames=sum(w.n_points for w in wells),
+            folder="plate-walls/abc",
+            elapsed_s=16.5,
+        ),
+    )
+
+
+def test_walls_card_lines_show_each_well_then_the_plate() -> None:
+    result = _walls_result(
+        3.24,
+        wells=(
+            _fit("B3", (10182.04, -10087.93), (3, 4, 3, 4)),
+            _fit("D5", (1.0, 2.0), (2, 3, 2, 3)),
+        ),
+    )
+    # §12.6, character for character: the frames of the four sides summed, one decimal
+    # on the centre, none on the diameter, two on the rotation.
+    assert walls_card_lines(result) == (
+        "B3: centre (10182.0, -10087.9) µm, 15298 µm across, 14 frames",
+        "D5: centre (1.0, 2.0) µm, 15298 µm across, 10 frames",
+        "plate 24-well: residual 3.2 µm, rotation 0.12°",
+    )
+
+
+def test_walls_card_lines_say_unknown_when_nothing_measured_the_residual() -> None:
+    result = _walls_result(None, wells=(_fit("B3", (1.0, 2.0), (1, 1, 1, 1)),))
+    assert walls_card_lines(result)[-1] == (
+        "plate 24-well: residual unknown, rotation 0.12°"
+    )
+
+
+def test_walls_card_lines_stay_under_the_cards_width() -> None:
+    # Six wells and the plate: seven lines, each shorter than the card's 80 characters.
+    wells = tuple(
+        _fit(f"A{i}", (-12345.6 * i, 98765.4 * i), (12, 12, 12, 12))
+        for i in range(1, 7)
+    )
+    lines = walls_card_lines(_walls_result(123.4, wells=wells))
+    assert len(lines) == 7
+    assert max(len(line) for line in lines) <= 80

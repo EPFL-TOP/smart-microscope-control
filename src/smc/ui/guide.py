@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from datetime import datetime
 
-    from smc.plugins.slots import PlateResult
+    from smc.plugins.slots import PlateResult, WellRef
     from smc.ui.controller import CheckItem, LoadedPreset
 
 __all__ = [
@@ -27,16 +27,24 @@ __all__ = [
     "END_LIVE_LABEL",
     "PLATE_NOT_CHOSEN",
     "SELECT_WELLS",
+    "WALLS_DRY_RUN",
+    "WALLS_MAX_CENTRES",
+    "WALLS_MIN_CENTRES",
+    "WALLS_NEED_CALIBRATION",
     "NextStep",
     "busy_note",
     "capture_centre_label",
     "capture_wall_label",
+    "centres_text",
     "command_line",
     "forget_label",
     "next_slot",
     "preset_differences",
     "preset_note_text",
     "replace_note",
+    "wall_touches_note",
+    "walls_card_lines",
+    "walls_centres_problem",
 ]
 
 #: What the scan plan waits for. The page cannot choose wells for the operator:
@@ -76,6 +84,30 @@ DRY_RUN_NO_FRAME = (
     "stand whose stage is simulated (demo-sample), or run the chain with smc run "
     "from plate-registration, without --dry-run: a run that is not a dry run "
     "refuses what a dry run made"
+)
+
+#: How many well centres ``plate-walls`` takes: the page's copy of the plugin's bounds
+#: (``plate_walls.plugin._MIN_WELLS`` and ``_MAX_WELLS``), pinned by a test. The plugin
+#: refuses a count it does not accept before anything moves; the page says so first.
+WALLS_MIN_CENTRES = 2
+WALLS_MAX_CENTRES = 6
+
+#: Why ``plate-walls`` does not run on a page served with ``--dry-run`` (m5 §12.3). The
+#: plugin refuses a dry run before it moves anything, and its refusal is a ``failed``
+#: record that would replace a usable plate (m5 §11.4): the controller refuses first.
+WALLS_DRY_RUN = (
+    "plate-walls images the walls, which a dry run does not do: serve the page "
+    "without --dry-run (demo-sample's stage is simulated), or register with "
+    "plate-registration"
+)
+
+#: Why ``plate-walls`` waits when the run document has no ``camera-calibration`` at all
+#: (m5 §12.3). The document's own words say the same for a terminal; the page has the
+#: tool one region up.
+WALLS_NEED_CALIBRATION = (
+    "plate-walls reads the camera's calibration: run camera-calibration first "
+    "(Set up), with the objective you register with in place, on a field with "
+    "texture (a well's wall will do)"
 )
 
 
@@ -144,7 +176,96 @@ def busy_note(running: str, *, live: bool) -> str:
     return f"{running} is running: wait for it to end, or press STOP."
 
 
-def replace_note(result: PlateResult, started_utc: datetime) -> str:
+def walls_centres_problem(captured: int) -> str | None:
+    """Why ``plate-walls`` cannot run with ``captured`` centres, or ``None`` (m5 §12.3).
+
+    The count is the page's copy of the plugin's (``WALLS_MIN_CENTRES`` to
+    ``WALLS_MAX_CENTRES``). Fewer than two says what to do next, in the operator's
+    words (Live, the Drive pad, the map); more than six says to forget some. The
+    texts say ``2 or 3`` as the design does: two wells measure, a third checks the
+    fit (m3 §17.4), and a fourth to sixth are allowed, not advised.
+    """
+    if captured == 0:
+        return (
+            "plate-walls needs the centres of 2 or 3 wells: centre a well under the "
+            "objective (Live and the Drive pad), click it on the map and press "
+            "Capture centre; then a second well, far from the first"
+        )
+    if captured < WALLS_MIN_CENTRES:
+        return (
+            f"{captured} centre captured, plate-walls needs 2 or 3 wells: centre a "
+            "second well, far from the first, click it on the map and press Capture "
+            "centre"
+        )
+    if captured > WALLS_MAX_CENTRES:
+        return (
+            f"plate-walls takes at most {WALLS_MAX_CENTRES} wells and {captured} "
+            "centres are captured: Forget some"
+        )
+    return None
+
+
+def centres_text(refs: Sequence[WellRef]) -> str:
+    """The centres captured on the page, one line each in capture order (m5 §12.5).
+
+    Plain text, never markup (FM-139): a well's name comes from the page, but the
+    positions are what the operator checks against the stage, so they are shown,
+    to a tenth of a micrometre.
+    """
+    if not refs:
+        return "no centre captured yet"
+    lines = [f"centres captured ({len(refs)}):"]
+    lines += [f"  {ref.well} ({ref.x_um:.1f}, {ref.y_um:.1f}) µm" for ref in refs]
+    return "\n".join(lines)
+
+
+def wall_touches_note(touches: int) -> str:
+    """What becomes of the wall captures under ``plate-walls``, said once (m5 §12.5).
+
+    They are ``plate-registration``'s; ``plate-walls`` images the walls itself and
+    ignores them. The operator who touched a wall would wonder; ``""`` for none.
+    """
+    if touches <= 0:
+        return ""
+    these = "1 wall capture is" if touches == 1 else f"{touches} wall captures are"
+    return (
+        f"{these} for plate-registration; plate-walls images the walls itself and "
+        "ignores them"
+    )
+
+
+def walls_card_lines(result: PlateResult) -> tuple[str, ...]:
+    """The card of a plate registered from images: each well measured, then the plate (m5 §12.6).
+
+    One line per well of ``walls.wells``, in the order given: the fitted centre,
+    the diameter and the frames its four sides took; then one for the plate, with
+    the residual and the rotation. The generic card shows a result's first keys and
+    cuts the walls, the part an operator reads. ``residual unknown`` when nothing
+    measured it: an unknown is not a zero.
+    """
+    lines: list[str] = []
+    if result.walls is not None:
+        for fit in result.walls.wells:
+            frames = sum(side.frames for side in fit.walls)
+            x_um, y_um = fit.center_xy_um
+            lines.append(
+                f"{fit.well}: centre ({x_um:.1f}, {y_um:.1f}) µm, "
+                f"{fit.diameter_um:.0f} µm across, {frames} frames"
+            )
+    residual = (
+        "residual unknown"
+        if result.residual_um is None
+        else f"residual {result.residual_um:.1f} µm"
+    )
+    lines.append(
+        f"plate {result.plate}: {residual}, rotation {result.rotation_deg:.2f}°"
+    )
+    return tuple(lines)
+
+
+def replace_note(
+    result: PlateResult, started_utc: datetime, *, keeps_captures: bool
+) -> str:
     """What a *Run* of a tool that provides the plate replaces, said before the click (m5 §11.4).
 
     The latest attempt decides the ``plate`` slot even when it fails, so a failed
@@ -153,6 +274,11 @@ def replace_note(result: PlateResult, started_utc: datetime) -> str:
     had again by the same command minus the capture that was wrong. The time is
     the record's start in the PC's local time, to the minute, and the method and
     the count are the result's own.
+
+    ``keeps_captures`` is whether the tool runs from the page's captures
+    (``plate-registration``, ``plate-walls``): under a tool that has none
+    (``plate-finding``) the sentence about forgetting one is false, and the note
+    ends after the failed run (m5 §12.7). It is required, so no call forgets it.
     """
     try:
         when = started_utc.astimezone().strftime("%Y-%m-%d %H:%M")
@@ -163,10 +289,15 @@ def replace_note(result: PlateResult, started_utc: datetime) -> str:
         # document is data (FM-125) and ``view()`` raises nothing for it.
         when = started_utc.isoformat(timespec="minutes")
     wells = "1 well" if result.n_refs == 1 else f"{result.n_refs} wells"
-    return (
+    note = (
         f"Run replaces the plate registered {when} ({result.method}, {wells}). "
-        "A failed run leaves no plate; the captures stay, so Forget the wrong one "
-        "and Run again to get a plate back."
+        "A failed run leaves no plate"
+    )
+    if not keeps_captures:
+        return note + "."
+    return (
+        note
+        + "; the captures stay, so Forget the wrong one and Run again to get a plate back."
     )
 
 
