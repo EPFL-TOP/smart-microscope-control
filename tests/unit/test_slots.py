@@ -23,6 +23,7 @@ from pydantic import BaseModel, ValidationError
 import smc
 from smc.plugins import slots
 from smc.plugins.slots import (
+    IMAGE_SIDES,
     CameraCalibration,
     Cell,
     CellsFile,
@@ -47,6 +48,7 @@ from smc.plugins.slots import (
     WallTouch,
     WellFit,
     WellRef,
+    refuse_image_side,
 )
 
 Sample = tuple[dict[str, Any], dict[str, Any]]  # (full, sparse)
@@ -277,8 +279,8 @@ _NIS = {
 SAMPLES: dict[type[BaseModel], Sample] = {
     WellRef: (_REF, _REF),
     WallTouch: (
-        {"well": "A1", "side": "left", "x_um": 1200.5, "y_um": -980.0},
-        {"well": "A1", "side": "left", "x_um": 1200.5, "y_um": -980.0},
+        {"well": "A1", "side": "-X", "x_um": 1200.5, "y_um": -980.0},
+        {"well": "A1", "side": "-X", "x_um": 1200.5, "y_um": -980.0},
     ),
     LatticeFit: (
         _FIT,
@@ -695,6 +697,46 @@ def test_a_wall_side_is_a_stage_direction_and_nothing_else(side: str) -> None:
         WallFrame.model_validate({**_WALL_FRAME, "side": direction})
 
 
+_TOUCH = {"well": "B3", "side": "+X", "x_um": 17967.9, "y_um": -10237.1}
+
+_OLD_SIDE_TEXT = (
+    "side {word!r} is a side on the image: a wall is named by a stage direction, "
+    "-X, +X, -Y or +Y (the plate page names walls on the image and maps them "
+    "with the camera calibration)"
+)
+
+
+@pytest.mark.parametrize("side", ["+X", "-X", "+Y", "-Y"])
+def test_a_wall_touch_takes_a_stage_direction(side: str) -> None:
+    touch = WallTouch.model_validate({**_TOUCH, "side": side})
+    assert touch.side == side
+
+
+@pytest.mark.parametrize("word", ["left", "right", "top", "bottom"])
+def test_a_wall_touch_names_the_old_side_it_refuses(word: str) -> None:
+    # The same word in two frames is the defect (FM-189): an image word is refused
+    # with the reason, never read as a stage direction, never translated.
+    with pytest.raises(ValidationError) as raised:
+        WallTouch.model_validate({**_TOUCH, "side": word})
+    (error,) = raised.value.errors()
+    assert error["type"] == "value_error"
+    assert error["msg"] == "Value error, " + _OLD_SIDE_TEXT.format(word=word)
+
+
+def test_refuse_image_side_leaves_other_values_to_the_literal() -> None:
+    # `mode="before"` must refuse only the four image words: another word goes on to
+    # the `Literal`, whose own error stands, and a stage direction passes untouched.
+    assert refuse_image_side("+X") == "+X"
+    assert refuse_image_side("middle") == "middle"
+    assert refuse_image_side(3) == 3
+    assert IMAGE_SIDES == ("left", "right", "top", "bottom")
+    for word in IMAGE_SIDES:
+        with pytest.raises(ValueError, match="is a side on the image"):
+            refuse_image_side(word)
+    assert _error_types(WallTouch, {**_TOUCH, "side": "middle"}) == ["literal_error"]
+    assert _error_types(WallTouch, {**_TOUCH, "side": "+x"}) == ["literal_error"]
+
+
 def test_a_method_the_plate_slot_does_not_know_is_refused() -> None:
     assert _error_types(PlateResult, {**_PLATE, "method": "guess"}) == ["literal_error"]
 
@@ -852,6 +894,8 @@ SLOTS_MAP = {
     "DensityWell",
     "FailedField",
     "FocusState",
+    "IMAGE_SIDES",
+    "ImageSide",
     "LatticeFit",
     "NisExportResult",
     "PlannedField",
@@ -874,6 +918,7 @@ SLOTS_MAP = {
     "load_cells",
     "load_frame",
     "normalise_well",
+    "refuse_image_side",
     "well_geometry",
 }
 

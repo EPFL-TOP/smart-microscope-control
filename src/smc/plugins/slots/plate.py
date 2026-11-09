@@ -23,6 +23,8 @@ from smc.plugins.api import PluginResult
 from smc.plugins.slots.base import SlotValue
 
 __all__ = [
+    "IMAGE_SIDES",
+    "ImageSide",
     "LatticeFit",
     "PlateResult",
     "WallFrame",
@@ -33,6 +35,7 @@ __all__ = [
     "WellGeometry",
     "WellRef",
     "normalise_well",
+    "refuse_image_side",
     "well_geometry",
 ]
 
@@ -42,6 +45,29 @@ _WELL = re.compile(r"([A-Za-z]+)\s*([0-9]+)")
 #: Never an image side: ``+X`` is the wall the stage reaches by going +X, whatever
 #: the camera's turn, so no operator names a side on the image-wall path (m3 §17.2).
 WallSide = Literal["+X", "+Y", "-X", "-Y"]
+
+#: A side as the operator sees it on the image. These words exist on the plate page
+#: only, which maps them to a ``WallSide`` with the camera calibration (m3 §19.3);
+#: the layer never takes one, because the same word in two frames was FM-189.
+ImageSide = Literal["left", "right", "top", "bottom"]
+IMAGE_SIDES: tuple[ImageSide, ...] = ("left", "right", "top", "bottom")
+
+
+def refuse_image_side(value: Any) -> Any:
+    """Refuse an image word where a stage direction is wanted, and say why.
+
+    Used as a ``mode="before"`` validator: a ``Literal`` alone would answer
+    ``left`` with its generic "input should be '+X', ..." and hide that the word
+    is a real side in the *other* frame. Anything else is returned unchanged, so
+    the ``Literal``'s own error still stands for a word that is no side at all.
+    """
+    if isinstance(value, str) and value in IMAGE_SIDES:
+        raise ValueError(
+            f"side {value!r} is a side on the image: a wall is named by a stage "
+            "direction, -X, +X, -Y or +Y (the plate page names walls on the image "
+            "and maps them with the camera calibration)"
+        )
+    return value
 
 
 class WellRef(SlotValue):
@@ -53,12 +79,22 @@ class WellRef(SlotValue):
 
 
 class WallTouch(SlotValue):
-    """A stage position at which a well's wall was found, on one of its four sides."""
+    """A stage position at which a well's wall was found, on one of its four sides.
+
+    ``side`` is a stage direction (``-X``, ``+X``, ``-Y``, ``+Y``): the wall the
+    stage reaches by going that way from the well's centre. A side named on the
+    image is refused, not translated (m3 §19.2).
+    """
 
     well: str
-    side: Literal["left", "right", "top", "bottom"]
+    side: WallSide
     x_um: float
     y_um: float
+
+    @field_validator("side", mode="before")
+    @classmethod
+    def _side_is_not_an_image_side(cls, value: Any) -> Any:
+        return refuse_image_side(value)
 
 
 class LatticeFit(SlotValue):
