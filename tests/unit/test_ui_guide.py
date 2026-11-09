@@ -19,12 +19,21 @@ from hypothesis import strategies as st
 
 from smc.plugins.geometry import Matrix2
 from smc.plugins.presets import Preset, PresetCheck, PresetFile
-from smc.plugins.slots import PlateResult, WallFrame, WallImages, WellFit, WellRef
-from smc.ui.controller import CheckItem, LoadedPreset
+from smc.plugins.scan_plan.algorithm import plan_fields
+from smc.plugins.slots import (
+    PlateResult,
+    ScanPlanResult,
+    WallFrame,
+    WallImages,
+    WellFit,
+    WellRef,
+)
+from smc.ui.controller import CheckItem, LoadedPreset, PlanLayer
 from smc.ui.guide import (
     CAPTURE_WELLS,
     DRY_RUN_NO_FRAME,
     END_LIVE_LABEL,
+    MAP_FIELDS_UP_TO,
     NO_CALIBRATION_FOR_SIDES,
     SELECT_WELLS,
     WALLS_DRY_RUN,
@@ -38,12 +47,15 @@ from smc.ui.guide import (
     centres_text,
     command_line,
     drive_image_note,
+    duration_text,
     forget_label,
     image_sides_note,
     next_slot,
+    plan_title,
     preset_differences,
     preset_note_text,
     replace_note,
+    scan_plan_card_lines,
     wall_touches_note,
     walls_card_lines,
     walls_centres_problem,
@@ -712,3 +724,189 @@ def test_walls_card_lines_stay_under_the_cards_width() -> None:
     lines = walls_card_lines(_walls_result(123.4, wells=wells))
     assert len(lines) == 7
     assert max(len(line) for line in lines) <= 80
+
+
+# --- the scan plan on the map and its card (m5 §14, #320) ----------------------------
+
+
+@pytest.mark.parametrize(
+    ("seconds", "text"),
+    [
+        (0.0, "0 s"),
+        (0.4, "0 s"),
+        (42.16, "42 s"),
+        (59.4, "59 s"),
+        (59.6, "1 min 00 s"),
+        (192.0, "3 min 12 s"),
+        (3599.4, "59 min 59 s"),
+        (3599.6, "1 h 00 min"),
+        (3900.0, "1 h 05 min"),
+        # From an hour the seconds are dropped, not rounded up into the minute.
+        (3659.0, "1 h 00 min"),
+        (36000.0, "10 h 00 min"),
+        # Python's `round` goes to the even second at a half, as §14.3 says: an estimate
+        # is a sum of timings in ms, so an exact half does occur.
+        (2.5, "2 s"),
+        (12.5, "12 s"),
+        (13.5, "14 s"),
+    ],
+)
+def test_duration_text_rounds_to_the_second_and_names_the_unit(
+    seconds: float, text: str
+) -> None:
+    assert duration_text(seconds) == text
+
+
+def _layer(count: int, wells: int, *, drawn: bool = True) -> PlanLayer:
+    return PlanLayer(
+        count=count,
+        wells=wells,
+        fov_um=(512.0, 512.0),
+        fields=tuple((float(i), 0.0) for i in range(count)) if drawn else (),
+    )
+
+
+def test_plan_title_says_how_many_fields_in_how_many_wells_and_the_bound() -> None:
+    assert plan_title(None) == ""
+    assert plan_title(_layer(72, 2)) == "; scan plan: 72 fields in 2 wells"
+    # The singular, for the field and for the well.
+    assert plan_title(_layer(1, 1)) == "; scan plan: 1 field in 1 well"
+    # Over the bound the layer holds no field, and the title says why nothing is drawn.
+    assert plan_title(_layer(20000, 1536, drawn=False)) == (
+        "; scan plan: 20000 fields in 1536 wells, too many to draw (over 5000)"
+    )
+    assert MAP_FIELDS_UP_TO == 5000
+    # The bound is a keyword, for the test of the boundary; the text quotes it.
+    assert plan_title(_layer(5, 1), drawn_up_to=5) == "; scan plan: 5 fields in 1 well"
+    assert plan_title(_layer(6, 1, drawn=False), drawn_up_to=5) == (
+        "; scan plan: 6 fields in 1 well, too many to draw (over 5)"
+    )
+    # The title reads the count and not whether fields were kept: an empty plan is not
+    # "too many to draw", and a count over the bound is, whatever the layer holds.
+    assert plan_title(_layer(0, 3, drawn=False)) == "; scan plan: 0 fields in 3 wells"
+    assert plan_title(_layer(6, 1), drawn_up_to=5) == (
+        "; scan plan: 6 fields in 1 well, too many to draw (over 5)"
+    )
+
+
+def _scan_plan(
+    wells: Sequence[str] = ("B11", "B2"),
+    *,
+    rows: int = 6,
+    columns: int = 6,
+    fov_um: tuple[float, float] = (512.0, 512.0),
+    overlap: float = 0.1,
+    objective: str | None = "Nikon 10X S Fluor",
+    estimate_s: float | None = None,
+) -> ScanPlanResult:
+    """A scan plan as ``scan-plan`` writes it, built as test_report.py builds one.
+
+    ``wells`` are in visiting order, which is not the alphabetical one (FM-204).
+    """
+    plate = PlateResult(
+        plate="96-well",
+        a1_center_xy_um=(0.0, 0.0),
+        rotation_deg=0.0,
+        method="seed",
+        residual_um=None,
+        scale_error=None,
+        n_refs=0,
+    )
+    half_w, half_h = fov_um[0] / 2, fov_um[1] / 2
+    plate_plan, fields = plan_fields(
+        plate,
+        list(wells),
+        fov_um=fov_um,
+        footprint_of=lambda x, y: [
+            (x - half_w, y - half_h),
+            (x + half_w, y - half_h),
+            (x + half_w, y + half_h),
+            (x - half_w, y + half_h),
+        ],
+        rows=rows,
+        columns=columns,
+        overlap=overlap,
+        clip_to_well=True,
+    )
+    return ScanPlanResult(
+        plate_plan=plate_plan,
+        wells=tuple(wells),
+        objective=objective,
+        pixel_size_um=1.0,
+        matrix_um_per_px=((1.0, 0.0), (0.0, -1.0)),
+        matrix_source="parameter",
+        image_shape_px=(512, 512),
+        fov_um=fov_um,
+        overlap=overlap,
+        rows=rows,
+        columns=columns,
+        fields=fields,
+        estimate_s=estimate_s,
+    )
+
+
+def test_scan_plan_card_lines_say_the_wells_the_fields_the_field_and_the_estimate() -> (
+    None
+):
+    result = _scan_plan(estimate_s=42.16)
+    assert len(result.fields) == 72
+    # §14.3, character for character: the multiplication sign is U+00D7, the micro U+00B5.
+    assert scan_plan_card_lines(result) == (
+        "wells: 2 (B11, B2)",
+        "fields: 72, a grid of 6 × 6 in each well",  # noqa: RUF001
+        "field: 512 × 512 µm at Nikon 10X S Fluor, overlap 0.1",  # noqa: RUF001
+        "estimate: about 42 s (the moves, refocus and snaps of the timings)",
+    )
+    # A plan made without an objective says no `at ...` rather than `at None`.
+    without = scan_plan_card_lines(_scan_plan(objective=None, estimate_s=1.0))
+    assert without[2] == "field: 512 × 512 µm, overlap 0.1"  # noqa: RUF001
+    # A real field of view is not a whole number of micrometres (0.65 µm x 2048 px):
+    # `:g` shows it, where a rounding to whole micrometres would hide a tenth.
+    real = scan_plan_card_lines(
+        _scan_plan(("B2",), rows=1, columns=1, fov_um=(1331.2, 1331.2), overlap=0.15)
+    )
+    assert real[2] == "field: 1331.2 × 1331.2 µm at Nikon 10X S Fluor, overlap 0.15"  # noqa: RUF001
+
+
+def test_scan_plan_card_says_what_to_run_when_the_estimate_is_unknown() -> None:
+    unknown = scan_plan_card_lines(_scan_plan(estimate_s=None))[-1]
+    assert unknown == (
+        "estimate: unknown, no usable timing: run timing, then scan-plan again"
+    )
+    # An unknown is not a zero (FM-170): 0.0 is an estimate, and says so.
+    zero = scan_plan_card_lines(_scan_plan(estimate_s=0.0))[-1]
+    assert zero == "estimate: about 0 s (the moves, refocus and snaps of the timings)"
+
+
+def test_scan_plan_card_names_the_wells_in_the_plans_order_and_cuts_after_six() -> None:
+    # FM-204: B11 before B2, and a later well that sorts first. A sort would pass the
+    # demo's own order only by luck of the string compare ("B11" < "B2").
+    names = ("B11", "B2", "A1", "D4", "C3", "E5")
+    assert scan_plan_card_lines(_scan_plan(names, rows=1, columns=1))[0] == (
+        "wells: 6 (B11, B2, A1, D4, C3, E5)"
+    )
+    seven = (*names, "F6")
+    assert scan_plan_card_lines(_scan_plan(seven, rows=1, columns=1))[0] == (
+        "wells: 7 (B11, B2, A1, D4, C3, E5, … 1 more)"
+    )
+    # A hand-edited document with no well says so, without an empty pair of brackets.
+    none = _scan_plan(rows=1, columns=1).model_copy(update={"wells": ()})
+    assert scan_plan_card_lines(none)[0] == "wells: 0"
+
+
+def test_scan_plan_card_says_how_many_fields_clipping_left_out() -> None:
+    whole = _scan_plan(rows=2, columns=2)
+    assert len(whole.fields) == 8
+    assert scan_plan_card_lines(whole)[1] == "fields: 8, a grid of 2 × 2 in each well"  # noqa: RUF001
+    # Clipping to the well took fields away: 14 by 14 in 2 wells is 392, the plan holds 344.
+    clipped = whole.model_copy(
+        update={
+            "rows": 14,
+            "columns": 14,
+            "fields": tuple(whole.fields[i % 8] for i in range(344)),
+        }
+    )
+    assert scan_plan_card_lines(clipped)[1] == (
+        "fields: 344 of 392, a grid of 14 × 14 in each well, "  # noqa: RUF001
+        "the fields that miss the well left out"
+    )

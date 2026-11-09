@@ -179,6 +179,22 @@ outline; the cells' **density** colours the wells (grey where unknown, a well wi
 frame is unknown, not zero), for the label chosen under *Density of*. The **route** is
 a red line with its stops, and the stage is a black cross.
 
+**The scan plan on the map.** Once `scan-plan` has run and its result is usable, the map
+draws **one orange rectangle for each field of the plan**: the field of view wide and
+high (the footprint's bounding box in stage axes, so a camera turned by another angle
+than 0° or 90° shows a box larger than its frame), centred on the field. They are the
+plan's own wells, whatever the *Wells* box says now: the plan is what `scan` will do, and
+a selection changed since has not changed it. The title ends with the count, `; scan plan:
+72 fields in 2 wells`. The route is drawn over the fields; no field is hoverable, labelled
+or joined to the next (the plan's order is on the card, in the order of its wells).
+**A plan that is not usable draws nothing**, as the density does not: stale (the plate or
+the timings were produced again since: the checklist says so and the card is marked),
+made on another stand, or a dry run's on a page that is not one. **A plan of more than
+5000 fields draws nothing**, not a first part of it (a first part would pass for all of
+it), and the title says so: `; scan plan: 20000 fields in 1536 wells, too many to draw
+(over 5000)`. The bound keeps what the page sends the browser at about 165 kB at each
+redraw; the card still says the count.
+
 **Which plate.** The page starts on the plate the run document names: the plate of the
 latest `plate-registration` or `plate-walls` record, whatever its status (the one you
 were working on). Without one, the profile's `[sample]` names it (the stand's camera
@@ -451,7 +467,21 @@ each is cut at 600 characters), or an indented `in the run document` when it nam
 images (`plate-walls`) is the exception to the result's values: it shows **one line per
 well measured**, then one for the plate (`B3: centre (10182.0, -10087.9) µm, 15298 µm
 across, 14 frames`, `plate 24-well: residual 3.2 µm, rotation 0.12°`; `residual unknown`
-when nothing measured it), and the folder of the frames it saved as its file. The page shows the path and never opens it: open it
+when nothing measured it), and the folder of the frames it saved as its file. **The card
+of a scan plan** is the same kind of exception: its first eight keys cut `estimate_s`
+away, the figure the operator wants before pressing `scan`, so it shows four lines,
+`wells: 2 (B11, B2)` (the plan's visiting order, at most six names, then `, … n more`),
+`fields: 72, a grid of 6 × 6 in each well` (or `fields: 344 of 392, a grid of 14 × 14 in
+each well, the fields that miss the well left out` when clipping to the well removed
+some), `field: 512 × 512 µm at <objective>, overlap 0.1` and `estimate: about 42 s (the
+moves, refocus and snaps of the timings)`. **The estimate sums only that**: each move, a
+refocus when the stand has an autofocus and the timings know its cost, and each snap; it
+leaves out a channel change, the cells, the report and the export. These four lines are
+cut at 600 characters, as an assumption is, and not at a value's 80: the clipped `fields:`
+line is 90 long. With no usable
+`timing` it says `estimate: unknown, no usable timing: run timing, then scan-plan again`
+(an unknown is not a zero, and `timing` is not a step of the page: it is optional). A
+second `timing` makes the plan stale: run `scan-plan` again to see the new estimate. The page shows the path and never opens it: open it
 from the PC. A card is a summary, bounded whatever the record holds: the run
 document and the log hold the rest. Cards, the next step and the run document's path
 **wrap** at the column, so a long path is read whole. A tool whose last run was stopped or failed shows
@@ -803,6 +833,12 @@ a real stand at 10× (16.5 s is the demo stage's, two wells); whether two captur
 should make `plate-walls` the next step, instead of `plate-registration` (the page offers
 the measured path first because it is the one the owner asked for; both stay on the page);
 and `plate-walls` on a 4× frame.
+
+**The scan plan on the map** adds, for the owner: the map at the stand's screen and zoom
+(72 fields of 512 µm at the full plate's extent are a few pixels each, and 5000 are more
+than the eye separates); the estimate against the time of a real scan on the Ti2-E (it
+was measured on the demo's simulated stage); and the plan of a real 384 or 1536-well
+plate in a browser.
 
 **Connect and Disconnect** add: Connect, Disconnect, NIS-Elements taking the stand,
 then Connect again, at a real stand; **a stand opened on the page's worker thread**,

@@ -21,13 +21,14 @@ if TYPE_CHECKING:
     from datetime import datetime
 
     from smc.plugins.geometry import Matrix2
-    from smc.plugins.slots import PlateResult, WellRef
-    from smc.ui.controller import CheckItem, LoadedPreset
+    from smc.plugins.slots import PlateResult, ScanPlanResult, WellRef
+    from smc.ui.controller import CheckItem, LoadedPreset, PlanLayer
 
 __all__ = [
     "CAPTURE_WELLS",
     "DRY_RUN_NO_FRAME",
     "END_LIVE_LABEL",
+    "MAP_FIELDS_UP_TO",
     "NO_CALIBRATION_FOR_SIDES",
     "PLATE_NOT_CHOSEN",
     "SELECT_WELLS",
@@ -42,12 +43,15 @@ __all__ = [
     "centres_text",
     "command_line",
     "drive_image_note",
+    "duration_text",
     "forget_label",
     "image_sides_note",
     "next_slot",
+    "plan_title",
     "preset_differences",
     "preset_note_text",
     "replace_note",
+    "scan_plan_card_lines",
     "wall_touches_note",
     "walls_card_lines",
     "walls_centres_problem",
@@ -91,6 +95,12 @@ DRY_RUN_NO_FRAME = (
     "from plate-registration, without --dry-run: a run that is not a dry run "
     "refuses what a dry run made"
 )
+
+#: Past this many fields the map draws none of the scan plan (m5 §14.1): a first part
+#: would show an arbitrary corner of the plan as if it were all of it, and a figure's
+#: fields are about 33 bytes each on the websocket at every redraw (measured, §14), so
+#: 5000 is about 165 kB. The title and the card say the count instead.
+MAP_FIELDS_UP_TO = 5000
 
 #: How many well centres ``plate-walls`` takes: the page's copy of the plugin's bounds
 #: (``plate_walls.plugin._MIN_WELLS`` and ``_MAX_WELLS``), pinned by a test. The plugin
@@ -332,6 +342,88 @@ def walls_card_lines(result: PlateResult) -> tuple[str, ...]:
         f"plate {result.plate}: {residual}, rotation {result.rotation_deg:.2f}°"
     )
     return tuple(lines)
+
+
+def plan_title(plan: PlanLayer | None, *, drawn_up_to: int = MAP_FIELDS_UP_TO) -> str:
+    """The suffix the map's title gets for the scan plan it draws, ``""`` for none (m5 §14.3).
+
+    Past ``drawn_up_to`` fields the layer holds none (a first part of the plan would
+    pass for all of it), so the title is where the operator reads that the plan exists
+    and why it is not drawn. The bound is a keyword so that the boundary is tested
+    without a plan of five thousand fields.
+    """
+    if plan is None:
+        return ""
+    fields = "1 field" if plan.count == 1 else f"{plan.count} fields"
+    wells = "1 well" if plan.wells == 1 else f"{plan.wells} wells"
+    text = f"; scan plan: {fields} in {wells}"
+    if plan.count > drawn_up_to:
+        text += f", too many to draw (over {drawn_up_to})"
+    return text
+
+
+def duration_text(seconds: float) -> str:
+    """``seconds`` as the page says a duration: to the second, then minutes, then hours (m5 §14.3).
+
+    Rounded to the nearest second (Python's ``round``): ``42.16`` is ``42 s``. Under
+    a minute ``<s> s``, under an hour ``<m> min <ss> s``, from an hour ``<h> h <mm>
+    min`` with the seconds dropped, because an estimate of hours is not read to the
+    second. The rounding comes first, so ``59.6`` is ``1 min 00 s``, never ``60 s``.
+    """
+    total = round(seconds)
+    if total < 60:
+        return f"{total} s"
+    if total < 3600:
+        minutes, rest = divmod(total, 60)
+        return f"{minutes} min {rest:02d} s"
+    hours, rest = divmod(total, 3600)
+    return f"{hours} h {rest // 60:02d} min"
+
+
+#: How many wells the scan plan's card names before it counts the others.
+_CARD_WELLS = 6
+
+
+def scan_plan_card_lines(result: ScanPlanResult) -> tuple[str, ...]:
+    """The card of a scan plan: the wells, the fields, the field and the estimate (m5 §14.3).
+
+    Built from the result because the generic card shows its first eight keys and
+    cut ``estimate_s`` away, the figure the operator wants before pressing *scan*.
+    The wells are named in the plan's order (the visiting order, not the
+    alphabetical one). The estimate says what ``estimate_s()`` sums, the moves, a
+    refocus when the timings know its cost and the snaps, and no more: it leaves out a
+    channel change, the cells, the report and the export. An unknown estimate says what
+    makes it unknown and what to run, and is never a zero (CLAUDE.md: unknown beats
+    guessed).
+    """
+    names = list(result.wells[:_CARD_WELLS])
+    if len(result.wells) > _CARD_WELLS:
+        names.append(f"… {len(result.wells) - _CARD_WELLS} more")
+    wells = f"wells: {len(result.wells)}"
+    if names:
+        wells += f" ({', '.join(names)})"
+    grid = f"a grid of {result.rows} × {result.columns} in each well"  # noqa: RUF001
+    planned = result.rows * result.columns * len(result.wells)
+    if len(result.fields) == planned:
+        fields = f"fields: {len(result.fields)}, {grid}"
+    else:
+        fields = (
+            f"fields: {len(result.fields)} of {planned}, {grid}, "
+            "the fields that miss the well left out"
+        )
+    width_um, height_um = result.fov_um
+    at = "" if result.objective is None else f" at {result.objective}"
+    field = f"field: {width_um:g} × {height_um:g} µm{at}, overlap {result.overlap:g}"  # noqa: RUF001
+    if result.estimate_s is None:
+        estimate = (
+            "estimate: unknown, no usable timing: run timing, then scan-plan again"
+        )
+    else:
+        estimate = (
+            f"estimate: about {duration_text(result.estimate_s)} "
+            "(the moves, refocus and snaps of the timings)"
+        )
+    return (wells, fields, field, estimate)
 
 
 def replace_note(

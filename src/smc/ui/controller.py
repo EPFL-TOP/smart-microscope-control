@@ -91,6 +91,7 @@ from smc.plugins.slots import (
     ImageSide,
     PlateResult,
     RouteResult,
+    ScanPlanResult,
     WallSide,
     WallTouch,
     WellGeometry,
@@ -103,6 +104,7 @@ from smc.ui.frames import Frame
 from smc.ui.guide import (
     CAPTURE_WELLS,
     DRY_RUN_NO_FRAME,
+    MAP_FIELDS_UP_TO,
     NO_CALIBRATION_FOR_SIDES,
     PLATE_NOT_CHOSEN,
     SELECT_WELLS,
@@ -112,6 +114,7 @@ from smc.ui.guide import (
     command_line,
     next_slot,
     replace_note,
+    scan_plan_card_lines,
     walls_card_lines,
     walls_centres_problem,
 )
@@ -133,6 +136,7 @@ __all__ = [
     "LoadedPreset",
     "PageServerError",
     "PageStatus",
+    "PlanLayer",
     "PlatePage",
     "PlateView",
     "ResultCard",
@@ -361,6 +365,23 @@ class ResultCard:
 
 
 @dataclass(frozen=True, slots=True)
+class PlanLayer:
+    """The usable scan plan as the map draws it, in stage µm (m5 §14.1).
+
+    ``count`` is every field of the plan, drawn or not, and ``wells`` the number of
+    wells it visits: the title and the card quote them. ``fov_um`` is the footprint's
+    bounding box in stage axes, the width and height of the rectangle drawn at each
+    field. ``fields`` are the ``(x_um, y_um)`` centres in visiting order, or ``()``
+    past ``MAP_FIELDS_UP_TO``: a first part of a large plan would pass for all of it.
+    """
+
+    count: int
+    wells: int
+    fov_um: tuple[float, float]
+    fields: tuple[tuple[float, float], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class PlateView:
     """A snapshot of what the run document says, as the page needs it (a pure read).
 
@@ -379,7 +400,10 @@ class PlateView:
     ``camera-calibration`` (whatever its objective: rotation and mirror belong to the
     optical path), ``None`` when there is none or its result does not validate; the
     page says from it what each side of the image is and what the arrows do to it
-    (m5 §13).
+    (m5 §13). ``plan`` is the fields of the usable ``scan-plan`` and the same
+    rule as the density: ``None`` when the slot is stale, of another profile, a dry
+    run on a page that is not one, does not validate or has a field of view that is
+    not positive (m5 §14.1).
     """
 
     plate: str
@@ -394,6 +418,7 @@ class PlateView:
     next_step: NextStep | None = None
     replaces: Mapping[str, str] = field(default_factory=dict)
     camera_matrix: Matrix2 | None = None
+    plan: PlanLayer | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -592,6 +617,51 @@ def _plate_from_images(result: Mapping[str, Any]) -> PlateResult | None:
     return found if found.walls is not None else None
 
 
+def _scan_plan_of(record: StageRecord) -> ScanPlanResult | None:
+    """``record``'s result as a ``ScanPlanResult``, or ``None``: anything else is the generic card.
+
+    Tried only for the record that provides ``scan-plan`` (every other record's
+    result would be validated for nothing), and never an exception for a document that
+    is data (FM-125): a result that does not validate keeps the generic card, and
+    ``view()`` says why in ``problems`` when the slot is usable.
+    """
+    if record.provides != "scan-plan" or record.result is None:
+        return None
+    try:
+        return ScanPlanResult.model_validate(record.result)
+    except ValidationError:
+        return None
+
+
+def _plan_layer(plan: ScanPlanResult | None, problems: list[str]) -> PlanLayer | None:
+    """The layer the map draws for a usable scan plan, ``None`` for no plan or one it cannot draw (m5 §14.1).
+
+    The model does not bound ``fov_um``, and a rectangle of zero or negative size is
+    invisible or flipped: it is a problem line and no layer, never an exception
+    (FM-125). Past ``MAP_FIELDS_UP_TO`` the layer keeps the count and no field, so
+    that the payload is bounded whatever a document holds (FM-140).
+    """
+    if plan is None:
+        return None
+    width_um, height_um = plan.fov_um
+    if not (width_um > 0.0 and height_um > 0.0):
+        problems.append(
+            f"scan-plan: fov_um {plan.fov_um} is not positive; its fields are not drawn"
+        )
+        return None
+    count = len(plan.fields)
+    return PlanLayer(
+        count=count,
+        wells=len(plan.wells),
+        fov_um=plan.fov_um,
+        fields=(
+            tuple((f.x_um, f.y_um) for f in plan.fields)
+            if count <= MAP_FIELDS_UP_TO
+            else ()
+        ),
+    )
+
+
 def _card(
     record: StageRecord, *, stale: bool = False, run_dir: PurePath | None = None
 ) -> ResultCard:
@@ -610,6 +680,9 @@ def _card(
     ``walls``) shows the wells measured and the plate instead of its first keys,
     which cut the walls away (m5 §12.6); its frames' folder is a file. A result that
     does not validate as one is the generic card, never an exception (FM-125).
+
+    A ``scan-plan`` result shows its wells, fields, field and estimate instead of
+    its first keys, which cut ``estimate_s`` away (m5 §14.3); the same rule.
     """
     when = record.finished_utc or record.started_utc
     try:
@@ -623,6 +696,7 @@ def _card(
     assumed: tuple[str, ...] = ()
     if record.status is StageStatus.done and record.result is not None:
         from_images = _plate_from_images(record.result)
+        planned = _scan_plan_of(record)
         if from_images is not None:
             lines = [_cut(_flat(line)) for line in walls_card_lines(from_images)]
             folder = None if from_images.walls is None else from_images.walls.folder
@@ -633,6 +707,13 @@ def _card(
                         _CARD_TEXT_CHARS,
                     )
                 )
+        elif planned is not None:
+            # Cut at a diagnosis's limit, not a value's 80: the clipped `fields:` line is
+            # 90 characters and its end says why the two counts differ (#320 deviation).
+            lines = [
+                _cut(_flat(line), _CARD_TEXT_CHARS)
+                for line in scan_plan_card_lines(planned)
+            ]
         else:
             for key, value in record.result.items():
                 if key == "assumed":
@@ -2739,6 +2820,9 @@ class PlatePage:
         density = self._slot(doc, "density", DensityResult, problems)
         route = self._slot(doc, "route", RouteResult, problems)
         calibration = self._slot(doc, "camera-calibration", CameraCalibration, problems)
+        plan = _plan_layer(
+            self._slot(doc, "scan-plan", ScanPlanResult, problems), problems
+        )
         geometries, nominal = self._registered_geometries(registered)
         selected = frozenset(self.selection)
         measured = {} if density is None else {w.well: w for w in density.wells}
@@ -2794,6 +2878,7 @@ class PlatePage:
             next_step=self._next_step(checklist, blocked, cards),
             replaces=self._replace_notes(doc),
             camera_matrix=None if calibration is None else calibration.matrix_um_per_px,
+            plan=plan,
         )
 
     def _replace_notes(self, doc: RunDocument) -> dict[str, str]:

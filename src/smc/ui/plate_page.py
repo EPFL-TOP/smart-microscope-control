@@ -82,6 +82,7 @@ from smc.ui.guide import (
     drive_image_note,
     forget_label,
     image_sides_note,
+    plan_title,
     preset_differences,
     preset_note_text,
     wall_touches_note,
@@ -418,6 +419,8 @@ class PlatePageView:
             {"x": [], "y": [], "order": [], "well": []}
         )
         self.stage_source = ColumnDataSource({"x": [], "y": []})
+        # The usable scan plan's fields, one rectangle each (m5 §14.2).
+        self.fields_source = ColumnDataSource({"x": [], "y": [], "w": [], "h": []})
         self.mapper = LinearColorMapper(
             palette=Viridis256, low=0.0, high=1.0, nan_color=_UNKNOWN_FILL
         )
@@ -444,6 +447,20 @@ class PlatePageView:
         )
         self.figure.add_layout(self.names)
         self.figure.add_layout(ColorBar(color_mapper=self.mapper), "right")
+        # Before the route's line, so that the route is drawn over the fields; the wells
+        # are `underlay`, below both, and the only renderer the hover reads. The orange
+        # differs from Viridis (the wells' fill) and from the route's red.
+        self.figure.rect(
+            "x",
+            "y",
+            "w",
+            "h",
+            source=self.fields_source,
+            fill_color="#ff7f0e",
+            fill_alpha=0.2,
+            line_color="#ff7f0e",
+            line_width=1,
+        )
         self.figure.line(
             "x", "y", source=self.route_source, line_width=2, color="#d62728"
         )
@@ -1636,6 +1653,15 @@ class PlatePageView:
             "order": [stop.order for stop in view.route],
             "well": [stop.well for stop in view.route],
         }
+        plan = view.plan
+        fields = () if plan is None else plan.fields
+        width_um, height_um = (0.0, 0.0) if plan is None else plan.fov_um
+        self.fields_source.data = {
+            "x": [x_um for x_um, _y_um in fields],
+            "y": [y_um for _x_um, y_um in fields],
+            "w": [width_um] * len(fields),
+            "h": [height_um] * len(fields),
+        }
         self.checklist_text.object = "\n".join(
             {
                 "ok": f"✓ {item.slot}",
@@ -1772,11 +1798,12 @@ class PlatePageView:
         self.mapper.high = max(known) if known and max(known) > 0.0 else 1.0
         self.names.visible = len(view.wells) <= NAMES_UP_TO_WELLS
         # Where the wells are drawn is only as good as the registration: say which map it is.
+        # The scan plan's suffix is where a plan too large to draw says so (m5 §14.3).
         self.figure.title.text = (
             f"{view.plate}: nominal map (A1 at 0, 0, not turned), the plate is not registered"
             if view.nominal
             else f"{view.plate}: the registered plate"
-        )
+        ) + plan_title(view.plan)
 
     def _ensure_renderer(self, circular: bool) -> None:
         """Round wells are circles and square ones rectangles: swap the glyph when the plate changes."""
