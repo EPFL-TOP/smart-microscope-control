@@ -3198,9 +3198,12 @@ calibration is run, the step says `WALLS_NEED_CALIBRATION` and the button is dis
 
 *Amended by #375.* When `plate-walls` is the step only because it is the slot's first
 provider (`plate-registration` did not load), on a dry-run page or a square-welled plate,
-`_walls_step` offers **no pairs**, so the step's command carries no `--param` a click or a
-terminal would run, and its reason is the refusal (§12.3 items 1 and 2), as it is the
-placeholder plate's when the plate is not chosen (§11.3).
+`_walls_step` fills **no page pair** (`plate`, `refs`), so the step's command carries no
+`--param plate=...` a click or a terminal would run, and its reason is the refusal (§12.3
+items 1 and 2), as it is the placeholder plate's when the plate is not chosen (§11.3). A
+pair that the profile's `[suggest]` table or a loaded preset gives the tool is still
+added after it, here as under the placeholder plate, and the step is blocked by the same
+reason either way.
 
 *Decided against:* a step that runs `camera-calibration` first. It moves the stage and
 measures at a place nobody chose, and which objective the registration is made at is the

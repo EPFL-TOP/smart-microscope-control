@@ -2556,6 +2556,14 @@ def test_plate_walls_params_refuse_the_dry_run_then_square_wells_then_the_count(
         with _refuses(ValueError, WALLS_DRY_RUN):
             dry_page.page_params("plate-walls")
         dry_page.close()
+        # The plate's gate is ahead of both: a dry-run page that nothing named a plate
+        # for says to choose it, as its button does (adversarial review of #375).
+        unchosen = _walls_page(dry, run_doc, centres=0, calibrated=False, chosen=False)
+        assert unchosen.plate_chosen is False
+        assert _walls_reason(unchosen) == PLACEHOLDER_REFUSAL
+        with _refuses(ValueError, PLACEHOLDER_REFUSAL):
+            unchosen.page_params("plate-walls")
+        unchosen.close()
     finally:
         dry.close()
 

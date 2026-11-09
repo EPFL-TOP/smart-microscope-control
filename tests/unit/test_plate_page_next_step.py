@@ -942,8 +942,10 @@ def test_plate_walls_alone_in_its_slot_offers_nothing_on_a_square_welled_plate(
 ) -> None:
     # #375: with `plate-registration` not loaded, `plate-walls` is the first provider and
     # so the step on any plate. On a 384-well plate the plugin refuses it before it moves
-    # and a failed record would replace a usable plate (§11.4): no pairs, so no command a
-    # click or a terminal would run, and the reason is the plate's.
+    # and a failed record would replace a usable plate (§11.4): the page fills no pair
+    # (`plate`, `refs`), so no command a click or a terminal would run, and the reason is
+    # the plate's. (A profile's suggestion or a preset can still add a pair of its own,
+    # as under the placeholder plate; the step is blocked all the same.)
     only = (Calibration, *(t for t in WORKFLOW if t is not Registration), Walls)
     _calibrated(run_doc)
     page = _walls_page(fake_microscope, run_doc, tools=only)
@@ -964,6 +966,9 @@ def test_plate_walls_alone_in_its_slot_offers_nothing_on_a_square_welled_plate(
         assert _pairs_of(square.command) == []
         assert square.why == ("the run document has no plate yet",)
         assert page.view().blocked["plate-walls"] == walls_square_wells("384-well")
+        # `_blocked` holds the same text and wins in the step, so the step's own reason
+        # is read where it is made (adversarial review of #375).
+        assert page._walls_step([]) == ([], walls_square_wells("384-well"))
     finally:
         page.close()
 
@@ -987,6 +992,7 @@ def test_plate_walls_alone_in_its_slot_offers_nothing_on_a_dry_run_page(
             assert step.params == ()
             assert step.blocked == WALLS_DRY_RUN
             assert _pairs_of(step.command) == []
+            assert page._walls_step([]) == ([], WALLS_DRY_RUN)
         finally:
             page.close()
     finally:

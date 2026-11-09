@@ -3143,8 +3143,11 @@ class PlatePage:
         none: nothing is then offered, as ``_registration_step`` offers nothing
         (m5 §11.3), and the sentence that says what to do is the step's. The same
         holds for a dry-run page and a square-welled plate (``_walls_refusal``): the
-        plugin refuses them, so no pairs, and so no command, are offered (#375). What
-        else can block it (the calibration, a closed stand) is the tool's own
+        plugin refuses them, so the page fills no pair (``plate``, ``refs``) for it
+        (#375). A profile's suggestion or a preset may still add its own pairs after
+        this, in ``next_step``, as they do under the placeholder plate: the step is
+        blocked by the same reason, which is also the tool's own ``blocked`` and wins
+        there. What else can block it (the calibration, a closed stand) is that
         ``blocked``, which the step carries.
         """
         if not self._plate_chosen:
