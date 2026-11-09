@@ -16,7 +16,9 @@ from __future__ import annotations
 import contextlib
 import errno
 import gc
+import logging
 import math
+import re
 import shutil
 import threading
 import weakref
@@ -155,13 +157,22 @@ class _Camera(SampleCamera):
         self.reported_shape: tuple[int, int] | None = None
         self.transposed_snap: int | None = None
         self.fail: dict[int, BaseException] = {}
+        #: Snaps (counted from 1) that return a frame of one level: no focus in it.
+        self.flat_snaps: set[int] = set()
+        #: Called at every snap, its answers kept in ``seen``.
+        self.watch: Callable[[], object] | None = None
+        self.seen: list[object] = []
 
     def snap(self) -> npt.NDArray[np.uint16]:
         self.snaps += 1
+        if self.watch is not None:
+            self.seen.append(self.watch())
         if self.snaps in self.fail:
             raise self.fail[self.snaps]
         if self.snaps == self.transposed_snap:
             return np.zeros((SHAPE[1], SHAPE[0]), dtype=np.uint16)
+        if self.snaps in self.flat_snaps:
+            return np.full(SHAPE, 1000, dtype=np.uint16)
         return super().snap()
 
     def image_shape(self) -> tuple[int, int]:
@@ -201,9 +212,21 @@ class _Turret:
 
 
 class _Autofocus:
-    """An autofocus that records every call; ``engage`` takes its results from a list."""
+    """An autofocus that records every call; ``engage`` takes its results from a list.
 
-    def __init__(self, *, engaged: bool, locked: bool) -> None:
+    With ``plane_um`` and ``z``, an engage that locks drives Z to that plane, as
+    PFS drives it to the plane its offset names (the plate's bottom, while the
+    sample camera is sharp at 0: the cells' plane, m3 §21.9).
+    """
+
+    def __init__(
+        self,
+        *,
+        engaged: bool,
+        locked: bool,
+        plane_um: float | None = None,
+        z: ZStage | None = None,
+    ) -> None:
         self.engaged = engaged
         self.locked = locked
         self.offset = 4242.0
@@ -211,6 +234,8 @@ class _Autofocus:
         #: What successive ``engage`` calls return (and leave); empty: they lock.
         #: An exception is raised, after the fake switched itself off.
         self.engage_results: list[bool | BaseException] = []
+        self.plane_um = plane_um
+        self.z = z
 
     def lose_lock(self) -> None:
         self.locked = False
@@ -235,6 +260,8 @@ class _Autofocus:
         if isinstance(result, BaseException):
             self.engaged = self.locked = False
             raise result
+        if result and self.plane_um is not None and self.z is not None:
+            self.z.move_to_um(self.plane_um, keep_autofocus=False)
         self.engaged = self.locked = result
         return result
 
@@ -2046,3 +2073,391 @@ def test_a_dry_run_scan_writes_nothing(
     assert result.failed == ()
     assert result.assumed == ("dry run: 12 fields walked, no frame taken",)
     assert [p.name for p in tmp_path.rglob("*") if p.is_file()] == ["run.json"]
+
+
+# ------------------------------------------------- the focus on the cells (m3 §21.6)
+
+#: The plane the autofocus double holds: the plate's bottom, 3 µm from the cells'
+#: plane, where the sample camera is sharp (Z = 0).
+PFS_PLANE_UM = 3.0
+LOGGER = "smc.plugins.scan"
+#: Eleven planes, ±10 µm: on the rig's 96 x 128 frames with the sample's noise,
+#: ±5 µm in steps of 1 rises too little and some fields read two peaks (D4),
+#: while this range found a peak in 36 sweeps of 36 (measured, #341).
+FOCUS: dict[str, object] = {"focus_range_um": 10.0, "focus_step_um": 2.0}
+
+
+class _LimitedZ:
+    """The demo's focus drive with the soft limits a test gives; every method written out."""
+
+    def __init__(self, inner: ZStage, limits: Limits | None) -> None:
+        self._inner = inner
+        self.limits = limits
+        self.moves = 0
+
+    def position_um(self) -> float:
+        return self._inner.position_um()
+
+    def move_to_um(self, z_um: float, *, keep_autofocus: bool = True) -> float:
+        self.moves += 1
+        return self._inner.move_to_um(z_um, keep_autofocus=keep_autofocus)
+
+    def move_by_um(
+        self, dz_um: float, *, force: bool = False, keep_autofocus: bool = True
+    ) -> float:
+        self.moves += 1
+        return self._inner.move_by_um(dz_um, force=force, keep_autofocus=keep_autofocus)
+
+    def wait(self, timeout_s: float | None = None) -> None:
+        self._inner.wait(timeout_s)
+
+    def is_busy(self) -> bool:
+        return self._inner.is_busy()
+
+    def stop(self) -> None:
+        self._inner.stop()
+
+    def limits_um(self) -> Limits | None:
+        return self.limits
+
+
+def _locked_on_the_plate(rig: _Rig) -> _Autofocus:
+    """An autofocus locked on the plate's bottom, at ``PFS_PLANE_UM``; the camera notes whether it is on at each snap."""
+    z = rig.microscope.require(ZStage)
+    z.move_to_um(PFS_PLANE_UM)
+    af = _Autofocus(engaged=True, locked=True, plane_um=PFS_PLANE_UM, z=z)
+    rig.microscope.override(Autofocus, af)
+    rig.camera.watch = lambda: af.engaged
+    return af
+
+
+def test_per_field_focus_takes_each_frame_at_the_sharp_plane(rig: _Rig) -> None:
+    af = _locked_on_the_plate(rig)
+
+    result = _result(_scan(rig, cell_focus="per-field", **FOCUS))
+
+    assert len(result.frames) == 12
+    assert result.failed == ()
+    for frame in result.frames:
+        assert frame.focus == "locked"
+        # The lock's offset, read before the switch-off: the plane PFS held.
+        assert frame.pfs_offset == 4242.0
+        assert frame.z_um is not None
+        assert abs(frame.z_um) <= 1.0
+        focus = frame.cell_focus
+        assert focus is not None
+        assert focus.source == "swept"
+        assert focus.sweep is not None
+        assert focus.sweep.centre_um == pytest.approx(PFS_PLANE_UM, abs=0.01)
+        assert len(focus.sweep.z_um) == 11
+        assert focus.sweep.outcome == "peak"
+        assert focus.dz_um == pytest.approx(-PFS_PLANE_UM, abs=1.0)
+        assert focus.frame_score > 0.0
+        assert focus.duration_s > 0.0
+    # Off at every snap, the sweep's and the frame's, and locked after the scan.
+    assert rig.camera.snaps == 12 * 12
+    assert rig.camera.seen == [False] * (12 * 12)
+    assert af.engaged
+    assert af.locked
+
+
+def test_per_well_focus_sweeps_until_a_peak_then_reuses_its_dz(rig: _Rig) -> None:
+    # No autofocus: every sweep is centred on the Z read before anything moved.
+    rig.microscope.require(ZStage).move_to_um(PFS_PLANE_UM)
+    # The first field's sweep sees nothing: a flat sweep does not decide a well.
+    rig.camera.flat_snaps = set(range(1, 12))
+
+    result = _result(_scan(rig, cell_focus="per-well", **FOCUS))
+
+    by_well: dict[str, list[ScanFrame]] = {}
+    for frame in result.frames:
+        by_well.setdefault(frame.well, []).append(frame)
+    first, second, *later = by_well["A1"]
+    assert first.cell_focus is not None
+    assert first.cell_focus.sweep is not None
+    assert first.cell_focus.sweep.outcome == "flat"
+    assert first.cell_focus.dz_um == 0.0
+    assert first.z_um == pytest.approx(PFS_PLANE_UM, abs=0.01)
+    assert second.cell_focus is not None
+    assert second.cell_focus.source == "swept"
+    assert second.cell_focus.dz_um == pytest.approx(-PFS_PLANE_UM, abs=1.0)
+    for frame in later:
+        assert frame.cell_focus is not None
+        assert frame.cell_focus.source == "well"
+        assert frame.cell_focus.sweep is None
+        assert frame.cell_focus.dz_um == second.cell_focus.dz_um
+        assert frame.z_um is not None
+        assert abs(frame.z_um) <= 1.0
+    # Every well decides its own offset, from its own first field with a peak.
+    for well in ("A2", "B2"):
+        sources = [f.cell_focus.source for f in by_well[well] if f.cell_focus]
+        assert sources == ["swept", "well", "well", "well"]
+    # A1: two sweeps and a frame each, two frames; A2 and B2: one sweep, four frames.
+    assert rig.camera.snaps == (2 * 12 + 2) + 2 * (11 + 4)
+    assert (
+        "the focus on the cells found a peak on 3 of 4 sweeps (flat 1, at an edge "
+        "0, two peaks 0): the others kept the centre"
+    ) in result.assumed
+
+
+def test_an_unlocked_field_gets_no_focus_step(rig: _Rig) -> None:
+    af = _locked_on_the_plate(rig)
+    af.engage_results = [False]  # the relock of the second field
+
+    result = _result(_scan(rig, cell_focus="per-field", **FOCUS))
+
+    frames = result.frames
+    assert frames[1].focus == "unlocked"
+    assert frames[1].cell_focus is None
+    assert [i for i, f in enumerate(frames) if f.cell_focus is None] == [1]
+    assert (
+        "the focus on the cells was skipped on 1 fields whose autofocus did not lock"
+        in result.assumed
+    )
+
+
+def test_a_failed_sweep_is_a_failed_field_and_leaves_the_autofocus_off(
+    rig: _Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    af = _locked_on_the_plate(rig)
+    rig.camera.fail = {3: DeviceTimeoutError("the camera did not answer in 5 s")}
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        result = _result(_scan(rig, cell_focus="per-field", **FOCUS))
+
+    assert [(f.name, f.error) for f in result.failed] == [
+        ("A1_0000", "DeviceTimeoutError: the camera did not answer in 5 s")
+    ]
+    assert len(result.frames) == 11
+    # The autofocus was off when the sweep failed, and nothing put it back
+    # there: the next field's re-engage did (FM-88).
+    assert rig.camera.seen[2] is False
+    assert af.calls.index("engage") > af.calls.index("disengage")
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == LOGGER and r.levelno == logging.WARNING
+    ]
+    assert warnings == [
+        "A1_0000: the focus on the cells failed (DeviceTimeoutError: the camera did "
+        "not answer in 5 s); the autofocus is left off"
+    ]
+
+
+def test_a_sweep_outside_the_limits_at_a_field_fails_it_with_nothing_moved(
+    rig: _Rig,
+) -> None:
+    z = _LimitedZ(rig.microscope.require(ZStage), Limits(-1000.0, 14.0))
+    rig.microscope.override(ZStage, z)
+    af = _locked_on_the_plate(rig)
+    z_moves_at: dict[int, int] = {}
+
+    def hold_high(n: int) -> None:
+        # From the second field on, PFS holds 8 µm: a sweep of ±10 µm passes 14.
+        z_moves_at[n] = z.moves
+        if n == 2:
+            af.plane_um = 8.0
+
+    rig.stage.after_move = hold_high
+
+    result = _result(_scan(rig, cell_focus="per-field", max_failed_in_row=12, **FOCUS))
+
+    assert [f.name for f in result.frames] == ["A1_0000"]
+    assert len(result.failed) == 11
+    assert {f.error for f in result.failed} == {
+        "SweepOutsideLimits: the focus sweep around 8 µm would reach 16 µm, "
+        "outside the soft limits [-1000, 14] µm"
+    }
+    # The relock of the second field moved Z (PFS drove it to 8); after it,
+    # nothing moved Z: the autofocus was never switched off again.
+    assert z.moves == z_moves_at[3]
+    assert af.calls.count("disengage") == 1
+    assert af.engaged
+    assert af.locked
+
+
+def test_the_next_field_relocks_after_the_focus(rig: _Rig) -> None:
+    af = _locked_on_the_plate(rig)
+
+    result = _result(_scan(rig, cell_focus="per-field", **FOCUS))
+
+    # Eleven relocks for the next fields, one after the last field.
+    assert af.calls.count("engage") == 12
+    assert af.calls.count("disengage") == 12
+    # §8's line counts the scan's own re-engages, not the focus's (FM-165).
+    assert not [a for a in result.assumed if a.startswith("the autofocus was engaged")]
+
+
+def test_the_focus_time_per_field_is_reported(rig: _Rig) -> None:
+    _locked_on_the_plate(rig)
+
+    result = _result(_scan(rig, cell_focus="per-field", **FOCUS))
+
+    lines = [a for a in result.assumed if a.startswith("the focus on the cells added")]
+    assert len(lines) == 1
+    assert re.fullmatch(
+        r"the focus on the cells added \d+\.\d\d s per field \(12 fields: \d+\.\d\d s "
+        r"to sweep and move, \d+\.\d\d s for the lock after\)",
+        lines[0],
+    ), lines[0]
+    caveat = [a for a in result.assumed if a.startswith("each frame's pfs_offset")]
+    assert len(caveat) == 1
+    assert re.fullmatch(
+        r"each frame's pfs_offset names the plane PFS held, not the cells' plane "
+        r"-?\d+\.\d\d…-?\d+\.\d\d µm from it: an export that engages PFS at that "
+        r"offset images the plane PFS held",
+        caveat[0],
+    ), caveat[0]
+
+
+def test_the_focus_time_without_an_autofocus_has_no_lock_part(rig: _Rig) -> None:
+    result = _result(_scan(rig, cell_focus="per-field", **FOCUS))
+
+    lines = [a for a in result.assumed if a.startswith("the focus on the cells added")]
+    assert len(lines) == 1
+    assert re.fullmatch(
+        r"the focus on the cells added \d+\.\d\d s per field \(12 fields: \d+\.\d\d s "
+        r"to sweep and move\)",
+        lines[0],
+    ), lines[0]
+    assert not [a for a in result.assumed if a.startswith("each frame's pfs_offset")]
+
+
+def test_cell_focus_without_soft_limits_is_refused_before_anything_moves(
+    rig: _Rig,
+) -> None:
+    z = _LimitedZ(rig.microscope.require(ZStage), None)
+    rig.microscope.override(ZStage, z)
+
+    reason = _refused(rig, cell_focus="per-field", **FOCUS)
+
+    assert (
+        reason == "cell_focus moves Z: the profile must set [safety] z_soft_limits_um"
+    )
+    assert z.moves == 0
+
+
+def test_a_first_sweep_past_the_soft_limit_is_refused_before_anything_moves(
+    rig: _Rig,
+) -> None:
+    z = _LimitedZ(rig.microscope.require(ZStage), None)
+    start = z.position_um()
+    z.limits = Limits(-1000.0, start + 3.0)
+    rig.microscope.override(ZStage, z)
+
+    reason = _refused(rig, cell_focus="per-field", **FOCUS)
+
+    # Planes 2 µm apart around the start: the first past the limit is start + 4.
+    assert reason == (
+        f"the focus sweep around {start:g} µm would reach {start + 4.0:g} µm, "
+        f"outside the soft limits [-1000, {start + 3.0:g}] µm"
+    )
+    assert z.moves == 0
+
+
+def test_cell_focus_off_never_moves_z_and_needs_no_limits(rig: _Rig) -> None:
+    z = _LimitedZ(rig.microscope.require(ZStage), None)
+    rig.microscope.override(ZStage, z)
+
+    result = _result(_scan(rig))
+
+    assert z.moves == 0
+    assert {f.cell_focus for f in result.frames} == {None}
+
+
+@pytest.mark.parametrize("cell_focus", ["off", "per-field"])
+def test_a_resume_after_the_autofocus_was_left_off_is_refused(
+    rig: _Rig, cell_focus: str
+) -> None:
+    af = _locked_on_the_plate(rig)
+    stop = threading.Event()
+    record = _scan(
+        rig,
+        cell_focus=cell_focus,
+        stop=stop,
+        on_progress=_at(5, stop.set),
+        **FOCUS,
+    )
+    assert record.status is StageStatus.stopped
+    # The checkpoint carries each frame's focus step, or none.
+    kept = _checkpoint(rig).frames
+    assert [f.focus for f in kept] == ["locked"] * 4
+    assert all((f.cell_focus is not None) == (cell_focus != "off") for f in kept)
+    if cell_focus == "off":
+        # The operator switched it off; with the step, the stop left it off.
+        af.engaged = af.locked = False
+    assert af.engaged is False
+    moves, snaps = rig.stage.moves, rig.camera.snaps
+
+    with pytest.raises(PluginRunError) as raised:
+        _scan(rig, cell_focus=cell_focus, resume=True, **FOCUS)
+
+    assert raised.value.reason == (
+        "the scan being resumed used the autofocus, which is not locked now (a stop "
+        "during the focus on the cells leaves it off): lock it on the sample, then "
+        "run scan --resume"
+    )
+    assert (rig.stage.moves, rig.camera.snaps) == (moves, snaps)
+    # Locked again on the sample, the resume runs.
+    af.engaged = af.locked = True
+    resumed = _result(_scan(rig, cell_focus=cell_focus, resume=True, **FOCUS))
+    assert len(resumed.frames) == 12
+
+
+def test_a_frame_without_cell_focus_is_written_as_before(rig: _Rig) -> None:
+    stop = threading.Event()
+    assert _scan(rig, stop=stop, on_progress=_at(5, stop.set)).status is (
+        StageStatus.stopped
+    )
+    checkpoint = _stored(rig).checkpoint
+    assert checkpoint is not None
+    assert len(checkpoint["frames"]) == 4
+    assert [k for f in checkpoint["frames"] for k in f if k == "cell_focus"] == []
+
+    result = _result(_scan(rig, resume=True))
+
+    stored = _stored(rig).result
+    assert stored is not None
+    assert [k for f in stored["frames"] for k in f if k == "cell_focus"] == []
+    assert set(stored["frames"][0]) == {
+        "well",
+        "index",
+        "name",
+        "file",
+        "x_um",
+        "y_um",
+        "z_um",
+        "focus",
+        "pfs_offset",
+        "t_s",
+    }
+    with tifffile.TiffFile(rig.run_dir / result.frames[0].file) as tiff:
+        written = tiff.shaped_metadata
+    assert written is not None
+    assert "cell_focus" not in written[0]
+    assert not [a for a in result.assumed if "focus on the cells" in a]
+
+
+def test_a_dry_run_plans_the_focus_and_runs_none(
+    demo_microscope_dry: Microscope, tmp_path: Path
+) -> None:
+    rig = _build(demo_microscope_dry, tmp_path)
+    _plan(rig)
+    af = _Autofocus(engaged=True, locked=True)
+    demo_microscope_dry.override(Autofocus, af)
+
+    result = _result(_scan(rig, cell_focus="per-field", **FOCUS))
+
+    assert rig.camera.snaps == 0
+    assert not MUTATING & set(af.calls)
+    assert result.assumed == (
+        "dry run: 12 fields walked, no frame taken",
+        "dry run: the focus on the cells was planned (11 planes per sweep), not run",
+    )
+
+
+def test_scan_params_refuse_a_focus_step_above_its_range() -> None:
+    with pytest.raises(ValueError, match=r"focus_step_um=2 is above focus_range_um=1"):
+        ScanParams(focus_range_um=1.0, focus_step_um=2.0)
+    with pytest.raises(ValueError, match=r"makes 1001 planes, more than 101"):
+        ScanParams(focus_range_um=50.0, focus_step_um=0.1)

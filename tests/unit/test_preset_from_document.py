@@ -439,6 +439,10 @@ CASES: dict[str, list[dict[str, Any]]] = {
             "max_failed_in_row": 2,
             "max_unlocked_in_row": 3,
             "landing_tolerance": 0.1,
+            "cell_focus": "per-well",
+            "focus_range_um": 2.5,
+            "focus_step_um": 0.5,
+            "focus_score": "normalized-variance",
         }
     ],
     "scan-plan": [

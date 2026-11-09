@@ -43,6 +43,7 @@ keep a night's scan from producing frames nobody can trust:
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import shutil
@@ -52,7 +53,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from smc.hardware.capabilities import (
     Autofocus,
@@ -63,6 +64,28 @@ from smc.hardware.capabilities import (
 )
 from smc.hardware.errors import HardwareError, MicroscopeHaltedError, MotionStoppedError
 from smc.plugins.api import PluginParams, RunContext
+from smc.plugins.cell_focus.algorithm import (
+    DEFAULT_SCORE,
+    LANDING_FRACTION,
+    MAX_RANGE_UM,
+    MAX_STEP_UM,
+    MIN_STEP_UM,
+    ScoreName,
+    find_peak,
+    plan_planes,
+    score_frame,
+    sweep_size_problem,
+)
+from smc.plugins.cell_focus.loop import (
+    AutofocusStillOn,
+    FocusDriveOffTarget,
+    SweepBounds,
+    check_sweep_bounds,
+    move_checked,
+    outside_limits,
+    sweep,
+    switch_off_for_sweep,
+)
 from smc.plugins.errors import PluginRunError
 from smc.plugins.scan.algorithm import (
     CALIBRATION_TOLERANCE,
@@ -81,6 +104,8 @@ from smc.plugins.scan.algorithm import (
 )
 from smc.plugins.slots import (
     FailedField,
+    FieldFocus,
+    FocusSweep,
     PlannedField,
     ScanFrame,
     ScanPlanResult,
@@ -100,7 +125,11 @@ if TYPE_CHECKING:
 __all__ = ["ScanCheckpoint", "ScanParams", "ScanPlugin"]
 
 _NAME = "scan"
+_LOG = logging.getLogger(f"smc.plugins.{_NAME}")
 _AGAIN = "run scan-plan again with the stand as it is now"
+#: Added to §8's refusals when the focus on the cells switched the autofocus
+#: off and nothing locked it again (FM-88: a failure restores nothing).
+_FOCUS_LEFT_OFF = "; the focus on the cells left the autofocus off"
 
 #: Windows' MAX_PATH, which counts the terminating NUL: a path of 260
 #: characters or more fails where long paths are not enabled. Module
@@ -146,6 +175,47 @@ class ScanParams(PluginParams):
             "demo's 10x (a field of view of 128 x 96 µm)."
         ),
     )
+    cell_focus: Literal["off", "per-field", "per-well"] = Field(
+        "off",
+        description=(
+            "The focus on the cells (m3 §21): per-field sweeps Z around every "
+            "field and takes its frame at the sharpest plane; per-well sweeps "
+            "until one field of the well finds a peak, then reuses its offset. "
+            "The autofocus is off for the sweep and the frame, and the next "
+            "field locks it again."
+        ),
+    )
+    focus_range_um: float = Field(
+        5.0,
+        gt=0.0,
+        le=MAX_RANGE_UM,
+        description=(
+            "The sweep's half-range in µm. Chosen, not measured: session 3 "
+            "measures it on cells."
+        ),
+    )
+    focus_step_um: float = Field(
+        1.0,
+        ge=MIN_STEP_UM,
+        le=MAX_STEP_UM,
+        description="The distance between two planes of the sweep, in µm. Chosen.",
+    )
+    focus_score: ScoreName = Field(
+        DEFAULT_SCORE,
+        description=(
+            "The focus score. brenner is chosen from the literature, not "
+            "measured on cells."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _a_sweep_with_planes(self) -> ScanParams:
+        problem = sweep_size_problem(
+            self.focus_range_um, self.focus_step_um, "focus_range_um", "focus_step_um"
+        )
+        if problem is not None:
+            raise ValueError(problem)
+        return self
 
 
 class ScanCheckpoint(BaseModel):
@@ -176,6 +246,173 @@ class _Stand:
     #: Whether the scan uses the autofocus: it was on and locked at the start.
     used: bool
     assumed: list[str] = field(default_factory=list)
+
+
+@dataclass
+class _Focus:
+    """The focus on the cells across fields (m3 §21.6): the flag, the counts and the times.
+
+    ``off_by_focus`` says a focus step switched the autofocus off and no field
+    has read it locked since: the next field engages it again, and a failure
+    says it was left off. It is cleared as §8's ``off_by_the_scan`` is.
+    """
+
+    off_by_focus: bool = False
+    #: Whether this field's step switched the autofocus off; reset per field.
+    switched: bool = False
+    #: Fields whose frame has a focus step, and their steps' time.
+    fields: int = 0
+    step_s: float = 0.0
+    #: The engages that follow a focus step, and their time (FM-165).
+    engages: int = 0
+    engage_s: float = 0.0
+    outcomes: dict[str, int] = field(
+        default_factory=lambda: dict.fromkeys(
+            ("peak", "flat", "at-edge", "two-peaks"), 0
+        )
+    )
+    #: Fields whose autofocus read unlocked: no step (FM-154).
+    skipped: int = 0
+    dz_um: list[float] = field(default_factory=list)
+    #: ``per-well``: the ``dz_um`` of the first field of each well with a peak.
+    well_dz_um: dict[str, float] = field(default_factory=dict)
+
+    def engage(self, af: Autofocus) -> bool:
+        """Engage after a focus step, timed whether it locks, gives up or raises."""
+        self.engages += 1
+        started = time.perf_counter()
+        try:
+            return af.engage()
+        finally:
+            self.engage_s += time.perf_counter() - started
+
+    def record(self, done: FieldFocus) -> None:
+        """Count a field whose frame was taken after its focus step."""
+        self.fields += 1
+        self.step_s += done.duration_s
+        self.dz_um.append(done.dz_um)
+
+    def assumed(self, *, dry_run: bool, with_autofocus: bool, planes: int) -> list[str]:
+        """``assumed``'s lines for the step (m3 §21.6), means to two decimals."""
+        if dry_run:
+            return [
+                f"dry run: the focus on the cells was planned ({planes} planes per "
+                "sweep), not run"
+            ]
+        lines: list[str] = []
+        if self.fields:
+            sweep_s = self.step_s / self.fields
+            lock_s = self.engage_s / self.fields if with_autofocus else 0.0
+            lock = f", {lock_s:.2f} s for the lock after" if with_autofocus else ""
+            lines.append(
+                f"the focus on the cells added {sweep_s + lock_s:.2f} s per field "
+                f"({self.fields} fields: {sweep_s:.2f} s to sweep and move{lock})"
+            )
+        sweeps = sum(self.outcomes.values())
+        if sweeps:
+            lines.append(
+                f"the focus on the cells found a peak on {self.outcomes['peak']} of "
+                f"{sweeps} sweeps (flat {self.outcomes['flat']}, at an edge "
+                f"{self.outcomes['at-edge']}, two peaks {self.outcomes['two-peaks']}): "
+                "the others kept the centre"
+            )
+        if self.skipped:
+            lines.append(
+                f"the focus on the cells was skipped on {self.skipped} fields whose "
+                "autofocus did not lock"
+            )
+        if with_autofocus and self.dz_um:
+            lines.append(
+                "each frame's pfs_offset names the plane PFS held, not the cells' "
+                f"plane {min(self.dz_um):.2f}…{max(self.dz_um):.2f} µm from it: an "
+                "export that engages PFS at that offset images the plane PFS held"
+            )
+        return lines
+
+
+@dataclass(frozen=True)
+class _Prepared:
+    """A field's focus step up to its snap: when it started, and what the frame will record."""
+
+    started: float
+    source: Literal["swept", "well"]
+    sweep: FocusSweep | None
+    dz_um: float
+
+
+def _focus_before_snap(
+    z: ZStage,
+    camera: Camera,
+    af: Autofocus | None,
+    params: ScanParams,
+    bounds: SweepBounds,
+    well: str,
+    focus: _Focus,
+    ctx: RunContext,
+) -> _Prepared | str:
+    """§21.6's steps 2-6 for one field, up to its snap; or the field's error when nothing moved.
+
+    ``af`` is the autofocus when the scan uses it (the field read it locked),
+    else ``None``. The centre is the Z PFS holds at the field, else the Z read
+    before anything moved: it never follows the previous field's best plane,
+    so nothing drifts from field to field (D2).
+
+    Raises:
+        FocusDriveOffTarget, AutofocusStillOn, HardwareError: The field fails;
+            the autofocus stays off when it was switched off.
+        MicroscopeHaltedError, MotionStoppedError, StopRequested: Passed.
+    """
+    centre = z.position_um() if af is not None else bounds.z_start_um
+    if not math.isfinite(centre):
+        return f"FocusDriveOffTarget: Z read {centre!r} at the field: no sweep is centred on it"
+    known = focus.well_dz_um.get(well) if params.cell_focus == "per-well" else None
+    planes: tuple[float, ...] = (
+        (centre + known,)
+        if known is not None
+        else plan_planes(centre, params.focus_range_um, params.focus_step_um)
+    )
+    refusal = outside_limits(centre, planes, bounds.limits)
+    if refusal is not None:
+        return f"SweepOutsideLimits: {refusal}"
+
+    started = time.perf_counter()
+    if af is not None:
+        focus.off_by_focus = True
+        switch_off_for_sweep(af)
+        focus.switched = True
+    tolerance_um = LANDING_FRACTION * params.focus_step_um
+    if known is not None:
+        move_checked(z, centre + known, tolerance_um)
+        return _Prepared(started, "well", None, known)
+
+    readbacks, scores = sweep(
+        z,
+        camera,
+        planes,
+        params.focus_step_um,
+        params.focus_score,
+        raise_if_stopped=ctx.raise_if_stopped,
+    )
+    peak = find_peak(readbacks, scores)
+    focus.outcomes[peak.outcome] += 1
+    target = centre if peak.z_um is None else peak.z_um
+    dz_um = target - centre
+    if peak.z_um is not None and params.cell_focus == "per-well":
+        focus.well_dz_um.setdefault(well, dz_um)
+    move_checked(z, target, tolerance_um)
+    return _Prepared(
+        started,
+        "swept",
+        FocusSweep(
+            score=params.focus_score,
+            centre_um=centre,
+            z_um=readbacks,
+            scores=scores,
+            outcome=peak.outcome,
+            best_z_um=peak.z_um,
+        ),
+        dz_um,
+    )
 
 
 class ScanPlugin:
@@ -214,6 +451,27 @@ class ScanPlugin:
                 the scan ends where it is.
             StopRequested: The operator stopped it; ``--resume`` continues.
         """
+        focus = _Focus()
+        reason: str | None = None
+        try:
+            return self._run(microscope, params, ctx, focus)
+        except PluginRunError as exc:
+            if not focus.off_by_focus:
+                raise
+            reason = exc.reason
+        # Raised outside the handler (FM-98). The focus step switched the
+        # autofocus off and nothing locked it again: a failure restores
+        # nothing (FM-88), so the operator is told.
+        raise PluginRunError(_NAME, reason + _FOCUS_LEFT_OFF)
+
+    def _run(
+        self,
+        microscope: Microscope,
+        params: ScanParams,
+        ctx: RunContext,
+        focus: _Focus,
+    ) -> ScanResult:
+        """``run``'s body; ``focus`` carries whether the focus step left the autofocus off."""
         xy = microscope.require(XYStage)
         camera = microscope.require(Camera)
         plan = ctx.upstream("scan-plan", ScanPlanResult)
@@ -231,12 +489,43 @@ class ScanPlugin:
         tolerance_um = landing_tolerance_um(plan.fov_um, params.landing_tolerance)
         paths = _paths(ctx, plan, token)
         stand = _check_stand(microscope, camera, plan, params)
+        if (
+            params.autofocus != "off"
+            and not stand.used
+            and any(frame.focus == "locked" for frame in frames)
+        ):
+            # Without this, if-engaged would resume silently without PFS; a
+            # stop during the focus on the cells leaves it off (m3 §21.6).
+            raise PluginRunError(
+                _NAME,
+                "the scan being resumed used the autofocus, which is not locked now "
+                "(a stop during the focus on the cells leaves it off): lock it on "
+                "the sample, then run scan --resume",
+            )
         groups = wells_to_scan(plan.wells, plan.fields, set(wells_done))
         total = sum(len(fields) for _, fields in groups)
         _check_disk(ctx, camera, plan, total)
 
         z_stage = microscope.get(ZStage)
         af = stand.autofocus
+        focusing = params.cell_focus != "off"
+        bounds: SweepBounds | None = None
+        if focusing:
+            if z_stage is None:
+                raise PluginRunError(
+                    _NAME, "cell_focus needs a focus drive, and this stand has none"
+                )
+            bounds = check_sweep_bounds(
+                _NAME,
+                "cell_focus",
+                microscope,
+                z_stage,
+                "focus_range_um",
+                params.focus_range_um,
+                params.focus_step_um,
+            )
+        # The autofocus the focus step switches off: the one the scan uses.
+        focus_af = af if stand.used else None
         done = 0
         # The fields of this attempt that ended without an error: a frame
         # written, or in a dry run a move walked.
@@ -255,6 +544,12 @@ class ScanPlugin:
             for planned in fields:
                 ctx.raise_if_stopped()
                 error: str | None = None
+                prepared: _Prepared | None = None
+                cell_focus: FieldFocus | None = None
+                pfs_offset: float | None = None
+                offset_read = False
+                in_step = False
+                focus.switched = False
                 try:
                     readback = xy.move_to_um(planned.x_um, planned.y_um)
                     if not ctx.dry_run:
@@ -284,14 +579,24 @@ class ScanPlugin:
                                 # A lock someone else took ends the scan's own
                                 # failure: a switch-off after it is not ours.
                                 off_by_the_scan = False
-                            elif off_by_the_scan or af.is_engaged():
-                                engage_attempts += 1
+                                focus.off_by_focus = False
+                            elif (
+                                off_by_the_scan or focus.off_by_focus or af.is_engaged()
+                            ):
                                 # Set before the call: one that raises leaves
                                 # the autofocus off too (FM-129).
                                 off_by_the_scan = True
-                                locked = af.engage()
-                                engage_locks += int(locked)
+                                if focus.off_by_focus:
+                                    # The lock after a focus step: timed and
+                                    # counted apart from §8's re-engages (FM-165).
+                                    locked = focus.engage(af)
+                                else:
+                                    engage_attempts += 1
+                                    locked = af.engage()
+                                    engage_locks += int(locked)
                                 off_by_the_scan = not locked
+                                if locked:
+                                    focus.off_by_focus = False
                             unlocked_in_row = 0 if locked else unlocked_in_row + 1
                             if unlocked_in_row >= params.max_unlocked_in_row:
                                 raise PluginRunError(
@@ -301,19 +606,63 @@ class ScanPlugin:
                                     f"checkpoint keeps {len(wells_done)} wells: "
                                     "lock it on the sample, then run scan --resume",
                                 )
+                        if focusing and bounds is not None and z_stage is not None:
+                            if focus_af is not None and not locked:
+                                # Its Z is where a search left it (FM-154).
+                                focus.skipped += 1
+                            else:
+                                in_step = True
+                                if focus_af is not None:
+                                    # The lock the sweep is centred on, read
+                                    # before the switch-off.
+                                    pfs_offset = focus_af.offset_native()
+                                    offset_read = True
+                                outcome = _focus_before_snap(
+                                    z_stage,
+                                    camera,
+                                    focus_af,
+                                    params,
+                                    bounds,
+                                    planned.well,
+                                    focus,
+                                    ctx,
+                                )
+                                if isinstance(outcome, str):
+                                    error = outcome
+                                else:
+                                    prepared = outcome
+                    if not ctx.dry_run and error is None:
                         z_um = z_stage.position_um() if z_stage is not None else None
-                        pfs_offset = (
-                            af.offset_native()
-                            if stand.used and af is not None
-                            else None
-                        )
+                        if not offset_read:
+                            pfs_offset = (
+                                af.offset_native()
+                                if stand.used and af is not None
+                                else None
+                            )
                         pixels = camera.snap()
+                        if prepared is not None:
+                            cell_focus = FieldFocus(
+                                source=prepared.source,
+                                sweep=prepared.sweep,
+                                dz_um=prepared.dz_um,
+                                frame_score=score_frame(
+                                    np.asarray(pixels), params.focus_score
+                                ),
+                                duration_s=time.perf_counter() - prepared.started,
+                            )
                 except (MicroscopeHaltedError, MotionStoppedError):
                     raise
-                except HardwareError as exc:
+                except (HardwareError, FocusDriveOffTarget, AutofocusStillOn) as exc:
                     error = _one_line(exc)
 
                 done += 1
+                if error is not None and in_step:
+                    _LOG.warning(
+                        "%s: the focus on the cells failed (%s)%s",
+                        planned.name,
+                        error,
+                        "; the autofocus is left off" if focus.switched else "",
+                    )
                 if error is not None:
                     failed.append(
                         FailedField(
@@ -338,6 +687,8 @@ class ScanPlugin:
                     continue
 
                 failed_in_row = 0
+                if cell_focus is not None:
+                    focus.record(cell_focus)
                 if not ctx.dry_run:
                     target = paths[planned.well, planned.name]
                     frames.append(
@@ -357,6 +708,7 @@ class ScanPlugin:
                                 focus=focus_state(af is not None, stand.used, locked),
                                 pfs_offset=pfs_offset,
                                 t_s=time.monotonic() - t0,
+                                cell_focus=cell_focus,
                             ),
                         )
                     )
@@ -389,6 +741,28 @@ class ScanPlugin:
             )
 
         assumed = stand.assumed
+        if focus.off_by_focus and af is not None and not ctx.dry_run:
+            # The last field's step left the autofocus off and no next field
+            # locks it: one engage, on a normal end only (a failure or a stop
+            # leaves it off, FM-88). Every frame is written by now, so a lock
+            # that does not come is said, not a failure.
+            why: str | None = None
+            try:
+                if focus.engage(af):
+                    focus.off_by_focus = False
+                else:
+                    why = "no lock came"
+            except (MicroscopeHaltedError, MotionStoppedError):
+                raise
+            except HardwareError as exc:
+                why = _one_line(exc)
+            if why is not None:
+                line = (
+                    f"the autofocus did not lock again after the last field ({why}): "
+                    "it is off"
+                )
+                _LOG.warning("%s", line)
+                assumed.append(line)
         if engage_attempts:
             # Attempts and locks: an engage that gave up is one, and not the other.
             assumed.append(
@@ -397,6 +771,20 @@ class ScanPlugin:
             )
         if ctx.dry_run:
             assumed.append(f"dry run: {done} fields walked, no frame taken")
+        if focusing and bounds is not None:
+            assumed.extend(
+                focus.assumed(
+                    dry_run=ctx.dry_run,
+                    with_autofocus=focus_af is not None,
+                    planes=len(
+                        plan_planes(
+                            bounds.z_start_um,
+                            params.focus_range_um,
+                            params.focus_step_um,
+                        )
+                    ),
+                )
+            )
         return ScanResult(
             folder=f"scan/{token}",
             objective=plan.objective,
