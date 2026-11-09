@@ -57,6 +57,7 @@ __all__ = [
     "SuggestSection",
     "check_pairs",
     "list_profiles",
+    "profile_text",
     "search_paths",
 ]
 
@@ -1149,7 +1150,7 @@ def _may_be_profile(path: Path) -> bool:
     stays listed: loading it is how its owner learns what is wrong.
     """
     try:
-        data = tomllib.loads(_read_text(path))
+        data = tomllib.loads(profile_text(path))
     except (ProfileError, tomllib.TOMLDecodeError):
         return True
     return "microscope" in data
@@ -1182,13 +1183,16 @@ def _not_found_message(name: str) -> str:
     )
 
 
-def _read_text(path: Path) -> str:
+def profile_text(path: Path) -> str:
     """The profile's text, or a ``ProfileError`` that says what to do about the file.
 
     Read as bytes and decoded as ``utf-8-sig``: Notepad before Windows 10 1903
     starts a "UTF-8" file with a byte-order mark, which ``tomllib`` refuses
     with an error at a line that is fine, and it also offers cp1252 and
-    UTF-16, which no decoder here can tell from a typo (FM-80).
+    UTF-16, which no decoder here can tell from a typo (FM-80). Public because
+    ``smc objective offset --write`` rewrites a profile from this text (m3
+    §20.7): a profile with a mark is written back without it, which the
+    loader reads the same.
     """
     try:
         raw = path.read_bytes()
@@ -1230,7 +1234,7 @@ def _exists(source: Path, key: str, target: Path, *, directory: bool) -> bool:
 
 
 def _load_file(path: Path) -> Profile:
-    text = _read_text(path)
+    text = profile_text(path)
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
