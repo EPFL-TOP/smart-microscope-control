@@ -524,8 +524,31 @@ class ScanPlugin:
                 params.focus_range_um,
                 params.focus_step_um,
             )
+            if params.autofocus == "off" and af is not None and af.is_engaged():
+                # The sweep's Z moves go through the layer's interlock, which
+                # switches an engaged autofocus off and leaves it off: with
+                # autofocus=off nothing would say so, or lock it again. The
+                # one read of an autofocus that "off" otherwise never reads.
+                raise PluginRunError(
+                    _NAME,
+                    "cell_focus moves Z, which switches the autofocus off, and it "
+                    "is on: run with autofocus=if-engaged to use it, or switch it "
+                    "off first",
+                )
         # The autofocus the focus step switches off: the one the scan uses.
         focus_af = af if stand.used else None
+        unused_af_line: str | None = None
+        if focusing and params.autofocus != "off" and af is not None and not stand.used:
+            # A stop during the focus on the cells leaves the autofocus off,
+            # and a stop in the first well leaves no checkpoint for the resume
+            # refusal to read: the next run must not go on without it silently.
+            unused_af_line = (
+                "the autofocus was off when the scan started: the focus on the "
+                "cells swept around the Z read then, and no frame was taken with "
+                "it (a stop during the focus on the cells leaves it off: if it "
+                "was locked on this plate, lock it again and run scan again)"
+            )
+            _LOG.warning("%s", unused_af_line)
         done = 0
         # The fields of this attempt that ended without an error: a frame
         # written, or in a dry run a move walked.
@@ -771,6 +794,8 @@ class ScanPlugin:
             )
         if ctx.dry_run:
             assumed.append(f"dry run: {done} fields walked, no frame taken")
+        if unused_af_line is not None:
+            assumed.append(unused_af_line)
         if focusing and bounds is not None:
             assumed.extend(
                 focus.assumed(

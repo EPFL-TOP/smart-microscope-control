@@ -112,6 +112,8 @@ def test_unequal_spacing_is_refined_through_the_readbacks() -> None:
 def test_plan_planes_is_symmetric_and_bounded() -> None:
     planes = plan_planes(10.0, 5.0, 1.0)
     assert planes == tuple(float(z) for z in range(5, 16))
+    # One step on each side is the smallest sweep the parameters allow.
+    assert plan_planes(0.0, 1.0, 1.0) == (-1.0, 0.0, 1.0)
     # The half-range is cut down to whole steps, never stretched past it.
     assert plan_planes(0.0, 2.5, 1.0) == (-2.0, -1.0, 0.0, 1.0, 2.0)
     # A range that is a whole number of steps in decimal keeps its ends.

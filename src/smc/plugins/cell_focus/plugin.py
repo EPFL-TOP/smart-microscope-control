@@ -40,7 +40,7 @@ from smc.hardware.capabilities import (
     ZStage,
 )
 from smc.hardware.errors import HardwareError, MicroscopeHaltedError, MotionStoppedError
-from smc.plugins.api import PluginParams, RunContext
+from smc.plugins.api import PluginParams, RunContext, StopRequested
 from smc.plugins.cell_focus.algorithm import (
     DEFAULT_SCORE,
     LANDING_FRACTION,
@@ -79,6 +79,13 @@ __all__ = ["FocusOnCellsParams", "FocusOnCellsPlugin"]
 _NAME = "focus-on-cells"
 _LOG = logging.getLogger(f"smc.plugins.{_NAME}")
 _BEST = "best.tif"
+#: Logged whenever a run that switched the autofocus off ends early: nothing
+#: locks it again or moves Z back (FM-88), so the operator is told.
+_LEFT_OFF_WARNING = (
+    "focus-on-cells ended early: the autofocus was left off and Z was left where "
+    "it stopped; {n} frames are kept in {folder}/. Lock the autofocus on the "
+    "sample again before imaging"
+)
 #: The autofocus at the start, as ``CellFocusResult.autofocus`` names it.
 _AutofocusState = Literal["locked", "off", "none"]
 
@@ -255,6 +262,7 @@ class FocusOnCellsPlugin:
         switched_off = False
         step = "the switch-off of the autofocus"
         error: str | None = None
+        unwritten: str | None = None
         try:
             if used and af is not None:
                 switch_off_for_sweep(af)
@@ -291,14 +299,37 @@ class FocusOnCellsPlugin:
             else:
                 step = "the move back to the centre"
                 move_checked(z, centre, tolerance_um)
-        except (MicroscopeHaltedError, MotionStoppedError):
+        except (MicroscopeHaltedError, MotionStoppedError, StopRequested):
+            # A halt or a stop is not a failure (FM-64), and nothing is put
+            # back after it (FM-88): what was left is said, then it passes.
+            if switched_off:
+                _LOG.warning(
+                    "%s", _LEFT_OFF_WARNING.format(n=len(written), folder=folder)
+                )
             raise
+        except PluginRunError as exc:
+            # A frame that could not be written (`_write`): its reason names
+            # the frame and the fix, and the operator must also learn that the
+            # autofocus is off and Z off its plane.
+            if not switched_off:
+                raise
+            unwritten = exc.reason
         except _SWEEP_ERRORS as exc:
             error = _one_line(exc)
+        # Raised outside the handlers (FM-98).
+        if unwritten is not None:
+            _LOG.warning("%s", _LEFT_OFF_WARNING.format(n=len(written), folder=folder))
+            raise PluginRunError(
+                _NAME,
+                f"{unwritten}; the autofocus was left off; Z was left where it stopped",
+            )
         if error is not None:
-            # Raised outside the handler (FM-98).
             where = step or f"plane {plane_no} of {n}"
             left_off = "; the autofocus was left off" if switched_off else ""
+            if switched_off:
+                _LOG.warning(
+                    "%s", _LEFT_OFF_WARNING.format(n=len(written), folder=folder)
+                )
             raise PluginRunError(
                 _NAME,
                 f"the focus sweep ended at {where} ({error}); the {len(written)} "

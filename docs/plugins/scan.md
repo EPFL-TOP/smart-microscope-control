@@ -95,7 +95,11 @@ written, and the message says what to do:
    the profile sets `[safety] z_soft_limits_um` (`cell_focus moves Z: the profile must
    set [safety] z_soft_limits_um`), `focus_range_um` is not above the Z jog limit, and
    the sweep around the Z read now lies inside the soft limits (`the focus sweep around
-   <z> µm would reach <plane> µm, outside the soft limits [<lo>, <hi>] µm`).
+   <z> µm would reach <plane> µm, outside the soft limits [<lo>, <hi>] µm`). With
+   `autofocus=off`, an autofocus that is on is refused: the sweep's Z moves switch it
+   off and nothing would lock it again or say so (`cell_focus moves Z, which switches
+   the autofocus off, and it is on: run with autofocus=if-engaged to use it, or switch
+   it off first`). It is the one read `autofocus=off` makes of the autofocus.
 
 ## During the scan
 
@@ -196,7 +200,11 @@ WARNING names the field and says the autofocus is left off. A halt or a stop end
 scan as always, **with the autofocus off**: nothing restores it after a failure or a
 stop, and every refusal of the scan then ends with `; the focus on the cells left the
 autofocus off`. Lock it on the sample before `--resume`: the resume refuses otherwise
-(check 7 above).
+(check 7 above). A stop inside the first well leaves no checkpoint, so there is
+nothing for that refusal to read: a scan with the step whose autofocus is present but
+off when it starts says so, as a WARNING and in `assumed` (`the autofocus was off when
+the scan started: the focus on the cells swept around the Z read then, and no frame
+was taken with it (…)`).
 
 **Each frame's `pfs_offset` is the lock's, not the cells' plane.** The frame's `z_um` is
 the plane it was taken at (the cells'); its `pfs_offset` is the offset of the lock the

@@ -13,6 +13,7 @@ from __future__ import annotations
 import errno
 import logging
 import re
+import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ from smc.plugins import PluginRunError, load, run_plugin
 from smc.plugins.cell_focus.plugin import FocusOnCellsParams, FocusOnCellsPlugin
 from smc.plugins.slots import CellFocusResult
 from smc.run import RunDocument, StageRecord, StageStatus
+from smc.run.files import temporary_path
 
 pytestmark = pytest.mark.demo
 
@@ -54,6 +56,8 @@ class _Z:
         self.off_um: dict[int, float] = {}
         #: The soft limits this drive reports; ``None``: the stand's.
         self.limits: Limits | None = None
+        #: Called with the move's number after each move.
+        self.after_move: Callable[[int], None] | None = None
 
     def position_um(self) -> float:
         return self._inner.position_um()
@@ -67,6 +71,8 @@ class _Z:
         if n in self.fail:
             raise self.fail[n]
         readback = self._inner.move_to_um(z_um, keep_autofocus=keep_autofocus)
+        if self.after_move is not None:
+            self.after_move(n)
         return readback + self.off_um.get(n, 0.0)
 
     def move_by_um(
@@ -491,6 +497,104 @@ def test_a_frame_that_cannot_be_written_ends_the_run_and_says_why(
     assert len(_tiffs(run_doc)) == 2
 
 
+def test_a_frame_not_written_after_the_switch_off_says_the_autofocus_is_off(
+    open_stand: Callable[..., Microscope],
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # FM-88: the run ends with PFS off and Z off its plane; the operator who
+    # frees the disk and runs it again must know to lock PFS first.
+    stand = open_stand()
+    af = _Autofocus(engaged=True, locked=True)
+    stand.override(Autofocus, af)
+    calls = 0
+    real = focus_plugin.write_atomically
+
+    def full_disk(path: Path, data: bytes, *, make_parents: bool = True) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 3:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        real(path, data, make_parents=make_parents)
+
+    monkeypatch.setattr(focus_plugin, "write_atomically", full_disk)
+
+    with caplog.at_level(logging.WARNING, logger=f"smc.plugins.{NAME}"):
+        reason = _refused(stand, run_doc)
+
+    assert reason.endswith(
+        "then run focus-on-cells again; the autofocus was left off; Z was left "
+        "where it stopped"
+    )
+    assert af.engaged is False
+    assert "engage" not in af.calls
+    assert _left_off_warnings(caplog) == 1
+
+
+def _left_off_warnings(caplog: pytest.LogCaptureFixture) -> int:
+    return sum(
+        r.name == f"smc.plugins.{NAME}"
+        and r.levelno == logging.WARNING
+        and "the autofocus was left off and Z was left where it stopped"
+        in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_a_stop_during_the_sweep_ends_it_at_the_next_plane(
+    open_stand: Callable[..., Microscope],
+    run_doc: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    stand = open_stand()
+    af = _Autofocus(engaged=True, locked=True)
+    stand.override(Autofocus, af)
+    z = _Z(stand.require(ZStage), af)
+    stand.override(ZStage, z)
+    stop = threading.Event()
+    z.after_move = lambda n: stop.set() if n == 3 else None
+
+    with caplog.at_level(logging.WARNING, logger=f"smc.plugins.{NAME}"):
+        record = run_plugin(
+            FocusOnCellsPlugin(), stand, FocusOnCellsParams(), run_doc, stop=stop
+        )
+
+    # A stop is an outcome, not a failure (FM-64), honoured before the 4th move.
+    assert record.status is StageStatus.stopped
+    assert len(z.moves) == 3
+    assert len(_tiffs(run_doc)) == 3
+    # Nothing is put back after a stop (FM-88), and that is said.
+    assert "engage" not in af.calls
+    assert af.engaged is False
+    assert _left_off_warnings(caplog) == 1
+
+
+def test_a_sweep_without_a_peak_moves_back_to_the_centre(
+    open_stand: Callable[..., Microscope], run_doc: Path
+) -> None:
+    # From 20 µm, ±5 µm never reaches the sharp plane at 0: the best is the
+    # sweep's lowest plane, an edge, and the centre is kept (D4).
+    stand = open_stand()
+    start = stand.require(ZStage).move_to_um(20.0)
+
+    result = _result(_run(stand, run_doc))
+
+    assert result.sweep.outcome == "at-edge"
+    assert result.sweep.best_z_um is None
+    assert result.best_file is None
+    assert len(result.files) == 11
+    assert not (run_doc.parent / result.folder / "best.tif").exists()
+    # Back at the centre, not left at the sweep's last plane (25 µm).
+    assert result.z_um == pytest.approx(start, abs=0.25)
+
+
+def _longest_write_chars(run_doc: Path) -> int:
+    """The longest path the tool writes, as Windows counts it: ``best.tif``'s temporary file."""
+    best = run_doc.parent / "cell-focus" / ("0" * 12) / "best.tif"
+    return len(str(temporary_path(best)))
+
+
 def test_a_frame_path_too_long_for_windows_is_refused_before_any_move(
     open_stand: Callable[..., Microscope],
     run_doc: Path,
@@ -499,14 +603,32 @@ def test_a_frame_path_too_long_for_windows_is_refused_before_any_move(
     stand = open_stand()
     z = _Z(stand.require(ZStage))
     stand.override(ZStage, z)
+    n = _longest_write_chars(run_doc)
     monkeypatch.setattr(focus_plugin, "ON_WINDOWS", True)
-    monkeypatch.setattr(focus_plugin, "MAX_PATH", len(str(run_doc.parent)) + 20)
+    monkeypatch.setattr(focus_plugin, "MAX_PATH", n)
 
     reason = _refused(stand, run_doc)
 
-    assert reason.startswith("a frame's path would reach ")
+    assert reason == (
+        f"a frame's path would reach {n} characters while it is written, and "
+        f"Windows takes {n - 1} at most unless long paths are enabled (not "
+        "assumed): move the run document to a shorter folder, then run "
+        "focus-on-cells again"
+    )
     assert z.moves == []
     assert not (run_doc.parent / "cell-focus").exists()
+
+
+def test_a_frame_path_one_character_under_the_limit_is_written(
+    open_stand: Callable[..., Microscope],
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stand = open_stand()
+    monkeypatch.setattr(focus_plugin, "ON_WINDOWS", True)
+    monkeypatch.setattr(focus_plugin, "MAX_PATH", _longest_write_chars(run_doc) + 1)
+
+    assert len(_result(_run(stand, run_doc)).files) == 11
 
 
 def test_a_dry_run_moves_nothing_and_writes_nothing(
@@ -535,3 +657,24 @@ def test_params_refuse_a_step_above_the_range_and_too_many_planes() -> None:
     with pytest.raises(ValueError, match=r"range_um=50 with step_um=0\.1 makes 1001"):
         FocusOnCellsParams(range_um=50.0, step_um=0.1)
     FocusOnCellsParams(range_um=5.0, step_um=0.1)  # 101 planes, the bound
+
+
+@pytest.mark.parametrize(
+    ("given", "accepted"),
+    [
+        ({"range_um": 50.0}, True),
+        ({"range_um": 50.1}, False),
+        ({"step_um": 0.1, "range_um": 5.0}, True),
+        ({"step_um": 0.09}, False),
+        ({"step_um": 10.0, "range_um": 10.0}, True),
+        ({"step_um": 10.1, "range_um": 20.0}, False),
+    ],
+)
+def test_params_hold_the_bounds_from_both_sides(
+    given: dict[str, float], accepted: bool
+) -> None:
+    if accepted:
+        FocusOnCellsParams(**given)
+    else:
+        with pytest.raises(ValueError, match=r"should be (less|greater) than or equal"):
+            FocusOnCellsParams(**given)

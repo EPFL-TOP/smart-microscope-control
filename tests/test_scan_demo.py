@@ -2461,3 +2461,156 @@ def test_scan_params_refuse_a_focus_step_above_its_range() -> None:
         ScanParams(focus_range_um=1.0, focus_step_um=2.0)
     with pytest.raises(ValueError, match=r"makes 1001 planes, more than 101"):
         ScanParams(focus_range_um=50.0, focus_step_um=0.1)
+
+
+@pytest.mark.parametrize(
+    ("given", "accepted"),
+    [
+        ({"focus_range_um": 50.0}, True),
+        ({"focus_range_um": 50.1}, False),
+        ({"focus_step_um": 0.1, "focus_range_um": 5.0}, True),
+        ({"focus_step_um": 0.09}, False),
+        ({"focus_step_um": 10.0, "focus_range_um": 10.0}, True),
+        ({"focus_step_um": 10.1, "focus_range_um": 20.0}, False),
+    ],
+)
+def test_scan_params_hold_the_focus_bounds_from_both_sides(
+    given: dict[str, float], accepted: bool
+) -> None:
+    if accepted:
+        ScanParams(**given)  # type: ignore[arg-type]
+    else:
+        with pytest.raises(ValueError, match=r"should be (less|greater) than or equal"):
+            ScanParams(**given)  # type: ignore[arg-type]
+
+
+def test_the_relock_after_focus_failing_in_a_row_says_the_focus_left_it_off(
+    rig: _Rig,
+) -> None:
+    af = _locked_on_the_plate(rig)
+    af.engage_results = [False, False, False]
+
+    with pytest.raises(PluginRunError) as raised:
+        _scan(rig, cell_focus="per-field", max_unlocked_in_row=3, **FOCUS)
+
+    assert raised.value.reason.startswith("the autofocus did not lock on 3 fields")
+    assert raised.value.reason.endswith(
+        "then run scan --resume; the focus on the cells left the autofocus off"
+    )
+    assert af.engaged is False
+
+
+@pytest.mark.parametrize("who", ["the scan", "the operator"])
+def test_a_lock_after_the_focus_clears_its_flag(rig: _Rig, who: str) -> None:
+    # Field 1 is swept and left off; field 2 is locked again (by the scan's
+    # re-engage, or by the operator before the scan reads it) at 8 µm, where
+    # a sweep of ±10 µm passes the limit of 14: nothing more switches PFS off,
+    # so the scan's refusal must not say the focus left it off. The scan ends
+    # at that field, so no later locked read can clear the flag in its place.
+    z = _LimitedZ(rig.microscope.require(ZStage), Limits(-1000.0, 14.0))
+    rig.microscope.override(ZStage, z)
+    af = _locked_on_the_plate(rig)
+
+    def at_move(n: int) -> None:
+        if n == 2:
+            af.plane_um = 8.0
+            if who == "the operator":
+                af.engage()
+
+    rig.stage.after_move = at_move
+
+    with pytest.raises(PluginRunError) as raised:
+        _scan(rig, cell_focus="per-field", max_failed_in_row=1, **FOCUS)
+
+    assert raised.value.reason.startswith("1 fields failed in a row, the last A1_0001")
+    assert not raised.value.reason.endswith("left the autofocus off")
+    assert af.engaged
+    assert af.locked
+
+
+@pytest.mark.parametrize(
+    ("last", "why"),
+    [
+        (False, "no lock came"),
+        (
+            DeviceTimeoutError("PFS did not answer"),
+            "DeviceTimeoutError: PFS did not answer",
+        ),
+    ],
+)
+def test_a_relock_after_the_last_field_that_fails_is_said_not_a_failure(
+    rig: _Rig,
+    caplog: pytest.LogCaptureFixture,
+    last: bool | BaseException,
+    why: str,
+) -> None:
+    af = _locked_on_the_plate(rig)
+    af.engage_results = [True] * 11 + [last]
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        result = _result(_scan(rig, cell_focus="per-field", **FOCUS))
+
+    line = f"the autofocus did not lock again after the last field ({why}): it is off"
+    assert len(result.frames) == 12
+    assert line in result.assumed
+    assert [r.getMessage() for r in caplog.records if r.name == LOGGER] == [line]
+    assert af.calls.count("engage") == 12
+
+
+def test_a_stop_during_a_sweep_is_honoured_at_the_next_plane(rig: _Rig) -> None:
+    af = _locked_on_the_plate(rig)
+    stop = threading.Event()
+
+    def watch() -> bool:
+        if rig.camera.snaps == 4:
+            stop.set()
+        return af.engaged
+
+    rig.camera.watch = watch
+
+    record = _scan(rig, cell_focus="per-field", stop=stop, **FOCUS)
+
+    assert record.status is StageStatus.stopped
+    # The fourth plane of the first sweep was the last: no fifth move, no frame.
+    assert rig.camera.snaps == 4
+    assert rig.stage.moves == 1
+    # Nothing locks it again after a stop (FM-88).
+    assert af.engaged is False
+    assert "engage" not in af.calls
+
+
+def test_cell_focus_with_autofocus_off_refuses_an_autofocus_that_is_on(
+    rig: _Rig,
+) -> None:
+    af = _Autofocus(engaged=True, locked=True)
+    rig.microscope.override(Autofocus, af)
+
+    reason = _refused(rig, autofocus="off", cell_focus="per-field", **FOCUS)
+
+    assert reason == (
+        "cell_focus moves Z, which switches the autofocus off, and it is on: run "
+        "with autofocus=if-engaged to use it, or switch it off first"
+    )
+    assert not MUTATING & set(af.calls)
+
+
+def test_cell_focus_with_an_autofocus_left_off_says_so(
+    rig: _Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A stop in the first well leaves no checkpoint and the autofocus off: the
+    # resume cannot be refused, so the run says it went on without it.
+    af = _Autofocus(engaged=False, locked=False)
+    rig.microscope.override(Autofocus, af)
+
+    with caplog.at_level(logging.WARNING, logger=LOGGER):
+        result = _result(_scan(rig, cell_focus="per-field", **FOCUS))
+
+    line = (
+        "the autofocus was off when the scan started: the focus on the cells swept "
+        "around the Z read then, and no frame was taken with it (a stop during the "
+        "focus on the cells leaves it off: if it was locked on this plate, lock it "
+        "again and run scan again)"
+    )
+    assert line in result.assumed
+    assert [r.getMessage() for r in caplog.records if r.name == LOGGER] == [line]
+    assert not MUTATING & set(af.calls)

@@ -98,8 +98,11 @@ Each TIFF is the frame in the camera's own dtype, with `{"z_um", "z_command_um",
   moves to put anything back: Z stays where it stopped and PFS stays off. Lock PFS
   again yourself before you image.
 - **A frame that cannot be written** (a full disk, a share that dropped, a file a viewer
-  holds open) ends the run with the OS's reason; the frames before it are kept.
-- **A halt or a stop** is not a failure: the run ends where it is.
+  holds open) ends the run with the OS's reason; the frames before it are kept, and,
+  when PFS had been switched off, the text ends `; the autofocus was left off; Z was
+  left where it stopped`.
+- **A halt or a stop** is not a failure: the run ends where it is. When PFS had been
+  switched off, a WARNING says it was left off and Z where it stopped.
 
 There is no checkpoint: a run is one sweep, and `--resume` starts it again.
 
@@ -113,8 +116,12 @@ Each folder is one stack: the TIFFs whose metadata has `z_um` (`best.tif` is lef
 It prints one row per plane (Z, the four scores) and, per score, the outcome and the
 refined Z of the same peak finder the tool uses. `--csv` writes every row with its
 folder; `--plot` writes one PNG per stack (each score divided by its maximum, against Z)
-when `matplotlib` is installed, and says so when it is not. A folder with fewer than 3
-frames is reported and skipped. Exit 0 when one stack was scored, else 1.
+when `matplotlib` is installed, and says so when it is not. The script expands a pattern
+such as `local/cell-focus/*` itself, since cmd.exe and PowerShell do not. A folder with
+fewer than 3 frames is reported and skipped; a TIFF without `z_um` is left out and
+counted; a frame Windows refuses to read for a moment is read again, and one that stays
+unreadable skips its stack (a curve with a hole in it would mislead). Exit 0 when one
+stack was scored and every output asked for was written, else 1.
 
 What to read from it at the stand: which score peaks within 1 µm of the focus you set by
 eye, whether the curves show two maxima, and what range and step the sweep needs.
