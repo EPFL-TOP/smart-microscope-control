@@ -2918,6 +2918,244 @@ chain); `test_merge_keeps_cells_of_different_wells_apart`;
 without torch or the weights (never in CI). **Failure modes**: FM-73,
 FM-78, FM-50 (no full path), FM-113, FM-24, FM-38.
 
+### 9.4 The model on a stand's frames (#342)
+
+The model's detections are checked on real frames before a scan's counts
+are used: a reference set annotated by the owner, a script that prints
+precision and recall per class for the model and for `blobs`, and three
+pre-processing parameters of `cells` set from that measurement. This
+section fixes the parameters, the measurement's code and the script's
+files; the numbers come from session 3's frames, after the code.
+
+**What was measured (2026-11-09, planning #342)**, with torch 2.13.0 and
+torchvision 0.28.0 (`../nikon-control/.venv`, Apple M5 Pro, CPU):
+
+- The checkpoint holds `classes` `['__background__', 'single', 'doublet',
+  'debris']`, `epoch` 6, `val_mAP@0.5` 0.867, `init_from`, and
+  `trainable_layers` 1, and **no pixel size, frame size or camera**.
+  `nikon-control` trains and infers with the same pre-processing
+  (`detector.normalize_plane`, percentiles 0.5 and 99.5, the plane repeated
+  to three channels, full frames, no crop, no `min_size` or `max_size`, so
+  torchvision's 800 and 1333; dihedral flips as the only augmentation). Its
+  only ND2 (`doublet003_xy05.nd2`, untracked) is a **Prime 95B** frame of
+  1412², 16 bits, 0.27555 µm per pixel, under a 40× λD NA 0.95. Whether the
+  training frames came from that camera is recorded nowhere: §16.1's
+  "1024²" came from an illustrative shape in `nikon-control`'s docs.
+- `fasterrcnn_resnet50_fpn(..., min_size=n, max_size=m)` loads the
+  checkpoint with `strict=True` (the resize has no weights), resizes a
+  1412² frame to `n`, and `transform.postprocess` returns the boxes in the
+  frame's own pixels: a box at `(w/2, h/4, w, h/2)` of the resized image came
+  back as `(706, 353, 1412, 706)` at 600, 800, 1100 and 1412.
+- Warm time per 1412² frame, after one cold call: 0.23 s at 600 px,
+  0.43 s at 800 (the default), 0.58 s at 1100, 0.96 s at 1412. At 1100 and
+  1412 a synthetic frame hit the limit of 100 boxes above a score of 0.05.
+- `normalize_plane` of a 12-bit frame and of the same frame times 16 differ
+  by at most 6e-8, and an offset of 100 counts changes nothing: **the bit
+  depth is not a parameter**. The same frame cut to 8 bits differs by 0.0027
+  (quantisation); no smc frame is 8 bits.
+- `nikon-control`'s review page (`nikon-control-dashboard`, page `/review`)
+  is its only annotation tool that opens TIFFs; the others read ND2 only.
+  It opens a folder of `images/<file_name>` and `annotations/val.json` (or
+  `train.json`), COCO: `categories` `{id, name}`, `images` `{id,
+  file_name, height, width}` and a per-image `reviewed` flag it sets,
+  `annotations` `{id, image_id, category_id, bbox [x, y, w, h], area}` with
+  `auto` (a proposal not yet confirmed) and `score`. Boxes are continuous
+  edges in `[0, W]` (`train_detector.py`), the convention the model's output
+  is in. Its `agreement.match_boxes` matches one-to-one, greedily by IoU
+  ≥ 0.5; it has no per-class precision or recall.
+
+**Pre-processing** — `smc/plugins/cells/detector.py`:
+
+```python
+@dataclass(frozen=True, slots=True)
+class Preprocessing:
+    percentiles: tuple[float, float] = (0.5, 99.5)
+    input_size_px: tuple[int, int] | None = None
+```
+
+```python
+MIN_INPUT_PX = 256
+MAX_INPUT_PX = 4096
+
+
+def model_input_size_px(
+    image_shape_px: tuple[int, int],
+    frame_um_per_px: float,
+    model_um_per_px: float,
+) -> tuple[int, int]: ...
+```
+
+- `percentiles` go to `normalize_plane`; `input_size_px` is torchvision's
+  `(min_size, max_size)`, passed to `fasterrcnn_resnet50_fpn` when it is
+  not `None` (the model's own 800 and 1333 otherwise).
+  `TorchDetector(weights, *, device, score_threshold, preprocessing=Preprocessing())`
+  and `load_detector(model_path, *, device, score_threshold,
+  preprocessing=Preprocessing())` take it; the default is today's behaviour.
+- `model_input_size_px`: `scale = frame_um_per_px / model_um_per_px`;
+  `(round(min(h, w) × scale), ceil(max(h, w) × scale))`, so that the shorter
+  side sets the scale and the longer one does not bind. A first value under
+  `MIN_INPUT_PX` or a second over `MAX_INPUT_PX` is a `ValueError` naming
+  both pixel sizes and the size it would give; a pixel size that is not
+  finite and positive is a `ValueError`. A 1412² frame at 0.2756 µm shown to
+  the model at 0.49 µm is `(794, 795)`.
+- No crop and no tiling: the resize sets the pixel size the model sees, and a
+  crop does not change it. Tiling (a frame larger than the model's input,
+  cut and its boxes merged) is a follow-up if the measurement asks for it.
+
+**Parameters** — `CellsParams` gains, after `merge_radius_um`:
+
+```python
+class CellsParams(PluginParams):
+    model_um_per_px: float | None = Field(None, gt=0.0, le=10.0)
+    low_percentile: float = Field(0.5, ge=0.0, lt=50.0)
+    high_percentile: float = Field(99.5, gt=50.0, le=100.0)
+    checked_um_per_px: float | None = Field(None, gt=0.0, le=10.0)
+```
+
+- `model_um_per_px`: the pixel size the model sees, in µm; `None` keeps the
+  model's own resize. The plugin computes
+  `model_input_size_px(scan.image_shape_px, scan.pixel_size_um,
+  params.model_um_per_px)` **before** `load_detector` (a refused size does
+  not wait for 166 MB), and its `ValueError` is a `PluginRunError` that
+  names `model_um_per_px`.
+- `low_percentile`, `high_percentile`: the intensity scaling, as trained.
+- `checked_um_per_px`: the frames' pixel size at which this model and
+  these parameters were measured (#342's script). It changes nothing in the
+  detection; it is what `assumed` compares the scan with.
+- With `detector=blobs`, the validator also refuses `model_um_per_px` or
+  `checked_um_per_px` that is not `None`, and percentiles other than 0.5 and
+  99.5 (`<name> is for detector=model: the blob detector ...`), as it
+  refuses `model_path`.
+- `assumed`, with `detector=model`, starts with one line when the scan was
+  not measured: `checked_um_per_px` `None` gives `the model's detections
+  were not measured on frames of this stand: checked_um_per_px is not set
+  (docs/plugins/cells.md)`; a scan whose `pixel_size_um` is more than 5 %
+  from it (`abs(p / c − 1) > 0.05`) gives `the frames are at {p:.4g} µm per
+  pixel and the model was checked at {c:.4g} µm per pixel: its counts at this
+  pixel size are not measured`. Within 5 %, no line. The merge radius line
+  follows, as before.
+- `CellsResult` does not change: the parameters are in the stage's
+  `params`, and `model`, `model_sha256` already name the detector.
+- Resume: the runner refuses a resume with other parameters, so a change of
+  pre-processing is never mixed into one result.
+
+**The measurement** — `smc/plugins/cells/evaluate.py`, numpy only:
+
+```python
+NO_BOX = "none"
+DEFAULT_MATCH_IOU = 0.5
+
+
+@dataclass(frozen=True, slots=True)
+class LabelledBox:
+    box_px: tuple[float, float, float, float]
+    label: str
+```
+
+```python
+@dataclass(frozen=True, slots=True)
+class ClassScore:
+    reference: int
+    detected: int
+    matched: int
+    precision: float | None
+    recall: float | None
+
+
+def match_boxes(
+    reference: Sequence[tuple[float, float, float, float]],
+    detected: Sequence[tuple[float, float, float, float]],
+    *,
+    min_iou: float = DEFAULT_MATCH_IOU,
+) -> list[tuple[int, int]]: ...
+def confusion(
+    reference: Sequence[LabelledBox],
+    detected: Sequence[LabelledBox],
+    *,
+    min_iou: float = DEFAULT_MATCH_IOU,
+) -> Counter[tuple[str, str]]: ...
+def class_scores(
+    counts: Counter[tuple[str, str]], classes: Sequence[str]
+) -> tuple[dict[str, ClassScore], ClassScore]: ...
+```
+
+- Boxes are `(row0, col0, row1, col1)`, as `Detection`; IoU is
+  `overlap.bbox_iou`.
+- `match_boxes` is `nikon-control`'s rule: every pair with IoU ≥ `min_iou`,
+  taken by decreasing IoU, then reference index, then detection index; a
+  pair is kept when neither box is taken. One-to-one, labels ignored: a
+  single found as a doublet is a match with the wrong label, not a miss and
+  a false box. `min_iou` outside `(0, 1]` is a `ValueError`.
+- `confusion` counts `(reference label, detected label)` over the matches,
+  `(label, NO_BOX)` for a reference box not matched and `(NO_BOX, label)`
+  for a detection not matched. Counters of frames add up.
+- `class_scores`: per class `c` of `classes`, `reference` the pairs
+  `(c, ·)`, `detected` the pairs `(·, c)`, `matched` `(c, c)`; `precision =
+  matched / detected` and `recall = matched / reference`, **`None`** when the
+  denominator is 0 (a class the detector never gives, as `debris` for
+  `blobs`, has no precision: not 0, not nan). The second value is the same
+  for any box, labels ignored: `matched` counts every pair with neither side
+  `NO_BOX`.
+
+**The script** — `scripts/dev/cells_check.py`, argparse, two commands. It
+is run with an interpreter that has smc and torch (the stand's PC with the
+`detect` extra; on a Mac, `../nikon-control/.venv/bin/python` with
+`PYTHONPATH=src`), prints ASCII only, reads and writes text as UTF-8.
+
+```text
+cells_check.py export RUN_JSON OUT_DIR [--wells A1,B2] [--count 20]
+    [--prefill model|blobs|none] [--prefill-score 0.3]
+    [--model-path P] [--device auto|cpu|cuda|mps] [--model-um-per-px X]
+cells_check.py measure DATASET_DIR [--detector model|blobs ...]
+    [--model-um-per-px native,0.49,...] [--percentiles 0.5:99.5,...]
+    [--score-threshold 0.5] [--max-overlap 0.7] [--match-iou 0.5]
+    [--model-path P] [--device ...] [--json OUT]
+```
+
+- `export` reads the run document's `scan` result (`RunDocument.load`,
+  `provider("scan")`, `ScanResult`), the run folder being the document's
+  folder, takes the frames of `--wells` (all by default) in the scan's
+  order, and keeps `--count` of them evenly spaced
+  (`round(linspace(0, n − 1, count))`, all when fewer). It refuses an
+  `OUT_DIR` that exists and is not empty: the owner's annotations are never
+  overwritten. It writes:
+  - `images/<basename of frame.file>`: the frame's file, copied unchanged
+    (a duplicate basename is refused);
+  - `annotations/val.json`: COCO as above, categories `single` 1, `doublet`
+    2, `debris` 3, each image `reviewed: false`, and the prefill's
+    detections (after `suppress_in_frame` at 0.7, at or above
+    `--prefill-score`) as annotations with `auto: true` and their `score`.
+    `x = col0`, `y = row0`, `w = col1 − col0`, `h = row1 − row0`;
+  - `manifest.json`: the run document's file name (never its path, FM-50),
+    the scan's `objective`, `pixel_size_um`, `image_shape_px`,
+    `exposure_ms`, the prefill (detector, model file name and SHA-256, score,
+    `model_um_per_px`), per image its `frame.file`, `well`, `x_um`, `y_um`,
+    and the time of the export.
+  `--prefill model` is the default: the owner deletes and corrects, which
+  is faster than drawing every cell, and the reference leans towards the
+  model's boxes, which `docs/plugins/cells.md` says.
+- `measure` reads `annotations/val.json` and `train.json` (those that
+  exist), keeps the images whose `reviewed` is true (none is an error: "mark
+  the frames you checked as reviewed in /review and save"), and takes
+  every annotation of those images as the reference, `auto` or not (a
+  reviewed frame is the owner's verdict). The frames' pixel size is
+  `manifest.json`'s. One configuration per `blobs` and per element of the
+  product `model_um_per_px × percentiles` (`native` is `None`). Each runs
+  the detector as `cells` does (`detect`, then `suppress_in_frame` at
+  `--max-overlap`), sums the confusions, and prints per configuration the
+  frames, the first frame's time and the mean of the others (cold and warm
+  apart), a table per class (`reference`, `detected`, `matched`,
+  `precision`, `recall`, `-` for `None`, three decimals), the line for any
+  box, and the confusion's non-zero counts. `--json` writes the same
+  numbers.
+
+**Tests**: `tests/unit/test_cells_evaluate.py` (pure); the script in
+`tests/test_dev_cells_check.py` with `blobs` on `PlateSample` frames (no
+torch); the parameters in `tests/test_cells_demo.py` with the stub
+detector; `input_size_px` reaching the model in
+`tests/unit/test_cells_detector.py` (skipped without torch, run from the
+torch venv).
+
 ## 10. Density (#193)
 
 `smc/plugins/density/algorithm.py` and `plugin.py`, entry point
@@ -4275,10 +4513,11 @@ For session 2 the critical path is #199 → #22, #19, #21, #213, #23 →
   rotation; the stage's repeatability (§4's return check measures it).
 - Whether the PFS holds its lock across a 96-well well at 40× in
   brightfield, and how often `engage()` is needed per field.
-- The model's behaviour on Prime 95B frames: it was trained on other
-  frames (1024², of a pixel size not recorded in the checkpoint) and
-  resizes everything to 800 px, so a 1412² frame is seen at about
-  0.49 µm per pixel. Detections are checked by eye on the first real scan.
+- The model's behaviour on Prime 95B frames: the frames it was trained on
+  are not recorded (size, pixel size and camera, §9.4; the "1024²" first
+  written here came from an illustrative shape), and it resizes everything
+  to 800 px, so a 1412² frame is seen at about 0.49 µm per pixel. Measured
+  on the first real scan with §9.4's script (#342).
 - Inference time on the microscope PC's CPU (0.34 s per frame on an M5
   Pro); a well of 305 frames would take about 2 minutes at that speed.
 - `merge_radius_um = 5.0` and the overlap of 10 % against real cells.
