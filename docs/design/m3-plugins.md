@@ -3,7 +3,8 @@
 - **Status**: design for issue #18 (§1, 2026-10-26); the plate-scan
   workflow, §2 to §16, for issue #192 (2026-10-27); the plate from images of
   the walls, §17, for issue #328 (2026-11-05); objectives' offsets, §18,
-  for issue #340 (2026-11-05).
+  for issue #340 (2026-11-05); the sides of a wall, §19, for issue #327
+  (2026-11-09).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 and M2, this document is the contract between issues
   that are built in parallel. Names, module paths and signatures below are
@@ -1019,7 +1020,7 @@ class WellRef(SlotValue):
 ```python
 class WallTouch(SlotValue):
     well: str
-    side: Literal["left", "right", "top", "bottom"]
+    side: WallSide  # "+X", "+Y", "-X", "-Y": a stage direction, §19 (was left, ...)
     x_um: float
     y_um: float
 ```
@@ -1663,8 +1664,8 @@ The references are **parameters**, not state. The guided loop of
    replaces `plate`; the run document's `params` keep every reference that
    made it, which is the audit trail `nikon-control`'s `plate.json` lacked.
 
-Wall touches go the same way: `goto-well --param side=left`, then a
-`WallTouch` per wall in `walls`. The plate page (§15) collects the
+Wall touches go the same way: `goto-well --param side=-X`, then a
+`WallTouch` per wall in `walls` (the sides are stage directions, §19). The plate page (§15) collects the
 references by clicks and calls the same plugins with the same parameters.
 Nothing survives between two runs that the document does not show.
 
@@ -1730,7 +1731,7 @@ centre goes into `assumed`.
 ```python
 class GotoWellParams(PluginParams):
     well: str
-    side: Literal["centre", "left", "right", "top", "bottom"] = "centre"
+    side: Literal["centre", "+X", "-X", "+Y", "-Y"] = "centre"  # §19
 ```
 
 ```python
@@ -1799,12 +1800,13 @@ is not committed, useq-schema 0.9.2 and pydantic 2.13.5 on Python 3.13;
 - **The residual spreads.** One reference of three that is 600 µm off
   gives a residual of 298 µm; 700 µm gives 348 µm (A1, A12 and H1 of a
   96-well plate, H1 moved in X). The worst reference is the one named.
-- **Wall touches are read per axis**, as `plate.py`: `left` and `right`
-  give X from their `x_um`, `top` and `bottom` give Y from their `y_um`,
+- **Wall touches are read per axis**, as `plate.py`: `-X` and `+X`
+  (`left` and `right` before #327, §19) give X from their `x_um`, `-Y` and
+  `+Y` (`bottom` and `top`) give Y from their `y_um`,
   and the other coordinate of a touch is not used, since the plate's
-  rotation is not known yet when walls are touched. `top` is +Y (towards
-  row A: rows grow towards −Y). An opposite pair gives the midpoint and a
-  signed size (`right − left`, `top − bottom`, so swapped sides are
+  rotation is not known yet when walls are touched. `+Y` is towards
+  row A: rows grow towards −Y. An opposite pair gives the midpoint and a
+  signed size (`+X − (−X)`, `+Y − (−Y)`, so swapped sides are
   refused by the size check); one wall gives the wall plus or minus the
   nominal half-size of that axis (`well_size[0]` for X, `[1]` for Y), and
   its axis is assumed. Touching along a stage axis from the wall point of
@@ -1812,7 +1814,7 @@ is not committed, useq-schema 0.9.2 and pydantic 2.13.5 on Python 3.13;
   49 µm at 10° for a 96-well well (computed); a pair cancels it for a round
   well. A side given twice and a touch of another well are `ValueError`s.
 - **`wall_position`** is the well's centre plus `R(θ) · (∓w/2, 0)` for
-  left and right and `R(θ) · (0, ±h/2)` for top and bottom, `w` and `h`
+  `-X` and `+X` and `R(θ) · (0, ∓h/2)` for `-Y` and `+Y`, `w` and `h`
   the well's size; any other side is a `ValueError` (`plate.py` raised a
   bare `KeyError`).
 - **`refs` of the result** hold the given references, then one per well
@@ -4057,7 +4059,8 @@ class PlatePage:
   the refusal is the `outcome`. **`capture_centre(well)`** and `capture_wall(well, side)`
   normalise the well (`normalise_well`), refuse one that is not on `plate`
   (`ValueError`: `<well> is not a well of the <plate> plate`), and **replace**
-  the earlier capture of the same well (and side): the operator centres it
+  the earlier capture of the same well (and side; `side` is an image side
+  and the touch's a stage side, m5 §12): the operator centres it
   again, and `plate-registration` refuses a well given twice. `forget(well)`
   drops the captures of one well, `forget()` all of them.
 - **`select_text`** and `toggle` take the wells of `plate`; a text or a well
@@ -4968,3 +4971,211 @@ exactly the shift (measured: 0.0 µm of difference on A1, D7 and H12 of a
 
 - m2 §13.8. A plate registered at 4× and scanned at 40× at the stand is the
   first real test of the whole.
+
+## 19. The sides of a wall, in the frame they are named in (#327)
+
+A wall is named by a direction, and a direction means something in one frame
+only. Three frames meet at a plate: the **image** the operator looks at (`left`,
+`right`, `top`, `bottom`), the **stage** (`+X`, `-X`, `+Y`, `-Y`: the X and Y of
+`smc stage get`, M1 §2) and the **plate**, the stage's turned by the plate's small
+rotation. Until #327 one set of words, `left right top bottom`, was typed in the
+image frame by the operator (on the page, and in the docs' steps) and read in the
+stage frame by the layer (`centre_from_walls`, `wall_position`, `goto-well`).
+FM-189 is that failure. This section fixes which words each part uses; the page's
+side of it is m5 §12.
+
+### 19.1 What was measured (2026-11-09, planning #327)
+
+On throwaway prototypes that are not committed; main at `13687da`, Python 3.13,
+useq-schema 0.9.2.
+
+- **The incident, reproduced.** `centre_from_walls("24-well", "B3", …)` with the
+  two touches of Ti2-E session 2 as the operator named them on the image, `left` at
+  (17967.9, −10237.1) and `bottom` at (10368.3, −2334.1), gives (25767.9, 5465.9),
+  both axes assumed: the issue's seed, 15.5 mm from B3's centre of §17.1,
+  (10182.0, −10087.9).
+- **A pair named on the image is refused, not misread.** The four touches of
+  §17.1's table, named as the files are (`left` at X 18067.4, `right` at X 2468.0),
+  are refused with `B3's left and right walls are -15599 µm apart, a 24-well well is
+  15600 µm (-200.0%): a touch of another well, or off the wall`. The signed size
+  catches a swapped pair, and names a wrong cause for it.
+- **The camera's turn decides which side is which.** From the matrix of §3.1 for
+  each camera, the stage side of each image side, and what a stage step does to the
+  image (the content moves by `−M⁻¹ · d`, in pixels, `+col` right and `+row` down):
+
+  | camera | `left` | `right` | `top` | `bottom` | +X step: the image moves | +Y step: the image moves |
+  |---|---|---|---|---|---|---|
+  | 0° | −X | +X | +Y | −Y | left | down |
+  | 0°, mirrored | +X | −X | +Y | −Y | right | down |
+  | 90° | −Y | +Y | −X | +X | up | left |
+  | 90°, mirrored | +Y | −Y | −X | +X | up | right |
+  | 180° (the Ti2-E at 10×) | +X | −X | −Y | +Y | right | up |
+  | 180°, mirrored | −X | +X | −Y | +Y | left | up |
+  | −90° | +Y | −Y | +X | −X | down | right |
+  | −90°, mirrored | −Y | +Y | +X | −X | down | left |
+
+  The words `left right top bottom` that the layer read until now are the first row
+  only: right on an upright camera, reversed on both axes at 180°. The 180° row is
+  Ti2-E session 2 as the frames and Drive showed it (§17.1: the image's right is −X
+  and its bottom +Y; `→` moved the image right and `↑` up); `camera-calibration` was
+  not run there. A real `camera-calibration` on the synthetic stand (384 × 512, the
+  camera at 0°, 90°, 180°, 180° mirrored, 3° and 30° mirrored) measured the rotation
+  within 0.02° and the mirror right, and gave the sides of the rows above; at 30° no
+  side is on a stage axis (30.0° off).
+
+### 19.2 One frame for each word
+
+- **The layer takes stage directions only.** `WallTouch.side` is `WallSide`
+  (`"+X"`, `"+Y"`, `"-X"`, `"-Y"`, §17.2's), and `GotoWellParams.side` is
+  `Literal["centre", "+X", "-X", "+Y", "-Y"]`. A side is the wall reached from the
+  well's centre by going that way **along the plate's own axes** (the stage's,
+  turned by the plate's rotation): `-X` is what `left` was, `+X` `right`, `-Y`
+  `bottom` and `+Y` `top`. `wall_position(result, well, side)` takes the same
+  four; `centre_from_walls` reads them per axis as §5.2 says, with the names
+  changed, and `plate-walls` already used them.
+- **The old words are refused, never read in the other frame.** One helper in
+  `slots/plate.py`, `refuse_image_side(value)`, used as a `field_validator(...,
+  mode="before")` on `WallTouch.side` and on `GotoWellParams.side`: a value in
+  `IMAGE_SIDES` raises `ValueError` with the text below; any other value goes on
+  to the `Literal`'s own check.
+
+  ```text
+  side 'left' is a side on the image: a wall is named by a stage direction, -X, +X, -Y or +Y (the plate page names walls on the image and maps them with the camera calibration)
+  ```
+
+  A run document written before holds the old words in `params.walls`; they are
+  not translated (a translation is a guess of the frame, the defect itself): `smc
+  run` of such parameters is refused with the text above, and the page reads no
+  capture its model refuses (`_captured`, logged, unchanged). The only such
+  documents are Ti2-E session 2's (smc 0.0.1).
+- **Why not keep the words and add image ones.** The same word in two frames is
+  the defect; a renamed word is refused where it is used in the old sense, and
+  cannot be read in the other frame by anyone.
+- **`ImageSide`, `IMAGE_SIDES`** live in `slots/plate.py` beside `WallSide`
+  (`Literal["left", "right", "top", "bottom"]` and the tuple of its four values),
+  exported by `smc.plugins.slots`.
+- **A swapped pair says so.** `_check_size`'s signed size is kept. When the size
+  is negative and its magnitude is within `DIAMETER_TOLERANCE` of the nominal, the
+  refusal is, with `lo`, `hi` the pair's sides (`-X`, `+X` or `-Y`, `+Y`) and
+  `gap` the magnitude in µm:
+
+  ```text
+  B3's -X and +X walls are swapped: the +X wall is 15599 µm on the -X side of the -X wall, a 24-well well's width; touch them again, each named by its direction from the well's centre
+  ```
+
+  (`height` for the Y pair.) Any other size off by more than the tolerance keeps
+  today's text with the sides named in the new words (`B3's -X and +X walls are
+  9200 µm apart, a 24-well well is 15600 µm (-41.0%): a touch of another well, or
+  off the wall; touch them again`). Messages of the other refusals: `no X wall for
+  B3: give -X and/or +X`, `no Y wall for B3: give -Y and/or +Y`, `B3: the -X wall
+  is given twice`.
+
+### 19.3 Image sides — `smc/plugins/frames.py` (new)
+
+Pure arithmetic on the camera matrix of §3.1: it imports `Matrix2` from
+`geometry` and the side types from `slots/plate.py`, and nothing from
+`smc.hardware`. It is the only place that turns an image word into a stage word.
+
+```python
+ImageDirection = Literal["left", "right", "up", "down"]
+QUARTER_TURN_TOLERANCE_DEG = 5.0
+
+
+def stage_side_of_image_side(side: ImageSide, matrix: Matrix2) -> WallSide: ...
+def image_direction_of_stage_step(
+    step: WallSide, matrix: Matrix2
+) -> ImageDirection: ...
+```
+
+- **An image side** is a direction from the well's centre on the image: `right` is
+  the matrix's first column `(m00, m10)` (a pixel to the right of the frame's
+  centre is `M @ (1, 0)` µm from it), `bottom` its second `(m01, m11)`, and `left`
+  and `top` their opposites. The stage side is the axis on which that vector has
+  the larger component, with the component's sign.
+- **A stage step** moves the image content by `−M⁻¹ @ d` pixels for a stage step
+  `d` (`+X` is `(1, 0)`, `-Y` is `(0, -1)`); the words are `right` for `+col`,
+  `left`, `down` for `+row` and `up`, again on the axis of the larger component.
+- **The quarter turn.** Both functions refuse a vector more than
+  `QUARTER_TURN_TOLERANCE_DEG` off a stage axis, `off = degrees(atan2(minor,
+  major))` with `major`, `minor` the larger and smaller component's magnitudes,
+  written `not off <= tolerance` so that a `nan` is refused (FM-104). 5° is chosen,
+  not measured: a wall touched `t` µm off the well's mid-line errs by `t · sin(5°)`
+  on the axis read, 87 µm for 1 mm, about what a hand-touched wall is worth at 10×
+  (§5.2 gives the plate's analogue), and a mounted camera is within a degree or two
+  of a quarter turn. A camera further turned is for centring wells (`refs`) or for
+  `plate-walls`, which takes the matrix itself.
+- **The refusals** are `ValueError`s with these texts: a matrix that cannot be
+  inverted or is not finite, `the camera matrix cannot be inverted (determinant
+  <d>); run camera-calibration`; a vector off a quarter turn, `the camera is turned
+  <off:.1f>° away from the stage's axes, a quarter turn at most 5° off: an arrow
+  moves the image diagonally and an image side is not a stage side`.
+- **Which matrix.** Rotation and mirror belong to the optical path (the camera's
+  port, the mirrors), not to the objective, so the page uses the latest *usable*
+  `camera-calibration` whatever its objective (m5 §12.1). A calibration is of the
+  path it was measured in: after a change of camera port or light path,
+  `camera-calibration` is run again (said in the plugin's docs).
+
+### 19.4 Who maps
+
+The plugins never see an image side. `plate-registration`, `goto-well` and
+`plate-walls` take stage directions, so each stays a pure function of its
+parameters and the `plate` slot: a plugin that read a camera calibration would
+make a registration depend on a slot that its parameters do not show (M3 §1).
+The plate page, whose operator reads the image, names walls on the image and maps
+them with `frames.py` before it builds a parameter (m5 §12). On the command line
+the operator names stage directions, and the docs say which frame each word is in
+and how to read the stage's from the camera calibration (the table of §19.1).
+
+### 19.5 Tests (FM-189's check)
+
+- `tests/unit/test_frames.py` (new): the eight rows of §19.1, **written out in
+  the test** and not computed with the code (FM-124), for each of the four image
+  sides and both steps; `((-1.1, 0.0), (0.0, 1.1))` is the Ti2-E's matrix of §17.1;
+  a camera 4.0° off a quarter turn is accepted and one 6.0° off refused (the
+  bound is 5.0°, so neither value sits on it) with the text above; a `nan` and a
+  singular matrix are refused.
+- `tests/unit/test_plate_registration.py` and `tests/test_plate_registration_demo.py`:
+  the incident's two touches, named in stage directions as the image-frame table
+  gives them (`left` → `+X` at (17967.9, −10237.1), `bottom` → `+Y` at (10368.3,
+  −2334.1)), give B3's centre at (10167.9, −10134.1), 14 and 46 µm from the
+  measured centre, not (25767.9, 5465.9); the four touches of §17.1 give
+  (10267.7, −10038.05) with a width of 15599.4 µm and a height of 15400.9 µm; the
+  old words are refused with §19.2's text, on `WallTouch` and on `GotoWellParams`;
+  a swapped pair gets the swapped text and an off-size pair the other.
+- `tests/test_goto_well_demo.py`: `side=+X` and `side=-Y` go to the points that
+  `left` and `bottom` went to; the demo's wall points are unchanged by the rename.
+- The page's tests (m5 §12.3) hold the end-to-end check: a stand whose matrix is
+  the Ti2-E's, walls captured under image names, the centre found where the walls
+  are.
+
+### 19.6 Not here
+
+- **The fitted centre as a cross on Live** before the registration is kept (the
+  issue's third question): it needs an overlay on the live frame (m5 §5), a design
+  of its own. This issue's guards are the mapping, the swapped-pair refusal and the
+  page's note of the mapping; the owner decides whether the cross follows.
+- **A profile key for the camera's orientation.** It would be a second source for
+  what `camera-calibration` measures; the page asks for the calibration instead.
+- **A mode of the page that needs no calibration** (an opposite pair oriented from
+  the two positions alone): a second mechanism for a case that one
+  `camera-calibration` removes.
+
+### 19.7 Not verified (for the owner)
+
+- **Which way the plate's grid runs on the Ti2-E's stage** (#327's question, #334).
+  The check, at 10× with B3 registered from its walls (a seed, rotation 0 assumed):
+  `smc run goto-well --param well=C4`. `useq` puts C4 at (+19 000, −19 000) µm from
+  B3 (24-well pitch, measured 2026-11-09), so from B3's centre of §17.1 at about
+  (29 182, −29 088). A well under the objective within a couple of mm means the
+  columns run towards +X and the rows towards −Y, as `useq`'s: nothing to do. Else
+  centre C4 and read `smc stage get`, and write both positions in the report. Two
+  wells whose columns run towards −X fit a rotation of 180° and `calibrate`
+  refuses it as beyond `max_rotation_deg` (measured: `the fit turns the plate by
+  180.0°, beyond ±10°: a reference well is misidentified …`), the safe answer; what
+  the layer does for a plate that lies turned on the stage is a design after the
+  measurement, not a guess now.
+- **`camera-calibration` at 10× on the Ti2-E**: `rotation_deg` near ±180° and
+  `mirrored` false are the 180° row of §19.1. Any other result is the finding.
+- **Which way NIS-Elements' own XY control moves the image** (press `→` and `↑`,
+  then the joystick the same ways, and note each): the page's note under the pad
+  says what the arrows do here, and the owner compares.
