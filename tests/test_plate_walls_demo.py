@@ -1450,7 +1450,7 @@ def test_a_circle_that_does_not_hold_is_refused_by_its_rms_and_named(
     _on_fake(fake_microscope)
     run_doc = tmp_path / "run.json"
     _seed(run_doc, fake_microscope)
-    monkeypatch.setattr("smc.plugins.plate_walls.plugin.MAX_RMS_FRACTION", 0.02 / 3200)
+    monkeypatch.setattr("smc.plugins.plate_walls.loop.MAX_RMS_FRACTION", 0.02 / 3200)
 
     refused = _refused(fake_microscope, run_doc, _refs("A1", "H12"))
 

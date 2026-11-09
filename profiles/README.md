@@ -168,14 +168,29 @@ by it (m3 §18).
   unmeasured offset: `goto-well` and `scan-plan` use the registration's own
   positions, say so in `assumed` and log a WARNING. An unknown offset is never
   taken as zero.
-- **Measuring them** is session 3's job: a point (not a wall) seen with every
-  objective, centred under each, XY and Z read, the 10x again to bound its own
-  repeatability, twice, at two places. The procedure is m2 §13.6, and nothing is
-  entered in `nikon-ti2.toml` before it has run.
+- **Measuring them** is a session's job, and nothing is entered in `nikon-ti2.toml`
+  before it has run. The XY offsets are measured **from the plate** by the
+  `objective-offsets` tool ([its page](../docs/plugins/objective-offsets.md), m3 §20):
+  the plate registered with `plate-walls`, the turret turned to each other objective
+  with your confirmation, the registered wells found again under it. `smc objective
+  offset --from-run-doc run.json --session "session 3 (#NNN)"` shows what that would
+  write, and `--write` writes it. The **hand procedure** (m2 §13.6) is a point (not a
+  wall) seen with every objective, centred under each, XY and Z read, the 10x again to
+  bound its own repeatability, twice, at two places. It is the only way to measure Z,
+  which the tool does not, and the cross-check of the tool's XY once, at the stand.
+- **What `--write` writes.** One block in the profile's file, between two marker lines
+  (`# >>> [objectives], written by smc objective offset --write` and `# <<< …`), appended
+  when there is none and replaced in place when there is one. No line outside it is
+  touched, CRLF line ends are kept, and an `[objectives]` table outside the block, or a
+  damaged block, is refused: delete the hand-written table first. An entry the run
+  measured is replaced, not merged, and a `z_offset_um` it held is dropped and said so.
+  Edit the values in the block only if no write follows.
 
 `smc objective offset` prints one line per turret label with its offset and
 when it was measured, `unknown` for what was not, and a line for every label of
-the profile that no turret position carries.
+the profile that no turret position carries. With `--from-run-doc` it opens no
+stand and prints what the run measured would put into the profile; `--write`
+writes it.
 
 ## Shipped profiles
 
@@ -212,6 +227,7 @@ origin; `profiles/demo-sample.toml` writes each one out.
 | `doublet_fraction` | `0.3` | The share of cells that are two spots side by side, in [0, 1]. |
 | `cell_radius_um` | `5.0` | The radius of a cell's spot, in [1e-6, 50] µm. |
 | `seed` | `0` | The same seed gives the same cells, texture and noise. |
+| `objective_shift_um` | `{}` | Turret label → `[x, y]` µm, each within ±1000: under that objective a feature is centred at its stage position plus this, the offsets of `[objectives]` (m2 §13.2) from an objective whose shift is zero. A label with no entry has none. Empty: the camera reads no turret. It lets `objective-offsets` recover a declared shift on the demo (m3 §20.8). |
 
 A `[sample]` is refused with a `micromanager.config` other than `""` (synthetic frames
 over a real stage would look like a working stand), with a plate that is not a `useq`
