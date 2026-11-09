@@ -163,16 +163,19 @@ def test_the_plate_and_the_plate_s_pitch_are_the_ones_asked_for(
 # ----------------------------------------------------------------- the walls
 
 
-def test_walls_become_a_reference_and_their_assumed_axis_is_said(
+def test_walls_in_stage_directions_become_a_reference(
     demo_microscope: Microscope, tmp_path: Path
 ) -> None:
-    """B2 from a left and right pair and one bottom wall; the touches' other coordinate is not read."""
+    """B2 from a -X and +X pair and one -Y wall; the touches' other coordinate is not read.
+
+    The axis with one wall is assumed and the result says so.
+    """
     a1 = (1000.0, -500.0)
     b2 = (a1[0] + PITCH_UM, a1[1] - PITCH_UM)
     walls = [
-        _wall("B2", "left", b2[0] - HALF_UM, 777.0),
-        _wall("b2", "right", b2[0] + HALF_UM, -777.0),
-        _wall("B2", "bottom", 555.0, b2[1] - HALF_UM),
+        _wall("B2", "-X", b2[0] - HALF_UM, 777.0),
+        _wall("b2", "+X", b2[0] + HALF_UM, -777.0),
+        _wall("B2", "-Y", 555.0, b2[1] - HALF_UM),
     ]
     result = _result(
         _run(
@@ -197,10 +200,10 @@ def test_references_come_first_then_each_wall_well_in_the_order_of_its_first_tou
     h1 = (0.0, -7 * PITCH_UM)
     a12 = (11 * PITCH_UM, 0.0)
     walls = [
-        _wall("H1", "left", h1[0] - HALF_UM, 0.0),
-        _wall("A12", "left", a12[0] - HALF_UM, 0.0),
-        _wall("H1", "bottom", 0.0, h1[1] - HALF_UM),
-        _wall("A12", "bottom", 0.0, a12[1] - HALF_UM),
+        _wall("H1", "-X", h1[0] - HALF_UM, 0.0),
+        _wall("A12", "-X", a12[0] - HALF_UM, 0.0),
+        _wall("H1", "-Y", 0.0, h1[1] - HALF_UM),
+        _wall("A12", "-Y", 0.0, a12[1] - HALF_UM),
     ]
     result = _result(
         _run(
@@ -225,10 +228,10 @@ def test_walls_alone_make_a_seed_that_says_what_it_assumed(
     demo_microscope: Microscope, tmp_path: Path
 ) -> None:
     walls = [
-        _wall("A1", "left", 1000.0 - HALF_UM, 0.0),
-        _wall("A1", "right", 1000.0 + HALF_UM, 0.0),
-        _wall("A1", "top", 0.0, 2000.0 + HALF_UM),
-        _wall("A1", "bottom", 0.0, 2000.0 - HALF_UM),
+        _wall("A1", "-X", 1000.0 - HALF_UM, 0.0),
+        _wall("A1", "+X", 1000.0 + HALF_UM, 0.0),
+        _wall("A1", "+Y", 0.0, 2000.0 + HALF_UM),
+        _wall("A1", "-Y", 0.0, 2000.0 - HALF_UM),
     ]
     result = _result(_run(demo_microscope, tmp_path, walls=walls))
     assert result.method == "seed"
@@ -243,8 +246,8 @@ def test_the_seed_s_line_comes_before_the_walls_lines(
 ) -> None:
     """One wall per axis: the result says the rotation was assumed, then what each wall assumed."""
     walls = [
-        _wall("A1", "right", 1000.0 + HALF_UM, 0.0),
-        _wall("A1", "top", 0.0, 2000.0 + HALF_UM),
+        _wall("A1", "+X", 1000.0 + HALF_UM, 0.0),
+        _wall("A1", "+Y", 0.0, 2000.0 + HALF_UM),
     ]
     result = _result(_run(demo_microscope, tmp_path, walls=walls))
     assert result.a1_center_xy_um == pytest.approx((1000.0, 2000.0))
@@ -280,8 +283,8 @@ def test_the_assumed_half_sizes_are_each_axis_s_on_an_anisotropic_plate(
             plate="test-anisotropic-15",
             refs=[{"well": "A1", "x_um": 0.0, "y_um": 0.0}],
             walls=[
-                _wall("B3", "left", b3[0] - 5000.0, 0.0),
-                _wall("B3", "bottom", 0.0, b3[1] - 2500.0),
+                _wall("B3", "-X", b3[0] - 5000.0, 0.0),
+                _wall("B3", "-Y", 0.0, b3[1] - 2500.0),
             ],
         )
     )
@@ -334,7 +337,7 @@ def test_a_well_given_both_as_a_reference_and_by_walls_is_refused(
         demo_microscope,
         tmp_path,
         refs=[{"well": "A01", "x_um": 0.0, "y_um": 0.0}],
-        walls=[_wall("a1", "left", 0.0, 0.0), _wall("A1", "bottom", 0.0, 0.0)],
+        walls=[_wall("a1", "-X", 0.0, 0.0), _wall("A1", "-Y", 0.0, 0.0)],
     )
     assert (
         str(error)
@@ -407,10 +410,10 @@ def test_the_first_well_given_both_ways_is_the_one_named(
             {"well": "A1", "x_um": 0.0, "y_um": 0.0},
         ],
         walls=[
-            _wall("A1", "left", 0.0, 0.0),
-            _wall("A1", "bottom", 0.0, 0.0),
-            _wall("H12", "left", 0.0, 0.0),
-            _wall("H12", "bottom", 0.0, 0.0),
+            _wall("A1", "-X", 0.0, 0.0),
+            _wall("A1", "-Y", 0.0, 0.0),
+            _wall("H12", "-X", 0.0, 0.0),
+            _wall("H12", "-Y", 0.0, 0.0),
         ],
     )
     assert str(error) == (
@@ -575,11 +578,9 @@ def test_a_wall_without_its_other_axis_is_refused(
     error = _refused(
         demo_microscope,
         tmp_path,
-        walls=[_wall("A1", "left", 0.0, 0.0), _wall("A1", "right", 6400.0, 0.0)],
+        walls=[_wall("A1", "-X", 0.0, 0.0), _wall("A1", "+X", 6400.0, 0.0)],
     )
-    assert str(error) == (
-        "plate-registration: no Y wall for A1: give top and/or bottom"
-    )
+    assert str(error) == ("plate-registration: no Y wall for A1: give -Y and/or +Y")
 
 
 def test_a_wrong_plate_type_fails_and_fills_no_slot(
@@ -643,16 +644,34 @@ def test_references_and_walls_parse_from_text() -> None:
         [
             "plate=384-well",
             'refs=[{"well": "a1", "x_um": 1, "y_um": 2}]',
-            'walls=[{"well": "B2", "side": "left", "x_um": 3, "y_um": 4}]',
+            'walls=[{"well": "B2", "side": "-X", "x_um": 3, "y_um": 4}]',
             "max_rotation_deg=5",
         ],
     )
     assert params.plate == "384-well"
     assert [(r.well, r.x_um, r.y_um) for r in params.refs] == [("a1", 1.0, 2.0)]
     assert [(w.well, w.side, w.x_um, w.y_um) for w in params.walls] == [
-        ("B2", "left", 3.0, 4.0)
+        ("B2", "-X", 3.0, 4.0)
     ]
     assert params.max_rotation_deg == 5.0
+
+
+@pytest.mark.parametrize("word", ["left", "right", "top", "bottom"])
+def test_the_old_side_words_are_refused_by_the_cli_parameters(word: str) -> None:
+    # `smc run plate-registration --param walls=[...]` of an earlier session names
+    # the sides on the image: refused with the reason, never read in the stage's
+    # frame (FM-189), and never translated.
+    with pytest.raises(ParamsError) as info:
+        parse_params(
+            PlateRegistrationParams,
+            [f'walls=[{{"well": "B2", "side": "{word}", "x_um": 3, "y_um": 4}}]'],
+        )
+    (problem,) = info.value.problems
+    assert problem.startswith("walls.0.side: ")
+    assert f"side {word!r} is a side on the image: a wall is named by a stage" in (
+        problem
+    )
+    assert "maps them with the camera calibration" in problem
 
 
 def test_a_reference_without_its_y_is_reported_by_its_path() -> None:

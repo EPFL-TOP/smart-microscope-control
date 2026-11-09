@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import threading
 from collections.abc import Iterator
 from datetime import datetime, timezone
@@ -39,7 +40,14 @@ from smc.hardware.errors import (
     SafetyRefusedError,
 )
 from smc.hardware.profile import Profile
-from smc.plugins import PluginRunError, UpstreamError, load, parse_params, run_plugin
+from smc.plugins import (
+    ParamsError,
+    PluginRunError,
+    UpstreamError,
+    load,
+    parse_params,
+    run_plugin,
+)
 from smc.plugins.goto_well import GotoWellParams, GotoWellPlugin, GotoWellResult
 from smc.plugins.slots import PlateResult
 from smc.run import RunDocument, StageRecord, StageStatus, write_stage
@@ -147,10 +155,10 @@ def _where(microscope: Microscope) -> tuple[float, float]:
 @pytest.mark.parametrize(
     ("well", "side", "offset"),
     [
-        ("B3", "top", (0.0, HALF_UM)),
-        ("C5", "right", (HALF_UM, 0.0)),
-        ("B2", "bottom", (0.0, -HALF_UM)),
-        ("B2", "left", (-HALF_UM, 0.0)),
+        ("B3", "+Y", (0.0, HALF_UM)),
+        ("C5", "+X", (HALF_UM, 0.0)),
+        ("B2", "-Y", (0.0, -HALF_UM)),
+        ("B2", "-X", (-HALF_UM, 0.0)),
     ],
 )
 def test_goto_well_drives_to_the_wall_point_on_a_rotated_plate(
@@ -317,7 +325,7 @@ def test_goto_well_sends_one_move_and_reads_no_position_before_it(
 
     monkeypatch.setattr(stage, "move_to_um", move)
     monkeypatch.setattr(stage, "position_um", position)
-    result = _result(_run(demo_microscope, tmp_path, well="B2", side="left"))
+    result = _result(_run(demo_microscope, tmp_path, well="B2", side="-X"))
     assert calls == [("move_to_um", result.target_x_um, result.target_y_um)]
 
 
@@ -354,7 +362,7 @@ def test_a_dry_run_says_the_position_is_the_target(
     _seed(tmp_path, dry_run=False)
     before = _where(demo_microscope_dry)
     expected = _at("C5", HALF_UM, 0.0)
-    record = _run(demo_microscope_dry, tmp_path, well="C5", side="right")
+    record = _run(demo_microscope_dry, tmp_path, well="C5", side="+X")
     assert record.dry_run is True
     result = _result(record)
     assert result.assumed[-1] == DRY_LINE
@@ -461,10 +469,10 @@ def test_goto_well_at_40x_on_a_plate_registered_at_10x_lands_shifted(
 @pytest.mark.parametrize(
     ("well", "side", "offset"),
     [
-        ("B3", "top", (0.0, HALF_UM)),
-        ("C5", "right", (HALF_UM, 0.0)),
-        ("B2", "bottom", (0.0, -HALF_UM)),
-        ("B2", "left", (-HALF_UM, 0.0)),
+        ("B3", "+Y", (0.0, HALF_UM)),
+        ("C5", "+X", (HALF_UM, 0.0)),
+        ("B2", "-Y", (0.0, -HALF_UM)),
+        ("B2", "-X", (-HALF_UM, 0.0)),
     ],
 )
 def test_goto_well_drives_to_the_shifted_wall_point_at_40x_on_a_plate_registered_at_10x(
@@ -644,11 +652,30 @@ def test_a_goto_well_result_written_before_the_objective_loads_as_unknown() -> N
 
 
 def test_the_parameters_parse_from_text() -> None:
-    params = parse_params(GotoWellParams, ["well=H12", "side=left"])
-    assert (params.well, params.side) == ("H12", "left")
+    params = parse_params(GotoWellParams, ["well=H12", "side=+X"])
+    assert (params.well, params.side) == ("H12", "+X")
+    assert parse_params(GotoWellParams, ["well=A1", "side=-Y"]).side == "-Y"
     assert parse_params(GotoWellParams, ["well=A1"]).side == "centre"
 
 
-def test_a_side_that_is_not_one_of_the_five_is_refused() -> None:
-    with pytest.raises(ValueError, match="side"):
+@pytest.mark.parametrize("word", ["left", "right", "top", "bottom"])
+def test_goto_well_refuses_a_side_on_the_image_with_the_reason(word: str) -> None:
+    # The same word in two frames was FM-189: `left` is refused and says why, on the
+    # model and through the command line's parameters, and nothing is moved.
+    reason = (
+        f"side {word!r} is a side on the image: a wall is named by a stage "
+        "direction, -X, +X, -Y or +Y"
+    )
+    with pytest.raises(ValueError, match=re.escape(reason)):
+        GotoWellParams(well="A1", side=word)  # type: ignore[arg-type]
+    with pytest.raises(ParamsError, match=re.escape(reason)):
+        parse_params(GotoWellParams, ["well=A1", f"side={word}"])
+
+
+def test_goto_well_refuses_a_word_that_is_no_side() -> None:
+    # Not an image word: the Literal's own error stands, and does not claim that
+    # `middle` is a side on the image.
+    with pytest.raises(ValueError, match="side") as raised:
         GotoWellParams(well="A1", side="middle")  # type: ignore[arg-type]
+    assert "Input should be 'centre', '+X', '-X', '+Y' or '-Y'" in str(raised.value)
+    assert "side on the image" not in str(raised.value)

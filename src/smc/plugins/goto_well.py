@@ -28,16 +28,16 @@ the first stage that moves the stand on a position computed from a measurement:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from smc.hardware.capabilities import ObjectiveTurret, XYStage
 from smc.plugins.api import PluginParams, PluginResult, RunContext
 from smc.plugins.errors import PluginRunError
 from smc.plugins.objectives import log_frame, objective_for, plate_for_objective
 from smc.plugins.plate_registration.algorithm import wall_position
-from smc.plugins.slots import PlateResult, well_geometry
+from smc.plugins.slots import PlateResult, refuse_image_side, well_geometry
 
 if TYPE_CHECKING:
     from smc.hardware.microscope import Microscope
@@ -48,21 +48,35 @@ _NAME = "goto-well"
 
 
 class GotoWellParams(PluginParams):
-    """The well to go to, and where in it: its centre or the point on one of its walls."""
+    """The well to go to, and where in it: its centre or the point on one of its walls.
+
+    A wall is named by a stage direction, never by what an image shows (m3 §19).
+    """
 
     well: str = Field(description="The well to go to, as useq names it (A1, H12).")
-    side: Literal["centre", "left", "right", "top", "bottom"] = Field(
+    side: Literal["centre", "+X", "-X", "+Y", "-Y"] = Field(
         "centre",
         description=(
-            "Where in the well: its centre, or the point on a wall (left and right "
-            "along the plate's X, top is +Y towards row A) from which to touch it."
+            "Where in the well: its centre, or the point on a wall from which to "
+            "touch it, named by the stage direction that reaches it from the centre "
+            "(-X and +X along the plate's X, -Y and +Y along its Y; +Y is towards "
+            "row A). A side as seen on an image (left, right, top, bottom) is "
+            "refused: the plate page maps those with the camera calibration."
         ),
     )
+
+    @field_validator("side", mode="before")
+    @classmethod
+    def _side_is_not_an_image_side(cls, value: Any) -> Any:
+        return refuse_image_side(value)
 
 
 class GotoWellResult(PluginResult):
     """Where the stage was sent and where it arrived, in µm.
 
+    ``side`` echoes the parameter: ``centre`` or a stage direction (``-X``, ``+X``,
+    ``-Y``, ``+Y``). It stays a ``str`` so that a run document written when the
+    words were ``left`` and ``right`` still loads; nothing writes those now.
     ``objective`` is the one in use, ``plate_objective`` the one the plate was
     registered with, and ``shift_um`` what the target was moved by between the
     two: ``(0.0, 0.0)`` for the same objective, ``None`` when no offset could be
