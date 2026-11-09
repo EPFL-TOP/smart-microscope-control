@@ -105,6 +105,7 @@ from smc.ui.guide import (
     command_line,
     next_slot,
     replace_note,
+    walls_card_lines,
     walls_centres_problem,
 )
 
@@ -547,6 +548,22 @@ def _file_path(value: str, run_dir: PurePath | None) -> str:
     return str(run_dir / value)
 
 
+def _plate_from_images(result: Mapping[str, Any]) -> PlateResult | None:
+    """``result`` as a ``PlateResult`` that holds ``walls``, or ``None``: anything else is the generic card.
+
+    A document is data (FM-125): a result that does not validate, or a plate
+    registered by another method, is no case for the card of this one, and the
+    validation is tried only when the result carries a ``walls`` object.
+    """
+    if not isinstance(result.get("walls"), dict):
+        return None
+    try:
+        found = PlateResult.model_validate(result)
+    except ValidationError:
+        return None
+    return found if found.walls is not None else None
+
+
 def _card(
     record: StageRecord, *, stale: bool = False, run_dir: PurePath | None = None
 ) -> ResultCard:
@@ -560,6 +577,11 @@ def _card(
     A ``_FILE_KEYS`` key with a text in it is a file, not a value: it is a
     ``files`` entry, and does not count against the card's lines. A number, a
     list or a blank text under such a key is no path and stays a line (FM-125).
+
+    A result that is a plate registered from images (``PlateResult`` with
+    ``walls``) shows the wells measured and the plate instead of its first keys,
+    which cut the walls away (m5 §12.6); its frames' folder is a file. A result that
+    does not validate as one is the generic card, never an exception (FM-125).
     """
     when = record.finished_utc or record.started_utc
     try:
@@ -572,18 +594,30 @@ def _card(
     files: list[str] = []
     assumed: tuple[str, ...] = ()
     if record.status is StageStatus.done and record.result is not None:
-        for key, value in record.result.items():
-            if key == "assumed":
-                continue
-            if key in _FILE_KEYS and isinstance(value, str) and value.strip():
+        from_images = _plate_from_images(record.result)
+        if from_images is not None:
+            lines = [_cut(_flat(line)) for line in walls_card_lines(from_images)]
+            folder = None if from_images.walls is None else from_images.walls.folder
+            if folder is not None and folder.strip():
                 files.append(
                     _cut(
-                        _flat(f"{key}: {_file_path(value, run_dir)}"),
+                        _flat(f"folder: {_file_path(folder, run_dir)}"),
                         _CARD_TEXT_CHARS,
                     )
                 )
-            else:
-                lines.append(_value_line(key, value))
+        else:
+            for key, value in record.result.items():
+                if key == "assumed":
+                    continue
+                if key in _FILE_KEYS and isinstance(value, str) and value.strip():
+                    files.append(
+                        _cut(
+                            _flat(f"{key}: {_file_path(value, run_dir)}"),
+                            _CARD_TEXT_CHARS,
+                        )
+                    )
+                else:
+                    lines.append(_value_line(key, value))
         if len(lines) > _CARD_LINES:
             lines = [*lines[:_CARD_LINES], f"… {len(lines) - _CARD_LINES} more"]
         found = record.result.get("assumed")
@@ -2684,10 +2718,15 @@ class PlatePage:
         record = doc.provider("plate")
         if result is None or record is None:
             return {}
-        note = replace_note(result, record.started_utc, keeps_captures=True)
         plugins = self._registry().plugins
+        # The second sentence of the note says the captures stay: true of the tools
+        # that run from them (their pairs hold `refs`), false of plate-finding (m5 §12.7).
         return {
-            tool.name: note
+            tool.name: replace_note(
+                result,
+                record.started_utc,
+                keeps_captures="refs" in PAGE_PARAMS.get(tool.name, ()),
+            )
             for tool in self.tools()
             if plugins[tool.name].plugin.provides == "plate"
         }

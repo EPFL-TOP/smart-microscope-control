@@ -65,7 +65,10 @@ from smc.plugins.slots import (
     DensityWell,
     PlateResult,
     RouteResult,
+    WallFrame,
+    WallImages,
     WallTouch,
+    WellFit,
     WellRef,
 )
 from smc.run import (
@@ -103,6 +106,7 @@ REAL = {
     "cells": "smc.plugins.cells.plugin:CellsPlugin",
     "density": "smc.plugins.density.plugin:DensityPlugin",
     "goto-well": "smc.plugins.goto_well:GotoWellPlugin",
+    "plate-finding": "smc.plugins.plate_finding.plugin:PlateFindingPlugin",
     "plate-registration": "smc.plugins.plate_registration.plugin:PlateRegistrationPlugin",
     "plate-walls": "smc.plugins.plate_walls.plugin:PlateWallsPlugin",
     "route": "smc.plugins.route.plugin:RoutePlugin",
@@ -2077,6 +2081,150 @@ def test_the_plates_refusal_comes_before_a_dry_runs_for_plate_walls(
         dry.close()
 
 
+def _walls_fit(well: str, centre: tuple[float, float], frames: int) -> WellFit:
+    return WellFit(
+        well=well,
+        recorded_xy_um=(centre[0] + 4.0, centre[1] - 4.0),
+        center_xy_um=centre,
+        diameter_um=15298.4,
+        size_error=0.0,
+        rms_um=3.0,
+        n_points=40,
+        walls=tuple(
+            WallFrame(side=side, x_um=0.0, y_um=0.0, n_points=10, frames=frames)
+            for side in ("+X", "+Y", "-X", "-Y")
+        ),
+    )
+
+
+def _walls_result(folder: str | None = "plate-walls/tok") -> PlateResult:
+    """What ``plate-walls`` writes for two wells: four frames on each side of the first, two of the second."""
+    return PlateResult(
+        plate="24-well",
+        a1_center_xy_um=(0.0, 0.0),
+        rotation_deg=0.1234,
+        method="wall-images",
+        residual_um=3.24,
+        scale_error=0.0,
+        n_refs=2,
+        assumed=(
+            "two wells: the residual checks their distance only; a third well "
+            "checks the fit",
+        ),
+        walls=WallImages(
+            objective="10x",
+            pixel_size_um=1.0,
+            image_shape_px=(100, 100),
+            search_um=3900.0,
+            wells=(
+                _walls_fit("B3", (10182.04, -10087.93), 4),
+                _walls_fit("D5", (1.0, 2.0), 2),
+            ),
+            frames=48,
+            folder=folder,
+            elapsed_s=16.5,
+        ),
+    )
+
+
+def test_a_plate_walls_card_shows_the_wells_the_plate_and_the_frames_folder(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed(
+        run_doc,
+        "plate-walls",
+        "plate",
+        _walls_result(),
+        params={"plate": "24-well"},
+    )
+    page = _stood_page(fake_microscope, run_doc, "plate-walls")
+    try:
+        card = page.view().cards["plate-walls"]
+        # §12.6: one line per well (the frames of its four sides summed), then the
+        # plate; not the result's first eight keys with the walls cut away.
+        assert card.lines == (
+            "B3: centre (10182.0, -10087.9) µm, 15298 µm across, 16 frames",
+            "D5: centre (1.0, 2.0) µm, 15298 µm across, 8 frames",
+            "plate 24-well: residual 3.2 µm, rotation 0.12°",
+        )
+        # The folder is the frames the operator may open: under the run folder, built
+        # the way the page builds every path (FM-24).
+        assert card.files == (f"folder: {run_doc.parent / 'plate-walls' / 'tok'}",)
+        assert card.assumed == (
+            "two wells: the residual checks their distance only; a third well "
+            "checks the fit",
+        )
+    finally:
+        page.close()
+
+
+@pytest.mark.parametrize("folder", [None, "", "   "], ids=["none", "empty", "blank"])
+def test_a_walls_card_with_no_folder_names_no_file(
+    fake_microscope: Microscope, run_doc: Path, folder: str | None
+) -> None:
+    _seed(run_doc, "plate-walls", "plate", _walls_result(folder))
+    page = _stood_page(fake_microscope, run_doc, "plate-walls")
+    try:
+        card = page.view().cards["plate-walls"]
+        assert card.files == ()
+        assert len(card.lines) == 3
+    finally:
+        page.close()
+
+
+@pytest.mark.parametrize(
+    "walls",
+    [
+        {"wells": "none", "folder": "plate-walls/tok"},
+        {"folder": 7, "wells": []},
+        "not an object",
+        [],
+    ],
+    ids=["wells-not-a-list", "a-folder-that-is-a-number", "text", "a-list"],
+)
+def test_a_walls_result_that_does_not_validate_keeps_the_generic_card(
+    fake_microscope: Microscope, run_doc: Path, walls: object
+) -> None:
+    # The document is data (FM-125) and `view()` raises nothing for it: a `walls` the
+    # model refuses is the generic card of the result's keys, never an exception.
+    _record(
+        run_doc,
+        "plate-walls",
+        provides="plate",
+        result={
+            "plate": "24-well",
+            "a1_center_xy_um": [0.0, 0.0],
+            "rotation_deg": 0.0,
+            "method": "wall-images",
+            "residual_um": 1.0,
+            "scale_error": None,
+            "n_refs": 2,
+            "walls": walls,
+        },
+    )
+    page = _stood_page(fake_microscope, run_doc, "plate-walls")
+    try:
+        card = page.view().cards["plate-walls"]
+        assert "plate: 24-well" in card.lines
+        assert not any(line.startswith("plate 24-well") for line in card.lines)
+    finally:
+        page.close()
+
+
+def test_a_plate_registration_card_keeps_its_generic_lines(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    page = _stood_page(fake_microscope, run_doc, "plate-registration")
+    try:
+        card = page.view().cards["plate-registration"]
+        assert "method: references" in card.lines
+        assert "plate: 96-well" in card.lines
+        assert card.files == ()
+    finally:
+        page.close()
+
+
 # --- the plate the page starts with (m5 §11.3, #332) --------------------------------
 
 PLACEHOLDER_REFUSAL = (
@@ -2437,6 +2585,41 @@ def test_a_usable_plate_gives_each_plate_tool_a_replace_note(
             "plate-registration": note,
             "plate-walls": note,
         }
+    finally:
+        page.close()
+
+
+def test_the_replace_note_under_plate_finding_does_not_mention_captures(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # plate-finding fills the plate from the image: it has no capture to forget, so the
+    # sentence about them is false under it (m5 §12.7). The tools that run from the
+    # page's captures keep it.
+    _seed(
+        run_doc,
+        "plate-registration",
+        "plate",
+        _plate(),
+        params={"plate": "96-well"},
+    )
+    page = _stood_page(
+        fake_microscope,
+        run_doc,
+        "plate-registration",
+        "plate-walls",
+        "plate-finding",
+    )
+    try:
+        when = T0.astimezone().strftime("%Y-%m-%d %H:%M")
+        head = f"Run replaces the plate registered {when} (references, 2 wells). "
+        replaces = page.view().replaces
+        assert replaces["plate-finding"] == f"{head}A failed run leaves no plate."
+        keeps = (
+            f"{head}A failed run leaves no plate; the captures stay, so Forget the "
+            "wrong one and Run again to get a plate back."
+        )
+        assert replaces["plate-registration"] == keeps
+        assert replaces["plate-walls"] == keeps
     finally:
         page.close()
 
