@@ -76,6 +76,10 @@ them if it is not the one you run on.
    - **A second Edit of the same lines**: the PostToolUse formatter rewraps
      a file after every Edit or Write, so Read the region again before you
      edit it a second time (#213, #224).
+   - **`Literal["a", "b"]` in an annotation**: write the `from typing import
+     Literal` line **before** the annotation, or the formatter (ruff UP037)
+     reads the strings as forward references and strips their quotes
+     (#331, #341); a module-level alias also works.
 
 ## Implement
 
