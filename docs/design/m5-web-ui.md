@@ -3780,7 +3780,7 @@ and `goto-well` still reads only the run document's slot.
 | Pose | Title (before `plan_title`'s suffix) |
 |---|---|
 | registered | `96-well: the registered plate` (as today) |
-| seed | `96-well: placed from one well (B3), not registered: the rotation is assumed 0°, not measured` |
+| seed | `96-well: placed from one well (B3), not registered: the rotation is assumed 0°, not measured` (a slot with no reference well: `96-well: placed from one well, not registered: ...`, the rest the same) |
 | estimated | `24-well: estimated from the stand's holder, not registered: centred at stage (400, -325) µm, not turned, A1 at the top left of this map` |
 | unplaced | `96-well: not registered, and this stand does not say where its plate lies: A1 is drawn at stage (0, 0), so the cross shows the stage and not a well` |
 
@@ -3913,9 +3913,7 @@ swapped axes or a sign flip show), FM-104 (a boolean where a number is expected)
 FM-125 (a profile value taken as it comes), FM-139 (plain text), FM-145 (the label
 is drawn from the last view; the tick never rebuilds it), FM-151 (a second tab
 draws the same pose and the same cross), FM-170 (an unknown says what is unknown:
-the `unplaced` title), FM-198 (the `unplaced` pose is a state, never written
-anywhere: no preset, record or file holds it), FM-162 (the browser walk names what
-it did not reach). A new entry of the checklist, named by its text when the develop
+the `unplaced` title), FM-162 (the browser walk names what it did not reach). A new entry of the checklist, named by its text when the develop
 session writes it: *an estimate drawn like a measurement* (a map that places a plate
 from an assumption and labels wells by it must say on its face which of measured,
 seeded, estimated or unplaced it is, because a name read off it is trusted; a test
