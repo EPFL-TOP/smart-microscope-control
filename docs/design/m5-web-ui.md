@@ -2258,6 +2258,10 @@ tomli 2.0.1 and pydantic 2.7.0):
 
 ```python
 NOT_IN_PARAMS: dict[str, dict[str, str]] = {
+    "objective-offsets": {
+        "confirm_turns": "the stage is clear only for the run that confirmed it: "
+        "every run confirms it again"
+    },
     "plate-finding": {
         "centre_x_um": "a preset holds no positions",
         "centre_y_um": "a preset holds no positions",
@@ -2266,6 +2270,11 @@ NOT_IN_PARAMS: dict[str, dict[str, str]] = {
         "plate": "the preset's plate holds it",
         "refs": "a preset holds no positions",
         "walls": "a preset holds no positions",
+        "objective": "the registration takes the objective in place",
+    },
+    "plate-walls": {
+        "plate": "the preset's plate holds it",
+        "refs": "a preset holds no positions",
     },
     "scan-plan": {"wells": "the preset's wells hold them"},
 }
@@ -2332,7 +2341,9 @@ It reads the document only.
 runs, in this order:
 
 1. The preset's held field:
-   - `plate=<check.plate>` for `plate-registration`;
+   - `plate=<check.plate>` for `plate-registration` and for `plate-walls` (#371:
+     a plugin whose `plate` `NOT_IN_PARAMS` names takes it here, or a run from the
+     preset would use the plugin's default plate);
    - `wells=<check.wells>` for `scan-plan`;
    - each when it is applied.
 2. Then `check.params[plugin]`.
@@ -3105,6 +3116,9 @@ makes it:
   agree. `_page_pairs` returns them for any number of centres; the number is the gate's
   (§12.3), as the plate's is (§11.3), so that a preset's check of the tool's other
   fields is not refused for it.
+- A preset holds the plate as its own field for this tool too (§10.2): a `plate` pair
+  under `plate-walls` is the mismatch `plate is not kept under params: the preset's
+  plate holds it`, and the step's pairs name the plate once (#371).
 - Wall captures stay `plate-registration`'s. `plate-walls` images the walls itself and
   ignores them; the page says so when some exist (§12.5).
 

@@ -108,6 +108,20 @@ class Registration:
         return EchoResult(plate=params.plate)
 
 
+class Walls:
+    name = "plate-walls"
+    provides = "plate"
+    summary = "Returns the plate it was given."
+    Params = PlateParams
+    Result = EchoResult
+    requires: tuple[type, ...] = ()
+    reads: tuple[str, ...] = ()
+    reads_optional: tuple[str, ...] = ()
+
+    def run(self, microscope: Any, params: PlateParams, ctx: RunContext) -> EchoResult:
+        return EchoResult(plate=params.plate)
+
+
 class Seen(BaseModel):
     done: int
 
@@ -404,6 +418,32 @@ def test_the_plate_of_a_preset_reaches_plate_registration_and_refs_do_not(
     ) in _lines(result)
     assert (
         "preset weekly [params.plate-registration]: refs is not kept under params: "
+        "a preset holds no positions"
+    ) in _lines(result)
+
+
+def test_the_plate_of_a_preset_reaches_plate_walls_and_a_plate_pair_under_it_is_named_and_dropped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_stand: list[bool]
+) -> None:
+    # plate-walls (#371): the page fills its plate as it does the registration's, so a
+    # preset holds the plate as its own field for both. A `plate` pair under it that
+    # was applied would reach the plugin, and one that was dropped without the preset's
+    # plate taking its place would run on the plugin's default.
+    _register(monkeypatch, Walls)
+    path = _weekly(tmp_path, WEEKLY + 'plate-walls = ["plate=6-well", "refs=[]"]\n')
+
+    result = _run(
+        "run", "plate-walls", "--preset", str(path), "--run-doc", _doc(tmp_path)
+    )
+
+    assert result.exit_code == 0, result.output
+    assert _stored(tmp_path, "plate-walls").params == {"plate": "96-well", "refs": ""}
+    assert (
+        "preset weekly [params.plate-walls]: plate is not kept under params: "
+        "the preset's plate holds it"
+    ) in _lines(result)
+    assert (
+        "preset weekly [params.plate-walls]: refs is not kept under params: "
         "a preset holds no positions"
     ) in _lines(result)
 
