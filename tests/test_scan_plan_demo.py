@@ -110,11 +110,15 @@ def _seed(
 
 
 def _write_plate(
-    path: Path, *, dry_run: bool = False, objective: str | None = IN_PLACE
+    path: Path,
+    *,
+    dry_run: bool = False,
+    objective: str | None = IN_PLACE,
+    plate: str = "96-well",
 ) -> PlateResult:
     """A registered plate; by default as ``plate-registration`` leaves it, with the objective in place."""
-    plate = PlateResult(
-        plate="96-well",
+    registered = PlateResult(
+        plate=plate,
         a1_center_xy_um=(1000.0, -500.0),
         rotation_deg=0.0,
         method="seed",
@@ -123,8 +127,8 @@ def _write_plate(
         n_refs=0,
         objective=objective,
     )
-    _seed(path, "plate-registration", "plate", plate, dry_run=dry_run)
-    return plate
+    _seed(path, "plate-registration", "plate", registered, dry_run=dry_run)
+    return registered
 
 
 def _write_calibration(
@@ -550,6 +554,32 @@ def test_clip_to_well_false_keeps_every_field(
     assert len(whole.fields) == 48 * 28
     assert len(clipped.fields) < len(whole.fields)
     assert {f.name for f in clipped.fields} < {f.name for f in whole.fields}
+
+
+def test_a_lab_plate_lays_its_fields_inside_its_wells(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    """``greiner-24-well`` (m3 §22): its wells sit at its 19.45 mm pitch, not ``24-well``'s 19.0.
+
+    The default grid is refused on a 15.6 mm well with the demo's 0.5 µm pixel
+    (116 x 68 fields), so 99 x 99, under the cap of 100, clipped to the well.
+    Under ``24-well``'s pitch D6 would be at (96 000, -57 500).
+    """
+    _write_plate(tmp_path / "run.json", plate="greiner-24-well")
+    microscope = demo_microscope_with_sample(shape=SHAPE, pixel_size_um=PIXEL_UM)
+
+    result = _result(_run(microscope, tmp_path, wells="B3,D6", rows=99, columns=99))
+
+    assert result.plate_plan.plate.name == "greiner-24-well"
+    # A kept field's frame meets the well; its centre may lie just outside it.
+    reach = 7800.0 + math.hypot(*result.fov_um) / 2.0
+    for well, centre in (("B3", (39900.0, -19950.0)), ("D6", (98250.0, -58850.0))):
+        fields = [f for f in result.fields if f.well == well]
+        assert 0 < len(fields) < 99 * 99  # measured 5903: clipped
+        mean_x = sum(f.x_um for f in fields) / len(fields)
+        mean_y = sum(f.y_um for f in fields) / len(fields)
+        assert (mean_x, mean_y) == pytest.approx(centre, abs=1.0)
+        assert max(math.dist((f.x_um, f.y_um), centre) for f in fields) < reach
 
 
 def test_a_derived_grid_over_100_per_axis_is_refused(
