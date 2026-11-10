@@ -4,7 +4,8 @@
   workflow, §2 to §16, for issue #192 (2026-10-27); the plate from images of
   the walls, §17, for issue #328 (2026-11-05); objectives' offsets, §18,
   for issue #340 (2026-11-05); the sides of a wall, §19, for issue #327
-  (2026-11-09); the focus on the cells, §21, for issue #341 (2026-11-09).
+  (2026-11-09); the focus on the cells, §21, for issue #341 (2026-11-09);
+  the lab's own plate definitions, §22, for issue #400 (2026-11-10).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 and M2, this document is the contract between issues
   that are built in parallel. Names, module paths and signatures below are
@@ -6669,3 +6670,166 @@ At the Ti2-E, 40× on a plate with cells, PFS locked on them (m2 §12.10.7):
   snap) and per field, against §21.6's `assumed` line.
 - Whether a Z readback lands within a quarter step of its command.
 - The 40×'s offset factor, which #392 (route and NIS-Elements) waits for.
+
+## 22. The lab's own plate definitions (#400)
+
+Every plate tool names its plate by a `useq` key (`24-well`), and smc took
+only the keys `useq` ships. The Greiner 24-well plate on the Ti2-E is not
+`useq`'s `24-well`: its pitch is 19.45 mm, not 19.0 (F9, session 3, #405),
+so `calibrate` refuses it at +2.4 % (`SCALE_TOLERANCE = 0.02`, §17). This
+section adds the lab's own definitions, kept in one versioned data file and
+registered with `useq` when `smc` is imported, so that every entry point (the
+CLI, the page, the plugins, a run document read back) sees them under their
+names. **Merging this section decides it.** It is additive: no slot, model or
+parameter changes, and a plate tool reads a lab plate as it reads `96-well`.
+
+### 22.1 What was measured (2026-11-10, planning #400)
+
+On main at `caaa60e` (useq-schema 0.9.2, pydantic 2.13, Python 3.13), with a
+prototype of §22.3 in the design session's scratchpad:
+
+- `useq.register_well_plates({name: {rows, columns, well_spacing,
+  well_size, circular_wells}})` updates a module-level dict; afterwards
+  `useq.WellPlate.from_str(name)` and `useq.registered_well_plate_keys()`
+  see the plate (`well_spacing=(19.45, 19.45)`, `well_size=(15.6, 15.6)`,
+  `name` the key). A key already present is **overwritten** without a word.
+- Session 3's hand centres, B3 (10 003, -10 051), B5 (-28 982, -9 919), C3
+  (10 031, 9 375) µm: under `24-well`, refused at +2.4 %; under a plate at
+  19.45 mm, the scale passes (+0.07 %) but the fit turns the plate by
+  179.8° and `max_rotation_deg` refuses it. The Ti2-E runs the plate's
+  columns towards −X and its rows towards +Y, `useq` the other way on both
+  axes: a turn of 180°. That is **#414**, not this section. The same centres
+  turned 180° about the origin fit at −0.21°, **residual 44.5 µm**.
+- Synthetic centres of A1, A6 and D1 at 19.45 mm, turned 0.3°: residual 0
+  under the new plate, refused at +2.4 % under `24-well`.
+- The plate-related suites (plate-finding, -registration, -walls, presets,
+  the guide, the demo sample) with the plate registered before collection:
+  one test changes. A synthetic survey of `useq`'s `24-well` is identified
+  as `greiner-24-well`, 0.809 against 0.804, and `decide` says `barely
+  beats` (the decisive margin is 0.08); a survey of the Greiner plate goes
+  the other way, 0.803 against 0.799. Both fits place every well within
+  1.9 mm, under the test's bound of 30 % of a radius (2.3 mm).
+- A wheel built from main with a file at `src/smc/plates.toml` ships it as
+  `smc/plates.toml`: hatch takes every file of the package.
+
+### 22.2 Decisions
+
+**D1. One data file, shipped in the package: `src/smc/plates.toml`.**
+Plates are the lab's, not a stand's: a profile (`profiles/*.toml`, ADR-0003)
+is the wrong home, and a Greiner plate goes from the Ti2-E to another stand
+unchanged. Package data travels with the wheel and with an editable install,
+and needs no search path. A stand-local file (an `$SMC_PLATES`) is not added:
+nothing asks for it yet.
+
+**D2. Every number says where it comes from.** `well_spacing_mm` and
+`well_size_mm` each carry a source: `measured` (where, when, how, the issue),
+`maker` (the maker's reference and datasheet) or `assumed` (taken from
+elsewhere, not checked on this plate). Rows and columns are counted, not
+sourced.
+
+**D3. Registered at `import smc`.** `smc/__init__.py` calls
+`smc.plates.register_lab_plates()`. Every entry point imports `smc` first,
+so no call site needs to remember it, and a run document that names a lab
+plate validates in any process that reads it. `useq` is imported there
+(~0.1 s, already paid by `smc.hardware`, `smc.cli` and the plugins).
+
+**D4. A lab plate never redefines a `useq` key.** `useq` overwrites a key
+silently (§22.1): a lab file that names `24-well` would change the geometry
+of every run document that holds it. The registration refuses a name `useq`
+already holds, with a `ValueError` that names the file; a second call is a
+no-op that returns the same names.
+
+**D5. A name is published once: its numbers do not change under it.** A run
+document stores the plate's name, not its geometry, so editing the spacing
+of `greiner-24-well` would move every well of every plate registered with it
+(0.75 mm at the sixth column for 0.15 mm of pitch), with nothing to say so.
+A corrected definition (the maker's datasheet replacing the measurement)
+takes a **new name**, and the old one stays in the file, its description
+saying what replaced it. A unit test pins each published name's numbers, so
+an edit in place fails the suite until its test is changed in the same
+commit, deliberately.
+
+**D6. Names are `useq`-style and end in `-well`**: lower case, digits and
+hyphens, `[a-z0-9]+(-[a-z0-9]+)*-well`. The profile's `[sample] plate`, the
+page's menu and `plate-finding` select well plates by that suffix (§2, m1
+§8). The first one is `greiner-24-well`.
+
+**D7. `plate-finding` fits lab plates too.** Its default candidates are
+"every registered `-well` plate" (§2), and a lab plate is one. A survey of a
+24-well plate then weighs `24-well` against `greiner-24-well`, 2.4 % apart,
+and it cannot tell them apart (§22.1): its decisive-margin note says so,
+which is the truth, and the operator names the plate. A survey that knows
+its plate passes `plates=[...]`. Hiding a lab plate from the default would
+instead fit a Greiner plate as `24-well`, 2.25 mm off at the sixth column,
+with no note.
+
+### 22.3 `src/smc/plates.toml` (new)
+
+```toml
+# The lab's own plate definitions (m3 §22). Read when smc is imported and
+# registered with useq under these names. A name, once used in a run
+# document, keeps its numbers: a corrected plate takes a new name (D5).
+
+[plates.greiner-24-well]
+description = "Greiner Bio-One 24-well plate, standard bottom, catalogue reference not read yet"
+rows = 4
+columns = 6
+well_spacing_mm = [19.45, 19.45]
+well_size_mm = [15.6, 15.6]
+circular_wells = true
+well_spacing_source = { kind = "measured", note = "..." }
+well_size_source = { kind = "assumed", note = "..." }
+```
+
+The notes are the plan's (#400). Keys outside the model are refused.
+
+### 22.4 `src/smc/plates.py` (new)
+
+```python
+PLATES_FILE = "plates.toml"
+
+
+class PlateSource(BaseModel):  # frozen, extra="forbid"
+    kind: Literal["measured", "maker", "assumed"]
+    note: str  # min_length=1
+
+
+class LabPlate(BaseModel):  # frozen, extra="forbid"
+    description: str  # min_length=1
+    rows: int  # 1..64
+    columns: int  # 1..96
+    well_spacing_mm: tuple[float, float]  # (x, y), finite, > 0
+    well_size_mm: tuple[float, float]  # (x, y), finite, > 0, below the spacing
+    circular_wells: bool
+    well_spacing_source: PlateSource
+    well_size_source: PlateSource
+
+
+def load_lab_plates(text: str | None = None) -> dict[str, LabPlate]: ...
+def register_lab_plates() -> tuple[str, ...]: ...
+```
+
+- `load_lab_plates(None)` reads the packaged file
+  (`importlib.resources.files("smc") / PLATES_FILE`, `encoding="utf-8"`);
+  `text` is for tests. A bad name, an unknown key or a bad value raises
+  `ValueError` naming `plates.toml` and the plate.
+- `register_lab_plates()` loads, refuses a `useq` name (D4), registers each
+  plate with `rows`, `columns`, `well_spacing`, `well_size` and
+  `circular_wells` (not `description`: `useq`'s `name` stays the key), and
+  returns the sorted names. Idempotent.
+- `smc.plates` imports nothing from `smc` (it runs inside `smc/__init__`).
+
+### 22.5 Not here
+
+- The plate's orientation on the Ti2-E's stage (180°): #414.
+- A stand-local plate file, a CLI to list plates, a page view of a plate's
+  provenance.
+- Changing `SCALE_TOLERANCE`: the guard is right; the definition was wrong.
+
+### 22.6 Not verified (for the owner)
+
+- `plate-walls` at the Ti2-E with `plate=greiner-24-well`, after #414's
+  decision (or with the plate turned 180° in its holder): the residual, and
+  `goto-well` to a fourth well within 100 µm of its centre (§17.7).
+- The maker's datasheet: the Greiner reference, read from the plate; its
+  pitch against 19.45 mm. A different pitch is a new name (D5).
