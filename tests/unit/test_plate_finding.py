@@ -50,6 +50,19 @@ from smc.plugins.slots import WellRef
 
 pytestmark = pytest.mark.filterwarnings("error::RuntimeWarning")
 
+#: ``useq``'s own well plates. The default candidates also hold the lab's
+#: (m3 §22 D7), and a survey cannot tell ``24-well`` from ``greiner-24-well``,
+#: 2.4 % apart: a test about telling ``useq``'s types apart names them.
+_USEQ_WELL_PLATES = (
+    "6-well",
+    "12-well",
+    "24-well",
+    "48-well",
+    "96-well",
+    "384-well",
+    "1536-well",
+)
+
 
 def survey_for(
     plate: str,
@@ -136,12 +149,32 @@ def worst_well_error(
 def test_the_plate_is_identified_and_located(
     plate: str, a1: tuple[float, float], rot: float
 ) -> None:
-    best, _notes = decide(fit(survey_for(plate, a1, rot)))
+    best, _notes = decide(fit(survey_for(plate, a1, rot), plates=_USEQ_WELL_PLATES))
 
     assert best is not None, "no usable fit"
     assert best.plate == plate, f"identified as {best.plate}"
     err = worst_well_error(plate, a1, rot, best.a1_center_xy_um, best.rotation_deg)
     radius = min(well_size_um(plate)) / 2
+    assert err < radius * 0.30, f"{err:.0f} µm is {err / radius:.0%} of a well radius"
+
+
+def test_the_two_24_well_types_are_a_coin_toss_and_the_notes_say_so() -> None:
+    """D7: the default candidates hold the lab's plate; 2.4 % apart, the survey cannot choose.
+
+    The note is the truth, and the operator names the plate. Either fit still
+    places every well well inside it.
+    """
+    a1, rot = (500.0, -500.0), -0.8
+    fits = fit(survey_for("24-well", a1, rot))
+
+    best, notes = decide(fits)
+
+    assert {fits[0].plate, fits[1].plate} == {"24-well", "greiner-24-well"}
+    assert best is not None
+    said = f"{fits[0].plate} ({fits[0].score:.3f}) barely beats {fits[1].plate} ("
+    assert any(note.startswith(said) for note in notes), notes
+    err = worst_well_error("24-well", a1, rot, best.a1_center_xy_um, best.rotation_deg)
+    radius = min(well_size_um("24-well")) / 2
     assert err < radius * 0.30, f"{err:.0f} µm is {err / radius:.0%} of a well radius"
 
 
