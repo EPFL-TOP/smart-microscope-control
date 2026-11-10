@@ -3685,7 +3685,8 @@ which way Z moves away from the sample. A first lock's band is
 `(−∞, z_start + E]` when it is `"decreasing"` and `[z_start − E, +∞)` when
 it is `"increasing"`, with `E` = `max_engage_excursion_um`; the Z soft
 limits still bound both sides, as in D2. D2's symmetric band would trip on
-the drop that D4 asks for.
+the drop that D4 asks for. *Amended by #402*: the bounded side uses
+`[safety] first_lock_max_rise_um` when the profile sets it (§12.11 D8).
 - **A trip is D2's**: switched off at once, `AutofocusExcursionError`, and
   the offset forgotten (it was never seen). It means that the floor's plane
   was not below where Z started: either the operator had not focused first
@@ -3803,6 +3804,8 @@ class SafetySection(_Section):  # gains, after max_engage_excursion_um
   already there, the floor is not below this objective's focus (m2 §12.10),
   so do not try a first lock with it again. The guard reads Z every 10 ms:
   it stops PFS once a jump is read, it does not prevent one ``.
+  *Amended by #402*: the bound and the advice of this text are §12.11
+  D10's.
 - **D6** (`SafetyRefusedError`, `how_to_force=""`): `` autofocus PFS:
   offset not moved: it is <on and not locked | locked, with no
   [autofocus.offset_per_um] factor for objective '3-Plan Apo LmbdD0.25
@@ -3917,8 +3920,186 @@ Limits of the design, named:
 - **The stand's button stays outside smc.** A press at an unseen offset
   jumps whatever smc says; D7 only stops smc from advising it.
 - **A first lock rests on a sign and on the operator's by-eye focus.** The
-  guard limits a wrong sign to E plus what Z covers between two reads; it
-  does not prevent it.
+  guard limits a wrong sign to E (`R` since §12.11 D8) plus what Z covers
+  between two reads; it does not prevent it.
+
+### 12.11 A first lock whose floor lies above the focus (#402)
+
+Extends §12.10 (D4, D5, §12.10.4, §12.10.5). **Merging this section
+decides it**: it answers #402's three questions, with the options not
+chosen and why, and fixes what the 40× does on 2026-11-11. No Protocol and
+no signature changes.
+
+#### 12.11.1 What is known
+
+Measured in Ti2-E session 3 (2026-11-10, #405; `nikon-ti2.md`, *Session
+3*), the 40× `3-Plan Apo LmbdD0.25 40x`, a Greiner 24-well plate with a
+standard plastic bottom (thickness not read) and debris, no cells:
+- **C4** (XY (−9545, 1932), near its −Y wall): focused by eye at Z
+  4005.56 µm, `--floor` (0), `engage`: locked at 3958.68 µm, **46.9 µm
+  away**, at the first try. Sharp under lock at offset 5388, Z 4004.58 µm;
+  the 40×'s factor is about 115 units/µm.
+- **C3** (XY (10031, 9375)), reached with PFS off and Z 200 µm down: focused
+  by eye at Z 4017.28 µm, `--floor`, `engage`: the guard tripped at
+  4074.08 µm, **56.8 µm toward the sample**, 6.8 µm past its 50 µm bound, one
+  read late. Z read 4074.14 µm next: the switch-off stopped Z at once.
+- So the plane the floor names lay 46.9 µm below the focus in C4 and at
+  least 56.8 µm above it in C3: relative to the focus, **one offset's plane
+  moved by at least 104 µm between two wells**, while the two by-eye foci
+  lie 11.7 µm apart.
+- At the 40×, PFS stayed locked over the plastic between B4 and C4 (the
+  `C4-edge` grid, Z within 1.6 µm); inside C4, Z varied by 1.7 µm over
+  1.4 mm, and an engage at a seen offset moved Z by −0.04 µm.
+- **Why the plane moved is not known.** Hypotheses, inferred only: (a) PFS
+  takes another interface of the thick bottom in one well than in the other
+  (the outer air-plastic surface or the inner one); a lock held over the
+  plastic between wells fits the outer one at C4; (b) the bottom's
+  thickness differs by about 100 µm between C3 and C4; (c) one by-eye focus
+  was on another plane, such as debris under the bottom, which the 11.7 µm
+  between the two foci makes unlikely.
+- **Measured on the Ti2-E fake** (`main` caaa60e, planning #402): a first
+  lock whose plane lies 8 µm above where Z started locks and returns
+  `True`, since its band is `z_start + 50`; and once the floor has been
+  seen locked, an engage at the floor from another Z, whose plane lies
+  40 µm above it, is a seen offset under D2's symmetric band and locks
+  40 µm toward the sample with no word. In one `Microscope` (the page), the
+  second well of F11 would not have been a first lock at all.
+
+#### 12.11.2 Decisions
+
+**D8. A first lock's bound toward the sample is a tolerance, not E.**
+`[safety] first_lock_max_rise_um` (`R`) bounds how far Z may move toward
+the sample during a first lock: the band is `(−∞, z_start + R]` when
+`z_away_from_sample` is `"decreasing"` and `[z_start − R, +∞)` when it is
+`"increasing"`. Unset, `R` is `E`: today's band.
+- **Why not E.** E bounds the plane of a seen offset, which lies where the
+  sample's own shape puts it (D2). A first lock asks for a drop, and any
+  rise means that its premise failed (D5): its bound is the noise of a Z
+  read, not the shape of a plate.
+- **What it buys.** F11's trip would have been read at about `R` + 6.8 µm
+  (the travel of one read in F11, one observation) instead of 56.8 µm.
+- **The Ti2-E sets `R = 5` µm** (chosen: Z reads repeat within 0.02 µm;
+  PFS off then on at a seen offset moved Z by 0.00 µm, a re-engage by
+  −0.04 µm). Z was not traced during a first lock that worked (§12.11.4).
+- **Validation**: positive, finite, not a TOML boolean (#106), and not above
+  `max_engage_excursion_um` when both are set (a `ProfileError` that names
+  both keys): a first lock looser than an engage at a seen offset is a
+  mistake. `Safety` checks the same with a `ValueError`.
+- **Not a condition of a first lock**: §12.10.4's four stay as they are.
+- **One value for every objective**: a rise means the same at every
+  magnification.
+- Not chosen: *a smaller E on the Ti2-E*. E also bounds the scan's relocks
+  at the 10×, across a plate that no session has traced; a trip there fails
+  the scan for no danger (working distance 15.2 mm).
+- Not chosen: *E per objective* (#402's third question). `R` covers the
+  first lock, where F11 happened; inside a well at the 40× a seen offset
+  moved Z by less than 2 µm. A 40× scan that relocks across walls is #416's.
+
+**D9. At or below the floor, `engage()` is always a first lock.** On a
+declared stand with the first lock's four conditions met and the autofocus
+off, `engage()` at an offset at or below the floor builds D5's one-sided
+band with `R`, whether or not that offset has been seen locked.
+- **Why.** F11: one offset with one objective named planes at least 104 µm
+  apart, relative to the focus, in two wells. A lock seen at the floor in
+  one well says nothing of the floor's plane in the next, and the floor is
+  set exactly when the operator starts at a new place. D1's path would
+  bound it by E both ways, and it locked 40 µm up with no word (§12.11.1).
+- **The autofocus on** at a seen floor (locked, or searching): D1's path,
+  as today. On at an unseen one: refused and switched off, as today.
+- **The relocks** (`first_lock=False`) keep D1: they bring Z back to where
+  PFS held it.
+- A first lock that locks leaves the floor seen; one that trips forgets
+  it, as today.
+- Not chosen: *seen offsets kept per XY*. A field, a well and a plate are
+  m3's notions, and the layer would have to guess a radius. A seen offset
+  above the floor engaged at another place stays D1's and D2's (§12.11.5).
+
+**D10. The trip names the place, not the objective.** §12.10.5's text for
+a first lock's trip toward the sample becomes, with `R` set:
+
+`` autofocus PFS: Z went from 4017.28 µm to 4074.08 µm while it engaged
+from the offset's floor, more than [safety] first_lock_max_rise_um (5 µm)
+toward the sample; it was switched off. The floor's plane is not below
+where Z started: focus on the sample by eye before a first lock; if Z was
+already there, the floor's plane lies above the focus at this place (m2
+§12.11), and no offset smc may set names a lower one: do not engage PFS
+here with this objective. The guard reads Z every 10 ms: it stops PFS once
+a jump is read, it does not prevent one ``
+
+Without `R`, the bound clause stays `more than [safety]
+max_engage_excursion_um (50 µm) toward the sample`, and the advice is the
+new one. The INFO line before the switch-on names the bound in force:
+`` … Z may move away from the sample, and at most 5 µm toward it ``.
+- **Why**: "the floor is not below this objective's focus … do not try a
+  first lock with it again" read as a verdict on the 40×, which had locked
+  from that floor in C4 ten minutes earlier.
+
+**#402's questions, answered.**
+- *Reuse an offset seen locked in another well instead of the floor*: no.
+  Under lock a larger offset names a higher plane (§12.10.1), and the floor
+  is the lowest offset smc may set: in C3 the offsets seen in C4
+  (5388-5698) name planes about 47-50 µm above the floor's, which already
+  lay at least 56.8 µm above the focus.
+- *A floor per objective*: no; D4 stands. A floor of its own could only lie
+  above the lowest value the device accepts, and so name a higher plane. A
+  lower floor needs offsets below 0, which no session has written
+  (§12.11.4).
+- *An excursion bound per objective*: not now (D8).
+
+#### 12.11.3 The 40× on 2026-11-11
+
+The owner scans at the 10× first, then at the 40× (#402). Every command
+with `--profile nikon-ti2`:
+1. **The F11 probe, at the 10×** (working distance 15.2 mm: harmless), in
+   C3 then in C4: `smc autofocus disengage`; `smc z move <Z − 200>`; `smc
+   stage move X Y`; focus by eye, PFS off, then `smc z get` (`Z_eye`);
+   `smc autofocus offset --floor`; `smc autofocus engage`; `smc z get`
+   (`Z_floor`); the knob under lock until sharp, `smc z get` and `smc
+   autofocus offset`. If `Z_eye − Z_floor` agrees within about 20 µm
+   between the two wells, the plane moves at the 40× only (hypothesis a,
+   at NA 0.95); if it differs by 100 µm or more, it moves from well to well
+   at every objective (a or b). The procedure below holds either way.
+2. **The bound.** With #402's PR merged and pulled, the profile has
+   `first_lock_max_rise_um = 5.0`. Without it, the stand's copy sets
+   `max_engage_excursion_um = 10.0` for the 40× part only (it bounds a
+   first lock's rise and every engage; at the 40× a seen offset moved Z by
+   less than 2 µm), and 50.0 again before any 10× scan.
+3. **One well at a time, PFS off across every wall.** PFS locked and
+   following its reference over a wall drives Z with no guard (D2: no
+   watchdog between actions), and F11 says the next well's plane can lie
+   104 µm elsewhere (#416). Per well: `smc autofocus disengage`; `smc z
+   move <Z − 200>`; `smc stage move X Y`; focus by eye with the knob, PFS
+   off; `smc autofocus offset --floor`; `smc autofocus engage` (the CLI,
+   not the page, until D9 is merged); `smc z get` at once, below the
+   by-eye focus; the knob under lock until sharp; then that well's scan
+   only.
+4. **A trip** (`AutofocusExcursionError` from the floor): that well is not
+   imaged with PFS at the 40×. `smc z move <Z − 200>`, note it, next well;
+   never the stand's button, never a second engage there.
+5. **Recorded per well**: `Z_eye`, `Z_floor` or the trip's Z, the sharp Z
+   and its offset: the data that settles F11.
+
+#### 12.11.4 Not verified
+
+- Which hypothesis of §12.11.1 holds; §12.11.3's probe separates "the 40×
+  only" from "every objective".
+- Whether PFS moves Z toward the sample before it drops on a first lock
+  that works: Z was not traced during one. If `R` trips first locks where
+  the by-eye focus says the floor lies below, `R` is raised in the profile,
+  never above E.
+- How fast a PFS jump travels: 6.8 µm in one read in F11, once.
+- Whether `PFSOffset` accepts values below 0, which would lower the floor:
+  never written.
+- Whether F11's jump touched the plate (not answered at the stand).
+
+#### 12.11.5 Limits of the design, named
+
+- **A seen offset above the floor, engaged at another place** (the page
+  after an XY move, or the scan after a lost lock in a new well) is D1's
+  and D2's: bounded by E, 50 µm on the Ti2-E, while F11 says its plane can
+  lie 104 µm away. At the 40×, §12.11.3 avoids it; the scan is #416's.
+- **PFS locked and following over a wall** is outside every guard (D2's
+  *Not chosen*), at every objective; #416.
 
 ## 13. Offsets between objectives (#340)
 
