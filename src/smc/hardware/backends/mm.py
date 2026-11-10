@@ -774,7 +774,12 @@ class _EngageGuard:
     A first lock from the offset's floor (m2 §12.10 D5) has a band open on
     ``open_side``, the side away from the sample: the floor's plane lies
     there, and a drop to it is what was asked; only Z toward the sample is
-    bounded, by ``E``, and the soft limits still bound both sides.
+    bounded, by ``rise_um`` (``[safety] first_lock_max_rise_um``, ``R``) or,
+    unset, by ``E``, and the soft limits still bound both sides. Any rise means
+    the floor's plane was not below where Z started, so ``R`` is the noise of a
+    Z read, not the shape of a plate (m2 §12.11 D8). ``engage()`` builds this
+    band at a floor already seen locked, too, while the autofocus is off: a
+    floor seen in one well names a plane anywhere in the next (D9).
     The window is settled once every Z read of the last ``settle_s`` lies
     within ``tolerance_um`` of each other, still locked; a lock lost meanwhile
     starts it again at the next locked read.
@@ -797,6 +802,7 @@ class _EngageGuard:
         tolerance_um: float,
         limit_s: float,
         open_side: Literal["below", "above"] | None = None,
+        rise_um: float | None = None,
     ) -> None:
         self._autofocus = autofocus
         self._focus = focus
@@ -805,11 +811,15 @@ class _EngageGuard:
         self._excursion_um = excursion_um
         #: The side a first lock leaves unbounded; ``None``: not a first lock.
         self.open_side = open_side
+        #: A first lock's bound toward the sample, when the profile sets one.
+        self._rise_um = rise_um
+        # The one bound of a first lock's bounded side: R, else E (m2 §12.11 D8).
+        bound = rise_um if rise_um is not None else excursion_um
         self._band: tuple[float, float] | None = None
-        if excursion_um is not None and open_side == "below":
-            self._band = (-math.inf, z_start_um + excursion_um)
-        elif excursion_um is not None and open_side == "above":
-            self._band = (z_start_um - excursion_um, math.inf)
+        if bound is not None and open_side == "below":
+            self._band = (-math.inf, z_start_um + bound)
+        elif bound is not None and open_side == "above":
+            self._band = (z_start_um - bound, math.inf)
         elif excursion_um is not None:
             held = z_start_um if z_held_um is None else z_held_um
             self._band = (
@@ -929,9 +939,13 @@ class _EngageGuard:
             where = (
                 "toward the sample" if self.first_lock else "beyond where it started"
             )
+            # The key in force (m2 §12.11 D10): R bounds a first lock when set.
+            rise = self._rise_um if self.first_lock else None
             self.why = (
                 f"more than [safety] max_engage_excursion_um ({self._excursion_um:g} "
                 f"µm) {where}"
+                if rise is None
+                else f"more than [safety] first_lock_max_rise_um ({rise:g} µm) {where}"
             )
         else:
             return z_um
@@ -1482,13 +1496,17 @@ class MMAutofocus:
         out of the soft limits or the band switches it off (D2).
 
         One exception to D1, here and not in the relocks: a *first lock from
-        below* (m2 §12.10 D4). An unseen offset at or below the floor (the
-        lower bound of ``[safety] autofocus_offset_soft_limits``), with the
+        below* (m2 §12.10 D4). An offset at or below the floor (the lower
+        bound of ``[safety] autofocus_offset_soft_limits``), with the
         autofocus off, engages when the profile also gives
         ``max_engage_excursion_um`` and ``z_away_from_sample`` and there is a
         focus drive to read: under lock a larger offset gives a larger Z, so
         the floor's plane lies away from a sample focused by eye. Its band is
-        open on that side and bounds Z toward the sample only (D5).
+        open on that side and bounds Z toward the sample only (D5), by
+        ``[safety] first_lock_max_rise_um`` when set, else by
+        ``max_engage_excursion_um`` (§12.11 D8). It is a first lock whether or
+        not the floor was seen locked: one floor named planes 104 µm apart in
+        two wells (§12.11 D9).
 
         Raises:
             ValueError: ``timeout_s`` is not finite or not in (0, 600] s, or
@@ -1500,7 +1518,10 @@ class MMAutofocus:
                 lacks for it. Not forceable.
             AutofocusExcursionError: Z left its bound while it engaged; it was
                 switched off, and its offset is no longer a seen one. During a
-                first lock: Z went toward the sample, or past a soft limit.
+                first lock: Z went toward the sample by more than
+                ``first_lock_max_rise_um`` (else ``max_engage_excursion_um``),
+                and the message says the floor's plane lies above the focus at
+                this place; or Z went past a soft limit.
             DeviceTimeoutError: No lock, and it could not be switched off (or
                 still reads on); or Z left its bound and it could not be
                 switched off. The wait stays registered as a motion, so the
@@ -1722,6 +1743,10 @@ class MMAutofocus:
             tolerance_um=self._settle_tolerance_um,
             limit_s=limit_s,
             open_side=open_side,
+            # Only a first lock's band takes R (m2 §12.11 D8).
+            rise_um=(
+                self._safety.first_lock_max_rise_um if open_side is not None else None
+            ),
         )
 
     def _check_engage(
@@ -1738,11 +1763,14 @@ class MMAutofocus:
         (FM-19). Neither refusal can be forced: a forced engage of an unknown
         offset at 40x is the crash itself (m2 §12.2 D1).
 
-        With ``first_lock`` (``engage()`` only), an unseen offset at or below
-        the floor engages as a first lock from below (m2 §12.10 D4), under a
-        band open away from the sample (D5), when nothing it needs is missing
-        and the autofocus reads off: ``z_start`` must be where the operator
-        focused, not where a search has already taken Z. Otherwise the refusal
+        With ``first_lock`` (``engage()`` only), an offset at or below the
+        floor engages as a first lock from below (m2 §12.10 D4), under a band
+        open away from the sample (D5), when nothing it needs is missing and
+        the autofocus reads off: ``z_start`` must be where the operator
+        focused, not where a search has already taken Z. That holds whether or
+        not the floor was seen locked (m2 §12.11 D9): a floor seen in one well
+        says nothing of its plane in the next. A seen floor with the autofocus
+        on, or the conditions missing, is D1's seen offset. Otherwise the refusal
         says how to lock from below, or what the profile lacks for it; it
         never names the stand's own controls, whose button jumped at an unseen
         offset (#331).
@@ -1772,43 +1800,37 @@ class MMAutofocus:
         objective = self._objective_label()
         offset = self._read_offset()
         seen = self._seen.get(objective, frozenset())
+        offset_limits = self._safety.autofocus_offset_soft_limits
+        missing = self._first_lock_missing(focus)
+        on: bool | None = None
+        if first_lock and offset_limits is not None and offset <= offset_limits[0]:
+            # At or below the floor, engage() is a first lock whether or not the
+            # floor was seen locked (m2 §12.11 D9): one floor named planes 104 µm
+            # apart in two wells (F11), and the floor is set at each new place.
+            on = self._engaged_for_the_check()
+            if (
+                not missing
+                and not on
+                # Always, with a focus drive and E: for the type checker.
+                and focus is not None
+                and guard is not None
+            ):
+                direction = self._safety.z_away_from_sample
+                guard = self._new_guard(
+                    focus,
+                    guard.z_start_um,
+                    None,
+                    limit_s,
+                    open_side="below" if direction == "decreasing" else "above",
+                )
+                guard.seen = (objective, offset)
+                return guard
         if offset in seen:
             if guard is not None:
                 guard.seen = (objective, offset)
             return guard
-        # Left searching, it would drive Z to that offset's plane the moment it
-        # found the reference. Unknown counts as on (FM-19).
-        try:
-            on = self._read_engaged()
-        except Exception as exc:
-            logger.debug(
-                "autofocus %s: its state could not be read (%s); switched off",
-                label,
-                _named(exc),
-            )
-            on = True
-        missing = self._first_lock_missing(focus)
-        offset_limits = self._safety.autofocus_offset_soft_limits
-        direction = self._safety.z_away_from_sample
-        if (
-            first_lock
-            and not missing
-            and not on
-            and offset_limits is not None
-            and offset <= offset_limits[0]
-            # Always, with a focus drive and E: for the type checker.
-            and focus is not None
-            and guard is not None
-        ):
-            guard = self._new_guard(
-                focus,
-                guard.z_start_um,
-                None,
-                limit_s,
-                open_side="below" if direction == "decreasing" else "above",
-            )
-            guard.seen = (objective, offset)
-            return guard
+        if on is None:
+            on = self._engaged_for_the_check()
         unit = f" {self._offset_unit}" if self._offset_unit else ""
         with_objective = "" if objective is None else f" with objective {objective!r}"
         known = ", ".join(f"{value:g}" for value in sorted(seen)) or "none"
@@ -1845,6 +1867,23 @@ class MMAutofocus:
             )
         raise _EngageRefusedError(f"{unseen}{switched}. {advice}", label=label)
 
+    def _engaged_for_the_check(self) -> bool:
+        """Whether it reads on, for the engage check; unknown counts as on (FM-19).
+
+        Left searching, it would drive Z to the offset's plane the moment it
+        found the reference, and a first lock's ``z_start`` would not be where
+        the operator focused.
+        """
+        try:
+            return self._read_engaged()
+        except Exception as exc:
+            logger.debug(
+                "autofocus %s: its state could not be read (%s); counted as on",
+                self._label,
+                _named(exc),
+            )
+            return True
+
     def _first_lock_missing(self, focus: ZStage | None) -> list[str]:
         """What a first lock from below needs and this stand lacks, in the decided order.
 
@@ -1870,14 +1909,16 @@ class MMAutofocus:
     def _send_on_for_a_first_lock(self, offset: float) -> None:
         """The switch-on of a first lock, after the line that says what Z may do."""
         unit = f" {self._offset_unit}" if self._offset_unit else ""
-        excursion = self._safety.max_engage_excursion_um  # never None for a first lock
+        # The bound in force: R if set, else E, never None for a first lock (D10).
+        rise = self._safety.first_lock_max_rise_um
+        bound = self._safety.max_engage_excursion_um if rise is None else rise
         logger.info(
             "autofocus %s: a first lock from the offset's floor (%s%s, m2 §12.10): Z "
             "may move away from the sample, and at most %s µm toward it",
             self._label,
             f"{offset:g}",
             unit,
-            "an unknown number of" if excursion is None else f"{excursion:g}",
+            "an unknown number of" if bound is None else f"{bound:g}",
         )
         self._send_on()
 
@@ -1923,13 +1964,16 @@ class MMAutofocus:
         )
         if guard.first_lock and guard.toward_sample:
             # The floor's plane was not away from the sample (m2 §12.10.5): the
-            # operator had not focused first, or the sign is wrong here.
+            # operator had not focused first, or here the floor's plane lies
+            # above the focus. It names the place, not the objective, which
+            # locked from the same floor in the next well (m2 §12.11 D10).
             raise AutofocusExcursionError(
                 f"autofocus {label}: {what}; it was switched off. The floor's plane "
                 f"is not below where Z started: focus on the sample by eye before a "
-                f"first lock; if Z was already there, the floor is not below this "
-                f"objective's focus (m2 §12.10), so do not try a first lock with it "
-                f"again. {guards}",
+                f"first lock; if Z was already there, the floor's plane lies above "
+                f"the focus at this place (m2 §12.11), and no offset smc may set "
+                f"names a lower one: do not engage {label} here with this objective. "
+                f"{guards}",
                 guard.z_start_um,
                 z_um,
             )

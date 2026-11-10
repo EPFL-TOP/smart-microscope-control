@@ -944,10 +944,10 @@ _DECLARED_EMERGENCY_STOP = (
             "from the offset's floor, more than [safety] max_engage_excursion_um (50 "
             "µm) toward the sample; it was switched off. The floor's plane is not "
             "below where Z started: focus on the sample by eye before a first lock; "
-            "if Z was already there, the floor is not below this objective's focus "
-            "(m2 §12.10), so do not try a first lock with it again. The guard reads "
-            "Z every 10 ms: it stops Autofocus once a jump is read, it does not "
-            "prevent one",
+            "if Z was already there, the floor's plane lies above the focus at this "
+            "place (m2 §12.11), and no offset smc may set names a lower one: do not "
+            "engage Autofocus here with this objective. The guard reads Z every 10 "
+            "ms: it stops Autofocus once a jump is read, it does not prevent one",
             id="first-lock-excursion",
         ),
         pytest.param(
