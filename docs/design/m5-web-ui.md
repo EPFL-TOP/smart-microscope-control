@@ -13,7 +13,9 @@
   target, why a Run is disabled, the plate the page starts with, what a Run
   replaces, a Ctrl-C that prints one line); the image's sides and what a move does
   to the image fixed by #327's plan (§13, 2026-11-09: the captures and the drive
-  take image sides, the notes say what each is on the stage).
+  take image sides, the notes say what each is on the stage); the map's place of
+  the stage fixed by #410's plan (§15, 2026-11-10: a cross that follows the frames
+  in Live, a plate estimated from the stand's holder, the pose the title names).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 to M3, this document is the contract between issues.
   Names, module paths and signatures below are fixed; an executor who needs to
@@ -3648,3 +3650,287 @@ names what it did not reach).
 in headless Chromium: `/ui-check` shows what a newcomer sees at the default zoom, not
 the stand's screen); the estimate against the time of a real scan on the Ti2-E
 (`timing` measured it on the demo's simulated stage here).
+
+## 15. The map says where the stage is on the plate (#410)
+
+Fixed by #410's plan (2026-11-10). The owner's feedback from Ti2-E session 3
+(#405), the three requests of the issue: show where the stage is on the plate
+before any calibration, as a cross that follows it in real time; and register from
+one position in each of three wells. This section decides what the map draws and
+says before a registration exists, what the cross follows, and what the
+three-well registration is. It adds one profile table and one field of `PlateView`;
+it changes no tool, slot or run document.
+
+**Measured 2026-11-10** on `origin/main` at `41e6993` (useq-schema 0.9.2,
+Python 3.13.0, Panel 1.10.0, Bokeh 3.10.1), with throwaway scripts on `Profile.demo()`
+and on `smc.plugins.plate_registration.algorithm`, not committed:
+
+- **The cross exists.** `PlatePageView.stage_source` is a `cross` scatter that `tick`
+  sets from `PageStatus.xy_um` once a second (`status()` reads `Microscope.state()`;
+  0.7 ms on the demo). On a `nominal` map it is drawn at the stage's XY on a plate
+  whose A1 is at (0, 0): on the Ti2-E, 48.6 mm and 29.2 mm from where the Greiner
+  24-well's A1 lies (below), so it shows the stage and no well.
+- **Live already reads the position ten times a second.** With Live on, the frame
+  numbers over one second were 14 to 23, and every `Frame.xy_um` is the stage's
+  position read right after that frame's snap (`_snap_once`: `state()` after
+  `snap`). After `jog_xy(300, 0)` from (1000, 2000) during Live, `page.frame().xy_um`
+  and `page.status().xy_um` both read (1300.0, 2000.0). A cross that follows the
+  frames needs no device read of its own.
+- **Where the plate lies on the Ti2-E.** The centre of the plate's grid of wells
+  is a stage point, and a plate of equal pitches and round wells turned 180° lands
+  on itself, so the centre does not depend on which way round the plate lies. From
+  session 3's B3 (10 003, -10 051) µm, at its measured pitches of 19.49 and
+  19.43 mm and the plate turned (columns towards -X, rows towards +Y, #414): the
+  centre is (258, -336) µm. From session 2's B3 (10 267.7, -10 038.1) µm at
+  19.45 mm: (543, -313) µm. **Both lie within 0.55 mm of the stage's origin,
+  285 µm apart in X** (the plate was taken off and put back between them). Their
+  mean is (400, -325) µm to 5 µm.
+- **The Greiner plate centred there** (`greiner-24-well`, #400): A1 (-48 225,
+  28 850), B3 (-9 325, 9 400), B5 (29 575, 9 400), C3 (-9 325, -10 050) µm. Row D
+  (y = -29 500) is outside the Ti2-E's soft limits of ±29 000 µm: the map shows
+  wells the stage cannot reach, as `docs/plugins/plate-registration.md` says of a
+  96-well plate.
+- **The tolerances of the two tools that take positions by hand.** `plate-walls`
+  takes a rough position up to half the well's radius from the centre
+  (`search_um`: 3 900 µm on a 24-well, `docs/plugins/plate-walls.md`): ten times the
+  estimate's error. `plate-registration` takes centres and refuses a fit whose
+  worst residual is beyond `GOOD_RESIDUAL_UM` = 300 µm. Three synthetic centres
+  of the Greiner plate, each off by at most 130 µm: residual 121.6 µm, rotation
+  0.10°, A1 off by 49.6 µm. One centre 900 µm off in X and the other two exact:
+  residuals B3 572.8, B5 351.5, C3 247.2 µm, so the plugin refuses `B3 is 573 µm
+  from where the others put it: centre it again`. Three centres each about 290 µm
+  off (hand centring at the plugin's own limit) gave 300.5 µm, which the plugin
+  also refuses.
+- **A drive click on a map with no registered plate moves nothing**: the click on
+  B2 of the nominal 96-well map returned `B2`, `goto-well` ended `UpstreamError:
+  goto-well reads plate, but the run document has no plate`, and the stage stayed
+  at (0, 0).
+- **The lookup of a well under a point.** `WellGeometry(...).contains` built from
+  a `WellView`'s fields and tried on all 1536 wells of a 1536-well plate: 0.19 ms.
+- **`demo-sample`** centres its plate on the stage origin by construction
+  (`[sample] a1_center_xy_um` is `None`, `SampleSection`).
+
+### 15.1 Decisions
+
+**D1. The cross keeps its tick, and follows the frames while Live runs.**
+
+- `tick` keeps drawing the cross from `status().xy_um` once a second, as today.
+- While Live runs, `frame_tick` draws it from the new frame's `xy_um`, ten times a
+  second, and `tick` leaves it alone. A session holds `self._cross_from_frames:
+  bool`, false at the start. `frame_tick` sets it when it draws a frame whose
+  `xy_um` is not `None` with `page.is_live` true, and `tick` sets it false when
+  `page.is_live` is false, and draws the cross from the status in that case and
+  when the flag is false. A frame that carries no position (`xy_um` is `None`)
+  draws no cross and leaves the flag as it was.
+- It reads nothing the controller does not hold: `frame_tick` reads `page.frame()`
+  and `page.is_live` and never the status or the view (FM-145). A snap that is not
+  Live never moves the cross: its frame is old by the time it is drawn.
+- **A faster cross outside Live is not decided here.** It would need a read of the
+  stage alone, whose cost on the Ti2-E is not measured (#333 saw `state()` wait up to
+  0.5 s during Live there). The Report names the lag: one second.
+
+**D2. The estimate: the profile says where its holder puts the plate.**
+
+A new optional table of the profile:
+
+```toml
+[holder]
+plate_centre_xy_um = [400.0, -325.0]  # stage XY of the centre of a plate's grid of wells, seated in its holder
+measured = "2026-11-10, sessions 2 and 3 (#334, #405): the Greiner 24-well's centre was (543, -313) and (258, -336) um; their mean to 5 um"
+```
+
+- **It is one point for every plate the holder takes.** An SBS plate's grid is
+  centred on its footprint (assumed from the standard; measured for the Greiner
+  24-well only), so the point is the same for a 96-well and a 24-well, and for a
+  plate turned 180°. A plate of another footprint (a slide, a dish) is not an SBS
+  plate: the title says "estimated" and nothing more is claimed.
+- **A value needs its provenance**, as an objective's offset does (m2 §13.3):
+  `plate_centre_xy_um` without a non-blank `measured` is refused, naming both. The
+  value is two finite numbers within ±150 000 µm (a stage is not longer: a larger
+  value is a unit mistake), and a TOML boolean is refused (FM-104, #106).
+- **`profiles/nikon-ti2.toml`** gets the table above. **`profiles/demo-sample.toml`**
+  gets `plate_centre_xy_um = [0.0, 0.0]` with `measured = "by construction: the
+  sample's plate is centred on the stage origin (m1 §8)"`: the sample's wells are
+  where the estimate puts them, so a test of the estimate can be checked against
+  the camera's image. A `[sample]` that sets `a1_center_xy_um` makes that value
+  wrong, and the map still says "estimated". `demo.toml` and `nikon-tie.toml` get
+  no table: their plate is *unplaced* (D3).
+- **Why the profile and not the last registration.** The profile is read, reviewed
+  and versioned, and says where the number comes from. A remembered registration is
+  state outside the repository that goes stale without a word, one per plate and
+  stand. Writing the table from a registration (a command, as `smc objective offset
+  --write` does for `[objectives]`) is a follow-up, not here.
+- **An estimate is never a registration.** It fills no slot of the run document,
+  moves nothing and feeds no tool: it is drawn.
+
+**D3. Four poses.** The map is drawn in one of four states, and says which.
+
+| `MapPose.kind` | When (first that holds) | Where A1 is drawn | `PlateView.nominal` |
+|---|---|---|---|
+| `registered` | a usable `plate` slot names the page's plate, its `method` is `references`, `lattice-fit` or `wall-images` | the slot's A1 and rotation | false |
+| `seed` | the same, and `method` is `seed` | the slot's A1, rotation 0° | false |
+| `estimated` | no such slot, and the profile's `[holder] plate_centre_xy_um` is set | the holder's centre minus the grid's centre offset from A1 (the mean of `useq`'s well positions for the plate at the origin), rotation 0° | true |
+| `unplaced` | otherwise | (0, 0), rotation 0°, as today | true |
+
+`nominal` keeps its meaning for every user of it: nothing but the title read it,
+and `goto-well` still reads only the run document's slot.
+
+**D4. The title says which, in these words.** `guide.map_title(plate, pose)`:
+
+| Pose | Title (before `plan_title`'s suffix) |
+|---|---|
+| registered | `96-well: the registered plate` (as today) |
+| seed | `96-well: placed from one well (B3), not registered: the rotation is assumed 0°, not measured` |
+| estimated | `24-well: estimated from the stand's holder, not registered: centred at stage (400, -325) µm, not turned, A1 at the top left of this map` |
+| unplaced | `96-well: not registered, and this stand does not say where its plate lies: A1 is drawn at stage (0, 0), so the cross shows the stage and not a well` |
+
+The numbers are `round`ed to whole µm (`:.0f`). The `unplaced` text replaces
+`nominal map (A1 at 0, 0, not turned), the plate is not registered`, which the
+operator could not act on. A title is plain text, never markup (FM-139).
+
+**D5. The cross is labelled with the well it is over.** A `LabelSet` on
+`stage_source` (a `text` column), drawn beside the cross:
+
+```python
+def stage_label(
+    wells: Sequence[WellView],
+    pose: MapPose,
+    xy_um: tuple[float, float] | None,
+) -> str: ...
+```
+
+- `""` when `xy_um` is `None`, when the pose is `unplaced` (the cross is on no real
+  well), or when the point is on no well (`WellGeometry.contains`, built from the
+  view's `WellView`s: the one place that knows a well's shape).
+- Otherwise `over B3`, then `" (estimated)"` for an `estimated` pose and `" (rotation
+  assumed)"` for a `seed`; nothing after it for `registered`. The first well in the
+  view's order that contains the point wins; wells do not overlap.
+- Computed from the **last drawn view** (`PlatePageView._view`), by `tick` and by
+  `frame_tick`; it never asks for a new view (FM-145). `stage_source.data` is set
+  with `x`, `y` and `text` at once.
+
+**D6. A name read off an estimate is an assumption, so nothing acts on it.**
+The estimate puts A1 at the top left of the map and does not know how the plate
+lies in the holder. A plate turned 180° swaps every name with the same wells at the
+same places (row r becomes R-1-r, column c becomes C-1-c: B3 is C4, #422), and no
+residual shows it. So:
+
+- **No capture takes its well from the cross.** *Capture centre of B3* still records
+  the well the operator clicked (§11.1); the cross says where the stage is, the
+  operator says which well it is.
+- **Drive stays a registered plate's.** A drive click on an estimated map moves
+  nothing (measured above), as on every map with no usable `plate`.
+- The title says "A1 at the top left of this map" and the label "(estimated)": the
+  operator can compare with the A1 printed on the plate. The choice of orientation
+  is #422's, which will place the estimate by it.
+
+**D7. The registration from one position in each of three wells needs no new tool.**
+`plate-registration` already fits any number of centres from two up: three of them
+fit the plate and check each other (a rotation and a translation from six
+numbers), and refuse a centre that is far from where the others put it. The page
+already records one centre per well (*Capture centre*, §11.1, §12.5) and runs the
+tool. What the plan adds is proof on the lab's plate (the tests named in #410's
+plan) and the page's words. What is *not* new, and the owner should know:
+
+- **By eye is only as good as the eye.** `plate-registration` needs centres good to
+  a few hundred µm, which an operator cannot judge in the middle of a 15.6 mm well at
+  the 10× (the field is about 1.4 mm). The tool that takes a rough position and
+  measures is `plate-walls`, whose rough position may be 3.9 mm off: that is the
+  path the page offers first when two or more centres are captured (§12.4). Whether
+  it registers the Greiner plate from one rough position in each of three wells is
+  **verified at Ti2-E session 4** (#404's criterion, with the time it takes).
+- **`CAPTURE_WELLS` says three.** It becomes `centre a well under the objective
+  (Live and the Drive pad), click it on the map and press Capture centre; three
+  wells far apart fit the plate and check each other` (`guide.py`; its test's
+  literal changes with it).
+
+**D8. Not here.**
+
+- Registering from the estimate itself (the plate "where the holder puts it", with
+  its error said) so that a few wells can be scanned at once. It needs a decision
+  about `PlateResult.method` (a slot model m3 §3.2 fixes), `scan`'s refusal of an
+  unmeasured plate, and what `assumed` says: a design of its own, the owner's call.
+- The plate's orientation (#422): the choice, the names it changes, the map's
+  back and front. The estimate assumes "not turned" until then.
+- Writing `[holder]` from a registration; a holder per plate type; the cross
+  faster than a second outside Live (D1); a click on the estimated map that
+  records a position.
+
+### 15.2 The interface
+
+```python
+#: smc/hardware/profile.py
+MAX_HOLDER_CENTRE_UM = 150_000.0
+
+
+class HolderSection(_Section):
+    plate_centre_xy_um: tuple[float, float] | None = None
+    measured: str = ""
+```
+
+`Profile` gains `holder: HolderSection = Field(default_factory=HolderSection)`, after
+`objectives`. The validators are the ones of `ObjectiveOffsetEntry.xy_offset_um`
+(two numbers, no boolean, finite, bounded by `MAX_HOLDER_CENTRE_UM`) and the
+provenance check of its `_a_value_needs_its_provenance`.
+
+```python
+#: smc/ui/controller.py
+PoseKind = Literal["registered", "seed", "estimated", "unplaced"]
+
+
+@dataclass(frozen=True, slots=True)
+class MapPose:
+    kind: PoseKind
+    holder_centre_um: tuple[float, float] | None = None  # "estimated" only
+    seed_well: str = ""  # "seed" only: the one reference well
+```
+
+`PlateView` gains `pose: MapPose = field(default_factory=lambda: MapPose("unplaced"))`
+as its **last** field. `PlatePage._registered_geometries(registered)` returns
+`(geometries, pose)` where it returned `(geometries, nominal)`; `view()` sets
+`nominal=pose.kind in ("estimated", "unplaced")` and `pose=pose`; `click` ignores it
+as it ignores `nominal` today. The geometry's cache key stays `(plate, a1,
+rotation)`, with the estimate's A1.
+
+```python
+#: smc/ui/guide.py (pure; MapPose and WellView are imported for typing only)
+def map_title(plate: str, pose: MapPose) -> str: ...
+def stage_label(
+    wells: Sequence[WellView], pose: MapPose, xy_um: tuple[float, float] | None
+) -> str: ...
+```
+
+`PlatePageView` gains `self._cross_from_frames`, the `LabelSet` on `stage_source`, a
+private `_draw_cross(xy_um)` that sets `stage_source.data` (`x`, `y`, `text`),
+`tick` and `frame_tick` as D1 says, and `_draw_wells` sets the title from
+`map_title(view.plate, view.pose)` followed by `plan_title(view.plan)`.
+
+### 15.3 Tests and failure modes
+
+Named in #410's plan. **Failure modes**: FM-73 (the estimate's tests use a plate
+whose grid is not square, the 96-well, beside the symmetric Greiner plate, so that
+swapped axes or a sign flip show), FM-104 (a boolean where a number is expected),
+FM-125 (a profile value taken as it comes), FM-139 (plain text), FM-145 (the label
+is drawn from the last view; the tick never rebuilds it), FM-151 (a second tab
+draws the same pose and the same cross), FM-170 (an unknown says what is unknown:
+the `unplaced` title), FM-198 (the `unplaced` pose is a state, never written
+anywhere: no preset, record or file holds it), FM-162 (the browser walk names what
+it did not reach). A new entry of the checklist, named by its text when the develop
+session writes it: *an estimate drawn like a measurement* (a map that places a plate
+from an assumption and labels wells by it must say on its face which of measured,
+seeded, estimated or unplaced it is, because a name read off it is trusted; a test
+for each state).
+
+**Not verified (for the owner)**:
+
+- The estimate against the plate on the Ti2-E: the Greiner plate put in its holder
+  (either way round) and the page's cross over a well it is physically over. The
+  value of `[holder]` is the mean of two sessions 285 µm apart; a plate put back
+  moved by that much.
+- The label's names against the printed plate: with the plate turned 180° the page
+  says `over B3` where the plate's own label is C4 (D6, #422).
+- The cross at the PC's screen and zoom, and its lag at the stand: a second outside
+  Live, a tenth of a second in Live (the frame's own read; `state()` on the Ti2-E
+  was seen to take up to 0.5 s during Live, #333).
+- `plate-walls` from one rough position in each of three wells on the Greiner plate,
+  and the time it takes (D7).
