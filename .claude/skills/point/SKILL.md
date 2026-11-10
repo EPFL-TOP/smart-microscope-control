@@ -48,28 +48,46 @@ The session ends when the list is posted.
 7. **Output.** Post the list as a comment on the open issue titled
    `Point: next steps` (create and pin it if missing; one comment per point,
    in English), then give the owner the same list in their language, at most
-   about fifteen lines. It leads with **Today**: a numbered sequence that the
-   owner can follow without judgement. **A red `main`, or an open `CI nightly
-   red` issue, is step 0**, above everything: no other PR is merged until the
-   owner has chosen to revert or to fix forward (ADR-0009). Name the run or
-   the issue, the tests it names, and the command that fixes it (a `/develop`
-   or a revert), and put every merge of the day after it. Each step says what to launch
-   (command and model), what it waits for (a posted plan, a merge), and what
-   to merge. A step runs at most three sessions in parallel. Follow every
-   issue of the day from its plan to its merge: `/plan` → merge the design
-   PR, if there is one → `/develop` (if its **Depends on** is merged) →
-   `/review` → merge. A plan with no develop step after it is an
-   incomplete sequence. Two issues that touch the same module go in
-   different steps.
+   about twenty lines. **A red `main`, or an open `CI nightly red` issue, is
+   step 0**, above everything: no other PR is merged until the owner has
+   chosen to revert or to fix forward (ADR-0009). Name the run or the issue,
+   the tests it names, and the command that fixes it (a `/develop` or a
+   revert), and put every merge of the day after it.
+
+   The list is written as **lanes**: up to three lanes run in parallel
+   (`S1`, `S2`, `S3`), one session at a time inside a lane, so the owner
+   opens at most three sessions and never has to judge what may run with
+   what. A lane holds the issues that share files (the plans' **Do not run
+   at the same time** lines decide), in priority order; issues on disjoint
+   files go in different lanes. Each lane is a numbered sequence of steps
+   (`S1.1`, `S1.2`, ...), and **each step is one session or one merge**, with
+   its command, its model and what it waits for. Every issue is followed
+   from its plan to its merge inside its lane: `/plan n` → merge the design
+   PR, if there is one → `/develop n` (if its **Depends on** is merged) →
+   `/review <pr>` → merge; a `/feature n` replaces the plan and the develop
+   for a small issue. A plan with no develop step after it is an incomplete
+   lane. A step that waits for another lane names it (`after S2.3`). A
+   session the owner runs at the stand (`/hardware-session`, `during`) is a
+   lane of its own. The last step of the day is a fresh `/point`.
 
    ```markdown
-   **Today**, in this order:
+   **Today**
    0. Only when the CI stops the merges: main is red (run <url>) or #N `CI nightly red` is open: revert or `/develop <n>` for the fix, before any merge.
-   1. Now, in parallel: `/plan 144` (Opus) · `/plan 101` (Opus) · `/plan 132` (Sonnet). Merge #145.
-   2. As each plan is posted: merge its design PR, then `/develop <n>` with the plan's model, unless its **Depends on** is still open.
-   3. As each develop session opens its PR: `/review <pr>` (Opus if moves-hardware, else Sonnet), then merge on "ready to merge"; on "changes requested", `/develop <n>` again (fix round).
-   4. Once #144's design PR is merged: `/plan 12` (Opus), then step 2 for it.
-   5. End of the day: a fresh `/point`.
+
+   **S1 — the plate definitions (#400), then the scan plan (#21)**
+   S1.1 `/plan 400` (Opus) → merge its design PR
+   S1.2 `/develop 400` (the plan's model) → `/review <pr>` (Sonnet) → merge
+   S1.3 `/plan 21` (Sonnet) → merge its design PR → `/develop 21` → `/review` (Opus: moves-hardware) → merge
+
+   **S2 — the profile (#401)**
+   S2.1 `/feature 401` (Sonnet) → `/review <pr>` (Sonnet) → merge
+
+   **S3 — the decision (#402), then the stand**
+   S3.1 `/plan 402` (Opus): its design PR ends with the decision; merge it
+   S3.2 after S1.2 and S2.1: `/hardware-session nikon-ti2 before` (Opus)
+   S3.3 tomorrow at the stand: `/hardware-session nikon-ti2 during` (Opus); back: `... after`, then `/point`
+
+   **End of the day**: `/point`.
    **For you** — decisions and hardware that today's steps do not wait for
    **Waiting** — #26, on #25
    **Process** — the develop skill now asks for …
