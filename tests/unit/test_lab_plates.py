@@ -145,6 +145,68 @@ def test_a_lab_plate_is_seen_by_useq_from_a_fresh_import(module: str) -> None:
     assert "(19.45, 19.45) True" in done.stdout, done.stderr
 
 
+def test_a_bad_plates_file_fails_the_import_of_smc_naming_the_file_and_the_plate() -> (
+    None
+):
+    """A plate whose numbers are wrong must not be used silently: the import itself fails.
+
+    The packaged file is replaced, in a fresh interpreter, before ``smc`` is
+    imported; a registration whose error was swallowed would print ``imported``.
+    """
+    bad = _text(name="greiner-24-well", rows="rows = 0")
+    code = (
+        "import importlib.resources\n"
+        "class _File:\n"
+        "    def joinpath(self, name):\n"
+        "        return self\n"
+        "    def read_text(self, encoding=None):\n"
+        f"        return {bad!r}\n"
+        "importlib.resources.files = lambda package: _File()\n"
+        "import smc\n"
+        "print('imported')\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=120,
+        check=False,
+    )
+
+    assert done.returncode != 0, done.stdout
+    assert "imported" not in done.stdout
+    assert "plates.toml: plate 'greiner-24-well': rows:" in done.stderr, done.stderr
+
+
+def test_useq_gets_each_axis_and_the_well_shape_as_filed(
+    monkeypatch: pytest.MonkeyPatch, registry: dict[str, object]
+) -> None:
+    """FM-73: a pitch or a well that differs by axis reaches ``useq`` unswapped, square wells square."""
+    monkeypatch.setattr(
+        plates,
+        "load_lab_plates",
+        lambda text=None: {
+            "test-anisotropic-15-well": _plate(
+                rows=3,
+                columns=5,
+                well_spacing_mm=(19.45, 19.0),
+                well_size_mm=(15.6, 15.0),
+                circular_wells=False,
+            )
+        },
+    )
+    monkeypatch.setattr(plates, "_registered", None)
+
+    plates.register_lab_plates()
+    plate = useq.WellPlate.from_str("test-anisotropic-15-well")
+
+    assert (plate.rows, plate.columns) == (3, 5)
+    assert plate.well_spacing == (19.45, 19.0)
+    assert plate.well_size == (15.6, 15.0)
+    assert plate.circular_wells is False
+
+
 def test_registering_twice_is_a_no_op_that_returns_the_same_names(
     monkeypatch: pytest.MonkeyPatch, registry: dict[str, object]
 ) -> None:
@@ -167,7 +229,7 @@ def test_registering_twice_is_a_no_op_that_returns_the_same_names(
 
 def test_the_registered_plate_is_useqs_with_the_name_as_its_key() -> None:
     """``useq`` gets the geometry only: the key stays the plate's name, not the description."""
-    assert plates.register_lab_plates() == ("greiner-24-well",)
+    assert plates.register_lab_plates() == tuple(sorted(PUBLISHED))
 
     plate = useq.WellPlate.from_str("greiner-24-well")
 
@@ -241,6 +303,42 @@ def test_the_template_of_the_bad_definitions_is_itself_valid() -> None:
             "test-24-well",
             "below the spacing",
         ),
+        (_text(name="test-24-well-2"), "test-24-well-2", "must end in '-well'"),
+        (
+            _text(well_spacing_mm="well_spacing_mm = [inf, 19.45]"),
+            "test-24-well",
+            "finite",
+        ),
+        (_text(rows="rows = 0"), "test-24-well", "rows: Input should be greater"),
+        (_text(rows="rows = 65"), "test-24-well", "rows: Input should be less"),
+        (
+            _text(columns="columns = 0"),
+            "test-24-well",
+            "columns: Input should be greater",
+        ),
+        (
+            _text(columns="columns = 97"),
+            "test-24-well",
+            "columns: Input should be less",
+        ),
+        (
+            _text(well_size_mm="well_size_mm = [19.45, 19.45]"),
+            "test-24-well",
+            "below the spacing",
+        ),
+        (
+            _text(
+                well_spacing_source='well_spacing_source = { kind = "measured", note = "" }'
+            ),
+            "test-24-well",
+            "well_spacing_source.note",
+        ),
+        (_text(rows='rows = "4"'), "test-24-well", "rows: Input should be a valid"),
+        (
+            _text(circular_wells="circular_wells = 1"),
+            "test-24-well",
+            "circular_wells: Input should be a valid",
+        ),
     ],
     ids=[
         "no-well-suffix",
@@ -251,6 +349,16 @@ def test_the_template_of_the_bad_definitions_is_itself_valid() -> None:
         "zero-spacing",
         "nan-spacing",
         "well-wider-than-pitch",
+        "text-after-well",
+        "inf-spacing",
+        "no-rows",
+        "too-many-rows",
+        "no-columns",
+        "too-many-columns",
+        "well-as-wide-as-pitch",
+        "empty-note",
+        "rows-as-text",
+        "circular-as-number",
     ],
 )
 def test_a_bad_definition_names_the_file_and_the_plate(
