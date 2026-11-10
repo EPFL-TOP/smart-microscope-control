@@ -33,8 +33,8 @@ dependencies = [
   # Phase correlation for camera calibration (m3 §4); a core dependency so the built-in plugin always loads.
   "scikit-image>=0.22",
   "pydantic>=2.7",
-  # typer 0.29 rewrites the validation and help text the CLI tests assert on and no longer
-  # brings `click`; the suite is written against 0.27. Moving to 0.29 is #398.
+  # typer 0.29 rewrites the usage-error and help text that two CLI tests assert on; the
+  # suite is written against 0.27 to 0.28. Moving to 0.29 is #398.
   "typer>=0.12,<0.29",
   "rich>=13",
   # Serial ports with their USB IDs for `smc discover` (the survey of a PC).
