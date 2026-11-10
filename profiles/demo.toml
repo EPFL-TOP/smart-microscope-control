@@ -28,6 +28,7 @@ turret_requires_confirm = true
 # stop_refused_by = []  # roles whose device refuses stop(): "xy_stage", "focus", "autofocus_offset"; measured at a stand (m2 §11)
 # max_engage_excursion_um = 50.0  # how far Z may move while the autofocus engages, beyond where it starts or held; omitted: only z_soft_limits_um bound it (m2 §12)
 # z_away_from_sample = "decreasing"  # which way Z moves away from the sample, "decreasing" or "increasing"; seen at the stand, never guessed (m2 §12.10, #98)
+# first_lock_max_rise_um = 5.0  # how far Z may move toward the sample during a first lock from the floor; omitted: max_engage_excursion_um (m2 §12.11)
 
 [autofocus]
 # The demo's DAutoFocus measures nothing, so every key is left unknown.

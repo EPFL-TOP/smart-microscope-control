@@ -699,13 +699,15 @@ FLOOR_PLANE = Z0 + (FLOOR - SEEN_OFFSET) / 6.0
 UNIT = " PFSOffset units"
 TOWARD = (
     "autofocus PFS: Z went from {z_start:.2f} µm to {z_um:.2f} µm while it engaged "
-    "from the offset's floor, more than [safety] max_engage_excursion_um (50 µm) "
-    "toward the sample; it was switched off. The floor's plane is not below where Z "
-    "started: focus on the sample by eye before a first lock; if Z was already "
-    "there, the floor is not below this objective's focus (m2 §12.10), so do not "
-    "try a first lock with it again. The guard reads Z every 10 ms: it stops PFS "
-    "once a jump is read, it does not prevent one"
+    "from the offset's floor, more than [safety] {bound} toward the sample; it was "
+    "switched off. The floor's plane is not below where Z started: focus on the "
+    "sample by eye before a first lock; if Z was already there, the floor's plane "
+    "lies above the focus at this place (m2 §12.11), and no offset smc may set names "
+    "a lower one: do not engage PFS here with this objective. The guard reads Z "
+    "every 10 ms: it stops PFS once a jump is read, it does not prevent one"
 )
+E_BOUND = "max_engage_excursion_um (50 µm)"
+R_BOUND = "first_lock_max_rise_um (5 µm)"
 
 
 def _first_lock(*, declared: bool = True, **safety: Any) -> Profile:
@@ -796,7 +798,9 @@ def test_a_first_lock_whose_plane_is_toward_the_sample_trips_and_says_so() -> No
         _jumps_to(stand, Z0 + 60.0)
         with pytest.raises(AutofocusExcursionError) as jumped:
             stand.af.engage()
-        assert str(jumped.value) == TOWARD.format(z_start=Z0, z_um=Z0 + 60.0)
+        assert str(jumped.value) == TOWARD.format(
+            z_start=Z0, z_um=Z0 + 60.0, bound=E_BOUND
+        )
         assert (jumped.value.z_start_um, jumped.value.z_um) == (Z0, Z0 + 60.0)
         assert stand.core.log == [ON, OFF]
         assert stand.af.is_engaged() is False
@@ -951,7 +955,9 @@ def test_an_increasing_stand_mirrors_the_first_lock_band() -> None:
         _jumps_to(stand, 2940.0)
         with pytest.raises(AutofocusExcursionError) as jumped:
             stand.af.engage()
-        assert str(jumped.value) == TOWARD.format(z_start=3000.0, z_um=2940.0)
+        assert str(jumped.value) == TOWARD.format(
+            z_start=3000.0, z_um=2940.0, bound=E_BOUND
+        )
         assert stand.core.log == [ON, OFF]
 
 
@@ -995,3 +1001,221 @@ def test_z_outside_the_soft_limits_is_refused_before_the_first_lock_check() -> N
             "[10, 4350] µm"
         )
         assert stand.core.log == []
+
+
+# --- D8, D9, D10: a first lock whose floor lies above the focus (m2 §12.11) ---------
+#
+# F11 (#402): at the 40x, the floor locked 46.9 µm below the focus in one well
+# and named a plane at least 56.8 µm above it in the next.
+
+RISE = {"first_lock_max_rise_um": 5.0}
+
+
+def test_a_first_lock_that_rises_more_than_first_lock_max_rise_um_trips_and_names_it() -> (
+    None
+):
+    # Measured on main caaa60e: without R, the same +8 µm locks and returns True.
+    with _stand(_first_lock(**RISE), offset=FLOOR) as stand:
+        _jumps_to(stand, Z0 + 8.0)
+        with pytest.raises(AutofocusExcursionError) as jumped:
+            stand.af.engage()
+        assert str(jumped.value) == TOWARD.format(
+            z_start=Z0, z_um=Z0 + 8.0, bound=R_BOUND
+        )
+        assert (jumped.value.z_start_um, jumped.value.z_um) == (Z0, Z0 + 8.0)
+        assert stand.core.log == [ON, OFF]
+        assert stand.af.is_engaged() is False
+
+
+def test_a_first_lock_that_rises_less_than_first_lock_max_rise_um_locks() -> None:
+    with _stand(_first_lock(**RISE), offset=FLOOR) as stand:
+        _jumps_to(stand, Z0 + 3.0)
+        assert stand.af.engage() is True
+        assert stand.z.position_um() == Z0 + 3.0
+        assert stand.core.log == [ON]
+
+
+def test_a_first_lock_without_first_lock_max_rise_um_keeps_e_toward_the_sample() -> (
+    None
+):
+    with _stand(_first_lock(), offset=FLOOR) as stand:
+        _jumps_to(stand, Z0 + 8.0)
+        assert stand.af.engage() is True
+        assert stand.core.log == [ON]
+
+
+def test_the_first_lock_info_line_names_the_rise_bound_in_force(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with _stand(_first_lock(**RISE), offset=FLOOR) as stand:
+        _plane_follows_the_offset(stand)
+        with caplog.at_level(logging.INFO, logger="smc.hardware.backends.mm"):
+            assert stand.af.engage() is True
+        assert (
+            "autofocus PFS: a first lock from the offset's floor (5000 PFSOffset "
+            "units, m2 §12.10): Z may move away from the sample, and at most 5 µm "
+            "toward it"
+        ) in caplog.messages
+
+
+def _floor_seen_then_back_at_z0(stand: Stand, caplog: pytest.LogCaptureFixture) -> None:
+    """A first lock at the floor that locks (one well), then PFS off and Z back at Z0."""
+    _plane_follows_the_offset(stand)
+    assert stand.af.engage() is True  # the floor is now seen
+    stand.af.disengage()
+    stand.core.setPosition("ZDrive", Z0)
+    stand.core.log.clear()
+    caplog.clear()
+
+
+def test_an_engage_at_a_floor_seen_locked_elsewhere_is_a_first_lock_again(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Measured on main: without D9, this second engage, a seen offset under
+    # D2's symmetric band, returns True at Z0 + 40 with no word.
+    with _stand(_first_lock(**RISE), offset=FLOOR) as stand:
+        _floor_seen_then_back_at_z0(stand, caplog)
+        _jumps_to(stand, Z0 + 40.0)
+        with (
+            caplog.at_level(logging.INFO, logger="smc.hardware.backends.mm"),
+            pytest.raises(AutofocusExcursionError) as jumped,
+        ):
+            stand.af.engage()
+        assert str(jumped.value) == TOWARD.format(
+            z_start=Z0, z_um=Z0 + 40.0, bound=R_BOUND
+        )
+        assert stand.core.log == [ON, OFF]
+        assert any("a first lock from the offset's floor" in m for m in caplog.messages)
+        assert stand.af.is_engaged() is False
+        # The trip forgot the floor (D9: "one that trips forgets it"): searching
+        # there now, it is unseen, so refused and switched off, not D1's engage.
+        stand.engage_directly(lockable=False)
+        with pytest.raises(SafetyRefusedError) as refused:
+            stand.af.engage()
+        assert str(refused.value) == _unseen_at(switched=SWITCHED, advice=FROM_BELOW)
+        assert stand.core.log == [OFF]
+
+
+def test_a_state_read_that_fails_at_a_seen_floor_engages_nothing(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Counted as on, it would take D1's band (±E) at a seen floor and lock 40 µm
+    # toward the sample (adversarial review of #402): a read that decides the
+    # band refuses with nothing sent, as an offset move's does (FM-19).
+    with _stand(_first_lock(**RISE), offset=FLOOR) as stand:
+        _floor_seen_then_back_at_z0(stand, caplog)
+        _jumps_to(stand, Z0 + 40.0)
+        autofocus = stand.af
+        real = autofocus._read_engaged  # type: ignore[attr-defined]
+        reads: list[str] = []
+
+        def fails_once() -> bool:
+            reads.append("engaged")
+            if len(reads) == 1:
+                raise RuntimeError("no answer")
+            return bool(real())
+
+        monkeypatch.setattr(autofocus, "_read_engaged", fails_once)
+        with pytest.raises(SafetyRefusedError) as refused:
+            autofocus.engage()
+        assert str(refused.value) == (
+            "autofocus PFS: not engaged: its state could not be read (no answer); at "
+            "the offset's floor (5000 PFSOffset units), whether it is off decides how "
+            "far Z may move toward the sample (m2 §12.11 D9), so nothing was sent"
+        )
+        assert refused.value.how_to_force == ""
+        assert stand.core.log == []
+        assert stand.z.position_um() == Z0
+        assert reads == ["engaged"]
+
+
+def test_a_state_read_that_fails_at_an_unseen_floor_is_counted_as_on_and_refused(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # As before #402: unknown counts as on (FM-19), so it is switched off and
+    # refused; the state is read once, and the refusal reuses it.
+    with _stand(_first_lock(**RISE), offset=FLOOR) as stand:
+        autofocus = stand.af
+        reads: list[str] = []
+
+        def fails() -> bool:
+            reads.append("engaged")
+            raise RuntimeError("no answer")
+
+        monkeypatch.setattr(autofocus, "_read_engaged", fails)
+        with (
+            caplog.at_level(logging.DEBUG, logger="smc.hardware.backends.mm"),
+            pytest.raises(SafetyRefusedError) as refused,
+        ):
+            autofocus.engage()
+        assert str(refused.value) == _unseen_at(switched=SWITCHED, advice=FROM_BELOW)
+        assert stand.core.log == [OFF]
+        assert reads == ["engaged"]
+        assert (
+            "autofocus PFS: its state could not be read (no answer); counted as on"
+        ) in caplog.messages
+
+
+def test_an_increasing_stand_bounds_a_first_locks_rise_by_first_lock_max_rise_um() -> (
+    None
+):
+    profile = _first_lock(z_away_from_sample="increasing", **RISE)
+    # 8 µm below Z: toward the sample on this stand, inside E, beyond R.
+    with _stand(profile, offset=FLOOR, z_um=3000.0) as stand:
+        _jumps_to(stand, 2992.0)
+        with pytest.raises(AutofocusExcursionError) as jumped:
+            stand.af.engage()
+        assert str(jumped.value) == TOWARD.format(
+            z_start=3000.0, z_um=2992.0, bound=R_BOUND
+        )
+        assert stand.core.log == [ON, OFF]
+
+
+def test_a_seen_floor_whose_plane_lies_far_below_engages_as_a_first_lock(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Without D9, D2's symmetric band trips at Z0 - 50.
+    with _stand(_first_lock(**RISE), offset=FLOOR) as stand:
+        _floor_seen_then_back_at_z0(stand, caplog)
+        _jumps_to(stand, Z0 - 80.0)
+        assert stand.af.engage() is True
+        assert stand.z.position_um() == Z0 - 80.0
+        assert stand.core.log == [ON]
+
+
+def test_a_seen_floor_with_the_autofocus_locked_is_engaged_as_a_seen_offset(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # D9 needs the autofocus off: locked, Z already sits where PFS holds it.
+    with _stand(_first_lock(**RISE), offset=FLOOR) as stand:
+        _plane_follows_the_offset(stand)
+        assert stand.af.engage() is True
+        stand.core.log.clear()
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="smc.hardware.backends.mm"):
+            assert stand.af.engage() is True
+        assert stand.core.log == [ON]
+        assert "autofocus: engage" in caplog.messages
+        assert not any(
+            "a first lock from the offset's floor" in m for m in caplog.messages
+        )
+
+
+def test_a_relock_at_a_seen_floor_is_not_a_first_lock() -> None:
+    # D9 is engage()'s only: a relock brings Z back to where PFS held it, so
+    # its band is D2's, widened to there, and a jump beyond it trips as before.
+    with _stand(_first_lock(**RISE), offset=FLOOR) as stand:
+        _plane_follows_the_offset(stand)
+        assert stand.af.engage() is True
+        stand.core.log.clear()
+        # 3 µm down, the relock comes back 8 µm above where PFS held Z: inside
+        # D2's band (E 50), beyond R. As a first lock it would trip.
+        _relock_drives_to(stand, FLOOR_PLANE + 8.0)
+        assert stand.z.move_by_um(-3.0) == FLOOR_PLANE - 3.0
+        assert stand.core.log == [
+            OFF,
+            f"setPosition('ZDrive', {FLOOR_PLANE - 3.0})",
+            ON,
+        ]
+        assert stand.z.position_um() == FLOOR_PLANE + 8.0
+        assert stand.af.is_locked() is True

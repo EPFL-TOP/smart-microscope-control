@@ -222,6 +222,9 @@ class SafetySection(_Section):
     #: Which way Z moves away from the sample, seen at the stand, never guessed
     #: (#98); ``None``: unknown, and no first lock from below runs (m2 §12.10).
     z_away_from_sample: Literal["decreasing", "increasing"] | None = None
+    #: How far Z may move toward the sample during a first lock from the floor;
+    #: None: max_engage_excursion_um (m2 §12.11 D8)
+    first_lock_max_rise_um: float | None = None
 
     @field_validator("stop_refused_by", mode="before")
     @classmethod
@@ -295,6 +298,35 @@ class SafetySection(_Section):
                 f"got {value}"
             )
         return value
+
+    @field_validator("first_lock_max_rise_um", mode="before")
+    @classmethod
+    def _first_lock_rise_not_boolean(cls, value: Any) -> Any:
+        return _no_boolean("first_lock_max_rise_um", value)
+
+    @field_validator("first_lock_max_rise_um")
+    @classmethod
+    def _first_lock_rise_positive_finite(cls, value: float | None) -> float | None:
+        # As for E: an infinite bound is not "no bound".
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            raise ValueError(
+                f"first_lock_max_rise_um must be a positive, finite number of µm, "
+                f"got {value}"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _first_lock_rise_not_above_the_excursion(self) -> SafetySection:
+        # A first lock asks for a drop, so any rise is its premise failing
+        # (m2 §12.11 D8): a bound looser than a seen offset's is a mistake.
+        rise, excursion = self.first_lock_max_rise_um, self.max_engage_excursion_um
+        if rise is not None and excursion is not None and rise > excursion:
+            raise ValueError(
+                f"first_lock_max_rise_um ({rise:g} µm) must not be above "
+                f"max_engage_excursion_um ({excursion:g} µm): a first lock bounded "
+                f"more loosely than an engage at a seen offset (m2 §12.11 D8)"
+            )
+        return self
 
     @field_validator("max_jog_um")
     @classmethod
