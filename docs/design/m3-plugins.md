@@ -6696,10 +6696,13 @@ prototype of §22.3 in the design session's scratchpad:
 - Session 3's hand centres, B3 (10 003, -10 051), B5 (-28 982, -9 919), C3
   (10 031, 9 375) µm: under `24-well`, refused at +2.4 %; under a plate at
   19.45 mm, the scale passes (+0.07 %) but the fit turns the plate by
-  179.8° and `max_rotation_deg` refuses it. The Ti2-E runs the plate's
-  columns towards −X and its rows towards +Y, `useq` the other way on both
-  axes: a turn of 180°. That is **#414**, not this section. The same centres
-  turned 180° about the origin fit at −0.21°, **residual 44.5 µm**.
+  179.8° and `max_rotation_deg` refuses it. The plate lay **turned 180° in
+  its holder** (owner, 2026-11-10: row A at the front, by the operator, and
+  row D at the back), so its columns ran towards −X and its rows towards +Y.
+  Put the right way, they run as `useq`'s (+X, −Y): no orientation of the
+  stand is needed. That the refusal blames a misnamed well rather than a
+  turned plate is **#414**. The same centres turned 180° about the origin fit
+  at −0.21°, **residual 44.5 µm**.
 - Synthetic centres of A1, A6 and D1 at 19.45 mm, turned 0.3°: residual 0
   under the new plate, refused at +2.4 % under `24-well`.
 - The plate-related suites (plate-finding, -registration, -walls, presets,
@@ -6821,15 +6824,16 @@ def register_lab_plates() -> tuple[str, ...]: ...
 
 ### 22.5 Not here
 
-- The plate's orientation on the Ti2-E's stage (180°): #414.
+- A refusal that names a plate turned 180° in its holder: #414.
 - A stand-local plate file, a CLI to list plates, a page view of a plate's
   provenance.
 - Changing `SCALE_TOLERANCE`: the guard is right; the definition was wrong.
 
 ### 22.6 Not verified (for the owner)
 
-- `plate-walls` at the Ti2-E with `plate=greiner-24-well`, after #414's
-  decision (or with the plate turned 180° in its holder): the residual, and
-  `goto-well` to a fourth well within 100 µm of its centre (§17.7).
+- `plate-walls` at the Ti2-E with `plate=greiner-24-well`, the plate the
+  right way in its holder (A1 at the back left, inferred from §22.1): the
+  columns run towards +X, the residual, and `goto-well` to a fourth well
+  within 100 µm of its centre (§17.7).
 - The maker's datasheet: the Greiner reference, read from the plate; its
   pitch against 19.45 mm. A different pitch is a new name (D5).
