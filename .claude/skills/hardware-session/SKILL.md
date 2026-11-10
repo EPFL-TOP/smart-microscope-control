@@ -3,7 +3,7 @@ name: hardware-session
 description: Prepare a session at a real microscope (pre-flight checklist, exact commands, safety) and afterwards turn the raw log into a Hardware session report issue plus follow-up issues, tests and profile entries. Use before and after any visit to a stand.
 ---
 
-# /hardware-session <microscope> [before|after]
+# /hardware-session <microscope> [before|during|after]
 
 Hardware is only ever driven by a **human present at the stand**. From a
 development machine you prepare and you write up; you never run
@@ -53,6 +53,38 @@ Produce a one-page checklist for the operator:
     if Z moved: switch the autofocus off with the stand's button, then
     write down both values. The jump went unnoticed in Ti2-E sessions 1
     and 2 (+235 µm, +206.6 µm; #205, #331).
+
+## During
+
+A session that sits beside the operator at the stand (on a laptop, never on
+the stand's PC) and walks the checklist with them. Used for the first time at
+Ti2-E session 3 (2026-11-10): it caught in the moment what sessions 1 and 2
+had missed (a Z read against the by-eye focus right after a PFS switch-on,
+an objective not seated, a plate whose pitch is not useq's).
+
+1. **The operator types; the session reads.** It never runs a command that
+   reaches the stand, never widens a bound, never works around a refusal of
+   the layer, and never decides a profile key outside the checklist's own
+   procedure.
+2. Read the checklist and the notes on the session issue (`gh issue view N
+   --comments`) and `docs/hardware/<stand>.md` first. For each step: the
+   exact command, the expected result, the safety reads it needs (Z against
+   the by-eye focus, the soft limits, the objective in place, the PFS offset
+   after a turn: the Ti2-E restores one per objective). Check what the
+   operator pastes against them and say **go** or **stop** before the next
+   step.
+3. On a blocking finding: record it with the raw lines, give the
+   checklist's fallback if it has one, and move on; what has no fallback is
+   left for the write-up, not improvised.
+4. Keep `local/surveys/<stand>/session<N>/notes.md` as a running log (step,
+   time, command, outcome, finding `F<n>`), remind the operator to save each
+   console into `terminal<k>.log` before it is closed, and name every file
+   the operator saves (run documents, frames, Z-stacks) with its path.
+5. At the end, write a **Summary for `/hardware-session <stand> after`** at
+   the bottom of the notes: done, not done, the findings in order, what the
+   findings unblock offline and what needs the stand again. File only the
+   issues the owner asks for that evening (p0, the next visit's critical
+   path), named in the notes so that the write-up does not file them twice.
 
 ## After
 

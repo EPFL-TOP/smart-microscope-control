@@ -141,9 +141,10 @@ them if it is not the one you run on.
     background**, never with `gh pr checks --watch` or `gh run watch` (each
     refresh reprints the whole job tree, about 60 KB for one wait, #353):
     `gh pr checks N` once to get the run id, then one Bash call with
-    `run_in_background` that loops `until` `gh run view <id> --json status
-    --jq .status` prints `completed`, sleeping 60 s between reads, and read
-    `gh pr checks N` when it returns. **The
+    `run_in_background`: `python scripts/dev/wait_for_run.py <id>` (it polls
+    every 60 s and prints one line with the conclusion; the sandbox refuses
+    an `until` loop with `$(...)`, #342, #380), and read `gh pr checks N`
+    when it returns. **The
     label**: when the plan's *Definition of done* has the line `the PR carries
     the label ci: full`, open the PR with `--label "ci: full"` (the CI reads
     the label when a run starts, so the first run already has the full
