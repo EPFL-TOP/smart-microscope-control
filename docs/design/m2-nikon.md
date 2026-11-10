@@ -3957,8 +3957,7 @@ def set_autofocus_offset(microscope: Microscope, value: float | None) -> DriveRe
     24370 PFSOffset units, soft limits [0, 20000]: above them; smc would not
     set an offset there, and here it engages only at an offset it has read
     locked with this objective (m2 §12.2 D1), and the stand's own button
-    would drive Z to the plane this offset names, as it did from 9370 (m2
-    §12.1)`.
+    would drive Z to the plane this offset names (m2 §12.1)`.
   - Above, on a stand that does not declare it: the first clause only,
     `…: above them; smc would not set an offset there`. The consequences of
     the last clause are the declared stand's (D1, §12.1).
