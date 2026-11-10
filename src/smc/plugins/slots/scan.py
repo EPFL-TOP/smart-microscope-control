@@ -12,11 +12,17 @@ from typing import Any, Literal
 
 import numpy.typing as npt
 import tifffile
-from pydantic import Field
+from pydantic import (
+    Field,
+    SerializationInfo,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+)
 
 from smc.plugins.api import PluginResult
 from smc.plugins.geometry import Matrix2
 from smc.plugins.slots.base import SlotValue
+from smc.plugins.slots.cell_focus import FieldFocus
 from smc.run.files import resolve_in_run, retry_on_permission_error
 
 __all__ = ["FailedField", "FocusState", "ScanFrame", "ScanResult", "load_frame"]
@@ -48,6 +54,21 @@ class ScanFrame(SlotValue):
     focus: FocusState
     pfs_offset: float | None
     t_s: float = Field(ge=0.0)
+    #: The focus on the cells' step for this field (m3 §21.6); ``None`` when
+    #: the scan ran without it, or the field got no step.
+    cell_focus: FieldFocus | None = None
+
+    @model_serializer(mode="wrap")
+    def _leave_out_a_missing_cell_focus(
+        self, handler: SerializerFunctionWrapHandler, info: SerializationInfo
+    ) -> dict[str, Any]:
+        # A frame without the step is written exactly as before the field
+        # existed, so an older smc still reads the scan: its model refuses a
+        # key it does not know (FM-107), and SCHEMA_VERSION stays 1.
+        data: dict[str, Any] = handler(self)
+        if self.cell_focus is None:
+            data.pop("cell_focus", None)
+        return data
 
 
 class FailedField(SlotValue):

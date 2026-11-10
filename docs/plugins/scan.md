@@ -38,6 +38,10 @@ smc run scan -p <profile> --run-doc run.json --dry-run
 | `max_failed_in_row` | 3 | This many fields failing in a row end the scan (1 to 100). |
 | `max_unlocked_in_row` | 5 | This many fields in a row on which the autofocus would not lock end the scan (1 to 1000). |
 | `landing_tolerance` | 0.05 | How far a field may land from its target, as a fraction of the smaller side of the plan's field of view (above 0, at most 0.5). A field that landed farther is failed, not photographed. 0.05 is 4.8 µm for the demo's 10× (a field of 128 × 96 µm). Read the stand's real agreement at the first hardware session before trusting a fraction. |
+| `cell_focus` | `off` | The focus on the cells ([below](#the-focus-on-the-cells-cell_focus)): `per-field` sweeps Z at every field, `per-well` until one field of the well finds a peak. |
+| `focus_range_um` | 5 | The sweep's half-range, in µm (above 0, at most 50, and at most the stand's Z jog limit). |
+| `focus_step_um` | 1 | The distance between two planes, in µm (0.1 to 10, at most `focus_range_um`, at most 101 planes). |
+| `focus_score` | `brenner` | `brenner`, `normalized-variance`, `gradient-energy` or `laplacian-variance`. The four `focus_*` defaults are chosen, not measured. |
 
 ## What is checked before anything moves
 
@@ -77,10 +81,25 @@ written, and the message says what to do:
    camera that reports no pixel size (0, or a value that is not finite) is not
    compared either, and `assumed` says that neither the plan's size nor a change
    during the scan was checked.
-7. **The autofocus**, as `autofocus` says (above).
+7. **The autofocus**, as `autofocus` says (above). With `--resume`, a scan whose
+   checkpoint holds frames taken with the autofocus locked is refused when it is not
+   locked now (and `autofocus` is not `off`): `the scan being resumed used the
+   autofocus, which is not locked now (a stop during the focus on the cells leaves it
+   off): lock it on the sample, then run scan --resume`. Without it, `if-engaged` would
+   resume the rest of the plate without PFS and say nothing.
 8. **The disk**: the free space of the run folder's disk must exceed 1.1 × the
    frames left (about 4.4 MB per field at 1412 × 1412 pixels of 16 bits, 1.3 GB for
    the 305 fields of a 96-well well at 40×).
+9. **The focus on the cells**, when `cell_focus` is not `off` (a dry run too): the
+   stand has a focus drive (`cell_focus needs a focus drive, and this stand has none`),
+   the profile sets `[safety] z_soft_limits_um` (`cell_focus moves Z: the profile must
+   set [safety] z_soft_limits_um`), `focus_range_um` is not above the Z jog limit, and
+   the sweep around the Z read now lies inside the soft limits (`the focus sweep around
+   <z> µm would reach <plane> µm, outside the soft limits [<lo>, <hi>] µm`). With
+   `autofocus=off`, an autofocus that is on is refused: the sweep's Z moves switch it
+   off and nothing would lock it again or say so (`cell_focus moves Z, which switches
+   the autofocus off, and it is on: run with autofocus=if-engaged to use it, or switch
+   it off first`). It is the one read `autofocus=off` makes of the autofocus.
 
 ## During the scan
 
@@ -138,8 +157,71 @@ the frame (`scan/<token>/A1/A1_0001.tif`), and the checkpoint keeps the wells do
 The scan does not test beforehand whether a file is held open: opening a file does not
 show the condition that blocks its replacement.
 
-The scan **never** moves Z, turns the turret, switches the autofocus on, changes its
-offset, or returns to a start position.
+The scan **never** turns the turret, changes the autofocus offset, or returns to a start
+position. It moves Z and switches the autofocus off and on again only for the focus on
+the cells (below), which is off by default; without it, it never moves Z and never
+switches the autofocus on.
+
+## The focus on the cells (`cell_focus`)
+
+PFS holds the plate's bottom; the cells sit a few micrometres above it, by an amount
+that differs from well to well. With `cell_focus=per-field`, each field gets a short Z
+sweep, and its frame is taken at the sharpest plane. It is the sweep of
+[`focus-on-cells`](focus-on-cells.md), with the same checks and the same peak finder.
+
+**At each field**, after the stage has landed and the lock is checked:
+
+1. A field whose autofocus is used and reads **unlocked gets no step**: its Z is where a
+   search left it. Its frame is taken as without the step, and `assumed` counts it.
+2. The **centre** is the Z PFS holds at the field when the autofocus is used, else the Z
+   read before the scan moved anything. It never follows the previous field's best plane,
+   so nothing drifts from field to field. The PFS offset is read here.
+3. The planes are checked against the soft limits; a sweep that would leave them fails
+   the field with nothing moved (`SweepOutsideLimits: the focus sweep around …`).
+4. **The autofocus is switched off** and read back off. A Z move under a lock is undone
+   by the relock before the frame, and stepping the PFS offset needs the 40×'s offset
+   factor, which is not measured.
+5. The sweep, the peak, the move to the peak (or back to the centre when there is
+   none: a flat sweep, a best at an end, two maxima), then the frame, **taken with the
+   autofocus off**.
+6. **The next field's re-engage locks it again**, and PFS takes Z back to its plane,
+   which carries the plate's tilt to the next field. After the last field, one engage
+   locks it again, on a normal end only; when no lock comes, `assumed` says `the
+   autofocus did not lock again after the last field (<why>): it is off`.
+
+With `cell_focus=per-well`, the fields of a well are swept in order until one finds a
+peak; every later field of the well then moves to its own centre plus that field's
+offset, with no sweep. An empty first field (a flat sweep) therefore does not decide a
+well.
+
+**A sweep that fails** (a readback more than a quarter step from its command, an
+autofocus that still reads on, a camera that does not answer) is a failed field, and a
+WARNING names the field and says the autofocus is left off. A halt or a stop ends the
+scan as always, **with the autofocus off**: nothing restores it after a failure or a
+stop, and every refusal of the scan then ends with `; the focus on the cells left the
+autofocus off`. Lock it on the sample before `--resume`: the resume refuses otherwise
+(check 7 above). A stop inside the first well leaves no checkpoint, so there is
+nothing for that refusal to read: a scan with the step whose autofocus is present but
+off when it starts says so, as a WARNING and in `assumed` (`the autofocus was off when
+the scan started: the focus on the cells swept around the Z read then, and no frame
+was taken with it (…)`).
+
+**Each frame's `pfs_offset` is the lock's, not the cells' plane.** The frame's `z_um` is
+the plane it was taken at (the cells'); its `pfs_offset` is the offset of the lock the
+sweep was centred on, and `focus` stays the lock read at the field. An export that
+engages PFS at that offset ([`route`](route.md), [`nis-export`](nis-export.md)) images
+the plane PFS held, not the cells' plane: `assumed` says how far apart they were. Carrying
+the cells' plane into the offset is #392.
+
+**What it costs** is measured and said: `assumed` gains `the focus on the cells added <a>
+s per field (<n> fields: <b> s to sweep and move, <c> s for the lock after)`, how many
+sweeps found a peak (`found a peak on <p> of <s> sweeps (flat <f>, at an edge <e>, two
+peaks <t>): the others kept the centre`), and the fields skipped. A dry run plans it and
+runs none of it: `dry run: the focus on the cells was planned (<n> planes per sweep), not
+run`.
+
+**A `--resume` of a scan stopped by an older smc** is refused as `the parameters differ`
+(its parameters lack the four `focus_*` keys): run it again without `--resume`.
 
 ## Resuming
 
@@ -178,7 +260,13 @@ The slot `scan` holds a `ScanResult` (`smc.plugins.slots`):
   `z_um` (`null` without a focus drive); `focus` (`locked`, `unlocked`: used and not
   locked, `off`: the stand has an autofocus the scan did not use, `none`: it has
   none); `pfs_offset` (in the autofocus's own unit, `null` when not used); `t_s` from
-  the start of the attempt that took it.
+  the start of the attempt that took it; and, only for a field that had the focus on
+  the cells, `cell_focus`: its `source` (`swept`, or `well` for a field that reused its
+  well's offset), its `sweep` (the centre, the Z readbacks, the scores, the outcome and
+  the refined plane), `dz_um` (the frame's Z command minus the centre), `frame_score`
+  and `duration_s`. A frame without the step has no `cell_focus` key at all, so a scan
+  run with `cell_focus=off` is written exactly as before and still reads in an older
+  smc.
 - `failed`: `well`, `index`, `name`, the target `x_um`, `y_um`, and `error` (a field
   that landed off target says `StageOffTarget: …`).
 - `objective`, `pixel_size_um`, `matrix_um_per_px`, `image_shape_px`: the plan's,
@@ -203,4 +291,9 @@ a TIFF held open on Windows during `--resume` (the `PermissionError` path is tes
 a stand-in, never with a real viewer); and a run folder past 259 characters on a Windows
 PC without long paths (the refusal is tested by patching the platform and the limit,
 and the failure it prevents was not reproduced; whether long paths are enabled is not
-read, so a PC that has them is refused too).
+read, so a PC that has them is refused too). For the focus on the cells (m3 §21.10):
+the sweep at 40× on cells with PFS locked, against the by-eye focus; PFS locking again
+at the next field after the sweep, and how far Z moves in it; the time per plane and per
+field against the `assumed` line; whether a Z readback lands within a quarter step of its
+command; and the defaults of the score, the range and the step, which session 3 chooses
+from the stacks of [`focus-on-cells`](focus-on-cells.md).
