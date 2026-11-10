@@ -16,16 +16,15 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from pymmcore_plus import CMMCorePlus
+from pymmcore_plus import CMMCorePlus, DeviceType
 from test_engage_guard import LOCK_TIMEOUT_S, _plane_follows_the_offset, _stand
-from test_mm_autofocus import LOCK_S
+from test_mm_autofocus import _ti2_core
 
-import smc.hardware.backends.mm as mm
 from smc.hardware import Microscope
 from smc.hardware.capabilities import ObjectiveTurret
 from smc.hardware.errors import SafetyRefusedError
 from smc.hardware.profile import Profile, RolesSection
-from smc.testing import FakeCore
+from smc.testing import FakeCore, FakeDevice
 
 PROFILES = Path(__file__).resolve().parents[2] / "profiles"
 TI2 = PROFILES / "nikon-ti2.toml"
@@ -36,12 +35,6 @@ FOUR_X, TEN_X, FORTY_X = (
     "2-Plan Fluor 10x",
     "3-Plan Apo LmbdD0.25 40x",
 )
-
-
-@pytest.fixture(autouse=True)
-def short_lock(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Read at call time (m2 §3.6): the profile sets no lock_timeout_s.
-    monkeypatch.setattr(mm, "DEFAULT_LOCK_TIMEOUT_S", LOCK_S)
 
 
 def _shipped() -> Profile:
@@ -135,3 +128,44 @@ def test_the_turret_gives_the_pixel_size_session_3_calibrated(
         assert turret.pixel_size_um("4-") == 0.0
     finally:
         microscope.close()
+
+
+def test_only_the_three_calibrated_objectives_have_a_pixel_size() -> None:
+    # The whole table: a size entered for "5-" or "6-" would be a guess that the layer
+    # reports as measured (FM-45: a whole value, not the entries one thought of).
+    assert Profile.load(TI2).camera.pixel_size_um == {
+        FOUR_X: 2.73909,
+        TEN_X: 1.12447,
+        FORTY_X: 0.276136,
+    }
+
+
+def test_locked_at_the_40x_an_offset_write_is_bounded_by_the_z_soft_limit() -> None:
+    # What the 40x's factor changes (m2 §12.10 D6): without it a locked offset write at the
+    # 40x was refused for want of a factor; with it, the implied-Z check (FM-90) is what bounds
+    # the write, by [safety] z_soft_limits_um. The test makes that consequence visible: the
+    # day #402 is decided and the 40x line leaves the profile, this test goes with it.
+    profile = _shipped()
+    assert profile.safety.z_soft_limits_um is not None
+    z_um = profile.safety.z_soft_limits_um[1] - 50.0
+    nosepiece = FakeDevice(
+        "Nosepiece", DeviceType.State, state_labels=tuple(_nosepiece_labels())
+    )
+    core = _ti2_core(turret=False, extra=[nosepiece])
+
+    with _stand(profile, offset=5388.0, z_um=z_um, core=core) as stand:
+        stand.core.setState("Nosepiece", 2)  # the 40x
+        stand.engage_directly()
+        assert stand.af.is_locked() is True
+        stand.core.log.clear()
+
+        # +14612 units at 112.6 units/µm imply +129.8 µm: 4429.8 µm, past the 4350 µm limit.
+        with pytest.raises(
+            SafetyRefusedError,
+            match=r"Z target 4429\.\d+ µm is outside the soft limits \[10\.0, 4350\.0\] µm",
+        ):
+            stand.af.set_offset_native(20000.0)
+        assert stand.core.log == []
+
+        # +4000 units imply +35.5 µm: 4335.5 µm, inside it.
+        assert stand.af.set_offset_native(9388.0) == 9388.0

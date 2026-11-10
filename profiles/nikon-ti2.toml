@@ -23,13 +23,15 @@ z_soft_limits_um = [10.0, 4350.0]    # owner, 2026-10-15: never above 4350 µm; 
 xy_soft_limits_um = [[-49000.0, 49000.0], [-29000.0, 29000.0]]    # owner
 turret_requires_confirm = true
 # Chosen from session 1 (#208), for the owner to confirm: 50 units moved Z by 4.6-8.5 µm
-# at 10x under lock (the range of the measured factors), and nothing with PFS off.
+# at 10x under lock (the range of the measured factors), and nothing with PFS off. At the 40x
+# (112.6 units/µm, below) it is 0.44 µm: a larger focus_by_um is refused unless forced, and the
+# value is not revised here.
 max_autofocus_offset_jog = 50.0                  # in [autofocus] offset_unit
 # Measured, session 3 (2026-11-10, #401), with PFS off, where no write moved Z: PFSOffset exposes
 # no property limits (#208), so the bounds are the values read back as written. 0, 1000, 3000, 5000,
 # 7000, 10000 and 20000 read back as written; 30000 read back 24370, where the stand clamps. 0 is
-# the floor of a first lock (m2 §12.10 D4). The stand's own per-objective offsets, 9370 (10x) and
-# 17794 (40x), lie inside.
+# the floor of a first lock (m2 §12.10 D4). The offsets read after a turn to the 10x (9370) and to
+# the 40x (17794) lie inside.
 autofocus_offset_soft_limits = [0.0, 20000.0]    # in [autofocus] offset_unit; not forceable
 stop_refused_by = ["xy_stage", "focus", "autofocus_offset"]  # measured, session 1 (#208): "Unsupported device command (11)", still and moving
 # Chosen (m2 §12.2 D2), for the owner to confirm: how far Z may move while PFS engages,
@@ -38,6 +40,9 @@ stop_refused_by = ["xy_stage", "focus", "autofocus_offset"]  # measured, session
 max_engage_excursion_um = 50.0
 # Seen from the side by the owner, session 3 (2026-11-10, #98, #401): `smc z move 500` lowers the
 # nosepiece and `smc z move 4000` raises it, so a falling Z moves the objective away from the sample.
+# With the floor above, a first lock runs at every objective. At the 40x, session 3's first lock
+# at C3 drove Z +56.8 µm toward the sample, one read past the 50 µm bound, before the guard
+# switched PFS off (F11, #402): a first lock at the 40x waits for #402.
 z_away_from_sample = "decreasing"
 
 [autofocus]
@@ -71,7 +76,14 @@ settle_tolerance_um = 0.5
 # The smallest is entered, so the implied-Z check overestimates a move and
 # focus_by_um undershoots (by up to 45 % at the 10x) rather than overshoots: 5.9 stays at the
 # 10x (6.34 is above it), and 112.6 is the 40x's, the interval nearest the offsets where the
-# stand focuses (5388 and 5698 at C4).
+# stand focuses (5388 and 5698 at C4). That holds up to offset 6973, where the 40x was
+# measured; above it the factor may be lower still and a move underestimated (the stand's own
+# 40x offset is 17794).
+# An entry for an objective ends m2 §12.10 D6's refusal of an offset write while locked at it:
+# the write is then bounded by [safety] autofocus_offset_soft_limits and by the implied-Z check
+# against z_soft_limits_um, not by a jog limit (an absolute write has none) nor by the excursion
+# guard of a first lock (F11, #402). Delete the 40x line to have D6 refuse such a write at the
+# 40x again until #402 is decided.
 "2-Plan Fluor 10x" = 5.9
 "3-Plan Apo LmbdD0.25 40x" = 112.6
 
@@ -141,9 +153,12 @@ settle_tolerance_um = 0.5
 #   Z. The stand's own parfocal steps from the 10x are +8.7 µm for the 4x and -47.5 µm for the 40x.
 #   Seen once (inferred): a turn left unseated stood at Z 485 µm, and seating the objective raised
 #   Z to 3657 µm, where it had been.
-# - The stand remembers a PFS offset per objective and restores it on a turn: 9370 for the 10x
-#   (also at power-on) and 17794 for the 40x; the 4x leaves the offset as it was. A first lock sets the
-#   floor after the last turn, right before it engages.
-# - A command sometimes fails to load the configuration, once seen in the session: `Error in device
-#   "Ti2-E__0": (Error message unavailable) (-10)`. A failed load sends nothing and the next command
-#   loads; the cause is inferred (the previous command's release of the stand not finished).
+# - The PFS offset changes on a turn (read: 9370 after a turn to the 10x, also at power-on, 17794
+#   after one to the 40x, unchanged after one to the 4x). That the stand remembers an offset per
+#   objective and restores it is inferred from these reads. A first lock sets the floor after the
+#   last turn, right before it engages.
+# - A command sometimes fails to load the configuration: three of about ten commands in a row did,
+#   `Error in device "Ti2-E__0": (Error message unavailable) (-10)` twice and once PVCAM's
+#   `pl_cam_open failed (PL_ERR_DDI_DEVICE_OPEN_FAILED)` (F10, #411). A failed load sends nothing
+#   and the next command loads; the cause is inferred (the previous command's release of the
+#   stand not finished).
