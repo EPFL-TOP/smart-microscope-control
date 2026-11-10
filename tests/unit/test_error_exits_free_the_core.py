@@ -628,6 +628,28 @@ _first_lock_excursion.engage_drives_z = True  # type: ignore[attr-defined]
 _first_lock_excursion.first_lock = True  # type: ignore[attr-defined]
 
 
+def _seen_floor_state_unreadable(
+    core: FakeCore, microscope: Microscope
+) -> tuple[str, str]:
+    """At a floor seen locked, the check's state read fails: refused (m2 §12.11 D9)."""
+    autofocus = microscope.require(Autofocus)
+    assert autofocus.engage() is True  # the floor is now seen
+    autofocus.disengage()
+
+    def unreadable() -> bool:
+        raise RuntimeError("device fault")  # fresh: not `failing` (FM-98)
+
+    autofocus._read_engaged = unreadable  # type: ignore[attr-defined]
+    try:
+        return _outcome(autofocus.engage)
+    finally:
+        del autofocus._read_engaged  # type: ignore[attr-defined]
+
+
+_seen_floor_state_unreadable.engage_drives_z = True  # type: ignore[attr-defined]
+_seen_floor_state_unreadable.first_lock = True  # type: ignore[attr-defined]
+
+
 def _offset_move_refused_while_searching(
     core: FakeCore, microscope: Microscope
 ) -> tuple[str, str]:
@@ -949,6 +971,14 @@ _DECLARED_EMERGENCY_STOP = (
             "engage Autofocus here with this objective. The guard reads Z every 10 "
             "ms: it stops Autofocus once a jump is read, it does not prevent one",
             id="first-lock-excursion",
+        ),
+        pytest.param(
+            _seen_floor_state_unreadable,
+            "_EngageRefusedError",
+            "autofocus Autofocus: not engaged: its state could not be read (device "
+            "fault); at the offset's floor (0), whether it is off decides how far Z "
+            "may move toward the sample (m2 §12.11 D9), so nothing was sent",
+            id="seen-floor-state-unreadable",
         ),
         pytest.param(
             _offset_move_refused_while_searching,

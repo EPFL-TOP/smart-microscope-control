@@ -1087,6 +1087,88 @@ def test_an_engage_at_a_floor_seen_locked_elsewhere_is_a_first_lock_again(
         assert stand.core.log == [ON, OFF]
         assert any("a first lock from the offset's floor" in m for m in caplog.messages)
         assert stand.af.is_engaged() is False
+        # The trip forgot the floor (D9: "one that trips forgets it"): searching
+        # there now, it is unseen, so refused and switched off, not D1's engage.
+        stand.engage_directly(lockable=False)
+        with pytest.raises(SafetyRefusedError) as refused:
+            stand.af.engage()
+        assert str(refused.value) == _unseen_at(switched=SWITCHED, advice=FROM_BELOW)
+        assert stand.core.log == [OFF]
+
+
+def test_a_state_read_that_fails_at_a_seen_floor_engages_nothing(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Counted as on, it would take D1's band (±E) at a seen floor and lock 40 µm
+    # toward the sample (adversarial review of #402): a read that decides the
+    # band refuses with nothing sent, as an offset move's does (FM-19).
+    with _stand(_first_lock(**RISE), offset=FLOOR) as stand:
+        _floor_seen_then_back_at_z0(stand, caplog)
+        _jumps_to(stand, Z0 + 40.0)
+        autofocus = stand.af
+        real = autofocus._read_engaged  # type: ignore[attr-defined]
+        reads: list[str] = []
+
+        def fails_once() -> bool:
+            reads.append("engaged")
+            if len(reads) == 1:
+                raise RuntimeError("no answer")
+            return bool(real())
+
+        monkeypatch.setattr(autofocus, "_read_engaged", fails_once)
+        with pytest.raises(SafetyRefusedError) as refused:
+            autofocus.engage()
+        assert str(refused.value) == (
+            "autofocus PFS: not engaged: its state could not be read (no answer); at "
+            "the offset's floor (5000 PFSOffset units), whether it is off decides how "
+            "far Z may move toward the sample (m2 §12.11 D9), so nothing was sent"
+        )
+        assert refused.value.how_to_force == ""
+        assert stand.core.log == []
+        assert stand.z.position_um() == Z0
+        assert reads == ["engaged"]
+
+
+def test_a_state_read_that_fails_at_an_unseen_floor_is_counted_as_on_and_refused(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # As before #402: unknown counts as on (FM-19), so it is switched off and
+    # refused; the state is read once, and the refusal reuses it.
+    with _stand(_first_lock(**RISE), offset=FLOOR) as stand:
+        autofocus = stand.af
+        reads: list[str] = []
+
+        def fails() -> bool:
+            reads.append("engaged")
+            raise RuntimeError("no answer")
+
+        monkeypatch.setattr(autofocus, "_read_engaged", fails)
+        with (
+            caplog.at_level(logging.DEBUG, logger="smc.hardware.backends.mm"),
+            pytest.raises(SafetyRefusedError) as refused,
+        ):
+            autofocus.engage()
+        assert str(refused.value) == _unseen_at(switched=SWITCHED, advice=FROM_BELOW)
+        assert stand.core.log == [OFF]
+        assert reads == ["engaged"]
+        assert (
+            "autofocus PFS: its state could not be read (no answer); counted as on"
+        ) in caplog.messages
+
+
+def test_an_increasing_stand_bounds_a_first_locks_rise_by_first_lock_max_rise_um() -> (
+    None
+):
+    profile = _first_lock(z_away_from_sample="increasing", **RISE)
+    # 8 µm below Z: toward the sample on this stand, inside E, beyond R.
+    with _stand(profile, offset=FLOOR, z_um=3000.0) as stand:
+        _jumps_to(stand, 2992.0)
+        with pytest.raises(AutofocusExcursionError) as jumped:
+            stand.af.engage()
+        assert str(jumped.value) == TOWARD.format(
+            z_start=3000.0, z_um=2992.0, bound=R_BOUND
+        )
+        assert stand.core.log == [ON, OFF]
 
 
 def test_a_seen_floor_whose_plane_lies_far_below_engages_as_a_first_lock(

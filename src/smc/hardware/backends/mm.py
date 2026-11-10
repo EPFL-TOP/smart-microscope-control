@@ -1515,7 +1515,9 @@ class MMAutofocus:
                 not seen locked on a declared stand and is not a first lock
                 (switched off first if it was on); nothing else was sent. The
                 message says how to lock it from below, or what the profile
-                lacks for it. Not forceable.
+                lacks for it. Or, at a floor seen locked, its state could not
+                be read, which decides the band (§12.11 D9); nothing was sent.
+                Not forceable.
             AutofocusExcursionError: Z left its bound while it engaged; it was
                 switched off, and its offset is no longer a seen one. During a
                 first lock: Z went toward the sample by more than
@@ -1802,12 +1804,26 @@ class MMAutofocus:
         seen = self._seen.get(objective, frozenset())
         offset_limits = self._safety.autofocus_offset_soft_limits
         missing = self._first_lock_missing(focus)
+        unit = f" {self._offset_unit}" if self._offset_unit else ""
         on: bool | None = None
         if first_lock and offset_limits is not None and offset <= offset_limits[0]:
             # At or below the floor, engage() is a first lock whether or not the
             # floor was seen locked (m2 §12.11 D9): one floor named planes 104 µm
             # apart in two wells (F11), and the floor is set at each new place.
-            on = self._engaged_for_the_check()
+            # At a seen floor, an unknown state counted as on would take D1's
+            # band (±E): there the read decides how far Z may rise, so it is
+            # refused with nothing sent (FM-19; adversarial review of #402).
+            try:
+                on = self._engaged_for_the_check(
+                    propagate=offset in seen and not missing
+                )
+            except Exception as exc:
+                raise _EngageRefusedError(
+                    f"its state could not be read ({_named(exc)}); at the offset's "
+                    f"floor ({offset:g}{unit}), whether it is off decides how far Z "
+                    f"may move toward the sample (m2 §12.11 D9), so nothing was sent",
+                    label=label,
+                ) from exc
             if (
                 not missing
                 and not on
@@ -1831,7 +1847,6 @@ class MMAutofocus:
             return guard
         if on is None:
             on = self._engaged_for_the_check()
-        unit = f" {self._offset_unit}" if self._offset_unit else ""
         with_objective = "" if objective is None else f" with objective {objective!r}"
         known = ", ".join(f"{value:g}" for value in sorted(seen)) or "none"
         unseen = (
@@ -1867,16 +1882,20 @@ class MMAutofocus:
             )
         raise _EngageRefusedError(f"{unseen}{switched}. {advice}", label=label)
 
-    def _engaged_for_the_check(self) -> bool:
+    def _engaged_for_the_check(self, *, propagate: bool = False) -> bool:
         """Whether it reads on, for the engage check; unknown counts as on (FM-19).
 
         Left searching, it would drive Z to the offset's plane the moment it
         found the reference, and a first lock's ``z_start`` would not be where
-        the operator focused.
+        the operator focused. With ``propagate``, a failed read is raised
+        instead: where "on" would loosen the band, unknown is not on either,
+        and the caller refuses.
         """
         try:
             return self._read_engaged()
         except Exception as exc:
+            if propagate:
+                raise
             logger.debug(
                 "autofocus %s: its state could not be read (%s); counted as on",
                 self._label,
