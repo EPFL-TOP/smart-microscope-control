@@ -42,6 +42,9 @@ New findings arrive as *Hardware session report* issues and land here.
   first resolution with name tie-breaks is mandatory.
 - **Neither `ZDrive` nor `PFSOffset` reports a focus direction** (0,
   unknown): the profile must say which way is away from the sample (#98).
+  Seen from the side in session 3: **Z decreasing moves the nosepiece
+  down, away from the sample**; under lock, the knob turned clockwise
+  lowers Z (#208).
 - PFS state is in properties: `FocusMaintenance` (On/Off), `PFS in Range`
   and `PFS Status` (read-only), `DichroicMirrorInserted`, `LEDIntensity`.
   Speeds are properties as well: `ZDrive` 0.5–2.5 mm/s, `XYStage`
@@ -55,15 +58,26 @@ New findings arrive as *Hardware session report* issues and land here.
   and `ZDrive` never busy (#205). `PFS in Range` means a reflection is
   seen, PFS on or off. A Z move with PFS locked switches PFS off (#1815,
   confirmed). `PFSOffset` holds whole units, has no property limits, and
-  moves Z only while PFS is on; at 10× about 6–11 units per µm. The
+  moves Z only while PFS is on; about 6–11 units per µm at 10× (6.34
+  from the floor) and about 115 at 40× (session 3, #405). It reads back
+  0–20000 as written and clamps 30000 to 24370. The
   stand's **PFS button ignores smc's soft limits**: it jumped +206.6 µm
   on a new plate (session 2, #334; #331).
+- **The stand keeps a PFS offset per objective and restores it on a turn**
+  (inferred from session 3's reads): 9370 for the 10×, also at power-on,
+  and 17794 for the 40×; the 4× leaves it as it was. An offset written
+  before a turn is gone after it (#407).
 - **XY and Z moves return only once they have ended**, and neither reads
   busy: 10 mm of XY in about 0.6 s, 50 µm of Z in 0.2–0.35 s (#221). A read
   takes under 0.05 ms (a cache in the adapter, inferred).
-- **A nosepiece turn** returns after about 1 s and never reads busy; the
-  stand switches PFS off by itself and moves Z by itself (+8.7 µm with the
-  4× against the 10×). `setConfig` of the lab's `BF` preset takes 7.1 s.
+- **A nosepiece turn** returns after 1.0–4.4 s, more from higher up, and
+  never reads busy; the stand switches PFS off by itself and moves Z by
+  itself: down to a 500 µm escape height and back **inside the call**
+  (the 500 µm read at the return is stale), then +8.7 µm with the 4× and
+  −47.5 µm with the 40× against the 10× (session 3, #405). A turret left
+  between positions fails `getStateLabel` ("Cannot get current position
+  label"), and seating it from the stand finishes the restore: Z rose
+  485 → 3657 µm by itself (#406). `setConfig` of the lab's `BF` preset takes 7.1 s.
   `DiaLamp`'s `Intensity` (0–2100) reads its previous value for a moment
   after a set (session 2, #330).
 - `IntermediateMagnification`'s `Magnification` reads `1.0x`/`1.5x`, and
@@ -84,7 +98,14 @@ New findings arrive as *Hardware session report* issues and land here.
 - Camera pixels: 11 µm is the Prime 95B's datasheet figure, not a
   measurement, and the lab's configuration defines no pixel size, so
   smc reports it as unknown. The old "6.5 µm, 2048²" figures were a
-  Hamamatsu's.
+  Hamamatsu's. Measured by `camera-calibration` in session 3 (lever 1.0×):
+  **2.73909 µm at 4×, 1.12447 µm at 10×, 0.276136 µm at 40×**, and the
+  camera sits **2.56° off the stage's axes** (rotation 177.44° at all
+  three). The Prime 95B is on the left port (`LightPath` `L100`); a
+  frame with the light path elsewhere is dark (#408).
+- A load fails now and then (`Ti2-E__0` (-10), or PVCAM
+  `PL_ERR_DDI_DEVICE_OPEN_FAILED`) when commands follow each other, and the
+  next command loads; nothing is sent (session 3, #411).
 - The lab's `MMConfig.cfg` (nikon-control, 2026-09-16) has no Startup
   preset and no `Core,TimeoutMs`. Its state labels are its own, and
   FilterTurret2's are truncated fragments, unusable as channel names.

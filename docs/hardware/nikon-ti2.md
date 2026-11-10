@@ -662,3 +662,120 @@ fake-only whole-unit test).
   turn does to Z under a plate (#330).
 - The 40×, the chain on the plate, the NIS export (#198); the plate's brand
   (a marking on one long edge, to read next time).
+
+## Session 3 — first locks from the floor, three calibrations, a 40× jump
+
+2026-11-10, the owner at the stand, commit `caaa60e`. Report: #405, with
+the raw excerpts; the folder stays in `local/surveys/nikon-ti2/session3/`
+and `local/scans/2026-11-10/`. The sample was session 2's 24-well plate,
+a **Greiner** with a standard plastic bottom (reference not read), holding
+debris and no cells. The 4×, 10× and 40× were used, the lever at 1.0×,
+the Prime 95B on the left port (`L100`).
+
+### Z, the offset and the turns
+
+- **Z decreasing moves the nosepiece down, away from the sample**, seen
+  from the side (#98): `z_away_from_sample = "decreasing"`.
+- **Under lock, turning the knob clockwise lowers Z** (#208).
+- **`PFSOffset` with PFS off** reads back every value from 0 to 20000 as
+  written and clamps 30000 to 24370; no write moved Z (2999.26 →
+  2999.22 µm over nine writes). Hence
+  `autofocus_offset_soft_limits = [0.0, 20000.0]` (#401).
+- **The stand keeps a PFS offset per objective and restores it on a
+  turn** (F3/F5, inferred from these reads): 9370 for the 10× (also at
+  power-on, although session 2 left 8141: the plane of the button jumps of
+  sessions 1 and 2), 17794 for the 40×; a turn to the 4× leaves the
+  offset as it was. A `--floor` written before a turn is gone after it
+  (#407).
+- **Every turn drops Z to 500 µm, whatever the start, and brings it back
+  inside the call** (F4). Without a plate, PFS off, 10× → 4× → 10×:
+
+  | Z before | 10×→4× call | 4× Z max / last | 4×→10× call | Z after | round trip |
+  |---|---|---|---|---|---|
+  | 561 µm | 1.00 s | 569.74 / 569.54 | 2.82 s | 560.72 | −0.28 µm |
+  | 1500 µm | 1.86 s | 1508.70 / 1508.42 | 2.05 s | 1499.34 | −0.62 µm |
+  | 3000 µm | 3.31 s | 3008.70 / 3008.16 | 3.39 s | 2999.22 | −0.78 µm |
+  | 4195 µm | 4.30 s | 4203.70 / 4203.02 | 4.38 s | 4193.80 | −1.20 µm |
+
+  The Z read at the return of 10× → 4× is 500 µm, and the next one, 10 ms
+  later, 4203.70: the first is **stale** (FM-188), since Z cannot travel
+  3.7 mm in 10 ms. Busy never read True. smc's turn line reports the
+  settled Z. The stand's parfocal steps from the 10× are **+8.7 µm for
+  the 4×** and **−47.5 µm for the 40×** (−47.48 there, +47.20 back).
+- **A turret left between positions** gives `getStateLabel('Nosepiece')
+  failed (Cannot get current position label)`; when the stand seated it,
+  Z rose by itself from 485.38 to 3656.86 µm: the unfinished turn's escape
+  height, then its restore (F1, F2, inferred; #406).
+
+### First locks from the floor (m2 §12.10.7)
+
+| Objective, well | By-eye focus | Z after `engage` from offset 0 | Z moved |
+|---|---|---|---|
+| 10×, B3 | 4132.38 µm | 3006.14 µm, locked | 1126 µm away |
+| 40×, C4 | 4005.56 µm | 3958.68 µm, locked | 46.9 µm away |
+| 40×, C3 | 4017.28 µm | guard tripped at 4074.08 µm | **+56.8 µm toward** |
+
+- At C3 the floor's plane lay above the by-eye focus. The excursion guard
+  (`max_engage_excursion_um = 50`) switched PFS off one 10 ms read past
+  its bound. Why the same floor sits 47 µm below the focus at C4 and at
+  least 57 µm above it at C3 is unknown (#402). Whether the 40× touched
+  the plate is not known.
+- **Factors**: 10×, **6.34 units/µm** (floor to 7061; sessions 1 and 2:
+  5.9, 6.0); 40×, **about 115 units/µm** from four points under lock,
+  (0, 3958.68), (4048, 3993.04), (5388, 4004.58), (6973, 4018.66): pairwise
+  112.6–117.8. Ratio 18, near (40/10)² = 16.
+- **At the 40× PFS held** over two 5×5 grids of 350 µm steps (Z within
+  1.7 µm over 1.4 mm) and through a 7.5 mm move inside a well (+2.1 µm).
+  An engage at an offset already seen locked moved Z by −0.04 µm (D1).
+- The 40× (Plan Apo λD, working distance 0.17–0.25 mm) focused through the
+  plate's standard plastic bottom at Z 4005–4011 µm, 344 µm under the
+  4350 µm limit. The lab uses this plate at the 40×.
+
+### The camera
+
+`camera-calibration`, lever 1.0×, binning 1:
+
+| Objective | Pixel size | Step | Residual | Rotation |
+|---|---|---|---|---|
+| 4× | 2.73909 µm | 900 µm | 0.894 µm | 177.437° |
+| 10× | 1.12447 µm | 350 µm | 0.642 µm | 177.443° |
+| 40× | 0.276136 µm | 100 µm | 0.535 µm | 177.437° |
+
+- **The camera sits 2.56° off the stage's axes** at all three objectives
+  (the "180°" of earlier notes was a rough value). Effective
+  magnifications 4.02×, 9.78×, 39.8× for 11 µm pixels; the 40× field is
+  389.9 µm.
+- With no pixel size known, the step falls back to 50 µm: at the 4× that
+  is about 18 px, and the fit gave a 10.7 µm residual (F6, #408).
+- **A frame with the light path on the eyepiece** makes the calibration
+  refuse with "parallel shifts: did the stage move?" (F8, #408). Live on
+  the page was dark for the same reason, with no hint. The lab calls the
+  left port "the Zyla"; it is the Prime 95B (1412 × 1412 px).
+
+### The plate
+
+- **Column +1 lies at stage −X** (#327).
+- Hand registration from wall reads at the 10×: B3 (10003, −10051),
+  B5 (−28982, −9919), C3 (10031, 9375) µm; **pitch 19.49 mm between
+  columns, 19.43 mm between rows**; the plate sits square to 0.1–0.2°.
+  B3 is 265 µm off session 2's in X: the plate was put back between them.
+- useq's `24-well` has a 19.0 mm spacing, so `plate-walls` refused the
+  plate at +2.7 % (F9, #400). At the 10× it found the walls of all three
+  wells; at the 4× it took an edge 1.6 mm inside B5's wall (F7, #409).
+
+### Loads
+
+Three of about ten `smc` commands in a row failed to load and the next
+one loaded: `Error in device "Ti2-E__0": (Error message unavailable)
+(-10)` twice, and once PVCAM's `pl_cam_open failed
+(PL_ERR_DDI_DEVICE_OPEN_FAILED)` (F10, #411). A failed load sends
+nothing.
+
+### Not settled by session 3
+
+- Why the 40× first lock from the floor went toward the sample at C3, and
+  whether it touched the plate (#402).
+- The plate's Greiner reference (#400).
+- The page's STOP during a drive and during Live (#333), the chain on a
+  registered plate (scan, cells, route), the objective offsets (#380),
+  the NIS export (#198); a plate with cells at the 40× (#342).
