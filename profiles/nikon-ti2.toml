@@ -23,20 +23,32 @@ z_soft_limits_um = [10.0, 4350.0]    # owner, 2026-10-15: never above 4350 µm; 
 xy_soft_limits_um = [[-49000.0, 49000.0], [-29000.0, 29000.0]]    # owner
 turret_requires_confirm = true
 # Chosen from session 1 (#208), for the owner to confirm: 50 units moved Z by 4.6-8.5 µm
-# at 10x under lock (the range of the measured factors), and nothing with PFS off.
+# at 10x under lock (the range of the measured factors), and nothing with PFS off. At the 40x
+# (112.6 units/µm, below) it is 0.44 µm: a larger focus_by_um is refused unless forced, and the
+# value is not revised here.
 max_autofocus_offset_jog = 50.0                  # in [autofocus] offset_unit
-# Unknown: PFSOffset exposes no property limits (#208); values seen so far 7803-9420.
-# autofocus_offset_soft_limits = [..., ...]
+# Measured, session 3 (2026-11-10, #401), with PFS off, where no write moved Z: PFSOffset exposes
+# no property limits (#208), so the bounds are the values read back as written. 0, 1000, 3000, 5000,
+# 7000, 10000 and 20000 read back as written; 30000 read back 24370, where the stand clamps. 0 is
+# the floor of a first lock (m2 §12.10 D4). The offsets read after a turn to the 10x (9370) and to
+# the 40x (17794) lie inside.
+autofocus_offset_soft_limits = [0.0, 20000.0]    # in [autofocus] offset_unit; not forceable
 stop_refused_by = ["xy_stage", "focus", "autofocus_offset"]  # measured, session 1 (#208): "Unsupported device command (11)", still and moving
 # Chosen (m2 §12.2 D2), for the owner to confirm: how far Z may move while PFS engages,
 # beyond where it started or held. Session 1 jumped +235 µm (#205), and the stand's button
 # +206.6 µm in session 2 (#334); at an offset seen locked, an engage moved Z 0.00 µm (#334).
 max_engage_excursion_um = 50.0
 first_lock_max_rise_um = 5.0  # chosen (m2 §12.11 D8, #402): a first lock asks for a drop; F11 rose 56.8 µm at the 40x under E alone
-# z_away_from_sample = "decreasing"  # inferred, not seen (#98): declared at the visit once seen from the side (m2 §12.10.7)
+# Seen from the side by the owner, session 3 (2026-11-10, #98, #401): `smc z move 500` lowers the
+# nosepiece and `smc z move 4000` raises it, so a falling Z moves the objective away from the sample.
+# With the floor above, a first lock runs at every objective. At the 40x, session 3's first lock
+# at C3 drove Z +56.8 µm toward the sample, one read past the 50 µm bound, before the guard
+# switched PFS off (F11, #402): first_lock_max_rise_um above now bounds that rise to 5 µm.
+z_away_from_sample = "decreasing"
 
 [autofocus]
-# Measured in session 1 (#208), 10x only: docs/hardware/nikon-ti2.md, Session 1.
+# Measured in session 1 (#208) at the 10x, and in session 3 (#401) at the 10x and the 40x:
+# docs/hardware/nikon-ti2.md, Sessions 1 and 3.
 offset_unit = "PFSOffset units"     # whole numbers only: 7927.5 reads 7927 (#207)
 # lock_timeout_s: unset, 5 s assumed. `locked` read True within 0.1 s in all three
 # engagements, but once 0.5 s before PFS drove Z +235 µm (#205): it is not a settling time.
@@ -53,21 +65,47 @@ settle_s = 1.0
 settle_tolerance_um = 0.5
 
 [autofocus.offset_per_um]
-# Under lock, a larger offset gives a larger Z. One factor per objective is a simplification:
-# +50 units gave 7.5 units/µm, -50 gave 10.8, and a manual re-set over 243 µm gave 5.9 (#208);
-# on a 24-well plate, +50 gave 9.6, -50 gave 10.5, and the knob over 203 µm gave 6.0 (#334).
+# Under lock, a larger offset gives a larger Z. One factor per objective is a simplification,
+# and the factor falls as the offset rises (40x, below: 117.8, 116.1, then 112.6 units/µm).
+# 10x: +50 units gave 7.5 units/µm, -50 gave 10.8, and a manual re-set over 243 µm gave 5.9 (#208);
+#   on a 24-well plate, +50 gave 9.6, -50 gave 10.5, and the knob over 203 µm gave 6.0 (#334);
+#   session 3 (2026-11-10, #401): from the floor (offset 0, Z 3006.14 µm) to offset 7061
+#   (Z 4120.18 µm), 7061 units over 1114.0 µm, gave 6.34, an average over a longer span.
+# 40x: session 3 (2026-11-10, #401), four points under lock, (offset, Z in µm): (0, 3958.68),
+#   (4048, 3993.04), (5388, 4004.58) and (6973, 4018.66). The three intervals give 117.8, 116.1
+#   and 112.6 units/µm, and the whole span 116.3.
 # The smallest is entered, so the implied-Z check overestimates a move and
-# focus_by_um undershoots (by up to 45 %) rather than overshoots.
+# focus_by_um undershoots (by up to 45 % at the 10x) rather than overshoots: 5.9 stays at the
+# 10x (6.34 is above it), and 112.6 is the 40x's, the interval nearest the offsets where the
+# stand focuses (5388 and 5698 at C4). That holds up to offset 6973, where the 40x was
+# measured; above it the factor may be lower still and a move underestimated (the stand's own
+# 40x offset is 17794).
+# An entry for an objective ends m2 §12.10 D6's refusal of an offset write while locked at it:
+# the write is then bounded by [safety] autofocus_offset_soft_limits and by the implied-Z check
+# against z_soft_limits_um, not by a jog limit (an absolute write has none) nor by the excursion
+# guard of a first lock (F11, #402). Delete the 40x line to have D6 refuse such a write at the
+# 40x again until #402 is decided.
 "2-Plan Fluor 10x" = 5.9
+"3-Plan Apo LmbdD0.25 40x" = 112.6
 
 [camera]
-# No pixel_size_um entry: a missing objective is unknown, never guessed. The nominal
-# 2.75 µm (4x), 1.1 µm (10x) and 0.275 µm (40x) are assumed, not measured (#22).
+# A missing objective is unknown, never guessed: the 4-, 5- and 6- positions have no entry. The
+# nominal 2.75 µm (4x), 1.1 µm (10x) and 0.275 µm (40x) were assumed, not measured (#22); session 3
+# measured the three sizes below.
 # A size entered here is for binning 1 and a magnification factor of 1.0 (the lever
 # at 1.0x): the layer divides it by the core's getMagnificationFactor(), the product of
 # the Magnifier devices, and a size measured with the lever at 1.5x is entered
 # multiplied by 1.5. Measured in session 2 (#334): IntermediateMagnification's
 # `Magnification` reads 1.0x / 1.5x, and getMagnificationFactor() 1.0 / 1.5.
+
+[camera.pixel_size_um]
+# Measured, session 3 (2026-11-10, #401), by `smc run camera-calibration` with the lever at 1.0x and
+# binning 1, each at the step named (a quarter of the field, as the plugin's default will be now that
+# a size is known; its 50 µm fallback gave a residual of 10.7 µm at the 4x). The camera is turned
+# 2.56 deg from the stage's axes (rotation 177.44 deg) at all three objectives.
+"1-Plan Fluor 4x" = 2.73909          # step 900 µm, residual 0.894 µm (nominal 2.75)
+"2-Plan Fluor 10x" = 1.12447         # step 350 µm, residual 0.642 µm (nominal 1.1)
+"3-Plan Apo LmbdD0.25 40x" = 0.276136    # step 100 µm, residual 0.535 µm (nominal 0.275)
 
 # [objectives]
 # Written by `smc objective offset --write` (m3 §20) as one block at the end of this file,
@@ -91,7 +129,8 @@ settle_tolerance_um = 0.5
 # measured = "YYYY-MM-DD, session 3 (#issue)"
 
 [quirks]
-# The direction of focus (which way is up) is unknown (#98).
+# The direction of Z is known (#98, session 3): a falling Z lowers the nosepiece, away from the
+# sample; it is `[safety] z_away_from_sample`.
 # Not read by the layer yet (#204); recorded for the design:
 # - XYStage, ZDrive and PFSOffset refuse stop() ("Unsupported device command (11)"):
 #   a sent move runs to its target. Switching PFS off stops a PFS-driven Z move.
@@ -100,9 +139,27 @@ settle_tolerance_um = 0.5
 # - setXYPosition and setPosition(ZDrive) return only once the move has ended (10 mm in
 #   0.6 s, 50 µm in 0.2-0.35 s); XYStage never reads busy either (#221).
 # - A Nosepiece turn returns after about 1 s, never reads busy, switches PFS off, and the
-#   stand moves Z by itself: 500.0 µm at the call's return, then +8.7 µm with the 4x (#330).
+#   stand moves Z by itself: +8.7 µm with the 4x (#330). The 500.0 µm read at the call's
+#   return, thought to be where Z stood, is a stale read (session 3, below).
 # - setConfig("Channel", "BF") takes 7.1 s; getCurrentConfig then reads "" because
 #   Exposure reads 10.0000 for the preset's 10 (FM-100).
 # - DiaLamp Intensity has limits [0, 2100]; a read 9 ms after a set returns the previous
 #   value, one 0.3 s after returns the new one (#330).
 # - The stand's PFS button ignores the soft limits above (#331).
+# Measured in session 3 (2026-11-10, #401):
+# - Under lock, turning the knob clockwise lowers Z, away from the sample (#208).
+# - A turn takes Z down to 500 µm and back to where it was, inside the call, whatever the start
+#   (1.0-4.3 s, longer from higher up). The 500 read at the return of a 10x -> 4x turn is stale
+#   (FM-188: the next read, 10 ms later, was back at the start); smc's turn line reports the settled
+#   Z. The stand's own parfocal steps from the 10x are +8.7 µm for the 4x and -47.5 µm for the 40x.
+#   Seen once (inferred): a turn left unseated stood at Z 485 µm, and seating the objective raised
+#   Z to 3657 µm, where it had been.
+# - The PFS offset changes on a turn (read: 9370 after a turn to the 10x, also at power-on, 17794
+#   after one to the 40x, unchanged after one to the 4x). That the stand remembers an offset per
+#   objective and restores it is inferred from these reads. A first lock sets the floor after the
+#   last turn, right before it engages.
+# - A command sometimes fails to load the configuration: three of about ten commands in a row did,
+#   `Error in device "Ti2-E__0": (Error message unavailable) (-10)` twice and once PVCAM's
+#   `pl_cam_open failed (PL_ERR_DDI_DEVICE_OPEN_FAILED)` (F10, #411). A failed load sends nothing
+#   and the next command loads; the cause is inferred (the previous command's release of the
+#   stand not finished).

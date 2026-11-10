@@ -1955,8 +1955,13 @@ def test_nikon_ti2_profile_holds_the_owner_limits_and_filter_turret2() -> None:
     assert loaded.safety.turret_requires_confirm is True
     assert loaded.micromanager.device_timeout_ms == 60_000
     assert loaded.config_path() == (PROFILES_DIR / "nikon-ti2.cfg").resolve()
-    # What session 1 measured at 10x (#208), and the offset jog chosen from it.
-    assert loaded.autofocus.offset_per_um == {"2-Plan Fluor 10x": 5.9}
+    # What sessions 1-3 measured under lock: the smallest factor per objective is
+    # entered (session 3's 10x 6.34 is above the 5.9 of session 1, and its 40x
+    # intervals gave 117.8, 116.1 and 112.6), and the offset jog chosen from session 1.
+    assert loaded.autofocus.offset_per_um == {
+        "2-Plan Fluor 10x": 5.9,
+        "3-Plan Apo LmbdD0.25 40x": 112.6,
+    }
     assert loaded.autofocus.offset_unit == "PFSOffset units"
     assert loaded.autofocus.in_range_property == "PFS in Range"
     assert loaded.autofocus.in_range_values == ["In Range"]
@@ -1967,11 +1972,10 @@ def test_nikon_ti2_profile_holds_the_owner_limits_and_filter_turret2() -> None:
         Role.focus,
         Role.autofocus_offset,
     )
-    # What no session has measured stays unknown, never guessed: the offset
-    # device exposes no limits, and the lock time is not a settling time.
-    assert loaded.camera.pixel_size_um == {}
+    # What no session has measured stays unknown, never guessed: the lock time is
+    # not a settling time. (The pixel sizes and the offset limits session 3 measured
+    # are asserted in test_ti2_profile_session3.py.)
     assert loaded.autofocus.lock_timeout_s is None
-    assert loaded.safety.autofocus_offset_soft_limits is None
 
 
 def test_the_ti2_profile_declares_how_it_engages() -> None:
