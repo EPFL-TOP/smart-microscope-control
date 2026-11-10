@@ -1360,6 +1360,64 @@ def test_new_numeric_engage_keys_refuse_a_toml_boolean(
     assert getattr(getattr(loaded, section), key) == 1.0
 
 
+# -- a first lock's rise (m2 §12.11 D8) ---------------------------------------------
+
+
+def test_first_lock_max_rise_um_defaults_to_none(tmp_path: Path) -> None:
+    # Unset, a first lock's bound toward the sample is E, as before #402.
+    profile = Profile.load(write_profile(tmp_path / "p.toml", ""))
+    assert profile.safety.first_lock_max_rise_um is None
+    assert Profile.demo().safety.first_lock_max_rise_um is None
+
+
+@pytest.mark.parametrize("value", ["0.0", "-1.0", "inf", "nan"])
+def test_first_lock_max_rise_um_must_be_positive_and_finite(
+    tmp_path: Path, value: str
+) -> None:
+    msg = _load_error(tmp_path, f"[safety]\nfirst_lock_max_rise_um = {value}\n")
+    assert "safety.first_lock_max_rise_um" in msg
+    assert (
+        f"first_lock_max_rise_um must be a positive, finite number of µm, got {value}"
+    ) in msg
+
+
+def test_first_lock_max_rise_um_refuses_a_boolean(tmp_path: Path) -> None:
+    # pydantic's lax mode would read `true` as a 1 µm bound (#106).
+    msg = _load_error(tmp_path, "[safety]\nfirst_lock_max_rise_um = true\n")
+    assert "safety.first_lock_max_rise_um" in msg
+    assert "first_lock_max_rise_um must be a number, not a boolean (got true)" in msg
+    integers = write_profile(
+        tmp_path / "ints.toml", "[safety]\nfirst_lock_max_rise_um = 5\n"
+    )
+    assert Profile.load(integers).safety.first_lock_max_rise_um == 5.0
+
+
+def test_first_lock_max_rise_um_above_max_engage_excursion_um_is_refused(
+    tmp_path: Path,
+) -> None:
+    # A first lock bounded more loosely than an engage at a seen offset is a
+    # mistake; equal is accepted (the `<` and `<=` mutants die here).
+    msg = _load_error(
+        tmp_path,
+        "[safety]\nmax_engage_excursion_um = 50.0\nfirst_lock_max_rise_um = 50.5\n",
+    )
+    assert (
+        "first_lock_max_rise_um (50.5 µm) must not be above max_engage_excursion_um "
+        "(50 µm): a first lock bounded more loosely than an engage at a seen offset "
+        "(m2 §12.11 D8)"
+    ) in msg
+    equal = write_profile(
+        tmp_path / "equal.toml",
+        "[safety]\nmax_engage_excursion_um = 50.0\nfirst_lock_max_rise_um = 50.0\n",
+    )
+    assert Profile.load(equal).safety.first_lock_max_rise_um == 50.0
+    # Without E, R alone loads: a first lock needs E anyway (m2 §12.10.4).
+    alone = write_profile(
+        tmp_path / "alone.toml", "[safety]\nfirst_lock_max_rise_um = 80.0\n"
+    )
+    assert Profile.load(alone).safety.first_lock_max_rise_um == 80.0
+
+
 # -- a first lock from below (m2 §12.10.3) ------------------------------------------
 
 
@@ -1923,6 +1981,8 @@ def test_the_ti2_profile_declares_how_it_engages() -> None:
     assert loaded.autofocus.settle_s == 1.0
     assert loaded.autofocus.settle_tolerance_um == 0.5
     assert loaded.safety.max_engage_excursion_um == 50.0
+    # Chosen (m2 §12.11 D8, #402): a first lock asks for a drop.
+    assert loaded.safety.first_lock_max_rise_um == 5.0
 
 
 def test_nikon_tie_profile_sets_no_limit_beyond_the_layers_defaults() -> None:

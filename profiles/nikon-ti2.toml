@@ -32,6 +32,7 @@ stop_refused_by = ["xy_stage", "focus", "autofocus_offset"]  # measured, session
 # beyond where it started or held. Session 1 jumped +235 µm (#205), and the stand's button
 # +206.6 µm in session 2 (#334); at an offset seen locked, an engage moved Z 0.00 µm (#334).
 max_engage_excursion_um = 50.0
+first_lock_max_rise_um = 5.0  # chosen (m2 §12.11 D8, #402): a first lock asks for a drop; F11 rose 56.8 µm at the 40x under E alone
 # z_away_from_sample = "decreasing"  # inferred, not seen (#98): declared at the visit once seen from the side (m2 §12.10.7)
 
 [autofocus]

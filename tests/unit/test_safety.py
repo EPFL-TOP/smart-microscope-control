@@ -292,3 +292,33 @@ def test_safety_refuses_an_unknown_z_away_from_sample(value: object) -> None:
         assert _offset_safety(z_away_from_sample=accepted).z_away_from_sample == (
             accepted
         )
+
+
+@pytest.mark.parametrize("value", [0.0, -1.0, math.inf, math.nan])
+def test_safety_refuses_a_first_lock_rise_that_is_not_positive_and_finite(
+    value: float,
+) -> None:
+    # Code builds Safety without a profile (m2 §12.11 D8): it checks R itself.
+    with pytest.raises(ValueError, match="first_lock_max_rise_um") as refused:
+        _offset_safety(first_lock_max_rise_um=value)
+    assert str(refused.value) == (
+        f"first_lock_max_rise_um must be finite and > 0, got {value!r}"
+    )
+    assert _offset_safety().first_lock_max_rise_um is None
+    accepted = _offset_safety(first_lock_max_rise_um=5)
+    assert accepted.first_lock_max_rise_um == 5.0
+    assert type(accepted.first_lock_max_rise_um) is float
+
+
+def test_safety_refuses_a_first_lock_rise_above_the_excursion() -> None:
+    with pytest.raises(ValueError, match="first_lock_max_rise_um") as refused:
+        _offset_safety(max_engage_excursion_um=50.0, first_lock_max_rise_um=50.5)
+    assert str(refused.value) == (
+        "first_lock_max_rise_um (50.5 µm) must not be above max_engage_excursion_um "
+        "(50 µm): a first lock bounded more loosely than an engage at a seen offset "
+        "(m2 §12.11 D8)"
+    )
+    equal = _offset_safety(max_engage_excursion_um=50.0, first_lock_max_rise_um=50.0)
+    assert equal.first_lock_max_rise_um == 50.0
+    # Without E, R alone is accepted: a first lock needs E anyway.
+    assert _offset_safety(first_lock_max_rise_um=80.0).first_lock_max_rise_um == 80.0

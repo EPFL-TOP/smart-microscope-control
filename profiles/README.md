@@ -63,6 +63,7 @@ turret_requires_confirm = true
 # stop_refused_by = []         # roles whose device refuses stop(), measured at the stand
 # max_engage_excursion_um = 50.0  # omitted: only z_soft_limits_um bound Z while the autofocus engages
 # z_away_from_sample = "decreasing"  # which way Z moves away from the sample, "decreasing" or "increasing"; seen at the stand, never guessed (m2 §12.10, #98)
+# first_lock_max_rise_um = 5.0  # how far Z may move toward the sample during a first lock from the floor; omitted: max_engage_excursion_um (m2 §12.11)
 
 [camera]
 pixel_size_um = { "Nikon 10X S Fluor" = 0.65, "Nikon 40X Plan Fluor ELWD" = 0.1625 }
@@ -117,6 +118,7 @@ reference = ""                 # "" = no offsets: the objective every offset is 
 | `autofocus.settle_s` / `settle_tolerance_um` | With `settle_s` > 0, `engage()` returns `True` only once every Z read of the last `settle_s` seconds lies within `settle_tolerance_um` µm of each other, still locked; a lock that has not settled by the lock timeout is switched off and is `False`. `settle_s` is in [0, 60] s and below `lock_timeout_s` (5 s when unset), which bounds the lock and the settling together; the tolerance is positive and finite. `0` (the default): the first locked read ends the wait (m2 §12.2 D3). |
 | `safety.max_engage_excursion_um` | How far Z may move while the autofocus engages, beyond where it started (or, for the relock after a Z move, where it held focus before). Beyond it, or past `z_soft_limits_um`, the autofocus is switched off and `AutofocusExcursionError` is raised. Z is read every 10 ms, so this limits a jump, it does not prevent one. Omitted: only the soft limits bound it. Positive and finite (m2 §12.2 D2). |
 | `safety.z_away_from_sample` | Which way Z moves away from the sample: `"decreasing"` or `"increasing"`, a reading of Z and not a gesture (on an upright or a light-sheet stand, "down" is not a sign of Z). Seen at the stand from the side, never guessed (#98). With it, `autofocus_offset_soft_limits`, `max_engage_excursion_um` and a focus drive, `engage()` on a stand that declares `engage_drives_z_to_offset` also engages an offset never seen locked when it is at or below the offset's floor (the lower bound of `autofocus_offset_soft_limits`): a *first lock from below*, whose band bounds Z only toward the sample. Omitted: unknown, and no first lock runs; the refusal names what is missing. Any other value, a boolean included, is refused (m2 §12.10). |
+| `safety.first_lock_max_rise_um` | How far Z may move toward the sample during a first lock from the floor (`R`). A first lock asks for a drop, so any rise means the floor's plane was not below where Z started: past `R` the autofocus is switched off and `AutofocusExcursionError` says so. It also bounds an `engage()` at or below the floor at an offset already seen locked elsewhere, which is a first lock again while the autofocus is off (one floor named planes 104 µm apart in two wells, #402). Omitted: `max_engage_excursion_um`. Positive and finite, and not above `max_engage_excursion_um` when both are set (equal is accepted). One value for every objective (m2 §12.11 D8, D9). |
 | `safety.stop_refused_by` | The roles whose device refuses `stop()`, among `xy_stage`, `focus` and `autofocus_offset`, each named once; empty (the default) declares nothing. A hardware session fills it from what the stand did, and `test_a_declared_stop_refusal_still_holds` checks it at each later session. The stop is still sent, so a firmware that accepts it still stops. What changes is what smc says: a move under way on a declared role runs to its target, `smc stage`/`smc z` moves and `smc run` print a `!` line saying so before anything is sent, and the Ctrl-C line, `close()` and the emergency stop name the refusal instead of "stopped" (m2 §11). |
 | `safety.turret_requires_confirm` | `true` (the default): `ObjectiveTurret.select()` refuses unless the call passes `confirm=True`, because turning the nosepiece can drive an objective into a loaded plate. `false`: it turns without `confirm`, and an INFO line says so whenever a select passes none. Either way, a turn switches the autofocus off first and never engages it again. |
 | `light_source.intensity_property` | The `light_source` device's property that sets how bright, in the device's own units. Used when the device has it and it is writable; otherwise a WARNING, and the hints decide. `""`: the first writable numeric property whose name holds `intensity`, `brightness`, `power`, `level` or `voltage`, one with limits first. With none, the light source has no knob, and `set_intensity_native()` refuses. |
@@ -134,7 +136,8 @@ copy; the owner decides whether to commit it.
 
 The new numeric keys (`lock_timeout_s`, `offset_per_um`'s values,
 `max_autofocus_offset_jog`, the offset soft limits, `settle_s`,
-`settle_tolerance_um`, `max_engage_excursion_um`) refuse a TOML boolean
+`settle_tolerance_um`, `max_engage_excursion_um`, `first_lock_max_rise_um`)
+refuse a TOML boolean
 (`true` would otherwise load as `1.0`) and accept an integer.
 
 Errors name the file, the dotted key and what to change, e.g.

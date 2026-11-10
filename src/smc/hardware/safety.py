@@ -113,6 +113,7 @@ class Safety:
         stop_refused_by: frozenset[str] = frozenset(),
         max_engage_excursion_um: float | None = None,
         z_away_from_sample: Literal["decreasing", "increasing"] | None = None,
+        first_lock_max_rise_um: float | None = None,
     ) -> None:
         #: The roles' values whose device refuses ``stop()`` (``"xy_stage"``):
         #: the backends set ``Motion.stop_refused`` from it (m2 §11.3).
@@ -141,6 +142,30 @@ class Safety:
         #: started or held; ``None``: only the Z soft limits bound it (m2 §12).
         self.max_engage_excursion_um = (
             None if max_engage_excursion_um is None else float(max_engage_excursion_um)
+        )
+        # As the profile validates it, for code that builds this (m2 §12.11 D8).
+        if first_lock_max_rise_um is not None and (
+            not math.isfinite(first_lock_max_rise_um) or first_lock_max_rise_um <= 0
+        ):
+            raise ValueError(
+                f"first_lock_max_rise_um must be finite and > 0, got "
+                f"{first_lock_max_rise_um!r}"
+            )
+        if (
+            first_lock_max_rise_um is not None
+            and self.max_engage_excursion_um is not None
+            and first_lock_max_rise_um > self.max_engage_excursion_um
+        ):
+            raise ValueError(
+                f"first_lock_max_rise_um ({first_lock_max_rise_um:g} µm) must not be "
+                f"above max_engage_excursion_um ({self.max_engage_excursion_um:g} "
+                f"µm): a first lock bounded more loosely than an engage at a seen "
+                f"offset (m2 §12.11 D8)"
+            )
+        #: How far Z may move toward the sample during a first lock from the
+        #: floor; ``None``: ``max_engage_excursion_um`` (m2 §12.11 D8).
+        self.first_lock_max_rise_um = (
+            None if first_lock_max_rise_um is None else float(first_lock_max_rise_um)
         )
         if not math.isfinite(max_jog_um) or max_jog_um < 0:
             raise ValueError(f"max_jog_um must be finite and >= 0, got {max_jog_um!r}")
