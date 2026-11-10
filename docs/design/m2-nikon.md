@@ -5,7 +5,8 @@
   (2026-10-19); §8 for #14 (2026-10-19); §8.10 for #167 (2026-10-20); §9
   for #48 (2026-10-20); §10 for #15 (2026-10-20); §11 for #204 and #206
   (2026-10-28), §11.11 for #224 (2026-10-30); §12 for #205 (2026-10-28);
-  §13 for #340 (2026-11-05).
+  §13 for #340 (2026-11-05); §8.11 D8 and §12.10's amendments for #407
+  (2026-11-10).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1, this document is the contract between issues that are
   built in parallel. Names, module paths and signatures below are fixed; an
@@ -1691,6 +1692,7 @@ row says. Each row says what the layer does about it.
 | A turn of `Nosepiece`, 10× → 4× → 10× | `setState` returns after about 1.0 s (0.99 s, 1.07 s); `deviceBusy("Nosepiece")` never reads true. | The call is the wait: the turn's busy poll returns at the first read, as the XY and Z moves do (#221). |
 | PFS during a turn | PFS on and searching (no sample): **the stand switched it off by itself**; `PFS` enabled read false at the call's return. A locked PFS was not tried. | §8.3's switch-off stays (§8.3, "Why the switch-off"). |
 | Z during a turn | Z read 561.5 µm before and **500.0 µm when the call returned**; 0.02 s later 570.26 µm, settled at 570.22 µm with the 4× (+8.7 µm); back with the 10× it read 561.48, then 561.44 µm. The operator heard a different mechanical noise and a beep. | A read of Z at the return can catch the stand mid-move: §8.11 D2 reads Z until still and reports before and after. |
+| `PFSOffset` across a turn, PFS off (session 3, #405 F3/F5) | **The stand puts an offset of its own in place.** From 0 (the floor), the turn to the 10× read **9370** and the turn to the 40× **17794**; the turn to the 4× left 0 as it was. The 10× read 9370 at power-on too, although session 2 had left 8141; the contracts' turns left 9370 behind. smc wrote nothing across these turns, and with PFS off an offset write moves no Z (§12.10.1). Each read came seconds after the turn, between commands: **when the offset lands against the call's return was not read**. The reading "an offset per objective, put back on a turn, none for the 4×" is inferred from these reads (`nikon-ti2.md`, *Session 3*). | §8.11 D8: the drive's text names the change; §12.10 D7: `--floor` comes after the last turn. |
 | `DiaLamp` `Intensity` | Limits [0, 2100]; 501 at the start. Set to 210, read 0.3 s later: 210. Set back to 501, read **9 ms later: 210 (the previous value)**; read 14 s later: 501. | §8.11 D1: the readback is re-read until fresh, within a bound. |
 | `setConfig("Channel", "BF")` | Returns after **7.1 s**; no device of the preset read busy at any point. Before it, `LightPath` read `1-EYE` and `CondenserTurret` `1-OPEN` (the preset sets `4-L100` and `7-N2`). Afterwards every value matched the preset, `Camera-1` `Exposure` reading `10.0000` for the preset's `10`. Which device takes the time is unknown. | §8.11 D5: a 7 s select is acceptable on the page; the page's other actions are refused meanwhile. |
 | `getCurrentConfig("Channel")` after that select | Read `""` (FM-100, confirmed on the stand). | `Channels.current()` compares numbers as numbers (§8.5); not run through smc on the stand. |
@@ -2026,6 +2028,76 @@ is not a second mutating call: the two reads are reads (m5 §6.1).
 nothing" to "sends nothing" for a refused turn: Z is read first. The CLI
 prints the text, the page shows it as the outcome; neither changes.
 
+**D8. The drive's text also names a change of the autofocus offset (#407).**
+Session 3 read an offset of the stand's own come back across a turn (§8.9:
+0 → 9370 at the 10×, 0 → 17794 at the 40×), and smc's text said only what
+Z did: the operator learned of it from `smc autofocus offset` or not at
+all. `drive.set_objective` reads `Autofocus.offset_native()` where D7 reads Z,
+and says what the two reads show. It is not a second mutating call (m5 §6.1).
+
+- **When.** The stand has an `Autofocus` (`microscope.get`) and it is not a
+  dry run (nothing turns). The first read comes just before
+  `turret.select(...)` and the second just after `turret.current()`, beside
+  D7's two Z reads; a turn that is refused or raises says nothing about the
+  offset, as it says nothing about Z.
+- **Compared exactly.** The offset is in the device's own units, no
+  tolerance can be given without a measurement, and a device that holds an
+  offset reads it back identically (`PFSOffset` read 9370 on every call of
+  session 3; the seen offsets are compared the same way, §12.2 D1). Any
+  difference counts.
+- **The words**, a clause after D7's Z clause (or in its place), in the
+  offset's own unit (`device units` when the profile names none); numbers
+  `:g`:
+  - changed: `; the autofocus offset went from 0 to 9370 PFSOffset units`;
+  - either read failed: `; the autofocus offset could not be read around the
+    turn (<cause>)`, with the cause as text on one line (the layer logs
+    nothing for this read, so the cause goes here, FM-170; FM-98);
+  - unchanged, no autofocus, or dry run: no clause: today's text.
+
+  So `objective '2-Plan Fluor 10x'; the stand moved Z from 3006.96 to 2998.04
+  µm (-8.92 µm); the autofocus offset went from 0 to 9370 PFSOffset units`.
+  The clause follows either of today's texts (`although ... was asked`
+  included); `reached` is today's.
+- **It says what was read, not why.** "The stand's value for this
+  objective" is an inference (§8.9), the 4× shows none, and the change is
+  the stand's whatever its reason: smc wrote nothing across the turn.
+- **Not chosen: a line in the turret's own INFO log.** Two places that
+  disagree on what the offset was are worse than one. Nothing but the drive
+  turns the turret for an operator, and `objective-offsets`' turns do not
+  engage PFS.
+- **Not chosen: waiting for the offset as D2 waits for Z.** When it lands
+  against the call's return is not measured (§8.11.3); a wait would be a
+  number made up. The two reads are one after the other, and FM-188 and FM-195
+  are the risk (below).
+- **The risk, named.** The second read comes after the turret's own wait for
+  Z (D2), so on a stand with a focus drive it is at least `TURN_Z_SETTLE_S`
+  (0.1 s) after the call returned (FM-195). A restore that lands after it is
+  missed: the text is today's, which says nothing false. A read that
+  catches the offset on its way would say a value that is neither: no stand
+  has shown it, and the visit reads `PFSOffset` every 10 ms across a turn
+  (§8.11.3).
+- **`FakeCore` gets the stand's quirk** (D6's family), so that the text and
+  the engage guard are tested against a stand whose turn changes the offset:
+
+  ```python
+  def set_offset_on_turn(
+      self, label: str, offset: float, *, device: str | None = None
+  ) -> None: ...
+  ```
+
+  A turn of **any `State` device** to the position named `label` (that moves
+  it: a turn to the position it is at changes nothing) sets the autofocus
+  offset to `offset`, held as the device holds it (`hold_whole_units`
+  applies). `device` is the label of the loaded `Stage` that is the offset
+  device (the Ti2-E's `PFSOffset`); `None` is the AutoFocus slot's own
+  offset (the demo's). It is set on the store and not logged: the stand's
+  own doing is no call of smc, and `log` stays what smc sent. Several labels
+  may be registered, each with its offset, and the latest registration of a
+  label wins. `ValueError` for a `label` that is no position of a loaded
+  `State` device, a `device` that is no loaded `Stage`, and `device=None`
+  with no device in the AutoFocus slot (FM-119: a misspelt label would build
+  a stand that never restores, and a test that passes).
+
 #### 8.11.3 Not verified
 
 - D1's bound against the real lag (§8.9): 1 s is assumed, and the visit
@@ -2035,6 +2107,12 @@ prints the text, the page shows it as the outcome; neither changes.
   escape at 500.0 µm may be fixed or relative (§8.9), and Z may need longer
   than the core timeout from Z about 4195 µm.
 - D3: that the label is fresh at the return of a turn.
+- D8: when `PFSOffset` reaches the stand's own value against the return of
+  the call, and whether it passes through other values on the way. Session
+  3 read it between commands. The visit reads `PFSOffset` with Z every 10 ms
+  from the call until 1 s after it, PFS off, on 10× → 4× → 10× → 40× → 10×
+  (`turn_reads.py` gains the read), and notes whether the first read after
+  the return is the final one.
 - That the Ti2-E reads the label, the lamp and Z fast enough for the
   windows: `POLL_INTERVAL_S` is 10 ms, and a read there costs 0.00–0.05 ms
   (session 2).
@@ -3630,8 +3708,16 @@ Measured in Ti2-E sessions 1 and 2 (#208, #334), unless labelled:
   soft limit is 15-95 µm short of it, a bound and not a procedure.
 - **A turn moves Z by itself** (+8.7 µm with the 4×) and switches PFS off
   (#330).
+- **A turn also changes the offset** (session 3, #405 F3/F5; §8.9): from 0,
+  the turn to the 10× read 9370 and the turn to the 40× 17794, and the turn
+  to the 4× left 0. The 10× read 9370 at power-on too, so 9370 was never the
+  operator's: it is the offset of session 1's and 2's button jumps. The
+  reading is "an offset per objective, put back on a turn" (inferred, the
+  4× shows none). What follows from the reads alone: **an offset set before
+  a turn is not the offset after it**, whichever objective is turned to.
 - **`PFSOffset` exposes no property limits**; the values seen are
-  7803-9420 (#208). Which values the device accepts is unknown.
+  7803-9420 (#208), and session 3 read 0 to 20000 back as written and
+  24370 for a write of 30000. Which values the device accepts is unknown.
 
 #### 12.10.2 Decisions
 
@@ -3734,6 +3820,39 @@ stand's button (§12.10.5). The page gains no control here: its autofocus
 control engages as today and shows the same refusal. A control for the
 floor on the page is M5's (m5 §6.2), if the operator asks for one.
 
+*Amended by #407.* **`--floor` comes after the last turn.** A turn changes
+the offset (§12.10.1), so a floor set before it is gone after it, and an
+engage would then be at the stand's own offset for the new objective:
+unseen, refused. In step 1's terms: turn to the objective first, focus by
+eye with PFS off, then `--floor`, then `engage`. The turn's own text says
+when the offset changed (§8.11 D8), so the operator sees it before the
+refusal does.
+
+**A turn forgets no seen offset (#407, decided).** The question (#364,
+item 3, asked again by #407): after a turn, must an engage refuse an offset
+because it is the one the stand put back? It already does when it matters,
+and needs nothing new:
+
+- **The seen offsets are keyed by objective**, and a turn changes the
+  objective: an offset seen locked at the 10× is no offset seen at the 4×,
+  even when the stand leaves the same number there.
+  `tests/unit/test_engage_guard.py::test_a_seen_offset_with_another_objective_in_place_is_refused`
+  already pins it, for a turn made at the stand.
+- **A turn records nothing.** It switches PFS off first (§8.3), so no read
+  after it finds a lock; and a restored offset that was never read locked
+  with that objective is unseen, and is refused with the first-lock advice
+  (measured on `FakeCore` with the Ti2-E's layout, 2026-11-10: the 40×'s
+  restored 17794).
+- **A restored offset that was seen locked is a seen one, rightly.** It is
+  the plane PFS held with that objective on this sample, which is D1's
+  premise, and D2's band bounds the jump. Forgetting it on every turn would
+  make "turn away and back, then engage" a first lock again for no gain in
+  safety, on the page that stays open. D9 (§12.11) applies on top: at or
+  below the floor, `engage()` is a first lock whether or not the floor was
+  seen.
+- What #364's item 3 asks, forgetting at a *sample* change, stays M5's: a
+  turn is not one.
+
 #### 12.10.3 Profile — `profile.py`
 
 ```toml
@@ -3824,6 +3943,33 @@ def set_autofocus_offset(microscope: Microscope, value: float | None) -> DriveRe
 - `smc autofocus offset` reads only: `offset 8141 PFSOffset units, soft
   limits [5000, 12000]`, or `…, no soft limits in the profile (no floor:
   no first lock)`.
+  *Amended by #407*: **an offset outside the soft limits says so.** Session
+  3 read `offset 24370 PFSOffset units, soft limits [0, 20000]` and nothing
+  said that 24370 lies outside what smc may set. The limits bound smc's
+  writes, never the stand's (a turn restores, the knob under lock moves it),
+  so a value outside them is the stand's. With a finite offset below the
+  lower bound or above the upper one (the bounds themselves are inside), a
+  clause follows the limits, a colon first, and `reached` stays true: the
+  read worked, and a finding is not a failure of it.
+  - Below: `offset -5 PFSOffset units, soft limits [0, 20000]: below them;
+    smc would not set an offset there`.
+  - Above, on a stand that declares `engage_drives_z_to_offset`: `offset
+    24370 PFSOffset units, soft limits [0, 20000]: above them; smc would not
+    set an offset there, and here it engages only at an offset it has read
+    locked with this objective (m2 §12.2 D1), and the stand's own button
+    would drive Z to the plane this offset names, as it did from 9370 (m2
+    §12.1)`.
+  - Above, on a stand that does not declare it: the first clause only,
+    `…: above them; smc would not set an offset there`. The consequences of
+    the last clause are the declared stand's (D1, §12.1).
+  - **Why the two sides differ.** Measured on `FakeCore` with the Ti2-E's
+    layout (2026-11-10): above the limits an engage at an offset not read
+    locked is refused, and one at an offset read locked engages; below the
+    floor an unseen engage is a first lock (D4), not a refusal. What a
+    value below the floor means on the stand is #364's first item, open, and
+    the Ti2-E has never been written below 0 (§12.11.4): the text claims
+    only what is certain there.
+  - An offset that is not finite gets no clause: it lies on no side.
 - `smc autofocus offset --to VALUE` or `--floor` (one of the two;
   `--dry-run` as the other drive commands) calls `set_offset_native`, then
   prints the readback: `offset 5000 PFSOffset units`. A readback that
@@ -3858,7 +4004,9 @@ step 4 brings an objective toward a sample at 40×.
    do not take the 40×.
 4. **The 40×.**
    - `smc autofocus disengage`, `smc z get`, `smc objective set "3-Plan Apo
-     LmbdD0.25 40x" --confirm`, `smc z get` (#330).
+     LmbdD0.25 40x" --confirm`, `smc z get` (#330). The turn's text names
+     the offset when the stand changed it (§8.11 D8), and `--floor` below
+     comes after the turn for that reason (D7, #407).
    - Focus by eye with PFS off; `smc z get` gives the by-eye focus.
    - `smc autofocus offset --floor`, `smc autofocus engage`, and `smc z
      get` at once: Z must be below the by-eye focus.
