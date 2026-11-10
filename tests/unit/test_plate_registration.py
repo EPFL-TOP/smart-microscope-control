@@ -461,6 +461,59 @@ def test_a_rotation_just_inside_the_bound_is_accepted() -> None:
     assert calibrate("96-well", refs).rotation_deg == pytest.approx(9.9, abs=1e-9)
 
 
+# ---- the lab's Greiner 24-well plate (m3 §22, #400) -------------------------
+
+#: Session 3's hand centres of the Ti2-E's Greiner plate (2026-11-10, #405), µm.
+SESSION_3_CENTRES = (
+    ("B3", 10003.0, -10051.0),
+    ("B5", -28982.0, -9919.0),
+    ("C3", 10031.0, 9375.0),
+)
+
+
+def test_centres_at_the_greiner_pitch_fit_its_plate_and_not_24_well() -> None:
+    """19.45 mm against useq's 19.0: the scale check refuses ``24-well`` and the lab plate fits."""
+    refs = _measure("greiner-24-well", (5000.0, -3000.0), 0.3, ["A1", "A6", "D1"])
+
+    cal = calibrate("greiner-24-well", refs)
+
+    assert cal.rotation_deg == pytest.approx(0.3, abs=1e-6)
+    assert cal.residual_um is not None
+    assert cal.residual_um < 1.0
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            "the measured well spacing is off the 24-well definition by +2.4%"
+        ),
+    ):
+        calibrate("24-well", refs)
+
+
+def test_session_3s_hand_centres_fit_the_greiner_plate_once_turned_180_degrees() -> (
+    None
+):
+    """The plate lay turned 180° in its holder (#414): negated, its centres fit the lab plate."""
+    refs = [WellRef(well=w, x_um=-x, y_um=-y) for w, x, y in SESSION_3_CENTRES]
+
+    cal = calibrate("greiner-24-well", refs)
+
+    assert abs(cal.rotation_deg) < 1.0  # measured -0.21°
+    assert cal.residual_um is not None
+    assert cal.residual_um < 100.0  # plate-walls' max_residual_um; measured 44.5
+    assert cal.scale_error is not None
+    assert abs(cal.scale_error) < 0.02  # measured +0.0007
+
+
+def test_session_3s_hand_centres_as_measured_are_refused_as_turned_180_degrees() -> (
+    None
+):
+    """As read at the stand the fit turns the plate 179.8°; #414 changes this refusal."""
+    refs = [WellRef(well=w, x_um=x, y_um=y) for w, x, y in SESSION_3_CENTRES]
+
+    with pytest.raises(ValueError, match=re.escape("turns the plate by 179.8°")):
+        calibrate("greiner-24-well", refs)
+
+
 # ---- the round trip against useq's forward model -------------------------
 
 _NAMES = {plate: tuple(nominal_offsets(plate)) for plate in PLATES}
