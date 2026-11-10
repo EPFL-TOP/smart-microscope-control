@@ -902,18 +902,44 @@ def test_command_pairs_let_param_win_over_the_preset() -> None:
     ]
 
 
-def test_command_pairs_hold_the_plate_for_plate_registration_and_nothing_else() -> None:
+def test_command_pairs_hold_the_plate_for_the_tools_that_take_it_and_nothing_else() -> (
+    None
+):
     check = _applied()
 
     assert command_pairs(check, "plate-registration", []) == ["plate=96-well"]
+    # plate-walls (#371): its `plate` is not kept under params, so the command takes
+    # it from here; without it the run would use the plugin's default plate, silently.
+    assert command_pairs(check, "plate-walls", []) == ["plate=96-well"]
     assert command_pairs(check, "cells", []) == ["detector=blobs"]
     assert command_pairs(check, "density", []) == []
+
+
+def test_every_key_a_preset_holds_as_its_own_field_is_passed_by_command_pairs() -> None:
+    # The two tables are one rule: a key `NOT_IN_PARAMS` says the preset holds as
+    # its plate or its wells must be one `command_pairs` hands the plugin, or the
+    # plugin runs on its own default and nothing says so (#371, FM-43).
+    check = PresetCheck("weekly", "24-well", "A1", {}, ())
+    held = [
+        (plugin, key)
+        for plugin, keys in NOT_IN_PARAMS.items()
+        for key in keys
+        if key in ("plate", "wells")
+    ]
+    assert ("plate-walls", "plate") in held
+
+    # The key and the `PresetCheck` attribute that holds its value have one name, and
+    # the two values differ: a row bound to the other attribute hands `plate=A1`.
+    for plugin, key in held:
+        pairs = command_pairs(check, plugin, [])
+        assert f"{key}={getattr(check, key)}" in pairs, (plugin, key, pairs)
 
 
 def test_command_pairs_leave_out_a_plate_that_was_not_applied() -> None:
     check = PresetCheck("weekly", None, None, {"cells": ("detector=blobs",)}, ())
 
     assert command_pairs(check, "plate-registration", []) == []
+    assert command_pairs(check, "plate-walls", []) == []
     assert command_pairs(check, "scan-plan", ["coverage=1"]) == ["coverage=1"]
 
 
