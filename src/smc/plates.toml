@@ -1,0 +1,21 @@
+# The lab's own plate definitions (m3 §22). Read when smc is imported and
+# registered with useq under these names. A name, once used in a run
+# document, keeps its numbers: a corrected plate takes a new name (D5), and
+# tests/unit/test_lab_plates.py pins each published name's numbers.
+#
+# Each plate: rows and columns (counted), well_spacing_mm and well_size_mm as
+# [x, y] in mm (useq's units), circular_wells, and a source for each of the two
+# measures: kind = "measured" (where, when, how, the issue), "maker" (the
+# reference and its datasheet) or "assumed" (taken from elsewhere, not checked
+# on this plate). Names are lower case and end in -well, and never one of
+# useq's own (24-well, 96-well, ...).
+
+[plates.greiner-24-well]
+description = "Greiner Bio-One 24-well plate, standard bottom, catalogue reference not read yet; the Ti2-E's plate of sessions 2 and 3"
+rows = 4
+columns = 6
+well_spacing_mm = [19.45, 19.45]
+well_size_mm = [15.6, 15.6]
+circular_wells = true
+well_spacing_source = { kind = "measured", note = "Ti2-E session 3, 2026-11-10 (#405, #400): well centres from walls read by hand at 10x; column pitch 19.49 mm (B3 to B5), row pitch 19.43 mm (B3 to C3), plate square to 0.2 deg; 19.45 mm on both axes, the owner's decision" }
+well_size_source = { kind = "assumed", note = "useq's 24-well size; walls read at 10x in session 3 gave 15.28 to 15.61 mm (B3, B5, C3), and session 2 15.60 x 15.40 mm (B3)" }

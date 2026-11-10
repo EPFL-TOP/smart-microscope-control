@@ -51,6 +51,11 @@ walls is **not verified** (see the end).
    smc run plate-walls -p <profile> --run-doc run.json --param plate=24-well --param 'refs=[{"well": "A1", "x_um": 1000, "y_um": -2000}, {"well": "D6", "x_um": 97500, "y_um": -59900}]'
    ```
 
+   The Ti2-E's Greiner plate is `plate=greiner-24-well` (19.45 mm pitch), not
+   `24-well` (19.0 mm). A refusal of the spacing by a few percent (`the measured
+   well spacing is off the 24-well definition by +2.4%`) is the wrong plate
+   definition, not a bad measurement: see [Plate names](README.md#plate-names).
+
    The commands are written for a POSIX shell. In `cmd.exe` and PowerShell 5.1,
    escape each inner double quote with a backslash, as the
    [`smc run`](README.md#running-a-plugin-smc-run) page says:

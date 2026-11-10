@@ -9,6 +9,7 @@ messages) is [`docs/design/m3-plugins.md`](../design/m3-plugins.md) §1; this pa
 is how to use it.
 
 - [Running a plugin: `smc run`](#running-a-plugin-smc-run)
+- [Plate names](#plate-names)
 - [Trying the workflow without a microscope](#trying-the-workflow-without-a-microscope)
 - [Writing a plugin](#writing-a-plugin)
 - [The run document](#the-run-document)
@@ -204,6 +205,41 @@ scan: autofocus=off
 scan-plan: coverage=0.4
 $ smc run scan-plan -p demo-sample --preset weekly --run-doc next.json   # next.json has its plate registered
 ```
+
+## Plate names
+
+Every tool names its plate (`--param plate=…`, the page's plate menu, the profile's
+`[sample] plate`) by a `useq` key: `useq`'s own (`6-well`, `12-well`, `24-well`,
+`48-well`, `96-well`, `384-well`, `1536-well`) and the lab's, from
+[`src/smc/plates.toml`](../../src/smc/plates.toml), which `smc` registers with `useq`
+when it is imported. A lab plate is used exactly as a `useq` one.
+
+| Name | Rows x columns | Pitch (mm) | Well (mm) | Sources |
+|---|---|---|---|---|
+| `greiner-24-well` | 4 x 6 | 19.45 | 15.6, round | Greiner Bio-One 24-well, the Ti2-E's plate. Pitch **measured** in session 3 (2026-11-10, #405): 19.49 mm along the columns, 19.43 along the rows, 19.45 on both by the owner's decision. Well size **assumed**: `useq`'s 24-well. |
+
+`useq`'s `24-well` has a 19.0 mm pitch: a Greiner plate registered under that name
+is refused (`the measured well spacing is off the 24-well definition by +2.4%`), and
+it must not be fitted as one, which would put its sixth column 2.25 mm off.
+
+**Adding a plate.** Add a table to `src/smc/plates.toml` with every key the others
+have; each of the two measures says where it comes from: `measured` (where, when,
+how, the issue), `maker` (the reference and its datasheet) or `assumed` (taken from
+elsewhere, not checked on this plate). The name is lower case, ends in `-well`, and is
+never one of `useq`'s: `smc` refuses to import otherwise, naming the file and the
+plate. Add the plate's numbers to `PUBLISHED` in `tests/unit/test_lab_plates.py`, and
+a line to the table above.
+
+**A name keeps its numbers.** A run document stores the plate's name, not its
+geometry: editing a used plate's pitch would move every well of every run that names
+it, with nothing to say so. A corrected plate (the maker's datasheet replacing a
+measurement) takes a **new name**, such as `greiner-<catalogue>-24-well`; the old
+one stays, its description saying what replaced it (m3 §22 D5). The test above fails
+an edit in place until its literal is changed in the same commit.
+
+**`plate-finding`** fits every registered `-well` plate, the lab's included. A survey
+cannot tell `24-well` from `greiner-24-well`, 2.4 % apart, and says so
+(`… barely beats …`): name the plate, or give `plates`.
 
 ## Trying the workflow without a microscope
 
