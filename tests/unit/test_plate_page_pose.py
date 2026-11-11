@@ -229,6 +229,27 @@ def test_a_plate_registered_for_another_plate_leaves_the_estimate(
     assert _centres(view)["A1"] == pytest.approx((-48_225.0, 28_850.0), abs=0.01)
 
 
+def test_the_estimate_follows_the_plate_chosen_after_another_was_drawn(
+    holder_page: PlatePage,
+) -> None:
+    # The grid's centre offset is kept per plate, and the first plate drawn must not give
+    # its offset to the next: 875 µm and 2325 µm off for a 24-well after a 96-well, and
+    # every well named by the wrong place. One page, three views, the plate chosen between.
+    expected = {
+        "96-well": (-49_100.0, 31_175.0),
+        "greiner-24-well": (-48_225.0, 28_850.0),
+    }
+    for plate in ("96-well", "greiner-24-well", "96-well"):
+        holder_page.choose_plate(plate)
+
+        centres = _centres(holder_page.view())
+
+        assert centres["A1"] == pytest.approx(expected[plate], abs=0.01)
+        mean_x = sum(x for x, _ in centres.values()) / len(centres)
+        mean_y = sum(y for _, y in centres.values()) / len(centres)
+        assert (mean_x, mean_y) == pytest.approx(HOLDER_CENTRE, abs=0.01)
+
+
 def test_a_click_reads_the_wells_the_view_draws_on_an_estimated_map(
     holder_page: PlatePage,
 ) -> None:

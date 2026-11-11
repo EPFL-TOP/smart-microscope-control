@@ -26,6 +26,7 @@ if os.environ.get("SMC_REQUIRE_UI"):
 else:
     pn = pytest.importorskip("panel")
 
+from bokeh.models import LabelSet
 from pymmcore_plus import CMMCorePlus
 
 from smc.hardware import Microscope
@@ -118,7 +119,8 @@ class _Scripted:
     """The controller as one view reads it, with Live, the frame and the stage's position scripted.
 
     Everything else is the real controller's, so the view, the pose and the wells are the
-    page's own. ``frame_reads`` counts the reads of ``frame()``, to show what a tick asks for.
+    page's own. ``reads`` is the name of every attribute the view asked the controller for,
+    in order: it shows what a callback reads (FM-145).
     """
 
     def __init__(self, page: PlatePage) -> None:
@@ -126,18 +128,23 @@ class _Scripted:
         self.live = False
         self.frame_now: Frame | None = None
         self.stage_xy: tuple[float, float] | None = None
+        self.reads: list[str] = []
 
     def __getattr__(self, name: str) -> Any:
+        self.reads.append(name)
         return getattr(self._page, name)
 
     @property
     def is_live(self) -> bool:
+        self.reads.append("is_live")
         return self.live
 
     def frame(self) -> Frame | None:
+        self.reads.append("frame")
         return self.frame_now
 
     def status(self) -> PageStatus:
+        self.reads.append("status")
         return replace(self._page.status(), xy_um=self.stage_xy)
 
 
@@ -412,6 +419,86 @@ def test_a_frame_without_a_position_leaves_the_cross_where_it_was(
     scripted.stage_xy = p2
     view.tick()
     assert _cross(view)["x"] == [p1[0]]
+
+
+def test_a_live_frame_that_the_tick_draws_still_moves_the_cross(
+    page: PlatePage,
+) -> None:
+    # The tick draws a new frame too, and now and then it is the first to see one: the
+    # picture shown must not be newer than the cross that follows the frames.
+    view, scripted = _scripted(page)
+    p1, p2 = B3, (B3[0] + 500.0, B3[1] - 300.0)
+    scripted.live = True
+    scripted.frame_now = _frame(1, p1)
+    view.frame_tick()
+
+    scripted.frame_now = _frame(2, p2)
+    # The status says another place: in Live it is not what the cross follows.
+    scripted.stage_xy = (p2[0] + 700.0, p2[1])
+    view.tick()  # draws frame 2 before the frame tick does
+    view.frame_tick()  # finds nothing new
+
+    assert view.image_figure.title.text == "frame 2"
+    assert (_cross(view)["x"], _cross(view)["y"]) == ([p2[0]], [p2[1]])
+
+
+def test_a_snap_that_the_tick_draws_outside_live_never_moves_the_cross(
+    page: PlatePage,
+) -> None:
+    view, scripted = _scripted(page)
+    here, there = B3, (B3[0] + 2 * PITCH_UM, B3[1])
+    scripted.stage_xy = here
+    scripted.frame_now = _frame(1, there)
+
+    view.tick()  # draws the snap's frame, and the cross from the status
+
+    assert view.image_figure.title.text == "frame 1"
+    assert (_cross(view)["x"], _cross(view)["y"]) == ([here[0]], [here[1]])
+
+
+def test_frame_tick_in_live_reads_the_frame_and_whether_live_runs_and_nothing_else(
+    page: PlatePage,
+) -> None:
+    # FM-145: it runs ten times a second on the loop that handles STOP, so the cross it
+    # moves comes from the frame it has drawn: not the status (a device read) and not the
+    # view (339 ms for 1536 wells). A frame already drawn asks nothing more than the frame.
+    view, scripted = _scripted(page)
+    scripted.live = True
+    scripted.frame_now = _frame(1, B3)
+    scripted.reads.clear()
+
+    view.frame_tick()
+
+    assert scripted.reads == ["frame", "is_live"]
+    assert (_cross(view)["x"], _cross(view)["y"]) == ([B3[0]], [B3[1]])
+
+    scripted.reads.clear()
+    view.frame_tick()
+    assert scripted.reads == ["frame"]
+
+
+def test_the_label_is_a_labelset_over_the_stage_columns(page: PlatePage) -> None:
+    # The label the operator reads is this layout, wired to the cross's own source and to
+    # its `text` column; the data tests above would pass with the wrong column drawn.
+    view = PlatePageView(page)
+
+    labels = [
+        r
+        for r in view.figure.center
+        if isinstance(r, LabelSet) and r.source is view.stage_source
+    ]
+
+    assert len(labels) == 1
+    label = labels[0]
+    assert (label.x, label.y, label.text) == ("x", "y", "text")
+    assert (label.x_offset, label.y_offset) == (12, 12)
+    # The look the plan fixes: small, bold, on a white ground that lets the map show.
+    assert label.text_font_size == "11px"
+    assert label.text_font_style == "bold"
+    assert (label.background_fill_color, label.background_fill_alpha) == (
+        "#ffffff",
+        0.7,
+    )
 
 
 def test_a_second_tab_draws_the_same_pose_and_cross(

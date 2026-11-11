@@ -7,6 +7,7 @@ shell reads it, never compared with the string the code builds (FM-45).
 from __future__ import annotations
 
 import json
+import math
 import shlex
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
@@ -1045,6 +1046,34 @@ def test_stage_label_follows_the_rotation_of_a_square_well() -> None:
     # rectangle turned by 30°: a label that ignored the rotation would name C5.
     outside = (50000.0 + 1900.0, 800.0)
     assert stage_label(WELLS, MapPose("registered"), outside) == ""
+
+
+def _turned(
+    centre: tuple[float, float], u_um: float, v_um: float, degrees: float
+) -> tuple[float, float]:
+    """The stage point at ``(u, v)`` from ``centre`` in a plate turned by ``degrees``, written out."""
+    angle = math.radians(degrees)
+    return (
+        centre[0] + math.cos(angle) * u_um - math.sin(angle) * v_um,
+        centre[1] + math.sin(angle) * u_um + math.cos(angle) * v_um,
+    )
+
+
+def test_stage_label_tells_a_rectangle_from_a_disc_and_its_height_from_its_width() -> (
+    None
+):
+    # C5 is the turned 4000 by 2000 µm rectangle of WELLS: half-sizes 2000 (u) and 1000 (v).
+    c5 = (50000.0, 0.0)
+    registered = MapPose("registered")
+    # (1900, 900) is in the rectangle and outside the 2000 µm disc (2102 µm from the
+    # centre): a well passed on as a disc would not name it.
+    assert stage_label(WELLS, registered, _turned(c5, 1900.0, 900.0, 30.0)) == "over C5"
+    # (0, 1500) is in the disc and 500 µm above the rectangle's 1000: a well whose height
+    # was taken for its width (a 4000 µm square) would name it.
+    assert stage_label(WELLS, registered, _turned(c5, 0.0, 1500.0, 30.0)) == ""
+    # A round well is not its bounding square: A1's 6000 µm disc leaves out the corner.
+    assert stage_label(WELLS, registered, (2900.0, 2900.0)) == ""
+    assert stage_label(WELLS, registered, (2100.0, 2100.0)) == "over A1"
 
 
 def test_stage_label_takes_the_first_well_in_the_views_order() -> None:

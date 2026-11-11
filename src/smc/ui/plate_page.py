@@ -1561,7 +1561,7 @@ class PlatePageView:
             self._objective_shown = True
             self.objective_select.value = status.objective
         self._draw_problems()
-        self._draw_frame()
+        self._follow_frame(self._draw_frame())
         self._draw_buttons()
         self._draw_drive()
         if previous is not None and status.running is None:
@@ -1646,7 +1646,17 @@ class PlatePageView:
         the time it is drawn (a snap's), and the cross stays where the tick put it; a frame
         with no position leaves the cross and the flag as they were.
         """
-        frame = self._draw_frame()
+        self._follow_frame(self._draw_frame())
+
+    def _follow_frame(self, frame: Frame | None) -> None:
+        """Move the cross to the position of ``frame``, the frame just drawn, while Live runs.
+
+        Both callbacks draw frames, so both call it: the tick sees a new frame first now and
+        then, and a cross that only the frame tick moved would stay a frame behind the
+        picture (the lag is one frame period, which a long exposure makes visible). ``None``
+        is no new frame; a frame with no position, or one drawn when Live is not running (a
+        snap's), moves nothing and leaves the flag as it was.
+        """
         if frame is None or frame.xy_um is None or not self.page.is_live:
             return
         self._cross_from_frames = True
