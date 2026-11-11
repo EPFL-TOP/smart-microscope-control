@@ -47,6 +47,18 @@ class ScanPlanResult(PluginResult):
     ``None`` when it could not be applied (an unknown objective or an offset
     that was not measured), in which case the fields are the registration's
     unshifted. Both default to unknown, so that older run documents load.
+
+    ``calibration_from`` is the run document the camera matrix was read from
+    when the plan was given one (``scan-plan``'s ``calibration``, m3 §23), as
+    typed with forward slashes and never resolved, and ``calibration_measured``
+    when that calibration was measured (its record's ``finished_utc`` to the
+    second, or ``at an unknown time``). A plate registered with one objective
+    and scanned with another cannot keep the second's calibration in the
+    registration's document, which holds one record per plugin, so the plan
+    says which document it rests on and how old that is. Both are ``None``
+    when the matrix is not from another document (the document's own
+    calibration, the profile's size or a parameter), and in every document
+    written before they existed.
     """
 
     plate_plan: useq.WellPlatePlan
@@ -64,6 +76,8 @@ class ScanPlanResult(PluginResult):
     estimate_s: float | None = Field(ge=0.0)
     plate_objective: str | None = None
     objective_shift_um: tuple[float, float] | None = None
+    calibration_from: str | None = None
+    calibration_measured: str | None = None
 
     @field_validator("plate_plan", mode="wrap")
     @classmethod

@@ -168,6 +168,8 @@ _SCAN_PLAN: dict[str, Any] = {
     "estimate_s": 1830.5,
     "plate_objective": "Nikon 10X Plan Fluor",
     "objective_shift_um": [-37.5, 12.25],
+    "calibration_from": "cal-40x.json",
+    "calibration_measured": "2026-11-10T19:50:30+00:00",
 }
 
 _FRAME: dict[str, Any] = {
@@ -414,6 +416,8 @@ SAMPLES: dict[type[BaseModel], Sample] = {
             "estimate_s": None,
             "plate_objective": None,
             "objective_shift_um": None,
+            "calibration_from": None,
+            "calibration_measured": None,
         },
     ),
     ScanFrame: (
@@ -813,6 +817,24 @@ def test_a_scan_plan_without_the_shift_loads_as_unknown() -> None:
     assert (full.plate_objective, full.objective_shift_um) == (
         "Nikon 10X Plan Fluor",
         (-37.5, 12.25),
+    )
+
+
+def test_a_scan_plan_without_a_calibration_document_loads_as_none() -> None:
+    # m3 §23.4: a plan written before #383 holds neither field; the matrix is not
+    # from another document, and the document says so by saying nothing.
+    older = {
+        key: value
+        for key, value in _SCAN_PLAN.items()
+        if key not in ("calibration_from", "calibration_measured")
+    }
+    loaded = ScanPlanResult.model_validate(older)
+    assert (loaded.calibration_from, loaded.calibration_measured) == (None, None)
+    assert ScanPlanResult.model_validate(loaded.model_dump(mode="json")) == loaded
+    full = ScanPlanResult.model_validate(_SCAN_PLAN)
+    assert (full.calibration_from, full.calibration_measured) == (
+        "cal-40x.json",
+        "2026-11-10T19:50:30+00:00",
     )
 
 
