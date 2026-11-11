@@ -254,15 +254,26 @@ class RunDocument(BaseModel):
             f"one wrote it, or restore it from a copy",
         )
 
-    def provider(self, slot: str) -> StageRecord | None:
+    def provider(
+        self, slot: str, *, excluding: str | None = None
+    ) -> StageRecord | None:
         """The record that fills ``slot``: the latest start, whatever its status.
 
         The latest attempt decides even when it did not finish: a re-run of
         plate registration that failed leaves no usable plate, rather than the
         older one silently. A tie on the start time goes to the later plugin
         name, so the choice never depends on the order of the file.
+
+        ``excluding`` names a plugin whose record is left out: a plugin that
+        reads the slot it provides (``plate-orientation``) reads the latest
+        *other* provider, never its own previous output (m3 §24 D8). For a
+        plugin that does not provide ``slot`` it changes nothing.
         """
-        filling = [r for r in self.stages.values() if r.provides == slot]
+        filling = [
+            r
+            for r in self.stages.values()
+            if r.provides == slot and r.plugin != excluding
+        ]
         if not filling:
             return None
         return max(filling, key=lambda r: (r.started_utc, r.plugin))
@@ -274,6 +285,10 @@ class RunDocument(BaseModel):
         or attempt than the one it read, or is itself stale; or when it read
         an optional slot as absent that now has a ``done`` provider. A record
         that read nothing is never stale.
+
+        Each read is judged against the provider *other than* ``plugin`` (m3
+        §24 D8): a record that reads the slot it provides is its own latest
+        provider, and compared with itself it would be stale forever.
         """
         return self._stale(plugin, frozenset())
 
@@ -283,7 +298,7 @@ class RunDocument(BaseModel):
             return False
         visited = visited | {plugin}
         for slot, read in record.reads.items():
-            current = self.provider(slot)
+            current = self.provider(slot, excluding=plugin)
             if read is None:
                 if current is not None and current.status is StageStatus.done:
                     return True
@@ -296,15 +311,26 @@ class RunDocument(BaseModel):
                 return True
         return False
 
-    def unusable(self, slot: str, *, profile: str, dry_run: bool) -> str | None:
+    def unusable(
+        self,
+        slot: str,
+        *,
+        profile: str,
+        dry_run: bool,
+        reader: str | None = None,
+    ) -> str | None:
         """Why ``slot`` cannot be read by a run on ``profile``, with the fix; ``None`` if it can.
 
         The first row that applies wins: no provider, a provider that did not
         end ``done``, a stale provider, a provider run on another profile, a
         provider that was a dry run when this run is not. A dry run may read
         a real result.
+
+        ``reader`` is the plugin about to read: its own record is left out of
+        the providers (m3 §24 D8). ``None`` judges the latest provider of all,
+        which is what every consumer of the slot reads.
         """
-        provider = self.provider(slot)
+        provider = self.provider(slot, excluding=reader)
         if provider is None:
             return (
                 f"the run document has no {slot}; smc run --list shows which plugin "

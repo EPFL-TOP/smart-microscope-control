@@ -262,7 +262,10 @@ def _naming_problem(plugin: Plugin[Any, Any], entry_name: str) -> str | None:
         for slot in slots:
             if not re.fullmatch(NAME_PATTERN, slot):
                 return f"{field} {slot!r}, which is not a slot name ({_SLOT_HINT})"
-        if plugin.provides in slots:
+        # A plugin may read the slot it provides: the run document then judges its
+        # read without its own record (m3 §24 D8). An optional read of it means
+        # nothing, since the slot is the plugin's own output when nothing else is.
+        if field == "reads_optional" and plugin.provides in slots:
             return f"{field} holds {plugin.provides!r}, the slot it provides itself"
     shared = [slot for slot in plugin.reads if slot in plugin.reads_optional]
     if shared:

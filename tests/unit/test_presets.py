@@ -105,6 +105,10 @@ class OffsetsParams(BaseModel):
     confirm_turns: bool = False
 
 
+class OrientationParams(BaseModel):
+    orientation: str = ""
+
+
 MODELS: dict[str, type[BaseModel]] = {
     "scan-plan": ScanPlanParams,
     "cells": CellsParams,
@@ -112,6 +116,7 @@ MODELS: dict[str, type[BaseModel]] = {
     "plate-finding": FindingParams,
     "plate-walls": WallsParams,
     "objective-offsets": OffsetsParams,
+    "plate-orientation": OrientationParams,
 }
 
 

@@ -29,6 +29,8 @@ wells `plate-walls` measured, and `smc objective offset --write` puts the result
 profile; it needs one camera calibration per objective),
 [`plate-finding`](plate-finding.md) (which plate it is and where, from a coarse survey
 of the plate with the stage and the camera; it switches the autofocus off),
+[`plate-orientation`](plate-orientation.md) (which way the registered plate lies in its
+holder: it renames the wells of a plate turned 180°, and measures nothing),
 [`cells`](cells.md) (single cells and doublets on a scan's frames, in stage µm,
 each counted once; needs the `detect` extra and the trained weights),
 [`scan-plan`](scan-plan.md) (which wells and which fields of each to image, from the
@@ -187,7 +189,9 @@ writes it; a name that exists is refused (exit 2) unless `--overwrite` is given.
 stand and moves nothing.
 
 What it leaves out is **said, never dropped**: the positions (`plate-registration`'s `refs`
-and `walls`, `plate-walls`' `refs`, `plate-finding`'s centre) are never saved, and a plugin whose recorded values
+and `walls`, `plate-walls`' `refs`, `plate-finding`'s centre) are never saved, nor is the plate's
+`orientation` (how the plate lies is declared again every session: a saved one would rename every
+well of the next plate), and a plugin whose recorded values
 do not read back as the same values (the string `null` in a field that also admits an
 absent value), do not encode as text, or are no longer valid for this smc loses **all** its
 pairs, with one line that names the key. The lines after the preset are those notes, and
@@ -331,7 +335,7 @@ class StageReport:
 | `requires` | Capability Protocols (`XYStage`, `ZStage`, `Camera`, ...): a tuple of classes that `smc.hardware.microscope.CAPABILITY_ROLES` knows. |
 | `provides` | The slot of the run document the result fills, by the same pattern. By convention the plugin's name, unless several plugins produce the same thing (plate registration and plate finding both provide `plate`). |
 | `reads` | Slots the plugin needs; the runner refuses to start without them. |
-| `reads_optional` | Slots the plugin uses when they are usable (timings, a calibration). Disjoint from `reads`, and neither holds `provides`. |
+| `reads_optional` | Slots the plugin uses when they are usable (timings, a calibration). Disjoint from `reads`, and never holds `provides`. `reads` may hold it (`plate-orientation` reads the plate it renames): every read then leaves the plugin's own record out. |
 
 `run(microscope, params, ctx)` is the hardware loop: it asks `microscope` for
 capabilities (`microscope.require(XYStage)`), does its work, and returns its
@@ -449,7 +453,9 @@ keyed by the plugin's **name**; its result fills the **slot** the plugin provide
   `plugin` and `attempt` it read.
 - **Slots.** The provider of a slot is the record with the latest start, even if
   it failed: a re-run of plate registration that failed leaves no usable plate,
-  rather than the older one silently.
+  rather than the older one silently. A read never resolves to the reader's own
+  record: a plugin that reads the slot it provides reads the latest *other*
+  provider, and is judged stale against that one.
 - **Staleness.** A stage is stale when something it read has been produced again
   since, directly or through a stage it read. `smc run` warns about the stages a
   run made stale.

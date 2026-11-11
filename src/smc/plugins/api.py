@@ -304,7 +304,9 @@ class RunContext:
         return self._result_of(slot, model)
 
     def _result_of(self, slot: str, model: type[M]) -> M:
-        provider = self._snapshot.provider(slot)
+        # Never the plugin's own record: a tool that reads the slot it provides
+        # reads the latest other provider, the one the runner recorded (m3 §24 D8).
+        provider = self._snapshot.provider(slot, excluding=self.plugin)
         if provider is None or provider.result is None:
             raise UpstreamError(
                 self.plugin,

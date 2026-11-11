@@ -2340,14 +2340,15 @@ def _list_plugins() -> None:
         )
 
 
-def _outdated(doc: RunDocument, slot: str, read: Any) -> bool:
+def _outdated(doc: RunDocument, slot: str, read: Any, reader: str) -> bool:
     """Whether what a stage read of ``slot`` is no longer what the document holds.
 
     The per-slot form of ``RunDocument.is_stale``, to say which slot: the
     provider is gone, was run again or by another plugin, is itself stale, or an
-    optional slot that was empty now has a result.
+    optional slot that was empty now has a result. ``reader``'s own record is left
+    out of the providers, as ``is_stale`` leaves it out (m3 §24 D8).
     """
-    current = doc.provider(slot)
+    current = doc.provider(slot, excluding=reader)
     if read is None:
         return current is not None and current.status is StageStatus.done
     return (
@@ -2364,7 +2365,7 @@ def _stale_lines(before: RunDocument, after: RunDocument) -> list[str]:
         if before.is_stale(plugin) or not after.is_stale(plugin):
             continue
         for slot, read in record.reads.items():
-            if _outdated(after, slot, read):
+            if _outdated(after, slot, read, plugin):
                 lines.append(
                     f"! {plugin} read {slot} from an earlier run; run it again"
                 )

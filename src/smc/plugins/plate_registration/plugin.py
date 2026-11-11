@@ -14,9 +14,13 @@ decides, because every later stage places its fields by the plate it writes:
   recorded and never turned to; no turret records none (unknown, not guessed), and
   a turret at an empty position is refused before the fit.
 
-* **A seed is a result, not a fit.** One reference sets A1 and assumes no
-  rotation; it says so in ``assumed`` and has no residual, so nothing reads it
-  as a measured registration.
+* **The operator declares which way the plate lies** (``orientation``, m3 §24): a
+  plate turned 180° lands on itself, so only the well names show the turn. The fit
+  is checked against the declaration, and a fit that turns the plate the other way
+  is refused with the words that say so.
+* **A seed is a result, not a fit.** One reference sets A1 and takes its
+  rotation from the declared orientation; it says so in ``assumed`` and has no
+  residual, so nothing reads it as a measured registration.
 * **A wall centre is a reference like any other, and says what it assumed.** A
   well given by walls goes into the fit with the others; an axis where only one
   wall was touched is reported (the centre is one wall plus the nominal
@@ -28,7 +32,7 @@ decides, because every later stage places its fields by the plate it writes:
 * **A bad fit is a refusal, not a ``done`` result to be checked.** A reference
   further than ``GOOD_RESIDUAL_UM`` from where the others put it fails the stage
   and names the well, so no unusable ``plate`` fills the slot.
-* **A rotation beyond the bound is a refusal** (FM-121): two equidistant
+* **A rotation beyond the bound of the declared orientation is a refusal** (FM-121): two equidistant
   references fit a turn of 90 degrees with no residual, and a plate is put on the
   stage by hand.
 """
@@ -58,6 +62,7 @@ from smc.plugins.slots import (
     normalise_well,
     well_geometry,
 )
+from smc.plugins.slots.plate import PlateOrientation
 
 if TYPE_CHECKING:
     from smc.hardware.microscope import Microscope
@@ -79,8 +84,8 @@ class PlateRegistrationParams(PluginParams):
         description=(
             "Wells centred under the objective, JSON: "
             'refs=[{"well": "A1", "x_um": 1000, "y_um": 2000}], the position '
-            "from smc stage get. One is a seed (rotation 0 assumed); every "
-            "reference so far goes in each run."
+            "from smc stage get. One is a seed (its rotation assumed from the "
+            "orientation); every reference so far goes in each run."
         ),
     )
     walls: tuple[WallTouch, ...] = Field(
@@ -90,7 +95,8 @@ class PlateRegistrationParams(PluginParams):
             'walls=[{"well": "B2", "side": "+X", "x_um": 0, "y_um": 0}]. '
             "A side is a stage direction, the wall that the stage reaches by going "
             "that way from the well's centre: -X or +X, -Y or +Y (+Y is towards "
-            "row A); the plate page's left, right, top and bottom are sides on the "
+            "row A on a plate that is not turned); the plate page's left, right, "
+            "top and bottom are sides on the "
             "image, which it maps with the camera calibration, and are refused "
             "here. Each well needs one -X or +X and one -Y or +Y; an opposite pair "
             "gives the centre and measures the well."
@@ -101,9 +107,16 @@ class PlateRegistrationParams(PluginParams):
         gt=0.0,
         le=45.0,
         description=(
-            "The largest rotation of the plate that the fit accepts; a rotation "
-            "past it is read as a misnamed well. Raise it only for a plate that "
-            "is really turned."
+            "The largest tilt of the plate from its declared orientation that the "
+            "fit accepts; a tilt past it is read as a misnamed well. Raise it "
+            "only for a plate that is really tilted in its holder."
+        ),
+    )
+    orientation: PlateOrientation = Field(
+        "not-turned",
+        description=(
+            "Which way the plate lies in its holder: not-turned (A1 at the "
+            "stage's -X +Y corner) or turned-180 (A1 at the +X -Y corner)."
         ),
     )
     objective: str | None = Field(
@@ -184,7 +197,10 @@ class PlateRegistrationPlugin:
                 *(WellRef(well=w, x_um=e.x_um, y_um=e.y_um) for w, e in edges.items()),
             ]
             fitted = calibrate(
-                params.plate, references, max_rotation_deg=params.max_rotation_deg
+                params.plate,
+                references,
+                max_rotation_deg=params.max_rotation_deg,
+                orientation=params.orientation,
             )
         except ValueError as exc:
             problem = str(exc) or "the registration was refused"

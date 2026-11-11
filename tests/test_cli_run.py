@@ -39,7 +39,7 @@ from smc.plugins.api import PluginParams, PluginResult, RunContext, StopRequeste
 from smc.plugins.errors import PluginRunError
 from smc.plugins.registry import GROUP
 from smc.plugins.slots import CellsResult, ReportResult, RouteResult
-from smc.run import RunDocument, StageRecord, StageStatus, write_stage
+from smc.run import ReadRecord, RunDocument, StageRecord, StageStatus, write_stage
 from smc.run import files as files_mod
 from smc.testing import FakeCore
 
@@ -1150,3 +1150,61 @@ def test_the_workflow_runs_end_to_end_on_demo_sample(tmp_path: Path) -> None:
     assert len(route.positions) >= 1
     report = ReportResult.model_validate(stages["report"].result)
     assert (tmp_path / report.file).is_file()
+
+
+def _stage(
+    plugin: str,
+    provides: str,
+    attempt: str,
+    minute: int,
+    reads: dict[str, ReadRecord | None] | None = None,
+) -> StageRecord:
+    started = datetime(2026, 11, 11, 9, minute, tzinfo=timezone.utc)
+    return StageRecord(
+        plugin=plugin,
+        provides=provides,
+        attempt=attempt,
+        status=StageStatus.done,
+        started_utc=started,
+        finished_utc=started,
+        profile="demo",
+        dry_run=False,
+        smc_version="0",
+        params={},
+        result={},
+        reads=reads or {},
+    )
+
+
+def test_the_stale_warning_names_only_the_slot_produced_again_for_a_stage_reading_its_own() -> (
+    None
+):
+    """A stage that reads the slot it provides is judged without itself (m3 §24 D8, FM-218).
+
+    ``turn`` read ``plate`` from the fit and ``cal`` from the calibration; the
+    calibration is run again. Only ``cal`` is outdated: compared with itself, the
+    ``plate`` it provides would read as produced again too.
+    """
+    fit = _stage("fit", "plate", "f1", 0)
+    calibration = _stage("calibrate", "cal", "c1", 1)
+    turn = _stage(
+        "turn",
+        "plate",
+        "t1",
+        2,
+        reads={
+            "plate": ReadRecord(plugin="fit", attempt="f1"),
+            "cal": ReadRecord(plugin="calibrate", attempt="c1"),
+        },
+    )
+    created = datetime(2026, 11, 11, 9, 0, tzinfo=timezone.utc)
+    before = RunDocument(
+        created_utc=created,
+        stages={"fit": fit, "calibrate": calibration, "turn": turn},
+    )
+    again = _stage("calibrate", "cal", "c2", 3)
+    after = before.model_copy(update={"stages": {**before.stages, "calibrate": again}})
+
+    assert cli._stale_lines(before, after) == [
+        "! turn read cal from an earlier run; run it again"
+    ]

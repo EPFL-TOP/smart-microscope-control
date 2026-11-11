@@ -615,7 +615,9 @@ RANGES: list[tuple[type[BaseModel], tuple[Any, ...], list[Any], list[Any]]] = [
     (LatticeFit, ("score",), [-0.1, 1.5], [0.0, 1.0]),
     (LatticeFit, ("n_samples",), [-1], [0]),
     (LatticeFit, ("n_inside",), [-1], [0]),
-    (PlateResult, ("rotation_deg",), [-180.5, 180.5], [-180.0, 180.0]),
+    # On its bounds a plate is turned (m3 §24 D2): the sample is `not-turned`,
+    # so the bounds are accepted in the test that follows the table.
+    (PlateResult, ("rotation_deg",), [-180.5, 180.5], []),
     (PlateResult, ("residual_um",), [-0.1], [0.0]),
     (PlateResult, ("n_refs",), [-1], [0]),
     (WallFrame, ("n_points",), [-1], [0]),
@@ -713,6 +715,15 @@ def test_a_value_on_its_bound_is_accepted(
 ) -> None:
     full, _ = SAMPLES[model]
     model.model_validate(_with(full, path, value))
+
+
+@pytest.mark.parametrize("value", [-180.0, 180.0])
+def test_a_turned_plates_rotation_on_its_bound_is_accepted(value: float) -> None:
+    full, _ = SAMPLES[PlateResult]
+    loaded = PlateResult.model_validate(
+        {**_with(full, ("rotation_deg",), value), "orientation": "turned-180"}
+    )
+    assert loaded.rotation_deg == value
 
 
 # --- a field that may be unknown must still be present ---------------------------

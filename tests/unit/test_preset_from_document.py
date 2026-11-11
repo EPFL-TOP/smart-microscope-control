@@ -218,6 +218,36 @@ def test_plate_finding_centre_is_not_kept_under_params_for_a_hand_written_preset
     )
 
 
+def test_a_plates_orientation_is_never_saved_and_not_kept_for_a_hand_written_preset() -> (
+    None
+):
+    # How the plate lies is declared every session (m3 §24): a saved `turned-180`
+    # would rename every well of the next plate, which a survey cannot see.
+    made = _preset_of(
+        _record(
+            "plate-finding",
+            _recorded("plate-finding", plate="24-well", orientation="turned-180"),
+            result={"plate": "24-well"},
+        )
+    )
+
+    assert made.preset.params == {"plate-finding": ("plate=24-well",)}
+
+    for plugin in (
+        "plate-finding",
+        "plate-orientation",
+        "plate-registration",
+        "plate-walls",
+    ):
+        preset = Preset(params={plugin: ("orientation=turned-180",)})
+        check = check_preset(_file(preset), MODELS, stand=STAND, registered=None)
+        assert check.params == {}
+        assert check.mismatches == (
+            f"preset weekly [params.{plugin}]: orientation is not kept under params: "
+            "how the plate lies is declared again every session",
+        )
+
+
 def test_plate_walls_plate_and_refs_are_never_saved_and_not_kept_for_a_hand_written_preset() -> (
     None
 ):
@@ -400,14 +430,17 @@ CASES: dict[str, list[dict[str, Any]]] = {
             "seed": 7,
             "statistic": "std",
             "max_failed_in_row": 5,
+            "orientation": "turned-180",
         }
     ],
+    "plate-orientation": [{"orientation": "turned-180"}],
     "plate-registration": [
         {
             "plate": "24-well",
             "refs": [{"well": "A1", "x_um": 1.0, "y_um": 2.0}],
             "walls": [{"well": "A1", "side": "-X", "x_um": 1.0, "y_um": 2.0}],
             "max_rotation_deg": 5.0,
+            "orientation": "turned-180",
             "objective": "Nikon 10X S Fluor",
         }
     ],
@@ -421,6 +454,7 @@ CASES: dict[str, list[dict[str, Any]]] = {
             "search_um": 500.0,
             "max_residual_um": 50.0,
             "max_rotation_deg": 5.0,
+            "orientation": "turned-180",
             "settle_ms": 30.0,
             "save_frames": False,
         }
@@ -488,7 +522,10 @@ def test_every_builtin_plugins_recorded_params_come_back_through_a_preset(
     plugin: str, given: dict[str, Any]
 ) -> None:
     recorded = _recorded(plugin, **given)
-    plate = recorded["plate"] if PROVIDES[plugin] == "plate" else "96-well"
+    # `plate-orientation` provides the plate and takes no plate name (m3 §24 D7).
+    plate = (
+        recorded.get("plate", "96-well") if PROVIDES[plugin] == "plate" else "96-well"
+    )
     records = [_record(plugin, recorded, result={"plate": plate})]
     if PROVIDES[plugin] != "plate":
         records.append(_registered(plate))

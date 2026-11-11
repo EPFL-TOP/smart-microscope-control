@@ -29,6 +29,7 @@ __all__ = [
     "pixel_matrix",
     "pixel_of_stage",
     "stage_of_pixel",
+    "wrap_deg",
 ]
 
 #: ``((m00, m01), (m10, m11))`` in µm per pixel: ``(dx, dy) = M @ (d_col, d_row)``.
@@ -148,6 +149,20 @@ def fov_of(matrix: Matrix2, image_shape_px: tuple[int, int]) -> tuple[float, flo
     xs = [x for x, _ in corners]
     ys = [y for _, y in corners]
     return (max(xs) - min(xs), max(ys) - min(ys))
+
+
+def wrap_deg(angle_deg: float) -> float:
+    """``angle_deg`` brought into (-180, 180].
+
+    A fitted rotation comes from ``atan2``, so a plate turned 180° can read
+    -179.8° as well as 179.8°: two angles are compared through this, never by
+    ``abs(a - 180)`` (m3 §24). ``math.remainder`` is exact and gives
+    [-180, 180]; -180 is the one value folded, to 180, so that each turn has
+    one name. A value that is not finite raises ``ValueError`` for infinity and
+    returns ``nan`` for ``nan``, as ``math.remainder`` does.
+    """
+    wrapped = math.remainder(angle_deg, 360.0)
+    return 180.0 if wrapped == -180.0 else wrapped
 
 
 def _centre(image_shape_px: tuple[int, int]) -> tuple[float, float]:

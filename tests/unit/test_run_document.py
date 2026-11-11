@@ -697,3 +697,82 @@ def test_a_dry_run_may_read_a_real_result() -> None:
     assert _unusable(dry, dry_run=False) == (
         "register was a dry run; run it without --dry-run"
     )
+
+
+# --- a stage that reads the slot it provides (m3 §24 D8) ------------------------
+
+
+def _reader_unusable(doc: RunDocument, reader: str | None) -> str | None:
+    return doc.unusable("plate", profile="demo", dry_run=False, reader=reader)
+
+
+def test_a_stage_that_reads_its_own_slot_is_judged_on_the_other_provider() -> None:
+    fit = _record("register", provides="plate", minute=0)
+    turn = _record("turn", provides="plate", minute=1, reads={"plate": _read(fit)})
+    doc = _doc(fit, turn)
+    # Every consumer reads the turn; the turn itself reads the fit.
+    assert doc.provider("plate") == turn
+    assert doc.provider("plate", excluding="turn") == fit
+    # Compared with itself (the latest provider) it would be stale forever.
+    assert not doc.is_stale("turn")
+    assert _reader_unusable(doc, "turn") is None
+    # Its read is judged on the fit: a fit from another stand refuses it by name.
+    elsewhere = _record("register", provides="plate", minute=0, profile="other")
+    assert _reader_unusable(_doc(elsewhere, turn), "turn") == (
+        "register was run on other, this is demo; run register again on this profile"
+    )
+
+
+def test_a_transform_after_a_fit_is_not_stale_and_its_readers_are() -> None:
+    fit = _record("register", provides="plate", minute=0)
+    plan = _record("plan", minute=1, reads={"plate": _read(fit)})
+    turn = _record("turn", provides="plate", minute=2, reads={"plate": _read(fit)})
+    doc = _doc(fit, plan, turn)
+    assert not doc.is_stale("turn")
+    assert doc.is_stale("plan")  # its wells were renamed
+    assert _reader_unusable(doc, None) is None
+    assert _reader_unusable(doc, "plan") is None
+    planned_again = _record("plan", minute=3, reads={"plate": _read(turn)})
+    assert not _doc(fit, planned_again, turn).is_stale("plan")
+
+
+def test_a_fit_run_again_after_the_transform_is_the_provider() -> None:
+    fit = _record("register", provides="plate", minute=0)
+    turn = _record("turn", provides="plate", minute=1, reads={"plate": _read(fit)})
+    plan = _record("plan", minute=2, reads={"plate": _read(turn)})
+    fit_again = _record("register", provides="plate", minute=3, attempt="again")
+    doc = _doc(fit_again, turn, plan)
+    assert doc.provider("plate") == fit_again
+    assert _reader_unusable(doc, None) is None
+    # The turn is set aside: what it read was produced again, and it is no
+    # longer the provider; its reader is stale.
+    assert doc.is_stale("turn")
+    assert doc.is_stale("plan")
+
+
+def test_a_failed_fit_after_the_transform_leaves_the_slot_unusable() -> None:
+    fit = _record("register", provides="plate", minute=0)
+    turn = _record("turn", provides="plate", minute=1, reads={"plate": _read(fit)})
+    failed = _record("register", provides="plate", minute=2, status=StageStatus.failed)
+    doc = _doc(failed, turn)
+    reason = "the last run of register ended failed; run it again"
+    assert _reader_unusable(doc, None) == reason
+    # The turn cannot rename it either: the fit it would read failed.
+    assert _reader_unusable(doc, "turn") == reason
+
+
+def test_excluding_a_plugin_that_does_not_provide_the_slot_changes_nothing() -> None:
+    fit = _record("register", provides="plate", minute=0)
+    plan = _record("plan", minute=1, reads={"plate": _read(fit)})
+    fit_again = _record("register", provides="plate", minute=2, attempt="again")
+    failed = _record("register", provides="plate", minute=2, status=StageStatus.failed)
+    elsewhere = _record("register", provides="plate", minute=2, profile="other")
+    for doc in (
+        _doc(fit, plan),
+        _doc(fit_again, plan),
+        _doc(failed, plan),
+        _doc(elsewhere, plan),
+        _doc(plan),
+    ):
+        assert doc.provider("plate", excluding="plan") == doc.provider("plate")
+        assert _reader_unusable(doc, "plan") == _reader_unusable(doc, None)

@@ -84,6 +84,12 @@ AUTOFOCUS_OFF_LINE = (
     "the autofocus is off after the survey; the scan never switches it on: lock it "
     "on the sample before the scan"
 )
+#: Every result's last line, on either orientation (m3 §24.4 (4)): the survey
+#: cannot see a turn, so the orientation is the operator's word.
+ORIENTATION_LINE = (
+    "orientation not-turned given by the operator: a plate turned 180° lands on "
+    "itself, so the survey cannot see it"
+)
 #: What an autofocus does that the survey must never do.
 MUTATING = {
     "engage",
@@ -525,7 +531,7 @@ def test_the_survey_fills_the_plate_slot_on_the_demo(
     assert 0.0 < result.fit.margin < result.fit.score
     assert result.fit.notes == ()
     # The demo's stage says nothing about its travel, and its autofocus is off.
-    assert result.assumed == (NO_LIMITS_LINE, AUTOFOCUS_OFF_LINE)
+    assert result.assumed == (NO_LIMITS_LINE, AUTOFOCUS_OFF_LINE, ORIENTATION_LINE)
     assert (progress[-2].done, progress[-2].total, progress[-2].message) == (
         208,
         208,
@@ -539,6 +545,48 @@ def test_the_survey_fills_the_plate_slot_on_the_demo(
     # FM-88: nothing moves after the survey; the stage stays at its last point.
     assert _here(demo_microscope) == pytest.approx(camera.positions[-1], abs=0.05)
     assert _stored(tmp_path) == record
+
+
+def test_plate_finding_names_wells_from_the_declared_orientation(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """The survey cannot see a turn: the operator's word names the wells (m3 §24 D5).
+
+    The same plate surveyed twice from the same start, once per orientation: the
+    ``turned-180`` result's A1 is the ``not-turned`` result's last well (C4 of a
+    12-well), and each says that its orientation was given, not seen (FM-217).
+    """
+    sample = _plate_at((0.0, 0.0), 1.2)
+    _on_demo(demo_microscope, sample)
+    start = demo_microscope.require(XYStage).position_um()
+    results = {}
+    for orientation in ("not-turned", "turned-180"):
+        demo_microscope.require(XYStage).move_to_um(start.x_um, start.y_um)
+        record = _run(
+            demo_microscope,
+            tmp_path,
+            name=f"{orientation}.json",
+            orientation=orientation,
+        )
+        results[orientation] = _result(record)
+
+    plain, turned = results["not-turned"], results["turned-180"]
+    assert plain.orientation == "not-turned"
+    assert turned.orientation == "turned-180"
+    # Two surveys of one plate differ by a few µm (each snap has its own noise:
+    # 2.3 µm measured), where a wrong name is a whole pitch, 26 mm, away.
+    tolerance_um = 25.0
+    assert math.dist(turned.a1_center_xy_um, plain.well_center_um("C4")) < tolerance_um
+    assert math.dist(turned.well_center_um("C4"), plain.a1_center_xy_um) < tolerance_um
+    assert (
+        math.dist(turned.well_center_um("B2"), plain.well_center_um("B3"))
+        < tolerance_um
+    )
+    for orientation, result in results.items():
+        assert (
+            f"orientation {orientation} given by the operator: a plate turned 180° "
+            "lands on itself, so the survey cannot see it"
+        ) in result.assumed
 
 
 def test_the_survey_visits_the_hand_computed_points_around_the_given_centre(
@@ -637,7 +685,11 @@ def test_an_engaged_autofocus_is_switched_off_and_not_relocked(
     assert "enableContinuousFocus(True)" not in log
     assert autofocus.is_engaged() is False
     # The result says what the scan will find, not what the survey did.
-    assert _result(record).assumed == (NO_LIMITS_LINE, AUTOFOCUS_OFF_LINE)
+    assert _result(record).assumed == (
+        NO_LIMITS_LINE,
+        AUTOFOCUS_OFF_LINE,
+        ORIENTATION_LINE,
+    )
     assert [r.getMessage() for r in caplog.records if r.name == LOGGER] == [
         AUTOFOCUS_LINE
     ]
@@ -654,7 +706,11 @@ def test_an_autofocus_that_is_off_is_left_alone(
     record = _run(fake_microscope, tmp_path, plates=["12-well"])
 
     assert not MUTATING & set(spy.calls)
-    assert _result(record).assumed == (NO_LIMITS_LINE, AUTOFOCUS_OFF_LINE)
+    assert _result(record).assumed == (
+        NO_LIMITS_LINE,
+        AUTOFOCUS_OFF_LINE,
+        ORIENTATION_LINE,
+    )
 
 
 def test_a_resumed_survey_still_says_the_autofocus_is_off(
@@ -691,7 +747,11 @@ def test_a_resumed_survey_still_says_the_autofocus_is_off(
         assert autofocus.is_engaged() is False
         record = _run(fake_microscope, tmp_path, resume=True, plates=["12-well"])
 
-    assert _result(record).assumed == (NO_LIMITS_LINE, AUTOFOCUS_OFF_LINE)
+    assert _result(record).assumed == (
+        NO_LIMITS_LINE,
+        AUTOFOCUS_OFF_LINE,
+        ORIENTATION_LINE,
+    )
     assert "enableContinuousFocus(True)" not in fake_core.log
     # Logged once, by the attempt that switched it off.
     assert [r.getMessage() for r in caplog.records if r.name == LOGGER] == [
@@ -710,7 +770,10 @@ def test_a_stand_without_an_autofocus_says_nothing_about_it(
 
         record = _run(microscope, tmp_path, plates=["12-well"])
 
-        assert _result(record).assumed == (NO_LIMITS_LINE,)
+        assert _result(record).assumed == (
+            NO_LIMITS_LINE,
+            ORIENTATION_LINE,
+        )
     finally:
         microscope.close()
 
@@ -732,7 +795,10 @@ def test_an_autofocus_engaged_again_before_the_end_is_not_reported_off(
 
     assert spy.calls.count("disengage") == 1
     assert spy.calls.count("is_engaged") == 2
-    assert _result(record).assumed == (NO_LIMITS_LINE,)
+    assert _result(record).assumed == (
+        NO_LIMITS_LINE,
+        ORIENTATION_LINE,
+    )
 
 
 def test_an_autofocus_that_cannot_be_read_at_the_end_is_a_finding_not_a_lost_survey(
@@ -751,6 +817,7 @@ def test_an_autofocus_that_cannot_be_read_at_the_end_is_a_finding_not_a_lost_sur
         NO_LIMITS_LINE,
         "the autofocus's state could not be read after the survey (HardwareError: "
         "pfs did not answer); check it before the scan",
+        ORIENTATION_LINE,
     )
 
 
@@ -803,7 +870,11 @@ def test_a_resume_with_nothing_left_to_visit_still_says_the_autofocus_is_off(
 
     record = _run(fake_microscope, tmp_path, resume=True, plates=["12-well"])
 
-    assert _result(record).assumed == (NO_LIMITS_LINE, AUTOFOCUS_OFF_LINE)
+    assert _result(record).assumed == (
+        NO_LIMITS_LINE,
+        AUTOFOCUS_OFF_LINE,
+        ORIENTATION_LINE,
+    )
     assert camera.snaps == 208
     assert spy.calls == ["is_engaged"]
 
@@ -1238,6 +1309,7 @@ def test_a_readback_that_is_not_finite_is_a_skipped_point(
         NO_LIMITS_LINE,
         "1 of 208 survey points could not be sampled and were skipped",
         AUTOFOCUS_OFF_LINE,
+        ORIENTATION_LINE,
     )
     assert result.fit is not None
     assert result.fit.n_samples == 207
@@ -1258,6 +1330,7 @@ def test_a_few_failed_points_are_skipped_and_counted(
         NO_LIMITS_LINE,
         "10 of 208 survey points could not be sampled and were skipped",
         AUTOFOCUS_OFF_LINE,
+        ORIENTATION_LINE,
     )
     assert result.fit is not None
     assert result.fit.n_samples == 198
@@ -1281,6 +1354,7 @@ def test_exactly_a_tenth_of_the_points_failing_is_not_too_many(
         NO_LIMITS_LINE,
         "18 of 180 survey points could not be sampled and were skipped",
         AUTOFOCUS_OFF_LINE,
+        ORIENTATION_LINE,
     )
     assert result.fit is not None
     assert result.fit.n_samples == 162
@@ -1356,6 +1430,7 @@ def test_three_failed_moves_in_a_row_end_the_survey(
         NO_LIMITS_LINE,
         "5 of 208 survey points could not be sampled and were skipped",
         AUTOFOCUS_OFF_LINE,
+        ORIENTATION_LINE,
     )
     assert result.fit is not None
     assert result.fit.n_samples == 203
@@ -1431,6 +1506,7 @@ def test_a_point_that_is_sampled_resets_the_count(
         NO_LIMITS_LINE,
         "4 of 208 survey points could not be sampled and were skipped",
         AUTOFOCUS_OFF_LINE,
+        ORIENTATION_LINE,
     )
     assert result.fit is not None
     assert result.fit.n_samples == 204
@@ -1548,6 +1624,7 @@ def test_a_frame_value_that_is_not_finite_is_a_skipped_point(
         NO_LIMITS_LINE,
         "1 of 208 survey points could not be sampled and were skipped",
         AUTOFOCUS_OFF_LINE,
+        ORIENTATION_LINE,
     )
     assert result.fit is not None
     assert result.fit.n_samples == 207
@@ -1590,6 +1667,7 @@ def test_points_outside_the_soft_limits_are_not_visited(
         f"{len(planned) - len(inside)} of {len(planned)} survey points are "
         "outside the stage's soft limits and were not sampled",
         AUTOFOCUS_OFF_LINE,
+        ORIENTATION_LINE,
     )
     assert result.fit is not None
     assert result.fit.n_samples == len(inside)
@@ -1670,7 +1748,10 @@ def test_limits_that_cut_nothing_say_nothing_and_a_point_on_a_limit_is_visited(
     record = _run(microscope, tmp_path, plates=["12-well"])
 
     result = _result(record)
-    assert result.assumed == (AUTOFOCUS_OFF_LINE,)
+    assert result.assumed == (
+        AUTOFOCUS_OFF_LINE,
+        ORIENTATION_LINE,
+    )
     assert camera.snaps == 208
     assert result.fit is not None
     assert result.fit.n_samples == 208

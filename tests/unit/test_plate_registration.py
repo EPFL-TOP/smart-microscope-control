@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Sequence
+from typing import Literal
 
 import pytest
 import useq
@@ -20,6 +21,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 from useq import _plate_registry
 
+from smc.plugins.geometry import wrap_deg
 from smc.plugins.plate_registration import algorithm
 from smc.plugins.plate_registration.algorithm import (
     DIAMETER_TOLERANCE,
@@ -173,7 +175,7 @@ def test_one_well_fixes_position_and_assumes_no_rotation() -> None:
     assert cal.residual_um is None
     assert cal.scale_error is None
     assert cal.assumed == (
-        "one reference well (A1): rotation 0° assumed, not measured",
+        "one reference well (A1): rotation 0° assumed from the declared orientation (not-turned), not measured",
     )
 
 
@@ -512,6 +514,169 @@ def test_session_3s_hand_centres_as_measured_are_refused_as_turned_180_degrees()
 
     with pytest.raises(ValueError, match=re.escape("turns the plate by 179.8°")):
         calibrate("greiner-24-well", refs)
+
+
+def test_session_3_centres_register_when_declared_turned() -> None:
+    """As read at the stand, declared turned 180° (m3 §24.1: 179.789°, 44.53 µm)."""
+    refs = [WellRef(well=w, x_um=x, y_um=y) for w, x, y in SESSION_3_CENTRES]
+
+    cal = calibrate("greiner-24-well", refs, orientation="turned-180")
+
+    assert cal.orientation == "turned-180"
+    assert abs(wrap_deg(cal.rotation_deg - 179.79)) < 0.5
+    assert cal.residual_um is not None
+    assert cal.residual_um < 100.0
+    assert cal.residual_um == pytest.approx(44.53, abs=0.01)
+    assert [r.well for r in cal.refs] == ["B3", "B5", "C3"]
+    # The printed B3 is where the operator centred it, within the residual.
+    assert math.dist(cal.well_center_um("B3"), (10003.0, -10051.0)) < 100.0
+
+
+def test_session_3_centres_declared_not_turned_are_refused_as_turned() -> None:
+    refs = [WellRef(well=w, x_um=x, y_um=y) for w, x, y in SESSION_3_CENTRES]
+
+    with pytest.raises(ValueError, match="the fit turns the plate") as raised:
+        calibrate("greiner-24-well", refs)
+
+    assert str(raised.value) == (
+        "the fit turns the plate by 179.8°: it lies turned 180° from the declared "
+        "orientation (not-turned), or two reference wells are swapped; if A1 is at "
+        "the other corner, declare orientation=turned-180, else check the well names"
+    )
+
+
+@pytest.mark.parametrize("tilt", [0.3, -0.3])
+def test_a_turned_plate_registers_where_useq_puts_it(tilt: float) -> None:
+    """24-well (4 x 6, not square) turned 180° and tilted: A1, rotation and names (FM-73)."""
+    a1 = (48000.0, -29000.0)
+    refs = _measure("24-well", a1, 180.0 + tilt, ["A1", "A6", "D1"])
+
+    cal = calibrate("24-well", refs, orientation="turned-180")
+
+    assert cal.a1_center_xy_um == pytest.approx(a1, abs=1e-6)
+    assert wrap_deg(cal.rotation_deg - (180.0 + tilt)) == pytest.approx(0.0, abs=1e-9)
+    for ref in _measure("24-well", a1, 180.0 + tilt, ["B3", "D6"]):
+        assert cal.well_center_um(ref.well) == pytest.approx(
+            (ref.x_um, ref.y_um), abs=1e-6
+        )
+
+
+@pytest.mark.parametrize("tilt", [17.5, -17.5])
+def test_a_turned_fit_beyond_the_tilt_bound_keeps_the_misnamed_well_refusal(
+    tilt: float,
+) -> None:
+    refs = _measure("96-well", (10.0, 20.0), 180.0 + tilt, ["A1", "A12", "H1"])
+
+    with pytest.raises(ValueError, match="the fit turns the plate") as raised:
+        calibrate("96-well", refs, orientation="turned-180")
+
+    assert str(raised.value) == (
+        f"the fit turns the plate by {tilt:.1f}° from turned-180, beyond ±10°: a "
+        "reference well is misidentified (two references the same distance apart "
+        "fit either way)"
+    )
+    cal = calibrate("96-well", refs, orientation="turned-180", max_rotation_deg=20.0)
+    assert wrap_deg(cal.rotation_deg - 180.0) == pytest.approx(tilt, abs=1e-9)
+
+
+@pytest.mark.parametrize(
+    ("orientation", "rotation", "other"),
+    [("not-turned", 0.0, "turned-180"), ("turned-180", 180.0, "not-turned")],
+)
+def test_two_swapped_references_are_refused_with_the_turned_text(
+    orientation: Literal["not-turned", "turned-180"], rotation: float, other: str
+) -> None:
+    """Two references exchanged fit at 180° exactly: the refusal names the swap too."""
+    b3, b5 = _measure("24-well", (1000.0, -2000.0), rotation, ["B3", "B5"])
+    swapped = [
+        WellRef(well="B3", x_um=b5.x_um, y_um=b5.y_um),
+        WellRef(well="B5", x_um=b3.x_um, y_um=b3.y_um),
+    ]
+
+    with pytest.raises(ValueError, match="the fit turns the plate by") as raised:
+        calibrate("24-well", swapped, orientation=orientation)
+
+    text = str(raised.value)
+    assert f"from the declared orientation ({orientation})" in text
+    assert "or two reference wells are swapped" in text
+    assert f"declare orientation={other}, else check the well names" in text
+
+
+@pytest.mark.parametrize(("tilt", "shown"), [(0.2, "-179.8"), (-0.2, "179.8")])
+def test_a_turned_plate_tilted_either_way_is_refused_as_turned(
+    tilt: float, shown: str
+) -> None:
+    """``atan2`` reads a turned plate as -179.8° as often as 179.8°: both are turned (m3 §24)."""
+    refs = _measure("24-well", (48000.0, -29000.0), 180.0 + tilt, ["A1", "A6", "D1"])
+
+    with pytest.raises(ValueError, match="the fit turns the plate") as raised:
+        calibrate("24-well", refs)
+
+    assert str(raised.value) == (
+        f"the fit turns the plate by {shown}°: it lies turned 180° from the declared "
+        "orientation (not-turned), or two reference wells are swapped; if A1 is at "
+        "the other corner, declare orientation=turned-180, else check the well names"
+    )
+
+
+def test_a_fit_beyond_the_bound_of_both_orientations_is_a_misnamed_well() -> None:
+    """17.5° from turned, 162.5° from not turned: neither, so a well is misnamed."""
+    refs = _measure("96-well", (10.0, 20.0), 197.5, ["A1", "A12", "H1"])
+
+    with pytest.raises(ValueError, match="the fit turns the plate") as raised:
+        calibrate("96-well", refs)
+
+    assert str(raised.value) == (
+        "the fit turns the plate by -162.5°, beyond ±10°: a reference well is "
+        "misidentified (two references the same distance apart fit either way)"
+    )
+
+
+@pytest.mark.parametrize("orientation", ["not-turned", "turned-180"])
+def test_a_tilt_on_the_bound_is_accepted(
+    orientation: Literal["not-turned", "turned-180"],
+) -> None:
+    turn = 180.0 if orientation == "turned-180" else 0.0
+    refs = _measure("96-well", (10.0, 20.0), turn + 7.5, ["A1", "A12", "H1"])
+    tilt = abs(
+        wrap_deg(
+            calibrate(
+                "96-well", refs, orientation=orientation, max_rotation_deg=20.0
+            ).rotation_deg
+            - turn
+        )
+    )
+
+    cal = calibrate("96-well", refs, orientation=orientation, max_rotation_deg=tilt)
+
+    assert cal.orientation == orientation
+
+
+def test_a_seed_on_a_turned_plate_places_a1_at_the_far_corner() -> None:
+    """One well, declared turned: A1 lies on the stage's +X -Y side of B3, as in useq's plan."""
+    b3 = (10003.0, -10051.0)
+
+    seed = calibrate(
+        "24-well",
+        [WellRef(well="b3", x_um=b3[0], y_um=b3[1])],
+        orientation="turned-180",
+    )
+
+    # B3 is 2 columns and 1 row from A1: turned, A1 is 2 pitches towards +X and one
+    # towards -Y of it (19 mm), where a plate not turned has it towards -X +Y.
+    assert seed.a1_center_xy_um == pytest.approx((b3[0] + 38000.0, b3[1] - 19000.0))
+    assert seed.rotation_deg == 180.0
+    assert seed.orientation == "turned-180"
+    assert seed.method == "seed"
+    truth = useq.WellPlatePlan(
+        plate="24-well", a1_center_xy=seed.a1_center_xy_um, rotation=180.0
+    )
+    lookup = {str(p.name): (p.x, p.y) for p in truth.all_well_positions}
+    assert lookup["B3"] == pytest.approx(b3, abs=1e-6)
+    assert seed.assumed == (
+        "one reference well (B3): rotation 180° assumed from the declared "
+        "orientation (turned-180), not measured",
+    )
 
 
 def test_three_hand_centred_wells_of_the_lab_plate_fit_it() -> None:
@@ -1065,6 +1230,48 @@ def test_wall_position_on_an_anisotropic_plate_uses_each_axis_s_size(
     }.items():
         expected = (centre[0] + cos * ox - sin * oy, centre[1] + sin * ox + cos * oy)
         assert wall_position(result, "B3", side) == pytest.approx(expected, abs=1e-6)
+
+
+@pytest.mark.parametrize("orientation", ["not-turned", "turned-180"])
+def test_wall_position_plus_x_is_the_stage_plus_x_on_a_turned_plate(
+    orientation: str,
+) -> None:
+    """A side is a stage direction on either orientation (m3 §24 D9, FM-189).
+
+    A 24-well tilted 0.3° in its holder: each side's point lies a half-size from
+    the centre along the stage's own direction, turned by the tilt only, never by
+    the 180° of the turn.
+    """
+    tilt = 0.3
+    rotation = wrap_deg(tilt + (180.0 if orientation == "turned-180" else 0.0))
+    result = PlateResult.model_validate(
+        {
+            "plate": "24-well",
+            "a1_center_xy_um": (48000.0, -29000.0),
+            "rotation_deg": rotation,
+            "method": "references",
+            "residual_um": None,
+            "scale_error": None,
+            "n_refs": 0,
+            "orientation": orientation,
+        }
+    )
+    cx, cy = result.well_center_um("B3")
+    half = 15600.0 / 2.0
+    cos, sin = math.cos(math.radians(tilt)), math.sin(math.radians(tilt))
+    for side, (ux, uy) in {
+        "+X": (1.0, 0.0),
+        "-X": (-1.0, 0.0),
+        "+Y": (0.0, 1.0),
+        "-Y": (0.0, -1.0),
+    }.items():
+        expected = (
+            cx + half * (cos * ux - sin * uy),
+            cy + half * (sin * ux + cos * uy),
+        )
+        assert wall_position(result, "B3", side) == pytest.approx(expected, abs=1e-6), (
+            side
+        )
 
 
 def test_an_unknown_well_is_refused_rather_than_placed() -> None:
