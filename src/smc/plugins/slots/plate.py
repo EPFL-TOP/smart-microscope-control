@@ -11,21 +11,26 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Literal
 
 import numpy as np
 import numpy.typing as npt
 import useq
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from smc.plugins.api import PluginResult
+from smc.plugins.geometry import wrap_deg
 from smc.plugins.slots.base import SlotValue
 
 __all__ = [
     "IMAGE_SIDES",
+    "ORIENTATION_DEG",
     "ImageSide",
     "LatticeFit",
+    "PlateOrientation",
     "PlateResult",
     "WallFrame",
     "WallImages",
@@ -36,10 +41,49 @@ __all__ = [
     "WellRef",
     "normalise_well",
     "refuse_image_side",
+    "turned_well",
     "well_geometry",
 ]
 
 _WELL = re.compile(r"([A-Za-z]+)\s*([0-9]+)")
+
+#: Which way the plate lies in its holder, in the stage's terms (m3 §24 D1).
+#: ``not-turned`` is ``useq``'s layout on the stage: A1 at the -X +Y corner,
+#: columns towards +X, rows towards -Y. ``turned-180`` is that plate turned 180°:
+#: A1 at the +X -Y corner. Text, not ``0``/``180``: a number literal cannot be
+#: given on the command line (pydantic does not turn "180" into an int literal).
+PlateOrientation = Literal["not-turned", "turned-180"]
+
+#: The rotation each orientation stands for; a fit's tilt is measured from it.
+ORIENTATION_DEG: Mapping[str, float] = MappingProxyType(
+    {"not-turned": 0.0, "turned-180": 180.0}
+)
+
+#: The bound between a plate's rotation and its orientation's (m3 §24 D2): a
+#: result beyond it says one thing in ``rotation_deg`` and another in
+#: ``orientation``, and is refused rather than read either way.
+_MAX_FROM_ORIENTATION_DEG = 90.0
+
+
+def turned_well(plate: str, well: str) -> str:
+    """The name of the well at ``well``'s place once the plate is turned 180°.
+
+    Row ``r`` becomes ``R-1-r`` and column ``c`` becomes ``C-1-c`` (B3 is C4 on a
+    24-well): a plate whose wells form a uniform grid lands on itself when turned,
+    so a turn only renames (m3 §24.1). The row and column are found in ``useq``'s
+    names, never by parsing letters (§3.2), because a 1536-well's rows run to AF.
+
+    Raises:
+        ValueError: The plate is unknown to ``useq`` or the well is not on it.
+    """
+    names = np.asarray(useq.WellPlate.from_str(plate).all_well_names)
+    found = np.argwhere(names == normalise_well(well))
+    if len(found) == 0:
+        raise ValueError(f"well {well!r} is not on the {plate} plate")
+    rows, cols = names.shape
+    row, col = int(found[0][0]), int(found[0][1])
+    return str(names[rows - 1 - row, cols - 1 - col])
+
 
 #: A wall of a well by the stage direction that reaches it from the well's centre.
 #: Never an image side: ``+X`` is the wall the stage reaches by going +X, whatever
@@ -191,6 +235,14 @@ class PlateResult(PluginResult):
     place": a stand with no turret, and every result written before ``objective``
     existed. It is the plate's own objective for every method, and has a
     default so that older run documents still load.
+
+    ``orientation`` is which way the plate lies in its holder, as the operator
+    declared it (m3 §24 D2): the samples follow the names printed on the plate,
+    and a plate turned 180° lands on itself, so nothing measured tells the two
+    apart. A result written before it existed reads ``not-turned``, which is what
+    every earlier fit was checked against. ``rotation_deg`` is the full rotation
+    (about 180° on a turned plate); the validator refuses one more than 90° from
+    the orientation's, so the two fields never contradict each other.
     """
 
     plate: str
@@ -204,6 +256,80 @@ class PlateResult(PluginResult):
     fit: LatticeFit | None = None
     walls: WallImages | None = None
     objective: str | None = None
+    orientation: PlateOrientation = "not-turned"
+
+    @model_validator(mode="after")
+    def _rotation_agrees_with_orientation(self) -> PlateResult:
+        delta = wrap_deg(self.rotation_deg - ORIENTATION_DEG[self.orientation])
+        # `not <=`: a nan never reaches here (allow_inf_nan=False), but the
+        # comparison refuses one anyway rather than let it through.
+        if not abs(delta) <= _MAX_FROM_ORIENTATION_DEG:
+            raise ValueError(
+                f"rotation_deg {self.rotation_deg:g} is {delta:.1f}° from "
+                f"orientation {self.orientation} "
+                f"({ORIENTATION_DEG[self.orientation]:g}°), beyond "
+                f"±{_MAX_FROM_ORIENTATION_DEG:g}°: the two contradict each other"
+            )
+        return self
+
+    def turned(self) -> PlateResult:
+        """The same plate turned 180° about its grid's centre: every well renamed, nothing moved.
+
+        A1 moves to the old centre of the last well and the rotation gains 180°,
+        so each well position stays and only its name changes (m3 §24 D6). Every
+        well name the result holds is renamed (``refs``, ``walls.wells``);
+        ``residual_um``, ``scale_error``, ``fit``, ``objective`` and ``method`` are
+        kept, because nothing is measured again. ``assumed`` keeps its lines and
+        says that their well names are the fit's.
+        """
+        names = useq.WellPlate.from_str(self.plate).all_well_names
+        last = str(names[-1][-1])
+        new: PlateOrientation = (
+            "turned-180" if self.orientation == "not-turned" else "not-turned"
+        )
+        refs = tuple(
+            ref.model_copy(update={"well": turned_well(self.plate, ref.well)})
+            for ref in self.refs
+        )
+        walls = self.walls
+        if walls is not None:
+            walls = walls.model_copy(
+                update={
+                    "wells": tuple(
+                        fit.model_copy(
+                            update={"well": turned_well(self.plate, fit.well)}
+                        )
+                        for fit in walls.wells
+                    )
+                }
+            )
+        line = (
+            f"turned 180° to {new} after the fit: every well renamed (row r to "
+            f"R-1-r, column c to C-1-c), nothing measured again; a well named in a "
+            f"line above is the fit's name"
+        )
+        # Validated again, not `model_copy`: the new rotation and orientation are
+        # checked against each other like any result's.
+        return type(self).model_validate(
+            {
+                **{name: getattr(self, name) for name in type(self).model_fields},
+                "a1_center_xy_um": self.well_center_um(last),
+                "rotation_deg": wrap_deg(self.rotation_deg + 180.0),
+                "orientation": new,
+                "refs": refs,
+                "walls": walls,
+                "assumed": (*self.assumed, line),
+            }
+        )
+
+    def with_orientation(self, orientation: PlateOrientation) -> PlateResult:
+        """This result declared ``orientation``: itself when it already is, else ``turned()``.
+
+        Absolute, not a toggle: asking for the fit's own orientation gives the
+        fit's numbers back, so running ``plate-orientation`` twice with the same
+        value changes nothing (m3 §24 D6).
+        """
+        return self if orientation == self.orientation else self.turned()
 
     @field_validator("plate")
     @classmethod
