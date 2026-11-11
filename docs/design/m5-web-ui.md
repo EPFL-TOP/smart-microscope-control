@@ -4506,6 +4506,11 @@ Every build issue edits `plate_page.py` and, from B2 on, `controller.py` and
   **every** provisional screen and in the expert view: one instance, drawn once. Its
   place does not depend on the state, so `refresh()` never rewrites a screen's list.
   B2 to B4 drop it from the screens they replace, whose own action is the next step.
+- **A live walk on B1's shell** (the owner and a design session, once #443 is
+  merged): `demo-sample` through Claude in Chrome (the `ui-check` skill's *Live mode*),
+  a newcomer's path through the five steps. It starts `/plan 444`, and its findings
+  change §17.4 here before B2 is planned. #431's plan began without it: no Chrome MCP
+  was available, and the page of today had already been walked (#293, #310).
 - **B2, the Stand and Plate screens** (#444): §17.4.1 and §17.4.2 in full,
   `guide.suggested_centres`, the "known" block, the *from …* lines.
 - **B3, the Wells and Scan screens** (#445): §17.4.3 and §17.4.4, the progress and
