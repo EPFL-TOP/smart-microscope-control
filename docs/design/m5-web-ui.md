@@ -18,7 +18,9 @@
   in Live, a plate estimated from the stand's holder, the pose the title names);
   which way the plate lies fixed by #422's plan (§16, 2026-11-11: the choice next
   to the plate menu, the stand's sides and A1 on the map, the switch that renames a
-  registered plate).
+  registered plate); the page as one guided scan fixed by #431's plan with the owner
+  (§17, 2026-11-11: five screens, one decision each, the map and the image side by
+  side, the expert view behind a switch; built by #443 to #446).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 to M3, this document is the contract between issues.
   Names, module paths and signatures below are fixed; an executor who needs to
@@ -4169,3 +4171,394 @@ line, not on a delay).
 **Not verified (for the owner)**: the Ti2-E's `back` and `right`, at the stand; the
 switch read by an operator who has not read this section; that the selection keeping
 its names after a turn is what the operator expects.
+
+## 17. The page as one guided scan (#431)
+
+Fixed by #431's plan with the owner (2026-11-11). The owner's words: "l'UI a aussi
+besoin de beaucoup d'amélioration" (2026-11-11), "c'est pas évident, la configuration
+est complexe" (2026-10-30), "des pré-réglages car on utilise souvent la même chose
+d'expérience en expérience" (2026-11-03), "wall-centring is very long … show the
+plate position … a live cross" (2026-11-10). The page grew by additions (§2 to §16)
+and works; this section redesigns the whole as **one path of five screens, one
+decision each**, with today's page kept as the **expert view** behind one switch.
+It adds no tool, no slot and no command: every button is still a plugin run or a
+capability call with its command (ADR-0006 principle 5), and every guard of the
+layer holds. The mock-up the owner decided on is
+[`mockups/m5-guided-scan.html`](mockups/m5-guided-scan.html) (static, opens in a
+browser; nothing in it talks to a stand).
+
+### 17.1 What the page is today (evidence, 2026-11-11)
+
+`/ui-check` on `main` at `149e1d7`, `demo-sample`, 1600 x 1000, 5 of 6 states
+reached (`wells-selected` not reached: #395), 0 server and 0 browser errors; and an
+inventory of `plate_page.py`, `controller.py` and `guide.py` at the same commit.
+
+- **One long column of forms.** The right-hand column (`width=420`) holds the
+  preset, the next step, the drive and an accordion of every plugin with every stage
+  open: `after-density-full.png` is about 6700 px high at a 1600 px width. The result
+  cards, the next step's 12-line `command:` and the run document's checklist are below
+  the fold or clipped at the right edge (`after-density.png`: the light note runs off
+  the viewport).
+- **The map and the image are two tabs.** The operator who centres a well (Live,
+  then the arrows) does not see the map, and the one who clicks a well does not see
+  the image; a Snap switches the tab by itself.
+- **The same choice in several places.** The plate: the *Plate* menu, the *The plate
+  is a …* confirmation and the preset. The objective: the drive's select, which turns
+  the turret, and `scan-plan`'s free-text `objective` field. Sides: three separate
+  selects (drive to, wall capture, density label). Two Run paths for one tool (the
+  next step's pairs, the form's fields).
+- **Overlaps.** The *Drive (next click moves the stage)* toggle is drawn over the
+  preset's *Save as* label (`empty.png`).
+- **What a newcomer met** (#293's walk, #310's walk, Ti2-E sessions 2 and 3): the
+  order of the tools left to the reader, results below the fold, a registration that
+  took most of a session (#405: "centring on the walls is very long"), the place of
+  the stage on the plate unknown before a registration (#410, now a cross).
+
+### 17.2 Decisions
+
+- **D1 Layout** (owner, on the mock-up). The status strip with STOP on top; under
+  it the step bar, five steps and the *Expert view* switch; under that the **step
+  panel** on the left (`STEP_PANEL_WIDTH_PX = 400`) and the **centre**, where the
+  map and the image sit **side by side**, each `sizing_mode="stretch_width"`, at every
+  width from 1280 px; the drive bar under the image. There are **no tabs**: neither
+  figure is ever hidden, which also retires FM-174's cause (a figure's view destroyed
+  by a dynamic tab).
+- **D2 Free steps with a suggested one** (owner). Every step opens at any time, and
+  none is disabled. The page opens on `opening_step` (§17.5); afterwards only the
+  operator changes the screen (a click on a step, or a screen's *Continue to …*
+  button). An action that cannot run is drawn disabled with its reason beside it, as
+  today (§11.2). A run's end, a Snap or a tick never changes the screen.
+- **D3 The guided registration is three centres by eye** (owner). The Plate screen
+  offers only `plate-registration` from three captured centres (proven on #410: a
+  residual of 121.6 µm and 0.10° for centres off by about 130 µm, and a centre 900 µm
+  off refused and named). `plate-walls` and `plate-finding` are named under *Other
+  ways to register* and are run from the expert view.
+- **D4 The expert view replaces the step panel** (owner). The switch swaps the left
+  panel's contents for today's regions (the preset, the next step, the page's
+  controls, the accordion of every plugin). The strip, the step bar, the map, the
+  image and the drive bar stay. The steps keep the screen they showed: switching the
+  expert view off shows it again, and a click on a step while the expert view is on
+  turns the switch off and shows that step.
+- **D5 One instance per widget, swapped, never hidden.** The step panel is one
+  `pn.Column` whose `objects` are replaced by the screen's list. A value widget (the
+  plate menu, *Plate lies*, *Wells*, a tool's field) is **one instance**, listed on
+  every screen that shows it, and drawn once because only one list is rendered.
+  **Measured** (2026-11-11, a throwaway Panel app driven by headless Chromium, Panel
+  1.10.0 / Bokeh 3.10.2 and Panel 1.9.4 / Bokeh 3.9.2, the oldest allowed): a
+  `TextInput` and a `Select` listed on two screens keep the value typed on one when the
+  other is shown; a value set by the server while the widget is off screen is drawn
+  when it comes back; the watchers fire once per change; 15 fast swaps leave no
+  console error. A **button** may have several instances (a step's own *Register the
+  plate* and the accordion's *Run plate-registration*): it holds no value, and every
+  instance goes through the same `_handler` and the same controller call. **The
+  figures are never in a swapped list** (FM-174).
+- **D6 The step is per browser tab.** The screen shown and the expert switch belong to
+  the view, not to the controller: two tabs may show two screens. What they draw is
+  still the controller's (FM-151).
+- **D7 What the page knows is not asked again.** Every value a screen shows that came
+  from somewhere says where, on one line under it: `from the preset <name>`, `from
+  the profile's suggestions`, `from the profile's sample`, `the objective in place`,
+  `the page's placeholder: choose the plate on the stage`. The objective of a scan is
+  the one in place, shown, never typed on a screen (`scan-plan`'s `objective` stays a
+  field of the expert view).
+- **D8 Texts.** English, sentence case, plain verbs; a screen's title is the question
+  it answers; an action says what it does (*Register the plate*, *Lay out the
+  fields*, *Start the scan*), and its result line uses the same verb (*Registered*,
+  *Laid out*, *Scanned*). The command of each action is under a closed *Command*
+  disclosure, never a 12-line block in the way (principle 5 keeps it one click away).
+- **D9 What this section does not change**: a plugin, a slot, the run document, a
+  command, the guards, `--dry-run`, the checklist's order (`_CHECKLIST`), the next
+  step's logic (§8.3, which each screen draws for its own tools), the module and class
+  names (§0).
+
+### 17.3 The layout
+
+```
+┌ [Connect][Disconnect]  demo-sample | XY … | Z … | 10x | autofocus off | light on | DRY RUN   [Resume] [STOP] ┐ strip
+│ outcome lines (connection, run, message, problems): an empty one takes no height                            │
+├ [1. Stand ✓][2. Plate ✓][3. Wells][4. Scan][5. Results]                                   [Expert view]    ┤ step bar
+│  demo-sample   96-well, registered   now                                                                     │ summaries
+├ step panel (400 px) ─┬─ map (stretch) ──────────────────────┬─ image (stretch) ───────────────────────────────┤
+│ title (the question) │ [Density of ▾] [Refresh]             │ [Snap] [Live]                                   │
+│ lead (one sentence)  │                                      │                                                 │
+│ fields + "from …"    │   plate map, cross, fields, density  │   frame                                         │
+│ [Action]             │                                      │                                                 │
+│ why it waits         │                                      ├─────────────────────────────────────────────────┤
+│ result line          │                                      │ drive bar: arrows, XY step, Z±, Z step,         │
+│ [Continue to …]      │                                      │ autofocus, objective, light, drive-on-click,     │
+│ ▸ Other ways         │                                      │ wall side; its notes                            │
+│ ▸ Command            │                                      │                                                 │
+└──────────────────────┴──────────────────────────────────────┴─────────────────────────────────────────────────┘
+```
+
+- `FIGURE_HEIGHT_PX = 460` for both figures (560 today), so that at 1280 x 800 the
+  strip, the step bar, both figures and the drive bar are on screen. `/ui-check` at
+  1280 x 800 is the proof; a figure lower than 400 px is a deviation to report, not a
+  fix.
+- `_TEXT_WIDTH = 370` (380 today) and every fixed width in the step panel at most
+  370, so that nothing in the 400 px panel runs past its edge (the notes of 520 px,
+  `_PLATE_NOTE_WIDTH`, become `None` with the wrapped style).
+- The step panel scrolls on its own (`scroll=True`) when a screen is taller than the
+  window; the strip, the step bar and the figures never scroll away.
+- The drive bar is a `pn.FlexBox(flex_wrap="wrap")` of today's drive widgets, plus the
+  map's *Drive to* select and the *Drive (next click moves the stage)* toggle, which
+  leave the map's controls row.
+
+### 17.4 The five screens
+
+Each screen below is the list the step panel shows. *Fields* are existing widgets
+unless marked new. *Waits* are the reasons drawn under the action (the controller
+refuses on its own: FM-169). Every action button is a new `pn.widgets.Button`
+through `_handler` (FM-171), calling the same controller method as the tool's own
+Run.
+
+**17.4.1 Stand** (`"stand"`)
+- Title: *Which stand, and which preset?* Lead: *The preset fills in the plate, the
+  scan's coverage and the cell detector. You can change any of them later.*
+- Shows: the stand line (`<stand>: connected` / `<stand>: not connected`) and a
+  *Connect <stand>* button (a second instance, same handler as the strip's) while
+  closed; the preset select with *Load*, *Save as* and *Save* (today's region);
+  a "known" block, new, `pn.pane.Str`: `Objective: <label>, in place`, `Camera:
+  calibrated at <objective> on <date>` or `Camera: not calibrated (the arrows cannot
+  say which way the image moves)`, `Light: on|off|not known`.
+- Action: *Load the preset* (today's Load). When the camera has no calibration for the
+  objective in place, a second action, *Calibrate the camera*, runs
+  `camera-calibration` with the profile's suggested pairs.
+- Continue: *Continue to Plate*.
+
+**17.4.2 Plate** (`"plate"`)
+- Title: *Where is the plate?* Lead: *Centre three wells far apart by eye, with Live
+  and the arrows, and capture each centre.*
+- Fields: *Plate* (`plate_select`) with its *from …* line; *Plate lies*
+  (`orientation_select`); the plate confirmation of §11.3 when the plate is the
+  placeholder.
+- The centres list, new: one row per **suggested well**, `guide.suggested_centres`
+  (three wells far apart: A1, the last column of row A, the last row of column 1,
+  as printed on the plate whatever its orientation), each with its state (`captured
+  at (x, y) µm with <objective>` / `go there, centre it, capture`) and *Go to
+  <well>* or *Redo*. A capture of another well (clicked on the map) is listed too;
+  the suggestion is not a rule.
+- Actions: *Capture the centre of <well>* (`capture_centre`), *Register the plate*
+  (`plate-registration` with the captured refs, the pairs of today's next step). Waits:
+  `CAPTURE_WELLS`, `PLATE_NOT_CHOSEN`, the stand, a run going. On a profile with a
+  `[sample]` of this plate the list says `known from the profile's sample, not
+  measured` and Register runs from the sample's refs (§8.3).
+- Result line: `Registered: residual <r> µm, turned <deg>°` and the card's `assumed`
+  lines. Other ways: *From the walls of 2–3 wells (slower; measures the wells' size
+  too) or automatically (surveys the plate, about 7 minutes): in the expert view.*
+- Continue: *Continue to Wells*.
+- #373 (the objective a plate records) is not decided here; the list shows the
+  objective of each capture, so that a turn between captures is visible.
+
+**17.4.3 Wells** (`"wells"`)
+- Title: *Which wells?* Lead: *Click wells on the map, or type them. The map shows the
+  fields and the time the scan will take.*
+- Fields: *Wells* (`select_input`), `scan-plan`'s `coverage` field (the tool's own
+  `TextInput`, one instance), `scan`'s `autofocus` field; each with its *from …* line.
+  A "known" block: `Objective: <label>, in place`, `Fields: <n> in <w> wells` and
+  `Time: about <duration_text>` from the plan (§14) once laid out, with the plan's
+  assumed timing on its own line.
+- Action: *Lay out the fields* (`scan-plan`). Waits: `SELECT_WELLS`, the plate.
+- Continue: *Continue to Scan*.
+
+**17.4.4 Scan** (`"scan"`)
+- Title: *Scan <wells>* (`Scan B2 and B11`, `Scan 12 wells`). Lead: *<n> fields at
+  <objective>. STOP, at the top right, stops the scan.*; on a stand whose profile says
+  `stop_refused_by`, the lead adds *A move already sent finishes first on this stand.*
+- Action: *Start the scan* (`scan`). Waits: the plan, `DRY_RUN_NO_FRAME`.
+- While it runs: a `pn.indicators.Progress` (`value=done`, `max=total`) and the
+  lines `Field <done> of <total>`, `Elapsed <t>`, `Left about <t> (estimated from the
+  fields so far)`, from `PageStatus.progress`; the map draws the plan's first `done`
+  fields as imaged (the plan's fields are in visiting order, §14.1).
+- Result line: `Scanned: <frames> frames, <failed> failed` and the folder.
+- Continue: *Continue to Results*.
+- **The frames as they arrive** on the image are not here: a plugin has no channel to
+  hand the page its frames (`smc.plugins.api` has `Progress` only). That is a change of
+  the plugin interface (m3), its own issue.
+
+**17.4.5 Results** (`"results"`)
+- Title: *Results*. Lead: *Each step reads the one before. Run the next one, or all
+  that are left.*
+- Rows, new, one per tool in checklist order (`cells`, `density`, `route`, `report`,
+  `nis-export`): a plain name (*Count the cells*, *Density per well*, *Route through
+  the densest fields*, *Report*, *Export for NIS-Elements*), a state line (the card's
+  first line when done, `after <previous>` when its input is missing, the reason when
+  blocked), and *Run* / *Again*. The key fields the profile or the preset fill
+  (`detector`, `labels`, `fields_per_well`) are under each row's *Choices*.
+- Action: *Run all that are left*: `PlatePage.run_chain(plugins)` (new), which starts
+  each tool when the previous one ends `done`, and stops at the first that does not
+  (failed, stopped, refused), saying which; STOP ends the chain. The chain is the
+  controller's (FM-169, FM-151), not a view's loop.
+- The map's colour bar has a title, `<class> cells per mm²` (#293, item 6).
+- *Where the files are*: each card's `files` lines and the run document's path.
+
+**The expert view** (`"expert"`): the preset region, the next-step region, the
+page's controls (*Plate*, *Plate lies*, *Wells*, the plate confirmation) and the
+accordion of every stage, as today.
+
+### 17.5 The steps (`smc/ui/guide.py`, pure)
+
+```python
+StepName = Literal["stand", "plate", "wells", "scan", "results"]
+
+STEPS: tuple[StepName, ...] = ("stand", "plate", "wells", "scan", "results")
+STEP_TITLES: Mapping[StepName, str] = {
+    "stand": "Stand",
+    "plate": "Plate",
+    "wells": "Wells",
+    "scan": "Scan",
+    "results": "Results",
+}
+#: Which screen holds the tools of a checklist slot (m5 §17.5). A slot not listed
+#: (a third party's) belongs to no screen and is in the expert view only.
+STEP_OF_SLOT: Mapping[str, StepName] = {
+    "camera-calibration": "stand",
+    "timings": "stand",
+    "plate": "plate",
+    "scan-plan": "wells",
+    "scan": "scan",
+    "cells": "results",
+    "density": "results",
+    "route": "results",
+    "report": "results",
+    "nis-export": "results",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class StepState:
+    step: StepName
+    done: bool
+    suggested: bool
+    summary: str
+
+
+def step_states(
+    checklist: Sequence[CheckItem],
+    *,
+    connected: bool,
+    stand: str,
+    preset: str | None,
+    plate: str,
+    plan: PlanLayer | None,
+) -> tuple[StepState, ...]: ...
+def opening_step(states: Sequence[StepState]) -> StepName: ...
+def step_button_label(index: int, state: StepState) -> str: ...
+```
+
+- `done`: *stand* when `connected`; *plate*, *wells*, *scan* when every
+  non-optional slot of `STEP_OF_SLOT` mapped to it is `ok`; *results* when all of its
+  slots are `ok`. The optional slots never decide.
+- `suggested`: the step that holds `next_slot(checklist)`, or *stand* while not
+  connected; at most one step is suggested, none when everything is done.
+- `summary`, one line, at most 40 characters: *stand* `<stand>` or `<stand>, preset
+  <name>`, `not connected`; *plate* `<plate>, registered`; *wells* `<w> wells, <n>
+  fields` from `plan`; *scan* `scanned`; *results* `<k> of 5 done`; `""` for a step
+  neither done nor suggested, `next` for the suggested one.
+- `opening_step`: the suggested step, else *results*.
+- `step_button_label(2, state)`: `"2. Plate ✓"` when done, `"2. Plate"` otherwise.
+  The number makes each step button's accessible name unique (*Plate* is also a select's
+  label and the map's title, which `/ui-check` locates by text).
+
+### 17.6 The view (`smc/ui/plate_page.py`)
+
+- `PlatePage.stand_name` (new property): the profile's `microscope.name`, read
+  without the stand, since `refresh()` must not call `status()` (its cost during Live
+  on the Ti2-E, #333).
+- `PlatePageView.step: StepName` (starts at `opening_step` on build) and
+  `PlatePageView.expert: bool` (`False`), per view (D6).
+- `step_buttons: dict[StepName, pn.widgets.Button]`, `step_summaries:
+  dict[StepName, pn.pane.Str]`, `expert_toggle: pn.widgets.Toggle(name="Expert
+  view")`, `continue_button: pn.widgets.Button` (one instance; its label is
+  `Continue to <next title>`, hidden on *results*), `step_panel: pn.Column`.
+- `screens: dict[StepName | Literal["expert"], list[Viewable]]`, built once in
+  `__init__`; `show_step(step)` and `show_expert(on)` replace `step_panel.objects`
+  with a **copy** of the list and restyle the step buttons (`button_type="primary"`
+  for the step shown, `"light"` otherwise; `css_classes=["smc-step",
+  "smc-step-shown"]` on the step shown and `["smc-step"]` on the others, which
+  `/ui-check` reads as `.smc-step-shown button`, measured on Panel 1.10.0 and 1.9.4).
+  `refresh()` rewrites the labels and summaries from `guide.step_states`, never
+  `step_panel.objects`, and `tick()` calls nothing new.
+- Today's `_layout` is replaced by the regions of §17.3. The `pn.Tabs`, `_PLATE_TAB`,
+  `_IMAGE_TAB` and the tab switches of `on_snap` and `on_live` go. The accordion stays
+  as built, and is listed in `screens["expert"]` only.
+- **Every handler is still registered through `_handler`.**
+  `test_every_handler_the_page_registers_is_guarded` walks `screens` as well as the
+  layout: a screen not shown is not in the layout, and `Viewable.select` would not see
+  its buttons (the gap FM-171 records for the accordion).
+
+### 17.7 Build order (each step leaves the page usable)
+
+Every build issue edits `plate_page.py` and, from B2 on, `controller.py` and
+`guide.py`: they run **one after another**, never in parallel.
+
+- **B1, the shell** (#443). The regions of §17.3, the step bar, the swap, the expert
+  switch, the guide's §17.5, `/ui-check` at 1280 x 800 on the new layout (§17.8). The
+  five screens are **provisional**, made of today's regions: *stand* the preset
+  region, `camera-calibration`'s and `timing`'s sections (the connection line stays
+  under the strip); *plate*
+  the plate controls and `plate-registration`'s section; *wells* *Wells* and
+  `scan-plan`'s section; *scan* `scan`'s section; *results* the sections of `cells`,
+  `density`, `route`, `report` and `nis-export`, then the run document's path and its
+  checklist (`run_document_text`, `checklist_text`, also in the expert view). Each
+  screen's title, lead and
+  `continue_button` are §17.4's. The next-step region (§8.3) is listed at the top of
+  **every** provisional screen and in the expert view: one instance, drawn once. Its
+  place does not depend on the state, so `refresh()` never rewrites a screen's list.
+  B2 to B4 drop it from the screens they replace, whose own action is the next step.
+- **B2, the Stand and Plate screens** (#444): §17.4.1 and §17.4.2 in full,
+  `guide.suggested_centres`, the "known" block, the *from …* lines.
+- **B3, the Wells and Scan screens** (#445): §17.4.3 and §17.4.4, the progress and
+  the imaged fields.
+- **B4, the Results screen** (#446): §17.4.5, `PlatePage.run_chain`, the colour bar's
+  title.
+- **The scan's frames on the image** (#447): a channel from a plugin to the page for
+  its frames, designed in m3 first.
+- **The walks** (#431's last criterion, the owner): on `demo-sample` after B4; then a
+  lab member at the Ti2-E: a plate registered and two wells scanned with no document
+  open.
+
+### 17.8 `/ui-check`
+
+From B1 on, the viewport is **1280 x 800** (the floor of D1; `--width` and
+`--height` stay). The states keep their names and change their actions: `empty` (as
+it opens), `wells-selected` (the *3. Wells* step, then `A1:B2` in *Wells*: its label
+is unique once the step panel shows one screen, which ends #395's double match),
+`snap` (the image's *Snap*, the screen unchanged), a new `expert` (the switch on, the
+photograph, the switch off; fourth, so that both stands reach it: `STATE_NAMES[:4]`),
+`after-density` (the chain, a Snap, no Refresh, then *5. Results*), `with-route`, and
+`turned` (*2. Plate*, then *Plate lies*). `summary.txt`'s `active tab` line becomes
+`step`, the label of the step button drawn as `primary`. B2 to B4 each read
+the states of their screens; each walks its screens at 1280 x 800 and says in its
+Report what is below the fold.
+
+### 17.9 Tests and failure modes
+
+- `tests/unit/test_ui_guide.py` gains, in B1:
+  `test_every_checklist_slot_has_a_step`,
+  `test_a_step_is_done_when_its_required_slots_are_ok`,
+  `test_the_suggested_step_holds_the_next_slot`,
+  `test_the_page_opens_on_the_stand_until_it_is_connected`,
+  `test_a_done_steps_summary_names_what_it_holds`,
+  `test_step_labels_are_unique_and_numbered`.
+- `tests/unit/test_plate_page_steps_view.py` (new, Panel), in B1:
+  `test_the_step_panel_shows_one_screen_at_a_time`,
+  `test_a_widget_on_two_screens_keeps_its_value_across_a_switch`,
+  `test_the_expert_view_holds_every_tool_and_the_step_comes_back`,
+  `test_both_figures_stay_in_the_model_tree_whatever_the_screen` (FM-174),
+  `test_the_strip_and_stop_are_outside_the_step_panel`,
+  `test_the_next_step_is_on_every_provisional_screen_and_drawn_once`,
+  `test_a_snap_or_a_runs_end_never_changes_the_screen`,
+  `test_two_views_show_their_own_screens`.
+- `tests/unit/test_plate_page.py`: the tab tests
+  (`test_the_tabs_are_not_dynamic_so_the_plate_figure_keeps_its_view_and_its_frame`,
+  `test_both_figures_stay_in_the_model_tree_whichever_tab_is_shown`) are replaced by
+  the FM-174 test above, and FM-174's *Check* names it.
+- **Failure modes**: FM-139 (plain text), FM-151 (two tabs, D6), FM-161 (every
+  handler looked at in a browser), FM-169 (a disabled button's handler runs: every
+  new action checks in the controller), FM-171 (every new button through
+  `_handler`, the guard test walks `screens`), FM-174 (the figures never in a swapped
+  list), FM-181 (the Plate screen's capture is today's `capture_centre`).
+
+**Not verified (for the owner)**: the page read by a newcomer; the layout on the
+stand PC's screen and over RDP; a 1280 px window with the browser's own zoom.
