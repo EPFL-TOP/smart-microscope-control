@@ -382,12 +382,37 @@ class PlanLayer:
     fields: tuple[tuple[float, float], ...]
 
 
+#: How the map's plate was placed (m5 §15 D3): *registered* by a tool that measured it,
+#: *seed* by one well the operator gave, *estimated* from the stand's holder, or
+#: *unplaced* when the stand says nothing and A1 is drawn at the stage's origin.
+PoseKind = Literal["registered", "seed", "estimated", "unplaced"]
+
+
+@dataclass(frozen=True, slots=True)
+class MapPose:
+    """Where the map draws the plate and on what that rests: what the title and the label say.
+
+    A name read off an estimate is trusted, so the pose travels with the wells and
+    never apart from them (m5 §15, FM-216). ``holder_centre_um`` is the stand's
+    ``[holder] plate_centre_xy_um`` and is set for ``estimated`` only; ``seed_well``
+    is the one reference well of a ``seed`` (``""`` when the slot has none).
+    """
+
+    kind: PoseKind
+    holder_centre_um: tuple[float, float] | None = None
+    seed_well: str = ""
+
+
 @dataclass(frozen=True, slots=True)
 class PlateView:
     """A snapshot of what the run document says, as the page needs it (a pure read).
 
-    ``nominal`` is true when the wells are those of the plate type with A1 at
-    (0, 0) and no rotation, not a registered plate. ``blocked`` maps a registered
+    ``nominal`` is true when the wells are not a registered plate's: those of the plate
+    type with no rotation, A1 at the stage's origin (``pose.kind`` *unplaced*) or placed
+    from the stand's holder (*estimated*, m5 §15). Nothing but the title read it before
+    ``pose``, and nothing else changed meaning: ``goto-well`` still reads only the run
+    document's slot, so a drive click on a nominal map moves nothing. ``pose`` says
+    which of the four the map is drawn in. ``blocked`` maps a registered
     tool to why it cannot run now: what it reads, what the stand lacks, or a
     stopped or failed run's checkpoint that ``smc run --resume`` could continue
     (``run()`` refuses to start such a stage afresh). ``problems`` are what
@@ -420,6 +445,7 @@ class PlateView:
     replaces: Mapping[str, str] = field(default_factory=dict)
     camera_matrix: Matrix2 | None = None
     plan: PlanLayer | None = None
+    pose: MapPose = field(default_factory=lambda: MapPose("unplaced"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -999,6 +1025,8 @@ class PlatePage:
             tuple[str, tuple[float, float], float], tuple[WellGeometry, ...]
         ] = {}
         self._names: dict[str, frozenset[str]] = {}
+        # Per plate: where the centre of its grid of wells lies from A1 (m5 §15 D3).
+        self._grid_offsets: dict[str, tuple[float, float]] = {}
         # What a worker and a status poll both write, under ``_lock``; never held
         # across a device call, and ``stop()`` never takes it (FM-70).
         self._lock = threading.Lock()
@@ -1166,7 +1194,7 @@ class PlatePage:
                 one (see ``goto``).
             RuntimeError: ``drive`` while a run is going, or after ``close``.
         """
-        geometries, _nominal = self._geometries(self._document()[0])
+        geometries, _pose = self._geometries(self._document()[0])
         for geometry in geometries:
             if geometry.contains(x_um, y_um):
                 well = geometry.well
@@ -2830,7 +2858,7 @@ class PlatePage:
         plan = _plan_layer(
             self._slot(doc, "scan-plan", ScanPlanResult, problems), problems
         )
-        geometries, nominal = self._registered_geometries(registered)
+        geometries, pose = self._registered_geometries(registered)
         selected = frozenset(self.selection)
         measured = {} if density is None else {w.well: w for w in density.wells}
         wells: list[WellView] = []
@@ -2874,7 +2902,7 @@ class PlatePage:
         cards = self._with_sample_source(doc, cards)
         return PlateView(
             plate=self._plate,
-            nominal=nominal,
+            nominal=pose.kind in ("estimated", "unplaced"),
             wells=tuple(wells),
             labels=() if density is None else density.labels,
             route=stops,
@@ -2886,6 +2914,7 @@ class PlatePage:
             replaces=self._replace_notes(doc),
             camera_matrix=None if calibration is None else calibration.matrix_um_per_px,
             plan=plan,
+            pose=pose,
         )
 
     def _replace_notes(self, doc: RunDocument) -> dict[str, str]:
@@ -3371,33 +3400,55 @@ class PlatePage:
                 blocked[name] = reason
         return blocked
 
-    def _geometries(self, doc: RunDocument) -> tuple[tuple[WellGeometry, ...], bool]:
-        """The wells the map draws for ``doc``: what ``view`` and ``click`` both use."""
+    def _geometries(self, doc: RunDocument) -> tuple[tuple[WellGeometry, ...], MapPose]:
+        """The wells the map draws for ``doc`` and how they were placed: what ``view`` and ``click`` both use."""
         registered = self._slot(doc, "plate", PlateResult, [])
         return self._registered_geometries(registered)
 
     def _registered_geometries(
         self, registered: PlateResult | None
-    ) -> tuple[tuple[WellGeometry, ...], bool]:
-        """The registered plate's wells when it is the page's plate, else the nominal plate's.
+    ) -> tuple[tuple[WellGeometry, ...], MapPose]:
+        """The wells of the page's plate and the pose that placed them (m5 §15 D3).
+
+        The first of these that holds wins: the registered plate when it is the page's
+        plate (a ``seed`` is drawn as one, its rotation being the 0° it assumed); else the
+        plate *estimated* from the profile's ``[holder]``, A1 at the holder's centre minus
+        the grid's centre offset from A1 and rotation 0°; else the plate *unplaced*, A1 at
+        the stage's origin. An estimate is a place to draw, never a registration: the run
+        document is not read for it and ``click`` still drives only a registered plate.
 
         Built once per ``(plate, a1_center_xy_um, rotation_deg)`` and kept: 1536
-        wells cost 339 ms, which a click or a refresh must not pay again.
+        wells cost 339 ms, which a click or a refresh must not pay again. The estimate's
+        A1 is a pure function of the plate and the profile, so its key is stable.
         """
         if registered is not None and registered.plate == self._plate:
-            key = (self._plate, registered.a1_center_xy_um, registered.rotation_deg)
-            nominal = False
-        else:
-            key = (self._plate, (0.0, 0.0), 0.0)
-            nominal = True
-        found = self._geometry.get(key)
-        if found is None:
-            if nominal or registered is None:
-                plan = useq.WellPlatePlan(
-                    plate=useq.WellPlate.from_str(self._plate), a1_center_xy=(0.0, 0.0)
+            a1, rotation = registered.a1_center_xy_um, registered.rotation_deg
+            if registered.method == "seed":
+                pose = MapPose(
+                    "seed",
+                    seed_well=registered.refs[0].well if registered.refs else "",
                 )
             else:
-                plan = registered.to_plan()
+                pose = MapPose("registered")
+        else:
+            rotation = 0.0
+            holder = self._profile.holder.plate_centre_xy_um
+            if holder is None:
+                a1, pose = (0.0, 0.0), MapPose("unplaced")
+            else:
+                offset = self._grid_centre_offset()
+                a1 = (holder[0] - offset[0], holder[1] - offset[1])
+                pose = MapPose("estimated", holder_centre_um=holder)
+        key = (self._plate, a1, rotation)
+        found = self._geometry.get(key)
+        if found is None:
+            plan = (
+                registered.to_plan()
+                if pose.kind in ("registered", "seed") and registered is not None
+                else useq.WellPlatePlan(
+                    plate=useq.WellPlate.from_str(self._plate), a1_center_xy=a1
+                )
+            )
             found = tuple(
                 well_geometry(plan, str(name))
                 for name in np.asarray(plan.all_well_names).ravel()
@@ -3405,7 +3456,35 @@ class PlatePage:
             if len(self._geometry) >= _GEOMETRY_KEPT:
                 self._geometry.clear()
             self._geometry[key] = found
-        return found, nominal
+        return found, pose
+
+    def _grid_centre_offset(self) -> tuple[float, float]:
+        """The centre of the page plate's grid of wells, as an offset from A1 (the mean of the wells' positions).
+
+        A holder's point is the centre of the grid and the map is placed by A1, so the
+        estimate needs this offset: ``(49 500, -31 500)`` µm for 96 wells, whose 12 by 8
+        grid is not square, so a swapped axis or a sign shows (FM-73). Kept per plate: the
+        positions of 1536 wells cost 5 ms, small but paid by every refresh.
+        """
+        found = self._grid_offsets.get(self._plate)
+        if found is None:
+            plan = useq.WellPlatePlan(
+                plate=useq.WellPlate.from_str(self._plate), a1_center_xy=(0.0, 0.0)
+            )
+            xs: list[float] = []
+            ys: list[float] = []
+            for position in plan.all_well_positions:
+                # ``useq`` types a position's axes as optional; a well of a plate plan
+                # always has both, and a missing one must not skew the mean unseen.
+                if position.x is None or position.y is None:
+                    raise ValueError(
+                        f"a well of the {self._plate} plate has no position in useq"
+                    )
+                xs.append(position.x)
+                ys.append(position.y)
+            found = (sum(xs) / len(xs), sum(ys) / len(ys))
+            self._grid_offsets[self._plate] = found
+        return found
 
     def _plate_names(self) -> frozenset[str]:
         found = self._names.get(self._plate)
