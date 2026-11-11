@@ -4236,7 +4236,9 @@ inventory of `plate_page.py`, `controller.py` and `guide.py` at the same commit.
 - **D4 The expert view replaces the step panel** (owner). The switch swaps the left
   panel's contents for today's regions (the preset, the next step, the page's
   controls, the accordion of every plugin). The strip, the step bar, the map, the
-  image and the drive bar stay. The steps keep the screen they showed.
+  image and the drive bar stay. The steps keep the screen they showed: switching the
+  expert view off shows it again, and a click on a step while the expert view is on
+  turns the switch off and shows that step.
 - **D5 One instance per widget, swapped, never hidden.** The step panel is one
   `pn.Column` whose `objects` are replaced by the screen's list. A value widget (the
   plate menu, *Plate lies*, *Wells*, a tool's field) is **one instance**, listed on
@@ -4460,6 +4462,9 @@ def step_button_label(index: int, state: StepState) -> str: ...
 
 ### 17.6 The view (`smc/ui/plate_page.py`)
 
+- `PlatePage.stand_name` (new property): the profile's `microscope.name`, read
+  without the stand, since `refresh()` must not call `status()` (its cost during Live
+  on the Ti2-E, #333).
 - `PlatePageView.step: StepName` (starts at `opening_step` on build) and
   `PlatePageView.expert: bool` (`False`), per view (D6).
 - `step_buttons: dict[StepName, pn.widgets.Button]`, `step_summaries:
@@ -4469,8 +4474,11 @@ def step_button_label(index: int, state: StepState) -> str: ...
 - `screens: dict[StepName | Literal["expert"], list[Viewable]]`, built once in
   `__init__`; `show_step(step)` and `show_expert(on)` replace `step_panel.objects`
   with a **copy** of the list and restyle the step buttons (`button_type="primary"`
-  for the step shown, `"light"` otherwise). `refresh()` and `tick()` rewrite the
-  labels and summaries from `guide.step_states`, never `step_panel.objects`.
+  for the step shown, `"light"` otherwise; `css_classes=["smc-step",
+  "smc-step-shown"]` on the step shown and `["smc-step"]` on the others, which
+  `/ui-check` reads as `.smc-step-shown button`, measured on Panel 1.10.0 and 1.9.4).
+  `refresh()` rewrites the labels and summaries from `guide.step_states`, never
+  `step_panel.objects`, and `tick()` calls nothing new.
 - Today's `_layout` is replaced by the regions of §17.3. The `pn.Tabs`, `_PLATE_TAB`,
   `_IMAGE_TAB` and the tab switches of `on_snap` and `on_live` go. The accordion stays
   as built, and is listed in `screens["expert"]` only.
@@ -4486,11 +4494,14 @@ Every build issue edits `plate_page.py` and, from B2 on, `controller.py` and
 
 - **B1, the shell** (#443). The regions of §17.3, the step bar, the swap, the expert
   switch, the guide's §17.5, `/ui-check` at 1280 x 800 on the new layout (§17.8). The
-  five screens are **provisional**, made of today's regions: *stand* the connection
-  line, the preset region, `camera-calibration`'s and `timing`'s sections; *plate*
+  five screens are **provisional**, made of today's regions: *stand* the preset
+  region, `camera-calibration`'s and `timing`'s sections (the connection line stays
+  under the strip); *plate*
   the plate controls and `plate-registration`'s section; *wells* *Wells* and
   `scan-plan`'s section; *scan* `scan`'s section; *results* the sections of `cells`,
-  `density`, `route`, `report` and `nis-export`. Each screen's title, lead and
+  `density`, `route`, `report` and `nis-export`, then the run document's path and its
+  checklist (`run_document_text`, `checklist_text`, also in the expert view). Each
+  screen's title, lead and
   `continue_button` are §17.4's. The next-step region (§8.3) is listed at the top of
   **every** provisional screen and in the expert view: one instance, drawn once. Its
   place does not depend on the state, so `refresh()` never rewrites a screen's list.
