@@ -29,7 +29,7 @@ from smc.plugins.registry import GROUP
 from smc.plugins.slots import PlateResult
 from smc.run import RunDocument, StageRecord, StageStatus, write_stage
 from smc.ui import controller as controller_module
-from smc.ui.controller import MapPose, PlatePage
+from smc.ui.controller import PlatePage
 from smc.ui.frames import Frame
 
 pytestmark = [
@@ -404,7 +404,7 @@ def test_three_captured_centres_register_the_lab_plate_from_the_page(
         assert plate.residual_um == pytest.approx(121.6, abs=0.5)
         assert math.dist(plate.a1_center_xy_um, (-48225.0, 28850.0)) < 55.0
         # The page's map is the registered plate's now, and says so.
-        assert page.view().pose == MapPose("registered")
+        assert page.view().pose.kind == "registered"
     finally:
         page.close()
 
