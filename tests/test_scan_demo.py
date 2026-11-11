@@ -598,6 +598,36 @@ def test_a_calibrated_plan_is_compared_within_ten_percent(
     assert rig.camera.snaps == 0
 
 
+def test_a_plan_from_a_calibration_document_names_it_when_the_size_changed(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """The advice that sent the operator to run.json is the one that makes the plate stale (m3 §23.5)."""
+    rig = _build(demo_microscope, tmp_path, calibrated_um=1.03)
+    assert _plan(rig).calibration_from is None
+    _edit_plan_result(
+        rig,
+        lambda result: result.update(
+            calibration_from="cal40x/run.json",
+            calibration_measured="2026-11-10T19:50:30+00:00",
+        ),
+    )
+
+    rig.stage.moves = 0
+    rig.camera.snaps = 0
+    rig.camera.reported_um = 1.5
+    with pytest.raises(PluginRunError) as raised:
+        _scan(rig)
+
+    assert raised.value.reason == (
+        "the camera reports 1.5 µm per pixel; the plan was made for 1.03 µm "
+        "(camera-calibration), more than 10% away (a binning, the magnifier "
+        "lever): run camera-calibration into cal40x/run.json, then scan-plan, "
+        "again with the stand as it is now"
+    )
+    assert rig.stage.moves == 0
+    assert rig.camera.snaps == 0
+
+
 def test_a_parameter_pixel_size_is_not_compared_and_says_so(rig: _Rig) -> None:
     plan = _plan(rig, pixel_size_um=2.0)
     assert plan.matrix_source == "parameter"

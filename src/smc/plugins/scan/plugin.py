@@ -1031,8 +1031,17 @@ def _check_stand(
             else CALIBRATION_TOLERANCE
         )
         if size_differs(p0, plan.pixel_size_um, tolerance):
+            # A plan that read another document's calibration (m3 §23) is sent
+            # there: run.json holds the registration's calibration, and running
+            # one into it makes the plate stale.
+            into = (
+                f" into {plan.calibration_from}"
+                if plan.calibration_from is not None
+                else ""
+            )
             again = (
-                "run camera-calibration, then scan-plan, again with the stand as it is now"
+                f"run camera-calibration{into}, then scan-plan, again with the stand "
+                "as it is now"
                 if plan.matrix_source == "camera-calibration"
                 else _AGAIN
             )
