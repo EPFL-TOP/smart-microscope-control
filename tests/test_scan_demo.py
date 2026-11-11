@@ -2326,9 +2326,12 @@ class _FailingAtWall(_Autofocus):
     def is_engaged(self) -> bool:
         engaged = super().is_engaged()
         if self.stage.moves == 4:
-            if self.how == "read" and self.error is not None:
+            read_back = self.calls[-2] == "disengage"
+            if self.error is not None and (
+                self.how == "read" or (self.how == "read-back" and read_back)
+            ):
                 raise self.error
-            if self.how == "still-on" and self.calls[-2] == "disengage":
+            if self.how == "still-on" and read_back:
                 return True
         return engaged
 
@@ -2356,9 +2359,10 @@ _STILL_ON = (
     [
         ("disengage", HardwareError("PFS did not answer"), _NOT_OFF),
         ("read", HardwareError("PFS did not answer"), _NOT_OFF),
+        ("read-back", HardwareError("PFS did not answer"), _NOT_OFF),
         ("still-on", None, _STILL_ON),
     ],
-    ids=["switch-off-raises", "read-raises", "still-on"],
+    ids=["switch-off-raises", "read-raises", "read-back-raises", "still-on"],
 )
 def test_a_switch_off_that_fails_at_a_wall_ends_the_scan_before_the_well(
     rig: _Rig, how: str, error: BaseException | None, reason: str
@@ -2377,15 +2381,135 @@ def test_a_switch_off_that_fails_at_a_wall_ends_the_scan_before_the_well(
     assert _stored(rig).status is StageStatus.failed
 
 
-def test_a_halt_at_a_wall_passes_as_a_halt(rig: _Rig) -> None:
-    """FM-64: a halt is not a switch-off that failed."""
-    af = _FailingAtWall(rig.stage, "read", MicroscopeHaltedError())
+@pytest.mark.parametrize(
+    ("how", "error"),
+    [
+        ("read", MicroscopeHaltedError()),
+        ("read", MotionStoppedError("pfs")),
+        ("disengage", MotionStoppedError("pfs")),
+    ],
+    ids=["halt-at-the-read", "stop-at-the-read", "stop-at-the-switch-off"],
+)
+def test_a_halt_at_a_wall_passes_as_a_halt(
+    rig: _Rig, how: str, error: HardwareError
+) -> None:
+    """FM-64: a halt or a stopped motion is not a switch-off that failed."""
+    af = _FailingAtWall(rig.stage, how, error)
     rig.microscope.override(Autofocus, af)
 
-    with pytest.raises(MicroscopeHaltedError):
+    with pytest.raises(type(error)):
         _scan(rig)
 
     assert rig.stage.moves == 4
+
+
+class _TurnedAtRead(_Turret):
+    """A turret that reads the 40x from its ``turned_at``-th read of ``current()`` on."""
+
+    def __init__(self, turned_at: int) -> None:
+        super().__init__()
+        self.turned_at = turned_at
+        self.reads = 0
+
+    def current(self) -> str:
+        self.reads += 1
+        return FORTY if self.reads >= self.turned_at else IN_PLACE
+
+
+def test_a_start_check_that_refuses_at_a_well_leaves_the_autofocus_locked(
+    rig: _Rig,
+) -> None:
+    """FM-130: the well's start check comes before the wall's switch-off."""
+    af = _Autofocus(engaged=True, locked=True)
+    rig.microscope.override(Autofocus, af)
+    # Reads: before the scan, A1's start and end, A2's start.
+    rig.microscope.override(ObjectiveTurret, _TurnedAtRead(4))
+
+    with pytest.raises(PluginRunError, match="at well A2;"):
+        _scan(rig)
+
+    assert af.engaged
+    assert af.calls.count("disengage") == 1  # A1's wall's
+    assert rig.stage.moves == 4
+    assert _checkpoint(rig).wells_done == ("A1",)
+
+
+def test_a_wall_engage_that_raises_is_counted_and_left_to_the_next_field(
+    rig: _Rig,
+) -> None:
+    """FM-129: counted before the call; the next field's engage is §8's."""
+    af = _Autofocus(engaged=True, locked=True)
+    af.engage_results = [HardwareError("engage gave up")]
+    rig.microscope.override(Autofocus, af)
+
+    result = _result(_scan(rig))
+
+    assert [(f.name, f.error) for f in result.failed] == [
+        ("A1_0000", "HardwareError: engage gave up")
+    ]
+    assert [f.focus for f in result.frames] == ["locked"] * 11
+    assert result.assumed == (
+        "the autofocus was engaged again on 1 fields and locked on 1 of them",
+        _wall_line(3, 3, 2),
+    )
+
+
+def test_a_stop_after_a_well_ends_with_the_autofocus_off_and_the_resume_says_why(
+    rig: _Rig,
+) -> None:
+    """Decided in #416's plan: a stop honoured after a wall leaves PFS off (FM-88)."""
+    af = _Autofocus(engaged=True, locked=True)
+    rig.microscope.override(Autofocus, af)
+    stop = threading.Event()
+
+    record = _scan(rig, stop=stop, on_progress=_at(4, stop.set))
+
+    assert record.status is StageStatus.stopped
+    assert af.calls[-3:] == ["is_engaged", "disengage", "is_engaged"]
+    assert af.engaged is False
+    assert _checkpoint(rig).wells_done == ("A1",)
+    assert rig.stage.moves == 4
+    with pytest.raises(PluginRunError, match="the scan switches it off between wells"):
+        _scan(rig, resume=True)
+    af.engaged = af.locked = True
+    assert len(_result(_scan(rig, resume=True)).frames) == 12
+
+
+class _Trips(_Autofocus):
+    """An engage that trips as the layer's does: a fresh error, held by no local of its own.
+
+    ``_Autofocus.engage`` raises the error it holds in a local, which makes a
+    cycle of the fake's own (its frame holds the error, the error's traceback
+    the frame).
+    """
+
+    def engage(self, timeout_s: float | None = None) -> bool:
+        self.calls.append("engage")
+        self.engaged = self.locked = False
+        raise _trip()
+
+
+def test_a_trip_leaves_no_reference_cycle(rig: _Rig) -> None:
+    """FM-98: the excursion caught at a field is not kept where the frame that raises holds it."""
+    af = _Trips(engaged=True, locked=True)
+    rig.microscope.override(Autofocus, af)
+    alive = weakref.ref(af)
+    gc.collect()
+    gc.disable()
+    try:
+        # Not ``pytest.raises``: its record keeps the error's traceback, and
+        # with it ``_run``'s frame, alive.
+        raised = False
+        try:
+            _scan(rig)
+        except PluginRunError:
+            raised = True
+        assert raised
+        rig.microscope.override(Autofocus, _Autofocus(engaged=False, locked=False))
+        del af
+        assert alive() is None
+    finally:
+        gc.enable()
 
 
 def test_a_trip_at_a_wells_first_field_ends_the_scan_with_the_checkpoint_kept(

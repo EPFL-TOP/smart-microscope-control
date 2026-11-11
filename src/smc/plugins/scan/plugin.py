@@ -620,7 +620,7 @@ class ScanPlugin:
             for planned in fields:
                 ctx.raise_if_stopped()
                 error: str | None = None
-                tripped: AutofocusExcursionError | None = None
+                tripped: str | None = None
                 prepared: _Prepared | None = None
                 cell_focus: FieldFocus | None = None
                 pfs_offset: float | None = None
@@ -737,7 +737,10 @@ class ScanPlugin:
                 except (MicroscopeHaltedError, MotionStoppedError):
                     raise
                 except AutofocusExcursionError as exc:
-                    tripped = exc
+                    # Its text only: the exception kept in a local of this
+                    # frame, raised through it, would hold the frame and the
+                    # stand until the cyclic collector (FM-98).
+                    tripped = _one_line(exc)
                 except (HardwareError, FocusDriveOffTarget, AutofocusStillOn) as exc:
                     error = _one_line(exc)
                 if tripped is not None:
@@ -751,7 +754,7 @@ class ScanPlugin:
                     raise PluginRunError(
                         _NAME,
                         "the autofocus moved Z out of its bound while it locked at "
-                        f"{planned.name} (well {planned.well}): {_one_line(tripped)}; "
+                        f"{planned.name} (well {planned.well}): {tripped}; "
                         f"the checkpoint keeps {len(wells_done)} wells. Its offset "
                         "names another plane here than where it held (m2 §12.11): "
                         f"with PFS off, focus on the sample in well {planned.well} by "

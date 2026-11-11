@@ -132,7 +132,9 @@ anything moves to the well: `the autofocus could not be switched off before well
 stand, then run scan --resume`, or `the autofocus still reads on after it was switched
 off before well <w>: …`. `assumed` says `the autofocus was switched off before the first
 field of <w> wells, so that no lock crossed a well's wall, and engaged again after it on
-<a> fields, locked on <l> of them`, apart from the engages after a lost lock.
+<a> fields, locked on <l> of them`, apart from the engages after a lost lock. With
+`autofocus=off` the scan never reads PFS, so it cannot switch it off at a wall: switch
+PFS off yourself before such a scan.
 
 **A trip ends the scan.** An engage that moves Z out of its bound (at a well's first
 field, after a lost lock, or after the focus on the cells) switches PFS off and makes
