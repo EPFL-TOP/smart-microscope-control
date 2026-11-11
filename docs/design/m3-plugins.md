@@ -5,7 +5,9 @@
   the walls, §17, for issue #328 (2026-11-05); objectives' offsets, §18,
   for issue #340 (2026-11-05); the sides of a wall, §19, for issue #327
   (2026-11-09); the focus on the cells, §21, for issue #341 (2026-11-09);
-  the lab's own plate definitions, §22, for issue #400 (2026-11-10).
+  the lab's own plate definitions, §22, for issue #400 (2026-11-10); a
+  plan's calibration from another run document, §23, for issue #383
+  (2026-11-10).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 and M2, this document is the contract between issues
   that are built in parallel. Names, module paths and signatures below are
@@ -2250,7 +2252,9 @@ class ScanPlanParams(PluginParams):
   with no turret, `camera.pixel_size_um()`; for another objective,
   `turret.pixel_size_um(objective)`; then `pixel_matrix`, `"profile"`,
   `assumed` gaining `no camera calibration for <objective>: rotation 0 and
-  no mirror assumed`. Refined while planning #21 (FM-103): the turret's size
+  no mirror assumed`. Since #383 (§23), a `calibration` parameter comes
+  between (1) and (2), and the line of (2) for another objective names it.
+  Refined while planning #21 (FM-103): the turret's size
   is the profile's **at binning 1** (`MMObjectiveTurret.pixel_size_um`),
   while the camera's includes the binning, the magnification factor and
   MMCore's own pixel calibration (m2 §8.10), so the turret's would plan a
@@ -6837,3 +6841,219 @@ def register_lab_plates() -> tuple[str, ...]: ...
   within 100 µm of its centre (§17.7).
 - The maker's datasheet: the Greiner reference, read from the plate; its
   pitch against 19.45 mm. A different pitch is a new name (D5).
+
+## 23. A plan's calibration from another run document (#383)
+
+The owner registers the plate with the 4× and scans with the 40×. `scan-plan`
+takes its camera matrix from the run document's `camera-calibration` when it
+is of the plan's objective (§7.3), and `plate-walls` read the 4×'s from the
+same slot. A run document holds one record per plugin (§1.7), so a 40×
+calibration run into it replaces the 4×'s: `plate-walls` becomes stale, and
+`plate` with it (`plate-walls read its inputs from an earlier run`). Without
+it, `scan-plan` sets the 4×'s aside (`camera calibration not used: it is of
+<4×>, the plan is for <40×>`) and plans with the profile's size, **rotation 0
+and no mirror assumed**. `route` takes the cells' stage positions from the
+plan's matrix (§11); the Ti2-E's camera is turned about 177° (session 3,
+#405), so a cell at `(dx, dy)` px from a field's centre is routed to about
+`(−dx, −dy)`: up to about 270 µm off at the 40×.
+
+**Decision**: `scan-plan` gains a parameter `calibration`, a run document of
+its own holding a `camera-calibration` made with the plan's objective in
+place, read by the rule `objective-offsets` reads its targets' with
+(`calibration_from`, §20.3). The operator keeps one document per objective
+(§20, step 1), and `run.json` keeps the registration's.
+
+Set aside:
+
+- **A slot with one record per objective.** The run document's one record
+  per plugin (§1.7) is what `provider`, `is_stale`, `unusable`, the runner's
+  reads and the page's checklist rest on; a slot keyed by objective changes
+  all of them for one slot. It would need an ADR.
+- **Staleness that ignores a calibration of another objective.** The runner
+  would have to know which objective each reader used, and the slot would
+  still hold one calibration: the page names a wall's sides with the
+  document's calibration (`PlatePage`, §19), which would then be the
+  40×'s for walls the 4× imaged (FM-189).
+
+**Not here**: the plate page (the parameter shows under *Advanced*, as
+`camera-calibration`'s `from_run_doc` does; a picker of documents is not
+added); `plate-walls` or `goto-well` reading a calibration from another
+document; staleness across documents: a `camera-calibration` run again into
+the document a plan read does not make the plan stale, as for
+`objective-offsets` (§20). The plan records when the calibration was
+measured.
+
+### 23.1 What was measured (2026-11-10, planning #383)
+
+On main at `caaa60e` (pymmcore-plus 0.18.1, useq-schema 0.9.2, Python
+3.13.0), with a prototype in the design session's scratchpad that replaced
+`_camera_basis` by one reading `calibration_from` first:
+
+- `profiles/demo-sample.toml` with `[sample]` as §20.1 (camera 30° and
+  mirrored, plate 1.2°), the stage's `Velocity` at 100 000: `camera-calibration`
+  under 20X into `cal-20x.json` (0.49950 µm per pixel, 29.967°, mirrored),
+  under 40X into `cal-40x.json` (0.24975, 29.967°, mirrored), then under 10X
+  (in place at open, 0.99933) and `plate-walls` (96-well, A1, H12, A12, 300 µm
+  off) into `run.json`: 1.9 s in all.
+- `scan-plan` (`objective` 40X, not turned in; `wells=A1`, 2 × 2) with the
+  40X document: `done`, its matrix the 40X calibration's
+  (`((−0.21636, 0.12475), (−0.12475, −0.21636))`), `matrix_source`
+  `camera-calibration`, `assumed` only the frame's line (the demo-sample
+  profile has no `[objectives]`). The same in a dry run (a dry run may read
+  a real result, `RunDocument.unusable`). With the 20X document: refused,
+  naming both objectives.
+- After both plans, `RunDocument.unusable("plate", ...)` is `None`: the
+  registration is untouched.
+- The runner records every slot of `reads_optional` read at the start
+  (`runner.py`, `_read_of`), so a plan with `calibration` still records
+  `camera-calibration` of `run.json` as read. That is harmless: a new
+  `camera-calibration` in `run.json` makes `plate-walls`, and so the plan,
+  stale anyway.
+- `calibration_from`'s time is the record's `finished_utc` to the second
+  (`2026-11-10T19:50:30+00:00`).
+
+### 23.2 The parameter — `scan_plan/plugin.py`
+
+```python
+class ScanPlanParams(PluginParams):  # gains
+    calibration: Path | None = Field(
+        None,
+        description=(
+            "A run document holding a camera-calibration made with the plan's "
+            "objective in place, for a plate registered with another objective "
+            "(relative to the working directory, as from_run_doc). Its matrix "
+            "is used, rotation and mirror included."
+        ),
+    )
+```
+
+A second model validator: `pixel_size_um` and `calibration` both given is a
+`ValueError`, `give pixel_size_um or calibration, not both`. The field comes
+after `pixel_size_um`.
+
+### 23.3 The matrix, in this order
+
+1. `pixel_size_um` given: unchanged.
+2. **`calibration` given** (new): `calibration_from(scan-plan, path,
+   profile=microscope.profile.microscope.name, dry_run=ctx.dry_run)`, its
+   refusals as they are. Then, `where = path.as_posix()` (FM-24, never
+   resolved: FM-50), each a `PluginRunError` of `scan-plan` raised outside
+   any handler (FM-98):
+   - its `objective` is not the plan's: `the calibration in <where> is of
+     <was>, the plan is for <now>: give calibration a run document whose
+     camera-calibration was made with <now> in place` (`an unknown
+     objective` for `None`, on either side, as `_why_not_used`);
+   - its `image_shape_px` is not the camera's: `the calibration in <where>
+     is of a frame of <its shape>, the camera gives <shape> (binning or the
+     region changed): run camera-calibration into it again with this camera
+     setting`.
+
+   Otherwise its matrix and size, `matrix_source="camera-calibration"`, and
+   in `assumed` only `_gap_line`'s line when there is one, as for (3). The
+   document's own `camera-calibration` is not read (`upstream_or_none` is
+   not called): the parameter wins, even over one of the same objective.
+   The plugin logs at INFO `camera calibration of <objective> from <where>,
+   measured <when>`.
+3. The document's `camera-calibration` of the plan's objective and frame:
+   unchanged.
+4. The profile's size: unchanged, except the line of a document's
+   calibration set aside because its objective differs (its own unknown
+   included), when the plan's objective is not `None`, which gains a hint:
+   `camera calibration not used: it is of <was>, the plan is for <now>;
+   give calibration, a run document whose camera-calibration was made with
+   <now> in place`. The frame-shape line, and a plan for an unknown
+   objective (no turret), are unchanged.
+
+A helper `_calibration_given(name, path, ctx, profile, objective, shape) ->
+tuple[_Basis, str, str]` (the basis, `where`, `when`) holds (2); `_Basis`
+does not change.
+
+### 23.4 The result — `slots/scan_plan.py`
+
+`ScanPlanResult` gains, after `objective_shift_um`:
+
+```python
+calibration_from: str | None = None
+calibration_measured: str | None = None
+```
+
+`calibration_from` is the document the matrix came from, as typed
+(`as_posix()`), and `calibration_measured` when it was measured
+(`calibration_from`'s second value); both `None` when the matrix is not from
+another document, and in every document written before #383. The docstring
+says so.
+
+### 23.5 The scan's advice — `scan/plugin.py`
+
+When the camera's size is more than 10 % from a `camera-calibration` plan's,
+the refusal's advice (§8, refined while planning #213) names the document
+when the plan read one: `run camera-calibration into <calibration_from>,
+then scan-plan, again with the stand as it is now`. Without it the text is
+unchanged. The advice that sent the operator to `run.json` is the one that
+makes the plate stale.
+
+### 23.6 Docs — `docs/plugins/scan-plan.md`
+
+The list of where the matrix comes from gains the parameter as its second
+item, with the new hint on the line of item 3; a short example *Registered
+at one objective, scanned at another*: the 40× calibrated into a document of
+its own (`smc objective set ... --confirm`, `smc run camera-calibration
+--run-doc cal-40x.json`), then `smc run scan-plan --run-doc run.json --param
+objective=... --param calibration=cal-40x.json`. The parameter's row in the
+parameters table.
+
+### 23.7 Tests
+
+- `tests/test_scan_plan_calibration_demo.py` (new; `pytest.mark.demo`): a
+  module fixture as §23.1 (the profile and the three documents through
+  `run_plugin`, FM-124; `skip` without the demo adapters); each test copies
+  `run.json` into its `tmp_path` and passes the calibration documents by
+  path.
+  - `test_a_plate_registered_at_one_objective_is_planned_with_another_objectives_calibration`,
+    parametrized over a real and a dry run: the plan for 40X with
+    `cal-40x.json` is `done`; its `matrix_um_per_px` and `pixel_size_um`
+    equal the 40X record's (read from `cal-40x.json`); the matrix is not
+    `pixel_matrix(pixel_size_um)` and its determinant is negative (turned
+    and mirrored: FM-203, FM-73); `matrix_source == "camera-calibration"`;
+    `calibration_from` is the path as passed, `as_posix()`;
+    `calibration_measured` is the 40X record's `finished_utc` to the second;
+    no line of `assumed` holds `rotation 0`; `unusable("plate", ...)` is
+    `None` before and after, and `unusable("scan-plan", ...)` after.
+  - `test_a_calibration_of_a_third_objective_is_refused_naming_both`: the
+    20X document for a 40X plan; the exact text of §23.3, the stage
+    `failed`, `__context__` and `__cause__` `None` (FM-98).
+- `tests/test_scan_plan_demo.py` gains (its `_seed` and `_write_calibration`
+  write a calibration into any document):
+  - `test_a_calibration_document_wins_over_the_documents_own` (the same
+    objective in both, 0.4 µm in `run.json`, 0.2 µm and another rotation in
+    the other: the plan's is the other's);
+  - `test_a_calibration_document_of_another_frame_is_refused`;
+  - `test_a_calibration_document_without_a_calibration_is_refused_with_its_path`
+    (a document holding only a plate);
+  - `test_a_dry_run_calibration_document_is_refused_for_a_real_plan`;
+  - `test_pixel_size_and_calibration_together_are_refused` (the params
+    model);
+  - the `another-objective` and `unknown-objective` cases of
+    `test_a_calibration_of_another_objective_or_frame_is_ignored_and_says_why`
+    gain the hint of §23.3 (4); `transposed-frame` keeps its text.
+- `tests/test_scan_demo.py` gains
+  `test_a_plan_from_a_calibration_document_names_it_when_the_size_changed`:
+  as `test_a_calibrated_plan_is_compared_within_ten_percent`, the
+  `scan-plan` record's result rewritten with `calibration_from` set
+  (`write_stage` of `StageRecord.model_validate({...})`, §20.1's pattern),
+  the advice of §23.5 exact.
+- `tests/unit/test_slots.py`: a `ScanPlanResult` dump without the two fields
+  loads with `None`.
+
+**Failure modes**: FM-24, FM-50, FM-73, FM-98, FM-124, FM-125, FM-189,
+FM-203, and a new entry for the class this section closes: *a per-objective
+value kept in a slot that holds one record per document* (the develop
+session gives it the next free id).
+
+### 23.8 Not verified (for the owner)
+
+- At the Ti2-E (session 4): a plate registered with `plate-walls` at the 4×
+  in `run.json`, a plan for the 40× with `calibration=cal40x\run.json`, a
+  scan, cells, and a route whose positions land on cells at the 40×
+  (session 3's three calibrations agree on 177.44°, #405, so the matrix
+  differs from the 4×'s by its size only).
