@@ -33,7 +33,13 @@ from typing import Any
 import numpy.typing as npt
 import tifffile
 
-from smc.plugins.slots import FocusState, PlannedField, ScanFrame
+from smc.plugins.slots import (
+    FocusState,
+    PlannedField,
+    ScanFrame,
+    ScanPlanResult,
+    well_geometry,
+)
 
 __all__ = [
     "CALIBRATION_TOLERANCE",
@@ -49,7 +55,10 @@ __all__ = [
     "landed_off_target",
     "landing_error_um",
     "landing_tolerance_um",
+    "offset_in_well_um",
+    "offset_lines",
     "size_differs",
+    "well_centres_um",
     "wells_to_scan",
 ]
 
@@ -189,6 +198,93 @@ def focus_state(has_autofocus: bool, used: bool, locked: bool) -> FocusState:
     if not used:
         return "off"
     return "locked" if locked else "unlocked"
+
+
+def well_centres_um(plan: ScanPlanResult) -> dict[str, tuple[float, float]]:
+    """The centre of every well that has a field in the plan, in stage µm, from the plan's own plate.
+
+    ``well_geometry`` of ``plan.plate_plan`` is the call the plan's clipping
+    made (m3 §7.2), in the frame of the plan's objective (§18.3, a plate moved
+    between objectives included), so the offsets are measured against the
+    centre the fields were laid around and the scan does no pitch or rotation
+    arithmetic of its own. A well of the plan with no field needs no centre
+    and is not looked up. Once per well, in plan order: the lookup scans every
+    well name of the plate.
+
+    Raises:
+        ValueError: A field's well is not on the plan's plate (an edited run
+            document), named in the message. Raised with no exception in
+            flight, so the traceback does not keep the plan alive (FM-98).
+    """
+    centres: dict[str, tuple[float, float]] = {}
+    problem = ""
+    for well in dict.fromkeys(field.well for field in plan.fields):
+        try:
+            centres[well] = well_geometry(plan.plate_plan, well).center_um
+        except ValueError:
+            problem = (
+                f"the plan has fields in well {well!r}, which its plate does not hold"
+            )
+            break
+    if problem:
+        raise ValueError(problem)
+    return centres
+
+
+def offset_in_well_um(
+    center_um: tuple[float, float], x_um: float, y_um: float
+) -> tuple[float, float]:
+    """The stage point minus the well's centre, in the **stage's** axes, in µm.
+
+    Not turned into the plate's axes: on a plate turned by θ a frame one pitch
+    along a row of wells reads ``(p cos θ, p sin θ)``, which is what the stage
+    did, and ``WellGeometry.to_plate_frame`` makes the other reading from the
+    same two numbers when a tool wants it (FM-73). Two axes subtracted, nothing
+    else: the sign is the stage's, ``+X`` of the centre reads positive.
+    """
+    return (x_um - center_um[0], y_um - center_um[1])
+
+
+def offset_lines(
+    plan: ScanPlanResult, *, kept: int, kept_without_offsets: int
+) -> tuple[str, ...]:
+    """What the frames' offsets from their well's centre rest on, for ``assumed`` (m3 §8, #430).
+
+    From the plan alone: the scan reads ``scan-plan`` and no other record, so
+    the plate's own method (a seed, a lattice fit) is not said here. The first
+    line follows the plan's ``objective_shift_um``: ``None`` says the plate was
+    not moved to the objective's frame and the offsets carry any difference
+    between the two (§18.2 rules 2 to 4), a shift says by how much it was
+    (rule 5), and ``(0.0, 0.0)`` (a plate registered with the objective in
+    use, or a stand with no turret) says nothing. The second line is for
+    frames kept from a checkpoint that an older smc wrote: the scan does not
+    fill them in (their TIFFs hold what was written, and a record that
+    disagreed with its file would be worse than a gap), so it counts them.
+    """
+    plate = plan.plate_objective or "an unknown objective"
+    objective = plan.objective or "the objective in use"
+    what = "the frames' offsets from their well's centre (well_dx_um, well_dy_um) are"
+    lines: list[str] = []
+    shift = plan.objective_shift_um
+    if shift is None:
+        lines.append(
+            f"{what} against the plate as the plan holds it, registered with "
+            f"{plate} and not moved to the frame of {objective}: they carry any "
+            "difference between the two (scan-plan's assumed says why)"
+        )
+    elif shift != (0.0, 0.0):
+        lines.append(
+            f"{what} against the plate moved from {plate}'s frame to "
+            f"{objective}'s by ({shift[0]:.1f}, {shift[1]:.1f}) µm, the profile's "
+            "offsets between objectives"
+        )
+    if kept_without_offsets > 0:
+        lines.append(
+            f"{kept_without_offsets} of the {kept} frames kept from the checkpoint "
+            "were written before a frame's offset from its well's centre was "
+            "recorded: they carry no well_dx_um or well_dy_um"
+        )
+    return tuple(lines)
 
 
 def encode_frame(frame: npt.NDArray[Any], meta: ScanFrame) -> bytes:

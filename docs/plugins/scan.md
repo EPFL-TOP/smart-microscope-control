@@ -68,6 +68,11 @@ written, and the message says what to do:
    paths are not read, so a PC that has them enabled is refused too: the fix is a
    shorter folder. A run folder that cannot be read at that moment is the message of
    the checkpoint's check (`the run folder cannot be read (…): … then run scan --resume`).
+   Last, after every path, each well that has fields must be one the plan's plate holds,
+   because every frame's offset from its well's centre is taken from that centre (an
+   edited run document is refused, with nothing moved: `the plan has fields in well
+   'Z9', which its plate does not hold: run scan-plan again with the stand as it is
+   now`).
 4. **The objective**: when the plan names one and the stand has a turret, the
    objective in place must be it:
    `the objective in place is 'Nikon 40X Plan Fluor ELWD'; the scan was planned for
@@ -266,7 +271,18 @@ The slot `scan` holds a `ScanResult` (`smc.plugins.slots`):
   the refined plane), `dz_um` (the frame's Z command minus the centre), `frame_score`
   and `duration_s`. A frame without the step has no `cell_focus` key at all, so a scan
   run with `cell_focus=off` is written exactly as before and still reads in an older
-  smc.
+  smc. Every frame also records **where it is in its well**: `well_dx_um` and
+  `well_dy_um`, the readback minus the well's centre, in **stage axes** and µm. `(0, 0)`
+  is the well's centre and a positive `well_dx_um` is the stage's +X side of it. They are
+  **not turned into the plate's axes**: on a plate turned by 13°, a frame 100 µm along a
+  row of wells reads `(97.4, 22.5)`, which is what the stage did (the plate's own
+  reading of the same two numbers is `WellGeometry.to_plate_frame`). They come from the
+  readback, not the target, so a frame that landed 3 µm right of its field reads 3 µm
+  more. A frame of a scan written before they existed has neither key, which is *not
+  recorded* and never zero.
+- A scan that records them has two keys that **an older smc refuses** (it refuses a key it
+  does not know rather than drop it): upgrade the smc that reads it. A scan written
+  before them still reads, and is written back without them.
 - `failed`: `well`, `index`, `name`, the target `x_um`, `y_um`, and `error` (a field
   that landed off target says `StageOffTarget: …`).
 - `objective`, `pixel_size_um`, `matrix_um_per_px`, `image_shape_px`: the plan's,
@@ -274,8 +290,38 @@ The slot `scan` holds a `ScanResult` (`smc.plugins.slots`):
 - `assumed`.
 
 Each TIFF is the frame in the camera's own dtype, with the frame's record as its JSON
-metadata. `load_frame(run_dir, frame)` reads one back and refuses a path that leaves
-the run folder.
+metadata, so the file alone says where the stage was and where that is in its well
+(`tifffile`'s `shaped_metadata`). `load_frame(run_dir, frame)` reads one back and
+refuses a path that leaves the run folder.
+
+### What the offsets rest on
+
+The centre of a well is the **plan's own**: `scan-plan`'s plate, in the frame of the
+plan's objective (the plate moved between objectives included), computed once per well
+before anything moves. The scan reads `scan-plan` and no other record, so it says what
+that plate was and not how the plate was found (a seed, a lattice fit: that is the
+plate record's to say). Written to `assumed` after every other line, when frames are
+written (never in a dry run):
+
+- **The plate was not moved to the objective's frame** (an older plan, an objective
+  that is not known, a plate that records no objective, or an offset between the two
+  that was not measured): `the frames' offsets from their well's centre (well_dx_um,
+  well_dy_um) are against the plate as the plan holds it, registered with <objective>
+  and not moved to the frame of <objective>: they carry any difference between the two
+  (scan-plan's assumed says why)`. An objective that is not known reads `an unknown
+  objective`, or `the objective in use`.
+- **The plate was moved** by the profile's offsets between objectives: `the frames'
+  offsets from their well's centre (well_dx_um, well_dy_um) are against the plate moved
+  from <objective>'s frame to <objective>'s by (31.5, -22.5) µm, the profile's offsets
+  between objectives` (the shift to one decimal).
+- **The plate was registered with the objective in use**, or the stand has no turret:
+  no line, the offsets are against the registration itself.
+
+After a `--resume` across an older smc, the frames of the checkpoint carry no offsets
+and the scan **does not fill them in** (their TIFFs hold what was written, and a record
+that disagreed with its file would be worse than a gap): `<n> of the <m> frames kept
+from the checkpoint were written before a frame's offset from its well's centre was
+recorded: they carry no well_dx_um or well_dy_um`.
 
 ## Not verified here
 
@@ -296,4 +342,7 @@ the sweep at 40× on cells with PFS locked, against the by-eye focus; PFS lockin
 at the next field after the sweep, and how far Z moves in it; the time per plane and per
 field against the `assumed` line; whether a Z readback lands within a quarter step of its
 command; and the defaults of the score, the range and the step, which session 3 chooses
-from the stacks of [`focus-on-cells`](focus-on-cells.md).
+from the stacks of [`focus-on-cells`](focus-on-cells.md). For a frame's place in its
+well (#430): at the Ti2-E, a 1 × 1 scan whose first frame was reached by `goto-well`
+to a well's centre reads `(0, 0)` within the stage's readback; and a 40× scan with the
+objective offsets applied reads the offsets that the by-eye position agrees with.

@@ -10,8 +10,10 @@ issues:
   goes through ``escape`` and nothing from a record is an ``id``, a class or a
   style (markup built from a result's text).
 * **A frame is what the scan saw.** A footprint is the scan's matrix and frame
-  shape at the stage's readback; a chosen field of the route uses the route's
-  (another objective is another field), never the plan's copy (FM-124).
+  shape at the stage's readback, drawn from the frame's own place in its well
+  when it records one (``well_dx_um``, ``well_dy_um``, #430); a chosen field of
+  the route uses the route's (another objective is another field), never the
+  plan's copy (FM-124).
 * **Y is flipped by arithmetic, never by a transform.** Stage Y is up and the
   page's is down; a ``scale(1, -1)`` on a group would mirror the text in it.
 * **A number that is not finite is refused, not drawn.** ``num`` names the stage
@@ -48,6 +50,7 @@ from smc.plugins.slots import (
     DensityWell,
     RoutePosition,
     RouteResult,
+    ScanFrame,
     ScanPlanResult,
     ScanResult,
     WellGeometry,
@@ -777,9 +780,10 @@ def _panel(
 
     The centre of the well is the origin and a stage point ``(x, y)`` is drawn
     at ``(x - cx, cy - y)``. The frames are the scan's footprints at the stage's
-    readback, with the scan's matrix and frame shape; a failed field has only
-    its target; a chosen field of the route has the route's own matrix and shape
-    (FM-124). The viewBox is the well's circumscribed square plus a tenth, and
+    readback (or at the frame's own place in its well, when it records one:
+    ``_frame_corners``), with the scan's matrix and frame shape; a failed field
+    has only its target; a chosen field of the route has the route's own matrix
+    and shape (FM-124). The viewBox is the well's circumscribed square plus a tenth, and
     grows to hold a footprint that reaches past the wall (fields are clipped by
     their footprint meeting the well, so the outer ones stick out).
     """
@@ -797,15 +801,7 @@ def _panel(
     positions = scene.frames_of.get(well, [])
     frame_paths: list[str] = []
     for position in positions:
-        frame = scan.frames[position]
-        corners = local(
-            footprint(
-                frame.x_um,
-                frame.y_um,
-                matrix=scan.matrix_um_per_px,
-                image_shape_px=scan.image_shape_px,
-            )
-        )
+        corners = _frame_corners(scan.frames[position], scan, cx, cy)
         reach = max(reach, farthest(corners))
         frame_paths.append(_polygon(corners, _frame_num))
     failed_here = [failed for failed in scan.failed if failed.well == well]
@@ -869,6 +865,41 @@ def _panel(
         f'<p class="caption">{_caption(reported, len(failed_here), drawn, sum(total.values()), outside, scene.cap)}</p>'
         "</section>"
     )
+
+
+def _frame_corners(
+    frame: ScanFrame, scan: ScanResult, cx: float, cy: float
+) -> list[Point]:
+    """A frame's footprint in its well's own drawing: the centre is the origin, ``y`` is down.
+
+    A frame that records its place in its well (``well_dx_um``, ``well_dy_um``:
+    the readback minus the plan's centre for the well, m3 §8) is drawn from
+    that record; a frame of a scan written before it existed, from the readback
+    minus the centre this page holds for the well. The two differ by 1e-12 µm
+    where both exist and the page prints 0.1 µm (measured, 160 000 corners),
+    so a scan of an older smc draws the page it always did. The report does not
+    compare the record with the plate: a plan run again makes the scan stale,
+    and the runner refuses a stale read as it does for ``x_um`` (FM-111).
+    """
+    if frame.well_dx_um is not None and frame.well_dy_um is not None:
+        return [
+            (x, -y)
+            for x, y in footprint(
+                frame.well_dx_um,
+                frame.well_dy_um,
+                matrix=scan.matrix_um_per_px,
+                image_shape_px=scan.image_shape_px,
+            )
+        ]
+    return [
+        (x - cx, cy - y)
+        for x, y in footprint(
+            frame.x_um,
+            frame.y_um,
+            matrix=scan.matrix_um_per_px,
+            image_shape_px=scan.image_shape_px,
+        )
+    ]
 
 
 def _frame_num(value: float) -> str:

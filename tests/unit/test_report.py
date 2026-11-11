@@ -202,12 +202,19 @@ def _records(
     plan_pixel_um: float = PIXEL_UM,
     plan_objective: str | None = "the scan's",
     labels: Sequence[str] = CLASSES,
+    well_offsets_um: tuple[float, float] | None = None,
 ) -> Records:
     """The plan, the scan, the cells and the density of ``wells``; the density is built from the seed.
 
     ``plan_matrix``, ``plan_shape``, ``plan_pixel_um`` and ``plan_objective`` are
     the camera and the objective the plan was laid for when they are not the
     scan's: the page must show the scan's (FM-124).
+
+    ``well_offsets_um`` is what the frames say of their place in their well
+    (m3 §8, #430): ``None`` is a scan of an smc that did not record it, and a
+    pair is ``(well_dx_um, well_dy_um)`` = the readback minus the well's centre
+    *plus* that pair, so ``(0.0, 0.0)`` is the truth and any other is a record
+    that says otherwise than the readback.
 
     ``failed`` maps a well to the number of its first fields that failed (all of
     them: no frame, a density of ``None`` and 0 fields). A well in ``below_grid``
@@ -276,19 +283,29 @@ def _records(
         if planned.well in below_grid and kept.get(planned.well, 0) >= 1:
             continue
         kept[planned.well] = kept.get(planned.well, 0) + 1
+        # The readback is not the target (the demo rounds a command).
+        x_um = planned.x_um + 0.3
+        y_um = planned.y_um - 0.2
+        place: dict[str, float] = {}
+        if well_offsets_um is not None:
+            well_x_um, well_y_um = _centre(planned.well, rotation_deg)
+            place = {
+                "well_dx_um": x_um - well_x_um + well_offsets_um[0],
+                "well_dy_um": y_um - well_y_um + well_offsets_um[1],
+            }
         frames.append(
             ScanFrame(
                 well=planned.well,
                 index=planned.index,
                 name=planned.name,
                 file=f"scan/t/{planned.name}.tif",
-                # The readback is not the target (the demo rounds a command).
-                x_um=planned.x_um + 0.3,
-                y_um=planned.y_um - 0.2,
+                x_um=x_um,
+                y_um=y_um,
                 z_um=1000.0 + 10.0 * k,
                 focus="locked",
                 pfs_offset=None,
                 t_s=float(k),
+                **place,
             )
         )
     scan = ScanResult(
@@ -897,6 +914,60 @@ def test_footprints_use_the_scans_matrix_and_frame_not_the_plans() -> None:
     # The readback is not the plan's field: a corner drawn at the target would be 0.3 off.
     planned = records.plan.fields[0]
     assert (in_a1[0].x_um, in_a1[0].y_um) != (planned.x_um, planned.y_um)
+
+
+def test_a_footprint_is_drawn_from_the_frames_offsets_when_it_has_them() -> None:
+    # m3 §8 (#430): the record says where a frame is in its well, and the page
+    # draws what the record says. Here it says 10 µm right and 7 µm up of the
+    # readback, which no stage coordinate does, so only the keys can place it.
+    matrix = _turned(5.0, 30.0, True)
+    records = _records(matrix=matrix, well_offsets_um=(10.0, -7.0))
+    _, page = _page(records)
+    in_a1 = [f for f in records.scan.frames if f.well == "A1"]
+    (frames,) = _paths(_section(page, "A1"), "frames")
+    drawn = _polygons(frames["d"])
+    assert len(drawn) == len(in_a1) > 0
+    cx, cy = _centre("A1")
+    for polygon, frame in zip(drawn, in_a1, strict=True):
+        assert frame.well_dx_um is not None
+        assert frame.well_dy_um is not None
+        expected = footprint(
+            frame.well_dx_um,
+            frame.well_dy_um,
+            matrix=matrix,
+            image_shape_px=SHAPE,
+        )
+        at_the_readback = footprint(
+            frame.x_um, frame.y_um, matrix=matrix, image_shape_px=SHAPE
+        )
+        assert len(polygon) == 4
+        for (px, py), (x, y), (rx, ry) in zip(
+            polygon, expected, at_the_readback, strict=True
+        ):
+            # Where the record says, in the page's axes (y down) ...
+            assert px == pytest.approx(x, abs=0.06)
+            assert py == pytest.approx(-y, abs=0.06)
+            # ... and not where the readback would put it.
+            assert px != pytest.approx(rx - cx, abs=1.0)
+            assert py != pytest.approx(cy - ry, abs=1.0)
+
+
+@pytest.mark.parametrize("rotation_deg", [0.0, 13.0])
+def test_a_scan_with_offsets_draws_the_same_page_as_one_without(
+    rotation_deg: float,
+) -> None:
+    # Offsets that are exactly the readback minus the centre: the two ways to
+    # place a footprint, ``footprint(x, y) - centre`` and ``footprint(x - cx,
+    # y - cy)``, differ by 1e-12 µm and the page prints 0.1 µm (measured, 0 of
+    # 160 000 corners), so a scan of an older smc draws the page it always did.
+    matrix = _turned(5.0, 30.0, True)
+
+    without = _render(_records(matrix=matrix, rotation_deg=rotation_deg))
+    exact = _render(
+        _records(matrix=matrix, rotation_deg=rotation_deg, well_offsets_um=(0.0, 0.0))
+    )
+
+    assert exact == without
 
 
 def test_the_cells_drawn_are_the_cells_density_counted() -> None:

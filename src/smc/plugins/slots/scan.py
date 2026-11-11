@@ -17,6 +17,7 @@ from pydantic import (
     SerializationInfo,
     SerializerFunctionWrapHandler,
     model_serializer,
+    model_validator,
 )
 
 from smc.plugins.api import PluginResult
@@ -42,6 +43,14 @@ class ScanFrame(SlotValue):
     ``pfs_offset`` the autofocus offset in its native unit, ``None`` when the
     autofocus was not used. ``t_s`` counts from the start of the attempt that
     took the frame, and ``file`` is relative to the run folder, POSIX.
+
+    ``well_dx_um``, ``well_dy_um`` say where the frame is in its well: the
+    readback minus the well's centre, **in stage axes** and µm (m3 §8, *Refined
+    while planning #430*). ``(0, 0)`` is the well's centre and a positive
+    ``well_dx_um`` the stage's +X side of it. They are not turned into the
+    plate's axes: on a plate turned by θ a frame one pitch along a row reads
+    ``(p cos θ, p sin θ)``, which is what the stage did. ``None`` means *not
+    recorded* (a scan written before they existed), never zero.
     """
 
     well: str
@@ -57,17 +66,34 @@ class ScanFrame(SlotValue):
     #: The focus on the cells' step for this field (m3 §21.6); ``None`` when
     #: the scan ran without it, or the field got no step.
     cell_focus: FieldFocus | None = None
+    #: The frame's place in its well (m3 §8, #430); both or neither.
+    well_dx_um: float | None = None
+    well_dy_um: float | None = None
+
+    @model_validator(mode="after")
+    def _a_frame_has_both_offsets_or_neither(self) -> ScanFrame:
+        if (self.well_dx_um is None) != (self.well_dy_um is None):
+            raise ValueError(
+                "well_dx_um and well_dy_um go together: a frame's place in its "
+                "well has both or neither"
+            )
+        return self
 
     @model_serializer(mode="wrap")
-    def _leave_out_a_missing_cell_focus(
+    def _leave_out_what_is_missing(
         self, handler: SerializerFunctionWrapHandler, info: SerializationInfo
     ) -> dict[str, Any]:
-        # A frame without the step is written exactly as before the field
-        # existed, so an older smc still reads the scan: its model refuses a
-        # key it does not know (FM-107), and SCHEMA_VERSION stays 1.
+        # A frame without the step, or without its place in its well, is
+        # written exactly as before the fields existed, so an older smc still
+        # reads the scan: its model refuses a key it does not know (FM-107),
+        # and SCHEMA_VERSION stays 1. The two offsets go together, and
+        # ``cell_focus`` by its own rule.
         data: dict[str, Any] = handler(self)
         if self.cell_focus is None:
             data.pop("cell_focus", None)
+        if self.well_dx_um is None:
+            data.pop("well_dx_um", None)
+            data.pop("well_dy_um", None)
         return data
 
 

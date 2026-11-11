@@ -99,7 +99,10 @@ from smc.plugins.scan.algorithm import (
     landed_off_target,
     landing_error_um,
     landing_tolerance_um,
+    offset_in_well_um,
+    offset_lines,
     size_differs,
+    well_centres_um,
     wells_to_scan,
 )
 from smc.plugins.slots import (
@@ -478,6 +481,10 @@ class ScanPlugin:
 
         token, wells_done, frames, failed = _resume(ctx, plan)
         resumed_frames = len(frames)
+        # Counted before the loop appends: a checkpoint of an smc that did not
+        # record a frame's place in its well keeps its frames as they were, and
+        # the result says how many (m3 §8, #430).
+        kept_without_offsets = sum(frame.well_dx_um is None for frame in frames)
         if not all(side > 0.0 for side in plan.fov_um):
             # An edited run document (a ``nan`` is refused too): a tolerance of
             # nothing would fail every field.
@@ -488,6 +495,18 @@ class ScanPlugin:
             )
         tolerance_um = landing_tolerance_um(plan.fov_um, params.landing_tolerance)
         paths = _paths(ctx, plan, token)
+        # Once per well, before anything moves, after the path refusals: a
+        # well the plan lists and its plate does not hold is an edited run
+        # document, and its field would be photographed with no place in a well.
+        centres: dict[str, tuple[float, float]] = {}
+        problem = ""
+        try:
+            centres = well_centres_um(plan)
+        except ValueError as exc:
+            problem = str(exc)
+        if problem:
+            # Raised outside the handler (FM-98).
+            raise PluginRunError(_NAME, f"{problem}: {_AGAIN}")
         stand = _check_stand(microscope, camera, plan, params)
         if (
             params.autofocus != "off"
@@ -714,6 +733,11 @@ class ScanPlugin:
                     focus.record(cell_focus)
                 if not ctx.dry_run:
                     target = paths[planned.well, planned.name]
+                    # The place in the well is the readback's, not the target's:
+                    # a frame that landed 3 µm off reads 3 µm more (m3 §8, #430).
+                    dx_um, dy_um = offset_in_well_um(
+                        centres[planned.well], readback.x_um, readback.y_um
+                    )
                     frames.append(
                         _write_frame(
                             plan,
@@ -732,6 +756,8 @@ class ScanPlugin:
                                 pfs_offset=pfs_offset,
                                 t_s=time.monotonic() - t0,
                                 cell_focus=cell_focus,
+                                well_dx_um=dx_um,
+                                well_dy_um=dy_um,
                             ),
                         )
                     )
@@ -808,6 +834,16 @@ class ScanPlugin:
                             params.focus_step_um,
                         )
                     ),
+                )
+            )
+        if not ctx.dry_run:
+            # What the frames' places in their wells rest on: last, after every
+            # line the scan already writes. A dry run takes no frame.
+            assumed.extend(
+                offset_lines(
+                    plan,
+                    kept=resumed_frames,
+                    kept_without_offsets=kept_without_offsets,
                 )
             )
         return ScanResult(
