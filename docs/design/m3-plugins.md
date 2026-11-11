@@ -1560,8 +1560,21 @@ def fit(
   the response was high, and the only note was "parallel shifts: did the
   stage move?". `signal_spread(frame)` is the 99th minus the 1st
   percentile of the frame in counts (float64, so a frame that is not 2-D
-  or not finite is a `ValueError`), and `carries_signal` is `>=
-  MIN_SIGNAL_SPREAD_COUNTS`, **50**. Measured on the Prime 95B (16-bit):
+  or not finite is a `ValueError`), and `carries_signal(frame,
+  bit_depth)`, the **one** decision every caller asks (the reference and
+  each probe frame), is true when that spread is `>=
+  MIN_SIGNAL_SPREAD_COUNTS`, **50** at 16 bits (`signal_floor_counts`
+  scales it by `2 ** (bits - 16)`, so 3.125 at 12 bits, and never above
+  16: a shallower mode reads fewer counts for the same light, and the
+  scaling can only let a dark frame through, the old behaviour, never
+  refuse a lit one), **or** when at least `MIN_FEATURE_FRACTION`
+  (`1e-4`, 20 pixels of a 384 x 512 frame, 199 of 1412 x 1412) of the
+  pixels lie a floor or more from the median. The second rule is for a
+  **sparse** field, a few beads or cells on a dark background: three
+  beads of 2.5 px are 0.24 % of the frame, and the percentiles read it as
+  dark (a spread of 10 or 11), where the base code calibrates it (found
+  by the adversarial review). The two real dark frames have no such
+  pixel (0 of 2 million), and a hot pixel is one in a million. Measured on the Prime 95B (16-bit):
   the two dark frames of Ti2-E session 2 (`smc snap`, 12 and 20 ms) span
   **11** counts (mean 100.5, std 2.3, `max - min` 45 to 47); of the 200
   frames of the stand's survey, the only ones under 50 are those two and
@@ -1570,9 +1583,11 @@ def fit(
   is the percentiles because one hot or stuck pixel makes a dark frame's
   `max - min` 65000; it is counts because a ratio to the pixel noise
   cannot tell a dark frame from a lit blank one (5.2 and 5.7, near the
-  4.65 of Gaussian noise). The floor is for a 16-bit camera, the only kind
-  on our stands; a stand with another bit depth is a plan change, not a
-  parameter. A lit field without texture still passes (the synthetic plate
+  4.65 of Gaussian noise). The floor was measured on a 16-bit camera, the
+  only kind on our stands, and follows the bit depth the camera reports.
+  A frame at full scale (its median is `2 ** bits - 1`) is refused with
+  its own remedy, "the camera's frame is saturated (...): lower the
+  exposure or the light" (one message, many causes). A lit field without texture still passes (the synthetic plate
   with `texture_std=0` spans 94): it is refused later, by the fit, as "the
   frames barely correlate".
 - **A probe that fits poorly** (#408, F6). `precision_reasons(fit,
@@ -1632,7 +1647,9 @@ measure the camera; run it without --dry-run"):
    `nothing was moved`, and so is a frame with no signal (§4.1): `the
    camera's frame is dark or flat (the 1st to 99th percentile spans <s>
    counts, under 50): is the light on and the light path on the camera?
-   nothing was moved`.
+   nothing was moved` (`under` is the floor of the camera's bit depth; a
+   frame at full scale reads `the camera's frame is saturated (...): lower
+   the exposure or the light; nothing was moved`).
 3. For `(dx, dy)` in `(step, 0)`, `(0, step)`: `ctx.raise_if_stopped()`,
    `xy.move_to_um(start + (dx, dy))`, `ctx.wait_s(settle_ms / 1000)`,
    `snap`, `measure_shift(reference, frame)` and `signal_spread(frame)`;
@@ -1650,9 +1667,11 @@ measure the camera; run it without --dry-run"):
    before the fit, so that "parallel shifts" follows only frames that carry
    signal: `the frame after the <+X probe|+Y probe> is dark or flat (the
    1st to 99th percentile spans <s> counts, under 50): did the light go
-   off, or did the step of <s> µm leave the lit sample? the stage is back
-   at its start` (the first such probe is named; a probe that left the lit
-   sample, onto the black plastic between wells, reads the same).
+   off, or did the step of <s> µm leave the lit sample? the stage was sent
+   back to its start` (the first such probe is named; a probe that left the
+   lit sample, onto the black plastic between wells, reads the same). The
+   return was sent and came back normally; where it landed is not read
+   here (FM-167), so the text says what was done, not where the stage is.
    Then `fit(...)`; notes → `PluginRunError` whose reason is the notes, then
    `step <s> µm`, and, when the step was the fallback or is at least 40 %
    of the smaller side in pixels (`step / pixel size`, pixel size known),

@@ -39,6 +39,7 @@ __all__ = [
     "DEFAULT_STEP_FRACTION",
     "FALLBACK_STEP_UM",
     "MAX_RESIDUAL_SHARE",
+    "MIN_FEATURE_FRACTION",
     "MIN_RESPONSE",
     "MIN_SIGNAL_SPREAD_COUNTS",
     "SMALL_STEP_FRACTION",
@@ -49,6 +50,7 @@ __all__ = [
     "fit",
     "measure_shift",
     "precision_reasons",
+    "signal_floor_counts",
     "signal_spread",
 ]
 
@@ -70,6 +72,11 @@ FALLBACK_STEP_UM = 50.0
 #: A ratio to the noise cannot tell a dark frame from a lit blank one (both read
 #: about 5), so the floor is in counts, for a 16-bit camera.
 MIN_SIGNAL_SPREAD_COUNTS = 50.0
+#: A frame also carries signal when this fraction of its pixels lies at least the
+#: floor away from its median: a few beads on a dark background cover 0.08 to
+#: 0.4 % of the frame, where a dark frame has none (the two real ones: 0 pixels
+#: of 2 million) and a hot pixel is one in a million.
+MIN_FEATURE_FRACTION = 1e-4
 #: A probe under this fraction of the frame's smaller side is a few pixels, and
 #: a few pixels fit poorly: 50 µm at the 4x is 18 px of 1412 (1.3 %), where the
 #: good fits of the same session were 311 to 362 px (22 to 26 %).
@@ -263,16 +270,44 @@ def signal_spread(frame: npt.NDArray[Any]) -> float:
     return float(high - low)
 
 
-def carries_signal(frame: npt.NDArray[Any]) -> bool:
-    """Whether the frame spans at least ``MIN_SIGNAL_SPREAD_COUNTS``: it is not dark or flat.
+def signal_floor_counts(bit_depth: int = 16) -> float:
+    """``MIN_SIGNAL_SPREAD_COUNTS`` for a camera of this bit depth: 50 at 16 bits, 3.125 at 12.
 
-    A positive test (``>=``), so that a spread that is not a number is not
+    The floor was measured on a 16-bit camera. A shallower one (a 12-bit mode of
+    the same Prime 95B) gives counts 16 times smaller for the same light, so a
+    lit frame would read under the 16-bit floor and be refused as dark: the
+    floor is scaled down with the depth, which can only let a dark frame through
+    (the old behaviour), never refuse a lit one. A depth above 16 is 16.
+    """
+    bits = min(max(int(bit_depth), 1), 16)
+    return MIN_SIGNAL_SPREAD_COUNTS * 2.0 ** (bits - 16)
+
+
+def carries_signal(frame: npt.NDArray[Any], bit_depth: int = 16) -> bool:
+    """Whether the frame has light on it: it is not dark or flat.
+
+    Two ways to carry signal, the single decision of every caller (a boundary
+    tested here is the boundary of the plugin):
+
+    * the 1st to 99th percentile spans at least ``signal_floor_counts``, which is
+      any frame with a sample that fills a few percent of the field;
+    * at least ``MIN_FEATURE_FRACTION`` of the pixels lie that far from the
+      median: a **sparse** field (a few fluorescent beads or cells on a dark
+      background) covers under 1 % of the pixels, so its percentiles read as
+      dark, and a handful of isolated hot pixels is far below that fraction.
+
+    Both are positive tests (``>=``), so that a number that is not one is not
     taken for signal.
 
     Raises:
         ValueError: The frame is not 2-D or holds a value that is not finite.
     """
-    return signal_spread(frame) >= MIN_SIGNAL_SPREAD_COUNTS
+    floor = signal_floor_counts(bit_depth)
+    if signal_spread(frame) >= floor:
+        return True
+    array = _as_frame(frame, "camera")
+    far = int(np.count_nonzero(np.abs(array - np.median(array)) >= floor))
+    return far >= MIN_FEATURE_FRACTION * array.size
 
 
 def precision_reasons(

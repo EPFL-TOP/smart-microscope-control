@@ -70,24 +70,34 @@ camera-calibration: 1/3 +X probe
 
 A stage that ran and could not produce a usable result ends the record `failed`
 with the reason, and **fills no slot**: a reader never finds a matrix it should
-not trust. The reason says which of five things went wrong. The first two are
-about the light and come before any judgement of the shifts:
+not trust. The reason says which of five things went wrong (six texts: the first
+is told two ways). The first ones are about the light and come before any
+judgement of the shifts:
 
 - `the camera's frame is dark or flat (the 1st to 99th percentile spans 11
   counts, under 50): is the light on and the light path on the camera? nothing
   was moved`: the reference frame has no light on it (the light path on the
-  eyepiece, the lamp or its shutter off, a saturated camera). It is judged first,
-  so the stage did not move. The number is how many counts the middle 98 % of the
-  frame spans; the Prime 95B's dark frame spans 11 and the dimmest lit frame
-  measured at the stand 177 (the floor, 50, is in between). The 1st to 99th
-  percentile and not the range, because one hot pixel makes a dark frame's range
-  as wide as a lit one's.
+  eyepiece, the lamp or its shutter off). It is judged first, so the stage did
+  not move. The number is how many counts the middle 98 % of the frame spans; the
+  Prime 95B's dark frame spans 11 and the dimmest lit frame measured at the stand
+  177 (the floor, 50 at 16 bits, is in between; it is smaller for a camera in a
+  shallower mode, 3.125 at 12 bits, which reads fewer counts for the same light).
+  The 1st to 99th percentile and not the range, because one hot pixel makes a
+  dark frame's range as wide as a lit one's. **A sparse field passes**: a few
+  beads or cells on a dark background fill under 1 % of the frame, so the
+  percentiles read it as dark, and a frame also carries light when at least 0.01 %
+  of its pixels (20 of a 384 x 512 frame, 199 of 1412 x 1412) lie the floor or
+  more from its median; a handful of hot pixels is far below that.
+- `the camera's frame is saturated (...): lower the exposure or the light; nothing
+  was moved`: the same refusal for a frame at full scale (65535 at 16 bits): the
+  remedy is the opposite one.
 - `the frame after the +X probe is dark or flat (...): did the light go off, or
-  did the step of 96 µm leave the lit sample? the stage is back at its start`:
-  the reference had light and a probe frame did not. The stage did move and came
-  back (the return runs before the frames are judged), so the cause is the light,
-  or a probe that left the lit sample (the black plastic between wells): give a
-  smaller `step_um`. The first such probe is named.
+  did the step of 96 µm leave the lit sample? the stage was sent back to its
+  start`: the reference had light and a probe frame did not. The stage did move
+  and the return was sent (it runs before the frames are judged; where it landed
+  is not read), so the cause is the light, or a probe that left the lit sample
+  (the black plastic between wells): give a smaller `step_um`. The first such probe
+  is named.
 
 The other three are what the shifts of frames with light say:
 
@@ -278,5 +288,6 @@ The two checks of #408 were built from frames and fits the Ti2-E gave in session
 floor of 50 counts, the tenth of the frame and the 5 % of the step. **Not run at a
 stand**: the refusal with the light path on the eyepiece, the line at the 4x with
 no pixel size in the profile (it should suggest about 970 µm), and the floor on
-the camera's other modes (binning, gain). A dark frame whose spread is above 50
-counts, or a lit one under it, is a number to bring back.
+the camera's other modes (binning, gain, a 12-bit mode: the floor follows the
+bit depth the camera reports, and no 12-bit frame was measured). A dark frame
+whose spread is above the floor, or a lit one under it, is a number to bring back.

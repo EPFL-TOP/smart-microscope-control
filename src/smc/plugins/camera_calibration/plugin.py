@@ -43,11 +43,12 @@ from smc.plugins.camera_calibration.algorithm import (
     DEFAULT_STEP_FRACTION,
     FALLBACK_STEP_UM,
     MIN_RESPONSE,
-    MIN_SIGNAL_SPREAD_COUNTS,
     Fit,
+    carries_signal,
     fit,
     measure_shift,
     precision_reasons,
+    signal_floor_counts,
     signal_spread,
 )
 from smc.plugins.errors import PluginRunError
@@ -146,6 +147,8 @@ class CameraCalibrationPlugin:
             )
 
         reported_um = camera.pixel_size_um()
+        # The floor of a frame with no light is for the camera's own bit depth.
+        bit_depth = int(camera.bit_depth())
         assumed: list[str] = []
         used_fallback = False
         if params.step_um is not None:
@@ -166,10 +169,11 @@ class CameraCalibrationPlugin:
         # A stage still travelling from an earlier move reads a fraction of it.
         xy.wait()
         start = xy.position_um()
-        reference = _checked_frame(self.name, camera.snap(), shape)
+        reference = _checked_frame(self.name, camera.snap(), shape, bit_depth)
         probes = (("+X probe", step_um, 0.0), ("+Y probe", 0.0, step_um))
         shifts = []
-        spreads: list[float] = []
+        # Per probe frame: whether it carries light, and the spread the message quotes.
+        signals: list[tuple[bool, float]] = []
         settle_s = params.settle_ms / 1000.0
         # Whether a move was sent and the return has not arrived: a stop before
         # the first move, or during the settle after the return, leaves the
@@ -183,7 +187,9 @@ class CameraCalibrationPlugin:
                 ctx.wait_s(settle_s)
                 probe_frame = camera.snap()
                 shifts.append(measure_shift(reference, probe_frame))
-                spreads.append(signal_spread(probe_frame))
+                signals.append(
+                    (carries_signal(probe_frame, bit_depth), signal_spread(probe_frame))
+                )
                 ctx.progress(done, 3, label)
             # Both probes returned normally, so the return runs (FM-88), and
             # before the fit is judged: an empty field still gets the stage back.
@@ -200,16 +206,18 @@ class CameraCalibrationPlugin:
         shift_x, shift_y = shifts
 
         # Before the fit: a probe frame with no light gives a shift of zero, and
-        # the fit would blame the stage for it ("parallel shifts"). The stage is
-        # back at its start here, so the refusal can say so.
-        for (label, _dx_um, _dy_um), spread in zip(probes, spreads, strict=True):
-            if not spread >= MIN_SIGNAL_SPREAD_COUNTS:
+        # the fit would blame the stage for it ("parallel shifts"). The return
+        # was sent and came back normally; where it landed is not read here
+        # (a move that returns is not a move that arrived, FM-167), so the
+        # refusal says what was done and not where the stage is.
+        for (label, _dx_um, _dy_um), (lit, spread) in zip(probes, signals, strict=True):
+            if not lit:
                 raise PluginRunError(
                     self.name,
                     f"the frame after the {label} is dark or flat "
-                    f"({_spread_detail(spread)}): did the light go off, or did the "
-                    f"step of {step_um:g} µm leave the lit sample? the stage is "
-                    "back at its start",
+                    f"({_spread_detail(spread, bit_depth)}): did the light go off, "
+                    f"or did the step of {step_um:g} µm leave the lit sample? the "
+                    "stage was sent back to its start",
                 )
 
         fitted = fit(shift_x, shift_y, step_um=step_um, image_shape_px=shape)
@@ -286,7 +294,7 @@ def _usable(pixel_size_um: float) -> bool:
 
 
 def _checked_frame(
-    name: str, frame: npt.NDArray[Any], shape: tuple[int, int]
+    name: str, frame: npt.NDArray[Any], shape: tuple[int, int], bit_depth: int
 ) -> npt.NDArray[Any]:
     """The reference frame, once it is known that every probe can be judged against it.
 
@@ -311,21 +319,29 @@ def _checked_frame(
             "the camera's frame has a value that is not finite; nothing was "
             "moved. Give the camera a mode that returns numbers",
         )
-    spread = signal_spread(array)
-    if not spread >= MIN_SIGNAL_SPREAD_COUNTS:
+    if not carries_signal(array, bit_depth):
+        detail = _spread_detail(signal_spread(array), bit_depth)
+        # A frame at full scale is no light path to look for: the remedy is the
+        # opposite one (one message, many causes).
+        if float(np.median(array)) >= 2.0 ** min(max(bit_depth, 1), 16) - 1.0:
+            raise PluginRunError(
+                name,
+                f"the camera's frame is saturated ({detail}): lower the exposure "
+                "or the light; nothing was moved",
+            )
         raise PluginRunError(
             name,
-            f"the camera's frame is dark or flat ({_spread_detail(spread)}): is "
-            "the light on and the light path on the camera? nothing was moved",
+            f"the camera's frame is dark or flat ({detail}): is the light on and "
+            "the light path on the camera? nothing was moved",
         )
     return frame
 
 
-def _spread_detail(spread: float) -> str:
+def _spread_detail(spread: float, bit_depth: int) -> str:
     """What was measured, and the floor, so that a surprise at a stand is a number to report."""
     return (
         f"the 1st to 99th percentile spans {spread:.0f} counts, "
-        f"under {MIN_SIGNAL_SPREAD_COUNTS:g}"
+        f"under {signal_floor_counts(bit_depth):g}"
     )
 
 
