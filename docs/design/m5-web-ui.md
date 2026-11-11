@@ -4491,8 +4491,10 @@ Every build issue edits `plate_page.py` and, from B2 on, `controller.py` and
   the plate controls and `plate-registration`'s section; *wells* *Wells* and
   `scan-plan`'s section; *scan* `scan`'s section; *results* the sections of `cells`,
   `density`, `route`, `report` and `nis-export`. Each screen's title, lead and
-  `continue_button` are §17.4's. The next-step region is listed on the screen that
-  holds its tool (`STEP_OF_SLOT`) and in the expert view.
+  `continue_button` are §17.4's. The next-step region (§8.3) is listed at the top of
+  **every** provisional screen and in the expert view: one instance, drawn once. Its
+  place does not depend on the state, so `refresh()` never rewrites a screen's list.
+  B2 to B4 drop it from the screens they replace, whose own action is the next step.
 - **B2, the Stand and Plate screens** (#444): §17.4.1 and §17.4.2 in full,
   `guide.suggested_centres`, the "known" block, the *from …* lines.
 - **B3, the Wells and Scan screens** (#445): §17.4.3 and §17.4.4, the progress and
@@ -4511,9 +4513,11 @@ From B1 on, the viewport is **1280 x 800** (the floor of D1; `--width` and
 `--height` stay). The states keep their names and change their actions: `empty` (as
 it opens), `wells-selected` (the *3. Wells* step, then `A1:B2` in *Wells*: its label
 is unique once the step panel shows one screen, which ends #395's double match),
-`snap` (the image's *Snap*, the screen unchanged), `after-density` (the chain, a Snap,
-no Refresh, then *5. Results*), `with-route`, `turned` (*2. Plate*, then *Plate
-lies*), and a seventh, `expert` (the switch on, after `turned`). B2 to B4 each read
+`snap` (the image's *Snap*, the screen unchanged), a new `expert` (the switch on, the
+photograph, the switch off; fourth, so that both stands reach it: `STATE_NAMES[:4]`),
+`after-density` (the chain, a Snap, no Refresh, then *5. Results*), `with-route`, and
+`turned` (*2. Plate*, then *Plate lies*). `summary.txt`'s `active tab` line becomes
+`step`, the label of the step button drawn as `primary`. B2 to B4 each read
 the states of their screens; each walks its screens at 1280 x 800 and says in its
 Report what is below the fold.
 
@@ -4532,7 +4536,7 @@ Report what is below the fold.
   `test_the_expert_view_holds_every_tool_and_the_step_comes_back`,
   `test_both_figures_stay_in_the_model_tree_whatever_the_screen` (FM-174),
   `test_the_strip_and_stop_are_outside_the_step_panel`,
-  `test_the_next_step_is_drawn_on_the_screen_of_its_tool`,
+  `test_the_next_step_is_on_every_provisional_screen_and_drawn_once`,
   `test_a_snap_or_a_runs_end_never_changes_the_screen`,
   `test_two_views_show_their_own_screens`.
 - `tests/unit/test_plate_page.py`: the tab tests
