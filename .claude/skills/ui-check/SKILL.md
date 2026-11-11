@@ -1,6 +1,6 @@
 ---
 name: ui-check
-description: Look at the plate page like a user does — serve it on a demo stand in dry run, drive it with headless Chromium through five states (empty, a typed well range, a snap, after density, with the route), and read the PNGs and summary.txt it writes. Use it on every area:ui issue, in /develop before the adversarial review and in /review of an area:ui PR; it also says how a session drives the served page through a Chrome MCP (tried once: screenshots and clicks, no page reading). Never an assertion or a baseline.
+description: Look at the plate page like a user does — serve it on a demo stand in dry run, drive it with headless Chromium through six states (empty, a typed well range, a snap, after density, with the route, the plate turned), and read the PNGs and summary.txt it writes. Use it on every area:ui issue, in /develop before the adversarial review and in /review of an area:ui PR; it also says how a session drives the served page through a Chrome MCP (tried once: screenshots and clicks, no page reading). Never an assertion or a baseline.
 ---
 
 # /ui-check
@@ -41,7 +41,7 @@ has both.
 
 (Windows: `.venv\Scripts\python`.) 33 s on macOS (measured), 19 s of them the `scan` of
 the chain; `--no-results` skips the chain when the change has nothing to do with
-results, and then the last two states are named as not reached. `--stand demo` serves
+results, and then the last three states are named as not reached. `--stand demo` serves
 the demo whose camera images no sample. Nothing else is a parameter: there is no
 `--profile`, because the page can move a stage, and the script serves only
 `demo-sample` and `demo`, the repository's own files, and always with `--dry-run`.
@@ -53,10 +53,12 @@ the demo whose camera images no sample. Nothing else is a parameter: there is no
 | `snap` | the Image tab, the Snap button | both |
 | `after-density` | runs the workflow while the page is up (`plate-registration`, `scan-plan`, `scan`, `cells`, `density`, on the demo's simulated stage), then a Snap on the Image tab (the page redraws when it ends, with the Plate tab hidden: #297) and back to the Plate tab, **no Refresh** | `demo-sample` |
 | `with-route` | `route`, then Refresh | `demo-sample` |
+| `turned` | on the Plate tab, the *Plate lies* select set to its `Turned 180°` option, then a wait for the strip's `plate-orientation done` line (m5 §16.4). Compare it with `with-route` by eye: the **same cross, other names** (the density and the route are stale after the turn, so they are gone) | `demo-sample` |
 
 A state it cannot reach is **named, never skipped**: `<state>: not reached: <why>`,
 on stdout and in `summary.txt`. It never clicks a tool's Run button, Drive, STOP or
-Resume.
+Resume; the one run it starts from the page is `turned`'s `plate-orientation`, which
+moves nothing.
 
 ## Read
 

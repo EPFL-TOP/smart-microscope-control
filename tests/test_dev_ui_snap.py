@@ -402,7 +402,7 @@ def test_the_demo_sample_profile_still_fits_the_chains_refs(snap) -> None:
 
 
 def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
-    names = ["empty", "wells-selected", "snap", "after-density", "with-route"]
+    names = ["empty", "wells-selected", "snap", "after-density", "with-route", "turned"]
 
     full = snap.plan_states("demo-sample", results=True)
     assert [p.name for p in full] == names
@@ -410,7 +410,8 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
 
     demo = snap.plan_states("demo", results=True)
     assert [p.name for p in demo] == names
-    assert [p.reachable for p in demo] == [True, True, True, False, False]
+    # `turned` needs the chain's registered plate (m5 §16.4): with the results.
+    assert [p.reachable for p in demo] == [True, True, True, False, False, False]
     for plan in demo[3:]:
         assert plan.reason == (
             "the demo camera images no sample: no cells, no density; "
@@ -418,16 +419,17 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
         )
 
     skipped = snap.plan_states("demo-sample", results=False)
-    assert [p.reachable for p in skipped] == [True, True, True, False, False]
+    assert [p.reachable for p in skipped] == [True, True, True, False, False, False]
     assert {p.reason for p in skipped[3:]} == {"skipped by --no-results"}
 
     failed = snap.plan_states(
         "demo-sample", results=True, chain_failure="cells exited 1: no detector"
     )
-    assert [p.reachable for p in failed] == [True, True, True, False, False]
+    assert [p.reachable for p in failed] == [True, True, True, False, False, False]
     assert failed[3].reason == "cells exited 1: no detector"
     assert failed[4].reason is not None
     assert "cells exited 1: no detector" in failed[4].reason
+    assert failed[5].reason == failed[4].reason
     # None is silent: every state that is not reached says why.
     for plans in (demo, skipped, failed):
         assert all(p.reachable or p.reason for p in plans)
@@ -945,9 +947,11 @@ def test_a_failed_chain_names_the_states_that_needed_it(snap, tmp_path) -> None:
         ("snap", True),
         ("after-density", False),
         ("with-route", False),
+        ("turned", False),
     ]
     assert records[3].reason == "cells exited 1: x"
     assert records[4].reason == "needs the chain: cells exited 1: x"
+    assert records[5].reason == "needs the chain: cells exited 1: x"
     assert (errors, warnings) == ([], 0)
 
 
@@ -958,7 +962,7 @@ def test_a_state_whose_control_times_out_is_named_and_the_next_state_runs(
     records, _, _ = _drive(snap, tmp_path, page, lambda steps: None)
     # `after-density` shows the Image tab too (its redraw is the one made while the
     # Plate tab is hidden, #297), so it fails on the same control; `with-route` runs.
-    assert [r.reached for r in records] == [True, True, False, False, True]
+    assert [r.reached for r in records] == [True, True, False, False, True, True]
     assert records[2].reason == "Locator.click: Timeout 10000ms exceeded."
     assert records[3].reason == records[2].reason
     page.screenshot.assert_any_call(path=str(tmp_path / "snap-FAILED.png"))
@@ -970,13 +974,35 @@ def test_a_state_whose_control_times_out_alone_is_the_only_one_named(
 ) -> None:
     page = _fake_page(fails_on_fill=True)
     records, _, _ = _drive(snap, tmp_path, page, lambda steps: None)
-    assert [r.reached for r in records] == [True, False, True, True, True]
+    assert [r.reached for r in records] == [True, False, True, True, True, True]
     assert records[1].reason == "Locator.fill: Timeout 10000ms exceeded."
     page.screenshot.assert_any_call(path=str(tmp_path / "wells-selected-FAILED.png"))
 
 
 def _no_chain() -> SimpleNamespace:
     return SimpleNamespace(run_chain=lambda steps: None)
+
+
+def test_the_turned_state_picks_the_selects_turned_label_and_waits_for_the_outcome(
+    snap,
+) -> None:
+    # The label is worded from the stand's sides, so it is read from the select; the
+    # state ends on the strip's outcome line, never on a delay (FM-162, m5 §16.4).
+    page = MagicMock()
+    select = page.get_by_label.return_value
+    select.locator.return_value.all_inner_texts.return_value = [
+        " A1 at the back left ",
+        "Turned 180\N{DEGREE SIGN}: A1 at the front right",
+    ]
+    snap._act_turned(page, _no_chain())
+    page.get_by_label.assert_called_once_with("Plate lies", exact=True)
+    select.select_option.assert_called_once_with(
+        label="Turned 180\N{DEGREE SIGN}: A1 at the front right"
+    )
+    page.locator.assert_any_call("pre")
+    page.locator.return_value.filter.assert_any_call(has_text="plate-orientation done")
+    page.locator.return_value.filter.return_value.first.wait_for.assert_called_once_with()
+    page.wait_for_timeout.assert_not_called()
 
 
 def test_after_density_redraws_on_the_image_tab_and_presses_no_refresh(snap) -> None:
