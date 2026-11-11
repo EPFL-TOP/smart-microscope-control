@@ -148,12 +148,46 @@ def test_a_lane_ends_at_the_next_bold_line_and_steps_outside_a_lane_are_ignored(
         "S1.1 `/feature 2` (Sonnet)",
         "",
         "S1.2 `/review` (Sonnet) → merge",
+        # a step of another lane, written inside this one, is nobody's
+        "S2.1 `/feature 9` (Sonnet) inside S1",
         "**End of the day**: `/point`.",
         "S1.3 `/plan 3` after the lane ended",
         "S2.1 `/plan 4` of a lane that was never opened",
     )
     assert list(lanes) == ["S1"]
     assert [s.id for s in lanes["S1"]] == ["S1.1", "S1.2"]
+
+
+def test_a_lane_head_does_not_inherit_the_issue_the_previous_lane_ended_on() -> None:
+    draft = (
+        "**S1 — a**\nS1.1 `/feature 5` (Sonnet)\n"
+        "**S2 — b**\nS2.1 `/review` (Sonnet) → merge\n"
+    )
+    lanes = lane.parse_point(draft)
+    assert [s.issue for s in lanes["S2"][0].segments] == [None, None]
+    # so the check says it, instead of a lane that reviews another lane's PR
+    problems = lane.check_point(draft)
+    assert len(problems) == 2
+    assert all(p.startswith("S2.1") for p in problems)
+
+
+@pytest.mark.parametrize(
+    ("text", "kind"),
+    [
+        ("merge", "merge"),
+        ("Merge it", "merge"),
+        ("merge; the following steps the same way", "merge"),
+        ("read the PR, then merge it", "owner"),
+        ("read the design PR", "owner"),
+        ("read the design PR; merge it", "design-merge"),
+        ("merge its design PR, if any", "design-merge"),
+        ("Merge its DESIGN PR", "design-merge"),
+        ("something nobody can parse", "owner"),
+        ("`/review` (Sonnet) then merge", "review"),
+    ],
+)
+def test_a_segment_is_classified_by_what_it_says(text, kind) -> None:
+    assert lane.classify(text) == kind
 
 
 def test_the_model_is_read_from_the_parenthesis_after_the_command() -> None:
@@ -163,6 +197,7 @@ def test_the_model_is_read_from_the_parenthesis_after_the_command() -> None:
         "S1.2 `/feature 2` for the thing (Sonnet; it reads the notes (twice) first)",
         "S1.3 `/plan 3` with no parenthesis",
         "S1.4 `/plan 4` (a note that mentions Opus later) and then (Haiku)",
+        "S1.5 `/plan 5` (a note) and then (Sonnet)",
     )
     models = [[s.model for s in step.segments] for step in lanes["S1"]]
     assert models == [
@@ -171,6 +206,8 @@ def test_the_model_is_read_from_the_parenthesis_after_the_command() -> None:
         [None],
         # the first parenthesis after the command decides: "a note that mentions Opus"
         ["opus"],
+        # and it ends at its own closing parenthesis: the (Sonnet) after it is no model
+        [None],
     ]
 
 
@@ -578,15 +615,73 @@ def test_a_step_waits_for_the_steps_it_follows_in_other_lanes() -> None:
     rows = lane.lane_status(lanes, "S2", done, T0)
     assert [r[2] for r in rows] == ["session", "wait"]
     assert rows[1][3] == "after S2.1"
-    # a step that names no step, or a cycle, is the owner's, not an endless wait
+    # a step that names no step is the owner's, not an endless wait
     lonely = lane.parse_point("**S1 — x**\nS1.1 after S9.9: `/feature 5`\n")
     assert lane.lane_status(lonely, "S1", _facts([_issue(5)]), T0)[0][2] == "owner"
+
+
+def test_two_lanes_that_follow_each_other_are_the_owners_not_an_endless_wait() -> None:
     cyclic = lane.parse_point(
         "**S1 — x**\nS1.1 after S2.1: `/feature 5`\n"
         "**S2 — y**\nS2.1 after S1.1: `/feature 6`\n"
     )
-    rows = lane.lane_status(cyclic, "S1", _facts([_issue(5), _issue(6)]), T0)
-    assert rows[0][2] in {"owner", "wait"}
+    facts = _facts([_issue(5), _issue(6)])
+    for lane_id in ("S1", "S2"):
+        rows = lane.lane_status(cyclic, lane_id, facts, T0)
+        assert rows[0][2] == "owner"
+        assert "leads back to" in rows[0][3]
+        view = lane.render(lane_id, rows, facts, {"createdAt": T0, "id": "IC_1"}, 51)
+        assert view.next_kind == "owner"
+    # a step that follows a later step of its own lane is the owner's too
+    later = lane.parse_point(
+        "**S1 — x**\nS1.1 after S1.2: `/feature 5`\nS1.2 `/feature 6`\n"
+    )
+    rows = lane.lane_status(later, "S1", _facts([_issue(5), _issue(6)]), T0)
+    assert rows[0][2:] == ("owner", "after S1.2 is not an earlier step of S1")
+
+
+def test_check_flags_an_after_cycle_and_an_after_on_a_later_step() -> None:
+    draft = (
+        "**S1 — x**\nS1.1 after S2.1: `/feature 1`\n"
+        "**S2 — y**\nS2.1 after S1.1: `/feature 2`\n"
+    )
+    problems = lane.check_point(draft)
+    assert [p.split(":")[0] for p in problems] == ["S1.1", "S2.1"]
+    assert all("a lane that waits forever" in p for p in problems)
+    assert "S1.1 -> S2.1 -> S1.1" in problems[0]
+    later = "**S1 — x**\nS1.1 after S1.2: `/feature 1`\nS1.2 `/feature 2`\n"
+    (problem,) = lane.check_point(later)
+    assert "after S1.2 is not an earlier step of S1" in problem
+    assert (
+        lane.check_point(
+            "**S1 — x**\nS1.1 `/feature 1`\nS1.2 after S1.1: `/feature 2`\n"
+        )
+        == []
+    )
+
+
+def test_after_holds_back_only_the_first_segment_of_a_step() -> None:
+    lanes = lane.parse_point(
+        "**S1 — a**\nS1.1 `/feature 5` (Sonnet) → `/review` (Sonnet) → merge\n"
+        "**S2 — b**\nS2.1 after S1.1: `/feature 6` (Sonnet) → `/review` (Sonnet)\n"
+    )
+    # #6 already has its PR (done by hand): only the first segment of S2.1 would wait
+    facts = _facts([_issue(5), _issue(6)], [_pr(12, (5,)), _pr(13, (6,))])
+    rows = lane.lane_status(lanes, "S2", facts, T0)
+    assert [r[2] for r in rows] == ["done", "session"]
+    assert rows[1][3] == "review 13"
+
+
+def test_a_step_follows_every_segment_of_a_step_of_its_own_lane() -> None:
+    lanes = lane.parse_point(
+        "**S1 — a**\nS1.1 `/feature 5` (Sonnet) → `/review` (Sonnet)\n"
+        "S1.2 after S1.1: `/feature 6`\n"
+    )
+    # the feature of S1.1 is done, its review is not: S1.2 still waits
+    facts = _facts([_issue(5), _issue(6)], [_pr(12, (5,))])
+    rows = lane.lane_status(lanes, "S1", facts, T0)
+    assert [r[2] for r in rows] == ["done", "session", "wait"]
+    assert rows[2][3] == "after S1.1"
 
 
 def _model(seg, skill, facts) -> str:
@@ -729,9 +824,81 @@ def test_an_owner_step_says_where_to_resume() -> None:
     assert view.lines[-1] == "RESUME: /lane S1 from S1.1"
 
 
+def test_the_last_owner_step_has_no_step_to_resume_at() -> None:
+    lanes = lane.parse_point("**S1 \N{EM DASH} o**\nS1.1 `/plan 5` with you: a walk\n")
+    facts = _facts([_issue(5)])
+    rows = lane.lane_status(lanes, "S1", facts, T0)
+    view = lane.render("S1", rows, facts, {"createdAt": T0, "id": "IC_1"}, 51)
+    assert view.lines[-1].startswith("NEXT: owner `/plan 5` with you")
+    assert not any(line.startswith("RESUME:") for line in view.lines)
+
+
+def test_the_fix_round_is_a_develop_session_on_the_develops_model_with_its_brief() -> (
+    None
+):
+    lanes = lane.parse_point(
+        "**S1 \N{EM DASH} r**\nS1.1 `/feature 5` (Sonnet) \N{RIGHTWARDS ARROW}"
+        " `/review` (haiku) \N{RIGHTWARDS ARROW} merge\n"
+    )
+    plan = _plan(AFTER, "**Risk**: tooling\n**Suggested model**: opus\n")
+    review = _review("changes requested", "2026-11-11T16:10:00Z")
+    facts = _facts([_issue(5, (plan,))], [_pr(12, (5,), texts=(review,))])
+    rows = lane.lane_status(lanes, "S1", facts, T0)
+    view = lane.render("S1", rows, facts, {"createdAt": T0, "id": "IC_1"}, 51)
+    # a develop session, on the plan's model: the haiku of the review segment is the
+    # review's, and the brief says it is the fix round
+    assert "NEXT: session develop 5 opus" in view.lines
+    assert f"BRIEF: {lane.brief('develop', 5, 'S1', True)}" in view.lines
+    assert "this is the fix round" in view.lines[-1]
+    assert "S1.1 [2] review (haiku)  session  develop 5 fix-round" in view.lines
+
+
+def test_the_output_of_a_run_is_ascii_whatever_the_point_says(tmp_path, capsys) -> None:
+    text = (
+        "**S1 \N{EM DASH} x**\nS1.1 `/plan 5` with you: a 40\N{MULTIPLICATION SIGN}"
+        " scan\N{RIGHTWARDS ARROW}\N{GREEK SMALL LETTER MU}m\n"
+    )
+    lanes = lane.parse_point(text)
+    facts = _facts([_issue(5)])
+    rows = lane.lane_status(lanes, "S1", facts, T0)
+    view = lane.render("S1", rows, facts, {"createdAt": T0, "id": "IC_1"}, 51)
+    assert all(line.isascii() for line in view.lines)
+    assert any("a 40x scan->?m" in line for line in view.lines)
+    # and what --check prints: a problem line quotes the segment as written
+    draft = tmp_path / "draft.md"
+    draft.write_text(
+        "**S1 \N{EM DASH} x**\nS1.1 merge the 40\N{MULTIPLICATION SIGN} thing\n",
+        encoding="utf-8",
+    )
+    assert lane.main(["--check", str(draft)]) == 1
+    out = capsys.readouterr().out
+    assert out.isascii()
+    assert "merge the 40x thing" in out
+
+
 def test_ascii_only_transliterates_what_a_console_cannot_encode() -> None:
     text = "a \N{EM DASH} b \N{RIGHTWARDS ARROW} c 40\N{MULTIPLICATION SIGN} \N{GREEK SMALL LETTER MU}m"
     assert lane.ascii_only(text) == "a - b -> c 40x ?m"
+    # one transliteration for the two scripts that print the Point's text
+    assert lane.ascii_only is lane.point.ascii_only
+
+
+def test_a_draft_saved_with_a_bom_or_in_utf16_is_read_or_named(
+    tmp_path, capsys
+) -> None:
+    # Notepad and PowerShell 5.1 save a BOM, or UTF-16: a BOM must not hide the first
+    # lane (the check would print "ok"), and UTF-16 must name the file (FM-80)
+    text = "**S1 \N{EM DASH} x**\nS1.1 `/review` (Sonnet) \N{RIGHTWARDS ARROW} merge\n"
+    bom = tmp_path / "bom.md"
+    bom.write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))
+    assert lane.main(["--check", str(bom)]) == 1
+    assert "S1.1" in capsys.readouterr().out
+    wide = tmp_path / "wide.md"
+    wide.write_bytes(text.encode("utf-16"))
+    assert lane.main(["--check", str(wide)]) == 4
+    err = capsys.readouterr().err
+    assert str(wide) in err
+    assert "save it as UTF-8" in err
 
 
 # --- the wait and the command line -----------------------------------------------------
@@ -837,6 +1004,82 @@ def test_the_exit_codes_tell_a_gh_failure_an_unknown_lane_and_a_crash_apart(
     with pytest.raises(SystemExit) as caught:
         lane.main(["S1", "--every", "0"])
     assert caught.value.code == 4
+
+
+# --- one run, end to end on canned `gh` replies --------------------------------------------
+
+
+def _canned_gh(monkeypatch) -> None:
+    """A tracking issue behind a decoy, two Points and a lane note after the newer one."""
+    old_point = (
+        "## Point (design session, 2026-11-10)\n\n"
+        "**S9 \N{EM DASH} yesterday**\nS9.1 `/feature 9` (Sonnet)\n"
+    )
+    point_text = (
+        "## Point (design session, 2026-11-11)\n\n"
+        "**S1 \N{EM DASH} today**\n"
+        "S1.1 `/plan 5` (Sonnet) \N{RIGHTWARDS ARROW} `/develop 5`\n"
+    )
+    comments = [
+        {"id": "IC_old", "createdAt": "2026-11-10T10:00:00Z", "body": old_point},
+        {"id": "IC_new", "createdAt": T0, "body": point_text},
+        {
+            "id": "IC_lane",
+            "createdAt": "2026-11-11T15:30:00Z",
+            "body": "## Lane (S1, 2026-11-11)\n\n**Done**: x\n**Next**: y\n",
+        },
+    ]
+
+    def fake(*args: str) -> Any:
+        if args[:2] == ("repo", "view"):
+            return {"nameWithOwner": "o/r"}
+        if args[:2] == ("issue", "list"):
+            # the decoy comes first: the tracking issue is found by its title
+            return [
+                {"number": 7, "title": "feat: something else"},
+                {"number": 51, "title": "Point: next steps"},
+            ]
+        if args[:2] == ("issue", "view"):
+            number = int(args[2])
+            if number == 51:
+                return {"number": 51, "comments": comments}
+            if number == 5:
+                # a plan posted before the Point: not this Point's plan
+                return _issue(5, (_plan(BEFORE),))
+            return {"number": number, "comments": []}
+        if args[:2] == ("pr", "list"):
+            return []
+        raise AssertionError(args)
+
+    monkeypatch.setattr(lane, "gh_json", fake)
+
+
+def test_a_run_reads_the_newest_point_by_its_header_and_dates_the_plans_from_it(
+    monkeypatch, capsys
+) -> None:
+    _canned_gh(monkeypatch)
+    assert lane.main(["S1"]) == 0
+    out = capsys.readouterr().out.splitlines()
+    # the newest `## Point`, not the lane note posted after it, and the tracking issue
+    assert out[0] == f"lane S1 | point {T0} (comment IC_new) | tracking #51"
+    # the plan on #5 is older than that Point: it is not this Point's plan
+    assert out[1] == "S1.1 [1] plan (sonnet)  session  plan 5"
+    assert "NEXT: session plan 5 sonnet" in out
+    assert out[-1].startswith("BRIEF: ")
+
+
+def test_an_unknown_lane_or_step_ends_with_exit_1_and_names_what_exists(
+    monkeypatch, capsys
+) -> None:
+    _canned_gh(monkeypatch)
+    # S9 is in the older Point only
+    assert lane.main(["S9"]) == 1
+    err = capsys.readouterr().err
+    assert "no lane S9" in err
+    assert "S1" in err
+    assert lane.main(["S1", "--from", "S9.9"]) == 1
+    assert "S9.9" in capsys.readouterr().err
+    assert lane.main(["S1", "--from", "S1.1"]) == 0
 
 
 # --- GitHub ---------------------------------------------------------------------------------

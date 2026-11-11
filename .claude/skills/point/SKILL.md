@@ -112,7 +112,8 @@ The session ends when the list is posted.
    several PRs is written as owner steps: a lane drives one PR per issue. **Before posting, run `python
    scripts/dev/lane.py --check <draft file>` and fix what it prints** (a plan
    with no develop after it, a review or a merge with no issue, an `after`
-   naming no step).
+   naming no step, a later step of its own lane, or a cycle of lanes that
+   wait for each other).
 
    No history and no explanations unless the owner asks.
 

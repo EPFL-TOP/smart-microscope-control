@@ -550,6 +550,20 @@ def test_a_lane_note_line_is_one_short_line(point) -> None:
     assert point.lane_notes([bare], "") == ["- S2 (2026-11-12T09:00:00Z): - / -"]
 
 
+def test_a_lane_note_line_is_ascii_whatever_the_subagent_wrote(point) -> None:
+    # A subagent writes arrows and dashes freely, and a redirected stdout on Windows
+    # is cp1252 with strict errors: one arrow would end the whole report (FM-20).
+    note = _lane(
+        "S1",
+        "2026-11-12T09:00:00Z",
+        "step \N{RIGHTWARDS ARROW} done",
+        "you \N{EM DASH} merge #5 \N{GREEK SMALL LETTER MU}m",
+    )
+    (line,) = point.lane_notes([note], "")
+    assert line == "- S1 (2026-11-12T09:00:00Z): step -> done / you - merge #5 ?m"
+    assert line.isascii()
+
+
 def test_the_report_lists_the_lanes_right_after_the_open_prs(
     point, monkeypatch, capsys
 ) -> None:

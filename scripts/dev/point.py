@@ -51,6 +51,31 @@ def clip(text: str, limit: int = MAX_LINE) -> str:
     return line if len(line) <= limit else line[: limit - 3] + "..."
 
 
+_ASCII = {
+    ord("\N{EM DASH}"): "-",
+    ord("\N{EN DASH}"): "-",
+    ord("\N{RIGHTWARDS ARROW}"): "->",
+    ord("\N{MULTIPLICATION SIGN}"): "x",
+    ord("\N{MIDDLE DOT}"): "-",
+    ord("\N{HORIZONTAL ELLIPSIS}"): "...",
+    ord("\N{LEFT SINGLE QUOTATION MARK}"): "'",
+    ord("\N{RIGHT SINGLE QUOTATION MARK}"): "'",
+    ord("\N{LEFT DOUBLE QUOTATION MARK}"): '"',
+    ord("\N{RIGHT DOUBLE QUOTATION MARK}"): '"',
+    ord("\N{NO-BREAK SPACE}"): " ",
+}
+
+
+def ascii_only(text: str) -> str:
+    """The text with what a Windows console cannot encode transliterated (#42).
+
+    A redirected stdout on Windows is cp1252 with strict errors (FM-20): a lane's
+    note is written by a subagent, which uses arrows and dashes freely, and one
+    arrow in it would end the whole report.
+    """
+    return text.translate(_ASCII).encode("ascii", "replace").decode("ascii")
+
+
 def depends_on(plan: str) -> list[int]:
     """Issue or PR numbers on a plan's ``**Depends on**`` line; [] for none."""
     for line in plan.splitlines():
@@ -97,8 +122,10 @@ def lane_notes(comments: list[dict[str, Any]], stamp: str) -> list[str]:
         return clip(" ".join(field(body, name)) or "-", 110)
 
     return [
-        f"- {lane} ({c['createdAt']}): {part(str(c['body']), 'Done')}"
-        f" / {part(str(c['body']), 'Next')}"
+        ascii_only(
+            f"- {lane} ({c['createdAt']}): {part(str(c['body']), 'Done')}"
+            f" / {part(str(c['body']), 'Next')}"
+        )
         for lane, c in sorted(newest.items(), key=lambda kv: int(kv[0][1:]))
     ]
 

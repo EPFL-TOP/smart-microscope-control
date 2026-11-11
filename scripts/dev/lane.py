@@ -245,13 +245,41 @@ def check_point(body: str) -> list[str]:
                     f"{step.id}: the plan of #{seg.issue} has no develop or feature"
                     f" of #{seg.issue} after it in {lane} (an incomplete lane)"
                 )
-        for step in steps:
-            problems.extend(
-                f"{step.id}: after {name} names no step"
-                for name in step.after
-                if name not in known
-            )
+        for i, step in enumerate(steps):
+            for name in step.after:
+                if name not in known:
+                    problems.append(f"{step.id}: after {name} names no step")
+                elif name in {s.id for s in steps[i:]}:
+                    problems.append(
+                        f"{step.id}: after {name} is not an earlier step of {lane}"
+                    )
+            cycle = after_cycle(lanes, step.id)
+            if cycle:
+                problems.append(
+                    f"{step.id}: after leads back to {step.id}"
+                    f" ({' -> '.join(cycle)}): a lane that waits forever"
+                )
     return problems
+
+
+def after_cycle(lanes: dict[str, list[Step]], step_id: str) -> list[str] | None:
+    """The steps of an ``after`` chain that leads from ``step_id`` back to itself.
+
+    Two lanes that each wait for the other would both poll until the timeout,
+    and neither would ever say why: it is the owner's to untangle.
+    """
+    graph = {s.id: s.after for steps in lanes.values() for s in steps}
+    seen: set[str] = set()
+    stack = [(step_id, [step_id])]
+    while stack:
+        node, path = stack.pop()
+        for nxt in graph.get(node, ()):
+            if nxt == step_id:
+                return [*path, nxt]
+            if nxt in graph and nxt not in seen:
+                seen.add(nxt)
+                stack.append((nxt, [*path, nxt]))
+    return None
 
 
 # -- the facts and the state of a step (pure: the facts are passed in) ----------
@@ -459,6 +487,11 @@ def _after_state(
     rows: list[Row],
 ) -> tuple[str, str] | None:
     """``wait after S2.3`` while a step this one follows is unfinished."""
+    cycle = after_cycle(lanes, step.id)
+    if cycle:
+        # Decided here, not by the nested lane: that one would say "owner" to
+        # itself and the outer lane would still read it as "not finished".
+        return ("owner", f"after leads back to {step.id}: {' -> '.join(cycle)}")
     unfinished: list[str] = []
     for name in step.after:
         lane = name.split(".")[0]
@@ -468,7 +501,7 @@ def _after_state(
         if lane in visiting:
             done = [r for r in rows if r[0].id == name]
             if not done:
-                return ("owner", f"after {name} is not an earlier step: a cycle")
+                return ("owner", f"after {name} is not an earlier step of {lane}")
             finished = all(r[2] == "done" for r in done)
         else:
             other = lane_status(lanes, lane, facts, t0, None, visiting)
@@ -572,24 +605,8 @@ def brief(skill: str, arg: int, lane_id: str, fix_round: bool) -> str:
     )
 
 
-_ASCII = {
-    ord("\N{EM DASH}"): "-",
-    ord("\N{EN DASH}"): "-",
-    ord("\N{RIGHTWARDS ARROW}"): "->",
-    ord("\N{MULTIPLICATION SIGN}"): "x",
-    ord("\N{MIDDLE DOT}"): "-",
-    ord("\N{HORIZONTAL ELLIPSIS}"): "...",
-    ord("\N{LEFT SINGLE QUOTATION MARK}"): "'",
-    ord("\N{RIGHT SINGLE QUOTATION MARK}"): "'",
-    ord("\N{LEFT DOUBLE QUOTATION MARK}"): '"',
-    ord("\N{RIGHT DOUBLE QUOTATION MARK}"): '"',
-    ord("\N{NO-BREAK SPACE}"): " ",
-}
-
-
-def ascii_only(text: str) -> str:
-    """The text with what a Windows console cannot encode transliterated (#42)."""
-    return text.translate(_ASCII).encode("ascii", "replace").decode("ascii")
+# One transliteration for the two scripts: the Point's text is printed by both.
+ascii_only = point.ascii_only
 
 
 @dataclass
@@ -836,7 +853,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if ns.check:
         try:
-            text = Path(ns.check).read_text(encoding="utf-8")
+            # utf-8-sig: a draft saved on Windows may start with a BOM, which would
+            # hide the first lane's head from the grammar and print "ok" (FM-80).
+            text = Path(ns.check).read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError as exc:
+            sys.stderr.write(
+                f"cannot read {ns.check}: not UTF-8 ({exc.reason}); save it as UTF-8\n"
+            )
+            return 4
         except OSError as exc:
             sys.stderr.write(f"cannot read {ns.check}: {exc}\n")
             return 4
