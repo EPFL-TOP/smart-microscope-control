@@ -668,8 +668,8 @@ fake-only whole-unit test).
 2026-11-10, the owner at the stand, commit `caaa60e`. Report: #405, with
 the raw excerpts; the folder stays in `local/surveys/nikon-ti2/session3/`
 and `local/scans/2026-11-10/`. The sample was session 2's 24-well plate,
-a **Greiner** with a standard plastic bottom (reference not read), holding
-debris and no cells. The 4×, 10× and 40× were used, the lever at 1.0×,
+a **Greiner 24 Well SensoPlate, glass bottom** (items 662892 / 662896;
+the maker's customer drawing, revision 9), holding debris and no cells. The 4×, 10× and 40× were used, the lever at 1.0×,
 the Prime 95B on the left port (`L100`).
 
 ### Z, the offset and the turns
@@ -728,8 +728,9 @@ the Prime 95B on the left port (`L100`).
   1.7 µm over 1.4 mm) and through a 7.5 mm move inside a well (+2.1 µm).
   An engage at an offset already seen locked moved Z by −0.04 µm (D1).
 - The 40× (Plan Apo λD, working distance 0.17–0.25 mm) focused through the
-  plate's standard plastic bottom at Z 4005–4011 µm, 344 µm under the
-  4350 µm limit. The lab uses this plate at the 40×.
+  plate's glass bottom at Z 4005–4011 µm, 344 µm under the 4350 µm
+  limit. The lab uses this plate at the 40×. (The bottom was called
+  "standard plastic" at the stand; the drawing and the owner correct it.)
 
 ### The camera
 
@@ -759,6 +760,12 @@ the Prime 95B on the left port (`L100`).
   B5 (−28982, −9919), C3 (10031, 9375) µm; **pitch 19.49 mm between
   columns, 19.43 mm between rows**; the plate sits square to 0.1–0.2°.
   B3 is 265 µm off session 2's in X: the plate was put back between them.
+- **The maker's numbers** (Greiner's drawing): pitch **19.5 mm** on both
+  axes, well Ø 15.66 mm at the bottom and 16.28 mm at the top, depth
+  17.7 mm; A1's centre 15.13 mm and 13.49 mm from the left and top edges;
+  footprint 127.76 × 85.48 mm (±0.2), height 19 mm (±0.15); flatness
+  "curvature 0.2" on top, +0.3/−0.1 mm at the bottom. The measured pitch
+  is 0.05 % (columns) and 0.36 % (rows) short of it.
 - useq's `24-well` has a 19.0 mm spacing, so `plate-walls` refused the
   plate at +2.7 % (F9, #400). At the 10× it found the walls of all three
   wells; at the 4× it took an edge 1.6 mm inside B5's wall (F7, #409).
@@ -775,7 +782,8 @@ nothing.
 
 - Why the 40× first lock from the floor went toward the sample at C3, and
   whether it touched the plate (#402).
-- The plate's Greiner reference (#400).
+- Which definition the plate gets: the measured 19.45 mm or the maker's
+  19.5 mm (#400), and the plate's 180° on the stage (#414).
 - The page's STOP during a drive and during Live (#333), the chain on a
   registered plate (scan, cells, route), the objective offsets (#380),
   the NIS export (#198); a plate with cells at the 40× (#342).
