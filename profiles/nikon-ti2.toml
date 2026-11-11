@@ -128,6 +128,16 @@ settle_tolerance_um = 0.5
 # z_offset_um = 0.0
 # measured = "YYYY-MM-DD, session 3 (#issue)"
 
+[holder]
+# Where the holder puts a plate: the stage XY of the centre of the plate's grid of wells, seated in
+# its holder (m5 §15 D2, #410). The plate page draws its map from it before any registration, labelled
+# "estimated"; it is an estimate, never a registration, and no tool reads it. One point serves every
+# SBS plate the holder takes, and a plate turned 180 deg lands on itself. Measured from the Greiner
+# 24-well's registered wells: (543, -313) um in session 2 and (258, -336) um in session 3 (the plate
+# was taken off and put back between them: 285 um apart in X); the mean is entered, to 5 um.
+plate_centre_xy_um = [400.0, -325.0]
+measured = "2026-11-10, sessions 2 and 3 (#334, #405): the Greiner 24-well's centre was (543, -313) and (258, -336) um; their mean to 5 um"
+
 [quirks]
 # The direction of Z is known (#98, session 3): a falling Z lowers the nosepiece, away from the
 # sample; it is `[safety] z_away_from_sample`.

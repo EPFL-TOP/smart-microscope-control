@@ -38,6 +38,7 @@ else:  # pragma: no cover - exercised on the 3.10 CI job
     import tomli as tomllib
 
 __all__ = [
+    "MAX_HOLDER_CENTRE_UM",
     "MAX_SAMPLE_CELLS",
     "MAX_XY_OFFSET_UM",
     "MAX_Z_OFFSET_UM",
@@ -45,6 +46,7 @@ __all__ = [
     "AutofocusSection",
     "CameraSection",
     "ChannelsSection",
+    "HolderSection",
     "LightSourceSection",
     "MicroManagerSection",
     "MicroscopeSection",
@@ -99,6 +101,10 @@ _MIN_CELL_RADIUS_UM = 1e-6
 #: guards, not measurements (m2 §13.3).
 MAX_XY_OFFSET_UM = 1000.0
 MAX_Z_OFFSET_UM = 500.0
+#: How far from the stage origin a plate holder's centre may lie, in µm. A stage is
+#: not longer than this (the Ti2-E travels ±29 000 µm), so a larger value is a unit
+#: mistake (mm for µm), not a measurement (m5 §15 D2).
+MAX_HOLDER_CENTRE_UM = 150_000.0
 
 
 def _no_boolean(name: str, value: Any) -> Any:
@@ -723,6 +729,65 @@ class ObjectivesSection(_Section):
         )
 
 
+class HolderSection(_Section):
+    """Where this stand's plate holder puts a plate: one point, an estimate (m5 §15 D2).
+
+    A plate seated in its holder hardly moves, so the stage's XY already says roughly
+    where one is on the plate before any registration. The point is the centre of a
+    plate's *grid of wells*: an SBS plate's grid is centred on its footprint, so the one
+    point serves every SBS plate the holder takes, and a plate turned 180° lands on
+    itself. It is **never a registration**: it is read by the map to draw an estimate
+    and labelled so, and it fills no slot and feeds no tool. Unset, the map says that
+    the stand does not say where its plate lies.
+    """
+
+    #: Stage XY, in µm, of the centre of a plate's grid of wells, as
+    #: ``XYStage.position_um()`` reads it.
+    plate_centre_xy_um: tuple[float, float] | None = None
+    #: When and in which session, as an objective's offset says it (m2 §13.3).
+    measured: str = ""
+
+    @field_validator("plate_centre_xy_um", mode="before")
+    @classmethod
+    def _centre_is_two_numbers(cls, value: Any) -> Any:
+        if isinstance(value, (list, tuple)):
+            if len(value) != 2:
+                raise ValueError(
+                    "plate_centre_xy_um must be exactly two numbers, [x, y] in µm; "
+                    f"got {len(value)}: {list(value)}"
+                )
+            for number in value:
+                # pydantic reads `true` as 1.0 µm, a plausible position (FM-104).
+                _no_boolean("each number of plate_centre_xy_um", number)
+        return value
+
+    @field_validator("plate_centre_xy_um")
+    @classmethod
+    def _centre_finite_and_bounded(
+        cls, value: tuple[float, float] | None
+    ) -> tuple[float, float] | None:
+        if value is not None and not all(
+            math.isfinite(number) and abs(number) <= MAX_HOLDER_CENTRE_UM
+            for number in value
+        ):
+            raise ValueError(
+                f"plate_centre_xy_um must be two finite numbers of µm, each within "
+                f"±{MAX_HOLDER_CENTRE_UM:g}: a stage is not longer, and a larger "
+                f"value is a unit mistake; got {list(value)}"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _a_value_needs_its_provenance(self) -> HolderSection:
+        if self.plate_centre_xy_um is not None and not self.measured.strip():
+            raise ValueError(
+                "plate_centre_xy_um needs measured = "
+                '"<date>, session N (#issue): how it was measured": a plate '
+                "position with no date and session is a guess"
+            )
+        return self
+
+
 class SampleSection(_Section):
     """The synthetic plate a demo stand's camera images (m1 §8, "The demo-sample stand").
 
@@ -1009,6 +1074,8 @@ class Profile(_Section):
     light_source: LightSourceSection = Field(default_factory=LightSourceSection)
     channels: ChannelsSection = Field(default_factory=ChannelsSection)
     objectives: ObjectivesSection = Field(default_factory=ObjectivesSection)
+    #: Where the plate holder puts a plate, an estimate the map draws (m5 §15 D2).
+    holder: HolderSection = Field(default_factory=HolderSection)
     quirks: dict[str, Any] = Field(default_factory=dict)
     #: ``None`` on every stand but the demo-sample one. After ``micromanager``:
     #: ``_sample_only_on_the_demo`` reads it from ``info.data``.
