@@ -316,6 +316,46 @@ def test_a_residual_beyond_300_um_fails_and_names_the_well(
     assert result.residual_um == pytest.approx(298.4, abs=0.1)
 
 
+def test_a_centre_900_um_off_on_the_lab_plate_is_refused_and_named(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """Three wells check each other: one centre 900 µm off in X is refused and named (m5 §15 D7, #410).
+
+    The Greiner 24-well at 19.45 mm, A1 where the Ti2-E's holder puts it, (-48 225, 28 850) µm:
+    B3, B5 and C3 are written out from that pitch. The 900 µm is three times the 300 µm that
+    refuses a fit, and the other two centres exact, so the worst residual is B3's (572.8 µm,
+    against 351.5 for B5 and 247.2 for C3) and the message names it.
+    """
+    centres = {
+        "B3": (-9325.0, 9400.0),
+        "B5": (29575.0, 9400.0),
+        "C3": (-9325.0, -10050.0),
+    }
+
+    def refs(b3_x_error_um: float) -> list[dict[str, object]]:
+        return [
+            {
+                "well": well,
+                "x_um": x + (b3_x_error_um if well == "B3" else 0.0),
+                "y_um": y,
+            }
+            for well, (x, y) in centres.items()
+        ]
+
+    error = _refused(
+        demo_microscope, tmp_path, plate="greiner-24-well", refs=refs(900.0)
+    )
+    assert "B3 is 573 µm from where the others put it: centre it again" in str(error)
+
+    # Without the error the same three centres register the plate where they say it is.
+    result = _result(
+        _run(demo_microscope, tmp_path, plate="greiner-24-well", refs=refs(0.0))
+    )
+    assert result.a1_center_xy_um == pytest.approx((-48225.0, 28850.0), abs=1e-6)
+    assert result.method == "references"
+    assert result.n_refs == 3
+
+
 def test_a_well_given_twice_is_refused(
     demo_microscope: Microscope, tmp_path: Path
 ) -> None:

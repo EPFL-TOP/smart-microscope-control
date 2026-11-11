@@ -14,6 +14,7 @@ import os
 import re
 import statistics
 import time
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from importlib.metadata import EntryPoint
 from pathlib import Path
@@ -23,11 +24,12 @@ import pytest
 
 from smc.hardware import Microscope
 from smc.hardware.capabilities import ObjectiveTurret, XYStage, ZStage
+from smc.hardware.profile import HolderSection, Profile
 from smc.plugins.registry import GROUP
 from smc.plugins.slots import PlateResult
-from smc.run import StageRecord, StageStatus, write_stage
+from smc.run import RunDocument, StageRecord, StageStatus, write_stage
 from smc.ui import controller as controller_module
-from smc.ui.controller import PlatePage
+from smc.ui.controller import MapPose, PlatePage
 from smc.ui.frames import Frame
 
 pytestmark = [
@@ -325,5 +327,155 @@ def test_a_jog_during_live_on_the_demo_moves_the_stage_and_live_goes_on(
         page.live(False)
         assert page.join(10.0)
         assert not page.status().halted
+    finally:
+        page.close()
+
+
+# -- where the stage is on the plate, before any registration (m5 §15, #410) ------------
+
+REGISTRATION = EntryPoint(
+    name="plate-registration",
+    value="smc.plugins.plate_registration.plugin:PlateRegistrationPlugin",
+    group=GROUP,
+)
+HOLDER_CENTRE_UM = (400.0, -325.0)
+
+#: The Greiner 24-well at 19.45 mm with its A1 at (-48 225, 28 850) µm, where a holder
+#: centred at (400, -325) µm puts it: three wells written out from that pitch (FM-124).
+LAB_CENTRES_UM = {
+    "B3": (-9325.0, 9400.0),
+    "B5": (29575.0, 9400.0),
+    "C3": (-9325.0, -10050.0),
+}
+#: What an eye gives, per well: the three centres are off by these, in µm.
+BY_EYE_UM = {"B3": (100.0, -60.0), "B5": (-80.0, 90.0), "C3": (50.0, 110.0)}
+
+
+@pytest.fixture
+def holder_microscope(mm_available: bool) -> Iterator[Microscope]:
+    """The demo stand with a profile whose ``[holder]`` says where its plate lies."""
+    if not mm_available:
+        pytest.skip("Micro-Manager demo adapters not installed")
+    profile = Profile.demo().model_copy(
+        update={
+            "holder": HolderSection(
+                plate_centre_xy_um=HOLDER_CENTRE_UM,
+                measured="2026-11-10, sessions 2 and 3 (#334, #405)",
+            )
+        }
+    )
+    microscope = Microscope.open(profile, dry_run=False)
+    try:
+        yield microscope
+    finally:
+        microscope.close()
+
+
+def test_three_captured_centres_register_the_lab_plate_from_the_page(
+    holder_microscope: Microscope, tmp_path: Path
+) -> None:
+    run_doc = tmp_path / "run.json"
+    page = PlatePage(holder_microscope, run_doc, entry_points=[REGISTRATION])
+    try:
+        page.choose_plate("greiner-24-well")
+        assert page.view().pose.kind == "estimated"
+        stage = holder_microscope.require(XYStage)
+        for well, (x_um, y_um) in LAB_CENTRES_UM.items():
+            # The stage is centred by eye on the well of a plate lying where the holder says.
+            error = BY_EYE_UM[well]
+            stage.move_to_um(x_um + error[0], y_um + error[1])
+            stage.wait(10.0)
+            page.capture_centre(well)
+        assert [r.well for r in page.refs] == ["B3", "B5", "C3"]
+
+        # The page's own pairs: the plate and the three centres it recorded.
+        page.run("plate-registration", page.page_params("plate-registration"))
+        assert page.join(30.0)
+        record = RunDocument.load(run_doc).stages["plate-registration"]
+
+        assert record.status is StageStatus.done, record.error
+        assert record.result is not None
+        plate = PlateResult.model_validate(record.result)
+        assert plate.method == "references"
+        assert plate.n_refs == 3
+        assert plate.plate == "greiner-24-well"
+        # Three centres off by about a hundred µm: a residual of 121.6 µm, below the
+        # 300 µm that refuses a fit, and A1 within 55 µm of where the holder put it.
+        assert plate.residual_um == pytest.approx(121.6, abs=0.5)
+        assert math.dist(plate.a1_center_xy_um, (-48225.0, 28850.0)) < 55.0
+        # The page's map is the registered plate's now, and says so.
+        assert page.view().pose == MapPose("registered")
+    finally:
+        page.close()
+
+
+def test_a_drive_click_on_an_estimated_map_moves_nothing(
+    holder_microscope: Microscope, tmp_path: Path
+) -> None:
+    # The estimate is drawn and never acted on (m5 §15 D6): `goto-well` reads the run
+    # document's plate, and there is none, so a drive click on the well the map shows
+    # ends with that refusal and the stage stays where it was.
+    page = PlatePage(holder_microscope, tmp_path / "run.json", entry_points=[GOTO_WELL])
+    try:
+        page.choose_plate("96-well")
+        view = page.view()
+        assert view.pose.kind == "estimated"
+        b2 = next(w.center_um for w in view.wells if w.well == "B2")
+        stage = holder_microscope.require(XYStage)
+        before = stage.position_um()
+
+        assert page.click(*b2, drive=True) == "B2"
+        assert page.join(30.0)
+
+        outcome = page.status().outcome
+        assert outcome is not None
+        assert "goto-well reads plate, but the run document has no plate" in outcome
+        after = stage.position_um()
+        assert (after.x_um, after.y_um) == (before.x_um, before.y_um)
+    finally:
+        page.close()
+
+
+def test_the_cross_follows_the_demo_stage_in_live_and_after_a_drive(
+    holder_microscope: Microscope, tmp_path: Path
+) -> None:
+    if os.environ.get("SMC_REQUIRE_UI"):
+        import panel  # noqa: F401  (CI must fail, not skip, when the extra is missing)
+    else:
+        pytest.importorskip("panel")
+    from smc.ui.plate_page import PlatePageView
+
+    page = PlatePage(holder_microscope, tmp_path / "run.json", entry_points=[GOTO_WELL])
+    try:
+        view = PlatePageView(page)
+        page.live(True)
+        deadline = time.monotonic() + 10.0
+        while page.frame() is None:
+            assert time.monotonic() < deadline, page.status().outcome
+            time.sleep(0.005)
+        # A jog during Live: a frame taken after it carries where the stage went.
+        page.jog_xy(100.0, 0.0)
+        _wait_for_outcome(page, "stage jog: ")
+        at_jog = page.frame()
+        assert at_jog is not None
+        deadline = time.monotonic() + 10.0
+        while (frame := page.frame()) is None or frame.number <= at_jog.number:
+            assert time.monotonic() < deadline, page.status().outcome
+            time.sleep(0.005)
+        view.frame_tick()
+        assert page.is_live
+        assert list(view.stage_source.data["x"]) == pytest.approx([100.0], abs=0.5)
+        assert list(view.stage_source.data["y"]) == pytest.approx([0.0], abs=0.5)
+        page.live(False)
+        assert page.join(10.0)
+
+        # Live is over: a drive moves the stage and the next tick draws it there.
+        page.jog_xy(0.0, 50.0)
+        assert page.join(10.0)
+        view.tick()
+        assert list(view.stage_source.data["x"]) == pytest.approx([100.0], abs=0.5)
+        assert list(view.stage_source.data["y"]) == pytest.approx([50.0], abs=0.5)
+        # It is on the estimated map, so the label says what it rests on.
+        assert len(view.stage_source.data["text"]) == 1
     finally:
         page.close()
