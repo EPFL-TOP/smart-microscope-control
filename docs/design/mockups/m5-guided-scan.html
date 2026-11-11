@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Guided scan mock-up</title>
+<!--
+  m5 §17 (#431): a static mock-up of the plate page as one guided scan, for the owner to
+  decide on before any code. It is not the page: nothing here talks to a stand. Every
+  region maps to a Panel object named in m5 §17 (the strip, the stepper, the step panel,
+  the map and the image, the drive bar). Open it in a browser; the stepper and the
+  "Expert view" switch work, everything else is drawn.
+-->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono&display=swap" rel="stylesheet">
+<style>
+:root {
+  --ink: #17202b; --ink-2: #4a5663; --ink-3: #7b8692;
+  --canvas: #eef1f4; --surface: #ffffff; --rule: #d5dbe1;
+  --primary: #2457a6; --primary-ink: #ffffff; --primary-soft: #e3ecf8;
+  --done: #2e7d4f; --assumed: #9a5a00; --assumed-soft: #fbf1e1;
+  --stop: #c62828; --well: #f3f4f6; --well-rim: #9aa3ad;
+  --strip-h: 52px; --stepper-h: 64px;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: var(--canvas); color: var(--ink);
+  font: 14px/1.45 "IBM Plex Sans", system-ui, sans-serif;
+  font-variant-numeric: tabular-nums;
+  display: grid; grid-template-rows: var(--strip-h) var(--stepper-h) 1fr; min-width: 1280px;
+}
+button { font: inherit; cursor: pointer; }
+:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+
+/* The strip: always on screen (ADR-0006 principle 4). */
+.strip { display: flex; align-items: center; gap: 18px; padding: 0 16px; background: var(--ink); color: #e9edf1; }
+.strip .stand { font-weight: 600; }
+.strip .fact { color: #c3ccd5; }
+.strip .fact b { color: #fff; font-weight: 500; }
+.strip .badge { border: 1px solid #e0a54a; color: #f2c27a; padding: 1px 8px; border-radius: 3px; font-size: 12px; }
+.strip .activity { margin-left: auto; color: #fff; }
+.strip .stop { background: var(--stop); color: #fff; border: 0; border-radius: 4px; padding: 0 28px; height: 38px; font-weight: 600; letter-spacing: .02em; }
+
+/* The stepper: five steps, each with its state and what it holds. */
+.stepper { display: flex; align-items: stretch; background: var(--surface); border-bottom: 1px solid var(--rule); padding: 0 8px; }
+.step { flex: 1; display: flex; gap: 10px; align-items: center; padding: 8px 12px; border: 0; background: none; text-align: left; border-bottom: 3px solid transparent; color: var(--ink-2); }
+.step .n { width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center; border: 1.5px solid var(--ink-3); font-size: 12px; flex: none; }
+.step .t { font-weight: 600; color: var(--ink); display: block; }
+.step .s { font-size: 12px; display: block; color: var(--ink-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 190px; }
+.step.done .n { background: var(--done); border-color: var(--done); color: #fff; }
+.step.current { border-bottom-color: var(--primary); }
+.step.current .n { background: var(--primary); border-color: var(--primary); color: #fff; }
+.expert { display: flex; align-items: center; gap: 8px; padding: 0 12px; color: var(--ink-2); border-left: 1px solid var(--rule); }
+.switch { width: 34px; height: 18px; border-radius: 9px; background: var(--rule); position: relative; border: 0; }
+.switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: #fff; transition: left .12s; }
+.switch[aria-checked="true"] { background: var(--primary); }
+.switch[aria-checked="true"]::after { left: 18px; }
+
+/* The body: the step panel on the left, the map and the image share the centre. */
+.body { display: grid; grid-template-columns: 360px 1fr; min-height: 0; }
+.panel { background: var(--surface); border-right: 1px solid var(--rule); padding: 18px 18px 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
+.panel h1 { font-size: 19px; font-weight: 600; margin: 0; line-height: 1.25; }
+.panel .lead { color: var(--ink-2); margin: -6px 0 0; }
+.field label { display: block; font-size: 12px; color: var(--ink-2); margin-bottom: 3px; }
+.field .ctl { border: 1px solid var(--rule); border-radius: 4px; padding: 6px 9px; background: #fff; display: flex; justify-content: space-between; align-items: center; }
+.field .from { font-size: 12px; color: var(--ink-3); margin-top: 2px; }
+.from.assumed { color: var(--assumed); }
+.known { display: grid; grid-template-columns: auto 1fr; gap: 3px 12px; font-size: 13px; padding: 10px 12px; background: var(--canvas); border-radius: 4px; }
+.known dt { color: var(--ink-2); } .known dd { margin: 0; }
+.primary { background: var(--primary); color: var(--primary-ink); border: 0; border-radius: 4px; padding: 10px 14px; font-weight: 600; width: 100%; }
+.primary[disabled] { background: var(--primary-soft); color: var(--ink-3); cursor: not-allowed; }
+.secondary { background: #fff; border: 1px solid var(--rule); border-radius: 4px; padding: 6px 10px; }
+.why { color: var(--assumed); font-size: 13px; margin-top: -8px; }
+.result { border-left: 3px solid var(--done); padding: 6px 10px; background: #f4f9f6; font-size: 13px; }
+.result.assumed { border-left-color: var(--assumed); background: var(--assumed-soft); }
+details { font-size: 13px; color: var(--ink-2); border-top: 1px solid var(--rule); padding-top: 8px; }
+details summary { cursor: pointer; }
+details pre { font: 12px/1.4 "IBM Plex Mono", monospace; white-space: pre-wrap; word-break: break-all; background: var(--canvas); padding: 8px; border-radius: 4px; color: var(--ink); }
+.centres { display: flex; flex-direction: column; gap: 6px; }
+.centre { display: grid; grid-template-columns: 34px 1fr auto; align-items: center; gap: 8px; padding: 6px 8px; border: 1px solid var(--rule); border-radius: 4px; }
+.centre .w { font-weight: 600; }
+.centre .st { font-size: 12px; color: var(--ink-3); }
+.centre.ok { border-color: #b9d8c5; } .centre.ok .st { color: var(--done); }
+.centre.now { border-color: var(--primary); box-shadow: inset 3px 0 0 var(--primary); }
+.rows { display: flex; flex-direction: column; gap: 6px; }
+.row { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; padding: 7px 10px; border: 1px solid var(--rule); border-radius: 4px; }
+.row .st { font-size: 12px; color: var(--ink-3); display: block; }
+.row.ok .st { color: var(--done); }
+.progress { height: 8px; border-radius: 4px; background: var(--canvas); overflow: hidden; }
+.progress i { display: block; height: 100%; width: 43%; background: var(--primary); }
+.spacer { flex: 1; }
+.tools-group { font-weight: 600; margin: 4px 0 -6px; }
+.tool { border: 1px solid var(--rule); border-radius: 4px; padding: 8px 10px; display: flex; justify-content: space-between; align-items: center; }
+.tool small { color: var(--ink-3); display: block; }
+
+.centre-area { display: grid; grid-template-columns: 1.3fr 1fr; gap: 12px; padding: 12px; min-height: 0; }
+.view { background: var(--surface); border: 1px solid var(--rule); border-radius: 4px; display: flex; flex-direction: column; min-height: 0; }
+.view header { padding: 8px 12px; border-bottom: 1px solid var(--rule); display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.view header b { font-weight: 600; }
+.view header span { font-size: 12px; color: var(--ink-2); }
+.view .fig { flex: 1; display: grid; place-items: center; min-height: 0; padding: 6px; }
+.view .fig svg { width: 100%; height: 100%; }
+.drive { display: flex; gap: 6px; align-items: center; padding: 8px 10px; border-top: 1px solid var(--rule); flex-wrap: wrap; font-size: 13px; }
+.drive .secondary { padding: 4px 9px; }
+.drive .sep { width: 1px; height: 20px; background: var(--rule); margin: 0 4px; }
+.legend { font-size: 12px; color: var(--ink-2); padding: 6px 12px; border-top: 1px solid var(--rule); display: flex; gap: 14px; flex-wrap: wrap; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+
+<header class="strip" role="status">
+  <span class="stand">demo-sample</span>
+  <span class="fact">XY <b>1 250.0, -3 400.0</b> µm</span>
+  <span class="fact">Z <b>4 003.3</b> µm</span>
+  <span class="fact"><b>10× S Fluor</b></span>
+  <span class="fact">autofocus <b>off</b></span>
+  <span class="fact">light <b>on</b></span>
+  <span class="badge" title="The page sends no move to the stage">dry run</span>
+  <span class="activity" id="activity">Idle</span>
+  <button class="stop">STOP</button>
+</header>
+
+<nav class="stepper" aria-label="Steps of the scan">
+  <button class="step" data-step="1"><span class="n">1</span><span><span class="t">Stand</span><span class="s" data-sum="1"></span></span></button>
+  <button class="step" data-step="2"><span class="n">2</span><span><span class="t">Plate</span><span class="s" data-sum="2"></span></span></button>
+  <button class="step" data-step="3"><span class="n">3</span><span><span class="t">Wells</span><span class="s" data-sum="3"></span></span></button>
+  <button class="step" data-step="4"><span class="n">4</span><span><span class="t">Scan</span><span class="s" data-sum="4"></span></span></button>
+  <button class="step" data-step="5"><span class="n">5</span><span><span class="t">Results</span><span class="s" data-sum="5"></span></span></button>
+  <div class="expert">Expert view <button class="switch" id="expert" role="switch" aria-checked="false" aria-label="Expert view"></button></div>
+</nav>
+
+<main class="body">
+  <section class="panel" id="panel"></section>
+  <section class="centre-area">
+    <article class="view">
+      <header><b>Plate</b><span id="map-title"></span></header>
+      <div class="fig"><svg id="map" viewBox="-6 -10 132 96" preserveAspectRatio="xMidYMid meet"></svg></div>
+      <div class="legend" id="map-legend"></div>
+    </article>
+    <article class="view">
+      <header><b>Image</b><span id="img-title">512 × 512, 10 ms, 0.65 µm/px</span></header>
+      <div class="fig"><svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet">
+        <defs><radialGradient id="cell"><stop offset="0" stop-color="#e6f5ea"/><stop offset="1" stop-color="#e6f5ea" stop-opacity="0"/></radialGradient></defs>
+        <rect width="100" height="100" fill="#1a1d21"/>
+        <g fill="url(#cell)"><circle cx="22" cy="30" r="4"/><circle cx="61" cy="18" r="3.5"/><circle cx="74" cy="66" r="4.5"/><circle cx="35" cy="72" r="3"/><circle cx="48" cy="45" r="3.8"/><circle cx="85" cy="35" r="3"/><circle cx="12" cy="84" r="3.4"/></g>
+        <g stroke="#ffffff88" stroke-width=".3"><line x1="50" y1="46" x2="50" y2="54"/><line x1="46" y1="50" x2="54" y2="50"/></g>
+        <text x="50" y="4" fill="#c3ccd5" font-size="3" text-anchor="middle">top of the image</text>
+      </svg></div>
+      <div class="drive" aria-label="Drive">
+        <button class="secondary">Live</button><button class="secondary">Snap</button>
+        <span class="sep"></span>
+        <button class="secondary" title="Move the image left">←</button><button class="secondary">↑</button><button class="secondary">↓</button><button class="secondary">→</button>
+        <span>100 µm</span>
+        <span class="sep"></span>
+        <button class="secondary">Z+</button><button class="secondary">Z−</button><span>1 µm</span>
+        <span class="sep"></span>
+        <button class="secondary">Autofocus</button>
+        <button class="secondary">10× ▾</button>
+        <button class="secondary">Light</button>
+      </div>
+    </article>
+  </section>
+</main>
+
+<script>
+const COMMAND = (tool, extra) => `smc run ${tool} -p profiles/demo-sample.toml --run-doc run.json --dry-run ${extra}`;
+const SUMMARY = {1: "demo-sample, preset weekly", 2: "96-well, registered", 3: "B2, B11: 72 fields", 4: "72 frames", 5: "density, route"};
+let current = 3;          // the step the page opens on once a plate is registered (§17 D3)
+
+const SCREENS = {
+1: () => `
+  <h1>Which stand, and which preset?</h1>
+  <p class="lead">The preset fills in the plate, the scan's coverage and the cell detector. You can change any of them later.</p>
+  <div class="field"><label>Stand</label><div class="ctl">demo-sample <span>connected</span></div>
+    <div class="from">from the command that started this page</div></div>
+  <div class="field"><label>Preset</label><div class="ctl">weekly <span>▾</span></div>
+    <div class="from">saved 2026-11-03: 96-well, coverage 0.4, detector blobs</div></div>
+  <dl class="known">
+    <dt>Objective</dt><dd>10× S Fluor, in place</dd>
+    <dt>Camera</dt><dd>calibrated at 10× on 2026-11-09</dd>
+    <dt>Light path</dt><dd>to the camera</dd>
+  </dl>
+  <button class="primary">Load the preset</button>
+  <div class="spacer"></div>
+  <details><summary>Command</summary><pre>smc presets show weekly</pre></details>`,
+2: () => `
+  <h1>Where is the plate?</h1>
+  <p class="lead">Centre three wells far apart by eye, with Live and the arrows, and capture each centre.</p>
+  <div class="field"><label>Plate</label><div class="ctl">96-well <span>▾</span></div><div class="from">from the preset weekly</div></div>
+  <div class="field"><label>Plate lies</label><div class="ctl">A1 at the back left <span>▾</span></div><div class="from">as the stand's holder holds it</div></div>
+  <div class="centres">
+    <div class="centre ok"><span class="w">A1</span><span class="st">captured at (-49 512, 31 488) µm</span><button class="secondary">Redo</button></div>
+    <div class="centre ok"><span class="w">A12</span><span class="st">captured at (49 470, 31 530) µm</span><button class="secondary">Redo</button></div>
+    <div class="centre now"><span class="w">H1</span><span class="st">go there, centre it, capture</span><button class="secondary">Go to H1</button></div>
+  </div>
+  <button class="secondary">Capture the centre of H1</button>
+  <button class="primary" disabled>Register the plate</button>
+  <div class="why">Capture H1 first: three centres fit the plate's turn and pitch.</div>
+  <div class="spacer"></div>
+  <details><summary>Other ways to register</summary><p>From the walls of 2–3 wells (slower, finds the well size too), or automatically (surveys the plate, about 7 minutes). In the expert view.</p></details>
+  <details><summary>Command</summary><pre>${COMMAND("plate-registration", "--param plate=96-well --param 'refs=[...]' --param orientation=not-turned")}</pre></details>`,
+3: () => `
+  <h1>Which wells?</h1>
+  <p class="lead">Click wells on the map, or type them. The map shows the fields and the time it will take.</p>
+  <div class="field"><label>Wells</label><div class="ctl">B2, B11 <span></span></div><div class="from">A1:D6, C*, all</div></div>
+  <div class="field"><label>Coverage of each well</label><div class="ctl">0.4 <span></span></div><div class="from">from the preset weekly</div></div>
+  <div class="field"><label>Autofocus during the scan</label><div class="ctl">if engaged <span>▾</span></div><div class="from">the profile's default</div></div>
+  <dl class="known"><dt>Objective</dt><dd>10× S Fluor, in place</dd><dt>Fields</dt><dd>72: a grid of 6 × 6 in each well</dd><dt>Time</dt><dd>about 3 min 20 s</dd></dl>
+  <div class="result assumed">Time assumed: no timing measured on this stand. Measure it in the expert view.</div>
+  <button class="primary">Lay out the fields</button>
+  <div class="spacer"></div>
+  <details><summary>More choices</summary><p>Overlap, field order, the objective's field of view: scan-plan's advanced fields.</p></details>
+  <details><summary>Command</summary><pre>${COMMAND("scan-plan", "--param wells=B2,B11 --param coverage=0.4")}</pre></details>`,
+4: () => `
+  <h1>Scan B2 and B11</h1>
+  <p class="lead">72 fields at 10×. STOP, at the top right, ends the scan after the field in progress.</p>
+  <button class="primary" disabled>Scanning…</button>
+  <div class="progress" aria-label="31 of 72 fields"><i></i></div>
+  <dl class="known"><dt>Field</dt><dd>31 of 72, in B2</dd><dt>Elapsed</dt><dd>1 min 25 s</dd><dt>Left</dt><dd>about 1 min 55 s</dd><dt>Saved to</dt><dd>scan/ddb1f68d/</dd></dl>
+  <div class="spacer"></div>
+  <details><summary>Command</summary><pre>${COMMAND("scan", "")}</pre></details>`,
+5: () => `
+  <h1>Results</h1>
+  <p class="lead">Each step reads the one before. Run the next one, or all that are left.</p>
+  <div class="rows">
+    <div class="row ok"><span>Count the cells<span class="st">done: 2 classes, 1 812 cells (blobs)</span></span><button class="secondary">Again</button></div>
+    <div class="row ok"><span>Density per well<span class="st">done: on the map</span></span><button class="secondary">Again</button></div>
+    <div class="row"><span>Route through the densest fields<span class="st">10 fields per well, class single</span></span><button class="primary" style="width:auto">Run</button></div>
+    <div class="row"><span>Report<span class="st">after the route</span></span><button class="secondary" disabled>Run</button></div>
+    <div class="row"><span>Export for NIS-Elements<span class="st">after the route</span></span><button class="secondary" disabled>Run</button></div>
+  </div>
+  <button class="secondary">Run all that are left</button>
+  <div class="result assumed">Cells counted with blobs: bright round spots, not a trained model.</div>
+  <div class="spacer"></div>
+  <details><summary>Where the files are</summary><pre>run.json
+cells/6ed1….json
+report.html (after Report)</pre></details>
+  <details><summary>Command</summary><pre>${COMMAND("route", "--param labels=single --param fields_per_well=10")}</pre></details>`,
+expert: () => `
+  <h1>Every tool</h1>
+  <p class="lead">Each tool's full form, in the order of the workflow. The steps above stay as they are.</p>
+  <div class="tools-group">Set up</div>
+  <div class="tool"><span>camera-calibration<small>pixel size, rotation, mirror</small></span><button class="secondary">Open</button></div>
+  <div class="tool"><span>plate-registration<small>from centres and walls</small></span><button class="secondary">Open</button></div>
+  <div class="tool"><span>plate-walls<small>from images of the walls</small></span><button class="secondary">Open</button></div>
+  <div class="tool"><span>plate-finding<small>survey the plate</small></span><button class="secondary">Open</button></div>
+  <div class="tool"><span>timing<small>moves, locks, snaps on this stand</small></span><button class="secondary">Open</button></div>
+  <div class="tools-group">Choose · Acquire · Find · Report</div>
+  <div class="tool"><span>scan-plan, scan, cells, density, route<small>as in the steps, every field shown</small></span><button class="secondary">Open</button></div>
+  <div class="tools-group">More</div>
+  <div class="tool"><span>focus-on-cells, goto-well, objective-offsets, plate-orientation, stage-report</span><button class="secondary">Open</button></div>`,
+};
+
+function well(r, c) { return {x: 10 + c * 9, y: 6 + r * 9}; }
+function drawMap(step) {
+  const rows = "ABCDEFGH";
+  const scanned = new Set(["B2", "B11"]);
+  const dens = {B2: "#3b528b", B11: "#fde725"};
+  let s = `<text x="60" y="-5" font-size="3" fill="#7b8692" text-anchor="middle">back of the stand</text>
+           <text x="60" y="83" font-size="3" fill="#7b8692" text-anchor="middle">front of the stand</text>`;
+  for (let r = 0; r < 8; r++) for (let c = 0; c < 12; c++) {
+    const name = rows[r] + (c + 1), p = well(r, c);
+    let fill = "var(--well)", stroke = "var(--well-rim)", sw = .25;
+    if (step >= 3 && scanned.has(name)) { stroke = "var(--primary)"; sw = .8; }
+    if (step === 5 && dens[name]) fill = dens[name];
+    if (step === 2 && ["A1", "A12", "H1"].includes(name)) { stroke = name === "H1" ? "var(--primary)" : "var(--done)"; sw = .9; }
+    s += `<circle cx="${p.x}" cy="${p.y}" r="3.6" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"/>`;
+    s += `<text x="${p.x}" y="${p.y + 1}" font-size="2.1" text-anchor="middle" fill="${step === 5 && name === "B2" ? "#fff" : "#4a5663"}" font-weight="${name === "A1" ? 700 : 400}">${name}</text>`;
+    if (step >= 3 && scanned.has(name)) for (let i = 0; i < 6; i++) for (let j = 0; j < 6; j++) {
+      const done = step === 4 && name === "B2" && i * 6 + j < 31;
+      s += `<rect x="${p.x - 2.4 + j * .8}" y="${p.y - 2.4 + i * .8}" width=".7" height=".7" fill="none" stroke="${done ? "var(--done)" : "var(--primary)"}" stroke-width=".12"/>`;
+    }
+    if (step === 5 && name === "B11") s += `<polyline points="${p.x - 2},${p.y - 2} ${p.x + 1},${p.y - 1.4} ${p.x - .6},${p.y + .8} ${p.x + 2},${p.y + 2}" fill="none" stroke="#c62828" stroke-width=".3"/>`;
+  }
+  const cross = step === 4 ? well(1, 1) : {x: 52, y: 37};
+  s += `<g stroke="var(--ink)" stroke-width=".45"><line x1="${cross.x - 3}" y1="${cross.y}" x2="${cross.x + 3}" y2="${cross.y}"/><line x1="${cross.x}" y1="${cross.y - 3}" x2="${cross.x}" y2="${cross.y + 3}"/></g>`;
+  document.getElementById("map").innerHTML = s;
+  document.getElementById("map-title").textContent = step === 1 ? "estimated from the stand's holder, not registered"
+    : step === 2 ? "estimated; registered once three centres are captured" : "registered, A1 at the back left";
+  const legend = {
+    1: `<span>+ the stage</span>`,
+    2: `<span><i style="border:1.5px solid var(--done)"></i>captured</span><span><i style="border:1.5px solid var(--primary)"></i>next</span><span>+ the stage</span>`,
+    3: `<span><i style="border:1.5px solid var(--primary)"></i>selected, with its fields</span><span>+ the stage</span>`,
+    4: `<span><i style="border:1.5px solid var(--done)"></i>field imaged</span><span><i style="border:1.5px solid var(--primary)"></i>to image</span><span>+ the stage</span>`,
+    5: `<span><i style="background:linear-gradient(90deg,#440154,#21918c,#fde725)"></i>cells of class single per mm², 0 to 1.6</span><span><i style="background:#c62828"></i>route</span>`,
+  }[step];
+  document.getElementById("map-legend").innerHTML = legend;
+}
+
+function show(step) {
+  current = step;
+  const expert = document.getElementById("expert").getAttribute("aria-checked") === "true";
+  document.getElementById("panel").innerHTML = SCREENS[expert ? "expert" : step]();
+  document.querySelectorAll(".step").forEach(b => {
+    const n = +b.dataset.step;
+    b.classList.toggle("current", n === step && !expert);
+    b.classList.toggle("done", n < step);
+    b.setAttribute("aria-current", n === step ? "step" : "false");
+  });
+  document.querySelectorAll("[data-sum]").forEach(e => {
+    const n = +e.dataset.sum;
+    const isDone = n < step;
+    e.textContent = isDone ? SUMMARY[n] : (n === step ? "now" : "");
+  });
+  document.getElementById("activity").textContent = step === 4 ? "scan: field 31 of 72, about 1 min 55 s left" : "Idle";
+  drawMap(step);
+}
+document.querySelectorAll(".step").forEach(b => b.addEventListener("click", () => show(+b.dataset.step)));
+document.getElementById("expert").addEventListener("click", e => {
+  const on = e.currentTarget.getAttribute("aria-checked") !== "true";
+  e.currentTarget.setAttribute("aria-checked", String(on));
+  show(current);
+});
+show(current);
+</script>
+</body>
+</html>
