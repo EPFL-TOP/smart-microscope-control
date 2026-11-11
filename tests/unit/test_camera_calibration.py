@@ -19,12 +19,18 @@ from hypothesis import strategies as st
 
 from smc.plugins.camera_calibration import algorithm
 from smc.plugins.camera_calibration.algorithm import (
+    MAX_RESIDUAL_SHARE,
     MIN_RESPONSE,
+    MIN_SIGNAL_SPREAD_COUNTS,
+    SMALL_STEP_FRACTION,
     UPSAMPLE,
     Fit,
     Shift,
+    carries_signal,
     fit,
     measure_shift,
+    precision_reasons,
+    signal_spread,
 )
 from smc.plugins.geometry import Matrix2
 from smc.testing.synthetic import PlateSample
@@ -600,3 +606,149 @@ def test_a_step_that_is_not_finite_and_positive_is_refused(step_um: float) -> No
     shift = Shift(1.0, 0.0, 1.0)
     with pytest.raises(ValueError, match="step_um"):
         fit(shift, shift, step_um=step_um, image_shape_px=SHAPE)
+
+
+# -- a frame with no signal (#408, F8): the light is off the camera's path
+
+
+def _dark_frame(*, hot_pixel: bool = False) -> np.ndarray:
+    """What the Prime 95B gave with no light on it (session 2's ``smc snap``).
+
+    Measured on the two real frames: mean 100.5, standard deviation 2.3, so
+    95 to 106 between the 1st and the 99th percentile; a column pattern is
+    added, since the fixed pattern is what made the dark frames correlate well
+    at a zero shift. One pixel at 65535 stands for a hot or stuck pixel.
+    """
+    rng = np.random.default_rng(408)
+    frame = 100.5 + rng.normal(0.0, 2.3, SHAPE) + rng.normal(0.0, 1.0, SHAPE[1])
+    frame = np.rint(frame).astype(np.uint16)
+    if hot_pixel:
+        frame[10, 20] = 65535
+    return frame
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        _dark_frame(),
+        _dark_frame(hot_pixel=True),
+        np.full(SHAPE, 65535, dtype=np.uint16),
+        np.zeros(SHAPE, dtype=np.uint16),
+    ],
+    ids=["dark", "dark-with-a-hot-pixel", "saturated", "zero"],
+)
+def test_a_measured_dark_frame_carries_no_signal(frame: np.ndarray) -> None:
+    """The hot pixel makes ``max - min`` 65000: only the percentiles see a dark frame."""
+    assert signal_spread(frame) < MIN_SIGNAL_SPREAD_COUNTS
+    assert not carries_signal(frame)
+
+
+def test_a_frame_with_a_sample_carries_signal() -> None:
+    """The synthetic plate, and a frame spanning 177 counts: the dimmest lit one of 200 real frames."""
+    rendered = PlateSample().render(0.0, 0.0, 0.0, shape=SHAPE, pixel_size_um=1.0)
+    dimmest = np.linspace(1000.0, 1000.0 + 177.0 / 0.98, SHAPE[0] * SHAPE[1])
+
+    assert carries_signal(rendered)
+    assert carries_signal(dimmest.reshape(SHAPE))
+    assert signal_spread(dimmest.reshape(SHAPE)) == pytest.approx(177.0, rel=1e-3)
+
+
+@pytest.mark.parametrize(
+    ("scale", "expected"), [(0.9, False), (1.1, True)], ids=["under", "over"]
+)
+def test_the_signal_floor_is_decided_at_fifty_counts(
+    scale: float, expected: bool
+) -> None:
+    """A ramp has a known spread; 0.9 and 1.1 times the floor, away from the boundary."""
+    ramp = np.linspace(0.0, 1.0, SHAPE[0] * SHAPE[1]).reshape(SHAPE)
+    frame = 1000.0 + ramp * (scale * MIN_SIGNAL_SPREAD_COUNTS / 0.98)
+
+    assert signal_spread(frame) == pytest.approx(scale * MIN_SIGNAL_SPREAD_COUNTS)
+    assert carries_signal(frame) is expected
+
+
+def test_the_floor_is_the_one_the_measurements_give() -> None:
+    """Real dark frames span 11 counts and the dimmest lit one 177: 50 sits between, 4 and 3.5 times away."""
+    assert 4.0 * 11.0 < MIN_SIGNAL_SPREAD_COUNTS < 177.0 / 3.0
+
+
+@pytest.mark.parametrize("dtype", [np.uint16, np.float32, np.float64])
+def test_the_signal_does_not_depend_on_the_frames_dtype(dtype: type) -> None:
+    frame = np.where(np.arange(SHAPE[0] * SHAPE[1]).reshape(SHAPE) % 2, 140, 100)
+
+    assert signal_spread(frame.astype(dtype)) == pytest.approx(40.0)
+
+
+def test_a_frame_that_is_not_2d_or_not_finite_has_no_signal_to_measure() -> None:
+    with pytest.raises(ValueError, match="2-D"):
+        signal_spread(np.zeros((4, 4, 3)))
+    with pytest.raises(ValueError, match="not finite"):
+        signal_spread(np.full(SHAPE, np.nan))
+
+
+# -- a probe that fits poorly (#408, F6): 50 µm at the 4x is 18 px
+
+
+def _fit_with(pixel_size_um: float, residual_um: float) -> Fit:
+    """A trustworthy fit of a camera at 177.4 degrees, as session 3 measured, with this residual."""
+    return Fit(
+        _matrix(pixel_size_um, 177.437, False),
+        pixel_size_um,
+        177.437,
+        False,
+        residual_um,
+        (),
+    )
+
+
+@pytest.mark.parametrize(
+    ("step_um", "pixel_size_um", "residual_um", "reasons"),
+    [
+        # Session 3, the 4x with no pixel size known: 18 px, 21 % of the step.
+        (50.0, 2.74526, 10.6551, ("18 px, under a tenth of the 1412 px frame", "21 %")),
+        # The three fits that were good: 329, 311 and 362 px; 0.1, 0.2 and 0.5 %.
+        (900.0, 2.73909, 0.894, ()),
+        (350.0, 1.12447, 0.642, ()),
+        (100.0, 0.276136, 0.535, ()),
+    ],
+    ids=["4x-fallback", "4x-900um", "10x-350um", "40x-100um"],
+)
+def test_session_three_s_fits_are_judged_as_they_were_measured(
+    step_um: float,
+    pixel_size_um: float,
+    residual_um: float,
+    reasons: tuple[str, ...],
+) -> None:
+    found = precision_reasons(
+        _fit_with(pixel_size_um, residual_um), step_um, (1412, 1412)
+    )
+
+    assert len(found) == len(reasons)
+    for expected, reason in zip(reasons, found, strict=True):
+        assert expected in reason
+
+
+@pytest.mark.parametrize(
+    ("step_px", "residual_share", "expect_small", "expect_residual"),
+    [
+        (0.9 * SMALL_STEP_FRACTION * SHAPE[0], 0.0, True, False),
+        (1.1 * SMALL_STEP_FRACTION * SHAPE[0], 0.0, False, False),
+        (100.0, 0.8 * MAX_RESIDUAL_SHARE, False, False),
+        (100.0, 1.2 * MAX_RESIDUAL_SHARE, False, True),
+        (0.9 * SMALL_STEP_FRACTION * SHAPE[0], 1.2 * MAX_RESIDUAL_SHARE, True, True),
+    ],
+    ids=["under-a-tenth", "over-a-tenth", "4-percent", "6-percent", "both"],
+)
+def test_the_precision_rules_are_decided_at_a_tenth_of_the_frame_and_five_percent_of_the_step(
+    step_px: float, residual_share: float, expect_small: bool, expect_residual: bool
+) -> None:
+    """The smaller side of a 384 x 512 frame, not the larger one (FM-73): a tenth is 38.4 px."""
+    pixel_size_um = 2.0
+    step_um = step_px * pixel_size_um
+    found = precision_reasons(
+        _fit_with(pixel_size_um, residual_share * step_um), step_um, SHAPE
+    )
+
+    assert any("under a tenth of the 384 px frame" in r for r in found) is expect_small
+    assert any("of the step" in r for r in found) is expect_residual
+    assert len(found) == int(expect_small) + int(expect_residual)
