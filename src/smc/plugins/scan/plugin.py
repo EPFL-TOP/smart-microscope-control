@@ -20,6 +20,13 @@ keep a night's scan from producing frames nobody can trust:
   engaged again once per field, and so is the scan's own failed engage (one
   that raised too, FM-129); one the operator switched off is not, and its
   fields are counted as unlocked.
+* **PFS never crosses a well's wall locked** (#416). Locked over a wall, it
+  follows its reference to the plane its offset names in the next well, with
+  no guard: before every well's first field the scan switches an engaged
+  autofocus off and reads it back off, and that field engages it again under
+  the layer's bound. A switch-off that cannot be made or read back ends the
+  scan before anything moves to the well; a relock that moves Z out of its
+  bound ends it too (the layer forgot the offset), with the wells done kept.
 * **A move that returned is not a move that arrived** (FM-167). The readback is
   compared with the target, on both axes, before the autofocus, Z or the
   camera are touched: a field that landed off target is a failed field, not a
@@ -62,7 +69,12 @@ from smc.hardware.capabilities import (
     XYStage,
     ZStage,
 )
-from smc.hardware.errors import HardwareError, MicroscopeHaltedError, MotionStoppedError
+from smc.hardware.errors import (
+    AutofocusExcursionError,
+    HardwareError,
+    MicroscopeHaltedError,
+    MotionStoppedError,
+)
 from smc.plugins.api import PluginParams, RunContext
 from smc.plugins.cell_focus.algorithm import (
     DEFAULT_SCORE,
@@ -448,8 +460,9 @@ class ScanPlugin:
                 frame came back in another shape; every field failed (a scan
                 with no frame at all); a frame could not be
                 written (a full disk, a share that dropped or a file a
-                viewer holds open is not a field's fault). The checkpoint
-                keeps the wells done.
+                viewer holds open is not a field's fault); the autofocus could
+                not be switched off before a well, or an engage moved Z out of
+                its bound. The checkpoint keeps the wells done.
             MicroscopeHaltedError, MotionStoppedError: The stand was stopped;
                 the scan ends where it is.
             StopRequested: The operator stopped it; ``--resume`` continues.
@@ -518,8 +531,9 @@ class ScanPlugin:
             raise PluginRunError(
                 _NAME,
                 "the scan being resumed used the autofocus, which is not locked now "
-                "(a stop during the focus on the cells leaves it off): lock it on "
-                "the sample, then run scan --resume",
+                "(the scan switches it off between wells, and a stop during the "
+                "focus on the cells leaves it off): lock it on the sample, then run "
+                "scan --resume",
             )
         groups = wells_to_scan(plan.wells, plan.fields, set(wells_done))
         total = sum(len(fields) for _, fields in groups)
@@ -580,12 +594,33 @@ class ScanPlugin:
         # switches it off when no lock comes, whether it returns or raises):
         # that one is the scan's to retry, until a field reads it locked.
         off_by_the_scan = False
+        # The wells whose wall the scan switched the autofocus off at, and the
+        # engages that followed (m3 §8, #416): counted apart from §8's.
+        wall_offs = 0
+        wall_engages = 0
+        wall_locks = 0
+        # Whether the next engage is the first after a wall's switch-off; a
+        # field that reads locked, or any engage made, ends its claim.
+        after_wall = False
         t0 = time.monotonic()
         for well, fields in groups:
             _check_well(camera, plan, stand, f" at well {well}")
+            # After the well's start check (FM-130), before anything moves to
+            # it: PFS locked over a wall follows its reference to another plane,
+            # with no guard (F11). A dry run never engages, so it switches nothing.
+            if (
+                stand.used
+                and af is not None
+                and not ctx.dry_run
+                and _switch_off_at_wall(af, well)
+            ):
+                off_by_the_scan = True
+                wall_offs += 1
+                after_wall = True
             for planned in fields:
                 ctx.raise_if_stopped()
                 error: str | None = None
+                tripped: AutofocusExcursionError | None = None
                 prepared: _Prepared | None = None
                 cell_focus: FieldFocus | None = None
                 pfs_offset: float | None = None
@@ -622,16 +657,23 @@ class ScanPlugin:
                                 # failure: a switch-off after it is not ours.
                                 off_by_the_scan = False
                                 focus.off_by_focus = False
+                                after_wall = False
                             elif (
                                 off_by_the_scan or focus.off_by_focus or af.is_engaged()
                             ):
                                 # Set before the call: one that raises leaves
                                 # the autofocus off too (FM-129).
                                 off_by_the_scan = True
+                                wall_engage = after_wall
+                                after_wall = False
                                 if focus.off_by_focus:
                                     # The lock after a focus step: timed and
                                     # counted apart from §8's re-engages (FM-165).
                                     locked = focus.engage(af)
+                                elif wall_engage:
+                                    wall_engages += 1
+                                    locked = af.engage()
+                                    wall_locks += int(locked)
                                 else:
                                     engage_attempts += 1
                                     locked = af.engage()
@@ -694,8 +736,28 @@ class ScanPlugin:
                             )
                 except (MicroscopeHaltedError, MotionStoppedError):
                     raise
+                except AutofocusExcursionError as exc:
+                    tripped = exc
                 except (HardwareError, FocusDriveOffTarget, AutofocusStillOn) as exc:
                     error = _one_line(exc)
+                if tripped is not None:
+                    # Not a failed field: the layer switched the autofocus off and
+                    # forgot its offset (m2 §12.2 D2), so every later engage would
+                    # be refused and the scan would fail fields with a message
+                    # that blames the stage. Raised outside the handler (FM-98).
+                    # The trip, not the focus step, is what left PFS off: the
+                    # text stays §8's, without ``run``'s suffix.
+                    focus.off_by_focus = False
+                    raise PluginRunError(
+                        _NAME,
+                        "the autofocus moved Z out of its bound while it locked at "
+                        f"{planned.name} (well {planned.well}): {_one_line(tripped)}; "
+                        f"the checkpoint keeps {len(wells_done)} wells. Its offset "
+                        "names another plane here than where it held (m2 §12.11): "
+                        f"with PFS off, focus on the sample in well {planned.well} by "
+                        "eye and lock it from below (m2 §12.10), then run scan "
+                        "--resume (the well is scanned again whole)",
+                    )
 
                 done += 1
                 if error is not None and in_step:
@@ -817,6 +879,13 @@ class ScanPlugin:
             assumed.append(
                 f"the autofocus was engaged again on {engage_attempts} fields and "
                 f"locked on {engage_locks} of them"
+            )
+        if wall_offs:
+            assumed.append(
+                f"the autofocus was switched off before the first field of "
+                f"{wall_offs} wells, so that no lock crossed a well's wall, and "
+                f"engaged again after it on {wall_engages} fields, locked on "
+                f"{wall_locks} of them"
             )
         if ctx.dry_run:
             assumed.append(f"dry run: {done} fields walked, no frame taken")
@@ -1128,6 +1197,50 @@ def _check_autofocus(
             "it off and run with autofocus=off",
         )
     return af, locked
+
+
+def _switch_off_at_wall(af: Autofocus, well: str) -> bool:
+    """Switch an engaged autofocus off before ``well``; whether this switched it off (m3 §8).
+
+    PFS locked over a well's wall follows its reference to the plane its
+    offset names in the next well, which moved by at least 104 µm between two
+    wells of one plate at the 40x (F11), with no action holding the microscope
+    and no guard (m2 §12.2 D2). Switched off, Z stays where PFS held it, and
+    the well's first field engages it again under D2's band. One that is off
+    is left as it is: the operator's switch-off is not undone (FM-129).
+
+    Raises:
+        PluginRunError: The switch-off or a read of it raised, or it still
+            reads on: PFS may be on, so nothing may move to the well (FM-19).
+        MicroscopeHaltedError, MotionStoppedError: Passed (FM-64).
+    """
+    cause: str | None = None
+    still_on = False
+    try:
+        if not af.is_engaged():
+            return False
+        af.disengage()
+        still_on = af.is_engaged()
+    except (MicroscopeHaltedError, MotionStoppedError):
+        raise
+    except HardwareError as exc:
+        cause = _one_line(exc)
+    # Raised outside the handler (FM-98).
+    if cause is not None:
+        raise PluginRunError(
+            _NAME,
+            f"the autofocus could not be switched off before well {well} ({cause}): "
+            "nothing moved to it, and PFS may still be on: switch it off at the "
+            "stand, then run scan --resume",
+        )
+    if still_on:
+        raise PluginRunError(
+            _NAME,
+            f"the autofocus still reads on after it was switched off before well "
+            f"{well}: nothing moved to it: switch it off at the stand, then run "
+            "scan --resume",
+        )
+    return True
 
 
 def _check_disk(
