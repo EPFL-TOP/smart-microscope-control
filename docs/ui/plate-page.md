@@ -173,18 +173,22 @@ under both.
 below) or squares (384 and 1536), turned by the plate's rotation. **Its title says how the
 plate was placed**, in one of four ways, because a well name read off the map is trusted:
 
-- `96-well: the registered plate`: A1 and the rotation come from a registration that
-  measured them (`plate-registration`, `plate-walls`, a lattice fit).
-- `96-well: placed from one well (B3), not registered: the rotation is assumed 0°, not
-  measured`: a registration from one well only (a *seed*): A1 is where that well says, the
-  plate is not turned, and nothing checked it.
+- `96-well: the registered plate, A1 at the back left`: A1 and the rotation come from a
+  registration that measured them (`plate-registration`, `plate-walls`, a lattice fit), and
+  the title names the corner A1 is at in the stand's words (in stage terms, `A1 at stage -X
+  +Y`, on a stand whose profile does not say its sides).
+- `96-well: placed from one well (B3), not registered: the rotation is taken from the
+  declared orientation, A1 at the back left, not measured`: a registration from one well only
+  (a *seed*): A1 is where that well says, the plate lies the way *Plate lies* said, and
+  nothing checked it.
 - `24-well: estimated from the stand's holder, not registered: centred at stage (400, -325)
-  µm, not turned, A1 at the top left of this map`: no plate is registered (or the registered
-  one is not the plate you chose), and the stand's profile says where its holder puts a plate
-  ([`[holder]`](../../profiles/README.md#holder-where-the-holder-puts-a-plate)). The plate is
-  drawn there, **an estimate good to a few hundred µm**: a plate put back moved by 285 µm on the
-  Ti2-E. It does not know which way round the plate lies, and a plate turned 180° swaps every
-  name (B3 is C4): compare the A1 of the map with the A1 printed on the plate.
+  µm, declared not turned, A1 at the top left of this map`: no plate is registered (or the
+  registered one is not the plate you chose), and the stand's profile says where its holder
+  puts a plate ([`[holder]`](../../profiles/README.md#holder-where-the-holder-puts-a-plate)).
+  The plate is drawn there, **an estimate good to a few hundred µm**: a plate put back moved
+  by 285 µm on the Ti2-E. Which way round it lies is what *Plate lies* says (`declared turned
+  180°, A1 at the bottom right of this map` when turned): compare the A1 of the map with the
+  A1 printed on the plate (see *Which way the plate lies*, below).
 - `96-well: not registered, and this stand does not say where its plate lies: A1 is drawn at
   stage (0, 0), so the cross shows the stage and not a well`: the stand's profile has no
   `[holder]`, so the wells are drawn from the origin and name nothing about the stage.
@@ -193,6 +197,15 @@ plate was placed**, in one of four ways, because a well name read off the map is
 it, a capture never takes its well from the cross (*Capture centre of B3* records the well you
 clicked), and a **drive click on an estimated map moves nothing**: `goto-well` needs a
 registered plate (`goto-well reads plate, but the run document has no plate`).
+
+**The stand's sides and A1.** When the profile says which stage direction is the back of
+the stand and which the operator's right (`[holder] back`, `right`:
+[profiles](../../profiles/README.md#back-right-the-sides-of-the-stand)), the map labels
+its four sides around the wells: *back of the stand*, *front of the stand*, *operator's
+left*, *operator's right*, half a well's pitch outside them. On the Ti2-E the back is at
+the top and the operator's right on the right; on a stand whose back is -X it is on the
+left of the map. Without them there are no side labels. **A1 is always labelled, bold**,
+on every plate: it is the one name you check against the plate.
 
 Names are drawn up to 96 wells. The selection has a thick blue
 outline; the cells' **density** colours the wells (grey where unknown, a well with no
@@ -207,6 +220,35 @@ second: each frame carries the stage's position, read right after its snap, so t
 costs no read of the stage. **Otherwise it follows the page's tick, once a second** (after a
 drive, at rest): a snap never moves it, since its frame is old by the time it is drawn. When
 Live ends the cross is drawn from the stage again within a second.
+
+**Which way the plate lies.** A plate goes into its holder one of two ways round, and the
+page cannot see which. **Say it in *Plate lies***, next to *Plate*: `A1 at the back left` or `Turned 180°: A1 at the front
+right` on the Ti2-E, worded from the stand's sides (in stage terms, `Not turned: A1 at stage
+-X +Y` and `Turned 180°: A1 at stage +X -Y`, with a note under the menu, on a stand whose
+profile does not say them). Every plate tool is given the choice (`orientation=` of
+`plate-registration`, `plate-walls`, `plate-finding` and `plate-orientation`); no tool's form
+offers it a second time. The next plate chosen keeps it: it is likely put down the same way.
+
+**Check it with the cross.** Look at where the objective really is on the plate (the well
+under it, or A1 printed at a corner) and compare it with the cross on the map and its label.
+If they disagree, the plate lies the other way: switch *Plate lies*.
+
+- **On a registered plate the switch renames the wells, and measures nothing.** It runs
+  `plate-orientation` (its outcome is on the strip, as any tool's; `smc run
+  plate-orientation --param orientation=turned-180` is the same from a terminal): within a
+  second the cross stays where it is and its label changes, `over B3` to `over C4` on a
+  24-well, because a plate turned 180° lands on itself and only its names move. No stage
+  moves and no fit is run again. The tools after it (`scan-plan` and on) read the plate
+  again: their results are stale, since their wells changed names.
+- **The captures follow; the selection keeps its names.** The centres and walls you captured
+  are positions, so they are renamed (B3's centre becomes C4's), and the well the capture
+  buttons named is cleared. A selection is the printed wells you chose (B3 is the B3 written
+  on the plate), so it keeps its names, which now lie elsewhere; the strip says so once.
+- **On an estimate** the switch turns the drawn plate about the holder's centre, at once;
+  nothing is run or written.
+- **It never** moves the stage, turns the plate by 90°, or warns that the cross and the
+  plate disagree: only you see the plate. A switch while a tool runs, or with the stand
+  closed, is refused and says why.
 
 **The scan plan on the map.** Once `scan-plan` has run and its result is usable, the map
 draws **one orange rectangle for each field of the plan**: the field of view wide and
@@ -847,10 +889,16 @@ at the stand ([#198](https://github.com/EPFL-TOP/smart-microscope-control/issues
 **The cross and the estimate** add: the estimate against the plate on the Ti2-E (the Greiner
 plate in its holder, either way round, and the cross over a well it is physically over: the
 `[holder]` value is the mean of two sessions 285 µm apart); the label's names against the
-printed plate (turned 180° the page says `over B3` where the plate says C4); the cross's lag at
+printed plate (turned 180° and not declared so, the page says `over B3` where the plate says
+C4); the cross's lag at
 the stand (a second outside Live, a tenth of a second in Live, and `state()` was seen to take up
 to 0.5 s there during Live); the cross and its label at the PC's screen and zoom; and
 `plate-walls` from one rough position in each of three wells, with the time it takes.
+
+**Which way the plate lies** adds, for the owner at the Ti2-E: the profile's `back = "+Y"`
+and `right = "+X"` (inferred from session 3, not seen); the *Plate lies* switch read by an
+operator who has not read this page, with the cross over a well they can see; and whether a
+selection that keeps its names after a turn is what the operator expects.
 
 **Live** adds: the rate a real browser shows, locally and over RDP (the demo camera
 gives 10 frames a second on the server; ADR-0006's revisit criterion for Panel is what a
