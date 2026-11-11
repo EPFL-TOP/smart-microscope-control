@@ -267,6 +267,11 @@ def test_what_a_preset_does_not_keep_under_params_is_what_the_page_fills() -> No
     # which `smc presets save` leaves out as well (#324, m5 §10.9).
     kept_elsewhere = {plugin: set(keys) for plugin, keys in NOT_IN_PARAMS.items()}
     filled = {plugin: set(keys) for plugin, keys in PAGE_PARAMS.items()}
+    # The plate's orientation (m3 §24) is declared every session and never kept; the
+    # page fills it once #422 is in (m5 §16, PAGE_PARAMS). Until then, set it aside.
+    for plugin in ("plate-finding", "plate-registration", "plate-walls"):
+        kept_elsewhere[plugin].discard("orientation")
+    assert kept_elsewhere.pop("plate-orientation") == {"orientation"}
     assert kept_elsewhere.pop("plate-finding") == {"centre_x_um", "centre_y_um"}
     # objective-offsets (#380): a preset never keeps `confirm_turns`, the operator's word
     # that the stage is clear for the turret to turn over the plate, which holds for one

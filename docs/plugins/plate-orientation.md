@@ -25,6 +25,10 @@ smc run plate-orientation -p <profile> --run-doc run.json --param orientation=tu
 |---|---|---|
 | `orientation` | (required) | `not-turned` (A1 at the stage's -X +Y corner) or `turned-180` (A1 at the +X -Y corner). |
 
+The tool is new: a microscope PC updated with `git pull` sees it only after
+`pip install -e .` in the smc folder (a plugin is registered when smc is installed); until
+then `smc run` answers `no plugin named 'plate-orientation'`.
+
 It has no default: running it is a statement. It is **absolute**, not a switch: the
 orientation the plate fit already has gives that fit back, number for number, so
 running it twice with the same value changes nothing.

@@ -90,7 +90,11 @@ _HEADER = (
 #: kept (m5 §10.2). The turn confirmation of ``objective-offsets`` is not kept
 #: either: it says the stage is clear *now*, so a saved one would confirm the next
 #: session's turns over a loaded plate for the operator (FM-14). Per plugin, the
-#: key and the reason the note gives.
+#: key and the reason the note gives. The plate's ``orientation`` is not kept
+#: either (m3 §24): it says how the plate was put down *this* time, and a saved
+#: one would rename every well of the next session's plate, which a survey cannot
+#: see.
+_ORIENTATION_NOTE = "how the plate lies is declared again every session"
 NOT_IN_PARAMS: dict[str, dict[str, str]] = {
     "objective-offsets": {
         "confirm_turns": "the stage is clear only for the run that confirmed it: "
@@ -99,16 +103,20 @@ NOT_IN_PARAMS: dict[str, dict[str, str]] = {
     "plate-finding": {
         "centre_x_um": "a preset holds no positions",
         "centre_y_um": "a preset holds no positions",
+        "orientation": _ORIENTATION_NOTE,
     },
+    "plate-orientation": {"orientation": _ORIENTATION_NOTE},
     "plate-registration": {
         "plate": "the preset's plate holds it",
         "refs": "a preset holds no positions",
         "walls": "a preset holds no positions",
         "objective": "the registration takes the objective in place",
+        "orientation": _ORIENTATION_NOTE,
     },
     "plate-walls": {
         "plate": "the preset's plate holds it",
         "refs": "a preset holds no positions",
+        "orientation": _ORIENTATION_NOTE,
     },
     "scan-plan": {"wells": "the preset's wells hold them"},
 }

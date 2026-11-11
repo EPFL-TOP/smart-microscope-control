@@ -602,6 +602,56 @@ def test_two_swapped_references_are_refused_with_the_turned_text(
     assert f"declare orientation={other}, else check the well names" in text
 
 
+@pytest.mark.parametrize(("tilt", "shown"), [(0.2, "-179.8"), (-0.2, "179.8")])
+def test_a_turned_plate_tilted_either_way_is_refused_as_turned(
+    tilt: float, shown: str
+) -> None:
+    """``atan2`` reads a turned plate as -179.8° as often as 179.8°: both are turned (m3 §24)."""
+    refs = _measure("24-well", (48000.0, -29000.0), 180.0 + tilt, ["A1", "A6", "D1"])
+
+    with pytest.raises(ValueError, match="the fit turns the plate") as raised:
+        calibrate("24-well", refs)
+
+    assert str(raised.value) == (
+        f"the fit turns the plate by {shown}°: it lies turned 180° from the declared "
+        "orientation (not-turned), or two reference wells are swapped; if A1 is at "
+        "the other corner, declare orientation=turned-180, else check the well names"
+    )
+
+
+def test_a_fit_beyond_the_bound_of_both_orientations_is_a_misnamed_well() -> None:
+    """17.5° from turned, 162.5° from not turned: neither, so a well is misnamed."""
+    refs = _measure("96-well", (10.0, 20.0), 197.5, ["A1", "A12", "H1"])
+
+    with pytest.raises(ValueError, match="the fit turns the plate") as raised:
+        calibrate("96-well", refs)
+
+    assert str(raised.value) == (
+        "the fit turns the plate by -162.5°, beyond ±10°: a reference well is "
+        "misidentified (two references the same distance apart fit either way)"
+    )
+
+
+@pytest.mark.parametrize("orientation", ["not-turned", "turned-180"])
+def test_a_tilt_on_the_bound_is_accepted(
+    orientation: Literal["not-turned", "turned-180"],
+) -> None:
+    turn = 180.0 if orientation == "turned-180" else 0.0
+    refs = _measure("96-well", (10.0, 20.0), turn + 7.5, ["A1", "A12", "H1"])
+    tilt = abs(
+        wrap_deg(
+            calibrate(
+                "96-well", refs, orientation=orientation, max_rotation_deg=20.0
+            ).rotation_deg
+            - turn
+        )
+    )
+
+    cal = calibrate("96-well", refs, orientation=orientation, max_rotation_deg=tilt)
+
+    assert cal.orientation == orientation
+
+
 def test_a_seed_on_a_turned_plate_places_a1_at_the_far_corner() -> None:
     """One well, declared turned: A1 lies on the stage's +X -Y side of B3, as in useq's plan."""
     b3 = (10003.0, -10051.0)

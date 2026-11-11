@@ -10,10 +10,12 @@ swapped with columns, fails here.
 from __future__ import annotations
 
 import math
+from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 
 import pytest
 import useq
+from pydantic import ValidationError
 
 from smc.hardware import Microscope
 from smc.hardware.capabilities import XYStage
@@ -30,7 +32,7 @@ from smc.plugins.plate_registration.plugin import (
 from smc.plugins.scan_plan.plugin import ScanPlanParams, ScanPlanPlugin
 from smc.plugins.slots import PlateResult, ScanPlanResult
 from smc.plugins.slots.plate import PlateOrientation, turned_well
-from smc.run import RunDocument, StageRecord, StageStatus
+from smc.run import RunDocument, StageRecord, StageStatus, write_stage
 
 pytestmark = pytest.mark.demo
 
@@ -49,6 +51,32 @@ def _truth(well: str) -> tuple[float, float]:
     )
     (position,) = [p for p in plan.all_well_positions if p.name == well]
     return float(position.x), float(position.y)  # type: ignore[arg-type]
+
+
+class _Ticking(datetime):
+    """``datetime`` whose ``now`` never gives the same instant twice: 20 ms apart at least.
+
+    The latest start provides a slot, and a tie goes to the later plugin name, which
+    ``plate-registration`` is. Back-to-back runs in one process can start in one tick
+    of a coarse clock (15.6 ms on Windows below Python 3.13, FM-197), and the turn
+    would then hide behind the fit it follows (FM-219).
+    """
+
+    last: datetime | None = None
+
+    @classmethod
+    def now(cls, tz: tzinfo | None = None) -> _Ticking:
+        real = datetime.now(tz)
+        if cls.last is not None and real < cls.last + timedelta(milliseconds=20):
+            real = cls.last + timedelta(milliseconds=20)
+        cls.last = real
+        return cls.fromtimestamp(real.timestamp(), tz)
+
+
+@pytest.fixture(autouse=True)
+def _starts_never_tie(monkeypatch: pytest.MonkeyPatch) -> None:
+    _Ticking.last = None
+    monkeypatch.setattr("smc.plugins.runner.datetime", _Ticking)
 
 
 @pytest.fixture
@@ -142,6 +170,41 @@ def test_plate_orientation_renames_the_registered_plate_through_the_runner(
     assert _unusable(stand, run_doc) is None
     assert back.result == fit_record.result
     assert not RunDocument.load(run_doc).is_stale("plate-orientation")
+
+
+def test_plate_orientation_runs_again_after_its_own_failed_run(
+    stand: Microscope, tmp_path: Path
+) -> None:
+    """Its failed run is the latest plate, but not the plate it reads (m3 §24 D8, FM-218)."""
+    run_doc = tmp_path / "run.json"
+    fit = _plate(_register(stand, run_doc, "turned-180"))
+    _plate(_turn(stand, run_doc, "not-turned"))
+    turned = RunDocument.load(run_doc).stages["plate-orientation"]
+    write_stage(
+        run_doc,
+        turned.model_copy(
+            update={"status": StageStatus.failed, "result": None, "error": "boom"}
+        ),
+    )
+    assert _unusable(stand, run_doc) == (
+        "the last run of plate-orientation ended failed; run it again"
+    )
+
+    again = _plate(_turn(stand, run_doc, "not-turned"))
+
+    assert again.well_center_um("B3") == pytest.approx(
+        fit.well_center_um("C4"), abs=1e-6
+    )
+    assert _unusable(stand, run_doc) is None
+
+
+def test_plate_orientation_has_no_default() -> None:
+    """Running it is a statement: nothing renames a plate unless told which way (m3 §24)."""
+    with pytest.raises(ValidationError) as raised:
+        PlateOrientationParams.model_validate({})
+    assert [(e["loc"], e["type"]) for e in raised.value.errors()] == [
+        (("orientation",), "missing")
+    ]
 
 
 def test_goto_well_on_a_turned_plate_reaches_the_printed_b3(
