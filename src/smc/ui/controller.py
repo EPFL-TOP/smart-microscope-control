@@ -393,7 +393,7 @@ class MapPose:
     """Where the map draws the plate and on what that rests: what the title and the label say.
 
     A name read off an estimate is trusted, so the pose travels with the wells and
-    never apart from them (m5 §15, FM-216). ``holder_centre_um`` is the stand's
+    never apart from them (m5 §15, FM-217). ``holder_centre_um`` is the stand's
     ``[holder] plate_centre_xy_um`` and is set for ``estimated`` only; ``seed_well``
     is the one reference well of a ``seed`` (``""`` when the slot has none).
     """

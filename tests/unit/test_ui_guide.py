@@ -133,7 +133,7 @@ def test_the_two_waiting_texts_are_the_designs() -> None:
 
 def test_capture_wells_says_three_wells_far_apart() -> None:
     # Three centres are what fits a plate and checks itself (m5 §15 D7): two fit it and
-    # check nothing, so the text must not keep the old "a second well" (FM-45: the claim).
+    # check only their spacing, so the text must not keep the old "a second well".
     assert "three wells far apart" in CAPTURE_WELLS
     assert "second well" not in CAPTURE_WELLS
     assert "check each other" in CAPTURE_WELLS

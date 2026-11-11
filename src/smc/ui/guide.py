@@ -76,7 +76,7 @@ SELECT_WELLS = (
 
 #: What plate registration waits for on a stand that has no sample to register from:
 #: the plate's place is measured by centring wells, never guessed. Three centres fit the
-#: plate and check each other; two fit it and check nothing (m5 §15 D7).
+#: plate and check each other; two fit it and check only their spacing (m5 §15 D7).
 CAPTURE_WELLS = (
     "centre a well under the objective (Live and the Drive pad), click it on the "
     "map and press Capture centre; three wells far apart fit the plate and check "
