@@ -12,6 +12,12 @@ harm.
 * **The return runs before the fit is judged.** An operator who calibrated on
   an empty field gets the stage back where they chose it, and then the reason
   the field was no good.
+* **A frame with no light is named before anything else is blamed** (F8, #408).
+  Dark frames correlate well at a zero shift, so a calibration with the light
+  path on the eyepiece measured two shifts of zero and asked whether the stage
+  had moved. The reference frame is judged before the first move, and each
+  probe frame after the return, so that "parallel shifts" follows only frames
+  that carry signal.
 * **The stage is waited for before its start is read** (FM-85), and the step is
   sized from the camera's own pixel size only when that is finite and positive
   (FM-104): a pixel size of 0 means "not measured".
@@ -37,9 +43,12 @@ from smc.plugins.camera_calibration.algorithm import (
     DEFAULT_STEP_FRACTION,
     FALLBACK_STEP_UM,
     MIN_RESPONSE,
+    MIN_SIGNAL_SPREAD_COUNTS,
     Fit,
     fit,
     measure_shift,
+    precision_reasons,
+    signal_spread,
 )
 from smc.plugins.errors import PluginRunError
 from smc.plugins.slots import CameraCalibration
@@ -160,6 +169,7 @@ class CameraCalibrationPlugin:
         reference = _checked_frame(self.name, camera.snap(), shape)
         probes = (("+X probe", step_um, 0.0), ("+Y probe", 0.0, step_um))
         shifts = []
+        spreads: list[float] = []
         settle_s = params.settle_ms / 1000.0
         # Whether a move was sent and the return has not arrived: a stop before
         # the first move, or during the settle after the return, leaves the
@@ -171,7 +181,9 @@ class CameraCalibrationPlugin:
                 away = True
                 xy.move_to_um(start.x_um + dx_um, start.y_um + dy_um)
                 ctx.wait_s(settle_s)
-                shifts.append(measure_shift(reference, camera.snap()))
+                probe_frame = camera.snap()
+                shifts.append(measure_shift(reference, probe_frame))
+                spreads.append(signal_spread(probe_frame))
                 ctx.progress(done, 3, label)
             # Both probes returned normally, so the return runs (FM-88), and
             # before the fit is judged: an empty field still gets the stage back.
@@ -187,11 +199,32 @@ class CameraCalibrationPlugin:
             raise
         shift_x, shift_y = shifts
 
+        # Before the fit: a probe frame with no light gives a shift of zero, and
+        # the fit would blame the stage for it ("parallel shifts"). The stage is
+        # back at its start here, so the refusal can say so.
+        for (label, _dx_um, _dy_um), spread in zip(probes, spreads, strict=True):
+            if not spread >= MIN_SIGNAL_SPREAD_COUNTS:
+                raise PluginRunError(
+                    self.name,
+                    f"the frame after the {label} is dark or flat "
+                    f"({_spread_detail(spread)}): did the light go off, or did the "
+                    f"step of {step_um:g} µm leave the lit sample? the stage is "
+                    "back at its start",
+                )
+
         fitted = fit(shift_x, shift_y, step_um=step_um, image_shape_px=shape)
         if not fitted.trustworthy:
             raise PluginRunError(
                 self.name,
                 _unusable_reason(fitted, step_um, shape, reported_um, used_fallback),
+            )
+        reasons = precision_reasons(fitted, step_um, shape)
+        if reasons:
+            better_um = suggested_step_um(fitted.pixel_size_um, shape)
+            assumed.append(
+                precision_line(
+                    step_um, reasons, better_um if better_um > step_um else None
+                )
             )
 
         after_return = measure_shift(reference, camera.snap())
@@ -260,7 +293,9 @@ def _checked_frame(
     ``measure_shift`` refuses a frame that is not 2-D or holds a value that is
     not finite, but only after the +X probe has moved the stage a quarter field:
     a colour camera's ``(h, w, 3)`` frame, a different region than the camera
-    reports, or a ``nan`` is known now, before anything moves.
+    reports, or a ``nan`` is known now, before anything moves. So is a frame
+    with no light on it (the light path on the eyepiece, F8): it correlates well
+    at a zero shift, and the fit would blame the stage after two moves.
     """
     array = np.asarray(frame)
     if array.shape != shape:
@@ -276,7 +311,52 @@ def _checked_frame(
             "the camera's frame has a value that is not finite; nothing was "
             "moved. Give the camera a mode that returns numbers",
         )
+    spread = signal_spread(array)
+    if not spread >= MIN_SIGNAL_SPREAD_COUNTS:
+        raise PluginRunError(
+            name,
+            f"the camera's frame is dark or flat ({_spread_detail(spread)}): is "
+            "the light on and the light path on the camera? nothing was moved",
+        )
     return frame
+
+
+def _spread_detail(spread: float) -> str:
+    """What was measured, and the floor, so that a surprise at a stand is a number to report."""
+    return (
+        f"the 1st to 99th percentile spans {spread:.0f} counts, "
+        f"under {MIN_SIGNAL_SPREAD_COUNTS:g}"
+    )
+
+
+def suggested_step_um(pixel_size_um: float, image_shape_px: tuple[int, int]) -> float:
+    """A quarter of the smaller side at this pixel size, to two significant figures, at most 2000 µm.
+
+    What a run that fitted poorly says to try next. It is the default step the
+    plugin would have chosen had it known the pixel size, so it cannot wrap
+    (§4.1), and two figures because the pixel size it comes from is a
+    measurement of a poor fit: 969.0 is 970. ``pixel_size_um`` is a measured
+    one, finite and positive (the caller has a trustworthy fit).
+    """
+    quarter_um = DEFAULT_STEP_FRACTION * min(image_shape_px) * pixel_size_um
+    digits = 1 - math.floor(math.log10(quarter_um))
+    return min(_MAX_STEP_UM, round(quarter_um, digits))
+
+
+def precision_line(
+    step_um: float, reasons: tuple[str, ...], suggested_um: float | None
+) -> str:
+    """The ``assumed`` line of a probe that fitted poorly, with the step to try instead.
+
+    One line, under the 160 characters the page's strip keeps of the first
+    ``assumed`` line (FM-205), and without the suggestion when it is not a
+    larger step than the one used: a residual that is large at a quarter of the
+    field is not cured by a probe of the same size.
+    """
+    line = f"step of {step_um:g} µm fits poorly ({'; '.join(reasons)})"
+    if suggested_um is not None:
+        line += f": run again with step_um={suggested_um:g}"
+    return line
 
 
 def _warn_left(ctx: RunContext, xy: XYStage, start: XY) -> None:

@@ -35,10 +35,16 @@ from smc.plugins import (
     load,
     run_plugin,
 )
-from smc.plugins.camera_calibration.algorithm import MIN_RESPONSE
+from smc.plugins.camera_calibration.algorithm import (
+    MIN_RESPONSE,
+    MIN_SIGNAL_SPREAD_COUNTS,
+    signal_spread,
+)
 from smc.plugins.camera_calibration.plugin import (
     CameraCalibrationParams,
     CameraCalibrationPlugin,
+    precision_line,
+    suggested_step_um,
 )
 from smc.plugins.slots import CameraCalibration
 from smc.run import RunDocument, StageRecord, StageStatus, write_stage
@@ -1209,3 +1215,240 @@ def _reporting_camera(
         shape=SHAPE,
         reported_um=reported_um,
     )
+
+
+# -- a frame with no light on the camera (#408, F8) and a probe of a few pixels (F6)
+
+
+def _dark(shape: tuple[int, ...]) -> np.ndarray:
+    """The Prime 95B's dark frame (session 2): mean 100.5, std 2.3, a column pattern."""
+    rng = np.random.default_rng(408)
+    frame = 100.5 + rng.normal(0.0, 2.3, shape) + rng.normal(0.0, 1.0, shape[1])
+    return np.rint(frame).astype(np.uint16)
+
+
+class _DarkSnapCamera(SampleCamera):
+    """A sample camera whose numbered frames carry no light, as with the light path on the eyepiece.
+
+    Snap 1 is the reference, 2 the +X probe, 3 the +Y probe, 4 the return.
+    """
+
+    def __init__(
+        self, *args: object, dark_snaps: tuple[int, ...], **kwargs: object
+    ) -> None:
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+        self._dark_snaps = dark_snaps
+        self.snaps = 0
+
+    def snap(self) -> np.ndarray:
+        self.snaps += 1
+        frame = super().snap()
+        return _dark(frame.shape) if self.snaps in self._dark_snaps else frame
+
+
+@pytest.mark.parametrize(
+    "spoil",
+    [
+        lambda frame: _dark(frame.shape),
+        lambda frame: np.full_like(frame, 65535),
+        lambda frame: np.zeros_like(frame),
+    ],
+    ids=["dark", "saturated", "zero"],
+)
+def test_a_frame_with_no_signal_is_refused_before_any_move_and_the_light_path_is_named(
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    spoil: Callable[[np.ndarray], np.ndarray],
+) -> None:
+    """F8: the light path was on the eyepiece, and the message pointed at the stage."""
+    demo_microscope.override(
+        Camera,
+        _BadFirstFrameCamera(
+            demo_microscope,
+            PlateSample(),
+            pixel_size_um=1.0,
+            shape=SHAPE,
+            spoil=spoil,
+        ),
+    )
+    stage = _FlakyStage(demo_microscope.require(XYStage))
+    demo_microscope.override(XYStage, stage)
+
+    with pytest.raises(PluginRunError) as raised:
+        _run(demo_microscope, tmp_path)
+
+    reason = raised.value.reason
+    assert "the camera's frame is dark or flat" in reason
+    assert "is the light on and the light path on the camera?" in reason
+    assert reason.endswith("nothing was moved")
+    assert "parallel shifts" not in reason
+    assert stage.moves == 0
+    stored = _stored(tmp_path)
+    assert stored.status is StageStatus.failed
+    assert stored.result is None
+
+
+@pytest.mark.parametrize(
+    ("dark_snaps", "label"),
+    [((2,), "+X probe"), ((3,), "+Y probe"), ((2, 3), "+X probe")],
+    ids=["x-probe", "y-probe", "both-name-the-first"],
+)
+def test_a_probe_frame_with_no_signal_is_refused_after_the_return_not_blamed_on_the_stage(
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    dark_snaps: tuple[int, ...],
+    label: str,
+) -> None:
+    """A dark probe gave a shift of zero, and "parallel shifts: did the stage move?" blamed the stage.
+
+    The stage did move, so the return runs first (FM-88) and the refusal says
+    where it is; the frame after the return is not taken.
+    """
+    camera = _DarkSnapCamera(
+        demo_microscope,
+        PlateSample(),
+        pixel_size_um=1.0,
+        shape=SHAPE,
+        dark_snaps=dark_snaps,
+    )
+    demo_microscope.override(Camera, camera)
+    stage = _FlakyStage(demo_microscope.require(XYStage))
+    demo_microscope.override(XYStage, stage)
+    start = _here(demo_microscope)
+
+    with pytest.raises(PluginRunError) as raised:
+        _run(demo_microscope, tmp_path)
+
+    reason = raised.value.reason
+    assert f"the frame after the {label} is dark or flat" in reason
+    assert "did the light go off" in reason
+    assert f"step of {STEP_UM:g} µm" in reason
+    assert reason.endswith("the stage is back at its start")
+    assert "parallel shifts" not in reason
+    assert "barely correlate" not in reason
+    # Two probes and the return; the frame after the return was not taken.
+    assert stage.moves == 3
+    assert camera.snaps == 3
+    assert _here(demo_microscope) == pytest.approx(start, abs=0.05)
+    stored = _stored(tmp_path)
+    assert stored.status is StageStatus.failed
+    assert stored.result is None
+
+
+def test_a_lit_featureless_field_is_not_taken_for_a_dark_one(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    """Noise and no texture spans 94 counts against a floor of 50: it is lit, and it moves."""
+    microscope = demo_microscope_with_sample(PlateSample(texture_std=0.0), shape=SHAPE)
+    assert signal_spread(microscope.require(Camera).snap()) > MIN_SIGNAL_SPREAD_COUNTS
+    stage = _FlakyStage(microscope.require(XYStage))
+    microscope.override(XYStage, stage)
+
+    with pytest.raises(PluginRunError, match="barely correlate"):
+        _run(microscope, tmp_path)
+
+    assert stage.moves == 3
+
+
+def test_a_fallback_step_of_a_few_pixels_is_named_with_a_suggested_step(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """F6: with no pixel size known, 50 µm at 2.745 µm per pixel is 18 px of the frame's 384 rows."""
+    demo_microscope.override(
+        Camera,
+        _ReportingCamera(
+            demo_microscope,
+            PlateSample(),
+            pixel_size_um=2.745,
+            shape=SHAPE,
+            reported_um=0.0,
+        ),
+    )
+
+    result = _result(_run(demo_microscope, tmp_path))
+
+    assert result.step_um == 50.0
+    assert result.assumed == (
+        "step of 50 µm: no pixel size was known",
+        "step of 50 µm fits poorly (18 px, under a tenth of the 384 px frame): "
+        "run again with step_um=260",
+    )
+    # The suggestion is a step the plugin accepts, and it fits without a note.
+    again = _result(_run(demo_microscope, tmp_path, step_um=260.0))
+    assert again.assumed == ()
+    assert again.pixel_size_um == pytest.approx(2.745, rel=0.01)
+
+
+def test_a_given_step_of_a_few_pixels_is_named_too(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    microscope = demo_microscope_with_sample(shape=SHAPE)
+
+    result = _result(_run(microscope, tmp_path, step_um=20.0))
+
+    assert result.assumed == (
+        "step of 20 µm fits poorly (20 px, under a tenth of the 384 px frame): "
+        "run again with step_um=96",
+    )
+
+
+def test_a_poor_fit_at_the_default_step_is_named_without_a_step_to_suggest(
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The synthetic plate has no residual to speak of, so the reason is given to the plugin.
+
+    A residual that is large at a quarter of the field is not cured by a probe
+    of the same size: the line names it and says nothing to run again with.
+    """
+    microscope = demo_microscope_with_sample(shape=SHAPE)
+    monkeypatch.setattr(
+        "smc.plugins.camera_calibration.plugin.precision_reasons",
+        lambda fitted, step_um, image_shape_px: ("residual 60.0 µm, 6 % of the step",),
+    )
+
+    result = _result(_run(microscope, tmp_path))
+
+    assert result.step_um == STEP_UM
+    assert result.assumed == (
+        f"step of {STEP_UM:g} µm fits poorly (residual 60.0 µm, 6 % of the step)",
+    )
+
+
+@pytest.mark.parametrize(
+    ("pixel_size_um", "shape", "expected_um"),
+    [
+        (2.74526, (1412, 1412), 970.0),  # session 3's 4x: 969.0, two figures
+        (0.276136, (1412, 1412), 97.0),  # the 40x: 97.47
+        (2.7473, SHAPE, 260.0),  # a quarter of 384 rows: 263.7
+        (30.0, SHAPE, 2000.0),  # 2880 µm, capped at the largest probe
+    ],
+)
+def test_the_suggested_step_is_a_quarter_of_the_field_to_two_figures_and_capped(
+    pixel_size_um: float, shape: tuple[int, int], expected_um: float
+) -> None:
+    assert suggested_step_um(pixel_size_um, shape) == expected_um
+
+
+def test_the_longest_precision_line_fits_the_strip() -> None:
+    """FM-205: the strip of the page keeps the first ``assumed`` line to 160 characters."""
+    line = precision_line(
+        1234.56,
+        (
+            "140 px, under a tenth of the 1412 px frame",
+            "residual 1999.9 µm, 100 % of the step",
+        ),
+        1999.0,
+    )
+
+    assert len(line) <= 160
+    assert line.endswith("run again with step_um=1999")
+
+
+def test_a_precision_line_without_a_larger_step_to_suggest_ends_at_the_reasons() -> (
+    None
+):
+    line = precision_line(970.0, ("residual 60.0 µm, 6 % of the step",), None)
+
+    assert line == "step of 970 µm fits poorly (residual 60.0 µm, 6 % of the step)"
