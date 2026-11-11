@@ -400,6 +400,7 @@ CASES: dict[str, list[dict[str, Any]]] = {
             "seed": 7,
             "statistic": "std",
             "max_failed_in_row": 5,
+            "orientation": "turned-180",
         }
     ],
     "plate-registration": [
@@ -408,6 +409,7 @@ CASES: dict[str, list[dict[str, Any]]] = {
             "refs": [{"well": "A1", "x_um": 1.0, "y_um": 2.0}],
             "walls": [{"well": "A1", "side": "-X", "x_um": 1.0, "y_um": 2.0}],
             "max_rotation_deg": 5.0,
+            "orientation": "turned-180",
             "objective": "Nikon 10X S Fluor",
         }
     ],
@@ -421,6 +423,7 @@ CASES: dict[str, list[dict[str, Any]]] = {
             "search_um": 500.0,
             "max_residual_um": 50.0,
             "max_rotation_deg": 5.0,
+            "orientation": "turned-180",
             "settle_ms": 30.0,
             "save_frames": False,
         }

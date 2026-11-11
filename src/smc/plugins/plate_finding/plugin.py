@@ -59,6 +59,7 @@ from smc.plugins.plate_finding.algorithm import (
     survey_points,
 )
 from smc.plugins.slots import PlateResult
+from smc.plugins.slots.plate import PlateOrientation
 
 if TYPE_CHECKING:
     from smc.hardware.microscope import Microscope
@@ -170,6 +171,13 @@ class PlateFindingParams(PluginParams):
         description=(
             "This many survey points failing in a row end the survey; the "
             "checkpoint keeps what was sampled."
+        ),
+    )
+    orientation: PlateOrientation = Field(
+        "not-turned",
+        description=(
+            "Which way the plate lies in its holder: not-turned (A1 at the "
+            "stage's -X +Y corner) or turned-180 (A1 at the +X -Y corner)."
         ),
     )
 
@@ -417,6 +425,13 @@ class PlateFindingPlugin:
             )
         # After every check that can refuse the fit: a refused fit reads nothing.
         assumed.extend(_autofocus_lines(autofocus))
+        # On either orientation, in the result itself (FM-165, FM-217): a plate
+        # turned 180° lands on itself, so the survey fits it as not turned and only
+        # the operator's word names its wells (m3 §24 D5).
+        assumed.append(
+            f"orientation {params.orientation} given by the operator: a plate "
+            "turned 180° lands on itself, so the survey cannot see it"
+        )
         ctx.logger.info(best.describe())
         return best.to_result(
             runner_up=runner_up.plate if runner_up is not None else None,
@@ -424,7 +439,7 @@ class PlateFindingPlugin:
             notes=notes,
             assumed=assumed,
             objective=objective,
-        )
+        ).with_orientation(params.orientation)
 
 
 def _plan(

@@ -58,7 +58,7 @@ A1 = (1000.0, 2000.0)
 ROTATION_DEG = 3.0
 PITCH_UM = 9000.0
 HALF_UM = 3200.0
-SEED_LINE = "one reference well (A1): rotation 0° assumed, not measured"
+SEED_LINE = "one reference well (A1): rotation 0° assumed from the declared orientation (not-turned), not measured"
 DRY_LINE = "dry run: the stage did not move; x_um and y_um are the target"
 
 

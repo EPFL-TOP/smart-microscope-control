@@ -20,6 +20,7 @@ from dataclasses import dataclass
 
 import useq
 
+from smc.plugins.geometry import wrap_deg
 from smc.plugins.slots import (
     PlateResult,
     WallTouch,
@@ -28,6 +29,7 @@ from smc.plugins.slots import (
     refuse_image_side,
     well_geometry,
 )
+from smc.plugins.slots.plate import ORIENTATION_DEG, PlateOrientation
 
 __all__ = [
     "DIAMETER_TOLERANCE",
@@ -55,7 +57,8 @@ DIAMETER_TOLERANCE = 0.10
 #: A plate is put on the stage by hand and is turned by degrees, not by tens of
 #: degrees. Two references the same distance apart (A1 and A2, or A1 and B1)
 #: fit a turn of 90 degrees with no residual, so the fit alone cannot say that
-#: a well was misnamed (FM-121).
+#: a well was misnamed (FM-121). The bound is a tilt from the declared
+#: orientation, not from 0° (m3 §24 D3).
 MAX_ROTATION_DEG = 10.0
 
 #: A wall is named by the stage direction that reaches it from the well's centre,
@@ -125,24 +128,30 @@ def calibrate(
     refs: Sequence[WellRef],
     *,
     max_rotation_deg: float = MAX_ROTATION_DEG,
+    orientation: PlateOrientation = "not-turned",
 ) -> PlateResult:
     """Fit A1's stage position and the plate's rotation from wells centred under the objective.
 
-    One reference sets A1 and assumes no rotation (a *seed*: enough to drive to
-    every other well to within a few hundred µm). Two or more also fit the
-    rotation, by a rigid 2-D fit (rotation and translation, Kabsch) with the
-    scale fixed by the plate definition; three or more make the residual say
-    something about the centring.
+    One reference sets A1 and takes its rotation from ``orientation`` (a *seed*:
+    enough to drive to every other well to within a few hundred µm). Two or more
+    also fit the rotation, by a rigid 2-D fit (rotation and translation, Kabsch)
+    with the scale fixed by the plate definition; three or more make the residual
+    say something about the centring.
 
     The scale is checked before the fit and the rotation after it, because
     neither the scale nor the residual can see a mislabelled pair of equidistant
-    wells: it fits at 90 degrees exactly (FM-121).
+    wells: it fits at 90 degrees exactly (FM-121). The rotation is compared with
+    the declared ``orientation`` (m3 §24 D3): a plate turned 180° lands on itself,
+    so only the operator's well names show the turn, and a fit within
+    ``max_rotation_deg`` of the *other* orientation is refused with the words
+    that say so (the plate lies the other way, or two references are swapped,
+    which fits at 180° exactly).
 
     Raises:
         ValueError: No reference; a well that is not on the plate, or given
             twice (after ``normalise_well``); a spacing off the plate
             definition by more than ``SCALE_TOLERANCE``; or a fitted rotation
-            beyond ``max_rotation_deg``.
+            beyond ``max_rotation_deg`` of the declared orientation.
     """
     if not refs:
         raise ValueError("need at least one reference well")
@@ -167,20 +176,27 @@ def calibrate(
     count = len(names)
 
     if count == 1:
+        # The well's nominal offset turned by the declared orientation: on a plate
+        # turned 180° A1 is at the far corner from the well, not the near one.
+        seed_deg = ORIENTATION_DEG[orientation]
+        seed = math.radians(seed_deg)
+        nx, ny = nominal[0]
         return PlateResult(
             plate=plate,
             a1_center_xy_um=(
-                measured[0][0] - nominal[0][0],
-                measured[0][1] - nominal[0][1],
+                measured[0][0] - (math.cos(seed) * nx - math.sin(seed) * ny),
+                measured[0][1] - (math.sin(seed) * nx + math.cos(seed) * ny),
             ),
-            rotation_deg=0.0,
+            rotation_deg=seed_deg,
             method="seed",
             residual_um=None,
             scale_error=None,
             n_refs=1,
             refs=normalised,
+            orientation=orientation,
             assumed=(
-                f"one reference well ({names[0]}): rotation 0° assumed, not measured",
+                f"one reference well ({names[0]}): rotation {seed_deg:g}° assumed "
+                f"from the declared orientation ({orientation}), not measured",
             ),
         )
 
@@ -208,12 +224,7 @@ def calibrate(
         m_mean[1] - (sin * d_mean[0] + cos * d_mean[1]),
     )
     rotation_deg = math.degrees(theta)
-    if abs(rotation_deg) > max_rotation_deg:
-        raise ValueError(
-            f"the fit turns the plate by {rotation_deg:.1f}°, beyond "
-            f"±{max_rotation_deg:g}°: a reference well is misidentified (two "
-            f"references the same distance apart fit either way)"
-        )
+    _check_rotation(rotation_deg, orientation, max_rotation_deg)
 
     # The fitted centres go through the slot's own geometry, so that the
     # residual is the distance to the centre that `well_center_um` will report.
@@ -233,6 +244,41 @@ def calibrate(
         scale_error=scale_error,
         n_refs=count,
         refs=normalised,
+        orientation=orientation,
+    )
+
+
+def _check_rotation(
+    rotation_deg: float, orientation: PlateOrientation, max_rotation_deg: float
+) -> None:
+    """Refuse a fitted rotation that is not a tilt of the declared orientation (m3 §24 D3).
+
+    ``atan2`` gives (-180, 180], so a turned plate can read -179.8°: every angle
+    is compared through ``wrap_deg``. The other orientation is checked first, so
+    that a plate put down the other way, or two references swapped (which fit at
+    180° exactly), are told apart from a misnamed well at another angle. Written
+    ``not ... <=`` so that a nan is refused.
+
+    Raises:
+        ValueError: The rotation is beyond ``max_rotation_deg`` of
+            ``orientation``.
+    """
+    delta = wrap_deg(rotation_deg - ORIENTATION_DEG[orientation])
+    if abs(delta) <= max_rotation_deg:
+        return
+    other = "turned-180" if orientation == "not-turned" else "not-turned"
+    if abs(wrap_deg(rotation_deg - ORIENTATION_DEG[other])) <= max_rotation_deg:
+        raise ValueError(
+            f"the fit turns the plate by {rotation_deg:.1f}°: it lies turned 180° "
+            f"from the declared orientation ({orientation}), or two reference "
+            f"wells are swapped; if A1 is at the other corner, declare "
+            f"orientation={other}, else check the well names"
+        )
+    suffix = " from turned-180" if orientation == "turned-180" else ""
+    raise ValueError(
+        f"the fit turns the plate by {delta:.1f}°{suffix}, beyond "
+        f"±{max_rotation_deg:g}°: a reference well is misidentified (two "
+        f"references the same distance apart fit either way)"
     )
 
 
@@ -267,7 +313,8 @@ def centre_from_walls(
     centre only with the nominal half-size, and the axis is reported as assumed.
 
     Each axis is read from its own coordinate: ``-X`` and ``+X`` use ``x_um``,
-    ``-Y`` and ``+Y`` use ``y_um`` (``+Y`` is towards row A), and the other
+    ``-Y`` and ``+Y`` use ``y_um`` (``+Y`` is towards row A on a plate that is
+    not turned), and the other
     coordinate of a touch is never read (FM-73). A side is a stage direction: the
     ``-X`` wall is the one the stage reaches by going -X from the well's centre,
     whatever the camera shows there. The sizes are the plate's, width for X and
@@ -372,11 +419,15 @@ def _check_size(
 def wall_position(result: PlateResult, well: str, side: str) -> tuple[float, float]:
     """The stage point at one wall of a well: the centre plus the half-size along the plate's own axes.
 
-    The offset is turned by the plate's rotation, so that on a turned plate the
-    point is on the wall and not on the stage axis. ``side`` is a stage direction,
-    ``-X`` or ``+X`` along the plate's X, ``-Y`` or ``+Y`` along its Y (``+Y`` is
-    towards row A), and the half-size is the well's width for X and its height for
-    Y (FM-73). A side named on the image is refused, not read in this frame.
+    The offset is turned by the plate's tilt from its orientation,
+    ``wrap_deg(rotation_deg - ORIENTATION_DEG[orientation])``, so that on a tilted
+    plate the point is on the wall and not on the stage axis. Not by the whole
+    rotation: ``side`` is a stage direction (m3 §19), and on a plate turned 180°
+    the whole rotation would send ``+X`` to the stage's -X wall (m3 §24 D9,
+    FM-189). ``-X`` or ``+X`` is along the plate's X, ``-Y`` or ``+Y`` along its Y
+    (``+Y`` is towards row A on a plate that is not turned), and the half-size is
+    the well's width for X and its height for Y (FM-73). A side named on the image
+    is refused, not read in this frame.
 
     Raises:
         ValueError: ``side`` is not one of the four, or is a side on the image;
@@ -393,7 +444,9 @@ def wall_position(result: PlateResult, well: str, side: str) -> tuple[float, flo
         "-Y": (0.0, -half_h),
         "+Y": (0.0, half_h),
     }[side]
-    angle = math.radians(result.rotation_deg)
+    angle = math.radians(
+        wrap_deg(result.rotation_deg - ORIENTATION_DEG[result.orientation])
+    )
     cos, sin = math.cos(angle), math.sin(angle)
     cx, cy = geometry.center_um
     return (cx + cos * ox - sin * oy, cy + sin * ox + cos * oy)

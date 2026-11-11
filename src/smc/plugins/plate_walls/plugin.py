@@ -71,6 +71,7 @@ from smc.plugins.slots import (
     WellRef,
     normalise_well,
 )
+from smc.plugins.slots.plate import PlateOrientation
 from smc.run.files import new_token
 
 if TYPE_CHECKING:
@@ -138,9 +139,16 @@ class PlateWallsParams(PluginParams):
         gt=0.0,
         le=45.0,
         description=(
-            "The largest rotation of the plate that the fit accepts; a rotation "
-            "past it is read as a misnamed well or a plate with its columns the "
-            "other way. Raise it only for a plate that is really turned."
+            "The largest tilt of the plate from its declared orientation that the "
+            "fit accepts; a tilt past it is read as a misnamed well. Raise it "
+            "only for a plate that is really tilted in its holder."
+        ),
+    )
+    orientation: PlateOrientation = Field(
+        "not-turned",
+        description=(
+            "Which way the plate lies in its holder: not-turned (A1 at the "
+            "stage's -X +Y corner) or turned-180 (A1 at the +X -Y corner)."
         ),
     )
     settle_ms: float = Field(
@@ -303,6 +311,7 @@ class PlateWallsPlugin:
             plate=params.plate,
             a1_center_xy_um=fitted.a1_center_xy_um,
             rotation_deg=fitted.rotation_deg,
+            orientation=fitted.orientation,
             method="wall-images",
             residual_um=residual_um,
             scale_error=fitted.scale_error,
@@ -381,7 +390,10 @@ def _fit_plate(
     problem = ""
     try:
         fitted = calibrate(
-            params.plate, measured, max_rotation_deg=params.max_rotation_deg
+            params.plate,
+            measured,
+            max_rotation_deg=params.max_rotation_deg,
+            orientation=params.orientation,
         )
     except ValueError as exc:
         problem = str(exc) or "the plate fit was refused"

@@ -109,7 +109,7 @@ def test_a_seed_fills_the_plate_slot_with_rotation_zero(
         (50000.0 - 5 * PITCH_UM, -20000.0 + 3 * PITCH_UM)
     )
     assert result.assumed == (
-        "one reference well (D6): rotation 0° assumed, not measured",
+        "one reference well (D6): rotation 0° assumed from the declared orientation (not-turned), not measured",
     )
     assert _stored(tmp_path).status is StageStatus.done
     assert _stored(tmp_path).provides == "plate"
@@ -237,7 +237,7 @@ def test_walls_alone_make_a_seed_that_says_what_it_assumed(
     assert result.method == "seed"
     assert result.a1_center_xy_um == pytest.approx((1000.0, 2000.0))
     assert result.assumed == (
-        "one reference well (A1): rotation 0° assumed, not measured",
+        "one reference well (A1): rotation 0° assumed from the declared orientation (not-turned), not measured",
     )
 
 
@@ -252,7 +252,7 @@ def test_the_seed_s_line_comes_before_the_walls_lines(
     result = _result(_run(demo_microscope, tmp_path, walls=walls))
     assert result.a1_center_xy_um == pytest.approx((1000.0, 2000.0))
     assert result.assumed == (
-        "one reference well (A1): rotation 0° assumed, not measured",
+        "one reference well (A1): rotation 0° assumed from the declared orientation (not-turned), not measured",
         "A1: the X centre is one wall plus the nominal half-size, 3200 µm",
         "A1: the Y centre is one wall plus the nominal half-size, 3200 µm",
     )
@@ -724,4 +724,11 @@ def test_the_parameters_are_described() -> None:
     from smc.plugins import describe_params
 
     keys = [row[0] for row in describe_params(PlateRegistrationParams)]
-    assert keys == ["plate", "refs", "walls", "max_rotation_deg", "objective"]
+    assert keys == [
+        "plate",
+        "refs",
+        "walls",
+        "max_rotation_deg",
+        "orientation",
+        "objective",
+    ]

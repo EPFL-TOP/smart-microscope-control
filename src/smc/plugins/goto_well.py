@@ -60,7 +60,8 @@ class GotoWellParams(PluginParams):
             "Where in the well: its centre, or the point on a wall from which to "
             "touch it, named by the stage direction that reaches it from the centre "
             "(-X and +X along the plate's X, -Y and +Y along its Y; +Y is towards "
-            "row A). A side as seen on an image (left, right, top, bottom) is "
+            "row A on a plate that is not turned). A side as seen on an image "
+            "(left, right, top, bottom) is "
             "refused: the plate page maps those with the camera calibration."
         ),
     )

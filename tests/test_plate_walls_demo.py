@@ -1493,7 +1493,8 @@ def test_a_plate_turned_the_other_way_is_refused_by_the_rotation_bound(
 
     The wells are imaged as they are: the walls are found and the centres fitted.
     It is the plate that is refused, with the fit's own words, and the stage is
-    left in the last well.
+    left in the last well. The words say that the plate lies turned, or two wells
+    are swapped (m3 §24.4 (1)).
     """
     sample = _plate(rotation_deg=179.0)
     camera = _on_fake(fake_microscope, sample)
@@ -1503,11 +1504,39 @@ def test_a_plate_turned_the_other_way_is_refused_by_the_rotation_bound(
     refused = _refused(fake_microscope, run_doc, _refs("A1", "H12", plate_deg=179.0))
 
     assert refused.reason == (
-        "the fit turns the plate by 179.0°, beyond ±10°: a reference well is "
-        "misidentified (two references the same distance apart fit either way)"
+        "the fit turns the plate by 179.0°: it lies turned 180° from the declared "
+        "orientation (not-turned), or two reference wells are swapped; if A1 is at "
+        "the other corner, declare orientation=turned-180, else check the well names"
     )
     assert _here(fake_microscope) == pytest.approx(camera.positions[-1], abs=0.1)
     assert _stored(run_doc).status is StageStatus.failed
+
+
+def test_a_plate_declared_turned_is_registered_from_its_walls(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    """The same plate declared ``turned-180``: registered, its wells named from the plate (m3 §24 D3)."""
+    _on_fake(fake_microscope, _plate(rotation_deg=179.0))
+    run_doc = tmp_path / "run.json"
+    _seed(run_doc, fake_microscope)
+
+    result = _result(
+        _run(
+            fake_microscope,
+            run_doc,
+            _refs("A1", "H12", plate_deg=179.0),
+            orientation="turned-180",
+        )
+    )
+
+    assert result.orientation == "turned-180"
+    assert result.rotation_deg == pytest.approx(179.0, abs=0.1)
+    assert [r.well for r in result.refs] == ["A1", "H12"]
+    assert result.walls is not None
+    assert [w.well for w in result.walls.wells] == ["A1", "H12"]
+    assert result.well_center_um("H12") == pytest.approx(
+        _truth("H12", rotation_deg=179.0), abs=5.0
+    )
 
 
 def test_a_narrower_search_is_the_one_used_and_reported(

@@ -79,7 +79,7 @@ you name a wall on the command line by the **stage's** direction (`-X`, `+X`, `-
 $ smc run plate-registration -p demo --run-doc run.json --param 'refs=[{"well": "A1", "x_um": 1000, "y_um": 2000}]'
 ✓ plate-registration done in 0.0 s — run.json, stage plate-registration
 {
-  "assumed": ["one reference well (A1): rotation 0° assumed, not measured"],
+  "assumed": ["one reference well (A1): rotation 0° assumed from the declared orientation (not-turned), not measured"],
   "plate": "96-well",
   "a1_center_xy_um": [1000.0, 2000.0],
   "rotation_deg": 0.0,
@@ -95,7 +95,7 @@ $ smc run plate-registration -p demo --run-doc run.json --param 'refs=[{"well": 
 $ smc run goto-well -p demo --run-doc run.json --param well=B2 --param side=-X
 ✓ goto-well done in 1.0 s — run.json, stage goto-well
 {
-  "assumed": ["plate: one reference well (A1): rotation 0° assumed, not measured"],
+  "assumed": ["plate: one reference well (A1): rotation 0° assumed from the declared orientation (not-turned), not measured"],
   "well": "B2",
   "side": "-X",
   "target_x_um": 6800.0,

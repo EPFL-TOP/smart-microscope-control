@@ -2255,6 +2255,7 @@ def test_the_form_of_plate_walls_offers_neither_plate_nor_refs(
             "search_um",
             "max_residual_um",
             "max_rotation_deg",
+            "orientation",  # the page fills it once #422 is in
             "settle_ms",
             "save_frames",
         }
@@ -5021,7 +5022,8 @@ def test_tools_follow_the_workflow_order_and_hide_what_the_page_fills(
     ]
     registration = by_name["plate-registration"]
     registration_rows = {row[0] for row in (*registration.key, *registration.advanced)}
-    assert registration_rows == {"max_rotation_deg"}
+    # `orientation` is a field of the form until #422 fills it from the page.
+    assert registration_rows == {"max_rotation_deg", "orientation"}
     assert registration.summary.startswith("Locate a well plate on the stage")
     assert by_name["scan"].key[0][0] == "autofocus"
 
