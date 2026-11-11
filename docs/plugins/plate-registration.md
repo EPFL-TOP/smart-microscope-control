@@ -47,8 +47,10 @@ JSON`, or an unexpected extra argument).
 
 1. **Seed.** `smc stage get` prints the position (`XY (1000.00, 2000.00) µm`); give it
    as a reference. One reference is a *seed*: A1 is where it implies and the rotation
-   is **assumed 0°**, which the result says in `assumed`. It is enough to drive to
-   every other well to within a few millimetres.
+   is **assumed from the declared orientation** (0° for `not-turned`, 180° for
+   `turned-180`, see [Which way the plate lies](#which-way-the-plate-lies)), which the
+   result says in `assumed`. It is enough to drive to every other well to within a few
+   millimetres.
 2. **Go to the next well.** `goto-well` drives there through the latest `plate`. Jog
    until the well is where you want it (`smc stage jog`), and read `smc stage get`.
 3. **Register again with every reference so far.** Each run replaces `plate`, and the
@@ -123,7 +125,8 @@ smc run plate-registration -p <profile> --run-doc run.json --param plate=384-wel
 | `plate` | `96-well` | A `useq` plate name (`6-well` to `1536-well`); the name is exact, `96-WELL` is refused. |
 | `refs` | none | Wells centred under the objective, JSON: `[{"well": "A1", "x_um": 1000, "y_um": 2000}]`. A well name is as you type it: `a1`, `A 1` and `A01` are `A1`. |
 | `walls` | none | Wall touches, JSON: `[{"well": "B2", "side": "-X", "x_um": 6800, "y_um": 0}]`. A `side` is a **stage direction** (`-X`, `+X`, `-Y`, `+Y`); `left`, `right`, `top` and `bottom` are refused. See [Wall touches](#wall-touches). |
-| `max_rotation_deg` | 10 | The largest rotation of the plate that the fit accepts (above 0, up to 45): see [What it refuses](#what-it-refuses). |
+| `max_rotation_deg` | 10 | The largest tilt of the plate from its declared orientation that the fit accepts (above 0, up to 45): see [What it refuses](#what-it-refuses). |
+| `orientation` | `not-turned` | Which way the plate lies in its holder: `not-turned` (A1 at the stage's -X +Y corner) or `turned-180` (A1 at the +X -Y corner). See [Which way the plate lies](#which-way-the-plate-lies). |
 | `objective` | the one in place | The objective the references were centred with, by its turret label (`smc objective list`): see [The objective the plate was registered with](#the-objective-the-plate-was-registered-with). Recorded, never turned to. |
 
 Give `refs`, `walls` or both: a well given by walls becomes a reference like any
@@ -159,6 +162,30 @@ shifts the scan grid and does not compound, and a well has margin. Rotation is t
 part worth care, because it acts over the whole plate, which is why the references
 should be far apart.
 
+### Which way the plate lies
+
+A plate can be put in its holder either way round. Turned 180°, every well lands where
+another one was (B3 where C4 was, on a 24-well): the positions are the same and only the
+names change, so nothing measured tells the two apart. The samples follow the names
+printed on the plate, so **say which way it lies** with `orientation`:
+
+| `orientation` | A1 is at the stage's | Rows run towards |
+|---|---|---|
+| `not-turned` (default) | -X +Y corner | -Y |
+| `turned-180` | +X -Y corner | +Y |
+
+Name the reference wells **from the plate** (the label printed on it). The fit is then
+checked against the declaration: a fit that turns the plate about 180° from it is refused
+with `the fit turns the plate by 179.8°: it lies turned 180° from the declared orientation
+(not-turned), or two reference wells are swapped; ...`. Either the plate lies the other way
+(declare `orientation=turned-180` and register again with the same references) or two
+references were swapped (two wells exchanged fit at 180° exactly). The result keeps the
+orientation, and every tool after it names the wells by it: `goto-well --param well=B3`
+goes to the B3 printed on the plate, either way.
+
+Found out after the fit that the plate lies the other way? Nothing needs measuring again:
+[`plate-orientation`](plate-orientation.md) renames the registered plate's wells.
+
 ### Wall touches
 
 At 40x a well is not visible (the field is about 333 µm, a 96-well well 6 400 µm),
@@ -175,7 +202,8 @@ and read on the stage put a seed 15.5 mm from the well on both axes, #327).
 
 - **`side` is a stage direction** on the command line: `-X`, `+X`, `-Y` or `+Y`, the
   wall that the stage reaches by going that way from the well's centre, along the
-  plate's own axes. `+Y` is **towards row A**. `-X` and `+X` use only the touch's
+  plate's own axes. `+Y` is **towards row A** on a plate that is not turned; on either
+  orientation `+X` is towards the stage's +X. `-X` and `+X` use only the touch's
   `x_um`, and `-Y` and `+Y` only its `y_um`: the other coordinate is never read.
   **`left`, `right`, `top` and `bottom` are refused**, with the reason (`side 'left'
   is a side on the image: a wall is named by a stage direction, -X, +X, -Y or +Y`):
@@ -208,7 +236,8 @@ and read on the stage put a seed 15.5 mm from the well on both axes, #327).
   centre only with the plate's nominal half-size, and the result says so in `assumed`
   (`B2: the Y centre is one wall plus the nominal half-size, 3200 µm`).
 - `goto-well --param side=-X` drives to the point on that wall, along the plate's
-  own axes, so it follows the fitted rotation. The wall is then within a field or
+  own axes, so it follows the plate's fitted tilt (its rotation from its declared
+  orientation, never the 180° of a turn). The wall is then within a field or
   two. On a turned plate a touch along a stage axis errs by `r (1 − cos θ)` for one
   wall (8 µm at 4°, 49 µm at 10°, for a 96-well well, computed); an opposite pair of
   a round well cancels it.
@@ -250,7 +279,8 @@ slot**, and a stage that reads it stops with the reason.
 | `well A1 given twice` | A well twice in `refs` (`A1` and `a1` are one). |
 | `well 'Z99' is not on the 96-well plate` | A name the plate does not have. |
 | `the measured well spacing is off the 384-well definition by +100.0%: wrong plate type, or a misidentified well` | The measured distance between the references is not the plate's, by more than 2 %: check the plate type and the well names. Without this check the fit would succeed and put every position further off across the plate. |
-| `the fit turns the plate by 90.0°, beyond ±10°: a reference well is misidentified` | The fitted rotation is past `max_rotation_deg`. **Two references the same distance apart** (A1 and A2, or A1 and B1) fit a turn of 90° with no residual, so neither the scale check nor the residual can see a misnamed one: a bound on the rotation does. Raise `max_rotation_deg` only for a plate that really is turned. |
+| `the fit turns the plate by 179.8°: it lies turned 180° from the declared orientation (not-turned), or two reference wells are swapped; if A1 is at the other corner, declare orientation=turned-180, else check the well names` | The fit is within `max_rotation_deg` of the *other* orientation. The plate lies the other way round (declare it), or two references were swapped, which fits at 180° exactly: see [Which way the plate lies](#which-way-the-plate-lies). |
+| `the fit turns the plate by 90.0°, beyond ±10°: a reference well is misidentified` | The fitted tilt from the declared orientation is past `max_rotation_deg` (on `turned-180` the text says `by 17.5° from turned-180`). **Two references the same distance apart** (A1 and A2, or A1 and B1) fit a turn of 90° with no residual, so neither the scale check nor the residual can see a misnamed one: a bound on the rotation does. Raise `max_rotation_deg` only for a plate that really is tilted in its holder. |
 | `H1 is 348 µm from where the others put it: centre it again` | A reference is further than 300 µm from the fit of the others: centre that well again. |
 | `A1's -X and +X walls are 9200 µm apart, a 96-well well is 6400 µm (+43.8%): a touch of another well, or off the wall; touch them again` | An opposite pair whose size is off the plate's by more than 10 %: touch both walls again. |
 | `B3's -X and +X walls are swapped: the +X wall is 15599 µm on the -X side of the -X wall, a 24-well well's width; touch them again, each named by its direction from the well's centre` | The pair has a well's size with the wrong sign: the two walls were named in the wrong frame (the image's `left` is not always the stage's `-X`, see [Wall touches](#wall-touches)). Name each by the stage direction that reaches it from the centre. `height` for the Y pair. |
@@ -304,7 +334,7 @@ smc run goto-well -p <profile> --run-doc run.json --param well=B2 --param side=+
 | Parameter | Default | Meaning |
 |---|---|---|
 | `well` | (required) | The well to go to, as `useq` names it (`H12`; `h12` and `H012` are read as `H12`). |
-| `side` | `centre` | `centre`, or the point on a wall named by a **stage direction**: `-X`, `+X`, `-Y`, `+Y` (`+Y` is towards row A). `left`, `right`, `top` and `bottom` are sides on an image and are refused, see [Wall touches](#wall-touches). The result echoes the stage direction. |
+| `side` | `centre` | `centre`, or the point on a wall named by a **stage direction**: `-X`, `+X`, `-Y`, `+Y` (`+Y` is towards row A on a plate that is not turned; `+X` is the stage's +X on either orientation). `left`, `right`, `top` and `bottom` are sides on an image and are refused, see [Wall touches](#wall-touches). The result echoes the stage direction. |
 
 It sends **one absolute move** and nothing else, and the layer's guards are the
 guards: a target outside the profile's XY soft limits is refused and the stage does

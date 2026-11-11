@@ -112,6 +112,7 @@ REAL = {
     "density": "smc.plugins.density.plugin:DensityPlugin",
     "goto-well": "smc.plugins.goto_well:GotoWellPlugin",
     "plate-finding": "smc.plugins.plate_finding.plugin:PlateFindingPlugin",
+    "plate-orientation": "smc.plugins.plate_orientation:PlateOrientationPlugin",
     "plate-registration": "smc.plugins.plate_registration.plugin:PlateRegistrationPlugin",
     "plate-walls": "smc.plugins.plate_walls.plugin:PlateWallsPlugin",
     "route": "smc.plugins.route.plugin:RoutePlugin",
@@ -3279,6 +3280,32 @@ def test_the_view_shows_why_a_stage_is_unusable(
             "the run document has no up; smc run --list shows which plugin provides it"
         ),
     }
+
+
+def test_a_tool_that_reads_its_own_slot_is_not_blocked_by_its_own_failed_run(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    """``plate-orientation`` reads the fit, not itself (m3 §24 D8): its failure blocks the others."""
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    _seed(
+        run_doc,
+        "plate-orientation",
+        "plate",
+        status=StageStatus.failed,
+        minute=1,
+        params={"orientation": "turned-180"},
+        reads={"plate": ReadRecord(plugin="plate-registration", attempt="a0")},
+    )
+    page = _stood_page(fake_microscope, run_doc, "plate-orientation", "scan-plan")
+    try:
+        view = page.view()
+        failed = "the last run of plate-orientation ended failed; run it again"
+        assert "plate-orientation" not in view.blocked
+        # Every consumer of the plate still sees the failed run as the plate.
+        assert view.blocked["scan-plan"] == failed
+        assert CheckItem("plate", False, "unusable", failed) in view.checklist
+    finally:
+        page.close()
 
 
 def test_a_blocked_tool_says_what_the_stand_lacks(

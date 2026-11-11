@@ -87,7 +87,8 @@ smc run plate-walls --show-params
 | `refs` | none | Two to six wells, each with the stage position where you centred it, JSON: `[{"well": "B3", "x_um": 10200, "y_um": -9700}]`. A well name is as you type it (`b3`, `B03`). |
 | `search_um` | half the well's radius | How far, on each axis, the wall may lie from where your position puts it. It may not exceed the radius. |
 | `max_residual_um` | 100 | The largest distance, in µm, between a well's measured centre and where the plate's fit puts it. Revisit it at the stand once a plate has been registered. |
-| `max_rotation_deg` | 10 | The largest rotation of the plate that the fit accepts (above 0, up to 45). |
+| `max_rotation_deg` | 10 | The largest tilt of the plate from its declared orientation that the fit accepts (above 0, up to 45). |
+| `orientation` | `not-turned` | Which way the plate lies in its holder: `not-turned` (A1 at the stage's -X +Y corner) or `turned-180` (A1 at the +X -Y corner). Name the wells of `refs` from the plate; see [plate-registration](plate-registration.md#which-way-the-plate-lies). |
 | `settle_ms` | 0 | Wait this long after each move before the frame is taken. |
 | `save_frames` | true | Save the frame centred on each wall, see below. |
 
@@ -170,13 +171,18 @@ a WARNING:
 | `<well>'s walls do not fit a circle: …` | The edge points do not lie on a circle: look at that well's frames. |
 | `<well> measures <D> µm across and the <plate> plate's wells <D0> µm: is it the right plate type?` | More than 10 % off the plate's well size: another plate, or the wrong `plate`. |
 | `<well>'s wall points lie <rms> µm from a circle on average, more than <bound> µm: a frame may show something else than the wall …` | A bubble, a scratch or a label took the place of a wall (the bound is 2 % of the radius). Look at the frames. |
-| `the fit turns the plate by <r>°, beyond ±<m>°: a reference well is misidentified …` | See the next paragraph. |
+| `the fit turns the plate by <r>°: it lies turned 180° from the declared orientation (<o>), or two reference wells are swapped; if A1 is at the other corner, declare orientation=<other>, else check the well names` | See the next paragraph. |
+| `the fit turns the plate by <r>°, beyond ±<m>°: a reference well is misidentified …` | The tilt from the declared orientation is past `max_rotation_deg`: a well is misnamed. |
 | `<well> is <n> µm from where the other wells put it (bound <b> µm): record it again, or check the plate type` | A well that the others do not put where it is, or a plate whose pitch is not the one named (a 96-well plate of pitch 9.03 mm fitted as 9.0 mm leaves two wells 196 µm off). |
 
-**A rotation near 180°.** If the stage runs the plate's columns towards −X, two wells
-fit a rotation near 180°, and the fit refuses it. That is the safe answer, and
-`max_rotation_deg` is not to be raised for it (it stops at 45°): which way the
-Ti2-E's plate runs is [#327](https://github.com/EPFL-TOP/smart-microscope-control/issues/327)'s question.
+**A rotation near 180°.** A plate put in its holder the other way round fits a
+rotation near 180° from the wells named on it (the Ti2-E's plate did in session 3, see
+issue 414), and so do two references swapped. Declared `not-turned`, the fit refuses it
+with the first text above; if A1 is at the stage's +X -Y corner, run again with
+`--param orientation=turned-180` and the same wells. `max_rotation_deg` is not to be
+raised for it (it stops at 45°, and it bounds the tilt from the declared orientation).
+After a registration, [`plate-orientation`](plate-orientation.md) renames the wells
+without measuring again.
 
 ## Trying it without a microscope
 

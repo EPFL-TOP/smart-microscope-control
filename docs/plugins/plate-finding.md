@@ -63,6 +63,7 @@ a survey of frames that were never taken has nothing to fit.
 | `seed` | 0 | Seeds the nudge: the same seed gives the same survey. |
 | `statistic` | `mean` | `mean` or `std` of each frame. Use `std` where wells and plastic differ by texture and not by brightness. |
 | `max_failed_in_row` | 3 | This many survey points failing in a row end the survey (1 to 100); the checkpoint keeps what was sampled. `scan`'s parameter of the same name. |
+| `orientation` | `not-turned` | Which way the plate lies in its holder: `not-turned` (A1 at the stage's -X +Y corner) or `turned-180` (A1 at the +X -Y corner). The survey cannot see it; see [Which way the plate lies](#which-way-the-plate-lies). |
 
 The survey has, at the default step and one pitch of margin, 130 points on a 6-well
 plate, 208 on 12-well, 352 on 24-well, 616 on 48-well, 1120 on 96-well, 3952 on
@@ -180,6 +181,19 @@ complete, so `--resume` fits it again without moving).
     …`, with the same ending.
 - A survey that ends with some points skipped says `<k> of <N> survey points could not
   be sampled and were skipped` in `assumed`.
+
+### Which way the plate lies
+
+A plate turned 180° in its holder lands on itself: every well is where another one
+was, so the survey fits it the same way either way round and **cannot tell**. Only you
+know which corner A1 is at, so say it with `orientation`: `not-turned` (A1 at the
+stage's -X +Y corner) or `turned-180` (A1 at the +X -Y corner). The wells are named
+from it, and the result says so in `assumed`, on either orientation:
+`orientation turned-180 given by the operator: a plate turned 180° lands on itself, so
+the survey cannot see it`. A result declared `turned-180` also has the line of a turn
+(`turned 180° to turned-180 after the fit: ...`). Found out afterwards that the plate
+lies the other way? [`plate-orientation`](plate-orientation.md) renames the wells
+without a new survey.
 
 ## The result
 
