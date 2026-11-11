@@ -1536,6 +1536,33 @@ def test_status_names_the_stand(run_doc: Path) -> None:
         microscope.close()
 
 
+def test_stand_name_reads_the_profile_not_the_stand(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # The step bar names the stand on every refresh(), which never calls status() (its
+    # cost during Live on the Ti2-E, #333): the name is the profile's, and a stand
+    # whose every read fails still has one.
+    def refuses() -> object:
+        raise AssertionError("the stand was read to name it")
+
+    with _replaced(fake_microscope, "state", refuses):
+        assert page.stand_name == "demo"
+    assert page.stand_name == page.status().stand
+
+
+def test_stand_name_is_the_profiles_name(run_doc: Path) -> None:
+    core = FakeCore.demo_like()
+    demo = Profile.demo()
+    named = demo.model_copy(
+        update={"microscope": demo.microscope.model_copy(update={"name": "ti2e-bench"})}
+    )
+    microscope = Microscope.from_core(cast("CMMCorePlus", core), named)
+    try:
+        assert _page(microscope, run_doc).stand_name == "ti2e-bench"
+    finally:
+        microscope.close()
+
+
 def test_status_reads_the_stand(page: PlatePage, fake_microscope: Microscope) -> None:
     fake_microscope.require(XYStage).move_to_um(1000.0, -500.0)
     fake_microscope.require(ZStage).move_to_um(12.5)
