@@ -3428,7 +3428,9 @@ settle window:
 - **An excursion is an error, not a refusal** (FM-64): something moved.
   `AutofocusExcursionError` is a `HardwareError`. m3's scan records it as a
   failed field (m3 §8); its next engage is refused before anything is sent,
-  so `max_failed_in_row` ends the scan with no second jump.
+  so `max_failed_in_row` ends the scan with no second jump. *Amended by
+  #416*: the scan ends at once on it, with the advice for the well where it
+  happened (m3 §8).
 - **A Z read that fails** while the guard needs it switches the autofocus
   off and raises the read's `HardwareError` (unknown counts as the state
   that adds the safeguard, FM-19).
@@ -4295,8 +4297,15 @@ with `--profile nikon-ti2`:
   after an XY move, or the scan after a lost lock in a new well) is D1's
   and D2's: bounded by E, 50 µm on the Ti2-E, while F11 says its plane can
   lie 104 µm away. At the 40×, §12.11.3 avoids it; the scan is #416's.
+  *Settled for the scan by #416* (m3 §8): every well's first field is such
+  an engage, made on purpose, and a trip ends the scan at that well. E
+  still bounds it; a key per objective waits for the numbers the scan's
+  frames record.
 - **PFS locked and following over a wall** is outside every guard (D2's
-  *Not chosen*), at every objective; #416.
+  *Not chosen*), at every objective; #416. *Settled for the scan by #416*
+  (m3 §8): the scan switches PFS off before the first field of every well
+  and engages it again there, under D2. `goto-well` and the page's stage
+  moves still carry a lock over a wall (#454).
 
 ## 13. Offsets between objectives (#340)
 

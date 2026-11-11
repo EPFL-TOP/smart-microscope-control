@@ -2703,6 +2703,134 @@ and without the keys, and a frame whose offsets say otherwise drawn where they
 say (it draws from the record). **Failure modes**: FM-32, FM-73, FM-104,
 FM-107, FM-111, FM-124.
 
+**Refined while planning #416** (PFS across a well's wall; merging this
+decides it; measured on the Ti2-E fake, `main` 8549b4f, 2026-11-11). F11
+(Ti2-E session 3, m2 §12.11.1): at the 40×, the plane the offset's floor
+names lay 46.9 µm below the focus in C4 and at least 56.8 µm above it in
+C3, while the two foci by eye lie 11.7 µm apart: relative to the focus, one
+offset's plane moved by at least 104 µm between two wells. The scan moved
+from well to well with PFS locked and engaged again only when a field read
+unlocked, so PFS locked and following its reference over a wall was outside
+every guard (m2 §12.2 D2, *Not chosen*: no watchdog between actions).
+Measured: PFS locked, an XY move of one pitch with the plane 60 µm toward
+the sample leaves PFS locked and Z +60 µm, with no word. With PFS switched
+off before the move and `engage()` at the operator's offset (a seen offset)
+after it, a plane at +40 µm or −45 µm locks under D2's band (`E` = 50 µm),
+and one at +60 µm or −60 µm trips `AutofocusExcursionError`, switches it
+off and forgets the offset, so the next `engage()` is refused. Z does not
+move while PFS is switched off (0.00 µm on the fake; §12.11.1 on the
+stand).
+
+- **PFS never crosses a well's wall locked.** When the scan uses the
+  autofocus (on and locked at the start, above), before the first field of
+  every well, after the well's start check (FM-130) and not in a dry run,
+  the scan reads `is_engaged()`; on, it calls `disengage()` and reads
+  `is_engaged()` again. The move to the well is then made with PFS off and
+  Z where PFS held it at the last field. The well's first field reads it
+  unlocked and engages it again as the scan's own switch-off
+  (`off_by_the_scan`, FM-129): one `engage()` at the operator's offset,
+  under D2's band around where Z started, `z_start ± E`, which is where PFS
+  held Z in the well before.
+  - **The first well of an attempt too**: nothing tells in which well the
+    operator locked, and a relock where they locked moved Z by −0.04 µm
+    (m2 §12.11.1).
+  - **At every objective and on every stand**, a rule of the scan with no
+    parameter: it costs one engage per well (the Ti2-E's `settle_s` is
+    1 s). Whether a plane moves between wells at the 10× is not known
+    (m2 §12.11.3's probe has not run); a trip there says that the frames
+    would have been far from the focus.
+  - **An autofocus that is off at a wall stays as it is**: the operator's
+    switch-off is not undone (FM-129), and the scan's own failed engage and
+    a focus step's switch-off (§21.6) are already the scan's to engage
+    again. Nothing is counted for that well.
+  - **Not in a dry run**: `disengage()` acts in a dry run (m2 §3.2), and a
+    dry run never calls `engage()`.
+  - **A switch-off that cannot be made or read back ends the scan** before
+    anything moves to the well, since PFS may still be on (unknown counts
+    as on, FM-19): a `HardwareError` from any of the three calls is a
+    `PluginRunError`, raised outside the handler (FM-98): `the autofocus
+    could not be switched off before well <w> (<Type>: <message>): nothing
+    moved to it, and PFS may still be on: switch it off at the stand, then
+    run scan --resume`; `is_engaged()` still `True` after `disengage()`:
+    `the autofocus still reads on after it was switched off before well
+    <w>: nothing moved to it: switch it off at the stand, then run scan
+    --resume`. `MicroscopeHaltedError` and `MotionStoppedError` pass first
+    (FM-64). The checkpoint keeps the wells done.
+- **A trip ends the scan.** An `AutofocusExcursionError` from a field's
+  `engage()` (a wall's, a lost lock's, or the one after a focus step) is no
+  longer a failed field: the layer switched the autofocus off and forgot
+  its offset (m2 §12.2 D2), so every later engage would be refused and the
+  scan could only fail `max_failed_in_row` fields with no frame and a
+  message that blames the stage. It is a `PluginRunError`, raised outside
+  the handler (FM-98): `the autofocus moved Z out of its bound while it
+  locked at <field> (well <w>): <the layer's message, one line>; the
+  checkpoint keeps <n> wells. Its offset names another plane here than
+  where it held (m2 §12.11): with PFS off, focus on the sample in well <w>
+  by eye and lock it from below (m2 §12.10), then run scan --resume (the
+  well is scanned again whole)`. The engage after the last field (§21.6)
+  keeps its rule: said, not a failure.
+- **Counted apart.** An engage counts as a wall's when it is the first
+  attempt after the scan switched the autofocus off at that well's wall (a
+  field off target leaves it to the next field); a field that reads locked
+  first ends the count's claim. §8's line keeps the engages after a lost
+  lock and after the scan's own failed engage; the engages after a focus
+  step stay the focus's (FM-165). `assumed` gains, after §8's line, when
+  the scan switched the autofocus off at a wall at least once: `the
+  autofocus was switched off before the first field of <w> wells, so that
+  no lock crossed a well's wall, and engaged again after it on <a> fields,
+  locked on <l> of them`.
+- **The resume refusal** above names the new cause: `the scan being resumed
+  used the autofocus, which is not locked now (the scan switches it off
+  between wells, and a stop during the focus on the cells leaves it off):
+  lock it on the sample, then run scan --resume`.
+- **The 40× with this** (replaces m2 §12.11.3 step 3's "one well per run"
+  for the scan): lock PFS from below in the first well (m2 §12.10 D7), then
+  scan the wells in one run. A trip ends the scan at the well whose plane
+  moved; that well is imaged once the operator has locked in it from below
+  by hand and run `scan --resume`. Each well's relock is bounded by `E`: at
+  50 µm, F11's jump would be read at about 57 µm, as it was in F11. The
+  stand's copy may set `max_engage_excursion_um` lower for a 40× scan, as
+  m2 §12.11.3 step 2 did, wide enough for a plate's change of height
+  between wells (C3's and C4's foci by eye 11.7 µm apart), and back to 50
+  before a 10× scan: the owner's call at the stand.
+- **Not chosen**:
+  - *Lowering Z before the move* (#416's first example). D2's band is
+    centred on where Z starts: lowered by 200 µm, the way back up to the
+    focus lies outside it, and every well would trip. With PFS off Z does
+    not move, and the bottom's height changes by about 12 µm between two
+    wells (the foci by eye), not 200.
+  - *A first lock from the floor in each well*. Its premise is a focus by
+    eye at that place (m2 §12.10 D5), which a scan has not; in F11's C3 the
+    floor's plane lay above the focus, where a first lock trips. The
+    operator's first lock by hand stays the way into a well where the
+    relock tripped.
+  - *A bound per objective* (`E` per objective, m2 §12.11 D8's *Not
+    chosen*). One `E` bounds every engage, and the stand's copy can be set
+    for a session; a key per objective waits for numbers: each frame records
+    its Z and focus, so the scan's run document says how far a well's lock
+    lies from the last well's at each objective.
+  - *Refusing runs of several wells at an objective the profile names*.
+    Each well's relock is bounded like any engage, and the trip stops the
+    scan at the first well whose plane moved; a refusal would make every
+    well a run of its own at the 40× for good.
+  - *Keeping the lock across walls under a watchdog*: m2 §12.2 D2's *Not
+    chosen* (a thread of its own, M5).
+- **Not here**: `goto-well` and the page's stage moves carry a lock over a
+  wall the same way (#454). NIS-Elements' own acquisition from
+  `nis-export`'s positions engages PFS at each position's offset, outside
+  smc.
+
+**Tests of #416** (names in the plan on the issue; the demo rig with the
+recording `_Autofocus` fake, three wells of four fields): the switch-off
+before each well's first field and its engage there, counted apart, and the
+first well's too; an operator's switch-off at a wall not undone; a focus
+step's switch-off not counted; nothing in a dry run; a switch-off that
+raises, a state read that raises, and one that still reads on, each ending
+the scan with nothing moved to the well; a trip at a well's first field
+and one after a lost lock ending the scan with the checkpoint kept and no
+later engage; the resume refusal's text. **Failure modes**: FM-19, FM-64,
+FM-98, FM-129, FM-130, FM-165, FM-215.
+
 ## 9. Cells (#23)
 
 `smc/plugins/cells/overlap.py`, `detector.py`, `algorithm.py`,
