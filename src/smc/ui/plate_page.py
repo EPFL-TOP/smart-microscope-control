@@ -82,9 +82,11 @@ from smc.ui.guide import (
     drive_image_note,
     forget_label,
     image_sides_note,
+    map_title,
     plan_title,
     preset_differences,
     preset_note_text,
+    stage_label,
     wall_touches_note,
 )
 
@@ -101,7 +103,8 @@ TICK_MS = 1000
 
 #: How often the page looks for a new frame, in milliseconds. It matches
 #: ``LIVE_PERIOD_S``: a faster callback would find no new frame, a slower one would
-#: drop frames the camera took. It reads ``PlatePage.frame()`` and nothing else.
+#: drop frames the camera took. It reads ``PlatePage.frame()`` and, once it has drawn
+#: one, ``PlatePage.is_live`` (to move the cross only while Live runs, m5 §15 D1).
 FRAME_TICK_MS = 100
 
 #: How long ``serve`` waits for Panel's server to stop, in seconds.
@@ -375,6 +378,14 @@ class PlatePageView:
         # tick last read (a result card names a profile only when it is another).
         self._seen_frame: int | None = None
         self._stand: str | None = None
+        # The cross has two writers (m5 §15 D1): the tick, from the stand's status once a
+        # second, and the frame tick, from each Live frame ten times a second. The flag
+        # says the frames hold it: set by the frame tick when it draws a frame's position
+        # while Live runs, cleared by the tick when Live is not running. ``_cross_xy`` is
+        # the position last drawn, so that a redraw of the view relabels the cross
+        # without reading the stand again.
+        self._cross_from_frames = False
+        self._cross_xy: tuple[float, float] | None = None
         self._tools = page.tools()
         # The next step the last redraw drew: the button runs this one, never a step
         # computed at the click (m5 §8.5). And the selection the *Wells* box stands
@@ -418,7 +429,9 @@ class PlatePageView:
         self.route_source = ColumnDataSource(
             {"x": [], "y": [], "order": [], "well": []}
         )
-        self.stage_source = ColumnDataSource({"x": [], "y": []})
+        # ``x``, ``y`` and ``text`` are always set together and of one length: a LabelSet
+        # over columns of different lengths raises in Bokeh, and the map stops redrawing.
+        self.stage_source = ColumnDataSource({"x": [], "y": [], "text": []})
         # The usable scan plan's fields, one rectangle each (m5 §14.2).
         self.fields_source = ColumnDataSource({"x": [], "y": [], "w": [], "h": []})
         self.mapper = LinearColorMapper(
@@ -475,6 +488,24 @@ class PlatePageView:
             size=18,
             line_width=3,
             color="#000000",
+        )
+        # The well the cross is over, beside it: on a white ground, so that it reads over
+        # the wells' fill and the names (m5 §15 D5).
+        self.figure.add_layout(
+            LabelSet(
+                x="x",
+                y="y",
+                text="text",
+                source=self.stage_source,
+                x_offset=12,
+                y_offset=12,
+                text_align="left",
+                text_baseline="bottom",
+                text_font_size="11px",
+                text_font_style="bold",
+                background_fill_color="#ffffff",
+                background_fill_alpha=0.7,
+            )
         )
         self.figure.on_event(Tap, self._handler(self.on_tap))
 
@@ -1511,10 +1542,14 @@ class PlatePageView:
         self.run_text.object = run_text(status)
         self.resume_button.visible = status.halted
         self.stop_button.disabled = False
-        self.stage_source.data = {
-            "x": [] if status.xy_um is None else [status.xy_um[0]],
-            "y": [] if status.xy_um is None else [status.xy_um[1]],
-        }
+        # While Live runs and its frames hold the cross, the tick leaves it to them: a
+        # frame's position is newer than the status read a moment ago. Outside Live the
+        # flag is cleared and the status draws it, so the cross never stays at an older
+        # position than the stage's after Live ends (m5 §15 D1).
+        if not self.page.is_live:
+            self._cross_from_frames = False
+        if not self._cross_from_frames:
+            self._draw_cross(status.xy_um)
         self._problems_status = status.problems
         if not self._objective_shown and status.objective in self._objective_labels:
             # Until it has, once: the select starts at the objective in place, and
@@ -1601,12 +1636,38 @@ class PlatePageView:
         self.connection_text.object = text
 
     def frame_tick(self) -> None:
-        """The frame callback's body: draw the controller's frame when it is new, and nothing else.
+        """The frame callback's body: draw the controller's frame when it is new, and the cross from it while Live runs.
 
         It reads no status and no view (FM-145): it runs ten times a second, and the
-        stand's read and the run document's belong to ``tick``.
+        stand's read and the run document's belong to ``tick``. It reads the controller's
+        frame and, for a frame it has just drawn, whether Live runs: every ``Frame``
+        carries the stage's position read right after its snap, so the cross follows the
+        frames with no device read of its own (m5 §15 D1). Outside Live a frame is old by
+        the time it is drawn (a snap's), and the cross stays where the tick put it; a frame
+        with no position leaves the cross and the flag as they were.
         """
-        self._draw_frame()
+        frame = self._draw_frame()
+        if frame is None or frame.xy_um is None or not self.page.is_live:
+            return
+        self._cross_from_frames = True
+        self._draw_cross(frame.xy_um)
+
+    def _draw_cross(self, xy_um: tuple[float, float] | None) -> None:
+        """Draw the cross at ``xy_um``, or none, with the label of the well it is over.
+
+        The one place that sets ``stage_source``, so that ``x``, ``y`` and ``text`` are
+        set at once and of one length (a closed stand gives three empty lists). The label
+        is computed from the last drawn view, which is ``None`` before the first refresh
+        (the label is then empty): it never asks the controller for a new one (FM-145).
+        """
+        self._cross_xy = xy_um
+        view = self._view
+        label = "" if view is None else stage_label(view.wells, view.pose, xy_um)
+        self.stage_source.data = {
+            "x": [] if xy_um is None else [xy_um[0]],
+            "y": [] if xy_um is None else [xy_um[1]],
+            "text": [] if xy_um is None else [label],
+        }
 
     def _shared_state(self) -> tuple[Any, ...]:
         """What the controller holds that every tab draws: compared, never rebuilt.
@@ -1742,8 +1803,8 @@ class PlatePageView:
         for name, pane in self.tool_cards.items():
             pane.object = card_text(cards.get(name), stand=self._stand)
 
-    def _draw_frame(self) -> None:
-        """Draw the controller's frame when it is one this session has not drawn.
+    def _draw_frame(self) -> Frame | None:
+        """Draw the controller's frame when it is one this session has not drawn, and return it; else ``None``.
 
         The axes are the frame's own pixels: ``dw`` and ``dh`` are its width and
         height, not those of the strided picture (FM-136). Bokeh draws an image's
@@ -1752,9 +1813,10 @@ class PlatePageView:
         """
         frame = self.page.frame()
         if frame is None or frame.number == self._seen_frame:
-            return
+            return None
         self._seen_frame = frame.number
         self._draw_image(frame)
+        return frame
 
     def _draw_image(self, frame: Frame) -> None:
         shown = display_image(frame.image, bit_depth=frame.bit_depth)
@@ -1797,13 +1859,15 @@ class PlatePageView:
         self.mapper.low = 0.0
         self.mapper.high = max(known) if known and max(known) > 0.0 else 1.0
         self.names.visible = len(view.wells) <= NAMES_UP_TO_WELLS
-        # Where the wells are drawn is only as good as the registration: say which map it is.
-        # The scan plan's suffix is where a plan too large to draw says so (m5 §14.3).
-        self.figure.title.text = (
-            f"{view.plate}: nominal map (A1 at 0, 0, not turned), the plate is not registered"
-            if view.nominal
-            else f"{view.plate}: the registered plate"
-        ) + plan_title(view.plan)
+        # Where the wells are drawn is only as good as the registration: say which map it is
+        # (registered, seed, estimated or unplaced, m5 §15 D4). The scan plan's suffix is
+        # where a plan too large to draw says so (m5 §14.3).
+        self.figure.title.text = map_title(view.plate, view.pose) + plan_title(
+            view.plan
+        )
+        # The cross's label names a well of *this* view: a registration that moved the wells
+        # relabels it now, from the position last drawn, and reads nothing (FM-145).
+        self._draw_cross(self._cross_xy)
 
     def _ensure_renderer(self, circular: bool) -> None:
         """Round wells are circles and square ones rectangles: swap the glyph when the plate changes."""

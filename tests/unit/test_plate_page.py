@@ -91,6 +91,21 @@ pytestmark = [
 ]
 
 T0 = datetime(2026, 10, 29, 9, 0, tzinfo=timezone.utc)
+
+
+def _unplaced_title(plate: str = "96-well") -> str:
+    """The title of a map on a stand whose profile has no ``[holder]`` (m5 §15 D4).
+
+    This page's profile is ``Profile.demo()``: it does not say where its plate lies, so
+    the map draws A1 at the origin and says so (the estimated and seed titles are the
+    business of ``test_plate_page_pose_view.py``).
+    """
+    return (
+        f"{plate}: not registered, and this stand does not say where its plate lies: "
+        "A1 is drawn at stage (0, 0), so the cross shows the stage and not a well"
+    )
+
+
 A1_OFF = (1000.0, -500.0)
 TURN_DEG = 7.0
 PITCH_96_UM = 9000.0
@@ -719,7 +734,9 @@ def test_frame_tick_reads_nothing_but_the_frame_from_the_controller(
     page: PlatePage, fake_microscope: Microscope
 ) -> None:
     # FM-145: it runs ten times a second on the loop that handles STOP. Not the status,
-    # not the view, and not the buttons either (`lacks`, `is_live`): `tick` has those.
+    # not the view, and not the buttons either (`lacks`): `tick` has those. One more is
+    # read since #410: whether Live runs, once a new frame has been drawn, to move the
+    # cross from its position only then (m5 §15 D1); a frame already drawn asks nothing.
     fake_microscope.override(Camera, FrameCamera(_rows_columns(6, 10)))
     view = PlatePageView(page)
     page.snap()
@@ -729,7 +746,7 @@ def test_frame_tick_reads_nothing_but_the_frame_from_the_controller(
     view.frame_tick()  # a new frame: drawn
     view.frame_tick()  # the same one: nothing
     assert list(view.image_source.data["dw"]) == [10]
-    assert spy.read == ["frame", "frame"]
+    assert spy.read == ["frame", "is_live", "frame"]
 
 
 def test_a_closed_tab_does_not_end_live(
@@ -1076,16 +1093,12 @@ def test_the_map_says_whether_the_plate_is_registered(
     run_doc: Path, page: PlatePage
 ) -> None:
     view = PlatePageView(page)
-    assert view.figure.title.text == (
-        "96-well: nominal map (A1 at 0, 0, not turned), the plate is not registered"
-    )
+    assert view.figure.title.text == _unplaced_title("96-well")
     _seed(run_doc, "plate-registration", "plate", _plate())
     view.refresh()
     assert view.figure.title.text == "96-well: the registered plate"
     view.plate_select.value = "384-well"
-    assert view.figure.title.text == (
-        "384-well: nominal map (A1 at 0, 0, not turned), the plate is not registered"
-    )
+    assert view.figure.title.text == _unplaced_title("384-well")
 
 
 def test_names_are_drawn_only_up_to_96_wells(page: PlatePage) -> None:
@@ -1601,8 +1614,7 @@ def test_the_map_draws_a_rectangle_for_each_planned_field_and_the_title_says_so(
     assert data["w"] == [600.0] * 12
     assert data["h"] == [400.0] * 12
     assert view.figure.title.text == (
-        "96-well: nominal map (A1 at 0, 0, not turned), the plate is not registered"
-        "; scan plan: 12 fields in 3 wells"
+        _unplaced_title("96-well") + "; scan plan: 12 fields in 3 wells"
     )
 
 
@@ -1618,10 +1630,7 @@ def test_the_title_of_a_registered_plate_gets_the_same_suffix(
     # A page with no plan says nothing of one.
     run_doc.unlink()
     view.refresh()
-    assert (
-        view.figure.title.text
-        == "96-well: nominal map (A1 at 0, 0, not turned), the plate is not registered"
-    )
+    assert view.figure.title.text == _unplaced_title("96-well")
 
 
 def test_a_plan_over_the_bound_draws_no_field_and_the_title_says_why(
@@ -3295,9 +3304,7 @@ def test_the_refresh_button_redraws_the_view_after_the_run_document_changed(
     run_doc: Path, page: PlatePage
 ) -> None:
     view = PlatePageView(page)
-    unregistered = (
-        "96-well: nominal map (A1 at 0, 0, not turned), the plate is not registered"
-    )
+    unregistered = _unplaced_title("96-well")
     assert view.figure.title.text == unregistered
     _seed(run_doc, "plate-registration", "plate", _plate())
     assert view.figure.title.text == unregistered  # a tick never reads the view
