@@ -1161,6 +1161,16 @@ class PlatePage:
         return self._run_doc.absolute()
 
     @property
+    def stand_name(self) -> str:
+        """The stand's name, the profile's ``microscope.name`` (m5 §17.6).
+
+        Read from the profile and never from the stand: the step bar names it on every
+        ``refresh()``, which must not call ``status()`` (its cost during Live on the
+        Ti2-E, #333), and a stand that is not connected still has a name.
+        """
+        return self._profile.microscope.name
+
+    @property
     def plate(self) -> str:
         """The plate the page is about, a name of ``useq``'s registry."""
         return self._plate

@@ -29,7 +29,14 @@ from smc.plugins.slots import (
     WellFit,
     WellRef,
 )
-from smc.ui.controller import CheckItem, LoadedPreset, MapPose, PlanLayer, WellView
+from smc.ui.controller import (
+    _CHECKLIST,
+    CheckItem,
+    LoadedPreset,
+    MapPose,
+    PlanLayer,
+    WellView,
+)
 from smc.ui.guide import (
     CAPTURE_WELLS,
     DRY_RUN_NO_FRAME,
@@ -37,24 +44,33 @@ from smc.ui.guide import (
     MAP_FIELDS_UP_TO,
     NO_CALIBRATION_FOR_SIDES,
     ORIENTATION_IN_STAGE_TERMS,
+    SCREEN_LEADS,
+    SCREEN_TITLES,
     SELECT_WELLS,
+    STEP_OF_SLOT,
+    STEP_TITLES,
+    STEPS,
     WALLS_DRY_RUN,
     WALLS_MAX_CENTRES,
     WALLS_MIN_CENTRES,
     WALLS_NEED_CALIBRATION,
     NextStep,
+    StepName,
+    StepState,
     a1_corner,
     busy_note,
     capture_centre_label,
     capture_wall_label,
     centres_text,
     command_line,
+    continue_label,
     drive_image_note,
     duration_text,
     forget_label,
     image_sides_note,
     map_title,
     next_slot,
+    opening_step,
     orientation_label,
     plan_title,
     preset_differences,
@@ -63,6 +79,8 @@ from smc.ui.guide import (
     scan_plan_card_lines,
     side_words,
     stage_label,
+    step_button_label,
+    step_states,
     wall_touches_note,
     walls_card_lines,
     walls_centres_problem,
@@ -1176,3 +1194,308 @@ def test_stage_label_takes_the_first_well_in_the_views_order() -> None:
     twin = _well("Z9", (0.0, 0.0))
     assert stage_label((WELLS[0], twin), MapPose("registered"), (0.0, 0.0)) == "over A1"
     assert stage_label((twin, WELLS[0]), MapPose("registered"), (0.0, 0.0)) == "over Z9"
+
+
+# -- the page's steps (m5 §17.5, #443) --------------------------------------------------
+
+
+def _checklist(**states: str) -> tuple[CheckItem, ...]:
+    """The page's checklist, in its order, with ``states`` by slot (``plate="ok"``), else ``not run``.
+
+    A slot is written with an underscore for the dash (``scan_plan``): a keyword cannot
+    hold a ``-``. The optional flags are the controller's own, so a change to the order
+    or the optional slots shows up here.
+    """
+    wanted = {slot.replace("-", "_"): state for slot, state in states.items()}
+    return tuple(
+        _item(slot, wanted.get(slot.replace("-", "_"), "not run"), optional=optional)
+        for slot, optional in _CHECKLIST
+    )
+
+
+def _states(
+    checklist: Sequence[CheckItem],
+    *,
+    connected: bool = True,
+    stand: str = "demo-sample",
+    preset: str | None = None,
+    plate: str = "96-well",
+    plan: PlanLayer | None = None,
+) -> dict[StepName, StepState]:
+    return {
+        state.step: state
+        for state in step_states(
+            checklist,
+            connected=connected,
+            stand=stand,
+            preset=preset,
+            plate=plate,
+            plan=plan,
+        )
+    }
+
+
+def test_every_checklist_slot_has_a_step() -> None:
+    # A slot of the controller's checklist that no step holds would be in the expert
+    # view only, and the step bar could never say it is waiting for it.
+    assert {slot for slot, _optional in _CHECKLIST} <= set(STEP_OF_SLOT)
+    assert set(STEP_OF_SLOT.values()) <= set(STEPS)
+    # Every step holds something: a step with no slot could never be done or suggested.
+    assert set(STEP_OF_SLOT.values()) == set(STEPS)
+    assert tuple(STEP_TITLES) == STEPS
+    assert set(SCREEN_TITLES) == set(STEPS) == set(SCREEN_LEADS)
+
+
+def test_a_step_is_done_when_its_required_slots_are_ok() -> None:
+    nothing = _states(_checklist())
+    assert [nothing[step].done for step in STEPS] == [True, False, False, False, False]
+
+    plate = _states(_checklist(plate="ok"))
+    assert [plate[step].done for step in STEPS] == [True, True, False, False, False]
+
+    # The optional slots never decide: the stand is done by the connection alone, and
+    # a camera calibration that is ok does not make any other step done.
+    calibrated = _states(_checklist(camera_calibration="ok"))
+    assert [calibrated[step].done for step in STEPS] == [
+        True,
+        False,
+        False,
+        False,
+        False,
+    ]
+    away = _states(_checklist(camera_calibration="ok", plate="ok"), connected=False)
+    assert away["stand"].done is False
+    assert away["plate"].done is True
+
+    # Results is done when all five of its slots are, and not one before.
+    four = _states(_checklist(cells="ok", density="ok", route="ok", report="ok"))
+    assert four["results"].done is False
+    five = _states(
+        _checklist(cells="ok", density="ok", route="ok", report="ok", nis_export="ok")
+    )
+    assert five["results"].done is True
+
+    # A slot that is unusable is not ok: the step it belongs to is not done.
+    assert _states(_checklist(scan="unusable"))["scan"].done is False
+
+
+def test_a_step_whose_slots_the_checklist_does_not_hold_is_not_done() -> None:
+    # Unknown beats guessed: an empty checklist says nothing about the plate, and a step
+    # with no required slot in it is not done (all([]) would say it is).
+    states = _states(())
+    assert [states[step].done for step in STEPS] == [True, False, False, False, False]
+
+
+def test_the_suggested_step_holds_the_next_slot() -> None:
+    # Walk the workflow: each slot made ok in turn moves the suggestion to the step of
+    # the next one, and nothing is suggested once everything is done.
+    order = [
+        ("plate", "plate"),
+        ("scan-plan", "wells"),
+        ("scan", "scan"),
+        ("cells", "results"),
+        ("density", "results"),
+        ("route", "results"),
+        ("report", "results"),
+        ("nis-export", "results"),
+    ]
+    done: dict[str, str] = {}
+    for slot, step in order:
+        states = _states(_checklist(**done))
+        assert [s.step for s in states.values() if s.suggested] == [step]
+        done[slot] = "ok"
+    everything = _states(_checklist(**done))
+    assert not any(state.suggested for state in everything.values())
+    assert all(state.done for state in everything.values())
+
+    # An unusable slot is still the next one: the step is suggested to run it again.
+    stale = _states(_checklist(plate="ok", scan_plan="unusable"))
+    assert [s.step for s in stale.values() if s.suggested] == ["wells"]
+
+
+def test_the_page_opens_on_the_stand_until_it_is_connected() -> None:
+    # A page not connected suggests the stand, whatever the run document holds.
+    away = step_states(
+        _checklist(plate="ok", scan_plan="ok"),
+        connected=False,
+        stand="demo-sample",
+        preset=None,
+        plate="96-well",
+        plan=None,
+    )
+    assert [s.step for s in away if s.suggested] == ["stand"]
+    assert opening_step(away) == "stand"
+
+    # Connected, it opens on the step of the next slot, and on Results when nothing is
+    # left (the owner reads what was made).
+    connected = step_states(
+        _checklist(plate="ok"),
+        connected=True,
+        stand="demo-sample",
+        preset=None,
+        plate="96-well",
+        plan=None,
+    )
+    assert opening_step(connected) == "wells"
+    all_ok = {slot: "ok" for slot, _optional in _CHECKLIST}
+    finished = step_states(
+        _checklist(**all_ok),
+        connected=True,
+        stand="demo-sample",
+        preset=None,
+        plate="96-well",
+        plan=None,
+    )
+    assert opening_step(finished) == "results"
+    assert opening_step(()) == "results"
+
+
+@given(
+    st.lists(
+        st.sampled_from(["ok", "not run", "unusable"]),
+        min_size=len(_CHECKLIST),
+        max_size=len(_CHECKLIST),
+    ),
+    st.booleans(),
+)
+def test_at_most_one_step_is_suggested_and_never_a_done_one(
+    states: list[str], connected: bool
+) -> None:
+    checklist = tuple(
+        _item(slot, state, optional=optional)
+        for (slot, optional), state in zip(_CHECKLIST, states, strict=True)
+    )
+    result = step_states(
+        checklist,
+        connected=connected,
+        stand="s",
+        preset=None,
+        plate="96-well",
+        plan=None,
+    )
+    suggested = [state for state in result if state.suggested]
+    assert len(suggested) <= 1
+    assert not any(state.done for state in suggested)
+    # The page opens on the suggested step, else on Results.
+    assert opening_step(result) == (suggested[0].step if suggested else "results")
+    # A stand that is not connected is the one suggestion, and the stand is not done.
+    if not connected:
+        assert [state.step for state in suggested] == ["stand"]
+
+
+def test_a_done_steps_summary_names_what_it_holds() -> None:
+    all_ok = {slot: "ok" for slot, _optional in _CHECKLIST}
+    plan = PlanLayer(count=72, wells=2, fov_um=(512.0, 512.0), fields=())
+    states = _states(
+        _checklist(**all_ok), stand="demo-sample", preset="weekly", plan=plan
+    )
+    assert states["stand"].summary == "demo-sample, preset weekly"
+    assert states["plate"].summary == "96-well, registered"
+    assert states["wells"].summary == "2 wells, 72 fields"
+    assert states["scan"].summary == "scanned"
+    assert states["results"].summary == "5 of 5 done"
+
+    # No preset: the stand alone. Not connected: it says so, and it is the one asked for.
+    assert _states(_checklist(), preset=None)["stand"].summary == "demo-sample"
+    away = _states(_checklist(), connected=False)["stand"]
+    assert (away.summary, away.suggested) == ("not connected", True)
+
+    # The singular, for a field and for a well.
+    one = PlanLayer(count=1, wells=1, fov_um=(1.0, 1.0), fields=())
+    assert _states(_checklist(**all_ok), plan=one)["wells"].summary == "1 well, 1 field"
+    # A plan the page could not read still says what the slot says, nothing it invents.
+    assert _states(_checklist(**all_ok), plan=None)["wells"].summary == "laid out"
+
+    # Results counts what is done, and says so before it is all done.
+    partial = _states(_checklist(plate="ok", scan_plan="ok", scan="ok", cells="ok"))
+    assert partial["results"].summary == "1 of 5 done"
+    assert partial["results"].suggested is True
+
+
+def test_a_step_neither_done_nor_suggested_says_nothing_and_the_suggested_says_next() -> (
+    None
+):
+    states = _states(_checklist(plate="ok"))
+    assert states["wells"].summary == "next"
+    assert states["scan"].summary == ""
+    assert states["results"].summary == ""
+
+
+def test_a_summary_is_one_line_of_at_most_forty_characters() -> None:
+    long = "a-stand-with-a-very-long-profile-name-indeed"
+    summary = _states(_checklist(), stand=long, preset="a-preset-with-a-long-name")[
+        "stand"
+    ].summary
+    assert len(summary) <= 40
+    assert summary.startswith("a-stand-with-a-very-long")
+    assert "\n" not in summary
+    # A short one is never cut.
+    assert (
+        _states(_checklist(), stand="x", preset="p")["stand"].summary == "x, preset p"
+    )
+
+
+def test_step_labels_are_unique_and_numbered() -> None:
+    states = step_states(
+        _checklist(plate="ok"),
+        connected=True,
+        stand="demo-sample",
+        preset=None,
+        plate="96-well",
+        plan=None,
+    )
+    labels = [step_button_label(i, state) for i, state in enumerate(states, start=1)]
+    assert labels == [
+        "1. Stand ✓",
+        "2. Plate ✓",
+        "3. Wells",
+        "4. Scan",
+        "5. Results",
+    ]
+    assert len(set(labels)) == len(labels)
+    # None of them is a bare title: a step's name starts with its number, so that it is
+    # never the one of the *Plate* select or of the map's title.
+    assert all(label[0].isdigit() for label in labels)
+
+
+def test_the_screens_titles_and_leads_are_the_designs() -> None:
+    assert SCREEN_TITLES == {
+        "stand": "Which stand, and which preset?",
+        "plate": "Where is the plate?",
+        "wells": "Which wells?",
+        "scan": "Scan the selected wells",
+        "results": "Results",
+    }
+    assert SCREEN_LEADS == {
+        "stand": (
+            "The preset fills in the plate, the scan's coverage and the cell "
+            "detector. You can change any of them later."
+        ),
+        "plate": (
+            "Centre three wells far apart by eye, with Live and the arrows, and "
+            "capture each centre."
+        ),
+        "wells": (
+            "Click wells on the map, or type them. The map shows the fields and "
+            "the time the scan will take."
+        ),
+        "scan": "STOP, at the top right, stops the scan.",
+        "results": (
+            "Each step reads the one before. Run the next one, or all that are left."
+        ),
+    }
+    assert STEP_TITLES == {
+        "stand": "Stand",
+        "plate": "Plate",
+        "wells": "Wells",
+        "scan": "Scan",
+        "results": "Results",
+    }
+
+
+def test_continue_label_names_the_next_step_and_none_after_results() -> None:
+    assert continue_label("stand") == "Continue to Plate"
+    assert continue_label("plate") == "Continue to Wells"
+    assert continue_label("wells") == "Continue to Scan"
+    assert continue_label("scan") == "Continue to Results"
+    assert continue_label("results") is None

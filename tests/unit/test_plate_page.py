@@ -398,7 +398,7 @@ def test_a_snap_is_drawn_by_the_next_tick_flipped_and_at_the_frames_size(
     fake_microscope.override(Camera, FrameCamera(_rows_columns(6, 10), bit_depth=14))
     view = PlatePageView(page)
     assert view.image_figure.title.text == "no frame yet"
-    assert view.tabs.active == 0
+    step = view.step
     _snap_and_draw(view, page)
     frame = page.frame()
     assert frame is not None
@@ -411,8 +411,9 @@ def test_a_snap_is_drawn_by_the_next_tick_flipped_and_at_the_frames_size(
     assert list(drawn["dw"]) == [10]
     assert list(drawn["dh"]) == [6]
     assert view.image_figure.title.text == frame.summary
-    assert view.tabs.active == 1
-    # The models with a frame in them still build, with the image tab active.
+    # The image is always on screen beside the map: a snap changes no screen (m5 §17.2).
+    assert (view.step, view.expert) == (step, False)
+    # The models with a frame in them still build.
     assert view.layout.get_root() is not None
 
 
@@ -432,34 +433,6 @@ def test_a_flat_frame_is_drawn_against_the_cameras_own_bit_depth(
     camera.frame = np.zeros((6, 10), dtype=np.uint16)
     _snap_and_draw(view, page)
     assert (view.image_source.data["image"][0] == 0).all()
-
-
-def test_the_tabs_are_not_dynamic_so_the_plate_figure_keeps_its_view_and_its_frame(
-    page: PlatePage,
-) -> None:
-    view = PlatePageView(page)
-    assert list(view.tabs._names) == ["Plate", "Image"]
-    # A dynamic tab destroys the figure's view when another tab is shown, and the
-    # figure's DataRange1d keeps the bounds of the dead view: the map is then framed
-    # on the union of every plate it drew, and Reset restores that (#297). Only
-    # /ui-check shows it (pytest has no browser): its `after-density` state.
-    assert view.tabs.dynamic is False
-    assert view.tabs.active == 0
-
-
-def test_both_figures_stay_in_the_model_tree_whichever_tab_is_shown(
-    page: PlatePage,
-) -> None:
-    view = PlatePageView(page)
-    root = view.layout.get_root()
-    # A figure that leaves the model tree has its view destroyed in the browser, and
-    # its ranges keep the bounds of the dead one (FM-174): what a dynamic tab does to
-    # the figure of the tab not shown. The parameter pinned above is how it is avoided.
-    for active in (1, 0, 1):
-        view.tabs.active = active
-        in_tree = {model.id for model in root.references()}
-        assert view.figure.id in in_tree
-        assert view.image_figure.id in in_tree
 
 
 def test_a_tool_that_ends_between_two_ticks_of_another_tab_is_drawn_there_too(
@@ -518,13 +491,14 @@ def test_a_frame_snapped_in_another_tab_is_drawn_by_the_next_tick(
     fake_microscope.override(Camera, FrameCamera(_rows_columns(6, 10)))
     first = PlatePageView(page)
     second = PlatePageView(page)
+    steps = (first.step, second.step)
     _snap_and_draw(first, page)
     assert list(second.image_source.data["dw"]) == []
     second.tick()
     assert list(second.image_source.data["dw"]) == [10]
     assert list(second.image_source.data["dh"]) == [6]
-    # Only the tab that clicked is taken to the image.
-    assert second.tabs.active == 0
+    # Neither tab changes its screen for a snap, the one that clicked included.
+    assert (first.step, second.step) == steps
     # A tab opened after the snap draws it at once.
     third = PlatePageView(page)
     assert list(third.image_source.data["dw"]) == [10]
@@ -608,11 +582,12 @@ def test_live_button_starts_and_ends_live_and_says_which(
     fake_microscope.override(Camera, FrameCamera(_rows_columns(6, 10)))
     view = PlatePageView(page)
     assert (view.live_button.label, view.live_button.disabled) == ("Live", False)
-    assert view.tabs.active == 0
+    step = view.step
     view.live_button.clicks += 1
     assert page.is_live
     assert view.live_button.label == "End live"
-    assert view.tabs.active == 1
+    # The image is beside the map already: Live changes no screen (m5 §17.2 D2).
+    assert (view.step, view.expert) == (step, False)
     view.live_button.clicks += 1
     assert page.join(10.0)
     view.tick()
@@ -979,7 +954,7 @@ def test_a_result_card_is_plain_text_under_its_tool(
     # Under its Run button (and the note that explains a disabled one), in its own
     # section; no other tool shows it.
     run = view.tool_runs["scan"]
-    (accordion,) = view.layout.select(pn.Accordion)
+    accordion = view.accordion  # in the expert view's list only, not in the layout
     (section,) = [s for stage in accordion.objects for s in stage if run in s]
     assert list(section).index(pane) == list(section).index(run) + 2
     assert view.tool_cards["goto-well"].object == ""
@@ -1023,7 +998,7 @@ def test_tools_under_more_are_built(page: PlatePage) -> None:
     # last card of the accordion, with its required field as a row of its own.
     assert "goto-well" in view.tool_runs
     assert "well" in view.tool_fields["goto-well"]
-    (accordion,) = view.layout.select(pn.Accordion)
+    accordion = view.accordion  # in the expert view's list only, not in the layout
     assert len(accordion.objects) == 4
     last = [b for b in accordion.objects[-1].select(pn.widgets.Button)]
     assert [b for b in last if b is view.tool_runs["goto-well"]]
@@ -1261,18 +1236,30 @@ def test_a_keyboard_interrupt_in_a_handler_is_not_swallowed(page: PlatePage) -> 
     assert view.message.object == ""
 
 
+def _roots(view: PlatePageView) -> list[Any]:
+    """The layout and every object of every screen: a screen that is not shown is not in the layout.
+
+    ``Viewable.select`` on the layout sees the screen the step panel holds now and
+    nothing of the others, so a button of a screen not shown would escape every walk
+    below (m5 §17.6, FM-171: the same gap the accordion has).
+    """
+    return [view.layout, *(item for items in view.screens.values() for item in items)]
+
+
 def _page_widgets(view: PlatePageView) -> list[Any]:
-    """Every widget of the view: the layout's, the tool column's too, and the view's attributes.
+    """Every widget of the view: the layout's, the screens', the tool column's, and the view's attributes.
 
     ``Viewable.select`` does not go into the panels of an ``Accordion`` (measured: 26
     widgets, and none of the four Run buttons, Capture centre, Capture wall or Forget),
     so each panel is walked, and the widgets the view holds as attributes (a widget or a
     dict of them) are added: a container this walk does not know cannot hide one.
     """
-    found: dict[int, Any] = {id(w): w for w in view.layout.select(pn.widgets.Widget)}
-    for accordion in view.layout.select(pn.Accordion):
-        for panel in accordion.objects:
-            found.update({id(w): w for w in panel.select(pn.widgets.Widget)})
+    found: dict[int, Any] = {}
+    for root in _roots(view):
+        found.update({id(w): w for w in root.select(pn.widgets.Widget)})
+        for accordion in root.select(pn.Accordion):
+            for panel in accordion.objects:
+                found.update({id(w): w for w in panel.select(pn.widgets.Widget)})
     for value in vars(view).values():
         for item in value.values() if isinstance(value, dict) else [value]:
             if isinstance(item, pn.widgets.Widget):
@@ -1285,12 +1272,14 @@ def _placed(view: PlatePageView) -> set[int]:
 
     ``_page_widgets`` adds what the view holds as attributes, so a widget deleted from
     the layout is still found there: it cannot tell a widget the operator sees from one
-    only a test reads. This walk goes through the layout alone.
+    only a test reads. This walk goes through the layout and the screens alone.
     """
-    found = {id(o) for o in view.layout.select()}
-    for accordion in view.layout.select(pn.Accordion):
-        for panel in accordion.objects:
-            found.update(id(o) for o in panel.select())
+    found: set[int] = set()
+    for root in _roots(view):
+        found.update(id(o) for o in root.select())
+        for accordion in root.select(pn.Accordion):
+            for panel in accordion.objects:
+                found.update(id(o) for o in panel.select())
     return found
 
 
@@ -1317,11 +1306,31 @@ def test_the_widgets_that_ask_and_explain_are_on_the_page(page: PlatePage) -> No
         assert id(getattr(view, name)) in placed, f"{name} is not in the layout"
 
 
+def _page_panes(view: PlatePageView) -> list[Any]:
+    """Every pane of the view, as ``_page_widgets`` finds the widgets: the layout's, the screens', the accordion's panels', and the view's attributes.
+
+    A pane is no widget, and the four outcome lines carry a watcher of their own
+    (``_hide_when_empty``, m5 §17.3): a walk of widgets alone does not see them, so a
+    handler registered on one without ``_handler`` passed (adversarial review of #443).
+    """
+    found: dict[int, Any] = {}
+    for root in _roots(view):
+        found.update({id(p): p for p in root.select(pn.pane.PaneBase)})
+        for accordion in root.select(pn.Accordion):
+            for panel in accordion.objects:
+                found.update({id(p): p for p in panel.select(pn.pane.PaneBase)})
+    for value in vars(view).values():
+        for item in value.values() if isinstance(value, dict) else [value]:
+            if isinstance(item, pn.pane.PaneBase):
+                found[id(item)] = item
+    return list(found.values())
+
+
 def test_every_handler_the_page_registers_is_guarded(page: PlatePage) -> None:
     view = PlatePageView(page)
     registered: list[Any] = [
         watcher.fn
-        for widget in _page_widgets(view)
+        for widget in [*_page_widgets(view), *_page_panes(view)]
         for by_name in widget.param.watchers.values()
         for watchers in by_name.values()
         for watcher in watchers
@@ -1332,9 +1341,12 @@ def test_every_handler_the_page_registers_is_guarded(page: PlatePage) -> None:
     ours = [
         fn for fn in registered if getattr(fn, "__module__", "") == plate_page.__name__
     ]
-    # 30 widgets' handlers and the tap at the time of writing: a floor that a lost
-    # container (the Accordion's 7) would go under.
-    assert len(ours) >= 30, "the test found too few handlers to check"
+    # 69 handlers at the time of writing (the widgets', the four outcome lines', the
+    # step bar's and the tap; measured by raising the floor until it failed): a floor
+    # that a lost container, a screen's list or the accordion's 7 would go under. It was
+    # 30 before the steps, and a floor that far under the count no longer notices a walk
+    # that loses a third of them.
+    assert len(ours) >= 60, f"the test found too few handlers to check: {len(ours)}"
     unguarded = [
         getattr(fn, "__qualname__", repr(fn))
         for fn in ours
@@ -2892,10 +2904,18 @@ def test_a_square_welled_plate_says_so_beside_the_walls_run(
 def test_no_widget_is_placed_twice_in_the_page(walls_page: PlatePage) -> None:
     # A Panel widget placed twice in one layout is drawn once (measured: one Bokeh model
     # for two places), so the second place is empty and nothing fails. The tree is the
-    # check, not a look at the page: every object of the layout is found once.
+    # check, not a look at the page: every object of the layout is found once. The layout
+    # holds one screen at a time (m5 §17.2 D5), so each screen is shown in turn: a widget
+    # listed twice in the screen's own list would be drawn once, and only that screen
+    # would show the hole.
     view = PlatePageView(walls_page)
+    for step in plate_page.STEPS:
+        view.show_step(step)
+        found = _placements(view)
+        assert len(found) == len(set(found)), f"a widget is placed twice on {step}"
+    view.show_expert(True)
     found = _placements(view)
-    assert len(found) == len(set(found))
+    assert len(found) == len(set(found)), "a widget is placed twice in the expert view"
 
 
 def _placements(view: PlatePageView) -> list[int]:
@@ -2909,10 +2929,18 @@ def _placements(view: PlatePageView) -> list[int]:
 
 def test_the_check_for_a_widget_placed_twice_can_fail(walls_page: PlatePage) -> None:
     # The check above must be able to fail: a widget put in two places is found twice.
+    # The section is in the accordion, which only the expert view renders.
     view = PlatePageView(walls_page)
+    view.show_expert(True)
     _section(view, "plate-registration").append(view.walls_forget_button)
     found = _placements(view)
     assert len(found) - len(set(found)) == 1
+    assert found.count(id(view.walls_forget_button)) == 2
+    # And on a step's own screen, whose list is not the accordion's.
+    view.show_step("plate")
+    view.screens["plate"].append(view.walls_forget_button)
+    view.show_step("plate")
+    found = _placements(view)
     assert found.count(id(view.walls_forget_button)) == 2
 
 

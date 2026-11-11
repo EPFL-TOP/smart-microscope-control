@@ -34,14 +34,15 @@ import math
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
-from typing import Any, cast
+from collections.abc import Callable, Iterator, Mapping
+from typing import Any, Literal, cast
 
 import numpy as np
 import panel as pn
 import useq
 from bokeh.events import Tap
 from bokeh.models import (
+    BasicTickFormatter,
     ColorBar,
     ColumnDataSource,
     HoverTool,
@@ -76,21 +77,29 @@ from smc.ui.frames import Frame, display_image
 from smc.ui.guide import (
     END_LIVE_LABEL,
     ORIENTATION_IN_STAGE_TERMS,
+    SCREEN_LEADS,
+    SCREEN_TITLES,
+    STEPS,
     NextStep,
+    StepName,
     busy_note,
     capture_centre_label,
     capture_wall_label,
     centres_text,
+    continue_label,
     drive_image_note,
     forget_label,
     image_sides_note,
     map_title,
+    opening_step,
     orientation_label,
     plan_title,
     preset_differences,
     preset_note_text,
     side_words,
     stage_label,
+    step_button_label,
+    step_states,
     wall_touches_note,
 )
 
@@ -139,18 +148,50 @@ _Z_DIRECTIONS = {"up": 1.0, "down": -1.0}
 #: cannot show as nothing.
 NO_LABEL = "(no label)"
 
-#: The centre's tabs, in the order they are built.
-_PLATE_TAB = 0
-_IMAGE_TAB = 1
+#: The step panel's width and the two figures' height (m5 §17.3). The design says 460 px so
+#: that the strip, the step bar, both figures and the drive bar are on a 1280 x 800 window;
+#: measured by ``/ui-check``, 460 leaves the whole drive bar below the fold (its last
+#: control at y 927 to 958), and 400 px, the floor the plan allows, shows its pad and its
+#: first rows: a figure lower than 400 px is a deviation to report, not a fix (#443).
+STEP_PANEL_WIDTH_PX = 400
+FIGURE_HEIGHT_PX = 400
+
+#: The step panel scrolls on its own, below the strip and the step bar (about 130 px at
+#: 1280 px wide): a screen taller than the window scrolls inside the panel, and the map,
+#: the image and the strip stay where they are (m5 §17.3).
+_STEP_PANEL_MAX_HEIGHT = "calc(100vh - 130px)"
+
+#: The strip stays at the top of the window when the page scrolls: a white ground, so that
+#: what scrolls under it is not read through it.
+_STICKY_STRIP = {
+    "position": "sticky",
+    "top": "0",
+    "z-index": "100",
+    "background-color": "white",
+}
+
+#: The screen the expert view shows: today's regions, behind one switch (m5 §17.2 D4).
+ScreenName = StepName | Literal["expert"]
+
+#: The tools each screen lists, provisionally (m5 §17.7 B1): today's tool sections, in
+#: the order of the workflow. B2 to B4 replace each screen's list with its designed
+#: contents. The names are the registry's (``timing`` fills the checklist's ``timings``).
+_SCREEN_TOOLS: Mapping[StepName, tuple[str, ...]] = {
+    "stand": ("camera-calibration", "timing"),
+    "plate": ("plate-registration",),
+    "wells": ("scan-plan",),
+    "scan": ("scan",),
+    "results": ("cells", "density", "route", "report", "nis-export"),
+}
+
+#: The width of a step's button and of the line under it in the step bar, in pixels.
+_STEP_WIDTH_PX = 170
 
 #: The two labels of the live button: ``_draw_buttons`` draws them and ``on_live`` reads
 #: them, so that a click does what the button says (m5 §5.3, #287). The second is the
 #: guide's, which ``busy_note`` quotes: the note and the button cannot differ (m5 §11.2).
 _LIVE_LABEL = "Live"
 _END_LIVE_LABEL = END_LIVE_LABEL
-
-#: The width of the note under the *Plate* select, in pixels: it wraps inside the map's column.
-_PLATE_NOTE_WIDTH = 520
 
 #: What the captures' note says while the buttons name no well (m5 §11.1).
 _NO_WELL_NOTE = (
@@ -177,8 +218,9 @@ _WARNING = "#b45309"
 #: ``<pre>`` through a stylesheet. Text, never markup (FM-139).
 _WRAP_STYLES = {"white-space": "pre-wrap", "overflow-wrap": "anywhere"}
 _WRAP_SHEET = "pre { white-space: pre-wrap; overflow-wrap: anywhere; }"
-#: The width of the text panes of the tools column, inside its 420 px.
-_TEXT_WIDTH = 380
+#: The width of the text panes of the step panel, inside its 400 px (m5 §17.3): every fixed
+#: width placed in a screen is at most this, so that nothing runs past the panel's edge.
+_TEXT_WIDTH = 370
 
 _SELECTED_OUTLINE = "#1f77b4"
 _PLAIN_OUTLINE = "#888888"
@@ -443,13 +485,19 @@ class PlatePageView:
         )
         self.figure = figure(
             match_aspect=True,
-            height=560,
+            height=FIGURE_HEIGHT_PX,
             sizing_mode="stretch_width",
             x_axis_label="stage X (µm)",
             y_axis_label="stage Y (µm)",
             tools="pan,wheel_zoom,box_zoom,reset,save",
             active_scroll="wheel_zoom",
         )
+        # Stage positions are whole micrometres up to a few hundred thousand: plain labels
+        # (-60000), never ``4.000e+4``, which Bokeh picks as soon as one tick reaches 1e5
+        # and which, in a 440 px map, ran the labels of the x axis into one another
+        # (``/ui-check``, #443; FM-174 reads the tick labels for it).
+        self.figure.xaxis.formatter = BasicTickFormatter(use_scientific=False)
+        self.figure.yaxis.formatter = BasicTickFormatter(use_scientific=False)
         self.wells_renderer: Any = None
         self.hover = HoverTool(tooltips="@tip")
         self.figure.add_tools(self.hover)
@@ -548,13 +596,23 @@ class PlatePageView:
             )
         )
         self.figure.on_event(Tap, self._handler(self.on_tap))
+        # The map's title says how far the wells can be trusted (registered, estimated,
+        # unplaced: m5 §15 D4) and the plan's size, in a sentence a figure's own title
+        # cuts at its width: at 440 px (m5 §17.3) it was clipped, caveat and all
+        # (``/ui-check``, #443). The text is set on both from one place (``_draw_wells``);
+        # the figure's own title is hidden, a pane above it wraps the same words.
+        self.figure.title.visible = False
+        self.map_title_text = _wrapped_text(
+            width=None, extra={"font-weight": "bold", "font-size": "12px"}
+        )
+        self.map_title_text.sizing_mode = "stretch_width"
 
         # The camera's frame: 8-bit grey from 0 to 255 (``display_image``), whatever
         # the camera's bit depth is.
         self.image_source = ColumnDataSource({"image": [], "dw": [], "dh": []})
         self.image_figure = figure(
             match_aspect=True,
-            height=560,
+            height=FIGURE_HEIGHT_PX,
             sizing_mode="stretch_width",
             title=NO_FRAME_TEXT,
             x_axis_label="camera x (px)",
@@ -572,10 +630,21 @@ class PlatePageView:
             color_mapper=LinearColorMapper(palette=Greys256, low=0, high=255),
         )
 
-        self.message = pn.pane.Str("", styles={"color": _WARNING})
-        self.problems_text = pn.pane.Str("", styles={"color": _WARNING})
-        self.status_text = pn.pane.Str("")
-        self.run_text = pn.pane.Str("")
+        # The outcome lines under the strip take no height while their text is empty
+        # (m5 §17.3): ``_hide_when_empty`` is registered for each below, so the rule is
+        # one, wherever the text is set.
+        #
+        # Each wraps at the window's width: an outcome is a sentence (``plate-orientation
+        # done ...; assumed: turned 180° ...`` is 200 characters) and ran past the right
+        # edge, its end unreadable (``/ui-check`` ``turned``, #443). Text, never
+        # Markdown (FM-139).
+        self.message = self._outcome_line({"color": _WARNING})
+        self.problems_text = self._outcome_line({"color": _WARNING})
+        # One line, wrapped when a refused STOP makes it long: it shares the strip's row
+        # with the four buttons, which keep their width.
+        self.status_text = _wrapped_text(width=None)
+        self.status_text.sizing_mode = "stretch_width"
+        self.run_text = self._outcome_line()
         self.drive_text = pn.pane.Str(
             DRIVE_TEXT, styles={"color": _WARNING}, visible=False
         )
@@ -600,9 +669,7 @@ class PlatePageView:
         )
         # What the page asks while nothing named the plate (m5 §11.3): the note says
         # what the 96-well is, and the button confirms it. Both visible only then.
-        self.plate_note = _wrapped_text(
-            extra={"color": _WARNING}, width=_PLATE_NOTE_WIDTH
-        )
+        self.plate_note = _wrapped_text(extra={"color": _WARNING})
         self.plate_confirm_button = pn.widgets.Button(label="", color="primary")
         # Which way the plate lies (m5 §16 D2): beside the plate menu, worded from the
         # stand's sides, and the only place it is said (no tool's form offers it).
@@ -618,9 +685,7 @@ class PlatePageView:
             value=page.orientation,
         )
         # Under the menu, only on a stand that does not say its sides (m5 §16 D3).
-        self.orientation_note = _wrapped_text(
-            ORIENTATION_IN_STAGE_TERMS, width=_PLATE_NOTE_WIDTH
-        )
+        self.orientation_note = _wrapped_text(ORIENTATION_IN_STAGE_TERMS)
         self.orientation_note.visible = not side_words(holder.back, holder.right)
         # Set while ``refresh`` re-syncs the select, so its watcher starts no run.
         self._syncing_orientation = False
@@ -638,7 +703,7 @@ class PlatePageView:
         self.select_input = pn.widgets.TextInput(
             label="Wells", placeholder="A1:D6, C*, all"
         )
-        self.refresh_button = pn.widgets.Button(label="Refresh")
+        self.refresh_button = pn.widgets.Button(label="Refresh", align="end")
         self.stop_button = pn.widgets.Button(label="STOP", color="danger")
         self.resume_button = pn.widgets.Button(label="Resume", visible=False)
         self.capture_centre_button = pn.widgets.Button(label="Capture centre")
@@ -668,9 +733,16 @@ class PlatePageView:
         # that needs the stand is disabled while it is closed.
         self.connect_button = pn.widgets.Button(label="Connect")
         self.disconnect_button = pn.widgets.Button(label="Disconnect")
-        self.connection_text = pn.pane.Str("")
+        self.connection_text = self._outcome_line()
 
         # Every handler goes through `_handler` (the document lock, a failure is a line).
+        for pane in (
+            self.connection_text,
+            self.run_text,
+            self.message,
+            self.problems_text,
+        ):
+            pane.param.watch(self._handler(self._hide_when_empty), "object")
         self.connect_button.on_click(self._handler(lambda event: self.on_connect()))
         self.disconnect_button.on_click(
             self._handler(lambda event: self.on_disconnect())
@@ -728,6 +800,7 @@ class PlatePageView:
         self.live_button.on_click(self._handler(lambda event: self.on_live()))
         self._build_drive()
         self._build_presets()
+        self._build_steps()
 
         self.tool_runs: dict[str, Any] = {}
         self.tool_fields: dict[str, dict[str, Any]] = {}
@@ -735,6 +808,10 @@ class PlatePageView:
         self.tool_cards: dict[str, Any] = {}
         self.layout = self._layout()
         self.refresh()
+        # The page opens on the step the run document and the connection suggest (m5
+        # §17.5), once: afterwards only the operator changes the screen (D2). Before the
+        # first render, so that no model of the screen it replaces was ever built.
+        self.show_step(opening_step(self._step_states))
         self.tick()
 
     # --- layout ---------------------------------------------------------------
@@ -915,23 +992,38 @@ class PlatePageView:
             self.preset_note,
         )
 
-    def _drive_region(self) -> Any:
-        """ADR-0006's *Drive*: the pad, the focus, the autofocus, the objective, the light."""
+    def _drive_bar(self) -> Any:
+        """ADR-0006's *Drive*, under the image where Live is watched (m5 §17.3): a bar that wraps.
+
+        The pad, the focus, the autofocus, the objective and the light of today's Drive
+        region, plus the map's *Drive to* select and its *Drive (next click moves the
+        stage)* toggle, which leave the map's controls: they are what the operator
+        reaches for with the image in view, and in the old row the toggle was drawn over
+        the preset's *Save as* (``/ui-check``, #431). A flex box wraps its groups at the
+        image column's width, so no group runs past the window at 1280 px.
+        """
         jog = self.jog_buttons
         pad = pn.Column(
             pn.Row(pn.Spacer(width=60), jog["up"]),
             pn.Row(jog["left"], jog["down"], jog["right"]),
         )
-        return pn.Column(
-            pn.pane.Str("Drive", styles={"font-weight": "bold"}),
+        # Each group is narrower than the image column (440 px at 1280): a group wider
+        # than the column is not wrapped, it runs past the window (the *Drive to* select
+        # and the toggle together did, ``/ui-check``, #443), so the two are separate
+        # items. The groups that fit side by side share a line.
+        return pn.FlexBox(
             pn.Row(pad, self.xy_step_select),
             self.drive_image_note,
             pn.Row(self.z_buttons["up"], self.z_buttons["down"], self.z_step_select),
             pn.Row(self.autofocus_on_button, self.autofocus_off_button),
+            pn.Row(self.light_on_button, self.light_off_button),
             pn.Row(self.objective_select, self.objective_button),
             self.objective_confirm,
-            pn.Row(self.light_on_button, self.light_off_button),
+            self.side_select,
+            self.drive_toggle,
             self.drive_note,
+            flex_wrap="wrap",
+            sizing_mode="stretch_width",
         )
 
     def _next_region(self) -> Any:
@@ -943,84 +1035,275 @@ class PlatePageView:
             self.next_note,
         )
 
+    def _build_steps(self) -> None:
+        """The step bar's widgets and the view's own state: the step shown and the expert switch (m5 §17.6).
+
+        Both belong to the browser tab, not to the controller (D6): two tabs may show two
+        screens, while what each draws is still the controller's (FM-151). A step's
+        button is not disabled whatever the run document says: every step opens at any
+        time (D2), and an action that cannot run says why beside itself.
+        """
+        self.step: StepName = "stand"
+        self.expert = False
+        self._step_states = step_states(
+            (),
+            connected=self.page.connected,
+            stand=self.page.stand_name,
+            preset=None,
+            plate=self.page.plate,
+            plan=None,
+        )
+        # Set while `show_*` re-syncs the switch, so that its watcher does not show again.
+        self._syncing_expert = False
+        self.step_buttons = {
+            step: pn.widgets.Button(
+                label=step_button_label(index, state),
+                width=_STEP_WIDTH_PX,
+                css_classes=["smc-step"],
+                color="light",
+            )
+            for index, (step, state) in enumerate(
+                zip(STEPS, self._step_states, strict=True), start=1
+            )
+        }
+        # Text, never Markdown (FM-139): a preset's name is a file's.
+        self.step_summaries = {
+            step: _wrapped_text(width=_STEP_WIDTH_PX, extra={"font-size": "12px"})
+            for step in STEPS
+        }
+        self.expert_toggle = pn.widgets.Toggle(
+            label="Expert view", value=False, color="light", align="start"
+        )
+        self.continue_button = pn.widgets.Button(label="Continue", color="primary")
+        # The panel that scrolls on its own (§17.3): the strip, the step bar and the
+        # figures stay on screen while a long screen is read.
+        self.step_panel = pn.Column(
+            width=STEP_PANEL_WIDTH_PX,
+            scroll=True,
+            styles={"max-height": _STEP_PANEL_MAX_HEIGHT},
+        )
+        for step, button in self.step_buttons.items():
+            button.on_click(self._handler(self._stepper(step)))
+        self.expert_toggle.param.watch(
+            self._handler(lambda event: self._on_expert_toggle(bool(event.new))),
+            "value",
+        )
+        self.continue_button.on_click(self._handler(lambda event: self.on_continue()))
+
+    def _stepper(self, step: StepName) -> Callable[[Any], None]:
+        def clicked(event: Any) -> None:
+            self.show_step(step)
+
+        return clicked
+
     def _layout(self) -> Any:
-        connection = pn.Row(
+        # Sticky: at 1280 x 800 the drive bar is partly below the fold (``/ui-check``), and
+        # a page scrolled to reach it must not take STOP out of view (ADR-0006: STOP is
+        # always offered).
+        strip = pn.Row(
             self.connect_button,
             self.disconnect_button,
-            self.connection_text,
-            sizing_mode="stretch_width",
-        )
-        strip = pn.Row(
             self.status_text,
-            pn.Spacer(sizing_mode="stretch_width"),
             self.resume_button,
             self.stop_button,
             sizing_mode="stretch_width",
+            styles=_STICKY_STRIP,
         )
-        controls = pn.Row(
-            self.plate_select,
-            self.orientation_select,
-            self.label_select,
-            self.side_select,
-            self.drive_toggle,
-        )
-        plate_tab = pn.Column(
-            controls,
-            pn.Row(self.plate_confirm_button, self.plate_note, self.orientation_note),
-            pn.Row(self.select_input, self.refresh_button),
-            pn.pane.Bokeh(self.figure, sizing_mode="stretch_width"),
+        step_bar = pn.Row(
+            *(
+                pn.Column(self.step_buttons[step], self.step_summaries[step])
+                for step in STEPS
+            ),
+            pn.Spacer(sizing_mode="stretch_width"),
+            self.expert_toggle,
             sizing_mode="stretch_width",
         )
-        image_tab = pn.Column(
-            pn.Row(self.snap_button, self.live_button, self.snap_note),
-            pn.pane.Bokeh(self.image_figure, sizing_mode="stretch_width"),
-            sizing_mode="stretch_width",
-        )
-        # Not dynamic: a dynamic tab destroys the figure's view when another tab is
-        # shown, and bokehjs's DataRange1d keeps the bounds of every view it has had,
-        # so the map was framed on the union of the plates it had drawn and neither
-        # Reset nor Refresh took the old ones out (#297). Bokeh keeps the view of a
-        # hidden tab, and its size, so no figure is laid out at zero size.
-        self.tabs = pn.Tabs(
-            ("Plate", plate_tab),
-            ("Image", image_tab),
-            dynamic=False,
-            sizing_mode="stretch_width",
-        )
-        left = pn.Column(
-            self.problems_text,
-            self.tabs,
-            self.run_document_text,
-            self.checklist_text,
-            sizing_mode="stretch_width",
-        )
+
+        sections = {tool.name: self._tool_section(tool) for tool in self._tools}
         stages: dict[str, list[Any]] = {}
         for tool in self._tools:
-            stages.setdefault(tool.stage, []).append(self._tool_section(tool))
+            stages.setdefault(tool.stage, []).append(sections[tool.name])
         # Where each tool's stage is in the accordion, so that the next step can open it.
         self._stage_index = {
             tool.name: list(stages).index(tool.stage) for tool in self._tools
         }
         self.accordion = pn.Accordion(
-            *((stage, pn.Column(*sections)) for stage, sections in stages.items()),
+            *((stage, pn.Column(*sections_)) for stage, sections_ in stages.items()),
             active=list(range(len(stages))),
         )
-        right = pn.Column(
-            self._preset_region(),
-            self._next_region(),
-            self._drive_region(),
-            self.accordion,
-            width=420,
+        self._build_screens(sections)
+
+        # Neither figure is ever in a swapped list, and there are no tabs: a tab that is
+        # not dynamic keeps a figure's view, but a figure that leaves the model tree has
+        # its view destroyed, and bokehjs's DataRange1d keeps the bounds of every view it
+        # has had, so the map was framed on the union of the plates it had drawn and
+        # neither Reset nor Refresh took the old ones out (#297, FM-174). Both are
+        # always on screen, side by side (m5 §17.2 D1).
+        map_column = pn.Column(
+            pn.Row(self.label_select, self.refresh_button),
+            self.map_title_text,
+            pn.pane.Bokeh(self.figure, sizing_mode="stretch_width"),
+            sizing_mode="stretch_width",
         )
+        image_column = pn.Column(
+            pn.Row(self.snap_button, self.live_button, self.snap_note),
+            pn.pane.Bokeh(self.image_figure, sizing_mode="stretch_width"),
+            self._drive_bar(),
+            sizing_mode="stretch_width",
+        )
+        centre = pn.Row(map_column, image_column, sizing_mode="stretch_width")
         return pn.Column(
-            connection,
             strip,
+            self.connection_text,
             self.drive_text,
             self.run_text,
             self.message,
-            pn.Row(left, right, sizing_mode="stretch_width"),
+            self.problems_text,
+            step_bar,
+            pn.Row(self.step_panel, centre, sizing_mode="stretch_width"),
             sizing_mode="stretch_width",
         )
+
+    def _build_screens(self, sections: dict[str, Any]) -> None:
+        """The lists the step panel shows, built once (m5 §17.2 D5, §17.6): never rewritten.
+
+        Each screen is its title, its lead, the next step (one instance, listed on every
+        screen and in the expert view, so it is drawn once and keeps its place whatever
+        the state), the regions of its step, and *Continue*. A value widget is one
+        instance listed on every screen that shows it: only one list is rendered, and a
+        swap keeps what was typed (measured, §17.2 D5). The tool sections are listed in
+        their screen and in the accordion's stage columns. A step's own regions are
+        today's, provisionally (B1): B2 to B4 replace them with each screen's design.
+        """
+        preset_region = self._preset_region()
+        next_region = self._next_region()
+        plate_controls = pn.Column(
+            self.plate_select,
+            self.orientation_select,
+            pn.Column(
+                self.plate_confirm_button, self.plate_note, self.orientation_note
+            ),
+        )
+        own: dict[StepName, list[Any]] = {
+            "stand": [preset_region],
+            "plate": [plate_controls],
+            "wells": [self.select_input],
+            "scan": [],
+            "results": [],
+        }
+        self.screens: dict[ScreenName, list[Any]] = {}
+        for step in STEPS:
+            self.screens[step] = [
+                _wrapped_text(SCREEN_TITLES[step], {"font-weight": "bold"}),
+                _wrapped_text(SCREEN_LEADS[step]),
+                next_region,
+                *own[step],
+                *(sections[name] for name in _SCREEN_TOOLS[step] if name in sections),
+                self.continue_button,
+            ]
+        # The run document's path and its checklist close the last screen and the expert
+        # view: where the files are, and what the next step reads.
+        self.screens["results"] += [self.run_document_text, self.checklist_text]
+        self.screens["expert"] = [
+            preset_region,
+            next_region,
+            plate_controls,
+            self.select_input,
+            self.accordion,
+            self.run_document_text,
+            self.checklist_text,
+        ]
+
+    def show_step(self, step: StepName) -> None:
+        """Show ``step``'s screen; the expert view, if it is on, goes off first (m5 §17.2 D4)."""
+        self.step = step
+        self.expert = False
+        self._sync_expert_toggle()
+        self._show()
+
+    def show_expert(self, on: bool) -> None:
+        """Show the expert view, or the screen of the step the view keeps (m5 §17.2 D4)."""
+        self.expert = on
+        self._sync_expert_toggle()
+        self._show()
+
+    def _on_expert_toggle(self, on: bool) -> None:
+        """The switch was pressed (or set by ``show_*``, which says so by ``_syncing_expert``)."""
+        if not self._syncing_expert:
+            self.show_expert(on)
+
+    def _sync_expert_toggle(self) -> None:
+        if self.expert_toggle.value == self.expert:
+            return
+        self._syncing_expert = True
+        try:
+            self.expert_toggle.value = self.expert
+        finally:
+            self._syncing_expert = False
+
+    def on_continue(self) -> None:
+        """*Continue to …*: the next step's screen; nothing after the last (a click on a hidden button still arrives)."""
+        position = STEPS.index(self.step) + 1
+        if position < len(STEPS):
+            self.show_step(STEPS[position])
+
+    def _show(self) -> None:
+        """Put the screen in the step panel, as a copy of its list, and restyle the step bar.
+
+        A copy: ``Column.objects`` takes the list it is given, and the screen's own must
+        never be the one a later swap mutates (m5 §17.6).
+        """
+        screen: ScreenName = "expert" if self.expert else self.step
+        label = continue_label(self.step)
+        self.continue_button.label = label or ""
+        self.continue_button.visible = label is not None
+        self.step_panel.objects = list(self.screens[screen])
+        self._style_steps()
+
+    def _style_steps(self) -> None:
+        """The step shown is the primary button, and the class ``/ui-check`` reads it by; none is while the expert view is on."""
+        for step, button in self.step_buttons.items():
+            shown = step == self.step and not self.expert
+            button.color = "primary" if shown else "light"
+            button.css_classes = (
+                ["smc-step", "smc-step-shown"] if shown else ["smc-step"]
+            )
+
+    def _draw_steps(self) -> None:
+        """The step bar's labels and summaries, from the run document and the connection (m5 §17.5).
+
+        Read from ``guide.step_states`` and never from the step panel's list: a screen is
+        not rewritten by a redraw, and the tick draws none of this (the stand's own
+        status is not read to name it). A summary is also the button's tooltip.
+        """
+        view = self._view
+        preset = self.page.preset
+        self._step_states = step_states(
+            () if view is None else view.checklist,
+            connected=self.page.connected,
+            stand=self.page.stand_name,
+            preset=None if preset is None else preset.file.name,
+            plate=self.page.plate,
+            plan=None if view is None else view.plan,
+        )
+        for index, state in enumerate(self._step_states, start=1):
+            button = self.step_buttons[state.step]
+            button.label = step_button_label(index, state)
+            button.description = state.summary or None
+            self.step_summaries[state.step].object = state.summary
+        self._style_steps()
+
+    @staticmethod
+    def _outcome_line(extra: dict[str, str] | None = None) -> Any:
+        """A line under the strip: empty and hidden, wrapped at the window's width (m5 §17.3)."""
+        line = _wrapped_text(extra=extra, width=None)
+        line.sizing_mode = "stretch_width"
+        line.visible = False
+        return line
+
+    def _hide_when_empty(self, event: Any) -> None:
+        """An outcome line takes no height while its text is empty (m5 §17.3)."""
+        event.obj.visible = bool(event.new)
 
     def _tool_section(self, tool: ToolView) -> Any:
         fields: dict[str, Any] = {}
@@ -1054,7 +1337,7 @@ class PlatePageView:
         note = pn.pane.Str(
             "",
             styles={"color": _WARNING},
-            width=380,
+            width=_TEXT_WIDTH,
             stylesheets=["pre { white-space: pre-wrap; }"],
         )
         self.tool_notes[tool.name] = note
@@ -1062,11 +1345,15 @@ class PlatePageView:
         # a file's path is as long as the folder it is in (m5 §8.4).
         card = _wrapped_text()
         self.tool_cards[tool.name] = card
-        parts: list[Any] = [pn.pane.Str(tool.summary), *key_widgets]
+        # Wrapped: a summary is a sentence, and the step panel is 400 px wide (m5 §17.3).
+        parts: list[Any] = [_wrapped_text(tool.summary), *key_widgets]
         if tool.name == "plate-registration":
             parts += [
                 pn.Row(self.capture_centre_button, self.forget_button),
-                pn.Row(self.capture_wall_button, self.capture_side_select),
+                # One under the other: the wall button names the well and the side
+                # (*Capture B2 wall at image left*) and the select is 300 px wide, which
+                # together ran past the panel's edge (``/ui-check``, #443).
+                pn.Column(self.capture_wall_button, self.capture_side_select),
                 self.image_note,
                 self.capture_note,
                 self.captures_text,
@@ -1313,16 +1600,16 @@ class PlatePageView:
         self.tick()
 
     def on_snap(self) -> None:
-        """Snap one frame and show the *Image* tab; the tick that first sees the frame draws it.
+        """Snap one frame; the tick that first sees the frame draws it, beside the map.
 
-        A refusal (an activity is going) is the page's message, as for a run.
+        A refusal (an activity is going) is the page's message, as for a run. The image
+        is always on screen (m5 §17.2 D1), so a snap changes no screen (D2).
         """
         self._try(self.page.snap)
-        self.tabs.active = _IMAGE_TAB
         self.tick()
 
     def on_live(self) -> None:
-        """Start live, or end it, and show the *Image* tab when it starts.
+        """Start live, or end it.
 
         Which of the two is read from the label the button shows, not from the
         controller at the click (m5 §5.3, #287): a click does what the button says,
@@ -1337,8 +1624,6 @@ class PlatePageView:
         """
         starting = self.live_button.label != _END_LIVE_LABEL
         self._try(lambda: self.page.live(starting))
-        if starting:
-            self.tabs.active = _IMAGE_TAB
         self.tick()
 
     def on_jog(self, direction: str) -> None:
@@ -1845,6 +2130,7 @@ class PlatePageView:
         self.drive_image_note.object = drive_image_note(view.camera_matrix)
         self._draw_cards()
         self._draw_next()
+        self._draw_steps()
         self._draw_problems()
         self._draw_plate_ask()
         self._draw_buttons()
@@ -1971,9 +2257,9 @@ class PlatePageView:
         # Where the wells are drawn is only as good as the registration: say which map it is
         # (registered, seed, estimated or unplaced, m5 §15 D4). The scan plan's suffix is
         # where a plan too large to draw says so (m5 §14.3).
-        self.figure.title.text = map_title(view.plate, view.pose) + plan_title(
-            view.plan
-        )
+        title = map_title(view.plate, view.pose) + plan_title(view.plan)
+        self.figure.title.text = title
+        self.map_title_text.object = title
         # The cross's label names a well of *this* view: a registration that moved the wells
         # relabels it now, from the position last drawn, and reads nothing (FM-145).
         self._draw_cross(self._cross_xy)

@@ -349,21 +349,25 @@ def test_next_step_text_says_the_command_is_posix_only_on_windows_only(
 # --- the region, its button, and what it runs ------------------------------------------------
 
 
-def test_the_next_step_region_heads_the_right_column(
+def test_the_next_step_region_follows_the_preset_in_the_expert_view(
     make_page: Callable[..., PlatePage],
 ) -> None:
     page = make_page()
     view = PlatePageView(page)
-    _left, right = view.layout[-1]
+    expert = view.screens["expert"]
     # The Preset region is above it (m5 §10.6): a preset is what the operator chooses
-    # before the first step. The step is the next thing, above Drive.
-    assert right[0][0].object == "Preset"
-    region, drive = right[1], right[2]
+    # before the first step. The step is the next thing, above the page's controls.
+    assert expert[0][0].object == "Preset"
+    region = expert[1]
     assert region[0].object == "Next step"
     assert region[1] is view.next_text
     assert region[2] is view.next_button
     assert region[3] is view.next_note
-    assert drive[0].object == "Drive"
+    # The Drive region is no longer in the tools column: it is the bar under the image.
+    assert not any(
+        getattr(getattr(item, "objects", [None])[0], "object", "") == "Drive"
+        for item in expert
+    )
     assert view.next_text.object == next_step_text(page.view().next_step)
     assert view.next_text.object.startswith(
         "plate-registration\n  the run document has no plate yet\n"
@@ -663,10 +667,14 @@ def test_the_run_document_header_names_the_absolute_path(
 ) -> None:
     page = make_page()
     view = PlatePageView(page)
-    left, _right = view.layout[-1]
     assert view.run_document_text.object == f"Run document  {run_doc}"
-    # Heads the checklist.
-    items = list(left)
+    # Heads the checklist, on the last screen and in the expert view.
+    for screen in ("results", "expert"):
+        items = list(view.screens[screen])
+        assert (
+            items.index(view.checklist_text) == items.index(view.run_document_text) + 1
+        )
+    items = list(view.screens["expert"])
     assert items.index(view.checklist_text) == items.index(view.run_document_text) + 1
     assert view.run_document_text.styles["font-weight"] == "bold"
 
@@ -707,7 +715,8 @@ def test_cards_and_the_step_wrap(
             "pre { white-space: pre-wrap; overflow-wrap: anywhere; }"
         ]
     for pane in [*view.tool_cards.values(), view.next_text, view.next_note]:
-        assert pane.width == 380
+        # The step panel is 400 px wide: a pane of the screens is at most 370 (m5 §17.3).
+        assert pane.width == 370
     # A path longer than the old 80-character cut reaches the card whole.
     text = view.tool_cards["scan-plan"].object
     assert f"  file: {run_doc.parent / long_path}" in text.splitlines()

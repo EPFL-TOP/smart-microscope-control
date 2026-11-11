@@ -8,6 +8,7 @@ running the script (``/ui-check``).
 import importlib.util
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -211,11 +212,12 @@ class _FakeError(Exception):
 
 
 def _fake_page(
-    *, fails_on_text: str | None = None, fails_on_fill: bool = False
+    *, fails_on_button: str | None = None, fails_on_fill: bool = False
 ) -> MagicMock:
-    """A page on which every control is there, and the one named in ``fails_on_text``
-    times out when it is clicked (or the Wells box when it is filled, with
-    ``fails_on_fill``), with the first line Playwright gives."""
+    """A page on which every control is there, and the button whose name is
+    ``fails_on_button`` (a string, or a step's ``"3. Wells"``) times out when it is
+    clicked (or the Wells box when it is filled, with ``fails_on_fill``), with the
+    first line Playwright gives."""
     page = MagicMock()
     page.locator.return_value.count.return_value = 0
     page.locator.return_value.all_inner_texts.return_value = ["a pane"]
@@ -225,17 +227,19 @@ def _fake_page(
             "Locator.fill: Timeout 10000ms exceeded.\nCall log:\n  - waiting"
         )
 
-    def get_by_text(text: str, exact: bool = False) -> MagicMock:
+    def get_by_role(role: str, name: object = None, **kwargs: object) -> MagicMock:
         found = MagicMock()
-        if text == fails_on_text:
-            error = _FakeError(
+        text = getattr(name, "pattern", name)
+        # A step's name is a regular expression, written ``^3\. Wells``: compared as
+        # the name a user reads, ``3. Wells``.
+        text = str(text).removeprefix("^").replace("\\.", ".")
+        if fails_on_button is not None and text == fails_on_button:
+            found.click.side_effect = _FakeError(
                 "Locator.click: Timeout 10000ms exceeded.\nCall log:\n  - waiting"
             )
-            found.click.side_effect = error
-            found.first.click.side_effect = error
         return found
 
-    page.get_by_text.side_effect = get_by_text
+    page.get_by_role.side_effect = get_by_role
     return page
 
 
@@ -402,7 +406,19 @@ def test_the_demo_sample_profile_still_fits_the_chains_refs(snap) -> None:
 
 
 def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
-    names = ["empty", "wells-selected", "snap", "after-density", "with-route", "turned"]
+    names = [
+        "empty",
+        "wells-selected",
+        "snap",
+        "expert",
+        "after-density",
+        "with-route",
+        "turned",
+    ]
+    assert list(snap.STATE_NAMES) == names
+    # `expert` is the fourth, so that both stands reach it (m5 §17.8).
+    alone = [True, True, True, True]
+    chained = [False, False, False]
 
     full = snap.plan_states("demo-sample", results=True)
     assert [p.name for p in full] == names
@@ -411,25 +427,26 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
     demo = snap.plan_states("demo", results=True)
     assert [p.name for p in demo] == names
     # `turned` needs the chain's registered plate (m5 §16.4): with the results.
-    assert [p.reachable for p in demo] == [True, True, True, False, False, False]
-    for plan in demo[3:]:
+    assert [p.reachable for p in demo] == [*alone, *chained]
+    for plan in demo[4:]:
         assert plan.reason == (
             "the demo camera images no sample: no cells, no density; "
             "use --stand demo-sample"
         )
 
     skipped = snap.plan_states("demo-sample", results=False)
-    assert [p.reachable for p in skipped] == [True, True, True, False, False, False]
-    assert {p.reason for p in skipped[3:]} == {"skipped by --no-results"}
+    assert [p.reachable for p in skipped] == [*alone, *chained]
+    assert {p.reason for p in skipped[4:]} == {"skipped by --no-results"}
 
     failed = snap.plan_states(
         "demo-sample", results=True, chain_failure="cells exited 1: no detector"
     )
-    assert [p.reachable for p in failed] == [True, True, True, False, False, False]
-    assert failed[3].reason == "cells exited 1: no detector"
-    assert failed[4].reason is not None
-    assert "cells exited 1: no detector" in failed[4].reason
-    assert failed[5].reason == failed[4].reason
+    assert [p.reachable for p in failed] == [*alone, *chained]
+    assert [p.name for p in failed[4:]] == ["after-density", "with-route", "turned"]
+    assert failed[4].reason == "cells exited 1: no detector"
+    assert failed[5].reason is not None
+    assert "cells exited 1: no detector" in failed[5].reason
+    assert failed[6].reason == failed[5].reason
     # None is silent: every state that is not reached says why.
     for plans in (demo, skipped, failed):
         assert all(p.reachable or p.reason for p in plans)
@@ -784,9 +801,10 @@ def test_the_summary_has_one_block_per_state_and_names_what_it_could_not_read(
     reached = snap.StateRecord(
         name="empty",
         reached=True,
-        active_tab="Plate",
+        step="3. Wells",
         wells="",
         texts=["idle", "no run yet"],
+        on_screen=["STOP: yes (y 8 to 40 of 800, x 1100 to 1160 of 1280)"],
     )
     unread = snap.StateRecord(name="snap", reached=True, texts=[])
     missed = snap.StateRecord(
@@ -804,9 +822,14 @@ def test_the_summary_has_one_block_per_state_and_names_what_it_could_not_read(
         "== snap ==",
         "== after-density ==",
     ]
-    assert "== empty ==\nreached\nactive tab: Plate\nWells: ''\n" in text
+    assert (
+        "== empty ==\nreached\nstep: 3. Wells\n"
+        "on screen: STOP: yes (y 8 to 40 of 800, x 1100 to 1160 of 1280)\n"
+        "Wells: ''\n"
+    ) in text
     assert "idle\n\nno run yet" in text
-    assert "== snap ==\nreached\nactive tab: ?\n" in text
+    assert "== snap ==\nreached\nstep: ?\n" in text
+    assert "active tab" not in text
     assert "Wells:" not in text.split("== snap ==")[1].split("== after")[0]
     assert "== after-density ==\nnot reached: cells exited 1: no frame" in text
     assert "server: stopped by SIGINT, exit 0 in 0.1 s" in text
@@ -945,28 +968,41 @@ def test_a_failed_chain_names_the_states_that_needed_it(snap, tmp_path) -> None:
         ("empty", True),
         ("wells-selected", True),
         ("snap", True),
+        ("expert", True),
         ("after-density", False),
         ("with-route", False),
         ("turned", False),
     ]
-    assert records[3].reason == "cells exited 1: x"
-    assert records[4].reason == "needs the chain: cells exited 1: x"
+    assert records[4].reason == "cells exited 1: x"
     assert records[5].reason == "needs the chain: cells exited 1: x"
+    assert records[6].reason == "needs the chain: cells exited 1: x"
     assert (errors, warnings) == ([], 0)
 
 
 def test_a_state_whose_control_times_out_is_named_and_the_next_state_runs(
     snap, tmp_path
 ) -> None:
-    page = _fake_page(fails_on_text="Image")
+    page = _fake_page(fails_on_button="Snap")
     records, _, _ = _drive(snap, tmp_path, page, lambda steps: None)
-    # `after-density` shows the Image tab too (its redraw is the one made while the
-    # Plate tab is hidden, #297), so it fails on the same control; `with-route` runs.
-    assert [r.reached for r in records] == [True, True, False, False, True, True]
+    # `after-density` takes a Snap too (the page reads the run document again at its
+    # end, #297), so it fails on the same control; `expert` and `with-route` run.
+    assert [r.reached for r in records] == [True, True, False, True, False, True, True]
     assert records[2].reason == "Locator.click: Timeout 10000ms exceeded."
-    assert records[3].reason == records[2].reason
+    assert records[4].reason == records[2].reason
     page.screenshot.assert_any_call(path=str(tmp_path / "snap-FAILED.png"))
     page.screenshot.assert_any_call(path=str(tmp_path / "after-density-FAILED.png"))
+
+
+def test_a_step_button_that_times_out_names_the_state_and_the_next_one_runs(
+    snap, tmp_path
+) -> None:
+    # The Wells step is clicked before the box is filled (m5 §17.8): a button that is
+    # not there fails `wells-selected` alone, named.
+    page = _fake_page(fails_on_button="3. Wells")
+    records, _, _ = _drive(snap, tmp_path, page, lambda steps: None)
+    assert [r.reached for r in records] == [True, False, True, True, True, True, True]
+    assert records[1].reason == "Locator.click: Timeout 10000ms exceeded."
+    page.screenshot.assert_any_call(path=str(tmp_path / "wells-selected-FAILED.png"))
 
 
 def test_a_state_whose_control_times_out_alone_is_the_only_one_named(
@@ -974,7 +1010,7 @@ def test_a_state_whose_control_times_out_alone_is_the_only_one_named(
 ) -> None:
     page = _fake_page(fails_on_fill=True)
     records, _, _ = _drive(snap, tmp_path, page, lambda steps: None)
-    assert [r.reached for r in records] == [True, False, True, True, True, True]
+    assert [r.reached for r in records] == [True, False, True, True, True, True, True]
     assert records[1].reason == "Locator.fill: Timeout 10000ms exceeded."
     page.screenshot.assert_any_call(path=str(tmp_path / "wells-selected-FAILED.png"))
 
@@ -995,7 +1031,21 @@ def test_the_turned_state_picks_the_selects_turned_label_and_waits_for_the_outco
         "Turned 180\N{DEGREE SIGN}: A1 at the front right",
     ]
     assert snap.ACTIONS["turned"] is snap._act_turned
+    # The select waits to be drawn before its options are read: the click on the Plate
+    # step is answered by the server, and `all_inner_texts` does not wait (an empty read
+    # gave the default label and a timeout, seen at the first run of #443).
+    seen: list[str] = []
+    select.wait_for.side_effect = lambda **kw: seen.append("wait")
+    select.locator.return_value.all_inner_texts.side_effect = lambda: (
+        seen.append("read")
+        or [
+            " A1 at the back left ",
+            "Turned 180\N{DEGREE SIGN}: A1 at the front right",
+        ]
+    )
     snap._act_turned(page, _no_chain())
+    assert seen == ["wait", "read"]
+    assert _step_names(page) == [r"^2\. Plate"]
     page.get_by_label.assert_called_once_with("Plate lies", exact=True)
     select.select_option.assert_called_once_with(
         label="Turned 180\N{DEGREE SIGN}: A1 at the front right"
@@ -1006,34 +1056,48 @@ def test_the_turned_state_picks_the_selects_turned_label_and_waits_for_the_outco
     page.wait_for_timeout.assert_not_called()
 
 
-def test_after_density_redraws_on_the_image_tab_and_presses_no_refresh(snap) -> None:
-    """#297: the page reads the run document again at the end of a snap, with the Plate
-    tab hidden. A Refresh on the visible map says nothing of a frame drawn out of view,
-    and a wait that is dropped reads the page before it has redrawn."""
+def _step_names(page: MagicMock) -> list[str]:
+    """The pattern of each ``get_by_role("button", name=<regex>)`` the action made."""
+    return [
+        c.kwargs["name"].pattern
+        for c in page.mock_calls
+        if c[0] == "get_by_role" and hasattr(c.kwargs.get("name"), "pattern")
+    ]
+
+
+def test_after_density_takes_a_snap_and_then_reads_the_results_step(snap) -> None:
+    """#297: the page reads the run document again at the end of a snap, with no Refresh
+    (a Refresh would redraw the map and say nothing of the redraw a snap made). Then the
+    Results step, whose checklist says the density is done: the wait comes after the
+    click, since the checklist is on that screen only, and a wait that is dropped reads
+    the page before it has redrawn."""
     page = MagicMock()
-    snap._act_after_density(page, _no_chain())
+    chains: list[list[object]] = []
+    snap._act_after_density(page, SimpleNamespace(run_chain=chains.append))
+    assert chains == [snap.CHAIN]
     calls = page.mock_calls
     assert [call[0] for call in calls] == [
-        "get_by_text",
-        "get_by_text().click",
+        "get_by_role",
+        "get_by_role().click",
         "get_by_role",
         "get_by_role().click",
         "locator",
         "locator().filter",
         "locator().filter().first.wait_for",
-        "get_by_text",
-        "get_by_text().first.click",
     ]
-    assert [c.args for c in calls if c[0] == "get_by_text"] == [("Image",), ("Plate",)]
-    assert [c.kwargs for c in calls if c[0] == "get_by_role"] == [{"name": "Snap"}]
+    first_role = next(c for c in calls if c[0] == "get_by_role")
+    assert first_role.kwargs == {"name": "Snap"}
+    assert _step_names(page) == [r"^5\. Results"]
     assert [c.kwargs for c in calls if c[0] == "locator().filter"] == [
         {"has_text": "✓ density"}
     ]
+    # No tab to click, and no Refresh.
+    assert not [c for c in calls if c[0] == "get_by_text"]
+    assert not [c for c in calls if c.kwargs.get("name") == "Refresh"]
 
 
-def test_with_route_shows_the_plate_tab_before_it_presses_refresh(snap) -> None:
-    """Refresh is on the Plate tab and hidden on the other: a state before this one that
-    failed on the Image tab must not make this one fail for a reason it does not name."""
+def test_with_route_presses_the_refresh_in_the_maps_header(snap) -> None:
+    """Refresh is in the map's header row, always in view: no screen is shown first."""
     page = MagicMock()
     chains: list[list[object]] = []
     snap._act_with_route(page, SimpleNamespace(run_chain=chains.append))
@@ -1043,10 +1107,158 @@ def test_with_route_shows_the_plate_tab_before_it_presses_refresh(snap) -> None:
         for c in page.mock_calls
         if c[0] in ("get_by_text", "get_by_role")
     ]
-    assert roots == [
-        ("get_by_text", ("Plate",), {"exact": True}),
-        ("get_by_role", ("button",), {"name": "Refresh"}),
+    assert roots == [("get_by_role", ("button",), {"name": "Refresh"})]
+
+
+def test_the_step_locators_match_a_steps_name_from_its_number(snap) -> None:
+    """A step's name is ``3. Wells`` and gains ``✓`` when done: it is matched from its
+    start, so that the box's label *Wells* and the map's *Plate* are never one."""
+    page = MagicMock()
+    snap._step_button(page, 3, "Wells")
+    (pattern,) = _step_names(page)
+    assert pattern == r"^3\. Wells"
+    name = re.compile(pattern)
+    for found in ("3. Wells", "3. Wells ✓"):
+        assert name.search(found)
+    for other in ("Wells", "13. Wells", "2. Wells", "Plate", "3. Plate"):
+        assert not name.search(other)
+
+
+def test_wells_selected_opens_the_wells_step_before_it_fills_the_box(snap) -> None:
+    page = MagicMock()
+    order: list[str] = []
+
+    def role(*args: object, **kwargs: object) -> MagicMock:
+        name = kwargs.get("name")
+        found = MagicMock()
+        found.click.side_effect = lambda: order.append(
+            f"click:{getattr(name, 'pattern', name)}"
+        )
+        return found
+
+    page.get_by_role.side_effect = role
+    box = page.get_by_label.return_value
+    box.fill.side_effect = lambda text: order.append(f"fill:{text}")
+    box.press.side_effect = lambda key: order.append(f"press:{key}")
+    snap._act_wells_selected(page, _no_chain())
+    # Connect is clicked only when enabled (FM-162); then the step, then the box.
+    assert order[-3:] == [r"click:^3\. Wells", "fill:A1:B2", "press:Enter"]
+    # The box is found by its exact label: *Wells* is the step's name too, with a number.
+    page.get_by_label.assert_called_once_with("Wells", exact=True)
+
+
+def test_snap_clicks_the_image_without_a_tab(snap) -> None:
+    page = MagicMock()
+    snap._act_snap(page, _no_chain())
+    assert [c.kwargs.get("name") for c in page.mock_calls if c[0] == "get_by_role"] == [
+        "Snap"
     ]
+    assert not [c for c in page.mock_calls if c[0] == "get_by_text"]
+
+
+def test_expert_waits_for_the_pressed_class_and_the_switch_goes_off_after_the_photograph(
+    snap, tmp_path
+) -> None:
+    # A pressed Toggle's button has `bk-active` (measured, Panel 1.10.0): the state waits
+    # for it, and puts the switch off again after the photograph (m5 §17.8).
+    page = MagicMock()
+    snap._act_expert(page, _no_chain())
+    page.get_by_role.assert_called_once_with("button", name="Expert view")
+    page.get_by_role.return_value.click.assert_called_once_with()
+    page.locator.assert_called_once_with("button.bk-active")
+    page.locator.return_value.filter.assert_called_once_with(has_text="Expert view")
+    page.locator.return_value.filter.return_value.wait_for.assert_called_once_with()
+
+    off = MagicMock()
+    snap._after_expert(off, _no_chain())
+    off.get_by_role.return_value.click.assert_called_once_with()
+    off.locator.return_value.filter.return_value.wait_for.assert_called_once_with(
+        state="detached"
+    )
+    assert {"expert": snap._after_expert} == snap.AFTER_ACTIONS
+
+    # In the driver: the photograph is taken before the switch goes off.
+    order: list[str] = []
+    drive_page = _fake_page()
+    drive_page.screenshot.side_effect = lambda **kw: order.append(Path(kw["path"]).name)
+    real_role = drive_page.get_by_role.side_effect
+
+    def role(*args: object, **kwargs: object) -> MagicMock:
+        found = real_role(*args, **kwargs)
+        if kwargs.get("name") == "Expert view":
+            found.click.side_effect = lambda: order.append("click:Expert view")
+        return found
+
+    drive_page.get_by_role.side_effect = role
+    _drive(snap, tmp_path, drive_page, lambda steps: None)
+    first = order.index("click:Expert view")
+    assert order[first : first + 4] == [
+        "click:Expert view",
+        "expert.png",
+        "expert-full.png",
+        "click:Expert view",
+    ]
+
+
+def test_the_viewport_defaults_to_1280_by_800_and_the_options_stay(snap) -> None:
+    args = snap.build_parser().parse_args([])
+    assert (args.width, args.height) == (1280, 800)
+    args = snap.build_parser().parse_args(["--width", "1600", "--height", "1000"])
+    assert (args.width, args.height) == (1600, 1000)
+
+
+def _located(boxes: dict[str, dict[str, float] | None]) -> list[tuple[str, MagicMock]]:
+    """The frame parts as ``_frame_parts`` gives them, with a box for each name in ``boxes``.
+
+    ``None`` is a part the browser draws no box for; a name left out is not on the page.
+    """
+    parts = []
+    for name in ("STOP", "step bar", "map", "image", "drive bar"):
+        found = MagicMock()
+        found.count.return_value = 1 if name in boxes else 0
+        found.first.bounding_box.return_value = boxes.get(name)
+        parts.append((name, found))
+    return parts
+
+
+def _box(x: float, y: float, width: float, height: float) -> dict[str, float]:
+    return {"x": x, "y": y, "width": width, "height": height}
+
+
+def test_on_screen_says_where_each_part_is_and_never_guesses(snap, monkeypatch) -> None:
+    page = MagicMock()
+    page.viewport_size = {"width": 1280, "height": 800}
+    parts = _located(
+        {
+            "STOP": _box(1200, 5, 60, 30),
+            "step bar": _box(10, 70, 170, 30),
+            "map": _box(400, 195, 440, 400),
+            "image": _box(840, 178, 440, 460),
+            # Below the fold: its bottom is past the viewport's.
+            "drive bar": _box(850, 760, 100, 50),
+        }
+    )
+    monkeypatch.setattr(snap, "_frame_parts", lambda page: parts)
+    assert snap._on_screen(page) == [
+        "STOP: yes (y 5 to 35 of 800, x 1200 to 1260 of 1280)",
+        "step bar: yes (y 70 to 100 of 800, x 10 to 180 of 1280)",
+        "map: yes (y 195 to 595 of 800, x 400 to 840 of 1280)",
+        "image: yes (y 178 to 638 of 800, x 840 to 1280 of 1280)",
+        "drive bar: NO (y 760 to 810 of 800, x 850 to 950 of 1280)",
+    ]
+    # A part the browser draws no box for, and one that is not on the page, are said so,
+    # never guessed to be in view.
+    parts = _located({"STOP": None})
+    assert snap._on_screen(page)[:2] == [
+        "STOP: not drawn",
+        "step bar: not on the page",
+    ]
+    # A part wider than the viewport is not on screen either (a drive bar that runs past
+    # the window was the first finding of #443).
+    parts = _located({"STOP": _box(1200, 5, 100, 30)})
+    assert snap._on_screen(page)[0].startswith("STOP: NO (")
+    # A page with no viewport (a fake) says nothing.
+    assert snap._on_screen(MagicMock()) == []
 
 
 # --- the chain against the plugins ------------------------------------------
