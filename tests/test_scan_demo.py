@@ -2790,6 +2790,12 @@ def test_a_translated_plate_is_measured_from_the_plans_centre_not_the_registrati
     )
 
 
+_NOT_HELD = (
+    "the plan has fields in well 'Z9', which its plate does not hold: run "
+    "scan-plan again with the stand as it is now"
+)
+
+
 def _a_field_in_a_well_no_plate_holds(result: dict[str, Any]) -> None:
     result["wells"] = [*result["wells"], "Z9"]
     result["fields"].append(
@@ -2804,12 +2810,29 @@ def test_a_plan_with_fields_in_a_well_the_plate_does_not_hold_is_refused_before_
     # plate holds it. Today's scan photographs it and the report then fails.
     _edit_plan_result(rig, _a_field_in_a_well_no_plate_holds)
 
-    reason = _refused(rig)
+    with pytest.raises(PluginRunError) as raised:
+        _scan(rig)
 
-    assert reason == (
-        "the plan has fields in well 'Z9', which its plate does not hold: run "
-        "scan-plan again with the stand as it is now"
-    )
+    assert raised.value.reason == _NOT_HELD
+    # Raised outside the handler of the lookup's ``ValueError``: inside it the
+    # error would carry that one as its context, and its traceback holds the
+    # frames that hold the plan and the microscope (FM-98).
+    assert raised.value.__context__ is None
+    assert rig.stage.moves == 0
+    assert rig.camera.snaps == 0
+    assert not (rig.run_dir / "scan").exists()
+
+
+def test_a_dry_run_refuses_a_well_the_plate_does_not_hold_too(
+    demo_microscope_dry: Microscope, tmp_path: Path
+) -> None:
+    # A dry run is the check of a plan: one that walked a plan its real scan
+    # refuses would pass it.
+    rig = _build(demo_microscope_dry, tmp_path)
+    _plan(rig)
+    _edit_plan_result(rig, _a_field_in_a_well_no_plate_holds)
+
+    assert _refused(rig) == _NOT_HELD
 
 
 def test_a_plate_that_records_no_objective_says_the_offsets_were_not_moved_to_the_frame(
@@ -2840,6 +2863,26 @@ def test_the_offset_lines_come_after_every_line_the_scan_already_writes(
         "the autofocus was engaged again on 2 fields and locked on 2 of them",
         _NOT_MOVED.format(p="an unknown objective", o=IN_PLACE),
     )
+
+
+def test_the_offset_line_comes_after_the_focus_lines_too(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    # The focus on the cells writes its lines after the autofocus's, and an
+    # autofocus left off writes one of its own: the offsets' line is after all.
+    rig = _build(demo_microscope, tmp_path, plate_objective=None)
+    _plan(rig)
+    af = _Autofocus(engaged=False, locked=False)
+    rig.microscope.override(Autofocus, af)
+
+    result = _result(_scan(rig, cell_focus="per-field", **FOCUS))
+
+    offsets = _NOT_MOVED.format(p="an unknown objective", o=IN_PLACE)
+    assert result.assumed.count(offsets) == 1
+    assert result.assumed[-1] == offsets
+    before = result.assumed[:-1]
+    assert any(line.startswith("the autofocus was off when") for line in before)
+    assert any(line.startswith("the focus on the cells ") for line in before)
 
 
 def test_a_plate_registered_with_the_objective_in_place_says_nothing_of_offsets(

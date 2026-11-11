@@ -327,6 +327,15 @@ def test_a_well_the_plate_does_not_hold_is_named() -> None:
     assert raised.value.__context__ is None
 
 
+def test_the_first_well_the_plate_does_not_hold_is_the_one_named() -> None:
+    plan = _plan([_field("A1", 0), _field("Z9", 0), _field("Y8", 0)])
+
+    with pytest.raises(ValueError, match="which its plate does not hold") as raised:
+        well_centres_um(plan)
+
+    assert str(raised.value).startswith("the plan has fields in well 'Z9',")
+
+
 def test_a_well_with_no_field_needs_no_centre() -> None:
     plan = _plan([_field("A1", 0)])
     assert well_centres_um(plan.model_copy(update={"wells": ("A1", "Z9")})) == {
@@ -394,6 +403,9 @@ _MOVED = (
             (-0.7, 12.0),
             [_MOVED.format(p="an unknown objective", o=_O, sx="-0.7", sy="12.0")],
         ),
+        # A shift along one axis only is a shift: the plate was moved.
+        (_O, _P, (0.0, -22.5), [_MOVED.format(p=_P, o=_O, sx="0.0", sy="-22.5")]),
+        (_O, _P, (12.0, 0.0), [_MOVED.format(p=_P, o=_O, sx="12.0", sy="0.0")]),
         # The plate registered with the objective in use, and a stand with no turret.
         (_O, _O, (0.0, 0.0), []),
         (_O, _O, (-0.0, 0.0), []),
@@ -427,6 +439,9 @@ _OLDER = (
     [
         (0, 0, []),
         (6, 0, []),
+        # One frame is enough to say it: a scan stopped after its first field.
+        (1, 1, [_OLDER.format(n=1, m=1)]),
+        (6, 1, [_OLDER.format(n=1, m=6)]),
         (4, 4, [_OLDER.format(n=4, m=4)]),
         (6, 2, [_OLDER.format(n=2, m=6)]),
     ],
