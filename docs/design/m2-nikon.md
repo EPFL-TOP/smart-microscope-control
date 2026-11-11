@@ -4151,12 +4151,62 @@ band with `R`, whether or not that offset has been seen locked.
   one well says nothing of the floor's plane in the next, and the floor is
   set exactly when the operator starts at a new place. D1's path would
   bound it by E both ways, and it locked 40 µm up with no word (§12.11.1).
-- **The autofocus on** at a seen floor (locked, or searching): D1's path,
-  as today. On at an unseen one: refused and switched off, as today.
+- **The autofocus on and locked** at a seen floor: D1's path, as today. Z
+  already sits where PFS holds it at this place, and a switch-on sent while
+  locked moved nothing (§12.1).
+- **The autofocus on and not locked** (searching) at the floor, seen or
+  not: switched off and refused, as an unseen offset is (D1), with
+  §12.10.5's advice. *Amended by #421*: this bullet first sent a seen floor
+  to D1's path. Searching, PFS drives Z to the floor's plane *at this
+  place* the moment it finds the reference, and D1's band bounds that by E
+  (50 µm on the Ti2-E) while F11 put one floor's planes 104 µm apart.
+  Measured on the Ti2-E fake (`main` fcda44b, 2026-11-11): the floor seen
+  locked, Z back at the focus, PFS left searching, a plane 40 µm toward the
+  sample: `engage()` sent the switch-on, locked 40 µm up and returned
+  `True` with no word. Switched off, the next `engage()` is a first lock,
+  once the operator has focused by eye with PFS off.
+  - **What decides it**: the lock read the check already makes first (the
+    one that makes the operator's lock seen), then the state read D9
+    already makes. A lock reached between the two reads as searching:
+    refused, the safe side. A failed lock read propagates with nothing
+    sent, as today (FM-19); a failed state read at a seen floor refuses
+    with nothing sent, as today.
+  - **The text names the floor, not an unseen offset** (the floor *was*
+    seen): `` autofocus PFS: not engaged: at the offset's floor (5000
+    PFSOffset units), a lock seen at one place says nothing of the floor's
+    plane at another (m2 §12.11 D9); it was on and searching, so it was
+    switched off. Lock it from below (m2 §12.10): with PFS off, focus on
+    the sample by eye, set the offset to its floor (5000 PFSOffset units),
+    engage, then turn the knob with PFS on until the sample is sharp; smc
+    then reads the lock `` (§12.10.5's advice, unchanged: setting the
+    floor again moves nothing). A switch-off that fails gives D1's
+    `HardwareError` for a searching autofocus, with this reason before
+    `; it was on and searching, and it could not be switched off`.
+  - **Nothing is forgotten**: nothing moved, and with the autofocus off
+    the floor is a first lock whether or not it is seen.
+  - **With a first lock's condition missing**, D9 does not apply and a
+    seen floor is D1's in every state, as any seen offset (§12.10.4).
+  - Not chosen: *switch off, then a first lock in the same call*. D5's
+    premise is that `z_start` is where the operator focused; a search may
+    have moved Z (it locked, then lost the lock), and nothing tells.
+  - Not chosen: *D5's one-sided band with the autofocus left on*. Same
+    premise, and PFS on can lock and jump between the check and the
+    guard's first poll, with no switch-on of smc's to start from.
+  - Not chosen: *refusing a searching autofocus at every seen offset*. The
+    scan's `engage()` after a lost lock is that case at the operator's
+    offset (D1, m3 §8). An offset above the floor was set by the knob at
+    the place it was seen; the floor is set when the operator starts at a
+    new one. Above the floor, §12.11.5's limit stands.
 - **The relocks** (`first_lock=False`) keep D1: they bring Z back to where
   PFS held it.
 - A first lock that locks leaves the floor seen; one that trips forgets
-  it, as today.
+  it, as today. *Settled by #421*: forgetting it for the whole objective
+  costs nothing. A relock needs a lock to suspend, and the lock read of
+  `suspend()` makes the floor seen again (measured on the Ti2-E fake,
+  2026-11-11: seen in one place, a trip in another forgets it, the
+  operator's lock back at the first, then `z move_by -3`: switched off,
+  moved, switched on, relocked, the floor seen again). An `engage()` at the
+  floor with the autofocus off is a first lock either way.
 - Not chosen: *seen offsets kept per XY*. A field, a well and a plate are
   m3's notions, and the layer would have to guess a radius. A seen offset
   above the floor engaged at another place stays D1's and D2's (§12.11.5).
