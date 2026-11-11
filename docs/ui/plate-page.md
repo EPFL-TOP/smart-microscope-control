@@ -96,7 +96,7 @@ page is not stuck.
   Live and the captures are greyed. Every tool needs the stand, as `smc run` opens it
   for every plugin. The map, the selection, the checklist and the result cards work
   all the same: they read the profile and the run document, not the stand. The last
-  frame stays on the *Image* tab after a Disconnect, with its time.
+  frame stays on the image after a Disconnect, with its time.
 - The profile is read **once**, when the command starts: an edited profile takes
   effect when the command (or the [service](service.md)) restarts.
 
@@ -164,12 +164,74 @@ redraw that a run's end makes keeps it.
 runs to its target. After STOP every action is refused until **Resume**, which is
 refused while a run is going.
 
-**The centre has two tabs, *Plate* and *Image*.** Both are kept: a map redrawn while you
-look at *Image* (a snap ends, a run ends) is framed on the plate when you come back, and
-**Reset** in the map's toolbar returns to that frame. The run document's checklist stays
-under both.
+**The regions, from the top** ([m5 §17.3](../design/m5-web-ui.md), at 1280 px wide and
+more):
 
-**The map** (*Plate*). The plate in stage µm, X right and Y up, wells as circles (96-well and
+```text
+[Connect][Disconnect]  demo-sample | XY … | Z … | 10x | …                 [Resume] [STOP]   the strip
+outcome lines (connection, run, message, problems): an empty one takes no height
+[1. Stand ✓][2. Plate ✓][3. Wells][4. Scan][5. Results]                       [Expert view]   the step bar
+ demo-sample   96-well, registered   next                                                    its summaries
+┌ step panel (400 px) ┬ map ──────────────────────┬ image ─────────────────────────────┐
+│ title: a question   │ [Density of ▾] [Refresh]  │ [Snap] [Live]                      │
+│ a sentence          │ the map's title, wrapped  │ the frame                          │
+│ the next step       │ the plate map             │ the drive bar: the pad, the steps, │
+│ the step's regions  │                           │ Z, autofocus, light, objective,    │
+│ [Continue to …]     │                           │ Drive to, Drive (next click …)     │
+└─────────────────────┴───────────────────────────┴────────────────────────────────────┘
+```
+
+- **There are no tabs.** The map and the image are side by side and **both always on
+  screen**, so that the operator who centres a well (Live, then the arrows) sees the map,
+  and the one who clicks a well sees the image. A snap, a Live, a run's end or a tick
+  changes **no screen**. Neither figure is ever removed and added again, so a map redrawn
+  while you look elsewhere is framed on the plate as it was drawn, and **Reset** in the
+  map's toolbar returns to that frame ([FM-174](../design/failure-modes.md)).
+- **The strip stays at the top of the window** when the page is scrolled, so that STOP is
+  always in reach. At 1280 x 800 the **drive bar is partly below the fold** (its pad and
+  its first rows are in view, the objective, *Drive to* and the toggle are a scroll
+  down); the figures are 400 px high, the least the layout allows, to show as much of it
+  as it can. A wider or taller window shows all of it.
+- **The step panel (400 px) scrolls on its own** when a screen is taller than the window;
+  the strip, the step bar and the figures do not scroll with it.
+
+**The five steps.** A step opens at any time: none is ever disabled (an action that cannot
+run is greyed with its reason beside it, as before). The button is `n. Title`, with a `✓`
+when the step is done, and a line under it: the stand's name (and the preset), `not
+connected`, `<plate>, registered`, `<w> wells, <n> fields`, `scanned`, `<k> of 5 done`,
+and `next` under the one the run document needs next. **The page opens on that step**
+(the stand while it is not connected, Results when everything is done) and afterwards only
+you change the screen: a click on a step, or the *Continue to …* button at the foot of a
+screen. The ticks and lines follow the run document after a run, a Refresh and a change of
+the connection, and nothing else moves with them. Each screen is a title (the question it
+answers), a sentence, **the next step** (the same one on every screen), the regions of its
+step, and *Continue*:
+
+| Step | What its screen holds today |
+|---|---|
+| *Stand* | the preset (load, save), `camera-calibration` and `timing` |
+| *Plate* | *Plate*, *Plate lies* and the plate's confirmation, `plate-registration` |
+| *Wells* | the *Wells* box, `scan-plan` |
+| *Scan* | `scan` |
+| *Results* | `cells`, `density`, `route`, `report`, `nis-export`, then the run document's path and its checklist |
+
+These are today's regions listed by step; the screens' own designs (the known values, the
+list of centres, the progress, the results' rows) come with the next builds of
+[#431](https://github.com/EPFL-TOP/smart-microscope-control/issues/431).
+
+**The expert view.** The *Expert view* switch replaces the step panel's contents with
+everything the page had before the steps: the preset, the next step, *Plate*, *Plate lies*,
+*Wells*, and an accordion of **every** tool, the ones no step holds included (`goto-well`,
+`plate-walls`, `plate-finding`, `plate-orientation`), then the run document and its
+checklist. The strip, the step bar, the map, the image and the drive bar stay. A click on
+a step turns the switch off and shows that step; turning it off shows the step you left. A
+value widget (the *Wells* box, a tool's field) is **one** widget listed on every screen that
+shows it, so what you typed on one is there on the other.
+
+**Per browser tab.** The step shown and the switch belong to the tab: two tabs may show two
+screens, and what each draws (the ticks, the lines, the map) is the server's.
+
+**The map**. The plate in stage µm, X right and Y up, wells as circles (96-well and
 below) or squares (384 and 1536), turned by the plate's rotation. **Its title says how the
 plate was placed**, in one of four ways, because a well name read off the map is trusted:
 
@@ -316,8 +378,8 @@ goes back to select after it, even if the click found no well or was refused. Th
 the stage to the same-named well of the other plate): choose the registered plate, or
 calibrate the one you chose.
 
-**Snap and the image** (*Image*). **Snap** takes one frame from the camera, makes the
-*Image* tab the one you see and draws the frame within a second. The title is the frame's
+**Snap and the image.** **Snap** takes one frame from the camera and draws it, beside the
+map, within a second. The title is the frame's
 own summary, as `smc snap` prints it (`512x512 uint16, exposure 10 ms, min 706, max
 5846`); before the first frame it says `no frame yet`. The frame is kept as the camera
 gave it, **never rescaled**, and a snap writes nothing: not a file, not the run
@@ -335,7 +397,7 @@ something else is going: a snap is one activity like a run, so only one runs at 
 stop; ...` and halts the stand. A frame the page cannot show (not 2-D `uint8` or
 `uint16`) is an outcome under the strip and is not kept.
 
-**Live** (*Image*, beside Snap). **Live** takes frames from the camera one after the
+**Live** (beside Snap). **Live** takes frames from the camera one after the
 other, **at most 10 a second**, and the page draws each new frame: the frame number is
 what it compares, every 0.1 s, so it draws nothing when there is nothing new. The
 button then says **End live**. While live goes the line under the strip reads
@@ -874,7 +936,7 @@ own.
 
 ## Not verified yet
 
-A real browser's tap and click, **the switch to the *Image* tab and the frame's
+A real browser's tap and click, **the frame's
 orientation** (Bokeh draws an image's first row at the bottom, so the page flips the
 rows to put the camera's top row on top: that is its documented convention, checked
 here on the data and not by eye), **a snap on a stand's camera**, the page's look, the periodic callback of a real
@@ -934,7 +996,16 @@ page redraws, never by the periodic callback); and the page over RDP.
 a preset saved by the service ([service.md](service.md)) into the profile's folder, where
 the service's account may not be allowed to write; a preset edited in Notepad (a
 byte-order mark, CRLF line ends) and read back on Windows; and the width of the region's
-select and buttons in the 420 px column.
+select and buttons in the 400 px step panel.
+
+**The steps and the regions** add, for the owner: the page on the stand PC's screen and
+over RDP (`/ui-check` read it in headless Chromium at 1280 x 800 on macOS, on the two demo
+stands, and at no other size); a 1280 px window with the browser's own zoom; whether a
+newcomer reads the step bar as the path (the numbers, the ticks, `next`) and finds the
+expert switch; how much of the drive bar a stand's window shows (at 1280 x 800 it is
+partly under the fold, so the scroll that reaches it must leave STOP in view: the strip is
+sticky, seen working in headless Chromium, not on the stand); and the *Continue to …*
+button at the foot of a long screen, which is a scroll down in the step panel.
 
 **Registering from images** adds, for the owner at the Ti2-E: the walk of the section above
 (steps 3 to 6) with the joystick, Live and the page open; the time of a `plate-walls` run on
