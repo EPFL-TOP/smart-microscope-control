@@ -7,7 +7,8 @@
   (2026-11-09); the focus on the cells, §21, for issue #341 (2026-11-09);
   the lab's own plate definitions, §22, for issue #400 (2026-11-10); a
   plan's calibration from another run document, §23, for issue #383
-  (2026-11-10).
+  (2026-11-10); the plate's orientation in its holder, §24, for issues #434
+  and #422 (2026-11-11).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 and M2, this document is the contract between issues
   that are built in parallel. Names, module paths and signatures below are
@@ -323,7 +324,8 @@ others load. In order:
    missing members by name.
 5. `name` not equal to the entry point's name, or not matching
    `NAME_PATTERN`; `provides` or a read not matching it; `reads` and
-   `reads_optional` not disjoint, or holding `provides`.
+   `reads_optional` not disjoint, or `reads_optional` holding `provides`
+   (`reads` may hold it since §24 D8: a tool that turns the slot it reads).
 6. `Params` not a subclass of `PluginParams`, `Result` not one of
    `PluginResult`; `requires` not a tuple of classes that are keys of
    `CAPABILITY_ROLES`: `requires <name>, which is not a capability`.
@@ -503,7 +505,11 @@ existing copies are not merged in this issue).
 among those whose `provides` is `slot` (ties broken by plugin name), `None`
 when there is none. The latest attempt decides even when it did not finish:
 a re-run of plate registration that failed leaves no usable plate, rather
-than the older one silently.
+than the older one silently. A **read never resolves to the reader's own
+record** (§24 D8): `provider(slot, excluding=reader)` leaves it out, and
+`is_stale`, `unusable(..., reader=)`, the runner and `RunContext` judge a
+plugin's reads that way, which changes nothing for a plugin that does not
+read the slot it provides.
 
 **Staleness.** `is_stale(plugin)` is true when the plugin's record read a
 slot whose provider has changed since: for each `(slot, read)` in its
@@ -7057,3 +7063,392 @@ session gives it the next free id).
   scan, cells, and a route whose positions land on cells at the 40×
   (session 3's three calibrations agree on 177.44°, #405, so the matrix
   differs from the 4×'s by its size only).
+
+## 24. The plate's orientation in its holder (#434, #422)
+
+A plate whose wells form a uniform grid lands on itself when it is turned 180°:
+the well positions stay and only the names swap (row `r` becomes `R-1-r`, column
+`c` becomes `C-1-c`; B3 becomes C4 on a 24-well). The samples follow the names
+printed on the plate, so a turned plate that the software does not know about is
+imaged at C4 under the name B3. `calibrate` sees the turn when the operator names
+wells from the plate, and refuses it as a misnamed well (#414); `plate-finding`
+cannot see it at all, and fits a turned plate at 0° with every name swapped and
+no word. Only the operator knows which way the plate lies, so **the operator
+declares it**: the orientation is how the plate was put down this time, not a
+property of the stand (#414's option 2, a stand orientation in the profile, was
+dropped for that reason).
+
+This section is the layer's half (#434): the slot keeps the orientation, the
+tools that fit a plate take it as a parameter and check or apply it, a pure tool
+renames a registered plate without measuring it again, and one rule of the run
+document lets that tool read the slot it provides. Every tool that reads `plate`
+then names the wells from it with no change of its own. The page's half (the
+choice, the map's back and front, the A1 corner, the switch after a
+registration) is m5 §16 (#422), against the interface fixed in §24.7.
+**Merging this section decides it.**
+
+### 24.1 What was measured (2026-11-11, planning #422)
+
+On main at `fcda44b` (useq-schema 0.9.2, pydantic 2.13, Python 3.13), with
+prototypes in the design session's scratchpad:
+
+- **A turn is always a renaming.** For each of the ten registered plates
+  (`useq`'s nine and `greiner-24-well`), a plan at A1 (1234, -567) µm turned
+  13°, and the same plan turned 180° about its grid's centre (A1 moved to the
+  old centre of the last well, rotation + 180°): every well `(r, c)` of one lies
+  on well `(R-1-r, C-1-c)` of the other, worst 4.0e-11 µm. A `useq.WellPlate`
+  is a uniform grid whatever its pitches and its well shape, so #422's item 7
+  ("plates with no 180° symmetry") has no case among the registered plates.
+- **Session 3's hand centres** (#414), B3 (10 003, -10 051), B5 (-28 982,
+  -9 919), C3 (10 031, 9 375) µm, on `greiner-24-well`: refused by `calibrate`
+  at the default ±10° (`the fit turns the plate by 179.8°, beyond ±10°`); with
+  the bound lifted, rotation **179.789°**, residual **44.53 µm**, scale error
+  +0.07 %, A1 at (48 788, -29 656). The same result turned 180° about the
+  grid's centre: rotation -0.211°, refs renamed C4, C2, B4, residual 44.53 µm
+  (unchanged), and its C4 lies on the first result's B3 (3.6e-11 µm). Turned
+  twice: A1 back to 6.9e-11 µm, rotation to 3e-14°.
+- **`wall_position` turns a side with the plate.** On that 179.8° result,
+  `wall_position(result, "B3", "+X")` lies at (-7 800, +29) µm from B3's
+  centre: on a turned plate `goto-well side=+X` goes to the stage's **-X**
+  wall, whereas a side is a stage direction (§19). `centre_from_walls` reads
+  stage coordinates and is right on either orientation.
+- **Text parameters.** `smc run ... --param turn_deg=180` against a field
+  `Literal[0, 180]` is refused (`Input should be 0 or 180`: pydantic's lax mode
+  does not turn the text "180" into an int literal); a string `Literal` is
+  accepted, as `goto-well`'s `side` is.
+- **The run document.** `RunDocument.provider(slot)` is the latest start among
+  the records that provide `slot`; a record that read `plate` and provides
+  `plate` is then its own provider, differs from the `ReadRecord` it holds, and
+  `is_stale` says so forever (reproduced on a synthetic document). The
+  registry's check 5 (§1.5) refuses such a plugin today.
+- **Who reads a plate's rotation** (every use in `src/`, read for this
+  section): `scan-plan` (`to_plan`, `well_geometry`; its in-well grid is
+  stage-aligned at 0, 30 and 180°, measured), `route` (`abs(cos)`, `abs(sin)`
+  for a square well's box), `density` and `report` (`well_geometry`, a full
+  turn), `objectives.plate_for_objective` (a translation), `nearest_well`,
+  the page's map (`WellView.rotation_deg`). Wells are selected and ordered by
+  their row and column in `useq`'s names (`parse_wells`, `order_wells`), never
+  by sorting positions. Only `calibrate`'s bound, the seed's 0°,
+  `plate-finding`'s ±4° search, `wall_position` and the page's estimate assume
+  a plate that is not turned.
+
+### 24.2 Decisions
+
+**D1. Two values, in the stage's terms.** `PlateOrientation =
+Literal["not-turned", "turned-180"]`. `not-turned` is `useq`'s layout on the
+stage: A1 at the -X +Y corner, columns towards +X, rows towards -Y (§2.1).
+`turned-180` is that plate turned 180°: A1 at the +X -Y corner. The operator's
+words ("A1 at the back left") come from the stand's directions on the page (m5
+§16) and are never stored: the slot stays the same arithmetic on every stand.
+Text values, not `0`/`180`, because a number literal cannot be given on the
+command line (§24.1).
+
+**D2. The slot keeps it.** `PlateResult.orientation: PlateOrientation =
+"not-turned"`, after `objective`. A run document written before it reads
+`not-turned`, which is what every earlier fit was checked against (`calibrate`
+refused anything beyond ±45°). A model validator refuses a result whose rotation
+is more than 90° from its orientation (`wrap_deg(rotation_deg -
+ORIENTATION_DEG[orientation])`), so the two fields never contradict each other.
+It is not in the profile.
+
+**D3. The tools that fit take it; `calibrate` checks it.** `plate-registration`,
+`plate-walls` and `plate-finding` gain `orientation: PlateOrientation =
+"not-turned"`. `calibrate` takes `orientation` and compares the fitted rotation
+with it: `delta = wrap_deg(rotation_deg - ORIENTATION_DEG[orientation])`.
+Within ±`max_rotation_deg`, the result carries the orientation. Within
+±`max_rotation_deg` of the *other* orientation, it is refused with §24.4 (1):
+the plate lies the other way, **or two wells are swapped** (two references
+exchanged fit at 180° exactly, so the message names both). Anything else keeps
+today's misnamed-well refusal, with `delta` in it. `max_rotation_deg` keeps its
+meaning (a tilt in the holder), its default (10°) and its cap (45°).
+
+**D4. A one-well seed takes its rotation from the declaration.** One reference
+sets A1 with `rotation_deg = ORIENTATION_DEG[orientation]`: A1 = the well's
+position minus the nominal offset turned by that angle. Its `assumed` line is
+§24.4 (3): the rotation came from the declared orientation, not from a
+measurement.
+
+**D5. `plate-finding` cannot see it, and says so.** It fits as it does today
+(±4° about `not-turned`) and, when the declaration is `turned-180`, turns its
+result (D6). Its `assumed` always holds §24.4 (4), on either orientation:
+until now the survey assumed `not-turned` silently.
+
+**D6. The turn is a renaming, done in one place.** `PlateResult.turned()`: A1
+moves to the old centre of the last well (row `R-1`, column `C-1`, through
+`well_geometry`); `rotation_deg` becomes `wrap_deg(rotation_deg + 180)`;
+`orientation` becomes the other one; every well name the result holds goes
+through `turned_well` (`refs[].well`, `walls.wells[].well`); `method`,
+`residual_um`, `scale_error`, `n_refs`, `fit`, `objective` and the other fields
+of `walls` are kept; `assumed` keeps its lines and gains §24.4 (5). Positions
+are not recomputed from anything measured: nothing is measured again.
+`PlateResult.with_orientation(o)` returns the result itself when it already
+has `o`, and `turned()` otherwise. It is **absolute**: asking for the fit's own
+orientation gives the fit's numbers back (§24.1: 6.9e-11 µm).
+
+**D7. A pure tool turns a registered plate: `plate-orientation`.**
+`requires = ()`, `reads = ("plate",)`, `provides = "plate"`, one required
+parameter `orientation`. It reads the latest *other* provider of `plate` (D8)
+and returns `with_orientation(params.orientation)`. It is the CLI's way to say
+"the plate lies the other way" after a fit without measuring again
+(`smc run plate-orientation --param orientation=turned-180`), and the page's
+switch runs it (m5 §16; ADR-0006: nothing exists only in the UI). The tools
+after it read its result like any `plate`; it makes them stale like any new
+`plate`, which is right, since their well names changed. A fit run again later
+is the newer provider and the turn is set aside with no extra rule.
+
+**D8. A read never resolves to the reader's own record.** One rule of the run
+document, so that D7's tool is not stale by construction:
+
+- `RunDocument.provider(slot, *, excluding: str | None = None)`: the latest
+  start among the records that provide `slot`, the record named `excluding` left
+  out.
+- `is_stale(plugin)` (and `_stale`) compares each slot that `plugin` read with
+  `provider(slot, excluding=plugin)`.
+- `unusable(slot, *, profile, dry_run, reader: str | None = None)` judges
+  `provider(slot, excluding=reader)`.
+- The runner's `check_ready`, `_reads_of` and `_read_of`, `RunContext`'s
+  `_result_of`, the CLI's `_outdated` and the page's readiness check of a tool's
+  `reads` pass the reading plugin's name.
+- The registry's check 5 (§1.5) allows `provides` in `reads`; it still refuses it
+  in `reads_optional` (an optional read of one's own slot means nothing).
+
+For every plugin that does not read its own slot nothing changes: its record
+never provides a slot it reads, so leaving it out leaves the same provider. Every
+other reader of `plate` (a consumer, the page's map, `unusable` with no reader)
+still sees `plate-orientation` when it is the latest. This is a rule of §1.7, not
+an architecture change: no slot, model or file format changes. A record whose
+reads are judged without itself cannot be its own input, so `_stale`'s recursion
+keeps its `visited` guard and gains no cycle.
+
+**D9. A wall's side stays a stage direction.** `wall_position` turns the
+half-size offset by the plate's rotation **from its orientation**,
+`wrap_deg(rotation_deg - ORIENTATION_DEG[orientation])`, not by `rotation_deg`:
+`+X` is towards the stage's +X on either orientation (FM-189). The texts that
+say "`+Y` is towards row A" (`goto_well.py`, `plate_registration/plugin.py`,
+`algorithm.py`, `docs/plugins/plate-registration.md`) say "towards row A on a
+plate that is not turned".
+
+**D10. What does not change.** `goto-well`, `scan-plan`, `route`, `density`,
+`report`, `nis-export`, `objective-offsets` and `objectives.py` read names and
+positions through `to_plan` and `well_geometry` (§24.1), so a plate declared
+`turned-180` sends `goto-well well=B3` to the printed B3 with no change to them.
+`PlateResult.rotation_deg` keeps its bounds ([-180, 180]).
+
+**D11. Not here.** A stand whose stage axes are mirrored as seen from above (no
+turn maps `useq`'s layout onto it; none is known); turns of 90° (a plate does not
+fit its holder that way); `[sample] rotation_deg`'s ±45° bound (the demo-sample
+stand draws a plate that is not turned; the tests declare the orientation, which
+is all `plate-finding` can be told); a warning when a declaration disagrees with
+a previous run document.
+
+### 24.3 The interface
+
+```python
+#: smc/plugins/geometry.py
+def wrap_deg(angle_deg: float) -> float:
+    """``angle_deg`` brought into (-180, 180]."""
+```
+
+```python
+#: smc/plugins/slots/plate.py
+PlateOrientation = Literal["not-turned", "turned-180"]
+ORIENTATION_DEG: Mapping[str, float] = {"not-turned": 0.0, "turned-180": 180.0}
+
+
+def turned_well(plate: str, well: str) -> str:
+    """The name of the well at ``well``'s place once the plate is turned 180°."""
+```
+
+```python
+class PlateResult(PluginResult):  # gains, after `objective`
+    orientation: PlateOrientation = "not-turned"
+
+    def turned(self) -> PlateResult: ...
+    def with_orientation(self, orientation: PlateOrientation) -> PlateResult: ...
+```
+
+`turned_well` normalises its input (`normalise_well`), finds the row and column
+in `useq`'s names (never by parsing letters, §3.2) and raises `ValueError` for a
+well that is not on the plate: `turned_well("24-well", "b3") == "C4"`,
+`turned_well("96-well", "A1") == "H12"`, `turned_well("1536-well", "A1") ==
+"AF48"` (measured).
+
+```python
+#: smc/plugins/plate_registration/algorithm.py
+def calibrate(
+    plate: str,
+    refs: Sequence[WellRef],
+    *,
+    max_rotation_deg: float = MAX_ROTATION_DEG,
+    orientation: PlateOrientation = "not-turned",
+) -> PlateResult: ...
+```
+
+```python
+class PlateRegistrationParams(PluginParams):  # gains
+    orientation: PlateOrientation = Field(
+        "not-turned",
+        description=(
+            "Which way the plate lies in its holder: not-turned (A1 at the "
+            "stage's -X +Y corner) or turned-180 (A1 at the +X -Y corner)."
+        ),
+    )
+```
+
+`PlateWallsParams` and `PlateFindingParams` gain the same field with the same
+text; `plate-walls` passes it to `calibrate`, `plate-finding` to
+`with_orientation` on its result (D5).
+
+```python
+#: smc/plugins/plate_orientation.py (new), entry point `plate-orientation`
+class PlateOrientationParams(PluginParams):
+    orientation: PlateOrientation = Field(
+        description=(
+            "Which way the plate lies: not-turned or turned-180. The latest "
+            "plate fit is renamed to it; nothing is measured again."
+        )
+    )
+```
+
+```python
+class PlateOrientationPlugin:
+    name = "plate-orientation"
+    summary = "Say which way the registered plate lies; renames its wells."
+    requires: tuple[type, ...] = ()
+    reads = ("plate",)
+    reads_optional: tuple[str, ...] = ()
+    provides = "plate"
+    Params = PlateOrientationParams
+    Result = PlateResult
+```
+
+`run` is `ctx.upstream("plate", PlateResult).with_orientation(params.orientation)`
+and nothing else: it touches no device and writes no file.
+
+```python
+#: smc/run/document.py
+class RunDocument:  # changes
+    def provider(
+        self, slot: str, *, excluding: str | None = None
+    ) -> StageRecord | None: ...
+    def unusable(
+        self,
+        slot: str,
+        *,
+        profile: str,
+        dry_run: bool,
+        reader: str | None = None,
+    ) -> str | None: ...
+```
+
+### 24.4 The texts
+
+1. `calibrate`, the other orientation:
+   `f"the fit turns the plate by {rotation_deg:.1f}°: it lies turned 180° from
+   the declared orientation ({orientation}), or two reference wells are swapped;
+   if A1 is at the other corner, declare orientation={other}, else check the
+   well names"`.
+2. `calibrate`, any other rotation: today's text with `delta` in place of
+   `rotation_deg`, and ` from turned-180` after the angle when the declaration is
+   `turned-180`: `f"the fit turns the plate by {delta:.1f}°{suffix}, beyond
+   ±{max_rotation_deg:g}°: a reference well is misidentified (two references
+   the same distance apart fit either way)"`. On `not-turned` it is today's text
+   to the character.
+3. The seed's `assumed`: `f"one reference well ({name}): rotation {deg:g}°
+   assumed from the declared orientation ({orientation}), not measured"`. On
+   `not-turned` it still holds `rotation 0° assumed`.
+4. `plate-finding`'s `assumed`: `f"orientation {orientation} given by the
+   operator: a plate turned 180° lands on itself, so the survey cannot see it"`.
+5. A turn's `assumed`: `f"turned 180° to {new} after the fit: every well renamed
+   (row r to R-1-r, column c to C-1-c), nothing measured again; a well named in
+   a line above is the fit's name"`.
+
+### 24.5 Docs
+
+`docs/plugins/plate-orientation.md` (new; the docs index and the tool table
+list it): what it does, when to run it (the cross on the page or a well's
+printed label says the plate lies the other way), what it never does (measure),
+the CLI line, and that the tools after it are then stale. `plate-registration.md`,
+`plate-walls.md` and `plate-finding.md`: the parameter in their tables, the
+refusal (1) in place of #414's, and the A1 corner of each value. The "`+Y` is
+towards row A" lines say "on a plate that is not turned" (D9).
+
+### 24.6 Tests
+
+FM-73: the tests use a plate whose grid is not square (24-well, 4 × 6, and
+96-well) and positions that differ in X and Y, so that a swap of rows and
+columns, or a mirror in place of a turn, fails. Values are synthetic from
+`useq.WellPlatePlan(..., rotation=180.0 + tilt)` unless they are session 3's.
+
+- `tests/unit/test_plate_orientation.py` (new):
+  `test_turned_well_swaps_row_and_column_on_every_registered_plate`
+  (every well of every registered plate, against the indices),
+  `test_a_turn_keeps_every_well_position_on_every_registered_plate` (≤ 1e-6 µm),
+  `test_turning_twice_gives_the_fit_back`,
+  `test_a_turn_renames_refs_and_wall_wells_and_keeps_the_residual`,
+  `test_with_orientation_of_the_same_orientation_is_the_result_itself`,
+  `test_a_result_whose_rotation_contradicts_its_orientation_is_refused`,
+  `test_a_document_without_an_orientation_reads_not_turned`,
+  `test_wrap_deg_is_in_minus_180_exclusive_to_180_inclusive` (180, -180, 540,
+  -180.2, 359.8).
+- `tests/unit/test_plate_registration.py` gains:
+  `test_session_3_centres_register_when_declared_turned` (§24.1's values,
+  rotation within 0.5° of 179.79, residual < 100 µm, `orientation ==
+  "turned-180"`),
+  `test_session_3_centres_declared_not_turned_are_refused_as_turned` (text (1)),
+  `test_a_turned_fit_beyond_the_tilt_bound_keeps_the_misnamed_well_refusal`
+  (text (2) with the suffix),
+  `test_two_swapped_references_are_refused_with_the_turned_text`,
+  `test_a_seed_on_a_turned_plate_places_a1_at_the_far_corner` (text (3)),
+  `test_wall_position_plus_x_is_the_stage_plus_x_on_a_turned_plate` (and the
+  three other sides, on both orientations).
+- `tests/unit/test_run_document.py` gains:
+  `test_a_stage_that_reads_its_own_slot_is_judged_on_the_other_provider`,
+  `test_a_transform_after_a_fit_is_not_stale_and_its_readers_are`,
+  `test_a_fit_run_again_after_the_transform_is_the_provider`,
+  `test_a_failed_fit_after_the_transform_leaves_the_slot_unusable`,
+  `test_excluding_a_plugin_that_does_not_provide_the_slot_changes_nothing`.
+- `tests/unit/test_plugin_registry.py` gains
+  `test_a_plugin_may_read_the_slot_it_provides_but_not_optionally`.
+- `tests/test_plate_orientation_demo.py` (new; `demo_microscope`):
+  `test_plate_orientation_renames_the_registered_plate_through_the_runner`
+  (`plate-registration` with refs from a turned 24-well plan declared
+  `not-turned` is refused; declared `turned-180` it is `done`; then
+  `plate-orientation` to `not-turned` and back: each `done`, `unusable("plate",
+  ...)` `None` after each, positions kept, names swapped),
+  `test_goto_well_on_a_turned_plate_reaches_the_printed_b3` (the stage at the
+  turned plan's B3 within 1 µm, and not at the not-turned plan's B3),
+  `test_goto_well_side_plus_x_moves_towards_plus_x_on_a_turned_plate`,
+  `test_scan_plan_after_a_turn_is_stale_and_plans_the_turned_names`.
+- `tests/test_plate_finding_demo.py` gains
+  `test_plate_finding_names_wells_from_the_declared_orientation`
+  (the module's `_on_demo` with the `PlateSample` of
+  `test_the_survey_fills_the_plate_slot_on_the_demo`, run once per
+  orientation: the `turned-180` result's A1 lies on the `not-turned` result's
+  last well within 1 µm, and `assumed` holds text (4) on both).
+
+**Failure modes**: FM-73 (symmetric data), FM-189 (a side named in one frame
+and applied in another, D9), FM-217 (an estimate drawn like a measurement: an
+orientation that was given is said to be given), FM-165 (the label belongs to the
+result, whichever branch), FM-111 (a read recorded against the provider it
+used), and a new entry named by its text for the develop session to number: *a
+read that resolves to the reader's own record* (a tool that reads the slot it
+provides is stale forever, or reads its own previous output, unless the read
+leaves its own record out).
+
+### 24.7 For the page (#422, m5 §16)
+
+- The page fills `orientation` itself: `PAGE_PARAMS` gains it for
+  `plate-registration`, `plate-walls`, `plate-finding` and `plate-orientation`.
+- The switch after a registration is `plate-orientation` through `run`, the
+  path of every tool.
+- Captures and a selection are names: `turned_well` renames them.
+- The estimate (m5 §15 D2) uses `ORIENTATION_DEG` about the holder's centre.
+
+### 24.8 Not verified (for the owner)
+
+- At the Ti2-E: the Greiner plate turned, declared `turned-180`, registered
+  from three wells named from the plate, and `goto-well` to a named well checked
+  by eye against the printed label; then the same with the plate not turned.
+- That the plate holder takes the plate either way round (#414 option 1 was
+  inferred, not tried).

@@ -15,7 +15,10 @@
   to the image fixed by #327's plan (§13, 2026-11-09: the captures and the drive
   take image sides, the notes say what each is on the stage); the map's place of
   the stage fixed by #410's plan (§15, 2026-11-10: a cross that follows the frames
-  in Live, a plate estimated from the stand's holder, the pose the title names).
+  in Live, a plate estimated from the stand's holder, the pose the title names);
+  which way the plate lies fixed by #422's plan (§16, 2026-11-11: the choice next
+  to the plate menu, the stand's sides and A1 on the map, the switch that renames a
+  registered plate).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 to M3, this document is the contract between issues.
   Names, module paths and signatures below are fixed; an executor who needs to
@@ -3851,7 +3854,7 @@ plan) and the page's words. What is *not* new, and the owner should know:
   about `PlateResult.method` (a slot model m3 §3.2 fixes), `scan`'s refusal of an
   unmeasured plate, and what `assumed` says: a design of its own, the owner's call.
 - The plate's orientation (#422): the choice, the names it changes, the map's
-  back and front. The estimate assumes "not turned" until then.
+  back and front. The estimate assumes "not turned" until then; §16 decides it.
 - Writing `[holder]` from a registration; a holder per plate type; the cross
   faster than a second outside Live (D1); a click on the estimated map that
   records a position.
@@ -3932,3 +3935,237 @@ for each state).
   was seen to take up to 0.5 s during Live, #333).
 - `plate-walls` from one rough position in each of three wells on the Greiner plate,
   and the time it takes (D7).
+
+## 16. Which way the plate lies, on the page (#422)
+
+The operator says which way the plate lies in its holder in one choice next to the
+plate menu, and the map shows what the choice means: which side of the stand is the
+back and which the front, and which corner holds A1. The check is the cross (§15):
+the operator looks at where the objective really is on the plate and compares it
+with the cross on the map; if they disagree, one switch to "turned 180°" corrects it,
+and on a registered plate it **renames the wells without measuring again**: the
+cross stays where it is and its well's name changes (B3 becomes C4 on a 24-well).
+The layer's half, the slot field, the checks and the tool that renames, is m3 §24
+(#434); this section uses its interface (m3 §24.3, §24.7) and changes none of it.
+**Merging this section decides it.**
+
+### 16.1 What was measured (2026-11-11, planning #422)
+
+Read on main at `fcda44b` for this section, with m3 §24.1's measurements:
+
+- The plate menu is `PlatePageView.plate_select`, first in the row `controls`
+  (`plate_select`, `label_select`, `side_select`, `drive_toggle`) at the top of
+  the Plate tab. The chosen plate is the controller's (`PlatePage._plate`,
+  `choose_plate`), shared by every tab through `_shared_state()` (FM-151).
+- The map is in stage µm, X right and Y up, with no word for the stand's sides.
+  Names are drawn up to `NAMES_UP_TO_WELLS` (96) wells only. The cross's label is
+  `stage_label(view.wells, view.pose, xy_um)` from the last drawn view, so a view
+  with renamed wells relabels the cross without moving it.
+- The estimate (§15 D2) is built with rotation 0 about A1 = holder centre minus
+  the grid's centre offset; its cache key is `(plate, a1, rotation)`.
+- The controller writes the run document only through `run_plugin` on its worker,
+  one activity at a time, with a connected stand (`run` refuses otherwise).
+  ADR-0006 principle 5: nothing exists only in the UI.
+- No profile entry says which stage direction is the back of the stand or the
+  operator's right. Session 3 (#405, #414; m3 §22.1) suggests, on the Ti2-E, +Y
+  is the back (rows ran towards +Y with row A by the operator) and +X the
+  operator's right (A1 at the front right of a plate turned 180°): **inferred,
+  not checked at the stand**.
+
+### 16.2 Decisions
+
+**D1. The stand's directions are profile knowledge, in `[holder]`.** Two optional
+keys, `back` and `right`, each a stage direction (`"+X"`, `"-X"`, `"+Y"`, `"-Y"`):
+the way the stage moves towards the back of the stand and towards the operator's
+right, seen by the operator at the front. Set both or neither, on different axes,
+with their provenance in `directions_measured` (as `measured` is for the centre;
+an empty provenance with a direction set is refused). A mirrored pair (the stage's
+axes left-handed seen from above) is accepted and labelled as it is: the corner
+words of D3 then say where A1 really is. `nikon-ti2.toml`: `back = "+Y"`,
+`right = "+X"`, `directions_measured` saying inferred from session 3 and to be
+checked; `demo-sample.toml`: the same values, "by construction: the demo map's
++Y is up and +X right, seen from the front". `demo.toml` and `nikon-tie.toml`
+leave them unset.
+
+**D2. The choice: a `Select` next to the plate menu.** `PlatePageView.
+orientation_select = pn.widgets.Select(label="Plate lies", options={label: value})`,
+second in `controls`, right after `plate_select`; values are m3's
+`PlateOrientation`, labels from `guide.orientation_label`. Its handler calls
+`PlatePage.choose_orientation(value)` inside `_try`, then `refresh()`, as
+`on_choose_plate` does; `refresh()` re-syncs it from the view.
+
+**D3. The words name A1's corner.** With the directions known, a stage direction
+is `back`/`front` (`back` and its opposite) or `right`/`left`; A1's corner is
+`-X +Y` not turned and `+X -Y` turned (m3 §24 D1), said back-or-front first:
+"A1 at the back left" and "Turned 180°: A1 at the front right" on the Ti2-E.
+Without them, in stage terms: "Not turned: A1 at stage -X +Y" and "Turned 180°: A1
+at stage +X -Y", and the note under the menu says the stand does not say which
+side is the back (`[holder] back`, `right`). The words are never stored.
+
+**D4. What the choice does.** `PlatePage.choose_orientation(orientation)`:
+
+- **On a registered plate** (a usable `plate` slot naming the page's plate) whose
+  orientation differs: it starts `plate-orientation` with `orientation=<value>`
+  through `run`, the path of every tool, and returns. A refusal (no stand, a run
+  going) leaves everything as it was and says why in the outcome, as any Run does.
+  The new names show on the first refresh after the activity ends `done` (the
+  tick's, within a second). A plate of the same orientation is a no-op.
+- **Otherwise** (an estimate, an unplaced map, no plate chosen): it sets the
+  controller's `_orientation`, which the estimate and the next fit's parameters
+  use.
+
+`PlatePage.orientation` is the registered plate's `orientation` when there is one,
+else `_orientation`; `_setup` starts from the `plate` slot's orientation when it
+names the page's plate, else `not-turned`. `choose_plate` keeps the orientation (the
+next plate is likely put down the same way). `_shared_state()` gains it (FM-151).
+
+**D5. The page fills `orientation` for every plate tool.** `PAGE_PARAMS`:
+`plate-registration` and `plate-walls` gain `"orientation"`; `plate-finding` and
+`plate-orientation` get `("orientation",)`; `page_params` emits
+`orientation=<PlatePage.orientation>` for each. No form offers it a second time.
+
+**D6. Names follow the turn; positions do not move.** When a `plate-orientation`
+activity ends `done` with the orientation changed, the controller renames its
+captures (`refs[].well`, `walls[].well`) through `turned_well`; `current` is
+cleared; the selection keeps its **names** (a well chosen as B3 is the printed B3,
+which is what a selection by name means everywhere, m3 §24 D10), and the note under
+the map says so once: "the selection kept its names; with the plate turned they
+lie elsewhere". After a restart, `_restore` takes the captures of a
+`plate-orientation` provider from the stage it read (`reads["plate"]`, that
+record's `refs` and `walls` parameters), renamed when the orientations differ.
+
+**D7. The estimate turns about the holder's centre.** With no registered plate, the
+estimate's rotation is `ORIENTATION_DEG[orientation]` and A1 is the holder's centre
+minus the grid's centre offset turned by it: for `turned-180`, A1 = holder centre
+**plus** the offset. The grid's centre is the same point either way (§15 D2), so
+the switch renames the estimated wells in place too.
+
+**D8. The map shows the stand's sides and A1.**
+
+- **Sides**: with the directions known, up to four plain-text labels, "back of the
+  stand", "front of the stand", "operator's left", "operator's right", each at the
+  middle of a side of the drawn wells' bounding box, half a well pitch outside it
+  (`PlateView.sides`, built in `view()`; drawn from a `side_source` `LabelSet`).
+  Without them, none, and D3's note.
+- **A1**: the A1 well's name is always drawn, bold, from an `a1_source`, whatever
+  the number of wells (`NAMES_UP_TO_WELLS` hides the others above 96).
+- **Title**: `MapPose` gains `orientation` and `a1_corner` (D3's corner words);
+  `map_title` says them: a registered plate "…: the registered plate, A1 at the
+  back left"; a seed's rotation is "taken from the declared orientation", no longer
+  "assumed 0°"; the estimate's "not turned, A1 at the top left of this map" names
+  the declared orientation and the map corner A1 is at (top left not turned, bottom
+  right turned).
+
+**D9. Not here.** A warning that the cross and the plate disagree (only the
+operator sees the plate); a choice of 90°; a picture of the plate in the holder.
+
+### 16.3 The interface
+
+```python
+#: smc/hardware/profile.py
+StageDirection = Literal["+X", "-X", "+Y", "-Y"]
+
+
+class HolderSection(_Section):  # gains
+    back: StageDirection | None = None
+    right: StageDirection | None = None
+    directions_measured: str = ""
+```
+
+```python
+#: smc/ui/controller.py
+@dataclass(frozen=True, slots=True)
+class MapPose:  # gains, after seed_well
+    orientation: PlateOrientation = "not-turned"
+    a1_corner: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class SideLabel:
+    text: str
+    x_um: float
+    y_um: float
+```
+
+`PlateView` gains `orientation: PlateOrientation = "not-turned"` and `sides:
+tuple[SideLabel, ...] = ()` after `pose`. `PlatePage` gains the property
+`orientation` and `choose_orientation(orientation: PlateOrientation) -> None`.
+
+```python
+#: smc/ui/guide.py (pure)
+def a1_corner(
+    orientation: PlateOrientation, back: str | None, right: str | None
+) -> str: ...
+def orientation_label(
+    orientation: PlateOrientation, back: str | None, right: str | None
+) -> str: ...
+def side_words(back: str | None, right: str | None) -> dict[str, str]: ...
+```
+
+`a1_corner("not-turned", "+Y", "+X") == "the back left"`, `a1_corner("turned-180",
+"+Y", "+X") == "the front right"`, `a1_corner("not-turned", None, None) == "stage
+-X +Y"`; `side_words("+Y", "+X") == {"+Y": "back of the stand", "-Y": "front of the
+stand", "+X": "operator's right", "-X": "operator's left"}`, `{}` without both.
+
+### 16.4 `/ui-check`
+
+A sixth state, `turned`, after `with-route` (it needs results, so it is in
+`STATE_NAMES[3:]`): on the Plate tab, the orientation select set to its turned
+label, then a wait for the outcome line of `plate-orientation`, then the
+photograph. `with-route` is the not-turned state; the two are compared by eye: the
+same cross, other names. `tests/test_dev_ui_snap.py`'s list of names and reachable
+split, and the skill's state table, follow.
+
+### 16.5 Docs
+
+`docs/ui/plate-page.md`: a section "Which way the plate lies" (the choice, the
+check with the cross, the switch after a registration, what it never does), the
+map's sides and A1 label in the map's section, and its *Not verified* lines
+updated; `profiles/README.md`: `[holder] back`, `right`, `directions_measured`.
+
+### 16.6 Tests and failure modes
+
+- `tests/unit/test_profile_holder.py` gains
+  `test_holder_directions_need_both_and_their_provenance`,
+  `test_holder_directions_on_one_axis_are_refused`,
+  `test_the_ti2_holder_says_back_is_plus_y_and_right_is_plus_x`.
+- `tests/unit/test_ui_guide.py` gains
+  `test_the_a1_corner_is_in_the_operators_words_when_the_stand_says_its_sides`
+  (both orientations, and `back = "+X"`, so that a word is not tied to an axis:
+  FM-73), `test_the_a1_corner_is_in_stage_terms_when_the_stand_does_not`,
+  `test_side_words_follow_back_and_right`,
+  `test_a_seeds_title_takes_its_rotation_from_the_declared_orientation`.
+- `tests/unit/test_plate_page_orientation.py` (new; controller, `fake_microscope`,
+  stub plugins as in `test_plate_page.py`):
+  `test_the_orientation_reaches_every_plate_tool_as_a_parameter`,
+  `test_switching_on_a_registered_plate_runs_plate_orientation`,
+  `test_switching_on_an_estimate_turns_it_about_the_holder_centre`
+  (96-well, so that a swap of rows and columns shows),
+  `test_switching_without_a_stand_changes_nothing_and_says_why`,
+  `test_the_orientation_shown_is_the_registered_plates`,
+  `test_a_turn_renames_the_captures_and_keeps_the_selection_by_name`,
+  `test_captures_are_restored_through_a_turn_after_a_restart`,
+  `test_choosing_another_plate_keeps_the_orientation`,
+  `test_a_second_tab_draws_the_new_orientation` (FM-151).
+- `tests/unit/test_plate_page_orientation_view.py` (new; Panel):
+  `test_the_orientation_select_is_next_to_the_plate_menu`,
+  `test_the_map_labels_the_stands_sides_and_a1`,
+  `test_a1_is_labelled_on_a_384_well_plate`,
+  `test_without_directions_the_map_has_no_side_labels_and_says_why`.
+- `tests/test_plate_page_orientation_demo.py` (new; `demo_microscope`, the page
+  over the real runner): a 24-well registered from three centres of a turned plan
+  declared `turned-180`, the stage on B3:
+  `test_switching_renames_the_wells_and_the_cross_stays` (the cross's `x`, `y`
+  unchanged, its label from `over B3` to `over C4`, no stage move, no new
+  `plate-registration` record), `test_selecting_b3_on_a_turned_plate_drives_to_the_printed_b3`
+  (a drive click, the stage at the turned plan's B3 within 1 µm).
+
+**Failure modes**: FM-73, FM-151, FM-217 (the map says whether its orientation was
+declared on an estimate or registered), FM-139 (plain text), FM-169 (a select
+disabled in the browser whose handler still runs: `choose_orientation` checks the
+stand and the activity itself), FM-162 (the `turned` state waits on the outcome
+line, not on a delay).
+
+**Not verified (for the owner)**: the Ti2-E's `back` and `right`, at the stand; the
+switch read by an operator who has not read this section; that the selection keeping
+its names after a turn is what the operator expects.
