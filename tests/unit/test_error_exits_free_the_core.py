@@ -1147,6 +1147,40 @@ def test_a_drive_turn_whose_z_cannot_be_read_frees_the_core(
     assert _alive(watched) == _FACADE_AND_CORE_FREED
 
 
+def _drive_a_turn_whose_offset_fails(core: FakeCore, microscope: Microscope) -> str:
+    """``drive.set_objective`` over a ``getAutoFocusOffset`` that raises a fresh error each call.
+
+    The demo layout reads its offset through ``getAutoFocusOffset``. The hook is
+    removed with ``del`` before the function returns (FM-92).
+    """
+
+    def offset() -> float:
+        raise RuntimeError("PFS: no answer")  # fresh: not `failing` (FM-98)
+
+    core.getAutoFocusOffset = offset  # type: ignore[method-assign]
+    try:
+        return drive.set_objective(microscope, _TWENTY_X, confirm=True).text
+    finally:
+        del core.getAutoFocusOffset
+
+
+def test_a_drive_turn_whose_offset_cannot_be_read_frees_the_core(
+    no_cyclic_gc: None,
+) -> None:
+    # `drive._read_offset` keeps the text of a HardwareError and never the error
+    # (FM-98): the clause carries the first cause, and a name bound to either error
+    # would be a cycle through the frame, with the core kept alive (m2 §8.11 D8).
+    core, microscope = _stand()
+    assert _drive_a_turn_whose_offset_fails(core, microscope) == (
+        f"objective '{_TWENTY_X}'; the autofocus offset could not be read around the "
+        f"turn (autofocus: getAutoFocusOffset() failed (PFS: no answer); check the "
+        f"device: power, cable, another program holding it)"
+    )
+    watched = _watch(microscope, core)
+    del microscope, core
+    assert _alive(watched) == _FACADE_AND_CORE_FREED
+
+
 def _executor(logger: logging.Logger | None = None) -> Executor:
     return Executor(
         dry_run=False,
