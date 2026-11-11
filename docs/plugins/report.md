@@ -76,8 +76,14 @@ In this order:
 ### Frames, cells and the cap
 
 The footprints are the **scan's**: its camera matrix and frame shape at the position the
-stage *read back*, as density counted them, not the plan's copy. The route's fields are
-the **route's** own matrix and shape: another objective is another field of view.
+stage *read back*, as density counted them, not the plan's copy. A frame that records its
+place in its well (`well_dx_um`, `well_dy_um`, see [`scan`](scan.md)) is drawn at **its
+own offsets from the well's centre**; a frame of a scan written before them is drawn at
+the readback minus the centre, which is the same page to the digits it prints (0.1 µm;
+the two differ by about 1e-12 µm). The page does not compare the offsets with the plate:
+a plan run again makes the scan stale, and the runner refuses a stale read. The route's
+fields are the **route's** own matrix and shape: another objective is another field of
+view.
 
 Only the cells **inside the well's shape** are drawn, the ones density counted; the
 caption gives the number on the plastic. When a well has more cells than the cap, a
