@@ -1221,6 +1221,185 @@ def test_a_relock_at_a_seen_floor_is_not_a_first_lock() -> None:
         assert stand.af.is_locked() is True
 
 
+# --- D9 amended by #421: a searching autofocus at a seen floor ---------------------
+#
+# D9's first reading sent a seen floor with the autofocus on and not locked to D1's
+# band (±E). Searching, PFS drives Z to the floor's plane at *this* place the moment
+# it finds the reference, and one floor named planes 104 µm apart (F11) against E = 50.
+
+SEEN_FLOOR_SEARCHING = (
+    "autofocus PFS: not engaged: at the offset's floor (5000 PFSOffset units), a "
+    "lock seen at one place says nothing of the floor's plane at another (m2 §12.11 "
+    "D9); it was on and searching, so it was switched off. " + FROM_BELOW
+)
+
+
+def _finds_the_reference_once_switched_on(
+    stand: Stand, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PFS left searching locks once smc sends the switch-on, as PFS that finds the sample."""
+    core = stand.core
+    switch = core.enableContinuousFocus
+
+    def enable(on: bool) -> None:
+        if on:
+            core.autofocus_lockable = True
+        switch(on)
+
+    monkeypatch.setattr(core, "enableContinuousFocus", enable)
+
+
+def test_a_seen_floor_with_the_autofocus_searching_is_switched_off_and_refused(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Measured on main: the plane 40 µm toward the sample is inside ±E and outside R,
+    # so D1's band passes it, the switch-on locks there and engage() returns True.
+    with _stand(_first_lock(**RISE), offset=FLOOR) as stand:
+        _floor_seen_then_back_at_z0(stand, caplog)
+        _jumps_to(stand, Z0 + 40.0)
+        stand.engage_directly(lockable=False)
+        _finds_the_reference_once_switched_on(stand, monkeypatch)
+        with pytest.raises(SafetyRefusedError) as refused:
+            stand.af.engage()
+        assert str(refused.value) == SEEN_FLOOR_SEARCHING
+        assert refused.value.how_to_force == ""
+        assert stand.core.log == [OFF]
+        assert stand.z.position_um() == Z0
+        assert stand.af.is_engaged() is False
+
+
+def test_a_seen_floor_searching_whose_switch_off_fails_says_it_may_still_move_z(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with _stand(_first_lock(**RISE), offset=FLOOR) as stand:
+        _floor_seen_then_back_at_z0(stand, caplog)
+        stand.engage_directly(lockable=False)
+        switch = stand.core.enableContinuousFocus
+
+        def stuck_on(enable: bool) -> None:
+            if enable:
+                switch(True)
+                return
+            raise RuntimeError("PFS: stuck on")
+
+        monkeypatch.setattr(stand.core, "enableContinuousFocus", stuck_on)
+        with pytest.raises(HardwareError) as stuck:
+            stand.af.engage()
+        assert not isinstance(stuck.value, SafetyRefusedError)
+        assert str(stuck.value) == (
+            "autofocus PFS: not engaged: at the offset's floor (5000 PFSOffset units), "
+            "a lock seen at one place says nothing of the floor's plane at another "
+            "(m2 §12.11 D9); it was on and searching, and it could not be switched off "
+            "(autofocus: enableContinuousFocus(False) failed (PFS: stuck on); check the "
+            "device: power, cable, another program holding it); it may still move Z: "
+            "stop() and check the stand, then resume()"
+        )
+        monkeypatch.setattr(stand.core, "enableContinuousFocus", switch)
+
+
+def test_after_a_searching_seen_floor_is_refused_the_next_engage_is_a_first_lock(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Nothing is forgotten by the refusal (nothing moved), and the advice leads to a
+    # first lock: with the autofocus off, the floor is one whether or not it is seen.
+    with _stand(_first_lock(**RISE), offset=FLOOR) as stand:
+        _floor_seen_then_back_at_z0(stand, caplog)
+        _jumps_to(stand, Z0 + 40.0)
+        stand.engage_directly(lockable=False)
+        _finds_the_reference_once_switched_on(stand, monkeypatch)
+        with pytest.raises(SafetyRefusedError):
+            stand.af.engage()
+        seen = stand.af._seen  # type: ignore[attr-defined]
+        assert seen == {"10x": frozenset({FLOOR})}
+        stand.core.log.clear()
+        _jumps_to(stand, Z0 + 40.0)
+        with (
+            caplog.at_level(logging.INFO, logger="smc.hardware.backends.mm"),
+            pytest.raises(AutofocusExcursionError),
+        ):
+            stand.af.engage()
+        assert any("a first lock from the offset's floor" in m for m in caplog.messages)
+        assert stand.core.log == [ON, OFF]
+
+
+def test_a_floor_forgotten_by_a_trip_is_seen_again_by_the_lock_a_relock_suspends(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # D9's last bullet (#421): forgetting the floor for the whole objective costs
+    # nothing, since a relock needs a lock to suspend and that lock read makes the
+    # floor seen again. It holds on main too: this pins it.
+    with _stand(_first_lock(**RISE), offset=FLOOR) as stand:
+        _floor_seen_then_back_at_z0(stand, caplog)
+        _jumps_to(stand, Z0 + 40.0)
+        with pytest.raises(AutofocusExcursionError):
+            stand.af.engage()
+        forgotten = stand.af._seen  # type: ignore[attr-defined]
+        assert forgotten == {"10x": frozenset()}
+        stand.core.setPosition("ZDrive", Z0)
+        stand.core.autofocus_target_um = None
+        stand.engage_directly()
+        assert stand.z.move_by_um(-3.0) == Z0 - 3.0
+        assert stand.core.log == [OFF, f"setPosition('ZDrive', {Z0 - 3.0})", ON]
+        # The lock read of suspend() recorded it: read before is_locked(), which
+        # would record it too.
+        seen_again = stand.af._seen  # type: ignore[attr-defined]
+        assert seen_again == {"10x": frozenset({FLOOR})}
+        assert stand.af.is_locked() is True
+
+
+def test_a_seen_floor_with_a_condition_missing_is_d1s_even_with_the_autofocus_searching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # D9 applies only where a first lock's four conditions are met: with one
+    # missing (here z_away_from_sample), a seen floor is any seen offset, D1's, in
+    # every state, so the searching autofocus is engaged and not refused.
+    with _stand(_first_lock(z_away_from_sample=None), offset=FLOOR) as stand:
+        _see(stand)
+        stand.engage_directly(lockable=False)
+        _finds_the_reference_once_switched_on(stand, monkeypatch)
+        assert stand.af.engage() is True
+        assert stand.core.log == [ON]
+
+
+def test_a_seen_offset_above_the_floor_with_the_autofocus_searching_still_engages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Not widened (#421, D9 "Not chosen"): the scan's engage() after a lost lock is
+    # a searching autofocus at the operator's offset, above the floor, and D1's.
+    with _stand(_first_lock(), offset=SEEN_OFFSET) as stand:
+        _see(stand)
+        stand.engage_directly(lockable=False)
+        _finds_the_reference_once_switched_on(stand, monkeypatch)
+        assert stand.af.engage() is True
+        assert stand.core.log == [ON]
+
+
+def test_a_lock_reached_between_the_two_reads_at_a_seen_floor_counts_as_searching(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The lock read is made first and decides (D9, "What decides it"): a lock that
+    # PFS reaches after it is read as searching, refused on the safe side.
+    with _stand(_first_lock(**RISE), offset=FLOOR) as stand:
+        _floor_seen_then_back_at_z0(stand, caplog)
+        _jumps_to(stand, Z0 + 40.0)
+        stand.engage_directly(lockable=False)
+        autofocus = stand.af
+        real = autofocus._read_engaged  # type: ignore[attr-defined]
+
+        def locks_after_the_state_read() -> bool:
+            on = bool(real())
+            if on:
+                stand.core.autofocus_lockable = True
+            return on
+
+        monkeypatch.setattr(autofocus, "_read_engaged", locks_after_the_state_read)
+        with pytest.raises(SafetyRefusedError) as refused:
+            autofocus.engage()
+        assert str(refused.value) == SEEN_FLOOR_SEARCHING
+        assert stand.core.log == [OFF]
+        assert stand.z.position_um() == Z0
+
+
 # --- a turn forgets no seen offset, and records none (m2 §12.10.2 D7, #407) ---------
 #
 # Session 3 read an offset of the stand's own come back across a turn: 9370 at the
