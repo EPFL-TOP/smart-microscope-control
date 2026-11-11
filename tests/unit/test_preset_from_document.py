@@ -460,7 +460,10 @@ CASES: dict[str, list[dict[str, Any]]] = {
             "columns": 2,
             "clip_to_well": False,
             "pixel_size_um": 0.65,
-        }
+        },
+        # `pixel_size_um` and `calibration` are refused together, so a case each; a
+        # path with a backslash and a space is the one a reader may take for an escape (FM-190).
+        {"wells": "B2", "calibration": "C:\\runs\\a b\\cal-40x.json"},
     ],
     "stage-report": [{"samples": 5, "interval_ms": 100.0, "include_z": False}],
     "timing": [

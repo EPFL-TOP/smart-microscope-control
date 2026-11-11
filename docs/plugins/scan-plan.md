@@ -18,6 +18,7 @@ smc run scan-plan -p <profile> --run-doc run.json --param wells=A1:B6
 smc run scan-plan -p <profile> --run-doc run.json --param wells=all --param coverage=0.33
 smc run scan-plan -p <profile> --run-doc run.json --param wells="A1, C*, *12" --param rows=5 --param columns=5
 smc run scan-plan -p <profile> --run-doc run.json --param wells=B2 --param objective="Nikon 40X Plan Fluor ELWD"
+smc run scan-plan -p <profile> --run-doc run.json --param wells=B2 --param objective="Nikon 40X Plan Fluor ELWD" --param calibration=cal-40x.json
 ```
 
 | Parameter | Default | Meaning |
@@ -29,7 +30,8 @@ smc run scan-plan -p <profile> --run-doc run.json --param wells=B2 --param objec
 | `coverage` | 1.0 | Fraction of the well's width the grid spans: 1 is edge to edge, 0.33 the middle third (up to 1.5, which runs past the well). Ignored when `rows` and `columns` are given. |
 | `rows`, `columns` | derived | Fields along Y and along X, 1 to 100 each. Give both or neither. |
 | `clip_to_well` | true | Keep only the fields whose frame meets the well: see [Clipping](#clipping-to-the-well). |
-| `pixel_size_um` | none | Plan with this pixel size (rotation 0, no mirror) instead of a calibration's or the profile's. |
+| `pixel_size_um` | none | Plan with this pixel size (rotation 0, no mirror) instead of a calibration's or the profile's. Not with `calibration`. |
+| `calibration` | none | A run document holding a `camera-calibration` made with the plan's objective in place, for a plate registered with another objective (a path relative to the working directory, as `from_run_doc` of `camera-calibration`): its matrix is used, rotation and mirror included. A calibration of another objective or frame in it is **refused**, never set aside. Not with `pixel_size_um`. See [A calibration from another run document](#a-calibration-from-another-run-document). Under *Advanced* on the plate page. |
 
 The demo has no plate, so the run document needs a `plate` stage first (here one
 written for the occasion: a 96-well plate with A1 at `(1000, -500)`, registered with the
@@ -139,20 +141,28 @@ these that exists, and **says which in `matrix_source` and what it assumed in
 
 1. **`pixel_size_um` given**: `"parameter"`, an upright camera with no mirror. `assumed`:
    `pixel size given as a parameter; rotation 0 and no mirror assumed`.
-2. **A `camera-calibration` of the same objective and frame shape**: `"camera-calibration"`,
-   measured, rotation and mirror included. One of another objective or frame is not used,
-   and `assumed` says why:
-   `camera calibration not used: it is of <its objective>, the plan is for <this one>`,
+2. **`calibration` given**: `"camera-calibration"`, the matrix of the `camera-calibration`
+   in that run document, rotation and mirror included, and the result's `calibration_from`
+   and `calibration_measured` say which document and when. The document's own
+   `camera-calibration` is **not read**, not even one of the same objective: the parameter
+   was asked for. A document that cannot be used, or whose calibration is of another
+   objective or frame, is refused, not set aside: see
+   [A calibration from another run document](#a-calibration-from-another-run-document).
+3. **A `camera-calibration` of the same objective and frame shape in the run document**:
+   `"camera-calibration"`, measured, rotation and mirror included. One of another objective
+   or frame is not used, and `assumed` says why:
+   `camera calibration not used: it is of <its objective>, the plan is for <this one>; give calibration, a run document whose camera-calibration was made with <this one> in place`,
    or `camera calibration not used: it is of a frame of (512, 300), the camera gives (300, 512)`
-   (shapes are `(height, width)`; `an unknown objective` stands for a stand without a turret).
-3. **The stand's configured pixel size**: `"profile"`, an upright camera with no mirror.
+   (shapes are `(height, width)`; `an unknown objective` stands for a stand without a turret,
+   which has no objective to give a calibration for, so its line has no hint).
+4. **The stand's configured pixel size**: `"profile"`, an upright camera with no mirror.
    For the objective in place (or a stand without a turret) it is the **camera's own**
    size, which includes the binning and the magnifier. For **another objective** it is
    the turret's, which is the profile's entry **for binning 1**, and `assumed` says so:
    `pixel size of <objective> from the profile, for binning 1: the camera's binning is not applied`.
    Either way: `no camera calibration for <objective>: rotation 0 and no mirror assumed`
    (`<objective>` reads `this stand` without a turret).
-4. **None**: the plan is refused.
+5. **None**: the plan is refused.
 
 ```text
 $ smc run scan-plan -p demo --run-doc run.json --param wells=A1 --param objective=Objective-2 --param rows=2 --param columns=2
@@ -210,6 +220,58 @@ the camera as far as you can, and do not take the absence of a line for a proof 
 grid is closed. (The check should take the frame's shape: a follow-up, since its
 signature is the design's.)
 
+## A calibration from another run document
+
+A plate registered with the 4× and scanned with the 40× needs the **40×'s** camera
+matrix, and a run document holds one record per plugin, so one `camera-calibration`.
+Running the 40×'s into `run.json` replaces the 4×'s that the registration was made
+with: `plate-walls` is then stale, and `plate` with it (`plate-walls read its inputs
+from an earlier run`). Without it the plan sets the 4×'s aside and plans with the
+profile's size, **rotation 0 and no mirror assumed**. That is wrong for a camera that is
+turned: the route takes a cell's stage position from the plan's matrix, and with the
+Ti2-E's camera turned about 177° (session 3, #405) a cell at `(dx, dy)` pixels from a
+field's centre is routed to about `(-dx, -dy)`, up to about 270 µm off at the 40×.
+
+So the 40×'s calibration lives in a **run document of its own**, and `scan-plan` is told
+where with `calibration`. The same rule loads it as `objective-offsets` loads its targets'
+calibrations ([`objective-offsets`](objective-offsets.md)), and `run.json` keeps the
+registration's.
+
+**Registered at one objective, scanned at another:**
+
+```text
+smc objective set "<the 40× label>" --confirm
+smc run camera-calibration -p <profile> --run-doc cal-40x.json
+smc run scan-plan -p <profile> --run-doc run.json --param wells=A1:B6 --param objective="<the 40× label>" --param calibration=cal-40x.json
+```
+
+`run.json` still holds the 4×'s `camera-calibration` and the registration: the plate stays
+usable. The plan's `matrix_um_per_px` and `pixel_size_um` are the 40×'s, its
+`matrix_source` is `camera-calibration`, `calibration_from` is `cal-40x.json` (as typed,
+with forward slashes, never made absolute) and `calibration_measured` when it was
+measured, to the second. Nothing in `assumed` says the camera is straight. The plan logs
+`camera calibration of <objective> from <document>, measured <when>` at INFO.
+
+What it refuses, with the document's path and never a fallback to the profile's size,
+because you named that document:
+
+| Document | Refusal |
+|---|---|
+| holds no usable `camera-calibration` (not there, not `done`, another profile, a dry run read by a real plan) | `in <where>: ...` the runner's own reason, or `<where>: ...` when it cannot be read |
+| its calibration is of another objective | `the calibration in <where> is of <was>, the plan is for <now>: give calibration a run document whose camera-calibration was made with <now> in place` |
+| its calibration is of another frame (binning or region of interest) | `the calibration in <where> is of a frame of (512, 300), the camera gives (300, 512) (binning or the region changed): run camera-calibration into it again with this camera setting` |
+| `pixel_size_um` is given as well | `give pixel_size_um or calibration, not both` |
+
+**What it does not do.** The plan does not become stale when `camera-calibration` is run
+again into the document it read: the plan records when the calibration was measured, and
+that is all. `scan` refuses a camera whose size has moved more than 10 % from the plan's;
+for a plan that read another document its advice names it: `run camera-calibration into
+cal-40x.json, then scan-plan, again with the stand as it is now`, because sending you to
+`run.json` is what makes the plate stale. Only the plan reads a calibration from another
+document: `plate-walls` still reads the one in its own run document, the 4×'s that the
+registration was made with, and `route` takes its matrix from the plan, so a route follows
+the 40×'s.
+
 ## The grid
 
 `rows` and `columns` default to the number of fields that span `coverage` of the well,
@@ -266,8 +328,10 @@ The slot `scan-plan` holds a `ScanPlanResult` (`smc.plugins.slots`): `plate_plan
 `GridRowsColumns`), `wells`, `objective`, `pixel_size_um`, `matrix_um_per_px`,
 `matrix_source`, `image_shape_px` (`(height, width)`), `fov_um` (`(width, height)` in
 stage axes), `overlap`, `rows`, `columns`, `fields` (`well`, `index`, `name`, `x_um`,
-`y_um`, in visiting order), `estimate_s`, `plate_objective`, `objective_shift_um` and
-`assumed`. A failed run fills no slot.
+`y_um`, in visiting order), `estimate_s`, `plate_objective`, `objective_shift_um`,
+`calibration_from` and `calibration_measured` (the document a `calibration` was read
+from, as typed, and when it was measured; `null` for any other source of the matrix and
+in a document written before they existed) and `assumed`. A failed run fills no slot.
 
 ## Not verified here
 
@@ -276,3 +340,8 @@ per pixel is the datasheet's, assumed) and its camera's rotation, and what a pla
 there, are for the first hardware session (#198). The offsets between objectives, that
 they are a translation, and a plate registered at 4× and scanned at 40× are for session 3
 (m2 §13.6, #340).
+
+A plan with `calibration` was run on the demo-sample stand only. At the Ti2-E (session 4):
+a 4× `plate-walls` registration in `run.json`, a 40× plan with `calibration=` the 40×'s own
+document, a scan, cells, and a route whose positions land on cells at the 40× (session 3's
+three calibrations agree on 177.44°, so the matrix differs from the 4×'s by its size only).

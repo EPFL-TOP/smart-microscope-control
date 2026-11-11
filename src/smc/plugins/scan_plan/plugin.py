@@ -27,12 +27,21 @@ rest on it:
   offset that is not measured, or a plate that does not record its objective, plans
   with the registration's positions and says so in ``assumed``, before the camera's
   lines, and in a WARNING. The result keeps the plate's objective and the shift.
+* **A calibration from another document** (m3 §23). A run document holds one
+  ``camera-calibration``, so a plate registered with the 4x cannot keep the 40x's
+  calibration beside its registration: running one into it replaces the 4x's and
+  makes the registration stale. ``calibration`` names a document of its own, whose
+  matrix, rotation and mirror included, the plan then rests on. It was asked for,
+  so one of another objective or frame is refused, never set aside for the
+  profile's size; and without it the plan would assume rotation 0, which routes a
+  cell of a camera turned 177 degrees to the other side of its field.
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import useq
@@ -40,6 +49,7 @@ from pydantic import Field, model_validator
 
 from smc.hardware.capabilities import Autofocus, Camera, ObjectiveTurret
 from smc.plugins.api import PluginParams, RunContext
+from smc.plugins.camera_calibration.plugin import calibration_from
 from smc.plugins.errors import PluginRunError
 from smc.plugins.geometry import (
     Matrix2,
@@ -132,12 +142,28 @@ class ScanPlanParams(PluginParams):
             "calibration's or the profile's."
         ),
     )
+    calibration: Path | None = Field(
+        None,
+        description=(
+            "A run document holding a camera-calibration made with the plan's "
+            "objective in place, for a plate registered with another objective "
+            "(relative to the working directory, as from_run_doc). Its matrix "
+            "is used, rotation and mirror included."
+        ),
+    )
 
     @model_validator(mode="after")
     def _rows_and_columns_come_together(self) -> ScanPlanParams:
         """A grid of 3 rows by however many columns the coverage gives is not a grid anyone asked for."""
         if (self.rows is None) != (self.columns is None):
             raise ValueError("rows and columns are given together or not at all")
+        return self
+
+    @model_validator(mode="after")
+    def _a_size_and_a_calibration_are_two_answers(self) -> ScanPlanParams:
+        """A bare size says rotation 0 and no mirror, a calibration says what was measured: asked for both, one would be dropped without a word."""
+        if self.pixel_size_um is not None and self.calibration is not None:
+            raise ValueError("give pixel_size_um or calibration, not both")
         return self
 
 
@@ -197,9 +223,24 @@ class ScanPlanPlugin:
                 "camera's region of interest",
             )
 
-        basis = _camera_basis(
-            self.name, params, ctx, camera, turret, objective, in_place, shape
+        basis, given = _camera_basis(
+            self.name,
+            params,
+            ctx,
+            camera,
+            turret,
+            objective,
+            in_place,
+            shape,
+            microscope.profile.microscope.name,
         )
+        if given is not None:
+            ctx.logger.info(
+                "camera calibration of %s from %s, measured %s",
+                _objective_name(objective),
+                given[0],
+                given[1],
+            )
         _require_invertible(self.name, basis.matrix, shape)
         fov_um = fov_of(basis.matrix, shape)
 
@@ -274,6 +315,8 @@ class ScanPlanPlugin:
             estimate_s=estimate,
             plate_objective=plate.objective,
             objective_shift_um=frame.shift_um,
+            calibration_from=given[0] if given is not None else None,
+            calibration_measured=given[1] if given is not None else None,
             assumed=assumed,
         )
 
@@ -322,29 +365,56 @@ def _camera_basis(
     objective: str | None,
     in_place: bool,
     shape: tuple[int, int],
-) -> _Basis:
-    """The matrix to plan with: a parameter, a calibration of this objective and frame, or the profile's size."""
+    profile: str,
+) -> tuple[_Basis, tuple[str, str] | None]:
+    """The matrix to plan with, and where and when a given calibration was measured (``None`` for any other source).
+
+    In this order (m3 §23.3): a pixel size given as a parameter; a calibration
+    document given as a parameter; the run document's own calibration of this
+    objective and frame; the profile's size. A document that was asked for and
+    does not fit is refused (the operator named it), where the document's own
+    that does not fit is set aside with the reason, because nobody chose it.
+    """
     if params.pixel_size_um is not None:
-        return _Basis(
-            pixel_matrix(params.pixel_size_um),
-            params.pixel_size_um,
-            "parameter",
-            ("pixel size given as a parameter; rotation 0 and no mirror assumed",),
+        return (
+            _Basis(
+                pixel_matrix(params.pixel_size_um),
+                params.pixel_size_um,
+                "parameter",
+                ("pixel size given as a parameter; rotation 0 and no mirror assumed",),
+            ),
+            None,
         )
+    if params.calibration is not None:
+        # The document's own camera-calibration is not read when one is given, even
+        # one of this objective: the parameter was asked for.
+        basis, where, when = _calibration_given(
+            name,
+            params.calibration,
+            ctx,
+            profile,
+            objective,
+            shape,
+            params.overlap,
+        )
+        return basis, (where, when)
 
     assumed: list[str] = []
     calibration = ctx.upstream_or_none("camera-calibration", CameraCalibration)
     if calibration is not None:
         why = _why_not_used(calibration, objective, shape)
         if why is None:
-            gaps = _gap_line(calibration.rotation_deg, params.overlap)
-            return _Basis(
-                calibration.matrix_um_per_px,
-                calibration.pixel_size_um,
-                "camera-calibration",
-                (gaps,) if gaps is not None else (),
-            )
-        assumed.append(f"camera calibration not used: {why}")
+            return _calibrated(calibration, params.overlap), None
+        # A calibration of another objective is what the plate's own registration
+        # leaves behind (a run document keeps one per plugin): say how to get the
+        # one of this objective. A plan with no objective has none to ask for.
+        hint = (
+            f"; give calibration, a run document whose camera-calibration was "
+            f"made with {objective} in place"
+            if calibration.objective != objective and objective is not None
+            else ""
+        )
+        assumed.append(f"camera calibration not used: {why}{hint}")
 
     label = objective if objective is not None else "this stand"
     if in_place or turret is None:
@@ -364,7 +434,71 @@ def _camera_basis(
     assumed.append(
         f"no camera calibration for {label}: rotation 0 and no mirror assumed"
     )
-    return _Basis(pixel_matrix(size_um), size_um, "profile", tuple(assumed))
+    return _Basis(pixel_matrix(size_um), size_um, "profile", tuple(assumed)), None
+
+
+def _calibrated(calibration: CameraCalibration, overlap: float) -> _Basis:
+    """The basis of a calibration that was measured: its matrix, and only the line about the gaps it leaves.
+
+    What the calibration itself assumed is not copied: it is the calibration's
+    to say, and the plan assumed nothing about the camera.
+    """
+    gaps = _gap_line(calibration.rotation_deg, overlap)
+    return _Basis(
+        calibration.matrix_um_per_px,
+        calibration.pixel_size_um,
+        "camera-calibration",
+        (gaps,) if gaps is not None else (),
+    )
+
+
+def _calibration_given(
+    name: str,
+    path: Path,
+    ctx: RunContext,
+    profile: str,
+    objective: str | None,
+    shape: tuple[int, int],
+    overlap: float,
+) -> tuple[_Basis, str, str]:
+    """The basis of the calibration in another run document, where it is (as typed) and when it was measured.
+
+    A plate is registered with the 4x and scanned with the 40x, and one run
+    document holds one ``camera-calibration`` (m3 §1.7): the 40x's cannot be run
+    into the registration's without making the registration stale, so it lives in
+    a document of its own, named here (m3 §23). The rule that loads it is
+    ``objective-offsets``'. The operator named this document, so one that does
+    not fit is refused and never set aside for the profile's size. ``path`` is
+    named as typed, with forward slashes (FM-24) and never resolved (FM-50).
+
+    Raises:
+        PluginRunError: The document cannot be used (``calibration_from``'s
+            refusals), or its calibration is of another objective or frame.
+    """
+    found, when = calibration_from(name, path, profile=profile, dry_run=ctx.dry_run)
+    where = path.as_posix()
+    if found.objective != objective:
+        # Raised outside any handler (FM-98): nothing here keeps another error.
+        raise PluginRunError(
+            name,
+            f"the calibration in {where} is of {_objective_name(found.objective)}, "
+            f"the plan is for {_objective_name(objective)}: give calibration a run "
+            f"document whose camera-calibration was made with "
+            f"{_objective_name(objective)} in place",
+        )
+    if found.image_shape_px != shape:
+        raise PluginRunError(
+            name,
+            f"the calibration in {where} is of a frame of {found.image_shape_px}, "
+            f"the camera gives {shape} (binning or the region changed): "
+            "run camera-calibration into it again with this camera setting",
+        )
+    return _calibrated(found, overlap), where, when
+
+
+def _objective_name(objective: str | None) -> str:
+    """The objective's label, or the words for no objective."""
+    return objective if objective is not None else _NO_OBJECTIVE
 
 
 def _why_not_used(
@@ -376,13 +510,10 @@ def _why_not_used(
     stale, so it is compared on both and the one that differs is named.
     """
     if calibration.objective != objective:
-        was = (
-            calibration.objective
-            if calibration.objective is not None
-            else _NO_OBJECTIVE
+        return (
+            f"it is of {_objective_name(calibration.objective)}, "
+            f"the plan is for {_objective_name(objective)}"
         )
-        now = objective if objective is not None else _NO_OBJECTIVE
-        return f"it is of {was}, the plan is for {now}"
     if calibration.image_shape_px != shape:
         return f"it is of a frame of {calibration.image_shape_px}, the camera gives {shape}"
     return None

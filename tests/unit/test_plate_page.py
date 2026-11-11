@@ -321,6 +321,7 @@ def test_the_page_builds_every_tool_the_registry_holds_in_workflow_order(
         "columns",
         "clip_to_well",
         "pixel_size_um",
+        "calibration",
     ]
     assert "wells" not in view.tool_fields["scan-plan"]
     assert set(view.tool_fields["plate-registration"]) == {"max_rotation_deg"}
