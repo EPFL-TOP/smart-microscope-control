@@ -1060,3 +1060,155 @@ def test_move_z_on_turn_refuses_an_unknown_label_no_focus_slot_and_an_inconsiste
         match=f"^{re.escape('move_z_on_turn: no focus device is in the Focus slot')}$",
     ):
         no_focus.move_z_on_turn(FOUR, 8.70)
+
+
+# --- the stand's own offset on a turn (m2 §8.11 D8, #407) ----------------------
+
+FORTY = "3-Plan Apo LmbdD0.25 40x"
+
+
+def test_set_offset_on_turn_sets_the_autofocus_slots_own_offset_when_the_turn_moves() -> (
+    None
+):
+    # Session 3: the turn to the 10x read 9370 where it had read 0, and smc had
+    # written nothing (m2 §8.9).
+    core = FakeCore.demo_like()
+    core.set_offset_on_turn("Nikon 20X Plan Fluor ELWD", 9370.0)
+    assert core.getAutoFocusOffset() == 0.0  # nothing happens before the turn
+    core.setStateLabel("Objective", "Nikon 20X Plan Fluor ELWD")
+    assert core.getAutoFocusOffset() == 9370.0
+    # The turn back, to a label nobody registered, leaves the offset where it
+    # is, as the stand's turn to the 4x leaves 0.
+    core.setStateLabel("Objective", "Nikon 10X S Fluor")
+    assert core.getAutoFocusOffset() == 9370.0
+    # The stand's own doing is no call of smc: only the turns are logged.
+    assert core.log == [
+        "setStateLabel('Objective', 'Nikon 20X Plan Fluor ELWD')",
+        "setStateLabel('Objective', 'Nikon 10X S Fluor')",
+    ]
+
+
+def test_set_offset_on_turn_sets_a_stage_offset_device_in_whole_units() -> None:
+    # The Ti2-E's offset device is the Stage PFSOffset, which holds whole units.
+    core = ti2_core()
+    core.hold_whole_units("PFSOffset")
+    core.set_offset_on_turn(FORTY, 9370.5, device="PFSOffset")
+    core.setStateLabel("Nosepiece", FORTY)
+    assert core.getPosition("PFSOffset") == 9370.0
+    # Neither the focus drive nor the AutoFocus slot's own offset is touched.
+    assert core.getPosition("ZDrive") == 0.0
+    assert core.getAutoFocusOffset() == 0.0
+    assert core.log == [f"setStateLabel('Nosepiece', {FORTY!r})"]
+
+
+def test_set_offset_on_turn_holds_the_autofocus_slots_offset_in_whole_units_too() -> (
+    None
+):
+    core = FakeCore.demo_like()
+    core.hold_whole_units("Autofocus")
+    core.set_offset_on_turn("Nikon 20X Plan Fluor ELWD", 9370.5)
+    core.setStateLabel("Objective", "Nikon 20X Plan Fluor ELWD")
+    assert core.getAutoFocusOffset() == 9370.0
+
+
+def test_set_offset_on_turn_needs_no_focus_device() -> None:
+    # move_z_on_turn needs a focus slot and returns early without one; the
+    # offset is the AutoFocus slot's, or a Stage's, whatever the Focus slot holds.
+    core = FakeCore(
+        [
+            FakeDevice("Nose", DeviceType.State, state_labels=("A", "B")),
+            FakeDevice("AF", DeviceType.AutoFocus),
+            FakeDevice("PFSOffset", DeviceType.Stage),
+        ],
+        autofocus="AF",
+    )
+    core.set_offset_on_turn("B", 12.5)
+    core.set_offset_on_turn("A", 7.0, device="PFSOffset")
+    core.setStateLabel("Nose", "B")
+    assert core.getAutoFocusOffset() == 12.5
+    core.setStateLabel("Nose", "A")
+    assert core.getPosition("PFSOffset") == 7.0
+
+
+def test_a_turn_to_the_position_it_is_at_leaves_the_offset_and_logs_nothing() -> None:
+    core = ti2_core()  # the nosepiece starts at the 10x
+    core.set_offset_on_turn(TEN, 9370.0, device="PFSOffset")
+    core.setStateLabel("Nosepiece", TEN)
+    core.setState("Nosepiece", 1)
+    assert core.getPosition("PFSOffset") == 0.0
+    # Only the two calls of the test are in the log: the knob logs nothing.
+    assert core.log == [
+        f"setStateLabel('Nosepiece', {TEN!r})",
+        "setState('Nosepiece', 1)",
+    ]
+    # A turn away to a label nobody registered changes nothing either.
+    core.setStateLabel("Nosepiece", FOUR)
+    assert core.getPosition("PFSOffset") == 0.0
+
+
+def test_set_offset_on_turn_serves_several_labels_and_the_latest_registration_wins() -> (
+    None
+):
+    core = ti2_core()
+    core.set_offset_on_turn(TEN, 9370.0, device="PFSOffset")
+    core.set_offset_on_turn(FORTY, 17794.0, device="PFSOffset")
+    core.setStateLabel("Nosepiece", FORTY)
+    assert core.getPosition("PFSOffset") == 17794.0
+    core.setStateLabel("Nosepiece", TEN)
+    assert core.getPosition("PFSOffset") == 9370.0
+    # Registered again, a label serves its latest value and its latest device:
+    # the first registration is gone, not added to.
+    core.set_offset_on_turn(FORTY, 1.0)
+    core.set_offset_on_turn(FORTY, 2.0, device="PFSOffset")
+    core.setStateLabel("Nosepiece", FORTY)
+    assert core.getPosition("PFSOffset") == 2.0
+    assert core.getAutoFocusOffset() == 0.0
+
+
+def test_set_offset_on_turn_refuses_an_unknown_label_a_missing_device_and_no_autofocus_slot() -> (
+    None
+):
+    core = ti2_core()
+    refusals: list[tuple[str, dict[str, Any], str]] = [
+        (
+            "Nope",
+            {},
+            "set_offset_on_turn: 'Nope' is no position label of a loaded State device",
+        ),
+        (
+            "Intensity",
+            {},
+            "set_offset_on_turn: 'Intensity' is no position label of a loaded State "
+            "device",
+        ),
+        (
+            FOUR,
+            {"device": "Nope"},
+            "set_offset_on_turn: 'Nope' is no loaded Stage device",
+        ),
+        (
+            FOUR,
+            {"device": "Nosepiece"},  # loaded, but a State device
+            "set_offset_on_turn: 'Nosepiece' is no loaded Stage device",
+        ),
+        (
+            FOUR,
+            {"device": "Core"},
+            "set_offset_on_turn: 'Core' is no loaded Stage device",
+        ),
+    ]
+    for label, options, message in refusals:
+        with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
+            core.set_offset_on_turn(label, 9370.0, **options)
+    # None of them registered anything.
+    core.setStateLabel("Nosepiece", FOUR)
+    assert core.getPosition("PFSOffset") == 0.0
+    assert core.getAutoFocusOffset() == 0.0
+    no_autofocus = FakeCore(
+        [FakeDevice("Nosepiece", DeviceType.State, state_labels=(TEN, FOUR))]
+    )
+    with pytest.raises(
+        ValueError,
+        match=f"^{re.escape('set_offset_on_turn: no device is in the AutoFocus slot')}$",
+    ):
+        no_autofocus.set_offset_on_turn(FOUR, 9370.0)

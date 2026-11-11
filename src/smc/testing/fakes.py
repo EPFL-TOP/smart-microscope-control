@@ -50,6 +50,12 @@ pymmcore 12.5.0.75.0), unless labelled *assumed*:
   turn moved Z by +8.7 µm and the call returned while Z read 500.0 µm, 0.02 s
   before it read the new value, session 2, #330). Assumed shape: seen once.
   The demo's turret returns at once and does not move Z.
+* **A turn can change the autofocus offset by itself**
+  (``set_offset_on_turn``; the Ti2-E's turn to the 10x read ``PFSOffset`` 9370
+  where it had read 0, and the turn to the 40x 17794, session 3, #405 F3, #407).
+  Assumed shape: an offset per objective, put back on a turn, none for the 4x;
+  when it lands against the call's return was not read. Set on the store and
+  not logged, as the stand's own doing.
 * **Config groups** (measured on the demo 2026-10-19, m2 §8.1). Groups and
   presets list sorted. ``defineConfig`` *merges*: it changes or adds one
   setting and keeps the others, creates a missing group, and accepts a
@@ -183,6 +189,10 @@ class FakeCore:
       turn of any ``State`` device to the position ``label`` adds ``delta_um``
       to the focus device's Z, and the next ``escape_reads`` reads of its
       position return ``escape_um`` first (#330).
+    * ``set_offset_on_turn(label, offset, *, device=None)``: a turn of any
+      ``State`` device to the position ``label`` sets the autofocus offset to
+      ``offset``: a ``Stage`` device's position, or with ``device=None`` the
+      AutoFocus slot's own offset; nothing is logged (#407).
     """
 
     def __init__(
@@ -232,6 +242,10 @@ class FakeCore:
         self._turn_z: dict[str, tuple[float, float | None, int]] = {}
         self._escape_um: float | None = None
         self._escape_left = 0
+        #: Position label -> ``(offset, device)`` (``set_offset_on_turn``):
+        #: ``device`` is the label of the ``Stage`` that holds the offset, or
+        #: ``None`` for the AutoFocus slot's own.
+        self._turn_offset: dict[str, tuple[float, str | None]] = {}
 
         self._devices: dict[str, FakeDevice] = {}
         for device in devices:
@@ -542,6 +556,50 @@ class FakeCore:
             )
         self._turn_z[label] = (float(delta_um), escape_um, escape_reads)
 
+    def set_offset_on_turn(
+        self, label: str, offset: float, *, device: str | None = None
+    ) -> None:
+        """Make a turn to the position ``label`` set the autofocus offset to ``offset``.
+
+        Session 3 read ``PFSOffset`` 9370 after the turn to the 10x and 17794
+        after the turn to the 40x, where it had read 0, with PFS off and smc
+        writing nothing across the turn; the turn to the 4x left 0 (#405 F3,
+        #407). A turn of **any** ``State`` device to the position named
+        ``label`` that moves it (a turn to the position it is at changes
+        nothing) sets the offset, held as the device holds it
+        (``hold_whole_units`` applies), **on the store** and not logged: the
+        stand's own doing is no call of the layer, and ``log`` stays what the
+        layer sent. ``device`` is the label of the loaded ``Stage`` that is the
+        offset device (the Ti2-E's ``PFSOffset``); ``None`` is the AutoFocus
+        slot's own offset (the demo's). It acts whether or not the Focus slot
+        is filled. Several labels may be registered, each with its offset;
+        registering a label again replaces the first registration whole.
+
+        Raises:
+            ValueError: ``label`` is the label of no position of a loaded
+                ``State`` device, ``device`` is no loaded ``Stage``, or
+                ``device`` is ``None`` with no device in the AutoFocus slot: a
+                misspelt label would otherwise build a stand that never
+                restores an offset, and a test that passes (FM-119).
+        """
+        if not any(
+            d.type == DeviceType.State and label in d.state_labels
+            for d in self._devices.values()
+        ):
+            raise ValueError(
+                f"set_offset_on_turn: {label!r} is no position label of a loaded "
+                f"State device"
+            )
+        if device is not None:
+            found = self._devices.get(device)
+            if found is None or found.type != DeviceType.Stage:
+                raise ValueError(
+                    f"set_offset_on_turn: {device!r} is no loaded Stage device"
+                )
+        elif not self._slots["autofocus"]:
+            raise ValueError("set_offset_on_turn: no device is in the AutoFocus slot")
+        self._turn_offset[label] = (float(offset), device)
+
     # --- helpers -------------------------------------------------------------
 
     def _record(self, name: str, *args: object) -> None:
@@ -584,14 +642,27 @@ class FakeCore:
             self._held_back[key] = (before, reads)
 
     def _turned(self, position_label: str) -> None:
-        """A State device changed position: a label registered by ``move_z_on_turn`` moves Z."""
+        """A State device changed position: what ``move_z_on_turn`` and ``set_offset_on_turn`` registered for the label.
+
+        The two are independent: the offset is set whether or not a focus device
+        is in its slot, and Z moves whether or not an offset is registered.
+        """
         turn = self._turn_z.get(position_label)
         focus = self._slots["focus"]
-        if turn is None or focus not in self._z:
+        if turn is not None and focus in self._z:
+            delta_um, escape_um, escape_reads = turn
+            self._z[focus] += delta_um
+            self._escape_um, self._escape_left = escape_um, escape_reads
+        stands = self._turn_offset.get(position_label)
+        if stands is None:
             return
-        delta_um, escape_um, escape_reads = turn
-        self._z[focus] += delta_um
-        self._escape_um, self._escape_left = escape_um, escape_reads
+        offset, device = stands
+        if device is not None:
+            self._z[device] = self._held(device, offset)
+            return
+        autofocus = self._slots["autofocus"]
+        if autofocus in self._af_offset:
+            self._af_offset[autofocus] = self._held(autofocus, offset)
 
     def _held(self, label: str, value: float) -> float:
         """What device ``label`` stores of ``value``: whole units if it holds them."""
