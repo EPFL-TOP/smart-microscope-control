@@ -518,6 +518,7 @@ def test_a_calibration_of_an_unknown_objective_is_given_to_a_plan_without_a_turr
     demo_microscope_with_sample: SampleMicroscopeFactory,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     microscope = _stand(demo_microscope_with_sample, tmp_path)
     _write_plate(tmp_path / "run.json", objective=None)
@@ -525,11 +526,20 @@ def test_a_calibration_of_an_unknown_objective_is_given_to_a_plan_without_a_turr
     _write_calibration(other, objective=None, rotation_deg=0.0)
     _without(microscope, monkeypatch, ObjectiveTurret)
 
-    result = _result(_run(microscope, tmp_path, wells="A1", calibration=other, **SMALL))
+    with caplog.at_level(logging.INFO, logger="smc"):
+        result = _result(
+            _run(microscope, tmp_path, wells="A1", calibration=other, **SMALL)
+        )
 
     assert result.objective is None
     assert result.matrix_source == "camera-calibration"
     assert result.calibration_from == other.as_posix()
+    # No objective is "None" in a line an operator reads.
+    infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert (
+        f"camera calibration of an unknown objective from {other.as_posix()}, "
+        f"measured {SEEDED_AT}" in infos
+    )
 
 
 def test_pixel_size_and_calibration_together_are_refused() -> None:
@@ -661,6 +671,82 @@ def test_a_dry_run_calibration_document_is_refused_for_a_real_plan(
     assert refused.reason == (
         f"in {other.as_posix()}: camera-calibration was a dry run; "
         "run it without --dry-run"
+    )
+
+
+def test_a_dry_run_plan_reads_a_dry_run_calibration_document(
+    demo_microscope_dry: Microscope, tmp_path: Path
+) -> None:
+    """A rehearsal made only of dry runs: a dry run may read a dry run, as it may read a real one."""
+    _write_plate(tmp_path / "run.json", dry_run=True)
+    other = tmp_path / "cal-dry.json"
+    given = _write_calibration(other, pixel_size_um=0.2, rotation_deg=0.0, dry_run=True)
+    demo_microscope_dry.override(
+        Camera,
+        SampleCamera(
+            demo_microscope_dry, PlateSample(), pixel_size_um=PIXEL_UM, shape=SHAPE
+        ),
+    )
+    assert demo_microscope_dry.dry_run
+
+    result = _result(
+        _run(demo_microscope_dry, tmp_path, wells="A1", calibration=other, **SMALL)
+    )
+
+    assert result.matrix_um_per_px == given.matrix_um_per_px
+    assert result.calibration_from == other.as_posix()
+    assert _stored(tmp_path).dry_run is True
+
+
+def test_the_plans_overlap_is_the_one_the_gap_line_of_a_given_calibration_names(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    """FM-124: the plan's own overlap, not the default 0.1, is what a turned camera's gaps are measured at."""
+    microscope = _stand(demo_microscope_with_sample, tmp_path)
+    other = tmp_path / "cal-other.json"
+    _write_calibration(other, pixel_size_um=0.2, rotation_deg=20.0)
+
+    result = _result(
+        _run(microscope, tmp_path, wells="A1", calibration=other, overlap=0.3, **SMALL)
+    )
+
+    assert result.overlap == 0.3
+    assert result.assumed == (
+        "the camera is turned 20.0° from the stage axes: at overlap 0.3 the grid "
+        "leaves gaps between fields; use overlap=0.69",
+    )
+
+
+def test_a_calibration_document_is_recorded_as_typed_and_not_resolved(
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FM-50: an absolute path names a user's folder in a document that is shared and moved."""
+    microscope = _stand(demo_microscope_with_sample, tmp_path)
+    (tmp_path / "docs").mkdir()
+    _write_calibration(tmp_path / "docs" / "cal.json", pixel_size_um=0.2)
+    monkeypatch.chdir(tmp_path)
+    typed = Path("docs") / "cal.json"
+
+    result = _result(_run(microscope, tmp_path, wells="A1", calibration=typed, **SMALL))
+
+    assert result.calibration_from == "docs/cal.json"
+    assert result.pixel_size_um == 0.2
+
+
+def test_a_calibration_of_another_objective_and_frame_is_refused_for_the_objective(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    """Two things are wrong and the first to fix is the objective: m3 §23.3 fixes the order of the refusals."""
+    microscope = _stand(demo_microscope_with_sample, tmp_path)
+    other = tmp_path / "cal-other.json"
+    _write_calibration(other, objective=FORTY, shape=(512, 300))
+
+    refused = _refused_calibration(microscope, tmp_path, other)
+
+    assert refused.reason == CALIBRATION_OF_ANOTHER_OBJECTIVE.format(
+        where=other.as_posix(), was=FORTY, now=IN_PLACE
     )
 
 

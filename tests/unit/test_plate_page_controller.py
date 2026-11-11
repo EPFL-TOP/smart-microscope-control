@@ -5017,6 +5017,7 @@ def test_tools_follow_the_workflow_order_and_hide_what_the_page_fills(
         "columns",
         "clip_to_well",
         "pixel_size_um",
+        "calibration",
     ]
     registration = by_name["plate-registration"]
     registration_rows = {row[0] for row in (*registration.key, *registration.advanced)}
