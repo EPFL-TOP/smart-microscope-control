@@ -158,3 +158,75 @@ def test_the_shipped_profiles_say_where_their_plate_lies() -> None:
     # A stand nobody measured says nothing: its plate is unplaced, not guessed.
     assert Profile.load(PROFILES / "demo.toml").holder.plate_centre_xy_um is None
     assert Profile.load(PROFILES / "nikon-tie.toml").holder.plate_centre_xy_um is None
+
+
+# --- which stage direction is the back of the stand and the operator's right (m5 §16 D1)
+
+
+def test_holder_directions_need_both_and_their_provenance(tmp_path: Path) -> None:
+    both = _write(
+        tmp_path / "both.toml",
+        '[holder]\nback = "-X"\nright = "+Y"\n'
+        'directions_measured = "2026-11-11, session 4 (#422)"\n',
+    )
+    holder = Profile.load(both).holder
+    assert (holder.back, holder.right) == ("-X", "+Y")
+    assert holder.directions_measured == "2026-11-11, session 4 (#422)"
+    # The directions need no centre, and the centre's provenance is not theirs.
+    assert holder.plate_centre_xy_um is None
+
+    for body, words in (
+        ('back = "+Y"\n', "both"),
+        ('right = "+X"\n', "both"),
+        ('back = "+Y"\nright = "+X"\n', "directions_measured"),
+        (
+            'back = "+Y"\nright = "+X"\ndirections_measured = "  "\n',
+            "directions_measured",
+        ),
+    ):
+        path = _write(tmp_path / "one.toml", f"[holder]\n{body}")
+        with pytest.raises(ProfileError) as info:
+            Profile.load(path)
+        assert words in str(info.value), body
+
+    # A provenance alone, with no direction, says nothing and is accepted.
+    alone = _write(tmp_path / "alone.toml", '[holder]\ndirections_measured = "x"\n')
+    assert Profile.load(alone).holder.back is None
+
+
+def test_holder_directions_on_one_axis_are_refused(tmp_path: Path) -> None:
+    for back, right in (("+Y", "-Y"), ("+X", "+X"), ("-X", "+X")):
+        path = _write(
+            tmp_path / "p.toml",
+            f'[holder]\nback = "{back}"\nright = "{right}"\n'
+            'directions_measured = "2026-11-11"\n',
+        )
+        with pytest.raises(ProfileError) as info:
+            Profile.load(path)
+        assert "different axes" in str(info.value), (back, right)
+
+    # A word that is no stage direction is refused by its type.
+    path = _write(
+        tmp_path / "p.toml",
+        '[holder]\nback = "up"\nright = "+X"\ndirections_measured = "x"\n',
+    )
+    with pytest.raises(ProfileError) as info:
+        Profile.load(path)
+    assert "holder.back" in str(info.value)
+
+
+def test_the_ti2_holder_says_back_is_plus_y_and_right_is_plus_x() -> None:
+    nikon = Profile.load(PROFILES / "nikon-ti2.toml").holder
+    assert (nikon.back, nikon.right) == ("+Y", "+X")
+    # Inferred from session 3, and says it is not checked at the stand.
+    assert "session 3" in nikon.directions_measured
+    assert "not checked at the stand" in nikon.directions_measured
+
+    sample = Profile.load(PROFILES / "demo-sample.toml").holder
+    assert (sample.back, sample.right) == ("+Y", "+X")
+    assert sample.directions_measured.startswith("by construction")
+
+    # A stand nobody looked at says neither: the page then speaks in stage terms.
+    for name in ("demo.toml", "nikon-tie.toml"):
+        holder = Profile.load(PROFILES / name).holder
+        assert (holder.back, holder.right) == (None, None), name

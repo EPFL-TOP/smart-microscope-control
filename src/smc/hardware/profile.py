@@ -56,6 +56,7 @@ __all__ = [
     "RolesSection",
     "SafetySection",
     "SampleSection",
+    "StageDirection",
     "SuggestSection",
     "check_pairs",
     "list_profiles",
@@ -105,6 +106,10 @@ MAX_Z_OFFSET_UM = 500.0
 #: not longer than this (the Ti2-E travels ±29 000 µm), so a larger value is a unit
 #: mistake (mm for µm), not a measurement (m5 §15 D2).
 MAX_HOLDER_CENTRE_UM = 150_000.0
+
+#: A direction of the stage, as ``XYStage.position_um()`` counts it: the way the
+#: stage moves towards a side of the stand (m5 §16 D1).
+StageDirection = Literal["+X", "-X", "+Y", "-Y"]
 
 
 def _no_boolean(name: str, value: Any) -> Any:
@@ -746,6 +751,15 @@ class HolderSection(_Section):
     plate_centre_xy_um: tuple[float, float] | None = None
     #: When and in which session, as an objective's offset says it (m2 §13.3).
     measured: str = ""
+    #: The stage direction towards the back of the stand, and towards the operator's
+    #: right, seen by the operator at the front (m5 §16 D1). Only the page's words
+    #: read them ("A1 at the back left"): a plate's orientation is in stage terms,
+    #: and the stage's axes may be mirrored seen from above, so neither is derived
+    #: from the other. Both or neither, on different axes.
+    back: StageDirection | None = None
+    right: StageDirection | None = None
+    #: Where ``back`` and ``right`` come from: a session, or an inference said as one.
+    directions_measured: str = ""
 
     @field_validator("plate_centre_xy_um", mode="before")
     @classmethod
@@ -784,6 +798,31 @@ class HolderSection(_Section):
                 "plate_centre_xy_um needs measured = "
                 '"<date>, session N (#issue): how it was measured": a plate '
                 "position with no date and session is a guess"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _directions_are_a_pair_with_their_provenance(self) -> HolderSection:
+        # One direction alone names two corners' words on one axis and guesses the
+        # other: the page would say "A1 at the back" of a plate whose left it does
+        # not know. A pair on one axis names no corner at all.
+        if (self.back is None) != (self.right is None):
+            raise ValueError(
+                "back and right go together: set both stage directions, or neither "
+                f"(got back = {self.back!r}, right = {self.right!r})"
+            )
+        if self.back is None or self.right is None:
+            return self
+        if self.back[1] == self.right[1]:
+            raise ValueError(
+                "back and right must be on different axes, one X and one Y; got "
+                f"back = {self.back!r}, right = {self.right!r}"
+            )
+        if not self.directions_measured.strip():
+            raise ValueError(
+                "back and right need directions_measured = "
+                '"<date>, session N (#issue): how it was seen": a side of the stand '
+                "with no date and session is a guess"
             )
         return self
 

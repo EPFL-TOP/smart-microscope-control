@@ -95,6 +95,9 @@ reference = ""                 # "" = no offsets: the objective every offset is 
 # [holder]                     # where the plate holder puts a plate: an estimate the plate page draws, never a registration (m5 §15)
 # plate_centre_xy_um = [400.0, -325.0]   # stage XY of the centre of the plate's grid of wells, seated in its holder
 # measured = "2026-11-10, sessions 2 and 3 (#334, #405): ..."   # required with a value
+# back = "+Y"                  # stage direction towards the back of the stand, seen from the front (m5 §16)
+# right = "+X"                 # stage direction towards the operator's right; both or neither, on different axes
+# directions_measured = "..."  # required with back and right
 
 [quirks]                       # free-form, consumed by backends; documented per key in M2
 
@@ -131,6 +134,7 @@ reference = ""                 # "" = no offsets: the objective every offset is 
 | `objectives.reference` | The objective every offset is measured from, by its turret label. `""` (the default): no offsets, and every one is unknown. It has no entry of its own: its offset is `(0, 0)` and `0` by definition. Needed as soon as `offsets` has an entry. |
 | `objectives.offsets."<label>"` | One objective's `xy_offset_um` (exactly two numbers), `z_offset_um` and `measured`. Each number is finite, not a boolean and within ±1000 µm (XY) or ±500 µm (Z): chosen guards against a unit or a sign slip, not measurements. A value needs a `measured` that is not blank. A key left out is unknown, never `0`. See [`[objectives]`](#objectives-offsets-between-objectives). |
 | `holder.plate_centre_xy_um` / `holder.measured` | The stage XY, in µm, of the centre of a plate's grid of wells when the plate sits in its holder: exactly two numbers, finite, not booleans, each within ±150 000 µm (a stage is not longer: a larger value is a unit mistake). It needs a `measured` that is not blank. Omitted: the stand does not say where its plate lies. An **estimate**, never a registration: see [`[holder]`](#holder-where-the-holder-puts-a-plate). |
+| `holder.back` / `holder.right` / `holder.directions_measured` | The stage directions (`"+X"`, `"-X"`, `"+Y"`, `"-Y"`) towards the back of the stand and towards the operator's right, seen from the front. Both or neither, on different axes, with a `directions_measured` that is not blank. Omitted: the plate page speaks in stage terms. See [`back`, `right`](#back-right-the-sides-of-the-stand). |
 | `suggest.<plugin>` | What this stand suggests for that plugin's run, shown by the plate page's next step: see [`[suggest]`](#suggest-what-the-stand-suggests-for-a-run). Allowed on every stand. |
 
 **A capture writes the configuration file.** `Channels.capture(name)` replaces
@@ -234,6 +238,34 @@ measured = "2026-11-10, sessions 2 and 3 (#334, #405): the Greiner 24-well's cen
   plate lies. `demo-sample` sets `[0.0, 0.0]` by construction, since its sample's plate is
   centred on the stage origin; were `[sample]` to set `a1_center_xy_um`, that value would be
   wrong and the map would still say *estimated*.
+
+### `back`, `right`: the sides of the stand
+
+Which way the stage moves towards the back of the stand, and towards the operator's
+right, seen by the operator standing at the front (m5 §16 D1). The plate page names the
+corner A1 is at in these words ("A1 at the back left", "Turned 180°: A1 at the front
+right") and labels the map's sides "back of the stand", "front of the stand",
+"operator's left" and "operator's right":
+
+```toml
+[holder]
+back = "+Y"
+right = "+X"
+directions_measured = "inferred from session 3 (#405, #414), not checked at the stand: ..."
+```
+
+- **Each is a stage direction**: `"+X"`, `"-X"`, `"+Y"` or `"-Y"`, the way
+  `XYStage.position_um()` counts. **Both or neither**, and **on different axes**: one
+  alone, or two on one axis, is refused at load.
+- **A mirrored pair is accepted.** The stage's axes may be left-handed seen from above;
+  the words then still say where A1 really is, which is the point.
+- **`directions_measured` is required** with them: when and how they were seen at the
+  stand, or that they are inferred and from what.
+- **Unset**, the page speaks in stage terms ("Not turned: A1 at stage -X +Y"), draws no
+  side labels, and says under its *Plate lies* choice that the stand does not say which
+  side is the back. `nikon-ti2` sets `+Y` and `+X`, **inferred** from session 3 and to be
+  checked at the stand; `demo-sample` the same, by construction (its map's +Y is up and +X
+  right); `demo` and `nikon-tie` neither.
 
 ## Shipped profiles
 
