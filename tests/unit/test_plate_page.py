@@ -1306,11 +1306,31 @@ def test_the_widgets_that_ask_and_explain_are_on_the_page(page: PlatePage) -> No
         assert id(getattr(view, name)) in placed, f"{name} is not in the layout"
 
 
+def _page_panes(view: PlatePageView) -> list[Any]:
+    """Every pane of the view, as ``_page_widgets`` finds the widgets: the layout's, the screens', the accordion's panels', and the view's attributes.
+
+    A pane is no widget, and the four outcome lines carry a watcher of their own
+    (``_hide_when_empty``, m5 §17.3): a walk of widgets alone does not see them, so a
+    handler registered on one without ``_handler`` passed (adversarial review of #443).
+    """
+    found: dict[int, Any] = {}
+    for root in _roots(view):
+        found.update({id(p): p for p in root.select(pn.pane.PaneBase)})
+        for accordion in root.select(pn.Accordion):
+            for panel in accordion.objects:
+                found.update({id(p): p for p in panel.select(pn.pane.PaneBase)})
+    for value in vars(view).values():
+        for item in value.values() if isinstance(value, dict) else [value]:
+            if isinstance(item, pn.pane.PaneBase):
+                found[id(item)] = item
+    return list(found.values())
+
+
 def test_every_handler_the_page_registers_is_guarded(page: PlatePage) -> None:
     view = PlatePageView(page)
     registered: list[Any] = [
         watcher.fn
-        for widget in _page_widgets(view)
+        for widget in [*_page_widgets(view), *_page_panes(view)]
         for by_name in widget.param.watchers.values()
         for watchers in by_name.values()
         for watcher in watchers
@@ -1321,9 +1341,12 @@ def test_every_handler_the_page_registers_is_guarded(page: PlatePage) -> None:
     ours = [
         fn for fn in registered if getattr(fn, "__module__", "") == plate_page.__name__
     ]
-    # 30 widgets' handlers and the tap at the time of writing: a floor that a lost
-    # container (the Accordion's 7) would go under.
-    assert len(ours) >= 30, "the test found too few handlers to check"
+    # 69 handlers at the time of writing (the widgets', the four outcome lines', the
+    # step bar's and the tap; measured by raising the floor until it failed): a floor
+    # that a lost container, a screen's list or the accordion's 7 would go under. It was
+    # 30 before the steps, and a floor that far under the count no longer notices a walk
+    # that loses a third of them.
+    assert len(ours) >= 60, f"the test found too few handlers to check: {len(ours)}"
     unguarded = [
         getattr(fn, "__qualname__", repr(fn))
         for fn in ours

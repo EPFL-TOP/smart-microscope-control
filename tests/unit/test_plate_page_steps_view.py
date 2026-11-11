@@ -30,7 +30,8 @@ from smc.hardware.capabilities import XYStage
 from smc.hardware.profile import Profile
 from smc.plugins.api import PluginParams, PluginResult, RunContext
 from smc.plugins.registry import GROUP
-from smc.plugins.slots import PlateResult
+from smc.plugins.scan_plan.algorithm import plan_fields
+from smc.plugins.slots import PlateResult, ScanPlanResult
 from smc.run import StageRecord, StageStatus, write_stage
 from smc.ui.controller import PlatePage
 from smc.ui.guide import SCREEN_LEADS, SCREEN_TITLES, STEPS, continue_label
@@ -158,6 +159,61 @@ def _seed_plate(run_doc: Path) -> None:
     )
 
 
+def _scan_plan_result() -> ScanPlanResult:
+    """A scan plan of 2 x 2 fields in each of B2 and B11 (8 fields), as test_plate_page.py builds one."""
+    fov_um = (512.0, 512.0)
+    half_w, half_h = fov_um[0] / 2, fov_um[1] / 2
+    plate_plan, fields = plan_fields(
+        _plate_result(),
+        ["B2", "B11"],
+        fov_um=fov_um,
+        footprint_of=lambda x, y: [
+            (x - half_w, y - half_h),
+            (x + half_w, y - half_h),
+            (x + half_w, y + half_h),
+            (x - half_w, y + half_h),
+        ],
+        rows=2,
+        columns=2,
+        overlap=0.1,
+        clip_to_well=True,
+    )
+    return ScanPlanResult(
+        plate_plan=plate_plan,
+        wells=("B2", "B11"),
+        objective="Nikon 10X S Fluor",
+        pixel_size_um=1.0,
+        matrix_um_per_px=((1.0, 0.0), (0.0, -1.0)),
+        matrix_source="parameter",
+        image_shape_px=(512, 512),
+        fov_um=fov_um,
+        overlap=0.1,
+        rows=2,
+        columns=2,
+        fields=fields,
+        estimate_s=None,
+    )
+
+
+def _seed_scan_plan(run_doc: Path) -> None:
+    write_stage(
+        run_doc,
+        StageRecord(
+            plugin="scan-plan",
+            provides="scan-plan",
+            attempt="a1",
+            status=StageStatus.done,
+            started_utc=T0 + timedelta(minutes=1),
+            finished_utc=T0 + timedelta(minutes=2),
+            profile="demo",
+            dry_run=False,
+            smc_version="0",
+            params={},
+            result=_scan_plan_result().model_dump(mode="json"),
+        ),
+    )
+
+
 def _ids_below(items: list[Any]) -> set[int]:
     """The id of every object under ``items``, the Accordion's panels too (``select`` stops at one)."""
     found: set[int] = set()
@@ -232,24 +288,55 @@ def test_the_step_panel_shows_one_screen_at_a_time(page: PlatePage) -> None:
             s: (["smc-step", "smc-step-shown"] if s == step else ["smc-step"])
             for s in STEPS
         }
-        # Never another step's tool: only the screen's own sections are listed.
         assert view.continue_button.label == (continue_label(step) or "")
         assert view.continue_button.visible is (step != "results")
-    # Each screen's provisional contents are today's regions (B1), not another's.
-    on = {step: {id(o) for o in _ids_objects(view.screens[step])} for step in STEPS}
-    run = {name: id(button) for name, button in view.tool_runs.items()}
-    assert run["scan-plan"] in on["wells"]
-    assert run["scan"] in on["scan"]
-    assert run["plate-registration"] in on["plate"]
-    assert run["camera-calibration"] in on["stand"]
-    assert run["timing"] in on["stand"]
-    for name in ("cells", "density", "route", "report", "nis-export"):
-        assert run[name] in on["results"]
-    # A tool of no step (a third party's, `goto-well`) is in the expert view only.
-    assert all(run["goto-well"] not in ids for ids in on.values())
-    assert run["goto-well"] in {id(o) for o in _ids_objects(view.screens["expert"])}
-    assert view.select_input in view.screens["wells"]
-    assert view.select_input not in view.screens["plate"]
+    # Each screen's provisional contents are today's regions (B1), listed by step (m5
+    # §17.7), written out here and not read from the code's table (FM-43): the tools of
+    # a screen are exactly these, so that a tool of another step does not leak onto it
+    # (found by the adversarial review of #443: each leak below survived every test).
+    on = {
+        step: {id(o) for o in _ids_objects(view.screens[step])}
+        for step in (*STEPS, "expert")
+    }
+    tools_on = {
+        step: {name for name, button in view.tool_runs.items() if id(button) in ids}
+        for step, ids in on.items()
+    }
+    assert tools_on == {
+        "stand": {"camera-calibration", "timing"},
+        "plate": {"plate-registration"},
+        "wells": {"scan-plan"},
+        "scan": {"scan"},
+        "results": {"cells", "density", "route", "report", "nis-export"},
+        # The expert view lists every tool, the ones no step holds included (`goto-well`
+        # is a third party's, as far as the steps go: in the expert view only).
+        "expert": set(view.tool_runs),
+    }
+    assert "goto-well" in view.tool_runs
+    # The page's own controls are each on their screen and on no other step's.
+    homes = {
+        "preset_select": {"stand", "expert"},
+        "plate_select": {"plate", "expert"},
+        "orientation_select": {"plate", "expert"},
+        "plate_confirm_button": {"plate", "expert"},
+        "select_input": {"wells", "expert"},
+        "run_document_text": {"results", "expert"},
+        "checklist_text": {"results", "expert"},
+        "continue_button": set(STEPS),
+        "next_text": {*STEPS, "expert"},
+    }
+    for attribute, screens in homes.items():
+        widget = getattr(view, attribute)
+        assert {s for s, ids in on.items() if id(widget) in ids} == screens, attribute
+    # Nothing in a screen is wider than the step panel's text (400 px less its scrollbar
+    # and margins, m5 §17.3): a fixed width past 370 runs past the panel's edge.
+    for step in STEPS:
+        too_wide = [
+            type(o).__name__
+            for o in _ids_objects(view.screens[step])
+            if isinstance(getattr(o, "width", None), int) and o.width > 370
+        ]
+        assert too_wide == [], f"{step} places a fixed width past 370 px: {too_wide}"
 
 
 def _ids_objects(items: list[Any]) -> list[Any]:
@@ -399,14 +486,23 @@ def test_both_figures_stay_in_the_model_tree_whatever_the_screen(
     for items in view.screens.values():
         assert not figures & {id(o) for o in _ids_objects(items)}
         assert not any(isinstance(o, pn.pane.Bokeh) for o in _ids_objects(items))
-    # Both are 460 px high (m5 §17.3), side by side in the centre.
+    # Both are the same height, side by side in the centre. The design says 460 px; 400 is
+    # the floor (m5 §17.3): a figure lower than that is a plan deviation to report, not a
+    # fix, so the number is pinned and not only the constant against itself.
     assert view.figure.height == view.image_figure.height == plate_page.FIGURE_HEIGHT_PX
+    assert plate_page.FIGURE_HEIGHT_PX >= 400
+    assert plate_page.STEP_PANEL_WIDTH_PX == 400
 
 
 def test_the_strip_and_stop_are_outside_the_step_panel(page: PlatePage) -> None:
     view = PlatePageView(page)
-    in_the_panel = _ids_below(list(view.step_panel.objects))
-    always = {id(o) for o in view.layout.select()} - in_the_panel
+    # The frame is the layout with an empty step panel, not the layout less the screen
+    # shown: a widget of the frame that the screen shown also lists would be subtracted
+    # with it and never compared (the Plate screen is the one the page opens on; found by
+    # the adversarial review of #443).
+    view.step_panel.objects = []
+    always = {id(o) for o in view.layout.select()}
+    view.show_step(view.step)
     for widget in (
         view.connect_button,
         view.disconnect_button,
@@ -540,6 +636,43 @@ def test_the_labels_and_summaries_follow_the_run_document_after_a_refresh(
     # Wells is the step that is suggested now.
     assert view.step == "plate"
     assert view.step_summaries["wells"].object == "next"
+
+
+def test_the_step_bar_shows_the_loaded_preset_and_the_scan_plans_counts(
+    page: PlatePage,
+    run_doc: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The view hands `guide.step_states` the loaded preset's name and the scan plan the
+    # view read; the guide's own tests prove the sentences, this proves the wiring (found
+    # by the adversarial review of #443: a view that passed neither stayed green).
+    monkeypatch.chdir(tmp_path)  # presets are looked for in ./profiles/presets
+    monkeypatch.delenv("SMC_PROFILES", raising=False)
+    folder = tmp_path / "profiles" / "presets"
+    folder.mkdir(parents=True)
+    (folder / "weekly.toml").write_text(
+        'stand = "demo"\nplate = "96-well"\n', encoding="utf-8"
+    )
+    _seed_plate(run_doc)
+    _seed_scan_plan(run_doc)
+    view = PlatePageView(page)
+    assert view.step_summaries["wells"].object == "2 wells, 8 fields"
+    assert view.step_buttons["wells"].label == "3. Wells ✓"
+    # No preset yet: the stand alone.
+    assert page.preset is None
+    assert view.step_summaries["stand"].object == "demo"
+    view.preset_select.value = "weekly"
+    view.preset_load_button.clicks += 1
+    assert page.preset is not None
+    assert view.message.object == ""
+    assert view.step_summaries["stand"].object == "demo, preset weekly"
+    # The tooltip says the same, and forgetting the preset takes it out again.
+    assert view.step_buttons["stand"].description == "demo, preset weekly"
+    view.preset_select.value = ""
+    view.preset_load_button.clicks += 1
+    assert page.preset is None
+    assert view.step_summaries["stand"].object == "demo"
 
 
 def test_two_views_show_their_own_screens(page: PlatePage, run_doc: Path) -> None:
