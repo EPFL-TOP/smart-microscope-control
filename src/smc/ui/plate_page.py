@@ -633,13 +633,18 @@ class PlatePageView:
         # The outcome lines under the strip take no height while their text is empty
         # (m5 §17.3): ``_hide_when_empty`` is registered for each below, so the rule is
         # one, wherever the text is set.
-        self.message = pn.pane.Str("", styles={"color": _WARNING}, visible=False)
-        self.problems_text = pn.pane.Str("", styles={"color": _WARNING}, visible=False)
+        #
+        # Each wraps at the window's width: an outcome is a sentence (``plate-orientation
+        # done ...; assumed: turned 180° ...`` is 200 characters) and ran past the right
+        # edge, its end unreadable (``/ui-check`` ``turned``, #443). Text, never
+        # Markdown (FM-139).
+        self.message = self._outcome_line({"color": _WARNING})
+        self.problems_text = self._outcome_line({"color": _WARNING})
         # One line, wrapped when a refused STOP makes it long: it shares the strip's row
         # with the four buttons, which keep their width.
         self.status_text = _wrapped_text(width=None)
         self.status_text.sizing_mode = "stretch_width"
-        self.run_text = pn.pane.Str("", visible=False)
+        self.run_text = self._outcome_line()
         self.drive_text = pn.pane.Str(
             DRIVE_TEXT, styles={"color": _WARNING}, visible=False
         )
@@ -728,7 +733,7 @@ class PlatePageView:
         # that needs the stand is disabled while it is closed.
         self.connect_button = pn.widgets.Button(label="Connect")
         self.disconnect_button = pn.widgets.Button(label="Disconnect")
-        self.connection_text = pn.pane.Str("", visible=False)
+        self.connection_text = self._outcome_line()
 
         # Every handler goes through `_handler` (the document lock, a failure is a line).
         for pane in (
@@ -1287,6 +1292,14 @@ class PlatePageView:
             button.description = state.summary or None
             self.step_summaries[state.step].object = state.summary
         self._style_steps()
+
+    @staticmethod
+    def _outcome_line(extra: dict[str, str] | None = None) -> Any:
+        """A line under the strip: empty and hidden, wrapped at the window's width (m5 §17.3)."""
+        line = _wrapped_text(extra=extra, width=None)
+        line.sizing_mode = "stretch_width"
+        line.visible = False
+        return line
 
     def _hide_when_empty(self, event: Any) -> None:
         """An outcome line takes no height while its text is empty (m5 §17.3)."""

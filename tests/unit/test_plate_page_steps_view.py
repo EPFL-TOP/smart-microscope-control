@@ -755,6 +755,19 @@ def test_an_outcome_line_takes_no_height_while_its_text_is_empty(
     for pane in (view.message, view.problems_text, view.run_text):
         assert pane.object == ""
         assert pane.visible is False
+    # Each line wraps at the window's width: a run's outcome is a sentence of 200
+    # characters (`plate-orientation done ...; assumed: ...`) and its end ran past the
+    # right edge in `/ui-check`'s `turned` state. Plain text, never Markdown (FM-139).
+    for pane in (
+        view.connection_text,
+        view.run_text,
+        view.message,
+        view.problems_text,
+        view.status_text,
+    ):
+        assert type(pane) is pn.pane.Str
+        assert pane.styles["white-space"] == "pre-wrap"
+        assert pane.sizing_mode == "stretch_width"
     # The connection line is never empty once the tick has read the stand.
     assert view.connection_text.object != ""
     assert view.connection_text.visible is True
