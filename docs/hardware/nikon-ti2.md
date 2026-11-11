@@ -746,11 +746,21 @@ the Prime 95B on the left port (`L100`).
   magnifications 4.02×, 9.78×, 39.8× for 11 µm pixels; the 40× field is
   389.9 µm.
 - With no pixel size known, the step falls back to 50 µm: at the 4× that
-  is about 18 px, and the fit gave a 10.7 µm residual (F6, #408).
-- **A frame with the light path on the eyepiece** makes the calibration
+  is about 18 px, and the fit gave a 10.7 µm residual, 21 % of the step,
+  where the three good fits have 0.1 to 0.5 % (F6, #408). The plugin now
+  names such a probe in `assumed` and suggests a `step_um` (about 970 µm
+  at the 4×); not run at the stand yet.
+- **A frame with the light path on the eyepiece** made the calibration
   refuse with "parallel shifts: did the stage move?" (F8, #408). Live on
   the page was dark for the same reason, with no hint. The lab calls the
   left port "the Zyla"; it is the Prime 95B (1412 × 1412 px).
+- **The Prime 95B's dark frame** (the two `smc snap` frames of session 2,
+  12 and 20 ms, 1412 × 1412 uint16, taken with no light on the camera):
+  mean 100.5, standard deviation 2.3, 95 to 106 between the 1st and the
+  99th percentile (a spread of 11 counts), range 79 to 126. Of 200 frames of
+  the surveys, the dimmest with light spans 177 counts between the same
+  percentiles (the 4× scan fields 395 to 1123, B3 at the 10× 5319). The
+  calibration refuses a frame under 50 before the first move (#408).
 
 ### The plate
 

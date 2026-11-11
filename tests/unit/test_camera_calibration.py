@@ -19,12 +19,20 @@ from hypothesis import strategies as st
 
 from smc.plugins.camera_calibration import algorithm
 from smc.plugins.camera_calibration.algorithm import (
+    MAX_RESIDUAL_SHARE,
+    MIN_FEATURE_FRACTION,
     MIN_RESPONSE,
+    MIN_SIGNAL_SPREAD_COUNTS,
+    SMALL_STEP_FRACTION,
     UPSAMPLE,
     Fit,
     Shift,
+    carries_signal,
     fit,
     measure_shift,
+    precision_reasons,
+    signal_floor_counts,
+    signal_spread,
 )
 from smc.plugins.geometry import Matrix2
 from smc.testing.synthetic import PlateSample
@@ -600,3 +608,240 @@ def test_a_step_that_is_not_finite_and_positive_is_refused(step_um: float) -> No
     shift = Shift(1.0, 0.0, 1.0)
     with pytest.raises(ValueError, match="step_um"):
         fit(shift, shift, step_um=step_um, image_shape_px=SHAPE)
+
+
+# -- a frame with no signal (#408, F8): the light is off the camera's path
+
+
+def _dark_frame(*, hot_pixel: bool = False) -> np.ndarray:
+    """What the Prime 95B gave with no light on it (session 2's ``smc snap``).
+
+    Measured on the two real frames: mean 100.5, standard deviation 2.3, so
+    95 to 106 between the 1st and the 99th percentile; a column pattern is
+    added, since the fixed pattern is what made the dark frames correlate well
+    at a zero shift. One pixel at 65535 stands for a hot or stuck pixel.
+    """
+    rng = np.random.default_rng(408)
+    frame = 100.5 + rng.normal(0.0, 2.3, SHAPE) + rng.normal(0.0, 1.0, SHAPE[1])
+    frame = np.rint(frame).astype(np.uint16)
+    if hot_pixel:
+        frame[10, 20] = 65535
+    return frame
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        _dark_frame(),
+        _dark_frame(hot_pixel=True),
+        np.full(SHAPE, 65535, dtype=np.uint16),
+        np.zeros(SHAPE, dtype=np.uint16),
+    ],
+    ids=["dark", "dark-with-a-hot-pixel", "saturated", "zero"],
+)
+def test_a_measured_dark_frame_carries_no_signal(frame: np.ndarray) -> None:
+    """The hot pixel makes ``max - min`` 65000: only the percentiles see a dark frame."""
+    assert signal_spread(frame) < MIN_SIGNAL_SPREAD_COUNTS
+    assert not carries_signal(frame)
+
+
+def test_a_frame_with_a_sample_carries_signal() -> None:
+    """The synthetic plate, and a frame spanning 177 counts: the dimmest lit one of 200 real frames."""
+    rendered = PlateSample().render(0.0, 0.0, 0.0, shape=SHAPE, pixel_size_um=1.0)
+    dimmest = np.linspace(1000.0, 1000.0 + 177.0 / 0.98, SHAPE[0] * SHAPE[1])
+
+    assert carries_signal(rendered)
+    assert carries_signal(dimmest.reshape(SHAPE))
+    assert signal_spread(dimmest.reshape(SHAPE)) == pytest.approx(177.0, rel=1e-3)
+
+
+def _step_frame(spread: float) -> np.ndarray:
+    """Half the frame at 0 and half at ``spread``: its 1st to 99th percentile spans exactly that.
+
+    The median is half of it, so no pixel lies a floor away from it: the
+    percentiles alone decide.
+    """
+    frame = np.zeros(SHAPE, dtype=np.float64)
+    frame[:, SHAPE[1] // 2 :] = spread
+    return frame
+
+
+@pytest.mark.parametrize(
+    ("spread", "expected"), [(49.0, False), (50.0, True), (51.0, True)]
+)
+def test_the_signal_floor_is_decided_at_exactly_fifty_counts(
+    spread: float, expected: bool
+) -> None:
+    """The boundary itself: ``>=`` and not ``>``, in the one function every caller asks."""
+    frame = _step_frame(spread)
+
+    assert signal_spread(frame) == spread
+    assert carries_signal(frame) is expected
+
+
+def test_the_constants_are_the_measured_numbers() -> None:
+    """Real dark frames span 11 counts and the dimmest lit one 177: 50 sits between, 4 and 3.5 times away."""
+    assert MIN_SIGNAL_SPREAD_COUNTS == 50.0
+    assert 4.0 * 11.0 < MIN_SIGNAL_SPREAD_COUNTS < 177.0 / 3.0
+    assert MIN_FEATURE_FRACTION == 1e-4
+    assert SMALL_STEP_FRACTION == 0.1
+    assert MAX_RESIDUAL_SHARE == 0.05
+
+
+@pytest.mark.parametrize(
+    ("bit_depth", "floor"), [(16, 50.0), (12, 3.125), (8, 0.1953125), (24, 50.0)]
+)
+def test_the_floor_scales_with_the_cameras_bit_depth_and_never_above_sixteen(
+    bit_depth: int, floor: float
+) -> None:
+    assert signal_floor_counts(bit_depth) == pytest.approx(floor)
+
+
+def test_a_lit_frame_of_a_12_bit_mode_carries_signal_and_its_dark_frame_does_not() -> (
+    None
+):
+    """The same light reads 16 times fewer counts: against the 16-bit floor it would be refused."""
+    rendered = PlateSample().render(0.0, 0.0, 0.0, shape=SHAPE, pixel_size_um=1.0)
+    lit_12_bit = rendered // 16
+    dark_12_bit = _dark_frame() // 16
+
+    assert signal_spread(lit_12_bit) < MIN_SIGNAL_SPREAD_COUNTS
+    assert not carries_signal(lit_12_bit)
+    assert carries_signal(lit_12_bit, bit_depth=12)
+    assert not carries_signal(dark_12_bit, bit_depth=12)
+
+
+def _dark_with_features(count: int) -> np.ndarray:
+    """The measured dark background with ``count`` pixels at 3000 counts: a sparse field."""
+    frame = _dark_frame().astype(np.float64)
+    flat = frame.reshape(-1)
+    flat[np.random.default_rng(1).choice(flat.size, count, replace=False)] = 3000.0
+    return frame
+
+
+@pytest.mark.parametrize(
+    ("count", "expected"),
+    [(19, False), (20, True), (160, True)],
+    ids=["19-hot-pixels", "20-pixels", "one-bead"],
+)
+def test_a_sparse_field_carries_signal_and_a_few_hot_pixels_do_not(
+    count: int, expected: bool
+) -> None:
+    """A bead of 2.5 px is about 160 pixels, 0.08 % of the frame: under the percentiles' 1 %.
+
+    ``MIN_FEATURE_FRACTION`` of this frame is 19.7 pixels; the percentiles read
+    a dark frame in every case here, so it is the second rule that decides.
+    """
+    frame = _dark_with_features(count)
+
+    assert signal_spread(frame) < MIN_SIGNAL_SPREAD_COUNTS
+    assert carries_signal(frame) is expected
+
+
+@pytest.mark.parametrize("dtype", [np.uint16, np.float32, np.float64])
+def test_the_signal_does_not_depend_on_the_frames_dtype(dtype: type) -> None:
+    frame = np.where(np.arange(SHAPE[0] * SHAPE[1]).reshape(SHAPE) % 2, 140, 100)
+
+    assert signal_spread(frame.astype(dtype)) == pytest.approx(40.0)
+
+
+def test_a_frame_that_is_not_2d_or_not_finite_has_no_signal_to_measure() -> None:
+    with pytest.raises(ValueError, match="2-D"):
+        signal_spread(np.zeros((4, 4, 3)))
+    with pytest.raises(ValueError, match="not finite"):
+        signal_spread(np.full(SHAPE, np.nan))
+
+
+# -- a probe that fits poorly (#408, F6): 50 µm at the 4x is 18 px
+
+
+def _fit_with(pixel_size_um: float, residual_um: float) -> Fit:
+    """A trustworthy fit of a camera at 177.4 degrees, as session 3 measured, with this residual."""
+    return Fit(
+        _matrix(pixel_size_um, 177.437, False),
+        pixel_size_um,
+        177.437,
+        False,
+        residual_um,
+        (),
+    )
+
+
+@pytest.mark.parametrize(
+    ("step_um", "pixel_size_um", "residual_um", "reasons"),
+    [
+        # Session 3, the 4x with no pixel size known: 18 px, 21 % of the step.
+        (
+            50.0,
+            2.74526,
+            10.6551,
+            (
+                "18 px, under a tenth of the 1412 px frame",
+                "residual 10.7 µm, 21 % of the step",
+            ),
+        ),
+        # The three fits that were good: 329, 311 and 362 px; 0.1, 0.2 and 0.5 %.
+        (900.0, 2.73909, 0.894, ()),
+        (350.0, 1.12447, 0.642, ()),
+        (100.0, 0.276136, 0.535, ()),
+    ],
+    ids=["4x-fallback", "4x-900um", "10x-350um", "40x-100um"],
+)
+def test_session_three_s_fits_are_judged_as_they_were_measured(
+    step_um: float,
+    pixel_size_um: float,
+    residual_um: float,
+    reasons: tuple[str, ...],
+) -> None:
+    found = precision_reasons(
+        _fit_with(pixel_size_um, residual_um), step_um, (1412, 1412)
+    )
+
+    assert found == reasons
+
+
+@pytest.mark.parametrize(
+    ("pixel_size_um", "flagged"),
+    [(2.74526, True), (1.12447, True), (0.276136, False)],
+    ids=["4x-18-px", "10x-44-px", "40x-181-px"],
+)
+def test_the_fallback_step_is_a_few_pixels_at_the_4x_and_the_10x_and_not_at_the_40x(
+    pixel_size_um: float, flagged: bool
+) -> None:
+    """The plan's own numbers, so that a bound that moves to 5 % or 20 % of the frame is seen."""
+    found = precision_reasons(_fit_with(pixel_size_um, 0.0), 50.0, (1412, 1412))
+
+    assert bool(found) is flagged
+
+
+def test_a_residual_that_is_nan_is_a_reason_not_a_pass() -> None:
+    found = precision_reasons(_fit_with(2.0, float("nan")), 1000.0, (1412, 1412))
+
+    assert len(found) == 1
+    assert found[0].startswith("residual nan")
+
+
+@pytest.mark.parametrize(
+    ("step_px", "residual_share", "expect_small", "expect_residual"),
+    [
+        (34.0, 0.0, True, False),  # a tenth of 384 rows is 38.4
+        (42.0, 0.0, False, False),
+        (100.0, 0.04, False, False),
+        (100.0, 0.06, False, True),
+        (34.0, 0.06, True, True),
+    ],
+    ids=["under-a-tenth", "over-a-tenth", "4-percent", "6-percent", "both"],
+)
+def test_the_precision_rules_are_decided_at_a_tenth_of_the_frame_and_five_percent_of_the_step(
+    step_px: float, residual_share: float, expect_small: bool, expect_residual: bool
+) -> None:
+    """The smaller side of a 384 x 512 frame, not the larger one (FM-73): a tenth is 38.4 px."""
+    pixel_size_um = 2.0
+    step_um = step_px * pixel_size_um
+    found = precision_reasons(
+        _fit_with(pixel_size_um, residual_share * step_um), step_um, SHAPE
+    )
+
+    assert any("under a tenth of the 384 px frame" in r for r in found) is expect_small
+    assert any("of the step" in r for r in found) is expect_residual
+    assert len(found) == int(expect_small) + int(expect_residual)

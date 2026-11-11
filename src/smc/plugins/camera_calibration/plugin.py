@@ -12,6 +12,12 @@ harm.
 * **The return runs before the fit is judged.** An operator who calibrated on
   an empty field gets the stage back where they chose it, and then the reason
   the field was no good.
+* **A frame with no light is named before anything else is blamed** (F8, #408).
+  Dark frames correlate well at a zero shift, so a calibration with the light
+  path on the eyepiece measured two shifts of zero and asked whether the stage
+  had moved. The reference frame is judged before the first move, and each
+  probe frame after the return, so that "parallel shifts" follows only frames
+  that carry signal.
 * **The stage is waited for before its start is read** (FM-85), and the step is
   sized from the camera's own pixel size only when that is finite and positive
   (FM-104): a pixel size of 0 means "not measured".
@@ -38,8 +44,12 @@ from smc.plugins.camera_calibration.algorithm import (
     FALLBACK_STEP_UM,
     MIN_RESPONSE,
     Fit,
+    carries_signal,
     fit,
     measure_shift,
+    precision_reasons,
+    signal_floor_counts,
+    signal_spread,
 )
 from smc.plugins.errors import PluginRunError
 from smc.plugins.slots import CameraCalibration
@@ -137,6 +147,8 @@ class CameraCalibrationPlugin:
             )
 
         reported_um = camera.pixel_size_um()
+        # The floor of a frame with no light is for the camera's own bit depth.
+        bit_depth = int(camera.bit_depth())
         assumed: list[str] = []
         used_fallback = False
         if params.step_um is not None:
@@ -157,9 +169,11 @@ class CameraCalibrationPlugin:
         # A stage still travelling from an earlier move reads a fraction of it.
         xy.wait()
         start = xy.position_um()
-        reference = _checked_frame(self.name, camera.snap(), shape)
+        reference = _checked_frame(self.name, camera.snap(), shape, bit_depth)
         probes = (("+X probe", step_um, 0.0), ("+Y probe", 0.0, step_um))
         shifts = []
+        # Per probe frame: whether it carries light, and the spread the message quotes.
+        signals: list[tuple[bool, float]] = []
         settle_s = params.settle_ms / 1000.0
         # Whether a move was sent and the return has not arrived: a stop before
         # the first move, or during the settle after the return, leaves the
@@ -171,7 +185,11 @@ class CameraCalibrationPlugin:
                 away = True
                 xy.move_to_um(start.x_um + dx_um, start.y_um + dy_um)
                 ctx.wait_s(settle_s)
-                shifts.append(measure_shift(reference, camera.snap()))
+                probe_frame = camera.snap()
+                shifts.append(measure_shift(reference, probe_frame))
+                signals.append(
+                    (carries_signal(probe_frame, bit_depth), signal_spread(probe_frame))
+                )
                 ctx.progress(done, 3, label)
             # Both probes returned normally, so the return runs (FM-88), and
             # before the fit is judged: an empty field still gets the stage back.
@@ -187,11 +205,34 @@ class CameraCalibrationPlugin:
             raise
         shift_x, shift_y = shifts
 
+        # Before the fit: a probe frame with no light gives a shift of zero, and
+        # the fit would blame the stage for it ("parallel shifts"). The return
+        # was sent and came back normally; where it landed is not read here
+        # (a move that returns is not a move that arrived, FM-167), so the
+        # refusal says what was done and not where the stage is.
+        for (label, _dx_um, _dy_um), (lit, spread) in zip(probes, signals, strict=True):
+            if not lit:
+                raise PluginRunError(
+                    self.name,
+                    f"the frame after the {label} is dark or flat "
+                    f"({_spread_detail(spread, bit_depth)}): did the light go off, "
+                    f"or did the step of {step_um:g} µm leave the lit sample? the "
+                    "stage was sent back to its start",
+                )
+
         fitted = fit(shift_x, shift_y, step_um=step_um, image_shape_px=shape)
         if not fitted.trustworthy:
             raise PluginRunError(
                 self.name,
                 _unusable_reason(fitted, step_um, shape, reported_um, used_fallback),
+            )
+        reasons = precision_reasons(fitted, step_um, shape)
+        if reasons:
+            better_um = suggested_step_um(fitted.pixel_size_um, shape)
+            assumed.append(
+                precision_line(
+                    step_um, reasons, better_um if better_um > step_um else None
+                )
             )
 
         after_return = measure_shift(reference, camera.snap())
@@ -253,14 +294,16 @@ def _usable(pixel_size_um: float) -> bool:
 
 
 def _checked_frame(
-    name: str, frame: npt.NDArray[Any], shape: tuple[int, int]
+    name: str, frame: npt.NDArray[Any], shape: tuple[int, int], bit_depth: int
 ) -> npt.NDArray[Any]:
     """The reference frame, once it is known that every probe can be judged against it.
 
     ``measure_shift`` refuses a frame that is not 2-D or holds a value that is
     not finite, but only after the +X probe has moved the stage a quarter field:
     a colour camera's ``(h, w, 3)`` frame, a different region than the camera
-    reports, or a ``nan`` is known now, before anything moves.
+    reports, or a ``nan`` is known now, before anything moves. So is a frame
+    with no light on it (the light path on the eyepiece, F8): it correlates well
+    at a zero shift, and the fit would blame the stage after two moves.
     """
     array = np.asarray(frame)
     if array.shape != shape:
@@ -276,7 +319,60 @@ def _checked_frame(
             "the camera's frame has a value that is not finite; nothing was "
             "moved. Give the camera a mode that returns numbers",
         )
+    if not carries_signal(array, bit_depth):
+        detail = _spread_detail(signal_spread(array), bit_depth)
+        # A frame at full scale is no light path to look for: the remedy is the
+        # opposite one (one message, many causes).
+        if float(np.median(array)) >= 2.0 ** min(max(bit_depth, 1), 16) - 1.0:
+            raise PluginRunError(
+                name,
+                f"the camera's frame is saturated ({detail}): lower the exposure "
+                "or the light; nothing was moved",
+            )
+        raise PluginRunError(
+            name,
+            f"the camera's frame is dark or flat ({detail}): is the light on and "
+            "the light path on the camera? nothing was moved",
+        )
     return frame
+
+
+def _spread_detail(spread: float, bit_depth: int) -> str:
+    """What was measured, and the floor, so that a surprise at a stand is a number to report."""
+    return (
+        f"the 1st to 99th percentile spans {spread:.0f} counts, "
+        f"under {signal_floor_counts(bit_depth):g}"
+    )
+
+
+def suggested_step_um(pixel_size_um: float, image_shape_px: tuple[int, int]) -> float:
+    """A quarter of the smaller side at this pixel size, to two significant figures, at most 2000 µm.
+
+    What a run that fitted poorly says to try next. It is the default step the
+    plugin would have chosen had it known the pixel size, so it cannot wrap
+    (§4.1), and two figures because the pixel size it comes from is a
+    measurement of a poor fit: 969.0 is 970. ``pixel_size_um`` is a measured
+    one, finite and positive (the caller has a trustworthy fit).
+    """
+    quarter_um = DEFAULT_STEP_FRACTION * min(image_shape_px) * pixel_size_um
+    digits = 1 - math.floor(math.log10(quarter_um))
+    return min(_MAX_STEP_UM, round(quarter_um, digits))
+
+
+def precision_line(
+    step_um: float, reasons: tuple[str, ...], suggested_um: float | None
+) -> str:
+    """The ``assumed`` line of a probe that fitted poorly, with the step to try instead.
+
+    One line, under the 160 characters the page's strip keeps of the first
+    ``assumed`` line (FM-205), and without the suggestion when it is not a
+    larger step than the one used: a residual that is large at a quarter of the
+    field is not cured by a probe of the same size.
+    """
+    line = f"step of {step_um:g} µm fits poorly ({'; '.join(reasons)})"
+    if suggested_um is not None:
+        line += f": run again with step_um={suggested_um:g}"
+    return line
 
 
 def _warn_left(ctx: RunContext, xy: XYStage, start: XY) -> None:

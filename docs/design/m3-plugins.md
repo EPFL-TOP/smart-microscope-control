@@ -1554,6 +1554,53 @@ def fit(
   a rigid camera: did each axis move its full command?"), which refuses
   an axis that moves a fraction of its command, or none plus noise
   (review of #211).
+- **A frame with no signal** (#408, F8). With the light path on the
+  eyepiece the camera sees its black level and its fixed pattern, which
+  correlate well at a zero shift: the two probes measured a shift of zero,
+  the response was high, and the only note was "parallel shifts: did the
+  stage move?". `signal_spread(frame)` is the 99th minus the 1st
+  percentile of the frame in counts (float64, so a frame that is not 2-D
+  or not finite is a `ValueError`), and `carries_signal(frame,
+  bit_depth)`, the **one** decision every caller asks (the reference and
+  each probe frame), is true when that spread is `>=
+  MIN_SIGNAL_SPREAD_COUNTS`, **50** at 16 bits (`signal_floor_counts`
+  scales it by `2 ** (bits - 16)`, so 3.125 at 12 bits, and never above
+  16: a shallower mode reads fewer counts for the same light, and the
+  scaling can only let a dark frame through, the old behaviour, never
+  refuse a lit one), **or** when at least `MIN_FEATURE_FRACTION`
+  (`1e-4`, 20 pixels of a 384 x 512 frame, 199 of 1412 x 1412) of the
+  pixels lie a floor or more from the median. The second rule is for a
+  **sparse** field, a few beads or cells on a dark background: three
+  beads of 2.5 px are 0.24 % of the frame, and the percentiles read it as
+  dark (a spread of 10 or 11), where the base code calibrates it (found
+  by the adversarial review). The two real dark frames have no such
+  pixel (0 of 2 million), and a hot pixel is one in a million. Measured on the Prime 95B (16-bit):
+  the two dark frames of Ti2-E session 2 (`smc snap`, 12 and 20 ms) span
+  **11** counts (mean 100.5, std 2.3, `max - min` 45 to 47); of the 200
+  frames of the stand's survey, the only ones under 50 are those two and
+  two saturated constant frames (0), and the dimmest lit one spans
+  **177**; the 4x scan fields span 395 to 1123 and B3 at the 10x 5319. It
+  is the percentiles because one hot or stuck pixel makes a dark frame's
+  `max - min` 65000; it is counts because a ratio to the pixel noise
+  cannot tell a dark frame from a lit blank one (5.2 and 5.7, near the
+  4.65 of Gaussian noise). The floor was measured on a 16-bit camera, the
+  only kind on our stands, and follows the bit depth the camera reports.
+  A frame at full scale (its median is `2 ** bits - 1`) is refused with
+  its own remedy, "the camera's frame is saturated (...): lower the
+  exposure or the light" (one message, many causes). A lit field without texture still passes (the synthetic plate
+  with `texture_std=0` spans 94): it is refused later, by the fit, as "the
+  frames barely correlate".
+- **A probe that fits poorly** (#408, F6). `precision_reasons(fit,
+  step_um, image_shape_px)` names two reasons, never refusing: the step at
+  the **measured** pixel size is under `SMALL_STEP_FRACTION` (a tenth) of
+  the smaller side (`18 px, under a tenth of the 1412 px frame`; 141 px on
+  the Prime), and the residual is over `MAX_RESIDUAL_SHARE` (5 %) of the
+  step (`residual 10.7 µm, 21 % of the step`). Session 3's four fits: 50 µm
+  at the 4x with no pixel size known, 18.2 px and 21 %; 900 µm at the 4x,
+  329 px and 0.1 %; 350 µm at the 10x, 311 px and 0.2 %; 100 µm at the
+  40x, 362 px and 0.5 %. The synthetic plate does not reproduce the 4x's
+  residual (0.000 at 18 px), so the residual rule is tested on these
+  numbers and the pixel rule through the plugin.
 
 ### 4.2 Plugin
 
@@ -1595,10 +1642,18 @@ measure the camera; run it without --dry-run"):
    distance, not a result).
 2. `xy.wait()` (FM-85: a stage still travelling from an earlier move
    reads a fraction of it); `start = xy.position_um()`; `reference =
-   camera.snap()`.
+   camera.snap()`, **judged before anything moves**: a shape other than
+   the camera reports and a value that is not finite are refused with
+   `nothing was moved`, and so is a frame with no signal (§4.1): `the
+   camera's frame is dark or flat (the 1st to 99th percentile spans <s>
+   counts, under 50): is the light on and the light path on the camera?
+   nothing was moved` (`under` is the floor of the camera's bit depth; a
+   frame at full scale reads `the camera's frame is saturated (...): lower
+   the exposure or the light; nothing was moved`).
 3. For `(dx, dy)` in `(step, 0)`, `(0, step)`: `ctx.raise_if_stopped()`,
    `xy.move_to_um(start + (dx, dy))`, `ctx.wait_s(settle_ms / 1000)`,
-   `snap`, `measure_shift(reference, frame)`; `ctx.progress(i, 3, "+X
+   `snap`, `measure_shift(reference, frame)` and `signal_spread(frame)`;
+   `ctx.progress(i, 3, "+X
    probe" | "+Y probe")`. On any exception here (a stop, a halt, a fault,
    a soft-limit refusal) the stage is left where it is: a WARNING names
    where (`position_um()` read in its own `try`, "unknown" when that read
@@ -1608,11 +1663,27 @@ measure the camera; run it without --dry-run"):
    fit is judged**: `ctx.raise_if_stopped()`, `move_to_um(start)`,
    `ctx.wait_s(settle_ms / 1000)`. An operator who calibrated on an empty
    field gets the stage back where they chose it.
-5. `fit(...)`; notes → `PluginRunError` whose reason is the notes, then
+5. **A probe frame with no signal** ends the run, after the return and
+   before the fit, so that "parallel shifts" follows only frames that carry
+   signal: `the frame after the <+X probe|+Y probe> is dark or flat (the
+   1st to 99th percentile spans <s> counts, under 50): did the light go
+   off, or did the step of <s> µm leave the lit sample? the stage was sent
+   back to its start` (the first such probe is named; a probe that left the
+   lit sample, onto the black plastic between wells, reads the same). The
+   return was sent and came back normally; where it landed is not read
+   here (FM-167), so the text says what was done, not where the stage is.
+   Then `fit(...)`; notes → `PluginRunError` whose reason is the notes, then
    `step <s> µm`, and, when the step was the fallback or is at least 40 %
    of the smaller side in pixels (`step / pixel size`, pixel size known),
    `a step over 40 % of the field may wrap: give a smaller step_um`.
-   Nothing fills the slot.
+   Nothing fills the slot. A trustworthy fit that `precision_reasons`
+   names adds one line to `assumed`, after the fallback or cap line and
+   before the return's: `step of <s> µm fits poorly (<reasons, "; ">): run
+   again with step_um=<q>`, where `q` is `suggested_step_um`, a quarter of
+   the smaller side at the measured pixel size to two significant figures
+   and at most 2000 (970 for session 3's 4x), and the clause is left out
+   when `q` is not larger than the step used. At most 160 characters, the
+   length the page's strip keeps of the first line (FM-205).
 6. `snap`; `measure_shift(reference, frame)`; `ctx.progress(3, 3,
    "return")`. When its response is at least `MIN_RESPONSE`,
    `return_error_um` is its stage length (`M` applied); otherwise `None`,
@@ -1653,7 +1724,10 @@ with a textured `PlateSample`:
 `test_a_dry_run_refuses_to_measure`;
 `test_reuse_copies_a_done_calibration_and_says_so` (also in a dry run);
 `test_reuse_refuses_another_profile_objective_or_shape`;
-`test_a_misreported_pixel_size_is_logged`.
+`test_a_misreported_pixel_size_is_logged`; and for #408
+`test_a_frame_with_no_signal_is_refused_before_any_move_and_the_light_path_is_named`,
+`test_a_probe_frame_with_no_signal_is_refused_after_the_return_not_blamed_on_the_stage`,
+`test_a_fallback_step_of_a_few_pixels_is_named_with_a_suggested_step`.
 
 **Failure modes**: FM-88, FM-64, FM-73, FM-75 (casts), FM-104 (finite
 pixel size), FM-85 (wait before the start is read; readbacks after the

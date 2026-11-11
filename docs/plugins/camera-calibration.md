@@ -22,6 +22,12 @@ the plugin measures how well the frames agree *after* aligning them and refuses 
 weak one (`the frames barely correlate: find a field with texture`). An
 out-of-focus field fails the same way.
 
+**With the light on and the light path on the camera**: a frame with no light on
+it is the camera's black level and its fixed pattern, and that pattern correlates
+well with itself, so the stage would be blamed for an image that never changed.
+The plugin looks at the reference frame first, **before anything moves**, and
+refuses one that is dark or flat (below).
+
 It moves the XY stage by a quarter of the smaller side of the frame and back
 (about 100 µm on the Ti2-E at 40×, from the datasheet's pixel size, which is
 assumed). Check that the plate or the dish can move that far, and that the
@@ -46,8 +52,9 @@ The sequence is a reference frame, a move in +X, a frame, a move in +Y, a frame,
 the return to the start, and a last frame that checks the return. Progress is
 `1/3 +X probe`, `2/3 +Y probe`, `3/3 return`. The reference frame is checked
 before anything moves: it must be one 2-D grey frame of the size the camera
-reports, with no `nan` in it. A colour mode (`(height, width, 3)`) or another
-region than the camera reports is refused there, with `nothing was moved`.
+reports, with no `nan` in it, and with light on it. A colour mode (`(height,
+width, 3)`) or another region than the camera reports is refused there, with
+`nothing was moved`, and so is a dark or flat frame (below).
 
 The demo devices cannot be calibrated: the demo camera ignores the stage, so both
 probes see no motion and the plugin says so (the tests use the synthetic plate of
@@ -63,12 +70,42 @@ camera-calibration: 1/3 +X probe
 
 A stage that ran and could not produce a usable result ends the record `failed`
 with the reason, and **fills no slot**: a reader never finds a matrix it should
-not trust. The reason says which of three things went wrong:
+not trust. The reason says which of five things went wrong (six texts: the first
+is told two ways). The first ones are about the light and come before any
+judgement of the shifts:
+
+- `the camera's frame is dark or flat (the 1st to 99th percentile spans 11
+  counts, under 50): is the light on and the light path on the camera? nothing
+  was moved`: the reference frame has no light on it (the light path on the
+  eyepiece, the lamp or its shutter off). It is judged first, so the stage did
+  not move. The number is how many counts the middle 98 % of the frame spans; the
+  Prime 95B's dark frame spans 11 and the dimmest lit frame measured at the stand
+  177 (the floor, 50 at 16 bits, is in between; it is smaller for a camera in a
+  shallower mode, 3.125 at 12 bits, which reads fewer counts for the same light).
+  The 1st to 99th percentile and not the range, because one hot pixel makes a
+  dark frame's range as wide as a lit one's. **A sparse field passes**: a few
+  beads or cells on a dark background fill under 1 % of the frame, so the
+  percentiles read it as dark, and a frame also carries light when at least 0.01 %
+  of its pixels (20 of a 384 x 512 frame, 199 of 1412 x 1412) lie the floor or
+  more from its median; a handful of hot pixels is far below that.
+- `the camera's frame is saturated (...): lower the exposure or the light; nothing
+  was moved`: the same refusal for a frame at full scale (65535 at 16 bits): the
+  remedy is the opposite one.
+- `the frame after the +X probe is dark or flat (...): did the light go off, or
+  did the step of 96 µm leave the lit sample? the stage was sent back to its
+  start`: the reference had light and a probe frame did not. The stage did move
+  and the return was sent (it runs before the frames are judged; where it landed
+  is not read), so the cause is the light, or a probe that left the lit sample
+  (the black plastic between wells): give a smaller `step_um`. The first such probe
+  is named.
+
+The other three are what the shifts of frames with light say:
 
 - `the frames barely correlate: find a field with texture`: nothing to lock onto.
+  A field with light and no texture (a blank well) is this one, not a dark frame.
 - `the two moves gave parallel shifts: did the stage move?`: the image did not
   follow the stage on one axis (a stage that ignored the command, the wrong
-  camera, a blocked light path).
+  camera). It follows frames that carry light: a dark one is named above.
 - `the shifts do not fit a rigid camera: did each axis move its full command?`:
   the frames agree, but the matrix they give is not a camera, because one axis
   executed a fraction of its command (about a quarter or less of it: a quarter
@@ -77,7 +114,7 @@ not trust. The reason says which of three things went wrong:
   little noise (a limit that clamped it, a stage that stopped short). Check the
   stage's travel on that axis, then run it again.
 
-Each is followed by `step <n> µm`, and by `a step over 40 % of the field may
+Each of these three is followed by `step <n> µm`, and by `a step over 40 % of the field may
 wrap: give a smaller step_um` when the step was the 50 µm fallback or more than
 40 % of the smaller side. Phase correlation reports each axis's shift in
 `[-N/2, N/2)`, so content moved by 200 rows of a 384-row frame reads -184: a step
@@ -116,11 +153,27 @@ The slot `camera-calibration` holds a `CameraCalibration`
 | `assumed` | What it rests on that was not measured: see below. |
 
 `assumed` can hold: `step of 50 µm: no pixel size was known` and `step capped at
-2000 µm: ...` (probe distances, not results); `the return could not be checked:
+2000 µm: ...` (probe distances, not results); `step of 50 µm fits poorly (18 px,
+under a tenth of the 1412 px frame; residual 10.7 µm, 21 % of the step): run again
+with step_um=970` (the next paragraph); `the return could not be checked:
 the frame after it did not correlate (<r>)`; `the stage came back <n> µm off: its
 repeatability limits the scan's stitching` (reported, not refused: above the
 larger of 2 µm and four pixels); `camera calibration reused from <path>, measured
 <time>`.
+
+**A probe that fits poorly is named, not refused** (F6, Ti2-E session 3). At the
+4x, with no pixel size in the profile, the 50 µm fallback is 18 px of a 1412 px
+frame, and the fit gave 2.745 µm per pixel, 177.8° and a residual of 10.7 µm
+(21 % of the step); with `step_um=900` the same stand gave 2.739 µm, 177.4° and
+0.9 µm. The line is added when the step, at the **measured** pixel size, is under
+a tenth of the frame's smaller side (141 px on the Prime 95B), or when the
+residual is over 5 % of the step (the three good fits of that session: 0.1 to
+0.5 %). The step to run again with is a quarter of the smaller side at the
+measured pixel size, to two figures and at most 2000 µm, and is left out when it
+is not larger than the step used (a residual that is large at a quarter of the
+field is not cured by the same probe). A stand whose profile has the pixel sizes
+(#401) never takes the fallback; the line also names a `step_um` you gave that is
+a few pixels.
 
 ### A `done` calibration is not a proof
 
@@ -145,7 +198,8 @@ plan as measured. Read the numbers before you trust them:
   with what you expect (the objective's and the camera's nominal size) and with
   the pixel-size WARNING below; on a periodic target give a `step_um` under half
   the period.
-- **A step of a few pixels** gives a result of poor precision, not an error.
+- **A step of a few pixels** gives a result of poor precision, not an error: it
+  is named in `assumed`, with the step to run again with (above).
 
 These checks are not made for you yet: whether a uniform scale error or a
 periodic target should be refused, and against what, waits for the data of the
@@ -228,3 +282,12 @@ Nothing in this page was measured on a microscope. The pixel size at 40× on the
 Ti2-E (0.275 µm per pixel is the datasheet's, assumed), the rotation and mirror of
 its camera, and the stage's repeatability are for the first hardware session
 (#198).
+
+The two checks of #408 were built from frames and fits the Ti2-E gave in sessions
+2 and 3 (the Prime 95B only), and run on the synthetic plate: the dark-or-flat
+floor of 50 counts, the tenth of the frame and the 5 % of the step. **Not run at a
+stand**: the refusal with the light path on the eyepiece, the line at the 4x with
+no pixel size in the profile (it should suggest about 970 µm), and the floor on
+the camera's other modes (binning, gain, a 12-bit mode: the floor follows the
+bit depth the camera reports, and no 12-bit frame was measured). A dark frame
+whose spread is above the floor, or a lit one under it, is a number to bring back.

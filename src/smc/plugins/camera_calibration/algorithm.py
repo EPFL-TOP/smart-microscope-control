@@ -38,12 +38,20 @@ from smc.plugins.geometry import Matrix2
 __all__ = [
     "DEFAULT_STEP_FRACTION",
     "FALLBACK_STEP_UM",
+    "MAX_RESIDUAL_SHARE",
+    "MIN_FEATURE_FRACTION",
     "MIN_RESPONSE",
+    "MIN_SIGNAL_SPREAD_COUNTS",
+    "SMALL_STEP_FRACTION",
     "UPSAMPLE",
     "Fit",
     "Shift",
+    "carries_signal",
     "fit",
     "measure_shift",
+    "precision_reasons",
+    "signal_floor_counts",
+    "signal_spread",
 ]
 
 #: Sub-pixel refinement of the correlation peak: 1 / 10 of a pixel, far below
@@ -56,6 +64,26 @@ MIN_RESPONSE = 0.05
 DEFAULT_STEP_FRACTION = 0.25
 #: The probe distance when no pixel size is known (a probe, not a result).
 FALLBACK_STEP_UM = 50.0
+#: A frame whose 1st-to-99th percentile spans fewer counts than this carries no
+#: light: it is dark or flat, and no probe of it can be judged. Measured on the
+#: Prime 95B (16-bit): its two dark frames of session 2 span 11 counts (std 2.3,
+#: mean 100.5), the dimmest of 200 lit frames spans 177, and one stuck pixel
+#: makes a dark frame's ``max - min`` 65000, which is why it is the percentiles.
+#: A ratio to the noise cannot tell a dark frame from a lit blank one (both read
+#: about 5), so the floor is in counts, for a 16-bit camera.
+MIN_SIGNAL_SPREAD_COUNTS = 50.0
+#: A frame also carries signal when this fraction of its pixels lies at least the
+#: floor away from its median: a few beads on a dark background cover 0.08 to
+#: 0.4 % of the frame, where a dark frame has none (the two real ones: 0 pixels
+#: of 2 million) and a hot pixel is one in a million.
+MIN_FEATURE_FRACTION = 1e-4
+#: A probe under this fraction of the frame's smaller side is a few pixels, and
+#: a few pixels fit poorly: 50 µm at the 4x is 18 px of 1412 (1.3 %), where the
+#: good fits of the same session were 311 to 362 px (22 to 26 %).
+SMALL_STEP_FRACTION = 0.1
+#: A fit whose residual is more than this share of its probe is poorly measured:
+#: 21 % at 18 px, against 0.1 to 0.5 % for the three good fits of session 3.
+MAX_RESIDUAL_SHARE = 0.05
 
 #: Fewer overlapping pixels than this on an axis say nothing about agreement.
 _MIN_OVERLAP_PX = 8
@@ -221,6 +249,92 @@ def fit(
         worst * max(height, width) / 2.0,
         tuple(notes),
     )
+
+
+def signal_spread(frame: npt.NDArray[Any]) -> float:
+    """How many counts the middle 98 % of the frame spans: the 99th percentile minus the 1st.
+
+    A frame with no light on the camera (the light path on the eyepiece, a
+    closed shutter) is the camera's black level and its fixed pattern, and that
+    pattern correlates well at a zero shift: the calibration then measures two
+    shifts of zero and blames the stage (F8, Ti2-E session 3). The spread tells
+    such a frame from one with a sample before anything moves. Percentiles, not
+    ``max - min``: a hot or stuck pixel makes the range of a dark frame as wide
+    as a lit one's.
+
+    Raises:
+        ValueError: The frame is not 2-D or holds a value that is not finite.
+    """
+    array = _as_frame(frame, "camera")
+    low, high = np.percentile(array, (1.0, 99.0))
+    return float(high - low)
+
+
+def signal_floor_counts(bit_depth: int = 16) -> float:
+    """``MIN_SIGNAL_SPREAD_COUNTS`` for a camera of this bit depth: 50 at 16 bits, 3.125 at 12.
+
+    The floor was measured on a 16-bit camera. A shallower one (a 12-bit mode of
+    the same Prime 95B) gives counts 16 times smaller for the same light, so a
+    lit frame would read under the 16-bit floor and be refused as dark: the
+    floor is scaled down with the depth, which can only let a dark frame through
+    (the old behaviour), never refuse a lit one. A depth above 16 is 16.
+    """
+    bits = min(max(int(bit_depth), 1), 16)
+    return MIN_SIGNAL_SPREAD_COUNTS * 2.0 ** (bits - 16)
+
+
+def carries_signal(frame: npt.NDArray[Any], bit_depth: int = 16) -> bool:
+    """Whether the frame has light on it: it is not dark or flat.
+
+    Two ways to carry signal, the single decision of every caller (a boundary
+    tested here is the boundary of the plugin):
+
+    * the 1st to 99th percentile spans at least ``signal_floor_counts``, which is
+      any frame with a sample that fills a few percent of the field;
+    * at least ``MIN_FEATURE_FRACTION`` of the pixels lie that far from the
+      median: a **sparse** field (a few fluorescent beads or cells on a dark
+      background) covers under 1 % of the pixels, so its percentiles read as
+      dark, and a handful of isolated hot pixels is far below that fraction.
+
+    Both are positive tests (``>=``), so that a number that is not one is not
+    taken for signal.
+
+    Raises:
+        ValueError: The frame is not 2-D or holds a value that is not finite.
+    """
+    floor = signal_floor_counts(bit_depth)
+    if signal_spread(frame) >= floor:
+        return True
+    array = _as_frame(frame, "camera")
+    far = int(np.count_nonzero(np.abs(array - np.median(array)) >= floor))
+    return far >= MIN_FEATURE_FRACTION * array.size
+
+
+def precision_reasons(
+    fitted: Fit, step_um: float, image_shape_px: tuple[int, int]
+) -> tuple[str, ...]:
+    """Why the probe was too short for its fit, one text per reason; none for a good fit.
+
+    A probe of a few pixels gives a result of poor precision, not an error: 50 µm
+    at the 4x is 18 px, and the fit had a residual of 10.7 µm (21 % of the step)
+    where the 900 µm probe, 329 px, had 0.9 µm. The step is judged in pixels at
+    the **measured** pixel size (the fallback step is a guess, so the stand's own
+    value cannot size it), against the smaller side of the frame (a rotated
+    camera puts the X probe on either axis, §4.1), and the residual against the
+    step. The fit is never refused for these: they are reasons to measure again.
+    """
+    reasons: list[str] = []
+    side = min(image_shape_px)
+    step_px = step_um / fitted.pixel_size_um
+    if step_px < SMALL_STEP_FRACTION * side:
+        reasons.append(f"{step_px:.0f} px, under a tenth of the {side} px frame")
+    # `not <=`: a residual that is nan is a reason, not a pass.
+    if not fitted.residual_um <= MAX_RESIDUAL_SHARE * step_um:
+        share = 100.0 * fitted.residual_um / step_um
+        reasons.append(
+            f"residual {fitted.residual_um:.1f} µm, {share:.0f} % of the step"
+        )
+    return tuple(reasons)
 
 
 def _as_frame(frame: npt.NDArray[Any], name: str) -> npt.NDArray[np.float64]:
