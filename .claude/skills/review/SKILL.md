@@ -87,6 +87,19 @@ a verdict, do what it unlocks (labels, dependents), and end the session.
    complete revised one (edit it in place, see `/plan`): the fix round and
    its adversarial reviewers read the plan, not the review (#54).
 
+## In a lane
+
+When `/lane` runs this skill (its brief says so), you are a **subagent** in
+your own worktree (`isolation: "worktree"`), fresh, with only the PR number:
+judge it from `CLAUDE.md`, the issue's plan and report and the PR, never from
+anything a develop session told the lane. You cannot ask the owner anything:
+where this skill would ask, stop and say what you need. For `/ui-check` (an
+`area: ui` PR), check the PR out in your own worktree: `git fetch origin
+<branch>` (a worktree session may refuse the `git -c url…insteadOf` form: write
+the https URL out), `git switch --detach FETCH_HEAD` or `origin/<branch>`,
+`python scripts/dev/worktree.py setup`. The develop session's worktree holds
+the branch, so you cannot check it out by name.
+
 ## Never
 
 - Merge. Rewrite the PR yourself. Give a ready verdict with red CI.

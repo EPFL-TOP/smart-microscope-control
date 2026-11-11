@@ -28,7 +28,8 @@ them if it is not the one you run on.
 2. Read the design-doc sections and ADRs the plan names, the failure modes
    it lists (`docs/design/failure-modes.md`), and the code you will touch.
 3. `Depends on`: if a dependency is not merged into `main`, stop and say so
-   on the issue.
+   on the issue. A design PR the plan opened is named on its **Ready for
+   /develop** line (`blocked by #<pr>`): it counts as a dependency too.
 4. Comment `Starting — <scope in three lines>`; set `status: in-progress`
    (remove `status: ready`).
 
@@ -205,6 +206,39 @@ When the latest `## Review` on the PR says **Verdict: changes requested**:
    the Report (`point.py` lists it when the PR merges). Mark the PR ready
    again (`gh pr ready N`: `/review` turned it into a draft). Set the issue to
    `status: in-review`. Call `ExitWorktree` with `action: "keep"`. Stop.
+
+## In a lane
+
+When `/lane` runs this skill (its brief says so), you are a **subagent** with
+`isolation: "worktree"`: you start in `.claude/worktrees/agent-<id>`, on a
+branch `worktree-agent-<id>`, at the main checkout's *local* `HEAD` (it can
+lag `origin/main`), with no `.venv`, and `EnterWorktree` and `ExitWorktree`
+are refused. You cannot ask the owner anything: where this skill would ask,
+stop and say what you need.
+
+- **Isolate** (step 5): skip `EnterWorktree`. Run `git branch -m
+  <type>/<N>-<slug>`, then step 5's fetch and `git merge --ff-only
+  origin/main`, then `python scripts/dev/worktree.py setup`. If the
+  fast-forward fails, `git status --porcelain` and `git log origin/main..HEAD`
+  must both print nothing (a fresh worktree): then `git reset --hard
+  origin/main`; otherwise stop and say so. A worktree session may refuse the
+  `git -c url…insteadOf` form of the SSH workaround: write the https URL out
+  (`git fetch https://github.com/<owner>/<repo>.git main`, then `git merge
+  --ff-only FETCH_HEAD`).
+- **CI** (step 13): do not rely on a background wait, a subagent is not woken
+  by one. Open the PR, read `gh pr checks N` once, and say in the Report that
+  the checks were running; the lane waits for them itself and stops for the
+  owner when they are red.
+- **Step 15**: no `ExitWorktree`; the harness keeps a worktree that holds
+  commits.
+- **Addressing a review**: the first develop's worktree holds the PR's
+  branch, and git refuses to check a branch out twice. Find that worktree
+  (`git worktree list --porcelain`), remove it with `git worktree remove
+  <path>` (never `--force`: git refuses a dirty or locked one, and then you
+  stop and say so), then `git switch <branch>`, `git pull --ff-only` (the
+  SSH workaround above), `python scripts/dev/worktree.py setup`, and go on
+  with *Addressing a review* from its step 2. Its last step has no
+  `ExitWorktree` either.
 
 ## Never
 
