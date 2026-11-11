@@ -2043,9 +2043,14 @@ class PlatePageView:
             running is not None and not live
         )
         self.snap_note.object = lacks or ""
-        # A turn on a registered plate is a run (m5 §16 D4): offered when one can start.
-        # The controller refuses it all the same when the select is not (FM-169).
-        self.orientation_select.disabled = running is not None and not live
+        # A turn on a registered plate is a run (m5 §16 D4): offered when one can start,
+        # so not while Live goes either, as every Run. On an estimate it runs nothing and
+        # stays offered beside Live. The controller refuses a run all the same when the
+        # select is not disabled (FM-169).
+        kind = None if self._view is None else self._view.pose.kind
+        self.orientation_select.disabled = running is not None and (
+            not live or kind in ("registered", "seed")
+        )
 
     def _draw_plate_ask(self) -> None:
         """The note and the button that ask which plate is on the stage, visible only while nothing named it (m5 §11.3).

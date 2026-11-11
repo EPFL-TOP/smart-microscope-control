@@ -527,6 +527,24 @@ def test_captures_are_restored_through_a_turn_after_a_restart(
     finally:
         page.close()
 
+    # Turned back: the latest turn read the same fit and says its orientation, so the
+    # fit's names stand (a rename here would name every capture 180° off).
+    _record(
+        run_doc,
+        "plate-orientation",
+        _fit(),
+        minute=2,
+        params={"orientation": "not-turned"},
+        reads=read,
+    )
+    page = _page(stand, run_doc)
+    try:
+        assert [r.well for r in page.refs] == ["B3", "H12"]
+        assert [w.well for w in page.walls] == ["B3"]
+        assert page.orientation == "not-turned"
+    finally:
+        page.close()
+
     # A fit run again since the turn read it is no source: no captures, as today.
     _registered(run_doc, _fit(), refs=REFS[:1], minute=3)
     _record(
@@ -541,6 +559,103 @@ def test_captures_are_restored_through_a_turn_after_a_restart(
     try:
         assert page.refs == ()
         assert page.walls == ()
+    finally:
+        page.close()
+
+
+def test_a_failed_turn_keeps_the_plate_and_the_captures_of_the_fit_it_read(
+    stand: Microscope, run_doc: Path
+) -> None:
+    # A plate that is not the page's placeholder (96-well): a failed turn has no
+    # result and no `plate` parameter, and the page must not fall back to the
+    # placeholder and drop the captures with it.
+    refs = (
+        WellRef(well="B3", x_um=19_000.0, y_um=-19_000.0),
+        WellRef(well="C4", x_um=38_000.0, y_um=-38_000.0),
+    )
+    _registered(run_doc, _fit("24-well"), refs=refs)
+    _record(
+        run_doc,
+        "plate-orientation",
+        None,
+        minute=1,
+        status=StageStatus.failed,
+        params={"orientation": "turned-180"},
+        reads={"plate": ReadRecord(plugin="plate-registration", attempt="a0")},
+    )
+    page = _page(stand, run_doc)
+    try:
+        assert page.plate == "24-well"
+        assert page.plate_chosen
+        assert [r.well for r in page.refs] == ["B3", "C4"]
+    finally:
+        page.close()
+
+
+def test_a_seed_declared_turned_shows_its_orientation(
+    stand: Microscope, run_doc: Path
+) -> None:
+    # One centre, registered turned (a seed): the pose and the select say turned, and
+    # A1's corner is the stand's front right (m5 §16 D4, D8).
+    seed = PlateResult(
+        plate="96-well",
+        a1_center_xy_um=(1000.0, -500.0),
+        rotation_deg=180.0,
+        method="seed",
+        residual_um=None,
+        scale_error=None,
+        n_refs=1,
+        refs=(WellRef(well="G10", x_um=1000.0, y_um=-500.0),),
+        orientation="turned-180",
+    )
+    _registered(run_doc, seed)
+    page = _page(stand, run_doc)
+    try:
+        view = page.view()
+        assert view.pose.kind == "seed"
+        assert view.orientation == view.pose.orientation == "turned-180"
+        assert view.pose.a1_corner == "the front right"
+    finally:
+        page.close()
+
+
+def test_an_unplaced_map_keeps_the_declared_orientation(
+    fake_core: FakeCore, run_doc: Path
+) -> None:
+    # A stand that does not say where its plate lies (no holder centre): the map stays
+    # unplaced, but the choice stands, for the select and for the next fit.
+    microscope = Microscope.from_core(cast("CMMCorePlus", fake_core), Profile.demo())
+    page = PlatePage(microscope, run_doc, entry_points=_entry_points(*PLATE_TOOLS))
+    try:
+        page.choose_plate("96-well")
+        page.choose_orientation("turned-180")
+        view = page.view()
+        assert view.pose.kind == "unplaced"
+        assert view.orientation == "turned-180"
+        assert page.page_params("plate-finding") == ["orientation=turned-180"]
+    finally:
+        page.close()
+        microscope.close()
+
+
+def test_a_tool_run_after_a_terminal_turn_is_given_the_turned_orientation(
+    stand: Microscope, run_doc: Path
+) -> None:
+    # The click reads the run document (`goto`'s rule): a turn written since the last
+    # view is the one the next fit is given, with no view in between.
+    _registered(run_doc, _fit())
+    page = _page(stand, run_doc, *PLATE_TOOLS)
+    try:
+        page.view()
+        _record(
+            run_doc,
+            "plate-orientation",
+            _fit(rotation_deg=-179.7, orientation="turned-180"),
+            minute=1,
+            params={"orientation": "turned-180"},
+            reads={"plate": ReadRecord(plugin="plate-registration", attempt="a0")},
+        )
+        assert page.page_params("plate-finding") == ["orientation=turned-180"]
     finally:
         page.close()
 

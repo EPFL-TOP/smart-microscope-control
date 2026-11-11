@@ -8,7 +8,9 @@ minus 5.5 by 3.5 pitches), never read back from the code under test.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -19,7 +21,7 @@ from pymmcore_plus import CMMCorePlus
 from smc.hardware import Microscope
 from smc.hardware.profile import HolderSection, Profile
 from smc.testing import FakeCore
-from smc.ui.controller import PlatePage
+from smc.ui.controller import MapPose, PlatePage
 from smc.ui.guide import ORIENTATION_IN_STAGE_TERMS
 from smc.ui.plate_page import PlatePageView
 
@@ -199,3 +201,29 @@ def test_the_select_is_disabled_while_an_activity_goes(
     view._running = None
     view._draw_buttons()
     assert not view.orientation_select.disabled
+
+
+def test_while_live_goes_the_select_follows_the_run_buttons_on_a_registered_map(
+    make_view: Any,
+) -> None:
+    # The operator checks the cross against the plate with Live on. On an estimate the
+    # switch runs nothing and stays offered; on a registered plate it is a run, which
+    # Live refuses as it refuses every Run (m5 §16 D4).
+    view = make_view()
+    page = view.page
+    event = threading.Event()
+    page._live_event = event
+    page._current_run = ("live", event)
+    try:
+        assert page.is_live
+        view._running = "live"
+        view._draw_buttons()
+        assert view._view.pose.kind == "estimated"
+        assert not view.orientation_select.disabled
+        view._view = replace(view._view, pose=MapPose("registered"))
+        view._draw_buttons()
+        assert view.orientation_select.disabled
+        assert all(button.disabled for button in view.tool_runs.values())
+    finally:
+        page._current_run = None
+        page._live_event = None

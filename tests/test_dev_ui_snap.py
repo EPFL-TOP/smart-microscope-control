@@ -994,6 +994,7 @@ def test_the_turned_state_picks_the_selects_turned_label_and_waits_for_the_outco
         " A1 at the back left ",
         "Turned 180\N{DEGREE SIGN}: A1 at the front right",
     ]
+    assert snap.ACTIONS["turned"] is snap._act_turned
     snap._act_turned(page, _no_chain())
     page.get_by_label.assert_called_once_with("Plate lies", exact=True)
     select.select_option.assert_called_once_with(

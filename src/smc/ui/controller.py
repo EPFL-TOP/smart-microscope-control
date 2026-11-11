@@ -3815,6 +3815,19 @@ class PlatePage:
             return str(found.plate)
         if record.plugin in _PLATE_PARAM_PLUGINS:
             return self._plate_of(record)
+        if record.plugin == "plate-orientation":
+            # A turn has no `plate` parameter: the plate is the fit's it read. One that
+            # failed opened the page on the placeholder and dropped the fit's captures
+            # (adversarial review of #422).
+            read = record.reads.get("plate")
+            fit = None if read is None else doc.stages.get(read.plugin)
+            if (
+                fit is not None
+                and read is not None
+                and fit.attempt == read.attempt
+                and fit.plugin in _PLATE_PARAM_PLUGINS
+            ):
+                return self._plate_of(fit)
         return None
 
     @staticmethod
