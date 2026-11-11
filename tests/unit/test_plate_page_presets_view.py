@@ -318,20 +318,23 @@ def _field(view: PlatePageView, tool: str, key: str) -> Any:
 # --- the region ---------------------------------------------------------------------
 
 
-def test_the_preset_region_heads_the_right_column(
+def test_the_preset_region_heads_the_expert_view_and_the_stand_screen(
     make_page: Callable[..., PlatePage],
 ) -> None:
     view = PlatePageView(make_page())
 
-    _left, right = view.layout[-1]
-    region = right[0]
+    # The first thing the expert view shows, and on the Stand screen after its title,
+    # its lead and the next step: the same column, one instance (m5 §17.2 D5).
+    expert = view.screens["expert"]
+    region = expert[0]
+    assert region in view.screens["stand"]
     assert region[0].object == "Preset"
     assert list(region[1]) == [view.preset_select, view.preset_load_button]
     assert list(region[2]) == [view.preset_name, view.preset_save_button]
     assert region[3] is view.preset_confirm
     assert region[4] is view.preset_note
     # Above the next step, and the first thing the column shows.
-    assert right[1][0].object == "Next step"
+    assert expert[1][0].object == "Next step"
     # Spelled `label=` (FM-147) and every one there from the start.
     assert view.preset_select.name == "Preset"
     assert view.preset_load_button.name == "Load"

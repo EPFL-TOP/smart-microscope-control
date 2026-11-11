@@ -90,9 +90,16 @@ def _close(a: tuple[float, float], b: tuple[float, float]) -> bool:
 
 def test_the_orientation_select_is_next_to_the_plate_menu(make_view: Any) -> None:
     view = make_view()
-    rows = [row for row in view.layout.select(pn.Row) if view.plate_select in row]
-    assert len(rows) == 1
-    assert list(rows[0])[:2] == [view.plate_select, view.orientation_select]
+    # The Plate screen's controls (the expert view lists the same column): the menu, and
+    # right after it the select of the way the plate lies.
+    columns = [
+        item
+        for item in view.screens["plate"]
+        if isinstance(item, pn.Column) and view.plate_select in item
+    ]
+    assert len(columns) == 1
+    assert list(columns[0])[:2] == [view.plate_select, view.orientation_select]
+    assert columns[0] in view.screens["expert"]
     select = view.orientation_select
     assert select.name == "Plate lies"
     # The Ti2-E's words: +Y is the back and +X the operator's right.
