@@ -14,6 +14,7 @@ does not lock and a light whose readback disagrees say so, with ``reached`` fals
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -215,14 +216,66 @@ def _z_clause(before: float | None, after: float | None) -> str:
     return ""
 
 
+@dataclass(frozen=True, slots=True)
+class _OffsetRead:
+    """One read of the autofocus offset: its value, or why there is none.
+
+    ``cause`` is the failure's text on one line, kept as text and never as the
+    exception (FM-98); the layer logs nothing for this read, so the text is the
+    only place the cause reaches the operator (FM-170).
+    """
+
+    value: float | None
+    cause: str = ""
+
+
+def _read_offset(autofocus: Autofocus) -> _OffsetRead:
+    """The offset now, or why it could not be read: a turn that was sent is not undone by it.
+
+    Only ``HardwareError`` counts as a failed read, as in ``_read_z``. An empty
+    message falls back to the class name, so the clause never ends in ``()``.
+    """
+    try:
+        return _OffsetRead(float(autofocus.offset_native()))
+    except HardwareError as exc:
+        return _OffsetRead(None, " ".join(str(exc).split()) or type(exc).__name__)
+
+
+def _offset_clause(
+    autofocus: Autofocus, before: _OffsetRead, after: _OffsetRead
+) -> str:
+    """What the text says about the offset across a turn: a change, nothing, or why it was not read.
+
+    The offset is in the device's own units and is compared exactly: no
+    tolerance can be given without a measurement, and a device that holds an
+    offset reads it back identically (m2 §8.11 D8). It says what was read, not
+    why: that the value is the stand's for this objective is an inference.
+    When both reads failed the first cause is the one named.
+    """
+    if before.value is None or after.value is None:
+        cause = before.cause if before.value is None else after.cause
+        return f"; the autofocus offset could not be read around the turn ({cause})"
+    # ``nan != nan``: two reads of the same unreadable number are no change.
+    same = before.value == after.value or (
+        math.isnan(before.value) and math.isnan(after.value)
+    )
+    if same:
+        return ""
+    return (
+        f"; the autofocus offset went from {before.value:g} to "
+        f"{_offset_text(autofocus, after.value)}"
+    )
+
+
 def set_objective(microscope: Microscope, label: str, *, confirm: bool) -> DriveResult:
     """Turn the turret to ``label``; the label it reads afterwards (FM-14, FM-125).
 
     The facade checks the confirmation first, then the label, so a refused turn
-    sends nothing. Z is read before the turn, as a read, and again after it (the
-    turret waits until Z is still): the Ti2-E moves Z during a turn, so the text
-    says what the stand did to it (m2 §8.11 D7). A stand with no focus drive, and
-    a dry run, say nothing about Z.
+    sends nothing. Z and the autofocus offset are read before the turn, as
+    reads, and again after it (the turret waits until Z is still): the Ti2-E
+    moves Z during a turn and puts an offset of its own in place, so the text
+    says what the stand did to them (m2 §8.11 D7, D8). A stand with no focus
+    drive or no autofocus, and a dry run, say nothing about Z or the offset.
 
     Raises:
         CapabilityMissingError: The stand has no objective turret.
@@ -232,20 +285,24 @@ def set_objective(microscope: Microscope, label: str, *, confirm: bool) -> Drive
     """
     turret = microscope.require(ObjectiveTurret)
     zstage = None if microscope.dry_run else microscope.get(ZStage)
-    before = None if zstage is None else _read_z(zstage)
+    autofocus = None if microscope.dry_run else microscope.get(Autofocus)
+    z_before = None if zstage is None else _read_z(zstage)
+    offset_before = None if autofocus is None else _read_offset(autofocus)
     turret.select(label, confirm=confirm)
     current = turret.current()
     if microscope.dry_run:
         return DriveResult(
             f"[dry-run] would turn to {label!r}; the turret is at {current!r}"
         )
-    z_clause = "" if zstage is None else _z_clause(before, _read_z(zstage))
+    clauses = "" if zstage is None else _z_clause(z_before, _read_z(zstage))
+    if autofocus is not None and offset_before is not None:
+        clauses += _offset_clause(autofocus, offset_before, _read_offset(autofocus))
     if current != label:
         return DriveResult(
-            f"objective {current!r}, although {label!r} was asked{z_clause}",
+            f"objective {current!r}, although {label!r} was asked{clauses}",
             reached=False,
         )
-    return DriveResult(f"objective {current!r}{z_clause}")
+    return DriveResult(f"objective {current!r}{clauses}")
 
 
 def read_autofocus(microscope: Microscope) -> AutofocusReading:
@@ -318,22 +375,62 @@ def _offset_text(autofocus: Autofocus, value: float) -> str:
     return f"{value:g} {autofocus.offset_unit() or 'device units'}"
 
 
+def _outside_clause(
+    value: float, limits: tuple[float, float], *, declared: bool
+) -> str:
+    """What the text says of an offset outside the soft limits; nothing for one inside or not finite.
+
+    The limits bound smc's writes and never the stand's (a turn restores an
+    offset, the knob under lock moves it), so a value outside them is the
+    stand's own, and the text says so (m2 §12.10.6). The bounds themselves are
+    inside, and a value that is not finite lies on no side. Above, a declared
+    stand adds what that means there: an engage needs an offset read locked
+    with this objective, and the stand's own button drives Z to the plane the
+    offset names. Below, only the first clause: what a value under the floor
+    means on the stand is not known (#364), so the text claims what is certain.
+    """
+    if not math.isfinite(value):
+        return ""
+    if value < limits[0]:
+        return ": below them; smc would not set an offset there"
+    if value > limits[1]:
+        text = ": above them; smc would not set an offset there"
+        if declared:
+            text += (
+                ", and here it engages only at an offset it has read locked with this "
+                "objective (m2 §12.2 D1), and the stand's own button would drive Z to "
+                "the plane this offset names (m2 §12.1)"
+            )
+        return text
+    return ""
+
+
 def read_autofocus_offset(microscope: Microscope) -> DriveResult:
     """The autofocus offset and its soft limits, whose lower bound is a first lock's floor (m2 §12.10).
 
-    Reads only: ``smc autofocus offset`` with no option.
+    Reads only: ``smc autofocus offset`` with no option. An offset outside the
+    soft limits is said to be, with what that means on this stand; the read
+    still worked, so ``reached`` stays true.
 
     Raises:
         CapabilityMissingError: The stand has no autofocus.
     """
     autofocus = microscope.require(Autofocus)
-    here = _offset_text(autofocus, autofocus.offset_native())
+    value = autofocus.offset_native()
+    here = _offset_text(autofocus, value)
     limits = autofocus.offset_limits_native()
     if limits is None:
         return DriveResult(
             f"offset {here}, no soft limits in the profile (no floor: no first lock)"
         )
-    return DriveResult(f"offset {here}, soft limits [{limits[0]:g}, {limits[1]:g}]")
+    outside = _outside_clause(
+        value,
+        limits,
+        declared=microscope.profile.autofocus.engage_drives_z_to_offset,
+    )
+    return DriveResult(
+        f"offset {here}, soft limits [{limits[0]:g}, {limits[1]:g}]{outside}"
+    )
 
 
 def set_autofocus_offset(microscope: Microscope, value: float | None) -> DriveResult:

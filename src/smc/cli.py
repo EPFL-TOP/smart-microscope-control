@@ -1956,7 +1956,8 @@ def objective_set(
     """Turn the turret to an objective; refused without --confirm.
 
     A turn switches an engaged autofocus off and does not engage it again: the
-    new objective's offset is not known.
+    new objective's offset is not known. The stand may change the autofocus
+    offset across a turn; the text says so.
     """
     _drive_command(
         ctx,
@@ -2032,6 +2033,8 @@ def autofocus_offset(
     sample by eye, then `smc autofocus offset --floor` (Z does not move), `smc
     autofocus engage` (Z drops away from the sample), then turn the knob with
     the autofocus on until the sample is sharp.
+
+    An offset outside the soft limits is said to be, with what that means.
     """
     if to is not None and floor:
         raise typer.BadParameter("use --to or --floor, not both")

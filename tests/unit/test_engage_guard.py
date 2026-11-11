@@ -44,7 +44,7 @@ from test_mm_autofocus import (
 )
 
 import smc.hardware.backends.mm as mm
-from smc.hardware.capabilities import XYStage
+from smc.hardware.capabilities import ObjectiveTurret, XYStage
 from smc.hardware.errors import (
     AutofocusExcursionError,
     AutofocusLostError,
@@ -1219,3 +1219,87 @@ def test_a_relock_at_a_seen_floor_is_not_a_first_lock() -> None:
         ]
         assert stand.z.position_um() == FLOOR_PLANE + 8.0
         assert stand.af.is_locked() is True
+
+
+# --- a turn forgets no seen offset, and records none (m2 §12.10.2 D7, #407) ---------
+#
+# Session 3 read an offset of the stand's own come back across a turn: 9370 at the
+# 10x, 17794 at the 40x, and the 4x leaves the number as it is. ``set_offset_on_turn``
+# is the stand's quirk; it is registered *after* ``_stand``, which turns the Nosepiece
+# to the 10x itself (a knob registered before it would fire there). The guard is
+# ``mm.py``'s and is not edited by #407: these tests pin what it already does.
+
+
+def _turn_to(stand: Stand, objective: str) -> None:
+    """Turn the nosepiece through the facade, confirmed, and clear the log."""
+    stand.microscope.require(ObjectiveTurret).select(objective, confirm=True)
+    stand.core.log.clear()
+
+
+def _the_stand_restores(stand: Stand, *, at_10x: float) -> None:
+    """The stand puts ``at_10x`` back at the 10x and 17794 at the 40x; the 4x registers nothing."""
+    stand.core.set_offset_on_turn("10x", at_10x, device="PFSOffset")
+    stand.core.set_offset_on_turn("40x", 17794.0, device="PFSOffset")
+
+
+def test_a_seen_offset_the_stand_restores_after_a_turn_away_and_back_is_still_seen() -> (
+    None
+):
+    # Seen locked at the 10x: the plane PFS held there on this sample is D1's premise,
+    # and forgetting it at every turn would make "turn away and back, then engage" a
+    # first lock again for no gain in safety.
+    with _stand(_first_lock(), offset=9370.0) as stand:
+        _the_stand_restores(stand, at_10x=9370.0)
+        _see(stand)
+        _turn_to(stand, "4x")
+        assert stand.core.getPosition("PFSOffset") == 9370.0  # the 4x leaves it
+        # At the 4x the same number is no seen offset: the seen offsets are keyed
+        # by objective.
+        with pytest.raises(SafetyRefusedError) as refused:
+            stand.af.engage()
+        assert str(refused.value) == _unseen_at(
+            9370.0, objective="4x", advice=FROM_BELOW
+        )
+        stand.af.set_offset_native(8000.0)  # the operator, PFS off: moves no Z
+        _turn_to(stand, "10x")
+        assert stand.core.getPosition("PFSOffset") == 9370.0  # put back by the stand
+
+        assert stand.af.engage() is True
+
+        assert stand.core.log == [ON]
+
+
+def test_an_offset_the_stand_restores_that_was_never_read_locked_is_refused_with_the_first_lock_advice() -> (
+    None
+):
+    with _stand(_first_lock(), offset=9370.0) as stand:
+        _the_stand_restores(stand, at_10x=9370.0)
+        _see(stand)  # 9370 is seen at the 10x, and says nothing of the 40x's
+        _turn_to(stand, "40x")
+        assert stand.core.getPosition("PFSOffset") == 17794.0
+
+        with pytest.raises(SafetyRefusedError) as refused:
+            stand.af.engage()
+
+        assert str(refused.value) == _unseen_at(
+            17794.0, objective="40x", advice=FROM_BELOW
+        )
+        assert refused.value.how_to_force == ""
+        assert stand.core.log == []
+
+
+def test_a_turn_records_no_seen_offset() -> None:
+    # 7927 was never read locked with the 10x. Turning away and back, the stand puts
+    # it back, and the turn records nothing (it switches PFS off first, so no read
+    # after it finds a lock): the offset is still unseen.
+    with _stand(_first_lock(), offset=7927.0) as stand:
+        _the_stand_restores(stand, at_10x=7927.0)
+        _turn_to(stand, "40x")
+        _turn_to(stand, "10x")
+        assert stand.core.getPosition("PFSOffset") == 7927.0
+
+        with pytest.raises(SafetyRefusedError) as refused:
+            stand.af.engage()
+
+        assert str(refused.value) == _unseen_at(7927.0, advice=FROM_BELOW)
+        assert stand.core.log == []
