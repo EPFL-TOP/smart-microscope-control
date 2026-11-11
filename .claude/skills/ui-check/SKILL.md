@@ -1,6 +1,6 @@
 ---
 name: ui-check
-description: Look at the plate page like a user does — serve it on a demo stand in dry run, drive it with headless Chromium through six states (empty, a typed well range, a snap, after density, with the route, the plate turned), and read the PNGs and summary.txt it writes. Use it on every area:ui issue, in /develop before the adversarial review and in /review of an area:ui PR; it also says how a session drives the served page through a Chrome MCP (tried once: screenshots and clicks, no page reading). Never an assertion or a baseline.
+description: Look at the plate page like a user does — serve it on a demo stand in dry run, drive it with headless Chromium at 1280 x 800 through seven states (empty, a typed well range, a snap, the expert view, after density, with the route, the plate turned), and read the PNGs and summary.txt it writes. Use it on every area:ui issue, in /develop before the adversarial review and in /review of an area:ui PR; it also says how a session drives the served page through a Chrome MCP (tried once: screenshots and clicks, no page reading). Never an assertion or a baseline.
 ---
 
 # /ui-check
@@ -49,11 +49,12 @@ the demo whose camera images no sample. Nothing else is a parameter: there is no
 | State | What the script does | Reached on |
 |---|---|---|
 | `empty` | nothing: the page as it opens, with the stand closed (#264) | both stands |
-| `wells-selected` | clicks Connect (when enabled) and waits for the strip, then types `A1:B2` in the Wells box, Enter | both |
-| `snap` | the Image tab, the Snap button | both |
-| `after-density` | runs the workflow while the page is up (`plate-registration`, `scan-plan`, `scan`, `cells`, `density`, on the demo's simulated stage), then a Snap on the Image tab (the page redraws when it ends, with the Plate tab hidden: #297) and back to the Plate tab, **no Refresh** | `demo-sample` |
-| `with-route` | `route`, then Refresh | `demo-sample` |
-| `turned` | on the Plate tab, the *Plate lies* select set to its `Turned 180°` option, then a wait for the strip's `plate-orientation done` line (m5 §16.4). Compare it with `with-route` by eye: the **same cross, other names** (the density and the route are stale after the turn, so they are gone) | `demo-sample` |
+| `wells-selected` | clicks Connect (when enabled) and waits for the strip, then the *3. Wells* step (its button is found by the name that starts with its number, `^3\. Wells`, since the label gains a `✓` when the step is done), then types `A1:B2` in the Wells box, Enter. The box's label is one match now that the step panel shows one screen, which ended #395 | both |
+| `snap` | the Snap button, always in view beside the map: no tab, and the screen does not change | both |
+| `expert` | the *Expert view* switch, a wait for its `bk-active` class (a pressed Toggle's button is `bk-btn bk-btn-light bk-active`), the photograph, then the switch off again | both (it is the fourth, so that `demo` reaches it) |
+| `after-density` | runs the workflow while the page is up (`plate-registration`, `scan-plan`, `scan`, `cells`, `density`, on the demo's simulated stage), then a Snap (the page reads the run document again when it ends: #297, **no Refresh**), then the *5. Results* step and a wait for `✓ density` in the checklist. Read the map for the **whole plate** and **plain tick labels** (−60000 to 60000, not `5.000e+4`: FM-174) | `demo-sample` |
+| `with-route` | `route`, then Refresh (in the map's header row) | `demo-sample` |
+| `turned` | the *2. Plate* step, then the *Plate lies* select set to its `Turned 180°` option (after a wait for the select: the server draws the screen), then a wait for the strip's `plate-orientation done` line (m5 §16.4). Compare it with `with-route` by eye: the **same cross, other names** (the density and the route are stale after the turn, so they are gone) | `demo-sample` |
 
 A state it cannot reach is **named, never skipped**: `<state>: not reached: <why>`,
 on stdout and in `summary.txt`. It never clicks a tool's Run button, Drive, STOP or
@@ -67,11 +68,11 @@ moves nothing.
    browser error, a server that did not stop on Ctrl-C); `1` the job could not be
    done (no browser, the server never served: its log's tail is printed); `2`
    refused. Exit 3 is "read", not "broken".
-2. **`<state>.png`**, the viewport (1600 x 1000), with the Read tool, for each
+2. **`<state>.png`**, the viewport (1280 x 800, the floor the layout is designed for: `--width` and `--height` change it), with the Read tool, for each
    state the change touches. Start here. `<state>-full.png` is the whole page and is
    shown too small to read: use it for the part below the fold only.
 3. **`summary.txt`** for what a PNG cannot give: the strip, the outcome, the
-   checklist and the result cards as text, the active tab, the Wells box, how the
+   checklist and the result cards as text, the step shown (`step:`, the button of the class `smc-step-shown`; with the expert view on, none is), what is on screen (`on screen:` says for the strip's STOP, the step bar, the map, the image and the last control of the drive bar whether each is wholly in the viewport and where), the Wells box, how the
    server stopped, the server's error lines and the browser's. The map and the image
    are **canvas**: they are in the PNGs only.
 4. **`server.log`** (the server's stdout and stderr as it wrote them) when the
@@ -90,9 +91,10 @@ would not choose) is reported as what it shows, not as a defect.
 - `wells-selected` ends exit 3 with **4 server error lines** until **#277** is fixed:
   the typed range raises in `on_select_text` (`_pending_writes should be non-None…`)
   and draws nothing. That is the script doing its job; do not work around it.
-- The tools column (`width=420`) runs past the right edge of the viewport at 1500
-  to 1700 px: the result cards are fully visible in `-full.png` only. A finding for
-  the owner, not for the change you are making.
+- At 1280 x 800 the **drive bar is under the fold** (m5 §17.3 wants it on screen; #443
+  measured its last control at y 927 to 958 with figures of 460 px and shortened them to
+  400 px, the floor): `summary.txt` says `on screen: drive bar: NO`. That is a finding
+  for the owner, not for the change you are making.
 - `snap` shows noise and the strip says `DRY RUN`: in dry run the stage does not
   move, so every frame of `demo-sample` is plastic. The chain runs *without*
   `--dry-run` on the simulated stage for that reason, and the page, which is in dry
@@ -169,8 +171,8 @@ window, Live, Drive).
 4. **It drives the page with the MCP's own tools.** What can be inspected: buttons,
    inputs, selects, tabs and the `pre` text panes, in Panel's shadow DOM (whether
    Claude in Chrome's page snapshot does not pierce it; see above). What cannot: the plate map and
-   the image are two canvases, pixels only. The tabs are not dynamic: the Snap
-   button exists while the Plate tab is shown, hidden, and the page cannot click it.
+   the image are two canvases, pixels only. There are no tabs: Snap is always in view,
+   and the step bar's buttons (`1. Stand` to `5. Results`) switch the screens.
 5. **One session on the page at a time.** The page owns the stand; a second would
    open a second one. Use a port of its own.
 

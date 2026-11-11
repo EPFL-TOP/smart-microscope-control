@@ -42,6 +42,7 @@ import panel as pn
 import useq
 from bokeh.events import Tap
 from bokeh.models import (
+    BasicTickFormatter,
     ColorBar,
     ColumnDataSource,
     HoverTool,
@@ -147,11 +148,27 @@ _Z_DIRECTIONS = {"up": 1.0, "down": -1.0}
 #: cannot show as nothing.
 NO_LABEL = "(no label)"
 
-#: The step panel's width and the two figures' height (m5 §17.3). 460 px leaves the strip,
-#: the step bar, both figures and the drive bar on a 1280 x 800 window (``/ui-check`` is
-#: the proof); a figure lower than 400 px is a deviation to report, not a fix.
+#: The step panel's width and the two figures' height (m5 §17.3). The design says 460 px so
+#: that the strip, the step bar, both figures and the drive bar are on a 1280 x 800 window;
+#: measured by ``/ui-check``, 460 leaves the whole drive bar below the fold (its last
+#: control at y 927 to 958), and 400 px, the floor the plan allows, shows its pad and its
+#: first rows: a figure lower than 400 px is a deviation to report, not a fix (#443).
 STEP_PANEL_WIDTH_PX = 400
-FIGURE_HEIGHT_PX = 460
+FIGURE_HEIGHT_PX = 400
+
+#: The step panel scrolls on its own, below the strip and the step bar (about 130 px at
+#: 1280 px wide): a screen taller than the window scrolls inside the panel, and the map,
+#: the image and the strip stay where they are (m5 §17.3).
+_STEP_PANEL_MAX_HEIGHT = "calc(100vh - 130px)"
+
+#: The strip stays at the top of the window when the page scrolls: a white ground, so that
+#: what scrolls under it is not read through it.
+_STICKY_STRIP = {
+    "position": "sticky",
+    "top": "0",
+    "z-index": "100",
+    "background-color": "white",
+}
 
 #: The screen the expert view shows: today's regions, behind one switch (m5 §17.2 D4).
 ScreenName = StepName | Literal["expert"]
@@ -475,6 +492,12 @@ class PlatePageView:
             tools="pan,wheel_zoom,box_zoom,reset,save",
             active_scroll="wheel_zoom",
         )
+        # Stage positions are whole micrometres up to a few hundred thousand: plain labels
+        # (-60000), never ``4.000e+4``, which Bokeh picks as soon as one tick reaches 1e5
+        # and which, in a 440 px map, ran the labels of the x axis into one another
+        # (``/ui-check``, #443; FM-174 reads the tick labels for it).
+        self.figure.xaxis.formatter = BasicTickFormatter(use_scientific=False)
+        self.figure.yaxis.formatter = BasicTickFormatter(use_scientific=False)
         self.wells_renderer: Any = None
         self.hover = HoverTool(tooltips="@tip")
         self.figure.add_tools(self.hover)
@@ -573,6 +596,16 @@ class PlatePageView:
             )
         )
         self.figure.on_event(Tap, self._handler(self.on_tap))
+        # The map's title says how far the wells can be trusted (registered, estimated,
+        # unplaced: m5 §15 D4) and the plan's size, in a sentence a figure's own title
+        # cuts at its width: at 440 px (m5 §17.3) it was clipped, caveat and all
+        # (``/ui-check``, #443). The text is set on both from one place (``_draw_wells``);
+        # the figure's own title is hidden, a pane above it wraps the same words.
+        self.figure.title.visible = False
+        self.map_title_text = _wrapped_text(
+            width=None, extra={"font-weight": "bold", "font-size": "12px"}
+        )
+        self.map_title_text.sizing_mode = "stretch_width"
 
         # The camera's frame: 8-bit grey from 0 to 255 (``display_image``), whatever
         # the camera's bit depth is.
@@ -969,15 +1002,20 @@ class PlatePageView:
             pn.Row(pn.Spacer(width=60), jog["up"]),
             pn.Row(jog["left"], jog["down"], jog["right"]),
         )
+        # Each group is narrower than the image column (440 px at 1280): a group wider
+        # than the column is not wrapped, it runs past the window (the *Drive to* select
+        # and the toggle together did, ``/ui-check``, #443), so the two are separate
+        # items. The groups that fit side by side share a line.
         return pn.FlexBox(
             pn.Row(pad, self.xy_step_select),
             self.drive_image_note,
             pn.Row(self.z_buttons["up"], self.z_buttons["down"], self.z_step_select),
             pn.Row(self.autofocus_on_button, self.autofocus_off_button),
+            pn.Row(self.light_on_button, self.light_off_button),
             pn.Row(self.objective_select, self.objective_button),
             self.objective_confirm,
-            pn.Row(self.light_on_button, self.light_off_button),
-            pn.Row(self.side_select, self.drive_toggle),
+            self.side_select,
+            self.drive_toggle,
             self.drive_note,
             flex_wrap="wrap",
             sizing_mode="stretch_width",
@@ -1034,7 +1072,11 @@ class PlatePageView:
         self.continue_button = pn.widgets.Button(label="Continue", color="primary")
         # The panel that scrolls on its own (§17.3): the strip, the step bar and the
         # figures stay on screen while a long screen is read.
-        self.step_panel = pn.Column(width=STEP_PANEL_WIDTH_PX, scroll=True)
+        self.step_panel = pn.Column(
+            width=STEP_PANEL_WIDTH_PX,
+            scroll=True,
+            styles={"max-height": _STEP_PANEL_MAX_HEIGHT},
+        )
         for step, button in self.step_buttons.items():
             button.on_click(self._handler(self._stepper(step)))
         self.expert_toggle.param.watch(
@@ -1050,6 +1092,9 @@ class PlatePageView:
         return clicked
 
     def _layout(self) -> Any:
+        # Sticky: at 1280 x 800 the drive bar is partly below the fold (``/ui-check``), and
+        # a page scrolled to reach it must not take STOP out of view (ADR-0006: STOP is
+        # always offered).
         strip = pn.Row(
             self.connect_button,
             self.disconnect_button,
@@ -1057,6 +1102,7 @@ class PlatePageView:
             self.resume_button,
             self.stop_button,
             sizing_mode="stretch_width",
+            styles=_STICKY_STRIP,
         )
         step_bar = pn.Row(
             *(
@@ -1090,6 +1136,7 @@ class PlatePageView:
         # always on screen, side by side (m5 §17.2 D1).
         map_column = pn.Column(
             pn.Row(self.label_select, self.refresh_button),
+            self.map_title_text,
             pn.pane.Bokeh(self.figure, sizing_mode="stretch_width"),
             sizing_mode="stretch_width",
         )
@@ -1285,11 +1332,15 @@ class PlatePageView:
         # a file's path is as long as the folder it is in (m5 §8.4).
         card = _wrapped_text()
         self.tool_cards[tool.name] = card
-        parts: list[Any] = [pn.pane.Str(tool.summary), *key_widgets]
+        # Wrapped: a summary is a sentence, and the step panel is 400 px wide (m5 §17.3).
+        parts: list[Any] = [_wrapped_text(tool.summary), *key_widgets]
         if tool.name == "plate-registration":
             parts += [
                 pn.Row(self.capture_centre_button, self.forget_button),
-                pn.Row(self.capture_wall_button, self.capture_side_select),
+                # One under the other: the wall button names the well and the side
+                # (*Capture B2 wall at image left*) and the select is 300 px wide, which
+                # together ran past the panel's edge (``/ui-check``, #443).
+                pn.Column(self.capture_wall_button, self.capture_side_select),
                 self.image_note,
                 self.capture_note,
                 self.captures_text,
@@ -2193,9 +2244,9 @@ class PlatePageView:
         # Where the wells are drawn is only as good as the registration: say which map it is
         # (registered, seed, estimated or unplaced, m5 §15 D4). The scan plan's suffix is
         # where a plan too large to draw says so (m5 §14.3).
-        self.figure.title.text = map_title(view.plate, view.pose) + plan_title(
-            view.plan
-        )
+        title = map_title(view.plate, view.pose) + plan_title(view.plan)
+        self.figure.title.text = title
+        self.map_title_text.object = title
         # The cross's label names a well of *this* view: a registration that moved the wells
         # relabels it now, from the position last drawn, and reads nothing (FM-145).
         self._draw_cross(self._cross_xy)

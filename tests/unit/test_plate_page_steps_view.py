@@ -568,6 +568,50 @@ def test_two_views_show_their_own_screens(page: PlatePage, run_doc: Path) -> Non
     assert (first.expert, second.expert) == (False, True)
 
 
+# -- what ``/ui-check`` found at 1280 x 800 (#443) -----------------------------------
+
+
+def test_the_strip_stays_on_top_and_the_step_panel_scrolls_on_its_own(
+    page: PlatePage,
+) -> None:
+    view = PlatePageView(page)
+    # Measured in headless Chromium (the scroll probe of #443): the page scrolls 189 px at
+    # 1280 x 800 to bring the drive bar up, and STOP stayed at y = 5. A strip that scrolled
+    # away would take STOP out of view (ADR-0006: always offered).
+    strip = next(
+        row
+        for row in view.layout
+        if isinstance(row, pn.Row) and view.stop_button in row
+    )
+    assert strip.styles["position"] == "sticky"
+    assert strip.styles["top"] == "0"
+    # An opaque ground, or what scrolls under it is read through it.
+    assert strip.styles["background-color"] == "white"
+    # The panel has a height of its own to scroll in (the window's less the frame's): a
+    # `scroll=True` column with no height grows with its screen, and the page scrolls.
+    assert view.step_panel.scroll is True
+    assert view.step_panel.styles["max-height"] == plate_page._STEP_PANEL_MAX_HEIGHT
+
+
+def test_the_maps_title_wraps_in_a_pane_and_its_ticks_are_plain_numbers(
+    page: PlatePage,
+) -> None:
+    view = PlatePageView(page)
+    # A figure's own title is one line cut at the figure's width: at 440 px the caveat
+    # ("estimated ..., not registered") was clipped. The same words, wrapped, above the map.
+    assert view.map_title_text.object == view.figure.title.text != ""
+    assert view.figure.title.visible is False
+    assert view.map_title_text.styles["white-space"] == "pre-wrap"
+    assert type(view.map_title_text) is pn.pane.Str
+    # Set where the title is, so a redraw keeps the two the same.
+    view.select_input.value = "A1:B2"
+    view.refresh()
+    assert view.map_title_text.object == view.figure.title.text
+    # Plain labels: Bokeh picks `4.000e+4` as soon as a tick reaches 1e5 (FM-174 reads it).
+    for axis in (view.figure.xaxis[0], view.figure.yaxis[0]):
+        assert axis.formatter.use_scientific is False
+
+
 # -- the outcome lines --------------------------------------------------------------
 
 
