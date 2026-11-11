@@ -468,6 +468,12 @@ class PlatePageView:
         # every plate, bold: the one name the operator checks against the plate, which
         # the names above leave out past ``NAMES_UP_TO_WELLS``.
         self.side_source = ColumnDataSource({"x": [], "y": [], "text": []})
+        # An invisible glyph at each side label: the map's auto range spans renderers,
+        # never annotations, and a label half a pitch beyond the top row was drawn off
+        # the canvas (seen by /ui-check, #422).
+        self.figure.scatter(
+            "x", "y", source=self.side_source, size=1, alpha=0.0
+        ).level = "underlay"
         self.figure.add_layout(
             LabelSet(
                 x="x",

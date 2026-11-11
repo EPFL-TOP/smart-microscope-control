@@ -117,6 +117,12 @@ def test_the_map_labels_the_stands_sides_and_a1(make_view: Any) -> None:
     assert _close(sides["operator's right"], (RIGHT + HALF_PITCH, middle_y))
     assert _close(sides["operator's left"], (LEFT - HALF_PITCH, middle_y))
     assert _labels(view.a1_source) == {"A1": (-49_100.0, 31_175.0)}
+    # A glyph renderer reads the sides' source, so the map's auto range takes them in:
+    # a label alone (an annotation) beyond the top row was drawn off the canvas.
+    assert any(
+        getattr(renderer, "data_source", None) is view.side_source
+        for renderer in view.figure.renderers
+    )
 
     # Turned, the sides stay where the stand's are and A1 moves to the far corner.
     view.orientation_select.value = "turned-180"
