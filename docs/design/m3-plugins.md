@@ -2638,11 +2638,13 @@ same number at 0.1 µm for all 160 000 corners.
   in the frame of the plan's objective (§18.3, the translation of a plate moved
   between objectives included). It is **computed once per scanned well before
   anything moves** and not re-derived: the scan does no pitch or rotation
-  arithmetic of its own. A well the plan lists and its plate does not hold (an
-  edited run document; a field of a well the plan does not list is refused
-  already, by the path check) is refused after check 2, with nothing moved:
-  `the plan lists well '<w>', which its plate does not hold: run scan-plan
-  again with the stand as it is now`. The offsets are made from the
+  arithmetic of its own. A well that has fields in the plan and that its plate
+  does not hold is refused with nothing moved, after the path check (an edited
+  run document: measured, today's scan photographs a field of a listed well
+  `Z9` that no plate holds, and the report then fails on it):
+  `the plan has fields in well '<w>', which its plate does not hold: run
+  scan-plan again with the stand as it is now`. A well with no field needs no
+  centre and is not looked up. The offsets are made from the
   readback at the field, after the move and the landing check, in the same
   statement that builds the frame's record; a failed field has no frame, so no
   offset (`FailedField` keeps the target), and a dry run takes no frame.
