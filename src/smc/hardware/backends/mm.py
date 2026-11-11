@@ -1513,7 +1513,9 @@ class MMAutofocus:
                 not above ``settle_s``; nothing was sent.
             SafetyRefusedError: Z is outside the soft limits, or the offset was
                 not seen locked on a declared stand and is not a first lock
-                (switched off first if it was on); nothing else was sent. The
+                (switched off first if it was on), or, at the floor, it was on
+                and searching, whether or not the floor was seen (switched off
+                first; §12.11 D9); nothing else was sent. The
                 message says how to lock it from below, or what the profile
                 lacks for it. Or, at a floor seen locked, its state could not
                 be read, which decides the band (§12.11 D9); nothing was sent.
@@ -1772,7 +1774,10 @@ class MMAutofocus:
         focused, not where a search has already taken Z. That holds whether or
         not the floor was seen locked (m2 §12.11 D9): a floor seen in one well
         says nothing of its plane in the next. A seen floor with the autofocus
-        on, or the conditions missing, is D1's seen offset. Otherwise the refusal
+        locked, or the conditions missing, is D1's seen offset; on and not
+        locked, at a floor seen or not, it is switched off and refused, since
+        searching it would drive Z to the floor's plane at this place (§12.11 D9,
+        #421). Otherwise the refusal
         says how to lock from below, or what the profile lacks for it; it
         never names the stand's own controls, whose button jumped at an unseen
         offset (#331).
@@ -1798,7 +1803,7 @@ class MMAutofocus:
             guard = self._new_guard(focus, z_start, z_held, limit_s)
         if not self._declared:
             return guard
-        self._read_locked()  # the operator's lock, if it holds now, is seen
+        locked = self._read_locked()  # the operator's lock, if it holds now, is seen
         objective = self._objective_label()
         offset = self._read_offset()
         seen = self._seen.get(objective, frozenset())
@@ -1806,6 +1811,7 @@ class MMAutofocus:
         missing = self._first_lock_missing(focus)
         unit = f" {self._offset_unit}" if self._offset_unit else ""
         on: bool | None = None
+        searching_at_the_floor = False
         if first_lock and offset_limits is not None and offset <= offset_limits[0]:
             # At or below the floor, engage() is a first lock whether or not the
             # floor was seen locked (m2 §12.11 D9): one floor named planes 104 µm
@@ -1841,20 +1847,36 @@ class MMAutofocus:
                 )
                 guard.seen = (objective, offset)
                 return guard
-        if offset in seen:
+            # On and not locked: searching, so it would drive Z to the floor's plane
+            # at this place the moment it found the reference, and D1's band (±E)
+            # bounds that by 50 µm while one floor's planes were 104 µm apart. Seen
+            # or not, it is switched off and refused below (D9, amended by #421). A
+            # lock reached between the two reads counts as searching: the safe side.
+            searching_at_the_floor = not missing and on and not locked
+        if offset in seen and not searching_at_the_floor:
             if guard is not None:
                 guard.seen = (objective, offset)
             return guard
         if on is None:
             on = self._engaged_for_the_check()
-        with_objective = "" if objective is None else f" with objective {objective!r}"
-        known = ", ".join(f"{value:g}" for value in sorted(seen)) or "none"
-        unseen = (
-            f"on this stand engaging drives Z to the plane the offset names "
-            f"([autofocus] engage_drives_z_to_offset, m2 §12), and offset "
-            f"{offset:g}{unit} has not been seen locked{with_objective} since the "
-            f"stand was opened (seen: {known})"
-        )
+        if offset in seen:
+            # Only reached searching at the floor: the floor *was* seen, and the
+            # message must not say otherwise.
+            reason = (
+                f"at the offset's floor ({offset:g}{unit}), a lock seen at one place "
+                f"says nothing of the floor's plane at another (m2 §12.11 D9)"
+            )
+        else:
+            with_objective = (
+                "" if objective is None else f" with objective {objective!r}"
+            )
+            known = ", ".join(f"{value:g}" for value in sorted(seen)) or "none"
+            reason = (
+                f"on this stand engaging drives Z to the plane the offset names "
+                f"([autofocus] engage_drives_z_to_offset, m2 §12), and offset "
+                f"{offset:g}{unit} has not been seen locked{with_objective} since the "
+                f"stand was opened (seen: {known})"
+            )
         if on:
             try:
                 self._executor.safe(self._off, lambda: None)
@@ -1862,7 +1884,7 @@ class MMAutofocus:
                 # Not the bare switch-off fault: it would drop why it was being
                 # switched off, and that it may now drive Z (FM-127).
                 raise HardwareError(
-                    f"autofocus {label}: not engaged: {unseen}; it was on and "
+                    f"autofocus {label}: not engaged: {reason}; it was on and "
                     f"searching, and it could not be switched off ({_named(exc)}); "
                     f"it may still move Z: stop() and check the stand, then resume()"
                 ) from exc
@@ -1880,7 +1902,7 @@ class MMAutofocus:
                 f"({offset_limits[0]:g}{unit}), engage, then turn the knob with "
                 f"{label} on until the sample is sharp; smc then reads the lock"
             )
-        raise _EngageRefusedError(f"{unseen}{switched}. {advice}", label=label)
+        raise _EngageRefusedError(f"{reason}{switched}. {advice}", label=label)
 
     def _engaged_for_the_check(self, *, propagate: bool = False) -> bool:
         """Whether it reads on, for the engage check; unknown counts as on (FM-19).
