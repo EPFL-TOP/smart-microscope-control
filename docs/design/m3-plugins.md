@@ -1202,6 +1202,10 @@ class ScanFrame(SlotValue):
     focus: FocusState
     pfs_offset: float | None
     t_s: float = Field(ge=0.0)
+    # Added by #341 and #430, last and optional (§21.5, §8 *Refined while planning #430*):
+    cell_focus: FieldFocus | None = None
+    well_dx_um: float | None = None
+    well_dy_um: float | None = None
 ```
 
 ```python
@@ -1238,7 +1242,10 @@ def load_frame(run_dir: Path, frame: ScanFrame) -> npt.NDArray[Any]: ...
   autofocus was not used. `focus`: `locked` (used and locked when the
   frame was taken), `unlocked` (used, not locked), `off` (the stand has
   an autofocus the scan did not use), `none` (it has none). `t_s` counts
-  from the start of the attempt that took the frame.
+  from the start of the attempt that took the frame. `well_dx_um`,
+  `well_dy_um`: where the frame is in its well, the readback minus the
+  well's centre in stage axes (§8, *Refined while planning #430*); `None`,
+  both, in a scan written before they existed.
 - `matrix_um_per_px` and `pixel_size_um` are the scan plan's, copied so
   that the cells need only `scan`. `frame_index()` maps a well to the
   indices of its frames in `frames`.
@@ -2587,6 +2594,115 @@ empty move log); `test_a_turret_turned_mid_scan_stops_at_the_next_well`;
 `test_a_dry_run_scan_writes_nothing`. **Failure modes**: FM-14, FM-12,
 FM-64, FM-88, FM-30, FM-38, FM-24, FM-103, FM-111.
 
+**Refined while planning #430** (measured on the demo, 2026-11-11, Python
+3.13, useq-schema 0.9.2, tifffile 2026.9.20, pydantic 2.13.5; the owner asked
+for a plate scanned at 10× and 40× "saving the images with the position of each
+image on the well"). A frame's record placed it on the stage; the well's centre
+was in another stage's record (`plate`, through `scan-plan`), so a TIFF read
+alone, or a run folder copied without thinking of the plan, could not say where
+in its well a frame lay. Measured: on the demo's seeded 96-well plate, with a
+1 × 1 grid, the three fields lie at the three wells' centres and `readback −
+well_geometry(plan.plate_plan, well).center_um` is `(0.0, 0.0)` for A1 (0, 0),
+A2 (9 000, 0) and B2 (9 000, −9 000) µm; with 2 × 2 fields it is `(±57.585,
+±43.2)`; and `ScanFrame` today refuses a key it does not know, so a frame that
+carries the new keys is not readable by an smc without them (FM-107). A
+prototype of the model (two optional floats, `cell_focus`'s wrap serializer
+extended, a validator that refuses one key without the other) dumps a frame
+without them exactly as today, reads its own dump back equal, and puts the keys
+in the TIFF's JSON as written. The report's two ways to place a footprint,
+`footprint(x, y) − centre` and `footprint(x − cx, y − cy)`, differ by at most
+3.6e-12 µm on 20 000 random frames up to ±50 mm from the origin, and print the
+same number at 0.1 µm for all 160 000 corners.
+
+- **The record.** `ScanFrame` gains, last and after `cell_focus`, `well_dx_um:
+  float | None = None` and `well_dy_um: float | None = None`: the frame's
+  centre minus the well's centre, **in stage axes and µm**, taken from the
+  readback (`x_um`, `y_um`), not the target: a frame that landed 3 µm right of
+  its field reads 3 µm more. `(0, 0)` is the well's centre; a positive `dx` is
+  the stage's +X side of it. They are **not turned into the plate's axes**: on
+  a plate turned by θ a frame one pitch along a row of wells reads `(p cos θ,
+  p sin θ)`, which is what the stage did; `WellGeometry.to_plate_frame` makes
+  the other reading from them. `None` means *not recorded* (a scan written
+  before #430), never zero. The two go together: a validator refuses one
+  without the other, and both are finite like every float of a slot value
+  (FM-32, FM-104).
+- **In the TIFF and the document.** `encode_frame` already writes
+  `ScanFrame.model_dump(mode="json")`, so the keys are in each TIFF's JSON with
+  no code of their own. As for `cell_focus`, a missing value is **left out of
+  the dump**: a frame without them is written exactly as before, so a scan of an
+  older smc reads and writes back unchanged, and `SCHEMA_VERSION` stays 1. A
+  frame *with* them is refused by an older smc (it refuses a key it does not
+  know rather than drop it, FM-107): upgrade the smc that reads it.
+- **The well's centre** is `well_geometry(plan.plate_plan, well).center_um` of
+  the plan the fields came from: the call `plan_fields`' clipping made (§7.2),
+  in the frame of the plan's objective (§18.3, the translation of a plate moved
+  between objectives included). It is **computed once per scanned well before
+  anything moves** and not re-derived: the scan does no pitch or rotation
+  arithmetic of its own. A well that has fields in the plan and that its plate
+  does not hold is refused with nothing moved, after the path check (an edited
+  run document: measured, today's scan photographs a field of a listed well
+  `Z9` that no plate holds, and the report then fails on it):
+  `the plan has fields in well '<w>', which its plate does not hold: run
+  scan-plan again with the stand as it is now`. A well with no field needs no
+  centre and is not looked up. The offsets are made from the
+  readback at the field, after the move and the landing check, in the same
+  statement that builds the frame's record; a failed field has no frame, so no
+  offset (`FailedField` keeps the target), and a dry run takes no frame.
+- **`assumed` says what the offsets rest on**, when frames are written (never
+  in a dry run), after every line the scan already writes, from the plan alone
+  (the scan reads `scan-plan` and no other record):
+  - `objective_shift_um is None` (an older plan, an objective in use that is not
+    known, or a plate that records no objective or whose offset to this
+    objective was not measured, §18.2 rules 2 to 4): `the frames' offsets from
+    their well's centre (well_dx_um, well_dy_um) are against the plate as the
+    plan holds it, registered with <plate_objective, or "an unknown objective">
+    and not moved to the frame of <objective, or "the objective in use">: they
+    carry any difference between the two (scan-plan's assumed says why)`.
+  - a shift that is not `(0.0, 0.0)` (the plate was translated, §18.2 rule 5):
+    `the frames' offsets from their well's centre (well_dx_um, well_dy_um) are
+    against the plate moved from <plate_objective, or "an unknown objective">'s
+    frame to <objective>'s by (<sx>, <sy>) µm, the profile's offsets between
+    objectives`, the shift to one decimal.
+  - `(0.0, 0.0)`, which is every plate registered with the objective in use, and
+    every stand with no turret: no line.
+  - frames kept from a checkpoint that an older smc wrote carry no offsets, and
+    **the scan does not fill them in**: the TIFFs hold what was written, and a
+    record that disagreed with its file would be worse than a gap. When `n > 0`
+    of the `m` frames kept lack them: `<n> of the <m> frames kept from the
+    checkpoint were written before a frame's offset from its well's centre was
+    recorded: they carry no well_dx_um or well_dy_um`.
+
+  The plate's own method (a seed, a lattice fit) is **not** said here: the plan
+  does not carry it, the scan reads `scan-plan` only, and it is the plate
+  record's to say (m5 §15 D6 draws it on the map). What the owner's request
+  called a plate that was estimated or translated is what the plan knows: the
+  shift above.
+- **The report draws from them** (§13): a frame's footprint is drawn at
+  `(well_dx_um, well_dy_um)` of the well's centre when the frame has them, and
+  at the readback minus the well's centre when it has not (a scan of an older
+  smc), the same page to the digits it prints. It does not compare the record
+  with the plan's plate: a plan run again makes the scan stale, and the runner
+  refuses a stale read, as it does for `x_um` (FM-111).
+- **Not here.** `cells`, `density`, `route` and `nis-export` read stage
+  coordinates, which they need, and stay as they are. The `scripts/dev` tools of
+  #343 compute the offset from the plate record today and read the keys where
+  they exist in their own change. The offsets are not filled into a scan that
+  has none (a rewrite of its TIFFs), and the well's centre is not recorded
+  beside them (it is in the plan).
+
+**Tests of #430** (names in the plan on the issue): the offset of a frame
+planned at a well's centre is `(0, 0)` and that of a frame that landed off is
+the readback's, each on a well whose centre is not the origin (A2, B2: a scan
+that forgot to subtract the centre reads `(9 000, …)`), on a non-square frame
+and on a plate turned by 13°, where the stage's axes and the plate's differ
+(FM-73); the keys are in the result and in each TIFF's JSON and agree; a record
+without them loads and is written back without them; one key without the other
+is refused; each `assumed` case, from both sides, and no line for the
+objective in use; a resume across the older smc; the report's page the same with
+and without the keys, and a frame whose offsets say otherwise drawn where they
+say (it draws from the record). **Failure modes**: FM-32, FM-73, FM-104,
+FM-107, FM-111, FM-124.
+
 ## 9. Cells (#23)
 
 `smc/plugins/cells/overlap.py`, `detector.py`, `algorithm.py`,
@@ -3792,7 +3908,9 @@ rendered by Google Chrome headless on macOS, not by Edge, Firefox or Safari):
   a plate turned by 0.8°). **No `transform` flips a group**, because text in
   it would be mirrored. A footprint is `footprint(x, y, matrix=…,
   image_shape_px=…)` of the **scan** (a frame is what the scan saw, FM-124),
-  at the stage's readback, drawn as one closed polygon; a **failed** field,
+  at the stage's readback (as the frame's own `well_dx_um`, `well_dy_um` say
+  it, §8 *Refined while planning #430*, or `x − cx`, `y − cy` for a frame that
+  has none), drawn as one closed polygon; a **failed** field,
   which has only its target, is drawn the same way, dashed; a chosen field of
   the route with the **route's** matrix and frame shape (another objective is
   another field). A square well is a polygon of its four corners turned by the
