@@ -6,8 +6,9 @@ are the session's.
 
     python scripts/dev/point.py [--since YYYY-MM-DD]
 
-"Since" defaults to the last comment on the open issue titled
-"Point: next steps", or seven days ago when there is none. Stdlib only;
+"Since" defaults to the last ``## Point`` comment on the open issue titled
+"Point: next steps", or seven days ago when there is none: a lane's note or an
+owner's note posted after the Point does not move it (FM-220). Stdlib only;
 needs an authenticated ``gh``. ASCII output (#42).
 """
 
@@ -28,6 +29,8 @@ STATUS = "status: "
 MAX_LINE = 220
 _DEPENDS = re.compile(r"\*\*Depends on\*\*:?\s*(.*)", re.IGNORECASE)
 _REF = re.compile(r"#(\d+)")
+# The lane a note belongs to: the `S<k>` right after the header's opening parenthesis.
+_LANE = re.compile(r"^## Lane \((S\d+)\b")
 _ADR_STATUS = re.compile(r"\*\*Status\*\*:\s*(.+)")
 _FAILING = {"FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"}
 # A run that ended without a verdict on the code: a push to main cancels the older run of
@@ -48,6 +51,31 @@ def clip(text: str, limit: int = MAX_LINE) -> str:
     return line if len(line) <= limit else line[: limit - 3] + "..."
 
 
+_ASCII = {
+    ord("\N{EM DASH}"): "-",
+    ord("\N{EN DASH}"): "-",
+    ord("\N{RIGHTWARDS ARROW}"): "->",
+    ord("\N{MULTIPLICATION SIGN}"): "x",
+    ord("\N{MIDDLE DOT}"): "-",
+    ord("\N{HORIZONTAL ELLIPSIS}"): "...",
+    ord("\N{LEFT SINGLE QUOTATION MARK}"): "'",
+    ord("\N{RIGHT SINGLE QUOTATION MARK}"): "'",
+    ord("\N{LEFT DOUBLE QUOTATION MARK}"): '"',
+    ord("\N{RIGHT DOUBLE QUOTATION MARK}"): '"',
+    ord("\N{NO-BREAK SPACE}"): " ",
+}
+
+
+def ascii_only(text: str) -> str:
+    """The text with what a Windows console cannot encode transliterated (#42).
+
+    A redirected stdout on Windows is cp1252 with strict errors (FM-20): a lane's
+    note is written by a subagent, which uses arrows and dashes freely, and one
+    arrow in it would end the whole report.
+    """
+    return text.translate(_ASCII).encode("ascii", "replace").decode("ascii")
+
+
 def depends_on(plan: str) -> list[int]:
     """Issue or PR numbers on a plan's ``**Depends on**`` line; [] for none."""
     for line in plan.splitlines():
@@ -61,6 +89,45 @@ def latest(comments: list[dict[str, Any]], prefix: str) -> dict[str, Any] | None
     """The newest comment whose body starts with ``prefix``."""
     hits = [c for c in comments if str(c.get("body", "")).lstrip().startswith(prefix)]
     return max(hits, key=lambda c: str(c.get("createdAt", "")), default=None)
+
+
+def last_point_time(comments: list[dict[str, Any]]) -> str | None:
+    """The ``createdAt`` of the newest ``## Point`` comment, or ``None``.
+
+    The window of a point opens at the last point, selected by its header: any
+    other comment on the tracking issue (a lane's note, the owner's) is posted
+    after the Point and would hide every report written before it (FM-220).
+    """
+    last = latest(comments, "## Point")
+    return str(last["createdAt"]) if last else None
+
+
+def lane_notes(comments: list[dict[str, Any]], stamp: str) -> list[str]:
+    """The newest ``## Lane (S<k>, ...)`` note of each lane since ``stamp``, one line each.
+
+    A lane session leaves a note whenever it ends or waits (`/lane`); the point
+    reads where each lane stands, not its history. ISO strings compare as
+    strings, so there is no date parsing to break on Python 3.10.
+    """
+    newest: dict[str, dict[str, Any]] = {}
+    for c in comments:
+        m = _LANE.match(str(c.get("body", "")).lstrip())
+        if not m or str(c.get("createdAt", "")) < stamp:
+            continue
+        lane = m.group(1)
+        if lane not in newest or str(c["createdAt"]) > str(newest[lane]["createdAt"]):
+            newest[lane] = c
+
+    def part(body: str, name: str) -> str:
+        return clip(" ".join(field(body, name)) or "-", 110)
+
+    return [
+        ascii_only(
+            f"- {lane} ({c['createdAt']}): {part(str(c['body']), 'Done')}"
+            f" / {part(str(c['body']), 'Next')}"
+        )
+        for lane, c in sorted(newest.items(), key=lambda kv: int(kv[0][1:]))
+    ]
 
 
 def dependencies(issue: dict[str, Any]) -> list[int]:
@@ -321,8 +388,8 @@ def ref_state(repo: str, number: int) -> str:
 
 
 def since_default(tracking: dict[str, Any] | None) -> datetime:
-    if tracking and tracking.get("comments"):
-        last = max(str(c["createdAt"]) for c in tracking["comments"])
+    last = last_point_time(tracking.get("comments", [])) if tracking else None
+    if last:
         return datetime.fromisoformat(last.replace("Z", "+00:00"))
     return datetime.now(timezone.utc) - timedelta(days=7)
 
@@ -417,6 +484,11 @@ def main() -> int:
         out.append("- none")
     out.append("")
 
+    out.append("## Lanes since the last point")
+    notes = lane_notes((tracking or {}).get("comments", []), stamp)
+    out.extend(notes or ["- none"])
+    out.append("")
+
     out.append("## CI on main")
     out.extend(main_ci(runs, stamp))
     out.append("")
@@ -487,6 +559,7 @@ def main() -> int:
                     "## Plan",
                     "## Review",
                     "## Point",
+                    "## Lane",
                     "## Applied",
                     "## CI nightly",
                     "Starting",

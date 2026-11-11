@@ -76,6 +76,7 @@ The session ends when the list is posted.
    ```markdown
    **Today**
    0. Only when the CI stops the merges: main is red (run <url>) or #N `CI nightly red` is open: revert or `/develop <n>` for the fix, before any merge.
+   Run each lane with `/lane S1`, `/lane S2`, `/lane S3` (Sonnet), each in a fresh session; a lane stops where you are needed and says so on this issue.
 
    **S1 — the plate definitions (#400), then the scan plan (#21)**
    S1.1 `/plan 400` (Opus) → merge its design PR
@@ -86,7 +87,7 @@ The session ends when the list is posted.
    S2.1 `/feature 401` (Sonnet) → `/review <pr>` (Sonnet) → merge
 
    **S3 — the decision (#402), then the stand**
-   S3.1 `/plan 402` (Opus): its design PR ends with the decision; merge it
+   S3.1 `/plan 402` (Opus), **with you**: its design PR ends with the decision; read it and merge it
    S3.2 after S1.2 and S2.1: `/hardware-session nikon-ti2 before` (Opus)
    S3.3 tomorrow at the stand: `/hardware-session nikon-ti2 during` (Opus); back: `... after`, then `/point`
 
@@ -95,6 +96,24 @@ The session ends when the list is posted.
    **Waiting** — #26, on #25
    **Process** — the develop skill now asks for …
    ```
+
+   **The grammar of a lane** is read by `scripts/dev/lane.py` (`/lane` drives
+   the lane from it), so it is written exactly: a lane is a line beginning
+   `**S<k> ` (bold, then a dash and its title); **one step per line**,
+   beginning `S<k>.<n> `; the segments of a step are joined by ` → `; each
+   session segment holds **one backticked command** (`/plan <n>`,
+   `/develop <n>`, `/feature <n>`, `/review <pr>`) with its model in the
+   parenthesis right after it (`(Opus)`, `(the plan's model)`); a design PR's
+   merge says `merge its design PR`, and a last `merge` is the PR's; a session
+   that needs the owner (a walk, a decision, the stand) says `with you` or is a
+   `/hardware-session`, `/adr` or `/point`; a step that waits for others starts
+   `after S<k>.<n>:`. A `/plan` whose design PR is the whole result (a
+   decision) has no develop after it: write it `with you`. An issue built as
+   several PRs is written as owner steps: a lane drives one PR per issue. **Before posting, run `python
+   scripts/dev/lane.py --check <draft file>` and fix what it prints** (a plan
+   with no develop after it, a review or a merge with no issue, an `after`
+   naming no step, a later step of its own lane, or a cycle of lanes that
+   wait for each other).
 
    No history and no explanations unless the owner asks.
 

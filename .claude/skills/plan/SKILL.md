@@ -126,3 +126,21 @@ the plan, do what it unlocks (labels, dependents), and end the session.
   editing its comment in place
   (`gh api -X PATCH repos/{owner}/{repo}/issues/comments/<id> -F body=@plan.md`),
   or post a complete revised `## Plan`.
+- **A plan that opened a design PR names it on its Ready line**:
+  `**Ready for /develop**: blocked by #<pr>`, until that PR is merged (a
+  design PR is not a dependency of the issue, so **Depends on** may say
+  `none`). `lane.py` and `/develop` read the line: the lane waits for the
+  merge, and the develop does not start before it.
+
+## In a lane
+
+When `/lane` runs this skill (its brief says so), you are a **subagent** in
+your own worktree (`isolation: "worktree"`), and you cannot ask the owner
+anything: where this skill would ask (a design choice the issue leaves open),
+stop and say what you need. A design PR is opened from that worktree: `git
+branch -m docs/<N>-<slug>`, then `/develop`'s step 5 fetch and fast-forward
+(`git fetch origin main`, `git merge --ff-only origin/main`; a worktree
+session may refuse the `git -c url…insteadOf` form: write the https URL out),
+because the worktree starts at the main checkout's local `HEAD`, which can lag
+`origin/main`. A plan that needs a live walk with the owner is not a lane
+step: `/point` writes it "with you".

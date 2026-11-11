@@ -15,3 +15,7 @@ costs more than it saves.
    the worktree isolation, the Report comment and the PR.
 3. Tell the owner the PR is open and that it was planned and built in one
    session — so they review it more carefully than a split-session PR.
+
+## In a lane
+
+In a lane: the *In a lane* sections of `/plan` and `/develop`.

@@ -2,6 +2,7 @@
 
 import importlib.util
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -468,3 +469,147 @@ def test_the_nightly_issue_is_left_out_of_the_owner_notes(
     )
     assert "nothing new" in notes
     assert "#77 owner note" not in notes
+
+
+# --- the window starts at the last Point; the lanes are listed (#432) ---------
+
+
+def _tracking(comments: list[dict]) -> dict:
+    return {**_issue(51, "Point: next steps", []), "comments": comments}
+
+
+def _lane(lane: str, at: str, done: str, nxt: str) -> dict:
+    return _c(
+        f"## Lane ({lane}, 2026-11-12)\n\n**Done**: {done}\n**Next**: {nxt}\n", at
+    )
+
+
+def test_since_is_the_last_point_not_a_later_lane_note(point) -> None:
+    # A note posted after the Point (a lane's, or the owner's) must not move the
+    # window: the next point would skip every report written before it (FM-220).
+    tracking = _tracking(
+        [
+            _c("## Point (design session, 2026-11-10)\n\nold", "2026-11-10T17:00:00Z"),
+            _c("## Point (design session, 2026-11-11)\n\nnew", "2026-11-11T08:00:00Z"),
+            _lane("S1", "2026-11-11T09:00:00Z", "S1.1 done", "S1.2 next"),
+            _c("a plain owner note", "2026-11-11T10:00:00Z"),
+        ]
+    )
+    assert point.last_point_time(tracking["comments"]) == "2026-11-11T08:00:00Z"
+    assert point.since_default(tracking) == datetime(
+        2026, 11, 11, 8, 0, tzinfo=timezone.utc
+    )
+
+
+def test_without_a_point_the_window_is_seven_days(point) -> None:
+    notes = [_lane("S1", "2026-11-11T09:00:00Z", "x", "y"), _c("a note", "t")]
+    assert point.last_point_time(notes) is None
+    for tracking in (None, _tracking([]), _tracking(notes)):
+        before = datetime.now(timezone.utc)
+        since = point.since_default(tracking)
+        after = datetime.now(timezone.utc)
+        assert before - timedelta(days=7) <= since <= after - timedelta(days=7)
+
+
+def test_the_latest_lane_note_of_each_lane_is_listed(point) -> None:
+    comments = [
+        _lane("S2", "2026-11-12T11:00:00Z", "S2.1 `/plan 430`", "wait for CI of #12"),
+        _lane("S1", "2026-11-12T09:00:00Z", "S1.1 old", "old"),
+        _lane(
+            "S1",
+            "2026-11-12T10:31:00Z",
+            "S1.2 `/review 445` (sonnet): ready to merge",
+            "you merge #445",
+        ),
+        _lane("S10", "2026-11-12T12:00:00Z", "tenth", "n10"),
+        _lane("S3", "2026-11-11T23:59:59Z", "before the window", "x"),
+        _c(
+            "## Point (design session, 2026-11-12)\n\nnot a lane",
+            "2026-11-12T12:00:00Z",
+        ),
+        _c("a plain note", "2026-11-12T12:30:00Z"),
+    ]
+    # sorted by lane number, one line each, the window's start included
+    assert point.lane_notes(comments, "2026-11-12T09:00:00Z") == [
+        "- S1 (2026-11-12T10:31:00Z): S1.2 `/review 445` (sonnet): ready to merge"
+        " / you merge #445",
+        "- S2 (2026-11-12T11:00:00Z): S2.1 `/plan 430` / wait for CI of #12",
+        "- S10 (2026-11-12T12:00:00Z): tenth / n10",
+    ]
+    assert point.lane_notes(comments, "2026-11-13T00:00:00Z") == []
+
+
+def test_a_lane_note_line_is_one_short_line(point) -> None:
+    long = "word " * 80
+    (line,) = point.lane_notes([_lane("S1", "2026-11-12T09:00:00Z", long, long)], "")
+    assert "\n" not in line
+    assert len(line) < 300
+    assert line.count("...") == 2
+    # a note that lacks a field is still listed, with a dash for it
+    bare = _c("## Lane (S2, 2026-11-12)\n\nsomething else", "2026-11-12T09:00:00Z")
+    assert point.lane_notes([bare], "") == ["- S2 (2026-11-12T09:00:00Z): - / -"]
+
+
+def test_a_lane_note_line_is_ascii_whatever_the_subagent_wrote(point) -> None:
+    # A subagent writes arrows and dashes freely, and a redirected stdout on Windows
+    # is cp1252 with strict errors: one arrow would end the whole report (FM-20).
+    note = _lane(
+        "S1",
+        "2026-11-12T09:00:00Z",
+        "step \N{RIGHTWARDS ARROW} done",
+        "you \N{EM DASH} merge #5 \N{GREEK SMALL LETTER MU}m",
+    )
+    (line,) = point.lane_notes([note], "")
+    assert line == "- S1 (2026-11-12T09:00:00Z): step -> done / you - merge #5 ?m"
+    assert line.isascii()
+
+
+def test_the_report_lists_the_lanes_right_after_the_open_prs(
+    point, monkeypatch, capsys
+) -> None:
+    tracking = _tracking(
+        [
+            _c("## Point (design session, 2026-11-11)\n\nnew", "2026-11-11T08:00:00Z"),
+            _lane("S1", "2026-11-11T09:00:00Z", "S1.1 plan", "S1.2 develop"),
+            _c("an owner note", "2026-11-11T10:00:00Z"),
+        ]
+    )
+    monkeypatch.setattr(point, "gh_json", _canned([], [tracking], []))
+    monkeypatch.setattr(sys, "argv", ["point.py"])
+    assert point.main() == 0
+    out = capsys.readouterr().out
+    # the window starts at the last Point, whatever was posted after it
+    assert "since 2026-11-11T08:00:00Z" in out.splitlines()[0]
+    headings = [line for line in out.splitlines() if line.startswith("## ")]
+    assert headings[1:3] == ["## Open pull requests", "## Lanes since the last point"]
+    lanes = out.split("## Lanes since the last point")[1].split("\n## ")[0]
+    assert "- S1 (2026-11-11T09:00:00Z): S1.1 plan / S1.2 develop" in lanes
+    assert out.split("## Merged since")[0].isascii()
+
+
+def test_the_lanes_section_says_none_without_a_note(point, monkeypatch, capsys) -> None:
+    monkeypatch.setattr(point, "gh_json", _canned([], [_tracking([])], []))
+    monkeypatch.setattr(sys, "argv", ["point.py", "--since", "2026-11-01"])
+    assert point.main() == 0
+    lanes = capsys.readouterr().out.split("## Lanes since the last point")[1]
+    assert lanes.split("\n## ")[0].strip() == "- none"
+
+
+def test_a_lane_note_is_not_an_owner_note(point, monkeypatch, capsys) -> None:
+    # A lane's note on a piece of work is the machine's, not the owner's: only the plain
+    # comment beside it is an owner note.
+    work = {
+        **_issue(5, "feat: y", ["status: in-progress"]),
+        "comments": [
+            _lane("S1", "2026-11-12T10:00:00Z", "S1.1 done", "S1.2 next"),
+            _c("is the stand free on Friday?", "2026-11-12T11:00:00Z"),
+        ],
+    }
+    monkeypatch.setattr(point, "gh_json", _canned([], [work], []))
+    monkeypatch.setattr(sys, "argv", ["point.py", "--since", "2026-11-01"])
+    assert point.main() == 0
+    notes = (
+        capsys.readouterr().out.split("## Since the last point")[1].split("\n## ")[0]
+    )
+    assert "#5 owner note: is the stand free on Friday?" in notes
+    assert "Lane" not in notes
