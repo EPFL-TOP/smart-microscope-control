@@ -199,11 +199,14 @@ _FIELD_FOCUS: dict[str, Any] = {
     "frame_score": 0.3,
     "duration_s": 0.25,
 }
-#: A frame of a scan that ran the focus on the cells (m3 §21.6).
+#: A frame of a scan that ran the focus on the cells (m3 §21.6) and that
+#: records its place in its well (m3 §8, #430): the full sample of ``ScanFrame``.
 _FRAME_FOCUSED: dict[str, Any] = {
     **_FRAME,
     "z_um": 1500.2,
     "cell_focus": _FIELD_FOCUS,
+    "well_dx_um": 12.5,
+    "well_dy_um": -7.25,
 }
 _CELL_FOCUS: dict[str, Any] = {
     "assumed": [],
@@ -958,6 +961,78 @@ def test_a_frame_without_cell_focus_dumps_without_the_key() -> None:
         mode="json"
     )
     assert "cell_focus" not in json.loads(frame.model_dump_json())
+
+
+_OFFSET_KEYS = {"well_dx_um", "well_dy_um"}
+
+
+def test_a_frame_without_its_place_in_the_well_dumps_without_the_keys() -> None:
+    # m3 §8 (#430): a scan written before the offsets existed reads, and is
+    # written back, exactly as it was: an older smc refuses a key it does not
+    # know (FM-107), so a frame with no offsets must not grow two.
+    frame = ScanFrame.model_validate(_FRAME)
+    assert frame.well_dx_um is None
+    assert frame.well_dy_um is None
+    assert not _OFFSET_KEYS & set(frame.model_dump())
+    assert not _OFFSET_KEYS & set(frame.model_dump(mode="json"))
+    assert not _OFFSET_KEYS & set(json.loads(frame.model_dump_json()))
+    assert set(frame.model_dump(mode="json")) == set(_FRAME)
+    assert ScanFrame.model_validate(frame.model_dump(mode="json")) == frame
+    # Nested in a result, and the result still loads from its own dump.
+    result = ScanResult.model_validate({**_SCAN, "frames": [_FRAME, _FRAME]})
+    dumped = result.model_dump(mode="json")
+    assert all(not _OFFSET_KEYS & set(f) for f in dumped["frames"])
+    assert ScanResult.model_validate(dumped) == result
+    # The interplay with cell_focus: each is left out by its own rule.
+    only_focus = ScanFrame.model_validate({**_FRAME, "cell_focus": _FIELD_FOCUS})
+    dump = only_focus.model_dump(mode="json")
+    assert "cell_focus" in dump
+    assert not _OFFSET_KEYS & set(dump)
+    only_offsets = ScanFrame.model_validate(
+        {**_FRAME, "well_dx_um": 1.0, "well_dy_um": 2.0}
+    )
+    dump = only_offsets.model_dump(mode="json")
+    assert "cell_focus" not in dump
+    assert set(dump) >= _OFFSET_KEYS
+
+
+def test_a_frame_with_its_place_in_the_well_dumps_both_keys() -> None:
+    frame = ScanFrame.model_validate(_FRAME_FOCUSED)
+    for dump in (
+        frame.model_dump(),
+        frame.model_dump(mode="json"),
+        json.loads(frame.model_dump_json()),
+    ):
+        assert dump["well_dx_um"] == 12.5
+        assert dump["well_dy_um"] == -7.25
+    # An offset of exactly zero is a place (the well's centre), not a missing
+    # value: it stays in the dump.
+    centre = ScanFrame.model_validate({**_FRAME, "well_dx_um": 0.0, "well_dy_um": -0.0})
+    assert set(centre.model_dump(mode="json")) >= _OFFSET_KEYS
+    assert centre.well_dx_um == 0.0
+
+
+@pytest.mark.parametrize("given", ["well_dx_um", "well_dy_um"])
+def test_one_offset_without_the_other_is_refused(given: str) -> None:
+    # Half a place is no place: a reader would take the missing half as zero.
+    sample = {**_FRAME, given: 1.0}
+    assert _error_types(ScanFrame, sample) == ["value_error"]
+    with pytest.raises(ValidationError, match="go together"):
+        ScanFrame.model_validate(sample)
+    # ``None`` for the other is the same as leaving it out.
+    both = {"well_dx_um": 1.0, "well_dy_um": 2.0}
+    missing = next(key for key in both if key != given)
+    assert _error_types(ScanFrame, {**_FRAME, **both, missing: None}) == ["value_error"]
+
+
+@pytest.mark.parametrize("key", ["well_dx_um", "well_dy_um"])
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_an_offset_that_is_not_a_number_is_refused(key: str, bad: float) -> None:
+    # FM-32, FM-104: unknown is ``None``, never ``nan``; a nan would slip into
+    # every footprint the report draws from the record.
+    sample = {**_FRAME, "well_dx_um": 1.0, "well_dy_um": 2.0, key: bad}
+    with pytest.raises(ValidationError):
+        ScanFrame.model_validate(sample)
 
 
 def test_a_sweep_refuses_lists_that_do_not_hold_together() -> None:
