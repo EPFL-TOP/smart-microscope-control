@@ -1173,6 +1173,94 @@ def test_read_autofocus_offset_without_soft_limits_says_no_first_lock(
     )
 
 
+# --- an offset outside the soft limits says so (m2 §12.10.6, #407) --------------------
+
+ABOVE_AND_WHAT_IT_MEANS = (
+    ": above them; smc would not set an offset there, and here it engages only at an "
+    "offset it has read locked with this objective (m2 §12.2 D1), and the stand's own "
+    "button would drive Z to the plane this offset names (m2 §12.1)"
+)
+
+
+def _offset_read_at(
+    value: float,
+    limits: tuple[float, float] = (0.0, 20000.0),
+    *,
+    declared: bool = False,
+) -> DriveResult:
+    """``read_autofocus_offset`` of a demo stand whose offset is ``value`` within ``limits``."""
+    profile = Profile.demo().model_copy(deep=True)
+    profile.safety.autofocus_offset_soft_limits = limits
+    profile.autofocus.offset_unit = "PFSOffset units"
+    profile.autofocus.engage_drives_z_to_offset = declared
+    core = FakeCore.demo_like()
+    core.setAutoFocusOffset(value)
+    microscope = Microscope.from_core(cast("CMMCorePlus", core), profile)
+    try:
+        return drive.read_autofocus_offset(microscope)
+    finally:
+        microscope.close()
+
+
+def test_read_autofocus_offset_above_the_limits_on_a_declared_stand_says_what_that_means() -> (
+    None
+):
+    # Session 3 read 24370 within [0, 20000] and nothing said it lay outside what smc
+    # may set. One unit past the bound, so that no tolerance hides it.
+    result = _offset_read_at(20001.0, declared=True)
+
+    assert result == DriveResult(
+        f"offset 20001 PFSOffset units, soft limits [0, 20000]{ABOVE_AND_WHAT_IT_MEANS}"
+    )
+
+
+def test_read_autofocus_offset_above_the_limits_on_an_undeclared_stand_says_only_that_smc_would_not_set_it() -> (
+    None
+):
+    result = _offset_read_at(20001.0)
+
+    assert result == DriveResult(
+        "offset 20001 PFSOffset units, soft limits [0, 20000]: above them; smc would "
+        "not set an offset there"
+    )
+
+
+@pytest.mark.parametrize("declared", [False, True], ids=["undeclared", "declared"])
+def test_read_autofocus_offset_below_the_limits_says_so(declared: bool) -> None:
+    # What a value below the floor means on the stand is #364's first item, open: the
+    # text claims only what is certain, on a declared stand as on any other.
+    result = _offset_read_at(-1.0, declared=declared)
+
+    assert result == DriveResult(
+        "offset -1 PFSOffset units, soft limits [0, 20000]: below them; smc would not "
+        "set an offset there"
+    )
+
+
+@pytest.mark.parametrize("declared", [False, True], ids=["undeclared", "declared"])
+@pytest.mark.parametrize("at", [5000.0, 12000.0], ids=["floor", "ceiling"])
+def test_read_autofocus_offset_at_each_bound_is_inside(
+    at: float, declared: bool
+) -> None:
+    # The bounds are inside: a `<` for a `<=` would flag the floor itself, which is
+    # what `--floor` sets.
+    result = _offset_read_at(at, (5000.0, 12000.0), declared=declared)
+
+    assert result == DriveResult(
+        f"offset {at:g} PFSOffset units, soft limits [5000, 12000]"
+    )
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_read_autofocus_offset_that_is_not_finite_gets_no_clause(value: float) -> None:
+    # It lies on no side of the limits.
+    result = _offset_read_at(value, declared=True)
+
+    assert result == DriveResult(
+        f"offset {value:g} PFSOffset units, soft limits [0, 20000]"
+    )
+
+
 def test_set_autofocus_offset_to_the_floor_sends_the_lower_bound() -> None:
     microscope = _with_offset_limits()
     try:

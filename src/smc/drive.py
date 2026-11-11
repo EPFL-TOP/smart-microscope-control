@@ -375,22 +375,62 @@ def _offset_text(autofocus: Autofocus, value: float) -> str:
     return f"{value:g} {autofocus.offset_unit() or 'device units'}"
 
 
+def _outside_clause(
+    value: float, limits: tuple[float, float], *, declared: bool
+) -> str:
+    """What the text says of an offset outside the soft limits; nothing for one inside or not finite.
+
+    The limits bound smc's writes and never the stand's (a turn restores an
+    offset, the knob under lock moves it), so a value outside them is the
+    stand's own, and the text says so (m2 §12.10.6). The bounds themselves are
+    inside, and a value that is not finite lies on no side. Above, a declared
+    stand adds what that means there: an engage needs an offset read locked
+    with this objective, and the stand's own button drives Z to the plane the
+    offset names. Below, only the first clause: what a value under the floor
+    means on the stand is not known (#364), so the text claims what is certain.
+    """
+    if not math.isfinite(value):
+        return ""
+    if value < limits[0]:
+        return ": below them; smc would not set an offset there"
+    if value > limits[1]:
+        text = ": above them; smc would not set an offset there"
+        if declared:
+            text += (
+                ", and here it engages only at an offset it has read locked with this "
+                "objective (m2 §12.2 D1), and the stand's own button would drive Z to "
+                "the plane this offset names (m2 §12.1)"
+            )
+        return text
+    return ""
+
+
 def read_autofocus_offset(microscope: Microscope) -> DriveResult:
     """The autofocus offset and its soft limits, whose lower bound is a first lock's floor (m2 §12.10).
 
-    Reads only: ``smc autofocus offset`` with no option.
+    Reads only: ``smc autofocus offset`` with no option. An offset outside the
+    soft limits is said to be, with what that means on this stand; the read
+    still worked, so ``reached`` stays true.
 
     Raises:
         CapabilityMissingError: The stand has no autofocus.
     """
     autofocus = microscope.require(Autofocus)
-    here = _offset_text(autofocus, autofocus.offset_native())
+    value = autofocus.offset_native()
+    here = _offset_text(autofocus, value)
     limits = autofocus.offset_limits_native()
     if limits is None:
         return DriveResult(
             f"offset {here}, no soft limits in the profile (no floor: no first lock)"
         )
-    return DriveResult(f"offset {here}, soft limits [{limits[0]:g}, {limits[1]:g}]")
+    outside = _outside_clause(
+        value,
+        limits,
+        declared=microscope.profile.autofocus.engage_drives_z_to_offset,
+    )
+    return DriveResult(
+        f"offset {here}, soft limits [{limits[0]:g}, {limits[1]:g}]{outside}"
+    )
 
 
 def set_autofocus_offset(microscope: Microscope, value: float | None) -> DriveResult:

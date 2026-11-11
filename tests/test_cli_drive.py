@@ -493,10 +493,39 @@ def test_autofocus_offset_reads_without_sending(
     assert plain.output.splitlines()[-1] == (
         "offset 0 device units, no soft limits in the profile (no floor: no first lock)"
     )
-    # The brackets survive the console: no rich markup is read in them.
+    # The brackets survive the console: no rich markup is read in them. The demo's
+    # offset 0 lies below the floor 5000, and the line says so (#407).
     assert limited.exit_code == 0, limited.output
     assert limited.output.splitlines()[-1] == (
-        "offset 0 device units, soft limits [5000, 12000]"
+        "offset 0 device units, soft limits [5000, 12000]: below them; smc would not "
+        "set an offset there"
+    )
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo")
+def test_autofocus_offset_outside_the_limits_says_so_and_exits_0(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Limits [-10, -5]: the demo's offset 0 lies above them. A finding is no failure
+    # of the read, so the exit code is 0, and nothing is written (m2 §12.10.6).
+    def no_write(microscope: object, value: float | None) -> DriveResult:
+        raise AssertionError("the offset was written")
+
+    monkeypatch.setattr(cli, "set_autofocus_offset", no_write)
+    path = tmp_path / "above.toml"
+    path.write_text(
+        '[microscope]\nname = "above"\n\n'
+        "[safety]\nautofocus_offset_soft_limits = [-10.0, -5.0]\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["autofocus", "offset", "-p", str(path)])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.splitlines()[-1] == (
+        "offset 0 device units, soft limits [-10, -5]: above them; smc would not set "
+        "an offset there"
     )
 
 
