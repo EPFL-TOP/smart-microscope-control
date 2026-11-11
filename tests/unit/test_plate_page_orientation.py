@@ -354,6 +354,31 @@ def test_the_orientation_shown_is_the_registered_plates(
         page.close()
 
 
+def test_a_turn_made_in_a_terminal_shows_at_the_next_view(
+    stand: Microscope, run_doc: Path
+) -> None:
+    # `smc run plate-orientation` from a terminal writes the run document only: the
+    # page learns it at its next read, and the tick (which compares `orientation`
+    # without reading the file, FM-145) then redraws every tab.
+    _registered(run_doc, _fit())
+    page = _page(stand, run_doc)
+    try:
+        assert page.orientation == "not-turned"
+        _record(
+            run_doc,
+            "plate-orientation",
+            _fit(rotation_deg=-179.7, orientation="turned-180"),
+            minute=1,
+            params={"orientation": "turned-180"},
+            reads={"plate": ReadRecord(plugin="plate-registration", attempt="a0")},
+        )
+        assert page.orientation == "not-turned"  # nothing read the file yet
+        assert page.view().orientation == "turned-180"
+        assert page.orientation == "turned-180"
+    finally:
+        page.close()
+
+
 # --- on an estimate, the plate turns about the holder's centre (D7) -----------------------
 
 
