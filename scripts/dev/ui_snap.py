@@ -8,7 +8,7 @@ that matter, and writes a PNG of each, plus ``summary.txt`` with the texts a
 canvas hides. A session reads the PNGs with its Read tool (``/ui-check``).
 
     python scripts/dev/ui_snap.py [--stand {demo-sample,demo}] [--out DIR]
-                                  [--width 1600] [--height 1000]
+                                  [--width 1280] [--height 800]
                                   [--no-results] [--keep-work]
 
 The page can move a stage, so the script takes no profile: ``--stand`` is one of
@@ -74,14 +74,23 @@ STOP_GRACE_S = 25.0
 TERMINATE_GRACE_S = 10.0
 KILL_GRACE_S = 5.0
 
+#: The first four need no chain and are reached on both stands (``expert`` is fourth for
+#: that: m5 §17.8); the last three need the results of a real run of the workflow.
 STATE_NAMES = (
     "empty",
     "wells-selected",
     "snap",
+    "expert",
     "after-density",
     "with-route",
     "turned",
 )
+REACHABLE_ALONE = 4
+
+#: The viewport the page is designed for (m5 §17.3): the strip, the step bar, both
+#: figures and the drive bar are on screen at 1280 x 800, the floor of a stand PC.
+VIEWPORT_WIDTH_PX = 1280
+VIEWPORT_HEIGHT_PX = 800
 
 # A child sharing the console can change its code page (FM-22).
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -145,9 +154,10 @@ class StateRecord:
     name: str
     reached: bool
     reason: str | None = None
-    active_tab: str | None = None
+    step: str | None = None
     wells: str | None = None
     texts: list[str] = field(default_factory=list)
+    on_screen: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -279,7 +289,7 @@ def plan_states(
     images no sample, ``--no-results`` skips the chain, and a chain step that failed
     leaves them without their input.
     """
-    plans = [StatePlan(name, True) for name in STATE_NAMES[:3]]
+    plans = [StatePlan(name, True) for name in STATE_NAMES[:REACHABLE_ALONE]]
     if stand != "demo-sample":
         reason: str | None = (
             "the demo camera images no sample: no cells, no density; "
@@ -290,7 +300,10 @@ def plan_states(
     else:
         reason = None
     if reason is not None:
-        return [*plans, *(StatePlan(n, False, reason) for n in STATE_NAMES[3:])]
+        return [
+            *plans,
+            *(StatePlan(n, False, reason) for n in STATE_NAMES[REACHABLE_ALONE:]),
+        ]
     if chain_failure is not None:
         return [
             *plans,
@@ -298,7 +311,7 @@ def plan_states(
             StatePlan("with-route", False, f"needs the chain: {chain_failure}"),
             StatePlan("turned", False, f"needs the chain: {chain_failure}"),
         ]
-    return [*plans, *(StatePlan(n, True) for n in STATE_NAMES[3:])]
+    return [*plans, *(StatePlan(n, True) for n in STATE_NAMES[REACHABLE_ALONE:])]
 
 
 # --- what is read back -----------------------------------------------------
@@ -342,7 +355,8 @@ def format_summary(
         lines.append(f"== {record.name} ==")
         if record.reached:
             lines.append("reached")
-            lines.append(f"active tab: {record.active_tab or '?'}")
+            lines.append(f"step: {record.step or '?'}")
+            lines += [f"on screen: {part}" for part in record.on_screen]
             if record.wells is not None:
                 lines.append(f"Wells: {record.wells!r}")
             for text in record.texts:
@@ -620,36 +634,70 @@ def _connect(page: Any) -> None:
     )
 
 
+def _step_button(page: Any, number: int, title: str) -> Any:
+    """A step's button by its accessible name, which starts with its number (m5 §17.5).
+
+    The label gains ``✓`` when the step is done, so the name is matched from its
+    start: ``Wells`` alone is also the box's label and the *Plate* the map's, which is
+    why a bare title was ambiguous (#395).
+    """
+    return page.get_by_role("button", name=re.compile(rf"^{number}\. {title}"))
+
+
 def _act_wells_selected(page: Any, stand: Stand) -> None:
     _connect(page)
-    box = page.get_by_label("Wells")
+    # The *Wells* box is on the Wells screen only: its label is one match, which ends
+    # #395's double one (the Wells screen's box and the expert view's list of it).
+    _step_button(page, 3, "Wells").click()
+    box = page.get_by_label("Wells", exact=True)
     box.fill("A1:B2")
     box.press("Enter")
 
 
 def _act_snap(page: Any, stand: Stand) -> None:
-    # The Snap button is on the Image tab, hidden while Plate is the one in view.
-    page.get_by_text("Image", exact=True).click()
+    # The image is beside the map: Snap is always in view, and no screen changes.
     page.get_by_role("button", name="Snap").click()
     page.locator("pre").filter(has_text="snap: ").first.wait_for()
 
 
+def _expert_switch(page: Any) -> Any:
+    return page.get_by_role("button", name="Expert view")
+
+
+def _act_expert(page: Any, stand: Stand) -> None:
+    """The expert switch on, and the wait for it: a pressed Toggle's button has ``bk-active``.
+
+    Measured: ``bk-btn bk-btn-light bk-active``. The photograph is taken by the caller
+    and ``_after_expert`` then puts the switch off, so that the next state starts on a
+    step's screen.
+    """
+    _expert_switch(page).click()
+    page.locator("button.bk-active").filter(has_text="Expert view").wait_for()
+
+
+def _after_expert(page: Any, stand: Stand) -> None:
+    """The switch off again, after the photograph (m5 §17.8); waits for the class to go."""
+    _expert_switch(page).click()
+    page.locator("button.bk-active").filter(has_text="Expert view").wait_for(
+        state="detached"
+    )
+
+
 def _act_after_density(page: Any, stand: Stand) -> None:
     stand.run_chain(CHAIN)
-    # The page reads the file again at the end of a snap, and a snap shows the Image
-    # tab: a redraw while the Plate tab is hidden, the case of #297. No Refresh: it
-    # would redraw a map in view and say nothing of the one drawn out of view.
-    page.get_by_text("Image", exact=True).click()
+    # The page reads the file again at the end of a snap: a redraw of the map with
+    # no Refresh, the case of #297 (a redraw made while the figure is out of view is
+    # no longer possible, since neither figure is ever hidden, but the picture is still
+    # read for the whole plate in view and for plain tick labels, FM-174). Then the
+    # Results screen, whose checklist says the density is done.
     page.get_by_role("button", name="Snap").click()
+    _step_button(page, 5, "Results").click()
     page.locator("pre").filter(has_text="✓ density").first.wait_for()
-    page.get_by_text("Plate", exact=True).first.click()
 
 
 def _act_with_route(page: Any, stand: Stand) -> None:
     stand.run_chain([ROUTE_STEP])
-    # Refresh is on the Plate tab: a state before this one that failed on the Image
-    # tab would otherwise leave this one waiting for a button that is hidden.
-    page.get_by_text("Plate", exact=True).first.click()
+    # Refresh is in the map's header row, always in view.
     page.get_by_role("button", name="Refresh").click()
 
 
@@ -662,8 +710,12 @@ def _act_turned(page: Any, stand: Stand) -> None:
     read from the select's own options, since it is worded from the stand's sides; a
     select with no turned option fails the state on ``select_option``, named.
     """
-    page.get_by_text("Plate", exact=True).first.click()
+    _step_button(page, 2, "Plate").click()
     select = page.get_by_label("Plate lies", exact=True)
+    # The click is answered by the server, which swaps the screen: the select is not
+    # there yet, and `all_inner_texts` does not wait (an empty read gave the default
+    # label, and a timeout on `select_option`).
+    select.wait_for()
     labels = [text.strip() for text in select.locator("option").all_inner_texts()]
     turned = next((t for t in labels if t.startswith("Turned 180")), "Turned 180")
     select.select_option(label=turned)
@@ -674,24 +726,84 @@ ACTIONS = {
     "empty": _act_empty,
     "wells-selected": _act_wells_selected,
     "snap": _act_snap,
+    "expert": _act_expert,
     "after-density": _act_after_density,
     "with-route": _act_with_route,
     "turned": _act_turned,
 }
 
+#: What a state does after its photograph: only ``expert`` has one (its switch off).
+AFTER_ACTIONS = {"expert": _after_expert}
 
-def _read_page(page: Any) -> tuple[str | None, str | None, list[str]]:
-    """The active tab, the Wells box and the text panes, as the page shows them.
+
+def _frame_parts(page: Any) -> list[tuple[str, Any]]:
+    """The parts of the page that must be in view without a scroll (m5 §17.3), by name.
+
+    The strip with STOP, the step bar, both figures and the last control of the drive
+    bar: the page is read for them at the viewport's size (1280 x 800 by default), which
+    is the floor the layout is designed for.
+    """
+    return [
+        ("STOP", page.get_by_role("button", name="STOP")),
+        ("step bar", _step_button(page, 1, "Stand")),
+        ("map", page.locator(".bk-Figure").first),
+        ("image", page.locator(".bk-Figure").last),
+        ("drive bar", page.get_by_role("button", name="Light off")),
+    ]
+
+
+def _on_screen(page: Any) -> list[str]:
+    """One line for each part of ``_frame_parts``: whether it is wholly in the viewport, and where.
+
+    A part that is not drawn, or whose box the browser does not give, says so and is
+    never guessed to be in view. A page with no viewport size (a fake) gives nothing.
+    """
+    viewport = page.viewport_size
+    if not isinstance(viewport, dict):
+        return []
+    lines: list[str] = []
+    for name, locator in _frame_parts(page):
+        if locator.count() == 0:
+            lines.append(f"{name}: not on the page")
+            continue
+        box = locator.first.bounding_box()
+        if box is None:
+            lines.append(f"{name}: not drawn")
+            continue
+        top, bottom = box["y"], box["y"] + box["height"]
+        left, right = box["x"], box["x"] + box["width"]
+        inside = (
+            top >= 0
+            and left >= 0
+            and bottom <= viewport["height"]
+            and right <= viewport["width"]
+        )
+        lines.append(
+            f"{name}: {'yes' if inside else 'NO'} (y {top:.0f} to {bottom:.0f} of "
+            f"{viewport['height']}, x {left:.0f} to {right:.0f} of {viewport['width']})"
+        )
+    return lines
+
+
+def _read_page(page: Any) -> tuple[str | None, str | None, list[str], list[str]]:
+    """The step shown, the Wells box, the text panes and what is on screen, as the page shows them.
 
     ``inner_text("body")`` of a Panel page is empty (shadow DOM); the panes' own
-    ``pre`` elements are not.
+    ``pre`` elements are not. The step is the button of the class ``smc-step-shown``
+    (m5 §17.6, measured on Panel 1.10.0 and 1.9.4); with the expert view on none is,
+    and it says so.
     """
-    tab = page.locator(".bk-tab.bk-active")
-    active = tab.first.inner_text().strip() if tab.count() else None
-    box = page.get_by_label("Wells")
+    shown = page.locator(".smc-step-shown button")
+    if shown.count():
+        step: str | None = shown.first.inner_text().strip()
+    elif page.locator("button.bk-active").filter(has_text="Expert view").count():
+        step = "(the expert view)"
+    else:
+        step = None
+    box = page.get_by_label("Wells", exact=True)
     wells = box.input_value() if box.count() == 1 else None
     texts = [t.strip() for t in page.locator("pre").all_inner_texts() if t.strip()]
-    return active, wells, texts
+    return step, wells, texts, _on_screen(page)
 
 
 def _outputs(out: Path, name: str) -> list[Path]:
@@ -762,7 +874,10 @@ def drive(
             page.wait_for_timeout(SETTLE_MS)
             page.screenshot(path=str(out / f"{plan.name}.png"))
             page.screenshot(path=str(out / f"{plan.name}-full.png"), full_page=True)
-            active, wells, texts = _read_page(page)
+            step, wells, texts, on_screen = _read_page(page)
+            after = AFTER_ACTIONS.get(plan.name)
+            if after is not None:
+                after(page, stand)
         except (pw.Error, ChainFailedError) as exc:
             reason = (
                 exc.args[0]
@@ -779,7 +894,9 @@ def drive(
                 later = plan_states(stand_name, results=results, chain_failure=reason)
                 remaining = list(later[len(records) :])
             continue
-        records.append(StateRecord(plan.name, True, None, active, wells, texts))
+        records.append(
+            StateRecord(plan.name, True, None, step, wells, texts, on_screen)
+        )
     return records, errors, warnings[0]
 
 
@@ -817,8 +934,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_OUT,
         help=f"where the PNGs and summary.txt go (default: {DEFAULT_OUT})",
     )
-    parser.add_argument("--width", type=int, default=1600, help="viewport width, px")
-    parser.add_argument("--height", type=int, default=1000, help="viewport height, px")
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=VIEWPORT_WIDTH_PX,
+        help="viewport width, px (default: the 1280 the layout is designed for)",
+    )
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=VIEWPORT_HEIGHT_PX,
+        help="viewport height, px (default: the 800 the layout is designed for)",
+    )
     parser.add_argument(
         "--no-results",
         action="store_true",
