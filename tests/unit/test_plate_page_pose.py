@@ -29,6 +29,8 @@ PROFILES = Path(__file__).resolve().parents[2] / "profiles"
 HOLDER_CENTRE = (400.0, -325.0)
 MEASURED = "2026-11-10, sessions 2 and 3 (#334, #405): the mean of two centres"
 THEN = datetime(2026, 11, 10, 9, 0, tzinfo=timezone.utc)
+#: A1's corner on a stand that does not say its sides (m5 §16 D3): the demo's.
+STAGE_A1 = "stage -X +Y"
 
 
 def _with_holder(centre: tuple[float, float] | None = HOLDER_CENTRE) -> Profile:
@@ -143,7 +145,9 @@ def test_a_holder_places_the_nominal_plate_by_its_grid_centre(
 
     view = holder_page.view()
 
-    assert view.pose == MapPose("estimated", holder_centre_um=HOLDER_CENTRE)
+    assert view.pose == MapPose(
+        "estimated", holder_centre_um=HOLDER_CENTRE, a1_corner=STAGE_A1
+    )
     assert view.nominal is True
     centres = _centres(view)
     assert len(centres) == wells
@@ -179,7 +183,7 @@ def test_a_registered_plate_of_the_page_plate_wins_over_the_holder(
 
     view = holder_page.view()
 
-    assert view.pose == MapPose("registered")
+    assert view.pose == MapPose("registered", a1_corner=STAGE_A1)
     assert view.nominal is False
     assert _centres(view)["A1"] == pytest.approx((1000.0, -500.0), abs=0.01)
 
@@ -202,7 +206,7 @@ def test_a_seed_is_drawn_as_a_seed_and_names_its_well(
 
     view = holder_page.view()
 
-    assert view.pose == MapPose("seed", seed_well=well)
+    assert view.pose == MapPose("seed", seed_well=well, a1_corner=STAGE_A1)
     assert view.nominal is False
     assert _centres(view)["A1"] == pytest.approx((1000.0, -500.0), abs=0.01)
 
@@ -213,7 +217,7 @@ def test_every_method_but_seed_is_a_registered_plate(
 ) -> None:
     _register(run_doc, _plate_result(method=method))
 
-    assert holder_page.view().pose == MapPose("registered")
+    assert holder_page.view().pose == MapPose("registered", a1_corner=STAGE_A1)
 
 
 def test_a_plate_registered_for_another_plate_leaves_the_estimate(
@@ -224,7 +228,9 @@ def test_a_plate_registered_for_another_plate_leaves_the_estimate(
 
     view = holder_page.view()
 
-    assert view.pose == MapPose("estimated", holder_centre_um=HOLDER_CENTRE)
+    assert view.pose == MapPose(
+        "estimated", holder_centre_um=HOLDER_CENTRE, a1_corner=STAGE_A1
+    )
     assert view.nominal is True
     assert _centres(view)["A1"] == pytest.approx((-48_225.0, 28_850.0), abs=0.01)
 

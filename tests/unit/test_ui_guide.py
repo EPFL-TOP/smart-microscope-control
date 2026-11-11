@@ -36,12 +36,14 @@ from smc.ui.guide import (
     END_LIVE_LABEL,
     MAP_FIELDS_UP_TO,
     NO_CALIBRATION_FOR_SIDES,
+    ORIENTATION_IN_STAGE_TERMS,
     SELECT_WELLS,
     WALLS_DRY_RUN,
     WALLS_MAX_CENTRES,
     WALLS_MIN_CENTRES,
     WALLS_NEED_CALIBRATION,
     NextStep,
+    a1_corner,
     busy_note,
     capture_centre_label,
     capture_wall_label,
@@ -53,11 +55,13 @@ from smc.ui.guide import (
     image_sides_note,
     map_title,
     next_slot,
+    orientation_label,
     plan_title,
     preset_differences,
     preset_note_text,
     replace_note,
     scan_plan_card_lines,
+    side_words,
     stage_label,
     wall_touches_note,
     walls_card_lines,
@@ -948,20 +952,36 @@ def test_map_title_says_which_pose_in_the_words_of_the_design() -> None:
     assert (
         map_title("96-well", MapPose("registered")) == "96-well: the registered plate"
     )
+    # The registered plate names A1's corner, the check the operator makes (m5 §16 D8).
+    assert (
+        map_title("96-well", MapPose("registered", a1_corner="the back left"))
+        == "96-well: the registered plate, A1 at the back left"
+    )
     assert map_title("96-well", MapPose("seed", seed_well="B3")) == (
         "96-well: placed from one well (B3), not registered: "
-        f"the rotation is assumed 0{DEG}, not measured"
+        "the rotation is taken from the declared orientation, not measured"
     )
     # A seed with no reference well says so without an empty pair of brackets.
     assert map_title("96-well", MapPose("seed")) == (
         "96-well: placed from one well, not registered: "
-        f"the rotation is assumed 0{DEG}, not measured"
+        "the rotation is taken from the declared orientation, not measured"
     )
     assert map_title(
         "24-well", MapPose("estimated", holder_centre_um=(400.0, -325.0))
     ) == (
         "24-well: estimated from the stand's holder, not registered: "
-        f"centred at stage (400, -325) {UM}, not turned, A1 at the top left of this map"
+        f"centred at stage (400, -325) {UM}, declared not turned, "
+        "A1 at the top left of this map"
+    )
+    assert map_title(
+        "24-well",
+        MapPose(
+            "estimated", holder_centre_um=(400.0, -325.0), orientation="turned-180"
+        ),
+    ) == (
+        "24-well: estimated from the stand's holder, not registered: "
+        f"centred at stage (400, -325) {UM}, declared turned 180{DEG}, "
+        "A1 at the bottom right of this map"
     )
     assert map_title("96-well", MapPose("unplaced")) == (
         "96-well: not registered, and this stand does not say where its plate lies: "
@@ -981,6 +1001,81 @@ def test_the_title_is_plain_text_whatever_the_plate_is_called() -> None:
     # FM-139: a title is never markup. The plate name is quoted as it is.
     title = map_title("<b>96-well</b>", MapPose("unplaced"))
     assert title.startswith("<b>96-well</b>: ")
+
+
+# -- which way the plate lies, in words (m5 §16 D3, D8, #422) ------------------------
+
+
+def test_the_a1_corner_is_in_the_operators_words_when_the_stand_says_its_sides() -> (
+    None
+):
+    # The Ti2-E: +Y is the back and +X the operator's right.
+    assert a1_corner("not-turned", "+Y", "+X") == "the back left"
+    assert a1_corner("turned-180", "+Y", "+X") == "the front right"
+    assert orientation_label("not-turned", "+Y", "+X") == "A1 at the back left"
+    assert (
+        orientation_label("turned-180", "+Y", "+X")
+        == f"Turned 180{DEG}: A1 at the front right"
+    )
+    # A stand whose back is +X: a word tied to an axis, or to the sign of Y, would say
+    # the Ti2-E's corner here (FM-73). A1 at -X +Y is the front right of it, and +X -Y
+    # the back left.
+    assert a1_corner("not-turned", "+X", "+Y") == "the front right"
+    assert a1_corner("turned-180", "+X", "+Y") == "the back left"
+    # A back of -Y and a right of -X: every sign flipped from the Ti2-E.
+    assert a1_corner("not-turned", "-Y", "-X") == "the front right"
+    assert a1_corner("turned-180", "-Y", "-X") == "the back left"
+
+
+def test_the_a1_corner_is_in_stage_terms_when_the_stand_does_not() -> None:
+    assert a1_corner("not-turned", None, None) == "stage -X +Y"
+    assert a1_corner("turned-180", None, None) == "stage +X -Y"
+    assert (
+        orientation_label("not-turned", None, None) == "Not turned: A1 at stage -X +Y"
+    )
+    assert (
+        orientation_label("turned-180", None, None)
+        == f"Turned 180{DEG}: A1 at stage +X -Y"
+    )
+    # One direction alone names no corner (the profile refuses it; this reads it safely).
+    assert a1_corner("not-turned", "+Y", None) == "stage -X +Y"
+    assert "[holder] back and right" in ORIENTATION_IN_STAGE_TERMS
+
+
+def test_side_words_follow_back_and_right() -> None:
+    assert side_words("+Y", "+X") == {
+        "+Y": "back of the stand",
+        "-Y": "front of the stand",
+        "+X": "operator's right",
+        "-X": "operator's left",
+    }
+    assert side_words("-X", "+Y") == {
+        "-X": "back of the stand",
+        "+X": "front of the stand",
+        "+Y": "operator's right",
+        "-Y": "operator's left",
+    }
+    assert side_words(None, None) == {}
+    assert side_words("+Y", None) == {}
+    assert side_words(None, "+X") == {}
+
+
+def test_a_seeds_title_takes_its_rotation_from_the_declared_orientation() -> None:
+    title = map_title(
+        "24-well",
+        MapPose(
+            "seed",
+            seed_well="C4",
+            orientation="turned-180",
+            a1_corner="the front right",
+        ),
+    )
+    assert title == (
+        "24-well: placed from one well (C4), not registered: the rotation is taken "
+        "from the declared orientation, A1 at the front right, not measured"
+    )
+    # Not the 0° that a seed assumed before an orientation could be declared.
+    assert f"0{DEG}" not in title
 
 
 def _well(
