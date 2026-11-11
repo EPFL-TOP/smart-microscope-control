@@ -189,9 +189,16 @@ class _Camera(SampleCamera):
 class _Turret:
     """A turret whose objective a test changes by hand; ``select`` is recorded, never wanted."""
 
-    def __init__(self, current: str = IN_PLACE) -> None:
+    def __init__(
+        self,
+        current: str = IN_PLACE,
+        offsets: dict[str, tuple[float, float]] | None = None,
+    ) -> None:
         self.now = current
         self.selects: list[str] = []
+        #: The profile's offsets from the reference ``IN_PLACE``; an objective that
+        #: is not here is "not measured", as on the rig before #430.
+        self.offsets = offsets or {}
 
     def labels(self) -> list[str]:
         return [FORTY, IN_PLACE]
@@ -208,6 +215,8 @@ class _Turret:
         return PIXEL_UM
 
     def offset(self, label: str) -> ObjectiveOffset:
+        if label in self.offsets:
+            return ObjectiveOffset(label, IN_PLACE, self.offsets[label], None, "")
         return ObjectiveOffset(label, None, None, None, "")
 
 
@@ -341,8 +350,19 @@ def _plan(rig: _Rig, **params: object) -> ScanPlanResult:
 
 
 def _build(
-    microscope: Microscope, tmp_path: Path, *, calibrated_um: float | None = None
+    microscope: Microscope,
+    tmp_path: Path,
+    *,
+    calibrated_um: float | None = None,
+    plate_objective: str | None = IN_PLACE,
 ) -> _Rig:
+    """The rig with a seeded plate registered with ``plate_objective``.
+
+    ``IN_PLACE`` is the objective the demo has in place, so the plan's shift is
+    ``(0.0, 0.0)`` and the scan's ``assumed`` says nothing of the offsets from a
+    well's centre (m3 §8, #430); ``None`` is a plate that records no objective,
+    whose plan has no shift.
+    """
     run_doc = tmp_path / "run.json"
     _seed(
         run_doc,
@@ -356,6 +376,7 @@ def _build(
             residual_um=None,
             scale_error=None,
             n_refs=0,
+            objective=plate_objective,
         ),
     )
     if calibrated_um is not None:
@@ -2460,6 +2481,10 @@ def test_a_frame_without_cell_focus_is_written_as_before(rig: _Rig) -> None:
         "focus",
         "pfs_offset",
         "t_s",
+        # A scan since #430 records the frame's place in its well; the key that
+        # stays out of the record is the focus step's.
+        "well_dx_um",
+        "well_dy_um",
     }
     with tifffile.TiffFile(rig.run_dir / result.frames[0].file) as tiff:
         written = tiff.shaped_metadata
@@ -2644,3 +2669,251 @@ def test_cell_focus_with_an_autofocus_left_off_says_so(
     assert line in result.assumed
     assert [r.getMessage() for r in caplog.records if r.name == LOGGER] == [line]
     assert not MUTATING & set(af.calls)
+
+
+# ------------------------------------------- a frame's place in its well (m3 §8, #430)
+
+#: The rig's three wells' centres in stage µm, written out from the plate's 9 mm
+#: pitch and A1 at the origin (measured on the demo): the oracle of these tests
+#: does not call ``well_geometry``, which the scan does (FM-124).
+CENTRES_UM = {"A1": (0.0, 0.0), "A2": (9000.0, 0.0), "B2": (9000.0, -9000.0)}
+OFFSET_KEYS = ("well_dx_um", "well_dy_um")
+_OFFSETS_OF = (
+    "the frames' offsets from their well's centre (well_dx_um, well_dy_um) are "
+)
+_NOT_MOVED = (
+    _OFFSETS_OF + "against the plate as the plan holds it, registered with {p} and "
+    "not moved to the frame of {o}: they carry any difference between the two "
+    "(scan-plan's assumed says why)"
+)
+_MOVED = (
+    _OFFSETS_OF + "against the plate moved from {p}'s frame to {o}'s by ({sx}, {sy}) "
+    "µm, the profile's offsets between objectives"
+)
+
+
+def test_a_frame_at_a_wells_centre_reads_zero_zero(rig: _Rig) -> None:
+    # One field per well: it lies at the well's centre, which for A2 and B2 is
+    # 9 mm from the origin, so a scan that forgot the subtraction reads 9 000.
+    plan = _plan(rig, rows=1, columns=1)
+    assert [(f.well, f.x_um, f.y_um) for f in plan.fields] == [
+        (well, *centre) for well, centre in CENTRES_UM.items()
+    ]
+
+    result = _result(_scan(rig))
+
+    assert [f.well for f in result.frames] == ["A1", "A2", "B2"]
+    for frame in result.frames:
+        assert (frame.x_um, frame.y_um) == pytest.approx(
+            CENTRES_UM[frame.well], abs=0.05
+        )
+        assert (frame.well_dx_um, frame.well_dy_um) == pytest.approx(
+            (0.0, 0.0), abs=0.05
+        )
+
+
+def test_a_frame_that_landed_off_reads_the_readbacks_offset(rig: _Rig) -> None:
+    plan = _plan(rig)
+    rig.stage.offset_um = (3.0, -2.0)  # within the landing tolerance (4.8 µm)
+
+    result = _result(_scan(rig))
+
+    assert len(result.frames) == 12
+    for frame, planned in zip(result.frames, plan.fields, strict=True):
+        centre_x_um, centre_y_um = CENTRES_UM[frame.well]
+        # The readback's place: the target's, 3 µm right and 2 µm down. The
+        # frame is not square, so a swapped pair reads other numbers (FM-73).
+        assert frame.well_dx_um == pytest.approx(
+            planned.x_um - centre_x_um + 3.0, abs=0.05
+        )
+        assert frame.well_dy_um == pytest.approx(
+            planned.y_um - centre_y_um - 2.0, abs=0.05
+        )
+        # And exactly the record's own readback minus the centre: not the target.
+        assert frame.well_dx_um == frame.x_um - centre_x_um
+        assert frame.well_dy_um == frame.y_um - centre_y_um
+
+
+def test_the_tiff_alone_places_the_frame_in_its_well(rig: _Rig) -> None:
+    _plan(rig)
+    rig.stage.offset_um = (3.0, -2.0)
+
+    result = _result(_scan(rig))
+
+    for frame in result.frames:
+        with tifffile.TiffFile(rig.run_dir / frame.file) as tiff:
+            stored = tiff.shaped_metadata
+        assert stored is not None
+        written = dict(stored[0])
+        centre_x_um, centre_y_um = CENTRES_UM[frame.well]
+        # Nothing but the file: where the stage was, and where that is in the well.
+        assert written["x_um"] - written["well_dx_um"] == pytest.approx(
+            centre_x_um, abs=1e-6
+        )
+        assert written["y_um"] - written["well_dy_um"] == pytest.approx(
+            centre_y_um, abs=1e-6
+        )
+        assert (written["well_dx_um"], written["well_dy_um"]) == (
+            frame.well_dx_um,
+            frame.well_dy_um,
+        )
+
+
+def test_a_translated_plate_is_measured_from_the_plans_centre_not_the_registrations(
+    rig: _Rig,
+) -> None:
+    # The plate was registered with the 10x and is scanned with the 40x, whose
+    # offset from it is (31.5, -22.5): the plan's fields are the translated
+    # centres (m3 §18.3), and the offsets are against those, so a frame
+    # planned at a centre reads (0, 0). Against the registration's centre it
+    # would read the shift.
+    turret = _Turret(
+        current=FORTY, offsets={IN_PLACE: (0.0, 0.0), FORTY: (31.5, -22.5)}
+    )
+    rig.microscope.override(ObjectiveTurret, turret)
+    plan = _plan(rig, rows=1, columns=1)
+    assert (plan.objective, plan.plate_objective) == (FORTY, IN_PLACE)
+    assert plan.objective_shift_um == (31.5, -22.5)
+
+    result = _result(_scan(rig))
+
+    for frame in result.frames:
+        centre_x_um, centre_y_um = CENTRES_UM[frame.well]
+        assert (frame.x_um, frame.y_um) == pytest.approx(
+            (centre_x_um + 31.5, centre_y_um - 22.5), abs=0.05
+        )
+        assert (frame.well_dx_um, frame.well_dy_um) == pytest.approx(
+            (0.0, 0.0), abs=0.05
+        )
+    assert result.assumed == (
+        _MOVED.format(p=IN_PLACE, o=FORTY, sx="31.5", sy="-22.5"),
+    )
+
+
+def _a_field_in_a_well_no_plate_holds(result: dict[str, Any]) -> None:
+    result["wells"] = [*result["wells"], "Z9"]
+    result["fields"].append(
+        {"well": "Z9", "index": 0, "name": "Z9_0000", "x_um": 1.0, "y_um": 2.0}
+    )
+
+
+def test_a_plan_with_fields_in_a_well_the_plate_does_not_hold_is_refused_before_anything_moves(
+    rig: _Rig,
+) -> None:
+    # An edited run document: Z9 is listed, so the path check passes, and no
+    # plate holds it. Today's scan photographs it and the report then fails.
+    _edit_plan_result(rig, _a_field_in_a_well_no_plate_holds)
+
+    reason = _refused(rig)
+
+    assert reason == (
+        "the plan has fields in well 'Z9', which its plate does not hold: run "
+        "scan-plan again with the stand as it is now"
+    )
+
+
+def test_a_plate_that_records_no_objective_says_the_offsets_were_not_moved_to_the_frame(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    rig = _build(demo_microscope, tmp_path, plate_objective=None)
+    plan = _plan(rig)
+    assert plan.objective_shift_um is None
+
+    result = _result(_scan(rig))
+
+    assert result.assumed == (_NOT_MOVED.format(p="an unknown objective", o=IN_PLACE),)
+    assert all(f.well_dx_um is not None for f in result.frames)
+
+
+def test_the_offset_lines_come_after_every_line_the_scan_already_writes(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    rig = _build(demo_microscope, tmp_path, plate_objective=None)
+    _plan(rig)
+    af = _Autofocus(engaged=True, locked=True)
+    rig.microscope.override(Autofocus, af)
+    rig.stage.after_move = lambda n: af.lose_lock() if n in (2, 3) else None
+
+    result = _result(_scan(rig))
+
+    assert result.assumed == (
+        "the autofocus was engaged again on 2 fields and locked on 2 of them",
+        _NOT_MOVED.format(p="an unknown objective", o=IN_PLACE),
+    )
+
+
+def test_a_plate_registered_with_the_objective_in_place_says_nothing_of_offsets(
+    rig: _Rig,
+) -> None:
+    assert _plan(rig).objective_shift_um == (0.0, 0.0)
+
+    result = _result(_scan(rig))
+
+    assert [line for line in result.assumed if "well_dx_um" in line] == []
+    assert len(result.frames) == 12
+    assert all(f.well_dx_um is not None for f in result.frames)
+
+
+def test_a_dry_run_says_nothing_of_offsets(
+    demo_microscope_dry: Microscope, tmp_path: Path
+) -> None:
+    # The plate records no objective, so a real scan would say so: a dry run
+    # takes no frame, and has no offsets to say anything about.
+    rig = _build(demo_microscope_dry, tmp_path, plate_objective=None)
+    _plan(rig)
+
+    result = _result(_scan(rig))
+
+    assert result.frames == ()
+    assert result.assumed == ("dry run: 12 fields walked, no frame taken",)
+
+
+def test_a_resume_across_an_older_smc_says_which_frames_carry_no_offsets(
+    rig: _Rig,
+) -> None:
+    stop = threading.Event()
+    assert _scan(rig, stop=stop, on_progress=_at(4, stop.set)).status is (
+        StageStatus.stopped
+    )
+    stored = _stored(rig)
+    assert stored.checkpoint is not None
+    assert _checkpoint(rig).wells_done == ("A1",)
+    kept = _checkpoint(rig).frames
+    assert len(kept) == 4
+    assert all(f.well_dx_um is not None for f in kept)
+    before = {f.file: (rig.run_dir / f.file).read_bytes() for f in kept}
+    # The checkpoint as an smc that did not record the offsets wrote it.
+    older = {
+        **stored.checkpoint,
+        "frames": [
+            {k: v for k, v in frame.items() if k not in OFFSET_KEYS}
+            for frame in stored.checkpoint["frames"]
+        ],
+    }
+    write_stage(rig.run_doc, stored.model_copy(update={"checkpoint": older}))
+
+    result = _result(_scan(rig, resume=True))
+
+    assert len(result.frames) == 12
+    # The four kept carry none, and are not filled in; the other eight have them.
+    assert [f.well_dx_um is None for f in result.frames] == [True] * 4 + [False] * 8
+    assert [f.well_dy_um is None for f in result.frames] == [True] * 4 + [False] * 8
+    # Their TIFFs are untouched: the record never disagrees with its file.
+    assert {f.file: (rig.run_dir / f.file).read_bytes() for f in kept} == before
+    assert result.assumed == (
+        "4 of the 4 frames kept from the checkpoint were written before a frame's "
+        "offset from its well's centre was recorded: they carry no well_dx_um or "
+        "well_dy_um",
+    )
+
+
+def test_a_resume_of_a_scan_that_recorded_the_offsets_says_nothing_of_them(
+    stopped: _Rig,
+) -> None:
+    checkpoint = _checkpoint(stopped)
+
+    result = _result(_scan(stopped, resume=True))
+
+    assert result.frames[:4] == checkpoint.frames
+    assert all(f.well_dx_um is not None for f in result.frames)
+    assert result.assumed == ()
