@@ -23,6 +23,9 @@ from smc.ui.controller import PlatePage
 from smc.ui.guide import ORIENTATION_IN_STAGE_TERMS
 from smc.ui.plate_page import PlatePageView
 
+#: A failure a handler swallowed fails the test that did not expect it (#277).
+pytestmark = pytest.mark.usefixtures("handler_failures")
+
 DEG = "\N{DEGREE SIGN}"
 HOLDER_CENTRE = (400.0, -325.0)
 #: The 96-well estimate's wells' box: A1 at (-49 100, 31 175) µm, 11 and 7 pitches of

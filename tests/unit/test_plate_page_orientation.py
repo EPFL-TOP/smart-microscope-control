@@ -523,6 +523,7 @@ def test_captures_are_restored_through_a_turn_after_a_restart(
 # --- another tab (FM-151) -------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("handler_failures")
 def test_a_second_tab_draws_the_new_orientation(
     stand: Microscope, run_doc: Path
 ) -> None:
