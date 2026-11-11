@@ -13,7 +13,7 @@ import shlex
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from smc.plugins.frames import image_direction_of_stage_step, stage_side_of_image_side
 from smc.plugins.slots import WellGeometry
@@ -40,25 +40,34 @@ __all__ = [
     "NO_CALIBRATION_FOR_SIDES",
     "ORIENTATION_IN_STAGE_TERMS",
     "PLATE_NOT_CHOSEN",
+    "SCREEN_LEADS",
+    "SCREEN_TITLES",
     "SELECTION_KEPT_ITS_NAMES",
     "SELECT_WELLS",
+    "STEPS",
+    "STEP_OF_SLOT",
+    "STEP_TITLES",
     "WALLS_DRY_RUN",
     "WALLS_MAX_CENTRES",
     "WALLS_MIN_CENTRES",
     "WALLS_NEED_CALIBRATION",
     "NextStep",
+    "StepName",
+    "StepState",
     "a1_corner",
     "busy_note",
     "capture_centre_label",
     "capture_wall_label",
     "centres_text",
     "command_line",
+    "continue_label",
     "drive_image_note",
     "duration_text",
     "forget_label",
     "image_sides_note",
     "map_title",
     "next_slot",
+    "opening_step",
     "orientation_label",
     "plan_title",
     "preset_differences",
@@ -67,6 +76,8 @@ __all__ = [
     "scan_plan_card_lines",
     "side_words",
     "stage_label",
+    "step_button_label",
+    "step_states",
     "wall_touches_note",
     "walls_card_lines",
     "walls_centres_problem",
@@ -184,6 +195,208 @@ def next_slot(checklist: Sequence[CheckItem]) -> CheckItem | None:
         if not item.optional and item.state != "ok":
             return item
     return None
+
+
+# -- the steps of the guided page (m5 §17.5, #443) -------------------------------------
+
+#: The five screens of the guided page, in the order an operator walks them.
+StepName = Literal["stand", "plate", "wells", "scan", "results"]
+
+STEPS: tuple[StepName, ...] = ("stand", "plate", "wells", "scan", "results")
+
+STEP_TITLES: Mapping[StepName, str] = {
+    "stand": "Stand",
+    "plate": "Plate",
+    "wells": "Wells",
+    "scan": "Scan",
+    "results": "Results",
+}
+
+#: Which screen holds the tools of a checklist slot (m5 §17.5). A slot not listed (a third
+#: party's) belongs to no screen: it is in the expert view only, and the step bar never
+#: says it is waiting for it.
+STEP_OF_SLOT: Mapping[str, StepName] = {
+    "camera-calibration": "stand",
+    "timings": "stand",
+    "plate": "plate",
+    "scan-plan": "wells",
+    "scan": "scan",
+    "cells": "results",
+    "density": "results",
+    "route": "results",
+    "report": "results",
+    "nis-export": "results",
+}
+
+#: The question each screen answers (m5 §17.4, D8). The scan's title is static until the
+#: Wells and Scan screens name the wells (B3, #445).
+SCREEN_TITLES: Mapping[StepName, str] = {
+    "stand": "Which stand, and which preset?",
+    "plate": "Where is the plate?",
+    "wells": "Which wells?",
+    "scan": "Scan the selected wells",
+    "results": "Results",
+}
+
+#: The one sentence under a screen's title (m5 §17.4).
+SCREEN_LEADS: Mapping[StepName, str] = {
+    "stand": (
+        "The preset fills in the plate, the scan's coverage and the cell detector. "
+        "You can change any of them later."
+    ),
+    "plate": (
+        "Centre three wells far apart by eye, with Live and the arrows, and capture "
+        "each centre."
+    ),
+    "wells": (
+        "Click wells on the map, or type them. The map shows the fields and the time "
+        "the scan will take."
+    ),
+    "scan": "STOP, at the top right, stops the scan.",
+    "results": "Each step reads the one before. Run the next one, or all that are left.",
+}
+
+#: A step's summary is one line under its button and never wider than the button's column.
+_SUMMARY_CHARS = 40
+
+
+@dataclass(frozen=True, slots=True)
+class StepState:
+    """What the step bar draws for one step: a tick, the suggestion, one line (m5 §17.5).
+
+    The state is the run document's and the connection's, never a view's: the step
+    *shown* belongs to the browser tab (D6), whereas *done* and *suggested* are the same
+    in every tab (FM-151).
+    """
+
+    step: StepName
+    done: bool
+    suggested: bool
+    summary: str
+
+
+def _cut(text: str) -> str:
+    """``text`` as a summary line: cut with an ellipsis rather than overflow the button."""
+    if len(text) <= _SUMMARY_CHARS:
+        return text
+    return text[: _SUMMARY_CHARS - 1] + "…"
+
+
+def _count(n: int, noun: str) -> str:
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
+def step_states(
+    checklist: Sequence[CheckItem],
+    *,
+    connected: bool,
+    stand: str,
+    preset: str | None,
+    plate: str,
+    plan: PlanLayer | None,
+) -> tuple[StepState, ...]:
+    """The five steps' states, in ``STEPS`` order, from the checklist and the connection.
+
+    The *stand* step is done by the connection alone: the optional slots (the camera's
+    calibration, the timings) never decide a step, since the workflow runs without them.
+    Another step is done when every required slot it holds is ``ok``, and a step the
+    checklist holds no required slot of is not done (unknown beats guessed: an empty
+    checklist says nothing about the plate). At most one step is suggested, the one that
+    holds ``next_slot``, or the stand while the page is not connected: nothing else can
+    run before it. A step that is neither done nor suggested has an empty summary, and
+    the suggested one says ``next``; *results* says how many of its tools are done as
+    soon as one is, since five tools are not one decision.
+
+    ``stand`` is the profile's name (``PlatePage.stand_name``, read without the stand),
+    ``preset`` the loaded preset's name, ``plate`` the plate the page is about and
+    ``plan`` the usable scan plan (``None``: none, or not readable).
+    """
+    held: dict[StepName, list[CheckItem]] = {step: [] for step in STEPS}
+    for item in checklist:
+        step = STEP_OF_SLOT.get(item.slot)
+        if step is not None:
+            held[step].append(item)
+
+    following = next_slot(checklist)
+    suggested: StepName | None
+    if not connected:
+        suggested = "stand"
+    elif following is None:
+        suggested = None
+    else:
+        suggested = STEP_OF_SLOT.get(following.slot)
+
+    states: list[StepState] = []
+    for step in STEPS:
+        required = [item for item in held[step] if not item.optional]
+        done_slots = sum(1 for item in held[step] if item.state == "ok")
+        done = (
+            connected
+            if step == "stand"
+            else bool(required) and all(item.state == "ok" for item in required)
+        )
+        summary = ""
+        if step == "stand":
+            if not connected:
+                summary = "not connected"
+            elif preset:
+                summary = f"{stand}, preset {preset}"
+            else:
+                summary = stand
+        elif step == "results" and done_slots:
+            summary = f"{done_slots} of {len(held[step])} done"
+        elif done and step == "plate":
+            summary = f"{plate}, registered"
+        elif done and step == "wells":
+            summary = (
+                f"{_count(plan.wells, 'well')}, {_count(plan.count, 'field')}"
+                if plan is not None
+                else "laid out"
+            )
+        elif done and step == "scan":
+            summary = "scanned"
+        elif step == suggested:
+            summary = "next"
+        states.append(
+            StepState(
+                step=step,
+                done=done,
+                suggested=step == suggested,
+                summary=_cut(summary),
+            )
+        )
+    return tuple(states)
+
+
+def opening_step(states: Sequence[StepState]) -> StepName:
+    """The step the page opens on: the suggested one, else *results* (m5 §17.5, D2).
+
+    Nothing left to do means the operator comes to read what was made. Only the
+    opening is the page's choice: afterwards the screen changes by the operator's
+    click alone (D2).
+    """
+    for state in states:
+        if state.suggested:
+            return state.step
+    return "results"
+
+
+def step_button_label(index: int, state: StepState) -> str:
+    """A step button's label: ``2. Plate ✓`` when done, ``2. Plate`` otherwise.
+
+    The number makes each button's accessible name unique: *Plate* is also a select's
+    label and the map's title, which ``/ui-check`` locates by text (m5 §17.5).
+    """
+    tick = " ✓" if state.done else ""
+    return f"{index}. {STEP_TITLES[state.step]}{tick}"
+
+
+def continue_label(step: StepName) -> str | None:
+    """The *Continue* button's label on ``step``: the next step's title, ``None`` after the last."""
+    position = STEPS.index(step)
+    if position + 1 >= len(STEPS):
+        return None
+    return f"Continue to {STEP_TITLES[STEPS[position + 1]]}"
 
 
 def capture_centre_label(well: str | None) -> str:
