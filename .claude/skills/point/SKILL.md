@@ -66,7 +66,10 @@ The session ends when the list is posted.
    PR, if there is one → `/develop n` (if its **Depends on** is merged) →
    `/review <pr>` → merge; a `/feature n` replaces the plan and the develop
    for a small issue. A plan with no develop step after it is an incomplete
-   lane. A step that waits for another lane names it (`after S2.3`). A
+   lane. A design PR that a `/plan` opened gets **no `/review` session**:
+   the owner reads its decision and merges it on green; a `/review` is for
+   a develop session's PR. A step that waits for another lane names it
+   (`after S2.3`). A
    session the owner runs at the stand (`/hardware-session`, `during`) is a
    lane of its own. The last step of the day is a fresh `/point`.
 

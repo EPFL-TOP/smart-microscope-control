@@ -187,10 +187,13 @@ def main_ci(runs: list[dict[str, Any]], stamp: str) -> list[str]:
         f" {clip(str(last.get('displayTitle', '')), 70)})"
     ]
     for r in ci:
-        failed = str(r.get("conclusion") or "").upper() in _FAILING
-        if failed and str(r.get("createdAt", "")) >= stamp:
+        conclusion = str(r.get("conclusion") or "").upper()
+        if conclusion in _FAILING and str(r.get("createdAt", "")) >= stamp:
+            # A push run that a newer push cancelled is no verdict on the code
+            # (ADR-0009): six of them read as six red mains on 2026-11-11.
+            word = "cancelled, no verdict" if conclusion in _NO_VERDICT else "FAILED"
             out.append(
-                f"- FAILED {str(r['createdAt'])[:16]} {event_label(r)}"
+                f"- {word} {str(r['createdAt'])[:16]} {event_label(r)}"
                 f" {clip(str(r.get('displayTitle', '')), 70)} {r.get('url', '')}"
             )
     return out

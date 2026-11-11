@@ -187,6 +187,18 @@ def test_a_flake_that_failed_main_since_the_last_point_is_listed(point) -> None:
     ]
 
 
+def test_a_run_cancelled_by_a_newer_push_is_listed_as_no_verdict(point) -> None:
+    # Six superseded push runs read as six red mains on 2026-11-11.
+    runs = [
+        _run("2026-10-01T09:00:00Z", "cancelled", "feat: a"),
+        _run("2026-10-01T10:00:00Z", "success", "feat: b"),
+    ]
+    assert point.main_ci(runs, "2026-10-01T00:00:00Z") == [
+        "- latest: success, push (2026-10-01T10:00, feat: b)",
+        "- cancelled, no verdict 2026-10-01T09:00 push feat: a u/2026-10-01T09:00:00Z",
+    ]
+
+
 def test_the_ci_lines_of_main_say_the_event(point) -> None:
     runs = [
         _run("2026-10-01T09:00:00Z", "failure", "feat: a", event="schedule"),
