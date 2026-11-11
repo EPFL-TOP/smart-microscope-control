@@ -279,13 +279,37 @@ def test_a_turret_between_positions_names_seating_it_and_the_z_rise() -> None:
     assert caught.value.__cause__ is original
 
 
+def test_the_turret_hint_holds_for_any_call_and_a_wrapped_answer() -> None:
+    # The cause is the same whichever call reads the turret, and an adapter or a
+    # later pymmcore may wrap the answer in a prefix and an error code.
+    text = f'Error in device "Nosepiece": {BETWEEN_POSITIONS} (11)'
+    with pytest.raises(HardwareError) as caught:
+        _proxy(RuntimeError(text), "objective_turret").getXPosition("Nosepiece")
+    assert str(caught.value) == (
+        f"objective_turret: getXPosition('Nosepiece') failed ({text}); {TURRET_HINT}"
+    )
+
+
+def test_a_turret_answer_that_is_not_utf8_keeps_the_hint_and_can_be_encoded() -> None:
+    # FM-05: the turret's branch goes through the same sanitising as every fault.
+    with pytest.raises(HardwareError) as caught:
+        _proxy(
+            RuntimeError(f"{BETWEEN_POSITIONS} caf\udce9"), "objective_turret"
+        ).getStateLabel("Nosepiece")
+    message = str(caught.value)
+    message.encode("utf-8")
+    assert "caf?" in message
+    assert message.endswith(f"; {TURRET_HINT}")
+
+
 @pytest.mark.parametrize(
     ("role", "text"),
     [
         ("objective_turret", "turret did not answer"),
         ("xy_stage", BETWEEN_POSITIONS),
+        ("objective_turret", BETWEEN_POSITIONS.lower()),
     ],
-    ids=["turret-other-fault", "other-role-same-text"],
+    ids=["turret-other-fault", "other-role-same-text", "turret-other-case"],
 )
 def test_other_faults_keep_the_device_hint(role: str, text: str) -> None:
     with pytest.raises(HardwareError) as caught:
