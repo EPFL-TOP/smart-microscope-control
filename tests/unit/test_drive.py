@@ -570,6 +570,297 @@ def test_set_objective_without_a_focus_drive_says_nothing_about_z() -> None:
         microscope.close()
 
 
+# --- what the stand did to the autofocus offset during a turn (m2 §8.11 D8, #407) -----
+
+NO_ANSWER = (
+    "autofocus: getAutoFocusOffset() failed (PFS: no answer); check the device: "
+    "power, cable, another program holding it"
+)
+
+
+@pytest.fixture
+def pfs_units() -> Iterator[Microscope]:
+    """The demo whose profile names its offset unit, as the Ti2-E's does."""
+    profile = Profile.demo().model_copy(deep=True)
+    profile.autofocus.offset_unit = "PFSOffset units"
+    microscope = Microscope.from_core(
+        cast("CMMCorePlus", FakeCore.demo_like()), profile
+    )
+    try:
+        yield microscope
+    finally:
+        microscope.close()
+
+
+class MovesZAndTheOffset(MovesZ):
+    """A turret that stops short, and whose turn moves Z and the offset, as the Ti2-E's does."""
+
+    def select(self, label: str, *, confirm: bool = False) -> str:
+        self._core.setAutoFocusOffset(9370.0)
+        return super().select(label, confirm=confirm)
+
+
+def test_set_objective_says_when_the_stand_changed_the_autofocus_offset(
+    pfs_units: Microscope,
+) -> None:
+    # Session 3: the turn to the 10x read the offset 9370 where it had read 0, and
+    # session 2's turn moved Z by +8.70 µm: both are the stand's, and both are said.
+    core = _fake(pfs_units)
+    core.setPosition("Z", 561.52)
+    core.move_z_on_turn(TWENTY_X, 8.70)
+    core.set_offset_on_turn(TWENTY_X, 9370.0)
+
+    result = drive.set_objective(pfs_units, TWENTY_X, confirm=True)
+
+    assert result == DriveResult(
+        f"objective '{TWENTY_X}'; the stand moved Z from 561.52 to 570.22 µm "
+        f"(+8.70 µm); the autofocus offset went from 0 to 9370 PFSOffset units"
+    )
+
+
+def test_set_objective_names_the_offset_when_z_did_not_move(
+    pfs_units: Microscope,
+) -> None:
+    _fake(pfs_units).set_offset_on_turn(TWENTY_X, 9370.0)
+
+    result = drive.set_objective(pfs_units, TWENTY_X, confirm=True)
+
+    assert result == DriveResult(
+        f"objective '{TWENTY_X}'; the autofocus offset went from 0 to 9370 PFSOffset "
+        f"units"
+    )
+
+
+def test_set_objective_names_the_offset_in_a_device_units_stand_when_the_profile_has_no_unit(
+    fake_microscope: Microscope, fake_core: FakeCore
+) -> None:
+    fake_core.set_offset_on_turn(TWENTY_X, 12.5)
+
+    result = drive.set_objective(fake_microscope, TWENTY_X, confirm=True)
+
+    assert result == DriveResult(
+        f"objective '{TWENTY_X}'; the autofocus offset went from 0 to 12.5 device units"
+    )
+
+
+def test_a_one_unit_change_of_the_offset_is_named(
+    fake_microscope: Microscope, fake_core: FakeCore
+) -> None:
+    # The offset is in the device's own units and compared exactly: no tolerance
+    # can be given without a measurement (m2 §8.11 D8).
+    fake_core.set_offset_on_turn(TWENTY_X, 1.0)
+
+    result = drive.set_objective(fake_microscope, TWENTY_X, confirm=True)
+
+    assert result == DriveResult(
+        f"objective '{TWENTY_X}'; the autofocus offset went from 0 to 1 device units"
+    )
+
+
+def test_set_objective_with_an_unchanged_offset_keeps_todays_text(
+    fake_microscope: Microscope, fake_core: FakeCore
+) -> None:
+    fake_core.setAutoFocusOffset(8141.0)
+    fake_core.set_offset_on_turn(TWENTY_X, 8141.0)  # the value it already has
+
+    result = drive.set_objective(fake_microscope, TWENTY_X, confirm=True)
+
+    assert result == DriveResult(f"objective '{TWENTY_X}'")
+
+
+def test_a_nan_offset_before_and_after_is_no_change(
+    fake_microscope: Microscope, fake_core: FakeCore
+) -> None:
+    # nan != nan: an exact comparison alone would say the offset went from nan to nan.
+    fake_core.setAutoFocusOffset(float("nan"))
+    fake_core.set_offset_on_turn(TWENTY_X, float("nan"))
+
+    result = drive.set_objective(fake_microscope, TWENTY_X, confirm=True)
+
+    assert result == DriveResult(f"objective '{TWENTY_X}'")
+
+
+def test_a_turret_that_stops_short_still_says_what_the_offset_did(
+    fake_microscope: Microscope, fake_core: FakeCore
+) -> None:
+    fake_core.setPosition("Z", 561.52)
+    fake_microscope.override(
+        ObjectiveTurret, MovesZAndTheOffset([TEN_X, TWENTY_X], TEN_X, fake_core)
+    )
+
+    result = drive.set_objective(fake_microscope, TWENTY_X, confirm=True)
+
+    assert result == DriveResult(
+        f"objective '{TEN_X}', although '{TWENTY_X}' was asked; the stand moved Z "
+        f"from 561.52 to 570.22 µm (+8.70 µm); the autofocus offset went from 0 to "
+        f"9370 device units",
+        reached=False,
+    )
+
+
+def test_set_objective_reads_the_offset_just_before_the_turn_and_just_after_it(
+    fake_microscope: Microscope, fake_core: FakeCore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    read, turn = fake_core.getAutoFocusOffset, fake_core.setStateLabel
+
+    def read_offset() -> float:
+        events.append("offset")
+        return read()
+
+    def turn_to(label: str, text: str) -> None:
+        events.append("turn")
+        turn(label, text)
+
+    monkeypatch.setattr(fake_core, "getAutoFocusOffset", read_offset)
+    monkeypatch.setattr(fake_core, "setStateLabel", turn_to)
+
+    drive.set_objective(fake_microscope, TWENTY_X, confirm=True)
+
+    assert events == ["offset", "turn", "offset"]
+
+
+def test_set_objective_says_when_the_offset_could_not_be_read(
+    fake_microscope: Microscope, fake_core: FakeCore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Both reads fail, each with a fresh error: the text names the first cause (the
+    # layer logs nothing for this read, so the cause goes here), and the turn is done.
+    reads: list[int] = []
+
+    def no_answer() -> float:
+        reads.append(len(reads) + 1)
+        raise RuntimeError(f"PFS: no answer {len(reads)}")
+
+    monkeypatch.setattr(fake_core, "getAutoFocusOffset", no_answer)
+
+    result = drive.set_objective(fake_microscope, TWENTY_X, confirm=True)
+
+    assert reads == [1, 2]
+    assert result == DriveResult(
+        f"objective '{TWENTY_X}'; the autofocus offset could not be read around the "
+        f"turn (autofocus: getAutoFocusOffset() failed (PFS: no answer 1); check the "
+        f"device: power, cable, another program holding it)"
+    )
+    assert fake_microscope.require(ObjectiveTurret).current() == TWENTY_X
+
+
+def test_set_objective_says_when_only_the_offset_read_before_the_turn_failed(
+    fake_microscope: Microscope, fake_core: FakeCore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = fake_core.getAutoFocusOffset
+    calls: list[int] = []
+
+    def fails_first() -> float:
+        calls.append(0)
+        if len(calls) == 1:  # the drive's own read, before the turn
+            raise RuntimeError("PFS: no answer")
+        return real()
+
+    monkeypatch.setattr(fake_core, "getAutoFocusOffset", fails_first)
+
+    result = drive.set_objective(fake_microscope, TWENTY_X, confirm=True)
+
+    assert result == DriveResult(
+        f"objective '{TWENTY_X}'; the autofocus offset could not be read around the "
+        f"turn ({NO_ANSWER})"
+    )
+
+
+def test_set_objective_says_when_only_the_offset_read_after_the_turn_failed(
+    fake_microscope: Microscope, fake_core: FakeCore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = fake_core.getAutoFocusOffset
+
+    def fails_once_turned() -> float:
+        if fake_core.getStateLabel("Objective") == TWENTY_X:
+            raise RuntimeError("PFS: no answer\nsecond line")  # one line in the text
+        return real()
+
+    monkeypatch.setattr(fake_core, "getAutoFocusOffset", fails_once_turned)
+
+    result = drive.set_objective(fake_microscope, TWENTY_X, confirm=True)
+
+    assert result == DriveResult(
+        f"objective '{TWENTY_X}'; the autofocus offset could not be read around the "
+        f"turn (autofocus: getAutoFocusOffset() failed (PFS: no answer second line); "
+        f"check the device: power, cable, another program holding it)"
+    )
+    assert "\n" not in result.text
+
+
+class ReadsWithoutAMessage(NeverLocks):
+    """An autofocus whose offset read fails with an error that says nothing."""
+
+    def offset_native(self) -> float:
+        raise HardwareError("")
+
+
+def test_an_offset_read_that_fails_without_a_message_names_the_error_class(
+    fake_microscope: Microscope,
+) -> None:
+    fake_microscope.override(Autofocus, ReadsWithoutAMessage())
+
+    result = drive.set_objective(fake_microscope, TWENTY_X, confirm=True)
+
+    assert result == DriveResult(
+        f"objective '{TWENTY_X}'; the autofocus offset could not be read around the "
+        f"turn (HardwareError)"
+    )
+
+
+def test_a_turret_that_stops_short_says_when_the_offset_could_not_be_read(
+    fake_microscope: Microscope, fake_core: FakeCore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_answer() -> float:
+        raise RuntimeError("PFS: no answer")
+
+    monkeypatch.setattr(fake_core, "getAutoFocusOffset", no_answer)
+    fake_microscope.override(ObjectiveTurret, StubTurret([TEN_X, TWENTY_X], TEN_X))
+
+    result = drive.set_objective(fake_microscope, TWENTY_X, confirm=True)
+
+    assert result == DriveResult(
+        f"objective '{TEN_X}', although '{TWENTY_X}' was asked; the autofocus offset "
+        f"could not be read around the turn ({NO_ANSWER})",
+        reached=False,
+    )
+
+
+def test_set_objective_in_dry_run_reads_no_offset_and_keeps_todays_text(
+    dry: Microscope, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    core = _fake(dry)
+    reads: list[str] = []
+    real = core.getAutoFocusOffset
+
+    def counted() -> float:
+        reads.append("offset")
+        return real()
+
+    monkeypatch.setattr(core, "getAutoFocusOffset", counted)
+
+    result = drive.set_objective(dry, TWENTY_X, confirm=True)
+
+    assert result == DriveResult(
+        f"[dry-run] would turn to '{TWENTY_X}'; the turret is at '{TEN_X}'"
+    )
+    assert reads == []
+
+
+def test_set_objective_without_an_autofocus_says_nothing_about_the_offset() -> None:
+    core = FakeCore.demo_like()
+    core.unloadDevice("Autofocus")
+    microscope = Microscope.from_core(cast("CMMCorePlus", core), Profile.demo())
+    try:
+        assert microscope.get(Autofocus) is None
+
+        result = drive.set_objective(microscope, TWENTY_X, confirm=True)
+
+        assert result == DriveResult(f"objective '{TWENTY_X}'")
+    finally:
+        microscope.close()
+
+
 def test_an_engage_that_does_not_lock_is_not_reached(
     fake_microscope: Microscope,
 ) -> None:
@@ -654,6 +945,7 @@ def test_drive_reaches_the_stand_only_through_the_facade() -> None:
         "__future__",
         "collections.abc",
         "dataclasses",
+        "math",
         "typing",
         "smc.hardware.capabilities",
         "smc.hardware.errors",
