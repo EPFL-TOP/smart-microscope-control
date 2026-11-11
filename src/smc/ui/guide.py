@@ -16,13 +16,20 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from smc.plugins.frames import image_direction_of_stage_step, stage_side_of_image_side
+from smc.plugins.slots import WellGeometry
 
 if TYPE_CHECKING:
     from datetime import datetime
 
     from smc.plugins.geometry import Matrix2
     from smc.plugins.slots import PlateResult, ScanPlanResult, WellRef
-    from smc.ui.controller import CheckItem, LoadedPreset, PlanLayer
+    from smc.ui.controller import (
+        CheckItem,
+        LoadedPreset,
+        MapPose,
+        PlanLayer,
+        WellView,
+    )
 
 __all__ = [
     "CAPTURE_WELLS",
@@ -46,12 +53,14 @@ __all__ = [
     "duration_text",
     "forget_label",
     "image_sides_note",
+    "map_title",
     "next_slot",
     "plan_title",
     "preset_differences",
     "preset_note_text",
     "replace_note",
     "scan_plan_card_lines",
+    "stage_label",
     "wall_touches_note",
     "walls_card_lines",
     "walls_centres_problem",
@@ -66,11 +75,12 @@ SELECT_WELLS = (
 )
 
 #: What plate registration waits for on a stand that has no sample to register from:
-#: the plate's place is measured by centring wells, never guessed.
+#: the plate's place is measured by centring wells, never guessed. Three centres fit the
+#: plate and check each other; two fit it and check only their spacing (m5 §15 D7).
 CAPTURE_WELLS = (
     "centre a well under the objective (Live and the Drive pad), click it on the "
-    "map and press Capture centre; a second well, far from the first, fits the "
-    "rotation too"
+    "map and press Capture centre; three wells far apart fit the plate and check "
+    "each other"
 )
 
 #: Why a tool that takes the plate does not run while the page shows the placeholder
@@ -358,6 +368,80 @@ def walls_card_lines(result: PlateResult) -> tuple[str, ...]:
         f"plate {result.plate}: {residual}, rotation {result.rotation_deg:.2f}°"
     )
     return tuple(lines)
+
+
+def map_title(plate: str, pose: MapPose) -> str:
+    """What the map's title says about how its plate was placed, before the scan plan's suffix (m5 §15 D4).
+
+    A well name read off the map is trusted, so the title says on its face which of
+    *registered* (measured), *seed* (one well given, the rotation assumed),
+    *estimated* (from the stand's holder) or *unplaced* (the stand says nothing) the
+    map is, and for the last two what the operator would need to act on it: where the
+    estimate puts the plate and which corner A1 is at, or that the cross then shows the
+    stage and no well. Plain text, never markup (FM-139): the plate name is quoted as it
+    is. The holder's centre is shown to whole µm, which is finer than it is known.
+    """
+    if pose.kind == "registered":
+        return f"{plate}: the registered plate"
+    if pose.kind == "seed":
+        well = f" ({pose.seed_well})" if pose.seed_well else ""
+        return (
+            f"{plate}: placed from one well{well}, not registered: "
+            "the rotation is assumed 0\N{DEGREE SIGN}, not measured"
+        )
+    if pose.kind == "estimated":
+        # `round` is an int: no "-0" for a point a fraction of a micron below zero. A
+        # pose with no centre (the controller never builds one) claims no position.
+        centre = pose.holder_centre_um
+        where = (
+            ""
+            if centre is None
+            else (
+                f"centred at stage ({round(centre[0])}, {round(centre[1])}) "
+                "\N{MICRO SIGN}m, "
+            )
+        )
+        return (
+            f"{plate}: estimated from the stand's holder, not registered: "
+            f"{where}not turned, A1 at the top left of this map"
+        )
+    return (
+        f"{plate}: not registered, and this stand does not say where its plate lies: "
+        "A1 is drawn at stage (0, 0), so the cross shows the stage and not a well"
+    )
+
+
+def stage_label(
+    wells: Sequence[WellView], pose: MapPose, xy_um: tuple[float, float] | None
+) -> str:
+    """The text by the cross: the well the stage is over, and on what that name rests (m5 §15 D5).
+
+    ``""`` when there is no position (a closed stand), when the map is *unplaced* (its
+    A1 is the stage's origin, so a name would be a coincidence of the drawing), or when
+    the point is on no well. Otherwise ``over B3``, then ``(estimated)`` or
+    ``(rotation assumed)`` for the poses that did not measure the plate: a name read off
+    an estimate is an assumption, and a plate turned 180° swaps every name (m5 §15 D6).
+
+    Each ``WellView`` is turned into a ``WellGeometry``, the one place that knows a well's
+    shape (a disc, or a rectangle turned with the plate), rather than copying the test:
+    0.19 ms over the 1536 wells of the largest plate. The first well in the view's order
+    that contains the point wins; wells do not overlap.
+    """
+    if xy_um is None or pose.kind == "unplaced":
+        return ""
+    x_um, y_um = xy_um
+    for well in wells:
+        geometry = WellGeometry(
+            well=well.well,
+            center_um=well.center_um,
+            size_um=well.size_um,
+            circular=well.circular,
+            rotation_deg=well.rotation_deg,
+        )
+        if geometry.contains(x_um, y_um):
+            note = {"estimated": " (estimated)", "seed": " (rotation assumed)"}
+            return f"over {well.well}{note.get(pose.kind, '')}"
+    return ""
 
 
 def plan_title(plan: PlanLayer | None, *, drawn_up_to: int = MAP_FIELDS_UP_TO) -> str:

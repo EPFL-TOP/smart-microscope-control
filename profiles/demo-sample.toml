@@ -53,6 +53,13 @@ pixel_size_um = { "Nikon 10X S Fluor" = 0.65, "Nikon 40X Plan Fluor ELWD" = 0.16
 # group = ""                # the config group whose presets are channels; "" = chosen (m2 §8.5)
 # exclude = []              # device labels that capture() never records
 
+[holder]
+# The stage XY of the centre of the plate's grid of wells (m5 §15 D2). The sample's plate is centred
+# on the stage origin, so the plate page's estimated map lies where the camera's image does. Were
+# [sample] to set a1_center_xy_um, this value would be wrong and the map would still say "estimated".
+plate_centre_xy_um = [0.0, 0.0]
+measured = "by construction: the sample's plate is centred on the stage origin (m1 section 8)"
+
 [quirks]
 # Behaviours the facade must encode for this stand. None for the simulator.
 

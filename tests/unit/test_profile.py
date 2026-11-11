@@ -1508,9 +1508,11 @@ def test_demo_sample_toml_loads_and_names_its_sample() -> None:
     assert loaded.source == DEMO_SAMPLE_TOML.resolve()
     # Every key of [sample] is written out at its default.
     assert loaded.sample == SampleSection()
-    # The rest is the demo's, so a tool behaves as it does on `demo`.
-    rest = {"microscope", "sample", "suggest"}
+    # The rest is the demo's, so a tool behaves as it does on `demo`; the holder is the
+    # sample's own: its plate is centred on the stage origin (m5 §15 D2).
+    rest = {"microscope", "sample", "suggest", "holder"}
     assert loaded.model_dump(exclude=rest) == Profile.demo().model_dump(exclude=rest)
+    assert loaded.holder.plate_centre_xy_um == (0.0, 0.0)
 
 
 def test_demo_sample_toml_writes_every_sample_key() -> None:

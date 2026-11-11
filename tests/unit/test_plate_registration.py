@@ -514,6 +514,36 @@ def test_session_3s_hand_centres_as_measured_are_refused_as_turned_180_degrees()
         calibrate("greiner-24-well", refs)
 
 
+def test_three_hand_centred_wells_of_the_lab_plate_fit_it() -> None:
+    """One centre by eye in each of three wells fits the plate and checks itself (m5 §15 D7, #410).
+
+    The plate lies where the Ti2-E's ``[holder]`` puts it (A1 at (-48 225, 28 850) µm) and
+    each centre is off by what an operator's eye gives, a hundred µm or so, which a well
+    15.6 mm wide at the 10x does not let one judge. The three fit each other: the worst
+    residual is the 121.6 µm measured at the design, a rotation of 0.10° the plate does not
+    have, and A1 within 55 µm of where it is, all below the 300 µm that refuses a fit.
+    """
+    a1 = (-48225.0, 28850.0)
+    truth = _measure("greiner-24-well", a1, 0.0, ["B3", "B5", "C3"])
+    errors = {"B3": (100.0, -60.0), "B5": (-80.0, 90.0), "C3": (50.0, 110.0)}
+    refs = [
+        WellRef(
+            well=r.well,
+            x_um=r.x_um + errors[r.well][0],
+            y_um=r.y_um + errors[r.well][1],
+        )
+        for r in truth
+    ]
+
+    cal = calibrate("greiner-24-well", refs)
+
+    assert cal.residual_um == pytest.approx(121.6, abs=0.5)
+    assert cal.residual_um is not None
+    assert cal.residual_um < GOOD_RESIDUAL_UM
+    assert cal.rotation_deg == pytest.approx(0.10, abs=0.02)
+    assert math.dist(cal.a1_center_xy_um, a1) < 55.0
+
+
 # ---- the round trip against useq's forward model -------------------------
 
 _NAMES = {plate: tuple(nominal_offsets(plate)) for plate in PLATES}

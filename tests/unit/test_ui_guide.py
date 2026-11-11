@@ -7,6 +7,7 @@ shell reads it, never compared with the string the code builds (FM-45).
 from __future__ import annotations
 
 import json
+import math
 import shlex
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
@@ -28,7 +29,7 @@ from smc.plugins.slots import (
     WellFit,
     WellRef,
 )
-from smc.ui.controller import CheckItem, LoadedPreset, PlanLayer
+from smc.ui.controller import CheckItem, LoadedPreset, MapPose, PlanLayer, WellView
 from smc.ui.guide import (
     CAPTURE_WELLS,
     DRY_RUN_NO_FRAME,
@@ -50,12 +51,14 @@ from smc.ui.guide import (
     duration_text,
     forget_label,
     image_sides_note,
+    map_title,
     next_slot,
     plan_title,
     preset_differences,
     preset_note_text,
     replace_note,
     scan_plan_card_lines,
+    stage_label,
     wall_touches_note,
     walls_card_lines,
     walls_centres_problem,
@@ -124,9 +127,17 @@ def test_the_two_waiting_texts_are_the_designs() -> None:
     )
     assert CAPTURE_WELLS == (
         "centre a well under the objective (Live and the Drive pad), click it on the "
-        "map and press Capture centre; a second well, far from the first, fits the "
-        "rotation too"
+        "map and press Capture centre; three wells far apart fit the plate and check "
+        "each other"
     )
+
+
+def test_capture_wells_says_three_wells_far_apart() -> None:
+    # Three centres are what fits a plate and checks itself (m5 §15 D7): two fit it and
+    # check only their spacing, so the text must not keep the old "a second well".
+    assert "three wells far apart" in CAPTURE_WELLS
+    assert "second well" not in CAPTURE_WELLS
+    assert "check each other" in CAPTURE_WELLS
 
 
 def test_the_dry_run_note_says_what_to_do() -> None:
@@ -923,3 +934,150 @@ def test_scan_plan_card_says_how_many_fields_clipping_left_out() -> None:
         "fields: 344 of 392, a grid of 14 × 14 in each well, "  # noqa: RUF001
         "the fields that miss the well left out"
     )
+
+
+# -- the map's title and the cross's label (m5 §15 D4, D5, #410) ---------------------
+
+# Written as names, not as characters: the design says U+00B5 (the micro sign, which a
+# font and an editor take for the Greek mu) and U+00B0.
+UM = "\N{MICRO SIGN}m"
+DEG = "\N{DEGREE SIGN}"
+
+
+def test_map_title_says_which_pose_in_the_words_of_the_design() -> None:
+    assert (
+        map_title("96-well", MapPose("registered")) == "96-well: the registered plate"
+    )
+    assert map_title("96-well", MapPose("seed", seed_well="B3")) == (
+        "96-well: placed from one well (B3), not registered: "
+        f"the rotation is assumed 0{DEG}, not measured"
+    )
+    # A seed with no reference well says so without an empty pair of brackets.
+    assert map_title("96-well", MapPose("seed")) == (
+        "96-well: placed from one well, not registered: "
+        f"the rotation is assumed 0{DEG}, not measured"
+    )
+    assert map_title(
+        "24-well", MapPose("estimated", holder_centre_um=(400.0, -325.0))
+    ) == (
+        "24-well: estimated from the stand's holder, not registered: "
+        f"centred at stage (400, -325) {UM}, not turned, A1 at the top left of this map"
+    )
+    assert map_title("96-well", MapPose("unplaced")) == (
+        "96-well: not registered, and this stand does not say where its plate lies: "
+        "A1 is drawn at stage (0, 0), so the cross shows the stage and not a well"
+    )
+
+
+def test_the_estimated_title_rounds_the_holder_to_whole_microns() -> None:
+    # `:.0f` would print "-0" for a point a fraction of a micron below zero.
+    near = MapPose("estimated", holder_centre_um=(400.4, -324.6))
+    assert "centred at stage (400, -325) " in map_title("96-well", near)
+    zero = MapPose("estimated", holder_centre_um=(-0.4, 0.4))
+    assert "centred at stage (0, 0) " in map_title("96-well", zero)
+
+
+def test_the_title_is_plain_text_whatever_the_plate_is_called() -> None:
+    # FM-139: a title is never markup. The plate name is quoted as it is.
+    title = map_title("<b>96-well</b>", MapPose("unplaced"))
+    assert title.startswith("<b>96-well</b>: ")
+
+
+def _well(
+    name: str,
+    centre: tuple[float, float],
+    *,
+    size: tuple[float, float] = (6000.0, 6000.0),
+    circular: bool = True,
+    rotation_deg: float = 0.0,
+) -> WellView:
+    return WellView(
+        well=name,
+        center_um=centre,
+        size_um=size,
+        circular=circular,
+        rotation_deg=rotation_deg,
+        selected=False,
+        counts=None,
+        per_mm2=None,
+    )
+
+
+WELLS = (
+    _well("A1", (0.0, 0.0)),
+    _well("B3", (18000.0, -9000.0)),
+    # A turned square well: a 4000 by 2000 µm rectangle, its long side 30° from +X.
+    _well(
+        "C5",
+        (50000.0, 0.0),
+        size=(4000.0, 2000.0),
+        circular=False,
+        rotation_deg=30.0,
+    ),
+)
+
+
+def test_stage_label_names_the_well_and_the_pose() -> None:
+    on_b3 = (18000.0, -9000.0)
+    assert stage_label(WELLS, MapPose("registered"), on_b3) == "over B3"
+    assert stage_label(WELLS, MapPose("estimated"), on_b3) == "over B3 (estimated)"
+    assert stage_label(WELLS, MapPose("seed"), on_b3) == "over B3 (rotation assumed)"
+    # The edge counts, as `WellGeometry.contains` has it.
+    assert stage_label(WELLS, MapPose("registered"), (18000.0 + 3000.0, -9000.0)) == (
+        "over B3"
+    )
+
+
+def test_stage_label_is_empty_where_the_map_cannot_name_a_well() -> None:
+    between = (9000.0, -4500.0)
+    assert stage_label(WELLS, MapPose("registered"), between) == ""
+    # No position (a closed stand), and a map that does not say where its plate is.
+    assert stage_label(WELLS, MapPose("registered"), None) == ""
+    assert stage_label(WELLS, MapPose("unplaced"), (0.0, 0.0)) == ""
+    # No wells at all, and a point that is not a number: unknown is not inside.
+    assert stage_label((), MapPose("registered"), (0.0, 0.0)) == ""
+    assert stage_label(WELLS, MapPose("registered"), (float("nan"), 0.0)) == ""
+
+
+def test_stage_label_follows_the_rotation_of_a_square_well() -> None:
+    inside = (50000.0 + 1800.0 * 0.8660254, 1800.0 * 0.5)
+    assert stage_label(WELLS, MapPose("registered"), inside) == "over C5"
+    # Inside the well's axis-aligned box (1900, 800 from its centre), outside the
+    # rectangle turned by 30°: a label that ignored the rotation would name C5.
+    outside = (50000.0 + 1900.0, 800.0)
+    assert stage_label(WELLS, MapPose("registered"), outside) == ""
+
+
+def _turned(
+    centre: tuple[float, float], u_um: float, v_um: float, degrees: float
+) -> tuple[float, float]:
+    """The stage point at ``(u, v)`` from ``centre`` in a plate turned by ``degrees``, written out."""
+    angle = math.radians(degrees)
+    return (
+        centre[0] + math.cos(angle) * u_um - math.sin(angle) * v_um,
+        centre[1] + math.sin(angle) * u_um + math.cos(angle) * v_um,
+    )
+
+
+def test_stage_label_tells_a_rectangle_from_a_disc_and_its_height_from_its_width() -> (
+    None
+):
+    # C5 is the turned 4000 by 2000 µm rectangle of WELLS: half-sizes 2000 (u) and 1000 (v).
+    c5 = (50000.0, 0.0)
+    registered = MapPose("registered")
+    # (1900, 900) is in the rectangle and outside the 2000 µm disc (2102 µm from the
+    # centre): a well passed on as a disc would not name it.
+    assert stage_label(WELLS, registered, _turned(c5, 1900.0, 900.0, 30.0)) == "over C5"
+    # (0, 1500) is in the disc and 500 µm above the rectangle's 1000: a well whose height
+    # was taken for its width (a 4000 µm square) would name it.
+    assert stage_label(WELLS, registered, _turned(c5, 0.0, 1500.0, 30.0)) == ""
+    # A round well is not its bounding square: A1's 6000 µm disc leaves out the corner.
+    assert stage_label(WELLS, registered, (2900.0, 2900.0)) == ""
+    assert stage_label(WELLS, registered, (2100.0, 2100.0)) == "over A1"
+
+
+def test_stage_label_takes_the_first_well_in_the_views_order() -> None:
+    # Wells do not overlap on a real plate; if a view's did, its order decides.
+    twin = _well("Z9", (0.0, 0.0))
+    assert stage_label((WELLS[0], twin), MapPose("registered"), (0.0, 0.0)) == "over A1"
+    assert stage_label((twin, WELLS[0]), MapPose("registered"), (0.0, 0.0)) == "over Z9"

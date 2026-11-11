@@ -92,6 +92,10 @@ reference = ""                 # "" = no offsets: the objective every offset is 
 # z_offset_um = -8.7           # focused Z under this objective minus under the reference
 # measured = "2026-11-12, session 3 (#NNN)"   # required with a value
 
+# [holder]                     # where the plate holder puts a plate: an estimate the plate page draws, never a registration (m5 §15)
+# plate_centre_xy_um = [400.0, -325.0]   # stage XY of the centre of the plate's grid of wells, seated in its holder
+# measured = "2026-11-10, sessions 2 and 3 (#334, #405): ..."   # required with a value
+
 [quirks]                       # free-form, consumed by backends; documented per key in M2
 
 # [suggest.scan-plan]          # one table per plugin: what this stand suggests for its run
@@ -126,6 +130,7 @@ reference = ""                 # "" = no offsets: the objective every offset is 
 | `channels.exclude` | Device labels that `capture()` never records (a `State` device that is not part of a channel). The objective turret is never recorded, listed or not. |
 | `objectives.reference` | The objective every offset is measured from, by its turret label. `""` (the default): no offsets, and every one is unknown. It has no entry of its own: its offset is `(0, 0)` and `0` by definition. Needed as soon as `offsets` has an entry. |
 | `objectives.offsets."<label>"` | One objective's `xy_offset_um` (exactly two numbers), `z_offset_um` and `measured`. Each number is finite, not a boolean and within ±1000 µm (XY) or ±500 µm (Z): chosen guards against a unit or a sign slip, not measurements. A value needs a `measured` that is not blank. A key left out is unknown, never `0`. See [`[objectives]`](#objectives-offsets-between-objectives). |
+| `holder.plate_centre_xy_um` / `holder.measured` | The stage XY, in µm, of the centre of a plate's grid of wells when the plate sits in its holder: exactly two numbers, finite, not booleans, each within ±150 000 µm (a stage is not longer: a larger value is a unit mistake). It needs a `measured` that is not blank. Omitted: the stand does not say where its plate lies. An **estimate**, never a registration: see [`[holder]`](#holder-where-the-holder-puts-a-plate). |
 | `suggest.<plugin>` | What this stand suggests for that plugin's run, shown by the plate page's next step: see [`[suggest]`](#suggest-what-the-stand-suggests-for-a-run). Allowed on every stand. |
 
 **A capture writes the configuration file.** `Channels.capture(name)` replaces
@@ -194,6 +199,41 @@ when it was measured, `unknown` for what was not, and a line for every label of
 the profile that no turret position carries. With `--from-run-doc` it opens no
 stand and prints what the run measured would put into the profile; `--write`
 writes it.
+
+## `[holder]`: where the holder puts a plate
+
+A plate seated in its holder hardly moves, so the stage's XY already says roughly where
+one is on the plate before any registration. This optional table gives the plate page
+that one point, and the page draws its map from it, labelled *estimated* (m5 §15):
+
+```toml
+[holder]
+plate_centre_xy_um = [400.0, -325.0]   # stage XY of the centre of a plate's grid of wells
+measured = "2026-11-10, sessions 2 and 3 (#334, #405): the Greiner 24-well's centre was (543, -313) and (258, -336) um; their mean to 5 um"
+```
+
+- **One point for every plate the holder takes.** The point is the centre of the plate's
+  *grid of wells*, and an SBS plate's grid is centred on its footprint (the standard says
+  so; it is measured for the Greiner 24-well only). The same point therefore serves a
+  96-well and a 24-well plate, and a plate turned 180° lands on itself, so the point does
+  not say which way round the plate lies. A plate of another footprint (a slide, a dish)
+  is not an SBS plate: the map still says *estimated* and claims nothing more.
+- **Estimated, never a registration.** The page reads it to draw the map and to label the
+  well under the cross. It fills no slot of the run document, moves nothing and feeds no
+  tool: a scan, a `goto-well` and a drive click still need a registered plate. Writing it
+  from a registration is not done yet.
+- **How to measure it.** Register a plate with its four corner wells measured (for example
+  with `plate-walls`), take the mean of those four registered centres, and enter it to a few
+  µm: the stage XY of the plate's grid centre. Put the plate back and measure it again before
+  trusting it: a plate taken off and put back moved by 285 µm in X on the Ti2-E, so the value
+  is good to a few hundred µm at best.
+- **`measured` is required** with the value, as an objective's offset needs it: the date,
+  the session and how it was measured. A value nobody can trace is a guess.
+- **Unset, the map says so.** `demo` and `nikon-tie` have no `[holder]`: their map is
+  *unplaced*, with A1 drawn at stage (0, 0), and says that the stand does not say where its
+  plate lies. `demo-sample` sets `[0.0, 0.0]` by construction, since its sample's plate is
+  centred on the stage origin; were `[sample]` to set `a1_center_xy_um`, that value would be
+  wrong and the map would still say *estimated*.
 
 ## Shipped profiles
 

@@ -170,14 +170,43 @@ look at *Image* (a snap ends, a run ends) is framed on the plate when you come b
 under both.
 
 **The map** (*Plate*). The plate in stage µm, X right and Y up, wells as circles (96-well and
-below) or squares (384 and 1536), turned by the plate's rotation. Its title says which
-map it is: **the registered plate** (A1 and the rotation from plate registration), or
-a **nominal map** (A1 at 0, 0, not turned) when no plate is registered or the plate
-you chose is not the registered one. Nothing in the nominal map says where the
-plate really is. Names are drawn up to 96 wells. The selection has a thick blue
+below) or squares (384 and 1536), turned by the plate's rotation. **Its title says how the
+plate was placed**, in one of four ways, because a well name read off the map is trusted:
+
+- `96-well: the registered plate`: A1 and the rotation come from a registration that
+  measured them (`plate-registration`, `plate-walls`, a lattice fit).
+- `96-well: placed from one well (B3), not registered: the rotation is assumed 0°, not
+  measured`: a registration from one well only (a *seed*): A1 is where that well says, the
+  plate is not turned, and nothing checked it.
+- `24-well: estimated from the stand's holder, not registered: centred at stage (400, -325)
+  µm, not turned, A1 at the top left of this map`: no plate is registered (or the registered
+  one is not the plate you chose), and the stand's profile says where its holder puts a plate
+  ([`[holder]`](../../profiles/README.md#holder-where-the-holder-puts-a-plate)). The plate is
+  drawn there, **an estimate good to a few hundred µm**: a plate put back moved by 285 µm on the
+  Ti2-E. It does not know which way round the plate lies, and a plate turned 180° swaps every
+  name (B3 is C4): compare the A1 of the map with the A1 printed on the plate.
+- `96-well: not registered, and this stand does not say where its plate lies: A1 is drawn at
+  stage (0, 0), so the cross shows the stage and not a well`: the stand's profile has no
+  `[holder]`, so the wells are drawn from the origin and name nothing about the stage.
+
+**The estimate is drawn and never used.** It fills no slot of the run document, no tool reads
+it, a capture never takes its well from the cross (*Capture centre of B3* records the well you
+clicked), and a **drive click on an estimated map moves nothing**: `goto-well` needs a
+registered plate (`goto-well reads plate, but the run document has no plate`).
+
+Names are drawn up to 96 wells. The selection has a thick blue
 outline; the cells' **density** colours the wells (grey where unknown, a well with no
 frame is unknown, not zero), for the label chosen under *Density of*. The **route** is
-a red line with its stops, and the stage is a black cross.
+a red line with its stops.
+
+**The cross.** The stage is a black cross, with the well it is over written beside it:
+`over B3` on a registered map, `over B3 (estimated)` on an estimated one, `over B3
+(rotation assumed)` on a seed's, and nothing between wells, on a map the stand does not place,
+or with the stand closed. **While Live runs the cross follows the frames**, ten times a
+second: each frame carries the stage's position, read right after its snap, so the cross
+costs no read of the stage. **Otherwise it follows the page's tick, once a second** (after a
+drive, at rest): a snap never moves it, since its frame is old by the time it is drawn. When
+Live ends the cross is drawn from the stage again within a second.
 
 **The scan plan on the map.** Once `scan-plan` has run and its result is usable, the map
 draws **one orange rectangle for each field of the plan**: the field of view wide and
@@ -543,6 +572,26 @@ plate-registration** then fits the plate from what was captured, as `smc run
 plate-registration --param refs=... --param walls=...` would. Choosing another plate
 clears the selection and the captures.
 
+**Three wells far apart are enough.** A plate seated in its holder hardly moves, so one
+centre in each of three wells (B3, B5 and C3 of a 24-well plate: far apart, not in a line)
+fits the plate and checks itself, two ways:
+
+- **By eye**, with *Capture centre* and **Run plate-registration**. Three centres each off by
+  at most 130 µm fit with a residual of 121.6 µm, a rotation of 0.10° the plate does not have
+  and A1 within 55 µm; **one centre 900 µm off is refused and named** (`B3 is 573 µm from where
+  the others put it: centre it again`). The limit is a worst residual of 300 µm, and **by
+  eye is only as good as the eye**: in the middle of a 15.6 mm well, at the 10x whose field is
+  about 1.4 mm, one cannot judge a few hundred µm. Numbers and limits:
+  [How good the centres must be](../plugins/plate-registration.md#how-good-the-centres-must-be).
+- **From a rough position**, with `plate-walls`: it takes a position up to 3 900 µm from the
+  centre of a 24-well and measures the centre from the well's walls, which is why the page
+  offers it first once two or more centres are captured. It takes longer. Whether it registers
+  the Greiner plate from one rough position in each of three wells is **to be verified at
+  the stand** (Ti2-E session 4).
+
+The map's *estimated* plate does not shorten either: it is drawn to find the way, and
+nothing registers from it.
+
 **Registering the plate from images.** Under `plate-walls` (*Set up*, right after
 `plate-registration`): the tool images each well's four walls itself and fits the plate
 from them, so you centre two or three wells by eye and press a button.
@@ -586,8 +635,9 @@ runs; the same file the next step's command names): `✓ plate` (usable), `· ce
 why). The slots of the plate-scan workflow come first, in its order; any other slot the
 document holds (a third-party plugin's stage) follows by name. A line above the
 map, in the warning colour, says what the page could not read and did not hide: an
-unreadable run document (the page then shows every stage as not run and the nominal
-map, and never writes the file), or a result that no longer matches its model.
+unreadable run document (the page then shows every stage as not run and the map as the
+profile places it, estimated or unplaced, and never writes the file), or a result that no
+longer matches its model.
 
 ## Presets
 
@@ -739,8 +789,8 @@ column, one click for each tool, until it says `every stage of the workflow is d
 
 To practise the plate step as at a stand, **capture centres yourself**: start **Live**,
 centre a well with the **Drive** pad (the frames follow the stage), click it on the map,
-**Capture centre**, and again for a second well far from the first; the next step then
-uses your captures, not the sample's. The plate is centred on the stage origin, so A1 is at
+**Capture centre**, and again for two more wells far apart (three fit the plate and check
+each other); the next step then uses your captures, not the sample's. The plate is centred on the stage origin, so A1 is at
 (−49 500, 31 500) µm and H12 at (49 500, −31 500) µm: drive there in 1000 µm steps, then
 finish with smaller ones. Or run **plate-finding**, which surveys the plate by itself and
 takes about 7 minutes on the demo stage. Each step's `command:` line is the same call from a
@@ -793,6 +843,14 @@ reading the stand once a second during a scan** (it runs on the loop that handle
 click on STOP: a device read that hangs in a vendor driver would delay STOP; it is to
 be timed on the Ti2-E) and what STOP's note says there. These are for the first session
 at the stand ([#198](https://github.com/EPFL-TOP/smart-microscope-control/issues/198)).
+
+**The cross and the estimate** add: the estimate against the plate on the Ti2-E (the Greiner
+plate in its holder, either way round, and the cross over a well it is physically over: the
+`[holder]` value is the mean of two sessions 285 µm apart); the label's names against the
+printed plate (turned 180° the page says `over B3` where the plate says C4); the cross's lag at
+the stand (a second outside Live, a tenth of a second in Live, and `state()` was seen to take up
+to 0.5 s there during Live); the cross and its label at the PC's screen and zoom; and
+`plate-walls` from one rough position in each of three wells, with the time it takes.
 
 **Live** adds: the rate a real browser shows, locally and over RDP (the demo camera
 gives 10 frames a second on the server; ADR-0006's revisit criterion for Panel is what a

@@ -258,6 +258,42 @@ slot**, and a stage that reads it stops with the reason.
 | `B3: the -X wall is given twice`, `a touch of B2 was given for A1`, `no X wall for A1: give -X and/or +X`, `no Y wall for A1: give -Y and/or +Y` | A mistake in `walls`; the text says which. |
 | `objective 'Nikon 100X' is not on the turret: ...`, `no objective is in place: the turret is at an empty position; ...`, `the stand has no turret, so objective cannot be checked; leave it unset` | The objective is not one the turret can have: see [The objective the plate was registered with](#the-objective-the-plate-was-registered-with). |
 
+### How good the centres must be
+
+**Three wells far apart are enough, and they check each other.** A rotation and a translation
+are three unknowns; three centres give six numbers, so three are left over to check the fit,
+and a centre that disagrees with the other two is named. Two centres give four numbers for the
+three unknowns: the one left over checks their spacing and nothing else. The numbers below
+are for the lab's Greiner 24-well (`greiner-24-well`, 19.45 mm between wells) at A1
+(-48 225, 28 850) µm, where the Ti2-E's holder puts it, with the centres of **B3, B5 and C3**
+built from the plate's definition and moved by hand, as `tests/unit/test_plate_registration.py`
+and `tests/test_plate_registration_demo.py` do:
+
+| The centres | The fit |
+|---|---|
+| each off by at most 130 µm: (+100, -60), (-80, +90) and (+50, +110) µm | residual 121.6 µm, a rotation of 0.10° that the plate does not have, A1 off by 49.6 µm: accepted |
+| B3 **900 µm** off in X, B5 and C3 exact | residuals B3 572.8, B5 351.5, C3 247.2 µm: refused, `B3 is 573 µm from where the others put it: centre it again` |
+| each about 290 µm off (hand centring at the limit) | 300.5 µm: also refused |
+
+- **The limit is 300 µm** (`GOOD_RESIDUAL_UM`): a fit whose worst residual is beyond it is
+  refused. It is a limit on the *worst* centre, so three centres that are each 130 µm off
+  give 121.6 µm, and a single bad one stands out.
+- **By eye is only as good as the eye.** The tool needs centres good to a few hundred µm,
+  which an operator cannot judge in the middle of a 15.6 mm well at the 10x (the field is
+  about 1.4 mm). A small residual says the centres agree with each other, not that each is
+  the well's centre: an error the three share (an eye that always centres on the same side of
+  the field) moves A1 with it and shows no residual.
+- **The tool that takes a rough position and measures** is [`plate-walls`](plate-walls.md):
+  its rough position may be up to half the well's radius from the centre (`search_um`:
+  3 900 µm on a 24-well), about ten times the error of the holder's estimate. The plate page offers it
+  first once two or more centres are captured. Whether it registers the Greiner plate from one
+  rough position in each of three wells, and the time it takes, is **verified at Ti2-E session 4**
+  (#404), not here.
+- **An estimate is not a centre.** The plate page draws a plate where the profile's
+  [`[holder]`](../../profiles/README.md#holder-where-the-holder-puts-a-plate) says it lies,
+  labelled *estimated*. That is for finding the way, and no tool takes it: this tool takes
+  centres that were measured.
+
 ## `goto-well`
 
 ```text
