@@ -1200,10 +1200,13 @@ def test_set_offset_on_turn_refuses_an_unknown_label_a_missing_device_and_no_aut
     for label, options, message in refusals:
         with pytest.raises(ValueError, match=f"^{re.escape(message)}$"):
             core.set_offset_on_turn(label, 9370.0, **options)
-    # None of them registered anything.
+    # None of them registered anything. A half-registration is invisible from the
+    # outside (it sits under a bad label, or points at a device that is no Stage),
+    # so the store is read: a refused call must leave it empty.
     core.setStateLabel("Nosepiece", FOUR)
     assert core.getPosition("PFSOffset") == 0.0
     assert core.getAutoFocusOffset() == 0.0
+    assert core._turn_offset == {}
     no_autofocus = FakeCore(
         [FakeDevice("Nosepiece", DeviceType.State, state_labels=(TEN, FOUR))]
     )
@@ -1212,3 +1215,4 @@ def test_set_offset_on_turn_refuses_an_unknown_label_a_missing_device_and_no_aut
         match=f"^{re.escape('set_offset_on_turn: no device is in the AutoFocus slot')}$",
     ):
         no_autofocus.set_offset_on_turn(FOUR, 9370.0)
+    assert no_autofocus._turn_offset == {}

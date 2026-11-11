@@ -657,6 +657,37 @@ def test_a_one_unit_change_of_the_offset_is_named(
     )
 
 
+@pytest.mark.parametrize(
+    ("before", "after", "said"),
+    [
+        # The turn back from the 40x to the 10x (session 3): a fall, from non-zero.
+        (17794.0, 9370.0, "from 17794 to 9370"),
+        (9370.0, 0.0, "from 9370 to 0"),  # a change that lands on 0
+        (-5.0, -10.0, "from -5 to -10"),  # negative, and falling
+        (5.0, -5.0, "from 5 to -5"),  # a sign flip is a change
+        # Below one unit: the device's own units are compared exactly, and a
+        # tolerance of half a unit or of nine tenths would hide this (m2 §8.11 D8).
+        (8141.0, 8141.25, "from 8141 to 8141.25"),
+    ],
+    ids=["fall", "to-zero", "negative", "sign-flip", "sub-unit"],
+)
+def test_a_change_of_the_offset_is_named_in_either_direction_and_at_any_size(
+    fake_microscope: Microscope,
+    fake_core: FakeCore,
+    before: float,
+    after: float,
+    said: str,
+) -> None:
+    fake_core.setAutoFocusOffset(before)
+    fake_core.set_offset_on_turn(TWENTY_X, after)
+
+    result = drive.set_objective(fake_microscope, TWENTY_X, confirm=True)
+
+    assert result == DriveResult(
+        f"objective '{TWENTY_X}'; the autofocus offset went {said} device units"
+    )
+
+
 def test_set_objective_with_an_unchanged_offset_keeps_todays_text(
     fake_microscope: Microscope, fake_core: FakeCore
 ) -> None:
@@ -701,23 +732,37 @@ def test_a_turret_that_stops_short_still_says_what_the_offset_did(
 def test_set_objective_reads_the_offset_just_before_the_turn_and_just_after_it(
     fake_microscope: Microscope, fake_core: FakeCore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The Z reads are recorded too: the second offset read is the last of the whole
+    # call, after D7's second Z read, so that it is as late as it can be after the
+    # turn returned (m2 §8.11 D8, FM-195). The turret reads Z of its own around the
+    # turn, so only the drive's own reads, the first and the last, are pinned.
+    fake_clock(monkeypatch)
     events: list[str] = []
     read, turn = fake_core.getAutoFocusOffset, fake_core.setStateLabel
+    position = fake_core.getPosition
 
     def read_offset() -> float:
         events.append("offset")
         return read()
+
+    def read_z(label: str | None = None) -> float:
+        events.append("z")
+        return position(label)
 
     def turn_to(label: str, text: str) -> None:
         events.append("turn")
         turn(label, text)
 
     monkeypatch.setattr(fake_core, "getAutoFocusOffset", read_offset)
+    monkeypatch.setattr(fake_core, "getPosition", read_z)
     monkeypatch.setattr(fake_core, "setStateLabel", turn_to)
 
     drive.set_objective(fake_microscope, TWENTY_X, confirm=True)
 
-    assert events == ["offset", "turn", "offset"]
+    assert events.count("offset") == 2
+    assert events[:2] == ["z", "offset"]  # Z first, then the offset, then the turn
+    assert events[-2:] == ["z", "offset"]  # the offset after the last Z read
+    assert 2 <= events.index("turn") < len(events) - 2
 
 
 def test_set_objective_says_when_the_offset_could_not_be_read(
