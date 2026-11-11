@@ -29,6 +29,14 @@ sessions**, and the GitHub issue is the contract between them:
   only stable lessons, never the current state. Reviews and plans for
   different PRs or issues run in parallel; changes to the same design
   document run one at a time.
+- A **lane session** (`/lane <S>`, Sonnet, a fresh session) runs one lane of
+  the Point: each step is a fresh subagent in its own worktree
+  (`isolation: worktree`), with the step's model, started from
+  `scripts/dev/lane.py`'s `NEXT:` line; it waits for CI and for merges, and
+  stops, with a `## Lane` note on the Point's issue, where the owner is needed
+  (a decision, a walk, a stand session, a red PR, a second "changes
+  requested"). It never edits, reads a diff, merges or decides: the owner
+  opens up to three, one per lane, and acts on merges and decisions only.
 - An **execution session** (a fresh session, Sonnet unless the plan
   suggests otherwise) takes **one** issue labelled `status: ready`,
   implements its plan, attacks the change with **`/adversarial-review`**
@@ -51,8 +59,8 @@ supervising session stays in the main checkout.
 
 Every comment an agent writes on GitHub starts with a header naming its
 kind and session — `## Plan (design session, <date>)`, `## Report (develop
-session, <date>)` — so that the owner's own notes stand out (`point.py`
-relies on it).
+session, <date>)`, `## Lane (S1, <date>)` — so that the owner's own notes
+stand out (`point.py` relies on it).
 
 ## Workflow: issue → plan → branch → implement → verify → PR
 
@@ -165,7 +173,8 @@ turned into code, a profile entry, a test or a doc line.
 Supervising sessions, each fresh and single-purpose: `/point` take stock
 and list what to do next (it starts every cycle) · `/plan <issue>` write the
 executable plan · `/review <pr>` light review against the plan, the rules
-and the adversarial review · `/adr` propose a decision · `/hardware-session`
+and the adversarial review · `/lane <S>` run one lane of the Point, each step
+a fresh subagent · `/adr` propose a decision · `/hardware-session`
 prepare and write up a session at a stand.
 Execution session: `/develop <issue>` implement one planned issue to a PR;
 it runs `/adversarial-review <issue>` before the PR, and `/ui-check` (the plate

@@ -8,6 +8,7 @@ import importlib.util
 import inspect
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -115,6 +116,27 @@ def test_the_afternoon_point_of_2026_11_11_parses_into_three_lanes() -> None:
     assert [s.segments[0].kind for s in s3] == ["plan", "feature", "feature"]
     # the real Point is a Point `/point` could have posted
     assert lane.check_point(POINT) == []
+
+
+def test_the_example_in_the_point_skill_is_a_point_the_check_accepts() -> None:
+    # /point writes lanes in the grammar its own skill shows: the two must not drift
+    skill = ROOT / ".claude" / "skills" / "point" / "SKILL.md"
+    block = skill.read_text(encoding="utf-8").split("```markdown", 1)[1].split("```")[0]
+    example = textwrap.dedent(block)
+    lanes = lane.parse_point(example)
+    assert list(lanes) == ["S1", "S2", "S3"]
+    assert lane.check_point(example) == []
+    kinds = [seg.kind for steps in lanes.values() for s in steps for seg in s.segments]
+    assert {
+        "plan",
+        "design-merge",
+        "develop",
+        "feature",
+        "review",
+        "merge",
+        "owner",
+    } <= set(kinds)
+    assert lanes["S3"][1].after == ("S1.2", "S2.1")
 
 
 def test_a_lane_ends_at_the_next_bold_line_and_steps_outside_a_lane_are_ignored() -> (
