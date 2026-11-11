@@ -48,6 +48,7 @@ from smc.hardware.capabilities import (
     ZStage,
 )
 from smc.hardware.errors import (
+    AutofocusExcursionError,
     DeviceTimeoutError,
     HardwareError,
     MicroscopeHaltedError,
@@ -1549,6 +1550,7 @@ def test_a_field_that_lands_off_target_is_a_failed_field_and_nothing_else_is_don
     af = _Autofocus(engaged=True, locked=True)
     rig.microscope.override(Autofocus, af)
     rig.stage.landing_error_um = {2: (6.0, 0.0)}
+    _marking_moves(rig, af, lambda _n: None)
 
     result = _result(_scan(rig))
 
@@ -1570,7 +1572,10 @@ def test_a_field_that_lands_off_target_is_a_failed_field_and_nothing_else_is_don
     # scan and once for each of the 11 frames, the offset for the frames only.
     assert af.calls.count("is_locked") == 12
     assert af.calls.count("offset_native") == 11
-    assert "engage" not in af.calls
+    # Nothing at all between the failed field's move and the next; the
+    # engages are the three wells' first fields' (#416).
+    assert _between_moves(af)[2] == []
+    assert af.calls.count("engage") == 3
 
 
 def test_a_field_off_target_does_not_engage_the_autofocus(rig: _Rig) -> None:
@@ -1578,12 +1583,16 @@ def test_a_field_off_target_does_not_engage_the_autofocus(rig: _Rig) -> None:
     af = _Autofocus(engaged=True, locked=True)
     rig.microscope.override(Autofocus, af)
     rig.stage.landing_error_um = {2: (6.0, 0.0)}
-    rig.stage.after_move = lambda n: af.lose_lock() if n in (2, 3) else None
+    _marking_moves(rig, af, lambda n: af.lose_lock() if n in (2, 3) else None)
 
     result = _result(_scan(rig))
 
     assert len(result.failed) == 1
-    assert af.calls.count("engage") == 1  # field 3's, not field 2's
+    cut = _between_moves(af)
+    assert "engage" not in cut[2]  # field 2's lost lock is left to field 3
+    assert cut[3].count("engage") == 1
+    # Field 3's and the three wells' first fields' (#416).
+    assert af.calls.count("engage") == 4
     assert [f.focus for f in result.frames] == ["locked"] * 11
 
 
@@ -1927,28 +1936,34 @@ def test_an_unlocked_autofocus_is_engaged_once_per_field(rig: _Rig) -> None:
 
     result = _result(_scan(rig))
 
-    assert af.calls.count("engage") == 2
+    # Fields 2 and 3, and the three wells' first fields (#416).
+    assert af.calls.count("engage") == 5
     assert [f.focus for f in result.frames] == ["locked"] * 12
     assert {f.pfs_offset for f in result.frames} == {af.offset}
     assert result.assumed == (
         "the autofocus was engaged again on 2 fields and locked on 2 of them",
+        _wall_line(3, 3, 3),
     )
-    assert not {"disengage", "set_offset_native", "offset_by_native"} & set(af.calls)
+    # Switched off at the three walls only; the offset never written.
+    assert af.calls.count("disengage") == 3
+    assert not {"set_offset_native", "offset_by_native"} & set(af.calls)
 
 
 def test_a_failed_engage_records_unlocked_frames(rig: _Rig) -> None:
     af = _Autofocus(engaged=True, locked=True)
-    af.engage_results = [False, True]
+    af.engage_results = [True, False, True]  # A1's wall, field 2, field 3
     rig.microscope.override(Autofocus, af)
     rig.stage.after_move = lambda n: af.lose_lock() if n == 2 else None
 
     result = _result(_scan(rig))
 
     assert [f.focus for f in result.frames] == ["locked", "unlocked"] + ["locked"] * 10
-    assert af.calls.count("engage") == 2  # field 2 failed to lock, field 3 locked
+    # Field 2 failed to lock, field 3 locked; and the three walls'.
+    assert af.calls.count("engage") == 5
     # Item 9: two attempts, one lock: the line counts both.
     assert result.assumed == (
         "the autofocus was engaged again on 2 fields and locked on 1 of them",
+        _wall_line(3, 3, 3),
     )
 
 
@@ -1957,7 +1972,8 @@ def test_an_engage_that_raises_is_the_scans_own_failure_and_is_retried(
 ) -> None:
     """FM-129: the protocol leaves PFS off when it gives up; the next field must not read that as the operator's switch-off."""
     af = _Autofocus(engaged=True, locked=True)
-    af.engage_results = [HardwareError("engage gave up")]
+    # A1's wall's engage locks; field 2's raises.
+    af.engage_results = [True, HardwareError("engage gave up")]
     rig.microscope.override(Autofocus, af)
     rig.stage.after_move = lambda n: af.lose_lock() if n == 2 else None
 
@@ -1966,9 +1982,11 @@ def test_an_engage_that_raises_is_the_scans_own_failure_and_is_retried(
     assert [f.error for f in result.failed] == ["HardwareError: engage gave up"]
     assert len(result.frames) == 11
     assert [f.focus for f in result.frames] == ["locked"] * 11
-    assert af.calls.count("engage") == 2  # field 2's raised, field 3's locked
+    # Field 2's raised, field 3's locked; and the three walls'.
+    assert af.calls.count("engage") == 5
     assert result.assumed == (
         "the autofocus was engaged again on 2 fields and locked on 1 of them",
+        _wall_line(3, 3, 3),
     )
 
 
@@ -1980,7 +1998,7 @@ def test_a_lock_the_operator_took_ends_the_scans_own_failure(rig: _Rig) -> None:
     the scan must not engage it again (it did, measured while planning #228).
     """
     af = _Autofocus(engaged=True, locked=True)
-    af.engage_results = [False]
+    af.engage_results = [True, False]  # A1's wall's, field 2's
     rig.microscope.override(Autofocus, af)
 
     def operator(n: int) -> None:
@@ -1995,18 +2013,21 @@ def test_a_lock_the_operator_took_ends_the_scans_own_failure(rig: _Rig) -> None:
 
     result = _result(_scan(rig, max_unlocked_in_row=100))
 
-    assert af.calls.count("engage") == 1
+    # A1's wall's and field 2's: none after the operator's switch-off, not at
+    # A2's or B2's wall either.
+    assert af.calls.count("engage") == 2
     assert [f.focus for f in result.frames] == ["locked", "unlocked", "locked"] + [
         "unlocked"
     ] * 9
     assert result.assumed == (
         "the autofocus was engaged again on 1 fields and locked on 0 of them",
+        _wall_line(1, 1, 1),
     )
 
 
 def test_unlocked_fields_in_a_row_fail_the_scan(rig: _Rig) -> None:
     af = _Autofocus(engaged=True, locked=True)
-    af.engage_results = [False] * 12
+    af.engage_results = [True] + [False] * 12  # A1's wall's locks
     rig.microscope.override(Autofocus, af)
     rig.stage.after_move = lambda n: af.lose_lock() if n >= 2 else None
 
@@ -2023,7 +2044,8 @@ def test_unlocked_fields_in_a_row_fail_the_scan(rig: _Rig) -> None:
 def test_unlocked_fields_not_in_a_row_do_not_fail_the_scan(rig: _Rig) -> None:
     """The count resets on a lock: two lost locks far apart are not two in a row."""
     af = _Autofocus(engaged=True, locked=True)
-    af.engage_results = [False, True, False, True]
+    # A1's wall's, then fields 2 to 5 (A2's wall finds it off after field 4).
+    af.engage_results = [True, False, True, False, True]
     rig.microscope.override(Autofocus, af)
     rig.stage.after_move = lambda n: af.lose_lock() if n in (2, 4) else None
 
@@ -2048,9 +2070,9 @@ def test_an_autofocus_switched_off_during_the_scan_is_not_engaged_again(
 
     result = _result(_scan(rig, max_unlocked_in_row=20))
 
-    assert af.calls.count("engage") == 0
+    assert af.calls.count("engage") == 1  # A1's wall's, before the switch-off
     assert [f.focus for f in result.frames] == ["locked"] * 2 + ["unlocked"] * 10
-    assert result.assumed == ()
+    assert result.assumed == (_wall_line(1, 1, 1),)
 
     # With the default, the unlocked fields end the scan before the 5th of them.
     rig.camera.snaps = 0
@@ -2058,7 +2080,7 @@ def test_an_autofocus_switched_off_during_the_scan_is_not_engaged_again(
     af.engaged = af.locked = True
     with pytest.raises(PluginRunError, match="did not lock on 5 fields in a row"):
         _scan(rig)
-    assert af.calls.count("engage") == 0
+    assert af.calls.count("engage") == 2  # and this run's A1 wall's
     assert rig.camera.snaps == 6
 
 
@@ -2096,6 +2118,433 @@ def test_a_stand_without_an_autofocus_records_none(
     result = _result(_scan(rig))
 
     assert [f.focus for f in result.frames] == ["none"] * 12
+
+
+# ------------------------------------------- PFS across a well's wall (m3 §8, #416)
+
+
+def _wall_line(wells: int, engages: int, locks: int) -> str:
+    return (
+        f"the autofocus was switched off before the first field of {wells} wells, so "
+        "that no lock crossed a well's wall, and engaged again after it on "
+        f"{engages} fields, locked on {locks} of them"
+    )
+
+
+def _marking_moves(rig: _Rig, af: _Autofocus, then: Callable[[int], None]) -> None:
+    """Write ``"move"`` into ``af.calls`` after every move, then run ``then``."""
+
+    def after(n: int) -> None:
+        af.calls.append("move")
+        then(n)
+
+    rig.stage.after_move = after
+
+
+def _between_moves(af: _Autofocus) -> list[list[str]]:
+    """``af.calls`` cut at each move: ``[0]`` before move 1, ``[n]`` after move ``n``."""
+    cut: list[list[str]] = [[]]
+    for call in af.calls:
+        if call == "move":
+            cut.append([])
+        else:
+            cut[-1].append(call)
+    return cut
+
+
+def _trip() -> AutofocusExcursionError:
+    return AutofocusExcursionError(
+        "autofocus PFS: Z went from 4000.00 µm to 4060.00 µm while it engaged",
+        4000.0,
+        4060.0,
+    )
+
+
+_TRIP_LINE = (
+    "AutofocusExcursionError: autofocus PFS: Z went from 4000.00 µm to 4060.00 µm "
+    "while it engaged"
+)
+
+
+def _tripped(field: str, well: str, kept: int) -> str:
+    return (
+        f"the autofocus moved Z out of its bound while it locked at {field} (well "
+        f"{well}): {_TRIP_LINE}; the checkpoint keeps {kept} wells. Its offset names "
+        "another plane here than where it held (m2 §12.11): with PFS off, focus on "
+        f"the sample in well {well} by eye and lock it from below (m2 §12.10), then "
+        "run scan --resume (the well is scanned again whole)"
+    )
+
+
+def test_the_autofocus_is_switched_off_before_each_wells_first_field_and_engaged_there(
+    rig: _Rig,
+) -> None:
+    """F11: PFS locked over a wall follows its reference to another plane, with no guard."""
+    af = _Autofocus(engaged=True, locked=True)
+    rig.microscope.override(Autofocus, af)
+    _marking_moves(rig, af, lambda _n: None)
+
+    result = _result(_scan(rig))
+
+    cut = _between_moves(af)
+    # Before each well's first move: read on, switched off, read back off.
+    for before in (0, 4, 8):
+        assert cut[before][-3:] == ["is_engaged", "disengage", "is_engaged"]
+    # At each well's first field: one engage, at the operator's offset.
+    for first in (1, 5, 9):
+        assert cut[first][:2] == ["is_locked", "engage"]
+    assert af.calls.count("disengage") == 3
+    assert af.calls.count("engage") == 3
+    assert [f.focus for f in result.frames] == ["locked"] * 12
+    assert result.assumed == (_wall_line(3, 3, 3),)
+
+
+def test_a_lost_lock_inside_a_well_is_counted_apart_from_the_walls(rig: _Rig) -> None:
+    af = _Autofocus(engaged=True, locked=True)
+    rig.microscope.override(Autofocus, af)
+    rig.stage.after_move = lambda n: af.lose_lock() if n in (2, 6) else None
+
+    result = _result(_scan(rig))
+
+    assert af.calls.count("engage") == 5
+    assert [f.focus for f in result.frames] == ["locked"] * 12
+    assert result.assumed == (
+        "the autofocus was engaged again on 2 fields and locked on 2 of them",
+        _wall_line(3, 3, 3),
+    )
+
+
+def test_an_autofocus_the_operator_switched_off_is_not_switched_on_at_the_next_wall(
+    rig: _Rig,
+) -> None:
+    """FM-129: the operator's switch-off wins at a wall too."""
+    af = _Autofocus(engaged=True, locked=True)
+    rig.microscope.override(Autofocus, af)
+
+    def switch_off(n: int) -> None:
+        if n == 4:
+            af.engaged = af.locked = False
+
+    _marking_moves(rig, af, switch_off)
+
+    result = _result(_scan(rig, max_unlocked_in_row=20))
+
+    after = [call for calls in _between_moves(af)[4:] for call in calls]
+    assert "disengage" not in after
+    assert "engage" not in after
+    assert [f.focus for f in result.frames] == ["locked"] * 3 + ["unlocked"] * 9
+    assert result.assumed == (_wall_line(1, 1, 1),)
+
+
+def test_a_wall_engage_that_fails_leaves_the_next_field_to_engage_as_the_scans_own(
+    rig: _Rig,
+) -> None:
+    af = _Autofocus(engaged=True, locked=True)
+    af.engage_results = [True, False]  # A1's wall engage locks, A2's gives up
+    rig.microscope.override(Autofocus, af)
+
+    result = _result(_scan(rig))
+
+    assert {f.name for f in result.frames if f.focus == "unlocked"} == {"A2_0000"}
+    assert len(result.frames) == 12
+    assert af.calls.count("engage") == 4
+    # A2_0001's engage is §8's: the wall's engage was made at A2_0000.
+    assert result.assumed == (
+        "the autofocus was engaged again on 1 fields and locked on 1 of them",
+        _wall_line(3, 3, 2),
+    )
+
+
+def test_a_wells_first_field_off_target_leaves_the_walls_engage_to_the_next(
+    rig: _Rig,
+) -> None:
+    """An engage drives Z: not for a field that is not photographed (FM-167), the wall's either."""
+    af = _Autofocus(engaged=True, locked=True)
+    rig.microscope.override(Autofocus, af)
+    rig.stage.landing_error_um = {1: (6.0, 0.0)}
+    _marking_moves(rig, af, lambda _n: None)
+
+    result = _result(_scan(rig))
+
+    assert [f.name for f in result.failed] == ["A1_0000"]
+    cut = _between_moves(af)
+    assert cut[1] == []
+    assert cut[2][:2] == ["is_locked", "engage"]
+    assert result.assumed == (_wall_line(3, 3, 3),)
+
+
+def test_a_lock_the_operator_took_after_a_wall_ends_the_walls_claim(
+    rig: _Rig,
+) -> None:
+    """A field that reads locked ends the wall's count: a later lost lock is §8's."""
+    af = _Autofocus(engaged=True, locked=True)
+    rig.microscope.override(Autofocus, af)
+    rig.stage.landing_error_um = {1: (6.0, 0.0)}
+
+    def operator(n: int) -> None:
+        if n == 2:
+            af.engaged = af.locked = True  # locked by hand before field 2
+        elif n == 3:
+            af.lose_lock()
+
+    rig.stage.after_move = operator
+
+    result = _result(_scan(rig))
+
+    assert [f.focus for f in result.frames] == ["locked"] * 11
+    assert result.assumed == (
+        "the autofocus was engaged again on 1 fields and locked on 1 of them",
+        _wall_line(3, 2, 2),
+    )
+
+
+def test_a_dry_run_never_switches_the_autofocus_off(
+    demo_microscope_dry: Microscope, tmp_path: Path
+) -> None:
+    """``disengage()`` acts in a dry run (m2 §3.2), and a dry run never engages."""
+    rig = _build(demo_microscope_dry, tmp_path)
+    _plan(rig)
+    af = _Autofocus(engaged=True, locked=True)
+    demo_microscope_dry.override(Autofocus, af)
+
+    result = _result(_scan(rig))
+
+    assert not {"disengage", "engage"} & set(af.calls)
+    assert af.engaged
+    assert result.assumed == ("dry run: 12 fields walked, no frame taken",)
+
+
+class _FailingAtWall(_Autofocus):
+    """An autofocus that fails at A2's wall: after the scan's 4th move, before its 5th."""
+
+    def __init__(self, stage: _Stage, how: str, error: BaseException | None) -> None:
+        super().__init__(engaged=True, locked=True)
+        self.stage = stage
+        self.how = how
+        self.error = error
+
+    def is_engaged(self) -> bool:
+        engaged = super().is_engaged()
+        if self.stage.moves == 4:
+            read_back = self.calls[-2] == "disengage"
+            if self.error is not None and (
+                self.how == "read" or (self.how == "read-back" and read_back)
+            ):
+                raise self.error
+            if self.how == "still-on" and read_back:
+                return True
+        return engaged
+
+    def disengage(self) -> None:
+        if self.stage.moves == 4 and self.how == "disengage":
+            self.calls.append("disengage")
+            assert self.error is not None
+            raise self.error
+        super().disengage()
+
+
+_NOT_OFF = (
+    "the autofocus could not be switched off before well A2 (HardwareError: PFS did "
+    "not answer): nothing moved to it, and PFS may still be on: switch it off at the "
+    "stand, then run scan --resume"
+)
+_STILL_ON = (
+    "the autofocus still reads on after it was switched off before well A2: nothing "
+    "moved to it: switch it off at the stand, then run scan --resume"
+)
+
+
+@pytest.mark.parametrize(
+    ("how", "error", "reason"),
+    [
+        ("disengage", HardwareError("PFS did not answer"), _NOT_OFF),
+        ("read", HardwareError("PFS did not answer"), _NOT_OFF),
+        ("read-back", HardwareError("PFS did not answer"), _NOT_OFF),
+        ("still-on", None, _STILL_ON),
+    ],
+    ids=["switch-off-raises", "read-raises", "read-back-raises", "still-on"],
+)
+def test_a_switch_off_that_fails_at_a_wall_ends_the_scan_before_the_well(
+    rig: _Rig, how: str, error: BaseException | None, reason: str
+) -> None:
+    """FM-19: a switch-off not read back counts as on; nothing moves to the well."""
+    af = _FailingAtWall(rig.stage, how, error)
+    rig.microscope.override(Autofocus, af)
+
+    with pytest.raises(PluginRunError) as raised:
+        _scan(rig)
+
+    assert raised.value.reason == reason
+    assert rig.stage.moves == 4
+    assert rig.camera.snaps == 4
+    assert _checkpoint(rig).wells_done == ("A1",)
+    assert _stored(rig).status is StageStatus.failed
+
+
+@pytest.mark.parametrize(
+    ("how", "error"),
+    [
+        ("read", MicroscopeHaltedError()),
+        ("read", MotionStoppedError("pfs")),
+        ("disengage", MotionStoppedError("pfs")),
+    ],
+    ids=["halt-at-the-read", "stop-at-the-read", "stop-at-the-switch-off"],
+)
+def test_a_halt_at_a_wall_passes_as_a_halt(
+    rig: _Rig, how: str, error: HardwareError
+) -> None:
+    """FM-64: a halt or a stopped motion is not a switch-off that failed."""
+    af = _FailingAtWall(rig.stage, how, error)
+    rig.microscope.override(Autofocus, af)
+
+    with pytest.raises(type(error)):
+        _scan(rig)
+
+    assert rig.stage.moves == 4
+
+
+class _TurnedAtRead(_Turret):
+    """A turret that reads the 40x from its ``turned_at``-th read of ``current()`` on."""
+
+    def __init__(self, turned_at: int) -> None:
+        super().__init__()
+        self.turned_at = turned_at
+        self.reads = 0
+
+    def current(self) -> str:
+        self.reads += 1
+        return FORTY if self.reads >= self.turned_at else IN_PLACE
+
+
+def test_a_start_check_that_refuses_at_a_well_leaves_the_autofocus_locked(
+    rig: _Rig,
+) -> None:
+    """FM-130: the well's start check comes before the wall's switch-off."""
+    af = _Autofocus(engaged=True, locked=True)
+    rig.microscope.override(Autofocus, af)
+    # Reads: before the scan, A1's start and end, A2's start.
+    rig.microscope.override(ObjectiveTurret, _TurnedAtRead(4))
+
+    with pytest.raises(PluginRunError, match="at well A2;"):
+        _scan(rig)
+
+    assert af.engaged
+    assert af.calls.count("disengage") == 1  # A1's wall's
+    assert rig.stage.moves == 4
+    assert _checkpoint(rig).wells_done == ("A1",)
+
+
+def test_a_wall_engage_that_raises_is_counted_and_left_to_the_next_field(
+    rig: _Rig,
+) -> None:
+    """FM-129: counted before the call; the next field's engage is §8's."""
+    af = _Autofocus(engaged=True, locked=True)
+    af.engage_results = [HardwareError("engage gave up")]
+    rig.microscope.override(Autofocus, af)
+
+    result = _result(_scan(rig))
+
+    assert [(f.name, f.error) for f in result.failed] == [
+        ("A1_0000", "HardwareError: engage gave up")
+    ]
+    assert [f.focus for f in result.frames] == ["locked"] * 11
+    assert result.assumed == (
+        "the autofocus was engaged again on 1 fields and locked on 1 of them",
+        _wall_line(3, 3, 2),
+    )
+
+
+def test_a_stop_after_a_well_ends_with_the_autofocus_off_and_the_resume_says_why(
+    rig: _Rig,
+) -> None:
+    """Decided in #416's plan: a stop honoured after a wall leaves PFS off (FM-88)."""
+    af = _Autofocus(engaged=True, locked=True)
+    rig.microscope.override(Autofocus, af)
+    stop = threading.Event()
+
+    record = _scan(rig, stop=stop, on_progress=_at(4, stop.set))
+
+    assert record.status is StageStatus.stopped
+    assert af.calls[-3:] == ["is_engaged", "disengage", "is_engaged"]
+    assert af.engaged is False
+    assert _checkpoint(rig).wells_done == ("A1",)
+    assert rig.stage.moves == 4
+    with pytest.raises(PluginRunError, match="the scan switches it off between wells"):
+        _scan(rig, resume=True)
+    af.engaged = af.locked = True
+    assert len(_result(_scan(rig, resume=True)).frames) == 12
+
+
+class _Trips(_Autofocus):
+    """An engage that trips as the layer's does: a fresh error, held by no local of its own.
+
+    ``_Autofocus.engage`` raises the error it holds in a local, which makes a
+    cycle of the fake's own (its frame holds the error, the error's traceback
+    the frame).
+    """
+
+    def engage(self, timeout_s: float | None = None) -> bool:
+        self.calls.append("engage")
+        self.engaged = self.locked = False
+        raise _trip()
+
+
+def test_a_trip_leaves_no_reference_cycle(rig: _Rig) -> None:
+    """FM-98: the excursion caught at a field is not kept where the frame that raises holds it."""
+    af = _Trips(engaged=True, locked=True)
+    rig.microscope.override(Autofocus, af)
+    alive = weakref.ref(af)
+    gc.collect()
+    gc.disable()
+    try:
+        # Not ``pytest.raises``: its record keeps the error's traceback, and
+        # with it ``_run``'s frame, alive.
+        raised = False
+        try:
+            _scan(rig)
+        except PluginRunError:
+            raised = True
+        assert raised
+        rig.microscope.override(Autofocus, _Autofocus(engaged=False, locked=False))
+        del af
+        assert alive() is None
+    finally:
+        gc.enable()
+
+
+def test_a_trip_at_a_wells_first_field_ends_the_scan_with_the_checkpoint_kept(
+    rig: _Rig,
+) -> None:
+    """The layer forgot the offset: every later engage would be refused (m2 §12.2 D2)."""
+    af = _Autofocus(engaged=True, locked=True)
+    af.engage_results = [True, _trip()]
+    rig.microscope.override(Autofocus, af)
+
+    with pytest.raises(PluginRunError) as raised:
+        _scan(rig)
+
+    assert raised.value.reason == _tripped("A2_0000", "A2", 1)
+    assert af.calls.count("engage") == 2
+    assert rig.camera.snaps == 4
+    checkpoint = _checkpoint(rig)
+    assert checkpoint.wells_done == ("A1",)
+    assert checkpoint.failed == ()
+    assert len(checkpoint.frames) == 4
+
+
+def test_a_trip_after_a_lost_lock_ends_the_scan(rig: _Rig) -> None:
+    af = _Autofocus(engaged=True, locked=True)
+    af.engage_results = [True, _trip()]
+    rig.microscope.override(Autofocus, af)
+    rig.stage.after_move = lambda n: af.lose_lock() if n == 2 else None
+
+    with pytest.raises(PluginRunError) as raised:
+        _scan(rig)
+
+    assert raised.value.reason == _tripped("A1_0001", "A1", 0)
+    assert af.calls.count("engage") == 2
+    assert rig.stage.moves == 2
+    assert rig.camera.snaps == 1
 
 
 # ----------------------------------------------------------------- dry run
@@ -2253,7 +2702,7 @@ def test_per_well_focus_sweeps_until_a_peak_then_reuses_its_dz(rig: _Rig) -> Non
 
 def test_an_unlocked_field_gets_no_focus_step(rig: _Rig) -> None:
     af = _locked_on_the_plate(rig)
-    af.engage_results = [False]  # the relock of the second field
+    af.engage_results = [True, False]  # A1's wall's; the relock of the second field
 
     result = _result(_scan(rig, cell_focus="per-field", **FOCUS))
 
@@ -2320,9 +2769,13 @@ def test_a_sweep_outside_the_limits_at_a_field_fails_it_with_nothing_moved(
         "outside the soft limits [-1000, 14] µm"
     }
     # The relock of the second field moved Z (PFS drove it to 8); after it,
-    # nothing moved Z: the autofocus was never switched off again.
-    assert z.moves == z_moves_at[3]
-    assert af.calls.count("disengage") == 1
+    # no refused field moved Z: the sweep's switch-off was never made again.
+    # What moved Z after it are the relocks at A2's and B2's first fields,
+    # whose walls switched it off (#416).
+    assert z_moves_at[4] == z_moves_at[3]
+    assert z.moves == z_moves_at[3] + 2
+    # The first field's step, and the three walls'.
+    assert af.calls.count("disengage") == 4
     assert af.engaged
     assert af.locked
 
@@ -2332,11 +2785,52 @@ def test_the_next_field_relocks_after_the_focus(rig: _Rig) -> None:
 
     result = _result(_scan(rig, cell_focus="per-field", **FOCUS))
 
-    # Eleven relocks for the next fields, one after the last field.
-    assert af.calls.count("engage") == 12
-    assert af.calls.count("disengage") == 12
+    # Eleven relocks for the next fields, one after the last field, and A1's
+    # wall's switch-off and engage (#416).
+    assert af.calls.count("engage") == 13
+    assert af.calls.count("disengage") == 13
     # §8's line counts the scan's own re-engages, not the focus's (FM-165).
     assert not [a for a in result.assumed if a.startswith("the autofocus was engaged")]
+
+
+def test_a_focus_steps_switch_off_is_not_counted_at_a_wall(rig: _Rig) -> None:
+    """FM-165: a well that starts with PFS off from the focus step has no wall's engage."""
+    af = _locked_on_the_plate(rig)
+    _marking_moves(rig, af, lambda _n: None)
+
+    result = _result(_scan(rig, cell_focus="per-field", **FOCUS))
+
+    cut = _between_moves(af)
+    # The first well's wall, before any sweep.
+    assert cut[0][-3:] == ["is_engaged", "disengage", "is_engaged"]
+    # A2's and B2's: the last field's step switched it off and read it back
+    # off; the wall reads it once more, off, and does nothing.
+    for before in (4, 8):
+        assert cut[before][-3:] == ["disengage", "is_engaged", "is_engaged"]
+    # One wall's switch-off and twelve steps'; one wall's engage, eleven
+    # relocks after a step and one after the last field.
+    assert af.calls.count("disengage") == 13
+    assert af.calls.count("engage") == 13
+    assert _wall_line(1, 1, 1) in result.assumed
+    assert not [a for a in result.assumed if a.startswith("the autofocus was engaged")]
+    assert [
+        a for a in result.assumed if a.startswith("the focus on the cells added")
+    ] != []
+
+
+def test_a_trip_after_a_focus_step_ends_the_scan_with_the_trips_own_text(
+    rig: _Rig,
+) -> None:
+    """The trip left PFS off, not the focus step: §8's text, without ``run``'s suffix."""
+    af = _locked_on_the_plate(rig)
+    af.engage_results = [True, _trip()]  # A1's wall's; the relock after field 1's step
+
+    with pytest.raises(PluginRunError) as raised:
+        _scan(rig, cell_focus="per-field", **FOCUS)
+
+    assert raised.value.reason == _tripped("A1_0001", "A1", 0)
+    assert af.calls.count("engage") == 2
+    assert af.engaged is False
 
 
 def test_the_focus_time_per_field_is_reported(rig: _Rig) -> None:
@@ -2444,9 +2938,9 @@ def test_a_resume_after_the_autofocus_was_left_off_is_refused(
         _scan(rig, cell_focus=cell_focus, resume=True, **FOCUS)
 
     assert raised.value.reason == (
-        "the scan being resumed used the autofocus, which is not locked now (a stop "
-        "during the focus on the cells leaves it off): lock it on the sample, then "
-        "run scan --resume"
+        "the scan being resumed used the autofocus, which is not locked now (the "
+        "scan switches it off between wells, and a stop during the focus on the "
+        "cells leaves it off): lock it on the sample, then run scan --resume"
     )
     assert (rig.stage.moves, rig.camera.snaps) == (moves, snaps)
     # Locked again on the sample, the resume runs.
@@ -2543,7 +3037,8 @@ def test_the_relock_after_focus_failing_in_a_row_says_the_focus_left_it_off(
     rig: _Rig,
 ) -> None:
     af = _locked_on_the_plate(rig)
-    af.engage_results = [False, False, False]
+    # A1's wall's locks and the first field is swept; the next three relocks fail.
+    af.engage_results = [True, False, False, False]
 
     with pytest.raises(PluginRunError) as raised:
         _scan(rig, cell_focus="per-field", max_unlocked_in_row=3, **FOCUS)
@@ -2600,7 +3095,8 @@ def test_a_relock_after_the_last_field_that_fails_is_said_not_a_failure(
     why: str,
 ) -> None:
     af = _locked_on_the_plate(rig)
-    af.engage_results = [True] * 11 + [last]
+    # A1's wall's, the eleven relocks of the next fields, the one after the last.
+    af.engage_results = [True] * 12 + [last]
 
     with caplog.at_level(logging.WARNING, logger=LOGGER):
         result = _result(_scan(rig, cell_focus="per-field", **FOCUS))
@@ -2609,7 +3105,7 @@ def test_a_relock_after_the_last_field_that_fails_is_said_not_a_failure(
     assert len(result.frames) == 12
     assert line in result.assumed
     assert [r.getMessage() for r in caplog.records if r.name == LOGGER] == [line]
-    assert af.calls.count("engage") == 12
+    assert af.calls.count("engage") == 13
 
 
 def test_a_stop_during_a_sweep_is_honoured_at_the_next_plane(rig: _Rig) -> None:
@@ -2629,9 +3125,12 @@ def test_a_stop_during_a_sweep_is_honoured_at_the_next_plane(rig: _Rig) -> None:
     # The fourth plane of the first sweep was the last: no fifth move, no frame.
     assert rig.camera.snaps == 4
     assert rig.stage.moves == 1
-    # Nothing locks it again after a stop (FM-88).
+    # Nothing locks it again after a stop (FM-88): the one engage is A1's
+    # wall's, before the sweep's switch-off.
     assert af.engaged is False
-    assert "engage" not in af.calls
+    assert af.calls.count("engage") == 1
+    assert "engage" not in af.calls[af.calls.index("engage") + 1 :]
+    assert "disengage" in af.calls[af.calls.index("engage") :]
 
 
 def test_cell_focus_with_autofocus_off_refuses_an_autofocus_that_is_on(
@@ -2861,6 +3360,7 @@ def test_the_offset_lines_come_after_every_line_the_scan_already_writes(
 
     assert result.assumed == (
         "the autofocus was engaged again on 2 fields and locked on 2 of them",
+        _wall_line(3, 3, 3),
         _NOT_MOVED.format(p="an unknown objective", o=IN_PLACE),
     )
 

@@ -17,7 +17,7 @@ was made for. It does not read the wells or the plate again.
 - **The camera is as it was for the plan**: the same binning, region of interest and
   magnifier lever. The plan's matrix is only right on that frame.
 - **The autofocus (PFS) is either locked on the sample, or off.** The scan never
-  switches it on. With the default `autofocus=if-engaged` it is used when it is on and
+  switches on one that was off when it started. With the default `autofocus=if-engaged` it is used when it is on and
   locked when the scan starts, and a scan with it on but not locked is refused:
   engaging it drives Z to the plane of whatever offset is stored, and only a lock you
   took on this sample shows that offset is yours (#205).
@@ -89,8 +89,9 @@ written, and the message says what to do:
 7. **The autofocus**, as `autofocus` says (above). With `--resume`, a scan whose
    checkpoint holds frames taken with the autofocus locked is refused when it is not
    locked now (and `autofocus` is not `off`): `the scan being resumed used the
-   autofocus, which is not locked now (a stop during the focus on the cells leaves it
-   off): lock it on the sample, then run scan --resume`. Without it, `if-engaged` would
+   autofocus, which is not locked now (the scan switches it off between wells, and a
+   stop during the focus on the cells leaves it off): lock it on the sample, then run
+   scan --resume`. Without it, `if-engaged` would
    resume the rest of the plate without PFS and say nothing.
 8. **The disk**: the free space of the run folder's disk must exceed 1.1 × the
    frames left (about 4.4 MB per field at 1412 × 1412 pixels of 16 bits, 1.3 GB for
@@ -114,6 +115,37 @@ hand, a binning changed or the lever moved (a pixel size more than 1 % from the 
 the start) ends the scan. A well is marked done only when the stand was the same at
 both ends, so a change in the middle of a well never leaves frames of another scale in
 the checkpoint: set it back and `--resume`, and that well is scanned again.
+
+**PFS never crosses a well's wall locked.** Locked over a wall, PFS follows its
+reference to the plane its offset names in the next well, and nothing reads Z while it
+does: on one 24-well plate at the 40×, that plane moved by at least 104 µm between two
+wells whose foci by eye lie 11.7 µm apart (Ti2-E session 3, F11). So when the scan uses
+the autofocus, before the first field of every well (the first well too, and not in a
+dry run) it switches PFS off and reads it back off; the stage then moves to the well
+with PFS off, and Z stays where PFS held it in the well before. The well's first field
+engages it again at your offset, bounded by `[safety] max_engage_excursion_um` around
+that Z (m2 §12.2 D2). It costs one engage per well. An autofocus that is already off at
+a wall (you switched it off, or the focus on the cells did) is left as it is. A
+switch-off that raises, or a PFS that still reads on after it, ends the scan before
+anything moves to the well: `the autofocus could not be switched off before well
+<w> (<error>): nothing moved to it, and PFS may still be on: switch it off at the
+stand, then run scan --resume`, or `the autofocus still reads on after it was switched
+off before well <w>: …`. `assumed` says `the autofocus was switched off before the first
+field of <w> wells, so that no lock crossed a well's wall, and engaged again after it on
+<a> fields, locked on <l> of them`, apart from the engages after a lost lock. With
+`autofocus=off` the scan never reads PFS, so it cannot switch it off at a wall: switch
+PFS off yourself before such a scan.
+
+**A trip ends the scan.** An engage that moves Z out of its bound (at a well's first
+field, after a lost lock, or after the focus on the cells) switches PFS off and makes
+the layer forget the offset, so every later engage would be refused. The scan ends,
+with the wells done kept: `the autofocus moved Z out of its bound while it locked at
+<field> (well <w>): …; the checkpoint keeps <n> wells. Its offset names another plane
+here than where it held (m2 §12.11): …`. **What you do then**: with PFS off, focus on
+the sample in that well by eye, lock PFS on it from below (m2 §12.10), and run
+`scan --resume`; the well is scanned again whole. At the 40×, this replaces "one well
+per run": lock PFS from below in the first well and scan the wells in one run; a trip
+stops at the well whose plane moved.
 
 **At every field**: a stop asked for is honoured, the stage moves, and then (not in a
 dry run) **the readback is compared with the target**, before anything else is read or
@@ -163,9 +195,10 @@ The scan does not test beforehand whether a file is held open: opening a file do
 show the condition that blocks its replacement.
 
 The scan **never** turns the turret, changes the autofocus offset, or returns to a start
-position. It moves Z and switches the autofocus off and on again only for the focus on
-the cells (below), which is off by default; without it, it never moves Z and never
-switches the autofocus on.
+position. It moves Z itself only for the focus on the cells (below), which is off by
+default. It switches the autofocus off and on again at every well's wall (above), for
+the focus on the cells, and to engage a lock that was lost; never one that was off when
+the scan started, or that you switched off.
 
 ## The focus on the cells (`cell_focus`)
 
@@ -345,4 +378,7 @@ command; and the defaults of the score, the range and the step, which session 3 
 from the stacks of [`focus-on-cells`](focus-on-cells.md). For a frame's place in its
 well (#430): at the Ti2-E, a 1 × 1 scan whose first frame was reached by `goto-well`
 to a well's centre reads `(0, 0)` within the stage's readback; and a 40× scan with the
-objective offsets applied reads the offsets that the by-eye position agrees with.
+objective offsets applied reads the offsets that the by-eye position agrees with. For
+PFS across walls (#416): the switch-off and the relock per well at the Ti2-E, a 10× then
+a 40× scan of two wells with PFS locked in the first, Z read after each well's first
+lock; and whether a plane moves between wells at the 10×.
