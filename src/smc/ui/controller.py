@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import queue
 import threading
 import time
@@ -99,6 +100,11 @@ from smc.plugins.slots import (
     normalise_well,
     well_geometry,
 )
+from smc.plugins.slots.plate import (
+    ORIENTATION_DEG,
+    PlateOrientation,
+    turned_well,
+)
 from smc.run import RunDocument, RunDocumentError, StageRecord, StageStatus
 from smc.ui.frames import Frame
 from smc.ui.guide import (
@@ -108,13 +114,16 @@ from smc.ui.guide import (
     NO_CALIBRATION_FOR_SIDES,
     PLATE_NOT_CHOSEN,
     SELECT_WELLS,
+    SELECTION_KEPT_ITS_NAMES,
     WALLS_DRY_RUN,
     WALLS_NEED_CALIBRATION,
     NextStep,
+    a1_corner,
     command_line,
     next_slot,
     replace_note,
     scan_plan_card_lines,
+    side_words,
     walls_card_lines,
     walls_centres_problem,
     walls_square_wells,
@@ -124,7 +133,7 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from smc.hardware.microscope import Microscope
-    from smc.hardware.profile import Profile
+    from smc.hardware.profile import HolderSection, Profile
 
 __all__ = [
     "KEY_PARAMS",
@@ -188,10 +197,14 @@ KEY_PARAMS: dict[str, tuple[str, ...]] = {
 #: parameter's default (m3 §18.3, #340), and the Drive region's select is where the
 #: operator turns it. A free-text label here would offer a second way to say it.
 PAGE_PARAMS: dict[str, tuple[str, ...]] = {
-    "plate-registration": ("plate", "refs", "walls", "objective"),
+    "plate-registration": ("plate", "refs", "walls", "objective", "orientation"),
     # The same captured centres as the registration, never its wall touches: the tool
     # images the walls itself (m5 §12.2). Naming `plate` is what gates it on §11.3.
-    "plate-walls": ("plate", "refs"),
+    "plate-walls": ("plate", "refs", "orientation"),
+    # The orientation is the *Plate lies* choice's, for every plate tool (m5 §16 D5):
+    # no form offers it a second time, and no other plate is filled for these two.
+    "plate-finding": ("orientation",),
+    "plate-orientation": ("orientation",),
     "scan-plan": ("wells",),
 }
 
@@ -285,6 +298,33 @@ def _needs_plate(plugin: str) -> bool:
     (``plate-walls``, #346) is gated by naming ``plate`` there, with no further code.
     """
     return "plate" in PAGE_PARAMS.get(plugin, ())
+
+
+def _turned(offset: tuple[float, float], rotation_deg: float) -> tuple[float, float]:
+    """``offset`` turned by ``rotation_deg`` counter-clockwise, X right and Y up: as ``useq`` turns a plan about A1.
+
+    Measured on ``useq``: at 90° the 96-well's A12, (99 000, 0) µm from A1, lands at
+    (0, 99 000). The two orientations are 0° and 180°, whose cosine and sine are
+    exact once rounded: a turned estimate's A1 is then the holder's centre plus the
+    offset to the micrometre, and the geometry cache's key stays one value.
+    """
+    angle = math.radians(rotation_deg)
+    cos, sin = round(math.cos(angle), 12), round(math.sin(angle), 12)
+    x, y = offset
+    return (cos * x - sin * y, sin * x + cos * y)
+
+
+def _turned_name(plate: str, well: str) -> str:
+    """``turned_well``, or ``well`` as it was when it is not on ``plate``.
+
+    A capture read back from the run document is validated as a model and not as a
+    well of the plate: one that names no well of it has no place to turn to, and
+    a rename must not fail the turn that the run document already holds.
+    """
+    try:
+        return turned_well(plate, well)
+    except ValueError:
+        return well
 
 
 def _image_side(side: str, extra: tuple[str, ...] = ()) -> ImageSide:
@@ -396,11 +436,25 @@ class MapPose:
     never apart from them (m5 §15, FM-217). ``holder_centre_um`` is the stand's
     ``[holder] plate_centre_xy_um`` and is set for ``estimated`` only; ``seed_well``
     is the one reference well of a ``seed`` (``""`` when the slot has none).
+    ``orientation`` is the registered plate's, or the one the operator declared for
+    the estimate (m5 §16 D4), and ``a1_corner`` the corner A1 is at in the words of
+    ``guide.a1_corner`` (``""``: nothing to say, as on an *unplaced* map).
     """
 
     kind: PoseKind
     holder_centre_um: tuple[float, float] | None = None
     seed_well: str = ""
+    orientation: PlateOrientation = "not-turned"
+    a1_corner: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class SideLabel:
+    """A side of the stand as the map labels it, in stage µm (m5 §16 D8): plain text (FM-139)."""
+
+    text: str
+    x_um: float
+    y_um: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -429,7 +483,9 @@ class PlateView:
     (m5 §13). ``plan`` is the fields of the usable ``scan-plan`` and the same
     rule as the density: ``None`` when the slot is stale, of another profile, a dry
     run on a page that is not one, does not validate or has a field of view that is
-    not positive (m5 §14.1).
+    not positive (m5 §14.1). ``orientation`` is ``PlatePage.orientation`` as this read
+    found it, what the *Plate lies* select shows (m5 §16 D2); ``sides`` are the stand's
+    sides around the wells, empty when the profile does not say them (§16 D8).
     """
 
     plate: str
@@ -446,6 +502,8 @@ class PlateView:
     camera_matrix: Matrix2 | None = None
     plan: PlanLayer | None = None
     pose: MapPose = field(default_factory=lambda: MapPose("unplaced"))
+    orientation: PlateOrientation = "not-turned"
+    sides: tuple[SideLabel, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1069,6 +1127,11 @@ class PlatePage:
         self.walls = ()
         doc, _unreadable = self._document()
         self._plate, self._plate_chosen = self._initial_plate(doc)
+        # The orientation the operator declared, for an estimate and the next fit (m5
+        # §16 D4), and the registered plate's as last read: ``(plate, orientation)``,
+        # so that the tick compares it without reading the document (FM-145).
+        self._registered: tuple[str, PlateOrientation] | None = None
+        self._orientation: PlateOrientation = self._read_orientation(doc)
         self._restore(doc)
 
     # --- plate and selection -------------------------------------------------
@@ -1130,11 +1193,92 @@ class PlatePage:
         self._plate_chosen = True
         if name == self._plate:
             return
+        # The next plate is likely put down the way the last one was (m5 §16 D4): the
+        # orientation shown, a registered plate's included, stays declared.
+        self._orientation = self.orientation
         self._plate = name
         self.selection = ()
         self.refs = ()
         self.walls = ()
         self.current = None
+
+    @property
+    def holder(self) -> HolderSection:
+        """The profile's ``[holder]``: what the view words the *Plate lies* choices with (m5 §16 D3).
+
+        Read-only, as the profile is the page's for its whole life.
+        """
+        return self._profile.holder
+
+    @property
+    def orientation(self) -> PlateOrientation:
+        """Which way the plate lies: the registered plate's when one names the page's plate, else the declared one (m5 §16 D4).
+
+        The registered plate's as the page last read it (a view, a choice, a run's
+        end): the tick compares this every second and never reads the document for
+        it (FM-145); a turn made in a terminal shows at the next refresh.
+        """
+        registered = self._registered
+        if registered is not None and registered[0] == self._plate:
+            return registered[1]
+        return self._orientation
+
+    def choose_orientation(self, orientation: PlateOrientation) -> None:
+        """Say which way the plate lies (m5 §16 D4).
+
+        On a registered plate of another orientation, it runs ``plate-orientation``,
+        the path of every tool, so the run document says it (ADR-0006, principle 5):
+        the wells are renamed when that run ends, nothing is measured and nothing
+        moves. A refusal there (no stand, an activity going) changes nothing and is
+        the outcome; this checks the stand and the activity itself, whatever state
+        the select was drawn in (FM-169). The orientation the plate already has does
+        nothing. Without a registered plate (an estimate, an unplaced map) it is the
+        declared orientation, which the estimate and the next fit's parameters read.
+
+        Raises:
+            ValueError: ``orientation`` is not one of ``ORIENTATION_DEG``'s.
+            RuntimeError: The page is closed.
+        """
+        if orientation not in ORIENTATION_DEG:
+            raise ValueError(
+                f"orientation must be one of {', '.join(ORIENTATION_DEG)}, "
+                f"got {orientation!r}"
+            )
+        doc = self._document()[0]
+        registered = self._registered_plate(doc)
+        if registered is None:
+            self._orientation = orientation
+            return
+        if registered.orientation == orientation:
+            return
+        if self._closed:
+            raise RuntimeError("the page is closed")
+        current = self._current_run
+        if current is not None:
+            self._set_outcome(f"plate-orientation: {current[0]} is running")
+            return
+        self.run("plate-orientation", [f"orientation={orientation}"])
+
+    def _registered_plate(self, doc: RunDocument) -> PlateResult | None:
+        """The usable ``plate`` slot when it names the page's plate, kept as the one ``orientation`` reads."""
+        registered = self._slot(doc, "plate", PlateResult, [])
+        self._note_registered(registered)
+        if registered is None or registered.plate != self._plate:
+            return None
+        return cast("PlateResult", registered)
+
+    def _note_registered(self, registered: PlateResult | None) -> None:
+        """Keep the registered plate's orientation for ``orientation``; one assignment, read without a lock."""
+        self._registered = (
+            None
+            if registered is None
+            else (str(registered.plate), registered.orientation)
+        )
+
+    def _read_orientation(self, doc: RunDocument) -> PlateOrientation:
+        """The orientation the page starts with: the ``plate`` slot's when it names the page's plate, else not turned."""
+        registered = self._registered_plate(doc)
+        return "not-turned" if registered is None else registered.orientation
 
     def select_text(self, text: str) -> None:
         """Replace the selection by the wells ``text`` names (``A1:D6``, ``C*``, ``all``).
@@ -1379,7 +1523,7 @@ class PlatePage:
             problem = walls_centres_problem(len(refs))
             if problem is not None:
                 raise ValueError(problem)
-            return self._dump_refs(refs)
+            return self._walls_pairs(refs)
         return self._page_pairs(plugin)
 
     def _page_pairs(self, plugin: str) -> list[str]:
@@ -1397,8 +1541,19 @@ class PlatePage:
         if plugin == "plate-registration":
             return self._registration_pairs(self.refs, self.walls)
         if plugin == "plate-walls":
-            return self._dump_refs(self.refs)
+            return self._walls_pairs(self.refs)
+        if plugin in ("plate-finding", "plate-orientation"):
+            return [self._orientation_pair()]
         return []
+
+    def _orientation_pair(self) -> str:
+        """``orientation=<value>``, the *Plate lies* choice as every plate tool takes it (m5 §16 D5).
+
+        Read from the run document at the click, as ``goto`` reads the plate: a turn
+        made since the last view is the one a fit or a rename is given.
+        """
+        self._registered_plate(self._document()[0])
+        return f"orientation={self.orientation}"
 
     def _dump_refs(self, refs: Sequence[WellRef]) -> list[str]:
         """The ``plate`` and ``refs`` pairs of the two tools that register from captured centres.
@@ -1409,12 +1564,24 @@ class PlatePage:
         dumped = json.dumps([r.model_dump(mode="json") for r in refs])
         return [f"plate={self._plate}", f"refs={dumped}"]
 
+    def _walls_pairs(self, refs: Sequence[WellRef]) -> list[str]:
+        """The pairs of ``plate-walls`` for this plate: the centres, and the orientation they are named for (m5 §16 D5)."""
+        return [*self._dump_refs(refs), self._orientation_pair()]
+
     def _registration_pairs(
         self, refs: Sequence[WellRef], walls: Sequence[WallTouch]
     ) -> list[str]:
-        """The pairs of ``plate-registration`` for this plate: one place dumps them, so a step and a click agree."""
+        """The pairs of ``plate-registration`` for this plate: one place dumps them, so a step and a click agree.
+
+        The captures are named for the orientation the page shows (a turn renames
+        them, m5 §16 D6), so the fit is told the same one.
+        """
         dumped_walls = json.dumps([w.model_dump(mode="json") for w in walls])
-        return [*self._dump_refs(refs), f"walls={dumped_walls}"]
+        return [
+            *self._dump_refs(refs),
+            f"walls={dumped_walls}",
+            self._orientation_pair(),
+        ]
 
     # --- presets (m5 §10.5) -----------------------------------------------------------
 
@@ -1747,6 +1914,14 @@ class PlatePage:
         """A plugin's run on the worker, and its outcome as text."""
         log.info("%s: started from the plate page", plugin)
         started = time.monotonic()
+        # The orientation the page names the captures for, read before a rename runs:
+        # what its end compares with (m5 §16 D6). Any provider of `plate` refreshes the
+        # orientation kept for the tick, so only the rename needs the one before.
+        turned_from = (
+            self._read_orientation(self._document()[0])
+            if plugin == "plate-orientation"
+            else None
+        )
         try:
             record = run_plugin(
                 entry.plugin,
@@ -1769,8 +1944,38 @@ class PlatePage:
             return f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
         if record.status is StageStatus.done:
             seconds = time.monotonic() - started
-            return f"{plugin} done in {seconds:.1f} s{_assumed_tail(record)}"
+            note = ""
+            if record.provides == "plate":
+                note = self._follow_plate(turned_from)
+            return f"{plugin} done in {seconds:.1f} s{_assumed_tail(record)}{note}"
         return f"{plugin} stopped"
+
+    def _follow_plate(self, turned_from: PlateOrientation | None) -> str:
+        """After a ``done`` provider of ``plate``: keep its orientation, and follow a turn; what the strip adds.
+
+        On the worker, before the activity ends: no capture can be taken meanwhile
+        (``_refuse_if_moving`` refuses one while an activity goes), and the tabs
+        redraw from the renamed captures when they see the end.
+
+        A turn (``turned_from`` is the orientation before a ``plate-orientation`` run,
+        and the plate now lies the other way) renames the captures through
+        ``turned_well``: they are positions, which a turn does not move, and their
+        names follow the plate (m5 §16 D6). ``current`` is cleared, since the well the
+        buttons named is not the one under them any more. The selection keeps its
+        names (a well chosen as B3 is the printed B3, m3 §24 D10), and the strip says
+        so once, when there is one.
+        """
+        registered = self._registered_plate(self._document()[0])
+        if (
+            turned_from is None
+            or registered is None
+            or registered.orientation == turned_from
+        ):
+            return ""
+        self._orientation = registered.orientation
+        self._rename_captures()
+        self.current = None
+        return f"; {SELECTION_KEPT_ITS_NAMES}" if self.selection else ""
 
     def lacks(self, capability: type) -> str | None:
         """Why the stand cannot offer ``capability``, or ``None``: the one text of a disabled control.
@@ -2852,6 +3057,7 @@ class PlatePage:
         if unreadable is not None:
             problems.append(f"run document: {unreadable}")
         registered = self._slot(doc, "plate", PlateResult, problems)
+        self._note_registered(registered)
         density = self._slot(doc, "density", DensityResult, problems)
         route = self._slot(doc, "route", RouteResult, problems)
         calibration = self._slot(doc, "camera-calibration", CameraCalibration, problems)
@@ -2915,6 +3121,38 @@ class PlatePage:
             camera_matrix=None if calibration is None else calibration.matrix_um_per_px,
             plan=plan,
             pose=pose,
+            orientation=pose.orientation,
+            sides=self._sides(geometries),
+        )
+
+    def _sides(self, geometries: Sequence[WellGeometry]) -> tuple[SideLabel, ...]:
+        """The stand's sides around the drawn wells, when the profile says them (m5 §16 D8).
+
+        Each at the middle of a side of the wells' bounding box, half a well pitch
+        outside it: by the wells, and never on one. The words are found by the stage
+        direction each side faces (``guide.side_words``), so a stand whose back is -X
+        has it on the left of the map. A plate whose wells cannot be drawn has none.
+        """
+        holder = self._profile.holder
+        words = side_words(holder.back, holder.right)
+        if not words or not geometries:
+            return ()
+        left = min(g.center_um[0] - g.size_um[0] / 2.0 for g in geometries)
+        right = max(g.center_um[0] + g.size_um[0] / 2.0 for g in geometries)
+        bottom = min(g.center_um[1] - g.size_um[1] / 2.0 for g in geometries)
+        top = max(g.center_um[1] + g.size_um[1] / 2.0 for g in geometries)
+        pitch_x_mm, pitch_y_mm = useq.WellPlate.from_str(self._plate).well_spacing
+        out_x, out_y = pitch_x_mm * 500.0, pitch_y_mm * 500.0  # half a pitch, in µm
+        middle_x, middle_y = (left + right) / 2.0, (bottom + top) / 2.0
+        places = {
+            "+X": (right + out_x, middle_y),
+            "-X": (left - out_x, middle_y),
+            "+Y": (middle_x, top + out_y),
+            "-Y": (middle_x, bottom - out_y),
+        }
+        return tuple(
+            SideLabel(words[direction], x_um, y_um)
+            for direction, (x_um, y_um) in places.items()
         )
 
     def _replace_notes(self, doc: RunDocument) -> dict[str, str]:
@@ -3194,7 +3432,7 @@ class PlatePage:
             "page; plate-walls images each well's four walls around its centre and "
             "moves the stage in X and Y only"
         )
-        return self._dump_refs(refs), None
+        return self._walls_pairs(refs), None
 
     def _registration_step(self, why: list[str]) -> tuple[list[str], str | None]:
         """The pairs of ``plate-registration`` and what it waits for, with a line of ``why`` for them.
@@ -3415,37 +3653,54 @@ class PlatePage:
     def _registered_geometries(
         self, registered: PlateResult | None
     ) -> tuple[tuple[WellGeometry, ...], MapPose]:
-        """The wells of the page's plate and the pose that placed them (m5 §15 D3).
+        """The wells of the page's plate and the pose that placed them (m5 §15 D3, §16 D7).
 
         The first of these that holds wins: the registered plate when it is the page's
-        plate (a ``seed`` is drawn as one, its rotation being the 0° it assumed); else the
-        plate *estimated* from the profile's ``[holder]``, A1 at the holder's centre minus
-        the grid's centre offset from A1 and rotation 0°; else the plate *unplaced*, A1 at
-        the stage's origin. An estimate is a place to draw, never a registration: the run
-        document is not read for it and ``click`` still drives only a registered plate.
+        plate (a ``seed`` is drawn as one, its rotation taken from its declared
+        orientation); else the plate *estimated* from the profile's ``[holder]``, turned
+        by the declared orientation about the holder's centre: rotation
+        ``ORIENTATION_DEG[orientation]`` and A1 at the holder's centre minus the grid's
+        centre offset from A1 turned by it (for ``turned-180``, plus the offset), so the
+        grid's centre stays on the holder and a switch renames the wells in place; else
+        the plate *unplaced*, A1 at the stage's origin, not turned. An estimate is a place
+        to draw, never a registration: the run document is not read for it and ``click``
+        still drives only a registered plate.
 
         Built once per ``(plate, a1_center_xy_um, rotation_deg)`` and kept: 1536
         wells cost 339 ms, which a click or a refresh must not pay again. The estimate's
-        A1 is a pure function of the plate and the profile, so its key is stable.
+        A1 is a pure function of the plate, the profile and the orientation, and a
+        turned estimate has another A1 and rotation: another key, never a stale one.
         """
+        holder = self._profile.holder
         if registered is not None and registered.plate == self._plate:
             a1, rotation = registered.a1_center_xy_um, registered.rotation_deg
+            orientation: PlateOrientation = registered.orientation
+            corner = a1_corner(orientation, holder.back, holder.right)
             if registered.method == "seed":
                 pose = MapPose(
                     "seed",
                     seed_well=registered.refs[0].well if registered.refs else "",
+                    orientation=orientation,
+                    a1_corner=corner,
                 )
             else:
-                pose = MapPose("registered")
+                pose = MapPose("registered", orientation=orientation, a1_corner=corner)
         else:
-            rotation = 0.0
-            holder = self._profile.holder.plate_centre_xy_um
-            if holder is None:
-                a1, pose = (0.0, 0.0), MapPose("unplaced")
+            orientation = self._orientation
+            centre = holder.plate_centre_xy_um
+            if centre is None:
+                a1, rotation = (0.0, 0.0), 0.0
+                pose = MapPose("unplaced", orientation=orientation)
             else:
-                offset = self._grid_centre_offset()
-                a1 = (holder[0] - offset[0], holder[1] - offset[1])
-                pose = MapPose("estimated", holder_centre_um=holder)
+                rotation = ORIENTATION_DEG[orientation]
+                turned_x, turned_y = _turned(self._grid_centre_offset(), rotation)
+                a1 = (centre[0] - turned_x, centre[1] - turned_y)
+                pose = MapPose(
+                    "estimated",
+                    holder_centre_um=centre,
+                    orientation=orientation,
+                    a1_corner=a1_corner(orientation, holder.back, holder.right),
+                )
         key = (self._plate, a1, rotation)
         found = self._geometry.get(key)
         if found is None:
@@ -3453,7 +3708,9 @@ class PlatePage:
                 registered.to_plan()
                 if pose.kind in ("registered", "seed") and registered is not None
                 else useq.WellPlatePlan(
-                    plate=useq.WellPlate.from_str(self._plate), a1_center_xy=a1
+                    plate=useq.WellPlate.from_str(self._plate),
+                    a1_center_xy=a1,
+                    rotation=rotation,
                 )
             )
             found = tuple(
@@ -3558,6 +3815,19 @@ class PlatePage:
             return str(found.plate)
         if record.plugin in _PLATE_PARAM_PLUGINS:
             return self._plate_of(record)
+        if record.plugin == "plate-orientation":
+            # A turn has no `plate` parameter: the plate is the fit's it read. One that
+            # failed opened the page on the placeholder and dropped the fit's captures
+            # (adversarial review of #422).
+            read = record.reads.get("plate")
+            fit = None if read is None else doc.stages.get(read.plugin)
+            if (
+                fit is not None
+                and read is not None
+                and fit.attempt == read.attempt
+                and fit.plugin in _PLATE_PARAM_PLUGINS
+            ):
+                return self._plate_of(fit)
         return None
 
     @staticmethod
@@ -3590,14 +3860,70 @@ class PlatePage:
         # plate the page did not take is no source: its wells are named for a plate
         # this page cannot build.
         provider = doc.provider("plate")
+        if provider is not None and provider.plugin == "plate-orientation":
+            self._restore_through_a_turn(doc, provider)
+            return
         if provider is None or self._plate_of(provider) != self._plate:
             return
+        self._restore_captures(provider)
+
+    def _restore_captures(self, provider: StageRecord) -> None:
+        """The captures a fit's record was run with: centres, and the walls of a registration."""
         if provider.plugin == "plate-registration":
             self.refs = self._captured(provider, "refs", WellRef)
             self.walls = self._captured(provider, "walls", WallTouch)
         elif provider.plugin == "plate-walls":
             # It takes centres and measures the walls itself: it has no walls to give.
             self.refs = self._captured(provider, "refs", WellRef)
+
+    def _restore_through_a_turn(self, doc: RunDocument, turn: StageRecord) -> None:
+        """The captures of the fit a ``plate-orientation`` record read, renamed when it turned the plate (m5 §16 D6).
+
+        The rename has no captures of its own: they are the fit's, which the record
+        names in ``reads["plate"]``. That fit is the source only while it is the attempt
+        the turn read and is of the page's plate; one run again since (a newer fit, or
+        one that failed) is no source, and the page holds no captures, as it would for
+        any provider without them. They are renamed when the turn ended ``done`` with
+        another orientation than the fit's: its names are then the turned plate's.
+        """
+        read = turn.reads.get("plate")
+        fit = None if read is None else doc.stages.get(read.plugin)
+        if (
+            read is None
+            or fit is None
+            or fit.attempt != read.attempt
+            or self._plate_of(fit) != self._plate
+        ):
+            return
+        self._restore_captures(fit)
+        if turn.status is not StageStatus.done:
+            return
+        try:
+            fitted = PlateResult.model_validate(fit.result)
+            turned = PlateResult.model_validate(turn.result)
+        except ValidationError as exc:
+            # Which names the captures carry is unknown: none is better than a guess.
+            log.info(
+                "the captures are not restored: a plate result does not validate: %s",
+                _first_problem(exc),
+            )
+            self.refs = ()
+            self.walls = ()
+            return
+        if fitted.orientation != turned.orientation:
+            self._rename_captures()
+
+    def _rename_captures(self) -> None:
+        """Rename every capture for the plate turned 180°: the positions stay, the names follow (m5 §16 D6)."""
+        plate = self._plate
+        self.refs = tuple(
+            ref.model_copy(update={"well": _turned_name(plate, ref.well)})
+            for ref in self.refs
+        )
+        self.walls = tuple(
+            touch.model_copy(update={"well": _turned_name(plate, touch.well)})
+            for touch in self.walls
+        )
 
     @staticmethod
     def _captured(

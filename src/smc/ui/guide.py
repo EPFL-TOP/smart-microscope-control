@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
     from smc.plugins.geometry import Matrix2
     from smc.plugins.slots import PlateResult, ScanPlanResult, WellRef
+    from smc.plugins.slots.plate import PlateOrientation
     from smc.ui.controller import (
         CheckItem,
         LoadedPreset,
@@ -37,13 +38,16 @@ __all__ = [
     "END_LIVE_LABEL",
     "MAP_FIELDS_UP_TO",
     "NO_CALIBRATION_FOR_SIDES",
+    "ORIENTATION_IN_STAGE_TERMS",
     "PLATE_NOT_CHOSEN",
+    "SELECTION_KEPT_ITS_NAMES",
     "SELECT_WELLS",
     "WALLS_DRY_RUN",
     "WALLS_MAX_CENTRES",
     "WALLS_MIN_CENTRES",
     "WALLS_NEED_CALIBRATION",
     "NextStep",
+    "a1_corner",
     "busy_note",
     "capture_centre_label",
     "capture_wall_label",
@@ -55,11 +59,13 @@ __all__ = [
     "image_sides_note",
     "map_title",
     "next_slot",
+    "orientation_label",
     "plan_title",
     "preset_differences",
     "preset_note_text",
     "replace_note",
     "scan_plan_card_lines",
+    "side_words",
     "stage_label",
     "wall_touches_note",
     "walls_card_lines",
@@ -370,24 +376,116 @@ def walls_card_lines(result: PlateResult) -> tuple[str, ...]:
     return tuple(lines)
 
 
+#: A1's corner in the stage's terms for each orientation (m3 §24 D1): ``useq``'s layout
+#: puts A1 at -X +Y, and a plate turned 180° has it at +X -Y.
+_A1_STAGE_CORNER: Mapping[str, tuple[str, str]] = {
+    "not-turned": ("-X", "+Y"),
+    "turned-180": ("+X", "-Y"),
+}
+
+#: Where A1 is on the map, which is drawn X right and Y up whatever the stand's sides.
+_A1_MAP_CORNER: Mapping[str, str] = {
+    "not-turned": "top left",
+    "turned-180": "bottom right",
+}
+
+#: What the note under *Plate lies* says while the profile names no side of the stand
+#: (m5 §16 D3): the choices are then in the stage's terms, and this says why.
+ORIENTATION_IN_STAGE_TERMS = (
+    "this stand does not say which side of it is the back, so the corners are named "
+    "in stage terms: its profile's [holder] back and right would name them"
+)
+
+
+#: What the strip adds when a turn renamed the plate under a selection (m5 §16 D6): a
+#: selection is names, the printed wells, which now lie elsewhere on the stage.
+SELECTION_KEPT_ITS_NAMES = (
+    "the selection kept its names; with the plate turned they lie elsewhere"
+)
+
+
+def _opposite(direction: str) -> str:
+    """``-X`` for ``+X``: the other end of one stage axis."""
+    return ("-" if direction[0] == "+" else "+") + direction[1:]
+
+
+def side_words(back: str | None, right: str | None) -> dict[str, str]:
+    """The words for each stage direction, from the profile's ``[holder] back`` and ``right`` (m5 §16 D3).
+
+    ``{}`` unless both are set: one side alone would name a corner by half. The
+    profile refuses one alone or two on one axis; this only reads what it accepted.
+    """
+    if back is None or right is None:
+        return {}
+    return {
+        back: "back of the stand",
+        _opposite(back): "front of the stand",
+        right: "operator's right",
+        _opposite(right): "operator's left",
+    }
+
+
+def a1_corner(
+    orientation: PlateOrientation, back: str | None, right: str | None
+) -> str:
+    """The corner A1 is at, in the operator's words when the stand says its sides (m5 §16 D3).
+
+    ``the back left``, back-or-front first, from the stage corner of the orientation
+    and the profile's directions; each word is found by the direction, never by its
+    axis, so a stand whose back is +X says it right (FM-73). Without the directions,
+    ``stage -X +Y``.
+    """
+    x, y = _A1_STAGE_CORNER[orientation]
+    if back is None or right is None:
+        return f"stage {x} {y}"
+    # The corner's direction on the back's axis, and the one on the right's: the
+    # profile keeps them on different axes, so each is found exactly once.
+    depth = x if x[1] == back[1] else y
+    width = x if x[1] == right[1] else y
+    front_or_back = "back" if depth == back else "front"
+    left_or_right = "right" if width == right else "left"
+    return f"the {front_or_back} {left_or_right}"
+
+
+def orientation_label(
+    orientation: PlateOrientation, back: str | None, right: str | None
+) -> str:
+    """The *Plate lies* choice's label: ``A1 at the back left``, ``Turned 180°: A1 at the front right`` (m5 §16 D3).
+
+    In stage terms when the stand does not say its sides, both labelled then, since
+    "A1 at stage -X +Y" alone does not say it is the plate as ``useq`` lays it.
+    """
+    corner = f"A1 at {a1_corner(orientation, back, right)}"
+    if orientation == "turned-180":
+        return f"Turned 180\N{DEGREE SIGN}: {corner}"
+    if back is None or right is None:
+        return f"Not turned: {corner}"
+    return corner
+
+
 def map_title(plate: str, pose: MapPose) -> str:
-    """What the map's title says about how its plate was placed, before the scan plan's suffix (m5 §15 D4).
+    """What the map's title says about how its plate was placed, before the scan plan's suffix (m5 §15 D4, §16 D8).
 
     A well name read off the map is trusted, so the title says on its face which of
-    *registered* (measured), *seed* (one well given, the rotation assumed),
-    *estimated* (from the stand's holder) or *unplaced* (the stand says nothing) the
-    map is, and for the last two what the operator would need to act on it: where the
-    estimate puts the plate and which corner A1 is at, or that the cross then shows the
-    stage and no well. Plain text, never markup (FM-139): the plate name is quoted as it
-    is. The holder's centre is shown to whole µm, which is finer than it is known.
+    *registered* (measured), *seed* (one well given, the rotation taken from the
+    declared orientation), *estimated* (from the stand's holder) or *unplaced* (the
+    stand says nothing) the map is, and for the last two what the operator would need
+    to act on it: where the estimate puts the plate, which orientation was declared and
+    which corner of the map A1 is at, or that the cross then shows the stage and no
+    well. A registered plate and a seed name A1's corner (``pose.a1_corner``), the check
+    the operator makes against the plate. Plain text, never markup (FM-139): the plate
+    name is quoted as it is. The holder's centre is shown to whole µm, which is finer
+    than it is known.
     """
+    corner = f", A1 at {pose.a1_corner}" if pose.a1_corner else ""
     if pose.kind == "registered":
-        return f"{plate}: the registered plate"
+        return f"{plate}: the registered plate{corner}"
     if pose.kind == "seed":
         well = f" ({pose.seed_well})" if pose.seed_well else ""
         return (
             f"{plate}: placed from one well{well}, not registered: "
-            "the rotation is assumed 0\N{DEGREE SIGN}, not measured"
+            f"the rotation is taken from the declared orientation{corner}, "
+            "not measured"
         )
     if pose.kind == "estimated":
         # `round` is an int: no "-0" for a point a fraction of a micron below zero. A
@@ -401,9 +499,16 @@ def map_title(plate: str, pose: MapPose) -> str:
                 "\N{MICRO SIGN}m, "
             )
         )
+        # "declared": the estimate measured no orientation, the operator said it (FM-217).
+        turned = (
+            "turned 180\N{DEGREE SIGN}"
+            if pose.orientation == "turned-180"
+            else "not turned"
+        )
         return (
             f"{plate}: estimated from the stand's holder, not registered: "
-            f"{where}not turned, A1 at the top left of this map"
+            f"{where}declared {turned}, A1 at the "
+            f"{_A1_MAP_CORNER[pose.orientation]} of this map"
         )
     return (
         f"{plate}: not registered, and this stand does not say where its plate lies: "

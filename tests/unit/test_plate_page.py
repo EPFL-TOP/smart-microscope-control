@@ -339,11 +339,8 @@ def test_the_page_builds_every_tool_the_registry_holds_in_workflow_order(
         "calibration",
     ]
     assert "wells" not in view.tool_fields["scan-plan"]
-    # `orientation` is a field of the form until #422 fills it from the page.
-    assert set(view.tool_fields["plate-registration"]) == {
-        "max_rotation_deg",
-        "orientation",
-    }
+    # `orientation` is the page's *Plate lies* choice (m5 §16 D5), never a field.
+    assert set(view.tool_fields["plate-registration"]) == {"max_rotation_deg"}
 
 
 # --- the image, Snap and the result cards ----------------------------------------------
@@ -1101,7 +1098,7 @@ def test_the_map_says_whether_the_plate_is_registered(
     assert view.figure.title.text == _unplaced_title("96-well")
     _seed(run_doc, "plate-registration", "plate", _plate())
     view.refresh()
-    assert view.figure.title.text == "96-well: the registered plate"
+    assert view.figure.title.text == "96-well: the registered plate, A1 at stage -X +Y"
     view.plate_select.value = "384-well"
     assert view.figure.title.text == _unplaced_title("384-well")
 
@@ -1630,7 +1627,7 @@ def test_the_title_of_a_registered_plate_gets_the_same_suffix(
     _seed(run_doc, "scan-plan", "scan-plan", _scan_plan_result(), minute=1)
     view = PlatePageView(page)
     assert view.figure.title.text == (
-        "96-well: the registered plate; scan plan: 12 fields in 3 wells"
+        "96-well: the registered plate, A1 at stage -X +Y; scan plan: 12 fields in 3 wells"
     )
     # A page with no plan says nothing of one.
     run_doc.unlink()
@@ -3314,7 +3311,7 @@ def test_the_refresh_button_redraws_the_view_after_the_run_document_changed(
     _seed(run_doc, "plate-registration", "plate", _plate())
     assert view.figure.title.text == unregistered  # a tick never reads the view
     view.refresh_button.clicks += 1
-    assert view.figure.title.text == "96-well: the registered plate"
+    assert view.figure.title.text == "96-well: the registered plate, A1 at stage -X +Y"
     assert "✓ plate" in view.checklist_text.object
 
 

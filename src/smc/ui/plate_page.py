@@ -35,7 +35,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import panel as pn
@@ -60,6 +60,7 @@ from smc.hardware.capabilities import (
 )
 from smc.plugins.presets import PresetError, PresetExistsError
 from smc.plugins.slots import IMAGE_SIDES
+from smc.plugins.slots.plate import ORIENTATION_DEG, PlateOrientation
 from smc.ui.controller import (
     NOT_CONNECTED,
     LoadedPreset,
@@ -74,6 +75,7 @@ from smc.ui.controller import (
 from smc.ui.frames import Frame, display_image
 from smc.ui.guide import (
     END_LIVE_LABEL,
+    ORIENTATION_IN_STAGE_TERMS,
     NextStep,
     busy_note,
     capture_centre_label,
@@ -83,9 +85,11 @@ from smc.ui.guide import (
     forget_label,
     image_sides_note,
     map_title,
+    orientation_label,
     plan_title,
     preset_differences,
     preset_note_text,
+    side_words,
     stage_label,
     wall_touches_note,
 )
@@ -459,6 +463,42 @@ class PlatePageView:
             text_font_size="9px",
         )
         self.figure.add_layout(self.names)
+        # The stand's sides around the wells and A1's name (m5 §16 D8): plain text, each
+        # source's ``x``, ``y`` and ``text`` set together, as the cross's. A1 is drawn on
+        # every plate, bold: the one name the operator checks against the plate, which
+        # the names above leave out past ``NAMES_UP_TO_WELLS``.
+        self.side_source = ColumnDataSource({"x": [], "y": [], "text": []})
+        # An invisible glyph at each side label: the map's auto range spans renderers,
+        # never annotations, and a label half a pitch beyond the top row was drawn off
+        # the canvas (seen by /ui-check, #422).
+        self.figure.scatter(
+            "x", "y", source=self.side_source, size=1, alpha=0.0
+        ).level = "underlay"
+        self.figure.add_layout(
+            LabelSet(
+                x="x",
+                y="y",
+                text="text",
+                source=self.side_source,
+                text_align="center",
+                text_baseline="middle",
+                text_font_size="11px",
+                text_color="#555555",
+            )
+        )
+        self.a1_source = ColumnDataSource({"x": [], "y": [], "text": []})
+        self.figure.add_layout(
+            LabelSet(
+                x="x",
+                y="y",
+                text="text",
+                source=self.a1_source,
+                text_align="center",
+                text_baseline="middle",
+                text_font_size="11px",
+                text_font_style="bold",
+            )
+        )
         self.figure.add_layout(ColorBar(color_mapper=self.mapper), "right")
         # Before the route's line, so that the route is drawn over the fields; the wells
         # are `underlay`, below both, and the only renderer the hover reads. The orange
@@ -564,6 +604,26 @@ class PlatePageView:
             extra={"color": _WARNING}, width=_PLATE_NOTE_WIDTH
         )
         self.plate_confirm_button = pn.widgets.Button(label="", color="primary")
+        # Which way the plate lies (m5 §16 D2): beside the plate menu, worded from the
+        # stand's sides, and the only place it is said (no tool's form offers it).
+        holder = page.holder
+        self.orientation_select = pn.widgets.Select(
+            label="Plate lies",
+            options={
+                orientation_label(value, holder.back, holder.right): value
+                for value in cast(
+                    "tuple[PlateOrientation, ...]", tuple(ORIENTATION_DEG)
+                )
+            },
+            value=page.orientation,
+        )
+        # Under the menu, only on a stand that does not say its sides (m5 §16 D3).
+        self.orientation_note = _wrapped_text(
+            ORIENTATION_IN_STAGE_TERMS, width=_PLATE_NOTE_WIDTH
+        )
+        self.orientation_note.visible = not side_words(holder.back, holder.right)
+        # Set while ``refresh`` re-syncs the select, so its watcher starts no run.
+        self._syncing_orientation = False
         self.label_select = pn.widgets.Select(
             label="Density of", options=[], value=None
         )
@@ -622,6 +682,9 @@ class PlatePageView:
         # the page holds by then.
         self.plate_select.param.watch(
             self._handler(lambda event: self._draw_preset_note()), "value"
+        )
+        self.orientation_select.param.watch(
+            self._handler(lambda event: self.on_choose_orientation(event.new)), "value"
         )
         self.label_select.param.watch(
             self._handler(lambda event: self._draw_wells()), "value"
@@ -895,11 +958,15 @@ class PlatePageView:
             sizing_mode="stretch_width",
         )
         controls = pn.Row(
-            self.plate_select, self.label_select, self.side_select, self.drive_toggle
+            self.plate_select,
+            self.orientation_select,
+            self.label_select,
+            self.side_select,
+            self.drive_toggle,
         )
         plate_tab = pn.Column(
             controls,
-            pn.Row(self.plate_confirm_button, self.plate_note),
+            pn.Row(self.plate_confirm_button, self.plate_note, self.orientation_note),
             pn.Row(self.select_input, self.refresh_button),
             pn.pane.Bokeh(self.figure, sizing_mode="stretch_width"),
             sizing_mode="stretch_width",
@@ -1134,6 +1201,18 @@ class PlatePageView:
         if name == self.page.plate:
             return
         self._try(lambda: self.page.choose_plate(name))
+        self.refresh()
+
+    def on_choose_orientation(self, value: PlateOrientation) -> None:
+        """The plate lies another way: the controller decides what that does (m5 §16 D4).
+
+        On a registered plate it starts ``plate-orientation`` and the select shows the
+        new value once that run ends (the refresh after it); a refusal is the outcome
+        and the refresh puts the select back. A re-sync by ``refresh`` does nothing.
+        """
+        if self._syncing_orientation or value == self.page.orientation:
+            return
+        self._try(lambda: self.page.choose_orientation(value))
         self.refresh()
 
     def _well_the_buttons_name(self) -> str:
@@ -1692,6 +1771,9 @@ class PlatePageView:
             # Another tab's confirmation of the placeholder changes the note, the
             # button and the tools' notes without changing the plate (FM-151).
             page.plate_chosen,
+            # Another tab's choice on an estimate changes no attribute above and no
+            # activity ends for it (FM-151); a turn's run does, and is here too.
+            page.orientation,
             page.selection,
             page.refs,
             page.walls,
@@ -1716,6 +1798,12 @@ class PlatePageView:
             self.label_select.value = labels[0] if labels else None
         if self.plate_select.value != view.plate:
             self.plate_select.value = view.plate
+        if self.orientation_select.value != view.orientation:
+            self._syncing_orientation = True
+            try:
+                self.orientation_select.value = view.orientation
+            finally:
+                self._syncing_orientation = False
         self._draw_wells()
         self._echo_selection()
         self.route_source.data = {
@@ -1869,6 +1957,17 @@ class PlatePageView:
         self.mapper.low = 0.0
         self.mapper.high = max(known) if known and max(known) > 0.0 else 1.0
         self.names.visible = len(view.wells) <= NAMES_UP_TO_WELLS
+        self.side_source.data = {
+            "x": [side.x_um for side in view.sides],
+            "y": [side.y_um for side in view.sides],
+            "text": [side.text for side in view.sides],
+        }
+        a1 = [w for w in view.wells if w.well == "A1"]
+        self.a1_source.data = {
+            "x": [w.center_um[0] for w in a1],
+            "y": [w.center_um[1] for w in a1],
+            "text": [w.well for w in a1],
+        }
         # Where the wells are drawn is only as good as the registration: say which map it is
         # (registered, seed, estimated or unplaced, m5 §15 D4). The scan plan's suffix is
         # where a plan too large to draw says so (m5 §14.3).
@@ -1944,6 +2043,14 @@ class PlatePageView:
             running is not None and not live
         )
         self.snap_note.object = lacks or ""
+        # A turn on a registered plate is a run (m5 §16 D4): offered when one can start,
+        # so not while Live goes either, as every Run. On an estimate it runs nothing and
+        # stays offered beside Live. The controller refuses a run all the same when the
+        # select is not disabled (FM-169).
+        kind = None if self._view is None else self._view.pose.kind
+        self.orientation_select.disabled = running is not None and (
+            not live or kind in ("registered", "seed")
+        )
 
     def _draw_plate_ask(self) -> None:
         """The note and the button that ask which plate is on the stage, visible only while nothing named it (m5 §11.3).

@@ -59,8 +59,11 @@ B3 = (ESTIMATED_A1[0] + 2 * PITCH_UM, ESTIMATED_A1[1] - PITCH_UM)
 
 ESTIMATED_TITLE = (
     "96-well: estimated from the stand's holder, not registered: "
-    f"centred at stage (400, -325) {UM}, not turned, A1 at the top left of this map"
+    f"centred at stage (400, -325) {UM}, declared not turned, "
+    "A1 at the top left of this map"
 )
+#: A registered plate names A1's corner, in stage terms on a stand with no sides (m5 §16 D8).
+REGISTERED_TITLE = "96-well: the registered plate, A1 at stage -X +Y"
 UNPLACED_TITLE = (
     "96-well: not registered, and this stand does not say where its plate lies: "
     "A1 is drawn at stage (0, 0), so the cross shows the stage and not a well"
@@ -223,12 +226,13 @@ def test_the_title_says_which_pose_the_map_is_drawn_in(
     view.refresh()
     assert view.figure.title.text == (
         "96-well: placed from one well (B3), not registered: "
-        f"the rotation is assumed 0{DEG}, not measured"
+        "the rotation is taken from the declared orientation, A1 at stage -X +Y, "
+        "not measured"
     )
 
     _register(run_doc, a1=ESTIMATED_A1)
     view.refresh()
-    assert view.figure.title.text == "96-well: the registered plate"
+    assert view.figure.title.text == REGISTERED_TITLE
 
 
 def test_the_estimated_map_draws_the_wells_where_the_holder_puts_them(
@@ -520,7 +524,7 @@ def test_a_second_tab_draws_the_same_pose_and_cross(
     first.refresh()
     second.refresh()
     assert first.figure.title.text == second.figure.title.text
-    assert first.figure.title.text == "96-well: the registered plate"
+    assert first.figure.title.text == REGISTERED_TITLE
     assert _cross(first) == _cross(second)
     assert _cross(second)["text"] == ["over B3"]
 

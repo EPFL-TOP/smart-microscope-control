@@ -77,6 +77,8 @@ class RegistrationParams(PluginParams):
     plate: str = "96-well"
     refs: tuple[WellRef, ...] = ()
     walls: tuple[WallTouch, ...] = ()
+    # The page fills it from its *Plate lies* choice (m5 §16 D5), as for the real one.
+    orientation: str = "not-turned"
 
 
 class ScanPlanParams(PluginParams):

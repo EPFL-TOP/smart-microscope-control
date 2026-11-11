@@ -74,7 +74,14 @@ STOP_GRACE_S = 25.0
 TERMINATE_GRACE_S = 10.0
 KILL_GRACE_S = 5.0
 
-STATE_NAMES = ("empty", "wells-selected", "snap", "after-density", "with-route")
+STATE_NAMES = (
+    "empty",
+    "wells-selected",
+    "snap",
+    "after-density",
+    "with-route",
+    "turned",
+)
 
 # A child sharing the console can change its code page (FM-22).
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -268,7 +275,7 @@ def plan_states(
 ) -> list[StatePlan]:
     """Which states can be reached, and why not for the others (never silent).
 
-    The last two need the results of a real run of the workflow: the demo camera
+    The last three need the results of a real run of the workflow: the demo camera
     images no sample, ``--no-results`` skips the chain, and a chain step that failed
     leaves them without their input.
     """
@@ -289,6 +296,7 @@ def plan_states(
             *plans,
             StatePlan("after-density", False, chain_failure),
             StatePlan("with-route", False, f"needs the chain: {chain_failure}"),
+            StatePlan("turned", False, f"needs the chain: {chain_failure}"),
         ]
     return [*plans, *(StatePlan(n, True) for n in STATE_NAMES[3:])]
 
@@ -645,12 +653,30 @@ def _act_with_route(page: Any, stand: Stand) -> None:
     page.get_by_role("button", name="Refresh").click()
 
 
+def _act_turned(page: Any, stand: Stand) -> None:
+    """The plate declared turned 180° on the *Plate lies* select (m5 §16.4).
+
+    The chain registered the plate, so the switch is a run of ``plate-orientation``:
+    the state waits for its outcome line on the strip, never for a delay (FM-162).
+    Compared by eye with ``with-route``: the same cross, other names. The label is
+    read from the select's own options, since it is worded from the stand's sides; a
+    select with no turned option fails the state on ``select_option``, named.
+    """
+    page.get_by_text("Plate", exact=True).first.click()
+    select = page.get_by_label("Plate lies", exact=True)
+    labels = [text.strip() for text in select.locator("option").all_inner_texts()]
+    turned = next((t for t in labels if t.startswith("Turned 180")), "Turned 180")
+    select.select_option(label=turned)
+    page.locator("pre").filter(has_text="plate-orientation done").first.wait_for()
+
+
 ACTIONS = {
     "empty": _act_empty,
     "wells-selected": _act_wells_selected,
     "snap": _act_snap,
     "after-density": _act_after_density,
     "with-route": _act_with_route,
+    "turned": _act_turned,
 }
 
 
@@ -796,7 +822,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-results",
         action="store_true",
-        help="do not run the chain of tools: the last two states are not reached",
+        help="do not run the chain of tools: the last three states are not reached",
     )
     parser.add_argument(
         "--keep-work",

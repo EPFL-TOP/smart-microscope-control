@@ -2208,6 +2208,7 @@ def test_plate_registration_params_are_the_plate_and_the_captures(
         "plate=96-well",
         f"refs={refs}",
         f"walls={walls}",
+        "orientation=not-turned",  # the *Plate lies* choice (m5 §16 D5)
     ]
 
 
@@ -2256,11 +2257,10 @@ def test_the_form_of_plate_walls_offers_neither_plate_nor_refs(
             "search_um",
             "max_residual_um",
             "max_rotation_deg",
-            "orientation",  # the page fills it once #422 is in
             "settle_ms",
             "save_frames",
         }
-        assert PAGE_PARAMS["plate-walls"] == ("plate", "refs")
+        assert PAGE_PARAMS["plate-walls"] == ("plate", "refs", "orientation")
     finally:
         page.close()
 
@@ -2285,10 +2285,15 @@ def test_plate_walls_params_are_the_plate_and_the_captured_centres(
             {"well": "B2", "x_um": 9001.5, "y_um": -9000.5},
         ]
     )
-    assert page.page_params("plate-walls") == ["plate=96-well", f"refs={refs}"]
+    assert page.page_params("plate-walls") == [
+        "plate=96-well",
+        f"refs={refs}",
+        "orientation=not-turned",
+    ]
     # The one dump for both tools: a step and a click agree, byte for byte.
     registration = page.page_params("plate-registration")
-    assert registration[:2] == page.page_params("plate-walls")
+    assert registration[:2] == page.page_params("plate-walls")[:2]
+    assert registration[-1] == page.page_params("plate-walls")[-1]
 
 
 def test_plate_walls_params_refuse_fewer_than_two_centres_and_more_than_six(
@@ -4984,6 +4989,8 @@ def test_every_key_and_page_param_is_a_field_of_its_plugin(
         "scan-plan",
         "plate-registration",
         "plate-walls",
+        "plate-finding",
+        "plate-orientation",
         "camera-calibration",
         "scan",
         "cells",
@@ -5049,8 +5056,8 @@ def test_tools_follow_the_workflow_order_and_hide_what_the_page_fills(
     ]
     registration = by_name["plate-registration"]
     registration_rows = {row[0] for row in (*registration.key, *registration.advanced)}
-    # `orientation` is a field of the form until #422 fills it from the page.
-    assert registration_rows == {"max_rotation_deg", "orientation"}
+    # `orientation` is the page's *Plate lies* choice (m5 §16 D5), never a field.
+    assert registration_rows == {"max_rotation_deg"}
     assert registration.summary.startswith("Locate a well plate on the stage")
     assert by_name["scan"].key[0][0] == "autofocus"
 
