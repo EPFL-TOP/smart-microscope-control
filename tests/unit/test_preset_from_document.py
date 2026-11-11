@@ -403,6 +403,7 @@ CASES: dict[str, list[dict[str, Any]]] = {
             "orientation": "turned-180",
         }
     ],
+    "plate-orientation": [{"orientation": "turned-180"}],
     "plate-registration": [
         {
             "plate": "24-well",
@@ -491,7 +492,10 @@ def test_every_builtin_plugins_recorded_params_come_back_through_a_preset(
     plugin: str, given: dict[str, Any]
 ) -> None:
     recorded = _recorded(plugin, **given)
-    plate = recorded["plate"] if PROVIDES[plugin] == "plate" else "96-well"
+    # `plate-orientation` provides the plate and takes no plate name (m3 §24 D7).
+    plate = (
+        recorded.get("plate", "96-well") if PROVIDES[plugin] == "plate" else "96-well"
+    )
     records = [_record(plugin, recorded, result={"plate": plate})]
     if PROVIDES[plugin] != "plate":
         records.append(_registered(plate))
