@@ -67,6 +67,24 @@ NO_PIXEL_SIZE = (
 NO_CALIBRATION = (
     "no camera calibration for {objective}: rotation 0 and no mirror assumed"
 )
+#: What a calibration set aside for its objective says to do (m3 §23.3 (4)).
+GIVE_CALIBRATION = (
+    "; give calibration, a run document whose camera-calibration was made with "
+    "{now} in place"
+)
+#: The refusal of a given calibration of another objective (m3 §23.3 (2)).
+CALIBRATION_OF_ANOTHER_OBJECTIVE = (
+    "the calibration in {where} is of {was}, the plan is for {now}: give "
+    "calibration a run document whose camera-calibration was made with {now} in place"
+)
+#: The refusal of a given calibration of another frame (m3 §23.3 (2)).
+CALIBRATION_OF_ANOTHER_FRAME = (
+    "the calibration in {where} is of a frame of {was}, the camera gives {now} "
+    "(binning or the region changed): run camera-calibration into it again with "
+    "this camera setting"
+)
+#: When ``_seed`` says the calibration was measured.
+SEEDED_AT = "2026-10-27T09:30:00+00:00"
 
 
 def _matrix(pixel_size_um: float, rotation_deg: float, mirrored: bool) -> Matrix2:
@@ -140,6 +158,7 @@ def _write_calibration(
     rotation_deg: float = 3.5,
     mirrored: bool = False,
     matrix: Matrix2 | None = None,
+    dry_run: bool = False,
 ) -> CameraCalibration:
     """A calibration as measured; ``matrix`` overrides the one that its other fields imply."""
     calibration = CameraCalibration(
@@ -158,7 +177,9 @@ def _write_calibration(
         return_error_um=0.4,
         step_um=48.0,
     )
-    _seed(path, "camera-calibration", "camera-calibration", calibration)
+    _seed(
+        path, "camera-calibration", "camera-calibration", calibration, dry_run=dry_run
+    )
     return calibration
 
 
@@ -251,6 +272,7 @@ def test_the_objective_in_place_takes_the_cameras_pixel_size(
     # Width from the 512 columns, height from the 300 rows.
     assert result.fov_um == (256.0, 150.0)
     assert result.assumed == (NO_CALIBRATION.format(objective=IN_PLACE),)
+    assert (result.calibration_from, result.calibration_measured) == (None, None)
     assert _stored(tmp_path) == record
 
 
@@ -297,6 +319,8 @@ def test_the_matrix_comes_from_a_calibration_of_the_same_objective_only(
         "the camera is turned 3.5° from the stage axes: at overlap 0.1 the grid "
         "leaves gaps between fields; use overlap=0.13",
     )
+    # The document's own calibration is not "from another document".
+    assert (result.calibration_from, result.calibration_measured) == (None, None)
 
 
 @pytest.mark.parametrize(
@@ -304,11 +328,13 @@ def test_the_matrix_comes_from_a_calibration_of_the_same_objective_only(
     [
         (
             {"objective": FORTY},
-            f"it is of {FORTY}, the plan is for {IN_PLACE}",
+            f"it is of {FORTY}, the plan is for {IN_PLACE}"
+            + GIVE_CALIBRATION.format(now=IN_PLACE),
         ),
         (
             {"objective": None},
-            f"it is of an unknown objective, the plan is for {IN_PLACE}",
+            f"it is of an unknown objective, the plan is for {IN_PLACE}"
+            + GIVE_CALIBRATION.format(now=IN_PLACE),
         ),
         (
             {"shape": (512, 300)},
@@ -334,6 +360,28 @@ def test_a_calibration_of_another_objective_or_frame_is_ignored_and_says_why(
     assert result.assumed == (
         f"camera calibration not used: {why}",
         NO_CALIBRATION.format(objective=IN_PLACE),
+    )
+    assert (result.calibration_from, result.calibration_measured) == (None, None)
+
+
+def test_the_hint_is_not_given_for_a_plan_of_an_unknown_objective(
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stand without a turret has no objective to give a calibration for (m3 §23.3 (4))."""
+    microscope = _stand(demo_microscope_with_sample, tmp_path)
+    _write_plate(tmp_path / "run.json", objective=None)
+    _write_calibration(tmp_path / "run.json", objective=FORTY)
+    _without(microscope, monkeypatch, ObjectiveTurret)
+
+    result = _result(_run(microscope, tmp_path, wells="A1", **SMALL))
+
+    assert result.objective is None
+    assert result.assumed == (
+        f"camera calibration not used: it is of {FORTY}, the plan is for "
+        "an unknown objective",
+        NO_CALIBRATION.format(objective="this stand"),
     )
 
 
@@ -386,6 +434,233 @@ def test_a_parameter_pixel_size_wins_over_a_calibration(
     assert result.matrix_um_per_px == pixel_matrix(0.3)
     assert result.assumed == (
         "pixel size given as a parameter; rotation 0 and no mirror assumed",
+    )
+    assert (result.calibration_from, result.calibration_measured) == (None, None)
+
+
+# ----------------------------------------------- a calibration from another document
+
+
+@pytest.mark.parametrize(
+    "own_objective", [IN_PLACE, FORTY], ids=["same-objective", "another-objective"]
+)
+def test_a_calibration_document_wins_over_the_documents_own(
+    own_objective: str,
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The document's own calibration is not read when one is given: it is not even set aside with a line."""
+    microscope = _stand(demo_microscope_with_sample, tmp_path)
+    _write_calibration(
+        tmp_path / "run.json",
+        objective=own_objective,
+        pixel_size_um=0.4,
+        rotation_deg=3.5,
+    )
+    other = tmp_path / "cal-other.json"
+    given = _write_calibration(other, pixel_size_um=0.2, rotation_deg=20.0)
+
+    with caplog.at_level(logging.INFO, logger="smc"):
+        result = _result(
+            _run(microscope, tmp_path, wells="A1", calibration=other, **SMALL)
+        )
+
+    # 0.2 µm and 20°, the given document's, and not the 0.4 µm and 3.5° of run.json.
+    assert result.matrix_source == "camera-calibration"
+    assert result.pixel_size_um == 0.2
+    assert result.matrix_um_per_px == given.matrix_um_per_px
+    assert result.matrix_um_per_px != _matrix(0.4, 3.5, False)
+    assert result.calibration_from == other.as_posix()
+    assert result.calibration_measured == SEEDED_AT
+    # Only the given calibration's own gap line: a calibration that was measured
+    # assumes nothing, and the document's own is not mentioned.
+    assert result.assumed == (
+        "the camera is turned 20.0° from the stage axes: at overlap 0.1 the grid "
+        "leaves gaps between fields; use overlap=0.69",
+    )
+    infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert (
+        f"camera calibration of {IN_PLACE} from {other.as_posix()}, "
+        f"measured {SEEDED_AT}" in infos
+    )
+
+
+def test_a_calibration_document_is_the_plans_whatever_objective_is_in_place(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    """The 40x is asked for with the 10x in place: the calibration of the objective asked for is the one that fits."""
+    microscope = _stand(demo_microscope_with_sample, tmp_path)
+    other = tmp_path / "cal-40x.json"
+    given = _write_calibration(
+        other, objective=FORTY, pixel_size_um=0.2, rotation_deg=0.0
+    )
+
+    result = _result(
+        _run(
+            microscope,
+            tmp_path,
+            wells="A1",
+            objective=FORTY,
+            calibration=other,
+            **SMALL,
+        )
+    )
+
+    assert result.objective == FORTY
+    assert result.matrix_source == "camera-calibration"
+    assert result.matrix_um_per_px == given.matrix_um_per_px
+    assert result.calibration_from == other.as_posix()
+    assert result.assumed == (NOT_MEASURED.format(origin=IN_PLACE, target=FORTY),)
+
+
+def test_a_calibration_of_an_unknown_objective_is_given_to_a_plan_without_a_turret(
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    microscope = _stand(demo_microscope_with_sample, tmp_path)
+    _write_plate(tmp_path / "run.json", objective=None)
+    other = tmp_path / "cal-other.json"
+    _write_calibration(other, objective=None, rotation_deg=0.0)
+    _without(microscope, monkeypatch, ObjectiveTurret)
+
+    result = _result(_run(microscope, tmp_path, wells="A1", calibration=other, **SMALL))
+
+    assert result.objective is None
+    assert result.matrix_source == "camera-calibration"
+    assert result.calibration_from == other.as_posix()
+
+
+def test_pixel_size_and_calibration_together_are_refused() -> None:
+    with pytest.raises(ValidationError) as raised:
+        ScanPlanParams(wells="A1", pixel_size_um=0.3, calibration=Path("cal.json"))
+
+    (error,) = raised.value.errors()
+    assert error["type"] == "value_error"
+    assert error["msg"] == "Value error, give pixel_size_um or calibration, not both"
+    # Either one alone is a plan.
+    assert (
+        ScanPlanParams(wells="A1", calibration=Path("cal.json")).pixel_size_um is None
+    )
+    assert ScanPlanParams(wells="A1", pixel_size_um=0.3).calibration is None
+
+
+def _refused_calibration(
+    microscope: Microscope, tmp_path: Path, other: Path
+) -> PluginRunError:
+    """The refusal of a plan that was given ``other``, with what every refusal of one must hold."""
+    with pytest.raises(PluginRunError) as raised:
+        _run(microscope, tmp_path, wells="A1", calibration=other, **SMALL)
+    # The stage that refuses is this one, not camera-calibration, whose helper read the document.
+    assert raised.value.plugin == "scan-plan"
+    # FM-98: raised outside the handler of the error it stands for.
+    assert raised.value.__context__ is None
+    assert raised.value.__cause__ is None
+    stored = _stored(tmp_path)
+    assert stored.status is StageStatus.failed
+    assert stored.result is None
+    return raised.value
+
+
+@pytest.mark.parametrize(
+    "seeded",
+    [{"objective": FORTY}, {"objective": None}],
+    ids=["another-objective", "unknown-objective"],
+)
+def test_a_calibration_document_of_another_objective_is_refused_naming_both(
+    seeded: dict[str, object],
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+) -> None:
+    """Never set aside for the profile's size: the operator named this document (m3 §23, decided)."""
+    microscope = _stand(demo_microscope_with_sample, tmp_path)
+    # The document's own is of the plan's objective: a refusal must not fall back to it.
+    _write_calibration(tmp_path / "run.json")
+    other = tmp_path / "cal-other.json"
+    _write_calibration(other, **seeded)  # type: ignore[arg-type]
+
+    refused = _refused_calibration(microscope, tmp_path, other)
+
+    was = seeded["objective"]
+    assert refused.reason == CALIBRATION_OF_ANOTHER_OBJECTIVE.format(
+        where=other.as_posix(),
+        was=was if was is not None else "an unknown objective",
+        now=IN_PLACE,
+    )
+
+
+def test_a_calibration_document_for_a_plan_of_an_unknown_objective_is_refused(
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a turret the plan's objective is unknown, and a calibration of one is another."""
+    microscope = _stand(demo_microscope_with_sample, tmp_path)
+    _write_plate(tmp_path / "run.json", objective=None)
+    other = tmp_path / "cal-other.json"
+    _write_calibration(other, objective=FORTY)
+    _without(microscope, monkeypatch, ObjectiveTurret)
+
+    refused = _refused_calibration(microscope, tmp_path, other)
+
+    assert refused.reason == CALIBRATION_OF_ANOTHER_OBJECTIVE.format(
+        where=other.as_posix(), was=FORTY, now="an unknown objective"
+    )
+
+
+def test_a_calibration_document_of_another_frame_is_refused(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    microscope = _stand(demo_microscope_with_sample, tmp_path)
+    other = tmp_path / "cal-other.json"
+    _write_calibration(other, shape=(512, 300))
+
+    refused = _refused_calibration(microscope, tmp_path, other)
+
+    assert refused.reason == CALIBRATION_OF_ANOTHER_FRAME.format(
+        where=other.as_posix(), was=(512, 300), now=SHAPE
+    )
+
+
+def test_a_calibration_document_without_a_calibration_is_refused_with_its_path(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    microscope = _stand(demo_microscope_with_sample, tmp_path)
+    other = tmp_path / "plate-only.json"
+    _write_plate(other)
+
+    refused = _refused_calibration(microscope, tmp_path, other)
+
+    assert refused.reason == (
+        f"in {other.as_posix()}: the run document has no camera-calibration; "
+        "smc run --list shows which plugin provides it"
+    )
+
+
+def test_a_calibration_document_that_is_not_there_is_refused_with_its_path(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    microscope = _stand(demo_microscope_with_sample, tmp_path)
+    missing = tmp_path / "nowhere" / "cal.json"
+
+    refused = _refused_calibration(microscope, tmp_path, missing)
+
+    assert refused.reason.startswith(f"{missing.as_posix()}: ")
+
+
+def test_a_dry_run_calibration_document_is_refused_for_a_real_plan(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    microscope = _stand(demo_microscope_with_sample, tmp_path)
+    other = tmp_path / "cal-dry.json"
+    _write_calibration(other, dry_run=True)
+
+    refused = _refused_calibration(microscope, tmp_path, other)
+
+    assert refused.reason == (
+        f"in {other.as_posix()}: camera-calibration was a dry run; "
+        "run it without --dry-run"
     )
 
 
