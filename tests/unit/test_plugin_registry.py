@@ -381,11 +381,6 @@ def test_a_missing_member_is_named() -> None:
             id="reads-and-optional-overlap",
         ),
         pytest.param(
-            "ReadsItsOwnSlot",
-            "reads holds 'good', the slot it provides itself",
-            id="reads-holding-provides",
-        ),
-        pytest.param(
             "OptionalReadsItsOwnSlot",
             "reads_optional holds 'good', the slot it provides itself",
             id="reads-optional-holding-provides",
@@ -396,6 +391,19 @@ def test_a_plugin_that_breaks_a_naming_rule_is_refused_with_the_rule(
     cls: str, reason: str
 ) -> None:
     assert _reason(cls) == reason
+
+
+def test_a_plugin_may_read_the_slot_it_provides_but_not_optionally() -> None:
+    # m3 §24 D8: the run document judges such a read without the reader's own
+    # record, so `plate-orientation` reads the fit it renames. An optional read of
+    # one's own slot means nothing, and stays refused.
+    registry = discover([_ep("good", "ReadsItsOwnSlot")])
+    assert registry.failures == ()
+    assert list(registry.plugins) == ["good"]
+    assert registry.plugins["good"].plugin.reads == ("good",)
+    assert _reason("OptionalReadsItsOwnSlot") == (
+        "reads_optional holds 'good', the slot it provides itself"
+    )
 
 
 def test_a_name_that_is_not_kebab_case_is_refused_even_when_the_entry_agrees() -> None:

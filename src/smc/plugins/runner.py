@@ -85,7 +85,9 @@ def check_ready(
             has been produced again since its checkpoint was made).
     """
     for slot in plugin.reads:
-        reason = doc.unusable(slot, profile=profile, dry_run=dry_run)
+        reason = doc.unusable(
+            slot, profile=profile, dry_run=dry_run, reader=plugin.name
+        )
         if reason is not None:
             raise UpstreamError(plugin.name, slot, reason)
     if not resume:
@@ -312,23 +314,27 @@ def _reads_of(
 
     ``check_ready`` found every slot of ``reads`` usable. An optional slot that is
     not usable is recorded as ``None``, which is also what the context answers
-    ``upstream_or_none`` with, and logged with its reason.
+    ``upstream_or_none`` with, and logged with its reason. Every read leaves the
+    plugin's own record out (m3 §24 D8), as ``check_ready`` and the context do,
+    so the record names the provider the plugin really read (FM-111).
     """
     reads: dict[str, ReadRecord | None] = {}
     for slot in plugin.reads:
-        reads[slot] = _read_of(doc, slot)
+        reads[slot] = _read_of(doc, slot, plugin.name)
     for slot in plugin.reads_optional:
-        reason = doc.unusable(slot, profile=profile, dry_run=dry_run)
+        reason = doc.unusable(
+            slot, profile=profile, dry_run=dry_run, reader=plugin.name
+        )
         if reason is None:
-            reads[slot] = _read_of(doc, slot)
+            reads[slot] = _read_of(doc, slot, plugin.name)
         else:
             reads[slot] = None
             log.info("%s: not using %s: %s", plugin.name, slot, reason)
     return reads
 
 
-def _read_of(doc: RunDocument, slot: str) -> ReadRecord:
-    provider = doc.provider(slot)
+def _read_of(doc: RunDocument, slot: str, reader: str) -> ReadRecord:
+    provider = doc.provider(slot, excluding=reader)
     if provider is None:  # unreachable once the slot is usable
         raise UpstreamError(
             "the runner",

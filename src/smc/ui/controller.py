@@ -3285,11 +3285,16 @@ class PlatePage:
             # The text, never the error: a kept error keeps its traceback (FM-98).
             return RunDocument.new(), str(exc)
 
-    def _unusable(self, doc: RunDocument, slot: str) -> str | None:
+    def _unusable(
+        self, doc: RunDocument, slot: str, reader: str | None = None
+    ) -> str | None:
+        # `reader` only for a tool's own reads: the page's map and checklist judge
+        # the latest provider of all, as every consumer reads it (m3 §24 D8).
         return doc.unusable(
             slot,
             profile=self._profile.microscope.name,
             dry_run=self._dry_run,
+            reader=reader,
         )
 
     def _slot(
@@ -3364,7 +3369,9 @@ class PlatePage:
                 reason = next(
                     (
                         r
-                        for r in (self._unusable(doc, s) for s in entry.plugin.reads)
+                        for r in (
+                            self._unusable(doc, s, name) for s in entry.plugin.reads
+                        )
                         if r
                     ),
                     None,
