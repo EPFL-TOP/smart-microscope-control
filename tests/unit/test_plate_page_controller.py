@@ -85,12 +85,14 @@ from smc.testing import FakeCore
 from smc.ui.controller import (
     KEY_PARAMS,
     LIVE_PERIOD_S,
+    NOT_CONNECTED,
     PAGE_PARAMS,
     CheckItem,
     PlatePage,
 )
 from smc.ui.frames import Frame
 from smc.ui.guide import (
+    GOTO_UNPLACED,
     NO_CALIBRATION_FOR_SIDES,
     WALLS_DRY_RUN,
     WALLS_NEED_CALIBRATION,
@@ -173,8 +175,9 @@ class StubGoto:
     Params = GotoParams
     Result = StubResult
     requires: tuple[type, ...] = ()
-    reads: tuple[str, ...] = ("plate",)
-    reads_optional: tuple[str, ...] = ()
+    # As the real plugin since #462: the plate if usable, the holder's estimate if not.
+    reads: tuple[str, ...] = ()
+    reads_optional: tuple[str, ...] = ("plate",)
     ran: ClassVar[list[tuple[str, str]]] = []
 
     def run(self, microscope: Any, params: GotoParams, ctx: RunContext) -> StubResult:
@@ -583,6 +586,54 @@ def test_a_click_in_drive_mode_runs_goto_well_with_the_wells_name_and_side(
     assert page.selection == ()
     assert page.status().outcome is not None
     assert page.status().outcome.startswith("goto-well done in ")
+
+
+def test_the_goto_line_says_the_refusal_then_the_runs_outcome(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # m3 §5.5 D7: what the last drive came to, for every tab, until Refresh.
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    page = _page(fake_microscope, run_doc)
+    try:
+        assert page.status().goto == ""
+        page.run("slow", [])
+        try:
+            assert Slow.started.wait(5)
+            with _refuses(RuntimeError, "slow is running"):
+                page.goto("B2")
+            assert page.status().goto == "slow is running"
+        finally:
+            Slow.release.set()
+        assert page.join(10.0)
+        # Another activity's end is not a drive's answer.
+        assert page.status().goto == "slow is running"
+        page.goto("B2")
+        assert page.join(10.0)
+        status = page.status()
+        assert status.outcome is not None
+        assert status.outcome.startswith("goto-well done in ")
+        assert status.goto == status.outcome
+        assert StubGoto.ran == [("B2", "centre")]
+        page.clear_outcome()
+        assert page.status().goto == ""
+    finally:
+        page.close()
+
+
+def test_a_goto_that_run_refuses_is_the_goto_lines_answer(run_doc: Path) -> None:
+    # `run` refusing without starting anything (the stand is closed here) is the
+    # answer, and "going to" never stays on a drive that went nowhere.
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    page = PlatePage.closed(
+        Profile.demo(), run_doc, entry_points=[_ep(c) for c in STUBS]
+    )
+    try:
+        page.goto("B2")
+        assert page.status().goto == f"goto-well: {NOT_CONNECTED}"
+        assert page.status().outcome == f"goto-well: {NOT_CONNECTED}"
+        assert StubGoto.ran == []
+    finally:
+        page.close()
 
 
 # --- `current` is a well the operator can see (m5 §11.1, #332) ----------------------
@@ -1489,10 +1540,11 @@ def test_a_plate_of_another_stand_or_a_dry_run_is_neither_drawn_nor_driven_to(
     )
     stage = fake_microscope.require(XYStage)
     before = stage.position_um()
-    page.goto("C5")
-    assert page.status().outcome == (
-        f"goto-well: UpstreamError: goto-well reads plate, but {why}"
-    )
+    # The plate is not usable and this stand has no [holder]: the map is unplaced, and
+    # the page refuses before a run starts (m3 §5.5 D6).
+    with pytest.raises(ValueError, match=f"^{re.escape(GOTO_UNPLACED)}$"):
+        page.goto("C5")
+    assert page.status().goto == GOTO_UNPLACED
     assert StubGoto.ran == []
     assert stage.position_um() == before
     assert page.status().running is None

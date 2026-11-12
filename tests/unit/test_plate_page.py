@@ -71,6 +71,7 @@ from smc.ui.controller import (
 )
 from smc.ui.frames import display_image
 from smc.ui.guide import (
+    GOTO_UNPLACED,
     NO_CALIBRATION_FOR_SIDES,
     WALLS_DRY_RUN,
     WALLS_NEED_CALIBRATION,
@@ -1418,15 +1419,41 @@ def test_a_drive_tap_that_is_refused_says_why_and_disarms_the_toggle(
     stage = fake_microscope.require(XYStage)
     before = stage.position_um()
     view.drive_toggle.value = True
-    # No plate is registered: `goto-well` itself refuses, and the refusal is the outcome.
+    # No plate is registered and the stand has no [holder]: the map is unplaced, and
+    # the page refuses before a run starts (m3 §5.5 D6), beside the toggle too (D7).
     _tap(view, 0.0, 0.0)
     assert page.join(10.0)
-    assert page.status().outcome == (
-        "goto-well: UpstreamError: goto-well reads plate, but the run document has "
-        "no plate; smc run --list shows which plugin provides it"
-    )
+    assert view.message.object == GOTO_UNPLACED
+    assert view.goto_text.object == GOTO_UNPLACED
     assert stage.position_um() == before
     assert not view.drive_toggle.value
+
+
+def test_a_drive_taps_answer_is_drawn_beside_the_toggle(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # #431 finding 4: an armed drive click was spent with no word where the operator
+    # pressed. The answer is the controller's, drawn by the tick, every tab (D7).
+    view = PlatePageView(page)
+    assert not view.goto_text.visible
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    view.refresh()
+    view.drive_toggle.value = True
+    _tap(view, *_centre("B2"))
+    assert page.join(10.0)
+    view.tick()
+    answer = page.status().goto
+    assert answer.startswith("goto-well done in ")
+    assert view.goto_text.object == answer
+    assert view.goto_text.visible
+    # A second tab draws the same, at its first tick.
+    other = PlatePageView(page)
+    other.tick()
+    assert other.goto_text.object == answer
+    # Beside the toggle: the next item of the drive bar.
+    items = list(view._drive_bar().objects)
+    at = next(i for i, item in enumerate(items) if item is view.drive_toggle)
+    assert items[at + 1] is view.goto_text
 
 
 def test_a_drive_tap_on_another_plates_map_is_refused_before_anything_moves(
@@ -2099,9 +2126,11 @@ def test_a_tool_run_greyed_in_live_says_so_beside_the_button(
         assert view.next_button.disabled
         assert view.next_note.object == LIVE_NOTE
         # A tool with a reason of its own keeps it: it holds longer than the activity
-        # (both of these read the plate, which the run document does not have yet).
+        # (scan-plan reads the plate, which the run document does not have yet).
         assert view.tool_notes["scan-plan"].object == SCAN_PLAN_REASON
-        assert view.tool_notes["goto-well"].object == SCAN_PLAN_REASON
+        # goto-well reads it only if usable since #462 (the holder's estimate
+        # otherwise, m3 §5.5): it has no reason of its own, and says Live's.
+        assert view.tool_notes["goto-well"].object == LIVE_NOTE
     finally:
         view.on_live()
     assert page.join(10.0)
@@ -3306,8 +3335,15 @@ def test_a_drive_tap_goes_to_the_wall_the_side_select_says(
     _tap(view, *_centre("C5"))
     assert page.join(10.0)
     record = RunDocument.load(run_doc).stages["goto-well"]
-    # `goto-well` gets the stage's side: the page named the wall on the image.
-    assert record.params == {"well": "C5", "side": "+X"}
+    # `goto-well` gets the stage's side: the page named the wall on the image. On a
+    # registered plate the page gives no `plate` nor `orientation` (m3 §5.5 D6): the
+    # record holds their defaults, which the model dumps since #462.
+    assert record.params == {
+        "well": "C5",
+        "side": "+X",
+        "plate": None,
+        "orientation": "not-turned",
+    }
     assert record.status is StageStatus.done
 
 

@@ -255,10 +255,23 @@ plate was placed**, in one of four ways, because a well name read off the map is
   stage (0, 0), so the cross shows the stage and not a well`: the stand's profile has no
   `[holder]`, so the wells are drawn from the origin and name nothing about the stage.
 
-**The estimate is drawn and never used.** It fills no slot of the run document, no tool reads
-it, a capture never takes its well from the cross (*Capture centre of B3* records the well you
-clicked), and a **drive click on an estimated map moves nothing**: `goto-well` needs a
-registered plate (`goto-well reads plate, but the run document has no plate`).
+**The estimate is drawn, and only a drive acts on it.** It fills no slot of the run document,
+no tool reads it, and a capture never takes its well from the cross (*Capture centre of B3*
+records the well you clicked). A **drive click on an estimated map** runs `goto-well` to the
+well's **centre** where the holder puts the page's plate, turned as *Plate lies* says; beside
+the *Drive* toggle the page says `going to B3: the holder's estimate, not registered; centre
+it by eye`, then the run's end, whose first `assumed` line is `target estimated from the
+stand's holder, not registered: ...`. Centre the well by eye before you capture it. What the
+page refuses before anything moves, beside the toggle too:
+
+- on an *unplaced* map (no `[holder]`): `the plate is not registered, and this stand's
+  profile does not say where its holder puts a plate ([holder] plate_centre_xy_um): register
+  the plate, or drive with the arrows`;
+- on the 96-well placeholder nothing named: `choose the plate on the stage first: ...`;
+- a wall (*Drive to* other than `centre`): `a wall is reached through a registered plate: go
+  to the centre, and register the plate`.
+
+The line beside the toggle is the same in every tab, and *Refresh* clears it.
 
 **The stand's sides and A1.** When the profile says which stage direction is the back of
 the stand and which the operator's right (`[holder] back`, `right`:

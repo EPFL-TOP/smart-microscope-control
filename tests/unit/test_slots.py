@@ -17,6 +17,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 import useq
 from pydantic import BaseModel, ValidationError
@@ -56,8 +57,11 @@ from smc.plugins.slots import (
     WallTouch,
     WellFit,
     WellRef,
+    holder_estimate,
     refuse_image_side,
+    well_geometry,
 )
+from smc.plugins.slots.plate import ORIENTATION_DEG, PlateOrientation
 
 Sample = tuple[dict[str, Any], dict[str, Any]]  # (full, sparse)
 
@@ -937,6 +941,49 @@ def test_well_center_um_normalises_its_argument_and_refuses_a_well_not_on_the_pl
         result.well_center_um("I13")
 
 
+# --- the holder's estimate (m3 §5.5 D2) --------------------------------------------
+
+#: Anisotropic and away from the origin (FM-73, FM-203): an exchange of X and Y, or a
+#: sign, moves A1 by thousands of µm.
+_HOLDER_XY_UM = (400.0, -325.0)
+
+
+@pytest.mark.parametrize(
+    ("orientation", "a1", "h12"),
+    [
+        ("not-turned", (-49_100.0, 31_175.0), (49_900.0, -31_825.0)),
+        ("turned-180", (49_900.0, -31_825.0), (-49_100.0, 31_175.0)),
+    ],
+)
+def test_holder_estimate_puts_the_grids_centre_on_the_holder(
+    orientation: PlateOrientation,
+    a1: tuple[float, float],
+    h12: tuple[float, float],
+) -> None:
+    plan = holder_estimate("96-well", _HOLDER_XY_UM, orientation)
+    assert plan.rotation == ORIENTATION_DEG[orientation]
+    assert well_geometry(plan, "A1").center_um == pytest.approx(a1, abs=0.01)
+    assert well_geometry(plan, "H12").center_um == pytest.approx(h12, abs=0.01)
+    centres = [
+        well_geometry(plan, str(name)).center_um
+        for name in np.asarray(plan.all_well_names).ravel()
+    ]
+    assert len(centres) == 96
+    mean = (
+        sum(x for x, _ in centres) / len(centres),
+        sum(y for _, y in centres) / len(centres),
+    )
+    assert mean == pytest.approx(_HOLDER_XY_UM, abs=0.01)
+
+
+def test_holder_estimate_refuses_an_unknown_plate() -> None:
+    with pytest.raises(ValueError, match=r"\AUnknown plate name 'bogus'"):
+        holder_estimate("bogus", _HOLDER_XY_UM, "not-turned")
+    # Names are exact, as useq's.
+    with pytest.raises(ValueError, match=r"\AUnknown plate name '96-WELL'"):
+        holder_estimate("96-WELL", _HOLDER_XY_UM, "not-turned")
+
+
 # --- the scan ------------------------------------------------------------------
 
 
@@ -1199,6 +1246,7 @@ SLOTS_MAP = {
     "WellFit",
     "WellGeometry",
     "WellRef",
+    "holder_estimate",
     "load_cells",
     "load_frame",
     "normalise_well",

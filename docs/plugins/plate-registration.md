@@ -14,7 +14,7 @@ survives between two runs that the run document does not show:
 | Plugin | Does | Moves the stage? |
 |---|---|---|
 | `plate-registration` | Fits the plate from `refs` (wells you centred) and `walls` (wall touches) and fills `plate`, with the objective it was seen with. | No; it only reads the turret. A dry run is the same computation. |
-| `goto-well` | Drives to a well's centre or to the point on one of its walls, through the latest `plate`, in the frame of the objective in use. | Yes: **one absolute XY move**. |
+| `goto-well` | Drives to a well's centre or to the point on one of its walls, through the latest `plate`, in the frame of the objective in use; before any registration, to a well's centre where the stand's `[holder]` puts the plate ([Before registration](#before-registration-the-holders-estimate)). | Yes: **one absolute XY move**. |
 
 ## The guided loop: never hunt for a well
 
@@ -50,7 +50,10 @@ JSON`, or an unexpected extra argument).
    is **assumed from the declared orientation** (0° for `not-turned`, 180° for
    `turned-180`, see [Which way the plate lies](#which-way-the-plate-lies)), which the
    result says in `assumed`. It is enough to drive to every other well to within a few
-   millimetres.
+   millimetres. On a stand whose profile has a `[holder]`, `goto-well` with `plate=`
+   reaches the first well before any reference, to the holder's estimate
+   ([Before registration](#before-registration-the-holders-estimate)); centre it by eye
+   and give that position as the seed.
 2. **Go to the next well.** `goto-well` drives there through the latest `plate`. Jog
    until the well is where you want it (`smc stage jog`), and read `smc stage get`.
 3. **Register again with every reference so far.** Each run replaces `plate`, and the
@@ -321,8 +324,9 @@ and `tests/test_plate_registration_demo.py` do:
   (#404), not here.
 - **An estimate is not a centre.** The plate page draws a plate where the profile's
   [`[holder]`](../../profiles/README.md#holder-where-the-holder-puts-a-plate) says it lies,
-  labelled *estimated*. That is for finding the way, and no tool takes it: this tool takes
-  centres that were measured.
+  labelled *estimated*. That is for finding the way, and it fills no slot: this tool takes
+  centres that were measured. Only a deliberate drive acts on it (`goto-well` with
+  `plate=`, below).
 
 ## `goto-well`
 
@@ -335,6 +339,8 @@ smc run goto-well -p <profile> --run-doc run.json --param well=B2 --param side=+
 |---|---|---|
 | `well` | (required) | The well to go to, as `useq` names it (`H12`; `h12` and `H012` are read as `H12`). |
 | `side` | `centre` | `centre`, or the point on a wall named by a **stage direction**: `-X`, `+X`, `-Y`, `+Y` (`+Y` is towards row A on a plate that is not turned; `+X` is the stage's +X on either orientation). `left`, `right`, `top` and `bottom` are sides on an image and are refused, see [Wall touches](#wall-touches). The result echoes the stage direction. |
+| `plate` | none | Used only when the run document has no usable `plate`: the `useq` name of the plate in the holder (`96-well`, `greiner-24-well`), to drive to the holder's estimate. With a usable `plate`, it must name the registered plate, or the run is refused. |
+| `orientation` | `not-turned` | Used only with the estimate: which way the plate lies (`not-turned`, `turned-180`). A registered plate's own orientation is used otherwise. |
 
 It sends **one absolute move** and nothing else, and the layer's guards are the
 guards: a target outside the profile's XY soft limits is refused and the stage does
@@ -377,6 +383,47 @@ well up to 99 × 63 mm from where it is, and `goto-well` sends the move as compu
 to the stage's own end stops. Check the seed with `smc stage get` against the well you
 named before the first `goto-well`, and add the limits to the profile (a hardware
 session) before using a stand without them.
+
+### Before registration: the holder's estimate
+
+```text
+smc run goto-well -p <profile> --run-doc run.json --param well=A1 --param plate=96-well
+smc run goto-well -p <profile> --run-doc run.json --param well=B3 --param plate=greiner-24-well --param orientation=turned-180
+```
+
+With no usable `plate` in the run document, `goto-well` drives to the well's
+**centre** where the profile's
+[`[holder] plate_centre_xy_um`](../../profiles/README.md#holder-where-the-holder-puts-a-plate)
+puts the plate you name: the centre of the plate's grid of wells on the holder's
+point, turned by `orientation`. It is the pose the plate page draws as *estimated*,
+from the same function, so the map and the drive never disagree
+([`m3-plugins.md`](../design/m3-plugins.md) §5.5). It is a way to reach a well to centre
+by eye, never a registration: it fills no slot any tool reads, and the record says so.
+
+- **Only the centre.** The estimate can be a few hundred µm off, more than a wall is
+  from the centre: `side=` other than `centre` is refused (`a wall is reached through
+  a registered plate: ...`).
+- **No objective offset.** The holder's point names no objective, so nothing is
+  shifted.
+- **What the record says**, in this order in `assumed`: `target estimated from the
+  stand's holder, not registered: the 96-well centred at stage (400, -325) µm, not
+  turned`; `plate not read: <why>` (the run document has no `plate`, or the one it has
+  was a dry run, another stand's, stale ...); `no objective offset applied: the
+  holder's estimate names no objective`; and, last, the dry-run line. `from_holder` is
+  `true`, `plate_objective` and `shift_um` are `null`. A WARNING says the same.
+- **A usable `plate` always wins.** `plate=` must then name it (`the registered plate
+  is a 96-well, not a 384-well: leave plate out, or register the 384-well`), and
+  `orientation` is not read.
+- **Refused before any move**, and recorded `failed`: no `plate=` (`... or give
+  plate=<a useq plate name> to drive to the estimate of the profile's [holder]`); no
+  `[holder]` (`... and this stand's profile has no [holder] plate_centre_xy_um to
+  estimate the plate from`); a plate name `useq` does not know (names are exact:
+  `96-WELL` is refused); a well not on it; a turret at an empty position. A `plate`
+  that is there and that its model refuses is refused as before, even with `plate=`.
+
+On the Ti2-E, A1 of a 96-well plate estimated from the holder lies outside the soft
+limits: the layer refuses it, and the page says so beside its *Drive* toggle (not
+verified at the stand).
 
 ### Dry runs
 

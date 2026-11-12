@@ -409,12 +409,12 @@ def test_three_captured_centres_register_the_lab_plate_from_the_page(
         page.close()
 
 
-def test_a_drive_click_on_an_estimated_map_moves_nothing(
+def test_a_drive_click_on_an_estimated_map_drives_to_the_estimate_and_says_so(
     holder_microscope: Microscope, tmp_path: Path
 ) -> None:
-    # The estimate is drawn and never acted on (m5 §15 D6): `goto-well` reads the run
-    # document's plate, and there is none, so a drive click on the well the map shows
-    # ends with that refusal and the stage stays where it was.
+    # FM-217's check (m3 §5.5): with no plate registered, a drive click on the well the
+    # map shows runs `goto-well` to the holder's estimate of its centre, and the record,
+    # the strip and the line beside the toggle say that it was estimated.
     page = PlatePage(holder_microscope, tmp_path / "run.json", entry_points=[GOTO_WELL])
     try:
         page.choose_plate("96-well")
@@ -422,16 +422,25 @@ def test_a_drive_click_on_an_estimated_map_moves_nothing(
         assert view.pose.kind == "estimated"
         b2 = next(w.center_um for w in view.wells if w.well == "B2")
         stage = holder_microscope.require(XYStage)
-        before = stage.position_um()
 
         assert page.click(*b2, drive=True) == "B2"
         assert page.join(30.0)
 
-        outcome = page.status().outcome
-        assert outcome is not None
-        assert "goto-well reads plate, but the run document has no plate" in outcome
+        # B2 is A1 plus one pitch each way, A1 the holder's centre minus the 96-well
+        # grid's centre offset (49 500, -31 500) µm: written by hand.
         after = stage.position_um()
-        assert (after.x_um, after.y_um) == (before.x_um, before.y_um)
+        assert (after.x_um, after.y_um) == pytest.approx(
+            (-40_100.0, 22_175.0), abs=0.02
+        )
+        status = page.status()
+        said = "assumed: target estimated from the stand's holder, not registered"
+        assert status.outcome is not None
+        assert said in status.outcome
+        assert said in status.goto
+        record = RunDocument.load(tmp_path / "run.json").stages["goto-well"]
+        assert record.status is StageStatus.done
+        assert record.result is not None
+        assert record.result["from_holder"] is True
     finally:
         page.close()
 
