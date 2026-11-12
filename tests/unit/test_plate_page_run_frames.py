@@ -25,7 +25,7 @@ import pytest
 import smc.ui.controller as controller_module
 from smc.hardware import Microscope
 from smc.hardware.capabilities import Camera
-from smc.plugins.api import PluginParams, PluginResult, RunContext
+from smc.plugins.api import PluginParams, PluginResult, RunContext, ShownFrame
 from smc.plugins.registry import GROUP
 from smc.ui.controller import PlatePage
 from smc.ui.frames import display_image
@@ -63,11 +63,16 @@ class Hands:
     handed: ClassVar[list[threading.Event]] = []
     go: ClassVar[list[threading.Event]] = []
     kept: ClassVar[list[RunContext]] = []
+    #: Hand the frames with no position and no label, as a plugin that says neither.
+    plain: ClassVar[bool] = False
 
     def run(self, microscope: Any, params: NoParams, ctx: RunContext) -> StubResult:
         Hands.kept.append(ctx)
         for i, image in enumerate(Hands.images):
-            ctx.show_frame(image, xy_um=(100.0 * i, -50.0 * i), label=f"F{i}")
+            if Hands.plain:
+                ctx.show_frame(image)
+            else:
+                ctx.show_frame(image, xy_um=(100.0 * i, -50.0 * i), label=f"F{i}")
             Hands.handed[i].set()
             if i in Hands.pauses:
                 while not Hands.go[i].is_set():
@@ -141,6 +146,7 @@ def _fresh_state() -> Iterator[None]:
     Hands.handed = [threading.Event() for _ in range(8)]
     Hands.go = [threading.Event() for _ in range(8)]
     Hands.kept = []
+    Hands.plain = False
     try:
         yield
     finally:
@@ -165,6 +171,25 @@ def page(fake_microscope: Microscope, tmp_path: Path) -> Iterator[PlatePage]:
 def _ended(page: PlatePage) -> None:
     assert page.join(WAIT_S), "the activity did not end"
     assert page.status().running is None
+
+
+@pytest.fixture
+def handed(monkeypatch: pytest.MonkeyPatch) -> list[ShownFrame]:
+    """Every ``ShownFrame`` the page's callback receives, in order, then passed on."""
+    seen: list[ShownFrame] = []
+    real = controller_module.run_plugin
+
+    def recording(*args: Any, **kwargs: Any) -> Any:
+        on_frame = kwargs["on_frame"]
+
+        def record(shown: ShownFrame) -> None:
+            seen.append(shown)
+            on_frame(shown)
+
+        return real(*args, **{**kwargs, "on_frame": record})
+
+    monkeypatch.setattr(controller_module, "run_plugin", recording)
+    return seen
 
 
 # --- the frames ------------------------------------------------------------------------
@@ -369,3 +394,142 @@ def test_a_frame_of_the_other_byte_order_is_kept_in_the_native_one(
     assert frame.image.dtype == np.uint16
     assert (frame.image == _image(2)).all()
     assert display_image(frame.image, bit_depth=frame.bit_depth).shape == (4, 6)
+
+
+# --- found by the adversarial review ---------------------------------------------------
+
+
+def test_a_frame_says_what_its_plugin_said_and_keeps_its_width(
+    page: PlatePage, handed: list[ShownFrame]
+) -> None:
+    # An 8-bit frame stays 8-bit (a flat one is shown against 8 bits, not 16), a
+    # frame without a label is named by its plugin alone, and its time is the
+    # plugin's, not the tick's.
+    eight = (np.arange(24, dtype=np.uint8).reshape(4, 6) + 7).astype(np.uint8)
+    Hands.plain = True
+    _hand(eight, pauses=frozenset({0}))
+    page.run("hands", [])
+    assert Hands.handed[0].wait(WAIT_S)
+    frame = page.frame()
+    assert frame is not None
+    assert frame.image.dtype == np.uint8
+    assert (frame.image == eight).all()
+    assert frame.summary == "hands: 4x6 uint8, min 7, max 30"
+    assert frame.xy_um is None
+    assert len(handed) == 1
+    assert frame.taken_utc == handed[0].taken_utc
+    Hands.go[0].set()
+    _ended(page)
+
+
+#: One frame for each test ``_LatestShown.put`` makes, and the words of its warning.
+UNSHOWABLE: list[tuple[str, Any, str]] = [
+    ("float", np.zeros((4, 6), dtype=np.float32), "a float32 frame of shape (4, 6)"),
+    (
+        "two-byte float",
+        np.zeros((4, 6), dtype=np.float16),
+        "a float16 frame of shape (4, 6)",
+    ),
+    ("3-D", np.zeros((2, 4, 6), dtype=np.uint16), "a uint16 frame of shape (2, 4, 6)"),
+    ("signed", np.zeros((4, 6), dtype=np.int16), "a int16 frame of shape (4, 6)"),
+    ("four bytes", np.zeros((4, 6), dtype=np.uint32), "a uint32 frame of shape (4, 6)"),
+    (
+        "eight bytes",
+        np.zeros((4, 6), dtype=np.uint64),
+        "a uint64 frame of shape (4, 6)",
+    ),
+    ("empty", np.zeros((0, 6), dtype=np.uint16), "a uint16 frame of shape (0, 6)"),
+    ("not an array", [[1, 2], [3, 4]], "a list frame of shape unknown"),
+]
+
+
+@pytest.mark.parametrize(
+    ("image", "words"),
+    [pytest.param(image, words, id=name) for name, image, words in UNSHOWABLE],
+)
+def test_every_frame_the_page_cannot_show_is_dropped_and_the_run_goes_on(
+    page: PlatePage, caplog: pytest.LogCaptureFixture, image: Any, words: str
+) -> None:
+    # One row for each clause of the test (FM-43): a uint32 frame would be wrapped
+    # into uint16 by the copy, and a list would raise in ``put`` and lose the
+    # callback for the rest of the run.
+    caplog.set_level(logging.WARNING, logger="smc.ui")
+    _hand(image, _image(1))
+    page.run("hands", [])
+    _ended(page)
+    assert [r.getMessage() for r in caplog.records if r.name.startswith("smc")] == [
+        f"hands handed {words}; the page shows 2-D uint8 or uint16 frames"
+    ]
+    frame = page.frame()
+    assert frame is not None
+    assert (frame.image == _image(1)).all()  # the callback was not dropped
+    outcome = page.status().outcome
+    assert outcome is not None
+    assert outcome.startswith("hands done in ")
+
+
+def _records_of_a_run(
+    page: PlatePage, caplog: pytest.LogCaptureFixture, frames: int
+) -> list[tuple[str, int]]:
+    """The (logger, level) of every record of one run of ``frames`` frames, each one drawn."""
+    caplog.clear()
+    _hand(*(_image(i) for i in range(frames)), pauses=frozenset(range(frames)))
+    page.run("hands", [])
+    for i in range(frames):
+        assert Hands.handed[i].wait(WAIT_S)
+        assert page.frame() is not None
+        Hands.go[i].set()
+    _ended(page)
+    page.frame()
+    # The loggers of the hand-off: a backend's one-time note at its first read is
+    # not the frames'.
+    return sorted(
+        (r.name, r.levelno)
+        for r in caplog.records
+        if r.name.startswith(("smc.ui", "smc.plugins"))
+    )
+
+
+def test_no_record_is_logged_per_frame(
+    page: PlatePage, caplog: pytest.LogCaptureFixture
+) -> None:
+    # FM-62, FM-178: neither the worker that hands a frame nor the loop that copies
+    # it logs anything for it; a run of five frames logs what a run of none does.
+    caplog.set_level(logging.DEBUG)
+    none = _records_of_a_run(page, caplog, 0)
+    for event in (*Hands.handed, *Hands.go):
+        event.clear()
+    five = _records_of_a_run(page, caplog, 5)
+    assert five == none
+
+
+def test_a_frame_the_page_cannot_copy_is_dropped_and_the_run_still_ends(
+    page: PlatePage,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A copy that fails must neither fail the tick nor, in the worker's ``finally``,
+    # skip the count of the run's end and its outcome's log line.
+    def no_room(shown: ShownFrame, number: int) -> Any:
+        raise MemoryError("no room for the copy")
+
+    monkeypatch.setattr(controller_module, "_frame_of", no_room)
+    caplog.set_level(logging.INFO, logger="smc.ui")
+    before = page.activities_ended
+    _hand(_image(0), _image(1), pauses=frozenset({0}))
+    page.run("hands", [])
+    assert Hands.handed[0].wait(WAIT_S)
+    assert page.frame() is None  # on the loop: dropped, not raised
+    Hands.go[0].set()
+    _ended(page)  # in the worker's finally: dropped, and the end counted
+    assert page.activities_ended == before + 1
+    assert page.frame() is None
+    messages = [r.getMessage() for r in caplog.records if r.name == "smc.ui"]
+    assert (
+        messages.count(
+            "the page could not keep a frame of hands (MemoryError: no room for the "
+            "copy); it is not shown"
+        )
+        == 1
+    )
+    assert any(m.startswith("hands done in ") for m in messages)

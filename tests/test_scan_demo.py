@@ -561,11 +561,22 @@ def test_every_written_frame_is_shown_once_with_its_readback_and_name(
 ) -> None:
     rig.stage.offset_um = (3.0, -2.0)  # the readback, not the target, is shown
     seen: list[ShownFrame] = []
+    snapped: list[npt.NDArray[Any]] = []
+    snap = rig.camera.snap
+
+    def recorded() -> npt.NDArray[np.uint16]:
+        pixels = snap()
+        snapped.append(pixels)
+        return pixels
+
+    rig.camera.snap = recorded  # type: ignore[method-assign]
 
     result = _result(_scan(rig, on_frame=seen.append))
 
-    assert len(seen) == len(result.frames) == 12
-    for shown, frame in zip(seen, result.frames, strict=True):
+    assert len(seen) == len(result.frames) == len(snapped) == 12
+    for shown, frame, pixels in zip(seen, result.frames, snapped, strict=True):
+        # The snap's own array: no copy on the scan's thread (m3 §25.2 D2).
+        assert shown.image is pixels
         assert shown.plugin == "scan"
         assert shown.label == frame.name
         assert shown.xy_um == (frame.x_um, frame.y_um)

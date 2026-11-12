@@ -641,9 +641,7 @@ class _LatestShown:
             with self._guard:
                 self._slot = shown
             return
-        with self._guard:
-            first, self._dropped = not self._dropped, True
-        if first:
+        if self.first_drop():
             log.warning(
                 "%s handed a %s frame of shape %s; the page shows 2-D uint8 or "
                 "uint16 frames",
@@ -651,6 +649,12 @@ class _LatestShown:
                 str(getattr(image, "dtype", type(image).__name__)),
                 str(getattr(image, "shape", "unknown")),
             )
+
+    def first_drop(self) -> bool:
+        """Whether a frame dropped now is the first since the last ``clear()``: the one to log."""
+        with self._guard:
+            first, self._dropped = not self._dropped, True
+        return first
 
     def take(self) -> ShownFrame | None:
         """The slot's frame, ``None`` when it is empty; the slot is emptied."""
@@ -2263,10 +2267,12 @@ class PlatePage:
                 self._current_run = None
                 # The run's last frame is kept although no session took it, and
                 # nothing of the run is left to replace a later snap's (m3 §25.5).
-                self._keep_shown()
+                failed = self._keep_shown()
                 # After the activity's own writes (a run's record is on disk by now),
                 # so a session that sees the count change reads them.
                 self._ended += 1
+            if failed is not None:
+                log.warning("%s", failed)
             log.info("%s", outcome)
 
     def _on_progress(self, progress: Progress) -> None:
@@ -2695,17 +2701,37 @@ class PlatePage:
         Every other session reads the same ``Frame`` (FM-151).
         """
         with self._lock:
-            self._keep_shown()
-            return self._frame
+            failed = self._keep_shown()
+            frame = self._frame
+        if failed is not None:
+            log.warning("%s", failed)
+        return frame
 
-    def _keep_shown(self) -> None:
-        """Turn the frame a run handed, if any, into the latest, numbered after it; the caller holds ``_lock``."""
+    def _keep_shown(self) -> str | None:
+        """Turn the frame a run handed, if any, into the latest, numbered after it; the caller holds ``_lock``.
+
+        A copy that fails (memory) drops that frame and keeps the latest as it
+        was: on the server's loop it would fail the tick, and in ``_work``'s
+        ``finally`` it would skip the count of the activity's end and its outcome's
+        log line. It returns the text to log, the first time since the activity
+        began, for the caller to log once ``_lock`` is released (FM-62); the
+        error itself is never kept (FM-98).
+        """
         shown = self._shown.take()
-        if shown is not None:
-            previous = self._frame
+        if shown is None:
+            return None
+        previous = self._frame
+        try:
             self._frame = _frame_of(
                 shown, 1 if previous is None else previous.number + 1
             )
+        except Exception as exc:
+            if self._shown.first_drop():
+                return (
+                    f"the page could not keep a frame of {shown.plugin} "
+                    f"({type(exc).__name__}: {_one_line(exc)}); it is not shown"
+                )
+        return None
 
     def _live(self, event: threading.Event) -> str:
         """Frames until ``event`` is set or one fails, and the outcome as text.

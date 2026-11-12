@@ -1401,9 +1401,11 @@ def test_a_keyboard_interrupt_in_the_progress_callback_passes_through(
 
 
 def test_a_shown_frame_reaches_the_callback_as_the_same_array(
-    fake_microscope: Microscope, tmp_path: Path
+    fake_microscope: Microscope, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # Handed over, never copied nor converted by the layer (m3 §25.2 D2).
+    # Handed over, never copied nor converted by the layer (m3 §25.2 D2), and
+    # nothing logged per frame (FM-62, FM-178).
+    caplog.set_level(logging.DEBUG)
     plugin = Showing()
     seen: list[ShownFrame] = []
     before = datetime.now(timezone.utc)
@@ -1418,6 +1420,7 @@ def test_a_shown_frame_reaches_the_callback_as_the_same_array(
         assert shown.label == f"F{i}"
         assert shown.taken_utc.tzinfo is timezone.utc
         assert before <= shown.taken_utc <= after
+    assert [r.getMessage() for r in caplog.records if r.name.startswith("smc")] == []
 
 
 def test_show_frame_without_a_callback_does_nothing(
