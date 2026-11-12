@@ -742,8 +742,10 @@ class HolderSection(_Section):
     plate's *grid of wells*: an SBS plate's grid is centred on its footprint, so the one
     point serves every SBS plate the holder takes, and a plate turned 180° lands on
     itself. It is **never a registration**: it is read by the map to draw an estimate
-    and labelled so, and it fills no slot and feeds no tool. Unset, the map says that
-    the stand does not say where its plate lies.
+    and labelled so, and it fills no slot. Only a deliberate drive acts on it:
+    ``goto-well`` with a ``plate`` parameter goes to a well's centre where it puts that
+    plate, and its record says so (m3 §5.5). Unset, the map says that the stand does
+    not say where its plate lies, and a drive needs a registered plate.
     """
 
     #: Stage XY, in µm, of the centre of a plate's grid of wells, as

@@ -223,9 +223,12 @@ measured = "2026-11-10, sessions 2 and 3 (#334, #405): the Greiner 24-well's cen
   not say which way round the plate lies. A plate of another footprint (a slide, a dish)
   is not an SBS plate: the map still says *estimated* and claims nothing more.
 - **Estimated, never a registration.** The page reads it to draw the map and to label the
-  well under the cross. It fills no slot of the run document, moves nothing and feeds no
-  tool: a scan, a `goto-well` and a drive click still need a registered plate. Writing it
-  from a registration is not done yet.
+  well under the cross. It fills no slot of the run document and feeds no tool: a scan
+  still needs a registered plate. Only a deliberate drive acts on it: `goto-well` with
+  `plate=` (and a drive click on the page's estimated map) goes to a well's centre where
+  it puts the plate, and its record says that the target was estimated
+  ([`goto-well`](../docs/plugins/plate-registration.md#before-registration-the-holders-estimate)).
+  Writing it from a registration is not done yet.
 - **How to measure it.** Register a plate with its four corner wells measured (for example
   with `plate-walls`), take the mean of those four registered centres, and enter it to a few
   µm: the stage XY of the plate's grid centre. Put the plate back and measure it again before

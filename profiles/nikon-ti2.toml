@@ -131,7 +131,8 @@ settle_tolerance_um = 0.5
 [holder]
 # Where the holder puts a plate: the stage XY of the centre of the plate's grid of wells, seated in
 # its holder (m5 §15 D2, #410). The plate page draws its map from it before any registration, labelled
-# "estimated"; it is an estimate, never a registration, and no tool reads it. One point serves every
+# "estimated"; it is an estimate, never a registration, and it fills no slot: only a deliberate drive
+# (goto-well with plate=, a drive click on the estimated map) acts on it (#462). One point serves every
 # SBS plate the holder takes, and a plate turned 180 deg lands on itself. Measured from the Greiner
 # 24-well's registered wells: (543, -313) um in session 2 and (258, -336) um in session 3 (the plate
 # was taken off and put back between them: 285 um apart in X); the mean is entered, to 5 um.
