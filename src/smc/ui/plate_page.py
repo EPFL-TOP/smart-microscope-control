@@ -104,6 +104,7 @@ from smc.ui.guide import (
     plate_from_line,
     preset_differences,
     preset_note_text,
+    register_replace_note,
     registered_line,
     side_words,
     stage_label,
@@ -369,13 +370,33 @@ def next_step_text(step: NextStep | None, *, windows: bool | None = None) -> str
         return "\n".join(step.why)
     lines = [step.plugin, *(f"  {line}" for line in step.why)]
     lines.append(f"  command: {step.command}")
-    if sys.platform == "win32" if windows is None else windows:
-        lines.append(
-            "  that line is quoted for a POSIX shell (bash, zsh); PowerShell and "
-            "cmd.exe read quotes differently: press the button, which makes the "
-            "same call"
-        )
+    note = posix_quoting_note(windows)
+    if note:
+        lines.append(f"  {note}")
     return "\n".join(lines)
+
+
+#: What a page served on Windows says under a command it shows (FM-175, m5 §8.8.6).
+_POSIX_QUOTING_NOTE = (
+    "that line is quoted for a POSIX shell (bash, zsh); PowerShell and "
+    "cmd.exe read quotes differently: press the button, which makes the "
+    "same call"
+)
+
+
+def posix_quoting_note(windows: bool | None = None) -> str:
+    """The note that a command is quoted for a POSIX shell, on a Windows page; ``""`` elsewhere.
+
+    One text for every command the page prints for pasting: the next step's, and the
+    *Command* disclosure under a Stand or Plate screen's button (m5 §17.2 D8), which
+    replaced the next step there. ``windows`` is ``None`` for "the PC this runs on" and is
+    given by a test.
+    """
+    return (
+        _POSIX_QUOTING_NOTE
+        if (sys.platform == "win32" if windows is None else windows)
+        else ""
+    )
 
 
 def _wrapped_text(
@@ -503,6 +524,10 @@ class PlatePageView:
         self._rows_drawn: tuple[CentreRow, ...] = ()
         self._register_drawn: tuple[tuple[str, ...], str | None] = ((), None)
         self._goto_row: int | None = None
+        self._goto_basis: tuple[Any, ...] | None = None
+        # Whether the commands say they are quoted for a POSIX shell: ``None`` is the PC this
+        # runs on (FM-175); a test sets it, as ``next_step_text`` takes ``windows=``.
+        self._windows: bool | None = None
 
         self.wells_source = ColumnDataSource(
             {
@@ -1070,11 +1095,16 @@ class PlatePageView:
         self.calibrate_button = pn.widgets.Button(label="Calibrate the camera")
         self.calibrate_note = _wrapped_text()
         self.calibrate_command = _wrapped_text()
+        # Under each command, on a Windows page only: the line is quoted for a POSIX shell
+        # (FM-175). Hidden, and taking no height, anywhere else.
+        self.calibrate_command_note = _wrapped_text()
+        self.calibrate_command_note.visible = False
         self.calibrate_box = pn.Column(
             self.calibrate_button,
             self.calibrate_note,
             pn.Card(
                 self.calibrate_command,
+                self.calibrate_command_note,
                 title="Command",
                 collapsed=True,
                 sizing_mode="stretch_width",
@@ -1090,9 +1120,16 @@ class PlatePageView:
             label="Register the plate", color="primary"
         )
         self.register_wait = _wrapped_text()
+        # What registering again would replace, said before the click (m5 §11.4, FM-172): the
+        # tool's own section, which carried that note, is in the expert view only.
+        self.register_replaces = _wrapped_text()
+        self.register_replaces.visible = False
         self.register_command = _wrapped_text()
+        self.register_command_note = _wrapped_text()
+        self.register_command_note.visible = False
         self.register_card = pn.Card(
             self.register_command,
+            self.register_command_note,
             title="Command",
             collapsed=True,
             sizing_mode="stretch_width",
@@ -1344,6 +1381,7 @@ class PlatePageView:
                 self.other_captures,
                 self.register_button,
                 self.register_wait,
+                self.register_replaces,
                 self.register_card,
                 self.registered_block,
                 self.other_ways_text,
@@ -1667,17 +1705,47 @@ class PlatePageView:
         keeps the text (``status().goto``) for every tab, and the tick draws it on the row
         ``_goto_row`` names. A click on a disabled button still arrives here (FM-169): the
         refusal is the controller's (a run going, Live included).
+
+        The row is the one **this click** names only when the click is the drive's: a refusal
+        of the click's own (an unplaced map, a plate nothing named) or an accepted drive. A
+        refusal because an activity goes (``RuntimeError``) is the state's, which every row's
+        busy note already says, and it leaves ``_goto_row`` where it was: the controller keeps
+        one text for every tab, and moving the row to the refused click would draw the
+        running drive's ``done`` on a well the stage never visited.
         """
         row = self._row(index)
         if row is None:
             self.message.object = "nothing to go to: press Refresh"
             return
         well = row.well
-        self._goto_row = index
-        if not self._try(lambda: self.page.goto(well)):
-            # The row says it; the controller also kept it for the drive bar's line.
+        basis = self._goto_state()
+        try:
+            self.page.goto(well)
+        except RuntimeError:
             self.message.object = ""
+            self.tick()
+            return
+        except ValueError:
+            # The row says it; the controller also kept it for the drive bar's line.
+            pass
+        self.message.object = ""
+        self._goto_row = index
+        self._goto_basis = basis
         self.tick()
+
+    def _goto_state(self) -> tuple[Any, ...]:
+        """What the drive's text on a row was about: the plate, the centres and the registered plate.
+
+        A row's drive text (a refusal, ``not registered``) is true of the state it was sent
+        in, and is dropped at the redraw that finds another (``_draw_plate_screen``): the
+        text outlived a registration and said ``not registered`` under ``Registered:``.
+        """
+        view = self._view
+        return (
+            self.page.plate,
+            self.page.refs,
+            None if view is None else view.registered,
+        )
 
     def on_capture_row(self, index: int) -> None:
         """*Capture the centre of <well>* (or *Redo*) of centre row ``index``: the well the row named when it was drawn.
@@ -2637,6 +2705,10 @@ class PlatePageView:
         """
         page = self.page
         view = self._view
+        # A row's drive text is about the state it was sent in: another plate, another
+        # centre or a plate registered since makes it history (``_goto_state``).
+        if self._goto_row is not None and self._goto_state() != self._goto_basis:
+            self._goto_row = None
         self.plate_from_text.object = plate_from_line(
             plate=page.plate,
             chosen=page.plate_chosen,
@@ -2678,6 +2750,11 @@ class PlatePageView:
                 lines += [f"assumed: {text}" for text in card.assumed]
         self.registered_block.object = "\n".join(lines)
         self.registered_block.visible = bool(lines)
+        # Said before the click, as the tool's own section says it in the expert view (§11.4).
+        self._say(
+            self.register_replaces,
+            "" if registered is None else register_replace_note(registered),
+        )
 
     def _draw_commands(self) -> None:
         """The *Command* disclosures of the Stand and Plate screens: the call each button makes (ADR-0006, principle 5, D8).
@@ -2691,6 +2768,10 @@ class PlatePageView:
             self.page.command_for("plate-registration", pairs) if pairs else ""
         )
         self.register_card.visible = bool(pairs)
+        # A page served on Windows says its commands are quoted for a POSIX shell (FM-175).
+        note = posix_quoting_note(self._windows)
+        self._say(self.register_command_note, note)
+        self._say(self.calibrate_command_note, note)
         self._draw_calibrate_command()
 
     def _draw_calibrate_command(self) -> None:

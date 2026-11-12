@@ -85,6 +85,7 @@ __all__ = [
     "plate_from_line",
     "preset_differences",
     "preset_note_text",
+    "register_replace_note",
     "registered_line",
     "replace_note",
     "scan_plan_card_lines",
@@ -617,6 +618,24 @@ def registered_line(result: PlateResult) -> str:
         else f"residual {result.residual_um:.1f} µm"
     )
     return f"Registered: {residual}, turned {result.rotation_deg:.2f}\N{DEGREE SIGN}"
+
+
+def register_replace_note(result: PlateResult) -> str:
+    """What *Register the plate* replaces when a plate is already registered, said before the click (m5 §11.4, FM-172).
+
+    The latest attempt decides the ``plate`` slot even when it fails, so a failed
+    registration leaves no plate where a usable one stood. The page does not refuse: the
+    captures stay, so the way back is to *Redo* the centre that was wrong and register
+    again. The tool's own note (``replace_note``) names the expert view's *Run* and
+    *Forget*, which this screen does not have: this one names its own buttons, and the
+    plate it speaks of is the result line's, a few lines above. Plain text (FM-139).
+    """
+    wells = "1 well" if result.n_refs == 1 else f"{result.n_refs} wells"
+    return (
+        f"Registering again replaces this plate ({result.method}, {wells}). A failed "
+        "run leaves no plate; the centres captured stay, so Redo the wrong one and "
+        "register again to get a plate back."
+    )
 
 
 def plate_from_line(

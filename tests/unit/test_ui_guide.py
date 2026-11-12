@@ -82,6 +82,7 @@ from smc.ui.guide import (
     plate_from_line,
     preset_differences,
     preset_note_text,
+    register_replace_note,
     registered_line,
     replace_note,
     scan_plan_card_lines,
@@ -1673,6 +1674,30 @@ def test_registered_line_says_when_the_residual_was_not_measured() -> None:
     )
     assert (
         registered_line(result(0.0, 0.0)) == "Registered: residual 0.0 µm, turned 0.00°"
+    )
+
+
+def test_register_replace_note_names_the_plate_it_replaces_and_the_way_back() -> None:
+    def result(method: str, n_refs: int) -> PlateResult:
+        return PlateResult(
+            plate="96-well",
+            a1_center_xy_um=(0.0, 0.0),
+            rotation_deg=0.0,
+            method=method,  # type: ignore[arg-type]
+            residual_um=None,
+            scale_error=None,
+            n_refs=n_refs,
+        )
+
+    # m5 §11.4: a failed registration leaves no plate; said before the click, in this
+    # screen's own words (*Redo*, not the tool's *Forget* and *Run*), whole (FM-45).
+    assert register_replace_note(result("references", 3)) == (
+        "Registering again replaces this plate (references, 3 wells). A failed run "
+        "leaves no plate; the centres captured stay, so Redo the wrong one and "
+        "register again to get a plate back."
+    )
+    assert register_replace_note(result("seed", 1)).startswith(
+        "Registering again replaces this plate (seed, 1 well). "
     )
 
 

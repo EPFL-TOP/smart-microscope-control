@@ -10,6 +10,7 @@ warnings are errors (FM-147), and a handler that failed fails the test that did 
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import shlex
 import threading
@@ -17,10 +18,12 @@ from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone
 from importlib.metadata import EntryPoint
 from pathlib import Path
-from typing import Any, ClassVar
+from types import SimpleNamespace
+from typing import Any, ClassVar, cast
 
 import numpy as np
 import pytest
+from pymmcore_plus import CMMCorePlus
 
 if os.environ.get("SMC_REQUIRE_UI"):
     import panel as pn  # CI must fail, not skip, when the extra is missing
@@ -28,23 +31,26 @@ else:
     pn = pytest.importorskip("panel")
 
 from smc.hardware import Microscope
-from smc.hardware.capabilities import Camera, ObjectiveTurret, XYStage
-from smc.hardware.profile import Profile
+from smc.hardware.capabilities import Camera, ObjectiveOffset, ObjectiveTurret, XYStage
+from smc.hardware.profile import HolderSection, Profile
 from smc.plugins.api import PluginParams, PluginResult, RunContext
 from smc.plugins.errors import PluginRunError
 from smc.plugins.registry import GROUP
 from smc.plugins.slots import PlateResult
 from smc.run import RunDocument, StageRecord, StageStatus, write_stage
+from smc.testing import FakeCore
 from smc.ui.controller import PlatePage
 from smc.ui.guide import (
     CAPTURE_WELLS,
+    GOTO_ESTIMATED,
     GOTO_NOT_DURING_LIVE,
     GOTO_UNPLACED,
     OTHER_WAYS_TO_REGISTER,
     PLATE_NOT_CHOSEN,
     SCREEN_LEADS,
+    NextStep,
 )
-from smc.ui.plate_page import _WARNING, PlatePageView
+from smc.ui.plate_page import _WARNING, PlatePageView, next_step_text
 
 pytestmark = [
     pytest.mark.filterwarnings(
@@ -62,6 +68,7 @@ REAL = {
     "camera-calibration": "smc.plugins.camera_calibration.plugin:CameraCalibrationPlugin",
     "goto-well": "smc.plugins.goto_well:GotoWellPlugin",
     "plate-registration": "smc.plugins.plate_registration.plugin:PlateRegistrationPlugin",
+    "plate-walls": "smc.plugins.plate_walls.plugin:PlateWallsPlugin",
 }
 
 
@@ -102,6 +109,20 @@ class FailingGoto(StubGoto):
 
     def run(self, microscope: Any, params: GotoParams, ctx: RunContext) -> NoResult:
         raise PluginRunError("goto-well", "the stage did not arrive")
+
+
+class BlockingGoto(StubGoto):
+    """A ``goto-well`` that is under way until released: the drive of a row that is in flight."""
+
+    started: ClassVar[threading.Event] = threading.Event()
+    release: ClassVar[threading.Event] = threading.Event()
+
+    def run(self, microscope: Any, params: GotoParams, ctx: RunContext) -> NoResult:
+        StubGoto.ran.append(params.well)
+        BlockingGoto.started.set()
+        while not BlockingGoto.release.is_set():
+            ctx.wait_s(0.05)
+        return NoResult()
 
 
 class Slow:
@@ -164,10 +185,13 @@ def _fresh_state() -> Iterator[None]:
     StubGoto.ran = []
     Slow.started = threading.Event()
     Slow.release = threading.Event()
+    BlockingGoto.started = threading.Event()
+    BlockingGoto.release = threading.Event()
     try:
         yield
     finally:
         Slow.release.set()
+        BlockingGoto.release.set()
 
 
 @pytest.fixture
@@ -200,6 +224,33 @@ def page(make_page: Callable[..., PlatePage]) -> PlatePage:
     return make_page(StubGoto, Slow)
 
 
+@pytest.fixture
+def holder_page(fake_core: FakeCore, run_doc: Path) -> Iterator[PlatePage]:
+    """A page on a stand whose profile says where its holder puts a plate (m3 §5.5, m5 §15).
+
+    The map is *estimated* until a plate is registered, and a *Go to* drives to the holder's
+    estimate. The tools are a ``goto-well`` that is under way until released, and ``Slow``.
+    """
+    profile = Profile.demo().model_copy(
+        update={
+            "holder": HolderSection(
+                plate_centre_xy_um=(400.0, -325.0), measured="a test's own centre"
+            )
+        }
+    )
+    microscope = Microscope.from_core(cast("CMMCorePlus", fake_core), profile)
+    controller = PlatePage(
+        microscope, run_doc, entry_points=_entry_points(BlockingGoto, Slow)
+    )
+    try:
+        yield controller
+    finally:
+        BlockingGoto.release.set()
+        Slow.release.set()
+        controller.close()
+        microscope.close()
+
+
 def _click(button: Any) -> None:
     button.clicks += 1
 
@@ -227,8 +278,18 @@ def _capture(page: PlatePage, fake_microscope: Microscope, *wells: str) -> None:
         page.capture_centre(well)
 
 
-def _seed_plate(run_doc: Path) -> None:
-    """A registered plate (the pose is *registered*): *Go to* then needs no holder."""
+def _seed_plate(
+    run_doc: Path,
+    *,
+    plugin: str = "plate-registration",
+    assumed: tuple[str, ...] = (),
+    minute: int = 0,
+) -> None:
+    """A registered plate (the pose is *registered*): *Go to* then needs no holder.
+
+    ``plugin`` is the tool that wrote it and ``minute`` orders the starts: a later record of
+    another tool is the one the page's plate comes from.
+    """
     result = PlateResult(
         plate="96-well",
         a1_center_xy_um=(0.0, 0.0),
@@ -237,16 +298,18 @@ def _seed_plate(run_doc: Path) -> None:
         residual_um=1.5,
         scale_error=0.0,
         n_refs=3,
+        assumed=assumed,
     )
+    then = T0 + timedelta(minutes=minute)
     write_stage(
         run_doc,
         StageRecord(
-            plugin="plate-registration",
+            plugin=plugin,
             provides="plate",
-            attempt="a0",
+            attempt=f"a{minute}",
             status=StageStatus.done,
-            started_utc=T0,
-            finished_utc=T0 + timedelta(minutes=1),
+            started_utc=then,
+            finished_utc=then + timedelta(minutes=1),
             profile="demo",
             dry_run=False,
             smc_version="0",
@@ -641,13 +704,13 @@ def test_go_to_is_disabled_during_live_and_says_why(
             assert slot.goto_button.disabled
             assert GOTO_NOT_DURING_LIVE in slot.note.object.split("\n")
             assert slot.note.styles.get("color") != _WARNING
-        # A click that still arrives is the controller's refusal, drawn on its row (FM-169).
+        # A click that still arrives is the controller's refusal (FM-169): the state's, so
+        # the note every row already has says it, and the click moves no row (a refusal
+        # because an activity goes is not the drive of the row that was clicked).
         _click(view.centre_slots[0].goto_button)
         assert page.status().goto == "live is running"
-        assert view.centre_slots[0].note.object.split("\n") == [
-            GOTO_NOT_DURING_LIVE,
-            "live is running",
-        ]
+        assert view.centre_slots[0].note.object.split("\n") == [GOTO_NOT_DURING_LIVE]
+        assert view.message.object == ""
         assert StubGoto.ran == []
     finally:
         page.live(False)
@@ -818,6 +881,438 @@ def test_no_widget_is_placed_twice_on_a_screen(page: PlatePage) -> None:
         view.show_step(step)
         found = [id(o) for o in _objects(list(view.step_panel.objects))]
         assert len(found) == len(set(found)), f"{step} places a widget twice"
+
+
+# -- what the adversarial review of #444 found ------------------------------------------
+
+HOSTILE = "<img src=x onerror=alert(1)>"
+
+
+class _Turret:
+    """A turret that names its objective with ``label``: a stand's text, which may hold anything."""
+
+    def __init__(self, label: str) -> None:
+        self._label = label
+
+    def labels(self) -> list[str]:
+        return [self._label]
+
+    def current(self) -> str:
+        return self._label
+
+    def select(self, label: str, *, confirm: bool = False) -> str:
+        return label
+
+    def pixel_size_um(self, label: str | None = None) -> float:
+        return 0.0
+
+    def offset(self, label: str) -> ObjectiveOffset:
+        return ObjectiveOffset(label, None, None, None, "")
+
+
+class HostileGoto(StubGoto):
+    """A ``goto-well`` whose run ends ``failed`` with a message that is markup."""
+
+    def run(self, microscope: Any, params: GotoParams, ctx: RunContext) -> NoResult:
+        raise PluginRunError("goto-well", HOSTILE)
+
+
+def test_the_rows_follow_the_maps_pose_and_an_estimated_drive_is_said_in_plain_words(
+    holder_page: PlatePage, run_doc: Path
+) -> None:
+    # The post-#462 path, the owner's walk's main finding: a drive before the registration
+    # went nowhere and said nothing. On a stand with a holder the map is *estimated*, the
+    # rows say so, and the row that started the drive says where it is going, in the plain
+    # colour (nothing in the warning colour before a capture).
+    page = holder_page
+    page.choose_plate("96-well")
+    view = PlatePageView(page)
+    view.show_step("plate")
+    view.refresh()
+    assert view._view is not None
+    assert view._view.pose.kind == "estimated"
+    assert _row_texts(view) == [
+        f"{well}: go there (estimated position), centre it by eye, capture"
+        for well in ("A1", "A12", "H1")
+    ]
+    _click(view.centre_slots[0].goto_button)
+    assert BlockingGoto.started.wait(5)
+    view.tick()
+    note = view.centre_slots[0].note
+    assert note.object.split("\n") == [
+        "goto-well is running: wait for it to end, or press STOP.",
+        GOTO_ESTIMATED.format(well="A1"),
+    ]
+    assert note.styles.get("color") != _WARNING
+    BlockingGoto.release.set()
+    assert page.join(10.0)
+    view.tick()
+    assert note.object.startswith("goto-well done in ")
+    assert note.styles.get("color") != _WARNING
+    # A plate registered since: the rows are those of a registered map, and what the drive
+    # said (an estimate) is history, not left under a plate that is now registered.
+    _seed_plate(run_doc)
+    view.refresh()
+    assert view._view.pose.kind == "registered"
+    assert _row_texts(view)[0] == "A1: go there, centre it, capture"
+    assert note.object == ""
+    assert not note.visible
+
+
+def test_a_rows_drive_text_is_history_once_something_it_was_about_changes(
+    make_page: Callable[..., PlatePage],
+    run_doc: Path,
+    fake_microscope: Microscope,
+) -> None:
+    page = make_page(Slow)  # the real goto-well, on a stand with no holder: unplaced
+    view = PlatePageView(page)
+    view.show_step("plate")
+    page.choose_plate("96-well")
+    view.refresh()
+    note = view.centre_slots[0].note
+    _click(view.centre_slots[0].goto_button)
+    assert note.object == GOTO_UNPLACED
+    # A redraw that finds nothing changed keeps it: the operator is reading it.
+    view.refresh()
+    assert note.object == GOTO_UNPLACED
+    # A centre captured is something it was about; it goes.
+    _capture(page, fake_microscope, "A1")
+    view.refresh()
+    assert note.object == ""
+    # The refusal again, and then a registered plate: the same.
+    page.forget()
+    view.refresh()
+    _click(view.centre_slots[0].goto_button)
+    assert note.object == GOTO_UNPLACED
+    _seed_plate(run_doc)
+    view.refresh()
+    assert view.registered_block.visible
+    assert note.object == ""
+    assert not note.visible
+
+
+def test_a_refused_click_while_a_drive_goes_leaves_the_drive_on_its_row(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # The controller keeps one drive text for every tab. A click that arrives while a drive
+    # goes (a second tab, a stale page: FM-169) is refused, and must not take the running
+    # drive's `done` to a well the stage never visited.
+    _seed_plate(run_doc)
+    page = make_page(BlockingGoto, Slow)
+    view = PlatePageView(page)
+    view.show_step("plate")
+    view.refresh()
+    _click(view.centre_slots[0].goto_button)
+    assert BlockingGoto.started.wait(5)
+    view.tick()
+    _click(view.centre_slots[1].goto_button)
+    assert StubGoto.ran == ["A1"]
+    assert view.message.object == ""
+    BlockingGoto.release.set()
+    assert page.join(10.0)
+    view.tick()
+    assert view.centre_slots[0].note.object.startswith("goto-well done in ")
+    assert view.centre_slots[1].note.object == ""
+    assert view.centre_slots[2].note.object == ""
+
+
+def test_a_map_drive_takes_the_answer_from_the_row(
+    page: PlatePage, run_doc: Path
+) -> None:
+    _seed_plate(run_doc)
+    view = PlatePageView(page)
+    view.show_step("plate")
+    view.refresh()
+    _click(view.centre_slots[1].goto_button)
+    assert page.join(10.0)
+    view.tick()
+    assert view.centre_slots[1].note.object.startswith("goto-well done in ")
+    # A drive armed on the map and clicked on a well: the answer is its, and no row's.
+    view.drive_toggle.value = True
+    view.on_tap(SimpleNamespace(x=0.0, y=0.0))
+    assert page.join(10.0)
+    view.tick()
+    assert view.goto_text.object.startswith("goto-well done in ")
+    assert view.centre_slots[1].note.object == ""
+    assert not view.centre_slots[1].note.visible
+
+
+def test_register_says_what_it_replaces_before_the_click(
+    make_page: Callable[..., PlatePage],
+    run_doc: Path,
+    fake_microscope: Microscope,
+) -> None:
+    # m5 §11.4 and FM-172: a failed registration leaves no plate where a usable one stood,
+    # and the page says so before the click. The tool's own section, which said it, is in
+    # the expert view only: the Plate screen's button says it in its own words.
+    page = make_page(Slow)
+    view = PlatePageView(page)
+    view.show_step("plate")
+    page.choose_plate("96-well")
+    view.refresh()
+    assert view.register_replaces.object == ""
+    assert not view.register_replaces.visible
+    _seed_plate(run_doc)
+    _capture(page, fake_microscope, "A1", "A12", "H1")
+    view.refresh()
+    assert view.register_replaces.visible
+    assert view.register_replaces.object == (
+        "Registering again replaces this plate (references, 3 wells). A failed run "
+        "leaves no plate; the centres captured stay, so Redo the wrong one and register "
+        "again to get a plate back."
+    )
+    assert view.register_replaces.styles.get("color") != _WARNING
+    assert not view.register_button.disabled
+
+
+def test_a_windows_page_says_its_commands_are_quoted_for_a_posix_shell(
+    make_page: Callable[..., PlatePage], fake_microscope: Microscope
+) -> None:
+    # FM-175: `shlex.join` quotes for a POSIX shell, and cmd.exe and PowerShell 5.1 read
+    # quotes differently. The next step said so under its line; the *Command* disclosures
+    # that replaced it on these two screens say it too, with the same words, on Windows only.
+    page = make_page(Slow)
+    view = PlatePageView(page)
+    page.choose_plate("96-well")
+    _capture(page, fake_microscope, "A1", "A12", "H1")
+    view.refresh()
+    words = (
+        "that line is quoted for a POSIX shell (bash, zsh); PowerShell and cmd.exe "
+        "read quotes differently: press the button, which makes the same call"
+    )
+    for pane in (view.register_command_note, view.calibrate_command_note):
+        assert pane.object == ""
+        assert not pane.visible
+    view._windows = True
+    view.refresh()
+    for pane, card_of in (
+        (view.register_command_note, view.register_card),
+        (view.calibrate_command_note, view.calibrate_box.objects[2]),
+    ):
+        assert pane.object == words
+        assert pane.visible
+        assert pane in card_of.objects
+        assert pane.styles.get("color") != _WARNING
+    # The next step's text says the same thing, from one source.
+    step = NextStep("scan", (), (), "smc run scan", None)
+    assert next_step_text(step, windows=True).endswith(f"  {words}")
+    assert words not in next_step_text(step, windows=False)
+
+
+def test_the_text_panes_of_the_two_screens_are_plain_text_whatever_the_stand_says(
+    make_page: Callable[..., PlatePage],
+    run_doc: Path,
+    fake_microscope: Microscope,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FM-139. Free text reaches these screens from the stand (the turret's label, an
+    # exception's message) and from a result (`assumed`): it is shown as it is, never as
+    # markup, or a label of `<img onerror=...>` runs on the stand PC.
+    _seed_plate(run_doc, assumed=(HOSTILE,))
+    fake_microscope.override(ObjectiveTurret, _Turret(HOSTILE))
+    page = make_page(HostileGoto)
+    real_status = page.status
+    monkeypatch.setattr(
+        page,
+        "status",
+        lambda: dataclasses.replace(real_status(), objective=HOSTILE),
+    )
+    view = PlatePageView(page)
+    _capture(page, fake_microscope, "A1")
+    _click(view.centre_slots[1].goto_button)
+    assert page.join(10.0)
+    view.refresh()
+    view.tick()
+    # Said as it was given, in each of the three places that hold a stand's or a result's words.
+    assert view.known_block.object.split("\n")[0] == f"Objective: {HOSTILE}, in place"
+    assert HOSTILE in view.centre_slots[0].text.object
+    assert view.registered_block.object.split("\n")[1] == f"assumed: {HOSTILE}"
+    assert HOSTILE in view.centre_slots[1].note.object
+    # And every text pane of both screens is a `Str`: counted together, so that a pane that
+    # becomes Markdown is a different count and not a pass.
+    shown: list[Any] = []
+    for step in ("stand", "plate"):
+        view.show_step(step)
+        objects = _objects(list(view.step_panel.objects))
+        # A card draws its title as an HTML pane of its own, from a constant of the page's.
+        titles = {f"<h3>{o.title}</h3>" for o in objects if isinstance(o, pn.Card)}
+        shown += [
+            o
+            for o in objects
+            if isinstance(o, pn.pane.PaneBase)
+            and not (type(o) is pn.pane.HTML and o.object in titles)
+        ]
+    assert len(shown) > 10
+    assert [type(o).__name__ for o in shown if type(o) is not pn.pane.Str] == []
+
+
+def test_the_known_block_reads_the_light_and_the_plate_line_reads_the_preset(
+    make_page: Callable[..., PlatePage],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)  # presets are looked for in ./profiles/presets
+    monkeypatch.delenv("SMC_PROFILES", raising=False)
+    folder = tmp_path / "profiles" / "presets"
+    folder.mkdir(parents=True)
+    (folder / "weekly.toml").write_text(
+        'stand = "demo"\nplate = "96-well"\n', encoding="utf-8"
+    )
+    page = make_page(Slow)
+    real_status = page.status
+    light: list[bool | None] = [None]
+    monkeypatch.setattr(
+        page,
+        "status",
+        lambda: dataclasses.replace(real_status(), light_on=light[0]),
+    )
+    view = PlatePageView(page)
+    # The light as the stand read it: the strip's own value, on the Stand screen too.
+    for value, said in ((None, "not known"), (True, "on"), (False, "off")):
+        light[0] = value
+        view.tick()
+        assert view.known_block.object.split("\n")[2] == f"Light: {said}"
+    # The plate's source: the placeholder, then the loaded preset's plate.
+    assert view.plate_from_text.object == (
+        "the page's placeholder: choose the plate on the stage"
+    )
+    view.preset_select.value = "weekly"
+    _click(view.preset_load_button)
+    assert view.plate_from_text.object == "from the preset weekly"
+
+
+def test_the_result_line_shows_the_assumed_lines_of_the_tool_that_wrote_the_plate(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # An older registration and a newer wall registration: the plate is the newer's, and
+    # so are the assumptions under the result line (not an older tool's).
+    _seed_plate(run_doc, assumed=("from the registration",))
+    _seed_plate(run_doc, plugin="plate-walls", assumed=("from the walls",), minute=2)
+    page = make_page(Slow)
+    view = PlatePageView(page)
+    view.show_step("plate")
+    assert view._view is not None
+    assert view._view.registered_by == "plate-walls"
+    assert view.registered_block.object.split("\n")[1:] == ["assumed: from the walls"]
+
+
+def test_a_pane_with_nothing_to_say_takes_no_height_on_a_fresh_plate_screen(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    view = PlatePageView(page)
+    view.show_step("plate")
+    page.choose_plate("96-well")
+    view.refresh()
+    for pane in (
+        view.registered_block,
+        view.other_captures,
+        view.register_replaces,
+        view.register_card,
+        view.calibrate_note,
+    ):
+        assert not pane.visible
+    _capture(page, fake_microscope, "A1", "A12", "H1")
+    view.refresh()
+    assert view.register_card.visible
+    assert not view.registered_block.visible
+
+
+def test_a_stand_that_lacks_what_a_tool_needs_says_why_beside_its_button(
+    make_page: Callable[..., PlatePage], fake_microscope: Microscope
+) -> None:
+    # The controller refuses these runs on its own (FM-169); the reason beside the button is
+    # the courtesy, and it is the tool's own (the next step's precedence).
+    page = make_page(Slow)
+    real_has = fake_microscope.has
+
+    def has(capability: type) -> bool:
+        return capability not in {Camera, XYStage} and real_has(capability)
+
+    fake_microscope.has = has  # type: ignore[method-assign]
+    try:
+        view = PlatePageView(page)
+        view.show_step("plate")
+        page.choose_plate("96-well")
+        view.refresh()
+        blocked = view._blocked
+        assert blocked["camera-calibration"]
+        assert view.calibrate_button.disabled
+        assert view.calibrate_note.object == blocked["camera-calibration"]
+    finally:
+        del fake_microscope.has
+
+
+def test_the_tools_own_reason_comes_before_the_screens_wait(run_doc: Path) -> None:
+    # With the stand closed, *Register the plate* has two things to say: the screen waits
+    # for a centre, and the tool needs the stand. What the stand says first wins (the
+    # next step's precedence): it is the reason that holds longer.
+    page = PlatePage.closed(
+        Profile.demo(), run_doc, entry_points=_entry_points(StubGoto, Slow)
+    )
+    try:
+        view = PlatePageView(page)
+        view.show_step("plate")
+        page.choose_plate("96-well")
+        view.refresh()
+        assert view._register_drawn[1] == CAPTURE_WELLS
+        assert view._blocked["plate-registration"] == "the stand is not connected"
+        assert view.register_button.disabled
+        assert view.register_wait.object == "the stand is not connected"
+    finally:
+        page.close()
+
+
+def test_a_registration_that_did_not_load_is_said_and_its_button_is_off(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    entry_points = [
+        EntryPoint(name="goto-well", value=REAL["goto-well"], group=GROUP),
+        EntryPoint(name="slow", value=f"{__name__}:Slow", group=GROUP),
+    ]
+    page = PlatePage(fake_microscope, run_doc, entry_points=entry_points)
+    try:
+        view = PlatePageView(page)
+        view.show_step("plate")
+        page.choose_plate("96-well")
+        view.refresh()
+        assert view.register_button.disabled
+        assert view.register_wait.object == (
+            "plate-registration did not load: the problems line says why"
+        )
+        # And with no calibration tool, *Calibrate the camera* is not offered at all.
+        assert not view.calibrate_box.visible
+    finally:
+        page.close()
+
+
+def test_the_second_connect_is_off_while_the_stand_is_connecting(
+    run_doc: Path, fake_microscope: Microscope
+) -> None:
+    release = threading.Event()
+
+    def opener() -> Microscope:
+        release.wait(10.0)
+        return fake_microscope
+
+    page = PlatePage.closed(
+        Profile.demo(), run_doc, opener=opener, entry_points=_entry_points()
+    )
+    try:
+        view = PlatePageView(page)
+        view.show_step("stand")
+        _click(view.stand_connect_button)
+        view.tick()
+        assert view.stand_text.object == "demo: connecting…"
+        assert view.stand_connect_button.disabled
+        assert view.stand_connect_button.visible
+        release.set()
+        assert page.join(10.0)
+        view.tick()
+        assert view.stand_text.object == "demo: connected"
+        assert not view.stand_connect_button.visible
+    finally:
+        release.set()
+        page.close()
 
 
 # -- the header and the scroll (D12) ---------------------------------------------------

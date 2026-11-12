@@ -269,8 +269,12 @@ disclosure shows the `smc run` line it makes.
   drew them. While it waits it says for what (`centre a well under the objective ...`,
   or `choose the plate on the stage first`). On a stand whose profile has a `[sample]` of
   this plate the rows say `known from the profile's sample, not measured` and the button
-  registers from them with no capture. The walls and the automatic survey are named under
-  **Other ways to register** and run from the expert view;
+  registers from them with no capture. With a plate already registered it says, before you
+  press it, that **registering again replaces that plate** and that a failed run leaves none
+  (the centres captured stay: *Redo* the wrong one and register again). On a Windows PC the
+  *Command* under it says that its line is quoted for a POSIX shell and that the button is
+  the way in. The walls and the automatic survey are named under **Other ways to register**
+  and run from the expert view;
 - the result, `Registered: residual 121.6 µm, turned 0.10°` (`residual not measured` for a
   seed), with what the registration assumed under it, and **Continue to Wells**.
 
