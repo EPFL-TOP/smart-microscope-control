@@ -98,7 +98,12 @@ def test_the_orientation_select_is_next_to_the_plate_menu(make_view: Any) -> Non
         if isinstance(item, pn.Column) and view.plate_select in item
     ]
     assert len(columns) == 1
-    assert list(columns[0])[:2] == [view.plate_select, view.orientation_select]
+    # The *from …* line of the plate sits between the menu and the select (m5 §17.2 D7).
+    assert list(columns[0])[:3] == [
+        view.plate_select,
+        view.plate_from_text,
+        view.orientation_select,
+    ]
     assert columns[0] in view.screens["expert"]
     select = view.orientation_select
     assert select.name == "Plate lies"

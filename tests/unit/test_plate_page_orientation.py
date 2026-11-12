@@ -23,7 +23,7 @@ import pytest
 from pymmcore_plus import CMMCorePlus
 
 from smc.hardware import Microscope
-from smc.hardware.capabilities import XYStage
+from smc.hardware.capabilities import ObjectiveTurret, XYStage
 from smc.hardware.profile import HolderSection, Profile
 from smc.plugins.api import PluginParams, PluginResult, RunContext
 from smc.plugins.registry import GROUP
@@ -484,6 +484,34 @@ def test_a_turn_renames_the_captures_and_keeps_the_selection_by_name(
         outcome = page.status().outcome
         assert outcome is not None
         assert SELECTION_KEPT_ITS_NAMES not in outcome
+    finally:
+        page.close()
+
+
+def test_a_turn_renames_the_capture_objectives_with_the_captures(
+    stand: Microscope, run_doc: Path
+) -> None:
+    # The turret label a capture was taken with is a third piece of state beside `refs`
+    # (#444): the positions stay and the names follow the turned plate, so the label must
+    # follow its centre, or the Plate screen would say "the objective not known" for it.
+    _registered(run_doc, _fit(), refs=REFS)
+    page = _page(stand, run_doc, "plate-orientation", "plate-registration")
+    try:
+        stand.require(XYStage).move_to_um(19_000.0, -9_500.0)
+        page.capture_centre("B3")
+        label = stand.require(ObjectiveTurret).current()
+        assert page.capture_objectives == {"B3": label}
+
+        page.choose_orientation("turned-180")
+        assert page.join(10.0)
+
+        # B3 is G10 on the turned plate: the same centre, the same objective.
+        assert [r.well for r in page.refs] == ["A1", "G10"]
+        assert page.capture_objectives == {"G10": label}
+        assert page._capture_objectives == {"G10": label}
+        page.choose_orientation("not-turned")
+        assert page.join(10.0)
+        assert page.capture_objectives == {"B3": label}
     finally:
         page.close()
 

@@ -254,7 +254,7 @@ def _drive(snap, tmp_path: Path, page: MagicMock, run_chain):
         plans=snap.plan_states("demo-sample", results=True),
         stand_name="demo-sample",
         results=True,
-        stand=SimpleNamespace(run_chain=run_chain),
+        stand=SimpleNamespace(run_chain=run_chain, viewport=(1280, 800)),
         out=tmp_path,
     )
 
@@ -414,11 +414,15 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
         "after-density",
         "with-route",
         "turned",
+        # The short-page shots of D12 (m5 §17.8): last, and reached with no chain.
+        "stand-620",
+        "plate-620",
     ]
     assert list(snap.STATE_NAMES) == names
     # `expert` is the fourth, so that both stands reach it (m5 §17.8).
     alone = [True, True, True, True]
     chained = [False, False, False]
+    short = [True, True]
 
     full = snap.plan_states("demo-sample", results=True)
     assert [p.name for p in full] == names
@@ -426,23 +430,24 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
 
     demo = snap.plan_states("demo", results=True)
     assert [p.name for p in demo] == names
-    # `turned` needs the chain's registered plate (m5 §16.4): with the results.
-    assert [p.reachable for p in demo] == [*alone, *chained]
-    for plan in demo[4:]:
+    # `turned` needs the chain's registered plate (m5 §16.4): with the results. The two
+    # short-page states need none: both stands reach them.
+    assert [p.reachable for p in demo] == [*alone, *chained, *short]
+    for plan in demo[4:7]:
         assert plan.reason == (
             "the demo camera images no sample: no cells, no density; "
             "use --stand demo-sample"
         )
 
     skipped = snap.plan_states("demo-sample", results=False)
-    assert [p.reachable for p in skipped] == [*alone, *chained]
-    assert {p.reason for p in skipped[4:]} == {"skipped by --no-results"}
+    assert [p.reachable for p in skipped] == [*alone, *chained, *short]
+    assert {p.reason for p in skipped[4:7]} == {"skipped by --no-results"}
 
     failed = snap.plan_states(
         "demo-sample", results=True, chain_failure="cells exited 1: no detector"
     )
-    assert [p.reachable for p in failed] == [*alone, *chained]
-    assert [p.name for p in failed[4:]] == ["after-density", "with-route", "turned"]
+    assert [p.reachable for p in failed] == [*alone, *chained, *short]
+    assert [p.name for p in failed[4:7]] == ["after-density", "with-route", "turned"]
     assert failed[4].reason == "cells exited 1: no detector"
     assert failed[5].reason is not None
     assert "cells exited 1: no detector" in failed[5].reason
@@ -972,6 +977,9 @@ def test_a_failed_chain_names_the_states_that_needed_it(snap, tmp_path) -> None:
         ("after-density", False),
         ("with-route", False),
         ("turned", False),
+        # The short-page shots need no chain.
+        ("stand-620", True),
+        ("plate-620", True),
     ]
     assert records[4].reason == "cells exited 1: x"
     assert records[5].reason == "needs the chain: cells exited 1: x"
@@ -986,7 +994,17 @@ def test_a_state_whose_control_times_out_is_named_and_the_next_state_runs(
     records, _, _ = _drive(snap, tmp_path, page, lambda steps: None)
     # `after-density` takes a Snap too (the page reads the run document again at its
     # end, #297), so it fails on the same control; `expert` and `with-route` run.
-    assert [r.reached for r in records] == [True, True, False, True, False, True, True]
+    assert [r.reached for r in records] == [
+        True,
+        True,
+        False,
+        True,
+        False,
+        True,
+        True,
+        True,
+        True,
+    ]
     assert records[2].reason == "Locator.click: Timeout 10000ms exceeded."
     assert records[4].reason == records[2].reason
     page.screenshot.assert_any_call(path=str(tmp_path / "snap-FAILED.png"))
@@ -1000,7 +1018,7 @@ def test_a_step_button_that_times_out_names_the_state_and_the_next_one_runs(
     # not there fails `wells-selected` alone, named.
     page = _fake_page(fails_on_button="3. Wells")
     records, _, _ = _drive(snap, tmp_path, page, lambda steps: None)
-    assert [r.reached for r in records] == [True, False, True, True, True, True, True]
+    assert [r.reached for r in records] == [True, False, *([True] * 7)]
     assert records[1].reason == "Locator.click: Timeout 10000ms exceeded."
     page.screenshot.assert_any_call(path=str(tmp_path / "wells-selected-FAILED.png"))
 
@@ -1010,7 +1028,7 @@ def test_a_state_whose_control_times_out_alone_is_the_only_one_named(
 ) -> None:
     page = _fake_page(fails_on_fill=True)
     records, _, _ = _drive(snap, tmp_path, page, lambda steps: None)
-    assert [r.reached for r in records] == [True, False, True, True, True, True, True]
+    assert [r.reached for r in records] == [True, False, *([True] * 7)]
     assert records[1].reason == "Locator.fill: Timeout 10000ms exceeded."
     page.screenshot.assert_any_call(path=str(tmp_path / "wells-selected-FAILED.png"))
 
@@ -1175,7 +1193,11 @@ def test_expert_waits_for_the_pressed_class_and_the_switch_goes_off_after_the_ph
     off.locator.return_value.filter.return_value.wait_for.assert_called_once_with(
         state="detached"
     )
-    assert {"expert": snap._after_expert} == snap.AFTER_ACTIONS
+    assert {
+        "expert": snap._after_expert,
+        "stand-620": snap._after_short,
+        "plate-620": snap._after_short,
+    } == snap.AFTER_ACTIONS
 
     # In the driver: the photograph is taken before the switch goes off.
     order: list[str] = []
@@ -1259,6 +1281,146 @@ def test_on_screen_says_where_each_part_is_and_never_guesses(snap, monkeypatch) 
     assert snap._on_screen(page)[0].startswith("STOP: NO (")
     # A page with no viewport (a fake) says nothing.
     assert snap._on_screen(MagicMock()) == []
+
+
+# --- the short-page states of D12 (m5 §17.2, §17.8, #444) -----------------------------
+
+
+def test_the_short_page_states_name_the_screens_titles_the_guide_draws(snap) -> None:
+    from smc.ui.guide import SCREEN_TITLES
+
+    # The script imports nothing of smc at import, so its copy of the two titles is pinned.
+    assert {
+        "stand-620": SCREEN_TITLES["stand"],
+        "plate-620": SCREEN_TITLES["plate"],
+    } == snap.SCREEN_TITLE_OF
+    assert snap.SHORT_VIEWPORT_HEIGHT_PX == 620
+
+
+@pytest.mark.parametrize(
+    ("action", "number", "title", "heading"),
+    [
+        ("_act_stand_620", 1, "Stand", "Which stand, and which preset?"),
+        ("_act_plate_620", 2, "Plate", "Where is the plate?"),
+    ],
+)
+def test_a_short_page_state_connects_forgets_the_outcome_shrinks_then_opens_its_screen(
+    snap, action: str, number: int, title: str, heading: str
+) -> None:
+    page = MagicMock()
+    page.viewport_size = {"width": 1280, "height": 800}
+    order: list[str] = []
+    page.set_viewport_size.side_effect = lambda size: order.append(f"resize:{size}")
+
+    def role(*args: object, **kwargs: object) -> MagicMock:
+        name = kwargs.get("name")
+        found = MagicMock()
+        found.is_enabled.return_value = False  # connected already: no click, FM-162
+        found.click.side_effect = lambda: order.append(
+            f"click:{getattr(name, 'pattern', name)}"
+        )
+        return found
+
+    page.get_by_role.side_effect = role
+    page.locator.return_value.filter.return_value.first.wait_for.side_effect = lambda: (
+        order.append("wait:title")
+    )
+    getattr(snap, action)(page, _no_chain())
+    # The outcome the earlier states left is forgotten with *Refresh* (D12 measures the
+    # header with its outcome lines empty); the page shrinks before the screen opens, so
+    # that it is laid out at 620 px and never resized under the photograph; the state ends
+    # on the screen's own title (FM-162), never on a delay.
+    assert order == [
+        "click:Refresh",
+        "resize:{'width': 1280, 'height': 620}",
+        f"click:^{number}\\. {title}",
+        "wait:title",
+    ]
+    page.locator.return_value.filter.assert_any_call(has_text=heading)
+    page.wait_for_timeout.assert_not_called()
+
+
+def test_a_short_page_state_puts_the_runs_viewport_back_after_its_photograph(
+    snap,
+) -> None:
+    page = MagicMock()
+    snap._after_short(page, SimpleNamespace(viewport=(1600, 1000)))
+    page.set_viewport_size.assert_called_once_with({"width": 1600, "height": 1000})
+    # In the driver the photograph is taken at 620 and the viewport is put back after it,
+    # and the states after them see the run's size again.
+    order: list[str] = []
+    drive_page = _fake_page()
+    drive_page.set_viewport_size.side_effect = lambda size: order.append(
+        f"resize:{size['height']}"
+    )
+    drive_page.screenshot.side_effect = lambda **kw: order.append(Path(kw["path"]).name)
+    _drive(snap, Path("."), drive_page, lambda steps: None)
+    first = order.index("stand-620.png")
+    assert order[first - 1] == "resize:620"
+    assert order[first : first + 3] == [
+        "stand-620.png",
+        "stand-620-full.png",
+        "resize:800",
+    ]
+    second = order.index("plate-620.png")
+    assert order[second - 1] == "resize:620"
+    assert order[second + 2] == "resize:800"
+    # The short states are the last two: nothing is photographed at a short height before.
+    assert order.index("turned.png") < first < second
+
+
+def test_on_screen_reports_the_title_and_the_first_action_of_a_short_page(
+    snap, monkeypatch
+) -> None:
+    page = MagicMock()
+    page.viewport_size = {"width": 1280, "height": 620}
+    seen: list[tuple[str, object]] = []
+
+    def part(name: str, box: dict[str, float] | None) -> tuple[str, MagicMock]:
+        found = MagicMock()
+        found.count.return_value = 1
+        found.first.bounding_box.return_value = box
+        seen.append((name, found))
+        return name, found
+
+    parts = [
+        part("STOP", _box(1200, 5, 60, 30)),
+        part("step bar", _box(10, 73, 170, 31)),
+        part("title", _box(10, 142, 370, 17)),
+        # The Plate screen's first action, past the window's bottom: the finding of the
+        # first run, when the header held a stale outcome line.
+        part("first action", _box(10, 592, 73, 31)),
+    ]
+    monkeypatch.setattr(snap, "_short_parts", lambda page, state: parts)
+    assert snap._on_screen(page, "plate-620") == [
+        "STOP: yes (y 5 to 35 of 620, x 1200 to 1260 of 1280)",
+        "step bar: yes (y 73 to 104 of 620, x 10 to 180 of 1280)",
+        "title: yes (y 142 to 159 of 620, x 10 to 380 of 1280)",
+        "first action: NO (y 592 to 623 of 620, x 10 to 83 of 1280)",
+    ]
+
+
+def test_the_short_parts_are_the_strip_the_step_bar_the_title_and_the_first_action(
+    snap,
+) -> None:
+    page = MagicMock()
+    stand = {n: c for n, c in snap._short_parts(page, "stand-620")}
+    assert list(stand) == ["STOP", "step bar", "title", "first action"]
+    page.get_by_role.assert_any_call("button", name="Load", exact=True)
+    page.locator.return_value.filter.assert_any_call(
+        has_text="Which stand, and which preset?"
+    )
+    page = MagicMock()
+    snap._short_parts(page, "plate-620")
+    names = [
+        c.kwargs["name"].pattern
+        for c in page.get_by_role.mock_calls
+        if hasattr(c.kwargs.get("name"), "pattern")
+    ]
+    # The first *Go to* of the rows, and the Stand step's button for the step bar.
+    assert r"^Go to " in names
+    assert r"^1\. Stand" in names
+    page.locator.return_value.filter.assert_any_call(has_text="Where is the plate?")
 
 
 # --- the chain against the plugins ------------------------------------------

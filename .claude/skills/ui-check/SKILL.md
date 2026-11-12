@@ -1,6 +1,6 @@
 ---
 name: ui-check
-description: Look at the plate page like a user does — serve it on a demo stand in dry run, drive it with headless Chromium at 1280 x 800 through seven states (empty, a typed well range, a snap, the expert view, after density, with the route, the plate turned), and read the PNGs and summary.txt it writes. Use it on every area:ui issue, in /develop before the adversarial review and in /review of an area:ui PR; it also says how a session drives the served page through a Chrome MCP (tried once: screenshots and clicks, no page reading). Never an assertion or a baseline.
+description: Look at the plate page like a user does — serve it on a demo stand in dry run, drive it with headless Chromium at 1280 x 800 through seven states (empty, a typed well range, a snap, the expert view, after density, with the route, the plate turned) and at 1280 x 620 through two more (the Stand screen and the Plate screen), and read the PNGs and summary.txt it writes. Use it on every area:ui issue, in /develop before the adversarial review and in /review of an area:ui PR; it also says how a session drives the served page through a Chrome MCP (tried once: screenshots and clicks, no page reading). Never an assertion or a baseline.
 ---
 
 # /ui-check
@@ -41,7 +41,7 @@ has both.
 
 (Windows: `.venv\Scripts\python`.) 33 s on macOS (measured), 19 s of them the `scan` of
 the chain; `--no-results` skips the chain when the change has nothing to do with
-results, and then the last three states are named as not reached. `--stand demo` serves
+results, and then `after-density`, `with-route` and `turned` are named as not reached. `--stand demo` serves
 the demo whose camera images no sample. Nothing else is a parameter: there is no
 `--profile`, because the page can move a stage, and the script serves only
 `demo-sample` and `demo`, the repository's own files, and always with `--dry-run`.
@@ -55,6 +55,8 @@ the demo whose camera images no sample. Nothing else is a parameter: there is no
 | `after-density` | runs the workflow while the page is up (`plate-registration`, `scan-plan`, `scan`, `cells`, `density`, on the demo's simulated stage), then a Snap (the page reads the run document again when it ends: #297, **no Refresh**), then the *5. Results* step and a wait for `✓ density` in the checklist. Read the map for the **whole plate** and **plain tick labels** (−60000 to 60000, not `5.000e+4`: FM-174) | `demo-sample` |
 | `with-route` | `route`, then Refresh (in the map's header row) | `demo-sample` |
 | `turned` | the *2. Plate* step, then the *Plate lies* select set to its `Turned 180°` option (after a wait for the select: the server draws the screen), then a wait for the strip's `plate-orientation done` line (m5 §16.4). Compare it with `with-route` by eye: the **same cross, other names** (the density and the route are stale after the turn, so they are gone) | `demo-sample` |
+| `stand-620` | Connect (when enabled), then *Refresh* (it forgets the outcome the earlier states left under the strip: D12 measures the header with its outcome lines empty), the viewport **resized to 1280 x 620**, then the *1. Stand* step and a wait for the screen's title; the viewport goes back to the run's after the photograph. `summary.txt` says for the strip's STOP, the step bar, the screen's **title** and its **first action** (the preset's *Load*) whether each is wholly inside the 620 px page (m5 §17.2 D12) | both stands, last (no chain) |
+| `plate-620` | The same, with the *2. Plate* step. Its first action is the first row's *Go to*. On `--stand demo` the screen is in its worst case (the placeholder plate, the confirmation, the orientation note of a stand that does not say its sides): read it there too, since `demo-sample` is registered by the chain's end | both stands, last (no chain) |
 
 A state it cannot reach is **named, never skipped**: `<state>: not reached: <why>`,
 on stdout and in `summary.txt`. It never clicks a tool's Run button, Drive, STOP or
@@ -72,7 +74,7 @@ moves nothing.
    state the change touches. Start here. `<state>-full.png` is the whole page and is
    shown too small to read: use it for the part below the fold only.
 3. **`summary.txt`** for what a PNG cannot give: the strip, the outcome, the
-   checklist and the result cards as text, the step shown (`step:`, the button of the class `smc-step-shown`; with the expert view on, none is), what is on screen (`on screen:` says for the strip's STOP, the step bar, the map, the image and the last control of the drive bar whether each is wholly in the viewport and where), the Wells box, how the
+   checklist and the result cards as text, the step shown (`step:`, the button of the class `smc-step-shown`; with the expert view on, none is), what is on screen (`on screen:` says for the strip's STOP, the step bar, the map, the image and the last control of the drive bar whether each is wholly in the viewport and where; for `stand-620` and `plate-620` it says it for STOP, the step bar, the screen's title and its first action), the Wells box, how the
    server stopped, the server's error lines and the browser's. The map and the image
    are **canvas**: they are in the PNGs only.
 4. **`server.log`** (the server's stdout and stderr as it wrote them) when the

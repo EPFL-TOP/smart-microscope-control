@@ -75,22 +75,30 @@ TERMINATE_GRACE_S = 10.0
 KILL_GRACE_S = 5.0
 
 #: The first four need no chain and are reached on both stands (``expert`` is fourth for
-#: that: m5 §17.8); the last three need the results of a real run of the workflow.
-STATE_NAMES = (
-    "empty",
-    "wells-selected",
-    "snap",
-    "expert",
-    "after-density",
-    "with-route",
-    "turned",
-)
-REACHABLE_ALONE = 4
+#: that: m5 §17.8); the next three need the results of a real run of the workflow; the last
+#: two are the short-page shots of D12 (m5 §17.2, §17.8), reached alone again, after them.
+ALONE_STATES = ("empty", "wells-selected", "snap", "expert")
+CHAIN_STATES = ("after-density", "with-route", "turned")
+SHORT_STATES = ("stand-620", "plate-620")
+STATE_NAMES = (*ALONE_STATES, *CHAIN_STATES, *SHORT_STATES)
+REACHABLE_ALONE = len(ALONE_STATES)
 
 #: The viewport the page is designed for (m5 §17.3): the strip, the step bar, both
 #: figures and the drive bar are on screen at 1280 x 800, the floor of a stand PC.
 VIEWPORT_WIDTH_PX = 1280
 VIEWPORT_HEIGHT_PX = 800
+
+#: The page of the owner's walk of #431: a 1280 x 800 window gave a 1280 x 623 page, and the
+#: Stand and Plate screens must show their title, lead, fields and first action in it (m5
+#: §17.2 D12). ``stand-620`` and ``plate-620`` shoot those two screens at this height.
+SHORT_VIEWPORT_HEIGHT_PX = 620
+
+#: The screens' titles, as the page draws them (``guide.SCREEN_TITLES``, which a test pins
+#: this to: this script imports nothing of smc at import).
+SCREEN_TITLE_OF = {
+    "stand-620": "Which stand, and which preset?",
+    "plate-620": "Where is the plate?",
+}
 
 # A child sharing the console can change its code page (FM-22).
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -285,11 +293,13 @@ def plan_states(
 ) -> list[StatePlan]:
     """Which states can be reached, and why not for the others (never silent).
 
-    The last three need the results of a real run of the workflow: the demo camera
-    images no sample, ``--no-results`` skips the chain, and a chain step that failed
-    leaves them without their input.
+    The three of ``CHAIN_STATES`` need the results of a real run of the workflow: the demo
+    camera images no sample, ``--no-results`` skips the chain, and a chain step that failed
+    leaves them without their input. The two short-page states of D12 need none, and are
+    reached on both stands, last.
     """
-    plans = [StatePlan(name, True) for name in STATE_NAMES[:REACHABLE_ALONE]]
+    plans = [StatePlan(name, True) for name in ALONE_STATES]
+    short = [StatePlan(name, True) for name in SHORT_STATES]
     if stand != "demo-sample":
         reason: str | None = (
             "the demo camera images no sample: no cells, no density; "
@@ -302,7 +312,8 @@ def plan_states(
     if reason is not None:
         return [
             *plans,
-            *(StatePlan(n, False, reason) for n in STATE_NAMES[REACHABLE_ALONE:]),
+            *(StatePlan(n, False, reason) for n in CHAIN_STATES),
+            *short,
         ]
     if chain_failure is not None:
         return [
@@ -310,8 +321,9 @@ def plan_states(
             StatePlan("after-density", False, chain_failure),
             StatePlan("with-route", False, f"needs the chain: {chain_failure}"),
             StatePlan("turned", False, f"needs the chain: {chain_failure}"),
+            *short,
         ]
-    return [*plans, *(StatePlan(n, True) for n in STATE_NAMES[REACHABLE_ALONE:])]
+    return [*plans, *(StatePlan(n, True) for n in CHAIN_STATES), *short]
 
 
 # --- what is read back -----------------------------------------------------
@@ -599,6 +611,8 @@ class Stand:
     run_doc: Path
     chain_log: Path
     env: dict[str, str]
+    #: The viewport of the run, which a short-page state puts back after its photograph.
+    viewport: tuple[int, int] = (VIEWPORT_WIDTH_PX, VIEWPORT_HEIGHT_PX)
 
     def run_chain(self, steps: Sequence[Step]) -> None:
         for step in steps:
@@ -722,6 +736,46 @@ def _act_turned(page: Any, stand: Stand) -> None:
     page.locator("pre").filter(has_text="plate-orientation done").first.wait_for()
 
 
+def _short_page(page: Any) -> None:
+    """The page at 1280 x 620, the height of the owner's walk (m5 §17.2 D12): the width stays the run's."""
+    size = page.viewport_size
+    width = size["width"] if isinstance(size, dict) else VIEWPORT_WIDTH_PX
+    page.set_viewport_size({"width": width, "height": SHORT_VIEWPORT_HEIGHT_PX})
+
+
+def _after_short(page: Any, stand: Stand) -> None:
+    """The run's viewport again after a short-page photograph, so that the next state starts as the others did."""
+    width, height = stand.viewport
+    page.set_viewport_size({"width": width, "height": height})
+
+
+def _open_screen(page: Any, number: int, title: str, heading: str) -> None:
+    """Connect, forget the last outcome, shrink the page, open the screen of step ``number`` and wait until its title is drawn.
+
+    D12 measures the screen under the header with its outcome lines empty: the states
+    before this one leave a ``snap:`` line under the strip, and *Refresh* (always in view,
+    in the map's header row) is what forgets it (m5 §8.8.3), as an operator would. The
+    shrink comes before the screen is opened, so that it is laid out at the short height
+    the state is about, never resized under a photograph. The wait is for the screen's own
+    title text, which the server draws when it swaps the screen (FM-162).
+    """
+    _connect(page)
+    page.get_by_role("button", name="Refresh").click()
+    _short_page(page)
+    _step_button(page, number, title).click()
+    page.locator("pre").filter(has_text=heading).first.wait_for()
+
+
+def _act_stand_620(page: Any, stand: Stand) -> None:
+    """*1. Stand* after Connect, at 1280 x 620 (m5 §17.8): its title and *Load* are inside the page."""
+    _open_screen(page, 1, "Stand", SCREEN_TITLE_OF["stand-620"])
+
+
+def _act_plate_620(page: Any, stand: Stand) -> None:
+    """*2. Plate* at 1280 x 620 (m5 §17.8): its title and first *Go to* are inside the page."""
+    _open_screen(page, 2, "Plate", SCREEN_TITLE_OF["plate-620"])
+
+
 ACTIONS = {
     "empty": _act_empty,
     "wells-selected": _act_wells_selected,
@@ -730,10 +784,17 @@ ACTIONS = {
     "after-density": _act_after_density,
     "with-route": _act_with_route,
     "turned": _act_turned,
+    "stand-620": _act_stand_620,
+    "plate-620": _act_plate_620,
 }
 
-#: What a state does after its photograph: only ``expert`` has one (its switch off).
-AFTER_ACTIONS = {"expert": _after_expert}
+#: What a state does after its photograph: ``expert`` puts its switch off, and the two
+#: short-page states put the viewport back.
+AFTER_ACTIONS = {
+    "expert": _after_expert,
+    "stand-620": _after_short,
+    "plate-620": _after_short,
+}
 
 
 def _frame_parts(page: Any) -> list[tuple[str, Any]]:
@@ -752,8 +813,28 @@ def _frame_parts(page: Any) -> list[tuple[str, Any]]:
     ]
 
 
-def _on_screen(page: Any) -> list[str]:
-    """One line for each part of ``_frame_parts``: whether it is wholly in the viewport, and where.
+def _short_parts(page: Any, state: str) -> list[tuple[str, Any]]:
+    """The parts that must be in view on a short page (m5 §17.2 D12), by name: the strip, the step bar, and the screen's title and first action.
+
+    Not the figures and the drive bar: at 620 px they are below the fold by design, and
+    the screen's own fields are read by eye in the PNG. The first action of *Stand* is
+    the preset's *Load*, and of *Plate* the first row's *Go to*.
+    """
+    first = (
+        page.get_by_role("button", name="Load", exact=True)
+        if state == "stand-620"
+        else page.get_by_role("button", name=re.compile(r"^Go to "))
+    )
+    return [
+        ("STOP", page.get_by_role("button", name="STOP")),
+        ("step bar", _step_button(page, 1, "Stand")),
+        ("title", page.locator("pre").filter(has_text=SCREEN_TITLE_OF[state])),
+        ("first action", first),
+    ]
+
+
+def _on_screen(page: Any, state: str | None = None) -> list[str]:
+    """One line for each part of ``_frame_parts`` (``_short_parts`` for a short-page state): whether it is wholly in the viewport, and where.
 
     A part that is not drawn, or whose box the browser does not give, says so and is
     never guessed to be in view. A page with no viewport size (a fake) gives nothing.
@@ -762,7 +843,8 @@ def _on_screen(page: Any) -> list[str]:
     if not isinstance(viewport, dict):
         return []
     lines: list[str] = []
-    for name, locator in _frame_parts(page):
+    parts = _short_parts(page, state) if state in SHORT_STATES else _frame_parts(page)
+    for name, locator in parts:
         if locator.count() == 0:
             lines.append(f"{name}: not on the page")
             continue
@@ -785,7 +867,9 @@ def _on_screen(page: Any) -> list[str]:
     return lines
 
 
-def _read_page(page: Any) -> tuple[str | None, str | None, list[str], list[str]]:
+def _read_page(
+    page: Any, state: str | None = None
+) -> tuple[str | None, str | None, list[str], list[str]]:
     """The step shown, the Wells box, the text panes and what is on screen, as the page shows them.
 
     ``inner_text("body")`` of a Panel page is empty (shadow DOM); the panes' own
@@ -803,7 +887,7 @@ def _read_page(page: Any) -> tuple[str | None, str | None, list[str], list[str]]
     box = page.get_by_label("Wells", exact=True)
     wells = box.input_value() if box.count() == 1 else None
     texts = [t.strip() for t in page.locator("pre").all_inner_texts() if t.strip()]
-    return step, wells, texts, _on_screen(page)
+    return step, wells, texts, _on_screen(page, state)
 
 
 def _outputs(out: Path, name: str) -> list[Path]:
@@ -874,7 +958,7 @@ def drive(
             page.wait_for_timeout(SETTLE_MS)
             page.screenshot(path=str(out / f"{plan.name}.png"))
             page.screenshot(path=str(out / f"{plan.name}-full.png"), full_page=True)
-            step, wells, texts, on_screen = _read_page(page)
+            step, wells, texts, on_screen = _read_page(page, plan.name)
             after = AFTER_ACTIONS.get(plan.name)
             if after is not None:
                 after(page, stand)
@@ -949,7 +1033,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-results",
         action="store_true",
-        help="do not run the chain of tools: the last three states are not reached",
+        help="do not run the chain of tools: after-density, with-route and turned "
+        "are not reached",
     )
     parser.add_argument(
         "--keep-work",
@@ -1005,7 +1090,14 @@ def _serve_and_drive(
 ) -> int:
     port = free_port()
     env = child_env(os.environ)
-    stand = Stand(sys.executable, profile, work / "run.json", out / "chain.log", env)
+    stand = Stand(
+        sys.executable,
+        profile,
+        work / "run.json",
+        out / "chain.log",
+        env,
+        (args.width, args.height),
+    )
     plans = plan_states(args.stand, results=not args.no_results)
     log = out / "server.log"
     records: list[StateRecord] = []
