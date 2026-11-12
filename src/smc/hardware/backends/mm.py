@@ -152,6 +152,25 @@ _NO_FACTORS: Mapping[str, float] = MappingProxyType({})
 
 logger = logging.getLogger("smc.hardware.backends.mm")
 
+#: What a device fault advises, unless a known answer names its cause better.
+_DEVICE_HINT = "check the device: power, cable, another program holding it"
+
+#: The Ti2-E nosepiece's answer with an objective not seated (session 3, #406).
+_BETWEEN_POSITIONS = "Cannot get current position label"
+
+#: The advice for that answer. Session 3 (#406): the 10x was left between two
+#: positions, and "power, cable" sent the operator to the wrong place; seating it
+#: from the stand then finished the interrupted turn, whose restore raised Z from
+#: 485 to 3657 µm by itself. The restore goes back to the height before the turn,
+#: so lowering Z first would not stop it: the clearance is what protects a plate.
+_TURRET_HINT = (
+    "the turret is likely between two positions: seat an objective from the "
+    "stand (if it is seated, check the device: power, cable, another program "
+    "holding it). Seating it may finish an interrupted turn and raise Z by "
+    "itself to its height before that turn: check the clearance under the "
+    "objective, or take the plate off, first"
+)
+
 
 class _FaultTranslator:
     """Forwards every call to the core; a ``RuntimeError`` becomes a ``HardwareError``.
@@ -194,10 +213,12 @@ class _FaultTranslator:
         shown = ", ".join(
             [*map(repr, args), *(f"{k}={v!r}" for k, v in kwargs.items())]
         )
-        message = (
-            f"{self._role}: {name}({shown}) failed ({_named(exc)}); check the device: "
-            "power, cable, another program holding it"
+        text = _named(exc)
+        between = (
+            self._role == Role.objective_turret.value and _BETWEEN_POSITIONS in text
         )
+        hint = _TURRET_HINT if between else _DEVICE_HINT
+        message = f"{self._role}: {name}({shown}) failed ({text}); {hint}"
         # An adapter's bytes may not be UTF-8 (FM-05): one lone surrogate and
         # the message can be neither logged nor serialised.
         return message.encode("utf-8", "replace").decode("utf-8")

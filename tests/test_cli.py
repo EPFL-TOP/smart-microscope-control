@@ -1162,6 +1162,67 @@ def test_doctor_prints_the_translated_fault_it_read() -> None:
     assert "unexpected" not in result.output
 
 
+class _TurretBetweenPositionsCore:
+    """The demo core, except that the turret answers as the Ti2-E's did, unseated (#406)."""
+
+    def __init__(self, core: object) -> None:
+        self._core = core
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._core, name)
+
+    def getStateLabel(self, label: str) -> str:  # noqa: N802 - MMCore's name
+        if label == "Objective":
+            raise RuntimeError("Cannot get current position label")
+        return str(self._core.getStateLabel(label))  # type: ignore[attr-defined]
+
+
+@pytest.fixture
+def turret_between_positions(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The core raises, as on the stand: the translator is the layer under test.
+    real_open_core = microscope_mod.open_core
+
+    def wrapped(config: object = None, **kwargs: object) -> _TurretBetweenPositionsCore:
+        return _TurretBetweenPositionsCore(real_open_core(config, **kwargs))  # type: ignore[arg-type]
+
+    monkeypatch.setattr(microscope_mod, "open_core", wrapped)
+
+
+#: What the operator reads for a turret between positions, after ``✗ ``.
+_TURRET_BETWEEN_POSITIONS = (
+    "objective_turret: getStateLabel('Objective') failed (Cannot get current "
+    "position label); the turret is likely between two positions: seat an "
+    "objective from the stand (if it is seated, check the device: power, cable, "
+    "another program holding it). Seating it may finish an interrupted turn and "
+    "raise Z by itself to its height before that turn: check the clearance under "
+    "the objective, or take the plate off, first"
+)
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo", "turret_between_positions")
+def test_doctor_names_a_turret_between_positions() -> None:
+    result = runner.invoke(app, ["doctor", "-p", "demo"])
+
+    assert result.exit_code == 1, result.output
+    # Session 3 (#406): the 10x unseated read as "power, cable" in the doctor.
+    assert f"✗ objective: HardwareError: {_TURRET_BETWEEN_POSITIONS}" in " ".join(
+        result.output.split()
+    ), result.output
+
+
+@pytest.mark.demo
+@pytest.mark.usefixtures("demo", "turret_between_positions")
+def test_objective_get_names_a_turret_between_positions() -> None:
+    result = runner.invoke(app, ["objective", "get"])
+
+    assert result.exit_code == 1, result.output
+    assert f"✗ {_TURRET_BETWEEN_POSITIONS}" in " ".join(result.output.split()), (
+        result.output
+    )
+    assert "unexpected" not in result.output
+
+
 # --- doctor --config -------------------------------------------------------------
 
 

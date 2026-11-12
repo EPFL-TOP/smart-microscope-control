@@ -17,7 +17,14 @@ import pytest
 
 from smc.hardware import Microscope
 from smc.hardware.backends.mm import as_hardware_errors
-from smc.hardware.capabilities import Camera, Properties, Shutter, XYStage, ZStage
+from smc.hardware.capabilities import (
+    Camera,
+    ObjectiveTurret,
+    Properties,
+    Shutter,
+    XYStage,
+    ZStage,
+)
 from smc.hardware.errors import (
     HardwareError,
     MicroscopeHaltedError,
@@ -29,6 +36,18 @@ from smc.testing import FakeCore
 
 TAIL = "check the device: power, cable, another program holding it"
 
+#: What the Ti2-E's nosepiece answered with the 10x left unseated (session 3, #406).
+BETWEEN_POSITIONS = "Cannot get current position label"
+
+#: The hint for that answer; a literal, so that a change of the text is seen here.
+TURRET_HINT = (
+    "the turret is likely between two positions: seat an objective from the "
+    "stand (if it is seated, check the device: power, cable, another program "
+    "holding it). Seating it may finish an interrupted turn and raise Z by "
+    "itself to its height before that turn: check the clearance under the "
+    "objective, or take the plate off, first"
+)
+
 
 class _Core:
     """Stands for the core: every call raises what the test gave it."""
@@ -39,6 +58,9 @@ class _Core:
         self.error = error
 
     def getXPosition(self, label: str) -> float:  # noqa: N802 - MMCore's name
+        raise self.error
+
+    def getStateLabel(self, label: str) -> str:  # noqa: N802 - MMCore's name
         raise self.error
 
     def configure(self, *args: object, **kwargs: object) -> None:
@@ -239,6 +261,82 @@ def test_a_faulting_objective_turret_is_a_hardware_error_naming_the_role(
         "objective_turret: getStateLabel('Objective') failed ("
     )
     assert type(caught.value) is HardwareError
+
+
+# --- a turret left between positions (#406) ----------------------------------------
+
+
+def test_a_turret_between_positions_names_seating_it_and_the_z_rise() -> None:
+    # Session 3: "power, cable" sent the operator to the wrong place; the 10x was
+    # not seated, and seating it raised Z by 3171 µm by itself.
+    original = RuntimeError(BETWEEN_POSITIONS)
+    with pytest.raises(HardwareError) as caught:
+        _proxy(original, "objective_turret").getStateLabel("Nosepiece")
+    assert str(caught.value) == (
+        "objective_turret: getStateLabel('Nosepiece') failed "
+        f"({BETWEEN_POSITIONS}); {TURRET_HINT}"
+    )
+    assert caught.value.__cause__ is original
+
+
+def test_the_turret_hint_holds_for_any_call_and_a_wrapped_answer() -> None:
+    # The cause is the same whichever call reads the turret, and an adapter or a
+    # later pymmcore may wrap the answer in a prefix and an error code.
+    text = f'Error in device "Nosepiece": {BETWEEN_POSITIONS} (11)'
+    with pytest.raises(HardwareError) as caught:
+        _proxy(RuntimeError(text), "objective_turret").getXPosition("Nosepiece")
+    assert str(caught.value) == (
+        f"objective_turret: getXPosition('Nosepiece') failed ({text}); {TURRET_HINT}"
+    )
+
+
+def test_a_turret_answer_that_is_not_utf8_keeps_the_hint_and_can_be_encoded() -> None:
+    # FM-05: the turret's branch goes through the same sanitising as every fault.
+    with pytest.raises(HardwareError) as caught:
+        _proxy(
+            RuntimeError(f"{BETWEEN_POSITIONS} caf\udce9"), "objective_turret"
+        ).getStateLabel("Nosepiece")
+    message = str(caught.value)
+    message.encode("utf-8")
+    assert "caf?" in message
+    assert message.endswith(f"; {TURRET_HINT}")
+
+
+@pytest.mark.parametrize(
+    ("role", "text"),
+    [
+        ("objective_turret", "turret did not answer"),
+        ("xy_stage", BETWEEN_POSITIONS),
+        ("objective_turret", BETWEEN_POSITIONS.lower()),
+    ],
+    ids=["turret-other-fault", "other-role-same-text", "turret-other-case"],
+)
+def test_other_faults_keep_the_device_hint(role: str, text: str) -> None:
+    with pytest.raises(HardwareError) as caught:
+        _proxy(RuntimeError(text), role).getStateLabel("Nosepiece")
+    message = str(caught.value)
+    assert message.endswith(f"({text}); {TAIL}")
+    assert "between two positions" not in message
+
+
+def test_a_turret_between_positions_is_named_on_the_pixel_size_and_objective_reads(
+    fake_core: FakeCore, fake_microscope: Microscope
+) -> None:
+    # The doctor's pixel_size row reads the turret when the core has no pixel
+    # size (the Ti2-E), and its objective row and `smc objective` read it always.
+    fake_core.pixel_size_um = 0.0
+    fake_core.failing["Objective"] = RuntimeError(BETWEEN_POSITIONS)
+    reads: list[Callable[[], object]] = [
+        fake_microscope.require(Camera).pixel_size_um,
+        fake_microscope.require(ObjectiveTurret).current,
+    ]
+    for read in reads:
+        with pytest.raises(HardwareError) as caught:
+            read()
+        assert str(caught.value) == (
+            "objective_turret: getStateLabel('Objective') failed "
+            f"({BETWEEN_POSITIONS}); {TURRET_HINT}"
+        )
 
 
 def test_a_move_whose_command_faults_is_stopped(
