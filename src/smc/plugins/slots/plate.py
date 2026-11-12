@@ -9,6 +9,7 @@ else re-derives where a well is or whether a point is inside it.
 
 from __future__ import annotations
 
+import functools
 import math
 import re
 from collections.abc import Mapping
@@ -39,6 +40,7 @@ __all__ = [
     "WellFit",
     "WellGeometry",
     "WellRef",
+    "holder_estimate",
     "normalise_well",
     "refuse_image_side",
     "turned_well",
@@ -63,6 +65,75 @@ ORIENTATION_DEG: Mapping[str, float] = MappingProxyType(
 #: result beyond it says one thing in ``rotation_deg`` and another in
 #: ``orientation``, and is refused rather than read either way.
 _MAX_FROM_ORIENTATION_DEG = 90.0
+
+
+def _turned(offset: tuple[float, float], rotation_deg: float) -> tuple[float, float]:
+    """``offset`` turned by ``rotation_deg`` counter-clockwise, X right and Y up: as ``useq`` turns a plan about A1.
+
+    Measured on ``useq``: at 90° the 96-well's A12, (99 000, 0) µm from A1, lands at
+    (0, 99 000). The two orientations are 0° and 180°, whose cosine and sine are
+    exact once rounded: a turned estimate's A1 is then the holder's centre plus the
+    offset to the micrometre, and the page's geometry cache's key stays one value.
+    """
+    angle = math.radians(rotation_deg)
+    cos, sin = round(math.cos(angle), 12), round(math.sin(angle), 12)
+    x, y = offset
+    return (cos * x - sin * y, sin * x + cos * y)
+
+
+@functools.lru_cache(maxsize=8)
+def _grid_centre_offset(plate: str) -> tuple[float, float]:
+    """The centre of ``plate``'s grid of wells, as an offset from A1 (the mean of the wells' positions).
+
+    A holder's point is the centre of the grid and a plan is placed by A1, so the
+    estimate needs this offset: ``(49 500, -31 500)`` µm for 96 wells, whose 12 by 8
+    grid is not square, so a swapped axis or a sign shows (FM-73). Kept per plate:
+    the positions of 1536 wells cost 5 ms, small but paid by every refresh.
+
+    Raises:
+        ValueError: ``useq`` does not know the plate, or one of its wells has no
+            position.
+    """
+    plan = useq.WellPlatePlan(
+        plate=useq.WellPlate.from_str(plate), a1_center_xy=(0.0, 0.0)
+    )
+    xs: list[float] = []
+    ys: list[float] = []
+    for position in plan.all_well_positions:
+        # ``useq`` types a position's axes as optional; a well of a plate plan
+        # always has both, and a missing one must not skew the mean unseen.
+        if position.x is None or position.y is None:
+            raise ValueError(f"a well of the {plate} plate has no position in useq")
+        xs.append(position.x)
+        ys.append(position.y)
+    return (sum(xs) / len(xs), sum(ys) / len(ys))
+
+
+def holder_estimate(
+    plate: str,
+    centre_xy_um: tuple[float, float],
+    orientation: PlateOrientation,
+) -> useq.WellPlatePlan:
+    """The plate as the stand's holder puts it: the grid's centre on ``centre_xy_um`` (m3 §5.5 D2).
+
+    The one estimate before a registration, which the plate page draws and
+    ``goto-well`` drives to, so that the two never disagree. The plan's rotation is
+    ``ORIENTATION_DEG[orientation]`` and its A1 the holder's centre minus the grid's
+    centre offset from A1 turned by it (for ``turned-180``, plus the offset): the
+    grid's centre stays on the holder, and a turn renames the wells in place. It is
+    a place to draw and to drive to by eye, never a registration: it fills no slot.
+
+    Raises:
+        ValueError: ``useq`` does not know the plate (its own text passes), or a
+            well of it has no position.
+    """
+    rotation = ORIENTATION_DEG[orientation]
+    turned_x, turned_y = _turned(_grid_centre_offset(plate), rotation)
+    return useq.WellPlatePlan(
+        plate=useq.WellPlate.from_str(plate),
+        a1_center_xy=(centre_xy_um[0] - turned_x, centre_xy_um[1] - turned_y),
+        rotation=rotation,
+    )
 
 
 def turned_well(plate: str, well: str) -> str:

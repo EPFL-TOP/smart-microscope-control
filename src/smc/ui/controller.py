@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import queue
 import threading
 import time
@@ -97,6 +96,7 @@ from smc.plugins.slots import (
     WallTouch,
     WellGeometry,
     WellRef,
+    holder_estimate,
     normalise_well,
     well_geometry,
 )
@@ -298,20 +298,6 @@ def _needs_plate(plugin: str) -> bool:
     (``plate-walls``, #346) is gated by naming ``plate`` there, with no further code.
     """
     return "plate" in PAGE_PARAMS.get(plugin, ())
-
-
-def _turned(offset: tuple[float, float], rotation_deg: float) -> tuple[float, float]:
-    """``offset`` turned by ``rotation_deg`` counter-clockwise, X right and Y up: as ``useq`` turns a plan about A1.
-
-    Measured on ``useq``: at 90° the 96-well's A12, (99 000, 0) µm from A1, lands at
-    (0, 99 000). The two orientations are 0° and 180°, whose cosine and sine are
-    exact once rounded: a turned estimate's A1 is then the holder's centre plus the
-    offset to the micrometre, and the geometry cache's key stays one value.
-    """
-    angle = math.radians(rotation_deg)
-    cos, sin = round(math.cos(angle), 12), round(math.sin(angle), 12)
-    x, y = offset
-    return (cos * x - sin * y, sin * x + cos * y)
 
 
 def _turned_name(plate: str, well: str) -> str:
@@ -1083,8 +1069,6 @@ class PlatePage:
             tuple[str, tuple[float, float], float], tuple[WellGeometry, ...]
         ] = {}
         self._names: dict[str, frozenset[str]] = {}
-        # Per plate: where the centre of its grid of wells lies from A1 (m5 §15 D3).
-        self._grid_offsets: dict[str, tuple[float, float]] = {}
         # What a worker and a status poll both write, under ``_lock``; never held
         # across a device call, and ``stop()`` never takes it (FM-70).
         self._lock = threading.Lock()
@@ -3668,13 +3652,12 @@ class PlatePage:
         The first of these that holds wins: the registered plate when it is the page's
         plate (a ``seed`` is drawn as one, its rotation taken from its declared
         orientation); else the plate *estimated* from the profile's ``[holder]``, turned
-        by the declared orientation about the holder's centre: rotation
-        ``ORIENTATION_DEG[orientation]`` and A1 at the holder's centre minus the grid's
-        centre offset from A1 turned by it (for ``turned-180``, plus the offset), so the
-        grid's centre stays on the holder and a switch renames the wells in place; else
-        the plate *unplaced*, A1 at the stage's origin, not turned. An estimate is a place
-        to draw, never a registration: the run document is not read for it and ``click``
-        still drives only a registered plate.
+        by the declared orientation about the holder's centre (``holder_estimate``, the
+        one ``goto-well`` drives to, m3 §5.5 D2), so the grid's centre stays on the
+        holder and a switch renames the wells in place; else the plate *unplaced*, A1 at
+        the stage's origin, not turned. An estimate is never a registration: the run
+        document is not read for it, it fills no slot, and only a deliberate drive
+        (``goto``) acts on it.
 
         Built once per ``(plate, a1_center_xy_um, rotation_deg)`` and kept: 1536
         wells cost 339 ms, which a click or a refresh must not pay again. The estimate's
@@ -3702,9 +3685,10 @@ class PlatePage:
                 a1, rotation = (0.0, 0.0), 0.0
                 pose = MapPose("unplaced", orientation=orientation)
             else:
+                # The one estimate the drive goes to as well (m3 §5.5 D2).
+                estimate = holder_estimate(self._plate, centre, orientation)
+                a1 = estimate.a1_center_xy
                 rotation = ORIENTATION_DEG[orientation]
-                turned_x, turned_y = _turned(self._grid_centre_offset(), rotation)
-                a1 = (centre[0] - turned_x, centre[1] - turned_y)
                 pose = MapPose(
                     "estimated",
                     holder_centre_um=centre,
@@ -3731,34 +3715,6 @@ class PlatePage:
                 self._geometry.clear()
             self._geometry[key] = found
         return found, pose
-
-    def _grid_centre_offset(self) -> tuple[float, float]:
-        """The centre of the page plate's grid of wells, as an offset from A1 (the mean of the wells' positions).
-
-        A holder's point is the centre of the grid and the map is placed by A1, so the
-        estimate needs this offset: ``(49 500, -31 500)`` µm for 96 wells, whose 12 by 8
-        grid is not square, so a swapped axis or a sign shows (FM-73). Kept per plate: the
-        positions of 1536 wells cost 5 ms, small but paid by every refresh.
-        """
-        found = self._grid_offsets.get(self._plate)
-        if found is None:
-            plan = useq.WellPlatePlan(
-                plate=useq.WellPlate.from_str(self._plate), a1_center_xy=(0.0, 0.0)
-            )
-            xs: list[float] = []
-            ys: list[float] = []
-            for position in plan.all_well_positions:
-                # ``useq`` types a position's axes as optional; a well of a plate plan
-                # always has both, and a missing one must not skew the mean unseen.
-                if position.x is None or position.y is None:
-                    raise ValueError(
-                        f"a well of the {self._plate} plate has no position in useq"
-                    )
-                xs.append(position.x)
-                ys.append(position.y)
-            found = (sum(xs) / len(xs), sum(ys) / len(ys))
-            self._grid_offsets[self._plate] = found
-        return found
 
     def _plate_names(self) -> frozenset[str]:
         found = self._names.get(self._plate)
