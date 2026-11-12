@@ -8,7 +8,8 @@
   the lab's own plate definitions, §22, for issue #400 (2026-11-10); a
   plan's calibration from another run document, §23, for issue #383
   (2026-11-10); the plate's orientation in its holder, §24, for issues #434
-  and #422 (2026-11-11).
+  and #422 (2026-11-11); a run's frames for whoever runs it, §25, for issue
+  #447 (2026-11-11).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 and M2, this document is the contract between issues
   that are built in parallel. Names, module paths and signatures below are
@@ -211,6 +212,13 @@ class RunContext:
     def progress(
         self, done: int, total: int | None = None, message: str = ""
     ) -> None: ...
+    def show_frame(
+        self,
+        image: npt.NDArray[Any],
+        *,
+        xy_um: tuple[float, float] | None = None,
+        label: str = "",
+    ) -> None: ...  # §25, #447
     def should_stop(self) -> bool: ...
     def raise_if_stopped(self) -> None: ...
     def wait_s(self, seconds: float) -> None: ...
@@ -240,6 +248,9 @@ with a run document under `tmp_path`, never by building a context.
   `on_progress`. Not validated (a cosmetic bug must not end a scan). A
   callback that raises an `Exception` is logged once at WARNING and not
   called again in this run; the run goes on. `KeyboardInterrupt` passes.
+- **`show_frame`** hands a frame the plugin has taken to the runner's
+  `on_frame`, for a page to show; nothing when there is none (`smc run`).
+  Never copied, never validated, never fatal, like `progress` (§25).
 - **`should_stop`** is true once the runner's `stop` event is set (a UI's
   Stop, a test). The CLI has no stop event: Ctrl-C is the
   `KeyboardInterrupt` that the Executor already turns into a stop (M1 §9).
@@ -557,6 +568,7 @@ def run_plugin(
     on_progress: Callable[[Progress], None] | None = None,
     stop: threading.Event | None = None,
     plugin_version: str | None = None,
+    on_frame: Callable[[ShownFrame], None] | None = None,  # §25, #447
 ) -> StageRecord: ...
 ```
 
@@ -2446,7 +2458,8 @@ scan); `z_um` from `ZStage.position_um()`, `pfs_offset` from
 `offset_native()` when used; `frame = camera.snap()`; the frame is written
 with `write_atomically` as a TIFF in its own dtype, as `smc snap` writes
 it (`tifffile` into a `BytesIO`, with the `ScanFrame` as JSON metadata),
-to `scan/<token>/<well>/<name>.tif`; `ctx.progress(done, total,
+to `scan/<token>/<well>/<name>.tif`; *added by #447 (§25)*: `ctx.show_frame(
+pixels, xy_um=<the readback>, label="<name>")`; `ctx.progress(done, total,
 "<name>")`.
 
 **Errors on a field**: `MicroscopeHaltedError` and `MotionStoppedError`
@@ -7772,3 +7785,196 @@ leaves its own record out).
   by eye against the printed label; then the same with the plate not turned.
 - That the plate holder takes the plate either way round (#414 option 1 was
   inferred, not tried).
+
+## 25. A run's frames for whoever runs it (#447)
+
+Asked by #431 ("the run: progress, STOP, the frames arriving"), left out of m5
+§17.4.4. During a scan started from the plate page, the page's image shows the
+fields as the scan takes them. Until now a plugin handed its runner nothing but
+`Progress` (§1.4), so the frames reached only the disk. This section adds one
+optional `RunContext` method and one optional `run_plugin` argument (additive,
+§0), the scan's call, and what the page does with it (m5 §17.4.4).
+
+### 25.1 What was measured (2026-11-11, planning #447)
+
+On `demo-sample` (macOS, py3.13, pymmcore-plus 0.18.1, numpy 2.5.3), the chain
+of `ui_snap`'s `CHAIN` (two-corner registration, `wells=B2,B11`,
+`coverage=0.4`), `scan` through `run_plugin`:
+
+- **The scan**: 72 frames of 512 x 512 `uint16` in 17.53, 17.63, 17.69 and
+  17.70 s over four runs (about 245 ms a field; the spread is 0.5 %).
+- **The channel prototyped** (a one-slot holder whose `put` the scan called
+  after each written frame, and a thread standing for the page that took the
+  holder's frame every 100 ms, copied it, read its minimum and maximum and ran
+  `display_image`): 17.68 and 17.63 s, against 17.70 and 17.71 s without it in
+  the same session. 72 frames handed, 47 and 46 drawn: fields that come faster
+  than the page's 100 ms are replaced before they are drawn, by design.
+- **What a frame costs** on this machine: the holder's `put` 0.1 µs; a copy
+  0.05 ms at 1412 x 1412 and 0.11 ms at 2048 x 2048; its minimum and maximum
+  0.07 and 0.16 ms. The stand PC is slower; the order of magnitude is what
+  counts against a field of hundreds of milliseconds.
+- **`Camera.snap()` on the MM backend** returns an array that owns its buffer
+  (`owndata`, no `base`), and a second snap does not change the first: what
+  the scan holds is its own, so handing it over needs no copy.
+- **The alternative, the page reading the scan folder's newest TIFF**: finding
+  the newest of 3,456 files (a 96-well plate of 36 fields) took 14.0 ms per
+  look (median of 10, `rglob` and `stat`), on a Mac's SSD, and grows with the
+  plate; reading a 512 x 512 TIFF 0.4 ms more. Ten looks a second on the
+  server's loop, and a page that must know the scan's folder layout and its
+  token, for one plugin. **Not chosen.**
+
+### 25.2 Decisions
+
+- **D1 A callback, as `progress` is.** `run_plugin(..., on_frame=)` and
+  `RunContext.show_frame(image, *, xy_um=None, label="")`. With no `on_frame`
+  (`smc run`, a test, a script), `show_frame` returns before it builds anything:
+  the scan pays one attribute read per field.
+- **D2 Handed over, never copied by the layer.** `show_frame` passes the
+  plugin's array itself. The plugin hands over an array it no longer writes to
+  (the scan's `pixels` is never written after the snap); whoever keeps it
+  copies it when, and only if, it shows it.
+- **D3 Never validated, never fatal.** A callback that raises an `Exception` is
+  logged once at WARNING, by its text (FM-98), and not called again in that
+  run; the run goes on. `KeyboardInterrupt` passes (FM-71). A frame of a shape
+  or dtype the page cannot show is the page's to drop (§25.5).
+- **D4 The newest wins.** The page keeps one frame: the latest handed. A field
+  the page has not drawn when the next one arrives is never drawn. The run's
+  last frame is always kept.
+- **D5 Only the frames the plugin records.** The scan shows the frame it has
+  just written, after the write, never a cell-focus sweep's planes (§21.4) nor
+  a failed field's; a dry run takes no frame and shows none.
+- **D6 Only the scan, here.** `plate-walls`, `plate-finding`,
+  `camera-calibration` and `cell-focus` take frames too and may call
+  `show_frame` later, each in an issue of its own; nothing here changes them.
+- **D7 The page's cross is unchanged.** The tick already draws it from the
+  stand's position once a second during a run (m5 §15 D1); the frame tick
+  moves it only during Live, as before.
+
+### 25.3 The interface — `smc/plugins/api.py`, `smc/plugins/runner.py`
+
+```python
+@dataclass(frozen=True, slots=True)
+class ShownFrame:
+    """A frame a plugin has taken, handed to whoever runs it (m3 §25)."""
+
+    plugin: str
+    image: npt.NDArray[Any]
+    xy_um: tuple[float, float] | None
+    label: str
+    taken_utc: datetime
+```
+
+`ShownFrame` is exported from `smc.plugins.api` beside `Progress`.
+`RunContext.__init__` gains the keyword `on_frame: Callable[[ShownFrame], None]
+| None = None` (a default, so a test that builds a context is unchanged), and
+`run_plugin` gains `on_frame: Callable[[ShownFrame], None] | None = None`, which
+it passes to the context and nowhere else.
+
+`show_frame(image, *, xy_um=None, label="")`:
+
+1. No callback (never given, or dropped after a failure): return.
+2. `ShownFrame(self.plugin, image, xy_um, label, datetime.now(timezone.utc))`,
+   handed to the callback. Not validated: no shape, dtype or finiteness check,
+   no `np.asarray`.
+3. An `Exception` from the callback: the callback is dropped for the rest of
+   the run and one WARNING is logged on the context's logger, `the frame
+   callback failed (<Type>: <message>); frames are not shown any more in this
+   run`, built from the text (FM-98). `KeyboardInterrupt` passes.
+
+The context holds the callback and nothing else of its caller: the page passes
+a bound method of a small holder (§25.5), never of `PlatePage`, which holds the
+stand (FM-92).
+
+### 25.4 The scan — `smc/plugins/scan/plugin.py`
+
+In the per-field loop (§8), after `frames.append(_write_frame(...))` and before
+`walked_ok += 1` and `ctx.progress(done, total, planned.name)`:
+
+```python
+ctx.show_frame(pixels, xy_um=(readback.x_um, readback.y_um), label=planned.name)
+```
+
+`pixels` is the snap's own array (the one written), the position is the
+readback the frame's record holds (not the target), and the label is the
+field's name. Nothing else in the scan changes: not its result, its checkpoint,
+its order of reads, its error handling.
+
+### 25.5 The page — `smc/ui/controller.py`, `smc/ui/frames.py`
+
+- **`_LatestShown`** (new, private, in `controller.py`): `__slots__`, its own
+  `threading.Lock`, one slot.
+  - `put(shown: ShownFrame) -> None`, called on the worker by the plugin: a
+    frame that is 2-D with an unsigned dtype of at most 2 bytes (the test of
+    `_take_frame`) replaces the slot; any other is dropped, and the first one
+    dropped since the last `clear()` is logged once at WARNING: `<plugin> handed
+    a <dtype> frame of shape <shape>; the page shows 2-D uint8 or uint16
+    frames`. Nothing else is logged, nothing copied (FM-62, FM-178).
+  - `take() -> ShownFrame | None`: the slot's frame, and the slot emptied.
+  - `clear() -> None`: the slot emptied and the warning re-armed.
+- `PlatePage._setup` builds `self._shown = _LatestShown()`; `_run_plugin`
+  passes `on_frame=self._shown.put` to `run_plugin`.
+- **`PlatePage.frame()`**, under `_lock`: `shown = self._shown.take()`; when it
+  is a frame, `self._frame` becomes the `Frame` of it, numbered after the
+  current one; then `self._frame` is returned as before. The `Frame` of a
+  `ShownFrame`: `image` a copy made read-only (`np.array`, then
+  `flags.writeable = False`, as `_take_frame` keeps a snap); `bit_depth=0`
+  (not read: `display_image` then stretches against the dtype's range for a flat
+  frame, its documented fallback); `exposure_ms=None` (not read);
+  `pixel_size_um=0.0` (unknown, the page's convention); `xy_um` and `taken_utc`
+  from the `ShownFrame`; `summary` `<plugin> <label>: <h>x<w> <dtype>, min <a>,
+  max <b>`, or `<plugin>: <h>x<w> …` when the label is empty. The copy is made
+  on the first session's tick that finds the frame, never on the scan's thread,
+  and only for the frames that are drawn; every other session reads the same
+  `Frame` (FM-151).
+- **The run's end**: `_work`'s `finally`, under `_lock` and before `_ended` is
+  counted, turns a frame left in the slot into `self._frame` the same way, so
+  the run's last frame is kept although no tab was open.
+- **A new activity**: `_start_activity`, under `_lock`, where it empties the
+  progress queue, calls `self._shown.clear()`, so a frame from a run can never
+  replace a later snap's.
+- `Frame.exposure_ms` becomes `float | None` (`None`: not read, a plugin's
+  frame); its docstring says so, and that `bit_depth` is `0` when not read.
+- `plate_page.py` is not changed: the frame tick draws `frame()` when its
+  number changes (FM-145), whatever took it.
+
+### 25.6 Tests
+
+- `tests/unit/test_plugin_runner.py`: a stub `Showing` that calls
+  `ctx.show_frame` three times;
+  `test_a_shown_frame_reaches_the_callback_as_the_same_array` (the `ShownFrame`'s
+  `image is` the stub's array, its plugin, position, label, and a UTC
+  `taken_utc`), `test_show_frame_without_a_callback_does_nothing`,
+  `test_a_failing_frame_callback_is_dropped_and_the_run_goes_on` (called once,
+  the WARNING's exact text, the record `done`),
+  `test_a_keyboard_interrupt_in_the_frame_callback_passes_through` (re-raised,
+  the record `stopped`).
+- `tests/test_scan_demo.py`: `test_every_written_frame_is_shown_once_with_its_readback_and_name`
+  (`on_frame=seen.append`: one per frame of the result, in order, `label` the
+  frame's name, `xy_um` its `x_um, y_um`, the pixels equal to its TIFF's),
+  `test_a_dry_run_shows_no_frame`, `test_a_failed_field_shows_no_frame`.
+- `tests/unit/test_plate_page_run_frames.py` (new; its own stub plugin, which
+  hands frames and waits on an event between them):
+  `test_a_runs_frame_becomes_the_pages_frame_with_the_next_number`,
+  `test_the_newest_of_several_handed_frames_is_the_one_kept`,
+  `test_the_runs_last_frame_is_kept_when_no_session_read_it`,
+  `test_a_snap_after_a_run_is_not_replaced_by_the_runs_frame`,
+  `test_the_kept_frame_is_a_read_only_copy` (the stub writes into its array
+  after `frame()`: the `Frame` is unchanged),
+  `test_a_frame_the_page_cannot_show_is_dropped_and_logged_once`,
+  `test_the_frame_callback_is_not_a_method_of_the_page` (FM-92: what
+  `run_plugin` receives as `on_frame` is bound to a `_LatestShown`).
+
+### 25.7 The bound (#447's acceptance)
+
+On `demo-sample` without `--dry-run`, the chain of §25.1, three runs each, in one
+session: `scan` through `run_plugin` with no `on_frame`, and `scan` through
+`PlatePage.run` with a thread that calls `frame()` and `display_image` every
+100 ms. **The page's median duration is at most 2 % above the direct one's**
+(the noise measured is 0.5 %); the thread draws at least 30 distinct frames per
+run, and after the run the page's frame is the scan's last field's. The develop
+session's Report gives the six durations and the counts.
+
+### 25.8 Not verified (for the owner)
+
+- The image following a scan at the Ti2-E (Prime 95B frames, the stand PC's
+  speed, over RDP), and a scan's duration there with the page open.

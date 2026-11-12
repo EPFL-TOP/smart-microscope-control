@@ -4372,9 +4372,9 @@ Run.
   fields as imaged (the plan's fields are in visiting order, §14.1).
 - Result line: `Scanned: <frames> frames, <failed> failed` and the folder.
 - Continue: *Continue to Results*.
-- **The frames as they arrive** on the image are not here: a plugin has no channel to
-  hand the page its frames (`smc.plugins.api` has `Progress` only). That is a change of
-  the plugin interface (m3), its own issue.
+- **The frames as they arrive** on the image: m3 §25 (#447). The scan hands each
+  frame it has written to the page through `RunContext.show_frame`; the image shows the
+  newest at the frame tick, and the screen draws nothing of its own for it.
 
 **17.4.5 Results** (`"results"`)
 - Title: *Results*. Lead: *Each step reads the one before. Run the next one, or all
@@ -4513,7 +4513,8 @@ Every build issue edits `plate_page.py` and, from B2 on, `controller.py` and
 - **B4, the Results screen** (#446): §17.4.5, `PlatePage.run_chain`, the colour bar's
   title.
 - **The scan's frames on the image** (#447): a channel from a plugin to the page for
-  its frames, designed in m3 first.
+  its frames, m3 §25. It edits `controller.py` and not `plate_page.py`, and runs
+  apart from B2 to B4 all the same.
 - **The walks** (#431's last criterion, the owner): on `demo-sample` after B4; then a
   lab member at the Ti2-E: a plate registered and two wells scanned with no document
   open.
