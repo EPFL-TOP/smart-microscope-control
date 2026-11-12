@@ -2181,3 +2181,35 @@ def test_plain_default_drops_one_pair_of_quotes_only() -> None:
     assert plain_default("1.0") == "1.0"
     assert plain_default("") == ""
     assert plain_default("None") == "None"
+    # A default whose first and last characters are the same and are not a quote: four
+    # real tools have one (`'0.0'` as a repr), and a check that tested only "same ends" would
+    # strip a `.` from each.
+    for default in ("0.0", "1e1", "1x1", "-5-", "11"):
+        assert plain_default(default) == default
+    assert plain_default("''") == ""
+
+
+def test_an_empty_field_is_the_default_before_it_is_the_presets() -> None:
+    # The order of the lines: a field that is empty says the tool's default even when the
+    # preset's value for it is empty too (a preset that clears a field), and never `from the
+    # preset`.
+    assert field_source_line(
+        value="", default="1.0", preset="weekly", preset_value="", suggested=""
+    ) == ("the tool's default: 1.0")
+    assert field_source_line(
+        value="", default="'off'", preset=None, preset_value=None, suggested=""
+    ) == ("the tool's default: off")
+
+
+def test_a_well_name_with_absurd_digits_is_sorted_last_and_never_raises() -> None:
+    # FM-125: a name from a record, as it comes. Python refuses `int()` of more than 4300
+    # digits, and the texts are drawn by the tick before the strip is: one such name would
+    # stop the strip, the problems line and the buttons every second.
+    huge = "A" + "9" * 5000
+    assert wells_text([huge, "B2"]) == f"B2 and {huge}"
+    assert wells_text([huge]) == huge
+    assert scan_title([huge], []) == f"Scan {huge}"
+    assert scan_title([], [huge, "A1"]) == f"Scan A1 and {huge}"
+    assert plan_selection_note([huge], ["A1"]).startswith(
+        f"The fields laid out are for {huge}; "
+    )

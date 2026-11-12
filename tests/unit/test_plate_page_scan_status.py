@@ -10,6 +10,7 @@ visiting order and not in alphabetical order (FM-204), and read ``view()``.
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from collections.abc import Iterator, Sequence
@@ -39,6 +40,7 @@ from smc.plugins.slots import (
 from smc.run import ReadRecord, StageRecord, StageStatus, write_stage
 from smc.testing import FakeCore
 from smc.ui.controller import PlatePage, RunClock, ScanSummary
+from smc.ui.guide import scan_progress_lines
 
 pytestmark = pytest.mark.filterwarnings(
     "error::DeprecationWarning", "error::PendingDeprecationWarning"
@@ -263,6 +265,77 @@ def test_a_tick_that_drains_the_queue_leaves_the_clock_as_the_worker_made_it(
         assert Reporting.reported[1].wait(BOUND_S)
         later = page.status()
         assert later.clock == RunClock(elapsed_s=9.0, first=(3.0, 1), last=(9.0, 2))
+        Reporting.gates[2].set()
+        _worker(page).join(BOUND_S)
+        assert not _worker(page).is_alive()
+    assert page.join(BOUND_S)
+
+
+class CoarseClock(Clock):
+    """A clock that ticks every 15.625 ms, as ``time.monotonic()`` does on Windows below Python 3.13 (FM-197)."""
+
+    TICK_S = 0.015625
+
+    def namespace(self) -> SimpleNamespace:
+        return SimpleNamespace(
+            monotonic=lambda: math.floor(self.now / self.TICK_S) * self.TICK_S,
+            sleep=time.sleep,
+        )
+
+
+def test_two_reports_in_one_clock_tick_leave_the_time_unknown_and_never_divide_by_zero(
+    page: PlatePage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 100.0 is a multiple of the tick, so the start reads exactly 100.0; the two reports come 8
+    # ms apart inside one tick and carry the same stamp. The controller keeps both, and *Left*
+    # says it is not known rather than dividing by a pace of zero.
+    clock = CoarseClock(100.0)
+    with monkeypatch.context() as patch:
+        patch.setattr(controller_module, "time", clock.namespace())
+        page.run("reporting", [])
+        clock.now = 100.001
+        Reporting.gates[0].set()
+        assert Reporting.reported[0].wait(BOUND_S)
+        clock.now = 100.009
+        Reporting.gates[1].set()
+        assert Reporting.reported[1].wait(BOUND_S)
+        status = page.status()
+        assert status.clock == RunClock(elapsed_s=0.0, first=(0.0, 1), last=(0.0, 2))
+        assert status.clock is not None
+        assert scan_progress_lines(2, 3, status.clock, running=True) == (
+            "Field 2 of 3",
+            "Elapsed 0 s",
+            "Left: not known yet (it needs two fields)",
+        )
+        Reporting.gates[2].set()
+        _worker(page).join(BOUND_S)
+        assert not _worker(page).is_alive()
+    assert page.join(BOUND_S)
+
+
+def test_two_reports_in_two_clock_ticks_give_a_finite_time_that_is_never_negative(
+    page: PlatePage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = CoarseClock(100.0)
+    with monkeypatch.context() as patch:
+        patch.setattr(controller_module, "time", clock.namespace())
+        page.run("reporting", [])
+        clock.now = 100.001
+        Reporting.gates[0].set()
+        assert Reporting.reported[0].wait(BOUND_S)
+        # 0.2 s later: twelve ticks on, and the clock reads 100.1875.
+        clock.now = 100.2
+        Reporting.gates[1].set()
+        assert Reporting.reported[1].wait(BOUND_S)
+        status = page.status()
+        assert status.clock == RunClock(
+            elapsed_s=0.1875, first=(0.0, 1), last=(0.1875, 2)
+        )
+        assert status.clock is not None
+        # One field left at 0.1875 s a field: under half a second, said as 0 s, and said.
+        assert scan_progress_lines(2, 3, status.clock, running=True)[-1] == (
+            "Left about 0 s (estimated from the fields so far)"
+        )
         Reporting.gates[2].set()
         _worker(page).join(BOUND_S)
         assert not _worker(page).is_alive()

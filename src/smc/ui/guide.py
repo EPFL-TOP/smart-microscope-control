@@ -1146,8 +1146,12 @@ REGISTER_FIRST = "register the plate first: step 2, Plate"
 #: foreign or missing plan is not what the scan would do.
 LAY_OUT_FIRST = "lay out the fields first: step 3, Wells"
 
-#: One well name as a plate prints it: the row's letters, then the column's number.
-_WELL_NAME = re.compile(r"([A-Za-z]+)(\d+)")
+#: One well name as a plate prints it: the row's letters, then the column's number. Bounded:
+#: a plate has rows of one or two letters and columns of one or two digits, and a name taken
+#: from a record as it comes (FM-125) may hold five thousand digits, which ``int()`` refuses
+#: (Python's limit is 4300): the page's texts are drawn before its strip, so one such name
+#: would stop the strip, the problems line and the buttons at every tick.
+_WELL_NAME = re.compile(r"([A-Za-z]{1,6})(\d{1,6})")
 
 
 def _plate_order(name: str) -> tuple[int, int, str, int, str]:

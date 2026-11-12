@@ -3170,9 +3170,12 @@ class PlatePageView:
 
         The scan visits the plan's fields in the plan's order (measured: the reports' names
         are the plan's), so the first ``done`` are the ones with a frame, a failed field
-        counted as visited. Nothing is drawn before the first report: the record of an earlier
-        scan, drawn by the last redraw, is cleared here. A ``done`` below what was drawn is a
-        new run and is drawn from its start. It reads the status and the last view only
+        counted as visited (the end of the run redraws from the record, which holds the frames
+        that were taken). A **dry run** takes none, whatever the progress says, and the page
+        says so (the note, the result line): nothing is drawn while one runs, as the record
+        draws none after it. Nothing is drawn before the first report either: the record of an
+        earlier scan, drawn by the last redraw, is cleared here. A ``done`` below what was drawn
+        is a new run and is drawn from its start. It reads the status and the last view only
         (FM-145); with no scan running ``refresh()`` draws the record, and the end of the run
         calls it.
         """
@@ -3184,7 +3187,7 @@ class PlatePageView:
         progress = status.progress
         done = (
             min(max(progress.done, 0), len(fields))
-            if progress is not None and progress.plugin == "scan"
+            if progress is not None and progress.plugin == "scan" and not status.dry_run
             else 0
         )
         if done == self._imaged_drawn or plan is None:

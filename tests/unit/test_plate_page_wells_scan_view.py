@@ -15,6 +15,7 @@ inside ``monkeypatch.context()``), so that *Left* is asserted as text and not as
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import shlex
 import threading
@@ -33,11 +34,13 @@ if os.environ.get("SMC_REQUIRE_UI"):
 else:
     pn = pytest.importorskip("panel")
 
+from bokeh.models import Line, Rect
+
 import smc.ui.controller as controller_module
 import smc.ui.plate_page as plate_page
 from smc.hardware import Microscope
 from smc.hardware.profile import Profile
-from smc.plugins.api import PluginParams, PluginResult, RunContext
+from smc.plugins.api import PluginParams, PluginResult, Progress, RunContext
 from smc.plugins.registry import GROUP
 from smc.plugins.scan_plan.algorithm import plan_fields
 from smc.plugins.slots import (
@@ -320,9 +323,15 @@ def _scan_plan_result(
     )
 
 
-def _scan_result(plan: ScanPlanResult, *, failed: tuple[str, ...] = ()) -> ScanResult:
-    """The scan of ``plan``: a frame for each field but the ``failed`` ones."""
+def _scan_result(
+    plan: ScanPlanResult,
+    *,
+    failed: tuple[str, ...] = (),
+    assumed: tuple[str, ...] = (),
+) -> ScanResult:
+    """The scan of ``plan``: a frame for each field but the ``failed`` ones, resting on ``assumed``."""
     return ScanResult(
+        assumed=assumed,
         folder="scan",
         objective=plan.objective,
         pixel_size_um=1.0,
@@ -414,12 +423,13 @@ def _seed_scan(
     plan: ScanPlanResult,
     *,
     failed: tuple[str, ...] = (),
+    assumed: tuple[str, ...] = (),
     minute: int = 2,
 ) -> None:
     _seed(
         run_doc,
         "scan",
-        _scan_result(plan, failed=failed),
+        _scan_result(plan, failed=failed, assumed=assumed),
         minute=minute,
         reads={"scan-plan": ReadRecord(plugin="scan-plan", attempt="a1")},
     )
@@ -713,16 +723,23 @@ def test_a_disabled_lay_out_or_start_is_refused_by_the_controller(
     assert StubScan.ran == 0
     assert not run_doc.exists()
 
-    # A run going: both are refused by the controller as for every Run.
+    # A run going: both are refused by the controller as for every Run. Every other wait is
+    # clear first (the plate chosen and registered, wells selected, a plan laid out), so that
+    # the buttons are disabled by the run and by nothing else.
     _seed_plate(run_doc)
     plan = _seed_plan(run_doc)
+    connected.choose_plate("96-well")
     view.refresh()
+    assert (view.layout_button.disabled, view.layout_wait.object) == (False, "")
+    assert (view.scan_button.disabled, view.scan_wait_text.object) == (False, "")
     before = run_doc.read_bytes()
     connected.run("slow", [])
     assert Slow.started.wait(BOUND_S)
     view.tick()
     assert view.layout_button.disabled is True
     assert view.scan_button.disabled is True
+    assert view.layout_wait.object == busy_note("slow", live=False)
+    assert view.scan_wait_text.object == busy_note("slow", live=False)
     _click(view.scan_button)
     assert view.message.object == "slow is running"
     _click(view.layout_button)
@@ -1098,10 +1115,13 @@ def test_the_map_marks_the_first_done_fields_while_the_scan_runs_and_the_record_
         StubScan.release.set()
         _worker(page).join(BOUND_S)
         assert not _worker(page).is_alive()
-        # The end of the run redraws the record: every field has a frame.
+        # The end of the run redraws the record: every field has a frame, and each is the
+        # field of view wide and high (a rectangle of no size is a layer nobody sees).
         view.tick()
         data = view.imaged_source.data
         assert list(zip(data["x"], data["y"], strict=True)) == centres
+        assert data["w"] == [512.0] * 12
+        assert data["h"] == [512.0] * 12
     assert page.join(BOUND_S)
 
 
@@ -1219,23 +1239,29 @@ def test_the_result_line_follows_the_run_document_not_the_progress(
     _seed_plate(run_doc)
     plan = _seed_plan(run_doc)
     failed = plan.fields[5].name
-    _seed_scan(run_doc, plan, failed=(failed,))
+    assumption = "the autofocus was left as it was: it is off on this stand"
+    _seed_scan(run_doc, plan, failed=(failed,), assumed=(assumption,))
     # A page started after the scan, as after a restart: no progress and no clock, and the
-    # result is there all the same, with the card's folder.
+    # result is there all the same, with the card's `assumed` lines and its folder (the scan's
+    # own section, which carried them, is the expert view's: FM-226).
     page = make_page()
     view = PlatePageView(page)
     view.show_step("scan")
     assert page.status().progress is None
     assert view.scan_progress.visible is False
     lines = view.scanned_block.object.split("\n")
-    assert lines[0] == "Scanned: 11 frames, 1 failed"
-    assert [line for line in lines[1:] if line.startswith("folder: ")] == [
-        f"folder: {run_doc.parent / 'scan'}"
+    assert lines == [
+        "Scanned: 11 frames, 1 failed",
+        f"assumed: {assumption}",
+        f"folder: {run_doc.parent / 'scan'}",
     ]
     assert view.scanned_block.visible is True
-    # The frame that failed is not marked imaged; the others are, in the plan's order.
+    # The frame that failed is not marked imaged; the others are, in the plan's order, each
+    # the field of view wide and high.
     data = view.imaged_source.data
     assert len(data["x"]) == 11
+    assert data["w"] == [512.0] * 11
+    assert data["h"] == [512.0] * 11
     assert (plan.fields[5].x_um, plan.fields[5].y_um) not in list(
         zip(data["x"], data["y"], strict=True)
     )
@@ -1248,18 +1274,21 @@ def test_a_dry_runs_result_line_says_no_frame_was_taken(
     view = PlatePageView(dry)
     _seed_plate(run_doc, dry_run=True)
     plan = _seed_plan(run_doc, dry_run=True)
+    walked = "dry run: 12 fields walked, no frame taken"
     _seed(
         run_doc,
         "scan",
-        _scan_result(plan, failed=()).model_copy(update={"frames": ()}),
+        _scan_result(plan, assumed=(walked,)).model_copy(update={"frames": ()}),
         minute=2,
         dry_run=True,
         reads={"scan-plan": ReadRecord(plugin="scan-plan", attempt="a1")},
     )
     view.refresh()
-    assert view.scanned_block.object.split("\n")[0] == (
-        "Scanned in a dry run: no frame was taken"
-    )
+    # The result line, then what the run assumed (it says what it left out), then the folder.
+    assert view.scanned_block.object.split("\n")[:2] == [
+        "Scanned in a dry run: no frame was taken",
+        f"assumed: {walked}",
+    ]
     assert view.imaged_source.data["x"] == []
 
 
@@ -1378,6 +1407,185 @@ def test_every_handler_the_new_buttons_register_is_guarded(page: PlatePage) -> N
         ]
         assert ours, button.label
         assert [fn for fn in ours if not hasattr(fn, "__wrapped__")] == [], button.label
+
+
+HOSTILE = '<img src=x onerror="alert(1)"> **bold** [x](javascript:y) &amp;'
+
+
+def test_every_text_pane_of_the_wells_and_scan_screens_is_plain_text_whatever_the_stand_says(
+    page: PlatePage, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # FM-139. Free text reaches these screens from the stand (the turret's label), from a plan
+    # (its objective and its assumptions) and from a scan (its assumptions): it is shown as it
+    # is, never as markup, or a label of `<img onerror=...>` runs on the stand PC.
+    _seed_plate(run_doc)
+    plan = _scan_plan_result().model_copy(
+        update={"objective": HOSTILE, "assumed": (HOSTILE,)}
+    )
+    _seed(run_doc, "scan-plan", plan, minute=1)
+    _seed(
+        run_doc,
+        "scan",
+        _scan_result(plan, assumed=(HOSTILE,)),
+        minute=2,
+        reads={"scan-plan": ReadRecord(plugin="scan-plan", attempt="a1")},
+    )
+    real_status = page.status
+    monkeypatch.setattr(
+        page, "status", lambda: dataclasses.replace(real_status(), objective=HOSTILE)
+    )
+    view = PlatePageView(page)
+    view.select_input.value = "B2,B11"
+    view.refresh()
+    view.tick()
+    # Said as it was given, in each of the places that hold a stand's or a result's words.
+    assert (
+        view.wells_known_block.object.split("\n")[0]
+        == f"Objective: {HOSTILE}, in place"
+    )
+    assert f"assumed: {HOSTILE}" in view.wells_known_block.object.split("\n")
+    assert view.scan_lead_text.object.startswith(f"12 fields at {HOSTILE}. ")
+    assert f"assumed: {HOSTILE}" in view.scanned_block.object.split("\n")
+    # And every text pane of both screens is a `Str`, counted together so that a pane that
+    # becomes Markdown is a different count and not a pass.
+    shown: list[Any] = []
+    for step in ("wells", "scan"):
+        view.show_step(step)
+        objects = _objects(list(view.step_panel.objects))
+        # A card draws its title as an HTML pane of its own, from a constant of the page's.
+        titles = {f"<h3>{o.title}</h3>" for o in objects if isinstance(o, pn.Card)}
+        shown += [
+            o
+            for o in objects
+            if isinstance(o, pn.pane.PaneBase)
+            and not (type(o) is pn.pane.HTML and o.object in titles)
+        ]
+    assert len(shown) > 14
+    assert [type(o).__name__ for o in shown if type(o) is not pn.pane.Str] == []
+
+
+def test_the_imaged_layer_is_a_green_rect_over_the_fields_under_the_route_and_not_hoverable(
+    page: PlatePage,
+) -> None:
+    view = PlatePageView(page)
+
+    def layer() -> Any:
+        renderers = view.figure.renderers
+        imaged = [r for r in renderers if r.data_source is view.imaged_source]
+        fields = [r for r in renderers if r.data_source is view.fields_source]
+        route = [
+            r
+            for r in renderers
+            if r.data_source is view.route_source and isinstance(r.glyph, Line)
+        ]
+        assert len(imaged) == len(fields) == len(route) == 1
+        assert isinstance(imaged[0].glyph, Rect)
+        assert imaged[0] not in view.hover.renderers
+        # The green is over the plan's orange, and the route over both.
+        assert (
+            renderers.index(fields[0])
+            < renderers.index(imaged[0])
+            < renderers.index(route[0])
+        )
+        return imaged[0].glyph, fields[0].glyph
+
+    for _plate in ("96-well", "384-well"):
+        # A plate with square wells swaps the wells' renderer: the layer stays where it was.
+        view.plate_select.value = _plate
+        green, orange = layer()
+        assert green.fill_color == green.line_color == "#2ca02c"
+        assert green.fill_color != orange.fill_color
+        # Visible over the orange: not clear, and more opaque than the plan's fields.
+        assert 0.0 < orange.fill_alpha < green.fill_alpha < 1.0
+        assert view.hover.renderers == [view.wells_renderer]
+
+
+def test_a_dry_run_scan_marks_no_field_while_it_runs(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # A dry run walks the fields and takes no frame, and says so (the note, the result line):
+    # a green field is a field with a frame, so the layer does not grow with the progress while
+    # the bar does. The stub takes frames, a real dry-run scan does not; only the layer while
+    # it runs is asserted here (m5 §17.10.2).
+    dry = make_page(dry_run=True)
+    view = PlatePageView(dry)
+    _seed_plate(run_doc, dry_run=True)
+    _seed_plan(run_doc, dry_run=True)
+    view.refresh()
+    StubScan.pause_at = 5
+    _click(view.scan_button)
+    assert StubScan.paused.wait(BOUND_S)
+    view.tick()
+    assert (view.scan_progress.value, view.scan_progress.max) == (5, 12)
+    assert view.imaged_source.data["x"] == []
+    StubScan.release.set()
+    assert dry.join(BOUND_S)
+
+
+def test_the_bar_never_holds_a_value_above_its_maximum_nor_a_maximum_below_one(
+    page: PlatePage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Panel refuses a `value` above the `max` it holds at that moment, and not a `max` below
+    # the `value` it holds: a shorter scan after a longer one, a total of 0, a report with no
+    # total and a done above the total are all drawn as a bar that holds.
+    view = PlatePageView(page)
+    real_status = page.status
+    for done, total, expected in (
+        (50, 72, (50, 72)),
+        (
+            6,
+            3,
+            (3, 3),
+        ),  # `max` shrinks below the value the bar held, then `value` follows
+        (0, 0, (0, 1)),
+        (4, None, (4, 4)),
+        (-1, 12, (0, 12)),
+    ):
+        progress = Progress("scan", done, total, "B2_0000")
+        monkeypatch.setattr(
+            page,
+            "status",
+            lambda progress=progress: dataclasses.replace(
+                real_status(), progress=progress
+            ),
+        )
+        view.tick()
+        assert (view.scan_progress.value, view.scan_progress.max) == expected, (
+            done,
+            total,
+        )
+        assert view.scan_progress.visible is True
+
+
+def test_a_second_scan_that_starts_before_the_view_redrew_is_drawn_from_its_own_count(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # The view saw five fields of the first run; that run ended and a second began between two
+    # ticks, so no end-of-run redraw separated them: the second's two fields replace the five
+    # (m5 §17.10.2: a `done` lower than what the view drew is a new run).
+    _seed_plate(run_doc)
+    plan = _seed_plan(run_doc)
+    view = PlatePageView(page)
+    StubScan.pause_at = 5
+    _click(view.scan_button)
+    assert StubScan.paused.wait(BOUND_S)
+    view.tick()
+    assert len(view.imaged_source.data["x"]) == 5
+    StubScan.release.set()
+    assert page.join(BOUND_S)
+    StubScan.paused = threading.Event()
+    StubScan.release = threading.Event()
+    StubScan.pause_at = 2
+    # Through the controller and with no tick of this view in between.
+    page.run("scan", [])
+    assert StubScan.paused.wait(BOUND_S)
+    view.tick()
+    data = view.imaged_source.data
+    assert list(zip(data["x"], data["y"], strict=True)) == [
+        (f.x_um, f.y_um) for f in plan.fields[:2]
+    ]
+    StubScan.release.set()
+    assert page.join(BOUND_S)
 
 
 # --- the whole path, on the demo's sample (the issue's second criterion) ---------------------
