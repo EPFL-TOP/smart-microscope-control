@@ -169,10 +169,15 @@ FIGURE_HEIGHT_PX = 400
 #: and a capture past them is text, never a widget built later (D5).
 _CENTRE_SLOTS = 3
 
-#: The step panel scrolls on its own, below the strip and the step bar (about 130 px at
-#: 1280 px wide): a screen taller than the window scrolls inside the panel, and the map,
-#: the image and the strip stay where they are (m5 §17.3).
-_STEP_PANEL_MAX_HEIGHT = "calc(100vh - 130px)"
+#: The step panel scrolls on its own, below the header: a screen taller than the window
+#: scrolls inside the panel, and the map, the image and the header stay where they are
+#: (m5 §17.3). Its max-height is the window's less the header's, which is **137 px** at
+#: 1280 px wide with the outcome lines empty (the strip, the connection line, the step bar
+#: and its summaries), measured with ``scripts/dev/ui_snap.py``'s ``stand-620`` and
+#: ``plate-620`` states on 2026-11-12 (Chromium, Panel 1.10.0): with 130 the panel ended 7 px
+#: below a 620 px window. 140 leaves 3 px. A long outcome grows the header and pushes the panel
+#: down: it is reported, not clipped (m5 §17.2 D12).
+_STEP_PANEL_MAX_HEIGHT = "calc(100vh - 140px)"
 
 #: The strip stays at the top of the window when the page scrolls: a white ground, so that
 #: what scrolls under it is not read through it.
@@ -2723,7 +2728,7 @@ class PlatePageView:
         busy = None if running is None else busy_note(running, live=live)
         blocked = self._blocked.get("camera-calibration")
         self.calibrate_button.disabled = running is not None or blocked is not None
-        self.calibrate_note.object = blocked or busy or ""
+        self._say(self.calibrate_note, blocked or busy or "")
         stage_off = not connected or (running is not None and not live)
         sent = self.goto_text.object
         for index, slot in enumerate(self.centre_slots):
@@ -2737,7 +2742,7 @@ class PlatePageView:
             drive = sent if self._goto_row == index and sent else ""
             if drive:
                 lines.append(drive)
-            slot.note.object = "\n".join(lines)
+            self._say(slot.note, "\n".join(lines))
             trouble = bool(drive) and not drive.startswith(_GOTO_PLAIN_PREFIXES)
             slot.note.styles = {
                 **_WRAP_STYLES,
@@ -2748,7 +2753,17 @@ class PlatePageView:
         if "plate-registration" not in self.tool_runs:
             reason = "plate-registration did not load: the problems line says why"
         self.register_button.disabled = running is not None or reason is not None
-        self.register_wait.object = reason or busy or ""
+        self._say(self.register_wait, reason or busy or "")
+
+    @staticmethod
+    def _say(pane: Any, text: str) -> None:
+        """``text`` in ``pane``, which takes no height while it is empty (m5 §17.3, D12).
+
+        An empty text pane still draws a line of its own: under each of the three centre
+        rows it spread them out by about 25 px, which D12's 620 px page cannot spare.
+        """
+        pane.object = text
+        pane.visible = bool(text)
 
     def _draw_captures(self) -> None:
         """The three capture buttons name the well they record and the side of the *Wall* select (m5 §11.1).

@@ -582,6 +582,28 @@ def test_a_refused_go_to_is_drawn_on_its_row(
     assert view.goto_text.object == GOTO_UNPLACED
 
 
+def test_an_empty_note_takes_no_height_and_a_said_one_does(
+    make_page: Callable[..., PlatePage],
+) -> None:
+    # An empty text pane still draws a line of its own, which spread the three rows out by
+    # about 25 px each in `/ui-check` (D12 has 620 px): the notes show only with a text.
+    page = make_page(Slow)
+    view = PlatePageView(page)
+    page.choose_plate("96-well")
+    view.refresh()
+    assert [slot.note.visible for slot in view.centre_slots] == [False] * 3
+    assert all(slot.note.object == "" for slot in view.centre_slots)
+    # The wait under *Register the plate* is a text: shown. The calibration's note has none
+    # while the stand is connected and idle: hidden.
+    assert view.register_wait.visible
+    assert view.register_wait.object == CAPTURE_WELLS
+    assert not view.calibrate_note.visible
+    _click(view.centre_slots[1].goto_button)
+    assert view.centre_slots[1].note.visible
+    assert view.centre_slots[1].note.object == GOTO_UNPLACED
+    assert not view.centre_slots[0].note.visible
+
+
 def test_a_goto_well_that_ends_failed_is_drawn_on_its_row(
     make_page: Callable[..., PlatePage], run_doc: Path
 ) -> None:

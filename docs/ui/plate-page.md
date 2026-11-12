@@ -187,13 +187,17 @@ outcome lines (connection, run, message, problems): an empty one takes no height
   changes **no screen**. Neither figure is ever removed and added again, so a map redrawn
   while you look elsewhere is framed on the plate as it was drawn, and **Reset** in the
   map's toolbar returns to that frame ([FM-174](../design/failure-modes.md)).
-- **The strip stays at the top of the window** when the page is scrolled, so that STOP is
-  always in reach. At 1280 x 800 the **drive bar is partly below the fold** (its pad and
-  its first rows are in view, the objective, *Drive to* and the toggle are a scroll
-  down); the figures are 400 px high, the least the layout allows, to show as much of it
-  as it can. A wider or taller window shows all of it.
+- **The header stays at the top of the window** when the page is scrolled: the strip, the
+  outcome lines and the step bar with its summaries are one block, so that STOP is always
+  in reach and the step bar does not scroll away. At 1280 x 800 the **drive bar is partly
+  below the fold** (its pad and its first rows are in view, the objective, *Drive to* and
+  the toggle are a scroll down); the figures are 400 px high, the least the layout allows,
+  to show as much of it as it can. A wider or taller window shows all of it.
 - **The step panel (400 px) scrolls on its own** when a screen is taller than the window;
-  the strip, the step bar and the figures do not scroll with it.
+  the header and the figures do not scroll with it. **A screen opens at its top**: a click
+  on a step (or *Continue*, or the expert switch) shows the new screen scrolled to its
+  title, whatever the last one was scrolled to. The header is about 140 px tall, and a long
+  outcome line makes it taller and pushes the panel down.
 
 **The five steps.** A step opens at any time: none is ever disabled (an action that cannot
 run is greyed with its reason beside it, as before). The button is `n. Title`, with a `✓`
@@ -204,20 +208,79 @@ and `next` under the one the run document needs next. **The page opens on that s
 you change the screen: a click on a step, or the *Continue to …* button at the foot of a
 screen. The ticks and lines follow the run document after a run, a Refresh and a change of
 the connection, and nothing else moves with them. Each screen is a title (the question it
-answers), a sentence, **the next step** (the same one on every screen), the regions of its
-step, and *Continue*:
+answers), a sentence, its own regions and *Continue*:
 
-| Step | What its screen holds today |
+| Step | What its screen holds |
 |---|---|
-| *Stand* | the preset (load, save), `camera-calibration` and `timing` |
-| *Plate* | *Plate*, *Plate lies* and the plate's confirmation, `plate-registration` |
-| *Wells* | the *Wells* box, `scan-plan` |
-| *Scan* | `scan` |
-| *Results* | `cells`, `density`, `route`, `report`, `nis-export`, then the run document's path and its checklist |
+| *Stand* | [designed](#the-stand-and-plate-screens): the stand line, the preset, what is known, *Calibrate the camera* |
+| *Plate* | [designed](#the-stand-and-plate-screens): the plate, three centres to capture, *Register the plate* |
+| *Wells* | provisionally today's regions: **the next step**, the *Wells* box, `scan-plan` |
+| *Scan* | provisionally: the next step, `scan` |
+| *Results* | provisionally: the next step, `cells`, `density`, `route`, `report`, `nis-export`, then the run document's path and its checklist |
 
-These are today's regions listed by step; the screens' own designs (the known values, the
-list of centres, the progress, the results' rows) come with the next builds of
+The three provisional screens are today's regions listed by step; their own designs (the
+progress, the results' rows) come with the next builds of
 [#431](https://github.com/EPFL-TOP/smart-microscope-control/issues/431).
+
+### The Stand and Plate screens
+
+These two screens hold **their own buttons and no next step**, and none of the tools'
+forms: a tool's form and its *Run* stay in the expert view. Every action still runs the
+tool it names with a command you can read: under each button a closed **Command**
+disclosure shows the `smc run` line it makes.
+
+**1. Stand: "Which stand, and which preset?"** From the top:
+
+- the stand line, `<stand>: connected` or `<stand>: not connected` with a **Connect
+  `<stand>`** button while it is closed (the strip's *Connect*, a second time);
+- the **preset**: pick one and press **Load**; **Save as** and **Save** write the page's
+  choices under a name (see *Presets*);
+- **what the page knows**, three lines, each saying what it rests on or that it is not
+  known: `Objective: <label>, in place` (or `not known`); `Camera: calibrated at <objective>
+  on <date> UTC`, `... not at <the one in place>` when the camera was calibrated at
+  another objective, `... objective not recorded`, or `not calibrated (the arrows cannot
+  say which way the image moves)`; `Light: on`, `off` or `not known`;
+- **Calibrate the camera**, shown only when there is no calibration or it was made at
+  another objective. It runs `camera-calibration` with what the profile suggests, as the
+  tool's own *Run* does.
+
+**2. Plate: "Where is the plate?"** From the top:
+
+- **Plate** and, under it, where the choice comes from: `the page's placeholder: choose the
+  plate on the stage`, `from the preset <name>`, `from the profile's sample` or `chosen on
+  this page`; then **Plate lies** (which way the plate lies in its holder) and, while the
+  plate is only the placeholder, the question *The plate is a …* that confirms it;
+- **three centres**, far apart (A1, the last column of row A and the last row of column 1,
+  as the plate prints them: `A1, A12, H1` on a 96-well plate, one well on a coverslip),
+  one row each. A row says what to do, `go there, centre it, capture`, then `captured at
+  (x, y) µm with <objective>` once it is (the objective in place when you captured, or
+  `the objective not known`), and has two buttons:
+  - **Go to `<well>`**: the same drive as a click on the map. Before the plate is registered
+    it goes to the **estimate** from the stand's holder (`go there (estimated position),
+    centre it by eye, capture`), and where the stand says nothing of its holder it
+    refuses and the row says why. It is **disabled while Live runs**, with `End live to go
+    to another well; Capture works during Live`. A refusal, or a drive that did not end
+    well, is written **on the row**;
+  - **Capture the centre of `<well>`** (**Redo** once captured): records where the stage is
+    as that well's centre. It **works during Live**: go to the well, start Live, centre
+    it with the arrows, capture, end Live. A well captured by clicking the map is listed
+    after the three, as text.
+- **Register the plate**, one button: `plate-registration` with the centres as the screen
+  drew them. While it waits it says for what (`centre a well under the objective ...`,
+  or `choose the plate on the stage first`). On a stand whose profile has a `[sample]` of
+  this plate the rows say `known from the profile's sample, not measured` and the button
+  registers from them with no capture. The walls and the automatic survey are named under
+  **Other ways to register** and run from the expert view;
+- the result, `Registered: residual 121.6 µm, turned 0.10°` (`residual not measured` for a
+  seed), with what the registration assumed under it, and **Continue to Wells**.
+
+Nothing on the Plate screen is in the warning colour before a capture: the rows say what to
+do, and a refusal is the only orange text.
+
+**At 1280 x 620** the title, the sentence, the fields and the first button of both screens
+are in view under the header (`ui-check`'s `stand-620` and `plate-620`); on a stand whose
+profile does not say its sides the Plate screen's first *Go to* sits at the foot of the
+window, and the other two rows and *Register the plate* are a scroll of the panel down.
 
 **The expert view.** The *Expert view* switch replaces the step panel's contents with
 everything the page had before the steps: the preset, the next step, *Plate*, *Plate lies*,
