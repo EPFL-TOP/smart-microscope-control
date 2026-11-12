@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
+import numpy as np
 import pytest
 from pydantic import BaseModel, Field
 from pymmcore_plus import CMMCorePlus
@@ -33,6 +34,7 @@ from smc.plugins.api import (
     PluginResult,
     Progress,
     RunContext,
+    ShownFrame,
     StopRequested,
 )
 from smc.plugins.errors import (
@@ -265,6 +267,21 @@ class Progressing(Base):
     def body(self, microscope: Any, params: Params, ctx: RunContext) -> Result:
         for done in (1, 2, 3):
             ctx.progress(done, 3, "step")
+        return Result(value=3)
+
+
+class Showing(Base):
+    """Hands three frames to whoever runs it, as the scan does (m3 §25.4)."""
+
+    name = provides = "showing"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.images = [np.full((4, 6), i, dtype=np.uint16) for i in range(3)]
+
+    def body(self, microscope: Any, params: Params, ctx: RunContext) -> Result:
+        for i, image in enumerate(self.images):
+            ctx.show_frame(image, xy_um=(10.0 * i, -5.0 * i), label=f"F{i}")
         return Result(value=3)
 
 
@@ -1381,6 +1398,82 @@ def test_a_keyboard_interrupt_in_the_progress_callback_passes_through(
     with pytest.raises(KeyboardInterrupt):
         _run(Progressing(), fake_microscope, tmp_path, on_progress=interrupt)
     assert _stored(tmp_path, "progressing").status is StageStatus.stopped
+
+
+def test_a_shown_frame_reaches_the_callback_as_the_same_array(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    # Handed over, never copied nor converted by the layer (m3 §25.2 D2).
+    plugin = Showing()
+    seen: list[ShownFrame] = []
+    before = datetime.now(timezone.utc)
+    record = _run(plugin, fake_microscope, tmp_path, on_frame=seen.append)
+    after = datetime.now(timezone.utc)
+    assert record.status is StageStatus.done
+    assert len(seen) == 3
+    for i, (shown, image) in enumerate(zip(seen, plugin.images, strict=True)):
+        assert shown.image is image
+        assert shown.plugin == "showing"
+        assert shown.xy_um == (10.0 * i, -5.0 * i)
+        assert shown.label == f"F{i}"
+        assert shown.taken_utc.tzinfo is timezone.utc
+        assert before <= shown.taken_utc <= after
+
+
+def test_show_frame_without_a_callback_does_nothing(
+    fake_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ``smc run`` passes no callback: nothing is built, not even the ShownFrame
+    # (m3 §25.2 D1), so the scan pays one attribute read per field.
+    def built(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("a ShownFrame was built with nobody to hand it to")
+
+    monkeypatch.setattr(api_mod, "ShownFrame", built)
+    record = _run(Showing(), fake_microscope, tmp_path)
+    assert record.status is StageStatus.done
+    assert record.result == {"assumed": [], "value": 3}
+
+
+def test_a_failing_frame_callback_is_dropped_and_the_run_goes_on(
+    fake_microscope: Microscope,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    calls: list[ShownFrame] = []
+
+    def broken(shown: ShownFrame) -> None:
+        calls.append(shown)
+        raise ValueError("the page is gone")
+
+    record = _run(Showing(), fake_microscope, tmp_path, on_frame=broken)
+    assert record.status is StageStatus.done
+    assert [shown.label for shown in calls] == ["F0"]  # called once, then dropped
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.WARNING and r.name.startswith("smc.plugins")
+    ]
+    assert warnings == [
+        "the frame callback failed (ValueError: the page is gone); frames are not "
+        "shown any more in this run"
+    ]
+    # Text, never the error: the kept log record holds no exception (FM-98).
+    assert all(
+        not isinstance(arg, BaseException)
+        for r in caplog.records
+        for arg in (r.args if isinstance(r.args, tuple) else ())
+    )
+
+
+def test_a_keyboard_interrupt_in_the_frame_callback_passes_through(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    def interrupt(shown: ShownFrame) -> None:
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        _run(Showing(), fake_microscope, tmp_path, on_frame=interrupt)
+    assert _stored(tmp_path, "showing").status is StageStatus.stopped
 
 
 def test_wait_s_returns_early_when_stop_is_set(

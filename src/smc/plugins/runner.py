@@ -38,6 +38,7 @@ from smc.plugins.api import (
     PluginParams,
     Progress,
     RunContext,
+    ShownFrame,
     StopRequested,
     _Attempt,
 )
@@ -175,12 +176,18 @@ def run_plugin(
     stop: threading.Event | None = None,
     plugin_version: str | None = None,
     preset: str | None = None,
+    on_frame: Callable[[ShownFrame], None] | None = None,
 ) -> StageRecord:
     """Run ``plugin`` on ``microscope`` and record the outcome in ``run_doc``.
 
     ``preset`` is the name of the preset that gave ``params`` their values
     (m5 §10.4). It goes into the first record, and every later record of the
     run is a copy of it, so a checkpoint and a stop name it too.
+
+    ``on_frame`` receives the frames the plugin hands to ``ctx.show_frame``,
+    uncopied (m3 §25.3); it is given to the context and to nothing else. The
+    plate page passes one to show a scan's fields as they come; ``smc run``
+    passes none, so a plugin's ``show_frame`` builds nothing there.
 
     Returns:
         The stage's record: ``done`` with its result, or ``stopped`` when the
@@ -252,6 +259,7 @@ def run_plugin(
         resumed=checkpoint,
         stop=stop if stop is not None else threading.Event(),
         on_progress=on_progress,
+        on_frame=on_frame,
     )
     try:
         result = plugin.run(microscope, params, ctx)

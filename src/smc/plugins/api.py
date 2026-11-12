@@ -6,11 +6,11 @@ reads, and one method, ``run(microscope, params, ctx)``: the hardware loop of
 ADR-0004. The algorithm it applies is a pure function in another module that
 takes no ``Microscope``.
 
-The context is how a plugin talks to whoever runs it, in four ways that never
-reach for the hardware or the operator's terminal directly: progress goes to a
-callback, a stop is asked of an ``Event``, what upstream stages produced is read
-from a snapshot of the run document, and a checkpoint is written through the
-run document's own atomic write.
+The context is how a plugin talks to whoever runs it, in five ways that never
+reach for the hardware or the operator's terminal directly: progress and the
+frames it has taken go to callbacks, a stop is asked of an ``Event``, what
+upstream stages produced is read from a snapshot of the run document, and a
+checkpoint is written through the run document's own atomic write.
 
 Nothing here imports ``smc.hardware`` at run time (``Microscope`` is only a type)
 and nothing imports ``pymmcore_plus``.
@@ -24,9 +24,11 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar, runtime_checkable
 
+import numpy.typing as npt
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from smc.plugins.errors import ResumeError, UpstreamError
@@ -45,6 +47,7 @@ __all__ = [
     "Progress",
     "R",
     "RunContext",
+    "ShownFrame",
     "StopRequested",
 ]
 
@@ -125,6 +128,23 @@ class Progress:
     message: str
 
 
+@dataclass(frozen=True, slots=True)
+class ShownFrame:
+    """A frame a plugin has taken, handed to whoever runs it (m3 §25).
+
+    ``image`` is the plugin's own array, neither copied nor checked: the plugin
+    no longer writes to it, and whoever keeps it copies it when, and only if, it
+    shows it (§25.2 D2). ``xy_um`` is where the frame was taken, as read back,
+    ``None`` when the plugin does not say; ``label`` names it (a field's name).
+    """
+
+    plugin: str
+    image: npt.NDArray[Any]
+    xy_um: tuple[float, float] | None
+    label: str
+    taken_utc: datetime
+
+
 class StopRequested(Exception):  # noqa: N818 (a signal, like StopIteration; the name is fixed by m3 §1.3)
     """A plugin's way out when ``ctx.should_stop()`` is true.
 
@@ -153,9 +173,9 @@ class RunContext:
 
     The constructor is the runner's and keyword-only, not public API: a plugin
     is tested through ``run_plugin`` with a run document under ``tmp_path``.
-    The context holds the stop event, the progress callback, a snapshot of the
-    run document and the run document's path, and no reference to the
-    microscope (FM-92).
+    The context holds the stop event, the progress and frame callbacks, a
+    snapshot of the run document and the run document's path, and no reference
+    to the microscope (FM-92).
 
     Attributes:
         plugin: The plugin's name.
@@ -192,6 +212,7 @@ class RunContext:
         resumed: dict[str, Any] | None,
         stop: threading.Event,
         on_progress: Callable[[Progress], None] | None,
+        on_frame: Callable[[ShownFrame], None] | None = None,
     ) -> None:
         self.plugin = plugin
         self.logger = logging.getLogger(f"smc.plugins.{plugin}")
@@ -209,6 +230,7 @@ class RunContext:
         self._resumed = resumed
         self._stop = stop
         self._on_progress = on_progress
+        self._on_frame = on_frame
 
     def progress(self, done: int, total: int | None = None, message: str = "") -> None:
         """Report progress to the runner's callback; never validated, never fatal.
@@ -230,6 +252,39 @@ class RunContext:
                 "any more in this run",
                 type(exc).__name__,
                 exc,
+            )
+
+    def show_frame(
+        self,
+        image: npt.NDArray[Any],
+        *,
+        xy_um: tuple[float, float] | None = None,
+        label: str = "",
+    ) -> None:
+        """Hand a frame taken, and no longer written to, to the runner's callback (m3 §25.3).
+
+        With nobody listening (``smc run``, a test, a script) it returns before
+        anything is built, so a scan pays one attribute read per field. The
+        array is handed as it is, never copied nor validated: a frame the
+        listener cannot show is the listener's to drop. A callback that raises
+        an ``Exception`` is logged once at WARNING and not called again in this
+        run, so a page's bug never ends a scan; ``KeyboardInterrupt`` passes.
+        """
+        callback = self._on_frame
+        if callback is None:
+            return
+        try:
+            callback(
+                ShownFrame(self.plugin, image, xy_um, label, datetime.now(timezone.utc))
+            )
+        except Exception as exc:
+            self._on_frame = None
+            # Text, never the error: a kept record keeps its traceback (FM-98).
+            self.logger.warning(
+                "the frame callback failed (%s: %s); frames are not shown any "
+                "more in this run",
+                type(exc).__name__,
+                str(exc),
             )
 
     def should_stop(self) -> bool:
