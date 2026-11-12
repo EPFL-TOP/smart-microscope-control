@@ -274,11 +274,17 @@ def test_the_step_panel_shows_one_screen_at_a_time(page: PlatePage) -> None:
         assert shown == view.screens[step]
         # A copy: a swap never hands the panel the screen's own list (§17.6).
         assert view.step_panel.objects is not view.screens[step]
-        title, lead, next_region, *_rest = shown
+        title, lead, *_rest = shown
         assert title.object == SCREEN_TITLES[step]
         assert title.styles["font-weight"] == "bold"
         assert lead.object == SCREEN_LEADS[step]
-        assert next_region in _next_regions(shown)
+        # The designed screens (B2: Stand and Plate) hold their own buttons and not the next
+        # step; the provisional ones (B3, B4) still list it, right after the lead.
+        regions = _next_regions(shown)
+        if step in ("stand", "plate"):
+            assert regions == []
+        else:
+            assert regions == [shown[2]]
         assert view.continue_button in shown
         # The step shown is the primary button, and the one `/ui-check` finds by its class.
         colours = {s: b.color for s, b in view.step_buttons.items()}
@@ -303,8 +309,10 @@ def test_the_step_panel_shows_one_screen_at_a_time(page: PlatePage) -> None:
         for step, ids in on.items()
     }
     assert tools_on == {
-        "stand": {"camera-calibration", "timing"},
-        "plate": {"plate-registration"},
+        # The Stand and Plate screens (B2) are designed: their actions are their own buttons
+        # and no tool section is listed on them (the sections stay in the expert view).
+        "stand": set(),
+        "plate": set(),
         "wells": {"scan-plan"},
         "scan": {"scan"},
         "results": {"cells", "density", "route", "report", "nis-export"},
@@ -323,7 +331,15 @@ def test_the_step_panel_shows_one_screen_at_a_time(page: PlatePage) -> None:
         "run_document_text": {"results", "expert"},
         "checklist_text": {"results", "expert"},
         "continue_button": set(STEPS),
-        "next_text": {*STEPS, "expert"},
+        "next_text": {"wells", "scan", "results", "expert"},
+        # B2's own widgets: each on its screen alone, `plate_from_text` with the menu it
+        # explains (the expert view lists the same column).
+        "stand_connect_button": {"stand"},
+        "known_block": {"stand"},
+        "calibrate_button": {"stand"},
+        "register_button": {"plate"},
+        "registered_block": {"plate"},
+        "plate_from_text": {"plate", "expert"},
     }
     for attribute, screens in homes.items():
         widget = getattr(view, attribute)
@@ -541,6 +557,12 @@ def test_the_next_step_is_on_every_provisional_screen_and_drawn_once(
     seen: set[int] = set()
     for name, items in view.screens.items():
         regions = _next_regions(items)
+        if name in ("stand", "plate"):
+            # Designed in B2: the action is the screen's own, and the walk found the next
+            # step's 12-line command (`plate-registration`, `Run scan-plan`) on them.
+            assert regions == [], f"{name} lists the next step"
+            continue
+        # The provisional screens left (B3, B4) and the expert view.
         assert len(regions) == 1, f"{name} lists the next step {len(regions)} times"
         seen.add(id(regions[0]))
         assert items.index(regions[0]) == (2 if name != "expert" else 1)
@@ -557,8 +579,9 @@ def test_the_next_step_is_on_every_provisional_screen_and_drawn_once(
         else:
             view.show_step(name)  # type: ignore[arg-type]
         rendered = [o for o in _ids_objects(list(view.step_panel.objects))]
-        assert sum(o is view.next_text for o in rendered) == 1
-        assert sum(o is view.next_button for o in rendered) == 1
+        drawn = 0 if name in ("stand", "plate") else 1
+        assert sum(o is view.next_text for o in rendered) == drawn
+        assert sum(o is view.next_button for o in rendered) == drawn
 
 
 # -- what changes the screen, and what never does ------------------------------------
@@ -710,16 +733,33 @@ def test_the_strip_stays_on_top_and_the_step_panel_scrolls_on_its_own(
     view = PlatePageView(page)
     # Measured in headless Chromium (the scroll probe of #443): the page scrolls 189 px at
     # 1280 x 800 to bring the drive bar up, and STOP stayed at y = 5. A strip that scrolled
-    # away would take STOP out of view (ADR-0006: always offered).
-    strip = next(
-        row
-        for row in view.layout
-        if isinstance(row, pn.Row) and view.stop_button in row
-    )
-    assert strip.styles["position"] == "sticky"
-    assert strip.styles["top"] == "0"
+    # away would take STOP out of view (ADR-0006: always offered). From B2 (D12) the sticky
+    # one is the header, which holds the strip, the outcome lines and the step bar: the
+    # owner's walk saw the strip hold while the step bar scrolled away (#431).
+    header = view.layout[0]
+    assert header is view.header
+    assert isinstance(header, pn.Column)
+    assert header.styles["position"] == "sticky"
+    assert header.styles["top"] == "0"
     # An opaque ground, or what scrolls under it is read through it.
-    assert strip.styles["background-color"] == "white"
+    assert header.styles["background-color"] == "white"
+    held = {id(o) for o in header.select()}
+    for widget in (
+        view.stop_button,
+        view.connection_text,
+        view.run_text,
+        view.message,
+        view.problems_text,
+        *view.step_buttons.values(),
+        *view.step_summaries.values(),
+        view.expert_toggle,
+    ):
+        assert id(widget) in held
+    # The strip is not sticky on its own any more: two sticky parts would stack at the top.
+    strip = next(
+        row for row in header if isinstance(row, pn.Row) and view.stop_button in row
+    )
+    assert "position" not in strip.styles
     # The panel has a height of its own to scroll in (the window's less the frame's): a
     # `scroll=True` column with no height grows with its screen, and the page scrolls.
     assert view.step_panel.scroll is True
@@ -779,8 +819,9 @@ def test_an_outcome_line_takes_no_height_while_its_text_is_empty(
     assert view.drive_text.visible is False
     view.drive_toggle.value = True
     assert view.drive_text.visible is True
-    # Their order under the strip, and the step bar then the centre below them.
-    top = list(view.layout)
+    # Their order under the strip, inside the sticky header, and the step bar after them;
+    # the centre is below the header (B2, D12).
+    top = list(view.header)
     assert top[1:6] == [
         view.connection_text,
         view.drive_text,
@@ -788,3 +829,4 @@ def test_an_outcome_line_takes_no_height_while_its_text_is_empty(
         view.message,
         view.problems_text,
     ]
+    assert view.layout[0] is view.header

@@ -2965,12 +2965,14 @@ def test_the_check_for_a_widget_placed_twice_can_fail(walls_page: PlatePage) -> 
     found = _placements(view)
     assert len(found) - len(set(found)) == 1
     assert found.count(id(view.walls_forget_button)) == 2
-    # And on a step's own screen, whose list is not the accordion's.
+    # And on a step's own screen, whose list is not the accordion's: *Register the plate*
+    # is listed once by the Plate screen (B2), and a second place is found.
     view.show_step("plate")
-    view.screens["plate"].append(view.walls_forget_button)
+    assert _placements(view).count(id(view.register_button)) == 1
+    view.screens["plate"].append(view.register_button)
     view.show_step("plate")
     found = _placements(view)
-    assert found.count(id(view.walls_forget_button)) == 2
+    assert found.count(id(view.register_button)) == 2
 
 
 def test_the_checklist_says_what_each_slot_is(run_doc: Path, page: PlatePage) -> None:

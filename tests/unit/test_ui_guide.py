@@ -45,6 +45,7 @@ from smc.ui.guide import (
     MAP_FIELDS_UP_TO,
     NO_CALIBRATION_FOR_SIDES,
     ORIENTATION_IN_STAGE_TERMS,
+    OTHER_WAYS_TO_REGISTER,
     SCREEN_LEADS,
     SCREEN_TITLES,
     SELECT_WELLS,
@@ -1721,4 +1722,16 @@ def test_go_to_is_not_offered_during_live_says_why_and_that_capture_works() -> N
     # beside a disabled *Go to*.
     assert GOTO_NOT_DURING_LIVE == (
         "End live to go to another well; Capture works during Live"
+    )
+
+
+def test_the_other_ways_to_register_name_the_walls_and_the_survey_and_the_expert_view() -> (
+    None
+):
+    # D3: the guided path offers three centres by eye; the two slower ways are named, and
+    # where to run them. Plain words, whole (FM-45).
+    assert OTHER_WAYS_TO_REGISTER == (
+        "Other ways to register: from the walls of 2 or 3 wells (slower; measures the "
+        "wells' size too) or automatically (surveys the plate, about 7 minutes): in the "
+        "expert view."
     )

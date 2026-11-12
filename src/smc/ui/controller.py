@@ -481,6 +481,9 @@ class PlateView:
     (m5 §17.4.1); ``registered`` is the usable ``plate`` slot when it names the page's
     plate, the Plate screen's result line (§17.4.2): ``None`` when there is none, it
     names another plate, or its result does not validate (the problem is in ``problems``).
+    ``registered_by`` is the tool that wrote that result (``plate-registration``,
+    ``plate-walls``...), so that the Plate screen shows the ``assumed`` lines of that tool's
+    card and not an older tool's; ``None`` exactly when ``registered`` is.
     """
 
     plate: str
@@ -501,6 +504,7 @@ class PlateView:
     sides: tuple[SideLabel, ...] = ()
     camera_calibration: CalibrationNote | None = None
     registered: PlateResult | None = None
+    registered_by: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -3292,6 +3296,12 @@ class PlatePage:
         calibration_record = (
             None if calibration is None else doc.provider("camera-calibration")
         )
+        # The latest provider of `plate`, when its usable result is the page's plate's.
+        plate_record = (
+            doc.provider("plate")
+            if registered is not None and registered.plate == self._plate
+            else None
+        )
         return PlateView(
             plate=self._plate,
             nominal=pose.kind in ("estimated", "unplaced"),
@@ -3317,11 +3327,8 @@ class PlatePage:
                     when_utc=_when_utc(calibration_record),
                 )
             ),
-            registered=(
-                registered
-                if registered is not None and registered.plate == self._plate
-                else None
-            ),
+            registered=None if plate_record is None else registered,
+            registered_by=None if plate_record is None else plate_record.plugin,
         )
 
     def _sides(self, geometries: Sequence[WellGeometry]) -> tuple[SideLabel, ...]:
@@ -3422,6 +3429,30 @@ class PlatePage:
             else:
                 found[name] = _Suggestion(tuple(pairs), entry.why)
         return found, tuple(problems)
+
+    def command_for(self, plugin: str, params: Sequence[str]) -> str:
+        """The ``smc run`` command that makes the call of ``plugin`` with ``params`` on this page (ADR-0006, principle 5).
+
+        What a screen's *Command* disclosure shows under its button: the same line the
+        next step builds, with the profile's file when there is one (a name otherwise),
+        this page's run document, its dry run and the loaded preset. One builder, so
+        that a button's command and the next step's cannot say two things.
+        """
+        return self._command(plugin, params, self.preset)
+
+    def _command(
+        self, plugin: str, params: Sequence[str], loaded: LoadedPreset | None
+    ) -> str:
+        """``command_for`` for the preset the caller already read: a step's pairs and its command name one preset (FM-151)."""
+        source = self._profile.source
+        return command_line(
+            plugin,
+            params,
+            profile=self._profile.microscope.name if source is None else str(source),
+            run_doc=self.run_doc,
+            dry_run=self._dry_run,
+            preset=None if loaded is None else str(loaded.file.path),
+        )
 
     def _next_step(
         self,
@@ -3532,15 +3563,7 @@ class PlatePage:
             pairs += named
             why.append(f"{' '.join(named)}: from the preset {loaded.file.name}")
         why += [f"or {other.name}: {_flat(other.summary)}" for other in others]
-        source = self._profile.source
-        command = command_line(
-            tool.name,
-            pairs,
-            profile=self._profile.microscope.name if source is None else str(source),
-            run_doc=self.run_doc,
-            dry_run=self._dry_run,
-            preset=None if loaded is None else str(loaded.file.path),
-        )
+        command = self._command(tool.name, pairs, loaded)
         # What the run document or the stand says first wins: it is the reason that holds.
         return NextStep(
             plugin=tool.name,

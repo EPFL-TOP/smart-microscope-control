@@ -35,6 +35,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 import numpy as np
@@ -76,26 +77,34 @@ from smc.ui.controller import (
 from smc.ui.frames import Frame, display_image
 from smc.ui.guide import (
     END_LIVE_LABEL,
+    GOTO_NOT_DURING_LIVE,
     ORIENTATION_IN_STAGE_TERMS,
+    OTHER_WAYS_TO_REGISTER,
     SCREEN_LEADS,
     SCREEN_TITLES,
     STEPS,
+    CentreRow,
     NextStep,
     StepName,
     busy_note,
     capture_centre_label,
     capture_wall_label,
+    centre_rows,
     centres_text,
     continue_label,
     drive_image_note,
     forget_label,
     image_sides_note,
+    known_text,
     map_title,
+    needs_calibration,
     opening_step,
     orientation_label,
     plan_title,
+    plate_from_line,
     preset_differences,
     preset_note_text,
+    registered_line,
     side_words,
     stage_label,
     step_button_label,
@@ -156,6 +165,10 @@ NO_LABEL = "(no label)"
 STEP_PANEL_WIDTH_PX = 400
 FIGURE_HEIGHT_PX = 400
 
+#: How many centre rows the Plate screen builds (m5 §17.4.2): the suggestion is three wells,
+#: and a capture past them is text, never a widget built later (D5).
+_CENTRE_SLOTS = 3
+
 #: The step panel scrolls on its own, below the strip and the step bar (about 130 px at
 #: 1280 px wide): a screen taller than the window scrolls inside the panel, and the map,
 #: the image and the strip stay where they are (m5 §17.3).
@@ -175,10 +188,12 @@ ScreenName = StepName | Literal["expert"]
 
 #: The tools each screen lists, provisionally (m5 §17.7 B1): today's tool sections, in
 #: the order of the workflow. B2 to B4 replace each screen's list with its designed
-#: contents. The names are the registry's (``timing`` fills the checklist's ``timings``).
+#: contents: the Stand and Plate screens (B2, #444) list no tool section, their actions
+#: are their own buttons and the sections stay in the expert view. The names are the
+#: registry's (``timing`` fills the checklist's ``timings``).
 _SCREEN_TOOLS: Mapping[StepName, tuple[str, ...]] = {
-    "stand": ("camera-calibration", "timing"),
-    "plate": ("plate-registration",),
+    "stand": (),
+    "plate": (),
     "wells": ("scan-plan",),
     "scan": ("scan",),
     "results": ("cells", "density", "route", "report", "nis-export"),
@@ -404,6 +419,29 @@ def _tip(well: WellView, label: str | None) -> str:
     return f"{well.well} — " + ", ".join(found)
 
 
+#: What the drive's answer starts with while it goes to a well and when it arrived
+#: (``PageStatus.goto``: ``GOTO_ESTIMATED``'s and the controller's ``going to <well>``, then the
+#: run's own ``goto-well done in ...``): the Plate screen's rows draw anything else (a
+#: refusal, a failed or stopped run) in the warning colour, and these in the plain one.
+_GOTO_PLAIN_PREFIXES = ("going to", "goto-well done")
+
+
+@dataclass(frozen=True, slots=True)
+class _CentreSlot:
+    """One of the Plate screen's three centre rows: built once, rewritten by ``refresh()`` (m5 §17.2 D5).
+
+    ``text`` is the row's sentence, ``goto_button`` and ``capture_button`` its two actions,
+    ``note`` why *Go to* is disabled and what the last drive to this row came to, and ``box``
+    the column that holds them, hidden when the plate has no such row.
+    """
+
+    text: Any
+    goto_button: Any
+    capture_button: Any
+    note: Any
+    box: Any
+
+
 class PlatePageView:
     """One session's widgets over one controller; every handler is a method the tests call.
 
@@ -453,6 +491,13 @@ class PlatePageView:
         self._expected_of: LoadedPreset | None = None
         self._filling = False
         self._preset_armed: tuple[str] | None = None
+        # The Plate screen (m5 §17.4.2): the centre rows and the registration the last
+        # redraw drew. A button runs what was drawn, never what would be computed at the
+        # click (#287, FM-177), and ``_goto_row`` is the row *this tab* last sent to a well,
+        # so that the drive's answer is drawn on the row that started it.
+        self._rows_drawn: tuple[CentreRow, ...] = ()
+        self._register_drawn: tuple[tuple[str, ...], str | None] = ((), None)
+        self._goto_row: int | None = None
 
         self.wells_source = ColumnDataSource(
             {
@@ -669,7 +714,10 @@ class PlatePageView:
         )
         # What the page asks while nothing named the plate (m5 §11.3): the note says
         # what the 96-well is, and the button confirms it. Both visible only then.
-        self.plate_note = _wrapped_text(extra={"color": _WARNING})
+        #
+        # In the plain colour: it asks a question the operator answers, and the Plate screen
+        # shows nothing in the warning colour before a capture (m5 §17.4.2, #431's walk).
+        self.plate_note = _wrapped_text()
         self.plate_confirm_button = pn.widgets.Button(label="", color="primary")
         # Which way the plate lies (m5 §16 D2): beside the plate menu, worded from the
         # stand's sides, and the only place it is said (no tool's form offers it).
@@ -805,6 +853,7 @@ class PlatePageView:
         self.live_button.on_click(self._handler(lambda event: self.on_live()))
         self._build_drive()
         self._build_presets()
+        self._build_stand_plate()
         self._build_steps()
 
         self.tool_runs: dict[str, Any] = {}
@@ -997,6 +1046,76 @@ class PlatePageView:
             self.preset_note,
         )
 
+    def _build_stand_plate(self) -> None:
+        """The widgets of the Stand and Plate screens, each action a button of its own (m5 §17.4.1, §17.4.2).
+
+        A button holds no value, so these are second instances of what the strip and the
+        tools' sections already offer, going through the same handlers and the same
+        controller calls (D5); every one is registered through ``_handler`` (FM-171) and
+        carries its text as ``label=`` (FM-147). A disabled button is a courtesy: the
+        controller refuses each of these calls on its own (FM-169). Text is plain, never
+        markup (FM-139): a well's name, a preset's name and a path come from outside.
+        """
+        stand = self.page.stand_name
+        # The Stand screen: the stand line with a *Connect* of its own, what is known
+        # about the stand, and the calibration offered only when it is missing.
+        self.stand_text = _wrapped_text()
+        self.stand_connect_button = pn.widgets.Button(label=f"Connect {stand}")
+        self.known_block = _wrapped_text()
+        self.calibrate_button = pn.widgets.Button(label="Calibrate the camera")
+        self.calibrate_note = _wrapped_text()
+        self.calibrate_command = _wrapped_text()
+        self.calibrate_box = pn.Column(
+            self.calibrate_button,
+            self.calibrate_note,
+            pn.Card(
+                self.calibrate_command,
+                title="Command",
+                collapsed=True,
+                sizing_mode="stretch_width",
+            ),
+        )
+        # The Plate screen: where the plate comes from, three centre rows built once, the
+        # captures past three as text, one *Register the plate* and what it came to.
+        self.plate_from_text = _wrapped_text()
+        self.centre_slots = [self._centre_slot(i) for i in range(_CENTRE_SLOTS)]
+        self.other_captures = _wrapped_text()
+        self.other_captures.visible = False
+        self.register_button = pn.widgets.Button(
+            label="Register the plate", color="primary"
+        )
+        self.register_wait = _wrapped_text()
+        self.register_command = _wrapped_text()
+        self.register_card = pn.Card(
+            self.register_command,
+            title="Command",
+            collapsed=True,
+            sizing_mode="stretch_width",
+            visible=False,
+        )
+        self.registered_block = _wrapped_text()
+        self.registered_block.visible = False
+        self.other_ways_text = _wrapped_text(OTHER_WAYS_TO_REGISTER)
+        self.stand_connect_button.on_click(
+            self._handler(lambda event: self.on_connect())
+        )
+        # The same handler as the *Run camera-calibration* of the expert view's section.
+        self.calibrate_button.on_click(
+            self._handler(self._runner("camera-calibration"))
+        )
+        self.register_button.on_click(self._handler(lambda event: self.on_register()))
+
+    def _centre_slot(self, index: int) -> _CentreSlot:
+        """One centre row's widgets: its sentence, *Go to*, *Capture the centre of* (or *Redo*) and its note (m5 §17.4.2)."""
+        text = _wrapped_text()
+        goto_button = pn.widgets.Button(label="Go to")
+        capture_button = pn.widgets.Button(label="Capture the centre")
+        note = _wrapped_text()
+        goto_button.on_click(self._handler(lambda event: self.on_goto_row(index)))
+        capture_button.on_click(self._handler(lambda event: self.on_capture_row(index)))
+        box = pn.Column(text, pn.Row(goto_button, capture_button), note, visible=False)
+        return _CentreSlot(text, goto_button, capture_button, note, box)
+
     def _drive_bar(self) -> Any:
         """ADR-0006's *Drive*, under the image where Live is watched (m5 §17.3): a bar that wraps.
 
@@ -1103,9 +1222,6 @@ class PlatePageView:
         return clicked
 
     def _layout(self) -> Any:
-        # Sticky: at 1280 x 800 the drive bar is partly below the fold (``/ui-check``), and
-        # a page scrolled to reach it must not take STOP out of view (ADR-0006: STOP is
-        # always offered).
         strip = pn.Row(
             self.connect_button,
             self.disconnect_button,
@@ -1113,7 +1229,6 @@ class PlatePageView:
             self.resume_button,
             self.stop_button,
             sizing_mode="stretch_width",
-            styles=_STICKY_STRIP,
         )
         step_bar = pn.Row(
             *(
@@ -1158,7 +1273,13 @@ class PlatePageView:
             sizing_mode="stretch_width",
         )
         centre = pn.Row(map_column, image_column, sizing_mode="stretch_width")
-        return pn.Column(
+        # One sticky header (m5 §17.2 D12): the strip, the outcome lines and the step bar
+        # with its summaries. At 1280 x 800 the drive bar is partly below the fold
+        # (``/ui-check``), and a page scrolled to reach it must not take STOP out of view
+        # (ADR-0006: STOP is always offered), nor the step bar, which scrolled away on the
+        # owner's walk while the strip held (#431): they stay on screen together. An
+        # outcome line takes no height while it is empty.
+        self.header = pn.Column(
             strip,
             self.connection_text,
             self.drive_text,
@@ -1166,6 +1287,11 @@ class PlatePageView:
             self.message,
             self.problems_text,
             step_bar,
+            sizing_mode="stretch_width",
+            styles=_STICKY_STRIP,
+        )
+        return pn.Column(
+            self.header,
             pn.Row(self.step_panel, centre, sizing_mode="stretch_width"),
             sizing_mode="stretch_width",
         )
@@ -1173,36 +1299,59 @@ class PlatePageView:
     def _build_screens(self, sections: dict[str, Any]) -> None:
         """The lists the step panel shows, built once (m5 §17.2 D5, §17.6): never rewritten.
 
-        Each screen is its title, its lead, the next step (one instance, listed on every
-        screen and in the expert view, so it is drawn once and keeps its place whatever
-        the state), the regions of its step, and *Continue*. A value widget is one
-        instance listed on every screen that shows it: only one list is rendered, and a
-        swap keeps what was typed (measured, §17.2 D5). The tool sections are listed in
-        their screen and in the accordion's stage columns. A step's own regions are
-        today's, provisionally (B1): B2 to B4 replace them with each screen's design.
+        Each screen is its title, its lead, its own regions and *Continue*. A value widget
+        is one instance listed on every screen that shows it: only one list is rendered,
+        and a swap keeps what was typed (measured, §17.2 D5). The Stand and Plate screens
+        are designed (B2, #444, §17.4.1 and §17.4.2): each holds its own buttons, none of
+        the next step (the walk found *Run scan-plan* on the Plate screen) and none of the
+        tool sections, which stay in the expert view. The other three are today's regions,
+        provisionally (B1), with the next step (one instance, listed on each of them and in
+        the expert view, so it is drawn once and keeps its place whatever the state): B3
+        and B4 replace them with each screen's design. The tool sections of a screen are
+        listed in it and in the accordion's stage columns.
         """
         preset_region = self._preset_region()
         next_region = self._next_region()
+        # The plate, where it comes from, which way it lies and the confirmation of the
+        # placeholder: one container on the Plate screen and in the expert view.
         plate_controls = pn.Column(
             self.plate_select,
+            self.plate_from_text,
             self.orientation_select,
             pn.Column(
                 self.plate_confirm_button, self.plate_note, self.orientation_note
             ),
         )
+        # The order is D12's: the stand line and the preset with its *Load* come first,
+        # then what is known, then the calibration, so that the title, the lead and the
+        # first action are on a 1280 x 620 page under the header.
+        stand_region = pn.Column(self.stand_text, self.stand_connect_button)
         own: dict[StepName, list[Any]] = {
-            "stand": [preset_region],
-            "plate": [plate_controls],
-            "wells": [self.select_input],
-            "scan": [],
-            "results": [],
+            "stand": [
+                stand_region,
+                preset_region,
+                self.known_block,
+                self.calibrate_box,
+            ],
+            "plate": [
+                plate_controls,
+                *(slot.box for slot in self.centre_slots),
+                self.other_captures,
+                self.register_button,
+                self.register_wait,
+                self.register_card,
+                self.registered_block,
+                self.other_ways_text,
+            ],
+            "wells": [next_region, self.select_input],
+            "scan": [next_region],
+            "results": [next_region],
         }
         self.screens: dict[ScreenName, list[Any]] = {}
         for step in STEPS:
             self.screens[step] = [
                 _wrapped_text(SCREEN_TITLES[step], {"font-weight": "bold"}),
                 _wrapped_text(SCREEN_LEADS[step]),
-                next_region,
                 *own[step],
                 *(sections[name] for name in _SCREEN_TOOLS[step] if name in sections),
                 self.continue_button,
@@ -1264,6 +1413,11 @@ class PlatePageView:
         self.continue_button.label = label or ""
         self.continue_button.visible = label is not None
         self.step_panel.objects = list(self.screens[screen])
+        # After the swap: a panel keeps the scroll of the screen it replaced, and the walk
+        # opened Plate scrolled as far as Stand had been, its title out of view (m5 §17.3,
+        # D12). Measured on Panel 1.10.0: a column scrolled in the browser reports its
+        # position to the server, and setting 0 after its objects changed scrolls it back.
+        self.step_panel.scroll_position = 0
         self._style_steps()
 
     def _style_steps(self) -> None:
@@ -1442,6 +1596,8 @@ class PlatePageView:
         if drive:
             # One click: an armed stage that stays armed after a mis-click is the danger.
             self.drive_toggle.value = False
+            # The drive's answer is now this click's, not the Plate screen row's.
+            self._goto_row = None
         self.refresh()
         self.tick()
 
@@ -1487,6 +1643,66 @@ class PlatePageView:
             return
         plugin, params = drawn.plugin, list(drawn.params)
         self._try(lambda: self.page.run(plugin, params))
+        self.tick()
+
+    def _row(self, index: int) -> CentreRow | None:
+        """The centre row ``index`` as the last redraw drew it, or ``None`` when it has none."""
+        rows = self._rows_drawn
+        return (
+            rows[index] if 0 <= index < min(len(rows), len(self.centre_slots)) else None
+        )
+
+    def on_goto_row(self, index: int) -> None:
+        """*Go to <well>* of centre row ``index``: ``PlatePage.goto`` of the well the row named when it was drawn (m5 §17.4.2, D10).
+
+        The same call as a drive click, so before a registration it drives to the holder's
+        estimate (#462) and refuses where the layer does. A refusal is drawn on the row that
+        started it, not in the header's line far from the button: on the owner's walk a drive
+        before the plate was registered moved nothing and said nothing (#431). The controller
+        keeps the text (``status().goto``) for every tab, and the tick draws it on the row
+        ``_goto_row`` names. A click on a disabled button still arrives here (FM-169): the
+        refusal is the controller's (a run going, Live included).
+        """
+        row = self._row(index)
+        if row is None:
+            self.message.object = "nothing to go to: press Refresh"
+            return
+        well = row.well
+        self._goto_row = index
+        if not self._try(lambda: self.page.goto(well)):
+            # The row says it; the controller also kept it for the drive bar's line.
+            self.message.object = ""
+        self.tick()
+
+    def on_capture_row(self, index: int) -> None:
+        """*Capture the centre of <well>* (or *Redo*) of centre row ``index``: the well the row named when it was drawn.
+
+        Never the controller's ``current``: the label names the well, and what the label
+        said is what is recorded (FM-177). Accepted while Live runs, so that the operator
+        centres in Live and captures there (D11); the controller refuses while another
+        activity goes or the stage moves (FM-169).
+        """
+        row = self._row(index)
+        if row is None:
+            self.message.object = "nothing to capture: press Refresh"
+            return
+        well = row.well
+        self._try(lambda: self.page.capture_centre(well))
+        self.refresh()
+
+    def on_register(self) -> None:
+        """*Register the plate*: ``plate-registration`` with the pairs the last redraw drew, as drawn (m5 §17.4.2, #287).
+
+        Never pairs computed at the click: the operator runs what the *Command* disclosure
+        shows, as ``on_next`` does. With a wait drawn there are no pairs, and the click, which
+        a disabled button still delivers, says what the screen waits for (FM-169); a busy
+        stand or a plate nothing named is the controller's refusal.
+        """
+        pairs, wait = self._register_drawn
+        if not pairs:
+            self.message.object = wait or "nothing to register: press Refresh"
+            return
+        self._try(lambda: self.page.run("plate-registration", list(pairs)))
         self.tick()
 
     def on_choose_plate(self, name: str) -> None:
@@ -1825,6 +2041,8 @@ class PlatePageView:
         if self._filling:
             return
         self._draw_preset_note()
+        # *Calibrate the camera* runs the same fields: its command follows them.
+        self._draw_calibrate_command()
 
     def _actual(self) -> dict[str, dict[str, str]]:
         """What every tool's fields hold now, by tool and key."""
@@ -1908,6 +2126,7 @@ class PlatePageView:
         elif status.connected and not self.objective_select.options:
             self._read_objectives_again()
         self._draw_connection(status)
+        self._draw_stand(status)
         self.status_text.object = status_line(status)
         self.run_text.object = run_text(status)
         self.goto_text.object = status.goto
@@ -2068,6 +2287,9 @@ class PlatePageView:
             page.orientation,
             page.selection,
             page.refs,
+            # Each centre's objective, which another tab's recapture changes with no change
+            # to the centres themselves when the stage did not move (FM-151).
+            page.capture_objectives,
             page.walls,
             page.current,
             page.activities_ended,
@@ -2140,6 +2362,8 @@ class PlatePageView:
         self._draw_steps()
         self._draw_problems()
         self._draw_plate_ask()
+        self._draw_plate_screen()
+        self._draw_commands()
         self._draw_buttons()
         self._draw_drive()
         # The options are read here and after a save, never by the tick (§10.6).
@@ -2327,6 +2551,7 @@ class PlatePageView:
         self.next_button.disabled = running is not None or blocked is not None
         self.next_note.object = blocked or busy or ""
         self._draw_captures()
+        self._draw_stand_plate_buttons()
         lacks = self.page.lacks(Camera)
         self.snap_button.disabled = running is not None or lacks is not None
         # While live goes its own button is the one that ends it; any other activity
@@ -2363,6 +2588,167 @@ class PlatePageView:
                 f"choose the plate, or press the button if it is a {plate}."
             )
             self.plate_confirm_button.label = f"The plate is a {plate}"
+
+    def _draw_stand(self, status: PageStatus) -> None:
+        """The Stand screen's line, its *Connect* and its "known" block, from the status the tick just read (m5 §17.4.1).
+
+        The block says what the page knows and where from (D7): the objective in place and
+        the light as the status read them, the camera's calibration as the last redraw read
+        it from the run document, which a closed stand still has. ``*Calibrate the camera*``
+        is offered only when the calibration is missing or made at another objective
+        (``needs_calibration``), and only while the tool is loaded. The strip and the screen
+        draw one stand, so the second *Connect* follows the strip's rule: it is there while
+        the stand is closed and disabled while any activity goes.
+        """
+        if status.running == "connect":
+            line = f"{status.stand}: connecting…"
+        elif status.running == "disconnect":
+            line = f"{status.stand}: disconnecting…"
+        else:
+            line = f"{status.stand}: {'connected' if status.connected else 'not connected'}"
+        self.stand_text.object = line
+        self.stand_connect_button.visible = not status.connected
+        self.stand_connect_button.disabled = status.running is not None
+        view = self._view
+        calibration = None if view is None else view.camera_calibration
+        objective = status.objective or None
+        self.known_block.object = known_text(
+            objective=objective, calibration=calibration, light_on=status.light_on
+        )
+        self.calibrate_box.visible = "camera-calibration" in self.tool_runs and (
+            needs_calibration(objective, calibration)
+        )
+
+    def _draw_plate_screen(self) -> None:
+        """The Plate screen from this redraw's view: where the plate comes from, the centre rows, what *Register* runs, what it came to (m5 §17.4.2).
+
+        The rows are rewritten here and never rebuilt (D5), from the controller's captures
+        and the view's pose; the pairs *Register the plate* runs are the ones drawn now
+        (``on_register``), so a capture, a plate or a preset changed in any tab redraws
+        them at the next tick (``_shared_state``). A slot with no row is hidden; the rows
+        past the slots are text. The result line is the registered plate's, with the
+        ``assumed`` lines of the card of the tool that wrote it: a registration from a
+        seed or from the sample says what it did not measure.
+        """
+        page = self.page
+        view = self._view
+        self.plate_from_text.object = plate_from_line(
+            plate=page.plate,
+            chosen=page.plate_chosen,
+            loaded=page.preset,
+            sample_plate=page.sample_plate,
+        )
+        rows = centre_rows(
+            page.plate,
+            page.refs,
+            page.capture_objectives,
+            pose="unplaced" if view is None else view.pose.kind,
+            from_sample=page.registers_from_sample,
+        )
+        self._rows_drawn = rows
+        for index, slot in enumerate(self.centre_slots):
+            row = rows[index] if index < len(rows) else None
+            slot.box.visible = row is not None
+            if row is None:
+                continue
+            slot.text.object = row.text
+            slot.goto_button.label = f"Go to {row.well}"
+            slot.capture_button.label = (
+                "Redo" if row.captured else f"Capture the centre of {row.well}"
+            )
+        others = rows[len(self.centre_slots) :]
+        self.other_captures.object = (
+            "\n".join(["Other captures:", *(row.text for row in others)])
+            if others
+            else ""
+        )
+        self.other_captures.visible = bool(others)
+        self._register_drawn = page.registration_step()
+        registered = None if view is None else view.registered
+        lines: list[str] = []
+        if registered is not None and view is not None:
+            lines.append(registered_line(registered))
+            card = view.cards.get(view.registered_by or "")
+            if card is not None:
+                lines += [f"assumed: {text}" for text in card.assumed]
+        self.registered_block.object = "\n".join(lines)
+        self.registered_block.visible = bool(lines)
+
+    def _draw_commands(self) -> None:
+        """The *Command* disclosures of the Stand and Plate screens: the call each button makes (ADR-0006, principle 5, D8).
+
+        *Register the plate* shows the pairs it runs, drawn with them; *Calibrate the camera*
+        the pairs of the tool's own form, which it reads at the click and which
+        ``_on_field_changed`` draws again.
+        """
+        pairs, _wait = self._register_drawn
+        self.register_command.object = (
+            self.page.command_for("plate-registration", pairs) if pairs else ""
+        )
+        self.register_card.visible = bool(pairs)
+        self._draw_calibrate_command()
+
+    def _draw_calibrate_command(self) -> None:
+        """The command of ``camera-calibration`` with the page's pairs and the form's typed fields."""
+        try:
+            pairs = [
+                *self.page.page_params("camera-calibration"),
+                *self._typed("camera-calibration"),
+            ]
+        except ValueError:
+            self.calibrate_command.object = ""
+            return
+        self.calibrate_command.object = self.page.command_for(
+            "camera-calibration", pairs
+        )
+
+    def _draw_stand_plate_buttons(self) -> None:
+        """Which buttons of the Stand and Plate screens are disabled, and the reason beside each (m5 §11.2, §17.2 D11, §17.4).
+
+        Drawn at every tick and every redraw. *Go to* is disabled while any activity goes,
+        Live included, and says ``GOTO_NOT_DURING_LIVE`` or what is running; the capture
+        stays enabled while Live runs, since the operator centres in Live and captures
+        there (D11). A row's note also holds what the last drive sent from that row came to
+        (``_goto_row``): a refusal or a run that did not end ``done`` in the warning colour,
+        and what it is going to, or arrived at, in the plain one. *Register the plate* is
+        disabled while a wait is drawn, with the wait beside it, or the tool's own reason (the
+        next step's precedence: what the run document or the stand says first wins, and
+        ``CAPTURE_WELLS`` is only this wait: before any capture nothing is in the warning
+        colour). The controller refuses every one of these calls itself (FM-169).
+        """
+        page = self.page
+        running = self._running
+        live = page.is_live
+        connected = page.connected
+        busy = None if running is None else busy_note(running, live=live)
+        blocked = self._blocked.get("camera-calibration")
+        self.calibrate_button.disabled = running is not None or blocked is not None
+        self.calibrate_note.object = blocked or busy or ""
+        stage_off = not connected or (running is not None and not live)
+        sent = self.goto_text.object
+        for index, slot in enumerate(self.centre_slots):
+            slot.goto_button.disabled = not connected or running is not None
+            slot.capture_button.disabled = stage_off
+            lines: list[str] = []
+            if live:
+                lines.append(GOTO_NOT_DURING_LIVE)
+            elif busy is not None:
+                lines.append(busy)
+            drive = sent if self._goto_row == index and sent else ""
+            if drive:
+                lines.append(drive)
+            slot.note.object = "\n".join(lines)
+            trouble = bool(drive) and not drive.startswith(_GOTO_PLAIN_PREFIXES)
+            slot.note.styles = {
+                **_WRAP_STYLES,
+                **({"color": _WARNING} if trouble else {}),
+            }
+        _pairs, wait = self._register_drawn
+        reason = self._blocked.get("plate-registration") or wait
+        if "plate-registration" not in self.tool_runs:
+            reason = "plate-registration did not load: the problems line says why"
+        self.register_button.disabled = running is not None or reason is not None
+        self.register_wait.object = reason or busy or ""
 
     def _draw_captures(self) -> None:
         """The three capture buttons name the well they record and the side of the *Wall* select (m5 §11.1).

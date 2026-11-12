@@ -23,6 +23,7 @@ import logging
 import math
 import os
 import re
+import shlex
 import string
 import subprocess
 import sys
@@ -5873,6 +5874,28 @@ def test_registration_step_is_the_next_steps_pairs_and_wait(
         page.close()
 
 
+def test_command_for_is_the_line_the_next_step_shows(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _page(fake_microscope, run_doc, _real("plate-registration"))
+    try:
+        page.choose_plate("96-well")
+        fake_microscope.require(XYStage).move_to_um(1.0, 2.0)
+        page.capture_centre("A1")
+        step = page.view().next_step
+        assert step is not None
+        assert step.plugin == "plate-registration"
+        # One builder: what a screen's *Command* shows is what the next step shows.
+        assert page.command_for("plate-registration", step.params) == step.command
+        words = shlex.split(page.command_for("camera-calibration", ["step_um=40"]))
+        assert words[:3] == ["smc", "run", "camera-calibration"]
+        assert words[words.index("--run-doc") + 1] == str(page.run_doc)
+        assert words[-2:] == ["--param", "step_um=40"]
+        assert "--dry-run" not in words
+    finally:
+        page.close()
+
+
 def _profile_with_sample(plate: str = "96-well") -> Profile:
     return Profile.model_validate(
         {"microscope": {"name": "demo"}, "sample": {"plate": plate}}
@@ -5939,6 +5962,7 @@ def test_the_view_carries_the_calibration_and_the_registered_plate(
         view = page.view()
         assert view.camera_calibration is None
         assert view.registered is None
+        assert view.registered_by is None
         seed_camera_calibration(run_doc, objective=TEN_X)
         _seed(run_doc, "plate-registration", "plate", _plate("96-well"), minute=1)
         view = page.view()
@@ -5948,9 +5972,12 @@ def test_the_view_carries_the_calibration_and_the_registered_plate(
             objective=TEN_X, when_utc="2026-11-09 09:30:00"
         )
         assert view.registered == _plate("96-well")
+        # The tool that wrote it, so that the screen shows that tool's `assumed` lines.
+        assert view.registered_by == "plate-registration"
         # A plate of another name is not the page's: no result line for it.
         page.choose_plate("384-well")
         assert page.view().registered is None
+        assert page.view().registered_by is None
         # A calibration that did not record its objective says so, and is still the matrix's.
         seed_camera_calibration(run_doc, objective=None)
         assert page.view().camera_calibration == CalibrationNote(

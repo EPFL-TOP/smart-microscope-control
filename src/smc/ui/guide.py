@@ -45,6 +45,7 @@ __all__ = [
     "MAP_FIELDS_UP_TO",
     "NO_CALIBRATION_FOR_SIDES",
     "ORIENTATION_IN_STAGE_TERMS",
+    "OTHER_WAYS_TO_REGISTER",
     "PLATE_NOT_CHOSEN",
     "SCREEN_LEADS",
     "SCREEN_TITLES",
@@ -441,6 +442,14 @@ def continue_label(step: StepName) -> str | None:
 #: is accepted (measured on the owner's walk, #431). Per well the path is Go to, Live,
 #: the arrows, Capture, End live, and nothing ends Live on its own.
 GOTO_NOT_DURING_LIVE = "End live to go to another well; Capture works during Live"
+
+#: What the Plate screen says of the two other ways to register (m5 §17.2 D3, §17.4.2): the
+#: guided path offers three centres by eye only, and these two are run from the expert view.
+OTHER_WAYS_TO_REGISTER = (
+    "Other ways to register: from the walls of 2 or 3 wells (slower; measures the "
+    "wells' size too) or automatically (surveys the plate, about 7 minutes): in the "
+    "expert view."
+)
 
 
 @dataclass(frozen=True, slots=True)
