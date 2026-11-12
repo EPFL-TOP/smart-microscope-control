@@ -92,6 +92,7 @@ from smc.plugins.slots import (
     PlateResult,
     RouteResult,
     ScanPlanResult,
+    ScanResult,
     WallSide,
     WallTouch,
     WellGeometry,
@@ -772,13 +773,21 @@ def _scan_plan_of(record: StageRecord) -> ScanPlanResult | None:
         return None
 
 
-def _plan_layer(plan: ScanPlanResult | None, problems: list[str]) -> PlanLayer | None:
+def _plan_layer(
+    plan: ScanPlanResult | None, scan: ScanResult | None, problems: list[str]
+) -> PlanLayer | None:
     """The layer the map draws for a usable scan plan, ``None`` for no plan or one it cannot draw (m5 §14.1).
 
     The model does not bound ``fov_um``, and a rectangle of zero or negative size is
     invisible or flipped: it is a problem line and no layer, never an exception
     (FM-125). Past ``MAP_FIELDS_UP_TO`` the layer keeps the count and no field, so
     that the payload is bounded whatever a document holds (FM-140).
+
+    ``scan`` is the usable ``scan`` of this plan, ``None`` when there is none (stale, of
+    another profile, not ``done``, not valid). A plan's field is *imaged* when the scan has
+    a frame with its name (m5 §17.10.2): a field that failed has none and a dry run takes
+    none, and the map claims only what the record holds. The plan's order is kept, and the
+    bound is the fields' own.
     """
     if plan is None:
         return None
@@ -789,15 +798,21 @@ def _plan_layer(plan: ScanPlanResult | None, problems: list[str]) -> PlanLayer |
         )
         return None
     count = len(plan.fields)
+    drawn = count <= MAP_FIELDS_UP_TO
+    framed = (
+        frozenset(frame.name for frame in scan.frames)
+        if drawn and scan is not None
+        else frozenset[str]()
+    )
     return PlanLayer(
         count=count,
         wells=len(plan.wells),
         fov_um=plan.fov_um,
-        fields=(
-            tuple((f.x_um, f.y_um) for f in plan.fields)
-            if count <= MAP_FIELDS_UP_TO
-            else ()
-        ),
+        fields=tuple((f.x_um, f.y_um) for f in plan.fields) if drawn else (),
+        well_names=tuple(plan.wells),
+        objective=plan.objective,
+        estimate_s=plan.estimate_s,
+        imaged=tuple((f.x_um, f.y_um) for f in plan.fields if f.name in framed),
     )
 
 
@@ -1151,6 +1166,15 @@ class PlatePage:
         self._lock = threading.Lock()
         self._current_run: tuple[str, threading.Event] | None = None
         self._progress: Progress | None = None
+        # The latest activity's clock (m5 §17.10.2), under ``_lock`` with the progress it
+        # times: the name, ``time.monotonic()`` at its start and at its end (``None``
+        # while it goes), and the first and the latest report as ``(seconds since the
+        # start, done)``, stamped when the worker made them. Live keeps none.
+        self._clock_of: str | None = None
+        self._clock_start: float | None = None
+        self._clock_end: float | None = None
+        self._first_report: tuple[float, int] | None = None
+        self._last_report: tuple[float, int] | None = None
         self._outcome: str | None = None
         # What the last drive to a well came to (m3 §5.5 D7), under ``_lock``.
         self._goto = ""
@@ -2093,6 +2117,10 @@ class PlatePage:
                 raise RuntimeError(f"{self._current_run[0]} is running")
             self._current_run = (name, event)
             self._progress = None
+            self._clock_of = name
+            self._clock_start = time.monotonic()
+            self._clock_end = None
+            self._first_report = self._last_report = None
             self._outcome = None
             while True:
                 try:
@@ -2124,6 +2152,7 @@ class PlatePage:
         finally:
             with self._lock:
                 self._outcome = outcome
+                self._clock_end = time.monotonic()
                 if name == "goto-well":
                     # Whoever started it: a drive click, a tool's Run, another tab.
                     self._goto = outcome
@@ -2132,6 +2161,24 @@ class PlatePage:
                 # so a session that sees the count change reads them.
                 self._ended += 1
             log.info("%s", outcome)
+
+    def _on_progress(self, progress: Progress) -> None:
+        """A plugin's report, on the worker: stamped with the clock, then queued for the tick (m5 §17.10.2).
+
+        The stamp is taken here and not when ``status()`` drains the queue: the tick is one
+        second coarse, and a scan of 0.19 s a field would show every report at the second
+        it was read. ``_lock`` is held for the stamp alone, never across the queue's put
+        or a device call (FM-70), and this never raises: the runner drops a callback that
+        does, and the rest of the run would show no progress.
+        """
+        now = time.monotonic()
+        with self._lock:
+            if self._clock_start is not None:
+                stamped = (max(0.0, now - self._clock_start), progress.done)
+                if self._first_report is None:
+                    self._first_report = stamped
+                self._last_report = stamped
+        self._queue.put(progress)
 
     def _run_plugin(
         self,
@@ -2158,7 +2205,7 @@ class PlatePage:
                 self._stand(),
                 parsed,
                 self._run_doc,
-                on_progress=self._queue.put,
+                on_progress=self._on_progress,
                 stop=event,
                 plugin_version=entry.version,
                 preset=preset,
@@ -3025,6 +3072,7 @@ class PlatePage:
             progress = self._progress
             outcome = self._outcome
             goto = self._goto
+            clock = self._clock()
         stand = self._profile.microscope.name
         stop_refused = tuple(
             role.value for role in self._profile.safety.stop_refused_by
@@ -3072,6 +3120,7 @@ class PlatePage:
                         stop_refused=stop_refused,
                         problems=tuple(problems),
                         goto=goto,
+                        clock=clock,
                     )
         return PageStatus(
             stand=stand,
@@ -3091,6 +3140,23 @@ class PlatePage:
             problems=(),
             connected=False,
             goto=goto,
+            clock=clock,
+        )
+
+    def _clock(self) -> RunClock | None:
+        """The latest activity's clock, or ``None`` before any and for Live; the caller holds ``_lock`` (m5 §17.10.2).
+
+        ``elapsed_s`` of an activity that goes is read now, and one that ended keeps its
+        length: the Scan screen says how long the scan took after it. Live reports no
+        clock, since it sets its own progress and runs until it is ended.
+        """
+        if self._clock_start is None or self._clock_of == "live":
+            return None
+        end = time.monotonic() if self._clock_end is None else self._clock_end
+        return RunClock(
+            elapsed_s=max(0.0, end - self._clock_start),
+            first=self._first_report,
+            last=self._last_report,
         )
 
     def join(self, timeout_s: float | None = None) -> bool:
@@ -3295,9 +3361,14 @@ class PlatePage:
         density = self._slot(doc, "density", DensityResult, problems)
         route = self._slot(doc, "route", RouteResult, problems)
         calibration = self._slot(doc, "camera-calibration", CameraCalibration, problems)
+        # The scan beside the plan: its frames mark the plan's fields on the map and its
+        # counts are the Scan screen's result line. Usable by the same rule as the plan, so
+        # a scan of an earlier plan (the plan was laid out again) is neither (m5 §17.10.2).
+        scan = self._slot(doc, "scan", ScanResult, problems)
         plan = _plan_layer(
-            self._slot(doc, "scan-plan", ScanPlanResult, problems), problems
+            self._slot(doc, "scan-plan", ScanPlanResult, problems), scan, problems
         )
+        scan_record = None if scan is None else doc.provider("scan")
         geometries, pose = self._registered_geometries(registered)
         selected = frozenset(self.selection)
         measured = {} if density is None else {w.well: w for w in density.wells}
@@ -3378,6 +3449,15 @@ class PlatePage:
             ),
             registered=None if plate_record is None else registered,
             registered_by=None if plate_record is None else plate_record.plugin,
+            scanned=(
+                None
+                if scan is None or scan_record is None
+                else ScanSummary(
+                    frames=len(scan.frames),
+                    failed=len(scan.failed),
+                    dry_run=scan_record.dry_run,
+                )
+            ),
         )
 
     def _sides(self, geometries: Sequence[WellGeometry]) -> tuple[SideLabel, ...]:
