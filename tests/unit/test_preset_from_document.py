@@ -404,7 +404,11 @@ CASES: dict[str, list[dict[str, Any]]] = {
             "relock": False,
         }
     ],
-    "goto-well": [{"well": "B2", "side": "-X"}],
+    "goto-well": [
+        {"well": "B2", "side": "-X"},
+        # An estimated drive's (#462): whether a preset should keep these is open.
+        {"well": "A1", "plate": "greiner-24-well", "orientation": "turned-180"},
+    ],
     "nis-export": [{"out": "/tmp/x y/out.xml", "overwrite": True}],
     "objective-offsets": [
         {

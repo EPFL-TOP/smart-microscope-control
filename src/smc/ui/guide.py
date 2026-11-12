@@ -36,6 +36,9 @@ __all__ = [
     "CAPTURE_WELLS",
     "DRY_RUN_NO_FRAME",
     "END_LIVE_LABEL",
+    "GOTO_ESTIMATED",
+    "GOTO_UNPLACED",
+    "GOTO_WALL_NEEDS_REGISTRATION",
     "MAP_FIELDS_UP_TO",
     "NO_CALIBRATION_FOR_SIDES",
     "ORIENTATION_IN_STAGE_TERMS",
@@ -162,6 +165,27 @@ WALLS_NEED_CALIBRATION = (
 NO_CALIBRATION_FOR_SIDES = (
     "walls are named on the image, and no camera calibration says which stage side "
     "that is: run camera-calibration (Set up), then try again"
+)
+
+#: Why a drive click goes nowhere on an *unplaced* map (m3 §5.5 D6): no registered plate,
+#: and no holder to estimate one from, so the page cannot say where a well is.
+GOTO_UNPLACED = (
+    "the plate is not registered, and this stand's profile does not say where its "
+    "holder puts a plate ([holder] plate_centre_xy_um): register the plate, or "
+    "drive with the arrows"
+)
+
+#: Why a wall of an *estimated* well is not driven to (m3 §5.5 D6): the holder's estimate
+#: can be a few hundred µm off, more than a wall's offset from the centre.
+GOTO_WALL_NEEDS_REGISTRATION = (
+    "a wall is reached through a registered plate: go to the centre, and register "
+    "the plate"
+)
+
+#: What the drive's answer says while it goes to an *estimated* well (m3 §5.5 D7), a
+#: ``str.format`` template with ``{well}``: the operator then centres it by eye.
+GOTO_ESTIMATED = (
+    "going to {well}: the holder's estimate, not registered; centre it by eye"
 )
 
 

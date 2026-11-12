@@ -110,6 +110,9 @@ from smc.ui.frames import Frame
 from smc.ui.guide import (
     CAPTURE_WELLS,
     DRY_RUN_NO_FRAME,
+    GOTO_ESTIMATED,
+    GOTO_UNPLACED,
+    GOTO_WALL_NEEDS_REGISTRATION,
     MAP_FIELDS_UP_TO,
     NO_CALIBRATION_FOR_SIDES,
     PLATE_NOT_CHOSEN,
@@ -449,10 +452,10 @@ class PlateView:
 
     ``nominal`` is true when the wells are not a registered plate's: those of the plate
     type with no rotation, A1 at the stage's origin (``pose.kind`` *unplaced*) or placed
-    from the stand's holder (*estimated*, m5 §15). Nothing but the title read it before
-    ``pose``, and nothing else changed meaning: ``goto-well`` still reads only the run
-    document's slot, so a drive click on a nominal map moves nothing. ``pose`` says
-    which of the four the map is drawn in. ``blocked`` maps a registered
+    from the stand's holder (*estimated*, m5 §15). A drive click on an *estimated* map
+    drives ``goto-well`` to the holder's estimate of the well's centre, and its record
+    says so; on an *unplaced* map it is refused (m3 §5.5 D6). ``pose`` says which of the
+    four the map is drawn in. ``blocked`` maps a registered
     tool to why it cannot run now: what it reads, what the stand lacks, or a
     stopped or failed run's checkpoint that ``smc run --resume`` could continue
     (``run()`` refuses to start such a stage afresh). ``problems`` are what
@@ -559,6 +562,9 @@ class PageStatus:
     refuse their stop, so that the page can say that STOP does not stop a move in
     flight on this stand (FM-117). With ``connected`` false the page holds no
     stand, and every read of it is unknown (``None``, ``?``), never a fault.
+    ``goto`` is what the last drive to a well came to, for every tab, whoever started
+    it (m3 §5.5 D7): a refusal, what it is going to, then the ``goto-well`` run's
+    outcome; ``""`` before any, and after *Refresh*.
     """
 
     stand: str
@@ -577,6 +583,7 @@ class PageStatus:
     stop_refused: tuple[str, ...]
     problems: tuple[str, ...]
     connected: bool = True
+    goto: str = ""
 
 
 def _one_line(error: BaseException) -> str:
@@ -1075,6 +1082,8 @@ class PlatePage:
         self._current_run: tuple[str, threading.Event] | None = None
         self._progress: Progress | None = None
         self._outcome: str | None = None
+        # What the last drive to a well came to (m3 §5.5 D7), under ``_lock``.
+        self._goto = ""
         self._frame: Frame | None = None
         self._queue: queue.SimpleQueue[Progress] = queue.SimpleQueue()
         self._worker: threading.Thread | None = None
@@ -1325,11 +1334,12 @@ class PlatePage:
         """The well under a point of the map: selected, or (``drive``) driven to.
 
         A point that is on no well, or is not finite, does nothing and returns
-        ``None``. In select mode nothing moves, whatever the map shows.
+        ``None``. In select mode nothing moves, whatever the map shows. A drive on an
+        *estimated* map goes to the holder's estimate of the well's centre (``goto``).
 
         Raises:
             ValueError: ``drive`` on a map of another plate than the registered
-                one (see ``goto``).
+                one, on an *unplaced* map, or what else ``goto`` refuses.
             RuntimeError: ``drive`` while a run is going, or after ``close``.
         """
         geometries, _pose = self._geometries(self._document()[0])
@@ -1350,7 +1360,7 @@ class PlatePage:
         return well
 
     def goto(self, well: str, side: str = "centre") -> None:
-        """Run ``goto-well`` for ``well``.
+        """Run ``goto-well`` for ``well``: through the registered plate, or to the holder's estimate.
 
         ``goto-well`` takes a well's name and reads the registered plate, while the
         map of a plate chosen with ``choose_plate`` is the nominal one when the
@@ -1358,29 +1368,86 @@ class PlatePage:
         drive the stage to C5 of the registered 384-well plate with nothing on the
         page to say so. So it refuses that mismatch before anything changes.
 
+        Without a registered plate, the map's pose decides (m3 §5.5 D6): an
+        *estimated* map drives to the well's centre where the stand's holder puts the
+        page's plate (the run gets ``plate`` and ``orientation``), never to a wall,
+        and never with the placeholder plate nothing named; an *unplaced* map, whose
+        stand does not say where its plate lies, refuses (``GOTO_UNPLACED``). Each
+        refusal the page can foresee comes here, before a thread starts (FM-206).
+
         ``side`` is ``centre`` or a side **on the image**, as the operator names a wall
         (m5 §13.1): ``goto-well`` takes stage directions, so the side is mapped with
         the latest usable ``camera-calibration`` and the run gets the stage's. The
-        mapping comes after the plate's check and before ``current`` changes and a
+        mapping comes after the plate's checks and before ``current`` changes and a
         run starts, so a refusal leaves the page as it was.
+
+        What it came to is ``status().goto`` (m3 §5.5 D7): the refusal's text, or what
+        it is going to, then the run's outcome.
 
         Raises:
             ValueError: A usable ``plate`` slot names another plate than ``plate``;
-                ``side`` is not ``centre`` or a side of the image; an image side with
-                no usable calibration (``NO_CALIBRATION_FOR_SIDES``), or one whose
-                camera is off a quarter turn (``frames``' own text).
+                an unplaced map (``GOTO_UNPLACED``); an estimated map of the
+                placeholder plate (``PLATE_NOT_CHOSEN``) or with a wall
+                (``GOTO_WALL_NEEDS_REGISTRATION``); ``side`` is not ``centre`` or a
+                side of the image; an image side with no usable calibration
+                (``NO_CALIBRATION_FOR_SIDES``), or one whose camera is off a quarter
+                turn (``frames``' own text).
             RuntimeError: A run is going, or the page is closed.
         """
+        try:
+            name, params, going = self._goto_params(well, side)
+        except (ValueError, RuntimeError) as exc:
+            with self._lock:
+                self._goto = _one_line(exc)
+            raise
+        self.current = name
+        with self._lock:
+            self._goto = going
+            ended = self._ended
+        self.run("goto-well", params)
+        with self._lock:
+            # ``run`` refused without starting anything (no stand, a parameter, a
+            # checkpoint): its outcome is the answer. An activity that started, or has
+            # already ended and said its own outcome, is left alone.
+            if self._current_run is None and self._ended == ended:
+                self._goto = self._outcome or going
+
+    def _goto_params(self, well: str, side: str) -> tuple[str, list[str], str]:
+        """``goto``'s checks in m3 §5.5 D6's order; the well, the run's parameters and what the drive says it is doing.
+
+        One read of the run document for the plate's check and the pose, so that a
+        click never judges two documents. A document that cannot be read is said
+        first, in ``view().problems``' words: read as empty, it would be judged a map
+        with no registered plate (``GOTO_UNPLACED``), and no run could write to it.
+        """
         self._refuse_if_busy()
-        self._refuse_another_registered_plate(self._document()[0])
+        doc, unreadable = self._document()
+        if unreadable is not None:
+            # The text `_document` took where it caught the error (FM-98).
+            raise ValueError(f"run document: {unreadable}")
+        self._refuse_another_registered_plate(doc)
+        _geometries, pose = self._geometries(doc)
+        if pose.kind == "unplaced":
+            raise ValueError(GOTO_UNPLACED)
+        estimated = pose.kind == "estimated"
+        if estimated and not self._plate_chosen:
+            raise ValueError(PLATE_NOT_CHOSEN)
+        if estimated and side != "centre":
+            raise ValueError(GOTO_WALL_NEEDS_REGISTRATION)
         stage_side = (
             "centre"
             if side == "centre"
             else self._stage_side(_image_side(side, ("centre",)))
         )
         name = normalise_well(well)
-        self.current = name
-        self.run("goto-well", [f"well={name}", f"side={stage_side}"])
+        params = [f"well={name}", f"side={stage_side}"]
+        if not estimated:
+            return name, params, f"going to {name}"
+        return (
+            name,
+            [*params, f"plate={self._plate}", self._orientation_pair()],
+            GOTO_ESTIMATED.format(well=name),
+        )
 
     def _stage_side(self, side: ImageSide) -> WallSide:
         """The stage side that ``side`` of the image is, from the document as it is now (m5 §13.1).
@@ -1891,6 +1958,9 @@ class PlatePage:
         finally:
             with self._lock:
                 self._outcome = outcome
+                if name == "goto-well":
+                    # Whoever started it: a drive click, a tool's Run, another tab.
+                    self._goto = outcome
                 self._current_run = None
                 # After the activity's own writes (a run's record is on disk by now),
                 # so a session that sees the count change reads them.
@@ -2788,6 +2858,7 @@ class PlatePage:
             running = None if self._current_run is None else self._current_run[0]
             progress = self._progress
             outcome = self._outcome
+            goto = self._goto
         stand = self._profile.microscope.name
         stop_refused = tuple(
             role.value for role in self._profile.safety.stop_refused_by
@@ -2834,6 +2905,7 @@ class PlatePage:
                         halted=state.halted,
                         stop_refused=stop_refused,
                         problems=tuple(problems),
+                        goto=goto,
                     )
         return PageStatus(
             stand=stand,
@@ -2852,6 +2924,7 @@ class PlatePage:
             stop_refused=stop_refused,
             problems=(),
             connected=False,
+            goto=goto,
         )
 
     def join(self, timeout_s: float | None = None) -> bool:
@@ -2974,6 +3047,7 @@ class PlatePage:
         with self._lock:
             if self._current_run is None:
                 self._outcome = None
+                self._goto = ""
 
     # --- the view ---------------------------------------------------------------
 

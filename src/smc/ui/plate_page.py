@@ -695,6 +695,10 @@ class PlatePageView:
         self.drive_toggle = pn.widgets.Toggle(
             label="Drive (next click moves the stage)", value=False
         )
+        # What the last drive to a well came to, beside the toggle the operator pressed
+        # (m3 §5.5 D7, #431 finding 4): a refusal, what it goes to, then the run's end.
+        # The controller's, so every tab draws the same (FM-151); text, never Markdown.
+        self.goto_text = self._outcome_line()
         self.side_select = pn.widgets.Select(
             label="Drive to (wall as on the image)",
             options=list(_SIDES),
@@ -741,6 +745,7 @@ class PlatePageView:
             self.run_text,
             self.message,
             self.problems_text,
+            self.goto_text,
         ):
             pane.param.watch(self._handler(self._hide_when_empty), "object")
         self.connect_button.on_click(self._handler(lambda event: self.on_connect()))
@@ -1021,6 +1026,7 @@ class PlatePageView:
             self.objective_confirm,
             self.side_select,
             self.drive_toggle,
+            self.goto_text,
             self.drive_note,
             flex_wrap="wrap",
             sizing_mode="stretch_width",
@@ -1904,6 +1910,7 @@ class PlatePageView:
         self._draw_connection(status)
         self.status_text.object = status_line(status)
         self.run_text.object = run_text(status)
+        self.goto_text.object = status.goto
         self.resume_button.visible = status.halted
         self.stop_button.disabled = False
         # While Live runs and its frames hold the cross, the tick leaves it to them: a
