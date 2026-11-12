@@ -4411,24 +4411,61 @@ Run.
 **17.4.3 Wells** (`"wells"`)
 - Title: *Which wells?* Lead: *Click wells on the map, or type them. The map shows the
   fields and the time the scan will take.*
-- Fields: *Wells* (`select_input`), `scan-plan`'s `coverage` field (the tool's own
-  `TextInput`, one instance), `scan`'s `autofocus` field; each with its *from …* line.
-  A "known" block: `Objective: <label>, in place`, `Fields: <n> in <w> wells` and
-  `Time: about <duration_text>` from the plan (§14) once laid out, with the plan's
-  assumed timing on its own line.
-- Action: *Lay out the fields* (`scan-plan`). Waits: `SELECT_WELLS`, the plate.
-- Continue: *Continue to Scan*.
+- Fields, in this order (the action is on the page without a scroll, as D12 asks of the
+  first two screens): *Wells* (`select_input`) with its line (`no well chosen yet`, `from
+  the preset <name>`, `chosen on this page`); `scan-plan`'s `coverage` field and
+  `scan`'s `autofocus` field (the tools' own `TextInput`s, one instance each, D5), each
+  with its *from …* line: `from the preset <name>`, `from the profile's suggestions`,
+  `typed on this page`, or `the tool's default: <default>` while it is empty. A string
+  default is shown without its quotes in the placeholder (`if-engaged`, not
+  `'if-engaged'`: finding 13 of the walk).
+- Action: *Lay out the fields* (`scan-plan`, the same handler as the tool's *Run*).
+  Waits, the first that holds: the stand is closed, the plate is not chosen
+  (`PLATE_NOT_CHOSEN`), no usable registered plate (`REGISTER_FIRST`), the tool's other
+  reason (a checkpoint, a missing capability), `SELECT_WELLS`; a run going says
+  `busy_note`.
+- Under the action, a "known" block (§17.10.3): `Objective: <label>, in place`, `Fields:
+  <n> in <w> wells`, `Time: about <duration_text>` from the plan's `estimate_s` (§14.3),
+  then the plan's own `assumed` lines. Before a plan, `Fields: not laid out yet`; a plan
+  the run document no longer holds usable says why (`Fields: out of date (<the
+  checklist's reason>)`); a plan made with no timing says `Time: not known (no timing
+  measured; the expert view's timing tool measures it, then lay out the fields again)`:
+  an unknown, never a zero (FM-170). When the wells selected are not the plan's, a note
+  says which wells the plan is for: the plan is what *scan* does (§14.1), and a selection
+  changed since has not changed it.
+- A *Command* disclosure (D8), then *Continue to Scan*.
 
 **17.4.4 Scan** (`"scan"`)
-- Title: *Scan <wells>* (`Scan B2 and B11`, `Scan 12 wells`). Lead: *<n> fields at
-  <objective>. STOP, at the top right, stops the scan.*; on a stand whose profile says
-  `stop_refused_by`, the lead adds *A move already sent finishes first on this stand.*
-- Action: *Start the scan* (`scan`). Waits: the plan, `DRY_RUN_NO_FRAME`.
-- While it runs: a `pn.indicators.Progress` (`value=done`, `max=total`) and the
-  lines `Field <done> of <total>`, `Elapsed <t>`, `Left about <t> (estimated from the
-  fields so far)`, from `PageStatus.progress`; the map draws the plan's first `done`
-  fields as imaged (the plan's fields are in visiting order, §14.1).
-- Result line: `Scanned: <frames> frames, <failed> failed` and the folder.
+- Title: *Scan <wells>*, from the **plan's** wells (the selection while there is no
+  plan, the static title while there is neither), in plate order and not in the
+  visiting order: `Scan B2`, `Scan B2 and B11` (the demo visits B11 first, §14),
+  `Scan A1, A2 and A3`, and from four wells `Scan 12 wells`. Lead: *<n> fields at
+  <objective>. STOP, at the top right, stops the scan.*, the plan's own count and
+  objective; on a stand whose profile says `stop_refused_by`, the lead adds *A move
+  already sent finishes first on this stand.*
+- Action: *Start the scan* (`scan`, the same handler as the tool's *Run*). Waits, the
+  first that holds: the stand is closed, no usable plan (`LAY_OUT_FIRST`), the tool's
+  other reason (a checkpoint: the page never starts a stage afresh over one, §2), a
+  run going (`busy_note`). `DRY_RUN_NO_FRAME` is a **note** under the action on a page
+  served with `--dry-run`, not a wait: a dry run walks the fields and is the mode the
+  page was asked for (`/ui-check` serves it so), and the note says what it leaves out.
+- While it runs, and after it until another activity starts: a `pn.indicators.Progress`
+  (`value=done`, `max=total`) and the lines `Field <done> of <total>`, `Elapsed <t>`,
+  `Left about <t> (estimated from the fields so far)`. They come from `PageStatus.progress`
+  and `PageStatus.clock` (§17.10.2): a `Progress` carries no time, so the controller
+  stamps each report. The rate is the one **between the first report and the latest**,
+  never from the click: the demo's scan takes 4.6 s to its first field and 0.19 s for
+  each of the next (measured, §17.10.1), so a rate from the click would say 2 min 47 s
+  left at the second field, where 13 s were. `Left` says `not known yet (it needs two fields)` until there are
+  two reports a clock tick apart (FM-197), and is not drawn once the last field is done.
+- The map draws the plan's first `done` fields as imaged while the scan runs (the
+  plan's fields are in visiting order, §14.1, and the scan visits them in it: measured,
+  the reports' names are the plan's in order), and, from the run document afterwards,
+  the fields the usable `scan` has a frame for (§17.10.2): the failed ones are not
+  marked, and a dry run, which takes no frame, marks none.
+- Result line, from the usable `scan` record, `Scanned: <frames> frames, <failed>
+  failed`, and `Scanned in a dry run: no frame was taken`; under it the card's
+  `assumed:` lines and its `folder:` line.
 - Continue: *Continue to Results*.
 - **The frames as they arrive** on the image: m3 §25 (#447). The scan hands each
   frame it has written to the page through `RunContext.show_frame`; the image shows the
@@ -4569,7 +4606,7 @@ Every build issue edits `plate_page.py` and, from B2 on, `controller.py` and
   scroll of D12. It comes after #462 (D10), which edits `goto_well.py` and
   `controller.py`.
 - **B3, the Wells and Scan screens** (#445): §17.4.3 and §17.4.4, the progress and
-  the imaged fields.
+  the imaged fields; their interface is §17.10.
 - **B4, the Results screen** (#446): §17.4.5, `PlatePage.run_chain`, the colour bar's
   title.
 - **The scan's frames on the image** (#447): a channel from a plugin to the page for
@@ -4622,6 +4659,210 @@ the title and the first action are inside the page.
   new action checks in the controller), FM-171 (every new button through
   `_handler`, the guard test walks `screens`), FM-174 (the figures never in a swapped
   list), FM-181 (the Plate screen's capture is today's `capture_centre`).
+
+### 17.10 The Wells and Scan screens' interface (#445, B3)
+
+Fixed by #445's plan (2026-11-12). §17.4.4 says the progress comes "from
+`PageStatus.progress`", which carries no time (`Progress(plugin, done, total, message)`,
+m3 §1.4): Elapsed and Left need a clock the controller keeps. This section fixes it, the
+layer of the imaged fields, and the texts; the build is #445.
+
+#### 17.10.1 What was measured (2026-11-12, planning #445)
+
+On `demo-sample` (macOS, Python 3.13.0, Panel 1.10.0), a throwaway
+script driving `PlatePage` as the screens do: Connect, `plate-registration` from the
+sample's refs, `select_text("B2,B11")`, `scan-plan` with `coverage=0.4`, `scan`:
+
+- **The reports.** `scan` calls `ctx.progress(done, total, name)` once per field, after a
+  failed field too (`done` counts the fields visited, not the frames written): 72 reports,
+  `total` 72 each, `message` the field's name. The names are the plan's `fields` in
+  order (`B11_0000` first: the demo visits B11 before B2). A poll of `status()` every
+  50 ms saw all 72.
+- **The clock.** The first report came 4.65 s after the click (the scan's own
+  start-up: checks, the stand's state, the folder), then every 0.05 to 0.11 s, the
+  last at 18.08 s: `scan done in 18.1 s`. The rate between the first report and the
+  last is 0.189 s a field; from the click, 0.251 s.
+- **After the run.** `status().progress` keeps the last report (`done=72, total=72`)
+  until another activity starts (`_start_activity` resets it).
+- **The records.** The usable `scan` result holds `frames` (72, each with its `well`,
+  `index` and `name`), `failed` (0) and `folder`; the card's `files` line is the
+  folder's absolute path. `scan-plan`'s `estimate_s` is `None` without a `timing`
+  run, with `assumed` `no camera calibration for Nikon 10X S Fluor: rotation 0 and no
+  mirror assumed`; with the demo's `timing` it was 42.16 s (§14).
+- **A page served with `--dry-run`** (what `/ui-check` serves): the same path ends
+  `scan done in 0.0 s; assumed: dry run: 72 fields walked, no frame taken`; the record has
+  `frames` 0 and `failed` 0, `dry_run` true, and a poll every 10 ms saw one report, the
+  last. A dry-run scan cannot be photographed mid-run.
+- **The widgets.** `pn.indicators.Progress(value=0, max=72)` takes `value` and `max` in
+  either order and does **not** refuse a `max` below the `value` (Panel 1.10.0): the page
+  never hands it one (`value=min(done, max)`). A Bokeh `ColumnDataSource` takes `.data`
+  assigned whole, as the page's other sources do.
+- **The fields' defaults.** `coverage` is a key field of `scan-plan` (default `1.0`,
+  suggested `0.4` on `demo-sample`); `autofocus` is the key field of `scan`, and its
+  default as `describe_params` gives it is `'if-engaged'`, with its quotes. `timing` has
+  no key field.
+
+#### 17.10.2 The interface
+
+```python
+#: smc/ui/controller.py
+@dataclass(frozen=True, slots=True)
+class RunClock:
+    """How long the latest activity has run, and its progress reports as they came.
+
+    ``elapsed_s`` is since the activity started, fixed when it ended. ``first`` and
+    ``last`` are ``(seconds since the start, done)`` of the first and the latest report.
+    """
+
+    elapsed_s: float
+    first: tuple[float, int] | None
+    last: tuple[float, int] | None
+```
+
+- **`PageStatus.clock: RunClock | None = None`**, after `goto`. `_start_activity` stamps
+  the start and clears the two reports, as it clears `_progress`; `_run_plugin` passes
+  `on_progress=self._on_progress` instead of `self._queue.put`, which stamps the report
+  (`time.monotonic()` at the worker, under `_lock`, never at the tick's drain, which is one
+  second coarse) and then puts it on the queue; `_work`'s `finally` stamps the end. `live`
+  reports no clock (it sets its own `_progress`). `elapsed_s` of a running activity is read
+  at `status()`. Nothing else reads a clock: the tick draws from the status.
+- **`PlanLayer`** gains, after `fields`, four defaulted fields: `well_names:
+  tuple[str, ...] = ()` (the plan's wells in visiting order), `objective: str | None =
+  None`, `estimate_s: float | None = None`, and `imaged: tuple[tuple[float, float],
+  ...] = ()`: the `(x_um, y_um)` of the plan's fields that have a frame in the **usable**
+  `scan` record of this plan (a field is matched to a frame by its `name`), `()` while
+  there is no usable `scan`, when it has no frame (a dry run) and, as `fields`, past
+  `MAP_FIELDS_UP_TO`.
+- **`ScanSummary(frames: int, failed: int, dry_run: bool)`** (frozen, slots), and
+  **`PlateView.scanned: ScanSummary | None = None`**, the last field: built by `view()`
+  from `self._slot(doc, "scan", ScanResult, problems)`, so a scan that is stale (the plan
+  was laid out again), made on another profile or that does not validate is `None` and
+  the card says why (FM-125, FM-154). A `scan` that did not end `done` has none.
+- **The view.** `PlatePageView.imaged_source` (a `ColumnDataSource` with `x`, `y`, `w`,
+  `h`) and one `figure.rect` with a green fill and outline, added **after** `fields_source`'s
+  glyph and before the route's line. `refresh()` sets it from `view.plan.imaged`
+  **unless a `scan` is running** (`self._running == "scan"`); `tick()` sets it from
+  `plan.fields[:min(done, len(plan.fields))]` while one is, only when `done` changed, and
+  clears it when the run's `done` is lower than what the view drew (a new run). The view
+  keeps `_imaged_drawn: int` for that; it is per view (D6, FM-151).
+
+```python
+#: smc/ui/guide.py (pure; types under TYPE_CHECKING, as plan_title's)
+REGISTER_FIRST = "register the plate first: step 2, Plate"
+LAY_OUT_FIRST = "lay out the fields first: step 3, Wells"
+
+
+def wells_text(wells: Sequence[str]) -> str: ...
+def scan_title(plan_wells: Sequence[str], selection: Sequence[str]) -> str: ...
+def scan_lead(plan: PlanLayer | None, *, stop_refused: bool) -> str: ...
+def wells_known_lines(
+    *,
+    objective: str | None,
+    plan: PlanLayer | None,
+    out_of_date: str | None,
+    assumed: Sequence[str],
+) -> tuple[str, ...]: ...
+def plan_selection_note(plan_wells: Sequence[str], selection: Sequence[str]) -> str: ...
+def field_source_line(
+    *,
+    value: str,
+    default: str,
+    preset: str | None,
+    preset_value: str | None,
+    suggested: str | None,
+) -> str: ...
+def wells_from_line(
+    selection: Sequence[str],
+    preset: str | None,
+    preset_selection: Sequence[str] | None,
+) -> str: ...
+def lay_out_wait(
+    *,
+    connected: bool,
+    plate_chosen: bool,
+    registered: bool,
+    blocked: str | None,
+    selected: int,
+) -> str | None: ...
+def scan_wait(
+    *, connected: bool, blocked: str | None, plan_usable: bool
+) -> str | None: ...
+def scan_progress_lines(
+    done: int, total: int, clock: RunClock | None, *, running: bool
+) -> tuple[str, ...]: ...
+def scanned_line(summary: ScanSummary) -> str: ...
+def plain_default(default: str) -> str: ...
+```
+
+#### 17.10.3 The texts
+
+- `wells_text`: one well `B2`; two `B2 and B11`; three `A1, A2 and A3`; four or more
+  `12 wells`. The names are in plate order (the letters, then the number as a number: `B2`
+  before `B11`), whatever order they come in.
+- `scan_title`: `Scan ` + `wells_text(plan_wells)`; with no plan wells, the selection's;
+  with neither, `SCREEN_TITLES["scan"]` unchanged (`Scan the selected wells`).
+- `scan_lead`: `<n> fields at <objective>. ` or `<n> fields. ` (`1 field`; no
+  objective), then `STOP, at the top right, stops the scan.`, then ` A move already sent
+  finishes first on this stand.` when `stop_refused`. With no plan, `SCREEN_LEADS["scan"]`
+  plus the same addition.
+- `wells_known_lines`, in order, each line only when it applies: `Objective: <label>, in
+  place` or `Objective: not known`; `Fields: <n> in <w> wells` (`1 field in 1 well`),
+  `Fields: out of date (<out_of_date>)` when the plan is unusable and the checklist says
+  why, else `Fields: not laid out yet`; with a plan, `Time: about <duration_text(estimate_s)>`
+  or `Time: not known (no timing measured; the expert view's timing tool measures it,
+  then lay out the fields again)`; then `assumed: <line>` for each of the plan card's
+  `assumed` lines. The text is plain (FM-139).
+- `plan_selection_note`: `""` when the two hold the same wells; else `The fields laid out
+  are for <wells_text(plan_wells)>; the wells selected now are <wells_text(selection)>.
+  Lay out the fields again to scan these.`, and with an empty selection `The fields laid
+  out are for <wells_text(plan_wells)>; no well is selected now.`
+- `field_source_line`, the first that holds: `value == ""`: `the tool's default:
+  <plain_default(default)>`; `preset is not None and value == preset_value`: `from the
+  preset <preset>`; `suggested is not None and value == suggested`: `from the profile's
+  suggestions`; else `typed on this page`.
+- `wells_from_line`: `no well chosen yet` for an empty selection; `from the preset
+  <preset>` when `preset_selection` is not `None` and equals the selection; else `chosen
+  on this page`.
+- `lay_out_wait`, the first that holds: not `connected` or not `plate_chosen`: `blocked`
+  (the controller's order puts `NOT_CONNECTED` and `PLATE_NOT_CHOSEN` first); not
+  `registered`: `REGISTER_FIRST`; `blocked`; `selected == 0`: `SELECT_WELLS`; else `None`.
+- `scan_wait`, the first that holds: not `connected`: `blocked`; not `plan_usable`:
+  `LAY_OUT_FIRST`; else `blocked`, which is `None` when nothing waits.
+- `scan_progress_lines(done, total, clock, running=…)`: `Field <done> of <total>`;
+  `Elapsed <duration_text(elapsed_s)>` (nothing without a clock); then, while `running`
+  and `done < total`: `Left about <duration_text(left)> (estimated from the fields so
+  far)`, `left = (total - done) * (last_t - first_t) / (last_done - first_done)` when
+  `last_done > first_done` and `last_t > first_t`, else `Left: not known yet (it needs
+  two fields)`. Never negative, never a division by zero (FM-197).
+- `scanned_line`: `Scanned: <frames> frames, <failed> failed` (`1 frame`), and for a dry
+  run `Scanned in a dry run: no frame was taken`.
+- `plain_default("'if-engaged'")` is `if-engaged`: one pair of matching quotes, `'` or
+  `"`, is dropped from a string default; anything else is as it came. It is the
+  placeholder of every tool's field, so that no field shows a quote the operator would
+  type.
+
+#### 17.10.4 `/ui-check`
+
+Two states join the nine of §17.8, after `plate-620`, both reached on `demo-sample` only and
+both on the dry-run page the script serves (they move nothing): `wells-laid-out`
+(Connect, *2. Plate*, *Register the plate*, *3. Wells*, `B2,B11` in *Wells*, *Lay out the
+fields*) and `scanned` (then *4. Scan*, *Start the scan*). The skill's rule that the
+script never clicks a tool's *Run* gains one clause: the buttons of the guided screens
+(*Register the plate*, *Lay out the fields*, *Start the scan*) are clicked, on the
+dry-run page only. A mid-scan look needs a stage that moves, so it is a one-off browser
+session on `demo-sample` served **without** `--dry-run` (a simulated stand), in the
+develop session's scratch directory, cited in its Report and not committed.
+
+#### 17.10.5 What this does not do
+
+- It does not frame the map on the plan's wells: a field of 512 µm on a plate of
+  127 mm is a pixel or two at 1280 px (finding 12 and 16 of the walk), and the orange
+  and green outlines are what shows. Framing the view is the map's own change (FM-174's
+  cause: a view that keeps the union of the plates it had).
+- It does not run `timing`: the *Time* line says what is not known. Whether the Wells
+  screen offers *Measure the timing* as the Stand screen offers *Calibrate the camera* is
+  the owner's (it moves the stage; a follow-up).
+- It does not change `scan`, `scan-plan`, `Progress`, the run document or a command.
 
 **Not verified (for the owner)**: the page read by a newcomer; the layout on the
 stand PC's screen and over RDP; a 1280 px window with the browser's own zoom.
