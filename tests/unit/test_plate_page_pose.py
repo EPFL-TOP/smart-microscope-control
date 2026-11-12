@@ -30,8 +30,10 @@ from smc.testing import FakeCore
 from smc.testing.sample_stand import sample_refs
 from smc.ui.controller import MapPose, PlatePage, PlateView
 from smc.ui.guide import (
+    GOTO_ESTIMATED,
     GOTO_UNPLACED,
     GOTO_WALL_NEEDS_REGISTRATION,
+    NO_CALIBRATION_FOR_SIDES,
     PLATE_NOT_CHOSEN,
 )
 
@@ -398,3 +400,92 @@ def test_goto_on_a_registered_plate_passes_todays_parameters(
     holder_page.goto("B2")
     assert runs == [("goto-well", ["well=B2", "side=centre"])]
     assert holder_page.status().goto == "going to B2"
+
+
+def _no_run(page: PlatePage, monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+    """``page.run`` replaced by a list of the parameters each call was given."""
+    runs: list[list[str]] = []
+    monkeypatch.setattr(page, "run", lambda plugin, params: runs.append(list(params)))
+    return runs
+
+
+def test_goto_on_a_seed_map_passes_todays_parameters_and_no_estimate_refusal(
+    holder_page: PlatePage, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A seed is a registration (the guided loop's first step): its map drives as
+    # today, with the placeholder plate and with a wall, never as an estimate.
+    seed = (WellRef(well="A1", x_um=1000.0, y_um=-500.0),)
+    _register(run_doc, _plate_result(method="seed", refs=seed))
+    assert not holder_page.plate_chosen
+    assert holder_page.view().pose.kind == "seed"
+    runs = _no_run(holder_page, monkeypatch)
+    holder_page.goto("B2")
+    assert runs == [["well=B2", "side=centre"]]
+    assert holder_page.status().goto == "going to B2"
+    # A wall is the camera calibration's to map, not refused as an estimate's.
+    with pytest.raises(ValueError, match=f"^{re.escape(NO_CALIBRATION_FOR_SIDES)}$"):
+        holder_page.goto("B2", "left")
+
+
+def test_goto_on_an_estimated_map_says_it_goes_to_the_estimate(
+    holder_page: PlatePage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    holder_page.choose_plate("96-well")
+    runs = _no_run(holder_page, monkeypatch)
+    holder_page.goto("b2")
+    assert runs == [
+        ["well=B2", "side=centre", "plate=96-well", "orientation=not-turned"]
+    ]
+    assert holder_page.status().goto == GOTO_ESTIMATED.format(well="B2")
+    assert holder_page.status().goto == (
+        "going to B2: the holder's estimate, not registered; centre it by eye"
+    )
+
+
+def test_a_goto_whose_run_raises_says_the_refusal_and_not_going_to(
+    holder_page: PlatePage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Another tab started an activity after goto's own check: run refuses, and the
+    # line must not say that the stage is going anywhere.
+    holder_page.choose_plate("96-well")
+
+    def busy(plugin: str, params: list[str]) -> None:
+        raise RuntimeError("scan is running")
+
+    monkeypatch.setattr(holder_page, "run", busy)
+    with pytest.raises(RuntimeError, match=r"^scan is running$"):
+        holder_page.goto("B2")
+    assert holder_page.status().goto == "scan is running"
+
+
+@pytest.mark.parametrize("stand", ["holder_stand", "bare_stand"])
+def test_goto_on_a_plate_that_does_not_validate_is_refused_before_anything_starts(
+    request: pytest.FixtureRequest, run_doc: Path, stand: str
+) -> None:
+    # The plate is there and usable, and its model refuses it: not "not registered"
+    # (no holder), nor a run the plugin is sure to refuse (a holder) (FM-206).
+    page, microscope = request.getfixturevalue(stand)
+    write_stage(
+        run_doc,
+        StageRecord(
+            plugin="plate-registration",
+            provides="plate",
+            attempt="a0",
+            status=StageStatus.done,
+            started_utc=THEN,
+            finished_utc=THEN,
+            profile="demo",
+            dry_run=False,
+            smc_version="0",
+            params={"plate": "96-well"},
+            result={"plate": "96-well", "assumed": []},
+        ),
+    )
+    page.choose_plate("96-well")
+    before = _where(microscope)
+    problem = "plate: result does not validate: a1_center_xy_um: Field required"
+    with pytest.raises(ValueError, match=f"^{re.escape(problem)}$"):
+        page.goto("B2")
+    assert page.status().goto == problem
+    assert "goto-well" not in RunDocument.load(run_doc).stages
+    assert _where(microscope) == before

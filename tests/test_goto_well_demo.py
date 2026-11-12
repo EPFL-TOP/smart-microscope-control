@@ -857,6 +857,106 @@ def test_goto_well_refuses_an_empty_turret_on_the_estimate_before_any_move(
     assert _where(holder_stand) == before
 
 
+def test_a_stop_before_the_estimates_move_sends_nothing(
+    holder_stand: Microscope, tmp_path: Path
+) -> None:
+    before = _where(holder_stand)
+    stop = threading.Event()
+    stop.set()
+    record = _run(holder_stand, tmp_path, well="A1", plate="96-well", stop=stop)
+    assert record.status is StageStatus.stopped
+    assert record.result is None
+    assert _where(holder_stand) == before
+
+
+def test_a_halt_reaches_the_caller_on_the_estimate_too(
+    holder_stand: Microscope, tmp_path: Path
+) -> None:
+    before = _where(holder_stand)
+    holder_stand.stop()
+    try:
+        with pytest.raises(MicroscopeHaltedError):
+            _run(holder_stand, tmp_path, well="A1", plate="96-well")
+    finally:
+        holder_stand.resume()
+    assert _stored(tmp_path).status is StageStatus.failed
+    assert _where(holder_stand) == before
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        MicroscopeHaltedError(),
+        DeviceTimeoutError("xy_stage did not arrive within 30 s"),
+        CoreError("the core lost the stage"),
+    ],
+    ids=["halt", "timeout", "core-error"],
+)
+def test_a_fault_of_the_estimates_move_reaches_the_runner_unchanged(
+    holder_stand: Microscope,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: Exception,
+) -> None:
+    def fails(x_um: float, y_um: float) -> object:
+        raise fault
+
+    monkeypatch.setattr(holder_stand.require(XYStage), "move_to_um", fails)
+    with pytest.raises(type(fault)) as info:
+        _run(holder_stand, tmp_path, well="A1", plate="96-well")
+    assert info.value is fault
+    assert _stored(tmp_path).status is StageStatus.failed
+
+
+def test_an_estimate_outside_the_soft_limits_is_refused_and_does_not_move(
+    mm_available: bool, tmp_path: Path
+) -> None:
+    # As A1 of a 96-well estimated on the Ti2-E: the layer refuses, unforceable.
+    if not mm_available:
+        pytest.skip("Micro-Manager demo adapters not installed")
+    profile = _holder_profile()
+    limited = profile.model_copy(
+        update={
+            "safety": profile.safety.model_copy(
+                update={
+                    "xy_soft_limits_um": ((-49_000.0, 49_000.0), (-29_000.0, 29_000.0))
+                }
+            )
+        }
+    )
+    microscope = Microscope.open(limited, dry_run=False)
+    try:
+        before = _where(microscope)
+        with pytest.raises(SafetyRefusedError) as info:
+            _run(microscope, tmp_path, well="A1", plate="96-well")
+        assert info.value.how_to_force == ""
+        assert _stored(tmp_path).status is StageStatus.failed
+        assert _where(microscope) == before
+    finally:
+        microscope.close()
+
+
+def test_the_estimate_sends_one_move_and_reads_no_position_before_it(
+    holder_stand: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stage = holder_stand.require(XYStage)
+    calls: list[tuple[object, ...]] = []
+    real_move, real_position = stage.move_to_um, stage.position_um
+
+    def move(x_um: float, y_um: float) -> object:
+        calls.append(("move_to_um", x_um, y_um))
+        return real_move(x_um, y_um)
+
+    def position() -> object:
+        calls.append(("position_um",))
+        return real_position()
+
+    monkeypatch.setattr(stage, "move_to_um", move)
+    monkeypatch.setattr(stage, "position_um", position)
+    result = _result(_run(holder_stand, tmp_path, well="A1", plate="96-well"))
+    assert calls == [("move_to_um", result.target_x_um, result.target_y_um)]
+
+
 def test_goto_well_on_a_dry_plate_drives_to_the_estimate_and_says_why(
     holder_stand: Microscope, tmp_path: Path
 ) -> None:

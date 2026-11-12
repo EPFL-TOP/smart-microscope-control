@@ -780,6 +780,22 @@ def test_a_usable_optional_result_that_the_model_refuses_raises_upstream_error(
             "provides it",
             id="absent",
         ),
+        pytest.param(
+            _timing_failed,
+            "the last run of timing ended failed; run it again",
+            id="failed",
+        ),
+        pytest.param(
+            _timing_on_another_stand,
+            "timing was run on another-stand, this is demo; run timing again on "
+            "this profile",
+            id="another-profile",
+        ),
+        pytest.param(
+            _timing_is_stale,
+            "timing read its inputs from an earlier run; run it again",
+            id="stale",
+        ),
     ],
 )
 def test_why_not_read_names_why_an_optional_slot_was_not_used(
@@ -807,6 +823,29 @@ def test_why_not_read_is_none_for_a_slot_that_was_read(
     record = _run(plugin, fake_microscope, tmp_path)
     assert record.reads["timings"] == ReadRecord(plugin="timing", attempt="timing-0")
     assert plugin.seen == {"why": None}
+
+
+class ReadsItsOwn(WhyNot):
+    """Provides the slot it reads optionally, as plate-orientation does (m3 §24 D8)."""
+
+    name = "reads-its-own"
+    provides = "timings"
+
+
+def test_why_not_read_leaves_the_plugins_own_record_out(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    # Its own earlier, usable record is not a provider of what it reads: the runner
+    # did not read it, and the reason is the runner's, not "the runner did not read it".
+    write_stage(_path(tmp_path), _done_record("up"))
+    write_stage(_path(tmp_path), _done_record("reads-its-own", provides="timings"))
+    plugin = ReadsItsOwn()
+    record = _run(plugin, fake_microscope, tmp_path)
+    assert record.reads["timings"] is None
+    assert plugin.seen == {
+        "why": "the run document has no timings; smc run --list shows which "
+        "plugin provides it"
+    }
 
 
 @pytest.mark.parametrize("slot", ["nothing", "up"])

@@ -1404,7 +1404,14 @@ class PlatePage:
         with self._lock:
             self._goto = going
             ended = self._ended
-        self.run("goto-well", params)
+        try:
+            self.run("goto-well", params)
+        except RuntimeError as exc:
+            # An activity another tab started since the checks above, or the page
+            # closed: "going to" must not stay on a drive that never started.
+            with self._lock:
+                self._goto = _one_line(exc)
+            raise
         with self._lock:
             # ``run`` refused without starting anything (no stand, a parameter, a
             # checkpoint): its outcome is the answer. An activity that started, or has
@@ -1419,6 +1426,9 @@ class PlatePage:
         click never judges two documents. A document that cannot be read is said
         first, in ``view().problems``' words: read as empty, it would be judged a map
         with no registered plate (``GOTO_UNPLACED``), and no run could write to it.
+        So is a usable ``plate`` whose result its model refuses: the map draws no
+        registered plate for it, but the plate is there, and ``goto-well`` refuses it
+        whatever the parameters (FM-206), in the words of ``view().problems``.
         """
         self._refuse_if_busy()
         doc, unreadable = self._document()
@@ -1426,6 +1436,10 @@ class PlatePage:
             # The text `_document` took where it caught the error (FM-98).
             raise ValueError(f"run document: {unreadable}")
         self._refuse_another_registered_plate(doc)
+        problems: list[str] = []
+        self._slot(doc, "plate", PlateResult, problems)
+        if problems:
+            raise ValueError(problems[0])
         _geometries, pose = self._geometries(doc)
         if pose.kind == "unplaced":
             raise ValueError(GOTO_UNPLACED)
