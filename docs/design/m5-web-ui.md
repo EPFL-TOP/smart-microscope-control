@@ -3824,7 +3824,10 @@ residual shows it. So:
   the well the operator clicked (§11.1); the cross says where the stage is, the
   operator says which well it is.
 - **Drive stays a registered plate's.** A drive click on an estimated map moves
-  nothing (measured above), as on every map with no usable `plate`.
+  nothing (measured above), as on every map with no usable `plate`. *Superseded by
+  D10 (§17.2, #462)*: a drive on an estimated map runs `goto-well` to the well's
+  centre on the estimate, and its record says that the target was estimated (m3
+  §5.5); on an `unplaced` map it is refused before anything starts.
 - The title says "A1 at the top left of this map" and the label "(estimated)": the
   operator can compare with the A1 printed on the plate. The choice of orientation
   is #422's, which will place the estimate by it.
@@ -4283,6 +4286,9 @@ The owner walked B1's shell on `demo-sample` through Claude in Chrome
   optional (#462). Without a plate, it drives to the well's centre on the map's
   `estimated` pose (§15 D3). Its record says that the target was estimated from the
   holder and not registered. On an `unplaced` pose it refuses, and nothing moves.
+  The interface is m3 §5.5: the plugin reads `[holder]` from the profile, the page
+  passes `plate` and `orientation`, and the answer of a drive is drawn beside the
+  *Drive* toggle (`PageStatus.goto`).
 - **D11 Go to and Live** (owner). A *Go to* is a `goto-well` run, refused while Live
   runs (§5.2). *Capture centre* is accepted while Live runs (measured on the walk),
   and so are the arrows. The Plate screen's *Go to* is drawn disabled while Live

@@ -867,7 +867,7 @@ plate-finding ──────┴─ plate ──► scan-plan ◄────
 |---|---|---|---|---|---|---|
 | `camera-calibration` | `camera-calibration` | — | — | `XYStage`, `Camera` | #22 | 4 |
 | `plate-registration` | `plate` | — | — | — | #19 | 5 |
-| `goto-well` | `goto-well` | `plate` | — | `XYStage` | #19 | 5 |
+| `goto-well` | `goto-well` | — | `plate` (#462) | `XYStage` | #19 | 5, 5.5 |
 | `plate-finding` | `plate` | — | — | `XYStage`, `Camera` | #20 | 6 |
 | `plate-walls` | `plate` | `camera-calibration` | — | `XYStage`, `Camera` | #328 | 17 |
 | `scan-plan` | `scan-plan` | `plate` | `camera-calibration`, `timings` | `Camera` | #21 | 7 |
@@ -1846,8 +1846,8 @@ class GotoWellResult(PluginResult):
     y_um: float
 ```
 
-`goto-well`: `requires = (XYStage,)`, `reads = ("plate",)`, `provides =
-"goto-well"`; one `move_to_um` to the well's centre or wall point, whose
+`goto-well`: `requires = (XYStage,)`, `reads = ("plate",)` (since #462
+`reads_optional`, §5.5), `provides = "goto-well"`; one `move_to_um` to the well's centre or wall point, whose
 soft limits and dry run are the layer's. Its model lives in
 `goto_well.py`: nothing reads its slot.
 
@@ -1945,6 +1945,154 @@ is not committed, useq-schema 0.9.2 and pydantic 2.13.5 on Python 3.13;
   span of 98 × 58 mm, and a 96-well plate's corner wells are 99 × 63 mm
   apart: wherever the plate sits, a `goto-well` to some corner wells will
   be refused by the layer (not measured at the stand; #198).
+
+### 5.5 Going to a well before registration (#462)
+
+The owner's D10 (m5 §17.2): before a plate is registered, `goto-well` drives to
+a well's centre where the stand's holder puts it, the map's `estimated` pose (m5
+§15 D3). Measured on `demo-sample` (2026-11-12): with no `plate` slot,
+`PlatePage.goto("A1")` ends `goto-well: UpstreamError: goto-well reads plate,
+but the run document has no plate; ...` from `check_ready`, and the stage
+stays at (0, 0).
+
+**D1. The plugin reads the holder from the profile, the page passes the plate
+and its orientation.** Plugins already read `microscope.profile` (`cell-focus`
+reads `[safety] max_z_jog_um`, `scan-plan` the stand's name), so the holder's
+centre is never a parameter: the map and the drive read the same `[holder]
+plate_centre_xy_um`, and nobody copies a number by hand. What the profile
+cannot know is which plate type lies in the holder and which way round: those
+are parameters, the page's *Plate* and *Plate lies* choices.
+
+```python
+class GotoWellParams(PluginParams):
+    well: str
+    side: Literal["centre", "+X", "-X", "+Y", "-Y"] = "centre"
+    plate: str | None = None  # a useq plate name; used only with no usable plate
+    orientation: PlateOrientation = "not-turned"  # the same; the slot's otherwise
+```
+
+`reads = ()`, `reads_optional = ("plate",)`. `GotoWellResult` gains
+`from_holder: bool = False` (an older record loads as registered).
+
+**D2. One estimate, written once.** The page's arithmetic moves to
+`smc/plugins/slots/plate.py`, and the page and the plugin both call it:
+
+```python
+def holder_estimate(
+    plate: str,
+    centre_xy_um: tuple[float, float],
+    orientation: PlateOrientation,
+) -> useq.WellPlatePlan: ...
+```
+
+The grid's centre offset from A1 (the mean of `useq`'s well positions for the
+plate at the origin, kept per plate name in an `lru_cache`) is turned by
+`ORIENTATION_DEG[orientation]` and taken from the centre; the plan has that A1
+and that rotation. `useq`'s `ValueError` for an unknown plate passes. Measured
+against `PlatePage.view()` on the demo with a holder at (400, -325) µm: the
+96-, 384-, 6-well and Greiner 24-well plates, not turned and turned 180°, every
+well within 0.0 µm.
+
+**D3. What `run` does, in this order; nothing moves before the move.**
+
+1. `plate = ctx.upstream_or_none("plate", PlateResult)`.
+2. **A usable plate**: the path of §5.3 and §18.3, unchanged, except that a
+   `plate` parameter naming another plate than the slot's is a
+   `PluginRunError`: `the registered plate is a <slot's>, not a <param>: leave
+   plate out, or register the <param>`. `orientation` is not read: the
+   registered plate's is measured.
+3. **No usable plate**, `why = ctx.why_not_read("plate")`:
+   - no `plate` parameter: `UpstreamError(goto-well, "plate", f"{why}; or give
+     plate=<a useq plate name> to drive to the estimate of the profile's
+     [holder]")`;
+   - no `[holder] plate_centre_xy_um`: `UpstreamError(goto-well, "plate",
+     f"{why}; and this stand's profile has no [holder] plate_centre_xy_um to
+     estimate the plate from")`;
+   - the turret is read as on the registered path (`objective_for`; an empty
+     position is refused);
+   - a `side` other than `centre`: `PluginRunError`: `a wall is reached
+     through a registered plate: the holder's estimate can be a few hundred µm
+     off; go to the centre, and register the plate`;
+   - `holder_estimate` and `well_geometry` on it: an unknown plate is
+     `<useq's text>; give a useq plate name (96-well, greiner-24-well)`, an
+     unknown well `<text>; give a well of the <plate> plate`
+     (`PluginRunError`, raised outside the handler, FM-98);
+   - one WARNING (`goto-well: driving to <well> of the <plate> estimated from
+     the stand's holder, not registered`), `ctx.raise_if_stopped()`, one
+     `move_to_um`, the readback as on the registered path.
+
+`UpstreamError` keeps the CLI's exit code 2 and the text the tests and the
+operator know. Raised in `run`, it is a `failed` record of `goto-well`, which
+no tool reads.
+
+**D4. The record says it was estimated.** `from_holder=True`, `objective` the
+one in place, `plate_objective=None`, `shift_um=None`, and `assumed` in this
+order (the strip shows the first, `_assumed_tail`):
+
+1. `target estimated from the stand's holder, not registered: the <plate>
+   centred at stage (<x>, <y>) µm, <not turned | turned 180°>` (whole µm,
+   `:.0f`);
+2. `plate not read: <why>`;
+3. `no objective offset applied: the holder's estimate names no objective`;
+4. the dry-run line, last, as today.
+
+**D5. `RunContext.why_not_read(slot) -> str | None`** (`smc/plugins/api.py`):
+why the runner did not use a slot of `reads_optional`, in
+`RunDocument.unusable`'s words, from the same snapshot, profile
+(`attempt.record.profile`), dry run and reader as the runner's `_reads_of`;
+`None` when it was used. A slot outside `reads_optional` is the `ValueError`
+`upstream_or_none` raises. No constructor change.
+
+**D6. The page.** `PlatePage.goto(well, side)`, in this order, each a
+`ValueError` or `RuntimeError` before `current` changes and a thread starts:
+`_refuse_if_busy`; `_refuse_another_registered_plate`; the pose of
+`_geometries(doc)`: `unplaced` is `GOTO_UNPLACED`; `estimated` with the
+placeholder plate (`not self._plate_chosen`) is `PLATE_NOT_CHOSEN`;
+`estimated` with a wall side is `GOTO_WALL_NEEDS_REGISTRATION`; then the image
+side's mapping as today. On `estimated` the run gets `plate=<the page's
+plate>` and `orientation=<the Plate lies choice>` after `well` and `side`; on
+`registered` and `seed` the parameters are today's, so no registered test
+changes. `goto-well` is not added to `PAGE_PARAMS`: that would gate the
+registered path on the placeholder too.
+
+```python
+#: smc/ui/guide.py
+GOTO_UNPLACED = (
+    "the plate is not registered, and this stand's profile does not say where its "
+    "holder puts a plate ([holder] plate_centre_xy_um): register the plate, or "
+    "drive with the arrows"
+)
+GOTO_WALL_NEEDS_REGISTRATION = (
+    "a wall is reached through a registered plate: go to the centre, and register "
+    "the plate"
+)
+GOTO_ESTIMATED = (
+    "going to {well}: the holder's estimate, not registered; centre it by eye"
+)
+```
+
+**D7. The answer is drawn where the operator pressed** (#431 finding 4).
+`PageStatus` gains `goto: str = ""` (last field): what the last `goto` came to.
+`goto` sets it under `_lock`: to the refusal's text when it refuses (then
+raises), to `GOTO_ESTIMATED` or `going to <well>` before `run`, and, when `run`
+returns without starting an activity (its own refusals are outcomes), to that
+outcome. `_work` sets it to the outcome when an activity named `goto-well`
+ends, whoever started it. `clear_outcome` (the *Refresh* button) clears it. The
+view's `goto_text` (an `_outcome_line()`) follows `drive_toggle` in the drive
+region and `tick` draws `status.goto` into it: every tab, plain text (FM-139,
+FM-151).
+
+**D8. What does not change.** A usable plate's path, its result and its
+assumed lines; the layer's guards (soft limits, the turret, STOP, dry run); an
+estimate fills no slot and feeds no tool (m5 §15 D2, D8); a capture records the
+well the operator clicked (m5 §15 D6). PFS carried across the walls by a move
+to another well is #454's, for both paths (FM-223).
+
+**Tests** are named in #462's plan. **Failure modes**: FM-64, FM-73 (the 96-well
+and a turned plate), FM-85, FM-98, FM-125, FM-139, FM-151, FM-169, FM-203 (the
+estimate's offset and rotation non-zero), FM-206 (what the page can foresee
+it refuses before `run`), FM-217 (amended: a drive on an estimated map runs
+`goto-well` to the estimate, and its record says so).
 
 ## 6. Automatic plate finding (#20)
 
@@ -4639,9 +4787,8 @@ class PlatePage:
   stage to C5 of the registered 384-well plate, with nothing on the page to
   say so. So `goto`, and `click` with `drive`, raise the `ValueError` of
   `page_params("scan-plan")` for that mismatch (the same check, one private
-  helper), before `current` changes and before a thread starts. An unusable
-  `plate` slot needs no check here: `check_ready` refuses `goto-well` itself and
-  the refusal is the `outcome`. **`capture_centre(well)`** and `capture_wall(well, side)`
+  helper), before `current` changes and before a thread starts. With no usable
+  `plate` slot, `goto` drives to the holder's estimate or refuses (§5.5 D6). **`capture_centre(well)`** and `capture_wall(well, side)`
   normalise the well (`normalise_well`), refuse one that is not on `plate`
   (`ValueError`: `<well> is not a well of the <plate> plate`), and **replace**
   the earlier capture of the same well (and side; `side` is an image side
