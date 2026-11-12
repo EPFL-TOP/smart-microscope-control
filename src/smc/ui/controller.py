@@ -155,6 +155,8 @@ __all__ = [
     "PlateView",
     "ResultCard",
     "RouteStop",
+    "RunClock",
+    "ScanSummary",
     "ToolView",
     "WellView",
 ]
@@ -404,12 +406,36 @@ class PlanLayer:
     bounding box in stage axes, the width and height of the rectangle drawn at each
     field. ``fields`` are the ``(x_um, y_um)`` centres in visiting order, or ``()``
     past ``MAP_FIELDS_UP_TO``: a first part of a large plan would pass for all of it.
+
+    The Wells and Scan screens (m5 §17.10.2) read four more, each defaulted: ``well_names``
+    are the plan's wells in visiting order (the title names them in plate order), ``objective``
+    the objective the plan was made for and ``estimate_s`` its estimate, ``None`` when no
+    timing was measured: an unknown, never a zero (FM-170). ``imaged`` are the ``(x_um, y_um)``
+    of the plan's fields the usable ``scan`` of this plan holds a frame for, ``()`` while
+    there is none, for a dry run, and past ``MAP_FIELDS_UP_TO`` as ``fields`` are.
     """
 
     count: int
     wells: int
     fov_um: tuple[float, float]
     fields: tuple[tuple[float, float], ...]
+    well_names: tuple[str, ...] = ()
+    objective: str | None = None
+    estimate_s: float | None = None
+    imaged: tuple[tuple[float, float], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ScanSummary:
+    """What the usable ``scan`` record holds, for the Scan screen's result line (m5 §17.10.2).
+
+    ``frames`` and ``failed`` are the counts of the record's own lists: a field that failed
+    has no frame, and a dry run takes none (``dry_run``), which is not a scan that failed.
+    """
+
+    frames: int
+    failed: int
+    dry_run: bool
 
 
 #: How the map's plate was placed (m5 §15 D3): *registered* by a tool that measured it,
@@ -483,7 +509,10 @@ class PlateView:
     names another plate, or its result does not validate (the problem is in ``problems``).
     ``registered_by`` is the tool that wrote that result (``plate-registration``,
     ``plate-walls``...), so that the Plate screen shows the ``assumed`` lines of that tool's
-    card and not an older tool's; ``None`` exactly when ``registered`` is.
+    card and not an older tool's; ``None`` exactly when ``registered`` is. ``scanned`` is what
+    the usable ``scan`` holds, for the Scan screen's result line (m5 §17.10.2): ``None`` when
+    there is none (stale, made on another profile, or one that does not validate: its
+    problem is in ``problems``) or when it did not end ``done``.
     """
 
     plate: str
@@ -505,6 +534,7 @@ class PlateView:
     camera_calibration: CalibrationNote | None = None
     registered: PlateResult | None = None
     registered_by: str | None = None
+    scanned: ScanSummary | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -566,6 +596,22 @@ class _Handed(NamedTuple):
 
 
 @dataclass(frozen=True, slots=True)
+class RunClock:
+    """How long the latest activity has run, and its progress reports as they came (m5 §17.10.2).
+
+    A ``Progress`` carries no time, and the Scan screen's *Left* needs one: the controller
+    stamps each report when the worker makes it, never when a tick drains it (the tick is
+    one second coarse). ``elapsed_s`` is since the activity started, fixed when it ended.
+    ``first`` and ``last`` are ``(seconds since the start, done)`` of the first and the
+    latest report, ``None`` before any.
+    """
+
+    elapsed_s: float
+    first: tuple[float, int] | None
+    last: tuple[float, int] | None
+
+
+@dataclass(frozen=True, slots=True)
 class PageStatus:
     """The stand and the run, read now.
 
@@ -576,7 +622,9 @@ class PageStatus:
     stand, and every read of it is unknown (``None``, ``?``), never a fault.
     ``goto`` is what the last drive to a well came to, for every tab, whoever started
     it (m3 §5.5 D7): a refusal, what it is going to, then the ``goto-well`` run's
-    outcome; ``""`` before any, and after *Refresh*.
+    outcome; ``""`` before any, and after *Refresh*. ``clock`` is the latest activity's
+    ``RunClock`` (m5 §17.10.2), ``None`` before any and while only Live has run: Live keeps
+    no clock.
     """
 
     stand: str
@@ -596,6 +644,7 @@ class PageStatus:
     problems: tuple[str, ...]
     connected: bool = True
     goto: str = ""
+    clock: RunClock | None = None
 
 
 def _one_line(error: BaseException) -> str:

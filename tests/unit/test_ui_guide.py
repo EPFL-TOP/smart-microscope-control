@@ -35,6 +35,8 @@ from smc.ui.controller import (
     LoadedPreset,
     MapPose,
     PlanLayer,
+    RunClock,
+    ScanSummary,
     WellView,
 )
 from smc.ui.guide import (
@@ -42,10 +44,13 @@ from smc.ui.guide import (
     DRY_RUN_NO_FRAME,
     END_LIVE_LABEL,
     GOTO_NOT_DURING_LIVE,
+    LAY_OUT_FIRST,
     MAP_FIELDS_UP_TO,
     NO_CALIBRATION_FOR_SIDES,
     ORIENTATION_IN_STAGE_TERMS,
     OTHER_WAYS_TO_REGISTER,
+    PLATE_NOT_CHOSEN,
+    REGISTER_FIRST,
     SCREEN_LEADS,
     SCREEN_TITLES,
     SELECT_WELLS,
@@ -70,14 +75,19 @@ from smc.ui.guide import (
     continue_label,
     drive_image_note,
     duration_text,
+    field_source_line,
     forget_label,
     image_sides_note,
     known_text,
+    lay_out_wait,
     map_title,
     needs_calibration,
     next_slot,
+    objective_line,
     opening_step,
     orientation_label,
+    plain_default,
+    plan_selection_note,
     plan_title,
     plate_from_line,
     preset_differences,
@@ -85,7 +95,12 @@ from smc.ui.guide import (
     register_replace_note,
     registered_line,
     replace_note,
+    scan_lead,
     scan_plan_card_lines,
+    scan_progress_lines,
+    scan_title,
+    scan_wait,
+    scanned_line,
     side_words,
     stage_label,
     step_button_label,
@@ -95,6 +110,9 @@ from smc.ui.guide import (
     walls_card_lines,
     walls_centres_problem,
     walls_square_wells,
+    wells_from_line,
+    wells_known_lines,
+    wells_text,
 )
 
 
@@ -1760,3 +1778,406 @@ def test_the_other_ways_to_register_name_the_walls_and_the_survey_and_the_expert
         "wells' size too) or automatically (surveys the plate, about 7 minutes): in the "
         "expert view."
     )
+
+
+# -- the Wells and Scan screens (m5 §17.4.3, §17.4.4, §17.10, #445) -----------------------
+
+
+NOT_CONNECTED_TEXT = "the stand is not connected"
+
+
+def _plan(
+    *,
+    count: int = 72,
+    wells: int = 2,
+    objective: str | None = "Nikon 10X S Fluor",
+    estimate_s: float | None = 42.16,
+) -> PlanLayer:
+    return PlanLayer(
+        count=count,
+        wells=wells,
+        fov_um=(512.0, 512.0),
+        fields=(),
+        objective=objective,
+        estimate_s=estimate_s,
+    )
+
+
+def test_the_two_waits_the_new_screens_add_are_pinned_as_written() -> None:
+    assert REGISTER_FIRST == "register the plate first: step 2, Plate"
+    assert LAY_OUT_FIRST == "lay out the fields first: step 3, Wells"
+
+
+def test_the_objective_line_is_the_one_the_stand_screen_prints() -> None:
+    assert (
+        objective_line("Nikon 10X S Fluor") == "Objective: Nikon 10X S Fluor, in place"
+    )
+    assert objective_line(None) == "Objective: not known"
+    # The Stand screen's block and the Wells screen's say the objective in one way.
+    first = known_text(objective="20x", calibration=None, light_on=None).splitlines()[0]
+    assert first == objective_line("20x")
+
+
+def test_wells_text_names_up_to_three_wells_in_plate_order_then_counts() -> None:
+    # The demo visits B11 before B2; the title reads the plate, not the route.
+    assert wells_text(["B11", "B2"]) == "B2 and B11"
+    assert wells_text(["B2"]) == "B2"
+    assert wells_text(["C3", "A1", "B2"]) == "A1, B2 and C3"
+    assert wells_text(["A10", "A9", "A2"]) == "A2, A9 and A10"
+    # A 1536-well plate's rows go Z, then AA: the length of the letters comes first.
+    assert wells_text(["AA1", "Z1"]) == "Z1 and AA1"
+    # Four wells or more are counted, whatever they are.
+    assert wells_text(["A1", "A2", "A3", "A4"]) == "4 wells"
+    assert wells_text([f"{row}{col}" for row in "AB" for col in range(1, 7)]) == (
+        "12 wells"
+    )
+    # A repeated name is one well, and nothing is no wells.
+    assert wells_text(["A1", "A1"]) == "A1"
+    assert wells_text([]) == "no wells"
+    # A name the plate does not print sorts last and is still said.
+    assert wells_text(["B2", "?"]) == "B2 and ?"
+
+
+@given(
+    st.lists(
+        st.tuples(st.sampled_from("ABCDEFGH"), st.integers(1, 12)),
+        min_size=1,
+        max_size=3,
+        unique=True,
+    ),
+    st.randoms(use_true_random=False),
+)
+def test_wells_text_does_not_depend_on_the_order_the_wells_come_in(
+    cells: list[tuple[str, int]], rng: Any
+) -> None:
+    names = [f"{row}{col}" for row, col in cells]
+    shuffled = list(names)
+    rng.shuffle(shuffled)
+    assert wells_text(shuffled) == wells_text(names)
+
+
+def test_scan_title_names_the_plans_wells_then_the_selection_then_the_static_title() -> (
+    None
+):
+    # The plan is what `scan` does: it names the wells, and the selection changed since
+    # does not rename it.
+    assert scan_title(["B11", "B2"], ["A1"]) == "Scan B2 and B11"
+    assert scan_title(["B2"], []) == "Scan B2"
+    assert scan_title([f"A{n}" for n in range(1, 13)], ["A1"]) == "Scan 12 wells"
+    # No plan: the selection, in plate order.
+    assert scan_title([], ["B11", "B2"]) == "Scan B2 and B11"
+    # Neither: the static title, unchanged.
+    assert scan_title([], []) == SCREEN_TITLES["scan"] == "Scan the selected wells"
+
+
+def test_scan_lead_says_the_fields_the_objective_and_the_move_in_flight_a_stop_leaves() -> (
+    None
+):
+    stop = "STOP, at the top right, stops the scan."
+    assert scan_lead(_plan(), stop_refused=False) == (
+        f"72 fields at Nikon 10X S Fluor. {stop}"
+    )
+    # The singular, and a plan that does not say its objective says no objective.
+    assert scan_lead(_plan(count=1, objective=None), stop_refused=False) == (
+        f"1 field. {stop}"
+    )
+    # A stand whose profile says a role refuses its stop: what STOP does not do.
+    assert scan_lead(_plan(), stop_refused=True) == (
+        f"72 fields at Nikon 10X S Fluor. {stop} "
+        "A move already sent finishes first on this stand."
+    )
+    # No plan: the static lead, with the same addition.
+    assert scan_lead(None, stop_refused=False) == SCREEN_LEADS["scan"] == stop
+    assert scan_lead(None, stop_refused=True) == (
+        f"{stop} A move already sent finishes first on this stand."
+    )
+
+
+def test_the_wells_known_lines_say_what_is_laid_out_out_of_date_or_not_known() -> None:
+    # A plan with an estimate: four lines, then the plan card's assumptions, in order.
+    assert wells_known_lines(
+        objective="Nikon 10X S Fluor",
+        plan=_plan(),
+        out_of_date=None,
+        assumed=(
+            "no camera calibration for Nikon 10X S Fluor: rotation 0 and no mirror assumed",
+        ),
+    ) == (
+        "Objective: Nikon 10X S Fluor, in place",
+        "Fields: 72 in 2 wells",
+        "Time: about 42 s",
+        "assumed: no camera calibration for Nikon 10X S Fluor: rotation 0 and no mirror "
+        "assumed",
+    )
+    # An estimate of None is an unknown said with what to do, never `0 s` (FM-170).
+    unknown = wells_known_lines(
+        objective=None, plan=_plan(estimate_s=None), out_of_date=None, assumed=()
+    )
+    assert unknown == (
+        "Objective: not known",
+        "Fields: 72 in 2 wells",
+        "Time: not known (no timing measured; the expert view's timing tool measures "
+        "it, then lay out the fields again)",
+    )
+    assert not any("0 s" in line for line in unknown)
+    # The singular.
+    one = wells_known_lines(
+        objective="10x",
+        plan=_plan(count=1, wells=1),
+        out_of_date=None,
+        assumed=(),
+    )
+    assert one[1] == "Fields: 1 field in 1 well"
+    # No plan: not laid out yet, and nothing else is claimed about time or assumptions.
+    assert wells_known_lines(
+        objective="10x", plan=None, out_of_date=None, assumed=("an old assumption",)
+    ) == ("Objective: 10x, in place", "Fields: not laid out yet")
+    # A plan the document no longer holds usable says why, in the checklist's words.
+    assert wells_known_lines(
+        objective="10x",
+        plan=None,
+        out_of_date="scan-plan read its inputs from an earlier run; run it again",
+        assumed=(),
+    )[1] == (
+        "Fields: out of date (scan-plan read its inputs from an earlier run; run it "
+        "again)"
+    )
+
+
+def test_plan_selection_note_is_empty_when_the_wells_agree_and_names_both_otherwise() -> (
+    None
+):
+    # The same wells in another order, or the plan's visiting order: no difference.
+    assert plan_selection_note(["B11", "B2"], ["B2", "B11"]) == ""
+    # No plan, nothing to compare.
+    assert plan_selection_note([], ["A1"]) == ""
+    assert plan_selection_note(["B2", "B11"], ["B2"]) == (
+        "The fields laid out are for B2 and B11; the wells selected now are B2. "
+        "Lay out the fields again to scan these."
+    )
+    assert plan_selection_note(["B2"], []) == (
+        "The fields laid out are for B2; no well is selected now."
+    )
+    # A selection that adds a well to the plan's is a difference too.
+    assert plan_selection_note(["B2"], ["B2", "C3"]).startswith(
+        "The fields laid out are for B2; the wells selected now are B2 and C3."
+    )
+
+
+def test_field_source_line_says_default_preset_suggestion_or_typed_in_that_order() -> (
+    None
+):
+    def say(
+        value: str,
+        *,
+        preset: str | None = "weekly",
+        preset_value: str | None = "0.4",
+        suggested: str | None = "0.4",
+        default: str = "'if-engaged'",
+    ) -> str:
+        return field_source_line(
+            value=value,
+            default=default,
+            preset=preset,
+            preset_value=preset_value,
+            suggested=suggested,
+        )
+
+    # An empty field is the tool's default, shown without a string's quotes.
+    assert say("") == "the tool's default: if-engaged"
+    assert say("  ") == "the tool's default: if-engaged"
+    assert say("", default="1.0") == "the tool's default: 1.0"
+    # The preset wins over the suggestion when both give the value.
+    assert say("0.4") == "from the preset weekly"
+    assert say("0.4", preset=None) == "from the profile's suggestions"
+    assert say("0.4", preset="weekly", preset_value="0.5") == (
+        "from the profile's suggestions"
+    )
+    assert say("0.4", preset=None, suggested=None) == "typed on this page"
+    assert say("0.7") == "typed on this page"
+    # A preset that does not set the field names nothing of it.
+    assert say("0.4", preset="weekly", preset_value=None, suggested=None) == (
+        "typed on this page"
+    )
+
+
+def test_wells_from_line_says_none_preset_or_page() -> None:
+    assert wells_from_line([], "weekly", ["B2"]) == "no well chosen yet"
+    assert wells_from_line([], None, None) == "no well chosen yet"
+    assert wells_from_line(["B2", "B11"], "weekly", ["B2", "B11"]) == (
+        "from the preset weekly"
+    )
+    # The box no longer holds what the preset selected, or the preset selected nothing.
+    assert wells_from_line(["B2"], "weekly", ["B2", "B11"]) == "chosen on this page"
+    assert wells_from_line(["B2"], "weekly", None) == "chosen on this page"
+    assert wells_from_line(["B2"], None, None) == "chosen on this page"
+    # A preset that is not loaded names nothing, whatever a stale selection says.
+    assert wells_from_line(["B2"], None, ["B2"]) == "chosen on this page"
+
+
+def test_lay_out_wait_orders_the_stand_the_plate_the_registration_the_tool_the_selection() -> (
+    None
+):
+    def wait(
+        *,
+        connected: bool = True,
+        plate_chosen: bool = True,
+        registered: bool = True,
+        blocked: str | None = None,
+        selected: int = 2,
+    ) -> str | None:
+        return lay_out_wait(
+            connected=connected,
+            plate_chosen=plate_chosen,
+            registered=registered,
+            blocked=blocked,
+            selected=selected,
+        )
+
+    assert wait() is None
+    # Every wait at once, taken off one by one: the first of them is said, in the order of
+    # the design. The tool's own reason is the controller's, and its words are not the guide's.
+    reason = "scan-plan: a reason of the tool"
+    assert (
+        wait(
+            connected=False,
+            plate_chosen=False,
+            registered=False,
+            blocked=NOT_CONNECTED_TEXT,
+            selected=0,
+        )
+        == NOT_CONNECTED_TEXT
+    )
+    assert (
+        wait(
+            plate_chosen=False,
+            registered=False,
+            blocked=PLATE_NOT_CHOSEN,
+            selected=0,
+        )
+        == PLATE_NOT_CHOSEN
+    )
+    assert wait(registered=False, blocked=reason, selected=0) == REGISTER_FIRST
+    assert wait(blocked=reason, selected=0) == reason
+    assert wait(blocked=None, selected=0) == SELECT_WELLS
+    assert wait(selected=1) is None
+
+
+def test_scan_wait_orders_the_stand_the_plan_and_the_tools_reason() -> None:
+    assert scan_wait(connected=True, blocked=None, plan_usable=True) is None
+    assert scan_wait(connected=False, blocked="not connected", plan_usable=False) == (
+        "not connected"
+    )
+    assert scan_wait(
+        connected=True, blocked="scan: a checkpoint", plan_usable=False
+    ) == (LAY_OUT_FIRST)
+    assert scan_wait(
+        connected=True, blocked="scan: a checkpoint", plan_usable=True
+    ) == ("scan: a checkpoint")
+
+
+def test_scan_progress_lines_estimate_from_the_first_report_and_not_from_the_click() -> (
+    None
+):
+    # First report at 30.0 s with 1 field done, the latest at 36.0 s with 4 done, 40.0 s
+    # since the click, 10 fields: 6 left at 2 s a field is 12 s. A rate from the click
+    # (40 s for 4 fields) gives 1 min 00 s: the start-up of a scan is not its pace.
+    clock = RunClock(elapsed_s=40.0, first=(30.0, 1), last=(36.0, 4))
+    assert scan_progress_lines(4, 10, clock, running=True) == (
+        "Field 4 of 10",
+        "Elapsed 40 s",
+        "Left about 12 s (estimated from the fields so far)",
+    )
+
+
+def test_scan_progress_lines_leave_the_time_unknown_with_one_report_or_a_clock_that_did_not_move() -> (
+    None
+):
+    unknown = "Left: not known yet (it needs two fields)"
+    # No report yet, and no clock at all.
+    assert scan_progress_lines(0, 72, RunClock(1.0, None, None), running=True)[-1] == (
+        unknown
+    )
+    assert scan_progress_lines(0, 72, None, running=True) == ("Field 0 of 72", unknown)
+    # One report: the first is the latest.
+    one = RunClock(5.0, (4.65, 1), (4.65, 1))
+    assert scan_progress_lines(1, 72, one, running=True)[-1] == unknown
+    # Two reports with one stamp, as a 15.625 ms clock gives (FM-197): no division by zero.
+    same_stamp = RunClock(5.0, (4.65, 1), (4.65, 2))
+    assert scan_progress_lines(2, 72, same_stamp, running=True)[-1] == unknown
+    # Two reports of one field (a retry) have no pace either.
+    same_field = RunClock(5.0, (4.65, 3), (5.0, 3))
+    assert scan_progress_lines(3, 72, same_field, running=True)[-1] == unknown
+
+
+def test_scan_progress_lines_draw_no_left_once_the_last_field_is_done_or_the_run_ended() -> (
+    None
+):
+    clock = RunClock(elapsed_s=23.0, first=(4.65, 1), last=(18.08, 72))
+    # The last field is done: nothing is left to estimate.
+    assert scan_progress_lines(72, 72, clock, running=True) == (
+        "Field 72 of 72",
+        "Elapsed 23 s",
+    )
+    # A run that ended (or stopped) at 30 of 72 left nothing to wait for either.
+    stopped = RunClock(elapsed_s=9.0, first=(4.0, 1), last=(8.0, 30))
+    assert scan_progress_lines(30, 72, stopped, running=False) == (
+        "Field 30 of 72",
+        "Elapsed 9 s",
+    )
+    # Without a clock there is no Elapsed.
+    assert scan_progress_lines(30, 72, None, running=False) == ("Field 30 of 72",)
+
+
+@given(
+    done=st.integers(0, 200),
+    total=st.integers(0, 200),
+    first_t=st.floats(0.0, 1000.0),
+    last_t=st.floats(0.0, 1000.0),
+    first_done=st.integers(0, 200),
+    last_done=st.integers(0, 200),
+    elapsed=st.floats(0.0, 2000.0),
+    running=st.booleans(),
+)
+def test_scan_progress_lines_never_raise_and_never_say_a_negative_time(
+    done: int,
+    total: int,
+    first_t: float,
+    last_t: float,
+    first_done: int,
+    last_done: int,
+    elapsed: float,
+    running: bool,
+) -> None:
+    clock = RunClock(elapsed, (first_t, first_done), (last_t, last_done))
+    lines = scan_progress_lines(done, total, clock, running=running)
+    assert lines[0] == f"Field {done} of {total}"
+    assert all("-" not in line for line in lines)
+    assert sum(line.startswith("Left") for line in lines) <= 1
+
+
+def test_scanned_line_counts_frames_and_says_a_dry_run_took_none() -> None:
+    assert scanned_line(ScanSummary(frames=72, failed=0, dry_run=False)) == (
+        "Scanned: 72 frames, 0 failed"
+    )
+    assert scanned_line(ScanSummary(frames=1, failed=2, dry_run=False)) == (
+        "Scanned: 1 frame, 2 failed"
+    )
+    # A dry run walks the fields and takes no frame: it is not a scan that found nothing.
+    assert scanned_line(ScanSummary(frames=0, failed=0, dry_run=True)) == (
+        "Scanned in a dry run: no frame was taken"
+    )
+
+
+def test_plain_default_drops_one_pair_of_quotes_only() -> None:
+    assert plain_default("'if-engaged'") == "if-engaged"
+    assert plain_default('"if-engaged"') == "if-engaged"
+    # One pair, not all of them; the inner ones are the operator's text.
+    assert plain_default("''x''") == "'x'"
+    # Not a pair: mismatched, one-sided, a lone quote, nothing to drop.
+    assert plain_default("'x\"") == "'x\""
+    assert plain_default("'x") == "'x"
+    assert plain_default("'") == "'"
+    assert plain_default("1.0") == "1.0"
+    assert plain_default("") == ""
+    assert plain_default("None") == "None"
