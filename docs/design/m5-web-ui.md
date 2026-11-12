@@ -4269,7 +4269,31 @@ inventory of `plate_page.py`, `controller.py` and `guide.py` at the same commit.
 - **D9 What this section does not change**: a plugin, a slot, the run document, a
   command, the guards, `--dry-run`, the checklist's order (`_CHECKLIST`), the next
   step's logic (§8.3, which each screen draws for its own tools), the module and class
-  names (§0).
+  names (§0). D10's change to `goto-well` is a plugin change, so it is #462's, outside
+  this section; the Plate screen uses it.
+
+The owner walked B1's shell on `demo-sample` through Claude in Chrome
+(2026-11-11, findings on #431). The walk used a 1280 x 800 window, which gives a
+1280 x 623 page. Three decisions came from that walk:
+
+- **D10 Go to before registration** (owner). Before a plate is registered,
+  `goto-well` ends `UpstreamError: … the run document has no plate` and nothing moves
+  (measured again on the walk; §15 measured it first). The largest jog step is
+  1 000 µm, about 80 clicks from (0, 0) to A1. `goto-well` therefore reads `plate` as
+  optional (#462). Without a plate, it drives to the well's centre on the map's
+  `estimated` pose (§15 D3). Its record says that the target was estimated from the
+  holder and not registered. On an `unplaced` pose it refuses, and nothing moves.
+- **D11 Go to and Live** (owner). A *Go to* is a `goto-well` run, refused while Live
+  runs (§5.2). *Capture centre* is accepted while Live runs (measured on the walk),
+  and so are the arrows. The Plate screen's *Go to* is drawn disabled while Live
+  runs, with `GOTO_NOT_DURING_LIVE` beside it. Per well, the path is: Go to, Live, the
+  arrows, Capture, End live. Nothing ends Live on its own.
+- **D12 Height** (owner). On the Stand and Plate screens, a screen's title, lead,
+  fields and first action fit a **1280 x 620** page under the header. The **header**
+  is one sticky column: the strip, the outcome lines and the step bar with its
+  summaries. It stays on screen when the page scrolls, because the walk lost the step
+  bar on a scroll. The figures keep `FIGURE_HEIGHT_PX`. `/ui-check` adds a 1280 x 620
+  shot of both screens (§17.8).
 
 ### 17.3 The layout
 
@@ -4300,6 +4324,14 @@ inventory of `plate_page.py`, `controller.py` and `guide.py` at the same commit.
   `_PLATE_NOTE_WIDTH`, become `None` with the wrapped style).
 - The step panel scrolls on its own (`scroll=True`) when a screen is taller than the
   window; the strip, the step bar and the figures never scroll away.
+- From B2 on (D12), the strip, the outcome lines and the step bar are **one header
+  column** with the strip's sticky style (`_STICKY_STRIP`). The walk saw the strip
+  hold when the page scrolled, while the step bar scrolled away. `show_step` sets the
+  step panel's `scroll_position` to 0. The walk opened Plate scrolled as far as Stand
+  had been, with its title out of view. **Measured** (2026-11-11, Panel 1.10.0 /
+  Bokeh 3.10.2, headless Chromium): a `Column(scroll=True)` scrolled in the browser
+  reports `scroll_position` 900 to the server, and after its `objects` are replaced,
+  setting 0 scrolls it back to the top.
 - The drive bar is a `pn.FlexBox(flex_wrap="wrap")` of today's drive widgets, plus the
   map's *Drive to* select and the *Drive (next click moves the stage)* toggle, which
   leave the map's controls row.
@@ -4325,6 +4357,10 @@ Run.
   objective in place, a second action, *Calibrate the camera*, runs
   `camera-calibration` with the profile's suggested pairs.
 - Continue: *Continue to Plate*.
+- Order (D12): the stand line, the preset select and *Load the preset* come first,
+  then the "known" block, then *Calibrate the camera*. The next-step region is not
+  on this screen (the walk found `plate-registration`'s 12-line command there), and
+  each action's command is under its *Command* disclosure (D8).
 
 **17.4.2 Plate** (`"plate"`)
 - Title: *Where is the plate?* Lead: *Centre three wells far apart by eye, with Live
@@ -4349,6 +4385,22 @@ Run.
 - Continue: *Continue to Wells*.
 - #373 (the objective a plate records) is not decided here; the list shows the
   objective of each capture, so that a turn between captures is visible.
+- From the walk (D10, D11):
+  - *Go to* `<well>` is `PlatePage.goto(well)`, the same call as a drive click. Before
+    a registration it drives to the holder's estimate (#462), and the row says
+    `estimated position: centre it by eye`. It is disabled while Live runs, with
+    `GOTO_NOT_DURING_LIVE`. A refused or failed *Go to* is drawn on its row. On the
+    walk, an armed drive click was spent with no word on the page.
+  - *Capture the centre of* `<well>` stays enabled while Live runs: the operator
+    centres in Live and captures there.
+  - There is one *Register the plate*. The tool's form and its *Run
+    plate-registration* stay in the expert view: the walk found two Run buttons, one
+    under the other. The walls (*Capture wall*, *Wall, as on the image*) are in the
+    expert view only.
+  - Before any capture, nothing is drawn in the warning colour. The rows say what
+    to do. `CAPTURE_WELLS` is the wait under *Register the plate* only.
+  - After a registration, the screen shows its result line and *Continue to Wells*.
+    It does not show the next step: the walk found *Run scan-plan* here.
 
 **17.4.3 Wells** (`"wells"`)
 - Title: *Which wells?* Lead: *Click wells on the map, or type them. The map shows the
@@ -4507,7 +4559,9 @@ Every build issue edits `plate_page.py` and, from B2 on, `controller.py` and
   place does not depend on the state, so `refresh()` never rewrites a screen's list.
   B2 to B4 drop it from the screens they replace, whose own action is the next step.
 - **B2, the Stand and Plate screens** (#444): §17.4.1 and §17.4.2 in full,
-  `guide.suggested_centres`, the "known" block, the *from …* lines.
+  `guide.suggested_centres`, the "known" block, the *from …* lines, the header and the
+  scroll of D12. It comes after #462 (D10), which edits `goto_well.py` and
+  `controller.py`.
 - **B3, the Wells and Scan screens** (#445): §17.4.3 and §17.4.4, the progress and
   the imaged fields.
 - **B4, the Results screen** (#446): §17.4.5, `PlatePage.run_chain`, the colour bar's
@@ -4531,7 +4585,9 @@ photograph, the switch off; fourth, so that both stands reach it: `STATE_NAMES[:
 `turned` (*2. Plate*, then *Plate lies*). `summary.txt`'s `active tab` line becomes
 `step`, the label of the step button drawn as `primary`. B2 to B4 each read
 the states of their screens; each walks its screens at 1280 x 800 and says in its
-Report what is below the fold.
+Report what is below the fold. From B2 on (D12), two more shots run at **1280 x
+620**: `stand-620` (*1. Stand*, connected) and `plate-620` (*2. Plate*). In both,
+the title and the first action are inside the page.
 
 ### 17.9 Tests and failure modes
 

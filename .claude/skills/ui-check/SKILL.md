@@ -135,6 +135,28 @@ fails on it, and the step said `cells` again, advice the page cannot follow (#31
 page now stops the step at `scan` on a dry run and says why; the guard below is the
 other half of that decision.
 
+**The walk of 2026-11-11** (Claude in Chrome from the VS Code extension, macOS,
+`demo-sample`, B1's shell at 8549b4f, findings on #431):
+
+- **Connecting.** The extension stayed `Not detected` until Claude Code had written
+  its native-messaging host. That host is the file
+  `com.anthropic.claude_code_browser_extension.json` in Chrome's
+  `NativeMessagingHosts` folder. It was written by running the extension's bundled
+  binary with `--chrome` in a terminal (`claude` was not on the PATH). Chrome then
+  had to be quit and reopened. The tools appeared once the owner's message used
+  `@browser`.
+- **Clicking by name.** A script in the page (the MCP's `javascript_tool`) walked the
+  shadow roots for `button` and `pre` elements. It clicked buttons by their text and
+  read the strip and the outcome lines. That replaced clicks at coordinates, which
+  missed as soon as an outcome line pushed the layout down by about 28 px.
+- **The window.** A 1280 x 800 window is a 1280 x 623 page. The mouse wheel over a
+  figure zooms the figure instead of scrolling the page. The window once changed size
+  under the session (a 1568 x 565 page), and the map drew squeezed wells until the
+  page was reloaded.
+- **Live and Drive.** A drive click is refused while Live runs, with the refusal at
+  the top of the page, out of view. A refused or missed click disarms *Drive*, so the
+  next click only selects a well.
+
 **Every later session adds what it learns here** (another MCP, keyboard use, a narrow
 window, Live, Drive).
 
