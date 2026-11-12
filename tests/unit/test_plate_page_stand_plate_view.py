@@ -1080,6 +1080,10 @@ def test_a_windows_page_says_its_commands_are_quoted_for_a_posix_shell(
         "that line is quoted for a POSIX shell (bash, zsh); PowerShell and cmd.exe "
         "read quotes differently: press the button, which makes the same call"
     )
+    # Both ways are set, never left to the runner's own platform: on a Windows runner the
+    # unset default is the note showing (found by CI on the first push of #444).
+    view._windows = False
+    view.refresh()
     for pane in (view.register_command_note, view.calibrate_command_note):
         assert pane.object == ""
         assert not pane.visible
