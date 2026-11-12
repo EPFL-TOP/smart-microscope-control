@@ -134,6 +134,22 @@ class Optional(Base):
         return Result()
 
 
+class WhyNot(Base):
+    """Asks why an optional slot was not read (m3 §5.5 D5); ``asks`` is the slot asked about."""
+
+    name = provides = "why-not"
+    reads = ("up",)
+    reads_optional = ("timings",)
+
+    def __init__(self, asks: str = "timings") -> None:
+        super().__init__()
+        self.asks = asks
+
+    def body(self, microscope: Any, params: Params, ctx: RunContext) -> Result:
+        self.seen = {"why": ctx.why_not_read(self.asks)}
+        return Result()
+
+
 class NeedsBoth(Base):
     name = provides = "needs-both"
     requires = (XYStage, ZStage)
@@ -748,6 +764,63 @@ def test_a_usable_optional_result_that_the_model_refuses_raises_upstream_error(
         "inputs are not permitted); run timing again"
     )
     assert _stored(tmp_path, "optional").status is StageStatus.failed
+
+
+@pytest.mark.parametrize(
+    ("records", "why"),
+    [
+        pytest.param(
+            _timing_was_a_dry_run,
+            "timing was a dry run; run it without --dry-run",
+            id="dry-run-provider",
+        ),
+        pytest.param(
+            list,
+            "the run document has no timings; smc run --list shows which plugin "
+            "provides it",
+            id="absent",
+        ),
+    ],
+)
+def test_why_not_read_names_why_an_optional_slot_was_not_used(
+    fake_microscope: Microscope, tmp_path: Path, records: Any, why: str
+) -> None:
+    # A real run (the fake stand is not a dry run): a rehearsal's timings are not
+    # read, and the plugin is told so in RunDocument.unusable's words.
+    assert not fake_microscope.dry_run
+    write_stage(_path(tmp_path), _done_record("up"))
+    for record in records():
+        write_stage(_path(tmp_path), record)
+    plugin = WhyNot()
+    record = _run(plugin, fake_microscope, tmp_path)
+    assert record.status is StageStatus.done
+    assert record.reads["timings"] is None
+    assert plugin.seen == {"why": why}
+
+
+def test_why_not_read_is_none_for_a_slot_that_was_read(
+    fake_microscope: Microscope, tmp_path: Path
+) -> None:
+    write_stage(_path(tmp_path), _done_record("up"))
+    write_stage(_path(tmp_path), _done_record("timing", provides="timings"))
+    plugin = WhyNot()
+    record = _run(plugin, fake_microscope, tmp_path)
+    assert record.reads["timings"] == ReadRecord(plugin="timing", attempt="timing-0")
+    assert plugin.seen == {"why": None}
+
+
+@pytest.mark.parametrize("slot", ["nothing", "up"])
+def test_why_not_read_refuses_a_slot_outside_reads_optional(
+    fake_microscope: Microscope, tmp_path: Path, slot: str
+) -> None:
+    # `up` is in reads: the runner insisted on it, so there is no "why not" to ask.
+    write_stage(_path(tmp_path), _done_record("up"))
+    problem = (
+        f"why-not does not declare {slot!r} in reads_optional; add it there "
+        f"(or to reads, and call upstream)"
+    )
+    with pytest.raises(ValueError, match=f"^{re.escape(problem)}$"):
+        _run(WhyNot(asks=slot), fake_microscope, tmp_path)
 
 
 def test_an_upstream_that_the_model_refuses_names_slot_provider_and_error(

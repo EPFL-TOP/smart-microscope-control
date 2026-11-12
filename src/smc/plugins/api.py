@@ -303,6 +303,34 @@ class RunContext:
             return None
         return self._result_of(slot, model)
 
+    def why_not_read(self, slot: str) -> str | None:
+        """Why the runner did not use ``slot`` of ``reads_optional``, with the fix; ``None`` when it did.
+
+        In ``RunDocument.unusable``'s words, judged as the runner judged it: the same
+        snapshot, the profile the running record names, the dry run and the reader
+        (m3 §5.5 D5). A plugin that falls back when a slot is not usable says why in
+        its record, so that the operator reads the fix and not only the fallback.
+
+        Raises:
+            ValueError: ``slot`` is not in the plugin's ``reads_optional``.
+        """
+        if slot not in self._reads_optional:
+            raise ValueError(
+                f"{self.plugin} does not declare {slot!r} in reads_optional; add "
+                f"it there (or to reads, and call upstream)"
+            )
+        if self._read_at_start.get(slot) is not None:
+            return None
+        reason = self._snapshot.unusable(
+            slot,
+            profile=self._attempt.record.profile,
+            dry_run=self.dry_run,
+            reader=self.plugin,
+        )
+        # The runner recorded the slot as not read because this same call said why;
+        # only a bug makes it answer ``None`` now.
+        return "the runner did not read it" if reason is None else reason
+
     def _result_of(self, slot: str, model: type[M]) -> M:
         # Never the plugin's own record: a tool that reads the slot it provides
         # reads the latest other provider, the one the runner recorded (m3 §24 D8).
