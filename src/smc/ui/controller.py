@@ -120,6 +120,7 @@ from smc.ui.guide import (
     SELECTION_KEPT_ITS_NAMES,
     WALLS_DRY_RUN,
     WALLS_NEED_CALIBRATION,
+    CalibrationNote,
     NextStep,
     a1_corner,
     command_line,
@@ -475,6 +476,11 @@ class PlateView:
     not positive (m5 §14.1). ``orientation`` is ``PlatePage.orientation`` as this read
     found it, what the *Plate lies* select shows (m5 §16 D2); ``sides`` are the stand's
     sides around the wells, empty when the profile does not say them (§16 D8).
+    ``camera_calibration`` is the objective and the time of the same usable
+    ``camera-calibration`` as ``camera_matrix``, for the Stand screen's "known" block
+    (m5 §17.4.1); ``registered`` is the usable ``plate`` slot when it names the page's
+    plate, the Plate screen's result line (§17.4.2): ``None`` when there is none, it
+    names another plate, or its result does not validate (the problem is in ``problems``).
     """
 
     plate: str
@@ -493,6 +499,8 @@ class PlateView:
     pose: MapPose = field(default_factory=lambda: MapPose("unplaced"))
     orientation: PlateOrientation = "not-turned"
     sides: tuple[SideLabel, ...] = ()
+    camera_calibration: CalibrationNote | None = None
+    registered: PlateResult | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -740,6 +748,21 @@ def _plan_layer(plan: ScanPlanResult | None, problems: list[str]) -> PlanLayer |
     )
 
 
+def _when_utc(record: StageRecord) -> str:
+    """When ``record`` ended, or started, in UTC as a card prints it; the unknown time when UTC cannot hold it.
+
+    One place for the result cards and the Stand screen's calibration line, so that
+    the two never say two times for one record. A date a model accepts (year 1 with an
+    offset) that UTC cannot hold must not stop ``view()``, which raises nothing for a
+    hand-edited document.
+    """
+    when = record.finished_utc or record.started_utc
+    try:
+        return when.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    except (OverflowError, ValueError):
+        return _UNKNOWN_TIME
+
+
 def _card(
     record: StageRecord, *, stale: bool = False, run_dir: PurePath | None = None
 ) -> ResultCard:
@@ -762,13 +785,7 @@ def _card(
     A ``scan-plan`` result shows its wells, fields, field and estimate instead of
     its first keys, which cut ``estimate_s`` away (m5 §14.3); the same rule.
     """
-    when = record.finished_utc or record.started_utc
-    try:
-        when_utc = when.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-    except (OverflowError, ValueError):
-        # A date a model accepts (year 1 with an offset) that UTC cannot hold: a
-        # hand-edited document must not stop ``view()``, which raises nothing for one.
-        when_utc = _UNKNOWN_TIME
+    when_utc = _when_utc(record)
     lines: list[str] = []
     files: list[str] = []
     assumed: tuple[str, ...] = ()
@@ -1118,6 +1135,11 @@ class PlatePage:
         self.selection = ()
         self.refs = ()
         self.walls = ()
+        # The turret label read at each centre this page captured (m5 §17.4.2): a third
+        # piece of capture state beside ``refs``, replaced whole and never edited in
+        # place, so that a tab reading it between two writes sees one or the other
+        # (FM-151). A capture restored from a run document has no entry: unknown.
+        self._capture_objectives: dict[str, str | None] = {}
         doc, _unreadable = self._document()
         self._plate, self._plate_chosen = self._initial_plate(doc)
         # The orientation the operator declared, for an estimate and the next fit (m5
@@ -1203,7 +1225,34 @@ class PlatePage:
         self.selection = ()
         self.refs = ()
         self.walls = ()
+        self._capture_objectives = {}
         self.current = None
+
+    @property
+    def sample_plate(self) -> str | None:
+        """The plate of the profile's ``[sample]``, or ``None``: what the Plate screen's *from …* line reads (m5 §17.2 D7).
+
+        A read of the profile, which is the page's for its whole life, as ``holder``
+        and ``stand_name`` are: it asks nothing of the stand.
+        """
+        sample = self._profile.sample
+        return None if sample is None else sample.plate
+
+    @property
+    def registers_from_sample(self) -> bool:
+        """Whether *Register the plate* would run from the profile's ``[sample]``, not from captures (m5 §8.3, §17.4.2).
+
+        When the plate is chosen, nothing is captured (centres or walls) and the
+        profile's sample is of this plate: its centres are known, not measured. The
+        sample branch of ``registration_step`` holds exactly when this does (a test
+        pins it), so that a row never says ``known from the profile's sample`` for a
+        plate the button would not register from it.
+        """
+        return (
+            self._plate_chosen
+            and not (self.refs or self.walls)
+            and self.sample_plate == self._plate
+        )
 
     @property
     def holder(self) -> HolderSection:
@@ -1514,10 +1563,56 @@ class PlatePage:
             if microscope is None:
                 raise RuntimeError(NOT_CONNECTED)
             position = microscope.require(XYStage).position_um()
+            # After the XY read, in the same block: the label is the turret's at this
+            # capture, so that a turn between two captures shows on the Plate screen.
+            objective = self._objective_in_place(microscope)
         ref = WellRef(well=name, x_um=position.x_um, y_um=position.y_um)
         kept = tuple(r for r in self.refs if normalise_well(r.well) != name)
+        # The objective first: a tab that reads between the two writes sees a well with
+        # no entry (unknown), never a new centre with the old objective (FM-151).
+        self._capture_objectives = {
+            **{w: o for w, o in self._capture_objectives.items() if w != name},
+            name: objective,
+        }
         self.refs = (*kept, ref)
         return ref
+
+    @staticmethod
+    def _objective_in_place(microscope: Microscope) -> str | None:
+        """The turret's label now, or ``None`` when the stand has no turret or its read fails.
+
+        A capture is the operator's work and the label only annotates it: a turret
+        between two positions (m2 §8.11) or a device that does not answer leaves the
+        capture standing, with the objective unknown, never an exception that loses
+        the centre (m5 §17.4.2). An empty label is unknown too: *with* nothing would
+        read as a fact. The failure is logged, once per capture.
+        """
+        turret = microscope.get(ObjectiveTurret)
+        if turret is None:
+            return None
+        try:
+            label = turret.current()
+        except Exception as exc:
+            log.warning(
+                "capture: the objective in place could not be read: %s: %s",
+                type(exc).__name__,
+                _one_line(exc),
+            )
+            return None
+        return label or None
+
+    @property
+    def capture_objectives(self) -> Mapping[str, str | None]:
+        """The turret label read when each captured centre was taken, by well (m5 §17.4.2).
+
+        Only for the wells still in ``refs``: a centre forgotten or dropped with its
+        plate leaves no label behind, whichever path dropped it. A well absent from the
+        mapping has no recorded objective (a capture restored from a run document), and
+        ``None`` is a capture whose label could not be read: the Plate screen says
+        ``the objective not known`` for both, never the one in place now.
+        """
+        held = self._capture_objectives
+        return {ref.well: held[ref.well] for ref in self.refs if ref.well in held}
 
     def capture_wall(self, well: str, side: str) -> WallTouch:
         """Record the stage position as a point of ``well``'s wall at ``side`` of the image.
@@ -1568,10 +1663,14 @@ class PlatePage:
         if well is None:
             self.refs = ()
             self.walls = ()
+            self._capture_objectives = {}
             return
         name = normalise_well(well)
         self.refs = tuple(r for r in self.refs if normalise_well(r.well) != name)
         self.walls = tuple(w for w in self.walls if normalise_well(w.well) != name)
+        self._capture_objectives = {
+            w: o for w, o in self._capture_objectives.items() if w != name
+        }
 
     def page_params(self, plugin: str) -> list[str]:
         """The ``key=value`` pairs the page fills itself for ``plugin`` (``PAGE_PARAMS``).
@@ -3188,6 +3287,11 @@ class PlatePage:
             if tool.name in doc.stages
         }
         cards = self._with_sample_source(doc, cards)
+        # The same usable slot as the matrix, so that what the Stand screen says of the
+        # calibration is what the arrows' note reads (m5 §17.4.1).
+        calibration_record = (
+            None if calibration is None else doc.provider("camera-calibration")
+        )
         return PlateView(
             plate=self._plate,
             nominal=pose.kind in ("estimated", "unplaced"),
@@ -3205,6 +3309,19 @@ class PlatePage:
             pose=pose,
             orientation=pose.orientation,
             sides=self._sides(geometries),
+            camera_calibration=(
+                None
+                if calibration is None or calibration_record is None
+                else CalibrationNote(
+                    objective=calibration.objective,
+                    when_utc=_when_utc(calibration_record),
+                )
+            ),
+            registered=(
+                registered
+                if registered is not None and registered.plate == self._plate
+                else None
+            ),
         )
 
     def _sides(self, geometries: Sequence[WellGeometry]) -> tuple[SideLabel, ...]:
@@ -3515,6 +3632,19 @@ class PlatePage:
             "moves the stage in X and Y only"
         )
         return self._walls_pairs(refs), None
+
+    def registration_step(self) -> tuple[tuple[str, ...], str | None]:
+        """The pairs the Plate screen's *Register the plate* runs, and what it waits for (m5 §17.4.2).
+
+        The public form of the next step's own computation, with its ``why`` lines
+        dropped: the same pairs and the same wait, so that the button and the next step
+        of the expert view cannot disagree. The view draws them at a ``refresh()`` and
+        runs the pairs it drew, never pairs recomputed at the click (#287). With a wait
+        the pairs are empty: nothing is offered while the plate is the placeholder
+        (m5 §11.3) or while no centre is captured and no sample gives them.
+        """
+        pairs, wait = self._registration_step([])
+        return tuple(pairs), wait
 
     def _registration_step(self, why: list[str]) -> tuple[list[str], str | None]:
         """The pairs of ``plate-registration`` and what it waits for, with a line of ``why`` for them.
@@ -3978,6 +4108,12 @@ class PlatePage:
             touch.model_copy(update={"well": _turned_name(plate, touch.well)})
             for touch in self.walls
         )
+        # The objective stays with the position, which a turn of the plate does not move:
+        # only the name it is held under follows (a third piece of state beside ``refs``).
+        self._capture_objectives = {
+            _turned_name(plate, well): objective
+            for well, objective in self._capture_objectives.items()
+        }
 
     @staticmethod
     def _captured(

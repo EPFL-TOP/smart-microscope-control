@@ -45,7 +45,14 @@ from pymmcore_plus import CMMCorePlus
 
 import smc.ui.controller as controller_module
 from smc.hardware import Microscope
-from smc.hardware.capabilities import Autofocus, Camera, XYStage, ZStage
+from smc.hardware.capabilities import (
+    Autofocus,
+    Camera,
+    ObjectiveOffset,
+    ObjectiveTurret,
+    XYStage,
+    ZStage,
+)
 from smc.hardware.errors import HardwareError, StopRefusedError
 from smc.hardware.profile import Profile
 from smc.hardware.roles import Role
@@ -92,10 +99,13 @@ from smc.ui.controller import (
 )
 from smc.ui.frames import Frame
 from smc.ui.guide import (
+    CAPTURE_WELLS,
     GOTO_UNPLACED,
     NO_CALIBRATION_FOR_SIDES,
+    PLATE_NOT_CHOSEN,
     WALLS_DRY_RUN,
     WALLS_NEED_CALIBRATION,
+    CalibrationNote,
     scan_plan_card_lines,
     walls_centres_problem,
     walls_square_wells,
@@ -5679,3 +5689,272 @@ def test_the_cards_scan_plan_lines_are_one_line_each_and_bounded(
     assert lines[2].startswith("field: 512 × 512 µm at 10X Plan Apoxxx")  # noqa: RUF001
     assert lines[2].endswith("x…")
     assert len(lines[2]) == 601
+
+
+# --- the Plate screen's state: the objective of a capture, the step, the view (m5 §17.4, #444) ---
+
+TEN_X = "Nikon 10X S Fluor"
+FORTY_X = "Nikon 40X Plan Fluor ELWD"
+
+
+class _TurretThatRaises:
+    """A turret whose ``current()`` raises, as a Ti2-E between two positions does (#406)."""
+
+    def labels(self) -> list[str]:
+        return [TEN_X]
+
+    def current(self) -> str:
+        raise RuntimeError("the turret is between two positions")
+
+    def select(self, label: str, *, confirm: bool = False) -> str:
+        return label
+
+    def pixel_size_um(self, label: str | None = None) -> float:
+        return 0.0
+
+    def offset(self, label: str) -> ObjectiveOffset:
+        return ObjectiveOffset(label, None, None, None, "")
+
+
+class _TurretWithNoLabel(_TurretThatRaises):
+    """A turret that answers with an empty label: a position nobody named."""
+
+    def current(self) -> str:
+        return ""
+
+
+def test_a_capture_records_the_objective_in_place(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    stage = fake_microscope.require(XYStage)
+    turret = fake_microscope.require(ObjectiveTurret)
+    assert page.capture_objectives == {}
+    stage.move_to_um(10.0, 20.0)
+    page.capture_centre("A1")
+    assert page.capture_objectives == {"A1": TEN_X}
+    # A turn between two captures shows in the list: each keeps the label it was taken with.
+    turret.select(FORTY_X, confirm=True)
+    stage.move_to_um(30.0, 40.0)
+    page.capture_centre("A12")
+    assert page.capture_objectives == {"A1": TEN_X, "A12": FORTY_X}
+    # A recapture of the same well replaces its label with the new one, in place.
+    stage.move_to_um(50.0, 60.0)
+    page.capture_centre("a1")
+    assert page.capture_objectives == {"A1": FORTY_X, "A12": FORTY_X}
+    assert [r.well for r in page.refs] == ["A12", "A1"]
+
+
+def test_a_capture_with_an_unreadable_turret_stands_with_no_objective(
+    page: PlatePage,
+    fake_microscope: Microscope,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake_microscope.require(XYStage).move_to_um(10.0, 20.0)
+    fake_microscope.override(ObjectiveTurret, _TurretThatRaises())
+    with caplog.at_level(logging.WARNING, logger="smc.ui"):
+        ref = page.capture_centre("A1")
+    # The centre stands: a label that cannot be read must not lose the operator's work.
+    assert ref == WellRef(well="A1", x_um=10.0, y_um=20.0)
+    assert page.refs == (ref,)
+    assert page.capture_objectives == {"A1": None}
+    lines = [r.getMessage() for r in caplog.records if r.name == "smc.ui"]
+    assert lines == [
+        "capture: the objective in place could not be read: RuntimeError: "
+        "the turret is between two positions"
+    ]
+    # An empty label is unknown too: "with" nothing would read as a fact.
+    fake_microscope.override(ObjectiveTurret, _TurretWithNoLabel())
+    page.capture_centre("A12")
+    assert page.capture_objectives == {"A1": None, "A12": None}
+
+
+def test_a_capture_on_a_stand_with_no_turret_stands_with_no_objective(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    real_get = fake_microscope.get
+
+    def get(capability: type) -> Any:
+        return None if capability is ObjectiveTurret else real_get(capability)
+
+    with _replaced(fake_microscope, "get", get):
+        page.capture_centre("A1")
+    assert page.capture_objectives == {"A1": None}
+    assert [r.well for r in page.refs] == ["A1"]
+
+
+def test_choosing_another_plate_drops_the_capture_objectives(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    page.capture_centre("A1")
+    page.capture_centre("A12")
+    assert set(page.capture_objectives) == {"A1", "A12"}
+    # The same plate confirms it and clears nothing; another plate drops the centres, and
+    # their labels with them: A1 of a 384-well is not the A1 that was centred.
+    page.choose_plate("96-well")
+    assert set(page.capture_objectives) == {"A1", "A12"}
+    page.choose_plate("384-well")
+    assert page.refs == ()
+    assert page.capture_objectives == {}
+    # The state itself holds none (the view filters by the centres, and this is not left to it).
+    assert page._capture_objectives == {}
+    # Back on the first plate: nothing comes back, and a new capture starts afresh.
+    page.choose_plate("96-well")
+    assert page.capture_objectives == {}
+    page.capture_centre("H1")
+    assert page.capture_objectives == {"H1": TEN_X}
+
+
+def test_forgetting_a_centre_drops_its_objective(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    page.capture_centre("A1")
+    page.capture_centre("A12")
+    page.forget("a1")
+    assert page.capture_objectives == {"A12": TEN_X}
+    assert page._capture_objectives == {"A12": TEN_X}
+    # The label of a forgotten well does not come back with a new capture elsewhere, and a
+    # recapture of the forgotten well is a new one.
+    fake_microscope.require(ObjectiveTurret).select(FORTY_X, confirm=True)
+    page.capture_centre("A1")
+    assert page.capture_objectives == {"A12": TEN_X, "A1": FORTY_X}
+    page.forget()
+    assert page.capture_objectives == {}
+    assert page._capture_objectives == {}
+
+
+def test_a_capture_restored_from_the_run_document_has_no_objective(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    refs = [{"well": "A1", "x_um": 1000.0, "y_um": -500.0}]
+    _seed(
+        run_doc,
+        "plate-registration",
+        "plate",
+        _plate("96-well"),
+        params={"plate": "96-well", "refs": refs, "walls": []},
+    )
+    restored = _page(fake_microscope, run_doc)
+    try:
+        assert [r.well for r in restored.refs] == ["A1"]
+        # Unknown, not "the one in place": the document does not say which it was.
+        assert restored.capture_objectives == {}
+    finally:
+        restored.close()
+
+
+def test_registration_step_is_the_next_steps_pairs_and_wait(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _page(fake_microscope, run_doc, _real("plate-registration"))
+    try:
+        # Nothing named the plate: nothing is offered, whatever is captured (m5 §11.3).
+        assert page.registration_step() == ((), PLATE_NOT_CHOSEN)
+        page.choose_plate("96-well")
+        assert page.registration_step() == ((), CAPTURE_WELLS)
+        stage = fake_microscope.require(XYStage)
+        for well in ("A1", "A12", "H1"):
+            stage.move_to_um(*_centre(well, a1=A1_OFF, rotation_deg=TURN_DEG))
+            page.capture_centre(well)
+        pairs, wait = page.registration_step()
+        assert wait is None
+        assert isinstance(pairs, tuple)
+        # The pairs are the next step's, and the click's: one computation said three ways.
+        step = page.view().next_step
+        assert step is not None
+        assert step.plugin == "plate-registration"
+        assert pairs == step.params == tuple(page.page_params("plate-registration"))
+        assert [p.split("=")[0] for p in pairs] == [
+            "plate",
+            "refs",
+            "walls",
+            "orientation",
+        ]
+    finally:
+        page.close()
+
+
+def _profile_with_sample(plate: str = "96-well") -> Profile:
+    return Profile.model_validate(
+        {"microscope": {"name": "demo"}, "sample": {"plate": plate}}
+    )
+
+
+def test_registration_step_registers_from_the_sample_until_something_is_captured(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = PlatePage.closed(
+        _profile_with_sample(),
+        run_doc,
+        opener=lambda: fake_microscope,
+        entry_points=_real("plate-registration"),
+    )
+    try:
+        # The sample names the plate, so it is chosen, and nothing is captured: the
+        # registration runs from the sample's centres, which are known and not measured.
+        assert page.sample_plate == "96-well"
+        assert page.plate_chosen
+        assert page.registers_from_sample is True
+        pairs, wait = page.registration_step()
+        assert wait is None
+        refs = json.loads(pairs[1].removeprefix("refs="))
+        assert [r["well"] for r in refs] == ["A1", "A12", "H1"]
+        page.connect()
+        assert page.join(10.0)
+        # A capture is measured, and wins: the sample no longer registers (m5 §8.3).
+        page.capture_centre("B2")
+        assert page.registers_from_sample is False
+        pairs, wait = page.registration_step()
+        assert json.loads(pairs[1].removeprefix("refs="))[0]["well"] == "B2"
+        page.forget()
+        assert page.registers_from_sample is True
+        # A plate that is not the sample's has no sample to register from, and says what to do.
+        page.choose_plate("384-well")
+        assert page.registers_from_sample is False
+        pairs, wait = page.registration_step()
+        assert pairs == ()
+        assert wait == (
+            "the profile's sample is a 96-well plate: "
+            "choose 96-well under plate-registration"
+        )
+    finally:
+        page.close()
+    # No sample at all: there is none to register from.
+    bare = PlatePage.closed(
+        Profile.demo(), run_doc, entry_points=_real("plate-registration")
+    )
+    try:
+        assert bare.sample_plate is None
+        assert bare.registers_from_sample is False
+    finally:
+        bare.close()
+
+
+def test_the_view_carries_the_calibration_and_the_registered_plate(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    page = _page(fake_microscope, run_doc)
+    try:
+        view = page.view()
+        assert view.camera_calibration is None
+        assert view.registered is None
+        seed_camera_calibration(run_doc, objective=TEN_X)
+        _seed(run_doc, "plate-registration", "plate", _plate("96-well"), minute=1)
+        view = page.view()
+        # The objective and the time of the same record as the matrix: the card's UTC string.
+        assert view.camera_matrix is not None
+        assert view.camera_calibration == CalibrationNote(
+            objective=TEN_X, when_utc="2026-11-09 09:30:00"
+        )
+        assert view.registered == _plate("96-well")
+        # A plate of another name is not the page's: no result line for it.
+        page.choose_plate("384-well")
+        assert page.view().registered is None
+        # A calibration that did not record its objective says so, and is still the matrix's.
+        seed_camera_calibration(run_doc, objective=None)
+        assert page.view().camera_calibration == CalibrationNote(
+            objective=None, when_utc="2026-11-09 09:30:00"
+        )
+    finally:
+        page.close()
