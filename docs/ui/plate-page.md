@@ -214,12 +214,12 @@ answers), a sentence, its own regions and *Continue*:
 |---|---|
 | *Stand* | [designed](#the-stand-and-plate-screens): the stand line, the preset, what is known, *Calibrate the camera* |
 | *Plate* | [designed](#the-stand-and-plate-screens): the plate, three centres to capture, *Register the plate* |
-| *Wells* | provisionally today's regions: **the next step**, the *Wells* box, `scan-plan` |
-| *Scan* | provisionally: the next step, `scan` |
+| *Wells* | [designed](#the-wells-and-scan-screens): the wells, coverage and autofocus, *Lay out the fields*, what is known |
+| *Scan* | [designed](#the-wells-and-scan-screens): *Start the scan*, a progress bar, what was scanned |
 | *Results* | provisionally: the next step, `cells`, `density`, `route`, `report`, `nis-export`, then the run document's path and its checklist |
 
-The three provisional screens are today's regions listed by step; their own designs (the
-progress, the results' rows) come with the next builds of
+The *Results* screen is today's regions listed by step; its own design (the results' rows)
+comes with the next build of
 [#431](https://github.com/EPFL-TOP/smart-microscope-control/issues/431).
 
 ### The Stand and Plate screens
@@ -285,6 +285,78 @@ do, and a refusal is the only orange text.
 are in view under the header (`ui-check`'s `stand-620` and `plate-620`); on a stand whose
 profile does not say its sides the Plate screen's first *Go to* sits at the foot of the
 window, and the other two rows and *Register the plate* are a scroll of the panel down.
+
+### The Wells and Scan screens
+
+As the two before them, these hold **their own buttons and no next step**, and none of the
+tools' forms; each button runs the tool it names, and its **Command** disclosure (closed)
+shows the `smc run` line it makes (on a Windows PC, with the note that the line is quoted for
+a POSIX shell and the button is the way in). Nothing is in the warning colour but a refusal.
+
+**3. Wells: "Which wells?"** From the top:
+
+- **Wells**, the box you click the map or type a range in (`A1:D6`, `C*`, `all`), and under it
+  where the choice comes from: `no well chosen yet`, `from the preset <name>` or `chosen on
+  this page`;
+- **coverage** (`scan-plan`'s) and **autofocus** (`scan`'s), the tools' own fields: what you
+  type here is what the tools' sections in the expert view hold, and the other way round.
+  Under each, where its value comes from: `from the preset <name>`, `from the profile's
+  suggestions`, `typed on this page`, or `the tool's default: 1.0` while it is empty. The
+  light grey text in an empty field is that default, **without the quotes** a string carries
+  in the tool's own words (`if-engaged`, not `'if-engaged'`): it is not something to type;
+- **Lay out the fields**: `scan-plan` with your wells and these two values, which is what the
+  tool's own *Run* does. While it waits it says for what, the first that holds: the stand is
+  closed, the plate is not chosen (`choose the plate on the stage first ...`), **register the
+  plate first: step 2, Plate**, the tool's own reason, **select the wells to scan**; and while
+  something runs, what runs and how to end it;
+- **what is known**, under the button: `Objective: <label>, in place`; `Fields: 72 in 2 wells`
+  (or `Fields: not laid out yet`, or `Fields: out of date (<why>)` when the plate or the timings
+  were produced again since, so the plan is stale); `Time: about 42 s`, or, for a plan made with
+  no timing measured, `Time: not known (no timing measured; the expert view's timing tool
+  measures it, then lay out the fields again)`: an unknown, never `0 s`; then what the plan
+  assumed (`assumed: no camera calibration for ...`). The page does not measure the timing
+  itself: that moves the stage;
+- when the wells selected are **not** the plan's wells, a note says which wells the plan is for
+  and to lay the fields out again to scan the others: the plan is what `scan` does, and a
+  selection made since has not changed it.
+
+**4. Scan: "Scan B2 and B11"** The title names the **plan's** wells in plate order (`Scan B2`,
+`Scan B2 and B11`, `Scan A1, A2 and A3`, and from four wells `Scan 12 wells`; the wells selected
+while there is no plan; `Scan the selected wells` while there is neither), and the sentence
+under it says the plan's size and where STOP is: `72 fields at Nikon 10X S Fluor. STOP, at the
+top right, stops the scan.` On a stand whose profile says a stop is refused, it adds that **a
+move already sent finishes first**. From the top:
+
+- **Start the scan**: `scan`, with the autofocus field. It waits, the first that holds, for the
+  stand, for a plan (`lay out the fields first: step 3, Wells`), for the tool's own reason (a
+  stopped scan with a checkpoint is never started afresh by the page: continue it with `smc
+  run --resume`), and says what runs while something does. On a page served with `--dry-run`
+  a note says that **a dry run walks the fields and takes no frame**, so `cells` and what
+  follows have nothing to read; the button still starts it;
+- while it runs, and **after it, until another activity starts**: a progress bar and three
+  lines, `Field 17 of 72`, `Elapsed 41 s`, `Left about 12 s (estimated from the fields so
+  far)`. *Left* is the pace **between the first field and the latest** times the fields that
+  remain, never the pace from the click (a scan takes seconds to its first field on the demo
+  and a fraction of a second for each next): it says `Left: not known yet (it needs two
+  fields)` until there are two reports a clock tick apart, and is not drawn once the last
+  field is done or the run has ended. Live never draws this bar: its frames have no total;
+- **what was scanned**, the result line from the run document, so it is there after a
+  restart: `Scanned: 72 frames, 0 failed`, or `Scanned in a dry run: no frame was taken`, with
+  the card's `assumed:` lines and the `folder:` where the frames are. A scan that was stopped or
+  failed, or is of an earlier plan, has **no** result line: its record is not a result.
+
+**On the map**, the plan's fields stay orange and the ones a scan has a frame for turn **green**
+over them: the first fields **as the scan reports them** while it runs (the scan visits the plan's
+fields in the plan's order), and, once it is done, the fields the run document's scan holds a
+frame for (a field that failed is not green; a dry run takes no frame, so none is). A scan that
+ended `stopped` leaves the map without green fields: its frames are on disk and `smc run
+--resume` continues it, but the page claims only what a usable result holds. A field is 512 µm on
+a plate of 127 mm: **a pixel or two at the default zoom**, so zoom the map to see them (the map is
+not framed on the plan's wells yet).
+
+**At 1280 x 800** the Wells screen's title, the box, the two fields and *Lay out the fields* are
+in view under the header, and what is known may be a scroll of the panel down (`ui-check`'s
+`wells-laid-out` says it). The Scan screen's title, the button and the bar are in view.
 
 **The expert view.** The *Expert view* switch replaces the step panel's contents with
 everything the page had before the steps: the preset, the next step, *Plate*, *Plate lies*,
@@ -406,7 +478,8 @@ made on another stand, or a dry run's on a page that is not one. **A plan of mor
 5000 fields draws nothing**, not a first part of it (a first part would pass for all of
 it), and the title says so: `; scan plan: 20000 fields in 1536 wells, too many to draw
 (over 5000)`. The bound keeps what the page sends the browser at about 165 kB at each
-redraw; the card still says the count.
+redraw; the card still says the count. The fields a scan has a frame for are drawn **green
+over the orange** ones, within the same bound (see *The Wells and Scan screens*).
 
 **Which plate.** The page starts on the plate the run document names: the plate of the
 latest `plate-registration` or `plate-walls` record, whatever its status (the one you
@@ -971,6 +1044,14 @@ column, one click for each tool, until it says `every stage of the workflow is d
    result card names the files it wrote (the scan's folder, the cells' file, the report and
    the NIS-Elements position list), and the last step lists them all.
 
+On the guided screens the same path to a scan is buttons, with no next step in the way (the
+next step stays on *Results* and in the expert view): *2. Plate* and **Register the plate**
+(from the sample's centres), *3. Wells* with `B2,B11` typed in the box and **Lay out the
+fields** (the profile's `coverage=0.4` is already in the field, and says where it comes from),
+then *4. Scan* and **Start the scan**. `tests/unit/test_plate_page_wells_scan_view.py` walks
+exactly this on `demo-sample`, without `--dry-run`: `Scanned: 72 frames, 0 failed`, 72 green
+fields, `Field 72 of 72`.
+
 To practise the plate step as at a stand, **capture centres yourself**: start **Live**,
 centre a well with the **Drive** pad (the frames follow the stage), click it on the map,
 **Capture centre**, and again for two more wells far apart (three fit the plate and check
@@ -1099,6 +1180,15 @@ and `plate-walls` on a 4× frame.
 than the eye separates); the estimate against the time of a real scan on the Ti2-E (it
 was measured on the demo's simulated stage); and the plan of a real 384 or 1536-well
 plate in a browser.
+
+**The Wells and Scan screens** add, for the owner: a newcomer reading the two screens on
+`demo-sample` without a manual (the walks of
+[#431](https://github.com/EPFL-TOP/smart-microscope-control/issues/431)); *Left* against the
+real time of a scan on the Ti2-E (the pace was measured on the demo's simulated stage, 0.19 s
+a field); **STOP during a scan on a stand whose profile says `stop_refused_by`** and what the
+Scan screen's sentence says there (a move already sent finishes first); the green fields at
+the stand's screen and zoom, and over RDP; and the layout of both screens at the stand PC's
+window (the Wells screen's known block may be a scroll of the panel down at 1280 x 800).
 
 **Connect and Disconnect** add: Connect, Disconnect, NIS-Elements taking the stand,
 then Connect again, at a real stand; **a stand opened on the page's worker thread**,

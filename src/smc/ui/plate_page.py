@@ -3112,8 +3112,9 @@ class PlatePageView:
         is no plan. The bar and its lines are drawn only for a report of ``scan``: Live's
         report is ``live``, and another activity's start clears the report, so the block goes
         with the next activity and stays after the scan until then. ``max`` is at least 1 and
-        ``value`` never above it (Panel does not refuse one, measured, §17.10.1), and the
-        stripes move only while the scan goes. The result line follows the run document, not
+        ``value`` never above it (Panel refuses a ``value`` above the ``max`` it holds at that
+        moment, so ``max`` is set first), and the stripes move only while the scan goes. The
+        result line follows the run document, not
         the progress, so it survives a restart (``view.scanned``); the card's ``assumed``
         lines and its ``folder:`` line go under it. The dry-run note is plain and said once.
         """
@@ -3130,10 +3131,9 @@ class PlatePageView:
             DRY_RUN_NO_FRAME if status is not None and status.dry_run else "",
         )
         progress = None if status is None else status.progress
-        shown = (
-            status is not None and progress is not None and progress.plugin == "scan"
-        )
-        if status is not None and progress is not None and shown:
+        shown = False
+        if status is not None and progress is not None and progress.plugin == "scan":
+            shown = True
             total = progress.done if progress.total is None else progress.total
             going = status.running == "scan"
             maximum = max(total, 1)

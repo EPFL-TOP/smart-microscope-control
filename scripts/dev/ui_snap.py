@@ -17,7 +17,10 @@ passed by absolute path (a name is looked up in the working directory and in
 ``$SMC_PROFILES``, and an operator's directory can shadow it). The page is always
 served with ``--dry-run``. The chain of tools that fills the run document runs
 *without* it, on the demo's simulated stage: in dry run the stage does not move,
-every frame is plastic, and no state past the first three could be reached.
+every frame is plastic, and no state past the first three could be reached. The two
+guided states (``wells-laid-out``, ``scanned``) press the guided screens' own buttons,
+*Register the plate*, *Lay out the fields* and *Start the scan*, on the dry-run page, where
+each is a run that moves nothing; the script never presses a tool's own *Run*.
 
 Exit codes: 0 every state reached, the server logged no error and stopped by
 Ctrl-C; 1 the job could not be done (no playwright, no browser, the server never
@@ -75,13 +78,20 @@ TERMINATE_GRACE_S = 10.0
 KILL_GRACE_S = 5.0
 
 #: The first four need no chain and are reached on both stands (``expert`` is fourth for
-#: that: m5 §17.8); the next three need the results of a real run of the workflow; the last
-#: two are the short-page shots of D12 (m5 §17.2, §17.8), reached alone again, after them.
+#: that: m5 §17.8); the next three need the results of a real run of the workflow; the next
+#: two are the short-page shots of D12 (m5 §17.2, §17.8), reached alone again, after them; the
+#: last two walk the Wells and Scan screens by their own buttons (m5 §17.10.4, #445): they
+#: need a sample to register the plate from, so ``demo-sample`` only, and nothing of the chain.
 ALONE_STATES = ("empty", "wells-selected", "snap", "expert")
 CHAIN_STATES = ("after-density", "with-route", "turned")
 SHORT_STATES = ("stand-620", "plate-620")
-STATE_NAMES = (*ALONE_STATES, *CHAIN_STATES, *SHORT_STATES)
+GUIDED_STATES = ("wells-laid-out", "scanned")
+STATE_NAMES = (*ALONE_STATES, *CHAIN_STATES, *SHORT_STATES, *GUIDED_STATES)
 REACHABLE_ALONE = len(ALONE_STATES)
+
+#: Why the guided states are not reached on the plain demo (m5 §17.10.4): its plate has no
+#: references to register from, and a registration from three centres by eye is a hand's work.
+NO_SAMPLE_TO_REGISTER = "the demo has no sample to register from"
 
 #: The viewport the page is designed for (m5 §17.3): the strip, the step bar, both
 #: figures and the drive bar are on screen at 1280 x 800, the floor of a stand PC.
@@ -98,6 +108,10 @@ SHORT_VIEWPORT_HEIGHT_PX = 620
 SCREEN_TITLE_OF = {
     "stand-620": "Which stand, and which preset?",
     "plate-620": "Where is the plate?",
+    # The Scan screen's title names the plan's wells (``guide.scan_title``): the two wells
+    # ``wells-laid-out`` types, in plate order.
+    "wells-laid-out": "Which wells?",
+    "scanned": "Scan B2 and B11",
 }
 
 # A child sharing the console can change its code page (FM-22).
@@ -166,6 +180,9 @@ class StateRecord:
     wells: str | None = None
     texts: list[str] = field(default_factory=list)
     on_screen: list[str] = field(default_factory=list)
+    #: What a state is about, read out of its texts by name (``scanned``: the progress lines
+    #: and the result line), so that the summary says them and a session does not hunt for them.
+    facts: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -300,6 +317,17 @@ def plan_states(
     """
     plans = [StatePlan(name, True) for name in ALONE_STATES]
     short = [StatePlan(name, True) for name in SHORT_STATES]
+    # The guided states register the plate from the sample themselves and run no chain, so
+    # they are reached with ``--no-results`` and after a chain that failed: ``demo-sample``
+    # only, since the plain demo has nothing to register from.
+    guided = [
+        StatePlan(
+            name,
+            stand == "demo-sample",
+            None if stand == "demo-sample" else NO_SAMPLE_TO_REGISTER,
+        )
+        for name in GUIDED_STATES
+    ]
     if stand != "demo-sample":
         reason: str | None = (
             "the demo camera images no sample: no cells, no density; "
@@ -314,6 +342,7 @@ def plan_states(
             *plans,
             *(StatePlan(n, False, reason) for n in CHAIN_STATES),
             *short,
+            *guided,
         ]
     if chain_failure is not None:
         return [
@@ -322,8 +351,9 @@ def plan_states(
             StatePlan("with-route", False, f"needs the chain: {chain_failure}"),
             StatePlan("turned", False, f"needs the chain: {chain_failure}"),
             *short,
+            *guided,
         ]
-    return [*plans, *(StatePlan(n, True) for n in CHAIN_STATES), *short]
+    return [*plans, *(StatePlan(n, True) for n in CHAIN_STATES), *short, *guided]
 
 
 # --- what is read back -----------------------------------------------------
@@ -369,6 +399,7 @@ def format_summary(
             lines.append("reached")
             lines.append(f"step: {record.step or '?'}")
             lines += [f"on screen: {part}" for part in record.on_screen]
+            lines += list(record.facts)
             if record.wells is not None:
                 lines.append(f"Wells: {record.wells!r}")
             for text in record.texts:
@@ -776,6 +807,67 @@ def _act_plate_620(page: Any, stand: Stand) -> None:
     _open_screen(page, 2, "Plate", SCREEN_TITLE_OF["plate-620"])
 
 
+def _declare_upright(page: Any) -> None:
+    """The *Plate lies* select back to the option that is not turned, when ``turned`` left it turned.
+
+    The sample's centres are A1 at the corner it prints: registering them with the plate
+    declared turned 180° is refused (``the fit turns the plate by 0.0°: it lies turned 180°
+    from the declared orientation``), and the ``turned`` state, which runs earlier on the same
+    page, leaves it so. On a registered plate the switch is a run of ``plate-orientation``, and
+    the state waits for its outcome line (FM-162); a select already upright is left alone, so
+    that ``--no-results`` runs, which never turn it, wait for nothing.
+    """
+    select = page.get_by_label("Plate lies", exact=True)
+    select.wait_for()
+    labels = [text.strip() for text in select.locator("option").all_inner_texts()]
+    upright = next((t for t in labels if t and not t.startswith("Turned")), None)
+    current = str(select.evaluate("el => el.options[el.selectedIndex].text")).strip()
+    if upright is None or current == upright:
+        return
+    select.select_option(label=upright)
+    page.locator("pre").filter(has_text="plate-orientation done").first.wait_for()
+
+
+def _act_wells_laid_out(page: Any, stand: Stand) -> None:
+    """The guided path to a plan, by the screens' own buttons: Connect, *Register the plate*, the two wells, *Lay out the fields* (m5 §17.10.4).
+
+    Served in dry run, so nothing moves: the registration runs from the sample's references
+    and the plan is computed, both legal in a dry run. These are the page's own buttons and
+    not a tool's *Run*, which this script never clicks. Each wait is for the text the server
+    draws when its run ends, never for a delay (FM-162): the strip's outcome line for the
+    registration, and the known block's count for the plan (a plan of the chain is stale after
+    the registration, so the count is the new one's). ``Fields: <n> in 2 wells`` is the line.
+    The plate is declared upright first (``_declare_upright``): ``turned`` leaves it turned.
+    """
+    _connect(page)
+    _step_button(page, 2, "Plate").click()
+    _declare_upright(page)
+    page.get_by_role("button", name="Register the plate").click()
+    page.locator("pre").filter(has_text="plate-registration done").first.wait_for()
+    _step_button(page, 3, "Wells").click()
+    box = page.get_by_label("Wells", exact=True)
+    box.fill("B2,B11")
+    box.press("Enter")
+    page.get_by_role("button", name="Lay out the fields").click()
+    page.locator("pre").filter(has_text="scan-plan done").first.wait_for()
+    page.locator("pre").filter(
+        has_text=re.compile(r"Fields: \d+ in 2 wells")
+    ).first.wait_for()
+
+
+def _act_scanned(page: Any, stand: Stand) -> None:
+    """*4. Scan*, then *Start the scan*, and the wait for the run's own outcome line (m5 §17.10.4).
+
+    A dry-run page walks the fields and takes no frame, so the scan ends at once with
+    ``scan done in 0.0 s``: the bar, its lines and the result line are what the PNG shows, and
+    a scan in motion is the one-off session on a stand that moves (the skill says so). The
+    outcome text starts ``scan done``: ``scan-plan done`` does not contain it.
+    """
+    _step_button(page, 4, "Scan").click()
+    page.get_by_role("button", name="Start the scan").click()
+    page.locator("pre").filter(has_text="scan done").first.wait_for()
+
+
 ACTIONS = {
     "empty": _act_empty,
     "wells-selected": _act_wells_selected,
@@ -786,6 +878,8 @@ ACTIONS = {
     "turned": _act_turned,
     "stand-620": _act_stand_620,
     "plate-620": _act_plate_620,
+    "wells-laid-out": _act_wells_laid_out,
+    "scanned": _act_scanned,
 }
 
 #: What a state does after its photograph: ``expert`` puts its switch off, and the two
@@ -833,8 +927,23 @@ def _short_parts(page: Any, state: str) -> list[tuple[str, Any]]:
     ]
 
 
+def _guided_parts(page: Any, state: str) -> list[tuple[str, Any]]:
+    """The frame's parts and the guided screen's own: its title and its first action (m5 §17.10.4), by name.
+
+    The page is at the run's 1280 x 800: the Wells screen is taller than the Stand's, so the
+    summary says whether its title and its first action, *Lay out the fields* or *Start the
+    scan*, are inside the page, and the figures and the drive bar as for any other state.
+    """
+    action = "Lay out the fields" if state == "wells-laid-out" else "Start the scan"
+    return [
+        *_frame_parts(page),
+        ("title", page.locator("pre").filter(has_text=SCREEN_TITLE_OF[state])),
+        ("first action", page.get_by_role("button", name=action)),
+    ]
+
+
 def _on_screen(page: Any, state: str | None = None) -> list[str]:
-    """One line for each part of ``_frame_parts`` (``_short_parts`` for a short-page state): whether it is wholly in the viewport, and where.
+    """One line for each part of ``_frame_parts`` (``_short_parts`` for a short-page state, ``_guided_parts`` for a guided one): whether it is wholly in the viewport, and where.
 
     A part that is not drawn, or whose box the browser does not give, says so and is
     never guessed to be in view. A page with no viewport size (a fake) gives nothing.
@@ -843,7 +952,12 @@ def _on_screen(page: Any, state: str | None = None) -> list[str]:
     if not isinstance(viewport, dict):
         return []
     lines: list[str] = []
-    parts = _short_parts(page, state) if state in SHORT_STATES else _frame_parts(page)
+    if state in SHORT_STATES:
+        parts = _short_parts(page, state)
+    elif state in GUIDED_STATES:
+        parts = _guided_parts(page, state)
+    else:
+        parts = _frame_parts(page)
     for name, locator in parts:
         if locator.count() == 0:
             lines.append(f"{name}: not on the page")
@@ -888,6 +1002,21 @@ def _read_page(
     wells = box.input_value() if box.count() == 1 else None
     texts = [t.strip() for t in page.locator("pre").all_inner_texts() if t.strip()]
     return step, wells, texts, _on_screen(page, state)
+
+
+def scan_facts(texts: Sequence[str]) -> list[str]:
+    """What the ``scanned`` state is about, read from the page's texts: the progress lines and the result line (m5 §17.10.4).
+
+    The progress block's text starts ``Field <n> of <m>`` and the result line ``Scanned``; the
+    first pane of each, its lines joined by `` | ``. A pane the page did not draw is said as
+    ``not on the page`` and never guessed: a state that reached no scan says so here.
+    """
+
+    def first(prefix: str) -> str:
+        found = next((t for t in texts if t.startswith(prefix)), None)
+        return "not on the page" if found is None else " | ".join(found.splitlines())
+
+    return [f"progress: {first('Field ')}", f"result: {first('Scanned')}"]
 
 
 def _outputs(out: Path, name: str) -> list[Path]:
@@ -979,7 +1108,16 @@ def drive(
                 remaining = list(later[len(records) :])
             continue
         records.append(
-            StateRecord(plan.name, True, None, step, wells, texts, on_screen)
+            StateRecord(
+                plan.name,
+                True,
+                None,
+                step,
+                wells,
+                texts,
+                on_screen,
+                scan_facts(texts) if plan.name == "scanned" else [],
+            )
         )
     return records, errors, warnings[0]
 
