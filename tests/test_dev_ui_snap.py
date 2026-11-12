@@ -414,15 +414,21 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
         "after-density",
         "with-route",
         "turned",
-        # The short-page shots of D12 (m5 §17.8): last, and reached with no chain.
+        # The short-page shots of D12 (m5 §17.8): after them, and reached with no chain.
         "stand-620",
         "plate-620",
+        # The Wells and Scan screens by their own buttons (m5 §17.10.4, #445): last.
+        "wells-laid-out",
+        "scanned",
     ]
     assert list(snap.STATE_NAMES) == names
     # `expert` is the fourth, so that both stands reach it (m5 §17.8).
     alone = [True, True, True, True]
     chained = [False, False, False]
     short = [True, True]
+    # The guided states register the plate from the sample themselves and need no chain.
+    guided = [True, True]
+    no_sample = [False, False]
 
     full = snap.plan_states("demo-sample", results=True)
     assert [p.name for p in full] == names
@@ -431,22 +437,29 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
     demo = snap.plan_states("demo", results=True)
     assert [p.name for p in demo] == names
     # `turned` needs the chain's registered plate (m5 §16.4): with the results. The two
-    # short-page states need none: both stands reach them.
-    assert [p.reachable for p in demo] == [*alone, *chained, *short]
+    # short-page states need none: both stands reach them. The guided ones need a sample.
+    assert [p.reachable for p in demo] == [*alone, *chained, *short, *no_sample]
     for plan in demo[4:7]:
         assert plan.reason == (
             "the demo camera images no sample: no cells, no density; "
             "use --stand demo-sample"
         )
+    assert [p.reason for p in demo[9:]] == [
+        "the demo has no sample to register from"
+    ] * 2
+    assert snap.NO_SAMPLE_TO_REGISTER == "the demo has no sample to register from"
 
+    # With no chain, or after a chain that failed, the guided states are still reached:
+    # they do not read the chain's results.
     skipped = snap.plan_states("demo-sample", results=False)
-    assert [p.reachable for p in skipped] == [*alone, *chained, *short]
+    assert [p.reachable for p in skipped] == [*alone, *chained, *short, *guided]
     assert {p.reason for p in skipped[4:7]} == {"skipped by --no-results"}
+    assert [p.reason for p in skipped[9:]] == [None, None]
 
     failed = snap.plan_states(
         "demo-sample", results=True, chain_failure="cells exited 1: no detector"
     )
-    assert [p.reachable for p in failed] == [*alone, *chained, *short]
+    assert [p.reachable for p in failed] == [*alone, *chained, *short, *guided]
     assert [p.name for p in failed[4:7]] == ["after-density", "with-route", "turned"]
     assert failed[4].reason == "cells exited 1: no detector"
     assert failed[5].reason is not None
@@ -977,9 +990,11 @@ def test_a_failed_chain_names_the_states_that_needed_it(snap, tmp_path) -> None:
         ("after-density", False),
         ("with-route", False),
         ("turned", False),
-        # The short-page shots need no chain.
+        # The short-page shots need no chain, and nor do the guided states.
         ("stand-620", True),
         ("plate-620", True),
+        ("wells-laid-out", True),
+        ("scanned", True),
     ]
     assert records[4].reason == "cells exited 1: x"
     assert records[5].reason == "needs the chain: cells exited 1: x"
@@ -1004,6 +1019,8 @@ def test_a_state_whose_control_times_out_is_named_and_the_next_state_runs(
         True,
         True,
         True,
+        True,
+        True,
     ]
     assert records[2].reason == "Locator.click: Timeout 10000ms exceeded."
     assert records[4].reason == records[2].reason
@@ -1018,9 +1035,19 @@ def test_a_step_button_that_times_out_names_the_state_and_the_next_one_runs(
     # not there fails `wells-selected` alone, named.
     page = _fake_page(fails_on_button="3. Wells")
     records, _, _ = _drive(snap, tmp_path, page, lambda steps: None)
-    assert [r.reached for r in records] == [True, False, *([True] * 7)]
+    # `wells-laid-out` clicks the same step, so it fails on the same control, named; the
+    # states around them run.
+    assert [r.reached for r in records] == [
+        True,
+        False,
+        *([True] * 7),
+        False,
+        True,
+    ]
     assert records[1].reason == "Locator.click: Timeout 10000ms exceeded."
+    assert records[9].reason == records[1].reason
     page.screenshot.assert_any_call(path=str(tmp_path / "wells-selected-FAILED.png"))
+    page.screenshot.assert_any_call(path=str(tmp_path / "wells-laid-out-FAILED.png"))
 
 
 def test_a_state_whose_control_times_out_alone_is_the_only_one_named(
@@ -1028,8 +1055,16 @@ def test_a_state_whose_control_times_out_alone_is_the_only_one_named(
 ) -> None:
     page = _fake_page(fails_on_fill=True)
     records, _, _ = _drive(snap, tmp_path, page, lambda steps: None)
-    assert [r.reached for r in records] == [True, False, *([True] * 7)]
+    # `wells-laid-out` types the wells in the same box: the same control, named.
+    assert [r.reached for r in records] == [
+        True,
+        False,
+        *([True] * 7),
+        False,
+        True,
+    ]
     assert records[1].reason == "Locator.fill: Timeout 10000ms exceeded."
+    assert records[9].reason == records[1].reason
     page.screenshot.assert_any_call(path=str(tmp_path / "wells-selected-FAILED.png"))
 
 
@@ -1287,12 +1322,16 @@ def test_on_screen_says_where_each_part_is_and_never_guesses(snap, monkeypatch) 
 
 
 def test_the_short_page_states_name_the_screens_titles_the_guide_draws(snap) -> None:
-    from smc.ui.guide import SCREEN_TITLES
+    from smc.ui.guide import SCREEN_TITLES, scan_title
 
-    # The script imports nothing of smc at import, so its copy of the two titles is pinned.
+    # The script imports nothing of smc at import, so its copy of the titles is pinned: the
+    # two short-page screens' and, for the guided states, the Wells screen's and the Scan
+    # screen's, which names the two wells the state types, in plate order.
     assert {
         "stand-620": SCREEN_TITLES["stand"],
         "plate-620": SCREEN_TITLES["plate"],
+        "wells-laid-out": SCREEN_TITLES["wells"],
+        "scanned": scan_title(["B11", "B2"], []),
     } == snap.SCREEN_TITLE_OF
     assert snap.SHORT_VIEWPORT_HEIGHT_PX == 620
 
@@ -1421,6 +1460,250 @@ def test_the_short_parts_are_the_strip_the_step_bar_the_title_and_the_first_acti
     assert r"^Go to " in names
     assert r"^1\. Stand" in names
     page.locator.return_value.filter.assert_any_call(has_text="Where is the plate?")
+
+
+# --- the guided states of the Wells and Scan screens (m5 §17.10.4, #445) ----------------
+
+
+UPRIGHT = "A1 at the back left"
+TURNED = "Turned 180\N{DEGREE SIGN}: A1 at the front right"
+
+
+def _recording_page(*, plate_lies: str = TURNED) -> tuple[MagicMock, list[str]]:
+    """A page that writes what an action does, in order: a click by its name, a fill, a key, a wait by its text.
+
+    *Connect* is enabled never, so the action does not click it (FM-162); a wait for a pane's
+    text is ``wait:<text or pattern>`` and the wait for the strip to lose ``not connected`` is
+    ``wait-detached:``. The *Plate lies* select offers the two options of a stand that says its
+    sides, shows ``plate_lies`` (the ``turned`` state leaves it turned), and writes the option
+    chosen as ``select:<label>``.
+    """
+    page = MagicMock()
+    page.viewport_size = {"width": 1280, "height": 800}
+    order: list[str] = []
+
+    def role(*args: object, **kwargs: object) -> MagicMock:
+        name = kwargs.get("name")
+        found = MagicMock()
+        found.is_enabled.return_value = False
+        found.click.side_effect = lambda: order.append(
+            f"click:{getattr(name, 'pattern', name)}"
+        )
+        return found
+
+    def filtered(*, has_text: object) -> MagicMock:
+        label = getattr(has_text, "pattern", has_text)
+        found = MagicMock()
+        found.first.wait_for.side_effect = lambda **kw: order.append(f"wait:{label}")
+        found.wait_for.side_effect = lambda **kw: order.append(f"wait-detached:{label}")
+        return found
+
+    page.get_by_role.side_effect = role
+    page.locator.return_value.filter.side_effect = filtered
+    box = page.get_by_label.return_value
+    box.fill.side_effect = lambda text: order.append(f"fill:{text}")
+    box.press.side_effect = lambda key: order.append(f"press:{key}")
+    box.wait_for.side_effect = lambda **kw: order.append("wait-select")
+    box.locator.return_value.all_inner_texts.return_value = [f" {UPRIGHT} ", TURNED]
+    box.evaluate.return_value = f" {plate_lies} "
+    box.select_option.side_effect = lambda label: order.append(f"select:{label}")
+    return page, order
+
+
+def test_the_wells_laid_out_state_clicks_the_pages_own_buttons_and_ends_on_texts(
+    snap,
+) -> None:
+    page, order = _recording_page()
+    assert snap.ACTIONS["wells-laid-out"] is snap._act_wells_laid_out
+    snap._act_wells_laid_out(page, _no_chain())
+    # The guided path, by the screens' own buttons: Plate, the plate declared upright (the
+    # `turned` state left it turned, and the sample's centres are refused for a plate that lies
+    # turned) with the wait for its outcome, *Register the plate* and the wait for its outcome
+    # line, Wells, the two wells, *Lay out the fields* and the waits for its outcome and for
+    # the count of the known block: every wait is for a text the server draws when its run
+    # ends (FM-162), never a delay.
+    assert order == [
+        r"wait-detached:\| not connected\b",
+        r"click:^2\. Plate",
+        "wait-select",
+        f"select:{UPRIGHT}",
+        "wait:plate-orientation done",
+        "click:Register the plate",
+        "wait:plate-registration done",
+        r"click:^3\. Wells",
+        "fill:B2,B11",
+        "press:Enter",
+        "click:Lay out the fields",
+        "wait:scan-plan done",
+        r"wait:Fields: \d+ in 2 wells",
+    ]
+    page.wait_for_timeout.assert_not_called()
+
+
+def test_the_wells_laid_out_state_leaves_a_plate_that_is_already_upright_alone(
+    snap,
+) -> None:
+    # A run with `--no-results` never turns the plate: no switch, and no wait for a run that
+    # was never started.
+    page, order = _recording_page(plate_lies=UPRIGHT)
+    snap._act_wells_laid_out(page, _no_chain())
+    assert order[:4] == [
+        r"wait-detached:\| not connected\b",
+        r"click:^2\. Plate",
+        "wait-select",
+        "click:Register the plate",
+    ]
+    assert not [line for line in order if line.startswith("select:")]
+    assert "wait:plate-orientation done" not in order
+    page.wait_for_timeout.assert_not_called()
+
+
+def test_the_scanned_state_starts_the_scan_and_waits_for_its_own_outcome(snap) -> None:
+    page, order = _recording_page()
+    assert snap.ACTIONS["scanned"] is snap._act_scanned
+    snap._act_scanned(page, _no_chain())
+    # `scan done` is not in `scan-plan done`: the wait is for the scan's own outcome line.
+    assert order == [r"click:^4\. Scan", "click:Start the scan", "wait:scan done"]
+    assert "scan done" not in "scan-plan done in 0.0 s"
+    page.wait_for_timeout.assert_not_called()
+
+
+def test_no_action_clicks_a_tools_own_run_button(snap) -> None:
+    # The skill's rule: the script presses the guided screens' three buttons and no tool's
+    # own *Run <tool>* (the expert view's), nor Drive, STOP or Resume.
+    import inspect
+
+    for name, action in snap.ACTIONS.items():
+        source = inspect.getsource(action)
+        assert 'name="Run ' not in source, name
+        assert "^Run " not in source, name
+        for forbidden in ("Drive", "Resume", 'name="STOP"'):
+            assert forbidden not in source.replace("Drive to", ""), (name, forbidden)
+    buttons = set()
+    for name in snap.GUIDED_STATES:
+        page, order = _recording_page()
+        snap.ACTIONS[name](page, _no_chain())
+        buttons |= {
+            line.removeprefix("click:") for line in order if line.startswith("click:")
+        }
+    assert {"Register the plate", "Lay out the fields", "Start the scan"} <= buttons
+
+
+def test_the_guided_parts_are_the_frames_and_the_screens_title_and_first_action(
+    snap,
+) -> None:
+    page = MagicMock()
+    wells = {n: c for n, c in snap._guided_parts(page, "wells-laid-out")}
+    assert list(wells) == [
+        "STOP",
+        "step bar",
+        "map",
+        "image",
+        "drive bar",
+        "title",
+        "first action",
+    ]
+    page.get_by_role.assert_any_call("button", name="Lay out the fields")
+    page.locator.return_value.filter.assert_any_call(has_text="Which wells?")
+    page = MagicMock()
+    snap._guided_parts(page, "scanned")
+    page.get_by_role.assert_any_call("button", name="Start the scan")
+    page.locator.return_value.filter.assert_any_call(has_text="Scan B2 and B11")
+
+
+def test_on_screen_reads_the_guided_parts_of_a_guided_state_and_only_there(
+    snap, monkeypatch
+) -> None:
+    page = MagicMock()
+    page.viewport_size = {"width": 1280, "height": 800}
+
+    def part(name: str, box: dict[str, float]) -> tuple[str, MagicMock]:
+        found = MagicMock()
+        found.count.return_value = 1
+        found.first.bounding_box.return_value = box
+        return name, found
+
+    guided = [
+        part("STOP", _box(1200, 5, 60, 30)),
+        part("title", _box(10, 142, 370, 17)),
+        # The first action past the page's bottom: what the summary must say as NO.
+        part("first action", _box(10, 790, 120, 31)),
+    ]
+    monkeypatch.setattr(snap, "_guided_parts", lambda page, state: guided)
+    for state in ("wells-laid-out", "scanned"):
+        assert snap._on_screen(page, state) == [
+            "STOP: yes (y 5 to 35 of 800, x 1200 to 1260 of 1280)",
+            "title: yes (y 142 to 159 of 800, x 10 to 380 of 1280)",
+            "first action: NO (y 790 to 821 of 800, x 10 to 130 of 1280)",
+        ]
+    # A state that is not guided reads the frame's parts, as before.
+    frame = _located({"STOP": _box(1200, 5, 60, 30)})
+    monkeypatch.setattr(snap, "_frame_parts", lambda page: frame)
+    assert snap._on_screen(page, "snap")[0] == (
+        "STOP: yes (y 5 to 35 of 800, x 1200 to 1260 of 1280)"
+    )
+    assert len(snap._on_screen(page, "snap")) == 5
+
+
+def test_scan_facts_say_the_progress_and_the_result_or_that_they_are_not_on_the_page(
+    snap,
+) -> None:
+    texts = [
+        "Scan B2 and B11",
+        "72 fields at Nikon 10X S Fluor. STOP, at the top right, stops the scan.",
+        "Field 72 of 72\nElapsed 0 s",
+        "Scanned in a dry run: no frame was taken\nassumed: dry run: 72 fields walked",
+    ]
+    assert snap.scan_facts(texts) == [
+        "progress: Field 72 of 72 | Elapsed 0 s",
+        "result: Scanned in a dry run: no frame was taken | assumed: dry run: 72 "
+        "fields walked",
+    ]
+    # A pane the page did not draw is said, never guessed.
+    assert snap.scan_facts(["Scan B2 and B11"]) == [
+        "progress: not on the page",
+        "result: not on the page",
+    ]
+    assert snap.scan_facts([]) == [
+        "progress: not on the page",
+        "result: not on the page",
+    ]
+
+
+def test_the_summary_says_a_states_facts_after_what_is_on_screen(snap) -> None:
+    record = snap.StateRecord(
+        name="scanned",
+        reached=True,
+        step="4. Scan",
+        texts=["Field 72 of 72"],
+        on_screen=["title: yes (y 142 to 159 of 800, x 10 to 380 of 1280)"],
+        facts=["progress: Field 72 of 72", "result: Scanned: 72 frames, 0 failed"],
+    )
+    text = snap.format_summary(
+        [record], server="stopped by SIGINT", server_errors=[], browser_errors=[]
+    )
+    lines = text.splitlines()
+    start = lines.index("== scanned ==")
+    assert lines[start : start + 6] == [
+        "== scanned ==",
+        "reached",
+        "step: 4. Scan",
+        "on screen: title: yes (y 142 to 159 of 800, x 10 to 380 of 1280)",
+        "progress: Field 72 of 72",
+        "result: Scanned: 72 frames, 0 failed",
+    ]
+
+
+def test_only_the_scanned_state_carries_facts(snap, tmp_path) -> None:
+    page = _fake_page()
+    records, _, _ = _drive(snap, tmp_path, page, lambda steps: None)
+    by_name = {r.name: r for r in records}
+    # The fake page's one pane is `a pane`: neither line is on it, and each says so.
+    assert by_name["scanned"].facts == [
+        "progress: not on the page",
+        "result: not on the page",
+    ]
+    assert [n for n, r in by_name.items() if r.facts] == ["scanned"]
 
 
 # --- the chain against the plugins ------------------------------------------

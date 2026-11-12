@@ -9,6 +9,7 @@ pairs it runs, and ``command_line`` is the same call typed in a terminal (princi
 
 from __future__ import annotations
 
+import re
 import shlex
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -31,6 +32,8 @@ if TYPE_CHECKING:
         MapPose,
         PlanLayer,
         PoseKind,
+        RunClock,
+        ScanSummary,
         WellView,
     )
 
@@ -42,11 +45,13 @@ __all__ = [
     "GOTO_NOT_DURING_LIVE",
     "GOTO_UNPLACED",
     "GOTO_WALL_NEEDS_REGISTRATION",
+    "LAY_OUT_FIRST",
     "MAP_FIELDS_UP_TO",
     "NO_CALIBRATION_FOR_SIDES",
     "ORIENTATION_IN_STAGE_TERMS",
     "OTHER_WAYS_TO_REGISTER",
     "PLATE_NOT_CHOSEN",
+    "REGISTER_FIRST",
     "SCREEN_LEADS",
     "SCREEN_TITLES",
     "SELECTION_KEPT_ITS_NAMES",
@@ -73,14 +78,19 @@ __all__ = [
     "continue_label",
     "drive_image_note",
     "duration_text",
+    "field_source_line",
     "forget_label",
     "image_sides_note",
     "known_text",
+    "lay_out_wait",
     "map_title",
     "needs_calibration",
     "next_slot",
+    "objective_line",
     "opening_step",
     "orientation_label",
+    "plain_default",
+    "plan_selection_note",
     "plan_title",
     "plate_from_line",
     "preset_differences",
@@ -88,7 +98,12 @@ __all__ = [
     "register_replace_note",
     "registered_line",
     "replace_note",
+    "scan_lead",
     "scan_plan_card_lines",
+    "scan_progress_lines",
+    "scan_title",
+    "scan_wait",
+    "scanned_line",
     "side_words",
     "stage_label",
     "step_button_label",
@@ -98,6 +113,9 @@ __all__ = [
     "walls_card_lines",
     "walls_centres_problem",
     "walls_square_wells",
+    "wells_from_line",
+    "wells_known_lines",
+    "wells_text",
 ]
 
 #: What the scan plan waits for. The page cannot choose wells for the operator:
@@ -265,8 +283,8 @@ STEP_OF_SLOT: Mapping[str, StepName] = {
     "nis-export": "results",
 }
 
-#: The question each screen answers (m5 §17.4, D8). The scan's title is static until the
-#: Wells and Scan screens name the wells (B3, #445).
+#: The question each screen answers (m5 §17.4, D8). The scan's title is the fallback of a
+#: page with neither a plan nor a selection: ``scan_title`` names the wells otherwise.
 SCREEN_TITLES: Mapping[StepName, str] = {
     "stand": "Which stand, and which preset?",
     "plate": "Where is the plate?",
@@ -487,6 +505,19 @@ def needs_calibration(
     )
 
 
+def objective_line(objective: str | None) -> str:
+    """The "known" blocks' first line: the objective in place as the strip reads it, or that it is not known (m5 §17.2 D7).
+
+    One line for the Stand screen's block and the Wells screen's, so that the two never
+    say the objective in two ways. The label is the stand's own (FM-139: plain text).
+    """
+    return (
+        "Objective: not known"
+        if objective is None
+        else f"Objective: {objective}, in place"
+    )
+
+
 def known_text(
     *,
     objective: str | None,
@@ -501,11 +532,7 @@ def known_text(
     never shown as a value (CLAUDE.md). ``objective`` is the one in place as the strip
     reads it, ``calibration`` the latest usable one, ``light_on`` the light as read.
     """
-    first = (
-        "Objective: not known"
-        if objective is None
-        else f"Objective: {objective}, in place"
-    )
+    first = objective_line(objective)
     if calibration is None:
         camera = (
             "Camera: not calibrated (the arrows cannot say which way the image moves)"
@@ -1107,6 +1134,281 @@ def scan_plan_card_lines(result: ScanPlanResult) -> tuple[str, ...]:
             "(the moves, refocus and snaps of the timings)"
         )
     return (wells, fields, field, estimate)
+
+
+# -- the Wells and Scan screens (m5 §17.4.3, §17.4.4, §17.10, #445) ---------------------
+
+#: What *Lay out the fields* waits for before a plate is registered (m5 §17.10.3): the
+#: scan plan reads the plate's place, and the stand's holder estimate is not a registration.
+REGISTER_FIRST = "register the plate first: step 2, Plate"
+
+#: What *Start the scan* waits for while there is no usable plan (m5 §17.10.3): a stale,
+#: foreign or missing plan is not what the scan would do.
+LAY_OUT_FIRST = "lay out the fields first: step 3, Wells"
+
+#: One well name as a plate prints it: the row's letters, then the column's number. Bounded:
+#: a plate has rows of one or two letters and columns of one or two digits, and a name taken
+#: from a record as it comes (FM-125) may hold five thousand digits, which ``int()`` refuses
+#: (Python's limit is 4300): the page's texts are drawn before its strip, so one such name
+#: would stop the strip, the problems line and the buttons at every tick.
+_WELL_NAME = re.compile(r"([A-Za-z]{1,6})(\d{1,6})")
+
+
+def _plate_order(name: str) -> tuple[int, int, str, int, str]:
+    """A well's sort key in plate order: ``B2`` before ``B11``, ``Z1`` before ``AA1`` (m5 §17.10.3).
+
+    A name that is not a letter group and a number sorts last, by its text: the page names
+    what a plan holds and does not refuse an odd name.
+    """
+    found = _WELL_NAME.fullmatch(name)
+    if found is None:
+        return (1, 0, "", 0, name)
+    row, column = found.groups()
+    return (0, len(row), row.upper(), int(column), name)
+
+
+def wells_text(wells: Sequence[str]) -> str:
+    """Wells as a title says them: one, two, three by name in plate order, then a count (m5 §17.10.3).
+
+    ``B2``, ``B2 and B11``, ``A1, A2 and A3``, and from four wells ``12 wells``. The order
+    is the plate's, never the order they come in (the demo scans B11 first): the operator
+    reads which wells, not the route. A repeated name counts once.
+    """
+    ordered = sorted(set(wells), key=_plate_order)
+    if not ordered:
+        return "no wells"
+    if len(ordered) == 1:
+        return ordered[0]
+    if len(ordered) <= 3:
+        return f"{', '.join(ordered[:-1])} and {ordered[-1]}"
+    return f"{len(ordered)} wells"
+
+
+def scan_title(plan_wells: Sequence[str], selection: Sequence[str]) -> str:
+    """The Scan screen's title, from the **plan's** wells (m5 §17.4.4, §17.10.3).
+
+    The plan is what ``scan`` does (§14.1), so it names the wells; the selection stands in
+    while there is no plan, and the static title while there is neither.
+    """
+    if plan_wells:
+        return f"Scan {wells_text(plan_wells)}"
+    if selection:
+        return f"Scan {wells_text(selection)}"
+    return SCREEN_TITLES["scan"]
+
+
+def scan_lead(plan: PlanLayer | None, *, stop_refused: bool) -> str:
+    """The Scan screen's lead: the plan's count and objective, where STOP is, and what it does not stop (m5 §17.10.3).
+
+    On a stand whose profile says a role refuses its stop (``stop_refused_by``) a move
+    already sent runs to its target, and the lead says so (FM-117): STOP is offered, never
+    promised more than it does. Without a plan the static lead stands, with the same addition.
+    """
+    stop = SCREEN_LEADS["scan"]
+    if stop_refused:
+        stop += " A move already sent finishes first on this stand."
+    if plan is None:
+        return stop
+    fields = _count(plan.count, "field")
+    at = "" if plan.objective is None else f" at {plan.objective}"
+    return f"{fields}{at}. {stop}"
+
+
+def wells_known_lines(
+    *,
+    objective: str | None,
+    plan: PlanLayer | None,
+    out_of_date: str | None,
+    assumed: Sequence[str],
+) -> tuple[str, ...]:
+    """The Wells screen's "known" block under *Lay out the fields*: objective, fields, time, assumptions (m5 §17.4.3, §17.10.3).
+
+    ``plan`` is the usable scan plan, ``None`` when there is none: then the line says the
+    plan is out of date and why (``out_of_date``: the checklist's reason for the slot) or
+    that none is laid out yet. A plan made with no timing says ``Time: not known`` with
+    what to run, never ``0 s`` (FM-170, CLAUDE.md: unknown beats guessed). ``assumed`` are
+    the plan card's own lines, drawn only beside a plan they are about. Plain text (FM-139).
+    """
+    lines = [objective_line(objective)]
+    if plan is None:
+        lines.append(
+            "Fields: not laid out yet"
+            if out_of_date is None
+            else f"Fields: out of date ({out_of_date})"
+        )
+        return tuple(lines)
+    # The label already says "Fields", so the plural carries the bare number (``72 in 2
+    # wells``) and only one says its noun (``1 field in 1 well``): ``Fields: 1`` alone
+    # would read as a count of nothing (m5 §17.10.3).
+    count = "1 field" if plan.count == 1 else str(plan.count)
+    lines.append(f"Fields: {count} in {_count(plan.wells, 'well')}")
+    if plan.estimate_s is None:
+        lines.append(
+            "Time: not known (no timing measured; the expert view's timing tool "
+            "measures it, then lay out the fields again)"
+        )
+    else:
+        lines.append(f"Time: about {duration_text(plan.estimate_s)}")
+    lines.extend(f"assumed: {line}" for line in assumed)
+    return tuple(lines)
+
+
+def plan_selection_note(plan_wells: Sequence[str], selection: Sequence[str]) -> str:
+    """What the screens say when the wells selected are not the plan's wells, or ``""`` (m5 §17.4.3).
+
+    The plan is what ``scan`` does and a selection changed since has not changed it
+    (§14.1): the note says which wells each is for, and what to do. Compared as sets: the
+    order a selection was made in is not a difference. No plan, nothing to compare.
+    """
+    if not plan_wells or set(plan_wells) == set(selection):
+        return ""
+    laid_out = f"The fields laid out are for {wells_text(plan_wells)}; "
+    if not selection:
+        return laid_out + "no well is selected now."
+    return (
+        laid_out
+        + f"the wells selected now are {wells_text(selection)}. "
+        + "Lay out the fields again to scan these."
+    )
+
+
+def field_source_line(
+    *,
+    value: str,
+    default: str,
+    preset: str | None,
+    preset_value: str | None,
+    suggested: str | None,
+) -> str:
+    """Where a tool's field on the Wells screen gets its value, on one line under it (m5 §17.2 D7, §17.10.3).
+
+    The first that holds: the field is empty, so the tool's own default applies (shown
+    without the quotes of a string default, as the placeholder is); the value is the loaded
+    preset's; it is the profile's suggestion; else the operator typed it here.
+    """
+    if not value.strip():
+        return f"the tool's default: {plain_default(default)}"
+    if preset is not None and value == preset_value:
+        return f"from the preset {preset}"
+    if suggested is not None and value == suggested:
+        return "from the profile's suggestions"
+    return "typed on this page"
+
+
+def wells_from_line(
+    selection: Sequence[str],
+    preset: str | None,
+    preset_selection: Sequence[str] | None,
+) -> str:
+    """Where the Wells box's selection comes from, on one line under it (m5 §17.10.3).
+
+    No well chosen is said as such; the loaded preset's selection, while the box still
+    holds exactly it; else the operator's own choice (a click on the map or a typed range).
+    """
+    if not selection:
+        return "no well chosen yet"
+    if (
+        preset is not None
+        and preset_selection is not None
+        and tuple(preset_selection) == tuple(selection)
+    ):
+        return f"from the preset {preset}"
+    return "chosen on this page"
+
+
+def lay_out_wait(
+    *,
+    connected: bool,
+    plate_chosen: bool,
+    registered: bool,
+    blocked: str | None,
+    selected: int,
+) -> str | None:
+    """Why *Lay out the fields* waits, or ``None``: the first of the stand, the plate, the registration, the tool, the selection (m5 §17.10.3).
+
+    ``blocked`` is the controller's reason for ``scan-plan`` (its order puts a closed stand
+    and a plate nothing named first, and then what the tool reads), so a missing
+    registration says the step to take (``REGISTER_FIRST``) and not the document's words.
+    """
+    if not connected or not plate_chosen:
+        return blocked
+    if not registered:
+        return REGISTER_FIRST
+    if blocked is not None:
+        return blocked
+    if selected == 0:
+        return SELECT_WELLS
+    return None
+
+
+def scan_wait(*, connected: bool, blocked: str | None, plan_usable: bool) -> str | None:
+    """Why *Start the scan* waits, or ``None``: the stand, then the plan, then the tool's own reason (m5 §17.10.3).
+
+    ``blocked`` is the controller's reason for ``scan``, which is ``None`` when nothing
+    waits (a checkpoint it will not start over is one such reason: the page never starts
+    a stage afresh over one, §2).
+    """
+    if not connected:
+        return blocked
+    if not plan_usable:
+        return LAY_OUT_FIRST
+    return blocked
+
+
+def scan_progress_lines(
+    done: int, total: int, clock: RunClock | None, *, running: bool
+) -> tuple[str, ...]:
+    """The Scan screen's lines under the bar: the field, the time so far and the time left (m5 §17.4.4, §17.10.3).
+
+    *Left* is the rate **between the first report and the latest** times the fields that
+    remain, never the rate from the click: the demo's scan takes 4.6 s to its first field
+    and 0.19 s for each of the next, so a rate from the click said 2 min 47 s at the second
+    field, where 13 s were (measured, §17.10.1). It is drawn only while the scan runs and
+    has fields left, and says it is not known until there are two reports a clock tick
+    apart (FM-197: Windows below Python 3.13 ticks every 15.6 ms, so two reports can carry
+    one stamp): never a division by zero, never a negative time.
+    """
+    lines = [f"Field {done} of {total}"]
+    if clock is not None:
+        lines.append(f"Elapsed {duration_text(max(0.0, clock.elapsed_s))}")
+    if running and done < total:
+        first, last = (None, None) if clock is None else (clock.first, clock.last)
+        if (
+            first is not None
+            and last is not None
+            and last[1] > first[1]
+            and last[0] > first[0]
+        ):
+            left = (total - done) * (last[0] - first[0]) / (last[1] - first[1])
+            lines.append(
+                f"Left about {duration_text(left)} (estimated from the fields so far)"
+            )
+        else:
+            lines.append("Left: not known yet (it needs two fields)")
+    return tuple(lines)
+
+
+def scanned_line(summary: ScanSummary) -> str:
+    """The Scan screen's result line, from the usable ``scan`` record (m5 §17.4.4, D8: the verb of the button).
+
+    A dry run walks the fields and takes no frame: it says so, rather than ``0 frames, 0
+    failed``, which would read as a scan that found nothing.
+    """
+    if summary.dry_run:
+        return "Scanned in a dry run: no frame was taken"
+    return f"Scanned: {_count(summary.frames, 'frame')}, {summary.failed} failed"
+
+
+def plain_default(default: str) -> str:
+    """A tool field's default as a placeholder shows it: one pair of matching quotes dropped (m5 §17.10.3).
+
+    ``describe_params`` prints a string default with its quotes (``'if-engaged'``), which
+    the operator would type if the placeholder were a value to copy. Only one pair, and
+    only a ``'`` or a ``"`` at both ends: anything else is as it came.
+    """
+    if len(default) >= 2 and default[0] == default[-1] and default[0] in "'\"":
+        return default[1:-1]
+    return default
 
 
 def replace_note(

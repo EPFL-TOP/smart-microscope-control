@@ -34,7 +34,7 @@ import math
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
@@ -76,10 +76,12 @@ from smc.ui.controller import (
 )
 from smc.ui.frames import Frame, display_image
 from smc.ui.guide import (
+    DRY_RUN_NO_FRAME,
     END_LIVE_LABEL,
     GOTO_NOT_DURING_LIVE,
     ORIENTATION_IN_STAGE_TERMS,
     OTHER_WAYS_TO_REGISTER,
+    PLATE_NOT_CHOSEN,
     SCREEN_LEADS,
     SCREEN_TITLES,
     STEPS,
@@ -93,24 +95,35 @@ from smc.ui.guide import (
     centres_text,
     continue_label,
     drive_image_note,
+    field_source_line,
     forget_label,
     image_sides_note,
     known_text,
+    lay_out_wait,
     map_title,
     needs_calibration,
     opening_step,
     orientation_label,
+    plain_default,
+    plan_selection_note,
     plan_title,
     plate_from_line,
     preset_differences,
     preset_note_text,
     register_replace_note,
     registered_line,
+    scan_lead,
+    scan_progress_lines,
+    scan_title,
+    scan_wait,
+    scanned_line,
     side_words,
     stage_label,
     step_button_label,
     step_states,
     wall_touches_note,
+    wells_from_line,
+    wells_known_lines,
 )
 
 __all__ = ["PlatePageView", "build", "card_text", "next_step_text", "serve"]
@@ -194,16 +207,27 @@ ScreenName = StepName | Literal["expert"]
 
 #: The tools each screen lists, provisionally (m5 §17.7 B1): today's tool sections, in
 #: the order of the workflow. B2 to B4 replace each screen's list with its designed
-#: contents: the Stand and Plate screens (B2, #444) list no tool section, their actions
-#: are their own buttons and the sections stay in the expert view. The names are the
-#: registry's (``timing`` fills the checklist's ``timings``).
+#: contents: the Stand, Plate, Wells and Scan screens (B2, #444; B3, #445) list no tool
+#: section, their actions are their own buttons and the sections stay in the expert view.
+#: The names are the registry's (``timing`` fills the checklist's ``timings``).
 _SCREEN_TOOLS: Mapping[StepName, tuple[str, ...]] = {
     "stand": (),
     "plate": (),
-    "wells": ("scan-plan",),
-    "scan": ("scan",),
+    "wells": (),
+    "scan": (),
     "results": ("cells", "density", "route", "report", "nis-export"),
 }
+
+#: The colour of the fields a scan has a frame for, over the plan's orange (m5 §17.10.2): a
+#: green that differs from Viridis (the wells' fill), the route's red and the plan's orange.
+#: A first choice: ``/ui-check``'s PNG decides whether it reads.
+_IMAGED_GREEN = "#2ca02c"
+
+#: The two fields of the tools that the Wells screen lists (m5 §17.4.3, D5): ``scan-plan``'s
+#: coverage and ``scan``'s autofocus, as ``(tool, key)``. Each is the one instance the expert
+#: view's section holds too.
+_COVERAGE_FIELD = ("scan-plan", "coverage")
+_AUTOFOCUS_FIELD = ("scan", "autofocus")
 
 #: The width of a step's button and of the line under it in the step bar, in pixels.
 _STEP_WIDTH_PX = 170
@@ -525,6 +549,12 @@ class PlatePageView:
         self._register_drawn: tuple[tuple[str, ...], str | None] = ((), None)
         self._goto_row: int | None = None
         self._goto_basis: tuple[Any, ...] | None = None
+        # The Wells and Scan screens (m5 §17.10): the last status the tick read, for the
+        # texts ``refresh()`` redraws (it never reads the stand, #333), and how many of the
+        # plan's fields the map shows as imaged *from the progress*: ``None`` while it shows
+        # the run document's record. Per view (D6, FM-151): another tab draws its own.
+        self._status: PageStatus | None = None
+        self._imaged_drawn: int | None = None
         # Whether the commands say they are quoted for a POSIX shell: ``None`` is the PC this
         # runs on (FM-175); a test sets it, as ``next_step_text`` takes ``windows=``.
         self._windows: bool | None = None
@@ -555,6 +585,8 @@ class PlatePageView:
         self.stage_source = ColumnDataSource({"x": [], "y": [], "text": []})
         # The usable scan plan's fields, one rectangle each (m5 §14.2).
         self.fields_source = ColumnDataSource({"x": [], "y": [], "w": [], "h": []})
+        # The plan's fields a scan has a frame for, drawn over them in green (m5 §17.10.2).
+        self.imaged_source = ColumnDataSource({"x": [], "y": [], "w": [], "h": []})
         self.mapper = LinearColorMapper(
             palette=Viridis256, low=0.0, high=1.0, nan_color=_UNKNOWN_FILL
         )
@@ -635,6 +667,19 @@ class PlatePageView:
             fill_color="#ff7f0e",
             fill_alpha=0.2,
             line_color="#ff7f0e",
+            line_width=1,
+        )
+        # After the plan's fields and before the route: the green is over the orange and the
+        # route over both.
+        self.figure.rect(
+            "x",
+            "y",
+            "w",
+            "h",
+            source=self.imaged_source,
+            fill_color=_IMAGED_GREEN,
+            fill_alpha=0.45,
+            line_color=_IMAGED_GREEN,
             line_width=1,
         )
         self.figure.line(
@@ -884,10 +929,13 @@ class PlatePageView:
         self._build_drive()
         self._build_presets()
         self._build_stand_plate()
+        self._build_wells_scan()
         self._build_steps()
 
         self.tool_runs: dict[str, Any] = {}
         self.tool_fields: dict[str, dict[str, Any]] = {}
+        # Each field's default as ``describe_params`` prints it, by ``(tool, key)``.
+        self._field_defaults: dict[tuple[str, str], str] = {}
         self.tool_notes: dict[str, Any] = {}
         self.tool_cards: dict[str, Any] = {}
         self.layout = self._layout()
@@ -1147,6 +1195,77 @@ class PlatePageView:
         )
         self.register_button.on_click(self._handler(lambda event: self.on_register()))
 
+    def _build_wells_scan(self) -> None:
+        """The widgets of the Wells and Scan screens, each action a button of its own (m5 §17.4.3, §17.4.4, §17.10, #445).
+
+        As the Stand and Plate screens': a button holds no value, so each is a second
+        instance of what the tool's section offers, going through the same handler and the
+        same controller call (D5), registered through ``_handler`` (FM-171) and carrying its
+        text as ``label=`` (FM-147). A disabled button is a courtesy: the controller refuses
+        each of these calls on its own (FM-169). The two tool fields the Wells screen lists
+        are the tools' own instances, built later with their sections (D5); the lines under
+        them say where each value comes from (D7). Text is plain, never markup (FM-139): a
+        well's name, a preset's name and a path come from outside. Every text pane that
+        draws nothing is hidden and takes no height (``_say``, D12).
+        """
+        # The Wells screen.
+        self.wells_from_text = _wrapped_text()
+        self.coverage_from_text = _wrapped_text()
+        self.autofocus_from_text = _wrapped_text()
+        self.layout_button = pn.widgets.Button(
+            label="Lay out the fields", color="primary"
+        )
+        self.layout_wait = _wrapped_text()
+        self.layout_wait.visible = False
+        self.wells_known_block = _wrapped_text()
+        self.wells_note = _wrapped_text()
+        self.wells_note.visible = False
+        self.layout_command = _wrapped_text()
+        self.layout_command_note = _wrapped_text()
+        self.layout_command_note.visible = False
+        self.layout_card = pn.Card(
+            self.layout_command,
+            self.layout_command_note,
+            title="Command",
+            collapsed=True,
+            sizing_mode="stretch_width",
+            visible=False,
+        )
+        # The Scan screen: its title and lead name the plan's wells and fields, so they are
+        # attributes now (``_draw_scan_screen``); the bar and the lines under it follow the
+        # scan's progress and stay after it, and the result line follows the run document.
+        self.scan_title_text = _wrapped_text(
+            SCREEN_TITLES["scan"], {"font-weight": "bold"}
+        )
+        self.scan_lead_text = _wrapped_text(SCREEN_LEADS["scan"])
+        self.scan_button = pn.widgets.Button(label="Start the scan", color="primary")
+        self.scan_wait_text = _wrapped_text()
+        self.scan_wait_text.visible = False
+        self.scan_dry_note = _wrapped_text()
+        self.scan_dry_note.visible = False
+        self.scan_progress = pn.indicators.Progress(
+            value=0, max=1, width=_TEXT_WIDTH, bar_color="primary", visible=False
+        )
+        self.scan_progress_text = _wrapped_text()
+        self.scan_progress_text.visible = False
+        self.scanned_block = _wrapped_text()
+        self.scanned_block.visible = False
+        self.scan_command = _wrapped_text()
+        self.scan_command_note = _wrapped_text()
+        self.scan_command_note.visible = False
+        self.scan_card = pn.Card(
+            self.scan_command,
+            self.scan_command_note,
+            title="Command",
+            collapsed=True,
+            sizing_mode="stretch_width",
+            visible=False,
+        )
+        # The same handlers as the *Run scan-plan* and *Run scan* of the expert view's
+        # sections: the pairs are the page's and the typed fields', read at the click.
+        self.layout_button.on_click(self._handler(self._runner("scan-plan")))
+        self.scan_button.on_click(self._handler(self._runner("scan")))
+
     def _centre_slot(self, index: int) -> _CentreSlot:
         """One centre row's widgets: its sentence, *Go to*, *Capture the centre of* (or *Redo*) and its note (m5 §17.4.2)."""
         text = _wrapped_text()
@@ -1343,14 +1462,15 @@ class PlatePageView:
 
         Each screen is its title, its lead, its own regions and *Continue*. A value widget
         is one instance listed on every screen that shows it: only one list is rendered,
-        and a swap keeps what was typed (measured, §17.2 D5). The Stand and Plate screens
-        are designed (B2, #444, §17.4.1 and §17.4.2): each holds its own buttons, none of
-        the next step (the walk found *Run scan-plan* on the Plate screen) and none of the
-        tool sections, which stay in the expert view. The other three are today's regions,
-        provisionally (B1), with the next step (one instance, listed on each of them and in
-        the expert view, so it is drawn once and keeps its place whatever the state): B3
-        and B4 replace them with each screen's design. The tool sections of a screen are
-        listed in it and in the accordion's stage columns.
+        and a swap keeps what was typed (measured, §17.2 D5). The Stand, Plate, Wells and
+        Scan screens are designed (B2, #444, §17.4.1 and §17.4.2; B3, #445, §17.4.3 and
+        §17.4.4): each holds its own buttons, none of the next step (the walk found *Run
+        scan-plan* on the Plate screen) and none of the tool sections, which stay in the
+        expert view; the Wells screen lists two of the tools' own fields, the same
+        instances the accordion holds. Results is today's regions, provisionally (B1), with
+        the next step (one instance, listed on it and in the expert view, so it is drawn
+        once and keeps its place whatever the state): B4 replaces it with its design. The
+        tool sections of a screen are listed in it and in the accordion's stage columns.
         """
         preset_region = self._preset_region()
         next_region = self._next_region()
@@ -1386,15 +1506,31 @@ class PlatePageView:
                 self.registered_block,
                 self.other_ways_text,
             ],
-            "wells": [next_region, self.select_input],
-            "scan": [next_region],
+            "wells": self._wells_region(),
+            "scan": [
+                self.scan_button,
+                self.scan_wait_text,
+                self.scan_dry_note,
+                self.scan_progress,
+                self.scan_progress_text,
+                self.scanned_block,
+                self.scan_card,
+            ],
             "results": [next_region],
         }
+        # The Scan screen's title and lead name the plan's wells and fields: panes the page
+        # rewrites (``_draw_scan_screen``), not the static text of the others.
+        titles = {
+            step: _wrapped_text(SCREEN_TITLES[step], {"font-weight": "bold"})
+            for step in STEPS
+        }
+        leads = {step: _wrapped_text(SCREEN_LEADS[step]) for step in STEPS}
+        titles["scan"], leads["scan"] = self.scan_title_text, self.scan_lead_text
         self.screens: dict[ScreenName, list[Any]] = {}
         for step in STEPS:
             self.screens[step] = [
-                _wrapped_text(SCREEN_TITLES[step], {"font-weight": "bold"}),
-                _wrapped_text(SCREEN_LEADS[step]),
+                titles[step],
+                leads[step],
                 *own[step],
                 *(sections[name] for name in _SCREEN_TOOLS[step] if name in sections),
                 self.continue_button,
@@ -1410,6 +1546,32 @@ class PlatePageView:
             self.accordion,
             self.run_document_text,
             self.checklist_text,
+        ]
+
+    def _wells_region(self) -> list[Any]:
+        """The Wells screen's own widgets, in the order of m5 §17.4.3 (the action is above what is known).
+
+        The *Wells* box, then the two tool fields with the line that says where each value
+        comes from, the action, its wait, what is known about the plan, the note that the
+        selection is not the plan's, and the *Command* disclosure. The two fields are the
+        tools' own instances (D5, ``tool_fields``), the ones the accordion holds too: a tool
+        that did not load has no field, and its line is left out with it.
+        """
+        listed: list[Any] = [self.select_input, self.wells_from_text]
+        for (tool, key), line in (
+            (_COVERAGE_FIELD, self.coverage_from_text),
+            (_AUTOFOCUS_FIELD, self.autofocus_from_text),
+        ):
+            field = self.tool_fields.get(tool, {}).get(key)
+            if field is not None:
+                listed += [field, line]
+        return [
+            *listed,
+            self.layout_button,
+            self.layout_wait,
+            self.wells_known_block,
+            self.wells_note,
+            self.layout_card,
         ]
 
     def show_step(self, step: StepName) -> None:
@@ -1517,9 +1679,13 @@ class PlatePageView:
                 # The field starts with what the stand suggests, so that this tool's own
                 # *Run* sends what the next step shows (m5 §8.3).
                 description += f"\nsuggested by the profile: {tool.suggested_why}"
+            # The placeholder is what an empty field means, not a value to type: a string
+            # default comes without the quotes ``describe_params`` prints (finding 13 of the
+            # walk), and the raw default is kept for the "from" lines (m5 §17.10.3).
+            self._field_defaults[(tool.name, name)] = default
             fields[name] = pn.widgets.TextInput(
                 label=name,
-                placeholder=default,
+                placeholder=plain_default(default),
                 description=description,
                 value=suggested.get(name, ""),
             )
@@ -2114,8 +2280,13 @@ class PlatePageView:
         if self._filling:
             return
         self._draw_preset_note()
-        # *Calibrate the camera* runs the same fields: its command follows them.
+        # *Calibrate the camera*, *Lay out the fields* and *Start the scan* run the same
+        # fields: their commands follow them, and so do the lines that say where the Wells
+        # screen's two values come from (m5 §17.10.3). A load draws them once, at its end.
         self._draw_calibrate_command()
+        self._draw_field_lines()
+        self._draw_layout_command()
+        self._draw_scan_command()
 
     def _actual(self) -> dict[str, dict[str, str]]:
         """What every tool's fields hold now, by tool and key."""
@@ -2200,6 +2371,13 @@ class PlatePageView:
             self._read_objectives_again()
         self._draw_connection(status)
         self._draw_stand(status)
+        # The Wells and Scan screens, from this status and the last view: text only, the
+        # tick reads nothing new (FM-145). The status is kept for ``refresh()``, which
+        # redraws the same texts from the view it has just read and never reads the stand.
+        self._status = status
+        self._draw_wells_screen(status)
+        self._draw_scan_screen(status)
+        self._draw_imaged(status)
         self.status_text.object = status_line(status)
         self.run_text.object = run_text(status)
         self.goto_text.object = status.goto
@@ -2408,6 +2586,13 @@ class PlatePageView:
             "w": [width_um] * len(fields),
             "h": [height_um] * len(fields),
         }
+        if self._running != "scan":
+            # A scan that goes draws its imaged fields from its progress (``_draw_imaged``),
+            # and this redraw, another tab's end of a run or a click, must not draw an older
+            # scan's record over them (m5 §17.10.2). The end of the run calls this again,
+            # with no scan running: the layer is then the record's.
+            self._imaged_drawn = None
+            self._set_imaged(() if plan is None else plan.imaged, (width_um, height_um))
         self.checklist_text.object = "\n".join(
             {
                 "ok": f"✓ {item.slot}",
@@ -2438,6 +2623,10 @@ class PlatePageView:
         self._draw_plate_screen()
         self._draw_commands()
         self._draw_buttons()
+        if self._status is not None:
+            # Before the first tick there is no status; that tick draws both screens.
+            self._draw_wells_screen(self._status)
+            self._draw_scan_screen(self._status)
         self._draw_drive()
         # The options are read here and after a save, never by the tick (§10.6).
         self._offer_presets()
@@ -2625,6 +2814,7 @@ class PlatePageView:
         self.next_note.object = blocked or busy or ""
         self._draw_captures()
         self._draw_stand_plate_buttons()
+        self._draw_wells_scan_buttons()
         lacks = self.page.lacks(Camera)
         self.snap_button.disabled = running is not None or lacks is not None
         # While live goes its own button is the one that ends it; any other activity
@@ -2772,7 +2962,11 @@ class PlatePageView:
         note = posix_quoting_note(self._windows)
         self._say(self.register_command_note, note)
         self._say(self.calibrate_command_note, note)
+        self._say(self.layout_command_note, note)
+        self._say(self.scan_command_note, note)
         self._draw_calibrate_command()
+        self._draw_layout_command()
+        self._draw_scan_command()
 
     def _draw_calibrate_command(self) -> None:
         """The command of ``camera-calibration`` with the page's pairs and the form's typed fields."""
@@ -2835,6 +3029,250 @@ class PlatePageView:
             reason = "plate-registration did not load: the problems line says why"
         self.register_button.disabled = running is not None or reason is not None
         self._say(self.register_wait, reason or busy or "")
+
+    def _field_line(self, field: tuple[str, str]) -> str:
+        """The line under one of the Wells screen's two tool fields: where its value comes from (m5 §17.2 D7, §17.10.3).
+
+        From the field as it is now and from what a load or the profile would put there: the
+        preset's own value, else the profile's suggestion (``_expected_from``'s rule), else
+        the operator typed it, and an empty field is the tool's default, in the words of the
+        placeholder. ``""`` for a tool that did not load: its field is not on the screen.
+        """
+        tool, key = field
+        widget = self.tool_fields.get(tool, {}).get(key)
+        view = next((t for t in self._tools if t.name == tool), None)
+        if widget is None or view is None:
+            return ""
+        loaded = self.page.preset
+        given = None if loaded is None else loaded.fields.get(tool, {}).get(key)
+        return field_source_line(
+            value=str(widget.value).strip(),
+            default=self._field_defaults.get(field, ""),
+            preset=None if loaded is None else loaded.file.name,
+            preset_value=None if given is None else given.strip(),
+            suggested=dict(view.suggested).get(key),
+        )
+
+    def _draw_field_lines(self) -> None:
+        """The three "from" lines of the Wells screen: the selection, the coverage and the autofocus (m5 §17.10.3).
+
+        Called by the screen's redraw and by a field's own change (``_on_field_changed``),
+        never while a load assigns the fields: a load ends with ``refresh()``.
+        """
+        loaded = self.page.preset
+        self.wells_from_text.object = wells_from_line(
+            self.page.selection,
+            None if loaded is None else loaded.file.name,
+            None if loaded is None else loaded.selection,
+        )
+        self.coverage_from_text.object = self._field_line(_COVERAGE_FIELD)
+        self.autofocus_from_text.object = self._field_line(_AUTOFOCUS_FIELD)
+
+    def _draw_wells_screen(self, status: PageStatus | None) -> None:
+        """The Wells screen's lines from the last view and this status: the "from" lines, what is known and the selection's note (m5 §17.4.3, §17.10).
+
+        The objective is the one in place as the status read it, the plan is the view's
+        usable plan, and a plan that is not usable says why in the checklist's words (the
+        card of the tool carried them before this screen replaced its section: FM-226). The
+        plan card's ``assumed`` lines go under it, plain text (FM-139). The button and its
+        wait are ``_draw_wells_scan_buttons``'s. A text pane that says nothing takes no height.
+        """
+        view = self._view
+        plan = None if view is None else view.plan
+        self._draw_field_lines()
+        item = (
+            None
+            if view is None
+            else next((i for i in view.checklist if i.slot == "scan-plan"), None)
+        )
+        card = None if view is None else view.cards.get("scan-plan")
+        self.wells_known_block.object = "\n".join(
+            wells_known_lines(
+                objective=None if status is None else (status.objective or None),
+                plan=plan,
+                out_of_date=(
+                    item.reason
+                    if item is not None and item.state == "unusable"
+                    else None
+                ),
+                assumed=() if card is None else card.assumed,
+            )
+        )
+        self._say(
+            self.wells_note,
+            plan_selection_note(
+                () if plan is None else plan.well_names, self.page.selection
+            ),
+        )
+
+    def _draw_scan_screen(self, status: PageStatus | None) -> None:
+        """The Scan screen from the last view and this status: its title and lead, the dry-run note, the progress and the result line (m5 §17.4.4, §17.10).
+
+        The title and the lead name the **plan's** wells and fields, the selection while there
+        is no plan. The bar and its lines are drawn only for a report of ``scan``: Live's
+        report is ``live``, and another activity's start clears the report, so the block goes
+        with the next activity and stays after the scan until then. ``max`` is at least 1 and
+        ``value`` never above it (Panel refuses a ``value`` above the ``max`` it holds at that
+        moment, so ``max`` is set first), and the stripes move only while the scan goes. The
+        result line follows the run document, not
+        the progress, so it survives a restart (``view.scanned``); the card's ``assumed``
+        lines and its ``folder:`` line go under it. The dry-run note is plain and said once.
+        """
+        view = self._view
+        plan = None if view is None else view.plan
+        self.scan_title_text.object = scan_title(
+            () if plan is None else plan.well_names, self.page.selection
+        )
+        self.scan_lead_text.object = scan_lead(
+            plan, stop_refused=bool(status is not None and status.stop_refused)
+        )
+        self._say(
+            self.scan_dry_note,
+            DRY_RUN_NO_FRAME if status is not None and status.dry_run else "",
+        )
+        progress = None if status is None else status.progress
+        shown = False
+        if status is not None and progress is not None and progress.plugin == "scan":
+            shown = True
+            total = progress.done if progress.total is None else progress.total
+            going = status.running == "scan"
+            maximum = max(total, 1)
+            # ``max`` first: Panel refuses a ``value`` above the ``max`` it holds at that
+            # moment (``param.update`` sets ``value`` first and raised, measured), and does
+            # not refuse a ``max`` below the ``value`` it holds, which is what a shorter
+            # scan after a longer one asks for.
+            self.scan_progress.max = maximum
+            self.scan_progress.value = min(max(progress.done, 0), maximum)
+            self.scan_progress.active = going
+            self._say(
+                self.scan_progress_text,
+                "\n".join(
+                    scan_progress_lines(
+                        progress.done, total, status.clock, running=going
+                    )
+                ),
+            )
+        else:
+            self._say(self.scan_progress_text, "")
+        self.scan_progress.visible = shown
+        summary = None if view is None else view.scanned
+        lines: list[str] = []
+        if view is not None and summary is not None:
+            lines.append(scanned_line(summary))
+            card = view.cards.get("scan")
+            if card is not None:
+                lines += [f"assumed: {text}" for text in card.assumed]
+                lines += list(card.files)
+        self._say(self.scanned_block, "\n".join(lines))
+
+    def _draw_imaged(self, status: PageStatus) -> None:
+        """While a scan runs, the plan's first ``done`` fields are drawn as imaged: from the progress, only when it changed (m5 §17.10.2).
+
+        The scan visits the plan's fields in the plan's order (measured: the reports' names
+        are the plan's), so the first ``done`` are the ones with a frame, a failed field
+        counted as visited (the end of the run redraws from the record, which holds the frames
+        that were taken). A **dry run** takes none, whatever the progress says, and the page
+        says so (the note, the result line): nothing is drawn while one runs, as the record
+        draws none after it. Nothing is drawn before the first report either: the record of an
+        earlier scan, drawn by the last redraw, is cleared here. A ``done`` below what was drawn
+        is a new run and is drawn from its start. It reads the status and the last view only
+        (FM-145); with no scan running ``refresh()`` draws the record, and the end of the run
+        calls it.
+        """
+        if status.running != "scan":
+            return
+        view = self._view
+        plan = None if view is None else view.plan
+        fields = () if plan is None else plan.fields
+        progress = status.progress
+        done = (
+            min(max(progress.done, 0), len(fields))
+            if progress is not None and progress.plugin == "scan" and not status.dry_run
+            else 0
+        )
+        if done == self._imaged_drawn or plan is None:
+            return
+        self._imaged_drawn = done
+        self._set_imaged(fields[:done], plan.fov_um)
+
+    def _set_imaged(
+        self, centres: Sequence[tuple[float, float]], fov_um: tuple[float, float]
+    ) -> None:
+        """The imaged fields' source set whole, ``fov_um`` wide and high at each centre (m5 §17.10.2)."""
+        width_um, height_um = fov_um
+        self.imaged_source.data = {
+            "x": [x_um for x_um, _y_um in centres],
+            "y": [y_um for _x_um, y_um in centres],
+            "w": [width_um] * len(centres),
+            "h": [height_um] * len(centres),
+        }
+
+    def _draw_wells_scan_buttons(self) -> None:
+        """Which of *Lay out the fields* and *Start the scan* is disabled, and the reason beside each (m5 §11.2, §17.4.3, §17.4.4).
+
+        Each button is disabled while a wait is drawn or an activity goes, and says its wait
+        (the first that holds, ``lay_out_wait`` and ``scan_wait``) or, with none, what runs
+        and how to end it (``busy_note``). The tool's own reason is the controller's
+        (``_blocked``): the stand closed, what the tool reads, a checkpoint the page never
+        starts over (FM-172). The controller refuses each of these calls itself (FM-169).
+        """
+        page = self.page
+        view = self._view
+        running = self._running
+        busy = None if running is None else busy_note(running, live=page.is_live)
+        connected = page.connected
+        plate_chosen = page.plate_chosen
+        blocked = self._blocked.get("scan-plan")
+        if connected and not plate_chosen:
+            # ``scan-plan`` takes no plate parameter, so the controller's reasons for it never
+            # name the placeholder: what it says for a plate nobody registered is the run
+            # document's, written for a terminal. The screen's own words (m5 §17.4.3).
+            blocked = PLATE_NOT_CHOSEN
+        lay_out = lay_out_wait(
+            connected=connected,
+            plate_chosen=plate_chosen,
+            registered=view is not None and view.registered is not None,
+            blocked=blocked,
+            selected=len(page.selection),
+        )
+        if "scan-plan" not in self.tool_runs:
+            lay_out = "scan-plan did not load: the problems line says why"
+        self.layout_button.disabled = running is not None or lay_out is not None
+        self._say(self.layout_wait, lay_out or busy or "")
+        start = scan_wait(
+            connected=connected,
+            blocked=self._blocked.get("scan"),
+            plan_usable=view is not None and view.plan is not None,
+        )
+        if "scan" not in self.tool_runs:
+            start = "scan did not load: the problems line says why"
+        self.scan_button.disabled = running is not None or start is not None
+        self._say(self.scan_wait_text, start or busy or "")
+
+    def _draw_layout_command(self) -> None:
+        """The command of *Lay out the fields*: ``scan-plan`` with the page's wells and the form's typed fields (m5 §17.2 D8).
+
+        Read at a redraw and at a field's change, never by the tick (it reads the run
+        document). A selection the controller refuses for (none, or on another plate) draws
+        no command, as ``_draw_calibrate_command`` does, and the card is hidden with it.
+        """
+        try:
+            pairs = [*self.page.page_params("scan-plan"), *self._typed("scan-plan")]
+        except ValueError:
+            self.layout_command.object = ""
+        else:
+            self.layout_command.object = self.page.command_for("scan-plan", pairs)
+        self.layout_card.visible = bool(self.layout_command.object)
+
+    def _draw_scan_command(self) -> None:
+        """The command of *Start the scan*: ``scan`` with the form's typed fields (m5 §17.2 D8)."""
+        try:
+            pairs = [*self.page.page_params("scan"), *self._typed("scan")]
+        except ValueError:
+            self.scan_command.object = ""
+        else:
+            self.scan_command.object = self.page.command_for("scan", pairs)
+        self.scan_card.visible = bool(self.scan_command.object)
 
     @staticmethod
     def _say(pane: Any, text: str) -> None:

@@ -1,6 +1,6 @@
 ---
 name: ui-check
-description: Look at the plate page like a user does — serve it on a demo stand in dry run, drive it with headless Chromium at 1280 x 800 through seven states (empty, a typed well range, a snap, the expert view, after density, with the route, the plate turned) and at 1280 x 620 through two more (the Stand screen and the Plate screen), and read the PNGs and summary.txt it writes. Use it on every area:ui issue, in /develop before the adversarial review and in /review of an area:ui PR; it also says how a session drives the served page through a Chrome MCP (tried once: screenshots and clicks, no page reading). Never an assertion or a baseline.
+description: Look at the plate page like a user does — serve it on a demo stand in dry run, drive it with headless Chromium at 1280 x 800 through seven states (empty, a typed well range, a snap, the expert view, after density, with the route, the plate turned), at 1280 x 620 through two more (the Stand screen and the Plate screen) and at 1280 x 800 through two guided ones (the fields laid out, the scan done), and read the PNGs and summary.txt it writes. Use it on every area:ui issue, in /develop before the adversarial review and in /review of an area:ui PR; it also says how a session drives the served page through a Chrome MCP (tried once: screenshots and clicks, no page reading). Never an assertion or a baseline.
 ---
 
 # /ui-check
@@ -57,11 +57,26 @@ the demo whose camera images no sample. Nothing else is a parameter: there is no
 | `turned` | the *2. Plate* step, then the *Plate lies* select set to its `Turned 180°` option (after a wait for the select: the server draws the screen), then a wait for the strip's `plate-orientation done` line (m5 §16.4). Compare it with `with-route` by eye: the **same cross, other names** (the density and the route are stale after the turn, so they are gone) | `demo-sample` |
 | `stand-620` | Connect (when enabled), then *Refresh* (it forgets the outcome the earlier states left under the strip: D12 measures the header with its outcome lines empty), the viewport **resized to 1280 x 620**, then the *1. Stand* step and a wait for the screen's title; the viewport goes back to the run's after the photograph. `summary.txt` says for the strip's STOP, the step bar, the screen's **title** and its **first action** (the preset's *Load*) whether each is wholly inside the 620 px page (m5 §17.2 D12) | both stands, last (no chain) |
 | `plate-620` | The same, with the *2. Plate* step. Its first action is the first row's *Go to*. On `--stand demo` the screen is in its worst case (the placeholder plate, the confirmation, the orientation note of a stand that does not say its sides): read it there too, since `demo-sample` is registered by the chain's end | both stands, last (no chain) |
+| `wells-laid-out` | the guided path to a plan, by the screens' own buttons: Connect (when enabled), the *2. Plate* step, *Register the plate* (a wait for the strip's `plate-registration done`), the *3. Wells* step, `B2,B11` in the Wells box, *Lay out the fields* (a wait for `scan-plan done` and for the known block's `Fields: <n> in 2 wells`). At 1280 x 800. Read the **orange fields** on the map (a field is 512 µm on a plate of 127 mm: a pixel or two) and the Wells screen's known block: `Time: not known …` on a page with no timing. `summary.txt` says for the STOP, the step bar, the map, the image, the drive bar and the screen's **title** (`Which wells?`) and **first action** (*Lay out the fields*) whether each is wholly inside the 800 px page | `demo-sample`, last |
+| `scanned` | then the *4. Scan* step and *Start the scan* (a wait for `scan done`). The page is a dry run, which walks the fields and takes **no frame**: the bar is full, the lines say `Field <n> of <n>` and `Elapsed`, the result line says `Scanned in a dry run: no frame was taken`, and the map has **no green field**. `summary.txt` says the progress lines and the result line (`progress:`, `result:`), and whether the title (`Scan B2 and B11`) and the first action (*Start the scan*) are inside the page. A scan in motion is the one-off session below | `demo-sample`, last |
+
+The two guided states register the plate from the sample themselves and run no chain, so
+they are reached with `--no-results` and after a chain that failed. On `--stand demo` they
+are named: `not reached: the demo has no sample to register from`.
 
 A state it cannot reach is **named, never skipped**: `<state>: not reached: <why>`,
-on stdout and in `summary.txt`. It never clicks a tool's Run button, Drive, STOP or
-Resume; the one run it starts from the page is `turned`'s `plate-orientation`, which
-moves nothing.
+on stdout and in `summary.txt`. It never clicks a tool's own Run button, Drive, STOP or
+Resume. The buttons of the **guided screens** (*Register the plate*, *Lay out the fields*,
+*Start the scan*) are clicked, on the dry-run page only, by the two guided states: each is
+a run that moves nothing in a dry run. `turned` starts a run from the page too, its
+`plate-orientation`, which moves nothing either.
+
+**A scan in motion** (the progress bar, `Field n of 72`, *Elapsed* and *Left*, the green
+fields growing) cannot be photographed on the dry-run page: its scan ends at once. It is a
+**one-off browser session**, in the develop session's scratch directory, cited in its Report
+and never committed: `demo-sample` served **without** `--dry-run` (a simulated stand, see
+*Live mode* below for the check of the profile) on a scratch run folder, driven by Playwright
+through the Plate, Wells and Scan screens, with PNGs taken while the scan runs (#445).
 
 ## Read
 
@@ -74,7 +89,7 @@ moves nothing.
    state the change touches. Start here. `<state>-full.png` is the whole page and is
    shown too small to read: use it for the part below the fold only.
 3. **`summary.txt`** for what a PNG cannot give: the strip, the outcome, the
-   checklist and the result cards as text, the step shown (`step:`, the button of the class `smc-step-shown`; with the expert view on, none is), what is on screen (`on screen:` says for the strip's STOP, the step bar, the map, the image and the last control of the drive bar whether each is wholly in the viewport and where; for `stand-620` and `plate-620` it says it for STOP, the step bar, the screen's title and its first action), the Wells box, how the
+   checklist and the result cards as text, the step shown (`step:`, the button of the class `smc-step-shown`; with the expert view on, none is), what is on screen (`on screen:` says for the strip's STOP, the step bar, the map, the image and the last control of the drive bar whether each is wholly in the viewport and where; for `stand-620` and `plate-620` it says it for STOP, the step bar, the screen's title and its first action, and for `wells-laid-out` and `scanned` for the frame's parts and the screen's title and its first action; `scanned` also says `progress:` and `result:`, the progress lines and the result line), the Wells box, how the
    server stopped, the server's error lines and the browser's. The map and the image
    are **canvas**: they are in the PNGs only.
 4. **`server.log`** (the server's stdout and stderr as it wrote them) when the
@@ -107,7 +122,9 @@ would not choose) is reported as what it shows, not as a defect.
 
 ## Never
 
-- Run a tool, drive the stage or press STOP through the page; start the page on any
+- Run a tool from its own section, drive the stage or press STOP through the page (the
+  guided screens' three buttons, in the two guided states, are the one thing it presses,
+  on the dry-run page); start the page on any
   other stand, or without `--dry-run` (the one exception is below: a simulated stand
   in a live walk where the owner wants the Run buttons pressed); run two sessions on
   the same page.
@@ -189,7 +206,8 @@ window, Live, Drive).
 
    (Windows: `.venv\Scripts\python`.) It must print `''`. **Every other profile keeps
    `--dry-run`**, and so does every walk that only reads: `scripts/dev/ui_snap.py`
-   never presses Run and always serves in dry run.
+   never presses a tool's own Run (only the guided screens' three buttons, in dry run)
+   and always serves in dry run.
 3. **It opens `http://localhost:<port>/`**, exactly as the command prints it: the
    websocket accepts `localhost` only, not `127.0.0.1`.
 4. **It drives the page with the MCP's own tools.** What can be inspected: buttons,
