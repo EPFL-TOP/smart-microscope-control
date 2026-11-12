@@ -41,6 +41,7 @@ from smc.ui.guide import (
     CAPTURE_WELLS,
     DRY_RUN_NO_FRAME,
     END_LIVE_LABEL,
+    GOTO_NOT_DURING_LIVE,
     MAP_FIELDS_UP_TO,
     NO_CALIBRATION_FOR_SIDES,
     ORIENTATION_IN_STAGE_TERMS,
@@ -54,6 +55,7 @@ from smc.ui.guide import (
     WALLS_MAX_CENTRES,
     WALLS_MIN_CENTRES,
     WALLS_NEED_CALIBRATION,
+    CalibrationNote,
     NextStep,
     StepName,
     StepState,
@@ -61,6 +63,7 @@ from smc.ui.guide import (
     busy_note,
     capture_centre_label,
     capture_wall_label,
+    centre_rows,
     centres_text,
     command_line,
     continue_label,
@@ -68,19 +71,24 @@ from smc.ui.guide import (
     duration_text,
     forget_label,
     image_sides_note,
+    known_text,
     map_title,
+    needs_calibration,
     next_slot,
     opening_step,
     orientation_label,
     plan_title,
+    plate_from_line,
     preset_differences,
     preset_note_text,
+    registered_line,
     replace_note,
     scan_plan_card_lines,
     side_words,
     stage_label,
     step_button_label,
     step_states,
+    suggested_centres,
     wall_touches_note,
     walls_card_lines,
     walls_centres_problem,
@@ -1499,3 +1507,218 @@ def test_continue_label_names_the_next_step_and_none_after_results() -> None:
     assert continue_label("wells") == "Continue to Scan"
     assert continue_label("scan") == "Continue to Results"
     assert continue_label("results") is None
+
+
+# -- the Stand and Plate screens (m5 §17.4.1, §17.4.2, #444) ------------------------------
+
+
+def test_suggested_centres_are_three_far_corners_as_printed() -> None:
+    # Measured on useq-schema 0.9.2 when #444 was planned: A1, the last column of row A and
+    # the last row of column 1, as the plate prints them. Typed out, not read from the
+    # function (FM-43): a plate whose rows run past Z (1536-well) is named `AF`.
+    assert suggested_centres("96-well") == ("A1", "A12", "H1")
+    assert suggested_centres("384-well") == ("A1", "A24", "P1")
+    assert suggested_centres("1536-well") == ("A1", "A48", "AF1")
+    assert suggested_centres("6-well") == ("A1", "A3", "B1")
+    assert suggested_centres("24-well") == ("A1", "A6", "D1")
+
+
+def test_a_one_well_plate_suggests_one_centre() -> None:
+    # A coverslip has one well: the list has one row, never A1 three times.
+    assert suggested_centres("coverslip-18mm-square") == ("A1",)
+    assert suggested_centres("coverslip-22mm-square") == ("A1",)
+
+
+def test_known_text_says_where_each_value_comes_from_or_that_it_is_not_known() -> None:
+    here = CalibrationNote(objective="Nikon 10X", when_utc="2026-11-12 09:30:00")
+    lines = known_text(objective="Nikon 10X", calibration=here, light_on=True)
+    assert lines.split("\n") == [
+        "Objective: Nikon 10X, in place",
+        "Camera: calibrated at Nikon 10X on 2026-11-12 09:30:00 UTC",
+        "Light: on",
+    ]
+    # Nothing is read: each line says it is not known, never a guess (CLAUDE.md).
+    nothing = known_text(objective=None, calibration=None, light_on=None)
+    assert nothing.split("\n") == [
+        "Objective: not known",
+        "Camera: not calibrated (the arrows cannot say which way the image moves)",
+        "Light: not known",
+    ]
+    off = known_text(objective="Nikon 10X", calibration=here, light_on=False)
+    assert off.split("\n")[2] == "Light: off"
+    # A calibration at another objective says both, and which one is in place.
+    other = CalibrationNote(objective="Nikon 40X", when_utc="2026-11-12 09:30:00")
+    another = known_text(objective="Nikon 10X", calibration=other, light_on=True)
+    assert another.split("\n")[1] == (
+        "Camera: calibrated at Nikon 40X on 2026-11-12 09:30:00 UTC, not at Nikon 10X"
+    )
+    # A calibration whose objective was not recorded does not claim one.
+    unrecorded = CalibrationNote(objective=None, when_utc="2026-11-12 09:30:00")
+    said = known_text(objective="Nikon 10X", calibration=unrecorded, light_on=True)
+    assert said.split("\n")[1] == (
+        "Camera: calibrated on 2026-11-12 09:30:00 UTC, objective not recorded"
+    )
+    # An objective that is not read says what the calibration was made at, and no more.
+    blind = known_text(objective=None, calibration=here, light_on=True)
+    assert blind.split("\n")[1] == (
+        "Camera: calibrated at Nikon 10X on 2026-11-12 09:30:00 UTC"
+    )
+    # The turret's label is a stand's text: printed as it is, never as markup (FM-139).
+    markup = known_text(objective="<b>10x</b>", calibration=None, light_on=None)
+    assert markup.split("\n")[0] == "Objective: <b>10x</b>, in place"
+
+
+def test_calibration_is_offered_when_none_or_another_objectives() -> None:
+    here = CalibrationNote(objective="Nikon 10X", when_utc="2026-11-12 09:30:00")
+    unrecorded = CalibrationNote(objective=None, when_utc="2026-11-12 09:30:00")
+    # None at all: offered, whatever is in place.
+    assert needs_calibration("Nikon 10X", None) is True
+    assert needs_calibration(None, None) is True
+    # Made at the objective in place: not offered.
+    assert needs_calibration("Nikon 10X", here) is False
+    # Both known and different: the matrix of another objective is not this one's.
+    assert needs_calibration("Nikon 40X", here) is True
+    # One of them unknown: the page does not claim a difference it cannot see.
+    assert needs_calibration(None, here) is False
+    assert needs_calibration("Nikon 10X", unrecorded) is False
+
+
+def _ref(well: str, x_um: float = 0.0, y_um: float = 0.0) -> WellRef:
+    return WellRef(well=well, x_um=x_um, y_um=y_um)
+
+
+def test_centre_rows_list_the_suggested_wells_then_other_captures() -> None:
+    rows = centre_rows(
+        "96-well",
+        [_ref("C5", 10.0, 20.0), _ref("A12", 30.0, 40.0)],
+        {"C5": "Nikon 10X", "A12": "Nikon 10X"},
+        pose="estimated",
+        from_sample=False,
+    )
+    # The three suggested wells first, in the suggestion's order, then a capture of
+    # another well in capture order: the suggestion is not a rule.
+    assert [row.well for row in rows] == ["A1", "A12", "H1", "C5"]
+    assert [row.captured for row in rows] == [False, True, False, True]
+    assert [row.text for row in rows] == [
+        "A1: go there (estimated position), centre it by eye, capture",
+        "A12: captured at (30.0, 40.0) µm with Nikon 10X",
+        "H1: go there (estimated position), centre it by eye, capture",
+        "C5: captured at (10.0, 20.0) µm with Nikon 10X",
+    ]
+    # Nothing captured: the three, none of them captured.
+    bare = centre_rows("96-well", [], {}, pose="registered", from_sample=False)
+    assert [(row.well, row.captured) for row in bare] == [
+        ("A1", False),
+        ("A12", False),
+        ("H1", False),
+    ]
+    # Each pose says how to get there (m5 §17.4.2, D10): registered, estimated, unplaced.
+    assert bare[0].text == "A1: go there, centre it, capture"
+    unplaced = centre_rows("96-well", [], {}, pose="unplaced", from_sample=False)
+    assert unplaced[0].text == "A1: jog there with the arrows, centre it, capture"
+    # `seed` is a plate placed from one well: the wells are drawn where they were given.
+    seed = centre_rows("96-well", [], {}, pose="seed", from_sample=False)
+    assert seed[0].text == "A1: go there, centre it, capture"
+    # On a stand whose profile has a sample of this plate and nothing captured, the page
+    # registers from the sample's centres: known, not measured (m5 §8.2).
+    sample = centre_rows("96-well", [], {}, pose="estimated", from_sample=True)
+    assert [row.text for row in sample] == [
+        "A1: known from the profile's sample, not measured",
+        "A12: known from the profile's sample, not measured",
+        "H1: known from the profile's sample, not measured",
+    ]
+    assert [row.captured for row in sample] == [False, False, False]
+
+
+def test_a_capture_row_names_its_objective_or_says_it_is_not_known() -> None:
+    # The list shows the objective of each capture, so that a turn between two captures
+    # is visible (m5 §17.4.2, #373 is not decided here).
+    rows = centre_rows(
+        "96-well",
+        [_ref("A1", 1.0, 2.0), _ref("A12", -0.04, 5.0), _ref("H1", 3.0, 4.0)],
+        {"A1": "Nikon 10X", "A12": None},
+        pose="registered",
+        from_sample=False,
+    )
+    assert [row.text for row in rows] == [
+        "A1: captured at (1.0, 2.0) µm with Nikon 10X",
+        # -0.04 rounds to a tenth as -0.0, which the page does not print (as `_um`).
+        "A12: captured at (0.0, 5.0) µm with the objective not known",
+        # No entry at all (a capture restored from a run document): the same words.
+        "H1: captured at (3.0, 4.0) µm with the objective not known",
+    ]
+
+
+def test_registered_line_says_when_the_residual_was_not_measured() -> None:
+    def result(residual_um: float | None, rotation_deg: float) -> PlateResult:
+        return PlateResult(
+            plate="96-well",
+            a1_center_xy_um=(0.0, 0.0),
+            rotation_deg=rotation_deg,
+            method="references",
+            residual_um=residual_um,
+            scale_error=None,
+            n_refs=3,
+        )
+
+    assert (
+        registered_line(result(121.64, 0.1))
+        == "Registered: residual 121.6 µm, turned 0.10°"
+    )
+    # A seed measures no residual: an unknown is not a zero (CLAUDE.md).
+    assert (
+        registered_line(result(None, -0.456))
+        == "Registered: residual not measured, turned -0.46°"
+    )
+    assert (
+        registered_line(result(0.0, 0.0)) == "Registered: residual 0.0 µm, turned 0.00°"
+    )
+
+
+def _loaded_for_plate(plate: str | None) -> LoadedPreset:
+    file = PresetFile("weekly", PRESET_PATH, Preset(plate=plate))
+    return LoadedPreset(
+        file=file,
+        check=PresetCheck("weekly", None, None, {}, ()),
+        fields={},
+        selection=None,
+        mismatches=(),
+    )
+
+
+def test_plate_from_line_names_the_placeholder_the_preset_the_sample_or_the_page() -> (
+    None
+):
+    def say(
+        *,
+        chosen: bool = True,
+        loaded: LoadedPreset | None = None,
+        sample_plate: str | None = None,
+    ) -> str:
+        return plate_from_line(
+            plate="96-well", chosen=chosen, loaded=loaded, sample_plate=sample_plate
+        )
+
+    weekly = _loaded_for_plate("96-well")
+    # The first that holds. Nothing named the plate: it is the page's placeholder, whatever
+    # a preset or a sample says of another plate.
+    assert (
+        say(chosen=False, loaded=weekly, sample_plate="96-well")
+        == "the page's placeholder: choose the plate on the stage"
+    )
+    assert say(loaded=weekly, sample_plate="96-well") == "from the preset weekly"
+    assert say(sample_plate="96-well") == "from the profile's sample"
+    assert say() == "chosen on this page"
+    # A preset of another plate, or with no plate, names nothing of this one.
+    assert say(loaded=_loaded_for_plate("24-well")) == "chosen on this page"
+    assert say(loaded=_loaded_for_plate(None)) == "chosen on this page"
+    # A sample of another plate neither.
+    assert say(sample_plate="384-well") == "chosen on this page"
+
+
+def test_go_to_is_not_offered_during_live_says_why_and_that_capture_works() -> None:
+    # The sentence of D11 (m5 §17.2), pinned as written: it is what the operator reads
+    # beside a disabled *Go to*.
+    assert GOTO_NOT_DURING_LIVE == (
+        "End live to go to another well; Capture works during Live"
+    )

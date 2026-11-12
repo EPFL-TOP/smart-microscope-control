@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from smc.plugins.frames import image_direction_of_stage_step, stage_side_of_image_side
+from smc.plugins.plate_registration.algorithm import suggested_refs
 from smc.plugins.slots import WellGeometry
 
 if TYPE_CHECKING:
@@ -29,6 +30,7 @@ if TYPE_CHECKING:
         LoadedPreset,
         MapPose,
         PlanLayer,
+        PoseKind,
         WellView,
     )
 
@@ -37,6 +39,7 @@ __all__ = [
     "DRY_RUN_NO_FRAME",
     "END_LIVE_LABEL",
     "GOTO_ESTIMATED",
+    "GOTO_NOT_DURING_LIVE",
     "GOTO_UNPLACED",
     "GOTO_WALL_NEEDS_REGISTRATION",
     "MAP_FIELDS_UP_TO",
@@ -54,6 +57,8 @@ __all__ = [
     "WALLS_MAX_CENTRES",
     "WALLS_MIN_CENTRES",
     "WALLS_NEED_CALIBRATION",
+    "CalibrationNote",
+    "CentreRow",
     "NextStep",
     "StepName",
     "StepState",
@@ -61,6 +66,7 @@ __all__ = [
     "busy_note",
     "capture_centre_label",
     "capture_wall_label",
+    "centre_rows",
     "centres_text",
     "command_line",
     "continue_label",
@@ -68,19 +74,24 @@ __all__ = [
     "duration_text",
     "forget_label",
     "image_sides_note",
+    "known_text",
     "map_title",
+    "needs_calibration",
     "next_slot",
     "opening_step",
     "orientation_label",
     "plan_title",
+    "plate_from_line",
     "preset_differences",
     "preset_note_text",
+    "registered_line",
     "replace_note",
     "scan_plan_card_lines",
     "side_words",
     "stage_label",
     "step_button_label",
     "step_states",
+    "suggested_centres",
     "wall_touches_note",
     "walls_card_lines",
     "walls_centres_problem",
@@ -421,6 +432,208 @@ def continue_label(step: StepName) -> str | None:
     if position + 1 >= len(STEPS):
         return None
     return f"Continue to {STEP_TITLES[STEPS[position + 1]]}"
+
+
+# -- the Stand and Plate screens (m5 §17.4.1, §17.4.2, #444) ---------------------------
+
+#: Why *Go to* is disabled while Live runs, and what is still possible (m5 §17.2 D11): a
+#: ``goto-well`` run is refused during Live (§5.2), whereas a capture reads the stage and
+#: is accepted (measured on the owner's walk, #431). Per well the path is Go to, Live,
+#: the arrows, Capture, End live, and nothing ends Live on its own.
+GOTO_NOT_DURING_LIVE = "End live to go to another well; Capture works during Live"
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationNote:
+    """What the Stand screen says of the camera's calibration: the objective it was made at, and when.
+
+    ``objective`` is the turret label the latest usable ``camera-calibration`` recorded,
+    ``None`` when it recorded none (*unknown*, not "the one in place"). ``when_utc`` is
+    the record's time in UTC as a result card prints it (``YYYY-MM-DD HH:MM:SS``, or its
+    unknown-time placeholder): the page says the zone beside it.
+    """
+
+    objective: str | None
+    when_utc: str
+
+
+def needs_calibration(
+    objective: str | None, calibration: CalibrationNote | None
+) -> bool:
+    """Whether the Stand screen offers *Calibrate the camera* (m5 §17.4.1).
+
+    When there is no calibration at all, or when both objectives are known and differ:
+    rotation and mirror belong to the optical path, but the matrix's scale is an
+    objective's, and the arrows' note must not say which way the image moves from the
+    matrix of another one. An objective that is not known, on either side, is no
+    difference the page can see, so it offers nothing it cannot justify.
+    """
+    if calibration is None:
+        return True
+    return (
+        objective is not None
+        and calibration.objective is not None
+        and objective != calibration.objective
+    )
+
+
+def known_text(
+    *,
+    objective: str | None,
+    calibration: CalibrationNote | None,
+    light_on: bool | None,
+) -> str:
+    """The "known" block of the Stand screen: three lines, each saying what it rests on (m5 §17.2 D7, §17.4.1).
+
+    Plain text, never markup (FM-139): the turret's label is the stand's. A value the
+    page has not read says ``not known`` and a camera with no calibration says what the
+    operator loses (the arrows cannot say which way the image moves): an unknown is
+    never shown as a value (CLAUDE.md). ``objective`` is the one in place as the strip
+    reads it, ``calibration`` the latest usable one, ``light_on`` the light as read.
+    """
+    first = (
+        "Objective: not known"
+        if objective is None
+        else f"Objective: {objective}, in place"
+    )
+    if calibration is None:
+        camera = (
+            "Camera: not calibrated (the arrows cannot say which way the image moves)"
+        )
+    elif calibration.objective is None:
+        camera = (
+            f"Camera: calibrated on {calibration.when_utc} UTC, objective not recorded"
+        )
+    else:
+        camera = f"Camera: calibrated at {calibration.objective} on {calibration.when_utc} UTC"
+        if objective is not None and objective != calibration.objective:
+            camera += f", not at {objective}"
+    light = (
+        "Light: not known"
+        if light_on is None
+        else f"Light: {'on' if light_on else 'off'}"
+    )
+    return "\n".join((first, camera, light))
+
+
+def suggested_centres(plate: str) -> tuple[str, ...]:
+    """The wells the Plate screen suggests centring: A1, the last column of row A and the last row of column 1 (m5 §17.4.2).
+
+    The names are the ones the plate prints, whatever way it lies in its holder (a turn
+    renames the operator's captures, §16 D6, never this list). They are far apart, so
+    they pin the rotation down: adjacent wells barely constrain it. It is the layer's
+    own list for the same purpose (``plate-registration``'s ``suggested_refs``, which
+    the sample's references use), so that the screen and the tool never disagree about
+    which three wells make a good calibration; a one-well plate (a coverslip) has one.
+
+    Raises:
+        ValueError: ``plate`` is not a plate of ``useq``'s registry.
+    """
+    return suggested_refs(plate)
+
+
+@dataclass(frozen=True, slots=True)
+class CentreRow:
+    """One row of the Plate screen's centres: the well, the sentence about it, and whether it is captured.
+
+    ``captured`` picks the row's second button: *Capture the centre of <well>*, or *Redo*.
+    """
+
+    well: str
+    text: str
+    captured: bool
+
+
+def _um_one(value: float) -> str:
+    """``value`` to a tenth of a micrometre; ``-0.0`` is printed ``0.0``, as the strip's ``_um`` does."""
+    text = f"{value:.1f}"
+    return text[1:] if text.startswith("-") and float(text) == 0.0 else text
+
+
+def centre_rows(
+    plate: str,
+    refs: Sequence[WellRef],
+    objectives: Mapping[str, str | None],
+    *,
+    pose: PoseKind,
+    from_sample: bool,
+) -> tuple[CentreRow, ...]:
+    """The Plate screen's centres: the suggested wells in their order, then the other captures in capture order (m5 §17.4.2).
+
+    The suggestion is not a rule: a well clicked on the map and captured is listed
+    too, after the three. A captured row says where and with which objective, so that a
+    turn of the turret between two captures is visible (#373 is not decided here); an
+    objective the page did not read, or a capture restored from a run document, says
+    ``the objective not known`` and never the one in place. A well not captured says
+    what to do, in the words the map's pose allows (D10): on an *estimated* map the
+    stage goes to the holder's estimate and the operator centres it by eye, on an
+    *unplaced* one nothing can go there (``goto`` refuses) and the arrows do. With
+    ``from_sample`` (a profile ``[sample]`` of this plate and nothing captured) the
+    registration runs from the sample's own centres: *known, not measured* (m5 §8.2).
+    """
+    captured = {ref.well: ref for ref in refs}
+    suggested = suggested_centres(plate)
+    wells = [*suggested, *(ref.well for ref in refs if ref.well not in suggested)]
+    rows: list[CentreRow] = []
+    for well in wells:
+        ref = captured.get(well)
+        if ref is not None:
+            label = objectives.get(well)
+            used = "the objective not known" if label is None else label
+            text = (
+                f"{well}: captured at ({_um_one(ref.x_um)}, {_um_one(ref.y_um)}) "
+                f"µm with {used}"
+            )
+        elif from_sample:
+            text = f"{well}: known from the profile's sample, not measured"
+        elif pose == "estimated":
+            text = f"{well}: go there (estimated position), centre it by eye, capture"
+        elif pose == "unplaced":
+            text = f"{well}: jog there with the arrows, centre it, capture"
+        else:
+            text = f"{well}: go there, centre it, capture"
+        rows.append(CentreRow(well=well, text=text, captured=ref is not None))
+    return tuple(rows)
+
+
+def registered_line(result: PlateResult) -> str:
+    """The Plate screen's result line: the residual and the turn of the plate just registered (m5 §17.4.2).
+
+    A seed or a lattice fit measures no residual, and says so: an unknown is not a
+    zero (CLAUDE.md). The rotation is the plate's own, to a hundredth of a degree.
+    """
+    residual = (
+        "residual not measured"
+        if result.residual_um is None
+        else f"residual {result.residual_um:.1f} µm"
+    )
+    return f"Registered: {residual}, turned {result.rotation_deg:.2f}\N{DEGREE SIGN}"
+
+
+def plate_from_line(
+    *,
+    plate: str,
+    chosen: bool,
+    loaded: LoadedPreset | None,
+    sample_plate: str | None,
+) -> str:
+    """Where the Plate screen's plate comes from, on one line under the menu (m5 §17.2 D7).
+
+    The first that holds: nothing named it (the page's placeholder, which no tool runs
+    on, §11.3); the loaded preset's plate; the profile's ``[sample]``'s; else the
+    operator's own choice on this page.
+    """
+    if not chosen:
+        return "the page's placeholder: choose the plate on the stage"
+    if (
+        loaded is not None
+        and loaded.file.preset is not None
+        and loaded.file.preset.plate == plate
+    ):
+        return f"from the preset {loaded.file.name}"
+    if sample_plate == plate:
+        return "from the profile's sample"
+    return "chosen on this page"
 
 
 def capture_centre_label(well: str | None) -> str:
