@@ -826,6 +826,14 @@ class ScanPlugin:
                             ),
                         )
                     )
+                    # The frame just written, at its readback: the snap's own
+                    # array, never written again, so it is handed uncopied, and
+                    # only to a runner that listens (m3 §25.4).
+                    ctx.show_frame(
+                        pixels,
+                        xy_um=(readback.x_um, readback.y_um),
+                        label=planned.name,
+                    )
                 walked_ok += 1
                 ctx.progress(done, total, planned.name)
 
