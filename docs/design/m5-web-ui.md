@@ -20,7 +20,8 @@
   to the plate menu, the stand's sides and A1 on the map, the switch that renames a
   registered plate); the page as one guided scan fixed by #431's plan with the owner
   (§17, 2026-11-11: five screens, one decision each, the map and the image side by
-  side, the expert view behind a switch; built by #443 to #446).
+  side, the expert view behind a switch; built by #443 to #446; B4's interface, §17.11,
+  by #446's plan, 2026-11-12).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 to M3, this document is the contract between issues.
   Names, module paths and signatures below are fixed; an executor who needs to
@@ -4474,18 +4475,32 @@ Run.
 **17.4.5 Results** (`"results"`)
 - Title: *Results*. Lead: *Each step reads the one before. Run the next one, or all
   that are left.*
-- Rows, new, one per tool in checklist order (`cells`, `density`, `route`, `report`,
-  `nis-export`): a plain name (*Count the cells*, *Density per well*, *Route through
-  the densest fields*, *Report*, *Export for NIS-Elements*), a state line (the card's
-  first line when done, `after <previous>` when its input is missing, the reason when
-  blocked), and *Run* / *Again*. The key fields the profile or the preset fill
-  (`detector`, `labels`, `fields_per_well`) are under each row's *Choices*.
-- Action: *Run all that are left*: `PlatePage.run_chain(plugins)` (new), which starts
-  each tool when the previous one ends `done`, and stops at the first that does not
-  (failed, stopped, refused), saying which; STOP ends the chain. The chain is the
-  controller's (FM-169, FM-151), not a view's loop.
-- The map's colour bar has a title, `<class> cells per mm²` (#293, item 6).
-- *Where the files are*: each card's `files` lines and the run document's path.
+- **First the action**, so that it is on the page without a scroll: *Run all that are
+  left* (`PlatePage.run_chain`, §17.11.2), its wait under it, and, once a chain has run,
+  one line that says what it did (§17.11.3).
+- Then the rows, new, one per tool in checklist order (`cells`, `density`, `route`,
+  `report`, `nis-export`). A row is: the plain name (*Count the cells*, *Density per
+  well*, *Route through the densest fields*, *Report*, *Export for NIS-Elements*) in
+  bold; a state line (`Done <time> UTC` when the tool is done, the run document's
+  reason when its result is not usable, `after <name>` when an input it reads is
+  missing, `Ready`, `Running now`); *Run* or *Again* with its wait beside it, and under
+  *Again* what it replaces; and one closed disclosure, *Choices and command*: the key
+  fields the profile or the preset fill (`detector` of `cells`; `labels` and
+  `fields_per_well` of `route`), each with its *from …* line (D7), then the tool's
+  command (D8) with the Windows note under it (FM-175). A row with no choice holds the
+  command only. A choice is the tool's own `TextInput`, one instance (D5).
+- *Run all that are left*: `PlatePage.run_chain` (new, §17.11.2) starts each tool that
+  is not done, in order, when the one before ended `done`, and stops at the first that
+  does not (failed, stopped, refused), saying which; STOP ends the chain. The chain is
+  the controller's (FM-169, FM-151), not a view's loop.
+- The map's colour bar has a title, `<class> cells per mm²` (#293, item 6): the class
+  the *Density of* select names.
+- *Where the files are*: one line for each file a step wrote, by the step's plain name,
+  then the run document's path (§17.11.3).
+- **Not on this screen**: the next step and the tools' own sections (the rows replace
+  them), and the run document's checklist: all three stay in the expert view. A step
+  that waits says why in its row (§17.11.3), and `cells` on a dry-run page over a dry-run
+  scan says `DRY_RUN_NO_FRAME`, as the next step did.
 
 **The expert view** (`"expert"`): the preset region, the next-step region, the
 page's controls (*Plate*, *Plate lies*, *Wells*, the plate confirmation) and the
@@ -4608,7 +4623,7 @@ Every build issue edits `plate_page.py` and, from B2 on, `controller.py` and
 - **B3, the Wells and Scan screens** (#445): §17.4.3 and §17.4.4, the progress and
   the imaged fields; their interface is §17.10.
 - **B4, the Results screen** (#446): §17.4.5, `PlatePage.run_chain`, the colour bar's
-  title.
+  title; their interface is §17.11.
 - **The scan's frames on the image** (#447): a channel from a plugin to the page for
   its frames, m3 §25. It edits `controller.py` and not `plate_page.py`, and runs
   apart from B2 to B4 all the same.
@@ -4630,7 +4645,8 @@ photograph, the switch off; fourth, so that both stands reach it: `STATE_NAMES[:
 the states of their screens; each walks its screens at 1280 x 800 and says in its
 Report what is below the fold. From B2 on (D12), two more shots run at **1280 x
 620**: `stand-620` (*1. Stand*, connected) and `plate-620` (*2. Plate*). In both,
-the title and the first action are inside the page.
+the title and the first action are inside the page. B4 adds
+`results-all` (§17.11.4).
 
 ### 17.9 Tests and failure modes
 
@@ -4863,6 +4879,310 @@ develop session's scratch directory, cited in its Report and not committed.
   screen offers *Measure the timing* as the Stand screen offers *Calibrate the camera* is
   the owner's (it moves the stage; a follow-up).
 - It does not change `scan`, `scan-plan`, `Progress`, the run document or a command.
+
+### 17.11 The Results screen's interface (#446, B4)
+
+Fixed by #446's plan (2026-11-12). §17.4.5 says `run_chain(plugins)` "starts each tool when
+the previous one ends `done`". It does not say what the chain is to the controller (one
+activity or five), where the tools' typed fields come from, what a refusal inside a chain
+is, what STOP does between two tools, or how a row knows what it waits for. This section
+fixes them, the texts and the screen's `/ui-check` state; the build is #446.
+
+#### 17.11.1 What was measured (2026-11-12, planning #446)
+
+On `demo-sample` (macOS, Python 3.13.0, Panel 1.10.0), by throwaway scripts that drive
+`PlatePage` as the screens do (Connect, `plate-registration` from the sample's refs,
+`B2,B11`, `scan-plan` with `coverage=0.4`, `scan`, then the five tools with the profile's
+`detector=blobs`) and by a throwaway test with a stub for each tool:
+
+- **The chain is quick on the demo and may be long on a real sample.** After the scan (7 to
+  18 s): `cells` 2.0 s cold and 0.2 to 0.35 s warm; `density`, `route`, `report` and
+  `nis-export` 0.00 to 0.01 s each. A real `cells` over a trained model and real frames
+  was not timed here and will take longer than the demo's blobs: a row says `Running now:
+  <done> of <total>` from the tool's own progress, and nothing in the chain is timed.
+- **After the scan, `cells` is runnable and the others are blocked** with the document's
+  words (`the run document has no cells; smc run --list shows which plugin provides it`),
+  which are for a terminal: the row says `after Count the cells` instead.
+- **A refused `run()` starts nothing.** A parameter the plugin refuses (`route
+  labels=nonsense`) or a blocked tool sets the outcome (`route: ParamsError: …`),
+  `status().running` stays `None`, `join()` returns at once and the run document is as it
+  was. The checks of `run()` are about thirty lines in front of `_start_activity`.
+- **Again.** `cells` again over a done chain leaves `density`, `route`, `report` and
+  `nis-export` `unusable` (`route read its inputs from an earlier run; run it again`).
+  `report` and `nis-export` again over fresh inputs end `done` with a new file, `nis-export`
+  with no `overwrite` (its default file is named by a token of the run).
+- **STOP.** `cells` stopped at once ends `cells stopped`, with the stop note `cells told to
+  stop; stopped: the stand is halted (Resume clears the halt)`; its record is `stopped` and
+  every tool after it is `unusable`. The stand is `halted`, and a later `cells` is not
+  refused for that: these tools move nothing.
+- **A dry-run page over a real chain's records** (what `/ui-check` serves): `route`, `report`
+  and `nis-export` run and end `done`, their records `dry_run` true, and `blocked` names
+  none of the tools whose inputs were there. The next step's `DRY_RUN_NO_FRAME` is not in `blocked`: `_next_step`
+  computes it for a tool that reads a `scan` that was a dry run (§8.8.1).
+- **The mechanism of §17.11.2**, prototyped in a test with a stub for each of the five tools
+  (named as the real ones, each with its `reads`) over a seeded plate, plan and scan: one
+  `_start_activity` named after the first tool; `_current_run` replaced by `(tool, event)`
+  before each tool; each tool through `check_ready` and `_run_plugin`; the chain ended at
+  the first outcome that is not `<tool> done`. A stub that raises `PluginRunError` ended
+  it (`stopped at route: …; done: cells, density`, and the later tools never ran). A stub
+  that waits on an `Event` and a `page.stop()` ended it `density stopped`, with the stop
+  note `density told to stop; …`, and `status().running` was `density` meanwhile; the stub
+  does not look at the stop by itself, so the test releases its `Event` after the stop
+  (FM-44).
+- **Not measured, and nothing here relies on it**: Panel 1.9.x (the py3.10 job resolves
+  it), a real `cells` over real frames, and a STOP on a stand that refuses it while a
+  chain runs.
+
+#### 17.11.2 The interface
+
+```python
+#: smc/ui/controller.py
+@dataclass(frozen=True, slots=True)
+class ChainEnd:
+    plugin: str
+    how: Literal["done", "failed", "stopped", "refused"]
+    outcome: str
+
+
+@dataclass(frozen=True, slots=True)
+class ChainStatus:
+    plugins: tuple[str, ...]
+    ended: tuple[ChainEnd, ...]
+    current: str | None
+
+
+class PlatePage:
+    def run_chain(
+        self, plugins: Sequence[str], params: Mapping[str, Sequence[str]]
+    ) -> None: ...
+```
+
+- **`ChainEnd.how`**: `done` (the record ended `done`), `failed` (the run raised: its
+  record is `failed`), `stopped` (the record is `stopped`), `refused` (the checks of
+  `run` said no and nothing was written). `outcome` is the text a single run of that tool
+  would have left. **`ChainStatus.plugins`** are the tools the chain runs, in order, and
+  **`current`** the tool going, `None` once it ended.
+- **`PageStatus.chain: ChainStatus | None = None`**, after `clock`. `_start_activity`
+  clears it; the chain's worker sets it as its first act and replaces it at each tool's
+  start and end, under `_lock`. It is kept after the end until another activity starts, as
+  `progress` and `clock` are.
+- **`run_chain(plugins, params)`** raises `RuntimeError` as `run` does (`<name> is running`,
+  or the page is closed: FM-169, the caller's `_try` says it). With the stand closed it
+  sets the outcome `run all: the stand is not connected` and starts nothing. `params` are
+  the pairs of each tool, **read by the view at the click** from the page's own values and
+  the fields the operator typed, as `on_run` reads them: the controller knows no widget.
+- **What is left.** The tools of `plugins` whose slot (the plugin's `provides`) is not `ok`
+  in the run document **read now**; a name no plugin has is kept and refused at its turn.
+  A tool that is `ok` is never run by a chain: running it again would make every tool after
+  it out of date (§17.11.1). None left: the outcome `run all: nothing is left: every step
+  is done` and nothing starts.
+- **One activity.** `_start_activity(left[0], body)`; the worker replaces `_current_run` by
+  `(tool, event)` under `_lock` before each tool, and then clears `_progress`, the queue
+  and the clock's two reports (`RunClock.elapsed_s` stays the chain's). So the strip, `stop`,
+  `close`, `join`, `_refuse_if_busy` and `busy_note` all say the tool that goes, and a second
+  run or activity is refused the whole time, between two tools too, because the activity is
+  never let go of between them. `_lock` is never held across `_prepare`, a run or a device
+  call (FM-70).
+- **Each tool, on the worker.** `prepared = self._prepare(tool, params.get(tool, ()),
+  preset)`. A `str` is a refusal, the very text `run` would have set as its outcome: the
+  chain ends with that tool `refused`, and nothing was written for it. A `_Prepared`
+  goes to `_run_plugin`, which now returns `_Ended(outcome, status)`, `status` one of
+  `done`, `stopped`, `failed`. `preset` is read **once, at the click**, as `run` reads it:
+  every record of the chain names the preset the operator saw.
+- **`_prepare(plugin, params, preset) -> _Prepared | str`** is the checks of `run` as they
+  stand and in their order, moved out of it so that a chain and a single run refuse with one
+  code: the stand, the plate's gate (`_needs_plate`), `plate-walls`' refusal, the plugin and
+  its parameters (a third party's validator's exception is an outcome: FM-113), `check_ready`,
+  the reachable checkpoint (FM-172). `run` becomes `_refuse_if_busy`, the preset's read,
+  `_prepare` and `_start_activity`: its behaviour, its refusals and their texts do not
+  change, and its tests pass as they are.
+- **STOP.** The activity's event is the chain's, and each tool gets it as its `stop`. The
+  worker looks at it **after** each tool and **before** the next. A STOP that lands in a
+  tool ends that tool `stopped`; one that lands between two tools, or on a tool that
+  ignores it and ends `done`, ends the chain `stopped before <next>`. Without the second
+  look the STOP would be lost, and the next tool would start.
+- **The end.** The activity's outcome (the strip's) is `run all done in <s> s: <tools>`
+  when every tool ended `done`; otherwise `run all stopped at <tool>: <that tool's
+  outcome>`, or `run all stopped before <tool>` after a STOP between two, then `; done:
+  <tools>` and `; not run: <tools>` when there are some. Whatever the chain's own code
+  raises is the outcome `run all: <Type>: <message>`, the text and never the exception
+  (FM-98). `activities_ended` counts the chain once, at its end (§2.1: what an activity
+  does while it goes is never an activity).
+
+```python
+#: smc/ui/guide.py (pure; CheckItem, ResultCard and ChainStatus are imported for typing only)
+RESULT_TOOLS: tuple[str, ...] = ("cells", "density", "route", "report", "nis-export")
+RESULT_NAMES: Mapping[str, str]  # §17.4.5's plain names, by tool
+RESULT_READS: Mapping[str, tuple[str, ...]] = {
+    "cells": ("scan",),
+    "density": ("scan-plan", "scan", "cells"),
+    "route": ("scan-plan", "scan", "cells"),
+    "report": ("scan-plan", "scan", "cells", "density"),
+    "nis-export": ("route",),
+}
+RESULT_CHOICES: Mapping[str, tuple[str, ...]] = {
+    "cells": ("detector",),
+    "route": ("labels", "fields_per_well"),
+}
+SCAN_FIRST = "scan first: step 4, Scan"
+
+
+@dataclass(frozen=True, slots=True)
+class ResultRow:
+    plugin: str
+    name: str
+    state: str
+    button: Literal["Run", "Again"]
+    wait: str
+    missing: bool
+    done: bool
+
+
+def results_left(checklist: Sequence[CheckItem]) -> tuple[str, ...]: ...
+def result_row(
+    plugin: str,
+    *,
+    checklist: Sequence[CheckItem],
+    card: ResultCard | None,
+    blocked: str | None,
+    dry_scan: bool,
+    running: str | None,
+    progress: tuple[int, int | None] | None,
+) -> ResultRow: ...
+def run_all_wait(rows: Sequence[ResultRow], left: Sequence[str]) -> str | None: ...
+def again_note(plugin: str, checklist: Sequence[CheckItem]) -> str: ...
+def chain_line(chain: ChainStatus | None) -> str: ...
+def files_lines(cards: Mapping[str, ResultCard]) -> tuple[str, ...]: ...
+def colour_bar_title(label: str | None) -> str: ...
+```
+
+- **`RESULT_READS` is the page's copy of the five plugins' `reads`**, as
+  `WALLS_MIN_CENTRES` is of `plate-walls`' bounds (§12.3): a test pins each row to the
+  plugin (`test_the_results_reads_are_the_plugins_reads`). The input a row waits for is
+  found from it and from the checklist, never read out of the document's sentence.
+- **The view** (`smc/ui/plate_page.py`). `_SCREEN_TOOLS["results"]` becomes `()`. New:
+  `run_all_button` (*Run all that are left*, primary, `label=`), `run_all_wait` and
+  `chain_text` (wrapped text panes, hidden while empty: `_say`), `result_rows: dict[str,
+  _ResultRow]` with one row of widgets for each name in `RESULT_TOOLS` (the name, the state,
+  the *Run* or *Again* button, its wait, the replace note, and a closed `pn.Card` titled
+  *Choices and command* that holds the tool's own fields for the keys of `RESULT_CHOICES`,
+  each with its *from …* line, then the command and the Windows note), `files_heading`,
+  `files_text`, and `colour_bar` (the `ColorBar` the figure already adds, kept). The row's
+  button goes through `_handler(self._runner(tool))`, the tool's own handler (`on_run`).
+  `on_run_all` reads each loaded tool's pairs, `[*page.page_params(tool), *self._typed(tool)]`, and
+  calls `page.run_chain(...)` with the tools of `RESULT_TOOLS` that loaded (a name that did
+  not load has a row that says so, and is not passed).
+- **The list of `screens["results"]`**, in this order: the title, the lead, `run_all_button`,
+  `run_all_wait`, `chain_text`, the five rows, `files_heading`, `files_text`,
+  `run_document_text`, `continue_button` (hidden on the last screen). It lists no next step,
+  no tool section and no checklist: all three are in `screens["expert"]` only.
+- **Drawing.** `_draw_results_screen(status)` is called by `tick()` and `refresh()` as B3's
+  screens are: text only, from the last view and this status, and it reads nothing new
+  (FM-145). A tool's end redraws the rows **inside a chain**: `tick()` compares
+  `len(status.chain.ended)` with the view's own `_chain_ended` (per view: D6) and a change
+  calls `refresh()` once, unless the end-of-run refresh of the same tick does it. A second
+  tab sees the same chain through the shared status (FM-151). `_draw_buttons` disables a
+  row's button while any activity goes or a wait is drawn, and says the wait or
+  `busy_note`; the controller refuses each call on its own (FM-169). `_on_field_changed`
+  redraws the rows' *from …* lines and commands, as it does the Wells screen's.
+- **`dry_scan`** is `status.dry_run` and the latest `scan` card is a dry run: the rule
+  `_next_step` uses for `DRY_RUN_NO_FRAME`, applied to the tools of `RESULT_READS` that read
+  `scan`. `_blocked` is not changed: the expert view's *Run cells* after a dry scan stays
+  enabled as it is today.
+- **The colour bar.** `colour_bar` keeps its `title` at `colour_bar_title(label_select.value)`;
+  `_draw_wells` sets it with the wells' values, so a change of the *Density of* select
+  changes it.
+
+#### 17.11.3 The texts
+
+- `results_left`: the slots of `RESULT_TOOLS` whose item is not `ok` (`not run` or
+  `unusable`), in the checklist's order.
+- `result_row`, the **state line**, the first that holds: `running == plugin`: `Running now`,
+  `Running now: <done> of <total>` from `progress`, `Running now: <done>` with no total; the
+  item is `ok`: `Done <card.when_utc> UTC`, then ` (dry run)` when the card says so, `Done`
+  alone with no card; the item is `unusable`: `Not usable: <its reason>` (`Not usable`
+  with no reason); an input is missing (the first slot of `RESULT_READS[plugin]` whose item
+  is not `ok`, an absent item included): `after <RESULT_NAMES[slot]>` for a tool of this
+  screen, `LAY_OUT_FIRST` for `scan-plan`, `SCAN_FIRST` for `scan`, `after <slot>` for any
+  other; else `Ready`.
+- `ResultRow.button` is `Again` exactly when the item is `ok`, else `Run`; `done` is the
+  same fact; `missing` is true exactly for the fourth state. `wait`, the first that holds:
+  `""` while `missing` (the state line says it); `blocked` when it is not `None` (the stand
+  is closed, a checkpoint, a capability: the controller's words); `DRY_RUN_NO_FRAME` when
+  `dry_scan` and the tool reads `scan`; else `""`. The view adds `busy_note` while an
+  activity goes, and says `<tool> did not load: the problems line says why` for a tool that
+  did not.
+- `run_all_wait(rows, left)`, the first that holds: `left` empty: `Nothing is left: every
+  step is done.`; the row of `left[0]` is `missing`: its `state`; its `wait` is not empty:
+  the `wait`; else `None`. The chain would stop at once on any of the three.
+- `again_note(plugin, checklist)`: `""` unless the tool's own item is `ok` and some tool
+  after it in `RESULT_TOOLS` is `ok` too; else `Again replaces this result. What comes after
+  it and is done (<names, in order, separated by ", ">) is out of date then: Run all that are
+  left runs it again.` (§11.4's idea, for the one place a click replaces a result that
+  others read.)
+- `chain_line(chain)`: `""` for `None`; while `current` is set, `Running <name> (<k> of
+  <n>).` with `k = len(ended) + 1`; every tool ended `done` and none is left: `Done: <names>.`;
+  else, after the last tool that ended: `failed`, `Stopped at <name>, which failed: <its
+  outcome>`; `refused`, `Stopped at <name>, which cannot run: <its outcome>`; `stopped`,
+  `Stopped at <name> by STOP.`; or `done` with tools left (a STOP between two), `Stopped
+  before <next name> by STOP.`; then ` Done: <names>.` when some ended `done`, and ` Not run:
+  <names>.` for the tools after the one it stopped at or before. A name is `RESULT_NAMES`'
+  or the tool's own. Plain text, never markup (FM-139): an outcome and a name come from
+  outside.
+- `files_lines(cards)`: for `scan`, then each tool of `RESULT_TOOLS`, in that order, each
+  entry of its card's `files` as `<name>: <path>`, the name `Scan frames` for `scan` and
+  `RESULT_NAMES`' for the others, the path what follows the first `: ` of the entry (the
+  whole entry when there is none). `files_text` is these lines, or `No step has written a
+  file yet.`; the heading is `Where the files are`. A card has files only when it ended
+  `done` (FM-154), so a stopped or failed tool names none.
+- `colour_bar_title(label)`: `""` for `None` or an empty label, else `<label> cells per
+  mm²`.
+
+#### 17.11.4 `/ui-check`
+
+One state joins the others: `results-all`, between `with-route` and `turned`, on
+`demo-sample` only. After `with-route` the run document holds a real `cells`, `density`
+and `route`; the script opens *5. Results*, waits for the density row to say `Done`, presses
+*Run all that are left* on the dry-run page, which runs `report` and `nis-export` (a run
+that moves nothing, measured above) and waits for the strip's `run all done`. It is read
+for the five rows, the files block, whether the title and *Run all that are left* are inside
+the 800 px page, and for what is below the fold. `after-density` waits for the density row's
+state line (`Done …`) instead of the checklist's `✓ density`, which is not on this screen
+any more. The rule that the script never presses a tool's own *Run* gains one clause: the
+buttons of the guided screens, *Run all that are left* included, are pressed on the dry-run
+page only. A chain in motion, with a step running and the others waiting, needs a stage that
+moves: a one-off browser session on `demo-sample` served **without** `--dry-run`, in the
+develop session's scratch directory, cited in its Report and not committed (as §17.10.4's).
+
+#### 17.11.5 Tests and failure modes
+
+- `tests/unit/test_ui_guide.py` gains the texts above; `tests/unit/test_plate_page_run_chain.py`
+  (new) is the controller's chain on stubs; `tests/unit/test_plate_page_results_view.py`
+  (new, Panel) is the screen; the demo end to end, from Connect to the export with no tool's
+  own button, is `@pytest.mark.demo`.
+- **Failure modes**: FM-169 (`run_chain` refuses on its own: busy, closed, the stand), FM-171
+  (every new handler through `_handler`, and the guard test walks `screens`), FM-172 (a chain
+  never starts a stage afresh over a checkpoint: `_prepare` is `run`'s check), FM-151 and
+  FM-145 (the rows follow the shared status; the tick reads no view), FM-139 (plain text),
+  FM-154 and FM-125 (a row's state from the checklist and a card read only when `done`), FM-226
+  (the old Results region's notes: each tool's blocked reason, the dry-run text, the Windows
+  note under a command; the next step, the sections and the checklist leave the screen on
+  purpose), FM-70 and FM-117 (STOP takes no lock the worker holds; the stop note), FM-44.
+  **A new entry**, named by its text: a STOP that lands between two steps of a chain is lost
+  unless the chain looks at the stop before it starts the next.
+
+#### 17.11.6 What this does not do
+
+- It adds no plugin, slot or command, and changes no tool: `run_chain` is `run` several times,
+  one activity.
+- It does not run `scan-plan` or `scan` in a chain: those are the screens before, with their
+  own buttons. It does not retry or skip a tool that failed: the chain says which one and why,
+  and the row's *Run* is there.
+- It does not resume: a stage stopped with a checkpoint is refused, as `run` refuses it, and
+  the row says the command that continues it (FM-172).
+- It does not change `_blocked`, the expert view or any tool's own *Run*.
+- It draws no bar for a running tool: the row says `Running now: <done> of <total>` and the
+  strip says the same.
 
 **Not verified (for the owner)**: the page read by a newcomer; the layout on the
 stand PC's screen and over RDP; a 1280 px window with the browser's own zoom.
