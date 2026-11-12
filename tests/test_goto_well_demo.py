@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
 from objective_offsets_stand import (
     FORTY,
@@ -31,6 +32,7 @@ from objective_offsets_stand import (
     opened,
     profile_with_offsets,
 )
+from smc.cli import app
 from smc.hardware import Microscope
 from smc.hardware.capabilities import ObjectiveOffset, ObjectiveTurret, XYStage
 from smc.hardware.errors import (
@@ -39,7 +41,7 @@ from smc.hardware.errors import (
     MicroscopeHaltedError,
     SafetyRefusedError,
 )
-from smc.hardware.profile import Profile
+from smc.hardware.profile import HolderSection, Profile
 from smc.plugins import (
     ParamsError,
     PluginRunError,
@@ -60,6 +62,7 @@ PITCH_UM = 9000.0
 HALF_UM = 3200.0
 SEED_LINE = "one reference well (A1): rotation 0° assumed from the declared orientation (not-turned), not measured"
 DRY_LINE = "dry run: the stage did not move; x_um and y_um are the target"
+DEMO_SAMPLE = Path(__file__).resolve().parents[1] / "profiles" / "demo-sample.toml"
 
 
 def _plate(
@@ -210,9 +213,15 @@ def test_goto_well_needs_a_plate(demo_microscope: Microscope, tmp_path: Path) ->
     before = _where(demo_microscope)
     with pytest.raises(
         UpstreamError, match="goto-well reads plate, but the run document has no plate"
-    ):
+    ) as info:
         _run(demo_microscope, tmp_path, well="A1")
     assert _where(demo_microscope) == before
+    # Without `plate=`, the refusal also says how to drive to the estimate (m3 §5.5 D3).
+    assert str(info.value) == (
+        "goto-well reads plate, but the run document has no plate; smc run --list "
+        "shows which plugin provides it; or give plate=<a useq plate name> to drive "
+        "to the estimate of the profile's [holder]"
+    )
 
 
 def test_an_unknown_well_fails_and_does_not_move(
@@ -334,8 +343,9 @@ def test_the_entry_point_loads_goto_well() -> None:
 
     assert entry.plugin.provides == "goto-well"
     assert entry.plugin.requires == (XYStage,)
-    assert entry.plugin.reads == ("plate",)
-    assert entry.plugin.reads_optional == ()
+    # Optional since #462: without a usable plate it drives to the holder's estimate.
+    assert entry.plugin.reads == ()
+    assert entry.plugin.reads_optional == ("plate",)
     assert entry.target == "smc.plugins.goto_well:GotoWellPlugin"
 
 
@@ -679,3 +689,312 @@ def test_goto_well_refuses_a_word_that_is_no_side() -> None:
         GotoWellParams(well="A1", side="middle")  # type: ignore[arg-type]
     assert "Input should be 'centre', '+X', '-X', '+Y' or '-Y'" in str(raised.value)
     assert "side on the image" not in str(raised.value)
+
+
+# ------------------------------------ before registration, the holder (#462)
+
+#: Anisotropic and away from the origin (FM-73, FM-203). A 96-well grid's centre is
+#: (49 500, -31 500) µm from A1, so A1 lies at the holder minus that, not turned,
+#: and at the holder plus that, turned 180°: written here, not from holder_estimate.
+HOLDER_UM = (400.0, -325.0)
+A1_ESTIMATED = (-49_100.0, 31_175.0)
+A1_ESTIMATED_TURNED = (49_900.0, -31_825.0)
+NO_PLATE = (
+    "the run document has no plate; smc run --list shows which plugin provides it"
+)
+ESTIMATE_LINE = (
+    "target estimated from the stand's holder, not registered: the 96-well centred "
+    "at stage (400, -325) µm, not turned"
+)
+NO_OFFSET_LINE = "no objective offset applied: the holder's estimate names no objective"
+
+
+def _holder_profile() -> Profile:
+    return Profile.demo().model_copy(
+        update={
+            "holder": HolderSection(
+                plate_centre_xy_um=HOLDER_UM,
+                measured="a test's holder, anisotropic and off the origin",
+            )
+        }
+    )
+
+
+@pytest.fixture
+def holder_stand(mm_available: bool) -> Iterator[Microscope]:
+    """The demo devices on a profile whose ``[holder]`` puts a plate at (400, -325) µm."""
+    if not mm_available:
+        pytest.skip("Micro-Manager demo adapters not installed")
+    microscope = Microscope.open(_holder_profile(), dry_run=False)
+    try:
+        yield microscope
+    finally:
+        microscope.close()
+
+
+def test_goto_well_without_a_plate_drives_to_the_holders_estimate(
+    holder_stand: Microscope, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        record = _run(holder_stand, tmp_path, well="A1", plate="96-well")
+    result = _result(record)
+    assert result.from_holder is True
+    assert (result.well, result.side) == ("A1", "centre")
+    assert (result.target_x_um, result.target_y_um) == pytest.approx(
+        A1_ESTIMATED, abs=0.01
+    )
+    assert (result.x_um, result.y_um) == pytest.approx(A1_ESTIMATED, abs=0.02)
+    assert _where(holder_stand) == pytest.approx(A1_ESTIMATED, abs=0.02)
+    assert result.objective == holder_stand.require(ObjectiveTurret).current()
+    assert (result.plate_objective, result.shift_um) == (None, None)
+    assert result.assumed == (
+        ESTIMATE_LINE,
+        f"plate not read: {NO_PLATE}",
+        NO_OFFSET_LINE,
+    )
+    assert record.reads == {"plate": None}
+    assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [
+        "goto-well: driving to A1 of the 96-well estimated from the stand's holder, "
+        "not registered"
+    ]
+
+
+def test_goto_well_on_a_turned_estimate_drives_to_the_turned_well(
+    holder_stand: Microscope, tmp_path: Path
+) -> None:
+    result = _result(
+        _run(
+            holder_stand,
+            tmp_path,
+            well="A1",
+            plate="96-well",
+            orientation="turned-180",
+        )
+    )
+    assert (result.target_x_um, result.target_y_um) == pytest.approx(
+        A1_ESTIMATED_TURNED, abs=0.01
+    )
+    assert _where(holder_stand) == pytest.approx(A1_ESTIMATED_TURNED, abs=0.02)
+    assert result.assumed[0] == (
+        "target estimated from the stand's holder, not registered: the 96-well "
+        "centred at stage (400, -325) µm, turned 180°"
+    )
+
+
+def test_goto_well_without_a_holder_names_both_missing_and_moves_nothing(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    before = _where(demo_microscope)
+    with pytest.raises(UpstreamError) as info:
+        _run(demo_microscope, tmp_path, well="A1", plate="96-well")
+    assert str(info.value) == (
+        f"goto-well reads plate, but {NO_PLATE}; and this stand's profile has no "
+        "[holder] plate_centre_xy_um to estimate the plate from"
+    )
+    assert _stored(tmp_path).status is StageStatus.failed
+    assert _where(demo_microscope) == before
+
+
+def test_goto_well_refuses_a_wall_on_the_estimate_before_any_move(
+    holder_stand: Microscope, tmp_path: Path
+) -> None:
+    before = _where(holder_stand)
+    with pytest.raises(PluginRunError) as info:
+        _run(holder_stand, tmp_path, well="B2", side="+X", plate="96-well")
+    assert str(info.value) == (
+        "goto-well: a wall is reached through a registered plate: the holder's "
+        "estimate can be a few hundred µm off; go to the centre, and register the plate"
+    )
+    assert _stored(tmp_path).status is StageStatus.failed
+    assert _where(holder_stand) == before
+
+
+@pytest.mark.parametrize(
+    ("plate", "well", "problem"),
+    [
+        pytest.param(
+            "bogus",
+            "A1",
+            "Unknown plate name 'bogus'. Use `useq.register_well_plates` to add new "
+            "plate definitions; give a useq plate name (96-well, greiner-24-well)",
+            id="unknown-plate",
+        ),
+        pytest.param(
+            "96-WELL",
+            "A1",
+            "Unknown plate name '96-WELL'. Use `useq.register_well_plates` to add new "
+            "plate definitions; give a useq plate name (96-well, greiner-24-well)",
+            id="names-are-exact",
+        ),
+        pytest.param(
+            "96-well",
+            "Z99",
+            "well 'Z99' is not on the 96-well plate; give a well of the 96-well plate",
+            id="unknown-well",
+        ),
+    ],
+)
+def test_goto_well_refuses_an_unknown_plate_on_the_estimate_before_any_move(
+    holder_stand: Microscope, tmp_path: Path, plate: str, well: str, problem: str
+) -> None:
+    before = _where(holder_stand)
+    with pytest.raises(PluginRunError) as info:
+        _run(holder_stand, tmp_path, well=well, plate=plate)
+    assert str(info.value) == f"goto-well: {problem}"
+    # Raised outside the handler: useq's error is not chained onto it (FM-98).
+    assert info.value.__context__ is None
+    assert _stored(tmp_path).status is StageStatus.failed
+    assert _where(holder_stand) == before
+
+
+def test_goto_well_refuses_an_empty_turret_on_the_estimate_before_any_move(
+    holder_stand: Microscope, tmp_path: Path
+) -> None:
+    holder_stand.override(ObjectiveTurret, _EmptyTurret())
+    before = _where(holder_stand)
+    with pytest.raises(PluginRunError, match="no objective is in place"):
+        _run(holder_stand, tmp_path, well="A1", plate="96-well")
+    assert _where(holder_stand) == before
+
+
+def test_goto_well_on_a_dry_plate_drives_to_the_estimate_and_says_why(
+    holder_stand: Microscope, tmp_path: Path
+) -> None:
+    _seed(tmp_path, dry_run=True)
+    result = _result(_run(holder_stand, tmp_path, well="A1", plate="96-well"))
+    assert result.from_holder is True
+    assert _where(holder_stand) == pytest.approx(A1_ESTIMATED, abs=0.02)
+    assert result.assumed[1] == (
+        "plate not read: plate-registration was a dry run; run it without --dry-run"
+    )
+
+
+def test_the_estimate_in_a_dry_run_says_the_stage_did_not_move(
+    mm_available: bool, tmp_path: Path
+) -> None:
+    if not mm_available:
+        pytest.skip("Micro-Manager demo adapters not installed")
+    microscope = Microscope.open(_holder_profile(), dry_run=True)
+    try:
+        before = _where(microscope)
+        result = _result(_run(microscope, tmp_path, well="A1", plate="96-well"))
+        assert result.assumed == (
+            ESTIMATE_LINE,
+            f"plate not read: {NO_PLATE}",
+            NO_OFFSET_LINE,
+            DRY_LINE,
+        )
+        assert (result.x_um, result.y_um) == pytest.approx(A1_ESTIMATED, abs=0.01)
+        assert _where(microscope) == before
+    finally:
+        microscope.close()
+
+
+def test_goto_well_with_a_usable_plate_ignores_the_holder(
+    holder_stand: Microscope, tmp_path: Path
+) -> None:
+    _seed(tmp_path)
+    expected = _at("B2", 0.0, 0.0)
+    record = _run(
+        holder_stand, tmp_path, well="B2", plate="96-well", orientation="turned-180"
+    )
+    result = _result(record)
+    assert result.from_holder is False
+    assert (result.target_x_um, result.target_y_um) == pytest.approx(expected, abs=1e-6)
+    assert _where(holder_stand) == pytest.approx(expected, abs=0.02)
+    assert result.assumed == ()
+    assert record.reads["plate"] is not None
+
+
+def test_goto_well_refuses_a_plate_that_is_not_the_registered_plate(
+    holder_stand: Microscope, tmp_path: Path
+) -> None:
+    _seed(tmp_path)
+    before = _where(holder_stand)
+    with pytest.raises(PluginRunError) as info:
+        _run(holder_stand, tmp_path, well="B2", plate="384-well")
+    assert str(info.value) == (
+        "goto-well: the registered plate is a 96-well, not a 384-well: leave plate "
+        "out, or register the 384-well"
+    )
+    assert _stored(tmp_path).status is StageStatus.failed
+    assert _where(holder_stand) == before
+
+
+def test_an_unreadable_plate_is_refused_even_with_plate_given(
+    holder_stand: Microscope, tmp_path: Path
+) -> None:
+    # A plate that is there and that the model refuses is not "no plate": it is
+    # refused as it was, and is not taken as a reason to drive to the estimate.
+    then = datetime(2026, 10, 28, 9, 30, tzinfo=timezone.utc)
+    write_stage(
+        tmp_path / "run.json",
+        StageRecord(
+            plugin="plate-registration",
+            provides="plate",
+            attempt="a1",
+            status=StageStatus.done,
+            started_utc=then,
+            finished_utc=then,
+            profile="demo",
+            dry_run=False,
+            smc_version="0",
+            params={},
+            result={"plate": "96-well", "assumed": []},
+        ),
+    )
+    before = _where(holder_stand)
+    with pytest.raises(UpstreamError) as info:
+        _run(holder_stand, tmp_path, well="A1", plate="96-well")
+    assert str(info.value).startswith(
+        "goto-well reads plate, but the result of plate-registration is not what "
+        "goto-well expects ("
+    )
+    assert str(info.value).endswith("); run plate-registration again")
+    assert _where(holder_stand) == before
+
+
+def test_the_estimate_parameters_parse_from_text() -> None:
+    params = parse_params(
+        GotoWellParams, ["well=A1", "plate=96-well", "orientation=turned-180"]
+    )
+    assert (params.plate, params.orientation) == ("96-well", "turned-180")
+    defaults = parse_params(GotoWellParams, ["well=A1"])
+    assert (defaults.plate, defaults.orientation) == (None, "not-turned")
+
+
+def test_smc_run_goto_well_drives_to_the_estimate_on_demo_sample(
+    mm_available: bool, tmp_path: Path
+) -> None:
+    if not mm_available:
+        pytest.skip("Micro-Manager demo adapters not installed")
+    run_doc = tmp_path / "run.json"
+    result = CliRunner(
+        env={"COLUMNS": "200", "SMC_PROFILE": None, "SMC_PROFILES": None}
+    ).invoke(
+        app,
+        [
+            "run",
+            "goto-well",
+            "-p",
+            str(DEMO_SAMPLE),
+            "--run-doc",
+            str(run_doc),
+            "--param",
+            "well=A1",
+            "--param",
+            "plate=96-well",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    record = RunDocument.load(run_doc).stages["goto-well"]
+    done = _result(record)
+    # demo-sample's holder is at (0, 0): A1 is the grid's centre offset, negated.
+    assert (done.target_x_um, done.target_y_um) == pytest.approx(
+        (-49_500.0, 31_500.0), abs=0.01
+    )
+    assert done.from_holder is True
+    assert done.assumed[0] == (
+        "target estimated from the stand's holder, not registered: the 96-well "
+        "centred at stage (0, 0) µm, not turned"
+    )
