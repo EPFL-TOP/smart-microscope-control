@@ -367,6 +367,7 @@ a plugin never builds one.
 | Member | Use |
 |---|---|
 | `ctx.progress(done, total=None, message="")` | Report progress. Never validated, never fatal: a callback that raises is dropped after one warning. |
+| `ctx.show_frame(image, *, xy_um=None, label="")` | Hand a frame you have taken, and no longer write to, to whoever runs the plugin (the plate page shows the newest). Never copied, never validated, never fatal; nothing when nobody listens. |
 | `ctx.should_stop()`, `ctx.raise_if_stopped()` | Has a stop been asked for? Check between units of work; `raise_if_stopped` raises `StopRequested`, which is an outcome and not an error. |
 | `ctx.wait_s(seconds)` | Wait, ending at a stop. **Never `time.sleep`**: it cannot be stopped, and on Windows one long wait keeps Ctrl-C from being delivered. |
 | `ctx.upstream(slot, Model)` | The result of the provider of a slot in `reads`, validated by `Model`. |

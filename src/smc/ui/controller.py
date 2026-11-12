@@ -67,6 +67,7 @@ from smc.plugins import (
     parse_params,
     run_plugin,
 )
+from smc.plugins.api import ShownFrame
 from smc.plugins.frames import stage_side_of_image_side
 from smc.plugins.geometry import Matrix2
 from smc.plugins.presets import (
@@ -594,6 +595,104 @@ class _Handed(NamedTuple):
     name: str
     run: Callable[[], str]
     switch_off: bool
+
+
+class _LatestShown:
+    """The newest frame a plugin's run handed the page, in one slot (m3 §25.5).
+
+    ``put`` is what ``run_plugin`` receives as ``on_frame``: a bound method of
+    this holder and never of ``PlatePage``, so the plugin's context holds no
+    reference to the page nor to the stand (FM-92). It runs on the worker, for
+    every frame, so it copies nothing and logs nothing but the first frame it
+    drops (FM-62, FM-178): the copy is made when a session's tick takes the
+    frame, or once at the run's end, never on the scan's thread per field. The
+    newest frame wins: one the page has not drawn when the next one comes is
+    never drawn, and none is queued.
+
+    The holder has its own lock, never held while ``PlatePage._lock`` is taken:
+    ``frame()`` holds ``_lock`` and then this one, ``put`` takes only this one.
+    """
+
+    __slots__ = ("_dropped", "_guard", "_slot")
+
+    def __init__(self) -> None:
+        self._guard = threading.Lock()
+        self._slot: ShownFrame | None = None
+        self._dropped = False
+
+    def put(self, shown: ShownFrame) -> None:
+        """Keep ``shown`` in place of the slot's frame, or drop a frame the page cannot show.
+
+        The page shows 2-D ``uint8`` or ``uint16`` frames, the test of
+        ``_take_frame``; any other is dropped, and the first one dropped since the
+        last ``clear()`` is logged once at WARNING. An empty frame is dropped too:
+        its minimum, taken on the server's loop, would raise at every tick. It
+        never raises: the runner drops a callback that does, and the rest of the
+        run would show no frame.
+        """
+        image = shown.image
+        if (
+            isinstance(image, np.ndarray)
+            and image.ndim == 2
+            and image.dtype.kind == "u"
+            and image.dtype.itemsize <= 2
+            and image.size > 0
+        ):
+            with self._guard:
+                self._slot = shown
+            return
+        with self._guard:
+            first, self._dropped = not self._dropped, True
+        if first:
+            log.warning(
+                "%s handed a %s frame of shape %s; the page shows 2-D uint8 or "
+                "uint16 frames",
+                shown.plugin,
+                str(getattr(image, "dtype", type(image).__name__)),
+                str(getattr(image, "shape", "unknown")),
+            )
+
+    def take(self) -> ShownFrame | None:
+        """The slot's frame, ``None`` when it is empty; the slot is emptied."""
+        with self._guard:
+            shown, self._slot = self._slot, None
+        return shown
+
+    def clear(self) -> None:
+        """Empty the slot and log the next frame dropped again: a new activity begins."""
+        with self._guard:
+            self._slot = None
+            self._dropped = False
+
+
+def _frame_of(shown: ShownFrame, number: int) -> Frame:
+    """The page's ``Frame`` of a plugin's frame: a read-only copy, and only what was read.
+
+    The copy is the page's own, as ``_take_frame`` keeps a snap's: the plugin no
+    longer writes to its array, but the page keeps the frame for as long as a
+    session draws it. It is made in the native byte order of its width, which
+    ``display_image`` reads. The page read neither the camera's bit depth nor its
+    exposure nor the pixel size: ``0``, ``None`` and ``0.0``, never guessed (m3
+    §25.5). The position and the time are the plugin's.
+    """
+    source = shown.image
+    kept = np.array(source, dtype=np.uint8 if source.dtype.itemsize == 1 else np.uint16)
+    kept.flags.writeable = False
+    height, width = kept.shape
+    name = f"{shown.plugin} {shown.label}" if shown.label else shown.plugin
+    return Frame(
+        number=number,
+        image=cast("npt.NDArray[np.uint8] | npt.NDArray[np.uint16]", kept),
+        bit_depth=0,
+        exposure_ms=None,
+        pixel_size_um=0.0,
+        xy_um=shown.xy_um,
+        taken_utc=shown.taken_utc,
+        summary=(
+            f"{name}: {height}x{width} {kept.dtype}, min {int(kept.min())}, "
+            f"max {int(kept.max())}"
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1179,6 +1278,9 @@ class PlatePage:
         # What the last drive to a well came to (m3 §5.5 D7), under ``_lock``.
         self._goto = ""
         self._frame: Frame | None = None
+        # The newest frame a run handed (m3 §25.5): its own lock, taken inside
+        # ``_lock`` and never around it.
+        self._shown = _LatestShown()
         self._queue: queue.SimpleQueue[Progress] = queue.SimpleQueue()
         self._worker: threading.Thread | None = None
         # The event of the live this page started, to tell it from any other activity
@@ -2127,6 +2229,8 @@ class PlatePage:
                     self._queue.get_nowait()
                 except queue.Empty:
                     break
+            # A frame of an earlier run must never replace this activity's (a snap's).
+            self._shown.clear()
             # Daemon: a plugin stuck in a vendor call must not keep the process
             # alive after the page is closed.
             worker = threading.Thread(
@@ -2157,6 +2261,9 @@ class PlatePage:
                     # Whoever started it: a drive click, a tool's Run, another tab.
                     self._goto = outcome
                 self._current_run = None
+                # The run's last frame is kept although no session took it, and
+                # nothing of the run is left to replace a later snap's (m3 §25.5).
+                self._keep_shown()
                 # After the activity's own writes (a run's record is on disk by now),
                 # so a session that sees the count change reads them.
                 self._ended += 1
@@ -2209,6 +2316,9 @@ class PlatePage:
                 stop=event,
                 plugin_version=entry.version,
                 preset=preset,
+                # The holder's method, never the page's: the context must not
+                # reach the stand (FM-92).
+                on_frame=self._shown.put,
             )
         except RunDocumentError as exc:
             if exc.record is not None and exc.record.result is not None:
@@ -2577,9 +2687,25 @@ class PlatePage:
         return current is not None and current[1] is self._live_event
 
     def frame(self) -> Frame | None:
-        """The latest frame, ``None`` before the first; the same for every session."""
+        """The latest frame, ``None`` before the first; the same for every session.
+
+        A frame a run handed since the last call becomes the latest here, on the
+        first session's tick that finds it (m3 §25.5): the copy is made on the
+        server's loop, for the frames drawn only, and never on the run's thread.
+        Every other session reads the same ``Frame`` (FM-151).
+        """
         with self._lock:
+            self._keep_shown()
             return self._frame
+
+    def _keep_shown(self) -> None:
+        """Turn the frame a run handed, if any, into the latest, numbered after it; the caller holds ``_lock``."""
+        shown = self._shown.take()
+        if shown is not None:
+            previous = self._frame
+            self._frame = _frame_of(
+                shown, 1 if previous is None else previous.number + 1
+            )
 
     def _live(self, event: threading.Event) -> str:
         """Frames until ``event`` is set or one fails, and the outcome as text.
