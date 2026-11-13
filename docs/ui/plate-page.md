@@ -371,7 +371,9 @@ a POSIX shell and the button is the way in). Nothing is in the warning colour bu
   sample): every guard of the layer applies, as to the expert view's own tool. The chain's
   line is drawn under it (`Running Timing (1 of 2).`, `Done: Timing, Field layout.`, or where
   it stopped), and the plan's time follows. On a page served with `--dry-run` it waits (`A dry
-  run cannot time the stand: ...`): `timing` refuses a dry run;
+  run cannot time the stand: ...`): `timing` refuses a dry run. It also waits while a stopped
+  scan's checkpoint stands (`Continue the scan or Start again first: ...`): laying the fields
+  out again would put that checkpoint out of `--resume`'s reach;
 - when the wells selected are **not** the plan's wells, a note says which wells the plan is for
   and to lay the fields out again to scan the others: the plan is what `scan` does, and a
   selection made since has not changed it.

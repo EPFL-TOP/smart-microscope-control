@@ -84,6 +84,7 @@ from smc.ui.guide import (
     DRY_RUN_NO_FRAME,
     END_LIVE_LABEL,
     FILES_HEADING,
+    MEASURE_AFTER_THE_SCAN,
     MEASURE_NOT_IN_A_DRY_RUN,
     MEASURE_THE_TIME,
     NO_FILES_YET,
@@ -3857,6 +3858,13 @@ class PlatePageView:
             or (
                 MEASURE_NOT_IN_A_DRY_RUN
                 if status is not None and status.dry_run
+                else None
+            )
+            or (
+                MEASURE_AFTER_THE_SCAN
+                if view is not None
+                and view.scan_end is not None
+                and view.scan_end.resumable
                 else None
             )
         )

@@ -2656,6 +2656,12 @@ class PlatePage:
         if not left:
             self._set_outcome(f"{RUN_ALL_LABEL}: nothing is left: every step is done")
             return
+        if (dropped := self._chain_drops_a_checkpoint(left, doc)) is not None:
+            # A chain is one click: it never makes out of date a checkpoint that `--resume`
+            # (or *Continue the scan*) could still continue (FM-172, adversarial review of
+            # #470: *Measure the time* lays the fields out again, and the stopped scan read them).
+            self._set_outcome(f"{RUN_ALL_LABEL}: {dropped}")
+            return
         # Read at the click, as `run` reads it: every record of the chain names the preset
         # the operator saw loaded (m5 §10.5).
         loaded = self.preset
@@ -2692,6 +2698,48 @@ class PlatePage:
                 left.append(tool)
                 made_again.add(slot)
         return tuple(left)
+
+    def _chain_drops_a_checkpoint(
+        self, left: Sequence[str], doc: RunDocument
+    ) -> str | None:
+        """Why running ``left`` would put a stopped or failed stage's reachable checkpoint out of date, or ``None``.
+
+        A stage reads what a tool of ``left`` provides (``reads`` or ``reads_optional``, the
+        rule of ``RunDocument.is_stale``) and holds a checkpoint ``reachable_checkpoint`` finds,
+        and the chain does not run that stage itself: the chain's end would leave it stale, and
+        its checkpoint lost to ``--resume`` (FM-172). The first such pair, in the chain's order.
+        """
+        registry = self._registry().plugins
+        profile = self._profile.microscope.name
+        kept: dict[str, StageStatus] = {}
+        for name in registry:
+            if name in left:
+                continue
+            status = reachable_checkpoint(
+                name, doc, profile=profile, dry_run=self._dry_run
+            )
+            if status is not None:
+                kept[name] = status
+        if not kept:
+            return None
+        for tool in left:
+            entry = registry.get(tool)
+            if entry is None:
+                continue
+            slot = entry.plugin.provides
+            for stage, status in kept.items():
+                reader = registry[stage].plugin
+                if slot in (*reader.reads, *reader.reads_optional):
+                    way = (
+                        "Continue the scan or Start again, on the Scan screen, first"
+                        if stage == "scan"
+                        else f"continue it first (smc run {stage} --resume)"
+                    )
+                    return (
+                        f"{tool_title(tool)} would put the checkpoint of the "
+                        f"{status.value} {tool_title(stage)} out of date: {way}"
+                    )
+        return None
 
     def _run_chain(
         self,

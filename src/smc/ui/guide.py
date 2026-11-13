@@ -71,6 +71,7 @@ __all__ = [
     "GOTO_WALL_NEEDS_REGISTRATION",
     "LAY_OUT_FIRST",
     "MAP_FIELDS_UP_TO",
+    "MEASURE_AFTER_THE_SCAN",
     "MEASURE_NOT_IN_A_DRY_RUN",
     "MEASURE_THE_TIME",
     "NOTHING_LEFT",
@@ -403,6 +404,12 @@ SCAN_CHECKPOINT_KEPT = (
 MEASURE_THE_TIME = "Measure the time"
 MEASURE_NOT_IN_A_DRY_RUN = (
     "A dry run cannot time the stand: serve the page without --dry-run to measure it."
+)
+#: ... and while a stopped scan's checkpoint stands: the fields laid out again would put it out
+#: of date (FM-172, the adversarial review of #470). The controller's chain refuses it too.
+MEASURE_AFTER_THE_SCAN = (
+    "Continue the scan or Start again first: laying the fields out again would drop "
+    "the stopped scan's checkpoint."
 )
 
 

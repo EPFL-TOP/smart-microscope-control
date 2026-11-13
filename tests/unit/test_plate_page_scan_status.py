@@ -41,7 +41,7 @@ from smc.plugins.slots import (
 from smc.run import ReadRecord, RunDocument, StageRecord, StageStatus, write_stage
 from smc.testing import FakeCore
 from smc.ui.controller import PlatePage, RunClock, ScanSummary
-from smc.ui.guide import scan_progress_lines
+from smc.ui.guide import scan_end_lines, scan_progress_lines
 
 pytestmark = pytest.mark.filterwarnings(
     "error::DeprecationWarning", "error::PendingDeprecationWarning"
@@ -1011,3 +1011,72 @@ def test_continue_or_start_again_on_a_halted_stand_is_refused_and_keeps_the_chec
     scan_page.run("scan", [], **{how: True})
     assert scan_page.join(BOUND_S)
     assert CheckpointScan.resumed == [None, 1 if how == "resume" else None]
+
+
+def test_a_cleanly_stopped_scan_seen_by_a_new_page_is_a_stop_without_a_count(
+    scan_page: PlatePage, fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # The owner closed and reopened the page after a STOP: the record is `stopped`, and this
+    # page saw no STOP and kept no progress.
+    _stop_the_scan(scan_page)
+    scan_page.close()
+    fresh = PlatePage(
+        fake_microscope, run_doc, entry_points=_scan_entry_points(with_others=False)
+    )
+    try:
+        end = fresh.view().scan_end
+    finally:
+        fresh.close()
+    assert end is not None
+    assert (end.kind, end.done, end.total, end.resumable) == (
+        "stopped",
+        None,
+        None,
+        True,
+    )
+    assert scan_end_lines(end) == ("Stopped by STOP.",)
+
+
+def test_a_later_scan_that_fails_without_a_stop_says_its_own_end(
+    scan_page: PlatePage,
+) -> None:
+    # The STOP of the scan before, and its count, are that run's: a run afresh that fails
+    # with no STOP and before its first report says a failure, without a count.
+    _stop_the_scan(scan_page)
+    CheckpointScan.paused = threading.Event()
+    CheckpointScan.release = threading.Event()
+    CheckpointScan.release.set()
+
+    def fails_at_once(self: Any, microscope: Any, params: Any, ctx: RunContext) -> Any:
+        raise RuntimeError("the camera timed out")
+
+    original = CheckpointScan.run
+    CheckpointScan.run = fails_at_once  # type: ignore[method-assign]
+    try:
+        scan_page.run("scan", [], afresh=True)
+        assert scan_page.join(BOUND_S)
+    finally:
+        CheckpointScan.run = original  # type: ignore[method-assign]
+    end = scan_page.view().scan_end
+    assert end is not None
+    assert (end.kind, end.done, end.total) == ("failed", None, None)
+
+
+def test_a_stop_in_another_tool_does_not_make_a_scan_failure_a_stop(
+    scan_page: PlatePage,
+) -> None:
+    CheckpointScan.ending = "fail"
+    scan_page.run("scan", [])
+    assert CheckpointScan.paused.wait(BOUND_S)
+    CheckpointScan.release.set()
+    assert scan_page.join(BOUND_S)
+    # STOP pressed while another tool runs: that tool's stop, never the scan's.
+    scan_page.run("reporting", [])
+    scan_page.stop()
+    for gate in Reporting.gates:
+        gate.set()
+    assert scan_page.join(BOUND_S)
+    scan_page.resume()
+    end = scan_page.view().scan_end
+    assert end is not None
+    assert end.kind == "failed"
