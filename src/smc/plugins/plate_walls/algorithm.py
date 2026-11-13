@@ -1,11 +1,18 @@
 """Where a well's wall is in a frame, and the circle of a well from its wall points (m3 §17.3).
 
-Pure: numpy only, no device, no file. The wall is the first fall from bright to
-dark that a line of the frame meets going outwards from a well's inside; the
-well's centre and size are the circle fitted to the wall points of its four
-sides. What it decides, because a wall found in the wrong place gives a plate
-registered a whole well off with no error to say so:
+Pure: numpy only, no device, no file. The wall is the fall from a well's inside
+to the plastic that a line of the frame meets going outwards, at the half level
+of that fall; the well's centre and size are the circle fitted to the wall
+points of its four sides. What it decides, because a wall found in the wrong
+place gives a plate registered a whole well off with no error to say so:
 
+* **The wall is the fall to the plastic, not the first fall below the midpoint.**
+  The meniscus darkens the inside of a well towards its wall: a shadow joined to
+  the wall, or a dark ridge on the inner border of a grey band, 0.76 to 1.67 mm
+  inside the plastic edge at the 4x, below the frame's midpoint before the
+  plastic is (B5, #409). The plastic is the run below the midpoint that reaches
+  the line's end or is long enough to be a gap between wells; a shadow or a
+  ridge ends inside the frame and is shorter.
 * **The camera's turn decides where to look.** The outward direction is a stage
   direction, turned into pixels by the camera matrix. A wrong matrix points the
   lines into the plastic, where every line starts dark and none gives a point:
@@ -42,9 +49,12 @@ __all__ = [
     "MIN_CLASS_FRACTION",
     "MIN_FRAME_SIDE_PX",
     "MIN_LINE_FRACTION",
+    "MIN_PLASTIC_UM",
     "OUTWARD",
+    "SHOULDER_PX",
     "SIDES",
     "STEP_FRACTION",
+    "WALL_LEVEL",
     "CircleFit",
     "WallEdge",
     "along_um",
@@ -85,6 +95,21 @@ MIN_FRAME_SIDE_PX = 128
 #: The walk's bound, on the frames of the whole run (FM-74): the same bound
 #: applies to what is allocated, a walk's offsets, as to what is moved.
 MAX_FRAMES = 600
+#: The plastic is reached where a line of the plastic's run first falls below
+#: this fraction of the way from the plastic's level to the inside's. The
+#: meniscus's shadows reach 0.16 of the way at their darkest, next to the wall,
+#: and the plastic sits at about 0.01 (B5 at the 4x, #409, §17.1).
+WALL_LEVEL = 0.1
+#: A run below the midpoint is the plastic when it reaches the line's end or is
+#: at least this long, in µm. A shadow or a ridge of the meniscus that ends
+#: inside the frame was 972 µm at most (B5's -X, 4x); the plastic between our
+#: wall and the neighbour's is a gap between wells, 1 900 µm at least (48-well).
+#: In µm, never in pixels: the samples are turned into pixels by the matrix.
+MIN_PLASTIC_UM = 1400.0
+#: How far before the plastic's first sample the wall's own shoulder is looked
+#: for, in samples: a wall that crosses a band at up to 45 degrees spreads its
+#: fall over BAND_PX samples, so twice that reaches the level it falls from.
+SHOULDER_PX = 2 * BAND_PX
 #: The sides of a well, as stage directions, in the order they are measured.
 SIDES: tuple[WallSide, ...] = ("+X", "+Y", "-X", "-Y")
 #: The unit vector from a well's centre to each side's wall, in stage axes.
@@ -161,13 +186,81 @@ def _outward_pixels(
     return pixel_of_stage(0.0, 0.0, ox, oy, matrix=matrix, image_shape_px=(1, 1))
 
 
+def _plastic_run(below: npt.NDArray[np.bool_], min_run: int) -> tuple[int, int] | None:
+    """The line's plastic: ``[start, end)`` of the first run of ``below`` that is one, else ``None``.
+
+    A run is the plastic when it reaches the line's end or is at least
+    ``min_run`` samples long. A shadow or a ridge of the meniscus is a run that
+    ends inside the frame and is shorter, so it is skipped, and the plastic
+    behind it is found. Two runs that fewer than ``BAND_PX`` samples above the
+    threshold separate are one: that is noise on the plastic's own edge.
+    """
+    padded = np.concatenate(([False], below, [False]))
+    change = np.flatnonzero(padded[1:] != padded[:-1]).tolist()
+    runs: list[list[int]] = []
+    for start, end in zip(change[0::2], change[1::2], strict=True):
+        if runs and start - runs[-1][1] < BAND_PX:
+            runs[-1][1] = end
+        else:
+            runs.append([start, end])
+    for start, end in runs:
+        if end == below.shape[0] or end - start >= min_run:
+            return start, end
+    return None
+
+
+def _wall_in_line(
+    line: npt.NDArray[np.float64],
+    below: npt.NDArray[np.bool_],
+    deep: float,
+    plastic: float,
+    min_run: int,
+) -> float | None:
+    """Where the wall is along one line, in samples, or ``None``: the half level of the fall into the plastic.
+
+    ``at`` is the first sample of the plastic's run below ``deep``. The edge is
+    not the frame's midpoint but the half level of the wall's own fall, between
+    the plastic and the shoulder it falls from (the largest of the
+    ``SHOULDER_PX`` samples before ``at``): behind a shadow the midpoint is
+    crossed by the shadow, 0.76 to 1.67 mm early at the 4x (#409). On a clean
+    step the shoulder is the inside and this is the half-intensity edge. The
+    inward scan stops after ``SHOULDER_PX`` samples whatever the line holds, so
+    the work of a line stays bounded by the frame (FM-74).
+    """
+    run = _plastic_run(below, min_run)
+    if run is None:
+        return None
+    deeper = np.flatnonzero(line[run[0] : run[1]] < deep)
+    if deeper.size == 0:
+        return None
+    at = run[0] + int(deeper[0])
+    shoulder = float(line[max(0, at - SHOULDER_PX) : at].max())
+    local = (plastic + shoulder) / 2.0
+    k = at
+    while k > 1 and at - k < SHOULDER_PX and line[k - 1] < local:
+        k -= 1
+    before = float(line[k - 1])
+    span = before - float(line[k])
+    # Between the sample at or above the half level and the next one; a span that
+    # is not positive has no crossing to interpolate and is put on `k`.
+    where = (before - local) / span if span > 0.0 else 1.0
+    return (k - 1) + min(max(where, 0.0), 1.0)
+
+
 def find_wall(
     frame: npt.NDArray[Any], *, outward_xy: tuple[float, float], matrix: Matrix2
 ) -> WallEdge | None:
-    """A well's wall in one frame, the inside bright and the outside dark, looking along ``outward_xy``.
+    """A well's wall in one frame: the fall from the inside to the plastic, looking along ``outward_xy``.
 
     Brightfield, measured on the Ti2-E (§17.1): the inside of a well is
-    brighter than the plastic, with no parameter for the other polarity.
+    brighter than the plastic, with no parameter for the other polarity. The
+    wall is the fall into the plastic, a run below the frame's midpoint that
+    reaches the line's end or is at least ``MIN_PLASTIC_UM`` long, at the half
+    level of that fall. It is not the first fall below the midpoint: the
+    meniscus of a well (a shadow joined to the wall, a dark ridge) crosses the
+    midpoint 0.76 to 1.67 mm inside the plastic at the 4x, and the walk that
+    took it fitted B5 a circle of 13 055 µm for 15 600 (#409). ``threshold`` is
+    still the midpoint that splits the frame's two classes and the runs.
     ``None`` is a frame with no wall in it: one class only, a dark class that is
     not dark enough, or too few lines that start inside a well and fall to the
     plastic. Never a guess.
@@ -183,6 +276,7 @@ def find_wall(
         raise ValueError(f"a frame must be 2-D with pixels, got shape {image.shape}")
     height, width = image.shape
     v_col, v_row = _outward_pixels(outward_xy, matrix)
+    (m00, m01), (m10, m11) = matrix
 
     pixels = image.astype(np.float64)
     low, high = np.percentile(pixels, (2.0, 98.0))
@@ -222,31 +316,43 @@ def find_wall(
     if not forward:
         lines = lines[:, ::-1]
 
+    # The plastic's and the inside's levels are read from the band means, whose
+    # noise is lower than the pixels': the pixels' 2nd percentile fell below the
+    # plastic under noise of 600 counts.
+    plastic, inside = (float(v) for v in np.percentile(lines, (2.0, 98.0)))
+    if not (math.isfinite(plastic) and math.isfinite(inside) and inside > plastic):
+        return None
+    deep = plastic + WALL_LEVEL * (inside - plastic)
+    # The plastic's run is at least this many samples, from µm: a pixel count
+    # would be right on one frame shape and one pixel size only (FM-126). A step
+    # too small to count (an overflow, not a finite number) asks for a run that
+    # only one reaching the line's end can be.
+    step_um = math.hypot(m00, m10) if along_columns else math.hypot(m01, m11)
+    needed = MIN_PLASTIC_UM / step_um if step_um > 0.0 else math.inf
+    min_run = math.ceil(needed) if needed <= length else length + 1
+
     starts_inside = lines[:, :BAND_PX].mean(axis=1) >= threshold
-    falls = lines[:, 1:] < threshold
-    has_fall = falls.any(axis=1)
-    first = falls.argmax(axis=1) + 1
-    usable = np.nonzero(starts_inside & has_fall)[0]
-    if usable.size < MIN_LINE_FRACTION * n_lines:
+    below = lines < threshold
+    # The runs start after the first sample, as the first fall always did.
+    below[:, 0] = False
+    kept: list[int] = []
+    positions: list[float] = []
+    for index in np.nonzero(starts_inside)[0].tolist():
+        position = _wall_in_line(lines[index], below[index], deep, plastic, min_run)
+        if position is not None:
+            kept.append(index)
+            positions.append(position)
+    if len(kept) < MIN_LINE_FRACTION * n_lines:
         return None
 
-    at = first[usable]
-    before = lines[usable, at - 1]
-    after = lines[usable, at]
-    span = before - after
-    # Between the sample before the fall and the one below the threshold; a line
-    # whose very first sample is already dark has no span, and is put on `at`.
-    where = np.divide(
-        before - threshold, span, out=np.ones_like(span), where=span > 0.0
-    )
-    position = (at - 1) + np.clip(where, 0.0, 1.0)
+    along = np.asarray(positions, dtype=np.float64)
     if not forward:
-        position = (length - 1) - position
-    middle = usable * BAND_PX + (BAND_PX - 1) / 2.0
+        along = (length - 1) - along
+    middle = np.asarray(kept, dtype=np.float64) * BAND_PX + (BAND_PX - 1) / 2.0
     points = (
-        np.column_stack((position, middle))
+        np.column_stack((along, middle))
         if along_columns
-        else np.column_stack((middle, position))
+        else np.column_stack((middle, along))
     )
     return WallEdge(
         points_px=points.astype(np.float64),
