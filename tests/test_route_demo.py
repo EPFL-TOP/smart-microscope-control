@@ -1230,7 +1230,7 @@ def test_another_objective_adds_no_unlocked_line(
 
 FACTOR = 112.6  # the 40X's offset units per µm, as the profile holds it
 #: The distance of the frame of field ``i`` of every well from the lock's plane, in µm.
-DZ_OF_INDEX = {0: -3.0, 1: 2.7, 2: -2.95, 3: 1.35}
+DZ_OF_INDEX = {0: -3.0, 1: 2.7, 2: 1.35, 3: -2.95}
 #: ``round(dz * FACTOR)`` of each distance, by hand: 337.8, 304.02, 332.17 and 152.01.
 #: A stop's offset is its frame's lock plus it, in whole units.
 DZ_STEP = {-3.0: -338.0, 2.7: 304.0, -2.95: -332.0, 1.35: 152.0}
@@ -1378,9 +1378,12 @@ def test_a_cell_focused_frames_offset_names_the_cells_plane_in_the_stop(
         # The Z is the cells' plane's readback, and the route does not touch it (D7).
         assert p.z_um == frame.z_um
     # Several kinds of frame supply a stop (the seed's nearest frames never include
-    # field 2's), so the test sees a distance of each sign.
+    # field 2's), so the test sees a distance of each sign, and the one whose product
+    # rounds up (a lock of 2000 + 10 k less 332.17 is 1667.83 + 10 k: 1668 + 10 k, where
+    # truncating would say 1667 + 10 k), so that the rounding is seen at the stop.
     assert len(set(distances)) >= 3
     assert min(distances) < 0.0 < max(distances)
+    assert -2.95 in distances
     total = len(result.positions)
     assert result.assumed == (
         BASE_LINE,

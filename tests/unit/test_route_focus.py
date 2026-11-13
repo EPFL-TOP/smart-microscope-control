@@ -278,25 +278,27 @@ def test_without_limits_an_offset_beyond_them_is_kept() -> None:
 
 
 @pytest.mark.parametrize(
-    ("dz_um", "outcome"),
+    ("dz_um", "outcome", "offset"),
     [
-        (49.9, "derived"),
-        (-49.9, "derived"),
-        (MAX_RANGE_UM, "derived"),
-        (-MAX_RANGE_UM, "derived"),
-        (50.1, "implausible"),
-        (-50.1, "implausible"),
+        # 5388 + 49.9 x 10 = 5887; 5388 - 49.9 x 10 = 4889 (the bound is 50 µm).
+        (49.9, "derived", 5887.0),
+        (-49.9, "derived", 4889.0),
+        (MAX_RANGE_UM, "derived", 5888.0),
+        (-MAX_RANGE_UM, "derived", 4888.0),
+        (50.1, "implausible", None),
+        (-50.1, "implausible", None),
     ],
 )
 def test_a_distance_beyond_the_sweeps_largest_range_is_implausible(
-    dz_um: float, outcome: StopOutcome
+    dz_um: float, outcome: StopOutcome, offset: float | None
 ) -> None:
     # The scan never sweeps wider than 50 µm: a larger distance is a record
     # edited behind the runner (FM-111), not a plane to convert.
     got = _of(dz_um, lock=5388.0, factors={OBJ: 10.0})
     assert got.outcome == outcome
+    assert got.pfs_offset == offset
     if outcome == "derived":
-        assert got.pfs_offset == float(round(5388.0 + dz_um * 10.0))
+        assert got.derived is not None
     else:
         assert got.pfs_offset is None
         assert got.derived is None
@@ -324,6 +326,29 @@ def test_a_distance_is_judged_before_the_objective_is_looked_up() -> None:
     assert got.outcome == "implausible"
 
 
+@pytest.mark.parametrize(
+    ("focus", "pfs_offset"), [("unlocked", 4000.0), ("off", None), ("none", None)]
+)
+@pytest.mark.parametrize("bad", [60.0, -60.0, math.nan, math.inf])
+def test_a_frame_that_is_not_derived_is_recorded_whatever_its_distance(
+    focus: FocusState, pfs_offset: float | None, bad: float
+) -> None:
+    # §26.3's order: step 3 (nothing to convert) before step 4 (the distance). An
+    # unlocked, `off` or `none` frame is left as the scan recorded it, and a
+    # distance that would be refused on a locked frame is not looked at.
+    cell_focus = FieldFocus.model_construct(
+        source="well", sweep=None, dz_um=bad, frame_score=0.3, duration_s=0.25
+    )
+    got = stop_focus(
+        _frame(cell_focus, focus=focus, pfs_offset=pfs_offset),
+        objective=OBJ,
+        factors=FACTORS,
+        offset_limits=LIMITS,
+    )
+    assert (got.outcome, got.z_um, got.pfs_offset) == ("recorded", Z_UM, pfs_offset)
+    assert got.derived is None
+
+
 # --- the plane that was not found -----------------------------------------------------
 
 
@@ -337,6 +362,36 @@ def test_a_sweep_without_a_peak_is_flagged_and_left_as_recorded(outcome: str) ->
         _frame(focus), objective=OBJ, factors=FACTORS, offset_limits=LIMITS
     )
     assert (got.outcome, got.pfs_offset, got.z_um) == ("recorded", 5388.0, Z_UM)
+    assert got.no_peak is True
+
+
+@pytest.mark.parametrize(
+    ("dz_um", "objective", "factors", "outcome"),
+    [
+        (-3.0, OBJ, FACTORS, "derived"),
+        (60.0, OBJ, FACTORS, "implausible"),
+        (-3.0, None, FACTORS, "no-objective"),
+        (-3.0, "Nikon 10X S Fluor", FACTORS, "no-factor"),
+        (50.0, OBJ, {OBJ: 1e308}, "no-factor"),
+        (-3.0, OBJ, {OBJ: 1e9}, "outside-limits"),
+    ],
+)
+def test_a_sweep_without_a_peak_is_flagged_whatever_became_of_the_offset(
+    dz_um: float,
+    objective: str | None,
+    factors: dict[str, float],
+    outcome: StopOutcome,
+) -> None:
+    # §26.3 step 2 does not depend on the offset: a record whose sweep found
+    # nothing and that still has a distance (edited, or written by a scan that
+    # keeps one) is counted in the no-peak line besides being derived or refused.
+    got = stop_focus(
+        _frame(_focus(dz_um, source="swept", outcome="flat")),
+        objective=objective,
+        factors=factors,
+        offset_limits=LIMITS,
+    )
+    assert got.outcome == outcome
     assert got.no_peak is True
 
 
@@ -531,6 +586,9 @@ def test_the_derived_range_is_the_smallest_and_largest_distance() -> None:
 def test_the_factors_sign_and_the_limits_are_said_as_they_are() -> None:
     (line,) = _lines([_one("derived", factor=-112.6)])
     assert "; -112.6 offset units per µm for " in line
+    # `{:g}`: a whole-number factor has no ".0" (the design's `100`, not `100.0`).
+    (whole,) = _lines([_one("derived", factor=100.0)])
+    assert "; 100 offset units per µm for " in whole
     (limits,) = _lines([_one("outside-limits", refused=-0.4)], limits=(-5.5, 20000.0))
     assert "(-0 for the first)" in limits
     assert "[-5.5, 20000]" in limits
@@ -600,3 +658,42 @@ def test_the_lines_keep_their_words_before_the_objective_and_stay_short() -> Non
     for name in ("no-objective", "outside-limits", "implausible", "no-peak"):
         assert "\n" not in forms[name]
         assert len(forms[name]) <= 500
+
+
+def test_the_plate_pages_card_keeps_every_line_whole_before_a_long_label() -> None:
+    # FM-205: the longest form of each line goes through the card builder itself,
+    # not through a model of it, so a change of its bound or of its `_cut(_flat())`
+    # shows here. A 700-character label with a line break is the free text.
+    from datetime import datetime, timezone
+
+    from smc.run import StageRecord, StageStatus
+    from smc.ui.controller import _card
+
+    label = "A\nB" + "x" * 697
+    forms = _longest_forms(label)
+    then = datetime(2026, 11, 13, 9, 30, tzinfo=timezone.utc)
+    record = StageRecord(
+        plugin="route",
+        provides="route",
+        attempt="a1",
+        status=StageStatus.done,
+        started_utc=then,
+        finished_utc=then,
+        profile="demo",
+        dry_run=False,
+        smc_version="0",
+        params={},
+        result={"assumed": list(forms.values())},
+    )
+
+    shown = _card(record).assumed
+
+    assert len(shown) == len(forms)  # the card keeps eight lines at most
+    for line, kept in zip(forms.values(), shown, strict=True):
+        assert "\n" not in kept
+        fixed = line[: line.index(label)] if label in line else line
+        # Everything the line says before the label is there, and for a line with
+        # no label, the whole line: no "…" where a word was.
+        assert kept.startswith(fixed)
+        if label not in line:
+            assert kept == line
