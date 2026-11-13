@@ -5468,9 +5468,10 @@ def map_frame(
 
 **`smc/ui/controller.py`**:
 
-- `GotoAnswer` (new, frozen dataclass): `well: str`, `phase: Literal["going", "at",
-  "refused", "failed"]`, `estimated: bool`, `text: str` (the refusal's or failure's one
-  line). `PageStatus` gains `goto_answer: GotoAnswer | None = None` (last field);
+- `GotoAnswer` (new, frozen dataclass, defined in `guide.py` because the pure
+  `goto_row_text` takes it, and imported here): `well: str`, `phase: Literal["going",
+  "at", "refused", "failed"]`, `estimated: bool`, `text: str` (the refusal's or
+  failure's one line). `PageStatus` gains `goto_answer: GotoAnswer | None = None` (last field);
   `goto: str` stays for the drive bar's line. `goto()` sets `_goto_answer` with `_goto`.
   A click refused because an activity runs (`_refuse_if_busy`) **leaves `_goto` and
   `_goto_answer` as they were** and raises (the view's `_try` says it): the running
