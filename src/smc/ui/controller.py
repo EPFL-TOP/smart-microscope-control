@@ -127,6 +127,7 @@ from smc.ui.guide import (
     PLATE_NOT_CHOSEN,
     RUN_ALL_LABEL,
     SCAN_CHECKPOINT_KEPT,
+    SCAN_HALTED,
     SELECT_WELLS,
     SELECTION_KEPT_ITS_NAMES,
     WALLS_DRY_RUN,
@@ -2515,6 +2516,11 @@ class PlatePage:
         """
         if self._microscope is None:
             return f"{plugin}: {NOT_CONNECTED}"
+        if (resume or afresh) and self._halted():
+            # The run would fail at its first move: a resume's record keeps its checkpoint,
+            # but a run afresh has already written over it by then (m5 §17.12 D17). The
+            # buttons wait for *Resume*; a click that arrives anyway is refused here (FM-169).
+            return f"{tool_title(plugin)}: {SCAN_HALTED}"
         if _needs_plate(plugin) and not self._plate_chosen:
             # The controller's own refusal (FM-169): a click on a disabled button
             # still arrives here, and so does a call that spells `plate=` itself. The
@@ -2571,6 +2577,11 @@ class PlatePage:
         if kept is not None and not (resume or afresh):
             return f"{plugin}: {_checkpoint_reason(plugin, kept)}"
         return _Prepared(entry, parsed)
+
+    def _halted(self) -> bool:
+        """Whether the stand is halted now (a STOP not yet cleared by ``resume()``), read inside a read a Disconnect waits for."""
+        with self._reading() as microscope:
+            return microscope is not None and microscope.state().halted
 
     def _registration_objective_refusal(self, params: Sequence[str]) -> str | None:
         """Why the registration of the page's own captures is refused for their objectives, or ``None`` (m5 §17.12 D13).

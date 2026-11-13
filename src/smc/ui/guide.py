@@ -1600,8 +1600,8 @@ _ERROR_TYPE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Interrupt)
 
 
 def _without_type(text: str) -> str:
-    """``text`` without a leading exception type name, on one line."""
-    flat = _flat(text).strip()
+    """``text`` without a leading exception type name, on one line with its runs of blanks as one space."""
+    flat = " ".join(text.split())
     return _ERROR_TYPE.sub("", flat, count=1) or flat
 
 

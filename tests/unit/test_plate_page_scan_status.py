@@ -984,3 +984,30 @@ def test_a_scan_with_no_record_or_a_done_record_has_no_scan_end(
     scan_page.run("scan", [])
     assert scan_page.join(BOUND_S)
     assert scan_page.view().scan_end is None
+
+
+@pytest.mark.parametrize("how", ["resume", "afresh"])
+def test_continue_or_start_again_on_a_halted_stand_is_refused_and_keeps_the_checkpoint(
+    scan_page: PlatePage, run_doc: Path, how: str
+) -> None:
+    # A run afresh on a halted stand writes its record over the checkpoint before its first
+    # move fails: the buttons wait for Resume, and a click that arrives anyway (FM-169) is
+    # refused before anything is written.
+    scan_page.run("scan", [])
+    assert CheckpointScan.paused.wait(BOUND_S)
+    scan_page.stop()
+    CheckpointScan.release.set()
+    assert scan_page.join(BOUND_S)
+    assert scan_page.status().halted
+    before = run_doc.read_bytes()
+    scan_page.run("scan", [], **{how: True})
+    assert scan_page.status().outcome == (
+        "Scan: Press Resume (top right) first: the stand is halted."
+    )
+    assert run_doc.read_bytes() == before
+    assert CheckpointScan.resumed == [None]
+    # After Resume the same call runs.
+    scan_page.resume()
+    scan_page.run("scan", [], **{how: True})
+    assert scan_page.join(BOUND_S)
+    assert CheckpointScan.resumed == [None, 1 if how == "resume" else None]
