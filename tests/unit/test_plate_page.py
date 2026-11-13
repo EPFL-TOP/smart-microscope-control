@@ -1943,17 +1943,17 @@ def test_the_run_button_of_a_stopped_stage_is_disabled_with_the_resume_command(
         # not only after a Refresh.
         view.tick()
         assert view.tool_runs["scan"].disabled
+        # The scan's words are the Scan screen's, which continues it (m5 §17.12 D17).
         assert view.tool_notes["scan"].object == (
-            "stopped with a checkpoint: continue it with `smc run scan --resume` "
-            "(close this page first); `smc run scan` without --resume starts afresh "
-            "and drops it"
+            "stopped with a checkpoint: Continue the scan, on the Scan screen, takes it "
+            "up; Start again there drops it"
         )
         # A click that gets through anyway (a stale tab) is refused by the controller
         # and the record is what the stop left.
         stopped = run_doc.read_bytes()
         view.on_run("scan")
         assert view.run_text.object.startswith(
-            "scan: stopped with a checkpoint: continue it with `smc run scan --resume`"
+            "scan: stopped with a checkpoint: Continue the scan, on the Scan screen"
         )
         assert run_doc.read_bytes() == stopped
     finally:

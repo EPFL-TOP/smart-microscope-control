@@ -799,7 +799,16 @@ def test_run_refuses_an_unreadable_run_document_and_leaves_it_alone(
 
 
 def _checkpoint_text(name: str, status: str) -> str:
-    """What the page says of a stage it will not start afresh (m3 §15.3), written out."""
+    """What the page says of a stage it will not start afresh (m3 §15.3), written out.
+
+    The scan's words are the Scan screen's, which continues it (m5 §17.12 D17, #470); every
+    other stage names ``smc run --resume`` and that the page must be closed first.
+    """
+    if name == "scan":
+        return (
+            f"{status} with a checkpoint: Continue the scan, on the Scan screen, takes it "
+            f"up; Start again there drops it"
+        )
     return (
         f"{status} with a checkpoint: continue it with `smc run {name} --resume` "
         f"(close this page first); `smc run {name}` without --resume starts afresh "

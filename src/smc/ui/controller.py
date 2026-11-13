@@ -123,8 +123,10 @@ from smc.ui.guide import (
     GOTO_WALL_NEEDS_REGISTRATION,
     MAP_FIELDS_UP_TO,
     NO_CALIBRATION_FOR_SIDES,
+    NOT_CONNECTED,
     PLATE_NOT_CHOSEN,
     RUN_ALL_LABEL,
+    SCAN_CHECKPOINT_KEPT,
     SELECT_WELLS,
     SELECTION_KEPT_ITS_NAMES,
     WALLS_DRY_RUN,
@@ -172,6 +174,7 @@ __all__ = [
     "ResultCard",
     "RouteStop",
     "RunClock",
+    "ScanEnd",
     "ScanSummary",
     "ToolView",
     "WellView",
@@ -297,9 +300,6 @@ LIVE_PERIOD_S = 0.1
 #: as "stopped" (FM-117).
 _STOP_ACCEPTED = "stopped: the stand is halted (Resume clears the halt)"
 
-#: Why everything that needs the stand is refused while the page holds none (m5 §7.2):
-#: the one reason a disabled control gives, and the first one.
-NOT_CONNECTED = "the stand is not connected"
 
 #: Wells built for a plate are kept (339 ms for 1536 of them); a registration
 #: changes the key rarely, so a handful is plenty.
@@ -468,6 +468,26 @@ class ScanSummary:
     dry_run: bool
 
 
+@dataclass(frozen=True, slots=True)
+class ScanEnd:
+    """How the latest ``scan`` ended when it did not end ``done``, for the Scan screen (m5 §17.12 D17, §17.12.4).
+
+    ``kind`` is ``stopped`` when the record is ``stopped``, or when STOP was pressed during
+    that scan on this page: a STOP that lands in a move ends the record ``failed`` (FM-64), and
+    the words follow what the operator did. ``done`` and ``total`` are the last progress this
+    page kept of that scan, ``None`` when it kept none (the page was opened after it, or another
+    run of ``scan`` started since). ``text`` is the record's ``error`` as written (``<Type>:
+    <message>``; the guide says the message). ``resumable`` is whether ``reachable_checkpoint``
+    finds the record's checkpoint: *Continue the scan* is offered only then.
+    """
+
+    kind: Literal["stopped", "failed"]
+    done: int | None
+    total: int | None
+    text: str
+    resumable: bool
+
+
 #: How the map's plate was placed (m5 §15 D3): *registered* by a tool that measured it,
 #: *seed* by one well the operator gave, *estimated* from the stand's holder, or
 #: *unplaced* when the stand says nothing and A1 is drawn at the stage's origin.
@@ -554,7 +574,10 @@ class PlateView:
     it would not, and while no centre is captured. ``frame_wells`` are the wells of the latest
     scan plan the run document holds, **usable or not**: the map frames them on the Wells, Scan
     and Results screens (m5 §17.12 D16), and an out-of-date plan is still the wells the
-    operator laid out. ``()`` when there is none or it does not validate.
+    operator laid out. ``()`` when there is none or it does not validate. ``scan_end`` is how
+    the latest ``scan`` record ended when it is ``stopped`` or ``failed`` (m5 §17.12 D17):
+    the Scan screen says it and, with a reachable checkpoint, offers *Continue the scan* and
+    *Start again*; ``None`` for no record, one that goes or one that ended ``done``.
     """
 
     plate: str
@@ -579,6 +602,7 @@ class PlateView:
     scanned: ScanSummary | None = None
     register_refusal: str | None = None
     frame_wells: tuple[str, ...] = ()
+    scan_end: ScanEnd | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -932,12 +956,17 @@ def _chain_outcome(
 def _checkpoint_reason(name: str, status: StageStatus) -> str:
     """Why the page will not start ``name`` afresh, and the command that continues it (m3 §15.3).
 
-    The page has no Resume (``smc run --resume`` is the way in M3), so a stage the
-    operator stopped, or that failed, with a checkpoint would be lost by one click
-    on Run. No path is named: the run document is the one this page was started
-    with, and the command needs ``--run-doc`` whatever the text says. ``smc run``
-    without ``--resume`` is the deliberate way to give the checkpoint up.
+    A stage the operator stopped, or that failed, with a checkpoint would be lost by one
+    click on Run. The page resumes only ``scan`` (*Continue the scan* on the Scan screen, m5
+    §17.12 D17), and says so for it; every other stage names ``smc run --resume``. No path is
+    named: the run document is the one this page was started with, and the command needs
+    ``--run-doc`` whatever the text says. ``smc run`` without ``--resume`` is the deliberate
+    way to give the checkpoint up.
     """
+    if name == "scan":
+        # The Scan screen continues it, or starts again on a second click (m5 §17.12 D17):
+        # ``close this page first`` is no longer the way for the scan.
+        return SCAN_CHECKPOINT_KEPT.format(status=status.value)
     return (
         f"{status.value} with a checkpoint: continue it with `smc run {name} "
         f"--resume` (close this page first); `smc run {name}` without --resume "
@@ -1477,6 +1506,17 @@ class PlatePage:
         self._clock_end: float | None = None
         self._first_report: tuple[float, int] | None = None
         self._last_report: tuple[float, int] | None = None
+        # The latest report of each plugin's latest activity, under ``_lock``, written where
+        # the worker reports: unlike ``_progress`` it outlives the next activity of another
+        # tool, so that the Scan screen still says how far a stopped scan got after a snap
+        # (m5 §17.12 D17). An activity of the same name drops its plugin's entry at its start.
+        self._reported: dict[str, Progress] = {}
+        # The plugins whose latest activity STOP was pressed in, under ``_lock`` (m5 §17.12
+        # D17): a STOP that lands in a move ends the record ``failed`` (FM-64), and the Scan
+        # screen says a stop all the same. Added by ``_work`` when the activity ends with its
+        # event set (``stop()`` sets it and takes no lock, FM-70); the next activity of that
+        # name removes it, so a later run says its own end.
+        self._stopped_activity: set[str] = set()
         # The latest chain (m5 §17.11.2), under ``_lock``: replaced whole at each tool's
         # start and end, never edited, and cleared when another activity starts.
         self._chain: ChainStatus | None = None
@@ -2391,7 +2431,14 @@ class PlatePage:
 
     # --- runs, stop, status ---------------------------------------------------------
 
-    def run(self, plugin: str, params: Sequence[str]) -> None:
+    def run(
+        self,
+        plugin: str,
+        params: Sequence[str],
+        *,
+        resume: bool = False,
+        afresh: bool = False,
+    ) -> None:
         """Run ``plugin`` with ``key=value`` strings, as ``smc run`` would, in one worker thread.
 
         What ``smc run`` checks before it opens the stand is checked here before a
@@ -2408,16 +2455,30 @@ class PlatePage:
         with a checkpoint: continue it with ...``, and nothing is written. It is
         not an exception, and ``view().blocked`` says the same beforehand.
 
+        ``resume`` continues the stage's checkpoint, as ``smc run --resume`` does: the
+        runner's own checks (``check_ready(..., resume=True)``: the parameters, the profile,
+        a dry run's checkpoint, a stale record) refuse it, said as the outcome, and the page
+        adds none of its own (m5 §17.12 D17). ``afresh`` is the one deliberate way a click
+        gives a checkpoint up: it skips the checkpoint refusal for this call, and only this
+        one. The Scan screen's *Start again* passes it on its second click, and nothing else
+        in the page does (FM-172).
+
         Raises:
+            ValueError: ``resume`` and ``afresh`` together, before anything is read or
+                started.
             RuntimeError: A run is going (``<plugin> is running``), or the page is
                 closed.
         """
+        if resume and afresh:
+            raise ValueError(
+                f"{plugin}: continue the checkpoint or start afresh, not both"
+            )
         self._refuse_if_busy()
         # Read at the click, not when the worker starts: the preset the operator
         # saw loaded is the one the record names (m5 §10.5).
         loaded = self.preset
         preset = None if loaded is None else loaded.file.name
-        prepared = self._prepare(plugin, params)
+        prepared = self._prepare(plugin, params, resume=resume, afresh=afresh)
         if isinstance(prepared, str):
             self._set_outcome(prepared)
             return
@@ -2425,11 +2486,20 @@ class PlatePage:
         self._start_activity(
             plugin,
             lambda event: (
-                self._run_plugin(plugin, entry, parsed, event, preset).outcome
+                self._run_plugin(
+                    plugin, entry, parsed, event, preset, resume=resume
+                ).outcome
             ),
         )
 
-    def _prepare(self, plugin: str, params: Sequence[str]) -> _Prepared | str:
+    def _prepare(
+        self,
+        plugin: str,
+        params: Sequence[str],
+        *,
+        resume: bool = False,
+        afresh: bool = False,
+    ) -> _Prepared | str:
         """What ``smc run`` checks before it opens the stand, for one tool: the plugin and its parameters, or the outcome that refuses it.
 
         A ``str`` is the outcome ``run`` sets for that refusal (``<plugin>: <why>``),
@@ -2438,6 +2508,10 @@ class PlatePage:
         the stand, the plate's gate, ``plate-walls``' refusal, the plugin and its
         parameters, ``check_ready`` and last a checkpoint. Never raises for a plugin's
         or a document's fault (FM-98, FM-113): text, so that no traceback is kept.
+
+        ``resume`` asks ``check_ready`` the resume's own questions (its ``ResumeError`` is the
+        outcome) and, since the checkpoint is what it continues, no checkpoint refusal;
+        ``afresh`` skips the checkpoint refusal alone (``run``). A chain passes neither.
         """
         if self._microscope is None:
             return f"{plugin}: {NOT_CONNECTED}"
@@ -2483,7 +2557,7 @@ class PlatePage:
                 parsed,
                 profile=profile,
                 dry_run=dry_run,
-                resume=False,
+                resume=resume,
             )
             # After `check_ready`, so that a stage that reads what is not usable says
             # that first, as `view().blocked` does. The stand's capabilities are the
@@ -2494,7 +2568,7 @@ class PlatePage:
         except (PluginError, RunDocumentError) as exc:
             # Text, never the error (FM-98).
             return f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
-        if kept is not None:
+        if kept is not None and not (resume or afresh):
             return f"{plugin}: {_checkpoint_reason(plugin, kept)}"
         return _Prepared(entry, parsed)
 
@@ -2693,6 +2767,8 @@ class PlatePage:
         with self._lock:
             self._current_run = (tool, event)
             self._progress = None
+            self._reported.pop(tool, None)
+            self._stopped_activity.discard(tool)
             self._first_report = self._last_report = None
             while True:
                 try:
@@ -2729,6 +2805,8 @@ class PlatePage:
                 raise RuntimeError(f"{self._current_run[0]} is running")
             self._current_run = (name, event)
             self._progress = None
+            self._reported.pop(name, None)
+            self._stopped_activity.discard(name)
             self._clock_of = name
             self._clock_start = time.monotonic()
             self._clock_end = None
@@ -2766,6 +2844,10 @@ class PlatePage:
             outcome = body(event)
         finally:
             with self._lock:
+                if event.is_set() and self._current_run is not None:
+                    # The tool going when it ended (a chain's, not its first's): STOP landed
+                    # in it, whatever its record says (FM-64, m5 §17.12 D17).
+                    self._stopped_activity.add(self._current_run[0])
                 self._outcome = outcome
                 self._clock_end = time.monotonic()
                 if name == "goto-well":
@@ -2821,6 +2903,7 @@ class PlatePage:
                 if self._first_report is None:
                     self._first_report = stamped
                 self._last_report = stamped
+            self._reported[progress.plugin] = progress
         self._queue.put(progress)
 
     def _run_plugin(
@@ -2830,6 +2913,8 @@ class PlatePage:
         parsed: PluginParams,
         event: threading.Event,
         preset: str | None = None,
+        *,
+        resume: bool = False,
     ) -> _Ended:
         """A plugin's run on the worker: its outcome as text, and whether it ended done, stopped or failed.
 
@@ -2844,7 +2929,7 @@ class PlatePage:
         and ``_goto_answer``): ``... not registered`` was true of the plate before it, and a
         drive's text never outlives the plate it was measured on.
         """
-        ended = self._run_plugin_once(plugin, entry, parsed, event, preset)
+        ended = self._run_plugin_once(plugin, entry, parsed, event, preset, resume)
         self._last_ended = ended
         if entry.plugin.provides == "plate":
             with self._lock:
@@ -2859,9 +2944,12 @@ class PlatePage:
         parsed: PluginParams,
         event: threading.Event,
         preset: str | None,
+        resume: bool = False,
     ) -> _Ended:
         """``_run_plugin`` without what it does after the run: the run and its outcome."""
-        log.info("%s: started from the plate page", plugin)
+        log.info(
+            "%s: %s from the plate page", plugin, "resumed" if resume else "started"
+        )
         title = tool_title(plugin)
         started = time.monotonic()
         # The orientation the page names the captures for, read before a rename runs:
@@ -2878,6 +2966,7 @@ class PlatePage:
                 self._stand(),
                 parsed,
                 self._run_doc,
+                resume=resume,
                 on_progress=self._on_progress,
                 stop=event,
                 plugin_version=entry.version,
@@ -4271,7 +4360,7 @@ class PlatePage:
             blocked=blocked,
             problems=(*problems, *self._plugin_problems(), *self._suggest_problems),
             cards=cards,
-            next_step=self._next_step(checklist, blocked, cards),
+            next_step=self._next_step(checklist, blocked, cards, doc),
             replaces=self._replace_notes(doc),
             camera_matrix=None if calibration is None else calibration.matrix_um_per_px,
             plan=plan,
@@ -4300,6 +4389,41 @@ class PlatePage:
             ),
             register_refusal=self._register_refusal(),
             frame_wells=self._frame_wells(doc),
+            scan_end=self._scan_end(doc),
+        )
+
+    def _scan_end(self, doc: RunDocument) -> ScanEnd | None:
+        """How the latest ``scan`` record ended, when it is ``stopped`` or ``failed`` (m5 §17.12 D17).
+
+        The record says the status and the error; this page says whether STOP was pressed in
+        that scan (``_stopped_activity``: a STOP in a move is a ``failed`` record, FM-64) and
+        how far it got (the last report it kept of it, ``_reported``). Both are read in one
+        section under ``_lock`` (FM-151). Whether the checkpoint can be continued is
+        ``reachable_checkpoint``'s, the test the runner's resume passes from the document.
+        """
+        record = doc.stages.get("scan")
+        if record is None or record.status not in (
+            StageStatus.stopped,
+            StageStatus.failed,
+        ):
+            return None
+        with self._lock:
+            reported = self._reported.get("scan")
+            stopped_here = "scan" in self._stopped_activity
+        kind: Literal["stopped", "failed"] = (
+            "stopped"
+            if record.status is StageStatus.stopped or stopped_here
+            else "failed"
+        )
+        kept = reachable_checkpoint(
+            "scan", doc, profile=self._profile.microscope.name, dry_run=self._dry_run
+        )
+        return ScanEnd(
+            kind=kind,
+            done=None if reported is None or reported.total is None else reported.done,
+            total=None if reported is None else reported.total,
+            text=record.error or "",
+            resumable=kept is not None,
         )
 
     @staticmethod
@@ -4506,18 +4630,26 @@ class PlatePage:
                 found[name] = _Suggestion(tuple(pairs), entry.why)
         return found, tuple(problems)
 
-    def command_for(self, plugin: str, params: Sequence[str]) -> str:
+    def command_for(
+        self, plugin: str, params: Sequence[str], *, resume: bool = False
+    ) -> str:
         """The ``smc run`` command that makes the call of ``plugin`` with ``params`` on this page (ADR-0006, principle 5).
 
         What a screen's *Command* disclosure shows under its button: the same line the
         next step builds, with the profile's file when there is one (a name otherwise),
         this page's run document, its dry run and the loaded preset. One builder, so
-        that a button's command and the next step's cannot say two things.
+        that a button's command and the next step's cannot say two things. ``resume``
+        names ``--resume``: the command of *Continue the scan* (m5 §17.12 D17).
         """
-        return self._command(plugin, params, self.preset)
+        return self._command(plugin, params, self.preset, resume=resume)
 
     def _command(
-        self, plugin: str, params: Sequence[str], loaded: LoadedPreset | None
+        self,
+        plugin: str,
+        params: Sequence[str],
+        loaded: LoadedPreset | None,
+        *,
+        resume: bool = False,
     ) -> str:
         """``command_for`` for the preset the caller already read: a step's pairs and its command name one preset (FM-151)."""
         source = self._profile.source
@@ -4528,6 +4660,7 @@ class PlatePage:
             run_doc=self.run_doc,
             dry_run=self._dry_run,
             preset=None if loaded is None else str(loaded.file.path),
+            resume=resume,
         )
 
     def _next_step(
@@ -4535,12 +4668,15 @@ class PlatePage:
         checklist: Sequence[CheckItem],
         blocked: dict[str, str],
         cards: dict[str, ResultCard],
+        doc: RunDocument,
     ) -> NextStep:
         """The tool the run document needs next, with the values to run it and why each (m5 §8.3).
 
         Computed from this ``view()``'s read, never by the tick. The pairs are the
         call the page's button makes and the command names, so what the operator
-        reads is what runs. The step never reads the tool's form.
+        reads is what runs. The step never reads the tool's form. A tool whose stopped
+        or failed record holds a checkpoint ``--resume`` can reach names ``smc run <tool>
+        --resume``: the same command without it drops the checkpoint (m5 §17.12 D17).
         """
         item = next_slot(checklist)
         if item is None:
@@ -4639,7 +4775,13 @@ class PlatePage:
             pairs += named
             why.append(f"{' '.join(named)}: from the preset {loaded.file.name}")
         why += [f"or {other.name}: {_flat(other.summary)}" for other in others]
-        command = self._command(tool.name, pairs, loaded)
+        kept = reachable_checkpoint(
+            tool.name,
+            doc,
+            profile=self._profile.microscope.name,
+            dry_run=self._dry_run,
+        )
+        command = self._command(tool.name, pairs, loaded, resume=kept is not None)
         # What the run document or the stand says first wins: it is the reason that holds.
         return NextStep(
             plugin=tool.name,

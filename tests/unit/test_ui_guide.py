@@ -16,7 +16,7 @@ import time
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PureWindowsPath
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 import pytest
 from hypothesis import given
@@ -43,6 +43,7 @@ from smc.ui.controller import (
     PlanLayer,
     ResultCard,
     RunClock,
+    ScanEnd,
     ScanSummary,
     WellView,
 )
@@ -66,6 +67,7 @@ from smc.ui.guide import (
     MAP_FIELDS_UP_TO,
     NO_CALIBRATION_FOR_SIDES,
     NO_FILES_YET,
+    NOT_CONNECTED,
     NOTHING_LEFT,
     ORIENTATION_IN_STAGE_TERMS,
     OTHER_WAYS_TO_REGISTER,
@@ -81,7 +83,12 @@ from smc.ui.guide import (
     RESULT_TOOLS,
     RUN_ALL_LABEL,
     SAMPLE_REGISTERS,
+    SCAN_CONTINUE,
     SCAN_FIRST,
+    SCAN_HALTED,
+    SCAN_REPLACES,
+    SCAN_START_AGAIN,
+    SCAN_START_AGAIN_CONFIRM,
     SCREEN_LEADS,
     SCREEN_TITLES,
     SELECT_WELLS,
@@ -145,6 +152,9 @@ from smc.ui.guide import (
     result_row,
     results_left,
     run_all_wait,
+    scan_actions_wait,
+    scan_again_confirm,
+    scan_end_lines,
     scan_lead,
     scan_plan_card_lines,
     scan_progress_lines,
@@ -3213,3 +3223,116 @@ def test_a_results_row_says_when_it_was_done_in_local_time() -> None:
         card=_result_card(when_local="2026-11-12 10:30", dry_run=True),
     )
     assert dry.state == "Done 2026-11-12 10:30 (dry run)"
+
+
+# --- part B: the Scan screen after a STOP or a failure (m5 §17.12 D17, D18, #470) ------------
+
+
+def test_part_bs_texts_are_the_design_docs() -> None:
+    # Copied from §17.12.5: a change of words is a change of the design.
+    assert SCAN_CONTINUE == "Continue the scan"
+    assert SCAN_START_AGAIN == "Start again"
+    assert SCAN_START_AGAIN_CONFIRM.format(done=36) == (
+        "Start again drops the 36 fields already taken: press again to drop them."
+    )
+    assert SCAN_HALTED == "Press Resume (top right) first: the stand is halted."
+    assert SCAN_REPLACES.format(frames=72) == (
+        "Starting the scan again replaces this one (72 frames)."
+    )
+
+
+def _end(
+    kind: Literal["stopped", "failed"] = "stopped",
+    done: int | None = 45,
+    total: int | None = 72,
+    text: str = "",
+) -> ScanEnd:
+    return ScanEnd(kind=kind, done=done, total=total, text=text, resumable=True)
+
+
+def test_a_stopped_scan_says_where_it_stopped() -> None:
+    assert scan_end_lines(_end()) == ("Stopped by STOP at field 45 of 72.",)
+
+
+def test_a_failed_scan_says_where_and_the_errors_line_without_its_type() -> None:
+    end = _end(
+        "failed",
+        text="PluginRunError: scan: the camera timed out after   5 s\nretry",
+    )
+    assert scan_end_lines(end) == (
+        "Failed at field 45 of 72: scan: the camera timed out after 5 s retry",
+    )
+    # A message that begins like a name but is no exception type keeps its words.
+    plain = _end("failed", text="`xy_stage XY`: the move was stopped")
+    assert scan_end_lines(plain) == (
+        "Failed at field 45 of 72: `xy_stage XY`: the move was stopped",
+    )
+
+
+@pytest.mark.parametrize(
+    ("done", "total"), [(None, None), (None, 72), (45, None)], ids=str
+)
+def test_a_scan_end_with_no_count_never_says_none(
+    done: int | None, total: int | None
+) -> None:
+    # A page opened after the stop kept no progress: no `field None of None`.
+    stopped = scan_end_lines(_end("stopped", done, total))
+    failed = scan_end_lines(_end("failed", done, total, "RuntimeError: dark"))
+    assert stopped == ("Stopped by STOP.",)
+    assert failed == ("Failed: dark",)
+    assert not any("None" in line for line in (*stopped, *failed))
+
+
+def test_a_failure_with_no_recorded_error_says_so() -> None:
+    assert scan_end_lines(_end("failed", text="")) == (
+        "Failed at field 45 of 72: no reason was recorded",
+    )
+
+
+def test_the_first_click_on_start_again_says_what_the_second_drops() -> None:
+    assert scan_again_confirm(36) == SCAN_START_AGAIN_CONFIRM.format(done=36)
+    assert scan_again_confirm(None) == (
+        "Start again drops the fields already taken: press again to drop them."
+    )
+
+
+def test_the_scan_actions_wait_for_the_stand_then_the_halt_then_a_run() -> None:
+    wait = scan_actions_wait
+    assert wait(connected=False, halted=True, running="scan") == NOT_CONNECTED
+    assert wait(connected=True, halted=True, running="scan") == SCAN_HALTED
+    assert wait(connected=True, halted=False, running="snap") == busy_note(
+        "snap", live=False
+    )
+    assert wait(connected=True, halted=False, running="live") == busy_note(
+        "live", live=True
+    )
+    assert wait(connected=True, halted=False, running=None) is None
+
+
+def test_a_resume_command_names_resume_once_and_the_same_words_otherwise() -> None:
+    common: dict[str, Any] = {
+        "profile": "demo-sample",
+        "run_doc": Path("run.json"),
+        "dry_run": False,
+    }
+    plain = shlex.split(command_line("scan", ["autofocus=off"], **common))
+    resumed = shlex.split(
+        command_line("scan", ["autofocus=off"], **common, resume=True)
+    )
+    assert "--resume" not in plain
+    assert resumed.count("--resume") == 1
+    assert [word for word in resumed if word != "--resume"] == plain
+
+
+def test_the_chain_line_names_a_tool_outside_results_by_its_plain_title() -> None:
+    going = ChainStatus(("timing", "scan-plan"), (), "timing")
+    assert chain_line(going) == "Running Timing (1 of 2)."
+    done = ChainStatus(
+        ("timing", "scan-plan"),
+        (
+            ChainEnd("timing", "done", "Timing done in 3.0 s"),
+            ChainEnd("scan-plan", "done", "Field layout done in 0.1 s"),
+        ),
+        None,
+    )
+    assert chain_line(done) == "Done: Timing, Field layout."
