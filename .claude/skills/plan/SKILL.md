@@ -126,6 +126,12 @@ the plan, do what it unlocks (labels, dependents), and end the session.
   editing its comment in place
   (`gh api -X PATCH repos/{owner}/{repo}/issues/comments/<id> -F body=@plan.md`),
   or post a complete revised `## Plan`.
+- **A design PR's body closes nothing, in any wording.** Before `gh pr
+  create`, read the body for *close*, *fix* or *resolve* (any ending) within
+  a few words of a `#N`: "the build closes #447" in #460's body closed #447
+  at the merge, although the line began with `Refs`. Write "the build's PR
+  ends #447's work" or name the issue without the verb. If `gh pr checks`
+  shows *closing references* red, fix the body before you report.
 - **A plan that opened a design PR names it on its Ready line**:
   `**Ready for /develop**: blocked by #<pr>`, until that PR is merged (a
   design PR is not a dependency of the issue, so **Depends on** may say

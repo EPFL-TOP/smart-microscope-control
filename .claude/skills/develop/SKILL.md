@@ -53,15 +53,20 @@ them if it is not the one you run on.
    - If `EnterWorktree` says you are already in a worktree, check
      `git worktree list` and continue only if it is this issue's.
    - **SSH**: an agent shell may have no SSH key loaded, so `fetch` and
-     `push` against the `git@github.com:` remote fail while `gh` works. Run
-     the git command as
-     `git -c url."https://github.com/".insteadOf="git@github.com:" <command>`.
-     Never change the remote.
+     `push` against the `git@github.com:` remote fail while `gh` works.
+     Write the https URL out: `git fetch
+     https://github.com/<owner>/<repo>.git main` then `git merge --ff-only
+     FETCH_HEAD`, and `git push https://github.com/<owner>/<repo>.git
+     HEAD:<branch>`. A worktree session refuses the older `git -c
+     url…insteadOf` form (eight Reports, #408 to #462). Never change the
+     remote.
 
    Never use the main checkout's `.venv` from a worktree: it is an editable
    install of the main checkout's code. From now on call the worktree's
    tools (`.venv/bin/ruff`, `.venv/bin/mypy`, `.venv/bin/pytest`; Windows
-   `.venv\Scripts\…`) and commit with `PATH=".venv/bin:$PATH" git commit …`.
+   `.venv\Scripts\…`) and commit with a plain `git commit …`: the hooks find
+   their own ruff, and a worktree session refuses an inline `PATH=…` before
+   `git commit` (the same eight Reports).
 
    **Shell in the worktree.** Its sandbox refuses compound commands:
    heredocs, `$(...)`, pipes into an interpreter, long `--jq` filters. Keep
