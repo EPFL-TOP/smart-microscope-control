@@ -148,6 +148,8 @@ __all__ = [
     "NOT_CONNECTED",
     "PAGE_PARAMS",
     "STAGES",
+    "ChainEnd",
+    "ChainStatus",
     "CheckItem",
     "LoadedPreset",
     "PageServerError",
@@ -735,6 +737,35 @@ class RunClock:
 
 
 @dataclass(frozen=True, slots=True)
+class ChainEnd:
+    """How one tool of a chain ended (m5 §17.11.2).
+
+    ``how`` is ``done`` (its record ended ``done``), ``failed`` (the run raised: its record
+    is ``failed``), ``stopped`` (its record is ``stopped``) or ``refused`` (the checks of
+    ``run`` said no, and nothing was written). ``outcome`` is the text a single run of that
+    tool would have left.
+    """
+
+    plugin: str
+    how: Literal["done", "failed", "stopped", "refused"]
+    outcome: str
+
+
+@dataclass(frozen=True, slots=True)
+class ChainStatus:
+    """The chain *Run all that are left* runs, as every session sees it (m5 §17.11.2).
+
+    ``plugins`` are the tools it runs, in order; ``ended`` is how each of the first ones
+    ended; ``current`` is the tool going, or the one about to start between two, and
+    ``None`` once the chain ended.
+    """
+
+    plugins: tuple[str, ...]
+    ended: tuple[ChainEnd, ...]
+    current: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class PageStatus:
     """The stand and the run, read now.
 
@@ -747,7 +778,9 @@ class PageStatus:
     it (m3 §5.5 D7): a refusal, what it is going to, then the ``goto-well`` run's
     outcome; ``""`` before any, and after *Refresh*. ``clock`` is the latest activity's
     ``RunClock`` (m5 §17.10.2), ``None`` before any and while only Live has run: Live keeps
-    no clock.
+    no clock. ``chain`` is the latest *Run all that are left* (m5 §17.11.2), kept after its
+    end until another activity starts, and ``None`` before any chain and while a later
+    activity goes.
     """
 
     stand: str
@@ -768,6 +801,7 @@ class PageStatus:
     connected: bool = True
     goto: str = ""
     clock: RunClock | None = None
+    chain: ChainStatus | None = None
 
 
 def _one_line(error: BaseException) -> str:
@@ -778,6 +812,37 @@ def _one_line(error: BaseException) -> str:
         Exception
     ):  # a message that cannot be printed is not worth losing the outcome
         return ""
+
+
+def _chain_outcome(
+    tools: tuple[str, ...],
+    ended: tuple[ChainEnd, ...],
+    stopped_before: str | None,
+    seconds: float,
+) -> str:
+    """The strip's text for a chain that ran to its end without a bug of its own (m5 §17.11.2).
+
+    ``run all done in <s> s: <tools>`` when every tool ended ``done``; else ``run all
+    stopped at <tool>: <its outcome>``, or ``run all stopped before <tool>`` after a STOP
+    between two tools, then ``; done: <tools>`` and ``; not run: <tools>`` (the tools
+    after the one it stopped at or before) when there are some.
+    """
+    done = [end.plugin for end in ended if end.how == "done"]
+    if stopped_before is None and len(done) == len(tools):
+        return f"run all done in {seconds:.1f} s: {', '.join(tools)}"
+    if stopped_before is not None:
+        head = f"run all stopped before {stopped_before}"
+        not_run = tools[len(ended) + 1 :]
+    else:
+        last = ended[-1]
+        head = f"run all stopped at {last.plugin}: {last.outcome}"
+        not_run = tools[len(ended) :]
+    text = head
+    if done:
+        text += f"; done: {', '.join(done)}"
+    if not_run:
+        text += f"; not run: {', '.join(not_run)}"
+    return text
 
 
 def _checkpoint_reason(name: str, status: StageStatus) -> str:
@@ -1297,6 +1362,9 @@ class PlatePage:
         self._clock_end: float | None = None
         self._first_report: tuple[float, int] | None = None
         self._last_report: tuple[float, int] | None = None
+        # The latest chain (m5 §17.11.2), under ``_lock``: replaced whole at each tool's
+        # start and end, never edited, and cleared when another activity starts.
+        self._chain: ChainStatus | None = None
         self._outcome: str | None = None
         # What the last drive to a well came to (m3 §5.5 D7), under ``_lock``.
         self._goto = ""
@@ -2228,6 +2296,136 @@ class PlatePage:
             return f"{plugin}: {_checkpoint_reason(plugin, kept)}"
         return _Prepared(entry, parsed)
 
+    def run_chain(
+        self, plugins: Sequence[str], params: Mapping[str, Sequence[str]]
+    ) -> None:
+        """Run the tools of ``plugins`` that are not done, in order, as one activity (m5 §17.11.2).
+
+        Each tool is ``run`` as a single click would run it: the same checks and the same
+        refusals (``_prepare``), the same record. The chain goes on while a tool ends
+        ``done`` and stops at the first that does not (failed, stopped, refused), and
+        at a STOP, which it looks at after each tool and before the next. A tool whose
+        slot is ``ok`` in the run document read now is never run: running it again would
+        make every tool after it out of date. ``params`` are the pairs of each tool, read
+        by the view at the click; a tool with no entry runs with none.
+
+        It is one activity, named after the tool that goes, so that a second run, a snap
+        or a close is refused or stops it the whole time, between two tools too. What it
+        came to is the outcome: ``run all done in <s> s: <tools>``, or where it stopped.
+        With the stand closed, or nothing left, the outcome says so and nothing starts.
+
+        Raises:
+            RuntimeError: An activity is going (``<name> is running``), or the page is
+                closed.
+        """
+        self._refuse_if_busy()
+        if self._microscope is None:
+            self._set_outcome(f"run all: {NOT_CONNECTED}")
+            return
+        # Read now and not from a view's list, which a second tab may have made stale: a tool
+        # that is `ok` here is never run again by the chain.
+        checklist = {
+            item.slot: item.state for item in self._checklist(self._document()[0])
+        }
+        registry = self._registry().plugins
+        left = tuple(
+            tool
+            for tool in dict.fromkeys(plugins)
+            if checklist.get(
+                registry[tool].plugin.provides if tool in registry else tool
+            )
+            != "ok"
+        )
+        if not left:
+            self._set_outcome("run all: nothing is left: every step is done")
+            return
+        # Read at the click, as `run` reads it: every record of the chain names the preset
+        # the operator saw loaded (m5 §10.5).
+        loaded = self.preset
+        preset = None if loaded is None else loaded.file.name
+        pairs = {tool: tuple(given) for tool, given in params.items()}
+        self._start_activity(
+            left[0], lambda event: self._run_chain(left, pairs, preset, event)
+        )
+
+    def _run_chain(
+        self,
+        tools: tuple[str, ...],
+        params: Mapping[str, Sequence[str]],
+        preset: str | None,
+        event: threading.Event,
+    ) -> str:
+        """The chain's worker body: each tool through ``_prepare`` and ``_run_plugin``; the outcome as text.
+
+        The activity's event is each tool's ``stop``. It is looked at **before** every tool
+        and after the last, and not only inside the plugin: a STOP that lands between two
+        tools, or on a tool that ignores it and ends ``done``, would otherwise be lost
+        and the next tool would start (FM-226's entry). ``_lock`` is never held across
+        ``_prepare``, a run or a device call (FM-70). Whatever this code itself raises is
+        the outcome ``run all: <Type>: <message>``, the text and never the exception
+        (FM-98); the chain's status is closed in ``finally``, so no tool is left
+        ``current``.
+        """
+        started = time.monotonic()
+        ended: list[ChainEnd] = []
+        stopped_before: str | None = None
+        try:
+            with self._lock:
+                self._chain = ChainStatus(tools, (), tools[0])
+            for tool in tools:
+                if event.is_set():
+                    stopped_before = tool
+                    break
+                self._begin_tool(tool, event)
+                prepared = self._prepare(tool, params.get(tool, ()))
+                if isinstance(prepared, str):
+                    end = ChainEnd(tool, "refused", prepared)
+                else:
+                    result = self._run_plugin(
+                        tool, prepared.entry, prepared.parsed, event, preset
+                    )
+                    end = ChainEnd(tool, result.status, result.outcome)
+                ended.append(end)
+                following = tools[len(ended)] if len(ended) < len(tools) else None
+                with self._lock:
+                    # The tool about to start stays `current` through the gap, so that
+                    # a tick there does not read the chain as stopped.
+                    self._chain = ChainStatus(
+                        tools, tuple(ended), following if end.how == "done" else None
+                    )
+                if end.how != "done":
+                    break
+        except Exception as exc:
+            return f"run all: {type(exc).__name__}: {_one_line(exc)}"
+        finally:
+            with self._lock:
+                self._chain = ChainStatus(tools, tuple(ended), None)
+        return _chain_outcome(
+            tools, tuple(ended), stopped_before, time.monotonic() - started
+        )
+
+    def _begin_tool(self, tool: str, event: threading.Event) -> None:
+        """Make ``tool`` the activity that goes: its name for the strip, a stop, a close and a refusal, and no report of the tool before.
+
+        The activity is never let go of between two tools, so a second run stays refused
+        in the gap. The progress, the queue and the clock's two reports are the tool
+        before's and are dropped, so that its last report does not show as this tool's
+        first (``RunClock.elapsed_s`` stays the chain's). ``stop()`` reads
+        ``_current_run`` without the lock and gets a tuple that holds the chain's one
+        event, whichever of the two it reads (FM-70).
+        """
+        with self._lock:
+            self._current_run = (tool, event)
+            self._progress = None
+            self._first_report = self._last_report = None
+            while True:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+            if self._chain is not None:
+                self._chain = replace(self._chain, current=tool)
+
     def _start_activity(
         self, name: str, body: Callable[[threading.Event], str]
     ) -> threading.Event:
@@ -2259,6 +2457,7 @@ class PlatePage:
             self._clock_start = time.monotonic()
             self._clock_end = None
             self._first_report = self._last_report = None
+            self._chain = None
             self._outcome = None
             while True:
                 try:
@@ -3261,6 +3460,7 @@ class PlatePage:
             outcome = self._outcome
             goto = self._goto
             clock = self._clock()
+            chain = self._chain
         stand = self._profile.microscope.name
         stop_refused = tuple(
             role.value for role in self._profile.safety.stop_refused_by
@@ -3309,6 +3509,7 @@ class PlatePage:
                         problems=tuple(problems),
                         goto=goto,
                         clock=clock,
+                        chain=chain,
                     )
         return PageStatus(
             stand=stand,
@@ -3329,6 +3530,7 @@ class PlatePage:
             connected=False,
             goto=goto,
             clock=clock,
+            chain=chain,
         )
 
     def _clock(self) -> RunClock | None:
