@@ -84,6 +84,7 @@ from smc.ui.guide import (
     DRY_RUN_NO_FRAME,
     END_LIVE_LABEL,
     FILES_HEADING,
+    MEASURE_NOT_IN_A_DRY_RUN,
     MEASURE_THE_TIME,
     NO_FILES_YET,
     ORIENTATION_IN_STAGE_TERMS,
@@ -3700,7 +3701,10 @@ class PlatePageView:
         # ``register_replace_note`` does for a plate).
         self._say(
             self.scan_replaces_text,
-            "" if summary is None else SCAN_REPLACES.format(frames=summary.frames),
+            # A dry run took no frame: starting again loses nothing to say.
+            ""
+            if summary is None or summary.dry_run
+            else SCAN_REPLACES.format(frames=summary.frames),
         )
 
     def _draw_imaged(self, status: PageStatus) -> None:
@@ -3830,7 +3834,9 @@ class PlatePageView:
         """*Measure the time* and its wait: offered while the usable plan has no time and both tools loaded (m5 §17.12 D18).
 
         Disabled while an activity goes or a tool of the chain cannot run (the controller's
-        reason, ``timing``'s first). The controller's chain refuses on its own (FM-169).
+        reason, ``timing``'s first), and on a page served with ``--dry-run``, which ``timing``
+        refuses (its calls take no time to measure). The controller's chain refuses on its own
+        (FM-169), and ``timing`` refuses a dry run before it moves anything.
         """
         view = self._view
         plan = None if view is None else view.plan
@@ -3844,7 +3850,16 @@ class PlatePageView:
         if not shown:
             self._say(self.measure_time_wait, "")
             return
-        reason = self._blocked.get("timing") or self._blocked.get("scan-plan")
+        status = self._status
+        reason = (
+            self._blocked.get("timing")
+            or self._blocked.get("scan-plan")
+            or (
+                MEASURE_NOT_IN_A_DRY_RUN
+                if status is not None and status.dry_run
+                else None
+            )
+        )
         self.measure_time_button.disabled = (
             self._running is not None or reason is not None
         )

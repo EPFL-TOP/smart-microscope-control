@@ -370,7 +370,8 @@ a POSIX shell and the button is the way in). Nothing is in the warning colour bu
   it stands, and switches the autofocus off and on again (it must be on and locked on the
   sample): every guard of the layer applies, as to the expert view's own tool. The chain's
   line is drawn under it (`Running Timing (1 of 2).`, `Done: Timing, Field layout.`, or where
-  it stopped), and the plan's time follows;
+  it stopped), and the plan's time follows. On a page served with `--dry-run` it waits (`A dry
+  run cannot time the stand: ...`): `timing` refuses a dry run;
 - when the wells selected are **not** the plan's wells, a note says which wells the plan is for
   and to lay the fields out again to scan the others: the plan is what `scan` does, and a
   selection made since has not changed it.
@@ -385,7 +386,8 @@ move already sent finishes first**. From the top:
 - **Start the scan**: `scan`, with the autofocus field. It waits, the first that holds, for the
   stand, for a plan (`lay out the fields first: step 3, Wells`), for the tool's own reason, and
   says what runs while something does. Over a scan already done it says what a new one
-  replaces: `Starting the scan again replaces this one (72 frames).` On a page served with
+  replaces: `Starting the scan again replaces this one (72 frames).` (not over a dry run's,
+  which took none). On a page served with
   `--dry-run` a note says that **a dry run walks the fields and takes no frame**, so `cells`
   and what follows have nothing to read; the button still starts it;
 - **after a STOP or a failure**, what ended the scan: `Stopped by STOP at field 45 of 72.`

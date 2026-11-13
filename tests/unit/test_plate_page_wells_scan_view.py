@@ -2050,3 +2050,31 @@ def test_the_chain_line_is_drawn_on_the_screen_of_its_first_tool(
     view._draw_chain_line(page.status())
     assert view.chain_text.object == "Running Count the cells (1 of 2)."
     assert view.wells_chain_text.visible is False
+
+
+def test_on_a_dry_run_page_measure_waits_and_a_dry_scan_replaces_nothing_said(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # `timing` refuses a dry run, whose calls take no time to measure; a dry-run scan took no
+    # frame, so starting again loses nothing ("replaces this one (0 frames)" read as a loss).
+    page = make_page(dry_run=True, stubs=(StubScan, Slow, StubTiming))
+    _seed_plate(run_doc)
+    plan = _seed_plan(run_doc, _scan_plan_result(("B11", "B2"), estimate_s=None))
+    _seed(
+        run_doc,
+        "scan",
+        _scan_result(plan),
+        minute=2,
+        dry_run=True,
+        reads={"scan-plan": ReadRecord(plugin="scan-plan", attempt="a1")},
+    )
+    view = PlatePageView(page)
+    view.refresh()
+    view.tick()
+    assert view.measure_time_button.visible is True
+    assert view.measure_time_button.disabled is True
+    assert view.measure_time_wait.object == (
+        "A dry run cannot time the stand: serve the page without --dry-run to measure it."
+    )
+    assert view.scanned_block.object.startswith("Scanned in a dry run")
+    assert view.scan_replaces_text.visible is False

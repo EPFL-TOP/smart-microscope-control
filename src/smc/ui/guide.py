@@ -71,6 +71,7 @@ __all__ = [
     "GOTO_WALL_NEEDS_REGISTRATION",
     "LAY_OUT_FIRST",
     "MAP_FIELDS_UP_TO",
+    "MEASURE_NOT_IN_A_DRY_RUN",
     "MEASURE_THE_TIME",
     "NOTHING_LEFT",
     "NOT_CONNECTED",
@@ -397,8 +398,12 @@ SCAN_CHECKPOINT_KEPT = (
     "{status} with a checkpoint: Continue the scan, on the Scan screen, takes it up; "
     "Start again there drops it"
 )
-#: The Wells screen's button while the plan has no time (m5 §17.12 D18).
+#: The Wells screen's button while the plan has no time (m5 §17.12 D18), and its wait on a page
+#: served with ``--dry-run``: ``timing`` refuses a dry run, whose calls take no time to measure.
 MEASURE_THE_TIME = "Measure the time"
+MEASURE_NOT_IN_A_DRY_RUN = (
+    "A dry run cannot time the stand: serve the page without --dry-run to measure it."
+)
 
 
 @dataclass(frozen=True, slots=True)
