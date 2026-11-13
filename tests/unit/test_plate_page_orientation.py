@@ -265,7 +265,7 @@ def test_switching_on_a_registered_plate_runs_plate_orientation(
         page.choose_orientation("turned-180")
         assert page.join(10.0)
         assert page.status().outcome is not None
-        assert page.status().outcome.startswith("plate-orientation done in ")
+        assert page.status().outcome.startswith("Plate orientation done in ")
 
         doc = RunDocument.load(run_doc)
         turn = doc.stages["plate-orientation"]

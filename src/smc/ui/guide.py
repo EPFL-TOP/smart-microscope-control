@@ -1982,7 +1982,12 @@ def chain_line(chain: ChainStatus | None) -> str:
         name = _result_name(last.plugin)
         not_run = after
         if last.how == "failed":
-            head = _sentence(f"Stopped at {name}, which failed: {last.outcome}")
+            # A tool's own outcome begins with its title (``Route failed: ...``, D20): it
+            # already says which tool and that it failed, so it is the head as it is.
+            if last.outcome.startswith(f"{tool_title(last.plugin)} failed"):
+                head = _sentence(last.outcome)
+            else:
+                head = _sentence(f"Stopped at {name}, which failed: {last.outcome}")
         elif last.how == "refused":
             head = _sentence(f"Stopped at {name}, which cannot run: {last.outcome}")
         else:
