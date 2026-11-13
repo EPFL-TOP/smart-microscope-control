@@ -8,10 +8,11 @@ not taken from the code, and frames are not square (FM-73): a swapped height
 and width, or a row read for a column, is invisible on a square frame. A mirror
 and a turn off the axes are in every case that can have them.
 
-The B3 frames of Ti2-E session 2 are private (FM-50) and are never in a
-worktree: those tests are skipped, with the reason, when the folder is not
-there (``SMC_SESSION2_DIR``, else ``local/surveys/nikon-ti2/session2`` of the
-checkout).
+The B3 frames of Ti2-E session 2 and the frames of session 3 (B5 at the 4x, B3,
+B5 and C3 at the 10x: #409) are private (FM-50) and are never in a worktree:
+those tests are skipped, with the reason, when the folder is not there
+(``SMC_SESSION2_DIR``, else ``local/surveys/nikon-ti2/session2`` of the
+checkout; ``SMC_SESSION3_DIR``, else ``local/scans/2026-11-10/plate-walls``).
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ from smc.plugins.plate_walls.algorithm import (
     OUTWARD,
     SIDES,
     STEP_FRACTION,
+    CircleFit,
     along_um,
     encode_wall_frame,
     find_wall,
@@ -195,6 +197,60 @@ def test_a_dark_band_narrower_than_the_plastic_is_not_a_wall() -> None:
     frame = np.full((64, 300), 10_000, dtype=np.uint16)
     frame[:, 101:180] = 1_000
     assert find_wall(frame, outward_xy=(1, 0), matrix=_matrix(2.0, 0.0, False)) is None
+
+
+@pytest.mark.parametrize(
+    ("matrix", "outward", "along_rows", "found"),
+    [
+        (((20.0, 0.0), (0.0, -2.0)), (1.0, 0.0), False, True),
+        (((2.0, 0.0), (0.0, -20.0)), (1.0, 0.0), False, False),
+        (((2.0, 0.0), (0.0, -20.0)), (0.0, -1.0), True, True),
+        (((20.0, 0.0), (0.0, -2.0)), (0.0, -1.0), True, False),
+    ],
+    ids=[
+        "columns at 20 µm",
+        "columns at 2 µm",
+        "rows at 20 µm",
+        "rows at 2 µm",
+    ],
+)
+def test_the_plastics_minimum_length_is_in_um_along_the_line_not_across_it(
+    matrix: Matrix2,
+    outward: tuple[float, float],
+    along_rows: bool,
+    found: bool,
+) -> None:
+    # A dark band of 79 samples that ends inside the frame is 1 580 µm where a
+    # sample is 20 µm along the line and 158 µm where it is 2 µm: the plastic of a
+    # gap between wells, or a ridge (FM-126, FM-131). The pixel's size across the
+    # line is the other number of the matrix, and must not be the one used.
+    frame = np.full((64, 300), 10_000, dtype=np.uint16)
+    frame[:, 101:180] = 1_000
+    if along_rows:
+        frame = frame.T
+    edge = find_wall(frame, outward_xy=outward, matrix=matrix)
+    assert (edge is not None) is found
+    if edge is not None:
+        assert edge.points_px[:, 1 if along_rows else 0] == pytest.approx(100.5)
+
+
+@pytest.mark.parametrize(
+    ("gap", "found"), [(1, True), (BAND_PX - 1, True), (BAND_PX, False), (40, False)]
+)
+def test_a_speck_in_the_plastic_splits_its_run_only_from_a_band_wide(
+    gap: int, found: bool
+) -> None:
+    # The plastic of a gap between wells, 600 samples (1 650 µm at 2.75 µm per
+    # pixel) that ends inside the frame, with bright specks of `gap` samples in the
+    # middle. Under a band's width they are noise on the plastic and the run is
+    # one; from a band's width they are the next well and each half is a shadow.
+    frame = np.full((64, 800), 50_000, dtype=np.uint16)
+    frame[:, 100:700] = 250
+    frame[:, 400 : 400 + gap] = 50_000
+    edge = find_wall(frame, outward_xy=(1, 0), matrix=_matrix(2.75, 0.0, False))
+    assert (edge is not None) is found
+    if edge is not None:
+        assert edge.points_px[:, 0] == pytest.approx(99.5)
 
 
 def test_a_shadow_joined_to_the_wall_is_not_taken_for_it() -> None:
@@ -890,9 +946,12 @@ def _b3_frame(side: str) -> npt.NDArray[np.uint16]:
 @needs_b3
 def test_b3s_centre_agrees_with_the_midpoint_of_its_walls() -> None:
     # The session's own table (#334): the walls' half-intensity edges, taken by
-    # eye on the frames, put B3's centre at (10 184.7, -10 091.4) µm. The fit of
-    # the edge points of the four frames, on no eye, is within 25 µm of it (4.4
-    # measured) and gives the well's size to 1 % of 15 300 µm (15 298 measured).
+    # eye on the frames, put B3's centre at (10 184.7, -10 091.4) µm. The eye read
+    # the half-intensity edge on the meniscus's ramp, which is wider on some sides
+    # than on others, and the fit takes the half level of the fall to the plastic
+    # (#409): its centre is within 50 µm of the eye's (28.4 measured; the midpoint
+    # rule was at 4.4) and its size within 1 % of the plate's 15 600 µm (15 561
+    # measured; 15 298 before, when the edge lay on the ramp).
     kept = []
     for side in SIDES:
         frame = _b3_frame(side)
@@ -908,8 +967,8 @@ def test_b3s_centre_agrees_with_the_midpoint_of_its_walls() -> None:
             )
         )
     fit = fit_circle(np.vstack(kept), floor_um=2.2)
-    assert math.dist(fit.center_xy_um, (10_184.7, -10_091.4)) < 25.0
-    assert fit.diameter_um == pytest.approx(15_300.0, rel=0.01)
+    assert math.dist(fit.center_xy_um, (10_184.7, -10_091.4)) < 50.0
+    assert fit.diameter_um == pytest.approx(15_600.0, rel=0.01)
     assert fit.n_used >= 0.95 * fit.n_points
 
 
@@ -922,3 +981,91 @@ def test_b3_with_an_upright_camera_finds_no_wall() -> None:
         assert (
             find_wall(_b3_frame(side), outward_xy=OUTWARD[side], matrix=upright) is None
         )
+
+
+# --- the frames of Ti2-E session 3 (private; skipped when absent) -----------------
+
+SESSION3 = Path(
+    os.environ.get("SMC_SESSION3_DIR")
+    or Path(__file__).resolve().parents[2] / "local/scans/2026-11-10/plate-walls"
+)
+#: The 4x run that failed on B5 (its frames are the ones centred on what the walk
+#: took for each wall) and the 10x run that found the walls of B3, B5 and C3.
+RUN_4X, RUN_10X = "d5d32a2051ad", "cdde0e648acc"
+#: The session's own calibrations, in µm per pixel (§17.1).
+MATRIX_4X: Matrix2 = ((-2.7376, 0.1217), (0.1225, 2.7351))
+MATRIX_10X: Matrix2 = ((-1.12426, 0.04985), (0.05022, 1.12245))
+#: Half the plate's well diameter, for the bound on the circle's rms.
+HALF_WELL_UM = 7_800.0
+
+
+def _session3_frames(run: str, well: str) -> list[Path]:
+    return [SESSION3 / run / f"{well}_{side}.tif" for side in SIDES]
+
+
+def _skip_without_session3(run: str, well: str) -> None:
+    """Skip, with the reason, when the well's four frames are not there (FM-50): a parameter reads its own frames."""
+    if not all(path.is_file() for path in _session3_frames(run, well)):
+        pytest.skip(
+            "the frames of session 3 are private and not in this checkout: "
+            f"{SESSION3 / run} has not {well}'s four frames (set SMC_SESSION3_DIR)"
+        )
+
+
+def _session3_fit(run: str, well: str, matrix: Matrix2) -> CircleFit:
+    """A well's circle from its four saved frames, each at the stage position its own metadata records."""
+    kept = []
+    for side, path in zip(SIDES, _session3_frames(run, well), strict=True):
+        with tifffile.TiffFile(path) as handle:
+            frame = np.asarray(handle.asarray())
+            shaped = handle.shaped_metadata
+        assert shaped is not None, f"{path.name} has no metadata"
+        edge = find_wall(frame, outward_xy=OUTWARD[side], matrix=matrix)
+        assert edge is not None, f"no wall on {well}'s {side} side"
+        assert len(edge.points_px) >= 0.9 * edge.n_lines, f"{well} {side}"
+        kept.append(
+            wall_points_um(
+                edge.points_px,
+                float(shaped[0]["x_um"]),
+                float(shaped[0]["y_um"]),
+                matrix=matrix,
+                image_shape_px=(frame.shape[0], frame.shape[1]),
+            )
+        )
+    # The floor of the trims is two pixels, as the plugin gives it.
+    return fit_circle(
+        np.vstack(kept), floor_um=2.0 * math.hypot(matrix[0][0], matrix[1][0])
+    )
+
+
+def test_b5_at_the_4x_is_measured_at_its_plastic_walls() -> None:
+    # F7 of #405: the walk took B5's meniscus for its walls and fitted a circle of
+    # 13 055 µm, rms 663 µm, which the size check refused. On the saved frames the
+    # plastic's wall gives 15 436 µm (23.5 µm rms) and a centre 23 µm from B5's
+    # centre at the 10x, (-29 004, -10 053) µm.
+    _skip_without_session3(RUN_4X, "B5")
+    fit = _session3_fit(RUN_4X, "B5", MATRIX_4X)
+    assert fit.diameter_um == pytest.approx(15_600.0, rel=0.02)
+    assert fit.rms_um < MAX_RMS_FRACTION * HALF_WELL_UM
+    assert math.dist(fit.center_xy_um, (-29_004.0, -10_053.0)) < 50.0
+
+
+@pytest.mark.parametrize(
+    ("well", "midpoint_centre"),
+    [
+        ("B3", (9_981.0, -10_140.0)),
+        ("B5", (-29_009.0, -10_057.0)),
+        ("C3", (10_068.0, 9_394.0)),
+    ],
+)
+def test_session_3s_10x_centres_stay_near_the_midpoint_rules(
+    well: str, midpoint_centre: tuple[float, float]
+) -> None:
+    # The 10x run found these three wells with the midpoint rule, on the
+    # meniscus's ramp. The plastic's wall moves each centre by 6 to 26 µm and the
+    # diameter towards the plate's 15 600 µm: the 10x behaviour holds (#409).
+    _skip_without_session3(RUN_10X, well)
+    fit = _session3_fit(RUN_10X, well, MATRIX_10X)
+    assert fit.diameter_um == pytest.approx(15_600.0, rel=0.01)
+    assert fit.rms_um < MAX_RMS_FRACTION * HALF_WELL_UM
+    assert math.dist(fit.center_xy_um, midpoint_centre) < 40.0
