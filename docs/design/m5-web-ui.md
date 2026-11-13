@@ -3766,8 +3766,10 @@ measured = "2026-11-10, sessions 2 and 3 (#334, #405): the Greiner 24-well's cen
   state outside the repository that goes stale without a word, one per plate and
   stand. Writing the table from a registration (a command, as `smc objective offset
   --write` does for `[objectives]`) is a follow-up, not here.
-- **An estimate is never a registration.** It fills no slot of the run document,
-  moves nothing and feeds no tool: it is drawn.
+- **An estimate is never a registration.** It fills no slot of the run document, and
+  nothing but a deliberate drive acts on it: from #462, `goto-well` reads the profile's
+  `[holder]` and drives to the estimate when the page asks it to (m3 §5.5), and its
+  record says the target was estimated and not registered (FM-217).
 
 **D3. Four poses.** The map is drawn in one of four states, and says which.
 
@@ -4325,7 +4327,8 @@ The owner walked B1's shell on `demo-sample` through Claude in Chrome
 - `FIGURE_HEIGHT_PX = 460` for both figures (560 today), so that at 1280 x 800 the
   strip, the step bar, both figures and the drive bar are on screen. `/ui-check` at
   1280 x 800 is the proof; a figure lower than 400 px is a deviation to report, not a
-  fix.
+  fix. B1 measured 400; §17.12 D15 (#452) compacts the header and the drive bar, and
+  allows 360 as the floor.
 - `_TEXT_WIDTH = 370` (380 today) and every fixed width in the step panel at most
   370, so that nothing in the 400 px panel runs past its edge (the notes of 520 px,
   `_PLATE_NOTE_WIDTH`, become `None` with the wrapped style).
@@ -4390,8 +4393,8 @@ Run.
   lines. Other ways: *From the walls of 2–3 wells (slower; measures the wells' size
   too) or automatically (surveys the plate, about 7 minutes): in the expert view.*
 - Continue: *Continue to Wells*.
-- #373 (the objective a plate records) is not decided here; the list shows the
-  objective of each capture, so that a turn between captures is visible.
+- #373 (the objective a plate records) is decided in §17.12 D13: *Register the plate*
+  is refused across a turn. The list shows the objective of each capture.
 - From the walk (D10, D11):
   - *Go to* `<well>` is `PlatePage.goto(well)`, the same call as a drive click. Before
     a registration it drives to the holder's estimate (#462), and the row says
@@ -4446,7 +4449,8 @@ Run.
   already sent finishes first on this stand.*
 - Action: *Start the scan* (`scan`, the same handler as the tool's *Run*). Waits, the
   first that holds: the stand is closed, no usable plan (`LAY_OUT_FIRST`), the tool's
-  other reason (a checkpoint: the page never starts a stage afresh over one, §2), a
+  other reason (a checkpoint: the page never starts a stage afresh over one, §2; from
+  #470, §17.12 D17, the screen offers *Continue the scan* and *Start again* instead), a
   run going (`busy_note`). `DRY_RUN_NO_FRAME` is a **note** under the action on a page
   served with `--dry-run`, not a wait: a dry run walks the fields and is the mode the
   page was asked for (`/ui-check` serves it so), and the note says what it leaves out.
@@ -4974,7 +4978,8 @@ class PlatePage:
 - **What is left.** The tools of `plugins` whose slot (the plugin's `provides`) is not `ok`
   in the run document **read now**; a name no plugin has is kept and refused at its turn.
   A tool that is `ok` is never run by a chain: running it again would make every tool after
-  it out of date (§17.11.1). None left: the outcome `run all: nothing is left: every step
+  it out of date (§17.11.1). **Amended by §17.12 D14** (#475): a tool that is `ok` but reads,
+  through `reads` or `reads_optional`, the slot of a tool left before it is left too. None left: the outcome `run all: nothing is left: every step
   is done` and nothing starts.
 - **One activity.** `_start_activity(left[0], body)`; the worker replaces `_current_run` by
   `(tool, event)` under `_lock` before each tool, and then clears `_progress`, the queue
@@ -5179,10 +5184,483 @@ develop session's scratch directory, cited in its Report and not committed (as �
   own buttons. It does not retry or skip a tool that failed: the chain says which one and why,
   and the row's *Run* is there.
 - It does not resume: a stage stopped with a checkpoint is refused, as `run` refuses it, and
-  the row says the command that continues it (FM-172).
+  the row says the command that continues it (FM-172). The Scan screen's own *Continue the
+  scan* is §17.12 D17 (#470).
 - It does not change `_blocked`, the expert view or any tool's own *Run*.
 - It draws no bar for a running tool: the row says `Running now: <done> of <total>` and the
   strip says the same.
 
 **Not verified (for the owner)**: the page read by a newcomer; the layout on the
 stand PC's screen and over RDP; a 1280 px window with the browser's own zoom.
+
+### 17.12 Round 2: the owner's walk and the build's leftovers (#475, #470)
+
+Fixed by #475's plan with the owner (2026-11-13). The owner walked the five screens
+on `demo-sample` in Chrome (a 1280 x 800 window, a 1280 x 623 page, `main` at
+`f861f98`, served without `--dry-run`), from Connect to the export, with a STOP in
+the scan. The findings are on #431 (`## Findings (live walk, 2026-11-13)`), each
+with its outcome. This section is what they, the Reports of B1 to B4 (#443 to
+#446) and #452, #457, #465, #470 and #373 change. It is built in two parts, one
+after the other (both edit `controller.py`, `guide.py` and `plate_page.py`):
+
+- **Part A** (#475): the texts, the header and the drive bar, the map's frame, the
+  notes drawn once, the chain's rule, the objective of a registration, Live's dark
+  frame, the files that open, the Wells screen's words. It changes what the page
+  draws and two refusals, and starts no tool in a new way.
+- **Part B** (#470): the Scan screen after a STOP or a failure (*Continue the scan*,
+  *Start again*), a scan that replaces another, and *Measure the time* on the Wells
+  screen. It starts `scan` with `resume=True` and `timing` from the guided screens:
+  tools that move the stage, started in a way the page did not have.
+
+#### 17.12.1 What the walk found (2026-11-13)
+
+- **After a STOP the scan could not go on from the page.** The record was `failed`
+  (`MotionStoppedError`: the STOP stopped a move, FM-64), the checkpoint stood,
+  *Start the scan* stayed disabled after *Resume* with `failed with a checkpoint:
+  continue it with smc run scan --resume (close this page first)`, and the expert
+  view's next step proposed `smc run scan` without `--resume`, the command that drops
+  the checkpoint. The progress block (`Field 36 of 72`, half a bar) stayed under
+  `Scanned: 72 frames` once the scan had been continued from a terminal.
+- **The same sentence under every row.** During a *Go to*, `goto-well is running:
+  wait for it to end, or press STOP.` four times on the Plate screen; during Live,
+  `End live to go to another well; Capture works during Live` three times (the chain's
+  busy sentence on Results, #446's Report, is the same defect).
+- **A row's answer was the tool's whole outcome**: `goto-well done in 5.9 s; assumed:
+  target estimated from the stand's holder, … (+2 more, on the card)`, where no card
+  is. After the registration the drive bar still said `… not registered`.
+- **A capture far from its well was accepted with no word**: H1 captured at A12's
+  place (99 mm off), two captures at one point, side by side until *Register*.
+- **Internal names**: `camera-calibration done in 0.2 s`, `run all done in 0.5 s:
+  cells, density, route, report, nis-export`, `run camera-calibration (Set up)` (a tab
+  that no longer exists), `coverage`, `autofocus`, `if-engaged`.
+- **The header took 180 px of 623**: the strip, `Disconnect releases demo-sample for
+  another program (NIS-Elements, ZEN)` on every screen, one or two outcome lines that
+  come and go (the page jumps by 27 px each time), the step bar, summaries wrapped on
+  two lines. The drive bar needed a scroll in every state, and the wheel over the image
+  zooms the image.
+- **The map**: the plate fills about 60 % of the map's width and the aspect stretches
+  the rest, so the 72 fields of B2 and B11 are specks; `operator's left` and `back of
+  the sta…` are clipped, `over A1 (estimated)` is drawn over `back of the stand` and the
+  well labels, `over A12` is cut at the right edge; the *Density of* select, empty, is
+  above the map from the Stand screen on; the colour bar's title is cut.
+- **Results**: a four-line *Again replaces …* under every row at all times, times in
+  UTC, the report and the export as paths that cannot be opened from the page;
+  `Registered: residual 62.3 µm` with no word of whether that is good; `Time: not known
+  (… the expert view's timing tool …)` on the Wells screen.
+
+#### 17.12.2 Decisions
+
+- **D13 The objective of a registration** (owner, #373). A capture keeps the turret
+  label read with it (B2's `capture_objectives`). *Register the plate* is **refused**,
+  in the controller and before anything starts (FM-169), when the captures it would
+  send were made with different objectives, or with another objective than the one in
+  place; the refusal says which and the two ways out (turn back, or redo the centres).
+  A capture whose objective is not known (a capture restored from a run document, a
+  turret that could not be read) is not compared: it can refuse nothing, and the
+  registration's `assumed` lines are the tool's as today. Captures are never cleared by
+  a turn. So a plate registered on the page records the objective its centres were
+  captured with, which #382's offsets step reads.
+- **D14 The chain's rule** (owner, #446's `## Plan deviation`, option 2). At the click,
+  `left` is the tools that are not `ok`, **and** each `ok` tool that reads, through
+  `reads` or `reads_optional`, the slot of a tool already in `left` before it,
+  transitively, in the chain's order. The chain makes no tool out of date that it does
+  not run after; its line counts them from the start (`Running Report (<k> of <n>)`). The
+  rule of §17.11.2 becomes: a tool that is `ok` and that nothing left before it feeds is
+  never run by a chain.
+- **D15 The header and the drive bar** (owner, #452: compact). The header is the
+  strip, **one** outcome line that always takes its height (empty or not), the
+  connection line only while a connect or disconnect goes or after it failed, the
+  message and problems lines only when they hold a text, the step bar, and summaries of
+  one line (at most 22 characters, cut with `…`). `Disconnect releases <stand> for
+  another program (NIS-Elements, ZEN)` leaves the header for the Stand screen's known
+  block. The drive bar is two columns and two rows: the pad and *XY step* on the left;
+  Z±, *Z step*, the autofocus pair and the light pair on the right; then *Objective* and
+  *Change objective* on one row, *Drive to* and the drive toggle on one row; the notes
+  under them. **Budget**, at a 1280 x 800 viewport with the stand connected and one
+  outcome line: the drive bar's controls, down to the drive toggle, are inside the
+  viewport (`/ui-check`'s `on screen: drive bar` in `wells-selected`); the notes may be
+  below. If the budget is not met at `FIGURE_HEIGHT_PX = 400`, the figures go down to
+  **360** (the floor) and the Report says the height measured; no lower. The wheel over
+  a figure keeps zooming it (Bokeh's `wheel_zoom`): the page scrolls with the wheel
+  anywhere else, and that is said in `docs/ui/plate-page.md`.
+- **D16 The map's frame** (owner). The map's two `DataRange1d` follow **one invisible
+  renderer**, the frame (`frame_source`, two points, the frame's corners), and nothing
+  else; a view sets the frame's two points, and the map reframes, keeping
+  `match_aspect`. On the Stand and Plate screens and in the expert view the frame is
+  the plate's outline with one pitch of margin on each side; on Wells, Scan and Results,
+  with a plan, it is the plan's wells' outlines with one pitch of margin; without a plan,
+  the plate. **Measured** (2026-11-13, Panel 1.10.0 / Bokeh 3.10.2, Chrome, a throwaway
+  app): changing a `DataRange1d`'s `renderers` after the page is drawn does **not**
+  reframe (the range stayed `-111382, 111382`); setting `start` and `end` reframes but
+  drops the aspect (an 86 000 x 5 000 µm frame drawn on a square plot); a range that
+  follows one invisible renderer's data reframes when the data changes and keeps the
+  aspect (`-47300, 47300, 7859, 37141` for a frame of `±43000, 20000..25000`). An
+  operator's own zoom or pan stops the range following until the toolbar's reset; that
+  is Bokeh's, and accepted. The side labels are drawn **inside** the frame (left and
+  right turned 90° along the plate's sides), and the label by the cross has a white
+  background at 0.8 and is aligned away from the frame's nearer edge.
+- **D17 The Scan screen after a STOP or a failure** (owner; part B). A `scan` whose
+  record is `stopped` or `failed` with a checkpoint that `reachable_checkpoint` finds
+  is offered **two actions**: *Continue the scan* (primary: `run("scan", params,
+  resume=True)`, the runner's own resume and its own checks, `check_ready(...,
+  resume=True)`) and *Start again* (secondary), which asks a second click (`Start again
+  drops the <done> fields already taken: press again to drop them`) and then runs `scan`
+  afresh with `afresh=True`, the one deliberate way a click gives up a checkpoint
+  (FM-172 holds: one click never does). While the stand is halted, both wait with
+  `Press Resume (top right) first: the stand is halted`. The screen says what ended the
+  scan: `Stopped by STOP at field <done> of <total>` when STOP was pressed during that
+  activity (whatever the record's status: a STOP that lands in a move ends `failed`,
+  FM-64), else `Failed at field <done> of <total>: <one line>`. The progress block is
+  not drawn once the scan's record is `done`. The expert view's next step for a stage
+  with such a checkpoint names `smc run <stage> --resume`. The checkpoint reason
+  (`close this page first`) leaves the page's texts for `scan`; the other stages keep
+  it (§17.11.6).
+- **D18 *Measure the time*** (owner; part B). On the Wells screen, while the plan says
+  `Time: not known`, a button *Measure the time* runs the chain `("timing",
+  "scan-plan")` (`run_chain`, D14's rule puts `scan-plan` in `left` because it reads
+  `timings` optionally), with `timing`'s profile-suggested pairs (as *Calibrate the
+  camera* runs `camera-calibration`'s). The Wells screen draws the chain's line under
+  it. `timing` moves the stage out and back from where it is (200 µm and 9 mm by
+  default) and switches the autofocus; it is the expert view's own tool, with every
+  guard of the layer, and #454's rule for a locked PFS across a wall applies to it.
+- **D19 A reason common to every action of a screen is drawn once.** The busy sentence
+  (`busy_note`) and `GOTO_NOT_DURING_LIVE` are drawn once per screen, under the
+  screen's first action (Plate: above the centre rows; Results: under *Run all that are
+  left*), never under each row; a row's wait says only what is the row's own.
+- **D20 Plain words and local time.** The outcome line names a tool by its plain
+  title (`TOOL_TITLES`), never its plugin name; a tool's exception is its one-line
+  message without the type name (the type goes to the log); the guided screens give
+  times in local time to the minute (`local_time`); the expert view's cards keep UTC.
+  The Wells screen says in plain words what `coverage` and `autofocus` are, on a line
+  above each (the fields are the tools' own, one instance, D5, and keep their names in
+  the expert view). The residual line names the bound the tool refuses beyond
+  (`GOOD_RESIDUAL_UM`, 300 µm). The *Again* note is one line of short names.
+- **D21 The files open from the page.** *Where the files are* draws each file of a
+  usable Results card as a link that opens it in a new tab, through one route of the
+  page's server, `/run-files/<path relative to the run document's folder>`, which
+  serves **only** the files the run document's usable records name (an allowlist the
+  controller computes at each request), and 404 for anything else. **Measured**
+  (2026-11-13, Panel 1.10.0): `pn.serve(..., static_dirs=...)` refuses a folder that does
+  not exist yet (the tools' folders appear after the page is served) and would serve the
+  whole run folder; a tornado `RequestHandler` passed as `extra_patterns=[(r"/run-files/(.*)",
+  handler)]` to `pn.serve(threaded=True)` serves a listed file (200) and answers 404 for
+  an unlisted one and for `../`. A file outside the run document's folder, and the scan's
+  frames folder, stay a path.
+- **D22 Live says when the frame is dark or saturated** (#457). The page tests each new
+  frame it read from the camera (Snap and Live, `bit_depth > 0`; a plugin's frame, whose
+  `bit_depth` is 0, is not tested) with `carries_signal` and `saturated`, which move to a
+  pure module of their own, `smc.plugins.frame_signal`, imported by `camera-calibration`
+  and by the page. **Measured** (2026-11-13, numpy, this Mac): `carries_signal` takes
+  4.5 ms on 512 x 512, 16.5 ms on 1200 x 1200 (the Prime 95B), 70.8 ms on 2048 x 2048, and
+  the saturation fraction under 2 ms; the test runs once per new frame, never per tick,
+  and on a frame larger than 1600 x 1600 on every other row and column.
+- **D23 What stays as it is.** `Left` across a well change (#470): the pace stays the one
+  between the first report and the latest; the Ti2-E's real scan decides whether a pace
+  per well is worth it. The registration's sample path (`from_sample`) keeps its rows'
+  words, and the screen says once, above the rows, that *Register the plate* uses the
+  profile's sample while nothing is captured.
+
+#### 17.12.3 The interface, part A (#475)
+
+**`smc/plugins/frame_signal.py`** (new, pure: numpy only). `MIN_SIGNAL_SPREAD_COUNTS`,
+`MIN_FEATURE_FRACTION`, `signal_spread`, `signal_floor_counts` and `carries_signal` move
+here from `camera_calibration/algorithm.py` unchanged (their docstrings and the
+measurements they cite with them); `camera_calibration/algorithm.py` imports them back
+with explicit re-exports (`from smc.plugins.frame_signal import carries_signal as
+carries_signal`, …), so that its importers and tests are unchanged. New:
+
+```python
+#: A frame is saturated when at least this fraction of its pixels sits at the camera's
+#: full scale. Assumed (one percent), not measured on a stand: labelled so in the docs.
+SATURATED_FRACTION = 0.01
+
+
+def saturated(frame: npt.NDArray[Any], bit_depth: int) -> bool: ...
+```
+
+`saturated` is `False` for `bit_depth <= 0` (not known), else whether the fraction of
+pixels `>= 2**bit_depth - 1` is at least `SATURATED_FRACTION`.
+
+**`smc/ui/guide.py`** (pure), new or changed:
+
+```python
+#: The plain title of each built-in tool, for the outcome line (m5 §17.12 D20). A tool
+#: not listed (a third party's) is named by its plugin name.
+TOOL_TITLES: Mapping[str, str] = {
+    "camera-calibration": "Camera calibration",
+    "timing": "Timing",
+    "goto-well": "Go to",
+    "plate-registration": "Registration",
+    "plate-walls": "Registration from the walls",
+    "plate-finding": "Plate finding",
+    "plate-orientation": "Plate orientation",
+    "scan-plan": "Field layout",
+    "scan": "Scan",
+    "cells": "Count the cells",
+    "density": "Density per well",
+    "route": "Route",
+    "report": "Report",
+    "nis-export": "Export for NIS-Elements",
+    "stage-report": "Stage report",
+}
+#: The short names the Again note lists (D20).
+RESULT_SHORT: Mapping[str, str] = {
+    "cells": "Count",
+    "density": "Density",
+    "route": "Route",
+    "report": "Report",
+    "nis-export": "Export",
+}
+
+
+def tool_title(plugin: str) -> str: ...
+def local_time(when_utc: datetime) -> str: ...
+def frame_hint(image: npt.NDArray[Any], bit_depth: int) -> str: ...
+def capture_note(
+    well: str,
+    captured_um: tuple[float, float],
+    expected_um: tuple[float, float] | None,
+    pitch_um: float,
+    others: Mapping[str, tuple[float, float]],
+) -> str: ...
+def register_objective_refusal(
+    objectives: Mapping[str, str | None], in_place: str | None
+) -> str | None: ...
+def goto_row_text(answer: GotoAnswer | None, well: str) -> str: ...
+def map_frame(
+    outlines: Sequence[tuple[float, float, float, float]], pitch_um: float
+) -> tuple[tuple[float, float], tuple[float, float]]: ...
+```
+
+- `tool_title`: `TOOL_TITLES.get(plugin, plugin)`.
+- `local_time`: `when_utc.astimezone().strftime("%Y-%m-%d %H:%M")` (as `replace_note`
+  does); a naive datetime is taken as UTC.
+- `frame_hint`: `""` when `bit_depth <= 0`; `FRAME_SATURATED` when `saturated`; else
+  `FRAME_DARK` when not `carries_signal(image, bit_depth)`; else `""`. A frame larger than
+  1600 x 1600 is tested on `image[::2, ::2]` (D22).
+- `capture_note`: `""` unless the capture is more than one pitch from `expected_um`
+  (the map's centre of that well in the pose drawn: registered, seed or estimated;
+  `None` on an unplaced map), or within one pitch of another well's capture in `others`;
+  then `CAPTURE_FAR` or `CAPTURE_SAME_PLACE`, the first that holds. A note, never a
+  refusal: the registration's own residual bound refuses a bad fit.
+- `register_objective_refusal`: `None` when the known labels among `objectives` are one
+  label equal to `in_place`, or when no label is known, or when `in_place` is `None` (a
+  turret not read refuses nothing: the tool's own `assumed` says the objective); else
+  `REGISTER_OBJECTIVES_DIFFER` when the known labels differ, else
+  `REGISTER_ACROSS_A_TURN`.
+- `goto_row_text`: the Plate screen's answer on the row a *Go to* was pressed on
+  (`""` for another row): `GOTO_ROW_GOING`, `GOTO_ROW_AT_ESTIMATE`, `GOTO_ROW_AT`, or the
+  refusal or failure's one line, without the tool's name.
+- `map_frame`: the bounding box of `outlines` (each `x0, y0, x1, y1`) grown by `pitch_um`
+  on each side, as the frame's two corner points `((x0, x1), (y0, y1))`.
+- Changed: `registered_line` adds the bound, `Registered: residual 62.3 µm of the 300 µm
+  allowed, turned -0.01°` (`GOOD_RESIDUAL_UM` from `plate_registration.algorithm`, which
+  the page already imports); `result_row`'s `Done …` and `known_text`'s calibration time
+  use the local time: `ResultCard` and the calibration note each gain `when_local: str`
+  (last field, default `""`), which the controller fills with `local_time(<the record's
+  start>)` where it fills `when_utc`; the expert view's cards keep `when_utc`; `again_note` returns one line, `AGAIN_NOTE.format(names=…)` with
+  `RESULT_SHORT`; `drive_image_note(None)` names the Stand screen's button
+  (`CAMERA_NOT_CALIBRATED_NOTE`); `known_text` gains the line `DISCONNECT_RELEASES`
+  while connected; `step_states`' summaries are cut at 22 characters with `…`;
+  `wells_known_lines`' no-timing line is `TIME_NOT_KNOWN` (part B replaces it with the
+  button); `plate_rows_note(*, running, live, from_sample) -> str` is the one note above
+  the centre rows (D19, D23).
+
+**`smc/ui/controller.py`**:
+
+- `GotoAnswer` (new, frozen dataclass): `well: str`, `phase: Literal["going", "at",
+  "refused", "failed"]`, `estimated: bool`, `text: str` (the refusal's or failure's one
+  line). `PageStatus` gains `goto_answer: GotoAnswer | None = None` (last field);
+  `goto: str` stays for the drive bar's line. `goto()` sets `_goto_answer` with `_goto`.
+  A click refused because an activity runs (`_refuse_if_busy`) **leaves `_goto` and
+  `_goto_answer` as they were** and raises (the view's `_try` says it): the running
+  drive's text is not overwritten (#444's Report). When a run of a tool whose `provides`
+  is `plate` ends, `_goto` and `_goto_answer` are cleared: a drive's text never outlives
+  the plate it was measured on.
+- The outcome line (`_run_plugin`, `_chain_outcome`, `stop`): `<tool_title> done in
+  <s> s…`, `<tool_title> stopped`, `<tool_title> failed: <one line>`, `Run all that are
+  left: done in <s> s (<titles>)`; a run during which STOP was pressed and that ended
+  `failed` on `MotionStoppedError` or `MicroscopeHaltedError` says `<tool_title> stopped
+  by STOP` (its record stays `failed`, FM-64). `_stop_note`'s `<plugin> told to stop` says
+  the title too.
+- `run_chain`: `left` per D14, from the registry's `reads` and `reads_optional` of each
+  tool of `plugins` (a name no plugin has reads nothing). The rest of §17.11.2 holds.
+- `_prepare("plate-registration", …)`, when the `refs` sent are the page's captures:
+  `register_objective_refusal(self.capture_objectives, <objective in place>)`; a
+  refusal is the outcome `Registration: <text>` and nothing starts (FM-169), as
+  `_prepare`'s other refusals are. `PlateView` gains `register_refusal: str | None`, the
+  same text before the click, which the view draws as *Register the plate*'s wait.
+- `PlatePage.run_file(relative: str) -> Path | None` (new): the path of
+  `<run document's folder>/<relative>` when it is one of the files the usable records of
+  the run document name (read now, under the same rules as the cards' `files`), else
+  `None`; never raises for a bad path (`..`, an absolute path, a missing file: `None`).
+- `PlatePage.served_files()` is not added: the allowlist is computed per request.
+
+**`smc/ui/plate_page.py`**:
+
+- `serve()` passes `extra_patterns=[(r"/run-files/(.*)", RunFileHandler, {"page": page})]`;
+  `RunFileHandler` (new, tornado `RequestHandler`) answers `page.run_file(path)` with the
+  file's bytes and a content type from `mimetypes` (`text/html` for the report,
+  `application/xml` for the export, `application/json`), and 404 for `None`.
+- *Where the files are* is a `pn.pane.HTML` whose links are built by the guide
+  (`files_html(cards, run_folder) -> str`, new, pure: every text is escaped with
+  `html.escape`, every href is `/run-files/` plus the URL-quoted POSIX relative path,
+  `target="_blank"`, `rel="noopener"`); a file outside the run folder is escaped text.
+  It is the one HTML pane of the page: FM-139 holds for every other text.
+- The header (D15): `connection_text` drawn only while a connect or disconnect goes or
+  after one failed; `run_text` with a `min_height` of one line; `message` and
+  `problems_text` visible only with a text.
+- The drive bar (D15): `_drive_bar()` builds the two columns and two rows.
+- The map (D16): `frame_source` and its renderer (`alpha=0`, not in the hover), the
+  ranges' `renderers=[frame]` set once at build; `_draw_map` sets `frame_source.data` from
+  `map_frame(...)` for the screen shown, and `show_step`/`show_expert` call it. The side
+  labels' `angle` and `text_align` per side; the cross's label `background_fill_color` and
+  `text_align`. `label_select` is visible only with options.
+- The Plate screen: one `plate_rows_note` pane above the rows; each row's wait holds only
+  its own reason; each row's answer is `goto_row_text(status.goto_answer, well)`; each
+  captured row adds `capture_note(...)` in the warning colour.
+- The Results screen: `busy_note` under *Run all that are left* only; the chain's line
+  is drawn after the rows' refresh in the same tick (#446's Report).
+- The image: `frame_hint` drawn beside *Snap* and *Live* (the pane that says `the stand
+  is not connected`), computed when the frame's number changes.
+- `tick()`: `_draw_wells_screen` and `_draw_scan_screen` each run inside a guard that
+  logs and goes on, so that a raise there never skips the strip and the buttons (#470).
+- `describe_params`' tuple default in plain words (`single`, not `('single',)`): the
+  guide's `plain_default` reads a tuple's repr as its items joined by `, `.
+
+#### 17.12.4 The interface, part B (#470)
+
+- `PlatePage.run(plugin, params, *, resume: bool = False, afresh: bool = False)`:
+  `resume` passes `resume=True` to `check_ready` and `run_plugin` (the runner's checks:
+  parameters that differ from the record's are its `ResumeError`, said as the outcome);
+  `afresh` skips `_prepare`'s checkpoint refusal for that one call, and only that one.
+  `resume and afresh` is a `ValueError`. The view's *Start again* passes `afresh=True`
+  only on the second click (D17), and nothing else in the page passes it.
+- `PlateView.scan_end: ScanEnd | None` (new): `kind: Literal["stopped", "failed"]`,
+  `done: int`, `total: int`, `text: str`, `resumable: bool` (a checkpoint
+  `reachable_checkpoint` finds), from the `scan` record and the progress the controller
+  kept; `stopped` when STOP was pressed during that activity.
+- `guide.scan_end_lines(end: ScanEnd) -> tuple[str, ...]`, `guide.scan_actions_wait(*,
+  connected, halted, running) -> str | None`, and the texts of §17.12.5.
+- The Scan screen: under *Start the scan*, when `scan_end` stands, its lines and the two
+  buttons *Continue the scan* and *Start again*, *Start the scan* hidden; the progress
+  block not drawn once the record is `done`; when a `Scanned:` result stands, *Start the
+  scan* says `SCAN_REPLACES` under it before the click, and the old result line is not
+  drawn while a scan runs.
+- The next step (§8.3) for a stage with a reachable checkpoint names `smc run <stage>
+  --resume`.
+- The Wells screen: *Measure the time* (D18) under the known block while the plan's
+  `estimate_s` is `None`; it calls `run_chain(("timing", "scan-plan"), params)`; the Wells
+  screen draws `chain_line(status.chain)` when the chain's first tool is `timing`, and the
+  Results screen only when it is a Results tool.
+- `/ui-check`: two states, `scan-stopped` (STOP pressed during the scan, `demo-sample`
+  only) and `scan-continued` (*Resume*, then *Continue the scan*, to `Scanned:`), on the
+  dry-run page the script serves. Not measured here: whether a dry-run scan stopped by
+  STOP leaves a checkpoint that `reachable_checkpoint` finds on a dry-run page. Part B
+  measures it first; if it does not, the two states are a one-off browser session on
+  `demo-sample` served without `--dry-run`, cited in the Report and not committed (as
+  §17.11.4's chain in motion).
+
+#### 17.12.5 The texts
+
+```python
+#: smc/ui/guide.py, part A
+FRAME_DARK = "The frame is dark: is the light on, and the light path on the camera?"
+FRAME_SATURATED = "The frame is saturated: lower the exposure."
+CAPTURE_FAR = (
+    "{well} was captured {distance_mm:.1f} mm from where the map puts it: is the "
+    "stage over {well}? Redo it there."
+)
+CAPTURE_SAME_PLACE = (
+    "{well} and {other} were captured at the same place: redo the one that is wrong."
+)
+REGISTER_ACROSS_A_TURN = (
+    "The centres were captured with the {captured}; the {in_place} is in place: turn "
+    "back to the {captured}, or redo the centres with the {in_place}."
+)
+REGISTER_OBJECTIVES_DIFFER = (
+    "The centres were captured with different objectives ({which}): redo them with "
+    "one objective."
+)
+GOTO_ROW_GOING = "Going to {well}…"
+GOTO_ROW_AT_ESTIMATE = (
+    "At {well}, the holder's estimate: centre it by eye with Live and the arrows, then "
+    "capture."
+)
+GOTO_ROW_AT = "At {well}."
+AGAIN_NOTE = "Again makes {names} out of date; Run all that are left runs them again."
+CAMERA_NOT_CALIBRATED_NOTE = (
+    "Which way the image moves for an arrow is not known: Calibrate the camera, on "
+    "the Stand screen, measures it."
+)
+DISCONNECT_RELEASES = "Disconnect releases {stand} for NIS-Elements or ZEN."
+SAMPLE_REGISTERS = (
+    "Register the plate uses the profile's sample while no centre is captured; "
+    "capture three to measure this plate."
+)
+TIME_NOT_KNOWN = "Time: not known (no timing measured yet)"
+COVERAGE_WORDS = "How much of each well's width the fields span: 0.4 is 40 %."
+AUTOFOCUS_WORDS = (
+    "Autofocus: if-engaged uses it when it is on and locked; required refuses to "
+    "start unless it is; off never touches it. The scan never switches it on."
+)
+
+#: part B
+SCAN_STOPPED = "Stopped by STOP at field {done} of {total}."
+SCAN_FAILED = "Failed at field {done} of {total}: {text}"
+SCAN_CONTINUE = "Continue the scan"
+SCAN_START_AGAIN = "Start again"
+SCAN_START_AGAIN_CONFIRM = (
+    "Start again drops the {done} fields already taken: press again to drop them."
+)
+SCAN_HALTED = "Press Resume (top right) first: the stand is halted."
+SCAN_REPLACES = "Starting the scan again replaces this one ({frames} frames)."
+MEASURE_THE_TIME = "Measure the time"
+```
+
+The outcome line's words (D20) are built in `controller.py` from `tool_title`; the
+expert view's buttons keep the plugin names (`Run scan-plan`), which are the commands'.
+
+#### 17.12.6 `/ui-check`
+
+Part A: `wells-selected` says `on screen: drive bar: yes` at 1280 x 800 (D15), and the
+summary's `on screen:` line gains the header's height (`header: <px>`). `after-density`
+shows the colour bar's title whole and the map framed on the plan's wells. Part B: the
+states `scan-stopped` and `scan-continued` (§17.12.4). Every state keeps 0 server and 0
+browser errors.
+
+#### 17.12.7 Tests and failure modes
+
+- Part A: `tests/unit/test_frame_signal.py` (new: the moved functions keep their tests'
+  results; `saturated` at the bound and one pixel under it; `bit_depth=0`);
+  `tests/unit/test_ui_guide.py` (the new texts and functions); the controller's
+  `run_chain` (D14), `goto` (the busy click that leaves the running text), the plate
+  registration's objective refusal and `run_file` in the existing controller modules;
+  `tests/unit/test_plate_page_run_files.py` (new: the route serves a listed file, 404 for
+  an unlisted one, for `..`, for an absolute path; on Windows a path with `\\`).
+- Part B: the resume and the second click in `tests/unit/test_plate_page_scan_status.py`
+  and `test_plate_page_wells_scan_view.py`; a demo test (`@pytest.mark.demo`) that STOPs
+  a scan, continues it and finds every field once.
+- **Failure modes**: FM-169 (every refusal in the controller), FM-171 (every new handler
+  through `_handler`), FM-172 (one click never drops a checkpoint: *Start again* is two),
+  FM-139 (plain text everywhere but `files_html`, whose every text is escaped), FM-151
+  and FM-145 (the tick reads the shared status; `frame_hint` once per frame), FM-174 (the
+  figures are never in a swapped list; the frame renderer is the view's own), FM-64 (a
+  STOP in a move is `failed`: the words say stopped, the record does not change), FM-175
+  (the Windows note under every command), FM-217 (the cross's label keeps the pose's
+  words), FM-229 (the chain's reads are the plugins'). **New entries**, named by their
+  text: *a reason common to every action of a screen drawn under each of them* (D19);
+  *a route that serves files from a folder serves the folder* (D21).
+
+#### 17.12.8 What this does not do
+
+- It adds no plugin, slot or command, and changes no tool's behaviour; part B uses the
+  runner's resume as `smc run --resume` does.
+- It does not resume a stage other than `scan` from the page (the rows of Results keep
+  their checkpoint reason), and does not retry or skip a tool.
+- It does not judge `Left` across wells (D23), does not open a folder from the page,
+  and does not change the expert view's cards (UTC).
+
+**Not verified (for the owner)**: the page read by a newcomer once more (#475's last
+criterion); the layout on the stand PC's screen and over RDP; a STOP at the Ti2-E on a
+stand whose profile says `stop_refused_by`; *Measure the time* at the Ti2-E with PFS.
