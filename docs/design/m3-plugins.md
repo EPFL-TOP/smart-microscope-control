@@ -5240,7 +5240,7 @@ On throwaway prototypes that are not committed; numpy 2.5.3, tifffile
     | session 2's B3, 10× | (10 182, −10 088), 15 298, 41.9 | (10 157, −10 098), 15 561, 22.5 |
 
     B5's centre at the 4× lies 23 µm from its centre at the 10×, and B3's
-    30 µm. The 10× centres move by 5 to 26 µm. The diameters grow by 140 to
+    30 µm. The 10× centres move by 6 to 27 µm. The diameters grow by 140 to
     260 µm towards the plate's 15 600, because the midpoint read the
     meniscus's ramp.
   - **Frames of a walk** were not saved, so they were simulated: windows of
