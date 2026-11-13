@@ -2000,7 +2000,13 @@ well within 0.0 µm.
    `plate` parameter naming another plate than the slot's is a
    `PluginRunError`: `the registered plate is a <slot's>, not a <param>: leave
    plate out, or register the <param>`. `orientation` is not read: the
-   registered plate's is measured.
+   registered plate's is measured. A slot the runner judges usable whose result
+   does not validate as a `PlateResult` (the ±90° orientation bound, for one) is
+   **refused, not replaced by an estimate**: `upstream_or_none` raises
+   `UpstreamError` "the result of <plugin> is not what goto-well expects", even
+   with `plate=` given (#465). A plate that is there and unreadable is a fault to
+   see, not one to drive around. The page's map draws that slot `estimated` or
+   `unplaced`; its `view().problems` names the cause.
 3. **No usable plate**, `why = ctx.why_not_read("plate")`:
    - no `plate` parameter: `UpstreamError(goto-well, "plate", f"{why}; or give
      plate=<a useq plate name> to drive to the estimate of the profile's
@@ -2086,7 +2092,8 @@ FM-151).
 
 **D8. What does not change.** A usable plate's path, its result and its
 assumed lines; the layer's guards (soft limits, the turret, STOP, dry run); an
-estimate fills no slot and feeds no tool (m5 §15 D2, D8); a capture records the
+estimate fills no slot, and nothing but a deliberate drive acts on it (this
+section's D1, m5 §15 D2, FM-217); a capture records the
 well the operator clicked (m5 §15 D6). PFS carried across the walls by a move
 to another well is #454's, for both paths (FM-223). *Settled by #454*
 (§5.6): `goto-well` switches an engaged autofocus off before its move.
