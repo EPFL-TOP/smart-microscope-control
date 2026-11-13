@@ -20,6 +20,7 @@ import io
 import json
 import math
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -268,6 +269,13 @@ def _render(
     )
 
 
+#: What `_walk` renders its frames with: `_render`'s signature.
+Render = Callable[
+    [PlateSample, tuple[float, float], tuple[int, int], float, float, bool],
+    npt.NDArray[np.uint16],
+]
+
+
 def _centre_of(sample: PlateSample, well: str) -> tuple[float, float]:
     """The well's true centre from the sample's own plate: the oracle."""
     plan = useq.WellPlatePlan(
@@ -292,6 +300,7 @@ def _walk(
     pixel_um: float,
     camera_deg: float,
     mirrored: bool,
+    render: Render = _render,
 ) -> tuple[npt.NDArray[np.float64], int]:
     """§17.4's walk for one well, with no stage: the edge points of its four centred frames, and the frames taken."""
     matrix = _matrix(pixel_um, camera_deg, mirrored)
@@ -306,7 +315,7 @@ def _walk(
             at = (recorded[0] + outward[0] * d, recorded[1] + outward[1] * d)
             taken += 1
             edge = find_wall(
-                _render(sample, at, shape, pixel_um, camera_deg, mirrored),
+                render(sample, at, shape, pixel_um, camera_deg, mirrored),
                 outward_xy=outward,
                 matrix=matrix,
             )
@@ -326,7 +335,7 @@ def _walk(
         at = (recorded[0] + outward[0] * found, recorded[1] + outward[1] * found)
         taken += 1
         edge = find_wall(
-            _render(sample, at, shape, pixel_um, camera_deg, mirrored),
+            render(sample, at, shape, pixel_um, camera_deg, mirrored),
             outward_xy=outward,
             matrix=matrix,
         )
@@ -370,6 +379,97 @@ def test_the_centre_of_a_well_is_recovered_within_a_micrometre(
         assert math.dist(fit.center_xy_um, truth) < 1.0
         assert fit.diameter_um == pytest.approx(2.0 * radius_um, abs=2.0)
         assert fit.n_used >= 0.95 * fit.n_points
+
+
+def _render_with_meniscus(
+    sample: PlateSample,
+    at: tuple[float, float],
+    shape: tuple[int, int],
+    pixel_um: float,
+    camera_deg: float,
+    mirrored: bool,
+    *,
+    centre: tuple[float, float],
+    radius_um: float,
+) -> npt.NDArray[np.uint16]:
+    """``_render``, then the well's meniscus and an inner ring painted on, from each pixel's stage position (#409).
+
+    ``d_in`` is how far a pixel lies inside the wall of the well centred at
+    ``centre``. The meniscus is the 800 µm inside the wall, darkened to 0.3 of
+    the way from the plastic's level to the well's; the ring is 250 µm wide,
+    its middle 1.6 mm inside the wall, at 0.05 (B5's -Y ridge, §17.1). The
+    pixel's position is written out from the matrix, as `wall_points_um` has it
+    but without calling it: the test does not use what it tests.
+    """
+    frame = _render(sample, at, shape, pixel_um, camera_deg, mirrored)
+    height, width = shape
+    (m00, m01), (m10, m11) = _matrix(pixel_um, camera_deg, mirrored)
+    d_col = np.arange(width, dtype=np.float64) - (width - 1) / 2.0
+    d_row = np.arange(height, dtype=np.float64)[:, None] - (height - 1) / 2.0
+    x = at[0] + m00 * d_col + m01 * d_row
+    y = at[1] + m10 * d_col + m11 * d_row
+    d_in = radius_um - np.hypot(x - centre[0], y - centre[1])
+    factor = np.ones_like(d_in)
+    factor[(d_in >= 0.0) & (d_in < 800.0)] = 0.3
+    factor[np.abs(d_in - 1_600.0) < 125.0] = 0.05
+    plastic = sample.plastic_level
+    painted = plastic + (frame.astype(np.float64) - plastic) * factor
+    return np.rint(np.clip(painted, 0.0, 65_535.0)).astype(np.uint16)
+
+
+@pytest.mark.parametrize(
+    "off",
+    [(0.0, 1_900.0), (-1_200.0, 900.0)],
+    ids=["B5's 1.9 mm in Y", "1.2 mm in X and 0.9 mm in Y"],
+)
+def test_a_well_with_a_meniscus_and_an_inner_ring_is_measured_at_its_wall(
+    off: tuple[float, float],
+) -> None:
+    # The acceptance criterion of #409, on a 24-well at the Ti2-E's 4x
+    # (2.739 µm per pixel, the camera at 177.437°, not mirrored) on a frame that
+    # is not square (FM-73). The meniscus shades the inside and a ring lies 1.6 mm
+    # inside the wall, as on B5; the recorded centre is off by B5's 1.9 mm or by
+    # another vector. The first fall below the midpoint is the ring's or the
+    # shadow's: the midpoint rule fitted this well 3 450 µm short of its diameter.
+    sample = PlateSample("24-well", A1, 0.0, seed=3)
+    truth = _centre_of(sample, "A1")
+    radius_um = _radius_of(sample)
+    pixel_um, shape, camera_deg = 2.739, (1412, 1600), 177.437
+
+    def render(
+        sample: PlateSample,
+        at: tuple[float, float],
+        shape: tuple[int, int],
+        pixel_um: float,
+        camera_deg: float,
+        mirrored: bool,
+    ) -> npt.NDArray[np.uint16]:
+        return _render_with_meniscus(
+            sample,
+            at,
+            shape,
+            pixel_um,
+            camera_deg,
+            mirrored,
+            centre=truth,
+            radius_um=radius_um,
+        )
+
+    recorded = (truth[0] + off[0], truth[1] + off[1])
+    points, _ = _walk(
+        sample,
+        recorded,
+        radius_um=radius_um,
+        shape=shape,
+        pixel_um=pixel_um,
+        camera_deg=camera_deg,
+        mirrored=False,
+        render=render,
+    )
+    fit = fit_circle(points, floor_um=2.0 * pixel_um)
+    assert math.dist(fit.center_xy_um, truth) < 1.0
+    assert fit.diameter_um == pytest.approx(2.0 * radius_um, abs=2.0)
+    assert fit.n_used >= 0.95 * fit.n_points
 
 
 def test_a_wall_is_found_on_each_side_with_a_turned_mirrored_camera() -> None:
