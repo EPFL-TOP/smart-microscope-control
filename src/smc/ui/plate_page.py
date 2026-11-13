@@ -95,7 +95,6 @@ from smc.ui.guide import (
     SCREEN_TITLES,
     STEPS,
     CentreRow,
-    GotoAnswer,
     NextStep,
     ResultRow,
     StepName,
@@ -643,12 +642,7 @@ class PlatePageView:
         # it names (``PageStatus.goto_answer``), so every tab draws the same (FM-151).
         self._rows_drawn: tuple[CentreRow, ...] = ()
         self._register_drawn: tuple[tuple[str, ...], str | None] = ((), None)
-        # The drive's answer this view last drew, and the state it was first seen in: an answer
-        # is about the plate, the centres and the registration it was sent in, and this view
-        # stops drawing it when one of them changes (``_goto_state``). Per view: another tab
-        # sees the same answer from the controller, and judges it by its own redraws.
-        self._answer_seen: GotoAnswer | None = None
-        self._answer_basis: tuple[Any, ...] | None = None
+
         # The Wells and Scan screens (m5 §17.10): the last status the tick read, for the
         # texts ``refresh()`` redraws (it never reads the stand, #333), and how many of the
         # plan's fields the map shows as imaged *from the progress*: ``None`` while it shows
@@ -2109,22 +2103,6 @@ class PlatePageView:
         self._try(lambda: self.page.run(plugin, params))
         self.tick()
 
-    def _goto_state(self) -> tuple[Any, ...]:
-        """What a drive's answer on a row was about: the plate, the centres and the registered plate.
-
-        An answer (a refusal, ``At A1, the holder's estimate``) is true of the state it was sent
-        in, and is dropped from the row by the redraw that finds another: ``not registered`` must
-        not stay under ``Registered:``, nor a refusal for an unplaced map after a capture placed it.
-        (The controller clears the answer itself when a registration ends or the plate changes:
-        this is the view's rule for the others, the captures.)
-        """
-        view = self._view
-        return (
-            self.page.plate,
-            self.page.refs,
-            None if view is None else view.registered,
-        )
-
     def _row(self, index: int) -> CentreRow | None:
         """The centre row ``index`` as the last redraw drew it, or ``None`` when it has none."""
         rows = self._rows_drawn
@@ -3417,12 +3395,10 @@ class PlatePageView:
                 running=running, live=live, from_sample=page.registers_from_sample
             ),
         )
-        status = self._status
-        answer = None if status is None else status.goto_answer
-        if answer is not self._answer_seen:
-            self._answer_seen, self._answer_basis = answer, self._goto_state()
-        elif answer is not None and self._goto_state() != self._answer_basis:
-            answer = None
+        # The controller's answer as it is now, not the tick's copy: a redraw that follows a
+        # capture or a registration must not show the one it ended (FM-151, FM-145: a read of
+        # one attribute, no stand).
+        answer = page.goto_answer
         trouble = answer is not None and answer.phase in ("refused", "failed")
         for slot, row in zip(self.centre_slots, self._rows_drawn, strict=False):
             slot.goto_button.disabled = not connected or running is not None

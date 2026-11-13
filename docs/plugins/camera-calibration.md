@@ -87,7 +87,14 @@ judgement of the shifts:
   beads or cells on a dark background fill under 1 % of the frame, so the
   percentiles read it as dark, and a frame also carries light when at least 0.01 %
   of its pixels (20 of a 384 x 512 frame, 199 of 1412 x 1412) lie the floor or
-  more from its median; a handful of hot pixels is far below that.
+  more from its median; a handful of hot pixels is far below that. The measure
+  (`signal_spread`, `signal_floor_counts`, `carries_signal` and their two constants)
+  lives in `smc.plugins.frame_signal`, which holds only numpy: the plate page asks the
+  same question of each frame of Snap and Live (m5 §17.12 D22) and says `The frame is
+  dark` with the same floor. `camera_calibration/algorithm.py` imports the names back,
+  so the plugin and its tests are unchanged. `frame_signal.saturated` (at least 1 % of
+  the pixels at the camera's full scale, an **assumed** fraction) is the page's; the
+  calibration's own saturation refusal below is its own.
 - `the camera's frame is saturated (...): lower the exposure or the light; nothing
   was moved`: the same refusal for a frame at full scale (65535 at 16 bits): the
   remedy is the opposite one.

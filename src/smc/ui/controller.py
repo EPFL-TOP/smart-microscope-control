@@ -313,6 +313,9 @@ JOG_WALL_MARGIN_UM = 500.0
 
 _Capture = TypeVar("_Capture", WellRef, WallTouch)
 
+#: "No ``view()`` has read the run document yet": not an attempt, and not ``None`` (no provider).
+_UNSEEN = object()
+
 
 #: The providers of ``plate`` whose ``plate`` parameter is the plate on the stage. Another
 #: provider's parameter of that name means something else (``plate-finding``'s sizes its
@@ -1485,6 +1488,9 @@ class PlatePage:
         self._goto = ""
         self._goto_answer: GotoAnswer | None = None
         self._last_ended: _Ended | None = None
+        # The latest provider of ``plate`` as the last ``view()`` found it, to see a registration
+        # that another process made (``_note_plate_attempt``).
+        self._plate_attempt: tuple[str, str] | object | None = _UNSEEN
         self._frame: Frame | None = None
         # The newest frame a run handed (m3 §25.5): its own lock, taken inside
         # ``_lock`` and never around it.
@@ -1709,6 +1715,21 @@ class PlatePage:
         if registered is None or registered.plate != self._plate:
             return None
         return cast("PlateResult", registered)
+
+    def _note_plate_attempt(self, record: StageRecord | None) -> None:
+        """A registration the page did not run itself (``smc run`` in a terminal) ends a drive's text too (m5 §17.12.3).
+
+        The page clears the text when a run of its own provides ``plate`` (``_run_plugin``); this
+        is the same rule for one written to the run document meanwhile, found when a view reads it:
+        ``... not registered`` must not stay under ``Registered:`` whoever registered. The first
+        read only notes the attempt, since nothing was said before it.
+        """
+        seen = None if record is None else (record.plugin, record.attempt)
+        previous, self._plate_attempt = self._plate_attempt, seen
+        if previous is not _UNSEEN and previous != seen:
+            with self._lock:
+                self._goto = ""
+                self._goto_answer = None
 
     def _note_registered(self, registered: PlateResult | None) -> None:
         """Keep the registered plate's orientation for ``orientation``; one assignment, read without a lock."""
@@ -1988,7 +2009,30 @@ class PlatePage:
             name: objective,
         }
         self.refs = (*kept, ref)
+        self._drop_goto_answer()
         return ref
+
+    @property
+    def goto_answer(self) -> GotoAnswer | None:
+        """What the last *Go to* said for the row of its well, as it is now (m5 §17.12.3).
+
+        The same value ``status().goto_answer`` carries, without reading the stand: a redraw
+        that follows a capture or a registration shows the row's new answer at once and not at
+        the next tick.
+        """
+        with self._lock:
+            return self._goto_answer
+
+    def _drop_goto_answer(self) -> None:
+        """The row's answer to the last *Go to* is about the centres as they were: a capture or a forgotten centre ends it (m5 §17.12.3).
+
+        For every tab at once, and not a marker each tab keeps (FM-225): ``At A1.`` is true
+        until the operator captures A1 or forgets it, and a refusal for an unplaced map is not
+        the word of a map whose centres changed. The drive bar's own line, ``goto``, stays
+        until the next drive, a plate change, a registration or *Refresh*.
+        """
+        with self._lock:
+            self._goto_answer = None
 
     @staticmethod
     def _objective_in_place(
@@ -2082,6 +2126,7 @@ class PlatePage:
             self.refs = ()
             self.walls = ()
             self._capture_objectives = {}
+            self._drop_goto_answer()
             return
         name = normalise_well(well)
         self.refs = tuple(r for r in self.refs if normalise_well(r.well) != name)
@@ -2089,6 +2134,7 @@ class PlatePage:
         self._capture_objectives = {
             w: o for w, o in self._capture_objectives.items() if w != name
         }
+        self._drop_goto_answer()
 
     def page_params(self, plugin: str) -> list[str]:
         """The ``key=value`` pairs the page fills itself for ``plugin`` (``PAGE_PARAMS``).
@@ -4214,6 +4260,7 @@ class PlatePage:
             if registered is not None and registered.plate == self._plate
             else None
         )
+        self._note_plate_attempt(plate_record)
         return PlateView(
             plate=self._plate,
             nominal=pose.kind in ("estimated", "unplaced"),

@@ -6480,3 +6480,66 @@ def test_run_file_names_a_file_the_document_gained_after_the_page_was_built(
         )
     finally:
         page.close()
+
+
+def test_a_capture_a_forgotten_centre_and_a_plate_change_end_the_drives_answer_for_every_tab(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # FM-225: a marker each tab keeps for a text the controller keeps once lied. The answer is the
+    # controller's, and what it was about ends it, for every tab at once.
+    page = _goto_page(fake_microscope, run_doc)
+    try:
+        stage = fake_microscope.require(XYStage)
+
+        def drive() -> None:
+            page.goto("B2")
+            assert page.join(10.0)
+            assert page.status().goto_answer == GotoAnswer("B2", "at", False, "")
+
+        drive()
+        stage.move_to_um(1.0, 2.0)
+        page.capture_centre("B2")
+        # The answer goes; the drive bar's line stays until the next drive (or Refresh).
+        assert page.goto_answer is None
+        assert page.status().goto_answer is None
+        assert page.status().goto.startswith("Go to done in ")
+
+        drive()
+        page.forget("B2")
+        assert page.goto_answer is None
+        drive()
+        page.forget()
+        assert page.goto_answer is None
+
+        drive()
+        page.choose_plate("384-well")
+        assert page.status().goto == ""
+        assert page.goto_answer is None
+        # Choosing the plate already shown is the confirmation, and clears nothing.
+        page.choose_plate("384-well")
+    finally:
+        page.close()
+
+
+def test_a_registration_made_elsewhere_clears_the_drives_text_when_a_view_reads_it(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # `smc run plate-registration` in a terminal: the page ran nothing, and finds the new attempt
+    # when it reads the run document (`view()`).
+    page = _goto_page(fake_microscope, run_doc)
+    try:
+        page.view()
+        page.goto("B2")
+        assert page.join(10.0)
+        assert page.goto_answer is not None
+        # Nothing changed: reading again keeps the answer the operator is reading.
+        page.view()
+        assert page.goto_answer is not None
+
+        _seed(run_doc, "plate-registration", "plate", _plate(), minute=10)
+        page.view()
+
+        assert page.goto_answer is None
+        assert page.status().goto == ""
+    finally:
+        page.close()
