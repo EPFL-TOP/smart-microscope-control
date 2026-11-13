@@ -97,6 +97,7 @@ def _stand(
     engage_drives_z: bool = False,
     device_timeout_ms: int | None = None,
     first_lock: bool = False,
+    factors: dict[str, float] | None = None,
 ) -> tuple[FakeCore, Microscope]:
     """A fake demo stand; ``declares`` goes into ``[safety] stop_refused_by``.
 
@@ -104,6 +105,7 @@ def _stand(
     ``device_timeout_ms`` ``[micromanager] device_timeout_ms``: how long a move
     waits before it gives up. ``first_lock`` gives what a first lock from below
     needs (m2 §12.10): the demo's offset 0 as the floor, E and the direction.
+    ``factors`` is ``[autofocus.offset_per_um]``.
     """
     core = FakeCore.demo_like()
     profile = Profile.demo()
@@ -128,6 +130,9 @@ def _stand(
         autofocus = profile.autofocus.model_copy(
             update={"engage_drives_z_to_offset": True}
         )
+        profile = profile.model_copy(update={"autofocus": autofocus})
+    if factors is not None:
+        autofocus = profile.autofocus.model_copy(update={"offset_per_um": factors})
         profile = profile.model_copy(update={"autofocus": autofocus})
     return core, Microscope.from_core(
         cast("CMMCorePlus", core), profile, dry_run=dry_run
@@ -628,6 +633,18 @@ _first_lock_excursion.engage_drives_z = True  # type: ignore[attr-defined]
 _first_lock_excursion.first_lock = True  # type: ignore[attr-defined]
 
 
+def _first_lock_factor_contradicts(
+    core: FakeCore, microscope: Microscope
+) -> tuple[str, str]:
+    """A factor whose sign puts the floor's plane toward the sample (m2 §12.12 D12)."""
+    return _outcome(microscope.require(Autofocus).engage)
+
+
+_first_lock_factor_contradicts.engage_drives_z = True  # type: ignore[attr-defined]
+_first_lock_factor_contradicts.first_lock = True  # type: ignore[attr-defined]
+_first_lock_factor_contradicts.factors = {"Nikon 10X S Fluor": -6.0}  # type: ignore[attr-defined]
+
+
 def _seen_floor_state_unreadable(
     core: FakeCore, microscope: Microscope
 ) -> tuple[str, str]:
@@ -973,6 +990,19 @@ _DECLARED_EMERGENCY_STOP = (
             id="first-lock-excursion",
         ),
         pytest.param(
+            _first_lock_factor_contradicts,
+            "_EngageRefusedError",
+            "autofocus Autofocus: not engaged: a first lock from the offset's floor "
+            "(m2 §12.10) needs the lowest offset to name the plane farthest from the "
+            "sample, but [autofocus.offset_per_um] for objective 'Nikon 10X S Fluor' "
+            "(-6) says a larger offset gives a smaller Z and [safety] "
+            'z_away_from_sample is "decreasing", so the floor\'s plane lies toward '
+            "the sample (m2 §12.12 D12). One of the two is wrong for this stand: "
+            "check both at the stand; until then smc engages only at an offset it "
+            "has read locked",
+            id="first-lock-factor-contradicts",
+        ),
+        pytest.param(
             _seen_floor_state_unreadable,
             "_EngageRefusedError",
             "autofocus Autofocus: not engaged: its state could not be read (device "
@@ -1004,6 +1034,7 @@ def test_a_failed_stop_or_switch_off_frees_the_core(
         engage_drives_z=getattr(scenario, "engage_drives_z", False),
         device_timeout_ms=getattr(scenario, "device_timeout_ms", None),
         first_lock=getattr(scenario, "first_lock", False),
+        factors=getattr(scenario, "factors", None),
     )
     assert scenario(core, microscope) == (kind, message)
     core.failing.clear()

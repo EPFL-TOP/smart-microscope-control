@@ -706,11 +706,27 @@ TOWARD = (
     "a lower one: do not engage PFS here with this objective. The guard reads Z "
     "every 10 ms: it stops PFS once a jump is read, it does not prevent one"
 )
+# The same trip on an "increasing" stand: its three words follow the direction
+# (m2 §12.12 D15).
+TOWARD_INCREASING = (
+    "autofocus PFS: Z went from {z_start:.2f} µm to {z_um:.2f} µm while it engaged "
+    "from the offset's floor, more than [safety] {bound} toward the sample; it was "
+    "switched off. The floor's plane is not above where Z started: focus on the "
+    "sample by eye before a first lock; if Z was already there, the floor's plane "
+    "lies below the focus at this place (m2 §12.11), and no offset smc may set names "
+    "a higher one: do not engage PFS here with this objective. The guard reads Z "
+    "every 10 ms: it stops PFS once a jump is read, it does not prevent one"
+)
 E_BOUND = "max_engage_excursion_um (50 µm)"
 R_BOUND = "first_lock_max_rise_um (5 µm)"
 
 
-def _first_lock(*, declared: bool = True, **safety: Any) -> Profile:
+def _first_lock(
+    *,
+    declared: bool = True,
+    factors: dict[str, float] | None = None,
+    **safety: Any,
+) -> Profile:
     return _profile(
         autofocus={
             "settle_s": 0.05,
@@ -718,6 +734,7 @@ def _first_lock(*, declared: bool = True, **safety: Any) -> Profile:
             "engage_drives_z_to_offset": declared,
             "lock_timeout_s": LOCK_TIMEOUT_S,
             "offset_unit": "PFSOffset units",
+            "offset_per_um": factors or {},
         },
         safety={
             **LIMITS,
@@ -954,12 +971,13 @@ def test_an_increasing_stand_mirrors_the_first_lock_band() -> None:
         _jumps_to(stand, 3400.0)
         assert stand.af.engage() is True
         assert stand.z.position_um() == 3400.0
-    # 60 µm below Z: toward the sample.
+    # 60 µm below Z: toward the sample. The words follow the direction (m2 §12.12
+    # D15); the Ti2-E's test above keeps the "decreasing" ones.
     with _stand(profile, offset=FLOOR, z_um=3000.0) as stand:
         _jumps_to(stand, 2940.0)
         with pytest.raises(AutofocusExcursionError) as jumped:
             stand.af.engage()
-        assert str(jumped.value) == TOWARD.format(
+        assert str(jumped.value) == TOWARD_INCREASING.format(
             z_start=3000.0, z_um=2940.0, bound=E_BOUND
         )
         assert stand.core.log == [ON, OFF]
@@ -1169,7 +1187,7 @@ def test_an_increasing_stand_bounds_a_first_locks_rise_by_first_lock_max_rise_um
         _jumps_to(stand, 2992.0)
         with pytest.raises(AutofocusExcursionError) as jumped:
             stand.af.engage()
-        assert str(jumped.value) == TOWARD.format(
+        assert str(jumped.value) == TOWARD_INCREASING.format(
             z_start=3000.0, z_um=2992.0, bound=R_BOUND
         )
         assert stand.core.log == [ON, OFF]
@@ -1486,3 +1504,133 @@ def test_a_turn_records_no_seen_offset() -> None:
 
         assert str(refused.value) == _unseen_at(7927.0, advice=FROM_BELOW)
         assert stand.core.log == []
+
+
+# --- D12-D14: first-lock follow-ups (m2 §12.12, #349) -----------------------------
+#
+# D12: the floor's plane lies away from the sample iff (factor > 0) ==
+# (z_away_from_sample == "decreasing"). The four sign/direction pairs each have
+# a test, so that a check on the factor's sign alone, or on the direction alone,
+# dies.
+
+CONTRADICTS = (
+    "autofocus PFS: not engaged: a first lock from the offset's floor (m2 §12.10) "
+    "needs the lowest offset to name the plane farthest from the sample, but "
+    "[autofocus.offset_per_um] for objective '10x' ({factor}) says a larger offset "
+    'gives a {larger} Z and [safety] z_away_from_sample is "{direction}", so the '
+    "floor's plane lies toward the sample (m2 §12.12 D12). One of the two is wrong "
+    "for this stand: check both at the stand; until then smc engages only at an "
+    "offset it has read locked"
+)
+
+
+def test_a_positive_factor_on_an_increasing_stand_refuses_the_first_lock_with_nothing_sent() -> (
+    None
+):
+    profile = _first_lock(z_away_from_sample="increasing", factors={"10x": 6.0})
+    with _stand(profile, offset=FLOOR, z_um=3000.0) as stand:
+        _jumps_to(stand, 3400.0)
+        with pytest.raises(SafetyRefusedError) as refused:
+            stand.af.engage()
+        assert str(refused.value) == CONTRADICTS.format(
+            factor="6", larger="larger", direction="increasing"
+        )
+        assert refused.value.how_to_force == ""
+        assert stand.core.log == []
+
+
+def test_a_negative_factor_on_a_decreasing_stand_refuses_the_first_lock_with_nothing_sent() -> (
+    None
+):
+    with _stand(_first_lock(factors={"10x": -6.0}), offset=FLOOR) as stand:
+        _plane_follows_the_offset(stand)
+        with pytest.raises(SafetyRefusedError) as refused:
+            stand.af.engage()
+        assert str(refused.value) == CONTRADICTS.format(
+            factor="-6", larger="smaller", direction="decreasing"
+        )
+        assert refused.value.how_to_force == ""
+        assert stand.core.log == []
+
+
+def test_a_negative_factor_on_an_increasing_stand_takes_the_first_lock() -> None:
+    profile = _first_lock(z_away_from_sample="increasing", factors={"10x": -6.0})
+    with _stand(profile, offset=FLOOR, z_um=3000.0) as stand:
+        _jumps_to(stand, 3400.0)
+        assert stand.af.engage() is True
+        assert stand.z.position_um() == 3400.0
+        assert stand.core.log == [ON]
+
+
+def test_a_positive_factor_on_a_decreasing_stand_takes_the_first_lock() -> None:
+    # The Ti2-E's case: 5.9 units/µm at the 10x, "decreasing" (m2 §12.12.1).
+    with _stand(_first_lock(factors={"10x": 6.0}), offset=FLOOR) as stand:
+        _plane_follows_the_offset(stand)
+        assert stand.af.engage() is True
+        assert stand.z.position_um() == FLOOR_PLANE
+        assert stand.core.log == [ON]
+
+
+def test_a_factor_for_another_objective_does_not_refuse_the_first_lock() -> None:
+    # D12 reads the factor of the objective in place only (m2 §12.12.3).
+    profile = _first_lock(z_away_from_sample="increasing", factors={"40x": 6.0})
+    with _stand(profile, offset=FLOOR, z_um=3000.0) as stand:
+        _jumps_to(stand, 3400.0)
+        assert stand.af.engage() is True
+        assert stand.core.log == [ON]
+
+
+def test_dry_run_first_lock_with_a_contradicting_factor_is_refused_too() -> None:
+    profile = _first_lock(factors={"10x": -6.0})
+    with _stand(profile, offset=FLOOR, dry_run=True) as stand:
+        with pytest.raises(SafetyRefusedError) as refused:
+            stand.af.engage()
+        assert str(refused.value) == CONTRADICTS.format(
+            factor="-6", larger="smaller", direction="decreasing"
+        )
+        assert stand.core.log == []
+
+
+def test_a_retry_after_a_first_locks_trip_is_a_first_lock_again() -> None:
+    # D13: nothing refuses a retry. It starts where the trip left Z, so a series
+    # rises by R each time, bounded by the Z soft limits alone (D11).
+    with _stand(_first_lock(**RISE), offset=FLOOR) as stand:
+        _jumps_to(stand, Z0 + 8.0)
+        with pytest.raises(AutofocusExcursionError) as first:
+            stand.af.engage()
+        assert (first.value.z_start_um, first.value.z_um) == (Z0, Z0 + 8.0)
+        stand.core.log.clear()
+        _jumps_to(stand, Z0 + 16.0)
+        with pytest.raises(AutofocusExcursionError) as second:
+            stand.af.engage()
+        assert str(second.value) == TOWARD.format(
+            z_start=Z0 + 8.0, z_um=Z0 + 16.0, bound=R_BOUND
+        )
+        assert second.value.z_start_um == first.value.z_um
+        assert stand.core.log == [ON, OFF]
+
+
+def test_a_first_lock_below_the_floor_that_drops_past_the_z_soft_limit_says_set_the_floor() -> (
+    None
+):
+    # Measured in planning #349: from 4269.44 to 3614.94 µm. "Raise the floor" cannot
+    # help an offset that is already below it (m2 §12.12 D14).
+    profile = _first_lock(z_soft_limits_um=(4000.0, 4350.0))
+    with _stand(profile, offset=4000.0) as stand:
+        _plane_follows_the_offset(stand)
+        with pytest.raises(AutofocusExcursionError) as jumped:
+            stand.af.engage()
+        assert str(jumped.value) == (
+            f"autofocus PFS: Z went from {Z0:.2f} µm to 3614.94 µm while it engaged "
+            "from the offset's floor, outside the soft limits [4000, 4350] µm; it was "
+            "switched off. The offset (4000 PFSOffset units) is below its floor (5000 "
+            "PFSOffset units), and its plane lies past the Z soft limits, away from the "
+            "sample: set the offset to its floor and engage again (m2 §12.12 D14). The "
+            "guard reads Z every 10 ms: it stops PFS once a jump is read, it does not "
+            "prevent one"
+        )
+        assert (jumped.value.z_start_um, jumped.value.z_um) == (
+            Z0,
+            Z0 + (4000.0 - SEEN_OFFSET) / 6.0,
+        )
+        assert stand.core.log == [ON, OFF]
