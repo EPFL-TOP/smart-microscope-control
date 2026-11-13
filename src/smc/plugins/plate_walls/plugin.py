@@ -20,9 +20,18 @@ recorded, and the decisions in it that keep a registration from lying:
   well: a wall that is not found, a well of another size, a circle that does not
   hold, a well that the others do not put where it is. A refusal leaves the
   stage where it is.
+* **An engaged autofocus is switched off once, before anything moves** (m3 §5.7
+  D1). PFS locked in one well follows its reference over the wall into the next,
+  whose plane lay at least 104 µm away at the 40x, with nothing holding the
+  microscope (m2 §12.2 D2, FM-223). So after every refusal and the stop check,
+  PFS on (or searching) is switched off and read back, every wall and well is
+  walked with it off, and the record says so first (``AUTOFOCUS_OFF_LINE``);
+  the operator engages it again on the sample. Nothing engages it. A switch-off
+  that fails or does not hold fails the run before anything moves (FM-19); one
+  that is off is left alone.
 * **Nothing moves to put something back** (FM-88): no return and no ``finally``
   that moves. On any exception a WARNING says where the stage was left. No Z,
-  turret, autofocus or light is touched.
+  turret or light is touched, and the autofocus only as above, never engaged.
 * **A halt is not a refusal** (FM-64): ``SafetyRefusedError`` from a move is a
   refusal that names the well and the side; ``MicroscopeHaltedError`` and
   ``MotionStoppedError`` are not ``SafetyRefusedError``s and pass unchanged.
@@ -37,7 +46,7 @@ from typing import TYPE_CHECKING
 import useq
 from pydantic import Field, field_validator
 
-from smc.hardware.capabilities import Camera, ObjectiveTurret, XYStage
+from smc.hardware.capabilities import Autofocus, Camera, ObjectiveTurret, XYStage
 from smc.plugins.api import PluginParams, RunContext
 from smc.plugins.errors import PluginRunError
 from smc.plugins.plate_registration.algorithm import (
@@ -52,6 +61,7 @@ from smc.plugins.plate_walls.algorithm import (
     walk_offsets_um,
 )
 from smc.plugins.plate_walls.loop import (
+    AUTOFOCUS_OFF_LINE,
     WallWalk,
     Where,
     check_calibration,
@@ -61,6 +71,7 @@ from smc.plugins.plate_walls.loop import (
     checked_search,
     measure_well,
     move,
+    switch_off_autofocus,
     warn_left,
 )
 from smc.plugins.slots import (
@@ -201,9 +212,10 @@ class PlateWallsPlugin:
                 than two, more than six, off the plate, twice or beyond the
                 stage's travel, a calibration that is not of this objective and
                 frame, a frame that is too small or holds a whole well, a walk
-                that is too long or leaves the soft limits (nothing moved); or,
-                the stage then where it was left: a wall that is not found or
-                was lost, a move the layer refused, a frame of another shape, a
+                that is too long or leaves the soft limits, an engaged
+                autofocus that could not be switched off or still reads on
+                (nothing moved); or, the stage then where it was left: a wall
+                that is not found or was lost, a move the layer refused, a frame of another shape, a
                 well of another size or whose walls do not make a circle, a
                 well that the others do not put where it is, a rotation beyond
                 ``max_rotation_deg``.
@@ -263,6 +275,13 @@ class PlateWallsPlugin:
             folder_text=f"plate-walls/{token}" if params.save_frames else None,
             no_wall_hint=_NO_WALL_HINT,
         )
+
+        # After every refusal that can come before the first move, and outside the
+        # `try` below: nothing has moved, so no warning says where the stage was
+        # left. A stop asked now keeps the lock (m3 §5.7 D1).
+        ctx.raise_if_stopped()
+        if switch_off_autofocus(_NAME, microscope.get(Autofocus), ctx):
+            assumed.insert(0, AUTOFOCUS_OFF_LINE)
 
         # A stage still travelling from an earlier move reads a fraction of it.
         xy.wait()

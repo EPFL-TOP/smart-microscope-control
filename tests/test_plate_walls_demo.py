@@ -36,9 +36,11 @@ import pytest
 import tifffile
 import useq
 
+from recording_autofocus import RecordingAutofocus
 from smc.hardware import Microscope
 from smc.hardware.capabilities import (
     XY,
+    Autofocus,
     Camera,
     Limits,
     ObjectiveOffset,
@@ -46,6 +48,7 @@ from smc.hardware.capabilities import (
     XYStage,
 )
 from smc.hardware.errors import (
+    CoreError,
     HardwareError,
     MicroscopeHaltedError,
     MotionStoppedError,
@@ -994,6 +997,10 @@ def test_a_calibration_of_another_frame_is_refused_before_anything_moves(
     camera = _on_fake(fake_microscope)
     stage = _Stage(fake_microscope.require(XYStage))
     fake_microscope.override(XYStage, stage)
+    # A refusal that comes before anything moves comes before the autofocus is
+    # touched too: a PFS switched off for a run that never moves is a loss (#478).
+    af = RecordingAutofocus(engaged=True)
+    fake_microscope.override(Autofocus, af)
     run_doc = tmp_path / "run.json"
     now = fake_microscope.require(ObjectiveTurret).current()
     ask = (
@@ -1031,6 +1038,8 @@ def test_a_calibration_of_another_frame_is_refused_before_anything_moves(
         assert refused.reason == reason
     assert stage.moves == 0
     assert camera.snaps == 0
+    assert "disengage" not in af.calls
+    assert af.engaged is True
 
 
 def test_a_dry_run_is_refused(demo_microscope_dry: Microscope, tmp_path: Path) -> None:
@@ -1775,3 +1784,280 @@ def test_the_start_is_read_after_the_stage_has_arrived(
     assert record.status is StageStatus.stopped
     (line,) = [r.getMessage() for r in caplog.records if r.name == LOGGER]
     assert line.endswith("not returned to (0.0, 0.0) µm where it started")
+
+
+# ------------------------- PFS across a well's wall: the switch-off (m3 §5.7, #478)
+
+AUTOFOCUS_OFF_LINE = (
+    "the autofocus was switched off before anything moved, so that no lock crossed "
+    "a well's wall: engage it again on the sample"
+)
+AUTOFOCUS_OFF_WARNING = (
+    "plate-walls: the autofocus was switched off before anything moved, so that no "
+    "lock crosses a well's wall (m2 §12.2 D2): engage it again after the run"
+)
+#: What a registration of two wells says today, with an autofocus that is off.
+TODAY_ASSUMED = (
+    "the stage reports no soft limits, so the frames' moves were not checked "
+    "against any travel",
+    "two wells: the residual checks their distance only; a third well checks the fit",
+)
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The plugin's own warnings: ``override`` warns too, on the layer's logger."""
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and r.name == LOGGER
+    ]
+
+
+def test_plate_walls_switches_an_engaged_autofocus_off_before_anything_moves_and_says_so_first(
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    stand, camera = _on_demo(demo_microscope_with_sample)
+    run_doc = tmp_path / "run.json"
+    _calibrate(stand, camera, run_doc)
+    af = RecordingAutofocus(engaged=True)
+    stand.override(Autofocus, af)
+
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        result = _result(_run(stand, run_doc, _refs("A1", "H12")))
+
+    # The whole list: one switch-off for the run, however many walls and wells.
+    assert af.calls == ["is_engaged", "disengage", "is_engaged"]
+    assert af.engaged is False
+    assert result.assumed == (AUTOFOCUS_OFF_LINE, *TODAY_ASSUMED)
+    assert _warnings(caplog) == [AUTOFOCUS_OFF_WARNING]
+
+
+def test_plate_walls_switches_the_autofocus_off_before_its_first_move(
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The order: the switch-off and its read back, then the first move of the walk."""
+    stand, camera = _on_demo(demo_microscope_with_sample)
+    run_doc = tmp_path / "run.json"
+    _calibrate(stand, camera, run_doc)
+    af = RecordingAutofocus(engaged=True)
+    stand.override(Autofocus, af)
+    stage = stand.require(XYStage)
+    real_move = stage.move_to_um
+
+    def move(x_um: float, y_um: float) -> XY:
+        af.calls.append("move_to_um")
+        return real_move(x_um, y_um)
+
+    monkeypatch.setattr(stage, "move_to_um", move)
+
+    _result(_run(stand, run_doc, _refs("A1", "H12")))
+
+    assert af.calls[:4] == ["is_engaged", "disengage", "is_engaged", "move_to_um"]
+    assert af.calls.count("disengage") == 1
+
+
+def test_plate_walls_leaves_an_autofocus_that_is_off_alone(
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    stand, camera = _on_demo(demo_microscope_with_sample)
+    run_doc = tmp_path / "run.json"
+    _calibrate(stand, camera, run_doc)
+    af = RecordingAutofocus(engaged=False)
+    stand.override(Autofocus, af)
+
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        result = _result(_run(stand, run_doc, _refs("A1", "H12")))
+
+    assert af.calls == ["is_engaged"]
+    assert result.assumed == TODAY_ASSUMED
+    assert _warnings(caplog) == []
+
+
+def test_plate_walls_switches_a_searching_autofocus_off_too(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    """PFS on and searching drives Z the moment it finds its reference (m2 §12.11 D9)."""
+    stand, camera = _on_demo(demo_microscope_with_sample)
+    run_doc = tmp_path / "run.json"
+    _calibrate(stand, camera, run_doc)
+    af = RecordingAutofocus(engaged=True, locked=False)
+    stand.override(Autofocus, af)
+
+    result = _result(_run(stand, run_doc, _refs("A1", "H12")))
+
+    assert af.calls == ["is_engaged", "disengage", "is_engaged"]
+    assert result.assumed[0] == AUTOFOCUS_OFF_LINE
+
+
+def test_a_stop_before_plate_walls_moves_keeps_the_autofocus_on(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    stand, camera = _on_demo(demo_microscope_with_sample)
+    run_doc = tmp_path / "run.json"
+    _calibrate(stand, camera, run_doc)
+    af = RecordingAutofocus(engaged=True)
+    stand.override(Autofocus, af)
+    before = _here(stand)
+    stop = threading.Event()
+    stop.set()
+
+    record = _run(stand, run_doc, _refs("A1", "H12"), stop=stop)
+
+    assert record.status is StageStatus.stopped
+    assert "disengage" not in af.calls
+    assert af.engaged is True
+    assert _here(stand) == before
+    assert camera.snaps == 0
+
+
+_NOT_SWITCHED_OFF = (
+    "the autofocus could not be switched off before anything moved ({cause}): "
+    "nothing moved, and PFS may still be on: switch it off at the stand, then run "
+    "plate-walls again"
+)
+_STILL_ON = (
+    "the autofocus still reads on after it was switched off: nothing moved: switch "
+    "it off at the stand, then run plate-walls again"
+)
+
+
+@pytest.mark.parametrize(
+    ("options", "reason", "calls"),
+    [
+        (
+            {"fails": "disengage"},
+            _NOT_SWITCHED_OFF.format(cause="CoreError: disengage failed on the fake"),
+            ["is_engaged", "disengage"],
+        ),
+        (
+            {"fails": "is_engaged"},
+            _NOT_SWITCHED_OFF.format(cause="CoreError: is_engaged failed on the fake"),
+            ["is_engaged"],
+        ),
+        (
+            {"read_fails_after_off": True},
+            _NOT_SWITCHED_OFF.format(
+                cause="CoreError: is_engaged failed on the fake after the switch-off"
+            ),
+            ["is_engaged", "disengage", "is_engaged"],
+        ),
+        ({"stays_on": True}, _STILL_ON, ["is_engaged", "disengage", "is_engaged"]),
+    ],
+    ids=["disengage-raises", "read-raises", "read-back-raises", "still-on"],
+)
+def test_a_switch_off_that_fails_ends_plate_walls_before_anything_moves(
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    options: dict[str, Any],
+    reason: str,
+    calls: list[str],
+) -> None:
+    """Unknown counts as on (FM-19): the run fails with §5.7's text whole, and nothing moved."""
+    stand, camera = _on_demo(demo_microscope_with_sample)
+    run_doc = tmp_path / "run.json"
+    _calibrate(stand, camera, run_doc)
+    af = RecordingAutofocus(engaged=True, **options)
+    stand.override(Autofocus, af)
+    before = _here(stand)
+
+    refused = _refused(stand, run_doc, _refs("A1", "H12"))
+
+    assert refused.reason == reason
+    assert af.calls == calls
+    assert _here(stand) == before
+    assert camera.snaps == 0
+    stored = _stored(run_doc)
+    assert stored.status is StageStatus.failed
+    assert stored.error == f"PluginRunError: plate-walls: {reason}"
+
+
+def test_a_switch_off_error_of_several_lines_is_said_by_its_first_in_plate_walls(
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A vendor's message can run over lines: the run's text keeps one.
+    stand, camera = _on_demo(demo_microscope_with_sample)
+    run_doc = tmp_path / "run.json"
+    _calibrate(stand, camera, run_doc)
+    af = RecordingAutofocus(engaged=True)
+
+    def fails() -> None:
+        raise CoreError("PFS did not answer\nError in device PFS: 10")
+
+    monkeypatch.setattr(af, "disengage", fails)
+    stand.override(Autofocus, af)
+
+    refused = _refused(stand, run_doc, _refs("A1", "H12"))
+
+    assert refused.reason == _NOT_SWITCHED_OFF.format(
+        cause="CoreError: PFS did not answer"
+    )
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [MicroscopeHaltedError(), MotionStoppedError("the stage was stopped")],
+    ids=["halt", "motion-stopped"],
+)
+def test_a_halt_from_the_switch_off_reaches_the_caller_unchanged_in_plate_walls(
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: Exception,
+) -> None:
+    """A halt or a stop is not a switch-off that failed: it passes first (FM-64)."""
+    stand, camera = _on_demo(demo_microscope_with_sample)
+    run_doc = tmp_path / "run.json"
+    _calibrate(stand, camera, run_doc)
+    af = RecordingAutofocus(engaged=True)
+
+    def fails() -> None:
+        raise fault
+
+    monkeypatch.setattr(af, "disengage", fails)
+    stand.override(Autofocus, af)
+    before = _here(stand)
+
+    with pytest.raises(type(fault)) as info:
+        _run(stand, run_doc, _refs("A1", "H12"))
+
+    assert info.value is fault
+    assert _here(stand) == before
+    assert camera.snaps == 0
+
+
+def test_a_halted_stand_switches_the_autofocus_off_and_plate_walls_ends_on_the_halt(
+    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+) -> None:
+    """PFS off is the safe side; the first move then raises the halt (FM-64).
+
+    The stand's stop switches the autofocus off itself; one switched on again
+    while halted (at the stand) is what the tool's own switch-off meets.
+    """
+    stand, camera = _on_demo(demo_microscope_with_sample)
+    run_doc = tmp_path / "run.json"
+    _calibrate(stand, camera, run_doc)
+    af = RecordingAutofocus(engaged=True)
+    stand.override(Autofocus, af)
+    before = _here(stand)
+    stand.stop()
+    assert af.engaged is False  # the stop's own switch-off
+    af.engaged = True
+    af.calls.clear()
+    try:
+        with pytest.raises(MicroscopeHaltedError):
+            _run(stand, run_doc, _refs("A1", "H12"))
+    finally:
+        stand.resume()
+
+    assert af.calls == ["is_engaged", "disengage", "is_engaged"]
+    assert _stored(run_doc).status is StageStatus.failed
+    assert _here(stand) == before
+    assert camera.snaps == 0
