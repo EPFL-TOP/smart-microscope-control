@@ -27,11 +27,13 @@ if TYPE_CHECKING:
     from smc.plugins.slots import PlateResult, ScanPlanResult, WellRef
     from smc.plugins.slots.plate import PlateOrientation
     from smc.ui.controller import (
+        ChainStatus,
         CheckItem,
         LoadedPreset,
         MapPose,
         PlanLayer,
         PoseKind,
+        ResultCard,
         RunClock,
         ScanSummary,
         WellView,
@@ -41,17 +43,26 @@ __all__ = [
     "CAPTURE_WELLS",
     "DRY_RUN_NO_FRAME",
     "END_LIVE_LABEL",
+    "FILES_HEADING",
     "GOTO_ESTIMATED",
     "GOTO_NOT_DURING_LIVE",
     "GOTO_UNPLACED",
     "GOTO_WALL_NEEDS_REGISTRATION",
     "LAY_OUT_FIRST",
     "MAP_FIELDS_UP_TO",
+    "NOTHING_LEFT",
     "NO_CALIBRATION_FOR_SIDES",
+    "NO_FILES_YET",
     "ORIENTATION_IN_STAGE_TERMS",
     "OTHER_WAYS_TO_REGISTER",
     "PLATE_NOT_CHOSEN",
     "REGISTER_FIRST",
+    "RESULT_CHOICES",
+    "RESULT_NAMES",
+    "RESULT_READS",
+    "RESULT_TOOLS",
+    "RUN_ALL_LABEL",
+    "SCAN_FIRST",
     "SCREEN_LEADS",
     "SCREEN_TITLES",
     "SELECTION_KEPT_ITS_NAMES",
@@ -66,19 +77,24 @@ __all__ = [
     "CalibrationNote",
     "CentreRow",
     "NextStep",
+    "ResultRow",
     "StepName",
     "StepState",
     "a1_corner",
+    "again_note",
     "busy_note",
     "capture_centre_label",
     "capture_wall_label",
     "centre_rows",
     "centres_text",
+    "chain_line",
+    "colour_bar_title",
     "command_line",
     "continue_label",
     "drive_image_note",
     "duration_text",
     "field_source_line",
+    "files_lines",
     "forget_label",
     "image_sides_note",
     "known_text",
@@ -98,6 +114,9 @@ __all__ = [
     "register_replace_note",
     "registered_line",
     "replace_note",
+    "result_row",
+    "results_left",
+    "run_all_wait",
     "scan_lead",
     "scan_plan_card_lines",
     "scan_progress_lines",
@@ -1555,3 +1574,292 @@ def _shown(text: str) -> str:
         return "(default)"
     flat = _flat(text)
     return flat if len(flat) <= _VALUE_CHARS else flat[:_VALUE_CHARS] + "…"
+
+
+# -- the Results screen (m5 §17.4.5, §17.11, #446) ---------------------------------------
+
+#: The tools of the Results screen in the checklist's order. Each is the slot it provides.
+RESULT_TOOLS: tuple[str, ...] = ("cells", "density", "route", "report", "nis-export")
+
+#: What each row calls its tool (m5 §17.4.5).
+RESULT_NAMES: Mapping[str, str] = {
+    "cells": "Count the cells",
+    "density": "Density per well",
+    "route": "Route through the densest fields",
+    "report": "Report",
+    "nis-export": "Export for NIS-Elements",
+}
+
+#: What each tool reads: the page's copy of the plugins' ``reads``, as ``WALLS_MIN_CENTRES``
+#: is of ``plate-walls``' bounds, pinned by a test. A row finds the input it waits for from
+#: this and the checklist, and never from the run document's sentence (``the run document
+#: has no cells; smc run --list ...``), which is for a terminal. The guide stays pure: it
+#: does not read the registry.
+RESULT_READS: Mapping[str, tuple[str, ...]] = {
+    "cells": ("scan",),
+    "density": ("scan-plan", "scan", "cells"),
+    "route": ("scan-plan", "scan", "cells"),
+    "report": ("scan-plan", "scan", "cells", "density"),
+    "nis-export": ("route",),
+}
+
+#: The parameters a row shows under *Choices and command*, which a profile or a preset fills.
+RESULT_CHOICES: Mapping[str, tuple[str, ...]] = {
+    "cells": ("detector",),
+    "route": ("labels", "fields_per_well"),
+}
+
+#: What a row says while the scan it reads has not run: its step is the screen before.
+SCAN_FIRST = "scan first: step 4, Scan"
+
+#: The label of the chain's button and what it says when there is none to run.
+RUN_ALL_LABEL = "Run all that are left"
+NOTHING_LEFT = "Nothing is left: every step is done."
+
+#: The heading of the files block, and what it says before any step wrote one.
+FILES_HEADING = "Where the files are"
+NO_FILES_YET = "No step has written a file yet."
+
+
+@dataclass(frozen=True, slots=True)
+class ResultRow:
+    """What one row of the Results screen says (m5 §17.11.3).
+
+    ``state`` is the state line; ``button`` is ``Again`` exactly when the tool is done, which
+    ``done`` says too; ``wait`` is what it waits for beside its button (``""`` when nothing),
+    and ``missing`` is true exactly when an input it reads is not done, which ``state`` then
+    says and ``wait`` does not repeat.
+    """
+
+    plugin: str
+    name: str
+    state: str
+    button: Literal["Run", "Again"]
+    wait: str
+    missing: bool
+    done: bool
+
+
+def _result_name(plugin: str) -> str:
+    """A tool's plain name; a name the table has not is its own."""
+    return RESULT_NAMES.get(plugin, plugin)
+
+
+def _names(plugins: Sequence[str]) -> str:
+    return ", ".join(_result_name(plugin) for plugin in plugins)
+
+
+def _is_ok(items: Mapping[str, CheckItem], slot: str) -> bool:
+    item = items.get(slot)
+    return item is not None and item.state == "ok"
+
+
+def results_left(checklist: Sequence[CheckItem]) -> tuple[str, ...]:
+    """The tools of the Results screen that are not ``ok``, in the checklist's order (m5 §17.11.3).
+
+    A tool that is ``not run`` and one whose result is ``unusable`` are both left: a chain
+    runs them. One that is ``ok`` is never run by a chain, since running it again would make
+    every tool that read it out of date.
+    """
+    return tuple(
+        item.slot
+        for item in checklist
+        if item.slot in RESULT_TOOLS and item.state != "ok"
+    )
+
+
+def result_row(
+    plugin: str,
+    *,
+    checklist: Sequence[CheckItem],
+    card: ResultCard | None,
+    blocked: str | None,
+    dry_scan: bool,
+    running: str | None,
+    progress: tuple[int, int | None] | None,
+) -> ResultRow:
+    """One row of the Results screen: the tool's state line, its button and what it waits for (m5 §17.11.3).
+
+    The state line is the first that holds: the tool runs now (with its own count, and
+    without a total when the plugin reports none); it is done, when and whether in a dry
+    run; its result is not usable, with the run document's reason; an input it reads is not
+    done, named by the step that makes it; else ``Ready``. ``blocked`` is the controller's
+    reason (the stand is closed, a checkpoint, a capability), and ``dry_scan`` is a page
+    served with ``--dry-run`` over a scan that was one: such a scan took no frame, so a tool
+    that reads ``scan`` has nothing to read (m5 §8.8.1).
+    """
+    items = {item.slot: item for item in checklist}
+    item = items.get(plugin)
+    done = item is not None and item.state == "ok"
+    missing = False
+    if running == plugin:
+        if progress is None:
+            state = "Running now"
+        elif progress[1] is None:
+            state = f"Running now: {progress[0]}"
+        else:
+            state = f"Running now: {progress[0]} of {progress[1]}"
+    elif done:
+        state = "Done"
+        if card is not None:
+            state = f"Done {_flat(card.when_utc)} UTC"
+            if card.dry_run:
+                state += " (dry run)"
+    elif item is not None and item.state == "unusable":
+        state = "Not usable"
+        if item.reason:
+            state = f"Not usable: {_flat(item.reason)}"
+    else:
+        absent = next(
+            (slot for slot in RESULT_READS.get(plugin, ()) if not _is_ok(items, slot)),
+            None,
+        )
+        if absent is None:
+            state = "Ready"
+        else:
+            missing = True
+            if absent == "scan-plan":
+                state = LAY_OUT_FIRST
+            elif absent == "scan":
+                state = SCAN_FIRST
+            elif absent in RESULT_TOOLS:
+                state = f"after {_result_name(absent)}"
+            else:
+                state = f"after {absent}"
+    if missing:
+        wait = ""
+    elif blocked is not None:
+        wait = blocked
+    elif dry_scan and "scan" in RESULT_READS.get(plugin, ()):
+        wait = DRY_RUN_NO_FRAME
+    else:
+        wait = ""
+    return ResultRow(
+        plugin=plugin,
+        name=_result_name(plugin),
+        state=state,
+        button="Again" if done else "Run",
+        wait=wait,
+        missing=missing,
+        done=done,
+    )
+
+
+def run_all_wait(rows: Sequence[ResultRow], left: Sequence[str]) -> str | None:
+    """Why *Run all that are left* waits, or ``None`` when it can start (m5 §17.11.3).
+
+    The chain starts with the first tool left and stops at once if that tool cannot run, so
+    the button waits for what that tool waits for: nothing is left, an input is missing (the
+    row's state line says which step makes it), or the tool's own wait.
+    """
+    if not left:
+        return NOTHING_LEFT
+    first = next((row for row in rows if row.plugin == left[0]), None)
+    if first is None:
+        return None
+    if first.missing:
+        return first.state
+    return first.wait or None
+
+
+def again_note(plugin: str, checklist: Sequence[CheckItem]) -> str:
+    """What *Again* replaces, or ``""`` (m5 §17.11.3; §11.4's idea, for the one place a click replaces a result others read).
+
+    Named are the tools after this one that are done and read it, directly or through
+    another: running it again makes their results out of date, and *Run all that are left*
+    runs them again. A tool no later tool reads (``report``, ``nis-export``) says nothing.
+    The rule is the plugins' ``reads`` (``RESULT_READS``) and not "every tool after it":
+    ``route`` does not read ``density``, so a new density leaves the route as it was.
+    """
+    items = {item.slot: item for item in checklist}
+    if plugin not in RESULT_TOOLS or not _is_ok(items, plugin):
+        return ""
+    reached = {plugin}
+    later: list[str] = []
+    for tool in RESULT_TOOLS[RESULT_TOOLS.index(plugin) + 1 :]:
+        if reached.intersection(RESULT_READS[tool]):
+            reached.add(tool)
+            if _is_ok(items, tool):
+                later.append(tool)
+    if not later:
+        return ""
+    return (
+        "Again replaces this result. What comes after it and is done "
+        f"({_names(later)}) is out of date then: {RUN_ALL_LABEL} runs it again."
+    )
+
+
+def _sentence(text: str) -> str:
+    """``text`` on one line and ending with a full stop: an outcome comes from outside and may end with none."""
+    flat = _flat(text).strip()
+    return flat if flat.endswith(".") else flat + "."
+
+
+def chain_line(chain: ChainStatus | None) -> str:
+    """The one line that says what *Run all that are left* is doing or did (m5 §17.11.3).
+
+    ``""`` before any chain. While a tool goes it says which, and how far along. After the
+    end: all done, or where it stopped and why (the tool failed, was refused, or STOP landed
+    in it or between two tools), what was done and what was not run, in the tools' plain
+    names. Plain text, never markup: an outcome and a name come from outside (FM-139). A chain
+    whose own code raised is told by the strip's outcome; its line reads like a stop.
+    """
+    if chain is None or not chain.plugins:
+        return ""
+    if chain.current is not None:
+        return (
+            f"Running {_result_name(chain.current)} "
+            f"({len(chain.ended) + 1} of {len(chain.plugins)})."
+        )
+    done = [end.plugin for end in chain.ended if end.how == "done"]
+    after = chain.plugins[len(chain.ended) :]
+    last = chain.ended[-1] if chain.ended else None
+    if last is not None and last.how == "done" and not after:
+        return f"Done: {_names(done)}."
+    if last is None or last.how == "done":
+        # A STOP between two tools (or before the first): nothing was refused or failed.
+        head = f"Stopped before {_result_name(after[0])} by STOP."
+        not_run = after[1:]
+    else:
+        name = _result_name(last.plugin)
+        not_run = after
+        if last.how == "failed":
+            head = _sentence(f"Stopped at {name}, which failed: {last.outcome}")
+        elif last.how == "refused":
+            head = _sentence(f"Stopped at {name}, which cannot run: {last.outcome}")
+        else:
+            head = f"Stopped at {name} by STOP."
+    parts = [head]
+    if done:
+        parts.append(f"Done: {_names(done)}.")
+    if not_run:
+        parts.append(f"Not run: {_names(not_run)}.")
+    return " ".join(parts)
+
+
+def files_lines(cards: Mapping[str, ResultCard]) -> tuple[str, ...]:
+    """A line for each file a step wrote: ``<the step's plain name>: <path>`` (m5 §17.11.3).
+
+    The scan first (``Scan frames``), then each tool of the screen in its order. A card
+    holds files only when its record ended ``done`` (FM-154), so a stopped or failed tool
+    names none. A card's entry is ``<key>: <path>``: the key (``file``, ``folder``) is the
+    run document's word and not the operator's, so the path is what follows the first
+    ``": "`` (the whole entry when there is none).
+    """
+    lines: list[str] = []
+    for plugin in ("scan", *RESULT_TOOLS):
+        card = cards.get(plugin)
+        if card is None:
+            continue
+        name = "Scan frames" if plugin == "scan" else _result_name(plugin)
+        for entry in card.files:
+            _key, separator, path = entry.partition(": ")
+            lines.append(f"{name}: {_flat(path if separator else entry)}")
+    return tuple(lines)
+
+
+def colour_bar_title(label: str | None) -> str:
+    """The map's colour bar title: the class the *Density of* select names, or nothing (m5 §17.4.5, #293 item 6)."""
+    if not label:
+        return ""
+    return f"{_flat(label)} cells per mm²"

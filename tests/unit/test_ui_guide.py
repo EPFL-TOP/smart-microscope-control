@@ -6,6 +6,8 @@ shell reads it, never compared with the string the code builds (FM-45).
 
 from __future__ import annotations
 
+import dataclasses
+import importlib
 import json
 import math
 import shlex
@@ -31,10 +33,13 @@ from smc.plugins.slots import (
 )
 from smc.ui.controller import (
     _CHECKLIST,
+    ChainEnd,
+    ChainStatus,
     CheckItem,
     LoadedPreset,
     MapPose,
     PlanLayer,
+    ResultCard,
     RunClock,
     ScanSummary,
     WellView,
@@ -43,14 +48,23 @@ from smc.ui.guide import (
     CAPTURE_WELLS,
     DRY_RUN_NO_FRAME,
     END_LIVE_LABEL,
+    FILES_HEADING,
     GOTO_NOT_DURING_LIVE,
     LAY_OUT_FIRST,
     MAP_FIELDS_UP_TO,
     NO_CALIBRATION_FOR_SIDES,
+    NO_FILES_YET,
+    NOTHING_LEFT,
     ORIENTATION_IN_STAGE_TERMS,
     OTHER_WAYS_TO_REGISTER,
     PLATE_NOT_CHOSEN,
     REGISTER_FIRST,
+    RESULT_CHOICES,
+    RESULT_NAMES,
+    RESULT_READS,
+    RESULT_TOOLS,
+    RUN_ALL_LABEL,
+    SCAN_FIRST,
     SCREEN_LEADS,
     SCREEN_TITLES,
     SELECT_WELLS,
@@ -63,19 +77,24 @@ from smc.ui.guide import (
     WALLS_NEED_CALIBRATION,
     CalibrationNote,
     NextStep,
+    ResultRow,
     StepName,
     StepState,
     a1_corner,
+    again_note,
     busy_note,
     capture_centre_label,
     capture_wall_label,
     centre_rows,
     centres_text,
+    chain_line,
+    colour_bar_title,
     command_line,
     continue_label,
     drive_image_note,
     duration_text,
     field_source_line,
+    files_lines,
     forget_label,
     image_sides_note,
     known_text,
@@ -95,6 +114,9 @@ from smc.ui.guide import (
     register_replace_note,
     registered_line,
     replace_note,
+    result_row,
+    results_left,
+    run_all_wait,
     scan_lead,
     scan_plan_card_lines,
     scan_progress_lines,
@@ -2213,3 +2235,461 @@ def test_a_well_name_with_absurd_digits_is_sorted_last_and_never_raises() -> Non
     assert plan_selection_note([huge], ["A1"]).startswith(
         f"The fields laid out are for {huge}; "
     )
+
+
+# -- the Results screen (m5 §17.4.5, §17.11, #446) --------------------------------------
+
+_PLUGIN_OF = {
+    "cells": "smc.plugins.cells.plugin:CellsPlugin",
+    "density": "smc.plugins.density.plugin:DensityPlugin",
+    "route": "smc.plugins.route.plugin:RoutePlugin",
+    "report": "smc.plugins.report.plugin:ReportPlugin",
+    "nis-export": "smc.plugins.nis_export.plugin:NisExportPlugin",
+}
+
+
+def _real_plugin(tool: str) -> Any:
+    module, _, name = _PLUGIN_OF[tool].partition(":")
+    return getattr(importlib.import_module(module), name)
+
+
+def _results(
+    reasons: dict[str, str] | None = None, **states: str
+) -> tuple[CheckItem, ...]:
+    """The checklist with ``states`` by slot (``scan="ok"``), and the reason of each ``unusable`` one."""
+    checklist = _checklist(**states)
+    given = {slot.replace("-", "_"): why for slot, why in (reasons or {}).items()}
+    return tuple(
+        dataclasses.replace(item, reason=given[item.slot.replace("-", "_")])
+        if item.slot.replace("-", "_") in given
+        else item
+        for item in checklist
+    )
+
+
+def _result_card(**changes: Any) -> ResultCard:
+    base: dict[str, Any] = {
+        "plugin": "cells",
+        "status": "done",
+        "when_utc": "2026-11-12 09:30:00",
+        "profile": "demo",
+        "dry_run": False,
+        "lines": (),
+        "assumed": (),
+        "error": None,
+    }
+    return ResultCard(**{**base, **changes})
+
+
+def _row(
+    plugin: str,
+    checklist: Sequence[CheckItem],
+    *,
+    card: ResultCard | None = None,
+    blocked: str | None = None,
+    dry_scan: bool = False,
+    running: str | None = None,
+    progress: tuple[int, int | None] | None = None,
+) -> ResultRow:
+    return result_row(
+        plugin,
+        checklist=checklist,
+        card=card,
+        blocked=blocked,
+        dry_scan=dry_scan,
+        running=running,
+        progress=progress,
+    )
+
+
+def test_the_results_tools_are_the_checklists_in_its_order_and_each_has_a_plain_name() -> (
+    None
+):
+    slots = [slot for slot, _optional in _CHECKLIST]
+    assert [slot for slot in slots if slot in RESULT_TOOLS] == list(RESULT_TOOLS)
+    assert set(RESULT_NAMES) == set(RESULT_TOOLS) == set(RESULT_READS)
+    # §17.4.5's words, and the screen they belong to (§17.5).
+    assert RESULT_NAMES == {
+        "cells": "Count the cells",
+        "density": "Density per well",
+        "route": "Route through the densest fields",
+        "report": "Report",
+        "nis-export": "Export for NIS-Elements",
+    }
+    assert {STEP_OF_SLOT[tool] for tool in RESULT_TOOLS} == {"results"}
+    assert RUN_ALL_LABEL == "Run all that are left"
+
+
+def test_the_results_reads_are_the_plugins_reads() -> None:
+    # The guide copies what the plugins read, so that it stays pure (§17.11.2): a plugin that
+    # reads one more slot must change this table, or a row would name the wrong input.
+    for tool in RESULT_TOOLS:
+        plugin = _real_plugin(tool)
+        assert plugin.name == plugin.provides == tool
+        assert RESULT_READS[tool] == tuple(plugin.reads), tool
+
+
+def test_the_results_choices_are_fields_of_the_tools_parameters() -> None:
+    for tool, keys in RESULT_CHOICES.items():
+        fields = _real_plugin(tool).Params.model_fields
+        for key in keys:
+            assert key in fields, (tool, key)
+
+
+def test_results_left_is_the_slots_that_are_not_ok_in_checklist_order() -> None:
+    checklist = _results(
+        {"route": "route read its inputs from an earlier run; run it again"},
+        plate="ok",
+        scan_plan="ok",
+        scan="ok",
+        cells="ok",
+        route="unusable",
+        report="ok",
+    )
+    # `not run` and `unusable` are both left; `ok` never is, whatever comes after it.
+    assert results_left(checklist) == ("density", "route", "nis-export")
+    assert (
+        results_left(
+            _results(cells="ok", density="ok", route="ok", report="ok", nis_export="ok")
+        )
+        == ()
+    )
+    # The slots of the other screens are never a Results tool.
+    assert results_left(_results()) == RESULT_TOOLS
+    assert results_left(()) == ()
+
+
+def test_a_done_row_says_when_and_offers_again_and_an_unusable_one_says_why_and_offers_run() -> (
+    None
+):
+    checklist = _results(
+        {"route": "route read its inputs from an earlier run; run it again"},
+        scan_plan="ok",
+        scan="ok",
+        cells="ok",
+        route="unusable",
+    )
+    done = _row("cells", checklist, card=_result_card())
+    assert (done.state, done.button, done.done) == (
+        "Done 2026-11-12 09:30:00 UTC",
+        "Again",
+        True,
+    )
+    assert done.name == "Count the cells"
+    assert not done.missing
+    dry = _row("cells", checklist, card=_result_card(dry_run=True))
+    assert dry.state == "Done 2026-11-12 09:30:00 UTC (dry run)"
+    # A done tool whose card the view could not make still says it is done.
+    assert _row("cells", checklist, card=None).state == "Done"
+
+    unusable = _row("route", checklist)
+    assert unusable.state == (
+        "Not usable: route read its inputs from an earlier run; run it again"
+    )
+    assert (unusable.button, unusable.done, unusable.missing) == ("Run", False, False)
+    # An unusable result with no reason, still a state of its own.
+    bare = tuple(
+        dataclasses.replace(item, reason=None) if item.slot == "route" else item
+        for item in checklist
+    )
+    assert _row("route", bare).state == "Not usable"
+
+
+def test_a_row_whose_input_is_missing_says_after_the_tool_that_makes_it() -> None:
+    nothing = _results()
+    assert _row("cells", nothing).state == SCAN_FIRST
+    assert SCAN_FIRST == "scan first: step 4, Scan"
+    # `density` reads the plan first, then the scan, then the cells.
+    assert _row("density", nothing).state == LAY_OUT_FIRST
+    assert _row("density", _results(scan_plan="ok")).state == SCAN_FIRST
+    assert (
+        _row("density", _results(scan_plan="ok", scan="ok")).state
+        == "after Count the cells"
+    )
+    # `route` waits for `cells` and not for `density`; `report` waits for `density`.
+    assert (
+        _row("route", _results(scan_plan="ok", scan="ok", cells="ok")).state == "Ready"
+    )
+    assert (
+        _row("report", _results(scan_plan="ok", scan="ok", cells="ok")).state
+        == "after Density per well"
+    )
+    assert _row("nis-export", _results(cells="ok")).state == (
+        "after Route through the densest fields"
+    )
+    # An unusable input is as missing as an absent one.
+    unusable = _results({"cells": "x"}, scan_plan="ok", scan="ok", cells="unusable")
+    assert _row("density", unusable).state == "after Count the cells"
+    assert _row("density", unusable).missing
+    # The document's own words, for a terminal, are nowhere in a missing row.
+    for tool in RESULT_TOOLS:
+        assert "run document" not in _row(tool, nothing).state
+        assert "smc run" not in _row(tool, nothing).state
+    # A slot that is no tool of the screen is named as it is.
+    assert _row("cells", ()).state == SCAN_FIRST
+
+
+def test_a_wait_is_the_stands_reason_then_the_dry_runs_and_never_both_with_a_missing_input() -> (
+    None
+):
+    ready = _results(scan_plan="ok", scan="ok", cells="ok", density="ok")
+    stand = "the stand is not connected"
+    # The controller's reason first, over the dry run's.
+    assert _row("route", ready, blocked=stand, dry_scan=True).wait == stand
+    assert _row("route", ready, dry_scan=True).wait == DRY_RUN_NO_FRAME
+    assert _row("route", ready).wait == ""
+    # The tool that reads no scan has nothing to hold back (`nis-export` reads the route).
+    assert _row("nis-export", _results(route="ok"), dry_scan=True).wait == ""
+    # A row that waits for an input says it in its state line and adds nothing.
+    missing = _row(
+        "density", _results(scan_plan="ok", scan="ok"), blocked=stand, dry_scan=True
+    )
+    assert missing.missing
+    assert missing.wait == ""
+
+
+def test_a_running_row_says_running_now_with_its_count_and_without_a_total() -> None:
+    ready = _results(scan_plan="ok", scan="ok", cells="ok")
+    assert _row("route", ready, running="route").state == "Running now"
+    assert _row("route", ready, running="route", progress=(3, 12)).state == (
+        "Running now: 3 of 12"
+    )
+    assert _row("route", ready, running="route", progress=(3, None)).state == (
+        "Running now: 3"
+    )
+    # Running wins over done: *Again* is running now, and the row says so.
+    done = _results(scan_plan="ok", scan="ok", cells="ok", route="ok")
+    assert (
+        _row("route", done, running="route", card=_result_card()).state == "Running now"
+    )
+    # Another tool's run is not this row's.
+    assert _row("route", ready, running="cells", progress=(3, 12)).state == "Ready"
+
+
+def test_run_all_waits_for_the_first_tool_left_and_says_nothing_is_left() -> None:
+    assert run_all_wait([], ()) == NOTHING_LEFT
+    assert NOTHING_LEFT == "Nothing is left: every step is done."
+
+    nothing = _results()
+    rows = [_row(tool, nothing) for tool in RESULT_TOOLS]
+    # The first tool left needs the scan: its state is the reason, never its (empty) wait.
+    assert run_all_wait(rows, RESULT_TOOLS) == SCAN_FIRST
+
+    ready = _results(scan_plan="ok", scan="ok")
+    rows = [_row(tool, ready, blocked="stand closed") for tool in RESULT_TOOLS]
+    assert run_all_wait(rows, RESULT_TOOLS) == "stand closed"
+    rows = [_row(tool, ready, dry_scan=True) for tool in RESULT_TOOLS]
+    assert run_all_wait(rows, RESULT_TOOLS) == DRY_RUN_NO_FRAME
+
+    assert (
+        run_all_wait([_row(tool, ready) for tool in RESULT_TOOLS], RESULT_TOOLS) is None
+    )
+    # Only the first tool left counts: `density` waits for `cells`, which the chain runs.
+    assert run_all_wait(
+        [_row(tool, ready) for tool in RESULT_TOOLS], RESULT_TOOLS[1:]
+    ) == ("after Count the cells")
+    # A name that has no row is not a wait.
+    assert run_all_wait([], ("their-tool",)) is None
+
+
+def test_again_names_the_later_steps_that_are_done_and_is_empty_for_the_last() -> None:
+    everything = _results(
+        scan_plan="ok",
+        scan="ok",
+        cells="ok",
+        density="ok",
+        route="ok",
+        report="ok",
+        nis_export="ok",
+    )
+    note = again_note("cells", everything)
+    assert note == (
+        "Again replaces this result. What comes after it and is done (Density per well, "
+        "Route through the densest fields, Report, Export for NIS-Elements) is out of "
+        "date then: Run all that are left runs it again."
+    )
+    # What reads it, and no more: the route does not read the density, and the export reads
+    # the route alone, so each of these names what really becomes out of date.
+    assert again_note("density", everything).endswith(
+        "(Report) is out of date then: Run all that are left runs it again."
+    )
+    assert "(Export for NIS-Elements)" in again_note("route", everything)
+    assert again_note("report", everything) == ""
+    assert again_note("nis-export", everything) == ""
+    # Only the tools that are done are named, in the tools' order.
+    partly = _results(scan_plan="ok", scan="ok", cells="ok", route="ok")
+    assert "(Route through the densest fields)" in again_note("cells", partly)
+    # A tool that is not done has nothing to replace; neither has a name no table has.
+    assert again_note("cells", _results()) == ""
+    assert again_note("their-tool", everything) == ""
+
+
+def _chain(
+    ended: Sequence[tuple[str, str, str]],
+    current: str | None = None,
+    plugins: tuple[str, ...] = RESULT_TOOLS,
+) -> ChainStatus:
+    return ChainStatus(
+        plugins=plugins,
+        ended=tuple(ChainEnd(plugin, how, outcome) for plugin, how, outcome in ended),  # type: ignore[arg-type]
+        current=current,
+    )
+
+
+def test_the_chain_line_says_which_tool_stopped_and_why_for_each_way_it_ends() -> None:
+    assert chain_line(None) == ""
+    # Going: which tool, and how far along (the first of five; the third).
+    assert (
+        chain_line(_chain([], current="cells")) == "Running Count the cells (1 of 5)."
+    )
+    assert (
+        chain_line(
+            _chain([("cells", "done", "x"), ("density", "done", "x")], current="route")
+        )
+        == "Running Route through the densest fields (3 of 5)."
+    )
+    # Every tool done: no "not run".
+    every = [(tool, "done", f"{tool} done") for tool in RESULT_TOOLS]
+    assert chain_line(_chain(every)) == (
+        "Done: Count the cells, Density per well, Route through the densest fields, "
+        "Report, Export for NIS-Elements."
+    )
+    # The chain of the tools left only: the names are those it ran.
+    assert chain_line(_chain([("report", "done", "x")], plugins=("report",))) == (
+        "Done: Report."
+    )
+
+    done_two = [("cells", "done", "x"), ("density", "done", "x")]
+    failed = _chain(
+        [*done_two, ("route", "failed", "route: PluginRunError: route: it broke")]
+    )
+    assert chain_line(failed) == (
+        "Stopped at Route through the densest fields, which failed: route: "
+        "PluginRunError: route: it broke. Done: Count the cells, Density per well. "
+        "Not run: Report, Export for NIS-Elements."
+    )
+    refused = _chain(
+        [*done_two, ("route", "refused", "route: ParamsError: labels: bad.")]
+    )
+    assert chain_line(refused) == (
+        "Stopped at Route through the densest fields, which cannot run: route: "
+        "ParamsError: labels: bad. Done: Count the cells, Density per well. "
+        "Not run: Report, Export for NIS-Elements."
+    )
+    stopped = _chain([*done_two, ("route", "stopped", "route stopped")])
+    assert chain_line(stopped) == (
+        "Stopped at Route through the densest fields by STOP. Done: Count the cells, "
+        "Density per well. Not run: Report, Export for NIS-Elements."
+    )
+    # A STOP between two tools: the last that ended is done and some are left.
+    between = _chain(done_two)
+    assert chain_line(between) == (
+        "Stopped before Route through the densest fields by STOP. Done: Count the cells, "
+        "Density per well. Not run: Report, Export for NIS-Elements."
+    )
+    # A STOP before the first tool: nothing was done.
+    assert chain_line(_chain([])) == (
+        "Stopped before Count the cells by STOP. Not run: Density per well, Route "
+        "through the densest fields, Report, Export for NIS-Elements."
+    )
+    # The first tool stopped, none done and none after it: no "Done", no "Not run".
+    assert chain_line(_chain([("report", "stopped", "x")], plugins=("report",))) == (
+        "Stopped at Report by STOP."
+    )
+    # A name no table has is its own, and an outcome of several lines is one.
+    odd = _chain(
+        [("their-tool", "failed", "boom\nin two lines")], plugins=("their-tool",)
+    )
+    assert chain_line(odd) == (
+        "Stopped at their-tool, which failed: boom in two lines."
+    )
+
+
+def test_files_lines_name_each_steps_file_without_its_key_and_only_when_done() -> None:
+    cards = {
+        "nis-export": _result_card(
+            plugin="nis-export", files=("file: /run/export.xml",)
+        ),
+        "scan": _result_card(plugin="scan", files=("folder: /run/scan",)),
+        "report": _result_card(
+            plugin="report",
+            files=("file: C:\\runs\\report: final.html", "file: /run/data.csv"),
+        ),
+        # A stopped record's card holds no files (FM-154): nothing to name.
+        "cells": _result_card(plugin="cells", status="stopped", files=()),
+        # An entry with no key is shown whole; a path that has a colon keeps it.
+        "route": _result_card(plugin="route", files=("/run/route.json",)),
+    }
+    assert files_lines(cards) == (
+        "Scan frames: /run/scan",
+        "Route through the densest fields: /run/route.json",
+        "Report: C:\\runs\\report: final.html",
+        "Report: /run/data.csv",
+        "Export for NIS-Elements: /run/export.xml",
+    )
+    assert files_lines({}) == ()
+    assert FILES_HEADING == "Where the files are"
+    assert NO_FILES_YET == "No step has written a file yet."
+    # A card of a tool the screen does not list is not named.
+    assert (
+        files_lines({"timing": _result_card(plugin="timing", files=("file: x",))}) == ()
+    )
+
+
+def test_the_colour_bar_names_the_class_and_is_empty_without_one() -> None:
+    assert colour_bar_title("single") == "single cells per mm²"
+    assert colour_bar_title("doublet") == "doublet cells per mm²"
+    assert colour_bar_title(None) == ""
+    assert colour_bar_title("") == ""
+    # A class comes from a record: one line, never markup.
+    assert colour_bar_title("a\nb") == "a b cells per mm²"
+
+
+_STATES = st.sampled_from(["ok", "not run", "unusable"])
+
+
+@given(
+    states=st.lists(_STATES, min_size=5, max_size=5),
+    inputs=st.lists(_STATES, min_size=2, max_size=2),
+    blocked=st.sampled_from([None, "stand closed"]),
+    dry_scan=st.booleans(),
+    running=st.sampled_from([None, *RESULT_TOOLS]),
+)
+def test_a_row_is_never_both_done_and_missing_and_a_missing_row_has_no_wait(
+    states: list[str],
+    inputs: list[str],
+    blocked: str | None,
+    dry_scan: bool,
+    running: str | None,
+) -> None:
+    # Whatever the document holds, the rows and the chain's button agree: *Again* is exactly
+    # a done tool, a missing input is said by the state alone, and the chain waits exactly
+    # for what its first tool waits for.
+    checklist = _checklist(
+        scan_plan=inputs[0],
+        scan=inputs[1],
+        **dict(
+            zip(
+                ("cells", "density", "route", "report", "nis_export"),
+                states,
+                strict=True,
+            )
+        ),
+    )
+    rows = [
+        _row(tool, checklist, blocked=blocked, dry_scan=dry_scan, running=running)
+        for tool in RESULT_TOOLS
+    ]
+    left = results_left(checklist)
+    for row in rows:
+        assert row.done == (row.button == "Again")
+        assert not (row.done and row.missing)
+        assert not (row.missing and row.wait)
+        assert not (row.missing and running == row.plugin)
+    expected = None
+    if not left:
+        expected = NOTHING_LEFT
+    else:
+        first = next(row for row in rows if row.plugin == left[0])
+        expected = (first.state if first.missing else first.wait) or None
+    assert run_all_wait(rows, left) == expected
