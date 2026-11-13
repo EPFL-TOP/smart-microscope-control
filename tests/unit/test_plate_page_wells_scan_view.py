@@ -787,8 +787,7 @@ def test_laying_out_two_wells_draws_the_fields_the_time_and_the_assumed_lines(
         f"Objective: {TEN_X}, in place",
         f"Fields: {len(plan.fields)} in 2 wells",
         # No timing was measured on this page: an unknown, never `0 s` (FM-170).
-        "Time: not known (no timing measured; the expert view's timing tool measures it, "
-        "then lay out the fields again)",
+        "Time: not known (no timing measured yet)",
     ]
     # The plan card's own assumptions, one line each, after the time.
     card = page.view().cards["scan-plan"]

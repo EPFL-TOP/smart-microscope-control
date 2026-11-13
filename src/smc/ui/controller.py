@@ -395,6 +395,9 @@ class ResultCard:
     ``files`` are ``<key>: <path>`` for each file the result names, under the same
     rule as ``lines``: where the result is, so that the operator can open it.
     Every text is bounded, whatever the record holds: the card is a summary.
+    ``when_local`` is ``when_utc``'s time in the PC's zone to the minute (``guide.local_time``),
+    which the guided screens say; the expert view's cards keep ``when_utc`` (m5 §17.12 D20).
+    ``""`` for a card built without it.
     """
 
     plugin: str
@@ -407,6 +410,7 @@ class ResultCard:
     error: str | None
     stale: bool = False
     files: tuple[str, ...] = ()
+    when_local: str = ""
 
 
 @dataclass(frozen=True, slots=True)

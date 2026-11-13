@@ -950,15 +950,12 @@ def test_again_says_what_it_replaces_and_the_note_goes_with_the_tool(
         [item for item in view._view.checklist],  # type: ignore[union-attr]
     )
     assert cells.replaces.object == expected
-    assert (
-        "(Density per well, Route through the densest fields, Report, Export for NIS-Elements)"
-        in expected
-    )
+    assert "Density, Route, Report, Export" in expected
     # What no later tool reads says nothing, and takes no height.
     for tool in ("report", "nis-export"):
         assert view.result_rows[tool].replaces.object == ""
         assert view.result_rows[tool].replaces.visible is False
-    assert "(Report)" in view.result_rows["density"].replaces.object
+    assert "makes Report out of date" in view.result_rows["density"].replaces.object
 
     # *Again* on `cells` runs the tool, and what read it is out of date: the note is gone (no
     # tool after it is done), and the chain button runs the four again.

@@ -397,8 +397,8 @@ def test_the_capture_buttons_are_disabled_while_an_activity_other_than_live_goes
 # --- the image's sides and what the arrows do to it (m5 §13, #327) ------------------
 
 NO_MATRIX_PAD = (
-    "Which way the image moves for an arrow is not known: run camera-calibration "
-    "(Set up)."
+    "Which way the image moves for an arrow is not known: Calibrate the camera, on "
+    "the Stand screen, measures it."
 )
 NO_MATRIX_SIDES = (
     "Walls are named on the image. No camera calibration says which stage side "

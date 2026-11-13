@@ -9,15 +9,23 @@ pairs it runs, and ``command_line`` is the same call typed in a terminal (princi
 
 from __future__ import annotations
 
+import ast
+import html
+import math
 import re
 import shlex
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from datetime import timezone
+from pathlib import Path, PurePath
+from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import quote
 
+import numpy.typing as npt
+
+from smc.plugins.frame_signal import carries_signal, saturated
 from smc.plugins.frames import image_direction_of_stage_step, stage_side_of_image_side
-from smc.plugins.plate_registration.algorithm import suggested_refs
+from smc.plugins.plate_registration.algorithm import GOOD_RESIDUAL_UM, suggested_refs
 from smc.plugins.slots import WellGeometry
 
 if TYPE_CHECKING:
@@ -40,12 +48,24 @@ if TYPE_CHECKING:
     )
 
 __all__ = [
+    "AGAIN_NOTE",
+    "AUTOFOCUS_WORDS",
+    "CAMERA_NOT_CALIBRATED_NOTE",
+    "CAPTURE_FAR",
+    "CAPTURE_SAME_PLACE",
     "CAPTURE_WELLS",
+    "COVERAGE_WORDS",
+    "DISCONNECT_RELEASES",
     "DRY_RUN_NO_FRAME",
     "END_LIVE_LABEL",
     "FILES_HEADING",
+    "FRAME_DARK",
+    "FRAME_SATURATED",
     "GOTO_ESTIMATED",
     "GOTO_NOT_DURING_LIVE",
+    "GOTO_ROW_AT",
+    "GOTO_ROW_AT_ESTIMATE",
+    "GOTO_ROW_GOING",
     "GOTO_UNPLACED",
     "GOTO_WALL_NEEDS_REGISTRATION",
     "LAY_OUT_FIRST",
@@ -56,13 +76,17 @@ __all__ = [
     "ORIENTATION_IN_STAGE_TERMS",
     "OTHER_WAYS_TO_REGISTER",
     "PLATE_NOT_CHOSEN",
+    "REGISTER_ACROSS_A_TURN",
     "REGISTER_FIRST",
+    "REGISTER_OBJECTIVES_DIFFER",
     "RESULT_CHOICES",
     "RESULT_NAMES",
     "RESULT_OPTIONAL_READS",
     "RESULT_READS",
+    "RESULT_SHORT",
     "RESULT_TOOLS",
     "RUN_ALL_LABEL",
+    "SAMPLE_REGISTERS",
     "SCAN_FIRST",
     "SCREEN_LEADS",
     "SCREEN_TITLES",
@@ -71,12 +95,15 @@ __all__ = [
     "STEPS",
     "STEP_OF_SLOT",
     "STEP_TITLES",
+    "TIME_NOT_KNOWN",
+    "TOOL_TITLES",
     "WALLS_DRY_RUN",
     "WALLS_MAX_CENTRES",
     "WALLS_MIN_CENTRES",
     "WALLS_NEED_CALIBRATION",
     "CalibrationNote",
     "CentreRow",
+    "GotoAnswer",
     "NextStep",
     "ResultRow",
     "StepName",
@@ -85,6 +112,7 @@ __all__ = [
     "again_note",
     "busy_note",
     "capture_centre_label",
+    "capture_note",
     "capture_wall_label",
     "centre_rows",
     "centres_text",
@@ -95,11 +123,16 @@ __all__ = [
     "drive_image_note",
     "duration_text",
     "field_source_line",
+    "files_html",
     "files_lines",
     "forget_label",
+    "frame_hint",
+    "goto_row_text",
     "image_sides_note",
     "known_text",
     "lay_out_wait",
+    "local_time",
+    "map_frame",
     "map_title",
     "needs_calibration",
     "next_slot",
@@ -110,8 +143,10 @@ __all__ = [
     "plan_selection_note",
     "plan_title",
     "plate_from_line",
+    "plate_rows_note",
     "preset_differences",
     "preset_note_text",
+    "register_objective_refusal",
     "register_replace_note",
     "registered_line",
     "replace_note",
@@ -129,6 +164,7 @@ __all__ = [
     "step_button_label",
     "step_states",
     "suggested_centres",
+    "tool_title",
     "wall_touches_note",
     "walls_card_lines",
     "walls_centres_problem",
@@ -240,6 +276,84 @@ GOTO_ESTIMATED = (
 )
 
 
+# -- round 2: the texts of m5 §17.12.5 (#475), copied from the design, never retyped -----
+
+#: What Live and Snap say of a frame that carries no light (m5 §17.12 D22, #457): the light
+#: path is the usual cause (F8, Ti2-E session 3: the light path on the eyepiece).
+FRAME_DARK = "The frame is dark: is the light on, and the light path on the camera?"
+
+#: What they say of a frame at the camera's full scale: the remedy is the exposure, not the light.
+FRAME_SATURATED = "The frame is saturated: lower the exposure."
+
+#: A capture further than one pitch from where the map puts its well (found on the owner's walk:
+#: H1 captured at A12's place, 99 mm off). A note, never a refusal: the registration's own
+#: residual bound refuses a bad fit.
+CAPTURE_FAR = (
+    "{well} was captured {distance_mm:.1f} mm from where the map puts it: is the "
+    "stage over {well}? Redo it there."
+)
+
+#: Two captures of two wells at one place (the same walk).
+CAPTURE_SAME_PLACE = (
+    "{well} and {other} were captured at the same place: redo the one that is wrong."
+)
+
+#: Why *Register the plate* is refused with the turret turned since the centres were captured
+#: (m5 §17.12 D13, #373): the matrix, the centres' scale and the offsets are an objective's.
+REGISTER_ACROSS_A_TURN = (
+    "The centres were captured with the {captured}; the {in_place} is in place: turn "
+    "back to the {captured}, or redo the centres with the {in_place}."
+)
+
+#: Why it is refused when the centres were captured with more than one objective.
+REGISTER_OBJECTIVES_DIFFER = (
+    "The centres were captured with different objectives ({which}): redo them with "
+    "one objective."
+)
+
+#: What a Plate row says of the *Go to* sent from it (m5 §17.12.3), in place of the tool's
+#: whole outcome, which names assumptions that the guided screens have no card for.
+GOTO_ROW_GOING = "Going to {well}…"
+GOTO_ROW_AT_ESTIMATE = (
+    "At {well}, the holder's estimate: centre it by eye with Live and the arrows, then "
+    "capture."
+)
+GOTO_ROW_AT = "At {well}."
+
+#: What *Again* replaces, on one line under a Results row (D20): the short names of what it
+#: makes out of date, since the long note was drawn under every row at all times.
+AGAIN_NOTE = "Again makes {names} out of date; Run all that are left runs them again."
+
+#: The arrows' note on a stand whose camera is not calibrated: it names the Stand screen's
+#: button, not a tab that the guided page no longer has.
+CAMERA_NOT_CALIBRATED_NOTE = (
+    "Which way the image moves for an arrow is not known: Calibrate the camera, on "
+    "the Stand screen, measures it."
+)
+
+#: The Stand screen says once what the header said on every screen (D15).
+DISCONNECT_RELEASES = "Disconnect releases {stand} for NIS-Elements or ZEN."
+
+#: Above the centre rows: *Register the plate* uses the profile's sample while nothing is
+#: captured (D23). The rows say it each in its own words, and the map says the plate is only
+#: estimated; this says once what the button will do.
+SAMPLE_REGISTERS = (
+    "Register the plate uses the profile's sample while no centre is captured; "
+    "capture three to measure this plate."
+)
+
+#: The Wells screen's plan line while no timing was measured (part B replaces it with a button).
+TIME_NOT_KNOWN = "Time: not known (no timing measured yet)"
+
+#: The Wells screen's two fields, in plain words, above each (D20): the fields are the tools'
+#: own and keep their names in the expert view.
+COVERAGE_WORDS = "How much of each well's width the fields span: 0.4 is 40 %."
+AUTOFOCUS_WORDS = (
+    "Autofocus: if-engaged uses it when it is on and locked; required refuses to "
+    "start unless it is; off never touches it. The scan never switches it on."
+)
+
+
 @dataclass(frozen=True, slots=True)
 class NextStep:
     """The tool the run document needs next, with the values to run it and why.
@@ -331,8 +445,9 @@ SCREEN_LEADS: Mapping[StepName, str] = {
     "results": "Each step reads the one before. Run the next one, or all that are left.",
 }
 
-#: A step's summary is one line under its button and never wider than the button's column.
-_SUMMARY_CHARS = 40
+#: A step's summary is one line under its button and never wider than the button's column:
+#: 22 characters, so that the step bar is one line tall (m5 §17.12 D15).
+_SUMMARY_CHARS = 22
 
 
 @dataclass(frozen=True, slots=True)
@@ -498,11 +613,15 @@ class CalibrationNote:
     ``objective`` is the turret label the latest usable ``camera-calibration`` recorded,
     ``None`` when it recorded none (*unknown*, not "the one in place"). ``when_utc`` is
     the record's time in UTC as a result card prints it (``YYYY-MM-DD HH:MM:SS``, or its
-    unknown-time placeholder): the page says the zone beside it.
+    unknown-time placeholder): the page says the zone beside it. ``when_local`` is the
+    same time in the PC's local zone to the minute (``local_time``), which the guided
+    screens say; ``""`` for a note built without it, and then ``when_utc`` is said
+    (m5 §17.12 D20).
     """
 
     objective: str | None
     when_utc: str
+    when_local: str = ""
 
 
 def needs_calibration(
@@ -543,6 +662,7 @@ def known_text(
     objective: str | None,
     calibration: CalibrationNote | None,
     light_on: bool | None,
+    stand: str | None = None,
 ) -> str:
     """The "known" block of the Stand screen: three lines, each saying what it rests on (m5 §17.2 D7, §17.4.1).
 
@@ -550,27 +670,39 @@ def known_text(
     page has not read says ``not known`` and a camera with no calibration says what the
     operator loses (the arrows cannot say which way the image moves): an unknown is
     never shown as a value (CLAUDE.md). ``objective`` is the one in place as the strip
-    reads it, ``calibration`` the latest usable one, ``light_on`` the light as read.
+    reads it, ``calibration`` the latest usable one, ``light_on`` the light as read. The
+    calibration's time is the PC's local one (``CalibrationNote.when_local``), the UTC
+    one for a note that has none. ``stand`` is the stand's name **while it is
+    connected**, ``None`` otherwise: a fourth line says that Disconnect releases it for
+    the vendor's software, which is a fact of the Stand screen and no longer of the
+    header (m5 §17.12 D15).
     """
     first = objective_line(objective)
     if calibration is None:
         camera = (
             "Camera: not calibrated (the arrows cannot say which way the image moves)"
         )
-    elif calibration.objective is None:
-        camera = (
-            f"Camera: calibrated on {calibration.when_utc} UTC, objective not recorded"
-        )
     else:
-        camera = f"Camera: calibrated at {calibration.objective} on {calibration.when_utc} UTC"
-        if objective is not None and objective != calibration.objective:
-            camera += f", not at {objective}"
+        when = (
+            calibration.when_local
+            if calibration.when_local
+            else f"{calibration.when_utc} UTC"
+        )
+        if calibration.objective is None:
+            camera = f"Camera: calibrated on {when}, objective not recorded"
+        else:
+            camera = f"Camera: calibrated at {calibration.objective} on {when}"
+            if objective is not None and objective != calibration.objective:
+                camera += f", not at {objective}"
     light = (
         "Light: not known"
         if light_on is None
         else f"Light: {'on' if light_on else 'off'}"
     )
-    return "\n".join((first, camera, light))
+    lines = [first, camera, light]
+    if stand is not None:
+        lines.append(DISCONNECT_RELEASES.format(stand=stand))
+    return "\n".join(lines)
 
 
 def suggested_centres(plate: str) -> tuple[str, ...]:
@@ -657,12 +789,14 @@ def registered_line(result: PlateResult) -> str:
     """The Plate screen's result line: the residual and the turn of the plate just registered (m5 §17.4.2).
 
     A seed or a lattice fit measures no residual, and says so: an unknown is not a
-    zero (CLAUDE.md). The rotation is the plate's own, to a hundredth of a degree.
+    zero (CLAUDE.md). The rotation is the plate's own, to a hundredth of a degree. A
+    measured residual says the bound the tool refuses beyond (``GOOD_RESIDUAL_UM``), so
+    that 62.3 µm reads as good or as bad without a manual (m5 §17.12 D20).
     """
     residual = (
         "residual not measured"
         if result.residual_um is None
-        else f"residual {result.residual_um:.1f} µm"
+        else f"residual {result.residual_um:.1f} µm of the {GOOD_RESIDUAL_UM:g} µm allowed"
     )
     return f"Registered: {residual}, turned {result.rotation_deg:.2f}\N{DEGREE SIGN}"
 
@@ -769,10 +903,7 @@ def drive_image_note(matrix: Matrix2 | None) -> str:
     +Y step and ``→`` a +X step. Plain text (FM-139).
     """
     if matrix is None:
-        return (
-            "Which way the image moves for an arrow is not known: run "
-            "camera-calibration (Set up)."
-        )
+        return CAMERA_NOT_CALIBRATED_NOTE
     try:
         up = image_direction_of_stage_step("+Y", matrix)
         right = image_direction_of_stage_step("+X", matrix)
@@ -1263,10 +1394,7 @@ def wells_known_lines(
     count = "1 field" if plan.count == 1 else str(plan.count)
     lines.append(f"Fields: {count} in {_count(plan.wells, 'well')}")
     if plan.estimate_s is None:
-        lines.append(
-            "Time: not known (no timing measured; the expert view's timing tool "
-            "measures it, then lay out the fields again)"
-        )
+        lines.append(TIME_NOT_KNOWN)
     else:
         lines.append(f"Time: about {duration_text(plan.estimate_s)}")
     lines.extend(f"assumed: {line}" for line in assumed)
@@ -1424,10 +1552,21 @@ def plain_default(default: str) -> str:
 
     ``describe_params`` prints a string default with its quotes (``'if-engaged'``), which
     the operator would type if the placeholder were a value to copy. Only one pair, and
-    only a ``'`` or a ``"`` at both ends: anything else is as it came.
+    only a ``'`` or a ``"`` at both ends: anything else is as it came. A tuple's repr
+    (``('single',)``, the default of a field that takes a list) is its items joined by
+    ``, `` (``single``): the repr's parentheses, quotes and trailing comma are Python's, not
+    the operator's words; a text that does not read as a tuple of literals, and an empty
+    tuple, are left as they came (m5 §17.12.3).
     """
     if len(default) >= 2 and default[0] == default[-1] and default[0] in "'\"":
         return default[1:-1]
+    if default.startswith("(") and default.endswith(")"):
+        try:
+            found = ast.literal_eval(default)
+        except (ValueError, SyntaxError, MemoryError, RecursionError):
+            return default
+        if isinstance(found, tuple) and found:
+            return ", ".join(str(item) for item in found)
     return default
 
 
@@ -1716,7 +1855,11 @@ def result_row(
     elif done:
         state = "Done"
         if card is not None:
-            state = f"Done {_flat(card.when_utc)} UTC"
+            state = (
+                f"Done {_flat(card.when_local)}"
+                if card.when_local
+                else f"Done {_flat(card.when_utc)} UTC"
+            )
             if card.dry_run:
                 state += " (dry run)"
     elif item is not None and item.state == "unusable":
@@ -1801,10 +1944,7 @@ def again_note(plugin: str, checklist: Sequence[CheckItem]) -> str:
                 later.append(tool)
     if not later:
         return ""
-    return (
-        "Again replaces this result. What comes after it and is done "
-        f"({_names(later)}) is out of date then: {RUN_ALL_LABEL} runs it again."
-    )
+    return AGAIN_NOTE.format(names=", ".join(RESULT_SHORT[tool] for tool in later))
 
 
 def _sentence(text: str) -> str:
@@ -1881,3 +2021,282 @@ def colour_bar_title(label: str | None) -> str:
     if not label:
         return ""
     return f"{_flat(label)} cells per mm²"
+
+
+# -- round 2: plain words, notes drawn once, the map's frame, the files (m5 §17.12, #475) ---
+
+#: The plain title of each built-in tool, for the outcome line (m5 §17.12 D20). A tool not
+#: listed (a third party's) is named by its plugin name.
+TOOL_TITLES: Mapping[str, str] = {
+    "camera-calibration": "Camera calibration",
+    "timing": "Timing",
+    "goto-well": "Go to",
+    "plate-registration": "Registration",
+    "plate-walls": "Registration from the walls",
+    "plate-finding": "Plate finding",
+    "plate-orientation": "Plate orientation",
+    "scan-plan": "Field layout",
+    "scan": "Scan",
+    "cells": "Count the cells",
+    "density": "Density per well",
+    "route": "Route",
+    "report": "Report",
+    "nis-export": "Export for NIS-Elements",
+    "stage-report": "Stage report",
+    # Two tools the design's table did not list; the test of the table asks for every one
+    # the repository ships.
+    "focus-on-cells": "Focus on cells",
+    "objective-offsets": "Objective offsets",
+}
+
+#: The short names the *Again* note lists (D20).
+RESULT_SHORT: Mapping[str, str] = {
+    "cells": "Count",
+    "density": "Density",
+    "route": "Route",
+    "report": "Report",
+    "nis-export": "Export",
+}
+
+#: A frame larger than this many pixels (1600 x 1600) is tested on every other row and column:
+#: ``carries_signal`` takes 16.5 ms on the Prime 95B's 1200 x 1200 and 70.8 ms on 2048 x 2048
+#: (measured, m5 §17.12 D22), and the test runs once per new frame.
+_FULL_TEST_PIXELS = 1600 * 1600
+
+#: Two captures closer than this fraction of a pitch are at one place. Not one pitch: two
+#: neighbouring wells, each centred by eye, are one pitch apart and are right.
+_SAME_PLACE_PITCH_FRACTION = 0.5
+
+
+@dataclass(frozen=True, slots=True)
+class GotoAnswer:
+    """What the last *Go to* said, for the Plate row it was sent from (m5 §17.12.3).
+
+    ``phase`` is ``going`` while the run goes, ``at`` once it ended ``done``, ``refused``
+    when the page refused it before anything started, ``failed`` when it ended any other
+    way (a failure, a STOP). ``estimated`` is whether the target was the holder's estimate
+    and not a registered plate, so that the row says to centre it by eye. ``text`` is the
+    refusal's or failure's one line, without the tool's name (``""`` for the other phases).
+    It is a value, replaced whole and never edited, so that a tab reads one or the other
+    (FM-151).
+    """
+
+    well: str
+    phase: Literal["going", "at", "refused", "failed"]
+    estimated: bool
+    text: str
+
+
+def tool_title(plugin: str) -> str:
+    """A tool's plain title for the outcome line; a plugin the table has not is named by its own name (m5 §17.12 D20)."""
+    return TOOL_TITLES.get(plugin, plugin)
+
+
+def local_time(when_utc: datetime) -> str:
+    """``when_utc`` in the PC's own zone, to the minute, as the guided screens say a time (m5 §17.12 D20).
+
+    A naive datetime is taken as UTC (the run document's times are; one without a zone
+    would otherwise be read as the PC's). A time the PC cannot show in its zone (Windows
+    before 1970 or after year 3000, year 1 or 9999 under an offset) is the value's own
+    ISO text, never an exception: a run document is data (FM-125) and ``view()`` raises
+    nothing for it.
+    """
+    aware = (
+        when_utc
+        if when_utc.tzinfo is not None
+        else when_utc.replace(tzinfo=timezone.utc)
+    )
+    try:
+        return aware.astimezone().strftime("%Y-%m-%d %H:%M")
+    except (OSError, OverflowError, ValueError):
+        return aware.isoformat(timespec="minutes")
+
+
+def frame_hint(image: npt.NDArray[Any], bit_depth: int) -> str:
+    """What the image says about a frame that carries no useful light, or ``""`` (m5 §17.12 D22, #457).
+
+    ``bit_depth`` is the camera's: a frame whose depth is not known (zero, a plugin's frame)
+    is not judged, since the full scale and the dark floor both depend on it. Saturated is
+    asked **before** dark: a frame at full scale everywhere spans no counts, and the light
+    path is not its remedy. A frame larger than 1600 x 1600 is tested on every other row and
+    column, which is a quarter of the work and the same verdict for a frame (a dark one is
+    dark everywhere). A frame that is not a 2-D array of numbers says nothing.
+    """
+    if bit_depth <= 0:
+        return ""
+    sample = image[::2, ::2] if image.size > _FULL_TEST_PIXELS else image
+    try:
+        if saturated(sample, bit_depth):
+            return FRAME_SATURATED
+        if not carries_signal(sample, bit_depth):
+            return FRAME_DARK
+    except ValueError:
+        return ""
+    return ""
+
+
+def capture_note(
+    well: str,
+    captured_um: tuple[float, float],
+    expected_um: tuple[float, float] | None,
+    pitch_um: float,
+    others: Mapping[str, tuple[float, float]],
+) -> str:
+    """A note on one captured centre that is far from its well or on another's place, or ``""`` (m5 §17.12.3).
+
+    ``expected_um`` is where the map's pose puts the centre of this well (registered, seed or
+    estimated), ``None`` on an *unplaced* map, which puts none: then nothing is far. A capture
+    more than one pitch of the plate from it is ``CAPTURE_FAR``: it is another well's place
+    (H1 captured at A12's, 99 mm off, on the owner's walk). A capture within half a pitch of
+    another well's capture is ``CAPTURE_SAME_PLACE``: two wells cannot be closer than a pitch,
+    so one of the two is wrong. The first that holds. A note, never a refusal: a bad fit is
+    refused by the registration's own residual bound, and a capture by eye is the operator's.
+    ``others`` are the other wells' captures, never this one's.
+    """
+    if expected_um is not None:
+        distance_um = _distance_um(captured_um, expected_um)
+        if distance_um > pitch_um:
+            return CAPTURE_FAR.format(well=well, distance_mm=distance_um / 1000.0)
+    for other, place in others.items():
+        if other != well and (
+            _distance_um(captured_um, place) < _SAME_PLACE_PITCH_FRACTION * pitch_um
+        ):
+            return CAPTURE_SAME_PLACE.format(well=well, other=other)
+    return ""
+
+
+def _distance_um(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def register_objective_refusal(
+    objectives: Mapping[str, str | None], in_place: str | None
+) -> str | None:
+    """Why *Register the plate* is refused for the objectives of its captures, or ``None`` (m5 §17.12 D13, #373).
+
+    A plate registered from centres captured with one objective and then another puts the
+    wells where neither objective saw them, and the offsets of #382 read the objective a
+    registration records. Only the **known** labels are compared: a capture restored from a
+    run document, or taken while the turret could not be read, has none and refuses nothing,
+    and a turret that is not read (``in_place`` is ``None``) refuses the turn nothing (the
+    tool's own ``assumed`` says the objective). Captures made with two objectives are refused
+    whatever the turret says. Plain text: the labels are the stand's (FM-139).
+    """
+    known = list(dict.fromkeys(label for label in objectives.values() if label))
+    if len(known) > 1:
+        which = ", ".join(known[:-1]) + f" and {known[-1]}"
+        return REGISTER_OBJECTIVES_DIFFER.format(which=which)
+    if not known or in_place is None or known[0] == in_place:
+        return None
+    return REGISTER_ACROSS_A_TURN.format(captured=known[0], in_place=in_place)
+
+
+def goto_row_text(answer: GotoAnswer | None, well: str) -> str:
+    """What the Plate row of ``well`` says of the *Go to* that was sent from it; ``""`` for another row (m5 §17.12.3).
+
+    The row of the well the drive was sent to, and no other: the answer is one for the whole
+    page. The refusal's or failure's line is the controller's, without the tool's name.
+    """
+    if answer is None or answer.well != well:
+        return ""
+    if answer.phase == "going":
+        return GOTO_ROW_GOING.format(well=well)
+    if answer.phase == "at":
+        template = GOTO_ROW_AT_ESTIMATE if answer.estimated else GOTO_ROW_AT
+        return template.format(well=well)
+    return answer.text
+
+
+def map_frame(
+    outlines: Sequence[tuple[float, float, float, float]], pitch_um: float
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """The frame the map is drawn in: the bounding box of ``outlines`` grown by one pitch, as ``((x0, x1), (y0, y1))`` (m5 §17.12 D16).
+
+    Each outline is ``(x0, y0, x1, y1)`` in stage µm, a well's (or the plate's). The margin is
+    one pitch on each side, so that the side labels and the stage's cross have room inside
+    the frame.
+
+    Raises:
+        ValueError: ``outlines`` is empty: a frame of nothing is no frame, and the caller keeps
+            the one it has.
+    """
+    if not outlines:
+        raise ValueError("a frame needs at least one outline")
+    x0 = min(min(o[0], o[2]) for o in outlines) - pitch_um
+    x1 = max(max(o[0], o[2]) for o in outlines) + pitch_um
+    y0 = min(min(o[1], o[3]) for o in outlines) - pitch_um
+    y1 = max(max(o[1], o[3]) for o in outlines) + pitch_um
+    return ((x0, x1), (y0, y1))
+
+
+def plate_rows_note(*, running: str | None, live: bool, from_sample: bool) -> str:
+    """The one note above the Plate screen's centre rows: what holds for every row, once (m5 §17.12 D19, D23).
+
+    The busy sentence and ``GOTO_NOT_DURING_LIVE`` were drawn under each row, four times
+    during a *Go to*. Live is told apart from any other activity, as ``busy_note`` does.
+    ``from_sample`` adds what *Register the plate* does while nothing is captured.
+    """
+    lines: list[str] = []
+    if live:
+        lines.append(GOTO_NOT_DURING_LIVE)
+    elif running is not None:
+        lines.append(busy_note(running, live=False))
+    if from_sample:
+        lines.append(SAMPLE_REGISTERS)
+    return "\n".join(lines)
+
+
+def _inside(path_text: str, run_folder: PurePath) -> PurePath | None:
+    """``path_text`` relative to ``run_folder``, or ``None`` when it is not a path inside it.
+
+    The text is parsed in the run folder's own flavour, so that a Windows path is read as one
+    on any PC (a page served on Windows names its files with backslashes); a ``..`` is no
+    file of the folder, whatever the text says.
+    """
+    try:
+        relative = type(run_folder)(path_text).relative_to(run_folder)
+    except (ValueError, TypeError):
+        return None
+    if not relative.parts or ".." in relative.parts:
+        return None
+    return relative
+
+
+def files_html(cards: Mapping[str, ResultCard], run_folder: PurePath | None) -> str:
+    """*Where the files are* as HTML: a link for each file inside the run folder, the others as text (m5 §17.12 D21).
+
+    The one HTML pane of the page, so that every text in it is escaped with ``html.escape``
+    (FM-139: a file name is data, and ``<``, ``&`` and ``"`` are legal in one). A ``file`` of a
+    card inside ``run_folder`` is a link to ``/run-files/<its path relative to the folder, as
+    POSIX and URL-quoted>``, opened in a new tab; a Windows relative path is quoted as POSIX
+    too, the route takes ``/``. A ``folder`` (the scan's frames), a file outside the run folder
+    (``nis-export``'s absolute ``out=``) and a path that cannot be read as one stay text: the
+    route serves only the files of the run document (``PlatePage.run_file``). Without
+    any file, ``NO_FILES_YET``.
+    """
+    lines: list[str] = []
+    for plugin in ("scan", *RESULT_TOOLS):
+        card = cards.get(plugin)
+        if card is None:
+            continue
+        name = html.escape("Scan frames" if plugin == "scan" else _result_name(plugin))
+        for entry in card.files:
+            key, separator, path = entry.partition(": ")
+            text = _flat(path if separator else entry)
+            relative = (
+                _inside(text, run_folder)
+                if run_folder is not None and separator and key == "file"
+                else None
+            )
+            if relative is None:
+                lines.append(f"<div>{name}: {html.escape(text)}</div>")
+                continue
+            href = "/run-files/" + quote(relative.as_posix(), safe="/")
+            shown = html.escape(relative.as_posix())
+            lines.append(
+                f'<div>{name}: <a href="{html.escape(href)}" target="_blank" '
+                f'rel="noopener">{shown}</a></div>'
+            )
+    if not lines:
+        return f"<div>{html.escape(NO_FILES_YET)}</div>"
+    return "".join(lines)

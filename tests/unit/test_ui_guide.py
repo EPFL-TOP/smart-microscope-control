@@ -11,9 +11,10 @@ import importlib
 import json
 import math
 import shlex
+import time
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, ClassVar
 
 import pytest
@@ -45,11 +46,21 @@ from smc.ui.controller import (
     WellView,
 )
 from smc.ui.guide import (
+    AGAIN_NOTE,
+    AUTOFOCUS_WORDS,
+    CAMERA_NOT_CALIBRATED_NOTE,
+    CAPTURE_FAR,
+    CAPTURE_SAME_PLACE,
     CAPTURE_WELLS,
+    COVERAGE_WORDS,
+    DISCONNECT_RELEASES,
     DRY_RUN_NO_FRAME,
     END_LIVE_LABEL,
     FILES_HEADING,
+    FRAME_DARK,
+    FRAME_SATURATED,
     GOTO_NOT_DURING_LIVE,
+    GOTO_UNPLACED,
     LAY_OUT_FIRST,
     MAP_FIELDS_UP_TO,
     NO_CALIBRATION_FOR_SIDES,
@@ -58,13 +69,17 @@ from smc.ui.guide import (
     ORIENTATION_IN_STAGE_TERMS,
     OTHER_WAYS_TO_REGISTER,
     PLATE_NOT_CHOSEN,
+    REGISTER_ACROSS_A_TURN,
     REGISTER_FIRST,
+    REGISTER_OBJECTIVES_DIFFER,
     RESULT_CHOICES,
     RESULT_NAMES,
     RESULT_OPTIONAL_READS,
     RESULT_READS,
+    RESULT_SHORT,
     RESULT_TOOLS,
     RUN_ALL_LABEL,
+    SAMPLE_REGISTERS,
     SCAN_FIRST,
     SCREEN_LEADS,
     SCREEN_TITLES,
@@ -72,11 +87,14 @@ from smc.ui.guide import (
     STEP_OF_SLOT,
     STEP_TITLES,
     STEPS,
+    TIME_NOT_KNOWN,
+    TOOL_TITLES,
     WALLS_DRY_RUN,
     WALLS_MAX_CENTRES,
     WALLS_MIN_CENTRES,
     WALLS_NEED_CALIBRATION,
     CalibrationNote,
+    GotoAnswer,
     NextStep,
     ResultRow,
     StepName,
@@ -85,6 +103,7 @@ from smc.ui.guide import (
     again_note,
     busy_note,
     capture_centre_label,
+    capture_note,
     capture_wall_label,
     centre_rows,
     centres_text,
@@ -95,11 +114,16 @@ from smc.ui.guide import (
     drive_image_note,
     duration_text,
     field_source_line,
+    files_html,
     files_lines,
     forget_label,
+    frame_hint,
+    goto_row_text,
     image_sides_note,
     known_text,
     lay_out_wait,
+    local_time,
+    map_frame,
     map_title,
     needs_calibration,
     next_slot,
@@ -110,8 +134,10 @@ from smc.ui.guide import (
     plan_selection_note,
     plan_title,
     plate_from_line,
+    plate_rows_note,
     preset_differences,
     preset_note_text,
+    register_objective_refusal,
     register_replace_note,
     registered_line,
     replace_note,
@@ -129,6 +155,7 @@ from smc.ui.guide import (
     step_button_label,
     step_states,
     suggested_centres,
+    tool_title,
     wall_touches_note,
     walls_card_lines,
     walls_centres_problem,
@@ -543,10 +570,10 @@ def test_the_drive_note_says_what_the_arrows_do_to_the_image() -> None:
     assert drive_image_note(_UPRIGHT) == (
         "On the image, ↑ moves it down, → moves it left; ↓ and ← the opposite."
     )
-    assert drive_image_note(None) == (
-        "Which way the image moves for an arrow is not known: run camera-calibration "
-        "(Set up)."
-    )
+    # The Stand screen's button, not a tab the guided page no longer has (#475, finding 12).
+    assert drive_image_note(None) == CAMERA_NOT_CALIBRATED_NOTE
+    assert "Calibrate the camera" in CAMERA_NOT_CALIBRATED_NOTE
+    assert "Set up" not in CAMERA_NOT_CALIBRATED_NOTE
 
 
 def test_the_notes_of_a_camera_off_a_quarter_turn_are_frames_text() -> None:
@@ -1440,7 +1467,8 @@ def test_a_done_steps_summary_names_what_it_holds() -> None:
     states = _states(
         _checklist(**all_ok), stand="demo-sample", preset="weekly", plan=plan
     )
-    assert states["stand"].summary == "demo-sample, preset weekly"
+    # 22 characters at most (m5 §17.12 D15): the step bar is one line tall.
+    assert states["stand"].summary == "demo-sample, preset w…"
     assert states["plate"].summary == "96-well, registered"
     assert states["wells"].summary == "2 wells, 72 fields"
     assert states["scan"].summary == "scanned"
@@ -1472,14 +1500,22 @@ def test_a_step_neither_done_nor_suggested_says_nothing_and_the_suggested_says_n
     assert states["results"].summary == ""
 
 
-def test_a_summary_is_one_line_of_at_most_forty_characters() -> None:
+def test_a_step_summary_is_cut_at_22_characters() -> None:
     long = "a-stand-with-a-very-long-profile-name-indeed"
     summary = _states(_checklist(), stand=long, preset="a-preset-with-a-long-name")[
         "stand"
     ].summary
-    assert len(summary) <= 40
-    assert summary.startswith("a-stand-with-a-very-long")
+    assert len(summary) == 22
+    assert summary == "a-stand-with-a-very-l…"
     assert "\n" not in summary
+    # Exactly 22 is not cut; 23 is.
+    assert (
+        _states(_checklist(), stand="s" * 22, preset=None)["stand"].summary == "s" * 22
+    )
+    assert (
+        _states(_checklist(), stand="s" * 23, preset=None)["stand"].summary
+        == "s" * 21 + "…"
+    )
     # A short one is never cut.
     assert (
         _states(_checklist(), stand="x", preset="p")["stand"].summary == "x, preset p"
@@ -1706,7 +1742,7 @@ def test_registered_line_says_when_the_residual_was_not_measured() -> None:
 
     assert (
         registered_line(result(121.64, 0.1))
-        == "Registered: residual 121.6 µm, turned 0.10°"
+        == "Registered: residual 121.6 µm of the 300 µm allowed, turned 0.10°"
     )
     # A seed measures no residual: an unknown is not a zero (CLAUDE.md).
     assert (
@@ -1714,7 +1750,8 @@ def test_registered_line_says_when_the_residual_was_not_measured() -> None:
         == "Registered: residual not measured, turned -0.46°"
     )
     assert (
-        registered_line(result(0.0, 0.0)) == "Registered: residual 0.0 µm, turned 0.00°"
+        registered_line(result(0.0, 0.0))
+        == "Registered: residual 0.0 µm of the 300 µm allowed, turned 0.00°"
     )
 
 
@@ -1939,8 +1976,7 @@ def test_the_wells_known_lines_say_what_is_laid_out_out_of_date_or_not_known() -
     assert unknown == (
         "Objective: not known",
         "Fields: 72 in 2 wells",
-        "Time: not known (no timing measured; the expert view's timing tool measures "
-        "it, then lay out the fields again)",
+        TIME_NOT_KNOWN,
     )
     assert not any("0 s" in line for line in unknown)
     # The singular.
@@ -2509,26 +2545,20 @@ def test_again_names_the_later_steps_that_are_done_and_is_empty_for_the_last() -
     )
     note = again_note("cells", everything)
     assert note == (
-        "Again replaces this result. What comes after it and is done (Density per well, "
-        "Route through the densest fields, Report, Export for NIS-Elements) is out of "
-        "date then: Run all that are left runs it again."
+        "Again makes Density, Route, Report, Export out of date; Run all that are left "
+        "runs them again."
     )
     # What reads it, and no more: the route does not read the density, and the export reads
     # the route alone, so each of these names what really becomes out of date.
-    assert again_note("density", everything).endswith(
-        "(Report) is out of date then: Run all that are left runs it again."
-    )
+    assert again_note("density", everything) == AGAIN_NOTE.format(names="Report")
     # A new route makes the export out of date, and the report too: it reads the route when
     # there is one (`reads_optional`), which the checklist shows after *Again* on the route.
-    assert again_note("route", everything).endswith(
-        "(Report, Export for NIS-Elements) is out of date then: Run all that are left "
-        "runs it again."
-    )
+    assert again_note("route", everything) == AGAIN_NOTE.format(names="Report, Export")
     assert again_note("report", everything) == ""
     assert again_note("nis-export", everything) == ""
     # Only the tools that are done are named, in the tools' order.
     partly = _results(scan_plan="ok", scan="ok", cells="ok", route="ok")
-    assert "(Route through the densest fields)" in again_note("cells", partly)
+    assert again_note("cells", partly) == AGAIN_NOTE.format(names="Route")
     # A tool that is not done has nothing to replace; neither has a name no table has.
     assert again_note("cells", _results()) == ""
     assert again_note("their-tool", everything) == ""
@@ -2703,3 +2733,449 @@ def test_a_row_is_never_both_done_and_missing_and_a_missing_row_has_no_wait(
         first = next(row for row in rows if row.plugin == left[0])
         expected = (first.state if first.missing else first.wait) or None
     assert run_all_wait(rows, left) == expected
+
+
+# -- round 2: plain words, notes drawn once, the frame, the files (m5 §17.12, #475) -----
+
+
+def test_the_round_2_texts_are_the_designs() -> None:
+    """Whole (FM-45): the design fixed these words with the owner, and a reword is a decision."""
+    assert FRAME_DARK == (
+        "The frame is dark: is the light on, and the light path on the camera?"
+    )
+    assert FRAME_SATURATED == "The frame is saturated: lower the exposure."
+    assert REGISTER_ACROSS_A_TURN == (
+        "The centres were captured with the {captured}; the {in_place} is in place: turn "
+        "back to the {captured}, or redo the centres with the {in_place}."
+    )
+    assert REGISTER_OBJECTIVES_DIFFER == (
+        "The centres were captured with different objectives ({which}): redo them with "
+        "one objective."
+    )
+    assert AGAIN_NOTE == (
+        "Again makes {names} out of date; Run all that are left runs them again."
+    )
+    assert RUN_ALL_LABEL in AGAIN_NOTE
+    assert DISCONNECT_RELEASES == "Disconnect releases {stand} for NIS-Elements or ZEN."
+    assert TIME_NOT_KNOWN == "Time: not known (no timing measured yet)"
+    assert COVERAGE_WORDS == (
+        "How much of each well's width the fields span: 0.4 is 40 %."
+    )
+    assert AUTOFOCUS_WORDS.startswith("Autofocus: if-engaged uses it when it is on")
+    assert SAMPLE_REGISTERS == (
+        "Register the plate uses the profile's sample while no centre is captured; "
+        "capture three to measure this plate."
+    )
+
+
+# The frame's verdict (#457): a frame is dark, saturated or lit.
+_FRAME = (96, 128)  # not square (FM-73)
+
+
+def _lit(shape: tuple[int, int] = _FRAME) -> Any:
+    import numpy as np
+
+    return (
+        np.linspace(100.0, 3000.0, shape[0] * shape[1]).reshape(shape).astype(np.uint16)
+    )
+
+
+def test_frame_hint_says_dark_for_a_flat_frame_and_saturated_before_dark_and_nothing_for_a_lit_one() -> (
+    None
+):
+    import numpy as np
+
+    dark = np.full(_FRAME, 100, dtype=np.uint16)
+    full_scale = np.full(_FRAME, 65535, dtype=np.uint16)
+
+    assert frame_hint(dark, 16) == FRAME_DARK
+    # A frame at full scale everywhere spans no counts either: saturated is asked first,
+    # because the light path is not its remedy.
+    assert frame_hint(full_scale, 16) == FRAME_SATURATED
+    assert frame_hint(_lit(), 16) == ""
+    # A camera whose depth is not known (a plugin's frame says 0) is not judged at all.
+    assert frame_hint(dark, 0) == ""
+    assert frame_hint(full_scale, 0) == ""
+    # The same lit counts on a 12-bit camera are lit, and 4095 is its full scale.
+    assert frame_hint(np.full(_FRAME, 4095, dtype=np.uint16), 12) == FRAME_SATURATED
+    # A frame that is not 2-D says nothing rather than raising in the page's tick.
+    assert frame_hint(np.zeros((4, 4, 3), dtype=np.uint16), 16) == ""
+
+
+def test_frame_hint_tests_a_large_frame_on_every_other_row() -> None:
+    import numpy as np
+
+    def striped(side: int) -> Any:
+        """Odd rows lit, even rows dark: a full test sees light, an every-other-row one does not."""
+        frame = np.full((side, side), 100, dtype=np.uint16)
+        frame[1::2, :] = 3000
+        return frame
+
+    # 1600 x 1600 is not larger: the whole frame is tested, and it carries signal.
+    assert frame_hint(striped(1600), 16) == ""
+    # 1602 x 1602 is: every other row and column, which here is the dark rows only.
+    assert frame_hint(striped(1602), 16) == FRAME_DARK
+
+
+def test_capture_note_names_a_capture_more_than_a_pitch_from_its_well() -> None:
+    pitch = 9000.0
+    far = capture_note("A1", (0.0, 0.0), (9001.0, 0.0), pitch, {})
+    assert far == CAPTURE_FAR.format(well="A1", distance_mm=9.001)
+    assert far.startswith("A1 was captured 9.0 mm from where the map puts it")
+    # One µm under the bound: said nothing. The bound is a pitch, as the map draws it.
+    assert capture_note("A1", (0.0, 0.0), (8999.0, 0.0), pitch, {}) == ""
+    # H1 at A12's place, 99 mm off (the owner's walk): the distance is said in mm.
+    assert "99.0 mm" in capture_note("H1", (49500.0, 0.0), (-49500.0, 0.0), pitch, {})
+
+
+def test_capture_note_names_two_captures_at_one_place() -> None:
+    pitch = 9000.0
+    same = capture_note(
+        "H1", (1000.0, 1000.0), (1000.0, 1000.0), pitch, {"A12": (1200.0, 1000.0)}
+    )
+    assert same == CAPTURE_SAME_PLACE.format(well="H1", other="A12")
+    # Two neighbouring wells, each centred by eye, are one pitch apart and are right.
+    assert (
+        capture_note("A2", (8999.0, 0.0), (9000.0, 0.0), pitch, {"A1": (0.0, 0.0)})
+        == ""
+    )
+    # A capture is never the same place as itself.
+    assert capture_note("A1", (0.0, 0.0), (0.0, 0.0), pitch, {"A1": (0.0, 0.0)}) == ""
+    # Far is said first when both hold.
+    both = capture_note(
+        "H1", (50000.0, 0.0), (0.0, 0.0), pitch, {"A12": (50000.0, 10.0)}
+    )
+    assert both.startswith("H1 was captured 50.0 mm")
+
+
+def test_capture_note_is_empty_on_an_unplaced_map() -> None:
+    # An unplaced map puts no well anywhere: nothing is far from where it is not.
+    assert capture_note("A1", (99999.0, 99999.0), None, 9000.0, {}) == ""
+    # Two captures at one place are still two captures at one place.
+    assert capture_note("A1", (0.0, 0.0), None, 9000.0, {"B1": (0.0, 50.0)}) != ""
+
+
+def test_register_objective_refusal_across_a_turn_names_both_objectives() -> None:
+    said = register_objective_refusal(
+        {"A1": "Nikon 10X", "H1": "Nikon 10X"}, "Nikon 40X"
+    )
+    assert said == REGISTER_ACROSS_A_TURN.format(
+        captured="Nikon 10X", in_place="Nikon 40X"
+    )
+    assert said is not None
+    assert "Nikon 10X" in said
+    assert "Nikon 40X" in said
+    # The same objective, one capture or several: nothing to say.
+    assert register_objective_refusal({"A1": "Nikon 10X"}, "Nikon 10X") is None
+    assert register_objective_refusal({}, "Nikon 10X") is None
+
+
+def test_register_objective_refusal_names_captures_made_with_different_objectives() -> (
+    None
+):
+    said = register_objective_refusal(
+        {"A1": "Nikon 10X", "H1": "Nikon 40X", "A12": "Nikon 10X"}, "Nikon 40X"
+    )
+    assert said == REGISTER_OBJECTIVES_DIFFER.format(which="Nikon 10X and Nikon 40X")
+    three = register_objective_refusal({"A1": "4X", "H1": "10X", "A12": "40X"}, "40X")
+    assert three == REGISTER_OBJECTIVES_DIFFER.format(which="4X, 10X and 40X")
+    # Whatever the turret says: two objectives are two objectives.
+    assert register_objective_refusal({"A1": "10X", "H1": "40X"}, "10X") == (
+        REGISTER_OBJECTIVES_DIFFER.format(which="10X and 40X")
+    )
+
+
+def test_register_objective_refusal_ignores_captures_whose_objective_is_not_known() -> (
+    None
+):
+    # A capture restored from a run document has no label, and one whose turret could not be
+    # read has `None`: neither is compared, so neither refuses anything.
+    assert register_objective_refusal({"A1": None, "H1": None}, "Nikon 40X") is None
+    assert (
+        register_objective_refusal({"A1": "Nikon 10X", "H1": None}, "Nikon 10X") is None
+    )
+    # The known one still refuses a turn.
+    assert register_objective_refusal(
+        {"A1": "Nikon 10X", "H1": None}, "Nikon 40X"
+    ) == REGISTER_ACROSS_A_TURN.format(captured="Nikon 10X", in_place="Nikon 40X")
+    # An empty label is unknown too: *with* nothing would read as a fact.
+    assert register_objective_refusal({"A1": ""}, "Nikon 40X") is None
+
+
+def test_register_objective_refusal_is_none_when_the_turret_was_not_read() -> None:
+    assert register_objective_refusal({"A1": "Nikon 10X"}, None) is None
+
+
+def test_goto_row_text_says_going_at_the_estimate_at_and_the_refusal_without_the_tools_name() -> (
+    None
+):
+    def answer(phase: str, *, estimated: bool = False, text: str = "") -> GotoAnswer:
+        return GotoAnswer("A1", phase, estimated, text)  # type: ignore[arg-type]
+
+    assert goto_row_text(None, "A1") == ""
+    # The row of another well says nothing of this drive.
+    assert goto_row_text(answer("going"), "H1") == ""
+    assert goto_row_text(answer("going"), "A1") == "Going to A1…"
+    assert goto_row_text(answer("at"), "A1") == "At A1."
+    assert goto_row_text(answer("at", estimated=True), "A1") == (
+        "At A1, the holder's estimate: centre it by eye with Live and the arrows, then "
+        "capture."
+    )
+    # The refusal's or failure's one line is the controller's, as it is, with no tool name.
+    assert goto_row_text(answer("refused", text=GOTO_UNPLACED), "A1") == GOTO_UNPLACED
+    failed = goto_row_text(answer("failed", text="the move was stopped"), "A1")
+    assert failed == "the move was stopped"
+    assert "goto-well" not in failed
+
+
+def test_map_frame_is_the_outlines_grown_by_one_pitch() -> None:
+    frame = map_frame([(0.0, 0.0, 10.0, 20.0), (100.0, 50.0, 110.0, 70.0)], 9.0)
+    assert frame == ((-9.0, 119.0), (-9.0, 79.0))
+    # An outline given with its corners the other way round is the same outline.
+    assert map_frame([(10.0, 20.0, 0.0, 0.0)], 9.0) == ((-9.0, 19.0), (-9.0, 29.0))
+    with pytest.raises(ValueError, match="at least one outline"):
+        map_frame([], 9.0)
+
+
+def test_plate_rows_note_says_what_holds_for_every_row_once() -> None:
+    assert plate_rows_note(running=None, live=False, from_sample=False) == ""
+    assert plate_rows_note(running="goto-well", live=False, from_sample=False) == (
+        busy_note("goto-well", live=False)
+    )
+    # Live is told apart: the way out is a button, and Capture still works.
+    assert plate_rows_note(running="live", live=True, from_sample=False) == (
+        GOTO_NOT_DURING_LIVE
+    )
+    assert plate_rows_note(running=None, live=False, from_sample=True) == (
+        SAMPLE_REGISTERS
+    )
+    both = plate_rows_note(running="goto-well", live=False, from_sample=True)
+    assert both.splitlines() == [busy_note("goto-well", live=False), SAMPLE_REGISTERS]
+
+
+def _file_card(plugin: str, *files: str) -> ResultCard:
+    return _result_card(plugin=plugin, files=tuple(files))
+
+
+def test_files_html_escapes_every_text_and_links_only_files_inside_the_run_folder() -> (
+    None
+):
+    run = Path("/runs/x")
+    nasty = 'a<b>&"c.html'
+    cards = {
+        "scan": _file_card("scan", "folder: /runs/x/frames"),
+        "report": _file_card("report", f"file: /runs/x/report/{nasty}"),
+        "nis-export": _file_card("nis-export", "file: /data/p.xml"),
+        "route": _file_card("route", "file: /runs/x/../etc/passwd"),
+    }
+
+    page = files_html(cards, run)
+
+    # The name is data: escaped in the text and URL-quoted in the link.
+    assert (
+        '<a href="/run-files/report/a%3Cb%3E%26%22c.html" target="_blank" '
+        'rel="noopener">report/a&lt;b&gt;&amp;&quot;c.html</a>'
+    ) in page
+    assert nasty not in page
+    # The scan's folder, a file outside the run folder and a `..` are text, never links.
+    assert page.count("<a ") == 1
+    assert "Scan frames: /runs/x/frames" in page
+    assert "Export for NIS-Elements: /data/p.xml" in page
+    assert "Route through the densest fields: /runs/x/../etc/passwd" in page
+    # The plain names, in the screen's order: the scan first, then each tool.
+    assert (
+        page.index("Scan frames") < page.index("Route through") < page.index("Report")
+    )
+
+
+def test_files_html_quotes_a_windows_relative_path_as_posix() -> None:
+    # A page served on Windows names its files with backslashes; the route takes `/`.
+    run = PureWindowsPath("C:/runs/x")
+    cards = {"report": _file_card("report", "file: C:\\runs\\x\\report\\a b.html")}
+
+    page = files_html(cards, run)
+
+    assert 'href="/run-files/report/a%20b.html"' in page
+    assert ">report/a b.html</a>" in page
+    # Another drive is outside the run folder.
+    other = {"report": _file_card("report", "file: D:\\runs\\x\\report\\a.html")}
+    assert "<a " not in files_html(other, run)
+
+
+def test_files_html_says_so_when_no_step_wrote_a_file() -> None:
+    assert files_html({}, Path("/runs/x")) == f"<div>{NO_FILES_YET}</div>"
+    # A card with no files is none; no run folder links nothing.
+    assert (
+        files_html({"report": _file_card("report")}, None)
+        == f"<div>{NO_FILES_YET}</div>"
+    )
+    nothing_to_link = files_html(
+        {"report": _file_card("report", "file: /r/a.html")}, None
+    )
+    assert "<a " not in nothing_to_link
+    assert "Report: /r/a.html" in nothing_to_link
+
+
+def test_tool_title_names_every_built_in_tool_and_a_third_partys_by_its_plugin_name() -> (
+    None
+):
+    from smc.plugins import discover
+
+    shipped = {
+        name
+        for name, entry in discover().plugins.items()
+        if entry.target.startswith("smc.")
+    }
+    assert shipped, (
+        "no plugin of the repository was found: the entry points are not installed"
+    )
+    assert shipped <= set(TOOL_TITLES), sorted(shipped - set(TOOL_TITLES))
+    assert tool_title("goto-well") == "Go to"
+    assert tool_title("plate-registration") == "Registration"
+    assert tool_title("scan") == "Scan"
+    # A name nobody listed is its own, and so is an activity that is no tool.
+    assert tool_title("their-tool") == "their-tool"
+    assert tool_title("live") == "live"
+    # The plain titles name no plugin: that was the defect.
+    assert all(title != plugin for plugin, title in TOOL_TITLES.items())
+    assert not any(title == title.lower() for title in TOOL_TITLES.values())
+
+
+def test_local_time_is_the_local_clock_to_the_minute_and_reads_a_naive_time_as_utc() -> (
+    None
+):
+    noon = datetime(2026, 11, 13, 12, 0, 59, tzinfo=timezone.utc)
+    assert local_time(noon) == noon.astimezone().strftime("%Y-%m-%d %H:%M")
+    # To the minute: the seconds are dropped, not rounded.
+    assert local_time(noon).count(":") == 1
+    # Naive is UTC (the document's times are), whatever zone the PC is in.
+    assert local_time(datetime(2026, 11, 13, 12, 0)) == local_time(noon)
+    # An offset is converted: 14:20 at +05:00 is 09:20 UTC, the same instant.
+    five = timezone(timedelta(hours=5))
+    assert local_time(datetime(2026, 11, 13, 14, 20, tzinfo=five)) == local_time(
+        datetime(2026, 11, 13, 9, 20, tzinfo=timezone.utc)
+    )
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="tzset is POSIX only")
+def test_local_time_is_in_the_zone_of_the_pc(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TZ", "UTC-2")  # POSIX: two hours east of UTC
+    time.tzset()
+    try:
+        assert local_time(datetime(2026, 11, 13, 12, 0, tzinfo=timezone.utc)) == (
+            "2026-11-13 14:00"
+        )
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+
+def test_local_time_of_a_start_the_pc_cannot_show_is_the_values_own_text() -> None:
+    # Year 1 under a positive offset is before UTC's year 1: no zone can show it, and the
+    # page's redraw must not end on it (FM-125).
+    odd = datetime(1, 1, 1, 0, 0, tzinfo=timezone(timedelta(hours=-5)))
+    said = local_time(odd)
+    assert said.startswith("0001-01-01")
+
+
+def test_the_again_note_is_one_line_of_short_names() -> None:
+    everything = _results(
+        scan_plan="ok",
+        scan="ok",
+        cells="ok",
+        density="ok",
+        route="ok",
+        report="ok",
+        nis_export="ok",
+    )
+    note = again_note("cells", everything)
+    assert "\n" not in note
+    assert len(note) < 100
+    # Short names, never the rows' long ones.
+    assert "Density per well" not in note
+    assert "Route through the densest fields" not in note
+    assert set(RESULT_SHORT) == set(RESULT_TOOLS)
+
+
+def test_registered_line_names_the_bound_the_tool_refuses_beyond() -> None:
+    result = PlateResult(
+        plate="96-well",
+        a1_center_xy_um=(0.0, 0.0),
+        rotation_deg=-0.01,
+        method="references",
+        residual_um=62.3,
+        scale_error=None,
+        n_refs=3,
+    )
+    assert registered_line(result) == (
+        "Registered: residual 62.3 µm of the 300 µm allowed, turned -0.01°"
+    )
+    # The bound is the registration's own, not a copy that could drift.
+    from smc.plugins.plate_registration.algorithm import GOOD_RESIDUAL_UM
+
+    assert f"{GOOD_RESIDUAL_UM:g} µm allowed" in registered_line(result)
+
+
+def test_plain_default_reads_a_tuple_as_its_items() -> None:
+    assert plain_default("('single',)") == "single"
+    assert plain_default("('a', 'b')") == "a, b"
+    assert plain_default("(1, 2.5)") == "1, 2.5"
+    # What does not read as a tuple of literals is as it came, never an exception.
+    assert plain_default("(x, y)") == "(x, y)"
+    assert plain_default("(1 +)") == "(1 +)"
+    assert plain_default("()") == "()"
+    assert plain_default("(1)") == "(1)"
+    assert plain_default("(" * 500 + ")" * 500) == "(" * 500 + ")" * 500
+    # The quote rule of before still holds.
+    assert plain_default("'if-engaged'") == "if-engaged"
+    assert field_source_line(
+        value="", default="('single',)", preset=None, preset_value=None, suggested=None
+    ) == ("the tool's default: single")
+
+
+def test_known_text_says_the_calibration_in_local_time_and_what_disconnect_does() -> (
+    None
+):
+    here = CalibrationNote(
+        objective="Nikon 10X",
+        when_utc="2026-11-12 09:30:00",
+        when_local="2026-11-12 10:30",
+    )
+    lines = known_text(
+        objective="Nikon 10X", calibration=here, light_on=True, stand="demo-sample"
+    ).split("\n")
+    assert lines == [
+        "Objective: Nikon 10X, in place",
+        "Camera: calibrated at Nikon 10X on 2026-11-12 10:30",
+        "Light: on",
+        "Disconnect releases demo-sample for NIS-Elements or ZEN.",
+    ]
+    # Not connected: no word of a release, and a note with no local time keeps its UTC one.
+    old = CalibrationNote(objective=None, when_utc="2026-11-12 09:30:00")
+    said = known_text(objective=None, calibration=old, light_on=None).split("\n")
+    assert said == [
+        "Objective: not known",
+        "Camera: calibrated on 2026-11-12 09:30:00 UTC, objective not recorded",
+        "Light: not known",
+    ]
+    # The stand's name is a text of the profile, printed as it is (FM-139).
+    markup = known_text(
+        objective=None, calibration=None, light_on=None, stand="<b>x</b>"
+    )
+    assert (
+        markup.split("\n")[-1]
+        == "Disconnect releases <b>x</b> for NIS-Elements or ZEN."
+    )
+
+
+def test_a_results_row_says_when_it_was_done_in_local_time() -> None:
+    card = _result_card(when_local="2026-11-12 10:30")
+    row = _row("cells", _results(scan="ok", cells="ok"), card=card)
+    assert row.state == "Done 2026-11-12 10:30"
+    assert "UTC" not in row.state
+    dry = _row(
+        "cells",
+        _results(scan="ok", cells="ok"),
+        card=_result_card(when_local="2026-11-12 10:30", dry_run=True),
+    )
+    assert dry.state == "Done 2026-11-12 10:30 (dry run)"
