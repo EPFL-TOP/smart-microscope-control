@@ -360,6 +360,22 @@ def test_a_relock_back_down_to_where_pfs_held_is_inside_the_band() -> None:
         assert stand.z.position_um() == Z0
 
 
+def test_a_relock_on_a_declared_stand_back_to_where_pfs_held_is_inside_the_band() -> (
+    None
+):
+    # The Ti2-E's case: the guard of a seen offset is built at its own return in the
+    # engage check (#349), and it must take where PFS held Z too (adversarial review
+    # of #349: a `None` there survived the suite).
+    with _stand(_guarded(declared=True)) as stand:
+        _see(stand)
+        stand.engage_directly()
+        _relock_drives_to(stand, Z0)
+        assert stand.z.move_to_um(Z0 - 80.0) == Z0 - 80.0
+        assert stand.core.log == [OFF, f"setPosition('ZDrive', {Z0 - 80.0})", ON]
+        assert stand.z.position_um() == Z0
+        assert stand.af.is_locked() is True
+
+
 def test_a_relock_that_overshoots_where_pfs_held_trips_the_guard() -> None:
     with _stand() as stand:
         stand.engage_directly()
@@ -1589,6 +1605,60 @@ def test_dry_run_first_lock_with_a_contradicting_factor_is_refused_too() -> None
             factor="-6", larger="smaller", direction="decreasing"
         )
         assert stand.core.log == []
+
+
+# D12 is read only where the one-sided band would be built (m2 §12.12 D12, "Where"):
+# with a contradicting factor, every other path keeps its own outcome. A check
+# hoisted earlier survived the suite (adversarial review of #349).
+CONTRADICTING = {"10x": -6.0}  # on a "decreasing" stand
+
+
+def test_a_contradicting_factor_with_the_autofocus_searching_at_the_floor_keeps_d9s_switch_off() -> (
+    None
+):
+    # D12's refusal sends nothing: here it would leave PFS searching toward the
+    # floor's plane (FM-19).
+    with _stand(_first_lock(factors=CONTRADICTING), offset=FLOOR) as stand:
+        stand.engage_directly(lockable=False)
+        with pytest.raises(SafetyRefusedError) as refused:
+            stand.af.engage()
+        assert str(refused.value) == _unseen_at(switched=SWITCHED, advice=FROM_BELOW)
+        assert stand.core.log == [OFF]
+        assert stand.af.is_engaged() is False
+
+
+def test_a_contradicting_factor_with_a_condition_missing_names_the_condition() -> None:
+    profile = _first_lock(z_away_from_sample=None, factors={"10x": 6.0})
+    with _stand(profile, offset=FLOOR) as stand:
+        with pytest.raises(SafetyRefusedError) as refused:
+            stand.af.engage()
+        assert str(refused.value) == _unseen_at(
+            advice=NO_FIRST_LOCK.format(missing="[safety] z_away_from_sample")
+        )
+        assert stand.core.log == []
+
+
+def test_a_contradicting_factor_does_not_refuse_the_floor_with_the_autofocus_locked() -> (
+    None
+):
+    # Locked at the floor by the operator: D1's seen offset, no first lock.
+    with _stand(_first_lock(factors=CONTRADICTING), offset=FLOOR) as stand:
+        stand.engage_directly()
+        assert stand.af.is_locked() is True
+        stand.core.log.clear()
+        assert stand.af.engage() is True
+        assert stand.core.log == [ON]
+
+
+def test_a_contradicting_factor_does_not_refuse_a_seen_offset_or_its_relock() -> None:
+    with _stand(_first_lock(factors=CONTRADICTING), offset=SEEN_OFFSET) as stand:
+        _see(stand)
+        assert stand.af.engage() is True
+        assert stand.core.log == [ON]
+        stand.core.log.clear()
+        assert stand.z.move_by_um(1.0) == Z0 + 1.0
+        assert stand.core.log == [OFF, f"setPosition('ZDrive', {Z0 + 1.0})", ON]
+        assert stand.af.is_locked() is True
 
 
 def test_a_retry_after_a_first_locks_trip_is_a_first_lock_again() -> None:
