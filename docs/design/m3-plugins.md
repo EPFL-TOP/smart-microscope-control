@@ -5195,6 +5195,76 @@ On throwaway prototypes that are not committed; numpy 2.5.3, tifffile
     the four frames: the outward direction points into the plastic, every
     line starts dark, and no line gives a point. A wrong calibration is a
     refusal, not a centre one well-width off (#327's failure).
+- **The frames of Ti2-E session 3** (2026-11-10, planning #409; F7 of #405;
+  `local/scans/2026-11-10/plate-walls/`, private: Prime 95B, 1412 × 1412 px,
+  brightfield, a Greiner 24-well plate with debris and no cells). The run
+  `d5d32a2051ad` is the 4× run that failed on B5; its saved frames are the
+  ones centred on what the walk took for each wall. `cdde0e648acc` is the 10×
+  run that found the walls of B3, B5 and C3. The matrices are the session's
+  calibrations: ((−2.7376, 0.1217), (0.1225, 2.7351)) µm per pixel at the 4×
+  and ((−1.12426, 0.04985), (0.05022, 1.12245)) at the 10×. The plastic edge
+  of a line is where it last falls below 0.1 of the way from the frame's 2nd
+  percentile to its 98th, read per line.
+  - **The 4× took B5's meniscus for its walls.** Going outwards, every B5
+    frame falls from the inside to a grey band before it falls to the
+    plastic. On ±X it is a shadow joined to the wall, 0.16–0.30 of the way
+    from the plastic to the inside; it lies below the midpoint over runs of
+    up to 685 µm (+X) and 972 µm (−X). On ±Y it is a dark ridge (down to
+    0.01–0.07 on −Y) on the inner border of a grey band (0.3–0.55) about
+    1.5 mm wide, with the wall beyond it. The midpoint threshold is crossed
+    at the shadow's or the ridge's start, 276 to 611 px (0.76 to 1.67 mm,
+    medians per side) inside the plastic edge. The plastic edge itself is in
+    every frame, 140 to 476 px from its far side. The four inner edges fit a
+    circle of 13 055 µm, rms 663 µm, which the size check refused. In the
+    frame centred on B5's "+Y wall" the plastic edge lies 575 px (1 575 µm)
+    further out: the owner found the wall at Y −2 350, and the walk took
+    −3 924.
+  - **B3 at the 4× has a paler meniscus.** No run below the midpoint ends
+    inside its frames. The midpoint's edge lies 20 to 27 px inside the
+    plastic edge on every side: the bias cancels in the centre but not in the
+    diameter (15 333 µm).
+  - **At the 10×** the midpoint's edge lies 55 to 77 px (62 to 87 µm)
+    inside the plastic edge on every side: that is the meniscus's ramp. The
+    runs below the midpoint that end inside a frame are at most 83 µm long
+    (C3 −X, debris).
+  - **§17.3's rule** (the plastic run, then the wall's own half level), on
+    the same frames, against the midpoint rule it replaces:
+
+    | frames | midpoint rule: centre (µm), diameter, rms | §17.3's rule |
+    |---|---|---|
+    | 4× B3 | (9 989, −10 115), 15 333, 16.3 | (9 995, −10 123), 15 436, 19.9 |
+    | 4× B5 | (−28 967, −9 928), 13 055, 663 | (−28 991, −10 034), 15 436, 23.5 |
+    | 10× B3 | (9 981, −10 140), 15 377, 12.3 | (9 986, −10 152), 15 516, 9.1 |
+    | 10× B5 | (−29 009, −10 057), 15 423, 8.5 | (−29 004, −10 053), 15 560, 8.7 |
+    | 10× C3 | (10 068, 9 394), 15 370, 2.7 (527 of 702 points kept) | (10 043, 9 387), 15 536, 13.0 (692 kept) |
+    | session 2's B3, 10× | (10 182, −10 088), 15 298, 41.9 | (10 157, −10 098), 15 561, 22.5 |
+
+    B5's centre at the 4× lies 23 µm from its centre at the 10×, and B3's
+    30 µm. The 10× centres move by 6 to 27 µm. The diameters grow by 140 to
+    260 µm towards the plate's 15 600, because the midpoint read the
+    meniscus's ramp.
+  - **Frames of a walk** were not saved, so they were simulated: windows of
+    706 and 1 000 px of the saved frames, every 25 px along the outward axis,
+    46 per frame. At the 4×, §17.3's rule gives the plastic edge or no wall in
+    all but 2 of the 368 windows. The 2 are B5 −X windows that cut a shadow at
+    their far end: the run reaches the line's end and is taken, and the frame
+    centred on it then holds the wall. The midpoint rule took an inner edge in
+    148 of B5's 184 windows.
+  - **The run's minimum length.** At `MIN_PLASTIC_UM` 0, 250 or 500 µm the
+    shadow runs of B5 are taken for the plastic: the circle's rms is 52, 86
+    and 24 µm, with lines lost. At 1 000 and 1 400 µm all of B5's lines are
+    used and the rms is 23.5 µm. The narrowest gap between round wells is
+    1 900 µm (48-well, below).
+  - **Variants measured and dropped.** (a) A fixed deep level (0.1) for the
+    edge itself, instead of the wall's own half level. It moved the rendered
+    centres by up to 1.4 µm and the diameters by up to 6 µm. Under frame noise
+    of 150 counts (well 3 000, plastic 800) it failed or put a centre 96 to
+    930 µm off, because its dark runs broke on the noise. (b) Runs taken
+    below the deep level instead of the midpoint, which the same noise broke.
+    §17.3's rule is as exact as the midpoint on the rendered cases below
+    (worst centre 0.05 µm, diameter 0.03 µm). Under noise of 600 counts its
+    worst centre error is 0.05 µm, against 0.16 µm for the midpoint.
+    11.4 ms per 1412 × 1412 frame (the midpoint 9.7), warm.
 - **Synthetic wells** (`PlateSample.render`, no stage), the whole walk of
   §17.4 with §17.3's functions, rough centres off by up to half a radius:
 
@@ -5306,6 +5376,9 @@ DEFAULT_SEARCH_FRACTION = 0.5
 MAX_RMS_FRACTION = 0.02
 MIN_FRAME_SIDE_PX = 128
 MAX_FRAMES = 600
+WALL_LEVEL = 0.1
+MIN_PLASTIC_UM = 1400.0
+SHOULDER_PX = 2 * BAND_PX
 SIDES: tuple[WallSide, ...] = ("+X", "+Y", "-X", "-Y")
 OUTWARD: dict[WallSide, tuple[float, float]] = {
     "+X": (1.0, 0.0),
@@ -5372,15 +5445,50 @@ def encode_wall_frame(frame: npt.NDArray[Any], meta: dict[str, Any]) -> bytes: .
      each averaged across its rows and walked along the columns in the
      direction of `v_col`'s sign; otherwise bands of `BAND_PX` columns walked
      along the rows. `n_lines` counts the bands.
-  4. **A line's point.** A line counts only when the mean of its first
-     `BAND_PX` samples, at the inward end, is at least `threshold`: it starts
-     inside a well. Its edge is the first sample below `threshold` after the
-     first, interpolated linearly with the sample before it; the point is
-     `(col, row)` with the band's middle (`start + (BAND_PX − 1) / 2`) on the
-     other axis. A line that never falls below gives no point. This is what
-     keeps a neighbouring well's walls out: going outwards, our wall is the
-     first fall from bright to dark; the neighbour's near wall is a rise, and
-     a line that starts in the plastic is not read.
+  4. **A line's point** (#409). A line counts only when the mean of its
+     first `BAND_PX` samples, at the inward end, is at least `threshold`: it
+     starts inside a well. The plastic is the darkest thing in a brightfield
+     frame, and it reaches the frame's edge, or the neighbour's wall at least
+     a gap between wells further out. The meniscus also falls below the
+     midpoint, but it is paler than the plastic, or ends inside the frame
+     (§17.1, session 3). So the wall is the fall to the plastic, found in
+     three steps:
+     1. **The plastic's run.** The runs of samples below `threshold` from
+        the second sample on; two runs that fewer than `BAND_PX` samples at or
+        above `threshold` separate are one (noise). The line's run is the
+        first that reaches the line's far end, or that is at least `ceil(
+        MIN_PLASTIC_UM / step_um)` samples long. `step_um` is the stage
+        length of one sample along the line: `hypot(m00, m10)` along the
+        columns, `hypot(m01, m11)` along the rows. With no such run, the line
+        gives no point. A shadow or a ridge of the meniscus that ends inside
+        the frame is shorter (972 µm at most, measured). The plastic between
+        our wall and the neighbour's is a gap between wells (1 900 µm at
+        least).
+     2. **The plastic reached.** `plastic` and `inside` are the 2nd and 98th
+        percentiles of all the lines' samples (the band means, whose noise is
+        lower than the pixels'). `at` is the first sample of the run below
+        `plastic + WALL_LEVEL × (inside − plastic)`. With none, the line
+        gives no point.
+     3. **The wall's own edge.** `shoulder` is the largest sample among the
+        `SHOULDER_PX` before `at` (from the line's start when there are fewer),
+        and `local = (plastic + shoulder) / 2`. Going inwards from `at`, the
+        edge is between the first sample at or above `local` and the next one,
+        interpolated linearly at `local` (a span that is not positive puts it
+        on the sample below `local`). The shoulder lies at most `SHOULDER_PX`
+        samples inwards, so this step moves the edge by no more than that.
+        `SHOULDER_PX` is twice `BAND_PX`: a wall that crosses a band at up to
+        45° spreads its fall over `BAND_PX` samples.
+
+     On a clean step the edge is the half-intensity edge, as before: between
+     the last bright sample and the first dark one, for a wall of 10 000 and
+     1 000 counts. On a wall with a shadow before it, the edge is the half
+     level of the wall's own fall to the plastic, not of the shadow's. The
+     point is `(col, row)` with the band's middle (`start + (BAND_PX − 1) /
+     2`) on the other axis. A neighbouring well's walls stay out: going
+     outwards, our wall is the first fall into a run that reaches the
+     plastic; the neighbour's near wall is a rise; and a line that starts in
+     the plastic is not read. `WallEdge.threshold` is still the midpoint
+     `threshold`, the one that splits the two classes and the runs.
   5. `None` when fewer than `MIN_LINE_FRACTION × n_lines` lines give a point;
      otherwise the `WallEdge`, `points_px` of shape `(n, 2)`.
 - **`wall_points_um`** maps the points to the stage, the frame taken at
@@ -5588,10 +5696,34 @@ against it; the page's own design goes in `m5-web-ui.md` with that issue.
   folder is `SMC_SESSION2_DIR` when set, else
   `<checkout>/local/surveys/nikon-ti2/session2`.
   `test_b3s_centre_agrees_with_the_midpoint_of_its_walls`: §17.1's matrix
-  and positions, the centre within 25 µm of (10 184.7, −10 091.4) µm (4.4
-  measured), the diameter within 1 % of 15 300 µm (15 298 measured);
+  and positions. Since #409 the centre is within 50 µm of (10 184.7,
+  −10 091.4) µm, the eye's half-intensity midpoint (28.4 measured). The eye
+  read the edge on the meniscus's ramp, which is wider on some sides than on
+  others. The diameter is within 1 % of the plate's 15 600 µm (15 561
+  measured). Until #409 the test asked for 25 µm and 1 % of 15 300.
   `test_b3_with_an_upright_camera_finds_no_wall`. The develop session runs
   them once with the variable set and says so in its report.
+- **On the frames of session 3** (#409), in the same module, skipped in the
+  same way. The folder is `SMC_SESSION3_DIR` when set, else
+  `<checkout>/local/scans/2026-11-10/plate-walls`. Each frame's stage
+  position is its own TIFF metadata (`x_um`, `y_um`), and the matrices are
+  §17.1's. `test_b5_at_the_4x_is_measured_at_its_plastic_walls`
+  (`d5d32a2051ad/B5_*.tif`): the diameter within 2 % of 15 600 µm (15 436
+  measured; the midpoint rule gave 13 055), the rms under `MAX_RMS_FRACTION
+  × 7 800` µm (23.5; 663), the centre within 50 µm of (−29 004, −10 053) µm,
+  B5's centre at the 10× (23). `test_session_3s_10x_centres_stay_near_the_midpoint_rules`
+  (`cdde0e648acc`, B3, B5 and C3): each diameter within 1 % of 15 600 µm,
+  each rms under the same bound, and each centre within 40 µm of the
+  midpoint rule's (§17.1's table: 13, 6 and 26 µm measured).
+- **The meniscus**, in the same module, on frames built by hand (not
+  square, FM-73) or rendered:
+  `test_a_shadow_joined_to_the_wall_is_not_taken_for_it` (B5 ±X);
+  `test_a_ridge_inside_the_well_is_not_taken_for_the_wall` (B5 −Y);
+  `test_a_dark_band_narrower_than_the_plastic_is_not_a_wall`;
+  `test_a_well_with_a_meniscus_and_an_inner_ring_is_measured_at_its_wall`
+  (the whole walk on a rendered 24-well, with a shadow and a ring 1.6 mm
+  inside the wall painted on by the test). The plan of #409 fixes their
+  frames and numbers.
 - `tests/test_plate_walls_demo.py`, on `demo_microscope_with_sample` (the
   stage's `Velocity` at 100 000, as §6's test), `camera-calibration` run first
   on the same document (the seam, FM-124):
@@ -5634,6 +5766,20 @@ bound), FM-124, FM-125, FM-131, FM-142.
 - `max_residual_um = 100`: no plate was registered from images yet.
 - 4×, the light and exposure the walls need, other plates than the 24-well,
   and whether the PFS holds its lock while the stage looks at the walls.
+- §17.3's rule (#409) in a walk at the stand. It was measured on the frames
+  that the 4× and 10× runs of session 3 saved, and on windows of them, not
+  on the frames a walk takes. A meniscus that is longer than
+  `MIN_PLASTIC_UM` and ends inside the frame would be taken for the plastic.
+  So would a meniscus that is as dark as the plastic and reaches the frame's
+  far end, where the frame centred on it does not show the wall (a 10× frame
+  is 1.6 mm wide). Neither was seen. Behind either stand the circle fit's
+  trims (one side's arc dropped), its rms and size checks (a refusal), and
+  "the wall was lost in the frame centred on it". A ridge that lies at the
+  inward end of the frame centred on the wall makes its lines start dark.
+  Those lines are not read, so the side is refused. This was measured on a
+  rendered 24-well at 2.739 µm per pixel with 1 200 rows, which puts the
+  frame's inward end 1 643 µm inside the wall, and a ring 1.6 mm inside it.
+  That is a refusal, not a wrong centre.
 
 ## 18. The plate in another objective's frame (#340)
 
