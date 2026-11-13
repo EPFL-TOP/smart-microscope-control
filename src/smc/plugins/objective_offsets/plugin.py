@@ -29,10 +29,17 @@ The decisions that keep a number that the stage will move by from lying:
   shift is one translation over the plate. They are judged after every target
   is measured, so the run fails with all the numbers in one message and no
   ``done`` record exists to write a profile from.
+* **An engaged autofocus is switched off once, before anything turns or moves**
+  (m3 §5.7 D1), with ``plate-walls``' own function and texts: PFS locked in one
+  well follows its reference over the wall into the next (m2 §12.2 D2, FM-223).
+  The layer's turret switches it off before a turn too, but not when it already
+  reads the first target, and then the first move to a wall would be made with
+  PFS engaged. The record says so first; nothing engages it again, and a
+  switch-off that fails or does not hold fails the run before anything moves.
 * **Nothing moves or turns back** (FM-88): on any exception a WARNING says where
-  the stage and the turret were left. No Z, autofocus or light is touched, and
-  no Z offset is measured (a focused Z needs the operator, which a plugin cannot
-  ask).
+  the stage and the turret were left. No Z or light is touched, the autofocus
+  only as above, and no Z offset is measured (a focused Z needs the operator,
+  which a plugin cannot ask).
 """
 
 from __future__ import annotations
@@ -46,7 +53,13 @@ from typing import TYPE_CHECKING
 import useq
 from pydantic import Field
 
-from smc.hardware.capabilities import Camera, ObjectiveTurret, XYStage, ZStage
+from smc.hardware.capabilities import (
+    Autofocus,
+    Camera,
+    ObjectiveTurret,
+    XYStage,
+    ZStage,
+)
 from smc.hardware.errors import SafetyRefusedError
 from smc.hardware.profile import MAX_XY_OFFSET_UM
 from smc.plugins.api import PluginParams, RunContext
@@ -66,6 +79,7 @@ from smc.plugins.plate_walls.algorithm import (
     walk_offsets_um,
 )
 from smc.plugins.plate_walls.loop import (
+    AUTOFOCUS_OFF_LINE,
     WallWalk,
     Where,
     check_calibration,
@@ -75,6 +89,7 @@ from smc.plugins.plate_walls.loop import (
     checked_search,
     measure_well,
     move,
+    switch_off_autofocus,
     warn_left,
 )
 from smc.plugins.slots import (
@@ -237,8 +252,9 @@ class ObjectiveOffsetsPlugin:
                 turret, is the plate's objective or is given twice, a well the
                 registration did not measure, a missing, doubled or unfit
                 calibration, a profile reference this run does not measure, a
-                walk that is too long or leaves the soft limits (nothing
-                turned or moved); or, the turret and the stage then where they
+                walk that is too long or leaves the soft limits, an engaged
+                autofocus that could not be switched off or still reads on
+                (nothing turned or moved); or, the turret and the stage then where they
                 were left: a turn the layer refused, a turret that reads
                 another label after it, a Z that is still moving, a wall that
                 is not found, wells that do not agree on the offset, or an
@@ -327,6 +343,15 @@ class ObjectiveOffsetsPlugin:
                     distances,
                 )
             )
+
+        # Every check is done, and nothing has turned or moved: the one switch-off
+        # of the run, outside the `try` below (m3 §5.7 D1). The layer's turret also
+        # switches PFS off before a turn, but not when it already reads the target,
+        # and then the first move to a wall would be made with PFS engaged. A stop
+        # asked now keeps the lock.
+        ctx.raise_if_stopped()
+        if switch_off_autofocus(_NAME, microscope.get(Autofocus), ctx):
+            assumed.insert(0, AUTOFOCUS_OFF_LINE)
 
         # A stage still travelling from an earlier move reads a fraction of it.
         xy.wait()

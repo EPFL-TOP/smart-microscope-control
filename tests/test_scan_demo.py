@@ -35,6 +35,7 @@ import pytest
 import tifffile
 
 import smc.plugins.scan.plugin as scan_plugin
+from recording_autofocus import RecordingAutofocus
 from smc.hardware import Microscope
 from smc.hardware.capabilities import (
     XY,
@@ -49,6 +50,7 @@ from smc.hardware.capabilities import (
 )
 from smc.hardware.errors import (
     AutofocusExcursionError,
+    CoreError,
     DeviceTimeoutError,
     HardwareError,
     MicroscopeHaltedError,
@@ -2157,14 +2159,134 @@ def test_an_autofocus_left_off_is_never_engaged(rig: _Rig) -> None:
     assert {f.pfs_offset for f in result.frames} == {None}
 
 
-def test_autofocus_off_reads_nothing_from_it(rig: _Rig) -> None:
-    af = _Autofocus(engaged=True, locked=True)
+def test_autofocus_off_reads_only_whether_the_autofocus_is_on(rig: _Rig) -> None:
+    """The one read ``off`` makes (m3 §5.7 D2): an autofocus that is off is then never touched."""
+    af = RecordingAutofocus(engaged=False)
     rig.microscope.override(Autofocus, af)
 
     result = _result(_scan(rig, autofocus="off"))
 
-    assert af.calls == []
+    assert af.calls == ["is_engaged"]
     assert [f.focus for f in result.frames] == ["off"] * 12
+
+
+_OFF_AND_ON = (
+    "autofocus=off, and the autofocus is on: the scan would carry its lock over "
+    "every well's wall with no guard (m2 §12.2 D2): run with autofocus=if-engaged "
+    "to use it, or switch it off first"
+)
+_OFF_AND_UNREAD = (
+    "autofocus=off, and whether the autofocus is on could not be read ({cause}): a "
+    "lock would cross every well's wall: switch it off at the stand, then run the "
+    "scan again"
+)
+
+
+@pytest.mark.parametrize("locked", [True, False], ids=["locked", "searching"])
+def test_autofocus_off_refuses_an_autofocus_that_is_on_before_anything_moves(
+    rig: _Rig, locked: bool
+) -> None:
+    """``off`` promises not to touch PFS, so a lock the operator left on would cross every wall (m3 §5.7 D2)."""
+    af = _Autofocus(engaged=True, locked=locked)
+    rig.microscope.override(Autofocus, af)
+
+    reason = _refused(rig, autofocus="off")
+
+    assert reason == _OFF_AND_ON
+    # One read, and nothing that acts: the scan does not switch it off for the operator.
+    assert af.calls == ["is_engaged"]
+    assert af.engaged is True
+
+
+def test_autofocus_off_refuses_an_autofocus_on_in_a_dry_run_too(
+    demo_microscope_dry: Microscope, tmp_path: Path
+) -> None:
+    """It only reads, and a dry run rehearses the refusal the run would meet."""
+    rig = _build(demo_microscope_dry, tmp_path)
+    _plan(rig)
+    af = _Autofocus(engaged=True, locked=True)
+    demo_microscope_dry.override(Autofocus, af)
+
+    reason = _refused(rig, autofocus="off")
+
+    assert reason == _OFF_AND_ON
+    assert af.calls == ["is_engaged"]
+
+
+def test_autofocus_off_refuses_an_autofocus_whose_state_cannot_be_read(
+    rig: _Rig,
+) -> None:
+    """Unknown counts as on (FM-19), and the refusal is raised outside the handler (FM-98)."""
+    af = RecordingAutofocus(engaged=False, fails="is_engaged")
+    rig.microscope.override(Autofocus, af)
+
+    with pytest.raises(PluginRunError) as raised:
+        _scan(rig, autofocus="off")
+
+    assert raised.value.reason == _OFF_AND_UNREAD.format(
+        cause="CoreError: is_engaged failed on the fake"
+    )
+    assert raised.value.__context__ is None
+    assert raised.value.__cause__ is None
+    assert af.calls == ["is_engaged"]
+    assert rig.stage.moves == 0
+    assert rig.camera.snaps == 0
+    assert _stored(rig).status is StageStatus.failed
+
+
+def test_autofocus_off_says_the_first_line_of_an_unreadable_state(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    af = RecordingAutofocus(engaged=False)
+
+    def fails() -> bool:
+        raise CoreError("PFS did not answer\nError in device PFS: 10")
+
+    monkeypatch.setattr(af, "is_engaged", fails)
+    rig.microscope.override(Autofocus, af)
+
+    reason = _refused(rig, autofocus="off")
+
+    assert reason == _OFF_AND_UNREAD.format(cause="CoreError: PFS did not answer")
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [MicroscopeHaltedError(), MotionStoppedError("the stage was stopped")],
+    ids=["halt", "motion-stopped"],
+)
+def test_a_halt_from_the_read_of_autofocus_off_reaches_the_caller_unchanged(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch, fault: Exception
+) -> None:
+    """A halt or a stop is not a state that cannot be read (FM-64)."""
+    af = RecordingAutofocus(engaged=False)
+
+    def fails() -> bool:
+        raise fault
+
+    monkeypatch.setattr(af, "is_engaged", fails)
+    rig.microscope.override(Autofocus, af)
+
+    with pytest.raises(type(fault)) as raised:
+        _scan(rig, autofocus="off")
+
+    assert raised.value is fault
+    assert rig.stage.moves == 0
+
+
+def test_autofocus_off_on_a_stand_without_an_autofocus_reads_nothing(
+    rig: _Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_get = rig.microscope.get
+    monkeypatch.setattr(
+        rig.microscope,
+        "get",
+        lambda wanted: None if wanted is Autofocus else real_get(wanted),
+    )
+
+    result = _result(_scan(rig, autofocus="off"))
+
+    assert [f.focus for f in result.frames] == ["none"] * 12
 
 
 def test_a_stand_without_an_autofocus_records_none(
@@ -3203,11 +3325,10 @@ def test_cell_focus_with_autofocus_off_refuses_an_autofocus_that_is_on(
 
     reason = _refused(rig, autofocus="off", cell_focus="per-field", **FOCUS)
 
-    assert reason == (
-        "cell_focus moves Z, which switches the autofocus off, and it is on: run "
-        "with autofocus=if-engaged to use it, or switch it off first"
-    )
-    assert not MUTATING & set(af.calls)
+    # The refusal of every ``autofocus=off`` on an autofocus that is on, one text for
+    # both (m3 §5.7 D2, §21): the focus on the cells reads it no more than the scan.
+    assert reason == _OFF_AND_ON
+    assert af.calls == ["is_engaged"]
 
 
 def test_cell_focus_with_an_autofocus_left_off_says_so(
