@@ -1701,7 +1701,10 @@ def test_objective_offsets_leaves_an_autofocus_that_is_off_alone(
 
 
 def test_a_stop_before_objective_offsets_turns_keeps_the_autofocus_on(
-    open_stand: Callable[..., Microscope], run_doc: Path, documents: Documents
+    open_stand: Callable[..., Microscope],
+    run_doc: Path,
+    documents: Documents,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     stop = threading.Event()
     stop.set()
@@ -1709,9 +1712,12 @@ def test_a_stop_before_objective_offsets_turns_keeps_the_autofocus_on(
     af = RecordingAutofocus(engaged=True)
     rig.stand.override(Autofocus, af)
 
-    record = _run(rig.stand, run_doc, (FORTY,), (documents.forty,), stop=stop)
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        record = _run(rig.stand, run_doc, (FORTY,), (documents.forty,), stop=stop)
 
     assert record.status is StageStatus.stopped
+    # Nothing turned or moved: no warning says where the stage and the turret were left.
+    assert _warnings(caplog) == []
     _nothing_moved(rig)
     assert "disengage" not in af.calls
     assert af.engaged is True
@@ -1756,6 +1762,7 @@ def test_a_switch_off_that_fails_ends_objective_offsets_before_anything_turns_or
     open_stand: Callable[..., Microscope],
     run_doc: Path,
     documents: Documents,
+    caplog: pytest.LogCaptureFixture,
     options: dict[str, Any],
     reason: str,
     calls: list[str],
@@ -1766,9 +1773,12 @@ def test_a_switch_off_that_fails_ends_objective_offsets_before_anything_turns_or
     rig.stand.override(Autofocus, af)
     before = _here(rig.stand)
 
-    refused = _refused(rig.stand, run_doc, (FORTY,), (documents.forty,))
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        refused = _refused(rig.stand, run_doc, (FORTY,), (documents.forty,))
 
     assert refused.reason == reason
+    # Raised outside the `try` that says where the stage and the turret were left.
+    assert _warnings(caplog) == []
     assert af.calls == calls
     _nothing_moved(rig)
     assert _here(rig.stand) == before
@@ -1831,3 +1841,25 @@ def test_a_halted_stand_switches_the_autofocus_off_and_objective_offsets_ends_on
     assert _stored(run_doc).status is StageStatus.failed
     assert rig.stage.moves == 0
     assert rig.camera.snaps == 0
+
+
+def test_objective_offsets_on_a_stand_without_an_autofocus_switches_nothing_off(
+    open_stand: Callable[..., Microscope],
+    run_doc: Path,
+    documents: Documents,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stand with no PFS: no call, no line, no warning, and the run is as it was."""
+    stand = open_stand()
+    real_get = stand.get
+    monkeypatch.setattr(
+        stand, "get", lambda wanted: None if wanted is Autofocus else real_get(wanted)
+    )
+
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        result = _result(_run(stand, run_doc, (FORTY,), (documents.forty,)))
+
+    assert AUTOFOCUS_OFF_LINE not in result.assumed
+    assert result.assumed[0] == NO_LIMITS_LINE
+    assert _warnings(caplog) == []

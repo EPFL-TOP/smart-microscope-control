@@ -462,6 +462,22 @@ def _refused(
     return raised.value
 
 
+def _engaged(stand: Microscope) -> RecordingAutofocus:
+    """An engaged autofocus on the stand: a refusal before anything moves must leave it on (m3 §5.7 D1).
+
+    The switch-off comes after every refusal that can happen before the first
+    move; a refusal after it would switch PFS off for a run that never moves.
+    """
+    af = RecordingAutofocus(engaged=True)
+    stand.override(Autofocus, af)
+    return af
+
+
+def _left_on(af: RecordingAutofocus) -> None:
+    assert "disengage" not in af.calls
+    assert af.engaged is True
+
+
 # --------------------------------------------------------------- registration
 
 
@@ -897,6 +913,7 @@ def test_a_walk_outside_the_soft_limits_is_refused_before_anything_moves(
         limits=(Limits(-1e6, limit_x), Limits(-1e6, 1e6)),
     )
     fake_microscope.override(XYStage, stage)
+    af = _engaged(fake_microscope)
 
     refused = _refused(fake_microscope, run_doc, refs)
 
@@ -911,6 +928,7 @@ def test_a_walk_outside_the_soft_limits_is_refused_before_anything_moves(
     )
     assert stage.moves == 0
     assert camera.snaps == 0
+    _left_on(af)
 
 
 @pytest.mark.parametrize(
@@ -944,6 +962,7 @@ def test_a_walk_that_leaves_the_travel_on_any_axis_is_refused_before_anything_mo
     }[limit]
     stage = _Stage(fake_microscope.require(XYStage), limits=limits)
     fake_microscope.override(XYStage, stage)
+    af = _engaged(fake_microscope)
 
     refused = _refused(fake_microscope, run_doc, refs)
 
@@ -957,6 +976,7 @@ def test_a_walk_that_leaves_the_travel_on_any_axis_is_refused_before_anything_mo
         "µm, outside the stage's soft limits"
     )
     assert stage.moves == 0
+    _left_on(af)
     assert camera.snaps == 0
 
 
@@ -1177,12 +1197,14 @@ def test_the_frame_and_the_search_are_checked_before_anything_moves(
     fake_microscope.override(XYStage, stage)
     run_doc = tmp_path / "run.json"
     _seed(run_doc, fake_microscope, shape=shape)
+    af = _engaged(fake_microscope)
 
     refused = _refused(fake_microscope, run_doc, _refs("A1", "H12"), **params)
 
     assert refused.reason == reason
     assert stage.moves == 0
     assert camera.snaps == 0
+    _left_on(af)
 
 
 @pytest.mark.parametrize(
@@ -1202,6 +1224,7 @@ def test_a_field_that_holds_a_whole_well_is_refused(
     fake_microscope.override(XYStage, stage)
     run_doc = tmp_path / "run.json"
     _seed(run_doc, fake_microscope, shape=shape, matrix=_matrix(5.0, 0.0, False))
+    af = _engaged(fake_microscope)
 
     refused = _refused(fake_microscope, run_doc, _refs("A1", "H12"))
 
@@ -1211,6 +1234,7 @@ def test_a_field_that_holds_a_whole_well_is_refused(
     )
     assert stage.moves == 0
     assert camera.snaps == 0
+    _left_on(af)
 
 
 def test_a_walk_of_too_many_frames_is_refused_before_anything_moves(
@@ -1226,6 +1250,7 @@ def test_a_walk_of_too_many_frames_is_refused_before_anything_moves(
         WellRef(well=f"{row}1", x_um=0.0, y_um=-9000.0 * i)
         for i, row in enumerate("ABCDEF")
     )
+    af = _engaged(fake_microscope)
 
     refused = _refused(fake_microscope, run_doc, refs, search_um=3200.0)
 
@@ -1236,6 +1261,7 @@ def test_a_walk_of_too_many_frames_is_refused_before_anything_moves(
     )
     assert stage.moves == 0
     assert camera.snaps == 0
+    _left_on(af)
 
 
 # ---------------------------------------------------- what a frame can be wrong
@@ -1896,7 +1922,9 @@ def test_plate_walls_switches_a_searching_autofocus_off_too(
 
 
 def test_a_stop_before_plate_walls_moves_keeps_the_autofocus_on(
-    demo_microscope_with_sample: SampleMicroscopeFactory, tmp_path: Path
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     stand, camera = _on_demo(demo_microscope_with_sample)
     run_doc = tmp_path / "run.json"
@@ -1907,9 +1935,12 @@ def test_a_stop_before_plate_walls_moves_keeps_the_autofocus_on(
     stop = threading.Event()
     stop.set()
 
-    record = _run(stand, run_doc, _refs("A1", "H12"), stop=stop)
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        record = _run(stand, run_doc, _refs("A1", "H12"), stop=stop)
 
     assert record.status is StageStatus.stopped
+    # Nothing moved: no warning says where the stage was left.
+    assert _warnings(caplog) == []
     assert "disengage" not in af.calls
     assert af.engaged is True
     assert _here(stand) == before
@@ -1954,6 +1985,7 @@ _STILL_ON = (
 def test_a_switch_off_that_fails_ends_plate_walls_before_anything_moves(
     demo_microscope_with_sample: SampleMicroscopeFactory,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
     options: dict[str, Any],
     reason: str,
     calls: list[str],
@@ -1966,9 +1998,13 @@ def test_a_switch_off_that_fails_ends_plate_walls_before_anything_moves(
     stand.override(Autofocus, af)
     before = _here(stand)
 
-    refused = _refused(stand, run_doc, _refs("A1", "H12"))
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        refused = _refused(stand, run_doc, _refs("A1", "H12"))
 
     assert refused.reason == reason
+    # Raised outside the `try` that says where the stage was left: nothing moved,
+    # so no "stopped at ... the stage is left at" warning, and no "switched off" one.
+    assert _warnings(caplog) == []
     assert af.calls == calls
     assert _here(stand) == before
     assert camera.snaps == 0
@@ -2061,3 +2097,25 @@ def test_a_halted_stand_switches_the_autofocus_off_and_plate_walls_ends_on_the_h
     assert _stored(run_doc).status is StageStatus.failed
     assert _here(stand) == before
     assert camera.snaps == 0
+
+
+def test_plate_walls_on_a_stand_without_an_autofocus_switches_nothing_off(
+    demo_microscope_with_sample: SampleMicroscopeFactory,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stand with no PFS: no call, no line, no warning, and the run is as it was."""
+    stand, camera = _on_demo(demo_microscope_with_sample)
+    run_doc = tmp_path / "run.json"
+    _calibrate(stand, camera, run_doc)
+    real_get = stand.get
+    monkeypatch.setattr(
+        stand, "get", lambda wanted: None if wanted is Autofocus else real_get(wanted)
+    )
+
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        result = _result(_run(stand, run_doc, _refs("A1", "H12")))
+
+    assert result.assumed == TODAY_ASSUMED
+    assert _warnings(caplog) == []
