@@ -312,13 +312,46 @@ def nightly_issues(issues: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
 
 
+def unreported_nightly(
+    runs: list[dict[str, Any]], issues: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """The failed nightly (or dispatch) run of ``main`` that has no open issue, or ``None``.
+
+    The report job opens the issue, and the issue is what ``merge_stoppers`` lists. A
+    report job that crashed, or ended with no verdict while the run was red (#358), left
+    a failed run and no issue, and the owner would read nothing. So the run itself is
+    read: the latest ``schedule`` or ``workflow_dispatch`` run of the workflow ``CI``
+    that has a verdict (a run in progress, or cancelled or skipped, decides nothing and
+    clears nothing, as for ``red_main``) stands until a later one is green. Only the
+    exact title covers it: ``CI nightly red (<branch>)`` is another ref's issue. An issue
+    that the owner closed by hand before the next green nightly leaves the line up until
+    then.
+    """
+    nightlies = sorted(
+        (
+            r
+            for r in runs
+            if r.get("workflowName") == "CI"
+            and r.get("event") in ("schedule", "workflow_dispatch")
+            and str(r.get("conclusion") or "").upper() not in {"", *_NO_VERDICT}
+        ),
+        key=lambda r: str(r.get("createdAt", "")),
+    )
+    if not nightlies or str(nightlies[-1].get("conclusion")).upper() not in _FAILING:
+        return None
+    if any(i.get("title") == NIGHTLY_TITLE for i in issues):
+        return None
+    return nightlies[-1]
+
+
 def merge_stoppers(
     runs: list[dict[str, Any]], issues: list[dict[str, Any]]
 ) -> list[str]:
-    """The lines of *CI that stops the merges*: a red ``main``, an open nightly issue.
+    """The lines of *CI that stops the merges*: a red ``main``, a failed nightly, an issue.
 
-    Both stop the merges of the code they name until the owner has chosen to
-    revert or to fix forward (ADR-0009), so they come before anything else.
+    Each stops the merges of the code it names until the owner has chosen to
+    revert or to fix forward (ADR-0009), so they come before anything else. A
+    failed nightly whose issue is open is listed through its issue, once.
     """
     out: list[str] = []
     red = red_main(runs)
@@ -326,6 +359,13 @@ def merge_stoppers(
         out.append(
             f"- main is RED since {str(red.get('createdAt', ''))[:16]}:"
             f" {clip(str(red.get('displayTitle', '')), 70)} {red.get('url', '')}"
+        )
+    failed = unreported_nightly(runs, issues)
+    if failed is not None:
+        out.append(
+            f"- the {event_label(failed)} run FAILED {str(failed.get('createdAt', ''))[:16]}"
+            f" {clip(str(failed.get('displayTitle', '')), 70)} {failed.get('url', '')}"
+            f' (no open "{NIGHTLY_TITLE}" issue: the report job opened none, read the run)'
         )
     out += [
         f"- #{i['number']} {clip(str(i['title']), 90)} (open: the full matrix is red)"
@@ -458,7 +498,9 @@ def main() -> int:
         "--branch",
         "main",
         "--limit",
-        "50",
+        # 50 runs of main reach back four days (measured 2026-11-13); a failed nightly
+        # stops the merges until a later one is green, so it must not scroll out.
+        "100",
         "--json",
         "conclusion,status,displayTitle,createdAt,workflowName,url,event",
     )
