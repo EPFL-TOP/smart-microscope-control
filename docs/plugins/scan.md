@@ -247,9 +247,13 @@ was taken with it (…)`).
 **Each frame's `pfs_offset` is the lock's, not the cells' plane.** The frame's `z_um` is
 the plane it was taken at (the cells'); its `pfs_offset` is the offset of the lock the
 sweep was centred on, and `focus` stays the lock read at the field. An export that
-engages PFS at that offset ([`route`](route.md), [`nis-export`](nis-export.md)) images
-the plane PFS held, not the cells' plane: `assumed` says how far apart they were. Carrying
-the cells' plane into the offset is #392.
+engages PFS at that offset would image the plane PFS held, not the cells' plane: `assumed`
+says how far apart they were. The scan records it so and does not derive anything: its
+`pfs_offset` is a reading. [`route`](route.md) now turns it into the offset of the cells'
+plane for its stops, from the frame's distance from the lock's plane and the profile's
+factor for the scan's objective (or leaves the offset out and says why), and
+[`nis-export`](nis-export.md) says when an offset it writes was derived. Carrying the
+cells' plane into the PFS offset during the scan itself is a later change.
 
 **What it costs** is measured and said: `assumed` gains `the focus on the cells added <a>
 s per field (<n> fields: <b> s to sweep and move, <c> s for the lock after)`, how many
