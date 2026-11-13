@@ -1910,6 +1910,19 @@ def test_a_continued_scan_counts_and_draws_the_plans_fields_not_the_rests(
     StubScan.release.set()
     assert page.join(BOUND_S)
     assert StubScan.resumed == [None, 4, 8]
+    # A fresh scan of a smaller plan afterwards counts its own fields: the plan count of the
+    # continued scan is that run's, never added to the next one's reports.
+    _seed(run_doc, "scan-plan", _scan_plan_result(("B11", "B2")), minute=9)
+    StubScan.paused = threading.Event()
+    StubScan.release = threading.Event()
+    StubScan.pause_at = 3
+    page.run("scan", [], afresh=True)
+    assert StubScan.paused.wait(BOUND_S)
+    progress = page.status().progress
+    StubScan.release.set()
+    assert page.join(BOUND_S)
+    assert progress is not None
+    assert (progress.done, progress.total) == (3, 8)
 
 
 def test_both_actions_wait_for_resume_while_the_stand_is_halted(
