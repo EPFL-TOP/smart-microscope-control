@@ -728,6 +728,23 @@ lock it again after the move (the layer's interlock); on a stand whose autofocus
 to its offset when it engages (the Ti2-E's PFS), that relock may bring Z back to the
 offset's plane, so **focus by hand with the autofocus off** there.
 
+**A jog that may leave a well switches the autofocus off first** (m5 §6.6). PFS locked
+in one well follows its reference over the wall into the next, whose plane lay at least
+104 µm away at the 40x (Ti2-E session 3). So with the autofocus on (locked or searching), the page reads
+where the stage is just before the jog: when the map places the plate and both the
+start and the end of the jog lie 500 µm or more inside the same well, PFS **stays on**,
+so you can look around one well under lock. Any other jog switches it off first, and
+the outcome says why, before the jog's own text: `stage jog: the autofocus was switched
+off before the move (it leaves C4), so that no lock crosses a well's wall: engage it
+again here; XY (…) µm`. The reasons are `it leaves <well>`, `it does not start 500 µm
+inside a well` (on the plastic, or near a wall) and `the map does not place the plate`
+(no `[holder]` and no registration, the placeholder plate, or a run document that
+cannot be read). Engage it again in the new well with **Autofocus on**. A switch-off or
+a read that fails, or an autofocus that still reads on after it, **moves nothing**, and
+the outcome says to switch it off at the stand. With the autofocus off, and in a dry
+run, a jog is made as before. A drive click on the map is a `goto-well`, which switches
+an engaged autofocus off before every move ([`goto-well`](../plugins/plate-registration.md#the-autofocus-is-switched-off-before-the-move)).
+
 **The objective needs a confirmation.** Choose it, press **Change objective**: the page
 asks `Turn the turret to '<label>'? A turn can drive an objective into a loaded plate:
 check that the stage is clear. The autofocus is switched off and not engaged again.`
