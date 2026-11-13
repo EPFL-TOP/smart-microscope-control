@@ -5774,7 +5774,12 @@ bound), FM-124, FM-125, FM-131, FM-142.
   far end, where the frame centred on it does not show the wall (a 10× frame
   is 1.6 mm wide). Neither was seen. Behind either stand the circle fit's
   trims (one side's arc dropped), its rms and size checks (a refusal), and
-  "the wall was lost in the frame centred on it".
+  "the wall was lost in the frame centred on it". A ridge that lies at the
+  inward end of the frame centred on the wall makes its lines start dark.
+  Those lines are not read, so the side is refused. This was measured on a
+  rendered 24-well at 2.739 µm per pixel with 1 200 rows, which puts the
+  frame's inward end 1 643 µm inside the wall, and a ring 1.6 mm inside it.
+  That is a refusal, not a wrong centre.
 
 ## 18. The plate in another objective's frame (#340)
 
