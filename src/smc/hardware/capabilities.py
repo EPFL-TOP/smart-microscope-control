@@ -338,11 +338,15 @@ class Autofocus(Protocol):
         off, as a raise (``MotionStoppedError``), never a ``False``.
 
         ``True``: locked and settled (``[autofocus] settle_s``). On a stand
-        that declares ``engage_drives_z_to_offset``, it engages only at an
-        offset seen locked with this objective since the stand was opened,
-        and refuses otherwise (``SafetyRefusedError``, not forceable). Z is
-        guarded while it engages: out of its bound, it is switched off and
-        ``AutofocusExcursionError`` is raised (m2 §12).
+        that declares ``engage_drives_z_to_offset``, it engages at an offset
+        seen locked with this objective since the stand was opened, and also,
+        as a *first lock from below* (m2 §12.10, §12.11 D9), at or below the
+        floor of the offset's soft limits with the autofocus off, under a band
+        open away from the sample, when the profile declares what that needs
+        (m2 §12.12 D11) and no factor for the objective contradicts the
+        direction (D12). It refuses otherwise (``SafetyRefusedError``, not
+        forceable). Z is guarded while it engages: out of its bound, it is
+        switched off and ``AutofocusExcursionError`` is raised (m2 §12).
         """
         ...
 
@@ -359,7 +363,10 @@ class Autofocus(Protocol):
 
         With the autofocus on, it follows the offset and drives Z, so a
         ``ZStage.stop()`` during the move ends it with the autofocus off
-        (``MotionStoppedError``).
+        (``MotionStoppedError``). On a stand that declares
+        ``engage_drives_z_to_offset``, with the autofocus on, it is refused
+        (``SafetyRefusedError``) unless it reads locked with a factor for the
+        objective in place (m2 §12.10 D6); off, the move drives no Z.
         """
         ...
 
@@ -369,7 +376,8 @@ class Autofocus(Protocol):
         With no ``[safety] max_autofocus_offset_jog`` in the profile, every
         non-zero change needs ``force``: the unit is the stand's own, so no
         default can be assumed. A ``ZStage.stop()`` ends it as it ends
-        ``set_offset_native``.
+        ``set_offset_native``, and on a declared stand it is refused while on
+        as ``set_offset_native`` is (m2 §12.10 D6).
         """
         ...
 
