@@ -176,11 +176,58 @@ def test_a_frame_of_one_level_has_no_wall(level: int) -> None:
 def test_a_frame_with_a_second_wall_takes_the_first_fall() -> None:
     # Going outwards: bright, a fall (ours), dark, a rise (the neighbour's near
     # wall), bright, a second fall (the neighbour's far wall). Only the first.
+    # At 20 µm per pixel, so that the dark gap, 79 samples, is 1 580 µm: over
+    # `MIN_PLASTIC_UM`, a gap between wells and not a band of the meniscus (at 2
+    # µm per pixel it is 158 µm, and the next test refuses it).
     frame = np.full((64, 300), 10_000, dtype=np.uint16)
     frame[:, 101:180] = 1_000
-    edge = find_wall(frame, outward_xy=(1, 0), matrix=_matrix(2.0, 0.0, False))
+    edge = find_wall(frame, outward_xy=(1, 0), matrix=_matrix(20.0, 0.0, False))
     assert edge is not None
     assert edge.points_px[:, 0] == pytest.approx(100.5)
+
+
+def test_a_dark_band_narrower_than_the_plastic_is_not_a_wall() -> None:
+    # The same frame at 2 µm per pixel: the dark band is 158 µm, a ridge of the
+    # meniscus and not the plastic, which either reaches the frame's end or is a
+    # gap between two wells. It ends inside the frame and is under 1 400 µm: no
+    # wall, where the first fall below the midpoint took it (#409).
+    frame = np.full((64, 300), 10_000, dtype=np.uint16)
+    frame[:, 101:180] = 1_000
+    assert find_wall(frame, outward_xy=(1, 0), matrix=_matrix(2.0, 0.0, False)) is None
+
+
+def test_a_shadow_joined_to_the_wall_is_not_taken_for_it() -> None:
+    # B5's +X and -X frames at the 4x (#409, §17.1): going outwards the inside
+    # (50 000) falls to a shadow joined to the wall (12 700, 0.25 of the way from
+    # the plastic), which lies below the midpoint, and then to the plastic (250).
+    # The midpoint is crossed at the shadow, 240 columns (660 µm) before the wall.
+    # 64 x 600, not square (FM-73), at the 4x's 2.75 µm per pixel.
+    frame = np.full((64, 600), 50_000, dtype=np.uint16)
+    frame[:, 300:540] = 12_700
+    frame[:, 540:] = 250
+    edge = find_wall(frame, outward_xy=(1, 0), matrix=_matrix(2.75, 0.0, False))
+    assert edge is not None
+    # The wall's own half level, 6 475, is crossed halfway between the last
+    # shadow column and the first plastic one.
+    assert edge.points_px[:, 0] == pytest.approx(539.5)
+    assert edge.points_px.shape == (8, 2)
+    # The midpoint stays the one that splits the two classes.
+    assert edge.threshold == pytest.approx(25_125.0)
+    assert edge.dark_ratio == pytest.approx(0.2042, rel=1e-3)
+
+
+def test_a_ridge_inside_the_well_is_not_taken_for_the_wall() -> None:
+    # B5's -Y frames (#409): a dark ridge 247 µm wide whose middle lies 1.6 mm
+    # inside the wall, on the inner border of a grey band (30 000). Going
+    # outwards the midpoint is crossed at the ridge, column 150; the plastic
+    # starts at 777. The ridge's run ends inside the frame and is not 1 400 µm.
+    frame = np.full((64, 1_000), 50_000, dtype=np.uint16)
+    frame[:, 150:240] = 1_000
+    frame[:, 240:777] = 30_000
+    frame[:, 777:] = 250
+    edge = find_wall(frame, outward_xy=(1, 0), matrix=_matrix(2.75, 0.0, False))
+    assert edge is not None
+    assert edge.points_px[:, 0] == pytest.approx(776.5)
 
 
 # --- find_wall on rendered wells ---------------------------------------------------
