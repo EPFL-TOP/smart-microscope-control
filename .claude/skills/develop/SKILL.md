@@ -79,6 +79,11 @@ them if it is not the one you run on.
      (no redirection, no `--jq`), then Write what you read into the file.
    - **Append to a test file**: Read it, then Edit with the last lines as the
      anchor, or Write the whole file; never `cat >>` or a heredoc.
+   - **A scratch file for a comment's body** is not named `report.md`: the
+     Write tool refuses that name, even as an input to `gh` (#358, #454).
+     Name it for its content (`issue-<N>-report.txt`).
+   - **`mutant.py` takes one test path or test id per run**, not two and not
+     `-k`: two files are two runs (#328, #349, #409).
    - **A second Edit of the same lines**: the PostToolUse formatter rewraps
      a file after every Edit or Write, so Read the region again before you
      edit it a second time (#213, #224).
