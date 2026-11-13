@@ -216,11 +216,7 @@ answers), a sentence, its own regions and *Continue*:
 | *Plate* | [designed](#the-stand-and-plate-screens): the plate, three centres to capture, *Register the plate* |
 | *Wells* | [designed](#the-wells-and-scan-screens): the wells, coverage and autofocus, *Lay out the fields*, what is known |
 | *Scan* | [designed](#the-wells-and-scan-screens): *Start the scan*, a progress bar, what was scanned |
-| *Results* | provisionally: the next step, `cells`, `density`, `route`, `report`, `nis-export`, then the run document's path and its checklist |
-
-The *Results* screen is today's regions listed by step; its own design (the results' rows)
-comes with the next build of
-[#431](https://github.com/EPFL-TOP/smart-microscope-control/issues/431).
+| *Results* | [designed](#the-results-screen): *Run all that are left*, a row for each of the five steps after the scan, where the files are |
 
 ### The Stand and Plate screens
 
@@ -357,6 +353,77 @@ not framed on the plan's wells yet).
 **At 1280 x 800** the Wells screen's title, the box, the two fields and *Lay out the fields* are
 in view under the header, and what is known may be a scroll of the panel down (`ui-check`'s
 `wells-laid-out` says it). The Scan screen's title, the button and the bar are in view.
+
+### The Results screen
+
+Like the screens before it, this one holds **its own buttons and no next step**, and none of the
+tools' forms: the next step, the tools' sections and the run document's checklist are in the
+[expert view](#the-expert-view-and-the-map), which keeps every tool's own *Run*. Nothing is in
+the warning colour but a refusal.
+
+**5. Results: "Results"**, with the sentence `Each step reads the one before. Run the next one, or
+all that are left.` From the top:
+
+- **Run all that are left**: runs the steps that are **not done**, in the order of the rows
+  below, as **one run**: the strip names the step that goes, and a second run, a Snap or a
+  Disconnect is refused until the chain ends. It goes on while a step ends well and stops at
+  the first that does not, **and at STOP** (a STOP that lands between two steps stops the chain
+  before the next one starts). A step that is **done is never run by it**: running it again would
+  make every step that read it out of date; press its *Again* for that. It uses the choices of
+  the rows (below) and the page's, as each step's own *Run* does. Under it, while it cannot
+  start, the reason: `Nothing is left: every step is done.`, the state of the first step left
+  when that is an input still missing (`scan first: step 4, Scan`, `after Count the cells`),
+  or that step's own reason; while a step runs, which one and how to end it;
+- **one line** once a chain has run, which says what it did: `Running Density per well (2 of
+  5).`; `Done: Count the cells, Density per well, ... .`; `Stopped at Route through the densest
+  fields, which failed: <the tool's words>. Done: ... Not run: ... .`; `... which cannot run:
+  <why>` when the step was refused before it started (a value it does not accept, a stage
+  stopped with a checkpoint: the page never starts one afresh, so the row says the command that
+  continues it); `Stopped at <step> by STOP.`; `Stopped before <step> by STOP.`. The strip says
+  the same in the tools' own words (`run all stopped at route: ...`), and stays until another
+  run starts;
+- **a row for each step**, in this order: *Count the cells*, *Density per well*, *Route through
+  the densest fields*, *Report*, *Export for NIS-Elements*. A row is:
+  - the **name**, in bold, and a **state line**: `Done 2026-11-12 09:30:00 UTC` (with `(dry
+    run)` when it was one), `Ready`, `Running now` (with `: 3 of 12` when the tool reports its
+    count), `Not usable: <why>` when its result is out of date (a step before it was run
+    again, the stand is another one), or what it waits for when an input is missing: `after
+    Count the cells`, `lay out the fields first: step 3, Wells`, `scan first: step 4, Scan`;
+  - **Run**, or **Again** when the step is done: the same call as the tool's own *Run* in the
+    expert view, with the choices below. It is disabled, with its reason under it, while
+    something runs (`cells is running: wait for it to end, or press STOP.`), when the stand is
+    closed, when a stage of its own is stopped with a checkpoint, and when an input is
+    missing (the state line says which);
+  - under **Again**, what it **replaces**: `Again replaces this result. What comes after it
+    and is done (Density per well, ...) is out of date then: Run all that are left runs it
+    again.` It names the steps after it that read it, directly or through another (the
+    report reads the route when there is one, so it is named after *Again* on the route),
+    and says nothing for a step no other reads (*Report*, *Export for NIS-Elements*);
+  - a closed **Choices and command**: the choices a profile or a preset fills, each with the
+    line that says where its value comes from (`from the profile's suggestions`, `from the
+    preset <name>`, `typed on this page`, or `the tool's default: ...`), and the `smc run` line
+    the row makes, with the note that the line is quoted for a POSIX shell on a Windows PC. The
+    choices are `detector` for *Count the cells* and `labels` and `fields_per_well` for *Route*;
+    a step with none holds the command only. They are **the tools' own fields**: what you type
+    here is what the expert view's section holds, and the other way round;
+- **Where the files are**: one line for each file a step wrote, `<the step's name>: <path>`
+  (`Scan frames`, *Count the cells*, *Report*, *Export for NIS-Elements*), `No step has written a
+  file yet.` before any; a stopped or failed step names none. The run document's path closes
+  the screen.
+
+**On a page served with `--dry-run`**, over a scan that was a dry run (it took no frame),
+*Count the cells* and the steps that read the scan wait with `this page is a dry run: scan walks
+the fields and takes no frame ...`: the way on is a stand whose stage is simulated
+(`demo-sample`, served without `--dry-run`). The expert view's own *Run cells* is not held back.
+
+**On the map**, the colour bar says which class its colours count, `single cells per mm²`: the
+class the *Density of* select names, and the title follows the select.
+
+**At 1280 x 800** the title, *Run all that are left* and the first row are in view under the
+header (`ui-check`'s `results-all`); the five rows are taller than the page, so the others, the
+files and the run document's path are a scroll of the panel down.
+
+### The expert view and the map
 
 **The expert view.** The *Expert view* switch replaces the step panel's contents with
 everything the page had before the steps: the preset, the next step, *Plate*, *Plate lies*,
@@ -1044,13 +1111,17 @@ column, one click for each tool, until it says `every stage of the workflow is d
    result card names the files it wrote (the scan's folder, the cells' file, the report and
    the NIS-Elements position list), and the last step lists them all.
 
-On the guided screens the same path to a scan is buttons, with no next step in the way (the
-next step stays on *Results* and in the expert view): *2. Plate* and **Register the plate**
-(from the sample's centres), *3. Wells* with `B2,B11` typed in the box and **Lay out the
-fields** (the profile's `coverage=0.4` is already in the field, and says where it comes from),
-then *4. Scan* and **Start the scan**. `tests/unit/test_plate_page_wells_scan_view.py` walks
-exactly this on `demo-sample`, without `--dry-run`: `Scanned: 72 frames, 0 failed`, 72 green
-fields, `Field 72 of 72`.
+On the guided screens the same path is buttons, with no next step in the way (the next step
+is in the expert view only): *2. Plate* and **Register the plate** (from the sample's centres),
+*3. Wells* with `B2,B11` typed in the box and **Lay out the fields** (the profile's
+`coverage=0.4` is already in the field, and says where it comes from), then *4. Scan* and
+**Start the scan**, then *5. Results* and **one click on Run all that are left**: `cells` (with
+the profile's `detector=blobs`), `density`, `route`, `report` and `nis-export` run one after
+the other, the strip says `run all done in ... s: cells, density, route, report, nis-export`,
+and *Where the files are* names the report and the export.
+`tests/unit/test_plate_page_wells_scan_view.py` walks the path to the scan on `demo-sample`,
+without `--dry-run`: `Scanned: 72 frames, 0 failed`, 72 green fields, `Field 72 of 72`; and
+`tests/unit/test_plate_page_results_view.py` the click, to the export.
 
 To practise the plate step as at a stand, **capture centres yourself**: start **Live**,
 centre a well with the **Drive** pad (the frames follow the stage), click it on the map,
@@ -1108,6 +1179,13 @@ reading the stand once a second during a scan** (it runs on the loop that handle
 click on STOP: a device read that hangs in a vendor driver would delay STOP; it is to
 be timed on the Ti2-E) and what STOP's note says there. These are for the first session
 at the stand ([#198](https://github.com/EPFL-TOP/smart-microscope-control/issues/198)).
+
+**The Results screen** adds: a real `cells` over real frames (the demo's takes 0.2 to 2 s, so the
+row's `Running now: <done> of <total>` and the chain's line have only been seen on a chain too
+fast to photograph), a STOP on a stand that refuses it while a chain runs (the chain ends
+`stopped` at the step that went, and the stand's own note says what the stop did), the Ti2-E,
+the screen on the stand PC and over RDP, and a newcomer reading the five rows and the chain's
+line without this page.
 
 **The cross and the estimate** add: the estimate against the plate on the Ti2-E (the Greiner
 plate in its holder, either way round, and the cross over a well it is physically over: the

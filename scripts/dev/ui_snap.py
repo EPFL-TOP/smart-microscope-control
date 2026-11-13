@@ -20,7 +20,9 @@ served with ``--dry-run``. The chain of tools that fills the run document runs
 every frame is plastic, and no state past the first three could be reached. The two
 guided states (``wells-laid-out``, ``scanned``) press the guided screens' own buttons,
 *Register the plate*, *Lay out the fields* and *Start the scan*, on the dry-run page, where
-each is a run that moves nothing; the script never presses a tool's own *Run*.
+each is a run that moves nothing, and so does ``results-all``, which presses the Results
+screen's *Run all that are left* over the chain's results (the report and the export, which
+move nothing); the script never presses a tool's own *Run*.
 
 Exit codes: 0 every state reached, the server logged no error and stopped by
 Ctrl-C; 1 the job could not be done (no playwright, no browser, the server never
@@ -78,12 +80,13 @@ TERMINATE_GRACE_S = 10.0
 KILL_GRACE_S = 5.0
 
 #: The first four need no chain and are reached on both stands (``expert`` is fourth for
-#: that: m5 §17.8); the next three need the results of a real run of the workflow; the next
+#: that: m5 §17.8); the next four need the results of a real run of the workflow
+#: (``results-all`` presses *Run all that are left* over them, m5 §17.11.4); the next
 #: two are the short-page shots of D12 (m5 §17.2, §17.8), reached alone again, after them; the
 #: last two walk the Wells and Scan screens by their own buttons (m5 §17.10.4, #445): they
 #: need a sample to register the plate from, so ``demo-sample`` only, and nothing of the chain.
 ALONE_STATES = ("empty", "wells-selected", "snap", "expert")
-CHAIN_STATES = ("after-density", "with-route", "turned")
+CHAIN_STATES = ("after-density", "with-route", "results-all", "turned")
 SHORT_STATES = ("stand-620", "plate-620")
 GUIDED_STATES = ("wells-laid-out", "scanned")
 STATE_NAMES = (*ALONE_STATES, *CHAIN_STATES, *SHORT_STATES, *GUIDED_STATES)
@@ -112,7 +115,25 @@ SCREEN_TITLE_OF = {
     # ``wells-laid-out`` types, in plate order.
     "wells-laid-out": "Which wells?",
     "scanned": "Scan B2 and B11",
+    # The Results screen's title is the screen's own name (``guide.SCREEN_TITLES``).
+    "results-all": "Results",
 }
+
+#: What the Results screen says (m5 §17.4.5, §17.11), as the page draws it and a test pins to
+#: ``guide`` (this script imports nothing of smc at import): the five rows' plain names in the
+#: checklist's order, the chain's button and the files block's heading. A row whose tool is done
+#: has the state line ``Done <date> ...``; the chain's own line says ``Done: ...`` and does not
+#: match ``DONE_ROW``.
+RESULT_ROWS = (
+    "Count the cells",
+    "Density per well",
+    "Route through the densest fields",
+    "Report",
+    "Export for NIS-Elements",
+)
+RUN_ALL = "Run all that are left"
+FILES_HEADING = "Where the files are"
+DONE_ROW = re.compile(r"^Done \d{4}-\d\d-\d\d")
 
 # A child sharing the console can change its code page (FM-22).
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -310,7 +331,7 @@ def plan_states(
 ) -> list[StatePlan]:
     """Which states can be reached, and why not for the others (never silent).
 
-    The three of ``CHAIN_STATES`` need the results of a real run of the workflow: the demo
+    The four of ``CHAIN_STATES`` need the results of a real run of the workflow: the demo
     camera images no sample, ``--no-results`` skips the chain, and a chain step that failed
     leaves them without their input. The two short-page states of D12 need none, and are
     reached on both stands, last.
@@ -348,8 +369,10 @@ def plan_states(
         return [
             *plans,
             StatePlan("after-density", False, chain_failure),
-            StatePlan("with-route", False, f"needs the chain: {chain_failure}"),
-            StatePlan("turned", False, f"needs the chain: {chain_failure}"),
+            *(
+                StatePlan(name, False, f"needs the chain: {chain_failure}")
+                for name in CHAIN_STATES[1:]
+            ),
             *short,
             *guided,
         ]
@@ -734,16 +757,36 @@ def _act_after_density(page: Any, stand: Stand) -> None:
     # no Refresh, the case of #297 (a redraw made while the figure is out of view is
     # no longer possible, since neither figure is ever hidden, but the picture is still
     # read for the whole plate in view and for plain tick labels, FM-174). Then the
-    # Results screen, whose checklist says the density is done.
+    # Results screen, whose density row says it is done: the second of its state lines that
+    # start ``Done <date>`` (``cells`` is the first), which the screen draws when it swaps in
+    # and the page reads the run document again (the checklist's ``✓ density`` is in the
+    # expert view only now).
     page.get_by_role("button", name="Snap").click()
     _step_button(page, 5, "Results").click()
-    page.locator("pre").filter(has_text="✓ density").first.wait_for()
+    page.locator("pre").filter(has_text=DONE_ROW).nth(1).wait_for()
 
 
 def _act_with_route(page: Any, stand: Stand) -> None:
     stand.run_chain([ROUTE_STEP])
     # Refresh is in the map's header row, always in view.
     page.get_by_role("button", name="Refresh").click()
+
+
+def _act_results_all(page: Any, stand: Stand) -> None:
+    """*5. Results*, then *Run all that are left*, and the wait for the strip's own ``run all done`` (m5 §17.11.4).
+
+    After ``with-route`` the run document holds a real ``cells``, ``density`` and ``route``,
+    so on this dry-run page the chain runs what is left, ``report`` and ``nis-export``: a run
+    that moves nothing (measured). The button is the screen's own and not a tool's *Run*, which
+    this script never clicks. Each wait is for the text the server draws, never for a delay
+    (FM-162): the density row's ``Done`` before the click, so that the click is on the redrawn
+    screen, and the outcome line after it. A chain in motion, with a step running and the others
+    waiting, needs a stage that moves: the one-off session the skill describes.
+    """
+    _step_button(page, 5, "Results").click()
+    page.locator("pre").filter(has_text=DONE_ROW).nth(1).wait_for()
+    page.get_by_role("button", name=RUN_ALL, exact=True).click()
+    page.locator("pre").filter(has_text="run all done").first.wait_for()
 
 
 def _act_turned(page: Any, stand: Stand) -> None:
@@ -875,6 +918,7 @@ ACTIONS = {
     "expert": _act_expert,
     "after-density": _act_after_density,
     "with-route": _act_with_route,
+    "results-all": _act_results_all,
     "turned": _act_turned,
     "stand-620": _act_stand_620,
     "plate-620": _act_plate_620,
@@ -942,8 +986,23 @@ def _guided_parts(page: Any, state: str) -> list[tuple[str, Any]]:
     ]
 
 
+def _results_parts(page: Any) -> list[tuple[str, Any]]:
+    """The frame's parts and the Results screen's own: its title and *Run all that are left* (m5 §17.11.4), by name.
+
+    The page is at the run's 1280 x 800: the summary says whether the title, which names the
+    screen, and the chain's button, which is the first action, are inside the page. What is
+    below the fold is the PNG's to say (``results-all-full.png``): the five rows are taller
+    than the page, and the screen's own panel scrolls.
+    """
+    return [
+        *_frame_parts(page),
+        ("title", page.locator("pre").filter(has_text=re.compile(r"^Results$"))),
+        ("first action", page.get_by_role("button", name=RUN_ALL, exact=True)),
+    ]
+
+
 def _on_screen(page: Any, state: str | None = None) -> list[str]:
-    """One line for each part of ``_frame_parts`` (``_short_parts`` for a short-page state, ``_guided_parts`` for a guided one): whether it is wholly in the viewport, and where.
+    """One line for each part of ``_frame_parts`` (``_short_parts`` for a short-page state, ``_guided_parts`` for a guided one, ``_results_parts`` for ``results-all``): whether it is wholly in the viewport, and where.
 
     A part that is not drawn, or whose box the browser does not give, says so and is
     never guessed to be in view. A page with no viewport size (a fake) gives nothing.
@@ -956,6 +1015,8 @@ def _on_screen(page: Any, state: str | None = None) -> list[str]:
         parts = _short_parts(page, state)
     elif state in GUIDED_STATES:
         parts = _guided_parts(page, state)
+    elif state == "results-all":
+        parts = _results_parts(page)
     else:
         parts = _frame_parts(page)
     for name, locator in parts:
@@ -1017,6 +1078,50 @@ def scan_facts(texts: Sequence[str]) -> list[str]:
         return "not on the page" if found is None else " | ".join(found.splitlines())
 
     return [f"progress: {first('Field ')}", f"result: {first('Scanned')}"]
+
+
+def results_facts(texts: Sequence[str]) -> list[str]:
+    """What ``results-all`` is about, read from the page's texts: the five rows' state lines, the chain's line and the files (m5 §17.11.4).
+
+    The page lists a row's bold name and then its state line, so a row's state is the pane after
+    its name; the chain's line is the first pane that starts ``Running``, ``Done:`` or
+    ``Stopped``, and the files are the pane after the block's heading, its lines joined by
+    `` | ``. A pane the page did not draw is said as ``not on the page`` and never guessed: a
+    state that reached no chain says so here.
+    """
+    missing = "not on the page"
+    lines: list[str] = []
+    for name in RESULT_ROWS:
+        at = next((i for i, text in enumerate(texts) if text == name), None)
+        state = (
+            missing
+            if at is None or at + 1 >= len(texts)
+            else " | ".join(texts[at + 1].splitlines())
+        )
+        lines.append(f"row {name}: {state}")
+    chain = next(
+        (t for t in texts if t.startswith(("Running ", "Done:", "Stopped "))), None
+    )
+    lines.append(
+        f"chain: {missing if chain is None else ' | '.join(chain.splitlines())}"
+    )
+    heading = next((i for i, text in enumerate(texts) if text == FILES_HEADING), None)
+    files = (
+        missing
+        if heading is None or heading + 1 >= len(texts)
+        else " | ".join(texts[heading + 1].splitlines())
+    )
+    lines.append(f"files: {files}")
+    return lines
+
+
+def state_facts(name: str, texts: Sequence[str]) -> list[str]:
+    """The facts a state is about, by name: ``scanned`` the scan's, ``results-all`` the chain's; none for the others."""
+    if name == "scanned":
+        return scan_facts(texts)
+    if name == "results-all":
+        return results_facts(texts)
+    return []
 
 
 def _outputs(out: Path, name: str) -> list[Path]:
@@ -1116,7 +1221,7 @@ def drive(
                 wells,
                 texts,
                 on_screen,
-                scan_facts(texts) if plan.name == "scanned" else [],
+                state_facts(plan.name, texts),
             )
         )
     return records, errors, warnings[0]
@@ -1171,8 +1276,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-results",
         action="store_true",
-        help="do not run the chain of tools: after-density, with-route and turned "
-        "are not reached",
+        help="do not run the chain of tools: after-density, with-route, results-all "
+        "and turned are not reached",
     )
     parser.add_argument(
         "--keep-work",

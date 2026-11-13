@@ -148,6 +148,8 @@ __all__ = [
     "NOT_CONNECTED",
     "PAGE_PARAMS",
     "STAGES",
+    "ChainEnd",
+    "ChainStatus",
     "CheckItem",
     "LoadedPreset",
     "PageServerError",
@@ -597,6 +599,25 @@ class _Handed(NamedTuple):
     switch_off: bool
 
 
+class _Prepared(NamedTuple):
+    """A tool that passed ``run``'s checks: the plugin as loaded and its parsed parameters (m5 §17.11.2)."""
+
+    entry: PluginEntry
+    parsed: PluginParams
+
+
+class _Ended(NamedTuple):
+    """How a plugin's run ended: its outcome text and its record's kind, for a chain to tell (m5 §17.11.2).
+
+    ``status`` is ``done`` (the record ended ``done``), ``stopped`` (the run was
+    stopped: its record is ``stopped``) or ``failed`` (the run raised, or its record
+    could not be written). A single run only says ``outcome``.
+    """
+
+    outcome: str
+    status: Literal["done", "stopped", "failed"]
+
+
 class _LatestShown:
     """The newest frame a plugin's run handed the page, in one slot (m3 §25.5).
 
@@ -716,6 +737,35 @@ class RunClock:
 
 
 @dataclass(frozen=True, slots=True)
+class ChainEnd:
+    """How one tool of a chain ended (m5 §17.11.2).
+
+    ``how`` is ``done`` (its record ended ``done``), ``failed`` (the run raised: its record
+    is ``failed``), ``stopped`` (its record is ``stopped``) or ``refused`` (the checks of
+    ``run`` said no, and nothing was written). ``outcome`` is the text a single run of that
+    tool would have left.
+    """
+
+    plugin: str
+    how: Literal["done", "failed", "stopped", "refused"]
+    outcome: str
+
+
+@dataclass(frozen=True, slots=True)
+class ChainStatus:
+    """The chain *Run all that are left* runs, as every session sees it (m5 §17.11.2).
+
+    ``plugins`` are the tools it runs, in order; ``ended`` is how each of the first ones
+    ended; ``current`` is the tool going, or the one about to start between two, and
+    ``None`` once the chain ended.
+    """
+
+    plugins: tuple[str, ...]
+    ended: tuple[ChainEnd, ...]
+    current: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class PageStatus:
     """The stand and the run, read now.
 
@@ -728,7 +778,9 @@ class PageStatus:
     it (m3 §5.5 D7): a refusal, what it is going to, then the ``goto-well`` run's
     outcome; ``""`` before any, and after *Refresh*. ``clock`` is the latest activity's
     ``RunClock`` (m5 §17.10.2), ``None`` before any and while only Live has run: Live keeps
-    no clock.
+    no clock. ``chain`` is the latest *Run all that are left* (m5 §17.11.2), kept after its
+    end until another activity starts, and ``None`` before any chain and while a later
+    activity goes.
     """
 
     stand: str
@@ -749,6 +801,7 @@ class PageStatus:
     connected: bool = True
     goto: str = ""
     clock: RunClock | None = None
+    chain: ChainStatus | None = None
 
 
 def _one_line(error: BaseException) -> str:
@@ -759,6 +812,37 @@ def _one_line(error: BaseException) -> str:
         Exception
     ):  # a message that cannot be printed is not worth losing the outcome
         return ""
+
+
+def _chain_outcome(
+    tools: tuple[str, ...],
+    ended: tuple[ChainEnd, ...],
+    stopped_before: str | None,
+    seconds: float,
+) -> str:
+    """The strip's text for a chain that ran to its end without a bug of its own (m5 §17.11.2).
+
+    ``run all done in <s> s: <tools>`` when every tool ended ``done``; else ``run all
+    stopped at <tool>: <its outcome>``, or ``run all stopped before <tool>`` after a STOP
+    between two tools, then ``; done: <tools>`` and ``; not run: <tools>`` (the tools
+    after the one it stopped at or before) when there are some.
+    """
+    done = [end.plugin for end in ended if end.how == "done"]
+    if stopped_before is None and len(done) == len(tools):
+        return f"run all done in {seconds:.1f} s: {', '.join(tools)}"
+    if stopped_before is not None:
+        head = f"run all stopped before {stopped_before}"
+        not_run = tools[len(ended) + 1 :]
+    else:
+        last = ended[-1]
+        head = f"run all stopped at {last.plugin}: {last.outcome}"
+        not_run = tools[len(ended) :]
+    text = head
+    if done:
+        text += f"; done: {', '.join(done)}"
+    if not_run:
+        text += f"; not run: {', '.join(not_run)}"
+    return text
 
 
 def _checkpoint_reason(name: str, status: StageStatus) -> str:
@@ -1278,6 +1362,9 @@ class PlatePage:
         self._clock_end: float | None = None
         self._first_report: tuple[float, int] | None = None
         self._last_report: tuple[float, int] | None = None
+        # The latest chain (m5 §17.11.2), under ``_lock``: replaced whole at each tool's
+        # start and end, never edited, and cleared when another activity starts.
+        self._chain: ChainStatus | None = None
         self._outcome: str | None = None
         # What the last drive to a well came to (m3 §5.5 D7), under ``_lock``.
         self._goto = ""
@@ -2132,28 +2219,47 @@ class PlatePage:
                 closed.
         """
         self._refuse_if_busy()
-        if self._microscope is None:
-            self._set_outcome(f"{plugin}: {NOT_CONNECTED}")
+        # Read at the click, not when the worker starts: the preset the operator
+        # saw loaded is the one the record names (m5 §10.5).
+        loaded = self.preset
+        preset = None if loaded is None else loaded.file.name
+        prepared = self._prepare(plugin, params)
+        if isinstance(prepared, str):
+            self._set_outcome(prepared)
             return
+        entry, parsed = prepared
+        self._start_activity(
+            plugin,
+            lambda event: (
+                self._run_plugin(plugin, entry, parsed, event, preset).outcome
+            ),
+        )
+
+    def _prepare(self, plugin: str, params: Sequence[str]) -> _Prepared | str:
+        """What ``smc run`` checks before it opens the stand, for one tool: the plugin and its parameters, or the outcome that refuses it.
+
+        A ``str`` is the outcome ``run`` sets for that refusal (``<plugin>: <why>``),
+        and nothing was written. The checks are in one place so that a single run and
+        a chain refuse with the same code and the same words (m5 §17.11.2): the order is
+        the stand, the plate's gate, ``plate-walls``' refusal, the plugin and its
+        parameters, ``check_ready`` and last a checkpoint. Never raises for a plugin's
+        or a document's fault (FM-98, FM-113): text, so that no traceback is kept.
+        """
+        if self._microscope is None:
+            return f"{plugin}: {NOT_CONNECTED}"
         if _needs_plate(plugin) and not self._plate_chosen:
             # The controller's own refusal (FM-169): a click on a disabled button
             # still arrives here, and so does a call that spells `plate=` itself. The
             # stand's being closed is the reason that holds longer, so it came first.
-            self._set_outcome(f"{plugin}: {PLATE_NOT_CHOSEN}")
-            return
+            return f"{plugin}: {PLATE_NOT_CHOSEN}"
         if plugin == "plate-walls" and (refusal := self._walls_refusal()) is not None:
             # The plugin refuses a dry run and square wells too, but its refusal is a
             # `failed` record, and the latest attempt decides the `plate` slot (m5
             # §11.4): a usable plate would be replaced by a failure. The page refuses
             # first, nothing written, before the parameters are read (FM-169, m5 §12.3).
-            self._set_outcome(f"{plugin}: {refusal}")
-            return
+            return f"{plugin}: {refusal}"
         profile = self._profile.microscope.name
         dry_run = self._dry_run
-        # Read at the click, not when the worker starts: the preset the operator
-        # saw loaded is the one the record names (m5 §10.5).
-        loaded = self.preset
-        preset = None if loaded is None else loaded.file.name
         try:
             entry = load(plugin, self._entry_points)
             try:
@@ -2167,8 +2273,7 @@ class PlatePage:
                 # turns only ValueError and AssertionError into a validation error:
                 # any other exception is the plugin's, and an outcome, never a click
                 # that ends with no word (FM-113).
-                self._set_outcome(f"{plugin}: {type(exc).__name__}: {_one_line(exc)}")
-                return
+                return f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
             doc = RunDocument.load_or_new(self._run_doc)
             check_ready(
                 entry.plugin,
@@ -2186,15 +2291,158 @@ class PlatePage:
             )
         except (PluginError, RunDocumentError) as exc:
             # Text, never the error (FM-98).
-            self._set_outcome(f"{plugin}: {type(exc).__name__}: {_one_line(exc)}")
-            return
+            return f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
         if kept is not None:
-            self._set_outcome(f"{plugin}: {_checkpoint_reason(plugin, kept)}")
+            return f"{plugin}: {_checkpoint_reason(plugin, kept)}"
+        return _Prepared(entry, parsed)
+
+    def run_chain(
+        self, plugins: Sequence[str], params: Mapping[str, Sequence[str]]
+    ) -> None:
+        """Run the tools of ``plugins`` that are not done, in order, as one activity (m5 §17.11.2).
+
+        Each tool is ``run`` as a single click would run it: the same checks and the same
+        refusals (``_prepare``), the same record. The chain goes on while a tool ends
+        ``done`` and stops at the first that does not (failed, stopped, refused), and
+        at a STOP, which it looks at after each tool and before the next. A tool whose
+        slot is ``ok`` in the run document read now is never run: running it again would
+        make every tool after it out of date. ``params`` are the pairs of each tool, read
+        by the view at the click; a tool with no entry runs with none.
+
+        It is one activity, named after the tool that goes, so that a second run, a snap
+        or a close is refused or stops it the whole time, between two tools too. What it
+        came to is the outcome: ``run all done in <s> s: <tools>``, or where it stopped.
+        With the stand closed, no step asked for, a run document that cannot be read, or
+        nothing left, the outcome says so and nothing starts.
+
+        Raises:
+            RuntimeError: An activity is going (``<name> is running``), or the page is
+                closed.
+        """
+        self._refuse_if_busy()
+        if self._microscope is None:
+            self._set_outcome(f"run all: {NOT_CONNECTED}")
             return
-        self._start_activity(
-            plugin,
-            lambda event: self._run_plugin(plugin, entry, parsed, event, preset),
+        if not plugins:
+            # The view passes none when no Results tool loaded, and a click on its disabled
+            # button still arrives here (FM-169): "every step is done" would be false.
+            self._set_outcome("run all: no step was asked for")
+            return
+        # Read now and not from a view's list, which a second tab may have made stale: a tool
+        # that is `ok` here is never run again by the chain.
+        doc, unreadable = self._document()
+        if unreadable is not None:
+            # `_document()` answers an unreadable file with an empty one, which would read every
+            # tool as `not run` and run the ones that are `ok` again over a lock that is gone by
+            # the time `_prepare` reads it (FM-24). `_prepare` refuses such a document at the
+            # first tool; the chain refuses it before it decides what is left.
+            self._set_outcome(f"run all: {_flat(unreadable)}")
+            return
+        checklist = {item.slot: item.state for item in self._checklist(doc)}
+        registry = self._registry().plugins
+        left = tuple(
+            tool
+            for tool in dict.fromkeys(plugins)
+            if checklist.get(
+                registry[tool].plugin.provides if tool in registry else tool
+            )
+            != "ok"
         )
+        if not left:
+            self._set_outcome("run all: nothing is left: every step is done")
+            return
+        # Read at the click, as `run` reads it: every record of the chain names the preset
+        # the operator saw loaded (m5 §10.5).
+        loaded = self.preset
+        preset = None if loaded is None else loaded.file.name
+        pairs = {tool: tuple(given) for tool, given in params.items()}
+        self._start_activity(
+            left[0], lambda event: self._run_chain(left, pairs, preset, event)
+        )
+
+    def _run_chain(
+        self,
+        tools: tuple[str, ...],
+        params: Mapping[str, Sequence[str]],
+        preset: str | None,
+        event: threading.Event,
+    ) -> str:
+        """The chain's worker body: each tool through ``_prepare`` and ``_run_plugin``; the outcome as text.
+
+        The activity's event is each tool's ``stop``. It is looked at **before** every tool
+        and after the last, and not only inside the plugin: a STOP that lands between two
+        tools, or on a tool that ignores it and ends ``done``, would otherwise be lost
+        and the next tool would start (FM-226's entry). ``_lock`` is never held across
+        ``_prepare``, a run or a device call (FM-70). Whatever this code itself raises is
+        the outcome ``run all: <Type>: <message>``, the text and never the exception
+        (FM-98), and the tool whose turn it was ends ``failed``, so that the Results screen
+        says which tool the chain stopped at and not that a STOP nobody pressed ended it; the
+        chain's status is closed in ``finally``, so no tool is left ``current``.
+        """
+        started = time.monotonic()
+        ended: list[ChainEnd] = []
+        stopped_before: str | None = None
+        turn: str | None = None
+        try:
+            with self._lock:
+                self._chain = ChainStatus(tools, (), tools[0])
+            for tool in tools:
+                if event.is_set():
+                    stopped_before = tool
+                    break
+                turn = tool
+                self._begin_tool(tool, event)
+                prepared = self._prepare(tool, params.get(tool, ()))
+                if isinstance(prepared, str):
+                    end = ChainEnd(tool, "refused", prepared)
+                else:
+                    result = self._run_plugin(
+                        tool, prepared.entry, prepared.parsed, event, preset
+                    )
+                    end = ChainEnd(tool, result.status, result.outcome)
+                ended.append(end)
+                following = tools[len(ended)] if len(ended) < len(tools) else None
+                with self._lock:
+                    # The tool about to start stays `current` through the gap, so that
+                    # a tick there does not read the chain as stopped.
+                    self._chain = ChainStatus(
+                        tools, tuple(ended), following if end.how == "done" else None
+                    )
+                if end.how != "done":
+                    break
+        except Exception as exc:
+            text = f"{type(exc).__name__}: {_one_line(exc)}"
+            if turn is not None and (not ended or ended[-1].plugin != turn):
+                ended.append(ChainEnd(turn, "failed", f"{turn}: {text}"))
+            return f"run all: {text}"
+        finally:
+            with self._lock:
+                self._chain = ChainStatus(tools, tuple(ended), None)
+        return _chain_outcome(
+            tools, tuple(ended), stopped_before, time.monotonic() - started
+        )
+
+    def _begin_tool(self, tool: str, event: threading.Event) -> None:
+        """Make ``tool`` the activity that goes: its name for the strip, a stop, a close and a refusal, and no report of the tool before.
+
+        The activity is never let go of between two tools, so a second run stays refused
+        in the gap. The progress, the queue and the clock's two reports are the tool
+        before's and are dropped, so that its last report does not show as this tool's
+        first (``RunClock.elapsed_s`` stays the chain's). ``stop()`` reads
+        ``_current_run`` without the lock and gets a tuple that holds the chain's one
+        event, whichever of the two it reads (FM-70).
+        """
+        with self._lock:
+            self._current_run = (tool, event)
+            self._progress = None
+            self._first_report = self._last_report = None
+            while True:
+                try:
+                    self._queue.get_nowait()
+                except queue.Empty:
+                    break
+            if self._chain is not None:
+                self._chain = replace(self._chain, current=tool)
 
     def _start_activity(
         self, name: str, body: Callable[[threading.Event], str]
@@ -2227,6 +2475,7 @@ class PlatePage:
             self._clock_start = time.monotonic()
             self._clock_end = None
             self._first_report = self._last_report = None
+            self._chain = None
             self._outcome = None
             while True:
                 try:
@@ -2300,8 +2549,8 @@ class PlatePage:
         parsed: PluginParams,
         event: threading.Event,
         preset: str | None = None,
-    ) -> str:
-        """A plugin's run on the worker, and its outcome as text."""
+    ) -> _Ended:
+        """A plugin's run on the worker: its outcome as text, and whether it ended done, stopped or failed."""
         log.info("%s: started from the plate page", plugin)
         started = time.monotonic()
         # The orientation the page names the captures for, read before a rename runs:
@@ -2328,20 +2577,24 @@ class PlatePage:
             )
         except RunDocumentError as exc:
             if exc.record is not None and exc.record.result is not None:
-                return (
+                return _Ended(
                     f"{plugin} ran, but its record could not be written: "
-                    f"{_one_line(exc)}"
+                    f"{_one_line(exc)}",
+                    "failed",
                 )
-            return f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
+            return _Ended(f"{plugin}: {type(exc).__name__}: {_one_line(exc)}", "failed")
         except Exception as exc:
-            return f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
+            return _Ended(f"{plugin}: {type(exc).__name__}: {_one_line(exc)}", "failed")
         if record.status is StageStatus.done:
             seconds = time.monotonic() - started
             note = ""
             if record.provides == "plate":
                 note = self._follow_plate(turned_from)
-            return f"{plugin} done in {seconds:.1f} s{_assumed_tail(record)}{note}"
-        return f"{plugin} stopped"
+            return _Ended(
+                f"{plugin} done in {seconds:.1f} s{_assumed_tail(record)}{note}",
+                "done",
+            )
+        return _Ended(f"{plugin} stopped", "stopped")
 
     def _follow_plate(self, turned_from: PlateOrientation | None) -> str:
         """After a ``done`` provider of ``plate``: keep its orientation, and follow a turn; what the strip adds.
@@ -3225,6 +3478,7 @@ class PlatePage:
             outcome = self._outcome
             goto = self._goto
             clock = self._clock()
+            chain = self._chain
         stand = self._profile.microscope.name
         stop_refused = tuple(
             role.value for role in self._profile.safety.stop_refused_by
@@ -3273,6 +3527,7 @@ class PlatePage:
                         problems=tuple(problems),
                         goto=goto,
                         clock=clock,
+                        chain=chain,
                     )
         return PageStatus(
             stand=stand,
@@ -3293,6 +3548,7 @@ class PlatePage:
             connected=False,
             goto=goto,
             clock=clock,
+            chain=chain,
         )
 
     def _clock(self) -> RunClock | None:

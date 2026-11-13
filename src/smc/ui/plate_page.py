@@ -78,24 +78,35 @@ from smc.ui.frames import Frame, display_image
 from smc.ui.guide import (
     DRY_RUN_NO_FRAME,
     END_LIVE_LABEL,
+    FILES_HEADING,
     GOTO_NOT_DURING_LIVE,
+    NO_FILES_YET,
     ORIENTATION_IN_STAGE_TERMS,
     OTHER_WAYS_TO_REGISTER,
     PLATE_NOT_CHOSEN,
+    RESULT_CHOICES,
+    RESULT_NAMES,
+    RESULT_TOOLS,
+    RUN_ALL_LABEL,
     SCREEN_LEADS,
     SCREEN_TITLES,
     STEPS,
     CentreRow,
     NextStep,
+    ResultRow,
     StepName,
+    again_note,
     busy_note,
     capture_centre_label,
     capture_wall_label,
     centre_rows,
     centres_text,
+    chain_line,
+    colour_bar_title,
     continue_label,
     drive_image_note,
     field_source_line,
+    files_lines,
     forget_label,
     image_sides_note,
     known_text,
@@ -112,6 +123,9 @@ from smc.ui.guide import (
     preset_note_text,
     register_replace_note,
     registered_line,
+    result_row,
+    results_left,
+    run_all_wait,
     scan_lead,
     scan_progress_lines,
     scan_title,
@@ -205,17 +219,17 @@ _STICKY_STRIP = {
 #: The screen the expert view shows: today's regions, behind one switch (m5 §17.2 D4).
 ScreenName = StepName | Literal["expert"]
 
-#: The tools each screen lists, provisionally (m5 §17.7 B1): today's tool sections, in
-#: the order of the workflow. B2 to B4 replace each screen's list with its designed
-#: contents: the Stand, Plate, Wells and Scan screens (B2, #444; B3, #445) list no tool
-#: section, their actions are their own buttons and the sections stay in the expert view.
-#: The names are the registry's (``timing`` fills the checklist's ``timings``).
+#: The tool sections each screen lists (m5 §17.7): none. B1 listed today's sections on every
+#: screen, provisionally, and B2 to B4 replaced each screen's list with its designed contents
+#: (B2, #444; B3, #445; B4, #446): every screen's actions are its own buttons and rows, and the
+#: tool sections stay in the expert view. Kept as a table so that a screen that lists one again
+#: says it here.
 _SCREEN_TOOLS: Mapping[StepName, tuple[str, ...]] = {
     "stand": (),
     "plate": (),
     "wells": (),
     "scan": (),
-    "results": ("cells", "density", "route", "report", "nis-export"),
+    "results": (),
 }
 
 #: The colour of the fields a scan has a frame for, over the plan's orange (m5 §17.10.2): a
@@ -492,6 +506,29 @@ class _CentreSlot:
     box: Any
 
 
+@dataclass(frozen=True, slots=True)
+class _ResultRow:
+    """One of the Results screen's five rows: built once, rewritten by the redraws (m5 §17.4.5, §17.11.2).
+
+    ``state`` is the state line, ``button`` is *Run* or *Again* (its label follows the
+    tool), ``wait`` what it waits for and ``replaces`` what *Again* makes out of date, each
+    hidden while empty. ``from_lines`` say where each choice's value comes from, by key;
+    ``command`` and ``command_note`` are the tool's call and the Windows note under it, in
+    the closed ``card``, which also holds the tool's own fields for ``RESULT_CHOICES``
+    (the same instances as the accordion's, D5). ``box`` is the column the screen lists.
+    """
+
+    state: Any
+    button: Any
+    wait: Any
+    replaces: Any
+    from_lines: dict[str, Any]
+    command: Any
+    command_note: Any
+    card: Any
+    box: Any
+
+
 class PlatePageView:
     """One session's widgets over one controller; every handler is a method the tests call.
 
@@ -555,6 +592,13 @@ class PlatePageView:
         # the run document's record. Per view (D6, FM-151): another tab draws its own.
         self._status: PageStatus | None = None
         self._imaged_drawn: int | None = None
+        # The Results screen (m5 §17.11): the rows the last redraw drew and the tools it
+        # found left, so that a button's wait is drawn from what the rows said and not from
+        # a second reading, and how many tools of the chain the tick last saw ended. All
+        # per view (D6, FM-151): another tab draws its own, from the shared status.
+        self._results_drawn: dict[str, ResultRow] = {}
+        self._results_left: tuple[str, ...] = ()
+        self._chain_ended = 0
         # Whether the commands say they are quoted for a POSIX shell: ``None`` is the PC this
         # runs on (FM-175); a test sets it, as ``next_step_text`` takes ``windows=``.
         self._windows: bool | None = None
@@ -654,7 +698,9 @@ class PlatePageView:
                 text_font_style="bold",
             )
         )
-        self.figure.add_layout(ColorBar(color_mapper=self.mapper), "right")
+        # Kept: its title names the class the *Density of* select names (m5 §17.4.5).
+        self.colour_bar = ColorBar(color_mapper=self.mapper)
+        self.figure.add_layout(self.colour_bar, "right")
         # Before the route's line, so that the route is drawn over the fields; the wells
         # are `underlay`, below both, and the only renderer the hover reads. The orange
         # differs from Viridis (the wells' fill) and from the route's red.
@@ -1266,6 +1312,76 @@ class PlatePageView:
         self.layout_button.on_click(self._handler(self._runner("scan-plan")))
         self.scan_button.on_click(self._handler(self._runner("scan")))
 
+    def _build_results(self) -> None:
+        """The Results screen's widgets: *Run all that are left*, a row for each tool and where the files are (m5 §17.4.5, §17.11.2, #446).
+
+        Built with the screens, after the tools' sections, because a row's closed *Choices
+        and command* holds the tool's own fields (D5: one instance, the accordion's too) and
+        those are made with the sections. Every button goes through ``_handler`` (FM-171) and
+        carries its text as ``label=`` (FM-147); a row's *Run* is the tool's own handler
+        (``_runner``), so the pairs it sends are the page's and the typed fields', read at the
+        click. A disabled button is a courtesy: the controller refuses each call on its own
+        (FM-169). A tool that did not load has a row with no field and no card, which says so.
+        Text is plain, never markup (FM-139): a class, a path and an outcome come from outside.
+        A pane that says nothing is hidden and takes no height (``_say``, D12).
+        """
+        self.run_all_button = pn.widgets.Button(label=RUN_ALL_LABEL, color="primary")
+        self.run_all_wait_text = _wrapped_text()
+        self.run_all_wait_text.visible = False
+        self.chain_text = _wrapped_text()
+        self.chain_text.visible = False
+        self.run_all_button.on_click(self._handler(lambda event: self.on_run_all()))
+        self.result_rows: dict[str, _ResultRow] = {}
+        for tool in RESULT_TOOLS:
+            fields = self.tool_fields.get(tool, {})
+            from_lines: dict[str, Any] = {}
+            inside: list[Any] = []
+            for key in RESULT_CHOICES.get(tool, ()):
+                field = fields.get(key)
+                if field is not None:
+                    from_lines[key] = _wrapped_text()
+                    inside += [field, from_lines[key]]
+            command = _wrapped_text()
+            command_note = _wrapped_text()
+            command_note.visible = False
+            card = pn.Card(
+                *inside,
+                command,
+                command_note,
+                title="Choices and command",
+                collapsed=True,
+                sizing_mode="stretch_width",
+                visible=False,
+            )
+            state = _wrapped_text()
+            button = pn.widgets.Button(label="Run")
+            wait = _wrapped_text()
+            wait.visible = False
+            replaces = _wrapped_text()
+            replaces.visible = False
+            button.on_click(self._handler(self._runner(tool)))
+            box = pn.Column(
+                _wrapped_text(RESULT_NAMES[tool], {"font-weight": "bold"}),
+                state,
+                button,
+                wait,
+                replaces,
+                card,
+            )
+            self.result_rows[tool] = _ResultRow(
+                state,
+                button,
+                wait,
+                replaces,
+                from_lines,
+                command,
+                command_note,
+                card,
+                box,
+            )
+        self.files_heading = _wrapped_text(FILES_HEADING, {"font-weight": "bold"})
+        self.files_text = _wrapped_text(NO_FILES_YET)
+
     def _centre_slot(self, index: int) -> _CentreSlot:
         """One centre row's widgets: its sentence, *Go to*, *Capture the centre of* (or *Redo*) and its note (m5 §17.4.2)."""
         text = _wrapped_text()
@@ -1467,11 +1583,12 @@ class PlatePageView:
         §17.4.4): each holds its own buttons, none of the next step (the walk found *Run
         scan-plan* on the Plate screen) and none of the tool sections, which stay in the
         expert view; the Wells screen lists two of the tools' own fields, the same
-        instances the accordion holds. Results is today's regions, provisionally (B1), with
-        the next step (one instance, listed on it and in the expert view, so it is drawn
-        once and keeps its place whatever the state): B4 replaces it with its design. The
-        tool sections of a screen are listed in it and in the accordion's stage columns.
+        instances the accordion holds. So is Results (B4, #446, §17.4.5): *Run all that are
+        left*, a row for each of its five tools (whose closed *Choices and command* holds
+        the same instances too) and where the files are; the next step, the sections and the
+        checklist are in the expert view only.
         """
+        self._build_results()
         preset_region = self._preset_region()
         next_region = self._next_region()
         # The plate, where it comes from, which way it lies and the confirmation of the
@@ -1516,7 +1633,17 @@ class PlatePageView:
                 self.scanned_block,
                 self.scan_card,
             ],
-            "results": [next_region],
+            # The action first, so that it is on the page without a scroll (§17.4.5); the
+            # run document's path closes the list, before *Continue* (which is hidden here).
+            "results": [
+                self.run_all_button,
+                self.run_all_wait_text,
+                self.chain_text,
+                *(row.box for row in self.result_rows.values()),
+                self.files_heading,
+                self.files_text,
+                self.run_document_text,
+            ],
         }
         # The Scan screen's title and lead name the plan's wells and fields: panes the page
         # rewrites (``_draw_scan_screen``), not the static text of the others.
@@ -1535,9 +1662,8 @@ class PlatePageView:
                 *(sections[name] for name in _SCREEN_TOOLS[step] if name in sections),
                 self.continue_button,
             ]
-        # The run document's path and its checklist close the last screen and the expert
-        # view: where the files are, and what the next step reads.
-        self.screens["results"] += [self.run_document_text, self.checklist_text]
+        # The expert view keeps the next step, the checklist and every tool section: what
+        # the Results screen's rows replace (§17.4.5).
         self.screens["expert"] = [
             preset_region,
             next_region,
@@ -2032,6 +2158,28 @@ class PlatePageView:
         self._try(run)
         self.tick()
 
+    def on_run_all(self) -> None:
+        """*Run all that are left*: the Results tools that loaded, each with the pairs its own *Run* sends (m5 §17.11.2).
+
+        The pairs are read here, at the click, from the page's values and the fields the
+        operator typed: the controller knows no widget. Which tools are left is the
+        controller's to decide from the run document read now, so a list this tab drew before
+        another one ran a tool can never run it again. A tool that did not load has a row that
+        says so and is not passed. Whatever the controller refuses is the message, as a tool's
+        own *Run* does.
+        """
+        tools = [tool for tool in RESULT_TOOLS if tool in self.tool_runs]
+
+        def run_all() -> None:
+            params = {
+                tool: [*self.page.page_params(tool), *self._typed(tool)]
+                for tool in tools
+            }
+            self.page.run_chain(tools, params)
+
+        self._try(run_all)
+        self.tick()
+
     def _typed(self, plugin: str) -> list[str]:
         """The ``key=value`` pairs of ``plugin``'s non-empty fields: what a run sends and a preset keeps."""
         return [
@@ -2287,6 +2435,8 @@ class PlatePageView:
         self._draw_field_lines()
         self._draw_layout_command()
         self._draw_scan_command()
+        self._draw_result_lines()
+        self._draw_result_commands()
 
     def _actual(self) -> dict[str, dict[str, str]]:
         """What every tool's fields hold now, by tool and key."""
@@ -2377,7 +2527,15 @@ class PlatePageView:
         self._status = status
         self._draw_wells_screen(status)
         self._draw_scan_screen(status)
+        self._draw_results_screen(status)
         self._draw_imaged(status)
+        # How many tools of a chain have ended since the last tick (per view, D6): a tool's
+        # end inside a chain changes the run document with no activity ending, so the rows
+        # are read again for it (m5 §17.11.2). A chain that is gone, or a new one, is no end.
+        chain = status.chain
+        ended = 0 if chain is None else len(chain.ended)
+        chain_moved = ended > 0 and ended != self._chain_ended
+        self._chain_ended = ended
         self.status_text.object = status_line(status)
         self.run_text.object = run_text(status)
         self.goto_text.object = status.goto
@@ -2406,8 +2564,10 @@ class PlatePageView:
         self._draw_buttons()
         self._draw_drive()
         if previous is not None and status.running is None:
+            # The end of a run, a chain's last tool included: one redraw covers the end the
+            # chain's count also reports in the same tick.
             self.refresh()
-        elif self._shared_state() != self._seen_state:
+        elif chain_moved or self._shared_state() != self._seen_state:
             # Another tab chose wells or a plate, or took a capture: the controller is
             # the server's, so a tab that does not redraw would run `scan-plan` with
             # wells it does not show. Reading five attributes is no view: the view is
@@ -2627,6 +2787,7 @@ class PlatePageView:
             # Before the first tick there is no status; that tick draws both screens.
             self._draw_wells_screen(self._status)
             self._draw_scan_screen(self._status)
+            self._draw_results_screen(self._status)
         self._draw_drive()
         # The options are read here and after a save, never by the tick (§10.6).
         self._offer_presets()
@@ -2735,6 +2896,9 @@ class PlatePageView:
         known = [v for v in values if math.isfinite(v)]
         self.mapper.low = 0.0
         self.mapper.high = max(known) if known and max(known) > 0.0 else 1.0
+        # The bar says which class its colours count: the select's, so that a change of the
+        # select, which draws the wells again, changes it too (m5 §17.4.5).
+        self.colour_bar.title = colour_bar_title(label) or None
         self.names.visible = len(view.wells) <= NAMES_UP_TO_WELLS
         self.side_source.data = {
             "x": [side.x_um for side in view.sides],
@@ -2815,6 +2979,7 @@ class PlatePageView:
         self._draw_captures()
         self._draw_stand_plate_buttons()
         self._draw_wells_scan_buttons()
+        self._draw_results_buttons()
         lacks = self.page.lacks(Camera)
         self.snap_button.disabled = running is not None or lacks is not None
         # While live goes its own button is the one that ends it; any other activity
@@ -2967,6 +3132,7 @@ class PlatePageView:
         self._draw_calibrate_command()
         self._draw_layout_command()
         self._draw_scan_command()
+        self._draw_result_commands()
 
     def _draw_calibrate_command(self) -> None:
         """The command of ``camera-calibration`` with the page's pairs and the form's typed fields."""
@@ -3273,6 +3439,116 @@ class PlatePageView:
         else:
             self.scan_command.object = self.page.command_for("scan", pairs)
         self.scan_card.visible = bool(self.scan_command.object)
+
+    def _draw_results_screen(self, status: PageStatus | None) -> None:
+        """The Results screen from the last view and this status: the rows, the chain's line and where the files are (m5 §17.4.5, §17.11).
+
+        Text only, from the last view and the status: it reads nothing new (FM-145), which is
+        also why a second tab draws the chain the first one started, from the shared status
+        (FM-151). A row's state line is the checklist's, the card's time and what is running
+        (``result_row``); the tool's own progress is the status's report, and only while that
+        tool runs. ``dry_scan`` is a page served with ``--dry-run`` over a scan that was one,
+        the rule the next step used for ``DRY_RUN_NO_FRAME``. The buttons and their waits are
+        ``_draw_results_buttons``'s, called last so that a redraw never leaves them behind.
+        """
+        view = self._view
+        checklist = () if view is None else view.checklist
+        cards = {} if view is None else view.cards
+        scan = cards.get("scan")
+        dry_scan = bool(
+            status is not None and status.dry_run and scan is not None and scan.dry_run
+        )
+        running = None if status is None else status.running
+        report = None if status is None else status.progress
+        rows: dict[str, ResultRow] = {}
+        for tool, widgets in self.result_rows.items():
+            progress = (
+                (report.done, report.total)
+                if report is not None and report.plugin == tool
+                else None
+            )
+            row = result_row(
+                tool,
+                checklist=checklist,
+                card=cards.get(tool),
+                blocked=self._blocked.get(tool),
+                dry_scan=dry_scan,
+                running=running,
+                progress=progress,
+            )
+            rows[tool] = row
+            widgets.state.object = row.state
+            widgets.button.label = row.button
+            self._say(widgets.replaces, again_note(tool, checklist))
+        self._results_drawn = rows
+        self._results_left = tuple(
+            tool for tool in results_left(checklist) if tool in self.tool_runs
+        )
+        self._say(self.chain_text, chain_line(None if status is None else status.chain))
+        self.files_text.object = "\n".join(files_lines(cards)) or NO_FILES_YET
+        self._draw_result_lines()
+        self._draw_results_buttons()
+
+    def _draw_results_buttons(self) -> None:
+        """Which of *Run all that are left* and the five rows' buttons is disabled, and the reason beside each (m5 §11.2, §17.11.2).
+
+        A button is disabled while an activity goes (a chain's own tools included: the strip
+        names the tool that runs) or a wait is drawn, and says the wait or, with none, what
+        runs and how to end it. A row whose input is missing is disabled and its state line
+        says which step makes it. A tool that did not load says so, and the chain's wait is
+        what its first tool left waits for. The controller refuses each of these calls itself
+        (FM-169).
+        """
+        running = self._running
+        busy = None if running is None else busy_note(running, live=self.page.is_live)
+        for tool, widgets in self.result_rows.items():
+            row = self._results_drawn.get(tool)
+            reason = "" if row is None else row.wait
+            if tool not in self.tool_runs:
+                reason = f"{tool} did not load: the problems line says why"
+            widgets.button.disabled = (
+                running is not None or bool(reason) or row is None or row.missing
+            )
+            self._say(widgets.wait, reason or busy or "")
+        wait = (
+            "the results tools did not load: the problems line says why"
+            if not any(tool in self.tool_runs for tool in RESULT_TOOLS)
+            else run_all_wait(list(self._results_drawn.values()), self._results_left)
+        )
+        self.run_all_button.disabled = running is not None or wait is not None
+        self._say(self.run_all_wait_text, wait or busy or "")
+
+    def _draw_result_lines(self) -> None:
+        """The *from …* line under each choice of the rows: where its value comes from (m5 §17.2 D7).
+
+        Called by the screen's redraw and by a field's own change (``_on_field_changed``),
+        never while a load assigns the fields: a load ends with ``refresh()``.
+        """
+        for tool, widgets in self.result_rows.items():
+            for key, line in widgets.from_lines.items():
+                line.object = self._field_line((tool, key))
+
+    def _draw_result_commands(self) -> None:
+        """The command of each row, with the page's pairs and the tool's typed fields, and the Windows note under it (m5 §17.2 D8, FM-175).
+
+        Read at a redraw and at a field's change, never by the tick (it reads the run
+        document). A tool that did not load, or whose pairs the controller refuses, draws no
+        command, and its card is hidden with it unless it holds a choice.
+        """
+        note = posix_quoting_note(self._windows)
+        for tool, widgets in self.result_rows.items():
+            try:
+                pairs = [*self.page.page_params(tool), *self._typed(tool)]
+            except ValueError:
+                widgets.command.object = ""
+            else:
+                widgets.command.object = (
+                    self.page.command_for(tool, pairs) if tool in self.tool_runs else ""
+                )
+            self._say(widgets.command_note, note if widgets.command.object else "")
+            widgets.card.visible = bool(widgets.command.object) or bool(
+                widgets.from_lines
+            )
 
     @staticmethod
     def _say(pane: Any, text: str) -> None:

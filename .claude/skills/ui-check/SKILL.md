@@ -1,6 +1,6 @@
 ---
 name: ui-check
-description: Look at the plate page like a user does — serve it on a demo stand in dry run, drive it with headless Chromium at 1280 x 800 through seven states (empty, a typed well range, a snap, the expert view, after density, with the route, the plate turned), at 1280 x 620 through two more (the Stand screen and the Plate screen) and at 1280 x 800 through two guided ones (the fields laid out, the scan done), and read the PNGs and summary.txt it writes. Use it on every area:ui issue, in /develop before the adversarial review and in /review of an area:ui PR; it also says how a session drives the served page through a Chrome MCP (tried once: screenshots and clicks, no page reading). Never an assertion or a baseline.
+description: Look at the plate page like a user does — serve it on a demo stand in dry run, drive it with headless Chromium at 1280 x 800 through eight states (empty, a typed well range, a snap, the expert view, after density, with the route, Run all that are left, the plate turned), at 1280 x 620 through two more (the Stand screen and the Plate screen) and at 1280 x 800 through two guided ones (the fields laid out, the scan done), and read the PNGs and summary.txt it writes. Use it on every area:ui issue, in /develop before the adversarial review and in /review of an area:ui PR; it also says how a session drives the served page through a Chrome MCP (tried once: screenshots and clicks, no page reading). Never an assertion or a baseline.
 ---
 
 # /ui-check
@@ -41,7 +41,7 @@ has both.
 
 (Windows: `.venv\Scripts\python`.) 33 s on macOS (measured), 19 s of them the `scan` of
 the chain; `--no-results` skips the chain when the change has nothing to do with
-results, and then `after-density`, `with-route` and `turned` are named as not reached. `--stand demo` serves
+results, and then `after-density`, `with-route`, `results-all` and `turned` are named as not reached. `--stand demo` serves
 the demo whose camera images no sample. Nothing else is a parameter: there is no
 `--profile`, because the page can move a stage, and the script serves only
 `demo-sample` and `demo`, the repository's own files, and always with `--dry-run`.
@@ -52,8 +52,9 @@ the demo whose camera images no sample. Nothing else is a parameter: there is no
 | `wells-selected` | clicks Connect (when enabled) and waits for the strip, then the *3. Wells* step (its button is found by the name that starts with its number, `^3\. Wells`, since the label gains a `✓` when the step is done), then types `A1:B2` in the Wells box, Enter. The box's label is one match now that the step panel shows one screen, which ended #395 | both |
 | `snap` | the Snap button, always in view beside the map: no tab, and the screen does not change | both |
 | `expert` | the *Expert view* switch, a wait for its `bk-active` class (a pressed Toggle's button is `bk-btn bk-btn-light bk-active`), the photograph, then the switch off again | both (it is the fourth, so that `demo` reaches it) |
-| `after-density` | runs the workflow while the page is up (`plate-registration`, `scan-plan`, `scan`, `cells`, `density`, on the demo's simulated stage), then a Snap (the page reads the run document again when it ends: #297, **no Refresh**), then the *5. Results* step and a wait for `✓ density` in the checklist. Read the map for the **whole plate** and **plain tick labels** (−60000 to 60000, not `5.000e+4`: FM-174) | `demo-sample` |
+| `after-density` | runs the workflow while the page is up (`plate-registration`, `scan-plan`, `scan`, `cells`, `density`, on the demo's simulated stage), then a Snap (the page reads the run document again when it ends: #297, **no Refresh**), then the *5. Results* step and a wait for the density row's state line (the second `Done <date> UTC`; the checklist's `✓ density` is the expert view's now). Read the map for the **whole plate** and **plain tick labels** (−60000 to 60000, not `5.000e+4`: FM-174) | `demo-sample` |
 | `with-route` | `route`, then Refresh (in the map's header row) | `demo-sample` |
+| `results-all` | the *5. Results* step, a wait for the density row's `Done`, then **the screen's own *Run all that are left*** (found by its whole name, so no row's *Run* answers to it) and a wait for the strip's `run all done`. After `with-route` the run document holds a real `cells`, `density` and `route`, so on the dry-run page the chain runs `report` and `nis-export`, which move nothing (measured, m5 §17.11.1). Read the **five rows** (state lines, *Run* or *Again*, a wait under a button that has one), *Run all that are left* with its line, the files block (`Where the files are`) and the colour bar's title on the map (`<class> cells per mm²`). `summary.txt` says `row <name>:` for each of the five rows' state lines, `chain:` and `files:`, and for the frame's parts and the screen's **title** (`Results`) and **first action** (*Run all that are left*) whether each is wholly inside the 800 px page. The five rows are taller than the page: say in the Report what is below the fold (`results-all-full.png`; the screen's own panel scrolls) | `demo-sample` |
 | `turned` | the *2. Plate* step, then the *Plate lies* select set to its `Turned 180°` option (after a wait for the select: the server draws the screen), then a wait for the strip's `plate-orientation done` line (m5 §16.4). Compare it with `with-route` by eye: the **same cross, other names** (the density and the route are stale after the turn, so they are gone) | `demo-sample` |
 | `stand-620` | Connect (when enabled), then *Refresh* (it forgets the outcome the earlier states left under the strip: D12 measures the header with its outcome lines empty), the viewport **resized to 1280 x 620**, then the *1. Stand* step and a wait for the screen's title; the viewport goes back to the run's after the photograph. `summary.txt` says for the strip's STOP, the step bar, the screen's **title** and its **first action** (the preset's *Load*) whether each is wholly inside the 620 px page (m5 §17.2 D12) | both stands, last (no chain) |
 | `plate-620` | The same, with the *2. Plate* step. Its first action is the first row's *Go to*. On `--stand demo` the screen is in its worst case (the placeholder plate, the confirmation, the orientation note of a stand that does not say its sides): read it there too, since `demo-sample` is registered by the chain's end | both stands, last (no chain) |
@@ -67,9 +68,10 @@ are named: `not reached: the demo has no sample to register from`.
 A state it cannot reach is **named, never skipped**: `<state>: not reached: <why>`,
 on stdout and in `summary.txt`. It never clicks a tool's own Run button, Drive, STOP or
 Resume. The buttons of the **guided screens** (*Register the plate*, *Lay out the fields*,
-*Start the scan*) are clicked, on the dry-run page only, by the two guided states: each is
-a run that moves nothing in a dry run. `turned` starts a run from the page too, its
-`plate-orientation`, which moves nothing either.
+*Start the scan*, and the Results screen's *Run all that are left*) are clicked, on the
+dry-run page only, by the two guided states and by `results-all`: each is a run that moves
+nothing in a dry run. `turned` starts a run from the page too, its `plate-orientation`,
+which moves nothing either.
 
 **A scan in motion** (the progress bar, `Field n of 72`, *Elapsed* and *Left*, the green
 fields growing) cannot be photographed on the dry-run page: its scan ends at once. It is a
@@ -77,6 +79,14 @@ fields growing) cannot be photographed on the dry-run page: its scan ends at onc
 and never committed: `demo-sample` served **without** `--dry-run` (a simulated stand, see
 *Live mode* below for the check of the profile) on a scratch run folder, driven by Playwright
 through the Plate, Wells and Scan screens, with PNGs taken while the scan runs (#445).
+
+**A chain in motion** (*Run all that are left* with a step running and the others waiting:
+`Running now`, `after <step>`, the chain's line `Running <step> (k of 5).`) is the same kind
+of session, through the Plate, Wells, Scan and Results screens, with PNGs of Results before the
+click, right after it and after it (#446). On the demo the five tools take about 2 s in all
+after the scan (`cells` is cold for about 2 s, and a row may read `Running now` then): a chain
+that is too fast to photograph is said so in the Report, and `results-all` above is what
+the script reads.
 
 ## Read
 
@@ -89,7 +99,7 @@ through the Plate, Wells and Scan screens, with PNGs taken while the scan runs (
    state the change touches. Start here. `<state>-full.png` is the whole page and is
    shown too small to read: use it for the part below the fold only.
 3. **`summary.txt`** for what a PNG cannot give: the strip, the outcome, the
-   checklist and the result cards as text, the step shown (`step:`, the button of the class `smc-step-shown`; with the expert view on, none is), what is on screen (`on screen:` says for the strip's STOP, the step bar, the map, the image and the last control of the drive bar whether each is wholly in the viewport and where; for `stand-620` and `plate-620` it says it for STOP, the step bar, the screen's title and its first action, and for `wells-laid-out` and `scanned` for the frame's parts and the screen's title and its first action; `scanned` also says `progress:` and `result:`, the progress lines and the result line), the Wells box, how the
+   checklist and the result cards as text, the step shown (`step:`, the button of the class `smc-step-shown`; with the expert view on, none is), what is on screen (`on screen:` says for the strip's STOP, the step bar, the map, the image and the last control of the drive bar whether each is wholly in the viewport and where; for `stand-620` and `plate-620` it says it for STOP, the step bar, the screen's title and its first action, and for `wells-laid-out`, `scanned` and `results-all` for the frame's parts and the screen's title and its first action; `scanned` also says `progress:` and `result:`, the progress lines and the result line, and `results-all` says `row <name>:` for each of the five rows, then `chain:` and `files:`), the Wells box, how the
    server stopped, the server's error lines and the browser's. The map and the image
    are **canvas**: they are in the PNGs only.
 4. **`server.log`** (the server's stdout and stderr as it wrote them) when the
@@ -123,8 +133,9 @@ would not choose) is reported as what it shows, not as a defect.
 ## Never
 
 - Run a tool from its own section, drive the stage or press STOP through the page (the
-  guided screens' three buttons, in the two guided states, are the one thing it presses,
-  on the dry-run page); start the page on any
+  guided screens' three buttons, in the two guided states, and the Results screen's *Run all
+  that are left*, in `results-all`, are the one thing it presses, on the dry-run page); start
+  the page on any
   other stand, or without `--dry-run` (the one exception is below: a simulated stand
   in a live walk where the owner wants the Run buttons pressed); run two sessions on
   the same page.
@@ -206,8 +217,8 @@ window, Live, Drive).
 
    (Windows: `.venv\Scripts\python`.) It must print `''`. **Every other profile keeps
    `--dry-run`**, and so does every walk that only reads: `scripts/dev/ui_snap.py`
-   never presses a tool's own Run (only the guided screens' three buttons, in dry run)
-   and always serves in dry run.
+   never presses a tool's own Run (only the guided screens' three buttons and the Results
+   screen's *Run all that are left*, in dry run) and always serves in dry run.
 3. **It opens `http://localhost:<port>/`**, exactly as the command prints it: the
    websocket accepts `localhost` only, not `127.0.0.1`.
 4. **It drives the page with the MCP's own tools.** What can be inspected: buttons,

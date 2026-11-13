@@ -413,6 +413,8 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
         "expert",
         "after-density",
         "with-route",
+        # The Results screen's chain (m5 §17.11.4): between the route and the turn.
+        "results-all",
         "turned",
         # The short-page shots of D12 (m5 §17.8): after them, and reached with no chain.
         "stand-620",
@@ -422,9 +424,10 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
         "scanned",
     ]
     assert list(snap.STATE_NAMES) == names
+    assert snap.CHAIN_STATES == ("after-density", "with-route", "results-all", "turned")
     # `expert` is the fourth, so that both stands reach it (m5 §17.8).
     alone = [True, True, True, True]
-    chained = [False, False, False]
+    chained = [False, False, False, False]
     short = [True, True]
     # The guided states register the plate from the sample themselves and need no chain.
     guided = [True, True]
@@ -439,12 +442,12 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
     # `turned` needs the chain's registered plate (m5 §16.4): with the results. The two
     # short-page states need none: both stands reach them. The guided ones need a sample.
     assert [p.reachable for p in demo] == [*alone, *chained, *short, *no_sample]
-    for plan in demo[4:7]:
+    for plan in demo[4:8]:
         assert plan.reason == (
             "the demo camera images no sample: no cells, no density; "
             "use --stand demo-sample"
         )
-    assert [p.reason for p in demo[9:]] == [
+    assert [p.reason for p in demo[10:]] == [
         "the demo has no sample to register from"
     ] * 2
     assert snap.NO_SAMPLE_TO_REGISTER == "the demo has no sample to register from"
@@ -453,18 +456,24 @@ def test_a_state_that_cannot_be_reached_is_named_with_its_reason(snap) -> None:
     # they do not read the chain's results.
     skipped = snap.plan_states("demo-sample", results=False)
     assert [p.reachable for p in skipped] == [*alone, *chained, *short, *guided]
-    assert {p.reason for p in skipped[4:7]} == {"skipped by --no-results"}
-    assert [p.reason for p in skipped[9:]] == [None, None]
+    assert {p.reason for p in skipped[4:8]} == {"skipped by --no-results"}
+    assert [p.reason for p in skipped[10:]] == [None, None]
 
     failed = snap.plan_states(
         "demo-sample", results=True, chain_failure="cells exited 1: no detector"
     )
     assert [p.reachable for p in failed] == [*alone, *chained, *short, *guided]
-    assert [p.name for p in failed[4:7]] == ["after-density", "with-route", "turned"]
+    assert [p.name for p in failed[4:8]] == [
+        "after-density",
+        "with-route",
+        "results-all",
+        "turned",
+    ]
     assert failed[4].reason == "cells exited 1: no detector"
     assert failed[5].reason is not None
     assert "cells exited 1: no detector" in failed[5].reason
     assert failed[6].reason == failed[5].reason
+    assert failed[7].reason == failed[5].reason
     # None is silent: every state that is not reached says why.
     for plans in (demo, skipped, failed):
         assert all(p.reachable or p.reason for p in plans)
@@ -989,6 +998,7 @@ def test_a_failed_chain_names_the_states_that_needed_it(snap, tmp_path) -> None:
         ("expert", True),
         ("after-density", False),
         ("with-route", False),
+        ("results-all", False),
         ("turned", False),
         # The short-page shots need no chain, and nor do the guided states.
         ("stand-620", True),
@@ -999,6 +1009,7 @@ def test_a_failed_chain_names_the_states_that_needed_it(snap, tmp_path) -> None:
     assert records[4].reason == "cells exited 1: x"
     assert records[5].reason == "needs the chain: cells exited 1: x"
     assert records[6].reason == "needs the chain: cells exited 1: x"
+    assert records[7].reason == "needs the chain: cells exited 1: x"
     assert (errors, warnings) == ([], 0)
 
 
@@ -1008,13 +1019,15 @@ def test_a_state_whose_control_times_out_is_named_and_the_next_state_runs(
     page = _fake_page(fails_on_button="Snap")
     records, _, _ = _drive(snap, tmp_path, page, lambda steps: None)
     # `after-density` takes a Snap too (the page reads the run document again at its
-    # end, #297), so it fails on the same control; `expert` and `with-route` run.
+    # end, #297), so it fails on the same control; `expert`, `with-route` and `results-all`
+    # run.
     assert [r.reached for r in records] == [
         True,
         True,
         False,
         True,
         False,
+        True,
         True,
         True,
         True,
@@ -1040,12 +1053,12 @@ def test_a_step_button_that_times_out_names_the_state_and_the_next_one_runs(
     assert [r.reached for r in records] == [
         True,
         False,
-        *([True] * 7),
+        *([True] * 8),
         False,
         True,
     ]
     assert records[1].reason == "Locator.click: Timeout 10000ms exceeded."
-    assert records[9].reason == records[1].reason
+    assert records[10].reason == records[1].reason
     page.screenshot.assert_any_call(path=str(tmp_path / "wells-selected-FAILED.png"))
     page.screenshot.assert_any_call(path=str(tmp_path / "wells-laid-out-FAILED.png"))
 
@@ -1059,12 +1072,12 @@ def test_a_state_whose_control_times_out_alone_is_the_only_one_named(
     assert [r.reached for r in records] == [
         True,
         False,
-        *([True] * 7),
+        *([True] * 8),
         False,
         True,
     ]
     assert records[1].reason == "Locator.fill: Timeout 10000ms exceeded."
-    assert records[9].reason == records[1].reason
+    assert records[10].reason == records[1].reason
     page.screenshot.assert_any_call(path=str(tmp_path / "wells-selected-FAILED.png"))
 
 
@@ -1121,9 +1134,10 @@ def _step_names(page: MagicMock) -> list[str]:
 def test_after_density_takes_a_snap_and_then_reads_the_results_step(snap) -> None:
     """#297: the page reads the run document again at the end of a snap, with no Refresh
     (a Refresh would redraw the map and say nothing of the redraw a snap made). Then the
-    Results step, whose checklist says the density is done: the wait comes after the
-    click, since the checklist is on that screen only, and a wait that is dropped reads
-    the page before it has redrawn."""
+    Results step, whose density row says it is done: the second of the state lines that
+    start ``Done <date>`` (``cells`` is the first). The wait comes after the click, since the
+    rows are on that screen only, and a wait that is dropped reads the page before it has
+    redrawn. The checklist's ``✓ density`` is the expert view's now."""
     page = MagicMock()
     chains: list[list[object]] = []
     snap._act_after_density(page, SimpleNamespace(run_chain=chains.append))
@@ -1136,14 +1150,16 @@ def test_after_density_takes_a_snap_and_then_reads_the_results_step(snap) -> Non
         "get_by_role().click",
         "locator",
         "locator().filter",
-        "locator().filter().first.wait_for",
+        "locator().filter().nth",
+        "locator().filter().nth().wait_for",
     ]
     first_role = next(c for c in calls if c[0] == "get_by_role")
     assert first_role.kwargs == {"name": "Snap"}
     assert _step_names(page) == [r"^5\. Results"]
     assert [c.kwargs for c in calls if c[0] == "locator().filter"] == [
-        {"has_text": "✓ density"}
+        {"has_text": snap.DONE_ROW}
     ]
+    assert [c.args for c in calls if c[0] == "locator().filter().nth"] == [(1,)]
     # No tab to click, and no Refresh.
     assert not [c for c in calls if c[0] == "get_by_text"]
     assert not [c for c in calls if c.kwargs.get("name") == "Refresh"]
@@ -1332,6 +1348,8 @@ def test_the_short_page_states_name_the_screens_titles_the_guide_draws(snap) -> 
         "plate-620": SCREEN_TITLES["plate"],
         "wells-laid-out": SCREEN_TITLES["wells"],
         "scanned": scan_title(["B11", "B2"], []),
+        # The Results screen's, which `results-all` reads (m5 §17.11.4).
+        "results-all": SCREEN_TITLES["results"],
     } == snap.SCREEN_TITLE_OF
     assert snap.SHORT_VIEWPORT_HEIGHT_PX == 620
 
@@ -1496,6 +1514,15 @@ def _recording_page(*, plate_lies: str = TURNED) -> tuple[MagicMock, list[str]]:
         found = MagicMock()
         found.first.wait_for.side_effect = lambda **kw: order.append(f"wait:{label}")
         found.wait_for.side_effect = lambda **kw: order.append(f"wait-detached:{label}")
+
+        def nth(index: int) -> MagicMock:
+            item = MagicMock()
+            item.wait_for.side_effect = lambda **kw: order.append(
+                f"wait-nth{index}:{label}"
+            )
+            return item
+
+        found.nth.side_effect = nth
         return found
 
     page.get_by_role.side_effect = role
@@ -1568,9 +1595,170 @@ def test_the_scanned_state_starts_the_scan_and_waits_for_its_own_outcome(snap) -
     page.wait_for_timeout.assert_not_called()
 
 
+def test_the_results_all_state_opens_results_waits_for_the_done_row_runs_all_and_waits_for_the_outcome(
+    snap,
+) -> None:
+    page, order = _recording_page()
+    assert snap.ACTIONS["results-all"] is snap._act_results_all
+    snap._act_results_all(page, _no_chain())
+    # The click on the button comes after the wait for the redrawn row (the screen is swapped by
+    # the server), and the last wait is the strip's own `run all done`: no delay anywhere (FM-162).
+    assert order == [
+        r"click:^5\. Results",
+        f"wait-nth1:{snap.DONE_ROW.pattern}",
+        "click:Run all that are left",
+        "wait:run all done",
+    ]
+    page.wait_for_timeout.assert_not_called()
+    # The button is found by its whole name: no row's *Run* answers to it.
+    page.get_by_role.assert_any_call("button", name="Run all that are left", exact=True)
+
+
+def test_the_results_screens_words_are_the_guides(snap) -> None:
+    from smc.ui.guide import (
+        FILES_HEADING,
+        RESULT_NAMES,
+        RESULT_TOOLS,
+        RUN_ALL_LABEL,
+    )
+
+    # The script imports nothing of smc at import, so its copy of the words is pinned.
+    assert tuple(RESULT_NAMES[tool] for tool in RESULT_TOOLS) == snap.RESULT_ROWS
+    assert snap.RUN_ALL == RUN_ALL_LABEL
+    assert snap.FILES_HEADING == FILES_HEADING
+
+
+def test_the_done_row_pattern_matches_a_state_line_and_not_the_chains_line(
+    snap,
+) -> None:
+    assert snap.DONE_ROW.search("Done 2026-11-12 09:30:00 UTC")
+    assert snap.DONE_ROW.search("Done 2026-11-12 09:30:00 UTC (dry run)")
+    # The chain's own line is `Done: ...`, the files block's `Scan frames: ...`.
+    assert not snap.DONE_ROW.search("Done: Count the cells, Density per well.")
+    assert not snap.DONE_ROW.search("Ready")
+    assert not snap.DONE_ROW.search("Not usable: Done 2026-11-12")
+
+
+def test_the_results_parts_are_the_frames_and_the_screens_title_and_run_all(
+    snap,
+) -> None:
+    page = MagicMock()
+    parts = dict(snap._results_parts(page))
+    assert list(parts) == [
+        "STOP",
+        "step bar",
+        "map",
+        "image",
+        "drive bar",
+        "title",
+        "first action",
+    ]
+    page.get_by_role.assert_any_call("button", name="Run all that are left", exact=True)
+    page.locator.return_value.filter.assert_any_call(has_text=re.compile(r"^Results$"))
+
+
+def test_on_screen_reads_the_results_parts_of_results_all_and_only_there(
+    snap, monkeypatch
+) -> None:
+    page = MagicMock()
+    page.viewport_size = {"width": 1280, "height": 800}
+    found = MagicMock()
+    found.count.return_value = 1
+    # The button past the page's bottom: what the summary must say as NO.
+    found.first.bounding_box.return_value = _box(10, 150, 170, 31)
+    title = MagicMock()
+    title.count.return_value = 1
+    title.first.bounding_box.return_value = _box(10, 142, 370, 17)
+    monkeypatch.setattr(
+        snap, "_results_parts", lambda page: [("title", title), ("first action", found)]
+    )
+    assert snap._on_screen(page, "results-all") == [
+        "title: yes (y 142 to 159 of 800, x 10 to 380 of 1280)",
+        "first action: yes (y 150 to 181 of 800, x 10 to 180 of 1280)",
+    ]
+    # Another state reads the frame's parts, as before.
+    monkeypatch.setattr(snap, "_frame_parts", lambda page: [("STOP", title)])
+    assert snap._on_screen(page, "snap") == [
+        "STOP: yes (y 142 to 159 of 800, x 10 to 380 of 1280)"
+    ]
+
+
+def test_results_facts_say_the_rows_the_chain_line_and_the_files_or_that_they_are_not_on_the_page(
+    snap,
+) -> None:
+    texts = [
+        "Results",
+        "Each step reads the one before. Run the next one, or all that are left.",
+        "Done: Report, Export for NIS-Elements.",
+        "Count the cells",
+        "Done 2026-11-12 09:00:00 UTC",
+        "Density per well",
+        "Done 2026-11-12 09:00:01 UTC",
+        "Route through the densest fields",
+        "Done 2026-11-12 09:00:02 UTC",
+        "Report",
+        "Done 2026-11-12 09:00:03 UTC (dry run)",
+        "Export for NIS-Elements",
+        "Done 2026-11-12 09:00:04 UTC (dry run)",
+        "Where the files are",
+        "Scan frames: /run/scan\nReport: /run/report.html",
+    ]
+    assert snap.results_facts(texts) == [
+        "row Count the cells: Done 2026-11-12 09:00:00 UTC",
+        "row Density per well: Done 2026-11-12 09:00:01 UTC",
+        "row Route through the densest fields: Done 2026-11-12 09:00:02 UTC",
+        "row Report: Done 2026-11-12 09:00:03 UTC (dry run)",
+        "row Export for NIS-Elements: Done 2026-11-12 09:00:04 UTC (dry run)",
+        "chain: Done: Report, Export for NIS-Elements.",
+        "files: Scan frames: /run/scan | Report: /run/report.html",
+    ]
+    # A pane the page did not draw is said, never guessed; a name that ends the list has no
+    # state line after it.
+    assert snap.results_facts(["Results", "Count the cells"]) == [
+        "row Count the cells: not on the page",
+        *(f"row {name}: not on the page" for name in snap.RESULT_ROWS[1:]),
+        "chain: not on the page",
+        "files: not on the page",
+    ]
+    assert snap.results_facts([]) == [
+        *(f"row {name}: not on the page" for name in snap.RESULT_ROWS),
+        "chain: not on the page",
+        "files: not on the page",
+    ]
+    # The chain's line is the first that starts as one: running, done or stopped.
+    assert snap.results_facts(["Running Count the cells (1 of 5)."])[-2] == (
+        "chain: Running Count the cells (1 of 5)."
+    )
+    assert snap.results_facts(["Stopped at Report by STOP."])[-2] == (
+        "chain: Stopped at Report by STOP."
+    )
+
+
+def test_the_summary_says_the_results_all_facts_in_their_order(snap) -> None:
+    record = snap.StateRecord(
+        name="results-all",
+        reached=True,
+        step="5. Results ✓",
+        facts=["row Report: Done 2026-11-12 09:00:03 UTC (dry run)", "chain: Done."],
+    )
+    text = snap.format_summary(
+        [record], server="stopped by SIGINT", server_errors=[], browser_errors=[]
+    )
+    lines = text.splitlines()
+    start = lines.index("== results-all ==")
+    assert lines[start : start + 5] == [
+        "== results-all ==",
+        "reached",
+        "step: 5. Results ✓",
+        "row Report: Done 2026-11-12 09:00:03 UTC (dry run)",
+        "chain: Done.",
+    ]
+
+
 def test_no_action_clicks_a_tools_own_run_button(snap) -> None:
-    # The skill's rule: the script presses the guided screens' three buttons and no tool's
-    # own *Run <tool>* (the expert view's), nor Drive, STOP or Resume.
+    # The skill's rule: the script presses the guided screens' three buttons, the Results
+    # screen's *Run all that are left* and no tool's own *Run <tool>* (the expert view's, nor
+    # a Results row's), nor Drive, STOP or Resume.
     import inspect
 
     for name, action in snap.ACTIONS.items():
@@ -1694,7 +1882,7 @@ def test_the_summary_says_a_states_facts_after_what_is_on_screen(snap) -> None:
     ]
 
 
-def test_only_the_scanned_state_carries_facts(snap, tmp_path) -> None:
+def test_only_the_scanned_and_results_all_states_carry_facts(snap, tmp_path) -> None:
     page = _fake_page()
     records, _, _ = _drive(snap, tmp_path, page, lambda steps: None)
     by_name = {r.name: r for r in records}
@@ -1703,7 +1891,12 @@ def test_only_the_scanned_state_carries_facts(snap, tmp_path) -> None:
         "progress: not on the page",
         "result: not on the page",
     ]
-    assert [n for n, r in by_name.items() if r.facts] == ["scanned"]
+    assert by_name["results-all"].facts == [
+        *(f"row {name}: not on the page" for name in snap.RESULT_ROWS),
+        "chain: not on the page",
+        "files: not on the page",
+    ]
+    assert [n for n, r in by_name.items() if r.facts] == ["results-all", "scanned"]
 
 
 # --- the chain against the plugins ------------------------------------------

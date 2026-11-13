@@ -437,18 +437,17 @@ def test_calibrate_the_camera_is_the_same_call_as_the_tools_own_run(
 
 
 def test_the_designed_screens_list_no_next_step_region(page: PlatePage) -> None:
-    # Stand and Plate (B2, #444), Wells and Scan (B3, #445): each action is the screen's own.
+    # Stand and Plate (B2, #444), Wells and Scan (B3, #445), Results (B4, #446): each action
+    # is the screen's own.
     view = PlatePageView(page)
-    for step in ("stand", "plate", "wells", "scan"):
+    for step in ("stand", "plate", "wells", "scan", "results"):
         view.show_step(step)
         shown = _objects(list(view.step_panel.objects))
         assert view.next_text not in shown, step
         assert view.next_button not in shown, step
         assert view.next_note not in shown, step
-    # The next step is still in the expert view, and on the provisional screen left (B4).
+    # The next step is still in the expert view.
     view.show_expert(True)
-    assert view.next_text in _objects(list(view.step_panel.objects))
-    view.show_step("results")
     assert view.next_text in _objects(list(view.step_panel.objects))
 
 

@@ -278,15 +278,11 @@ def test_the_step_panel_shows_one_screen_at_a_time(page: PlatePage) -> None:
         assert title.object == SCREEN_TITLES[step]
         assert title.styles["font-weight"] == "bold"
         assert lead.object == SCREEN_LEADS[step]
-        # The designed screens (B2: Stand and Plate; B3: Wells and Scan) hold their own
-        # buttons and not the next step; the provisional one (B4: Results) still lists it,
-        # right after the lead. The Scan screen's title and lead are the fallbacks of a page
-        # with no plan and no selection, which is what this page is (m5 §17.10.3).
-        regions = _next_regions(shown)
-        if step in ("stand", "plate", "wells", "scan"):
-            assert regions == []
-        else:
-            assert regions == [shown[2]]
+        # Every screen is designed now (B2: Stand and Plate; B3: Wells and Scan; B4: Results):
+        # each holds its own buttons and none the next step, which is the expert view's. The
+        # Scan screen's title and lead are the fallbacks of a page with no plan and no
+        # selection, which is what this page is (m5 §17.10.3).
+        assert _next_regions(shown) == []
         assert view.continue_button in shown
         # The step shown is the primary button, and the one `/ui-check` finds by its class.
         colours = {s: b.color for s, b in view.step_buttons.items()}
@@ -311,14 +307,15 @@ def test_the_step_panel_shows_one_screen_at_a_time(page: PlatePage) -> None:
         for step, ids in on.items()
     }
     assert tools_on == {
-        # The Stand, Plate (B2), Wells and Scan (B3) screens are designed: their actions are
-        # their own buttons and no tool section is listed on them (the sections stay in the
-        # expert view). Only Results (B4) still lists today's sections.
+        # Every screen is designed (B2: Stand and Plate; B3: Wells and Scan; B4: Results):
+        # their actions are their own buttons and rows, and no tool section is listed on
+        # them (the sections stay in the expert view). The Results rows' buttons are their
+        # own: `tool_runs` holds the sections' *Run* buttons only.
         "stand": set(),
         "plate": set(),
         "wells": set(),
         "scan": set(),
-        "results": {"cells", "density", "route", "report", "nis-export"},
+        "results": set(),
         # The expert view lists every tool, the ones no step holds included (`goto-well`
         # is a third party's, as far as the steps go: in the expert view only).
         "expert": set(view.tool_runs),
@@ -331,10 +328,12 @@ def test_the_step_panel_shows_one_screen_at_a_time(page: PlatePage) -> None:
         "orientation_select": {"plate", "expert"},
         "plate_confirm_button": {"plate", "expert"},
         "select_input": {"wells", "expert"},
+        # The run document's path closes the Results screen and the expert view; its
+        # checklist and the next step are the expert view's alone (B4, m5 §17.4.5).
         "run_document_text": {"results", "expert"},
-        "checklist_text": {"results", "expert"},
+        "checklist_text": {"expert"},
         "continue_button": set(STEPS),
-        "next_text": {"results", "expert"},
+        "next_text": {"expert"},
         # B2's own widgets: each on its screen alone, `plate_from_text` with the menu it
         # explains (the expert view lists the same column).
         "stand_connect_button": {"stand"},
@@ -361,6 +360,12 @@ def test_the_step_panel_shows_one_screen_at_a_time(page: PlatePage) -> None:
         "scan_progress_text": {"scan"},
         "scanned_block": {"scan"},
         "scan_card": {"scan"},
+        # B4's: each on the Results screen alone.
+        "run_all_button": {"results"},
+        "run_all_wait_text": {"results"},
+        "chain_text": {"results"},
+        "files_heading": {"results"},
+        "files_text": {"results"},
     }
     for attribute, screens in homes.items():
         widget = getattr(view, attribute)
@@ -571,25 +576,22 @@ def test_the_strip_and_stop_are_outside_the_step_panel(page: PlatePage) -> None:
     assert not always & _ids_below(list(view.step_panel.objects))
 
 
-def test_the_next_step_is_on_the_provisional_screen_and_the_expert_view_and_drawn_once(
+def test_the_next_step_is_in_the_expert_view_only_and_drawn_once(
     page: PlatePage,
 ) -> None:
     view = PlatePageView(page)
-    seen: set[int] = set()
     for name, items in view.screens.items():
         regions = _next_regions(items)
-        if name in ("stand", "plate", "wells", "scan"):
-            # Designed in B2 and B3: the action is the screen's own, and the walk found the
-            # next step's 12-line command (`plate-registration`, `Run scan-plan`) on them.
+        if name != "expert":
+            # Every step screen is designed (B2 to B4): the action is the screen's own, and
+            # the walk found the next step's 12-line command (`plate-registration`, `Run
+            # scan-plan`) on them.
             assert regions == [], f"{name} lists the next step"
             continue
-        # The provisional screen left (B4: Results) and the expert view.
         assert len(regions) == 1, f"{name} lists the next step {len(regions)} times"
-        seen.add(id(regions[0]))
-        assert items.index(regions[0]) == (2 if name != "expert" else 1)
-    # One instance for all of them, so that it is drawn once and its place never depends
-    # on the state: refresh() never rewrites a screen's list.
-    assert len(seen) == 1
+        assert items.index(regions[0]) == 1
+    # Listed once, so that it is drawn once and its place never depends on the state:
+    # refresh() never rewrites a screen's list.
     before = {name: list(items) for name, items in view.screens.items()}
     view.refresh()
     view.tick()
@@ -600,7 +602,7 @@ def test_the_next_step_is_on_the_provisional_screen_and_the_expert_view_and_draw
         else:
             view.show_step(name)  # type: ignore[arg-type]
         rendered = [o for o in _ids_objects(list(view.step_panel.objects))]
-        drawn = 0 if name in ("stand", "plate", "wells", "scan") else 1
+        drawn = 1 if name == "expert" else 0
         assert sum(o is view.next_text for o in rendered) == drawn
         assert sum(o is view.next_button for o in rendered) == drawn
 
