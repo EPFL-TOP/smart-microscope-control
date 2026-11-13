@@ -18,8 +18,10 @@ import threading
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 import pytest
+from pymmcore_plus import DeviceType
 from typer.testing import CliRunner
 
 from objective_offsets_stand import (
@@ -32,16 +34,30 @@ from objective_offsets_stand import (
     opened,
     profile_with_offsets,
 )
+from recording_autofocus import RecordingAutofocus
 from smc.cli import app
 from smc.hardware import Microscope
-from smc.hardware.capabilities import ObjectiveOffset, ObjectiveTurret, XYStage
+from smc.hardware.capabilities import (
+    Autofocus,
+    ObjectiveOffset,
+    ObjectiveTurret,
+    XYStage,
+    ZStage,
+)
 from smc.hardware.errors import (
     CoreError,
     DeviceTimeoutError,
     MicroscopeHaltedError,
+    MotionStoppedError,
     SafetyRefusedError,
 )
-from smc.hardware.profile import HolderSection, Profile
+from smc.hardware.profile import (
+    AutofocusSection,
+    HolderSection,
+    MicroscopeSection,
+    Profile,
+    SafetySection,
+)
 from smc.plugins import (
     ParamsError,
     PluginRunError,
@@ -53,6 +69,10 @@ from smc.plugins import (
 from smc.plugins.goto_well import GotoWellParams, GotoWellPlugin, GotoWellResult
 from smc.plugins.slots import PlateResult
 from smc.run import RunDocument, StageRecord, StageStatus, write_stage
+from smc.testing import FakeCore, FakeDevice
+
+if TYPE_CHECKING:
+    from pymmcore_plus import CMMCorePlus
 
 pytestmark = pytest.mark.demo
 
@@ -86,7 +106,11 @@ def _plate(
 
 
 def _seed(
-    tmp_path: Path, plate: PlateResult | None = None, *, dry_run: bool = False
+    tmp_path: Path,
+    plate: PlateResult | None = None,
+    *,
+    dry_run: bool = False,
+    profile: str = "demo",
 ) -> None:
     """The ``plate`` slot as an earlier ``plate-registration`` run left it, ``done``."""
     then = datetime(2026, 10, 28, 9, 30, tzinfo=timezone.utc)
@@ -99,7 +123,7 @@ def _seed(
             status=StageStatus.done,
             started_utc=then,
             finished_utc=then,
-            profile="demo",
+            profile=profile,
             dry_run=dry_run,
             smc_version="0",
             params={},
@@ -1098,3 +1122,376 @@ def test_smc_run_goto_well_drives_to_the_estimate_on_demo_sample(
         "target estimated from the stand's holder, not registered: the 96-well "
         "centred at stage (0, 0) µm, not turned"
     )
+
+
+# -------------------------------- the autofocus across a well's wall (#454)
+
+
+def _switched_off_line(well: str) -> str:
+    """m3 §5.6 D1's ``assumed`` line, written here and not read from the plugin."""
+    return (
+        "the autofocus was switched off before the move, so that no lock crossed a "
+        f"well's wall: engage it again in {well}"
+    )
+
+
+def _switched_off_warning(well: str) -> str:
+    return (
+        f"goto-well: the autofocus was switched off before the move to {well}, so "
+        "that no lock crosses a well's wall (m2 §12.2 D2): engage it again there"
+    )
+
+
+def _not_switched_off(well: str, cause: str) -> str:
+    return (
+        f"goto-well: the autofocus could not be switched off before the move to "
+        f"{well} ({cause}): the stage did not move, and PFS may still be on: switch "
+        "it off at the stand, then go to the well again"
+    )
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The plugin's own warnings: ``override`` warns too, on the layer's logger."""
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and r.name == "smc.plugins.goto-well"
+    ]
+
+
+def test_goto_well_switches_an_engaged_autofocus_off_before_the_move_and_says_so_first(
+    demo_microscope: Microscope, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _seed(tmp_path, _plate(method="seed", assumed=(SEED_LINE,)))
+    af = RecordingAutofocus(engaged=True)
+    demo_microscope.override(Autofocus, af)
+    expected = _at("B2", 0.0, 0.0)
+
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        result = _result(_run(demo_microscope, tmp_path, well="b2"))
+
+    # The whole list: a goto-well run makes no other call on the autofocus.
+    assert af.calls == ["is_engaged", "disengage", "is_engaged"]
+    assert af.engaged is False
+    assert _where(demo_microscope) == pytest.approx(expected, abs=0.02)
+    assert result.autofocus_switched_off is True
+    assert result.assumed == (_switched_off_line("B2"), f"plate: {SEED_LINE}")
+    assert _warnings(caplog) == [_switched_off_warning("B2")]
+
+
+def test_goto_well_switches_the_autofocus_off_before_it_sends_the_move(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The order: the switch-off and its read back, then the one move, nothing between."""
+    _seed(tmp_path)
+    af = RecordingAutofocus(engaged=True)
+    demo_microscope.override(Autofocus, af)
+    stage = demo_microscope.require(XYStage)
+    real_move = stage.move_to_um
+
+    def move(x_um: float, y_um: float) -> object:
+        af.calls.append("move_to_um")
+        return real_move(x_um, y_um)
+
+    monkeypatch.setattr(stage, "move_to_um", move)
+    _result(_run(demo_microscope, tmp_path, well="A2"))
+    assert af.calls == ["is_engaged", "disengage", "is_engaged", "move_to_um"]
+
+
+def test_goto_well_to_the_estimate_switches_the_autofocus_off_and_says_so_before_the_estimate(
+    holder_stand: Microscope, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    af = RecordingAutofocus(engaged=True)
+    holder_stand.override(Autofocus, af)
+
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        result = _result(_run(holder_stand, tmp_path, well="a1", plate="96-well"))
+
+    assert af.calls == ["is_engaged", "disengage", "is_engaged"]
+    assert _where(holder_stand) == pytest.approx(A1_ESTIMATED, abs=0.02)
+    assert result.autofocus_switched_off is True
+    assert result.assumed == (
+        _switched_off_line("A1"),
+        ESTIMATE_LINE,
+        f"plate not read: {NO_PLATE}",
+        NO_OFFSET_LINE,
+    )
+    assert _switched_off_warning("A1") in _warnings(caplog)
+
+
+def test_goto_well_leaves_an_autofocus_that_is_off_alone(
+    demo_microscope: Microscope, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _seed(tmp_path)
+    af = RecordingAutofocus(engaged=False)
+    demo_microscope.override(Autofocus, af)
+
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        result = _result(_run(demo_microscope, tmp_path, well="B2"))
+
+    assert af.calls == ["is_engaged"]
+    assert result.autofocus_switched_off is False
+    assert result.assumed == ()
+    assert _warnings(caplog) == []
+    assert _where(demo_microscope) == pytest.approx(_at("B2", 0.0, 0.0), abs=0.02)
+
+
+def test_goto_well_searching_counts_as_on(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """PFS on and searching drives Z the moment it finds its reference: it is switched off too."""
+    _seed(tmp_path)
+    af = RecordingAutofocus(engaged=True, locked=False)
+    demo_microscope.override(Autofocus, af)
+
+    result = _result(_run(demo_microscope, tmp_path, well="B2"))
+
+    assert af.calls.count("disengage") == 1
+    assert "is_locked" not in af.calls
+    assert result.autofocus_switched_off is True
+
+
+def test_goto_well_in_a_dry_run_switches_nothing(
+    demo_microscope_dry: Microscope, tmp_path: Path
+) -> None:
+    # A switch-off acts in a dry run (m2 §3.2), and nothing moves to carry a lock.
+    _seed(tmp_path)
+    af = RecordingAutofocus(engaged=True)
+    demo_microscope_dry.override(Autofocus, af)
+
+    result = _result(_run(demo_microscope_dry, tmp_path, well="B2"))
+
+    assert af.calls == []
+    assert af.engaged is True
+    assert result.autofocus_switched_off is False
+    assert result.assumed == (DRY_LINE,)
+
+
+def test_a_stop_before_the_move_keeps_the_autofocus_on_and_sends_nothing(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    _seed(tmp_path)
+    af = RecordingAutofocus(engaged=True)
+    demo_microscope.override(Autofocus, af)
+    before = _where(demo_microscope)
+    stop = threading.Event()
+    stop.set()
+
+    record = _run(demo_microscope, tmp_path, well="A2", stop=stop)
+
+    assert record.status is StageStatus.stopped
+    assert "disengage" not in af.calls
+    assert af.engaged is True
+    assert _where(demo_microscope) == before
+
+
+def _fails_before_the_move(
+    microscope: Microscope, tmp_path: Path, af: RecordingAutofocus, cause: str
+) -> None:
+    """Unknown counts as on (FM-19): the run fails with §5.6's text whole, and nothing moved."""
+    _seed(tmp_path)
+    microscope.override(Autofocus, af)
+    before = _where(microscope)
+
+    with pytest.raises(PluginRunError) as info:
+        _run(microscope, tmp_path, well="a2")
+
+    assert str(info.value) == _not_switched_off("A2", cause)
+    # Raised outside the handler: the device's error is not kept on it (FM-98).
+    assert info.value.__context__ is None
+    stored = _stored(tmp_path)
+    assert stored.status is StageStatus.failed
+    assert stored.error == f"PluginRunError: {_not_switched_off('A2', cause)}"
+    assert _where(microscope) == before
+
+
+def test_a_switch_off_that_raises_fails_goto_well_before_the_move(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    af = RecordingAutofocus(engaged=True, fails="disengage")
+    _fails_before_the_move(
+        demo_microscope, tmp_path, af, "CoreError: disengage failed on the fake"
+    )
+    assert af.calls == ["is_engaged", "disengage"]
+
+
+def test_a_state_read_that_raises_fails_goto_well_before_the_move(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    af = RecordingAutofocus(engaged=True, fails="is_engaged")
+    _fails_before_the_move(
+        demo_microscope, tmp_path, af, "CoreError: is_engaged failed on the fake"
+    )
+    assert af.calls == ["is_engaged"]
+
+
+def test_a_read_after_the_switch_off_that_raises_fails_goto_well_before_the_move(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    af = RecordingAutofocus(engaged=True, read_fails_after_off=True)
+    _fails_before_the_move(
+        demo_microscope,
+        tmp_path,
+        af,
+        "CoreError: is_engaged failed on the fake after the switch-off",
+    )
+    assert af.calls == ["is_engaged", "disengage", "is_engaged"]
+
+
+def test_an_autofocus_that_still_reads_on_fails_goto_well_before_the_move(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    _seed(tmp_path)
+    af = RecordingAutofocus(engaged=True, stays_on=True)
+    demo_microscope.override(Autofocus, af)
+    before = _where(demo_microscope)
+    text = (
+        "goto-well: the autofocus still reads on after it was switched off before "
+        "the move to A2: the stage did not move: switch it off at the stand, then go "
+        "to the well again"
+    )
+
+    with pytest.raises(PluginRunError) as info:
+        _run(demo_microscope, tmp_path, well="a2")
+
+    assert str(info.value) == text
+    assert af.calls == ["is_engaged", "disengage", "is_engaged"]
+    stored = _stored(tmp_path)
+    assert stored.status is StageStatus.failed
+    assert stored.error == f"PluginRunError: {text}"
+    assert _where(demo_microscope) == before
+
+
+def test_a_halted_stand_switches_the_autofocus_off_and_the_halt_reaches_the_caller(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """PFS off is the safe side; the move then raises the halt as it did (FM-64).
+
+    The stand's stop switches the autofocus off itself; one switched on again
+    while halted (at the stand) is what ``goto-well``'s own switch-off meets.
+    """
+    _seed(tmp_path)
+    af = RecordingAutofocus(engaged=True)
+    demo_microscope.override(Autofocus, af)
+    before = _where(demo_microscope)
+    demo_microscope.stop()
+    assert af.engaged is False  # the stop's own switch-off
+    af.engaged = True
+    af.calls.clear()
+    try:
+        with pytest.raises(MicroscopeHaltedError):
+            _run(demo_microscope, tmp_path, well="A2")
+    finally:
+        demo_microscope.resume()
+    assert af.calls == ["is_engaged", "disengage", "is_engaged"]
+    assert _stored(tmp_path).status is StageStatus.failed
+    assert _where(demo_microscope) == before
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [MicroscopeHaltedError(), MotionStoppedError("the stage was stopped")],
+    ids=["halt", "motion-stopped"],
+)
+def test_a_halt_from_the_switch_off_reaches_the_caller_unchanged(
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: Exception,
+) -> None:
+    """A halt or a stop is not a switch-off that failed: it passes first (FM-64)."""
+    _seed(tmp_path)
+    af = RecordingAutofocus(engaged=True)
+    demo_microscope.override(Autofocus, af)
+    before = _where(demo_microscope)
+
+    def fails() -> None:
+        raise fault
+
+    monkeypatch.setattr(af, "disengage", fails)
+    with pytest.raises(type(fault)) as info:
+        _run(demo_microscope, tmp_path, well="A2")
+    assert info.value is fault
+    assert _where(demo_microscope) == before
+
+
+def test_a_goto_well_result_written_before_454_loads_with_the_autofocus_not_switched_off() -> (
+    None
+):
+    older = {
+        "well": "B2",
+        "side": "centre",
+        "target_x_um": 1.0,
+        "target_y_um": 2.0,
+        "x_um": 1.0,
+        "y_um": 2.0,
+        "assumed": [],
+    }
+    assert GotoWellResult.model_validate(older).autofocus_switched_off is False
+
+
+def _ti2_stand() -> tuple[FakeCore, Microscope]:
+    """The Ti2-E's focus and PFS on a ``FakeCore``, PFS driving Z to its offset's plane.
+
+    Built here and not imported from ``tests/unit/test_mm_autofocus``: a module of
+    ``tests/`` is collected before ``tests/unit`` is on the path. No turret, so the
+    plate is moved into no objective's frame.
+    """
+    core = FakeCore(
+        [
+            FakeDevice("ZDrive", DeviceType.Stage),
+            FakeDevice("PFS", DeviceType.AutoFocus),
+            FakeDevice("PFSOffset", DeviceType.Stage),
+            FakeDevice("XYStage", DeviceType.XYStage),
+            FakeDevice("Camera-1", DeviceType.Camera),
+        ],
+        camera="Camera-1",
+        xy_stage="XYStage",
+        focus="ZDrive",
+        autofocus="PFS",
+    )
+    profile = Profile(
+        microscope=MicroscopeSection(name="ti2e-fake"),
+        safety=SafetySection.model_validate(
+            {"max_z_jog_um": 50.0, "max_engage_excursion_um": 50.0}
+        ),
+        autofocus=AutofocusSection.model_validate({"engage_drives_z_to_offset": True}),
+    )
+    return core, Microscope.from_core(cast("CMMCorePlus", core), profile)
+
+
+def test_goto_well_leaves_z_where_pfs_held_it_when_the_next_wells_plane_lies_60_um_higher(
+    tmp_path: Path,
+) -> None:
+    """F11's two wells on the Ti2-E fake: Z does not follow PFS over the wall (FM-223).
+
+    The fake drives Z only at a locked read, so the test reads once more after the
+    move: without the switch-off, that read moved Z to ``Z0 + 60.00`` (measured
+    in #454's plan).
+    """
+    core, microscope = _ti2_stand()
+    try:
+        _seed(tmp_path, _plate(objective=None), profile="ti2e-fake")
+        a1, a2 = _at("A1", 0.0, 0.0), _at("A2", 0.0, 0.0)
+        boundary = (a1[0] + a2[0]) / 2.0
+        microscope.require(XYStage).move_to_um(*a1)
+        z = microscope.require(ZStage)
+        z0 = z.position_um()
+        core.autofocus_target_um = lambda: (
+            z0 if core.getXPosition() < boundary else z0 + 60.0
+        )
+        af = microscope.require(Autofocus)
+        core.enableContinuousFocus(True)  # switched on at the stand
+        assert af.is_locked() is True  # seen locked in A1, where its plane is Z0
+        assert z.position_um() == pytest.approx(z0, abs=0.01)
+
+        record = _run(microscope, tmp_path, well="A2")
+        locked_after = af.is_locked()  # the read at which a carried lock drives Z
+
+        assert z.position_um() == pytest.approx(z0, abs=0.01)
+        assert locked_after is False
+        assert af.is_engaged() is False
+        assert _where(microscope) == pytest.approx(a2, abs=0.02)
+        assert _result(record).autofocus_switched_off is True
+    finally:
+        microscope.close()
