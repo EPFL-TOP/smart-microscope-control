@@ -440,7 +440,8 @@ def set_autofocus_offset(microscope: Microscope, value: float | None) -> DriveRe
     write moves no Z. One mutating call (m5 §6.1): the soft limits and the
     offset are reads. The text is the readback, and one that differs from the
     value asked says so with ``reached`` false (FM-155): the Ti2-E holds whole
-    units, so 7927.5 honestly reads 7927.
+    units, so 7927.5 honestly reads 7927. The floor read back above itself
+    also says to set a floor the device holds (m2 §12.12 D16).
 
     Raises:
         CapabilityMissingError: The stand has no autofocus.
@@ -450,6 +451,7 @@ def set_autofocus_offset(microscope: Microscope, value: float | None) -> DriveRe
         MicroscopeHaltedError: The stand is halted.
     """
     autofocus = microscope.require(Autofocus)
+    floor_asked = value is None
     if value is None:
         limits = autofocus.offset_limits_native()
         if limits is None:
@@ -466,10 +468,17 @@ def set_autofocus_offset(microscope: Microscope, value: float | None) -> DriveRe
             f"is at {_offset_text(autofocus, autofocus.offset_native())}"
         )
     if landed != value:
-        return DriveResult(
-            f"offset {_offset_text(autofocus, landed)}, although {value:g} was asked",
-            reached=False,
-        )
+        text = f"offset {_offset_text(autofocus, landed)}, although {value:g} was asked"
+        if floor_asked and landed > value:
+            # A device that rounds up: above the floor engage() takes no first
+            # lock and says to set the offset to its floor, which lands here
+            # again (m2 §12.12 D16). Below it, engage() takes one (D14).
+            text += (
+                ": above the floor, where engage() takes no first lock; set the floor "
+                "([safety] autofocus_offset_soft_limits) to a value this device holds "
+                "(m2 §12.12 D16)"
+            )
+        return DriveResult(text, reached=False)
     return DriveResult(f"offset {_offset_text(autofocus, landed)}")
 
 

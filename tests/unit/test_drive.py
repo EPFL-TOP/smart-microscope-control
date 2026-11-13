@@ -1354,6 +1354,68 @@ def test_set_autofocus_offset_whose_readback_differs_is_not_reached(
     )
 
 
+class LandsAt(NeverLocks):
+    """An offset device whose floor is 7927.5 and which lands at ``landed`` whatever is asked."""
+
+    def __init__(self, landed: float) -> None:
+        self.landed = landed
+
+    def set_offset_native(self, value: float) -> float:
+        return self.landed
+
+    def offset_unit(self) -> str:
+        return "PFSOffset units"
+
+    def offset_limits_native(self) -> tuple[float, float] | None:
+        return (7927.5, 20000.0)
+
+
+def test_set_autofocus_offset_floor_read_back_above_the_floor_says_to_set_a_floor_the_device_holds(
+    fake_microscope: Microscope,
+) -> None:
+    # A device that rounds up lands above the floor, where engage() takes no first
+    # lock and refuses with "set the offset to its floor": the circle of #349's item 7
+    # (m2 §12.12 D16).
+    fake_microscope.override(Autofocus, LandsAt(7928.0))
+
+    result = drive.set_autofocus_offset(fake_microscope, None)
+
+    assert result == DriveResult(
+        "offset 7928 PFSOffset units, although 7927.5 was asked: above the floor, "
+        "where engage() takes no first lock; set the floor ([safety] "
+        "autofocus_offset_soft_limits) to a value this device holds (m2 §12.12 D16)",
+        reached=False,
+    )
+
+
+def test_set_autofocus_offset_floor_read_back_below_the_floor_keeps_the_readback_text(
+    fake_microscope: Microscope,
+) -> None:
+    # The Ti2-E truncates: engage() takes a first lock below the floor (D14), so the
+    # text says only what the readback is.
+    fake_microscope.override(Autofocus, LandsAt(7927.0))
+
+    result = drive.set_autofocus_offset(fake_microscope, None)
+
+    assert result == DriveResult(
+        "offset 7927 PFSOffset units, although 7927.5 was asked", reached=False
+    )
+
+
+def test_set_autofocus_offset_to_a_value_read_back_higher_says_nothing_of_the_floor(
+    fake_microscope: Microscope,
+) -> None:
+    # `--to` names a value, not the floor: the clause is for the floor alone, even
+    # where the readback lies above it.
+    fake_microscope.override(Autofocus, LandsAt(7928.0))
+
+    result = drive.set_autofocus_offset(fake_microscope, 7927.5)
+
+    assert result == DriveResult(
+        "offset 7928 PFSOffset units, although 7927.5 was asked", reached=False
+    )
+
+
 def test_set_autofocus_offset_in_dry_run_says_where_it_is() -> None:
     microscope = _with_offset_limits(dry_run=True)
     try:
