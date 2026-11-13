@@ -40,6 +40,7 @@ from smc.plugins.slots import (
     MeasuredOffset,
     NisExportResult,
     ObjectiveOffsetsResult,
+    OffsetFromFocus,
     OffsetWell,
     PlannedField,
     PlateResult,
@@ -300,6 +301,18 @@ _STOP: dict[str, Any] = {
     "pfs_offset": 512.0,
     "counts": {"single": 2},
 }
+#: A stop whose offset route derived for the cells' plane (m3 §26.3): a lock at
+#: 5388, the frame 3.0 µm from it and a factor of 112.6 give 5050 (5050.2, rounded).
+_OFFSET_FROM_FOCUS: dict[str, Any] = {
+    "lock_offset": 5388.0,
+    "dz_um": -3.0,
+    "offset_per_um": 112.6,
+}
+_STOP_DERIVED: dict[str, Any] = {
+    **_STOP,
+    "pfs_offset": 5050.0,
+    "offset_from_focus": _OFFSET_FROM_FOCUS,
+}
 _ROUTE: dict[str, Any] = {
     "assumed": [],
     "objective": "Nikon 40X Plan Fluor ELWD",
@@ -307,7 +320,7 @@ _ROUTE: dict[str, Any] = {
     "image_shape_px": [1200, 1412],
     "fov_um": [388.3, 330.0],
     "labels": ["single"],
-    "positions": [_STOP],
+    "positions": [_STOP, {**_STOP_DERIVED, "order": 1}],
     "uncovered": {"A1": 0},
     "distance_um": 9000.0,
     "travel_s": 1.5,
@@ -470,6 +483,10 @@ SAMPLES: dict[type[BaseModel], Sample] = {
         {**_DENSITY_WELL, "area_mm2": 0.0, "counts": {}, "per_mm2": None},
     ),
     DensityResult: (_DENSITY, {**_DENSITY, "wells": []}),
+    OffsetFromFocus: (_OFFSET_FROM_FOCUS, _OFFSET_FROM_FOCUS),
+    # The stop's own sample stays the plain one: a derived stop with no
+    # `pfs_offset` is refused, which the generic "unknown is None" test below
+    # would try. The derived stop is in `_ROUTE`, so every generic check meets it.
     RoutePosition: (_STOP, {**_STOP, "z_um": None, "pfs_offset": None}),
     RouteResult: (
         _ROUTE,
@@ -1164,6 +1181,75 @@ def test_route_to_useq_keeps_the_route_order_and_an_unknown_z() -> None:
     assert RouteResult.model_validate({**_ROUTE, "positions": []}).to_useq() == ()
 
 
+def test_a_stop_without_an_offset_from_focus_dumps_without_the_key() -> None:
+    # m3 §26.3: a route from a scan without the focus step is written exactly as
+    # before the field existed, so an older smc still reads it (its model refuses
+    # a key it does not know, FM-107). Nested in a result too, and in every dump.
+    stop = RoutePosition.model_validate(_STOP)
+    assert stop.offset_from_focus is None
+    for dump in (
+        stop.model_dump(),
+        stop.model_dump(mode="json"),
+        json.loads(stop.model_dump_json()),
+    ):
+        assert set(dump) == set(_STOP)
+    # An explicit None is the same stop, and the same dump.
+    assert RoutePosition.model_validate({**_STOP, "offset_from_focus": None}) == stop
+    route = RouteResult.model_validate({**_ROUTE, "positions": [_STOP, _STOP_DERIVED]})
+    plain, derived = route.model_dump(mode="json")["positions"]
+    assert set(plain) == set(_STOP)
+    assert derived["offset_from_focus"] == _OFFSET_FROM_FOCUS
+    assert RouteResult.model_validate(route.model_dump(mode="json")) == route
+    assert set(json.loads(route.model_dump_json())["positions"][0]) == set(_STOP)
+
+
+def test_an_offset_from_focus_needs_a_pfs_offset_and_a_non_zero_factor() -> None:
+    # A derivation with no offset to be the cells' plane's, and a factor of zero
+    # (which makes every distance worth nothing), are records nobody may write.
+    with pytest.raises(ValidationError) as raised:
+        RoutePosition.model_validate({**_STOP_DERIVED, "pfs_offset": None})
+    (error,) = raised.value.errors()
+    assert error["type"] == "value_error"
+    assert "offset_from_focus" in error["msg"]
+    assert "pfs_offset" in error["msg"]
+    for zero in (0.0, -0.0):
+        sample = {**_OFFSET_FROM_FOCUS, "offset_per_um": zero}
+        assert _error_types(OffsetFromFocus, sample) == ["value_error"]
+        with pytest.raises(ValidationError, match="offset_per_um"):
+            RoutePosition.model_validate({**_STOP_DERIVED, "offset_from_focus": sample})
+    # A negative factor is a sign, which the record keeps.
+    negative = OffsetFromFocus.model_validate(
+        {**_OFFSET_FROM_FOCUS, "offset_per_um": -112.6}
+    )
+    assert negative.offset_per_um == -112.6
+
+
+class _OlderStop(SlotValue):
+    """``RoutePosition`` as it was before ``offset_from_focus``: what an older smc reads a route with."""
+
+    order: int
+    well: str
+    name: str
+    x_um: float
+    y_um: float
+    z_um: float | None
+    pfs_offset: float | None
+    counts: dict[str, int]
+
+
+def test_a_route_with_a_derived_stop_is_refused_by_a_model_without_the_field() -> None:
+    # FM-107, as intended (m3 §26.3): an older smc must not load a route whose
+    # offsets it cannot say were derived, and write it back without that.
+    route = RouteResult.model_validate({**_ROUTE, "positions": [_STOP, _STOP_DERIVED]})
+    plain, derived = route.model_dump(mode="json")["positions"]
+    _OlderStop.model_validate(plain)
+    with pytest.raises(ValidationError) as raised:
+        _OlderStop.model_validate(derived)
+    assert [(e["type"], e["loc"]) for e in raised.value.errors()] == [
+        ("extra_forbidden", ("offset_from_focus",))
+    ]
+
+
 def _imports_of(path: Path) -> set[str]:
     """Every module a source file imports, by its dotted name.
 
@@ -1227,6 +1313,7 @@ SLOTS_MAP = {
     "MeasuredOffset",
     "NisExportResult",
     "ObjectiveOffsetsResult",
+    "OffsetFromFocus",
     "OffsetWell",
     "PlannedField",
     "PlateResult",

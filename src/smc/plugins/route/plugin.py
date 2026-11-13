@@ -1,11 +1,13 @@
 """``route`` chooses the fields that hold the most cells of the wanted classes, then the shortest path through them (m3 §11).
 
 The pure part (the candidate lattice, the greedy that counts each cell once, the
-nearest-neighbour-then-2-opt ordering) is ``algorithm.py``. This reads the three
-records upstream and moves nothing, so a dry run is no different from any other,
-and it reads the stand only to ask the turret which objectives it has and what
-the profile says their pixel sizes are. What it decides, because the positions
-that NIS-Elements will visit rest on it:
+nearest-neighbour-then-2-opt ordering) is ``algorithm.py``, and the stop's Z and
+autofocus offset are ``focus.py``'s. This reads the three records upstream and
+moves nothing, so a dry run is no different from any other, and it reads the
+stand only to ask the turret which objectives it has and what the profile says
+their pixel sizes are, and, for the scan's own objective, the profile's autofocus
+offset factors and offset limits (a profile read, not a device's). What it
+decides, because the positions that NIS-Elements will visit rest on it:
 
 * **The scan's camera is the camera.** The matrix and the frame's shape are the
   scan's, so a cell is in a field exactly as the scan saw it (FM-124); the plan's
@@ -23,6 +25,15 @@ that NIS-Elements will visit rest on it:
   the offset is one that nobody read locked on this sample (FM-118), which the
   export would hand on as the operator's. A well whose every frame is unlocked
   gives ``None`` for both, and ``assumed`` counts the stops the rule changed.
+* **The offset names the plane the frame was taken at** (m3 §26). A scan with the focus
+  on the cells takes its frames at the cells' plane with the autofocus off, and records
+  the offset of the lock it swept from. Handed on, that offset would have NIS-Elements
+  engage the autofocus at the plane the autofocus held, not the cells'. So the stop's
+  ``pfs_offset`` is the lock's plus the frame's distance from it times the profile's
+  factor for the scan's objective, with ``offset_from_focus`` saying so; or none, with
+  ``assumed`` saying why (no objective recorded, no factor, an offset outside the
+  profile's limits, a distance the scan could not have swept), and the Z kept. Never a
+  clamp: ``focus.py`` has each bound.
 * **A size that is not a number is not a size** (FM-104): a pixel size of 0 means
   "not measured", infinity is above 0, and either is refused, not defaulted.
 * **The lattice is derived from a value that may be wrong** (FM-121): a scan matrix
@@ -55,6 +66,7 @@ from smc.plugins.route.algorithm import (
     order_route,
     path_length_um,
 )
+from smc.plugins.route.focus import StopFocus, focus_assumed, stop_focus
 from smc.plugins.slots import (
     Cell,
     CellsResult,
@@ -233,6 +245,8 @@ class RoutePlugin:
         total_wanted = 0
         nearest_unlocked = 0
         without_candidate = 0
+        factors, offset_limits = _offset_profile(microscope, imaging)
+        focuses: list[StopFocus] = []
         for done, well in enumerate(scanned):
             ctx.raise_if_stopped()
             wanted = sum(
@@ -259,6 +273,13 @@ class RoutePlugin:
                         if imaging.other
                         else _nearest_frame(scan, candidates, field)
                     )
+                    focus = stop_focus(
+                        frame,
+                        objective=scan.objective,
+                        factors=factors,
+                        offset_limits=offset_limits,
+                    )
+                    focuses.append(focus)
                     if not imaging.other and len(candidates) < len(taken):
                         # The rule changed this stop's answer only when the nearest
                         # of all the well's frames is the unlocked one.
@@ -274,9 +295,10 @@ class RoutePlugin:
                             name=f"{well}_r{k:03d}",
                             x_um=field.x_um,
                             y_um=field.y_um,
-                            z_um=frame.z_um if frame is not None else None,
-                            pfs_offset=frame.pfs_offset if frame is not None else None,
+                            z_um=focus.z_um,
+                            pfs_offset=focus.pfs_offset,
                             counts=dict(field.counts),
+                            offset_from_focus=focus.derived,
                         )
                     )
                 previous = (positions[-1].x_um, positions[-1].y_um)
@@ -330,6 +352,12 @@ class RoutePlugin:
                     )
                     if nearest_unlocked
                     else ()
+                ),
+                *focus_assumed(
+                    focuses,
+                    total=len(positions),
+                    objective=scan.objective,
+                    offset_limits=offset_limits,
                 ),
             ),
         )
@@ -446,6 +474,26 @@ def _imaging_with(
             f"z_um and pfs_offset are unknown for {wanted}: the scan's were "
             f"measured with {scan.objective}",
         ),
+    )
+
+
+def _offset_profile(
+    microscope: Microscope, imaging: _Imaging
+) -> tuple[dict[str, float], tuple[float, float] | None]:
+    """The profile's autofocus offset factors and offset limits: what turns a frame's distance into an offset (m3 §26.4).
+
+    Read once, and only when the route images with the scan's objective: for
+    another there is no frame to read and nothing to convert. The factors are
+    the profile's alone (the ``Autofocus`` capability has no read of them, and
+    ``focus_by_um`` that uses them moves), read as ``goto-well`` reads the
+    holder's centre. Nothing is asked of a device.
+    """
+    if imaging.other:
+        return {}, None
+    profile = microscope.profile
+    return (
+        dict(profile.autofocus.offset_per_um),
+        profile.safety.autofocus_offset_soft_limits,
     )
 
 

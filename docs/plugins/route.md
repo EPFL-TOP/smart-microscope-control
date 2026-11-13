@@ -7,9 +7,11 @@ list of stage positions that the second, high-magnification pass visits.
 
 It reads the `scan-plan`, `scan` and `cells` slots (and `timings` when there is
 one), and moves nothing. It asks the stand for nothing but the objective turret's
-labels and the profile's pixel sizes, and only when you ask for another objective
-than the scan's. The design is [`m3-plugins.md`](../design/m3-plugins.md) §11; this
-page is how to use it.
+labels and the profile's pixel sizes (only when you ask for another objective than
+the scan's), and, for the scan's own objective, two things the **profile** says: its
+`[autofocus.offset_per_um]` factors and its `autofocus_offset_soft_limits`. No device
+is read for them. The design is [`m3-plugins.md`](../design/m3-plugins.md) §11 and,
+for the stop's offset, §26; this page is how to use it.
 
 ## Running it
 
@@ -67,6 +69,42 @@ re-run starts over and gives the same route (nothing in it is random).
    has no such frame (no frame at all, or only unlocked ones), or when you image
    with another objective (below).
 
+   **The stop's offset names the cells' plane, when the scan focused on the cells.** A
+   frame of a scan that ran [`focus-on-cells`](focus-on-cells.md) was taken at the
+   cells' plane with the autofocus off: its `z_um` is that plane, and its `pfs_offset`
+   is the offset of the lock the sweep was centred on, so it names the plane PFS held,
+   `dz_um` below or above the cells (`dz_um` is in the frame's `cell_focus`). Handed on
+   as it is, the export would have NIS-Elements engage PFS at that plane, not the
+   cells'. So, for a frame that is `locked`, has a `pfs_offset` and a `cell_focus`
+   whose `dz_um` is not 0, the stop gets
+
+   ```text
+   pfs_offset = round(lock offset + dz_um x factor)
+   ```
+
+   where the factor is the profile's `offset_per_um` **for the scan's objective**, by
+   its exact label, sign included, and the result is a whole number (the Ti2-E holds
+   whole units). The stop's `offset_from_focus` records the three numbers it came from,
+   so a reader can tell a derived offset from a reading. `z_um` is never changed: it is
+   the readback at the cells' plane. Every other frame is as the scan recorded it, and
+   needs no factor: a scan without the step, a field that got none, an autofocus that
+   was `off` or `none`, a sweep that found no peak or a peak on the centre (`dz_um` is
+   0).
+
+   Where it cannot be derived the stop has **no** `pfs_offset` (and no
+   `offset_from_focus`), keeps its `z_um`, and `assumed` says why. Nothing is ever
+   clamped: a clamped offset would be a plane nobody chose, written where PFS engages.
+   The bounds, each a stop without an offset:
+
+   - the scan recorded **no objective**, or the profile has **no factor for it** (or
+     one that is zero or not a number): a factor measured at one objective is never used
+     for another;
+   - the derived offset lies **outside the profile's `autofocus_offset_soft_limits`**,
+     when it has them (the limits themselves are allowed). They are the range smc's
+     own guards accept, and NIS-Elements has none;
+   - the frame's `dz_um` is **more than 50 µm** (the largest range a focus sweep can
+     have) or not a number: the record cannot be right, run `scan` again.
+
 A field holds the cells inside its frame, the edge included. A cell within a rounding
 error of an edge (a millionth of a pixel) may fall on either side, and it is counted
 once whichever it is: the count and the choice use the same arithmetic.
@@ -81,7 +119,7 @@ The slot `route` holds a `RouteResult` (`smc.plugins.slots`):
 
 | Field | Meaning |
 |---|---|
-| `positions` | The stops in route order: `order` (in the whole route), `well`, `name` (`<well>_r<k>`, `k` from 0 along the well's route, three digits), `x_um`, `y_um`, `z_um` and `pfs_offset` (both from the nearest frame that was not `unlocked`, step 4; `null` when there is none), and `counts` (**every** label asked for, zeros included). |
+| `positions` | The stops in route order: `order` (in the whole route), `well`, `name` (`<well>_r<k>`, `k` from 0 along the well's route, three digits), `x_um`, `y_um`, `z_um` and `pfs_offset` (both from the nearest frame that was not `unlocked`, step 4; `null` when there is none; the offset of the cells' plane, derived, when the scan focused on the cells), `counts` (**every** label asked for, zeros included), and `offset_from_focus` (`lock_offset`, `dz_um` and `offset_per_um`, only on a stop whose `pfs_offset` was derived; the key is absent otherwise, so a route from a scan without the focus step is written as it always was). |
 | `uncovered` | Well to the number of wanted cells that no stop holds. **Every well the cells stage scanned** is a key, zeros included, in the plan's order; a well it did not scan is absent. |
 | `distance_um` | The length of the whole route, between wells included. |
 | `travel_s` | The sum of `timings.move_ms` over the same legs; `null` when no `timing` stage ran. Unknown is not zero. |
@@ -110,7 +148,9 @@ For another objective the result says, in `assumed`:
   not image the same point at the same stage position, and nothing here knows by how
   much;
 - `z_um and pfs_offset are unknown for <objective>: the scan's were measured with
-  <scan objective>`, and they are `null` on every stop.
+  <scan objective>`, and they are `null` on every stop. There is no frame to read, so
+  there is nothing to derive an offset from, and none of the offset lines of *What it
+  assumes* appears.
 
 ## What it assumes
 
@@ -136,6 +176,42 @@ It is one line (shown wrapped here), `m` may be 0 and it still says `0 have none
 A stop whose nearest frame was not unlocked is not counted, whether or not a farther
 frame was; a scan without unlocked frames adds no line; and for **another objective**
 it never appears, because every stop has no Z and no offset already.
+
+After it, a route from a scan that focused on the cells adds one line for each of the
+following that applies, in this order (`<n> of <total> stops` each; shown wrapped):
+
+- **derived**: `carry a pfs_offset derived for the cells' plane, not read with PFS
+  locked there: their frame was taken <lo>…<hi> µm from the plane PFS held, and the
+  offset is the lock's plus that distance times the profile's factor (one number for a
+  factor that varies with the offset), rounded to a whole unit; <factor> offset units
+  per µm for <objective>`. `<lo>…<hi>` are the smallest and largest `dz_um` of the
+  derived stops. **The factor is one number for something that falls as the offset
+  rises**: at the 40× it was measured at 117.8, 116.1 and 112.6 per interval between
+  offsets 0 and 6973, and the smallest is entered, so within that range a derived
+  distance undershoots by up to 4.4 % (0.22 µm for a 5 µm sweep). Above 6973 it may
+  overshoot, by an amount nobody measured, and the Ti2-E's own 40× offset is 17794.
+- **no objective**: `have no pfs_offset: their frame was taken away from the plane PFS
+  held (the focus on the cells) and the scan recorded no objective, so the profile's
+  offset_per_um factor cannot be looked up; they keep z_um, the cells' plane`;
+- **no factor**: `have no pfs_offset: ... and the profile has no
+  [autofocus.offset_per_um] factor for the scan's objective; they keep z_um, the
+  cells' plane (objective: <objective>)`. The demo stand has no factor, so a demo scan
+  gets this line;
+- **outside the limits**: `have no pfs_offset: the offset derived for the cells' plane
+  (<first> for the first) lies outside the profile's autofocus_offset_soft_limits
+  [<a>, <b>]; they keep z_um, the cells' plane`;
+- **implausible**: `have no pfs_offset: their frame's plane is not within 50 µm of the
+  plane PFS held (the focus sweep's largest range), so the record cannot be right; run
+  scan again; they keep z_um`;
+- **no peak**: `took their frame from a field whose focus sweep found no peak (flat,
+  at an edge or two peaks): its plane is the sweep's centre, not the cells' plane`.
+  Such a stop is as the scan recorded it, and a number cannot say that the plane was
+  not found, so it is counted. It is counted whatever became of its offset.
+
+A scan **without the focus step** (or one whose steps are all at the lock's plane) adds
+none of these lines and no `offset_from_focus`: the route is what it was. The objective's
+label is last in each line that has one, so the plate page's card, which cuts a line at
+600 characters, never cuts what a line says.
 
 For a camera that is turned by the stage, the lattice's step and `fov_um` use the
 bounding box of the turned frame, as `scan-plan` does, so the step is larger than a
@@ -402,3 +478,11 @@ Nothing in this page was run on a microscope.
   rests on, and **the offset between the two objectives**, which is not applied.
 - **That NIS-Elements visits the positions as they are** (#196).
 - **The time on the microscope PC's CPU.**
+- **The stop's offset at the Ti2-E, 40×, after a scan with the focus on the cells** (m3
+  §26.9): load the export in NIS-Elements with the objective clear of the plate for the
+  first stop and look at one derived stop (it engages PFS at the offset: the image
+  should be the cells' plane, as the scan's frame was); the factor at the offsets the
+  stops use (change the offset by a known distance under lock near theirs and read Z:
+  the 4.4 % above, and the offsets beyond 6973); that NIS-Elements accepts both flags
+  set and takes `dPFSOffset` the way `PFSOffset` is written; and whether a derived plane
+  lands within the cells' depth of field of the scan's frame, per well and per plate.

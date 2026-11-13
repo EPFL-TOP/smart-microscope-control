@@ -40,7 +40,10 @@ from smc.plugins.slots import (
     CellsFile,
     CellsResult,
     FailedField,
+    FieldFocus,
     FocusState,
+    FocusSweep,
+    OffsetFromFocus,
     PlateResult,
     RoutePosition,
     RouteResult,
@@ -171,6 +174,7 @@ def _seed(
     scan_objective: str | None = IN_PLACE,
     failed_wells: tuple[str, ...] = (),
     focus_of: Mapping[tuple[str, int], FocusState] | None = None,
+    cell_focus_of: Mapping[tuple[str, int], FieldFocus] | None = None,
     file_token: str = "t1",
 ) -> Seed:
     """The plan, the scan and the cells of ``wells``, in ``tmp_path/run.json``.
@@ -187,6 +191,11 @@ def _seed(
     field index)``; every other frame is ``locked``. A frame that is ``off`` or
     ``none`` has no autofocus offset, as the scan records none when it did not use the
     autofocus; ``locked`` and ``unlocked`` keep theirs.
+
+    ``cell_focus_of`` gives the focus step (m3 §21.5) of the frames it names, keyed the
+    same way; every other frame has none, as a scan without the step records. A frame's
+    ``pfs_offset`` is the lock's, whatever its step says, and its ``z_um`` the cells'
+    plane: the seed does not derive anything.
     """
     path = tmp_path / "run.json"
     plate = PlateResult(
@@ -256,6 +265,7 @@ def _seed(
                 focus=focus,
                 pfs_offset=None if focus in ("off", "none") else 2000.0 + 10.0 * k,
                 t_s=float(k),
+                cell_focus=(cell_focus_of or {}).get((field.well, field.index)),
             )
         )
     scan = ScanResult(
@@ -1208,6 +1218,440 @@ def test_another_objective_adds_no_unlocked_line(
         f"the field of {IN_PLACE} is the scan's scaled by the profile's pixel sizes",
         "no offset between the two objectives is applied",
         f"z_um and pfs_offset are unknown for {IN_PLACE}: the scan's were measured with {FORTY}",
+    )
+
+
+# ------------------------------------------ the cells' plane's offset (m3 §26, #392)
+#
+# A frame taken at the cells' plane with the autofocus off records the lock's offset and
+# its distance from the lock's plane. The route turns them into the offset of the cells'
+# plane, or into none. The numbers below are written here from the seed's frames (a lock
+# of 2000 + 10 k) and the 40X's factor, never read from the result (FM-124).
+
+FACTOR = 112.6  # the 40X's offset units per µm, as the profile holds it
+#: The distance of the frame of field ``i`` of every well from the lock's plane, in µm.
+DZ_OF_INDEX = {0: -3.0, 1: 2.7, 2: 1.35, 3: -2.95}
+#: ``round(dz * FACTOR)`` of each distance, by hand: 337.8, 304.02, 332.17 and 152.01.
+#: A stop's offset is its frame's lock plus it, in whole units.
+DZ_STEP = {-3.0: -338.0, 2.7: 304.0, -2.95: -332.0, 1.35: 152.0}
+BASE_LINE = (
+    "the route minimises the Euclidean distance between fields; whether the "
+    "stage's move time follows it is not measured"
+)
+
+
+def _step(dz_um: float, *, source: str = "well", outcome: str = "peak") -> FieldFocus:
+    """A focus step: a distance from the lock's plane, from a sweep of three planes or a well's."""
+    sweep = None
+    if source == "swept":
+        sweep = FocusSweep(
+            score="brenner",
+            centre_um=1000.0,
+            z_um=(999.0, 1000.0, 1001.0),
+            scores=(0.1, 0.3, 0.2),
+            outcome=outcome,  # type: ignore[arg-type]
+            best_z_um=1000.2 if outcome == "peak" else None,
+        )
+    return FieldFocus(
+        source=source,  # type: ignore[arg-type]
+        sweep=sweep,
+        dz_um=dz_um,
+        frame_score=0.4,
+        duration_s=0.3,
+    )
+
+
+def _steps(
+    wells: Sequence[str] = WELLS, dz_of_index: Mapping[int, float] = DZ_OF_INDEX
+) -> dict[tuple[str, int], FieldFocus]:
+    """A step for every frame of ``wells`` (a well has at most four fields: a 2 x 2 grid)."""
+    return {(well, i): _step(dz) for well in wells for i, dz in dz_of_index.items()}
+
+
+def _stand_with(
+    microscope: Microscope,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    factors: dict[str, float],
+    limits: tuple[float, float] | None = None,
+) -> None:
+    """The stand as if its profile had these offset factors and these offset limits.
+
+    The demo has neither: a copy of its profile that does is read back by the next call.
+    """
+    profile = microscope.profile
+    copy = profile.model_copy(
+        update={
+            "autofocus": profile.autofocus.model_copy(
+                update={"offset_per_um": factors}
+            ),
+            "safety": profile.safety.model_copy(
+                update={"autofocus_offset_soft_limits": limits}
+            ),
+        }
+    )
+    monkeypatch.setattr(microscope, "profile", copy)
+
+
+def _source_frame(seed: Seed, position: RoutePosition) -> ScanFrame:
+    """The frame a stop takes everything from: the nearest of its well that was not unlocked (§11)."""
+    candidates = [f for f in _frames_of(seed, position.well) if f.focus != "unlocked"]
+    return _nearest_of(candidates, position)
+
+
+def _derived_line(
+    n: int, total: int, lo: float, hi: float, objective: str, factor: float = FACTOR
+) -> str:
+    """§26.6's line for the stops that carry a derived offset, spelled out."""
+    return (
+        f"{n} of {total} stops carry a pfs_offset derived for the cells' plane, not "
+        f"read with PFS locked there: their frame was taken {lo:+.2f}…{hi:+.2f} µm "
+        f"from the plane PFS held, and the offset is the lock's plus that distance "
+        f"times the profile's factor (one number for a factor that varies with the "
+        f"offset), rounded to a whole unit; {factor:g} offset units per µm for "
+        f"{objective}"
+    )
+
+
+def _no_factor_line(n: int, total: int, objective: str) -> str:
+    return (
+        f"{n} of {total} stops have no pfs_offset: their frame was taken away from "
+        f"the plane PFS held (the focus on the cells) and the profile has no "
+        f"[autofocus.offset_per_um] factor for the scan's objective; they keep z_um, "
+        f"the cells' plane (objective: {objective})"
+    )
+
+
+def _no_objective_line(n: int, total: int) -> str:
+    return (
+        f"{n} of {total} stops have no pfs_offset: their frame was taken away from "
+        f"the plane PFS held (the focus on the cells) and the scan recorded no "
+        f"objective, so the profile's offset_per_um factor cannot be looked up; they "
+        f"keep z_um, the cells' plane"
+    )
+
+
+def _outside_line(n: int, total: int, first: float, low: float, high: float) -> str:
+    return (
+        f"{n} of {total} stops have no pfs_offset: the offset derived for the "
+        f"cells' plane ({first:.0f} for the first) lies outside the profile's "
+        f"autofocus_offset_soft_limits [{low:g}, {high:g}]; they keep z_um, the "
+        f"cells' plane"
+    )
+
+
+def _no_peak_line(n: int, total: int) -> str:
+    return (
+        f"{n} of {total} stops took their frame from a field whose focus sweep found "
+        f"no peak (flat, at an edge or two peaks): its plane is the sweep's centre, "
+        f"not the cells' plane"
+    )
+
+
+def test_a_cell_focused_frames_offset_names_the_cells_plane_in_the_stop(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every stop's frame was taken 3 µm below, 2.7 above, ... the plane PFS held: the stop's offset is that plane's, in whole units."""
+    seed = _seed(tmp_path, scan_objective=FORTY, cell_focus_of=_steps())
+    _stand_with(
+        demo_microscope, monkeypatch, factors={FORTY: FACTOR}, limits=(0.0, 20000.0)
+    )
+
+    result = _result(_run(demo_microscope, tmp_path))
+
+    assert result.positions
+    distances = []
+    for p in result.positions:
+        frame = _source_frame(seed, p)
+        assert frame.pfs_offset is not None
+        dz = DZ_OF_INDEX[frame.index]
+        distances.append(dz)
+        # The lock's offset moved by the distance times the factor: the sign is the
+        # factor's, so a frame below the lock's plane (dz < 0) has the smaller offset.
+        assert p.pfs_offset == frame.pfs_offset + DZ_STEP[dz]
+        assert p.pfs_offset is not None
+        assert p.pfs_offset.is_integer()
+        assert abs(p.pfs_offset - (frame.pfs_offset + dz * FACTOR)) <= 0.5
+        assert p.offset_from_focus == OffsetFromFocus(
+            lock_offset=frame.pfs_offset, dz_um=dz, offset_per_um=FACTOR
+        )
+        # The Z is the cells' plane's readback, and the route does not touch it (D7).
+        assert p.z_um == frame.z_um
+    # Several kinds of frame supply a stop (the seed's nearest frames never include
+    # field 2's), so the test sees a distance of each sign, and the one whose product
+    # rounds up (a lock of 2000 + 10 k less 332.17 is 1667.83 + 10 k: 1668 + 10 k, where
+    # truncating would say 1667 + 10 k), so that the rounding is seen at the stop.
+    assert len(set(distances)) >= 3
+    assert min(distances) < 0.0 < max(distances)
+    assert -2.95 in distances
+    total = len(result.positions)
+    assert result.assumed == (
+        BASE_LINE,
+        _derived_line(total, total, min(distances), max(distances), FORTY),
+    )
+    # The record says it too, in what the run document holds and not in a model read
+    # back from it (the key is left out when empty, so it must be there when not).
+    raw = _stored(tmp_path).result
+    assert raw is not None
+    stop = raw["positions"][0]
+    assert stop["offset_from_focus"] == {
+        "lock_offset": result.positions[0].offset_from_focus.lock_offset,  # type: ignore[union-attr]
+        "dz_um": DZ_OF_INDEX[_source_frame(seed, result.positions[0]).index],
+        "offset_per_um": FACTOR,
+    }
+    assert stop["pfs_offset"] == result.positions[0].pfs_offset
+
+
+def test_the_derived_offset_follows_the_nearest_frame_not_the_wells_first(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed = _seed(tmp_path, scan_objective=FORTY, cell_focus_of=_steps())
+    _stand_with(demo_microscope, monkeypatch, factors={FORTY: FACTOR})
+
+    result = _result(_run(demo_microscope, tmp_path))
+
+    for p in result.positions:
+        assert p.offset_from_focus is not None
+        assert p.offset_from_focus.lock_offset == _source_frame(seed, p).pfs_offset
+    # More than one frame supplies an offset in A1: it is not the well's first frame's.
+    first = _frames_of(seed, "A1")[0]
+    locks = [
+        p.offset_from_focus.lock_offset
+        for p in _positions_of(result, "A1")
+        if p.offset_from_focus is not None
+    ]
+    assert len(set(locks)) > 1
+    assert any(lock != first.pfs_offset for lock in locks)
+
+
+@pytest.mark.parametrize(
+    "factors", [{}, {FORTY: FACTOR}], ids=["no-entry", "another-objectives-entry"]
+)
+def test_without_a_factor_the_stops_have_no_offset_keep_z_and_the_route_says_why(
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    factors: dict[str, float],
+) -> None:
+    """The demo has no factor at all; a factor measured at the 40X is not the 10X's (FM-214)."""
+    seed = _seed(tmp_path, cell_focus_of=_steps())  # the scan's objective: IN_PLACE
+    _stand_with(demo_microscope, monkeypatch, factors=factors)
+
+    result = _result(_run(demo_microscope, tmp_path))
+
+    assert result.positions
+    for p in result.positions:
+        frame = _source_frame(seed, p)
+        assert (p.z_um, p.pfs_offset, p.offset_from_focus) == (frame.z_um, None, None)
+    total = len(result.positions)
+    assert result.assumed == (BASE_LINE, _no_factor_line(total, total, IN_PLACE))
+    # The record has no key for what it does not say.
+    raw = _stored(tmp_path).result
+    assert raw is not None
+    assert all("offset_from_focus" not in stop for stop in raw["positions"])
+
+
+def test_the_demo_stand_has_no_factor_and_no_offset_limits(
+    demo_microscope: Microscope,
+) -> None:
+    # The premise of the test above and of every other that patches the profile.
+    assert demo_microscope.profile.autofocus.offset_per_um == {}
+    assert demo_microscope.profile.safety.autofocus_offset_soft_limits is None
+
+
+def test_a_scan_that_recorded_no_objective_gives_no_offset(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed = _seed(tmp_path, scan_objective=None, cell_focus_of=_steps())
+    _stand_with(demo_microscope, monkeypatch, factors={FORTY: FACTOR, IN_PLACE: FACTOR})
+
+    result = _result(_run(demo_microscope, tmp_path))
+
+    assert result.objective is None
+    assert result.positions
+    for p in result.positions:
+        frame = _source_frame(seed, p)
+        assert (p.z_um, p.pfs_offset, p.offset_from_focus) == (frame.z_um, None, None)
+    total = len(result.positions)
+    assert result.assumed == (BASE_LINE, _no_objective_line(total, total))
+
+
+def test_an_offset_outside_the_profiles_limits_is_left_out_and_said(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Locks of 2000 to 2150 and steps of -338 to +304: limits of 1750 and 2400 let some through and refuse others."""
+    low, high = 1750.0, 2400.0
+    seed = _seed(tmp_path, scan_objective=FORTY, cell_focus_of=_steps())
+    _stand_with(
+        demo_microscope, monkeypatch, factors={FORTY: FACTOR}, limits=(low, high)
+    )
+
+    result = _result(_run(demo_microscope, tmp_path))
+
+    kept: list[float] = []
+    refused: list[float] = []  # the offsets that were refused, in the route's order
+    for p in result.positions:
+        frame = _source_frame(seed, p)
+        assert frame.pfs_offset is not None
+        dz = DZ_OF_INDEX[frame.index]
+        wanted = frame.pfs_offset + DZ_STEP[dz]
+        assert p.z_um == frame.z_um  # a refused offset keeps the Z
+        if low <= wanted <= high:
+            assert p.pfs_offset == wanted
+            assert p.offset_from_focus is not None
+            kept.append(dz)
+        else:
+            # Left out, never clamped to the limit that it broke.
+            assert (p.pfs_offset, p.offset_from_focus) == (None, None)
+            refused.append(wanted)
+    assert kept
+    assert refused  # the test would prove nothing without both kinds
+    total = len(result.positions)
+    assert result.assumed == (
+        BASE_LINE,
+        _derived_line(len(kept), total, min(kept), max(kept), FORTY),
+        _outside_line(len(refused), total, refused[0], low, high),
+    )
+
+
+def test_a_sweep_that_found_no_peak_is_counted_and_keeps_its_plane(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A2's sweeps found nothing (flat, at the centre): its stops are counted, and keep the lock's offset and Z as recorded."""
+    steps = _steps(("A1", "B2", "B1"))
+    steps.update(
+        {("A2", i): _step(0.0, source="swept", outcome="flat") for i in range(4)}
+    )
+    seed = _seed(tmp_path, scan_objective=FORTY, cell_focus_of=steps)
+    _stand_with(demo_microscope, monkeypatch, factors={FORTY: FACTOR})
+
+    result = _result(_run(demo_microscope, tmp_path))
+
+    flat = _positions_of(result, "A2")
+    others = [p for p in result.positions if p.well != "A2"]
+    assert flat
+    assert others
+    for p in flat:
+        frame = _source_frame(seed, p)
+        assert (p.z_um, p.pfs_offset, p.offset_from_focus) == (
+            frame.z_um,
+            frame.pfs_offset,
+            None,
+        )
+    distances = [DZ_OF_INDEX[_source_frame(seed, p).index] for p in others]
+    total = len(result.positions)
+    assert result.assumed == (
+        BASE_LINE,
+        _derived_line(len(others), total, min(distances), max(distances), FORTY),
+        _no_peak_line(len(flat), total),
+    )
+
+
+@pytest.mark.parametrize("steps", ["none", "at-the-centre"])
+def test_a_scan_without_the_focus_step_is_routed_exactly_as_before(
+    demo_microscope: Microscope,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    steps: str,
+) -> None:
+    """No step, or steps at the lock's plane (no distance to convert): the stops are the scan's, key and line included."""
+    focus = (
+        None if steps == "none" else _steps(dz_of_index=dict.fromkeys(range(4), 0.0))
+    )
+    seed = _seed(tmp_path, scan_objective=FORTY, cell_focus_of=focus)
+    # A factor and limits that would derive something if there were a distance.
+    _stand_with(
+        demo_microscope, monkeypatch, factors={FORTY: FACTOR}, limits=(0.0, 20000.0)
+    )
+
+    result = _result(_run(demo_microscope, tmp_path))
+
+    assert result.positions
+    for p in result.positions:
+        frame = _source_frame(seed, p)
+        assert (p.z_um, p.pfs_offset, p.offset_from_focus) == (
+            frame.z_um,
+            frame.pfs_offset,
+            None,
+        )
+    assert result.assumed == (BASE_LINE,)
+    # What the run document holds is what it held before the field existed.
+    raw = _stored(tmp_path).result
+    assert raw is not None
+    assert all(
+        set(stop)
+        == {"order", "well", "name", "x_um", "y_um", "z_um", "pfs_offset", "counts"}
+        for stop in raw["positions"]
+    )
+
+
+def test_another_objective_has_no_offset_and_no_focus_line(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scan's frames name the 40X's planes: for the 10X there is no frame to read and nothing to convert."""
+    _seed(tmp_path, scan_objective=FORTY, cell_focus_of=_steps())
+    _stand_with(
+        demo_microscope,
+        monkeypatch,
+        factors={FORTY: FACTOR, IN_PLACE: 5.9},
+        limits=(0.0, 20000.0),
+    )
+
+    result = _result(_run(demo_microscope, tmp_path, objective=IN_PLACE))
+
+    assert result.positions
+    assert all(
+        (p.z_um, p.pfs_offset, p.offset_from_focus) == (None, None, None)
+        for p in result.positions
+    )
+    assert result.assumed == (
+        BASE_LINE,
+        f"the field of {IN_PLACE} is the scan's scaled by the profile's pixel sizes",
+        "no offset between the two objectives is applied",
+        f"z_um and pfs_offset are unknown for {IN_PLACE}: the scan's were measured with {FORTY}",
+    )
+
+
+def test_an_unlocked_nearest_frame_is_still_skipped_for_a_cell_focused_one(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The offset is derived from the frame the stop takes its Z from (FM-154), never from an unlocked one's stored offset."""
+    steps = _steps()
+    _stand_with(demo_microscope, monkeypatch, factors={FORTY: FACTOR})
+    locked_dir = tmp_path / "locked"
+    locked_dir.mkdir()
+    first = _seed(locked_dir, scan_objective=FORTY, cell_focus_of=steps)
+    before = _result(_run(demo_microscope, locked_dir))
+    marked_dir = tmp_path / "marked"
+    marked_dir.mkdir()
+    seed = _seed(
+        marked_dir,
+        scan_objective=FORTY,
+        cell_focus_of=steps,
+        focus_of=_nearest_frames_of_first_stops(first, before, "unlocked"),
+    )
+
+    after = _result(_run(demo_microscope, marked_dir))
+
+    concerned = [p for p in after.positions if _nearest_was_unlocked(seed, p)]
+    assert concerned
+    for p in concerned:
+        frame = _source_frame(seed, p)
+        unlocked = _nearest_of(_frames_of(seed, p.well), p)
+        assert frame.focus == "locked"
+        assert frame.pfs_offset is not None
+        assert p.offset_from_focus is not None
+        assert p.offset_from_focus.lock_offset == frame.pfs_offset
+        assert p.offset_from_focus.lock_offset != unlocked.pfs_offset
+        assert p.pfs_offset == frame.pfs_offset + DZ_STEP[DZ_OF_INDEX[frame.index]]
+        assert p.z_um == frame.z_um
+    total = len(after.positions)
+    distances = [DZ_OF_INDEX[_source_frame(seed, p).index] for p in after.positions]
+    # The unlocked line stays where it was and the offsets' lines follow it.
+    assert after.assumed == (
+        BASE_LINE,
+        _unlocked_line(len(concerned), total, 0),
+        _derived_line(total, total, min(distances), max(distances), FORTY),
     )
 
 

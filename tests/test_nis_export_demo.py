@@ -24,7 +24,12 @@ from smc.plugins.nis_export import plugin as plugin_module
 from smc.plugins.nis_export.format import NisPosition, decode
 from smc.plugins.nis_export.plugin import NisExportParams, NisExportPlugin
 from smc.plugins.params import parse_params
-from smc.plugins.slots import NisExportResult, RoutePosition, RouteResult
+from smc.plugins.slots import (
+    NisExportResult,
+    OffsetFromFocus,
+    RoutePosition,
+    RouteResult,
+)
 from smc.run import RunDocument, StageRecord, StageStatus, write_stage
 from smc.run.files import AtomicWriteError
 
@@ -48,6 +53,7 @@ def _stop(
     y_um: float,
     z_um: float | None,
     pfs_offset: float | None,
+    offset_from_focus: OffsetFromFocus | None = None,
 ) -> RoutePosition:
     return RoutePosition(
         order=order,
@@ -58,6 +64,7 @@ def _stop(
         z_um=z_um,
         pfs_offset=pfs_offset,
         counts={"single": 1},
+        offset_from_focus=offset_from_focus,
     )
 
 
@@ -219,6 +226,81 @@ def test_stops_that_all_have_z_and_an_offset_are_exported_in_pfs_offset_mode(
         (4089.1000000000004, 9368.0),
         (4100.5, 9401.0),
     ]
+
+
+def _derived_line(k: int, n: int) -> str:
+    """m3 §26.6's line for ``k`` of ``n`` positions whose offset route derived, spelled out."""
+    return (
+        f"{k} of {n} positions have a dPFSOffset that route derived from the scan's "
+        f"lock offset and the distance of the cells' plane from it, with the "
+        f"profile's factor, and not read: NIS-Elements engages PFS at a plane that "
+        f"was never read locked"
+    )
+
+
+#: A stop at the 40X's cells' plane: a lock of 5388, 3.0 µm and 112.6 units per µm
+#: (5388 - 337.8 = 5050.2), and another 2.7 µm above its lock (4000 + 304.02 = 4304).
+DERIVED_A = OffsetFromFocus(lock_offset=5388.0, dz_um=-3.0, offset_per_um=112.6)
+DERIVED_B = OffsetFromFocus(lock_offset=4000.0, dz_um=2.7, offset_per_um=112.6)
+
+
+def test_derived_offsets_are_said_in_assumed_and_written_as_given(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """Two of three stops have an offset route derived: the file carries them as it carries any, and the line counts them."""
+    stops = (
+        _stop(0, "A1_r000", -11613.25, 4822.5, 4089.12, 5050.0, DERIVED_A),
+        _stop(1, "A1_r001", -8271.25, 5612.6, 4090.5, 4304.0, DERIVED_B),
+        STOPS[2],
+    )
+    _seed(tmp_path, stops)
+
+    record = _run(demo_microscope, tmp_path)
+
+    result = _result(record)
+    assert result.z_mode == "pfs-offset"
+    # After the frame's line and the two flags' line, once for all of them.
+    assert result.assumed == (FRAME, BOTH_FLAGS, _derived_line(2, 3))
+    # The offsets are written as they are in the route: nothing is added or taken off.
+    assert [(p.z_um, p.pfs_offset) for p in _points_of(tmp_path, record)] == [
+        (4089.12, 5050.0),
+        (4090.5, 4304.0),
+        (4100.5, 9401.0),
+    ]
+    # And a route none of whose stops was derived says nothing of it.
+    _seed(tmp_path)
+    assert _result(_run(demo_microscope, tmp_path)).assumed == (FRAME, BOTH_FLAGS)
+
+
+def test_a_stop_that_lost_its_offset_makes_the_list_z_only_without_the_line(
+    demo_microscope: Microscope, tmp_path: Path
+) -> None:
+    """The route left one stop's offset out (it cannot be derived): the list carries Z only, and the derived stop's offset is not written, so the line would be false."""
+    stops = (
+        _stop(0, "A1_r000", -11613.25, 4822.5, 4089.12, 5050.0, DERIVED_A),
+        _stop(1, "A1_r001", -8271.25, 5612.6, 4090.5, None),
+        STOPS[2],
+    )
+    _seed(tmp_path, stops)
+
+    record = _run(demo_microscope, tmp_path)
+
+    result = _result(record)
+    assert result.z_mode == "z"
+    assert result.assumed == (
+        FRAME,
+        "1 of 3 positions have no pfs_offset: the export carries Z without the "
+        "autofocus (bPFSEnabled false, dPFSOffset written as 0)",
+    )
+    points = _points_of(tmp_path, record)
+    assert [p.z_um for p in points] == [4089.12, 4090.5, 4100.5]
+    assert all(p.pfs_offset is None for p in points)
+    # Nor with no Z at all.
+    stops = (stops[0], _stop(1, "A1_r001", -8271.25, 5612.6, None, None), STOPS[2])
+    _seed(tmp_path, stops)
+    none = _result(_run(demo_microscope, tmp_path))
+    assert none.z_mode == "none"
+    assert not any("derived" in line for line in none.assumed)
 
 
 def test_a_stop_without_an_offset_exports_z_only_and_says_how_many(

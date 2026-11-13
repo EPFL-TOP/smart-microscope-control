@@ -81,8 +81,25 @@ not read back.
   (`smc stage get`).
 - In `pfs-offset` mode: *`bIncludeZ` and `bPFSEnabled` are both set, which the NIS-Elements
   sample did not show.* The sample had `bPFSEnabled` false.
+- In `pfs-offset` mode, when the route derived at least one stop's offset (its
+  `offset_from_focus` is set, see below): *K of N positions have a dPFSOffset that route
+  derived from the scan's lock offset and the distance of the cells' plane from it, with
+  the profile's factor, and not read: NIS-Elements engages PFS at a plane that was never
+  read locked.* The file does not change: a derived offset is written like any other. The
+  line is the only place that says it is not a reading.
 - In `z` mode: *N of M positions have no `pfs_offset`…*
 - In `none` mode: *N of M positions have no `z_um`…*
+
+## What a derived offset is
+
+A scan with the focus on the cells records each frame at the cells' plane, with PFS off, and the
+offset of the lock it swept from. Handed on as it is, that offset would have PFS engage at the
+plane it held, not the cells'. So [`route`](route.md) turns the lock's offset and the frame's
+distance from it into the offset of the cells' plane, with the profile's factor for the scan's
+objective, and says so in the stop's `offset_from_focus`; or it leaves the offset out, and the
+list is `z` mode. `nis-export` reads none of that: it writes the stop's `pfs_offset` and counts
+the stops that have `offset_from_focus`. In `z` and `none` mode the offsets are not written, so
+there is no such line, and the route's own `assumed` says why a stop has none.
 
 ## When it refuses
 
@@ -119,3 +136,7 @@ Nothing in this page was opened in NIS-Elements. For the owner at the Ti2-E (#19
   first assumed line is true.
 - **With `bPFSEnabled` false and `dPFSOffset` 0** NIS neither complains nor moves the
   autofocus offset.
+- **A derived `dPFSOffset`** (a scan with the focus on the cells, m3 §26.9): load the list with
+  the objective clear of the plate for the first stop and look at one derived stop. NIS-Elements
+  engages PFS at the offset, and the image should be the cells' plane, as the scan's frame was;
+  and that it takes `dPFSOffset` the way Micro-Manager's `PFSOffset` is written.

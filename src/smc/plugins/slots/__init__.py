@@ -39,7 +39,7 @@ from smc.plugins.slots.plate import (
     well_geometry,
 )
 from smc.plugins.slots.report import ReportResult
-from smc.plugins.slots.route import RoutePosition, RouteResult
+from smc.plugins.slots.route import OffsetFromFocus, RoutePosition, RouteResult
 from smc.plugins.slots.scan import (
     FailedField,
     FocusState,
@@ -68,6 +68,7 @@ __all__ = [
     "MeasuredOffset",
     "NisExportResult",
     "ObjectiveOffsetsResult",
+    "OffsetFromFocus",
     "OffsetWell",
     "PlannedField",
     "PlateResult",

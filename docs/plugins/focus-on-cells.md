@@ -128,9 +128,13 @@ eye, whether the curves show two maxima, and what range and step the sweep needs
 
 ## What it does not do
 
-- It does not change the PFS offset: carrying the cells' plane into the offset needs
-  the 40×'s offset factor (m3 §21.2 D1). The route and the NIS-Elements export still
-  engage PFS at the plane it held (#392).
+- It does not change the PFS offset, and neither does the scan with it (m3 §21.2 D1): a
+  frame keeps the lock's offset, a reading. The [`route`](route.md) derives, for its
+  stops, the offset of the cells' plane from the frame's distance from the lock's plane
+  and the profile's factor for the objective (the 40×'s is in the profile since session
+  3), or leaves it out and says why (m3 §26); the NIS-Elements export says when an offset
+  was derived. Carrying the cells' plane into the offset while scanning is a later
+  change.
 - It never moves XY, turns the turret, or returns to a start position.
 - It does not choose the score or the defaults: session 3 does (§21.10).
 
@@ -151,4 +155,6 @@ on them (m3 §21.10): the sweep on a few wells and `focus_scores.py` on their st
 score peaks at the by-eye focus within 1 µm, whether the curves have two maxima, the
 defaults of range and step); the PFS lock held after the relock (`smc autofocus get`) and
 how far Z moved in it; the time per plane and per field; whether a Z readback lands within
-a quarter step of its command; and the 40×'s offset factor, which #392 waits for.
+a quarter step of its command. The 40×'s offset factor at the offsets the route uses, and
+that NIS-Elements engages PFS at a derived offset on the cells' plane, are for the route's
+own check (m3 §26.9).
