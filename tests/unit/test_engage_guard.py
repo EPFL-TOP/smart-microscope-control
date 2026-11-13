@@ -850,8 +850,10 @@ def _no_focus_drive_core() -> FakeCore:
         ({}, "a focus drive to read"),
         ({"max_engage_excursion_um": None}, "[safety] max_engage_excursion_um"),
         ({"z_away_from_sample": None}, "[safety] z_away_from_sample"),
+        # Nothing else bounds Z on the band's open side (m2 §12.12 D11).
+        ({"z_soft_limits_um": None}, "[safety] z_soft_limits_um"),
     ],
-    ids=["floor", "focus", "excursion", "direction"],
+    ids=["floor", "focus", "excursion", "direction", "z-soft-limits"],
 )
 def test_a_first_lock_with_a_condition_missing_is_refused_with_nothing_sent(
     safety: dict[str, Any], missing: str
@@ -873,11 +875,13 @@ def test_a_first_lock_with_a_condition_missing_is_refused_with_nothing_sent(
         assert stand.core.log == []
 
 
-def test_a_first_lock_with_every_condition_missing_names_all_four_in_order() -> None:
+def test_a_first_lock_with_every_condition_missing_names_all_five_in_order() -> None:
+    # The Z soft limits come last (m2 §12.12 D11): each one-condition text stays.
     profile = _first_lock(
         autofocus_offset_soft_limits=None,
         max_engage_excursion_um=None,
         z_away_from_sample=None,
+        z_soft_limits_um=None,
     )
     with _ti2(profile, core=_no_focus_drive_core()) as stand:
         with pytest.raises(SafetyRefusedError) as refused:
@@ -885,8 +889,8 @@ def test_a_first_lock_with_every_condition_missing_names_all_four_in_order() -> 
         assert str(refused.value) == _unseen_at(
             advice=NO_FIRST_LOCK.format(
                 missing="[safety] autofocus_offset_soft_limits, a focus drive to "
-                "read, [safety] max_engage_excursion_um and [safety] "
-                "z_away_from_sample"
+                "read, [safety] max_engage_excursion_um, [safety] "
+                "z_away_from_sample and [safety] z_soft_limits_um"
             )
         )
         assert stand.core.log == []

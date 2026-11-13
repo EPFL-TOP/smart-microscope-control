@@ -1951,7 +1951,10 @@ class MMAutofocus:
 
         Each is what lets the guard bound the case where the floor's plane is
         not away from the sample (m2 §12.10 D4): the floor itself, a Z to read,
-        a band toward the sample, and which side that is.
+        a band toward the sample, and which side that is. Then the Z soft
+        limits (m2 §12.12 D11): the band is open away from the sample, so only
+        they bound Z there, and they bound a series of retries toward it. Last,
+        so that each text with one condition missing stays as it was.
         """
         safety = self._safety
         needs = (
@@ -1965,6 +1968,7 @@ class MMAutofocus:
                 "[safety] max_engage_excursion_um",
             ),
             (safety.z_away_from_sample is None, "[safety] z_away_from_sample"),
+            (safety.z_soft_limits_um is None, "[safety] z_soft_limits_um"),
         )
         return [name for lacking, name in needs if lacking]
 
