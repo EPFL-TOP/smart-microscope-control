@@ -552,7 +552,8 @@ def test_an_unknown_run_whose_jobs_cannot_be_listed_names_the_run_in_a_warning(
 ) -> None:
     # First silent path of #358: no verdict from the aggregate and no job list to upgrade
     # it. It may be a red run, so the log must say which run it was.
-    monkeypatch.setenv("LINT_RESULT", "success")
+    # The two results differ, so that a swapped or a missing one shows.
+    monkeypatch.setenv("LINT_RESULT", "cancelled")
     monkeypatch.setenv("TEST_RESULT", "abandoned")
     gh = FakeGh(issues=[{"number": 42, "title": "CI nightly red"}])
     inner = gh.__call__
@@ -568,8 +569,13 @@ def test_an_unknown_run_whose_jobs_cannot_be_listed_names_the_run_in_a_warning(
     named = [w for w in _warnings(capsys.readouterr().out) if "/actions/runs/123" in w]
     assert len(named) == 1
     assert "could not be listed" in named[0]
-    assert "abandoned" in named[0]
+    assert "lint=cancelled, tests=abandoned" in named[0]
     assert "no issue was touched" in named[0]
+
+
+def test_the_unknown_warning_says_a_result_that_was_not_set(rep) -> None:
+    text = rep.unknown_warning(RUN_URL, "", "", None)
+    assert "lint=unset, tests=unset" in text
 
 
 def test_an_unknown_run_with_no_failed_job_names_the_run_and_its_jobs_in_a_warning(
@@ -727,24 +733,29 @@ def test_run_gh_sends_stdin_as_utf_8_bytes_with_unix_line_ends(
     assert seen[1]["input"] is None
 
 
-# What `gh` is to this test: a child that prints, byte for byte, what it was sent.
-_ECHO_STDIN = "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"
+# What `gh` is to this test: a child that prints the bytes it was sent as hex. Hex, not
+# the bytes themselves: a text-mode reader of the child's output folds "\r\n" into "\n"
+# and would hide the very CRLF the test looks for (found in the review of #358).
+_ECHO_STDIN_AS_HEX = "import sys; sys.stdout.write(sys.stdin.buffer.read().hex())"
 
 
 def test_run_gh_leaves_no_carriage_return_in_what_a_child_reads(
     rep, monkeypatch
 ) -> None:
     # The real subprocess, with `gh` swapped for a Python child. On macOS and Linux it
-    # cannot fail; on Windows it is the one that sees text mode write CRLF.
+    # cannot see text mode's newline translation (it is not there); on Windows a text-mode
+    # stdin would hand the child "0d0a" and fail here. The test above fails everywhere.
     real_run = subprocess.run
 
     def run_the_child(cmd, **kwargs):
-        return real_run([sys.executable, "-I", "-c", _ECHO_STDIN, *cmd[1:]], **kwargs)
+        child = [sys.executable, "-I", "-c", _ECHO_STDIN_AS_HEX, *cmd[1:]]
+        return real_run(child, **kwargs)
 
     monkeypatch.setattr(rep.subprocess, "run", run_the_child)
 
     sent = "line one\nline two \N{LATIN SMALL LETTER E WITH ACUTE}\n"
-    assert rep.run_gh(["issue", "create", "--body-file", "-"], sent) == sent
+    got = rep.run_gh(["issue", "create", "--body-file", "-"], sent)
+    assert got == sent.encode("utf-8").hex()
 
 
 def test_run_gh_raises_with_what_gh_said_when_it_fails(rep, monkeypatch) -> None:

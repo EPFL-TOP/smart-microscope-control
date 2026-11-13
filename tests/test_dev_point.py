@@ -351,6 +351,17 @@ def test_a_failed_nightly_with_no_open_issue_stops_the_merges(
     assert point.unreported_nightly([failed], []) == failed
 
 
+def test_a_red_main_comes_before_a_failed_nightly_and_before_an_issue(point) -> None:
+    red = _run("2026-10-01T09:00:00Z", "failure", "feat: a")
+    failed = _run("2026-10-01T10:00:00Z", "failure", "feat: b", event="schedule")
+    other = _nightly(80, "CI nightly red (chore/x)")
+    lines = point.merge_stoppers([failed, red], [other])
+    assert len(lines) == 3
+    assert "main is RED" in lines[0]
+    assert "the nightly run FAILED" in lines[1]
+    assert lines[2].startswith("- #80 ")
+
+
 def test_a_failed_nightly_with_its_open_issue_is_listed_once(point) -> None:
     failed = _run("2026-10-01T09:00:00Z", "failure", "feat: a", event="schedule")
     lines = point.merge_stoppers([failed], [_nightly(77)])
