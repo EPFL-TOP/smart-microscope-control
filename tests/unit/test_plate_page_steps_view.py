@@ -1029,3 +1029,96 @@ def test_the_header_holds_one_outcome_line_of_fixed_height(page: PlatePage) -> N
     # Summaries are one line (at most 22 characters, cut with an ellipsis): the step bar is
     # one line tall.
     assert all(len(pane.object) <= 22 for pane in view.step_summaries.values())
+
+
+def test_the_frame_has_no_padding_and_the_stand_screen_keeps_the_plate_when_a_plan_stands(
+    page: PlatePage, run_doc: Path
+) -> None:
+    _seed_plate(run_doc)
+    _seed_scan_plan(run_doc)
+    view = PlatePageView(page)
+    view.refresh()
+    # The frame already holds a pitch of margin: Bokeh's own 5 % each side would be a second one.
+    assert view.figure.x_range.range_padding == 0.0
+    assert view.figure.y_range.range_padding == 0.0
+    # Only the Wells, Scan and Results screens frame the plan: Stand, Plate and the expert view
+    # keep the plate, plan or no plan.
+    view.show_step("wells")
+    plan_frame = _frame(view)
+    for step in ("stand", "plate"):
+        view.show_step(step)
+        assert _frame(view) != pytest.approx(plan_frame), step
+    view.show_expert(True)
+    assert _frame(view) != pytest.approx(plan_frame)
+
+
+def test_the_map_frames_the_wells_of_a_plan_that_is_not_usable(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # "Even one that is not usable" (m5 §17.12 D16): a plan made on another profile is no longer the
+    # plan the screens say, and is still the wells the operator laid out.
+    _seed_plate(run_doc)
+    write_stage(
+        run_doc,
+        StageRecord(
+            plugin="scan-plan",
+            provides="scan-plan",
+            attempt="a1",
+            status=StageStatus.done,
+            started_utc=T0 + timedelta(minutes=1),
+            finished_utc=T0 + timedelta(minutes=2),
+            profile="another stand",
+            dry_run=False,
+            smc_version="0",
+            params={},
+            result=_scan_plan_result().model_dump(mode="json"),
+        ),
+    )
+    view = PlatePageView(page)
+    view.refresh()
+    assert view._view is not None
+    assert view._view.plan is None
+    view.show_step("plate")
+    plate_frame = _frame(view)
+    view.show_step("wells")
+    wells = [w for w in view._view.wells if w.well in ("B2", "B11")]
+    assert _frame(view) == pytest.approx(_grown(wells, 9000.0))
+    assert _frame(view) != pytest.approx(plate_frame)
+
+
+def test_a_square_wells_outline_is_the_box_of_its_rotated_rectangle() -> None:
+    from smc.ui.controller import WellView
+
+    def well(rotation_deg: float, *, circular: bool) -> Any:
+        return WellView(
+            well="A1",
+            center_um=(1000.0, 2000.0),
+            size_um=(4000.0, 2000.0),
+            circular=circular,
+            rotation_deg=rotation_deg,
+            selected=False,
+            counts=None,
+            per_mm2=None,
+        )
+
+    # Not turned: the rectangle's own box. A quarter turn swaps its sides. A negative turn is the same
+    # box as the positive one (the box is of absolute values).
+    assert plate_page._outline(well(0.0, circular=False)) == pytest.approx(
+        (-1000.0, 1000.0, 3000.0, 3000.0)
+    )
+    assert plate_page._outline(well(90.0, circular=False)) == pytest.approx(
+        (0.0, 0.0, 2000.0, 4000.0)
+    )
+    assert plate_page._outline(well(-30.0, circular=False)) == pytest.approx(
+        plate_page._outline(well(30.0, circular=False))
+    )
+    # 30 degrees: half-width (4000 cos + 2000 sin) / 2 and half-height (4000 sin + 2000 cos) / 2.
+    cos, sin = 0.8660254037844387, 0.5
+    half_x, half_y = (4000 * cos + 2000 * sin) / 2, (4000 * sin + 2000 * cos) / 2
+    assert plate_page._outline(well(30.0, circular=False)) == pytest.approx(
+        (1000.0 - half_x, 2000.0 - half_y, 1000.0 + half_x, 2000.0 + half_y)
+    )
+    # A round well has the same box whatever the plate's turn.
+    assert plate_page._outline(well(30.0, circular=True)) == pytest.approx(
+        plate_page._outline(well(0.0, circular=True))
+    )

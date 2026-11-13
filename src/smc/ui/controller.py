@@ -4357,16 +4357,44 @@ class PlatePage:
             root = run_dir.resolve()
             if not wanted.is_relative_to(root):
                 return None
-            doc, _unreadable = self._document()
-            named = {
-                Path(path).resolve()
-                for entry in self._file_entries(doc, run_dir)
-                for path in [entry.partition(": ")[2]]
-                if entry.startswith("file: ")
-            }
+            doc, unreadable = self._document()
+            if unreadable is not None:
+                # Fails closed, and says why in the log (FM-229): an unreadable document is no
+                # empty one, and a 404 alone reads as a file that is gone.
+                log.info(
+                    "run-files: the run document could not be read: %s", unreadable
+                )
+                return None
+            named = self._named_files(doc, run_dir)
             return wanted if wanted in named and wanted.is_file() else None
         except (OSError, ValueError, RuntimeError):
             return None
+
+    def _named_files(self, doc: RunDocument, run_dir: Path) -> set[Path]:
+        """The resolved paths of the files of ``doc`` that lie inside ``run_dir``, for ``run_file``.
+
+        An entry is judged **lexically first** (``relative_to`` the run folder, no ``..``) and
+        resolved only when it is inside: ``nis-export --param out=`` may name a share, and a
+        ``resolve()`` of an offline UNC path or a mapped drive raises (FM-116) and, on Windows,
+        waits on the network on the server's loop (FM-62). One such entry must not take the
+        report's link with it, so each resolve is its own ``try``.
+        """
+        named: set[Path] = set()
+        for entry in self._file_entries(doc, run_dir):
+            key, separator, path = entry.partition(": ")
+            if not separator or key != "file":
+                continue
+            try:
+                inside = Path(path).relative_to(run_dir)
+            except ValueError:
+                continue
+            if ".." in inside.parts:
+                continue
+            try:
+                named.add(Path(path).resolve())
+            except (OSError, RuntimeError):
+                continue
+        return named
 
     def _file_entries(self, doc: RunDocument, run_dir: Path) -> list[str]:
         """The ``files`` entries of every card ``view()`` would draw, built the same way."""

@@ -1643,3 +1643,22 @@ def test_a_plate_registered_from_the_plate_screen_alone(
     finally:
         page.close()
         page.release()
+
+
+def test_the_plate_screen_places_the_rows_note_every_rows_notes_and_the_replace_note_under_the_result(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # The layout, walked (FM-201: a widget that is built and set but never placed draws nothing, and no
+    # test of its attributes sees it): a note that is not in the screen's list is a warning nobody reads.
+    _seed_plate(run_doc)
+    view = PlatePageView(page)
+    view.show_step("plate")
+    placed = {id(o) for o in _objects(list(view.step_panel.objects))}
+    assert id(view.rows_note) in placed
+    for slot in view.centre_slots:
+        assert id(slot.note) in placed
+        assert id(slot.capture_note) in placed
+    # What the result's replacement note follows is the result line, not what is above it.
+    screen = view.screens["plate"]
+    assert screen.index(view.register_replaces) > screen.index(view.registered_block)
+    assert screen.index(view.rows_note) < screen.index(view.centre_slots[0].box)

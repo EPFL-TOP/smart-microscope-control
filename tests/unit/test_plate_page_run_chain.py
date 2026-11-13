@@ -22,6 +22,7 @@ import pytest
 
 import smc.ui.controller as controller_module
 from smc.hardware import Microscope
+from smc.hardware.errors import MotionStoppedError
 from smc.hardware.profile import Profile
 from smc.plugins import PluginRunError
 from smc.plugins.api import PluginParams, PluginResult, RunContext
@@ -77,6 +78,11 @@ class _Stub:
         how = _Stub.behaviour.get(self.name, "done")
         if how == "fail":
             raise PluginRunError(self.name, "it broke")
+        if how == "move_stopped":
+            # Inside a move when the stop lands: the move raises, and the run ends `failed`.
+            _Stub.started[self.name].set()
+            _Stub.release[self.name].wait(WAIT_S)
+            raise MotionStoppedError("xy_stage XY")
         if how in ("wait", "wait_ignoring_stop"):
             _Stub.started[self.name].set()
             _Stub.release[self.name].wait(WAIT_S)
@@ -497,6 +503,33 @@ def test_stop_during_a_tool_ends_the_chain_stopped_at_that_tool(
     # The stop note names the tool that was going, never "run all".
     assert page.status().stop_note is not None
     assert page.status().stop_note.startswith("Route told to stop; ")  # type: ignore[union-attr]
+
+
+def test_a_stop_that_lands_in_a_move_ends_the_chain_stopped_while_the_record_stays_failed(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # FM-64: the stage stopped, so the words say stopped (the Results screen's line says `by STOP`,
+    # not `which failed`); the record is `failed`, because the run raised.
+    _Stub.behaviour["route"] = "move_stopped"
+
+    page.run_chain(TOOLS, {})
+    assert _Stub.started["route"].wait(WAIT_S)
+    page.stop()
+    _Stub.release["route"].set()
+    _ended(page)
+
+    chain = page.status().chain
+    assert chain is not None
+    assert [(end.plugin, end.how) for end in chain.ended] == [
+        ("cells", "done"),
+        ("density", "done"),
+        ("route", "stopped"),
+    ]
+    assert _outcome(page) == (
+        "Run all that are left: Route stopped by STOP; done: Count the cells, "
+        "Density per well; not run: Report, Export for NIS-Elements"
+    )
+    assert _records(run_doc)["route"] is StageStatus.failed
 
 
 def test_stop_between_two_tools_ends_the_chain_before_the_next(

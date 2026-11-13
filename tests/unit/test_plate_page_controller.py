@@ -6162,10 +6162,13 @@ def test_a_registration_clears_the_drives_text(
         assert page.join(10.0)
         assert page.status().goto.startswith("Go to done in ")
         assert page.status().goto_answer is not None
-        stage = fake_microscope.require(XYStage)
-        for well in ("A1", "A12"):
-            stage.move_to_um(*_centre(well, a1=A1_OFF, rotation_deg=TURN_DEG))
-            page.capture_centre(well)
+        # The centres are set directly: a capture ends the answer itself (`_drop_goto_answer`),
+        # and this test is about the registration's own end.
+        page.refs = tuple(
+            WellRef(well=well, x_um=x, y_um=y)
+            for well in ("A1", "A12")
+            for x, y in [_centre(well, a1=A1_OFF, rotation_deg=TURN_DEG)]
+        )
 
         _run_and_join(
             page, "plate-registration", page.page_params("plate-registration")
@@ -6541,5 +6544,133 @@ def test_a_registration_made_elsewhere_clears_the_drives_text_when_a_view_reads_
 
         assert page.goto_answer is None
         assert page.status().goto == ""
+    finally:
+        page.close()
+
+
+# --- what the adversarial review of #475 found: one offline share, an unreadable document, the tool's own run ---
+
+
+def test_one_entry_that_cannot_be_resolved_does_not_take_the_reports_link_with_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `nis-export --param out=` may name a share that is offline: `Path.resolve` of it raises a bare
+    # OSError on Windows (FM-116) and waits on the network. The entry is outside the run folder, so it
+    # is judged lexically and never resolved; and one that is resolved fails on its own.
+    page, named, _outside = _named_files(tmp_path)
+    resolved: list[str] = []
+    real_resolve = Path.resolve
+
+    def resolve(self: Path, strict: bool = False) -> Path:
+        resolved.append(self.name)
+        if self.name == "secret.txt":
+            raise OSError(64, "the specified network name is no longer available")
+        return real_resolve(self, strict=strict)
+
+    try:
+        monkeypatch.setattr(Path, "resolve", resolve)
+        assert page.run_file("report/abc.html") == real_resolve(named)
+        # The share's entry was never resolved: it is outside the run folder.
+        assert "secret.txt" not in resolved
+    finally:
+        monkeypatch.undo()
+        page.close()
+
+
+def test_an_entry_inside_the_run_folder_that_cannot_be_resolved_is_skipped_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    page, named, _outside = _named_files(tmp_path)
+    run = page.run_doc.parent
+    (run / "export").mkdir(exist_ok=True)
+    (run / "export" / "broken.json").write_text("{}", encoding="utf-8")
+    _record(page.run_doc, "slow", result={"file": "export/broken.json"})
+    real_resolve = Path.resolve
+
+    def resolve(self: Path, strict: bool = False) -> Path:
+        if self.name == "broken.json":
+            raise OSError(5, "access denied")
+        return real_resolve(self, strict=strict)
+
+    try:
+        monkeypatch.setattr(Path, "resolve", resolve)
+        assert page.run_file("report/abc.html") == real_resolve(named)
+        assert page.run_file("export/broken.json") is None
+    finally:
+        monkeypatch.undo()
+        page.close()
+
+
+def test_an_unreadable_run_document_serves_nothing_and_says_why_in_the_log(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # FM-229: an unreadable document is no empty one. The route fails closed, and the log says
+    # why (a bare 404 reads as a file that is gone).
+    page, _named, _outside = _named_files(tmp_path)
+    try:
+        assert page.run_file("report/abc.html") is not None
+        page.run_doc.write_text("{ not json", encoding="utf-8")
+        with caplog.at_level(logging.INFO, logger="smc.ui"):
+            assert page.run_file("report/abc.html") is None
+        assert any(
+            "run document could not be read" in r.getMessage() for r in caplog.records
+        )
+    finally:
+        page.close()
+
+
+def test_a_goto_well_run_from_the_tools_own_run_leaves_no_answer_for_a_row(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # The drive bar's line says the outcome of any `goto-well`; the Plate row's answer is the click's
+    # own (`goto()` leaves `going`), and the answer of an earlier drive is not about this run.
+    page = _goto_page(fake_microscope, run_doc)
+    try:
+        page.goto("B2")
+        assert page.join(10.0)
+        assert page.status().goto_answer == GotoAnswer("B2", "at", False, "")
+
+        page.run("goto-well", ["well=C3"])
+        assert page.join(10.0)
+
+        assert page.status().goto_answer is None
+        assert page.status().goto.startswith("Go to done in ")
+        assert StubGoto.ran == [("B2", "centre"), ("C3", "centre")]
+    finally:
+        page.close()
+
+
+class SlowScan(Slow):
+    """``scan`` that waits for the stop and ends stopped: a built-in tool's name, so its title is not its plugin name."""
+
+    name = provides = "scan"
+
+
+def test_close_says_was_stopped_for_a_tool_whose_title_is_not_its_name(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # `close()` compares the outcome and the stop note with the words the strip uses (the title).
+    page = _page(fake_microscope, run_doc, [_ep(SlowScan)])
+    page.run("scan", [])
+    assert Slow.started.wait(5)
+    page.close()
+    assert page.close_lines == ("scan was stopped",)
+    assert page.status().outcome == "Scan stopped"
+    assert page.close_ended
+
+
+def test_the_views_read_of_a_turret_that_does_not_answer_is_not_logged_at_every_redraw(
+    fake_microscope: Microscope, run_doc: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # `view().register_refusal` reads the turret at every redraw (FM-178): a failure of that read is
+    # the capture's to log once, never the redraw's.
+    page = _page(fake_microscope, run_doc, _real("plate-registration"))
+    try:
+        _captured_at_the_ten_x(page, fake_microscope)
+        fake_microscope.override(ObjectiveTurret, _TurretThatRaises())
+        with caplog.at_level(logging.WARNING, logger="smc.ui"):
+            for _ in range(3):
+                assert page.view().register_refusal is None
+        assert not [r for r in caplog.records if "could not be read" in r.getMessage()]
     finally:
         page.close()

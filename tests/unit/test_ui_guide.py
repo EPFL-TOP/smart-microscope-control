@@ -7,6 +7,7 @@ shell reads it, never compared with the string the code builds (FM-45).
 from __future__ import annotations
 
 import dataclasses
+import html
 import importlib
 import json
 import math
@@ -2834,6 +2835,9 @@ def test_capture_note_names_two_captures_at_one_place() -> None:
         "H1", (1000.0, 1000.0), (1000.0, 1000.0), pitch, {"A12": (1200.0, 1000.0)}
     )
     assert same == CAPTURE_SAME_PLACE.format(well="H1", other="A12")
+    # The bound is half a pitch (4500 µm here): one µm each side of it.
+    assert capture_note("A2", (0.0, 4499.0), None, pitch, {"A1": (0.0, 0.0)}) != ""
+    assert capture_note("A2", (0.0, 4501.0), None, pitch, {"A1": (0.0, 0.0)}) == ""
     # Two neighbouring wells, each centred by eye, are one pitch apart and are right.
     assert (
         capture_note("A2", (8999.0, 0.0), (9000.0, 0.0), pitch, {"A1": (0.0, 0.0)})
@@ -2988,6 +2992,25 @@ def test_files_html_escapes_every_text_and_links_only_files_inside_the_run_folde
     )
 
 
+def test_files_html_escapes_the_text_only_entries_as_well() -> None:
+    # `nis-export --param out=` can be any absolute path on the PC, and a POSIX file name may hold
+    # `<`: what is not a link is text in the same pane, and escaped (FM-139).
+    hostile = '<img src=x onerror=1> & "q"'
+    cards = {
+        "scan": _file_card("scan", f"folder: /runs/x/{hostile}"),
+        "report": _file_card("report", f"file: /elsewhere/{hostile}.html"),
+        "route": _file_card("route", f"file: /runs/x/../{hostile}"),
+        "nis-export": _file_card("nis-export", f"file: {hostile}"),
+    }
+
+    page = files_html(cards, Path("/runs/x"))
+
+    assert "<img" not in page
+    assert page.count(html.escape(hostile)) == 4
+    assert "&lt;img src=x onerror=1&gt; &amp; &quot;q&quot;" in page
+    assert "<a " not in page
+
+
 def test_files_html_quotes_a_windows_relative_path_as_posix() -> None:
     # A page served on Windows names its files with backslashes; the route takes `/`.
     run = PureWindowsPath("C:/runs/x")
@@ -3065,17 +3088,28 @@ def test_local_time_is_in_the_zone_of_the_pc(monkeypatch: pytest.MonkeyPatch) ->
         assert local_time(datetime(2026, 11, 13, 12, 0, tzinfo=timezone.utc)) == (
             "2026-11-13 14:00"
         )
+        # A naive time is UTC and not the PC's: on a PC at UTC+2 it is still 14:00 local (a CI
+        # runner at UTC could not tell the two apart).
+        assert local_time(datetime(2026, 11, 13, 12, 0)) == "2026-11-13 14:00"
     finally:
         monkeypatch.undo()
         time.tzset()
 
 
-def test_local_time_of_a_start_the_pc_cannot_show_is_the_values_own_text() -> None:
-    # Year 1 under a positive offset is before UTC's year 1: no zone can show it, and the
-    # page's redraw must not end on it (FM-125).
-    odd = datetime(1, 1, 1, 0, 0, tzinfo=timezone(timedelta(hours=-5)))
-    said = local_time(odd)
-    assert said.startswith("0001-01-01")
+@pytest.mark.parametrize("error", [OSError, OverflowError, ValueError])
+def test_local_time_of_a_start_the_pc_cannot_show_is_the_values_own_text(
+    error: type[Exception],
+) -> None:
+    # A date the PC cannot show in its zone (Windows before 1970 or after year 3000, year 1 or 9999
+    # under an offset) raises one of these from `astimezone()`: the page's redraw must not end on it
+    # (FM-125). A subclass whose `astimezone` raises makes it happen on any PC.
+    class Unshowable(datetime):
+        def astimezone(self, tz: Any = None) -> datetime:
+            raise error("no zone shows this date")
+
+    odd = Unshowable(2026, 11, 13, 14, 20, tzinfo=timezone(timedelta(hours=5)))
+
+    assert local_time(odd) == "2026-11-13T14:20+05:00"
 
 
 def test_the_again_note_is_one_line_of_short_names() -> None:

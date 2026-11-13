@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from importlib.metadata import EntryPoint
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import pytest
 
@@ -200,8 +201,8 @@ class RunFilesTest(AsyncHTTPTestCase):
             "/run-files/report/../../secret.txt",
             "/run-files/report/%2E%2E%2F%2E%2E%2Fsecret.txt",
             # An absolute path, as a POSIX one and as the drive of a Windows one.
-            f"/run-files/{self.secret}",
-            f"/run-files//{str(self.secret).lstrip('/')}",
+            f"/run-files/{quote(str(self.secret), safe='')}",
+            f"/run-files//{quote(str(self.secret).lstrip('/'), safe='/')}",
             "/run-files/C:/Windows/win.ini",
             "/run-files/C%3A%5CWindows%5Cwin.ini",
             # A backslash that a Windows path reads as a parent.
@@ -247,7 +248,7 @@ class RunFilesTest(AsyncHTTPTestCase):
         # `nis-export --param out=` may write anywhere: the card shows the path, the page links
         # none of it, and the route serves only what is inside the run folder.
         _record(self.run_doc, "nis-export", {"file": str(self.secret)})
-        assert self.fetch(f"/run-files/{self.secret}").code == 404
+        assert self.fetch(f"/run-files/{quote(str(self.secret), safe='')}").code == 404
         assert self.fetch("/run-files/../secret.txt").code == 404
         assert self.fetch("/run-files/secret.txt").code == 404
 
