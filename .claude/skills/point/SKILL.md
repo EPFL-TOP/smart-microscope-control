@@ -13,7 +13,7 @@ The session ends when the list is posted.
 
 1. **Facts.** Run `python scripts/dev/point.py` and read only its Markdown:
    first the **CI that stops the merges** (a red `main`, an open `CI nightly
-   red` issue: ADR-0009), then open PRs with checks and the latest design
+   red` issue, a failed nightly run with no issue: ADR-0009), then open PRs with checks and the latest design
    verdict, issues by status,
    blocked issues whose dependencies are now merged, what develop sessions
    reported since the last point (follow-ups, not verified, deviations),
@@ -75,7 +75,7 @@ The session ends when the list is posted.
 
    ```markdown
    **Today**
-   0. Only when the CI stops the merges: main is red (run <url>) or #N `CI nightly red` is open: revert or `/develop <n>` for the fix, before any merge.
+   0. Only when the CI stops the merges: main is red (run <url>), #N `CI nightly red` is open, or the nightly run <url> failed with no issue: revert or `/develop <n>` for the fix, before any merge.
    Run each lane with `/lane S1`, `/lane S2`, `/lane S3` (Sonnet), each in a fresh session; a lane stops where you are needed and says so on this issue.
 
    **S1 — the plate definitions (#400), then the scan plan (#21)**

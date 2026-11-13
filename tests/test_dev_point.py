@@ -333,6 +333,98 @@ def test_both_stoppers_are_listed_red_main_first(point) -> None:
     assert lines[1].startswith("- #77 ")
 
 
+@pytest.mark.parametrize(
+    ("event", "label"), [("schedule", "nightly"), ("workflow_dispatch", "manual")]
+)
+def test_a_failed_nightly_with_no_open_issue_stops_the_merges(
+    point, event, label
+) -> None:
+    # The report job crashed or ended silent (#358): no issue, but the run itself is red.
+    failed = _run("2026-10-01T09:00:00Z", "failure", "feat: a", event=event)
+    lines = point.merge_stoppers([failed], [])
+    assert len(lines) == 1
+    assert "FAILED" in lines[0]
+    assert label in lines[0]
+    assert "u/2026-10-01T09:00:00Z" in lines[0]
+    assert "no open" in lines[0]
+    assert "CI nightly red" in lines[0]
+    assert point.unreported_nightly([failed], []) == failed
+
+
+def test_a_red_main_comes_before_a_failed_nightly_and_before_an_issue(point) -> None:
+    red = _run("2026-10-01T09:00:00Z", "failure", "feat: a")
+    failed = _run("2026-10-01T10:00:00Z", "failure", "feat: b", event="schedule")
+    other = _nightly(80, "CI nightly red (chore/x)")
+    lines = point.merge_stoppers([failed, red], [other])
+    assert len(lines) == 3
+    assert "main is RED" in lines[0]
+    assert "the nightly run FAILED" in lines[1]
+    assert lines[2].startswith("- #80 ")
+
+
+def test_a_failed_nightly_with_its_open_issue_is_listed_once(point) -> None:
+    failed = _run("2026-10-01T09:00:00Z", "failure", "feat: a", event="schedule")
+    lines = point.merge_stoppers([failed], [_nightly(77)])
+    assert len(lines) == 1
+    assert lines[0].startswith("- #77 ")
+    assert point.unreported_nightly([failed], [_nightly(77)]) is None
+
+
+def test_a_nightly_issue_of_another_branch_does_not_cover_a_failed_nightly_of_main(
+    point,
+) -> None:
+    failed = _run("2026-10-01T09:00:00Z", "failure", "feat: a", event="schedule")
+    other = _nightly(80, "CI nightly red (chore/x)")
+    lines = point.merge_stoppers([failed], [other])
+    assert len(lines) == 2
+    assert "FAILED" in lines[0]
+    assert lines[1].startswith("- #80 ")
+
+
+def test_a_later_green_nightly_clears_a_failed_one_and_a_cancelled_or_running_one_not(
+    point,
+) -> None:
+    failed = _run("2026-10-01T09:00:00Z", "failure", "feat: a", event="schedule")
+    green = _run("2026-10-02T09:00:00Z", "success", "feat: b", event="schedule")
+    assert point.unreported_nightly([failed, green], []) is None
+    # a green dispatch clears it as well: it ran the same matrix
+    manual = _run(
+        "2026-10-02T10:00:00Z", "success", "feat: b", event="workflow_dispatch"
+    )
+    assert point.unreported_nightly([failed, manual], []) is None
+    # a cancelled, skipped or running nightly is no verdict: the failed one stands
+    for conclusion in ("cancelled", "skipped", "neutral", ""):
+        later = _run("2026-10-02T09:00:00Z", conclusion, "feat: b", event="schedule")
+        assert point.unreported_nightly([failed, later], []) == failed
+    # the latest verdict decides, whatever the order of the list
+    assert point.unreported_nightly([green, failed], []) is None
+    red_again = _run("2026-10-03T09:00:00Z", "failure", "feat: c", event="schedule")
+    assert point.unreported_nightly([red_again, green, failed], []) == red_again
+
+
+@pytest.mark.parametrize(
+    "conclusion", ["failure", "timed_out", "action_required", "startup_failure"]
+)
+def test_every_failing_conclusion_of_a_nightly_counts(point, conclusion) -> None:
+    run = _run("2026-10-01T09:00:00Z", conclusion, "feat: a", event="schedule")
+    assert point.unreported_nightly([run], []) == run
+
+
+def test_only_a_failed_run_of_the_ci_workflow_that_is_a_nightly_counts(point) -> None:
+    push = _run("2026-10-01T09:00:00Z", "failure", "feat: a", event="push")
+    other = {
+        **_run("2026-10-01T10:00:00Z", "failure", "feat: b", event="schedule"),
+        "workflowName": "closing references",
+    }
+    bare = {
+        k: v
+        for k, v in _run("2026-10-01T11:00:00Z", "failure", event="schedule").items()
+        if k != "event"
+    }
+    assert point.unreported_nightly([push, other, bare], []) is None
+    assert point.unreported_nightly([], []) is None
+
+
 def test_a_title_that_only_resembles_the_nightly_is_not_a_nightly_issue(point) -> None:
     # A work issue about the nightly may start with its words: only the exact title, or the
     # title with a branch, is what nightly_report.py writes.
@@ -429,6 +521,26 @@ def test_the_report_opens_with_the_ci_that_stops_the_merges(
     # the run list asks for the event
     run_call = next(a for a in seen if a[0] == "run")
     assert "event" in run_call[run_call.index("--json") + 1].split(",")
+
+
+def test_the_report_lists_a_failed_nightly_with_no_issue_among_the_stoppers(
+    point, monkeypatch, capsys
+) -> None:
+    # A nightly that is older than the 50 newest runs of main would be missed (measured on
+    # 2026-11-13: 50 runs reach back four days): the listing asks for more.
+    seen: list[tuple[str, ...]] = []
+    failed = _run("2026-11-05T09:00:00Z", "failure", "feat: a", event="schedule")
+    monkeypatch.setattr(point, "gh_json", _canned([failed], [], seen))
+    monkeypatch.setattr(sys, "argv", ["point.py", "--since", "2026-11-01"])
+
+    assert point.main() == 0
+
+    out = capsys.readouterr().out
+    first = out.split("## Open pull requests")[0]
+    assert "the nightly run FAILED" in first
+    assert "u/2026-11-05T09:00:00Z" in first
+    run_call = next(a for a in seen if a[0] == "run")
+    assert int(run_call[run_call.index("--limit") + 1]) >= 100
 
 
 def test_the_report_says_none_when_the_ci_is_clear(point, monkeypatch, capsys) -> None:
