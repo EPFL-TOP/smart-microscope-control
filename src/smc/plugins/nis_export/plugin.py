@@ -14,6 +14,11 @@ program says that the two agree:
   ``pfs-offset``; every stop with a Z, ``z``; otherwise ``none``. One flag covers the whole
   list, so a single stop without a Z (a well whose frames were all ``unlocked``, FM-154)
   takes the Z of the others out as well, and the result counts how many stops lacked it.
+* **A derived offset is written like any other, and said once.** A stop's ``pfs_offset`` is
+  the scan's reading, or, when the route has ``offset_from_focus`` for it, the offset of
+  the cells' plane that the route computed from a factor (m3 §26). The file cannot tell
+  the two apart and NIS-Elements engages the autofocus at either, so in ``pfs-offset``
+  mode ``assumed`` counts the positions that carry a derived one.
 * **A new file for every run**, as for ``report``: a ``done`` result's file is never
   rewritten (m3 §2.3). Only an ``out`` the operator names is written where they say, and
   refused when it exists unless ``overwrite`` is true. Its folder is never created, so a
@@ -183,10 +188,29 @@ def _nis_position(stop: RoutePosition, mode: str) -> NisPosition:
     )
 
 
+def _derived_line(derived: int, count: int) -> str:
+    """The line for the positions whose ``dPFSOffset`` the route derived and nobody read (m3 §26.6).
+
+    NIS-Elements engages the autofocus at the offset it is given, with none of
+    smc's guards, so a plane that was computed from a factor and never read
+    locked is said once, in the export's own words. Said only in ``pfs-offset``
+    mode: in the others the offsets are not written.
+    """
+    return (
+        f"{derived} of {count} positions have a dPFSOffset that route derived from "
+        f"the scan's lock offset and the distance of the cells' plane from it, with "
+        f"the profile's factor, and not read: NIS-Elements engages PFS at a plane "
+        f"that was never read locked"
+    )
+
+
 def _assumed(stops: Sequence[RoutePosition], mode: str) -> tuple[str, ...]:
     """The frame of the coordinates, then what the chosen mode takes from the stops."""
     count = len(stops)
     if mode == "pfs-offset":
+        derived = sum(stop.offset_from_focus is not None for stop in stops)
+        if derived:
+            return (_FRAME, _BOTH_FLAGS, _derived_line(derived, count))
         return (_FRAME, _BOTH_FLAGS)
     if mode == "z":
         lacking = sum(stop.pfs_offset is None for stop in stops)
