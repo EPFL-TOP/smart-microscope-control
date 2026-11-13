@@ -39,9 +39,11 @@ import numpy as np
 import numpy.typing as npt
 import pytest
 
+from recording_autofocus import RecordingAutofocus
 from smc.hardware import Microscope
 from smc.hardware.capabilities import (
     XY,
+    Autofocus,
     Camera,
     Limits,
     ObjectiveOffset,
@@ -52,6 +54,7 @@ from smc.hardware.capabilities import (
 from smc.hardware.errors import (
     HardwareError,
     MicroscopeHaltedError,
+    MotionStoppedError,
     SafetyRefusedError,
 )
 from smc.hardware.profile import ObjectivesSection, Profile, SampleSection
@@ -954,12 +957,18 @@ def test_a_walk_that_leaves_the_soft_limits_is_refused_before_the_turret_turns(
         }
     )
     rig = _rig(open_stand(profile))
+    # A refusal that comes before anything moves comes before the autofocus is
+    # touched too: a PFS switched off for a run that never moves is a loss (#478).
+    af = RecordingAutofocus(engaged=True)
+    rig.stand.override(Autofocus, af)
 
     refused = _refused(rig.stand, run_doc, (FORTY,), (documents.forty,))
 
     assert "wall would be looked for at" in refused.reason
     assert refused.reason.endswith("outside the stage's soft limits")
     _nothing_moved(rig)
+    assert "disengage" not in af.calls
+    assert af.engaged is True
 
 
 def _edited_calibration(
@@ -1604,3 +1613,221 @@ def test_the_wells_given_are_the_wells_measured(
     # Its frames: two wells, four sides.
     assert measure.folder is not None
     assert len(list((run_doc.parent / measure.folder).glob("*.tif"))) == 8
+
+
+# ------------------------- PFS across a well's wall: the switch-off (m3 §5.7, #478)
+
+AUTOFOCUS_OFF_LINE = (
+    "the autofocus was switched off before anything moved, so that no lock crossed "
+    "a well's wall: engage it again on the sample"
+)
+AUTOFOCUS_OFF_WARNING = (
+    "objective-offsets: the autofocus was switched off before anything moved, so "
+    "that no lock crosses a well's wall (m2 §12.2 D2): engage it again after the run"
+)
+NO_LIMITS_LINE = (
+    "the stage reports no soft limits, so the frames' moves were not checked "
+    "against any travel"
+)
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """The plugin's own warnings: ``override`` and the layer's turret warn too, on their own loggers."""
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and r.name == LOGGER
+    ]
+
+
+def test_objective_offsets_switches_an_engaged_autofocus_off_before_anything_moves_at_the_first_target(
+    open_stand: Callable[..., Microscope],
+    run_doc: Path,
+    documents: Documents,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gap that was measured: the turret already reads the first target.
+
+    ``select`` then returns at once, so the layer's own switch-off before a turn
+    never runs, and the first move to a wall was made with PFS engaged. An operator
+    who ran ``camera-calibration`` at the 40x and left it in place meets it.
+    """
+    stand = open_stand()
+    stand.require(ObjectiveTurret).select(FORTY, confirm=True)
+    rig = _rig(stand)
+    af = RecordingAutofocus(engaged=True)
+    stand.override(Autofocus, af)
+    real_move = rig.stage.move_to_um
+
+    def move(x_um: float, y_um: float) -> XY:
+        af.calls.append("move_to_um")
+        return real_move(x_um, y_um)
+
+    monkeypatch.setattr(rig.stage, "move_to_um", move)
+
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        result = _result(_run(stand, run_doc, (FORTY,), (documents.forty,)))
+
+    # The switch-off and its read back come before any move, and are made once. The
+    # layer's turns read the autofocus too, so the rest of the list is not asserted.
+    assert af.calls[:3] == ["is_engaged", "disengage", "is_engaged"]
+    assert af.calls.index("move_to_um") > 2
+    assert af.calls.count("disengage") == 1
+    assert af.engaged is False
+    assert result.assumed[:2] == (AUTOFOCUS_OFF_LINE, NO_LIMITS_LINE)
+    assert _warnings(caplog) == [AUTOFOCUS_OFF_WARNING]
+
+
+def test_objective_offsets_leaves_an_autofocus_that_is_off_alone(
+    open_stand: Callable[..., Microscope],
+    run_doc: Path,
+    documents: Documents,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    stand = open_stand()
+    af = RecordingAutofocus(engaged=False)
+    stand.override(Autofocus, af)
+
+    with caplog.at_level(logging.WARNING, logger="smc"):
+        result = _result(_run(stand, run_doc, (FORTY,), (documents.forty,)))
+
+    # The layer's turns read the autofocus too: the list is not asserted whole.
+    assert "disengage" not in af.calls
+    assert af.calls[0] == "is_engaged"
+    assert AUTOFOCUS_OFF_LINE not in result.assumed
+    assert result.assumed[0] == NO_LIMITS_LINE
+    assert _warnings(caplog) == []
+
+
+def test_a_stop_before_objective_offsets_turns_keeps_the_autofocus_on(
+    open_stand: Callable[..., Microscope], run_doc: Path, documents: Documents
+) -> None:
+    stop = threading.Event()
+    stop.set()
+    rig = _rig(open_stand())
+    af = RecordingAutofocus(engaged=True)
+    rig.stand.override(Autofocus, af)
+
+    record = _run(rig.stand, run_doc, (FORTY,), (documents.forty,), stop=stop)
+
+    assert record.status is StageStatus.stopped
+    _nothing_moved(rig)
+    assert "disengage" not in af.calls
+    assert af.engaged is True
+
+
+_NOT_SWITCHED_OFF = (
+    "the autofocus could not be switched off before anything moved ({cause}): "
+    "nothing moved, and PFS may still be on: switch it off at the stand, then run "
+    "objective-offsets again"
+)
+_STILL_ON = (
+    "the autofocus still reads on after it was switched off: nothing moved: switch "
+    "it off at the stand, then run objective-offsets again"
+)
+
+
+@pytest.mark.parametrize(
+    ("options", "reason", "calls"),
+    [
+        (
+            {"fails": "disengage"},
+            _NOT_SWITCHED_OFF.format(cause="CoreError: disengage failed on the fake"),
+            ["is_engaged", "disengage"],
+        ),
+        (
+            {"fails": "is_engaged"},
+            _NOT_SWITCHED_OFF.format(cause="CoreError: is_engaged failed on the fake"),
+            ["is_engaged"],
+        ),
+        (
+            {"read_fails_after_off": True},
+            _NOT_SWITCHED_OFF.format(
+                cause="CoreError: is_engaged failed on the fake after the switch-off"
+            ),
+            ["is_engaged", "disengage", "is_engaged"],
+        ),
+        ({"stays_on": True}, _STILL_ON, ["is_engaged", "disengage", "is_engaged"]),
+    ],
+    ids=["disengage-raises", "read-raises", "read-back-raises", "still-on"],
+)
+def test_a_switch_off_that_fails_ends_objective_offsets_before_anything_turns_or_moves(
+    open_stand: Callable[..., Microscope],
+    run_doc: Path,
+    documents: Documents,
+    options: dict[str, Any],
+    reason: str,
+    calls: list[str],
+) -> None:
+    """Unknown counts as on (FM-19): the run fails with §5.7's text whole; the turret and the stage stay."""
+    rig = _rig(open_stand())
+    af = RecordingAutofocus(engaged=True, **options)
+    rig.stand.override(Autofocus, af)
+    before = _here(rig.stand)
+
+    refused = _refused(rig.stand, run_doc, (FORTY,), (documents.forty,))
+
+    assert refused.reason == reason
+    assert af.calls == calls
+    _nothing_moved(rig)
+    assert _here(rig.stand) == before
+    stored = _stored(run_doc)
+    assert stored.status is StageStatus.failed
+    assert stored.error == f"PluginRunError: objective-offsets: {reason}"
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [MicroscopeHaltedError(), MotionStoppedError("the stage was stopped")],
+    ids=["halt", "motion-stopped"],
+)
+def test_a_halt_from_the_switch_off_reaches_the_caller_unchanged_in_objective_offsets(
+    open_stand: Callable[..., Microscope],
+    run_doc: Path,
+    documents: Documents,
+    monkeypatch: pytest.MonkeyPatch,
+    fault: Exception,
+) -> None:
+    """A halt or a stop is not a switch-off that failed: it passes first (FM-64)."""
+    rig = _rig(open_stand())
+    af = RecordingAutofocus(engaged=True)
+
+    def fails() -> None:
+        raise fault
+
+    monkeypatch.setattr(af, "disengage", fails)
+    rig.stand.override(Autofocus, af)
+
+    with pytest.raises(type(fault)) as info:
+        _run(rig.stand, run_doc, (FORTY,), (documents.forty,))
+
+    assert info.value is fault
+    _nothing_moved(rig)
+
+
+def test_a_halted_stand_switches_the_autofocus_off_and_objective_offsets_ends_on_the_halt(
+    open_stand: Callable[..., Microscope], run_doc: Path, documents: Documents
+) -> None:
+    """PFS off is the safe side; the turn then raises the halt (FM-64).
+
+    The stand's stop switches the autofocus off itself; one switched on again
+    while halted (at the stand) is what the tool's own switch-off meets.
+    """
+    rig = _rig(open_stand())
+    af = RecordingAutofocus(engaged=True)
+    rig.stand.override(Autofocus, af)
+    rig.stand.stop()
+    assert af.engaged is False  # the stop's own switch-off
+    af.engaged = True
+    af.calls.clear()
+    try:
+        with pytest.raises(MicroscopeHaltedError):
+            _run(rig.stand, run_doc, (FORTY,), (documents.forty,))
+    finally:
+        rig.stand.resume()
+
+    assert af.calls[:3] == ["is_engaged", "disengage", "is_engaged"]
+    assert _stored(run_doc).status is StageStatus.failed
+    assert rig.stage.moves == 0
+    assert rig.camera.snaps == 0
