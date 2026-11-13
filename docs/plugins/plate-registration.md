@@ -14,7 +14,7 @@ survives between two runs that the run document does not show:
 | Plugin | Does | Moves the stage? |
 |---|---|---|
 | `plate-registration` | Fits the plate from `refs` (wells you centred) and `walls` (wall touches) and fills `plate`, with the objective it was seen with. | No; it only reads the turret. A dry run is the same computation. |
-| `goto-well` | Drives to a well's centre or to the point on one of its walls, through the latest `plate`, in the frame of the objective in use; before any registration, to a well's centre where the stand's `[holder]` puts the plate ([Before registration](#before-registration-the-holders-estimate)). | Yes: **one absolute XY move**. |
+| `goto-well` | Drives to a well's centre or to the point on one of its walls, through the latest `plate`, in the frame of the objective in use; before any registration, to a well's centre where the stand's `[holder]` puts the plate ([Before registration](#before-registration-the-holders-estimate)). | Yes: **one absolute XY move**, after switching an engaged autofocus (PFS) off ([The autofocus](#the-autofocus-is-switched-off-before-the-move)). |
 
 ## The guided loop: never hunt for a well
 
@@ -54,8 +54,10 @@ JSON`, or an unexpected extra argument).
    reaches the first well before any reference, to the holder's estimate
    ([Before registration](#before-registration-the-holders-estimate)); centre it by eye
    and give that position as the seed.
-2. **Go to the next well.** `goto-well` drives there through the latest `plate`. Jog
-   until the well is where you want it (`smc stage jog`), and read `smc stage get`.
+2. **Go to the next well.** `goto-well` drives there through the latest `plate`; with
+   PFS on, it switches it off before the move, and you engage it again in the well
+   ([The autofocus](#the-autofocus-is-switched-off-before-the-move)). Jog until the
+   well is where you want it (`smc stage jog`), and read `smc stage get`.
 3. **Register again with every reference so far.** Each run replaces `plate`, and the
    run document's `params` keep every reference that made it: that is the audit
    trail. The fit replaces the seed, so the next well is found more accurately than
@@ -383,6 +385,36 @@ well up to 99 × 63 mm from where it is, and `goto-well` sends the move as compu
 to the stage's own end stops. Check the seed with `smc stage get` against the well you
 named before the first `goto-well`, and add the limits to the profile (a hardware
 session) before using a stand without them.
+
+### The autofocus is switched off before the move
+
+PFS locked in one well follows its reference over the wall into the next, whose
+plane lay at least 104 µm away at the 40x (Ti2-E session 3), with nothing holding the
+microscope (m2 §12.2 D2, FM-223). So `goto-well` switches an engaged autofocus off,
+and reads it back, just before its move: on both paths, every time (the same well's
+too), and whether it is locked or still searching. The move is then made with PFS off
+and Z where PFS held it. **Engage it again in the well** (the page's *Autofocus on*,
+or `smc autofocus engage`): `goto-well` never does, because at the 40x the way into a
+new well is a first lock from below, after a focus by eye (m2 §12.11.3).
+
+- It says so three ways: a WARNING, `autofocus_switched_off: true` in the result, and
+  the **first** `assumed` line (`the autofocus was switched off before the move, so
+  that no lock crossed a well's wall: engage it again in B2`), which the page's strip
+  shows.
+- An autofocus that is off is left off, and nothing is said. A stop asked before the
+  move keeps the lock and sends nothing. In a dry run nothing is switched (a switch-off
+  acts on the stand, even in a dry run).
+- A switch-off that raises, a read of it that raises, or an autofocus that still reads
+  on after it fails the run **before anything moves**: `the autofocus could not be
+  switched off before the move to A2 (CoreError: ...): the stage did not move, and PFS
+  may still be on: switch it off at the stand, then go to the well again`. A halted
+  stand switches it off, then the move raises the halt as before.
+- A scan run after it with `autofocus=if-engaged` runs without PFS unless you engage it
+  again.
+- Not yet the tools that move between wells themselves (`plate-walls`,
+  `objective-offsets`, `scan` with `autofocus=off`, #478), nor `smc stage move` and
+  `smc stage jog`, which know no plate: switch PFS off before them at the 40x
+  (m2 §12.11.3 step 3).
 
 ### Before registration: the holder's estimate
 

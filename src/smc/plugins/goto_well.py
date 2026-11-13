@@ -33,6 +33,14 @@ the first stage that moves the stand on a position computed from a measurement:
   ``assumed`` line), applies no objective offset, and fills no slot that any
   tool reads. A usable slot always wins: the parameters then only check that it
   is the same plate.
+* **An engaged autofocus is switched off before the move** (m3 §5.6 D1). PFS
+  locked in one well follows its reference over the wall into the next, whose
+  plane lay at least 104 µm away at the 40x (F11), with nothing holding the
+  microscope (m2 §12.2 D2, FM-223). So before every move, the same well's too,
+  PFS on (or searching) is switched off and read back, and the record says so
+  first; the operator engages it again in the well. A switch-off that fails or
+  does not hold fails the run before anything moves (FM-19). Not in a dry run:
+  nothing moves, and a switch-off would act on the stand.
 """
 
 from __future__ import annotations
@@ -41,7 +49,8 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from pydantic import Field, field_validator
 
-from smc.hardware.capabilities import ObjectiveTurret, XYStage
+from smc.hardware.capabilities import Autofocus, ObjectiveTurret, XYStage
+from smc.hardware.errors import HardwareError, MicroscopeHaltedError, MotionStoppedError
 from smc.plugins.api import PluginParams, PluginResult, RunContext
 from smc.plugins.errors import PluginRunError, UpstreamError
 from smc.plugins.objectives import log_frame, objective_for, plate_for_objective
@@ -124,6 +133,9 @@ class GotoWellResult(PluginResult):
     All three default to unknown, so that older run documents load.
     ``from_holder`` is true when the target is the holder's estimate and not a
     registered plate (m3 §5.5 D4); an older record loads as registered.
+    ``autofocus_switched_off`` is true when an engaged autofocus was switched off
+    before the move, so that no lock crossed a well's wall (m3 §5.6 D1); the
+    operator engages it again in the well. An older record loads as ``False``.
     """
 
     well: str
@@ -136,6 +148,7 @@ class GotoWellResult(PluginResult):
     plate_objective: str | None = None
     shift_um: tuple[float, float] | None = None
     from_holder: bool = False
+    autofocus_switched_off: bool = False
 
 
 class GotoWellPlugin:
@@ -171,8 +184,8 @@ class GotoWellPlugin:
                 slot whose result the model refuses. Nothing was moved.
             PluginRunError: The well is not on the plate, the ``plate`` parameter
                 is not the registered plate or not a plate ``useq`` knows, a wall
-                was asked of an estimate, or the turret is at an empty position;
-                nothing was moved.
+                was asked of an estimate, the turret is at an empty position, or
+                an engaged autofocus could not be switched off; nothing was moved.
             StopRequested: The operator stopped it before the move was sent.
             SafetyRefusedError: The target is outside the soft limits; the stage
                 did not move. The layer's errors are not caught (FM-64), and a
@@ -189,8 +202,10 @@ class GotoWellPlugin:
                 params.plate,
             )
             ctx.raise_if_stopped()
+            switched_off = _switch_off_before_move(microscope, ctx, estimate.well)
             arrived = microscope.require(XYStage).move_to_um(*estimate.target)
-            lines = list(estimate.assumed)
+            lines = [_switched_off_line(estimate.well)] if switched_off else []
+            lines.extend(estimate.assumed)
             if ctx.dry_run:
                 lines.append(_DRY_LINE)
             return GotoWellResult(
@@ -204,6 +219,7 @@ class GotoWellPlugin:
                 plate_objective=None,
                 shift_um=None,
                 from_holder=True,
+                autofocus_switched_off=switched_off,
                 assumed=tuple(lines),
             )
         if params.plate is not None and params.plate != plate.plate:
@@ -237,9 +253,11 @@ class GotoWellPlugin:
             raise PluginRunError(_NAME, problem)
 
         ctx.raise_if_stopped()
+        switched_off = _switch_off_before_move(microscope, ctx, well)
         landed = microscope.require(XYStage).move_to_um(*target)
 
-        assumed = [f"plate: {line}" for line in plate.assumed]
+        assumed = [_switched_off_line(well)] if switched_off else []
+        assumed.extend(f"plate: {line}" for line in plate.assumed)
         assumed.extend(frame.assumed)
         if ctx.dry_run:
             assumed.append(_DRY_LINE)
@@ -253,8 +271,80 @@ class GotoWellPlugin:
             objective=objective,
             plate_objective=plate.objective,
             shift_um=frame.shift_um,
+            autofocus_switched_off=switched_off,
             assumed=tuple(assumed),
         )
+
+
+def _switched_off_line(well: str) -> str:
+    """The first ``assumed`` line of a run that switched the autofocus off (m3 §5.6 D1).
+
+    First, so that the page's strip shows it (``_assumed_tail``).
+    """
+    return (
+        "the autofocus was switched off before the move, so that no lock crossed a "
+        f"well's wall: engage it again in {well}"
+    )
+
+
+def _switch_off_before_move(microscope: Microscope, ctx: RunContext, well: str) -> bool:
+    """Switch an engaged autofocus off and read it back; whether this switched it off (m3 §5.6 D1).
+
+    Called just before the one move, after the stop check, with nothing between:
+    a lock carried over a well's wall drives Z to the plane its offset names in
+    the next well, unguarded (m2 §12.2 D2). ``is_engaged()`` decides, not
+    ``is_locked()``: PFS searching drives Z the moment it finds its reference.
+    No call at all without an autofocus or in a dry run, where nothing moves
+    and a switch-off would act on the stand (m2 §3.2). One that is off is left
+    off, and nothing is said.
+
+    Raises:
+        PluginRunError: A read or the switch-off raised, or it still reads on:
+            PFS may be on, so nothing may move (FM-19). Raised outside the
+            handler, with the error's text only (FM-98).
+        MicroscopeHaltedError, MotionStoppedError: Passed first (FM-64).
+    """
+    af = microscope.get(Autofocus)
+    if af is None or ctx.dry_run:
+        return False
+    cause: str | None = None
+    still_on = False
+    try:
+        if not af.is_engaged():
+            return False
+        af.disengage()
+        still_on = af.is_engaged()
+    except (MicroscopeHaltedError, MotionStoppedError):
+        raise
+    except HardwareError as exc:
+        cause = _one_line(exc)
+    if cause is not None:
+        raise PluginRunError(
+            _NAME,
+            f"the autofocus could not be switched off before the move to {well} "
+            f"({cause}): the stage did not move, and PFS may still be on: switch it "
+            "off at the stand, then go to the well again",
+        )
+    if still_on:
+        raise PluginRunError(
+            _NAME,
+            f"the autofocus still reads on after it was switched off before the move "
+            f"to {well}: the stage did not move: switch it off at the stand, then go "
+            "to the well again",
+        )
+    ctx.logger.warning(
+        "%s: the autofocus was switched off before the move to %s, so that no lock "
+        "crosses a well's wall (m2 §12.2 D2): engage it again there",
+        _NAME,
+        well,
+    )
+    return True
+
+
+def _one_line(exc: BaseException) -> str:
+    """``<Type>: <first line of the message>``: a device's error, for the run's text."""
+    lines = str(exc).splitlines()
+    return f"{type(exc).__name__}: {lines[0] if lines else ''}".rstrip()
 
 
 class _Estimate(NamedTuple):

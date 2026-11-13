@@ -142,6 +142,7 @@ if TYPE_CHECKING:
     from smc.hardware.profile import HolderSection, Profile
 
 __all__ = [
+    "JOG_WALL_MARGIN_UM",
     "KEY_PARAMS",
     "LIVE_PERIOD_S",
     "MORE_STAGE",
@@ -163,6 +164,7 @@ __all__ = [
     "ScanSummary",
     "ToolView",
     "WellView",
+    "jog_crossing",
 ]
 
 log = logging.getLogger("smc.ui")
@@ -291,6 +293,12 @@ NOT_CONNECTED = "the stand is not connected"
 #: Wells built for a plate are kept (339 ms for 1536 of them); a registration
 #: changes the key rarely, so a handful is plenty.
 _GEOMETRY_KEPT = 4
+
+#: How far inside one well a jog must start and end for PFS to stay on, in µm.
+#: Chosen (m5 §6.6 D1): the holder's estimate can be a few hundred µm off, and the
+#: map draws a registered plate at its registration's positions, not shifted to the
+#: objective in use; a jog that ends this close to a wall switches PFS off a step early.
+JOG_WALL_MARGIN_UM = 500.0
 
 _Capture = TypeVar("_Capture", WellRef, WallTouch)
 
@@ -802,6 +810,36 @@ class PageStatus:
     goto: str = ""
     clock: RunClock | None = None
     chain: ChainStatus | None = None
+
+
+def jog_crossing(
+    geometries: Sequence[WellGeometry],
+    placed: bool,
+    start_um: tuple[float, float],
+    target_um: tuple[float, float],
+) -> str | None:
+    """Why a jog from ``start_um`` to ``target_um`` may cross a well's wall; ``None``: it stays inside one (m5 §6.6 D1).
+
+    PFS locked in one well follows its reference over the wall into the next,
+    whose plane can lie 104 µm away at the 40x (F11), so the page switches it off
+    before a jog that may leave the well. A jog stays inside one well when the map
+    places the plate and both ends lie ``JOG_WALL_MARGIN_UM`` or more inside the
+    same well. A well shrunk by the margin is convex and the pad jogs along one
+    axis at a time, so such a jog never leaves the well on its way. Unknown counts
+    as crossing (FM-19): a map that does not place the plate, or a start on the
+    plastic or too near a wall.
+    """
+    if not placed:
+        return "the map does not place the plate"
+    well = next(
+        (g for g in geometries if g.contains(*start_um, margin_um=JOG_WALL_MARGIN_UM)),
+        None,
+    )
+    if well is None:
+        return f"it does not start {JOG_WALL_MARGIN_UM:.0f} µm inside a well"
+    if not well.contains(*target_um, margin_um=JOG_WALL_MARGIN_UM):
+        return f"it leaves {well.well}"
+    return None
 
 
 def _one_line(error: BaseException) -> str:
@@ -3163,14 +3201,100 @@ class PlatePage:
     def jog_xy(self, dx_um: float, dy_um: float) -> None:
         """``smc stage jog dx dy``: one activity per click, or between two frames of live.
 
+        With the autofocus on, a jog that may leave a well switches it off first
+        (m5 §6.6): a lock carried over a wall drives Z to the next well's plane. The
+        wells and whether the map places the plate are read here, at the click, as
+        ``goto`` reads them; the stage's position is read on the worker, just before
+        the move. An unreadable run document counts as a map that does not place the
+        plate (FM-19).
+
         Raises:
             RuntimeError: Another activity is going (``<name> is running``), the
                 page is closed, or live is ending or holds a waiting action.
         """
+        doc, unreadable = self._document()
+        geometries, pose = self._geometries(doc)
+        placed = unreadable is None and (
+            pose.kind in ("registered", "seed")
+            or (pose.kind == "estimated" and self._plate_chosen)
+        )
         self._drive(
             "stage jog",
             XYStage,
-            lambda: drive.jog_xy(self._stand(), dx_um, dy_um),
+            lambda: self._jog_xy_across_walls(dx_um, dy_um, geometries, placed),
+        )
+
+    def _jog_xy_across_walls(
+        self,
+        dx_um: float,
+        dy_um: float,
+        geometries: Sequence[WellGeometry],
+        placed: bool,
+    ) -> DriveResult:
+        """``drive.jog_xy``, after switching an engaged autofocus off when the jog may leave a well (m5 §6.6 D2).
+
+        On the worker, with no lock held across a device call (FM-70). Nothing is
+        read from the autofocus in a dry run (a switch-off acts there, m2 §3.2) or
+        on a stand without one. Searching counts as on (``is_engaged()``): PFS
+        drives Z the moment it finds its reference. A read or a switch-off that
+        fails, or one that does not hold, moves nothing and says so (D3); each text
+        is built from the error inside the handler and returned after it (FM-98).
+        ``drive.jog_xy`` stays the one call that moves.
+        """
+        stand = self._stand()
+        af = stand.get(Autofocus)
+        if stand.dry_run or af is None:
+            return drive.jog_xy(stand, dx_um, dy_um)
+        cause: str | None = None
+        reason: str | None = None
+        still_on = False
+        try:
+            # Off: no reason, and the jog below is made as before. The jog itself is
+            # never inside this handler: its failure is not a switch-off's.
+            if af.is_engaged():
+                start = stand.require(XYStage).position_um()
+                reason = jog_crossing(
+                    geometries,
+                    placed,
+                    (start.x_um, start.y_um),
+                    (start.x_um + dx_um, start.y_um + dy_um),
+                )
+                if reason is not None:
+                    af.disengage()
+                    still_on = af.is_engaged()
+        except HardwareError as exc:
+            cause = f"{type(exc).__name__}: {_one_line(exc)}"
+        if cause is not None:
+            return DriveResult(
+                f"the autofocus could not be switched off before the move ({cause}): "
+                "the stage did not move, and PFS may still be on: switch it off, then "
+                "jog again",
+                reached=False,
+            )
+        if reason is None:
+            return drive.jog_xy(stand, dx_um, dy_um)
+        if still_on:
+            return DriveResult(
+                "the autofocus still reads on after it was switched off before the "
+                "move: the stage did not move: switch it off at the stand, then jog "
+                "again",
+                reached=False,
+            )
+        switched = (
+            f"the autofocus was switched off before the move ({reason}), so that no "
+            "lock crosses a well's wall"
+        )
+        failed: str | None = None
+        try:
+            jogged = drive.jog_xy(stand, dx_um, dy_um)
+        except HardwareError as exc:
+            failed = f"{type(exc).__name__}: {_one_line(exc)}"
+        if failed is not None:
+            return DriveResult(
+                f"{switched}; then the jog failed: {failed}", reached=False
+            )
+        return DriveResult(
+            f"{switched}: engage it again here; {jogged.text}", reached=jogged.reached
         )
 
     def jog_z(self, dz_um: float) -> None:
