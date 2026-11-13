@@ -17,9 +17,14 @@ page is how to use it.
 | It images | nothing | each well's four walls, a few frames a side |
 | Needs | nothing | the camera's calibration at the objective in place |
 
-It touches no Z, turret, autofocus or light. The PFS stays as it is; the tool reads
-no Z and moves none, and whether the PFS holds its lock while the stage looks at the
-walls is **not verified** (see the end).
+It touches no Z, turret or light. **It switches the PFS off before anything moves, and
+leaves it off.** A lock taken in one well follows its reference over the wall into the
+next well, whose plane can lie more than 100 µm away at the 40×, with nothing holding the
+microscope; so an autofocus that is on (or still searching) is switched off once, read
+back off, and every wall and every well is walked with it off, Z where the PFS held it.
+The tool never engages it again: lock it yourself on the sample, in the well you work in.
+One that is already off is left alone and nothing is said. Whether the walls are still
+found at the 40× with the PFS off across wells is **not verified** (see the end).
 
 ## At the stand
 
@@ -127,9 +132,11 @@ with:
   `rms_um` (how far the points lie from the circle) and, per wall, where the frame was
   taken, its edge points and how many frames the side took; the pixel size and frame of
   the calibration, the search distance, and the seconds the run took.
-- `assumed`: that the stage reports no soft limits, when it does not; that **two wells**
-  check their distance only, a third checks the fit; and the frames that could not be
-  saved.
+- `assumed`: first, when the PFS was on, that it was switched off before anything moved
+  (`the autofocus was switched off before anything moved, so that no lock crossed a
+  well's wall: engage it again on the sample`; a WARNING says it too); that the stage
+  reports no soft limits, when it does not; that **two wells** check their distance only,
+  a third checks the fit; and the frames that could not be saved.
 
 **Frames.** With `save_frames` (the default) the centred frame of each wall is a TIFF,
 `plate-walls/<token>/<well>_<side>.tif` beside the run document (`B3_+X.tif`), with the
@@ -157,6 +164,8 @@ first group is checked **before anything moves**.
 | `search_um <s> is more than the well's radius <r> µm` | The search may not pass the well's centre. |
 | `up to <n> frames: use a lower magnification or a smaller search_um` | More than 600 frames could be needed. |
 | `<well>'s <side> wall would be looked for at (<x>, <y>) µm, outside the stage's soft limits` | A frame of the walk would leave the travel: put the well further inside, or give a smaller `search_um`. |
+| `the autofocus could not be switched off before anything moved (<error>): nothing moved, and PFS may still be on: switch it off at the stand, then run plate-walls again` | The PFS was on, and switching it off or reading it back failed. Unknown counts as on: switch it off at the stand. |
+| `the autofocus still reads on after it was switched off: nothing moved: …` | The PFS did not go off. Switch it off at the stand. |
 
 The others come **after the stage has moved**, which stays where it is and says where in
 a WARNING:
@@ -209,5 +218,6 @@ to a fourth well (record that well where `goto-well` left the stage and run `pla
 on it with one of the first three: its `center_xy_um − recorded_xy_um` is how far
 `goto-well` landed from its centre, to be under 100 µm); the 4× objective; the light and
 exposure the walls need; plates other than the 24-well; which way the plate's columns
-run on the stage; whether the PFS holds its lock while the stage looks at the walls.
+run on the stage; whether the walls are still found at the 40× with the PFS off across wells
+(a wall that is not found is a refusal that names the well).
 `max_residual_um = 100` was set before any plate was registered from images.

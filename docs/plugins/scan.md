@@ -34,7 +34,7 @@ smc run scan -p <profile> --run-doc run.json --dry-run
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `autofocus` | `if-engaged` | `if-engaged`: use it when it is on and locked at the start. `required`: refuse to start unless it is. `off`: never touch it, not even to read it. |
+| `autofocus` | `if-engaged` | `if-engaged`: use it when it is on and locked at the start. `required`: refuse to start unless it is. `off`: never used, and **refused when it is on** (a lock would cross every well's wall): the one read `off` makes is whether it is on. |
 | `max_failed_in_row` | 3 | This many fields failing in a row end the scan (1 to 100). |
 | `max_unlocked_in_row` | 5 | This many fields in a row on which the autofocus would not lock end the scan (1 to 1000). |
 | `landing_tolerance` | 0.05 | How far a field may land from its target, as a fraction of the smaller side of the plan's field of view (above 0, at most 0.5). A field that landed farther is failed, not photographed. 0.05 is 4.8 µm for the demo's 10× (a field of 128 × 96 µm). Read the stand's real agreement at the first hardware session before trusting a fraction. |
@@ -86,7 +86,15 @@ written, and the message says what to do:
    camera that reports no pixel size (0, or a value that is not finite) is not
    compared either, and `assumed` says that neither the plan's size nor a change
    during the scan was checked.
-7. **The autofocus**, as `autofocus` says (above). With `--resume`, a scan whose
+7. **The autofocus**, as `autofocus` says (above). With `autofocus=off`, an autofocus that
+   is on or still searching is refused, and so is one whose state cannot be read (a dry
+   run too, and on a resume): `autofocus=off, and the autofocus is on: the scan would carry
+   its lock over every well's wall with no guard (m2 §12.2 D2): run with
+   autofocus=if-engaged to use it, or switch it off first`, or `autofocus=off, and
+   whether the autofocus is on could not be read (<error>): a lock would cross every
+   well's wall: switch it off at the stand, then run the scan again`. The scan does not
+   switch it off for you: `off` is what you asked, and you may have meant `if-engaged`.
+   It is the one read `autofocus=off` makes of the autofocus. With `--resume`, a scan whose
    checkpoint holds frames taken with the autofocus locked is refused when it is not
    locked now (and `autofocus` is not `off`): `the scan being resumed used the
    autofocus, which is not locked now (the scan switches it off between wells, and a
@@ -102,10 +110,10 @@ written, and the message says what to do:
    set [safety] z_soft_limits_um`), `focus_range_um` is not above the Z jog limit, and
    the sweep around the Z read now lies inside the soft limits (`the focus sweep around
    <z> µm would reach <plane> µm, outside the soft limits [<lo>, <hi>] µm`). With
-   `autofocus=off`, an autofocus that is on is refused: the sweep's Z moves switch it
-   off and nothing would lock it again or say so (`cell_focus moves Z, which switches
-   the autofocus off, and it is on: run with autofocus=if-engaged to use it, or switch
-   it off first`). It is the one read `autofocus=off` makes of the autofocus.
+   `autofocus=off`, an autofocus that is on is refused, as check 7 says, for every
+   `cell_focus`: the sweep's Z moves would switch it off, and nothing would lock it again
+   or say so. This is the same refusal and the same text, the one read `autofocus=off`
+   makes of the autofocus.
 
 ## During the scan
 
@@ -133,8 +141,8 @@ stand, then run scan --resume`, or `the autofocus still reads on after it was sw
 off before well <w>: …`. `assumed` says `the autofocus was switched off before the first
 field of <w> wells, so that no lock crossed a well's wall, and engaged again after it on
 <a> fields, locked on <l> of them`, apart from the engages after a lost lock. With
-`autofocus=off` the scan never reads PFS, so it cannot switch it off at a wall: switch
-PFS off yourself before such a scan.
+`autofocus=off` the scan does not use PFS, so it cannot switch it off at a wall, and it
+refuses to start while PFS is on (check 7): a lock left on would cross every wall.
 
 **A trip ends the scan.** An engage that moves Z out of its bound (at a well's first
 field, after a lost lock, or after the focus on the cells) switches PFS off and makes

@@ -411,10 +411,10 @@ new well is a first lock from below, after a focus by eye (m2 §12.11.3).
   stand switches it off, then the move raises the halt as before.
 - A scan run after it with `autofocus=if-engaged` runs without PFS unless you engage it
   again.
-- Not yet the tools that move between wells themselves (`plate-walls`,
-  `objective-offsets`, `scan` with `autofocus=off`, #478), nor `smc stage move` and
-  `smc stage jog`, which know no plate: switch PFS off before them at the 40x
-  (m2 §12.11.3 step 3).
+- `plate-walls` and `objective-offsets` switch it off once before anything moves, and
+  `scan` with `autofocus=off` refuses an autofocus that is on (#478): see their pages.
+  Not yet `smc stage move` and `smc stage jog`, which know no plate: switch PFS off
+  before them at the 40x (m2 §12.11.3 step 3).
 
 ### Before registration: the holder's estimate
 
