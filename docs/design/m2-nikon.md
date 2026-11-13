@@ -4305,7 +4305,12 @@ with `--profile nikon-ti2`:
   *Not chosen*), at every objective; #416. *Settled for the scan by #416*
   (m3 §8): the scan switches PFS off before the first field of every well
   and engages it again there, under D2. `goto-well` and the page's stage
-  moves still carry a lock over a wall (#454).
+  moves still carry a lock over a wall (#454). *Settled for them by #454*
+  (m3 §5.6, m5 §6.6): `goto-well` switches PFS off before every move, and
+  the page's jog before one that may leave a well; the operator engages it
+  again there. The tools that move between wells with PFS as it is
+  (`plate-walls`, `objective-offsets`, `scan` with `autofocus=off`) and the
+  CLI's stage moves still carry it.
 
 ## 13. Offsets between objectives (#340)
 

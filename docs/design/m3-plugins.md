@@ -2029,6 +2029,8 @@ no tool reads.
 one in place, `plate_objective=None`, `shift_um=None`, and `assumed` in this
 order (the strip shows the first, `_assumed_tail`):
 
+0. *Since #454*, when `goto-well` switched the autofocus off before its move,
+   §5.6 D1's line;
 1. `target estimated from the stand's holder, not registered: the <plate>
    centred at stage (<x>, <y>) µm, <not turned | turned 180°>` (whole µm,
    `:.0f`);
@@ -2086,13 +2088,110 @@ FM-151).
 assumed lines; the layer's guards (soft limits, the turret, STOP, dry run); an
 estimate fills no slot and feeds no tool (m5 §15 D2, D8); a capture records the
 well the operator clicked (m5 §15 D6). PFS carried across the walls by a move
-to another well is #454's, for both paths (FM-223).
+to another well is #454's, for both paths (FM-223). *Settled by #454*
+(§5.6): `goto-well` switches an engaged autofocus off before its move.
 
 **Tests** are named in #462's plan. **Failure modes**: FM-64, FM-73 (the 96-well
 and a turned plate), FM-85, FM-98, FM-125, FM-139, FM-151, FM-169, FM-203 (the
 estimate's offset and rotation non-zero), FM-206 (what the page can foresee
 it refuses before `run`), FM-217 (amended: a drive on an estimated map runs
 `goto-well` to the estimate, and its record says so).
+
+### 5.6 PFS across a well's wall: `goto-well` (#454)
+
+**Merging this section decides it** (with m5 §6.6; measured on the Ti2-E fake,
+`main` 26d912b, 2026-11-13). Since #416 the scan switches PFS off before every
+well (§8, *Refined while planning #416*); `goto-well` sent its one move with PFS
+left as it was, so a lock taken in one well was carried, locked, into the next,
+and PFS followed its reference over the wall with no guard (m2 §12.2 D2, *Not
+chosen*: no watchdog between actions; FM-223). Measured: PFS locked at a seen
+offset in one well, an XY move of one pitch to a well whose plane lies 60 µm
+toward the sample leaves PFS locked, and Z reads +60.00 µm at the next locked
+read, with no word. With PFS switched off before the move, Z reads 0.00 µm of
+change after it, and an `engage()` at the seen offset there trips D2's band
+(`AutofocusExcursionError`, `E` = 50 µm) at +60 µm and locks at +40 µm. A
+switch-off in a dry run acts (m2 §3.2): `is_engaged()` reads `False` after it.
+
+**D1. `goto-well` switches an engaged autofocus off before its move, and
+says so.** On both paths (a registered plate, the holder's estimate), after
+every refusal of §5 and §5.5 D3 and after `ctx.raise_if_stopped()`, just
+before the one `move_to_um`: `microscope.get(Autofocus)`; when there is one
+and the run is not a dry run, `is_engaged()`; on, `disengage()` and
+`is_engaged()` again. The move is then made with PFS off and Z where PFS held
+it. `goto-well` never engages it again: the operator does, in the new well
+(the page's *Autofocus on*, or `smc autofocus engage`), under D2's band around
+where Z is, at the seen offset (m2 §12.2 D1) or as a first lock from the
+floor (m2 §12.11 D9). `requires` stays `(XYStage,)`: a stand with no
+autofocus moves as today.
+- **Every `goto-well`, the same well's too.** No position is read before the
+  move (`test_goto_well_sends_one_move_and_reads_no_position_before_it`
+  stands): the target is a well's place computed from a plate that may be an
+  estimate a few hundred µm off, and the start may lie in any well or on the
+  plastic between. A drive to the well the stage is already in (re-centring,
+  a wall point) is the operator's rare act; it costs one engage at a seen
+  offset, which locked within 0.04 µm in one well (m2 §12.11.1).
+- **A stop asked before the switch-off sends nothing** (`ctx.raise_if_stopped()`
+  first): the lock is kept, nothing moved (#459's lesson for the scan).
+- **An autofocus that is off is left off**, and nothing is said.
+- **Searching counts as on** (`is_engaged()`, not `is_locked()`): PFS on and
+  searching drives Z to its offset's plane the moment it finds the reference
+  (m2 §12.11 D9).
+- **Not in a dry run**: nothing moves, so no lock crosses a wall, and the
+  switch-off would act on the stand.
+- **A halted stand**: the switch-off is made (a safe call, it runs while
+  halted), and the move then raises `MicroscopeHaltedError` as today. PFS off
+  is the safe side; the WARNING says it was switched off.
+- **A switch-off that cannot be made or read back fails the run before
+  anything moves** (unknown counts as on, FM-19): a `HardwareError` from any of
+  the three calls is a `PluginRunError` raised outside the handler (FM-98):
+  `the autofocus could not be switched off before the move to <well> (<Type>:
+  <message>): the stage did not move, and PFS may still be on: switch it off
+  at the stand, then go to the well again`; `is_engaged()` still `True` after
+  `disengage()`: `the autofocus still reads on after it was switched off
+  before the move to <well>: the stage did not move: switch it off at the
+  stand, then go to the well again`. `MicroscopeHaltedError` and
+  `MotionStoppedError` pass first (FM-64). `<well>` is the well's name as
+  `well_geometry` normalised it.
+- **Said three ways.** One WARNING before the move: `goto-well: the autofocus
+  was switched off before the move to <well>, so that no lock crosses a
+  well's wall (m2 §12.2 D2): engage it again there`. The result's new field
+  `autofocus_switched_off: bool = False` (an older record loads as `False`).
+  And the **first** `assumed` line, on both paths, so that the page's strip
+  shows it (`_assumed_tail`): `the autofocus was switched off before the move,
+  so that no lock crossed a well's wall: engage it again in <well>`. §5.5 D4's
+  list gains it as line 0, before the estimate's line.
+- **Not chosen**:
+  - *The scan's rule only when the target lies in another well than the
+    start* (m5 §6.6's rule for a jog). It needs a position read before the
+    move and a well test on a plate that may be an estimate, for a case the
+    operator rarely makes; a jog, by contrast, is the way to look around one
+    well under lock, and m5 §6.6 keeps PFS on there.
+  - *Engaging it again after the move*, as the scan does at a well's first
+    field. At the 40× the way into a new well is a first lock from below by
+    the operator (m2 §12.11.3), whose premise is a focus by eye with PFS off;
+    an engage at the seen offset would skip it, bounded by `E` only
+    (m2 §12.11.5). The scan engages again because it must image the well.
+  - *Refusing the move while PFS is on*: one more click for the same end
+    state, and a refusal would read as a fault.
+  - *Lowering Z before the move*: §8's *Not chosen* (D2's band is centred on
+    where Z starts).
+- **Not here**: the page's jog (m5 §6.6); the CLI's `smc stage move` and
+  `smc stage jog`, which know no plate (m2 §12.11 D9, *Not chosen*: no radius;
+  m2 §12.11.3 step 3 stays their procedure); the tools that move between wells
+  with PFS as it is (`plate-walls` and `objective-offsets` through their shared
+  loop, `scan` with `autofocus=off`): a follow-up of #454 (FM-223, *Not
+  covered*). A switch-off before a scan leaves the scan with `autofocus=
+  if-engaged` running without PFS unless the operator engages it again; the
+  WARNING and the strip say to (#459 weighs the scan's own word for it).
+
+**Tests of #454** (names in the plan on the issue): on the demo with the
+recording `_Autofocus` fake, the switch-off before the move on both paths and
+its `assumed` line first; an autofocus that is off left alone; nothing in a
+dry run; a stop before the move sending nothing; a switch-off that raises, a
+state read that raises and one that still reads on, each failing with the
+stage where it was; on the Ti2-E fake, Z not following into a well whose
+plane lies 60 µm higher. **Failure modes**: FM-19, FM-64, FM-98, FM-129,
+FM-215, FM-223.
 
 ## 6. Automatic plate finding (#20)
 
@@ -3051,7 +3150,9 @@ stand).
   - *Keeping the lock across walls under a watchdog*: m2 §12.2 D2's *Not
     chosen* (a thread of its own, M5).
 - **Not here**: `goto-well` and the page's stage moves carry a lock over a
-  wall the same way (#454). NIS-Elements' own acquisition from
+  wall the same way (#454). *Settled by #454*: `goto-well` switches it off
+  before every move (§5.6), the page's jog before one that leaves a well
+  (m5 §6.6). NIS-Elements' own acquisition from
   `nis-export`'s positions engages PFS at each position's offset, outside
   smc.
 
