@@ -35,6 +35,7 @@ from smc.ui.guide import (
     GOTO_WALL_NEEDS_REGISTRATION,
     NO_CALIBRATION_FOR_SIDES,
     PLATE_NOT_CHOSEN,
+    GotoAnswer,
 )
 
 PROFILES = Path(__file__).resolve().parents[2] / "profiles"
@@ -341,7 +342,9 @@ def test_goto_on_an_estimated_map_passes_the_plate_and_the_orientation(
     # The Greiner 24-well's pitch is 19 450 µm, its grid 6 by 4: turned 180° about the
     # holder, B3 lies where C4 does on the plate not turned, written here by hand.
     assert _where(microscope) == pytest.approx((10_125.0, -10_050.0), abs=0.01)
-    assert page.status().goto.startswith("goto-well done in ")
+    assert page.status().goto.startswith("Go to done in ")
+    # The row says to centre it by eye: the drive went to the holder's estimate (m5 §17.12.3).
+    assert page.status().goto_answer == GotoAnswer("B3", "at", True, "")
 
 
 def test_goto_on_an_unplaced_map_is_refused_before_anything_starts(

@@ -1117,7 +1117,7 @@ def test_the_turned_state_picks_the_selects_turned_label_and_waits_for_the_outco
         label="Turned 180\N{DEGREE SIGN}: A1 at the front right"
     )
     page.locator.assert_any_call("pre")
-    page.locator.return_value.filter.assert_any_call(has_text="plate-orientation done")
+    page.locator.return_value.filter.assert_any_call(has_text="Plate orientation done")
     page.locator.return_value.filter.return_value.first.wait_for.assert_called_once_with()
     page.wait_for_timeout.assert_not_called()
 
@@ -1554,14 +1554,14 @@ def test_the_wells_laid_out_state_clicks_the_pages_own_buttons_and_ends_on_texts
         r"click:^2\. Plate",
         "wait-select",
         f"select:{UPRIGHT}",
-        "wait:plate-orientation done",
+        "wait:Plate orientation done",
         "click:Register the plate",
-        "wait:plate-registration done",
+        "wait:Registration done",
         r"click:^3\. Wells",
         "fill:B2,B11",
         "press:Enter",
         "click:Lay out the fields",
-        "wait:scan-plan done",
+        "wait:Field layout done",
         r"wait:Fields: \d+ in 2 wells",
     ]
     page.wait_for_timeout.assert_not_called()
@@ -1581,7 +1581,7 @@ def test_the_wells_laid_out_state_leaves_a_plate_that_is_already_upright_alone(
         "click:Register the plate",
     ]
     assert not [line for line in order if line.startswith("select:")]
-    assert "wait:plate-orientation done" not in order
+    assert "wait:Plate orientation done" not in order
     page.wait_for_timeout.assert_not_called()
 
 
@@ -1589,9 +1589,9 @@ def test_the_scanned_state_starts_the_scan_and_waits_for_its_own_outcome(snap) -
     page, order = _recording_page()
     assert snap.ACTIONS["scanned"] is snap._act_scanned
     snap._act_scanned(page, _no_chain())
-    # `scan done` is not in `scan-plan done`: the wait is for the scan's own outcome line.
-    assert order == [r"click:^4\. Scan", "click:Start the scan", "wait:scan done"]
-    assert "scan done" not in "scan-plan done in 0.0 s"
+    # `Scan done` is not in `Field layout done`: the wait is for the scan's own outcome line.
+    assert order == [r"click:^4\. Scan", "click:Start the scan", "wait:Scan done"]
+    assert "scan done" not in "field layout done in 0.0 s"
     page.wait_for_timeout.assert_not_called()
 
 
@@ -1602,12 +1602,12 @@ def test_the_results_all_state_opens_results_waits_for_the_done_row_runs_all_and
     assert snap.ACTIONS["results-all"] is snap._act_results_all
     snap._act_results_all(page, _no_chain())
     # The click on the button comes after the wait for the redrawn row (the screen is swapped by
-    # the server), and the last wait is the strip's own `run all done`: no delay anywhere (FM-162).
+    # the server), and the last wait is the strip's own `Run all that are left: done`: no delay anywhere (FM-162).
     assert order == [
         r"click:^5\. Results",
         f"wait-nth1:{snap.DONE_ROW.pattern}",
         "click:Run all that are left",
-        "wait:run all done",
+        "wait:Run all that are left: done",
     ]
     page.wait_for_timeout.assert_not_called()
     # The button is found by its whole name: no row's *Run* answers to it.
@@ -1910,3 +1910,51 @@ def test_every_param_of_the_chain_is_a_param_of_its_plugin(snap) -> None:
     for step in [*snap.CHAIN, snap.ROUTE_STEP]:
         params = load(step.plugin).plugin.Params
         parse_params(params, [f"{key}={value}" for key, value in step.params])
+
+
+# --- round 2: the header's height and the drive bar's last control (m5 §17.12 D15, #475) ---
+
+
+def test_on_screen_adds_the_headers_height_when_the_browser_says_it(
+    snap, monkeypatch
+) -> None:
+    page = MagicMock()
+    page.viewport_size = {"width": 1280, "height": 800}
+    parts = _located({"STOP": _box(1200, 5, 60, 30)})
+    monkeypatch.setattr(snap, "_frame_parts", lambda page: parts)
+    page.evaluate.return_value = 137.4
+
+    lines = snap._on_screen(page)
+
+    assert lines[-1] == "header: 137 px"
+    assert lines[0].startswith("STOP: yes (")
+    # The script it ran reads the sticky element's height through the shadow roots.
+    page.evaluate.assert_called_once_with(snap._HEADER_HEIGHT_JS)
+    assert "sticky" in snap._HEADER_HEIGHT_JS
+    assert "shadowRoot" in snap._HEADER_HEIGHT_JS
+    # A page that gives no number (a fake, a header the browser cannot find) says nothing:
+    # nothing is guessed.
+    for answer in (None, "tall", True):
+        page.evaluate.return_value = answer
+        assert not [
+            line for line in snap._on_screen(page) if line.startswith("header:")
+        ]
+    page.evaluate.side_effect = RuntimeError("the page is closed")
+    assert not [line for line in snap._on_screen(page) if line.startswith("header:")]
+
+
+def test_the_drive_bars_part_is_its_last_control_the_drive_toggle(snap) -> None:
+    page = MagicMock()
+    parts = dict(snap._frame_parts(page))
+    assert list(parts) == ["STOP", "step bar", "map", "image", "drive bar"]
+    # The toggle is the lowest control of the bar (the notes under it may be below the fold).
+    names = [
+        call.kwargs.get("name")
+        for call in page.get_by_role.call_args_list
+        if call.args == ("button",)
+    ]
+    patterns = [name for name in names if hasattr(name, "pattern")]
+    assert [p.pattern for p in patterns][-1] == r"^Drive\b"
+    assert snap._DRIVE_TOGGLE.search("Drive (click moves the stage)")
+    # (*Drive to* is a select, not a button: the role filter leaves it out.)
+    assert not snap._DRIVE_TOGGLE.search("Light off")

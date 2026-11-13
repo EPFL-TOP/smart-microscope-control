@@ -54,7 +54,12 @@ from smc.hardware.capabilities import (
     XYStage,
     ZStage,
 )
-from smc.hardware.errors import HardwareError, StopRefusedError
+from smc.hardware.errors import (
+    HardwareError,
+    MicroscopeHaltedError,
+    MotionStoppedError,
+    StopRefusedError,
+)
 from smc.hardware.profile import Profile
 from smc.hardware.roles import Role
 from smc.plugins import runner as runner_mod
@@ -104,9 +109,13 @@ from smc.ui.guide import (
     GOTO_UNPLACED,
     NO_CALIBRATION_FOR_SIDES,
     PLATE_NOT_CHOSEN,
+    REGISTER_ACROSS_A_TURN,
+    REGISTER_OBJECTIVES_DIFFER,
     WALLS_DRY_RUN,
     WALLS_NEED_CALIBRATION,
     CalibrationNote,
+    GotoAnswer,
+    local_time,
     scan_plan_card_lines,
     walls_centres_problem,
     walls_square_wells,
@@ -596,7 +605,7 @@ def test_a_click_in_drive_mode_runs_goto_well_with_the_wells_name_and_side(
     assert page.current == "B3"
     assert page.selection == ()
     assert page.status().outcome is not None
-    assert page.status().outcome.startswith("goto-well done in ")
+    assert page.status().outcome.startswith("Go to done in ")
 
 
 def test_the_goto_line_says_the_refusal_then_the_runs_outcome(
@@ -612,17 +621,19 @@ def test_the_goto_line_says_the_refusal_then_the_runs_outcome(
             assert Slow.started.wait(5)
             with _refuses(RuntimeError, "slow is running"):
                 page.goto("B2")
-            assert page.status().goto == "slow is running"
+            # A click refused because an activity runs is no answer: the drive's text,
+            # here none, stays as it was (#444's Report).
+            assert page.status().goto == ""
         finally:
             Slow.release.set()
         assert page.join(10.0)
-        # Another activity's end is not a drive's answer.
-        assert page.status().goto == "slow is running"
+        # Another activity's end is not a drive's answer either.
+        assert page.status().goto == ""
         page.goto("B2")
         assert page.join(10.0)
         status = page.status()
         assert status.outcome is not None
-        assert status.outcome.startswith("goto-well done in ")
+        assert status.outcome.startswith("Go to done in ")
         assert status.goto == status.outcome
         assert StubGoto.ran == [("B2", "centre")]
         page.clear_outcome()
@@ -1213,9 +1224,9 @@ def test_a_failed_run_keeps_no_exception(page: PlatePage) -> None:
         assert len(Failing.raised) == 1
         # Dead without the cyclic collector: nothing the page holds reaches it (FM-98).
         assert Failing.raised[0]() is None
-        assert page.status().outcome == (
-            "failing: PluginRunError: failing: line one line two"
-        )
+        # The tool's one line, and not the exception's type, which goes to the log
+        # (m5 §17.12 D20).
+        assert page.status().outcome == "failing failed: failing: line one line two"
     finally:
         gc.enable()
 
@@ -1439,7 +1450,7 @@ def test_close_says_how_a_run_that_failed_while_it_was_stopped_ended(
     page.close()
     assert page.close_lines == (
         f"fails told to stop; {_ACCEPTED}",
-        "fails: PluginRunError: fails: the move was stopped",
+        "fails failed: fails: the move was stopped",
     )
     assert page.close_ended
 
@@ -5969,7 +5980,9 @@ def test_the_view_carries_the_calibration_and_the_registered_plate(
         # The objective and the time of the same record as the matrix: the card's UTC string.
         assert view.camera_matrix is not None
         assert view.camera_calibration == CalibrationNote(
-            objective=TEN_X, when_utc="2026-11-09 09:30:00"
+            objective=TEN_X,
+            when_utc="2026-11-09 09:30:00",
+            when_local=local_time(datetime(2026, 11, 9, 9, 30, tzinfo=timezone.utc)),
         )
         assert view.registered == _plate("96-well")
         # The tool that wrote it, so that the screen shows that tool's `assumed` lines.
@@ -5981,7 +5994,683 @@ def test_the_view_carries_the_calibration_and_the_registered_plate(
         # A calibration that did not record its objective says so, and is still the matrix's.
         seed_camera_calibration(run_doc, objective=None)
         assert page.view().camera_calibration == CalibrationNote(
-            objective=None, when_utc="2026-11-09 09:30:00"
+            objective=None,
+            when_utc="2026-11-09 09:30:00",
+            when_local=local_time(datetime(2026, 11, 9, 9, 30, tzinfo=timezone.utc)),
         )
+    finally:
+        page.close()
+
+
+# --- round 2: the outcome's words, the drive's answer, the objective of a registration, the files (m5 §17.12, #475) ---
+
+
+class SlowGoto(StubGoto):
+    """A ``goto-well`` that goes until ``Slow.release`` is set: a drive that is under way."""
+
+    def run(self, microscope: Any, params: GotoParams, ctx: RunContext) -> StubResult:
+        StubGoto.ran.append((params.well, params.side))
+        Slow.started.set()
+        while not Slow.release.is_set():
+            ctx.wait_s(0.05)
+        return StubResult()
+
+
+class FailingGoto(StubGoto):
+    """A ``goto-well`` whose move ends in an error."""
+
+    def run(self, microscope: Any, params: GotoParams, ctx: RunContext) -> StubResult:
+        raise PluginRunError("goto-well", "the stage did not arrive")
+
+
+class StoppedInAMove(Slow):
+    """``scan`` as a stop leaves it when it lands in a move: the move raises, so the run fails (FM-64)."""
+
+    name = provides = "scan"
+    make: ClassVar[Callable[[], BaseException]] = lambda: MotionStoppedError(
+        "xy_stage XY"
+    )
+
+    def run(self, microscope: Any, params: NoParams, ctx: RunContext) -> StubResult:
+        Slow.started.set()
+        try:
+            while True:
+                ctx.wait_s(0.05)
+        except StopRequested:
+            raise type(self).make() from None
+
+
+class MoveRefused(Stub):
+    """``scan`` whose move is stopped although nobody pressed STOP (the stand was halted before)."""
+
+    name = provides = "scan"
+
+    def run(self, microscope: Any, params: StubParams, ctx: RunContext) -> StubResult:
+        raise MotionStoppedError("xy_stage XY")
+
+
+class Counting(Stub):
+    """``cells``: a built-in tool's name on a stub, so that the outcome says its title."""
+
+    name = provides = "cells"
+
+
+class FailingRoute(Failing):
+    """``route`` that fails."""
+
+    name = provides = "route"
+
+
+def _goto_page(
+    microscope: Microscope, run_doc: Path, goto: type[StubGoto] = StubGoto
+) -> PlatePage:
+    """A page whose ``goto-well`` is ``goto``, over a registered plate: a drive to B2 is accepted."""
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    classes = [goto if cls is StubGoto else cls for cls in STUBS]
+    return PlatePage(microscope, run_doc, entry_points=[_ep(c) for c in classes])
+
+
+def test_a_refused_goto_click_leaves_the_running_drives_text(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # #444's Report: a second click on a drive that goes overwrote its text with the refusal.
+    page = _goto_page(fake_microscope, run_doc, SlowGoto)
+    try:
+        page.goto("B2")
+        assert Slow.started.wait(5)
+        going = page.status()
+        assert going.goto == "going to B2"
+        assert going.goto_answer == GotoAnswer("B2", "going", False, "")
+
+        with _refuses(RuntimeError, "goto-well is running"):
+            page.goto("C3")
+
+        after = page.status()
+        assert (after.goto, after.goto_answer) == (going.goto, going.goto_answer)
+        Slow.release.set()
+        assert page.join(10.0)
+        assert page.status().goto_answer == GotoAnswer("B2", "at", False, "")
+    finally:
+        Slow.release.set()
+        page.close()
+
+
+def test_a_goto_answers_going_then_at_and_a_refusal_or_a_failure_in_the_tools_own_line(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _goto_page(fake_microscope, run_doc)
+    try:
+        assert page.status().goto_answer is None
+        page.goto("B2")
+        assert page.join(10.0)
+        assert page.status().goto_answer == GotoAnswer("B2", "at", False, "")
+        # A refusal before anything starts says its line, and the drive bar says the same.
+        page.choose_plate("384-well")
+        with pytest.raises(ValueError, match="the registered plate is a 96-well"):
+            page.goto("B2")
+        refused = page.status().goto_answer
+        assert refused is not None
+        assert (refused.well, refused.phase) == ("B2", "refused")
+        assert refused.text == page.status().goto
+        assert "goto-well" not in refused.text
+    finally:
+        page.close()
+    failing = _goto_page(fake_microscope, run_doc, FailingGoto)
+    try:
+        failing.goto("B2")
+        assert failing.join(10.0)
+        answer = failing.status().goto_answer
+        # The tool's line without the title that begins the strip's outcome.
+        assert answer == GotoAnswer(
+            "B2", "failed", False, "goto-well: the stage did not arrive"
+        )
+        assert (
+            failing.status().goto == "Go to failed: goto-well: the stage did not arrive"
+        )
+        failing.clear_outcome()
+        assert failing.status().goto_answer is None
+    finally:
+        failing.close()
+
+
+def test_a_goto_that_run_refuses_is_the_rows_refusal_in_the_tools_line(
+    run_doc: Path,
+) -> None:
+    # The stand is closed: `run` refuses without starting anything, and that is the answer.
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    page = PlatePage.closed(
+        Profile.demo(), run_doc, entry_points=[_ep(c) for c in STUBS]
+    )
+    try:
+        page.goto("B2")
+        assert page.status().goto_answer == GotoAnswer(
+            "B2", "refused", False, NOT_CONNECTED
+        )
+    finally:
+        page.close()
+
+
+def test_a_registration_clears_the_drives_text(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # `... not registered` was true of the plate before: it never outlives the plate it
+    # was measured on (the owner's walk, finding 9).
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    page = _page(fake_microscope, run_doc, _real("plate-registration"))
+    try:
+        page.goto("B2")
+        assert page.join(10.0)
+        assert page.status().goto.startswith("Go to done in ")
+        assert page.status().goto_answer is not None
+        # The centres are set directly: a capture ends the answer itself (`_drop_goto_answer`),
+        # and this test is about the registration's own end.
+        page.refs = tuple(
+            WellRef(well=well, x_um=x, y_um=y)
+            for well in ("A1", "A12")
+            for x, y in [_centre(well, a1=A1_OFF, rotation_deg=TURN_DEG)]
+        )
+
+        _run_and_join(
+            page, "plate-registration", page.page_params("plate-registration")
+        )
+
+        assert page.status().outcome is not None
+        assert page.status().outcome.startswith("Registration done in ")  # type: ignore[union-attr]
+        assert page.status().goto == ""
+        assert page.status().goto_answer is None
+    finally:
+        page.close()
+
+
+@pytest.mark.parametrize(
+    "make",
+    [lambda: MotionStoppedError("xy_stage XY"), lambda: MicroscopeHaltedError()],
+    ids=["a move stopped", "a halted stand"],
+)
+def test_a_stop_that_lands_in_a_move_is_said_stopped_by_stop(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    make: Callable[[], BaseException],
+) -> None:
+    monkeypatch.setattr(StoppedInAMove, "make", staticmethod(make))
+    page = _page(fake_microscope, run_doc, [_ep(StoppedInAMove)])
+    try:
+        page.run("scan", [])
+        assert Slow.started.wait(5)
+        page.stop()
+        assert page.join(10.0)
+
+        # The words say stopped; the record does not change: it is `failed` (FM-64).
+        assert page.status().outcome == "Scan stopped by STOP"
+        assert RunDocument.load(run_doc).stages["scan"].status is StageStatus.failed
+        assert page.status().stop_note is not None
+        assert page.status().stop_note.startswith("Scan told to stop; ")  # type: ignore[union-attr]
+    finally:
+        page.close()
+
+
+def test_a_move_stopped_when_nobody_pressed_stop_is_a_failure(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _page(fake_microscope, run_doc, [_ep(MoveRefused)])
+    try:
+        page.run("scan", [])
+        assert page.join(10.0)
+        outcome = page.status().outcome
+        assert outcome is not None
+        assert outcome.startswith("Scan failed: ")
+        assert "stopped by STOP" not in outcome
+    finally:
+        page.close()
+
+
+def test_the_outcome_names_the_tool_by_its_title_and_not_its_exception_type(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    page = _page(fake_microscope, run_doc, [_ep(Counting), _ep(FailingRoute)])
+    try:
+        with caplog.at_level(logging.INFO, logger="smc.ui"):
+            _run_and_join(page, "cells")
+            assert page.status().outcome is not None
+            assert page.status().outcome.startswith("Count the cells done in ")  # type: ignore[union-attr]
+
+            _run_and_join(page, "route")
+        assert page.status().outcome == "Route failed: failing: line one line two"
+        # The type is the log's, with the one line (m5 §17.12 D20).
+        assert any(
+            "PluginRunError" in record.getMessage()
+            and "line one line two" in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        page.close()
+
+
+def _captured_at_the_ten_x(page: PlatePage, fake_microscope: Microscope) -> None:
+    """Three centres captured with the 10x in place: A1, A12 and H1 where a plate turned 7 degrees has them."""
+    page.choose_plate("96-well")
+    stage = fake_microscope.require(XYStage)
+    for well in ("A1", "A12", "H1"):
+        stage.move_to_um(*_centre(well, a1=A1_OFF, rotation_deg=TURN_DEG))
+        page.capture_centre(well)
+    assert page.capture_objectives == {"A1": TEN_X, "A12": TEN_X, "H1": TEN_X}
+
+
+def test_register_across_a_turn_is_refused_before_anything_starts(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed(run_doc, "plate-registration", "plate", _plate())
+    page = _page(fake_microscope, run_doc, _real("plate-registration"))
+    try:
+        _captured_at_the_ten_x(page, fake_microscope)
+        fake_microscope.require(ObjectiveTurret).select(FORTY_X, confirm=True)
+        pairs = page.page_params("plate-registration")
+        before = run_doc.read_bytes()
+        ended = page.activities_ended
+
+        page.run("plate-registration", pairs)
+
+        refusal = REGISTER_ACROSS_A_TURN.format(captured=TEN_X, in_place=FORTY_X)
+        status = page.status()
+        # The refusal names both objectives and the two ways out, and nothing started or was written.
+        assert status.outcome == f"Registration: {refusal}"
+        assert TEN_X in refusal
+        assert FORTY_X in refusal
+        assert status.running is None
+        assert page.activities_ended == ended
+        assert run_doc.read_bytes() == before
+        # The captures stay across a turn: nothing clears them but Redo, Forget and a plate change.
+        assert len(page.refs) == 3
+        # The view says the same text before the click.
+        assert page.view().register_refusal == refusal
+    finally:
+        page.close()
+
+
+def test_register_with_the_objective_of_the_captures_runs(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _page(fake_microscope, run_doc, _real("plate-registration"))
+    try:
+        _captured_at_the_ten_x(page, fake_microscope)
+        assert page.view().register_refusal is None
+        # A turn and a turn back: it is the objective in place now that counts.
+        turret = fake_microscope.require(ObjectiveTurret)
+        turret.select(FORTY_X, confirm=True)
+        assert page.view().register_refusal is not None
+        turret.select(TEN_X, confirm=True)
+        assert page.view().register_refusal is None
+
+        _run_and_join(
+            page, "plate-registration", page.page_params("plate-registration")
+        )
+
+        outcome = page.status().outcome
+        assert outcome is not None
+        assert outcome.startswith("Registration done in ")
+    finally:
+        page.close()
+
+
+def test_register_is_refused_for_captures_made_with_two_objectives(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _page(fake_microscope, run_doc, _real("plate-registration"))
+    try:
+        page.choose_plate("96-well")
+        stage = fake_microscope.require(XYStage)
+        turret = fake_microscope.require(ObjectiveTurret)
+        stage.move_to_um(*_centre("A1", a1=A1_OFF, rotation_deg=TURN_DEG))
+        page.capture_centre("A1")
+        turret.select(FORTY_X, confirm=True)
+        stage.move_to_um(*_centre("A12", a1=A1_OFF, rotation_deg=TURN_DEG))
+        page.capture_centre("A12")
+
+        page.run("plate-registration", page.page_params("plate-registration"))
+
+        expected = REGISTER_OBJECTIVES_DIFFER.format(which=f"{TEN_X} and {FORTY_X}")
+        assert page.status().outcome == f"Registration: {expected}"
+        assert page.view().register_refusal == expected
+        assert page.status().running is None
+    finally:
+        page.close()
+
+
+def test_captures_whose_objective_is_not_known_refuse_nothing(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # A capture restored from a run document has no label: it is not compared.
+    page = _page(fake_microscope, run_doc, _real("plate-registration"))
+    try:
+        page.choose_plate("96-well")
+        page.refs = tuple(
+            WellRef(well=w, x_um=x, y_um=y)
+            for w in ("A1", "A12")
+            for x, y in [_centre(w, a1=A1_OFF, rotation_deg=TURN_DEG)]
+        )
+        assert page.capture_objectives == {}
+        fake_microscope.require(ObjectiveTurret).select(FORTY_X, confirm=True)
+        assert page.view().register_refusal is None
+
+        _run_and_join(
+            page, "plate-registration", page.page_params("plate-registration")
+        )
+
+        assert page.status().outcome is not None
+        assert page.status().outcome.startswith("Registration done in ")  # type: ignore[union-attr]
+    finally:
+        page.close()
+
+
+def test_a_turret_that_cannot_be_read_refuses_no_registration(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _page(fake_microscope, run_doc, _real("plate-registration"))
+    try:
+        _captured_at_the_ten_x(page, fake_microscope)
+        fake_microscope.override(ObjectiveTurret, _TurretThatRaises())
+        # The stand's refusal of a read is the tool's `assumed` to say: nothing is refused here.
+        assert page.view().register_refusal is None
+    finally:
+        page.close()
+
+
+def test_the_registration_of_the_profiles_sample_is_not_about_the_pages_captures(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    page = _page(fake_microscope, run_doc, _real("plate-registration"))
+    try:
+        _captured_at_the_ten_x(page, fake_microscope)
+        fake_microscope.require(ObjectiveTurret).select(FORTY_X, confirm=True)
+        sample = [
+            WellRef(well="A1", x_um=1.0, y_um=2.0),
+            WellRef(well="A12", x_um=3.0, y_um=2.0),
+        ]
+        pairs = [
+            "plate=96-well",
+            f"refs={json.dumps([r.model_dump(mode='json') for r in sample])}",
+        ]
+
+        assert page._registration_objective_refusal(pairs) is None
+        assert (
+            page._registration_objective_refusal(["plate=96-well", "refs=not json"])
+            is None
+        )
+    finally:
+        page.close()
+
+
+def _named_files(tmp_path: Path) -> tuple[PlatePage, Path, Path]:
+    """A run folder with a report the run document names, a sibling it does not, and a file outside."""
+    run = tmp_path / "run"
+    (run / "report").mkdir(parents=True)
+    (run / "frames").mkdir()
+    doc = run / "run.json"
+    named = run / "report" / "abc.html"
+    named.write_text("<p>a report</p>", encoding="utf-8")
+    (run / "report" / "other.html").write_text("not named", encoding="utf-8")
+    (run / "frames" / "a.tif").write_bytes(b"II")
+    outside = tmp_path / "secret.txt"
+    outside.write_text("secret", encoding="utf-8")
+    (run / "x").mkdir()
+    (run / "x" / "y.html").write_text("a failed run's", encoding="utf-8")
+    _record(doc, "stub", result={"file": "report/abc.html"})
+    _record(doc, "reader", result={"folder": "frames"})
+    _record(
+        doc,
+        "progressing",
+        status=StageStatus.failed,
+        result={"file": "x/y.html"},
+        error="boom",
+    )
+    _record(doc, "failing", result={"file": str(outside)})
+    page = PlatePage.closed(Profile.demo(), doc, entry_points=[_ep(c) for c in STUBS])
+    return page, named, outside
+
+
+def test_run_file_serves_a_file_the_run_document_names_and_nothing_else(
+    tmp_path: Path,
+) -> None:
+    page, named, outside = _named_files(tmp_path)
+    try:
+        assert page.run_file("report/abc.html") == named.resolve()
+        # A sibling the document does not name, a folder, the scan's frames folder, a record that
+        # did not end done, and a file outside the run folder are all `None`.
+        for refused in (
+            "report/other.html",
+            "report",
+            "report/",
+            "frames",
+            "frames/a.tif",
+            "x/y.html",
+            "run.json",
+            str(outside),
+            str(named),
+            "../secret.txt",
+            "..\\secret.txt",
+            "report/../report/abc.html",
+            "report/abc.html/..",
+            "/report/abc.html",
+            "C:/report/abc.html",
+            "C:\\report\\abc.html",
+            "",
+            ".",
+            "report/abc.html\x00",
+            "nothing/here.html",
+        ):
+            assert page.run_file(refused) is None, refused
+        # Read now, at each request: a file gone is not served, and one that appears and is named is.
+        named.unlink()
+        assert page.run_file("report/abc.html") is None
+    finally:
+        page.close()
+
+
+def test_run_file_names_a_file_the_document_gained_after_the_page_was_built(
+    tmp_path: Path,
+) -> None:
+    page, _named, _outside = _named_files(tmp_path)
+    try:
+        run = page.run_doc.parent
+        (run / "report" / "new.html").write_text("new", encoding="utf-8")
+        assert page.run_file("report/new.html") is None
+        _record(page.run_doc, "stub", result={"file": "report/new.html"}, attempt="a1")
+        assert (
+            page.run_file("report/new.html") == (run / "report" / "new.html").resolve()
+        )
+    finally:
+        page.close()
+
+
+def test_a_capture_a_forgotten_centre_and_a_plate_change_end_the_drives_answer_for_every_tab(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # FM-225: a marker each tab keeps for a text the controller keeps once lied. The answer is the
+    # controller's, and what it was about ends it, for every tab at once.
+    page = _goto_page(fake_microscope, run_doc)
+    try:
+        stage = fake_microscope.require(XYStage)
+
+        def drive() -> None:
+            page.goto("B2")
+            assert page.join(10.0)
+            assert page.status().goto_answer == GotoAnswer("B2", "at", False, "")
+
+        drive()
+        stage.move_to_um(1.0, 2.0)
+        page.capture_centre("B2")
+        # The answer goes; the drive bar's line stays until the next drive (or Refresh).
+        assert page.goto_answer is None
+        assert page.status().goto_answer is None
+        assert page.status().goto.startswith("Go to done in ")
+
+        drive()
+        page.forget("B2")
+        assert page.goto_answer is None
+        drive()
+        page.forget()
+        assert page.goto_answer is None
+
+        drive()
+        page.choose_plate("384-well")
+        assert page.status().goto == ""
+        assert page.goto_answer is None
+        # Choosing the plate already shown is the confirmation, and clears nothing.
+        page.choose_plate("384-well")
+    finally:
+        page.close()
+
+
+def test_a_registration_made_elsewhere_clears_the_drives_text_when_a_view_reads_it(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # `smc run plate-registration` in a terminal: the page ran nothing, and finds the new attempt
+    # when it reads the run document (`view()`).
+    page = _goto_page(fake_microscope, run_doc)
+    try:
+        page.view()
+        page.goto("B2")
+        assert page.join(10.0)
+        assert page.goto_answer is not None
+        # Nothing changed: reading again keeps the answer the operator is reading.
+        page.view()
+        assert page.goto_answer is not None
+
+        _seed(run_doc, "plate-registration", "plate", _plate(), minute=10)
+        page.view()
+
+        assert page.goto_answer is None
+        assert page.status().goto == ""
+    finally:
+        page.close()
+
+
+# --- what the adversarial review of #475 found: one offline share, an unreadable document, the tool's own run ---
+
+
+def test_one_entry_that_cannot_be_resolved_does_not_take_the_reports_link_with_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `nis-export --param out=` may name a share that is offline: `Path.resolve` of it raises a bare
+    # OSError on Windows (FM-116) and waits on the network. The entry is outside the run folder, so it
+    # is judged lexically and never resolved; and one that is resolved fails on its own.
+    page, named, _outside = _named_files(tmp_path)
+    resolved: list[str] = []
+    real_resolve = Path.resolve
+
+    def resolve(self: Path, strict: bool = False) -> Path:
+        resolved.append(self.name)
+        if self.name == "secret.txt":
+            raise OSError(64, "the specified network name is no longer available")
+        return real_resolve(self, strict=strict)
+
+    try:
+        monkeypatch.setattr(Path, "resolve", resolve)
+        assert page.run_file("report/abc.html") == real_resolve(named)
+        # The share's entry was never resolved: it is outside the run folder.
+        assert "secret.txt" not in resolved
+    finally:
+        monkeypatch.undo()
+        page.close()
+
+
+def test_an_entry_inside_the_run_folder_that_cannot_be_resolved_is_skipped_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    page, named, _outside = _named_files(tmp_path)
+    run = page.run_doc.parent
+    (run / "export").mkdir(exist_ok=True)
+    (run / "export" / "broken.json").write_text("{}", encoding="utf-8")
+    _record(page.run_doc, "slow", result={"file": "export/broken.json"})
+    real_resolve = Path.resolve
+
+    def resolve(self: Path, strict: bool = False) -> Path:
+        if self.name == "broken.json":
+            raise OSError(5, "access denied")
+        return real_resolve(self, strict=strict)
+
+    try:
+        monkeypatch.setattr(Path, "resolve", resolve)
+        assert page.run_file("report/abc.html") == real_resolve(named)
+        assert page.run_file("export/broken.json") is None
+    finally:
+        monkeypatch.undo()
+        page.close()
+
+
+def test_an_unreadable_run_document_serves_nothing_and_says_why_in_the_log(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # FM-229: an unreadable document is no empty one. The route fails closed, and the log says
+    # why (a bare 404 reads as a file that is gone).
+    page, _named, _outside = _named_files(tmp_path)
+    try:
+        assert page.run_file("report/abc.html") is not None
+        page.run_doc.write_text("{ not json", encoding="utf-8")
+        with caplog.at_level(logging.INFO, logger="smc.ui"):
+            assert page.run_file("report/abc.html") is None
+        assert any(
+            "run document could not be read" in r.getMessage() for r in caplog.records
+        )
+    finally:
+        page.close()
+
+
+def test_a_goto_well_run_from_the_tools_own_run_leaves_no_answer_for_a_row(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # The drive bar's line says the outcome of any `goto-well`; the Plate row's answer is the click's
+    # own (`goto()` leaves `going`), and the answer of an earlier drive is not about this run.
+    page = _goto_page(fake_microscope, run_doc)
+    try:
+        page.goto("B2")
+        assert page.join(10.0)
+        assert page.status().goto_answer == GotoAnswer("B2", "at", False, "")
+
+        page.run("goto-well", ["well=C3"])
+        assert page.join(10.0)
+
+        assert page.status().goto_answer is None
+        assert page.status().goto.startswith("Go to done in ")
+        assert StubGoto.ran == [("B2", "centre"), ("C3", "centre")]
+    finally:
+        page.close()
+
+
+class SlowScan(Slow):
+    """``scan`` that waits for the stop and ends stopped: a built-in tool's name, so its title is not its plugin name."""
+
+    name = provides = "scan"
+
+
+def test_close_says_was_stopped_for_a_tool_whose_title_is_not_its_name(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # `close()` compares the outcome and the stop note with the words the strip uses (the title).
+    page = _page(fake_microscope, run_doc, [_ep(SlowScan)])
+    page.run("scan", [])
+    assert Slow.started.wait(5)
+    page.close()
+    assert page.close_lines == ("scan was stopped",)
+    assert page.status().outcome == "Scan stopped"
+    assert page.close_ended
+
+
+def test_the_views_read_of_a_turret_that_does_not_answer_is_not_logged_at_every_redraw(
+    fake_microscope: Microscope, run_doc: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # `view().register_refusal` reads the turret at every redraw (FM-178): a failure of that read is
+    # the capture's to log once, never the redraw's.
+    page = _page(fake_microscope, run_doc, _real("plate-registration"))
+    try:
+        _captured_at_the_ten_x(page, fake_microscope)
+        fake_microscope.override(ObjectiveTurret, _TurretThatRaises())
+        with caplog.at_level(logging.WARNING, logger="smc.ui"):
+            for _ in range(3):
+                assert page.view().register_refusal is None
+        assert not [r for r in caplog.records if "could not be read" in r.getMessage()]
     finally:
         page.close()

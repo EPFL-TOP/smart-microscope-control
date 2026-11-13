@@ -15,7 +15,9 @@ on a sleep (FM-44).
 
 from __future__ import annotations
 
+import html
 import os
+import re
 import shlex
 import threading
 from collections.abc import Callable, Iterator
@@ -23,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from importlib.metadata import EntryPoint
 from pathlib import Path
 from typing import Any, ClassVar, cast
+from urllib.parse import unquote
 
 import pytest
 from pymmcore_plus import CMMCorePlus
@@ -62,6 +65,7 @@ from smc.ui.guide import (
     SCREEN_LEADS,
     SCREEN_TITLES,
     again_note,
+    local_time,
 )
 from smc.ui.plate_page import PlatePageView, posix_quoting_note
 
@@ -542,8 +546,9 @@ def test_a_row_per_tool_in_checklist_order_with_the_plain_names_and_the_states_o
     _seed_done(run_doc, "density", minute=4)
     view.refresh()
     assert _states(view) == {
-        "cells": "Done 2026-11-12 09:03:00 UTC",
-        "density": "Done 2026-11-12 09:04:00 UTC",
+        # The PC's own time to the minute (m5 §17.12 D20): the test asks the same clock.
+        "cells": f"Done {local_time(T0 + timedelta(minutes=3))}",
+        "density": f"Done {local_time(T0 + timedelta(minutes=4))}",
         "route": "Ready",
         "report": "Ready",
         "nis-export": "after Route through the densest fields",
@@ -606,7 +611,7 @@ def test_a_row_that_cannot_run_says_why_and_a_click_on_it_is_refused_by_the_cont
     _click(view.result_rows["cells"].button)
     assert closed.status().outcome == f"cells: {NOT_CONNECTED}"
     _click(view.run_all_button)
-    assert closed.status().outcome == f"run all: {NOT_CONNECTED}"
+    assert closed.status().outcome == f"Run all that are left: {NOT_CONNECTED}"
     assert _Stub.ran == []
 
     page = make_page()
@@ -639,7 +644,7 @@ def test_run_all_waits_for_the_first_tool_left_and_a_click_on_it_is_refused_by_t
     _ended(page)
     outcome = page.status().outcome
     assert outcome is not None
-    assert outcome.startswith("run all stopped at cells: cells: UpstreamError: ")
+    assert outcome.startswith("Run all that are left: cells: UpstreamError: ")
     assert _Stub.ran == []
     # After the scan it is enabled and says nothing (the tick that follows a run's end).
     _seed_scan(run_doc)
@@ -817,11 +822,10 @@ def test_run_all_redraws_the_rows_at_each_tools_end_and_reads_the_view_once_per_
         == "density is running: wait for it to end, or press STOP."
     )
     assert all(row.button.disabled for row in view.result_rows.values())
-    # Each disabled button says what runs: the row that waits for an input says it above, and
-    # the same note stands under its button, so that a click that does nothing says why.
-    busy = "density is running: wait for it to end, or press STOP."
-    assert view.result_rows["route"].wait.object == busy
-    assert view.result_rows["route"].wait.visible is True
+    # What runs holds for every button: it is said once, under *Run all that are left*, and
+    # not under each row (m5 §17.12 D19). A row's wait is its own reason only.
+    assert all(row.wait.object == "" for row in view.result_rows.values())
+    assert all(row.wait.visible is False for row in view.result_rows.values())
     view.tick()
     view.tick()
     assert reads == [1]  # nothing ended since: no read
@@ -833,7 +837,7 @@ def test_run_all_redraws_the_rows_at_each_tools_end_and_reads_the_view_once_per_
     assert [state.startswith("Done ") for state in _states(view).values()] == [True] * 5
     outcome = page.status().outcome
     assert outcome is not None
-    assert outcome.startswith("run all done in ")
+    assert outcome.startswith("Run all that are left: done in ")
     assert view.chain_text.object == (
         "Done: Count the cells, Density per well, Route through the densest fields, "
         "Report, Export for NIS-Elements."
@@ -844,7 +848,9 @@ def test_run_all_redraws_the_rows_at_each_tools_end_and_reads_the_view_once_per_
     assert view.run_all_wait_text.object == NOTHING_LEFT
     _Stub.ran.clear()
     _click(view.run_all_button)
-    assert page.status().outcome == "run all: nothing is left: every step is done"
+    assert page.status().outcome == (
+        "Run all that are left: nothing is left: every step is done"
+    )
     assert _Stub.ran == []
 
 
@@ -893,8 +899,8 @@ def test_a_second_tab_draws_the_chain_the_first_started(
         ),
         (
             "fail",
-            "Stopped at Route through the densest fields, which failed: route: "
-            f"PluginRunError: route: {HOSTILE}. Done: Count the cells, Density per well. "
+            # The tool's own outcome is the head: it says which tool and that it failed.
+            f"Route failed: route: {HOSTILE}. Done: Count the cells, Density per well. "
             "Not run: Report, Export for NIS-Elements.",
         ),
     ],
@@ -930,7 +936,7 @@ def test_the_chain_line_names_the_tool_that_stopped_it_and_stop_from_the_page_en
     # A STOP stopped the stand: the strip says it, and the chain's line does not need to.
     status = page.status()
     assert status.outcome is not None
-    assert status.outcome.startswith("run all stopped at route: ")
+    assert status.outcome.startswith("Run all that are left: Route ")
 
 
 def test_again_says_what_it_replaces_and_the_note_goes_with_the_tool(
@@ -950,15 +956,12 @@ def test_again_says_what_it_replaces_and_the_note_goes_with_the_tool(
         [item for item in view._view.checklist],  # type: ignore[union-attr]
     )
     assert cells.replaces.object == expected
-    assert (
-        "(Density per well, Route through the densest fields, Report, Export for NIS-Elements)"
-        in expected
-    )
+    assert "Density, Route, Report, Export" in expected
     # What no later tool reads says nothing, and takes no height.
     for tool in ("report", "nis-export"):
         assert view.result_rows[tool].replaces.object == ""
         assert view.result_rows[tool].replaces.visible is False
-    assert "(Report)" in view.result_rows["density"].replaces.object
+    assert "makes Report out of date" in view.result_rows["density"].replaces.object
 
     # *Again* on `cells` runs the tool, and what read it is out of date: the note is gone (no
     # tool after it is done), and the chain button runs the four again.
@@ -1075,13 +1078,13 @@ def test_a_bug_in_the_chain_is_said_as_the_tools_failure_and_never_as_a_stop(
     view.tick()
 
     assert view.chain_text.object == (
-        "Stopped at Density per well, which failed: density: ValueError: boom. "
+        "Density per well failed: ValueError: boom. "
         "Done: Count the cells. Not run: Route through the densest fields, Report, "
         "Export for NIS-Elements."
     )
     assert "STOP" not in view.chain_text.object
     outcome = page.status().outcome
-    assert outcome == "run all: ValueError: boom"
+    assert outcome == "Run all that are left: ValueError: boom"
 
 
 def test_no_results_tool_loaded_says_so_under_run_all_and_disables_it(
@@ -1099,7 +1102,7 @@ def test_no_results_tool_loaded_says_so_under_run_all_and_disables_it(
     assert all(row.button.disabled for row in view.result_rows.values())
     # A click that arrives anyway is the controller's to answer, with what is true.
     _click(view.run_all_button)
-    assert page.status().outcome == "run all: no step was asked for"
+    assert page.status().outcome == "Run all that are left: no step was asked for"
 
 
 def test_the_colour_bar_follows_the_density_select(
@@ -1199,19 +1202,19 @@ def test_every_text_pane_of_the_results_screen_is_plain_text_whatever_a_record_s
     _click(view.run_all_button)
     _ended(page)
     view.tick()
-    assert HOSTILE in view.files_text.object
-    assert any(
-        line.startswith("Count the cells: ") and HOSTILE in line
-        for line in view.files_text.object.split("\n")
-    )
+    # The one HTML pane of the page (m5 §17.12 D21): every text in it is escaped, so the file
+    # name that is markup is shown as text and is never the pane's own.
+    assert type(view.files_text) is pn.pane.HTML
+    assert html.escape(HOSTILE) in view.files_text.object
+    assert HOSTILE not in view.files_text.object
+    assert "<img" not in view.files_text.object
     assert HOSTILE in view.chain_text.object
-    assert view.chain_text.object.startswith(
-        "Stopped at Density per well, which failed: density: PluginRunError: density: "
-    )
+    assert view.chain_text.object.startswith("Density per well failed: density: ")
     shown = [
         o
         for o in _objects(list(view.step_panel.objects))
         if isinstance(o, pn.pane.PaneBase)
+        and o is not view.files_text
         # A card draws its title as an HTML pane of its own, from a constant of the page's.
         and not (
             type(o) is pn.pane.HTML
@@ -1230,7 +1233,7 @@ def test_every_text_pane_of_the_results_screen_is_plain_text_whatever_a_record_s
 
 def test_no_file_is_named_before_a_step_wrote_one(page: PlatePage) -> None:
     view = PlatePageView(page)
-    assert view.files_text.object == NO_FILES_YET
+    assert view.files_text.object == f"<div>{NO_FILES_YET}</div>"
 
 
 def test_each_files_line_names_its_step_and_its_path(
@@ -1240,11 +1243,13 @@ def test_each_files_line_names_its_step_and_its_path(
     _seed_done(run_doc, "cells", minute=3, result=FileResult(file="cells/cells.json"))
     page = make_page()
     view = PlatePageView(page)
-    lines = view.files_text.object.split("\n")
-    assert lines == [
-        f"Scan frames: {run_doc.parent / 'scan'}",
-        f"Count the cells: {run_doc.parent / 'cells' / 'cells.json'}",
-    ]
+    # The scan's folder stays a path; a file of the run folder is a link that opens it in a new
+    # tab, through the page's own route (m5 §17.12 D21).
+    assert view.files_text.object == (
+        f"<div>Scan frames: {html.escape(str(run_doc.parent / 'scan'))}</div>"
+        '<div>Count the cells: <a href="/run-files/cells/cells.json" '
+        'target="_blank" rel="noopener">cells/cells.json</a></div>'
+    )
 
 
 @pytest.mark.demo
@@ -1286,25 +1291,31 @@ def test_a_scan_runs_through_to_the_export_from_one_click(
         assert view.tool_fields["cells"]["detector"].value == "blobs"
         assert view.result_rows["cells"].state.object == "Ready"
         assert view.run_all_button.disabled is False, view.run_all_wait_text.object
-        assert view.files_text.object.startswith("Scan frames: ")
+        assert view.files_text.object.startswith("<div>Scan frames: ")
         _click(view.run_all_button)
         assert page.join(180.0), "the chain did not end"
         view.tick()
         outcome = page.status().outcome
         assert outcome is not None
         # No number asserted: it is a duration (FM-197).
-        assert outcome.startswith("run all done in "), outcome
-        assert outcome.endswith(" s: cells, density, route, report, nis-export")
+        assert outcome.startswith("Run all that are left: done in "), outcome
+        assert outcome.endswith(
+            " s (Count the cells, Density per well, Route, Report, Export for NIS-Elements)"
+        )
         assert [
             row.state.object.startswith("Done ") for row in view.result_rows.values()
         ] == [True] * 5
         assert view.step_buttons["results"].label == "5. Results ✓"
         assert view.chain_text.object.startswith("Done: Count the cells, ")
         # The report and the export were written, and the files block names them.
-        lines = view.files_text.object.split("\n")
-        named = {line.split(": ", 1)[0]: line.split(": ", 1)[1] for line in lines}
+        # ... as links, and what each link asks the route for is served (D21).
+        links = re.findall(
+            r'<div>([^<:]+): <a href="/run-files/([^"]+)"', view.files_text.object
+        )
+        named = {step: unquote(href) for step, href in links}
         for step in ("Report", "Export for NIS-Elements"):
-            assert Path(named[step]).exists(), (step, named[step])
+            assert page.run_file(named[step]) is not None, (step, named)
+            assert (run_doc.parent / named[step]).exists(), (step, named[step])
         # Nothing is left: the button says so and is off.
         assert view.run_all_button.disabled is True
         assert view.run_all_wait_text.object == NOTHING_LEFT
@@ -1313,3 +1324,105 @@ def test_a_scan_runs_through_to_the_export_from_one_click(
     finally:
         page.close()
         page.release()
+
+
+# --- round 2: a reason said once, the chain's line after its rows, the files that open (m5 §17.12, #475) ---
+
+
+def test_the_busy_note_is_drawn_under_run_all_only(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # #446's Report: `density is running: wait for it to end, or press STOP.` six times while a
+    # chain went. A reason common to every button of a screen is said once, under the first
+    # (D19); a row says only what is its own.
+    _seed_scan(run_doc)
+    _Stub.behaviour["density"] = "wait"
+    view = PlatePageView(page)
+    view.show_step("results")
+    _click(view.run_all_button)
+    assert _Stub.started["density"].wait(BOUND_S)
+    view.tick()
+    busy = "density is running: wait for it to end, or press STOP."
+    try:
+        texts = [
+            o.object
+            for o in _objects(list(view.step_panel.objects))
+            if isinstance(o, pn.pane.Str) and o.visible
+        ]
+        assert view.run_all_wait_text.object == busy
+        assert sum(busy in text for text in texts) == 1
+        assert all(row.wait.object == "" for row in view.result_rows.values())
+    finally:
+        _Stub.release["density"].set()
+        _ended(page)
+    # A row's own reason is still its own: an input that is missing is said by its state line,
+    # and a tool the stand cannot run by its wait.
+    view.tick()
+    assert all(row.wait.object == "" for row in view.result_rows.values())
+
+
+def test_the_chain_line_and_the_rows_change_in_the_same_tick(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # The chain's line is the status's and the rows are the view's: drawn first, the line said
+    # `Running Density per well (2 of 5)` over a `cells` row that still said `Ready` (#446's
+    # Report). Within one tick the rows are redrawn first and the line after them.
+    _seed_scan(run_doc)
+    _Stub.behaviour["density"] = "wait"
+    view = PlatePageView(page)
+    view.show_step("results")
+    events: list[str] = []
+    view.result_rows["cells"].state.param.watch(
+        lambda event: events.append(f"row:{event.new}"), "object"
+    )
+    view.chain_text.param.watch(
+        lambda event: events.append(f"line:{event.new}"), "object"
+    )
+    _click(view.run_all_button)
+    assert _Stub.started["density"].wait(BOUND_S)
+    events.clear()
+    try:
+        view.tick()
+        row = next(i for i, e in enumerate(events) if e.startswith("row:Done "))
+        line = next(
+            i
+            for i, e in enumerate(events)
+            if e == "line:Running Density per well (2 of 5)."
+        )
+        assert row < line, events
+    finally:
+        _Stub.release["density"].set()
+        _ended(page)
+
+
+def test_where_the_files_are_links_the_report_and_the_export(
+    page: PlatePage, run_doc: Path
+) -> None:
+    run = run_doc.parent
+    (run / "report").mkdir()
+    (run / "report" / "abc.html").write_text("<p>report</p>", encoding="utf-8")
+    (run / "export").mkdir()
+    (run / "export" / "list.xml").write_text("<x/>", encoding="utf-8")
+    _seed_scan(run_doc)
+    _seed_done(run_doc, "cells", minute=3)
+    _seed_done(run_doc, "density", minute=4)
+    _seed_done(run_doc, "route", minute=5)
+    _seed_done(run_doc, "report", minute=6, result=FileResult(file="report/abc.html"))
+    _seed_done(
+        run_doc, "nis-export", minute=7, result=FileResult(file="export/list.xml")
+    )
+    view = PlatePageView(page)
+    view.show_step("results")
+
+    links = re.findall(
+        r'<a href="([^"]+)" target="_blank" rel="noopener">', view.files_text.object
+    )
+
+    assert links == ["/run-files/report/abc.html", "/run-files/export/list.xml"]
+    # Each link asks the route for a file the controller serves, and nothing else is a link.
+    for href in links:
+        served = page.run_file(unquote(href.removeprefix("/run-files/")))
+        assert served is not None
+        assert served.is_file()
+    assert "Scan frames: " in view.files_text.object
+    assert view.files_text.object.count("<a ") == 2

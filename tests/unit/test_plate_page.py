@@ -81,7 +81,13 @@ from smc.ui.guide import (
     walls_centres_problem,
     walls_square_wells,
 )
-from smc.ui.plate_page import PlatePageView, build, card_text, serve
+from smc.ui.plate_page import (
+    PlatePageView,
+    RunFileHandler,
+    build,
+    card_text,
+    serve,
+)
 
 pytestmark = [
     pytest.mark.filterwarnings(
@@ -1443,16 +1449,20 @@ def test_a_drive_taps_answer_is_drawn_beside_the_toggle(
     assert page.join(10.0)
     view.tick()
     answer = page.status().goto
-    assert answer.startswith("goto-well done in ")
+    assert answer.startswith("Go to done in ")
     assert view.goto_text.object == answer
     assert view.goto_text.visible
     # A second tab draws the same, at its first tick.
     other = PlatePageView(page)
     other.tick()
     assert other.goto_text.object == answer
-    # Beside the toggle: the next item of the drive bar.
+    # Under the row that holds the toggle: the next item of the drive bar.
     items = list(view._drive_bar().objects)
-    at = next(i for i, item in enumerate(items) if item is view.drive_toggle)
+    at = next(
+        i
+        for i, item in enumerate(items)
+        if view.drive_toggle in getattr(item, "objects", ())
+    )
     assert items[at + 1] is view.goto_text
 
 
@@ -1883,13 +1893,13 @@ def test_stop_is_always_offered_and_resume_only_when_halted(page: PlatePage) -> 
     assert view.resume_button.visible
     assert not view.stop_button.disabled
     assert view.run_text.object == (
-        "scan stopped\n"
-        "scan told to stop; stopped: the stand is halted (Resume clears the halt)"
+        "Scan stopped\n"
+        "Scan told to stop; stopped: the stand is halted (Resume clears the halt)"
     )
     assert "HALTED" in view.status_text.object
     view.on_resume()
     assert not view.resume_button.visible
-    assert view.run_text.object == "scan stopped"
+    assert view.run_text.object == "Scan stopped"
 
 
 def test_stop_button_stops_through_a_click(page: PlatePage) -> None:
@@ -1979,7 +1989,7 @@ def test_a_running_tool_disables_every_run_button_until_it_ends(
     assert not view.tool_runs["plate-registration"].disabled
     assert not view.tool_runs["scan"].disabled
     assert view.tool_runs["scan-plan"].disabled
-    assert view.run_text.object.startswith("scan done in ")
+    assert view.run_text.object.startswith("Scan done in ")
 
 
 def test_a_run_that_ends_redraws_the_view(run_doc: Path, page: PlatePage) -> None:
@@ -3166,6 +3176,8 @@ def test_serve_returns_on_ctrl_c_and_stops_the_server(
             "show": False,
             "threaded": True,
             "verbose": False,
+            # The one route the page adds: the files of the run document (m5 §17.12 D21).
+            "extra_patterns": [(r"/run-files/(.*)", RunFileHandler, {"page": page})],
         }
     ]
     assert said == [

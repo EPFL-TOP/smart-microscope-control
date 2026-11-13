@@ -87,7 +87,7 @@ def test_two_captured_wells_register_the_plate_in_one_click_on_demo_sample(
         assert page.join(60.0), "camera-calibration did not end"
         outcome = page.status().outcome
         assert outcome is not None
-        assert outcome.startswith("camera-calibration done in "), outcome
+        assert outcome.startswith("Camera calibration done in "), outcome
 
         # D6, a few hundred µm off its centre as a hand leaves it (300 and -200 µm), by
         # relative moves of at most 4500 µm on one axis, as the Drive pad makes them.
@@ -112,7 +112,7 @@ def test_two_captured_wells_register_the_plate_in_one_click_on_demo_sample(
         assert page.join(120.0), "plate-walls did not end"
         outcome = page.status().outcome
         assert outcome is not None
-        assert outcome.startswith("plate-walls done in "), outcome
+        assert outcome.startswith("Registration from the walls done in "), outcome
 
         # What it left: the plate, registered from the walls, with a residual that was
         # measured and A1 where the sample puts it.

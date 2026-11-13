@@ -22,6 +22,7 @@ import pytest
 
 import smc.ui.controller as controller_module
 from smc.hardware import Microscope
+from smc.hardware.errors import MotionStoppedError
 from smc.hardware.profile import Profile
 from smc.plugins import PluginRunError
 from smc.plugins.api import PluginParams, PluginResult, RunContext
@@ -77,6 +78,11 @@ class _Stub:
         how = _Stub.behaviour.get(self.name, "done")
         if how == "fail":
             raise PluginRunError(self.name, "it broke")
+        if how == "move_stopped":
+            # Inside a move when the stop lands: the move raises, and the run ends `failed`.
+            _Stub.started[self.name].set()
+            _Stub.release[self.name].wait(WAIT_S)
+            raise MotionStoppedError("xy_stage XY")
         if how in ("wait", "wait_ignoring_stop"):
             _Stub.started[self.name].set()
             _Stub.release[self.name].wait(WAIT_S)
@@ -103,6 +109,8 @@ class Route(_Stub):
 class Report(_Stub):
     name = provides = "report"
     reads = ("scan-plan", "scan", "cells", "density")
+    # As the real tool: it reads the route when there is one, so a new route makes it out of date.
+    reads_optional = ("route",)
 
 
 class NisExport(_Stub):
@@ -263,8 +271,10 @@ def test_run_all_runs_each_tool_left_in_order_when_the_one_before_ended_done(
 
     assert _Stub.ran == list(TOOLS)
     outcome = _outcome(page)
-    assert outcome.startswith("run all done in ")
-    assert outcome.endswith(" s: cells, density, route, report, nis-export")
+    assert outcome.startswith("Run all that are left: done in ")
+    assert outcome.endswith(
+        " s (Count the cells, Density per well, Route, Report, Export for NIS-Elements)"
+    )
     chain = page.status().chain
     assert chain is not None
     assert chain.plugins == TOOLS
@@ -296,7 +306,87 @@ def test_a_tool_that_is_ok_is_never_run_by_the_chain(
     chain = page.status().chain
     assert chain is not None
     assert chain.plugins == ("density", "route", "report", "nis-export")
-    assert _outcome(page).endswith(" s: density, route, report, nis-export")
+    assert _outcome(page).endswith(
+        " s (Density per well, Route, Report, Export for NIS-Elements)"
+    )
+
+
+def test_a_tool_the_chain_would_make_out_of_date_is_left_too(
+    page: PlatePage, run_doc: Path
+) -> None:
+    """#446's `## Plan deviation`: a `report` that read the route as absent, with the route not run.
+
+    The report is `ok`, so a chain that left it would run the route and end with a report that
+    is out of date and that it did not run. The rule (m5 §17.12 D14): an `ok` tool that a tool
+    left before it feeds, through `reads` or `reads_optional`, is left too.
+    """
+    _seed(run_doc, "cells", minute=3, reads=_read(run_doc, "scan"))
+    _seed(
+        run_doc,
+        "density",
+        minute=4,
+        reads=_read(run_doc, "scan-plan", "scan", "cells"),
+    )
+    _seed(
+        run_doc,
+        "report",
+        minute=5,
+        # The route was not there when the report was made: an optional read of nothing.
+        reads={
+            **_read(run_doc, "scan-plan", "scan", "cells", "density"),
+            "route": None,
+        },
+    )
+    states = {item.slot: item.state for item in page.view().checklist}
+    assert (states["cells"], states["density"], states["report"]) == ("ok",) * 3
+    assert states["route"] == "not run"
+
+    assert page._chain_left(TOOLS, RunDocument.load(run_doc)) == (
+        "route",
+        "report",
+        "nis-export",
+    )
+    page.run_chain(TOOLS, {})
+    _ended(page)
+
+    # `cells` and `density` read nothing the chain makes again: they are never run.
+    assert _Stub.ran == ["route", "report", "nis-export"]
+    chain = page.status().chain
+    assert chain is not None
+    assert chain.plugins == ("route", "report", "nis-export")
+    assert [(end.plugin, end.how) for end in chain.ended] == [
+        ("route", "done"),
+        ("report", "done"),
+        ("nis-export", "done"),
+    ]
+    # What fails today: the report was out of date after the route and the chain left it.
+    assert {
+        item.slot: item.state for item in page.view().checklist if item.slot in TOOLS
+    } == {tool: "ok" for tool in TOOLS}
+
+
+def test_what_a_tool_left_feeds_is_left_transitively_and_in_the_chains_order(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # `cells` failed, so it is made again; the route reads it and the export reads the route.
+    _seed(run_doc, "cells", minute=3, status=StageStatus.failed)
+    _seed(run_doc, "route", minute=5, reads=_read(run_doc, "scan-plan", "scan"))
+    _seed(run_doc, "nis-export", minute=6, reads=_read(run_doc, "route"))
+    doc = RunDocument.load(run_doc)
+    # The export reads only the route: it is left because the route is, which is left because
+    # of `cells` (transitively), and the chain's order says each is looked at after its feeder.
+    assert page._chain_left(("cells", "route", "nis-export"), doc) == (
+        "cells",
+        "route",
+        "nis-export",
+    )
+    # A tool the chain was not asked to run is not run for it: `nis-export` is a feeder's
+    # reader only through the route, which is not in this chain.
+    assert page._chain_left(("cells", "nis-export"), doc) == ("cells",)
+    # In the chain's order: a tool before its feeder was looked at before the feeder was left.
+    assert page._chain_left(("route", "cells"), doc) == ("cells",)
+    # A name no plugin has provides itself and reads nothing; it is left only when not ok.
+    assert page._chain_left(("their-tool",), doc) == ("their-tool",)
 
 
 def test_a_failed_tool_ends_the_chain_and_the_outcome_names_it_with_what_was_done_and_not_run(
@@ -308,9 +398,10 @@ def test_a_failed_tool_ends_the_chain_and_the_outcome_names_it_with_what_was_don
     _ended(page)
 
     assert _Stub.ran == ["cells", "density", "route"]
+    # The tool's own words, its plain title and its one line, with no exception type.
     assert _outcome(page) == (
-        "run all stopped at route: route: PluginRunError: route: it broke; "
-        "done: cells, density; not run: report, nis-export"
+        "Run all that are left: Route failed: route: it broke; "
+        "done: Count the cells, Density per well; not run: Report, Export for NIS-Elements"
     )
     chain = page.status().chain
     assert chain is not None
@@ -319,7 +410,7 @@ def test_a_failed_tool_ends_the_chain_and_the_outcome_names_it_with_what_was_don
         ("density", "done"),
         ("route", "failed"),
     ]
-    assert chain.ended[-1].outcome == "route: PluginRunError: route: it broke"
+    assert chain.ended[-1].outcome == "Route failed: route: it broke"
     assert chain.current is None
     records = _records(run_doc)
     assert records["route"] is StageStatus.failed
@@ -340,8 +431,8 @@ def test_a_refused_tool_ends_the_chain_with_the_text_run_gives_and_writes_nothin
 
     assert _Stub.ran == ["cells", "density"]
     assert _outcome(page) == (
-        f"run all stopped at route: {single}; done: cells, density; "
-        "not run: report, nis-export"
+        f"Run all that are left: {single}; done: Count the cells, Density per well; "
+        "not run: Report, Export for NIS-Elements"
     )
     chain = page.status().chain
     assert chain is not None
@@ -375,7 +466,7 @@ def test_a_stopped_record_with_a_checkpoint_is_refused_by_the_chain_as_run_refus
     assert _Stub.ran == []
     # `cells` and `density` are ok, so the chain was `route`, `report` and `nis-export`.
     assert _outcome(page) == (
-        f"run all stopped at route: {single}; not run: report, nis-export"
+        f"Run all that are left: {single}; not run: Report, Export for NIS-Elements"
     )
     chain = page.status().chain
     assert chain is not None
@@ -398,8 +489,8 @@ def test_stop_during_a_tool_ends_the_chain_stopped_at_that_tool(
 
     assert _Stub.ran == ["cells", "density", "route"]
     assert _outcome(page) == (
-        "run all stopped at route: route stopped; done: cells, density; "
-        "not run: report, nis-export"
+        "Run all that are left: Route stopped; done: Count the cells, Density per well; "
+        "not run: Report, Export for NIS-Elements"
     )
     chain = page.status().chain
     assert chain is not None
@@ -411,7 +502,34 @@ def test_stop_during_a_tool_ends_the_chain_stopped_at_that_tool(
     assert _records(run_doc)["route"] is StageStatus.stopped
     # The stop note names the tool that was going, never "run all".
     assert page.status().stop_note is not None
-    assert page.status().stop_note.startswith("route told to stop; ")  # type: ignore[union-attr]
+    assert page.status().stop_note.startswith("Route told to stop; ")  # type: ignore[union-attr]
+
+
+def test_a_stop_that_lands_in_a_move_ends_the_chain_stopped_while_the_record_stays_failed(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # FM-64: the stage stopped, so the words say stopped (the Results screen's line says `by STOP`,
+    # not `which failed`); the record is `failed`, because the run raised.
+    _Stub.behaviour["route"] = "move_stopped"
+
+    page.run_chain(TOOLS, {})
+    assert _Stub.started["route"].wait(WAIT_S)
+    page.stop()
+    _Stub.release["route"].set()
+    _ended(page)
+
+    chain = page.status().chain
+    assert chain is not None
+    assert [(end.plugin, end.how) for end in chain.ended] == [
+        ("cells", "done"),
+        ("density", "done"),
+        ("route", "stopped"),
+    ]
+    assert _outcome(page) == (
+        "Run all that are left: Route stopped by STOP; done: Count the cells, "
+        "Density per well; not run: Report, Export for NIS-Elements"
+    )
+    assert _records(run_doc)["route"] is StageStatus.failed
 
 
 def test_stop_between_two_tools_ends_the_chain_before_the_next(
@@ -429,7 +547,8 @@ def test_stop_between_two_tools_ends_the_chain_before_the_next(
 
     assert _Stub.ran == ["cells", "density"]
     assert _outcome(page) == (
-        "run all stopped before route; done: cells, density; not run: report, nis-export"
+        "Run all that are left: stopped before Route; done: Count the cells, "
+        "Density per well; not run: Report, Export for NIS-Elements"
     )
     chain = page.status().chain
     assert chain is not None
@@ -487,7 +606,7 @@ def test_run_all_with_the_stand_closed_or_nothing_left_starts_no_activity(
     _seed_scan(run_doc)
     closed = make_page(connect=False)
     closed.run_chain(TOOLS, {})
-    assert closed.status().outcome == f"run all: {NOT_CONNECTED}"
+    assert closed.status().outcome == f"Run all that are left: {NOT_CONNECTED}"
     assert closed.status().running is None
     assert closed.status().chain is None
     assert closed.activities_ended == 0
@@ -500,7 +619,9 @@ def test_run_all_with_the_stand_closed_or_nothing_left_starts_no_activity(
     _Stub.ran.clear()
 
     connected.run_chain(TOOLS, {})
-    assert connected.status().outcome == "run all: nothing is left: every step is done"
+    assert connected.status().outcome == (
+        "Run all that are left: nothing is left: every step is done"
+    )
     assert connected.status().running is None
     assert connected.activities_ended == ended
     assert _Stub.ran == []
@@ -604,10 +725,10 @@ def test_close_during_a_chain_stops_it_and_says_so(
 
     assert page.close_ended
     assert len(page.close_lines) == 2
-    assert page.close_lines[0].startswith("density told to stop; ")
+    assert page.close_lines[0].startswith("Density per well told to stop; ")
     assert page.close_lines[1] == (
-        "run all stopped at density: density stopped; done: cells; "
-        "not run: route, report, nis-export"
+        "Run all that are left: Density per well stopped; done: Count the cells; "
+        "not run: Route, Report, Export for NIS-Elements"
     )
     assert _records(run_doc)["density"] is StageStatus.stopped
 
@@ -624,13 +745,15 @@ def test_a_bug_in_the_chain_is_an_outcome_and_not_an_exception(
     _ended(page)
 
     # The text, on one line, and never the exception (FM-98); the page is free again.
-    assert _outcome(page) == "run all: ValueError: a bug in the chain"
+    assert _outcome(page) == "Run all that are left: ValueError: a bug in the chain"
     chain = page.status().chain
     assert chain is not None
     # The tool whose turn it was is the one that failed: the Results screen then says
     # which, and never reads the chain as a STOP nobody pressed.
     assert chain.ended == (
-        ChainEnd("cells", "failed", "cells: ValueError: a bug in the chain"),
+        ChainEnd(
+            "cells", "failed", "Count the cells failed: ValueError: a bug in the chain"
+        ),
     )
     assert chain.current is None
     assert _Stub.ran == []
@@ -653,14 +776,14 @@ def test_a_bug_after_one_tool_ends_that_tool_failed_and_is_never_read_as_a_stop(
     page.run_chain(TOOLS, {})
     _ended(page)
 
-    assert _outcome(page) == "run all: ValueError: boom"
+    assert _outcome(page) == "Run all that are left: ValueError: boom"
     chain = page.status().chain
     assert chain is not None
     assert [(end.plugin, end.how) for end in chain.ended] == [
         ("cells", "done"),
         ("density", "failed"),
     ]
-    assert chain.ended[-1].outcome == "density: ValueError: boom"
+    assert chain.ended[-1].outcome == "Density per well failed: ValueError: boom"
     assert chain.current is None
     assert _Stub.ran == ["cells"]
 
@@ -693,7 +816,7 @@ def test_a_run_document_that_cannot_be_read_ends_the_call_with_its_error_and_run
     page.run_chain(TOOLS, {})
 
     outcome = _outcome(page)
-    assert outcome.startswith("run all: ")
+    assert outcome.startswith("Run all that are left: ")
     assert "the file is locked by another program" in outcome
     assert "\n" not in outcome
     # Nothing started: no activity, no chain, no tool run, and the `ok` one was not run again.
@@ -709,7 +832,7 @@ def test_run_all_with_no_step_asked_for_says_so_and_starts_no_activity(
     # own (FM-169), and says what is true: nothing is done, nothing was asked for.
     before = page.activities_ended
     page.run_chain([], {})
-    assert _outcome(page) == "run all: no step was asked for"
+    assert _outcome(page) == "Run all that are left: no step was asked for"
     assert page.status().running is None
     assert page.status().chain is None
     assert page.activities_ended == before
@@ -758,7 +881,7 @@ def test_a_name_no_plugin_has_is_refused_at_its_turn_as_text(
     _ended(page)
 
     outcome = _outcome(page)
-    assert outcome.startswith("run all stopped at their-tool: their-tool: ")
+    assert outcome.startswith("Run all that are left: their-tool: ")
     chain = page.status().chain
     assert chain is not None
     assert [(end.plugin, end.how) for end in chain.ended] == [("their-tool", "refused")]
@@ -800,9 +923,11 @@ def test_a_record_that_could_not_be_written_ends_the_tool_failed_and_stops_the_c
     assert chain is not None
     assert [(end.plugin, end.how) for end in chain.ended] == [("cells", "failed")]
     outcome = _outcome(page)
-    assert outcome.startswith("run all stopped at cells: ")
+    assert outcome.startswith("Run all that are left: Count the cells ")
     assert "the disk is full" in outcome
-    assert outcome.endswith("; not run: density, route, report, nis-export")
+    assert outcome.endswith(
+        "; not run: Density per well, Route, Report, Export for NIS-Elements"
+    )
     assert ("ran, but its record could not be written" in outcome) is with_result
 
 

@@ -161,7 +161,7 @@ def test_selecting_b3_on_a_turned_plate_drives_to_the_printed_b3(
     assert page.join(30.0)
     outcome = page.status().outcome
     assert outcome is not None
-    assert outcome.startswith("goto-well done"), outcome
+    assert outcome.startswith("Go to done"), outcome
     landed = stage.position_um()
     x_um, y_um = _truth("B3")
     assert abs(landed.x_um - x_um) < 1.0

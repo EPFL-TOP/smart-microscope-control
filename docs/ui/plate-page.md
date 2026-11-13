@@ -50,17 +50,21 @@ read from the profile, before anything is opened.
 
 ### Connect and Disconnect
 
-The row above the strip holds **Connect**, **Disconnect** and one line that says
-where the stand is:
+The row above the strip holds **Connect** and **Disconnect**, and, **only while it has
+something to say**, one line under the strip (the strip itself says `<stand> | not connected`
+or the stand's state, and `DRY RUN`):
 
-| The stand | The row says | Enabled |
+| The stand | The line says | Enabled |
 |---|---|---|
-| closed (the page as it opens) | `<stand> is not connected: Connect opens it, and the controls that need the stand are disabled until then` | Connect |
+| closed (the page as it opens) | nothing: the line takes no height | Connect |
 | Connect is opening it | `connecting <stand>…` | neither |
-| held | `Disconnect releases <stand> for another program (NIS-Elements, ZEN)` | Disconnect |
+| a Connect that failed | `<stand> is not connected: Connect opens it, and the controls that need the stand are disabled until then` (the failure is the outcome line's: `connect: <why>`) | Connect |
+| held | nothing here: the Stand screen says `Disconnect releases <stand> for NIS-Elements or ZEN.` | Disconnect |
 | Disconnect is releasing it | `disconnecting <stand>…` | neither |
 
-`(dry run)` is added when it is one. Both buttons are disabled while anything goes
+`(dry run)` is added when it is one. The line goes with the next activity. (It used to say
+`Disconnect releases ... for another program` on every screen, which took 27 px of a 623 px
+page, m5 §17.12 D15.) Both buttons are disabled while anything goes
 (a run, a snap, live, a drive action, a connect, a disconnect), and the capture
 buttons with them. A slow stand takes seconds to open: `connecting…` is what says the
 page is not stuck.
@@ -90,9 +94,11 @@ page is not stuck.
     start NIS-Elements or ZEN before restarting `smc ui`;
   - `disconnect: <Type>: <why>` for any other error: the page has let go of the
     stand, which may be half unloaded.
-- **With the stand closed** every control that needs it is disabled, and the row's
-  line is the reason: the strip says `<stand> | not connected` (and `DRY RUN`), every
-  tool's note and the Drive region say `the stand is not connected` once, Snap,
+- **With the stand closed** every control that needs it is disabled, and the reason is
+  said where it is needed: the strip says `<stand> | not connected` (and `DRY RUN`), the line
+  under it says so after a Connect that failed, every
+  tool's note and the Drive region say `the stand is not connected` once, the *Drive* toggle
+  waits too, Snap,
   Live and the captures are greyed. Every tool needs the stand, as `smc run` opens it
   for every plugin. The map, the selection, the checklist and the result cards work
   all the same: they read the profile and the run document, not the stand. The last
@@ -121,8 +127,8 @@ Connect opened it, is released after. What the command prints last depends on wh
 | What happened | The last lines |
 |---|---|
 | The stand took the stop and the run ended stopped | `<plugin> was stopped`, exit 0 |
-| The stand refused the stop (the Ti2-E's does) | `<plugin> told to stop; halted, but <why>`, then how the run ended: a move under way runs to its target, so it is never "stopped" by default |
-| The run failed while it was stopped | the stop's line, then `<plugin>: <Error>: <message>`, exit 0 |
+| The stand refused the stop (the Ti2-E's does) | `<title> told to stop; halted, but <why>`, then how the run ended: a move under way runs to its target, so it is never "stopped" by default |
+| The run failed while it was stopped | the stop's line, then `<title> failed: <message>` (the tool's plain title, and no exception type: that is in the log), exit 0 |
 | The run did not end within the wait | the stop's line, then `✗ <plugin> did not end within 10 s`, **exit 1**; the stand is released under a run that is still alive |
 | A Connect was still opening a slow stand | the command waits up to 8 s more, then `connect: <stand> was opened after the page closed, and released` (exit 0), or `✗ connect: <stand> is still opening after 18 s: the process ends now, and whether the stand is left connected is not known` (**exit 1**) |
 
@@ -150,15 +156,20 @@ stand is halted. `?` is an unknown, never a zero. With the stand closed it is
 `<stand> | not connected` and nothing else. It is read once a second, and no
 faster: a scan must not be slowed by a status poll. **STOP is always offered**, a run
 or not. Under it: the run's progress as `done/total message`, how the last run ended
-(`<plugin> done in 12.3 s`, `<plugin> stopped`, or `<plugin>: <Error>: <message>`) and
-what the last STOP did. A run that ended `done` and **assumed** something says its first
-assumption: `scan done in 0.0 s; assumed: dry run: 36 fields walked, no frame taken`, cut
+(`<title> done in 12.3 s`, `<title> stopped`, `<title> stopped by STOP` when STOP landed in
+a move the tool was making, or `<title> failed: <message>`) and
+what the last STOP did. The **title** is the tool's plain name, never its plugin name: `Go to`,
+`Registration`, `Camera calibration`, `Field layout`, `Scan`, `Count the cells`, `Density per
+well`, `Route`, `Report`, `Export for NIS-Elements` (`TOOL_TITLES` in `smc/ui/guide.py`); a
+third party's tool is named by its own plugin name, and the exception's type is in the log.
+A run that ended `done` and **assumed** something says its first
+assumption: `Scan done in 0.0 s; assumed: dry run: 36 fields walked, no frame taken`, cut
 at 160 characters, then `(+2 more, on the card)` when there are others; the tool's card
 holds them all. **Refresh** also forgets how the last run ended, so that a line like
 `cells: ... run scan again` does not outlive the chain that was run elsewhere; the
 redraw that a run's end makes keeps it.
 
-**STOP says what it did.** `<plugin> told to stop; stopped: the stand is halted
+**STOP says what it did.** `<title> told to stop; stopped: the stand is halted
 (Resume clears the halt)`, or `halted, but <why the stand refused>`, or `the stop failed:
 <why>`. On a stand whose stages refuse a stop (the Ti2-E's, [#204](https://github.com/EPFL-TOP/smart-microscope-control/issues/204)) the strip also says so: a move already under way
 runs to its target. After STOP every action is refused until **Resume**, which is
@@ -169,15 +180,16 @@ more):
 
 ```text
 [Connect][Disconnect]  demo-sample | XY … | Z … | 10x | …                 [Resume] [STOP]   the strip
-outcome lines (connection, run, message, problems): an empty one takes no height
+the outcome line (always its height); the connection, message and problems lines only with a text
 [1. Stand ✓][2. Plate ✓][3. Wells][4. Scan][5. Results]                       [Expert view]   the step bar
  demo-sample   96-well, registered   next                                                    its summaries
 ┌ step panel (400 px) ┬ map ──────────────────────┬ image ─────────────────────────────┐
-│ title: a question   │ [Density of ▾] [Refresh]  │ [Snap] [Live]                      │
+│ title: a question   │ [Refresh] (Density of ▾)  │ [Snap] [Live] a note on the frame  │
 │ a sentence          │ the map's title, wrapped  │ the frame                          │
-│ the next step       │ the plate map             │ the drive bar: the pad, the steps, │
-│ the step's regions  │                           │ Z, autofocus, light, objective,    │
-│ [Continue to …]     │                           │ Drive to, Drive (next click …)     │
+│ the step's regions  │ the plate map             │ the drive bar: two columns (the    │
+│ [Continue to …]     │                           │ pad and its step | Z, autofocus,   │
+│                     │                           │ light), then objective, Drive to   │
+│                     │                           │ and the Drive toggle on one row each│
 └─────────────────────┴───────────────────────────┴────────────────────────────────────┘
 ```
 
@@ -185,14 +197,24 @@ outcome lines (connection, run, message, problems): an empty one takes no height
   screen**, so that the operator who centres a well (Live, then the arrows) sees the map,
   and the one who clicks a well sees the image. A snap, a Live, a run's end or a tick
   changes **no screen**. Neither figure is ever removed and added again, so a map redrawn
-  while you look elsewhere is framed on the plate as it was drawn, and **Reset** in the
+  while you look elsewhere is framed as it was drawn, and **Reset** in the
   map's toolbar returns to that frame ([FM-174](../design/failure-modes.md)).
 - **The header stays at the top of the window** when the page is scrolled: the strip, the
   outcome lines and the step bar with its summaries are one block, so that STOP is always
-  in reach and the step bar does not scroll away. At 1280 x 800 the **drive bar is partly
-  below the fold** (its pad and its first rows are in view, the objective, *Drive to* and
-  the toggle are a scroll down); the figures are 400 px high, the least the layout allows,
-  to show as much of it as it can. A wider or taller window shows all of it.
+  in reach and the step bar does not scroll away. It holds **one outcome line that always
+  takes its height**, empty or not (the page used to jump by a line each time an outcome came
+  and went), and the connection, message and problems lines only while they have a text.
+  The **drive bar** is two columns and two rows: the pad and *XY step* on the left; *Z +*,
+  *Z −*, *Z step*, the autofocus pair and the light pair on the right; then *Objective* with
+  *Change objective*, and *Drive to* with the *Drive* toggle, each on one row; its notes are
+  under them. At 1280 x 800 its controls, down to the *Drive* toggle, are in view
+  (`ui-check`'s `wells-selected` says `drive bar: yes`); the notes may be a scroll down. The
+  figures are **360 px** high, the floor the layout allows: at 400 the toggle was 20 px below
+  the fold. The header is 137 px tall with its one outcome line (it was 180 on the owner's
+  walk), and a long outcome makes it taller.
+- **The wheel over a figure zooms that figure** (Bokeh's `wheel_zoom`), as it always did; the
+  page scrolls with the wheel anywhere else. To scroll the page with the pointer over the map or
+  the image, move it off the figure. **Reset** in a figure's toolbar frames it again.
 - **The step panel (400 px) scrolls on its own** when a screen is taller than the window;
   the header and the figures do not scroll with it. **A screen opens at its top**: a click
   on a step (or *Continue*, or the expert switch) shows the new screen scrolled to its
@@ -201,7 +223,8 @@ outcome lines (connection, run, message, problems): an empty one takes no height
 
 **The five steps.** A step opens at any time: none is ever disabled (an action that cannot
 run is greyed with its reason beside it, as before). The button is `n. Title`, with a `✓`
-when the step is done, and a line under it: the stand's name (and the preset), `not
+when the step is done, and a line under it, **one line of at most 22 characters** (cut with
+`…`, so that the step bar is one line tall): the stand's name (and the preset), `not
 connected`, `<plate>, registered`, `<w> wells, <n> fields`, `scanned`, `<k> of 5 done`,
 and `next` under the one the run document needs next. **The page opens on that step**
 (the stand while it is not connected, Results when everything is done) and afterwards only
@@ -233,9 +256,11 @@ disclosure shows the `smc run` line it makes.
   choices under a name (see *Presets*);
 - **what the page knows**, three lines, each saying what it rests on or that it is not
   known: `Objective: <label>, in place` (or `not known`); `Camera: calibrated at <objective>
-  on <date> UTC`, `... not at <the one in place>` when the camera was calibrated at
+  on <date and time>`, in **the PC's own time to the minute** (the expert view's cards and the run
+  document stay UTC), `... not at <the one in place>` when the camera was calibrated at
   another objective, `... objective not recorded`, or `not calibrated (the arrows cannot
-  say which way the image moves)`; `Light: on`, `off` or `not known`;
+  say which way the image moves)`; `Light: on`, `off` or `not known`; and, while the stand is
+  connected, `Disconnect releases <stand> for NIS-Elements or ZEN.`;
 - **Calibrate the camera**, shown only when there is no calibration or it was made at
   another objective. It runs `camera-calibration` with what the profile suggests, as the
   tool's own *Run* does.
@@ -248,34 +273,58 @@ disclosure shows the `smc run` line it makes.
   plate is only the placeholder, the question *The plate is a …* that confirms it;
 - **three centres**, far apart (A1, the last column of row A and the last row of column 1,
   as the plate prints them: `A1, A12, H1` on a 96-well plate, one well on a coverslip),
-  one row each. A row says what to do, `go there, centre it, capture`, then `captured at
+  one row each, under **one note** that says what holds for every row, **once**: what runs
+  (`goto-well is running: wait for it to end, or press STOP.`), or `End live to go to another
+  well; Capture works during Live` during Live, and, while nothing is captured on a stand
+  whose profile has a `[sample]` of this plate, that *Register the plate* uses the sample.
+  A row says what to do, `go there, centre it, capture`, then `captured at
   (x, y) µm with <objective>` once it is (the objective in place when you captured, or
   `the objective not known`), and has two buttons:
   - **Go to `<well>`**: the same drive as a click on the map. Before the plate is registered
     it goes to the **estimate** from the stand's holder (`go there (estimated position),
     centre it by eye, capture`), and where the stand says nothing of its holder it
-    refuses and the row says why. It is **disabled while Live runs**, with `End live to go
-    to another well; Capture works during Live`. A refusal, or a drive that did not end
-    well, is written **on the row**;
+    refuses and the row says why. It is **disabled while anything runs, Live included**. What
+    the drive came to is written **on the row of its well**, in its own words: `Going to A1…`,
+    `At A1.`, `At A1, the holder's estimate: centre it by eye with Live and the arrows, then
+    capture.`, or the refusal's or the failure's one line (in the warning colour, without the
+    tool's name). A second click while a drive goes is refused and does not overwrite the
+    running drive's text. The answer is about the plate, the centres and the registration it
+    was sent in, and goes when one changes (a registration clears it, so that `... not
+    registered` never stays under `Registered:`);
   - **Capture the centre of `<well>`** (**Redo** once captured): records where the stage is
     as that well's centre. It **works during Live**: go to the well, start Live, centre
     it with the arrows, capture, end Live. A well captured by clicking the map is listed
-    after the three, as text.
+    after the three, as text. **A capture far from its well is noted** under its row, in the
+    warning colour: `H1 was captured 99.0 mm from where the map puts it: is the stage over H1?
+    Redo it there.` (more than one pitch of the plate from where the map draws that well, in
+    the pose drawn: registered, seed or estimated; on an *unplaced* map nothing is far from
+    where it is not), and two captures at one place (closer than half a pitch) are noted on
+    both rows: `A12 and A1 were captured at the same place: redo the one that is wrong.` It is
+    a note, never a refusal: the registration's own residual bound refuses a bad fit.
 - **Register the plate**, one button: `plate-registration` with the centres as the screen
   drew them. While it waits it says for what (`centre a well under the objective ...`,
   or `choose the plate on the stage first`). On a stand whose profile has a `[sample]` of
   this plate the rows say `known from the profile's sample, not measured` and the button
-  registers from them with no capture. With a plate already registered it says, before you
-  press it, that **registering again replaces that plate** and that a failed run leaves none
+  registers from them with no capture. **It is refused across a turn of the turret**
+  (m5 §17.12 D13, #373): when the centres were captured with another objective than the one in
+  place, or with two objectives, the button waits with `The centres were captured with the
+  Nikon 10X; the Nikon 40X is in place: turn back to the Nikon 10X, or redo the centres with
+  the Nikon 40X.` (or `... with different objectives (...): redo them with one objective.`),
+  and the click that still arrives starts nothing and writes nothing. Only the objectives the
+  page read are compared: a capture restored from a run document, or taken while the turret
+  could not be read, refuses nothing. The captures stay across a turn. With a plate already
+  registered it says, **under the result line**, that **registering again replaces that plate**
+  and that a failed run leaves none
   (the centres captured stay: *Redo* the wrong one and register again). On a Windows PC the
   *Command* under it says that its line is quoted for a POSIX shell and that the button is
   the way in. The walls and the automatic survey are named under **Other ways to register**
   and run from the expert view;
-- the result, `Registered: residual 121.6 µm, turned 0.10°` (`residual not measured` for a
-  seed), with what the registration assumed under it, and **Continue to Wells**.
+- the result, `Registered: residual 62.3 µm of the 300 µm allowed, turned 0.10°` (`residual not
+  measured` for a seed): the bound is the one the tool refuses beyond; with what the registration
+  assumed under it, and **Continue to Wells**.
 
 Nothing on the Plate screen is in the warning colour before a capture: the rows say what to
-do, and a refusal is the only orange text.
+do, and a refusal, a failure or a note on a far capture is the only orange text.
 
 **At 1280 x 620** the title, the sentence, the fields and the first button of both screens
 are in view under the header (`ui-check`'s `stand-620` and `plate-620`); on a stand whose
@@ -294,12 +343,16 @@ a POSIX shell and the button is the way in). Nothing is in the warning colour bu
 - **Wells**, the box you click the map or type a range in (`A1:D6`, `C*`, `all`), and under it
   where the choice comes from: `no well chosen yet`, `from the preset <name>` or `chosen on
   this page`;
-- **coverage** (`scan-plan`'s) and **autofocus** (`scan`'s), the tools' own fields: what you
+- **coverage** (`scan-plan`'s) and **autofocus** (`scan`'s), the tools' own fields, each with
+  **what it is in plain words above it** (`How much of each well's width the fields span: 0.4 is
+  40 %.`; `Autofocus: if-engaged uses it when it is on and locked; required refuses to start
+  unless it is; off never touches it. The scan never switches it on.`): what you
   type here is what the tools' sections in the expert view hold, and the other way round.
   Under each, where its value comes from: `from the preset <name>`, `from the profile's
   suggestions`, `typed on this page`, or `the tool's default: 1.0` while it is empty. The
   light grey text in an empty field is that default, **without the quotes** a string carries
-  in the tool's own words (`if-engaged`, not `'if-engaged'`): it is not something to type;
+  in the tool's own words (`if-engaged`, not `'if-engaged'`, and a list's default as its items,
+  `single`, not `('single',)`): it is not something to type;
 - **Lay out the fields**: `scan-plan` with your wells and these two values, which is what the
   tool's own *Run* does. While it waits it says for what, the first that holds: the stand is
   closed, the plate is not chosen (`choose the plate on the stage first ...`), **register the
@@ -308,8 +361,7 @@ a POSIX shell and the button is the way in). Nothing is in the warning colour bu
 - **what is known**, under the button: `Objective: <label>, in place`; `Fields: 72 in 2 wells`
   (or `Fields: not laid out yet`, or `Fields: out of date (<why>)` when the plate or the timings
   were produced again since, so the plan is stale); `Time: about 42 s`, or, for a plan made with
-  no timing measured, `Time: not known (no timing measured; the expert view's timing tool
-  measures it, then lay out the fields again)`: an unknown, never `0 s`; then what the plan
+  no timing measured, `Time: not known (no timing measured yet)`: an unknown, never `0 s`; then what the plan
   assumed (`assumed: no camera calibration for ...`). The page does not measure the timing
   itself: that moves the stage;
 - when the wells selected are **not** the plan's wells, a note says which wells the plan is for
@@ -347,8 +399,9 @@ fields in the plan's order), and, once it is done, the fields the run document's
 frame for (a field that failed is not green; a dry run takes no frame, so none is). A scan that
 ended `stopped` leaves the map without green fields: its frames are on disk and `smc run
 --resume` continues it, but the page claims only what a usable result holds. A field is 512 µm on
-a plate of 127 mm: **a pixel or two at the default zoom**, so zoom the map to see them (the map is
-not framed on the plan's wells yet).
+a plate of 127 mm, and the map is **framed on the plan's wells** from the Wells screen on (a pitch
+of margin around them), so the fields are specks only on a plan that spans the plate; zoom the map
+to see them.
 
 **At 1280 x 800** the Wells screen's title, the box, the two fields and *Lay out the fields* are
 in view under the header, and what is known may be a scroll of the panel down (`ui-check`'s
@@ -368,8 +421,11 @@ all that are left.` From the top:
   below, as **one run**: the strip names the step that goes, and a second run, a Snap or a
   Disconnect is refused until the chain ends. It goes on while a step ends well and stops at
   the first that does not, **and at STOP** (a STOP that lands between two steps stops the chain
-  before the next one starts). A step that is **done is never run by it**: running it again would
-  make every step that read it out of date; press its *Again* for that. It uses the choices of
+  before the next one starts). A step that is **done is never run by it, unless a step left before
+  it feeds it** (m5 §17.12 D14): running that step would make it out of date, so it runs again
+  after it, and the chain never ends with a step it made out of date and did not run (a report
+  that read the route as absent is run again after the route; the chain counts them from the
+  start, `Running Report (3 of 4)`). Any other done step is not run: press its *Again* for that. It uses the choices of
   the rows (below) and the page's, as each step's own *Run* does. Under it, while it cannot
   start, the reason: `Nothing is left: every step is done.`, the state of the first step left
   when that is an input still missing (`scan first: step 4, Scan`, `after Count the cells`),
@@ -380,23 +436,22 @@ all that are left.` From the top:
   <why>` when the step was refused before it started (a value it does not accept, a stage
   stopped with a checkpoint: the page never starts one afresh, so the row says the command that
   continues it); `Stopped at <step> by STOP.`; `Stopped before <step> by STOP.`. The strip says
-  the same in the tools' own words (`run all stopped at route: ...`), and stays until another
-  run starts;
+  the same in the tools' own words (`Run all that are left: Route failed: ...`), and stays until
+  another run starts;
 - **a row for each step**, in this order: *Count the cells*, *Density per well*, *Route through
   the densest fields*, *Report*, *Export for NIS-Elements*. A row is:
-  - the **name**, in bold, and a **state line**: `Done 2026-11-12 09:30:00 UTC` (with `(dry
-    run)` when it was one), `Ready`, `Running now` (with `: 3 of 12` when the tool reports its
+  - the **name**, in bold, and a **state line**: `Done 2026-11-12 10:30` in the PC's own time to
+    the minute (with `(dry run)` when it was one), `Ready`, `Running now` (with `: 3 of 12` when the tool reports its
     count), `Not usable: <why>` when its result is out of date (a step before it was run
     again, the stand is another one), or what it waits for when an input is missing: `after
     Count the cells`, `lay out the fields first: step 3, Wells`, `scan first: step 4, Scan`;
   - **Run**, or **Again** when the step is done: the same call as the tool's own *Run* in the
     expert view, with the choices below. It is disabled, with its reason under it, while
-    something runs (`cells is running: wait for it to end, or press STOP.`), when the stand is
-    closed, when a stage of its own is stopped with a checkpoint, and when an input is
+    something runs, when the stand is closed, when a stage of its own is stopped with a checkpoint, and when an input is
     missing (the state line says which);
-  - under **Again**, what it **replaces**: `Again replaces this result. What comes after it
-    and is done (Density per well, ...) is out of date then: Run all that are left runs it
-    again.` It names the steps after it that read it, directly or through another (the
+  - under **Again**, what it **replaces**, on one line of short names: `Again makes Density,
+    Route, Report, Export out of date; Run all that are left runs them again.` It names the
+    steps after it that read it, directly or through another (the
     report reads the route when there is one, so it is named after *Again* on the route),
     and says nothing for a step no other reads (*Report*, *Export for NIS-Elements*);
   - a closed **Choices and command**: the choices a profile or a preset fills, each with the
@@ -408,16 +463,22 @@ all that are left.` From the top:
     here is what the expert view's section holds, and the other way round;
 - **Where the files are**: one line for each file a step wrote, `<the step's name>: <path>`
   (`Scan frames`, *Count the cells*, *Report*, *Export for NIS-Elements*), `No step has written a
-  file yet.` before any; a stopped or failed step names none. The run document's path closes
-  the screen.
+  file yet.` before any; a stopped or failed step names none. **A file inside the run document's
+  folder is a link that opens it in a new tab** (the report opens as a page, the export as XML), through
+  the page's own route, `/run-files/<path in the run folder>`, which serves **only the files the
+  run document's records name** (read at each request) and answers 404 to anything else: a
+  sibling, a parent (`..`), an absolute path, a folder. The scan's frames folder and a file outside
+  the run folder (`nis-export --param out=/elsewhere/x.xml`) stay a path. The run document's path
+  closes the screen.
 
 **On a page served with `--dry-run`**, over a scan that was a dry run (it took no frame),
 *Count the cells* and the steps that read the scan wait with `this page is a dry run: scan walks
 the fields and takes no frame ...`: the way on is a stand whose stage is simulated
 (`demo-sample`, served without `--dry-run`). The expert view's own *Run cells* is not held back.
 
-**On the map**, the colour bar says which class its colours count, `single cells per mm²`: the
-class the *Density of* select names, and the title follows the select.
+**On the map**, the colour bar says which class its colours count, `single cells per mm²`, along
+the bar: the class the *Density of* select names, and the title follows the select. The select
+shows only once a density exists.
 
 **At 1280 x 800** the title, *Run all that are left* and the first row are in view under the
 header (`ui-check`'s `results-all`); the five rows are taller than the page, so the others, the
@@ -438,7 +499,14 @@ shows it, so what you typed on one is there on the other.
 screens, and what each draws (the ticks, the lines, the map) is the server's.
 
 **The map**. The plate in stage µm, X right and Y up, wells as circles (96-well and
-below) or squares (384 and 1536), turned by the plate's rotation. **Its title says how the
+below) or squares (384 and 1536), turned by the plate's rotation. **It is framed on what the
+screen is about** (m5 §17.12 D16): on the Stand and Plate screens and in the expert view, the
+plate with a pitch of margin all round; on the Wells, Scan and Results screens, **the plan's
+wells** with a pitch of margin (the plate when there is no plan, or none of its wells is on
+this plate). One invisible layer, the frame, is the only thing the map's ranges follow, so a
+change of screen reframes the map and keeps its aspect; a zoom or a pan of your own stops it
+following until the toolbar's **Reset**. The *Density of* select is above the map only when a
+density exists. **Its title says how the
 plate was placed**, in one of four ways, because a well name read off the map is trusted:
 
 - `96-well: the registered plate, A1 at the back left`: A1 and the rotation come from a
@@ -483,7 +551,8 @@ The line beside the toggle is the same in every tab, and *Refresh* clears it.
 the stand and which the operator's right (`[holder] back`, `right`:
 [profiles](../../profiles/README.md#back-right-the-sides-of-the-stand)), the map labels
 its four sides around the wells: *back of the stand*, *front of the stand*, *operator's
-left*, *operator's right*, half a well's pitch outside them. On the Ti2-E the back is at
+left*, *operator's right*, half a well's pitch outside them, inside the frame, the left and
+the right one **turned 90° along the plate's sides**. On the Ti2-E the back is at
 the top and the operator's right on the right; on a stand whose back is -X it is on the
 left of the map. Without them there are no side labels. **A1 is always labelled, bold**,
 on every plate: it is the one name you check against the plate.
@@ -493,7 +562,9 @@ outline; the cells' **density** colours the wells (grey where unknown, a well wi
 frame is unknown, not zero), for the label chosen under *Density of*. The **route** is
 a red line with its stops.
 
-**The cross.** The stage is a black cross, with the well it is over written beside it:
+**The cross.** The stage is a black cross, with the well it is over written beside it, on a
+white ground, and **on the side away from the frame's nearer edge** (left of the cross beside the
+right edge, below it beside the top), so that `over A12` is not cut:
 `over B3` on a registered map, `over B3 (estimated)` on an estimated one, `over B3
 (rotation assumed)` on a seed's, and nothing between wells, on a map the stand does not place,
 or with the stand closed. **While Live runs the cross follows the frames**, ten times a
@@ -616,6 +687,18 @@ something else is going: a snap is one activity like a run, so only one runs at 
 (`snap is running`, `<plugin> is running`), and STOP during a snap says `snap told to
 stop; ...` and halts the stand. A frame the page cannot show (not 2-D `uint8` or
 `uint16`) is an outcome under the strip and is not kept.
+
+**A frame that carries no light says so**, beside *Snap* and *Live* (m5 §17.12 D22, #457): `The
+frame is dark: is the light on, and the light path on the camera?` when the frame's 1st to 99th
+percentile spans fewer counts than the camera's dark floor (`smc.plugins.frame_signal`, the
+calibration's own measure: 50 counts at 16 bits, scaled with the depth, and a sparse field of a few
+beads still counts as light), and `The frame is saturated: lower the exposure.` when at least **one
+percent of the pixels sit at the camera's full scale**. That fraction is **an assumption**, not
+measured on a stand (`SATURATED_FRACTION`), and a stand's own frames will decide it. Saturated is
+asked first: a frame at full scale everywhere spans no counts, and the light path is not its
+remedy. The test runs **once for each new frame** (4.5 ms at 512 x 512, 16.5 ms at the Prime
+95B's 1200 x 1200, on every other row and column past 1600 x 1600), never at a tick. A frame a
+plugin handed the page (a scan's) has no bit depth, and is not judged.
 
 **Live** (beside Snap). **Live** takes frames from the camera one after the
 other, **at most 10 a second**, and the page draws each new frame: the frame number is
@@ -1134,7 +1217,8 @@ is in the expert view only): *2. Plate* and **Register the plate** (from the sam
 `coverage=0.4` is already in the field, and says where it comes from), then *4. Scan* and
 **Start the scan**, then *5. Results* and **one click on Run all that are left**: `cells` (with
 the profile's `detector=blobs`), `density`, `route`, `report` and `nis-export` run one after
-the other, the strip says `run all done in ... s: cells, density, route, report, nis-export`,
+the other, the strip says `Run all that are left: done in ... s (Count the cells, Density per well, Route,
+Report, Export for NIS-Elements)`,
 and *Where the files are* names the report and the export.
 `tests/unit/test_plate_page_wells_scan_view.py` walks the path to the scan on `demo-sample`,
 without `--dry-run`: `Scanned: 72 frames, 0 failed`, 72 green fields, `Field 72 of 72`; and
@@ -1284,6 +1368,17 @@ a field); **STOP during a scan on a stand whose profile says `stop_refused_by`**
 Scan screen's sentence says there (a move already sent finishes first); the green fields at
 the stand's screen and zoom, and over RDP; and the layout of both screens at the stand PC's
 window (the Wells screen's known block may be a scroll of the panel down at 1280 x 800).
+
+**The second round** (the owner's walk of 2026-11-13, m5 §17.12) adds, for the owner: the page
+read by a newcomer once more (#475's last criterion); the layout at the stand PC's screen and over
+RDP (the drive bar's toggle is in view at 1280 x 800 with the figures at 360 px, measured in headless
+Chromium on macOS only); the **saturated fraction** of the frame hint (one percent of the pixels at full
+scale, assumed, not measured on a stand) and the dark floor on the Ti2-E's camera in its other modes;
+the report and the export opened from *Where the files are* in the stand PC's browser (the route and the
+map's reframing were checked on Panel 1.10.0 and 1.9.4, headless Chromium, macOS); *Register the plate*
+refused across a turn of the Ti2-E's real turret, and the capture notes against a real registration;
+the local time on a PC whose zone is not the lab's; a STOP in a move on a stand whose profile says
+`stop_refused_by` (the words say `stopped by STOP` only when the stand raised the stop's own error).
 
 **Connect and Disconnect** add: Connect, Disconnect, NIS-Elements taking the stand,
 then Connect again, at a real stand; **a stand opened on the page's worker thread**,

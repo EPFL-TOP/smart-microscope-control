@@ -50,7 +50,13 @@ from smc.hardware.capabilities import (
     XYStage,
     ZStage,
 )
-from smc.hardware.errors import HardwareError, MicroscopeBusyError, StopRefusedError
+from smc.hardware.errors import (
+    HardwareError,
+    MicroscopeBusyError,
+    MicroscopeHaltedError,
+    MotionStoppedError,
+    StopRefusedError,
+)
 from smc.hardware.microscope import describe_autofocus
 from smc.hardware.safety import Safety
 from smc.plugins import (
@@ -118,18 +124,23 @@ from smc.ui.guide import (
     MAP_FIELDS_UP_TO,
     NO_CALIBRATION_FOR_SIDES,
     PLATE_NOT_CHOSEN,
+    RUN_ALL_LABEL,
     SELECT_WELLS,
     SELECTION_KEPT_ITS_NAMES,
     WALLS_DRY_RUN,
     WALLS_NEED_CALIBRATION,
     CalibrationNote,
+    GotoAnswer,
     NextStep,
     a1_corner,
     command_line,
+    local_time,
     next_slot,
+    register_objective_refusal,
     replace_note,
     scan_plan_card_lines,
     side_words,
+    tool_title,
     walls_card_lines,
     walls_centres_problem,
     walls_square_wells,
@@ -302,6 +313,9 @@ JOG_WALL_MARGIN_UM = 500.0
 
 _Capture = TypeVar("_Capture", WellRef, WallTouch)
 
+#: "No ``view()`` has read the run document yet": not an attempt, and not ``None`` (no provider).
+_UNSEEN = object()
+
 
 #: The providers of ``plate`` whose ``plate`` parameter is the plate on the stage. Another
 #: provider's parameter of that name means something else (``plate-finding``'s sizes its
@@ -395,6 +409,9 @@ class ResultCard:
     ``files`` are ``<key>: <path>`` for each file the result names, under the same
     rule as ``lines``: where the result is, so that the operator can open it.
     Every text is bounded, whatever the record holds: the card is a summary.
+    ``when_local`` is ``when_utc``'s time in the PC's zone to the minute (``guide.local_time``),
+    which the guided screens say; the expert view's cards keep ``when_utc`` (m5 §17.12 D20).
+    ``""`` for a card built without it.
     """
 
     plugin: str
@@ -407,6 +424,7 @@ class ResultCard:
     error: str | None
     stale: bool = False
     files: tuple[str, ...] = ()
+    when_local: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -478,11 +496,17 @@ class MapPose:
 
 @dataclass(frozen=True, slots=True)
 class SideLabel:
-    """A side of the stand as the map labels it, in stage µm (m5 §16 D8): plain text (FM-139)."""
+    """A side of the stand as the map labels it, in stage µm (m5 §16 D8): plain text (FM-139).
+
+    ``angle_deg`` is the text's turn, counter-clockwise: the labels at the left and the right of
+    the wells are turned 90° along the plate's sides, so that a long side such as ``operator's
+    left`` fits the frame's margin (m5 §17.12 D16); the others read as text does.
+    """
 
     text: str
     x_um: float
     y_um: float
+    angle_deg: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -524,7 +548,13 @@ class PlateView:
     card and not an older tool's; ``None`` exactly when ``registered`` is. ``scanned`` is what
     the usable ``scan`` holds, for the Scan screen's result line (m5 §17.10.2): ``None`` when
     there is none (stale, made on another profile, or one that does not validate: its
-    problem is in ``problems``) or when it did not end ``done``.
+    problem is in ``problems``) or when it did not end ``done``. ``register_refusal`` is why
+    *Register the plate* would be refused for the objectives of the page's captures (m5
+    §17.12 D13), the text ``run`` gives as its outcome, drawn before the click; ``None`` when
+    it would not, and while no centre is captured. ``frame_wells`` are the wells of the latest
+    scan plan the run document holds, **usable or not**: the map frames them on the Wells, Scan
+    and Results screens (m5 §17.12 D16), and an out-of-date plan is still the wells the
+    operator laid out. ``()`` when there is none or it does not validate.
     """
 
     plate: str
@@ -547,6 +577,8 @@ class PlateView:
     registered: PlateResult | None = None
     registered_by: str | None = None
     scanned: ScanSummary | None = None
+    register_refusal: str | None = None
+    frame_wells: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -619,11 +651,17 @@ class _Ended(NamedTuple):
 
     ``status`` is ``done`` (the record ended ``done``), ``stopped`` (the run was
     stopped: its record is ``stopped``) or ``failed`` (the run raised, or its record
-    could not be written). A single run only says ``outcome``.
+    could not be written). A single run only says ``outcome``. ``stopped_by_stop`` is
+    true when STOP was pressed during the run and a move it stopped ended it ``failed``
+    (FM-64: the record stays ``failed``, the words say stopped). ``detail`` is the
+    one line of a ``stopped`` or ``failed`` end **without the tool's title**, for the
+    Plate row that a *Go to* was sent from (m5 §17.12 D20).
     """
 
     outcome: str
     status: Literal["done", "stopped", "failed"]
+    stopped_by_stop: bool = False
+    detail: str = ""
 
 
 class _LatestShown:
@@ -788,7 +826,9 @@ class PageStatus:
     ``RunClock`` (m5 §17.10.2), ``None`` before any and while only Live has run: Live keeps
     no clock. ``chain`` is the latest *Run all that are left* (m5 §17.11.2), kept after its
     end until another activity starts, and ``None`` before any chain and while a later
-    activity goes.
+    activity goes. ``goto_answer`` is what the same drive came to as the Plate row it was
+    sent from says it (m5 §17.12.3): the well, and going, at, refused or failed; ``goto``
+    stays the drive bar's line.
     """
 
     stand: str
@@ -810,6 +850,7 @@ class PageStatus:
     goto: str = ""
     clock: RunClock | None = None
     chain: ChainStatus | None = None
+    goto_answer: GotoAnswer | None = None
 
 
 def jog_crossing(
@@ -860,26 +901,31 @@ def _chain_outcome(
 ) -> str:
     """The strip's text for a chain that ran to its end without a bug of its own (m5 §17.11.2).
 
-    ``run all done in <s> s: <tools>`` when every tool ended ``done``; else ``run all
-    stopped at <tool>: <its outcome>``, or ``run all stopped before <tool>`` after a STOP
-    between two tools, then ``; done: <tools>`` and ``; not run: <tools>`` (the tools
-    after the one it stopped at or before) when there are some.
+    ``Run all that are left: done in <s> s (<titles>)`` when every tool ended ``done``;
+    else ``Run all that are left: <the outcome of the tool that stopped it>``, or
+    ``Run all that are left: stopped before <tool>`` after a STOP between two tools, then
+    ``; done: <titles>`` and ``; not run: <titles>`` (the tools after the one it stopped at
+    or before) when there are some. The tools are named by their plain title, never their
+    plugin name (m5 §17.12 D20); the tool that stopped it names itself in its own outcome.
     """
     done = [end.plugin for end in ended if end.how == "done"]
     if stopped_before is None and len(done) == len(tools):
-        return f"run all done in {seconds:.1f} s: {', '.join(tools)}"
+        return (
+            f"{RUN_ALL_LABEL}: done in {seconds:.1f} s "
+            f"({', '.join(tool_title(tool) for tool in tools)})"
+        )
     if stopped_before is not None:
-        head = f"run all stopped before {stopped_before}"
+        head = f"{RUN_ALL_LABEL}: stopped before {tool_title(stopped_before)}"
         not_run = tools[len(ended) + 1 :]
     else:
         last = ended[-1]
-        head = f"run all stopped at {last.plugin}: {last.outcome}"
+        head = f"{RUN_ALL_LABEL}: {last.outcome}"
         not_run = tools[len(ended) :]
     text = head
     if done:
-        text += f"; done: {', '.join(done)}"
+        text += f"; done: {', '.join(tool_title(tool) for tool in done)}"
     if not_run:
-        text += f"; not run: {', '.join(not_run)}"
+        text += f"; not run: {', '.join(tool_title(tool) for tool in not_run)}"
     return text
 
 
@@ -1056,6 +1102,11 @@ def _when_utc(record: StageRecord) -> str:
         return _UNKNOWN_TIME
 
 
+def _when_local(record: StageRecord) -> str:
+    """``_when_utc``'s time in the PC's zone, to the minute, for the guided screens (m5 §17.12 D20)."""
+    return local_time(record.finished_utc or record.started_utc)
+
+
 def _card(
     record: StageRecord, *, stale: bool = False, run_dir: PurePath | None = None
 ) -> ResultCard:
@@ -1142,6 +1193,7 @@ def _card(
         ),
         stale=stale and record.status is StageStatus.done,
         files=tuple(files),
+        when_local=_when_local(record),
     )
 
 
@@ -1157,6 +1209,31 @@ def _sample_refs_text(refs: Sequence[WellRef]) -> str:
         "profile's [sample] puts the plate; this stand's plate is synthetic, so "
         "they are known, not measured"
     )
+
+
+def _well_or_as_given(well: str) -> str:
+    """``well`` as the page names wells (``normalise_well``), or as it was given when it names none: a refusal still answers the row."""
+    try:
+        return normalise_well(well)
+    except ValueError:
+        return well
+
+
+def _refs_pair(params: Sequence[str]) -> object | None:
+    """The ``refs=`` pair of ``params`` read as JSON, as ``parse_params`` would read it; ``None`` when there is none or it is not JSON.
+
+    The last pair wins, as it does for the parser. A value that is not JSON is the
+    parser's refusal to make, not this reader's: it says nothing.
+    """
+    found: object | None = None
+    for item in params:
+        key, separator, value = item.partition("=")
+        if separator and key == "refs":
+            try:
+                found = json.loads(value)
+            except (ValueError, RecursionError):
+                found = None
+    return found
 
 
 def _are_the_refs(found: object, refs: Sequence[WellRef]) -> bool:
@@ -1404,8 +1481,16 @@ class PlatePage:
         # start and end, never edited, and cleared when another activity starts.
         self._chain: ChainStatus | None = None
         self._outcome: str | None = None
-        # What the last drive to a well came to (m3 §5.5 D7), under ``_lock``.
+        # What the last drive to a well came to (m3 §5.5 D7), under ``_lock``: the drive
+        # bar's line, and the same drive as the Plate row it was sent from says it (m5
+        # §17.12.3), replaced whole. ``_last_ended`` is how the latest ``_run_plugin`` ended,
+        # written and read by the worker alone.
         self._goto = ""
+        self._goto_answer: GotoAnswer | None = None
+        self._last_ended: _Ended | None = None
+        # The latest provider of ``plate`` as the last ``view()`` found it, to see a registration
+        # that another process made (``_note_plate_attempt``).
+        self._plate_attempt: tuple[str, str] | object | None = _UNSEEN
         self._frame: Frame | None = None
         # The newest frame a run handed (m3 §25.5): its own lock, taken inside
         # ``_lock`` and never around it.
@@ -1535,6 +1620,10 @@ class PlatePage:
         self.walls = ()
         self._capture_objectives = {}
         self.current = None
+        # A drive's text never outlives the plate it was measured on (m5 §17.12.3).
+        with self._lock:
+            self._goto = ""
+            self._goto_answer = None
 
     @property
     def sample_plate(self) -> str | None:
@@ -1626,6 +1715,21 @@ class PlatePage:
         if registered is None or registered.plate != self._plate:
             return None
         return cast("PlateResult", registered)
+
+    def _note_plate_attempt(self, record: StageRecord | None) -> None:
+        """A registration the page did not run itself (``smc run`` in a terminal) ends a drive's text too (m5 §17.12.3).
+
+        The page clears the text when a run of its own provides ``plate`` (``_run_plugin``); this
+        is the same rule for one written to the run document meanwhile, found when a view reads it:
+        ``... not registered`` must not stay under ``Registered:`` whoever registered. The first
+        read only notes the attempt, since nothing was said before it.
+        """
+        seen = None if record is None else (record.plugin, record.attempt)
+        previous, self._plate_attempt = self._plate_attempt, seen
+        if previous is not _UNSEEN and previous != seen:
+            with self._lock:
+                self._goto = ""
+                self._goto_answer = None
 
     def _note_registered(self, registered: PlateResult | None) -> None:
         """Keep the registered plate's orientation for ``orientation``; one assignment, read without a lock."""
@@ -1751,23 +1855,25 @@ class PlatePage:
                 turn (``frames``' own text).
             RuntimeError: A run is going, or the page is closed.
         """
+        # A click refused because an activity runs leaves the page's drive text as it was
+        # (the running drive's own, #444's Report): it is not an answer to this click.
+        self._refuse_if_busy()
         try:
-            name, params, going = self._goto_params(well, side)
+            name, params, going, estimated = self._goto_params(well, side)
         except (ValueError, RuntimeError) as exc:
-            with self._lock:
-                self._goto = _one_line(exc)
+            self._answer_goto(_well_or_as_given(well), "refused", False, _one_line(exc))
             raise
         self.current = name
         with self._lock:
             self._goto = going
+            self._goto_answer = GotoAnswer(name, "going", estimated, "")
             ended = self._ended
         try:
             self.run("goto-well", params)
         except RuntimeError as exc:
             # An activity another tab started since the checks above, or the page
             # closed: "going to" must not stay on a drive that never started.
-            with self._lock:
-                self._goto = _one_line(exc)
+            self._answer_goto(name, "refused", estimated, _one_line(exc))
             raise
         with self._lock:
             # ``run`` refused without starting anything (no stand, a parameter, a
@@ -1775,9 +1881,28 @@ class PlatePage:
             # already ended and said its own outcome, is left alone.
             if self._current_run is None and self._ended == ended:
                 self._goto = self._outcome or going
+                if self._outcome:
+                    self._goto_answer = GotoAnswer(
+                        name,
+                        "refused",
+                        estimated,
+                        self._outcome.removeprefix("goto-well: "),
+                    )
 
-    def _goto_params(self, well: str, side: str) -> tuple[str, list[str], str]:
-        """``goto``'s checks in m3 §5.5 D6's order; the well, the run's parameters and what the drive says it is doing.
+    def _answer_goto(
+        self,
+        well: str,
+        phase: Literal["refused", "failed"],
+        estimated: bool,
+        text: str,
+    ) -> None:
+        """What a refused click says: the drive bar's line and the row's answer, one value each, together."""
+        with self._lock:
+            self._goto = text
+            self._goto_answer = GotoAnswer(well, phase, estimated, text)
+
+    def _goto_params(self, well: str, side: str) -> tuple[str, list[str], str, bool]:
+        """``goto``'s checks in m3 §5.5 D6's order; the well, the run's parameters, what the drive says it is doing and whether it goes to the holder's estimate.
 
         One read of the run document for the plate's check and the pose, so that a
         click never judges two documents. A document that cannot be read is said
@@ -1785,9 +1910,9 @@ class PlatePage:
         with no registered plate (``GOTO_UNPLACED``), and no run could write to it.
         So is a usable ``plate`` whose result its model refuses: the map draws no
         registered plate for it, but the plate is there, and ``goto-well`` refuses it
-        whatever the parameters (FM-206), in the words of ``view().problems``.
+        whatever the parameters (FM-206), in the words of ``view().problems``. The check
+        that an activity runs is ``goto``'s, made before this and outside its handler.
         """
-        self._refuse_if_busy()
         doc, unreadable = self._document()
         if unreadable is not None:
             # The text `_document` took where it caught the error (FM-98).
@@ -1813,11 +1938,12 @@ class PlatePage:
         name = normalise_well(well)
         params = [f"well={name}", f"side={stage_side}"]
         if not estimated:
-            return name, params, f"going to {name}"
+            return name, params, f"going to {name}", False
         return (
             name,
             [*params, f"plate={self._plate}", self._orientation_pair()],
             GOTO_ESTIMATED.format(well=name),
+            True,
         )
 
     def _stage_side(self, side: ImageSide) -> WallSide:
@@ -1883,17 +2009,44 @@ class PlatePage:
             name: objective,
         }
         self.refs = (*kept, ref)
+        self._drop_goto_answer()
         return ref
 
+    @property
+    def goto_answer(self) -> GotoAnswer | None:
+        """What the last *Go to* said for the row of its well, as it is now (m5 §17.12.3).
+
+        The same value ``status().goto_answer`` carries, without reading the stand: a redraw
+        that follows a capture or a registration shows the row's new answer at once and not at
+        the next tick.
+        """
+        with self._lock:
+            return self._goto_answer
+
+    def _drop_goto_answer(self) -> None:
+        """The row's answer to the last *Go to* is about the centres as they were: a capture or a forgotten centre ends it (m5 §17.12.3).
+
+        For every tab at once, and not a marker each tab keeps (FM-225): ``At A1.`` is true
+        until the operator captures A1 or forgets it, and a refusal for an unplaced map is not
+        the word of a map whose centres changed. The drive bar's own line, ``goto``, stays
+        until the next drive, a plate change, a registration or *Refresh*.
+        """
+        with self._lock:
+            self._goto_answer = None
+
     @staticmethod
-    def _objective_in_place(microscope: Microscope) -> str | None:
+    def _objective_in_place(
+        microscope: Microscope, *, log_failure: bool = True
+    ) -> str | None:
         """The turret's label now, or ``None`` when the stand has no turret or its read fails.
 
         A capture is the operator's work and the label only annotates it: a turret
         between two positions (m2 §8.11) or a device that does not answer leaves the
         capture standing, with the objective unknown, never an exception that loses
         the centre (m5 §17.4.2). An empty label is unknown too: *with* nothing would
-        read as a fact. The failure is logged, once per capture.
+        read as a fact. The failure is logged, once per capture; the view's read before
+        the click (``view().register_refusal``) passes ``log_failure=False``, since it
+        runs at every redraw and a turret that does not answer would fill the log.
         """
         turret = microscope.get(ObjectiveTurret)
         if turret is None:
@@ -1901,11 +2054,12 @@ class PlatePage:
         try:
             label = turret.current()
         except Exception as exc:
-            log.warning(
-                "capture: the objective in place could not be read: %s: %s",
-                type(exc).__name__,
-                _one_line(exc),
-            )
+            if log_failure:
+                log.warning(
+                    "capture: the objective in place could not be read: %s: %s",
+                    type(exc).__name__,
+                    _one_line(exc),
+                )
             return None
         return label or None
 
@@ -1972,6 +2126,7 @@ class PlatePage:
             self.refs = ()
             self.walls = ()
             self._capture_objectives = {}
+            self._drop_goto_answer()
             return
         name = normalise_well(well)
         self.refs = tuple(r for r in self.refs if normalise_well(r.well) != name)
@@ -1979,6 +2134,7 @@ class PlatePage:
         self._capture_objectives = {
             w: o for w, o in self._capture_objectives.items() if w != name
         }
+        self._drop_goto_answer()
 
     def page_params(self, plugin: str) -> list[str]:
         """The ``key=value`` pairs the page fills itself for ``plugin`` (``PAGE_PARAMS``).
@@ -2296,6 +2452,14 @@ class PlatePage:
             # §11.4): a usable plate would be replaced by a failure. The page refuses
             # first, nothing written, before the parameters are read (FM-169, m5 §12.3).
             return f"{plugin}: {refusal}"
+        if plugin == "plate-registration" and (
+            refusal := self._registration_objective_refusal(params)
+        ):
+            # The centres were captured with another objective than the one in place, or
+            # with two (m5 §17.12 D13, #373): the same refusal the view shows before the
+            # click, here before anything starts or is written (FM-169). It says the tool
+            # by its title, as the outcome line does (D20).
+            return f"{tool_title(plugin)}: {refusal}"
         profile = self._profile.microscope.name
         dry_run = self._dry_run
         try:
@@ -2334,6 +2498,31 @@ class PlatePage:
             return f"{plugin}: {_checkpoint_reason(plugin, kept)}"
         return _Prepared(entry, parsed)
 
+    def _registration_objective_refusal(self, params: Sequence[str]) -> str | None:
+        """Why the registration of the page's own captures is refused for their objectives, or ``None`` (m5 §17.12 D13).
+
+        Only when the ``refs`` of ``params`` are the page's captures (``_are_the_refs``): a
+        registration from the profile's sample, or from references typed in a terminal's
+        words, is not about captures made on this page. The objective in place is read now,
+        as ``capture_centre`` reads it, inside a read a Disconnect waits for. A turret that
+        cannot be read, or a stand that is closed, refuses nothing here: the stand's own
+        refusal comes first, and the tool's ``assumed`` says the objective.
+        """
+        refs = self.refs
+        if not refs:
+            return None
+        found = _refs_pair(params)
+        if found is None or not _are_the_refs(found, refs):
+            return None
+        return register_objective_refusal(self.capture_objectives, self._turret_label())
+
+    def _turret_label(self, *, log_failure: bool = True) -> str | None:
+        """The objective in place, read from the turret now; ``None`` when the stand is closed or the read fails."""
+        with self._reading() as microscope:
+            if microscope is None:
+                return None
+            return self._objective_in_place(microscope, log_failure=log_failure)
+
     def run_chain(
         self, plugins: Sequence[str], params: Mapping[str, Sequence[str]]
     ) -> None:
@@ -2343,15 +2532,17 @@ class PlatePage:
         refusals (``_prepare``), the same record. The chain goes on while a tool ends
         ``done`` and stops at the first that does not (failed, stopped, refused), and
         at a STOP, which it looks at after each tool and before the next. A tool whose
-        slot is ``ok`` in the run document read now is never run: running it again would
-        make every tool after it out of date. ``params`` are the pairs of each tool, read
-        by the view at the click; a tool with no entry runs with none.
+        slot is ``ok`` in the run document read now is never run, **unless a tool left
+        before it feeds it** (``_chain_left``): running that one makes it out of date, and
+        the chain would end with a tool it made out of date and did not run (m5 §17.12 D14,
+        #446). ``params`` are the pairs of each tool, read by the view at the click; a tool
+        with no entry runs with none.
 
         It is one activity, named after the tool that goes, so that a second run, a snap
         or a close is refused or stops it the whole time, between two tools too. What it
-        came to is the outcome: ``run all done in <s> s: <tools>``, or where it stopped.
-        With the stand closed, no step asked for, a run document that cannot be read, or
-        nothing left, the outcome says so and nothing starts.
+        came to is the outcome: ``Run all that are left: done in <s> s (<titles>)``, or
+        where it stopped. With the stand closed, no step asked for, a run document that
+        cannot be read, or nothing left, the outcome says so and nothing starts.
 
         Raises:
             RuntimeError: An activity is going (``<name> is running``), or the page is
@@ -2359,12 +2550,12 @@ class PlatePage:
         """
         self._refuse_if_busy()
         if self._microscope is None:
-            self._set_outcome(f"run all: {NOT_CONNECTED}")
+            self._set_outcome(f"{RUN_ALL_LABEL}: {NOT_CONNECTED}")
             return
         if not plugins:
             # The view passes none when no Results tool loaded, and a click on its disabled
             # button still arrives here (FM-169): "every step is done" would be false.
-            self._set_outcome("run all: no step was asked for")
+            self._set_outcome(f"{RUN_ALL_LABEL}: no step was asked for")
             return
         # Read now and not from a view's list, which a second tab may have made stale: a tool
         # that is `ok` here is never run again by the chain.
@@ -2374,20 +2565,11 @@ class PlatePage:
             # tool as `not run` and run the ones that are `ok` again over a lock that is gone by
             # the time `_prepare` reads it (FM-24). `_prepare` refuses such a document at the
             # first tool; the chain refuses it before it decides what is left.
-            self._set_outcome(f"run all: {_flat(unreadable)}")
+            self._set_outcome(f"{RUN_ALL_LABEL}: {_flat(unreadable)}")
             return
-        checklist = {item.slot: item.state for item in self._checklist(doc)}
-        registry = self._registry().plugins
-        left = tuple(
-            tool
-            for tool in dict.fromkeys(plugins)
-            if checklist.get(
-                registry[tool].plugin.provides if tool in registry else tool
-            )
-            != "ok"
-        )
+        left = self._chain_left(plugins, doc)
         if not left:
-            self._set_outcome("run all: nothing is left: every step is done")
+            self._set_outcome(f"{RUN_ALL_LABEL}: nothing is left: every step is done")
             return
         # Read at the click, as `run` reads it: every record of the chain names the preset
         # the operator saw loaded (m5 §10.5).
@@ -2397,6 +2579,34 @@ class PlatePage:
         self._start_activity(
             left[0], lambda event: self._run_chain(left, pairs, preset, event)
         )
+
+    def _chain_left(self, plugins: Sequence[str], doc: RunDocument) -> tuple[str, ...]:
+        """The tools of ``plugins`` a chain runs: those not ``ok``, and each ``ok`` one that a tool left before it feeds (m5 §17.12 D14).
+
+        *Feeds* is the plugins' own ``reads`` and ``reads_optional``, the rule the runner
+        uses to call a result out of date (``RunDocument.is_stale``): an ``ok`` ``report``
+        that read the route as absent is made out of date by a ``route`` the chain now runs,
+        and a chain that left it would end with a tool that is no longer ``ok`` and that it
+        did not run (#446's ``## Plan deviation``). Taken in the chain's order and
+        transitively: a tool joins ``left`` before the next is looked at, so what it provides
+        feeds the later ones. A name no plugin has provides itself and reads nothing.
+        """
+        checklist = {item.slot: item.state for item in self._checklist(doc)}
+        registry = self._registry().plugins
+        left: list[str] = []
+        made_again: set[str] = set()
+        for tool in dict.fromkeys(plugins):
+            entry = registry.get(tool)
+            slot = tool if entry is None else entry.plugin.provides
+            reads = (
+                set()
+                if entry is None
+                else {*entry.plugin.reads, *entry.plugin.reads_optional}
+            )
+            if checklist.get(slot) != "ok" or reads & made_again:
+                left.append(tool)
+                made_again.add(slot)
+        return tuple(left)
 
     def _run_chain(
         self,
@@ -2412,7 +2622,7 @@ class PlatePage:
         tools, or on a tool that ignores it and ends ``done``, would otherwise be lost
         and the next tool would start (FM-226's entry). ``_lock`` is never held across
         ``_prepare``, a run or a device call (FM-70). Whatever this code itself raises is
-        the outcome ``run all: <Type>: <message>``, the text and never the exception
+        the outcome ``Run all that are left: <message>``, the text and never the exception
         (FM-98), and the tool whose turn it was ends ``failed``, so that the Results screen
         says which tool the chain stopped at and not that a STOP nobody pressed ended it; the
         chain's status is closed in ``finally``, so no tool is left ``current``.
@@ -2437,7 +2647,13 @@ class PlatePage:
                     result = self._run_plugin(
                         tool, prepared.entry, prepared.parsed, event, preset
                     )
-                    end = ChainEnd(tool, result.status, result.outcome)
+                    # A STOP that landed in a move ends the record `failed` (FM-64), and
+                    # the chain says what happened: stopped, not failed.
+                    end = ChainEnd(
+                        tool,
+                        "stopped" if result.stopped_by_stop else result.status,
+                        result.outcome,
+                    )
                 ended.append(end)
                 following = tools[len(ended)] if len(ended) < len(tools) else None
                 with self._lock:
@@ -2449,10 +2665,14 @@ class PlatePage:
                 if end.how != "done":
                     break
         except Exception as exc:
+            # The chain's own code raised: a bug of the page's, whose type a developer
+            # reads, unlike a tool's exception, which says its line only (D20).
             text = f"{type(exc).__name__}: {_one_line(exc)}"
             if turn is not None and (not ended or ended[-1].plugin != turn):
-                ended.append(ChainEnd(turn, "failed", f"{turn}: {text}"))
-            return f"run all: {text}"
+                ended.append(
+                    ChainEnd(turn, "failed", f"{tool_title(turn)} failed: {text}")
+                )
+            return f"{RUN_ALL_LABEL}: {text}"
         finally:
             with self._lock:
                 self._chain = ChainStatus(tools, tuple(ended), None)
@@ -2551,6 +2771,7 @@ class PlatePage:
                 if name == "goto-well":
                     # Whoever started it: a drive click, a tool's Run, another tab.
                     self._goto = outcome
+                    self._goto_answer = self._goto_end(outcome)
                 self._current_run = None
                 # The run's last frame is kept although no session took it, and
                 # nothing of the run is left to replace a later snap's (m3 §25.5).
@@ -2561,6 +2782,28 @@ class PlatePage:
             if failed is not None:
                 log.warning("%s", failed)
             log.info("%s", outcome)
+
+    def _goto_end(self, outcome: str) -> GotoAnswer | None:
+        """What the drive that just ended says on its row; the caller holds ``_lock``.
+
+        Only a drive that ``goto()`` started has a row: it left ``going`` as the answer. A
+        ``goto-well`` run from the tool's own *Run* (the expert view, a terminal's words)
+        has no well the page named, and the answer of an earlier drive would be wrong
+        about it: none. ``_last_ended`` is the worker's own, so it is this run's when its
+        outcome is the one being said; any other way out (the body raised) is a failure
+        that says the outcome as it is.
+        """
+        asked = self._goto_answer
+        if asked is None or asked.phase != "going":
+            return None
+        ended = self._last_ended
+        if ended is None or ended.outcome != outcome:
+            return GotoAnswer(asked.well, "failed", asked.estimated, outcome)
+        if ended.status == "done":
+            return GotoAnswer(asked.well, "at", asked.estimated, "")
+        return GotoAnswer(
+            asked.well, "failed", asked.estimated, ended.detail or outcome
+        )
 
     def _on_progress(self, progress: Progress) -> None:
         """A plugin's report, on the worker: stamped with the clock, then queued for the tick (m5 §17.10.2).
@@ -2588,8 +2831,38 @@ class PlatePage:
         event: threading.Event,
         preset: str | None = None,
     ) -> _Ended:
-        """A plugin's run on the worker: its outcome as text, and whether it ended done, stopped or failed."""
+        """A plugin's run on the worker: its outcome as text, and whether it ended done, stopped or failed.
+
+        The outcome names the tool by its plain title (``tool_title``), and a failure is the
+        exception's one line without its type, which goes to the log (m5 §17.12 D20). A run
+        during which STOP was pressed and that ended on a move the stop stopped
+        (``MotionStoppedError``, ``MicroscopeHaltedError``) says ``<title> stopped by STOP``,
+        and its record stays ``failed`` (FM-64). How it ended is kept for ``_work``, which
+        says what a *Go to* came to on the row it was sent from.
+
+        The end of a run of a tool that provides ``plate`` clears the drive's text (``_goto``
+        and ``_goto_answer``): ``... not registered`` was true of the plate before it, and a
+        drive's text never outlives the plate it was measured on.
+        """
+        ended = self._run_plugin_once(plugin, entry, parsed, event, preset)
+        self._last_ended = ended
+        if entry.plugin.provides == "plate":
+            with self._lock:
+                self._goto = ""
+                self._goto_answer = None
+        return ended
+
+    def _run_plugin_once(
+        self,
+        plugin: str,
+        entry: PluginEntry,
+        parsed: PluginParams,
+        event: threading.Event,
+        preset: str | None,
+    ) -> _Ended:
+        """``_run_plugin`` without what it does after the run: the run and its outcome."""
         log.info("%s: started from the plate page", plugin)
+        title = tool_title(plugin)
         started = time.monotonic()
         # The orientation the page names the captures for, read before a rename runs:
         # what its end compares with (m5 §16 D6). Any provider of `plate` refreshes the
@@ -2614,25 +2887,52 @@ class PlatePage:
                 on_frame=self._shown.put,
             )
         except RunDocumentError as exc:
+            line = _one_line(exc)
+            log.info("%s failed: %s: %s", plugin, type(exc).__name__, line)
             if exc.record is not None and exc.record.result is not None:
                 return _Ended(
-                    f"{plugin} ran, but its record could not be written: "
-                    f"{_one_line(exc)}",
+                    f"{title} ran, but its record could not be written: {line}",
                     "failed",
+                    detail=line,
                 )
-            return _Ended(f"{plugin}: {type(exc).__name__}: {_one_line(exc)}", "failed")
+            return self._failed(plugin, exc, event)
         except Exception as exc:
-            return _Ended(f"{plugin}: {type(exc).__name__}: {_one_line(exc)}", "failed")
+            return self._failed(plugin, exc, event)
         if record.status is StageStatus.done:
             seconds = time.monotonic() - started
             note = ""
             if record.provides == "plate":
                 note = self._follow_plate(turned_from)
             return _Ended(
-                f"{plugin} done in {seconds:.1f} s{_assumed_tail(record)}{note}",
+                f"{title} done in {seconds:.1f} s{_assumed_tail(record)}{note}",
                 "done",
             )
-        return _Ended(f"{plugin} stopped", "stopped")
+        return _Ended(f"{title} stopped", "stopped", detail="Stopped.")
+
+    @staticmethod
+    def _failed(plugin: str, error: BaseException, event: threading.Event) -> _Ended:
+        """How a run that raised ended: ``<title> failed: <one line>``, or ``<title> stopped by STOP``.
+
+        A STOP that lands in a move ends the run on ``MotionStoppedError`` (or
+        ``MicroscopeHaltedError`` when the stand was already halted): the operator pressed
+        STOP and the stage stopped, which is not a failure to say (the walk of 2026-11-13).
+        ``event`` is the activity's, set by ``stop()`` and by nothing else, so it says that
+        STOP was pressed during **this** run. The record stays ``failed`` (FM-64). The
+        exception's type goes to the log, never the screen (m5 §17.12 D20).
+        """
+        line = _one_line(error)
+        log.info("%s failed: %s: %s", plugin, type(error).__name__, line)
+        title = tool_title(plugin)
+        if event.is_set() and isinstance(
+            error, MotionStoppedError | MicroscopeHaltedError
+        ):
+            return _Ended(
+                f"{title} stopped by STOP",
+                "failed",
+                stopped_by_stop=True,
+                detail="Stopped by STOP.",
+            )
+        return _Ended(f"{title} failed: {line}", "failed", detail=line)
 
     def _follow_plate(self, turned_from: PlateOrientation | None) -> str:
         """After a ``done`` provider of ``plate``: keep its orientation, and follow a turn; what the strip adds.
@@ -3549,7 +3849,7 @@ class PlatePage:
         current = self._current_run
         if current is not None:
             current[1].set()
-        prefix = "" if current is None else f"{current[0]} told to stop; "
+        prefix = "" if current is None else f"{tool_title(current[0])} told to stop; "
         with self._reading() as microscope:
             try:
                 if microscope is None:
@@ -3601,6 +3901,7 @@ class PlatePage:
             progress = self._progress
             outcome = self._outcome
             goto = self._goto
+            goto_answer = self._goto_answer
             clock = self._clock()
             chain = self._chain
         stand = self._profile.microscope.name
@@ -3652,6 +3953,7 @@ class PlatePage:
                         goto=goto,
                         clock=clock,
                         chain=chain,
+                        goto_answer=goto_answer,
                     )
         return PageStatus(
             stand=stand,
@@ -3673,6 +3975,7 @@ class PlatePage:
             goto=goto,
             clock=clock,
             chain=chain,
+            goto_answer=goto_answer,
         )
 
     def _clock(self) -> RunClock | None:
@@ -3742,14 +4045,16 @@ class PlatePage:
                 # Not over an outcome the worker has just written: ``release()``
                 # tells a connect's outcome as a closing line.
                 if self._current_run is not None:
-                    self._outcome = f"{plugin} did not end within {_CLOSE_WAIT_S:.0f} s"
+                    self._outcome = (
+                        f"{tool_title(plugin)} did not end within {_CLOSE_WAIT_S:.0f} s"
+                    )
         with self._lock:
             outcome = self._outcome
         note = self._stop_note
         if (
             ended
-            and outcome == f"{plugin} stopped"
-            and note == f"{plugin} told to stop; {_STOP_ACCEPTED}"
+            and outcome == f"{tool_title(plugin)} stopped"
+            and note == f"{tool_title(plugin)} told to stop; {_STOP_ACCEPTED}"
         ):
             # The stand took the stop and the run ended stopped: the one case in which
             # "was stopped" is the whole truth.
@@ -3812,6 +4117,7 @@ class PlatePage:
             if self._current_run is None:
                 self._outcome = None
                 self._goto = ""
+                self._goto_answer = None
 
     # --- the view ---------------------------------------------------------------
 
@@ -3954,6 +4260,7 @@ class PlatePage:
             if registered is not None and registered.plate == self._plate
             else None
         )
+        self._note_plate_attempt(plate_record)
         return PlateView(
             plate=self._plate,
             nominal=pose.kind in ("estimated", "unplaced"),
@@ -3977,6 +4284,7 @@ class PlatePage:
                 else CalibrationNote(
                     objective=calibration.objective,
                     when_utc=_when_utc(calibration_record),
+                    when_local=_when_local(calibration_record),
                 )
             ),
             registered=None if plate_record is None else registered,
@@ -3990,7 +4298,112 @@ class PlatePage:
                     dry_run=scan_record.dry_run,
                 )
             ),
+            register_refusal=self._register_refusal(),
+            frame_wells=self._frame_wells(doc),
         )
+
+    @staticmethod
+    def _frame_wells(doc: RunDocument) -> tuple[str, ...]:
+        """The wells of the latest ``scan-plan`` record of ``doc`` that validates, whatever its state (m5 §17.12 D16)."""
+        record = doc.provider("scan-plan")
+        planned = None if record is None else _scan_plan_of(record)
+        return () if planned is None else tuple(planned.wells)
+
+    def _register_refusal(self) -> str | None:
+        """Why *Register the plate* is refused for the objectives of the page's captures, for ``view()``; ``None`` for no captures (m5 §17.12 D13).
+
+        The same ``register_objective_refusal`` ``run`` asks, with the objective in place read
+        from the turret now: a turn made since the last tick shows at the next redraw, and the
+        click asks again. The read does not log a failure (``log_failure=False``): a redraw
+        is frequent, and a capture that could not read its label already said so.
+        """
+        if not self.refs:
+            return None
+        return register_objective_refusal(
+            self.capture_objectives, self._turret_label(log_failure=False)
+        )
+
+    def run_file(self, relative: str) -> Path | None:
+        """The path of ``<the run document's folder>/<relative>`` when the run document names that file, else ``None`` (m5 §17.12 D21).
+
+        What the page's ``/run-files/`` route serves, and the only thing it serves: a file
+        that a result card of the run document lists under a ``file`` key and that lies
+        inside the run document's folder. The list is **read now**, at each request, with the
+        cards' own rules (``_card``: only a record that ended ``done`` has files), so that a
+        tool run again after the page drew its link is served the new file, and a file no
+        record names is served never: not a sibling, not a parent, not the scan's frames
+        folder, not a folder's listing (FM-175's cousin: a route that serves files from a
+        folder serves the folder).
+
+        ``relative`` arrives with ``/``, whatever the OS. It is rebuilt from its parts and
+        compared **resolved**, so that a ``..`` that the URL layer left, a symlink, an
+        absolute path or a drive letter cannot name a file the list does not; on Windows the
+        comparison keeps its case rules. Never raises for a bad path: ``None``.
+        """
+        try:
+            posix = PurePosixPath(relative)
+            if (
+                not relative
+                or "\x00" in relative
+                or posix.is_absolute()
+                or PureWindowsPath(relative).is_absolute()
+                or PureWindowsPath(relative).drive
+                or ".." in posix.parts
+                or ".." in PureWindowsPath(relative).parts
+            ):
+                return None
+            run_dir = self.run_doc.parent
+            wanted = (run_dir / Path(*posix.parts)).resolve()
+            root = run_dir.resolve()
+            if not wanted.is_relative_to(root):
+                return None
+            doc, unreadable = self._document()
+            if unreadable is not None:
+                # Fails closed, and says why in the log (FM-229): an unreadable document is no
+                # empty one, and a 404 alone reads as a file that is gone.
+                log.info(
+                    "run-files: the run document could not be read: %s", unreadable
+                )
+                return None
+            named = self._named_files(doc, run_dir)
+            return wanted if wanted in named and wanted.is_file() else None
+        except (OSError, ValueError, RuntimeError):
+            return None
+
+    def _named_files(self, doc: RunDocument, run_dir: Path) -> set[Path]:
+        """The resolved paths of the files of ``doc`` that lie inside ``run_dir``, for ``run_file``.
+
+        An entry is judged **lexically first** (``relative_to`` the run folder, no ``..``) and
+        resolved only when it is inside: ``nis-export --param out=`` may name a share, and a
+        ``resolve()`` of an offline UNC path or a mapped drive raises (FM-116) and, on Windows,
+        waits on the network on the server's loop (FM-62). One such entry must not take the
+        report's link with it, so each resolve is its own ``try``.
+        """
+        named: set[Path] = set()
+        for entry in self._file_entries(doc, run_dir):
+            key, separator, path = entry.partition(": ")
+            if not separator or key != "file":
+                continue
+            try:
+                inside = Path(path).relative_to(run_dir)
+            except ValueError:
+                continue
+            if ".." in inside.parts:
+                continue
+            try:
+                named.add(Path(path).resolve())
+            except (OSError, RuntimeError):
+                continue
+        return named
+
+    def _file_entries(self, doc: RunDocument, run_dir: Path) -> list[str]:
+        """The ``files`` entries of every card ``view()`` would draw, built the same way."""
+        entries: list[str] = []
+        for tool in self.tools():
+            record = doc.stages.get(tool.name)
+            if record is not None:
+                entries.extend(_card(record, run_dir=run_dir).files)
+        return entries
 
     def _sides(self, geometries: Sequence[WellGeometry]) -> tuple[SideLabel, ...]:
         """The stand's sides around the drawn wells, when the profile says them (m5 §16 D8).
@@ -4017,8 +4430,10 @@ class PlatePage:
             "+Y": (middle_x, top + out_y),
             "-Y": (middle_x, bottom - out_y),
         }
+        # The left side reads upwards and the right one downwards, as an axis's label does.
+        turned = {"+X": -90.0, "-X": 90.0, "+Y": 0.0, "-Y": 0.0}
         return tuple(
-            SideLabel(words[direction], x_um, y_um)
+            SideLabel(words[direction], x_um, y_um, turned[direction])
             for direction, (x_um, y_um) in places.items()
         )
 

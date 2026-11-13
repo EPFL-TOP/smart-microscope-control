@@ -134,6 +134,10 @@ RESULT_ROWS = (
 RUN_ALL = "Run all that are left"
 FILES_HEADING = "Where the files are"
 DONE_ROW = re.compile(r"^Done \d{4}-\d\d-\d\d")
+#: The last control of the drive bar (m5 §17.12 D15): the *Drive* toggle, the lowest of the bar's
+#: controls (the notes under it may be below the fold). Its name starts ``Drive``; nothing else
+#: button-shaped does.
+_DRIVE_TOGGLE = re.compile(r"^Drive\b")
 
 # A child sharing the console can change its code page (FM-22).
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -773,7 +777,7 @@ def _act_with_route(page: Any, stand: Stand) -> None:
 
 
 def _act_results_all(page: Any, stand: Stand) -> None:
-    """*5. Results*, then *Run all that are left*, and the wait for the strip's own ``run all done`` (m5 §17.11.4).
+    """*5. Results*, then *Run all that are left*, and the wait for the strip's own ``Run all that are left: done`` (m5 §17.11.4).
 
     After ``with-route`` the run document holds a real ``cells``, ``density`` and ``route``,
     so on this dry-run page the chain runs what is left, ``report`` and ``nis-export``: a run
@@ -786,7 +790,7 @@ def _act_results_all(page: Any, stand: Stand) -> None:
     _step_button(page, 5, "Results").click()
     page.locator("pre").filter(has_text=DONE_ROW).nth(1).wait_for()
     page.get_by_role("button", name=RUN_ALL, exact=True).click()
-    page.locator("pre").filter(has_text="run all done").first.wait_for()
+    page.locator("pre").filter(has_text="Run all that are left: done").first.wait_for()
 
 
 def _act_turned(page: Any, stand: Stand) -> None:
@@ -807,7 +811,7 @@ def _act_turned(page: Any, stand: Stand) -> None:
     labels = [text.strip() for text in select.locator("option").all_inner_texts()]
     turned = next((t for t in labels if t.startswith("Turned 180")), "Turned 180")
     select.select_option(label=turned)
-    page.locator("pre").filter(has_text="plate-orientation done").first.wait_for()
+    page.locator("pre").filter(has_text="Plate orientation done").first.wait_for()
 
 
 def _short_page(page: Any) -> None:
@@ -868,7 +872,7 @@ def _declare_upright(page: Any) -> None:
     if upright is None or current == upright:
         return
     select.select_option(label=upright)
-    page.locator("pre").filter(has_text="plate-orientation done").first.wait_for()
+    page.locator("pre").filter(has_text="Plate orientation done").first.wait_for()
 
 
 def _act_wells_laid_out(page: Any, stand: Stand) -> None:
@@ -886,13 +890,13 @@ def _act_wells_laid_out(page: Any, stand: Stand) -> None:
     _step_button(page, 2, "Plate").click()
     _declare_upright(page)
     page.get_by_role("button", name="Register the plate").click()
-    page.locator("pre").filter(has_text="plate-registration done").first.wait_for()
+    page.locator("pre").filter(has_text="Registration done").first.wait_for()
     _step_button(page, 3, "Wells").click()
     box = page.get_by_label("Wells", exact=True)
     box.fill("B2,B11")
     box.press("Enter")
     page.get_by_role("button", name="Lay out the fields").click()
-    page.locator("pre").filter(has_text="scan-plan done").first.wait_for()
+    page.locator("pre").filter(has_text="Field layout done").first.wait_for()
     page.locator("pre").filter(
         has_text=re.compile(r"Fields: \d+ in 2 wells")
     ).first.wait_for()
@@ -902,13 +906,13 @@ def _act_scanned(page: Any, stand: Stand) -> None:
     """*4. Scan*, then *Start the scan*, and the wait for the run's own outcome line (m5 §17.10.4).
 
     A dry-run page walks the fields and takes no frame, so the scan ends at once with
-    ``scan done in 0.0 s``: the bar, its lines and the result line are what the PNG shows, and
+    ``Scan done in 0.0 s``: the bar, its lines and the result line are what the PNG shows, and
     a scan in motion is the one-off session on a stand that moves (the skill says so). The
     outcome text starts ``scan done``: ``scan-plan done`` does not contain it.
     """
     _step_button(page, 4, "Scan").click()
     page.get_by_role("button", name="Start the scan").click()
-    page.locator("pre").filter(has_text="scan done").first.wait_for()
+    page.locator("pre").filter(has_text="Scan done").first.wait_for()
 
 
 ACTIONS = {
@@ -947,7 +951,7 @@ def _frame_parts(page: Any) -> list[tuple[str, Any]]:
         ("step bar", _step_button(page, 1, "Stand")),
         ("map", page.locator(".bk-Figure").first),
         ("image", page.locator(".bk-Figure").last),
-        ("drive bar", page.get_by_role("button", name="Light off")),
+        ("drive bar", page.get_by_role("button", name=_DRIVE_TOGGLE)),
     ]
 
 
@@ -1001,6 +1005,36 @@ def _results_parts(page: Any) -> list[tuple[str, Any]]:
     ]
 
 
+#: Finds the sticky header (the strip, the outcome line and the step bar) wherever Panel put it,
+#: through the shadow roots, and says its height in pixels; ``null`` when there is none.
+_HEADER_HEIGHT_JS = """() => {
+  const found = [];
+  const walk = (root) => {
+    for (const el of root.querySelectorAll('*')) {
+      if (getComputedStyle(el).position === 'sticky') found.push(el);
+      if (el.shadowRoot) walk(el.shadowRoot);
+    }
+  };
+  walk(document);
+  return found.length ? found[0].getBoundingClientRect().height : null;
+}"""
+
+
+def _header_height_px(page: Any) -> float | None:
+    """The height of the sticky header in pixels, or ``None`` when the browser says none (m5 §17.12 D15).
+
+    What the owner's walk measured as 180 px of a 623 px page. ``None`` for a page that cannot
+    answer (a fake), so that nothing is guessed.
+    """
+    try:
+        height = page.evaluate(_HEADER_HEIGHT_JS)
+    except Exception:
+        return None
+    if isinstance(height, bool) or not isinstance(height, int | float):
+        return None
+    return float(height)
+
+
 def _on_screen(page: Any, state: str | None = None) -> list[str]:
     """One line for each part of ``_frame_parts`` (``_short_parts`` for a short-page state, ``_guided_parts`` for a guided one, ``_results_parts`` for ``results-all``): whether it is wholly in the viewport, and where.
 
@@ -1039,6 +1073,9 @@ def _on_screen(page: Any, state: str | None = None) -> list[str]:
             f"{name}: {'yes' if inside else 'NO'} (y {top:.0f} to {bottom:.0f} of "
             f"{viewport['height']}, x {left:.0f} to {right:.0f} of {viewport['width']})"
         )
+    header = _header_height_px(page)
+    if header is not None:
+        lines.append(f"header: {header:.0f} px")
     return lines
 
 

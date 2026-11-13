@@ -397,8 +397,8 @@ def test_the_capture_buttons_are_disabled_while_an_activity_other_than_live_goes
 # --- the image's sides and what the arrows do to it (m5 §13, #327) ------------------
 
 NO_MATRIX_PAD = (
-    "Which way the image moves for an arrow is not known: run camera-calibration "
-    "(Set up)."
+    "Which way the image moves for an arrow is not known: Calibrate the camera, on "
+    "the Stand screen, measures it."
 )
 NO_MATRIX_SIDES = (
     "Walls are named on the image. No camera calibration says which stage side "
@@ -993,3 +993,156 @@ def test_a_stand_lacking_one_capability_disables_that_group_and_no_other(
             assert view.drive_note.object == note
         finally:
             page.close()
+
+
+# --- round 2: a frame that carries no light, the Drive toggle (m5 §17.12 D15, D22, #457, #475) ---
+
+
+class _ConstantCamera(FrameCamera):
+    """A camera that gives a frame of ``frame`` and says its depth: what a dark or a blown-out field gives."""
+
+    def __init__(self, frame: np.ndarray, bit_depth: int = 16) -> None:
+        self._frame = frame
+        self._depth = bit_depth
+
+    def snap(self) -> np.ndarray:
+        return self._frame
+
+    def image_shape(self) -> tuple[int, int]:
+        return (int(self._frame.shape[0]), int(self._frame.shape[1]))
+
+    def bit_depth(self) -> int:
+        return self._depth
+
+
+def _lit_frame() -> np.ndarray:
+    return np.linspace(100.0, 3000.0, 60 * 80).reshape(60, 80).astype(np.uint16)
+
+
+def _snapped(page: PlatePage, stand: Microscope, camera: Camera) -> PlatePageView:
+    stand.override(Camera, camera)
+    view = PlatePageView(page)
+    page.snap()
+    assert page.join(10.0)
+    view.frame_tick()
+    view.tick()
+    return view
+
+
+def test_the_live_image_says_when_the_frame_is_dark(
+    page: PlatePage, stand: Microscope
+) -> None:
+    from smc.ui.guide import FRAME_DARK, FRAME_SATURATED
+
+    # The light path on the eyepiece: the camera's black level and its fixed pattern (F8).
+    dark = np.full((60, 80), 100, dtype=np.uint16)
+    view = _snapped(page, stand, _ConstantCamera(dark))
+    assert view.snap_note.object == FRAME_DARK
+    # The same pane that says the camera is gone, beside *Snap* and *Live*.
+    assert view.snap_note.styles["color"] == plate_page_warning()
+
+    # A saturated frame has its own remedy, and says it before dark.
+    blown = np.full((60, 80), 65535, dtype=np.uint16)
+    stand.override(Camera, _ConstantCamera(blown))
+    page.snap()
+    assert page.join(10.0)
+    view.frame_tick()
+    assert view.snap_note.object == FRAME_SATURATED
+    view.tick()
+    assert view.snap_note.object == FRAME_SATURATED
+
+    # A lit frame says nothing, and the next frame takes the hint away.
+    stand.override(Camera, _ConstantCamera(_lit_frame()))
+    page.snap()
+    assert page.join(10.0)
+    view.frame_tick()
+    assert view.snap_note.object == ""
+    view.tick()
+    assert view.snap_note.object == ""
+
+
+def plate_page_warning() -> str:
+    from smc.ui.plate_page import _WARNING
+
+    return _WARNING
+
+
+def test_the_hint_is_computed_when_the_frame_changes_and_not_at_every_tick(
+    page: PlatePage, stand: Microscope, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import smc.ui.plate_page as plate_page
+
+    calls: list[int] = []
+    real = plate_page.frame_hint
+
+    def counting(image: Any, bit_depth: int) -> str:
+        calls.append(1)
+        return real(image, bit_depth)
+
+    monkeypatch.setattr(plate_page, "frame_hint", counting)
+    view = _snapped(page, stand, _ConstantCamera(_lit_frame()))
+    assert calls == [1]
+    for _ in range(5):
+        view.tick()
+        view.frame_tick()
+    # The same frame: no second test (FM-145).
+    assert calls == [1]
+
+
+def test_a_plugins_frame_is_not_tested_for_light(
+    page: PlatePage, stand: Microscope
+) -> None:
+    # A frame a plugin handed the page has no depth (it says 0): its full scale and its dark
+    # floor are not known, and nothing is said of it (m5 §17.12 D22).
+    from datetime import datetime, timezone
+
+    from smc.plugins.api import ShownFrame
+
+    view = PlatePageView(page)
+    dark = np.full((60, 80), 100, dtype=np.uint16)
+    page._shown.put(
+        ShownFrame(
+            plugin="scan",
+            image=dark,
+            xy_um=None,
+            label="A1_0",
+            taken_utc=datetime.now(timezone.utc),
+        )
+    )
+    view.frame_tick()
+    frame = page.frame()
+    assert frame is not None
+    assert frame.bit_depth == 0
+    assert view.snap_note.object == ""
+
+
+def test_the_drive_toggle_waits_for_the_stand(stand: Microscope, run_doc: Path) -> None:
+    # *Drive* arms the next click on a well, which runs `goto-well` on the stand: with the
+    # stand closed there is nothing to arm (the owner's walk, finding 14).
+    closed = PlatePage.closed(
+        Profile.demo(),
+        run_doc,
+        entry_points=[
+            EntryPoint(name="scan", value=f"{__name__}:SlowScan", group=GROUP)
+        ],
+    )
+    view = PlatePageView(closed)
+    try:
+        assert view.drive_toggle.disabled is True
+        view.drive_toggle.disabled = (
+            False  # a click that still arrives is the controller's
+        )
+        view.tick()
+        assert view.drive_toggle.disabled is True
+    finally:
+        closed.close()
+
+    connected = _controller(stand, run_doc)
+    try:
+        view = PlatePageView(connected)
+        assert view.drive_toggle.disabled is False
+        view.drive_toggle.value = True
+        view.tick()
+        assert view.drive_toggle.value is True
+    finally:
+        connected.close()

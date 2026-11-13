@@ -131,12 +131,28 @@ def test_the_map_labels_the_stands_sides_and_a1(make_view: Any) -> None:
     assert _close(sides["operator's right"], (RIGHT + HALF_PITCH, middle_y))
     assert _close(sides["operator's left"], (LEFT - HALF_PITCH, middle_y))
     assert _labels(view.a1_source) == {"A1": (-49_100.0, 31_175.0)}
-    # A glyph renderer reads the sides' source, so the map's auto range takes them in:
-    # a label alone (an annotation) beyond the top row was drawn off the canvas.
-    assert any(
+    # The frame holds a pitch of margin around the wells, so the labels, half a pitch
+    # outside them, are inside it (m5 §17.12 D16): no glyph of their own is needed, and none
+    # reads the sides' source any more.
+    (x0, x1), (y0, y1) = view._frame_drawn
+    for x, y in sides.values():
+        assert x0 < x < x1
+        assert y0 < y < y1
+    assert not any(
         getattr(renderer, "data_source", None) is view.side_source
         for renderer in view.figure.renderers
     )
+    # The labels at the left and the right of the wells are turned 90 degrees along the
+    # plate's sides, the others read as text does; the left one reads upwards.
+    angles = dict(
+        zip(view.side_source.data["text"], view.side_source.data["angle"], strict=True)
+    )
+    assert angles == {
+        "back of the stand": 0.0,
+        "front of the stand": 0.0,
+        "operator's left": 90.0,
+        "operator's right": -90.0,
+    }
 
     # Turned, the sides stay where the stand's are and A1 moves to the far corner.
     view.orientation_select.value = "turned-180"

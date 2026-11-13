@@ -29,7 +29,7 @@ else:
 from smc.hardware.profile import Profile
 from smc.run import RunDocument
 from smc.ui.controller import PlatePage
-from smc.ui.guide import SELECT_WELLS
+from smc.ui.guide import SELECT_WELLS, tool_title
 from smc.ui.plate_page import PlatePageView
 
 pytestmark = [
@@ -106,7 +106,7 @@ def test_the_weekly_preset_reaches_the_export_by_next_steps_without_typing(
             assert page.join(120.0), f"{step.plugin} did not end"
             outcome = page.status().outcome
             assert outcome is not None
-            assert outcome.startswith(f"{step.plugin} done in "), outcome
+            assert outcome.startswith(f"{tool_title(step.plugin)} done in "), outcome
             ran.append(step.plugin)
         else:
             pytest.fail(f"the next steps did not end in {MAX_WALKS} walks: {ran}")

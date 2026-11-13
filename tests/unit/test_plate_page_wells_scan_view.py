@@ -481,8 +481,11 @@ def test_the_wells_screen_lists_the_wells_box_the_two_fields_and_the_action_befo
     assert shown[2:] == [
         view.select_input,
         view.wells_from_text,
+        # What each field is, in plain words, above it (m5 §17.12 D20).
+        view.coverage_words,
         coverage,
         view.coverage_from_text,
+        view.autofocus_words,
         autofocus,
         view.autofocus_from_text,
         view.layout_button,
@@ -671,7 +674,7 @@ def test_lay_out_the_fields_says_what_it_waits_for_and_runs_the_tools_handler(
     assert page.join(BOUND_S)
     view.tick()
     assert page.status().outcome is not None
-    assert page.status().outcome.startswith("scan-plan done in ")
+    assert page.status().outcome.startswith("Field layout done in ")
     doc = RunDocument.load(run_doc)
     record = doc.provider("scan-plan")
     assert record is not None
@@ -787,8 +790,7 @@ def test_laying_out_two_wells_draws_the_fields_the_time_and_the_assumed_lines(
         f"Objective: {TEN_X}, in place",
         f"Fields: {len(plan.fields)} in 2 wells",
         # No timing was measured on this page: an unknown, never `0 s` (FM-170).
-        "Time: not known (no timing measured; the expert view's timing tool measures it, "
-        "then lay out the fields again)",
+        "Time: not known (no timing measured yet)",
     ]
     # The plan card's own assumptions, one line each, after the time.
     card = page.view().cards["scan-plan"]
@@ -970,7 +972,7 @@ def test_a_dry_run_page_says_what_a_scan_leaves_out_and_still_starts_it(
     assert StubScan.ran == 1
     view.tick()
     assert dry.status().outcome is not None
-    assert dry.status().outcome.startswith("scan done in ")
+    assert dry.status().outcome.startswith("Scan done in ")
 
 
 def test_a_page_that_is_not_a_dry_run_has_no_dry_run_note(page: PlatePage) -> None:
@@ -1644,7 +1646,7 @@ def test_two_wells_laid_out_and_scanned_from_these_screens_alone(
         view.tick()
         outcome = page.status().outcome
         assert outcome is not None
-        assert outcome.startswith("scan done in "), outcome
+        assert outcome.startswith("Scan done in "), outcome
         assert (
             view.scanned_block.object.split("\n")[0] == "Scanned: 72 frames, 0 failed"
         )
@@ -1664,3 +1666,67 @@ def test_two_wells_laid_out_and_scanned_from_these_screens_alone(
     finally:
         page.close()
         page.release()
+
+
+# --- round 2: the fields in plain words, a raise that costs nothing (m5 §17.12, #475) ---
+
+
+def test_each_of_the_two_fields_has_its_words_above_it_and_a_tuple_default_has_no_repr(
+    make_page: Callable[..., PlatePage],
+) -> None:
+    from smc.ui.guide import AUTOFOCUS_WORDS, COVERAGE_WORDS
+
+    view = PlatePageView(make_page(real=tuple(REAL), stubs=()))
+    assert view.coverage_words.object == COVERAGE_WORDS
+    assert view.autofocus_words.object == AUTOFOCUS_WORDS
+    # `coverage` and `autofocus` are the tools' own names, said once in words, plain text.
+    assert "0.4 is 40 %" in view.coverage_words.object
+    assert "if-engaged" in view.autofocus_words.object
+    shown = view.screens["wells"]
+    assert (
+        shown.index(view.coverage_words)
+        == shown.index(view.tool_fields["scan-plan"]["coverage"]) - 1
+    )
+    assert (
+        shown.index(view.autofocus_words)
+        == shown.index(view.tool_fields["scan"]["autofocus"]) - 1
+    )
+    # No field of any tool shows a tuple's repr as its default (`('single',)`, #446's Report).
+    for tool, key in view._field_defaults:
+        placeholder = view.tool_fields[tool][key].placeholder
+        assert not (placeholder.startswith("(") and placeholder.endswith(",)")), (
+            tool,
+            key,
+            placeholder,
+        )
+
+
+def test_a_raise_in_a_screens_draw_does_not_cost_the_strip(
+    page: PlatePage,
+    run_doc: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # `tick()` drew the Wells and Scan screens before the strip's text, the buttons and STOP: a
+    # raise there left a page with a strip that said nothing (#470's develop item). Each draw is
+    # guarded: logged with its traceback, and the tick goes on.
+    view = PlatePageView(page)
+    view.tick()
+    good = view.status_text.object
+    assert good != ""
+
+    def broken(status: Any) -> None:
+        raise ValueError("a bug in this screen's draw")
+
+    monkeypatch.setattr(view, "_draw_wells_screen", broken)
+    monkeypatch.setattr(view, "_draw_scan_screen", broken)
+    view.status_text.object = ""
+    view.stop_button.disabled = True
+    with caplog.at_level("ERROR", logger="smc.ui"):
+        view.tick()
+
+    assert view.status_text.object == good
+    assert view.stop_button.disabled is False
+    assert [r.exc_info is not None for r in caplog.records].count(True) == 2
+    # The same through a redraw, which draws both screens too.
+    view.refresh()

@@ -681,7 +681,7 @@ def test_a_run_that_fails_while_it_is_stopped_says_how_it_ended(
     assert result.exit_code == 0, result.output
     assert result.output.splitlines()[-2:] == [
         "fails told to stop; stopped: the stand is halted (Resume clears the halt)",
-        "fails: PluginRunError: fails: the move was stopped",
+        "fails failed: fails: the move was stopped",
     ]
     assert "fails was stopped" not in result.output
 
