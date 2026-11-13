@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Iterator
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import cast
 
@@ -27,7 +28,14 @@ from smc.hardware import Microscope
 from smc.hardware.capabilities import Autofocus, Camera, XYStage
 from smc.hardware.errors import CoreError
 from smc.hardware.profile import HolderSection, Profile
-from smc.plugins.slots import WellGeometry, holder_estimate, well_geometry
+from smc.plugins.slots import (
+    PlateResult,
+    WellGeometry,
+    WellRef,
+    holder_estimate,
+    well_geometry,
+)
+from smc.run import StageRecord, StageStatus, write_stage
 from smc.testing import FakeCore
 from smc.ui.controller import JOG_WALL_MARGIN_UM, PlatePage, jog_crossing
 
@@ -110,6 +118,47 @@ def _profile(*, holder: bool = True) -> Profile:
     )
 
 
+#: A plate registered with A1 at (1000, -500) µm and not turned, in the run document.
+REGISTERED_A1 = (1000.0, -500.0)
+
+
+def _registered(method: str = "references") -> PlateResult:
+    seeded = method == "seed"
+    return PlateResult(
+        plate="96-well",
+        a1_center_xy_um=REGISTERED_A1,
+        rotation_deg=0.0,
+        method=method,  # type: ignore[arg-type]
+        residual_um=None if seeded else 2.0,
+        scale_error=None if seeded else 0.001,
+        n_refs=1 if seeded else 2,
+        refs=(WellRef(well="A1", x_um=REGISTERED_A1[0], y_um=REGISTERED_A1[1]),)
+        if seeded
+        else (),
+    )
+
+
+def _register(run_doc: Path, plate: PlateResult) -> None:
+    """``plate`` as an earlier ``plate-registration`` left it, ``done`` and of this stand."""
+    then = datetime(2026, 11, 13, 9, 0, tzinfo=timezone.utc)
+    write_stage(
+        run_doc,
+        StageRecord(
+            plugin="plate-registration",
+            provides="plate",
+            attempt="a0",
+            status=StageStatus.done,
+            started_utc=then,
+            finished_utc=then,
+            profile="demo",
+            dry_run=False,
+            smc_version="0",
+            params={"plate": plate.plate},
+            result=plate.model_dump(mode="json"),
+        ),
+    )
+
+
 class Stand:
     """A page on the fake demo stand, the stage at A1's centre, PFS a recording fake."""
 
@@ -121,12 +170,16 @@ class Stand:
         choose: bool = True,
         dry_run: bool = False,
         af: RecordingAutofocus | None = None,
+        start: tuple[float, float] = A1,
+        registered: PlateResult | None = None,
     ) -> None:
         self.core = FakeCore.demo_like()
         self.microscope = Microscope.from_core(
             cast("CMMCorePlus", self.core), _profile(holder=holder), dry_run=dry_run
         )
-        self.core.setXYPosition("XY", *A1)  # the store: a dry run moves nothing
+        self.core.setXYPosition("XY", *start)  # the store: a dry run moves nothing
+        if registered is not None:
+            _register(tmp_path / "run.json", registered)
         self.af = af if af is not None else RecordingAutofocus(engaged=True)
         self.microscope.override(Autofocus, self.af)
         self.page = PlatePage(self.microscope, tmp_path / "run.json", entry_points=[])
@@ -206,6 +259,60 @@ def test_the_switch_off_comes_before_the_jog(
     monkeypatch.setattr(xy, "move_by_um", move_by_um)
     stand.jog(3000.0)
     assert seen == [False]
+
+
+def test_a_jog_in_y_that_leaves_a_well_switches_the_autofocus_off(
+    stands: Callable[..., Stand],
+) -> None:
+    stand = stands()
+    outcome = stand.jog(0.0, 3000.0)
+    assert outcome == (
+        f"{SWITCHED.format(reason='it leaves A1')}: engage it again here; "
+        "XY (-49500.00, 34500.00) µm"
+    )
+    assert stand.af.calls.count("disengage") == 1
+
+
+def test_a_jog_in_y_inside_one_well_keeps_the_autofocus_on(
+    stands: Callable[..., Stand],
+) -> None:
+    stand = stands()
+    assert stand.jog(0.0, -1000.0) == "stage jog: XY (-49500.00, 30500.00) µm"
+    assert stand.af.calls.count("disengage") == 0
+
+
+@pytest.mark.parametrize(
+    ("dx_um", "dy_um", "leaves"),
+    [
+        # From 2000 µm right of A1's centre, the wall is 700 µm away on +X...
+        (1000.0, 0.0, True),
+        # ...and 4700 µm away on -X: the step's sign is the jog's.
+        (-1000.0, 0.0, False),
+        # A Y step from there ends 2236 µm from the centre: X and Y are not swapped.
+        (0.0, 1000.0, False),
+    ],
+    ids=["toward-the-wall", "away-from-it", "across-in-y"],
+)
+def test_a_jog_from_off_the_centre_is_judged_at_its_own_end(
+    stands: Callable[..., Stand], dx_um: float, dy_um: float, leaves: bool
+) -> None:
+    stand = stands(start=_from_a1(2000.0))
+    outcome = stand.jog(dx_um, dy_um)
+    assert outcome.startswith(SWITCHED.format(reason="it leaves A1")) is leaves
+    assert stand.af.calls.count("disengage") == (1 if leaves else 0)
+
+
+@pytest.mark.parametrize("method", ["references", "seed"])
+def test_a_registered_plate_places_the_map_for_the_jog(
+    stands: Callable[..., Stand], method: str
+) -> None:
+    # No holder: without the registration the map would not place the plate.
+    stand = stands(holder=False, start=REGISTERED_A1, registered=_registered(method))
+    assert stand.jog(1000.0) == "stage jog: XY (2000.00, -500.00) µm"
+    assert stand.af.calls.count("disengage") == 0
+    outcome = stand.jog(2000.0)  # ends 3000 µm from A1's centre
+    assert outcome.startswith(f"{SWITCHED.format(reason='it leaves A1')}: ")
+    assert stand.af.calls.count("disengage") == 1
 
 
 def test_a_jog_on_an_unplaced_map_switches_the_autofocus_off(

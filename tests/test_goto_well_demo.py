@@ -1285,6 +1285,55 @@ def test_a_stop_before_the_move_keeps_the_autofocus_on_and_sends_nothing(
     assert _where(demo_microscope) == before
 
 
+def test_a_stop_before_the_estimates_move_keeps_the_autofocus_on(
+    holder_stand: Microscope, tmp_path: Path
+) -> None:
+    af = RecordingAutofocus(engaged=True)
+    holder_stand.override(Autofocus, af)
+    before = _where(holder_stand)
+    stop = threading.Event()
+    stop.set()
+
+    record = _run(holder_stand, tmp_path, well="A1", plate="96-well", stop=stop)
+
+    assert record.status is StageStatus.stopped
+    assert "disengage" not in af.calls
+    assert af.engaged is True
+    assert _where(holder_stand) == before
+
+
+def test_the_estimate_switches_the_autofocus_off_before_it_sends_the_move(
+    holder_stand: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    af = RecordingAutofocus(engaged=True)
+    holder_stand.override(Autofocus, af)
+    stage = holder_stand.require(XYStage)
+    real_move = stage.move_to_um
+
+    def move(x_um: float, y_um: float) -> object:
+        af.calls.append("move_to_um")
+        return real_move(x_um, y_um)
+
+    monkeypatch.setattr(stage, "move_to_um", move)
+    _result(_run(holder_stand, tmp_path, well="A1", plate="96-well"))
+    assert af.calls == ["is_engaged", "disengage", "is_engaged", "move_to_um"]
+
+
+def test_a_switch_off_error_of_several_lines_is_said_by_its_first(
+    demo_microscope: Microscope, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A vendor's message can run over lines: the run's text keeps one.
+    af = RecordingAutofocus(engaged=True)
+
+    def fails() -> None:
+        raise CoreError("PFS did not answer\nError in device PFS: 10")
+
+    monkeypatch.setattr(af, "disengage", fails)
+    _fails_before_the_move(
+        demo_microscope, tmp_path, af, "CoreError: PFS did not answer"
+    )
+
+
 def _fails_before_the_move(
     microscope: Microscope, tmp_path: Path, af: RecordingAutofocus, cause: str
 ) -> None:
