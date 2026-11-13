@@ -195,8 +195,9 @@ follow_imports = "skip"
 
 # Panel is an optional extra: without the skip, `pn.widgets.Button(...)` is a no-untyped-call
 # with it installed and an import-not-found without it (measured, m3 §15.3), as torch's.
+# tornado comes with Bokeh: `lint & types` installs `.[dev]` only, so it is missing there (#490).
 [[tool.mypy.overrides]]
-module = ["panel", "panel.*", "bokeh", "bokeh.*", "param", "param.*"]
+module = ["panel", "panel.*", "bokeh", "bokeh.*", "param", "param.*", "tornado", "tornado.*"]
 ignore_missing_imports = true
 follow_imports = "skip"
 

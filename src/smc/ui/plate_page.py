@@ -41,7 +41,6 @@ from typing import Any, Literal, cast
 
 import numpy as np
 import panel as pn
-import tornado.web
 import useq
 from bokeh.events import Tap
 from bokeh.models import (
@@ -54,6 +53,7 @@ from bokeh.models import (
 )
 from bokeh.palettes import Greys256, Viridis256
 from bokeh.plotting import figure
+from tornado.web import HTTPError, RequestHandler
 
 from smc.hardware.capabilities import (
     Autofocus,
@@ -3905,7 +3905,8 @@ def build(page: PlatePage) -> Any:
     return view.layout
 
 
-class RunFileHandler(tornado.web.RequestHandler):
+# tornado is skipped by mypy as Panel is (pyproject), so its base class is Any on every PC.
+class RunFileHandler(RequestHandler):  # type: ignore[misc]
     """``GET /run-files/<path>``: a file the run document names, and nothing else (m5 §17.12 D21).
 
     *Where the files are* links the report and the export to this route so that they open from
@@ -3929,12 +3930,12 @@ class RunFileHandler(tornado.web.RequestHandler):
         """Answer with the file ``relative`` names, or 404 (see the class)."""
         path = self.page.run_file(relative)
         if path is None:
-            raise tornado.web.HTTPError(404)
+            raise HTTPError(404)
         try:
             body = path.read_bytes()
         except OSError:
             # A file the document names that cannot be read now (gone since the check, locked).
-            raise tornado.web.HTTPError(404) from None
+            raise HTTPError(404) from None
         kind = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         if kind.startswith("text/"):
             kind += "; charset=utf-8"
