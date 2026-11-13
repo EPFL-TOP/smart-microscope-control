@@ -181,6 +181,40 @@ def _failed_jobs(jobs: list[tuple[str, str | None]]) -> list[tuple[str, str]]:
     ]
 
 
+def unknown_warning(
+    run_url: str,
+    lint: str,
+    test: str,
+    jobs: list[tuple[str, str | None]] | None,
+) -> str:
+    """The ``::warning::`` line of a run that has no verdict and touches no issue.
+
+    ``unknown`` opens and closes nothing (a cancelled run says nothing about the code),
+    but two ways of getting there hide a red run: the jobs could not be listed, so the
+    aggregate could not be upgraded to red, or they were listed and none concluded
+    ``failure`` or ``timed_out`` (a job that ended ``startup_failure`` or
+    ``action_required`` never ran its tests). The log must say which run it was and
+    what the report saw, or the report ends exit 0 and silent. One line, because a
+    workflow command ends where its line does.
+    """
+    seen = f"lint={lint or 'unset'}, tests={test or 'unset'}"
+    if jobs is None:
+        what = "the jobs could not be listed"
+    else:
+        odd = _failed_jobs(jobs)
+        what = (
+            "jobs that did not succeed: "
+            + ", ".join(f"`{name}`: {conclusion}" for name, conclusion in odd)
+            if odd
+            else "no job failed"
+        )
+    message = (
+        f"no verdict on {run_url} ({seen}; {what}): no issue was touched,"
+        " read the run before trusting it"
+    )
+    return "::warning::" + " ".join(message.split())
+
+
 def body(
     today: str,
     ref: str,
@@ -290,13 +324,15 @@ def run_gh(args: list[str], stdin: str | None = None) -> str:
     env = dict(os.environ)
     if os.environ.get("GITHUB_REPOSITORY"):
         env.setdefault("GH_REPO", os.environ["GITHUB_REPOSITORY"])
+    # Bytes, not text mode: a text-mode stdin is a TextIOWrapper that writes "\n" as
+    # os.linesep, so on Windows the body of an issue would carry CRLF (#358; the same
+    # reason `select_matrix.py` pins newline="\n" for $GITHUB_OUTPUT).
+    data = None if stdin is None else stdin.encode("utf-8")
     try:
         done = subprocess.run(
             ["gh", *args],
-            input=stdin,
+            input=data,
             capture_output=True,
-            text=True,
-            encoding="utf-8",
             env=env,
             timeout=_GH_TIMEOUT_S,
             check=False,
@@ -304,10 +340,9 @@ def run_gh(args: list[str], stdin: str | None = None) -> str:
     except (OSError, subprocess.SubprocessError) as error:
         raise GhError(f"gh {' '.join(args[:2])}: {error}") from error
     if done.returncode != 0:
-        raise GhError(
-            f"gh {' '.join(args[:2])} failed: {done.stderr.strip() or done.returncode}"
-        )
-    return done.stdout
+        said = done.stderr.decode("utf-8", errors="replace").strip()
+        raise GhError(f"gh {' '.join(args[:2])} failed: {said or done.returncode}")
+    return done.stdout.decode("utf-8", errors="replace")
 
 
 def _json_documents(text: str) -> list[object]:
@@ -345,7 +380,9 @@ def main(gh: Gh | None = None, today: str | None = None) -> int:
     ref = os.environ.get("GITHUB_REF_NAME", "main")
     sha = os.environ.get("GITHUB_SHA", "")
     run_url = f"{server}/{repo}/actions/runs/{run_id}"
-    status = state(os.environ.get("LINT_RESULT", ""), os.environ.get("TEST_RESULT", ""))
+    lint = os.environ.get("LINT_RESULT", "")
+    test = os.environ.get("TEST_RESULT", "")
+    status = state(lint, test)
     title = issue_title(ref)
     try:
         listing_args = ["issue", "list", "--state", "open", "--label", LABEL]
@@ -365,6 +402,8 @@ def main(gh: Gh | None = None, today: str | None = None) -> int:
         # failed is a failure whatever the aggregate says.
         if status == "unknown" and jobs is not None and has_failed_job(jobs):
             status = "red"
+        if status == "unknown":
+            print(unknown_warning(run_url, lint, test, jobs))
         if status == "red":
             junit = failed_tests(Path(os.environ.get("JUNIT_DIR", "junit")))
             text = body(today, ref, sha, run_url, jobs, junit)

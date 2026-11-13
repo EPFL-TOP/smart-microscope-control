@@ -543,11 +543,139 @@ def test_an_unknown_run_whose_jobs_cannot_be_listed_touches_no_issue(
     assert gh.verbs() == []
 
 
+def _warnings(output: str) -> list[str]:
+    return [line for line in output.splitlines() if line.startswith("::warning::")]
+
+
+def test_an_unknown_run_whose_jobs_cannot_be_listed_names_the_run_in_a_warning(
+    rep, monkeypatch, ci_env, capsys
+) -> None:
+    # First silent path of #358: no verdict from the aggregate and no job list to upgrade
+    # it. It may be a red run, so the log must say which run it was.
+    monkeypatch.setenv("LINT_RESULT", "success")
+    monkeypatch.setenv("TEST_RESULT", "abandoned")
+    gh = FakeGh(issues=[{"number": 42, "title": "CI nightly red"}])
+    inner = gh.__call__
+
+    def flaky(args: list[str], stdin: str | None = None) -> str:
+        if args[0] == "api":
+            raise rep.GhError("HTTP 502")
+        return inner(args, stdin)
+
+    assert rep.main(gh=flaky, today=TODAY) == 0
+
+    assert gh.verbs() == []
+    named = [w for w in _warnings(capsys.readouterr().out) if "/actions/runs/123" in w]
+    assert len(named) == 1
+    assert "could not be listed" in named[0]
+    assert "abandoned" in named[0]
+    assert "no issue was touched" in named[0]
+
+
+def test_an_unknown_run_with_no_failed_job_names_the_run_and_its_jobs_in_a_warning(
+    rep, monkeypatch, ci_env, capsys
+) -> None:
+    # Second silent path: the jobs are listed and none failed or timed out. A job that
+    # ended `startup_failure` or `action_required` never ran its tests.
+    monkeypatch.setenv("LINT_RESULT", "success")
+    monkeypatch.setenv("TEST_RESULT", "abandoned")
+    gh = FakeGh(
+        issues=[{"number": 42, "title": "CI nightly red"}],
+        jobs=[
+            {"name": "lint & types", "conclusion": "success"},
+            {"name": "tests (ubuntu-latest, py3.13)", "conclusion": "success"},
+            {"name": "tests (macos-latest, py3.13)", "conclusion": "startup_failure"},
+            {"name": "tests (windows-latest, py3.14)", "conclusion": "action_required"},
+            {"name": "nightly report", "conclusion": None},
+        ],
+    )
+
+    assert rep.main(gh=gh, today=TODAY) == 0
+
+    assert gh.verbs() == []
+    warnings = _warnings(capsys.readouterr().out)
+    assert len(warnings) == 1
+    text = warnings[0]
+    assert "/actions/runs/123" in text
+    assert "`tests (macos-latest, py3.13)`: startup_failure" in text
+    assert "`tests (windows-latest, py3.14)`: action_required" in text
+    assert "lint & types" not in text
+    assert "py3.13)`: success" not in text
+    assert "nightly report" not in text
+    assert "no issue was touched" in text
+
+
+def test_an_unknown_run_with_every_job_listed_as_fine_still_names_the_run(
+    rep, monkeypatch, ci_env, capsys
+) -> None:
+    # The aggregate says no verdict and the jobs show nothing wrong: still a line, so a
+    # reader of the log is never left to guess what the report did.
+    monkeypatch.setenv("LINT_RESULT", "success")
+    monkeypatch.setenv("TEST_RESULT", "cancelled")
+    gh = FakeGh(jobs=[{"name": "lint & types", "conclusion": "success"}])
+    assert rep.main(gh=gh, today=TODAY) == 0
+    (text,) = _warnings(capsys.readouterr().out)
+    assert "/actions/runs/123" in text
+    assert "no job failed" in text
+
+
+def test_the_unknown_warning_is_one_line_that_a_workflow_command_can_carry(
+    rep,
+) -> None:
+    # A workflow command ends at the end of its line: a newline in a job's name would cut
+    # the message, and what follows would be a stray line of the log.
+    text = rep.unknown_warning(
+        RUN_URL,
+        "success",
+        "abandoned",
+        [("tests (a,\nb)", "startup_failure"), ("tests (c, py1)", "cancelled")],
+    )
+    assert text.startswith("::warning::")
+    assert "\n" not in text
+    assert "\r" not in text
+    assert RUN_URL in text
+    assert "startup_failure" in text
+    assert "cancelled" in text
+
+
+def test_a_red_or_green_run_writes_no_unknown_warning(
+    rep, monkeypatch, ci_env, capsys
+) -> None:
+    monkeypatch.setenv("LINT_RESULT", "success")
+    monkeypatch.setenv("TEST_RESULT", "failure")
+    gh = FakeGh(jobs=[{"name": "tests (a, py1)", "conclusion": "failure"}])
+    assert rep.main(gh=gh, today=TODAY) == 0
+    assert gh.verbs() == ["issue create"]
+    # an abandoned matrix that the jobs show to be red is red, not unknown
+    monkeypatch.setenv("TEST_RESULT", "abandoned")
+    assert rep.main(gh=gh, today=TODAY) == 0
+    monkeypatch.setenv("TEST_RESULT", "success")
+    assert rep.main(gh=FakeGh(), today=TODAY) == 0
+    assert _warnings(capsys.readouterr().out) == []
+
+
+def test_main_lets_an_unexpected_error_fail_the_job(rep, monkeypatch, ci_env) -> None:
+    # A crash (a listing that is not JSON) is not turned into a quiet exit 0: the job
+    # goes red, and a red run with no issue is what `point.py` reads (#358).
+    monkeypatch.setenv("LINT_RESULT", "failure")
+    monkeypatch.setenv("TEST_RESULT", "success")
+
+    def garbled(args: list[str], stdin: str | None = None) -> str:
+        return "this is not json"
+
+    with pytest.raises(json.JSONDecodeError):
+        rep.main(gh=garbled, today=TODAY)
+
+
 def _completed(
-    returncode: int, stdout: str = "", stderr: str = ""
-) -> subprocess.CompletedProcess[str]:
+    returncode: int, stdout: str | bytes = b"", stderr: str | bytes = b""
+) -> subprocess.CompletedProcess[bytes]:
+    # `run_gh` reads bytes (no text mode), so the fake hands bytes back.
+    def raw(value: str | bytes) -> bytes:
+        return value.encode("utf-8") if isinstance(value, str) else value
+
     return subprocess.CompletedProcess(
-        args=[], returncode=returncode, stdout=stdout, stderr=stderr
+        args=[], returncode=returncode, stdout=raw(stdout), stderr=raw(stderr)
     )
 
 
@@ -566,11 +694,57 @@ def test_run_gh_sends_the_text_on_stdin_and_returns_what_gh_printed(
 
     assert seen["cmd"] == ["gh", "issue", "create", "--body-file", "-"]
     # `--body-file -` reads the standard input: without it the issue has an empty body
-    assert seen["kwargs"]["input"] == "THE BODY"
-    assert seen["kwargs"]["encoding"] == "utf-8"
-    assert seen["kwargs"]["text"] is True
+    assert seen["kwargs"]["input"] == b"THE BODY"
     # a hung gh must not hold the report job for ever
     assert 0 < seen["kwargs"]["timeout"] <= 600
+
+
+def test_run_gh_sends_stdin_as_utf_8_bytes_with_unix_line_ends(
+    rep, monkeypatch
+) -> None:
+    # Text mode would hand the string to a TextIOWrapper that writes "\n" as os.linesep:
+    # on Windows the body of the issue would carry CRLF. Bytes bypass that layer, so no
+    # system rewrites them, and nothing on macOS or Linux could show the difference but
+    # this look at what reaches `subprocess.run`.
+    seen: list[dict] = []
+
+    def fake_run(cmd, **kwargs):
+        seen.append(kwargs)
+        return _completed(0, "")
+
+    monkeypatch.setattr(rep.subprocess, "run", fake_run)
+
+    rep.run_gh(
+        ["issue", "create", "--body-file", "-"],
+        "a\nb \N{LATIN SMALL LETTER E WITH ACUTE}\n",
+    )
+    rep.run_gh(["issue", "list"], None)
+
+    assert seen[0]["input"] == b"a\nb \xc3\xa9\n"
+    assert isinstance(seen[0]["input"], bytes)
+    assert not seen[0].get("text")
+    assert not seen[0].get("universal_newlines")
+    assert seen[1]["input"] is None
+
+
+# What `gh` is to this test: a child that prints, byte for byte, what it was sent.
+_ECHO_STDIN = "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"
+
+
+def test_run_gh_leaves_no_carriage_return_in_what_a_child_reads(
+    rep, monkeypatch
+) -> None:
+    # The real subprocess, with `gh` swapped for a Python child. On macOS and Linux it
+    # cannot fail; on Windows it is the one that sees text mode write CRLF.
+    real_run = subprocess.run
+
+    def run_the_child(cmd, **kwargs):
+        return real_run([sys.executable, "-I", "-c", _ECHO_STDIN, *cmd[1:]], **kwargs)
+
+    monkeypatch.setattr(rep.subprocess, "run", run_the_child)
+
+    sent = "line one\nline two \N{LATIN SMALL LETTER E WITH ACUTE}\n"
+    assert rep.run_gh(["issue", "create", "--body-file", "-"], sent) == sent
 
 
 def test_run_gh_raises_with_what_gh_said_when_it_fails(rep, monkeypatch) -> None:
@@ -580,6 +754,24 @@ def test_run_gh_raises_with_what_gh_said_when_it_fails(rep, monkeypatch) -> None
     )
     with pytest.raises(rep.GhError, match=r"issue list.*HTTP 403"):
         rep.run_gh(["issue", "list"], None)
+
+
+def test_a_message_of_gh_that_is_not_utf_8_is_still_a_gh_error(
+    rep, monkeypatch
+) -> None:
+    # Without text mode the bytes are decoded here: a stray byte in a vendor message must
+    # not turn the diagnosis into a UnicodeDecodeError that names nothing.
+    monkeypatch.setattr(
+        rep.subprocess,
+        "run",
+        lambda *a, **k: _completed(1, b"", b"HTTP 403 \xff forbidden"),
+    )
+    with pytest.raises(rep.GhError, match=r"issue list.*HTTP 403"):
+        rep.run_gh(["issue", "list"], None)
+    monkeypatch.setattr(
+        rep.subprocess, "run", lambda *a, **k: _completed(0, b"caf\xe9", b"")
+    )
+    assert "caf" in rep.run_gh(["issue", "list"], None)
 
 
 def test_run_gh_raises_when_gh_is_missing_or_hangs(rep, monkeypatch) -> None:
