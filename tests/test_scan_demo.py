@@ -56,6 +56,7 @@ from smc.hardware.errors import (
     SafetyRefusedError,
 )
 from smc.plugins import PluginRunError, Progress, load, run_plugin
+from smc.plugins.api import ShownFrame
 from smc.plugins.errors import ResumeError
 from smc.plugins.geometry import pixel_matrix
 from smc.plugins.scan.plugin import ScanCheckpoint, ScanParams, ScanPlugin
@@ -422,6 +423,7 @@ def _scan(
     resume: bool = False,
     on_progress: Callable[[Progress], None] | None = None,
     stop: threading.Event | None = None,
+    on_frame: Callable[[ShownFrame], None] | None = None,
     **params: object,
 ) -> StageRecord:
     return run_plugin(
@@ -432,6 +434,7 @@ def _scan(
         resume=resume,
         on_progress=on_progress,
         stop=stop,
+        on_frame=on_frame,
     )
 
 
@@ -548,6 +551,65 @@ def test_progress_counts_every_field_of_the_attempt(rig: _Rig) -> None:
 
     assert [(p.done, p.total) for p in seen] == [(n, 12) for n in range(1, 13)]
     assert seen[0].message == "A1_0000"
+
+
+# ------------------------------------------------- the frames shown (m3 §25.4)
+
+
+def test_every_written_frame_is_shown_once_with_its_readback_and_name(
+    rig: _Rig,
+) -> None:
+    rig.stage.offset_um = (3.0, -2.0)  # the readback, not the target, is shown
+    seen: list[ShownFrame] = []
+    snapped: list[npt.NDArray[Any]] = []
+    snap = rig.camera.snap
+
+    def recorded() -> npt.NDArray[np.uint16]:
+        pixels = snap()
+        snapped.append(pixels)
+        return pixels
+
+    rig.camera.snap = recorded  # type: ignore[method-assign]
+
+    result = _result(_scan(rig, on_frame=seen.append))
+
+    assert len(seen) == len(result.frames) == len(snapped) == 12
+    for shown, frame, pixels in zip(seen, result.frames, snapped, strict=True):
+        # The snap's own array: no copy on the scan's thread (m3 §25.2 D2).
+        assert shown.image is pixels
+        assert shown.plugin == "scan"
+        assert shown.label == frame.name
+        assert shown.xy_um == (frame.x_um, frame.y_um)
+        np.testing.assert_array_equal(shown.image, load_frame(rig.run_dir, frame))
+
+
+def test_a_dry_run_shows_no_frame(
+    demo_microscope_dry: Microscope, tmp_path: Path
+) -> None:
+    rig = _build(demo_microscope_dry, tmp_path)
+    _plan(rig)
+    seen: list[ShownFrame] = []
+
+    record = _scan(rig, on_frame=seen.append)
+
+    assert record.dry_run is True
+    assert _result(record).frames == ()
+    assert rig.stage.moves == 12  # the fields were walked
+    assert seen == []
+
+
+def test_a_failed_field_shows_no_frame(rig: _Rig) -> None:
+    # The snap of the second field fails: showing the frame still held from the
+    # first field under the second's name would be a frame of the wrong place.
+    plan = _plan(rig)
+    rig.camera.fail = {2: HardwareError("the camera timed out")}
+    seen: list[ShownFrame] = []
+
+    result = _result(_scan(rig, on_frame=seen.append))
+
+    assert [f.name for f in result.failed] == [plan.fields[1].name]
+    assert [s.label for s in seen] == [f.name for f in result.frames]
+    assert len(seen) == 11
 
 
 # ------------------------------------------------- refused before anything moves

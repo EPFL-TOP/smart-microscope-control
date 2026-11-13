@@ -23,20 +23,25 @@ _HIGH_PERCENTILE = 99.5
 
 @dataclass(frozen=True, slots=True)
 class Frame:
-    """One snapped frame and what the page needs to say of it.
+    """One frame, snapped by the page or handed by a plugin's run, and what the page needs to say of it.
 
     ``image`` is the camera's own array, never rescaled and read-only, so that
     the sessions that draw it cannot change it. ``number`` counts the
-    controller's frames from 1: a view redraws when it changes, never on the
-    tick alone (FM-145, FM-151). ``pixel_size_um`` is ``0.0`` when the camera
-    does not know it, as ``smc snap`` writes it, and ``xy_um`` is ``None`` when
-    the stand has no XY stage or cannot read it.
+    controller's frames from 1, snaps, live and a run's alike: a view redraws
+    when it changes, never on the tick alone (FM-145, FM-151).
+    ``pixel_size_um`` is ``0.0`` when the camera does not know it, as ``smc
+    snap`` writes it, and ``xy_um`` is ``None`` when the stand has no XY stage
+    or cannot read it. A plugin's frame (m3 §25.5) is not read from the camera
+    by the page, so what the page did not read is said to be unknown, never
+    guessed: ``bit_depth`` is ``0`` (``display_image`` then stretches a flat
+    frame against the dtype's range), ``exposure_ms`` is ``None`` and
+    ``pixel_size_um`` is ``0.0``.
     """
 
     number: int
     image: npt.NDArray[np.uint8] | npt.NDArray[np.uint16]
     bit_depth: int
-    exposure_ms: float
+    exposure_ms: float | None
     pixel_size_um: float
     xy_um: tuple[float, float] | None
     taken_utc: datetime
