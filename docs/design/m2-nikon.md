@@ -4432,12 +4432,13 @@ advice is:
 from the offset's floor, outside the soft limits [4000, 4350] µm; it was
 switched off. The offset (4000 PFSOffset units) is below its floor (5000
 PFSOffset units), and its plane lies past the Z soft limits, away from the
-sample: set the offset to its floor (smc autofocus offset --floor) and
-engage again (m2 §12.12 D14). The guard reads Z every 10 ms: it stops PFS
-once a jump is read, it does not prevent one ``
+sample: set the offset to its floor and engage again (m2 §12.12 D14).
+The guard reads Z every 10 ms: it stops PFS once a jump is read, it does
+not prevent one ``
 
-At the floor, "raise the floor" stays. The offset is the one the guard
-engaged at (the `seen` pair); the floor is the profile's.
+At the floor, "raise the floor" stays. The text names no CLI command: the
+page shows it too. The offset is the one the guard engaged at (the `seen`
+pair); the floor is the profile's.
 
 **D15. A trip's words follow the direction** (item 6). D10's text takes
 three words from `z_away_from_sample`: `"decreasing"`, "is not below where
