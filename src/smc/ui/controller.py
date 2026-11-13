@@ -597,6 +597,25 @@ class _Handed(NamedTuple):
     switch_off: bool
 
 
+class _Prepared(NamedTuple):
+    """A tool that passed ``run``'s checks: the plugin as loaded and its parsed parameters (m5 §17.11.2)."""
+
+    entry: PluginEntry
+    parsed: PluginParams
+
+
+class _Ended(NamedTuple):
+    """How a plugin's run ended: its outcome text and its record's kind, for a chain to tell (m5 §17.11.2).
+
+    ``status`` is ``done`` (the record ended ``done``), ``stopped`` (the run was
+    stopped: its record is ``stopped``) or ``failed`` (the run raised, or its record
+    could not be written). A single run only says ``outcome``.
+    """
+
+    outcome: str
+    status: Literal["done", "stopped", "failed"]
+
+
 class _LatestShown:
     """The newest frame a plugin's run handed the page, in one slot (m3 §25.5).
 
@@ -2132,28 +2151,47 @@ class PlatePage:
                 closed.
         """
         self._refuse_if_busy()
-        if self._microscope is None:
-            self._set_outcome(f"{plugin}: {NOT_CONNECTED}")
+        # Read at the click, not when the worker starts: the preset the operator
+        # saw loaded is the one the record names (m5 §10.5).
+        loaded = self.preset
+        preset = None if loaded is None else loaded.file.name
+        prepared = self._prepare(plugin, params)
+        if isinstance(prepared, str):
+            self._set_outcome(prepared)
             return
+        entry, parsed = prepared
+        self._start_activity(
+            plugin,
+            lambda event: (
+                self._run_plugin(plugin, entry, parsed, event, preset).outcome
+            ),
+        )
+
+    def _prepare(self, plugin: str, params: Sequence[str]) -> _Prepared | str:
+        """What ``smc run`` checks before it opens the stand, for one tool: the plugin and its parameters, or the outcome that refuses it.
+
+        A ``str`` is the outcome ``run`` sets for that refusal (``<plugin>: <why>``),
+        and nothing was written. The checks are in one place so that a single run and
+        a chain refuse with the same code and the same words (m5 §17.11.2): the order is
+        the stand, the plate's gate, ``plate-walls``' refusal, the plugin and its
+        parameters, ``check_ready`` and last a checkpoint. Never raises for a plugin's
+        or a document's fault (FM-98, FM-113): text, so that no traceback is kept.
+        """
+        if self._microscope is None:
+            return f"{plugin}: {NOT_CONNECTED}"
         if _needs_plate(plugin) and not self._plate_chosen:
             # The controller's own refusal (FM-169): a click on a disabled button
             # still arrives here, and so does a call that spells `plate=` itself. The
             # stand's being closed is the reason that holds longer, so it came first.
-            self._set_outcome(f"{plugin}: {PLATE_NOT_CHOSEN}")
-            return
+            return f"{plugin}: {PLATE_NOT_CHOSEN}"
         if plugin == "plate-walls" and (refusal := self._walls_refusal()) is not None:
             # The plugin refuses a dry run and square wells too, but its refusal is a
             # `failed` record, and the latest attempt decides the `plate` slot (m5
             # §11.4): a usable plate would be replaced by a failure. The page refuses
             # first, nothing written, before the parameters are read (FM-169, m5 §12.3).
-            self._set_outcome(f"{plugin}: {refusal}")
-            return
+            return f"{plugin}: {refusal}"
         profile = self._profile.microscope.name
         dry_run = self._dry_run
-        # Read at the click, not when the worker starts: the preset the operator
-        # saw loaded is the one the record names (m5 §10.5).
-        loaded = self.preset
-        preset = None if loaded is None else loaded.file.name
         try:
             entry = load(plugin, self._entry_points)
             try:
@@ -2167,8 +2205,7 @@ class PlatePage:
                 # turns only ValueError and AssertionError into a validation error:
                 # any other exception is the plugin's, and an outcome, never a click
                 # that ends with no word (FM-113).
-                self._set_outcome(f"{plugin}: {type(exc).__name__}: {_one_line(exc)}")
-                return
+                return f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
             doc = RunDocument.load_or_new(self._run_doc)
             check_ready(
                 entry.plugin,
@@ -2186,15 +2223,10 @@ class PlatePage:
             )
         except (PluginError, RunDocumentError) as exc:
             # Text, never the error (FM-98).
-            self._set_outcome(f"{plugin}: {type(exc).__name__}: {_one_line(exc)}")
-            return
+            return f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
         if kept is not None:
-            self._set_outcome(f"{plugin}: {_checkpoint_reason(plugin, kept)}")
-            return
-        self._start_activity(
-            plugin,
-            lambda event: self._run_plugin(plugin, entry, parsed, event, preset),
-        )
+            return f"{plugin}: {_checkpoint_reason(plugin, kept)}"
+        return _Prepared(entry, parsed)
 
     def _start_activity(
         self, name: str, body: Callable[[threading.Event], str]
@@ -2300,8 +2332,8 @@ class PlatePage:
         parsed: PluginParams,
         event: threading.Event,
         preset: str | None = None,
-    ) -> str:
-        """A plugin's run on the worker, and its outcome as text."""
+    ) -> _Ended:
+        """A plugin's run on the worker: its outcome as text, and whether it ended done, stopped or failed."""
         log.info("%s: started from the plate page", plugin)
         started = time.monotonic()
         # The orientation the page names the captures for, read before a rename runs:
@@ -2328,20 +2360,24 @@ class PlatePage:
             )
         except RunDocumentError as exc:
             if exc.record is not None and exc.record.result is not None:
-                return (
+                return _Ended(
                     f"{plugin} ran, but its record could not be written: "
-                    f"{_one_line(exc)}"
+                    f"{_one_line(exc)}",
+                    "failed",
                 )
-            return f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
+            return _Ended(f"{plugin}: {type(exc).__name__}: {_one_line(exc)}", "failed")
         except Exception as exc:
-            return f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
+            return _Ended(f"{plugin}: {type(exc).__name__}: {_one_line(exc)}", "failed")
         if record.status is StageStatus.done:
             seconds = time.monotonic() - started
             note = ""
             if record.provides == "plate":
                 note = self._follow_plate(turned_from)
-            return f"{plugin} done in {seconds:.1f} s{_assumed_tail(record)}{note}"
-        return f"{plugin} stopped"
+            return _Ended(
+                f"{plugin} done in {seconds:.1f} s{_assumed_tail(record)}{note}",
+                "done",
+            )
+        return _Ended(f"{plugin} stopped", "stopped")
 
     def _follow_plate(self, turned_from: PlateOrientation | None) -> str:
         """After a ``done`` provider of ``plate``: keep its orientation, and follow a turn; what the strip adds.
