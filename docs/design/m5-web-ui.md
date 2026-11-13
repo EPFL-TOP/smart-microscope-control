@@ -980,6 +980,99 @@ FM-151, FM-155, FM-167, FM-36, FM-37, FM-32, FM-43, FM-45, FM-47, FM-161. #295
 adds FM-180 (a drop at STOP that also drops the safe call) and FM-181 (a position
 recorded while a move waits or runs).
 
+### 6.6 A jog that leaves a well with the autofocus on (#454)
+
+**Merging this section decides it** (with m3 §5.6). The page's XY moves are
+two: a drive click (or *Go to*) runs `goto-well`, which switches an engaged
+autofocus off before its move (m3 §5.6); and the pad's jog (`jog_xy`, steps up
+to 1000 µm, §6.4), which sent `drive.jog_xy` with PFS left as it was. A jog is
+the way to look around one well under lock at the 40× (Z varied by 1.7 µm over
+1.4 mm inside C4, PFS locked, m2 §12.11.1), so PFS stays on for a jog that
+stays inside one well, and is switched off before one that may leave it.
+Which jogs stay inside a well is m3's notion, read on the page's map, not the
+layer's (m2 §12.11 D9, *Not chosen*: no radius). Measured on the demo
+96-well estimate (`main` 26d912b): A1's disc has a radius of 3200 µm, so a
+point 2600 µm from its centre lies 500 µm inside the wall and one 2800 µm
+from it does not.
+
+**D1. The rule.** A jog **stays inside one well** when the map places the
+plate and both its start (the stage's position, read just before the move)
+and its target (start + step) lie `JOG_WALL_MARGIN_UM = 500.0` µm or more
+inside the same well (`WellGeometry.contains(..., margin_um=...)`). Any other
+jog **may cross a wall**. The map places the plate when its pose is
+*registered* or *seed*, or *estimated* with a plate the operator chose; not
+when it is *unplaced*, *estimated* with the placeholder plate, or when the run
+document cannot be read (unknown counts as crossing, FM-19).
+- **The margin, chosen**: the holder's estimate can be a few hundred µm off
+  (m3 §5.5), and the map draws a registered plate at its registration's
+  positions, not shifted to the objective in use (m3 §18.3), whose offset on
+  the Ti2-E is not measured. A jog that ends within 500 µm of a wall switches
+  PFS off one step early. A well shrunk by the margin is convex (a disc or a
+  rectangle) and the pad jogs along one axis at a time, so a jog that keeps
+  PFS on never leaves the well on its way.
+- **A sequence of jogs** over the plastic between two wells is caught at the
+  first one whose target is not 500 µm inside the start's well.
+
+**D2. What `jog_xy` does.** The geometries and whether the map places the
+plate are read in `jog_xy`, in the caller's thread, as `goto` reads them
+(`_document()`, `_geometries()`, `_plate_chosen`), with no lock held across a
+device call (FM-70). The action handed to `_drive("stage jog", XYStage, …)`
+(an activity, or between two frames of live) is then, on the worker:
+1. the stand is in dry run, or has no autofocus (`get(Autofocus)` is
+   `None`): `drive.jog_xy`, as today;
+2. `is_engaged()`; off: `drive.jog_xy`, as today;
+3. on (searching counts as on): the stage's position (`XYStage.position_um()`),
+   then `jog_crossing(geometries, placed, start, target)`; `None` (it stays
+   inside one well): `drive.jog_xy`, as today;
+4. otherwise `disengage()` and `is_engaged()` again, then `drive.jog_xy`, and
+   the outcome says it first.
+
+`jog_crossing(geometries: Sequence[WellGeometry], placed: bool, start_um:
+tuple[float, float], target_um: tuple[float, float]) -> str | None` is a pure
+function in `smc/ui/controller.py`: `None` when the jog stays inside one well,
+else the reason, one of `the map does not place the plate`, `it does not
+start 500 µm inside a well`, `it leaves <well>`.
+
+**D3. Texts** (the outcome, `stage jog: …`, as every drive action's, §6.3):
+- switched off: `stage jog: the autofocus was switched off before the move
+  (<reason>), so that no lock crosses a well's wall: engage it again here;
+  <drive.jog_xy's text>`, `reached` as the jog's;
+- switched off, then the jog raised (a halt, a soft limit): `stage jog: the
+  autofocus was switched off before the move (<reason>), so that no lock
+  crosses a well's wall; then the jog failed: <Type>: <message>`. The
+  switch-off is said whatever the jog does;
+- a read or the switch-off raised (`is_engaged()`, `position_um()`,
+  `disengage()` or the read after it): `stage jog: the autofocus could not be
+  switched off before the move (<Type>: <message>): the stage did not move,
+  and PFS may still be on: switch it off, then jog again`. A failed position
+  read with the autofocus on gives the same text: the jog cannot be judged, and
+  nothing moves;
+- still on after the switch-off: `stage jog: the autofocus still reads on
+  after it was switched off before the move: the stage did not move: switch it
+  off at the stand, then jog again`.
+The texts are built from the error's text in the handler and returned after
+it (FM-98); the action never raises for these cases.
+
+- **Not chosen**:
+  - *Switching off before every jog with PFS on*: the operator could no longer
+    look around a well under lock at the 40×, which is what PFS is for.
+  - *Refusing a jog that may cross with PFS on*: one more click (*Autofocus
+    off*) for the same end state.
+  - *The same in `smc stage jog`* (ADR-0006 principle 5): the command has no
+    plate and no map; the layer does not know wells (m2 §12.11 D9). Its
+    procedure stays m2 §12.11.3 step 3.
+  - *Engaging it again after the jog*: m3 §5.6 D1's *Not chosen*.
+- **Not here**: the Z jog (`jog_z`), which the layer's interlock suspends and
+  relocks (FM-12); the tools run from the page (m3 §5.6, *Not here*).
+
+**Tests of #454**: the pure rule on a 96-well estimate (inside, one step past
+the margin, the plastic, another well, an unplaced map, the placeholder
+plate); the controller on `fake_microscope` with the recording `_Autofocus`
+fake: a jog inside one well with PFS on keeps it on, one that leaves switches
+it off first and says so, an autofocus that is off is never switched, nothing
+in a dry run, the three failures each moving nothing, and the jog handed to
+live. **Failure modes**: FM-19, FM-45, FM-70, FM-98, FM-223.
+
 ## 7. The stand's lifetime and the service (#264)
 
 Fixed by #264's plan (2026-10-30). Until #264, the command opens the stand when it
