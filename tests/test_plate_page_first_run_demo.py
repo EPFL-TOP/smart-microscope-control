@@ -19,7 +19,7 @@ import pytest
 
 from smc.hardware.profile import Profile
 from smc.ui.controller import PlatePage
-from smc.ui.guide import DRY_RUN_NO_FRAME, SELECT_WELLS
+from smc.ui.guide import DRY_RUN_NO_FRAME, SELECT_WELLS, tool_title
 
 pytestmark = [
     pytest.mark.demo,
@@ -72,7 +72,7 @@ def test_a_newcomer_reaches_the_export_by_next_steps_alone(
             assert page.join(120.0), f"{step.plugin} did not end"
             outcome = page.status().outcome
             assert outcome is not None
-            assert outcome.startswith(f"{step.plugin} done in "), outcome
+            assert outcome.startswith(f"{tool_title(step.plugin)} done in "), outcome
             ran.append((step.plugin, step.params))
         else:
             pytest.fail(f"the next steps did not end in {MAX_WALKS} walks: {ran}")
@@ -136,7 +136,7 @@ def test_a_dry_run_page_ends_its_next_steps_at_scan_and_says_why(
             assert page.join(120.0), f"{step.plugin} did not end"
             outcome = page.status().outcome
             assert outcome is not None
-            assert outcome.startswith(f"{step.plugin} done in "), outcome
+            assert outcome.startswith(f"{tool_title(step.plugin)} done in "), outcome
             ran.append(step.plugin)
         else:
             pytest.fail(f"the next steps did not stop in {MAX_WALKS} walks: {ran}")

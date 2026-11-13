@@ -528,11 +528,12 @@ def test_both_figures_stay_in_the_model_tree_whatever_the_screen(
     for items in view.screens.values():
         assert not figures & {id(o) for o in _ids_objects(items)}
         assert not any(isinstance(o, pn.pane.Bokeh) for o in _ids_objects(items))
-    # Both are the same height, side by side in the centre. The design says 460 px; 400 is
-    # the floor (m5 §17.3): a figure lower than that is a plan deviation to report, not a
-    # fix, so the number is pinned and not only the constant against itself.
+    # Both are the same height, side by side in the centre. The design said 460 px, then 400;
+    # 360 is the floor (m5 §17.12 D15, measured at 1280 x 800 with the drive bar's toggle in view):
+    # a figure lower than that is a plan deviation to report, not a fix, so the number is
+    # pinned and not only the constant against itself.
     assert view.figure.height == view.image_figure.height == plate_page.FIGURE_HEIGHT_PX
-    assert plate_page.FIGURE_HEIGHT_PX >= 400
+    assert plate_page.FIGURE_HEIGHT_PX >= 360
     assert plate_page.STEP_PANEL_WIDTH_PX == 400
 
 
@@ -815,9 +816,12 @@ def test_an_outcome_line_takes_no_height_while_its_text_is_empty(
     page: PlatePage,
 ) -> None:
     view = PlatePageView(page)
-    for pane in (view.message, view.problems_text, view.run_text):
+    for pane in (view.message, view.problems_text):
         assert pane.object == ""
         assert pane.visible is False
+    # The one outcome line is the exception: it always takes its height (D15).
+    assert view.run_text.object == ""
+    assert view.run_text.visible is True
     # Each line wraps at the window's width: a run's outcome is a sentence of 200
     # characters (`plate-orientation done ...; assumed: ...`) and its end ran past the
     # right edge in `/ui-check`'s `turned` state. Plain text, never Markdown (FM-139).
@@ -831,9 +835,9 @@ def test_an_outcome_line_takes_no_height_while_its_text_is_empty(
         assert type(pane) is pn.pane.Str
         assert pane.styles["white-space"] == "pre-wrap"
         assert pane.sizing_mode == "stretch_width"
-    # The connection line is never empty once the tick has read the stand.
-    assert view.connection_text.object != ""
-    assert view.connection_text.visible is True
+    # The connection line says nothing until a connect or a disconnect goes or fails.
+    assert view.connection_text.object == ""
+    assert view.connection_text.visible is False
     view.message.object = "that did not work"
     assert view.message.visible is True
     view.message.object = ""
@@ -853,3 +857,175 @@ def test_an_outcome_line_takes_no_height_while_its_text_is_empty(
         view.problems_text,
     ]
     assert view.layout[0] is view.header
+
+
+# --- round 2: the map's frame, the density select, the header (m5 §17.12 D15, D16, #475) ---
+
+
+def _frame(view: PlatePageView) -> tuple[float, float, float, float]:
+    """The frame's box as ``(x0, x1, y0, y1)``: flat, so that ``pytest.approx`` reads it."""
+    data = view.frame_source.data
+    return (min(data["x"]), max(data["x"]), min(data["y"]), max(data["y"]))
+
+
+def test_the_frame_renderer_is_the_only_one_the_ranges_follow(page: PlatePage) -> None:
+    from bokeh.models import DataRange1d
+
+    view = PlatePageView(page)
+    figure = view.figure
+    # Set once, at the build: changing a range's renderers after the page is drawn does not reframe
+    # (measured on Panel 1.10.0 / Bokeh 3.10.2), so what moves is the frame source's data.
+    for axis_range in (figure.x_range, figure.y_range):
+        assert isinstance(axis_range, DataRange1d)
+        assert axis_range.renderers == [view.frame_renderer]
+    assert view.frame_renderer.data_source is view.frame_source
+    # Invisible, and in no hover's list (FM-174: the hover names the wells only).
+    assert view.frame_renderer.glyph.fill_alpha == 0.0
+    assert view.frame_renderer.glyph.line_alpha == 0.0
+    assert view.frame_renderer not in (view.hover.renderers or [])
+    assert figure.match_aspect is True
+    # No other source feeds the ranges: the side labels have no glyph of their own any more.
+    assert not any(
+        getattr(r, "data_source", None) is view.side_source for r in figure.renderers
+    )
+    # Redrawing the wells does not replace the list the ranges hold.
+    view.refresh()
+    view.show_step("wells")
+    assert figure.x_range.renderers == [view.frame_renderer]
+
+
+def _grown(wells: list[Any], pitch: float) -> tuple[float, float, float, float]:
+    """The wells' box grown by a pitch each way, as ``(x0, x1, y0, y1)`` (m5 §17.12 D16)."""
+    return (
+        min(w.center_um[0] - w.size_um[0] / 2 for w in wells) - pitch,
+        max(w.center_um[0] + w.size_um[0] / 2 for w in wells) + pitch,
+        min(w.center_um[1] - w.size_um[1] / 2 for w in wells) - pitch,
+        max(w.center_um[1] + w.size_um[1] / 2 for w in wells) + pitch,
+    )
+
+
+def test_the_map_frames_the_plate_then_the_plans_wells(
+    page: PlatePage, run_doc: Path
+) -> None:
+    _seed_plate(run_doc)
+    view = PlatePageView(page)
+    view.refresh()
+    assert view._view is not None
+    pitch = 9000.0
+    wells = list(view._view.wells)
+    # The Stand and Plate screens and the expert view: the plate, a pitch of margin all round.
+    plate_frame = _grown(wells, pitch)
+    assert _frame(view) == pytest.approx(plate_frame)
+    for step in ("stand", "plate"):
+        view.show_step(step)
+        assert _frame(view) == pytest.approx(plate_frame)
+    view.show_expert(True)
+    assert _frame(view) == pytest.approx(plate_frame)
+
+    # A plan stands (B2 and B11): the Wells, Scan and Results screens frame its wells.
+    _seed_scan_plan(run_doc)
+    view.refresh()
+    framed = _grown([w for w in wells if w.well in ("B2", "B11")], pitch)
+    assert framed != pytest.approx(plate_frame)
+    for step in ("wells", "scan", "results"):
+        view.show_step(step)
+        assert _frame(view) == pytest.approx(framed), step
+    # Back to the plate for the screens that are about the plate; the expert view frames it too.
+    view.show_step("plate")
+    assert _frame(view) == pytest.approx(plate_frame)
+    view.show_step("wells")
+    view.show_expert(True)
+    assert _frame(view) == pytest.approx(plate_frame)
+
+
+def test_the_map_frames_the_plate_when_the_plan_names_no_well_of_it(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # A plan whose wells are not on this plate: no frame of nothing.
+    _seed_plate(run_doc)
+    plan = _scan_plan_result().model_copy(update={"wells": ("Z99",)})
+    write_stage(
+        run_doc,
+        StageRecord(
+            plugin="scan-plan",
+            provides="scan-plan",
+            attempt="a1",
+            status=StageStatus.done,
+            started_utc=T0 + timedelta(minutes=1),
+            finished_utc=T0 + timedelta(minutes=2),
+            profile="demo",
+            dry_run=False,
+            smc_version="0",
+            params={},
+            result=plan.model_dump(mode="json"),
+        ),
+    )
+    view = PlatePageView(page)
+    view.refresh()
+    plate_frame = _frame(view)
+    view.show_step("wells")
+    assert _frame(view) == plate_frame
+
+
+def test_the_density_select_shows_only_with_a_class(
+    page: PlatePage, run_doc: Path
+) -> None:
+    from smc.plugins.slots import DensityResult, DensityWell
+
+    view = PlatePageView(page)
+    # Empty and above the map from the Stand screen on, before: the owner's walk.
+    assert view.label_select.options == []
+    assert view.label_select.visible is False
+    density = DensityResult(
+        labels=("live",),
+        area_grid_um=10.0,
+        wells=(
+            DensityWell(
+                well="A1",
+                fields=1,
+                failed_fields=0,
+                area_mm2=2.0,
+                counts={"live": 3},
+                outside_well=0,
+                per_mm2={"live": 1.5},
+            ),
+        ),
+    )
+    write_stage(
+        run_doc,
+        StageRecord(
+            plugin="density",
+            provides="density",
+            attempt="a2",
+            status=StageStatus.done,
+            started_utc=T0 + timedelta(minutes=2),
+            finished_utc=T0 + timedelta(minutes=3),
+            profile="demo",
+            dry_run=False,
+            smc_version="0",
+            params={},
+            result=density.model_dump(mode="json"),
+        ),
+    )
+    view.refresh()
+    assert view.label_select.options == ["live"]
+    assert view.label_select.visible is True
+
+
+def test_the_header_holds_one_outcome_line_of_fixed_height(page: PlatePage) -> None:
+    view = PlatePageView(page)
+    # The one line that always takes its height: empty or not (the page jumped by a line each
+    # time an outcome came and went, finding 11).
+    assert view.run_text.visible is True
+    assert view.run_text.min_height == plate_page._RUN_LINE_PX
+    view.tick()
+    view.run_text.object = "a short outcome"
+    assert view.run_text.visible is True
+    view.run_text.object = ""
+    assert view.run_text.visible is True
+    # The others only with a text.
+    for pane in (view.connection_text, view.message, view.problems_text):
+        assert pane.visible is bool(pane.object)
+    # Summaries are one line (at most 22 characters, cut with an ellipsis): the step bar is
+    # one line tall.
+    assert all(len(pane.object) <= 22 for pane in view.step_summaries.values())

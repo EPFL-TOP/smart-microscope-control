@@ -493,11 +493,17 @@ class MapPose:
 
 @dataclass(frozen=True, slots=True)
 class SideLabel:
-    """A side of the stand as the map labels it, in stage µm (m5 §16 D8): plain text (FM-139)."""
+    """A side of the stand as the map labels it, in stage µm (m5 §16 D8): plain text (FM-139).
+
+    ``angle_deg`` is the text's turn, counter-clockwise: the labels at the left and the right of
+    the wells are turned 90° along the plate's sides, so that a long side such as ``operator's
+    left`` fits the frame's margin (m5 §17.12 D16); the others read as text does.
+    """
 
     text: str
     x_um: float
     y_um: float
+    angle_deg: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -542,7 +548,10 @@ class PlateView:
     problem is in ``problems``) or when it did not end ``done``. ``register_refusal`` is why
     *Register the plate* would be refused for the objectives of the page's captures (m5
     §17.12 D13), the text ``run`` gives as its outcome, drawn before the click; ``None`` when
-    it would not, and while no centre is captured.
+    it would not, and while no centre is captured. ``frame_wells`` are the wells of the latest
+    scan plan the run document holds, **usable or not**: the map frames them on the Wells, Scan
+    and Results screens (m5 §17.12 D16), and an out-of-date plan is still the wells the
+    operator laid out. ``()`` when there is none or it does not validate.
     """
 
     plate: str
@@ -566,6 +575,7 @@ class PlateView:
     registered_by: str | None = None
     scanned: ScanSummary | None = None
     register_refusal: str | None = None
+    frame_wells: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1604,6 +1614,10 @@ class PlatePage:
         self.walls = ()
         self._capture_objectives = {}
         self.current = None
+        # A drive's text never outlives the plate it was measured on (m5 §17.12.3).
+        with self._lock:
+            self._goto = ""
+            self._goto_answer = None
 
     @property
     def sample_plate(self) -> str | None:
@@ -4238,7 +4252,15 @@ class PlatePage:
                 )
             ),
             register_refusal=self._register_refusal(),
+            frame_wells=self._frame_wells(doc),
         )
+
+    @staticmethod
+    def _frame_wells(doc: RunDocument) -> tuple[str, ...]:
+        """The wells of the latest ``scan-plan`` record of ``doc`` that validates, whatever its state (m5 §17.12 D16)."""
+        record = doc.provider("scan-plan")
+        planned = None if record is None else _scan_plan_of(record)
+        return () if planned is None else tuple(planned.wells)
 
     def _register_refusal(self) -> str | None:
         """Why *Register the plate* is refused for the objectives of the page's captures, for ``view()``; ``None`` for no captures (m5 §17.12 D13).
@@ -4333,8 +4355,10 @@ class PlatePage:
             "+Y": (middle_x, top + out_y),
             "-Y": (middle_x, bottom - out_y),
         }
+        # The left side reads upwards and the right one downwards, as an axis's label does.
+        turned = {"+X": -90.0, "-X": 90.0, "+Y": 0.0, "-Y": 0.0}
         return tuple(
-            SideLabel(words[direction], x_um, y_um)
+            SideLabel(words[direction], x_um, y_um, turned[direction])
             for direction, (x_um, y_um) in places.items()
         )
 

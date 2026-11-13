@@ -20,6 +20,7 @@ import pytest
 
 from smc.hardware.profile import Profile
 from smc.ui.controller import PlatePage
+from smc.ui.guide import tool_title
 
 pytestmark = [
     pytest.mark.demo,
@@ -36,7 +37,7 @@ def _run(page: PlatePage, plugin: str, params: list[str]) -> None:
     assert page.join(120.0), f"{plugin} did not end"
     outcome = page.status().outcome
     assert outcome is not None
-    assert outcome.startswith(f"{plugin} done in "), outcome
+    assert outcome.startswith(f"{tool_title(plugin)} done in "), outcome
 
 
 def _registered_and_planned(page: PlatePage, *, with_timing: bool) -> None:

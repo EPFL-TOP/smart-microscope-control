@@ -31,6 +31,7 @@ import contextlib
 import functools
 import logging
 import math
+import mimetypes
 import sys
 import threading
 import time
@@ -40,6 +41,7 @@ from typing import Any, Literal, cast
 
 import numpy as np
 import panel as pn
+import tornado.web
 import useq
 from bokeh.events import Tap
 from bokeh.models import (
@@ -76,10 +78,11 @@ from smc.ui.controller import (
 )
 from smc.ui.frames import Frame, display_image
 from smc.ui.guide import (
+    AUTOFOCUS_WORDS,
+    COVERAGE_WORDS,
     DRY_RUN_NO_FRAME,
     END_LIVE_LABEL,
     FILES_HEADING,
-    GOTO_NOT_DURING_LIVE,
     NO_FILES_YET,
     ORIENTATION_IN_STAGE_TERMS,
     OTHER_WAYS_TO_REGISTER,
@@ -92,12 +95,14 @@ from smc.ui.guide import (
     SCREEN_TITLES,
     STEPS,
     CentreRow,
+    GotoAnswer,
     NextStep,
     ResultRow,
     StepName,
     again_note,
     busy_note,
     capture_centre_label,
+    capture_note,
     capture_wall_label,
     centre_rows,
     centres_text,
@@ -106,11 +111,14 @@ from smc.ui.guide import (
     continue_label,
     drive_image_note,
     field_source_line,
-    files_lines,
+    files_html,
     forget_label,
+    frame_hint,
+    goto_row_text,
     image_sides_note,
     known_text,
     lay_out_wait,
+    map_frame,
     map_title,
     needs_calibration,
     opening_step,
@@ -119,6 +127,7 @@ from smc.ui.guide import (
     plan_selection_note,
     plan_title,
     plate_from_line,
+    plate_rows_note,
     preset_differences,
     preset_note_text,
     register_replace_note,
@@ -140,7 +149,14 @@ from smc.ui.guide import (
     wells_known_lines,
 )
 
-__all__ = ["PlatePageView", "build", "card_text", "next_step_text", "serve"]
+__all__ = [
+    "PlatePageView",
+    "RunFileHandler",
+    "build",
+    "card_text",
+    "next_step_text",
+    "serve",
+]
 
 #: Names are drawn on a plate of at most this many wells; on more they are noise.
 NAMES_UP_TO_WELLS = 96
@@ -185,13 +201,24 @@ _Z_DIRECTIONS = {"up": 1.0, "down": -1.0}
 #: cannot show as nothing.
 NO_LABEL = "(no label)"
 
-#: The step panel's width and the two figures' height (m5 §17.3). The design says 460 px so
-#: that the strip, the step bar, both figures and the drive bar are on a 1280 x 800 window;
-#: measured by ``/ui-check``, 460 leaves the whole drive bar below the fold (its last
-#: control at y 927 to 958), and 400 px, the floor the plan allows, shows its pad and its
-#: first rows: a figure lower than 400 px is a deviation to report, not a fix (#443).
+#: The step panel's width and the two figures' height (m5 §17.3, §17.12 D15). The design says
+#: 460 px so that the strip, the step bar, both figures and the drive bar are on a 1280 x 800
+#: window; measured by ``/ui-check``, 460 left the whole drive bar below the fold (#443), and 400
+#: left its last control, the *Drive* toggle, 20 px below the fold once the bar was two columns
+#: and two rows (#475, ``wells-selected``: y 788 to 820 of 800 with the header at 143 px). 360 is
+#: the floor D15 allows, and it is not lowered again: ``test_both_figures_stay_in_the_model_tree_whatever_the_screen``
+#: pins ``>= 360``.
 STEP_PANEL_WIDTH_PX = 400
-FIGURE_HEIGHT_PX = 400
+FIGURE_HEIGHT_PX = 360
+
+#: The height the outcome line keeps while it is empty, in pixels: one line of a text pane.
+#: Measured by ``/ui-check``'s ``header`` figure with and without a text (m5 §17.12 D15).
+_RUN_LINE_PX = 17
+
+#: The drive bar's widgets sit closer than Panel's default margin (5 px above, 10 px on each side):
+#: two columns of them are 440 px at most (the image column at 1280 px), and with the default
+#: the *Z step* select ran past the window (``/ui-check``, #475).
+_DRIVE_MARGIN = (3, 4)
 
 #: How many centre rows the Plate screen builds (m5 §17.4.2): the suggestion is three wells,
 #: and a capture past them is text, never a widget built later (D5).
@@ -336,6 +363,20 @@ def status_line(status: PageStatus) -> str:
     return " | ".join(parts)
 
 
+def _a_connection_failed(outcome: str, stand: str) -> bool:
+    """Whether the activity that ended last was a connect or a disconnect that did not succeed (m5 §17.12 D15).
+
+    The controller's outcomes begin ``connect:`` and ``disconnect:``; a success says
+    ``<stand> connected`` or ``<stand> released``. The outcome stays until another activity
+    starts, so the line goes with the next one.
+    """
+    if outcome.startswith("connect:"):
+        return f"connect: {stand} connected" not in outcome
+    if outcome.startswith("disconnect:"):
+        return f"disconnect: {stand} released" not in outcome
+    return False
+
+
 def run_text(status: PageStatus) -> str:
     """The run: its progress as ``done/total message``, its outcome and what the last stop did."""
     lines: list[str] = []
@@ -468,6 +509,24 @@ def _default_step(options: dict[str, float], preferred: float) -> float:
     return preferred if preferred in values else max(values)
 
 
+def _outline(well: WellView) -> tuple[float, float, float, float]:
+    """The box a well occupies on the map, ``(x0, y0, x1, y1)`` in stage µm, for the frame (m5 §17.12 D16).
+
+    A square well is turned with the plate, so its box is the turned rectangle's; a round one
+    has the same box whatever the turn.
+    """
+    x_um, y_um = well.center_um
+    width_um, height_um = well.size_um
+    if well.circular:
+        half_x, half_y = width_um / 2.0, height_um / 2.0
+    else:
+        angle = math.radians(well.rotation_deg)
+        cos, sin = abs(math.cos(angle)), abs(math.sin(angle))
+        half_x = (width_um * cos + height_um * sin) / 2.0
+        half_y = (width_um * sin + height_um * cos) / 2.0
+    return (x_um - half_x, y_um - half_y, x_um + half_x, y_um + half_y)
+
+
 def _tip(well: WellView, label: str | None) -> str:
     """What a hover says of a well: its name, and the counts and density when there are some."""
     if well.counts is None:
@@ -483,26 +542,22 @@ def _tip(well: WellView, label: str | None) -> str:
     return f"{well.well} — " + ", ".join(found)
 
 
-#: What the drive's answer starts with while it goes to a well and when it arrived
-#: (``PageStatus.goto``: ``GOTO_ESTIMATED``'s and the controller's ``going to <well>``, then the
-#: run's own ``goto-well done in ...``): the Plate screen's rows draw anything else (a
-#: refusal, a failed or stopped run) in the warning colour, and these in the plain one.
-_GOTO_PLAIN_PREFIXES = ("going to", "goto-well done")
-
-
 @dataclass(frozen=True, slots=True)
 class _CentreSlot:
     """One of the Plate screen's three centre rows: built once, rewritten by ``refresh()`` (m5 §17.2 D5).
 
     ``text`` is the row's sentence, ``goto_button`` and ``capture_button`` its two actions,
-    ``note`` why *Go to* is disabled and what the last drive to this row came to, and ``box``
-    the column that holds them, hidden when the plate has no such row.
+    ``note`` what the last drive to this well came to (``goto_row_text``) and ``capture_note``
+    a note on its capture, in the warning colour: a reason common to every row is not here but
+    in the one note above the rows (m5 §17.12 D19). ``box`` is the column that holds them,
+    hidden when the plate has no such row.
     """
 
     text: Any
     goto_button: Any
     capture_button: Any
     note: Any
+    capture_note: Any
     box: Any
 
 
@@ -548,6 +603,10 @@ class PlatePageView:
         # The number of the frame this session last drew, and the stand's name the
         # tick last read (a result card names a profile only when it is another).
         self._seen_frame: int | None = None
+        # What the frame last drawn says of its light (``frame_hint``): dark, saturated or
+        # nothing, computed when the frame's number changes and drawn beside *Snap* and *Live*.
+        self._frame_hint = ""
+        self._camera_lacks: str | None = None
         self._stand: str | None = None
         # The cross has two writers (m5 §15 D1): the tick, from the stand's status once a
         # second, and the frame tick, from each Live frame ten times a second. The flag
@@ -580,12 +639,16 @@ class PlatePageView:
         self._preset_armed: tuple[str] | None = None
         # The Plate screen (m5 §17.4.2): the centre rows and the registration the last
         # redraw drew. A button runs what was drawn, never what would be computed at the
-        # click (#287, FM-177), and ``_goto_row`` is the row *this tab* last sent to a well,
-        # so that the drive's answer is drawn on the row that started it.
+        # click (#287, FM-177). The drive's answer is the controller's, on the row of the well
+        # it names (``PageStatus.goto_answer``), so every tab draws the same (FM-151).
         self._rows_drawn: tuple[CentreRow, ...] = ()
         self._register_drawn: tuple[tuple[str, ...], str | None] = ((), None)
-        self._goto_row: int | None = None
-        self._goto_basis: tuple[Any, ...] | None = None
+        # The drive's answer this view last drew, and the state it was first seen in: an answer
+        # is about the plate, the centres and the registration it was sent in, and this view
+        # stops drawing it when one of them changes (``_goto_state``). Per view: another tab
+        # sees the same answer from the controller, and judges it by its own redraws.
+        self._answer_seen: GotoAnswer | None = None
+        self._answer_basis: tuple[Any, ...] | None = None
         # The Wells and Scan screens (m5 §17.10): the last status the tick read, for the
         # texts ``refresh()`` redraws (it never reads the stand, #333), and how many of the
         # plan's fields the map shows as imaged *from the progress*: ``None`` while it shows
@@ -627,6 +690,9 @@ class PlatePageView:
         # ``x``, ``y`` and ``text`` are always set together and of one length: a LabelSet
         # over columns of different lengths raises in Bokeh, and the map stops redrawing.
         self.stage_source = ColumnDataSource({"x": [], "y": [], "text": []})
+        # The map's frame (m5 §17.12 D16): two points, the corners of the box the map shows.
+        self.frame_source = ColumnDataSource({"x": [], "y": []})
+        self._frame_drawn: tuple[tuple[float, float], tuple[float, float]] | None = None
         # The usable scan plan's fields, one rectangle each (m5 §14.2).
         self.fields_source = ColumnDataSource({"x": [], "y": [], "w": [], "h": []})
         # The plan's fields a scan has a frame for, drawn over them in green (m5 §17.10.2).
@@ -643,6 +709,20 @@ class PlatePageView:
             tools="pan,wheel_zoom,box_zoom,reset,save",
             active_scroll="wheel_zoom",
         )
+        # The frame: an invisible glyph at the two corners of the box the map shows, and the
+        # only renderer the two ranges follow (D16). A view sets its two points and the map
+        # reframes, keeping ``match_aspect``; changing a range's ``renderers`` after the page
+        # is drawn does not reframe (measured on Panel 1.10.0 / Bokeh 3.10.2), so they are set
+        # **once, here**, and what moves is the source's data. It is the map's own and in
+        # no hover's list (``self.hover.renderers`` names the wells only, FM-174). No padding:
+        # the frame already holds a pitch of margin on each side.
+        self.frame_renderer = self.figure.scatter(
+            "x", "y", source=self.frame_source, size=1, alpha=0.0
+        )
+        self.figure.x_range.renderers = [self.frame_renderer]
+        self.figure.y_range.renderers = [self.frame_renderer]
+        self.figure.x_range.range_padding = 0.0
+        self.figure.y_range.range_padding = 0.0
         # Stage positions are whole micrometres up to a few hundred thousand: plain labels
         # (-60000), never ``4.000e+4``, which Bokeh picks as soon as one tick reaches 1e5
         # and which, in a 440 px map, ran the labels of the x axis into one another
@@ -666,18 +746,19 @@ class PlatePageView:
         # source's ``x``, ``y`` and ``text`` set together, as the cross's. A1 is drawn on
         # every plate, bold: the one name the operator checks against the plate, which
         # the names above leave out past ``NAMES_UP_TO_WELLS``.
-        self.side_source = ColumnDataSource({"x": [], "y": [], "text": []})
-        # An invisible glyph at each side label: the map's auto range spans renderers,
-        # never annotations, and a label half a pitch beyond the top row was drawn off
-        # the canvas (seen by /ui-check, #422).
-        self.figure.scatter(
-            "x", "y", source=self.side_source, size=1, alpha=0.0
-        ).level = "underlay"
+        self.side_source = ColumnDataSource({"x": [], "y": [], "text": [], "angle": []})
+        # The labels sit half a pitch outside the wells, inside the frame (which holds a pitch
+        # of margin, D16), so no glyph is needed for the range to take them in: a label alone
+        # beyond the top row was drawn off the canvas under the auto range (#422). The left
+        # and the right one are turned 90° along the plate's sides, which is where a long word
+        # fits (``operator's left`` was clipped, the owner's walk).
         self.figure.add_layout(
             LabelSet(
                 x="x",
                 y="y",
                 text="text",
+                angle="angle",
+                angle_units="deg",
                 source=self.side_source,
                 text_align="center",
                 text_baseline="middle",
@@ -744,23 +825,24 @@ class PlatePageView:
             color="#000000",
         )
         # The well the cross is over, beside it: on a white ground, so that it reads over
-        # the wells' fill and the names (m5 §15 D5).
-        self.figure.add_layout(
-            LabelSet(
-                x="x",
-                y="y",
-                text="text",
-                source=self.stage_source,
-                x_offset=12,
-                y_offset=12,
-                text_align="left",
-                text_baseline="bottom",
-                text_font_size="11px",
-                text_font_style="bold",
-                background_fill_color="#ffffff",
-                background_fill_alpha=0.7,
-            )
+        # the wells' fill and the names (m5 §15 D5). The ground is whiter than it was (0.8), and
+        # the label is drawn **away from the frame's nearer edge** (``_draw_cross``): beside the
+        # right edge it ran off the map (``over A12`` was cut, the owner's walk, D16).
+        self.cross_label = LabelSet(
+            x="x",
+            y="y",
+            text="text",
+            source=self.stage_source,
+            x_offset=12,
+            y_offset=12,
+            text_align="left",
+            text_baseline="bottom",
+            text_font_size="11px",
+            text_font_style="bold",
+            background_fill_color="#ffffff",
+            background_fill_alpha=0.8,
         )
+        self.figure.add_layout(self.cross_label)
         self.figure.on_event(Tap, self._handler(self.on_tap))
         # The map's title says how far the wells can be trusted (registered, estimated,
         # unplaced: m5 §15 D4) and the plan's size, in a sentence a figure's own title
@@ -810,7 +892,12 @@ class PlatePageView:
         # with the four buttons, which keep their width.
         self.status_text = _wrapped_text(width=None)
         self.status_text.sizing_mode = "stretch_width"
+        # The one outcome line that always takes its height, empty or not: an outcome that
+        # comes and goes pushed the page down and up by a line each time (the owner's walk,
+        # #431 finding 11; m5 §17.12 D15). A second line (a stop note) grows it.
         self.run_text = self._outcome_line()
+        self.run_text.visible = True
+        self.run_text.min_height = _RUN_LINE_PX
         self.drive_text = pn.pane.Str(
             DRIVE_TEXT, styles={"color": _WARNING}, visible=False
         )
@@ -862,7 +949,11 @@ class PlatePageView:
             label="Density of", options=[], value=None
         )
         self.drive_toggle = pn.widgets.Toggle(
-            label="Drive (next click moves the stage)", value=False
+            label="Drive (click moves the stage)",
+            value=False,
+            width=210,
+            margin=_DRIVE_MARGIN,
+            align="end",
         )
         # What the last drive to a well came to, beside the toggle the operator pressed
         # (m3 §5.5 D7, #431 finding 4): a refusal, what it goes to, then the run's end.
@@ -872,6 +963,8 @@ class PlatePageView:
             label="Drive to (wall as on the image)",
             options=list(_SIDES),
             value="centre",
+            width=200,
+            margin=_DRIVE_MARGIN,
         )
         self.select_input = pn.widgets.TextInput(
             label="Wells", placeholder="A1:D6, C*, all"
@@ -911,7 +1004,6 @@ class PlatePageView:
         # Every handler goes through `_handler` (the document lock, a failure is a line).
         for pane in (
             self.connection_text,
-            self.run_text,
             self.message,
             self.problems_text,
             self.goto_text,
@@ -1010,15 +1102,17 @@ class PlatePageView:
             options=xy_steps,
             value=_default_step(xy_steps, _XY_DEFAULT_UM),
             width=110,
+            margin=_DRIVE_MARGIN,
         )
         self.z_step_select = pn.widgets.Select(
             label="Z step",
             options=z_steps,
             value=_default_step(z_steps, _Z_DEFAULT_UM),
-            width=110,
+            width=90,
+            margin=_DRIVE_MARGIN,
         )
         self.jog_buttons = {
-            direction: pn.widgets.Button(label=label, width=50)
+            direction: pn.widgets.Button(label=label, width=50, margin=_DRIVE_MARGIN)
             for direction, label in (
                 ("up", "↑"),
                 ("left", "←"),
@@ -1027,12 +1121,18 @@ class PlatePageView:
             )
         }
         self.z_buttons = {
-            "up": pn.widgets.Button(label="Z +", width=60),
+            "up": pn.widgets.Button(label="Z +", width=50, margin=_DRIVE_MARGIN),
             # A minus sign, as wide as the plus: a hyphen reads as a dash.
-            "down": pn.widgets.Button(label="Z \N{MINUS SIGN}", width=60),
+            "down": pn.widgets.Button(
+                label="Z \N{MINUS SIGN}", width=50, margin=_DRIVE_MARGIN
+            ),
         }
-        self.autofocus_on_button = pn.widgets.Button(label="Autofocus on")
-        self.autofocus_off_button = pn.widgets.Button(label="Autofocus off")
+        self.autofocus_on_button = pn.widgets.Button(
+            label="Autofocus on", margin=_DRIVE_MARGIN
+        )
+        self.autofocus_off_button = pn.widgets.Button(
+            label="Autofocus off", margin=_DRIVE_MARGIN
+        )
         # Built once per session, while the stand may be closed: the tick reads the
         # labels again when the connection it sees changes (m5 §7.3).
         self._seen_connected = page.connected
@@ -1041,8 +1141,11 @@ class PlatePageView:
             label="Objective",
             options={label or NO_LABEL: label for label in self._objective_labels},
             width=220,
+            margin=_DRIVE_MARGIN,
         )
-        self.objective_button = pn.widgets.Button(label="Change objective")
+        self.objective_button = pn.widgets.Button(
+            label="Change objective", margin=_DRIVE_MARGIN, align="end"
+        )
         self.objective_confirm_text = pn.pane.Str(
             "", styles={"color": _WARNING, "white-space": "pre-wrap"}, width=380
         )
@@ -1057,8 +1160,10 @@ class PlatePageView:
             ),
             visible=False,
         )
-        self.light_on_button = pn.widgets.Button(label="Light on")
-        self.light_off_button = pn.widgets.Button(label="Light off")
+        self.light_on_button = pn.widgets.Button(label="Light on", margin=_DRIVE_MARGIN)
+        self.light_off_button = pn.widgets.Button(
+            label="Light off", margin=_DRIVE_MARGIN
+        )
         self.drive_note = pn.pane.Str(
             "", styles={"color": _WARNING, "white-space": "pre-wrap"}, width=380
         )
@@ -1207,6 +1312,10 @@ class PlatePageView:
         # The Plate screen: where the plate comes from, three centre rows built once, the
         # captures past three as text, one *Register the plate* and what it came to.
         self.plate_from_text = _wrapped_text()
+        # What holds for every row, said once above them (m5 §17.12 D19): a drive that goes, Live,
+        # and what *Register the plate* uses while nothing is captured.
+        self.rows_note = _wrapped_text()
+        self.rows_note.visible = False
         self.centre_slots = [self._centre_slot(i) for i in range(_CENTRE_SLOTS)]
         self.other_captures = _wrapped_text()
         self.other_captures.visible = False
@@ -1258,6 +1367,10 @@ class PlatePageView:
         self.wells_from_text = _wrapped_text()
         self.coverage_from_text = _wrapped_text()
         self.autofocus_from_text = _wrapped_text()
+        # What each of the two fields is, in plain words, above it (m5 §17.12 D20): the fields
+        # are the tools' own and keep their names in the expert view.
+        self.coverage_words = _wrapped_text(COVERAGE_WORDS)
+        self.autofocus_words = _wrapped_text(AUTOFOCUS_WORDS)
         self.layout_button = pn.widgets.Button(
             label="Lay out the fields", color="primary"
         )
@@ -1380,7 +1493,12 @@ class PlatePageView:
                 box,
             )
         self.files_heading = _wrapped_text(FILES_HEADING, {"font-weight": "bold"})
-        self.files_text = _wrapped_text(NO_FILES_YET)
+        # The one HTML pane of the page (m5 §17.12 D21): links to the files the run document
+        # names, through the server's ``/run-files/`` route. ``files_html`` escapes every text
+        # in it, and no other text of the page becomes markup (FM-139).
+        self.files_text = pn.pane.HTML(
+            f"<div>{NO_FILES_YET}</div>", width=_TEXT_WIDTH, margin=(5, 10)
+        )
 
     def _centre_slot(self, index: int) -> _CentreSlot:
         """One centre row's widgets: its sentence, *Go to*, *Capture the centre of* (or *Redo*) and its note (m5 §17.4.2)."""
@@ -1388,10 +1506,15 @@ class PlatePageView:
         goto_button = pn.widgets.Button(label="Go to")
         capture_button = pn.widgets.Button(label="Capture the centre")
         note = _wrapped_text()
+        note.visible = False
+        far = _wrapped_text(extra={"color": _WARNING})
+        far.visible = False
         goto_button.on_click(self._handler(lambda event: self.on_goto_row(index)))
         capture_button.on_click(self._handler(lambda event: self.on_capture_row(index)))
-        box = pn.Column(text, pn.Row(goto_button, capture_button), note, visible=False)
-        return _CentreSlot(text, goto_button, capture_button, note, box)
+        box = pn.Column(
+            text, pn.Row(goto_button, capture_button), note, far, visible=False
+        )
+        return _CentreSlot(text, goto_button, capture_button, note, far, box)
 
     def _drive_bar(self) -> Any:
         """ADR-0006's *Drive*, under the image where Live is watched (m5 §17.3): a bar that wraps.
@@ -1408,23 +1531,26 @@ class PlatePageView:
             pn.Row(pn.Spacer(width=60), jog["up"]),
             pn.Row(jog["left"], jog["down"], jog["right"]),
         )
-        # Each group is narrower than the image column (440 px at 1280): a group wider
-        # than the column is not wrapped, it runs past the window (the *Drive to* select
-        # and the toggle together did, ``/ui-check``, #443), so the two are separate
-        # items. The groups that fit side by side share a line.
-        return pn.FlexBox(
-            pn.Row(pad, self.xy_step_select),
-            self.drive_image_note,
+        # Two columns and two rows (m5 §17.12 D15): the pad and its step on the left; the
+        # focus, the autofocus and the light on the right; then the objective on one row
+        # and the drive on another, with the notes under them. The old flex box wrapped
+        # nine groups into five lines and needed a scroll in every state (#452). Each
+        # row is narrower than the image column (440 px at 1280): a group wider than the
+        # column is not wrapped, it runs past the window (``/ui-check``, #443).
+        pad_column = pn.Column(pad, self.xy_step_select)
+        focus_column = pn.Column(
             pn.Row(self.z_buttons["up"], self.z_buttons["down"], self.z_step_select),
             pn.Row(self.autofocus_on_button, self.autofocus_off_button),
             pn.Row(self.light_on_button, self.light_off_button),
+        )
+        return pn.Column(
+            pn.Row(pad_column, focus_column),
             pn.Row(self.objective_select, self.objective_button),
             self.objective_confirm,
-            self.side_select,
-            self.drive_toggle,
+            pn.Row(self.side_select, self.drive_toggle),
             self.goto_text,
+            self.drive_image_note,
             self.drive_note,
-            flex_wrap="wrap",
             sizing_mode="stretch_width",
         )
 
@@ -1614,13 +1740,15 @@ class PlatePageView:
             ],
             "plate": [
                 plate_controls,
+                self.rows_note,
                 *(slot.box for slot in self.centre_slots),
                 self.other_captures,
                 self.register_button,
                 self.register_wait,
-                self.register_replaces,
                 self.register_card,
                 self.registered_block,
+                # Under the result line it follows (the owner's walk, finding 10).
+                self.register_replaces,
                 self.other_ways_text,
             ],
             "wells": self._wells_region(),
@@ -1684,13 +1812,13 @@ class PlatePageView:
         that did not load has no field, and its line is left out with it.
         """
         listed: list[Any] = [self.select_input, self.wells_from_text]
-        for (tool, key), line in (
-            (_COVERAGE_FIELD, self.coverage_from_text),
-            (_AUTOFOCUS_FIELD, self.autofocus_from_text),
+        for (tool, key), words, line in (
+            (_COVERAGE_FIELD, self.coverage_words, self.coverage_from_text),
+            (_AUTOFOCUS_FIELD, self.autofocus_words, self.autofocus_from_text),
         ):
             field = self.tool_fields.get(tool, {}).get(key)
             if field is not None:
-                listed += [field, line]
+                listed += [words, field, line]
         return [
             *listed,
             self.layout_button,
@@ -1750,6 +1878,9 @@ class PlatePageView:
         # position to the server, and setting 0 after its objects changed scrolls it back.
         self.step_panel.scroll_position = 0
         self._style_steps()
+        # The map frames what the screen is about: the plate, or the plan's wells (D16).
+        self._draw_map_frame()
+        self._draw_cross(self._cross_xy)
 
     def _style_steps(self) -> None:
         """The step shown is the primary button, and the class ``/ui-check`` reads it by; none is while the expert view is on."""
@@ -1931,8 +2062,6 @@ class PlatePageView:
         if drive:
             # One click: an armed stage that stays armed after a mis-click is the danger.
             self.drive_toggle.value = False
-            # The drive's answer is now this click's, not the Plate screen row's.
-            self._goto_row = None
         self.refresh()
         self.tick()
 
@@ -1980,6 +2109,22 @@ class PlatePageView:
         self._try(lambda: self.page.run(plugin, params))
         self.tick()
 
+    def _goto_state(self) -> tuple[Any, ...]:
+        """What a drive's answer on a row was about: the plate, the centres and the registered plate.
+
+        An answer (a refusal, ``At A1, the holder's estimate``) is true of the state it was sent
+        in, and is dropped from the row by the redraw that finds another: ``not registered`` must
+        not stay under ``Registered:``, nor a refusal for an unplaced map after a capture placed it.
+        (The controller clears the answer itself when a registration ends or the plate changes:
+        this is the view's rule for the others, the captures.)
+        """
+        view = self._view
+        return (
+            self.page.plate,
+            self.page.refs,
+            None if view is None else view.registered,
+        )
+
     def _row(self, index: int) -> CentreRow | None:
         """The centre row ``index`` as the last redraw drew it, or ``None`` when it has none."""
         rows = self._rows_drawn
@@ -1991,53 +2136,24 @@ class PlatePageView:
         """*Go to <well>* of centre row ``index``: ``PlatePage.goto`` of the well the row named when it was drawn (m5 §17.4.2, D10).
 
         The same call as a drive click, so before a registration it drives to the holder's
-        estimate (#462) and refuses where the layer does. A refusal is drawn on the row that
-        started it, not in the header's line far from the button: on the owner's walk a drive
-        before the plate was registered moved nothing and said nothing (#431). The controller
-        keeps the text (``status().goto``) for every tab, and the tick draws it on the row
-        ``_goto_row`` names. A click on a disabled button still arrives here (FM-169): the
-        refusal is the controller's (a run going, Live included).
-
-        The row is the one **this click** names only when the click is the drive's: a refusal
-        of the click's own (an unplaced map, a plate nothing named) or an accepted drive. A
-        refusal because an activity goes (``RuntimeError``) is the state's, which every row's
-        busy note already says, and it leaves ``_goto_row`` where it was: the controller keeps
-        one text for every tab, and moving the row to the refused click would draw the
-        running drive's ``done`` on a well the stage never visited.
+        estimate (#462) and refuses where the layer does. What it came to is drawn on the row of
+        the well, from the controller's answer (``status().goto_answer``): a refusal beside the
+        button, not in the header's line far from it (on the owner's walk a drive before the
+        plate was registered moved nothing and said nothing, #431). A click on a disabled button
+        still arrives here (FM-169): the refusal is the controller's. A click refused because
+        an activity goes (a drive, Live) is the state's, which the one note above the rows
+        already says, and the controller leaves the running drive's text as it was.
         """
         row = self._row(index)
         if row is None:
             self.message.object = "nothing to go to: press Refresh"
             return
-        well = row.well
-        basis = self._goto_state()
-        try:
-            self.page.goto(well)
-        except RuntimeError:
-            self.message.object = ""
-            self.tick()
-            return
-        except ValueError:
-            # The row says it; the controller also kept it for the drive bar's line.
-            pass
+        # Both refusals are the controller's to say: the busy one by the note above the rows,
+        # a refusal of the click's own by the answer it kept for this well.
+        with contextlib.suppress(RuntimeError, ValueError):
+            self.page.goto(row.well)
         self.message.object = ""
-        self._goto_row = index
-        self._goto_basis = basis
         self.tick()
-
-    def _goto_state(self) -> tuple[Any, ...]:
-        """What the drive's text on a row was about: the plate, the centres and the registered plate.
-
-        A row's drive text (a refusal, ``not registered``) is true of the state it was sent
-        in, and is dropped at the redraw that finds another (``_draw_plate_screen``): the
-        text outlived a registration and said ``not registered`` under ``Registered:``.
-        """
-        view = self._view
-        return (
-            self.page.plate,
-            self.page.refs,
-            None if view is None else view.registered,
-        )
 
     def on_capture_row(self, index: int) -> None:
         """*Capture the centre of <well>* (or *Redo*) of centre row ``index``: the well the row named when it was drawn.
@@ -2525,8 +2641,8 @@ class PlatePageView:
         # tick reads nothing new (FM-145). The status is kept for ``refresh()``, which
         # redraws the same texts from the view it has just read and never reads the stand.
         self._status = status
-        self._draw_wells_screen(status)
-        self._draw_scan_screen(status)
+        self._guarded(self._draw_wells_screen, status)
+        self._guarded(self._draw_scan_screen, status)
         self._draw_results_screen(status)
         self._draw_imaged(status)
         # How many tools of a chain have ended since the last tick (per view, D6): a tool's
@@ -2573,6 +2689,25 @@ class PlatePageView:
             # wells it does not show. Reading five attributes is no view: the view is
             # rebuilt only when one of them changed.
             self.refresh()
+        # The chain's line last: after the rows it is about have been redrawn (D20's note).
+        self._draw_chain_line(status)
+
+    def _guarded(
+        self, draw: Callable[[PageStatus | None], None], status: PageStatus | None
+    ) -> None:
+        """Run one screen's draw so that a raise in it is logged and the tick goes on (m5 §17.12.3, #470).
+
+        ``tick()`` draws the Wells and Scan screens before the strip's text and the buttons: a raise
+        in either skipped them, and the operator was left with a strip that said nothing and a STOP
+        that did not follow the stand. The failure is logged with its traceback (the server's log),
+        never kept, and the screen keeps what it drew last.
+        """
+        try:
+            draw(status)
+        except Exception:
+            log.exception(
+                "%s failed: the screen keeps what it drew last", draw.__name__
+            )
 
     def _follow_connection(self, connected: bool) -> None:
         """The objective's choices of the stand now held, or none: read again when the connection changes.
@@ -2607,31 +2742,35 @@ class PlatePageView:
         self._disarm()
 
     def _draw_connection(self, status: PageStatus) -> None:
-        """The *Connect* row: what the stand's state is, and which of the two buttons applies.
+        """The *Connect* row: which of the two buttons applies, and a line only while a connect or a disconnect goes or after one failed.
 
-        Both are disabled while an activity goes (live included), so that
+        Both buttons are disabled while an activity goes (live included), so that
         Disconnect is never offered under a run; the controller refuses a click
         all the same (FM-169). While ``connect`` or ``disconnect`` is the activity
-        the row says so: on a slow stand it would otherwise read ``Connect opens it``
-        beside a greyed-out button, and the page would look stuck (m5 §7.3, #305).
+        the line says so: on a slow stand it would otherwise read ``Connect opens it``
+        beside a greyed-out button, and the page would look stuck (m5 §7.3, #305). After a
+        connect that failed it says why the controls are disabled; at any other time it is
+        empty and takes no height (m5 §17.12 D15: the line on every screen took 27 px of
+        a 623 px page, and what Disconnect does is said once, on the Stand screen).
         """
         busy = status.running is not None
         self.connect_button.disabled = busy or status.connected
         self.disconnect_button.disabled = busy or not status.connected
+        outcome = status.outcome or ""
         if status.running == "connect":
             text = f"connecting {status.stand}…"
         elif status.running == "disconnect":
             text = f"disconnecting {status.stand}…"
-        elif status.connected:
-            text = (
-                f"Disconnect releases {status.stand} for another program "
-                f"(NIS-Elements, ZEN)"
-            )
-        else:
+        elif not status.connected and _a_connection_failed(outcome, status.stand):
             text = (
                 f"{status.stand} is not connected: Connect opens it, and the "
                 f"controls that need the stand are disabled until then"
             )
+        else:
+            # Neither goes nor failed: the strip says the stand is connected or not, and
+            # what Disconnect does is on the Stand screen (m5 §17.12 D15).
+            self.connection_text.object = ""
+            return
         if status.dry_run:
             text += " (dry run)"
         self.connection_text.object = text
@@ -2674,11 +2813,75 @@ class PlatePageView:
         self._cross_xy = xy_um
         view = self._view
         label = "" if view is None else stage_label(view.wells, view.pose, xy_um)
+        self._align_cross_label(xy_um)
         self.stage_source.data = {
             "x": [] if xy_um is None else [xy_um[0]],
             "y": [] if xy_um is None else [xy_um[1]],
             "text": [] if xy_um is None else [label],
         }
+
+    def _align_cross_label(self, xy_um: tuple[float, float] | None) -> None:
+        """Put the cross's label on the side of the cross that faces the frame's middle (m5 §17.12 D16).
+
+        Beside the right edge the label is drawn to the left of the cross, beside the top edge
+        below it: the label is a single point's, so its alignment is the layer's, set at each
+        draw. Without a frame or a position the defaults stand (up and to the right).
+        """
+        frame = self._frame_drawn
+        if xy_um is None or frame is None:
+            return
+        (x0, x1), (y0, y1) = frame
+        near_right = xy_um[0] > (x0 + x1) / 2.0
+        near_top = xy_um[1] > (y0 + y1) / 2.0
+        self.cross_label.text_align = "right" if near_right else "left"
+        self.cross_label.x_offset = -12 if near_right else 12
+        self.cross_label.text_baseline = "top" if near_top else "bottom"
+        self.cross_label.y_offset = -12 if near_top else 12
+
+    def _frame_outlines(self) -> list[tuple[float, float, float, float]]:
+        """The outlines the map is framed on for the screen shown (m5 §17.12 D16): the plan's wells, or the plate's.
+
+        The Stand and Plate screens and the expert view frame the plate; the Wells, Scan and
+        Results screens frame the wells of the plan the document holds, **even one that is not
+        usable** (an out-of-date plan is still the wells the operator laid out), and the plate when
+        none stands or none of its wells is on this plate. An operator's own zoom is Bokeh's, and
+        stops the range following until the toolbar's *Reset*; nothing here overrides it.
+        """
+        view = self._view
+        if view is None or not view.wells:
+            return []
+        planned = set(view.frame_wells)
+        if planned and not self.expert and self.step in ("wells", "scan", "results"):
+            chosen = [well for well in view.wells if well.well in planned]
+            if chosen:
+                return [_outline(well) for well in chosen]
+        return [_outline(well) for well in view.wells]
+
+    def _draw_map_frame(self) -> None:
+        """Set the frame's two points for the screen shown, when they changed (m5 §17.12 D16).
+
+        Called by every redraw of the wells and by every change of screen, never by the tick (it
+        reads the last view, FM-145). With no outline (no wells drawn) the frame is left as it
+        is: a frame of nothing is no frame. The margin is one pitch of the plate, from ``useq``
+        as the controller's sides use it; a plate with no spacing (a coverslip) falls back to
+        the size of its well.
+        """
+        outlines = self._frame_outlines()
+        view = self._view
+        if view is None or not outlines:
+            return
+        spacing_mm = useq.WellPlate.from_str(view.plate).well_spacing
+        pitch_um = max(spacing_mm) * 1000.0
+        if pitch_um <= 0.0:
+            pitch_um = max(max(abs(o[2] - o[0]), abs(o[3] - o[1])) for o in outlines)
+        frame = map_frame(outlines, pitch_um)
+        if frame == self._frame_drawn:
+            return
+        self._frame_drawn = frame
+        (x0, x1), (y0, y1) = frame
+        self.frame_source.data = {"x": [x0, x1], "y": [y0, y1]}
+        # The label's side depends on where the frame's middle is.
+        self._align_cross_label(self._cross_xy)
 
     def _shared_state(self) -> tuple[Any, ...]:
         """What the controller holds that every tab draws: compared, never rebuilt.
@@ -2721,6 +2924,9 @@ class PlatePageView:
         self.label_select.options = labels
         if self.label_select.value not in labels:
             self.label_select.value = labels[0] if labels else None
+        # The *Density of* menu has nothing to choose before a density exists, and was drawn
+        # empty above the map from the Stand screen on (the owner's walk, D16).
+        self.label_select.visible = bool(labels)
         if self.plate_select.value != view.plate:
             self.plate_select.value = view.plate
         if self.orientation_select.value != view.orientation:
@@ -2785,9 +2991,10 @@ class PlatePageView:
         self._draw_buttons()
         if self._status is not None:
             # Before the first tick there is no status; that tick draws both screens.
-            self._draw_wells_screen(self._status)
-            self._draw_scan_screen(self._status)
+            self._guarded(self._draw_wells_screen, self._status)
+            self._guarded(self._draw_scan_screen, self._status)
             self._draw_results_screen(self._status)
+            self._draw_chain_line(self._status)
         self._draw_drive()
         # The options are read here and after a save, never by the tick (§10.6).
         self._offer_presets()
@@ -2854,6 +3061,12 @@ class PlatePageView:
             return None
         self._seen_frame = frame.number
         self._draw_image(frame)
+        # Once for each new frame, never at a tick: 4.5 ms at 512 x 512 and 16.5 ms at the Prime
+        # 95B's 1200 x 1200, on every other row and column past 1600 x 1600 (m5 §17.12 D22, FM-145).
+        self._frame_hint = frame_hint(frame.image, frame.bit_depth)
+        # ``_camera_lacks`` is the tick's last read: this callback asks the controller for the
+        # frame and nothing else (FM-145), so a camera that is gone is the tick's to say.
+        self.snap_note.object = self._camera_lacks or self._frame_hint
         return frame
 
     def _draw_image(self, frame: Frame) -> None:
@@ -2904,6 +3117,7 @@ class PlatePageView:
             "x": [side.x_um for side in view.sides],
             "y": [side.y_um for side in view.sides],
             "text": [side.text for side in view.sides],
+            "angle": [side.angle_deg for side in view.sides],
         }
         a1 = [w for w in view.wells if w.well == "A1"]
         self.a1_source.data = {
@@ -2917,6 +3131,8 @@ class PlatePageView:
         title = map_title(view.plate, view.pose) + plan_title(view.plan)
         self.figure.title.text = title
         self.map_title_text.object = title
+        # The frame before the cross: the label's side is the frame's (D16).
+        self._draw_map_frame()
         # The cross's label names a well of *this* view: a registration that moved the wells
         # relabels it now, from the position last drawn, and reads nothing (FM-145).
         self._draw_cross(self._cross_xy)
@@ -2988,7 +3204,8 @@ class PlatePageView:
         self.live_button.disabled = lacks is not None or (
             running is not None and not live
         )
-        self.snap_note.object = lacks or ""
+        self._camera_lacks = lacks
+        self.snap_note.object = lacks or self._frame_hint
         # A turn on a registered plate is a run (m5 §16 D4): offered when one can start,
         # so not while Live goes either, as every Run. On an estimate it runs nothing and
         # stays offered beside Live. The controller refuses a run all the same when the
@@ -3041,7 +3258,10 @@ class PlatePageView:
         calibration = None if view is None else view.camera_calibration
         objective = status.objective or None
         self.known_block.object = known_text(
-            objective=objective, calibration=calibration, light_on=status.light_on
+            objective=objective,
+            calibration=calibration,
+            light_on=status.light_on,
+            stand=status.stand if status.connected else None,
         )
         self.calibrate_box.visible = "camera-calibration" in self.tool_runs and (
             needs_calibration(objective, calibration)
@@ -3060,10 +3280,6 @@ class PlatePageView:
         """
         page = self.page
         view = self._view
-        # A row's drive text is about the state it was sent in: another plate, another
-        # centre or a plate registered since makes it history (``_goto_state``).
-        if self._goto_row is not None and self._goto_state() != self._goto_basis:
-            self._goto_row = None
         self.plate_from_text.object = plate_from_line(
             plate=page.plate,
             chosen=page.plate_chosen,
@@ -3088,6 +3304,7 @@ class PlatePageView:
             slot.capture_button.label = (
                 "Redo" if row.captured else f"Capture the centre of {row.well}"
             )
+            self._say(slot.capture_note, self._capture_note_of(row, view))
         others = rows[len(self.centre_slots) :]
         self.other_captures.object = (
             "\n".join(["Other captures:", *(row.text for row in others)])
@@ -3110,6 +3327,27 @@ class PlatePageView:
             self.register_replaces,
             "" if registered is None else register_replace_note(registered),
         )
+
+    def _capture_note_of(self, row: CentreRow, view: PlateView | None) -> str:
+        """The note under a captured row that is far from its well or on another's place, else ``""`` (m5 §17.12.3).
+
+        The expected place is the centre the map draws for that well in the pose drawn
+        (registered, seed or estimated), and none on an *unplaced* map, which puts no well
+        anywhere: then only two captures at one place can be said. The pitch is the plate's,
+        from ``useq``, as the map and the frame use it. A capture the controller no longer
+        holds (another tab forgot it) has no note.
+        """
+        if not row.captured or view is None:
+            return ""
+        held = {ref.well: (ref.x_um, ref.y_um) for ref in self.page.refs}
+        place = held.get(row.well)
+        if place is None:
+            return ""
+        centres = {well.well: well.center_um for well in view.wells}
+        expected = None if view.pose.kind == "unplaced" else centres.get(row.well)
+        pitch_um = max(useq.WellPlate.from_str(view.plate).well_spacing) * 1000.0
+        others = {well: xy for well, xy in held.items() if well != row.well}
+        return capture_note(row.well, place, expected, pitch_um, others)
 
     def _draw_commands(self) -> None:
         """The *Command* disclosures of the Stand and Plate screens: the call each button makes (ADR-0006, principle 5, D8).
@@ -3152,15 +3390,17 @@ class PlatePageView:
         """Which buttons of the Stand and Plate screens are disabled, and the reason beside each (m5 §11.2, §17.2 D11, §17.4).
 
         Drawn at every tick and every redraw. *Go to* is disabled while any activity goes,
-        Live included, and says ``GOTO_NOT_DURING_LIVE`` or what is running; the capture
-        stays enabled while Live runs, since the operator centres in Live and captures
-        there (D11). A row's note also holds what the last drive sent from that row came to
-        (``_goto_row``): a refusal or a run that did not end ``done`` in the warning colour,
-        and what it is going to, or arrived at, in the plain one. *Register the plate* is
-        disabled while a wait is drawn, with the wait beside it, or the tool's own reason (the
-        next step's precedence: what the run document or the stand says first wins, and
-        ``CAPTURE_WELLS`` is only this wait: before any capture nothing is in the warning
-        colour). The controller refuses every one of these calls itself (FM-169).
+        Live included; the capture stays enabled while Live runs, since the operator centres
+        in Live and captures there (D11). **What holds for every row is said once**, in the note
+        above them (``plate_rows_note``: what runs, or that Live has to end first, and what
+        *Register the plate* uses while nothing is captured, m5 §17.12 D19, D23); a row says only
+        what the last drive to its well came to (``goto_row_text``, a refusal or a failure in the
+        warning colour, going and arrived in the plain one). *Register the plate* is disabled
+        while a wait is drawn, with the wait beside it: the tool's own reason (the next step's
+        precedence: what the run document or the stand says first wins, and ``CAPTURE_WELLS`` is
+        only this wait: before any capture nothing is in the warning colour), or the refusal that
+        a turn of the turret since the captures would meet (``register_refusal``, D13). The
+        controller refuses every one of these calls itself (FM-169).
         """
         page = self.page
         running = self._running
@@ -3171,30 +3411,42 @@ class PlatePageView:
         self.calibrate_button.disabled = running is not None or blocked is not None
         self._say(self.calibrate_note, blocked or busy or "")
         stage_off = not connected or (running is not None and not live)
-        sent = self.goto_text.object
-        for index, slot in enumerate(self.centre_slots):
+        self._say(
+            self.rows_note,
+            plate_rows_note(
+                running=running, live=live, from_sample=page.registers_from_sample
+            ),
+        )
+        status = self._status
+        answer = None if status is None else status.goto_answer
+        if answer is not self._answer_seen:
+            self._answer_seen, self._answer_basis = answer, self._goto_state()
+        elif answer is not None and self._goto_state() != self._answer_basis:
+            answer = None
+        trouble = answer is not None and answer.phase in ("refused", "failed")
+        for slot, row in zip(self.centre_slots, self._rows_drawn, strict=False):
             slot.goto_button.disabled = not connected or running is not None
             slot.capture_button.disabled = stage_off
-            lines: list[str] = []
-            if live:
-                lines.append(GOTO_NOT_DURING_LIVE)
-            elif busy is not None:
-                lines.append(busy)
-            drive = sent if self._goto_row == index and sent else ""
-            if drive:
-                lines.append(drive)
-            self._say(slot.note, "\n".join(lines))
-            trouble = bool(drive) and not drive.startswith(_GOTO_PLAIN_PREFIXES)
+            self._say(slot.note, goto_row_text(answer, row.well))
             slot.note.styles = {
                 **_WRAP_STYLES,
-                **({"color": _WARNING} if trouble else {}),
+                **({"color": _WARNING} if trouble and answer.well == row.well else {}),  # type: ignore[union-attr]
             }
+        for slot in self.centre_slots[len(self._rows_drawn) :]:
+            slot.goto_button.disabled = not connected or running is not None
+            slot.capture_button.disabled = stage_off
+            self._say(slot.note, "")
         _pairs, wait = self._register_drawn
-        reason = self._blocked.get("plate-registration") or wait
+        view = self._view
+        reason = (
+            self._blocked.get("plate-registration")
+            or wait
+            or (None if view is None else view.register_refusal)
+        )
         if "plate-registration" not in self.tool_runs:
             reason = "plate-registration did not load: the problems line says why"
         self.register_button.disabled = running is not None or reason is not None
-        self._say(self.register_wait, reason or busy or "")
+        self._say(self.register_wait, reason or "")
 
     def _field_line(self, field: tuple[str, str]) -> str:
         """The line under one of the Wells screen's two tool fields: where its value comes from (m5 §17.2 D7, §17.10.3).
@@ -3484,10 +3736,21 @@ class PlatePageView:
         self._results_left = tuple(
             tool for tool in results_left(checklist) if tool in self.tool_runs
         )
-        self._say(self.chain_text, chain_line(None if status is None else status.chain))
-        self.files_text.object = "\n".join(files_lines(cards)) or NO_FILES_YET
+        # The chain's line is not drawn here: a tool of the chain that ended is also a new
+        # row, and the line is drawn after the rows' redraw, in the same tick (``_draw_chain_line``).
+        self.files_text.object = files_html(cards, self.page.run_doc.parent)
         self._draw_result_lines()
         self._draw_results_buttons()
+
+    def _draw_chain_line(self, status: PageStatus | None) -> None:
+        """The chain's line under *Run all that are left*, drawn **after** the rows it is about (m5 §17.12.3, #446's Report).
+
+        A tool of a chain that ended changes the run document with no activity ending, and the tick
+        reads the rows again for it (``refresh()``); the line is the status's, so drawn before
+        that it said ``Running Route (3 of 5)`` over a density row that still said ``Ready``. It is
+        called last by the tick and by ``refresh()``.
+        """
+        self._say(self.chain_text, chain_line(None if status is None else status.chain))
 
     def _draw_results_buttons(self) -> None:
         """Which of *Run all that are left* and the five rows' buttons is disabled, and the reason beside each (m5 §11.2, §17.11.2).
@@ -3509,7 +3772,9 @@ class PlatePageView:
             widgets.button.disabled = (
                 running is not None or bool(reason) or row is None or row.missing
             )
-            self._say(widgets.wait, reason or busy or "")
+            # A row's own reason only: what runs holds for every row, and is said once, under
+            # *Run all that are left* (m5 §17.12 D19).
+            self._say(widgets.wait, reason)
         wait = (
             "the results tools did not load: the problems line says why"
             if not any(tool in self.tool_runs for tool in RESULT_TOOLS)
@@ -3634,6 +3899,11 @@ class PlatePageView:
                 widget.disabled = busy or reasons[name] is not None
         self.xy_step_select.disabled = reasons["pad"] is not None
         self.z_step_select.disabled = reasons["focus"] is not None
+        # *Drive* arms the next click on a well, which runs `goto-well` on the stand: with the
+        # stand closed there is nothing to arm (the owner's walk, finding 14).
+        self.drive_toggle.disabled = not page.connected
+        if not page.connected and self.drive_toggle.value:
+            self.drive_toggle.value = False
         self.objective_select.disabled = reasons["objective"] is not None
         if busy or reasons["objective"] is not None:
             self._disarm()
@@ -3657,6 +3927,45 @@ def build(page: PlatePage) -> Any:
     pn.state.add_periodic_callback(view.tick, period=TICK_MS)
     pn.state.add_periodic_callback(view.frame_tick, period=FRAME_TICK_MS)
     return view.layout
+
+
+class RunFileHandler(tornado.web.RequestHandler):
+    """``GET /run-files/<path>``: a file the run document names, and nothing else (m5 §17.12 D21).
+
+    *Where the files are* links the report and the export to this route so that they open from
+    the page. The route is the page's own and serves what ``PlatePage.run_file`` finds: the
+    files a usable result of the run document lists, inside its folder, read at each request;
+    **404** for anything else (a sibling, a parent, an absolute path, a folder, a file that is
+    gone). It never lists a directory. The bytes are read in binary (``Path.read_bytes``), so no
+    encoding is guessed, and the type is ``mimetypes``' for the name (``text/html`` for the
+    report, ``application/xml`` for the export, ``application/json``), ``application/octet-stream``
+    for one it does not know; a ``text/`` type says UTF-8, which is what the layer writes
+    (CLAUDE.md). A file name is data: the path is never echoed into a page.
+    """
+
+    page: PlatePage
+
+    def initialize(self, page: PlatePage) -> None:
+        """Tornado's constructor hook: the page whose run document is served."""
+        self.page = page
+
+    def get(self, relative: str) -> None:
+        """Answer with the file ``relative`` names, or 404 (see the class)."""
+        path = self.page.run_file(relative)
+        if path is None:
+            raise tornado.web.HTTPError(404)
+        try:
+            body = path.read_bytes()
+        except OSError:
+            # A file the document names that cannot be read now (gone since the check, locked).
+            raise tornado.web.HTTPError(404) from None
+        kind = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        if kind.startswith("text/"):
+            kind += "; charset=utf-8"
+        self.set_header("Content-Type", kind)
+        # The bytes are shown as the type says, never sniffed into another (an export is not HTML).
+        self.set_header("X-Content-Type-Options", "nosniff")
+        self.write(body)
 
 
 def serve(page: PlatePage, *, port: int) -> None:
@@ -3696,6 +4005,10 @@ def serve(page: PlatePage, *, port: int) -> None:
             show=False,
             threaded=True,
             verbose=False,
+            # The files of the run document open from the page (m5 §17.12 D21): one route, an
+            # allowlist the controller computes at each request. ``static_dirs`` would refuse a
+            # folder that does not exist yet and serve the whole run folder.
+            extra_patterns=[(r"/run-files/(.*)", RunFileHandler, {"page": page})],
         )
         # Panel's thread is not a daemon: whatever ends this block, it is stopped, or
         # the process waits for it at exit.

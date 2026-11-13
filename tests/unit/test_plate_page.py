@@ -81,7 +81,13 @@ from smc.ui.guide import (
     walls_centres_problem,
     walls_square_wells,
 )
-from smc.ui.plate_page import PlatePageView, build, card_text, serve
+from smc.ui.plate_page import (
+    PlatePageView,
+    RunFileHandler,
+    build,
+    card_text,
+    serve,
+)
 
 pytestmark = [
     pytest.mark.filterwarnings(
@@ -1450,9 +1456,13 @@ def test_a_drive_taps_answer_is_drawn_beside_the_toggle(
     other = PlatePageView(page)
     other.tick()
     assert other.goto_text.object == answer
-    # Beside the toggle: the next item of the drive bar.
+    # Under the row that holds the toggle: the next item of the drive bar.
     items = list(view._drive_bar().objects)
-    at = next(i for i, item in enumerate(items) if item is view.drive_toggle)
+    at = next(
+        i
+        for i, item in enumerate(items)
+        if view.drive_toggle in getattr(item, "objects", ())
+    )
     assert items[at + 1] is view.goto_text
 
 
@@ -3166,6 +3176,8 @@ def test_serve_returns_on_ctrl_c_and_stops_the_server(
             "show": False,
             "threaded": True,
             "verbose": False,
+            # The one route the page adds: the files of the run document (m5 §17.12 D21).
+            "extra_patterns": [(r"/run-files/(.*)", RunFileHandler, {"page": page})],
         }
     ]
     assert said == [

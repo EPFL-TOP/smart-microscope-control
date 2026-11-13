@@ -47,7 +47,6 @@ CLOSED_TEXT = (
     "demo is not connected: Connect opens it, and the controls that need the "
     "stand are disabled until then"
 )
-CONNECTED_TEXT = "Disconnect releases demo for another program (NIS-Elements, ZEN)"
 
 
 class NoParams(PluginParams):
@@ -163,7 +162,10 @@ def test_a_closed_stand_disables_what_needs_it_and_says_why_once(
     view = PlatePageView(page)
     assert not view.connect_button.disabled
     assert view.disconnect_button.disabled
-    assert view.connection_text.object == CLOSED_TEXT
+    # A stand that was never opened says it in the strip and on every control's note: the
+    # line under the strip is for a connect that goes or failed (m5 §17.12 D15).
+    assert view.connection_text.object == ""
+    assert not view.connection_text.visible
     assert view.capture_centre_button.disabled
     assert view.capture_wall_button.disabled
     assert view.snap_button.disabled
@@ -179,9 +181,12 @@ def test_a_dry_run_page_says_so_on_its_connect_row(
 ) -> None:
     page = _page(tmp_path / "run.json", opened, dry_run=True)
     view = PlatePageView(page)
-    assert view.connection_text.object == f"{CLOSED_TEXT} (dry run)"
+    # The strip says DRY RUN, closed or open; the connection line has nothing to say.
+    assert view.status_text.object == "demo | not connected | DRY RUN"
+    assert view.connection_text.object == ""
     _connect(view)
-    assert view.connection_text.object == f"{CONNECTED_TEXT} (dry run)"
+    assert view.status_text.object.endswith("| DRY RUN")
+    assert view.connection_text.object == ""
     page.close()
     page.release()
 
@@ -219,7 +224,11 @@ def test_connect_through_a_click_enables_the_controls_and_reads_the_objectives(
     )
     assert view.connect_button.disabled
     assert not view.disconnect_button.disabled
-    assert view.connection_text.object == CONNECTED_TEXT
+    # What Disconnect does is said once, on the Stand screen (m5 §17.12 D15).
+    assert view.connection_text.object == ""
+    assert view.known_block.object.splitlines()[-1] == (
+        "Disconnect releases demo for NIS-Elements or ZEN."
+    )
     # Connected, but no well is selected: the captures wait for one (m5 §11.1), and
     # are usable as soon as a click on the map names it.
     assert view.capture_centre_button.disabled
@@ -240,10 +249,48 @@ def test_disconnect_through_a_click_closes_the_page_again(
     assert page.join(5)
     view.tick()
     assert not page.connected
-    assert view.connection_text.object == CLOSED_TEXT
+    assert view.connection_text.object == ""
+    assert "Disconnect releases" not in view.known_block.object
     assert view.objective_select.options == {}
     assert view.drive_note.object == "the stand is not connected"
     assert list(opened[0].core.getLoadedDevices()) == ["Core"]
+
+
+def test_the_connection_line_comes_back_after_a_connect_that_failed_and_goes_with_the_next(
+    tmp_path: Path, opened: list[Microscope]
+) -> None:
+    # The line is for a connect that goes or failed (m5 §17.12 D15): after a failure it says why
+    # every control that needs the stand is disabled, and the next activity clears it.
+    page = _page(tmp_path / "run.json", opened)
+    real_opener = page._opener
+    refusing = {"on": True}
+
+    def opener() -> Microscope:
+        if refusing["on"]:
+            raise RuntimeError("another program holds the stand")
+        return real_opener()
+
+    page._opener = opener
+    view = PlatePageView(page)
+    try:
+        assert view.connection_text.object == ""
+        view.connect_button.clicks += 1
+        assert page.join(5)
+        view.tick()
+        assert not page.connected
+        assert page.status().outcome == (
+            "connect: RuntimeError: another program holds the stand"
+        )
+        assert view.connection_text.object == CLOSED_TEXT
+        assert view.connection_text.visible
+        refusing["on"] = False
+        _connect(view)
+        assert page.connected
+        assert view.connection_text.object == ""
+        assert not view.connection_text.visible
+    finally:
+        page.close()
+        page.release()
 
 
 def test_the_objective_select_follows_the_turret_of_a_second_connection(
@@ -325,7 +372,8 @@ def test_the_connection_row_says_connecting_and_disconnecting_while_the_activity
             gate.set()
             assert page.join(5)
         view.tick()
-        assert view.connection_text.object == f"{CONNECTED_TEXT}{suffix}"
+        # Connected: nothing to say under the strip.
+        assert view.connection_text.object == ""
 
         closing, held = threading.Event(), threading.Event()
         stand = opened[0]
@@ -348,7 +396,7 @@ def test_the_connection_row_says_connecting_and_disconnecting_while_the_activity
             held.set()
             assert page.join(5)
         view.tick()
-        assert view.connection_text.object == f"{CLOSED_TEXT}{suffix}"
+        assert view.connection_text.object == ""
     finally:
         gate.set()
         page.close()

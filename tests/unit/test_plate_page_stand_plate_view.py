@@ -47,8 +47,11 @@ from smc.ui.guide import (
     GOTO_UNPLACED,
     OTHER_WAYS_TO_REGISTER,
     PLATE_NOT_CHOSEN,
+    REGISTER_ACROSS_A_TURN,
+    SAMPLE_REGISTERS,
     SCREEN_LEADS,
     NextStep,
+    local_time,
 )
 from smc.ui.plate_page import _WARNING, PlatePageView, next_step_text
 
@@ -392,20 +395,24 @@ def test_the_stand_screen_offers_the_calibration_until_the_objective_in_place_ha
         f"Objective: {TEN_X}, in place",
         "Camera: not calibrated (the arrows cannot say which way the image moves)",
         "Light: not known",
+        # What Disconnect does is said once, here, while the stand is connected (D15).
+        "Disconnect releases demo for NIS-Elements or ZEN.",
     ]
     # Calibrated at the objective in place: nothing to offer, and the line says when.
     seed_camera_calibration(run_doc, objective=TEN_X)
     view.on_refresh()
     assert not view.calibrate_box.visible
+    # In the PC's own zone, to the minute (m5 §17.12 D20): the test asks the same clock.
+    when = local_time(datetime(2026, 11, 9, 9, 30, tzinfo=timezone.utc))
     assert view.known_block.object.split("\n")[1] == (
-        f"Camera: calibrated at {TEN_X} on 2026-11-09 09:30:00 UTC"
+        f"Camera: calibrated at {TEN_X} on {when}"
     )
     # Calibrated at another objective: offered again, and the line says both.
     seed_camera_calibration(run_doc, objective=FORTY_X)
     view.on_refresh()
     assert view.calibrate_box.visible
     assert view.known_block.object.split("\n")[1] == (
-        f"Camera: calibrated at {FORTY_X} on 2026-11-09 09:30:00 UTC, not at {TEN_X}"
+        f"Camera: calibrated at {FORTY_X} on {when}, not at {TEN_X}"
     )
 
 
@@ -499,7 +506,9 @@ def test_before_any_capture_nothing_on_the_plate_screen_is_in_the_warning_colour
     coloured = [
         o
         for o in _objects(list(view.step_panel.objects))
-        if isinstance(o, pn.pane.Str) and o.styles.get("color") == _WARNING
+        if isinstance(o, pn.pane.Str)
+        and o.styles.get("color") == _WARNING
+        and o.visible
     ]
     assert coloured == []
     page.choose_plate("96-well")
@@ -616,12 +625,209 @@ def test_a_row_goes_to_the_well_it_names(
     # The same call as a drive click: the controller drove, and made the well current.
     assert StubGoto.ran == ["A12"]
     assert page.current == "A12"
-    # The answer is drawn on the row that started it, in the plain colour.
+    # The answer is drawn on the row of the well, in its own words and the plain colour:
+    # not the tool's whole outcome, which names assumptions that no card here shows.
     note = view.centre_slots[1].note
-    assert note.object.startswith("goto-well done in ")
+    assert note.object == "At A12."
     assert note.styles.get("color") != _WARNING
     assert view.centre_slots[0].note.object == ""
     assert view.message.object == ""
+
+
+def test_a_reason_common_to_every_row_is_drawn_once_above_them(
+    page: PlatePage, run_doc: Path, fake_microscope: Microscope
+) -> None:
+    # The owner's walk (finding 4): `goto-well is running: wait for it to end, or press STOP.`
+    # four times under a drive, `End live to go to another well` three times in Live. A reason
+    # that holds for every action of a screen is said once (m5 §17.12 D19), and a row says only
+    # what is its own.
+    _seed_plate(run_doc)
+    fake_microscope.override(Camera, LiveCamera())
+    view = PlatePageView(page)
+    view.show_step("plate")
+    view.refresh()
+    assert view.rows_note.object == ""
+    assert not view.rows_note.visible
+
+    _click(view.tool_runs["slow"])
+    try:
+        assert Slow.started.wait(5)
+        view.tick()
+        reason = "slow is running: wait for it to end, or press STOP."
+        assert view.rows_note.object == reason
+        assert view.rows_note.visible
+        everything = [
+            o.object
+            for o in _objects(list(view.step_panel.objects))
+            if isinstance(o, pn.pane.Str)
+        ]
+        assert sum(reason in text for text in everything) == 1
+    finally:
+        Slow.release.set()
+    assert page.join(10.0)
+    view.tick()
+    assert view.rows_note.object == ""
+
+    view.on_live()
+    try:
+        view.tick()
+        everything = [
+            o.object
+            for o in _objects(list(view.step_panel.objects))
+            if isinstance(o, pn.pane.Str)
+        ]
+        assert sum(GOTO_NOT_DURING_LIVE in text for text in everything) == 1
+        assert view.rows_note.object == GOTO_NOT_DURING_LIVE
+    finally:
+        page.live(False)
+    assert page.join(10.0)
+
+
+def test_the_rows_note_says_what_register_uses_while_nothing_is_captured(
+    fake_core: FakeCore, run_doc: Path
+) -> None:
+    # D23: the map says the plate is estimated, the rows say each in its own words, and one
+    # line above them says what the button will do.
+    shipped = Path(__file__).resolve().parents[2] / "profiles" / "demo-sample.toml"
+    microscope = Microscope.from_core(
+        cast("CMMCorePlus", fake_core), Profile.load(shipped)
+    )
+    page = PlatePage(microscope, run_doc, entry_points=_entry_points(StubGoto, Slow))
+    try:
+        view = PlatePageView(page)
+        view.show_step("plate")
+        view.refresh()
+        assert page.registers_from_sample
+        assert view.rows_note.object == SAMPLE_REGISTERS
+        assert view.rows_note.visible
+        # A capture ends the sample's rows: the note goes with them.
+        microscope.require(XYStage).move_to_um(*_well_centre("A1"))
+        page.capture_centre("A1")
+        view.refresh()
+        assert not page.registers_from_sample
+        assert view.rows_note.object == ""
+    finally:
+        page.close()
+        microscope.close()
+
+
+def test_a_row_answers_a_goto_in_its_own_words(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    _seed_plate(run_doc)
+    page = make_page(BlockingGoto, Slow)
+    view = PlatePageView(page)
+    view.show_step("plate")
+    view.refresh()
+    assert [slot.note.object for slot in view.centre_slots] == ["", "", ""]
+
+    _click(view.centre_slots[2].goto_button)
+    assert BlockingGoto.started.wait(5)
+    view.tick()
+    assert view.centre_slots[2].note.object == "Going to H1…"
+    assert [slot.note.object for slot in view.centre_slots[:2]] == ["", ""]
+    BlockingGoto.release.set()
+    assert page.join(10.0)
+    view.tick()
+    assert view.centre_slots[2].note.object == "At H1."
+    assert view.centre_slots[2].note.styles.get("color") != _WARNING
+    # Another tab draws the same answer from the controller's, on the same row.
+    other = PlatePageView(page)
+    other.show_step("plate")
+    other.tick()
+    assert other.centre_slots[2].note.object == "At H1."
+
+
+def test_a_far_capture_is_drawn_in_the_warning_colour_on_its_row(
+    page: PlatePage, run_doc: Path, fake_microscope: Microscope
+) -> None:
+    # The owner's walk (finding 6): H1 captured at A12's place, 99 mm off, with no word.
+    _seed_plate(run_doc)
+    stage = fake_microscope.require(XYStage)
+    stage.move_to_um(*_well_centre("A1"))
+    page.capture_centre("A1")
+    stage.move_to_um(*_well_centre("A12"))
+    page.capture_centre("H1")
+    view = PlatePageView(page)
+    view.show_step("plate")
+    view.refresh()
+
+    a1, _a12, h1 = view.centre_slots
+    assert not a1.capture_note.visible
+    assert h1.capture_note.visible
+    assert h1.capture_note.object.startswith("H1 was captured 117.")
+    assert "Redo it there." in h1.capture_note.object
+    assert h1.capture_note.styles["color"] == _WARNING
+    # A note and never a refusal: the button stays as it was.
+    assert not h1.capture_button.disabled
+
+    # Redone where it belongs, the note goes.
+    stage.move_to_um(*_well_centre("H1"))
+    page.capture_centre("H1")
+    view.refresh()
+    assert not h1.capture_note.visible
+
+
+def test_two_captures_at_one_place_are_noted_on_both_rows_of_an_unplaced_map(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # No plate registered and no holder: the map puts no well anywhere, so nothing is far
+    # from where it is not, and only two captures at one point can be said (D16's pose rule).
+    page.choose_plate("96-well")
+    stage = fake_microscope.require(XYStage)
+    stage.move_to_um(1000.0, 2000.0)
+    page.capture_centre("A1")
+    stage.move_to_um(1010.0, 2000.0)
+    page.capture_centre("A12")
+    view = PlatePageView(page)
+    view.show_step("plate")
+    view.refresh()
+    assert view._view is not None
+    assert view._view.pose.kind == "unplaced"
+    a1, a12, h1 = view.centre_slots
+    assert a1.capture_note.object == (
+        "A1 and A12 were captured at the same place: redo the one that is wrong."
+    )
+    assert a12.capture_note.object == (
+        "A12 and A1 were captured at the same place: redo the one that is wrong."
+    )
+    assert a12.capture_note.styles["color"] == _WARNING
+    assert not h1.capture_note.visible
+
+
+def test_register_shows_the_refusal_across_a_turn_before_the_click(
+    page: PlatePage, fake_microscope: Microscope
+) -> None:
+    # The centres captured with the 10x, the turret turned to the 40x (m5 §17.12 D13, #373):
+    # the button waits with the reason, the click that still arrives starts nothing, and the
+    # outcome names both objectives.
+    page.choose_plate("96-well")
+    _capture(page, fake_microscope, "A1", "A12", "H1")
+    view = PlatePageView(page)
+    view.show_step("plate")
+    view.refresh()
+    assert not view.register_button.disabled
+
+    fake_microscope.require(ObjectiveTurret).select(FORTY_X, confirm=True)
+    view.refresh()
+
+    refusal = REGISTER_ACROSS_A_TURN.format(captured=TEN_X, in_place=FORTY_X)
+    assert view.register_button.disabled
+    assert view.register_wait.object == refusal
+    assert view.register_wait.visible
+    assert not page.run_doc.exists()
+    _click(view.register_button)
+    view.tick()
+    assert page.status().running is None
+    assert page.status().outcome == f"Registration: {refusal}"
+    assert view.run_text.object.startswith(f"Registration: {refusal}")
+    # Nothing was started or written.
+    assert not page.run_doc.exists()
+    # Turned back, the wait goes and the button is on.
+    fake_microscope.require(ObjectiveTurret).select(TEN_X, confirm=True)
+    view.refresh()
+    assert not view.register_button.disabled
+    assert view.register_wait.object == ""
 
 
 def test_a_refused_go_to_is_drawn_on_its_row(
@@ -678,12 +884,12 @@ def test_a_goto_well_that_ends_failed_is_drawn_on_its_row(
     _click(view.centre_slots[0].goto_button)
     assert page.join(10.0)
     view.tick()
-    # The run's own outcome, whole (FM-45), in the warning colour: it did not end `done`.
+    # The tool's one line, whole (FM-45) and without the exception's type, in the warning
+    # colour: it did not end `done`. The drive bar says the outcome with the tool's title.
     note = view.centre_slots[0].note
-    assert (
-        note.object == "goto-well: PluginRunError: goto-well: the stage did not arrive"
-    )
+    assert note.object == "goto-well: the stage did not arrive"
     assert note.styles["color"] == _WARNING
+    assert view.goto_text.object == "Go to failed: goto-well: the stage did not arrive"
     assert view.message.object == ""
 
 
@@ -700,16 +906,18 @@ def test_go_to_is_disabled_during_live_and_says_why(
     try:
         assert page.is_live
         view.tick()
+        # Said once, above the rows, and not under each of them (m5 §17.12 D19).
+        assert view.rows_note.object.split("\n") == [GOTO_NOT_DURING_LIVE]
+        assert view.rows_note.visible
         for slot in view.centre_slots:
             assert slot.goto_button.disabled
-            assert GOTO_NOT_DURING_LIVE in slot.note.object.split("\n")
-            assert slot.note.styles.get("color") != _WARNING
-        # A click that still arrives is the controller's refusal (FM-169): the state's, so
-        # the note every row already has says it, and the click moves no row (a refusal
-        # because an activity goes is not the drive of the row that was clicked).
+            assert slot.note.object == ""
+        # A click that still arrives is the controller's refusal (FM-169): the state's, which
+        # the note above the rows already says, and it leaves the drive's text as it was.
         _click(view.centre_slots[0].goto_button)
-        assert page.status().goto == "live is running"
-        assert view.centre_slots[0].note.object.split("\n") == [GOTO_NOT_DURING_LIVE]
+        assert page.status().goto == ""
+        assert view.rows_note.object.split("\n") == [GOTO_NOT_DURING_LIVE]
+        assert all(slot.note.object == "" for slot in view.centre_slots)
         assert view.message.object == ""
         assert StubGoto.ran == []
     finally:
@@ -717,7 +925,8 @@ def test_go_to_is_disabled_during_live_and_says_why(
     assert page.join(10.0)
     view.tick()
     assert not any(slot.goto_button.disabled for slot in view.centre_slots)
-    assert GOTO_NOT_DURING_LIVE not in view.centre_slots[1].note.object
+    assert GOTO_NOT_DURING_LIVE not in view.rows_note.object
+    assert not view.rows_note.visible
 
 
 def test_capture_stays_enabled_during_live(
@@ -808,17 +1017,21 @@ def test_a_disabled_register_or_go_to_is_refused_by_the_controller(
         view.tick()
         reason = "slow is running: wait for it to end, or press STOP."
         assert view.register_button.disabled
-        assert view.register_wait.object == reason
+        # The reason common to every action of the screen is said once, above the rows; the
+        # button's own wait is its own reason, and it has none (m5 §17.12 D19).
+        assert view.rows_note.object == reason
+        assert view.register_wait.object == ""
+        assert not view.register_wait.visible
         assert view.calibrate_button.disabled
         assert view.calibrate_note.object == reason
         assert all(slot.goto_button.disabled for slot in view.centre_slots)
-        assert reason in view.centre_slots[0].note.object
+        assert all(slot.note.object == "" for slot in view.centre_slots)
         # Capture reads the stage, so it is disabled while another activity goes too.
         assert all(slot.capture_button.disabled for slot in view.centre_slots)
         _click(view.register_button)
         assert view.message.object == "slow is running"
         _click(view.centre_slots[0].goto_button)
-        assert page.status().goto == "slow is running"
+        assert page.status().goto == ""
         assert StubGoto.ran == []
         view.message.object = ""
         _click(view.centre_slots[1].capture_button)
@@ -939,15 +1152,21 @@ def test_the_rows_follow_the_maps_pose_and_an_estimated_drive_is_said_in_plain_w
     assert BlockingGoto.started.wait(5)
     view.tick()
     note = view.centre_slots[0].note
-    assert note.object.split("\n") == [
-        "goto-well is running: wait for it to end, or press STOP.",
-        GOTO_ESTIMATED.format(well="A1"),
-    ]
+    # What runs is said once above the rows; the row says where it is going.
+    assert view.rows_note.object == (
+        "goto-well is running: wait for it to end, or press STOP."
+    )
+    assert note.object == "Going to A1…"
+    assert page.status().goto == GOTO_ESTIMATED.format(well="A1")
     assert note.styles.get("color") != _WARNING
     BlockingGoto.release.set()
     assert page.join(10.0)
     view.tick()
-    assert note.object.startswith("goto-well done in ")
+    # At the estimate: centre it by eye (the row knows the drive went to the holder's estimate).
+    assert note.object == (
+        "At A1, the holder's estimate: centre it by eye with Live and the arrows, then "
+        "capture."
+    )
     assert note.styles.get("color") != _WARNING
     # A plate registered since: the rows are those of a registered map, and what the drive
     # said (an estimate) is history, not left under a plate that is now registered.
@@ -1008,10 +1227,12 @@ def test_a_refused_click_while_a_drive_goes_leaves_the_drive_on_its_row(
     _click(view.centre_slots[1].goto_button)
     assert StubGoto.ran == ["A1"]
     assert view.message.object == ""
+    # The refused click left the running drive's text: A1 is still where it is going.
+    assert view.centre_slots[0].note.object == "Going to A1…"
     BlockingGoto.release.set()
     assert page.join(10.0)
     view.tick()
-    assert view.centre_slots[0].note.object.startswith("goto-well done in ")
+    assert view.centre_slots[0].note.object == "At A1."
     assert view.centre_slots[1].note.object == ""
     assert view.centre_slots[2].note.object == ""
 
@@ -1026,13 +1247,15 @@ def test_a_map_drive_takes_the_answer_from_the_row(
     _click(view.centre_slots[1].goto_button)
     assert page.join(10.0)
     view.tick()
-    assert view.centre_slots[1].note.object.startswith("goto-well done in ")
-    # A drive armed on the map and clicked on a well: the answer is its, and no row's.
+    assert view.centre_slots[1].note.object == "At A12."
+    # A drive armed on the map and clicked on a well: the answer is the click's, on the row of
+    # the well it names (A1 is one of the three rows), and the drive bar says the outcome.
     view.drive_toggle.value = True
     view.on_tap(SimpleNamespace(x=0.0, y=0.0))
     assert page.join(10.0)
     view.tick()
-    assert view.goto_text.object.startswith("goto-well done in ")
+    assert view.goto_text.object.startswith("Go to done in ")
+    assert view.centre_slots[0].note.object == "At A1."
     assert view.centre_slots[1].note.object == ""
     assert not view.centre_slots[1].note.visible
 
@@ -1406,7 +1629,7 @@ def test_a_plate_registered_from_the_plate_screen_alone(
         assert page.join(60.0)
         view.tick()
         assert page.status().outcome is not None
-        assert page.status().outcome.startswith("plate-registration done in ")
+        assert page.status().outcome.startswith("Registration done in ")
         assert view.registered_block.visible
         lines = view.registered_block.object.split("\n")
         assert lines[0].startswith("Registered: residual ")

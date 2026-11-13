@@ -98,7 +98,7 @@ def test_a_drive_click_moves_the_demo_stage_to_the_well(
         assert page.join(30.0)
         status = page.status()
         assert status.outcome is not None
-        assert status.outcome.startswith("goto-well done in ")
+        assert status.outcome.startswith("Go to done in ")
         stage = demo_microscope.require(XYStage)
         stage.wait(10.0)
         position = stage.position_um()

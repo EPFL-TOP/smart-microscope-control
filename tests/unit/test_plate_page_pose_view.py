@@ -495,14 +495,39 @@ def test_the_label_is_a_labelset_over_the_stage_columns(page: PlatePage) -> None
     assert len(labels) == 1
     label = labels[0]
     assert (label.x, label.y, label.text) == ("x", "y", "text")
-    assert (label.x_offset, label.y_offset) == (12, 12)
+    assert label is view.cross_label
+    # The offset says the side: away from the frame's nearer edge (m5 §17.12 D16).
+    assert label.x_offset == (12 if label.text_align == "left" else -12)
+    assert label.y_offset == (12 if label.text_baseline == "bottom" else -12)
     # The look the plan fixes: small, bold, on a white ground that lets the map show.
     assert label.text_font_size == "11px"
     assert label.text_font_style == "bold"
     assert (label.background_fill_color, label.background_fill_alpha) == (
         "#ffffff",
-        0.7,
+        0.8,
     )
+
+
+def test_the_cross_label_is_drawn_away_from_the_frames_nearer_edge(
+    page: PlatePage,
+) -> None:
+    # `over A12` was cut at the right edge of the map (the owner's walk): beside the right
+    # edge the label goes to the left of the cross, beside the top edge below it.
+    view = PlatePageView(page)
+    (x0, x1), (y0, y1) = view._frame_drawn
+    label = view.cross_label
+
+    view._draw_cross((x1 - 10.0, y1 - 10.0))
+    assert (label.text_align, label.x_offset) == ("right", -12)
+    assert (label.text_baseline, label.y_offset) == ("top", -12)
+
+    view._draw_cross((x0 + 10.0, y0 + 10.0))
+    assert (label.text_align, label.x_offset) == ("left", 12)
+    assert (label.text_baseline, label.y_offset) == ("bottom", 12)
+
+    # No position, no change: the label has nothing to be away from.
+    view._draw_cross(None)
+    assert (label.text_align, label.x_offset) == ("left", 12)
 
 
 def test_a_second_tab_draws_the_same_pose_and_cross(
