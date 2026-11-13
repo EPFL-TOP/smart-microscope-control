@@ -531,8 +531,10 @@ def test_neither_screen_lists_the_next_step_or_a_tool_section(page: PlatePage) -
             o for o in shown if isinstance(o, pn.Card) and o.title == "Advanced"
         ]
         assert not [o for o in shown if isinstance(o, pn.Accordion)]
-    # The next step is still where B4 has not replaced it.
+    # The next step is in the expert view alone, B4 having replaced it on Results.
     view.show_step("results")
+    assert view.next_text not in _objects(list(view.step_panel.objects))
+    view.show_expert(True)
     assert view.next_text in _objects(list(view.step_panel.objects))
 
 

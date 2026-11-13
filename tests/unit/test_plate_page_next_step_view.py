@@ -668,12 +668,11 @@ def test_the_run_document_header_names_the_absolute_path(
     page = make_page()
     view = PlatePageView(page)
     assert view.run_document_text.object == f"Run document  {run_doc}"
-    # Heads the checklist, on the last screen and in the expert view.
-    for screen in ("results", "expert"):
-        items = list(view.screens[screen])
-        assert (
-            items.index(view.checklist_text) == items.index(view.run_document_text) + 1
-        )
+    # Closes the Results screen, which lists no checklist (B4, m5 §17.4.5), and heads the
+    # checklist in the expert view.
+    results = list(view.screens["results"])
+    assert view.checklist_text not in results
+    assert results.index(view.run_document_text) == len(results) - 2  # then *Continue*
     items = list(view.screens["expert"])
     assert items.index(view.checklist_text) == items.index(view.run_document_text) + 1
     assert view.run_document_text.styles["font-weight"] == "bold"
