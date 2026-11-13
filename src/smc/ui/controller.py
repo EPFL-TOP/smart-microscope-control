@@ -2312,7 +2312,8 @@ class PlatePage:
         It is one activity, named after the tool that goes, so that a second run, a snap
         or a close is refused or stops it the whole time, between two tools too. What it
         came to is the outcome: ``run all done in <s> s: <tools>``, or where it stopped.
-        With the stand closed, or nothing left, the outcome says so and nothing starts.
+        With the stand closed, no step asked for, a run document that cannot be read, or
+        nothing left, the outcome says so and nothing starts.
 
         Raises:
             RuntimeError: An activity is going (``<name> is running``), or the page is
@@ -2322,11 +2323,22 @@ class PlatePage:
         if self._microscope is None:
             self._set_outcome(f"run all: {NOT_CONNECTED}")
             return
+        if not plugins:
+            # The view passes none when no Results tool loaded, and a click on its disabled
+            # button still arrives here (FM-169): "every step is done" would be false.
+            self._set_outcome("run all: no step was asked for")
+            return
         # Read now and not from a view's list, which a second tab may have made stale: a tool
         # that is `ok` here is never run again by the chain.
-        checklist = {
-            item.slot: item.state for item in self._checklist(self._document()[0])
-        }
+        doc, unreadable = self._document()
+        if unreadable is not None:
+            # `_document()` answers an unreadable file with an empty one, which would read every
+            # tool as `not run` and run the ones that are `ok` again over a lock that is gone by
+            # the time `_prepare` reads it (FM-24). `_prepare` refuses such a document at the
+            # first tool; the chain refuses it before it decides what is left.
+            self._set_outcome(f"run all: {_flat(unreadable)}")
+            return
+        checklist = {item.slot: item.state for item in self._checklist(doc)}
         registry = self._registry().plugins
         left = tuple(
             tool
@@ -2363,12 +2375,14 @@ class PlatePage:
         and the next tool would start (FM-226's entry). ``_lock`` is never held across
         ``_prepare``, a run or a device call (FM-70). Whatever this code itself raises is
         the outcome ``run all: <Type>: <message>``, the text and never the exception
-        (FM-98); the chain's status is closed in ``finally``, so no tool is left
-        ``current``.
+        (FM-98), and the tool whose turn it was ends ``failed``, so that the Results screen
+        says which tool the chain stopped at and not that a STOP nobody pressed ended it; the
+        chain's status is closed in ``finally``, so no tool is left ``current``.
         """
         started = time.monotonic()
         ended: list[ChainEnd] = []
         stopped_before: str | None = None
+        turn: str | None = None
         try:
             with self._lock:
                 self._chain = ChainStatus(tools, (), tools[0])
@@ -2376,6 +2390,7 @@ class PlatePage:
                 if event.is_set():
                     stopped_before = tool
                     break
+                turn = tool
                 self._begin_tool(tool, event)
                 prepared = self._prepare(tool, params.get(tool, ()))
                 if isinstance(prepared, str):
@@ -2396,7 +2411,10 @@ class PlatePage:
                 if end.how != "done":
                     break
         except Exception as exc:
-            return f"run all: {type(exc).__name__}: {_one_line(exc)}"
+            text = f"{type(exc).__name__}: {_one_line(exc)}"
+            if turn is not None and (not ended or ended[-1].plugin != turn):
+                ended.append(ChainEnd(turn, "failed", f"{turn}: {text}"))
+            return f"run all: {text}"
         finally:
             with self._lock:
                 self._chain = ChainStatus(tools, tuple(ended), None)

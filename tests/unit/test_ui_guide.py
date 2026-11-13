@@ -61,6 +61,7 @@ from smc.ui.guide import (
     REGISTER_FIRST,
     RESULT_CHOICES,
     RESULT_NAMES,
+    RESULT_OPTIONAL_READS,
     RESULT_READS,
     RESULT_TOOLS,
     RUN_ALL_LABEL,
@@ -2327,6 +2328,10 @@ def test_the_results_reads_are_the_plugins_reads() -> None:
         plugin = _real_plugin(tool)
         assert plugin.name == plugin.provides == tool
         assert RESULT_READS[tool] == tuple(plugin.reads), tool
+        # The optional reads make a tool out of date too (`report` reads the route when
+        # there is one): `again_note` walks them, so they are pinned like the others.
+        assert RESULT_OPTIONAL_READS[tool] == tuple(plugin.reads_optional), tool
+    assert set(RESULT_OPTIONAL_READS) == set(RESULT_TOOLS)
 
 
 def test_the_results_choices_are_fields_of_the_tools_parameters() -> None:
@@ -2513,7 +2518,12 @@ def test_again_names_the_later_steps_that_are_done_and_is_empty_for_the_last() -
     assert again_note("density", everything).endswith(
         "(Report) is out of date then: Run all that are left runs it again."
     )
-    assert "(Export for NIS-Elements)" in again_note("route", everything)
+    # A new route makes the export out of date, and the report too: it reads the route when
+    # there is one (`reads_optional`), which the checklist shows after *Again* on the route.
+    assert again_note("route", everything).endswith(
+        "(Report, Export for NIS-Elements) is out of date then: Run all that are left "
+        "runs it again."
+    )
     assert again_note("report", everything) == ""
     assert again_note("nis-export", everything) == ""
     # Only the tools that are done are named, in the tools' order.

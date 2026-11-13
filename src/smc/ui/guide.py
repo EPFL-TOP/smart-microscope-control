@@ -59,6 +59,7 @@ __all__ = [
     "REGISTER_FIRST",
     "RESULT_CHOICES",
     "RESULT_NAMES",
+    "RESULT_OPTIONAL_READS",
     "RESULT_READS",
     "RESULT_TOOLS",
     "RUN_ALL_LABEL",
@@ -1603,6 +1604,19 @@ RESULT_READS: Mapping[str, tuple[str, ...]] = {
     "nis-export": ("route",),
 }
 
+#: What each tool reads **if it is there** (the plugins' ``reads_optional``), pinned by the same
+#: test. A tool that read an optional slot is out of date when that slot is made again, as one
+#: that required it is (``RunDocument.is_stale``): ``report`` reads the route when there is one,
+#: so a new route makes it stale. It is for ``again_note`` only: an optional input that is not
+#: there never makes a row wait, so a row's state line does not read it.
+RESULT_OPTIONAL_READS: Mapping[str, tuple[str, ...]] = {
+    "cells": (),
+    "density": (),
+    "route": ("timings",),
+    "report": ("route",),
+    "nis-export": (),
+}
+
 #: The parameters a row shows under *Choices and command*, which a profile or a preset fills.
 RESULT_CHOICES: Mapping[str, tuple[str, ...]] = {
     "cells": ("detector",),
@@ -1768,8 +1782,10 @@ def again_note(plugin: str, checklist: Sequence[CheckItem]) -> str:
     Named are the tools after this one that are done and read it, directly or through
     another: running it again makes their results out of date, and *Run all that are left*
     runs them again. A tool no later tool reads (``report``, ``nis-export``) says nothing.
-    The rule is the plugins' ``reads`` (``RESULT_READS``) and not "every tool after it":
-    ``route`` does not read ``density``, so a new density leaves the route as it was.
+    The rule is the plugins' ``reads`` and ``reads_optional`` (``RESULT_READS``,
+    ``RESULT_OPTIONAL_READS``) and not "every tool after it": ``route`` does not read
+    ``density``, so a new density leaves the route as it was, while ``report`` reads the
+    route when there is one, so a new route makes it out of date.
     """
     items = {item.slot: item for item in checklist}
     if plugin not in RESULT_TOOLS or not _is_ok(items, plugin):
@@ -1777,7 +1793,9 @@ def again_note(plugin: str, checklist: Sequence[CheckItem]) -> str:
     reached = {plugin}
     later: list[str] = []
     for tool in RESULT_TOOLS[RESULT_TOOLS.index(plugin) + 1 :]:
-        if reached.intersection(RESULT_READS[tool]):
+        if reached.intersection(RESULT_READS[tool]) or reached.intersection(
+            RESULT_OPTIONAL_READS[tool]
+        ):
             reached.add(tool)
             if _is_ok(items, tool):
                 later.append(tool)

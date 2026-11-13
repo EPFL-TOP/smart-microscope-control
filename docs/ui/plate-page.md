@@ -396,8 +396,9 @@ all that are left.` From the top:
     missing (the state line says which);
   - under **Again**, what it **replaces**: `Again replaces this result. What comes after it
     and is done (Density per well, ...) is out of date then: Run all that are left runs it
-    again.` It names the steps after it that read it, directly or through another, and says
-    nothing for a step no other reads (*Report*, *Export for NIS-Elements*);
+    again.` It names the steps after it that read it, directly or through another (the
+    report reads the route when there is one, so it is named after *Again* on the route),
+    and says nothing for a step no other reads (*Report*, *Export for NIS-Elements*);
   - a closed **Choices and command**: the choices a profile or a preset fills, each with the
     line that says where its value comes from (`from the profile's suggestions`, `from the
     preset <name>`, `typed on this page`, or `the tool's default: ...`), and the `smc run` line

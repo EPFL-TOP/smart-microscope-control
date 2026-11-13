@@ -20,12 +20,20 @@ from typing import Any, ClassVar, cast
 
 import pytest
 
+import smc.ui.controller as controller_module
 from smc.hardware import Microscope
 from smc.hardware.profile import Profile
 from smc.plugins import PluginRunError
 from smc.plugins.api import PluginParams, PluginResult, RunContext
 from smc.plugins.registry import GROUP
-from smc.run import ReadRecord, RunDocument, StageRecord, StageStatus, write_stage
+from smc.run import (
+    ReadRecord,
+    RunDocument,
+    RunDocumentError,
+    StageRecord,
+    StageStatus,
+    write_stage,
+)
 from smc.testing import FakeCore
 from smc.ui.controller import NOT_CONNECTED, ChainEnd, PlatePage
 
@@ -619,6 +627,213 @@ def test_a_bug_in_the_chain_is_an_outcome_and_not_an_exception(
     assert _outcome(page) == "run all: ValueError: a bug in the chain"
     chain = page.status().chain
     assert chain is not None
-    assert chain.ended == ()
+    # The tool whose turn it was is the one that failed: the Results screen then says
+    # which, and never reads the chain as a STOP nobody pressed.
+    assert chain.ended == (
+        ChainEnd("cells", "failed", "cells: ValueError: a bug in the chain"),
+    )
     assert chain.current is None
     assert _Stub.ran == []
+
+
+def test_a_bug_after_one_tool_ends_that_tool_failed_and_is_never_read_as_a_stop(
+    page: PlatePage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = page._prepare
+    calls: list[str] = []
+
+    def breaks_on_the_second(plugin: str, params: Any) -> Any:
+        calls.append(plugin)
+        if len(calls) == 2:
+            raise ValueError("boom")
+        return real(plugin, params)
+
+    monkeypatch.setattr(page, "_prepare", breaks_on_the_second)
+
+    page.run_chain(TOOLS, {})
+    _ended(page)
+
+    assert _outcome(page) == "run all: ValueError: boom"
+    chain = page.status().chain
+    assert chain is not None
+    assert [(end.plugin, end.how) for end in chain.ended] == [
+        ("cells", "done"),
+        ("density", "failed"),
+    ]
+    assert chain.ended[-1].outcome == "density: ValueError: boom"
+    assert chain.current is None
+    assert _Stub.ran == ["cells"]
+
+
+# --- the call itself: what it reads, what it refuses ---------------------------------------
+
+
+def test_a_run_document_that_cannot_be_read_ends_the_call_with_its_error_and_runs_nothing(
+    page: PlatePage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An unreadable document is an empty one to `_document()`: every tool would read as `not
+    # run`, and a tool that is `ok` would be run again (FM-24: a read refused for a moment on
+    # Windows, where `_prepare`'s own read a few milliseconds later succeeds).
+    page.run("cells", [])
+    _ended(page)
+    _Stub.ran.clear()
+    real = controller_module.RunDocument.load_or_new
+    calls: list[int] = []
+
+    def refused_once(path: Path) -> RunDocument:
+        calls.append(1)
+        if len(calls) == 1:
+            raise RunDocumentError(path, "the file is locked by another program")
+        return real(path)
+
+    monkeypatch.setattr(
+        controller_module.RunDocument, "load_or_new", staticmethod(refused_once)
+    )
+
+    page.run_chain(TOOLS, {})
+
+    outcome = _outcome(page)
+    assert outcome.startswith("run all: ")
+    assert "the file is locked by another program" in outcome
+    assert "\n" not in outcome
+    # Nothing started: no activity, no chain, no tool run, and the `ok` one was not run again.
+    assert page.status().running is None
+    assert page.status().chain is None
+    assert _Stub.ran == []
+
+
+def test_run_all_with_no_step_asked_for_says_so_and_starts_no_activity(
+    page: PlatePage,
+) -> None:
+    # The view passes an empty list when no Results tool loaded; the controller refuses on its
+    # own (FM-169), and says what is true: nothing is done, nothing was asked for.
+    before = page.activities_ended
+    page.run_chain([], {})
+    assert _outcome(page) == "run all: no step was asked for"
+    assert page.status().running is None
+    assert page.status().chain is None
+    assert page.activities_ended == before
+    assert _Stub.ran == []
+
+
+def test_run_all_while_the_stand_is_connecting_is_refused_as_busy_not_as_closed(
+    run_doc: Path,
+) -> None:
+    # The guard is the first line of the call: with it gone, a call during `connect` (the stand
+    # is still None) would answer `the stand is not connected` and not `connect is running`.
+    gate = threading.Event()
+    opened = threading.Event()
+    stands: list[Microscope] = []
+
+    def slow_open() -> Microscope:
+        opened.set()
+        gate.wait(WAIT_S)
+        stand = Microscope.from_core(
+            cast("Any", FakeCore.demo_like()), Profile.demo(), dry_run=False
+        )
+        stands.append(stand)
+        return stand
+
+    page = PlatePage.closed(
+        Profile.demo(), run_doc, opener=slow_open, entry_points=_entry_points()
+    )
+    try:
+        page.connect()
+        assert opened.wait(WAIT_S)
+        with pytest.raises(RuntimeError, match="connect is running"):
+            page.run_chain(TOOLS, {})
+        assert page.status().outcome is None
+    finally:
+        gate.set()
+        page.join(WAIT_S)
+        page.close()
+        for stand in stands:
+            stand.close()
+
+
+def test_a_name_no_plugin_has_is_refused_at_its_turn_as_text(
+    page: PlatePage, run_doc: Path
+) -> None:
+    page.run_chain(["their-tool"], {})
+    _ended(page)
+
+    outcome = _outcome(page)
+    assert outcome.startswith("run all stopped at their-tool: their-tool: ")
+    chain = page.status().chain
+    assert chain is not None
+    assert [(end.plugin, end.how) for end in chain.ended] == [("their-tool", "refused")]
+    assert "their-tool" not in RunDocument.load(run_doc).stages
+
+
+@pytest.mark.parametrize("with_result", [False, True])
+def test_a_record_that_could_not_be_written_ends_the_tool_failed_and_stops_the_chain(
+    page: PlatePage, run_doc: Path, monkeypatch: pytest.MonkeyPatch, with_result: bool
+) -> None:
+    # `_run_plugin` has two branches for a run document that refuses a write (FM-34): the stage
+    # ran and its result is lost, or it was never recorded. Both are `failed`, and a chain
+    # that carried on over either would end `run all done` with no record of the last tool.
+    def refuse(*args: Any, **kwargs: Any) -> Any:
+        record = None
+        if with_result:
+            record = StageRecord(
+                plugin="cells",
+                provides="cells",
+                attempt="x",
+                status=StageStatus.done,
+                started_utc=T0,
+                finished_utc=T0,
+                profile="demo",
+                dry_run=False,
+                smc_version="0",
+                params={},
+                result={},
+                reads={},
+            )
+        raise RunDocumentError(run_doc, "the disk is full", record=record)
+
+    monkeypatch.setattr(controller_module, "run_plugin", refuse)
+
+    page.run_chain(TOOLS, {})
+    _ended(page)
+
+    chain = page.status().chain
+    assert chain is not None
+    assert [(end.plugin, end.how) for end in chain.ended] == [("cells", "failed")]
+    outcome = _outcome(page)
+    assert outcome.startswith("run all stopped at cells: ")
+    assert "the disk is full" in outcome
+    assert outcome.endswith("; not run: density, route, report, nis-export")
+    assert ("ran, but its record could not be written" in outcome) is with_result
+
+
+# --- what the status says from the first tool, and after the chain -----------------------
+
+
+def test_the_chain_is_visible_from_its_first_tool(page: PlatePage) -> None:
+    # `cells` is the slow one on real frames: its row and the chain's line say it goes.
+    _Stub.behaviour["cells"] = "wait"
+
+    page.run_chain(TOOLS, {})
+    assert _Stub.started["cells"].wait(WAIT_S)
+    during = page.status()
+    assert during.running == "cells"
+    assert during.chain is not None
+    assert during.chain.plugins == TOOLS
+    assert during.chain.ended == ()
+    assert during.chain.current == "cells"
+    _Stub.release["cells"].set()
+    _ended(page)
+
+
+def test_another_activity_clears_the_chain_when_it_starts(page: PlatePage) -> None:
+    page.run_chain(TOOLS, {})
+    _ended(page)
+    assert page.status().chain is not None  # kept after its end, as the progress is
+
+    _Stub.behaviour["cells"] = "wait"
+    page.run("cells", [])  # *Again* on a tool that is done
+    assert _Stub.started["cells"].wait(WAIT_S)
+    assert page.status().chain is None  # the chain's line goes with the next activity
+    _Stub.release["cells"].set()
+    _ended(page)
+    assert page.status().chain is None

@@ -117,12 +117,16 @@ class _Stub:
     reads: tuple[str, ...]
 
     behaviour: ClassVar[dict[str, str]] = {}
+    #: The count a tool reports (of 5) before it ends or waits: the row says it while it goes.
+    reports: ClassVar[dict[str, int]] = {}
     ran: ClassVar[list[str]] = []
     started: ClassVar[dict[str, threading.Event]] = {}
     release: ClassVar[dict[str, threading.Event]] = {}
 
     def run(self, microscope: Any, params: NoParams, ctx: RunContext) -> NoResult:
         _Stub.ran.append(self.name)
+        if self.name in _Stub.reports:
+            ctx.progress(_Stub.reports[self.name], 5, "")
         how = _Stub.behaviour.get(self.name, "done")
         if how == "fail":
             raise PluginRunError(self.name, HOSTILE)
@@ -180,6 +184,7 @@ def _entry_points(real: tuple[str, ...] = ()) -> list[EntryPoint]:
 @pytest.fixture(autouse=True)
 def _fresh_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     _Stub.behaviour = {}
+    _Stub.reports = {}
     _Stub.ran = []
     _Stub.started = {name: threading.Event() for name in RESULT_TOOLS}
     _Stub.release = {name: threading.Event() for name in RESULT_TOOLS}
@@ -812,6 +817,11 @@ def test_run_all_redraws_the_rows_at_each_tools_end_and_reads_the_view_once_per_
         == "density is running: wait for it to end, or press STOP."
     )
     assert all(row.button.disabled for row in view.result_rows.values())
+    # Each disabled button says what runs: the row that waits for an input says it above, and
+    # the same note stands under its button, so that a click that does nothing says why.
+    busy = "density is running: wait for it to end, or press STOP."
+    assert view.result_rows["route"].wait.object == busy
+    assert view.result_rows["route"].wait.visible is True
     view.tick()
     view.tick()
     assert reads == [1]  # nothing ended since: no read
@@ -956,6 +966,10 @@ def test_again_says_what_it_replaces_and_the_note_goes_with_the_tool(
     _ended(page)
     view.tick()
     assert cells.replaces.visible is False
+    # The chain's line goes with the next activity: it said `Done: ...` about a result that is
+    # no longer the document's (the rows say Run for four tools).
+    assert page.status().chain is None
+    assert view.chain_text.visible is False
     assert [view.result_rows[t].button.label for t in RESULT_TOOLS] == [
         "Again",
         "Run",
@@ -1017,6 +1031,75 @@ def test_a_dry_run_page_over_a_real_scan_holds_nothing_back(
     assert view.run_all_button.disabled is False
     assert view.run_all_wait_text.visible is False
     assert all(DRY_RUN_NO_FRAME not in wait for wait in _waits(view).values())
+
+
+def test_a_running_row_says_the_tools_own_count_and_no_other_row_does(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # `Running now: <done> of <total>` is the tool's own report (m5 §17.11.3): the only live
+    # word of a `cells` over real frames, which takes minutes.
+    _seed_scan(run_doc)
+    _Stub.reports["cells"] = 2
+    _Stub.behaviour["cells"] = "wait"
+    view = PlatePageView(page)
+    view.show_step("results")
+
+    _click(view.run_all_button)
+    assert _Stub.started["cells"].wait(BOUND_S)
+    view.tick()
+    assert _states(view)["cells"] == "Running now: 2 of 5"
+    assert _states(view)["density"] == "after Count the cells"
+    assert view.chain_text.object == "Running Count the cells (1 of 5)."
+    _Stub.release["cells"].set()
+    _ended(page)
+
+
+def test_a_bug_in_the_chain_is_said_as_the_tools_failure_and_never_as_a_stop(
+    page: PlatePage, run_doc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_scan(run_doc)
+    real = page._prepare
+    calls: list[str] = []
+
+    def breaks_on_the_second(plugin: str, params: Any) -> Any:
+        calls.append(plugin)
+        if len(calls) == 2:
+            raise ValueError("boom")
+        return real(plugin, params)
+
+    monkeypatch.setattr(page, "_prepare", breaks_on_the_second)
+    view = PlatePageView(page)
+    view.show_step("results")
+    _click(view.run_all_button)
+    _ended(page)
+    view.tick()
+
+    assert view.chain_text.object == (
+        "Stopped at Density per well, which failed: density: ValueError: boom. "
+        "Done: Count the cells. Not run: Route through the densest fields, Report, "
+        "Export for NIS-Elements."
+    )
+    assert "STOP" not in view.chain_text.object
+    outcome = page.status().outcome
+    assert outcome == "run all: ValueError: boom"
+
+
+def test_no_results_tool_loaded_says_so_under_run_all_and_disables_it(
+    make_page: Callable[..., PlatePage], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    page = make_page()
+    monkeypatch.setattr(page, "tools", lambda: ())
+    view = PlatePageView(page)
+    view.show_step("results")
+    assert view.run_all_button.disabled is True
+    assert (
+        view.run_all_wait_text.object
+        == "the results tools did not load: the problems line says why"
+    )
+    assert all(row.button.disabled for row in view.result_rows.values())
+    # A click that arrives anyway is the controller's to answer, with what is true.
+    _click(view.run_all_button)
+    assert page.status().outcome == "run all: no step was asked for"
 
 
 def test_the_colour_bar_follows_the_density_select(
