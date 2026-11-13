@@ -2191,8 +2191,7 @@ autofocus moves as today.
   `smc stage jog`, which know no plate (m2 §12.11 D9, *Not chosen*: no radius;
   m2 §12.11.3 step 3 stays their procedure); the tools that move between wells
   with PFS as it is (`plate-walls` and `objective-offsets` through their shared
-  loop, `scan` with `autofocus=off`): a follow-up of #454 (FM-223, *Not
-  covered*). A switch-off before a scan leaves the scan with `autofocus=
+  loop, `scan` with `autofocus=off`): §5.7 (#478). A switch-off before a scan leaves the scan with `autofocus=
   if-engaged` running without PFS unless the operator engages it again; the
   WARNING and the strip say to (#459 weighs the scan's own word for it).
 
@@ -2204,6 +2203,114 @@ state read that raises and one that still reads on, each failing with the
 stage where it was; on the Ti2-E fake, Z not following into a well whose
 plane lies 60 µm higher. **Failure modes**: FM-19, FM-64, FM-98, FM-129,
 FM-215, FM-223.
+
+### 5.7 PFS across a well's wall: `plate-walls`, `objective-offsets`, `scan` with `autofocus=off` (#478)
+
+**Merging this section decides it** (the follow-up §5.6 names; FM-223, *Not
+covered*). Measured on the demo stands, `main` f20a825, 2026-11-13, with
+`tests/recording_autofocus.py`'s `RecordingAutofocus` put on the stand by
+`Microscope.override(Autofocus, ...)`:
+- The demo's autofocus (`MMAutofocus`) reads off at open, on the real and the
+  dry-run demo: a run on the demo meets an autofocus that is off, and the
+  `assumed` lines the tests assert today do not change.
+- `plate-walls` with an engaged autofocus registers two wells and makes **no
+  call** on it: every wall and every well is walked with PFS as it was.
+- `objective-offsets` with an engaged autofocus: the layer's turret switches
+  it off before a turn (`MMObjectiveTurret._switch_off_first`: one read, the
+  switch-off, a WARNING, no read back), so the first turn covers the run.
+  **Not when the turret already reads the first target** (`select` returns at
+  once): the first move to a wall is made with PFS engaged, and it is switched
+  off only at the second target's turn. An operator who ran
+  `camera-calibration` at the 40× and left it in place meets that case.
+
+**D1. `plate-walls` and `objective-offsets` switch an engaged autofocus off
+once, before anything moves, and say so.** One function of the shared loop,
+`plate_walls/loop.py`: `switch_off_autofocus(stage: str, autofocus: Autofocus
+| None, ctx: RunContext) -> bool`, whether it switched it off, with §5.6 D1's
+three calls and rules: no call without an autofocus; `is_engaged()`; on,
+`disengage()` and `is_engaged()` again.
+- **Where**: after every refusal that comes before anything moves (the
+  checks of §17.4 and §20.6, the soft limits, the walk's size), then
+  `ctx.raise_if_stopped()`, then the switch-off, before `xy.wait()` and the
+  start's read; in `objective-offsets` before the first turn. Outside the
+  `try` whose handler says where the stage was left: nothing has moved.
+- **Once per run, never engaged again**: the walls of a well and the wells of
+  the run are walked with PFS off, Z where PFS held it; nothing engages it at
+  the end (FM-88). A lock in a new well at the 40× is the operator's first
+  lock from below (m2 §12.11.3), which a tool cannot ask for (§5.1).
+- **Searching counts as on** (`is_engaged()`), as in §5.6.
+- **No dry-run branch**: both tools refuse a dry run before it (§17.4,
+  §20.6).
+- **A switch-off that cannot be made or read back fails the run before
+  anything moves** (unknown counts as on, FM-19): a `HardwareError` from any
+  of the three calls is a `PluginRunError` of `stage`, raised outside the
+  handler (FM-98): `the autofocus could not be switched off before anything
+  moved (<Type>: <first line>): nothing moved, and PFS may still be on: switch
+  it off at the stand, then run <stage> again`; `is_engaged()` still `True`
+  after `disengage()`: `the autofocus still reads on after it was switched
+  off: nothing moved: switch it off at the stand, then run <stage> again`.
+  `MicroscopeHaltedError` and `MotionStoppedError` pass first (FM-64); on a
+  halted stand the switch-off is made (a safe call) and the first move raises
+  the halt.
+- **Said twice.** One WARNING on `ctx.logger`: `<stage>: the autofocus was
+  switched off before anything moved, so that no lock crosses a well's wall
+  (m2 §12.2 D2): engage it again after the run`. And the **first** `assumed`
+  line of the result (`AUTOFOCUS_OFF_LINE` in `loop.py`), so that the page's
+  strip shows it (`_assumed_tail`): `the autofocus was switched off before
+  anything moved, so that no lock crossed a well's wall: engage it again on
+  the sample`. No new result field: `plate` is read by every later tool, and
+  the line is in the record.
+- **Not chosen**:
+  - *Refusing to start with PFS on*: §5.6's reason (one more click for the
+    same end state, read as a fault).
+  - *The scan's rule* (off before each well, engaged again at its first
+    field, §8): an engage in a new well at the 40× skips the first lock from
+    below (§5.6, *Not chosen*); these tools image walls, not cells.
+  - *Leaving `objective-offsets` to the layer's turn*: it misses a turret
+    that already reads the first target (measured above), and `plate-walls`
+    turns nothing.
+  - *Folding §5.6's and §8's switch-offs into this function*: their texts
+    name a well and their callers differ; a refactor of its own if ever.
+
+**D2. `scan` with `autofocus=off` refuses an autofocus that is on, before
+anything moves.** In `_check_autofocus` (§8, check 3): with `off` and an
+autofocus, one `is_engaged()`, nothing else. On (searching too) →
+`PluginRunError`: `autofocus=off, and the autofocus is on: the scan would
+carry its lock over every well's wall with no guard (m2 §12.2 D2): run with
+autofocus=if-engaged to use it, or switch it off first`. A `HardwareError`
+from the read → `PluginRunError` raised outside the handler (FM-19, FM-98):
+`autofocus=off, and whether the autofocus is on could not be read (<Type>:
+<first line>): a lock would cross every well's wall: switch it off at the
+stand, then run the scan again`. `MicroscopeHaltedError` and
+`MotionStoppedError` pass. No autofocus: no read, as today.
+- **In a dry run too**: it only reads, and a dry run rehearses the refusal the
+  run would meet.
+- **On a resume too**: the check runs before anything moves on every attempt.
+- **It replaces `cell_focus`'s refusal of an engaged autofocus with
+  `autofocus=off`** (§21), which can no longer be reached: one text for both.
+- **The parameter's description** says it: `off: never used, and refused
+  when it is on (a lock would cross every well's wall)`.
+- **Not chosen**: *switching it off*, before the first well or at every wall.
+  `off` promises that the scan does not touch the autofocus, the operator who
+  left it on may have meant `if-engaged`, and a scan switched to "no PFS"
+  silently images the first well otherwise than the operator set it. A
+  refusal makes the choice theirs, as `cell_focus`'s does.
+- **Not here**: #459 (the scan's `if-engaged` follow-ups of #416); the CLI's
+  `smc stage move` and `smc stage jog` (§5.6, *Not here*); `plate-finding`'s
+  switch-off before its survey, which reads no state back (§6): a fix of its
+  own if a review asks.
+
+**Tests of #478** (names in the plan on the issue): on the demo stands with
+`RecordingAutofocus`, for `plate-walls` and `objective-offsets` (the latter
+with the turret already at its first target): the switch-off before the first
+move or turn and its `assumed` line first; one that is off left alone; a
+searching one switched off; a stop before it sending nothing; a switch-off
+that raises, a state read that raises, a read back that raises and one that
+still reads on, each failing with nothing moved; a halted stand. For `scan`:
+`off` refusing an autofocus that is on or searching, in a dry run too, and one
+whose state cannot be read, with nothing moved; `off` reading `is_engaged()`
+alone when it is off. **Failure modes**: FM-19, FM-64, FM-88, FM-98, FM-129,
+FM-223.
 
 ## 6. Automatic plate finding (#20)
 
@@ -2691,7 +2798,8 @@ only), `Autofocus`, `ObjectiveTurret`.
    `p0`.
 3. **The autofocus**: `required` with no autofocus or one not engaged:
    `PluginRunError` ("engage PFS on the stand before the scan").
-   `if-engaged`: used when it is engaged now. `off`: never touched.
+   `if-engaged`: used when it is engaged now. `off`: never used, and refused
+   when it is on (§5.7 D2).
 4. **The disk**: `shutil.disk_usage(run_dir).free` must exceed 1.1 × the
    fields left × `H × W × itemsize` of a frame (about 4 MB at 1412²,
    1.2 GB per 96-well well), else `PluginRunError` naming both numbers.
@@ -2766,7 +2874,7 @@ again the autofocus it uses, as §21.6 fixes.
   `required` refuses an autofocus that is missing, off or not locked;
   `if-engaged` refuses one that is on and not locked ("lock it on the
   sample, or switch it off and run with autofocus=off"); `off` reads
-  nothing from it. A failed `engage()` (one that returns False, or raises)
+  only whether it is on, and refuses it on (§5.7 D2). A failed `engage()` (one that returns False, or raises)
   leaves it off (the protocol); the next unlocked field engages it again,
   which is the scan's own state, not one the operator left. An autofocus the
   operator switches off during the scan is not engaged again (FM-129; its
@@ -5777,7 +5885,8 @@ bound), FM-124, FM-125, FM-131, FM-142.
   is #327's.
 - `max_residual_um = 100`: no plate was registered from images yet.
 - 4×, the light and exposure the walls need, other plates than the 24-well,
-  and whether the PFS holds its lock while the stage looks at the walls.
+  and whether the walls are found with PFS switched off before the run
+  (§5.7 D1), at the 40× above all.
 - §17.3's rule (#409) in a walk at the stand. It was measured on the frames
   that the 4× and 10× runs of session 3 saved, and on windows of them, not
   on the frames a walk takes. A meniscus that is longer than
