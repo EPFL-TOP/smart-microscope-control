@@ -3736,7 +3736,8 @@ offset becomes seen (D1).
   the floor, a focus drive to read, `[safety] max_engage_excursion_um` and
   `[safety] z_away_from_sample` (D5). With any of them missing, the unseen
   offset is refused as today, and the refusal names what is missing
-  (§12.10.5).
+  (§12.10.5). *Amended by #349*: and `[safety] z_soft_limits_um`, last
+  (§12.12 D11).
 - **`engage()` only.** The relock and `focus_by_um`'s relock keep D1 as it
   is: they bring Z back to where PFS held it, so an unseen offset there is
   a lost lock, not a first lock.
@@ -3886,7 +3887,9 @@ class SafetySection(_Section):  # gains, after max_engage_excursion_um
   `engage()` sets (the relocks do not). On a declared stand, when the
   offset read is unseen and that keyword is set and the offset is at or
   below the floor, it checks the first lock's conditions in this order: the
-  floor, a focus drive, `max_engage_excursion_um`, `z_away_from_sample`.
+  floor, a focus drive, `max_engage_excursion_um`, `z_away_from_sample`
+  (*amended by #349*: then `z_soft_limits_um`, §12.12 D11; and a factor
+  whose sign contradicts the direction refuses, D12).
   With all of them, the guard is built one-sided (D5) and the engage goes
   on; with one missing, it gives today's refusal with §12.10.5's advice. As
   D1's check, it runs inside the action, before the switch-on, in dry-run
@@ -3914,7 +3917,8 @@ class SafetySection(_Section):  # gains, after max_engage_excursion_um
   autofocus_offset_soft_limits | a focus drive to read | [safety]
   max_engage_excursion_um | [safety] z_away_from_sample>, which this stand
   does not have; until then smc engages only at an offset it has read
-  locked ``.
+  locked ``. *Amended by #349*: `[safety] z_soft_limits_um` ends the list
+  (§12.12 D11).
 - **An unseen offset above the floor** gets the first of the two, with the
   floor's value.
 - **Excursion during a first lock** (`AutofocusExcursionError`): ``
@@ -3926,7 +3930,9 @@ class SafetySection(_Section):  # gains, after max_engage_excursion_um
   so do not try a first lock with it again. The guard reads Z every 10 ms:
   it stops PFS once a jump is read, it does not prevent one ``.
   *Amended by #402*: the bound and the advice of this text are §12.11
-  D10's.
+  D10's. *Amended by #349*: its words "below", "above" and "lower" follow
+  `z_away_from_sample` (§12.12 D15); a trip past the soft limit away from
+  the sample from an offset below the floor says to set the floor (D14).
 - **D6** (`SafetyRefusedError`, `how_to_force=""`): `` autofocus PFS:
   offset not moved: it is <on and not locked | locked, with no
   [autofocus.offset_per_um] factor for objective '3-Plan Apo LmbdD0.25
@@ -3975,6 +3981,8 @@ def set_autofocus_offset(microscope: Microscope, value: float | None) -> DriveRe
   `--dry-run` as the other drive commands) calls `set_offset_native`, then
   prints the readback: `offset 5000 PFSOffset units`. A readback that
   differs from the value asked says so, `reached` false (FM-155).
+  *Amended by #349*: `--floor` read back above the floor says what to
+  change (§12.12 D16).
 - `--floor` with no soft limits exits 1 before anything is sent: `no floor:
   [safety] autofocus_offset_soft_limits is not set (m2 §12.10)`.
 - Reading the floor (`offset_limits_native()`) is a read, so
@@ -4232,6 +4240,8 @@ new one. The INFO line before the switch-on names the bound in force:
 - **Why**: "the floor is not below this objective's focus … do not try a
   first lock with it again" read as a verdict on the 40×, which had locked
   from that floor in C4 ten minutes earlier.
+- *Amended by #349*: on an `"increasing"` stand the text says "not above",
+  "lies below" and "names a higher one" (§12.12 D15).
 
 **#402's questions, answered.**
 - *Reuse an offset seen locked in another well instead of the floor*: no.
@@ -4311,6 +4321,174 @@ with `--profile nikon-ti2`:
   again there. The tools that move between wells with PFS as it is
   (`plate-walls`, `objective-offsets`, `scan` with `autofocus=off`) and the
   CLI's stage moves still carry it.
+
+### 12.12 First-lock follow-ups (#349)
+
+Extends §12.10 and §12.11 (D4, D5, D9, D10, §12.10.4-§12.10.6). **Merging
+this section decides it**: it answers the nine items left by the review
+of #348 (#349; #364 asked three of them first), with the options not
+chosen. No Protocol and no signature changes. On the Ti2-E's profile as it
+stands only the texts change: it declares every condition below, and its
+factors agree with its direction (D12).
+
+#### 12.12.1 What is known
+
+- **The Ti2-E declares a first lock in full** since session 3 (#401,
+  #402): the floor 0, `z_away_from_sample = "decreasing"`, Z soft limits
+  [10, 4350] µm, E 50 µm, R 5 µm.
+- **The sign of offset → Z is measured at both objectives that took a first
+  lock**: positive at the 10× (5.9-10.8 units/µm, #208, #334, #401) and at
+  the 40× (112.6-117.8 units/µm, #401). Both are in
+  `[autofocus.offset_per_um]`. At the 10×, the floor's plane lay about
+  1.1 mm below the focus (offset 0 at Z 3006.14 µm, 7061 at 4120.18 µm).
+- **A retry after a trip starts where the trip left Z.** Measured on the
+  Ti2-E fake (`main` 1a820a0, planning #349), a plane always 60 µm above
+  where Z starts and R = 5 µm: the first `engage()` tripped at 4329.44 µm
+  from 4269.44, the second at 4389.44 from 4329.44, and the third was
+  refused only because Z lay outside the 4350 µm soft limit. Each attempt
+  is bounded; a series is bounded by the Z soft limits alone. At the stand
+  each attempt rises by R plus what Z covers in one read (6.8 µm in F11).
+- **Measured on the same fake**: with no `z_soft_limits_um`, a first lock
+  at the floor dropped Z by 487.8 µm and returned `True`; an offset below
+  the floor (4000, floor 5000) whose drop passed a 4000 µm soft limit
+  tripped with "raise the floor", which cannot help; and on an
+  `"increasing"` stand a trip toward the sample said "not below where Z
+  started … lies above the focus", the words of a `"decreasing"` one.
+- **The Ti2-E truncates the offset toward zero** (7927.5 reads 7927, #207;
+  `FakeCore.hold_whole_units`). A fractional floor there lands below
+  itself, and `engage()` then takes a first lock at that offset (D4: at or
+  below). Only a device that rounds up would land above the floor, where
+  `engage()` refuses with "set the offset to its floor": the circle of
+  #349's item 7.
+
+#### 12.12.2 Decisions
+
+**D11. A first lock also needs `[safety] z_soft_limits_um`** (item 1).
+`_first_lock_missing` gains it, last: the floor, a focus drive, E, the
+direction, then the Z soft limits.
+- **Why**: the band is open away from the sample (D5), so without the soft
+  limits nothing bounds Z on that side; and they are what bounds a series
+  of retries toward the sample (§12.12.1, D13).
+- **Last**, so that each text with one condition missing stays as it is.
+- Not chosen: *a bound of its own on the open side*. The drop is what a
+  first lock asks for, and its length is the distance to the floor's plane
+  (1.1 mm at the 10×): only the stand's own limits bound it sensibly.
+
+**D12. A factor whose sign puts the floor's plane toward the sample refuses
+the first lock** (item 2). The floor's plane lies away from the sample when
+the factor is positive and `z_away_from_sample` is `"decreasing"`, or
+negative and `"increasing"`. When `[autofocus.offset_per_um]` has a factor
+for the objective in place and its sign says the opposite, `engage()` at or
+below the floor is refused, not forceable, nothing sent, in dry-run too:
+every attempt would rise toward the sample by R and trip.
+- **Where**: in `_check_engage`, where the one-sided band would be built
+  (every condition met, the autofocus read off). A searching autofocus at
+  the floor keeps D9's refusal; a seen floor with the autofocus locked keeps
+  D1's path; with a condition missing, D11's refusal comes first.
+- **With no factor** for that objective, nothing changes: the sign is
+  inferred and D5 bounds it (§12.10.9). A first lock is how an objective is
+  locked before its factor is measured (§12.10.7, step 4), so the factor
+  cannot be a condition.
+- **Text** (`SafetyRefusedError`, `how_to_force=""`): `` autofocus PFS: not
+  engaged: a first lock from the offset's floor (m2 §12.10) needs the
+  lowest offset to name the plane farthest from the sample, but
+  [autofocus.offset_per_um] for objective '10x' (5.9) says a larger offset
+  gives a larger Z and [safety] z_away_from_sample is "increasing", so the
+  floor's plane lies toward the sample (m2 §12.12 D12). One of the two is
+  wrong for this stand: check both at the stand; until then smc engages
+  only at an offset it has read locked ``. With a negative factor, "a
+  smaller Z".
+- Not chosen: *a key of its own for the sign*. One more thing to declare
+  from the stand, where the factors already record the sign once measured.
+- Not chosen: *the floor at the upper bound when the sign is negative*. No
+  stand has that sign; the refusal names it if one does.
+- Not chosen: *a `ProfileError` at load*. A profile that contradicts itself
+  for one objective would stop every command on the stand, `smc doctor`
+  included; the refusal is a finding at the call that depends on it.
+
+**D13. A retry after a trip is not refused** (item 3). An `engage()` after
+a first lock's trip toward the sample, at the same floor with the same
+objective, is a first lock again under D5's band.
+- **Why**: the trip is a fact of the place, not of the objective or the
+  floor: the 40× locked from the floor at C4 and tripped at C3 (F11,
+  §12.11 D10), and the layer has no place (§12.11 D9, *Not chosen*). A
+  refusal for (objective, floor) for the rest of the process would refuse
+  C4 after C3. And the CLI, the first lock's route (§12.11.3), opens one
+  `Microscope` per command, so a memory of the process reaches no second
+  command.
+- **What bounds a series** is D11. The trip's text already says to focus by
+  eye before a first lock, which brings Z back; it is unchanged.
+- Not chosen: *refusing while Z reads where the last trip left it*. It would
+  hold on the page only, and a Z move of a micrometre would end it.
+
+**D14. An offset below the floor stays a first lock; its trip past the soft
+limit away from the sample says to set the floor** (item 4). D4's "at or
+below" stands: below the floor the plane lies farther away still, and a
+stand may leave the offset there (§12.10.6). When a first lock from an
+offset below the floor ends past the Z soft limit away from the sample, the
+advice is:
+
+`` autofocus PFS: Z went from 4269.44 µm to 3614.94 µm while it engaged
+from the offset's floor, outside the soft limits [4000, 4350] µm; it was
+switched off. The offset (4000 PFSOffset units) is below its floor (5000
+PFSOffset units), and its plane lies past the Z soft limits, away from the
+sample: set the offset to its floor and engage again (m2 §12.12 D14).
+The guard reads Z every 10 ms: it stops PFS once a jump is read, it does
+not prevent one ``
+
+At the floor, "raise the floor" stays. The text names no CLI command: the
+page shows it too. The offset is the one the guard engaged at (the `seen`
+pair); the floor is the profile's.
+
+**D15. A trip's words follow the direction** (item 6). D10's text takes
+three words from `z_away_from_sample`: `"decreasing"`, "is not below where
+Z started", "lies above the focus", "names a lower one" (the Ti2-E's text,
+unchanged); `"increasing"`, "is not above", "lies below", "names a higher
+one". The name of the procedure, "lock it from below", stays.
+
+**D16. A floor the device does not hold** (item 7). The profile does not
+check the floor's value: whether a device holds whole units is the
+device's, and the readback says it (FM-155). `smc autofocus offset --floor`
+whose readback lies above the floor (a device that rounds up) says what to
+change, `reached` false:
+
+`` offset 7928 PFSOffset units, although 7927.5 was asked: above the floor,
+where engage() takes no first lock; set the floor ([safety]
+autofocus_offset_soft_limits) to a value this device holds (m2 §12.12
+D16) ``
+
+A readback below the floor keeps today's text: `engage()` takes a first
+lock there (D14). `profiles/README.md` says that the floor is a value the
+device holds as written (the Ti2-E: a whole number).
+
+**Seen offsets at a sample change (item 5): settled by D9.** With the
+autofocus off, `engage()` at or below the floor is a first lock whether or
+not the floor was seen, so a second first lock on a page that stays open is
+no longer taken under D2's band. A seen offset above the floor, engaged at
+another place, is §12.11.5's limit, settled for the scan by #416 and for
+`goto-well` and the page's jog by #454. Nothing is forgotten at a sample
+change, and m5 needs no signal for it.
+
+**No behaviour (items 8, 9).** The `Autofocus` Protocol's docstrings
+(`engage()`, `set_offset_native`, `offset_by_native`) say what §12.10-§12.12
+decided: a first lock at or below the floor, and D6's refusal of an offset
+move while on. The tidy-ups of `mm.py` (the guard built once per engage,
+the branches that cannot run, one helper for the offset unit's suffix)
+change no text and no outcome.
+
+#### 12.12.3 Not verified
+
+- That one stand's factors share one sign with every objective (inferred:
+  one offset lens, §12.10.1); D12 reads the factor of the objective in
+  place only.
+- D12 at a stand: no profile contradicts itself today.
+
+#### 12.12.4 Limits of the design, named
+
+- **A series of retries at one place** rises toward the sample by R plus
+  one read's travel each time, until the Z soft limit refuses the next
+  (D13). The operator's by-eye focus between two attempts is what prevents
+  it.
 
 ## 13. Offsets between objectives (#340)
 
