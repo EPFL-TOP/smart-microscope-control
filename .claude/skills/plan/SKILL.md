@@ -126,6 +126,12 @@ the plan, do what it unlocks (labels, dependents), and end the session.
   editing its comment in place
   (`gh api -X PATCH repos/{owner}/{repo}/issues/comments/<id> -F body=@plan.md`),
   or post a complete revised `## Plan`.
+- **A plan never edits `.claude/settings.json`.** The allow list and the
+  denies are the owner's: the auto-mode classifier refuses an edit of the
+  permission settings in a develop session (#432's PR could not add the two
+  `lane.py` lines), so a step that needs it cannot be done. Name the lines to
+  add in the plan, under *Not verified* or *Risks*, and say the owner adds
+  them.
 - **A design PR's body closes nothing, in any wording.** Before `gh pr
   create`, read the body for *close*, *fix* or *resolve* (any ending) within
   a few words of a `#N`: "the build closes #447" in #460's body closed #447

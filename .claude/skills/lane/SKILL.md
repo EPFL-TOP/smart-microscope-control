@@ -24,8 +24,10 @@ tracking issue (where the lane is). Memory keeps nothing of it.
    segment with its state, and exactly one `NEXT:` line. Remember the Point's
    comment id from the header: when it differs between two runs, a new Point
    replaced this one; finish nothing new, post a note "a new Point was posted;
-   relaunch `/lane` from it", and end. Exit 1 (an unknown lane, no Point) or
-   2 (a `gh` failure): say what it printed and end.
+   relaunch `/lane` from it", and end. Exit 1 (an unknown lane, no Point), 2 (a
+   `gh` failure), 4 (a usage error, or a crash of the script: FM-82) or 130
+   (interrupted): say what it printed and end. Exit 3 is the timeout of
+   `--wait`, step 3.
 2. `NEXT: session <skill> <arg> <model>` followed by `BRIEF: <text>`: **one**
    `Agent` call with `subagent_type: "general-purpose"`, `model: <model>`,
    `isolation: "worktree"`, `description: "<skill> <arg> (lane <S>)"` and, as
@@ -36,6 +38,27 @@ tracking issue (where the lane is). Memory keeps nothing of it.
    deviation`, "not ready", an error, a refused command), post them as the
    note's **Next** and end: never work around a refusal, never retry the step
    by hand.
+
+   **A step that changed nothing is not run twice.** `lane.py` derives every
+   state from GitHub, so a subagent that returned without changing anything
+   there (a refused command, a crash before the `Starting` comment, a review
+   never posted, a claim of success with no effect, no output at all) leaves
+   the same step to do. Its last lines are not evidence; the next run of
+   `lane.py` is. When the `NEXT: session ...` line **and** the `BRIEF:` line
+   of that run are identical to those of the step you just ran, post the note
+   with **Next** `you: <skill> <arg> ended without a result; read its worktree
+   or run it by hand`, add that `/lane <S>` resumes it (the state is on
+   GitHub, nothing was marked done), and end: never start it again, never read
+   the worktree yourself.
+   - Compare with the step **just run**, never an earlier one, and compare
+     both lines: a fix round's `NEXT:` line equals the first run's
+     (`NEXT: session develop 5 opus` twice), only its `BRIEF:` says "this is
+     the fix round". So `review 12`, `develop 5` (the fix round), `review 12`
+     is not a repeat, while `develop 5` twice or `review 12` twice in a row is.
+   - A bound on top: the same `BRIEF:` text is started at most twice in one
+     lane session, the second time only after a fix round. Only a `session`
+     line is compared: a `wait` has its own timeout (step 3), an `owner` line
+     ends the lane.
 3. `NEXT: wait <what>` (a CI run, a merge, a step of another lane): post the
    note, unless your previous note already says the same wait; then **one**
    Bash call with `run_in_background: true`: `python scripts/dev/lane.py <S>
