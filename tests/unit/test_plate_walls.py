@@ -178,7 +178,7 @@ def test_a_frame_of_one_level_has_no_wall(level: int) -> None:
 
 def test_a_frame_with_a_second_wall_takes_the_first_fall() -> None:
     # Going outwards: bright, a fall (ours), dark, a rise (the neighbour's near
-    # wall), bright, a second fall (the neighbour's far wall). Only the first.
+    # wall), bright to the frame's end. Only the first fall is one into the dark.
     # At 20 µm per pixel, so that the dark gap, 79 samples, is 1 580 µm: over
     # `MIN_PLASTIC_UM`, a gap between wells and not a band of the meniscus (at 2
     # µm per pixel it is 158 µm, and the next test refuses it).
@@ -187,6 +187,20 @@ def test_a_frame_with_a_second_wall_takes_the_first_fall() -> None:
     edge = find_wall(frame, outward_xy=(1, 0), matrix=_matrix(20.0, 0.0, False))
     assert edge is not None
     assert edge.points_px[:, 0] == pytest.approx(100.5)
+
+
+def test_a_frame_with_two_plastics_takes_the_first() -> None:
+    # The same gap between wells (1 580 µm), then the neighbour's inside, then a
+    # second fall into dark that reaches the frame's end. Both runs qualify as the
+    # plastic (the second by reaching the end); ours is the first, as the plan
+    # decides. Reading the outermost edge from the line's end was rejected for
+    # this frame (#409).
+    frame = np.full((64, 400), 10_000, dtype=np.uint16)
+    frame[:, 100:180] = 1_000
+    frame[:, 300:] = 1_000
+    edge = find_wall(frame, outward_xy=(1, 0), matrix=_matrix(20.0, 0.0, False))
+    assert edge is not None
+    assert edge.points_px[:, 0] == pytest.approx(99.5)
 
 
 def test_a_dark_band_narrower_than_the_plastic_is_not_a_wall() -> None:
@@ -253,24 +267,115 @@ def test_a_speck_in_the_plastic_splits_its_run_only_from_a_band_wide(
         assert edge.points_px[:, 0] == pytest.approx(99.5)
 
 
-def test_a_shadow_joined_to_the_wall_is_not_taken_for_it() -> None:
+@pytest.mark.parametrize(
+    ("pixel_um", "samples", "found"),
+    [
+        (2.75, 353, False),
+        (2.75, 509, False),
+        (2.75, 510, True),
+        (20.0, 69, False),
+        (20.0, 70, True),
+    ],
+    ids=[
+        "972 µm: B5's longest run of meniscus",
+        "1 399.75 µm",
+        "1 402.5 µm",
+        "1 380 µm",
+        "1 400 µm",
+    ],
+)
+def test_the_minimum_plastic_is_asked_at_its_length_in_um_rounded_up(
+    pixel_um: float, samples: int, found: bool
+) -> None:
+    # `MIN_PLASTIC_UM` / 2.75 is 509.09 samples: 509 are too few and 510 enough
+    # (a floor would take 509), and 1 400 / 20 is 70 exactly, enough (a strict
+    # `>` would refuse it). A dark run of 353 samples is 971.75 µm, the longest
+    # run of B5's meniscus that ended inside a frame (§17.1): not the plastic.
+    # The run ends inside the frame, with 100 bright samples on each side.
+    frame = np.full((64, samples + 200), 10_000, dtype=np.uint16)
+    frame[:, 100 : 100 + samples] = 1_000
+    edge = find_wall(frame, outward_xy=(1, 0), matrix=_matrix(pixel_um, 0.0, False))
+    assert (edge is not None) is found
+    if edge is not None:
+        assert edge.points_px[:, 0] == pytest.approx(99.5)
+
+
+def test_the_plastics_minimum_length_is_read_along_the_line_under_a_turned_camera() -> (
+    None
+):
+    # Under a camera turned 45° a sample along the line is 2.75 µm of stage still,
+    # the hypot of the matrix's column and not its first entry (1.944): a dark run
+    # of 545 samples is 1 499 µm along the line and is taken (FM-126, FM-131).
+    # §17.3 reads the length along the line, as the walk does, and not across it.
+    frame = np.full((64, 1_200), 10_000, dtype=np.uint16)
+    frame[:, 100:645] = 1_000
+    edge = find_wall(frame, outward_xy=(1, 0), matrix=_matrix(2.75, 45.0, False))
+    assert edge is not None
+    assert edge.points_px[:, 0] == pytest.approx(99.5)
+
+
+@pytest.mark.parametrize(
+    "shadow",
+    [8_210, 12_700, 15_175],
+    ids=["0.16 of the way", "0.25", "0.30"],
+)
+def test_a_shadow_joined_to_the_wall_is_not_taken_for_it(shadow: int) -> None:
     # B5's +X and -X frames at the 4x (#409, §17.1): going outwards the inside
     # (50 000) falls to a shadow joined to the wall (12 700, 0.25 of the way from
-    # the plastic), which lies below the midpoint, and then to the plastic (250).
-    # The midpoint is crossed at the shadow, 240 columns (660 µm) before the wall.
-    # 64 x 600, not square (FM-73), at the 4x's 2.75 µm per pixel.
+    # the plastic; 0.16 to 0.30 measured), which lies below the midpoint, and
+    # then to the plastic (250). The midpoint is crossed at the shadow, 240
+    # columns (660 µm) before the wall. 64 x 600, not square (FM-73), at the 4x's
+    # 2.75 µm per pixel. A deep level over 0.16 would take the darkest shadow.
     frame = np.full((64, 600), 50_000, dtype=np.uint16)
-    frame[:, 300:540] = 12_700
+    frame[:, 300:540] = shadow
     frame[:, 540:] = 250
     edge = find_wall(frame, outward_xy=(1, 0), matrix=_matrix(2.75, 0.0, False))
     assert edge is not None
-    # The wall's own half level, 6 475, is crossed halfway between the last
-    # shadow column and the first plastic one.
+    # The wall's own half level, between the shadow and the plastic, is crossed
+    # halfway between the last shadow column and the first plastic one.
     assert edge.points_px[:, 0] == pytest.approx(539.5)
     assert edge.points_px.shape == (8, 2)
     # The midpoint stays the one that splits the two classes.
     assert edge.threshold == pytest.approx(25_125.0)
-    assert edge.dark_ratio == pytest.approx(0.2042, rel=1e-3)
+    assert edge.dark_ratio == pytest.approx(
+        (240 * shadow + 60 * 250) / 300 / 50_000, rel=1e-3
+    )
+
+
+def test_a_run_that_never_reaches_the_deep_level_gives_no_point() -> None:
+    # Half the rows are B5's +X frame, the other half have a wide shadow that
+    # reaches the line's end and is never as dark as the plastic (0.25 of the way,
+    # over the deep level of 0.1): a run that qualifies by reaching the end and no
+    # wall in it. Those lines give no point, where a guess would put them on the
+    # shadow's start, 240 columns before the wall.
+    frame = np.full((64, 600), 50_000, dtype=np.uint16)
+    frame[:40, 300:540] = 12_700
+    frame[:40, 540:] = 250
+    frame[40:, 300:] = 12_700
+    edge = find_wall(frame, outward_xy=(1, 0), matrix=_matrix(2.75, 0.0, False))
+    assert edge is not None
+    assert edge.n_lines == 8
+    assert edge.points_px.shape == (5, 2)
+    assert edge.points_px[:, 0] == pytest.approx(539.5)
+    assert edge.points_px[:, 1] == pytest.approx(np.arange(5) * BAND_PX + 3.5)
+
+
+def test_the_levels_are_read_from_the_band_means_not_from_the_pixels() -> None:
+    # A frame of 6 000 inside and 2 400 plastic with noise of 600 counts: the
+    # pixels' 2nd percentile lies far below the plastic's own level (it is the tail
+    # of the noise), the band means' does not. Read from the pixels the deep level
+    # falls under the plastic, lines lose their wall and the others find it where
+    # the noise crosses it, up to 110 columns off (#409, the plan's "decided").
+    rng = np.random.default_rng(1)
+    base = np.full((64, 600), 2_400.0)
+    base[:, :300] = 6_000.0
+    frame = np.clip(base + rng.normal(0.0, 600.0, size=base.shape), 0, 65_535)
+    edge = find_wall(
+        frame.astype(np.uint16), outward_xy=(1, 0), matrix=_matrix(2.75, 0.0, False)
+    )
+    assert edge is not None
+    assert edge.points_px.shape == (8, 2)
+    assert edge.points_px[:, 0] == pytest.approx(299.5, abs=2.0)
 
 
 def test_a_ridge_inside_the_well_is_not_taken_for_the_wall() -> None:
