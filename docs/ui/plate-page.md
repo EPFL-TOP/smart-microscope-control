@@ -362,8 +362,18 @@ a POSIX shell and the button is the way in). Nothing is in the warning colour bu
   (or `Fields: not laid out yet`, or `Fields: out of date (<why>)` when the plate or the timings
   were produced again since, so the plan is stale); `Time: about 42 s`, or, for a plan made with
   no timing measured, `Time: not known (no timing measured yet)`: an unknown, never `0 s`; then what the plan
-  assumed (`assumed: no camera calibration for ...`). The page does not measure the timing
-  itself: that moves the stage;
+  assumed (`assumed: no camera calibration for ...`);
+- **Measure the time**, under what is known, only while the plan says `Time: not known`: it
+  runs `timing` and then lays the fields out again (`scan-plan`, which reads the timings), as
+  one chain, each with what its own *Run* sends (the profile's suggestions are the fields'
+  starting values). **`timing` moves the stage** 200 µm and 9 mm along X and back from where
+  it stands, and switches the autofocus off and on again (it must be on and locked on the
+  sample): every guard of the layer applies, as to the expert view's own tool. The chain's
+  line is drawn under it (`Running Timing (1 of 2).`, `Done: Timing, Field layout.`, or where
+  it stopped), and the plan's time follows. On a page served with `--dry-run` it waits (`A dry
+  run cannot time the stand: ...`): `timing` refuses a dry run. It also waits while a stopped
+  scan's checkpoint stands (`Continue the scan or Start again first: ...`): laying the fields
+  out again would put that checkpoint out of `--resume`'s reach;
 - when the wells selected are **not** the plan's wells, a note says which wells the plan is for
   and to lay the fields out again to scan the others: the plan is what `scan` does, and a
   selection made since has not changed it.
@@ -376,29 +386,54 @@ top right, stops the scan.` On a stand whose profile says a stop is refused, it 
 move already sent finishes first**. From the top:
 
 - **Start the scan**: `scan`, with the autofocus field. It waits, the first that holds, for the
-  stand, for a plan (`lay out the fields first: step 3, Wells`), for the tool's own reason (a
-  stopped scan with a checkpoint is never started afresh by the page: continue it with `smc
-  run --resume`), and says what runs while something does. On a page served with `--dry-run`
-  a note says that **a dry run walks the fields and takes no frame**, so `cells` and what
-  follows have nothing to read; the button still starts it;
-- while it runs, and **after it, until another activity starts**: a progress bar and three
-  lines, `Field 17 of 72`, `Elapsed 41 s`, `Left about 12 s (estimated from the fields so
-  far)`. *Left* is the pace **between the first field and the latest** times the fields that
-  remain, never the pace from the click (a scan takes seconds to its first field on the demo
-  and a fraction of a second for each next): it says `Left: not known yet (it needs two
-  fields)` until there are two reports a clock tick apart, and is not drawn once the last
-  field is done or the run has ended. Live never draws this bar: its frames have no total;
+  stand, for a plan (`lay out the fields first: step 3, Wells`), for the tool's own reason, and
+  says what runs while something does. Over a scan already done it says what a new one
+  replaces: `Starting the scan again replaces this one (72 frames).` (not over a dry run's,
+  which took none). On a page served with
+  `--dry-run` a note says that **a dry run walks the fields and takes no frame**, so `cells`
+  and what follows have nothing to read; the button still starts it;
+- **after a STOP or a failure**, what ended the scan: `Stopped by STOP at field 45 of 72.`
+  (whatever the run document says: a STOP that lands in a move ends the record `failed`), or
+  `Failed at field 45 of 72: <the error's line>`; a page opened after the stop, or that ran
+  something else of its own since, did not see the count and says `Stopped by STOP.` or
+  `Failed: <line>`. When the scan kept a checkpoint the page can continue (the scan saves one
+  after **each well**: a STOP in the first well leaves none, and *Start the scan* then begins
+  again), **Start the scan gives way to two buttons**:
+  - **Continue the scan** takes the scan up where its checkpoint is, as `smc run scan
+    --resume` does, with the same checks: a field typed differently since the stop is refused
+    (`cannot resume scan: the parameters differ from the run being resumed: autofocus`), and
+    nothing runs. The well that was under way when STOP landed is scanned again from its first
+    field. Its **Command** disclosure says `--resume`;
+  - **Start again** drops the checkpoint and starts afresh, and **asks a second click**: the
+    first says `Start again drops the 45 fields already taken: press again to drop them.`
+    Changing screen, any other button, or a new end of the scan asks again; another tab does
+    not inherit the question.
+
+  Both wait with `Press Resume (top right) first: the stand is halted.` until you press
+  *Resume*: a run on a halted stand fails at its first move, and one started afresh would
+  already have dropped the checkpoint. A click that gets through anyway is refused;
+- while it runs, and after it until another activity starts **or until its record is done**: a
+  progress bar and three lines, `Field 17 of 72`, `Elapsed 41 s`, `Left about 12 s (estimated
+  from the fields so far)`. *Left* is the pace **between the first field and the latest** times
+  the fields that remain, never the pace from the click (a scan takes seconds to its first field
+  on the demo and a fraction of a second for each next): it says `Left: not known yet (it needs
+  two fields)` until there are two reports a clock tick apart, and is not drawn once the last
+  field is done or the run has ended. Across a change of well *Left* does not know the stage's
+  long travel between the two wells, and says less than it takes; that stays so until a real
+  scan says it matters. Once the scan is done the result line below says it, and the bar goes.
+  Live never draws this bar: its frames have no total;
 - **what was scanned**, the result line from the run document, so it is there after a
   restart: `Scanned: 72 frames, 0 failed`, or `Scanned in a dry run: no frame was taken`, with
-  the card's `assumed:` lines and the `folder:` where the frames are. A scan that was stopped or
-  failed, or is of an earlier plan, has **no** result line: its record is not a result.
+  the card's `assumed:` lines and the `folder:` where the frames are. It is not drawn while a
+  new scan runs. A scan that was stopped or failed, or is of an earlier plan, has **no** result
+  line: its record is not a result.
 
 **On the map**, the plan's fields stay orange and the ones a scan has a frame for turn **green**
 over them: the first fields **as the scan reports them** while it runs (the scan visits the plan's
 fields in the plan's order), and, once it is done, the fields the run document's scan holds a
 frame for (a field that failed is not green; a dry run takes no frame, so none is). A scan that
-ended `stopped` leaves the map without green fields: its frames are on disk and `smc run
---resume` continues it, but the page claims only what a usable result holds. A field is 512 µm on
+ended `stopped` leaves the map without green fields: its frames are on disk and *Continue the
+scan* takes it up, but the page claims only what a usable result holds. A field is 512 µm on
 a plate of 127 mm, and the map is **framed on the plan's wells** from the Wells screen on (a pitch
 of margin around them), so the fields are specks only on a plan that spans the plate; zoom the map
 to see them.
@@ -942,7 +977,10 @@ its status and its error and **no values**: they are not a result. The card foll
 tab, when a run, a snap or a live view ends (a tool that takes less than a second included) and when
 you press **Refresh**, not every second.
 
-**Run never drops a checkpoint that `--resume` can continue, and never continues one.**
+**Run never drops a checkpoint that `--resume` can continue, and never continues one.** The
+scan is the one stage the page continues: its Scan screen offers *Continue the scan* and *Start
+again* (above), and its Run button in the expert view says ``stopped with a checkpoint: Continue
+the scan, on the Scan screen, takes it up; Start again there drops it``. For every other stage:
 After STOP (or a failure) a stage's record is `stopped` or `failed`, and the checklist
 says `run it again`. When that record holds a checkpoint that `smc run NAME --resume`
 could still continue (made on this stand, not a dry run's checkpoint for a real run, and

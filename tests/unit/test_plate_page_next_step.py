@@ -1421,6 +1421,35 @@ def test_the_step_carries_the_tools_blocked_reason_first(
     )
 
 
+def test_the_next_step_of_a_stage_with_a_checkpoint_names_resume(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # The walk of 2026-11-13: the expert view proposed `smc run scan` without --resume, the
+    # command that drops the checkpoint (m5 §17.12 D17).
+    page = make_page(_profile(sample={}))
+    _plate_done(run_doc)
+    fresh = page.view().next_step
+    assert fresh is not None
+    assert fresh.plugin == "scan-plan"
+    assert "--resume" not in shlex.split(fresh.command)
+    _seed(
+        run_doc,
+        "scan-plan",
+        minute=1,
+        status=StageStatus.failed,
+        checkpoint={"done": 1},
+        reads={"plate": ReadRecord(plugin="plate-registration", attempt="a0")},
+    )
+    held = page.view().next_step
+    assert held is not None
+    assert held.plugin == "scan-plan"
+    words = shlex.split(held.command)
+    assert words[:3] == ["smc", "run", "scan-plan"]
+    assert words.count("--resume") == 1
+    # The same command the *Command* disclosure of a button builds with `resume=True`.
+    assert held.command == page.command_for("scan-plan", held.params, resume=True)
+
+
 # --- the end ------------------------------------------------------------------------------
 
 

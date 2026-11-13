@@ -43,6 +43,7 @@ if TYPE_CHECKING:
         PoseKind,
         ResultCard,
         RunClock,
+        ScanEnd,
         ScanSummary,
         WellView,
     )
@@ -70,7 +71,11 @@ __all__ = [
     "GOTO_WALL_NEEDS_REGISTRATION",
     "LAY_OUT_FIRST",
     "MAP_FIELDS_UP_TO",
+    "MEASURE_AFTER_THE_SCAN",
+    "MEASURE_NOT_IN_A_DRY_RUN",
+    "MEASURE_THE_TIME",
     "NOTHING_LEFT",
+    "NOT_CONNECTED",
     "NO_CALIBRATION_FOR_SIDES",
     "NO_FILES_YET",
     "ORIENTATION_IN_STAGE_TERMS",
@@ -87,7 +92,18 @@ __all__ = [
     "RESULT_TOOLS",
     "RUN_ALL_LABEL",
     "SAMPLE_REGISTERS",
+    "SCAN_CHECKPOINT_KEPT",
+    "SCAN_CONTINUE",
+    "SCAN_FAILED",
+    "SCAN_FAILED_UNCOUNTED",
     "SCAN_FIRST",
+    "SCAN_HALTED",
+    "SCAN_REPLACES",
+    "SCAN_START_AGAIN",
+    "SCAN_START_AGAIN_CONFIRM",
+    "SCAN_START_AGAIN_CONFIRM_UNCOUNTED",
+    "SCAN_STOPPED",
+    "SCAN_STOPPED_UNCOUNTED",
     "SCREEN_LEADS",
     "SCREEN_TITLES",
     "SELECTION_KEPT_ITS_NAMES",
@@ -153,6 +169,9 @@ __all__ = [
     "result_row",
     "results_left",
     "run_all_wait",
+    "scan_actions_wait",
+    "scan_again_confirm",
+    "scan_end_lines",
     "scan_lead",
     "scan_plan_card_lines",
     "scan_progress_lines",
@@ -351,6 +370,46 @@ COVERAGE_WORDS = "How much of each well's width the fields span: 0.4 is 40 %."
 AUTOFOCUS_WORDS = (
     "Autofocus: if-engaged uses it when it is on and locked; required refuses to "
     "start unless it is; off never touches it. The scan never switches it on."
+)
+
+#: Why everything that needs the stand is refused while the page holds none (m5 §7.2):
+#: the one reason a disabled control gives, and the first one. The controller's too.
+NOT_CONNECTED = "the stand is not connected"
+
+#: The Scan screen after a scan that did not end ``done`` (m5 §17.12 D17, part B). The two
+#: ``UNCOUNTED`` variants are for a page that kept no progress of that scan (it was opened
+#: after the stop, or another activity ran since): never ``field None of None``.
+SCAN_STOPPED = "Stopped by STOP at field {done} of {total}."
+SCAN_STOPPED_UNCOUNTED = "Stopped by STOP."
+SCAN_FAILED = "Failed at field {done} of {total}: {text}"
+SCAN_FAILED_UNCOUNTED = "Failed: {text}"
+SCAN_CONTINUE = "Continue the scan"
+SCAN_START_AGAIN = "Start again"
+SCAN_START_AGAIN_CONFIRM = (
+    "Start again drops the {done} fields already taken: press again to drop them."
+)
+SCAN_START_AGAIN_CONFIRM_UNCOUNTED = (
+    "Start again drops the fields already taken: press again to drop them."
+)
+SCAN_HALTED = "Press Resume (top right) first: the stand is halted."
+SCAN_REPLACES = "Starting the scan again replaces this one ({frames} frames)."
+#: Why the scan's own *Run* (the expert view) does not start it afresh over a checkpoint the
+#: Scan screen continues: the page's words, not ``close this page first`` (D17).
+SCAN_CHECKPOINT_KEPT = (
+    "{status} with a checkpoint: Continue the scan, on the Scan screen, takes it up; "
+    "Start again there drops it"
+)
+#: The Wells screen's button while the plan has no time (m5 §17.12 D18), and its wait on a page
+#: served with ``--dry-run``: ``timing`` refuses a dry run, whose calls take no time to measure.
+MEASURE_THE_TIME = "Measure the time"
+MEASURE_NOT_IN_A_DRY_RUN = (
+    "A dry run cannot time the stand: serve the page without --dry-run to measure it."
+)
+#: ... and while a stopped scan's checkpoint stands: the fields laid out again would put it out
+#: of date (FM-172, the adversarial review of #470). The controller's chain refuses it too.
+MEASURE_AFTER_THE_SCAN = (
+    "Continue the scan or Start again first: laying the fields out again would drop "
+    "the stopped scan's checkpoint."
 )
 
 
@@ -1547,6 +1606,64 @@ def scanned_line(summary: ScanSummary) -> str:
     return f"Scanned: {_count(summary.frames, 'frame')}, {summary.failed} failed"
 
 
+#: A record's ``error`` is ``<Type>: <message>`` (the runner's ``_error_line``); the screen says
+#: the message alone, and the type stays in the run document and the log (m5 §17.12 D20).
+_ERROR_TYPE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Interrupt): ")
+
+
+def _without_type(text: str) -> str:
+    """``text`` without a leading exception type name, on one line with its runs of blanks as one space."""
+    flat = " ".join(text.split())
+    return _ERROR_TYPE.sub("", flat, count=1) or flat
+
+
+def scan_end_lines(end: ScanEnd) -> tuple[str, ...]:
+    """What the Scan screen says of a scan that ended ``stopped`` or ``failed`` (m5 §17.12 D17).
+
+    A STOP is said as a stop whatever the record says: a STOP that lands in a move ends the
+    record ``failed`` (FM-64), and ``end.kind`` is the controller's, which knows STOP was
+    pressed. How far it got is the progress the controller kept of that scan; a page that kept
+    none (opened after the stop, or another activity ran since) drops the count rather than
+    say ``field None of None``. A failure says its one line without the exception's type.
+    Plain text (FM-139): the error comes from a plugin.
+    """
+    counted = end.done is not None and end.total is not None
+    if end.kind == "stopped":
+        if counted:
+            return (SCAN_STOPPED.format(done=end.done, total=end.total),)
+        return (SCAN_STOPPED_UNCOUNTED,)
+    text = _without_type(end.text) or "no reason was recorded"
+    if counted:
+        return (SCAN_FAILED.format(done=end.done, total=end.total, text=text),)
+    return (SCAN_FAILED_UNCOUNTED.format(text=text),)
+
+
+def scan_again_confirm(done: int | None) -> str:
+    """What the first click on *Start again* says: the second one drops the checkpoint (m5 §17.12 D17, FM-172)."""
+    if done is None:
+        return SCAN_START_AGAIN_CONFIRM_UNCOUNTED
+    return SCAN_START_AGAIN_CONFIRM.format(done=done)
+
+
+def scan_actions_wait(
+    *, connected: bool, halted: bool, running: str | None
+) -> str | None:
+    """Why *Continue the scan* and *Start again* wait, or ``None`` (m5 §17.12 D17).
+
+    The first that holds: the stand is closed; it is halted (the run would fail at its first
+    move: *Resume* comes first); an activity goes (``busy_note``, Live told apart by its name,
+    the one activity that ends by a button of its own). The tool's other reasons are the
+    runner's, said as the outcome at the click (``check_ready(..., resume=True)``).
+    """
+    if not connected:
+        return NOT_CONNECTED
+    if halted:
+        return SCAN_HALTED
+    if running is not None:
+        return busy_note(running, live=running == "live")
+    return None
+
+
 def plain_default(default: str) -> str:
     """A tool field's default as a placeholder shows it: one pair of matching quotes dropped (m5 §17.10.3).
 
@@ -1616,6 +1733,7 @@ def command_line(
     run_doc: Path,
     dry_run: bool,
     preset: str | None = None,
+    resume: bool = False,
 ) -> str:
     """The ``smc run`` command that makes the call a step makes, quoted for a POSIX shell.
 
@@ -1628,10 +1746,15 @@ def command_line(
     path): given, the terminal's run applies the preset as the page's does, and
     its record names the preset as the page's would (m5 §10.5). The pairs that
     follow repeat what the preset gives, so the command says all it runs.
+
+    ``resume`` adds ``--resume``: the command that continues a stage's checkpoint, which
+    the same command without it drops (m5 §17.12 D17).
     """
     words = ["smc", "run", plugin, "-p", profile, "--run-doc", str(run_doc)]
     if dry_run:
         words.append("--dry-run")
+    if resume:
+        words.append("--resume")
     if preset is not None:
         words += ["--preset", preset]
     for pair in params:
@@ -1794,8 +1917,8 @@ class ResultRow:
 
 
 def _result_name(plugin: str) -> str:
-    """A tool's plain name; a name the table has not is its own."""
-    return RESULT_NAMES.get(plugin, plugin)
+    """A tool's plain name: the row's, else its plain title (``Timing``, D20), else its own name."""
+    return RESULT_NAMES.get(plugin) or tool_title(plugin)
 
 
 def _names(plugins: Sequence[str]) -> str:

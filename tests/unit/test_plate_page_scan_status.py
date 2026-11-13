@@ -26,6 +26,7 @@ from pymmcore_plus import CMMCorePlus
 import smc.ui.controller as controller_module
 from smc.hardware import Microscope
 from smc.hardware.capabilities import Camera
+from smc.hardware.errors import MotionStoppedError
 from smc.hardware.profile import Profile
 from smc.plugins.api import PluginParams, PluginResult, Progress, RunContext
 from smc.plugins.registry import GROUP
@@ -37,10 +38,10 @@ from smc.plugins.slots import (
     ScanPlanResult,
     ScanResult,
 )
-from smc.run import ReadRecord, StageRecord, StageStatus, write_stage
+from smc.run import ReadRecord, RunDocument, StageRecord, StageStatus, write_stage
 from smc.testing import FakeCore
 from smc.ui.controller import PlatePage, RunClock, ScanSummary
-from smc.ui.guide import scan_progress_lines
+from smc.ui.guide import scan_end_lines, scan_progress_lines
 
 pytestmark = pytest.mark.filterwarnings(
     "error::DeprecationWarning", "error::PendingDeprecationWarning"
@@ -746,3 +747,336 @@ def test_a_report_with_no_activity_is_queued_and_stamps_nothing_it_could_not_tim
     status = page.status()
     assert status.progress == Progress("scan", 1, 2, "B2_0000")
     assert status.clock is None
+
+
+# --- part B: the scan after a STOP or a failure (m5 §17.12 D17, #470) ------------------------
+
+
+class CheckpointScanParams(PluginParams):
+    step: int = 1
+
+
+class CheckpointScanResult(PluginResult):
+    resumed_from: int | None
+
+
+class _Kept(PluginParams):
+    """The checkpoint the stub keeps: how many fields it took."""
+
+    taken: int
+
+
+class CheckpointScan:
+    """A ``scan`` of three fields that checkpoints after the first and waits at a gate there.
+
+    ``ending`` says how it ends at the gate: ``stop`` raises ``StopRequested`` once STOP was
+    pressed (a ``stopped`` record), ``move`` raises ``MotionStoppedError`` as a stage stopped in
+    a move does (a ``failed`` record, FM-64), ``fail`` raises a plain error whether or not STOP
+    was pressed. ``resumed`` holds what each run read of the checkpoint (``None``: afresh).
+    """
+
+    name = provides = "scan"
+    summary = "A test scan that keeps a checkpoint."
+    Params = CheckpointScanParams
+    Result = CheckpointScanResult
+    requires: tuple[type, ...] = ()
+    reads: tuple[str, ...] = ()
+    reads_optional: tuple[str, ...] = ()
+    ending: ClassVar[str] = "stop"
+    paused: ClassVar[threading.Event] = threading.Event()
+    release: ClassVar[threading.Event] = threading.Event()
+    resumed: ClassVar[list[int | None]] = []
+
+    def run(
+        self, microscope: Any, params: CheckpointScanParams, ctx: RunContext
+    ) -> CheckpointScanResult:
+        kept = ctx.checkpoint(_Kept)
+        start = 0 if kept is None else kept.taken
+        CheckpointScan.resumed.append(None if kept is None else kept.taken)
+        for done in range(start + 1, 4):
+            ctx.progress(done, 3, f"F{done}")
+            if done == 1 and kept is None:
+                ctx.save_checkpoint(_Kept(taken=1))
+                CheckpointScan.paused.set()
+                CheckpointScan.release.wait(BOUND_S)
+                if CheckpointScan.ending == "fail":
+                    raise RuntimeError("the camera timed out")
+                if CheckpointScan.ending == "move" and ctx.should_stop():
+                    raise MotionStoppedError("xy_stage XY")
+                ctx.raise_if_stopped()
+        return CheckpointScanResult(resumed_from=None if kept is None else kept.taken)
+
+
+def _scan_entry_points(*, with_others: bool = True) -> list[EntryPoint]:
+    scan = EntryPoint(name="scan", value=f"{__name__}:CheckpointScan", group=GROUP)
+    return [scan, *(_entry_points() if with_others else [])]
+
+
+@pytest.fixture
+def scan_page(fake_microscope: Microscope, run_doc: Path) -> Iterator[PlatePage]:
+    CheckpointScan.ending = "stop"
+    CheckpointScan.paused = threading.Event()
+    CheckpointScan.release = threading.Event()
+    CheckpointScan.resumed = []
+    controller = PlatePage(fake_microscope, run_doc, entry_points=_scan_entry_points())
+    try:
+        yield controller
+    finally:
+        CheckpointScan.release.set()
+        controller.close()
+
+
+def _stop_the_scan(page: PlatePage, params: Sequence[str] = ()) -> None:
+    """Start the stub scan, STOP it at its gate, wait for its end and clear the halt."""
+    page.run("scan", list(params))
+    assert CheckpointScan.paused.wait(BOUND_S)
+    page.stop()
+    CheckpointScan.release.set()
+    assert page.join(BOUND_S)
+    page.resume()
+
+
+def test_continue_runs_the_scan_with_resume_and_the_runners_checks(
+    scan_page: PlatePage, run_doc: Path
+) -> None:
+    _stop_the_scan(scan_page)
+    end = scan_page.view().scan_end
+    assert end is not None
+    assert (end.kind, end.done, end.total, end.resumable) == ("stopped", 1, 3, True)
+    # A plain click over the checkpoint starts nothing: the page's words, not "close this page".
+    before = run_doc.read_bytes()
+    scan_page.run("scan", [])
+    outcome = scan_page.status().outcome
+    assert outcome is not None
+    assert "Continue the scan, on the Scan screen" in outcome
+    assert "close this page first" not in outcome
+    assert run_doc.read_bytes() == before
+    assert CheckpointScan.resumed == [None]
+    # Continue: the runner's resume, which hands the plugin its checkpoint.
+    scan_page.run("scan", [], resume=True)
+    assert scan_page.join(BOUND_S)
+    assert CheckpointScan.resumed == [None, 1]
+    record = RunDocument.load_or_new(run_doc).stages["scan"]
+    assert record.status is StageStatus.done
+    assert record.result is not None
+    assert record.result["resumed_from"] == 1
+    assert scan_page.view().scan_end is None
+    # A resume of a stage that finished is the runner's refusal, said as the outcome.
+    scan_page.run("scan", [], resume=True)
+    outcome = scan_page.status().outcome
+    assert outcome is not None
+    assert "cannot resume scan: scan finished" in outcome
+    assert CheckpointScan.resumed == [None, 1]
+
+
+def test_start_again_afresh_drops_the_checkpoint_for_that_call_only(
+    scan_page: PlatePage, run_doc: Path
+) -> None:
+    _stop_the_scan(scan_page)
+    CheckpointScan.paused = threading.Event()
+    CheckpointScan.release = threading.Event()
+    scan_page.run("scan", [], afresh=True)
+    assert CheckpointScan.paused.wait(BOUND_S)
+    # Afresh: the plugin was not handed the checkpoint.
+    assert CheckpointScan.resumed == [None, None]
+    scan_page.stop()
+    CheckpointScan.release.set()
+    assert scan_page.join(BOUND_S)
+    scan_page.resume()
+    # The next plain click is refused again: `afresh` held for one call.
+    before = run_doc.read_bytes()
+    scan_page.run("scan", [])
+    assert run_doc.read_bytes() == before
+    assert CheckpointScan.resumed == [None, None]
+
+
+def test_resume_and_afresh_together_are_refused_before_anything_starts(
+    scan_page: PlatePage, run_doc: Path
+) -> None:
+    with pytest.raises(ValueError, match="not both"):
+        scan_page.run("scan", [], resume=True, afresh=True)
+    assert scan_page._worker is None
+    assert not run_doc.exists()
+    assert scan_page.status().outcome is None
+
+
+def test_a_stop_that_lands_in_a_move_makes_a_stopped_scan_end(
+    scan_page: PlatePage, run_doc: Path
+) -> None:
+    CheckpointScan.ending = "move"
+    _stop_the_scan(scan_page)
+    record = RunDocument.load_or_new(run_doc).stages["scan"]
+    # The record stays `failed` (FM-64); the words follow the STOP.
+    assert record.status is StageStatus.failed
+    assert (record.error or "").startswith("MotionStoppedError: ")
+    end = scan_page.view().scan_end
+    assert end is not None
+    assert (end.kind, end.done, end.total, end.resumable) == ("stopped", 1, 3, True)
+    # Another activity since (a quick run) neither makes the stop a failure nor loses the count.
+    scan_page.run("quick", [])
+    assert scan_page.join(BOUND_S)
+    end = scan_page.view().scan_end
+    assert end is not None
+    assert (end.kind, end.done, end.total) == ("stopped", 1, 3)
+
+
+def test_a_failure_with_no_stop_is_a_failed_scan_end_with_the_records_error(
+    scan_page: PlatePage,
+) -> None:
+    CheckpointScan.ending = "fail"
+    scan_page.run("scan", [])
+    assert CheckpointScan.paused.wait(BOUND_S)
+    CheckpointScan.release.set()
+    assert scan_page.join(BOUND_S)
+    end = scan_page.view().scan_end
+    assert end is not None
+    assert (end.kind, end.done, end.total, end.resumable) == ("failed", 1, 3, True)
+    assert end.text == "RuntimeError: the camera timed out"
+
+
+def test_a_scan_end_seen_by_a_new_page_has_no_field_count(
+    scan_page: PlatePage, fake_microscope: Microscope, run_doc: Path
+) -> None:
+    CheckpointScan.ending = "move"
+    _stop_the_scan(scan_page)
+    scan_page.close()
+    fresh = PlatePage(
+        fake_microscope, run_doc, entry_points=_scan_entry_points(with_others=False)
+    )
+    try:
+        end = fresh.view().scan_end
+    finally:
+        fresh.close()
+    assert end is not None
+    # This page kept no progress and saw no STOP: the record's words, without a count.
+    assert (end.kind, end.done, end.total, end.resumable) == (
+        "failed",
+        None,
+        None,
+        True,
+    )
+    assert end.text.startswith("MotionStoppedError: ")
+
+
+def test_continue_with_fields_changed_since_the_stop_says_the_runners_refusal(
+    scan_page: PlatePage, run_doc: Path
+) -> None:
+    _stop_the_scan(scan_page, ["step=1"])
+    before = run_doc.read_bytes()
+    scan_page.run("scan", ["step=2"], resume=True)
+    assert scan_page.status().outcome == (
+        "scan: ResumeError: cannot resume scan: the parameters differ from the run "
+        "being resumed: step"
+    )
+    # Nothing ran and nothing was written: the checkpoint still stands.
+    assert run_doc.read_bytes() == before
+    assert CheckpointScan.resumed == [None]
+    end = scan_page.view().scan_end
+    assert end is not None
+    assert end.resumable
+
+
+def test_a_scan_with_no_record_or_a_done_record_has_no_scan_end(
+    scan_page: PlatePage,
+) -> None:
+    assert scan_page.view().scan_end is None
+    CheckpointScan.release.set()
+    scan_page.run("scan", [])
+    assert scan_page.join(BOUND_S)
+    assert scan_page.view().scan_end is None
+
+
+@pytest.mark.parametrize("how", ["resume", "afresh"])
+def test_continue_or_start_again_on_a_halted_stand_is_refused_and_keeps_the_checkpoint(
+    scan_page: PlatePage, run_doc: Path, how: str
+) -> None:
+    # A run afresh on a halted stand writes its record over the checkpoint before its first
+    # move fails: the buttons wait for Resume, and a click that arrives anyway (FM-169) is
+    # refused before anything is written.
+    scan_page.run("scan", [])
+    assert CheckpointScan.paused.wait(BOUND_S)
+    scan_page.stop()
+    CheckpointScan.release.set()
+    assert scan_page.join(BOUND_S)
+    assert scan_page.status().halted
+    before = run_doc.read_bytes()
+    scan_page.run("scan", [], **{how: True})
+    assert scan_page.status().outcome == (
+        "Scan: Press Resume (top right) first: the stand is halted."
+    )
+    assert run_doc.read_bytes() == before
+    assert CheckpointScan.resumed == [None]
+    # After Resume the same call runs.
+    scan_page.resume()
+    scan_page.run("scan", [], **{how: True})
+    assert scan_page.join(BOUND_S)
+    assert CheckpointScan.resumed == [None, 1 if how == "resume" else None]
+
+
+def test_a_cleanly_stopped_scan_seen_by_a_new_page_is_a_stop_without_a_count(
+    scan_page: PlatePage, fake_microscope: Microscope, run_doc: Path
+) -> None:
+    # The owner closed and reopened the page after a STOP: the record is `stopped`, and this
+    # page saw no STOP and kept no progress.
+    _stop_the_scan(scan_page)
+    scan_page.close()
+    fresh = PlatePage(
+        fake_microscope, run_doc, entry_points=_scan_entry_points(with_others=False)
+    )
+    try:
+        end = fresh.view().scan_end
+    finally:
+        fresh.close()
+    assert end is not None
+    assert (end.kind, end.done, end.total, end.resumable) == (
+        "stopped",
+        None,
+        None,
+        True,
+    )
+    assert scan_end_lines(end) == ("Stopped by STOP.",)
+
+
+def test_a_later_scan_that_fails_without_a_stop_says_its_own_end(
+    scan_page: PlatePage,
+) -> None:
+    # The STOP of the scan before, and its count, are that run's: a run afresh that fails
+    # with no STOP and before its first report says a failure, without a count.
+    _stop_the_scan(scan_page)
+    CheckpointScan.paused = threading.Event()
+    CheckpointScan.release = threading.Event()
+    CheckpointScan.release.set()
+
+    def fails_at_once(self: Any, microscope: Any, params: Any, ctx: RunContext) -> Any:
+        raise RuntimeError("the camera timed out")
+
+    original = CheckpointScan.run
+    CheckpointScan.run = fails_at_once  # type: ignore[method-assign]
+    try:
+        scan_page.run("scan", [], afresh=True)
+        assert scan_page.join(BOUND_S)
+    finally:
+        CheckpointScan.run = original  # type: ignore[method-assign]
+    end = scan_page.view().scan_end
+    assert end is not None
+    assert (end.kind, end.done, end.total) == ("failed", None, None)
+
+
+def test_a_stop_in_another_tool_does_not_make_a_scan_failure_a_stop(
+    scan_page: PlatePage,
+) -> None:
+    CheckpointScan.ending = "fail"
+    scan_page.run("scan", [])
+    assert CheckpointScan.paused.wait(BOUND_S)
+    CheckpointScan.release.set()
+    assert scan_page.join(BOUND_S)
+    # STOP pressed while another tool runs: that tool's stop, never the scan's.
+    scan_page.run("reporting", [])
+    scan_page.stop()
+    for gate in Reporting.gates:
+        gate.set()
+    assert scan_page.join(BOUND_S)
+    scan_page.resume()
+    end = scan_page.view().scan_end
+    assert end is not None
+    assert end.kind == "failed"
