@@ -3714,7 +3714,10 @@ class PlatePageView:
         The scan visits the plan's fields in the plan's order (measured: the reports' names
         are the plan's), so the first ``done`` are the ones with a frame, a failed field
         counted as visited (the end of the run redraws from the record, which holds the frames
-        that were taken). A **dry run** takes none, whatever the progress says, and the page
+        that were taken). A continued scan's ``done`` is the plan's too (the controller adds
+        back the fields its checkpoint holds, which are the plan's first: whole wells, in the
+        plan's order), so its first ``done`` are the checkpoint's fields and the ones taken
+        since. A **dry run** takes none, whatever the progress says, and the page
         says so (the note, the result line): nothing is drawn while one runs, as the record
         draws none after it. Nothing is drawn before the first report either: the record of an
         earlier scan, drawn by the last redraw, is cleared here. A ``done`` below what was drawn

@@ -477,7 +477,8 @@ class ScanEnd:
     that scan on this page: a STOP that lands in a move ends the record ``failed`` (FM-64), and
     the words follow what the operator did. ``done`` and ``total`` are the last progress this
     page kept of that scan, ``None`` when it kept none (the page was opened after it, or another
-    run of ``scan`` started since). ``text`` is the record's ``error`` as written (``<Type>:
+    run of ``scan`` started since); both count the plan's fields, a continued scan's too
+    (``PlatePage._counted_over``). ``text`` is the record's ``error`` as written (``<Type>:
     <message>``; the guide says the message). ``resumable`` is whether ``reachable_checkpoint``
     finds the record's checkpoint: *Continue the scan* is offered only then.
     """
@@ -665,10 +666,15 @@ class _Handed(NamedTuple):
 
 
 class _Prepared(NamedTuple):
-    """A tool that passed ``run``'s checks: the plugin as loaded and its parsed parameters (m5 §17.11.2)."""
+    """A tool that passed ``run``'s checks: the plugin as loaded and its parsed parameters (m5 §17.11.2).
+
+    ``planned`` is the field count of the plan a resumed ``scan`` reads, ``None`` for any other
+    call: what its reports are counted up to (``PlatePage._counted_over``).
+    """
 
     entry: PluginEntry
     parsed: PluginParams
+    planned: int | None = None
 
 
 class _Ended(NamedTuple):
@@ -1518,6 +1524,13 @@ class PlatePage:
         # event set (``stop()`` sets it and takes no lock, FM-70); the next activity of that
         # name removes it, so a later run says its own end.
         self._stopped_activity: set[str] = set()
+        # The plugin a resumed run is counted for and its plan's field count, under ``_lock``
+        # (review of #496): a resumed ``scan`` counts ``done`` and ``total`` over the wells its
+        # checkpoint does not hold (``wells_to_scan``), and ``_on_progress`` adds back the plan
+        # fields it leaves out, so that every line, the confirm of *Start again* and the map
+        # count the plan's fields. Set by ``_run_plugin_once`` for each run, ``None`` but for a
+        # resume of the scan.
+        self._counted_over: tuple[str, int] | None = None
         # The latest chain (m5 §17.11.2), under ``_lock``: replaced whole at each tool's
         # start and end, never edited, and cleared when another activity starts.
         self._chain: ChainStatus | None = None
@@ -2483,12 +2496,12 @@ class PlatePage:
         if isinstance(prepared, str):
             self._set_outcome(prepared)
             return
-        entry, parsed = prepared
+        entry, parsed, planned = prepared
         self._start_activity(
             plugin,
             lambda event: (
                 self._run_plugin(
-                    plugin, entry, parsed, event, preset, resume=resume
+                    plugin, entry, parsed, event, preset, resume=resume, planned=planned
                 ).outcome
             ),
         )
@@ -2576,7 +2589,14 @@ class PlatePage:
             return f"{plugin}: {type(exc).__name__}: {_one_line(exc)}"
         if kept is not None and not (resume or afresh):
             return f"{plugin}: {_checkpoint_reason(plugin, kept)}"
-        return _Prepared(entry, parsed)
+        planned = None
+        if resume and entry.plugin.name == "scan":
+            # The plan the scan reads (its upstream ``scan-plan``), read in the same document
+            # ``check_ready`` passed: a resume refuses a plan changed since the stop.
+            record = doc.provider("scan-plan")
+            plan = None if record is None else _scan_plan_of(record)
+            planned = None if plan is None else len(plan.fields)
+        return _Prepared(entry, parsed, planned)
 
     def _halted(self) -> bool:
         """Whether the stand is halted now (a STOP not yet cleared by ``resume()``), read inside a read a Disconnect waits for."""
@@ -2866,6 +2886,7 @@ class PlatePage:
             self._progress = None
             self._reported.pop(name, None)
             self._stopped_activity.discard(name)
+            self._counted_over = None
             self._clock_of = name
             self._clock_start = time.monotonic()
             self._clock_end = None
@@ -2953,10 +2974,30 @@ class PlatePage:
         second coarse, and a scan of 0.19 s a field would show every report at the second
         it was read. ``_lock`` is held for the stamp alone, never across the queue's put
         or a device call (FM-70), and this never raises: the runner drops a callback that
-        does, and the rest of the run would show no progress.
+        does, and the rest of the run would show no progress. A resumed scan's report is
+        counted over the plan here, once, so that the status, ``_reported`` and the clock
+        all hold the plan's counts (``_counted_over``).
         """
         now = time.monotonic()
         with self._lock:
+            counted = self._counted_over
+            if (
+                counted is not None
+                and counted[0] == progress.plugin
+                and progress.total is not None
+                and 0 < progress.total <= counted[1]
+            ):
+                # A resumed scan counts the fields its checkpoint does not hold; the plan's
+                # are those plus the ones it holds, which are the plan's first (the plan
+                # lists each well's fields together, in its wells' order, and the
+                # checkpoint keeps whole wells in that order): review of #496.
+                held = counted[1] - progress.total
+                progress = Progress(
+                    progress.plugin,
+                    progress.done + held,
+                    progress.total + held,
+                    progress.message,
+                )
             if self._clock_start is not None:
                 stamped = (max(0.0, now - self._clock_start), progress.done)
                 if self._first_report is None:
@@ -2974,6 +3015,7 @@ class PlatePage:
         preset: str | None = None,
         *,
         resume: bool = False,
+        planned: int | None = None,
     ) -> _Ended:
         """A plugin's run on the worker: its outcome as text, and whether it ended done, stopped or failed.
 
@@ -2988,7 +3030,9 @@ class PlatePage:
         and ``_goto_answer``): ``... not registered`` was true of the plate before it, and a
         drive's text never outlives the plate it was measured on.
         """
-        ended = self._run_plugin_once(plugin, entry, parsed, event, preset, resume)
+        ended = self._run_plugin_once(
+            plugin, entry, parsed, event, preset, resume, planned
+        )
         self._last_ended = ended
         if entry.plugin.provides == "plate":
             with self._lock:
@@ -3004,8 +3048,13 @@ class PlatePage:
         event: threading.Event,
         preset: str | None,
         resume: bool = False,
+        planned: int | None = None,
     ) -> _Ended:
         """``_run_plugin`` without what it does after the run: the run and its outcome."""
+        with self._lock:
+            # Before the runner starts, so before its first report: every run says what its
+            # own reports are counted over, and only a resumed scan has a plan to add back.
+            self._counted_over = None if planned is None else (plugin, planned)
         log.info(
             "%s: %s from the plate page", plugin, "resumed" if resume else "started"
         )

@@ -121,6 +121,8 @@ class StubScan:
     test moves its own clock where the worker would have read it. ``checkpoint_at`` is the
     field after which it saves a checkpoint (``0``: none), and a resumed run starts after the
     fields its checkpoint took; ``resumed`` is what each run read of the checkpoint.
+    ``counts_the_rest`` counts a resumed run as the real scan does: ``done`` and ``total``
+    over the fields its checkpoint does not hold (``wells_to_scan``, review of #496).
     """
 
     name = provides = "scan"
@@ -137,6 +139,7 @@ class StubScan:
     before_report: ClassVar[Callable[[int], None] | None] = None
     checkpoint_at: ClassVar[int] = 0
     resumed: ClassVar[list[int | None]] = []
+    counts_the_rest: ClassVar[bool] = False
 
     def run(
         self, microscope: Any, params: StubScanParams, ctx: RunContext
@@ -153,7 +156,10 @@ class StubScan:
             hook = StubScan.before_report
             if hook is not None:
                 hook(position)
-            ctx.progress(position, total, field.name)
+            if StubScan.counts_the_rest:
+                ctx.progress(position - start, total - start, field.name)
+            else:
+                ctx.progress(position, total, field.name)
             if position == StubScan.checkpoint_at:
                 ctx.save_checkpoint(_Taken(taken=position))
             if position == StubScan.pause_at:
@@ -217,6 +223,7 @@ def _fresh_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[No
     StubScan.pause_at = 0
     StubScan.checkpoint_at = 0
     StubScan.resumed = []
+    StubScan.counts_the_rest = False
     StubScan.paused = threading.Event()
     StubScan.release = threading.Event()
     StubScan.before_report = None
@@ -1857,6 +1864,52 @@ def test_continue_runs_the_scan_with_resume_from_the_view(
     assert view.scan_button.visible is True
     assert view.scan_progress.visible is False
     assert view.scanned_block.object.startswith("Scanned: 12 frames")
+
+
+def test_a_continued_scan_counts_and_draws_the_plans_fields_not_the_rests(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # The real scan counts a resumed run over the wells its checkpoint does not hold: without
+    # the plan's count added back, the continued scan read `Field 6 of 8` and drew the plan's
+    # first six fields, a second STOP said `field 6 of 8`, and Start again's confirm said it
+    # dropped 6 fields where it drops 10 (review of #496, FM-172).
+    plan = _scan_plan_result()
+    centres = [(f.x_um, f.y_um) for f in plan.fields]
+    view = _stopped_view(page, run_doc)
+    assert view.scan_end_text.object == "Stopped by STOP at field 5 of 12."
+    StubScan.counts_the_rest = True
+    StubScan.checkpoint_at = 8
+    StubScan.pause_at = 10
+    _click(view.scan_continue_button)
+    assert StubScan.paused.wait(BOUND_S)
+    view.tick()
+    assert StubScan.resumed == [None, 4]
+    assert view.scan_progress_text.object.split("\n")[0] == "Field 10 of 12"
+    assert (view.scan_progress.value, view.scan_progress.max) == (10, 12)
+    # The checkpoint's four fields and the six taken since: the plan's first ten.
+    data = view.imaged_source.data
+    assert list(zip(data["x"], data["y"], strict=True)) == centres[:10]
+    page.stop()
+    StubScan.release.set()
+    assert page.join(BOUND_S)
+    page.resume()
+    view.tick()
+    assert view.scan_end_text.object == "Stopped by STOP at field 10 of 12."
+    _click(view.scan_again_button)
+    view.tick()
+    assert view.scan_actions_text.object == (
+        "Start again drops the 10 fields already taken: press again to drop them."
+    )
+    # A third leg continues from the checkpoint the second one saved: counted from field 9.
+    StubScan.paused = threading.Event()
+    StubScan.release = threading.Event()
+    StubScan.pause_at = 9
+    page.run("scan", [], resume=True)
+    assert StubScan.paused.wait(BOUND_S)
+    assert page.status().progress == Progress("scan", 9, 12, plan.fields[8].name)
+    StubScan.release.set()
+    assert page.join(BOUND_S)
+    assert StubScan.resumed == [None, 4, 8]
 
 
 def test_both_actions_wait_for_resume_while_the_stand_is_halted(

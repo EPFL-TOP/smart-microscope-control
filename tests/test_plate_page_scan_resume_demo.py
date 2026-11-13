@@ -96,9 +96,18 @@ def test_a_scan_stopped_and_continued_from_the_page_takes_every_field_once(
         page.resume()
         page.run("scan", page.page_params("scan"), resume=True)
         assert page.join(BOUND_S), "the continued scan did not end"
-        outcome = page.status().outcome
+        status = page.status()
+        outcome = status.outcome
         assert outcome is not None
         assert outcome.startswith("Scan done in "), outcome
+        # The real scan counts a resumed run over the wells its checkpoint does not hold: the
+        # page counts the plan's fields, so its last report is the plan's last field (review
+        # of #496).
+        assert status.progress is not None
+        assert (status.progress.done, status.progress.total) == (
+            len(plan.fields),
+            len(plan.fields),
+        )
         done = RunDocument.load(run_doc).stages["scan"]
         assert done.status is StageStatus.done
         assert done.result is not None
