@@ -9,7 +9,8 @@
   plan's calibration from another run document, §23, for issue #383
   (2026-11-10); the plate's orientation in its holder, §24, for issues #434
   and #422 (2026-11-11); a run's frames for whoever runs it, §25, for issue
-  #447 (2026-11-11).
+  #447 (2026-11-11); the cells' plane in the route and the export, §26, for
+  issue #392 (2026-11-13).
 - **Owner**: the design session. **Executors**: `/develop` sessions, one per issue.
 - **Rule**: as in M1 and M2, this document is the contract between issues
   that are built in parallel. Names, module paths and signatures below are
@@ -1358,6 +1359,10 @@ class RoutePosition(SlotValue):
     pfs_offset: float | None
     counts: dict[str, int]
 ```
+
+*Amended by §26 (#392)*: `RoutePosition` gains `offset_from_focus:
+OffsetFromFocus | None = None`, last, and `pfs_offset` is the offset of the
+cells' plane for a stop that has one.
 
 ```python
 class RouteResult(PluginResult):
@@ -4085,6 +4090,10 @@ whose autofocus had lost the sample.
   both the operator's choice); Ctrl-C ends it at once. Reopen it if the
   plate page's Stop shows the wait at a stand.
 
+*Amended by §26 (#392)*: a stop whose frame has a focus step on the cells (§21)
+takes the offset of the cells' plane, derived from the frame's lock offset and
+its `dz_um` with the profile's factor, or none, with `assumed` saying which.
+
 **Tests** (hypothesis where marked): `test_no_field_leaves_its_well_or_enters_an_exclusion`
 (hypothesis over margins, exclusions, rotations); `test_chosen_fields_never_overlap`;
 `test_the_greedy_takes_the_densest_field_first`;
@@ -4562,6 +4571,9 @@ prototype that is not committed, on Python 3.13 and 3.10):
 Not verified: that NIS-Elements 6.20 loads a file this encoder wrote, in
 each mode (a `pfs-offset` list sets both flags, which the sample does not
 show), and that a stop exported this way is the field the scan imaged.
+
+*Amended by §26 (#392)*: in `pfs-offset` mode, `assumed` gains a line when a
+stop's offset was derived by `route` (§26.5).
 
 ## 15. The plate page (#197)
 
@@ -7263,7 +7275,7 @@ when `cell_focus != "off"` and not in a dry run:
 - with the autofocus used: `each frame's pfs_offset names the plane PFS
   held, not the cells' plane <min>…<max> µm from it: an export that
   engages PFS at that offset images the plane PFS held` (route and
-  NIS-Elements: #392);
+  NIS-Elements: §26, #392);
 - in a dry run, instead: `dry run: the focus on the cells was planned
   (<n> planes per sweep), not run`.
 
@@ -7413,7 +7425,8 @@ At the Ti2-E, 40× on a plate with cells, PFS locked on them (m2 §12.10.7):
 - The time per plane (a Z move of a step and its settling, FM-195, then a
   snap) and per field, against §21.6's `assumed` line.
 - Whether a Z readback lands within a quarter step of its command.
-- The 40×'s offset factor, which #392 (route and NIS-Elements) waits for.
+- The cells' plane in the route and the export: §26.9 (#392). The 40×'s offset
+  factor is in the profile since session 3 (#401).
 
 ## 22. The lab's own plate definitions (#400)
 
@@ -8379,3 +8392,379 @@ session's Report gives the six durations and the counts.
 
 - The image following a scan at the Ti2-E (Prime 95B frames, the stand PC's
   speed, over RDP), and a scan's duration there with the page open.
+
+## 26. The cells' plane in the route and the export (#392)
+
+A scan with `cell_focus` (§21) takes each frame at the cells' plane with PFS
+off. The frame's `z_um` is that plane, and its `pfs_offset` is the offset of
+the lock the sweep was centred on, so it names the plane PFS held, `dz_um`
+below or above the cells (§21.2 D1). `route` copies both into its stops
+(§11) and `nis-export` writes `pfs_offset` with PFS enabled (§14):
+NIS-Elements would engage PFS at that offset and image the plane PFS held,
+not the cells'. The scan's `assumed` says so (§21.6); nothing acted on it.
+This section makes a route from a cell-focused scan **carry an offset that
+names the cells' plane, or no offset, and say why**. It extends §3.5, §11 and
+§14 additively (one optional field of `RoutePosition`, one pure module, new
+`assumed` lines) and changes no layer interface and not the scan. **Merging
+this section decides it.**
+
+### 26.1 What is known (2026-11-13, planning #392)
+
+On `main` `1594a82`, Python 3.13, pydantic 2.13.5, in throwaway scripts that
+are not committed:
+- **The 40×'s factor is measured.** `profiles/nikon-ti2.toml` holds
+  `"3-Plan Apo LmbdD0.25 40x" = 112.6` offset units per µm since session 3
+  (#401): four points under lock, at offsets 0, 4048, 5388 and 6973, gave
+  117.8, 116.1 and 112.6 per interval and 116.3 over the whole span, and the
+  smallest is entered. It is positive: a larger offset gives a larger Z, and
+  `z_away_from_sample` is `"decreasing"`, so a larger Z is toward the sample
+  (m2 §12.12.1). The 10×'s is 5.9. The two blockers the issue names (the focus
+  on the cells, PR #394, and the 40×'s factor) are therefore met.
+- **The factor lives in the profile and nowhere else.** The `Autofocus`
+  Protocol has no read of it: `focus_by_um` uses it and moves (m2 §3.5), and at
+  the 40× it is refused above 0.44 µm unless forced (`max_autofocus_offset_jog
+  = 50` units, the profile's own comment). Plugins already read the profile
+  through the facade (`goto-well` its holder's centre, `cell_focus.loop` its Z
+  jog limit), so `microscope.profile.autofocus.offset_per_um` and
+  `microscope.profile.safety.autofocus_offset_soft_limits` are readable from
+  `route` with no Protocol change.
+- **On the demo** (`Profile.demo()`): no factor, no offset limits, and the
+  objective in place is `Nikon 10X S Fluor`. `monkeypatch.setattr(microscope,
+  "profile", copy)`, the copy holding a factor and limits (`model_copy`
+  twice), is read back by the next call, so a plugin test can give the stand
+  a factor.
+- **The frame's numbers.** `ScanFrame.pfs_offset` is read before the
+  switch-off (§21.6, step 2) and `FieldFocus.dz_um` is the frame's Z command
+  minus the centre, 0.0 without a peak (§21.5).
+- **Prototyped** (a `RoutePosition` with the new field, the rule of §26.3;
+  `mypy --strict` clean, `ruff` clean apart from the missing docstrings): a
+  lock at 5388 with `dz_um = -3.0` gives 5050 (5050.2), +2.7 gives 5692
+  (5692.02), −2.95 gives 5056 (5055.83), and the factor −112.6 mirrors the
+  first (5726). `round()` takes a tie to the even integer (5669.5 gives
+  5670), so no test value sits on one. A stop without the field dumps the
+  same JSON as today's `RoutePosition`, and today's model refuses a dump that
+  has it (`ValidationError`, FM-107).
+- **Not measured**: anything at the Ti2-E, and that NIS-Elements engages PFS
+  at the plane that an offset names the way Micro-Manager's `PFSOffset` does
+  (§14 shares the unit, 9370 in the sample, and its sample never had both
+  flags set).
+
+### 26.2 Decisions
+
+**D1. The route derives the offset from the profile's factor** (option 1 of
+the issue). A stop whose frame came from a cell-focused field gets
+`pfs_offset = lock offset + dz_um × factor`, rounded to a whole unit, and
+says it was derived (§26.3, §26.6). Where it cannot be derived (D3 to D5),
+the stop has **no** `pfs_offset` and keeps `z_um`, which is already the
+cells' plane (option 2's form, per stop), and `assumed` says why.
+- *Why*: an offset names a plane relative to the plate's bottom, which PFS
+  follows, so it carries the cells' height to a field that an absolute Z does
+  not reach (the plate's tilt, and from well to well F11's 104 µm), and the
+  export keeps PFS through the acquisition.
+- Not chosen: *Z only for a cell-focused scan* (option 2 as the rule). One
+  flag covers the whole list (§14): the export would lose PFS for every
+  position, and the acquisition's focus drift with it, to correct a plane a
+  few micrometres away.
+- Not chosen: *the scan carries the focus into the offset* (option 3,
+  §21.2 D1's later change). It needs `focus_by_um` under lock, which the
+  profile's jog limit refuses above 0.44 µm at the 40×, and a settle window
+  per well. A scan that did it would record the cells' own offset and no
+  distance to convert, and nothing here prevents it: it is a later issue,
+  measured against this one's cost.
+- Not chosen: *the scan records the derived offset in its frame*. `pfs_offset`
+  there is a reading (§3.4); a derived value belongs to the stage that needs
+  it, and the factor stays out of the scan's record.
+
+**D2. The conversion.** `offset = round(lock_offset + dz_um × offset_per_um)`,
+the factor's sign included. It is rounded to a whole unit because the Ti2-E
+holds whole units (7927.5 reads 7927, #207) and NIS's own offsets are whole:
+at most half a unit, 0.005 µm at the 40×. The value is a `float` with an
+integer value.
+
+**D3. Only when there is a distance to convert.** The frame's `focus` is
+`locked`, its `pfs_offset` is not `None`, and its `cell_focus` is set with
+`dz_um != 0.0`. Every other frame is as the scan recorded it and needs no
+factor: no step (a scan without the feature, a field that got none), no
+autofocus (`off`, `none`: no offset), and a sweep with no peak or a peak on
+the centre (`dz_um` is 0.0: the frame's Z is the lock's plane and its offset
+names it). §11's rule of #232 is unchanged: both values come from one frame,
+the nearest that is not `unlocked` (FM-154).
+
+**D4. The factor is the scan's objective's.** `scan.objective`, looked up by
+its exact label in `[autofocus.offset_per_um]`. A stop of another objective
+(the route's `objective=`) has no frame to read (§11) and nothing to convert.
+A scan that recorded no objective, or a profile with no entry for it, gives
+no offset: a factor measured at one objective is never used for another
+(FM-214).
+
+**D5. Bounds, each ending in no offset, never a clamp** (FM-121). The factor
+is finite and non-zero (the profile's own rule, repeated: the function does
+not trust its caller). `dz_um` is finite and `|dz_um| <= MAX_RANGE_UM` (50 µm,
+§21.3): the scan never sweeps wider, so a larger value is a record edited
+behind the runner (FM-111). The derived offset lies inside `[safety]
+autofocus_offset_soft_limits`, bounds included, when the profile has them.
+smc's guards do not reach NIS-Elements, which engages PFS at the offset it is
+given, so the offset is the one number that must stay inside the range the
+layer itself would accept (m2 §12.10, not forceable).
+
+**D6. The factor's error is stated, not hidden.** It is one number for a
+factor that falls as the offset rises (§26.1: 117.8, 116.1, 112.6), and the
+smallest is entered. Within the measured offsets (0 to 6973) the derived
+distance undershoots by up to 4.4 %, which is 0.22 µm at the default ±5 µm
+sweep; above them it may overshoot, by an amount nobody measured (the stand's
+own 40× offset is 17794). Every derived stop says so (§26.6), and §26.9 lists
+it.
+
+**D7. `z_um` is never changed.** It is the readback at the cells' plane.
+
+**D8. A stop whose frame found no peak says so.** Its frame lies at the
+sweep's centre: Z and offset agree, and name the plane PFS held, not the
+cells' (§21.3's `flat`, `at-edge` and `two-peaks`). `route`
+counts those stops in `assumed` (§26.6): that the plane was not found is not
+something a number can say.
+
+**D9. One stop, one frame, as before.** Averaging `dz_um` over a well's
+frames is not chosen: one sweep's peak is noisy, a flat one gives 0.0, and
+the nearest-frame rule of §11 serves Z and offset together. Revisit it with
+the stand's numbers.
+
+**D10. `scripts/dev/select_fields.py` is not changed here.** It builds its
+stops from a frame's own offset (#343's prototype), and its follow-up is #488,
+which calls `stop_focus`.
+
+### 26.3 The interface — `slots/route.py`, `route/focus.py` (new)
+
+```python
+class OffsetFromFocus(SlotValue):
+    lock_offset: float
+    dz_um: float
+    offset_per_um: float
+```
+
+`lock_offset` is the offset the scan read locked at the frame's field, before
+the focus step switched PFS off (the frame's `pfs_offset`); `dz_um` is the
+frame's `cell_focus.dz_um`; `offset_per_um` is the profile's factor, sign
+included. A validator refuses `offset_per_um == 0` (`ValueError`). Exported
+from `slots/__init__.py`.
+
+```python
+class RoutePosition(SlotValue):  # gains, last
+    offset_from_focus: OffsetFromFocus | None = None
+```
+
+For a stop that has one, `pfs_offset` is the offset of the cells' plane,
+`round(lock_offset + dz_um × offset_per_um)`. A validator refuses
+`offset_from_focus` with no `pfs_offset` (`ValueError` naming both); it does
+not recompute the sum. A wrap serializer drops the key when it is `None`, as
+`ScanFrame.cell_focus` does (§21.5): a route from a scan without the step is
+written exactly as before, still reads in an older smc, and `SCHEMA_VERSION`
+stays 1. A route with a derived stop does not read in an older smc (FM-107),
+as intended. `RoutePosition`'s docstring says that `pfs_offset` is the scan's
+reading except for a stop that has `offset_from_focus`.
+
+```python
+StopOutcome = Literal[
+    "recorded", "derived", "no-objective", "no-factor", "outside-limits", "implausible"
+]
+```
+
+```python
+@dataclass(frozen=True, slots=True)
+class StopFocus:
+    z_um: float | None
+    pfs_offset: float | None
+    derived: OffsetFromFocus | None
+    outcome: StopOutcome
+    refused_offset: float | None  # "outside-limits": the offset refused
+    no_peak: bool  # the frame's own sweep found no peak (D8)
+```
+
+```python
+def stop_focus(
+    frame: ScanFrame | None,
+    *,
+    objective: str | None,
+    factors: Mapping[str, float],
+    offset_limits: tuple[float, float] | None,
+) -> StopFocus: ...
+def focus_assumed(
+    stops: Sequence[StopFocus],
+    *,
+    total: int,
+    objective: str | None,
+    offset_limits: tuple[float, float] | None,
+) -> tuple[str, ...]: ...
+```
+
+Pure, in `smc/plugins/route/focus.py`: it imports the slot models and
+`MAX_RANGE_UM` from `smc.plugins.cell_focus.algorithm`, never a capability.
+`stop_focus`, in this order:
+1. `frame is None`: `recorded`, with every value `None` and `no_peak` false.
+2. `no_peak` is true when the frame's `cell_focus` has `source == "swept"` and
+   its sweep's `outcome != "peak"`; false otherwise.
+3. D3's condition not met: `recorded`, with the frame's `z_um` and
+   `pfs_offset` as they are.
+4. `dz_um` not finite, or `abs(dz_um) > MAX_RANGE_UM`: `implausible`.
+5. `objective is None`: `no-objective`.
+6. `factors` has no entry for `objective`, or the entry is not finite or is
+   zero: `no-factor`.
+7. `offset = float(round(pfs_offset + dz_um * factor))`; with `offset_limits`
+   set and the offset outside it, bounds included: `outside-limits`, with
+   `refused_offset`.
+8. Otherwise `derived`, with `derived` an `OffsetFromFocus` and `pfs_offset`
+   the offset.
+
+Steps 4 to 7 keep the frame's `z_um` and give `pfs_offset=None`,
+`derived=None`. `focus_assumed` is §26.6's lines, in its order.
+
+### 26.4 In the route — `route/plugin.py`
+
+- Read once per run, when the imaging objective is the scan's:
+  `microscope.profile.autofocus.offset_per_um` and
+  `microscope.profile.safety.autofocus_offset_soft_limits`. Nothing else is
+  asked of the stand: `route` still moves nothing and reads no device.
+- Each stop calls `stop_focus(frame, objective=scan.objective, ...)` where it
+  copied `frame.z_um` and `frame.pfs_offset` (the frame is still chosen as in
+  §11), and takes `z_um`, `pfs_offset` and `offset_from_focus` from the
+  result. For another objective there is no frame: the call gets `None` and
+  gives today's `None`s and no line.
+- `assumed` gains `focus_assumed(...)` after §11's lines, the unlocked line
+  included.
+
+### 26.5 In the export — `nis_export/plugin.py`
+
+`z_mode` and `_nis_position` are unchanged: a derived offset is written like
+any other. In `pfs-offset` mode, when `k > 0` stops have `offset_from_focus`,
+`assumed` gains one line after `_BOTH_FLAGS` (§26.6). In `z` and `none` mode
+no line is added: the offsets are not written, the existing lines count the
+stops that have none, and the route's `assumed` says why.
+
+### 26.6 The texts
+
+The words that matter come first and a free text (the objective's label) is
+last, so that the plate page's card, which cuts a line at 600 characters
+(FM-205, FM-139), never cuts what a line says. `<n>` and `<total>` are the
+stops concerned and all the route's stops, `<lo>` and `<hi>` the smallest and
+largest `dz_um` of the derived stops (`{:+.2f}`), `<factor>` the factor
+(`{:g}`), `<first>` the first refused offset (`{:.0f}`), and `<a>`, `<b>` the
+limits (`{:g}`). Each line is added only when its count is above 0, in this
+order, after §11's lines:
+
+- derived: `<n> of <total> stops carry a pfs_offset derived for the cells'
+  plane, not read with PFS locked there: their frame was taken <lo>…<hi> µm
+  from the plane PFS held, and the offset is the lock's plus that distance
+  times the profile's factor (one number for a factor that varies with the
+  offset), rounded to a whole unit; <factor> offset units per µm for
+  <objective>`;
+- `no-objective`: `<n> of <total> stops have no pfs_offset: their frame was
+  taken away from the plane PFS held (the focus on the cells) and the scan
+  recorded no objective, so the profile's offset_per_um factor cannot be
+  looked up; they keep z_um, the cells' plane`;
+- `no-factor`: `<n> of <total> stops have no pfs_offset: their frame was
+  taken away from the plane PFS held (the focus on the cells) and the profile
+  has no [autofocus.offset_per_um] factor for the scan's objective; they keep
+  z_um, the cells' plane (objective: <objective>)`;
+- `outside-limits`: `<n> of <total> stops have no pfs_offset: the offset
+  derived for the cells' plane (<first> for the first) lies outside the
+  profile's autofocus_offset_soft_limits [<a>, <b>]; they keep z_um, the
+  cells' plane`;
+- `implausible`: `<n> of <total> stops have no pfs_offset: their frame's plane
+  is not within 50 µm of the plane PFS held (the focus sweep's largest
+  range), so the record cannot be right; run scan again; they keep z_um`
+  (`50` is `{MAX_RANGE_UM:g}`);
+- no peak: `<n> of <total> stops took their frame from a field whose focus
+  sweep found no peak (flat, at an edge or two peaks): its plane is the
+  sweep's centre, not the cells' plane`.
+
+The export's line (`<k>` stops with `offset_from_focus`, `<n>` positions):
+`<k> of <n> positions have a dPFSOffset that route derived from the scan's
+lock offset and the distance of the cells' plane from it, with the profile's
+factor, and not read: NIS-Elements engages PFS at a plane that was never read
+locked`.
+
+Measured on the longest forms (a 60-character label, `-50.00…+50.00`, a
+factor of `-112.6`, limits `[0, 20000]`, 120 stops): 426, 240, 267, 198, 195
+and 165 characters, and 235 for the export's.
+
+### 26.7 Docs
+
+`docs/plugins/route.md` (the stop's offset, the new lines, the profile read),
+`docs/plugins/nis-export.md` (the new line, what a derived offset is),
+`docs/plugins/scan.md` and `docs/plugins/focus-on-cells.md` (each says that
+the route now derives the cells' plane's offset and no longer names #392 as
+waiting for the factor).
+
+### 26.8 Tests
+
+Every expected value is written in the test from the frame's numbers and
+the factor (FM-124), on a non-square frame (FM-73), and none is the number
+of the tolerance it is compared with, except the offset limits, which are
+tested on the bound and one unit beyond it.
+- **The rule** (`tests/unit/test_route_focus.py`, new):
+  - `test_a_frame_without_a_focus_step_keeps_the_scans_offset`,
+    `test_a_frame_at_the_centre_keeps_the_scans_offset_and_needs_no_factor`
+    (`dz_um` 0.0, no factors);
+  - `test_the_offset_moves_by_the_distance_times_the_factor` (5388 with −3.0
+    and 112.6: 5050; +2.7: 5692; −112.6 and −3.0: 5726; the record's three
+    fields), `test_the_offset_is_rounded_to_a_whole_unit` (−2.95: 5056, up);
+  - `test_no_objective_no_entry_or_a_bad_factor_gives_no_offset_and_keeps_z`
+    (`None`; a label not in `factors`; 0.0, `nan`, `inf`);
+  - `test_an_offset_outside_the_profiles_limits_is_left_out_from_both_sides`
+    (factor 100, limits 0 to 20000: `dz_um` 10 at a lock of 19000 gives
+    20000, kept, and at 19001 gives 20001, refused with its value; `dz_um`
+    −10 at 1000 gives 0, kept, and at 999 gives −1, refused; with no limits
+    20001 is kept);
+  - `test_a_distance_beyond_the_sweeps_largest_range_is_implausible` (49.9
+    kept, 50.1 refused, and a non-finite one from `model_construct`);
+  - `test_an_unlocked_off_or_none_frame_is_left_as_recorded` (FM-154);
+  - `test_a_sweep_without_a_peak_is_flagged_and_left_as_recorded` (the three
+    outcomes; not for `peak`, not for `source == "well"`);
+  - `test_z_is_the_frames_in_every_outcome`;
+  - the texts: `test_each_line_is_the_one_of_the_design` (every line, exact),
+    `test_the_lines_keep_their_words_before_the_objective_and_stay_short`
+    (a 60-character label, at most 500 characters; a 700-character label with
+    a line break, one line, the label last, FM-139, FM-205),
+    `test_the_derived_range_is_the_smallest_and_largest_distance`,
+    `test_a_route_without_a_focus_step_gets_no_line`.
+- **The slot** (`tests/unit/test_slots.py`): `SLOTS_MAP` gains
+  `OffsetFromFocus`, `SAMPLES` gain a stop with it;
+  `test_a_stop_without_an_offset_from_focus_dumps_without_the_key`,
+  `test_an_offset_from_focus_needs_a_pfs_offset_and_a_non_zero_factor`,
+  `test_a_route_with_a_derived_stop_is_refused_by_a_model_without_the_field`.
+- **The route** (`tests/test_route_demo.py`: `_seed` gains `cell_focus_of`,
+  a map from `(well, field index)` to a `FieldFocus`, and a helper gives the
+  stand a factor and limits through `monkeypatch`; every test already there
+  stays as it is):
+  - `test_a_cell_focused_frames_offset_names_the_cells_plane_in_the_stop`,
+    `test_the_derived_offset_follows_the_nearest_frame_not_the_wells_first`;
+  - `test_without_a_factor_the_stops_have_no_offset_keep_z_and_the_route_says_why`
+    (the demo has none), `test_a_scan_that_recorded_no_objective_gives_no_offset`,
+    `test_an_offset_outside_the_profiles_limits_is_left_out_and_said`;
+  - `test_a_sweep_that_found_no_peak_is_counted_and_keeps_its_plane`;
+  - `test_a_scan_without_the_focus_step_is_routed_exactly_as_before` (no key in
+    the dump, no new line);
+  - `test_another_objective_has_no_offset_and_no_focus_line`;
+  - `test_an_unlocked_nearest_frame_is_still_skipped_for_a_cell_focused_one`.
+- **The export** (`tests/test_nis_export_demo.py`):
+  `test_derived_offsets_are_said_in_assumed_and_written_as_given` (the file's
+  `dPFSOffset` read back with `decode`),
+  `test_a_stop_that_lost_its_offset_makes_the_list_z_only_without_the_line`,
+  and the existing tests, unedited.
+
+**Failure modes**: FM-73, FM-98, FM-104, FM-107, FM-111, FM-118, FM-121,
+FM-124, FM-139, FM-154, FM-205, FM-214.
+
+### 26.9 Not verified (for the owner)
+
+At the Ti2-E, 40×, after a scan with `cell_focus` (§21.10) and `route`:
+- **Load the export in NIS-Elements** with the objective clear of the plate
+  for the first stop, and look at one derived stop: NIS engages PFS at the
+  offset, and the image is the cells' plane, as the scan's frame was (by eye,
+  against the frame).
+- **The factor at the offsets used.** Change the offset by a known distance
+  under lock at an offset near the stops' and read Z (`smc autofocus offset`,
+  `smc z get`, as #401): D6's 4.4 % and the offsets above 6973.
+- That NIS-Elements accepts both flags set (§14) and takes `dPFSOffset` the
+  way `PFSOffset` is written.
+- Whether a derived plane lands within the cells' depth of field of the
+  scan's frame, per well and per plate.
