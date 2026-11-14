@@ -324,6 +324,12 @@ _CLOSE_WAIT_S = 10.0
 _READS_WAIT_S = 5.0
 _READS_POLL_S = 0.01
 
+#: How long a stand read that runs off the loop may go unanswered while an activity
+#: goes before ``status()`` says so in ``problems``, in seconds (m3 §15.4 D5). Far
+#: above a snap (166 to 198 ms measured at the Ti2-E) and the exposures M3 uses; a
+#: strip that stays still without a word would hide a device that stopped answering.
+_STAND_READ_LATE_S = 10.0
+
 #: How long ``release()`` waits for a connect that ``close()`` gave up on, in
 #: seconds. 10 (``close``) + 10 (the server's stop) + 8 is 28 s, inside the service's
 #: ``AppStopMethodConsole 30000`` (``docs/ui/service.md``).
@@ -990,6 +996,28 @@ class PageStatus:
     clock: RunClock | None = None
     chain: ChainStatus | None = None
     goto_answer: GotoAnswer | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _StandRead:
+    """One read of the stand: the fields of ``PageStatus`` that come from a device (m3 §15.4 D2).
+
+    ``began_s`` is ``time.monotonic()`` before the read's first device call, so
+    that of two reads the one that began later is the newer, whichever ended
+    last (D3). ``connected`` false is the closed stand's read: every field
+    unknown, a fact and not a fault.
+    """
+
+    began_s: float
+    connected: bool
+    xy_um: tuple[float, float] | None
+    z_um: float | None
+    objective: str | None
+    autofocus: str
+    light_on: bool | None
+    moving: tuple[str, ...]
+    halted: bool
+    problems: tuple[str, ...]
 
 
 def jog_crossing(
@@ -1680,6 +1708,14 @@ class PlatePage:
         # across a device call, and ``stop()`` never takes it (FM-70).
         self._lock = threading.Lock()
         self._current_run: tuple[str, threading.Event] | None = None
+        # The stand as the latest read saw it, what ``status()`` serves while an
+        # activity goes (m3 §15.4): the newest read by ``began_s``, the start
+        # (``time.monotonic()``) of the one read in flight off the loop, or ``None``,
+        # and the text of the last background read that raised, a string and never
+        # the exception (FM-98). All three under ``_lock``, never held across a read.
+        self._stand_read: _StandRead | None = None
+        self._stand_read_in_flight: float | None = None
+        self._stand_read_error: str | None = None
         self._progress: Progress | None = None
         # The latest activity's clock (m5 §17.10.2), under ``_lock`` with the progress it
         # times: the name, ``time.monotonic()`` at its start and at its end (``None``
@@ -4304,8 +4340,43 @@ class PlatePage:
         stop_refused = tuple(
             role.value for role in self._profile.safety.stop_refused_by
         )
-        # The whole read of the facade, from ``state()`` to the status built for it, is
-        # registered: a Disconnect waits for it before it unloads (m5 §7.2).
+        read = self._read_stand()
+        return PageStatus(
+            stand=stand,
+            dry_run=self._dry_run,
+            running=running,
+            progress=progress,
+            outcome=outcome,
+            stop_note=self._stop_note,
+            xy_um=read.xy_um,
+            z_um=read.z_um,
+            objective=read.objective,
+            autofocus=read.autofocus,
+            light_on=read.light_on,
+            moving=read.moving,
+            halted=read.halted,
+            stop_refused=stop_refused,
+            problems=read.problems,
+            connected=read.connected,
+            goto=goto,
+            clock=clock,
+            chain=chain,
+            goto_answer=goto_answer,
+        )
+
+    def _read_stand(self) -> _StandRead:
+        """Read the stand once, as ``status()`` shows it (m3 §15.4 D2).
+
+        Takes no lock and tolerates a failed device: what failed is in
+        ``problems``. The facade is read once; when a ``disconnect`` dropped it
+        during the read, the answer is the closed stand's, so a read of a released
+        stand is never told as its fault (``another program holding it``). The whole
+        read, from ``state()`` to the fields built for it, is registered: a
+        Disconnect waits for it before it unloads (m5 §7.2). ``began_s`` is taken
+        before the first device call, so that the newer of two reads is the one that
+        began later (D3).
+        """
+        began_s = time.monotonic()
         with self._reading() as microscope:
             if microscope is not None:
                 state = microscope.state()
@@ -4328,13 +4399,9 @@ class PlatePage:
                     else "no autofocus"
                 )
                 if self._microscope is microscope:
-                    return PageStatus(
-                        stand=stand,
-                        dry_run=self._dry_run,
-                        running=running,
-                        progress=progress,
-                        outcome=outcome,
-                        stop_note=self._stop_note,
+                    return _StandRead(
+                        began_s=began_s,
+                        connected=True,
                         xy_um=None
                         if state.xy is None
                         else (state.xy.x_um, state.xy.y_um),
@@ -4344,20 +4411,11 @@ class PlatePage:
                         light_on=light_on,
                         moving=tuple(state.moving),
                         halted=state.halted,
-                        stop_refused=stop_refused,
                         problems=tuple(problems),
-                        goto=goto,
-                        clock=clock,
-                        chain=chain,
-                        goto_answer=goto_answer,
                     )
-        return PageStatus(
-            stand=stand,
-            dry_run=self._dry_run,
-            running=running,
-            progress=progress,
-            outcome=outcome,
-            stop_note=self._stop_note,
+        return _StandRead(
+            began_s=began_s,
+            connected=False,
             xy_um=None,
             z_um=None,
             objective=None,
@@ -4365,13 +4423,7 @@ class PlatePage:
             light_on=None,
             moving=(),
             halted=False,
-            stop_refused=stop_refused,
             problems=(),
-            connected=False,
-            goto=goto,
-            clock=clock,
-            chain=chain,
-            goto_answer=goto_answer,
         )
 
     def _clock(self) -> RunClock | None:
