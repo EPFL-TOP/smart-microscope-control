@@ -1802,6 +1802,16 @@ class PlatePage:
         return self._run_doc.absolute()
 
     @property
+    def profile_argument(self) -> str:
+        """What ``-p`` takes in a command typed for this page: the profile's file when it has one, its name otherwise.
+
+        The one spelling of the page's commands (``command_for``, the next step, the offsets
+        block's how-to), so that none of them names the stand another way (m5 §18.2 D9).
+        """
+        source = self._profile.source
+        return self._profile.microscope.name if source is None else str(source)
+
+    @property
     def stand_name(self) -> str:
         """The stand's name, the profile's ``microscope.name`` (m5 §17.6).
 
@@ -4948,11 +4958,10 @@ class PlatePage:
         resume: bool = False,
     ) -> str:
         """``command_for`` for the preset the caller already read: a step's pairs and its command name one preset (FM-151)."""
-        source = self._profile.source
         return command_line(
             plugin,
             params,
-            profile=self._profile.microscope.name if source is None else str(source),
+            profile=self.profile_argument,
             run_doc=self.run_doc,
             dry_run=self._dry_run,
             preset=None if loaded is None else str(loaded.file.path),

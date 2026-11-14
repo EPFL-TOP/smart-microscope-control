@@ -118,6 +118,7 @@ from smc.ui.guide import (
     a1_corner,
     again_note,
     busy_note,
+    calibration_how_text,
     calibration_paths,
     calibration_read_line,
     capture_centre_label,
@@ -154,6 +155,7 @@ from smc.ui.guide import (
     offsets_in_two_documents,
     offsets_is_the_plates,
     offsets_lead,
+    offsets_lead_unread,
     offsets_not_on_turret,
     offsets_others,
     offsets_plan_heading,
@@ -3635,3 +3637,29 @@ def test_a_calibration_line_says_its_objective_and_its_date_or_that_none_is_know
     assert calibration_read_line("c.json", None, "at an unknown time") == (
         "c.json: calibrated at an unknown objective, at an unknown time"
     )
+
+
+def test_the_lead_while_the_turret_is_not_read_does_not_say_it_has_no_other_objective() -> (
+    None
+):
+    assert offsets_lead_unread(_TEN_X) == (
+        f"The plate was registered with {_TEN_X}. The turret's other objectives are "
+        "read when the stand is connected."
+    )
+
+
+def test_the_how_to_names_the_three_steps_the_command_and_where_a_path_is_read_from() -> (
+    None
+):
+    command = (
+        "smc run camera-calibration -p /p/stand.toml --run-doc cal-<objective>.json"
+    )
+
+    assert calibration_how_text(command).splitlines() == [
+        "1. In the drive bar, Change objective to the objective, and bring a well's "
+        "wall into the image (Live and the arrows).",
+        "2. Press Disconnect on the Stand screen: the terminal needs the stand.",
+        "3. In a terminal, run this, then press Connect again:",
+        f"   {command}",
+        "A relative path is read from where smc ui was started.",
+    ]

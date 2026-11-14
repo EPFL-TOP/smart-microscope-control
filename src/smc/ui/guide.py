@@ -144,6 +144,7 @@ __all__ = [
     "a1_corner",
     "again_note",
     "busy_note",
+    "calibration_how_text",
     "calibration_paths",
     "calibration_read_line",
     "capture_centre_label",
@@ -180,6 +181,7 @@ __all__ = [
     "offsets_in_two_documents",
     "offsets_is_the_plates",
     "offsets_lead",
+    "offsets_lead_unread",
     "offsets_no_objective",
     "offsets_not_on_turret",
     "offsets_others",
@@ -2732,4 +2734,36 @@ def offsets_written_line(path: str) -> str:
     return _flat(
         f"Written into {path}. The page keeps the offsets it was started with: "
         "restart it to use these."
+    )
+
+
+def offsets_lead_unread(plate_objective: str) -> str:
+    """The block's first line while the turret's labels are not read (the stand is closed, or the read failed): what is known, and when the rest is (D3).
+
+    The turret is the stand's, and a closed stand has none to name: saying that it has no other
+    objective would be a statement about a stand nobody asked.
+    """
+    return _flat(
+        f"The plate was registered with {plate_objective}. The turret's other "
+        "objectives are read when the stand is connected."
+    )
+
+
+def calibration_how_text(command: str) -> str:
+    """How to make the calibration document of an objective, in the operator's steps (D9).
+
+    The page does not make it (a run into a document of its own is #501), and the terminal
+    needs the stand: *Disconnect* releases it, *Connect* takes it back. ``command`` is the
+    page's own ``smc run camera-calibration`` line, ``cal-<objective>.json`` standing for the
+    file the operator names; a relative path is read from where ``smc ui`` was started, as
+    the tool reads it.
+    """
+    return "\n".join(
+        [
+            "1. In the drive bar, Change objective to the objective, and bring a well's "
+            "wall into the image (Live and the arrows).",
+            "2. Press Disconnect on the Stand screen: the terminal needs the stand.",
+            f"3. In a terminal, run this, then press Connect again:\n   {_flat(command)}",
+            "A relative path is read from where smc ui was started.",
+        ]
     )
