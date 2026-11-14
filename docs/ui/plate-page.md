@@ -331,6 +331,81 @@ are in view under the header (`ui-check`'s `stand-620` and `plate-620`); on a st
 profile does not say its sides the Plate screen's first *Go to* sits at the foot of the
 window, and the other two rows and *Register the plate* are a scroll of the panel down.
 
+### Measure the offsets between objectives
+
+A plate registered with one objective is scanned with another one, and the same feature is not
+centred at the same stage position under both. The **offsets** are how far apart. They are
+measured once per stand and written into the profile, so the block is **not a step of the
+scan**: it is one card at the foot of the Plate screen (and in the expert view, after the next
+step), and the scan's chain never stops on it. It is the page's part of the `objective-offsets`
+tool ([objective-offsets](../plugins/objective-offsets.md)) and of
+`smc objective offset --from-run-doc`, which print the same lines.
+
+**When it appears.** Only when the plate was **registered from its walls** (*Registration from
+the walls*) **with an objective the result records**: the tool compares the centres
+`plate-walls` measured, and a difference of guesses would be a guess. A plate registered by eye
+(*Register the plate*), found by `plate-finding`, or registered before the objective was
+recorded has no block. A page served with `--dry-run` shows the block with the reason it
+waits (`a dry run cannot turn the turret or image the walls; run it without --dry-run`).
+
+**The documents.** The block's one field takes the **camera calibration of each objective to
+measure**: one run document per line, in the order the turret is to turn (the last one stays in
+place). The objective to measure is the one **the document holds**, so a document with no
+target and a target with no document cannot be typed. Under the field, one line each:
+`<path as typed>: calibrated at <objective> on <date>`, or the tool's own reason (`<path>: does
+not exist`, not JSON, no calibration, another stand's). The page adds three refusals of its
+own, the first that holds in line order: the plate's own objective (its offset from itself is
+zero), an objective that is not on the turret, an objective in two documents; and at most five
+objectives in one run. A pasted path loses one pair of surrounding quotes (Windows' *Copy as
+path* adds them) and a relative path is read from where `smc ui` was started. The documents are
+read when the field changes and at *Measure the offsets*, never at each tick.
+
+**Two clicks, and the turret turns only at the second.** *Measure the offsets* reads the
+documents and asks: `Turn the turret to <a>, then <b>, with the plate on the stage? Check that
+each objective clears the plate (its working distance, the plate's height) and that the stage
+is clear. In place now: <label>. The turret is left at <b>, not turned back, and the autofocus
+is switched off and not engaged again.` Nothing has turned. *Turn and measure* then runs the
+tool, and the controller reads the documents **again** and turns nothing unless they still
+name the objectives the question was about (a path edited, a file replaced and a second tab
+all change what would turn). *Cancel*, an edit of the field, an activity that starts and a
+*Disconnect* each drop the question. A turn can drive an objective into a loaded plate: the
+check is the operator's.
+
+**While it runs.** `Objective in place: <label>` follows the stand at every tick (`not known`
+for a turret between two objectives, with `(the turret may be turning)` while the tool runs),
+and under it the tool's last report with its count, `no report yet: the turn and the walk to
+the first well come first` before the first (it came 5.9 s after the click on the demo stand;
+the report names the target it measured and lags the turret by a walk). After the run the line
+says `(the turret is not turned back)`: nothing in the page turns it back, and STOP leaves it
+where it is.
+
+**What it measured.** The card names each target, `<objective>: shift from <plate objective>
+(<+x>, <+y>) µm, spread <s> µm over A1, H12, A12 (bound <b> µm)`, then `offsets to write:` and
+`the turret is left at <label>`. A refusal is drawn in the tool's own words (a spread beyond its
+bound names every well of every target). A result whose plate was registered again since says
+`out of date: the plate was registered again since`.
+
+**Writing the profile.** Under the card, an optional **Session** (it goes into each offset's
+`measured` text) and the **preview**: the lines of the command, read from a **fresh load of the
+profile's file** and not from the page's own copy, under `Writing these replaces what <path>
+holds:`, with what each offset was (`was unknown`, `was xy (...) µm, measured ...`, a Z that is
+dropped). *Write these offsets into `<file>`* writes only the lines that were shown: if the
+profile, the result or the session changed since, nothing is written and the page says to look
+again (*Refresh*). A profile built into smc has no file and no button. After a write the block
+says `Written into <path>. The page keeps the offsets it was started with: restart it to use
+these.`: a page that is already connected goes on with the offsets it opened with, and a second
+write is refused by the reference check (the profile now holds a reference).
+
+**Not here.** The calibration documents are made in a terminal (the closed *How to make a
+calibration document* says how: *Change objective*, bring a wall into the image, *Disconnect*,
+`smc run camera-calibration -p <stand> --run-doc cal-<objective>.json`, *Connect* again;
+making them from the page is [#501](https://github.com/EPFL-TOP/smart-microscope-control/issues/501)).
+There is no Z offset, no turn back, no `wells`, `search_um`, `max_spread_um` or `settle_ms`
+field (the tool's own section in the expert view has them, with its `confirm_turns` checkbox),
+and no preset for the block. That section's **Run objective-offsets** is not guarded against the
+tool's refusals that depend on the documents, as `smc run` is not: a failed run replaces the
+usable result there. The block is the protected way.
+
 ### The Wells and Scan screens
 
 As the two before them, these hold **their own buttons and no next step**, and none of the

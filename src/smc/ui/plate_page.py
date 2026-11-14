@@ -32,6 +32,7 @@ import functools
 import logging
 import math
 import mimetypes
+import shlex
 import sys
 import threading
 import time
@@ -68,6 +69,7 @@ from smc.plugins.slots.plate import ORIENTATION_DEG, PlateOrientation
 from smc.ui.controller import (
     NOT_CONNECTED,
     LoadedPreset,
+    OffsetsStep,
     PageServerError,
     PageStatus,
     PlatePage,
@@ -80,6 +82,7 @@ from smc.ui.controller import (
 from smc.ui.frames import Frame, display_image
 from smc.ui.guide import (
     AUTOFOCUS_WORDS,
+    CALIBRATION_HOW_WINDOWS_NOTE,
     COVERAGE_WORDS,
     DRY_RUN_NO_FRAME,
     END_LIVE_LABEL,
@@ -88,6 +91,9 @@ from smc.ui.guide import (
     MEASURE_NOT_IN_A_DRY_RUN,
     MEASURE_THE_TIME,
     NO_FILES_YET,
+    OFFSETS_NOT_TURNED_BACK,
+    OFFSETS_STALE,
+    OFFSETS_TITLE,
     ORIENTATION_IN_STAGE_TERMS,
     OTHER_WAYS_TO_REGISTER,
     PLATE_NOT_CHOSEN,
@@ -107,6 +113,8 @@ from smc.ui.guide import (
     StepName,
     again_note,
     busy_note,
+    calibration_how_text,
+    calibration_read_line,
     capture_centre_label,
     capture_note,
     capture_wall_label,
@@ -116,6 +124,7 @@ from smc.ui.guide import (
     colour_bar_title,
     continue_label,
     drive_image_note,
+    error_words,
     field_source_line,
     files_html,
     forget_label,
@@ -127,6 +136,14 @@ from smc.ui.guide import (
     map_frame,
     map_title,
     needs_calibration,
+    objective_in_place_line,
+    offsets_confirm_text,
+    offsets_lead,
+    offsets_lead_unread,
+    offsets_others,
+    offsets_plan_heading,
+    offsets_run_line,
+    offsets_written_line,
     opening_step,
     orientation_label,
     plain_default,
@@ -267,6 +284,15 @@ _SCREEN_TOOLS: Mapping[StepName, tuple[str, ...]] = {
     "scan": (),
     "results": (),
 }
+
+#: The offsets block's two fields, in the words of m5 §18.2 D3 and D7. A multi-line placeholder
+#: shows the two lines an operator types for two objectives.
+_OFFSETS_CALIBRATIONS_LABEL = (
+    "Camera calibrations, one run document per objective, one path per line"
+)
+_OFFSETS_CALIBRATIONS_PLACEHOLDER = "cal-10x.json\ncal-40x.json"
+_OFFSETS_SESSION_LABEL = "Session (goes into each offset's measured text; optional)"
+_OFFSETS_SESSION_PLACEHOLDER = "session 3 (#NNN)"
 
 #: The colour of the fields a scan has a frame for, over the plan's orange (m5 §17.10.2): a
 #: green that differs from Viridis (the wells' fill), the route's red and the plan's orange.
@@ -675,6 +701,16 @@ class PlatePageView:
         # Whether the commands say they are quoted for a POSIX shell: ``None`` is the PC this
         # runs on (FM-175); a test sets it, as ``next_step_text`` takes ``windows=``.
         self._windows: bool | None = None
+        # The offsets block (m5 §18): the objectives the first click armed, per view (D4, FM-151:
+        # another tab arms its own); the step its field's last read drew; the lines of the
+        # preview as drawn, which *Write* sends back for the controller to compare (D7); the
+        # wait that came from the documents and the turret, which the tick cannot redraw because
+        # it reads nothing (FM-145); and how the latest result ended, for the line after a run.
+        self._offsets_armed: tuple[str, ...] | None = None
+        self._offsets_step_drawn: OffsetsStep | None = None
+        self._offsets_shown: tuple[str, ...] = ()
+        self._offsets_wait = ""
+        self._offsets_card_status: str | None = None
 
         self.wells_source = ColumnDataSource(
             {
@@ -1078,6 +1114,7 @@ class PlatePageView:
         self._build_presets()
         self._build_stand_plate()
         self._build_wells_scan()
+        self._build_offsets()
         self._build_steps()
 
         self.tool_runs: dict[str, Any] = {}
@@ -1359,6 +1396,109 @@ class PlatePageView:
             self._handler(self._runner("camera-calibration"))
         )
         self.register_button.on_click(self._handler(lambda event: self.on_register()))
+
+    def _build_offsets(self) -> None:
+        """The offsets block's widgets: one Card that measures the offsets between objectives (m5 §18.3).
+
+        One instance, listed on the Plate screen and in the expert view (D1, D5 of §17.2), hidden
+        until the plate is registered from its walls (D2). Every button goes through ``_handler``
+        and carries its text as ``label=`` (FM-171, FM-147); every text is plain, since a label
+        is the stand's and a path the operator's (FM-139); a disabled button is a courtesy and the
+        controller refuses each call on its own (FM-169).
+        """
+        self.offsets_lead_text = _wrapped_text()
+        self.objective_in_place_text = _wrapped_text()
+        self.calibrations_input = pn.widgets.TextAreaInput(
+            label=_OFFSETS_CALIBRATIONS_LABEL,
+            placeholder=_OFFSETS_CALIBRATIONS_PLACEHOLDER,
+            rows=3,
+            sizing_mode="stretch_width",
+        )
+        self.calibration_reads_text = _wrapped_text()
+        self.calibration_reads_text.visible = False
+        self.calibration_how_text = _wrapped_text()
+        self.calibration_how_card = pn.Card(
+            self.calibration_how_text,
+            title="How to make a calibration document",
+            collapsed=True,
+            sizing_mode="stretch_width",
+        )
+        self.offsets_measure_button = pn.widgets.Button(
+            label="Measure the offsets", color="primary"
+        )
+        self.offsets_wait_text = _wrapped_text()
+        self.offsets_confirm_text = _wrapped_text(extra={"color": _WARNING})
+        self.offsets_turn_button = pn.widgets.Button(
+            label="Turn and measure", color="danger"
+        )
+        self.offsets_cancel_button = pn.widgets.Button(label="Cancel")
+        self.offsets_confirm_box = pn.Column(
+            self.offsets_confirm_text,
+            pn.Row(self.offsets_turn_button, self.offsets_cancel_button),
+            visible=False,
+        )
+        self.offsets_run_text = _wrapped_text()
+        self.offsets_result_text = _wrapped_text()
+        # Shown with the first result: before a run it asks for the session of numbers that do
+        # not exist yet (the browser session of #382 found it).
+        self.offsets_session_input = pn.widgets.TextInput(
+            label=_OFFSETS_SESSION_LABEL,
+            placeholder=_OFFSETS_SESSION_PLACEHOLDER,
+            visible=False,
+        )
+        self.offsets_plan_text = _wrapped_text()
+        self.offsets_write_button = pn.widgets.Button(
+            label="Write these offsets", visible=False
+        )
+        self.offsets_write_note = _wrapped_text()
+        for pane in (
+            self.calibration_reads_text,
+            self.offsets_wait_text,
+            self.offsets_confirm_text,
+            self.offsets_run_text,
+            self.offsets_result_text,
+            self.offsets_plan_text,
+            self.offsets_write_note,
+        ):
+            pane.visible = False
+        self.offsets_box = pn.Card(
+            self.offsets_lead_text,
+            self.objective_in_place_text,
+            self.calibrations_input,
+            self.calibration_reads_text,
+            self.calibration_how_card,
+            self.offsets_measure_button,
+            self.offsets_wait_text,
+            self.offsets_confirm_box,
+            self.offsets_run_text,
+            self.offsets_result_text,
+            self.offsets_session_input,
+            self.offsets_plan_text,
+            self.offsets_write_button,
+            self.offsets_write_note,
+            title=OFFSETS_TITLE,
+            collapsed=False,
+            sizing_mode="stretch_width",
+            visible=False,
+        )
+        self.offsets_measure_button.on_click(
+            self._handler(lambda event: self.on_offsets_measure())
+        )
+        self.offsets_turn_button.on_click(
+            self._handler(lambda event: self.on_offsets_turn())
+        )
+        self.offsets_cancel_button.on_click(
+            self._handler(lambda event: self.on_offsets_cancel())
+        )
+        self.offsets_write_button.on_click(
+            self._handler(lambda event: self.on_offsets_write())
+        )
+        self.calibrations_input.param.watch(
+            self._handler(self._on_calibrations_changed), "value"
+        )
+        self.offsets_session_input.param.watch(
+            self._handler(lambda event: self._draw_offsets_plan()), "value"
+        )
 
     def _build_wells_scan(self) -> None:
         """The widgets of the Wells and Scan screens, each action a button of its own (m5 §17.4.3, §17.4.4, §17.10, #445).
@@ -1794,6 +1934,9 @@ class PlatePageView:
                 # Under the result line it follows (the owner's walk, finding 10).
                 self.register_replaces,
                 self.other_ways_text,
+                # Measured once per stand and not on the scan's path: after the way to
+                # register and before *Continue*, hidden until the plate is from its walls.
+                self.offsets_box,
             ],
             "wells": self._wells_region(),
             "scan": [
@@ -1844,6 +1987,7 @@ class PlatePageView:
         self.screens["expert"] = [
             preset_region,
             next_region,
+            self.offsets_box,
             plate_controls,
             self.select_input,
             self.accordion,
@@ -2529,6 +2673,98 @@ class PlatePageView:
         self._armed = None
         self.objective_confirm.visible = False
 
+    # --- the offsets block (m5 §18) -----------------------------------------------------
+
+    def on_offsets_measure(self) -> None:
+        """*Measure the offsets*: read the documents and, when nothing waits, ask the question; nothing turns (m5 §18.2 D4, FM-14).
+
+        The first of two clicks. It arms the objectives the documents name and draws the
+        confirmation, which says where the turret turns, what to check and where it is left. The
+        turn is the second click's (``on_offsets_turn``), and the controller compares what that
+        click sends with what was armed here. A wait draws no confirmation.
+        """
+        self._offsets_disarm()
+        step = self._read_offsets_step()
+        if step.wait is not None:
+            return
+        status = self._status
+        self._offsets_armed = step.targets
+        self._say(
+            self.offsets_confirm_text,
+            offsets_confirm_text(
+                None if status is None else status.objective, step.targets
+            ),
+        )
+        self.offsets_confirm_box.visible = True
+
+    def on_offsets_turn(self) -> None:
+        """*Turn and measure*: the armed objectives, with the documents typed now; then disarmed (m5 §18.2 D4).
+
+        What is armed is what the operator was asked about; ``measure_offsets`` reads the
+        documents again and turns nothing unless they are still those objectives (FM-169). With
+        nothing armed (a stale browser shows the button after a disarm) it is given none, and the
+        controller's refusal says to choose the documents again.
+        """
+        armed = self._offsets_armed
+        text = str(self.calibrations_input.value)
+        self._offsets_disarm()
+        self._try(lambda: self.page.measure_offsets(armed or (), text))
+        self.tick()
+
+    def on_offsets_cancel(self) -> None:
+        """*Cancel*: drop the confirmation; nothing turns."""
+        self._offsets_disarm()
+
+    def on_offsets_write(self) -> None:
+        """*Write these offsets*: the lines of the preview as drawn, with the session typed now (m5 §18.2 D7, FM-172).
+
+        The controller computes the plan again and writes only when its lines are the ones
+        drawn: a profile edited, a result produced again or a session typed since the preview
+        was drawn is a refusal that says to look again, and nothing is written. A write draws the
+        block again, so that it says what it did.
+        """
+        shown = self._offsets_shown
+        session = str(self.offsets_session_input.value)
+        self._try(lambda: self.page.write_offsets(session, shown))
+        self.refresh()
+        self.tick()
+
+    def _on_calibrations_changed(self, event: Any) -> None:
+        """An edit of the field: the confirmation is dropped and the documents are read again (m5 §18.2 D3, D4).
+
+        The field sends its value when it loses focus or on Ctrl-Enter, not at each key. The read
+        is a click's, never the tick's or ``refresh()``'s (FM-145).
+        """
+        self._offsets_disarm()
+        self._read_offsets_step()
+
+    def _offsets_disarm(self) -> None:
+        self._offsets_armed = None
+        self._say(self.offsets_confirm_text, "")
+        self.offsets_confirm_box.visible = False
+
+    def _read_offsets_step(self) -> OffsetsStep:
+        """Read the typed documents, draw one line under the field for each and the wait beside the button; return the step.
+
+        The wait is kept only when it comes from the documents and the turret: one that comes
+        from the stand, the mode, the plate or an activity is the live reason of the button
+        (``_draw_offsets_buttons``) and would be stale at the next tick.
+        """
+        step = self.page.offsets_step(str(self.calibrations_input.value))
+        self._offsets_step_drawn = step
+        self._say(
+            self.calibration_reads_text,
+            "\n".join(
+                read.problem
+                or calibration_read_line(read.path, read.objective, read.measured)
+                for read in step.reads
+            ),
+        )
+        live = self._blocked.get("objective-offsets") or self._running
+        self._offsets_wait = "" if live else (step.wait or "")
+        self._draw_offsets_buttons()
+        return step
+
     # --- presets (m5 §10.6) --------------------------------------------------------
 
     def on_load_preset(self) -> None:
@@ -2746,6 +2982,7 @@ class PlatePageView:
         self._status = status
         self._guarded(self._draw_wells_screen, status)
         self._guarded(self._draw_scan_screen, status)
+        self._guarded(self._draw_offsets, status)
         self._draw_results_screen(status)
         self._draw_imaged(status)
         # How many tools of a chain have ended since the last tick (per view, D6): a tool's
@@ -3090,6 +3327,7 @@ class PlatePageView:
         self._draw_problems()
         self._draw_plate_ask()
         self._draw_plate_screen()
+        self._draw_offsets_view()
         self._draw_commands()
         self._draw_buttons()
         if self._status is not None:
@@ -3299,6 +3537,7 @@ class PlatePageView:
         self._draw_stand_plate_buttons()
         self._draw_wells_scan_buttons()
         self._draw_results_buttons()
+        self._draw_offsets_buttons()
         lacks = self.page.lacks(Camera)
         self.snap_button.disabled = running is not None or lacks is not None
         # While live goes its own button is the one that ends it; any other activity
@@ -3586,6 +3825,143 @@ class PlatePageView:
         )
         self.coverage_from_text.object = self._field_line(_COVERAGE_FIELD)
         self.autofocus_from_text.object = self._field_line(_AUTOFOCUS_FIELD)
+
+    def _draw_offsets(self, status: PageStatus | None) -> None:
+        """The block's two lines that follow the stand: the objective in place and, while the tool runs, its last report (m5 §18.2 D5).
+
+        Text only, from the status the tick already read (FM-145): the turret's label moves at
+        each turn, ahead of the report that names the target (the report lags a walk). After a
+        run the line says the turret is not turned back (FM-88). A confirmation armed before an
+        activity went, or before the stand was released, is dropped: what it asked about may
+        no longer be true.
+        """
+        if status is None or not self.offsets_box.visible:
+            return
+        running = status.running == "objective-offsets"
+        line = objective_in_place_line(status.objective, running=running)
+        if not running and self._offsets_card_status is not None:
+            line = f"{line} {OFFSETS_NOT_TURNED_BACK}"
+        self.objective_in_place_text.object = line
+        self._say(
+            self.offsets_run_text,
+            offsets_run_line(status.progress) if running else "",
+        )
+        if status.running is not None or not status.connected:
+            self._offsets_disarm()
+
+    def _draw_offsets_buttons(self) -> None:
+        """Which buttons of the block are disabled, and the one wait beside the first (m5 §18.2 D1, D8).
+
+        The wait is, in this order, the tool's reason from the last redraw (the stand closed, a dry
+        run, a plate the tool cannot measure from, what it reads and requires), what the activity going is,
+        and what the last read of the documents said (``_read_offsets_step``). A disabled button is
+        a courtesy: the controller refuses each call (FM-169).
+        """
+        if not self.offsets_box.visible:
+            self._say(self.offsets_wait_text, "")
+            return
+        running = self._running
+        reason = self._blocked.get("objective-offsets")
+        busy = None if running is None else busy_note(running, live=self.page.is_live)
+        waiting = running is not None or reason is not None
+        self.offsets_measure_button.disabled = waiting
+        self.offsets_turn_button.disabled = waiting
+        self.offsets_write_button.disabled = running is not None
+        self._say(self.offsets_wait_text, reason or busy or self._offsets_wait)
+
+    def _draw_offsets_view(self) -> None:
+        """The block from this redraw's view: shown or hidden, its lead, the card and the preview (m5 §18.2 D2, D6, D7).
+
+        Read at ``refresh()``, which is where the run document is read again; the typed
+        documents are not (FM-145). A block that is hidden holds nothing armed.
+        """
+        view = self._view
+        offer = None if view is None else view.offsets
+        self.offsets_box.visible = offer is not None
+        if view is None or offer is None:
+            # Nothing the block says is left in a pane of a page that does not offer it.
+            self._offsets_disarm()
+            self._offsets_shown = ()
+            self._offsets_card_status = None
+            self._offsets_wait = ""
+            self.offsets_lead_text.object = ""
+            self.objective_in_place_text.object = ""
+            for pane in (
+                self.calibration_reads_text,
+                self.offsets_wait_text,
+                self.offsets_run_text,
+                self.offsets_result_text,
+                self.offsets_plan_text,
+                self.offsets_write_note,
+            ):
+                self._say(pane, "")
+            return
+        # The turret's labels are the page's own copy, read at the connection: a redraw reads
+        # no stand (#333). With none read, the lead says so and does not say there are none.
+        others = offsets_others(self._objective_labels, offer.plate_objective)
+        self.offsets_lead_text.object = (
+            offsets_lead(offer.plate_objective, others)
+            if self._objective_labels
+            else offsets_lead_unread(offer.plate_objective)
+        )
+        card = view.cards.get("objective-offsets")
+        self._offsets_card_status = None if card is None else card.status
+        self._say(self.offsets_result_text, self._offsets_result(card))
+        self.offsets_session_input.visible = card is not None
+        self._draw_offsets_plan()
+        command = f"smc run camera-calibration -p {shlex.quote(self.page.profile_argument)} --run-doc cal-<objective>.json"
+        note = CALIBRATION_HOW_WINDOWS_NOTE if posix_quoting_note(self._windows) else ""
+        self.calibration_how_text.object = "\n".join(
+            [calibration_how_text(command), *([note] if note else [])]
+        )
+        # The card's status decides the line after a run, and the tick that ended the run drew
+        # the line before this redraw: say it now, from the status already read.
+        self._draw_offsets(self._status)
+
+    @staticmethod
+    def _offsets_result(card: ResultCard | None) -> str:
+        """The latest result of the tool as the block draws it: its status, the lines of the card, and a refusal in the tool's words (m5 §18.2 D6).
+
+        Plain text (FM-139). The refusal is the card's ``error`` without the exception's type and
+        the tool's name, which name what to do; a result whose inputs were produced again says
+        so first.
+        """
+        if card is None:
+            return ""
+        lines = [f"{card.status} {card.when_local or card.when_utc + ' UTC'}"]
+        if card.stale:
+            lines.append(OFFSETS_STALE)
+        lines += [f"  {line}" for line in card.lines]
+        lines += [f"assumed: {text}" for text in card.assumed]
+        if card.error is not None:
+            lines.append(f"error: {error_words(card.error)}")
+        return "\n".join(lines)
+
+    def _draw_offsets_plan(self) -> None:
+        """The preview of what writing would replace, from a fresh load of the profile's file, and the write button (m5 §18.2 D7).
+
+        Drawn at ``refresh()`` and at each change of the session text. The lines are kept as
+        drawn: *Write* sends exactly these back, and the controller writes only if they are the
+        ones it computes then (FM-172). A plan the library refuses, or a profile with no file, is
+        its text and no button; after a write the block says so while the result is the one written.
+        """
+        plan = self.page.offsets_plan(str(self.offsets_session_input.value))
+        self._offsets_shown = plan.lines
+        if plan.lines:
+            text = "\n".join(
+                [offsets_plan_heading(self.page.profile_argument), *plan.lines]
+            )
+        elif plan.problem is not None and not plan.written:
+            text = plan.problem
+        else:
+            text = ""
+        self._say(self.offsets_plan_text, text)
+        self.offsets_write_button.label = f"Write these offsets into {plan.file}"
+        self.offsets_write_button.visible = bool(plan.lines)
+        self._say(
+            self.offsets_write_note,
+            offsets_written_line(self.page.profile_argument) if plan.written else "",
+        )
 
     def _draw_wells_screen(self, status: PageStatus | None) -> None:
         """The Wells screen's lines from the last view and this status: the "from" lines, what is known and the selection's note (m5 §17.4.3, §17.10).

@@ -14,6 +14,7 @@ import html
 import math
 import re
 import shlex
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timezone
@@ -25,14 +26,21 @@ import numpy.typing as npt
 
 from smc.plugins.frame_signal import carries_signal, saturated
 from smc.plugins.frames import image_direction_of_stage_step, stage_side_of_image_side
+from smc.plugins.objective_offsets.algorithm import MAX_TARGETS
 from smc.plugins.plate_registration.algorithm import GOOD_RESIDUAL_UM, suggested_refs
 from smc.plugins.slots import WellGeometry
 
 if TYPE_CHECKING:
     from datetime import datetime
 
+    from smc.plugins.api import Progress
     from smc.plugins.geometry import Matrix2
-    from smc.plugins.slots import PlateResult, ScanPlanResult, WellRef
+    from smc.plugins.slots import (
+        ObjectiveOffsetsResult,
+        PlateResult,
+        ScanPlanResult,
+        WellRef,
+    )
     from smc.plugins.slots.plate import PlateOrientation
     from smc.ui.controller import (
         ChainStatus,
@@ -51,6 +59,7 @@ if TYPE_CHECKING:
 __all__ = [
     "AGAIN_NOTE",
     "AUTOFOCUS_WORDS",
+    "CALIBRATION_HOW_WINDOWS_NOTE",
     "CAMERA_NOT_CALIBRATED_NOTE",
     "CAPTURE_FAR",
     "CAPTURE_SAME_PLACE",
@@ -78,6 +87,17 @@ __all__ = [
     "NOT_CONNECTED",
     "NO_CALIBRATION_FOR_SIDES",
     "NO_FILES_YET",
+    "OFFSETS_DRY_RUN",
+    "OFFSETS_NOTHING_ARMED",
+    "OFFSETS_NOT_TURNED_BACK",
+    "OFFSETS_NO_DOCUMENT",
+    "OFFSETS_NO_FILE",
+    "OFFSETS_PLAN_CHANGED",
+    "OFFSETS_RESTART_FIRST",
+    "OFFSETS_STALE",
+    "OFFSETS_TITLE",
+    "OFFSETS_TOO_MANY",
+    "OFFSETS_TURRET_UNREAD",
     "ORIENTATION_IN_STAGE_TERMS",
     "OTHER_WAYS_TO_REGISTER",
     "PLATE_NOT_CHOSEN",
@@ -127,6 +147,9 @@ __all__ = [
     "a1_corner",
     "again_note",
     "busy_note",
+    "calibration_how_text",
+    "calibration_paths",
+    "calibration_read_line",
     "capture_centre_label",
     "capture_note",
     "capture_wall_label",
@@ -138,6 +161,7 @@ __all__ = [
     "continue_label",
     "drive_image_note",
     "duration_text",
+    "error_words",
     "field_source_line",
     "files_html",
     "files_lines",
@@ -152,7 +176,22 @@ __all__ = [
     "map_title",
     "needs_calibration",
     "next_slot",
+    "objective_in_place_line",
     "objective_line",
+    "offsets_card_lines",
+    "offsets_changed",
+    "offsets_confirm_text",
+    "offsets_in_two_documents",
+    "offsets_is_the_plates",
+    "offsets_lead",
+    "offsets_lead_unread",
+    "offsets_no_objective",
+    "offsets_not_on_turret",
+    "offsets_others",
+    "offsets_plan_heading",
+    "offsets_plate_refusal",
+    "offsets_run_line",
+    "offsets_written_line",
     "opening_step",
     "orientation_label",
     "plain_default",
@@ -2428,3 +2467,340 @@ def files_html(cards: Mapping[str, ResultCard], run_folder: PurePath | None) -> 
     if not lines:
         return f"<div>{html.escape(NO_FILES_YET)}</div>"
     return "".join(lines)
+
+
+# -- the offsets between objectives (m5 §18, #382) ---------------------------------------
+
+#: The offsets block's title: the text of its Card (D1).
+OFFSETS_TITLE = "Measure the offsets between objectives"
+
+#: What the block waits for while no calibration document is typed (D3).
+OFFSETS_NO_DOCUMENT = "Give the camera calibration of each objective to measure: one run document per line."
+
+#: Why the block does not run on a page served with ``--dry-run`` (D8): the tool refuses a
+#: dry run before anything moves, and its refusal would be a ``failed`` record that
+#: replaces a usable result (m5 §11.4, FM-206). The tool's own words, pinned by a test.
+OFFSETS_DRY_RUN = (
+    "a dry run cannot turn the turret or image the walls; run it without --dry-run"
+)
+
+#: The sixth line is not read: a run measures at most ``MAX_TARGETS`` objectives (D3).
+OFFSETS_TOO_MANY = f"at most {MAX_TARGETS} objectives in one run"
+
+#: What follows the objective in place once a run has ended (D5): nothing in the page turns
+#: the turret back (FM-88).
+OFFSETS_NOT_TURNED_BACK = "(the turret is not turned back)"
+
+#: What a click on *Turn and measure* with nothing armed says (D4, FM-169).
+OFFSETS_NOTHING_ARMED = "choose the documents and press Measure the offsets again"
+
+#: What a write says when the lines it was asked to write are not the ones it now computes (D7).
+OFFSETS_PLAN_CHANGED = (
+    "the offsets or the profile changed since they were shown: look at them again "
+    "(Refresh)"
+)
+
+#: A profile with no file has nothing to write into (D7).
+OFFSETS_NO_FILE = "this stand's profile is built into smc, with no file to write"
+
+#: Added to the library's refusal of a reference changed since the run, when this page itself
+#: wrote into the profile earlier: the stand it holds still has the offsets it started with, so
+#: the tool measures from the old reference and every new result is refused the same way until
+#: the page is started again (the review of #382).
+OFFSETS_RESTART_FIRST = (
+    "this page wrote into the profile since it started and still measures from the offsets "
+    "it started with: restart it before measuring again"
+)
+
+#: Under the how-to's command on a Windows page: its own note, since no button of the block makes
+#: this call (the document is made in a terminal, #501) and the line carries a placeholder.
+CALIBRATION_HOW_WINDOWS_NOTE = (
+    "On Windows that line is quoted for a POSIX shell: in PowerShell or cmd.exe, drop the single "
+    "quotes around the profile's path, and write the objective's name for <objective> in the "
+    "document's name."
+)
+
+#: Under a result whose inputs were produced again since (D6).
+OFFSETS_STALE = "out of date: the plate was registered again since"
+
+#: The turret's labels could not be read (no turret, or the read failed), so no objective of a
+#: document can be checked against it: the page does not guess that one is there.
+OFFSETS_TURRET_UNREAD = (
+    "the turret's objectives could not be read: check the stand, then try again"
+)
+
+#: ``PluginRunError: objective-offsets: <words>``: the type, then the tool's own name.
+_ERROR_TYPE = re.compile(r"^[A-Za-z_][\w.]*Error: ")
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}T")
+
+
+def offsets_others(labels: Sequence[str], plate_objective: str) -> tuple[str, ...]:
+    """The turret's other objectives: its labels in order, without the empty positions and without the plate's own (m5 §18.3).
+
+    The plate's objective is the one its centres were captured with, and its offset
+    from itself is zero by definition, so it is never one to measure.
+    """
+    return tuple(
+        label for label in labels if label.strip() and label != plate_objective
+    )
+
+
+def calibration_paths(text: str) -> tuple[str, ...]:
+    """The paths typed one per line: each stripped of its blanks and of one pair of surrounding quotes, blank lines dropped (m5 §18.3).
+
+    Windows' *Copy as path* puts a pair of ``"`` around what it copies, and its Properties
+    dialog puts an invisible U+202A (left-to-right embedding) before the path it copies: the
+    OS refuses the name with it (``EINVAL``), and an operator cannot see why. A Unicode
+    format character (category ``Cf``) at either end of a line is dropped with the blanks. A
+    path is shown and kept as typed afterwards, never resolved (FM-24, FM-50).
+    """
+    paths: list[str] = []
+    for line in re.split(r"\r\n|\r|\n", text):
+        path = _trimmed(line, blanks=True)
+        if len(path) >= 2 and path[0] == '"' and path[-1] == '"':
+            path = _trimmed(path[1:-1], blanks=False)
+        if path.strip():
+            paths.append(path)
+    return tuple(paths)
+
+
+def _trimmed(text: str, *, blanks: bool) -> str:
+    """``text`` without the Unicode format characters at its ends, and the blanks too when ``blanks``."""
+
+    def drop(char: str) -> bool:
+        return unicodedata.category(char) == "Cf" or (blanks and char.isspace())
+
+    start, end = 0, len(text)
+    while start < end and drop(text[start]):
+        start += 1
+    while end > start and drop(text[end - 1]):
+        end -= 1
+    return text[start:end]
+
+
+def offsets_lead(plate_objective: str, others: Sequence[str]) -> str:
+    """The block's first lines: the objective the plate was registered with, the others and what the page does (D3).
+
+    One line of plain text (FM-139): a label is the stand's. With no other objective
+    on the turret there is nothing to measure, and it says so.
+    """
+    registered = f"The plate was registered with {plate_objective}."
+    if not others:
+        return _flat(f"{registered} The turret has no other objective.")
+    return _flat(
+        f"{registered} Other objectives on the turret: {', '.join(others)}. The page "
+        "turns the turret to each objective of the documents below, finds the walls of "
+        "the wells it registered again, and says how far the same wells moved."
+    )
+
+
+def objective_in_place_line(objective: str | None, *, running: bool) -> str:
+    """``Objective in place: <label>``, read from the stand at every tick, or that it is not known (D5).
+
+    Not known is a turret between two objectives or a read that failed: while a run
+    goes it is most likely turning, and the line says so. A blank label is an empty
+    turret position, which is no objective in place.
+    """
+    if objective is None or not objective.strip():
+        turning = " (the turret may be turning)" if running else ""
+        return f"Objective in place: not known{turning}"
+    return _flat(f"Objective in place: {objective}")
+
+
+def offsets_run_line(progress: Progress | None) -> str:
+    """While the tool runs: its last report with the count, or that none has come yet (D5).
+
+    The first report came 5.9 s after the click on the demo stage (m5 §18.1): the turn
+    and the walk to the first well come before it. An unknown total is the report alone.
+    """
+    if progress is None:
+        return "no report yet: the turn and the walk to the first well come first"
+    report = _flat(progress.message).strip()
+    if progress.total is None:
+        return report
+    count = f"({progress.done} of {progress.total})"
+    return f"{report} {count}" if report else count
+
+
+def offsets_confirm_text(in_place: str | None, targets: Sequence[str]) -> str:
+    """The question the block asks before the turret turns: where it turns, what to check, where it is left (D4, FM-14).
+
+    Said once, after *Measure the offsets* and before *Turn and measure*: a turn with the
+    plate on the stage can drive an objective into it, and nothing turns back.
+
+    Raises:
+        ValueError: ``targets`` is empty; the block never asks without one.
+    """
+    if not targets:
+        raise ValueError("offsets_confirm_text needs at least one objective to turn to")
+    turns = ", then ".join(targets)
+    now = "not known" if in_place is None or not in_place.strip() else in_place
+    return _flat(
+        f"Turn the turret to {turns}, with the plate on the stage? Check that each "
+        "objective clears the plate (its working distance, the plate's height) and "
+        f"that the stage is clear. In place now: {now}. The turret is left at "
+        f"{targets[-1]}, not turned back, and the autofocus is switched off and not "
+        "engaged again."
+    )
+
+
+def offsets_card_lines(result: ObjectiveOffsetsResult) -> tuple[str, ...]:
+    """The card of an ``objective-offsets`` result: each target's shift, the offsets to write and where the turret is left (D6).
+
+    One line per target, as its measure says it: the shift from the plate's objective
+    (``:+.2f``, and a ``-0.0`` is written ``+0.00``), the spread of its wells and the
+    bound it was held to. The generic card counts ``measures: 2 items`` and says
+    nothing an operator reads (m5 §18.1). Each line is one line (FM-139: a label is the
+    stand's); the card cuts each at its own bound.
+    """
+    lines: list[str] = []
+    for measure in result.measures:
+        wells = ", ".join(well.well for well in measure.wells)
+        lines.append(
+            _flat(
+                f"{measure.objective}: shift from {result.plate_objective} "
+                f"{_xy(measure.shift_xy_um)} µm, spread {measure.spread_um:.2f} µm over "
+                f"{wells} (bound {measure.max_spread_um:.2f} µm)"
+            )
+        )
+    written = ", ".join(
+        f"{offset.objective} {_xy(offset.xy_offset_um)} µm" for offset in result.offsets
+    )
+    lines.append(_flat(f"offsets to write: {written or 'none'}"))
+    lines.append(_flat(f"the turret is left at {result.objective_in_place}"))
+    return tuple(lines)
+
+
+def _xy(value: tuple[float, float]) -> str:
+    """``(+x, +y)`` to two decimals; ``+ 0.0`` keeps a ``-0.0`` from showing as ``-0.00``."""
+    x_um, y_um = (number + 0.0 for number in value)
+    return f"({x_um:+.2f}, {y_um:+.2f})"
+
+
+def error_words(text: str) -> str:
+    """``text`` as the tool words it: without the exception's type and without the tool's own name (D6).
+
+    The card's ``error`` is ``PluginRunError: objective-offsets: <words>``; the block
+    draws the words, which name what to do. Any other text is returned as it is.
+    """
+    return _ERROR_TYPE.sub("", text, count=1).removeprefix("objective-offsets: ")
+
+
+def offsets_plate_refusal(plate: PlateResult) -> str | None:
+    """The tool's refusal of a plate it cannot measure from, in its words, or ``None`` (D8, m3 §20.6 item 3).
+
+    A plate registered by eye or fitted has positions nobody measured; one that records
+    no objective has none to compare with; one whose wall images name another objective
+    was mixed by hand. The page's copy of ``objective_offsets.plugin._checked_plate``,
+    pinned to it by a test: the page says it before the click, for a state it holds, and
+    the tool says it again.
+    """
+    if plate.method != "wall-images" or plate.walls is None:
+        return (
+            f"the plate was registered with {plate.method}: objective-offsets "
+            "compares the centres plate-walls measured, so register it with "
+            "plate-walls"
+        )
+    if not plate.objective:
+        return (
+            "the plate does not record the objective it was registered with: "
+            "register it with plate-walls on a stand with a turret"
+        )
+    if plate.walls.objective != plate.objective:
+        return (
+            f"the plate's record names {plate.objective} and its wall images "
+            f"{plate.walls.objective}: register it again with plate-walls"
+        )
+    return None
+
+
+def offsets_is_the_plates(objective: str) -> str:
+    """Why an objective whose document is typed is left out: it is the one the plate was registered with (D3)."""
+    return _flat(
+        f"{objective} is the objective the plate was registered with: its offset from "
+        "itself is zero; leave its document out"
+    )
+
+
+def offsets_not_on_turret(objective: str, labels: Sequence[str]) -> str:
+    """Why a document's objective is refused: the turret has no such position (D3)."""
+    on_turret = ", ".join(label for label in labels if label.strip())
+    return _flat(f"{objective} is not on the turret: {on_turret}")
+
+
+def offsets_in_two_documents(objective: str, first: str, second: str) -> str:
+    """Why two lines are refused: both documents hold a calibration of the same objective (D3)."""
+    return _flat(f"{objective} is in two documents: {first} and {second}")
+
+
+def offsets_no_objective(path: str) -> str:
+    """Why a document is refused: its calibration records no objective, so it cannot name the one to measure (D3)."""
+    return _flat(
+        f"{path}: the calibration records no objective, so it cannot name one to measure"
+    )
+
+
+def calibration_read_line(path: str, objective: str | None, measured: str) -> str:
+    """The line under the field for a document the tool accepts: its path as typed, its objective and its date (D3).
+
+    ``measured`` is what ``calibration_from`` returns: the record's time to the second,
+    or ``at an unknown time``; only the date is shown.
+    """
+    when = (
+        f" on {measured[:10]}" if _ISO_DATE.match(measured) else ", at an unknown time"
+    )
+    at = "an unknown objective" if objective is None else objective
+    return _flat(f"{path}: calibrated at {at}{when}")
+
+
+def offsets_changed(was: Sequence[str], now: Sequence[str]) -> str:
+    """Why *Turn and measure* turns nothing: the documents name other objectives than the ones the operator confirmed (D4, FM-169)."""
+    return _flat(
+        "the objectives changed since you confirmed them "
+        f"({', '.join(was)} → {', '.join(now)}): measure again"
+    )
+
+
+def offsets_plan_heading(path: str) -> str:
+    """The line above the preview: what a write replaces, and where (D7)."""
+    return _flat(f"Writing these replaces what {path} holds:")
+
+
+def offsets_written_line(path: str) -> str:
+    """What the block says after a write, while the result is the one written: the profile is changed, the running page is not (D7)."""
+    return _flat(
+        f"Written into {path}. The page keeps the offsets it was started with: "
+        "restart it to use these."
+    )
+
+
+def offsets_lead_unread(plate_objective: str) -> str:
+    """The block's first line while the turret's labels are not read (the stand is closed, or the read failed): what is known, and when the rest is (D3).
+
+    The turret is the stand's, and a closed stand has none to name: saying that it has no other
+    objective would be a statement about a stand nobody asked.
+    """
+    return _flat(
+        f"The plate was registered with {plate_objective}. The turret's other "
+        "objectives are read when the stand is connected."
+    )
+
+
+def calibration_how_text(command: str) -> str:
+    """How to make the calibration document of an objective, in the operator's steps (D9).
+
+    The page does not make it (a run into a document of its own is #501), and the terminal
+    needs the stand: *Disconnect* releases it, *Connect* takes it back. ``command`` is the
+    page's own ``smc run camera-calibration`` line, ``cal-<objective>.json`` standing for the
+    file the operator names; a relative path is read from where ``smc ui`` was started, as
+    the tool reads it.
+    """
+    return "\n".join(
+        [
+            "1. In the drive bar, Change objective to the objective, and bring a well's "
+            "wall into the image (Live and the arrows).",
+            "2. Press Disconnect on the Stand screen: the terminal needs the stand.",
+            f"3. In a terminal, run this, then press Connect again:\n   {_flat(command)}",
+            "A relative path is read from where smc ui was started.",
+        ]
+    )

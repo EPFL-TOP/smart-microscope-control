@@ -55,15 +55,18 @@ from smc.hardware.errors import (
     MicroscopeBusyError,
     MicroscopeHaltedError,
     MotionStoppedError,
+    ProfileError,
     StopRefusedError,
 )
 from smc.hardware.microscope import describe_autofocus
+from smc.hardware.profile import Profile
 from smc.hardware.safety import Safety
 from smc.plugins import (
     ParamsError,
     PluginEntry,
     PluginError,
     PluginParams,
+    PluginRunError,
     Progress,
     Registry,
     check_ready,
@@ -74,8 +77,18 @@ from smc.plugins import (
     run_plugin,
 )
 from smc.plugins.api import ShownFrame
+from smc.plugins.camera_calibration.plugin import calibration_from
 from smc.plugins.frames import stage_side_of_image_side
 from smc.plugins.geometry import Matrix2
+from smc.plugins.objective_offsets.algorithm import MAX_TARGETS
+from smc.plugins.objective_offsets.profile_offsets import (
+    OffsetsPlan,
+    OffsetsWriteError,
+    plan_offsets,
+)
+from smc.plugins.objective_offsets.profile_offsets import (
+    write_offsets as write_offsets_block,
+)
 from smc.plugins.presets import (
     NOT_IN_PARAMS,
     Preset,
@@ -96,6 +109,7 @@ from smc.plugins.slots import (
     CameraCalibration,
     DensityResult,
     ImageSide,
+    ObjectiveOffsetsResult,
     PlateResult,
     RouteResult,
     ScanPlanResult,
@@ -124,6 +138,14 @@ from smc.ui.guide import (
     MAP_FIELDS_UP_TO,
     NO_CALIBRATION_FOR_SIDES,
     NOT_CONNECTED,
+    OFFSETS_DRY_RUN,
+    OFFSETS_NO_DOCUMENT,
+    OFFSETS_NO_FILE,
+    OFFSETS_NOTHING_ARMED,
+    OFFSETS_PLAN_CHANGED,
+    OFFSETS_RESTART_FIRST,
+    OFFSETS_TOO_MANY,
+    OFFSETS_TURRET_UNREAD,
     PLATE_NOT_CHOSEN,
     RUN_ALL_LABEL,
     SCAN_CHECKPOINT_KEPT,
@@ -136,9 +158,18 @@ from smc.ui.guide import (
     GotoAnswer,
     NextStep,
     a1_corner,
+    busy_note,
+    calibration_paths,
     command_line,
     local_time,
     next_slot,
+    offsets_card_lines,
+    offsets_changed,
+    offsets_in_two_documents,
+    offsets_is_the_plates,
+    offsets_no_objective,
+    offsets_not_on_turret,
+    offsets_plate_refusal,
     register_objective_refusal,
     replace_note,
     scan_plan_card_lines,
@@ -153,7 +184,7 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from smc.hardware.microscope import Microscope
-    from smc.hardware.profile import HolderSection, Profile
+    from smc.hardware.profile import HolderSection
 
 __all__ = [
     "JOG_WALL_MARGIN_UM",
@@ -163,10 +194,14 @@ __all__ = [
     "NOT_CONNECTED",
     "PAGE_PARAMS",
     "STAGES",
+    "CalibrationRead",
     "ChainEnd",
     "ChainStatus",
     "CheckItem",
     "LoadedPreset",
+    "OffsetsOffer",
+    "OffsetsPlanView",
+    "OffsetsStep",
     "PageServerError",
     "PageStatus",
     "PlanLayer",
@@ -257,6 +292,11 @@ _CARD_CHARS = 80
 #: An assumption and an error are diagnoses whose end often says what to do: they are
 #: cut later than a value (more than twice the longest assumption a plugin writes).
 _CARD_TEXT_CHARS = 600
+
+#: ``objective-offsets``' refusal of spreads names every well of every target (about 230
+#: characters a target: five targets and six wells come to about 1 400), and its end says
+#: which target to measure again: a cut at ``_CARD_TEXT_CHARS`` would clip it (m5 §18.2 D6).
+_OFFSETS_ERROR_CHARS = 2000
 
 #: The strip says a finished run's first assumption, cut here: a pointer to the card, which
 #: holds every line at ``_CARD_TEXT_CHARS`` (m5 §8.8.2).
@@ -532,6 +572,70 @@ class SideLabel:
 
 
 @dataclass(frozen=True, slots=True)
+class OffsetsOffer:
+    """The offsets block is offered: the plate was registered from its walls, with this objective (m5 §18.2 D2).
+
+    ``plate_objective`` is the objective the plate's centres were measured with, and the one
+    every other objective's offset is measured from in this run. Nothing else is in it: the
+    turret's other labels are read from the stand when the block is drawn.
+    """
+
+    plate_objective: str
+
+
+@dataclass(frozen=True, slots=True)
+class CalibrationRead:
+    """One line of the block's field, read: the document the typed path names (m5 §18.3).
+
+    ``path`` is as typed, never resolved (FM-24, FM-50). ``objective`` and ``measured`` are the
+    document's camera calibration's (``calibration_from``: the objective it was done with and
+    the record's time to the second, or ``at an unknown time``); ``problem`` is why the
+    document cannot be used, in the tool's words, and then ``objective`` is ``None`` and
+    ``measured`` is empty.
+    """
+
+    path: str
+    objective: str | None
+    measured: str
+    problem: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class OffsetsStep:
+    """What the block's *Measure the offsets* would run, and what it waits for (m5 §18.3).
+
+    ``reads`` has one entry for each typed path (at most ``MAX_TARGETS``) and ``targets`` are
+    the objectives of those documents, in line order: the objectives the turret would turn to.
+    ``wait`` is the first reason there is nothing to run (the stand, the plate, a document, a
+    refusal of the page's own); with one, ``pairs`` is empty, else it is the ``targets`` and
+    ``calibrations`` pairs of ``smc run objective-offsets``, JSON so that a Windows path's
+    backslashes are doubled by the encoder and not by the operator.
+    """
+
+    pairs: tuple[str, ...]
+    targets: tuple[str, ...]
+    reads: tuple[CalibrationRead, ...]
+    wait: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class OffsetsPlanView:
+    """What writing the offsets would put into the profile, as the block draws it (m5 §18.3, D7).
+
+    ``file`` is the profile's file name (``""`` for a profile with no file), ``lines`` the
+    preview of ``plan_offsets``, as they are, with the old values in them; ``problem`` is why
+    there is nothing to write (the library's words, or the page's) and then ``lines`` is
+    empty; ``written`` says the usable result is the one this page wrote into this file.
+    Everything empty and no problem: there is no usable result to preview.
+    """
+
+    file: str
+    lines: tuple[str, ...]
+    problem: str | None
+    written: bool
+
+
+@dataclass(frozen=True, slots=True)
 class PlateView:
     """A snapshot of what the run document says, as the page needs it (a pure read).
 
@@ -580,6 +684,9 @@ class PlateView:
     the latest ``scan`` record ended when it is ``stopped`` or ``failed`` (m5 §17.12 D17):
     the Scan screen says it and, with a reachable checkpoint, offers *Continue the scan* and
     *Start again*; ``None`` for no record, one that goes or one that ended ``done``.
+    ``offsets`` is the offsets block's offer (m5 §18.2 D2): the usable ``plate`` slot is the
+    page's plate, was registered from images (``walls``) and records the objective it was
+    registered with; ``None`` otherwise, and the block is hidden.
     """
 
     plate: str
@@ -605,6 +712,7 @@ class PlateView:
     register_refusal: str | None = None
     frame_wells: tuple[str, ...] = ()
     scan_end: ScanEnd | None = None
+    offsets: OffsetsOffer | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1080,6 +1188,60 @@ def _scan_plan_of(record: StageRecord) -> ScanPlanResult | None:
         return None
 
 
+def _offsets_of(record: StageRecord) -> ObjectiveOffsetsResult | None:
+    """``record``'s result as an ``ObjectiveOffsetsResult``, or ``None``: anything else is the generic card.
+
+    Tried only for the record that provides ``objective-offsets`` and never an exception
+    for a document that is data (FM-125): a result that does not validate keeps the generic
+    card, and the block's preview says why it has nothing to write (m5 §18.2 D6).
+    """
+    if record.provides != "objective-offsets" or record.result is None:
+        return None
+    try:
+        return ObjectiveOffsetsResult.model_validate(record.result)
+    except ValidationError:
+        return None
+
+
+def _read_calibration(path: str, *, profile: str, dry_run: bool) -> CalibrationRead:
+    """The calibration document ``path`` names, read as the tool reads it, or why it cannot be (m5 §18.3).
+
+    A typed path is data, and so is the file it names (FM-125, FM-98): ``calibration_from``
+    raises ``PluginRunError`` with the tool's words for a missing file, one that is not JSON, a
+    document with no usable calibration; any other error of reading it (a folder is refused by
+    the document, but a name the OS refuses, a permission, a file too large) is a text for the
+    line, never an exception in a Panel callback, and the error itself is not kept.
+    """
+    problem = ""
+    try:
+        found, measured = calibration_from(
+            "objective-offsets", Path(path), profile=profile, dry_run=dry_run
+        )
+    except PluginRunError as exc:
+        problem = exc.reason
+    except Exception as exc:
+        problem = f"{path}: {type(exc).__name__}: {_one_line(exc)}"
+    if problem:
+        return CalibrationRead(path, None, "", _flat(problem))
+    if found.objective is None or not found.objective.strip():
+        # A calibration made at an empty turret position holds a blank label: no objective to turn to.
+        return CalibrationRead(path, None, "", offsets_no_objective(path))
+    return CalibrationRead(path, found.objective, measured, None)
+
+
+def _offsets_offer_of(registered: PlateResult | None) -> OffsetsOffer | None:
+    """The offsets block's offer for a usable plate that is the page's: registered from images, with its objective recorded (m5 §18.2 D2).
+
+    A plate registered by eye, fitted by ``plate-finding`` or registered before the objective
+    was recorded is no case for the tool (m3 §20.6 item 3): the block is hidden, and the
+    accordion's section gives the tool's own refusal. A plate whose wall images name another
+    objective is offered, and the block's wait says so (``offsets_plate_refusal``).
+    """
+    if registered is None or registered.walls is None or not registered.objective:
+        return None
+    return OffsetsOffer(registered.objective)
+
+
 def _plan_layer(
     plan: ScanPlanResult | None, scan: ScanResult | None, problems: list[str]
 ) -> PlanLayer | None:
@@ -1163,7 +1325,11 @@ def _card(
     does not validate as one is the generic card, never an exception (FM-125).
 
     A ``scan-plan`` result shows its wells, fields, field and estimate instead of
-    its first keys, which cut ``estimate_s`` away (m5 §14.3); the same rule.
+    its first keys, which cut ``estimate_s`` away (m5 §14.3); the same rule. An
+    ``objective-offsets`` result shows each target's shift, spread, wells and bound, the
+    offsets to write and where the turret is left, instead of ``measures: 2 items`` (m5
+    §18.2 D6), and its ``error`` is kept to ``_OFFSETS_ERROR_CHARS``: the tool's refusal
+    of spreads names every well of every target.
     """
     when_utc = _when_utc(record)
     lines: list[str] = []
@@ -1172,6 +1338,7 @@ def _card(
     if record.status is StageStatus.done and record.result is not None:
         from_images = _plate_from_images(record.result)
         planned = _scan_plan_of(record)
+        offsets = _offsets_of(record)
         if from_images is not None:
             lines = [_cut(_flat(line)) for line in walls_card_lines(from_images)]
             folder = None if from_images.walls is None else from_images.walls.folder
@@ -1188,6 +1355,11 @@ def _card(
             lines = [
                 _cut(_flat(line), _CARD_TEXT_CHARS)
                 for line in scan_plan_card_lines(planned)
+            ]
+        elif offsets is not None:
+            lines = [
+                _cut(_flat(line), _CARD_TEXT_CHARS)
+                for line in offsets_card_lines(offsets)
             ]
         else:
             for key, value in record.result.items():
@@ -1225,7 +1397,12 @@ def _card(
         error=(
             None
             if record.error is None
-            else _cut(_flat(record.error), _CARD_TEXT_CHARS)
+            else _cut(
+                _flat(record.error),
+                _OFFSETS_ERROR_CHARS
+                if record.provides == "objective-offsets"
+                else _CARD_TEXT_CHARS,
+            )
         ),
         stale=stale and record.status is StageStatus.done,
         files=tuple(files),
@@ -1524,6 +1701,10 @@ class PlatePage:
         # event set (``stop()`` sets it and takes no lock, FM-70); the next activity of that
         # name removes it, so a later run says its own end.
         self._stopped_activity: set[str] = set()
+        # What this page wrote into a profile's file, under ``_lock``: the ``finished_utc`` of the
+        # ``objective-offsets`` result and the file (m5 §18.2 D7). The block says *Written* while
+        # the usable result is that one, and no longer once the tool has run again.
+        self._offsets_written: tuple[datetime, Path] | None = None
         # The plugin a resumed run is counted for and its plan's field count, under ``_lock``
         # (review of #496): a resumed ``scan`` counts ``done`` and ``total`` over the wells its
         # checkpoint does not hold (``wells_to_scan``), and ``_on_progress`` adds back the plan
@@ -1621,6 +1802,16 @@ class PlatePage:
         Symbolic links are not resolved: it is the path as the command was given.
         """
         return self._run_doc.absolute()
+
+    @property
+    def profile_argument(self) -> str:
+        """What ``-p`` takes in a command typed for this page: the profile's file when it has one, its name otherwise.
+
+        The one spelling of the page's commands (``command_for``, the next step, the offsets
+        block's how-to), so that none of them names the stand another way (m5 §18.2 D9).
+        """
+        source = self._profile.source
+        return self._profile.microscope.name if source is None else str(source)
 
     @property
     def stand_name(self) -> str:
@@ -2545,6 +2736,14 @@ class PlatePage:
             # §11.4): a usable plate would be replaced by a failure. The page refuses
             # first, nothing written, before the parameters are read (FM-169, m5 §12.3).
             return f"{plugin}: {refusal}"
+        if plugin == "objective-offsets" and (
+            refusal := self._offsets_refusal(self._document()[0])
+        ):
+            # The tool refuses a dry run and a plate it cannot measure from too, but its refusal
+            # is a `failed` record that replaces a usable result (§11.4): the page refuses first,
+            # nothing written, before the parameters are read (FM-169, FM-206, m5 §18.2 D8). A
+            # document that cannot be read is read again below, and refused with its error.
+            return f"{tool_title(plugin)}: {refusal}"
         if plugin == "plate-registration" and (
             refusal := self._registration_objective_refusal(params)
         ):
@@ -4498,6 +4697,7 @@ class PlatePage:
             register_refusal=self._register_refusal(),
             frame_wells=self._frame_wells(doc),
             scan_end=self._scan_end(doc),
+            offsets=(None if plate_record is None else _offsets_offer_of(registered)),
         )
 
     def _scan_end(self, doc: RunDocument) -> ScanEnd | None:
@@ -4760,11 +4960,10 @@ class PlatePage:
         resume: bool = False,
     ) -> str:
         """``command_for`` for the preset the caller already read: a step's pairs and its command name one preset (FM-151)."""
-        source = self._profile.source
         return command_line(
             plugin,
             params,
-            profile=self._profile.microscope.name if source is None else str(source),
+            profile=self.profile_argument,
             run_doc=self.run_doc,
             dry_run=self._dry_run,
             preset=None if loaded is None else str(loaded.file.path),
@@ -4920,6 +5119,30 @@ class PlatePage:
             return walls_square_wells(self._plate)
         return None
 
+    def _offsets_refusal(self, doc: RunDocument) -> str | None:
+        """Why the page does not run ``objective-offsets`` in this mode or on this plate, or ``None`` (m5 §18.2 D8, FM-206).
+
+        A dry run first, then, **when the ``plate`` slot of ``doc`` is usable**, the tool's three
+        refusals of a plate that is not from the walls, records no objective, or whose wall images
+        name another one (m3 §20.6 item 3, in the tool's words). The tool refuses all of them
+        before it turns anything, but its refusal is a ``failed`` record, and the latest attempt
+        decides the slot (§11.4): a usable result of the tool would be replaced by a failure the
+        page could foresee. One source for the accordion's reason (``_blocked``), the click
+        (``_prepare``) and the block's wait (``offsets_step``), so that they agree (FM-169).
+
+        An unusable or absent plate is ``None``: the reason that follows it in ``_blocked`` comes
+        from ``reads``, as for every tool. So is a document that could not be read: ``_document()``
+        answers it with an empty one and the error beside it, and a decision from the empty
+        document alone would read the plate as absent (FM-229); the callers that need to say why
+        take the error too (``offsets_step``) or let the next read refuse with it (``_prepare``).
+        What depends on the stand or on a document alone (a calibration of another frame, a Z that
+        moves) is the tool's, after the click.
+        """
+        if self._dry_run:
+            return OFFSETS_DRY_RUN
+        plate = self._slot(doc, "plate", PlateResult, [])
+        return None if plate is None else offsets_plate_refusal(plate)
+
     def _walls_is_next(self, providers: Sequence[ToolView]) -> bool:
         """Whether ``plate-walls`` is the tool of the ``plate`` slot's step, not the first provider (m5 §12.4).
 
@@ -4994,6 +5217,245 @@ class PlatePage:
         """
         pairs, wait = self._registration_step([])
         return tuple(pairs), wait
+
+    # --- the offsets block (m5 §18) -----------------------------------------------------
+
+    def offsets_step(self, calibrations_text: str) -> OffsetsStep:
+        """Read the typed calibration documents and say what *Measure the offsets* would run, or what it waits for (m5 §18.2 D3, D8).
+
+        The objectives to measure are **the documents'**: each line is a run document holding a
+        ``camera-calibration``, read with the tool's own ``calibration_from``, and the objective
+        it was done with is the one to turn to, so a document with no target and a target with
+        no document cannot be typed. A line the tool refuses is that line's ``problem``, its
+        words; a path is data (FM-125, FM-98): any other error of reading it (a folder, a
+        permission, a name the OS refuses) is a text for the line and never an exception in a
+        Panel callback. A relative path is read from where ``smc ui`` was started, as the tool
+        reads it, and is shown as typed.
+
+        ``wait`` is the first of: the stand is closed, ``_offsets_refusal``, a run document that
+        cannot be read (FM-229: not an empty one), a plate the tool cannot read, an activity
+        going, no document typed, the first line with a problem, then the page's own three
+        refusals in line order (the plate's own objective, an objective not on the turret, one
+        in two documents: foresight, FM-206; the tool checks every one again) and last the
+        sixth line, which is not read. Never called from the tick or from ``refresh()``: it
+        reads files (FM-145), and none while an activity goes (``reads`` is then empty and the
+        wait is the activity's).
+        """
+        paths = calibration_paths(calibrations_text)
+        profile = self._profile.microscope.name
+        # Nothing is opened while an activity goes: a typed path on a share that does not answer
+        # would hold the loop that handles STOP, with the stage moving (FM-62, FM-148); the wait
+        # is the activity's, and the lines under the field come back with the next edit or click.
+        busy = self._current_run is not None
+        reads = (
+            ()
+            if busy
+            else tuple(
+                _read_calibration(path, profile=profile, dry_run=self._dry_run)
+                for path in paths[:MAX_TARGETS]
+            )
+        )
+        targets = tuple(
+            read.objective
+            for read in reads
+            if read.objective is not None and read.problem is None
+        )
+        wait = self._offsets_wait(paths, reads)
+        pairs: tuple[str, ...] = ()
+        if wait is None:
+            pairs = (
+                f"targets={json.dumps(list(targets))}",
+                f"calibrations={json.dumps([read.path for read in reads])}",
+            )
+        return OffsetsStep(pairs, targets, reads, wait)
+
+    def _offsets_wait(
+        self, paths: Sequence[str], reads: Sequence[CalibrationRead]
+    ) -> str | None:
+        """The first reason ``offsets_step`` has nothing to run, in the order its docstring gives, or ``None``."""
+        if self._microscope is None:
+            return NOT_CONNECTED
+        doc, unreadable = self._document()
+        refusal = self._offsets_refusal(doc)
+        if refusal is not None:
+            return refusal
+        if unreadable is not None:
+            return f"run document: {_flat(unreadable)}"
+        unusable = self._unusable(doc, "plate", "objective-offsets")
+        if unusable is not None:
+            return unusable
+        current = self._current_run
+        if current is not None:
+            return busy_note(current[0], live=current[0] == "live")
+        if not paths:
+            return OFFSETS_NO_DOCUMENT
+        for read in reads:
+            if read.problem is not None:
+                return read.problem
+        plate = self._slot(doc, "plate", PlateResult, [])
+        labels = self.objective_labels()
+        if not labels:
+            return OFFSETS_TURRET_UNREAD
+        first_path: dict[str, str] = {}
+        for read in reads:
+            objective = read.objective
+            if objective is None:
+                continue  # unreachable: a document with no objective is a problem above
+            if plate is not None and objective == plate.objective:
+                return offsets_is_the_plates(objective)
+            if objective not in labels:
+                return offsets_not_on_turret(objective, labels)
+            if objective in first_path:
+                return offsets_in_two_documents(
+                    objective, first_path[objective], read.path
+                )
+            first_path[objective] = read.path
+        if len(paths) > MAX_TARGETS:
+            return OFFSETS_TOO_MANY
+        return None
+
+    def measure_offsets(self, armed: Sequence[str], calibrations_text: str) -> None:
+        """Turn the turret to each objective of the documents and measure the offsets, if they are still the objectives the operator confirmed (m5 §18.2 D4, FM-14).
+
+        The block's *Turn and measure*, the second of two clicks, and **the only place in the
+        page that writes ``confirm_turns=true``**: the first click armed the objectives the
+        documents named and asked the question (``offsets_confirm_text``). Here the documents
+        are read again, and nothing turns unless every one is usable and their objectives are
+        the armed ones: a path edited, a file replaced or an activity started since the
+        question was asked changes what the turret would be driven to, and the operator
+        confirmed a different turn (FM-169: the controller refuses on its own, whatever the
+        button says, and a stale tab or a script sends the click all the same). The refusal is
+        the outcome, ``Objective offsets: <why>``, and nothing is written or started. The run
+        that follows is ``run``'s, with its checks; the tool checks everything again before it
+        turns.
+
+        Raises:
+            RuntimeError: An activity is going (``<name> is running``), or the page is closed.
+        """
+        self._refuse_if_busy()
+        why = self._offsets_confirm_refusal(armed, calibrations_text)
+        if isinstance(why, str):
+            self._set_outcome(f"{tool_title('objective-offsets')}: {why}")
+            return
+        self.run("objective-offsets", [*why.pairs, "confirm_turns=true"])
+
+    def _offsets_confirm_refusal(
+        self, armed: Sequence[str], calibrations_text: str
+    ) -> OffsetsStep | str:
+        """The step to run when the armed objectives are the documents' now, else the text that says why not."""
+        if not armed:
+            return OFFSETS_NOTHING_ARMED
+        step = self.offsets_step(calibrations_text)
+        if step.wait is not None:
+            return step.wait
+        if step.targets != tuple(armed):
+            return offsets_changed(armed, step.targets)
+        return step
+
+    def offsets_plan(self, session: str) -> OffsetsPlanView:
+        """What writing the usable ``objective-offsets`` result would put into the profile, from a fresh load of its file (m5 §18.2 D7).
+
+        The command's own reading (``Profile.load(source)``), never the page's in-memory profile:
+        the preview names what the file holds now, and a stand already connected goes on with the
+        offsets it opened with. Only a usable result has a preview; the library's refusals
+        (a result of another profile, a reference changed since the run, one that does not
+        validate, a session of more than one line) are ``problem``, the preview's place, and so
+        are a profile with no file and a file or a document that cannot be read. Nothing is
+        written. Called at ``refresh()`` and at a change of the session text, never by the tick
+        (FM-145): it reads two files.
+        """
+        return self._offsets_plan(session)[1]
+
+    def _offsets_plan(
+        self, session: str
+    ) -> tuple[OffsetsPlan | None, OffsetsPlanView, datetime | None]:
+        """``offsets_plan`` with the library's plan, which ``write_offsets`` writes, and when the result it is made from finished."""
+        source = self._profile.source
+        if source is None:
+            return None, OffsetsPlanView("", (), OFFSETS_NO_FILE, False), None
+        file = source.name
+        doc, unreadable = self._document()
+        if unreadable is not None:
+            return (
+                None,
+                OffsetsPlanView(file, (), f"run document: {_flat(unreadable)}", False),
+                None,
+            )
+        record = doc.provider("objective-offsets")
+        if record is None or self._unusable(doc, "objective-offsets") is not None:
+            return None, OffsetsPlanView(file, (), None, False), None
+        with self._lock:
+            kept = self._offsets_written
+        written = (
+            kept is not None
+            and record.finished_utc is not None
+            and kept == (record.finished_utc, source)
+        )
+        problem = ""
+        plan: OffsetsPlan | None = None
+        try:
+            # The profile as the file holds it now, by its path (a name would be searched for).
+            plan = plan_offsets(
+                Profile.load(source),
+                doc,
+                self._run_doc,
+                session=session.strip() or None,
+            )
+        except (OffsetsWriteError, ProfileError) as exc:
+            # Text, never the error (FM-98).
+            problem = _flat(str(exc))
+            if kept is not None and kept[1] == source and not written:
+                # This page wrote into the file earlier: the stand it holds still has the old
+                # reference, so running the tool again cannot help until it is restarted.
+                problem = f"{problem}; {OFFSETS_RESTART_FIRST}"
+        if plan is None:
+            return (
+                None,
+                OffsetsPlanView(file, (), problem, written),
+                record.finished_utc,
+            )
+        return (
+            plan,
+            OffsetsPlanView(file, plan.lines, None, written),
+            record.finished_utc,
+        )
+
+    def write_offsets(self, session: str, shown: Sequence[str]) -> None:
+        """Write the offsets into the profile's file, if they are the lines the operator was shown (m5 §18.2 D7, FM-172).
+
+        The plan is computed again, from a fresh load of the file, and written only when its
+        ``lines`` are the ``shown`` ones: the offsets, the profile or the session may have
+        changed since the preview was drawn (another tab, an editor, a tool run again), and the
+        operator confirmed what replaces what, not whatever replaces something. Otherwise
+        nothing is written and the outcome says to look again. The refusals are outcomes,
+        ``Objective offsets: <why>``; a write is ``Offsets written into <file name>``. The page
+        does not reload its profile: a stand already connected goes on with the offsets it
+        opened with.
+
+        Raises:
+            RuntimeError: An activity is going (``<name> is running``), or the page is closed.
+        """
+        self._refuse_if_busy()
+        plan, view, finished = self._offsets_plan(session)
+        title = tool_title("objective-offsets")
+        if plan is None:
+            self._set_outcome(f"{title}: {view.problem or OFFSETS_NO_DOCUMENT}")
+            return
+        if tuple(shown) != plan.lines:
+            self._set_outcome(f"{title}: {OFFSETS_PLAN_CHANGED}")
+            return
+        failure = ""
+        try:
+            write_offsets_block(plan)
+        except OffsetsWriteError as exc:
+            failure = _flat(str(exc))
+        if failure:
+            self._set_outcome(f"{title}: {failure}")
+            return
+        with self._lock:
+            if finished is not None:
+                self._offsets_written = (finished, plan.source)
+        self._set_outcome(f"Offsets written into {plan.source.name}")
 
     def _registration_step(self, why: list[str]) -> tuple[list[str], str | None]:
         """The pairs of ``plate-registration`` and what it waits for, with a line of ``why`` for them.
@@ -5164,6 +5626,8 @@ class PlatePage:
             )
             if reason is None and name == "plate-walls":
                 reason = self._walls_refusal()
+            if reason is None and name == "objective-offsets":
+                reason = self._offsets_refusal(doc)
             if reason is None:
                 reason = next(
                     (

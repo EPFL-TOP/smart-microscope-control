@@ -22,12 +22,17 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
+from smc.plugins.api import Progress
 from smc.plugins.geometry import Matrix2
 from smc.plugins.presets import Preset, PresetCheck, PresetFile
 from smc.plugins.scan_plan.algorithm import plan_fields
 from smc.plugins.slots import (
+    MeasuredOffset,
+    ObjectiveOffsetsResult,
+    OffsetWell,
     PlateResult,
     ScanPlanResult,
+    TargetMeasure,
     WallFrame,
     WallImages,
     WellFit,
@@ -69,6 +74,9 @@ from smc.ui.guide import (
     NO_FILES_YET,
     NOT_CONNECTED,
     NOTHING_LEFT,
+    OFFSETS_NO_DOCUMENT,
+    OFFSETS_NOTHING_ARMED,
+    OFFSETS_TOO_MANY,
     ORIENTATION_IN_STAGE_TERMS,
     OTHER_WAYS_TO_REGISTER,
     PLATE_NOT_CHOSEN,
@@ -110,6 +118,9 @@ from smc.ui.guide import (
     a1_corner,
     again_note,
     busy_note,
+    calibration_how_text,
+    calibration_paths,
+    calibration_read_line,
     capture_centre_label,
     capture_note,
     capture_wall_label,
@@ -121,6 +132,7 @@ from smc.ui.guide import (
     continue_label,
     drive_image_note,
     duration_text,
+    error_words,
     field_source_line,
     files_html,
     files_lines,
@@ -135,7 +147,21 @@ from smc.ui.guide import (
     map_title,
     needs_calibration,
     next_slot,
+    objective_in_place_line,
     objective_line,
+    offsets_card_lines,
+    offsets_changed,
+    offsets_confirm_text,
+    offsets_in_two_documents,
+    offsets_is_the_plates,
+    offsets_lead,
+    offsets_lead_unread,
+    offsets_not_on_turret,
+    offsets_others,
+    offsets_plan_heading,
+    offsets_plate_refusal,
+    offsets_run_line,
+    offsets_written_line,
     opening_step,
     orientation_label,
     plain_default,
@@ -3336,3 +3362,326 @@ def test_the_chain_line_names_a_tool_outside_results_by_its_plain_title() -> Non
         None,
     )
     assert chain_line(done) == "Done: Timing, Field layout."
+
+
+# -- the offsets between objectives (m5 §18, #382) ----------------------------------------
+
+_TEN_X = "Nikon 10X S Fluor"
+_FOUR_X = "Nikon 4X Plan Fluor"
+_FORTY_X = "Nikon 40X Plan Fluor ELWD"
+
+
+def _offsets_measure(
+    objective: str,
+    shift: tuple[float, float],
+    wells: tuple[str, ...] = ("A1", "H12", "A12"),
+) -> TargetMeasure:
+    fits = tuple(
+        OffsetWell(
+            well=well,
+            origin_xy_um=(0.0, 0.0),
+            delta_xy_um=shift,
+            fit=_fit(well, shift, (1, 1, 1, 1)),
+        )
+        for well in wells
+    )
+    return TargetMeasure(
+        objective=objective,
+        calibration="cal.json",
+        calibration_measured="2026-11-10T10:00:00+00:00",
+        pixel_size_um=2.5,
+        z_after_turn_um=None,
+        wells=fits,
+        shift_xy_um=shift,
+        spread_um=0.03,
+        max_spread_um=2.0,
+        frames=24,
+        folder=None,
+    )
+
+
+def _offsets_result(
+    measures: tuple[TargetMeasure, ...],
+    offsets: tuple[MeasuredOffset, ...],
+    *,
+    plate_objective: str = _TEN_X,
+    in_place: str = _FORTY_X,
+) -> ObjectiveOffsetsResult:
+    return ObjectiveOffsetsResult(
+        plate_objective=plate_objective,
+        reference=plate_objective,
+        reference_in_profile=False,
+        measures=measures,
+        offsets=offsets,
+        objective_in_place=in_place,
+        elapsed_s=62.8,
+    )
+
+
+def test_the_other_objectives_leave_out_the_plates_and_the_empty_positions() -> None:
+    labels = ("", _FOUR_X, _TEN_X, "   ", _FORTY_X)
+
+    assert offsets_others(labels, _TEN_X) == (_FOUR_X, _FORTY_X)
+    assert offsets_others((_TEN_X, ""), _TEN_X) == ()
+
+
+def test_calibration_paths_drop_blank_lines_and_one_pair_of_quotes() -> None:
+    text = (
+        '  cal-10x.json \n\n"C:\\Users\\me\\My Docs\\cal-40x.json"\r\n   \n'
+        '""\n""twice""\n"unclosed\n'
+    )
+
+    assert calibration_paths(text) == (
+        "cal-10x.json",
+        "C:\\Users\\me\\My Docs\\cal-40x.json",
+        '"twice"',
+        '"unclosed',
+    )
+    assert calibration_paths("") == ()
+    assert calibration_paths("\n \n") == ()
+
+
+def test_the_offsets_lead_names_the_plates_objective_and_the_others() -> None:
+    assert offsets_lead(_TEN_X, (_FOUR_X, _FORTY_X)) == (
+        f"The plate was registered with {_TEN_X}. Other objectives on the turret: "
+        f"{_FOUR_X}, {_FORTY_X}. The page turns the turret to each objective of the "
+        "documents below, finds the walls of the wells it registered again, and says "
+        "how far the same wells moved."
+    )
+
+
+def test_the_offsets_lead_with_no_other_objective_says_so() -> None:
+    assert offsets_lead(_TEN_X, ()) == (
+        f"The plate was registered with {_TEN_X}. The turret has no other objective."
+    )
+
+
+def test_the_objective_in_place_line_says_not_known_and_may_be_turning_while_it_runs() -> (
+    None
+):
+    assert objective_in_place_line(_FORTY_X, running=False) == (
+        f"Objective in place: {_FORTY_X}"
+    )
+    assert objective_in_place_line(_FORTY_X, running=True) == (
+        f"Objective in place: {_FORTY_X}"
+    )
+    assert objective_in_place_line(None, running=False) == (
+        "Objective in place: not known"
+    )
+    assert objective_in_place_line(None, running=True) == (
+        "Objective in place: not known (the turret may be turning)"
+    )
+    # An empty turret position is no objective in place.
+    assert objective_in_place_line("", running=True) == (
+        "Objective in place: not known (the turret may be turning)"
+    )
+
+
+def test_the_offsets_run_line_says_no_report_yet_then_the_report_and_its_count() -> (
+    None
+):
+    assert offsets_run_line(None) == (
+        "no report yet: the turn and the walk to the first well come first"
+    )
+    assert offsets_run_line(Progress("objective-offsets", 3, 24, "40X: A12 -Y")) == (
+        "40X: A12 -Y (3 of 24)"
+    )
+    assert offsets_run_line(Progress("objective-offsets", 3, None, "40X: A12 -Y")) == (
+        "40X: A12 -Y"
+    )
+    assert offsets_run_line(Progress("objective-offsets", 0, 24, "")) == "(0 of 24)"
+
+
+def test_the_confirmation_names_what_is_in_place_the_turns_and_where_the_turret_is_left() -> (
+    None
+):
+    assert offsets_confirm_text(_TEN_X, (_FOUR_X, _FORTY_X)) == (
+        f"Turn the turret to {_FOUR_X}, then {_FORTY_X}, with the plate on the stage? "
+        "Check that each objective clears the plate (its working distance, the "
+        "plate's height) and that the stage is clear. "
+        f"In place now: {_TEN_X}. The turret is left at {_FORTY_X}, not turned back, "
+        "and the autofocus is switched off and not engaged again."
+    )
+    assert "In place now: not known." in offsets_confirm_text(None, (_FOUR_X,))
+    assert offsets_confirm_text(None, (_FOUR_X,)).startswith(
+        f"Turn the turret to {_FOUR_X}, with the plate on the stage?"
+    )
+    with pytest.raises(ValueError, match="at least one objective"):
+        offsets_confirm_text(_TEN_X, ())
+
+
+def test_the_offsets_card_lines_name_each_target_its_shift_spread_wells_and_bound() -> (
+    None
+):
+    # Asymmetric on purpose, with a -0.0 that must not print as "-0.00" (FM-203); the
+    # expected text is written from the numbers.
+    result = _offsets_result(
+        (
+            _offsets_measure(_FOUR_X, (-12.341, 6.789)),
+            _offsets_measure(_FORTY_X, (-0.0, 12.25), wells=("A1", "B2")),
+        ),
+        (
+            MeasuredOffset(objective=_FOUR_X, xy_offset_um=(-12.341, 6.789)),
+            MeasuredOffset(objective=_FORTY_X, xy_offset_um=(-0.0, 19.039)),
+        ),
+    )
+
+    assert offsets_card_lines(result) == (
+        f"{_FOUR_X}: shift from {_TEN_X} (-12.34, +6.79) µm, spread 0.03 µm over A1, "
+        "H12, A12 (bound 2.00 µm)",
+        f"{_FORTY_X}: shift from {_TEN_X} (+0.00, +12.25) µm, spread 0.03 µm over A1, "
+        "B2 (bound 2.00 µm)",
+        f"offsets to write: {_FOUR_X} (-12.34, +6.79) µm, {_FORTY_X} (+0.00, +19.04) µm",
+        f"the turret is left at {_FORTY_X}",
+    )
+
+
+def test_the_offsets_card_lines_are_one_line_each_for_a_label_with_a_line_break_and_700_characters() -> (
+    None
+):
+    label = "40X\nlens " + "x" * 700
+    result = _offsets_result(
+        (_offsets_measure(label, (1.0, 2.0)),),
+        (MeasuredOffset(objective=label, xy_offset_um=(1.0, 2.0)),),
+        in_place=label,
+    )
+
+    lines = offsets_card_lines(result)
+
+    assert len(lines) == 3
+    assert all("\n" not in line and "\r" not in line for line in lines)
+    assert lines[0].startswith("40X lens xxxx")
+    # The card's own bound cuts them (controller._card); the pure texts keep what they say.
+    assert all(len(line) > 700 for line in lines)
+
+
+def test_error_words_drop_the_exception_type_and_the_tools_name_and_leave_other_text_alone() -> (
+    None
+):
+    tool = "no camera calibration of Nikon 40X in calibrations: turn to it"
+
+    assert error_words(f"PluginRunError: objective-offsets: {tool}") == tool
+    assert error_words(f"objective-offsets: {tool}") == tool
+    assert error_words(f"ValueError: {tool}") == tool
+    assert error_words(tool) == tool
+    # Another tool's name, and a colon that is not a type's, stay.
+    assert error_words("plate-walls: it failed") == "plate-walls: it failed"
+    assert error_words("disk full: D:\\run.json") == "disk full: D:\\run.json"
+    # The type is taken once, at the start only.
+    assert error_words("see PluginRunError: x") == "see PluginRunError: x"
+
+
+def test_the_plate_refusals_the_page_foresees_are_the_tools_words() -> None:
+    from smc.plugins.errors import PluginRunError
+    from smc.plugins.objective_offsets.plugin import _checked_plate
+
+    wells = (
+        _fit("A1", (0.0, 0.0), (1, 1, 1, 1)),
+        _fit("H12", (9.0, 9.0), (1, 1, 1, 1)),
+    )
+    walls = _walls_result(None, wells=wells)
+    assert walls.walls is not None
+    fine = walls.model_copy(update={"objective": walls.walls.objective})
+    cases = {
+        "by eye": fine.model_copy(update={"method": "references"}),
+        "no objective": fine.model_copy(update={"objective": None}),
+        "mixed up": fine.model_copy(update={"objective": "another"}),
+    }
+
+    for plate in cases.values():
+        with pytest.raises(PluginRunError) as raised:
+            _checked_plate(plate)
+        assert offsets_plate_refusal(plate) == raised.value.reason
+    assert offsets_plate_refusal(fine) is None
+    assert _checked_plate(fine)[0] == walls.walls.objective
+
+
+def test_the_offsets_refusals_and_waits_are_one_line_in_the_tools_words() -> None:
+    assert offsets_is_the_plates(_TEN_X) == (
+        f"{_TEN_X} is the objective the plate was registered with: its offset from "
+        "itself is zero; leave its document out"
+    )
+    assert offsets_not_on_turret(_FORTY_X, ("", _FOUR_X, _TEN_X)) == (
+        f"{_FORTY_X} is not on the turret: {_FOUR_X}, {_TEN_X}"
+    )
+    assert offsets_in_two_documents(_FORTY_X, "a.json", "b.json") == (
+        f"{_FORTY_X} is in two documents: a.json and b.json"
+    )
+    assert offsets_changed((_FOUR_X, _FORTY_X), (_FORTY_X,)) == (
+        f"the objectives changed since you confirmed them ({_FOUR_X}, {_FORTY_X} → "
+        f"{_FORTY_X}): measure again"
+    )
+    assert OFFSETS_TOO_MANY == "at most 5 objectives in one run"
+    assert OFFSETS_NO_DOCUMENT == (
+        "Give the camera calibration of each objective to measure: one run document "
+        "per line."
+    )
+    assert OFFSETS_NOTHING_ARMED == (
+        "choose the documents and press Measure the offsets again"
+    )
+    assert offsets_plan_heading("/p/stand.toml") == (
+        "Writing these replaces what /p/stand.toml holds:"
+    )
+    assert offsets_written_line("/p/stand.toml") == (
+        "Written into /p/stand.toml. The page keeps the offsets it was started with: "
+        "restart it to use these."
+    )
+
+
+def test_a_calibration_line_says_its_objective_and_its_date_or_that_none_is_known() -> (
+    None
+):
+    assert calibration_read_line(
+        "cal-40x.json", _FORTY_X, "2026-11-14T14:06:37+00:00"
+    ) == (f"cal-40x.json: calibrated at {_FORTY_X} on 2026-11-14")
+    assert calibration_read_line("c.json", None, "at an unknown time") == (
+        "c.json: calibrated at an unknown objective, at an unknown time"
+    )
+
+
+def test_the_lead_while_the_turret_is_not_read_does_not_say_it_has_no_other_objective() -> (
+    None
+):
+    assert offsets_lead_unread(_TEN_X) == (
+        f"The plate was registered with {_TEN_X}. The turret's other objectives are "
+        "read when the stand is connected."
+    )
+
+
+def test_the_how_to_names_the_three_steps_the_command_and_where_a_path_is_read_from() -> (
+    None
+):
+    command = (
+        "smc run camera-calibration -p /p/stand.toml --run-doc cal-<objective>.json"
+    )
+
+    assert calibration_how_text(command).splitlines() == [
+        "1. In the drive bar, Change objective to the objective, and bring a well's "
+        "wall into the image (Live and the arrows).",
+        "2. Press Disconnect on the Stand screen: the terminal needs the stand.",
+        "3. In a terminal, run this, then press Connect again:",
+        f"   {command}",
+        "A relative path is read from where smc ui was started.",
+    ]
+
+
+def test_calibration_paths_drop_the_invisible_characters_a_windows_dialog_puts_before_a_path() -> (
+    None
+):
+    # Windows' Properties dialog puts U+202A before the path it copies, and the OS refuses the
+    # name with it: an operator sees a path that looks right and an error that says nothing.
+    pasted = (
+        "\u202aC:\\Users\\lab\\cal-40x.json\n"
+        "\u200e D:\\cal.json \u200f\n"
+        '"\u202aE:\\quoted.json"\n'
+        "F:\\in\u200bside.json"
+    )
+
+    assert calibration_paths(pasted) == (
+        "C:\\Users\\lab\\cal-40x.json",
+        "D:\\cal.json",
+        "E:\\quoted.json",
+        # Inside a name nothing is touched: only the two ends of a line are.
+        "F:\\in\u200bside.json",
+    )
+    assert calibration_paths("\u202a\n\u200b \u200f") == ()

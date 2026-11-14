@@ -231,8 +231,11 @@ The others come **after the turret has turned**, which stays where it is:
   failure.
 - **The magnifier lever** is not keyed: the offsets are for the lever as it was during the
   run, which the profile stores by objective alone.
-- **The plate page** has no step for it yet (#382), nor a button that writes the profile.
-  A preset never keeps `confirm_turns`: the turns are confirmed again at every run.
+- **The plate page** has a block for it on the Plate screen (*Measure the offsets between
+  objectives*, [the plate page](../ui/plate-page.md#measure-the-offsets-between-objectives),
+  #382): it asks before the turret turns and writes the profile after showing what it
+  replaces. The block does not make the calibration documents (#501). A preset never keeps
+  `confirm_turns`: the turns are confirmed again at every run.
 
 ## Trying it without a microscope
 
