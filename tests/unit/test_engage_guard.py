@@ -44,6 +44,7 @@ from test_mm_autofocus import (
 )
 
 import smc.hardware.backends.mm as mm
+from smc.drive import DriveResult, set_autofocus_offset
 from smc.hardware.capabilities import ObjectiveTurret, XYStage
 from smc.hardware.errors import (
     AutofocusExcursionError,
@@ -1770,3 +1771,35 @@ def test_a_first_lock_below_the_floor_that_drops_past_the_z_soft_limit_says_set_
             Z0 + (4000.0 - SEEN_OFFSET) / 6.0,
         )
         assert stand.core.log == [ON, OFF]
+
+
+def test_the_advice_to_set_the_floor_on_a_device_that_truncates_is_followed_to_the_same_offset_and_says_so_each_time() -> (
+    None
+):
+    # The circle of m2 §12.12.1 end to end, on the real autofocus over a core that holds
+    # whole units: the floor 7927.5 reads 7927, a first lock from there drops Z past the
+    # 4000 µm soft limit and says "set the offset to its floor" (D14), and following it
+    # lands at 7927 again. D16 says so each time, before any engage (FM-237).
+    core = _ti2_core()
+    core.hold_whole_units("PFSOffset")
+    profile = _first_lock(
+        autofocus_offset_soft_limits=(7927.5, 12000.0),
+        z_soft_limits_um=(4000.0, 4350.0),
+    )
+    with _stand(profile, offset=7927.0, core=core) as stand:
+        _jumps_to(stand, 3614.94)
+        with pytest.raises(AutofocusExcursionError) as jumped:
+            stand.af.engage()
+        assert "set the offset to its floor and engage again" in str(jumped.value)
+
+        for _ in range(2):
+            assert set_autofocus_offset(stand.microscope, None) == DriveResult(
+                "offset 7927 PFSOffset units, although 7927.5 was asked: below the "
+                "floor, so setting the floor again may change nothing; either this "
+                "device does not hold the floor as written (set the floor, [safety] "
+                "autofocus_offset_soft_limits, to a value it holds) or it did not "
+                "take the write (read the offset again and check the stand) (m2 "
+                "§12.12 D16)",
+                reached=False,
+            )
+            assert stand.core.getPosition("PFSOffset") == 7927.0
