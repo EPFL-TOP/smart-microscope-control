@@ -73,6 +73,7 @@ from smc.ui.controller import (
     PlatePage,
     PlateView,
     ResultCard,
+    ScanEnd,
     ToolView,
     WellView,
 )
@@ -83,6 +84,9 @@ from smc.ui.guide import (
     DRY_RUN_NO_FRAME,
     END_LIVE_LABEL,
     FILES_HEADING,
+    MEASURE_AFTER_THE_SCAN,
+    MEASURE_NOT_IN_A_DRY_RUN,
+    MEASURE_THE_TIME,
     NO_FILES_YET,
     ORIENTATION_IN_STAGE_TERMS,
     OTHER_WAYS_TO_REGISTER,
@@ -91,6 +95,9 @@ from smc.ui.guide import (
     RESULT_NAMES,
     RESULT_TOOLS,
     RUN_ALL_LABEL,
+    SCAN_CONTINUE,
+    SCAN_REPLACES,
+    SCAN_START_AGAIN,
     SCREEN_LEADS,
     SCREEN_TITLES,
     STEPS,
@@ -134,6 +141,9 @@ from smc.ui.guide import (
     result_row,
     results_left,
     run_all_wait,
+    scan_actions_wait,
+    scan_again_confirm,
+    scan_end_lines,
     scan_lead,
     scan_progress_lines,
     scan_title,
@@ -636,6 +646,12 @@ class PlatePageView:
         self._expected_of: LoadedPreset | None = None
         self._filling = False
         self._preset_armed: tuple[str] | None = None
+        # The Scan screen's *Start again* (m5 §17.12 D17): the scan end its first click armed
+        # for, per view (D6: a second tab never inherits it). The second click runs the scan
+        # afresh only while the view's ``scan_end`` is still this one; a change of screen, of
+        # the scan end or any other button drops it (FM-172: one click never drops a
+        # checkpoint).
+        self._again_armed: ScanEnd | None = None
         # The Plate screen (m5 §17.4.2): the centre rows and the registration the last
         # redraw drew. A button runs what was drawn, never what would be computed at the
         # click (#287, FM-177). The drive's answer is the controller's, on the row of the well
@@ -1371,6 +1387,15 @@ class PlatePageView:
         self.layout_wait = _wrapped_text()
         self.layout_wait.visible = False
         self.wells_known_block = _wrapped_text()
+        # *Measure the time* (m5 §17.12 D18), under the known block while the plan has no
+        # time: the chain of ``timing`` and ``scan-plan``, whose line is drawn under it.
+        self.measure_time_button = pn.widgets.Button(
+            label=MEASURE_THE_TIME, visible=False
+        )
+        self.measure_time_wait = _wrapped_text()
+        self.measure_time_wait.visible = False
+        self.wells_chain_text = _wrapped_text()
+        self.wells_chain_text.visible = False
         self.wells_note = _wrapped_text()
         self.wells_note.visible = False
         self.layout_command = _wrapped_text()
@@ -1394,6 +1419,22 @@ class PlatePageView:
         self.scan_button = pn.widgets.Button(label="Start the scan", color="primary")
         self.scan_wait_text = _wrapped_text()
         self.scan_wait_text.visible = False
+        # What *Start the scan* would replace (``SCAN_REPLACES``), under it before the click.
+        self.scan_replaces_text = _wrapped_text()
+        self.scan_replaces_text.visible = False
+        # A scan that ended stopped or failed (m5 §17.12 D17): what ended it, then, over a
+        # checkpoint the page can continue, the two actions in place of *Start the scan* and
+        # the one line under them (their wait, or what the second click of *Start again* drops).
+        self.scan_end_text = _wrapped_text()
+        self.scan_end_text.visible = False
+        self.scan_continue_button = pn.widgets.Button(
+            label=SCAN_CONTINUE, color="primary", visible=False
+        )
+        self.scan_again_button = pn.widgets.Button(
+            label=SCAN_START_AGAIN, visible=False
+        )
+        self.scan_actions_text = _wrapped_text()
+        self.scan_actions_text.visible = False
         self.scan_dry_note = _wrapped_text()
         self.scan_dry_note.visible = False
         self.scan_progress = pn.indicators.Progress(
@@ -1418,6 +1459,15 @@ class PlatePageView:
         # sections: the pairs are the page's and the typed fields', read at the click.
         self.layout_button.on_click(self._handler(self._runner("scan-plan")))
         self.scan_button.on_click(self._handler(self._runner("scan")))
+        self.scan_continue_button.on_click(
+            self._handler(lambda event: self.on_scan_continue())
+        )
+        self.scan_again_button.on_click(
+            self._handler(lambda event: self.on_scan_again(), keeps_scan_arm=True)
+        )
+        self.measure_time_button.on_click(
+            self._handler(lambda event: self.on_measure_time())
+        )
 
     def _build_results(self) -> None:
         """The Results screen's widgets: *Run all that are left*, a row for each tool and where the files are (m5 §17.4.5, §17.11.2, #446).
@@ -1749,6 +1799,11 @@ class PlatePageView:
             "scan": [
                 self.scan_button,
                 self.scan_wait_text,
+                self.scan_replaces_text,
+                self.scan_end_text,
+                self.scan_continue_button,
+                self.scan_again_button,
+                self.scan_actions_text,
                 self.scan_dry_note,
                 self.scan_progress,
                 self.scan_progress_text,
@@ -1818,6 +1873,9 @@ class PlatePageView:
             self.layout_button,
             self.layout_wait,
             self.wells_known_block,
+            self.measure_time_button,
+            self.measure_time_wait,
+            self.wells_chain_text,
             self.wells_note,
             self.layout_card,
         ]
@@ -1862,6 +1920,8 @@ class PlatePageView:
         never be the one a later swap mutates (m5 §17.6).
         """
         screen: ScreenName = "expert" if self.expert else self.step
+        # A change of screen is a reason to ask again (m5 §17.12 D17).
+        self._again_armed = None
         label = continue_label(self.step)
         self.continue_button.label = label or ""
         self.continue_button.visible = label is not None
@@ -2001,7 +2061,9 @@ class PlatePageView:
 
     # --- handlers ---------------------------------------------------------------
 
-    def _handler(self, fn: Callable[..., Any]) -> Callable[..., None]:
+    def _handler(
+        self, fn: Callable[..., Any], *, keeps_scan_arm: bool = False
+    ) -> Callable[..., None]:
         """``fn`` as Panel and Bokeh should call it: under the document lock, and never raising.
 
         Panel runs a handler without the session's lock when an event flushes a change
@@ -2014,10 +2076,22 @@ class PlatePageView:
         page, not only a traceback in a console the operator does not read; ``Exception``
         only, so that Ctrl-C passes. The exception is formatted and kept nowhere
         (FM-98). Every handler the page registers goes through here.
+
+        A click on any button but *Start again* (``keeps_scan_arm``) drops that button's
+        arm first: what the operator does between the two clicks is a reason to ask again
+        (m5 §17.12 D17, FM-172). A button's click only: a watcher of a value the tick
+        rewrites (an outcome line's ``_hide_when_empty``) goes through here too, and would
+        drop the arm at every tick.
         """
 
         @functools.wraps(fn)
         def run(*args: Any, **kwargs: Any) -> None:
+            if (
+                not keeps_scan_arm
+                and args
+                and isinstance(getattr(args[0], "obj", None), pn.widgets.Button)
+            ):
+                self._again_armed = None
             try:
                 # Looked up at call time: a test replaces it with a spy.
                 with pn.io.unlocked():
@@ -2272,6 +2346,57 @@ class PlatePageView:
             self.page.run_chain(tools, params)
 
         self._try(run_all)
+        self.tick()
+
+    def _scan_pairs(self) -> list[str]:
+        """What *Start the scan* sends: the page's pairs and the scan's typed fields, read at the click."""
+        return [*self.page.page_params("scan"), *self._typed("scan")]
+
+    def on_scan_continue(self) -> None:
+        """*Continue the scan*: the runner's resume of the scan's checkpoint, with what *Start the scan* would send (m5 §17.12 D17).
+
+        The checks are the runner's (``check_ready(..., resume=True)``): fields changed since
+        the stop are its refusal, said as the outcome. The page adds none of its own (D17), but
+        the controller refuses it while the stand is halted, as the button's wait says.
+        """
+        self._try(lambda: self.page.run("scan", self._scan_pairs(), resume=True))
+        self.tick()
+
+    def on_scan_again(self) -> None:
+        """*Start again*: the first click arms and says what the second drops; the second runs the scan afresh (m5 §17.12 D17, FM-172).
+
+        The arm is the scan end the first click saw; the second click runs only while the
+        view's scan end is still that one, and arms again otherwise (another tab continued
+        the scan, a new end was drawn). ``afresh=True`` is passed here and nowhere else.
+        """
+        view = self._view
+        end = None if view is None else view.scan_end
+        armed = self._again_armed
+        if armed is None or end is None or armed != end:
+            self._again_armed = end if end is not None and end.resumable else None
+            self._draw_wells_scan_buttons()
+            return
+        self._again_armed = None
+        self._try(lambda: self.page.run("scan", self._scan_pairs(), afresh=True))
+        self.tick()
+
+    def on_measure_time(self) -> None:
+        """*Measure the time*: ``timing``, then the fields laid out again, as one chain (m5 §17.12 D18).
+
+        Each tool with the pairs its own *Run* sends: the profile's suggestions are the
+        fields' starting values, as *Calibrate the camera* sends ``camera-calibration``'s. The
+        chain's rule (D14) runs ``scan-plan`` after ``timing``, since it reads the timings.
+        """
+        tools = ("timing", "scan-plan")
+
+        def measure() -> None:
+            params = {
+                tool: [*self.page.page_params(tool), *self._typed(tool)]
+                for tool in tools
+            }
+            self.page.run_chain(tools, params)
+
+        self._try(measure)
         self.tick()
 
     def _typed(self, plugin: str) -> list[str]:
@@ -3524,9 +3649,24 @@ class PlatePageView:
             self.scan_dry_note,
             DRY_RUN_NO_FRAME if status is not None and status.dry_run else "",
         )
+        end = self._scan_end_offered()
+        self._say(
+            self.scan_end_text, "" if end is None else "\n".join(scan_end_lines(end))
+        )
         progress = None if status is None else status.progress
+        scanning = status is not None and status.running == "scan"
+        card = None if view is None else view.cards.get("scan")
+        # Once the scan's record is done its result line says it: the bar at its end and
+        # ``Field 72 of 72`` under ``Scanned: 72 frames`` said it twice (m5 §17.12 D17). The
+        # view is read when a run ends, so a done card while a new scan goes is the old one.
+        finished = card is not None and card.status == "done" and not scanning
         shown = False
-        if status is not None and progress is not None and progress.plugin == "scan":
+        if (
+            status is not None
+            and progress is not None
+            and progress.plugin == "scan"
+            and not finished
+        ):
             shown = True
             total = progress.done if progress.total is None else progress.total
             going = status.running == "scan"
@@ -3549,15 +3689,24 @@ class PlatePageView:
         else:
             self._say(self.scan_progress_text, "")
         self.scan_progress.visible = shown
-        summary = None if view is None else view.scanned
+        # The result line of the scan before is not drawn while a new one goes (D17).
+        summary = None if view is None or scanning else view.scanned
         lines: list[str] = []
-        if view is not None and summary is not None:
+        if summary is not None:
             lines.append(scanned_line(summary))
-            card = view.cards.get("scan")
             if card is not None:
                 lines += [f"assumed: {text}" for text in card.assumed]
                 lines += list(card.files)
         self._say(self.scanned_block, "\n".join(lines))
+        # What *Start the scan* would replace, under it before the click (D17, as B2's
+        # ``register_replace_note`` does for a plate).
+        self._say(
+            self.scan_replaces_text,
+            # A dry run took no frame: starting again loses nothing to say.
+            ""
+            if summary is None or summary.dry_run
+            else SCAN_REPLACES.format(frames=summary.frames),
+        )
 
     def _draw_imaged(self, status: PageStatus) -> None:
         """While a scan runs, the plan's first ``done`` fields are drawn as imaged: from the progress, only when it changed (m5 §17.10.2).
@@ -3565,7 +3714,10 @@ class PlatePageView:
         The scan visits the plan's fields in the plan's order (measured: the reports' names
         are the plan's), so the first ``done`` are the ones with a frame, a failed field
         counted as visited (the end of the run redraws from the record, which holds the frames
-        that were taken). A **dry run** takes none, whatever the progress says, and the page
+        that were taken). A continued scan's ``done`` is the plan's too (the controller adds
+        back the fields its checkpoint holds, which are the plan's first: whole wells, in the
+        plan's order), so its first ``done`` are the checkpoint's fields and the ones taken
+        since. A **dry run** takes none, whatever the progress says, and the page
         says so (the note, the result line): nothing is drawn while one runs, as the record
         draws none after it. Nothing is drawn before the first report either: the record of an
         earlier scan, drawn by the last redraw, is cleared here. A ``done`` below what was drawn
@@ -3641,7 +3793,88 @@ class PlatePageView:
         if "scan" not in self.tool_runs:
             start = "scan did not load: the problems line says why"
         self.scan_button.disabled = running is not None or start is not None
-        self._say(self.scan_wait_text, start or busy or "")
+        # Over a checkpoint the page continues, the two actions take *Start the scan*'s place
+        # (m5 §17.12 D17); its wait would be the checkpoint, which they replace.
+        end = self._scan_end_offered()
+        offer = end is not None and end.resumable and "scan" in self.tool_runs
+        self.scan_button.visible = not offer
+        self._say(self.scan_wait_text, "" if offer else (start or busy or ""))
+        self._draw_measure_time(busy)
+        self.scan_continue_button.visible = offer
+        self.scan_again_button.visible = offer
+        if end is None or not offer:
+            self._again_armed = None
+            self._say(self.scan_actions_text, "")
+            return
+        status = self._status
+        wait = scan_actions_wait(
+            connected=connected,
+            halted=status is not None and status.halted,
+            running=running,
+        )
+        self.scan_continue_button.disabled = wait is not None
+        self.scan_again_button.disabled = wait is not None
+        armed = self._again_armed
+        self._say(
+            self.scan_actions_text,
+            wait or (scan_again_confirm(end.done) if armed is not None else ""),
+        )
+
+    def _scan_end_offered(self) -> ScanEnd | None:
+        """The scan end the Scan screen draws, or ``None``: none while a scan goes (m5 §17.12 D17).
+
+        The view is read again when a run ends, not when one starts, so while the continued
+        (or a new) scan goes the last view still holds the end before it: the screen then
+        draws the scan that goes, never the end it replaces. An arm of *Start again* made
+        for another end than this one is dropped here (D17).
+        """
+        view = self._view
+        end = None if view is None or self._running == "scan" else view.scan_end
+        if self._again_armed is not None and self._again_armed != end:
+            self._again_armed = None
+        return end
+
+    def _draw_measure_time(self, busy: str | None) -> None:
+        """*Measure the time* and its wait: offered while the usable plan has no time and both tools loaded (m5 §17.12 D18).
+
+        Disabled while an activity goes or a tool of the chain cannot run (the controller's
+        reason, ``timing``'s first), and on a page served with ``--dry-run``, which ``timing``
+        refuses (its calls take no time to measure). The controller's chain refuses on its own
+        (FM-169), and ``timing`` refuses a dry run before it moves anything.
+        """
+        view = self._view
+        plan = None if view is None else view.plan
+        shown = (
+            plan is not None
+            and plan.estimate_s is None
+            and "timing" in self.tool_runs
+            and "scan-plan" in self.tool_runs
+        )
+        self.measure_time_button.visible = shown
+        if not shown:
+            self._say(self.measure_time_wait, "")
+            return
+        status = self._status
+        reason = (
+            self._blocked.get("timing")
+            or self._blocked.get("scan-plan")
+            or (
+                MEASURE_NOT_IN_A_DRY_RUN
+                if status is not None and status.dry_run
+                else None
+            )
+            or (
+                MEASURE_AFTER_THE_SCAN
+                if view is not None
+                and view.scan_end is not None
+                and view.scan_end.resumable
+                else None
+            )
+        )
+        self.measure_time_button.disabled = (
+            self._running is not None or reason is not None
+        )
+        self._say(self.measure_time_wait, reason or busy or "")
 
     def _draw_layout_command(self) -> None:
         """The command of *Lay out the fields*: ``scan-plan`` with the page's wells and the form's typed fields (m5 §17.2 D8).
@@ -3659,13 +3892,17 @@ class PlatePageView:
         self.layout_card.visible = bool(self.layout_command.object)
 
     def _draw_scan_command(self) -> None:
-        """The command of *Start the scan*: ``scan`` with the form's typed fields (m5 §17.2 D8)."""
+        """The command of *Start the scan*, or of *Continue the scan* (``--resume``) over a checkpoint it continues (m5 §17.2 D8, §17.12 D17)."""
+        view = self._view
+        end = None if view is None else view.scan_end
         try:
-            pairs = [*self.page.page_params("scan"), *self._typed("scan")]
+            pairs = self._scan_pairs()
         except ValueError:
             self.scan_command.object = ""
         else:
-            self.scan_command.object = self.page.command_for("scan", pairs)
+            self.scan_command.object = self.page.command_for(
+                "scan", pairs, resume=end is not None and end.resumable
+            )
         self.scan_card.visible = bool(self.scan_command.object)
 
     def _draw_results_screen(self, status: PageStatus | None) -> None:
@@ -3726,7 +3963,12 @@ class PlatePageView:
         that it said ``Running Route (3 of 5)`` over a density row that still said ``Ready``. It is
         called last by the tick and by ``refresh()``.
         """
-        self._say(self.chain_text, chain_line(None if status is None else status.chain))
+        chain = None if status is None else status.chain
+        first = None if chain is None or not chain.plugins else chain.plugins[0]
+        # Each screen draws the chains its own button starts (m5 §17.12.4): *Measure the
+        # time*'s on Wells, *Run all that are left*'s on Results.
+        self._say(self.chain_text, chain_line(chain) if first in RESULT_TOOLS else "")
+        self._say(self.wells_chain_text, chain_line(chain) if first == "timing" else "")
 
     def _draw_results_buttons(self) -> None:
         """Which of *Run all that are left* and the five rows' buttons is disabled, and the reason beside each (m5 §11.2, §17.11.2).

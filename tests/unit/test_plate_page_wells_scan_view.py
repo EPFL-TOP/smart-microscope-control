@@ -49,10 +49,11 @@ from smc.plugins.slots import (
     ScanFrame,
     ScanPlanResult,
     ScanResult,
+    TimingsResult,
 )
 from smc.run import ReadRecord, RunDocument, StageRecord, StageStatus, write_stage
 from smc.testing import FakeCore
-from smc.ui.controller import NOT_CONNECTED, PlatePage
+from smc.ui.controller import NOT_CONNECTED, ChainStatus, PlatePage
 from smc.ui.guide import (
     DRY_RUN_NO_FRAME,
     LAY_OUT_FIRST,
@@ -106,12 +107,22 @@ class StubScanParams(PluginParams):
     autofocus: Literal["if-engaged", "required", "off"] = "if-engaged"
 
 
+class _Taken(PluginParams):
+    """The stub scan's checkpoint: how many fields of the plan it took."""
+
+    taken: int
+
+
 class StubScan:
     """A ``scan`` that reports each field of the plan it reads, and can wait after one of them.
 
     ``pause_at`` is the number of fields it reports before it waits on ``release``; ``0`` is no
     wait. ``before_report`` is called with the field's position before each report, so that a
-    test moves its own clock where the worker would have read it.
+    test moves its own clock where the worker would have read it. ``checkpoint_at`` is the
+    field after which it saves a checkpoint (``0``: none), and a resumed run starts after the
+    fields its checkpoint took; ``resumed`` is what each run read of the checkpoint.
+    ``counts_the_rest`` counts a resumed run as the real scan does: ``done`` and ``total``
+    over the fields its checkpoint does not hold (``wells_to_scan``, review of #496).
     """
 
     name = provides = "scan"
@@ -126,18 +137,31 @@ class StubScan:
     paused: ClassVar[threading.Event] = threading.Event()
     release: ClassVar[threading.Event] = threading.Event()
     before_report: ClassVar[Callable[[int], None] | None] = None
+    checkpoint_at: ClassVar[int] = 0
+    resumed: ClassVar[list[int | None]] = []
+    counts_the_rest: ClassVar[bool] = False
 
     def run(
         self, microscope: Any, params: StubScanParams, ctx: RunContext
     ) -> ScanResult:
         StubScan.ran += 1
         plan = ctx.upstream("scan-plan", ScanPlanResult)
+        kept = ctx.checkpoint(_Taken)
+        StubScan.resumed.append(None if kept is None else kept.taken)
+        start = 0 if kept is None else kept.taken
         total = len(plan.fields)
         for position, field in enumerate(plan.fields, start=1):
+            if position <= start:
+                continue
             hook = StubScan.before_report
             if hook is not None:
                 hook(position)
-            ctx.progress(position, total, field.name)
+            if StubScan.counts_the_rest:
+                ctx.progress(position - start, total - start, field.name)
+            else:
+                ctx.progress(position, total, field.name)
+            if position == StubScan.checkpoint_at:
+                ctx.save_checkpoint(_Taken(taken=position))
             if position == StubScan.pause_at:
                 StubScan.paused.set()
                 StubScan.release.wait(BOUND_S)
@@ -197,6 +221,9 @@ def _entry_points(
 def _fresh_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     StubScan.ran = 0
     StubScan.pause_at = 0
+    StubScan.checkpoint_at = 0
+    StubScan.resumed = []
+    StubScan.counts_the_rest = False
     StubScan.paused = threading.Event()
     StubScan.release = threading.Event()
     StubScan.before_report = None
@@ -491,6 +518,10 @@ def test_the_wells_screen_lists_the_wells_box_the_two_fields_and_the_action_befo
         view.layout_button,
         view.layout_wait,
         view.wells_known_block,
+        # *Measure the time* and the chain's line under what is known (m5 §17.12 D18).
+        view.measure_time_button,
+        view.measure_time_wait,
+        view.wells_chain_text,
         view.wells_note,
         view.layout_card,
         view.continue_button,
@@ -504,6 +535,13 @@ def test_the_wells_screen_lists_the_wells_box_the_two_fields_and_the_action_befo
     assert scan[2:] == [
         view.scan_button,
         view.scan_wait_text,
+        # What a scan replaces; after a STOP or a failure, what ended it and the two actions
+        # that take *Start the scan*'s place (m5 §17.12 D17).
+        view.scan_replaces_text,
+        view.scan_end_text,
+        view.scan_continue_button,
+        view.scan_again_button,
+        view.scan_actions_text,
         view.scan_dry_note,
         view.scan_progress,
         view.scan_progress_text,
@@ -1000,7 +1038,7 @@ def _run_a_scan_to(
     assert StubScan.paused.wait(BOUND_S)
 
 
-def test_the_progress_bar_and_its_lines_follow_the_scan_and_stay_after_it(
+def test_the_progress_block_goes_once_the_scan_is_done(
     page: PlatePage, run_doc: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _seed_plate(run_doc)
@@ -1038,15 +1076,14 @@ def test_the_progress_bar_and_its_lines_follow_the_scan_and_stay_after_it(
         _worker(page).join(BOUND_S)
         assert not _worker(page).is_alive()
         view.tick()
-        # After the end the bar and its lines stay, with no *Left*, the stripes stopped and
-        # the length of the run fixed.
-        assert (view.scan_progress.value, view.scan_progress.max) == (12, 12)
-        assert view.scan_progress.active is False
-        assert view.scan_progress.visible is True
-        assert view.scan_progress_text.object == "Field 12 of 12\nElapsed 40 s"
+        # Once the record is done its result line says it: the bar at its end and ``Field 12
+        # of 12`` under ``Scanned: 12 frames`` said it twice (the owner's walk, m5 §17.12 D17).
+        assert view.scan_progress.visible is False
+        assert view.scan_progress_text.visible is False
+        assert view.scanned_block.object.startswith("Scanned: 12 frames, 0 failed")
         clock.now = 500.0
         view.tick()
-        assert view.scan_progress_text.object == "Field 12 of 12\nElapsed 40 s"
+        assert view.scan_progress.visible is False
     assert page.join(BOUND_S)
     assert view.scan_button.disabled is False
 
@@ -1059,10 +1096,17 @@ def test_the_progress_block_goes_with_the_next_activity_and_is_not_lives(
     view = PlatePageView(page)
     view.show_step("scan")
     view.refresh()
+    # A scan stopped at its third field: its record is not done, so its block stays.
+    StubScan.pause_at = 3
     _click(view.scan_button)
+    assert StubScan.paused.wait(BOUND_S)
+    page.stop()
+    StubScan.release.set()
     assert page.join(BOUND_S)
+    page.resume()
     view.tick()
     assert view.scan_progress.visible is True
+    assert view.scan_progress_text.object.startswith("Field 3 of 12")
     # Another activity starts: its progress is its own, and the block goes (a snap resets it).
     view.on_snap()
     assert page.join(BOUND_S)
@@ -1229,8 +1273,9 @@ def test_a_second_tab_draws_the_same_progress_from_the_shared_status(
     first.tick()
     second.tick()
     for view in (first, second):
-        assert view.scan_progress.active is False
-        assert view.scan_progress_text.object.startswith("Field 12 of 12")
+        # Done: the result line says it, and the block goes in both (m5 §17.12 D17).
+        assert view.scan_progress.visible is False
+        assert view.scan_progress_text.visible is False
         assert len(view.imaged_source.data["x"]) == 12
         assert (
             view.scanned_block.object.split("\n")[0] == "Scanned: 12 frames, 0 failed"
@@ -1651,8 +1696,8 @@ def test_two_wells_laid_out_and_scanned_from_these_screens_alone(
             view.scanned_block.object.split("\n")[0] == "Scanned: 72 frames, 0 failed"
         )
         assert len(view.imaged_source.data["x"]) == 72
-        assert view.scan_progress.value == view.scan_progress.max == 72
-        assert view.scan_progress_text.object.startswith("Field 72 of 72\nElapsed ")
+        # Done: the result line says it, and the progress block is gone (m5 §17.12 D17).
+        assert view.scan_progress.visible is False
         # Nothing of a tool's own section was needed, and the run document says so: the
         # plan and the scan are there, laid out and made by these screens' buttons.
         doc = RunDocument.load(run_doc)
@@ -1730,3 +1775,484 @@ def test_a_raise_in_a_screens_draw_does_not_cost_the_strip(
     assert [r.exc_info is not None for r in caplog.records].count(True) == 2
     # The same through a redraw, which draws both screens too.
     view.refresh()
+
+
+# --- part B: the Scan screen after a STOP or a failure, Measure the time (m5 §17.12, #470) ----
+
+
+def _stopped_view(
+    page: PlatePage,
+    run_doc: Path,
+    *,
+    resume: bool = True,
+    checkpoint_at: int = 4,
+    plan: ScanPlanResult | None = None,
+) -> PlatePageView:
+    """A view on the Scan screen over a scan of twelve fields STOPped at its fifth, with a checkpoint after the fourth.
+
+    ``resume`` clears the halt the STOP left, as the operator's *Resume* does; ``checkpoint_at``
+    ``0`` keeps none (a STOP in the scan's first well).
+    """
+    _seed_plate(run_doc)
+    _seed_plan(run_doc, plan)
+    view = PlatePageView(page)
+    view.show_step("scan")
+    view.refresh()
+    StubScan.checkpoint_at = checkpoint_at
+    StubScan.pause_at = 5
+    _click(view.scan_button)
+    assert StubScan.paused.wait(BOUND_S)
+    page.stop()
+    StubScan.release.set()
+    assert page.join(BOUND_S)
+    if resume:
+        page.resume()
+    view.tick()
+    # The next run of the stub waits on fresh events.
+    StubScan.paused = threading.Event()
+    StubScan.release = threading.Event()
+    StubScan.pause_at = 0
+    return view
+
+
+def test_a_stopped_scan_shows_continue_and_start_again_and_hides_start(
+    page: PlatePage, run_doc: Path
+) -> None:
+    view = _stopped_view(page, run_doc)
+    assert view.scan_end_text.visible is True
+    assert view.scan_end_text.object == "Stopped by STOP at field 5 of 12."
+    assert view.scan_button.visible is False
+    assert view.scan_wait_text.visible is False
+    for button, label in (
+        (view.scan_continue_button, "Continue the scan"),
+        (view.scan_again_button, "Start again"),
+    ):
+        assert button.visible is True
+        assert button.disabled is False
+        assert button.label == label
+    assert view.scan_continue_button.button_type == "primary"
+    assert view.scan_again_button.button_type != "primary"
+    assert view.scan_actions_text.visible is False
+    # The stopped scan's block stays (its record is not done) and no result line is drawn.
+    assert view.scan_progress.visible is True
+    assert view.scanned_block.visible is False
+    # The command under it is the one that continues the checkpoint.
+    assert "--resume" in _words(view.scan_command.object)
+
+
+def test_continue_runs_the_scan_with_resume_from_the_view(
+    page: PlatePage, run_doc: Path
+) -> None:
+    view = _stopped_view(page, run_doc)
+    StubScan.pause_at = 8
+    _click(view.scan_continue_button)
+    assert StubScan.paused.wait(BOUND_S)
+    view.tick()
+    # While the continued scan goes, the end it continues is not drawn, nor its actions.
+    assert view.scan_end_text.visible is False
+    assert view.scan_continue_button.visible is False
+    assert view.scan_again_button.visible is False
+    assert view.scan_progress.visible is True
+    StubScan.release.set()
+    assert page.join(BOUND_S)
+    assert StubScan.resumed == [None, 4]
+    view.tick()
+    # Done: the end, the two actions and the progress block go; the result line comes.
+    assert view.scan_end_text.visible is False
+    assert view.scan_continue_button.visible is False
+    assert view.scan_again_button.visible is False
+    assert view.scan_button.visible is True
+    assert view.scan_progress.visible is False
+    assert view.scanned_block.object.startswith("Scanned: 12 frames")
+
+
+def test_a_continued_scan_counts_and_draws_the_plans_fields_not_the_rests(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # The real scan counts a resumed run over the wells its checkpoint does not hold: without
+    # the plan's count added back, the continued scan read `Field 6 of 8` and drew the plan's
+    # first six fields, a second STOP said `field 6 of 8`, and Start again's confirm said it
+    # dropped 6 fields where it drops 10 (review of #496, FM-172).
+    plan = _scan_plan_result()
+    centres = [(f.x_um, f.y_um) for f in plan.fields]
+    view = _stopped_view(page, run_doc)
+    assert view.scan_end_text.object == "Stopped by STOP at field 5 of 12."
+    StubScan.counts_the_rest = True
+    StubScan.checkpoint_at = 8
+    StubScan.pause_at = 10
+    _click(view.scan_continue_button)
+    assert StubScan.paused.wait(BOUND_S)
+    view.tick()
+    assert StubScan.resumed == [None, 4]
+    assert view.scan_progress_text.object.split("\n")[0] == "Field 10 of 12"
+    assert (view.scan_progress.value, view.scan_progress.max) == (10, 12)
+    # The checkpoint's four fields and the six taken since: the plan's first ten.
+    data = view.imaged_source.data
+    assert list(zip(data["x"], data["y"], strict=True)) == centres[:10]
+    page.stop()
+    StubScan.release.set()
+    assert page.join(BOUND_S)
+    page.resume()
+    view.tick()
+    assert view.scan_end_text.object == "Stopped by STOP at field 10 of 12."
+    _click(view.scan_again_button)
+    view.tick()
+    assert view.scan_actions_text.object == (
+        "Start again drops the 10 fields already taken: press again to drop them."
+    )
+    # A third leg continues from the checkpoint the second one saved: counted from field 9.
+    StubScan.paused = threading.Event()
+    StubScan.release = threading.Event()
+    StubScan.pause_at = 9
+    page.run("scan", [], resume=True)
+    assert StubScan.paused.wait(BOUND_S)
+    assert page.status().progress == Progress("scan", 9, 12, plan.fields[8].name)
+    StubScan.release.set()
+    assert page.join(BOUND_S)
+    assert StubScan.resumed == [None, 4, 8]
+    # A fresh scan of a smaller plan afterwards counts its own fields: the plan count of the
+    # continued scan is that run's, never added to the next one's reports.
+    _seed(run_doc, "scan-plan", _scan_plan_result(("B11", "B2")), minute=9)
+    StubScan.paused = threading.Event()
+    StubScan.release = threading.Event()
+    StubScan.pause_at = 3
+    page.run("scan", [], afresh=True)
+    assert StubScan.paused.wait(BOUND_S)
+    progress = page.status().progress
+    StubScan.release.set()
+    assert page.join(BOUND_S)
+    assert progress is not None
+    assert (progress.done, progress.total) == (3, 8)
+
+
+def test_both_actions_wait_for_resume_while_the_stand_is_halted(
+    page: PlatePage, run_doc: Path
+) -> None:
+    view = _stopped_view(page, run_doc, resume=False)
+    assert page.status().halted
+    assert view.scan_continue_button.disabled is True
+    assert view.scan_again_button.disabled is True
+    assert view.scan_actions_text.object == (
+        "Press Resume (top right) first: the stand is halted."
+    )
+    # A click that arrives anyway is the controller's refusal, and nothing runs (FM-169).
+    before = run_doc.read_bytes()
+    _click(view.scan_continue_button)
+    _click(view.scan_again_button)
+    _click(view.scan_again_button)
+    assert run_doc.read_bytes() == before
+    assert StubScan.resumed == [None]
+    page.resume()
+    view.tick()
+    assert view.scan_continue_button.disabled is False
+    assert view.scan_actions_text.visible is False
+
+
+def test_a_single_click_on_start_again_drops_nothing(
+    page: PlatePage, run_doc: Path
+) -> None:
+    view = _stopped_view(page, run_doc)
+    before = run_doc.read_bytes()
+    worker = page._worker
+    _click(view.scan_again_button)
+    view.tick()
+    # Nothing ran, nothing was written, and the screen says what the second click drops.
+    assert page._worker is worker
+    assert page.status().running is None
+    assert run_doc.read_bytes() == before
+    assert StubScan.resumed == [None]
+    assert view.scan_actions_text.object == (
+        "Start again drops the 5 fields already taken: press again to drop them."
+    )
+    # A second tab never inherits the arm (D6): its first click arms it there too.
+    other = PlatePageView(page)
+    other.show_step("scan")
+    other.tick()
+    assert other.scan_actions_text.visible is False
+    _click(other.scan_again_button)
+    assert page.status().running is None
+    assert run_doc.read_bytes() == before
+
+
+def test_the_second_click_on_start_again_runs_the_scan_afresh(
+    page: PlatePage, run_doc: Path
+) -> None:
+    view = _stopped_view(page, run_doc)
+    _click(view.scan_again_button)
+    _click(view.scan_again_button)
+    assert page.join(BOUND_S)
+    # Afresh: the stub was not handed the checkpoint, and the scan is done.
+    assert StubScan.resumed == [None, None]
+    view.tick()
+    assert view.scan_end_text.visible is False
+    assert view.scan_actions_text.visible is False
+    assert RunDocument.load(run_doc).stages["scan"].status is StageStatus.done
+
+
+def test_the_start_again_arm_is_dropped_when_the_screen_changes(
+    page: PlatePage, run_doc: Path
+) -> None:
+    view = _stopped_view(page, run_doc)
+    before = run_doc.read_bytes()
+    # A change of screen: the next click arms again, and runs nothing.
+    _click(view.scan_again_button)
+    view.show_step("wells")
+    view.show_step("scan")
+    view.tick()
+    assert view.scan_actions_text.visible is False
+    _click(view.scan_again_button)
+    assert page.status().running is None
+    assert run_doc.read_bytes() == before
+    # Any other button between the two clicks drops it too (a snap here).
+    _click(view.snap_button)
+    assert page.join(BOUND_S)
+    view.tick()
+    assert view.scan_actions_text.visible is False
+    _click(view.scan_again_button)
+    assert page.status().running is None
+    assert run_doc.read_bytes() == before
+    assert StubScan.resumed == [None]
+    # A tick, which rewrites the strip's outcome lines, keeps it: the second click runs.
+    view.tick()
+    _click(view.scan_again_button)
+    assert page.join(BOUND_S)
+    assert StubScan.resumed == [None, None]
+
+
+def test_a_rescan_says_what_it_replaces_and_hides_the_old_line_while_it_runs(
+    page: PlatePage, run_doc: Path
+) -> None:
+    _seed_plate(run_doc)
+    plan = _seed_plan(run_doc)
+    _seed_scan(run_doc, plan)
+    view = PlatePageView(page)
+    view.show_step("scan")
+    view.refresh()
+    view.tick()
+    assert view.scan_replaces_text.object == (
+        "Starting the scan again replaces this one (12 frames)."
+    )
+    assert view.scanned_block.object.startswith("Scanned: 12 frames")
+    StubScan.pause_at = 3
+    _click(view.scan_button)
+    assert StubScan.paused.wait(BOUND_S)
+    view.tick()
+    # While the new scan runs the old result line and the note are not drawn.
+    assert view.scanned_block.visible is False
+    assert view.scan_replaces_text.visible is False
+    assert view.scan_progress.visible is True
+    StubScan.release.set()
+    assert page.join(BOUND_S)
+    view.tick()
+    assert view.scanned_block.object.startswith("Scanned: 12 frames")
+
+
+class StubTimingParams(PluginParams):
+    repeats: int = 3
+
+
+class StubTiming:
+    """A ``timing`` that measures nothing and gives the timings ``scan-plan`` estimates from."""
+
+    name = "timing"
+    provides = "timings"
+    summary = "A test timing."
+    Params = StubTimingParams
+    Result = TimingsResult
+    requires: tuple[type, ...] = ()
+    reads: tuple[str, ...] = ()
+    reads_optional: tuple[str, ...] = ()
+    repeats: ClassVar[list[int]] = []
+
+    def run(
+        self, microscope: Any, params: StubTimingParams, ctx: RunContext
+    ) -> TimingsResult:
+        StubTiming.repeats.append(params.repeats)
+        return TimingsResult(
+            move_overhead_ms=100.0,
+            move_ms_per_mm=10.0,
+            refocus_ms=None,
+            snap_ms=50.0,
+            samples=params.repeats,
+        )
+
+
+def test_measure_the_time_runs_timing_then_the_layout_as_one_chain(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    StubTiming.repeats = []
+    page = make_page(stubs=(StubScan, Slow, StubTiming))
+    _seed_plate(run_doc)
+    _seed_plan(run_doc, _scan_plan_result(("B11", "B2"), estimate_s=None))
+    page.select_text("B11, B2")
+    view = PlatePageView(page)
+    view.show_step("wells")
+    view.refresh()
+    view.tick()
+    assert view.measure_time_button.visible is True
+    assert view.measure_time_button.label == "Measure the time"
+    assert view.measure_time_button.disabled is False
+    assert "Time: not known" in view.wells_known_block.object
+    # The field the operator typed (or the profile's suggestion it starts with) is sent.
+    view.tool_fields["timing"]["repeats"].value = "2"
+    _click(view.measure_time_button)
+    assert page.join(BOUND_S)
+    view.tick()
+    assert StubTiming.repeats == [2]
+    chain = page.status().chain
+    assert chain is not None
+    assert chain.plugins == ("timing", "scan-plan")
+    assert [end.how for end in chain.ended] == ["done", "done"]
+    # The plan was laid out again with the timings: it has a time, and the button goes.
+    assert view._view is not None
+    assert view._view.plan is not None
+    assert view._view.plan.estimate_s is not None
+    assert view.measure_time_button.visible is False
+    assert "Time: about" in view.wells_known_block.object
+
+
+def test_the_chain_line_is_drawn_on_the_screen_of_its_first_tool(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    page = make_page(stubs=(StubScan, Slow, StubTiming))
+    _seed_plate(run_doc)
+    _seed_plan(run_doc, _scan_plan_result(("B11", "B2"), estimate_s=None))
+    page.select_text("B11, B2")
+    view = PlatePageView(page)
+    view.refresh()
+    _click(view.measure_time_button)
+    assert page.join(BOUND_S)
+    view.tick()
+    # Measure the time's chain: on the Wells screen, never under Run all that are left.
+    assert view.wells_chain_text.object == "Done: Timing, Field layout."
+    assert view.chain_text.visible is False
+    # A chain whose first tool is a Results tool is drawn on Results only.
+    page._chain = ChainStatus(("cells", "density"), (), "cells")
+    view._draw_chain_line(page.status())
+    assert view.chain_text.object == "Running Count the cells (1 of 2)."
+    assert view.wells_chain_text.visible is False
+
+
+def test_on_a_dry_run_page_measure_waits_and_a_dry_scan_replaces_nothing_said(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # `timing` refuses a dry run, whose calls take no time to measure; a dry-run scan took no
+    # frame, so starting again loses nothing ("replaces this one (0 frames)" read as a loss).
+    page = make_page(dry_run=True, stubs=(StubScan, Slow, StubTiming))
+    _seed_plate(run_doc)
+    plan = _seed_plan(run_doc, _scan_plan_result(("B11", "B2"), estimate_s=None))
+    _seed(
+        run_doc,
+        "scan",
+        _scan_result(plan),
+        minute=2,
+        dry_run=True,
+        reads={"scan-plan": ReadRecord(plugin="scan-plan", attempt="a1")},
+    )
+    view = PlatePageView(page)
+    view.refresh()
+    view.tick()
+    assert view.measure_time_button.visible is True
+    assert view.measure_time_button.disabled is True
+    assert view.measure_time_wait.object == (
+        "A dry run cannot time the stand: serve the page without --dry-run to measure it."
+    )
+    assert view.scanned_block.object.startswith("Scanned in a dry run")
+    assert view.scan_replaces_text.visible is False
+
+
+def test_a_stop_with_no_checkpoint_says_it_and_keeps_start_the_scan(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # A STOP in the scan's first well leaves no checkpoint (the scan saves one after each
+    # well): nothing to continue, so Start the scan stays, and starts it again.
+    view = _stopped_view(page, run_doc, checkpoint_at=0)
+    assert view._view is not None
+    end = view._view.scan_end
+    assert end is not None
+    assert end.resumable is False
+    assert view.scan_end_text.object == "Stopped by STOP at field 5 of 12."
+    assert view.scan_button.visible is True
+    assert view.scan_button.disabled is False
+    assert view.scan_continue_button.visible is False
+    assert view.scan_again_button.visible is False
+    assert "--resume" not in _words(view.scan_command.object)
+    _click(view.scan_button)
+    assert page.join(BOUND_S)
+    assert StubScan.resumed == [None, None]
+
+
+def test_an_arm_made_for_another_scan_end_only_arms_again(
+    page: PlatePage, run_doc: Path
+) -> None:
+    view = _stopped_view(page, run_doc)
+    _click(view.scan_again_button)
+    # Another tab continues the scan and it is STOPped again, at another field: a new end.
+    StubScan.pause_at = 7
+    page.run("scan", [], resume=True)
+    assert StubScan.paused.wait(BOUND_S)
+    page.stop()
+    StubScan.release.set()
+    assert page.join(BOUND_S)
+    page.resume()
+    view.tick()
+    assert view._view is not None
+    assert view._view.scan_end is not None
+    assert view._view.scan_end.done == 7
+    before = run_doc.read_bytes()
+    _click(view.scan_again_button)
+    # The click on the new end arms it, and runs nothing.
+    assert page.status().running is None
+    assert run_doc.read_bytes() == before
+    assert StubScan.resumed == [None, 4]
+    assert view.scan_actions_text.object == (
+        "Start again drops the 7 fields already taken: press again to drop them."
+    )
+
+
+def test_an_outcome_line_rewritten_between_the_two_clicks_keeps_the_arm(
+    page: PlatePage, run_doc: Path
+) -> None:
+    # Its watcher goes through the page's handler too; only a button's click drops the arm.
+    view = _stopped_view(page, run_doc)
+    _click(view.scan_again_button)
+    view.problems_text.object = "a problem the tick drew"
+    view.message.object = "a message"
+    _click(view.scan_again_button)
+    assert page.join(BOUND_S)
+    assert StubScan.resumed == [None, None]
+
+
+def test_measure_the_time_never_drops_a_stopped_scans_checkpoint(
+    make_page: Callable[..., PlatePage], run_doc: Path
+) -> None:
+    # Laying the fields out again makes the stopped scan's record stale, and its checkpoint
+    # lost to --resume (FM-172, adversarial review of #470): the button waits, and the
+    # controller's chain refuses a click that arrives anyway (FM-169).
+    page = make_page(stubs=(StubScan, Slow, StubTiming))
+    StubTiming.repeats = []
+    view = _stopped_view(
+        page, run_doc, plan=_scan_plan_result(("B11", "B2", "A1"), estimate_s=None)
+    )
+    page.select_text("B11, B2, A1")
+    view.refresh()
+    view.tick()
+    assert view.measure_time_button.visible is True
+    assert view.measure_time_button.disabled is True
+    assert view.measure_time_wait.object == (
+        "Continue the scan or Start again first: laying the fields out again would "
+        "drop the stopped scan's checkpoint."
+    )
+    before = run_doc.read_bytes()
+    _click(view.measure_time_button)
+    assert page.join(BOUND_S)
+    assert page.status().outcome == (
+        "Run all that are left: Field layout would put the checkpoint of the stopped "
+        "Scan out of date: Continue the scan or Start again, on the Scan screen, first"
+    )
+    assert StubTiming.repeats == []
+    assert run_doc.read_bytes() == before
+    assert view._view is not None
+    view.refresh()
+    assert view._view.scan_end is not None
+    assert view._view.scan_end.resumable
