@@ -517,6 +517,12 @@ throwaway script, posted on #16), every 100 ms.
   measured to work on this stand.
 - The stand's own controls stop everything: the joystick, the focus knob
   and the PFS button.
+- **What smc does about it** (m2 §11.12, #221): the profile cuts a long move
+  into segments, `[safety] max_segment_um = 5000.0` for XY and
+  `max_z_segment_um = 100.0` for Z (chosen equal to the jog limits, not
+  measured), so a Ctrl-C, a stop or the emergency stop lets a move run at
+  most to the end of its current segment. Each segment must read back within
+  1 µm of its target before the next is sent. Not yet run at the stand (#198).
 
 ### PFS (m2 §4)
 
