@@ -53,8 +53,11 @@ from smc.ui.controller import (
 from smc.ui.guide import (
     OFFSETS_DRY_RUN,
     OFFSETS_NO_DOCUMENT,
+    OFFSETS_RESTART_FIRST,
     OFFSETS_TOO_MANY,
+    OFFSETS_TURRET_UNREAD,
     busy_note,
+    offsets_no_objective,
     offsets_plate_refusal,
 )
 
@@ -1384,3 +1387,168 @@ def test_after_a_write_the_plan_says_written_and_a_second_write_is_refused_by_th
     assert twice == once
     assert outcome == f"Objective offsets: {refusal}"
     assert again.written is False
+    # The page's stand still holds the profile it started with, so the tool measures from the
+    # old reference and the library refuses every new result: the page says to restart.
+    assert again.problem == f"{refusal}; {OFFSETS_RESTART_FIRST}"
+
+
+# --- what the review of #382 found ----------------------------------------------------
+
+
+@pytest.mark.parametrize("objective", [None, "", "  "], ids=["none", "empty", "blank"])
+def test_a_calibration_that_names_no_objective_names_nothing_to_turn_to(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    tmp_path: Path,
+    seed_camera_calibration: Callable[..., Any],
+    objective: str | None,
+) -> None:
+    # A camera calibration made at an empty turret position holds a blank label (FM-125):
+    # it would be a target the confirmation asks to turn to, and the tool would refuse it.
+    _seed_plate(run_doc)
+    path = tmp_path / "cal-blank.json"
+    seed_camera_calibration(path, objective=objective)
+    page = _stub_page(fake_microscope, run_doc)
+    try:
+        step = page.offsets_step(_typed(path))
+    finally:
+        page.close()
+
+    assert step.wait == offsets_no_objective(str(path))
+    assert (step.pairs, step.targets) == ((), ())
+    assert step.reads == (CalibrationRead(str(path), None, "", step.wait),)
+
+
+def test_offsets_step_says_the_turret_could_not_be_read_and_guesses_nothing(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    tmp_path: Path,
+    seed_camera_calibration: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_plate(run_doc)
+    forty = _document(tmp_path, FORTY, seed_camera_calibration)
+    page = _stub_page(fake_microscope, run_doc)
+    try:
+        monkeypatch.setattr(page, "objective_labels", lambda: ())
+        step = page.offsets_step(_typed(forty))
+    finally:
+        page.close()
+
+    assert step.wait == OFFSETS_TURRET_UNREAD
+    assert step.pairs == ()
+
+
+def test_a_path_with_a_null_byte_is_a_text_for_its_line_and_never_an_exception(
+    fake_microscope: Microscope, run_doc: Path
+) -> None:
+    _seed_plate(run_doc)
+    page = _stub_page(fake_microscope, run_doc)
+    try:
+        step = page.offsets_step("a\x00b.json")
+    finally:
+        page.close()
+
+    (read,) = step.reads
+    assert read.objective is None
+    assert read.problem is not None
+    assert read.problem.startswith("a\x00b.json: ValueError: ")
+    assert step.wait == read.problem
+
+
+def test_a_relative_path_comes_back_as_typed_in_the_line_and_in_the_pair(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    tmp_path: Path,
+    seed_camera_calibration: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Read from where `smc ui` was started, as the tool reads it, and never resolved: the
+    # run record would carry the operator's folder (FM-24, FM-50).
+    _seed_plate(run_doc)
+    seed_camera_calibration(tmp_path / "cal-40x.json", objective=FORTY)
+    monkeypatch.chdir(tmp_path)
+    page = _stub_page(fake_microscope, run_doc)
+    try:
+        step = page.offsets_step("cal-40x.json")
+    finally:
+        page.close()
+
+    assert step.wait is None
+    assert step.reads[0].path == "cal-40x.json"
+    assert step.pairs[1] == 'calibrations=["cal-40x.json"]'
+
+
+def test_offsets_step_opens_no_file_while_an_activity_goes(
+    fake_microscope: Microscope,
+    run_doc: Path,
+    tmp_path: Path,
+    seed_camera_calibration: Callable[..., Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A path on a share that does not answer would hold the loop that handles STOP while the
+    # stage moves (FM-62, FM-148): nothing is opened under a run, and the wait is the run's.
+    _seed_plate(run_doc)
+    forty = _document(tmp_path, FORTY, seed_camera_calibration)
+    opened: list[Path] = []
+    real = controller_module.calibration_from
+
+    def spy(stage: str, path: Path, **kwargs: Any) -> Any:
+        opened.append(path)
+        return real(stage, path, **kwargs)
+
+    monkeypatch.setattr(controller_module, "calibration_from", spy)
+    page = _stub_page(fake_microscope, run_doc)
+    try:
+        page.run("slow", [])
+        assert Slow.started.wait(10.0)
+        during = page.offsets_step(_typed(forty))
+        opened_during = list(opened)
+        Slow.release.set()
+        assert page.join(10.0)
+        after = page.offsets_step(_typed(forty))
+    finally:
+        Slow.release.set()
+        page.close()
+
+    assert opened_during == []
+    assert during.reads == ()
+    assert during.wait == busy_note("slow", live=False)
+    assert opened == [forty]
+    assert after.wait is None
+
+
+def test_a_write_that_fails_is_an_outcome_and_is_not_kept_as_written(
+    make_stand: Callable[[str], Microscope],
+    run_doc: Path,
+    stand_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from smc.run.files import AtomicWriteError
+
+    page = _plan_page(make_stand, run_doc, held=False)
+    try:
+        shown = page.offsets_plan("").lines
+        before = stand_file.read_bytes()
+
+        def refuse(path: Path, data: bytes, *, make_parents: bool = True) -> None:
+            raise AtomicWriteError(PermissionError(13, "Access is denied"), None)
+
+        monkeypatch.setattr("smc.run.files.write_atomically", refuse)
+        page.write_offsets("", shown)
+        outcome = page.status().outcome
+        kept = page.offsets_plan("").written
+        monkeypatch.undo()
+        # The file is as it was and the click may be tried again.
+        unchanged = stand_file.read_bytes() == before
+        page.write_offsets("", shown)
+        outcome_again = page.status().outcome
+    finally:
+        page.close()
+
+    assert outcome == (
+        f"Objective offsets: {stand_file.resolve()} was not changed: Access is denied"
+    )
+    assert kept is False
+    assert unchanged is True
+    assert outcome_again == "Offsets written into stand.toml"

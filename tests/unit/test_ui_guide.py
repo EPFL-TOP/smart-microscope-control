@@ -3663,3 +3663,25 @@ def test_the_how_to_names_the_three_steps_the_command_and_where_a_path_is_read_f
         f"   {command}",
         "A relative path is read from where smc ui was started.",
     ]
+
+
+def test_calibration_paths_drop_the_invisible_characters_a_windows_dialog_puts_before_a_path() -> (
+    None
+):
+    # Windows' Properties dialog puts U+202A before the path it copies, and the OS refuses the
+    # name with it: an operator sees a path that looks right and an error that says nothing.
+    pasted = (
+        "\u202aC:\\Users\\lab\\cal-40x.json\n"
+        "\u200e D:\\cal.json \u200f\n"
+        '"\u202aE:\\quoted.json"\n'
+        "F:\\in\u200bside.json"
+    )
+
+    assert calibration_paths(pasted) == (
+        "C:\\Users\\lab\\cal-40x.json",
+        "D:\\cal.json",
+        "E:\\quoted.json",
+        # Inside a name nothing is touched: only the two ends of a line are.
+        "F:\\in\u200bside.json",
+    )
+    assert calibration_paths("\u202a\n\u200b \u200f") == ()

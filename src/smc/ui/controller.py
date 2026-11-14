@@ -143,6 +143,7 @@ from smc.ui.guide import (
     OFFSETS_NO_FILE,
     OFFSETS_NOTHING_ARMED,
     OFFSETS_PLAN_CHANGED,
+    OFFSETS_RESTART_FIRST,
     OFFSETS_TOO_MANY,
     OFFSETS_TURRET_UNREAD,
     PLATE_NOT_CHOSEN,
@@ -1222,7 +1223,8 @@ def _read_calibration(path: str, *, profile: str, dry_run: bool) -> CalibrationR
         problem = f"{path}: {type(exc).__name__}: {_one_line(exc)}"
     if problem:
         return CalibrationRead(path, None, "", _flat(problem))
-    if found.objective is None:
+    if found.objective is None or not found.objective.strip():
+        # A calibration made at an empty turret position holds a blank label: no objective to turn to.
         return CalibrationRead(path, None, "", offsets_no_objective(path))
     return CalibrationRead(path, found.objective, measured, None)
 
@@ -5236,13 +5238,22 @@ class PlatePage:
         refusals in line order (the plate's own objective, an objective not on the turret, one
         in two documents: foresight, FM-206; the tool checks every one again) and last the
         sixth line, which is not read. Never called from the tick or from ``refresh()``: it
-        reads files (FM-145).
+        reads files (FM-145), and none while an activity goes (``reads`` is then empty and the
+        wait is the activity's).
         """
         paths = calibration_paths(calibrations_text)
         profile = self._profile.microscope.name
-        reads = tuple(
-            _read_calibration(path, profile=profile, dry_run=self._dry_run)
-            for path in paths[:MAX_TARGETS]
+        # Nothing is opened while an activity goes: a typed path on a share that does not answer
+        # would hold the loop that handles STOP, with the stage moving (FM-62, FM-148); the wait
+        # is the activity's, and the lines under the field come back with the next edit or click.
+        busy = self._current_run is not None
+        reads = (
+            ()
+            if busy
+            else tuple(
+                _read_calibration(path, profile=profile, dry_run=self._dry_run)
+                for path in paths[:MAX_TARGETS]
+            )
         )
         targets = tuple(
             read.objective
@@ -5393,6 +5404,10 @@ class PlatePage:
         except (OffsetsWriteError, ProfileError) as exc:
             # Text, never the error (FM-98).
             problem = _flat(str(exc))
+            if kept is not None and kept[1] == source and not written:
+                # This page wrote into the file earlier: the stand it holds still has the old
+                # reference, so running the tool again cannot help until it is restarted.
+                problem = f"{problem}; {OFFSETS_RESTART_FIRST}"
         if plan is None:
             return (
                 None,

@@ -14,6 +14,7 @@ import html
 import math
 import re
 import shlex
+import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timezone
@@ -58,6 +59,7 @@ if TYPE_CHECKING:
 __all__ = [
     "AGAIN_NOTE",
     "AUTOFOCUS_WORDS",
+    "CALIBRATION_HOW_WINDOWS_NOTE",
     "CAMERA_NOT_CALIBRATED_NOTE",
     "CAPTURE_FAR",
     "CAPTURE_SAME_PLACE",
@@ -91,6 +93,7 @@ __all__ = [
     "OFFSETS_NO_DOCUMENT",
     "OFFSETS_NO_FILE",
     "OFFSETS_PLAN_CHANGED",
+    "OFFSETS_RESTART_FIRST",
     "OFFSETS_STALE",
     "OFFSETS_TITLE",
     "OFFSETS_TOO_MANY",
@@ -2500,6 +2503,23 @@ OFFSETS_PLAN_CHANGED = (
 #: A profile with no file has nothing to write into (D7).
 OFFSETS_NO_FILE = "this stand's profile is built into smc, with no file to write"
 
+#: Added to the library's refusal of a reference changed since the run, when this page itself
+#: wrote into the profile earlier: the stand it holds still has the offsets it started with, so
+#: the tool measures from the old reference and every new result is refused the same way until
+#: the page is started again (the review of #382).
+OFFSETS_RESTART_FIRST = (
+    "this page wrote into the profile since it started and still measures from the offsets "
+    "it started with: restart it before measuring again"
+)
+
+#: Under the how-to's command on a Windows page: its own note, since no button of the block makes
+#: this call (the document is made in a terminal, #501) and the line carries a placeholder.
+CALIBRATION_HOW_WINDOWS_NOTE = (
+    "On Windows that line is quoted for a POSIX shell: in PowerShell or cmd.exe, drop the single "
+    "quotes around the profile's path, and write the objective's name for <objective> in the "
+    "document's name."
+)
+
 #: Under a result whose inputs were produced again since (D6).
 OFFSETS_STALE = "out of date: the plate was registered again since"
 
@@ -2528,17 +2548,34 @@ def offsets_others(labels: Sequence[str], plate_objective: str) -> tuple[str, ..
 def calibration_paths(text: str) -> tuple[str, ...]:
     """The paths typed one per line: each stripped of its blanks and of one pair of surrounding quotes, blank lines dropped (m5 §18.3).
 
-    Windows' *Copy as path* puts a pair of ``"`` around what it copies. A path is shown
-    and kept as typed afterwards, never resolved (FM-24, FM-50).
+    Windows' *Copy as path* puts a pair of ``"`` around what it copies, and its Properties
+    dialog puts an invisible U+202A (left-to-right embedding) before the path it copies: the
+    OS refuses the name with it (``EINVAL``), and an operator cannot see why. A Unicode
+    format character (category ``Cf``) at either end of a line is dropped with the blanks. A
+    path is shown and kept as typed afterwards, never resolved (FM-24, FM-50).
     """
     paths: list[str] = []
     for line in re.split(r"\r\n|\r|\n", text):
-        path = line.strip()
+        path = _trimmed(line, blanks=True)
         if len(path) >= 2 and path[0] == '"' and path[-1] == '"':
-            path = path[1:-1]
+            path = _trimmed(path[1:-1], blanks=False)
         if path.strip():
             paths.append(path)
     return tuple(paths)
+
+
+def _trimmed(text: str, *, blanks: bool) -> str:
+    """``text`` without the Unicode format characters at its ends, and the blanks too when ``blanks``."""
+
+    def drop(char: str) -> bool:
+        return unicodedata.category(char) == "Cf" or (blanks and char.isspace())
+
+    start, end = 0, len(text)
+    while start < end and drop(text[start]):
+        start += 1
+    while end > start and drop(text[end - 1]):
+        end -= 1
+    return text[start:end]
 
 
 def offsets_lead(plate_objective: str, others: Sequence[str]) -> str:

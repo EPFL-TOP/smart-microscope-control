@@ -82,6 +82,7 @@ from smc.ui.controller import (
 from smc.ui.frames import Frame, display_image
 from smc.ui.guide import (
     AUTOFOCUS_WORDS,
+    CALIBRATION_HOW_WINDOWS_NOTE,
     COVERAGE_WORDS,
     DRY_RUN_NO_FRAME,
     END_LIVE_LABEL,
@@ -3909,7 +3910,7 @@ class PlatePageView:
         self.offsets_session_input.visible = card is not None
         self._draw_offsets_plan()
         command = f"smc run camera-calibration -p {shlex.quote(self.page.profile_argument)} --run-doc cal-<objective>.json"
-        note = posix_quoting_note(self._windows)
+        note = CALIBRATION_HOW_WINDOWS_NOTE if posix_quoting_note(self._windows) else ""
         self.calibration_how_text.object = "\n".join(
             [calibration_how_text(command), *([note] if note else [])]
         )

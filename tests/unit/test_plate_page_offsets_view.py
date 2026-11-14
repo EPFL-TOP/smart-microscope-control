@@ -12,14 +12,17 @@ stub that records what it was given and turns nothing; the controller's tests
 
 from __future__ import annotations
 
+import dataclasses
 import os
+import shlex
 import threading
 from collections.abc import Callable, Iterator
 from importlib.metadata import EntryPoint
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 import pytest
+from pymmcore_plus import CMMCorePlus
 
 if os.environ.get("SMC_REQUIRE_UI"):
     import panel as pn  # CI must fail, not skip, when the extra is missing
@@ -27,6 +30,7 @@ else:
     pn = pytest.importorskip("panel")
 
 from test_plate_page_offsets import (
+    DEMO_PROFILE,
     FORTY,
     TEN,
     TWENTY,
@@ -34,6 +38,7 @@ from test_plate_page_offsets import (
     StubOffsetsParams,
     _document,
     _dry_microscope,
+    _plan_page,
     _result,
     _seed_offsets,
     _seed_plate,
@@ -43,21 +48,27 @@ from test_plate_page_offsets import (
 
 from smc.hardware import Microscope
 from smc.hardware.capabilities import ObjectiveTurret
+from smc.hardware.profile import Profile
 from smc.plugins.api import RunContext
 from smc.plugins.registry import GROUP
 from smc.plugins.slots import ObjectiveOffsetsResult
-from smc.run import RunDocument
+from smc.run import RunDocument, StageStatus
+from smc.run.files import AtomicWriteError
 from smc.testing import FakeCore
 from smc.ui import plate_page
 from smc.ui.controller import PlatePage
 from smc.ui.guide import (
+    CALIBRATION_HOW_WINDOWS_NOTE,
     OFFSETS_DRY_RUN,
     OFFSETS_NO_DOCUMENT,
     OFFSETS_NOT_TURNED_BACK,
     OFFSETS_NOTHING_ARMED,
+    OFFSETS_PLAN_CHANGED,
+    OFFSETS_STALE,
     busy_note,
     offsets_confirm_text,
     offsets_lead,
+    offsets_written_line,
 )
 from smc.ui.plate_page import PlatePageView
 
@@ -638,3 +649,286 @@ def test_a_busy_page_says_what_runs_beside_the_button(
     assert view.offsets_measure_button.disabled is True
     Slow.release.set()
     assert view.page.join(10.0)
+
+
+# --- the write, as the view sends it (D7, FM-172) -----------------------------------
+
+
+@pytest.fixture
+def stand_file(tmp_path: Path) -> Path:
+    """A copy of ``demo.toml`` in a folder with a space in its name: the one file a write may replace."""
+    folder = tmp_path / "my profiles"
+    folder.mkdir()
+    path = folder / "stand.toml"
+    path.write_bytes(DEMO_PROFILE.read_bytes())
+    return path
+
+
+@pytest.fixture
+def make_plan_view(
+    fake_core: FakeCore, run_doc: Path, stand_file: Path
+) -> Iterator[Callable[..., PlatePageView]]:
+    """A view over a stand on the profile file, its document holding the plate and a result of the 40X; every page it built is closed."""
+    stands: list[Microscope] = []
+    pages: list[PlatePage] = []
+
+    def make_stand(extra: str = "") -> Microscope:
+        if extra:
+            stand_file.write_bytes(stand_file.read_bytes() + extra.encode("utf-8"))
+        stand = Microscope.from_core(
+            cast("CMMCorePlus", fake_core), Profile.load(stand_file)
+        )
+        stands.append(stand)
+        return stand
+
+    def make(*, held: bool = True) -> PlatePageView:
+        page = _plan_page(make_stand, run_doc, held=held)
+        pages.append(page)
+        view = PlatePageView(page)
+        view.show_step("plate")
+        view.refresh()
+        view.tick()
+        return view
+
+    try:
+        yield make
+    finally:
+        for page in pages:
+            page.close()
+        for stand in stands:
+            stand.close()
+
+
+def _edit_the_profile(stand_file: Path) -> bytes:
+    """What an editor or a ``git pull`` does between the preview and the click: another offset for the 40X."""
+    stand_file.write_text(
+        stand_file.read_text(encoding="utf-8").replace(
+            "xy_offset_um = [1.0, 2.0]", "xy_offset_um = [3.0, 4.0]"
+        ),
+        encoding="utf-8",
+    )
+    return stand_file.read_bytes()
+
+
+def test_write_sends_the_lines_that_were_drawn_and_a_profile_edited_since_is_refused(
+    make_plan_view: Callable[..., PlatePageView], stand_file: Path
+) -> None:
+    view = make_plan_view()
+    assert view.offsets_write_button.visible is True
+    assert view.offsets_write_button.label == "Write these offsets into stand.toml"
+    assert view.offsets_write_note.object == ""
+    edited = _edit_the_profile(stand_file)
+
+    # The preview on screen is the one drawn before the edit: the controller computes the
+    # plan again, finds other lines and writes nothing (a page that recomputed the lines at
+    # the click would write what nobody was shown).
+    _click(view.offsets_write_button)
+    assert stand_file.read_bytes() == edited
+    assert view.page.status().outcome == f"Objective offsets: {OFFSETS_PLAN_CHANGED}"
+    assert view.offsets_write_note.object == ""
+
+    # Drawn again from the file as it is now, the same click writes.
+    view.refresh()
+    _click(view.offsets_write_button)
+    assert stand_file.read_bytes() != edited
+    offsets = Profile.load(stand_file).objectives.offsets[FORTY]
+    assert offsets.xy_offset_um == (-37.5, 12.25)
+    assert view.page.status().outcome == "Offsets written into stand.toml"
+    assert view.offsets_write_note.object == offsets_written_line(
+        view.page.profile_argument
+    )
+
+
+def test_the_session_typed_goes_into_the_text_written(
+    make_plan_view: Callable[..., PlatePageView], stand_file: Path
+) -> None:
+    view = make_plan_view()
+    view.offsets_session_input.value = "session 3 (#412)"
+    assert view.offsets_plan_text.object.endswith(
+        'measured = "2026-11-14, session 3 (#412), objective-offsets in run.json"'
+    )
+
+    _click(view.offsets_write_button)
+
+    written = Profile.load(stand_file).objectives.offsets[FORTY].measured
+    assert written == "2026-11-14, session 3 (#412), objective-offsets in run.json"
+
+
+def test_a_write_that_fails_is_an_outcome_and_the_block_says_nothing_was_written(
+    make_plan_view: Callable[..., PlatePageView],
+    stand_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Windows refuses the rename while an editor or a sync client holds the profile (FM-24,
+    # FM-38): the file is as it was, the outcome says why, and nothing claims a write.
+    view = make_plan_view()
+    before = stand_file.read_bytes()
+
+    def refuse(path: Path, data: bytes, *, make_parents: bool = True) -> None:
+        raise AtomicWriteError(PermissionError(13, "Access is denied"), None)
+
+    monkeypatch.setattr("smc.run.files.write_atomically", refuse)
+    _click(view.offsets_write_button)
+
+    assert stand_file.read_bytes() == before
+    assert view.page.status().outcome == (
+        f"Objective offsets: {stand_file.resolve()} was not changed: Access is denied"
+    )
+    assert view.offsets_write_note.object == ""
+    assert view.page.offsets_plan("").written is False
+
+
+def test_the_session_field_and_the_write_button_wait_for_a_result(
+    make_view: Callable[..., PlatePageView],
+    run_doc: Path,
+) -> None:
+    _seed_plate(run_doc)
+    view = make_view()
+    view.show_step("plate")
+    view.refresh()
+    view.tick()
+
+    assert view.offsets_box.visible is True
+    assert view.offsets_session_input.visible is False
+    assert view.offsets_write_button.visible is False
+    assert view.offsets_write_note.object == ""
+
+    _seed_offsets(run_doc, _result((FORTY, (-37.5, 12.25))))
+    view.refresh()
+
+    assert view.offsets_session_input.visible is True
+
+
+# --- what drops the confirmation (D4) ------------------------------------------------
+
+
+def _armed(
+    make_view: Callable[..., PlatePageView],
+    run_doc: Path,
+    tmp_path: Path,
+    seed_calibration: Callable[..., Any],
+) -> tuple[PlatePageView, list[str]]:
+    view, text = _ready(make_view, run_doc, tmp_path, seed_calibration)
+    _click(view.offsets_measure_button)
+    assert view._offsets_armed == (FORTY, TWENTY)
+    return view, text.splitlines()
+
+
+def test_a_stand_released_since_the_question_drops_it_at_the_next_tick(
+    make_view: Callable[..., PlatePageView],
+    run_doc: Path,
+    tmp_path: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    view, _paths = _armed(make_view, run_doc, tmp_path, seed_camera_calibration)
+    status = view.page.status()
+
+    # No activity goes: only the connection changed (the how-to's second step is Disconnect).
+    view._draw_offsets(dataclasses.replace(status, connected=False))
+
+    assert (view._offsets_armed, view.offsets_confirm_box.visible) == (None, False)
+    assert view.offsets_confirm_text.visible is False
+
+
+def test_a_turn_the_controller_refuses_still_drops_what_was_armed(
+    make_view: Callable[..., PlatePageView],
+    run_doc: Path,
+    tmp_path: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    view, paths = _armed(make_view, run_doc, tmp_path, seed_camera_calibration)
+    # The second document is now the calibration of another objective: the click is refused
+    # and no tool starts, so nothing running can be what disarms the view.
+    seed_camera_calibration(Path(paths[1]), objective="Objective-2")
+
+    _click(view.offsets_turn_button)
+
+    assert Measuring.seen == []
+    assert view.page.status().running is None
+    assert (view._offsets_armed, view.offsets_confirm_box.visible) == (None, False)
+    assert "the objectives changed since you confirmed them" in (
+        view.page.status().outcome or ""
+    )
+
+
+def test_a_second_measure_that_now_waits_closes_the_question(
+    make_view: Callable[..., PlatePageView],
+    run_doc: Path,
+    tmp_path: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    view, paths = _armed(make_view, run_doc, tmp_path, seed_camera_calibration)
+    Path(paths[1]).unlink()
+
+    _click(view.offsets_measure_button)
+
+    assert (view._offsets_armed, view.offsets_confirm_box.visible) == (None, False)
+    assert "does not exist" in view.offsets_wait_text.object
+
+
+def test_a_plate_that_is_no_longer_from_the_walls_hides_the_block_and_drops_the_question(
+    make_view: Callable[..., PlatePageView],
+    run_doc: Path,
+    tmp_path: Path,
+    seed_camera_calibration: Callable[..., Any],
+) -> None:
+    view, _paths = _armed(make_view, run_doc, tmp_path, seed_camera_calibration)
+    by_eye = _walls_plate(method="references", with_walls=False, walls_objective=None)
+    _seed_plate(run_doc, by_eye, plugin="plate-registration", minute=2)
+
+    view.refresh()
+
+    assert view.offsets_box.visible is False
+    assert (view._offsets_armed, view.offsets_confirm_box.visible) == (None, False)
+
+
+# --- a refusal in the tool's words, and a result gone stale (D6) --------------------
+
+
+def test_the_block_draws_a_refusal_as_the_tool_words_it_and_says_when_a_result_is_stale(
+    make_view: Callable[..., PlatePageView], run_doc: Path
+) -> None:
+    _seed_plate(run_doc)
+    _seed_offsets(
+        run_doc,
+        status=StageStatus.failed,
+        error="PluginRunError: objective-offsets: 40X is given twice in targets",
+    )
+    view = make_view()
+    view.show_step("plate")
+    view.refresh()
+    failed = view.offsets_result_text.object.splitlines()
+
+    assert failed[1] == "error: 40X is given twice in targets"
+    assert "PluginRunError" not in view.offsets_result_text.object
+
+    # The plate is registered again after a good result: it says so before anything else.
+    _seed_offsets(run_doc, _result((FORTY, (-37.5, 12.25))), minute=2)
+    _seed_plate(run_doc, plugin="plate-walls", minute=3)
+    view.refresh()
+    stale = view.offsets_result_text.object.splitlines()
+
+    assert stale[1] == OFFSETS_STALE
+
+
+# --- the how-to (D9) ----------------------------------------------------------------
+
+
+def test_the_how_to_quotes_the_profile_and_a_windows_page_gets_its_own_note(
+    make_plan_view: Callable[..., PlatePageView],
+) -> None:
+    view = make_plan_view()
+    profile = view.page.profile_argument
+    assert " " in profile  # the folder of the test's profile has a space
+    command = f"-p {shlex.quote(profile)} --run-doc cal-<objective>.json"
+
+    view._windows = False
+    view.refresh()
+    assert command in view.calibration_how_text.object
+    assert CALIBRATION_HOW_WINDOWS_NOTE not in view.calibration_how_text.object
+
+    view._windows = True
+    view.refresh()
+    assert view.calibration_how_text.object.endswith(CALIBRATION_HOW_WINDOWS_NOTE)
+    # The page-wide note points at a button this card does not have: not drawn here.
+    assert "press the button" not in view.calibration_how_text.object
