@@ -154,8 +154,14 @@ the stage `XY (x, y) µm`, `Z`, the objective, the autofocus
 read failed), the light, `DRY RUN` when it is one, and `HALTED` with **Resume** when the
 stand is halted. `?` is an unknown, never a zero. With the stand closed it is
 `<stand> | not connected` and nothing else. It is read once a second, and no
-faster: a scan must not be slowed by a status poll. **STOP is always offered**, a run
-or not. Under it: the run's progress as `done/total message`, how the last run ended
+faster: a scan must not be slowed by a status poll. During a run or Live the strip
+can be about a second old: the page reads no device on the loop that takes the click on
+STOP (a read waits on the camera for as long as a snap, 133 ms median and 464 ms at
+most at the Ti2-E), so a background read refreshes it and the strip shows its latest
+answer ([m3 §15.4](../design/m3-plugins.md)). A stand that has not answered for 10 s is
+said above the map: `the stand has not answered a read for <n> s; the strip shows its
+last answer`; a read that failed is `stand read: <Type>: <message>`. **STOP is always
+offered**, a run or not. Under it: the run's progress as `done/total message`, how the last run ended
 (`<title> done in 12.3 s`, `<title> stopped`, `<title> stopped by STOP` when STOP landed in
 a move the tool was making, or `<title> failed: <message>`) and
 what the last STOP did. The **title** is the tool's plain name, never its plugin name: `Go to`,
